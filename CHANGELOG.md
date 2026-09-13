@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.23 — 2026-09-13
+
+- Improved Worker and browser event ordering on complex pages.
+- Additional compatibility and stability fixes.
+
 ## 0.1.22 — 2026-09-13
 
 - Improved compatibility and reliability for Workers, embedded frames, and

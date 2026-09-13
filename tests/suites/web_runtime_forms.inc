@@ -5181,7 +5181,7 @@
         "w2=new Worker(url2);let observed='',stale=false,crossPhase=false,"
         "samePhase=false,finished=0;"
         "const finish=()=>{if(++finished!==2)return;"
-        "pocSummary=observed==='ready'&&!stale&&!crossPhase&&!samePhase&&"
+        "pocSummary=observed==='ready'&&!stale&&crossPhase&&!samePhase&&"
         "syncOrder==='first,second,after'&&"
         "synthetic.join(',')==='first,second,after,micro'"
         "?'worker-checkpoint-ok':'worker-checkpoint-failed:'"
@@ -5189,7 +5189,7 @@
         "synthetic.join(',')].join('|');"
         "w1.terminate();w2.terminate();URL.revokeObjectURL(url1);"
         "URL.revokeObjectURL(url2)};let state;const lateCapture=()=>"
-        "samePhase=true,lateBubble=()=>{crossPhase=true;finish()};"
+        "samePhase=true,lateBubble=()=>crossPhase=true;"
         "w1.addEventListener('message',()=>{let chain=Promise.resolve();"
         "for(let i=0;i<70;i++)chain=chain.then(()=>{});"
         "chain.then(()=>state='ready');"
@@ -5237,10 +5237,14 @@
         worker_listener_removal_runtime,
         "(()=>{pocSummary='pending';const url=URL.createObjectURL(new Blob(["
         "\"postMessage('ready')\"])),worker=new Worker(url);let micro=false,"
-        "second=false;worker.addEventListener('message',event=>{"
-        "Promise.resolve().then(()=>micro=true);"
+        "second=false,lifetime=false;worker.addEventListener('message',event=>{"
+        "Promise.resolve().then(()=>{let redispatchBlocked=false;try{worker."
+        "dispatchEvent(event)}catch(error){redispatchBlocked=error.name==="
+        "'InvalidStateError'}micro=true;lifetime=event.currentTarget===worker&&"
+        "event.eventPhase===Event.AT_TARGET&&redispatchBlocked});"
         "event.stopImmediatePropagation();setTimeout(()=>{"
-        "pocSummary=micro&&!second?'worker-stopped-checkpoint-ok':"
+        "pocSummary=micro&&lifetime&&!second&&event.currentTarget===null&&"
+        "event.eventPhase===Event.NONE?'worker-stopped-checkpoint-ok':"
         "'worker-stopped-checkpoint-failed';worker.terminate();"
         "URL.revokeObjectURL(url)},0)});worker.addEventListener('message',"
         "()=>second=true)})()",
@@ -5252,6 +5256,49 @@
     }
     CHECK(strcmp(worker_listener_removal_result.summary,
                  "worker-stopped-checkpoint-ok") == 0);
+    script_runtime_destroy(worker_listener_removal_runtime);
+    document_destroy(&worker_listener_removal_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker listener exceptions report after callback checkpoint");
+    CHECK(document_parse(
+        &worker_listener_removal_document, &budget,
+        worker_listener_removal_page,
+        strlen(worker_listener_removal_page), 8));
+    memset(&worker_listener_removal_result, 0,
+           sizeof(worker_listener_removal_result));
+    worker_listener_removal_runtime = script_runtime_create_deferred(
+        &worker_listener_removal_document, &budget, 4 * MIB, 1000,
+        "https://worker-exception-checkpoint.test/", NULL,
+        &worker_listener_removal_result);
+    CHECK(worker_listener_removal_runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        worker_listener_removal_runtime,
+        "(()=>{pocSummary='pending';const url=URL.createObjectURL(new Blob(["
+        "\"postMessage('ready')\"])),worker=new Worker(url);let state='',"
+        "errorSaw=false,secondSaw=false;addEventListener('error',event=>{"
+        "if(event.error?.message==='checkpoint-probe')errorSaw=state==="
+        "'micro'});worker.addEventListener('message',()=>{Promise.resolve()."
+        "then(()=>state='micro');throw new Error('checkpoint-probe')});"
+        "worker.addEventListener('message',()=>{secondSaw=state==='micro';"
+        "setTimeout(()=>{pocSummary=errorSaw&&secondSaw?"
+        "'worker-exception-checkpoint-ok':"
+        "'worker-exception-checkpoint-failed:'+state+':'+errorSaw+':' +"
+        "secondSaw;worker.terminate();URL.revokeObjectURL(url)},0)})})()",
+        "<worker-exception-checkpoint>", &worker_listener_removal_result));
+    for (size_t worker_turn = 0; worker_turn < 8; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_listener_removal_runtime, worker_turn, 8,
+            &worker_listener_removal_result));
+    }
+    if (strcmp(worker_listener_removal_result.summary,
+               "worker-exception-checkpoint-ok") != 0) {
+        fprintf(stderr, "worker exception checkpoint summary=%s error=%s\n",
+                worker_listener_removal_result.summary,
+                worker_listener_removal_result.error);
+    }
+    CHECK(strcmp(worker_listener_removal_result.summary,
+                 "worker-exception-checkpoint-ok") == 0);
     script_runtime_destroy(worker_listener_removal_runtime);
     document_destroy(&worker_listener_removal_document);
     CHECK(budget.current == 0);
