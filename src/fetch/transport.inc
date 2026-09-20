@@ -713,6 +713,16 @@ static bool append_request_headers(
             budget, headers, "Content-Type",
             request == NULL ? NULL : request->content_type)) return false;
     if (!append_extra_headers(budget, headers, extra_headers)) return false;
+    const char *cache_control = NULL;
+    const char *pragma = NULL;
+    fetch_cache_mode_headers(
+        request == NULL ? FETCH_CACHE_DEFAULT : request->cache_mode,
+        extra_headers, &cache_control, &pragma);
+    if (!hop_add_named_header(
+            budget, headers, "Cache-Control", cache_control)
+        || !hop_add_named_header(budget, headers, "Pragma", pragma)) {
+        return false;
+    }
     return hop_add_named_header(
                budget, headers, "If-None-Match",
                request == NULL ? NULL : request->if_none_match)

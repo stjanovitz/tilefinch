@@ -24,14 +24,14 @@
   const trustedJSONStringify = JSON.stringify;
   const trustedStructuredClone = globalThis.__tilefinchCloneWorkerValue,
     trustedCloneIntrinsics = globalThis.__tilefinchWorkerCloneIntrinsics.owner,
-    trustedScheduleTimeout = globalThis.__tilefinchScheduleTimeout,
+    trustedScheduleTask = globalThis.__tilefinchScheduleTask,
     trustedQueueCheckpointContinuation =
       globalThis.__tilefinchQueueCheckpointContinuation;
   delete globalThis.__tilefinchQueueCheckpointContinuation;
   let activityCloses = [];
   let activityCloseScheduled = false;
   const scheduleDatabaseTask = (callback) => {
-    const id = intrinsicApply(trustedScheduleTimeout, globalThis, [callback, 0]);
+    const id = intrinsicApply(trustedScheduleTask, globalThis, [callback]);
     return id !== 0;
   }, closeTransactionActivities = () => {
     activityCloseScheduled = false;

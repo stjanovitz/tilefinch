@@ -3521,9 +3521,8 @@ bool navigation_advance_runtime(NavigationSession *session,
             return false;
         }
         if (script_runtime_consume_relayout(frame->runtime)) {
-            bool frame_presented = navigation_refresh_frame_presentation(
-                session, frame);
-            if (!frame_presented && !session->page.loaded) return false;
+            if (!navigation_refresh_frame_presentation_or_defer(
+                    session, frame)) return false;
         }
         if (tilefinch_trace_callback_source()
             && frame->callback_error_source_context[0] == '\0'
@@ -3552,10 +3551,11 @@ consume_script_navigation:
     ;
     char navigation_url[NAVIGATION_URL_LIMIT];
     bool replace = false;
+    bool user_activated = false;
     if (script_runtime_consume_navigation(session->page.runtime,
                                           navigation_url,
                                           sizeof(navigation_url),
-                                          &replace)) {
+                                          &replace, &user_activated)) {
         if (session->trace_frame_capabilities) {
             (void) navigation_collect_frame_capability_trace(session);
         }
@@ -3573,6 +3573,7 @@ consume_script_navigation:
             session->pending_navigation_same_origin =
                 navigation_same_origin(current_url, navigation_url);
         }
+        session->pending_navigation_user_activated = user_activated;
         uint64_t generation = navigation_begin(session);
         session->performance.runtime_us += navigation_record_slice(
             session, NAVIGATION_SLICE_RUNTIME, runtime_started,
@@ -3708,11 +3709,32 @@ static NavigationFrame *navigation_loaded_frame_for_element(
     return NULL;
 }
 
+static void navigation_notify_frame_user_activation(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    if (session == NULL || frame == NULL) return;
+    /* HTML activation notification marks the active Window and every
+       ancestor Window. Do this before dispatch so child handlers and parent
+       message callbacks observe one coherent activation snapshot. */
+    script_runtime_notify_user_activation(session->page.runtime);
+    NavigationFrame *current = frame;
+    for (size_t depth = 0; current != NULL && depth < NAVIGATION_FRAME_LIMIT;
+         depth++) {
+        script_runtime_notify_user_activation(current->runtime);
+        if (current->parent_frame_slot_plus_one == 0) break;
+        size_t parent_slot = current->parent_frame_slot_plus_one - 1u;
+        if (parent_slot >= session->page.frame_count) break;
+        current = &session->page.frames[parent_slot];
+        if (current->retired || !current->loaded) break;
+    }
+}
+
 static bool navigation_finish_frame_activation(
     NavigationSession *session, NavigationFrame *frame,
     lxb_dom_node_t *target)
 {
     if (session == NULL || frame == NULL || target == NULL) return false;
+    navigation_notify_frame_user_activation(session, frame);
     if (!script_runtime_dispatch_activation_node(
             frame->runtime, target, &frame->script_result)) {
         (void) navigation_retire_failed_document_refresh(
@@ -3721,9 +3743,8 @@ static bool navigation_finish_frame_activation(
     }
     bool relayout = script_runtime_consume_relayout(frame->runtime);
     if (relayout) {
-        bool frame_presented = navigation_refresh_frame_presentation(
-            session, frame);
-        if (!frame_presented && !session->page.loaded) return false;
+        if (!navigation_refresh_frame_presentation_or_defer(
+                session, frame)) return false;
     }
     return navigation_deliver_frame_messages(session);
 }
@@ -3734,6 +3755,7 @@ static bool navigation_finish_frame_pointer_click(
     int offset_x, int offset_y)
 {
     if (session == NULL || frame == NULL || target == NULL) return false;
+    navigation_notify_frame_user_activation(session, frame);
     long target_handle = script_runtime_node_handle(
         frame->runtime, target);
     if (target_handle == 0) return false;
@@ -3770,9 +3792,8 @@ static bool navigation_finish_frame_pointer_click(
     script_runtime_node_handle_release(frame->runtime, target_handle);
     bool relayout = script_runtime_consume_relayout(frame->runtime);
     if (relayout) {
-        bool frame_presented = navigation_refresh_frame_presentation(
-            session, frame);
-        if (!frame_presented && !session->page.loaded) return false;
+        if (!navigation_refresh_frame_presentation_or_defer(
+                session, frame)) return false;
     }
     bool delivered = navigation_deliver_frame_messages(session);
     if (trace && !delivered)

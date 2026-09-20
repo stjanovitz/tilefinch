@@ -290,6 +290,29 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(state["routes"], 1)
         self.assertEqual(state["ambiguous_routes"], 1)
 
+    def test_mixed_cache_mode_route_fails_closed_before_reverse_order_replay(self) -> None:
+        base = (
+            "psp-http-trace=13\nmethod=GET\nurl=https://cache-route.test/value\n"
+            "success=1\nstatus=200\nlength=0\ncontent-type=text/plain\n"
+            "response-header-count=0\nset-cookie-count=0\n"
+        )
+        for first, second in ((0, 2), (2, 0)):
+            with self.subTest(first=first), tempfile.TemporaryDirectory() as temporary:
+                trace = Path(temporary)
+                write_trace_meta(trace, count=2)
+                (trace / "0000.meta").write_text(
+                    base + f"request-extra-header-shape=@cache={first};\n"
+                )
+                (trace / "0001.meta").write_text(
+                    base + f"request-extra-header-shape=@cache={second};\n"
+                )
+                completed = inspect(trace)
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(
+                    "mixed request cache modes cannot be routed faithfully",
+                    completed.stderr,
+                )
+
     def test_length_mismatch_is_rejected_before_browser_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             trace = Path(temporary)

@@ -1366,6 +1366,11 @@ bool script_runtime_dispatch_pointer_node(
     ScriptRuntime *runtime, lxb_dom_node_t *node, unsigned phase,
     int client_x, int client_y, int offset_x, int offset_y,
     unsigned buttons, ScriptResult *result);
+/* HTML transient activation is a timed document state, not merely a flag on
+   the synchronous event callback. Embedders notify ancestor runtimes for a
+   trusted child-frame input before dispatching the event. */
+void script_runtime_notify_user_activation(ScriptRuntime *runtime);
+bool script_runtime_has_transient_user_activation(ScriptRuntime *runtime);
 bool script_runtime_dispatch_input_node(ScriptRuntime *runtime,
                                         lxb_dom_node_t *node,
                                         const char *event_type,
@@ -1450,7 +1455,8 @@ void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
 bool script_runtime_consume_mutations(ScriptRuntime *runtime,
                                       ScriptMutationJournal *result);
 bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
-                                       size_t url_size, bool *replace);
+                                       size_t url_size, bool *replace,
+                                       bool *user_activated);
 bool script_runtime_has_pending_navigation(const ScriptRuntime *runtime);
 bool script_runtime_consume_media_request(ScriptRuntime *runtime,
                                           ScriptMediaRequest *request);

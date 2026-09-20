@@ -3669,6 +3669,7 @@ bool controller_execute_action(BrowserController *controller,
                  sizeof(navigation->pending_navigation_referer), "%s",
                  current->url);
     }
+    navigation->pending_navigation_user_activated = true;
     uint64_t generation = navigation_begin(navigation);
     const char *method = copy.type == CONTROLLER_ACTION_FORM_SUBMIT
                          ? copy.method : "GET";

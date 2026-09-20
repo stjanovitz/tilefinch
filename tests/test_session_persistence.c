@@ -219,7 +219,17 @@ static bool populate(BrowserSession *session)
                "theme", "dark", 4)
         && browser_session_storage_set(
                session, "https://www.wikipedia.org/", false,
-               "tab", "source-only", 11);
+               "tab", "source-only", 11)
+        && browser_session_opfs_create(
+               session, "https://www.wikipedia.org/", "/private",
+               BROWSER_OPFS_DIRECTORY) == BROWSER_OPFS_OK
+        && browser_session_opfs_create(
+               session, "https://www.wikipedia.org/", "/private/state",
+               BROWSER_OPFS_FILE) == BROWSER_OPFS_OK
+        && browser_session_opfs_write(
+               session, "https://www.wikipedia.org/", "/private/state",
+               (const unsigned char *) "opfs-secret", 11)
+               == BROWSER_OPFS_OK;
 }
 
 static int test_round_trip_and_clear(void)
@@ -306,9 +316,11 @@ static int test_round_trip_and_clear(void)
     browser_session_persistence_load_destroy(incremental_load);
     browser_session_destroy(&incremental);
 
+    BrowserOpfsView opfs_view = {0};
     CHECK(!file_contains(persistence_path, "durable=yes")
           && !file_contains(persistence_path, "session_only=no")
           && !file_contains(persistence_path, "source-only")
+          && !file_contains(persistence_path, "opfs-secret")
           && browser_session_persistence_load(
               &target, persistence_path, BROWSER_SESSION_PERSIST_CACHE,
               &limits) == BROWSER_SESSION_PERSISTENCE_OK
@@ -317,7 +329,10 @@ static int test_round_trip_and_clear(void)
           && browser_session_persistence_load(
               &target, persistence_path,
               BROWSER_SESSION_PERSIST_LOCAL_STORAGE,
-              &limits) == BROWSER_SESSION_PERSISTENCE_OK);
+              &limits) == BROWSER_SESSION_PERSISTENCE_OK
+          && browser_session_opfs_stat(
+                 &target, "https://www.wikipedia.org/", "/private/state",
+                 &opfs_view) == BROWSER_OPFS_NOT_FOUND);
 
     BrowserCacheEntry *css = find_cache(
         &target, "https://static.test/site.css");

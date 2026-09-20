@@ -2646,6 +2646,8 @@ bool browser_engine_begin_navigation_url(
     BrowserEngine *engine, const char *url, size_t maximum_bytes,
     long timeout_ms, bool record_history)
 {
+    if (engine != NULL)
+        engine->navigation.pending_navigation_user_activated = false;
     return browser_engine_begin_navigation_request(
         engine, url, "GET", NULL, 0, NULL,
         maximum_bytes, timeout_ms, record_history);
@@ -2670,6 +2672,7 @@ bool browser_engine_begin_navigation_action(
                  sizeof(engine->navigation.pending_navigation_referer),
                  "%s", current_url);
     }
+    engine->navigation.pending_navigation_user_activated = true;
     const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
         ? action->method : "GET";
     if (action->type == CONTROLLER_ACTION_NAVIGATE
@@ -2685,6 +2688,7 @@ bool browser_engine_begin_navigation_action(
         snprintf(work->url, sizeof(work->url), "%s", action->url);
         bool committed = browser_engine_commit_same_document_action(
             engine, action->url);
+        engine->navigation.pending_navigation_user_activated = false;
         work->status = committed ? BROWSER_NAVIGATION_JOB_SUCCEEDED
                                  : BROWSER_NAVIGATION_JOB_FAILED;
         work->metrics.status = work->status;
@@ -2692,12 +2696,15 @@ bool browser_engine_begin_navigation_action(
         if (committed) clear_error(engine);
         return committed;
     }
-    return browser_engine_begin_navigation_request(
+    bool began = browser_engine_begin_navigation_request(
         engine, action->url, method,
         action->body_length == 0 ? NULL : action->body,
         action->body_length,
         action->content_type[0] == '\0' ? NULL : action->content_type,
         maximum_bytes, timeout_ms, true);
+    if (!began)
+        engine->navigation.pending_navigation_user_activated = false;
+    return began;
 }
 
 typedef struct {
@@ -4258,6 +4265,7 @@ bool browser_engine_execute_action(BrowserEngine *engine,
                      sizeof(engine->navigation.pending_navigation_referer),
                      "%s", current_url);
         }
+        engine->navigation.pending_navigation_user_activated = true;
         return browser_engine_load_url_with_limits(
             engine, action->url, maximum_bytes, timeout_ms, true);
     }

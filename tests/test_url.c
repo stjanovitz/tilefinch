@@ -175,6 +175,22 @@ int main(void)
     CHECK(tilefinch_request_same_site(&request));
     CHECK(!tilefinch_request_sends_credentials(&request));
     CHECK(strcmp(tilefinch_request_fetch_site(&request), "same-site") == 0);
+    request.top_level_url = "https://chatgpt.com/";
+    request.initiator_url =
+        "https://challenges.cloudflare.com/challenge-frame";
+    request.target_url =
+        "https://brunhild.challenges.cloudflare.com/probe";
+    request.credentials = TILEFINCH_CREDENTIALS_INCLUDE;
+    CHECK(tilefinch_request_context_analyze(&request, &facts)
+          && !facts.same_origin && !facts.same_site
+          && !facts.allows_lax_cookie
+          && facts.site == TILEFINCH_REQUEST_SITE_SAME_SITE
+          && strcmp(tilefinch_request_facts_fetch_site(&facts),
+                    "same-site") == 0);
+    CHECK(!tilefinch_request_same_site(&request));
+    request.initiator_url = "https://app.example.test/page";
+    request.top_level_url = "https://app.example.test/page";
+    request.credentials = TILEFINCH_CREDENTIALS_SAME_ORIGIN;
     request.target_url = "http://api.example.test/data";
     CHECK(!tilefinch_request_same_site(&request));
     request.target_url = "https://bob.github.io/data";

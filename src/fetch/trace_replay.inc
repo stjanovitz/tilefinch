@@ -69,8 +69,8 @@ static bool trace_replay_response_with_scratch(
     if (record_status == NULL || rejected == NULL) return false;
     *record_status = TRACE_REPLAY_RECORD_INVALID;
     *rejected = false;
-    if (!trace_extra_header_shape(
-            request == NULL ? NULL : request->extra_headers,
+    if (!trace_extra_header_shape_with_cache(
+            request,
             scratch->request_extra_header_shape,
             sizeof(scratch->request_extra_header_shape))) return false;
     if (!trace_path(scratch->meta_path, sizeof(scratch->meta_path), sequence,
@@ -120,7 +120,9 @@ static bool trace_replay_response_with_scratch(
     bool has_request_referrer_source = false;
     bool has_request_referrer_policy = false;
     bool has_request_content_type = false, request_content_type_match = false;
-    bool has_request_extra_shape = false, request_extra_shape_match = false;
+    bool has_request_extra_shape = false;
+    bool request_extra_shape_with_cache_match = false;
+    bool request_extra_shape_legacy_match = false;
     bool has_request_if_none_match = false, request_if_none_match_match = false;
     bool has_request_if_modified_since = false;
     bool request_if_modified_since_match = false;
@@ -163,7 +165,7 @@ static bool trace_replay_response_with_scratch(
             TRACE_SEE(TRACE_V6_VERSION);
             size_t parsed = 0;
             if (trace_parse_size_value(equals, &parsed)
-                && parsed >= 1 && parsed <= 12) {
+                && parsed >= 1 && parsed <= 13) {
                 trace_version = (unsigned) parsed;
             } else {
                 trace_fields_valid = false;
@@ -287,8 +289,18 @@ static bool trace_replay_response_with_scratch(
         else if (strcmp(scratch->line, "request-extra-header-shape") == 0) {
             TRACE_SEE(TRACE_V6_REQUEST_EXTRA_SHAPE);
             has_request_extra_shape = true;
-            request_extra_shape_match = strcmp(
+            const char *separator = strchr(
+                scratch->request_extra_header_shape, ';');
+            const char *legacy_expected = separator == NULL
+                ? scratch->request_extra_header_shape : separator + 1;
+            /* Metadata fields are keyed and may be reordered. Record both
+               interpretations here, then select one after the final version
+               is known instead of depending on psp-http-trace appearing
+               first in the file. */
+            request_extra_shape_with_cache_match = strcmp(
                 equals, scratch->request_extra_header_shape) == 0;
+            request_extra_shape_legacy_match = strcmp(
+                equals, legacy_expected) == 0;
         }
         else if (strcmp(scratch->line, "request-allow-http-errors") == 0) {
             TRACE_SEE(TRACE_V6_REQUEST_ALLOW_ERRORS);
@@ -858,6 +870,9 @@ static bool trace_replay_response_with_scratch(
         && request->sec_fetch_mode != NULL
         && strcasecmp(request->sec_fetch_mode, "navigate") == 0
         && request_fetch_dest_match && request_fetch_mode_match;
+    bool request_extra_shape_match = trace_version >= 13
+        ? request_extra_shape_with_cache_match
+        : request_extra_shape_legacy_match;
     bool v6_shape_match = trace_version < 6
            /* Cookie values are redacted at capture, so byte length is the
               only comparator left -- and pages that mint session cookies
@@ -907,6 +922,8 @@ static bool trace_replay_response_with_scratch(
     bool v9_shape_match = trace_version >= 9
         ? logical_url_match
         : strchr(logical_url, '#') == NULL;
+    bool cache_mode_trace_match = trace_version >= 13
+        || request == NULL || request->cache_mode == FETCH_CACHE_DEFAULT;
     bool credential_origin_match = !has_recorded_credential_origin
         || recorded_credential_origin[0] == '\0'
         || trace_source_context_match(
@@ -1032,7 +1049,7 @@ static bool trace_replay_response_with_scratch(
     }
     bool request_identity_match = method_match && url_match
         && v6_shape_match && v7_shape_match && v8_shape_match
-        && v9_shape_match
+        && v9_shape_match && cache_mode_trace_match
         && (recorded_request_length == SIZE_MAX
             || recorded_request_length == request_length)
         && (!has_request_hash || recorded_request_hash == request_hash)
@@ -1341,7 +1358,7 @@ static bool trace_replay_response_with_scratch(
 
 static bool trace_record_request_key(
     size_t sequence, const char *method, const char *url,
-    TraceReplayScratch *scratch, bool *valid)
+    FetchCacheMode cache_mode, TraceReplayScratch *scratch, bool *valid)
 {
     if (method == NULL || url == NULL || scratch == NULL || valid == NULL) {
         return false;
@@ -1351,8 +1368,12 @@ static bool trace_record_request_key(
                     "meta")) return false;
     FILE *meta = fopen(scratch->meta_path, "rb");
     if (meta == NULL) return false;
-    bool method_seen = false, url_seen = false;
+    bool version_seen = false, method_seen = false, url_seen = false;
+    bool extra_shape_seen = false;
     bool method_match = false, url_match = false, parse_ok = true;
+    unsigned trace_version = 0;
+    FetchCacheMode recorded_cache_mode = FETCH_CACHE_DEFAULT;
+    bool cache_mode_seen = false;
     while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
         size_t length = strlen(scratch->line);
         while (length != 0
@@ -1363,7 +1384,15 @@ static bool trace_record_request_key(
         char *equals = strchr(scratch->line, '=');
         if (equals == NULL) continue;
         *equals++ = '\0';
-        if (strcmp(scratch->line, "method") == 0) {
+        if (strcmp(scratch->line, "psp-http-trace") == 0) {
+            size_t parsed = 0;
+            bool field_ok = !version_seen
+                && trace_parse_size_value(equals, &parsed)
+                && parsed >= 1 && parsed <= 13;
+            if (field_ok) trace_version = (unsigned) parsed;
+            version_seen = true;
+            parse_ok = parse_ok && field_ok;
+        } else if (strcmp(scratch->line, "method") == 0) {
             if (method_seen) parse_ok = false;
             method_seen = true;
             method_match = strcmp(equals, method) == 0;
@@ -1371,11 +1400,23 @@ static bool trace_record_request_key(
             if (url_seen) parse_ok = false;
             url_seen = true;
             url_match = strcmp(equals, url) == 0;
+        } else if (strcmp(
+                       scratch->line,
+                       "request-extra-header-shape") == 0) {
+            bool field_ok = !extra_shape_seen;
+            if (field_ok) {
+                cache_mode_seen = trace_cache_mode_from_header_shape(
+                    equals, &recorded_cache_mode);
+            }
+            extra_shape_seen = true;
+            parse_ok = parse_ok && field_ok;
         }
     }
     if (ferror(meta) || fclose(meta) != 0) parse_ok = false;
-    *valid = parse_ok && method_seen && url_seen;
-    return *valid && method_match && url_match;
+    *valid = parse_ok && version_seen && method_seen && url_seen
+        && (trace_version < 13 || cache_mode_seen);
+    return *valid && method_match && url_match
+        && (trace_version < 13 || recorded_cache_mode == cache_mode);
 }
 
 typedef struct {
@@ -1385,7 +1426,8 @@ typedef struct {
     bool transport_timeout;
 } TraceResponseKeyDescriptor;
 
-static uint64_t trace_response_key_hash(const char *method, const char *url)
+static uint64_t trace_response_key_hash(
+    const char *method, const char *url, FetchCacheMode cache_mode)
 {
     uint64_t hash = UINT64_C(1469598103934665603);
     const char *parts[] = {method, "\n", url};
@@ -1396,6 +1438,8 @@ static uint64_t trace_response_key_hash(const char *method, const char *url)
             hash *= UINT64_C(1099511628211);
         }
     }
+    hash ^= (unsigned) cache_mode;
+    hash *= UINT64_C(1099511628211);
     return hash;
 }
 
@@ -1408,6 +1452,10 @@ static bool trace_record_request_key_hash(
     FILE *meta = fopen(scratch->meta_path, "rb");
     if (meta == NULL) return false;
     char method[16] = {0};
+    unsigned trace_version = 0;
+    FetchCacheMode cache_mode = FETCH_CACHE_DEFAULT;
+    bool version_seen = false, cache_mode_seen = false;
+    bool extra_shape_seen = false;
     bool method_seen = false, url_seen = false, parse_ok = true;
     while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
         size_t length = strlen(scratch->line);
@@ -1419,7 +1467,15 @@ static bool trace_record_request_key_hash(
         char *equals = strchr(scratch->line, '=');
         if (equals == NULL) continue;
         *equals++ = '\0';
-        if (strcmp(scratch->line, "method") == 0) {
+        if (strcmp(scratch->line, "psp-http-trace") == 0) {
+            size_t parsed = 0;
+            bool field_ok = !version_seen
+                && trace_parse_size_value(equals, &parsed)
+                && parsed >= 1 && parsed <= 13;
+            if (field_ok) trace_version = (unsigned) parsed;
+            version_seen = true;
+            parse_ok = parse_ok && field_ok;
+        } else if (strcmp(scratch->line, "method") == 0) {
             bool field_ok = !method_seen
                 && strlen(equals) < sizeof(method);
             if (field_ok) snprintf(method, sizeof(method), "%s", equals);
@@ -1434,12 +1490,24 @@ static bool trace_record_request_key_hash(
             }
             url_seen = true;
             parse_ok = parse_ok && field_ok;
+        } else if (strcmp(
+                       scratch->line,
+                       "request-extra-header-shape") == 0) {
+            bool field_ok = !extra_shape_seen;
+            if (field_ok) {
+                cache_mode_seen = trace_cache_mode_from_header_shape(
+                    equals, &cache_mode);
+            }
+            extra_shape_seen = true;
+            parse_ok = parse_ok && field_ok;
         }
     }
     if (ferror(meta) || fclose(meta) != 0) parse_ok = false;
-    parse_ok = parse_ok && method_seen && url_seen;
+    parse_ok = parse_ok && version_seen && method_seen && url_seen
+        && (trace_version < 13 || cache_mode_seen);
     if (parse_ok) {
-        *hash = trace_response_key_hash(method, scratch->request_key);
+        *hash = trace_response_key_hash(method, scratch->request_key,
+                                        cache_mode);
     }
     scratch->request_key[0] = '\0';
     return parse_ok;
@@ -1566,7 +1634,8 @@ typedef struct {
    in record-id order even when their bytes are identical; lower ranks never
    become a fallback after exhaustion. */
 static bool trace_response_key_select(
-    const char *method, const char *url, TraceReplayScratch *scratch,
+    const char *method, const char *url, FetchCacheMode cache_mode,
+    TraceReplayScratch *scratch,
     FetchResult *result, TraceResponseKeySelection *selection)
 {
     if (method == NULL || url == NULL || scratch == NULL || result == NULL
@@ -1582,7 +1651,7 @@ static bool trace_response_key_select(
         && fetch_trace.replay_route_index_count
            == fetch_trace.replay_record_count;
     uint64_t requested_hash = indexed
-        ? trace_response_key_hash(method, url) : 0;
+        ? trace_response_key_hash(method, url, cache_mode) : 0;
     for (size_t sequence = 0;
          sequence < fetch_trace.replay_record_count; sequence++) {
         const TraceReplayRouteIndexEntry *entry = indexed
@@ -1597,7 +1666,7 @@ static bool trace_response_key_select(
         if (entry != NULL && entry->key_hash != requested_hash) continue;
         bool key_valid = false;
         bool key_match = trace_record_request_key(
-            sequence, method, url, scratch, &key_valid);
+            sequence, method, url, cache_mode, scratch, &key_valid);
         if (!key_valid) {
             fetch_trace.replay_invalid_route_request_count++;
             snprintf(result->error, sizeof(result->error),
@@ -1682,7 +1751,9 @@ static bool trace_replay_response(Budget *budget, const char *method,
     if (fetch_trace.replay_response_keyed) {
         TraceResponseKeySelection selection;
         bool selected = trace_response_key_select(
-            method, canonical_url, scratch, result, &selection);
+            method, canonical_url,
+            request == NULL ? FETCH_CACHE_DEFAULT : request->cache_mode,
+            scratch, result, &selection);
         if (!selected) {
             /* The selector records corrupt route metadata as invalid. */
             terminal_accounted = true;
@@ -1738,13 +1809,22 @@ static bool trace_replay_response(Budget *budget, const char *method,
             snprintf(result->error, sizeof(result->error),
                      "HTTP response-keyed replay has no record for %s %s",
                      method, canonical_url);
+            if (trace_replay_diagnostics_enabled()) {
+                fprintf(stderr,
+                        "HTTP response-keyed replay unmatched "
+                        "method=%.12s url=%.700s\n",
+                        method, canonical_url);
+            }
         }
     } else {
         bool indexed = fetch_trace.replay_route_index != NULL
             && fetch_trace.replay_route_index_count
                == fetch_trace.replay_record_count;
         uint64_t requested_hash = indexed
-            ? trace_response_key_hash(method, canonical_url) : 0;
+            ? trace_response_key_hash(
+                  method, canonical_url,
+                  request == NULL ? FETCH_CACHE_DEFAULT
+                                  : request->cache_mode) : 0;
         for (size_t sequence = 0;
              sequence < fetch_trace.replay_record_count; sequence++) {
             if (trace_replay_record_claimed(sequence)) continue;
@@ -1759,7 +1839,9 @@ static bool trace_replay_response(Budget *budget, const char *method,
             if (entry != NULL && entry->key_hash != requested_hash) continue;
             bool key_valid = false;
             bool key_match = trace_record_request_key(
-                sequence, method, canonical_url, scratch, &key_valid);
+                sequence, method, canonical_url,
+                request == NULL ? FETCH_CACHE_DEFAULT : request->cache_mode,
+                scratch, &key_valid);
             if (!key_valid) {
                 snprintf(result->error, sizeof(result->error),
                          "HTTP replay record %zu metadata is corrupt",

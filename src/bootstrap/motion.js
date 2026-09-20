@@ -13,14 +13,18 @@
     KEYFRAME_LIMIT = 16,
     RULE_LIMIT = 128,
     ELEMENT_LIMIT = 128,
+    SHADOW_ROOT_LIMIT = 16,
     FRAME_LIMIT = 16,
     DURATION_LIMIT = 4000,
     ITERATION_LIMIT = 8,
     reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches,
     active = new Set(),
-    applied = new WeakMap();
+    applied = new WeakMap(),
+    lifecycleStates = new Set();
   let pending = false,
     observer = null,
+    lifecycleTimer = 0,
+    lifecycleTimerDue = Infinity,
     scans = 0,
     declarationParses = 0,
     retainedKeyframes = 0,
@@ -193,6 +197,7 @@
         duration = 0,
         delay = 0,
         iterations = 1,
+        infinite = false,
         direction = "normal",
         easing = "ease";
       const shorthand = firstListItem(declarations.get("animation"));
@@ -207,7 +212,10 @@
             if (!sawTime) duration = parsedTime;
             else delay = parsedTime;
             sawTime = true;
-          } else if (token === "infinite") iterations = ITERATION_LIMIT;
+          } else if (token === "infinite") {
+            iterations = ITERATION_LIMIT;
+            infinite = true;
+          }
           else if (/^\d+(?:\.\d+)?$/.test(token))
             iterations = Math.max(
               1,
@@ -262,10 +270,9 @@
         declarations.get("animation-iteration-count"),
       );
       if (authoredIterations) {
+        infinite = authoredIterations === "infinite";
         iterations =
-          authoredIterations === "infinite"
-            ? ITERATION_LIMIT
-            : Math.max(
+          infinite ? ITERATION_LIMIT : Math.max(
                 1,
                 Math.min(
                   ITERATION_LIMIT,
@@ -291,6 +298,7 @@
             duration,
             delay,
             iterations,
+            infinite,
             direction,
             easing,
             scrollLinked,
@@ -336,9 +344,11 @@
     keyframes,
     rules,
     depth = 0,
+    keyframeLimit = KEYFRAME_LIMIT,
+    ruleLimit = RULE_LIMIT,
   ) => {
     if (depth > 8) return;
-    for (let at = begin; at < end && rules.length < RULE_LIMIT; ) {
+    for (let at = begin; at < end && rules.length < ruleLimit; ) {
       while (at < end && /\s/.test(text[at])) at++;
       if (at >= end) break;
       let delimiter = at,
@@ -376,7 +386,7 @@
       const header = text.slice(at, delimiter).trim(),
         lower = header.toLowerCase();
       if (/^@(?:-webkit-)?keyframes\s+/i.test(header)) {
-        if (keyframes.size < KEYFRAME_LIMIT) {
+        if (keyframes.size < keyframeLimit) {
           const name = header
             .replace(/^@(?:-webkit-)?keyframes\s+/i, "")
             .trim()
@@ -400,6 +410,8 @@
             keyframes,
             rules,
             depth + 1,
+            keyframeLimit,
+            ruleLimit,
           );
       } else if (
         lower.startsWith("@layer") ||
@@ -412,6 +424,8 @@
           keyframes,
           rules,
           depth + 1,
+          keyframeLimit,
+          ruleLimit,
         );
       } else if (!header.startsWith("@")) {
         const body = text.slice(delimiter + 1, close);
@@ -441,9 +455,88 @@
         globalThis.__tilefinchReportUncaught?.(error, "CSS animation event");
       }
     },
+    lifecycleNow = () => {
+      const now = Number(performance.now());
+      return Number.isFinite(now) ? Math.max(0, now) : 0;
+    },
+    armLifecycleTimer = () => {
+      let due = Infinity;
+      for (const state of lifecycleStates) {
+        if (!state.started) due = Math.min(due, state.startAt);
+        else if (state.nextIterationAt < state.endAt)
+          due = Math.min(due, state.nextIterationAt);
+        else if (!state.ended) due = Math.min(due, state.endAt);
+      }
+      if (lifecycleTimer && due >= lifecycleTimerDue) return;
+      if (lifecycleTimer) globalThis.__tilefinchCancelTimer?.(lifecycleTimer);
+      lifecycleTimer = 0;
+      lifecycleTimerDue = due;
+      if (!Number.isFinite(due)) return;
+      const delay = Math.max(0, Math.ceil(due - lifecycleNow()));
+      lifecycleTimer = globalThis.__tilefinchScheduleTimeout?.(
+        serviceLifecycles,
+        delay,
+      ) || 0;
+    },
+    serviceLifecycles = () => {
+      lifecycleTimer = 0;
+      lifecycleTimerDue = Infinity;
+      const now = lifecycleNow();
+      for (const state of Array.from(lifecycleStates)) {
+        if (!state.started && now >= state.startAt) {
+          state.started = true;
+          dispatchAnimationEvent(state.element, "animationstart", state.config);
+          if (state.config.infinite) {
+            lifecycleStates.delete(state);
+            continue;
+          }
+        }
+        let remainingIterations = ITERATION_LIMIT - 1;
+        while (
+          state.started &&
+          state.nextIterationAt < state.endAt &&
+          now >= state.nextIterationAt &&
+          remainingIterations-- > 0
+        ) {
+          dispatchAnimationEvent(
+            state.element,
+            "animationiteration",
+            state.config,
+            (state.nextIterationAt - state.startAt) / 1000,
+          );
+          state.nextIterationAt += state.config.duration;
+        }
+        if (state.started && !state.ended && now >= state.endAt) {
+          state.ended = true;
+          dispatchAnimationEvent(
+            state.element,
+            "animationend",
+            state.config,
+            (state.config.duration * state.config.iterations) / 1000,
+          );
+          lifecycleStates.delete(state);
+        }
+      }
+      armLifecycleTimer();
+    },
+    startLifecycle = (element, state) => {
+      const now = lifecycleNow(),
+        activeDuration = state.config.duration * state.config.iterations;
+      state.element = element;
+      state.started = false;
+      state.ended = false;
+      state.startAt = now + state.config.delay;
+      state.nextIterationAt = state.startAt + state.config.duration;
+      state.endAt = state.config.infinite
+        ? Infinity
+        : state.startAt + activeDuration;
+      lifecycleStates.add(state);
+      armLifecycleTimer();
+    },
     stopAnimation = (element, state, cancelled) => {
       state.animation?.cancel();
-      if (cancelled)
+      lifecycleStates.delete(state);
+      if (cancelled && !state.ended)
         dispatchAnimationEvent(
           element,
           "animationcancel",
@@ -452,6 +545,7 @@
         );
       applied.delete(element);
       active.delete(element);
+      armLifecycleTimer();
     },
     staticFrame = (frames, config) => {
       const reverse =
@@ -480,76 +574,137 @@
       } else if (frame.transform !== undefined) {
         element.style.setProperty("transform", frame.transform, "important");
       }
-      applied.set(element, { animation: null, config, signature, static: true });
+      const state = { animation: null, config, signature, static: true };
+      applied.set(element, state);
+      active.add(element);
+      startLifecycle(element, state);
+    },
+    queryTree = (root, selector, limit, nativeInline) => {
+      if (!root || limit <= 0) return [];
+      try {
+        const scope = root === document ? 0 : root.__handle;
+        if (nativeInline && scope !== undefined)
+          return globalThis.__tilefinchQueryAll(selector, scope, limit);
+        return root.querySelectorAll(selector);
+      } catch {
+        return [];
+      }
+    },
+    wrappedElement = (value, nativeInline) =>
+      nativeInline && typeof value === "number"
+        ? globalThis.__tilefinchWrap(value)
+        : value,
+    collectTreeRoots = (nativeInline) => {
+      const roots = [document];
+      let inspected = 0;
+      for (
+        let rootIndex = 0;
+        rootIndex < roots.length && roots.length < SHADOW_ROOT_LIMIT &&
+        inspected < STYLE_NODE_LIMIT;
+        rootIndex++
+      ) {
+        const hosts = queryTree(
+          roots[rootIndex],
+          "*",
+          STYLE_NODE_LIMIT - inspected,
+          nativeInline,
+        );
+        const count = Math.min(
+          hosts.length,
+          STYLE_NODE_LIMIT - inspected,
+        );
+        inspected += count;
+        for (let index = 0; index < count; index++) {
+          const host = wrappedElement(hosts[index], nativeInline),
+            shadow = globalThis.__tilefinchShadowRootForHost?.(host);
+          if (shadow && !roots.includes(shadow)) {
+            roots.push(shadow);
+            if (roots.length >= SHADOW_ROOT_LIMIT) break;
+          }
+        }
+      }
+      return roots;
     },
     scan = () => {
       scans++;
-      const keyframes = new Map(),
-        rules = [];
       let retainedBytes = 0,
-        retainedNodes = 0;
+        retainedNodes = 0,
+        retainedStyles = 0,
+        totalKeyframes = 0,
+        totalRules = 0;
       const nativeInline = typeof globalThis.__tilefinchQueryAll === "function"
-        && !globalThis.__tilefinchHasRemoteNodeWriter;
-      const styleNodes = nativeInline
-          ? globalThis.__tilefinchQueryAll("style", 0, STYLE_LIMIT)
-          : document.querySelectorAll("style"),
-        styleCount = Math.min(STYLE_LIMIT, styleNodes.length);
-      for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
-        const style = styleNodes[styleIndex];
-        const available = STYLE_BYTES_LIMIT - retainedBytes,
-          availableNodes = STYLE_NODE_LIMIT - retainedNodes;
-        if (available <= 0 || availableNodes <= 0) break;
-        const retained = styleTextPrefix(style, available, availableNodes);
-        retainedBytes += retained.bytes;
-        retainedNodes += retained.nodes;
-        if (/(?:animation|keyframes)/i.test(retained.text))
-          parseRules(retained.text, 0, retained.text.length, keyframes, rules);
-      }
-      const candidates = new Map();
-      for (const rule of rules) {
-        let elements = [];
-        try {
-          elements = document.querySelectorAll(rule.selector);
-        } catch {
-          continue;
-        }
-        for (const element of elements) {
-          if (!(element instanceof Element)) continue;
-          if (!candidates.has(element) && candidates.size >= ELEMENT_LIMIT)
-            break;
-          candidates.set(element, rule.config);
-        }
-      }
-      let inlineElements = [];
-      try {
-        // Inspect bounded native attribute prefixes before creating wrappers.
-        // Most inline styles are geometry/color, not motion; wrapping all of
-        // them first can exhaust a tight realm even when no animation applies.
-        inlineElements = nativeInline
-          ? globalThis.__tilefinchQueryAll("[style]", 0, ELEMENT_LIMIT)
-          : document.querySelectorAll("[style]");
-      } catch {}
-      for (const element of inlineElements) {
-        if (
-          retainedBytes >= STYLE_BYTES_LIMIT ||
-          retainedNodes >= STYLE_NODE_LIMIT
-        )
+        && !globalThis.__tilefinchHasRemoteNodeWriter,
+        roots = collectTreeRoots(nativeInline),
+        candidates = new Map(),
+        candidateFrames = new Map();
+      for (const root of roots) {
+        if (retainedStyles >= STYLE_LIMIT || candidates.size >= ELEMENT_LIMIT)
           break;
-        if (!nativeInline && !candidates.has(element)
-          && candidates.size >= ELEMENT_LIMIT) break;
-        const retained = styleAttributePrefix(
-          element,
-          STYLE_BYTES_LIMIT - retainedBytes,
-        );
-        retainedBytes += boundedUtf8Length(retained);
-        retainedNodes++;
-        const config = /animation/i.test(retained)
-          ? animationConfig(declarationMap(retained)) : null;
-        if (config) {
-          const target = nativeInline ? globalThis.__tilefinchWrap(element) : element;
+        const keyframes = new Map(),
+          rules = [],
+          styleNodes = queryTree(
+            root, "style", STYLE_LIMIT - retainedStyles, nativeInline),
+          styleCount = Math.min(
+            STYLE_LIMIT - retainedStyles,
+            styleNodes.length,
+          );
+        retainedStyles += styleCount;
+        for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
+          const style = styleNodes[styleIndex],
+            available = STYLE_BYTES_LIMIT - retainedBytes,
+            availableNodes = STYLE_NODE_LIMIT - retainedNodes;
+          if (available <= 0 || availableNodes <= 0) break;
+          const retained = styleTextPrefix(style, available, availableNodes);
+          retainedBytes += retained.bytes;
+          retainedNodes += retained.nodes;
+          if (/(?:animation|keyframes)/i.test(retained.text))
+            parseRules(
+              retained.text, 0, retained.text.length, keyframes, rules, 0,
+              KEYFRAME_LIMIT - totalKeyframes,
+              RULE_LIMIT - totalRules);
+        }
+        totalKeyframes += keyframes.size;
+        totalRules += rules.length;
+        for (const rule of rules) {
+          const elements = queryTree(
+            root, rule.selector, ELEMENT_LIMIT - candidates.size,
+            nativeInline);
+          for (const value of elements) {
+            const element = wrappedElement(value, nativeInline);
+            if (!(element instanceof Element)) continue;
+            if (!candidates.has(element) && candidates.size >= ELEMENT_LIMIT)
+              break;
+            candidates.set(element, rule.config);
+            candidateFrames.set(element, keyframes.get(rule.config.name));
+          }
+        }
+        /* Inspect bounded native attribute prefixes before creating wrappers.
+           Most inline styles are geometry/color, not motion; wrapping all of
+           them first can exhaust a tight realm even when no animation applies. */
+        const inlineElements = queryTree(
+          root, "[style]", ELEMENT_LIMIT - candidates.size, nativeInline);
+        for (const value of inlineElements) {
+          if (
+            retainedBytes >= STYLE_BYTES_LIMIT ||
+            retainedNodes >= STYLE_NODE_LIMIT
+          )
+            break;
+          const target = wrappedElement(value, nativeInline);
           if (!(target instanceof Element)) continue;
-          if (!candidates.has(target) && candidates.size >= ELEMENT_LIMIT) break;
-          candidates.set(target, config);
+          if (!candidates.has(target) && candidates.size >= ELEMENT_LIMIT)
+            break;
+          const retained = styleAttributePrefix(
+            value,
+            STYLE_BYTES_LIMIT - retainedBytes,
+          );
+          retainedBytes += boundedUtf8Length(retained);
+          retainedNodes++;
+          const config = /animation/i.test(retained)
+            ? animationConfig(declarationMap(retained)) : null;
+          if (config) {
+            candidates.set(target, config);
+            candidateFrames.set(target, keyframes.get(config.name));
+          }
         }
       }
       for (const element of Array.from(active)) {
@@ -560,7 +715,7 @@
         }
       }
       for (const [element, config] of candidates) {
-        const frames = keyframes.get(config.name);
+        const frames = candidateFrames.get(element);
         if (!frames || frames.length < 2) continue;
         const signature =
           config.name +
@@ -570,6 +725,8 @@
           config.delay +
           ":" +
           config.iterations +
+          ":" +
+          config.infinite +
           ":" +
           config.direction +
           ":" +
@@ -596,23 +753,16 @@
           state = { animation, config, signature };
         applied.set(element, state);
         active.add(element);
-        queueMicrotask(() => {
-          if (applied.get(element) === state)
-            dispatchAnimationEvent(element, "animationstart", config);
-        });
+        startLifecycle(element, state);
         animation.finished.then(() => {
           if (applied.get(element) !== state) return;
-          dispatchAnimationEvent(
-            element,
-            "animationend",
-            config,
-            (config.duration * config.iterations) / 1000,
-          );
-          active.delete(element);
+          /* Property interpolation may hit the bounded frame ceiling before
+             the authored timeline. The shared lifecycle timer therefore owns
+             animationstart/iteration/end timing independently. */
         });
       }
-      retainedKeyframes = keyframes.size;
-      retainedRules = rules.length;
+      retainedKeyframes = totalKeyframes;
+      retainedRules = totalRules;
       matchedElements = candidates.size;
       pending = false;
     },
@@ -705,7 +855,7 @@
       childList: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ["class"],
+      attributeFilter: ["class", "style", "hidden", "id"],
     });
   };
   globalThis.__tilefinchBeginMotionObservation = beginObserving;
