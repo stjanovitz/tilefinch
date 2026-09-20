@@ -1445,6 +1445,21 @@
         &frame_owner_navigation, owned_frame->element, 110, 60));
     CHECK(strcmp(owned_frame->script_result.summary,
                  "frame-pointer-clicked") == 0);
+    puts("test: refused child-frame publication retries committed mutation");
+    NavigationFramePresentation *presentation_before_refusal =
+        owned_frame->presentation;
+    CHECK(script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "document.body.style.backgroundColor='rgb(1, 2, 3)';"
+              "globalThis.pocSummary='frame-presentation-dirty'",
+              "https://frame-owner.test/frame-presentation-dirty.js",
+              &owned_frame->script_result)
+          && strcmp(owned_frame->script_result.summary,
+                    "frame-presentation-dirty") == 0);
+    navigation_test_refuse_next_frame_presentation();
+    CHECK(navigation_advance_runtime(&frame_owner_navigation, 0, 4)
+          && owned_frame->presentation != presentation_before_refusal
+          && !owned_frame->presentation_dirty);
     /* Queue one complete legacy-capacity burst before delivery.  The first
        child task replies three times while fifteen messages remain queued.
        postMessage must queue all three replies rather than exposing the
@@ -2584,22 +2599,23 @@
         "const randomBytes=crypto.getRandomValues(new Uint8Array(32));"
         "performance.mark('startup');const heapMemory=performance.memory,heapMemoryProto=Object.getPrototypeOf(heapMemory),perfOk=performance.getEntriesByName('startup').length===1&&PerformanceObserver.supportedEntryTypes.includes('resource')&&Object.prototype.toString.call(heapMemory)==='[object MemoryInfo]'&&heapMemory!==performance.memory&&Object.getOwnPropertyNames(heapMemory).length===0&&Object.getOwnPropertyNames(heapMemoryProto).join(',')==='totalJSHeapSize,usedJSHeapSize,jsHeapSizeLimit'&&heapMemory.constructor===Object&&Number.isFinite(heapMemory.jsHeapSizeLimit)&&Number.isFinite(heapMemory.totalJSHeapSize)&&Number.isFinite(heapMemory.usedJSHeapSize)&&heapMemory.jsHeapSizeLimit>=heapMemory.totalJSHeapSize&&heapMemory.totalJSHeapSize>=heapMemory.usedJSHeapSize&&heapMemory.usedJSHeapSize>0;"
         "const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');"
-        "const blob=new Blob(['PSP'],{type:'text/plain'});const blobURL=URL.createObjectURL(blob);const workerBlob=new Blob(['self.ready=true;'],{type:'text/javascript'});const workerURL=URL.createObjectURL(workerBlob);const worker=new Worker(workerURL);const builtinSource=Function.prototype.toString;const blobOk=blob.size===3&&blob.type==='text/plain'&&Object.getOwnPropertyNames(blob).length===0&&blob._bytes===undefined&&blobURL.startsWith('blob:https://')&&worker instanceof Worker&&worker instanceof EventTarget&&Object.prototype.toString.call(worker)==='[object Worker]'&&Object.getPrototypeOf(Worker.prototype)===EventTarget.prototype&&Object.getOwnPropertyNames(worker).length===0&&Blob.name==='Blob'&&URL.createObjectURL.name==='createObjectURL'&&URL.revokeObjectURL.name==='revokeObjectURL'&&builtinSource.call(Blob).includes('[native code]')&&builtinSource.call(Blob.prototype.slice).includes('[native code]')&&builtinSource.call(MutationObserver).includes('[native code]')&&builtinSource.call(PerformanceObserver.prototype.observe).includes('[native code]')&&builtinSource.call(Worker).includes('[native code]')&&builtinSource.call(Worker.prototype.postMessage).includes('[native code]');worker.terminate();URL.revokeObjectURL(workerURL);URL.revokeObjectURL(blobURL);"
+        "const blob=new Blob(['PSP'],{type:'text/plain'});const blobURL=URL.createObjectURL(blob);const workerBlob=new Blob(['self.ready=true;'],{type:'text/javascript'});const workerURL=URL.createObjectURL(workerBlob);const worker=new Worker(workerURL);const builtinSource=Function.prototype.toString;let createObjectURLConstruct='',revokeObjectURLConstruct='',revokeSymbol='';try{Reflect.construct(URL.createObjectURL,[])}catch(error){createObjectURLConstruct=error.name}try{Reflect.construct(URL.revokeObjectURL,[])}catch(error){revokeObjectURLConstruct=error.name}try{URL.revokeObjectURL(Symbol())}catch(error){revokeSymbol=error.name}const blobURLStaticShapeOk=!Object.prototype.hasOwnProperty.call(URL.createObjectURL,'prototype')&&!Object.prototype.hasOwnProperty.call(URL.revokeObjectURL,'prototype')&&createObjectURLConstruct==='TypeError'&&revokeObjectURLConstruct==='TypeError'&&revokeSymbol==='TypeError';const blobOk=blob.size===3&&blob.type==='text/plain'&&Object.getOwnPropertyNames(blob).length===0&&blob._bytes===undefined&&blobURL.startsWith('blob:https://')&&worker instanceof Worker&&worker instanceof EventTarget&&Object.prototype.toString.call(worker)==='[object Worker]'&&Object.getPrototypeOf(Worker.prototype)===EventTarget.prototype&&Object.getOwnPropertyNames(worker).length===0&&Blob.name==='Blob'&&URL.createObjectURL.name==='createObjectURL'&&URL.revokeObjectURL.name==='revokeObjectURL'&&blobURLStaticShapeOk&&builtinSource.call(Blob).includes('[native code]')&&builtinSource.call(Blob.prototype.slice).includes('[native code]')&&builtinSource.call(MutationObserver).includes('[native code]')&&builtinSource.call(PerformanceObserver.prototype.observe).includes('[native code]')&&builtinSource.call(Worker).includes('[native code]')&&builtinSource.call(Worker.prototype.postMessage).includes('[native code]');worker.terminate();URL.revokeObjectURL(workerURL);URL.revokeObjectURL(blobURL);"
+        "let revokeOmitted='';try{URL.revokeObjectURL()}catch(error){revokeOmitted=error.name}const blobURLUUID=/^blob:https:\\/\\/[^/]+\\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(blobURL)&&/^blob:https:\\/\\/[^/]+\\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(workerURL)&&blobURL!==workerURL&&revokeOmitted==='TypeError';"
         "const interfaceHost=document.createElement('div');document.body.appendChild(interfaceHost);const shadow=interfaceHost.attachShadow({mode:'closed'});shadow.innerHTML='<div id=shadow-probe><span class=child></span></div>';const shadowProbe=shadow.querySelector('#shadow-probe'),shadowMarkupOk=shadow.nodeType===Node.DOCUMENT_FRAGMENT_NODE&&shadow.host===interfaceHost&&shadowProbe!==null&&shadow.getElementById('shadow-probe')===shadowProbe&&shadowProbe.querySelector('.child')!==null&&document.getElementById('shadow-probe')===null;const openHost=document.createElement('div');document.body.appendChild(openHost);const openShadow=openHost.attachShadow({mode:'open'});openShadow.innerHTML='<div id=open-shadow-probe></div>';const openShadowProbe=openShadow.querySelector('#open-shadow-probe'),openShadowMarkupOk=openHost.shadowRoot===openShadow&&openShadowProbe!==null&&openShadow.getElementById('open-shadow-probe')===openShadowProbe&&document.getElementById('open-shadow-probe')===null;const frame=document.createElement('iframe');frame.id='shadow-frame';frame.style.cssText='width:300px;height:65px';frame.setAttribute('sandbox','allow-same-origin');shadow.appendChild(frame);const shadowFrameRect=frame.getBoundingClientRect(),shadowHostRect=interfaceHost.getBoundingClientRect();const iterator=document.createNodeIterator(interfaceHost,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);const nativeSource=Function.prototype.toString;const prototypeQueriesOk=[Document.prototype,DocumentFragment.prototype,Element.prototype].every(proto=>typeof proto.querySelector==='function'&&typeof proto.querySelectorAll==='function'&&nativeSource.call(proto.querySelector).includes('[native code]')&&nativeSource.call(proto.querySelectorAll).includes('[native code]'));const frameEval=frame.contentWindow.eval;globalThis.__frameElementProbe=frame;const opaqueFrame=document.createElement('iframe');opaqueFrame.setAttribute('sandbox','allow-scripts');document.body.appendChild(opaqueFrame);const frameElementOk=window.frameElement===null&&frame.contentWindow.frameElement===frame&&frameEval('frameElement===parent.__frameElementProbe')&&opaqueFrame.contentWindow.frameElement===null;delete globalThis.__frameElementProbe;frame.contentWindow.frameOnly=40;delete globalThis.frameEvalLeak;const directFrameEval=frameEval('frameOnly+2')===42;frameEval('frameEvalLeak=7');const isolatedFrameEval=frame.contentWindow.frameEvalLeak===7&&globalThis.frameEvalLeak===undefined;frameEval('function persistentFrameFunction(){return 39} var persistentFrameVar=3');const persistentFrameDeclarations=frameEval('persistentFrameFunction()+persistentFrameVar')===42;frameEval('function outerFrameFn(){\\n  function nestedFrameFn(){return 1}\\n  var nestedFrameVar=2;\\n  return nestedFrameFn()+nestedFrameVar}\\nconst frameConfig={a:41};\\nclass FrameKind{}\\nlet frameLetValue=outerFrameFn();');const frameOwn=name=>Object.prototype.hasOwnProperty.call(frame.contentWindow,name);const nestedFrameNotLeaked=frameOwn('outerFrameFn')&&!frameOwn('nestedFrameFn')&&!frameOwn('nestedFrameVar')&&frame.contentWindow.nestedFrameFn===undefined;const lexicalFrameDeclarations=frameEval('frameConfig.a+1')===42&&frameEval('typeof FrameKind')==='function'&&frameEval('frameLetValue')===3&&frameEval('const frameOnce=5;frameOnce*2')===10&&frameEval('frameOnce')===5;frame.contentDocument.title='Child title';const frameThisAndDocument=frameEval('this===window&&document.title===\"Child title\"');const frameImplementation=frame.contentDocument.implementation,frameMadeDocument=frameImplementation.createHTMLDocument('Made');frame.contentDocument.write('<p id=frame-write>ok</p>');frame.contentDocument.close();const frameDocumentApis=frameImplementation instanceof DOMImplementation&&frame.contentDocument.implementation===frameImplementation&&frameMadeDocument.title==='Made'&&frame.contentDocument.getElementById('frame-write')?.textContent==='ok'&&nativeSource.call(DOMImplementation).includes('[native code]')&&nativeSource.call(DOMImplementation.prototype.createHTMLDocument).includes('[native code]');const staleFrame=document.createElement('iframe'),staleWindow=staleFrame.contentWindow,eventShape=new Event('tilefinch-shape');let stalePostOk=true;try{staleWindow.postMessage({probe:true},'*');}catch(_){stalePostOk=false;}dispatchEvent(eventShape);const eventPrototypeOk=['composedPath','preventDefault','stopPropagation','stopImmediatePropagation'].every(name=>typeof Event.prototype[name]==='function'&&!Object.prototype.hasOwnProperty.call(eventShape,name));const interfaceBits=[interfaceHost instanceof HTMLDivElement,interfaceHost.nodeType===Node.ELEMENT_NODE,frame instanceof HTMLIFrameElement,shadow instanceof ShadowRoot,shadowMarkupOk,openShadowMarkupOk,shadow.getElementById('shadow-frame')===frame,frame.parentNode===shadow,frame.parentElement===null,shadowFrameRect.width===300,shadowFrameRect.height>=65,frame.isConnected,frame.contentDocument instanceof Document&&frame.contentDocument!==document,Object.prototype.toString.call(frame.contentWindow)==='[object Window]',Object.prototype.toString.call(frame.contentDocument)==='[object HTMLDocument]','eval' in frame.contentWindow,typeof frameEval==='function',frameEval('21*2')===42,frameElementOk,directFrameEval,isolatedFrameEval,persistentFrameDeclarations,nestedFrameNotLeaked,lexicalFrameDeclarations,frameThisAndDocument,frameDocumentApis,stalePostOk,staleWindow.frameElement===null,nativeSource.call(frameEval).includes('[native code]'),prototypeQueriesOk,eventPrototypeOk,interfaceHost.shadowRoot===null,iterator.nextNode()!==null,interfaceHost.isConnected,interfaceHost.getBoundingClientRect().width>0,document.scripts.length>0,document.styleSheets.length>0],interfaceOk=interfaceBits.every(Boolean);"
         "const positionFirst=document.createElement('i'),positionSecond=document.createElement('i'),positionDetached=document.createElement('i');interfaceHost.append(positionFirst,positionSecond);const disconnectedForward=positionFirst.compareDocumentPosition(positionDetached),disconnectedReverse=positionDetached.compareDocumentPosition(positionFirst);let invalidPositionThrew=false;try{positionFirst.compareDocumentPosition({});}catch(error){invalidPositionThrew=error instanceof TypeError;}const positionOk=Node.DOCUMENT_POSITION_DISCONNECTED===1&&Node.prototype.DOCUMENT_POSITION_CONTAINED_BY===16&&positionFirst.compareDocumentPosition(positionFirst)===0&&interfaceHost.compareDocumentPosition(positionFirst)===(Node.DOCUMENT_POSITION_FOLLOWING|Node.DOCUMENT_POSITION_CONTAINED_BY)&&positionFirst.compareDocumentPosition(interfaceHost)===(Node.DOCUMENT_POSITION_PRECEDING|Node.DOCUMENT_POSITION_CONTAINS)&&positionFirst.compareDocumentPosition(positionSecond)===Node.DOCUMENT_POSITION_FOLLOWING&&positionSecond.compareDocumentPosition(positionFirst)===Node.DOCUMENT_POSITION_PRECEDING&&(disconnectedForward&(Node.DOCUMENT_POSITION_DISCONNECTED|Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC))===(Node.DOCUMENT_POSITION_DISCONNECTED|Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC)&&(disconnectedForward&6)!==0&&(disconnectedReverse&6)!==0&&(disconnectedForward&6)!==(disconnectedReverse&6)&&invalidPositionThrew;"
         "const queryHost=document.createElement('div');queryHost.innerHTML='<span id=qa></span><i><span id=qb></span></i>';document.body.appendChild(queryHost);const connectedList=queryHost.querySelectorAll('span'),scopedList=queryHost.querySelectorAll(':scope > span'),snapshotList=queryHost.querySelectorAll('span'),detachedQuery=document.createElement('div');detachedQuery.innerHTML='<span id=qd></span>';const detachedList=detachedQuery.querySelectorAll('span'),queryFragment=document.createDocumentFragment(),fragmentSpan=document.createElement('span');fragmentSpan.id='qf';queryFragment.appendChild(fragmentSpan);const fragmentList=queryFragment.querySelectorAll('span'),movingId=document.createElement('div');movingId.id='moving-query-probe';document.body.appendChild(movingId);const movingIdFound=document.body.querySelector('#moving-query-probe')===movingId;movingId.remove();const movingIdRemoved=document.body.querySelector('#moving-query-probe')===null;document.body.appendChild(movingId);const movingIdRestored=document.body.querySelector('#moving-query-probe')===movingId;queryHost.appendChild(document.createElement('span'));let iteratedIds='',forEachIds='';for(const node of connectedList)iteratedIds+=node.id;connectedList.forEach(node=>forEachIds+=node.id);const selectorFailures=['','div,',':tilefinch-unknown-pseudo','[data-open'].map(selector=>{try{queryHost.querySelectorAll(selector);return false}catch(error){return error instanceof DOMException&&error.name==='SyntaxError'}});const nodeListOk=connectedList instanceof NodeList&&!Array.isArray(connectedList)&&Object.prototype.toString.call(connectedList)==='[object NodeList]'&&connectedList.length===2&&snapshotList.length===2&&connectedList.item(0.9)===connectedList[0]&&connectedList.item(4294967296)===connectedList[0]&&connectedList.item(99)===null&&iteratedIds==='qaqb'&&forEachIds==='qaqb'&&[...connectedList.keys()].join(',')==='0,1'&&[...connectedList.entries()][1][1].id==='qb'&&scopedList instanceof NodeList&&!Array.isArray(scopedList)&&scopedList.length===1&&scopedList[0].id==='qa'&&detachedList instanceof NodeList&&detachedList[0].id==='qd'&&fragmentList instanceof NodeList&&fragmentList[0].id==='qf'&&movingIdFound&&movingIdRemoved&&movingIdRestored&&selectorFailures.every(Boolean);"
         "interfaceHost.style.setProperty('--CaseSensitive','kept');interfaceHost.style.cssFloat='left';interfaceHost.style.placeItems='center end';interfaceHost.style.placeSelf='start end';interfaceHost.style.placeContent='end center';const cssomNameOk=interfaceHost.style.getPropertyValue('--CaseSensitive')==='kept'&&interfaceHost.style.getPropertyValue('float')==='left'&&interfaceHost.style.alignItems==='center'&&interfaceHost.style.justifyItems==='end'&&interfaceHost.style.placeItems==='center end'&&interfaceHost.style.alignSelf==='start'&&interfaceHost.style.justifySelf==='end'&&interfaceHost.style.placeSelf==='start end'&&interfaceHost.style.alignContent==='end'&&interfaceHost.style.justifyContent==='center'&&interfaceHost.style.placeContent==='end center';"
-        "const mutationShapeObserver=new MutationObserver(()=>{}),mutationShapeOk=Object.getOwnPropertyNames(mutationShapeObserver).length===0&&Object.prototype.toString.call(mutationShapeObserver)==='[object MutationObserver]'&&Object.prototype.toString.call(new PerformanceObserver(()=>{}))==='[object PerformanceObserver]';const xhrProbe=new XMLHttpRequest,xhrPrototypeNames=Object.getOwnPropertyNames(XMLHttpRequest.prototype),xhrShapeOk=XMLHttpRequest.name==='XMLHttpRequest'&&Object.prototype.toString.call(xhrProbe)==='[object XMLHttpRequest]'&&xhrProbe instanceof EventTarget&&Object.getPrototypeOf(XMLHttpRequest.prototype)===XMLHttpRequestEventTarget.prototype&&xhrProbe.upload instanceof XMLHttpRequestUpload&&xhrProbe.upload instanceof EventTarget&&['readyState','response','responseText','responseType','responseURL','responseXML','status','statusText','timeout','upload','withCredentials','onreadystatechange'].every(name=>xhrPrototypeNames.includes(name))&&!xhrPrototypeNames.some(name=>name[0]==='_'||name==='emit')&&Function.prototype.toString.call(XMLHttpRequest).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequest.prototype.open).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequestEventTarget.prototype.addEventListener).includes('[native code]');"
+        "const mutationShapeObserver=new MutationObserver(()=>{}),mutationShapeOk=Object.getOwnPropertyNames(mutationShapeObserver).length===0&&Object.prototype.toString.call(mutationShapeObserver)==='[object MutationObserver]'&&Object.prototype.toString.call(new PerformanceObserver(()=>{}))==='[object PerformanceObserver]';const xhrProbe=new XMLHttpRequest,xhrPrototypeNames=Object.getOwnPropertyNames(XMLHttpRequest.prototype),xhrUpload=xhrProbe.upload,xhrReadonlyNames=['readyState','status','statusText','response','responseURL','responseXML','upload'],xhrReadonlyDescriptors=xhrReadonlyNames.every(name=>{const descriptor=Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype,name);return typeof descriptor?.get==='function'&&descriptor.set===undefined});let xhrBrandChecks=0,xhrBrandRejects=0;for(const name of [...xhrReadonlyNames,'timeout','withCredentials','onreadystatechange']){const descriptor=Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype,name);for(const kind of ['get','set'])if(typeof descriptor?.[kind]==='function'){xhrBrandChecks++;try{descriptor[kind].call(xhrUpload,kind==='set'?0:undefined)}catch(error){if(error instanceof TypeError)xhrBrandRejects++}}}const xhrBrandOk=xhrBrandChecks===13&&xhrBrandRejects===xhrBrandChecks;xhrProbe.status=299;xhrProbe.readyState=4;xhrProbe.upload={};let xhrStrictReadonly='';try{(()=>{'use strict';xhrProbe.status=299})()}catch(error){xhrStrictReadonly=error.name}const xhrShapeOk=XMLHttpRequest.name==='XMLHttpRequest'&&Object.prototype.toString.call(xhrProbe)==='[object XMLHttpRequest]'&&xhrProbe instanceof EventTarget&&Object.getPrototypeOf(XMLHttpRequest.prototype)===XMLHttpRequestEventTarget.prototype&&xhrProbe.upload===xhrUpload&&xhrProbe.upload instanceof XMLHttpRequestUpload&&xhrProbe.upload instanceof EventTarget&&xhrProbe.status===0&&xhrProbe.readyState===0&&xhrReadonlyDescriptors&&xhrBrandOk&&xhrStrictReadonly==='TypeError'&&['readyState','response','responseText','responseType','responseURL','responseXML','status','statusText','timeout','upload','withCredentials','onreadystatechange'].every(name=>xhrPrototypeNames.includes(name))&&!xhrPrototypeNames.some(name=>name[0]==='_'||name==='emit')&&Function.prototype.toString.call(XMLHttpRequest).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequest.prototype.open).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequestEventTarget.prototype.addEventListener).includes('[native code]');"
         "let navigatorConstructed=false,uaDataConstructed=false,gpuConstructed=false,wgslConstructed=false,pluginsConstructed=false,mimeTypesConstructed=false,clipboardConstructed=false,storageManagerConstructed=false,keyboardConstructed=false,keyboardMapConstructed=false;try{new Navigator}catch(_){navigatorConstructed=true}try{new NavigatorUAData}catch(_){uaDataConstructed=true}try{new GPU}catch(_){gpuConstructed=true}try{new WGSLLanguageFeatures}catch(_){wgslConstructed=true}try{new PluginArray}catch(_){pluginsConstructed=true}try{new MimeTypeArray}catch(_){mimeTypesConstructed=true}try{new Clipboard}catch(_){clipboardConstructed=true}try{new StorageManager}catch(_){storageManagerConstructed=true}try{new Keyboard}catch(_){keyboardConstructed=true}try{new KeyboardLayoutMap}catch(_){keyboardMapConstructed=true}const navigatorIdentityOwn=Object.getOwnPropertyNames(navigator).some(name=>['userAgent','appCodeName','appName','appVersion','language','languages','platform','product','productSub','vendor','vendorSub','maxTouchPoints','cookieEnabled','onLine','hardwareConcurrency','deviceMemory','userAgentData','gpu','plugins','mimeTypes','pdfViewerEnabled','webdriver','javaEnabled','getGamepads','clipboard','storage','keyboard','connection','getBattery','permissions','sendBeacon'].includes(name)),navigatorShapeOk=navigator instanceof Navigator&&Object.prototype.toString.call(navigator)==='[object Navigator]'&&!navigatorIdentityOwn&&Object.getPrototypeOf(navigator)===Navigator.prototype&&clientInformation===navigator&&navigator.appCodeName==='Mozilla'&&navigator.appName==='Netscape'&&navigator.product==='Gecko'&&navigator.vendor===''&&navigator.webdriver===false&&navigator.pdfViewerEnabled===false&&navigator.javaEnabled()===false&&navigator.plugins instanceof PluginArray&&navigator.mimeTypes instanceof MimeTypeArray&&navigator.plugins.length===0&&navigator.mimeTypes.length===0&&navigator.plugins.item(0)===null&&navigator.mimeTypes.namedItem('application/pdf')===null&&Object.prototype.toString.call(navigator.plugins)==='[object PluginArray]'&&Object.prototype.toString.call(navigator.mimeTypes)==='[object MimeTypeArray]'&&navigator.clipboard instanceof Clipboard&&Object.prototype.toString.call(navigator.clipboard)==='[object Clipboard]'&&navigator.storage instanceof StorageManager&&navigator.storage===navigator.storage&&Object.prototype.toString.call(navigator.storage)==='[object StorageManager]'&&navigator.keyboard instanceof Keyboard&&navigator.keyboard===navigator.keyboard&&Object.prototype.toString.call(navigator.keyboard)==='[object Keyboard]'&&navigator.userAgentData instanceof NavigatorUAData&&Object.prototype.toString.call(navigator.userAgentData)==='[object NavigatorUAData]'&&navigatorConstructed&&uaDataConstructed&&pluginsConstructed&&mimeTypesConstructed&&clipboardConstructed&&storageManagerConstructed&&keyboardConstructed&&keyboardMapConstructed;const platformStatusShapeOk=navigator.connection===navigator.connection&&navigator.connection instanceof NetworkInformation&&Object.prototype.toString.call(navigator.connection)==='[object NetworkInformation]'&&navigator.permissions===navigator.permissions&&navigator.permissions instanceof Permissions&&Object.prototype.toString.call(navigator.permissions)==='[object Permissions]'&&typeof navigator.getBattery==='function';const gpuEntryOk=!isSecureContext?navigator.gpu===undefined:navigator.gpu===navigator.gpu&&navigator.gpu instanceof GPU&&Object.prototype.toString.call(navigator.gpu)==='[object GPU]'&&Object.getOwnPropertyNames(navigator.gpu).length===0&&navigator.gpu.wgslLanguageFeatures instanceof WGSLLanguageFeatures&&Object.prototype.toString.call(navigator.gpu.wgslLanguageFeatures)==='[object WGSLLanguageFeatures]'&&navigator.gpu.wgslLanguageFeatures.size===0&&[...navigator.gpu.wgslLanguageFeatures].length===0&&navigator.gpu.getPreferredCanvasFormat()==='bgra8unorm'&&gpuConstructed&&wgslConstructed;const capabilitiesOk=navigatorShapeOk&&platformStatusShapeOk&&gpuEntryOk&&typeof RTCPeerConnection==='undefined'&&typeof RTCDataChannel==='undefined';"
-        "const encoder=new TextEncoder,encodedReplacement=encoder.encode(String.fromCharCode(0xd800)),intoTarget=new Uint8Array(4),intoResult=encoder.encodeInto('A€B',intoTarget);const streamingDecoder=new TextDecoder,streamFirst=streamingDecoder.decode(new Uint8Array([0xe2,0x82]),{stream:true}),streamSecond=streamingDecoder.decode(new Uint8Array([0xac]));let fatalEncoding='';try{new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array([0xc0]));}catch(error){fatalEncoding=error.name;}const encodingOk=encodedReplacement.join(',')==='239,191,189'&&intoResult.read===2&&intoResult.written===4&&intoTarget.join(',')==='65,226,130,172'&&streamFirst===''&&streamSecond==='€'&&new TextDecoder().decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='A'&&new TextDecoder('utf8',{ignoreBOM:true}).decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='﻿A'&&new TextDecoder().decode(new Uint8Array([0xc0,0xaf])).length===2&&fatalEncoding==='TypeError';"
-        "let invalidBase64Name='';try{atob('!');}catch(error){invalidBase64Name=error.name;}const base64Ok=atob(btoa('PSP\\0'))==='PSP\\0'&&atob('UFM')==='PS'&&atob('UFM=')==='PS'&&invalidBase64Name==='InvalidCharacterError';"
+        "const encoder=new TextEncoder,encodedReplacement=encoder.encode(String.fromCharCode(0xd800)),largeEncoded=encoder.encode('x'.repeat(240*1024)),intoTarget=new Uint8Array(4),intoResult=encoder.encodeInto('A€B',intoTarget);const streamingDecoder=new TextDecoder,streamFirst=streamingDecoder.decode(new Uint8Array([0xe2,0x82]),{stream:true}),streamSecond=streamingDecoder.decode(new Uint8Array([0xac]));let fatalEncoding='',nbspEncoding='',verticalTabEncoding='',boundedEncoding='';try{new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array([0xc0]));}catch(error){fatalEncoding=error.name;}try{new TextDecoder(String.fromCharCode(0xa0)+'windows-1252')}catch(error){nbspEncoding=error.name;}try{new TextDecoder(String.fromCharCode(0x0b)+'windows-1252')}catch(error){verticalTabEncoding=error.name;}try{new TextDecoder('windows-1252').decode(new Uint8Array(1024*1024+1))}catch(error){boundedEncoding=error.name;}const latinDecoder=new TextDecoder('iso-8859-1'),latinText=latinDecoder.decode(new Uint8Array([0x41,0x80,0x81,0xa3])),fatalLatin=new TextDecoder('windows-1252',{fatal:true}).decode(new Uint8Array([0x8d,0x9d]));const encodingOk=encodedReplacement.join(',')==='239,191,189'&&largeEncoded.length===240*1024&&largeEncoded[0]===120&&largeEncoded[largeEncoded.length-1]===120&&globalThis.__tilefinchEncodeUtf8===undefined&&intoResult.read===2&&intoResult.written===4&&intoTarget.join(',')==='65,226,130,172'&&streamFirst===''&&streamSecond==='€'&&new TextDecoder().decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='A'&&new TextDecoder('utf8',{ignoreBOM:true}).decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='﻿A'&&new TextDecoder().decode(new Uint8Array([0xc0,0xaf])).length===2&&fatalEncoding==='TypeError'&&nbspEncoding==='RangeError'&&verticalTabEncoding==='RangeError'&&boundedEncoding==='RangeError'&&new TextDecoder(String.fromCharCode(0x20,0x09)+'iso-8859-1'+String.fromCharCode(0x0d,0x0a)).encoding==='windows-1252'&&latinDecoder.encoding==='windows-1252'&&latinText.length===4&&latinText.charCodeAt(0)===65&&latinText.charCodeAt(1)===0x20ac&&latinText.charCodeAt(2)===0x81&&latinText.charCodeAt(3)===0xa3&&fatalLatin.charCodeAt(0)===0x8d&&fatalLatin.charCodeAt(1)===0x9d&&new TextDecoder('us-ascii').decode(new Uint8Array([0x80]))==='€';"
+        "const successfulBase64=atob(btoa('PSP\\0'))==='PSP\\0'&&atob('UFM')==='PS'&&atob('UFM=')==='PS',successfulBase64Diagnostic=globalThis.__tilefinchBase64Error;let invalidBase64Name='';try{atob('!');}catch(error){invalidBase64Name=error.name;}const base64Ok=successfulBase64&&successfulBase64Diagnostic===''&&invalidBase64Name==='InvalidCharacterError'&&globalThis.__tilefinchBase64Error.includes('bad-index=0');"
         "const abortController=new AbortController,abortSignal=abortController.signal;let abortSeen=false;abortSignal.addEventListener('abort',()=>abortSeen=true,{once:true});abortController.abort();const recursiveSignal=new AbortController().signal,recursiveCalls=[],onceAbort=()=>{recursiveCalls.push('once');recursiveSignal.dispatchEvent(new Event('abort'))};recursiveSignal.addEventListener('abort',onceAbort,{once:true});recursiveSignal.addEventListener('abort',{handleEvent(){recursiveCalls.push('object')}});recursiveSignal.dispatchEvent(new Event('abort'));const removalSignal=new AbortController().signal,removalCalls=[],removedAbort=()=>removalCalls.push('removed');removalSignal.addEventListener('abort',()=>{removalCalls.push('first');removalSignal.removeEventListener('abort',removedAbort)});removalSignal.addEventListener('abort',removedAbort);removalSignal.dispatchEvent(new Event('abort'));const falsySignal=AbortSignal.any([AbortSignal.abort(0)]),privateController=new AbortController,privateSignal=privateController.signal,fakeSignalTarget=new EventTarget;let falsyThrown='none',badTimeout='',signalConstructor='',borrowedSignal='',borrowedController='',fakeSignalError='',fakeSignalTouched=0;try{falsySignal.throwIfAborted()}catch(error){falsyThrown=error}try{AbortSignal.timeout(-1)}catch(error){badTimeout=error.name}try{new AbortSignal}catch(error){signalConstructor=error.name}try{AbortSignal.prototype.throwIfAborted.call({})}catch(error){borrowedSignal=error.name}try{AbortController.prototype.abort.call({})}catch(error){borrowedController=error.name}try{fakeSignalTarget.addEventListener('fake',()=>{},{signal:{get aborted(){fakeSignalTouched++;return false},addEventListener(){}}})}catch(error){fakeSignalError=error.name}privateController.signal='forged';privateSignal.aborted=true;privateSignal.reason='forged';const abortOk=abortSignal instanceof EventTarget&&abortSignal.aborted&&abortSeen&&abortSignal.reason instanceof DOMException&&abortSignal.reason.name==='AbortError'&&recursiveCalls.join(',')==='once,object,object'&&removalCalls.join(',')==='first'&&falsySignal.aborted&&falsySignal.reason===0&&falsyThrown===0&&badTimeout==='RangeError'&&signalConstructor==='TypeError'&&borrowedSignal==='TypeError'&&borrowedController==='TypeError'&&fakeSignalError==='TypeError'&&fakeSignalTouched===0&&privateController.signal===privateSignal&&!privateSignal.aborted&&privateSignal.reason===undefined&&!Object.prototype.hasOwnProperty.call(privateController,'signal')&&!Object.prototype.hasOwnProperty.call(privateSignal,'aborted');"
         "const headerProbe=new Headers(new Map([['z-last','1'],['a-first','2'],['z-last','3']])),headerOrder=[...headerProbe.keys()].join(','),headerValues=[...headerProbe.values()].join(','),generatedHeaders=new Headers((function*(){yield ['x-one','1'];yield ['x-two','2']})()),tabHeaders=new Headers({'x-tab':'\\talpha\\t beta\\t'});let illegalHeader='',badHeaderPair='';try{Headers.prototype.get.call({},{toString(){return 'a-first'}})}catch(error){illegalHeader=error.name}try{new Headers((function*(){yield ['one']})())}catch(error){badHeaderPair=error.name}const headersOk=!Object.prototype.hasOwnProperty.call(headerProbe,'map')&&headerOrder==='a-first,z-last'&&headerValues==='2,3'&&[...headerProbe][0][0]==='a-first'&&headerProbe.get('Z-LAST')==='3'&&generatedHeaders.get('x-one')==='1'&&generatedHeaders.get('x-two')==='2'&&tabHeaders.get('x-tab')==='alpha\\t beta'&&illegalHeader==='TypeError'&&badHeaderPair==='TypeError';"
         "const template=document.createElement('template');template.innerHTML='<template for=target><b>update</b></template><template data-assistant-presentation-flush></template>';const templateClone=template.cloneNode(true),clonedTarget=templateClone.content.querySelector('template[for=target]'),flushTemplate=template.content.querySelector('template[data-assistant-presentation-flush]'),fragmentProbe=document.createDocumentFragment(),fragmentText=document.createTextNode('fragment');fragmentProbe.appendChild(fragmentText);const fragmentHost=document.createElement('div');fragmentHost.appendChild(fragmentProbe);const equalProbe=document.createElement('p');equalProbe.textContent='equal';const templateOk=template.children.length===0&&template.content.querySelector('template[for=target]')!==null&&template.content.querySelectorAll('template[for],template[data-assistant-presentation-flush]').length===2&&flushTemplate.matches('template[data-assistant-presentation-flush]')&&clonedTarget.content.querySelector('b').textContent==='update'&&equalProbe.isEqualNode(equalProbe.cloneNode(true))&&fragmentProbe.childNodes.length===0&&fragmentHost.textContent==='fragment';"
         "let detachedCanvasScans=0;const savedQuerySelectorAll=Element.prototype.querySelectorAll;Element.prototype.querySelectorAll=function(...args){detachedCanvasScans++;return savedQuerySelectorAll.apply(this,args);};const parsedDocument=new DOMParser().parseFromString('<p id=parsed>One &amp; <b>two</b></p>','text/html'),xmlDocument=new DOMParser().parseFromString('<x/>','application/xml');Element.prototype.querySelectorAll=savedQuerySelectorAll;const parsedElement=parsedDocument.getElementById('parsed'),domParserBits=[detachedCanvasScans===0,parsedDocument instanceof Document,parsedDocument.nodeType===Node.DOCUMENT_NODE,parsedDocument.defaultView===null,parsedDocument.contentType==='text/html',parsedDocument.documentElement.textContent==='One & two',parsedElement?.querySelector('b').textContent==='two',xmlDocument instanceof Document&&xmlDocument.documentElement?.localName==='x'],domParserOk=domParserBits.every(Boolean);"
         "const workDocument=document.implementation.createHTMLDocument('');workDocument.documentElement.innerHTML='<style id=\"adopted-style\">#adopted-probe{color:rgb(1,2,3)}</style>';const adoptedStyle=workDocument.getElementById('adopted-style');document.head.appendChild(adoptedStyle);const createdDocumentOk=adoptedStyle instanceof HTMLStyleElement&&adoptedStyle.ownerDocument===document&&adoptedStyle.parentElement===document.head&&adoptedStyle.textContent.includes('#adopted-probe');"
         "const moveA=document.createElement('div'),moveB=document.createElement('div'),moveOne=document.createElement('i'),moveTwo=document.createElement('i'),moveThree=document.createElement('i');moveOne.id='move-one';moveTwo.id='move-two';moveThree.id='move-three';moveA.appendChild(moveOne);moveA.appendChild(moveTwo);moveB.appendChild(moveOne);const crossAppendOk=moveA.firstChild===moveTwo&&moveB.firstChild===moveOne;moveA.insertBefore(moveTwo,moveTwo);moveA.appendChild(moveThree);moveA.appendChild(moveTwo);const reorderOk=moveA.firstChild===moveThree&&moveA.lastChild===moveTwo;const orphanReference=document.createElement('i');let invalidInsertThrew=false;try{moveA.insertBefore(moveOne,orphanReference);}catch(_){invalidInsertThrew=true;}const invalidInsertPreserved=moveOne.parentElement===moveB&&moveA.firstChild===moveThree;moveA.insertBefore(moveOne,moveTwo);const crossInsertOk=moveB.childNodes.length===0&&moveA.childNodes.length===3&&moveA.childNodes[0]===moveThree&&moveA.childNodes[1]===moveOne&&moveA.childNodes[2]===moveTwo;const preinsertOk=crossAppendOk&&reorderOk&&invalidInsertThrew&&invalidInsertPreserved&&crossInsertOk;"
-        "const platformOk=streamOk&&streamStateOk&&storageOk&&localStorage.length===1&&capabilitiesOk&&mutationShapeOk&&xhrShapeOk&&cssomNameOk&&encodingOk&&base64Ok&&abortOk&&headersOk&&templateOk&&domParserOk&&createdDocumentOk&&preinsertOk&&positionOk&&nodeListOk&&randomBytes.some(value=>value!==0)&&crypto.randomUUID().length===36&&svg.namespaceURI.includes('svg')&&perfOk&&blobOk&&interfaceOk&&top===window&&parent===window;"
+        "const platformOk=streamOk&&streamStateOk&&storageOk&&localStorage.length===1&&capabilitiesOk&&mutationShapeOk&&xhrShapeOk&&cssomNameOk&&encodingOk&&base64Ok&&abortOk&&headersOk&&templateOk&&domParserOk&&createdDocumentOk&&preinsertOk&&positionOk&&nodeListOk&&randomBytes.some(value=>value!==0)&&crypto.randomUUID().length===36&&svg.namespaceURI.includes('svg')&&perfOk&&blobOk&&blobURLUUID&&interfaceOk&&top===window&&parent===window;"
         "const url=new URL('../next?q=one+two#part','https://example.test/a/b');url.searchParams.set('extra','yes');"
         "const recordParams=new URLSearchParams({conversationState:'{\\\"messages\\\":[]}',count:0});const sequenceParams=new URLSearchParams([['first','one'],['first','two']]);"
         "const malformedParams=new URLSearchParams('bad=%E0%A4%A&literal=%&plus=a+b'),lone=String.fromCharCode(0xd800),loneParams=new URLSearchParams([[lone,lone]]),valueParams=new URLSearchParams('a=1&a=2&a=1'),liveParams=new URLSearchParams('first=1&second=2'),liveKeys=liveParams.keys(),liveFirst=liveKeys.next().value;liveParams.append('third','3');const liveRest=[...liveKeys].join(','),stableURL=new URL('https://example.test/old?a=1'),stableParams=stableURL.searchParams,directURL=new URL('https://example.test/path?old=1'),directParams=directURL.searchParams,componentURL=new URL('https://old.test:444/a?x=1#old'),componentParams=componentURL.searchParams;valueParams.delete('a','1');stableURL.href='https://example.test/new?b=2';directURL.search='?new=two words#part';componentURL.pathname='next path?literal';componentURL.hash='new hash';componentURL.hostname='Example.TEST';componentURL.port='443';componentURL.host='other.test:8443';componentURL.protocol='http';const componentHref=componentURL.href;componentURL.host='bad host';componentURL.port='99999';const urlOk=url.pathname==='/next'&&url.searchParams.get('q')==='one two'&&url.search.includes('extra=yes')&&String(new URL('.',url))==='https://example.test/'&&recordParams.toString()==='conversationState=%7B%22messages%22%3A%5B%5D%7D&count=0'&&sequenceParams.getAll('first').join(',')==='one,two'&&malformedParams.get('bad')==='�%A'&&malformedParams.get('literal')==='%'&&malformedParams.get('plus')==='a b'&&loneParams.toString()==='%EF%BF%BD=%EF%BF%BD'&&valueParams.getAll('a').join(',')==='2'&&!valueParams.has('a','1')&&valueParams.has('a','2')&&liveFirst==='first'&&liveRest==='second,third'&&stableURL.searchParams===stableParams&&stableParams.get('a')===null&&stableParams.get('b')==='2'&&directURL.searchParams===directParams&&directURL.search==='?new=two%20words%23part'&&directParams.get('old')===null&&directParams.get('new')==='two words#part'&&directURL.href==='https://example.test/path?new=two%20words%23part'&&componentURL.searchParams===componentParams&&componentParams.get('x')==='1'&&componentHref==='http://other.test:8443/next%20path%3Fliteral?x=1#new%20hash'&&componentURL.href===componentHref;"
@@ -2970,27 +2986,40 @@
     CHECK(worker_lifecycle_runtime != NULL
           && script_runtime_evaluate_diagnostic(
               worker_lifecycle_runtime,
-              "(()=>{pocSummary='pending';const source=\"const xhr=new "
-              "XMLHttpRequest;let relative=false;try{xhr.open('GET','child')}"
-              "catch(error){relative=error&&error.name==='SyntaxError'}xhr."
-              "responseType='document';postMessage([relative,xhr.responseType,"
-              "xhr instanceof XMLHttpRequest,Object.getPrototypeOf(XMLHttpRequest)"
-              "===Function.prototype]"
-              ".join(':'))\",url=URL.createObjectURL(new Blob([source])),worker="
+              "(()=>{pocSummary='pending';const source=\"const descriptorOk="
+              "(holder,name,value)=>{const d=Object.getOwnPropertyDescriptor("
+              "holder,name);return !!d&&d.value===value&&d.enumerable&&!d."
+              "writable&&!d.configurable},xhrConstants=[['UNSENT',0],['OPENED',"
+              "1],['HEADERS_RECEIVED',2],['LOADING',3],['DONE',4]],readerConstants"
+              "=[['EMPTY',0],['LOADING',1],['DONE',2]],xhr=new XMLHttpRequest;"
+              "let relative=false;try{xhr.open('GET','child')}catch(error){"
+              "relative=error&&error.name==='SyntaxError'}xhr.responseType="
+              "'document';const constants=xhrConstants.every(([name,value])=>"
+              "descriptorOk(XMLHttpRequest,name,value)&&descriptorOk("
+              "XMLHttpRequest.prototype,name,value))&&readerConstants.every("
+              "([name,value])=>descriptorOk(FileReader,name,value)&&descriptorOk("
+              "FileReader.prototype,name,value)),reader=new FileReader;reader."
+              "onloadend=()=>postMessage([relative,xhr.responseType,xhr instanceof"
+              " XMLHttpRequest,Object.getPrototypeOf(XMLHttpRequest)===Function."
+              "prototype,constants,reader.readyState===FileReader.DONE,reader."
+              "result==='ok'].join(':'));reader.readAsText(new Blob(['ok']))\","
+              "url=URL.createObjectURL(new Blob([source])),worker="
               "new Worker(url);worker.onmessage=event=>{pocSummary=event.data;"
               "worker.terminate();URL.revokeObjectURL(url)}})()",
               "<worker-xhr-semantics>", &worker_lifecycle_result));
-    for (size_t worker_turn = 0; worker_turn < 8; worker_turn++) {
+    for (size_t worker_turn = 0; worker_turn < 16; worker_turn++) {
         CHECK(script_runtime_advance(
             worker_lifecycle_runtime, worker_turn, 16,
             &worker_lifecycle_result));
     }
-    if (strcmp(worker_lifecycle_result.summary, "true::true:true") != 0) {
+    if (strcmp(worker_lifecycle_result.summary,
+               "true::true:true:true:true:true") != 0) {
         fprintf(stderr, "worker XHR semantics summary=%s error=%s\n",
                 worker_lifecycle_result.summary,
                 worker_lifecycle_result.error);
     }
-    CHECK(strcmp(worker_lifecycle_result.summary, "true::true:true") == 0);
+    CHECK(strcmp(worker_lifecycle_result.summary,
+                 "true::true:true:true:true:true") == 0);
     script_runtime_destroy(worker_lifecycle_runtime);
     document_destroy(&worker_lifecycle_document);
     CHECK(budget.current == 0);
@@ -3030,6 +3059,47 @@
     }
     CHECK(strcmp(worker_local_error_result.summary,
                  "local-boom:true:0:0:true:local-boom") == 0);
+    script_runtime_destroy(worker_local_error_runtime);
+    document_destroy(&worker_local_error_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker message-listener errors stay in the Worker realm");
+    CHECK(document_parse(
+        &worker_local_error_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    memset(&worker_local_error_result, 0, sizeof(worker_local_error_result));
+    worker_local_error_runtime = script_runtime_create_deferred(
+        &worker_local_error_document, &budget, 4 * MIB, 1000,
+        "https://worker-message-error.test/", NULL,
+        &worker_local_error_result);
+    CHECK(worker_local_error_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_local_error_runtime,
+              "(()=>{pocSummary='pending';let windowErrors=0;"
+              "globalThis.onerror=()=>{windowErrors++;return true};const source="
+              "`self.onerror=(message,filename,line,column,error)=>{postMessage("
+              "['scope',message,error instanceof Error,error&&error.message]."
+              "join(':'));return true};onmessage=()=>{throw new Error("
+              "'message-boom')}`;const url=URL.createObjectURL(new Blob([source])),"
+              "worker=new Worker(url);worker.onerror=()=>{pocSummary="
+              "'OWNER-ERROR'};worker.onmessage=event=>{pocSummary=event.data+':'"
+              "+windowErrors;worker.terminate();URL.revokeObjectURL(url)};"
+              "worker.postMessage('go')})()",
+              "<worker-message-error>", &worker_local_error_result));
+    for (size_t message_error_turn = 0; message_error_turn < 12;
+         message_error_turn++) {
+        CHECK(script_runtime_advance(
+            worker_local_error_runtime, message_error_turn, 16,
+            &worker_local_error_result));
+    }
+    if (strcmp(worker_local_error_result.summary,
+               "scope:message-boom:true:message-boom:0") != 0) {
+        fprintf(stderr, "worker message error summary=%s error=%s\n",
+                worker_local_error_result.summary,
+                worker_local_error_result.error);
+    }
+    CHECK(strcmp(worker_local_error_result.summary,
+                 "scope:message-boom:true:message-boom:0") == 0);
     script_runtime_destroy(worker_local_error_runtime);
     document_destroy(&worker_local_error_document);
     CHECK(budget.current == 0);
@@ -3508,6 +3578,141 @@
     document_destroy(&worker_isolation_document);
     CHECK(budget.current == 0);
 
+    puts("test: Worker encoding APIs use worker-realm buffer brands");
+    PocDocument worker_encoding_document;
+    CHECK(document_parse(
+        &worker_encoding_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_encoding_result = {0};
+    ScriptRuntime *worker_encoding_runtime = script_runtime_create_deferred(
+        &worker_encoding_document, &budget, 4 * MIB, 1000,
+        "https://worker-encoding.test/", NULL, &worker_encoding_result);
+    CHECK(worker_encoding_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_encoding_runtime,
+              "(()=>{pocSummary='pending';const source=\"let encoded=false,"
+              "decoded='',into='',streamed='',direct='';try{const encoder=new TextEncoder(),bytes="
+              "encoder.encode('A');encoded=bytes instanceof Uint8Array&&bytes"
+              "[0]===65;const target=new Uint8Array(1),result=encoder.encodeInto"
+              "('A',target);into=[result.read,result.written,target[0]].join(',');"
+              "encoder.encode=()=>{throw new Error('must not call encode')};"
+              "const zero=encoder.encodeInto('A'.repeat(262145),new Uint8Array(0)),"
+              "astralTarget=new Uint8Array(4),astral=encoder.encodeInto("
+              "String.fromCodePoint(0x1f600),astralTarget);direct=[zero.read,"
+              "zero.written,astral.read,astral.written,Array.from(astralTarget)."
+              "join('.')].join(',');"
+              "decoded=new TextDecoder().decode(new Uint8Array([65]).buffer);"
+              "const streaming=new TextDecoder(),first=streaming.decode(new "
+              "Uint8Array([226]),{stream:true}),middle=streaming.decode(undefined,"
+              "{stream:true}),last=streaming.decode(new Uint8Array([130,172]));"
+              "streamed=first+middle+last}catch(error){decoded='error:'+error.name}"
+              "new Blob([new Uint8Array([65]).buffer]).text().then(blobText=>{"
+              "postMessage([encoded,decoded,into,streamed,blobText,direct].join(':'));"
+              "close()})\",url=URL.createObjectURL(new "
+              "Blob([source])),worker=new Worker(url);worker.onmessage=event=>{"
+              "pocSummary=event.data;worker.terminate();URL.revokeObjectURL(url)}})()",
+              "<worker-encoding-brands>", &worker_encoding_result));
+    for (size_t worker_turn = 0; worker_turn < 6; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_encoding_runtime, worker_turn, 8,
+            &worker_encoding_result));
+    }
+    if (strcmp(worker_encoding_result.summary,
+               "true:A:1,1,65:€:A:0,0,2,4,240.159.152.128") != 0) {
+        fprintf(stderr, "worker encoding summary=%s error=%s\n",
+                worker_encoding_result.summary, worker_encoding_result.error);
+    }
+    CHECK(strcmp(worker_encoding_result.summary,
+                 "true:A:1,1,65:€:A:0,0,2,4,240.159.152.128") == 0);
+    script_runtime_destroy(worker_encoding_runtime);
+    document_destroy(&worker_encoding_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker fetch body APIs return worker-realm values");
+    PocDocument worker_fetch_realm_document;
+    CHECK(document_parse(
+        &worker_fetch_realm_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_fetch_realm_result = {0};
+    ScriptRuntime *worker_fetch_realm_runtime = script_runtime_create_deferred(
+        &worker_fetch_realm_document, &budget, 4 * MIB, 1000,
+        "https://worker-fetch-realm.test/", NULL,
+        &worker_fetch_realm_result);
+    CHECK(worker_fetch_realm_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_fetch_realm_runtime,
+              "(()=>{pocSummary='pending';const source=\"(async()=>{const "
+              "response=new Response('{\\\"record\\\":{}}'),jsonPending="
+              "response.json(),json=await jsonPending,pair=new Headers({x:'y'})"
+              ".entries().next().value,bufferPending=new Response(new Uint8Array"
+              "([65])).arrayBuffer(),buffer=await bufferPending,request=new Request"
+              "('https://worker-fetch-realm.test/',{method:'POST',body:'{}'}),"
+              "requestPending=request.json(),requestJson=await requestPending;"
+              "postMessage([jsonPending instanceof Promise,json instanceof Object,"
+              "json.record instanceof Object,pair instanceof Array,bufferPending "
+              "instanceof Promise,buffer instanceof ArrayBuffer,new Uint8Array"
+              "(buffer)[0]===65,requestPending instanceof Promise,requestJson "
+              "instanceof Object].join(':'));close()})().catch(error=>postMessage"
+              "('error:'+error.name+':'+error.message))\",url=URL.createObjectURL"
+              "(new Blob([source])),worker=new Worker(url);worker.onmessage=event=>{"
+              "pocSummary=event.data;worker.terminate();URL.revokeObjectURL(url)}})()",
+              "<worker-fetch-realm-values>", &worker_fetch_realm_result));
+    for (size_t worker_turn = 0; worker_turn < 8; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_fetch_realm_runtime, worker_turn, 8,
+            &worker_fetch_realm_result));
+    }
+    const char *worker_fetch_realm_expected =
+        "true:true:true:true:true:true:true:true:true";
+    if (strcmp(worker_fetch_realm_result.summary,
+               worker_fetch_realm_expected) != 0) {
+        fprintf(stderr, "worker fetch realm summary=%s error=%s\n",
+                worker_fetch_realm_result.summary,
+                worker_fetch_realm_result.error);
+    }
+    CHECK(strcmp(worker_fetch_realm_result.summary,
+                 worker_fetch_realm_expected) == 0);
+    script_runtime_destroy(worker_fetch_realm_runtime);
+    document_destroy(&worker_fetch_realm_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker messages use the messaging task source");
+    PocDocument worker_message_task_document;
+    CHECK(document_parse(
+        &worker_message_task_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_message_task_result = {0};
+    ScriptRuntime *worker_message_task_runtime = script_runtime_create_deferred(
+        &worker_message_task_document, &budget, 4 * MIB, 1000,
+        "https://worker-message-task.test/", NULL,
+        &worker_message_task_result);
+    CHECK(worker_message_task_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_message_task_runtime,
+              "(()=>{pocSummary='pending';const source=\"postMessage('ready');"
+              "onmessage=()=>postMessage('echo')\",url=URL.createObjectURL(new "
+              "Blob([source])),worker=new Worker(url),order=[],finish=()=>{if("
+              "order.length!==2)return;pocSummary=order.join(',');worker.terminate();"
+              "URL.revokeObjectURL(url)};worker.onmessage=event=>{if(event.data==="
+              "'ready'){let depth=0;const nest=()=>{if(depth++<7){setTimeout(nest,"
+              "0);return}setTimeout(()=>{order.push('timer');finish()},0);worker."
+              "postMessage('go')};nest();return}order.push('message');finish()}})()",
+              "<worker-message-task-source>", &worker_message_task_result));
+    for (size_t worker_turn = 0; worker_turn < 24; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_message_task_runtime, worker_turn, 8,
+            &worker_message_task_result));
+    }
+    if (strcmp(worker_message_task_result.summary, "message,timer") != 0) {
+        fprintf(stderr, "worker message task summary=%s error=%s\n",
+                worker_message_task_result.summary,
+                worker_message_task_result.error);
+    }
+    CHECK(strcmp(worker_message_task_result.summary, "message,timer") == 0);
+    script_runtime_destroy(worker_message_task_runtime);
+    document_destroy(&worker_message_task_document);
+    CHECK(budget.current == 0);
+
     puts("test: Worker structured clone creates own data properties");
     PocDocument worker_clone_property_document;
     CHECK(document_parse(
@@ -3740,12 +3945,14 @@
               "try{new SubtleCrypto}catch(e){if(e instanceof TypeError)constructors++}"
               "try{Crypto.prototype.getRandomValues.call({},new Uint8Array(1))}"
               "catch(e){if(e instanceof TypeError)illegal++}"
-              "try{SubtleCrypto.prototype.digest.call({},'SHA-256',new Uint8Array())}"
-              "catch(e){if(e instanceof TypeError)illegal++}"
+              "const illegalPromise=SubtleCrypto.prototype.digest.call({},'SHA-256',"
+              "new Uint8Array());let digestRejected=false;illegalPromise.then(()=>{},"
+              "error=>{digestRejected=error instanceof TypeError});"
               "const ownerOk=crypto instanceof Crypto&&crypto.subtle instanceof SubtleCrypto"
               "&&Object.prototype.toString.call(crypto)==='[object Crypto]'"
               "&&Object.prototype.toString.call(crypto.subtle)==='[object SubtleCrypto]'"
-              "&&constructors===2&&illegal===2;crypto.ownerOnly=1;const source=\""
+              "&&constructors===2&&illegal===1&&illegalPromise instanceof Promise;"
+              "crypto.ownerOnly=1;const source=\""
               "const bytes=new Uint8Array(4);crypto.getRandomValues(bytes);"
               "const raw=new ArrayBuffer(6),all=new Uint8Array(raw);"
               "all.set([1,2,3,4,5,6]);Promise.all(["
@@ -3768,6 +3975,7 @@
               "error.name+'-'+String(error.message)))\","
               "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
               "worker.onmessage=e=>{delete crypto.ownerOnly;pocSummary=ownerOk&&"
+              "digestRejected&&"
               "e.data==='11111111111'?'WORKER-CRYPTO-OK':'WORKER-CRYPTO-BAD-'+"
               "String(e.data);worker.terminate();"
               "URL.revokeObjectURL(url)}})()",
@@ -4475,6 +4683,53 @@
     document_destroy(&worker_performance_document);
     CHECK(budget.current == 0);
 
+    puts("test: native MessagePort delivery checkpoints between listeners");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 4 * MIB, 1000,
+        "https://message-port-checkpoints.test/", NULL,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';const channel=new MessageChannel,"
+              "order=[];channel.port1.addEventListener('message',event=>{"
+              "order.push('first-'+event.data);Promise.resolve().then(()=>"
+              "order.push('micro-'+event.data))});channel.port1.addEventListener("
+              "'message',event=>{order.push('second-'+event.data);if(event.data"
+              "===2){const nativeOrder=order.join(',');let synchronous=[];const "
+              "target=new EventTarget;target.addEventListener('probe',()=>{"
+              "synchronous.push('listener');Promise.resolve().then(()=>"
+              "synchronous.push('micro'))});target.dispatchEvent(new Event("
+              "'probe'));synchronous.push('after');pocSummary=nativeOrder==="
+              "'first-1,micro-1,second-1,first-2,micro-2,second-2'&&"
+              "synchronous.join(',')==='listener,after'?"
+              "'MESSAGE-PORT-CHECKPOINTS-OK':'MESSAGE-PORT-CHECKPOINTS-BAD:'"
+              "+nativeOrder+':'+synchronous.join(',');channel.port1.close();"
+              "channel.port2.close()}});channel.port1.start();channel.port2."
+              "postMessage(1);channel.port2.postMessage(2)})()",
+              "<message-port-checkpoints>", &worker_performance_result));
+    for (size_t message_turn = 0; message_turn < 16; message_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, message_turn, 16,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary,
+               "MESSAGE-PORT-CHECKPOINTS-OK") != 0) {
+        fprintf(stderr, "message port checkpoints summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "MESSAGE-PORT-CHECKPOINTS-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    CHECK(budget.current == 0);
+
     puts("test: MessagePort transfer preserves FIFO and resets queue state");
     CHECK(document_parse(
         &worker_performance_document, &budget, worker_lifecycle_page,
@@ -4746,40 +5001,72 @@
           && script_runtime_evaluate_diagnostic(
               worker_performance_runtime,
               "(()=>{pocSummary='pending';const sentinel=new Error('sentinel'),"
-              "order=[];let threw=false,bad;try{bad=navigator.permissions.query("
-              "{get name(){throw sentinel}})}catch(error){threw=error===sentinel}"
-              "const badResult=threw?Promise.resolve(false):bad.then(()=>false,"
-              "error=>error===sentinel),first=navigator.permissions.query("
-              "{name:'geolocation'}),second=navigator.permissions.query("
-              "{name:'geolocation'});first.then(()=>order.push('permission'));"
+              "order=[],descriptor={name:'geolocation'};let getterRan=false,"
+              "threw=false,bad;try{bad=navigator.permissions.query({get name(){"
+              "getterRan=true;throw sentinel}})}catch(_){threw=true}const badResult="
+              "threw?Promise.resolve(false):bad.then(()=>false,error=>error==="
+              "sentinel);let primitiveGetterRan=false,primitive;Object."
+              "defineProperty(String.prototype,'name',{configurable:true,get(){"
+              "primitiveGetterRan=true;return 'geolocation'}});try{primitive="
+              "navigator.permissions.query('geolocation').then(()=>false,error=>"
+              "error instanceof TypeError)}finally{delete String.prototype.name};"
+              "let statusBrand=false,networkBrand=false;try{Object."
+              "getOwnPropertyDescriptor(PermissionStatus.prototype,'state').get."
+              "call({})}catch(error){statusBrand=error instanceof TypeError}try{"
+              "Object.getOwnPropertyDescriptor(NetworkInformation.prototype,'type')"
+              ".get.call({})}catch(error){networkBrand=error instanceof TypeError}"
+              "const first=navigator.permissions.query(descriptor);descriptor."
+              "name='camera';const second=navigator.permissions.query({name:"
+              "'geolocation'}),brand=Permissions.prototype.query.call("
+              "Object.create(Permissions.prototype),"
+              "{name:'geolocation'}).then(()=>false,error=>error instanceof "
+              "TypeError);first.then(()=>order.push('permission'));queueMicrotask("
+              "()=>order.push('micro'));Promise.all([first,second,badResult,brand,"
+              "primitive])"
+              ".then(values=>{const topOk=!threw&&getterRan&&!primitiveGetterRan&&"
+              "values[2]&&values[3]&&values[4]&&"
+              "values[0]!==values[1]&&values[0] instanceof PermissionStatus&&"
+              "values[1] instanceof PermissionStatus&&values[0].name==="
+              "'geolocation'&&values[1].name==='geolocation'&&"
+              "Object.getOwnPropertyNames(values[0]).length===0&&statusBrand&&"
+              "networkBrand&&Object.getOwnPropertyNames(navigator.connection)."
+              "length===0&&values[0].state==='denied'&&order.join(',')==="
+              "'micro,permission';const source=\"const sentinel=new Error("
+              "'worker-sentinel'),order=[],descriptor={name:'geolocation'};let "
+              "getterRan=false,threw=false,bad;try{bad=navigator.permissions."
+              "query({get name(){getterRan=true;throw sentinel}})}catch(_){threw="
+              "true}const badResult=threw?Promise.resolve(false):bad.then(()=>"
+              "false,error=>error===sentinel),first=navigator.permissions.query("
+              "descriptor);descriptor.name='camera';const second=navigator."
+              "permissions.query({name:'geolocation'}),brand=Permissions.prototype."
+              "query.call({}, {name:'geolocation'}).then(()=>false,error=>error "
+              "&&error.name==='TypeError');let statusBrand=false,networkBrand=false;"
+              "try{Object.getOwnPropertyDescriptor(PermissionStatus.prototype,'state')"
+              ".get.call({})}catch(error){statusBrand=error?.name==='TypeError'}try{"
+              "Object.getOwnPropertyDescriptor(NetworkInformation.prototype,'type')"
+              ".get.call({})}catch(error){networkBrand=error?.name==='TypeError'}"
+              "first.then(()=>order.push('permission'));"
               "queueMicrotask(()=>order.push('micro'));Promise.all([first,second,"
-              "badResult]).then(values=>{const topOk=!threw&&values[2]&&"
-              "values[0]!==values[1]&&values[0] instanceof PermissionStatus&&"
-              "values[1] instanceof PermissionStatus&&values[0].name==="
-              "'geolocation'&&values[0].state==='denied'&&order.join(',')==="
-              "'micro,permission';let brand=false;try{Permissions.prototype.query."
-              "call({}, {name:'geolocation'})}catch(error){brand=error instanceof "
-              "TypeError}const source=\"const sentinel=new Error('worker-"
-              "sentinel'),order=[];let threw=false,bad;try{bad=navigator."
-              "permissions.query({get name(){throw sentinel}})}catch(error){"
-              "threw=error===sentinel}const badResult=threw?Promise.resolve("
-              "false):bad.then(()=>false,error=>error===sentinel),first="
-              "navigator.permissions.query({name:'geolocation'}),second="
-              "navigator.permissions.query({name:'geolocation'});first.then("
-              "()=>order.push('permission'));queueMicrotask(()=>order.push("
-              "'micro'));Promise.all([first,second,badResult]).then(values=>"
-              "postMessage({ok:!threw&&values[2]&&first instanceof Promise&&"
-              "values[0]!==values[1]&&values[0] instanceof PermissionStatus&&"
-              "values[1] instanceof PermissionStatus&&values[0].name==="
-              "'geolocation'&&values[0].state==='denied'&&order.join(',')==="
-              "'micro,permission',permissionsRealm:Object.getPrototypeOf("
-              "Permissions)===Function.prototype,statusRealm:Object."
-              "getPrototypeOf(PermissionStatus)===Function.prototype}))\",url="
-              "URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
-              "worker.onmessage=event=>{pocSummary=topOk&&brand&&event.data.ok&&"
-              "event.data.permissionsRealm&&event.data.statusRealm?"
+              "badResult,brand]).then(values=>postMessage({ok:!threw&&getterRan&&"
+              "values[2]&&values[3]&&first instanceof Promise&&values[0]!=="
+              "values[1]&&values[0] instanceof PermissionStatus&&values[1] "
+              "instanceof PermissionStatus&&values[0].name==='geolocation'&&"
+              "values[1].name==='geolocation'&&Object."
+              "getOwnPropertyNames(values[0]).length===0&&statusBrand&&networkBrand&&"
+              "Object.getOwnPropertyNames(navigator.connection).length===0&&"
+              "values[0].state==='denied'&&order.join(',')==='micro,permission',"
+              "threw,getterRan,bad:values[2],brand:values[3],firstPromise:first "
+              "instanceof Promise,distinct:values[0]!==values[1],firstStatus:"
+              "values[0] instanceof PermissionStatus,secondStatus:values[1] "
+              "instanceof PermissionStatus,name:values[0].name,state:values[0]."
+              "state,order:order.join(','),"
+              "permissionsRealm:Object.getPrototypeOf(Permissions)===Function."
+              "prototype,statusRealm:Object.getPrototypeOf(PermissionStatus)==="
+              "Function.prototype}))\",url=URL.createObjectURL(new Blob([source])),"
+              "worker=new Worker(url);worker.onmessage=event=>{pocSummary=topOk&&"
+              "event.data.ok&&event.data.permissionsRealm&&event.data.statusRealm?"
               "'PERMISSIONS-QUERY-OK':'PERMISSIONS-QUERY-BAD:'+JSON.stringify("
-              "{topOk,brand,worker:event.data,order,threw});worker.terminate();"
+              "{topOk,worker:event.data,order,threw,getterRan});worker.terminate();"
               "URL.revokeObjectURL(url)}})})()",
               "<permissions-query-semantics>", &worker_performance_result));
     for (size_t worker_turn = 0; worker_turn < 16; worker_turn++) {
@@ -4815,16 +5102,23 @@
           && script_runtime_evaluate_diagnostic(
               worker_performance_runtime,
               "(()=>{pocSummary='pending';const order=[],first=navigator.storage."
-              "estimate(),second=navigator.storage.estimate();first.then(()=>"
+              "estimate(),second=navigator.storage.estimate(),brand=StorageManager."
+              "prototype.estimate.call({}).then(()=>false,error=>error instanceof "
+              "TypeError),forgedBrand=StorageManager.prototype.estimate.call(Object."
+              "create(StorageManager.prototype)).then(()=>false,error=>error "
+              "instanceof TypeError),keyboardBrand=Keyboard.prototype.getLayoutMap."
+              "call(Object.create(Keyboard.prototype)).then(()=>false,error=>error "
+              "instanceof TypeError),clipboardBrand=Clipboard.prototype.readText."
+              "call(Object.create(Clipboard.prototype)).then(()=>false,error=>error "
+              "instanceof TypeError);first.then(()=>"
               "order.push('storage'));queueMicrotask(()=>order.push('micro'));"
               "Promise.all([first,second,navigator.storage.persisted(),navigator."
-              "storage.persist()]).then(values=>{const topOk=first instanceof "
+              "storage.persist(),brand,forgedBrand,keyboardBrand,clipboardBrand]).then(values=>{const topOk=first instanceof "
               "Promise&&values[0]!==values[1]&&Object.getPrototypeOf(values[0])"
               "===Object.prototype&&Number.isFinite(values[0].usage)&&Number."
               "isFinite(values[0].quota)&&values[0].quota>=values[0].usage&&"
               "values[2]===false&&values[3]===false&&order.join(',')==='micro,"
-              "storage';let brand=false;try{StorageManager.prototype.estimate."
-              "call({})}catch(error){brand=error instanceof TypeError}const source="
+              "storage'&&values[4]&&values[5]&&values[6]&&values[7];const source="
               "\"const order=[],first=navigator.storage.estimate(),second="
               "navigator.storage.estimate();first.then(()=>order.push('storage'))"
               ";queueMicrotask(()=>order.push('micro'));Promise.all([first,second,"
@@ -4842,9 +5136,9 @@
               "realm:Object."
               "getPrototypeOf(StorageManager)===Function.prototype}))\",url=URL."
               "createObjectURL(new Blob([source])),worker=new Worker(url);worker."
-              "onmessage=event=>{pocSummary=topOk&&brand&&event.data.ok&&event.data."
+              "onmessage=event=>{pocSummary=topOk&&event.data.ok&&event.data."
               "realm?'STORAGE-MANAGER-OK':'STORAGE-MANAGER-BAD:'+JSON.stringify({"
-              "topOk,brand,worker:event.data,order});worker.terminate();URL."
+              "topOk,worker:event.data,order});worker.terminate();URL."
               "revokeObjectURL(url)}})})()",
               "<storage-manager-semantics>", &worker_performance_result));
     for (size_t worker_turn = 0; worker_turn < 16; worker_turn++) {
@@ -4860,6 +5154,406 @@
     }
     CHECK(strcmp(worker_performance_result.summary,
                  "STORAGE-MANAGER-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    puts("test: bounded OPFS is coherent across window and Worker realms");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 6 * MIB, 1000,
+        "https://opfs.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';(async()=>{const savedNavigator=navigator,"
+              "savedStorage=savedNavigator.storage,clientGetter=Object."
+              "getOwnPropertyDescriptor(globalThis,'clientInformation').get;let "
+              "poisonReads=0;Object.defineProperty(globalThis,'navigator',{"
+              "configurable:true,enumerable:true,get(){poisonReads++;throw Error("
+              "'navigator poison')}});const clientStable=clientGetter.call("
+              "globalThis)===savedNavigator,rootPromise=StorageManager.prototype."
+              "getDirectory.call(savedStorage);Object.defineProperty(globalThis,"
+              "'navigator',{configurable:true,enumerable:true,writable:false,value:"
+              "savedNavigator});const root=await rootPromise,invalidPromise=root."
+              "getFileHandle('/');let "
+              "invalidName=false;try{await invalidPromise}catch(error){invalidName="
+              "invalidPromise instanceof Promise&&error instanceof TypeError}let "
+              "badReceiverPromise,badReceiverSync=false;try{badReceiverPromise="
+              "FileSystemDirectoryHandle.prototype.getFileHandle.call({},'x')}catch"
+              "(error){badReceiverSync=true}const badReceiverRejected=!"
+              "badReceiverSync&&badReceiverPromise instanceof Promise&&await "
+              "badReceiverPromise.then(()=>false,error=>error instanceof TypeError),"
+              "symbolRejected=await root.getFileHandle(Symbol()).then(()=>false,"
+              "error=>error instanceof TypeError);const "
+              "dir=await root.getDirectoryHandle('save',"
+              "{create:true}),file=await dir.getFileHandle('state.txt',{create:"
+              "true}),writer=await file.createWritable();await writer.write('abc')"
+              ";await writer.close();const snapshot=await file.getFile(),entries="
+              "[];for await(const pair of dir)entries.push(pair[0]+':'+pair[1]."
+              "kind);const ordered=await dir.getFileHandle('ordered.bin',{create:"
+              "true}),orderedWriter=await ordered.createWritable(),seek=orderedWriter."
+              "write({type:'seek',position:3}),write=orderedWriter.write('X');await "
+              "Promise.all([seek,write]);await orderedWriter.close();const orderedBytes="
+              "new Uint8Array(await(await ordered.getFile()).arrayBuffer()),blobFile="
+              "await dir.getFileHandle('blob.txt',{create:true}),blobWriter=await "
+              "blobFile.createWritable(),defaultWriter=blobWriter.getWriter();let "
+              "locked=false;try{await blobWriter.write('bad')}catch(error){locked="
+              "error instanceof TypeError}await defaultWriter.write(new Blob(['blob']))"
+              ";await defaultWriter.close();const malformedFile=await dir."
+              "getFileHandle('malformed.bin',{create:true}),malformedWriter=await "
+              "malformedFile.createWritable();let missingData=false;try{await "
+              "malformedWriter.write({type:'write'})}catch(error){missingData=error "
+              "instanceof TypeError}await malformedWriter.abort();const blobText=await "
+              "(await blobFile.getFile())"
+              ".text(),bridgeHidden=typeof globalThis.__tilefinchOpfsCommand==='undefined'"
+              ",source=\"(async()=>{const root=await navigator.storage."
+              "getDirectory(),dir=await root.getDirectoryHandle('save'),file=await"
+              " FileSystemDirectoryHandle.prototype.getFileHandle.call(dir,'state.txt')"
+              ",before=await(await FileSystemFileHandle.prototype.getFile.call(file))."
+              "text(),writer=await file.createWritable({keepExistingData:true});"
+              "await writer.seek(3);await writer.write(new Uint8Array([33]));await "
+              "writer.close();const locked=await file.createWritable({keepExistingData:"
+              "true}),stream=locked instanceof WritableStream,lock=locked.getWriter();"
+              "await lock.write({type:'seek',position:4});await lock.write(new Blob(['?']))"
+              ";await lock.close();const after=await(await file.getFile()).text();"
+              "postMessage({before,after,root:root instanceof "
+              "FileSystemDirectoryHandle,rootBase:root instanceof FileSystemHandle,"
+              "file:file instanceof FileSystemFileHandle,fileBase:file instanceof "
+              "FileSystemHandle,stream,promise:navigator.storage.getDirectory() "
+              "instanceof Promise,bridge:typeof globalThis.__tilefinchOpfsCommand})})()."
+              "catch(error=>postMessage({error:error.name+':'+error.message}))\","
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=async event=>{try{const current=await(await file."
+              "getFile()).text(),old=await snapshot.text(),aborted=await file."
+              "createWritable({keepExistingData:true});await aborted.truncate(1);"
+              "await aborted.abort();const afterAbort=await(await file.getFile())."
+              "text(),resolved=await root.resolve(file);pocSummary=!event.data.error"
+              "&&event.data.before==='abc'&&event.data.after==='abc!?'&&current==="
+              "'abc!?'&&old==='abc'&&afterAbort==='abc!?'&&event.data.root&&event."
+              "data.rootBase&&event.data.file&&event.data.fileBase&&event.data.stream&&"
+              "event.data.promise&&event.data.bridge==='undefined'&&bridgeHidden&&locked&&"
+              "clientStable&&poisonReads===0&&invalidName&&badReceiverRejected&&"
+              "symbolRejected&&missingData&&"
+              "blobText==='blob'&&orderedBytes.length===4&&orderedBytes[0]===0&&"
+              "orderedBytes[1]===0&&orderedBytes[2]===0&&orderedBytes[3]===88&&"
+              "entries.join(',')==='state.txt:file'"
+              "&&resolved.join('/')==='save/state.txt'&&Object.prototype.toString."
+              "call(root)==='[object FileSystemDirectoryHandle]'?'OPFS-OK':"
+              "'OPFS-BAD:'+JSON.stringify({worker:event.data,current,old,afterAbort,"
+              "entries,resolved});}catch(error){pocSummary='OPFS-ERROR:'+error.name"
+              "+':'+error.message}worker.terminate();URL.revokeObjectURL(url)}})()."
+              "catch(error=>{pocSummary='OPFS-ERROR:'+error.name+':'+error.message"
+              "})})()",
+              "<opfs-window-worker>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 64; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 32,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary, "OPFS-OK") != 0) {
+        fprintf(stderr, "OPFS summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary, "OPFS-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    puts("test: dedicated Worker exposes a bounded OPFS sync access handle");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 5 * MIB, 1000,
+        "https://opfs-sync.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';const source=\"(async()=>{const root="
+              "await navigator.storage.getDirectory(),file=await root."
+              "getFileHandle('sync.bin',{create:true}),handle=await file."
+              "createSyncAccessHandle();let invalidPromise,invalidSync=false;try{"
+              "invalidPromise=FileSystemFileHandle.prototype.createSyncAccessHandle."
+              "call({})}catch(error){invalidSync=true}const invalidRejected=!invalidSync"
+              "&&invalidPromise instanceof Promise&&await invalidPromise.then(()=>false,"
+              "error=>error&&error.name==='TypeError'),input=new Uint8Array([7,8,9]),options="
+              "Object.create({at:1});options.unused=()=>0;let locked="
+              "false;try{await file.createWritable()}catch(error){locked=error.name"
+              "==='NoModificationAllowedError'}const first=handle.write(input."
+              "subarray(0,1)),written=first+handle.write(input.subarray(1)),size="
+              "handle.getSize(),output=new Uint8Array(2),read=handle.read(output,"
+              "options);handle.truncate(2);handle.flush();handle.close();handle.close();"
+              "postMessage({written,size,read,bytes:Array.from(output),locked,tag:"
+              "Object.prototype.toString.call(handle),ctor:handle instanceof "
+              "FileSystemSyncAccessHandle,invalidRejected})})().catch(error=>postMessage"
+              "({error:error.name+':'+error.message}))\",url=URL.createObjectURL(new Blob(["
+              "source])),worker=new Worker(url);worker.onmessage=async event=>{try{"
+              "const root=await navigator.storage.getDirectory(),file=await root."
+              "getFileHandle('sync.bin'),bytes=new Uint8Array(await(await file."
+              "getFile()).arrayBuffer()),writer=await file.createWritable();await "
+              "writer.close();const data=event.data;pocSummary=!data.error&&data."
+              "written===3&&data.size===3&&data.read===2&&data.bytes.join(',')==='8,9'"
+              "&&data.locked&&data.ctor&&data.invalidRejected&&data.tag==='[object "
+              "FileSystemSyncAccessHandle]'&&bytes.length===2&&bytes[0]===7&&bytes[1]"
+              "===8?'OPFS-SYNC-OK':'OPFS-SYNC-BAD:'+JSON.stringify({data,bytes:Array."
+              "from(bytes)});worker.terminate();URL.revokeObjectURL(url)}catch(error){"
+              "pocSummary='OPFS-SYNC-ERROR:'+error.name+':'+error.message}}})()",
+              "<opfs-worker-sync-access>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 64; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 32,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary,
+               "OPFS-SYNC-OK") != 0) {
+        fprintf(stderr, "OPFS sync summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-SYNC-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    puts("test: terminating a Worker releases its active OPFS writer");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 5 * MIB, 1000,
+        "https://opfs-terminate.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';const source=\"(async()=>{const root="
+              "await navigator.storage.getDirectory(),file=await root."
+              "getFileHandle('held.bin',{create:true});globalThis.held=await "
+              "file.createWritable();postMessage('held')})().catch(error=>"
+              "postMessage(error.name+':'+error.message))\",url=URL."
+              "createObjectURL(new Blob([source])),worker=new Worker(url);worker."
+              "onmessage=event=>{if(event.data!=='held'){pocSummary='OPFS-"
+              "TERMINATE-ERROR:'+event.data;return}worker.terminate();setTimeout("
+              "async()=>{try{const root=await navigator.storage.getDirectory(),"
+              "file=await root.getFileHandle('held.bin'),writer=await file."
+              "createWritable();await writer.write('released');await writer."
+              "close();pocSummary=await(await file.getFile()).text()==='released'"
+              "?'OPFS-TERMINATE-OK':'OPFS-TERMINATE-BAD'}catch(error){pocSummary="
+              "'OPFS-TERMINATE-ERROR:'+error.name+':'+error.message}URL."
+              "revokeObjectURL(url)},0)}})()",
+              "<opfs-worker-termination>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 64; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 32,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary,
+               "OPFS-TERMINATE-OK") != 0) {
+        fprintf(stderr, "OPFS termination summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-TERMINATE-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    puts("test: terminating a Worker cancels a pending OPFS acquisition");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 5 * MIB, 1000,
+        "https://opfs-pending.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(async()=>{pocSummary='pending';const root=await navigator.storage."
+              "getDirectory(),file=await root.getFileHandle('pending.bin',{create:"
+              "true}),prototype=FileSystemFileHandle.prototype,original=prototype."
+              "createSyncAccessHandle;prototype.createSyncAccessHandle=function(){"
+              "const receiver=this;return new Promise((resolve,reject)=>setTimeout("
+              "()=>original.call(receiver).then(resolve,reject),0))};const source="
+              "\"(async()=>{const root=await navigator.storage.getDirectory(),file="
+              "await root.getFileHandle('pending.bin');postMessage('kill');file."
+              "createSyncAccessHandle().then(handle=>handle.close(),()=>{})})()."
+              "catch(error=>postMessage(error.name+':'+error.message))\",url=URL."
+              "createObjectURL(new Blob([source])),worker=new Worker(url);worker."
+              "onmessage=event=>{if(event.data!=='kill'){pocSummary='OPFS-PENDING-"
+              "ERROR:'+event.data;return}worker.terminate();prototype."
+              "createSyncAccessHandle=original;let waits=4;const retry=async()=>{if("
+              "waits-->0){setTimeout(retry,0);return}try{const writer=await file."
+              "createWritable();await writer.close();pocSummary='OPFS-PENDING-OK'}"
+              "catch(error){pocSummary='OPFS-PENDING-ERROR:'+error.name+':'"
+              "+error.message}URL.revokeObjectURL(url)};setTimeout(retry,0)}})()."
+              "catch(error=>{pocSummary='OPFS-PENDING-ERROR:'+error.name+':'"
+              "+error.message})",
+              "<opfs-worker-pending-termination>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 96; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 32,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary,
+               "OPFS-PENDING-OK") != 0) {
+        fprintf(stderr, "OPFS pending termination summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-PENDING-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    puts("test: OPFS is hidden outside secure contexts but admitted on loopback");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 4 * MIB, 1000,
+        "http://insecure.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{const topHidden=typeof navigator.storage.getDirectory==="
+              "'undefined'&&typeof FileSystemHandle==='undefined',source=\"postMessage"
+              "({secure:isSecureContext,directory:typeof navigator.storage."
+              "getDirectory,handle:typeof FileSystemHandle})\",url=URL."
+              "createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=event=>{pocSummary=topHidden&&!event.data.secure&&"
+              "event.data.directory==='undefined'&&event.data.handle==='undefined'?"
+              "'OPFS-INSECURE-HIDDEN':'OPFS-INSECURE-EXPOSED:'+JSON.stringify("
+              "event.data);worker.terminate();URL.revokeObjectURL(url)}})()",
+              "<opfs-insecure-hidden>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 24; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 16,
+            &worker_performance_result));
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-INSECURE-HIDDEN") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 4 * MIB, 1000,
+        "http://localhost/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "pocSummary='pending';navigator.storage.getDirectory().then(root=>{"
+              "pocSummary=root instanceof FileSystemDirectoryHandle&&typeof "
+              "globalThis.__tilefinchOpfsCommand==='undefined'?"
+              "'OPFS-LOOPBACK-OK':'OPFS-LOOPBACK-BAD'})",
+              "<opfs-loopback>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 16; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 16,
+            &worker_performance_result));
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-LOOPBACK-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    browser_session_destroy(&storage_manager_session);
+    CHECK(budget.current == 0);
+
+    puts("test: stale OPFS writers cannot overwrite a cleared and recreated file");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
+    CHECK(browser_session_opfs_create(
+              &storage_manager_session, "https://opfs.test/", "/state",
+              BROWSER_OPFS_FILE) == BROWSER_OPFS_OK
+          && browser_session_opfs_write(
+                 &storage_manager_session, "https://opfs.test/", "/state",
+                 (const unsigned char *) "old", 3) == BROWSER_OPFS_OK);
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 5 * MIB, 1000,
+        "https://opfs.test/", &storage_manager_session,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "pocSummary='pending';(async()=>{const root=await navigator.storage."
+              "getDirectory();globalThis.pendingFile=await root.getFileHandle('state')"
+              ";globalThis.pendingWriter=await pendingFile.createWritable({"
+              "keepExistingData:true});await pendingWriter.write({type:'write',"
+              "position:0,data:'stale'});pocSummary='OPFS-STALE-READY'})()",
+              "<opfs-stale-ready>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 16; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 16,
+            &worker_performance_result));
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-STALE-READY") == 0
+          && browser_session_clear_site_data(
+                 &storage_manager_session, "https://opfs.test/")
+          && browser_session_opfs_create(
+                 &storage_manager_session, "https://opfs.test/", "/state",
+                 BROWSER_OPFS_FILE) == BROWSER_OPFS_OK
+          && browser_session_opfs_write(
+                 &storage_manager_session, "https://opfs.test/", "/state",
+                 (const unsigned char *) "fresh", 5) == BROWSER_OPFS_OK);
+    CHECK(script_runtime_evaluate_diagnostic(
+        worker_performance_runtime,
+        "pocSummary='pending';pendingWriter.close().then(()=>{pocSummary="
+        "'OPFS-STALE-COMMITTED'},async error=>{const text=await(await pendingFile."
+        "getFile()).text(),retry=await pendingFile.createWritable({keepExistingData:"
+        "true});await retry.abort();pocSummary=error.name==='InvalidStateError'&&"
+        "text==='fresh'?'OPFS-STALE-OK':'OPFS-STALE-BAD:'+error.name+':'+text})",
+        "<opfs-stale-close>", &worker_performance_result));
+    for (size_t worker_turn = 16; worker_turn < 48; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 16,
+            &worker_performance_result));
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "OPFS-STALE-OK") == 0);
     script_runtime_destroy(worker_performance_runtime);
     document_destroy(&worker_performance_document);
     browser_session_destroy(&storage_manager_session);
@@ -4881,18 +5575,18 @@
               "(()=>{pocSummary='pending';const order=[],first=navigator.keyboard."
               "getLayoutMap(),second=navigator.keyboard.getLayoutMap();first.then"
               "(()=>order.push('keyboard'));queueMicrotask(()=>order.push('micro'))"
-              ";Promise.all([first,second]).then(values=>{let keyboardBrand=false,"
-              "mapBrand=false;try{Keyboard.prototype.getLayoutMap.call({})}catch("
-              "error){keyboardBrand=error instanceof TypeError}try{"
+              ";const keyboardBrand=Keyboard.prototype.getLayoutMap.call({}).then("
+              "()=>false,error=>error instanceof TypeError);Promise.all([first,"
+              "second,keyboardBrand]).then(values=>{let mapBrand=false;try{"
               "KeyboardLayoutMap.prototype.get.call({},'KeyA')}catch(error){"
               "mapBrand=error instanceof TypeError}pocSummary=first instanceof "
               "Promise&&first!==second&&values[0]===values[1]&&values[0] instanceof"
               " KeyboardLayoutMap&&Object.prototype.toString.call(values[0])==="
               "'[object KeyboardLayoutMap]'&&values[0].size===0&&values[0].get("
               "'KeyA')===undefined&&!values[0].has('KeyA')&&[...values[0]].length"
-              "===0&&order.join(',')==='micro,keyboard'&&keyboardBrand&&mapBrand?"
+              "===0&&order.join(',')==='micro,keyboard'&&values[2]&&mapBrand?"
               "'KEYBOARD-MAP-OK':'KEYBOARD-MAP-BAD:'+JSON.stringify({order,"
-              "keyboardBrand,mapBrand,same:values[0]===values[1],size:values[0]."
+              "keyboardBrand:values[2],mapBrand,same:values[0]===values[1],size:values[0]."
               "size})})})()",
               "<keyboard-map-semantics>", &worker_performance_result));
     for (size_t keyboard_turn = 0; keyboard_turn < 8; keyboard_turn++) {
@@ -4926,8 +5620,10 @@
           && script_runtime_evaluate_diagnostic(
               worker_performance_runtime,
               "(()=>{pocSummary='pending';const first=navigator.getBattery(),"
-              "second=navigator.getBattery(),handler=()=>{};Promise.all([first,"
-              "second]).then(values=>{const battery=values[0];battery."
+              "second=navigator.getBattery(),handler=()=>{},bad=Navigator."
+              "prototype.getBattery.call({}).then(()=>false,error=>error "
+              "instanceof TypeError);Promise.all([first,second,bad]).then("
+              "values=>{const battery=values[0];battery."
               "onchargingchange=handler;battery.onchargingtimechange=handler;"
               "battery.ondischargingtimechange=handler;battery.onlevelchange="
               "handler;let brand=false;try{BatteryManager.prototype.level.get}"
@@ -4937,7 +5633,9 @@
               "values[1]&&battery instanceof BatteryManager&&battery."
               "onchargingchange===handler&&battery.onchargingtimechange==="
               "handler&&battery.ondischargingtimechange===handler&&battery."
-              "onlevelchange===handler&&brand?'BATTERY-STATUS-OK':"
+              "onlevelchange===handler&&values[2]&&Navigator.prototype."
+              "getBattery.name==='getBattery'&&Navigator.prototype.getBattery."
+              "length===0&&brand?'BATTERY-STATUS-OK':"
               "'BATTERY-STATUS-BAD:'+JSON.stringify({samePromise:first==="
               "second,sameManager:values[0]===values[1],handlers:[battery."
               "onchargingchange===handler,battery.onchargingtimechange==="
@@ -4986,20 +5684,79 @@
               "brand=false;try{GPU.prototype.getPreferredCanvasFormat.call({})}"
               "catch(error){brand=error instanceof TypeError}const invalid="
               "navigator.gpu.requestAdapter({powerPreference:'invalid'}).then("
-              "()=>false,error=>error instanceof TypeError);Promise.all([request,"
-              "invalid]).then(values=>{const topOk=values[0]===null&&values[1]&&"
+              "()=>false,error=>error instanceof TypeError),primitive=navigator."
+              "gpu.requestAdapter(1).then(()=>false,error=>error instanceof "
+              "TypeError),symbolFeature=navigator.gpu.requestAdapter({"
+              "featureLevel:Symbol()}).then(()=>false,error=>error instanceof "
+              "TypeError),unknownFeature=navigator.gpu.requestAdapter({"
+              "featureLevel:'future-unknown'}).then(value=>value===null);let "
+              "invalidReadLater=false,badReceiverSync=false,"
+              "badReceiver;const invalidOrder=navigator.gpu.requestAdapter({get "
+              "powerPreference(){return 'invalid'},get xrCompatible(){"
+              "invalidReadLater=true;return false}}).then(()=>false,error=>error "
+              "instanceof TypeError);try{badReceiver=GPU.prototype.requestAdapter."
+              "call({}).then(()=>false,error=>error instanceof TypeError)}catch(_)"
+              "{badReceiverSync=true;badReceiver=Promise.resolve(false)}Promise."
+              "all([request,invalid,primitive,symbolFeature,unknownFeature,"
+              "invalidOrder,"
+              "badReceiver]).then(values=>{const topOk=values[0]===null&&values."
+              "slice(1).every(Boolean)&&"
               "accesses.join(',')==='featureLevel,forceFallbackAdapter,"
               "powerPreference,xrCompatible'&&order.join(',')==='micro,gpu'&&"
-              "brand;const source=\"const order=[],request=navigator.gpu."
-              "requestAdapter();request.then(()=>order.push('gpu'));"
-              "queueMicrotask(()=>order.push('micro'));request.then(value=>"
-              "postMessage({ok:value===null&&request instanceof Promise&&"
-              "navigator.gpu instanceof GPU&&navigator.gpu.wgslLanguageFeatures"
-              " instanceof WGSLLanguageFeatures&&order.join(',')==='micro,gpu',"
-              "gpuRealm:Object.getPrototypeOf(GPU)===Function.prototype,wgslRealm:"
-              "Object.getPrototypeOf(WGSLLanguageFeatures)===Function.prototype,"
-              "order:order.join(',')}))\",url=URL.createObjectURL(new Blob(["
-              "source])),worker=new Worker(url);worker.onmessage=event=>{const "
+              "brand&&!invalidReadLater&&!badReceiverSync;const source=`(async()=>"
+              "{const order=[],gpu=navigator.gpu,features=gpu.wgslLanguageFeatures,"
+              "LocalPromise=Promise,request=gpu.requestAdapter();request.then(()=>order.push('gpu'));"
+              "queueMicrotask(()=>order.push('micro'));let symbolRejected=false,"
+              "forEachRejected=false,featureBrand=false,gpuBrand=false;try{"
+              "features.has(Symbol())}catch(error){symbolRejected=error instanceof "
+              "TypeError}try{features.forEach(5)}catch(error){forEachRejected=error"
+              " instanceof TypeError}try{WGSLLanguageFeatures.prototype.has.call("
+              "{})}catch(error){featureBrand=error instanceof TypeError}let second;"
+              "try{second=GPU.prototype.requestAdapter.call(gpu)}catch(_){second="
+              "null}try{GPU.prototype.getPreferredCanvasFormat.call({})}catch("
+              "error){gpuBrand=error instanceof TypeError}const unknown=gpu."
+              "requestAdapter({featureLevel:'future-unknown'}),primitive=gpu."
+              "requestAdapter(1).then(()=>false,error=>error instanceof TypeError),"
+              "symbolFeature=gpu.requestAdapter({featureLevel:Symbol()}).then("
+              "()=>false,error=>error instanceof TypeError),badReceiver=GPU."
+              "prototype.requestAdapter.call({}).then(()=>false,error=>error "
+              "instanceof TypeError);globalThis.Promise={resolve(){return 9},"
+              "reject(){return 9}};const poisoned=gpu.requestAdapter();globalThis."
+              "Promise=LocalPromise;let inspected=false;const sentinel={get name"
+              "(){inspected=true;throw Error('name touched')}},named={name:"
+              "'TypeError',message:'authored'},authored=gpu.requestAdapter({get "
+              "featureLevel(){throw sentinel}}).then(()=>false,error=>error==="
+              "sentinel&&!inspected),namedAuthored=gpu.requestAdapter({get "
+              "featureLevel(){throw named}}).then(()=>false,error=>error===named),"
+              "values=await LocalPromise.all([request,second,unknown,primitive,"
+              "symbolFeature,badReceiver,poisoned,authored,namedAuthored]),format=GPU.prototype."
+              "getPreferredCanvasFormat.call(gpu);postMessage({ok:values[0]===null"
+              "&&values[1]===null&&values[2]===null&&values.slice(3,6).every(Boolean)"
+              "&&values[6]===null&&values[7]&&values[8]&&!inspected&&request instanceof LocalPromise&&poisoned instanceof LocalPromise&&"
+              "second instanceof "
+              "LocalPromise&&gpu instanceof GPU&&features instanceof "
+              "WGSLLanguageFeatures&&features===gpu.wgslLanguageFeatures&&"
+              "features.size===0&&!features.has('unsupported')&&[...features]."
+              "length===0&&features.keys===features.values&&features[Symbol."
+              "iterator]===features.values&&Object.prototype.toString.call("
+              "features.values())==='[object Set Iterator]'&&!Object.prototype."
+              "propertyIsEnumerable.call(WGSLLanguageFeatures.prototype,Symbol."
+              "iterator)&&format==='bgra8unorm'"
+              "&&GPU.prototype.getPreferredCanvasFormat.name==="
+              "'getPreferredCanvasFormat'&&GPU.prototype.requestAdapter.name==="
+              "'requestAdapter'&&features.forEach.name==='forEach'&&features."
+              "forEach.length===1"
+              "&&order.join(',')==='micro,gpu'&&symbolRejected&&forEachRejected&&"
+              "featureBrand&&gpuBrand,gpuRealm:Object.getPrototypeOf(GPU)==="
+              "Function.prototype,wgslRealm:Object.getPrototypeOf("
+              "WGSLLanguageFeatures)===Function.prototype,order:order.join(',')})}"
+              ")()`;const url=URL.createObjectURL(new Blob(["
+              "source])),worker=new Worker(url),ownerRequest=GPU.prototype."
+              "requestAdapter;GPU.prototype.requestAdapter=()=>Promise.reject("
+              "'owner-poison'),ownerFormat=GPU.prototype.getPreferredCanvasFormat;"
+              "GPU.prototype.getPreferredCanvasFormat=()=> 'poison';worker."
+              "onmessage=event=>{GPU.prototype.requestAdapter=ownerRequest;GPU."
+              "prototype.getPreferredCanvasFormat=ownerFormat;const "
               "value=event.data;pocSummary=topOk&&value.ok&&value.gpuRealm&&"
               "value.wgslRealm?'WEBGPU-PROBE-OK':'WEBGPU-PROBE-BAD:'+JSON."
               "stringify({topOk,accesses,order,worker:value});worker.terminate();"
@@ -5499,7 +6256,13 @@
               ".enumerable"
               "&&!Object.hasOwn(performance,'now')"
               "&&Number.isFinite(Performance.prototype.now.call(performance))"
-              "&&rejected&&json.timeOrigin===performance.timeOrigin"
+              "&&rejected&&json.timeOrigin===performance.timeOrigin;const nav="
+              "performance.getEntriesByType('navigation')[0],navJSON=nav.toJSON();"
+              "pocSummary=pocSummary&&nav instanceof PerformanceNavigationTiming"
+              "&&nav.criticalCHRestart===0&&nav.notRestoredReasons===null&&"
+              "nav.confidence===null&&navJSON.criticalCHRestart===0&&"
+              "navJSON.notRestoredReasons===null&&navJSON.confidence===null&&"
+              "typeof PerformanceTimingConfidence==='function'"
               "?'PERFORMANCE-INTERFACE-OK':'PERFORMANCE-INTERFACE-BAD'})()",
               "<performance-interface>", &performance_observer_result)
           && strcmp(performance_observer_result.summary,

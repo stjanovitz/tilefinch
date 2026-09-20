@@ -327,6 +327,7 @@ typedef struct {
     bool identity_encoding;
     bool raw_gzip_encoding;
     bool force_fresh_connection;
+    FetchCacheMode cache_mode;
     bool send_low_client_hints;
     bool send_client_hints;
     bool suppress_high_client_hints;
@@ -734,6 +735,8 @@ static size_t fetch_background_receive_header(
     }
     if (status_line) {
         long status = 0;
+        long negotiated_http_version =
+            fetch_http_version_from_status_line(data, length);
         char status_line[128];
         size_t copied = length < sizeof(status_line) - 1u
             ? length : sizeof(status_line) - 1u;
@@ -741,6 +744,7 @@ static size_t fetch_background_receive_header(
         status_line[copied] = '\0';
         if (sscanf(status_line, "HTTP/%*s %ld", &status) == 1) {
             fetch_background_reset_response_headers(slot);
+            slot->result.negotiated_http_version = negotiated_http_version;
             slot->header_status = status;
             slot->result.status_code = status;
         }
@@ -954,6 +958,10 @@ static bool fetch_background_configure_request_shape(
             }
         }
     }
+    const char *cache_control = NULL;
+    const char *pragma = NULL;
+    fetch_cache_mode_headers(
+        slot->cache_mode, slot->extra_headers, &cache_control, &pragma);
     return hints_ready && configure_easy_method(
                slot->easy, slot->method, &request, slot->body_enabled)
         && fetch_background_append_header(
@@ -984,7 +992,10 @@ static bool fetch_background_configure_request_shape(
         && fetch_background_append_named_header(
                slot, "If-Modified-Since", slot->if_modified_since)
         && fetch_background_append_extra_headers(
-               slot, slot->extra_headers);
+               slot, slot->extra_headers)
+        && fetch_background_append_named_header(
+               slot, "Cache-Control", cache_control)
+        && fetch_background_append_named_header(slot, "Pragma", pragma);
 }
 
 static long fetch_background_remaining_ms(const FetchBackgroundSlot *slot)
@@ -3132,6 +3143,7 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->identity_encoding = request->identity_encoding;
         slot->raw_gzip_encoding = request->raw_gzip_encoding;
         slot->force_fresh_connection = request->force_fresh_connection;
+        slot->cache_mode = request->cache_mode;
         slot->send_low_client_hints = request->send_low_client_hints;
         slot->send_client_hints = request->send_client_hints;
         slot->suppress_high_client_hints = false;
@@ -3563,6 +3575,7 @@ static void fetch_background_copy_header_snapshot(
 {
     if (destination == NULL || source == NULL) return;
     destination->status_code = source->status_code;
+    destination->negotiated_http_version = source->negotiated_http_version;
     snprintf(destination->effective_url, sizeof(destination->effective_url),
              "%s", source->effective_url);
     snprintf(destination->content_type, sizeof(destination->content_type),

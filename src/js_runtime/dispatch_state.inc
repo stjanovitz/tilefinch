@@ -112,7 +112,8 @@ bool script_runtime_dispatch_pointer_node(
     };
     JSValue returned = JS_UNDEFINED;
     bool trusted_activation = phase == 0u || phase == 2u || phase == 5u;
-    runtime->bridge.user_activation_active = trusted_activation;
+    if (trusted_activation)
+        js_rt_bridge_notify_user_activation(&runtime->bridge);
     runtime->result.event_dispatch_entered = true;
     if (result != NULL) result->event_dispatch_entered = true;
     js_rt_saturating_add_size(
@@ -123,7 +124,6 @@ bool script_runtime_dispatch_pointer_node(
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_activation_handle,
         "__tilefinchDispatchActivationHandle", 7, arguments, &returned);
-    runtime->bridge.user_activation_active = false;
     for (size_t i = 0; i < 7; i++)
         JS_FreeValue(runtime->context, arguments[i]);
     if (ok) runtime->result.last_event_cancelled =
@@ -151,6 +151,18 @@ bool script_runtime_dispatch_pointer_node(
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
     return ok;
+}
+
+void script_runtime_notify_user_activation(ScriptRuntime *runtime)
+{
+    if (runtime != NULL)
+        js_rt_bridge_notify_user_activation(&runtime->bridge);
+}
+
+bool script_runtime_has_transient_user_activation(ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && js_rt_bridge_user_activation_is_active(&runtime->bridge);
 }
 
 static bool runtime_clear_page_fullscreen(ScriptRuntime *runtime,
@@ -349,14 +361,18 @@ bool script_runtime_consume_mutations(ScriptRuntime *runtime,
 }
 
 bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
-                                       size_t url_size, bool *replace)
+                                       size_t url_size, bool *replace,
+                                       bool *user_activated)
 {
     if (runtime == NULL || url == NULL || url_size == 0
         || !runtime->bridge.navigation_requested) return false;
     snprintf(url, url_size, "%s", runtime->bridge.navigation_url);
     if (replace != NULL) *replace = runtime->bridge.navigation_replace;
+    if (user_activated != NULL)
+        *user_activated = runtime->bridge.navigation_user_activated;
     runtime->bridge.navigation_requested = false;
     runtime->bridge.navigation_replace = false;
+    runtime->bridge.navigation_user_activated = false;
     runtime->bridge.navigation_url[0] = '\0';
     return true;
 }

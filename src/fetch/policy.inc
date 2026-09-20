@@ -703,6 +703,9 @@ static bool fetch_request_validate_with_facts(
     if (request->identity_encoding && request->raw_gzip_encoding) {
         REQUEST_INVALID(FETCH_REQUEST_VALIDATION_CONTEXT);
     }
+    if ((unsigned) request->cache_mode > (unsigned) FETCH_CACHE_RELOAD) {
+        REQUEST_INVALID(FETCH_REQUEST_VALIDATION_CACHE_MODE);
+    }
     if ((unsigned) request->credentials
             > (unsigned) FETCH_CREDENTIALS_SAME_ORIGIN
         || (request->credentials == FETCH_CREDENTIALS_SAME_ORIGIN

@@ -112,6 +112,17 @@ static bool navigation_stream_headers(void *opaque,
         stream->response_headers_elapsed_us =
             navigation_now_us() - stream->started_us;
     }
+    if (stream != NULL) {
+        stream->response_status = metadata->status_code > 0
+            && metadata->status_code <= UINT16_MAX
+                ? (uint16_t) metadata->status_code : 0;
+        snprintf(stream->next_hop_protocol,
+                 sizeof(stream->next_hop_protocol), "%s",
+                 fetch_http_version_name(metadata->negotiated_http_version));
+        snprintf(stream->response_content_type,
+                 sizeof(stream->response_content_type), "%s",
+                 metadata->content_type);
+    }
     if (metadata->effective_url[0] != '\0') {
         snprintf(stream->document_url, sizeof(stream->document_url), "%s",
                  metadata->effective_url);
@@ -816,7 +827,7 @@ static uint64_t navigation_load_enqueue_fetch_request(NavigationLoad *load)
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
         .destination = TILEFINCH_DESTINATION_DOCUMENT,
         .top_level_navigation = true,
-        .user_activated = !contextual,
+        .user_activated = load->request_context.user_activated,
         .transport = {
             .body = load->body, .body_length = load->body_length,
             .content_type = load->content_type[0] == '\0'
@@ -996,6 +1007,8 @@ static NavigationLoad *navigation_load_begin_common(
     }
     bool contextual_navigation =
         session->pending_navigation_referer[0] != '\0';
+    bool user_activated = contextual_navigation
+        ? session->pending_navigation_user_activated : true;
     if (contextual_navigation
         && !tilefinch_url_request_key(session->pending_navigation_referer,
                                    load->source_url,
@@ -1007,6 +1020,7 @@ static NavigationLoad *navigation_load_begin_common(
     }
     session->pending_navigation_referer[0] = '\0';
     session->pending_navigation_same_origin = false;
+    session->pending_navigation_user_activated = false;
     load->request_context = (TilefinchRequestContext) {
         .target_url = load->request_url,
         .initiator_url = contextual_navigation ? load->source_url : NULL,
@@ -1017,7 +1031,7 @@ static NavigationLoad *navigation_load_begin_common(
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
         .destination = TILEFINCH_DESTINATION_DOCUMENT,
         .top_level_navigation = true,
-        .user_activated = !contextual_navigation
+        .user_activated = user_activated
     };
     session->performance.first_dom_us = 0;
     session->performance.first_layout_us = 0;

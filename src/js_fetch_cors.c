@@ -110,29 +110,51 @@ void js_rt_record_network_response(ScriptResult *result,
     result->last_network_body_prefix[at] = '\0';
 }
 
+#define JS_FETCH_MAXIMUM_BYTES (1024u * 1024u)
+
 /* Keep exactly one eager JavaScript representation of a native response.
    Fetch bodies are byte sequences regardless of MIME type.  Decoding here
    would irreversibly replace invalid UTF-8 before arrayBuffer()/bytes()/Blob
    consumers can observe the transport payload. */
-void js_rt_script_set_response_body(JSContext *context, JSValue response,
-                              const FetchResult *fetched)
+bool js_rt_script_set_response_body(JSContext *context, JSValue response,
+                                    const FetchResult *fetched,
+                                    bool prefer_text)
 {
     if (context == NULL || fetched == NULL || JS_IsException(response)) {
-        return;
+        return false;
     }
-    (void) JS_SetPropertyStr(context, response, "bodyLength",
-                            JS_NewInt64(context, (int64_t) fetched->length));
-    (void) JS_SetPropertyStr(context, response, "bodyBytes",
-        JS_NewArrayBufferCopy(context,
-                              (const uint8_t *) fetched->data,
-                              fetched->length));
+    if (JS_SetPropertyStr(context, response, "bodyLength",
+            JS_NewInt64(context, (int64_t) fetched->length)) < 0) {
+        return false;
+    }
+    /* XMLHttpRequest's default/text representations need only the decoded
+       string. Building an ArrayBuffer copy first can consume the remaining
+       per-realm heap and make the subsequent string fail, even though the
+       native response and final string each fit independently. Keep Fetch
+       byte-canonical, and keep malformed XHR input on the JavaScript
+       decoder so its replacement behavior remains exact. */
+    if (prefer_text && fetched->length <= JS_FETCH_MAXIMUM_BYTES
+        && js_rt_utf8_valid((const uint8_t *) fetched->data,
+                            fetched->length)) {
+        const uint8_t *bytes = (const uint8_t *) fetched->data;
+        size_t length = fetched->length;
+        if (length >= 3u && bytes[0] == 0xefu && bytes[1] == 0xbbu
+            && bytes[2] == 0xbfu) {
+            bytes += 3u;
+            length -= 3u;
+        }
+        return JS_SetPropertyStr(context, response, "body",
+            JS_NewStringLen(context, (const char *) bytes, length)) >= 0;
+    }
+    return JS_SetPropertyStr(context, response, "bodyBytes",
+        JS_NewArrayBufferCopy(context, (const uint8_t *) fetched->data,
+                              fetched->length)) >= 0;
 }
 
 /* Modern SPA API payloads such as custom emoji inventories and trending
    timelines run to several megabytes.  The per-response cap scales with the
    configured script file budget so constrained profiles keep their
    small reservations while SPA-sized budgets admit real payloads. */
-#define JS_FETCH_MAXIMUM_BYTES (1024u * 1024u)
 static size_t js_fetch_response_limit(const DomBridge *bridge)
 {
     size_t limit = JS_FETCH_MAXIMUM_BYTES;
@@ -559,9 +581,9 @@ bool js_rt_script_resource_timing_allowed(
 uint8_t js_rt_script_resource_timing_protocol(long version)
 {
     const char *name = fetch_http_version_name(version);
-    if (strcmp(name, "1.0") == 0) return 1;
-    if (strcmp(name, "1.1") == 0) return 2;
-    if (strcmp(name, "2") == 0) return 3;
+    if (strcmp(name, "http/1.0") == 0) return 1;
+    if (strcmp(name, "http/1.1") == 0) return 2;
+    if (strcmp(name, "h2") == 0) return 3;
     return 0;
 }
 
@@ -1152,7 +1174,11 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
                                 JS_NewStringLen(
                                     context, visible_headers,
                                     visible_headers_length));
-        js_rt_script_set_response_body(context, response, fetched);
+        if (!js_rt_script_set_response_body(
+                context, response, fetched, false)) {
+            JS_FreeValue(context, response);
+            response = JS_EXCEPTION;
+        }
     }
     fetch_result_free(fetched);
     return response;
@@ -1234,13 +1260,43 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         ? JS_ToCStringLen(context, &accept_length, argv[13]) : "*/*";
     bool accept_valid = accept != NULL && strlen(accept) == accept_length
         && accept_length <= JS_FETCH_MAXIMUM_ACCEPT_BYTES;
+    int prefer_text_value = argc > 15 && !JS_IsUndefined(argv[15])
+        ? JS_ToBool(context, argv[15]) : 0;
+    bool prefer_text_response = prefer_text_value > 0;
+    FetchCacheMode cache_mode = FETCH_CACHE_DEFAULT;
+    bool cache_mode_valid = true;
+    bool cache_mode_conversion_failed = false;
+    if (argc > 14 && !JS_IsUndefined(argv[14])) {
+        size_t length = 0;
+        const char *value = JS_ToCStringLen(context, &length, argv[14]);
+        if (value == NULL) {
+            cache_mode_valid = false;
+            cache_mode_conversion_failed = true;
+        } else if (strlen(value) != length) {
+            cache_mode_valid = false;
+        } else if ((length == 7u && memcmp(value, "default", 7u) == 0)
+                   || (length == 11u
+                       && memcmp(value, "force-cache", 11u) == 0)) {
+            cache_mode = FETCH_CACHE_DEFAULT;
+        } else if (length == 8u && memcmp(value, "no-cache", 8u) == 0) {
+            cache_mode = FETCH_CACHE_NO_CACHE;
+        } else if (length == 8u && memcmp(value, "no-store", 8u) == 0) {
+            cache_mode = FETCH_CACHE_NO_STORE;
+        } else if (length == 6u && memcmp(value, "reload", 6u) == 0) {
+            cache_mode = FETCH_CACHE_RELOAD;
+        } else {
+            cache_mode_valid = false;
+        }
+        JS_FreeCString(context, value);
+    }
     if (method == NULL || reference == NULL
         || (argc > 2 && !JS_IsUndefined(argv[2]) && body == NULL)
         || (argc > 3 && !JS_IsUndefined(argv[3]) && content_type == NULL)
         || (argc > 4 && !JS_IsUndefined(argv[4])
             && extra_headers == NULL) || !valid_policy || !valid_timeout
         || worker_destination_value < 0 || !redirect_mode_valid
-        || !integrity_valid || !accept_valid) {
+        || !integrity_valid || !accept_valid || !cache_mode_valid
+        || prefer_text_value < 0) {
         if (method != NULL) JS_FreeCString(context, method);
         if (reference != NULL) JS_FreeCString(context, reference);
         if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
@@ -1256,6 +1312,9 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         if (!integrity_valid && integrity != NULL) {
             return JS_ThrowTypeError(context, "Invalid integrity metadata");
         }
+        if (!cache_mode_valid && !cache_mode_conversion_failed) {
+            return JS_ThrowTypeError(context, "Invalid cache mode");
+        }
         return JS_EXCEPTION;
     }
     bool method_exact = strlen(method) == method_length;
@@ -1268,6 +1327,7 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         .method = method, .body = body,
         .body_length = body_length,
         .content_type = content_type, .extra_headers = extra_headers,
+        .cache_mode = cache_mode,
         .allow_http_errors = true,
         .send_low_client_hints = true,
         .accept = accept,
@@ -1423,6 +1483,7 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
     *async_fetch = (ScriptAsyncFetch) {
         .id = id, .mode = request_mode, .credentials = credentials,
         .destination = destination,
+        .prefer_text_response = prefer_text_response,
         .integrity = integrity_copy,
         .integrity_length = integrity_length
     };
@@ -2048,7 +2109,7 @@ static JSValue js_multiplayer_start(JSContext *context,
         parsed_mode = TILEFINCH_MULTIPLAYER_MODE_DISCOVER;
     bool valid = parsed_mode != 0
         && multiplayer_document_allowed(bridge)
-        && bridge->user_activation_active
+        && js_rt_bridge_user_activation_is_active(bridge)
         && !bridge->multiplayer.active
         && game_length <= TILEFINCH_MULTIPLAYER_GAME_ID_LIMIT
         && peer_length <= TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT
@@ -3480,7 +3541,7 @@ bool js_fetch_cors_install(JSContext *context, JSValue global)
     return js_rt_install_function(context, global, "__tilefinchFetchSync",
                                   js_fetch_sync, 11)
         && js_rt_install_function(context, global, "__tilefinchFetchAsync",
-                                  js_fetch_async, 14)
+                                  js_fetch_async, 16)
         && js_rt_install_function(context, global, "__tilefinchCancelNetwork",
                                   js_fetch_cancel, 2)
         && js_rt_install_function(context, global,

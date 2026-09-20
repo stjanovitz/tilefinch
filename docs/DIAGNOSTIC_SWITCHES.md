@@ -81,7 +81,7 @@ the code and its strings ship).
 | `TILEFINCH_DUMP_BUDGET` | 1 | `src/interactive_main.c` | always | Print Budget categories and large resource allocations after the interactive lab tick loop. |
 | `TILEFINCH_DUMP_FRAME_MEMORY` | 2 | `src/interactive_main.c` | always | Print per-frame script runtime memory reports in the interactive lab. |
 | `TILEFINCH_DUMP_JS_MEMORY` | 1 | `src/diagnostic_trace.h` | host | Print QuickJS memory usage at boot-window advances and runtime teardown. |
-| `TILEFINCH_DUMP_JS_POOL` | 1 | `src/diagnostic_trace.h` | host | Print the QuickJS pool class report at runtime teardown. |
+| `TILEFINCH_DUMP_JS_POOL` | 2 | `src/diagnostic_trace.h` | host | Print the QuickJS pool class report at runtime teardown. |
 | `TILEFINCH_DUMP_JS_POOL_AT_PEAK` | 1 | `src/budget.c` | always | Print the QuickJS pool report when its peak is reached. |
 | `TILEFINCH_DUMP_JS_PROFILE` | 1 | `src/diagnostic_trace.h` | host | Dump the QuickJS execution profile at teardown (profile builds only). |
 

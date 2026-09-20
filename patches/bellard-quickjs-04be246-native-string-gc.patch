@@ -1,0 +1,45 @@
+diff --git a/quickjs.c b/quickjs.c
+index 7ea95799..9c801dcf 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4576,6 +4576,11 @@ JSValue JS_NewStringLenLatin1UninitializedPortable(JSContext *ctx,
+         return JS_ThrowInternalError(ctx, "string too long");
+     if (len == 0)
+         return JS_AtomToString(ctx, JS_ATOM_empty_string);
++    /* Native producers bypass the ordinary string builders, so preserve the
++       same pre-allocation collection opportunity for a large result.  This
++       matters near a bounded heap: otherwise collectible cycles can make an
++       atob()/decoder output fail even though the live result fits. */
++    js_trigger_gc(ctx->rt, sizeof(JSString) + len + 1u);
+     str = js_alloc_string(ctx, (int)len, 0);
+     if (str == NULL)
+         return JS_EXCEPTION;
+@@ -5684,6 +5689,18 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
+ 
+     sh = *psh;
+     new_size = max_int(count, sh->prop_size * 3 / 2);
++    new_hash_size = sh->prop_hash_mask + 1;
++    while (new_hash_size < new_size)
++        new_hash_size = 2 * new_hash_size;
++    /* Property growth otherwise bypasses every allocation site that can
++       collect cycles.  Do it before mutating either allocation so a bounded
++       heap can reclaim dead author graphs without exposing a half-resized
++       object to the collector. */
++    size_t property_bytes = sizeof(JSProperty) * (size_t)new_size;
++    size_t shape_bytes = get_shape_size(new_hash_size, new_size);
++    js_trigger_gc(ctx->rt,
++                  shape_bytes > SIZE_MAX - property_bytes
++                      ? SIZE_MAX : property_bytes + shape_bytes);
+     /* Reallocate prop array first to avoid crash or size inconsistency
+        in case of memory allocation failure */
+     if (p) {
+@@ -5693,9 +5710,6 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
+             return -1;
+         p->prop = new_prop;
+     }
+-    new_hash_size = sh->prop_hash_mask + 1;
+-    while (new_hash_size < new_size)
+-        new_hash_size = 2 * new_hash_size;
+     /* resize the property shapes. Using js_realloc() is not possible in
+        case the GC runs during the allocation */
+     old_sh = sh;

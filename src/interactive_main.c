@@ -244,6 +244,121 @@ static bool interactive_seed_extracted_recovery(BrowserEngine *engine)
     return reader != BROWSER_BLANK_READER_RECOVERY_NONE;
 }
 
+static bool interactive_frame_event_seen(const char *log, const char *event)
+{
+    if (log == NULL || event == NULL) return false;
+    size_t event_length = strlen(event);
+    for (const char *token = log; token[0] != '\0';) {
+        const char *end = strchr(token, ',');
+        if (end == NULL) end = token + strlen(token);
+        const char *colon = memchr(token, ':', (size_t) (end - token));
+        if (colon != NULL && (size_t) (end - colon - 1) == event_length
+            && memcmp(colon + 1, event, event_length) == 0) return true;
+        token = end[0] == ',' ? end + 1 : end;
+    }
+    return false;
+}
+
+static const char *interactive_last_child_frame_event(
+    const char *log, const char *event)
+{
+    if (log == NULL || event == NULL) return NULL;
+    size_t event_length = strlen(event);
+    const char *last = NULL;
+    for (const char *token = log; token[0] != '\0';) {
+        const char *end = strchr(token, ',');
+        if (end == NULL) end = token + strlen(token);
+        static const char prefix[] = "C>P:";
+        if ((size_t) (end - token) == sizeof(prefix) - 1u + event_length
+            && memcmp(token, prefix, sizeof(prefix) - 1u) == 0
+            && memcmp(token + sizeof(prefix) - 1u,
+                      event, event_length) == 0) {
+            last = token;
+        }
+        token = end[0] == ',' ? end + 1 : end;
+    }
+    return last;
+}
+
+static const char *interactive_challenge_outcome(
+    const NavigationSession *navigation, const char *body_text)
+{
+    if (navigation == NULL || navigation->last_cf_mitigated[0] == '\0')
+        return "not-applicable";
+    if (body_text != NULL
+        && strstr(body_text, "Browser not supported") != NULL)
+        return "browser-unsupported";
+
+    const char *log = navigation->frame_message_event_log;
+    const char *start = interactive_last_child_frame_event(log, "init");
+    const char *ended = interactive_last_child_frame_event(
+        log, "interactiveEnd");
+    const char *failed = interactive_last_child_frame_event(log, "fail");
+    const char *forced = interactive_last_child_frame_event(log, "forceFail");
+    if (forced != NULL && (failed == NULL || forced > failed)) failed = forced;
+
+    /* The visible parent text can survive replacement of its challenge
+       iframe.  Prefer the newest bounded child lifecycle over stale
+       "Verification successful" text: a new init reopens the challenge,
+       and fail/forceFail terminates only that current generation. */
+    if (start != NULL) {
+        if (failed != NULL && failed > start) return "verification-failed";
+        if (ended == NULL || ended < start) return "challenge-active";
+    } else if (failed != NULL) {
+        return "verification-failed";
+    }
+    return body_text != NULL
+               && strstr(body_text, "Verification successful") != NULL
+        ? "verification-waiting" : "challenge-active";
+}
+
+static bool interactive_run_frame_probe(
+    NavigationSession *navigation, const char *source)
+{
+    bool evaluated = false;
+    if (navigation == NULL || source == NULL) return false;
+    for (size_t i = 0; i < navigation->page.frame_count; i++) {
+        NavigationFrame *frame = &navigation->page.frames[i];
+        if (!frame->loaded || frame->runtime == NULL) continue;
+        bool ok = script_runtime_evaluate_diagnostic(
+            frame->runtime, source, "<frame-probe>", &frame->script_result);
+        printf("frame-probe index=%zu status=%s url=\"%.512s\" "
+               "summary=\"%.2048s\" error=\"%.512s\"\n",
+               i, ok ? "ok" : "failed", frame->url,
+               frame->script_result.summary, frame->script_result.error);
+        evaluated = true;
+    }
+    return evaluated;
+}
+
+static bool interactive_activate_event_source_frame(
+    NavigationSession *navigation, long source, uint64_t source_generation,
+    bool pointer, int pointer_x, int pointer_y)
+{
+    if (navigation == NULL || source == 0) return false;
+    NavigationFrame *frame = NULL;
+    for (size_t i = 0; i < navigation->page.frame_count; i++) {
+        NavigationFrame *candidate = &navigation->page.frames[i];
+        if (!candidate->retired && candidate->loaded
+            && candidate->parent_handle == source
+            && candidate->lifecycle_generation == source_generation) {
+            frame = candidate;
+            break;
+        }
+    }
+    if (frame == NULL) return false;
+    while (frame->parent_frame_slot_plus_one != 0) {
+        size_t parent = frame->parent_frame_slot_plus_one - 1u;
+        if (parent >= navigation->page.frame_count) return false;
+        frame = &navigation->page.frames[parent];
+        if (frame->retired || !frame->loaded) return false;
+    }
+    return pointer
+        ? navigation_activate_frame_at(
+              navigation, frame->element, pointer_x, pointer_y)
+        : navigation_activate_frame(navigation, frame->element);
+}
+
 static void print_runtime_liveness(const char *realm, size_t slot,
                                    uint64_t generation,
                                    ScriptRuntime *runtime,
@@ -285,6 +400,9 @@ int main(int argc, char **argv)
     const char *post_click_selector = NULL;
     const char *output = "interactive.ppm";
     const char *probe_script = NULL;
+    const char *frame_probe_script = NULL;
+    const char *frame_probe_event = NULL;
+    const char *frame_activate_event = NULL;
     const char *visual_state_marker = NULL;
     const char *user_css = NULL;
     const char *commands_path = NULL;
@@ -308,6 +426,8 @@ int main(int argc, char **argv)
     bool adaptive_resources_explicit = false;
     bool pace_real_time = false;
     size_t ticks = 0, tick_ms = 16, focus_next = 0, limit_mb = 24;
+    size_t frame_activate_delay_ticks = 0;
+    int frame_activate_pointer_x = 0, frame_activate_pointer_y = 0;
     size_t max_download_kb = 4096;
     size_t interaction_ticks = 32;
     int requested_scroll_y = 0;
@@ -335,6 +455,7 @@ int main(int argc, char **argv)
     bool fetch_scripts = false, activate = false, follow_action = false;
     bool no_javascript = false;
     bool trace_frames = false, trace_page = false;
+    bool frame_activate_pointer = false;
     bool probe_usability = false;
     bool diagnostic_frame_safari = false;
     bool interactive_loop = false;
@@ -358,6 +479,12 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--trace-frames") == 0) trace_frames = true;
         else if (strcmp(argv[i], "--trace-page") == 0) trace_page = true;
+        else if (strcmp(argv[i], "--frame-activate-pointer") == 0) {
+            if (i + 2 >= argc) { usage(argv[0]); return 2; }
+            frame_activate_pointer = true;
+            frame_activate_pointer_x = (int) strtol(argv[++i], NULL, 10);
+            frame_activate_pointer_y = (int) strtol(argv[++i], NULL, 10);
+        }
         else if (strcmp(argv[i], "--probe-usability") == 0) {
             probe_usability = true;
         }
@@ -467,6 +594,22 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--probe-script") == 0) {
             probe_script = argv[++i];
+        }
+        else if (strcmp(argv[i], "--frame-probe-script") == 0
+                 && i + 1 < argc) {
+            frame_probe_script = argv[++i];
+        }
+        else if (strcmp(argv[i], "--frame-probe-event") == 0
+                 && i + 1 < argc) {
+            frame_probe_event = argv[++i];
+        }
+        else if (strcmp(argv[i], "--frame-activate-event") == 0
+                 && i + 1 < argc) {
+            frame_activate_event = argv[++i];
+        }
+        else if (strcmp(argv[i], "--frame-activate-delay-ticks") == 0
+                 && i + 1 < argc) {
+            frame_activate_delay_ticks = strtoul(argv[++i], NULL, 10);
         }
         else if (strcmp(argv[i], "--block-origin") == 0) {
             if (blocked_origin_count
@@ -592,6 +735,9 @@ int main(int argc, char **argv)
     }
     if ((fixture == NULL) == (url == NULL) || limit_mb < 4 || limit_mb > 512
         || ticks > 20000 || interaction_ticks > 20000
+        || frame_activate_delay_ticks > 20000
+        || (frame_activate_pointer
+            && (frame_activate_pointer_x < 0 || frame_activate_pointer_y < 0))
         || max_download_kb < 1 || max_download_kb > 65536
         || tick_ms > 60000 || focus_next > 10000
         || script_timeout_ms < 1 || script_timeout_ms > 300000
@@ -616,6 +762,16 @@ int main(int argc, char **argv)
                 || !deterministic_replay_requested
                 || !response_keyed_replay || !loop_capture_frames))
         || (probe_script != NULL && fixture == NULL)
+        || (frame_probe_event != NULL
+            && (frame_probe_script == NULL || frame_probe_event[0] == '\0'
+                || strlen(frame_probe_event)
+                       >= sizeof(((NavigationSession *) 0)
+                                     ->last_frame_message_event)))
+        || (frame_activate_event != NULL
+            && (frame_activate_event[0] == '\0'
+                || strlen(frame_activate_event)
+                       >= sizeof(((NavigationSession *) 0)
+                                     ->last_frame_message_event)))
         || (reader_mode && (user_css != NULL || hide_cookie_banners
                             || experimental_compressed_sections))) {
         usage(argv[0]); return 2;
@@ -932,6 +1088,13 @@ int main(int argc, char **argv)
 #define experimental (application->experimental)
 #define section_fetch (application->section_fetch)
     char *input = NULL;
+    char *frame_probe_source = NULL;
+    size_t frame_probe_length = 0;
+    bool frame_probe_ran = false;
+    uint64_t frame_activation_sequence = 0;
+    long pending_frame_activation_source = 0;
+    uint64_t pending_frame_activation_generation = 0;
+    size_t pending_frame_activation_tick = SIZE_MAX;
     uint16_t *frame = NULL;
     FILE *command_stream = NULL;
     InteractiveMediaSession media;
@@ -1474,6 +1637,15 @@ int main(int argc, char **argv)
        final presentation decision below can account for all intervening
        ticks, including pages with a permanent interval or recurring rAF. */
     bool blank_reader_recovery_seeded = false;
+    if (frame_probe_script != NULL) {
+        frame_probe_source = read_file(
+            budget, frame_probe_script, &frame_probe_length);
+        if (frame_probe_source == NULL) {
+            fprintf(stderr, "frame-probe read failed path=%s\n",
+                    frame_probe_script);
+            goto cleanup;
+        }
+    }
     if (!reader_mode
         && script_runtime_has_pending_author_work(navigation.page.runtime)
         && browser_engine_page_is_visually_blank(engine)) {
@@ -1519,6 +1691,61 @@ int main(int argc, char **argv)
         }
         if (!navigation_run_background_resources(&navigation)) {
             goto cleanup;
+        }
+        if (!frame_probe_ran && frame_probe_event != NULL
+            && interactive_frame_event_seen(
+                   navigation.frame_message_event_log, frame_probe_event)) {
+            printf("frame-probe trigger=\"%s\" tick=%zu sequence=%llu\n",
+                   frame_probe_event, i + 1u,
+                   (unsigned long long)
+                       navigation.last_frame_message_sequence);
+            if (!interactive_run_frame_probe(
+                    &navigation, frame_probe_source)) {
+                fprintf(stderr, "frame-probe found no loaded child frame\n");
+                goto cleanup;
+            }
+            frame_probe_ran = true;
+            if (frame_activate_event == NULL) break;
+        }
+        if (frame_activate_event != NULL
+            && navigation.last_frame_message_event_sequence
+                   != frame_activation_sequence
+            && strcmp(navigation.last_frame_message_event,
+                      frame_activate_event) == 0) {
+            printf("frame-activation queued trigger=\"%s\" tick=%zu "
+                   "sequence=%llu delay=%zu mode=%s\n",
+                   frame_activate_event, i + 1u,
+                   (unsigned long long)
+                       navigation.last_frame_message_event_sequence,
+                   frame_activate_delay_ticks,
+                   frame_activate_pointer ? "pointer" : "controller");
+            frame_activation_sequence =
+                navigation.last_frame_message_event_sequence;
+            pending_frame_activation_source =
+                navigation.last_frame_message_event_source;
+            pending_frame_activation_generation =
+                navigation.last_frame_message_event_source_generation;
+            pending_frame_activation_tick =
+                i + 1u + frame_activate_delay_ticks;
+        }
+        if (pending_frame_activation_source != 0
+            && i + 1u >= pending_frame_activation_tick) {
+            printf("frame-activation dispatch tick=%zu sequence=%llu mode=%s\n",
+                   i + 1u,
+                   (unsigned long long) frame_activation_sequence,
+                   frame_activate_pointer ? "pointer" : "controller");
+            if (!interactive_activate_event_source_frame(
+                    &navigation, pending_frame_activation_source,
+                    pending_frame_activation_generation,
+                    frame_activate_pointer, frame_activate_pointer_x,
+                    frame_activate_pointer_y)) {
+                fprintf(stderr,
+                        "frame-activation found no activatable source frame\n");
+                goto cleanup;
+            }
+            pending_frame_activation_source = 0;
+            pending_frame_activation_generation = 0;
+            pending_frame_activation_tick = SIZE_MAX;
         }
         if (pace_real_time && tick_ms != 0
             && (i + 1u) % ((5000u + tick_ms - 1u) / tick_ms) == 0u) {
@@ -1625,6 +1852,9 @@ int main(int argc, char **argv)
                navigation.page.script_result.error);
         budget_free(budget, eval_source);
     }
+    if (frame_probe_source != NULL && !frame_probe_ran)
+        (void) interactive_run_frame_probe(
+            &navigation, frame_probe_source);
     if (getenv("TILEFINCH_TRACE_DOM") != NULL) {
         size_t remaining = 1024;
         dump_probe_dom(lxb_dom_interface_node(navigation.page.document.html),
@@ -3090,12 +3320,8 @@ int main(int argc, char **argv)
            navigation.page.script_result.retention_dirty_drops,
            navigation.page.script_result.retention_state_evictions,
            navigation.page.script_result.retention_control_drops);
-    const char *challenge_outcome = navigation.last_cf_mitigated[0] == '\0'
-        ? "not-applicable"
-        : (strstr(body_text, "Browser not supported") != NULL
-           ? "browser-unsupported"
-           : (strstr(body_text, "Verification successful") != NULL
-              ? "verification-waiting" : "challenge-active"));
+    const char *challenge_outcome = interactive_challenge_outcome(
+        &navigation, body_text);
     bool clearance_found = false;
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
         if (session.cookies[i].value != NULL
@@ -3238,6 +3464,12 @@ int main(int argc, char **argv)
                    : (child->loaded ? "loaded" : "failed"),
                child->script_result.summary,
                child->script_result.error);
+        if (getenv("TILEFINCH_DUMP_JS_POOL") != NULL
+            && child->runtime != NULL) {
+            printf("frame[%zu] memory-begin\n", i);
+            script_runtime_report_memory(child->runtime, stdout);
+            printf("frame[%zu] memory-end\n", i);
+        }
         printf("frame[%zu] http=%ld server=\"%s\" cf-ray=\"%s\"\n", i,
                child->http_status, child->server, child->cf_ray);
         printf("frame[%zu] callback-errors=%zu last=\"%s\" "
@@ -3695,6 +3927,7 @@ cleanup:
     section_store_stream_abort(&section_stream_builder);
     if (section_fetch.budget != NULL) fetch_result_destroy(&section_fetch);
     section_store_destroy(&section_store);
+    budget_free(budget, frame_probe_source);
     budget_free(budget, input);
     budget_free(budget, application);
     bool engine_clean = browser_engine_shutdown(engine);

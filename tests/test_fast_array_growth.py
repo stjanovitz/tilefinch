@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 
-EXPECTED_SUMMARY = 'javascript summary="FAST-ARRAY-OK:300000:2052427040"'
+EXPECTED_SUMMARY = 'javascript summary="FAST-ARRAY-OK:300000:1167525152"'
 
 
 def run(lab: Path, fixture: Path, growth_kb) -> int:

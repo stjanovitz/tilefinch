@@ -3112,6 +3112,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
     }
     if (intent->clear_session_storage_requested) {
         browser_session_storage_clear_all(browser->session, false);
+        browser_session_opfs_clear_all(browser->session);
         psp_ui_show_status(
             &process->presentation.ui, "SESSION STORAGE CLEARED", 180);
         return;

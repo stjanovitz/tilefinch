@@ -595,7 +595,7 @@
     CHECK(location_assignment_runtime != NULL
           && script_runtime_consume_navigation(
               location_assignment_runtime, assigned_url,
-              sizeof(assigned_url), &assigned_replace)
+              sizeof(assigned_url), &assigned_replace, NULL)
           && strcmp(assigned_url,
                     "https://example.test/assigned?from=href") == 0
           && !assigned_replace);
@@ -1699,6 +1699,31 @@
           && document_provenance_result.success
           && strcmp(document_provenance_result.summary,
                     "DOCUMENT-PROVENANCE-OK") == 0);
+    ScriptNavigationTiming document_navigation_headers_timing = {
+        .response_start_us = 180000,
+        .response_status = 200,
+        .next_hop_protocol = "h2",
+        .content_type = "text/html"
+    };
+    static const char document_navigation_headers_source[] =
+        "(()=>{const entry=performance.getEntriesByType('navigation')[0];"
+        "pocSummary=entry.responseStart===180&&entry.responseEnd===0"
+        "&&entry.finalResponseHeadersStart===180&&entry.transferSize===300"
+        "&&entry.encodedBodySize===0&&entry.decodedBodySize===0"
+        "&&entry.responseStatus===200&&entry.nextHopProtocol==='h2'"
+        "&&entry.contentType==='text/html'?'NAVIGATION-HEADERS-OK':"
+        "'NAVIGATION-HEADERS-FAILED:'+JSON.stringify(entry.toJSON())})()";
+    CHECK(script_runtime_record_navigation_timing(
+              document_provenance_runtime,
+              &document_navigation_headers_timing)
+          && script_runtime_evaluate_diagnostic(
+              document_provenance_runtime,
+              document_navigation_headers_source,
+              "<document-navigation-headers>",
+              &document_provenance_result)
+          && document_provenance_result.success
+          && strcmp(document_provenance_result.summary,
+                    "NAVIGATION-HEADERS-OK") == 0);
     ScriptNavigationTiming document_navigation_timing = {
         .measured = true,
         .response_complete = true,
@@ -1826,6 +1851,39 @@
               &deterministic_tick_result)
           && strcmp(deterministic_tick_result.summary,
                     "TIMER-THIS-OK") == 0);
+
+    static const char timer_nesting_source[] =
+        "(()=>{const timeoutTimes=[],intervalTimes=[],mixedTimes=[],"
+        "base=__tilefinchNow;const stamp=()=>__tilefinchNow-base;"
+        "const timeoutStep=()=>{timeoutTimes.push(stamp());"
+        "if(timeoutTimes.length<8)setTimeout(timeoutStep,0)};"
+        "let interval=setInterval(()=>{intervalTimes.push(stamp());"
+        "if(intervalTimes.length===8)clearInterval(interval)},0);"
+        "const mixedStep=useInterval=>{mixedTimes.push(stamp());"
+        "if(mixedTimes.length===8)return;if(useInterval){let id=setInterval("
+        "()=>{clearInterval(id);mixedStep(false)},0)}else setTimeout("
+        "()=>mixedStep(true),0)};setTimeout(timeoutStep,0);setTimeout("
+        "()=>mixedStep(true),0);__tilefinchPumpTimers(0,64);"
+        "const first=[timeoutTimes.length,intervalTimes.length,mixedTimes.length];"
+        "__tilefinchPumpTimers(3,64);const second=[timeoutTimes.length,"
+        "intervalTimes.length,mixedTimes.length];__tilefinchPumpTimers(1,64);"
+        "const third=[timeoutTimes.length,intervalTimes.length,mixedTimes.length];"
+        "__tilefinchPumpTimers(4,64);pocSummary=[first,second,third,"
+        "timeoutTimes,intervalTimes,mixedTimes].map(value=>value.join(','))"
+        ".join('|')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              deterministic_tick_runtime, timer_nesting_source,
+              "<timer-nesting>", &deterministic_tick_result));
+    if (strcmp(deterministic_tick_result.summary,
+               "6,6,6|6,6,6|7,7,7|0,0,0,0,0,0,4,8|"
+               "0,0,0,0,0,0,4,8|0,0,0,0,0,0,4,8") != 0) {
+        fprintf(stderr, "timer nesting summary=%s error=%s\n",
+                deterministic_tick_result.summary,
+                deterministic_tick_result.error);
+    }
+    CHECK(strcmp(deterministic_tick_result.summary,
+                 "6,6,6|6,6,6|7,7,7|0,0,0,0,0,0,4,8|"
+                 "0,0,0,0,0,0,4,8|0,0,0,0,0,0,4,8") == 0);
 
     static const char deterministic_raf_surface_source[] =
         "(()=>{let immediate=false,cancelled=false,observed=false;"
@@ -2123,6 +2181,82 @@
                     "STYLESHEET-MOTION-STATIC") == 0
           && stylesheet_animation_result.bootstrap_lazy_module_loads == 1
           && stylesheet_animation_result.bootstrap_lazy_module_failures == 0);
+
+    puts("test: reduced-motion CSS animations retain lifecycle events");
+    static const char stylesheet_animation_lifecycle_source[] =
+        "(()=>{const style=document.createElement('style'),"
+        "box=document.createElement('div'),events=[];"
+        "style.textContent='@keyframes eventpulse{from{opacity:.5}'"
+        "+'to{opacity:1}}.event-probe{animation:eventpulse 32ms linear '"
+        "+'16ms 2}';box.className='event-probe';"
+        "box.addEventListener('animationstart',event=>events.push('start:'"
+        "+event.animationName));box.addEventListener('animationiteration',"
+        "event=>events.push('iteration:'+event.elapsedTime));"
+        "box.addEventListener('animationend',event=>{events.push('end:'"
+        "+event.elapsedTime);globalThis.pocSummary=events.join(',')});"
+        "document.head.appendChild(style);document.body.appendChild(box);"
+        "__tilefinchMaybeStartMotion();globalThis.pocSummary='EVENTS-PENDING'"
+        "})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              stylesheet_animation_runtime,
+              stylesheet_animation_lifecycle_source,
+              "<stylesheet-animation-lifecycle>",
+              &stylesheet_animation_result));
+    for (size_t tick = 0; tick < 8
+                          && strcmp(stylesheet_animation_result.summary,
+                                    "start:eventpulse,iteration:0.032,end:0.064")
+                                 != 0;
+         tick++) {
+        CHECK(script_runtime_advance(
+            stylesheet_animation_runtime, 16, 16,
+            &stylesheet_animation_result));
+    }
+    if (strcmp(stylesheet_animation_result.summary,
+               "start:eventpulse,iteration:0.032,end:0.064") != 0) {
+        fprintf(stderr, "stylesheet animation lifecycle summary=%s error=%s\n",
+                stylesheet_animation_result.summary,
+                stylesheet_animation_result.error);
+    }
+    CHECK(stylesheet_animation_result.success
+          && strcmp(stylesheet_animation_result.summary,
+                    "start:eventpulse,iteration:0.032,end:0.064") == 0);
+
+    puts("test: closed shadow CSS animations retain lifecycle events");
+    static const char shadow_animation_lifecycle_source[] =
+        "(()=>{const host=document.createElement('div'),"
+        "root=host.attachShadow({mode:'closed'}),"
+        "style=document.createElement('style'),box=document.createElement('div');"
+        "style.textContent='@keyframes shadowpulse{from{opacity:.5}'"
+        "+'to{opacity:1}}.shadow-probe{animation:shadowpulse 32ms linear}';"
+        "box.className='shadow-probe';box.addEventListener('animationstart',"
+        "()=>{globalThis.pocSummary='SHADOW-START'});"
+        "box.addEventListener('animationend',event=>{globalThis.pocSummary="
+        "'SHADOW-END:'+event.animationName;host.remove()});root.appendChild(style);"
+        "root.appendChild(box);document.body.appendChild(host);"
+        "__tilefinchMaybeStartMotion();globalThis.pocSummary='SHADOW-PENDING'"
+        "})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              stylesheet_animation_runtime,
+              shadow_animation_lifecycle_source,
+              "<shadow-animation-lifecycle>",
+              &stylesheet_animation_result));
+    for (size_t tick = 0; tick < 6
+                          && strcmp(stylesheet_animation_result.summary,
+                                    "SHADOW-END:shadowpulse") != 0;
+         tick++) {
+        CHECK(script_runtime_advance(
+            stylesheet_animation_runtime, 16, 16,
+            &stylesheet_animation_result));
+    }
+    if (strcmp(stylesheet_animation_result.summary,
+               "SHADOW-END:shadowpulse") != 0) {
+        fprintf(stderr, "shadow animation lifecycle summary=%s error=%s\n",
+                stylesheet_animation_result.summary,
+                stylesheet_animation_result.error);
+    }
+    CHECK(stylesheet_animation_result.success
+          && strcmp(stylesheet_animation_result.summary,
+                    "SHADOW-END:shadowpulse") == 0);
 
     puts("test: bounded native text prefixes preserve textContent semantics");
     static const char bounded_text_prefix_source[] =

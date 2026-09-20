@@ -76,7 +76,7 @@ static bool test_ca_bundle_configuration(void)
                &bundle_version, &bundle_length, bundle_digest)
         && bundle_version == TILEFINCH_CA_BUNDLE_VERSION
         && bundle_length == 0 && bundle_digest[0] == 0
-        && strcmp(fetch_http_version_name(0), "unknown") == 0
+        && strcmp(fetch_http_version_name(0), "") == 0
         && fetch_set_ca_bundle_path("/tmp/tilefinch-roots.pem")
         && fetch_ca_bundle_path() != NULL
         && strcmp(
@@ -515,6 +515,14 @@ static bool test_request_validation_before_replay(void)
     error = FETCH_REQUEST_VALIDATION_OK;
     if (fetch_request_validate(&candidate, &error)
         || error != FETCH_REQUEST_VALIDATION_CONTEXT) return false;
+
+    candidate = request();
+    candidate.cache_mode = FETCH_CACHE_RELOAD;
+    if (!fetch_request_validate(&candidate, NULL)) return false;
+    candidate.cache_mode = (FetchCacheMode) (FETCH_CACHE_RELOAD + 1);
+    error = FETCH_REQUEST_VALIDATION_OK;
+    if (fetch_request_validate(&candidate, &error)
+        || error != FETCH_REQUEST_VALIDATION_CACHE_MODE) return false;
 
     candidate = request();
     candidate.credentials = (FetchCredentialPolicy) -1;

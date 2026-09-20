@@ -1,5 +1,8 @@
 (() => {
-  const ownKeys = Reflect.ownKeys,
+  const nativeOwnKeys = Reflect.ownKeys,
+    ownPropertyNames = Object.getOwnPropertyNames,
+    ownPropertyDescriptors = Object.getOwnPropertyDescriptors,
+    deleteProperty = Reflect.deleteProperty,
     getDescriptor = Object.getOwnPropertyDescriptor,
     defineProperty = Object.defineProperty,
     freeze = Object.freeze,
@@ -33,6 +36,7 @@
       "__tilefinchDispatchInputHandle",
       "__tilefinchDispatchSubmitHandle",
       "__tilefinchDispatchWindowEventCheckpointed",
+      "__tilefinchDispatchEventTargetCheckpointed",
       "__tilefinchEventObserverDelta",
       "__tilefinchFetchForWorker",
       "__tilefinchFetchWorkerScript",
@@ -49,6 +53,7 @@
       "__tilefinchNormalizeTimerDelay",
       "__tilefinchScheduleTimeout",
       "__tilefinchScheduleInterval",
+      "__tilefinchScheduleTask",
       "__tilefinchCancelTimer",
       "__tilefinchPointerHoverEventsObserved",
       "__tilefinchPointerMarkupChanged",
@@ -103,6 +108,7 @@
       "__tilefinchSaveSectionState",
       "__tilefinchSetFrameWindowState",
       "__tilefinchStylesheetHasMotionKeyframes",
+      "__tilefinchTrustedEvent",
       "__tilefinchTrustedString",
       "__tilefinchUpdateGamepad",
     ]);
@@ -112,7 +118,7 @@
       markNative(constructor);
       const prototype = constructor.prototype;
       if (!prototype) return;
-      for (const key of ownKeys(prototype)) {
+      for (const key of nativeOwnKeys(prototype)) {
         const descriptor = getDescriptor(prototype, key);
         if (!descriptor) continue;
         markNative(descriptor.value);
@@ -149,6 +155,7 @@
   });
   for (const name of [
     "Blob", "DOMImplementation", "MutationObserver", "Navigator", "NavigatorUAData",
+    "UserActivation",
     "PluginArray", "MimeTypeArray", "Plugin", "MimeType", "Clipboard",
     "Performance", "PerformanceObserver", "VisibilityStateEntry",
     "Screen", "ScreenOrientation",
@@ -166,7 +173,7 @@
     ]],
   ])
     for (const name of names) markNative(owner?.[name]);
-  for (const key of ownKeys(globalThis)) {
+  for (const key of nativeOwnKeys(globalThis)) {
     if (typeof key !== "string" || !key.startsWith("__tilefinch")) continue;
     const descriptor = getDescriptor(globalThis, key);
     if (!descriptor) continue;
@@ -188,4 +195,57 @@
          page-realm pass can make it. */
     }
   }
+  /* Native bridge entry points are implementation slots, not Web globals.
+     They are deliberately non-enumerable, but reflection APIs expose
+     non-enumerable names too. Keep those names out of author-visible global
+     inventories while retaining the actual slots for later lazy bootstrap
+     groups and native callbacks. */
+  const authorGlobalKeys = (keys) => {
+      const visible = [];
+      for (const key of keys)
+        if (typeof key !== "string" || !key.startsWith("__tilefinch"))
+          visible.push(key);
+      return visible;
+    },
+    reflectedOwnKeys = function ownKeys(target) {
+      const keys = nativeOwnKeys(target);
+      return target === globalThis ? authorGlobalKeys(keys) : keys;
+    },
+    reflectedOwnPropertyNames = function getOwnPropertyNames(target) {
+      const keys = ownPropertyNames(target);
+      return target === globalThis ? authorGlobalKeys(keys) : keys;
+    },
+    reflectedOwnPropertyDescriptors = function getOwnPropertyDescriptors(
+      target,
+    ) {
+      const descriptors = ownPropertyDescriptors(target);
+      if (target === globalThis)
+        for (const key of nativeOwnKeys(descriptors))
+          if (typeof key === "string" && key.startsWith("__tilefinch"))
+            deleteProperty(descriptors, key);
+      return descriptors;
+    };
+  for (const value of [
+    reflectedOwnKeys,
+    reflectedOwnPropertyNames,
+    reflectedOwnPropertyDescriptors,
+  ]) markNative(value);
+  defineProperty(Reflect, "ownKeys", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: reflectedOwnKeys,
+  });
+  defineProperty(Object, "getOwnPropertyNames", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: reflectedOwnPropertyNames,
+  });
+  defineProperty(Object, "getOwnPropertyDescriptors", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: reflectedOwnPropertyDescriptors,
+  });
 })();

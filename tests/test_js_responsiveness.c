@@ -87,6 +87,26 @@ static JSValue timed_promise_job(JSContext *context, int argc,
     return JS_UNDEFINED;
 }
 
+static int test_user_activation_expiry(void)
+{
+    TimedCooperate probe = { .now_ns = UINT64_C(1000000000) };
+    TilefinchPlatformServices services = {
+        .context = &probe, .monotonic_time_ns = timed_cooperate_clock
+    };
+    DomBridge bridge = { .performance_origin_ns = probe.now_ns };
+    tilefinch_platform_set_services(&services);
+    js_rt_bridge_notify_user_activation(&bridge);
+    CHECK(js_rt_bridge_user_activation_is_active(&bridge)
+          && bridge.user_activation_has_been_active);
+    probe.now_ns += UINT64_C(4999000000);
+    CHECK(js_rt_bridge_user_activation_is_active(&bridge));
+    probe.now_ns += UINT64_C(1000000);
+    CHECK(!js_rt_bridge_user_activation_is_active(&bridge)
+          && bridge.user_activation_has_been_active);
+    tilefinch_platform_set_services(NULL);
+    return 0;
+}
+
 static int test_watchdog_elapsed_cooperation(void)
 {
     TimedCooperate probe = { .now_ns = UINT64_C(1000000000) };
@@ -648,6 +668,71 @@ static bool collect_and_drain_finalizers(ScriptRuntime *runtime,
     return true;
 }
 
+static int test_stream_and_xhr_private_state_reclamation(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 8u * MIB, 4000,
+        "https://private-state.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "new ReadableStream({start(c){c.close()}});new XMLHttpRequest();"
+        "globalThis.pocSummary='PRIVATE-STATE-WARM';",
+        "<private-state-warm>", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t baseline =
+        budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+
+    /* Browser-private state must be owned by its public object, not by a
+       realm-global WeakMap value. QuickJS cannot collect a WeakMap value/key
+       ephemeron when the value closes over its otherwise-dead key; that used
+       to retain every dropped stream queue and completed XHR response. */
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{for(let at=0;at<2;at++)new ReadableStream({start(c){"
+        "c.enqueue(new Uint8Array(256*1024));c.close()}});"
+        "const xhr=new XMLHttpRequest();xhr.payload=new Uint8Array(512*1024);"
+        "xhr.onload=function(){return xhr}})();"
+        "globalThis.__retainedController=null;"
+        "(()=>{new ReadableStream({start(c){__retainedController=c}})})();"
+        "globalThis.__retainedXHR=new XMLHttpRequest();"
+        "globalThis.__retainedThis=false;__retainedXHR.onload=function(){"
+        "__retainedThis=this===__retainedXHR};"
+        "globalThis.pocSummary='PRIVATE-STATE-PENDING';",
+        "<private-state-pressure>", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "__retainedController.enqueue(new Uint8Array([7]));"
+        "__retainedController.close();"
+        "__retainedXHR.dispatchEvent(new Event('load'));"
+        "let branded=false;try{Object.getOwnPropertyDescriptor("
+        "XMLHttpRequest.prototype,'responseText').get.call({})}catch(error){"
+        "branded=error instanceof TypeError}"
+        "globalThis.pocSummary=__retainedThis&&branded?"
+        "'PRIVATE-STATE-OK':'PRIVATE-STATE-FAILED';"
+        "globalThis.__retainedController=null;globalThis.__retainedXHR=null;",
+        "<private-state-live-owner>", &result));
+    CHECK(strcmp(result.summary, "PRIVATE-STATE-OK") == 0);
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t retained =
+        budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    printf("private-state-reclamation baseline=%zu retained=%zu delta=%zu\n",
+           baseline, retained, retained > baseline ? retained - baseline : 0u);
+    CHECK(retained <= baseline + 128u * 1024u);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_response_body_release_with_retained_wrappers(void)
 {
     Budget budget;
@@ -1104,6 +1189,7 @@ int main(int argc, char **argv)
     CHECK(test_gc_pacing_requires_heap_growth() == 0);
     CHECK(test_dom_wrapper_receiver_sharing() == 0);
     CHECK(test_dom_order_without_sibling_wrappers() == 0);
+    CHECK(test_stream_and_xhr_private_state_reclamation() == 0);
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
@@ -1112,6 +1198,7 @@ int main(int argc, char **argv)
     CHECK(test_job_heap_rejection_is_fatal() == 0);
     CHECK(test_blank_recovery_author_work_census() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
+    CHECK(test_user_activation_expiry() == 0);
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
     CHECK(tilefinch_sha256_digest(NULL, 0, digest)
           && digest_matches_hex(
@@ -1434,8 +1521,8 @@ int main(int argc, char **argv)
               "addEventListener('gamepaddisconnected',e=>"
               "__gamepadEvents.push(e.type+':'+e.gamepad.index));"
               "globalThis.pocSummary=bridge&&!bridge.writable&&"
-              "!bridge.configurable&&first!==second&&first.length===1&&"
-              "second.length===0?"
+              "!bridge.configurable&&first!==second&&first.length===5&&"
+              "second.length===4&&second.every(value=>value===null)?"
               "'GAMEPAD-HIDDEN':'GAMEPAD-LEAKED'",
               "<gamepad-install>", &result)
           && strcmp(result.summary, "GAMEPAD-HIDDEN") == 0);
@@ -1455,7 +1542,8 @@ int main(int argc, char **argv)
               "globalThis.__gamepadRef=p;"
               "globalThis.__gamepadButtonsRef=p.buttons;"
               "globalThis.pocSummary="
-              "first!==secondSnapshot&&first.length===1&&p===second&&"
+              "first!==secondSnapshot&&first.length===4&&p===second&&"
+              "first.slice(1).every(value=>value===null)&&"
               "p.id==='PSP Built-in Controller'"
               "&&p.mapping==='standard'&&p.buttons.length===17"
               "&&p.buttons[0].pressed&&p.buttons[12].value===1"
@@ -1491,9 +1579,10 @@ int main(int argc, char **argv)
           && script_runtime_advance(runtime, 0, 8, &result)
           && script_runtime_evaluate_diagnostic(
               runtime,
-              "globalThis.pocSummary=navigator.getGamepads()[0]===null&&"
+              "(()=>{const pads=navigator.getGamepads();globalThis.pocSummary="
+              "pads.length===4&&pads.every(value=>value===null)&&"
               "__gamepadEvents.join(',')==='gamepadconnected:0,"
-              "gamepaddisconnected:0'?'GAMEPAD-DISCONNECTED':'GAMEPAD-BAD'",
+              "gamepaddisconnected:0'?'GAMEPAD-DISCONNECTED':'GAMEPAD-BAD'})()",
               "<gamepad-disconnected>", &result)
           && strcmp(result.summary, "GAMEPAD-DISCONNECTED") == 0);
 
@@ -1521,6 +1610,66 @@ int main(int argc, char **argv)
           && strcmp(result.summary, "PAGE-CONTROLS-REQUESTED") == 0
           && script_runtime_page_fullscreen_active(runtime)
           && script_runtime_exit_page_fullscreen(runtime));
+
+    puts("test: transient user activation reaches microtasks and navigation");
+    /* Earlier cases deliberately exercise trusted page controls on this
+       long-lived fixture. Reset only the test-owned activation state so this
+       case can pin the initial Navigator contract independently. */
+    runtime->bridge.user_activation_active = false;
+    runtime->bridge.user_activation_has_been_active = false;
+    runtime->bridge.user_activation_expires_ms = 0;
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.__activationOriginalURL=location.href;"
+              "globalThis.__activationTarget=document.createElement('button');"
+              "__activationTarget.id='activation-target';"
+              "document.body.append(__activationTarget);"
+              "__activationTarget.addEventListener('click',()=>"
+              "Promise.resolve().then(()=>{globalThis.pocSummary="
+              "navigator.userActivation.isActive&&"
+              "navigator.userActivation.hasBeenActive?"
+              "'ACTIVATION-MICROTASK-OK':'ACTIVATION-MICROTASK-BAD';"
+              "location.href='https://example.test/activated'}));"
+              "globalThis.pocSummary=!navigator.userActivation.isActive&&"
+              "!navigator.userActivation.hasBeenActive&&"
+              "typeof __tilefinchUserActivationState==='undefined'?"
+              "'ACTIVATION-INITIAL-OK':'ACTIVATION-INITIAL-BAD'",
+              "<user-activation-setup>", &result)
+          && strcmp(result.summary, "ACTIVATION-INITIAL-OK") == 0);
+    char activation_url[NAVIGATION_URL_LIMIT];
+    bool activation_replace = false;
+    bool activation_snapshot = true;
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, "__activationTarget.click()",
+              "<synthetic-activation>", &result)
+          && strcmp(result.summary, "ACTIVATION-MICROTASK-BAD") == 0
+          && script_runtime_consume_navigation(
+                 runtime, activation_url, sizeof(activation_url),
+                 &activation_replace, &activation_snapshot)
+          && strcmp(activation_url,
+                    "https://example.test/activated") == 0
+          && !activation_replace && !activation_snapshot);
+    lxb_dom_node_t *activation_target = find_element_id(
+        lxb_dom_interface_node(document.html), "activation-target");
+    activation_snapshot = false;
+    CHECK(activation_target != NULL
+          && script_runtime_dispatch_activation_node(
+                 runtime, activation_target, &result)
+          && strcmp(result.summary, "ACTIVATION-MICROTASK-OK") == 0
+          && script_runtime_consume_navigation(
+                 runtime, activation_url, sizeof(activation_url),
+                 &activation_replace, &activation_snapshot)
+          && activation_snapshot
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "history.replaceState(null,'',__activationOriginalURL);"
+                 "__activationTarget.remove();"
+                 "delete globalThis.__activationTarget;"
+                 "delete globalThis.__activationOriginalURL;"
+                 "delete globalThis.__tilefinchLastClickDefault",
+                 "<user-activation-cleanup>", &result));
+    runtime->bridge.user_activation_active = false;
+    runtime->bridge.user_activation_expires_ms = 0;
 
     puts("test: asynchronous callback entry observes cancellation");
     CHECK(script_runtime_evaluate_diagnostic(
@@ -2152,7 +2301,7 @@ int main(int argc, char **argv)
 
     static const char webcrypto_digest_probe[] =
         "(()=>{let synchronous=false,arrayPromise,typedPromise,viewPromise,"
-        "unsupportedPromise,typePromise,quotaPromise;try{"
+        "unsupportedPromise,typePromise,brandPromise,symbolPromise,quotaPromise;try{"
         "const expected='ba7816bf8f01cfea414140de5dae2223'"
         "+'b00361a396177a9cb410ff61f20015ad';"
         "const whole=new Uint8Array([97,98,99]);"
@@ -2163,6 +2312,8 @@ int main(int argc, char **argv)
         "new DataView(framed.buffer,1,3));"
         "unsupportedPromise=crypto.subtle.digest('SHA-1',whole);"
         "typePromise=crypto.subtle.digest('SHA-256','abc');"
+        "brandPromise=SubtleCrypto.prototype.digest.call({},'SHA-256',whole);"
+        "symbolPromise=crypto.subtle.digest({name:Symbol()},whole);"
         "quotaPromise=crypto.subtle.digest('SHA-256',"
         "new Uint8Array(1024*1024+1));"
         "const hex=value=>[...new Uint8Array(value)]"
@@ -2172,6 +2323,8 @@ int main(int argc, char **argv)
         "viewPromise.then(value=>hex(value)===expected),"
         "unsupportedPromise.then(()=>false,error=>error.name==='NotSupportedError'),"
         "typePromise.then(()=>false,error=>error.name==='TypeError'),"
+        "brandPromise.then(()=>false,error=>error.name==='TypeError'),"
+        "symbolPromise.then(()=>false,error=>error.name==='TypeError'),"
         "quotaPromise.then(()=>false,error=>error.name==='RangeError')])"
         ".then(checks=>{globalThis.pocSummary=!synchronous"
         "&&arrayPromise instanceof Promise&&checks.every(Boolean)"
@@ -3727,12 +3880,29 @@ int main(int argc, char **argv)
              "text/plain;charset=iso-8859-1");
     JSValue raw_text_payload = JS_NewObject(runtime->context);
     CHECK(!JS_IsException(raw_text_payload));
-    js_rt_script_set_response_body(
-        runtime->context, raw_text_payload, &raw_text_response);
+    /* A textual XHR may bypass the intermediate ArrayBuffer, but malformed
+       UTF-8 must stay byte-backed so the Encoding Standard replacement path
+       remains authoritative. */
+    CHECK(js_rt_script_set_response_body(
+        runtime->context, raw_text_payload, &raw_text_response, true));
     JSValue raw_text_global = JS_GetGlobalObject(runtime->context);
     CHECK(JS_SetPropertyStr(runtime->context, raw_text_global,
                             "__tilefinchTestRawTextPayload",
                             raw_text_payload) >= 0);
+
+    char direct_text_response_bytes[] = {
+        (char) 0xef, (char) 0xbb, (char) 0xbf, 'o', 'k'
+    };
+    FetchResult direct_text_response = {0};
+    direct_text_response.data = direct_text_response_bytes;
+    direct_text_response.length = sizeof(direct_text_response_bytes);
+    JSValue direct_text_payload = JS_NewObject(runtime->context);
+    CHECK(!JS_IsException(direct_text_payload));
+    CHECK(js_rt_script_set_response_body(
+        runtime->context, direct_text_payload, &direct_text_response, true));
+    CHECK(JS_SetPropertyStr(runtime->context, raw_text_global,
+                            "__tilefinchTestDirectTextPayload",
+                            direct_text_payload) >= 0);
     JS_FreeValue(runtime->context, raw_text_global);
 
     static const char request_body_content_type_probe[] =
@@ -3787,7 +3957,12 @@ int main(int argc, char **argv)
         "formBoundary&&formBoundary!==oldBoundary&&formText.includes(oldBoundary)&&"
         "formText.includes('name=\\\"line%0D%0Aname\\\"')&&"
         "headerResponse.status===204&&headerResponse.body===null&&"
-        "rawBytes.join(',')==='233,0,65'&&seen.length===3&&"
+        "rawBytes.join(',')==='233,0,65'&&"
+        "__tilefinchTestRawTextPayload.body===undefined&&"
+        "__tilefinchTestRawTextPayload.bodyLength===3&&"
+        "__tilefinchTestDirectTextPayload.body==='ok'&&"
+        "__tilefinchTestDirectTextPayload.bodyBytes===undefined&&"
+        "__tilefinchTestDirectTextPayload.bodyLength===5&&seen.length===3&&"
         "seen[0][0]==='text/plain;charset=UTF-8'&&seen[0][1]===''&&"
         "seen[0][2]==='*/*'&&seen[1][2]==='application/json'&&"
         "seen[1][1].includes('if-none-match: \\\"tag\\\"')&&"
@@ -4339,12 +4514,13 @@ int main(int argc, char **argv)
           && result.indexed_db_bytes == 0
           && result.indexed_db_peak_bytes > 0
           && result.indexed_db_quota_errors == 0
-          /* The same realm loaded Game Audio, Canvas, and Streams earlier;
-             IndexedDB is the fourth deferred standards module admitted. */
+          /* The same realm loaded Game Audio, Canvas, Streams, and the OPFS
+             constructors earlier; IndexedDB is the next deferred standards
+             module admitted. */
           /* Cumulative for this runtime: the compatibility probe above also
              loads the Worker module for its close() check, and the Intl
              probes load the lazy Intl module. */
-          && result.bootstrap_lazy_module_loads == 7
+          && result.bootstrap_lazy_module_loads == 8
           && result.bootstrap_lazy_module_failures == 0);
 
     static const char indexeddb_generator_probe[] =
@@ -5947,13 +6123,34 @@ int main(int argc, char **argv)
 
     puts("test: JavaScript browser identity matches native client hints");
     static const char browser_identity_probe[] =
-        "const d=navigator.userAgentData,b=d.brands[0];"
+        "const d=navigator.userAgentData,b=d.brands[0];let navigatorIllegal=false;"
+        "try{Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent')."
+        "get.call(Object.create(Navigator.prototype))}catch(error){"
+        "navigatorIllegal=error instanceof TypeError}const authenticNavigator="
+        "navigator,navigatorDescriptor=Object.getOwnPropertyDescriptor("
+        "globalThis,'navigator'),languagesGetter=Object.getOwnPropertyDescriptor("
+        "Navigator.prototype,'languages').get,brandsGetter=Object."
+        "getOwnPropertyDescriptor(NavigatorUAData.prototype,'brands').get,"
+        "forgedNavigator=Object.create(Navigator.prototype),forgedUAData=Object."
+        "create(NavigatorUAData.prototype);Object.defineProperty(forgedNavigator,"
+        "'userAgentData',{configurable:true,value:forgedUAData});let authenticOk="
+        "false,forgedNavigatorRejected=false,forgedUARejected=false;try{Object."
+        "defineProperty(globalThis,'navigator',{configurable:true,enumerable:"
+        "navigatorDescriptor.enumerable,writable:false,value:forgedNavigator});"
+        "authenticOk=languagesGetter.call(authenticNavigator).join(',')==="
+        "'en-US,en'&&brandsGetter.call(d)[0].brand===b.brand;try{languagesGetter."
+        "call(forgedNavigator)}catch(error){forgedNavigatorRejected=error "
+        "instanceof TypeError}try{brandsGetter.call(forgedUAData)}catch(error){"
+        "forgedUARejected=error instanceof TypeError}}finally{Object."
+        "defineProperty(globalThis,'navigator',navigatorDescriptor)}const "
+        "navigatorBrandStable=authenticOk&&forgedNavigatorRejected&&"
+        "forgedUARejected;"
         "d.getHighEntropyValues(['uaFullVersion','fullVersionList'])"
-        ".then(v=>globalThis.pocSummary="
+        ".then(v=>globalThis.pocSummary=navigatorIllegal&&navigatorBrandStable?"
         "b.brand+'|'+b.version+'|'+v.uaFullVersion+'|'"
         "+v.fullVersionList[0].brand+'|'"
         "+v.fullVersionList[0].version+'|'+navigator.language+'|'"
-        "+navigator.languages.join(','));";
+        "+navigator.languages.join(','):'NAVIGATOR-BRAND-FAILED');";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, browser_identity_probe, "<browser-identity-probe>",
               &result)
@@ -5973,21 +6170,32 @@ int main(int argc, char **argv)
         "['architecture','formFactors','wow64'];return{next(){accesses.push("
         "'next'+at);return at<values.length?{value:{toString(){accesses.push("
         "'string'+at);return values[at++]}},done:false}:{done:true}}}}};"
-        "let getterIllegal=0,methodIllegal=0;for(const name of ['brands',"
-        "'mobile','platform'])try{Object.getOwnPropertyDescriptor(proto,name)"
-        ".get.call({})}catch(error){if(error instanceof TypeError)getterIllegal++}"
-        "try{proto.getHighEntropyValues.call({},[])}catch(error){methodIllegal="
-        "error instanceof TypeError?1:-1}Promise.all([data.getHighEntropyValues("
-        "hints),data.getHighEntropyValues(['fullVersionList'])]).then(values=>{"
+        "const forged=Object.create(proto);let getterIllegal=0;for(const name of "
+        "['brands','mobile','platform'])try{Object.getOwnPropertyDescriptor("
+        "proto,name).get.call(forged)}catch(error){if(error instanceof TypeError)"
+        "getterIllegal++}"
+        "const rejected=invoke=>{let promise;try{promise=invoke()}catch(_){return "
+        "Promise.resolve(false)}return promise instanceof Promise?promise.then("
+        "()=>false,error=>error instanceof TypeError):Promise.resolve(false)},"
+        "order=[],timed=data.getHighEntropyValues([]).then(()=>order.push('ua'));"
+        "queueMicrotask(()=>order.push('micro'));Promise.all([data."
+        "getHighEntropyValues(hints),data.getHighEntropyValues(["
+        "'fullVersionList']),rejected(()=>proto.getHighEntropyValues.call(forged,"
+        "[])),rejected(()=>data.getHighEntropyValues([Symbol('hint')])),"
+        "rejected(()=>data.getHighEntropyValues({[Symbol.iterator](){throw new "
+        "TypeError('iterator')}})),rejected(()=>data.getHighEntropyValues()),"
+        "timed]).then(values=>{"
         "const first=values[0],second=values[1];globalThis.pocSummary="
-        "getterIllegal===3&&methodIllegal===1&&accesses.join(',')==="
+        "getterIllegal===3&&values[2]&&values[3]&&values[4]&&values[5]&&"
+        "order.join(',')==='micro,ua'&&accesses.join(',')==="
         "'iterator,next0,string0,next1,string1,next2,string2,next3'&&"
         "first.architecture==='MIPS'&&Array.isArray(first.formFactors)&&"
         "first.formFactors.length===1&&first.formFactors[0]==='Mobile'&&"
         "first.wow64===false&&first.brands===data.brands&&"
         "second.fullVersionList.length===data.brands.length?"
         "'UA-CLIENT-HINTS-OK':'UA-CLIENT-HINTS-FAILED:'+JSON.stringify({"
-        "getterIllegal,methodIllegal,accesses,first,second})})})()";
+        "getterIllegal,rejections:values.slice(2,6),order,accesses,first,"
+        "second})})})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, ua_client_hints_probe, "<ua-client-hints-probe>",
               &result));

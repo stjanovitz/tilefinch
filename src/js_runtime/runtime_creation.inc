@@ -287,6 +287,7 @@ typedef enum {
     LAZY_BOOTSTRAP_WASM,
     LAZY_BOOTSTRAP_CAPABILITIES,
     LAZY_BOOTSTRAP_INTL,
+    LAZY_BOOTSTRAP_OPFS,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -295,7 +296,8 @@ _Static_assert(LAZY_BOOTSTRAP_COUNT == SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT,
 
 typedef enum {
     LAZY_BOOTSTRAP_GLOBAL = 0,
-    LAZY_BOOTSTRAP_CANVAS_PROTOTYPE
+    LAZY_BOOTSTRAP_CANVAS_PROTOTYPE,
+    LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE
 } LazyBootstrapTarget;
 
 typedef struct {
@@ -375,7 +377,18 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"SourceBuffer", LAZY_BOOTSTRAP_CAPABILITIES, LAZY_BOOTSTRAP_GLOBAL},
     {"SourceBufferList", LAZY_BOOTSTRAP_CAPABILITIES,
      LAZY_BOOTSTRAP_GLOBAL},
-    {"Intl", LAZY_BOOTSTRAP_INTL, LAZY_BOOTSTRAP_GLOBAL}
+    {"Intl", LAZY_BOOTSTRAP_INTL, LAZY_BOOTSTRAP_GLOBAL},
+    {"FileSystemHandle", LAZY_BOOTSTRAP_OPFS, LAZY_BOOTSTRAP_GLOBAL},
+    {"FileSystemFileHandle", LAZY_BOOTSTRAP_OPFS,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"FileSystemDirectoryHandle", LAZY_BOOTSTRAP_OPFS,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"FileSystemWritableFileStream", LAZY_BOOTSTRAP_OPFS,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"FileSystemSyncAccessHandle", LAZY_BOOTSTRAP_OPFS,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"getDirectory", LAZY_BOOTSTRAP_OPFS,
+     LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE}
 };
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
@@ -391,6 +404,7 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_WASM: return "WebAssembly";
     case LAZY_BOOTSTRAP_CAPABILITIES: return "Browser capabilities";
     case LAZY_BOOTSTRAP_INTL: return "Intl";
+    case LAZY_BOOTSTRAP_OPFS: return "Origin-private file system";
     default: return "Platform feature";
     }
 }
@@ -453,8 +467,10 @@ static JSValue runtime_lazy_bootstrap_target(
     if (target == LAZY_BOOTSTRAP_GLOBAL || JS_IsException(global)) {
         return global;
     }
+    const char *constructor_name = target == LAZY_BOOTSTRAP_CANVAS_PROTOTYPE
+        ? "HTMLCanvasElement" : "StorageManager";
     JSValue constructor = JS_GetPropertyStr(
-        context, global, "HTMLCanvasElement");
+        context, global, constructor_name);
     JS_FreeValue(context, global);
     if (JS_IsException(constructor)) return constructor;
     JSValue prototype = JS_GetPropertyStr(context, constructor, "prototype");
@@ -678,6 +694,42 @@ static bool runtime_load_lazy_bootstrap(
                          browser_bootstrap_intl_bytecode),
             "<browser-intl-lazy>", &browser_bootstrap_intl_bytecode,
             false, trace, &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_OPFS) {
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom bridge_atom = JS_NewAtom(
+            runtime->context, "__tilefinchOpfsCommand");
+        JSAtom storage_atom = JS_NewAtom(
+            runtime->context, "__tilefinchOpfsStorageManager");
+        bool bridge_ready = !JS_IsException(global)
+            && bridge_atom != JS_ATOM_NULL
+            && storage_atom != JS_ATOM_NULL
+            && js_rt_install_function(
+                runtime->context, global, "__tilefinchOpfsCommand",
+                js_opfs_command, 4)
+            && JS_DefinePropertyValue(
+                   runtime->context, global, storage_atom,
+                   JS_DupValue(runtime->context,
+                               runtime->opfs_storage_manager),
+                   JS_PROP_CONFIGURABLE) >= 0;
+        if (bridge_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_opfs,
+                             browser_bootstrap_opfs_bytecode),
+                "<browser-opfs-lazy>", &browser_bootstrap_opfs_bytecode,
+                false, trace, &total_us, &compile_us);
+        }
+        if (bridge_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(
+                runtime->context, global, bridge_atom, 0);
+            JS_FreeAtom(runtime->context, bridge_atom);
+        }
+        if (storage_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(
+                runtime->context, global, storage_atom, 0);
+            JS_FreeAtom(runtime->context, storage_atom);
+        }
+        JS_FreeValue(runtime->context, global);
     }
     if (evaluated && feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
         JSValue global = JS_GetGlobalObject(runtime->context);
@@ -1383,6 +1435,7 @@ static ScriptRuntime *script_runtime_create_internal(
     host->media_update = JS_UNDEFINED;
     host->page_visibility_host_apply = JS_UNDEFINED;
     host->fullscreen_host_exit = JS_UNDEFINED;
+    host->opfs_storage_manager = JS_UNDEFINED;
     host->game_audio_host_suspend = JS_UNDEFINED;
     host->game_audio_host_complete = JS_UNDEFINED;
     host->function_to_string = JS_UNDEFINED;
@@ -2180,6 +2233,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchDecodeUtf8Valid",
                                        js_utf8_decode_valid, 2)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchEncodeUtf8",
+                                       js_utf8_encode, 1)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchDetachArrayBuffer",
                                        js_detach_array_buffer, 1)
                    && js_rt_install_function(host->context, global,
@@ -2221,6 +2277,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchRequestNavigation",
                                        js_request_navigation, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchUserActivationState",
+                                       js_user_activation_state, 0)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchRequestMedia",
                                        js_request_media, 4)
@@ -2421,6 +2480,16 @@ static ScriptRuntime *script_runtime_create_internal(
                 host, LAZY_BOOTSTRAP_INTL);
         }
         if (evaluated) {
+            bool expose_opfs = !host->bridge.opaque_origin
+                && host->bridge.document_url != NULL
+                && tilefinch_url_potentially_trustworthy(
+                       host->bridge.document_url);
+            if (expose_opfs) {
+                evaluated = runtime_install_lazy_bootstrap_feature(
+                    host, LAZY_BOOTSTRAP_OPFS);
+            }
+        }
+        if (evaluated) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 host, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
                           browser_bootstrap_compat,
@@ -2512,6 +2581,18 @@ static ScriptRuntime *script_runtime_create_internal(
             host->fullscreen_host_exit = JS_GetPropertyStr(
                 host->context, global,
                 "__tilefinchExitFullscreenFromHost");
+            JSValue navigator = JS_GetPropertyStr(
+                host->context, global, "navigator");
+            if (!JS_IsException(navigator)) {
+                host->opfs_storage_manager = JS_GetPropertyStr(
+                    host->context, navigator, "storage");
+                if (JS_IsException(host->opfs_storage_manager)) {
+                    JS_FreeValue(host->context,
+                                 host->opfs_storage_manager);
+                    host->opfs_storage_manager = JS_UNDEFINED;
+                }
+            }
+            JS_FreeValue(host->context, navigator);
             host->bridge.trusted_node_wrap = JS_GetPropertyStr(
                 host->context, global, "__tilefinchWrap");
             host->bridge.trusted_stable_script_wrap = JS_GetPropertyStr(
@@ -2590,10 +2671,13 @@ static ScriptRuntime *script_runtime_create_internal(
                 host->context, "__tilefinchApplyPageVisibility");
             JSAtom visibility_query_atom = JS_NewAtom(
                 host->context, "__tilefinchPageVisible");
+            JSAtom user_activation_atom = JS_NewAtom(
+                host->context, "__tilefinchUserActivationState");
             if (media_state_atom == JS_ATOM_NULL
                 || fullscreen_exit_atom == JS_ATOM_NULL
                 || visibility_apply_atom == JS_ATOM_NULL
                 || visibility_query_atom == JS_ATOM_NULL
+                || user_activation_atom == JS_ATOM_NULL
                 || JS_DeleteProperty(
                        host->context, global, media_state_atom, 0) < 0
                 || JS_DeleteProperty(
@@ -2601,13 +2685,16 @@ static ScriptRuntime *script_runtime_create_internal(
                 || JS_DeleteProperty(
                        host->context, global, visibility_apply_atom, 0) <= 0
                 || JS_DeleteProperty(
-                       host->context, global, visibility_query_atom, 0) <= 0) {
+                       host->context, global, visibility_query_atom, 0) <= 0
+                || JS_DeleteProperty(
+                       host->context, global, user_activation_atom, 0) <= 0) {
                 evaluated = false;
             }
             JS_FreeAtom(host->context, media_state_atom);
             JS_FreeAtom(host->context, fullscreen_exit_atom);
             JS_FreeAtom(host->context, visibility_apply_atom);
             JS_FreeAtom(host->context, visibility_query_atom);
+            JS_FreeAtom(host->context, user_activation_atom);
         }
         /* Trusted bootstrap may use dynamic compilation to construct bounded
            browser shims. Author code begins only after the native QuickJS

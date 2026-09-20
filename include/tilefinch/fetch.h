@@ -221,6 +221,15 @@ typedef enum {
     FETCH_PAGE_REDIRECT_MANUAL
 } FetchPageRedirectMode;
 
+typedef enum {
+    /* Browser-authored cache policy. These values grant only fixed native
+       Cache-Control/Pragma synthesis and never bypass CORS header analysis. */
+    FETCH_CACHE_DEFAULT = 0,
+    FETCH_CACHE_NO_CACHE,
+    FETCH_CACHE_NO_STORE,
+    FETCH_CACHE_RELOAD
+} FetchCacheMode;
+
 typedef bool (*FetchRedirectUrlValidator)(const char *url);
 
 typedef struct {
@@ -230,6 +239,7 @@ typedef struct {
     const char *content_type;
     /* Newline-delimited, prevalidated "name: value" application headers. */
     const char *extra_headers;
+    FetchCacheMode cache_mode;
     /* Browser-generated CORS preflight fields use extra_headers as their
        bounded wire representation, but page-controlled callers may never
        inject Access-Control-Request-* themselves.  This flag opens only the
@@ -352,6 +362,7 @@ typedef enum {
     FETCH_REQUEST_VALIDATION_EXTRA_HEADERS,
     FETCH_REQUEST_VALIDATION_BODY,
     FETCH_REQUEST_VALIDATION_CREDENTIALS,
+    FETCH_REQUEST_VALIDATION_CACHE_MODE,
     FETCH_REQUEST_VALIDATION_CONTEXT
 } FetchRequestValidationError;
 

@@ -1254,8 +1254,12 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
                                            fetched->effective_url))
                               ? "cors" : "basic"));
                 if (!filtered) {
-                    js_rt_script_set_response_body(
-                        runtime->context, payload, fetched);
+                    if (!js_rt_script_set_response_body(
+                            runtime->context, payload, fetched,
+                            async_fetch.prefer_text_response)) {
+                        JS_FreeValue(runtime->context, payload);
+                        payload = JS_EXCEPTION;
+                    }
                 }
             }
         } else {

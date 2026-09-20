@@ -49,12 +49,17 @@ longer depend on them.
     retaining the logical scan and interrupt bounds.
 12. `single-char-string-buffer` — single-code-unit `StringBuffer` results
     share the immutable one-character cache.
-13. `compact-char-array` and `compact-char-array-cow` — pack dense arrays
-    of one-character Latin-1 strings, with copy-on-write (option
+13. `compact-char-array`, `compact-char-array-cow`, and `compact-byte-array`
+    — pack dense arrays of one-character Latin-1 strings, signed/unsigned
+    byte integers, or signed 16-bit integers, with copy-on-write for character
+    arrays (option
     `PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY`, default ON).
 14. `array-length-shrink` — keep examining the current property-table slot
     when deletion compacts a sparse Array's shape, so reducing `length`
     cannot leave configurable indexed properties behind.
+15. `native-string-gc` — give bounded native Latin-1 producers the same
+    pre-allocation cycle-collection opportunity as the engine's other large
+    string builders.
 
 The embedder also exposes a trap-free `JS_IsProxy` brand query. HTML
 structured clone uses it to reject Proxy values before reflecting over their

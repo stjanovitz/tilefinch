@@ -444,6 +444,31 @@
     CHECK(attribute_equals(inline_node, "data-third", "click"));
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
+              "(()=>{const event=new Event('probe'),descriptor="
+              "Object.getOwnPropertyDescriptor(event,'isTrusted');"
+              "let changed=false;try{Object.defineProperty(event,'isTrusted',"
+              "{value:true})}catch(error){changed=error instanceof TypeError}"
+              "pocSummary=!event.isTrusted&&descriptor.enumerable&&"
+              "!descriptor.configurable&&typeof descriptor.get==='function'&&"
+              "descriptor.set===undefined&&changed?'trusted-event-shape':'bad';})()",
+              "<trusted-event-shape>", &interactive.page.script_result)
+          && strcmp(interactive.page.script_result.summary,
+                    "trusted-event-shape") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              interactive.page.runtime,
+              "(()=>{const hidden=name=>typeof name!=='string'||"
+              "!name.startsWith('__tilefinch');const ordinary={visible:1};"
+              "pocSummary=Reflect.ownKeys(globalThis).every(hidden)&&"
+              "Object.getOwnPropertyNames(globalThis).every(hidden)&&"
+              "Reflect.ownKeys(Object.getOwnPropertyDescriptors(globalThis))"
+              ".every(hidden)&&Reflect.ownKeys(ordinary).includes('visible')&&"
+              "Object.getOwnPropertyNames(ordinary).includes('visible')?"
+              "'private-global-shape':'bad';})()",
+              "<private-global-shape>", &interactive.page.script_result)
+          && strcmp(interactive.page.script_result.summary,
+                    "private-global-shape") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              interactive.page.runtime,
               "document.getElementById('status').setAttribute("
               "'aria-label','ready')",
               "<semantic-attribute-mutation>",
@@ -3130,7 +3155,7 @@
             &capability_trace_navigation);
     bool capability_trace_has_missing = strstr(
         capability_trace_navigation.last_page_trace,
-        "has:navigator.tilefinchMissingProbe") != NULL;
+        "has:global.navigator.tilefinchMissingProbe") != NULL;
     bool capability_trace_has_failure_call = strstr(
         capability_trace_navigation.last_page_trace,
         "call:global.Math.min") != NULL;

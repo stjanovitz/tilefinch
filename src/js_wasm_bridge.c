@@ -941,7 +941,10 @@ static JSValue js_wasm_call_export(
     }
     const TilefinchWasmExport *exported = &instance->exports[export_index];
     wasm_function_inst_t function = exported->function;
-    if (wasm_trace_enabled()) {
+    bool trace = wasm_trace_enabled();
+    uint64_t trace_started_us = trace
+        ? tilefinch_platform_monotonic_time_us() : 0;
+    if (trace) {
         fprintf(stderr, "tilefinch-wasm: call export=%s argc=%d\n",
                 exported->name, argc);
     }
@@ -999,6 +1002,14 @@ static JSValue js_wasm_call_export(
             instance->execution, function, result_count, results,
             parameter_count, arguments);
     instance->call_depth--;
+    if (trace) {
+        fprintf(stderr,
+                "tilefinch-wasm: return export=%s called=%u elapsed-us=%llu\n",
+                exported->name, called ? 1u : 0u,
+                (unsigned long long)
+                    (tilefinch_platform_monotonic_time_us()
+                     - trace_started_us));
+    }
     if (!wasm_memory_refresh(context, instance, false)) {
         wasm_runtime_set_exception(instance->instance, NULL);
         return JS_EXCEPTION;

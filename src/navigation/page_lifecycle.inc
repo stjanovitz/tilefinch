@@ -12,6 +12,8 @@ struct NavigationFramePresentation {
 
 static bool navigation_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame);
+static bool navigation_refresh_frame_presentation_or_defer(
+    NavigationSession *session, NavigationFrame *frame);
 
 static NavigationFrame *navigation_frame_parent(
     NavigationSession *session, const NavigationFrame *frame)
@@ -1161,7 +1163,7 @@ static bool navigation_dispatch_frame_parent_event(
     if (!dispatched) return true;
     if (!script_runtime_consume_relayout(parent_runtime)) return true;
     return parent == NULL ? navigation_relayout(session)
-                          : navigation_refresh_frame_presentation(
+                          : navigation_refresh_frame_presentation_or_defer(
                                 session, parent);
 }
 
@@ -1389,11 +1391,17 @@ static bool navigation_queue_frame_message(void *opaque,
             trace_limit = (size_t) requested;
         }
         fprintf(stderr,
-                "frame-message-json sequence=%llu direction=%s source=%ld target=%ld json=\"%.*s\"\n",
+                "frame-message-json sequence=%llu time-ms=%llu direction=%s "
+                "source=%ld source-generation=%llu target=%ld "
+                "target-generation=%llu json=\"%.*s\"\n",
                 (unsigned long long) message->sequence,
+                (unsigned long long) (navigation_now_us() / 1000u),
                 source == session->page.runtime ? "parent-to-child"
                                                 : "child-to-parent",
-                message->source_frame_handle, message->target_frame_handle,
+                message->source_frame_handle,
+                (unsigned long long) message->source_generation,
+                message->target_frame_handle,
+                (unsigned long long) message->target_generation,
                 (int) (json_length < trace_limit ? json_length : trace_limit),
                 json);
     }
@@ -1411,6 +1419,12 @@ static bool navigation_queue_frame_message(void *opaque,
                 }
                 memcpy(session->last_frame_message_event, event, length);
                 session->last_frame_message_event[length] = '\0';
+                session->last_frame_message_event_sequence =
+                    message->sequence;
+                session->last_frame_message_event_source =
+                    message->source_frame_handle;
+                session->last_frame_message_event_source_generation =
+                    message->source_generation;
                 char record[112];
                 int written = snprintf(
                     record, sizeof(record), "%s:%.*s",
@@ -1763,12 +1777,13 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
         NavigationFrame *frame = &session->page.frames[i];
         if (frame->retired || !frame->loaded || frame->runtime == NULL
             || !frame->presentation_dirty) continue;
-        frame->presentation_dirty = false;
-        if (!navigation_refresh_frame_presentation(session, frame)) {
-            frame->presentation_dirty = session->page.loaded;
-            if (!session->page.loaded) return false;
-        }
-        break;
+        if (!navigation_refresh_frame_presentation_or_defer(
+                session, frame)) return false;
+        /* A permanently unpublishable frame (for example, one whose element
+           was detached) keeps its retry latch, but must not starve a later
+           child whose snapshot can be refreshed. The fixed frame table keeps
+           this scan bounded; still stop after the first successful publish. */
+        if (!frame->presentation_dirty) break;
     }
     return true;
 }
@@ -2681,6 +2696,12 @@ static bool navigation_refresh_frame_presentation(
     if (session == NULL || frame == NULL || frame->runtime == NULL
         || frame->document.html == NULL || frame->element == NULL
         || session->images != &session->page.images) return false;
+#if !defined(__PSP__)
+    if (tilefinch_test_faults()->refuse_next_frame_presentation) {
+        tilefinch_test_faults()->refuse_next_frame_presentation = false;
+        return false;
+    }
+#endif
     int width = 0, height = 0;
     if (!navigation_frame_presentation_dimensions(
             session, frame, &width, &height)) return false;
@@ -2789,11 +2810,32 @@ static bool navigation_refresh_frame_presentation(
        time; the top-level page alone publishes final damage. */
     NavigationFrame *parent = navigation_frame_parent(session, frame);
     return parent == NULL ? navigation_relayout(session)
-                          : navigation_refresh_frame_presentation(
+                          : navigation_refresh_frame_presentation_or_defer(
                                 session, parent);
 }
 
+/* A child mutation has already committed before its opaque snapshot is
+   rebuilt. Refusing the bounded layout/render allocation is therefore a
+   deferrable publication failure while the owning page remains live. Keep
+   the dirty bit latched so a later owner tick retries instead of leaving the
+   old child pixels permanently published. */
+static bool navigation_refresh_frame_presentation_or_defer(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    if (session == NULL || frame == NULL) return false;
+    frame->presentation_dirty = false;
+    if (navigation_refresh_frame_presentation(session, frame)) return true;
+    if (!session->page.loaded) return false;
+    frame->presentation_dirty = true;
+    return true;
+}
+
 #if !defined(__PSP__)
+void navigation_test_refuse_next_frame_presentation(void)
+{
+    tilefinch_test_faults()->refuse_next_frame_presentation = true;
+}
+
 bool navigation_test_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame)
 {
@@ -2820,7 +2862,7 @@ static bool navigation_install_frame_capability_trace(
            browser-capability signal and can make the validation run hit
            its heap ceiling. The objects below are the standards surfaces
            this diagnostic is intended to inventory. */
-        "for(const name of ['navigator','performance','screen','history'])if(globalThis[name])globalThis[name]=traceObject(globalThis[name],name);"
+        "for(const name of ['performance','screen','history'])if(globalThis[name])globalThis[name]=traceObject(globalThis[name],name);"
         "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','MutationObserver'])if(typeof globalThis[name]==='function')globalThis[name]=traceObject(globalThis[name],name);})();";
     return script_runtime_evaluate_diagnostic(
         frame->runtime, trace_setup, "<frame-capability-trace>",
@@ -3088,9 +3130,8 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     frame->loaded = true;
     session->frames_loaded++;
-    bool frame_presented = navigation_refresh_frame_presentation(
-        session, frame);
-    if (!frame_presented && !session->page.loaded) return false;
+    if (!navigation_refresh_frame_presentation_or_defer(
+            session, frame)) return false;
     if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL) {
         script_runtime_report_roots(frame->runtime, stderr, "frame-loaded",
                                     "child", frame->parent_handle);

@@ -8,6 +8,14 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.24 — 2026-09-19
+
+- Improved compatibility for Workers, embedded frames, Web Crypto, storage,
+  and other modern web APIs.
+- Reduced JavaScript memory use and improved stability on script-heavy pages.
+- Fixed additional frame updates, session-data clearing, and platform API
+  behavior.
+
 ## 0.1.23 — 2026-09-13
 
 - Improved Worker and browser event ordering on complex pages.

@@ -21,6 +21,20 @@
 #define DEFAULT_STORAGE_BYTES (16u * 1024u)
 #define DEFAULT_COOKIE_BYTES (4u * 1024u)
 
+typedef struct {
+    char origin[BROWSER_ORIGIN_LIMIT];
+    char path[BROWSER_OPFS_PATH_LIMIT];
+    unsigned char *data;
+    size_t data_length;
+    int64_t last_modified_ms;
+    uint64_t generation;
+    BrowserOpfsKind kind;
+} BrowserOpfsEntry;
+
+struct BrowserOpfsStore {
+    BrowserOpfsEntry entries[BROWSER_OPFS_ENTRIES];
+};
+
 static BrowserCacheEntry *cache_find_key(BrowserSession *session,
                                          const char *key);
 static BrowserCacheEntry *cache_find_resource_key(
@@ -166,6 +180,7 @@ bool browser_session_init(BrowserSession *session, Budget *budget,
     memset(session, 0, sizeof(*session));
     session->budget = budget;
     session->maximum_storage_bytes = DEFAULT_STORAGE_BYTES;
+    session->maximum_opfs_bytes = BROWSER_OPFS_TOTAL_BYTE_LIMIT;
     session->maximum_cookie_bytes = DEFAULT_COOKIE_BYTES;
     session->maximum_cookie_long_path_bytes =
         BROWSER_COOKIE_LONG_PATH_BYTES;
@@ -672,6 +687,310 @@ void browser_session_storage_clear_all(BrowserSession *session, bool local)
         budget_free(session->budget, entry->value);
         memset(entry, 0, sizeof(*entry));
     }
+}
+
+static bool opfs_path_valid(const char *path)
+{
+    if (path == NULL || path[0] != '/') return false;
+    size_t length = strlen(path);
+    if (length == 0 || length >= BROWSER_OPFS_PATH_LIMIT) return false;
+    if (length > 1 && path[length - 1] == '/') return false;
+    const char *component = path + 1;
+    while (*component != '\0') {
+        const char *separator = strchr(component, '/');
+        size_t component_length = separator == NULL
+            ? strlen(component) : (size_t) (separator - component);
+        if (component_length == 0
+            || (component_length == 1 && component[0] == '.')
+            || (component_length == 2 && component[0] == '.'
+                && component[1] == '.')) return false;
+        component = separator == NULL ? component + component_length
+                                      : separator + 1;
+    }
+    return true;
+}
+
+static BrowserOpfsEntry *opfs_find(
+    BrowserSession *session, const char *origin, const char *path)
+{
+    if (session == NULL || session->opfs == NULL) return NULL;
+    for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+        BrowserOpfsEntry *entry = &session->opfs->entries[i];
+        if (entry->kind != BROWSER_OPFS_NONE
+            && strcmp(entry->origin, origin) == 0
+            && strcmp(entry->path, path) == 0) return entry;
+    }
+    return NULL;
+}
+
+static BrowserOpfsResult opfs_authority(
+    const BrowserSession *session, const char *url,
+    char origin[BROWSER_ORIGIN_LIMIT])
+{
+    if (session == NULL || session->budget == NULL
+        || !session->site_data_allowed
+        || session->captive_portal_stash != NULL
+        || url == NULL || !copy_origin(url, origin)) {
+        return BROWSER_OPFS_UNAVAILABLE;
+    }
+    return BROWSER_OPFS_OK;
+}
+
+static bool opfs_parent_path(
+    const char *path, char parent[BROWSER_OPFS_PATH_LIMIT])
+{
+    if (!opfs_path_valid(path) || strcmp(path, "/") == 0) return false;
+    const char *separator = strrchr(path, '/');
+    size_t length = separator == path ? 1u : (size_t) (separator - path);
+    memcpy(parent, path, length);
+    parent[length] = '\0';
+    return true;
+}
+
+static int64_t opfs_modified_now(void)
+{
+    int64_t seconds = (int64_t) time(NULL);
+    if (seconds <= 0 || seconds > INT64_MAX / 1000) return 0;
+    return seconds * 1000;
+}
+
+static uint64_t opfs_next_generation(BrowserSession *session)
+{
+    session->opfs_generation_clock++;
+    if (session->opfs_generation_clock == 0)
+        session->opfs_generation_clock = 1;
+    return session->opfs_generation_clock;
+}
+
+BrowserOpfsResult browser_session_opfs_stat(
+    const BrowserSession *session, const char *url, const char *path,
+    BrowserOpfsView *view)
+{
+    if (view != NULL) memset(view, 0, sizeof(*view));
+    char origin[BROWSER_ORIGIN_LIMIT];
+    BrowserOpfsResult authority = opfs_authority(session, url, origin);
+    if (authority != BROWSER_OPFS_OK) return authority;
+    if (!opfs_path_valid(path)) return BROWSER_OPFS_INVALID_PATH;
+    if (strcmp(path, "/") == 0) {
+        if (view != NULL) view->kind = BROWSER_OPFS_DIRECTORY;
+        return BROWSER_OPFS_OK;
+    }
+    BrowserOpfsEntry *entry = opfs_find(
+        (BrowserSession *) session, origin, path);
+    if (entry == NULL) return BROWSER_OPFS_NOT_FOUND;
+    if (view != NULL) {
+        view->kind = entry->kind;
+        view->data = entry->data;
+        view->data_length = entry->data_length;
+        view->last_modified_ms = entry->last_modified_ms;
+        view->generation = entry->generation;
+    }
+    return BROWSER_OPFS_OK;
+}
+
+BrowserOpfsResult browser_session_opfs_create(
+    BrowserSession *session, const char *url, const char *path,
+    BrowserOpfsKind kind)
+{
+    char origin[BROWSER_ORIGIN_LIMIT];
+    BrowserOpfsResult authority = opfs_authority(session, url, origin);
+    if (authority != BROWSER_OPFS_OK) return authority;
+    if (!opfs_path_valid(path) || strcmp(path, "/") == 0
+        || (kind != BROWSER_OPFS_FILE
+            && kind != BROWSER_OPFS_DIRECTORY)) {
+        return BROWSER_OPFS_INVALID_PATH;
+    }
+    BrowserOpfsEntry *existing = opfs_find(session, origin, path);
+    if (existing != NULL) {
+        return existing->kind == kind ? BROWSER_OPFS_OK
+                                      : BROWSER_OPFS_TYPE_MISMATCH;
+    }
+    char parent[BROWSER_OPFS_PATH_LIMIT];
+    if (!opfs_parent_path(path, parent)) return BROWSER_OPFS_INVALID_PATH;
+    if (strcmp(parent, "/") != 0) {
+        BrowserOpfsEntry *parent_entry = opfs_find(session, origin, parent);
+        if (parent_entry == NULL) return BROWSER_OPFS_NOT_FOUND;
+        if (parent_entry->kind != BROWSER_OPFS_DIRECTORY)
+            return BROWSER_OPFS_TYPE_MISMATCH;
+    }
+    if (session->opfs == NULL) {
+        session->opfs = budget_calloc(
+            session->budget, 1, sizeof(*session->opfs));
+        if (session->opfs == NULL) return BROWSER_OPFS_QUOTA_EXCEEDED;
+    }
+    BrowserOpfsEntry *entry = NULL;
+    for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+        if (session->opfs->entries[i].kind == BROWSER_OPFS_NONE) {
+            entry = &session->opfs->entries[i];
+            break;
+        }
+    }
+    if (entry == NULL) return BROWSER_OPFS_QUOTA_EXCEEDED;
+    snprintf(entry->origin, sizeof(entry->origin), "%s", origin);
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+    entry->kind = kind;
+    entry->last_modified_ms = opfs_modified_now();
+    entry->generation = opfs_next_generation(session);
+    return BROWSER_OPFS_OK;
+}
+
+BrowserOpfsResult browser_session_opfs_write(
+    BrowserSession *session, const char *url, const char *path,
+    const unsigned char *data, size_t data_length)
+{
+    char origin[BROWSER_ORIGIN_LIMIT];
+    BrowserOpfsResult authority = opfs_authority(session, url, origin);
+    if (authority != BROWSER_OPFS_OK) return authority;
+    if (!opfs_path_valid(path) || strcmp(path, "/") == 0
+        || (data == NULL && data_length != 0)) {
+        return BROWSER_OPFS_INVALID_PATH;
+    }
+    BrowserOpfsEntry *entry = opfs_find(session, origin, path);
+    if (entry == NULL) return BROWSER_OPFS_NOT_FOUND;
+    if (entry->kind != BROWSER_OPFS_FILE)
+        return BROWSER_OPFS_TYPE_MISMATCH;
+    if (data_length > BROWSER_OPFS_FILE_BYTE_LIMIT)
+        return BROWSER_OPFS_QUOTA_EXCEEDED;
+    size_t retained = session->opfs_bytes >= entry->data_length
+        ? session->opfs_bytes - entry->data_length : 0;
+    if (retained > session->maximum_opfs_bytes
+        || data_length > session->maximum_opfs_bytes - retained) {
+        return BROWSER_OPFS_QUOTA_EXCEEDED;
+    }
+    unsigned char *copy = NULL;
+    if (data_length != 0) {
+        copy = budget_malloc(session->budget, data_length);
+        if (copy == NULL) return BROWSER_OPFS_QUOTA_EXCEEDED;
+        memcpy(copy, data, data_length);
+    }
+    budget_free(session->budget, entry->data);
+    entry->data = copy;
+    session->opfs_bytes = retained + data_length;
+    entry->data_length = data_length;
+    entry->last_modified_ms = opfs_modified_now();
+    entry->generation = opfs_next_generation(session);
+    return BROWSER_OPFS_OK;
+}
+
+static bool opfs_descendant(const char *parent, const char *candidate,
+                            const char **relative)
+{
+    if (strcmp(parent, "/") == 0) {
+        if (candidate[0] != '/' || candidate[1] == '\0') return false;
+        if (relative != NULL) *relative = candidate + 1;
+        return true;
+    }
+    size_t length = strlen(parent);
+    if (strncmp(candidate, parent, length) != 0
+        || candidate[length] != '/' || candidate[length + 1] == '\0') {
+        return false;
+    }
+    if (relative != NULL) *relative = candidate + length + 1;
+    return true;
+}
+
+static void opfs_clear_entry(BrowserSession *session, BrowserOpfsEntry *entry)
+{
+    if (entry->data_length <= session->opfs_bytes)
+        session->opfs_bytes -= entry->data_length;
+    else
+        session->opfs_bytes = 0;
+    budget_free(session->budget, entry->data);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void opfs_release_if_empty(BrowserSession *session)
+{
+    if (session == NULL || session->opfs == NULL) return;
+    for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++)
+        if (session->opfs->entries[i].kind != BROWSER_OPFS_NONE) return;
+    budget_free(session->budget, session->opfs);
+    session->opfs = NULL;
+}
+
+void browser_session_opfs_clear_all(BrowserSession *session)
+{
+    if (session == NULL || session->opfs == NULL) return;
+    for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+        BrowserOpfsEntry *entry = &session->opfs->entries[i];
+        if (entry->kind != BROWSER_OPFS_NONE)
+            opfs_clear_entry(session, entry);
+    }
+    opfs_release_if_empty(session);
+}
+
+BrowserOpfsResult browser_session_opfs_remove(
+    BrowserSession *session, const char *url, const char *path,
+    bool recursive)
+{
+    char origin[BROWSER_ORIGIN_LIMIT];
+    BrowserOpfsResult authority = opfs_authority(session, url, origin);
+    if (authority != BROWSER_OPFS_OK) return authority;
+    if (!opfs_path_valid(path) || strcmp(path, "/") == 0)
+        return BROWSER_OPFS_INVALID_PATH;
+    BrowserOpfsEntry *entry = opfs_find(session, origin, path);
+    if (entry == NULL) return BROWSER_OPFS_NOT_FOUND;
+    if (entry->kind == BROWSER_OPFS_DIRECTORY) {
+        for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+            BrowserOpfsEntry *child = &session->opfs->entries[i];
+            if (child->kind != BROWSER_OPFS_NONE
+                && strcmp(child->origin, origin) == 0
+                && opfs_descendant(path, child->path, NULL)) {
+                if (!recursive) return BROWSER_OPFS_NOT_EMPTY;
+            }
+        }
+        if (recursive) {
+            for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+                BrowserOpfsEntry *child = &session->opfs->entries[i];
+                if (child->kind != BROWSER_OPFS_NONE
+                    && strcmp(child->origin, origin) == 0
+                    && opfs_descendant(path, child->path, NULL)) {
+                    opfs_clear_entry(session, child);
+                }
+            }
+        }
+    }
+    opfs_clear_entry(session, entry);
+    opfs_release_if_empty(session);
+    return BROWSER_OPFS_OK;
+}
+
+BrowserOpfsResult browser_session_opfs_child(
+    const BrowserSession *session, const char *url, const char *parent,
+    size_t index, const char **name, BrowserOpfsView *view)
+{
+    if (name != NULL) *name = NULL;
+    if (view != NULL) memset(view, 0, sizeof(*view));
+    char origin[BROWSER_ORIGIN_LIMIT];
+    BrowserOpfsResult authority = opfs_authority(session, url, origin);
+    if (authority != BROWSER_OPFS_OK) return authority;
+    BrowserOpfsView parent_view;
+    BrowserOpfsResult parent_result = browser_session_opfs_stat(
+        session, url, parent, &parent_view);
+    if (parent_result != BROWSER_OPFS_OK) return parent_result;
+    if (parent_view.kind != BROWSER_OPFS_DIRECTORY)
+        return BROWSER_OPFS_TYPE_MISMATCH;
+    size_t seen = 0;
+    if (session->opfs == NULL) return BROWSER_OPFS_NOT_FOUND;
+    for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+        const BrowserOpfsEntry *entry = &session->opfs->entries[i];
+        const char *relative = NULL;
+        if (entry->kind == BROWSER_OPFS_NONE
+            || strcmp(entry->origin, origin) != 0
+            || !opfs_descendant(parent, entry->path, &relative)
+            || strchr(relative, '/') != NULL) continue;
+        if (seen++ != index) continue;
+        if (name != NULL) *name = relative;
+        if (view != NULL) {
+            view->kind = entry->kind;
+            view->data = entry->data;
+            view->data_length = entry->data_length;
+            view->last_modified_ms = entry->last_modified_ms;
+            view->generation = entry->generation;
+        }
+        return BROWSER_OPFS_OK;
+    }
+    return BROWSER_OPFS_NOT_FOUND;
 }
 
 struct BrowserCookieOverlay {
@@ -1883,6 +2202,15 @@ bool browser_session_site_data_usage(
         else usage->session_storage_count++;
         usage->storage_bytes += entry->value_length + strlen(entry->key);
     }
+    if (session->opfs != NULL) {
+        for (size_t at = 0; at < BROWSER_OPFS_ENTRIES; at++) {
+            const BrowserOpfsEntry *entry = &session->opfs->entries[at];
+            if (entry->kind == BROWSER_OPFS_NONE
+                || strcmp(entry->origin, origin) != 0) continue;
+            usage->opfs_entry_count++;
+            usage->opfs_bytes += entry->data_length;
+        }
+    }
     return true;
 }
 
@@ -1909,6 +2237,16 @@ bool browser_session_clear_site_data(
             session->storage_bytes = 0;
         budget_free(session->budget, entry->value);
         memset(entry, 0, sizeof(*entry));
+    }
+    if (session->opfs != NULL) {
+        for (size_t at = 0; at < BROWSER_OPFS_ENTRIES; at++) {
+            BrowserOpfsEntry *entry = &session->opfs->entries[at];
+            if (entry->kind != BROWSER_OPFS_NONE
+                && strcmp(entry->origin, origin) == 0) {
+                opfs_clear_entry(session, entry);
+            }
+        }
+        opfs_release_if_empty(session);
     }
     for (size_t at = 0; at < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; at++) {
         BrowserClientHintEntry *entry = &session->client_hints[at];
@@ -4032,8 +4370,10 @@ bool browser_session_cache_restore_offline(
 
 struct BrowserCaptivePortalStash {
     BrowserStorageEntry storage[BROWSER_STORAGE_ENTRIES];
+    struct BrowserOpfsStore *opfs;
     BrowserCookieEntry cookies[BROWSER_COOKIE_ENTRIES];
     size_t storage_bytes;
+    size_t opfs_bytes;
     size_t cookie_bytes;
     size_t cookie_long_path_bytes;
     size_t cookie_clock;
@@ -4127,8 +4467,10 @@ bool browser_session_captive_portal_begin(
         session->budget, 1, sizeof(*stash));
     if (stash == NULL) return false;
     memcpy(stash->storage, session->storage, sizeof(stash->storage));
+    stash->opfs = session->opfs;
     memcpy(stash->cookies, session->cookies, sizeof(stash->cookies));
     stash->storage_bytes = session->storage_bytes;
+    stash->opfs_bytes = session->opfs_bytes;
     stash->cookie_bytes = session->cookie_bytes;
     stash->cookie_long_path_bytes = session->cookie_long_path_bytes;
     stash->cookie_clock = session->cookie_clock;
@@ -4148,8 +4490,10 @@ bool browser_session_captive_portal_begin(
     stash->hsts_clock = session->hsts_clock;
 
     memset(session->storage, 0, sizeof(session->storage));
+    session->opfs = NULL;
     memset(session->cookies, 0, sizeof(session->cookies));
     session->storage_bytes = 0;
+    session->opfs_bytes = 0;
     session->cookie_bytes = 0;
     session->cookie_long_path_bytes = 0;
     session->cookie_clock = 0;
@@ -4176,13 +4520,21 @@ void browser_session_captive_portal_end(BrowserSession *session)
     struct BrowserCaptivePortalStash *stash = session->captive_portal_stash;
     for (size_t at = 0; at < BROWSER_STORAGE_ENTRIES; at++)
         budget_free(session->budget, session->storage[at].value);
+    if (session->opfs != NULL) {
+        for (size_t at = 0; at < BROWSER_OPFS_ENTRIES; at++)
+            budget_free(
+                session->budget, session->opfs->entries[at].data);
+        budget_free(session->budget, session->opfs);
+    }
     for (size_t at = 0; at < BROWSER_COOKIE_ENTRIES; at++) {
         budget_free(session->budget, session->cookies[at].value);
         budget_free(session->budget, session->cookies[at].long_path);
     }
     memcpy(session->storage, stash->storage, sizeof(session->storage));
+    session->opfs = stash->opfs;
     memcpy(session->cookies, stash->cookies, sizeof(session->cookies));
     session->storage_bytes = stash->storage_bytes;
+    session->opfs_bytes = stash->opfs_bytes;
     session->cookie_bytes = stash->cookie_bytes;
     session->cookie_long_path_bytes = stash->cookie_long_path_bytes;
     session->cookie_clock = stash->cookie_clock;
@@ -4210,6 +4562,12 @@ void browser_session_destroy(BrowserSession *session)
     browser_session_captive_portal_end(session);
     for (size_t i = 0; i < BROWSER_STORAGE_ENTRIES; i++) {
         budget_free(session->budget, session->storage[i].value);
+    }
+    if (session->opfs != NULL) {
+        for (size_t i = 0; i < BROWSER_OPFS_ENTRIES; i++) {
+            budget_free(session->budget, session->opfs->entries[i].data);
+        }
+        budget_free(session->budget, session->opfs);
     }
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
         budget_free(session->budget, session->cookies[i].value);

@@ -230,12 +230,253 @@ static bool trace_extra_header_shape(const char *serialized, char *output,
     return true;
 }
 
+static bool trace_extra_header_shape_with_cache(
+    const FetchRequest *request, char *output, size_t capacity)
+{
+    if (output == NULL || capacity == 0) return false;
+    unsigned mode = request == NULL ? (unsigned) FETCH_CACHE_DEFAULT
+                                    : (unsigned) request->cache_mode;
+    int written = snprintf(output, capacity, "@cache=%u;", mode);
+    if (written < 0 || (size_t) written >= capacity) return false;
+    return trace_extra_header_shape(
+        request == NULL ? NULL : request->extra_headers,
+        output + (size_t) written, capacity - (size_t) written);
+}
+
+static bool trace_cache_mode_from_header_shape(
+    const char *shape, FetchCacheMode *mode)
+{
+    if (shape == NULL || mode == NULL || strncmp(shape, "@cache=", 7) != 0
+        || shape[7] < '0' || shape[7] > '9' || shape[8] != ';') return false;
+    unsigned parsed = (unsigned) (shape[7] - '0');
+    if (parsed > (unsigned) FETCH_CACHE_RELOAD) return false;
+    *mode = (FetchCacheMode) parsed;
+    return true;
+}
+
+static void trace_cookie_provenance_clear(void)
+{
+    for (size_t i = 0; i < FETCH_TRACE_COOKIE_PROVENANCE_LIMIT; i++) {
+        TraceCookieProvenanceEntry *entry =
+            &fetch_trace.cookie_provenance[i];
+        if (entry->storage != NULL && entry->budget != NULL)
+            budget_free(entry->budget, entry->storage);
+        memset(entry, 0, sizeof(*entry));
+    }
+    fetch_trace.cookie_provenance_evictions = 0;
+    fetch_trace.cookie_provenance_allocation_failed = false;
+}
+
+static bool trace_cookie_pair_span(const char *text, size_t text_length,
+                                   bool set_cookie,
+                                   const char **name, size_t *name_length,
+                                   const char **value, size_t *value_length)
+{
+    if (text == NULL || name == NULL || name_length == NULL
+        || value == NULL || value_length == NULL) return false;
+    const char *end = text + text_length;
+    while (text < end && isspace((unsigned char) *text)) text++;
+    if (set_cookie) {
+        const char *semicolon = memchr(text, ';', (size_t) (end - text));
+        if (semicolon != NULL) end = semicolon;
+    }
+    const char *equals = memchr(text, '=', (size_t) (end - text));
+    if (equals == NULL) return false;
+    const char *name_end = equals;
+    while (name_end > text
+           && isspace((unsigned char) name_end[-1])) name_end--;
+    const char *value_start = equals + 1;
+    while (value_start < end
+           && isspace((unsigned char) *value_start)) value_start++;
+    while (end > value_start
+           && isspace((unsigned char) end[-1])) end--;
+    if (name_end == text
+        || (size_t) (name_end - text) >= BROWSER_KEY_LIMIT) return false;
+    *name = text;
+    *name_length = (size_t) (name_end - text);
+    *value = value_start;
+    *value_length = (size_t) (end - value_start);
+    return true;
+}
+
+static bool trace_cookie_pair(const char *text, bool set_cookie,
+                              const char **name, size_t *name_length,
+                              const char **value, size_t *value_length)
+{
+    return text != NULL
+        && trace_cookie_pair_span(text, strlen(text), set_cookie,
+                                  name, name_length, value, value_length);
+}
+
+static void trace_cookie_provenance_observe(
+    Budget *budget, size_t response_sequence, size_t cookie_index,
+    const char *set_cookie)
+{
+    const char *name = NULL, *value = NULL;
+    size_t name_length = 0, value_length = 0;
+    if (budget == NULL
+        || !trace_cookie_pair(set_cookie, true, &name, &name_length,
+                              &value, &value_length)) return;
+    size_t slot = FETCH_TRACE_COOKIE_PROVENANCE_LIMIT;
+    size_t oldest = 0;
+    for (size_t i = 0; i < FETCH_TRACE_COOKIE_PROVENANCE_LIMIT; i++) {
+        TraceCookieProvenanceEntry *entry =
+            &fetch_trace.cookie_provenance[i];
+        if (entry->storage == NULL) {
+            slot = i;
+            break;
+        }
+        TraceCookieProvenanceEntry *oldest_entry =
+            &fetch_trace.cookie_provenance[oldest];
+        if (entry->response_sequence < oldest_entry->response_sequence
+            || (entry->response_sequence == oldest_entry->response_sequence
+                && entry->cookie_index < oldest_entry->cookie_index)) {
+            oldest = i;
+        }
+    }
+    if (slot == FETCH_TRACE_COOKIE_PROVENANCE_LIMIT) {
+        TraceCookieProvenanceEntry *oldest_entry =
+            &fetch_trace.cookie_provenance[oldest];
+        if (response_sequence < oldest_entry->response_sequence
+            || (response_sequence == oldest_entry->response_sequence
+                && cookie_index <= oldest_entry->cookie_index)) return;
+        slot = oldest;
+        budget_free(oldest_entry->budget, oldest_entry->storage);
+        memset(oldest_entry, 0, sizeof(*oldest_entry));
+        fetch_trace.cookie_provenance_evictions++;
+    }
+    size_t storage_size = name_length + 1u;
+    if (value_length > SIZE_MAX - storage_size - 1u) {
+        fetch_trace.cookie_provenance_allocation_failed = true;
+        return;
+    }
+    storage_size += value_length + 1u;
+    char *storage = budget_malloc(budget, storage_size);
+    if (storage == NULL) {
+        fetch_trace.cookie_provenance_allocation_failed = true;
+        return;
+    }
+    memcpy(storage, name, name_length);
+    storage[name_length] = '\0';
+    memcpy(storage + name_length + 1u, value, value_length);
+    storage[name_length + 1u + value_length] = '\0';
+    fetch_trace.cookie_provenance[slot] = (TraceCookieProvenanceEntry) {
+        .budget = budget,
+        .storage = storage,
+        .name_length = name_length,
+        .value_length = value_length,
+        .response_sequence = response_sequence,
+        .cookie_index = cookie_index
+    };
+}
+
+typedef struct {
+    char name[BROWSER_KEY_LIMIT];
+    size_t issuer_sequence;
+    size_t issuer_index;
+    size_t occurrences;
+    bool exact;
+    bool latest;
+} TraceCookieProvenanceResult;
+
+static size_t trace_cookie_provenance_match(
+    const char *cookie_header, TraceCookieProvenanceResult *results,
+    size_t capacity)
+{
+    if (cookie_header == NULL || results == NULL || capacity == 0) return 0;
+    size_t count = 0;
+    const char *at = cookie_header;
+    while (*at != '\0') {
+        const char *end = strchr(at, ';');
+        if (end == NULL) end = at + strlen(at);
+        size_t token_length = (size_t) (end - at);
+        if (token_length < FETCH_SET_COOKIE_LIMIT) {
+            const char *name = NULL, *value = NULL;
+            size_t name_length = 0, value_length = 0;
+            if (trace_cookie_pair_span(at, token_length, false,
+                                       &name, &name_length,
+                                       &value, &value_length)) {
+                size_t result_at = count;
+                for (size_t i = 0; i < count; i++) {
+                    if (strlen(results[i].name) == name_length
+                        && memcmp(results[i].name, name, name_length) == 0) {
+                        result_at = i;
+                        break;
+                    }
+                }
+                bool known = false;
+                size_t latest = FETCH_TRACE_COOKIE_PROVENANCE_LIMIT;
+                size_t matching = FETCH_TRACE_COOKIE_PROVENANCE_LIMIT;
+                for (size_t i = 0;
+                     i < FETCH_TRACE_COOKIE_PROVENANCE_LIMIT; i++) {
+                    const TraceCookieProvenanceEntry *entry =
+                        &fetch_trace.cookie_provenance[i];
+                    if (entry->storage == NULL
+                        || entry->name_length != name_length
+                        || memcmp(entry->storage, name, name_length) != 0) {
+                        continue;
+                    }
+                    known = true;
+                    if (latest == FETCH_TRACE_COOKIE_PROVENANCE_LIMIT
+                        || entry->response_sequence
+                               > fetch_trace.cookie_provenance[latest]
+                                     .response_sequence
+                        || (entry->response_sequence
+                                == fetch_trace.cookie_provenance[latest]
+                                      .response_sequence
+                            && entry->cookie_index
+                                   > fetch_trace.cookie_provenance[latest]
+                                         .cookie_index)) latest = i;
+                    const char *entry_value =
+                        entry->storage + entry->name_length + 1u;
+                    if (entry->value_length == value_length
+                        && memcmp(entry_value, value, value_length) == 0
+                        && (matching == FETCH_TRACE_COOKIE_PROVENANCE_LIMIT
+                            || entry->response_sequence
+                                   > fetch_trace.cookie_provenance[matching]
+                                         .response_sequence
+                            || (entry->response_sequence
+                                    == fetch_trace.cookie_provenance[matching]
+                                          .response_sequence
+                                && entry->cookie_index
+                                       > fetch_trace.cookie_provenance[matching]
+                                             .cookie_index))) matching = i;
+                }
+                if (known && (result_at < count || count < capacity)) {
+                    if (result_at == count) {
+                        memset(&results[result_at], 0,
+                               sizeof(results[result_at]));
+                        memcpy(results[result_at].name, name, name_length);
+                        results[result_at].name[name_length] = '\0';
+                        count++;
+                    }
+                    TraceCookieProvenanceResult *result =
+                        &results[result_at];
+                    result->occurrences++;
+                    if (matching != FETCH_TRACE_COOKIE_PROVENANCE_LIMIT) {
+                        const TraceCookieProvenanceEntry *entry =
+                            &fetch_trace.cookie_provenance[matching];
+                        result->exact = true;
+                        result->issuer_sequence = entry->response_sequence;
+                        result->issuer_index = entry->cookie_index;
+                        result->latest = matching == latest;
+                    }
+                }
+            }
+        }
+        at = *end == ';' ? end + 1 : end;
+    }
+    return count;
+}
+
 typedef struct {
     char meta_path[4096];
     char body_path[4096];
     char logical_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char request_key[TILEFINCH_URL_SERIALIZED_LIMIT];
-    char header_value[FETCH_EXTRA_HEADERS_MAX + 1];
+    char header_value[FETCH_EXTRA_HEADERS_MAX + 16];
+    TraceCookieProvenanceResult cookie_provenance[
+        FETCH_TRACE_COOKIE_PROVENANCE_LIMIT];
 } TraceCaptureScratch;
 
 static bool trace_capture_response_at(size_t sequence, const char *method,
@@ -280,12 +521,15 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
         response_body_hash = trace_body_hash(
             result->data == NULL ? "" : result->data, result->length);
     }
-    if (!trace_extra_header_shape(
-            request == NULL ? NULL : request->extra_headers,
-            scratch->header_value, sizeof(scratch->header_value))) {
+    if (!trace_extra_header_shape_with_cache(
+            request, scratch->header_value, sizeof(scratch->header_value))) {
         budget_free(budget, scratch);
         return false;
     }
+    size_t cookie_provenance_count = trace_cookie_provenance_match(
+        request == NULL ? NULL : request->cookie,
+        scratch->cookie_provenance,
+        FETCH_TRACE_COOKIE_PROVENANCE_LIMIT);
     FetchResponseSecurityMetadata captured_security = result->security;
     if (captured_security.version
             != FETCH_RESPONSE_SECURITY_METADATA_VERSION
@@ -305,7 +549,7 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
         budget_free(budget, scratch);
         return false;
     }
-    bool ok = fprintf(meta, "psp-http-trace=12\n") >= 0
+    bool ok = fprintf(meta, "psp-http-trace=13\n") >= 0
         && fprintf(meta, "cookie-values=%s\n",
                    fetch_trace.capture_raw_cookie_values
                        ? "raw" : "redacted") >= 0
@@ -337,6 +581,13 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
         && fprintf(meta, "request-has-cf-clearance=%d\n",
                    request != NULL && request->cookie != NULL
                    && strstr(request->cookie, "cf_clearance=") != NULL) >= 0
+        && fprintf(meta, "request-cookie-provenance-count=%zu\n",
+                   cookie_provenance_count) >= 0
+        && fprintf(meta, "request-cookie-provenance-complete=%d\n",
+                   fetch_trace.cookie_provenance_allocation_failed
+                       ? 0 : 1) >= 0
+        && fprintf(meta, "request-cookie-provenance-evictions=%zu\n",
+                   fetch_trace.cookie_provenance_evictions) >= 0
         && fprintf(meta, "request-extra-header-bytes=%zu\n",
                    request == NULL || request->extra_headers == NULL
                      ? 0 : strlen(request->extra_headers)) >= 0
@@ -457,6 +708,20 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
                    result->set_cookie_count) >= 0
         && fprintf(meta, "set-cookies-truncated=%d\n",
                    result->set_cookies_truncated ? 1 : 0) >= 0;
+    for (size_t i = 0; ok && i < cookie_provenance_count; i++) {
+        const TraceCookieProvenanceResult *provenance =
+            &scratch->cookie_provenance[i];
+        ok = fprintf(meta,
+                     "request-cookie-provenance-%zu="
+                     "name:%s,issuer:%zu:%zu,exact:%d,latest:%d,"
+                     "occurrences:%zu\n",
+                     i, provenance->name,
+                     provenance->issuer_sequence,
+                     provenance->issuer_index,
+                     provenance->exact ? 1 : 0,
+                     provenance->latest ? 1 : 0,
+                     provenance->occurrences) >= 0;
+    }
     for (size_t i = 0; ok && i < result->set_cookie_count; i++) {
         char name[32];
         (void) snprintf(name, sizeof(name), "set-cookie-%zu", i);
@@ -497,6 +762,11 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
     if (!ok) {
         (void) remove(scratch->meta_path);
         (void) remove(scratch->body_path);
+    } else {
+        for (size_t i = 0; i < result->set_cookie_count; i++) {
+            trace_cookie_provenance_observe(
+                budget, sequence, i, result->set_cookies[i]);
+        }
     }
     budget_free(budget, scratch);
     return ok;
@@ -770,7 +1040,7 @@ typedef struct {
     char request_referrer_policy[64];
     char request_client_hint_tokens[1024];
     char request_client_hint_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
-    char request_extra_header_shape[FETCH_EXTRA_HEADERS_MAX + 1];
+    char request_extra_header_shape[FETCH_EXTRA_HEADERS_MAX + 16];
 } TraceReplayScratch;
 
 typedef enum {

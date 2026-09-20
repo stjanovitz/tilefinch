@@ -142,8 +142,11 @@ class RedirectHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "<none>")
         cookie = self.headers.get("Cookie", "<none>")
         custom = self.headers.get("X-Test", "<none>")
+        cache_control = self.headers.get("Cache-Control", "<none>")
+        pragma = self.headers.get("Pragma", "<none>")
         payload = (f"cors-method={method};origin={origin};cookie={cookie};"
-                   f"x-test={custom};body=").encode() + body
+                   f"x-test={custom};cache-control={cache_control};"
+                   f"pragma={pragma};body=").encode() + body
         allow_origin = "*" if wildcard else origin
         headers = [
             ("Content-Type", "text/plain"),
@@ -720,6 +723,11 @@ class RedirectHandler(BaseHTTPRequestHandler):
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    # The transport-pool fixture intentionally opens nine connections at
+    # once.  socketserver's default backlog is only five on some Python/macOS
+    # combinations, which makes the kernel refuse a valid fixture request
+    # before the threaded server can accept it.
+    request_queue_size = 16
 
     def handle_error(self, _request, _client_address):
         # Header-time redirect termination deliberately resets keep-alive

@@ -698,6 +698,9 @@ struct NavigationSession {
     long last_frame_message_source;
     long last_frame_message_target;
     char last_frame_message_event[96];
+    uint64_t last_frame_message_event_sequence;
+    long last_frame_message_event_source;
+    uint64_t last_frame_message_event_source_generation;
     char frame_message_event_log[512];
     /* Source-free causal snapshot taken when the most recent event-shaped
        frame message was queued. It survives child-frame teardown so a late
@@ -727,6 +730,7 @@ struct NavigationSession {
     bool diagnostic_frame_safari;
     char pending_navigation_referer[NAVIGATION_URL_LIMIT];
     bool pending_navigation_same_origin;
+    bool pending_navigation_user_activated;
     char pending_response_referrer_policy[128];
     char *user_css;
     size_t user_css_length;
@@ -1079,6 +1083,8 @@ void navigation_test_refuse_next_same_document_relayout(void);
 /* Refuse the first allocation in the next general relayout build, after any
    native or author DOM mutation has already committed. */
 void navigation_test_refuse_next_relayout(void);
+/* Refuse one child-frame snapshot refresh after its mutation has committed. */
+void navigation_test_refuse_next_frame_presentation(void);
 bool navigation_test_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame);
 bool navigation_test_configure_frame_messaging(

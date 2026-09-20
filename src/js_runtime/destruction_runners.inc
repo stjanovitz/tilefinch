@@ -92,6 +92,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context,
                      runtime->page_visibility_host_apply);
         JS_FreeValue(runtime->context, runtime->fullscreen_host_exit);
+        JS_FreeValue(runtime->context, runtime->opfs_storage_manager);
         JS_FreeValue(runtime->context, runtime->game_audio_host_suspend);
         JS_FreeValue(runtime->context, runtime->game_audio_host_complete);
         JS_FreeValue(runtime->context, runtime->dispatch_input_handle);
@@ -110,6 +111,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->media_update = JS_UNDEFINED;
         runtime->page_visibility_host_apply = JS_UNDEFINED;
         runtime->fullscreen_host_exit = JS_UNDEFINED;
+        runtime->opfs_storage_manager = JS_UNDEFINED;
         runtime->game_audio_host_suspend = JS_UNDEFINED;
         runtime->game_audio_host_complete = JS_UNDEFINED;
         runtime->dispatch_input_handle = JS_UNDEFINED;

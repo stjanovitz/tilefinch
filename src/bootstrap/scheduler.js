@@ -69,7 +69,13 @@
   function schedule(callback, delay, repeat, args, kind = "timeout") {
     if (typeof callback !== "function" || timers.length >= limit) return 0;
     const id = nextId++;
-    const span = Math.max(repeat ? 1 : 0, normalizeTimerDelay(delay)),
+    const timerAlgorithm = kind === "timeout" || kind === "interval",
+      parentNesting = timerAlgorithm && activeTimer?.timerAlgorithm
+        ? activeTimer.nesting : 0,
+      nesting = timerAlgorithm ? parentNesting + 1 : 0,
+      requestedSpan = normalizeTimerDelay(delay),
+      span = timerAlgorithm && parentNesting > 5
+        ? Math.max(4, requestedSpan) : requestedSpan,
       registeredAt = currentSchedulerTime();
     const timer = timerPool.pop();
     if (timer) {
@@ -80,10 +86,14 @@
       timer.repeat = repeat;
       timer.args = args;
       timer.kind = kind;
+      timer.timerAlgorithm = timerAlgorithm;
+      timer.nesting = nesting;
+      timer.requestedSpan = requestedSpan;
       timers.push(timer);
     } else {
       timers.push({
         id, callback, due: registeredAt + span, span, repeat, args, kind,
+        timerAlgorithm, nesting, requestedSpan,
       });
     }
     return id;
@@ -149,6 +159,8 @@
      redirected through author code. */
   globalThis.__tilefinchScheduleTimeout = scheduleTimeout;
   globalThis.__tilefinchScheduleInterval = scheduleInterval;
+  globalThis.__tilefinchScheduleTask = (callback) =>
+    schedule(callback, 0, false, EMPTY_TIMER_ARGS, "platform-task");
   globalThis.__tilefinchCancelTimer = clear;
   globalThis.setTimeout = scheduleTimeout;
   globalThis.setInterval = scheduleInterval;
@@ -185,7 +197,8 @@
       blockedDrains = new Set();
     let channelCount = 0;
     const scheduleEndpointDrain = (endpoint) => {
-      if (endpoint.drainPending || endpoint.queue.length === 0) return true;
+      if (endpoint.drainPending || endpoint.deliveryInProgress ||
+          endpoint.queue.length === 0) return true;
       const receiver = endpoint.receiver;
       if (!receiver || receiver._closed || !receiver._started) {
         blockedDrains.delete(endpoint);
@@ -196,8 +209,12 @@
         const current = endpoint.receiver;
         if (!current || current._closed || !current._started) return;
         const item = endpoint.queue.shift();
-        if (item) current._deliver(item.data, item.ports);
-        if (endpoint.queue.length) scheduleEndpointDrain(endpoint);
+        if (!item) return;
+        endpoint.deliveryInProgress = true;
+        current._deliver(item.data, item.ports, () => {
+          endpoint.deliveryInProgress = false;
+          if (endpoint.queue.length) scheduleEndpointDrain(endpoint);
+        });
       }, 0, false, EMPTY_TIMER_ARGS, "message");
       if (!id) {
         blockedDrains.add(endpoint);
@@ -225,6 +242,7 @@
           receiver: this,
           queue: [],
           drainPending: false,
+          deliveryInProgress: false,
         };
         this._peer = null;
         this._closed = false;
@@ -294,11 +312,15 @@
            pump retries it once capacity becomes available. */
         scheduleEndpointDrain(endpoint);
       }
-      _deliver(data, ports = []) {
-        if (this._closed || !this._started) return;
+      _deliver(data, ports = [], complete = null) {
+        if (this._closed || !this._started) {
+          if (typeof complete === "function") complete();
+          return;
+        }
         const event = trusted(createMessageEvent(
           "message", data, "", null, ports));
-        this.dispatchEvent(event);
+        globalThis.__tilefinchDispatchEventTargetCheckpointed(
+          this, event, complete);
       }
       postMessage(value, transfer = []) {
         if (this._closed) return;
@@ -695,6 +717,16 @@
       }
       ran++;
       if (timer.repeat) {
+        /* Repeating timers recursively run the timer initialization steps.
+           Their task nesting therefore rises just like a timeout chain, and
+           the same timeout/interval counter applies to combinations of both.
+           Browser-internal timers never participate in this counter. */
+        if (timer.timerAlgorithm) {
+          const parentNesting = timer.nesting;
+          timer.nesting = parentNesting + 1;
+          timer.span = parentNesting > 5
+            ? Math.max(4, timer.requestedSpan) : timer.requestedSpan;
+        }
         timer.due = currentSchedulerTime() + timer.span;
         timers.push(timer);
       } else releaseTimer(timer);
