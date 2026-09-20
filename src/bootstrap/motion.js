@@ -615,8 +615,12 @@
         );
         inspected += count;
         for (let index = 0; index < count; index++) {
-          const host = wrappedElement(hosts[index], nativeInline),
-            shadow = globalThis.__tilefinchShadowRootForHost?.(host);
+          /* Native query results are handles. Shadow-root lookup accepts that
+             identity directly, so discovering roots must not retain wrappers
+             for thousands of unrelated hosts. */
+          const shadow = globalThis.__tilefinchShadowRootForHost?.(
+            hosts[index],
+          );
           if (shadow && !roots.includes(shadow)) {
             roots.push(shadow);
             if (roots.length >= SHADOW_ROOT_LIMIT) break;
@@ -638,8 +642,7 @@
         candidates = new Map(),
         candidateFrames = new Map();
       for (const root of roots) {
-        if (retainedStyles >= STYLE_LIMIT || candidates.size >= ELEMENT_LIMIT)
-          break;
+        if (retainedStyles >= STYLE_LIMIT) break;
         const keyframes = new Map(),
           rules = [],
           styleNodes = queryTree(
@@ -666,32 +669,45 @@
         totalKeyframes += keyframes.size;
         totalRules += rules.length;
         for (const rule of rules) {
-          const elements = queryTree(
-            root, rule.selector, ELEMENT_LIMIT - candidates.size,
-            nativeInline);
-          for (const value of elements) {
-            const element = wrappedElement(value, nativeInline);
-            if (!(element instanceof Element)) continue;
-            if (!candidates.has(element) && candidates.size >= ELEMENT_LIMIT)
-              break;
-            candidates.set(element, rule.config);
-            candidateFrames.set(element, keyframes.get(rule.config.name));
+          if (candidates.size >= ELEMENT_LIMIT) {
+            /* Admission is full, but later authored rules still override the
+               retained set. Matching those 128 wrappers is bounded and avoids
+               both new wrappers and a zero-length query that suppresses the
+               cascade. */
+            for (const element of candidates.keys()) {
+              if (element.getRootNode() !== root) continue;
+              let matches = false;
+              try { matches = element.matches(rule.selector); } catch {}
+              if (!matches) continue;
+              candidates.set(element, rule.config);
+              candidateFrames.set(element, keyframes.get(rule.config.name));
+            }
+          } else {
+            const elements = queryTree(
+              root, rule.selector, ELEMENT_LIMIT, nativeInline);
+            for (const value of elements) {
+              const element = wrappedElement(value, nativeInline);
+              if (!(element instanceof Element)) continue;
+              if (!candidates.has(element)
+                  && candidates.size >= ELEMENT_LIMIT) break;
+              candidates.set(element, rule.config);
+              candidateFrames.set(element, keyframes.get(rule.config.name));
+            }
           }
         }
         /* Inspect bounded native attribute prefixes before creating wrappers.
            Most inline styles are geometry/color, not motion; wrapping all of
            them first can exhaust a tight realm even when no animation applies. */
-        const inlineElements = queryTree(
-          root, "[style]", ELEMENT_LIMIT - candidates.size, nativeInline);
+        const revisitCandidates = candidates.size >= ELEMENT_LIMIT,
+          inlineElements = revisitCandidates
+          ? candidates.keys()
+          : queryTree(root, "[style]", ELEMENT_LIMIT, nativeInline);
         for (const value of inlineElements) {
+          if (revisitCandidates && value.getRootNode() !== root) continue;
           if (
             retainedBytes >= STYLE_BYTES_LIMIT ||
             retainedNodes >= STYLE_NODE_LIMIT
           )
-            break;
-          const target = wrappedElement(value, nativeInline);
-          if (!(target instanceof Element)) continue;
-          if (!candidates.has(target) && candidates.size >= ELEMENT_LIMIT)
             break;
           const retained = styleAttributePrefix(
             value,
@@ -702,6 +718,10 @@
           const config = /animation/i.test(retained)
             ? animationConfig(declarationMap(retained)) : null;
           if (config) {
+            const target = wrappedElement(value, nativeInline);
+            if (!(target instanceof Element)) continue;
+            if (!candidates.has(target) && candidates.size >= ELEMENT_LIMIT)
+              continue;
             candidates.set(target, config);
             candidateFrames.set(target, keyframes.get(config.name));
           }

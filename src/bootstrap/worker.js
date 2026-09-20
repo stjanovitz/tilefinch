@@ -98,8 +98,8 @@ globalThis.__tilefinchInstallWorker = (
   )
     throw new Error("Worker bootstrap is unavailable");
 
-  const workerSourceForBlob = (blob) =>
-    workerIntrinsics.sourceForBlob(blob);
+  const WORKER_OPFS_FILE_LIMIT = 64 * 1024,
+    workerSourceForBlob = (blob) => workerIntrinsics.sourceForBlob(blob);
 
   /* Dedicated workers share selected Web Platform constructors with their
      owner, but never the owner's arbitrary global properties.  Keep this
@@ -235,6 +235,7 @@ globalThis.__tilefinchInstallWorker = (
         encoderStates=new WeakMap(),decoderStates=new WeakMap(),
         ownerEncode=OwnerEncoder.prototype.encode,
         ownerDecode=OwnerDecoder.prototype.decode,
+        cloneBytes=structuredClone,
         localError=error=>{
           if(error&&error.name==='RangeError')return new RangeError(error.message);
           if(error&&error.name==='TypeError')return new TypeError(error.message);
@@ -256,10 +257,8 @@ globalThis.__tilefinchInstallWorker = (
         encode(input=''){
           const state=encoderState(this);
           try{
-            const source=Reflect.apply(ownerEncode,state,[String(input)]),
-              copy=new Uint8Array(source.length);
-            for(let at=0;at<source.length;at++)copy[at]=source[at];
-            return copy;
+            const source=Reflect.apply(ownerEncode,state,[String(input)]);
+            return cloneBytes(source);
           }catch(error){throw localError(error)}
         }
         encodeInto(source,destination){
@@ -1057,6 +1056,7 @@ globalThis.__tilefinchInstallWorker = (
       outboundQueued: 0, outboundDelivered: 0, outboundDropped: 0,
       outboundDroppedInactive: 0, outboundDroppedQueue: 0,
       inboundTransferArguments: 0, outboundTransferArguments: 0,
+      opfsReadScratchBytes: 0, opfsReadCloneBytes: 0,
       terminations: 0, lastId: 0, lastTerminationReason: 0,
       lastTaskMs: 0,
     },
@@ -1082,6 +1082,8 @@ globalThis.__tilefinchInstallWorker = (
         workerProgress.inboundTransferArguments,
       workerOutboundTransferArguments: () =>
         workerProgress.outboundTransferArguments,
+      workerOpfsReadScratchBytes: () => workerProgress.opfsReadScratchBytes,
+      workerOpfsReadCloneBytes: () => workerProgress.opfsReadCloneBytes,
       workerTerminations: () => workerProgress.terminations,
       workerLastId: () => workerProgress.lastId,
       workerLastTerminationReason: () => workerProgress.lastTerminationReason,
@@ -1960,11 +1962,25 @@ globalThis.__tilefinchInstallWorker = (
                     });
                   defineMethod(SyncType.prototype, "read", function(buffer, options) {
                     const target = localMutableBytes(buffer),
-                      copy = new ownerIntrinsics.Uint8Array(target.byteLength),
-                      count = ownerForMethod(this).read(copy,
-                        syncAccessOptions(options));
-                    target.set(cloneWorkerValue(
-                      copy.subarray(0, count), state.cloneIntrinsics));
+                      owner = ownerForMethod(this),
+                      readOptions = syncAccessOptions(options),
+                      size = owner.getSize(),
+                      available = readOptions?.at === undefined
+                        ? size : Math.max(0, size - readOptions.at),
+                      copyLength = Math.min(
+                        target.byteLength, available,
+                        WORKER_OPFS_FILE_LIMIT,
+                      ),
+                      copy = new ownerIntrinsics.Uint8Array(copyLength),
+                      count = owner.read(copy, readOptions);
+                    workerProgress.opfsReadScratchBytes += copyLength;
+                    if (count > 0) {
+                      const exact = count === copy.byteLength
+                        ? copy : copy.slice(0, count);
+                      workerProgress.opfsReadCloneBytes += count;
+                      target.set(cloneWorkerValue(
+                        exact, state.cloneIntrinsics));
+                    }
                     return count;
                   });
                   defineMethod(SyncType.prototype, "write", function(buffer, options) {
