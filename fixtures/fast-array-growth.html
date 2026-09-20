@@ -8,7 +8,9 @@
   const values = [];
   let checksum = 0;
   for (let index = 0; index < 300000; index++) {
-    const value = index & 15;
+    // Keep this capacity-growth probe on boxed storage. Compact byte/short
+    // arrays have their own semantic and memory qualification lane.
+    const value = 40000 + (index & 15);
     values.push(value);
     checksum = (checksum + value + index) | 0;
   }

@@ -754,6 +754,14 @@ static int run_compact_character_array(void)
         "sparse.reverse();sparse.reverse();sparse.length=1;"
         "if(sparse.length!==1||Object.keys(sparse).join(',')!=='0'"
         "||sparse.join('')!=='9')return 'length-shrink';"
+        "const copiedArray=[],copiedProto=Object.create(Array.prototype);"
+        "copiedArray.length=3;Object.defineProperty(copiedProto,'1',{"
+        "configurable:true,get(){delete copiedProto[1];copiedArray.length=0;"
+        "copiedArray.push('a','b','c');return 'X'}});"
+        "Object.setPrototypeOf(copiedArray,copiedProto);"
+        "copiedArray.copyWithin(0,1,3);"
+        "if(JSON.stringify(copiedArray)!=='[\"X\",\"c\",\"c\"]')"
+        "return 'copy-within-transition';"
         "const preserved=joined.length===n&&joined.charCodeAt(3)===94;"
         "return [preserved?1:0,copied?1:0,removed[0].charCodeAt(0),"
         "removed[1].charCodeAt(0),applied.length,chars[1],"
@@ -788,9 +796,76 @@ static int run_compact_character_array(void)
         "&&stringFirst[32]==='g';"
         "return [atomSafe,wideSafe,astralSafe,cowSafe,arrayFirstSafe,"
         "stringFirstSafe].map(Number).join(':')})()";
+    static const char byte_memory_source[] =
+        "(()=>{const n=617000,bytes=[];"
+        "for(let i=0;i<n;i++)bytes.push((i*29+7)&255);"
+        "return [bytes.length,bytes[0],bytes[12345],bytes[n-1]]"
+        ".join(':')})()";
+    static const char byte_semantic_source[] =
+        "(()=>{const bytes=[];for(let i=0;i<128;i++)bytes.push((i*29+7)&255);"
+        "if(bytes[3]!==94)return 'get';bytes[3]=90;"
+        "delete bytes[127];bytes[127]=202;bytes.length=64;"
+        "bytes.copyWithin(8,0,8);const copied=bytes[8]===7&&bytes[15]===210;"
+        "const removed=bytes.splice(4,2,88,89);bytes.reverse();"
+        "Object.defineProperty(bytes,'1',{value:75,writable:true,"
+        "enumerable:true,configurable:true});bytes.push(300);"
+        "const deopt=bytes[64]===300;bytes.push('wide');"
+        "const json=JSON.stringify(bytes.slice(-3));"
+        "return [copied?1:0,removed[0],removed[1],bytes[1],deopt?1:0,"
+        "json,bytes.length].join(':')})()";
+    static const char byte_repack_setup_source[] =
+        "globalThis.byteRepackProbe=[];"
+        "for(let i=0;i<256;i++)byteRepackProbe.push((i*29+7)&255);"
+        "byteRepackProbe[0]={temporary:true};byteRepackProbe[0]=65;";
+    static const char byte_repack_memory_source[] =
+        "(()=>{const n=120000,bytes=byteRepackProbe;"
+        "for(let i=256;i<n;i++)bytes.push((i*29+7)&255);"
+        "return [bytes.length,bytes[0],bytes[12345],bytes[n-1]]"
+        ".join(':')})()";
+    static const char byte_deopt_limit_source[] =
+        "(()=>{const bytes=[];for(let i=0;i<200000;i++)bytes.push(i&255);"
+        "try{bytes[0]={temporary:true};return 'accepted'}catch(error){"
+        "return [error.name,bytes.length,bytes[0]].join(':')}})()";
+    static const char capacity_repack_source[] =
+        "(()=>{globalThis.capacityRepack=Array(70000).fill(65);"
+        "capacityRepack.push(66,67,68);return [capacityRepack.length,"
+        "capacityRepack[0],capacityRepack[70000],capacityRepack[70002]]"
+        ".join(':')})()";
+    static const char signed_byte_memory_source[] =
+        "(()=>{const n=617000,bytes=[];"
+        "for(let i=0;i<n;i++)bytes.push(((i*29+7)&255)-128);"
+        "return [bytes.length,bytes[0],bytes[12345],bytes[n-1]]"
+        ".join(':')})()";
+    static const char signed_byte_semantic_source[] =
+        "(()=>{const bytes=[];for(let i=0;i<128;i++)bytes.push(i-128);"
+        "if(bytes[3]!==-125)return 'get';bytes[3]=-90;"
+        "delete bytes[127];bytes[127]=-5;bytes.length=64;"
+        "bytes.copyWithin(8,0,8);const copied=bytes[8]===-128&&bytes[15]===-121;"
+        "const removed=bytes.splice(4,2,-88,-89);bytes.reverse();"
+        "Object.defineProperty(bytes,'1',{value:-75,writable:true,"
+        "enumerable:true,configurable:true});"
+        "const deopt=[];deopt.push(-1);deopt.push(-2);deopt.push(128);"
+        "return [copied?1:0,removed[0],removed[1],bytes[1],bytes.length,"
+        "deopt.join(':')==='-1:-2:128'?1:0].join(':')})()";
+    static const char short_memory_source[] =
+        "(()=>{const n=617000,values=[];"
+        "for(let i=0;i<n;i++)values.push(((i*29+7)&255)-(i&1?128:0));"
+        "return [values.length,values[0],values[12345],values[n-1]]"
+        ".join(':')})()";
+    static const char short_semantic_source[] =
+        "(()=>{const values=[];values.push(-1);values.push(200);"
+        "for(let i=2;i<128;i++)values.push((i&1)?i-128:i+128);"
+        "if(values[0]!==-1||values[1]!==200||values[2]!==130)return 'get';"
+        "values[3]=-300;delete values[127];values[127]=255;values.length=64;"
+        "values.copyWithin(8,0,8);const copied=values[8]===-1&&values[9]===200;"
+        "const removed=values.splice(4,2,-1000,1000);values.reverse();"
+        "Object.defineProperty(values,'1',{value:-200,writable:true,"
+        "enumerable:true,configurable:true});values.push(40000);"
+        "return [copied?1:0,removed[0],removed[1],values[1],"
+        "values[64],values.length].join(':')})()";
     Budget budget;
     budget_init(&budget, 8u * MIB);
-    if (setenv("TILEFINCH_JS_ARRAY_CAP_KB", "640", 1) != 0) return 1;
+    if (setenv("TILEFINCH_JS_ARRAY_CAP_KB", "1280", 1) != 0) return 1;
     BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
     if (pool == NULL) {
         unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
@@ -884,6 +959,241 @@ static int run_compact_character_array(void)
     JS_FreeCString(context, text);
     JS_FreeValue(context, value);
 
+    value = JS_Eval(context, byte_memory_source,
+                    sizeof(byte_memory_source) - 1u,
+                    "<compact-byte-array-memory>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact byte-array memory exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool byte_memory_ok = text != NULL
+        && strcmp(text, "617000:7:124:114") == 0;
+    if (!byte_memory_ok)
+        fprintf(stderr, "compact byte-array memory result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, byte_semantic_source,
+                    sizeof(byte_semantic_source) - 1u,
+                    "<compact-byte-array-semantics>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact byte-array semantic exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool byte_semantic_ok = text != NULL
+        && strcmp(text, "1:123:152:75:1:[7,300,\"wide\"]:66") == 0;
+    if (!byte_semantic_ok)
+        fprintf(stderr, "compact byte-array semantic result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    okay = okay && byte_memory_ok && byte_semantic_ok;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, byte_repack_setup_source,
+                    sizeof(byte_repack_setup_source) - 1u,
+                    "<compact-byte-array-repack-setup>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JS_FreeValue(context, JS_GetException(context));
+        okay = 0;
+        goto cleanup;
+    }
+    JS_FreeValue(context, value);
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue repacked_array = JS_GetPropertyStr(
+        context, global, "byteRepackProbe");
+    uint32_t generic_capacity = JS_GetFastArrayCapacityForTest(repacked_array);
+    JS_FreeValue(context, repacked_array);
+    JS_FreeValue(context, global);
+    if (generic_capacity == 0) {
+        fprintf(stderr, "compact byte-array did not deoptimize to fast storage\n");
+        okay = 0;
+        goto cleanup;
+    }
+
+    value = JS_Eval(context, byte_repack_memory_source,
+                    sizeof(byte_repack_memory_source) - 1u,
+                    "<compact-byte-array-repack>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact byte-array repack exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        okay = 0;
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool byte_repack_ok = text != NULL
+        && strcmp(text, "120000:65:124:170") == 0;
+    global = JS_GetGlobalObject(context);
+    repacked_array = JS_GetPropertyStr(
+        context, global, "byteRepackProbe");
+    byte_repack_ok = byte_repack_ok
+        && JS_GetFastArrayCapacityForTest(repacked_array) == 0;
+    (void)JS_SetPropertyStr(context, global, "byteRepackProbe",
+                            JS_UNDEFINED);
+    JS_FreeValue(context, repacked_array);
+    JS_FreeValue(context, global);
+    if (!byte_repack_ok)
+        fprintf(stderr, "compact byte-array repack result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    okay = okay && byte_repack_ok;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, byte_deopt_limit_source,
+                    sizeof(byte_deopt_limit_source) - 1u,
+                    "<compact-byte-array-deopt-limit>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JS_FreeValue(context, JS_GetException(context));
+        okay = 0;
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool byte_deopt_limit_ok = text != NULL
+        && strcmp(text, "RangeError:200000:0") == 0;
+    if (!byte_deopt_limit_ok)
+        fprintf(stderr, "compact byte-array deopt limit result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    okay = okay && byte_deopt_limit_ok;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, capacity_repack_source,
+                    sizeof(capacity_repack_source) - 1u,
+                    "<compact-byte-array-capacity-repack>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JS_FreeValue(context, JS_GetException(context));
+        okay = 0;
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    global = JS_GetGlobalObject(context);
+    JSValue capacity_repacked = JS_GetPropertyStr(
+        context, global, "capacityRepack");
+    bool capacity_repack_ok = text != NULL
+        && strcmp(text, "70003:65:66:68") == 0
+        && JS_GetFastArrayCapacityForTest(capacity_repacked) == 0;
+    (void)JS_SetPropertyStr(context, global, "capacityRepack", JS_UNDEFINED);
+    JS_FreeValue(context, capacity_repacked);
+    JS_FreeValue(context, global);
+    if (!capacity_repack_ok)
+        fprintf(stderr, "compact capacity repack result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    okay = okay && capacity_repack_ok;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, signed_byte_memory_source,
+                    sizeof(signed_byte_memory_source) - 1u,
+                    "<compact-signed-byte-array-memory>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact signed-byte-array memory exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool signed_byte_memory_ok = text != NULL
+        && strcmp(text, "617000:-121:-4:-14") == 0;
+    if (!signed_byte_memory_ok)
+        fprintf(stderr, "compact signed-byte-array memory result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, signed_byte_semantic_source,
+                    sizeof(signed_byte_semantic_source) - 1u,
+                    "<compact-signed-byte-array-semantics>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact signed-byte-array semantic exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool signed_byte_semantic_ok = text != NULL
+        && strcmp(text, "1:-124:-123:-75:64:1") == 0;
+    if (!signed_byte_semantic_ok)
+        fprintf(stderr, "compact signed-byte-array semantic result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    okay = okay && signed_byte_memory_ok && signed_byte_semantic_ok;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, short_memory_source,
+                    sizeof(short_memory_source) - 1u,
+                    "<compact-short-array-memory>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact short-array memory exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool short_memory_ok = text != NULL
+        && strcmp(text, "617000:7:-4:-14") == 0;
+    if (!short_memory_ok)
+        fprintf(stderr, "compact short-array memory result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, short_semantic_source,
+                    sizeof(short_semantic_source) - 1u,
+                    "<compact-short-array-semantics>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact short-array semantic exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    bool short_semantic_ok = text != NULL
+        && strcmp(text, "1:132:-123:-200:40000:65") == 0;
+    if (!short_semantic_ok)
+        fprintf(stderr, "compact short-array semantic result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    okay = okay && short_memory_ok && short_semantic_ok;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
 cleanup:
     unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
     JS_FreeContext(context);
@@ -891,6 +1201,125 @@ cleanup:
     (void) budget_quickjs_pool_trim(pool, 0);
     if (!budget_quickjs_pool_destroy(pool) || budget.current != 0)
         return 1;
+    return okay ? 0 : 1;
+}
+
+static int run_native_string_gc_headroom(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JS_SetGCThreshold(runtime, SIZE_MAX);
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+
+    static const char cycles_source[] =
+        "(()=>{for(let i=0;i<12000;i++){const a={},b={};"
+        "a.peer=b;b.peer=a}})()";
+    JSValue value = JS_Eval(context, cycles_source,
+                            sizeof(cycles_source) - 1u,
+                            "<native-string-gc-headroom>",
+                            JS_EVAL_TYPE_GLOBAL);
+    int okay = !JS_IsException(value);
+    JS_FreeValue(context, value);
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(runtime, &usage);
+    JS_SetMemoryLimit(runtime, (size_t)usage.malloc_size + 64u * 1024u);
+    JS_SetGCThreshold(runtime, 0u);
+    uint64_t gc_before = JS_GetGCRunCount(runtime);
+    uint8_t *storage = NULL;
+    value = JS_NewStringLenLatin1UninitializedPortable(
+        context, 512u * 1024u, &storage);
+    uint64_t gc_delta = JS_GetGCRunCount(runtime) - gc_before;
+    okay &= !JS_IsException(value) && storage != NULL && gc_delta != 0u;
+    if (!JS_IsException(value) && storage != NULL) {
+        storage[0] = 7u;
+        storage[512u * 1024u - 1u] = 11u;
+    }
+    JS_FreeValue(context, value);
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay)
+        fprintf(stderr, "native string GC headroom failed gc-runs=%llu\n",
+                (unsigned long long)gc_delta);
+    return okay ? 0 : 1;
+}
+
+static int run_property_growth_gc_headroom(void)
+{
+    enum { PROPERTY_COUNT = 128 };
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JS_SetGCThreshold(runtime, SIZE_MAX);
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+
+    JSValue target = JS_NewObject(context);
+    JSAtom atoms[PROPERTY_COUNT];
+    int okay = !JS_IsException(target);
+    for (unsigned i = 0; i < PROPERTY_COUNT; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "field%03u", i);
+        atoms[i] = JS_NewAtom(context, name);
+        okay &= atoms[i] != JS_ATOM_NULL;
+    }
+    static const char cycles_source[] =
+        "(()=>{for(let i=0;i<12000;i++){const a={},b={};"
+        "a.peer=b;b.peer=a}})()";
+    JSValue value = JS_Eval(context, cycles_source,
+                            sizeof(cycles_source) - 1u,
+                            "<property-growth-gc-headroom>",
+                            JS_EVAL_TYPE_GLOBAL);
+    okay &= !JS_IsException(value);
+    JS_FreeValue(context, value);
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(runtime, &usage);
+    JS_SetMemoryLimit(runtime, (size_t)usage.malloc_size + 1u);
+    JS_SetGCThreshold(runtime, 0u);
+    uint64_t gc_before = JS_GetGCRunCount(runtime);
+    for (unsigned i = 0; okay && i < PROPERTY_COUNT; i++) {
+        okay = JS_DefinePropertyValue(
+            context, target, atoms[i], JS_NewInt32(context, (int32_t)i),
+            JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE) >= 0;
+    }
+    uint64_t gc_delta = JS_GetGCRunCount(runtime) - gc_before;
+    JSValue last = okay
+        ? JS_GetProperty(context, target, atoms[PROPERTY_COUNT - 1u])
+        : JS_UNDEFINED;
+    int32_t last_value = -1;
+    okay &= !JS_IsException(last)
+        && JS_ToInt32(context, &last_value, last) == 0
+        && last_value == PROPERTY_COUNT - 1 && gc_delta != 0u;
+    JS_FreeValue(context, last);
+    if (!okay && JS_HasException(context))
+        JS_FreeValue(context, JS_GetException(context));
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    for (unsigned i = 0; i < PROPERTY_COUNT; i++)
+        JS_FreeAtom(context, atoms[i]);
+    JS_FreeValue(context, target);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay)
+        fprintf(stderr, "property growth GC headroom failed gc-runs=%llu\n",
+                (unsigned long long)gc_delta);
     return okay ? 0 : 1;
 }
 
@@ -1265,7 +1694,9 @@ static int run_near_limit_array_growth(void)
     static const char prepare[] =
         /* 94215 is an exact fast-array capacity reached after the host's
            large-array growth cap takes over. */
-        "globalThis.nearLimitArray=Array(94215).fill(0);";
+        /* Keep this generic-growth test on boxed storage; byte-only Arrays
+           have their own compact-representation coverage below. */
+        "globalThis.nearLimitArray=Array(94215).fill(40000);";
     JSValue value = JS_Eval(context, prepare, sizeof(prepare) - 1u,
                             "<near-limit-array-prepare>",
                             JS_EVAL_TYPE_GLOBAL);
@@ -1281,7 +1712,7 @@ static int run_near_limit_array_growth(void)
     JS_FreeValue(context, global);
     static const char fill_capacity[] =
         "while(nearLimitArray.length<nearLimitCapacity)"
-        "nearLimitArray.push(0);";
+        "nearLimitArray.push(256);";
     value = JS_Eval(context, fill_capacity, sizeof(fill_capacity) - 1u,
                     "<near-limit-array-fill-capacity>",
                     JS_EVAL_TYPE_GLOBAL);
@@ -1404,5 +1835,17 @@ int main(int argc, char **argv)
         return 1;
     }
     puts("QuickJS compact character-array bound: PASS");
+
+    if (run_native_string_gc_headroom() != 0) {
+        fprintf(stderr, "QuickJS native-string GC headroom failed\n");
+        return 1;
+    }
+    puts("QuickJS native-string GC headroom: PASS");
+
+    if (run_property_growth_gc_headroom() != 0) {
+        fprintf(stderr, "QuickJS property-growth GC headroom failed\n");
+        return 1;
+    }
+    puts("QuickJS property-growth GC headroom: PASS");
     return 0;
 }

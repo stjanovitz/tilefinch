@@ -32,6 +32,8 @@ typedef struct {
     bool refuse_next_static_fallback_layout;
     /* Refuse the next same-document relayout once. */
     bool refuse_next_same_document_relayout;
+    /* Refuse the next child-frame presentation refresh once. */
+    bool refuse_next_frame_presentation;
     /* Refuse the next background web-font relayout once. */
     bool refuse_next_background_font_relayout;
     /* Refuse the next render-shell initialization once. */

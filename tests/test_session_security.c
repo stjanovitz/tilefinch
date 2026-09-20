@@ -1601,6 +1601,116 @@ static int test_websocket_policy_and_close_payload(Budget *budget)
     return 0;
 }
 
+static int test_bounded_origin_private_file_system(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    size_t initialized = budget->current;
+    BrowserOpfsView view = {0};
+    CHECK(session.opfs == NULL
+          && browser_session_opfs_stat(
+                 &session, "https://files.test/page", "/", &view)
+                 == BROWSER_OPFS_OK
+          && view.kind == BROWSER_OPFS_DIRECTORY
+          && session.opfs == NULL && budget->current == initialized);
+    budget_inject_failure_after(budget, 0);
+    CHECK(browser_session_opfs_create(
+              &session, "https://files.test/page", "/refused",
+              BROWSER_OPFS_FILE) == BROWSER_OPFS_QUOTA_EXCEEDED
+          && session.opfs == NULL && budget->current == initialized);
+    budget_clear_failure_injection(budget);
+    CHECK(browser_session_opfs_create(
+              &session, "https://files.test/page", "/saves",
+              BROWSER_OPFS_DIRECTORY) == BROWSER_OPFS_OK
+          && session.opfs != NULL
+          && browser_session_opfs_create(
+                 &session, "https://files.test/page", "/saves/state.bin",
+                 BROWSER_OPFS_FILE) == BROWSER_OPFS_OK);
+    static const unsigned char payload[] = {1u, 3u, 5u, 7u};
+    CHECK(browser_session_opfs_write(
+              &session, "https://files.test/page", "/saves/state.bin",
+              payload, sizeof(payload)) == BROWSER_OPFS_OK
+          && browser_session_opfs_stat(
+                 &session, "https://files.test/other", "/saves/state.bin",
+                 &view) == BROWSER_OPFS_OK
+          && view.kind == BROWSER_OPFS_FILE
+          && view.data_length == sizeof(payload)
+          && view.generation != 0
+          && memcmp(view.data, payload, sizeof(payload)) == 0
+          && browser_session_opfs_stat(
+                 &session, "https://other.test/", "/saves/state.bin",
+                 &view) == BROWSER_OPFS_NOT_FOUND);
+    const char *name = NULL;
+    CHECK(browser_session_opfs_child(
+              &session, "https://files.test/", "/saves", 0,
+              &name, &view) == BROWSER_OPFS_OK
+          && strcmp(name, "state.bin") == 0
+          && view.kind == BROWSER_OPFS_FILE
+          && browser_session_opfs_remove(
+                 &session, "https://files.test/", "/saves", false)
+                 == BROWSER_OPFS_NOT_EMPTY);
+    unsigned char too_large[BROWSER_OPFS_FILE_BYTE_LIMIT + 1u];
+    memset(too_large, 0xa5, sizeof(too_large));
+    CHECK(browser_session_opfs_write(
+              &session, "https://files.test/", "/saves/state.bin",
+              too_large, sizeof(too_large)) == BROWSER_OPFS_QUOTA_EXCEEDED
+          && browser_session_opfs_stat(
+                 &session, "https://files.test/", "/saves/state.bin",
+                 &view) == BROWSER_OPFS_OK
+          && view.data_length == sizeof(payload)
+          && memcmp(view.data, payload, sizeof(payload)) == 0);
+    uint64_t old_generation = view.generation;
+    CHECK(browser_session_opfs_remove(
+              &session, "https://files.test/", "/saves/state.bin", false)
+              == BROWSER_OPFS_OK
+          && browser_session_opfs_create(
+                 &session, "https://files.test/", "/saves/state.bin",
+                 BROWSER_OPFS_FILE) == BROWSER_OPFS_OK
+          && browser_session_opfs_write(
+                 &session, "https://files.test/", "/saves/state.bin",
+                 payload, sizeof(payload)) == BROWSER_OPFS_OK
+          && browser_session_opfs_stat(
+                 &session, "https://files.test/", "/saves/state.bin", &view)
+                 == BROWSER_OPFS_OK
+          && view.generation != old_generation);
+    BrowserSiteDataUsage usage = {0};
+    CHECK(browser_session_site_data_usage(
+              &session, "https://files.test/", &usage)
+          && usage.opfs_entry_count == 2
+          && usage.opfs_bytes == sizeof(payload));
+    browser_session_set_site_data_allowed(&session, false);
+    CHECK(browser_session_opfs_stat(
+              &session, "https://files.test/", "/", &view)
+              == BROWSER_OPFS_UNAVAILABLE);
+    browser_session_set_site_data_allowed(&session, true);
+    CHECK(browser_session_captive_portal_begin(
+              &session, "http://portal.test/")
+          && browser_session_opfs_stat(
+                 &session, "http://portal.test/", "/", &view)
+                 == BROWSER_OPFS_UNAVAILABLE);
+    browser_session_captive_portal_end(&session);
+    CHECK(browser_session_opfs_stat(
+              &session, "https://files.test/", "/saves/state.bin", &view)
+              == BROWSER_OPFS_OK
+          && browser_session_clear_site_data(
+                 &session, "https://files.test/")
+          && browser_session_opfs_stat(
+                 &session, "https://files.test/", "/saves/state.bin", &view)
+                 == BROWSER_OPFS_NOT_FOUND);
+    CHECK(browser_session_opfs_create(
+              &session, "https://files.test/", "/session.bin",
+              BROWSER_OPFS_FILE) == BROWSER_OPFS_OK);
+    browser_session_opfs_clear_all(&session);
+    CHECK(session.opfs == NULL && session.opfs_bytes == 0
+          && browser_session_opfs_stat(
+                 &session, "https://files.test/", "/session.bin", &view)
+                 == BROWSER_OPFS_NOT_FOUND);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget;
@@ -1623,6 +1733,7 @@ int main(void)
                     "cross-site") == 0);
     CHECK(test_bounded_site_adapter_state(&budget) == 0);
     CHECK(test_site_data_inspection_and_clear(&budget) == 0);
+    CHECK(test_bounded_origin_private_file_system(&budget) == 0);
     CHECK(test_bounded_site_adapter_document_cache(&budget) == 0);
     CHECK(test_global_site_data_policy(&budget) == 0);
     CHECK(test_cookie_eviction_guard(&budget) == 0);

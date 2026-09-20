@@ -1,15 +1,10 @@
 (() => {
+  let readableState;
   const streamQueueLimit = 64,
     streamByteLimit = 256 * 1024,
     compressionByteLimit = 1024 * 1024,
     compressionNative = globalThis.__tilefinchCompressionRun,
     largeStreamEndpoints = new WeakSet(),
-    readableStreamStates = new WeakMap(),
-    readableState = (stream) => {
-      const state = readableStreamStates.get(stream);
-      if (!state) throw new TypeError("invalid readable stream");
-      return state;
-    },
     chunkBytes = (value) => {
       if (value instanceof ArrayBuffer) return value.byteLength;
       if (ArrayBuffer.isView(value)) return value.byteLength;
@@ -146,6 +141,10 @@
     }
   }
   class ReadableStream {
+    #state;
+    static {
+      readableState = (stream) => stream.#state;
+    }
     constructor(source = {}) {
       let closeResolve, closeReject;
       const closedPromise = new Promise((resolve, reject) => {
@@ -169,7 +168,7 @@
           source: source || {},
           status: "readable",
         };
-      readableStreamStates.set(this, state);
+      this.#state = state;
       state.controller = {
         get desiredSize() {
           const limit = largeStreamEndpoints.has(state.source)
@@ -735,8 +734,7 @@
       this.ignoreBOM = decoder.ignoreBOM;
     }
   };
-  const compressionStates = new WeakMap(),
-    compressionChunk = (value) => {
+  const compressionChunk = (value) => {
       let source;
       if (value instanceof ArrayBuffer) {
         source = new Uint8Array(value);
@@ -791,41 +789,35 @@
       return new TransformStream(transformer);
     };
   class CompressionStream {
+    #transform;
     constructor(format) {
       if (typeof compressionNative !== "function")
         throw new TypeError("CompressionStream is unavailable");
       const transform = compressionTransform(
         compressionFormat(format), false);
-      compressionStates.set(this, transform);
+      this.#transform = transform;
     }
     get readable() {
-      const state = compressionStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      return state.readable;
+      return this.#transform.readable;
     }
     get writable() {
-      const state = compressionStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      return state.writable;
+      return this.#transform.writable;
     }
   }
   class DecompressionStream {
+    #transform;
     constructor(format) {
       if (typeof compressionNative !== "function")
         throw new TypeError("DecompressionStream is unavailable");
       const transform = compressionTransform(
         compressionFormat(format), true);
-      compressionStates.set(this, transform);
+      this.#transform = transform;
     }
     get readable() {
-      const state = compressionStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      return state.readable;
+      return this.#transform.readable;
     }
     get writable() {
-      const state = compressionStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      return state.writable;
+      return this.#transform.writable;
     }
   }
   Object.defineProperty(CompressionStream.prototype, Symbol.toStringTag, {

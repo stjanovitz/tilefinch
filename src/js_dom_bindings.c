@@ -179,7 +179,7 @@ JSValue js_dom_set_fullscreen(JSContext *context,
         || JS_ToInt32(context, &enabled, argv[1]) < 0) return JS_FALSE;
     if (enabled != 0) {
         size_t slot = 0;
-        if (!bridge->user_activation_active
+        if (!js_rt_bridge_user_activation_is_active(bridge)
             || bridge->host->document_scope
                    != SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL
             || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
@@ -187,6 +187,10 @@ JSValue js_dom_set_fullscreen(JSContext *context,
             || !bridge_node_is_connected(bridge->nodes[slot])) {
             return JS_FALSE;
         }
+        /* requestFullscreen() is an activation-consuming API. The sticky
+           hasBeenActive bit remains set, but this gesture cannot authorize a
+           later privileged operation. */
+        js_rt_bridge_consume_user_activation(bridge);
         bridge->fullscreen_node_handle = handle;
         if (bridge->stylesheet != NULL) {
             ((Stylesheet *) bridge->stylesheet)->fullscreen_node =
@@ -249,7 +253,7 @@ JSValue js_game_audio_command(JSContext *context,
     if (bridge == NULL || bridge->host == NULL || argc < 1
         || JS_ToInt32(context, &command, argv[0]) < 0) return JS_FALSE;
     if (command == 0) {
-        if (!bridge->user_activation_active) return JS_FALSE;
+        if (!js_rt_bridge_user_activation_is_active(bridge)) return JS_FALSE;
         return tilefinch_game_audio_resume(runtime_game_audio(bridge))
             ? JS_TRUE : JS_FALSE;
     }

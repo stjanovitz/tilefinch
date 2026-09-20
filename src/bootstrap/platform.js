@@ -22,9 +22,22 @@
   const trustedJSONParse = JSON.parse;
   const trustedJSONStringify = JSON.stringify;
   const decodeUtf8ValidNative = globalThis.__tilefinchDecodeUtf8Valid;
+  const encodeUtf8Native = globalThis.__tilefinchEncodeUtf8;
+  const cryptoRandomFillNative = globalThis.__tilefinchCryptoRandomFill;
   delete globalThis.__tilefinchDecodeUtf8Valid;
+  delete globalThis.__tilefinchEncodeUtf8;
   const trustedString = String,
+    trustedStringToWellFormed = Function.call.bind(
+      String.prototype.toWellFormed,
+    ),
+    trustedWebIDLString = value => {
+      /* String(Symbol()) is an ECMAScript convenience. Web IDL DOMString
+         conversion uses ToString, which rejects symbol values. */
+      if (typeof value === "symbol") throw new TypeError("Symbol is not a string");
+      return String(value);
+    },
     trustedStringFromCodePoint = Function.call.bind(String.fromCodePoint),
+    trustedTypeErrorPrototype = TypeError.prototype,
     TrustedUint8Array = Uint8Array;
   const trustedMapGet = Function.call.bind(Map.prototype.get),
     trustedMapSet = Function.call.bind(Map.prototype.set),
@@ -95,6 +108,23 @@
     trustedStringIndexOf = Function.call.bind(String.prototype.indexOf),
     trustedArrayJoin = Function.call.bind(Array.prototype.join),
     trustedFunctionApply = Function.call.bind(Function.prototype.apply);
+  const trustedIsArrayBuffer = (value) => {
+    try {
+      trustedArrayBufferByteLength(value);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  let trustedGPURequestAdapter = null,
+    trustedGPUGetPreferredCanvasFormat = null;
+  let platformNavigator = null,
+    platformNavigatorUAData = null;
+  const platformNavigatorBrand = value => value === platformNavigator,
+    platformNavigatorUADataBrand = value =>
+      platformNavigatorUAData !== null
+      && platformNavigatorUAData !== undefined
+      && value === platformNavigatorUAData;
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
@@ -1312,16 +1342,7 @@
           );
       }
       encode(input = "") {
-        const text = String(input),
-          bytes = [];
-        for (let i = 0; i < text.length; ) {
-          const next = this._next(text, i);
-          this._write(next.cp, bytes);
-          i += next.units;
-          if (bytes.length > 256 * 1024)
-            throw new RangeError("encoded text exceeds bounded size");
-        }
-        return new Uint8Array(bytes);
+        return encodeUtf8Native(trustedStringToWellFormed(String(input)));
       }
       encodeInto(source, destination) {
         if (!(destination instanceof Uint8Array))
@@ -1349,13 +1370,59 @@
         return { read, written };
       }
     };
-  if (globalThis.TextDecoder === undefined)
+  if (globalThis.TextDecoder === undefined) {
+    /* Matches js_utf8_decode_valid() and the buffered fetch/XHR response
+       ceiling. Keeping one bound lets admitted complete responses use the
+       native validation/string-construction path instead of an O(n) series
+       of interpreted string appends. */
+    const textDecoderMaximumBytes = 1024 * 1024;
+    const windows1252Labels = [
+      "ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1",
+      "ibm819", "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591",
+      "iso_8859-1", "iso_8859-1:1987", "l1", "latin1", "us-ascii",
+      "windows-1252", "x-cp1252",
+    ];
+    const windows1252High = [
+      0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+      0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+      0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+      0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+    ];
     globalThis.TextDecoder = class TextDecoder {
       constructor(label = "utf-8", options = {}) {
-        const normalized = String(label).trim().toLowerCase();
-        if (!["utf-8", "utf8", "unicode-1-1-utf-8"].includes(normalized))
+        const labelText = trustedString(label);
+        let labelStart = 0,
+          labelEnd = labelText.length;
+        const isAsciiWhitespace = (code) =>
+          code === 0x09 ||
+          code === 0x0a ||
+          code === 0x0c ||
+          code === 0x0d ||
+          code === 0x20;
+        while (
+          labelStart < labelEnd &&
+          isAsciiWhitespace(trustedCharCodeAt(labelText, labelStart))
+        )
+          labelStart++;
+        while (
+          labelEnd > labelStart &&
+          isAsciiWhitespace(trustedCharCodeAt(labelText, labelEnd - 1))
+        )
+          labelEnd--;
+        const normalized = trustedStringLower(
+          trustedStringSlice(labelText, labelStart, labelEnd),
+        );
+        if (["utf-8", "utf8", "unicode-1-1-utf-8"].includes(normalized)) {
+          this.encoding = "utf-8";
+          this._encodingKind = 0;
+        } else if (windows1252Labels.includes(normalized)) {
+          /* The Encoding Standard deliberately maps ISO-8859-1 and ASCII
+             labels to the web-compatible windows-1252 decoder. */
+          this.encoding = "windows-1252";
+          this._encodingKind = 1;
+        } else {
           throw new RangeError("only UTF-8 is supported");
-        this.encoding = "utf-8";
+        }
         this.fatal = !!options.fatal;
         this.ignoreBOM = !!options.ignoreBOM;
         this._pending = new Uint8Array();
@@ -1373,9 +1440,22 @@
           );
         else throw new TypeError("BufferSource required");
         const stream = !!options.stream;
+        if (this._encodingKind === 1) {
+          if (bytes.length > textDecoderMaximumBytes)
+            throw new RangeError("decoded input exceeds bounded size");
+          let out = "";
+          for (let i = 0; i < bytes.length; i++) {
+            const byte = bytes[i];
+            let cp = byte;
+            if (byte >= 0x80 && byte <= 0x9f)
+              cp = windows1252High[byte - 0x80];
+            out += trustedStringFromCodePoint(null, cp);
+          }
+          return out;
+        }
         const hadPending = this._pending.length !== 0;
         if (hadPending) {
-          if (this._pending.length + bytes.length > 256 * 1024)
+          if (this._pending.length + bytes.length > textDecoderMaximumBytes)
             throw new RangeError("decoded input exceeds bounded size");
           const joined = new Uint8Array(this._pending.length + bytes.length);
           joined.set(this._pending);
@@ -1383,6 +1463,8 @@
           bytes = joined;
         }
         this._pending = new Uint8Array();
+        if (bytes.length > textDecoderMaximumBytes)
+          throw new RangeError("decoded input exceeds bounded size");
         if (!stream && !hadPending && decodeUtf8ValidNative) {
           const decoded = decodeUtf8ValidNative(
             bytes, !this.ignoreBOM && !this._bomSeen);
@@ -1478,6 +1560,7 @@
         return out;
       }
     };
+  }
   const blobURLs = new Map(),
     blobStates = new WeakMap(),
     fileStates = new WeakMap(),
@@ -1495,10 +1578,22 @@
       trustedUint8ArraySet(copy, state.bytes);
       return copy;
     };
-  let nextBlobURL = 1,
-    blobURLBytes = 0;
+  let blobURLBytes = 0;
   const blobURLLimit = 16,
-    blobURLByteLimit = 512 * 1024;
+    blobURLByteLimit = 512 * 1024,
+    blobURLIdentifier = () => {
+      const bytes = new TrustedUint8Array(16);
+      cryptoRandomFillNative(bytes);
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      let hex = "";
+      for (let index = 0; index < bytes.length; index++)
+        hex += bytes[index].toString(16).padStart(2, "0");
+      return (
+        hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" +
+        hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20)
+      );
+    };
   const TilefinchBlob = class Blob {
     constructor(parts = [], options = {}) {
       if (parts === null || parts === undefined || !parts[Symbol.iterator])
@@ -1511,8 +1606,11 @@
         if (blobState) {
           bytes = blobState.bytes;
           byteLength = blobState.length;
-        } else if (part instanceof ArrayBuffer) {
-          bytes = new Uint8Array(part);
+        } else if (trustedIsArrayBuffer(part)) {
+          /* ArrayBuffer is a realm-specific constructor. Check its internal
+             slot through the captured getter so Worker and frame buffers are
+             copied as bytes rather than silently stringified. */
+          bytes = new TrustedUint8Array(part);
           byteLength = bytes.byteLength;
         } else if (ArrayBuffer.isView(part)) {
           bytes = new Uint8Array(
@@ -3151,27 +3249,36 @@
       url.hash;
     return true;
   };
-  TilefinchURL.createObjectURL = function createObjectURL(blob) {
-    const state = trustedWeakMapGet(blobStates, blob);
-    if (!state) throw new TypeError("Blob required");
-    if (
-      trustedMapSize(blobURLs) >= blobURLLimit ||
-      blobURLBytes + state.bytes.byteLength > blobURLByteLimit
-    )
-      throw new RangeError("blob URL quota exceeded");
-    const url = "blob:" + location.origin + "/" + nextBlobURL++;
-    trustedMapSet(blobURLs, url, blob);
-    blobURLBytes += state.bytes.byteLength;
-    return url;
+  /* Web IDL static operations are non-constructible built-in functions and
+     do not expose an own `prototype`. Concise methods have that shape; plain
+     function expressions do not. */
+  const blobURLStaticOperations = {
+    createObjectURL(blob) {
+      if (arguments.length === 0) throw new TypeError("Blob required");
+      const state = trustedWeakMapGet(blobStates, blob);
+      if (!state) throw new TypeError("Blob required");
+      if (
+        trustedMapSize(blobURLs) >= blobURLLimit ||
+        blobURLBytes + state.bytes.byteLength > blobURLByteLimit
+      )
+        throw new RangeError("blob URL quota exceeded");
+      const url = "blob:" + location.origin + "/" + blobURLIdentifier();
+      trustedMapSet(blobURLs, url, blob);
+      blobURLBytes += state.bytes.byteLength;
+      return url;
+    },
+    revokeObjectURL(url) {
+      if (arguments.length === 0) throw new TypeError("URL required");
+      url = trustedWebIDLString(url);
+      const blob = trustedMapGet(blobURLs, url);
+      if (blob) {
+        blobURLBytes -= blobBytes(blob).byteLength;
+        trustedMapDelete(blobURLs, url);
+      }
+    },
   };
-  TilefinchURL.revokeObjectURL = function revokeObjectURL(url) {
-    url = trustedString(url);
-    const blob = trustedMapGet(blobURLs, url);
-    if (blob) {
-      blobURLBytes -= blobBytes(blob).byteLength;
-      trustedMapDelete(blobURLs, url);
-    }
-  };
+  TilefinchURL.createObjectURL = blobURLStaticOperations.createObjectURL;
+  TilefinchURL.revokeObjectURL = blobURLStaticOperations.revokeObjectURL;
   /* Worker binds policy and retained source to one WebIDL conversion. Keep
      the conversion intrinsic private and make lookup accept only its already
      converted primitive so author String replacement cannot split identity. */
@@ -3225,6 +3332,12 @@
       apply: trustedFunctionApply,
       charCodeAt: trustedCharCodeAt,
       indexOf: trustedStringIndexOf,
+      gpu: (receiver, args) =>
+        trustedFunctionApply(trustedGPURequestAdapter, receiver, args),
+      gpuFormat: (receiver) =>
+        trustedFunctionApply(trustedGPUGetPreferredCanvasFormat, receiver, []),
+      typeError: (value) => value !== null && typeof value === "object" &&
+        trustedObjectPrototype(value) === trustedTypeErrorPrototype,
       join: trustedArrayJoin,
       slice: trustedStringSlice,
       sourceForBlob: workerSourceForBlob,
@@ -3243,7 +3356,7 @@
       : new TypeError(message);
   };
   const workerCloneConstructorNames = Object.freeze([
-      "Object", "Array", "ArrayBuffer", "DataView", "Date", "RegExp",
+      "Object", "Array", "ArrayBuffer", "DataView", "Date", "RegExp", "Promise",
       "Blob", "File", "MessagePort",
       "Map", "Set", "Error", "EvalError", "RangeError", "ReferenceError",
       "SyntaxError", "TypeError", "URIError", "Boolean", "Number", "String",
@@ -6039,20 +6152,25 @@
       }
     } catch (error) {
       if (deferException) return { error, item, list };
+      let observed = false;
       if (typeof errorObserver === "function")
-        try { errorObserver(error, item, list); } catch (_) {}
-      __tilefinchReportUncaught(error, "event " + event.type);
+        try { observed = errorObserver(error, item, list) === true; } catch (_) {}
+      if (!observed)
+        __tilefinchReportUncaught(error, "event " + event.type);
     } finally {
       event.__passive = false;
     }
     return null;
   };
   const reportListenerException = (pending, event, errorObserver) => {
+    let observed = false;
     if (typeof errorObserver === "function")
       try {
-        errorObserver(pending.error, pending.item, pending.list);
+        observed = errorObserver(
+          pending.error, pending.item, pending.list) === true;
       } catch (_) {}
-    __tilefinchReportUncaught(pending.error, "event " + event.type);
+    if (!observed)
+      __tilefinchReportUncaught(pending.error, "event " + event.type);
   };
   globalThis.__tilefinchInvokeListenerList = (
     map,
@@ -6267,6 +6385,37 @@
         if (listeners.length === 0 && typeof betweenPhases !== "function")
           finish();
         else resume();
+      } catch (error) {
+        finish();
+        throw error;
+      }
+    };
+    globalThis.__tilefinchDispatchEventTargetCheckpointed = (
+      target,
+      event,
+      complete = null,
+      errorObserver = null,
+    ) => {
+      const value = event;
+      globalThis.__tilefinchPrepareEvent(value, target, [target]);
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        globalThis.__tilefinchFinishEventDispatch(value);
+        __tilefinchRecordEvent();
+        if (typeof complete === "function") complete();
+      };
+      try {
+        if (value.__stopped) finish();
+        else globalThis.__tilefinchInvokeEventTargetCheckpointed(
+          target,
+          value,
+          Event.AT_TARGET,
+          errorObserver,
+          null,
+          finish,
+        );
       } catch (error) {
         finish();
         throw error;
@@ -7362,6 +7511,7 @@
        matching the prototype/brand surface feature-detection code expects. */
     const navigatorToken = {},
       uaDataToken = {},
+      userActivationToken = {},
       gpuToken = {},
       wgslLanguageFeaturesToken = {},
       pluginArrayToken = {},
@@ -7369,6 +7519,7 @@
       pluginToken = {},
       mimeTypeToken = {},
       languages = Object.freeze(["en-US", "en"]),
+      readUserActivationState = globalThis.__tilefinchUserActivationState,
       brands = Object.freeze([
         Object.freeze({
           brand: String(globalThis.__tilefinchBrowserBrand),
@@ -7383,12 +7534,18 @@
         }),
         Object.freeze({ brand: "Not.A/Brand", version: "99.0.0.0" }),
       ]);
+    const webIDLString = value => {
+      /* String(Symbol()) is a special ECMAScript convenience. Web IDL's
+         DOMString conversion uses ToString, which rejects symbol values. */
+      if (typeof value === "symbol") throw new TypeError("Symbol is not a string");
+      return String(value);
+    };
     const queuePlatformTask = (operation, quotaLabel = "Platform") =>
       new Promise((resolve, reject) => {
-        const task = setTimeout(() => {
+        const task = globalThis.__tilefinchScheduleTask(() => {
           try { resolve(operation()); }
           catch (error) { reject(error); }
-        }, 0);
+        });
         if (task === 0)
           reject(new DOMException(
             quotaLabel + " task quota exceeded", "QuotaExceededError"));
@@ -7399,36 +7556,54 @@
           throw new TypeError("Illegal constructor");
       }
       get size() {
-        if (!(this instanceof WGSLLanguageFeatures))
+        if (this !== wgslLanguageFeatures)
           throw new TypeError("Illegal invocation");
         return 0;
       }
-      has() {
-        if (!(this instanceof WGSLLanguageFeatures))
+      has(value) {
+        if (this !== wgslLanguageFeatures)
           throw new TypeError("Illegal invocation");
+        webIDLString(value);
         return false;
       }
       entries() {
-        if (!(this instanceof WGSLLanguageFeatures))
+        if (this !== wgslLanguageFeatures)
           throw new TypeError("Illegal invocation");
-        return [][Symbol.iterator]();
-      }
-      keys() {
-        if (!(this instanceof WGSLLanguageFeatures))
-          throw new TypeError("Illegal invocation");
-        return [][Symbol.iterator]();
+        return emptyWGSLFeatures.entries();
       }
       values() {
-        if (!(this instanceof WGSLLanguageFeatures))
+        if (this !== wgslLanguageFeatures)
           throw new TypeError("Illegal invocation");
-        return [][Symbol.iterator]();
+        return emptyWGSLFeatures.values();
       }
-      forEach() {
-        if (!(this instanceof WGSLLanguageFeatures))
+      forEach(callback, thisArg = undefined) {
+        if (this !== wgslLanguageFeatures)
           throw new TypeError("Illegal invocation");
+        if (typeof callback !== "function")
+          throw new TypeError("callback must be callable");
+        emptyWGSLFeatures.forEach(callback, thisArg);
       }
-      [Symbol.iterator]() { return this.values(); }
     }
+    const emptyWGSLFeatures = new Set();
+    Object.defineProperties(WGSLLanguageFeatures.prototype, {
+      keys: {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: WGSLLanguageFeatures.prototype.values,
+      },
+      [Symbol.iterator]: {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: WGSLLanguageFeatures.prototype.values,
+      },
+    });
+    for (const name of ["has", "entries", "values", "forEach"])
+      Object.defineProperty(WGSLLanguageFeatures.prototype, name, {
+        ...Object.getOwnPropertyDescriptor(WGSLLanguageFeatures.prototype, name),
+        enumerable: true,
+      });
     Object.defineProperty(
       WGSLLanguageFeatures.prototype,
       Symbol.toStringTag,
@@ -7440,34 +7615,36 @@
           throw new TypeError("Illegal constructor");
       }
       get wgslLanguageFeatures() {
-        if (!(this instanceof GPU)) throw new TypeError("Illegal invocation");
+        if (this !== gpu) throw new TypeError("Illegal invocation");
         return wgslLanguageFeatures;
       }
       getPreferredCanvasFormat() {
-        if (!(this instanceof GPU)) throw new TypeError("Illegal invocation");
+        if (this !== gpu) throw new TypeError("Illegal invocation");
         return "bgra8unorm";
       }
       requestAdapter(options = {}) {
-        if (!(this instanceof GPU)) throw new TypeError("Illegal invocation");
         /* Even without an admitted WebGPU adapter, Web IDL still converts the
            complete options dictionary. Sites use those ordered conversions
            to distinguish an implementation from a placeholder. Conversion
            failures reject this promise; an unavailable adapter resolves to
            null from the WebGPU task timeline. */
         try {
+          if (this !== gpu) throw new TypeError("Illegal invocation");
           if (options === null || options === undefined) options = {};
+          else if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("GPURequestAdapterOptions must be a dictionary");
           const featureValue = options.featureLevel,
             featureLevel = featureValue === undefined
-              ? "core" : String(featureValue),
-            forceFallbackAdapter = Boolean(options.forceFallbackAdapter),
+              ? "core" : webIDLString(featureValue);
+          const forceFallbackAdapter = Boolean(options.forceFallbackAdapter),
             powerValue = options.powerPreference,
             powerPreference = powerValue === undefined
-              ? undefined : String(powerValue),
-            xrCompatible = Boolean(options.xrCompatible);
+              ? undefined : webIDLString(powerValue);
           if (powerPreference !== undefined
               && powerPreference !== "low-power"
               && powerPreference !== "high-performance")
             throw new TypeError("Invalid GPU powerPreference");
+          const xrCompatible = Boolean(options.xrCompatible);
           /* Preserve all observable conversions while making the PSP's lack
              of a WebGPU adapter explicit. */
           void featureLevel;
@@ -7479,6 +7656,8 @@
         return queuePlatformTask(() => null, "WebGPU");
       }
     }
+    trustedGPURequestAdapter = GPU.prototype.requestAdapter;
+    trustedGPUGetPreferredCanvasFormat = GPU.prototype.getPreferredCanvasFormat;
     Object.defineProperty(GPU.prototype, Symbol.toStringTag, {
       configurable: true,
       value: "GPU",
@@ -7532,39 +7711,65 @@
       });
     const plugins = new PluginArray(pluginArrayToken),
       mimeTypes = new MimeTypeArray(mimeTypeArrayToken);
+    class UserActivation {
+      constructor() {
+        if (arguments[0] !== userActivationToken)
+          throw new TypeError("Illegal constructor");
+      }
+      get hasBeenActive() {
+        if (this !== userActivation) throw new TypeError("Illegal invocation");
+        return (readUserActivationState() & 2) !== 0;
+      }
+      get isActive() {
+        if (this !== userActivation) throw new TypeError("Illegal invocation");
+        return (readUserActivationState() & 1) !== 0;
+      }
+    }
+    Object.defineProperty(UserActivation.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "UserActivation",
+    });
+    const userActivation = new UserActivation(userActivationToken);
     class NavigatorUAData {
       constructor() {
         if (arguments[0] !== uaDataToken)
           throw new TypeError("Illegal constructor");
       }
       get brands() {
-        if (!(this instanceof NavigatorUAData))
+        if (!platformNavigatorUADataBrand(this))
           throw new TypeError("Illegal invocation");
         return brands;
       }
       get mobile() {
-        if (!(this instanceof NavigatorUAData))
+        if (!platformNavigatorUADataBrand(this))
           throw new TypeError("Illegal invocation");
         return true;
       }
       get platform() {
-        if (!(this instanceof NavigatorUAData))
+        if (!platformNavigatorUADataBrand(this))
           throw new TypeError("Illegal invocation");
         return "PlayStation Portable";
       }
       getHighEntropyValues(hints) {
-        if (!(this instanceof NavigatorUAData))
-          throw new TypeError("Illegal invocation");
-        /* Web IDL converts the complete sequence before the operation runs.
-           Keep the observable iterator/string order while bounding hostile
-           iterables independently of the number of hints we recognize. */
-        const requested = [];
-        for (const hint of hints) {
-          if (requested.length >= 64)
-            throw new RangeError("UA client hint quota exceeded");
-          requested.push(String(hint));
+        let requested;
+        try {
+          if (!platformNavigatorUADataBrand(this))
+            throw new TypeError("Illegal invocation");
+          /* Promise-returning Web IDL operations convert arguments before
+             returning, but surface conversion and receiver failures through
+             the returned rejected promise. Preserve the complete observable
+             iterator/string order while bounding hostile iterables. */
+          requested = [];
+          for (const hint of hints) {
+            if (requested.length >= 64)
+              throw new RangeError("UA client hint quota exceeded");
+            requested.push(webIDLString(hint));
+          }
+        } catch (error) {
+          return Promise.reject(error);
         }
-        const all = Object.assign(Object.create(null), {
+        return queuePlatformTask(() => {
+          const all = Object.assign(Object.create(null), {
             architecture: "MIPS",
             bitness: "32",
             formFactors: Object.freeze(["Mobile"]),
@@ -7575,18 +7780,19 @@
             fullVersionList,
             wow64: false,
           }),
-          value = {
-            brands,
-            mobile: true,
-            platform: "PlayStation Portable",
-          };
-        for (const hint of requested)
-          if (Object.prototype.hasOwnProperty.call(all, hint))
-            value[hint] = all[hint];
-        return Promise.resolve(value);
+            value = {
+              brands,
+              mobile: true,
+              platform: "PlayStation Portable",
+            };
+          for (const hint of requested)
+            if (Object.prototype.hasOwnProperty.call(all, hint))
+              value[hint] = all[hint];
+          return value;
+        }, "UA client hints");
       }
       toJSON() {
-        if (!(this instanceof NavigatorUAData))
+        if (!platformNavigatorUADataBrand(this))
           throw new TypeError("Illegal invocation");
         return { brands, mobile: true, platform: "PlayStation Portable" };
       }
@@ -7595,10 +7801,10 @@
       configurable: true,
       value: "NavigatorUAData",
     });
-    const uaData = diagnosticMobileSafari
+    platformNavigatorUAData = diagnosticMobileSafari
       ? undefined
-      : new NavigatorUAData(uaDataToken),
-      values = diagnosticMobileSafari
+      : new NavigatorUAData(uaDataToken);
+    const values = diagnosticMobileSafari
         ? {
             userAgent:
               "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
@@ -7619,33 +7825,104 @@
         if (arguments[0] !== navigatorToken)
           throw new TypeError("Illegal constructor");
       }
-      get userAgent() { return values.userAgent; }
-      get appCodeName() { return "Mozilla"; }
-      get appName() { return "Netscape"; }
+      get userAgent() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return values.userAgent;
+      }
+      get appCodeName() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return "Mozilla";
+      }
+      get appName() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return "Netscape";
+      }
       get appVersion() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return values.userAgent.startsWith("Mozilla/")
           ? values.userAgent.slice(8)
           : "";
       }
-      get language() { return languages[0]; }
-      get languages() { return languages; }
-      get platform() { return values.platform; }
-      get product() { return "Gecko"; }
-      get productSub() { return "20030107"; }
-      get vendor() { return ""; }
-      get vendorSub() { return ""; }
-      get maxTouchPoints() { return values.maxTouchPoints; }
-      get cookieEnabled() { return true; }
-      get onLine() { return true; }
-      get hardwareConcurrency() { return values.hardwareConcurrency; }
-      get deviceMemory() { return values.deviceMemory; }
-      get userAgentData() { return uaData; }
-      get gpu() { return globalThis.isSecureContext ? gpu : undefined; }
-      get plugins() { return plugins; }
-      get mimeTypes() { return mimeTypes; }
-      get pdfViewerEnabled() { return false; }
-      get webdriver() { return false; }
-      javaEnabled() { return false; }
+      get language() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return languages[0];
+      }
+      get languages() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return languages;
+      }
+      get platform() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return values.platform;
+      }
+      get product() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return "Gecko";
+      }
+      get productSub() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return "20030107";
+      }
+      get vendor() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return "";
+      }
+      get vendorSub() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return "";
+      }
+      get maxTouchPoints() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return values.maxTouchPoints;
+      }
+      get cookieEnabled() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return true;
+      }
+      get onLine() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return true;
+      }
+      get hardwareConcurrency() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return values.hardwareConcurrency;
+      }
+      get deviceMemory() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return values.deviceMemory;
+      }
+      get userAgentData() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return platformNavigatorUAData;
+      }
+      get userActivation() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return userActivation;
+      }
+      get gpu() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return globalThis.isSecureContext ? gpu : undefined;
+      }
+      get plugins() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return plugins;
+      }
+      get mimeTypes() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return mimeTypes;
+      }
+      get pdfViewerEnabled() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return false;
+      }
+      get webdriver() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return false;
+      }
+      javaEnabled() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return false;
+      }
     }
     Object.defineProperty(Navigator.prototype, Symbol.toStringTag, {
       configurable: true,
@@ -7654,6 +7931,7 @@
     for (const constructor of [
       Navigator,
       NavigatorUAData,
+      UserActivation,
       GPU,
       WGSLLanguageFeatures,
       PluginArray,
@@ -7674,27 +7952,41 @@
       }
     globalThis.Navigator = Navigator;
     globalThis.NavigatorUAData = NavigatorUAData;
+    globalThis.UserActivation = UserActivation;
     globalThis.GPU = GPU;
     globalThis.WGSLLanguageFeatures = WGSLLanguageFeatures;
     globalThis.PluginArray = PluginArray;
     globalThis.MimeTypeArray = MimeTypeArray;
     globalThis.Plugin = Plugin;
     globalThis.MimeType = MimeType;
-    globalThis.navigator = new Navigator(navigatorToken);
+    platformNavigator = new Navigator(navigatorToken);
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      enumerable: true,
+      writable: false,
+      value: platformNavigator,
+    });
+    globalThis.__tilefinchNavigatorBrand = platformNavigatorBrand;
     Object.defineProperty(globalThis, "clientInformation", {
       configurable: true,
       enumerable: true,
-      get() { return globalThis.navigator; },
+      /* Window's two Navigator attributes expose the same associated
+         Navigator object.  Do not consult the replaceable public navigator
+         property here: author code may redefine it without changing the
+         object associated with clientInformation. */
+      get() { return platformNavigator; },
     });
     const storageManagerToken = {};
+    let storageManager = null;
+    const storageManagerBrand = value => value === storageManager;
     class StorageManager {
       constructor() {
         if (arguments[0] !== storageManagerToken)
           throw new TypeError("Illegal constructor");
       }
       estimate() {
-        if (!(this instanceof StorageManager))
-          throw new TypeError("Illegal invocation");
+        if (!storageManagerBrand(this))
+          return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
           const values = globalThis.__tilefinchStorageEstimate();
           if (!values)
@@ -7706,8 +7998,8 @@
         }, "Storage");
       }
       persisted() {
-        if (!(this instanceof StorageManager))
-          throw new TypeError("Illegal invocation");
+        if (!storageManagerBrand(this))
+          return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
           if (!globalThis.__tilefinchStorageAvailable())
             throw new TypeError("Storage is unavailable for this origin");
@@ -7715,8 +8007,8 @@
         }, "Storage");
       }
       persist() {
-        if (!(this instanceof StorageManager))
-          throw new TypeError("Illegal invocation");
+        if (!storageManagerBrand(this))
+          return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
           if (!globalThis.__tilefinchStorageAvailable())
             throw new TypeError("Storage is unavailable for this origin");
@@ -7733,13 +8025,12 @@
         ...Object.getOwnPropertyDescriptor(StorageManager.prototype, key),
         enumerable: true,
       });
-    const storageManager = new StorageManager(storageManagerToken);
+    storageManager = new StorageManager(storageManagerToken);
     Object.defineProperty(Navigator.prototype, "storage", {
       configurable: true,
       enumerable: true,
       get() {
-        if (!(this instanceof Navigator))
-          throw new TypeError("Illegal invocation");
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return storageManager;
       },
     });
@@ -7755,45 +8046,47 @@
       emptyKeyboardMap = new Map();
     let keyboard = null,
       keyboardLayoutMap = null;
+    const keyboardBrand = value => value === keyboard,
+      keyboardLayoutMapBrand = value => value === keyboardLayoutMap;
     class KeyboardLayoutMap {
       constructor() {
         if (arguments[0] !== keyboardLayoutMapToken)
           throw new TypeError("Illegal constructor");
       }
       get size() {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         return 0;
       }
       entries() {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         return emptyKeyboardMap.entries();
       }
       forEach(callback, thisArg) {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         if (typeof callback !== "function")
           throw new TypeError("callback must be a function");
         emptyKeyboardMap.forEach(callback, thisArg);
       }
       get(key) {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         return emptyKeyboardMap.get(String(key));
       }
       has(key) {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         return emptyKeyboardMap.has(String(key));
       }
       keys() {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         return emptyKeyboardMap.keys();
       }
       values() {
-        if (!(this instanceof KeyboardLayoutMap))
+        if (!keyboardLayoutMapBrand(this))
           throw new TypeError("Illegal invocation");
         return emptyKeyboardMap.values();
       }
@@ -7805,8 +8098,8 @@
           throw new TypeError("Illegal constructor");
       }
       getLayoutMap() {
-        if (!(this instanceof Keyboard))
-          throw new TypeError("Illegal invocation");
+        if (!keyboardBrand(this))
+          return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
           if (keyboardLayoutMap === null)
             keyboardLayoutMap = new KeyboardLayoutMap(keyboardLayoutMapToken);
@@ -7814,8 +8107,8 @@
         });
       }
       lock() {
-        if (!(this instanceof Keyboard))
-          throw new TypeError("Illegal invocation");
+        if (!keyboardBrand(this))
+          return Promise.reject(new TypeError("Illegal invocation"));
         if (!document.fullscreenElement)
           return Promise.reject(
             new DOMException(
@@ -7826,7 +8119,7 @@
         return Promise.resolve();
       }
       unlock() {
-        if (!(this instanceof Keyboard))
+        if (!keyboardBrand(this))
           throw new TypeError("Illegal invocation");
       }
     }
@@ -7855,8 +8148,7 @@
       configurable: true,
       enumerable: true,
       get() {
-        if (!(this instanceof Navigator))
-          throw new TypeError("Illegal invocation");
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         if (keyboard === null) keyboard = new Keyboard(keyboardToken);
         return keyboard;
       },
@@ -7896,7 +8188,6 @@
     Object.freeze(axes);
     Object.freeze(buttons);
     let connected = false,
-      hasGamepadGesture = false,
       timestamp = 0,
       currentButtonBits = 0;
     /* PSP analog input can change on every sampled frame. Keep that hot
@@ -7943,14 +8234,12 @@
       enumerable: true,
       writable: true,
       value: function getGamepads() {
-        if (!(this instanceof Navigator))
-          throw new TypeError("Illegal invocation");
-        /* Before an explicit page-controls handoff, exposing even a null slot
-           reveals the presence of the built-in controller. Afterwards retain
-           its assigned index across disconnects, but return a new sequence so
-           author mutation cannot poison later snapshots. */
-        if (!hasGamepadGesture) return [];
-        return [connected ? gamepad : null];
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        /* Browsers expose a stable bounded set of index slots even when no
+           controller is connected. Four null entries reveal no controller
+           state, retain the PSP controller's assigned index across handoffs,
+           and keep each returned sequence independently mutable. */
+        return [connected ? gamepad : null, null, null, null];
       },
     });
     globalThis.__tilefinchUpdateGamepad = (
@@ -7961,7 +8250,6 @@
       nextTimestamp,
     ) => {
       nextConnected = !!nextConnected;
-      if (nextConnected) hasGamepadGesture = true;
       buttonBits = Number(buttonBits) >>> 0;
       if (buttonBits !== currentButtonBits) {
         currentButtonBits = buttonBits;
@@ -7981,6 +8269,7 @@
   }
   {
     const clipboardToken = {};
+    let clipboard = null;
     class Clipboard extends EventTarget {
       constructor() {
         super();
@@ -7988,6 +8277,8 @@
           throw new TypeError("Illegal constructor");
       }
       writeText(value) {
+      if (this !== clipboard)
+        return Promise.reject(new TypeError("Illegal invocation"));
       try {
         globalThis.__tilefinchClipboardWrite(value);
         return Promise.resolve();
@@ -7996,6 +8287,8 @@
       }
       }
       readText() {
+        if (this !== clipboard)
+          return Promise.reject(new TypeError("Illegal invocation"));
         return Promise.resolve(globalThis.__tilefinchClipboardStats.text);
       }
     }
@@ -8008,13 +8301,12 @@
         ...Object.getOwnPropertyDescriptor(Clipboard.prototype, key),
         enumerable: true,
       });
-    const clipboard = new Clipboard(clipboardToken);
+    clipboard = new Clipboard(clipboardToken);
     Object.defineProperty(Navigator.prototype, "clipboard", {
       configurable: true,
       enumerable: true,
       get() {
-        if (!(this instanceof Navigator))
-          throw new TypeError("Illegal invocation");
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return clipboard;
       },
     });
@@ -8066,56 +8358,6 @@
             " bad-code=" +
             (bad < 0 ? -1 : text.charCodeAt(bad)),
         );
-      }
-    };
-  }
-  {
-    const decode = globalThis.atob,
-      history = [];
-    let calls = 0;
-    globalThis.atob = (input) => {
-      const text = String(input),
-        codes = [];
-      for (let i = 0; i < Math.min(12, text.length); i++)
-        codes.push(text.charCodeAt(i));
-      const call = ++calls,
-        brief =
-          call +
-          ":" +
-          text.length +
-          ":" +
-          (text.length ? text.charCodeAt(0) : -1),
-        detail =
-          "call=" +
-          call +
-          " type=" +
-          typeof input +
-          " tag=" +
-          Object.prototype.toString.call(input) +
-          " length=" +
-          text.length +
-          " prefix=" +
-          codes.join(",");
-      try {
-        const output = decode(input),
-          out = [];
-        for (let i = 0; i < Math.min(4, output.length); i++)
-          out.push(output.charCodeAt(i));
-        history.push(brief + ">" + output.length + ":" + out.join(","));
-        if (history.length > 8) history.shift();
-        return output;
-      } catch (error) {
-        const diagnostic = detail + " prior=" + history.join("|");
-        globalThis.__tilefinchBase64Error =
-          (
-            String(globalThis.__tilefinchBase64Error || "").slice(-1024) +
-            " " +
-            diagnostic
-          ).slice(-2048);
-        if (error && typeof error === "object")
-          error.message =
-            String(error.message || error) + " [" + diagnostic + "]";
-        throw error;
       }
     };
   }
@@ -8899,6 +9141,34 @@
         return state[name];
       },
     });
+  const performanceTimingConfidenceToken = {},
+    performanceTimingConfidenceStates = new WeakMap();
+  class PerformanceTimingConfidence {
+    constructor(token, randomizedTriggerRate, value) {
+      if (token !== performanceTimingConfidenceToken)
+        throw new TypeError("Illegal constructor");
+      performanceTimingConfidenceStates.set(this, {
+        randomizedTriggerRate,
+        value,
+      });
+    }
+    get randomizedTriggerRate() {
+      const state = performanceTimingConfidenceStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.randomizedTriggerRate;
+    }
+    get value() {
+      const state = performanceTimingConfidenceStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.value;
+    }
+    toJSON() {
+      return {
+        randomizedTriggerRate: this.randomizedTriggerRate,
+        value: this.value,
+      };
+    }
+  }
   class PerformanceNavigationTiming extends PerformanceResourceTiming {
     constructor(name) {
       super(name, "navigation");
@@ -8915,6 +9185,9 @@
         domComplete: 0,
         loadEventStart: 0,
         loadEventEnd: 0,
+        criticalCHRestart: 0,
+        notRestoredReasons: null,
+        confidence: null,
       };
     }
     toJSON() {
@@ -8930,6 +9203,9 @@
         domComplete: this.domComplete,
         loadEventStart: this.loadEventStart,
         loadEventEnd: this.loadEventEnd,
+        criticalCHRestart: this.criticalCHRestart,
+        notRestoredReasons: this.notRestoredReasons,
+        confidence: this.confidence,
       };
     }
   }
@@ -8937,7 +9213,7 @@
     "type", "redirectCount", "unloadEventStart", "unloadEventEnd",
     "domInteractive", "domContentLoadedEventStart",
     "domContentLoadedEventEnd", "domComplete", "loadEventStart",
-    "loadEventEnd",
+    "loadEventEnd", "criticalCHRestart", "notRestoredReasons",
   ])
     Object.defineProperty(PerformanceNavigationTiming.prototype, name, {
       configurable: true,
@@ -8948,12 +9224,26 @@
         return state[name];
       },
     });
+  Object.defineProperty(PerformanceNavigationTiming.prototype, "confidence", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      const state = requirePerformanceEntryState(this).navigation;
+      if (!state) throw new TypeError("Illegal invocation");
+      if (state.domInteractive === 0) return null;
+      if (state.confidence === null)
+        state.confidence = new PerformanceTimingConfidence(
+          performanceTimingConfidenceToken, 0, "high");
+      return state.confidence;
+    },
+  });
   for (const [constructor, name] of [
     [PerformanceEntry, "PerformanceEntry"],
     [PerformanceMark, "PerformanceMark"],
     [PerformanceMeasure, "PerformanceMeasure"],
     [PerformanceResourceTiming, "PerformanceResourceTiming"],
     [PerformanceNavigationTiming, "PerformanceNavigationTiming"],
+    [PerformanceTimingConfidence, "PerformanceTimingConfidence"],
     [VisibilityStateEntry, "VisibilityStateEntry"],
   ]) {
     Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
@@ -8996,6 +9286,7 @@
     PerformanceMeasure,
     PerformanceResourceTiming,
     PerformanceNavigationTiming,
+    PerformanceTimingConfidence,
     PerformanceObserverEntryList,
   });
   globalThis.VisibilityStateEntry = VisibilityStateEntry;
@@ -9016,7 +9307,7 @@
     schedulePerformanceObserver = (observer, state) => {
       if (state.pending || state.records.length === 0) return;
       state.pending = true;
-      setTimeout(() => {
+      globalThis.__tilefinchScheduleTask(() => {
         state.pending = false;
         if (!performanceObservers.has(observer) || state.records.length === 0)
           return;
@@ -9033,7 +9324,7 @@
           );
         }
         state.dropped = 0;
-      }, 0);
+      });
     },
     notifyPerformanceObservers = (entry) => {
       for (const observer of performanceObservers) {
@@ -9203,6 +9494,12 @@
       resource.responseStart = responseStart;
       resource.finalResponseHeadersStart = responseStart;
     }
+    resource.responseStatus = Math.max(0, Math.min(65535,
+      Math.trunc(Number(responseStatus) || 0)));
+    resource.nextHopProtocol = String(nextHopProtocol || "");
+    resource.contentType = String(contentType || "");
+    if (!responseComplete && resource.responseStatus > 0)
+      resource.transferSize = 300;
     if (responseComplete) {
       resource.responseEnd = responseEnd;
       resource.finalResponseHeadersStart = resource.responseStart;
@@ -9212,10 +9509,6 @@
       resource.encodedBodySize = encoded;
       resource.decodedBodySize = decoded;
       resource.transferSize = encodedBodyBytesMeasured ? encoded + 300 : 0;
-      resource.responseStatus = Math.max(0, Math.min(65535,
-        Math.trunc(Number(responseStatus) || 0)));
-      resource.nextHopProtocol = String(nextHopProtocol || "");
-      resource.contentType = String(contentType || "");
     }
     const epoch = performanceTimeOrigin;
     performanceTimingState.fetchStart = epoch;

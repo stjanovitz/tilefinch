@@ -3393,6 +3393,17 @@ function loadRecord(metaPath) {
       && (status === 0 || externalCancel || transportTimeout)) {
     throw new CaptureError(`${metaPath}: successful response has failure-only transport state`);
   }
+  let cacheMode = 0;
+  const traceVersion = metadata["psp-http-trace"] === undefined
+    ? 0 : metadataInteger(metadata, "psp-http-trace", metaPath);
+  if (traceVersion >= 13) {
+    const shape = String(metadata["request-extra-header-shape"] || "");
+    const match = /^@cache=([0-3]);/.exec(shape);
+    if (!match) {
+      throw new CaptureError(`${metaPath}: missing or invalid request cache mode`);
+    }
+    cacheMode = Number(match[1]);
+  }
   const signature = crypto.createHash("sha256").update(JSON.stringify({
     success: metadata.success === "1", status, contentType,
     headers, body_sha256: crypto.createHash("sha256").update(body).digest("hex"),
@@ -3403,7 +3414,7 @@ function loadRecord(metaPath) {
     id: path.basename(metaPath, ".meta"), method, url,
     success: metadata.success === "1", status, contentType,
     headers, body, cookies, responseDateSeconds, asyncDelayPumps,
-    externalCancel, transportTimeout, signature,
+    externalCancel, transportTimeout, cacheMode, signature,
   };
 }
 
@@ -3611,7 +3622,19 @@ function loadTrace(traceDirectory) {
     grouped.get(key).push(record);
   }
   const routes = new Map();
-  for (const [key, candidates] of grouped) routes.set(key, selectRoute(candidates));
+  for (const [key, candidates] of grouped) {
+    /* Playwright exposes final HTTP headers but not Request.cache. Author
+       headers can be byte-identical to browser-generated cache headers, so
+       inference from the wire would be ambiguous. Native v13 replay keys by
+       the retained cache mode; fail closed when one method+URL route mixes
+       modes until the reference interceptor can bind that value exactly. */
+    if (new Set(candidates.map((record) => record.cacheMode)).size > 1) {
+      throw new CaptureError(
+        `${root}: mixed request cache modes cannot be routed faithfully for ${key.replace("\0", " ")}`,
+      );
+    }
+    routes.set(key, selectRoute(candidates));
+  }
   return {
     root, records, routes, digest, originMs,
     ambiguousRoutes: [...routes.values()].filter((route) => route.ambiguous).length,

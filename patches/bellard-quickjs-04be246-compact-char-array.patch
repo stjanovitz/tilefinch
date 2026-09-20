@@ -410,6 +410,15 @@ index 126ac249..0a374994 100644
          }
      }
 
+@@ -41949,7 +42122,7 @@ static int JS_CopySubArray(JSContext *ctx,
+             to = to_pos + i;
+         }
+-        if (p && p->fast_array &&
++        if (p && p->fast_array && !p->compact_char_array &&
+             from >= 0 && from < (len = p->u.array.count)  &&
+             to >= 0 && to < len) {
+             int64_t l, j;
+
 @@ -42997,8 +43170,23 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
              c = p->u.str8[0];
          else

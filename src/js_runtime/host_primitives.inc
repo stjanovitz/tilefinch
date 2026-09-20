@@ -365,6 +365,10 @@ static JSValue js_request_navigation(JSContext *context,
     bridge->navigation_requested = true;
     bridge->navigation_replace = argc > 1
                                  && JS_ToBool(context, argv[1]) > 0;
+    /* Snapshot at the request boundary. The host may not consume this until
+       a later turn, after the transient activation itself has expired. */
+    bridge->navigation_user_activated =
+        js_rt_bridge_user_activation_is_active(bridge);
 #if !defined(TILEFINCH_NO_TRACE)
     if (getenv("TILEFINCH_TRACE_NAVIGATION_REQUESTS") != NULL) {
         fprintf(stderr,
@@ -375,6 +379,20 @@ static JSValue js_request_navigation(JSContext *context,
 #endif
     JS_FreeCString(context, url);
     return JS_UNDEFINED;
+}
+
+static JSValue js_user_activation_state(JSContext *context,
+                                        JSValueConst this_value,
+                                        int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    unsigned state = 0;
+    if (js_rt_bridge_user_activation_is_active(bridge)) state |= 1u;
+    if (bridge != NULL && bridge->user_activation_has_been_active) state |= 2u;
+    return JS_NewInt32(context, (int32_t) state);
 }
 
 static JSValue js_request_media(JSContext *context,
@@ -947,7 +965,9 @@ static JSValue js_storage_available(JSContext *context,
     (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
     return JS_NewBool(context, bridge != NULL && bridge->session != NULL
-                               && !bridge->opaque_origin);
+                               && !bridge->opaque_origin
+                               && browser_session_site_data_allowed(
+                                      bridge->session));
 }
 
 static JSValue js_storage_estimate(JSContext *context,
@@ -964,13 +984,18 @@ static JSValue js_storage_estimate(JSContext *context,
                bridge->session, bridge->document_url, &usage)) {
         return JS_NULL;
     }
-    size_t quota = bridge->session->maximum_storage_bytes;
-    if (quota < usage.storage_bytes) quota = usage.storage_bytes;
+    size_t used = usage.storage_bytes > SIZE_MAX - usage.opfs_bytes
+        ? SIZE_MAX : usage.storage_bytes + usage.opfs_bytes;
+    size_t quota = bridge->session->maximum_storage_bytes
+                       > SIZE_MAX - bridge->session->maximum_opfs_bytes
+        ? SIZE_MAX : bridge->session->maximum_storage_bytes
+                         + bridge->session->maximum_opfs_bytes;
+    if (quota < used) quota = used;
     JSValue values = JS_NewArray(context);
     if (JS_IsException(values)) return values;
     if (JS_SetPropertyUint32(
             context, values, 0,
-            JS_NewInt64(context, (int64_t) usage.storage_bytes)) < 0
+            JS_NewInt64(context, (int64_t) used)) < 0
         || JS_SetPropertyUint32(
                context, values, 1,
                JS_NewInt64(context, (int64_t) quota)) < 0) {
@@ -1332,7 +1357,7 @@ static bool fill_secure_random(uint8_t *data, size_t length)
    byte. Malformed input stays in the JavaScript decoder because it implements
    the Encoding Standard's exact replacement behavior; this seam only accepts
    a wholly valid UTF-8 sequence. */
-static bool js_utf8_valid(const uint8_t *bytes, size_t length)
+bool js_rt_utf8_valid(const uint8_t *bytes, size_t length)
 {
     size_t at = 0u;
     while (at < length) {
@@ -1378,12 +1403,16 @@ static JSValue js_utf8_decode_valid(JSContext *context,
         JS_FreeValue(context, buffer);
         return JS_ThrowTypeError(context, "UTF-8 byte array required");
     }
-    if (length > 256u * 1024u) {
+    /* Keep this aligned with the buffered text decoder bound in platform.js
+       and JS_FETCH_MAXIMUM_BYTES. Responses admitted by fetch/XHR must not
+       fall back to one interpreted concatenation per byte merely because
+       they are larger than the former 256 KiB helper ceiling. */
+    if (length > 1024u * 1024u) {
         JS_FreeValue(context, buffer);
         return JS_NULL;
     }
     bytes = bytes == NULL ? NULL : bytes + offset;
-    if (!js_utf8_valid(bytes, length)) {
+    if (!js_rt_utf8_valid(bytes, length)) {
         JS_FreeValue(context, buffer);
         return JS_NULL;
     }
@@ -1396,6 +1425,51 @@ static JSValue js_utf8_decode_valid(JSContext *context,
     JSValue result = JS_NewStringLen(
         context, (const char *) (bytes == NULL ? (uint8_t *) "" : bytes),
         length);
+    JS_FreeValue(context, buffer);
+    return result;
+}
+
+static JSValue js_utf8_encode(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(context, "well-formed string required");
+    JSValue units_value = JS_GetPropertyStr(context, argv[0], "length");
+    uint32_t units = 0u;
+    if (JS_IsException(units_value)
+        || JS_ToUint32(context, &units, units_value) < 0) {
+        JS_FreeValue(context, units_value);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(context, units_value);
+    /* Every UTF-16 code unit contributes at least one output byte, so reject
+       oversized strings before JS_ToCStringLen can allocate a UTF-8 copy. */
+    if (units > 256u * 1024u)
+        return JS_ThrowRangeError(context,
+                                  "encoded text exceeds bounded size");
+    size_t length = 0u;
+    const char *bytes = JS_ToCStringLen(context, &length, argv[0]);
+    if (bytes == NULL) return JS_EXCEPTION;
+    /* Keep TextEncoder bounded at its existing PSP-facing ceiling. The
+       bootstrap first applies the Web IDL USVString conversion, so QuickJS's
+       UTF-8 conversion never sees an unmatched surrogate here. */
+    if (length > 256u * 1024u) {
+        JS_FreeCString(context, bytes);
+        return JS_ThrowRangeError(context,
+                                  "encoded text exceeds bounded size");
+    }
+    JSValue buffer = JS_NewArrayBufferCopy(
+        context, (const uint8_t *) bytes, length);
+    JS_FreeCString(context, bytes);
+    if (JS_IsException(buffer)) return buffer;
+    /* QuickJS's public constructor helper expects the optional byteOffset and
+       length slots to be present even when they are undefined. Supplying only
+       argv[0] lets its ArrayBuffer branch read beyond the argument array. */
+    JSValueConst arguments[3] = { buffer, JS_UNDEFINED, JS_UNDEFINED };
+    JSValue result = JS_NewTypedArray(
+        context, 3, arguments, JS_TYPED_ARRAY_UINT8);
     JS_FreeValue(context, buffer);
     return result;
 }
@@ -1620,6 +1694,215 @@ static bool js_compression_buffer_source(
     *length = view_length;
     *owner = buffer;
     return true;
+}
+
+enum {
+    JS_OPFS_STAT = 0,
+    JS_OPFS_CREATE,
+    JS_OPFS_READ,
+    JS_OPFS_WRITE,
+    JS_OPFS_REMOVE,
+    JS_OPFS_LIST
+};
+
+static JSValue js_opfs_result(JSContext *context, BrowserOpfsResult status)
+{
+    JSValue result = JS_NewArray(context);
+    if (!JS_IsException(result)
+        && JS_DefinePropertyValueUint32(
+               context, result, 0, JS_NewInt32(context, status),
+               JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(context, result);
+        return JS_EXCEPTION;
+    }
+    return result;
+}
+
+/* One private command sink keeps the OPFS surface lazy while the native
+   boundary remains authoritative for origin, secure-context, site-data and
+   captive-portal policy. JavaScript supplies only a canonical path and
+   bounded payload, never an origin. */
+static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int32_t command = -1;
+    if (argc < 2)
+        return JS_ThrowTypeError(context, "OPFS command and path required");
+    if (JS_ToInt32(context, &command, argv[0]) < 0) return JS_EXCEPTION;
+    const char *path = JS_ToCString(context, argv[1]);
+    if (path == NULL) return JS_EXCEPTION;
+    bool authorized = bridge != NULL && bridge->session != NULL
+        && !bridge->opaque_origin && bridge->document_url != NULL
+        && tilefinch_url_potentially_trustworthy(bridge->document_url)
+        && browser_session_site_data_allowed(bridge->session)
+        && !browser_session_captive_portal_active(bridge->session);
+    if (!authorized) {
+        JS_FreeCString(context, path);
+        return js_opfs_result(context, BROWSER_OPFS_UNAVAILABLE);
+    }
+    BrowserOpfsResult status = BROWSER_OPFS_INVALID_PATH;
+    BrowserOpfsView view = {0};
+    JSValue result = JS_UNDEFINED;
+    if (command == JS_OPFS_STAT) {
+        status = browser_session_opfs_stat(
+            bridge->session, bridge->document_url, path, &view);
+        result = js_opfs_result(context, status);
+        if (status == BROWSER_OPFS_OK && !JS_IsException(result)) {
+            if (JS_DefinePropertyValueUint32(
+                    context, result, 1,
+                    JS_NewInt32(context, (int32_t) view.kind),
+                    JS_PROP_C_W_E) < 0
+                || JS_DefinePropertyValueUint32(
+                       context, result, 2,
+                       JS_NewInt64(context, (int64_t) view.data_length),
+                       JS_PROP_C_W_E) < 0
+                || JS_DefinePropertyValueUint32(
+                       context, result, 3,
+                       JS_NewInt64(context, view.last_modified_ms),
+                       JS_PROP_C_W_E) < 0
+                || JS_DefinePropertyValueUint32(
+                       context, result, 4,
+                       JS_NewInt64(context, (int64_t) view.generation),
+                       JS_PROP_C_W_E) < 0) {
+                JS_FreeValue(context, result);
+                result = JS_EXCEPTION;
+            }
+        }
+    } else if (command == JS_OPFS_CREATE) {
+        int32_t kind = -1;
+        if (argc > 2) {
+            if (JS_ToInt32(context, &kind, argv[2]) < 0) {
+                JS_FreeCString(context, path);
+                return JS_EXCEPTION;
+            }
+            status = browser_session_opfs_create(
+                bridge->session, bridge->document_url, path,
+                (BrowserOpfsKind) kind);
+        }
+        result = js_opfs_result(context, status);
+    } else if (command == JS_OPFS_READ) {
+        status = browser_session_opfs_stat(
+            bridge->session, bridge->document_url, path, &view);
+        if (status == BROWSER_OPFS_OK && view.kind != BROWSER_OPFS_FILE)
+            status = BROWSER_OPFS_TYPE_MISMATCH;
+        result = js_opfs_result(context, status);
+        if (status == BROWSER_OPFS_OK && !JS_IsException(result)) {
+            JSValue data = JS_NewArrayBufferCopy(
+                context, view.data == NULL
+                    ? (const uint8_t *) "" : view.data,
+                view.data_length);
+            if (JS_IsException(data)
+                || JS_DefinePropertyValueUint32(
+                       context, result, 1, data, JS_PROP_C_W_E) < 0
+                || JS_DefinePropertyValueUint32(
+                       context, result, 2,
+                       JS_NewInt64(context, view.last_modified_ms),
+                       JS_PROP_C_W_E) < 0
+                || JS_DefinePropertyValueUint32(
+                       context, result, 3,
+                       JS_NewInt64(context, (int64_t) view.generation),
+                       JS_PROP_C_W_E) < 0) {
+                if (JS_IsException(data)) JS_FreeValue(context, data);
+                JS_FreeValue(context, result);
+                result = JS_EXCEPTION;
+            }
+        }
+    } else if (command == JS_OPFS_WRITE) {
+        const uint8_t *bytes = NULL;
+        size_t length = 0;
+        JSValue owner = JS_UNDEFINED;
+        int64_t expected_generation = 0;
+        if (argc < 4 || !js_compression_buffer_source(
+                            context, argv[2], &bytes, &length, &owner)) {
+            JS_FreeCString(context, path);
+            return JS_ThrowTypeError(context, "OPFS write requires bytes");
+        }
+        if (JS_ToInt64(context, &expected_generation, argv[3]) < 0) {
+            JS_FreeValue(context, owner);
+            JS_FreeCString(context, path);
+            return JS_EXCEPTION;
+        }
+        BrowserOpfsResult found = browser_session_opfs_stat(
+            bridge->session, bridge->document_url, path, &view);
+        if (found != BROWSER_OPFS_OK) status = found;
+        else if (expected_generation <= 0
+                 || view.generation != (uint64_t) expected_generation)
+            status = BROWSER_OPFS_STALE;
+        else {
+            status = browser_session_opfs_write(
+                bridge->session, bridge->document_url, path, bytes, length);
+            if (status == BROWSER_OPFS_OK)
+                status = browser_session_opfs_stat(
+                    bridge->session, bridge->document_url, path, &view);
+        }
+        JS_FreeValue(context, owner);
+        result = js_opfs_result(context, status);
+        if (status == BROWSER_OPFS_OK && !JS_IsException(result)
+            && JS_DefinePropertyValueUint32(
+                   context, result, 1,
+                   JS_NewInt64(context, (int64_t) view.generation),
+                   JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(context, result);
+            result = JS_EXCEPTION;
+        }
+    } else if (command == JS_OPFS_REMOVE) {
+        int recursive = argc > 2 ? JS_ToBool(context, argv[2]) : 0;
+        if (recursive < 0) {
+            JS_FreeCString(context, path);
+            return JS_EXCEPTION;
+        }
+        status = browser_session_opfs_remove(
+            bridge->session, bridge->document_url, path,
+            recursive > 0);
+        result = js_opfs_result(context, status);
+    } else if (command == JS_OPFS_LIST) {
+        BrowserOpfsView parent_view = {0};
+        status = browser_session_opfs_stat(
+            bridge->session, bridge->document_url, path, &parent_view);
+        if (status == BROWSER_OPFS_OK
+            && parent_view.kind != BROWSER_OPFS_DIRECTORY)
+            status = BROWSER_OPFS_TYPE_MISMATCH;
+        result = js_opfs_result(context, status);
+        if (status == BROWSER_OPFS_OK && !JS_IsException(result)) {
+            uint32_t output = 1;
+            for (size_t index = 0; index < BROWSER_OPFS_ENTRIES; index++) {
+                const char *name = NULL;
+                BrowserOpfsResult child = browser_session_opfs_child(
+                    bridge->session, bridge->document_url, path,
+                    index, &name, &view);
+                if (child == BROWSER_OPFS_NOT_FOUND) break;
+                if (child != BROWSER_OPFS_OK || name == NULL) {
+                    status = child;
+                    break;
+                }
+                if (JS_DefinePropertyValueUint32(
+                        context, result, output++,
+                        JS_NewString(context, name), JS_PROP_C_W_E) < 0
+                    || JS_DefinePropertyValueUint32(
+                           context, result, output++,
+                           JS_NewInt32(context, (int32_t) view.kind),
+                           JS_PROP_C_W_E) < 0) {
+                    if (JS_HasException(context)) {
+                        JS_FreeValue(context, result);
+                        JS_FreeCString(context, path);
+                        return JS_EXCEPTION;
+                    }
+                    status = BROWSER_OPFS_QUOTA_EXCEEDED;
+                    break;
+                }
+            }
+            if (status != BROWSER_OPFS_OK) {
+                JS_FreeValue(context, result);
+                result = js_opfs_result(context, status);
+            }
+        }
+    } else {
+        result = js_opfs_result(context, BROWSER_OPFS_INVALID_PATH);
+    }
+    JS_FreeCString(context, path);
+    return result;
 }
 
 /* Blob-URL Fetch bypasses the network scheduler, so it cannot use the
@@ -2140,7 +2423,10 @@ bool js_rt_install_function(JSContext *context, JSValue global,
             || strcmp(name, "__tilefinchMultiplayerClose") == 0);
     bool transient_bootstrap_bridge =
         strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0
-        || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0;
+        || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0
+        || strcmp(name, "__tilefinchEncodeUtf8") == 0
+        || strcmp(name, "__tilefinchOpfsCommand") == 0
+        || strcmp(name, "__tilefinchUserActivationState") == 0;
     int flags = test_network_override
         ? JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE
         : transient_bootstrap_bridge ? JS_PROP_CONFIGURABLE : 0;

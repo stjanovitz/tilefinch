@@ -35,6 +35,7 @@ globalThis.__tilefinchInstallWorker = (
     setCryptoBufferNormalizer =
       globalThis.__tilefinchSetCryptoBufferNormalizer,
     normalizeTimerDelay = globalThis.__tilefinchNormalizeTimerDelay,
+    scheduleTask = globalThis.__tilefinchScheduleTask,
     scheduleTimeout = globalThis.__tilefinchScheduleTimeout,
     scheduleInterval = globalThis.__tilefinchScheduleInterval,
     cancelTimer = globalThis.__tilefinchCancelTimer,
@@ -64,6 +65,9 @@ globalThis.__tilefinchInstallWorker = (
     typeof trustedString !== "function" ||
     !workerIntrinsics || typeof workerIntrinsics.sourceForBlob !== "function" ||
     typeof workerIntrinsics.apply !== "function" ||
+    typeof workerIntrinsics.gpu !== "function" ||
+    typeof workerIntrinsics.gpuFormat !== "function" ||
+    typeof workerIntrinsics.typeError !== "function" ||
     typeof cloneWorkerValue !== "function" ||
     !workerCloneIntrinsics ||
     typeof workerCloneIntrinsics.capture !== "function" ||
@@ -80,6 +84,7 @@ globalThis.__tilefinchInstallWorker = (
     typeof createWorkerCrypto !== "function" ||
     typeof setCryptoBufferNormalizer !== "function" ||
     typeof normalizeTimerDelay !== "function" ||
+    typeof scheduleTask !== "function" ||
     typeof scheduleTimeout !== "function" ||
     typeof scheduleInterval !== "function" ||
     typeof cancelTimer !== "function" ||
@@ -106,6 +111,8 @@ globalThis.__tilefinchInstallWorker = (
     "CompressionStream", "CountQueuingStrategy", "Crypto", "CryptoKey",
     "DecompressionStream", "DOMException", "DOMRect", "ErrorEvent", "Event", "EventSource",
     "EventTarget", "File", "FileList", "FileReader", "FormData",
+    "FileSystemHandle", "FileSystemFileHandle", "FileSystemDirectoryHandle",
+    "FileSystemWritableFileStream", "FileSystemSyncAccessHandle",
     "FileReaderSync",
     "MessageChannel", "MessageEvent", "MessagePort",
     "PerformanceEntry", "PerformanceMeasure", "PerformanceMark",
@@ -136,6 +143,8 @@ globalThis.__tilefinchInstallWorker = (
         'IDBRequest','IDBOpenDBRequest','IDBKeyRange','IDBTransaction',
         'IDBObjectStore','IDBIndex','IDBCursor','IDBCursorWithValue',
         'Permissions','PermissionStatus','StorageManager','GPU',
+        'FileSystemHandle','FileSystemFileHandle','FileSystemDirectoryHandle',
+        'FileSystemWritableFileStream','FileSystemSyncAccessHandle',
         'WGSLLanguageFeatures'],
       localMethod=(original,name)=>{
         if(typeof original!=='function')return original;
@@ -196,6 +205,12 @@ globalThis.__tilefinchInstallWorker = (
           set(value){Object.defineProperty(root,name,{value,writable:true,
             configurable:true,enumerable:false})}
         });
+      },
+      installConstants=(constructor,pairs)=>{
+        for(const [name,value] of pairs)
+          for(const holder of [constructor,constructor.prototype])
+            Object.defineProperty(holder,name,{value,enumerable:true,
+              writable:false,configurable:false});
       };
     for(const name of names)install(name);
     install('Intl',original=>{
@@ -209,6 +224,188 @@ globalThis.__tilefinchInstallWorker = (
       }
       return local;
     });
+    {
+      /* Encoding objects are realm-local Web Platform objects. Merely copying
+         the owner's constructors makes encode() return owner Uint8Arrays and
+         makes encodeInto()/decode() reject valid worker-local BufferSources
+         through the owner's instanceof checks. Keep the mature bounded
+         codecs as the implementation core, but adapt every public value at
+         this realm boundary. */
+      const OwnerEncoder=root.TextEncoder,OwnerDecoder=root.TextDecoder,
+        encoderStates=new WeakMap(),decoderStates=new WeakMap(),
+        ownerEncode=OwnerEncoder.prototype.encode,
+        ownerDecode=OwnerDecoder.prototype.decode,
+        localError=error=>{
+          if(error&&error.name==='RangeError')return new RangeError(error.message);
+          if(error&&error.name==='TypeError')return new TypeError(error.message);
+          return error;
+        },
+        encoderState=value=>{
+          const state=encoderStates.get(value);
+          if(!state)throw new TypeError('Illegal invocation');
+          return state;
+        },
+        decoderState=value=>{
+          const state=decoderStates.get(value);
+          if(!state)throw new TypeError('Illegal invocation');
+          return state;
+        };
+      class TextEncoder{
+        constructor(){encoderStates.set(this,new OwnerEncoder())}
+        get encoding(){encoderState(this);return 'utf-8'}
+        encode(input=''){
+          const state=encoderState(this);
+          try{
+            const source=Reflect.apply(ownerEncode,state,[String(input)]),
+              copy=new Uint8Array(source.length);
+            for(let at=0;at<source.length;at++)copy[at]=source[at];
+            return copy;
+          }catch(error){throw localError(error)}
+        }
+        encodeInto(source,destination){
+          encoderState(this);
+          if(!(destination instanceof Uint8Array))
+            throw new TypeError('Uint8Array destination required');
+          const text=String(source);
+          let read=0,written=0;
+          while(read<text.length){
+            const first=text.charCodeAt(read),pair=first>=0xd800&&first<=0xdbff&&
+              read+1<text.length&&text.charCodeAt(read+1)>=0xdc00&&
+              text.charCodeAt(read+1)<=0xdfff,
+              units=pair?2:1,
+              cp=pair?0x10000+((first-0xd800)<<10)+
+                (text.charCodeAt(read+1)-0xdc00):
+                first>=0xd800&&first<=0xdfff?0xfffd:first,
+              need=cp<=0x7f?1:cp<=0x7ff?2:cp<=0xffff?3:4;
+            if(written+need>destination.byteLength)break;
+            if(need===1)destination[written]=cp;
+            else if(need===2){
+              destination[written]=0xc0|(cp>>6);
+              destination[written+1]=0x80|(cp&0x3f);
+            }else if(need===3){
+              destination[written]=0xe0|(cp>>12);
+              destination[written+1]=0x80|((cp>>6)&0x3f);
+              destination[written+2]=0x80|(cp&0x3f);
+            }else{
+              destination[written]=0xf0|(cp>>18);
+              destination[written+1]=0x80|((cp>>12)&0x3f);
+              destination[written+2]=0x80|((cp>>6)&0x3f);
+              destination[written+3]=0x80|(cp&0x3f);
+            }
+            written+=need;read+=units;
+          }
+          return {read,written};
+        }
+      }
+      class TextDecoder{
+        constructor(label='utf-8',options={}){
+          try{decoderStates.set(this,new OwnerDecoder(label,options))}
+          catch(error){throw localError(error)}
+        }
+        get encoding(){return decoderState(this).encoding}
+        get fatal(){return decoderState(this).fatal}
+        get ignoreBOM(){return decoderState(this).ignoreBOM}
+        decode(input,options={}){
+          const state=decoderState(this);
+          if(input instanceof ArrayBuffer)input=new Uint8Array(input);
+          try{return Reflect.apply(ownerDecode,state,[input,options])}
+          catch(error){throw localError(error)}
+        }
+      }
+      Object.defineProperty(TextEncoder.prototype,Symbol.toStringTag,
+        {configurable:true,value:'TextEncoder'});
+      Object.defineProperty(TextDecoder.prototype,Symbol.toStringTag,
+        {configurable:true,value:'TextDecoder'});
+      root.TextEncoder=TextEncoder;root.TextDecoder=TextDecoder;
+    }
+    {
+      /* The transport and body stores are shared with the owner, but Web IDL
+         objects returned to author code belong to the current realm. Adapt
+         promise settlement and container values here instead of duplicating
+         the bounded fetch machine or exposing its private state. */
+      const OwnerHeaders=root.Headers,OwnerRequest=root.Request,
+        OwnerResponse=root.Response,ownerFetch=root.fetch,
+        localPromise=value=>new Promise((resolve,reject)=>
+          Promise.resolve(value).then(resolve,reject)),
+        localBuffer=value=>{
+          const source=new Uint8Array(value),copy=new Uint8Array(source.length);
+          copy.set(source);return copy.buffer;
+        },
+        requestArrayBuffer=OwnerRequest.prototype.arrayBuffer,
+        requestText=OwnerRequest.prototype.text,
+        requestBlob=OwnerRequest.prototype.blob,
+        requestFormData=OwnerRequest.prototype.formData,
+        requestClone=OwnerRequest.prototype.clone,
+        responseArrayBuffer=OwnerResponse.prototype.arrayBuffer,
+        responseText=OwnerResponse.prototype.text,
+        responseBlob=OwnerResponse.prototype.blob,
+        responseFormData=OwnerResponse.prototype.formData,
+        responseClone=OwnerResponse.prototype.clone;
+      class Headers extends OwnerHeaders{
+        constructor(init={}){super(init)}
+        *entries(){
+          const iterator=OwnerHeaders.prototype.entries.call(this);
+          for(const pair of iterator)yield [pair[0],pair[1]];
+        }
+        *keys(){for(const pair of this.entries())yield pair[0]}
+        *values(){for(const pair of this.entries())yield pair[1]}
+        [Symbol.iterator](){return this.entries()}
+        forEach(callback,thisArg){
+          if(typeof callback!=='function')
+            throw new TypeError('Headers callback must be a function');
+          for(const [name,value] of this.entries())
+            Reflect.apply(callback,thisArg,[value,name,this]);
+        }
+      }
+      class Request extends OwnerRequest{
+        constructor(input,init){
+          super(input,init);this.headers=new Headers(this.headers);
+        }
+        arrayBuffer(){
+          return localPromise(Reflect.apply(requestArrayBuffer,this,[]))
+            .then(localBuffer);
+        }
+        bytes(){return this.arrayBuffer().then(buffer=>new Uint8Array(buffer))}
+        text(){return localPromise(Reflect.apply(requestText,this,[]))}
+        json(){return this.text().then(text=>JSON.parse(text))}
+        blob(){return localPromise(Reflect.apply(requestBlob,this,[]))}
+        formData(){return localPromise(Reflect.apply(requestFormData,this,[]))}
+        clone(){return new Request(Reflect.apply(requestClone,this,[]))}
+      }
+      let localizeResponse;
+      class Response extends OwnerResponse{
+        constructor(body=null,init={}){
+          super(body,init);this.headers=new Headers(this.headers);
+        }
+        arrayBuffer(){
+          return localPromise(Reflect.apply(responseArrayBuffer,this,[]))
+            .then(localBuffer);
+        }
+        bytes(){return this.arrayBuffer().then(buffer=>new Uint8Array(buffer))}
+        text(){return localPromise(Reflect.apply(responseText,this,[]))}
+        json(){return this.text().then(text=>JSON.parse(text))}
+        blob(){return localPromise(Reflect.apply(responseBlob,this,[]))}
+        formData(){return localPromise(Reflect.apply(responseFormData,this,[]))}
+        clone(){return localizeResponse(Reflect.apply(responseClone,this,[]))}
+        static error(){return localizeResponse(OwnerResponse.error())}
+        static redirect(url,status){
+          return localizeResponse(OwnerResponse.redirect(url,status))
+        }
+        static json(data,init={}){
+          const headers=new Headers(init.headers);
+          if(!headers.has('content-type'))
+            headers.set('content-type','application/json');
+          return new Response(JSON.stringify(data),{...init,headers});
+        }
+      }
+      localizeResponse=value=>value instanceof Response?value:
+        new Response(value.body,{status:value.status,statusText:value.statusText,
+          url:value.url,headers:value.headers,redirected:value.redirected,
+          type:value.type});
+      root.Headers=Headers;root.Request=Request;root.Response=Response;
+      root.fetch=(...args)=>localPromise(Reflect.apply(ownerFetch,root,args))
+        .then(localizeResponse);
+    }
     {
       const Base=root.XMLHttpRequest,
         register=root.__tilefinchRegisterWorkerXHR,
@@ -248,6 +445,8 @@ globalThis.__tilefinchInstallWorker = (
       });
       Object.defineProperty(WorkerXMLHttpRequest,'name',{
         configurable:true,value:'XMLHttpRequest'});
+      installConstants(WorkerXMLHttpRequest,[['UNSENT',0],['OPENED',1],
+        ['HEADERS_RECEIVED',2],['LOADING',3],['DONE',4]]);
       root.XMLHttpRequest=WorkerXMLHttpRequest;
     }
     {
@@ -265,6 +464,7 @@ globalThis.__tilefinchInstallWorker = (
         configurable:true,writable:true,value:WorkerFileReader});
       Object.defineProperty(WorkerFileReader,'name',{
         configurable:true,value:'FileReader'});
+      installConstants(WorkerFileReader,[['EMPTY',0],['LOADING',1],['DONE',2]]);
       root.FileReader=WorkerFileReader;
     }
     {
@@ -305,8 +505,8 @@ globalThis.__tilefinchInstallWorker = (
       WorkerWebSocket.prototype=Object.create(Base.prototype);
       Object.defineProperty(WorkerWebSocket.prototype,'constructor',{
         configurable:true,writable:true,value:WorkerWebSocket});
-      for(const key of ['CONNECTING','OPEN','CLOSING','CLOSED'])
-        Object.defineProperty(WorkerWebSocket,key,{value:Base[key]});
+      installConstants(WorkerWebSocket,[['CONNECTING',0],['OPEN',1],
+        ['CLOSING',2],['CLOSED',3]]);
       Object.defineProperty(WorkerWebSocket,'name',{
         configurable:true,value:'WebSocket'});
       root.WebSocket=WorkerWebSocket;
@@ -362,6 +562,48 @@ globalThis.__tilefinchInstallWorker = (
         set(value){Object.defineProperty(root,'indexedDB',{configurable:true,
           enumerable:false,writable:true,value})}
       });
+    }
+    {
+      const ownerGPU=root.__tilefinchOwnerGPU,b=root.__tilefinchGPUBridge;
+      delete root.__tilefinchOwnerGPU;
+      delete root.__tilefinchGPUBridge;
+      if(ownerGPU){
+        const G=root.GPU,W=root.WGSLLanguageFeatures,empty=new Set(),P=root.Promise,
+          resolve=P.resolve.bind(P),reject=P.reject.bind(P),
+          then=Function.call.bind(P.prototype.then),
+          gpu=Object.create(G.prototype),features=Object.create(W.prototype),
+          brand=(value,expected)=>{
+            if(value!==expected)throw new TypeError('Illegal invocation')},
+          method=(holder,name,value)=>Object.defineProperty(holder,name,
+            {configurable:true,enumerable:true,writable:true,value}),
+          getter=(holder,name,get)=>Object.defineProperty(holder,name,
+            {configurable:true,enumerable:true,get}),
+          values=function values(){brand(this,features);return empty.values()},
+          entries=function entries(){brand(this,features);return empty.entries()},
+          has=function has(value){brand(this,features);if(typeof value==='symbol')
+            throw new TypeError('Symbol is not a string');String(value);return false},
+          each=function forEach(callback){brand(this,features);
+            return empty.forEach(callback,arguments[1])},
+          format=function getPreferredCanvasFormat(){brand(this,gpu);
+            return b.gpuFormat(ownerGPU)},
+          local=e=>b.typeError(e)?new TypeError(e.message):e,
+          request=function requestAdapter(options={}){try{brand(this,gpu);
+            const pending=resolve(b.gpu(ownerGPU,arguments.length?[options]:[]));
+            return then(pending,undefined,error=>{throw local(error)})
+          }catch(error){return reject(local(error))}};
+        getter(W.prototype,'size',function(){brand(this,features);return 0});
+        method(W.prototype,'has',has);method(W.prototype,'entries',entries);
+        method(W.prototype,'values',values);method(W.prototype,'keys',values);
+        Object.defineProperty(W.prototype,Symbol.iterator,{configurable:true,
+          enumerable:false,writable:true,value:values});
+        method(W.prototype,'forEach',each);
+        getter(G.prototype,'wgslLanguageFeatures',function(){
+          brand(this,gpu);return features});
+        method(G.prototype,'getPreferredCanvasFormat',format);
+        method(G.prototype,'requestAdapter',request);
+        Object.defineProperty(root,'__tilefinchWorkerGPUFacade',{
+          configurable:true,enumerable:false,writable:false,value:gpu});
+      }
     }
     {
       const importScriptsOwner=root.__tilefinchImportScripts,
@@ -923,7 +1165,9 @@ globalThis.__tilefinchInstallWorker = (
         scope = Object.create(DedicatedWorkerGlobalScope.prototype);
       let workerNavigator = null, workerLocation = null,
         workerUAData = null, workerPermissions = null,
-        workerStorage = null, workerGPU = null;
+        workerStorage = null, workerGPU = null,
+        workerOpfsOwners = null, workerOpfsFacades = null,
+        workerOpfsPrototypesReady = false;
       Object.defineProperties(WorkerGlobalScope.prototype, {
         self: {
           configurable: true,
@@ -952,22 +1196,30 @@ globalThis.__tilefinchInstallWorker = (
           handlers: newHandlerSlots(),
           scopeHandlers: newHandlerSlots(),
           timers: new Set(),
-          timerNestingById: new Map(),
-          currentTimerNesting: -1,
           xhrs: new Set(),
           fileReaders: new Set(),
           webSockets: new Set(),
           idbConnections: new Set(),
+          opfsWriters: new Set(),
           children: new Set(),
           scope: null,
           dispatchType: "",
           dispatchOwner: null,
           dispatchEvent: null,
           errorObserver: null,
+          scopeErrorObserver: null,
       };
       state.errorObserver = (error, item, list) =>
         reportOwnerListenerError(
           state, state.dispatchType, error, item, list);
+      /* Exceptions from browser-invoked Worker-global listeners are reported
+         through the Worker error lifecycle, not the owner Window's generic
+         event-listener exception path. Returning true tells the shared event
+         dispatcher that this observer has assumed reporting responsibility. */
+      state.scopeErrorObserver = error => {
+        reportWorkerError(owner, error, workerURL);
+        return true;
+      };
       Object.defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, {
         configurable: true,
         value: "WorkerGlobalScope",
@@ -1043,7 +1295,7 @@ globalThis.__tilefinchInstallWorker = (
         workerProgress.outboundQueued++;
         workerProgress.lastId = state.id;
         state.outboundPending = (state.outboundPending || 0) + 1;
-        const queued = scheduleTimeout(() => {
+        const queued = scheduleTask(() => {
           let deliveryFinished = false;
           const finishDelivery = (delivered) => {
             if (deliveryFinished) return;
@@ -1071,7 +1323,7 @@ globalThis.__tilefinchInstallWorker = (
             finishDelivery(false);
             throw error;
           }
-        }, 0);
+        });
         if (!queued) {
           state.outboundPending--;
           workerProgress.outboundDropped++;
@@ -1243,13 +1495,10 @@ globalThis.__tilefinchInstallWorker = (
               state.realm, source, workerURL, 4);
             args = [];
           }
-          const nesting = state.currentTimerNesting < 0
-              ? 0 : state.currentTimerNesting + 1;
           let id = 0;
           const invoke = () => {
             if (!repeat && state.timers.delete(id))
               workerProgress.pendingTimers--;
-            if (!repeat) state.timerNestingById.delete(id);
             if (!state.active || state.closing) return;
             if (traceWorkerLifecycle)
               traceWorkerNative("worker-lifecycle", {
@@ -1259,25 +1508,18 @@ globalThis.__tilefinchInstallWorker = (
             workerProgress.timerCallbacks++;
             workerProgress.lastId = state.id;
             workerProgress.lastTaskMs = workerProgressClock.now();
-            const previousNesting = state.currentTimerNesting;
-            state.currentTimerNesting = nesting;
             try {
               workerIntrinsics.apply(callback, state.scope, args);
             } catch (error) {
               reportWorkerError(owner, error, workerURL);
-            } finally {
-              state.currentTimerNesting = previousNesting;
             }
           };
-          const requestedDelay = normalizeTimerDelay(delay),
-            normalizedDelay = nesting >= 5
-              ? Math.max(4, requestedDelay) : requestedDelay;
+          const normalizedDelay = normalizeTimerDelay(delay);
           id = repeat
-            ? scheduleInterval(invoke, Math.max(1, normalizedDelay))
+            ? scheduleInterval(invoke, normalizedDelay)
             : scheduleTimeout(invoke, normalizedDelay);
           if (id) {
             state.timers.add(id);
-            state.timerNestingById.set(id, nesting);
             workerProgress.pendingTimers++;
             if (traceWorkerLifecycle) {
               const at = workerProgressClock.now();
@@ -1298,7 +1540,6 @@ globalThis.__tilefinchInstallWorker = (
           if (state.timers.has(timerId)) {
             cancelTimer(timerId);
             state.timers.delete(timerId);
-            state.timerNestingById.delete(timerId);
             workerProgress.pendingTimers--;
             if (traceWorkerLifecycle)
               traceWorkerNative("worker-lifecycle", {
@@ -1464,12 +1705,13 @@ globalThis.__tilefinchInstallWorker = (
               if (!wrappers[key]) {
                 const method = Reflect.get(target, key, target);
                 wrappers[key] = function (...args) {
-                  if (this !== facade)
-                    throw new TypeError("Illegal invocation");
                   const WorkerPromise = state.realm?.Promise;
                   if (typeof WorkerPromise !== "function")
                     throw new DOMException(
                       "Worker is terminated", "InvalidStateError");
+                  if (this !== facade)
+                    return WorkerPromise.reject(
+                      new TypeError("Illegal invocation"));
                   try {
                     const result = WorkerPromise.resolve(
                       Reflect.apply(method, target, args),
@@ -1511,9 +1753,49 @@ globalThis.__tilefinchInstallWorker = (
           userAgentData: () => {
             const ownerUAData = ownerNavigator.userAgentData;
             if (!ownerUAData) return undefined;
-            if (workerUAData === null)
+            if (workerUAData === null) {
               workerUAData = workerPromiseFacade(
                 ownerUAData, ["getHighEntropyValues"]);
+              const workerUADataGet = (receiver, value) => {
+                  if (receiver !== workerUAData)
+                    throw new TypeError("Illegal invocation");
+                  return value;
+                },
+                workerUADataToJSON = function toJSON() {
+                  if (this !== workerUAData)
+                    throw new TypeError("Illegal invocation");
+                  return {
+                    brands: ownerUAData.brands,
+                    mobile: ownerUAData.mobile,
+                    platform: ownerUAData.platform,
+                  };
+                };
+              Object.defineProperties(workerUAData, {
+                brands: {
+                  configurable: true, enumerable: true,
+                  get() {
+                    return workerUADataGet(this, ownerUAData.brands);
+                  },
+                },
+                mobile: {
+                  configurable: true, enumerable: true,
+                  get() {
+                    return workerUADataGet(this, ownerUAData.mobile);
+                  },
+                },
+                platform: {
+                  configurable: true, enumerable: true,
+                  get() {
+                    return workerUADataGet(this, ownerUAData.platform);
+                  },
+                },
+                toJSON: {
+                  configurable: true, enumerable: true, writable: true,
+                  value: workerUADataToJSON,
+                },
+              });
+              markNative(workerUADataToJSON);
+            }
             return workerUAData;
           },
           connection: () => ownerNavigator.connection,
@@ -1524,16 +1806,22 @@ globalThis.__tilefinchInstallWorker = (
                 localizeStatus = value => {
                   if (!LocalPermissionStatus || value == null) return value;
                   const status = Object.create(LocalPermissionStatus.prototype);
-                  Object.defineProperties(status, {
-                    _name: {
-                      configurable: true, writable: true,
-                      value: String(value.name || ""),
+                  let onchange = null;
+                  return new Proxy(status, {
+                    get(object, key, receiver) {
+                      if (key === "name") return String(value.name || "");
+                      if (key === "state") return String(value.state || "denied");
+                      if (key === "onchange") return onchange;
+                      return Reflect.get(object, key, receiver);
                     },
-                    _onchange: {
-                      configurable: true, writable: true, value: null,
+                    set(object, key, next, receiver) {
+                      if (key === "onchange") {
+                        onchange = typeof next === "function" ? next : null;
+                        return true;
+                      }
+                      return Reflect.set(object, key, next, receiver);
                     },
                   });
-                  return status;
                 };
               workerPermissions = workerPromiseFacade(
                 ownerNavigator.permissions, ["query"],
@@ -1545,7 +1833,359 @@ globalThis.__tilefinchInstallWorker = (
           storage: () => {
             if (workerStorage === null) {
               const LocalStorageManager = state.realm?.StorageManager,
+                WorkerPromise = state.realm?.Promise,
+                ownerIntrinsics = workerCloneIntrinsics.owner,
+                ownerPromise = ownerIntrinsics.Promise,
+                localPromise = (operation, transform = value => value) => {
+                  try {
+                    return WorkerPromise.resolve(operation()).then(transform);
+                  } catch (error) {
+                    return WorkerPromise.reject(error);
+                  }
+                },
+                workerAbortError = () => new DOMException(
+                  "Worker is terminated", "AbortError"),
+                guardExclusiveOwner = owner => {
+                  if (state.active && !state.closing) return owner;
+                  try { owner?._abort(workerAbortError()); } catch (_) {}
+                  throw workerAbortError();
+                },
+                exclusivePromise = (operation, transform) => {
+                  try {
+                    const pending = ownerPromise.resolve(operation()),
+                      guarded = Reflect.apply(ownerPromise.prototype.then,
+                        pending, [guardExclusiveOwner]);
+                    return WorkerPromise.resolve(guarded).then(transform);
+                  } catch (error) {
+                    return WorkerPromise.reject(error);
+                  }
+                },
+                ensureOpfsMaps = () => {
+                  if (workerOpfsOwners === null) {
+                    workerOpfsOwners = createPrivateWeakMap();
+                    workerOpfsFacades = createPrivateWeakMap();
+                  }
+                },
+                ensureOpfsPrototypes = () => {
+                  if (workerOpfsPrototypesReady) return;
+                  const Base = state.realm?.FileSystemHandle,
+                    FileType = state.realm?.FileSystemFileHandle,
+                    DirectoryType = state.realm?.FileSystemDirectoryHandle,
+                    WriterType = state.realm?.FileSystemWritableFileStream,
+                    SyncType = state.realm?.FileSystemSyncAccessHandle,
+                    WritableType = state.realm?.WritableStream;
+                  if (!Base?.prototype || !FileType?.prototype
+                      || !DirectoryType?.prototype || !WriterType?.prototype
+                      || !SyncType?.prototype || !WritableType?.prototype)
+                    return;
+                  Object.setPrototypeOf(FileType.prototype, Base.prototype);
+                  Object.setPrototypeOf(DirectoryType.prototype, Base.prototype);
+                  Object.setPrototypeOf(
+                    WriterType.prototype, WritableType.prototype);
+                  const ownerForMethod = value => {
+                    ensureOpfsMaps();
+                    const owner = workerOpfsOwners.get(value);
+                    if (!owner) throw new TypeError("Illegal invocation");
+                    return owner;
+                  },
+                    defineMethod = (prototype, name, value) =>
+                      Object.defineProperty(prototype, name, {
+                        configurable: true, enumerable: true,
+                        writable: true, value,
+                      });
+                  Object.defineProperties(Base.prototype, {
+                    kind: { configurable: true, enumerable: true,
+                      get() { return ownerForMethod(this).kind; } },
+                    name: { configurable: true, enumerable: true,
+                      get() { return ownerForMethod(this).name; } },
+                  });
+                  defineMethod(Base.prototype, "isSameEntry", function(other) {
+                    return localPromise(() => ownerForMethod(this).isSameEntry(
+                      ownerFor(other)));
+                  });
+                  defineMethod(Base.prototype, "queryPermission", function(...args) {
+                    return localPromise(() => Reflect.apply(
+                      ownerForMethod(this).queryPermission,
+                      ownerForMethod(this), args));
+                  });
+                  defineMethod(Base.prototype, "requestPermission", function(...args) {
+                    return localPromise(() => Reflect.apply(
+                      ownerForMethod(this).requestPermission,
+                      ownerForMethod(this), args));
+                  });
+                  defineMethod(FileType.prototype, "getFile", function() {
+                    return localPromise(
+                      () => ownerForMethod(this).getFile(), localizeFile);
+                  });
+                  defineMethod(FileType.prototype, "createWritable", function(options) {
+                    return exclusivePromise(
+                      () => ownerForMethod(this).createWritable(options),
+                      localizeWriter);
+                  });
+                  defineMethod(FileType.prototype, "createSyncAccessHandle", function() {
+                    return exclusivePromise(
+                      () => ownerForMethod(this).createSyncAccessHandle(),
+                      localizeSyncAccessHandle);
+                  });
+                  defineMethod(DirectoryType.prototype, "getFileHandle",
+                    function(...args) { return localPromise(
+                      () => Reflect.apply(ownerForMethod(this).getFileHandle,
+                        ownerForMethod(this), args), localizeHandle); });
+                  defineMethod(DirectoryType.prototype, "getDirectoryHandle",
+                    function(...args) { return localPromise(
+                      () => Reflect.apply(ownerForMethod(this).getDirectoryHandle,
+                        ownerForMethod(this), args), localizeHandle); });
+                  defineMethod(DirectoryType.prototype, "removeEntry",
+                    function(...args) { return localPromise(() => Reflect.apply(
+                      ownerForMethod(this).removeEntry,
+                      ownerForMethod(this), args)); });
+                  defineMethod(DirectoryType.prototype, "resolve",
+                    function(candidate) { return localPromise(
+                      () => ownerForMethod(this).resolve(ownerFor(candidate)),
+                      value => value === null ? null : localArray(value)); });
+                  for (const name of ["entries", "keys", "values"])
+                    defineMethod(DirectoryType.prototype, name, function() {
+                      return localizeIterator(
+                        ownerForMethod(this)[name](), name === "entries");
+                    });
+                  defineMethod(DirectoryType.prototype, Symbol.asyncIterator,
+                    function() { return localizeIterator(
+                      ownerForMethod(this).entries(), true); });
+                  for (const name of ["write", "seek", "truncate"])
+                    defineMethod(WriterType.prototype, name, function(value) {
+                      const direct = Reflect.get(this, name);
+                      if (direct === WriterType.prototype[name])
+                        throw new TypeError("Illegal invocation");
+                      return Reflect.apply(direct, this, [value]);
+                    });
+                  defineMethod(SyncType.prototype, "read", function(buffer, options) {
+                    const target = localMutableBytes(buffer),
+                      copy = new ownerIntrinsics.Uint8Array(target.byteLength),
+                      count = ownerForMethod(this).read(copy,
+                        syncAccessOptions(options));
+                    target.set(cloneWorkerValue(
+                      copy.subarray(0, count), state.cloneIntrinsics));
+                    return count;
+                  });
+                  defineMethod(SyncType.prototype, "write", function(buffer, options) {
+                    localMutableBytes(buffer);
+                    return ownerForMethod(this).write(
+                      cloneWorkerValue(buffer, ownerIntrinsics),
+                      syncAccessOptions(options));
+                  });
+                  for (const name of ["truncate", "getSize", "flush"])
+                    defineMethod(SyncType.prototype, name, function(...args) {
+                      return Reflect.apply(ownerForMethod(this)[name],
+                        ownerForMethod(this), args);
+                    });
+                  defineMethod(SyncType.prototype, "close", function() {
+                    const owner = ownerForMethod(this);
+                    try { return owner.close(); }
+                    finally { state.opfsWriters.delete(owner); }
+                  });
+                  workerOpfsPrototypesReady = true;
+                },
+                ownerFor = value => {
+                  ensureOpfsMaps();
+                  return workerOpfsOwners.get(value) || value;
+                },
+                localArray = value => {
+                  const LocalArray = state.realm?.Array;
+                  return typeof LocalArray?.from === "function"
+                    ? LocalArray.from(value) : Array.from(value);
+                },
+                localMutableBytes = value => {
+                  const LocalArrayBuffer = state.realm?.ArrayBuffer,
+                    LocalUint8Array = state.realm?.Uint8Array;
+                  if (typeof LocalArrayBuffer !== "function"
+                      || typeof LocalUint8Array !== "function")
+                    throw new TypeError("ArrayBuffer support is unavailable");
+                  if (value instanceof LocalArrayBuffer)
+                    return new LocalUint8Array(value);
+                  if (LocalArrayBuffer.isView(value)) return new LocalUint8Array(
+                    value.buffer, value.byteOffset, value.byteLength);
+                  throw new TypeError("Expected an ArrayBuffer or view");
+                },
+                syncAccessOptions = options => {
+                  if (options == null) return undefined;
+                  const at = options.at;
+                  return at === undefined ? undefined : { at };
+                },
+                localizeFile = value => value == null ? value
+                  : cloneWorkerValue(value, state.cloneIntrinsics),
+                localizeIterator = (iterator, pair) => {
+                  const local = {
+                    next() {
+                      return localPromise(() => iterator.next(), result => {
+                        if (result?.done) return {
+                          value: undefined, done: true,
+                        };
+                        let value = result?.value;
+                        if (pair && Array.isArray(value)) value = localArray([
+                          String(value[0]), localizeHandle(value[1]),
+                        ]);
+                        else if (value && typeof value === "object"
+                                 && (value.kind === "file"
+                                     || value.kind === "directory"))
+                          value = localizeHandle(value);
+                        return { value, done: false };
+                      });
+                    },
+                    [Symbol.asyncIterator]() { return this; },
+                  };
+                  return local;
+                },
+                localizeWriter = owner => {
+                  guardExclusiveOwner(owner);
+                  ensureOpfsMaps();
+                  ensureOpfsPrototypes();
+                  const existing = workerOpfsFacades.get(owner);
+                  if (existing) return existing;
+                  const LocalWriter = state.realm?.FileSystemWritableFileStream,
+                    LocalWritableStream = state.realm?.WritableStream,
+                    methods = new Map();
+                  if (typeof LocalWritableStream !== "function") return owner;
+                  const target = new LocalWritableStream({
+                    write(value) {
+                      return localPromise(() => owner.write(
+                        cloneWorkerValue(value, ownerIntrinsics)));
+                    },
+                    close() {
+                      return localPromise(() => owner.close()).then(
+                        value => {
+                          state.opfsWriters.delete(owner);
+                          return value;
+                        },
+                        error => {
+                          state.opfsWriters.delete(owner);
+                          throw error;
+                        });
+                    },
+                    abort(reason) {
+                      return localPromise(() => owner.abort(
+                        cloneWorkerValue(reason, ownerIntrinsics))).then(
+                        value => {
+                          state.opfsWriters.delete(owner);
+                          return value;
+                        },
+                        error => {
+                          state.opfsWriters.delete(owner);
+                          throw error;
+                        });
+                    },
+                  });
+                  if (LocalWriter?.prototype)
+                    Object.setPrototypeOf(target, LocalWriter.prototype);
+                  const facade = new Proxy(target, {
+                    get(object, key, receiver) {
+                      if (["write", "seek", "truncate"].includes(key)) {
+                        if (!methods.has(key)) methods.set(key, value => {
+                          if (object.locked)
+                            return WorkerPromise.reject(
+                              new TypeError("stream is locked"));
+                          const command = key === "write" ? value
+                            : key === "seek"
+                              ? { type: "seek", position: value }
+                              : { type: "truncate", size: value };
+                          return object._write(command);
+                        });
+                        return methods.get(key);
+                      }
+                      return Reflect.get(object, key, receiver);
+                    },
+                  });
+                  workerOpfsOwners.set(facade, owner);
+                  workerOpfsFacades.set(owner, facade);
+                  state.opfsWriters.add(owner);
+                  return facade;
+                },
+                localizeSyncAccessHandle = owner => {
+                  guardExclusiveOwner(owner);
+                  ensureOpfsMaps();
+                  ensureOpfsPrototypes();
+                  const existing = workerOpfsFacades.get(owner);
+                  if (existing) return existing;
+                  const LocalSync = state.realm?.FileSystemSyncAccessHandle,
+                    facade = Object.create(LocalSync?.prototype || null);
+                  workerOpfsOwners.set(facade, owner);
+                  workerOpfsFacades.set(owner, facade);
+                  state.opfsWriters.add(owner);
+                  return facade;
+                },
+                localizeHandle = owner => {
+                  if (!owner || (owner.kind !== "file"
+                                 && owner.kind !== "directory")) return owner;
+                  ensureOpfsMaps();
+                  ensureOpfsPrototypes();
+                  const existing = workerOpfsFacades.get(owner);
+                  if (existing) return existing;
+                  const LocalBase = state.realm?.FileSystemHandle,
+                    LocalType = owner.kind === "file"
+                    ? state.realm?.FileSystemFileHandle
+                    : state.realm?.FileSystemDirectoryHandle,
+                    target = Object.create(LocalType?.prototype || null),
+                    methods = new Map();
+                  if (LocalBase?.prototype && LocalType?.prototype
+                      && Object.getPrototypeOf(LocalType.prototype)
+                           !== LocalBase.prototype)
+                    Object.setPrototypeOf(
+                      LocalType.prototype, LocalBase.prototype);
+                  let facade;
+                  facade = new Proxy(target, {
+                    get(object, key, receiver) {
+                      if (key === "kind" || key === "name") return owner[key];
+                      if (key === "getFile" && owner.kind === "file")
+                        return methods.get(key) || (methods.set(key, () =>
+                          localPromise(() => owner.getFile(), localizeFile)),
+                        methods.get(key));
+                      if (key === "createWritable" && owner.kind === "file")
+                        return methods.get(key) || (methods.set(key, options =>
+                          exclusivePromise(() => owner.createWritable(options),
+                                           localizeWriter)), methods.get(key));
+                      if (key === "createSyncAccessHandle"
+                          && owner.kind === "file")
+                        return methods.get(key) || (methods.set(key, () =>
+                          exclusivePromise(() => owner.createSyncAccessHandle(),
+                                           localizeSyncAccessHandle)),
+                          methods.get(key));
+                      if ((key === "getFileHandle" || key === "getDirectoryHandle")
+                          && owner.kind === "directory")
+                        return methods.get(key) || (methods.set(key, (...args) =>
+                          localPromise(() => Reflect.apply(owner[key], owner, args),
+                                       localizeHandle)), methods.get(key));
+                      if (key === "removeEntry" && owner.kind === "directory")
+                        return methods.get(key) || (methods.set(key, (...args) =>
+                          localPromise(() => Reflect.apply(owner[key], owner, args))),
+                        methods.get(key));
+                      if (key === "resolve" && owner.kind === "directory")
+                        return methods.get(key) || (methods.set(key, candidate =>
+                          localPromise(() => owner.resolve(ownerFor(candidate)),
+                            value => value === null ? null : localArray(value))),
+                        methods.get(key));
+                      if ((key === "entries" || key === "keys" || key === "values")
+                          && owner.kind === "directory")
+                        return methods.get(key) || (methods.set(key, () =>
+                          localizeIterator(owner[key](), key === "entries")),
+                        methods.get(key));
+                      if (key === Symbol.asyncIterator && owner.kind === "directory")
+                        return () => localizeIterator(owner.entries(), true);
+                      if (key === "isSameEntry")
+                        return methods.get(key) || (methods.set(key, candidate =>
+                          localPromise(() => owner.isSameEntry(ownerFor(candidate)))),
+                        methods.get(key));
+                      if (key === "queryPermission" || key === "requestPermission")
+                        return methods.get(key) || (methods.set(key, (...args) =>
+                          localPromise(() => Reflect.apply(owner[key], owner, args))),
+                        methods.get(key));
+                      return Reflect.get(object, key, receiver);
+                    },
+                  });
+                  workerOpfsOwners.set(facade, owner);
+                  workerOpfsFacades.set(owner, facade);
+                  return facade;
+                },
                 localizeStorageResult = (value, method) => {
+                  if (method === "getDirectory") return localizeHandle(value);
                   if (method !== "estimate" || value == null) return value;
                   const result = Object.create(
                     state.realm?.Object?.prototype || Object.prototype,
@@ -1554,36 +2194,18 @@ globalThis.__tilefinchInstallWorker = (
                   result.quota = Math.max(0, Number(value.quota) || 0);
                   return result;
                 };
+              const storageMethods = ["estimate", "persisted"];
+              if (typeof ownerNavigator.storage?.getDirectory === "function")
+                storageMethods.push("getDirectory");
               workerStorage = workerPromiseFacade(
-                ownerNavigator.storage, ["estimate", "persisted"],
+                ownerNavigator.storage, storageMethods,
                 LocalStorageManager?.prototype, localizeStorageResult,
               );
             }
             return workerStorage;
           },
           gpu: () => {
-            const ownerGPU = ownerNavigator.gpu;
-            if (!ownerGPU) return undefined;
-            if (workerGPU === null) {
-              const LocalGPU = state.realm?.GPU,
-                LocalWGSL = state.realm?.WGSLLanguageFeatures;
-              workerGPU = workerPromiseFacade(
-                ownerGPU, ["requestAdapter"], LocalGPU?.prototype,
-              );
-              /* requestAdapter must return a Worker-realm Promise, while the
-                 synchronous SameObject capability set must also carry the
-                 Worker's constructor identity. Its empty contents are the
-                 honest PSP result. */
-              if (LocalWGSL?.prototype) {
-                const localWGSL = Object.create(LocalWGSL.prototype);
-                Object.defineProperty(workerGPU, "wgslLanguageFeatures", {
-                  configurable: true,
-                  enumerable: true,
-                  value: localWGSL,
-                });
-              }
-            }
-            return workerGPU;
+            return workerGPU || undefined;
           },
         },
         workerLocationValues = {
@@ -1695,8 +2317,8 @@ globalThis.__tilefinchInstallWorker = (
       Object.setPrototypeOf(WorkerGlobalScope.prototype, fallback);
       /* DedicatedWorkerGlobalScope.close(): messages the worker already
          posted in this task still reach the owner, further tasks queued to
-         the worker (timers, owner messages) are discarded, and the shutdown
-         itself runs once every task-0 timer queued before it has drained. */
+         the worker (timers, owner messages) are discarded, and shutdown runs
+         as its own platform task after the current worker task. */
       scope.close = () => {
         if (!state.active || state.closing) return;
         state.closing = true;
@@ -1704,10 +2326,10 @@ globalThis.__tilefinchInstallWorker = (
            the worker posted (before or after close()) has reached the
            owner. Timer order alone cannot express that: a zero-delay
            timer scheduled during a drain may run in the same pass. */
-        const closeTimer = scheduleTimeout(() => {
+        const closeTimer = scheduleTask(() => {
           state.closeTaskEnded = true;
           finishWorkerClose(state);
-        }, 0);
+        });
         /* A full owner timer queue must not strand a closing Worker.  A
            microtask runs after the current Worker evaluation, avoiding realm
            destruction while its stack is still active. */
@@ -1769,6 +2391,8 @@ globalThis.__tilefinchInstallWorker = (
           socket, "close", () => state.webSockets.delete(socket));
       };
       scope.__tilefinchGetOwnerIndexedDB = () => globalThis.indexedDB;
+      scope.__tilefinchOwnerGPU = ownerNavigator.gpu;
+      scope.__tilefinchGPUBridge = workerIntrinsics;
       scope.__tilefinchRegisterWorkerIDBRequest = (request, tracksDatabase) => {
         if (!tracksDatabase || !request ||
             typeof request.addEventListener !== "function") return;
@@ -1786,10 +2410,14 @@ globalThis.__tilefinchInstallWorker = (
       state.realm = createWorkerRealmNative(
         scope, DedicatedWorkerGlobalScope.prototype,
         workerRealmConstructorInit);
+      workerGPU = state.realm?.__tilefinchWorkerGPUFacade || undefined;
+      if (state.realm) delete state.realm.__tilefinchWorkerGPUFacade;
       delete scope.__tilefinchRegisterWorkerXHR;
       delete scope.__tilefinchRegisterWorkerFileReader;
       delete scope.__tilefinchRegisterWorkerWebSocket;
       delete scope.__tilefinchGetOwnerIndexedDB;
+      delete scope.__tilefinchOwnerGPU;
+      delete scope.__tilefinchGPUBridge;
       delete scope.__tilefinchRegisterWorkerIDBRequest;
       delete scope.__tilefinchWorkerScriptURL;
       delete scope.__tilefinchImportScripts;
@@ -1841,7 +2469,7 @@ globalThis.__tilefinchInstallWorker = (
            with worker-src/mixed-content/CORS policy applied at its native
            destination, and are tied to terminate()/close() through the
            Worker's lifetime signal. */
-        state.startTimer = scheduleTimeout(() => {
+        state.startTimer = scheduleTask(() => {
           state.startTimer = 0;
           if (!state.active) return;
           if (traceWorkerLifecycle)
@@ -1868,7 +2496,7 @@ globalThis.__tilefinchInstallWorker = (
           } catch (error) {
             failWorkerStart(error);
           }
-        }, 0);
+        });
         if (!state.startTimer)
           throw new DOMException(
             "Worker startup task quota exceeded", "QuotaExceededError");
@@ -1948,7 +2576,7 @@ globalThis.__tilefinchInstallWorker = (
           value, state.cloneIntrinsics, transfer, ports);
       workerProgress.inboundQueued++;
       workerProgress.lastId = state.id;
-      const queued = scheduleTimeout(() => {
+      const queued = scheduleTask(() => {
         if (!state.active || state.closing) {
           workerProgress.inboundDropped++;
           return;
@@ -1970,13 +2598,14 @@ globalThis.__tilefinchInstallWorker = (
         try {
           if (!event.__stopped)
             invokeEventTargetCheckpointed(
-              state.scope, event, Event.AT_TARGET, null, null, finish);
+              state.scope, event, Event.AT_TARGET,
+              state.scopeErrorObserver, null, finish);
           else finish();
         } catch (error) {
           finish();
           throw error;
         }
-      }, 0);
+      });
       if (!queued) workerProgress.inboundDropped++;
     }
     terminate() {
@@ -2006,6 +2635,11 @@ globalThis.__tilefinchInstallWorker = (
     workerProgress.lastId = state.id;
     workerProgress.lastTerminationReason = reason;
     workerProgress.lastTaskMs = workerProgressClock.now();
+    for (const writer of state.opfsWriters) {
+      try { writer._abort(new DOMException(
+        "Worker is terminated", "AbortError")); } catch (_) {}
+    }
+    state.opfsWriters.clear();
     if (state.realm) {
       try {
         destroyWorkerRealmNative(state.realm);
@@ -2020,7 +2654,6 @@ globalThis.__tilefinchInstallWorker = (
     workerProgress.pendingTimers = Math.max(
       0, workerProgress.pendingTimers - state.timers.size);
     state.timers.clear();
-    state.timerNestingById.clear();
     for (const xhr of state.xhrs) {
       try { abortXHRForWorker(xhr); } catch (_) {}
     }

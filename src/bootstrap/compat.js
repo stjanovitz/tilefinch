@@ -64,6 +64,10 @@
     trustedDataViewByteLength = Function.call.bind(
       Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get,
     ),
+    trustedPromiseResolve = Function.call.bind(Promise.resolve, Promise),
+    trustedPromiseReject = Function.call.bind(Promise.reject, Promise),
+    trustedPromiseThen = Function.call.bind(Promise.prototype.then),
+    navigatorBrand = globalThis.__tilefinchNavigatorBrand,
     trustedCryptoRandomFill = globalThis.__tilefinchCryptoRandomFill,
     trustedUint8ArraySet = Function.call.bind(Uint8Array.prototype.set),
     isArrayBuffer = (value) => {
@@ -95,6 +99,7 @@
       }
       return copyArrayBufferBytes(buffer, byteOffset, byteLength);
     };
+  delete globalThis.__tilefinchNavigatorBrand;
   /* See dom.js: hardening.js only sees the globals that exist when it runs,
      so anything created on first write is declared here instead. */
   for (const [name, initial] of [
@@ -436,10 +441,14 @@
         immediateStopped: false,
         passive: false,
         path: null,
+        trusted: false,
       });
       Object.defineProperty(this, "isTrusted", {
-        value: false,
-        configurable: true,
+        configurable: false,
+        enumerable: true,
+        get() {
+          return eventState(this).trusted;
+        },
       });
     }
     preventDefault() {
@@ -587,10 +596,7 @@
   document.createEvent = createEvent;
   Document.prototype.createEvent = createEvent;
   globalThis.__tilefinchTrustedEvent = (event) => {
-    Object.defineProperty(event, "isTrusted", {
-      value: true,
-      configurable: true,
-    });
+    eventState(event).trusted = true;
     return event;
   };
   globalThis.CustomEvent = class CustomEvent extends Event {
@@ -3187,9 +3193,9 @@
         subtleInstances.add(this);
       }
       digest(algorithm, data) {
-        if (!subtleInstances.has(this))
-          throw new TypeError("Illegal invocation");
         try {
+          if (!subtleInstances.has(this))
+            throw new TypeError("Illegal invocation");
           const name =
             typeof algorithm === "string"
               ? algorithm
@@ -3198,7 +3204,9 @@
                 : undefined;
           if (name === undefined)
             throw new TypeError("Algorithm name is required");
-          if (String(name).toUpperCase() !== "SHA-256")
+          if (typeof name === "symbol")
+            throw new TypeError("Symbol is not a string");
+          if (TrustedString(name).toUpperCase() !== "SHA-256")
             throw new DOMException(
               "Unsupported digest algorithm",
               "NotSupportedError",
@@ -3220,11 +3228,12 @@
           /* Native admission handles a raw ArrayBuffer originating in another
              bounded same-origin Window realm. Worker-local raw buffers were
              normalized to a local view above before crossing realms. */
-          const result = Promise.resolve(
+          const result = trustedPromiseResolve(
             __tilefinchCryptoDigestSHA256(source));
-          return normalizers ? result.then(normalizers.output) : result;
+          return normalizers
+            ? trustedPromiseThen(result, normalizers.output) : result;
         } catch (error) {
-          return Promise.reject(error);
+          return trustedPromiseReject(error);
         }
       }
     }
@@ -3963,16 +3972,7 @@
         contentType = request.headers.get("content-type") || "",
         accept = request.headers.get("accept") || "*/*",
         authorHeaderBlock = nativeHeaderBlock(request.headers),
-        cacheHeaderBlock = request.cache === "no-store"
-          ? "cache-control: no-store"
-          : request.cache === "reload"
-            ? "cache-control: no-cache\npragma: no-cache"
-            : request.cache === "no-cache"
-              ? "cache-control: no-cache"
-              : "",
-        headerBlock = authorHeaderBlock && cacheHeaderBlock
-          ? authorHeaderBlock + "\n" + cacheHeaderBlock
-          : authorHeaderBlock || cacheHeaderBlock,
+        headerBlock = authorHeaderBlock,
         signal = request.signal,
         method = request.method,
         url = request.url,
@@ -4060,6 +4060,7 @@
               request.redirect,
               request.integrity,
               accept,
+              request.cache,
             ),
           networkRetainedBytes(
             method,
@@ -4152,7 +4153,7 @@
     enumerable: true,
     writable: true,
     value: function sendBeacon(url, data = null) {
-      if (!(this instanceof Navigator))
+      if (!navigatorBrand(this))
         throw new TypeError("Illegal invocation");
       try {
         const target = new URL(String(url), location.href);
@@ -4859,10 +4860,8 @@
       return true;
     };
   }
-  const xhrEventTargetStates = new WeakMap(),
-    xhrPublicStates = new WeakMap(),
-    xhrPrivateStates = new WeakMap(),
-    xhrEventHandlerTypes = [
+  let xhrEventTargetState, xhrPublicState, xhrPrivateState;
+  const xhrEventHandlerTypes = [
       "abort",
       "error",
       "load",
@@ -4870,27 +4869,33 @@
       "loadstart",
       "progress",
       "timeout",
-    ];
+  ];
   class XMLHttpRequestEventTarget extends EventTarget {
+    #eventState;
+    #publicState;
+    static {
+      xhrEventTargetState = (target) => target.#eventState;
+      xhrPublicState = (target) => target.#publicState;
+    }
     constructor() {
       super();
-      xhrEventTargetStates.set(this, {
+      this.#eventState = {
         handlers: new Map(),
         handlerListeners: new Map(),
-      });
-      xhrPublicStates.set(this, Object.create(null));
+      };
+      this.#publicState = Object.create(null);
     }
   }
   const xhrSetEventHandler = (target, type, value) => {
-    const state = xhrEventTargetStates.get(target);
+    const state = xhrEventTargetState(target);
     if (!state) throw new TypeError("Illegal invocation");
     const callback = typeof value === "function" ? value : null,
       wrapper = state.handlerListeners.get(type);
     state.handlers.set(type, callback);
     if (callback && !wrapper) {
-      const listener = (event) => {
-        const active = xhrEventTargetStates.get(target)?.handlers.get(type);
-        if (typeof active === "function") return active.call(target, event);
+      const listener = function (event) {
+        const active = xhrEventTargetState(this)?.handlers.get(type);
+        if (typeof active === "function") return active.call(this, event);
       };
       state.handlerListeners.set(type, listener);
       EventTarget.prototype.addEventListener.call(target, type, listener);
@@ -4904,7 +4909,7 @@
       configurable: true,
       enumerable: true,
       get() {
-        return xhrEventTargetStates.get(this)?.handlers.get(type) || null;
+        return xhrEventTargetState(this)?.handlers.get(type) || null;
       },
       set(value) {
         xhrSetEventHandler(this, type, value);
@@ -4920,20 +4925,29 @@
     configurable: true,
     value: "XMLHttpRequestUpload",
   });
+  const xhrSetPublic = (target, name, value) => {
+    const state = xhrPublicState(target);
+    if (!state) throw new TypeError("Illegal invocation");
+    state[name] = value;
+  };
   class TilefinchXMLHttpRequest extends XMLHttpRequestEventTarget {
+    #privateState;
+    static {
+      xhrPrivateState = (target) => target.#privateState;
+    }
     constructor() {
       super();
-      this.readyState = 0;
-      this.status = 0;
-      this.statusText = "";
-      this.response = null;
-      this.responseURL = "";
-      this.responseXML = null;
+      xhrSetPublic(this, "readyState", 0);
+      xhrSetPublic(this, "status", 0);
+      xhrSetPublic(this, "statusText", "");
+      xhrSetPublic(this, "response", null);
+      xhrSetPublic(this, "responseURL", "");
+      xhrSetPublic(this, "responseXML", null);
       this.onreadystatechange = null;
       this.timeout = 0;
       this.withCredentials = false;
-      this.upload = new XMLHttpRequestUpload();
-      xhrPrivateStates.set(this, {
+      xhrSetPublic(this, "upload", new XMLHttpRequestUpload());
+      this.#privateState = {
         async: true,
         done: true,
         generation: 0,
@@ -4953,10 +4967,10 @@
         uploadComplete: false,
         uploadStarted: false,
         url: "",
-      });
+      };
     }
     get responseType() {
-      return xhrPrivateStates.get(this).responseType;
+      return xhrPrivateState(this).responseType;
     }
     set responseType(value) {
       value = String(value || "");
@@ -4969,10 +4983,10 @@
           "Response type cannot change now",
           "InvalidStateError",
         );
-      xhrPrivateStates.get(this).responseType = value;
+      xhrPrivateState(this).responseType = value;
     }
     get responseText() {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (state.responseType !== "" && state.responseType !== "text")
         throw new DOMException(
           "responseText is unavailable for this response type",
@@ -4981,7 +4995,7 @@
       return state.responseText;
     }
     open(method, url, async = true) {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (!state.done && state.requestId)
         cancelNetwork(
           state.requestId,
@@ -4994,11 +5008,11 @@
       state.method = String(method).toUpperCase();
       state.url = String(url);
       state.async = !!async;
-      this.status = 0;
-      this.statusText = "";
-      this.response = null;
-      this.responseURL = "";
-      this.responseXML = null;
+      xhrSetPublic(this, "status", 0);
+      xhrSetPublic(this, "statusText", "");
+      xhrSetPublic(this, "response", null);
+      xhrSetPublic(this, "responseURL", "");
+      xhrSetPublic(this, "responseXML", null);
       state.responseHeaders = new Headers();
       state.headers = new Headers();
       state.responseText = "";
@@ -5010,12 +5024,12 @@
       state.uploadBytes = 0;
       state.uploadComplete = false;
       state.uploadStarted = false;
-      this.readyState = 1;
+      xhrSetPublic(this, "readyState", 1);
       state.stateTrace = [1];
       xhrEmit(this, "readystatechange");
     }
     setRequestHeader(name, value) {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
       state.headers.append(name, value);
@@ -5023,7 +5037,7 @@
     overrideMimeType(type) {
       if (this.readyState === 3 || this.readyState === 4)
         throw new DOMException("Response is loading", "InvalidStateError");
-      xhrPrivateStates.get(this).mimeType = String(type);
+      xhrPrivateState(this).mimeType = String(type);
     }
     emit(type, loaded = 0, total = 0) {
       const event = new Event(type);
@@ -5037,11 +5051,11 @@
         callback.call(this, event);
     }
     _state(value) {
-      this.readyState = value;
+      xhrSetPublic(this, "readyState", value);
       xhrEmit(this, "readystatechange");
     }
     _finish(type, generation) {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return false;
       state.done = true;
       if (state.timeoutId) clearTimeout(state.timeoutId);
@@ -5055,11 +5069,11 @@
       return state.generation === generation;
     }
     _apply(raw, generation) {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return;
       if (!xhrUploadFinish(this, "load", generation)) return;
-      this.status = Number(raw.status) || 0;
-      this.responseURL = raw.url || state.url;
+      xhrSetPublic(this, "status", Number(raw.status) || 0);
+      xhrSetPublic(this, "responseURL", raw.url || state.url);
       state.responseHeaders = new Headers(
         raw.headers || "content-type: " + raw.contentType + "\n",
       );
@@ -5095,24 +5109,24 @@
       xhrEmit(this, "progress", byteLength, byteLength);
       if (state.generation !== generation || state.done) return;
       if (state.responseType === "" || state.responseType === "text")
-        this.response = state.responseText;
+        xhrSetPublic(this, "response", state.responseText);
       else if (state.responseType === "json") {
         try {
-          this.response = JSON.parse(state.responseText);
+          xhrSetPublic(this, "response", JSON.parse(state.responseText));
         } catch (_) {
-          this.response = null;
+          xhrSetPublic(this, "response", null);
         }
       } else if (state.responseType === "arraybuffer") {
         const bytes = supplied || new TextEncoder().encode(fallbackBody);
-        this.response =
+        xhrSetPublic(this, "response",
           bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
             ? bytes.buffer
-            : bytes.slice().buffer;
+            : bytes.slice().buffer);
       } else if (state.responseType === "blob") {
         const bytes = supplied || new TextEncoder().encode(fallbackBody);
-        this.response = new Blob([bytes], {
+        xhrSetPublic(this, "response", new Blob([bytes], {
           type: state.responseHeaders.get("content-type") || "",
-        });
+        }));
       } else if (state.responseType === "document") {
         const mime =
           /xml/i.test(
@@ -5122,11 +5136,11 @@
           )
             ? "text/xml"
             : "text/html";
-        this.response = new DOMParser().parseFromString(
+        xhrSetPublic(this, "response", new DOMParser().parseFromString(
           state.responseText,
           mime,
-        );
-      } else this.response = null;
+        ));
+      } else xhrSetPublic(this, "response", null);
       if (
         state.responseType === "" &&
         /(?:xml|html)/i.test(
@@ -5136,31 +5150,31 @@
         )
       ) {
         const mime = /xml/i.test(state.mimeType || "") ? "text/xml" : "text/html";
-        this.responseXML = new DOMParser().parseFromString(
+        xhrSetPublic(this, "responseXML", new DOMParser().parseFromString(
           state.responseText,
           mime,
-        );
+        ));
       } else if (state.responseType === "document") {
-        this.responseXML = this.response;
+        xhrSetPublic(this, "responseXML", this.response);
       }
       if (!xhrState(this, 4, generation)) return;
       xhrFinish(this, "load", generation);
     }
     _fail(error, type = "error", generation) {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return;
       if (!xhrUploadFinish(this, type, generation)) return;
       globalThis.__tilefinchXHRLastError = String(
         (error && error.stack) || error || type,
       );
-      this.status = 0;
-      this.response = null;
+      xhrSetPublic(this, "status", 0);
+      xhrSetPublic(this, "response", null);
       state.responseText = "";
       if (!xhrState(this, 4, generation)) return;
       xhrFinish(this, type, generation);
     }
     send(body = null) {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
       globalThis.__tilefinchXHRSendCalls++;
@@ -5216,6 +5230,11 @@
                   undefined,
                   undefined,
                   accept,
+                  undefined,
+                  state.responseType === "" ||
+                    state.responseType === "text" ||
+                    state.responseType === "json" ||
+                    state.responseType === "document",
                 ),
               networkRetainedBytes(
                 method,
@@ -5267,8 +5286,8 @@
                 new DOMException("The operation timed out", "TimeoutError"),
                 false,
               );
-              this.status = 0;
-              this.readyState = 4;
+              xhrSetPublic(this, "status", 0);
+              xhrSetPublic(this, "readyState", 4);
               xhrEmit(this, "readystatechange");
               if (state.generation !== generation || state.done) return;
               if (!xhrUploadFinish(this, "timeout", generation)) return;
@@ -5291,7 +5310,7 @@
       }
     }
     abort() {
-      const state = xhrPrivateStates.get(this);
+      const state = xhrPrivateState(this);
       if (state.done) return;
       state.generation += 1;
       const generation = state.generation;
@@ -5303,20 +5322,20 @@
           new DOMException("This operation was aborted", "AbortError"),
           false,
         );
-      this.status = 0;
-      this.readyState = 0;
+      xhrSetPublic(this, "status", 0);
+      xhrSetPublic(this, "readyState", 0);
       if (!xhrUploadFinish(this, "abort", generation)) return;
       xhrFinish(this, "abort", generation);
     }
     getResponseHeader(name) {
       return this.readyState < 2
         ? null
-        : xhrPrivateStates.get(this).responseHeaders.get(name);
+        : xhrPrivateState(this).responseHeaders.get(name);
     }
     getAllResponseHeaders() {
       if (this.readyState < 2) return "";
       let output = "";
-      xhrPrivateStates.get(this).responseHeaders.forEach(
+      xhrPrivateState(this).responseHeaders.forEach(
         (value, name) => (output += name + ": " + value + "\r\n"),
       );
       return output;
@@ -5339,20 +5358,31 @@
     "response",
     "responseURL",
     "responseXML",
-    "timeout",
     "upload",
-    "withCredentials",
   ])
     Object.defineProperty(TilefinchXMLHttpRequest.prototype, name, {
       configurable: true,
       enumerable: true,
       get() {
-        const state = xhrPublicStates.get(this);
+        xhrPrivateState(this);
+        const state = xhrPublicState(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        return state[name];
+      },
+    });
+  for (const name of ["timeout", "withCredentials"])
+    Object.defineProperty(TilefinchXMLHttpRequest.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        xhrPrivateState(this);
+        const state = xhrPublicState(this);
         if (!state) throw new TypeError("Illegal invocation");
         return state[name];
       },
       set(value) {
-        const state = xhrPublicStates.get(this);
+        xhrPrivateState(this);
+        const state = xhrPublicState(this);
         if (!state) throw new TypeError("Illegal invocation");
         state[name] = value;
       },
@@ -5364,11 +5394,12 @@
       configurable: true,
       enumerable: true,
       get() {
-        return xhrEventTargetStates
-          .get(this)
+        xhrPrivateState(this);
+        return xhrEventTargetState(this)
           ?.handlers.get("readystatechange") || null;
       },
       set(value) {
+        xhrPrivateState(this);
         xhrSetEventHandler(this, "readystatechange", value);
       },
     },
@@ -5398,9 +5429,9 @@
     xhrEmit = (xhr, type, loaded = 0, total = 0) =>
       xhrEmitTarget(xhr, type, loaded, total),
     xhrGenerationCurrent = (xhr, generation) =>
-      xhrPrivateStates.get(xhr)?.generation === generation,
+      xhrPrivateState(xhr)?.generation === generation,
     xhrUploadStart = (xhr, method, serialized, generation) => {
-      const state = xhrPrivateStates.get(xhr);
+      const state = xhrPrivateState(xhr);
       if (method === "GET" || method === "HEAD" || serialized === undefined)
         return xhrGenerationCurrent(xhr, generation);
       const bytes = typeof serialized === "string"
@@ -5413,7 +5444,7 @@
       return xhrGenerationCurrent(xhr, generation) && !state.done;
     },
     xhrUploadFinish = (xhr, type, generation) => {
-      const state = xhrPrivateStates.get(xhr);
+      const state = xhrPrivateState(xhr);
       if (!xhrGenerationCurrent(xhr, generation)) return false;
       if (!state.uploadStarted || state.uploadComplete) return !state.done;
       state.uploadComplete = true;
@@ -5430,7 +5461,7 @@
       return xhrGenerationCurrent(xhr, generation) && !state.done;
     },
     xhrState = (xhr, value, generation) => {
-      const state = xhrPrivateStates.get(xhr);
+      const state = xhrPrivateState(xhr);
       if (state.generation !== generation || state.done) return false;
       state.stateTrace.push(value);
       xhrStateImpl.call(xhr, value);
@@ -5453,7 +5484,7 @@
       xhrApplyImpl.call(xhr, raw, generation);
       if (xhrGenerationCurrent(xhr, generation)
           && xhr.readyState === 4 && xhr.status !== 0) {
-        const state = xhrPrivateStates.get(xhr);
+        const state = xhrPrivateState(xhr);
         globalThis.__tilefinchXHRResponseCount++;
         globalThis.__tilefinchXHRLastStatus = xhr.status;
         globalThis.__tilefinchXHRLastResponseType = state.responseType;
@@ -5477,7 +5508,7 @@
     enumerable: false,
     writable: false,
     value: (xhr) => {
-      const state = xhrPrivateStates.get(xhr);
+      const state = xhrPrivateState(xhr);
       if (!state) return false;
       state.generation += 1;
       if (state.timeoutId) clearTimeout(state.timeoutId);
@@ -5492,9 +5523,9 @@
       state.done = true;
       state.sent = false;
       state.uploadComplete = true;
-      xhr.status = 0;
-      xhr.readyState = 0;
-      xhr.response = null;
+      xhrSetPublic(xhr, "status", 0);
+      xhrSetPublic(xhr, "readyState", 0);
+      xhrSetPublic(xhr, "response", null);
       return true;
     },
   });
@@ -5570,7 +5601,19 @@
     batteryManager = null,
     batteryPromise = null,
     permissions = null;
-  const batteryStates = new TrustedWeakMap(),
+  const networkInformationStates = new TrustedWeakMap(),
+    permissionStatusStates = new TrustedWeakMap(),
+    batteryStates = new TrustedWeakMap(),
+    networkInformationState = value => {
+      const state = trustedWeakMapGet(networkInformationStates, value);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    },
+    permissionStatusState = value => {
+      const state = trustedWeakMapGet(permissionStatusStates, value);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    },
     batteryState = value => {
       const state = trustedWeakMapGet(batteryStates, value);
       if (!state) throw new TypeError("Illegal invocation");
@@ -5581,21 +5624,22 @@
       if (arguments[0] !== platformStatusToken)
         throw new TypeError("Illegal constructor");
       super();
-      this._onchange = null;
+      trustedWeakMapSet(networkInformationStates, this, { onchange: null });
     }
-    get onchange() { return this._onchange; }
+    get onchange() { return networkInformationState(this).onchange; }
     set onchange(value) {
-      this._onchange = typeof value === "function" ? value : null;
+      networkInformationState(this).onchange =
+        typeof value === "function" ? value : null;
     }
     /* The PSP's only network interface is 802.11b Wi-Fi. Report the
        standardized connection kind and the radio's first-hop ceiling rather
        than leaving two members missing from an interface we already expose. */
-    get type() { return "wifi"; }
-    get downlinkMax() { return 11; }
-    get effectiveType() { return "3g"; }
-    get rtt() { return 300; }
-    get downlink() { return 1.5; }
-    get saveData() { return false; }
+    get type() { networkInformationState(this); return "wifi"; }
+    get downlinkMax() { networkInformationState(this); return 11; }
+    get effectiveType() { networkInformationState(this); return "3g"; }
+    get rtt() { networkInformationState(this); return 300; }
+    get downlink() { networkInformationState(this); return 1.5; }
+    get saveData() { networkInformationState(this); return false; }
   }
   class BatteryManager extends EventTarget {
     constructor() {
@@ -5643,14 +5687,17 @@
       if (token !== platformStatusToken)
         throw new TypeError("Illegal constructor");
       super();
-      this._name = name;
-      this._onchange = null;
+      trustedWeakMapSet(permissionStatusStates, this, {
+        name: String(name),
+        onchange: null,
+      });
     }
-    get name() { return this._name; }
-    get state() { return "denied"; }
-    get onchange() { return this._onchange; }
+    get name() { return permissionStatusState(this).name; }
+    get state() { permissionStatusState(this); return "denied"; }
+    get onchange() { return permissionStatusState(this).onchange; }
     set onchange(value) {
-      this._onchange = typeof value === "function" ? value : null;
+      permissionStatusState(this).onchange =
+        typeof value === "function" ? value : null;
     }
   }
   class Permissions {
@@ -5659,27 +5706,31 @@
         throw new TypeError("Illegal constructor");
     }
     query(descriptor) {
-      if (!(this instanceof Permissions))
-        throw new TypeError("Illegal invocation");
-      /* Permissions.query() converts its object descriptor and resolves from
-         the permissions task source.  In particular, an author getter must
-         reject the returned promise rather than escape synchronously, and a
-         reaction registered on the result must not overtake microtasks from
-         the calling task.  Keep this bounded by the scheduler's existing
-         timer quota and do not retain one status object per queried name. */
+      let name;
+      try {
+        if (this !== permissions)
+          throw new TypeError("Illegal invocation");
+        if (descriptor === null || descriptor === undefined)
+          throw new TypeError("Permission descriptor is required");
+        if (typeof descriptor !== "object" && typeof descriptor !== "function")
+          throw new TypeError("Permission descriptor must be an object");
+        const value = descriptor.name;
+        if (typeof value === "symbol")
+          throw new TypeError("Symbol is not a string");
+        name = String(value);
+        if (!permissionNames.has(name))
+          throw new TypeError("Unsupported permission name");
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      /* Permissions.query() snapshots its descriptor before returning and
+         resolves from the permissions task source. A later author mutation
+         cannot alter the pending request, while conversion/receiver failures
+         remain promise rejections. Keep successful completion bounded by the
+         scheduler's existing timer quota. */
       return new Promise((resolve, reject) => {
-        const task = setTimeout(() => {
-          try {
-            if (descriptor === null || descriptor === undefined)
-              throw new TypeError("Permission descriptor is required");
-            const name = String(descriptor.name);
-            if (!permissionNames.has(name))
-              throw new TypeError("Unsupported permission name");
-            resolve(new PermissionStatus(platformStatusToken, name));
-          } catch (error) {
-            reject(error);
-          }
-        }, 0);
+        const task = setTimeout(
+          () => resolve(new PermissionStatus(platformStatusToken, name)), 0);
         if (task === 0)
           reject(new DOMException(
             "Permission query task quota exceeded", "QuotaExceededError"));
@@ -5714,7 +5765,7 @@
       configurable: true,
       enumerable: true,
       get() {
-        if (!(this instanceof Navigator))
+        if (!navigatorBrand(this))
           throw new TypeError("Illegal invocation");
         if (networkInformation === null)
           networkInformation = new NetworkInformation(platformStatusToken);
@@ -5724,16 +5775,16 @@
     getBattery: {
       configurable: true,
       enumerable: true,
-      value() {
-        if (!(this instanceof Navigator))
-          throw new TypeError("Illegal invocation");
+      value: function getBattery() {
+        if (!navigatorBrand(this))
+          return trustedPromiseReject(new TypeError("Illegal invocation"));
         if (batteryManager === null)
           batteryManager = new BatteryManager(platformStatusToken);
         /* The Battery Status API stores one promise on each Navigator.  This
            identity is observable and prevents repeated probes from creating
            needless reactions and allocations on the PSP. */
         if (batteryPromise === null)
-          batteryPromise = Promise.resolve(batteryManager);
+          batteryPromise = trustedPromiseResolve(batteryManager);
         return batteryPromise;
       },
     },
@@ -5741,7 +5792,7 @@
       configurable: true,
       enumerable: true,
       get() {
-        if (!(this instanceof Navigator))
+        if (!navigatorBrand(this))
           throw new TypeError("Illegal invocation");
         if (permissions === null)
           permissions = new Permissions(platformStatusToken);

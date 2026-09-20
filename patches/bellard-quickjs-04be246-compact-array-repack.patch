@@ -1,0 +1,256 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -9923,6 +9923,12 @@
+ 
+     if (!is_compact_array(p))
+         return 0;
++    if (unlikely(ctx->rt->fast_array_byte_limit != 0) &&
++        sizeof(*values) * (uint64_t)count >
++            ctx->rt->fast_array_byte_limit) {
++        JS_ThrowRangeError(ctx, "array exceeds the device profile size");
++        return -1;
++    }
+     values = NULL;
+     if (count != 0) {
+         values = js_malloc(ctx, sizeof(*values) * (size_t)count);
+@@ -9945,9 +9951,141 @@
+     p->compact_byte_array = 0;
+     p->compact_signed_byte_array = 0;
+     p->compact_short_array = 0;
++    return 0;
++}
++
++/* Store into an existing compact-array element without expanding it into
++   boxed JSValues.  Return one when the value was consumed, zero when the
++   representation cannot hold it, and -1 on exception. */
++static int set_compact_array_element(JSContext *ctx, JSObject *p,
++                                     uint32_t index, JSValue value)
++{
++    uint8_t byte;
++    uint16_t short_value;
++    BOOL compatible = p->compact_char_array
++        ? js_value_is_latin1_char(value, &byte)
++        : p->compact_byte_array
++        ? js_value_is_uint8(value, &byte)
++        : p->compact_signed_byte_array
++        ? js_value_is_int8(value, &byte)
++        : js_value_is_int16(value, &short_value);
++    if (compatible) {
++        if (expand_compact_array(ctx, p, p->u.array.count)) {
++            JS_FreeValue(ctx, value);
++            return -1;
++        }
++        if (p->compact_short_array)
++            compact_array_shorts(p)[index] = short_value;
++        else
++            compact_array_bytes(p)[index] = byte;
++        JS_FreeValue(ctx, value);
++        return 1;
++    }
++    if ((p->compact_byte_array || p->compact_signed_byte_array) &&
++        js_value_is_int16(value, &short_value)) {
++        if (upgrade_compact_numeric_array_to_short(
++                ctx, p, p->u.array.count)) {
++            JS_FreeValue(ctx, value);
++            return -1;
++        }
++        compact_array_shorts(p)[index] = short_value;
++        JS_FreeValue(ctx, value);
++        return 1;
++    }
+     return 0;
+ }
++
++/* A compact numeric array can temporarily deoptimize for an incompatible
++   write and later become homogeneous again. Reconsider it at power-of-two
++   lengths and at the comparatively rare capacity-growth boundary above 64K;
++   never scan on every append. This also recovers large homogeneous scratch
++   arrays initially created through a generic Array operation. */
++static int try_repack_numeric_array_append(JSContext *ctx, JSObject *p,
++                                           int append_count,
++                                           JSValueConst *appended,
++                                           uint32_t new_len,
++                                           BOOL capacity_checkpoint)
++{
++    uint32_t count = p->u.array.count;
++    uint32_t new_size;
++    int32_t minimum = INT32_MAX, maximum = INT32_MIN;
++    int wide;
++    JSString *storage;
+ 
++    if (count < 256u || append_count < 1 ||
++        (!capacity_checkpoint && (count & (count - 1u)) != 0u))
++        return 0;
++    for (int i = 0; i < append_count; i++) {
++        if (JS_VALUE_GET_TAG(appended[i]) != JS_TAG_INT)
++            return 0;
++        int32_t item = JS_VALUE_GET_INT(appended[i]);
++        if (item < minimum) minimum = item;
++        if (item > maximum) maximum = item;
++    }
++    for (uint32_t i = 0; i < count; i++) {
++        JSValueConst current = p->u.array.u.values[i];
++        if (JS_VALUE_GET_TAG(current) != JS_TAG_INT)
++            return 0;
++        int32_t current_item = JS_VALUE_GET_INT(current);
++        if (current_item < minimum) minimum = current_item;
++        if (current_item > maximum) maximum = current_item;
++    }
++    if (minimum >= 0 && maximum <= UINT8_MAX) {
++        wide = 0;
++    } else if (minimum >= INT8_MIN && maximum <= INT8_MAX) {
++        wide = 0;
++    } else if (minimum >= INT16_MIN && maximum <= INT16_MAX) {
++        wide = 1;
++    } else {
++        return 0;
++    }
++    if (new_len > JS_STRING_LEN_MAX)
++        return 0;
++    new_size = new_len;
++    if (new_size < 256u * 1024u) {
++        uint64_t grown = (uint64_t)new_size * 3u / 2u;
++        if (grown > JS_STRING_LEN_MAX) grown = JS_STRING_LEN_MAX;
++        new_size = (uint32_t)grown;
++    } else {
++        uint64_t grown = ((uint64_t)new_size + 65535u) & ~(uint64_t)65535u;
++        if (grown > JS_STRING_LEN_MAX) grown = JS_STRING_LEN_MAX;
++        new_size = (uint32_t)grown;
++    }
++    if (ctx->rt->fast_array_byte_limit != 0 &&
++        sizeof(JSString) + ((uint64_t)new_len << wide) + 1u - wide
++            > ctx->rt->fast_array_byte_limit)
++        return 0;
++    storage = js_alloc_string(ctx, new_size, wide);
++    if (storage == NULL)
++        return -1;
++    if (wide) {
++        for (uint32_t i = 0; i < count; i++)
++            storage->u.str16[i] =
++                (uint16_t)(int16_t)JS_VALUE_GET_INT(p->u.array.u.values[i]);
++        for (int i = 0; i < append_count; i++)
++            storage->u.str16[count + (uint32_t)i] =
++                (uint16_t)(int16_t)JS_VALUE_GET_INT(appended[i]);
++    } else {
++        for (uint32_t i = 0; i < count; i++)
++            storage->u.str8[i] =
++                (uint8_t)JS_VALUE_GET_INT(p->u.array.u.values[i]);
++        for (int i = 0; i < append_count; i++)
++            storage->u.str8[count + (uint32_t)i] =
++                (uint8_t)JS_VALUE_GET_INT(appended[i]);
++        storage->u.str8[new_len] = '\0';
++    }
++    storage->len = new_len;
++    js_free(ctx, p->u.array.u.values);
++    p->u.array.u.ptr = storage;
++    p->u.array.u1.size = new_size;
++    p->u.array.count = new_len;
++    p->compact_char_array = 0;
++    p->compact_byte_array = !wide && minimum >= 0;
++    p->compact_signed_byte_array = !wide && minimum < 0;
++    p->compact_short_array = wide;
++    return 1;
++}
++
+ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
+                                                              JSObject *p)
+ {
+@@ -10462,6 +10600,17 @@
+         JS_FreeValue(ctx, val);
+         return -1;
+     }
++    if (!is_compact_array(p)) {
++        JSValueConst appended = val;
++        BOOL capacity_checkpoint =
++            new_len > p->u.array.u1.size && p->u.array.count >= 65536u;
++        int repacked = try_repack_numeric_array_append(
++            ctx, p, 1, &appended, new_len, capacity_checkpoint);
++        if (repacked != 0) {
++            JS_FreeValue(ctx, val);
++            return repacked < 0 ? -1 : TRUE;
++        }
++    }
+     if (unlikely(new_len > p->u.array.u1.size)) {
+         if (expand_fast_array(ctx, p, new_len)) {
+             JS_FreeValue(ctx, val);
+@@ -10874,40 +11023,10 @@
+                 return add_fast_array_element(ctx, p, val, flags);
+             }
+             if (is_compact_array(p)) {
+-                uint8_t byte;
+-                uint16_t short_value;
+-                BOOL compatible = p->compact_char_array
+-                    ? js_value_is_latin1_char(val, &byte)
+-                    : p->compact_byte_array
+-                    ? js_value_is_uint8(val, &byte)
+-                    : p->compact_signed_byte_array
+-                    ? js_value_is_int8(val, &byte)
+-                    : js_value_is_int16(val, &short_value);
+-                if (compatible) {
+-                    if (expand_compact_array(
+-                            ctx, p, p->u.array.count)) {
+-                        JS_FreeValue(ctx, val);
+-                        return -1;
+-                    }
+-                    if (p->compact_short_array)
+-                        compact_array_shorts(p)[idx] = short_value;
+-                    else
+-                        compact_array_bytes(p)[idx] = byte;
+-                    JS_FreeValue(ctx, val);
+-                    break;
+-                }
+-                if ((p->compact_byte_array ||
+-                     p->compact_signed_byte_array) &&
+-                    js_value_is_int16(val, &short_value)) {
+-                    if (upgrade_compact_numeric_array_to_short(
+-                            ctx, p, p->u.array.count)) {
+-                        JS_FreeValue(ctx, val);
+-                        return -1;
+-                    }
+-                    compact_array_shorts(p)[idx] = short_value;
+-                    JS_FreeValue(ctx, val);
+-                    break;
+-                }
++                int compact_result = set_compact_array_element(
++                    ctx, p, idx, val);
++                if (compact_result < 0) return -1;
++                if (compact_result > 0) break;
+                 if (convert_compact_array_to_values(ctx, p)) {
+                     JS_FreeValue(ctx, val);
+                     return -1;
+@@ -44332,10 +44451,11 @@
+             array->compact_char_array && n == array->u.array.count &&
+             empty_separator) {
+             JSString *joined = compact_array_string(array);
+-            joined->len = array->u.array.count;
+-            joined->u.str8[joined->len] = '\0';
+-            js_rc(joined)->ref_count++;
+-            JSValue result = JS_MKPTR(JS_TAG_STRING, joined);
++            /* The compact backing store belongs to the mutable Array. Keep
++               the returned primitive independent so later array writes,
++               atomization, or in-place concatenation cannot alias it. */
++            JSValue result = js_new_string8_len(
++                ctx, (const char *)joined->u.str8, array->u.array.count);
+             JS_FreeValue(ctx, sep);
+             JS_FreeValue(ctx, obj);
+             return result;
+@@ -44526,6 +44646,19 @@
+                         convert_compact_array_to_values(ctx, p))
+                         return JS_EXCEPTION;
+                 }
++                if (!is_compact_array(p) && argc > 0) {
++                    BOOL capacity_checkpoint =
++                        new_len > p->u.array.u1.size &&
++                        p->u.array.count >= 65536u;
++                    int repacked = try_repack_numeric_array_append(
++                        ctx, p, argc, argv, new_len, capacity_checkpoint);
++                    if (repacked < 0)
++                        return JS_EXCEPTION;
++                    if (repacked > 0) {
++                        p->prop[0].u.value = JS_NewInt32(ctx, new_len);
++                        return JS_NewInt32(ctx, new_len);
++                    }
++                }
+                 if (unlikely(new_len > p->u.array.u1.size)) {
+                     if (expand_fast_array(ctx, p, new_len))
+                         return JS_EXCEPTION;

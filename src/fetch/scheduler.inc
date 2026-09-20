@@ -382,6 +382,7 @@ static FetchRequest scheduled_background_hop_shape(
         .content_type = hop != NULL && hop->body_enabled
             ? item->content_type : NULL,
         .extra_headers = hop == NULL ? NULL : hop->extra_headers,
+        .cache_mode = base == NULL ? FETCH_CACHE_DEFAULT : base->cache_mode,
         .cookie = hop == NULL || hop->cookie_header[0] == '\0'
             ? NULL : hop->cookie_header,
         .if_none_match = base == NULL ? NULL : base->if_none_match,
@@ -579,6 +580,8 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
                        ? 0 : source->body_length,
         .content_type = item->content_type,
         .extra_headers = item->extra_headers, .cookie = item->cookie,
+        .cache_mode = source == NULL
+            ? FETCH_CACHE_DEFAULT : source->cache_mode,
         .cors_preflight = source != NULL && source->cors_preflight,
         .allow_http_errors = source != NULL && source->allow_http_errors,
         .send_client_hints = source != NULL && source->send_client_hints,

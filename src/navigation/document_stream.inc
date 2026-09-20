@@ -1590,7 +1590,10 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
     if (stream->runtime != NULL) {
         if (stream->response_headers_elapsed_us != 0) {
             const ScriptNavigationTiming navigation_timing = {
-                .response_start_us = stream->response_headers_elapsed_us
+                .response_start_us = stream->response_headers_elapsed_us,
+                .response_status = stream->response_status,
+                .next_hop_protocol = stream->next_hop_protocol,
+                .content_type = stream->response_content_type
             };
             (void) script_runtime_record_navigation_timing(
                 stream->runtime, &navigation_timing);

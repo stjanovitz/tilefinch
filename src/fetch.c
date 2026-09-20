@@ -278,6 +278,47 @@ static bool append_extra_headers(Budget *budget, struct curl_slist **headers,
     return ok;
 }
 
+static bool fetch_serialized_headers_contains_name(
+    const char *serialized, const char *wanted)
+{
+    if (serialized == NULL || wanted == NULL || wanted[0] == '\0') {
+        return false;
+    }
+    size_t wanted_length = strlen(wanted);
+    const char *at = serialized;
+    while (*at != '\0') {
+        const char *end = strchr(at, '\n');
+        if (end == NULL) end = at + strlen(at);
+        const char *colon = memchr(at, ':', (size_t) (end - at));
+        if (colon != NULL && (size_t) (colon - at) == wanted_length
+            && strncasecmp(at, wanted, wanted_length) == 0) return true;
+        at = *end == '\0' ? end : end + 1;
+    }
+    return false;
+}
+
+static void fetch_cache_mode_headers(
+    FetchCacheMode mode, const char *author_headers,
+    const char **cache_control, const char **pragma)
+{
+    if (cache_control != NULL) *cache_control = NULL;
+    if (pragma != NULL) *pragma = NULL;
+    bool has_cache_control = fetch_serialized_headers_contains_name(
+        author_headers, "Cache-Control");
+    bool has_pragma = fetch_serialized_headers_contains_name(
+        author_headers, "Pragma");
+    if (mode == FETCH_CACHE_NO_CACHE) {
+        if (!has_cache_control && cache_control != NULL) {
+            *cache_control = "max-age=0";
+        }
+    } else if (mode == FETCH_CACHE_NO_STORE || mode == FETCH_CACHE_RELOAD) {
+        if (!has_cache_control && cache_control != NULL) {
+            *cache_control = "no-cache";
+        }
+        if (!has_pragma && pragma != NULL) *pragma = "no-cache";
+    }
+}
+
 typedef struct FetchHopState FetchHopState;
 
 static const char *fetch_hop_logical_url(const FetchHopState *hop);
@@ -616,17 +657,24 @@ bool fetch_transport_http2_available(void)
 const char *fetch_http_version_name(long version)
 {
     switch (version) {
-#if defined(CURL_HTTP_VERSION_1_0)
-        case CURL_HTTP_VERSION_1_0: return "1.0";
-#endif
-#if defined(CURL_HTTP_VERSION_1_1)
-        case CURL_HTTP_VERSION_1_1: return "1.1";
-#endif
-#if defined(CURL_HTTP_VERSION_2_0)
-        case CURL_HTTP_VERSION_2_0: return "2";
-#endif
-        default: return "unknown";
+        case CURL_HTTP_VERSION_1_0: return "http/1.0";
+        case CURL_HTTP_VERSION_1_1: return "http/1.1";
+        case CURL_HTTP_VERSION_2_0: return "h2";
+        default: return "";
     }
+}
+
+static long fetch_http_version_from_status_line(
+    const char *line, size_t length)
+{
+    if (line == NULL) return 0;
+    if (length >= 9u && memcmp(line, "HTTP/1.0 ", 9u) == 0)
+        return CURL_HTTP_VERSION_1_0;
+    if (length >= 9u && memcmp(line, "HTTP/1.1 ", 9u) == 0)
+        return CURL_HTTP_VERSION_1_1;
+    if (length >= 7u && memcmp(line, "HTTP/2 ", 7u) == 0)
+        return CURL_HTTP_VERSION_2_0;
+    return 0;
 }
 
 static bool fetch_transport_runtime_supported(void)
@@ -1189,6 +1237,19 @@ typedef struct {
     bool descriptor_valid;
 } TraceReplayRouteIndexEntry;
 
+/* Capture-only provenance keeps cookie values in Budget-owned memory and
+   writes only equality results to disk. It is deliberately small: the live
+   challenge path needs the newest issuances, not an unbounded cookie log. */
+#define FETCH_TRACE_COOKIE_PROVENANCE_LIMIT 16u
+typedef struct {
+    Budget *budget;
+    char *storage;
+    size_t name_length;
+    size_t value_length;
+    size_t response_sequence;
+    size_t cookie_index;
+} TraceCookieProvenanceEntry;
+
 static struct {
     FetchTraceMode mode;
     char directory[2048];
@@ -1213,6 +1274,10 @@ static struct {
     size_t replay_reusable_claim_count;
     size_t replay_occurrence_exhausted_count;
     uint64_t replay_claimed[FETCH_TRACE_CLAIM_WORDS];
+    TraceCookieProvenanceEntry cookie_provenance[
+        FETCH_TRACE_COOKIE_PROVENANCE_LIMIT];
+    size_t cookie_provenance_evictions;
+    bool cookie_provenance_allocation_failed;
     /* Response-keyed replay is a lab boundary.  Keep its route accelerator
        proportional to small/medium opened corpora instead of reserving the
        4096-record ceiling in every PSP process.  The accelerator is capped

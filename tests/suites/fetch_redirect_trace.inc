@@ -78,6 +78,48 @@ static bool trace_meta_contains(const char *trace_directory,
     return fclose(file) == 0 && found;
 }
 
+static bool trace_meta_sequence_contains(const char *trace_directory,
+                                         size_t sequence,
+                                         const char *expected)
+{
+    char path[4096];
+    int written = snprintf(path, sizeof(path), "%s/%04zu.meta",
+                           trace_directory, sequence);
+    if (written < 0 || (size_t) written >= sizeof(path)) return false;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (strcmp(line, expected) == 0) {
+            found = true;
+            break;
+        }
+    }
+    return fclose(file) == 0 && found;
+}
+
+static bool trace_meta_sequence_has_substring(const char *trace_directory,
+                                              size_t sequence,
+                                              const char *needle)
+{
+    char path[4096];
+    int written = snprintf(path, sizeof(path), "%s/%04zu.meta",
+                           trace_directory, sequence);
+    if (written < 0 || (size_t) written >= sizeof(path)) return false;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (strstr(line, needle) != NULL) {
+            found = true;
+            break;
+        }
+    }
+    return fclose(file) == 0 && found;
+}
+
 static bool trace_info_contains(const char *trace_directory,
                                 const char *needle)
 {
@@ -148,9 +190,14 @@ static bool test_single_hop_trace_acquisition(
           && result.set_cookie_count == 1
           && strcmp(result.set_cookies[0], "hop=seen; Path=/") == 0);
     fetch_result_destroy(&result);
+    request.cookie = "hop=seen";
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_request_single_hop(
+              budget, url, &request, 64u * 1024u, 5000, &result));
+    fetch_result_destroy(&result);
     fetch_trace_end();
     CHECK(trace_info_contains(trace_directory, "capture-complete=yes")
-          && trace_info_contains(trace_directory, "record-count=1")
+          && trace_info_contains(trace_directory, "record-count=2")
           && trace_meta_contains(trace_directory, "cookie-values=redacted\n")
           && trace_meta_contains(trace_directory, "request-cookie-bytes=0\n")
           && trace_meta_contains(
@@ -160,9 +207,20 @@ static bool test_single_hop_trace_acquisition(
           && trace_meta_contains(trace_directory, "set-cookie-count=1\n")
           && trace_meta_contains(
                  trace_directory, "set-cookie-0=hop=xxxx; Path=/\n")
-          && trace_meta_contains(trace_directory, cookie_url_line));
+          && trace_meta_contains(trace_directory, cookie_url_line)
+          && trace_meta_sequence_contains(
+                 trace_directory, 1,
+                 "request-cookie-provenance-count=1\n")
+          && trace_meta_sequence_contains(
+                 trace_directory, 1,
+                 "request-cookie-provenance-0="
+                 "name:hop,issuer:0:0,exact:1,latest:1,occurrences:1\n")
+          && !trace_meta_sequence_has_substring(
+                 trace_directory, 1, "hop=seen"));
     CHECK(trace_remove_file(trace_directory, "0000.meta")
           && trace_remove_file(trace_directory, "0000.body")
+          && trace_remove_file(trace_directory, "0001.meta")
+          && trace_remove_file(trace_directory, "0001.body")
           && trace_remove_file(trace_directory, "trace.meta"));
     return budget->current == baseline;
 }
@@ -248,10 +306,30 @@ static bool trace_rewrite_record_version(
     FILE *output = input == NULL ? NULL : fopen(temporary, "wb");
     bool ok = output != NULL;
     bool version_seen = false;
+    bool strip_cache_shape = strcmp(from_version, "13") == 0
+        && strcmp(to_version, "13") != 0;
+    bool add_cache_shape = strcmp(from_version, "13") != 0
+        && strcmp(to_version, "13") == 0;
     while (ok && fgets(line, sizeof(line), input) != NULL) {
         if (strcmp(line, expected) == 0) {
             version_seen = true;
             ok = fprintf(output, "psp-http-trace=%s\n", to_version) >= 0;
+        } else if (strip_cache_shape
+                   && strncmp(
+                          line, "request-extra-header-shape=@cache=0;",
+                          sizeof("request-extra-header-shape=@cache=0;") - 1)
+                          == 0) {
+            ok = fprintf(output, "request-extra-header-shape=%s",
+                         line + sizeof(
+                             "request-extra-header-shape=@cache=0;") - 1)
+                 >= 0;
+        } else if (add_cache_shape
+                   && strncmp(line, "request-extra-header-shape=",
+                              sizeof("request-extra-header-shape=") - 1)
+                          == 0) {
+            ok = fprintf(output, "request-extra-header-shape=@cache=0;%s",
+                         line + sizeof("request-extra-header-shape=") - 1)
+                 >= 0;
         } else {
             ok = fputs(line, output) >= 0;
         }
@@ -264,7 +342,43 @@ static bool trace_rewrite_record_version(
     return ok;
 }
 
-static bool trace_downgrade_record_v12_to_v8(
+static bool trace_move_record_version_to_end(
+    const char *trace_directory, size_t sequence)
+{
+    char path[4096], temporary[4096], line[9000], version[64] = {0};
+    int path_written = snprintf(
+        path, sizeof(path), "%s/%04zu.meta", trace_directory, sequence);
+    int temporary_written = snprintf(
+        temporary, sizeof(temporary), "%s/%04zu.meta.tmp",
+        trace_directory, sequence);
+    if (path_written < 0 || (size_t) path_written >= sizeof(path)
+        || temporary_written < 0
+        || (size_t) temporary_written >= sizeof(temporary)) return false;
+    FILE *input = fopen(path, "rb");
+    FILE *output = input == NULL ? NULL : fopen(temporary, "wb");
+    bool ok = output != NULL;
+    while (ok && fgets(line, sizeof(line), input) != NULL) {
+        if (strncmp(line, "psp-http-trace=",
+                    sizeof("psp-http-trace=") - 1) == 0) {
+            if (version[0] != '\0' || strlen(line) >= sizeof(version)) {
+                ok = false;
+            } else {
+                snprintf(version, sizeof(version), "%s", line);
+            }
+        } else {
+            ok = fputs(line, output) >= 0;
+        }
+    }
+    ok = ok && version[0] != '\0' && !ferror(input)
+        && fputs(version, output) >= 0;
+    if (input != NULL) ok = fclose(input) == 0 && ok;
+    if (output != NULL) ok = fclose(output) == 0 && ok;
+    if (ok) ok = rename(temporary, path) == 0;
+    if (!ok) (void) remove(temporary);
+    return ok;
+}
+
+static bool trace_downgrade_record_v13_to_v8(
     const char *trace_directory, size_t sequence)
 {
     char path[4096], temporary[4096], line[9000];
@@ -281,9 +395,16 @@ static bool trace_downgrade_record_v12_to_v8(
     bool ok = output != NULL;
     bool version_seen = false;
     while (ok && fgets(line, sizeof(line), input) != NULL) {
-        if (strcmp(line, "psp-http-trace=12\n") == 0) {
+        if (strcmp(line, "psp-http-trace=13\n") == 0) {
             version_seen = true;
             ok = fputs("psp-http-trace=8\n", output) >= 0;
+        } else if (strncmp(line, "request-extra-header-shape=@cache=0;",
+                           sizeof("request-extra-header-shape=@cache=0;") - 1)
+                   == 0) {
+            ok = fprintf(output, "request-extra-header-shape=%s",
+                         line + sizeof(
+                             "request-extra-header-shape=@cache=0;") - 1)
+                 >= 0;
         } else if (strncmp(line, "logical-request-url=", 20) == 0
                    || strncmp(
                           line,
@@ -374,7 +495,7 @@ static bool test_trace_logical_url_and_referrer_metadata(
     fetch_trace_end();
     snprintf(logical_line, sizeof(logical_line),
              "logical-request-url=%s\n", normalized_sync_url);
-    CHECK(trace_meta_contains(trace_directory, "psp-http-trace=12\n")
+    CHECK(trace_meta_contains(trace_directory, "psp-http-trace=13\n")
           && trace_meta_contains(trace_directory, logical_line)
           && trace_meta_contains(
                  trace_directory,
@@ -468,7 +589,7 @@ static bool test_trace_logical_url_and_referrer_metadata(
           && fetch_redirect(budget, legacy_url, &request, &result));
     fetch_result_destroy(&result);
     fetch_trace_end();
-    CHECK(trace_downgrade_record_v12_to_v8(trace_directory, 0));
+    CHECK(trace_downgrade_record_v13_to_v8(trace_directory, 0));
     result = (FetchResult) {.budget = budget};
     CHECK(fetch_trace_replay_begin(trace_directory, error, sizeof(error))
           && fetch_redirect(budget, legacy_url, &request, &result)
@@ -506,7 +627,7 @@ static bool test_trace_logical_url_and_referrer_metadata(
     fetch_result_destroy(&result);
     fetch_trace_end();
     CHECK(trace_rewrite_record_version(
-        trace_directory, 0, "12", "9"));
+        trace_directory, 0, "13", "9"));
     result = (FetchResult) {.budget = budget};
     CHECK(fetch_trace_replay_begin(trace_directory, error, sizeof(error))
           && fetch_redirect(budget, legacy_url, typed_request, &result)
@@ -1007,7 +1128,7 @@ static bool test_response_cookie_trace_capacity(
        v3 compatibility path, then create a duplicate index and missing slot
        which the old v6-only completeness check allowed through. */
     CHECK(trace_rewrite_record_version(
-        trace_directory, 0, "12", "3"));
+        trace_directory, 0, "13", "3"));
     FetchResult legacy = {.budget = budget};
     CHECK(fetch_trace_replay_begin(
         trace_directory, error, sizeof(error)));
@@ -1036,7 +1157,7 @@ static bool test_response_cookie_trace_capacity(
           && legacy.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY);
     fetch_result_destroy(&legacy);
     CHECK(trace_rewrite_record_version(
-        trace_directory, 0, "3", "12"));
+        trace_directory, 0, "3", "13"));
 
     snprintf(url, sizeof(url),
              "http://127.0.0.1:%u/response-cookie-overflow", port);
@@ -1166,6 +1287,10 @@ static bool test_redirect_trace_roundtrip(Budget *budget, unsigned port,
     fetch_trace_end();
     fetch_result_destroy(&captured);
 
+    /* Trace metadata is keyed rather than positional. Keep cache-mode
+       admission independent of the version field's physical line order. */
+    CHECK(trace_move_record_version_to_end(trace_directory, 0));
+
     FetchResult replayed = {.budget = budget};
     CHECK(fetch_trace_replay_begin(trace_directory, error, sizeof(error))
           && fetch_redirect(budget, url, &request, &replayed)
@@ -1190,6 +1315,11 @@ static bool test_redirect_trace_roundtrip(Budget *budget, unsigned port,
     CHECK(strlen(mismatch.extra_headers) == strlen(request.extra_headers)
           && trace_replay_rejects(
               budget, trace_directory, url, &mismatch));
+
+    mismatch = request;
+    mismatch.cache_mode = FETCH_CACHE_NO_STORE;
+    CHECK(trace_replay_rejects(
+        budget, trace_directory, url, &mismatch));
 
     /* allow_http_errors is client-side error-tolerance policy, never
        serialized onto the wire, so flipping it must NOT strand the

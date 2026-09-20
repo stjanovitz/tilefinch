@@ -57,6 +57,8 @@ BOOTSTRAP_SOURCE(browser_bootstrap_frames, "frames.js",
                  "<browser-frames>", browser_bootstrap_frames_bytecode)
 BOOTSTRAP_SOURCE(browser_bootstrap_intl, "intl.js",
                  "<browser-intl>", browser_bootstrap_intl_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_opfs, "opfs.js",
+                 "<browser-opfs>", browser_bootstrap_opfs_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,

@@ -1252,6 +1252,8 @@ static size_t receive_header(char *data, size_t size, size_t count,
     if (colon == NULL) {
         if (length >= 5 && strncasecmp(data, "HTTP/", 5) == 0) {
             reset_response_metadata(context->result);
+            context->result->negotiated_http_version =
+                fetch_http_version_from_status_line(data, length);
             /* The negotiated protocol version is readable only while this
                transfer still owns its connection, so sample it here rather
                than from the completed handle. */

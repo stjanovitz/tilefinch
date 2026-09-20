@@ -98,8 +98,10 @@ JSValue js_dom_parse_color(JSContext *context,
 /* Browser-authored, non-page-controlled constructor facade installed into a
    fresh DedicatedWorkerGlobalScope before it is published. Keep it bounded
    independently of author script admission; the facade includes the local
-   XHR/FileReader/WebSocket/Worker compatibility surface. */
-#define SCRIPT_WORKER_REALM_INITIALIZER_MAX_BYTES 16384u
+   XHR/FileReader/WebSocket/Worker and realm-owned encoding compatibility
+   surfaces. The source is already resident in the lazy bootstrap; this cap
+   bounds only its temporary handoff into the fresh realm. */
+#define SCRIPT_WORKER_REALM_INITIALIZER_MAX_BYTES (32u * 1024u)
 #define SCRIPT_LAZY_RESIDENT_BUNDLE_LIMIT 64u
 #define SCRIPT_LAZY_COMPILE_HEAP_MULTIPLIER 4u
 #define SCRIPT_LAZY_COMPILE_FIXED_HEAP_BYTES (256u * 1024u)
@@ -118,7 +120,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
 #define SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES (128u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 10u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 11u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -168,6 +170,7 @@ typedef struct {
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
     TilefinchRequestDestination destination;
+    bool prefer_text_response;
     char *integrity;
     size_t integrity_length;
     char target_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
@@ -334,6 +337,7 @@ typedef struct DomBridge {
     size_t console_messages;
     bool navigation_requested;
     bool navigation_replace;
+    bool navigation_user_activated;
     char navigation_url[2048];
     bool media_requested;
     bool media_audio_only;
@@ -345,6 +349,8 @@ typedef struct DomBridge {
     char *media_source;
     int64_t fullscreen_node_handle;
     bool user_activation_active;
+    bool user_activation_has_been_active;
+    uint64_t user_activation_expires_ms;
     bool scroll_requested;
     int scroll_y;
     ScriptRemoteElementLookupCallback remote_element_lookup;
@@ -567,6 +573,10 @@ struct ScriptRuntime {
     /* Captured before author code and removed from the global object. Used
        when native lifecycle observes that the fullscreen element detached. */
     JSValue fullscreen_host_exit;
+    /* Captured before author code can replace Window.navigator. The lazy
+       OPFS module receives this identity through a temporary native-only
+       handoff so StorageManager branding never consults a mutable global. */
+    JSValue opfs_storage_manager;
     /* Installed by the lazy game-audio module, captured immediately, and
        removed before evaluation returns to author code. */
     JSValue game_audio_host_suspend;
@@ -658,6 +668,43 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime);
 void js_rt_runtime_update_result(ScriptRuntime *runtime,
                                  ScriptResult *result);
 uint64_t js_rt_monotonic_time_ns(void);
+/* HTML deliberately leaves the transient-activation duration to the user
+   agent. Five seconds matches the interoperability window used by major
+   engines while keeping privileged actions tightly bounded on the PSP. */
+#define SCRIPT_TRANSIENT_USER_ACTIVATION_MS UINT64_C(5000)
+static inline uint64_t js_rt_bridge_elapsed_ms(const DomBridge *bridge)
+{
+    if (bridge == NULL) return 0;
+    if (bridge->deterministic_clock) return bridge->clock_host_elapsed_ms;
+    uint64_t now_ns = js_rt_monotonic_time_ns();
+    return now_ns > bridge->performance_origin_ns
+        ? (now_ns - bridge->performance_origin_ns) / UINT64_C(1000000)
+        : 0;
+}
+static inline void js_rt_bridge_notify_user_activation(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    uint64_t now_ms = js_rt_bridge_elapsed_ms(bridge);
+    bridge->user_activation_active = true;
+    bridge->user_activation_has_been_active = true;
+    bridge->user_activation_expires_ms =
+        now_ms > UINT64_MAX - SCRIPT_TRANSIENT_USER_ACTIVATION_MS
+        ? UINT64_MAX : now_ms + SCRIPT_TRANSIENT_USER_ACTIVATION_MS;
+}
+static inline bool js_rt_bridge_user_activation_is_active(DomBridge *bridge)
+{
+    if (bridge == NULL || !bridge->user_activation_active) return false;
+    if (js_rt_bridge_elapsed_ms(bridge)
+        < bridge->user_activation_expires_ms) return true;
+    bridge->user_activation_active = false;
+    return false;
+}
+static inline void js_rt_bridge_consume_user_activation(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    bridge->user_activation_active = false;
+    bridge->user_activation_expires_ms = 0;
+}
 void js_rt_saturating_add_size(size_t *value, size_t amount);
 void js_rt_trace_script_quota_rejection(DomBridge *bridge,
                                         const char *reason);
@@ -756,8 +803,10 @@ bool js_rt_multiplayer_deliver(ScriptRuntime *runtime,
                                size_t *author_tasks);
 void js_rt_record_network_response(ScriptResult *result,
                                    const FetchResult *fetched);
-void js_rt_script_set_response_body(JSContext *context, JSValue response,
-                                    const FetchResult *fetched);
+bool js_rt_utf8_valid(const uint8_t *bytes, size_t length);
+bool js_rt_script_set_response_body(JSContext *context, JSValue response,
+                                    const FetchResult *fetched,
+                                    bool prefer_text);
 void js_rt_script_store_response_cookies(
     DomBridge *bridge, const FetchResult *fetched, const char *fallback_url,
     TilefinchRequestMode mode, TilefinchCredentialsMode credentials,

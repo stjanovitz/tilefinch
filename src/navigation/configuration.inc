@@ -412,7 +412,10 @@ static bool page_capability_trace_setup(NavigationSession *session)
         "const trace=(target,label,depth=0)=>{if(target===null||(typeof target!=='object'&&typeof target!=='function'))return target;if(rawByProxy.has(target))return target;if(typeof target.nodeType==='number'||ArrayBuffer.isView(target)||target instanceof ArrayBuffer)return target;if(traced.has(target))return traced.get(target);const raw=value=>rawByProxy.get(value)||value,rawArgs=args=>args.map(raw),proxy=new Proxy(target,{has(object,key){const present=Reflect.has(object,key);if(typeof key!=='symbol'){const name=label+'.'+String(key);record('has:'+name);if(!present)missing.add(name);}return present;},get(object,key){let name=label;if(typeof key!=='symbol'){name=label+'.'+String(key);record('get:'+name);if(!(key in object))missing.add(name);}const descriptor=Reflect.getOwnPropertyDescriptor(object,key);if(descriptor&&Object.prototype.hasOwnProperty.call(descriptor,'value')&&!descriptor.configurable&&!descriptor.writable){shape(name,descriptor.value);return descriptor.value;}const value=Reflect.get(object,key,object);shape(name,value);if(name==='call:new:PerformanceObserver.observe.options.entryTypes'&&Array.isArray(value))state.observerEntryTypes=value.slice(0,8).map(item=>String(item).slice(0,48));return depth===0&&typeof value!=='function'?value:trace(value,name,Math.max(0,depth-1));},set(object,key,value,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';record('set:'+name);if(!(key in object))missing.add(name);}return Reflect.set(object,key,raw(value),raw(receiver));},apply(target,thisArg,args){const name='call:'+label;record(name);const unwrapped=rawArgs(args),callArgs=name==='call:new:PerformanceObserver.observe'&&unwrapped.length!==0?[trace(unwrapped[0],name+'.options',1),...unwrapped.slice(1)]:unwrapped,value=Reflect.apply(target,raw(thisArg),callArgs);shape(name,value);return value;},construct(target,args,newTarget){const name='new:'+label;record(name);const value=Reflect.construct(target,rawArgs(args),raw(newTarget));shape(name,value);return value;}});traced.set(target,proxy);rawByProxy.set(proxy,target);return proxy;};"
         "const install=(name,depth=2)=>{const value=globalThis[name];if(!value)return;const wrapped=trace(value,name,depth),descriptor=Object.getOwnPropertyDescriptor(globalThis,name);if(descriptor&&descriptor.configurable)Object.defineProperty(globalThis,name,{configurable:true,enumerable:descriptor.enumerable,writable:true,value:wrapped});else globalThis[name]=wrapped;};globalThis.__tilefinchTraceValue=trace;globalThis.__tilefinchGlobalProxy=trace(globalThis,'global',2);"
         "const rawDocument=globalThis.document;"
-        "for(const name of ['navigator','performance','crypto','screen','history','Intl','trustedTypes'])install(name);"
+        /* Navigator methods enforce Web IDL receiver identity. Replacing the
+           singleton with a diagnostic Proxy changes that identity and can
+           turn the trace itself into a compatibility failure. */
+        "for(const name of ['performance','crypto','screen','history','Intl','trustedTypes'])install(name);"
         "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','ReadableStream','MutationObserver','RTCPeerConnection','RTCSessionDescription','RTCIceCandidate','RTCDataChannel','GPU','TrustedHTML','TrustedScript','TrustedScriptURL','TrustedTypePolicy','TrustedTypePolicyFactory'])if(typeof globalThis[name]==='function')install(name);"
         "const xhrGet=XMLHttpRequest.prototype.getResponseHeader;XMLHttpRequest.prototype.getResponseHeader=function(name){const value=xhrGet.call(this,name);globalThis.__tilefinchXHRLastHeaderRead=String(name)+'='+String(value);return value;};})();";
     if (!script_runtime_evaluate_diagnostic(
@@ -573,6 +576,9 @@ typedef struct {
     DocumentParser *parser;
     uint64_t started_us;
     uint64_t response_headers_elapsed_us;
+    uint16_t response_status;
+    char next_hop_protocol[16];
+    char response_content_type[256];
     uint64_t parse_us;
     char document_url[NAVIGATION_URL_LIMIT];
     char resource_base_url[NAVIGATION_URL_LIMIT];

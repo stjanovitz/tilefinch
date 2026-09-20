@@ -96,6 +96,22 @@ bool tilefinch_request_context_analyze(
     facts->same_origin = !context->initiator_opaque
         && context->initiator_url != NULL
         && parsed_same_origin(&initiator, &target);
+    bool initiator_same_site = false;
+    if (!context->initiator_opaque && context->initiator_url != NULL) {
+        char initiator_site[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+        char target_site[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+        initiator_same_site = tilefinch_url_site_key(
+                                  context->initiator_url, initiator_site,
+                                  sizeof(initiator_site))
+            && tilefinch_url_site_key(
+                   context->target_url, target_site, sizeof(target_site))
+            && strcmp(initiator_site, target_site) == 0;
+    }
+    /* Cookie same-site policy is keyed by the top-level site. Fetch
+       Metadata instead describes the relationship between the request's
+       initiator and target. Keep those authorities distinct: a third-party
+       frame fetching a sibling origin is cross-site for cookie policy but
+       emits Sec-Fetch-Site: same-site. */
     if (!context->initiator_opaque && top_url != NULL) {
         char top_site[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
         char target_site[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
@@ -114,8 +130,8 @@ bool tilefinch_request_context_analyze(
     facts->site = context->initiator_url == NULL
         ? TILEFINCH_REQUEST_SITE_NONE
         : (facts->same_origin ? TILEFINCH_REQUEST_SITE_SAME_ORIGIN
-           : facts->same_site ? TILEFINCH_REQUEST_SITE_SAME_SITE
-                              : TILEFINCH_REQUEST_SITE_CROSS_SITE);
+           : initiator_same_site ? TILEFINCH_REQUEST_SITE_SAME_SITE
+                                 : TILEFINCH_REQUEST_SITE_CROSS_SITE);
     return true;
 }
 

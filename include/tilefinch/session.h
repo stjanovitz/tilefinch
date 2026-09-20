@@ -10,6 +10,10 @@
 #include "tilefinch/request_context.h"
 
 #define BROWSER_STORAGE_ENTRIES 64
+#define BROWSER_OPFS_ENTRIES 32
+#define BROWSER_OPFS_PATH_LIMIT 256
+#define BROWSER_OPFS_FILE_BYTE_LIMIT (64u * 1024u)
+#define BROWSER_OPFS_TOTAL_BYTE_LIMIT (256u * 1024u)
 #define BROWSER_COOKIE_ENTRIES 32
 #define BROWSER_COOKIE_PER_DOMAIN_LIMIT 8
 #define BROWSER_COOKIE_LONG_PATH_LIMIT 2048
@@ -54,6 +58,34 @@ typedef struct {
     size_t value_length;
     bool local;
 } BrowserStorageEntry;
+
+typedef enum {
+    BROWSER_OPFS_NONE = 0,
+    BROWSER_OPFS_FILE = 1,
+    BROWSER_OPFS_DIRECTORY = 2
+} BrowserOpfsKind;
+
+struct BrowserOpfsStore;
+
+typedef enum {
+    BROWSER_OPFS_OK = 0,
+    BROWSER_OPFS_UNAVAILABLE,
+    BROWSER_OPFS_NOT_FOUND,
+    BROWSER_OPFS_TYPE_MISMATCH,
+    BROWSER_OPFS_ALREADY_EXISTS,
+    BROWSER_OPFS_NOT_EMPTY,
+    BROWSER_OPFS_QUOTA_EXCEEDED,
+    BROWSER_OPFS_INVALID_PATH,
+    BROWSER_OPFS_STALE
+} BrowserOpfsResult;
+
+typedef struct {
+    BrowserOpfsKind kind;
+    const unsigned char *data;
+    size_t data_length;
+    int64_t last_modified_ms;
+    uint64_t generation;
+} BrowserOpfsView;
 
 typedef struct {
     char domain[BROWSER_ORIGIN_LIMIT];
@@ -308,6 +340,9 @@ typedef struct BrowserSession {
     /* Non-owning engine-lifetime request policy. */
     struct ContentBlocker *content_blocker;
     BrowserStorageEntry storage[BROWSER_STORAGE_ENTRIES];
+    /* Allocated only on the first mutating OPFS operation. Ordinary pages
+       pay one pointer, not the bounded file table. */
+    struct BrowserOpfsStore *opfs;
     BrowserCookieEntry cookies[BROWSER_COOKIE_ENTRIES];
     BrowserCacheEntry cache[BROWSER_CACHE_ENTRIES];
     BrowserSiteAdapterState site_adapter_state;
@@ -315,10 +350,13 @@ typedef struct BrowserSession {
         BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES];
     BrowserClientHintEntry client_hints[BROWSER_CLIENT_HINT_ORIGIN_LIMIT];
     size_t storage_bytes;
+    size_t opfs_bytes;
+    uint64_t opfs_generation_clock;
     size_t cookie_bytes;
     size_t cookie_long_path_bytes;
     size_t cache_bytes;
     size_t maximum_storage_bytes;
+    size_t maximum_opfs_bytes;
     size_t maximum_cookie_bytes;
     size_t maximum_cookie_long_path_bytes;
     size_t maximum_cache_bytes;
@@ -459,6 +497,8 @@ typedef struct {
     size_t session_storage_count;
     size_t cookie_bytes;
     size_t storage_bytes;
+    size_t opfs_entry_count;
+    size_t opfs_bytes;
 } BrowserSiteDataUsage;
 /* Summarizes and clears only the origin/domain represented by url.  These
    operations remain available when ordinary site-data admission is disabled,
@@ -482,6 +522,25 @@ void browser_session_storage_clear(BrowserSession *session, const char *url,
    sessionStorage; persistent storage code deliberately never calls that
    form. */
 void browser_session_storage_clear_all(BrowserSession *session, bool local);
+/* A bounded, RAM-backed origin-private file system. Paths are canonical,
+   absolute OPFS paths (root is "/"); the native layer derives the origin
+   from url and never accepts page-supplied authority. */
+BrowserOpfsResult browser_session_opfs_stat(
+    const BrowserSession *session, const char *url, const char *path,
+    BrowserOpfsView *view);
+BrowserOpfsResult browser_session_opfs_create(
+    BrowserSession *session, const char *url, const char *path,
+    BrowserOpfsKind kind);
+BrowserOpfsResult browser_session_opfs_write(
+    BrowserSession *session, const char *url, const char *path,
+    const unsigned char *data, size_t data_length);
+BrowserOpfsResult browser_session_opfs_remove(
+    BrowserSession *session, const char *url, const char *path,
+    bool recursive);
+BrowserOpfsResult browser_session_opfs_child(
+    const BrowserSession *session, const char *url, const char *parent,
+    size_t index, const char **name, BrowserOpfsView *view);
+void browser_session_opfs_clear_all(BrowserSession *session);
 bool browser_session_cookie_get(const BrowserSession *session,
                                 const char *url, char *output,
                                 size_t output_capacity);

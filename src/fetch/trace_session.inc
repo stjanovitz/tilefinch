@@ -56,6 +56,7 @@ static void trace_capture_invalidate(const char *reason, size_t sequence)
             sequence, reason == NULL ? "capture failed" : reason);
     /* fetch_trace_end() normally finalizes a capture. This path has already
        revoked authority and must not attempt to publish it again. */
+    trace_cookie_provenance_clear();
     memset(&fetch_trace, 0, sizeof(fetch_trace));
 }
 
@@ -747,6 +748,7 @@ void fetch_trace_end(void)
         fprintf(stderr,
                 "HTTP trace finalization failed; replay authority removed\n");
     }
+    trace_cookie_provenance_clear();
     free(fetch_trace.replay_route_index);
     memset(&fetch_trace, 0, sizeof(fetch_trace));
 }

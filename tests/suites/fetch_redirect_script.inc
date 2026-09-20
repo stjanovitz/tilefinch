@@ -121,9 +121,11 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
         "fetch('/final',{cache:'only-if-cached',mode:'same-origin'}).then("
         "r=>checks.push(r.status===504,r.type==='basic',r.body===null)),"
         "fetch('/final?cache=no-store',{cache:'no-store'}).then(r=>r.text())."
-        "then(t=>checks.push(t.includes('cache-control=no-store'))),"
+        "then(t=>checks.push(t.includes('cache-control=no-cache')&&"
+        "t.includes('pragma=no-cache'))),"
         "fetch('/final?cache=no-cache',{cache:'no-cache'}).then(r=>r.text())."
-        "then(t=>checks.push(t.includes('cache-control=no-cache'))),"
+        "then(t=>checks.push(t.includes('cache-control=max-age=0')&&"
+        "t.includes('pragma=<none>'))),"
         "fetch('/final?cache=reload',{cache:'reload'}).then(r=>r.text())."
         "then(t=>checks.push(t.includes('cache-control=no-cache')&&"
         "t.includes('pragma=no-cache'))),"
@@ -494,6 +496,41 @@ static bool test_javascript_cors(Budget *budget, unsigned document_port,
     CHECK(browser_session_cookie_header(
               &session, cookie_url, cookies, sizeof(cookies))
           && strcmp(cookies, "cross=secret") == 0);
+
+    snprintf(target, sizeof(target),
+             "http://127.0.0.1:%u/cors-simple", target_port);
+    written = snprintf(
+        source, sizeof(source),
+        "globalThis.pocSummary='pending';Promise.all(["
+        "fetch('%s?cache=no-store',{cache:'no-store'}).then(r=>r.text()),"
+        "fetch('%s?cache=no-cache',{cache:'no-cache'}).then(r=>r.text()),"
+        "fetch('%s?cache=reload',{cache:'reload'}).then(r=>r.text())"
+        "]).then(v=>globalThis.pocSummary='cache:'+v.join('|'))"
+        ".catch(error=>globalThis.pocSummary='blocked:'+error)",
+        target, target, target);
+    CHECK(written > 0 && (size_t) written < sizeof(source)
+          && script_runtime_evaluate_diagnostic(
+                 runtime, source, "<cors-cache-mode>", &result)
+          && pump_script_network(runtime, &result)
+          && strstr(result.summary, "cache:cors-method=GET") != NULL
+          && strstr(result.summary,
+                    "cache-control=no-cache;pragma=no-cache") != NULL
+          && strstr(result.summary,
+                    "cache-control=max-age=0;pragma=<none>") != NULL);
+
+    written = snprintf(
+        source, sizeof(source),
+        "globalThis.pocSummary='pending';"
+        "fetch('%s?cache=author',{cache:'no-store',"
+        "headers:{'Cache-Control':'no-cache'}})"
+        ".then(()=>globalThis.pocSummary='unexpected')"
+        ".catch(error=>globalThis.pocSummary='blocked:'+error)", target);
+    CHECK(written > 0 && (size_t) written < sizeof(source)
+          && script_runtime_evaluate_diagnostic(
+                 runtime, source, "<cors-author-cache-header>", &result)
+          && pump_script_network(runtime, &result)
+          && strstr(result.summary, "blocked:TypeError:") != NULL
+          && strstr(result.summary, "unexpected") == NULL);
 
     written = snprintf(
         source, sizeof(source),
@@ -962,7 +999,7 @@ static bool test_redirect_cors_trace_taint(
        replayed for CORS-mode requests: a same-origin final URL does not prove
        that the redirect chain stayed same-origin. */
     CHECK(trace_rewrite_record_version(
-              trace_directory, 0, "12", "7")
+              trace_directory, 0, "13", "7")
           && replace_trace_byte(
               meta_path, "redirect-origin-tainted", 'x')
           && trace_replay_rejects(
@@ -970,7 +1007,7 @@ static bool test_redirect_cors_trace_taint(
           && replace_trace_byte(
               meta_path, "xedirect-origin-tainted", 'r')
           && trace_rewrite_record_version(
-              trace_directory, 0, "7", "12"));
+              trace_directory, 0, "7", "13"));
 
     /* Corpus startup now validates the complete finalized record inventory,
        including every body, before serving requests.  With that stronger
