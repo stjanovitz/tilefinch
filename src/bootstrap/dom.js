@@ -1015,11 +1015,14 @@
     shadowRootByHostHandle.delete(Number(handle));
   });
   let shadowRootCreated = false;
-  const shadowRootForHost = (host) =>
-    shadowRootByHost.get(host) ||
-    (host?.__handle !== undefined
-      ? shadowRootByHostHandle.get(Number(host.__handle)) || null
-      : null);
+  const shadowRootForHost = (host) => {
+    if (typeof host === "number")
+      return shadowRootByHostHandle.get(Number(host)) || null;
+    return shadowRootByHost.get(host) ||
+      (host?.__handle !== undefined
+        ? shadowRootByHostHandle.get(Number(host.__handle)) || null
+        : null);
+  };
   class ShadowRoot extends DocumentFragment {
     constructor(token) {
       super();

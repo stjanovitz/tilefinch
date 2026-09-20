@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.25 — 2026-09-19
+
+- Fixed dynamic styling and motion handling on large pages.
+- Improved Worker and origin-private storage performance and memory use.
+
 ## 0.1.24 — 2026-09-19
 
 - Improved compatibility for Workers, embedded frames, Web Crypto, storage,

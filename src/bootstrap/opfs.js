@@ -23,6 +23,13 @@
     token = {}, handleStates = createPrivateWeakMap(),
     writerStates = createPrivateWeakMap(), syncStates = createPrivateWeakMap(),
     activeWriterPaths = [];
+  let bufferGrowths = 0,
+    bufferCopiedBytes = 0;
+  if (globalThis.__tilefinchRootCensus)
+    Object.defineProperties(globalThis.__tilefinchRootCensus, {
+      opfsBufferGrowths: { get: () => bufferGrowths },
+      opfsBufferCopiedBytes: { get: () => bufferCopiedBytes },
+    });
 
   const task = (operation) => new TrustedPromise((resolve, reject) => {
     const id = scheduleTask(() => {
@@ -87,16 +94,33 @@
         value.buffer, value.byteOffset, value.byteLength);
       throw new TypeError("Expected an ArrayBuffer or view");
     },
+    ensureCapacity = (state, length) => {
+      if (length <= state.bytes.byteLength) return;
+      let capacity = Math.max(64, state.bytes.byteLength);
+      while (capacity < length) {
+        const doubled = capacity * 2;
+        capacity = doubled > FILE_LIMIT ? FILE_LIMIT : doubled;
+      }
+      const next = new Uint8Array(capacity);
+      next.set(state.bytes.subarray(0, state.length));
+      bufferGrowths++;
+      bufferCopiedBytes += state.length;
+      state.bytes = next;
+    },
     resize = (state, length) => {
       length = Math.trunc(Number(length));
       if (!Number.isFinite(length) || length < 0)
         throw new TypeError("Invalid file size");
       if (length > FILE_LIMIT)
         throw new DOMException("File exceeds bounded size", "QuotaExceededError");
-      if (length === state.bytes.byteLength) return;
-      const next = new Uint8Array(length);
-      next.set(state.bytes.subarray(0, Math.min(length, state.bytes.byteLength)));
-      state.bytes = next;
+      if (length === state.length) return;
+      const before = state.length;
+      ensureCapacity(state, length);
+      /* A shrink followed by growth must expose zero-filled bytes even though
+         capacity is retained for bounded amortized appends. */
+      if (length < before) state.bytes.fill(0, length, before);
+      else state.bytes.fill(0, before, length);
+      state.length = length;
       if (state.position > length) state.position = length;
     },
     releaseWriter = (state) => {
@@ -105,6 +129,7 @@
       const at = activeWriterPaths.indexOf(state.path);
       if (at >= 0) activeWriterPaths.splice(at, 1);
       state.bytes = new Uint8Array();
+      state.length = 0;
     },
     writerState = (stream) => {
       const state = writerStates.get(stream);
@@ -154,7 +179,7 @@
       const bytes = bytesFor(value), end = state.position + bytes.byteLength;
       if (end > FILE_LIMIT)
         throw new DOMException("File exceeds bounded size", "QuotaExceededError");
-      if (end > state.bytes.byteLength) resize(state, end);
+      if (end > state.length) resize(state, end);
       state.bytes.set(bytes, state.position);
       state.position = end;
     };
@@ -358,7 +383,8 @@
             const state = writerState(stream);
             try {
               checked(command(
-                OP_WRITE, state.path, state.bytes, state.generation));
+                OP_WRITE, state.path,
+                state.bytes.subarray(0, state.length), state.generation));
             } finally { releaseWriter(state); }
           });
         },
@@ -368,7 +394,8 @@
       });
       stream = this;
       writerStates.set(this, {
-        path, bytes, generation, position: 0, closed: false,
+        path, bytes, length: bytes.byteLength,
+        generation, position: 0, closed: false,
       });
     }
     write(value) {
@@ -391,17 +418,18 @@
     constructor(value, path, bytes, generation) {
       if (value !== token) throw new TypeError("Illegal constructor");
       syncStates.set(this, {
-        path, bytes, generation, position: 0, closed: false, dirty: false,
+        path, bytes, length: bytes.byteLength,
+        generation, position: 0, closed: false, dirty: false,
       });
     }
     read(buffer, options = {}) {
       const state = syncState(this), target = mutableBytesFor(buffer),
         at = syncOffset(state, options);
-      if (at >= state.bytes.byteLength || target.byteLength === 0) {
-        state.position = Math.min(at, state.bytes.byteLength);
+      if (at >= state.length || target.byteLength === 0) {
+        state.position = Math.min(at, state.length);
         return 0;
       }
-      const count = Math.min(target.byteLength, state.bytes.byteLength - at);
+      const count = Math.min(target.byteLength, state.length - at);
       target.set(state.bytes.subarray(at, at + count));
       state.position = at + count;
       return count;
@@ -411,24 +439,25 @@
         at = syncOffset(state, options), end = at + bytes.byteLength;
       if (!Number.isSafeInteger(end) || end > FILE_LIMIT)
         throw new DOMException("File exceeds bounded size", "QuotaExceededError");
-      if (end > state.bytes.byteLength) resize(state, end);
+      if (end > state.length) resize(state, end);
       state.bytes.set(bytes, at);
       state.position = end;
       state.dirty = state.dirty || bytes.byteLength > 0;
       return bytes.byteLength;
     }
     truncate(size) {
-      const state = syncState(this), before = state.bytes.byteLength;
+      const state = syncState(this), before = state.length;
       resize(state, size);
-      state.position = Math.min(state.position, state.bytes.byteLength);
-      state.dirty = state.dirty || state.bytes.byteLength !== before;
+      state.position = Math.min(state.position, state.length);
+      state.dirty = state.dirty || state.length !== before;
     }
-    getSize() { return syncState(this).bytes.byteLength; }
+    getSize() { return syncState(this).length; }
     flush() {
       const state = syncState(this);
       if (!state.dirty) return;
       const result = checked(command(
-        OP_WRITE, state.path, state.bytes, state.generation));
+        OP_WRITE, state.path,
+        state.bytes.subarray(0, state.length), state.generation));
       const generation = Number(result[1]);
       if (!Number.isSafeInteger(generation) || generation <= 0)
         throw new DOMException(

@@ -2127,6 +2127,275 @@
                     "MOTION-NEGATIVE-CACHED") == 0);
     script_runtime_destroy(motion_free_runtime);
 
+    puts("test: motion discovery does not wrap unrelated native nodes");
+    size_t motion_wrapper_page_capacity = 40u * 1024u;
+    char *motion_wrapper_page = malloc(motion_wrapper_page_capacity);
+    CHECK(motion_wrapper_page != NULL);
+    size_t motion_wrapper_page_length = 0;
+    if (motion_wrapper_page != NULL) {
+        int written = snprintf(
+            motion_wrapper_page, motion_wrapper_page_capacity,
+            "<!doctype html><html><head><style>"
+            "@keyframes absent{from{opacity:.1}to{opacity:.2}}"
+            ".motion-target{animation:absent 1s linear}"
+            "</style></head><body>");
+        CHECK(written > 0 && (size_t) written < motion_wrapper_page_capacity);
+        motion_wrapper_page_length = written > 0 ? (size_t) written : 0;
+        for (size_t node = 0; node < 384u; node++) {
+            static const char ordinary[] = "<div></div>";
+            CHECK(motion_wrapper_page_length + sizeof(ordinary)
+                  < motion_wrapper_page_capacity);
+            memcpy(motion_wrapper_page + motion_wrapper_page_length,
+                   ordinary, sizeof(ordinary) - 1u);
+            motion_wrapper_page_length += sizeof(ordinary) - 1u;
+        }
+        for (size_t node = 0; node < 128u; node++) {
+            static const char styled[] = "<div style='color:red'></div>";
+            CHECK(motion_wrapper_page_length + sizeof(styled)
+                  < motion_wrapper_page_capacity);
+            memcpy(motion_wrapper_page + motion_wrapper_page_length,
+                   styled, sizeof(styled) - 1u);
+            motion_wrapper_page_length += sizeof(styled) - 1u;
+        }
+        static const char close_page[] = "</body></html>";
+        memcpy(motion_wrapper_page + motion_wrapper_page_length,
+               close_page, sizeof(close_page));
+        motion_wrapper_page_length += sizeof(close_page) - 1u;
+    }
+    PocDocument motion_wrapper_document = {0};
+    CHECK(motion_wrapper_page != NULL
+          && document_parse(
+              &motion_wrapper_document, &budget, motion_wrapper_page,
+              motion_wrapper_page_length, 37));
+    ScriptResult motion_wrapper_result = {0};
+    ScriptRuntime *motion_wrapper_runtime = script_runtime_create_configured(
+        &motion_wrapper_document, &budget, 4u * MIB, 1000,
+        "https://motion-wrapper.test/", &deterministic_tick_options,
+        &motion_wrapper_result);
+    bool motion_wrapper_started = motion_wrapper_runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+            motion_wrapper_runtime,
+            "document.body.className='motion-scan-trigger';"
+            "pocSummary='pending'",
+            "<motion-wrapper-start>", &motion_wrapper_result)
+        && script_runtime_advance(
+            motion_wrapper_runtime, 16, 16, &motion_wrapper_result);
+    if (!motion_wrapper_started) {
+        fprintf(stderr, "motion wrapper setup summary=%s error=%s\n",
+                motion_wrapper_result.summary, motion_wrapper_result.error);
+    }
+    CHECK(motion_wrapper_started);
+    if (motion_wrapper_result.root_node_wrappers > 16u) {
+        fprintf(stderr, "motion discovery retained %zu unrelated wrappers\n",
+                motion_wrapper_result.root_node_wrappers);
+    }
+    CHECK(motion_wrapper_result.root_node_wrappers <= 16u);
+    script_runtime_destroy(motion_wrapper_runtime);
+    document_destroy(&motion_wrapper_document);
+    free(motion_wrapper_page);
+
+    puts("test: motion candidate ceiling still applies later CSS overrides");
+    size_t motion_override_capacity = 32u * 1024u;
+    char *motion_override_page = malloc(motion_override_capacity);
+    CHECK(motion_override_page != NULL);
+    size_t motion_override_length = 0;
+    if (motion_override_page != NULL) {
+        int written = snprintf(
+            motion_override_page, motion_override_capacity,
+            "<!doctype html><html><head><style>"
+            "@keyframes base{from{opacity:.1}to{opacity:.2}}"
+            "@keyframes override{from{opacity:.3}to{opacity:.4}}"
+            "@keyframes below{from{opacity:.5}to{opacity:.6}}"
+            ".all{animation:base 1s linear}"
+            "#last{animation:override 1s linear}"
+            "#last2{animation:below 1s linear}"
+            "</style></head><body>");
+        CHECK(written > 0 && (size_t) written < motion_override_capacity);
+        motion_override_length = written > 0 ? (size_t) written : 0;
+        for (size_t node = 0; node < 128u; node++) {
+            char element[96];
+            int element_length = snprintf(
+                element, sizeof(element),
+                node == 127u ? "<div class=all id=last></div>"
+                             : "<div class=all></div>");
+            CHECK(element_length > 0
+                  && motion_override_length + (size_t) element_length
+                         < motion_override_capacity);
+            memcpy(motion_override_page + motion_override_length,
+                   element, (size_t) element_length);
+            motion_override_length += (size_t) element_length;
+        }
+        static const char close_page[] = "</body></html>";
+        memcpy(motion_override_page + motion_override_length,
+               close_page, sizeof(close_page));
+        motion_override_length += sizeof(close_page) - 1u;
+    }
+    PocDocument motion_override_document = {0};
+    CHECK(motion_override_page != NULL
+          && document_parse(
+              &motion_override_document, &budget, motion_override_page,
+              motion_override_length, 37));
+    ScriptResult motion_override_result = {0};
+    ScriptRuntime *motion_override_runtime = script_runtime_create_configured(
+        &motion_override_document, &budget, 5u * MIB, 1000,
+        "https://motion-override.test/", &deterministic_tick_options,
+        &motion_override_result);
+    CHECK(motion_override_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              motion_override_runtime,
+              "document.body.className='motion-scan-trigger';"
+              "pocSummary='pending'",
+              "<motion-override-start>", &motion_override_result)
+          && script_runtime_advance(
+              motion_override_runtime, 16, 16, &motion_override_result)
+          && script_runtime_evaluate_diagnostic(
+              motion_override_runtime,
+              "pocSummary=Number(document.getElementById('last').style.opacity)"
+              "===0.4?'MOTION-OVERRIDE-OK':'MOTION-OVERRIDE-BAD:'+"
+              "document.getElementById('last').style.opacity",
+              "<motion-override-check>", &motion_override_result));
+    if (strcmp(motion_override_result.summary, "MOTION-OVERRIDE-OK") != 0) {
+        fprintf(stderr, "motion override summary=%s error=%s\n",
+                motion_override_result.summary, motion_override_result.error);
+    }
+    CHECK(strcmp(motion_override_result.summary, "MOTION-OVERRIDE-OK") == 0);
+    puts("test: motion CSS override remains correct below candidate ceiling");
+    bool motion_override_below_started = script_runtime_evaluate_diagnostic(
+              motion_override_runtime,
+              "const first=document.querySelector('.all');"
+              "first.parentNode.removeChild(first);"
+              "document.getElementById('last').style.removeProperty('opacity');"
+              "document.getElementById('last').id='last2';"
+              "document.body.className='motion-scan-below';"
+              "pocSummary='pending'",
+              "<motion-override-below-start>", &motion_override_result);
+    bool motion_override_below_advanced = motion_override_below_started
+          && script_runtime_advance(
+              motion_override_runtime, 32, 16, &motion_override_result)
+          && script_runtime_advance(
+              motion_override_runtime, 48, 16, &motion_override_result);
+    bool motion_override_below_checked = motion_override_below_advanced
+          && script_runtime_evaluate_diagnostic(
+              motion_override_runtime,
+              "pocSummary=Number(document.getElementById('last2').style.opacity)"
+              "===0.6?'MOTION-OVERRIDE-BELOW-OK':'MOTION-OVERRIDE-BELOW-BAD'",
+              "<motion-override-below-check>", &motion_override_result);
+    if (!motion_override_below_started || !motion_override_below_advanced
+        || !motion_override_below_checked
+        || strcmp(motion_override_result.summary,
+                  "MOTION-OVERRIDE-BELOW-OK") != 0) {
+        fprintf(stderr,
+                "motion below start=%d advance=%d check=%d summary=%s error=%s\n",
+                motion_override_below_started,
+                motion_override_below_advanced,
+                motion_override_below_checked,
+                motion_override_result.summary, motion_override_result.error);
+    }
+    CHECK(motion_override_below_started && motion_override_below_advanced
+          && motion_override_below_checked
+          && strcmp(motion_override_result.summary,
+                    "MOTION-OVERRIDE-BELOW-OK") == 0);
+    script_runtime_destroy(motion_override_runtime);
+    document_destroy(&motion_override_document);
+    free(motion_override_page);
+
+    puts("test: motion candidate ceiling still applies inline overrides");
+    char *motion_inline_override_page = malloc(motion_override_capacity);
+    CHECK(motion_inline_override_page != NULL);
+    size_t motion_inline_override_length = 0;
+    if (motion_inline_override_page != NULL) {
+        int written = snprintf(
+            motion_inline_override_page, motion_override_capacity,
+            "<!doctype html><html><head><style>"
+            "@keyframes base{from{opacity:.1}to{opacity:.2}}"
+            "@keyframes override{from{opacity:.3}to{opacity:.4}}"
+            "@keyframes below{from{opacity:.5}to{opacity:.6}}"
+            ".all{animation:base 1s linear}"
+            "</style></head><body>");
+        CHECK(written > 0 && (size_t) written < motion_override_capacity);
+        motion_inline_override_length = written > 0 ? (size_t) written : 0;
+        for (size_t node = 0; node < 128u; node++) {
+            char element[128];
+            int element_length = snprintf(
+                element, sizeof(element),
+                node == 127u
+                    ? "<div class=all id=last style='animation:override 1s linear'></div>"
+                    : "<div class=all></div>");
+            CHECK(element_length > 0
+                  && motion_inline_override_length + (size_t) element_length
+                         < motion_override_capacity);
+            memcpy(motion_inline_override_page + motion_inline_override_length,
+                   element, (size_t) element_length);
+            motion_inline_override_length += (size_t) element_length;
+        }
+        static const char close_page[] = "</body></html>";
+        memcpy(motion_inline_override_page + motion_inline_override_length,
+               close_page, sizeof(close_page));
+        motion_inline_override_length += sizeof(close_page) - 1u;
+    }
+    PocDocument motion_inline_override_document = {0};
+    CHECK(motion_inline_override_page != NULL
+          && document_parse(
+              &motion_inline_override_document, &budget,
+              motion_inline_override_page, motion_inline_override_length, 37));
+    ScriptResult motion_inline_override_result = {0};
+    ScriptRuntime *motion_inline_override_runtime =
+        script_runtime_create_configured(
+            &motion_inline_override_document, &budget, 5u * MIB, 1000,
+            "https://motion-inline-override.test/",
+            &deterministic_tick_options, &motion_inline_override_result);
+    CHECK(motion_inline_override_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              motion_inline_override_runtime,
+              "document.body.className='motion-scan-trigger';"
+              "pocSummary='pending'",
+              "<motion-inline-override-start>",
+              &motion_inline_override_result)
+          && script_runtime_advance(
+              motion_inline_override_runtime, 16, 16,
+              &motion_inline_override_result)
+          && script_runtime_evaluate_diagnostic(
+              motion_inline_override_runtime,
+              "pocSummary=Number(document.getElementById('last').style.opacity)"
+              "===0.4?'MOTION-INLINE-OVERRIDE-OK':"
+              "'MOTION-INLINE-OVERRIDE-BAD:'+document.getElementById('last')"
+              ".style.opacity",
+              "<motion-inline-override-check>",
+              &motion_inline_override_result));
+    if (strcmp(motion_inline_override_result.summary,
+               "MOTION-INLINE-OVERRIDE-OK") != 0) {
+        fprintf(stderr, "motion inline override summary=%s error=%s\n",
+                motion_inline_override_result.summary,
+                motion_inline_override_result.error);
+    }
+    CHECK(strcmp(motion_inline_override_result.summary,
+                 "MOTION-INLINE-OVERRIDE-OK") == 0);
+    puts("test: motion inline override remains correct below candidate ceiling");
+    CHECK(script_runtime_evaluate_diagnostic(
+              motion_inline_override_runtime,
+              "document.querySelector('.all').remove();"
+              "document.getElementById('last').style.removeProperty('opacity');"
+              "document.getElementById('last').style.animation='below 1s linear';"
+              "document.body.className='motion-inline-scan-below';"
+              "pocSummary='pending'",
+              "<motion-inline-override-below-start>",
+              &motion_inline_override_result)
+          && script_runtime_advance(
+              motion_inline_override_runtime, 32, 16,
+              &motion_inline_override_result)
+          && script_runtime_evaluate_diagnostic(
+              motion_inline_override_runtime,
+              "pocSummary=Number(document.getElementById('last').style.opacity)"
+              "===0.6?'MOTION-INLINE-OVERRIDE-BELOW-OK':"
+              "'MOTION-INLINE-OVERRIDE-BELOW-BAD'",
+              "<motion-inline-override-below-check>",
+              &motion_inline_override_result)
+          && strcmp(motion_inline_override_result.summary,
+                    "MOTION-INLINE-OVERRIDE-BELOW-OK") == 0);
+    script_runtime_destroy(motion_inline_override_runtime);
+    document_destroy(&motion_inline_override_document);
+    free(motion_inline_override_page);
+
     puts("test: reduced-motion mode resolves one static stylesheet state");
     ScriptResult stylesheet_animation_result;
     ScriptRuntimeOptions stylesheet_animation_options =
