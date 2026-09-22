@@ -15,6 +15,8 @@
 #     --url URL         start on an HTTPS page instead of native HOME
 #     --offline-library DIR
 #                       seed an exact offline/ directory into the isolated run
+#     --data-dir DIR    seed profile and site-data files into the run's data
+#                       directory (for example tests/fixtures/ppsspp-site-data)
 #     --heap-mb N       validation JavaScript heap override
 #     --script-file-kb N
 #                       validation per-script source override
@@ -61,9 +63,21 @@ debug_log=0
 update_golden=0
 start_url=
 offline_library=
+data_seed=
 heap_mb=
 script_file_kb=
-graphics=${TILEFINCH_PPSSPP_GRAPHICS:-opengl}
+# PPSSPP's OpenGL backend no longer initializes on current macOS: the emulator
+# records the failure, shows a dialog, and never starts the EBOOT, which from
+# here looks exactly like a hung browser until the timeout. Vulkan (MoltenVK,
+# bundled with PPSSPP) works there. Nothing this harness compares depends on
+# the host renderer: traces and timings are produced by PSP code.
+if [ -n "${TILEFINCH_PPSSPP_GRAPHICS:-}" ]; then
+    graphics=$TILEFINCH_PPSSPP_GRAPHICS
+elif [ "$(uname -s)" = Darwin ]; then
+    graphics=vulkan
+else
+    graphics=opengl
+fi
 case "$graphics" in
     opengl) graphics_backend='0 (OPENGL)' ;;
     vulkan) graphics_backend='3 (VULKAN)' ;;
@@ -81,6 +95,8 @@ while [ "$#" -gt 0 ]; do
         --url=*) start_url=${1#--url=}; shift ;;
         --offline-library) offline_library=$2; shift 2 ;;
         --offline-library=*) offline_library=${1#--offline-library=}; shift ;;
+        --data-dir) data_seed=$2; shift 2 ;;
+        --data-dir=*) data_seed=${1#--data-dir=}; shift ;;
         --heap-mb) heap_mb=$2; shift 2 ;;
         --heap-mb=*) heap_mb=${1#--heap-mb=}; shift ;;
         --script-file-kb) script_file_kb=$2; shift 2 ;;
@@ -95,6 +111,12 @@ while [ "$#" -gt 0 ]; do
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+
+# Pin the reference cursor clock instead of depending on PPSSPP's auto clock.
+# Explicit underclocks are pressure profiles, not shipping cadence passes.
+if [ "$scenario" = cursor-latency ] && [ "$ppsspp_cpu_mhz" = 0 ]; then
+    ppsspp_cpu_mhz=333
+fi
 
 if [ "$scenario" = wikipedia-article-section-live ] || [ "$scenario" = wikipedia-section-input-live ]; then
     # This receiver trace starts at History; an unfragmented article is a
@@ -136,6 +158,21 @@ if [ -n "$offline_library" ]; then
     [ -f "$offline_library/library.bin" ] || {
         printf 'offline library has no library.bin: %s\n' \
             "$offline_library" >&2
+        exit 2
+    }
+fi
+if [ -n "$data_seed" ]; then
+    case "$data_seed" in
+        /*) ;;
+        *) data_seed="$root/$data_seed" ;;
+    esac
+    [ -f "$data_seed/profile.cfg" ] || {
+        printf 'data seed has no profile.cfg: %s\n' "$data_seed" >&2
+        exit 2
+    }
+    # The optional-component stage installs its own profile.cfg.
+    [ -z "${TILEFINCH_PPSSPP_COMPONENT_STAGE:-}" ] || {
+        printf '%s\n' '--data-dir cannot be combined with a component stage' >&2
         exit 2
     }
 fi
@@ -275,6 +312,16 @@ stop_emulator() {
             # parent; this run's unique --log path is the ownership token.
             ppsspp_pids=$(pgrep -f -- "--log=$emulator_log" 2>/dev/null || true)
             [ -n "$ppsspp_pids" ] && kill $ppsspp_pids 2>/dev/null || true
+            # An emulator sitting in its "graphics backend failed" dialog
+            # ignores SIGTERM, and the wait below would then never return.
+            grace=0
+            while [ "$grace" -lt 5 ] \
+                && pgrep -f -- "--log=$emulator_log" >/dev/null 2>&1; do
+                sleep 1
+                grace=$((grace + 1))
+            done
+            ppsspp_pids=$(pgrep -f -- "--log=$emulator_log" 2>/dev/null || true)
+            [ -n "$ppsspp_pids" ] && kill -9 $ppsspp_pids 2>/dev/null || true
         else
             kill "$emulator_pid" 2>/dev/null || true
         fi
@@ -348,6 +395,11 @@ run_once() {
     if [ -n "$offline_library" ]; then
         mkdir -p "$app_dir/offline"
         cp -R "$offline_library/." "$app_dir/offline/"
+    fi
+    if [ -n "$data_seed" ]; then
+        # The unslotted fixture keeps its data files beside the EBOOT
+        # (tilefinch_install_paths_derive).
+        cp -R "$data_seed/." "$app_dir/"
     fi
 
     {
@@ -441,10 +493,35 @@ run_once() {
     # emulator ourselves.
     elapsed=0
     saw_outcome=0
+    graphics_failed=0
+    graphics_canary_seconds=0
     while kill -0 "$emulator_pid" 2>/dev/null; do
         if grep -q 'tilefinch-validation: outcome=clean-exit' \
             "$validation_log" 2>/dev/null; then
             saw_outcome=1
+            stop_emulator
+            emulator_pid=
+            break
+        fi
+        # PPSSPP names a backend in this file before it initializes it and
+        # clears the name once initialization succeeds, so the file existing
+        # is normal for a moment. A name that is still there well after
+        # start-up means the backend never came up; the EBOOT does not run
+        # after that, so stop and say why instead of reporting a browser
+        # timeout minutes later.
+        failed_backends="$home_dir/.config/ppsspp/PSP/SYSTEM/FailedGraphicsBackends.txt"
+        if [ -s "$failed_backends" ]; then
+            graphics_canary_seconds=$((graphics_canary_seconds + 1))
+        else
+            graphics_canary_seconds=0
+        fi
+        if [ "$graphics_canary_seconds" -ge 15 ]; then
+            printf 'PPSSPP could not start its %s graphics backend (%s lists: %s).\n' \
+                "$graphics" "$failed_backends" \
+                "$(tr '\n' ' ' <"$failed_backends")" >&2
+            printf 'The EBOOT never ran. Set TILEFINCH_PPSSPP_GRAPHICS=%s and retry.\n' \
+                "$([ "$graphics" = vulkan ] && echo opengl || echo vulkan)" >&2
+            graphics_failed=1
             stop_emulator
             emulator_pid=
             break
@@ -467,6 +544,7 @@ run_once() {
              "$emulator_stderr" "$validation_log"; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
+    cp "$run_dir/script.ini" "$run_result/ppsspp-requested.ini"
     for f in "$app_dir"/frame-mark-*.ppm "$app_dir"/data/frame-mark-*.ppm; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
@@ -599,6 +677,27 @@ if [ "$scenario" = runtime-input-live ]; then
         printf 'FAIL: runtime input had no measured visible acknowledgement.\n' >&2
         exit 1
     }
+fi
+if [ "$scenario" = site-restore ]; then
+    # The trace only proves the script idled. The point of this scenario is
+    # that both restore phases and the font load took their Memory Stick
+    # slices through the declared policy, and that it arbitrated between them.
+    [ -n "$data_seed" ] || {
+        printf 'FAIL: site-restore needs --data-dir tests/fixtures/ppsspp-site-data.\n' >&2
+        exit 1
+    }
+    for expected in \
+        'tilefinch-frame-pumps: order-violations=0 wiring-violations=0' \
+        'tilefinch-site-data: deferred-local-storage load=ok ' \
+        'tilefinch-site-data: deferred-disk-cache load=ok ' \
+        'tilefinch-frame-pump: name=site-restore-storage admissions=[1-9][0-9]* slices=[1-9]' \
+        'tilefinch-frame-pump: name=site-restore-cache admissions=[1-9][0-9]* slices=[1-9]' \
+        'tilefinch-frame-pump: name=baseline-fonts admissions=[1-9][0-9]* slices=[1-9][0-9]* yields=[1-9]'; do
+        grep -Eq "$expected" "$telemetry_log" || {
+            printf 'FAIL: restore pumps: missing %s\n' "$expected" >&2
+            exit 1
+        }
+    done
 fi
 if [ "$scenario" = runtime-cancel-live ]; then
     grep -Eq 'tilefinch-ui-supervisor: scope=page-runtime .*presentations=[1-9][0-9]* .*cancelled=1 .*input-acks=[1-9][0-9]* .*max-ack=[1-9][0-9]*us .*drained=1' \
@@ -792,37 +891,13 @@ if [ "$scenario" = treadline-offline-controls ]; then
         }
 fi
 if [ "$scenario" = cursor-latency ]; then
-    cursor_line=$(grep 'tilefinch-ui-cadence: phase=controlled-exit' \
-        "$telemetry_log" | tail -1 || true)
-    cursor_cadence_line=$(grep \
-        'tilefinch-cursor-cadence: phase=controlled-exit' \
-        "$telemetry_log" | tail -1 || true)
-    cursor_samples=$(printf '%s\n' "$cursor_line" \
-        | sed -n 's/.*cursor-samples=\([0-9][0-9]*\).*/\1/p')
-    cursor_presents=$(printf '%s\n' "$cursor_line" \
-        | sed -n 's/.*cursor-presents=\([0-9][0-9]*\).*/\1/p')
-    cursor_coalesced=$(printf '%s\n' "$cursor_line" \
-        | sed -n 's/.*cursor-coalesced=\([0-9][0-9]*\).*/\1/p')
-    cursor_intervals=$(printf '%s\n' "$cursor_cadence_line" \
-        | sed -n 's/.*intervals=\([0-9][0-9]*\).*/\1/p')
-    cursor_cadence_average=$(printf '%s\n' "$cursor_cadence_line" \
-        | sed -n 's/.*average=\([0-9][0-9]*\)us.*/\1/p')
-    [ -n "$cursor_samples" ] && [ "$cursor_samples" -gt 0 ] \
-        && [ "$cursor_samples" = "$cursor_presents" ] \
-        && [ "$cursor_coalesced" = 0 ] || {
-        printf '%s\n' \
-            'FAIL: cursor samples did not receive one immediate accepted presentation.' \
-            "$cursor_line" >&2
-        exit 1
-    }
-    [ -n "$cursor_intervals" ] && [ "$cursor_intervals" -gt 0 ] \
-        && [ -n "$cursor_cadence_average" ] \
-        && [ "$cursor_cadence_average" -le 20000 ] || {
-        printf '%s\n' \
-            'FAIL: cursor sampling did not sustain near-display cadence.' \
-            "$cursor_cadence_line" >&2
-        exit 1
-    }
+    cursor_run=1
+    while [ "$cursor_run" -le "$runs" ]; do
+        python3 "$root/tools/check_cursor_cadence.py" \
+            "$result_dir/run-$cursor_run/tilefinch-validation.txt" \
+            --cpu-mhz "$ppsspp_cpu_mhz"
+        cursor_run=$((cursor_run + 1))
+    done
 fi
 
 # Determinism first, then conformance: two runs that disagree with each other
@@ -872,7 +947,7 @@ grep 'outcome=' "$trace" || true
 grep 'tilefinch-input-telemetry: ' "$telemetry_log" || true
 [ "$scenario" != cursor-latency ] \
     || grep -E \
-        'tilefinch-(ui|cursor)-cadence: phase=controlled-exit' "$telemetry_log"
+        'tilefinch-(ui-cadence|cursor-cadence|cursor-work): phase=controlled-exit' "$telemetry_log"
 printf 'artifacts: %s\n' "$result_dir"
 rm -rf "$session_dir"
 printf '\nscripted input: PASS (%s, %s run(s))\n' "$scenario" "$runs"

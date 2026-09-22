@@ -383,6 +383,7 @@ if(PSP)
             src/psp_app/psp_app_surfaces.c
             src/psp_app/psp_app_youtube.c
             src/psp_app/psp_app_exit_handoff.c
+            src/psp_app/psp_app_frame_pumps.c
             src/psp_app/psp_app_glyph_component.c
             src/psp_app/psp_app_voice_component.c
             src/psp_clock_worker.c

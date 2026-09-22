@@ -117,7 +117,7 @@ int main(int argc, char **argv)
         if (fonts_ready)
             psp_ui_set_chrome_fonts(
                 font_set_face(&fonts, FONT_SANS),
-                font_set_face_variant(&fonts, FONT_SANS, false, true));
+                font_set_face_variant(&fonts, FONT_SANS, false, true), 1u);
         PspUiHomeView entrance_home = {
             .tile_count = 6,
             .continue_count = 3,
@@ -191,7 +191,7 @@ int main(int argc, char **argv)
     if (fonts_ready)
         psp_ui_set_chrome_fonts(
             font_set_face(&fonts, FONT_SANS),
-            font_set_face_variant(&fonts, FONT_SANS, false, true));
+            font_set_face_variant(&fonts, FONT_SANS, false, true), 1u);
 
     for (int y = 0; y < PREVIEW_HEIGHT; y++) {
         uint16_t background = preview_rgb565(

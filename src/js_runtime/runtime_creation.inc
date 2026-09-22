@@ -1325,7 +1325,7 @@ static JSValue js_runtime_trace_worker_message(
 #if defined(CONFIG_PROPERTY_FAULT_TRACE)
 static void runtime_configure_property_fault_trace(JSRuntime *runtime)
 {
-    const char *trace_value = getenv("TILEFINCH_TRACE_JS_PROPERTY_FAULTS");
+    const char *trace_value = tilefinch_trace_js_property_faults_value();
     uint32_t limit = 0u;
     if (trace_value != NULL && trace_value[0] != '\0'
         && strcmp(trace_value, "0") != 0) {
@@ -2142,6 +2142,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchComputedStyleGet",
                                        js_computed_style_get, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchComputedStyleSupport",
+                                       js_computed_style_support, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchStyleSet",
                                        js_style_set, 3)

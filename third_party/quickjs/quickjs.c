@@ -5695,7 +5695,9 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     /* Property growth otherwise bypasses every allocation site that can
        collect cycles.  Do it before mutating either allocation so a bounded
        heap can reclaim dead author graphs without exposing a half-resized
-       object to the collector. */
+       object to the collector.  add_shape_property() may have temporarily
+       removed this unshared shape from the interning hash, but the live
+       object/context still owns it and it remains on the GC list. */
     size_t property_bytes = sizeof(JSProperty) * (size_t)new_size;
     size_t shape_bytes = get_shape_size(new_hash_size, new_size);
     js_trigger_gc(ctx->rt,
@@ -10009,6 +10011,40 @@ static int set_compact_array_element(JSContext *ctx, JSObject *p,
     return 0;
 }
 
+/* Interpreter-only common case: overwrite an existing numeric element when
+   no allocation, representation change, or copy-on-write is required.  Keep
+   characters, widening, appends, and shared/atomized backing on the complete
+   property path below. */
+static force_inline BOOL set_compact_numeric_array_element_fast(
+    JSObject *p, uint32_t index, JSValueConst value)
+{
+    JSString *storage;
+    int32_t item;
+
+    if (unlikely(!p->fast_array || index >= p->u.array.count ||
+                 JS_VALUE_GET_TAG(value) != JS_TAG_INT ||
+                 p->compact_char_array))
+        return FALSE;
+    storage = compact_array_string(p);
+    if (unlikely(storage->atom_type != 0 ||
+                 js_rc(storage)->ref_count != 1))
+        return FALSE;
+    item = JS_VALUE_GET_INT(value);
+    if (p->compact_byte_array) {
+        if (unlikely(item < 0 || item > UINT8_MAX)) return FALSE;
+        compact_array_bytes(p)[index] = (uint8_t)item;
+    } else if (p->compact_signed_byte_array) {
+        if (unlikely(item < INT8_MIN || item > INT8_MAX)) return FALSE;
+        compact_array_bytes(p)[index] = (uint8_t)(int8_t)item;
+    } else if (p->compact_short_array) {
+        if (unlikely(item < INT16_MIN || item > INT16_MAX)) return FALSE;
+        compact_array_shorts(p)[index] = (uint16_t)(int16_t)item;
+    } else {
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* A compact numeric array can temporarily deoptimize for an incompatible
    write and later become homogeneous again. Reconsider it at power-of-two
    lengths and at the comparatively rare capacity-growth boundary above 64K;
@@ -10069,9 +10105,12 @@ static int try_repack_numeric_array_append(JSContext *ctx, JSObject *p,
         sizeof(JSString) + ((uint64_t)new_len << wide) + 1u - wide
             > ctx->rt->fast_array_byte_limit)
         return 0;
-    storage = js_alloc_string(ctx, new_size, wide);
+    /* Repacking is optional.  If its smaller backing store cannot be
+       allocated, retain the ordinary fast array and let the append use its
+       existing capacity (or report a real growth refusal below). */
+    storage = js_alloc_string_rt(ctx->rt, new_size, wide);
     if (storage == NULL)
-        return -1;
+        return 0;
     if (wide) {
         for (uint32_t i = 0; i < count; i++)
             storage->u.str16[i] =
@@ -20678,9 +20717,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
                     p = JS_VALUE_GET_OBJ(sp[-3]);
                     idx = JS_VALUE_GET_INT(sp[-2]);
-                    if (unlikely(p->class_id != JS_CLASS_ARRAY ||
-                                 is_compact_array(p)))
+                    if (unlikely(p->class_id != JS_CLASS_ARRAY))
                         goto put_array_el_slow_path;
+                    if (unlikely(is_compact_array(p))) {
+                        if (likely(set_compact_numeric_array_element_fast(
+                                p, idx, sp[-1]))) {
+                            JS_FreeValue(ctx, sp[-1]);
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            BREAK;
+                        }
+                        goto put_array_el_slow_path;
+                    }
                     if (unlikely(idx >= (uint32_t)p->u.array.count)) {
                         uint32_t new_len, array_len;
                         if (unlikely(idx != (uint32_t)p->u.array.count ||

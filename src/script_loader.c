@@ -10,6 +10,7 @@
 #include "tilefinch/url.h"
 
 #include "data_url.h"
+#include "diagnostic_trace.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -24,7 +25,7 @@ static void script_trace_skip(const char *url)
 {
     static int enabled = -1;
     if (enabled < 0)
-        enabled = getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL;
+        enabled = tilefinch_trace_script_failures();
     if (enabled)
         fprintf(stderr, "script-quota-skip url=%s\n",
                 url == NULL ? "<null>" : url);
@@ -34,7 +35,7 @@ static void script_trace_attempt(const char *url)
 {
     static int enabled = -1;
     if (enabled < 0)
-        enabled = getenv("TILEFINCH_TRACE_SCRIPT_ATTEMPTS") != NULL;
+        enabled = tilefinch_trace_script_attempts();
     if (enabled)
         fprintf(stderr, "script-attempt url=%s\n",
                 url == NULL ? "<null>" : url);
@@ -686,7 +687,7 @@ static ScriptQuotaReserveResult script_quota_reserve_bounded(
         ScriptQuotaProgressResult progress =
             script_runtime_script_quota_progress(runtime, wait_ms);
         if (progress == SCRIPT_QUOTA_PROGRESS_FAILED) {
-            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+            if (tilefinch_trace_script_failures()) {
                 fprintf(stderr,
                         "script-quota-progress-failure requested=%zu "
                         "pump=%zu/%zu\n",
@@ -1324,7 +1325,7 @@ static bool script_evaluate_external_node(
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return false;
     }
-    bool trace_failure = getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL;
+    bool trace_failure = tilefinch_trace_script_failures();
     /* ScriptResult is intentionally telemetry-rich and larger than the PSP's
        complete per-frame allowance. Evaluation already retains the canonical
        result in ScriptRuntime, so materialize a temporary copy only when the
@@ -1431,7 +1432,7 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
             inline_cost.flags |= part.flags;
         }
     }
-    bool trace_failure = getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL;
+    bool trace_failure = tilefinch_trace_script_failures();
     char id_copy[128] = {0};
     size_t id_copy_length = 0;
     if (trace_failure) {
@@ -1453,7 +1454,7 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
     if (!module && try_data_fast_path) {
         data = script_runtime_evaluate_inline_data(
             runtime, node, &data_bytes);
-        if (getenv("TILEFINCH_TRACE_SCRIPT_ATTEMPTS") != NULL) {
+        if (tilefinch_trace_script_attempts()) {
             fprintf(stderr,
                     "inline-data-fast-path status=%d bytes=%zu\n",
                     (int) data, data_bytes);
@@ -1626,7 +1627,7 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
     bool admitted = script_admit_known_working_set_with_reserve(
         runtime, budget, source_length,
         budget_reserve, execution_reserve, metrics);
-    if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+    if (tilefinch_trace_script_failures()) {
         size_t heap_remaining = script_runtime_heap_remaining(runtime);
         fprintf(stderr,
                 "inline-script-admission bytes=%zu heap-remaining=%zu "
@@ -1660,7 +1661,7 @@ static bool script_evaluate_data_url_node(
             }
         }
         else metrics->failed++;
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "data-script-decode-failure encoded=%zu result=%d "
                     "media-type=\"%s\" module=%s\n",
@@ -1750,7 +1751,7 @@ static bool execute_external_node(
     size_t reference_length = 0;
     const char *reference = script_source_attribute(node, &reference_length);
     if (reference == NULL || reference_length == 0) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "external-script-reference-failure reference=%s "
                     "length=%zu\n",
@@ -1769,7 +1770,7 @@ static bool execute_external_node(
         char data_url[NAVIGATION_URL_LIMIT];
         if (reference_length >= sizeof(data_url)) {
             metrics->failed++;
-            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+            if (tilefinch_trace_script_failures()) {
                 fprintf(stderr,
                         "data-script-url-too-long length=%zu limit=%zu\n",
                         reference_length, sizeof(data_url) - 1u);
@@ -1795,7 +1796,7 @@ static bool execute_external_node(
     }
     if (reference_length >= NAVIGATION_URL_LIMIT) {
         metrics->failed++;
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "external-script-url-too-long length=%zu limit=%u\n",
                     reference_length, (unsigned) NAVIGATION_URL_LIMIT);
@@ -1963,7 +1964,7 @@ static bool execute_external_node(
             ? lazy_plan.largest_factory_bytes : cached_length;
         if (!script_admit_known_working_set(
                 runtime, budget, compile_working_bytes, metrics)) {
-            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+            if (tilefinch_trace_script_failures()) {
                 fprintf(stderr,
                         "script-admission-reject url=%s working=%zu\n",
                         resolved,
@@ -2001,7 +2002,7 @@ static bool execute_external_node(
     bool pressure_capped = false;
     if (!script_bound_network_working_set(
             runtime, budget, &response_limit, &pressure_capped, metrics)) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr, "script-network-bound-reject url=%s\n",
                     resolved);
         }
@@ -2045,7 +2046,7 @@ static bool execute_external_node(
                        request->sec_fetch_mode)));
     FetchResult *fetch = fetch_result_create(budget);
     if (fetch == NULL) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "script-fetch-result-allocation-failure url=\"%s\" "
                     "remaining=%zu\n",
@@ -2057,7 +2058,7 @@ static bool execute_external_node(
     }
     if (request == NULL || !fetch_scheduler_request(scheduler, resolved, request,
                                  response_limit, timeout_ms, fetch)) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "script-fetch-failure url=\"%s\" limit=%zu "
                     "pressure-capped=%s error=\"%s\"\n",
@@ -2274,7 +2275,7 @@ static bool execute_external_node_live(
     if (document != NULL) {
         if (!document_base_url(document, live_document_url, base_url,
                                sizeof(base_url))) {
-            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+            if (tilefinch_trace_script_failures()) {
                 fprintf(stderr,
                         "script-live-base-failure document-url=\"%s\"\n",
                         live_document_url == NULL ? "" : live_document_url);
@@ -2497,7 +2498,7 @@ static bool pipeline_module_load(void *opaque,
         if (request == NULL || !fetch_scheduler_request(scheduler, url, request,
                                      response_limit, context->timeout_ms,
                                      fetch)) {
-            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+            if (tilefinch_trace_script_failures()) {
                 size_t pool_reserved = 0, pool_maximum = 0;
                 size_t slots_active = 0, slots_maximum = 0;
                 fetch_scheduler_reservation_state(
@@ -2681,14 +2682,14 @@ static bool pipeline_module_load(void *opaque,
         "}catch(e){throw await i.abort(e).catch(()=>{}),e}finally{";
     static const char dpu_catch_diagnostic[] =
         "}catch(e){globalThis.__tilefinchDpuStage='error:'+String(e&&e.message||e);console.error('stream-loop-error',e&&e.stack||e);throw await i.abort(e).catch(()=>{}),e}finally{";
-    bool react_diagnostic = getenv("TILEFINCH_TRACE_REACT_ERROR") != NULL
+    bool react_diagnostic = tilefinch_trace_react_error()
         && strstr(url, "/react-stable-") != NULL;
-    bool sentinel_diagnostic = getenv("TILEFINCH_TRACE_SENTINEL") != NULL
+    bool sentinel_diagnostic = tilefinch_trace_sentinel()
         && strstr(url, "/client-shared-") != NULL;
-    bool submit_diagnostic = getenv("TILEFINCH_TRACE_SENTINEL") != NULL
+    bool submit_diagnostic = tilefinch_trace_sentinel()
         && strstr(url, "/client-C") != NULL
         && strstr(url, "/client-shared-") == NULL;
-    bool dpu_diagnostic = getenv("TILEFINCH_TRACE_DPU") != NULL
+    bool dpu_diagnostic = tilefinch_trace_dpu()
         && strstr(url, "/client-C") != NULL
         && strstr(url, "/client-shared-") == NULL;
     size_t diagnostic_extra = react_diagnostic
@@ -3145,7 +3146,7 @@ static bool document_scripts_execute_internal(
         || base_url == NULL || document_url == NULL || metrics == NULL
         || maximum_file_bytes == 0 || scheduler == NULL
         || script_root == NULL) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "document-script-pipeline-invalid-input document=%s "
                     "runtime=%s budget=%s base=%s url=%s metrics=%s "
@@ -3171,7 +3172,7 @@ static bool document_scripts_execute_internal(
     ModuleLoadContext *module_context = budget_calloc(
         budget, 1, sizeof(*module_context));
     if (module_context == NULL) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr, "document-script-module-context-allocation-failure\n");
         }
         return false;
@@ -3358,7 +3359,7 @@ static bool document_scripts_execute_internal(
         if (added == 0) break;
     }
     bool finished = script_runtime_finish_loading(runtime, result);
-    if (!finished && getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+    if (!finished && tilefinch_trace_script_failures()) {
         fprintf(stderr,
                 "document-load-event-failure error=\"%s\" context=\"%s\"\n",
                 result == NULL ? "<diagnostic unavailable>" : result->error,

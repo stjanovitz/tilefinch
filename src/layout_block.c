@@ -98,6 +98,7 @@ static bool layout_block_fallback(LayoutContext *context,
         .base_right = x + safe_width,
         .y = y,
         .line_gap = 0,
+        .strut_fixed = layout_inline_style_line_height_fixed(context, parent),
         .layout = context->layout,
         .command_start = context->layout->count,
         .link_start = context->layout->link_count,
@@ -313,8 +314,19 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         style->height_percent = false;
         style->height = context->assigned_flex_height;
     }
-    resolve_padding(context->sheet, style, width);
-    resolve_margin(context->sheet, style, width);
+    /* Percentage padding and margins refer to the width of the containing
+       block. For an out-of-flow box that is its positioned ancestor's padding
+       box (or the fixed containing block), not the flow width it was reached
+       through. */
+    int percentage_basis = width;
+    if (style->fixed_position) {
+        percentage_basis = positioned_box->fixed_node != NULL
+            ? positioned_box->fixed_width : context->layout->width;
+    } else if (style->out_of_flow) {
+        percentage_basis = positioned_box->width;
+    }
+    resolve_padding(context->sheet, style, percentage_basis);
+    resolve_margin(context->sheet, style, percentage_basis);
     const char *trace_class = context->layout->trace_layout_class;
     if (trace_class != NULL && trace_class[0] != '\0') {
         size_t class_length = 0, parent_class_length = 0;
@@ -385,10 +397,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     bool fixed_captured = style->fixed_position
         && positioned_box->fixed_node != NULL;
-    int positioning_width = style->fixed_position
-        ? (fixed_captured ? positioned_box->fixed_width
-                          : context->layout->width)
-        : positioned_box->width;
+    int positioning_width = positioned ? percentage_basis
+                                       : positioned_box->width;
     int viewport_height = context->layout->viewport.css_height > 0
                           ? context->layout->viewport.css_height : 272;
     int positioning_height = style->fixed_position
@@ -682,6 +692,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             layout_add_coordinate(outer_y, content_border_top),
             style->padding.top),
         .line_gap = 0,
+        .strut_fixed = layout_inline_style_line_height_fixed(context, style),
         .layout = context->layout,
         .command_start = context->layout->count,
         .link_start = context->layout->link_count,

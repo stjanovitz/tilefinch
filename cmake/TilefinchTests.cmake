@@ -18,6 +18,11 @@ if(PSP_BROWSER_BUILD_TESTS)
     find_package(Threads REQUIRED)
     if(NOT PSP)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_test(NAME tilefinch-cursor-cadence-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cursor_cadence.py)
+        set_tests_properties(tilefinch-cursor-cadence-tests PROPERTIES
+            LABELS "tilefinch;unit;input;performance" TIMEOUT 10)
         add_test(NAME tilefinch-bootstrap-generated-check
             COMMAND tilefinch_bootstrap_bytecode_generator --check
                 "${TILEFINCH_BOOTSTRAP_SOURCE_DIR}"
@@ -39,6 +44,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-bootstrap-global-owner-tests PROPERTIES
             LABELS "tilefinch;unit;javascript;bootstrap;architecture"
             TIMEOUT 10)
+        # The computed-style registry generates membership, enumeration and
+        # the getter's identifiers; this checks what the compiler cannot.
+        add_test(NAME tilefinch-computed-style-registry-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_computed_style_registry.py
+                ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tilefinch-computed-style-registry-tests
+            PROPERTIES LABELS "tilefinch;unit;architecture" TIMEOUT 20)
         add_test(NAME tilefinch-diagnostic-switch-registry-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_diagnostic_switches.py
@@ -436,6 +449,17 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;architecture;lifecycle"
         ENVIRONMENT "TILEFINCH_TRACE_TASKS=1"
         TIMEOUT 30)
+    # Every registered computed-style property, read from a fixture page that
+    # authors most of them, against a checked-in dump: a changed resolved
+    # value is a reviewable diff. Regenerate with --computed-style-dump.
+    add_test(NAME tilefinch-computed-style-golden-tests
+        COMMAND tilefinch-browser-engine-tests --computed-style-golden
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/computed-style-dump.html
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/computed-style-dump.golden.txt
+            ${CMAKE_CURRENT_BINARY_DIR}/computed-style-dump.actual.txt)
+    set_tests_properties(tilefinch-computed-style-golden-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;style"
+        TIMEOUT 60)
 
     tilefinch_add_test_binary(tilefinch-browser-profile-tests
         tests/test_browser_profile.c)
@@ -932,6 +956,48 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;media;psp;state"
         TIMEOUT 30)
 
+    # Rule 2 as a gate: the unlocked Budget ledger aborts host tests when a
+    # thread other than its owner mutates it. This binary provokes the
+    # violation deliberately, with the abort disabled.
+    tilefinch_add_test_binary(tilefinch-budget-owner-tests
+        tests/test_budget_owner.c)
+    # The test creates threads itself, independent of how the core links.
+    target_link_libraries(tilefinch-budget-owner-tests
+        PRIVATE tilefinch_core Threads::Threads)
+    add_test(NAME tilefinch-budget-owner-tests
+        COMMAND tilefinch-budget-owner-tests)
+    set_tests_properties(tilefinch-budget-owner-tests PROPERTIES
+        LABELS "tilefinch;unit;budget"
+        TIMEOUT 30)
+
+    # The resident loop's optional pumps are admitted through one declared
+    # policy table. The test proves table order, each admission rule, and the
+    # exact set of pump pairs able to contend for one resource in a frame.
+    tilefinch_add_test_binary(tilefinch-frame-pumps-tests
+        tests/test_frame_pumps.c)
+    target_link_libraries(tilefinch-frame-pumps-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-frame-pumps-tests
+        COMMAND tilefinch-frame-pumps-tests)
+    set_tests_properties(tilefinch-frame-pumps-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 60)
+
+    # The emulator scenario that exercises the restore pumps boots from a
+    # checked-in Memory Stick seed. Loading it here with the shipping readers
+    # turns a format change into a host failure; inside PPSSPP a stale seed
+    # would only look like a restore with nothing to do.
+    tilefinch_add_test_binary(tilefinch-site-data-fixture
+        tests/tools/site_data_fixture.c)
+    target_link_libraries(tilefinch-site-data-fixture
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-site-data-fixture-tests
+        COMMAND tilefinch-site-data-fixture --check
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ppsspp-site-data)
+    set_tests_properties(tilefinch-site-data-fixture-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-psp-network-supervisor-tests
         tests/test_psp_network_supervisor.c)
     target_link_libraries(tilefinch-psp-network-supervisor-tests
@@ -1085,11 +1151,14 @@ if(PSP_BROWSER_BUILD_TESTS)
                     $<TARGET_FILE:psp-browser-trace-inventory>)
             set_tests_properties(tilefinch-trace-acquisition-tests PROPERTIES
                 LABELS "tilefinch;unit;acceptance;tooling;security"
-                # This adversarial test creates executable wrappers. On macOS,
-                # the first-execution scanner can stall them indefinitely when
-                # other process-heavy acceptance tests start concurrently.
-                # Serial execution keeps the security assertions intact and
-                # makes the release gate independent of that host scheduler.
+                # This adversarial test creates executable wrappers and is
+                # kept serial so their first execution on macOS does not queue
+                # behind other process-heavy acceptance tests. That was once
+                # blamed for this test's intermittent 120 s failures; the cause
+                # was different (the tool passed its own standard input to a
+                # helper which reads to end-of-file, so the test hung whenever
+                # it was launched with a standard input that stays open) and is
+                # fixed in the tool and pinned by the test.
                 RUN_SERIAL TRUE
                 TIMEOUT 150)
         endif()

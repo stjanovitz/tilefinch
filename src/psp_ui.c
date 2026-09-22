@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+#if defined(__PSP__)
 #include <pspkernel.h>
 #endif
 
@@ -156,6 +156,14 @@ typedef struct {
     UiChromeUnicodeGlyph unicode[UI_CHROME_UNICODE_GLYPH_LIMIT];
     uint32_t unicode_clock;
     const FontFace *faces[2];
+    /* Glyph loads allocate on the faces' Budget, whose ledger is unlocked
+       and owned by the thread that binds the faces. The loading-UI
+       supervisor draws chrome from the callback thread, so it may only use
+       what is already cached. */
+#if defined(__PSP__)
+    int owner_thread;
+#endif
+    PspUiChromeGlyphPreload preload;
 } UiChromeFontCache;
 
 static UiChromeFontCache chrome_font_cache;
@@ -738,6 +746,16 @@ static void fill_rect(uint16_t *pixels, int width, int height, int stride,
     if (right > width) right = width;
     if (bottom > height) bottom = height;
     if (left >= right || top >= bottom) return;
+    /* HOME and panel backgrounds are opaque. Keep their common fill free
+       of a per-pixel blend branch on Allegrex; translucent fills retain
+       exactly the existing rounding and read/modify/write behavior. */
+    if (opacity >= 4u) {
+        for (int y = top; y < bottom; y++) {
+            uint16_t *row = pixels + (size_t) y * (size_t) stride;
+            for (int x = left; x < right; x++) row[x] = color;
+        }
+        return;
+    }
     /* RGB565 half-black is exactly each channel divided by two. Preserve
        blend565()'s floor semantics with a channel-safe mask, while avoiding
        three extracts, multiplies, divisions, and a repack for every shadow
@@ -753,8 +771,7 @@ static void fill_rect(uint16_t *pixels, int width, int height, int stride,
     for (int y = top; y < bottom; y++) {
         uint16_t *row = pixels + (size_t) y * (size_t) stride;
         for (int x = left; x < right; x++) {
-            row[x] = opacity >= 4u
-                ? color : blend565(color, row[x], opacity * 2u);
+            row[x] = blend565(color, row[x], opacity * 2u);
         }
     }
 }
@@ -1061,6 +1078,11 @@ static void draw_font_glyph(uint16_t *pixels, int width, int height,
     }
 }
 
+PspUiChromeGlyphPreload psp_ui_chrome_glyph_preload(void)
+{
+    return chrome_font_cache.preload;
+}
+
 void psp_ui_clear_chrome_font(void)
 {
     for (size_t weight = 0; weight < 2u; weight++) {
@@ -1082,14 +1104,67 @@ void psp_ui_clear_chrome_font(void)
     memset(&chrome_font_cache, 0, sizeof(chrome_font_cache));
 }
 
-void psp_ui_set_chrome_fonts(
-    const FontFace *regular, const FontFace *bold)
+static const FontGlyph *chrome_font_glyph(
+    unsigned codepoint, int scale, bool bold, bool *known_missing);
+static bool chrome_glyph_load_allowed(void);
+static bool chrome_glyph_slot_retryable(uint8_t state);
+
+/* Rasterize every printable ASCII glyph at one chrome scale, both weights,
+   on the calling thread. Idempotent: cached glyphs are not reloaded. */
+static void chrome_preload_scale(int scale)
 {
+    if (chrome_font_cache.faces[0] == NULL) return;
+#if defined(__PSP__)
+    uint64_t started = sceKernelGetSystemTimeWide();
+#endif
+    unsigned loaded = 0;
+    for (size_t weight = 0; weight < 2u; weight++) {
+        for (unsigned codepoint = UI_CHROME_GLYPH_FIRST;
+             codepoint <= UI_CHROME_GLYPH_LAST; codepoint++) {
+            size_t at = codepoint - UI_CHROME_GLYPH_FIRST;
+            if (!chrome_glyph_slot_retryable(
+                    chrome_font_cache.loaded[weight][scale >= 2 ? 1u : 0u][at]))
+                continue;
+            if (chrome_font_glyph(codepoint, scale, weight == 1u, NULL)
+                != NULL) loaded++;
+        }
+    }
+    chrome_font_cache.preload.glyphs = loaded;
+    chrome_font_cache.preload.scale = (unsigned) scale;
+#if defined(__PSP__)
+    chrome_font_cache.preload.elapsed_us =
+        sceKernelGetSystemTimeWide() - started;
+#else
+    chrome_font_cache.preload.elapsed_us = 0;
+#endif
+}
+
+void psp_ui_preload_chrome_scale(unsigned scale)
+{
+    if (!chrome_glyph_load_allowed()) return;
+    chrome_preload_scale(scale >= 2u ? 2 : 1);
+}
+
+void psp_ui_set_chrome_fonts(
+    const FontFace *regular, const FontFace *bold, unsigned scale)
+{
+    if (bold == NULL) bold = regular;
     if (chrome_font_cache.faces[0] == regular
         && chrome_font_cache.faces[1] == bold) return;
     psp_ui_clear_chrome_font();
     chrome_font_cache.faces[0] = regular;
-    chrome_font_cache.faces[1] = bold != NULL ? bold : regular;
+    chrome_font_cache.faces[1] = bold;
+#if defined(__PSP__)
+    chrome_font_cache.owner_thread = sceKernelGetThreadId();
+#endif
+    /* Rasterize every printable ASCII glyph at the current chrome scale now,
+       on the owning thread, so the supervisor's status text and chrome
+       labels never miss during page work. The scale changes only through
+       the option-items screen, whose toggle the supervisor never admits, so
+       it changes on this thread, and its handler preloads the other size
+       before the next frame draws at it. Non-ASCII
+       stays lazy (bounded LRU) and is owner-only. */
+    chrome_preload_scale(scale >= 2u ? 2 : 1);
 }
 
 void psp_ui_set_device_status(
@@ -1176,13 +1251,45 @@ static void ui_format_clock(char *out, size_t size)
  * unreachable the moment a chrome face was set. Out of line so the
  * composite's instruction-cache ratchet does not pay for it.
  */
+/* Whether this thread may rasterize into the cache. Only a cache miss asks. */
+static bool chrome_glyph_load_allowed(void)
+{
+#if defined(__PSP__)
+    return chrome_font_cache.owner_thread == 0
+        || sceKernelGetThreadId() == chrome_font_cache.owner_thread;
+#else
+    return true;
+#endif
+}
+
+/* Cache slot states. A character the face lacks is settled; a load the
+   Budget refused is not, because pressure passes. Such a slot is retried on
+   later owner-thread misses, a bounded number of times, and only then
+   treated as missing. */
+#define UI_CHROME_GLYPH_LOADED 1u
+#define UI_CHROME_GLYPH_MISSING 2u
+#define UI_CHROME_GLYPH_REFUSED_FIRST 3u
+#define UI_CHROME_GLYPH_REFUSED_LIMIT 4u
+
 static __attribute__((noinline)) uint8_t chrome_glyph_load(
-    size_t weight, unsigned codepoint, int pixel_height, FontGlyph *glyph)
+    size_t weight, unsigned codepoint, int pixel_height, FontGlyph *glyph,
+    uint8_t previous)
 {
     const FontFace *face = chrome_font_cache.faces[weight];
-    if (!font_face_has_codepoint(face, codepoint)) return 2u;
-    return font_glyph_load(face, codepoint, pixel_height, false, glyph)
-        ? 1u : 2u;
+    if (!font_face_has_codepoint(face, codepoint))
+        return UI_CHROME_GLYPH_MISSING;
+    if (font_glyph_load(face, codepoint, pixel_height, false, glyph))
+        return UI_CHROME_GLYPH_LOADED;
+    unsigned refusals = previous >= UI_CHROME_GLYPH_REFUSED_FIRST
+        ? previous - UI_CHROME_GLYPH_REFUSED_FIRST + 1u : 0u;
+    return refusals + 1u >= UI_CHROME_GLYPH_REFUSED_LIMIT
+        ? UI_CHROME_GLYPH_MISSING
+        : (uint8_t) (UI_CHROME_GLYPH_REFUSED_FIRST + refusals);
+}
+
+static bool chrome_glyph_slot_retryable(uint8_t state)
+{
+    return state == 0u || state >= UI_CHROME_GLYPH_REFUSED_FIRST;
 }
 
 static const FontGlyph *chrome_font_glyph(
@@ -1211,7 +1318,7 @@ static const FontGlyph *chrome_font_glyph(
                 victim = entry;
             }
         }
-        if (victim == NULL) return NULL;
+        if (victim == NULL || !chrome_glyph_load_allowed()) return NULL;
         if (victim->loaded == 1u)
             font_glyph_destroy(
                 chrome_font_cache.faces[victim->weight], &victim->glyph);
@@ -1222,7 +1329,7 @@ static const FontGlyph *chrome_font_glyph(
         victim->age = ++chrome_font_cache.unicode_clock;
         int pixel_height = size == 0u ? 11 : 15;
         victim->loaded = chrome_glyph_load(
-            weight, codepoint, pixel_height, &victim->glyph);
+            weight, codepoint, pixel_height, &victim->glyph, 0u);
         if (victim->loaded != 1u) {
             if (known_missing != NULL) *known_missing = true;
             return NULL;
@@ -1230,15 +1337,19 @@ static const FontGlyph *chrome_font_glyph(
         return &victim->glyph;
     }
     size_t at = (size_t) (codepoint - UI_CHROME_GLYPH_FIRST);
-    if (chrome_font_cache.loaded[weight][size][at] == 0u) {
+    uint8_t *state = &chrome_font_cache.loaded[weight][size][at];
+    if (chrome_glyph_slot_retryable(*state)) {
+        /* An off-owner miss draws the built-in bitmap for this tick; the
+           owner loads the glyph on its next frame. */
+        if (!chrome_glyph_load_allowed()) return NULL;
         /* Compact chrome is viewed on a physical 4.3-inch panel. One extra
            pixel materially improves it without changing panel geometry. */
         int pixel_height = size == 0u ? 11 : 15;
-        chrome_font_cache.loaded[weight][size][at] = chrome_glyph_load(
+        *state = chrome_glyph_load(
             weight, codepoint, pixel_height,
-            &chrome_font_cache.glyphs[weight][size][at]);
+            &chrome_font_cache.glyphs[weight][size][at], *state);
     }
-    if (chrome_font_cache.loaded[weight][size][at] != 1u) {
+    if (*state != UI_CHROME_GLYPH_LOADED) {
         if (known_missing != NULL) *known_missing = true;
         return NULL;
     }
@@ -1318,6 +1429,7 @@ static int draw_text_with_font(
         glyph = chrome_font_glyph(
             codepoint, scale, chrome_bold, NULL);
         bool transient_loaded = glyph == NULL && font != NULL
+            && chrome_glyph_load_allowed()
             && font_face_has_codepoint(font, codepoint)
             && font_glyph_load(
                 font, codepoint, 7 * scale, false, &transient_glyph);

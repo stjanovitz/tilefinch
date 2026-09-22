@@ -118,6 +118,15 @@ def psp_firmware_backend_destroy(source: str):
         source.index("static bool psp_media_backend_create_track_info(")]
 
 
+def frame_pump_policy(name):
+    """Source text of one entry in the declared frame-pump policy table."""
+    policies = without_comments(
+        (ROOT / "src/frame_pumps.c").read_text(encoding="utf-8"))
+    start = policies.index("[FRAME_PUMP_" + name + "] = {")
+    return policies[start:policies.index("},", start)]
+
+
+
 class PspSdkContractTests(unittest.TestCase):
     def test_setup_cpu_donation_preserves_priority_and_input_ownership(self):
         transport = without_comments((ROOT / "src/fetch/background_transport.inc").read_text())
@@ -1341,16 +1350,167 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn(
             "browser_engine_pending_navigation_url(browser->engine)", pump)
 
+    def test_every_frame_pump_site_asks_and_records(self):
+        """The policy table only governs work that goes through it.
+
+        tests/test_frame_pumps.c proves properties of the table by simulating
+        call sites which ask for admission and record their slice. That proof
+        says nothing about the real loop unless the real call sites do the
+        same, so pin the wiring: every pump identifier is both admitted and
+        recorded in the frontend, and every call of a pump's work function
+        sits behind the admission of that pump.
+        """
+        header = (ROOT / "include/tilefinch/frame_pumps.h").read_text(
+            encoding="utf-8")
+        enum = header[header.index("typedef enum {"):
+                      header.index("} FramePumpId;")]
+        pumps = [name for name in re.findall(r"FRAME_PUMP_([A-Z_]+)", enum)
+                 if name != "COUNT"]
+        self.assertGreaterEqual(len(pumps), 10)
+
+        sources = [ROOT / "src/psp_script_main.c"] + sorted(
+            path for path in (ROOT / "src/psp_app").glob("*.c")
+            if path.name != "psp_app_frame_pumps.c")
+        frontend = "\n".join(
+            without_comments(path.read_text(encoding="utf-8"))
+            for path in sources)
+
+        def mentions(function, pump):
+            return re.search(
+                function + r"\(\s*&?app,\s*FRAME_PUMP_" + pump + r"\b",
+                frontend) is not None
+
+        # Site restoration selects one of its two identifiers at run time and
+        # passes the variable, so its identifiers are checked where they are
+        # chosen rather than at the call.
+        restore = frontend[
+            frontend.index("bool psp_site_data_restore_idle_pump("):]
+        restore = restore[:restore.index("\n}\n")]
+        selected = {"SITE_RESTORE_STORAGE", "SITE_RESTORE_CACHE"}
+        for name in selected:
+            self.assertIn("FRAME_PUMP_" + name, restore)
+        self.assertIn("psp_app_frame_pump_admit(app, pump,", restore)
+        self.assertIn("psp_app_frame_pump_ran(app, pump)", restore)
+        self.assertLess(
+            restore.index("psp_app_frame_pump_admit(app, pump,"),
+            restore.index("psp_site_data_restore_pump("))
+        self.assertLess(
+            restore.index("psp_site_data_restore_pump("),
+            restore.index("psp_app_frame_pump_ran(app, pump)"))
+
+        for name in pumps:
+            if name in selected:
+                continue
+            run = mentions("psp_app_frame_pump_run", name)
+            self.assertTrue(
+                run or mentions("psp_app_frame_pump_admit", name),
+                name + " never asks the policy table for admission")
+            self.assertTrue(
+                run or mentions("psp_app_frame_pump_ran", name),
+                name + " never records the slice it consumed")
+
+        # Each work function, the pump which must guard it, and how far back
+        # the admission may sit. Distances are generous bounds on one block,
+        # not layout pins.
+        guarded = {
+            "fetch_preconnect_pump(": ("PRECONNECT", 200),
+            "psp_update_session_pump(": ("UPDATE_SESSION", 200),
+            "screenshot_png_pump(": ("SCREENSHOT", 300),
+            "psp_offline_store_pump(": ("OFFLINE_DOWNLOAD", 800),
+            "browser_engine_run_idle_work(": ("PAGE_IDLE", 1200),
+            "browser_engine_run_deferred_image_work(":
+                ("DEFERRED_IMAGE", 900),
+            "browser_engine_pump_baseline_fonts(": ("BASELINE_FONTS", 300),
+        }
+        for call, (name, reach) in guarded.items():
+            sites = [match.start() for match in re.finditer(
+                re.escape(call), frontend)]
+            self.assertTrue(sites, call + " is no longer called")
+            for site in sites:
+                before = frontend[max(0, site - reach):site]
+                self.assertIn(
+                    "FRAME_PUMP_" + name, before,
+                    call + " runs without the admission of " + name)
+
+        # The resolver pump is gated by the admission result its caller
+        # computed, and only a tick that pumped records a slice.
+        youtube = without_comments(
+            (ROOT / "src/psp_app/psp_app_youtube.c").read_text(
+                encoding="utf-8"))
+        gate = youtube.index("if (!pump_allowed) return;")
+        pump = youtube.index("youtube_resolve_job_pump(")
+        self.assertLess(gate, pump)
+        self.assertIn("pumped_this_tick = true", youtube[gate:pump])
+        self.assertRegex(
+            youtube,
+            r"bool pump_allowed = eligible && psp_app_frame_pump_admit\(\s*app, "
+            r"FRAME_PUMP_PROVIDER_PRERESOLVE")
+        self.assertRegex(
+            youtube,
+            r"if \(preresolve->pumped_this_tick\)\s*"
+            r"psp_app_frame_pump_ran\(app, FRAME_PUMP_PROVIDER_PRERESOLVE\)")
+
+        # Restoration has exactly two callers outside the optional path, and
+        # both are mandatory work rather than idle work: the navigation gate
+        # (localStorage must be complete before a commit) and exit cleanup,
+        # which runs after the frame loop has ended.
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        calls = [match.start() for match in re.finditer(
+            r"(?<!bool )psp_site_data_restore_pump\(", main)]
+        self.assertEqual(len(calls), 3)
+        gate_start = main.index(
+            "bool psp_site_data_restore_gate_navigation(")
+        self.assertTrue(gate_start < calls[0] < main.index(
+            "bool psp_site_data_restore_idle_pump("))
+        self.assertGreater(calls[2], main.index("psp_browser_close("))
+
+        # Nothing infers a slice from an earlier sample: a writer can start
+        # and finish between two admissions.
+        binding = without_comments(
+            (ROOT / "src/psp_app/psp_app_frame_pumps.c").read_text(
+                encoding="utf-8"))
+        self.assertNotIn("previous_active", binding + header)
+        # Conditions are sampled only when the pump's own policy names them.
+        self.assertIn("needed = policy->blocked_by", binding)
+        self.assertIn("yields = policy->yields_to_active", binding)
+        for predicate in ("psp_media_open_work_pending(",
+                          "browser_engine_navigation_pending(",
+                          "offline_download_manager_active(",
+                          "fetch_preconnect_in_flight("):
+            at = binding.index(predicate)
+            guard = max(binding.rfind("REFUSE_IF(", 0, at),
+                        binding.rfind("YIELD_IF_ACTIVE(", 0, at))
+            self.assertGreater(guard, 0)
+            self.assertLess(at - guard, 260, predicate + " is unconditional")
+
     def test_background_downloads_do_not_starve_behind_hidden_media(self):
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         download = main[
             main.index("bool offline_download_active ="):
             main.index("bool runtime_layout_changed = false;")]
+        # The hidden decoder is reclaimed before admission asks whether a
+        # pipeline is still resident, so a closed player cannot leave the
+        # queued download permanently refused.
         self.assertLess(
             download.index(
                 "psp_media_reclaim_hidden_pipeline(&browser->media)"),
-            download.index("browser->media.playback == NULL"))
+            download.index(
+                "psp_app_frame_pump_run(&app, FRAME_PUMP_OFFLINE_DOWNLOAD)"))
+        self.assertIn(
+            "FACTS_MEDIA_PIPELINE", frame_pump_policy("OFFLINE_DOWNLOAD"))
+        policies = (ROOT / "src/frame_pumps.c").read_text(encoding="utf-8")
+        pipeline = policies[policies.index("#define FACTS_MEDIA_PIPELINE"):]
+        self.assertIn(
+            "FRAME_FACT_MEDIA_PLAYBACK", pipeline[:pipeline.index(")")])
+        binding = without_comments(
+            (ROOT / "src/psp_app/psp_app_frame_pumps.c").read_text(
+                encoding="utf-8"))
+        self.assertRegex(
+            binding,
+            r"REFUSE_IF\(FRAME_FACT_MEDIA_PLAYBACK,\s*"
+            r"browser->media\.playback != NULL\)")
         updater = main[
             main.index("if (update_check_pending"):
             main.index("PspUiIntent intent =")]
@@ -5964,10 +6124,12 @@ class PspSdkContractTests(unittest.TestCase):
             "browser_engine_run_idle_work(", idle_start)]
         self.assertNotIn("browser->youtube_preresolve.state", idle)
         self.assertNotIn("PSP_YOUTUBE_PRERESOLVE_RESOLVING", idle)
-        self.assertIn("page_input_active ||", idle)
-        self.assertIn("app->browser->media.ui.visible", idle)
-        self.assertIn(
-            "psp_media_open_work_pending(&app->browser->media)", idle)
+        self.assertIn("FRAME_PUMP_PAGE_IDLE", idle)
+        self.assertIn("page_input_active", idle)
+        page_idle = frame_pump_policy("PAGE_IDLE")
+        for fact in ("FRAME_FACT_INPUT_BUTTONS", "FRAME_FACT_INPUT_INTENT",
+                     "FRAME_FACT_MEDIA_VISIBLE", "FRAME_FACT_MEDIA_OPEN"):
+            self.assertIn(fact, page_idle)
         observe = main.index("psp_app_youtube_preresolve_tick(")
         idle_schedule = main.index(
             "psp_schedule_page_render_work(", observe)
@@ -5981,10 +6143,13 @@ class PspSdkContractTests(unittest.TestCase):
         image_pump = main.index(
             "browser_engine_run_deferred_image_work(", helper)
         post_present_guard = main[helper:image_pump]
-        self.assertIn("page_idle_pumped", post_present_guard)
+        self.assertIn("FRAME_PUMP_DEFERRED_IMAGE", post_present_guard)
         self.assertIn("render_job_pending", post_present_guard)
         self.assertIn("input_active", post_present_guard)
-        self.assertIn("media.ui.visible", post_present_guard)
+        deferred_image = frame_pump_policy("DEFERRED_IMAGE")
+        # It does not share a frame with a page-idle slice or a visible player.
+        self.assertIn("PUMP(PAGE_IDLE)", deferred_image)
+        self.assertIn("FRAME_FACT_MEDIA_VISIBLE", deferred_image)
         self.assertIn(
             "browser_engine_prepare_focused_provider_media_thumbnail(",
             frontend)
@@ -6579,8 +6744,15 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("typedef struct {", main.index(
                 "psp_site_data_restore_idle_pump("))]
         terminal = idle.index("PSP_SITE_DATA_RESTORE_DONE) return false")
-        veto_chain = idle.index("bool cache_restore_may_run")
-        self.assertLess(terminal, veto_chain)
+        admission = idle.index("psp_app_frame_pump_admit(")
+        self.assertLess(terminal, admission)
+        # Only the expendable cache half stays out of the association ladder.
+        self.assertIn(
+            "FRAME_FACT_NETWORK_WARMING",
+            frame_pump_policy("SITE_RESTORE_CACHE"))
+        self.assertNotIn(
+            "FRAME_FACT_NETWORK_WARMING",
+            frame_pump_policy("SITE_RESTORE_STORAGE"))
 
         navigation = main[
             main.index("bool site_data_waiting ="):

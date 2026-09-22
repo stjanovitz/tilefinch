@@ -13,6 +13,7 @@
 #include <curl/curl.h>
 
 #include "fetch_redirect_abort.h"
+#include "diagnostic_trace.h"
 
 /* The explicit legacy PSP escape hatch still ships libcurl 7.64. Map the
    post-7.85 string-list protocol options and 7.66's curl_multi_poll onto

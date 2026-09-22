@@ -30,6 +30,10 @@ may record API lookups, task failures, network shape, cookie names, and the
 eventual clearance state; they must not patch the challenge, synthesize its
 payload, import clearance from another browser, or add a site-specific client.
 
+The probes and command scripts used for these observations are kept together,
+with what each one reports, in
+[`tests/fixtures/challenge-lab/`](../../tests/fixtures/challenge-lab/README.md).
+
 The current qualification establishes these boundaries:
 
 - Browser/API comparison found and fixed a real same-origin iframe difference:
@@ -275,6 +279,13 @@ skips downloaded author scripts but leaves the runtime enabled. The native
 search/edit/submit/link-focus/Back regression in
 `tests/fixtures/no-javascript-search.commands` runs in the standard interactive
 acceptance gate without JavaScript.
+
+A page that sets `globalThis.pocSummary` has it printed as
+`javascript summary="..."`, which is how small host micro-benchmarks report.
+`benchmarks/fixtures/computed-style-reads.html` is one: it times
+`getComputedStyle()` creation, reads and membership tests, and carries its run
+command and reference numbers in its header. It is a before/after comparison
+tool, not a gate.
 
 `psp-browser-interactive-lab` exercises the persistent layers together. It retains JavaScript and session state, can advance the bounded timer clock, load quota-controlled same-origin scripts, repeat navigation to exercise HTTP validators and the script cache, drive controller focus/edit/activation, follow GET/POST form actions, and render the resulting page:
 

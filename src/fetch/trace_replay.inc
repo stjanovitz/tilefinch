@@ -3,7 +3,7 @@ static bool trace_replay_diagnostics_enabled(void)
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
     return true;
 #else
-    return getenv("TILEFINCH_TRACE_REPLAY_DIAGNOSTICS") != NULL;
+    return tilefinch_trace_replay_diagnostics();
 #endif
 }
 

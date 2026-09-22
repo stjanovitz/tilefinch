@@ -76,6 +76,15 @@ smaller. "Writer" names the owning source file.
 | `theme.tfth` | legacy user-provided theme | ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only compatibility path for an older Custom selection |
 | `adblock.txt`, `adblock-allow.txt` | user-provided | read-only | user-managed | n/a |
 
+Not everything a page may store reaches this directory. The origin-private
+file system (`navigator.storage.getDirectory()`) is deliberately RAM-only: at
+most 32 files and directories across all origins, 64 KiB per file, 256 KiB in
+total, charged to the session `Budget` and allocated on first write. It is
+never serialized, so it does not survive exit, and it is excluded from the
+site-data snapshot. Per-site **Clear site data** removes that origin's
+entries, **Clear session storage** removes every origin's, and a captive-portal
+session is given an empty store of its own.
+
 Each discipline can briefly hold up to three generations of a file
 (`.tmp` + `.bak` + primary) while a save is in flight; budget accordingly for
 the two 5 MB site-data stores. Stale `.tmp` files from an interrupted save are

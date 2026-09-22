@@ -1107,7 +1107,7 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
             return JS_ThrowTypeError(context, "CORS preflight failed");
         }
     }
-    if (getenv("TILEFINCH_TRACE_REQUEST_BODY") != NULL && body != NULL
+    if (tilefinch_trace_request_body() && body != NULL
         && body_length <= 256 && memchr(body, '\0', body_length) == NULL) {
         fprintf(stderr, "page-request-body method=%s url=%s bytes=%zu value=\"%s\"\n",
                 method, url, body_length, body);
@@ -2886,7 +2886,7 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         bridge->fetch_scheduler, task->request_url, &request,
         response_limit, timeout_ms) : 0;
     if (task->request_id == 0) {
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "dynamic-script-enqueue-failure url=\"%s\" "
                     "valid=%s response-limit=%zu scheduler=%s\n",
@@ -3317,7 +3317,7 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
         }
         bool fatal = false;
         if (!selected->success) {
-            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+            if (tilefinch_trace_script_failures()) {
                 fprintf(stderr,
                         "dynamic-script-ready-failure url=\"%s\" "
                         "sequence=%llu module=%s state=%d\n",

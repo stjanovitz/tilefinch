@@ -497,7 +497,7 @@ static void wasm_import_raw_callback(
 
 static bool wasm_trace_enabled(void)
 {
-    return getenv("TILEFINCH_TRACE_WASM") != NULL;
+    return tilefinch_trace_wasm();
 }
 
 static void wasm_runtime_release_if_idle(void)

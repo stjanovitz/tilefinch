@@ -3,6 +3,7 @@ set(TILEFINCH_CORE_SOURCES
     src/browser_profile.c
     src/browser_tabs.c
     src/budget.c
+    src/frame_pumps.c
     src/tilefinch_test_faults.c
     src/captive_portal.c
     src/content_blocker.c
@@ -268,6 +269,20 @@ if(NOT PSP_BROWSER_ENABLE_GIF)
 endif()
 if(PSP_BROWSER_DISABLE_TRACE)
     target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_NO_TRACE=1)
+endif()
+if(TILEFINCH_OWNER_CHECKS)
+    # PUBLIC: the check adds owner fields to Budget, so every consumer must
+    # agree on the structure layout.
+    target_compile_definitions(tilefinch_core PUBLIC TILEFINCH_OWNER_CHECKS=1)
+    if(NOT PSP)
+        # The host check identifies threads through pthreads. Declare it with
+        # the option: macOS folds these symbols into its system library, but
+        # other hosts require explicit linkage. PUBLIC because budget.h then
+        # includes <pthread.h> for every consumer.
+        set(THREADS_PREFER_PTHREAD_FLAG ON)
+        find_package(Threads REQUIRED)
+        target_link_libraries(tilefinch_core PUBLIC Threads::Threads)
+    endif()
 endif()
 if(TILEFINCH_PROFILE_LAYOUT_FLOW)
     if(NOT PSP OR NOT TILEFINCH_PSP_VALIDATION_LOG)

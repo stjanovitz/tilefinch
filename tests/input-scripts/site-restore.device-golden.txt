@@ -1,0 +1,3 @@
+tilefinch-input-script: text-entry=danzeff
+tilefinch-input-script: armed script=input-script.txt steps=2 stall-limit=1800
+tilefinch-input-script: outcome=complete steps=1/2 frames=600 held-frames=0 actions=0 settings=0
