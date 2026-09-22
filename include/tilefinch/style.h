@@ -100,6 +100,15 @@ typedef int32_t StyleLength;
 #define STYLE_LENGTH_FIT_CONTENT (INT32_MAX - 3)
 #define STYLE_LENGTH_DIRECT_LIMIT INT32_C(1048575)
 
+/* ComputedStyle.line_height: zero is the `normal` keyword, a negative value
+   is a multiplier in thousandths awaiting the element's font size, and a
+   positive value is device pixels. An authored zero (`0`, `0px`, `0%`) is a
+   fourth case: it must serialize as `0px`, not `normal`, so it keeps this
+   sentinel through the cascade and inheritance. Its glyph ink overflows a
+   zero-height line box rather than advancing flow with normal metrics. */
+#define STYLE_LINE_HEIGHT_ZERO INT32_MIN
+#define STYLE_LINE_HEIGHT_INVALID (INT32_MIN + 1)
+
 #define STYLE_INSET_TOP_PERCENT UINT8_C(1)
 #define STYLE_INSET_RIGHT_PERCENT UINT8_C(2)
 #define STYLE_INSET_BOTTOM_PERCENT UINT8_C(4)
@@ -294,7 +303,12 @@ enum {
     VERTICAL_SUB,
     VERTICAL_MIDDLE,
     VERTICAL_TOP,
-    VERTICAL_BOTTOM
+    VERTICAL_BOTTOM,
+    /* Retained so CSSOM reports what was authored. Every layout consumer
+       tests for the specific keywords above, so these two align as
+       `baseline`, exactly as they did while they were stored as it. */
+    VERTICAL_TEXT_TOP,
+    VERTICAL_TEXT_BOTTOM
 };
 
 typedef uint8_t AppearanceMode;

@@ -1009,6 +1009,9 @@ lxb_dom_node_t *dom_document_order_next(
 JSValue js_computed_style_get(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
+JSValue js_computed_style_support(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv);
 JSValue js_dom_append(JSContext *context, JSValueConst this_value,
                       int argc, JSValueConst *argv);
 JSValue js_dom_prepare_dynamic_subtree(JSContext *context,

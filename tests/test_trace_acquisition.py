@@ -255,10 +255,11 @@ def _stub_cache_root() -> Path | None:
     stub executables.
 
     The first execution of a newly written executable is authorized by one
-    system-wide macOS scanner whose latency is unbounded under load: about
-    0.2 s idle, seconds when other first executions are queued, and past the
-    tooling's 120 s subprocess cap when a parallel ctest run has many tests
-    writing executables at once.  Keeping each stub at a content-addressed
+    system-wide macOS scanner whose latency grows under load: about 0.2 s
+    idle, more when other first executions are queued.  (It was never shown
+    to reach the tooling's 120 s subprocess cap.  The 120 s failures once
+    attributed to it were an inherited standard input; see _run.)  Keeping
+    each stub at a content-addressed
     path means a given stub text is written, and therefore assessed, once per
     machine rather than once per run.  The scanner itself is untouched.
 
@@ -613,29 +614,42 @@ class TraceAcquisitionTests(unittest.TestCase):
         environment = self._environment(mode)
         if environment_updates is not None:
             environment.update(environment_updates)
-        return subprocess.run(
-            [
-                sys.executable,
-                str(TOOL_PATH),
-                "--contract",
-                str(self.contract),
-                "--diagnostic",
-                str(self.diagnostic),
-                "--source-trace",
-                str(self.source),
-                "--output-trace",
-                str(output),
-                "--recorder",
-                str(self.recorder),
-                "--native-inventory",
-                str(native_inventory or self.native_inventory),
-            ],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-        )
+        # Every run gets a standard input that stays open and never reaches
+        # end-of-file, which is what a CI runner or a parent process commonly
+        # leaves behind.  The tool must not pass it to its helpers: the node
+        # wrapper below reads standard input to the end, so an inherited open
+        # pipe used to park it until the tool's 120 s cap and turn a security
+        # assertion into an intermittent timeout, depending only on how the
+        # test happened to be launched.
+        hostile_input, never_written = os.pipe()
+        try:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(TOOL_PATH),
+                    "--contract",
+                    str(self.contract),
+                    "--diagnostic",
+                    str(self.diagnostic),
+                    "--source-trace",
+                    str(self.source),
+                    "--output-trace",
+                    str(output),
+                    "--recorder",
+                    str(self.recorder),
+                    "--native-inventory",
+                    str(native_inventory or self.native_inventory),
+                ],
+                check=False,
+                text=True,
+                stdin=hostile_input,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+        finally:
+            os.close(hostile_input)
+            os.close(never_written)
 
     def test_atomic_merge_retains_origin_and_redacted_response_cookie(self) -> None:
         source_sha, _source_bytes = ACQUIRE.trace_digest(

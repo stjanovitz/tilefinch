@@ -302,7 +302,7 @@ static bool curl_global_release(void)
         (void) budget_concurrent_pool_metrics(
             &curl_concurrent_pool, &curl_last_pool_metrics);
 #if !defined(__PSP__)
-        if (getenv("TILEFINCH_TRACE_CURL_POOL") != NULL) {
+        if (tilefinch_trace_curl_pool()) {
             fprintf(stderr,
                     "tilefinch-curl-pool: limit=%zu peak=%zu current=%zu "
                     "active=%zu allocations=%zu frees=%zu failures=%zu\n",

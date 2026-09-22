@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width">
+<style>
+:root { --accent: #336699; --gap: 6px; }
+body { margin: 0; font: 16px/1.25 sans-serif; color: #222; }
+#plain { }
+#box {
+  width: 50%; height: 40px; min-width: 10px; max-width: 90%;
+  min-height: 5px; max-height: 300px;
+  margin: 1px 2px 3px 4px; padding: 2px 5% 4px 8px;
+  border: 2px solid var(--accent); border-left: 4px dashed rgba(10, 20, 30, .5);
+  border-radius: 4px 8px; box-sizing: border-box;
+  background: #fafafa url(bg.png) no-repeat; background-size: 50% auto;
+  background-position: 10% 20%; background-clip: padding-box;
+  background-origin: content-box;
+  outline: 3px dotted red; outline-offset: 2px;
+  opacity: .75; overflow: hidden auto; z-index: 3; position: relative;
+  top: 1px; left: 2px; right: 3px; bottom: 4px;
+  box-shadow: 1px 2px 3px #000; cursor: pointer;
+}
+#text {
+  font: italic 700 20px/30px serif; letter-spacing: 2px; word-spacing: 3px;
+  text-align: center; text-indent: 12px; text-transform: uppercase;
+  text-decoration: underline; text-overflow: ellipsis; text-shadow: 1px 1px #000;
+  white-space: pre-wrap; direction: rtl; unicode-bidi: isolate;
+  vertical-align: text-top; tab-size: 4; hyphens: none; font-kerning: none;
+  overflow-wrap: anywhere; word-break: break-all; visibility: hidden;
+  text-wrap: balance; user-select: none; touch-action: pan-x;
+  -webkit-line-clamp: 3; color: rgb(1 2 3 / 50%);
+}
+#flex {
+  display: flex; flex-direction: column-reverse; flex-wrap: wrap;
+  justify-content: space-between; align-items: center; align-content: flex-end;
+  gap: var(--gap) 10%; width: 300px;
+}
+#item { flex: 2 3 40%; align-self: flex-start; order: 5; }
+#grid {
+  display: grid; grid-template-columns: 1fr 2fr 40px;
+  grid-template-rows: auto 20px; grid-template-areas: "a b c" "d e f";
+  row-gap: 4px; column-gap: 8px;
+}
+#fx {
+  transform: translate(10px, 5px) scale(2); transform-origin: 10px 20px;
+  perspective: 100px; filter: blur(2px); clip-path: inset(1px 2px);
+  will-change: transform; pointer-events: none; contain: layout;
+  content-visibility: auto; aspect-ratio: 16 / 9; isolation: isolate;
+  mix-blend-mode: multiply; backface-visibility: hidden;
+  transition: opacity .25s ease-in, color 1s; resize: both;
+  scroll-behavior: smooth; scroll-snap-type: x mandatory;
+  scroll-margin-top: 7px; scroll-padding: 3px; overscroll-behavior: contain;
+  scrollbar-width: thin; appearance: none; object-fit: cover;
+  object-position: 25% 75%; translate: 1px 2px; rotate: 45deg; scale: 1.5;
+  color-scheme: dark; text-size-adjust: 80%;
+}
+#float { float: right; clear: both; width: 120px; }
+#tab { border-collapse: collapse; border-spacing: 3px 5px; caption-side: bottom;
+  table-layout: fixed; width: 200px; }
+#list { list-style: square inside; }
+#host { width: 200px; height: 100px; padding: 0 10px; }
+#host::before { content: "b"; display: block; width: 20px; height: 10px;
+  padding-left: 10%; color: blue; }
+#host::after { content: ""; display: inline-block; line-height: 0; }
+#gone { display: none; width: 40px; }
+#inl { width: 100px; height: 50px; }
+#pos { position: absolute; inset: 5px auto auto 7px; width: auto; }
+#imp { line-height: 30px !important; }
+#cb { position: relative; width: 400px; padding: 0 20px; }
+#cbwrap { width: 100px; }
+#cbabs { position: absolute; top: 0; left: 0; width: 50px; padding: 0 10%; }
+#calczero { line-height: calc(10px - 10px); }
+#lhpseudo::before { content: "b"; font-size: 10px; line-height: 3; }
+</style>
+</head>
+<body>
+<div id="plain">p</div>
+<div id="box">b</div>
+<p id="text">t <span id="textchild">c</span></p>
+<div id="flex"><div id="item">i</div><div id="plainitem">j</div></div>
+<div id="grid"><div id="cell">1</div><div>2</div><div>3</div></div>
+<div id="fx">f</div>
+<div id="float">fl</div>
+<table id="tab"><caption>c</caption><tr><td id="td" valign="middle">x</td></tr></table>
+<ol id="list"><li id="li">o</li></ol>
+<div id="host">h</div>
+<div id="gone">g</div>
+<span id="inl" style="width:100px;height:50px">s</span>
+<div id="pos">a</div>
+<div id="imp" style="line-height:10px;--local: 5px;margin-left:var(--local)">m</div>
+<a id="link" href="/x">l</a>
+<div id="cb"><div id="cbwrap"><div id="cbabs">a</div></div></div>
+<div id="calczero">z</div>
+<div id="lhpseudo">p</div>
+<img id="img" width="30" height="20" alt="">
+<input id="input" type="text" value="v">
+<svg id="svg" width="40" height="40"><rect id="rect" width="10" height="10"
+  fill="red" stroke="#00f" stroke-width="2" opacity=".5" cursor="move"/></svg>
+</body>
+</html>

@@ -8,6 +8,12 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.26 — 2026-09-21
+
+- Improved page layout and computed-style compatibility on complex sites.
+- Improved PSP cursor responsiveness, UI rendering, and frame scheduling.
+- Hardened JavaScript memory handling and runtime diagnostics.
+
 ## 0.1.25 — 2026-09-19
 
 - Fixed dynamic styling and motion handling on large pages.

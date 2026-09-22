@@ -48,6 +48,7 @@
 #include "tilefinch/cancellation.h"
 #include "tilefinch/captive_portal.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/frame_pumps.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/media_backend.h"
@@ -226,6 +227,13 @@ bool psp_run_initial_page_load(
     BrowserEngine *engine, PspUiState *ui, const uint16_t *frame,
     const char *url, size_t maximum_bytes, long timeout_ms,
     const char *argv0, bool dump_provisional, bool *stopped);
+/* Chrome glyph cache changes, serialized against a supervisor presentation
+   that may be drawing from the cache on the callback thread. */
+void psp_presentation_rebind_chrome_fonts(
+    const FontFace *regular, const FontFace *bold, unsigned scale);
+void psp_presentation_preload_chrome_scale(unsigned scale);
+/* Validation log line for what the last chrome-font binding rasterized. */
+void psp_report_chrome_glyph_preload(void);
 BrowserSessionPersistenceLimits psp_site_data_limits(
     unsigned cache_megabytes);
 bool psp_site_data_load(
@@ -499,6 +507,7 @@ bool psp_display_validation_timing_snapshot(
     PspDisplayBackendTiming *timing);
 void psp_video_scanout_note_discontinuity(void);
 void psp_cursor_latency_sample(uint64_t sampled_us);
+void psp_cursor_latency_idle(void);
 void psp_clock_validation_probe(void);
 const char *psp_power_test_phase_name(PspPowerTestPhase phase);
 void psp_power_log_battery(
@@ -526,6 +535,7 @@ bool psp_power_auto_start(
 #define psp_report_presentation_cadence(phase) ((void) 0)
 #define psp_video_scanout_note_discontinuity() ((void) 0)
 #define psp_cursor_latency_sample(sampled_us) ((void) (sampled_us))
+#define psp_cursor_latency_idle() ((void) 0)
 #endif
 
 /* src/psp_app/psp_app_input.c */
@@ -778,6 +788,9 @@ typedef struct {
     ControllerFocusKind observed_focus_kind;
     PspYoutubePreresolveState state;
     bool observation_valid;
+    /* Set by the tick that actually pumped the resolver, so its owner can
+       record the consumed frame slice; cleared at the start of every tick. */
+    bool pumped_this_tick;
 } PspYoutubePreresolve;
 
 void psp_youtube_preresolve_reset(
@@ -903,6 +916,8 @@ typedef struct {
     PspRecoveryTracker recovery;
     PspExitPlan exit;
     PspSiteDataRestore site_data_restore;
+    /* Declared admission state for this frame's optional pumps. */
+    FramePumpFrame frame_pumps;
     PspReaderNavigation reader_navigation;
     PspCaptivePortal *captive_portal;
     bool blank_reader_recovery_pending;
@@ -1023,8 +1038,8 @@ bool psp_captive_portal_active(const PspInteractiveState *interactive);
 /* src/psp_app/psp_app_youtube.c */
 void psp_app_youtube_preresolve_tick(
     PspApp *app, const PspAppFrameState *frame, const PspUiIntent *intent,
-    bool render_job_pending, bool site_data_restore_work,
-    bool offline_download_active, bool input_active);
+    bool render_job_pending, bool offline_download_active,
+    bool input_active);
 
 /* src/psp_app/psp_app_surfaces.c -- declared after PspApp because they take
    it. Every internal-home navigation goes through these two; see the
@@ -1035,6 +1050,16 @@ bool psp_route_native_home(PspApp *app, const char *url);
 /* src/psp_app/psp_app_actions.c */
 void psp_app_dispatch_action(
     PspApp *app, PspAppFrameState *frame, PspUiIntent *intent);
+/* Sample the frame facts and ask the declared pump policy
+   (include/tilefinch/frame_pumps.h). local_facts carries the FRAME_FACT_*
+   bits only the caller can observe: input, page dirt and the render job. */
+bool psp_app_frame_pump_admit(PspApp *app, FramePumpId id,
+                              uint32_t local_facts);
+void psp_app_frame_pump_ran(PspApp *app, FramePumpId id);
+/* Admission and the slice record in one call, for a pump whose slice follows
+   admission unconditionally. Every pump site uses either this or the pair
+   above; tests/test_psp_sdk_contracts.py checks that none is left out. */
+bool psp_app_frame_pump_run(PspApp *app, FramePumpId id);
 void psp_app_pump_provider_handoff_reclaim(
     PspApp *app, uint64_t frame_us, bool player_presented);
 /* src/psp_app/psp_app_settings.c */

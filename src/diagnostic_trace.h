@@ -217,4 +217,223 @@ static inline bool tilefinch_trace_worker_source(void)
 #endif
 }
 
+static inline bool tilefinch_dump_js_pool_at_peak(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_DUMP_JS_POOL_AT_PEAK") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_console(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_CONSOLE") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline const char *tilefinch_trace_cookie_value(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return NULL;
+#else
+    static const char *value;
+    static bool sampled;
+    if (!sampled) {
+        value = getenv("TILEFINCH_TRACE_COOKIE");
+        sampled = true;
+    }
+    return value;
+#endif
+}
+
+static inline bool tilefinch_trace_cookie(void)
+{
+    return tilefinch_trace_cookie_value() != NULL;
+}
+
+static inline bool tilefinch_trace_curl_pool(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_CURL_POOL") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_images(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_IMAGES") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_image_profile(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_IMAGE_PROFILE") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline const char *tilefinch_trace_js_property_faults_value(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return NULL;
+#else
+    static const char *value;
+    static bool sampled;
+    if (!sampled) {
+        value = getenv("TILEFINCH_TRACE_JS_PROPERTY_FAULTS");
+        sampled = true;
+    }
+    return value;
+#endif
+}
+
+static inline bool tilefinch_trace_js_roots(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_module_order(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_MODULE_ORDER") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline const char *tilefinch_trace_raw_cookies_value(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return NULL;
+#else
+    static const char *value;
+    static bool sampled;
+    if (!sampled) {
+        value = getenv("TILEFINCH_TRACE_RAW_COOKIES");
+        sampled = true;
+    }
+    return value;
+#endif
+}
+
+static inline bool tilefinch_trace_react_error(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_REACT_ERROR") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_replay_diagnostics(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_REPLAY_DIAGNOSTICS") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_request_body(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_REQUEST_BODY") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_script_attempts(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_SCRIPT_ATTEMPTS") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline const char *tilefinch_trace_script_residency_value(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return NULL;
+#else
+    static const char *value;
+    static bool sampled;
+    if (!sampled) {
+        value = getenv("TILEFINCH_TRACE_SCRIPT_RESIDENCY");
+        sampled = true;
+    }
+    return value;
+#endif
+}
+
+static inline bool tilefinch_trace_sentinel(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_SENTINEL") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_startup_failure(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_STARTUP_FAILURE") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static inline bool tilefinch_trace_wasm(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_WASM") != NULL;
+    return enabled != 0;
+#endif
+}
+
 #endif

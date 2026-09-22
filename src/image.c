@@ -25,6 +25,7 @@
 #include "image_svg_decode_internal.h"
 #include "style_internal.h"
 #include "style_cache_internal.h"
+#include "diagnostic_trace.h"
 
 #include <lexbor/html/serialize.h>
 
@@ -56,7 +57,7 @@ static void image_trace(const char *reason, const char *source,
                         size_t length)
 {
     static int enabled = -1;
-    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_IMAGES") != NULL;
+    if (enabled < 0) enabled = tilefinch_trace_images();
     if (!enabled) return;
     if (source == NULL) source = "";
     if (length > 200) length = 200;
@@ -413,7 +414,7 @@ static void image_note_request_finished(ImageLoadContext *context,
     } else {
         stats->fetch_failures_transport++;
     }
-    if (getenv("TILEFINCH_TRACE_IMAGES") != NULL) {
+    if (tilefinch_trace_images()) {
         fprintf(stderr,
                 "tilefinch: image fetch-result status=%ld timed-out=%s "
                 "bytes=%zu elapsed-ms=%llu no-progress-ms=%llu "
@@ -452,7 +453,7 @@ static bool image_profile_enabled(void)
 #else
     static int enabled = -1;
     if (enabled < 0) {
-        enabled = getenv("TILEFINCH_TRACE_IMAGE_PROFILE") != NULL;
+        enabled = tilefinch_trace_image_profile();
     }
     return enabled != 0;
 #endif
@@ -3920,7 +3921,7 @@ static bool load_image_node_with_provenance_impl(
     if (pending->request_id == 0) {
         images->stats.failed++;
         image_trace("enqueue-failed", resolved, strlen(resolved));
-        if (getenv("TILEFINCH_TRACE_IMAGES") != NULL) {
+        if (tilefinch_trace_images()) {
             fprintf(stderr, "tilefinch: image enqueue error=%s\n",
                     fetch_scheduler_last_error(context->scheduler));
         }

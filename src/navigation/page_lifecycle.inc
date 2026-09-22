@@ -623,6 +623,39 @@ static ScriptNavigationTiming navigation_timing_from_fetch(
     return timing;
 }
 
+/* Whether a document belongs to a Cloudflare managed challenge, by the two
+   signals the native layer owns. The top-level response says so itself with
+   `cf-mitigated: challenge`. The challenge (and Turnstile) frame does not
+   carry that header, but its document URL is the service's own challenge
+   platform. Neither is read from page script, and neither changes what the
+   browser sends: this only sizes a heap. */
+bool navigation_url_is_challenge_platform(const char *url)
+{
+    static const char platform[] =
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/";
+    return url != NULL
+        && strncmp(url, platform, sizeof(platform) - 1u) == 0;
+}
+
+/* The script-heap limit for one new runtime. Only a child frame is raised.
+   The interpreter that needs the room runs in the challenge frame; the
+   top-level "Just a moment" document peaks near 5 MB and fits the ordinary
+   limit, so it is not given room it does not use. */
+size_t navigation_script_heap_limit(const NavigationSession *session,
+                                    ScriptDocumentScope document_scope,
+                                    const char *url)
+{
+    if (session == NULL) return 0;
+    size_t limit = session->js_memory_limit;
+    if (limit == 0 || limit >= NAVIGATION_MANAGED_CHALLENGE_JS_HEAP_BYTES
+        || document_scope != SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME) return limit;
+    /* Every frame of a challenge page takes part in the challenge, and the
+       platform's own frame is one wherever it is embedded (Turnstile). */
+    return strcmp(session->last_cf_mitigated, "challenge") == 0
+            || navigation_url_is_challenge_platform(url)
+        ? NAVIGATION_MANAGED_CHALLENGE_JS_HEAP_BYTES : limit;
+}
+
 static ScriptRuntime *navigation_create_runtime(
     NavigationSession *session, PocDocument *document, const char *url,
     const char *document_referrer, uint64_t navigation_started_us,
@@ -635,6 +668,10 @@ static ScriptRuntime *navigation_create_runtime(
     ScriptResult *result)
 {
     if (session == NULL) return NULL;
+    size_t js_memory_limit =
+        navigation_script_heap_limit(session, document_scope, url);
+    if (js_memory_limit != session->js_memory_limit)
+        session->managed_challenge_heap_raises++;
     bool bind_remote_document = inherit_remote_document
         && document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL;
     ScriptRuntimeOptions options = {
@@ -691,7 +728,7 @@ static ScriptRuntime *navigation_create_runtime(
             ? session->runtime_section_identity : 0
     };
     ScriptRuntime *runtime = script_runtime_create_configured(
-        document, session->budget, session->js_memory_limit,
+        document, session->budget, js_memory_limit,
         session->js_timeout_ms, url, &options, result);
     if (runtime != NULL && canvas_images != NULL) {
         script_runtime_set_images(runtime, canvas_images);
@@ -1220,7 +1257,7 @@ static bool navigation_retire_exhausted_script_realms(
     size_t remaining = script_runtime_heap_remaining(
         session->page.runtime);
 #ifndef TILEFINCH_NO_TRACE
-    if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+    if (tilefinch_trace_script_failures()) {
         fprintf(stderr,
                 "tilefinch-script-retirement: explicit-oom=%s "
                 "heap-remaining=%zu error=\"%.160s\"\n",
@@ -1737,7 +1774,7 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
                     NULL, false, navigation_frame_parent_result(
                               session, target_owner_frame));
             }
-            if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
+            if (tilefinch_trace_js_roots()
                 && target_owner_frame->runtime != NULL) {
                 script_runtime_report_roots(
                     target_owner_frame->runtime, stderr, "frame-failed",
@@ -1856,7 +1893,7 @@ static bool navigation_retire_detached_frames(NavigationSession *session)
                 false,
                 NULL, false, navigation_frame_parent_result(
                           session, frame))) return false;
-        if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
+        if (tilefinch_trace_js_roots()
             && frame->runtime != NULL) {
             script_runtime_report_roots(frame->runtime, stderr,
                                         "pre-detach", "child",
@@ -3132,7 +3169,7 @@ static bool navigation_complete_frame(NavigationSession *session,
     session->frames_loaded++;
     if (!navigation_refresh_frame_presentation_or_defer(
             session, frame)) return false;
-    if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL) {
+    if (tilefinch_trace_js_roots()) {
         script_runtime_report_roots(frame->runtime, stderr, "frame-loaded",
                                     "child", frame->parent_handle);
     }

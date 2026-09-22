@@ -318,7 +318,7 @@ static bool trace_capture_activate(const BrowserSession *session,
     fetch_trace.mode = FETCH_TRACE_CAPTURE;
     fetch_trace.sequence = 0;
     fetch_trace.clock_origin_ms = trace_wall_time_ms();
-    const char *raw_cookie_opt_in = getenv("TILEFINCH_TRACE_RAW_COOKIES");
+    const char *raw_cookie_opt_in = tilefinch_trace_raw_cookies_value();
     fetch_trace.capture_raw_cookie_values = raw_cookie_opt_in != NULL
         && strcmp(raw_cookie_opt_in, "1") == 0;
     if (!trace_capture_info_write(

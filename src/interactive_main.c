@@ -3330,8 +3330,9 @@ int main(int argc, char **argv)
             break;
         }
     }
-    printf("challenge outcome=%s clearance=%s\n", challenge_outcome,
-           clearance_found ? "present" : "absent");
+    printf("challenge outcome=%s clearance=%s heap-raises=%zu\n",
+           challenge_outcome, clearance_found ? "present" : "absent",
+           navigation.managed_challenge_heap_raises);
     printf("navigation loads=%zu destroys=%zu history=%zu pruned=%zu reloads=%zu\n",
            navigation.loads_committed, navigation.page_destroys,
            navigation.history_count, navigation.history_pruned, reloads);

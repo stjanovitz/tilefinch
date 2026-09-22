@@ -495,7 +495,7 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
         .credentials = credentials
     };
     runtime->active_module_credentials = credentials;
-    if (getenv("TILEFINCH_TRACE_MODULE_ORDER") != NULL) {
+    if (tilefinch_trace_module_order()) {
         fprintf(stderr, "tilefinch: module-load %s <- %s\n", request_url,
                 referrer_url);
     }
@@ -628,7 +628,7 @@ static bool script_runtime_evaluate_external_typed_at(
         return false;
     }
     js_rt_runtime_arm_watchdog(runtime);
-    if (module && getenv("TILEFINCH_TRACE_STARTUP_FAILURE") != NULL) {
+    if (module && tilefinch_trace_startup_failure()) {
         static const char expose_startup_failure[] =
             "if(globalThis.__webMobileStartupRecovery)"
             "globalThis.__webMobileStartupRecovery.recover=()=>false;";
@@ -941,7 +941,7 @@ bool js_rt_preflight_external_classic_segment(
     }
     js_rt_capture_error_source_context(
         source, source_length, name, &runtime->result);
-    if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+    if (tilefinch_trace_script_failures()) {
         fprintf(stderr,
                 "dynamic-script-segment-preflight-failure url=\"%s\" "
                 "bytes=%zu error=\"%s\" context=\"%s\"\n",

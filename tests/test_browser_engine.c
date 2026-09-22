@@ -152,6 +152,39 @@ static void remove_large_youtube_replay(const char *directory)
     (void) rmdir(directory);
 }
 
+static bool write_document_replay(
+    char directory[128], const char *url, const char *html,
+    size_t html_length, long status, const char *cf_mitigated)
+{
+    snprintf(directory, 128, "/tmp/tilefinch-document-replay-XXXXXX");
+    if (mkdtemp(directory) == NULL) return false;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/0000.body", directory);
+    FILE *body = fopen(path, "wb");
+    bool ok = body != NULL
+        && fwrite(html, 1, html_length, body) == html_length
+        && fclose(body) == 0;
+    snprintf(path, sizeof(path), "%s/0000.meta", directory);
+    FILE *meta = ok ? fopen(path, "wb") : NULL;
+    ok = meta != NULL && fprintf(
+        meta,
+        "psp-http-trace=1\nmethod=GET\nurl=%s\n"
+        "success=1\nasync-delay-pumps=0\nexternal-cancel=0\n"
+        "transport-timeout=0\nerror=\nstatus=%ld\nlength=%zu\n"
+        "effective-url=%s\n"
+        "content-type=text/html; charset=utf-8\netag=\nlast-modified=\n"
+        "cf-mitigated=%s\naccept-ch=\ncritical-ch=\nserver=cloudflare\n"
+        "cf-ray=\nset-cookie-count=0\n",
+        url, status, html_length, url, cf_mitigated) > 0
+        && fclose(meta) == 0;
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    FILE *trace = ok ? fopen(path, "wb") : NULL;
+    return trace != NULL && fprintf(
+        trace, "psp-http-trace-clock=1\norigin-ms=1700000000000\n"
+               "capture-complete=yes\nrecord-count=1\n") > 0
+        && fclose(trace) == 0;
+}
+
 static bool write_history_form_replay(
     char directory[128], const char *html, size_t html_length,
     const char *effective_url)
@@ -331,6 +364,14 @@ int main(int argc, char **argv)
         return test_native_text_sync_does_not_relayout_twice();
     if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
         return test_computed_paint_style_does_not_force_layout();
+    if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
+        return test_computed_style_resolved_values();
+    if (argc == 4 && strcmp(argv[1], "--computed-style-dump") == 0)
+        return computed_style_dump(argv[2], argv[3], NULL);
+    if (argc == 5 && strcmp(argv[1], "--computed-style-golden") == 0)
+        return computed_style_dump(argv[2], argv[4], argv[3]);
+    if (argc == 2 && strcmp(argv[1], "--managed-challenge-heap-only") == 0)
+        return test_managed_challenge_script_heap();
     if (argc == 2 && strcmp(argv[1], "--deferred-startup-only") == 0)
         return test_deferred_startup_journey();
     if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
@@ -370,6 +411,8 @@ int main(int argc, char **argv)
     CHECK(test_staged_optional_fonts_relayout_before_repaint() == 0);
     CHECK(test_native_text_sync_does_not_relayout_twice() == 0);
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
+    CHECK(test_computed_style_resolved_values() == 0);
+    CHECK(test_managed_challenge_script_heap() == 0);
     CHECK(test_deferred_image_relayout_requests_repaint() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);

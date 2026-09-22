@@ -10,6 +10,7 @@
  */
 
 #include "tilefinch/psp_display.h"
+#include "tilefinch/psp_input_cadence.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -543,9 +544,27 @@ static bool test_rearm_follows_the_active_surface(void)
     return true;
 }
 
+static bool test_cursor_cadence_excludes_idle_but_not_slow_motion(void)
+{
+    PspInputCadence cadence = {0};
+    psp_input_cadence_observe(&cadence, true, 0);
+    psp_input_cadence_observe(&cadence, true, 16000);
+    psp_input_cadence_observe(&cadence, false, 32000);
+    psp_input_cadence_observe(&cadence, false, 48000);
+    psp_input_cadence_observe(&cadence, true, 1000000);
+    psp_input_cadence_observe(&cadence, true, 1016000);
+    CHECK(cadence.intervals == 2 && cadence.segments == 2);
+    CHECK(cadence.total_us == 32000 && cadence.max_us == 16000);
+    /* A real stall during continued motion must still fail a cadence gate. */
+    psp_input_cadence_observe(&cadence, true, 1116000);
+    CHECK(cadence.intervals == 3 && cadence.max_us == 100000);
+    return true;
+}
+
 int main(void)
 {
-    bool ok = test_publish_uses_next_frame_and_claims_the_mode()
+    bool ok = test_cursor_cadence_excludes_idle_but_not_slow_motion()
+        && test_publish_uses_next_frame_and_claims_the_mode()
         && test_rejected_present_is_a_failure_not_a_frame()
         && test_buffers_rotate_and_stay_distinct()
         && test_refused_mode_is_reported()

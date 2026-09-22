@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "tilefinch/url.h"
+#include "diagnostic_trace.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_SESSION, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_SESSION, (n), (s))
@@ -1809,7 +1810,7 @@ static bool cookie_set(BrowserCookieStore *store,
     } else if (expires_valid && expires_at <= now) {
         remove = true;
     }
-    if (getenv("TILEFINCH_TRACE_COOKIE") != NULL) {
+    if (tilefinch_trace_cookie()) {
         fprintf(stderr, "cookie-store host=%s domain=%s path=%.*s name=%s remove=%d expires-valid=%d expires-delta=%lld max-age-valid=%d\n",
                 parsed.host, domain, (int) path_length, path,
                 name, remove, expires_valid,

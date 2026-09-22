@@ -627,6 +627,11 @@ void psp_app_apply_setting(
             enabled ? "AUTO READER ON" : "AUTO READER OFF", 180);
     }
     if (intent->setting.id == PSP_UI_SETTING_BROWSER_UI_SCALE) {
+        /* Owner thread, page work paused by the menu: fill the chrome cache
+           at the new size before the next frame draws at it. */
+        psp_presentation_preload_chrome_scale(
+            intent->setting.value.unsigned_value);
+        psp_report_chrome_glyph_preload();
         browser_profile_set_ui_scale(
             profile, intent->setting.value.unsigned_value);
         psp_profile_store_mark_dirty(

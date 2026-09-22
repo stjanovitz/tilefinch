@@ -941,7 +941,8 @@ static int test_computed_paint_style_does_not_force_layout(void)
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
     static const char page[] =
-        "<!doctype html><style>body{margin:0}#target{width:100px}</style>"
+        "<!doctype html><style>body{margin:0}#target{width:100px}"
+        ".toggled{font-weight:700;white-space:nowrap}</style>"
         "<div id=target>Paint-only style reads during hydration</div>";
     CHECK(engine != NULL && browser_engine_commit_html(engine,
         "https://style-read.test/", page, sizeof(page) - 1, true));
@@ -956,6 +957,14 @@ static int test_computed_paint_style_does_not_force_layout(void)
         "if(getComputedStyle(target).color!=='rgb('+i+', 0, 0)')throw Error('color');}"
         "target.style.visibility='hidden';"
         "if(getComputedStyle(target).visibility!=='hidden')throw Error('visibility');"
+        /* Text properties resolve from the cascade alone as well. */
+        "target.style.lineHeight='30px';target.style.textAlign='center';"
+        "target.className='toggled';"
+        "var read=getComputedStyle(target);"
+        "if(read.lineHeight!=='30px'||read.textAlign!=='center'"
+        "||read.fontWeight!=='700'||read.whiteSpace!=='nowrap')"
+        "throw Error('text:'+read.lineHeight+'/'+read.textAlign+'/'"
+        "+read.fontWeight+'/'+read.whiteSpace);"
         "target.style.visibility='visible';target.style.width='123px';",
         "<computed-paint-read>", &result) && result.success);
     CHECK(navigation->incremental_relayouts == before);
@@ -972,6 +981,558 @@ static int test_computed_paint_style_does_not_force_layout(void)
         && navigation->incremental_relayouts == before + 2);
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
+    return 0;
+}
+
+/* getComputedStyle() reports resolved values, and only for the properties
+   the engine supports. Every expectation here is an exact value: a test that
+   merely required "not empty" would pass on a table of initial values while
+   the cascade, inheritance and used sizes were all wrong. */
+static int test_computed_style_resolved_values(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}"
+        "#host{font-size:20px;line-height:1.5;text-align:right;direction:rtl;"
+        "letter-spacing:2px;word-spacing:3px;list-style-type:square}"
+        "#imp{line-height:30px!important;text-align:center!important}"
+        "#flex{display:flex}#item{flex:2 3 40%;vertical-align:middle}"
+        "#pct{line-height:150%;font-size:10px}#tab{tab-size:4}"
+        "#half{width:50%;height:30px;padding:0 5px}"
+        "#border{width:50%;box-sizing:border-box;padding:0 5px}"
+        "#pctpad{width:50%;padding:0 10%}"
+        "#pseudo{width:200px;height:100px}"
+        "#pseudo::before{content:'b';display:block;width:20px;height:10px}"
+        "#zero{line-height:0}#zerounit{line-height:0px}"
+        "#zerolines{line-height:0}"
+        "#zerofont{font:10px/0 serif}"
+        "#gone{display:none}#gonesized{display:none;width:40px}"
+        "#grand{width:800px;padding:0 10%}"
+        "#narrow{width:400px;padding:0 10%}"
+        "#nested{padding-left:10%;width:50%}"
+        "#padhost{width:400px;padding:0 50px}"
+        "#padhost::before{content:'b';display:block;padding-left:10%;"
+        "width:20px}"
+        "#ttop{vertical-align:text-top}#tbot{vertical-align:text-bottom}"
+        "#cb{position:relative;width:400px;padding:0 20px}#cbwrap{width:100px}"
+        "#cbabs{position:absolute;top:0;left:0;width:50px;padding:0 10%}"
+        "#cbfix{position:fixed;top:0;left:0;width:50px;padding-left:10%}"
+        "#cbin,#cbfin{padding-left:10%;width:20px}"
+        "#invalidzero{line-height:23px;line-height:0banana}"
+        "#invalidangle{line-height:24px;line-height:0deg}"
+        "#invalidpercent{line-height:25px;line-height:0%%}"
+        "#lhp::before{content:'b';font-size:10px;line-height:3}"
+        "#lhq::before{content:'b';font-size:10px;line-height:150%}"
+        "#calc0{line-height:calc(0)}#calc0px{line-height:calc(0px)}"
+        "#calcdiff{line-height:calc(10px - 10px)}"
+        "#calcsix{line-height:calc(2px * 3)}"
+        "#strut{line-height:20px}#strutzero{line-height:0}"
+        "#strutnext{line-height:20px}"
+        "#inlwrap{width:400px}#inlpad{padding-left:10%}"
+        "#badunit{line-height:23px;line-height:1banana}"
+        "#badunit2{line-height:1.5;line-height:12garbage;font-size:10px}"
+        "#rad{border-radius:1px 2px 3px 4px;direction:rtl;cursor:pointer;"
+        "background-size:50% auto;margin:1px auto 3px 4px}"
+        "#rad::before{content:'r'}"
+        "#under{text-decoration:underline}"
+        "#struck{text-decoration:line-through}"
+        "</style>"
+        "<div id=host><span id=child>x</span></div>"
+        "<div id=imp style='line-height:10px;text-align:left'>y</div>"
+        "<div id=flex><div id=item>z</div><div id=plainitem>w</div></div>"
+        "<div id=pct>p</div><pre id=tab>t</pre><div id=plain>q</div>"
+        "<div id=inl style='line-height:inherit;"
+        "letter-spacing:var(--nope, 1px);word-spacing:2em'>i</div>"
+        "<ol><li id=ordered>o</li></ol>"
+        "<div id=half>h</div><div id=border>b</div>"
+        "<div id=pctpad>p</div><div id=pseudo>s</div>"
+        "<span id=sized style='width:100px;height:50px'>i</span>"
+        "<div id=zero>z</div><div id=zerounit>z</div><div id=zerofont>z</div>"
+        "<div id=gone>g</div><div id=gonesized>g</div>"
+        "<div id=grand><div id=narrow><div id=nested>n</div></div></div>"
+        "<div id=padhost>p</div>"
+        "<span id=ttop>t</span><span id=tbot>t</span>"
+        "<p id=under>u<span id=underchild>c</span></p>"
+        "<p id=struck>s</p><a id=link href='/x'>l</a><div id=rad>r</div>"
+        "<div id=cb><div id=cbwrap><div id=cbabs><div id=cbin>x</div></div>"
+        "<div id=cbfix><div id=cbfin>y</div></div></div></div>"
+        "<div id=strut><span id=strutzero>t</span></div>"
+        "<div id=strutnext>n</div>"
+        "<div id=inlwrap><span><span><span id=inlpad>p</span></span>"
+        "wrapper text</span></div>"
+        "<div id=badunit>b</div><div id=badunit2>b</div>"
+        "<div id=lhp>p</div><div id=lhq>q</div><div id=calc0>a</div>"
+        "<div id=calc0px>b</div><div id=calcdiff>c</div>"
+        "<div id=calcsix>d</div><div id=invalidzero>i</div>"
+        "<div id=invalidangle>a</div><div id=invalidpercent>p</div>"
+        "<div id=zerolines>Visible<br>overflow<br>text</div>";
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://style-values.test/", page, sizeof(page) - 1, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+    ScriptResult result = {0};
+    static const char source[] =
+        "(()=>{const bad=[];"
+        "const want=(id,name,expected)=>{const got=getComputedStyle("
+        "document.getElementById(id)).getPropertyValue(name);"
+        "if(got!==expected)bad.push(id+'.'+name+'='+JSON.stringify(got));};"
+        /* Authored through a stylesheet, then inherited. A unitless
+           line-height is resolved against each element's own font size. */
+        "for(const id of['host','child']){want(id,'line-height','30px');"
+        "want(id,'text-align','right');want(id,'direction','rtl');"
+        "want(id,'letter-spacing','2px');want(id,'word-spacing','3px');"
+        "want(id,'list-style-type','square');}"
+        "want('child','vertical-align','baseline');"
+        /* Raw inline text must never stand in for the resolved value. */
+        "want('imp','line-height','30px');want('imp','text-align','center');"
+        "want('inl','line-height','normal');"
+        "want('inl','letter-spacing','1px');"
+        "want('inl','word-spacing','32px');"
+        /* Scaled integer fields decode to CSS numbers. */
+        "want('item','flex-grow','2');want('item','flex-shrink','3');"
+        "want('item','flex-basis','40%');"
+        "want('item','vertical-align','middle');"
+        "want('plainitem','flex-grow','0');"
+        "want('plainitem','flex-shrink','1');"
+        "want('plainitem','flex-basis','auto');"
+        "want('pct','line-height','15px');want('tab','tab-size','4');"
+        /* Initial values, including `normal` where layout uses a number. */
+        "want('plain','line-height','normal');"
+        "want('plain','text-align','start');want('plain','direction','ltr');"
+        "want('plain','letter-spacing','normal');"
+        "want('plain','word-spacing','0px');"
+        "want('plain','vertical-align','baseline');"
+        "want('plain','writing-mode','horizontal-tb');"
+        "want('plain','unicode-bidi','normal');want('plain','tab-size','8');"
+        "want('plain','table-layout','auto');"
+        "want('plain','list-style-type','disc');"
+        "want('plain','aspect-ratio','auto');"
+        "want('ordered','list-style-type','decimal');"
+        /* An out-of-flow box resolves percentages against its containing
+           block: the positioned ancestor's padding box (400 + 2 * 20), not
+           the 100px static wrapper it sits in; a fixed box uses the initial
+           containing block. Layout must place the content where CSSOM says
+           the padding ends. */
+        "want('cbabs','padding-left','44px');"
+        "want('cbabs','padding','0px 44px 0px 44px');"
+        "want('cbin','padding-left','5px');"
+        "want('cbfin','padding-left','5px');"
+        "want('invalidzero','line-height','23px');"
+        "want('invalidangle','line-height','24px');"
+        "want('invalidpercent','line-height','25px');"
+        "const inset=(outer,inner)=>document.getElementById(inner)"
+        ".getBoundingClientRect().left-document.getElementById(outer)"
+        ".getBoundingClientRect().left;"
+        "if(inset('cbabs','cbin')!==44)bad.push('abs layout='+"
+        "inset('cbabs','cbin'));"
+        "const fixedPad=getComputedStyle(document.getElementById('cbfix'))"
+        ".paddingLeft;if(fixedPad!==Math.round(innerWidth/10)+'px'"
+        "||inset('cbfix','cbfin')!==parseInt(fixedPad))"
+        "bad.push('fixed='+fixedPad+' layout='+inset('cbfix','cbfin'));"
+        /* A pseudo-element resolves a relative line-height against its own
+           font size, like an element. */
+        "for(const[id,expected]of[['lhp','30px'],['lhq','15px']]){"
+        "const got=getComputedStyle(document.getElementById(id),'::before')"
+        ".lineHeight;if(got!==expected)bad.push(id+'::before='+got);}"
+        /* A zero line-height run must not collapse its parent's line: the
+           block keeps its own line-height as a strut, so the next block
+           starts below it. */
+        "{const strut=document.getElementById('strut').getBoundingClientRect(),"
+        "next=document.getElementById('strutnext').getBoundingClientRect();"
+        "if(strut.height!==20||next.top!==strut.top+20)"
+        "bad.push('strut='+strut.height+'/'+next.top);}"
+        /* Inline wrappers are not containing blocks: the percentage refers
+           to the nearest block container (400px), not the span's box. */
+        "want('inlpad','padding-left','40px');"
+        /* An unknown unit is invalid and must not overwrite the earlier
+           valid declaration, nor read as pixels. */
+        "want('badunit','line-height','23px');"
+        "want('badunit2','line-height','15px');"
+        /* A calculated zero is an authored zero, not `normal`. */
+        "want('calc0','line-height','0px');"
+        "want('calc0px','line-height','0px');"
+        "want('calcdiff','line-height','0px');"
+        "want('calcsix','line-height','6px');"
+        /* A logical radius that was not authored maps to its physical
+           corner: under rtl the inline start is the right-hand side. */
+        "want('rad','border-start-start-radius','2px');"
+        "want('rad','border-start-end-radius','1px');"
+        "want('rad','border-end-start-radius','3px');"
+        "want('rad','border-end-end-radius','4px');"
+        "want('rad','background-size','50% auto');"
+        "want('rad','margin','1px auto 3px 4px');"
+        /* A pseudo-element has the sparse properties too: inherited ones
+           come from its originating element, the rest are initial. */
+        "const radBefore=getComputedStyle(document.getElementById('rad'),"
+        "'::before');"
+        "for(const[name,expected]of[['cursor','pointer'],['tab-size','8'],"
+        "['user-select','auto'],['scroll-margin-top','0px'],"
+        "['border-end-end-radius','0px']])"
+        "if(radBefore.getPropertyValue(name)!==expected)bad.push('before.'+"
+        "name+'='+JSON.stringify(radBefore.getPropertyValue(name)));"
+        /* Keywords layout treats as baseline still report as authored. */
+        "want('ttop','vertical-align','text-top');"
+        "want('tbot','vertical-align','text-bottom');"
+        /* text-decoration-line is not inherited: a child of an underlined
+           element draws the ancestor's line but declares none. Only the
+           underline is retained; other lines are not painted either. */
+        "want('under','text-decoration-line','underline');"
+        "want('underchild','text-decoration-line','none');"
+        "want('link','text-decoration-line','underline');"
+        "want('plain','text-decoration-line','none');"
+        "want('struck','text-decoration-line','none');"
+        /* Width and height resolve to used pixels when there is a box. */
+        /* No viewport declaration, so the page lays out at the 980 px
+           fallback width. A percentage comes back in pixels. `width` names
+           the content box by default and the border box under
+           box-sizing:border-box, so both halves report 490px even though
+           one of them also has 10px of padding outside that. */
+        "want('plain','width','980px');"
+        "want('half','width','490px');want('half','height','30px');"
+        "want('border','width','490px');"
+        "const auto=getComputedStyle(document.getElementById('plain')).height;"
+        "if(!/^[1-9][0-9]*px$/.test(auto))bad.push('plain.height='+auto);"
+        "if(getComputedStyle(document.getElementById('child')).width!=='auto')"
+        "bad.push('inline width');"
+        /* Percentage padding is a packed value until it is resolved against
+           the containing block: 10% of 980 on each side. Subtracting the
+           packed value once made this width 0px. */
+        "want('pctpad','width','490px');"
+        "want('pctpad','padding-left','98px');"
+        "want('pctpad','padding','0px 98px 0px 98px');"
+        "if(document.getElementById('pctpad').getBoundingClientRect().width"
+        "!==686)bad.push('pctpad box');"
+        /* Percentages chain: each level resolves against its own
+           containing block's content box. #grand's 10% is of the 980px page;
+           #narrow's is of #grand's 800px content box, not of its own 560px
+           padding box (which is what a one-level approximation used, giving
+           #nested 44px); #nested's is of #narrow's 400px content box. */
+        "want('grand','padding-left','98px');want('grand','width','800px');"
+        "want('narrow','padding-left','80px');want('narrow','width','400px');"
+        "want('nested','padding-left','40px');want('nested','width','200px');"
+        /* A pseudo-element's containing block is its originating element's
+           content box (400px), not that element's parent (980px). */
+        "const padded=getComputedStyle("
+        "document.getElementById('padhost'),'::before');"
+        "if(padded.paddingLeft!=='40px'||padded.width!=='20px')"
+        "bad.push('pseudo padding='+padded.paddingLeft+'/'+padded.width);"
+        /* A pseudo-element is not its originating element's box. */
+        "const before=getComputedStyle("
+        "document.getElementById('pseudo'),'::before');"
+        "if(before.width!=='20px'||before.height!=='10px')"
+        "bad.push('pseudo='+before.width+'x'+before.height);"
+        "want('pseudo','width','200px');want('pseudo','height','100px');"
+        /* Width and height do not apply to a non-replaced inline, so its
+           authored values come back rather than its text box. */
+        "want('sized','width','100px');want('sized','height','50px');"
+        /* An authored zero is not the `normal` keyword. */
+        "want('zero','line-height','0px');"
+        "want('zerounit','line-height','0px');"
+        "want('zerofont','line-height','0px');"
+        "want('zerolines','height','0px');"
+        /* No box: the computed value, which is `auto` when nothing is set. */
+        "want('gone','width','auto');want('gone','height','auto');"
+        "want('gonesized','width','40px');"
+        /* The supported set: one list, no shorthands or aliases in it. */
+        "const style=getComputedStyle(document.getElementById('plain'));"
+        "const names=[...style];"
+        "if(names.length!==style.length||names.length<150)"
+        "bad.push('length='+style.length);"
+        "if(names.join()!==[...names].sort().join()"
+        "||new Set(names).size!==names.length)bad.push('order');"
+        "for(const name of['flex','padding','overflow','gap',"
+        "'-webkit-user-select'])"
+        "if(names.includes(name))bad.push('enumerated '+name);"
+        "for(const name of['height','lineHeight','line-height','cssFloat',"
+        "'flexGrow','flex','--anything'])"
+        "if(!(name in style))bad.push('missing '+name);"
+        "if('bogusProperty' in style)bad.push('bogus');"
+        "if(style[0]!==names[0]||style.item(names.length)!==''"
+        "||Object.keys(style).length!==names.length)bad.push('indexed');"
+        "const empty=names.filter(name=>style.getPropertyValue(name)==='');"
+        "if(empty.length)bad.push('empty:'+empty.join('/'));"
+        /* Registered but deliberately not enumerated: shorthands and legacy
+           aliases are still attributes of the declaration, with values. */
+        "for(const name of['border-image','border-radius','border-width',"
+        "'flex','gap','overflow','overscroll-behavior','padding',"
+        "'place-content','place-items','place-self','scroll-margin',"
+        "'scroll-padding','text-wrap','-webkit-appearance',"
+        "'-webkit-backdrop-filter','-webkit-user-select',"
+        "'-webkit-text-size-adjust'])"
+        "if(!(name in style)||style.getPropertyValue(name)===''"
+        "||names.includes(name))bad.push('unlisted '+name);"
+        /* The object is live across attachment, mutation and detachment,
+           and a disconnected element has an empty declaration block. */
+        "const node=document.createElement('div'),live=getComputedStyle(node);"
+        "if(live.length!==0||live.display!==''||live.item(0)!==''"
+        "||[...live].length!==0||!('display' in live))bad.push('detached');"
+        "document.body.appendChild(node);"
+        "if(live.length!==names.length||live.display!=='block'"
+        "||live.textAlign!=='start')bad.push('attached');"
+        "node.style.textAlign='center';"
+        "if(live.textAlign!=='center')bad.push('mutated');"
+        "node.remove();"
+        "if(live.length!==0||live.display!=='')bad.push('removed');"
+        "if(bad.length)throw Error(bad.join(' | '));})()";
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        navigation->page.runtime, source, "<computed-resolved-values>",
+        &result);
+    if (!evaluated || !result.success)
+        fprintf(stderr, "computed style: %s\n", result.error);
+    CHECK(evaluated && result.success);
+    /* Zero line-height overlaps the lines; it must not erase their glyph
+       commands or advance the three baselines as normal-height lines. */
+    size_t zero_ink_count = 0;
+    int zero_ink_y = 0;
+    for (size_t i = 0; i < navigation->page.layout.count; i++) {
+        const DrawCommand *command = &navigation->page.layout.commands[i];
+        if (command->type != DRAW_TEXT
+            || (command->radius & LAYOUT_TEXT_ZERO_LINE_HEIGHT) == 0)
+            continue;
+        if ((command->text_length == 7
+             && memcmp(command->text, "Visible", 7) == 0)
+            || (command->text_length == 8
+                && memcmp(command->text, "overflow", 8) == 0)
+            || (command->text_length == 4
+                && memcmp(command->text, "text", 4) == 0)) {
+            CHECK(command->height > 0 && command->width > 0);
+            if (zero_ink_count == 0) zero_ink_y = command->y;
+            CHECK(command->y == zero_ink_y);
+            zero_ink_count++;
+        }
+    }
+    CHECK(zero_ink_count == 3);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Every property the computed-style registry answers for, read from a fixture
+   page which authors most of them, across ordinary elements, replaced and
+   form content, a table cell, both pseudo-elements, display:none, and an SVG
+   shape. The checked-in golden makes any change to a resolved value a
+   reviewable diff; with `golden_path` NULL the dump is only written, which is
+   how the golden is regenerated:
+
+     tilefinch-browser-engine-tests --computed-style-dump FIXTURE OUTPUT */
+static int computed_style_dump(const char *fixture_path,
+                               const char *output_path,
+                               const char *golden_path)
+{
+    static char page[16384];
+    FILE *fixture = fopen(fixture_path, "rb");
+    CHECK(fixture != NULL);
+    size_t page_length = fread(page, 1, sizeof(page), fixture);
+    fclose(fixture);
+    CHECK(page_length > 0 && page_length < sizeof(page));
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://style-dump.test/", page, page_length, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+
+    /* Enumerable longhands come from the declaration itself. The rest are
+       names enumeration omits: registered shorthands and aliases, SVG
+       presentation attributes, custom properties, and names nothing
+       supports. Missing one here only narrows the dump. */
+    static const char setup[] =
+        "(()=>{const names=[...getComputedStyle(document.body)].concat(["
+        "'-webkit-appearance','-webkit-backdrop-filter',"
+        "'-webkit-text-size-adjust','-webkit-user-select','border-image',"
+        "'border-radius','border-width','flex','gap','overflow',"
+        "'overscroll-behavior','padding','place-content','place-items',"
+        "'place-self','scroll-margin','scroll-padding','text-wrap',"
+        "'transition-duration','fill','stroke','stroke-width',"
+        "'--accent','--gap','--local','--missing','bogus-property','margin',"
+        "'border','font','background']);"
+        "const targets=[];for(const node of document.querySelectorAll('[id]'))"
+        "targets.push([node.id,null]);"
+        "targets.push(['host','::before'],['host','::after'],"
+        "['plain','::before'],['lhpseudo','::before']);"
+        "globalThis.__dump={names,targets};"
+        "globalThis.pocSummary=names.length+' '+targets.length;})()";
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation->page.runtime, setup, "<computed-style-dump>",
+              &result) && result.success);
+    unsigned name_count = 0, target_count = 0;
+    CHECK(sscanf(result.summary, "%u %u", &name_count, &target_count) == 2
+          && name_count >= 150 && target_count >= 10);
+
+    FILE *output = fopen(output_path, "wb");
+    CHECK(output != NULL);
+    const unsigned chunk = 8;
+    for (unsigned target = 0; target < target_count; target++) {
+        for (unsigned first = 0; first < name_count; first += chunk) {
+            char source[512];
+            snprintf(source, sizeof(source),
+                "(()=>{const[id,pseudo]=__dump.targets[%u],"
+                "style=getComputedStyle(document.getElementById(id),pseudo);"
+                "globalThis.pocSummary=(%u?'':'## '+id+(pseudo||'')+'\\n')+"
+                "__dump.names.slice(%u,%u).map(name=>name+': '+"
+                "JSON.stringify(style.getPropertyValue(name))).join('\\n');"
+                "})()", target, first, first, first + chunk);
+            bool evaluated = script_runtime_evaluate_diagnostic(
+                navigation->page.runtime, source, "<computed-style-dump>",
+                &result);
+            if (!evaluated || !result.success)
+                fprintf(stderr, "computed style dump: %s\n", result.error);
+            /* A full summary buffer means a truncated chunk. */
+            CHECK(evaluated && result.success
+                  && strlen(result.summary) + 1 < sizeof(result.summary));
+            fprintf(output, "%s\n", result.summary);
+        }
+    }
+    fclose(output);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    if (golden_path == NULL) return 0;
+
+    FILE *actual = fopen(output_path, "rb");
+    FILE *golden = fopen(golden_path, "rb");
+    CHECK(actual != NULL && golden != NULL);
+    char actual_line[1024], golden_line[1024];
+    char heading[128] = "";
+    unsigned differences = 0;
+    for (;;) {
+        char *got = fgets(actual_line, sizeof(actual_line), actual);
+        char *want = fgets(golden_line, sizeof(golden_line), golden);
+        if (got == NULL && want == NULL) break;
+        if (got != NULL && got[0] == '#')
+            snprintf(heading, sizeof(heading), "%s", got);
+        if (got == NULL || want == NULL || strcmp(got, want) != 0) {
+            if (differences++ < 20)
+                fprintf(stderr, "computed style golden: under %s  want %s"
+                        "  got  %s", heading,
+                        want == NULL ? "(end)\n" : want,
+                        got == NULL ? "(end)\n" : got);
+            if (got == NULL || want == NULL) break;
+        }
+    }
+    fclose(actual);
+    fclose(golden);
+    if (differences != 0)
+        fprintf(stderr, "computed style golden: %u line(s) differ; if the "
+                "change is intended, regenerate with --computed-style-dump\n",
+                differences);
+    CHECK(differences == 0);
+    return 0;
+}
+
+/* A frame taking part in a Cloudflare managed challenge gets a larger script
+   heap, because the challenge interpreter does not fit the ordinary one. The
+   signals are the top-level response's own `cf-mitigated: challenge` header
+   and the challenge platform's document URL, so nothing a page writes can ask
+   for the raise, and the top-level document never gets it. */
+static int test_managed_challenge_script_heap(void)
+{
+    static const char page[] =
+        "<!doctype html><title>Just a moment...</title>"
+        "<script>globalThis.ran=true;</script><p>Verifying</p>";
+    static const char platform_frame[] =
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/"
+        "turnstile/f/av0/rch/x/0x4AAAA/light/fbE/new/normal?lang=auto";
+    static const char other_frame[] = "https://ads.example.test/frame";
+    const size_t configured = 7u * MIB;
+    const size_t raised = NAVIGATION_MANAGED_CHALLENGE_JS_HEAP_BYTES;
+    const struct {
+        const char *url;
+        long status;
+        const char *cf_mitigated;
+        bool challenge_page;
+    } cases[] = {
+        { "https://ordinary-heap.test/", 200, "", false },
+        /* A 403 from the same CDN that is not a challenge. */
+        { "https://blocked-heap.test/", 403, "", false },
+        { "https://challenge-heap.test/", 403, "challenge", true },
+    };
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.javascript.heap_limit = configured;
+        char error[256] = {0};
+        BrowserEngine *engine =
+            browser_engine_create(&config, error, sizeof(error));
+        char fixture[128];
+        CHECK(engine != NULL
+              && write_document_replay(fixture, cases[at].url, page,
+                                       sizeof(page) - 1u, cases[at].status,
+                                       cases[at].cf_mitigated)
+              && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        (void) browser_engine_load_url_with_limits(
+            engine, cases[at].url, 1u * MIB, 1000, true);
+        fetch_trace_end();
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        ScriptRuntime *runtime =
+            navigation == NULL ? NULL : navigation->page.runtime;
+        CHECK(runtime != NULL);
+        /* The top-level document keeps the configured heap even when it is
+           the challenge page: its own script fits the ordinary limit. */
+        CHECK(script_runtime_heap_remaining(runtime) <= configured);
+        CHECK(navigation->managed_challenge_heap_raises == 0);
+        CHECK(navigation_script_heap_limit(
+                  navigation, SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL, cases[at].url)
+              == configured);
+        CHECK(navigation_script_heap_limit(
+                  navigation, SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL, platform_frame)
+              == configured);
+        /* Every frame of a challenge page takes part in the challenge. */
+        CHECK(navigation_script_heap_limit(
+                  navigation, SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME, other_frame)
+              == (cases[at].challenge_page ? raised : configured));
+        /* The platform's own frame is raised wherever it is embedded, which
+           is how a Turnstile widget on an ordinary page is covered. */
+        CHECK(navigation_script_heap_limit(
+                  navigation, SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME,
+                  platform_frame) == raised);
+        /* Never lowers, never stacks, and leaves disabled scripting alone. */
+        size_t saved = navigation->js_memory_limit;
+        navigation->js_memory_limit = 16u * MIB;
+        CHECK(navigation_script_heap_limit(
+                  navigation, SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME,
+                  platform_frame) == 16u * MIB);
+        navigation->js_memory_limit = 0;
+        CHECK(navigation_script_heap_limit(
+                  navigation, SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME,
+                  platform_frame) == 0);
+        navigation->js_memory_limit = saved;
+        remove_large_youtube_replay(fixture);
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+    }
+    /* Scheme, host and path prefix all have to match. */
+    CHECK(navigation_url_is_challenge_platform(platform_frame));
+    CHECK(!navigation_url_is_challenge_platform(
+        "https://challenges.cloudflare.com/other"));
+    CHECK(!navigation_url_is_challenge_platform(
+        "https://challenges.cloudflare.com.evil.test/cdn-cgi/"
+        "challenge-platform/"));
+    CHECK(!navigation_url_is_challenge_platform(
+        "http://challenges.cloudflare.com/cdn-cgi/challenge-platform/"));
+    CHECK(!navigation_url_is_challenge_platform(
+        "https://example.test/?next=https://challenges.cloudflare.com/"
+        "cdn-cgi/challenge-platform/"));
+    CHECK(!navigation_url_is_challenge_platform(NULL));
+    CHECK(navigation_script_heap_limit(
+              NULL, SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME, platform_frame) == 0);
     return 0;
 }
 

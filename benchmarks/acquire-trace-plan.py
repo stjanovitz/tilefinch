@@ -1097,15 +1097,24 @@ def _bounded_command(
     command: list[str], label: str, timeout: float,
     standard_input: bytes | None = None,
 ) -> bytes:
+    # With no input of its own a helper must see end-of-file, never whatever
+    # the operator's shell, CI runner, or parent test left on standard input.
+    # subprocess.run(input=None) inherits that descriptor; a helper which
+    # reads standard input then blocks until this cap whenever the inherited
+    # pipe simply stays open, and the run is reported as a timeout.
     try:
         completed = subprocess.run(
             command,
             check=False,
             env=_safe_environment(),
-            input=standard_input,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
+            **(
+                {"stdin": subprocess.DEVNULL}
+                if standard_input is None
+                else {"input": standard_input}
+            ),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise AcquisitionError(f"{label} failed to run: {error}") from error
@@ -1336,6 +1345,7 @@ def _run_recorder(
             command,
             check=False,
             env=_safe_environment(),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout_ms / 1000 + 5,

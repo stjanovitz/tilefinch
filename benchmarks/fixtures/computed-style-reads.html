@@ -1,0 +1,30 @@
+<!doctype html>
+<!--
+  Host micro-benchmark for getComputedStyle(): 3000 iterations each of creating
+  a declaration, reading through it by attribute and by getPropertyValue(), and
+  a membership test. Times are milliseconds per 3000 operations.
+
+    build-preset-release/psp-browser-interactive-lab \
+        --fixture benchmarks/fixtures/computed-style-reads.html --ticks 40 \
+        | grep 'javascript summary'
+
+  It is a comparison tool, not a gate: run it three times before and after a
+  change on the same machine and compare. Reference, release build, 2026-09-21
+  (after the getter began dispatching through the registry):
+    create=4.1 display=11.0 color=10.9 marginTop=12.0 create+display=15.4
+    lineHeight=12.1 in=2.2
+-->
+<html><head><style>.a .b .c{color:red;line-height:1.4} .c{display:flex;width:50%}</style></head>
+<body><div class="a"><div class="b"><div class="c" id="t" style="margin-top:3px">x</div></div></div>
+<script>globalThis.pocSummary="pending";setTimeout(()=>{
+const t=document.getElementById("t"); const N=3000; const out=[];
+const run=(label,fn)=>{const s=performance.now(); for(let i=0;i<N;i++)fn(); out.push(label+"="+(performance.now()-s).toFixed(1));};
+const cs=getComputedStyle(t);
+run("create",()=>getComputedStyle(t));
+run("display",()=>cs.display);
+run("color",()=>cs.getPropertyValue("color"));
+run("marginTop",()=>cs.marginTop);
+run("create+display",()=>getComputedStyle(t).display);
+run("lineHeight",()=>cs.lineHeight);
+run("in",()=>"display" in cs);
+globalThis.pocSummary=out.join(" ");},30);</script></body></html>

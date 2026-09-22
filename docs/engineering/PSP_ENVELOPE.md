@@ -86,6 +86,19 @@ Native and JavaScript callback boundaries must either poll the watchdog or
 prove a small fixed upper bound. A dependency call which cannot be interrupted
 is named in diagnostics rather than being counted as cooperative work.
 
+### Boot timeline
+
+September 4 PPSSPP ordinary-launcher validation measured browser-main to HOME
+at 362.6 ms and interactive-ready at 396.3 ms, versus 735.6/769.3 ms before
+these changes. About 319.6 ms of that difference is the removed synthetic
+clock probe; roughly 53 ms is the remaining reduction, including splash
+presentation waits. This does not establish physical PSP release boot time:
+validation logging and asset diagnostics remain, and emulator storage is not
+a Memory Stick. The validation-only `tilefinch-boot-input` line separately
+records the first actual controller sample and its delay from interactive
+loop entry (30.2 ms without an input script in the final run). Input-script
+file loading adds harness overhead and must not be treated as shipping work.
+
 ## 32-bit hot-path discipline
 
 The PSP has expensive software helpers for 64-bit division and modulo. Normal

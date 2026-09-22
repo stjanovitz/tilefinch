@@ -109,6 +109,19 @@ option(PSP_BROWSER_USE_BELLARD_QUICKJS
        "Use pinned upstream QuickJS instead of QuickJS-NG" OFF)
 option(TILEFINCH_PROFILE_LAYOUT_FLOW
     "Enable intrusive exclusive layout-flow timers in PSP validation builds" OFF)
+# The unlocked Budget ledger has exactly one owning thread. Host test builds
+# assert that rule on every ledger mutation. The PSP is where the worker
+# threads actually exist, so a PSP build may opt in for a PPSSPP or device
+# qualification run; it stays off by default there because a thread-identity
+# syscall per allocation distorts the timing validation builds measure.
+if(PSP_BROWSER_BUILD_TESTS AND NOT PSP)
+    set(tilefinch_owner_checks_default ON)
+else()
+    set(tilefinch_owner_checks_default OFF)
+endif()
+option(TILEFINCH_OWNER_CHECKS
+       "Report (and on the host abort) when a Budget is mutated by a thread that does not own it"
+       ${tilefinch_owner_checks_default})
 option(TILEFINCH_PSP_VALIDATION_LOG
        "Enable PSP stdout validation, Memory Stick logs/crash journal, and the logging watchdog (slow; intended only for diagnostic builds)" OFF)
 option(TILEFINCH_PSP_MEDIA_PICTURE_TRACE
@@ -361,7 +374,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-        "ac5f19e0b254e49edf4560b53f6aaa3d77a5ad510743e2bd97da30cde146e3d1")
+        "0ad44ce4195e8b84966f561cd3afd4aa0e9c217094b4eeb083a0007b4b42fa1d")
     set(tilefinch_quickjs_vendor_h_sha256
         "225a7d514aa4b380da014588a8181e9e8df82feec752ebb4adde01e16a53605e")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
@@ -410,19 +423,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "61cd4dec598a33a022642b677bf16657c4238ae5d7563b65503f5ca533a42d15")
+            "c4fc025aff4d1b70c493148123691c01f39dce57b0fba85f5ca0e0153ff8e582")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "28d2bd1e3e8ca30a29b60f72a2794c9bde4f862287551c67b71a5e14ec2f4e53")
+            "70eba8290e71fb51eb6fae508391c831c6aaafd9a28e221b90d0dce264d43705")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "0b799d1c8fce7df167b1bdc7de34ec0cdf07dde117836c9673c822677e7e0025")
+            "94b72f8d0f40911b44a8224452bfbeedab3b66be63f72814e9e08a196180ea57")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "5a691fa918707ac85fd6a9c4cd3f7abd54e4a19b2b9d8724a310f1bce63cb05e")
+            "2fad09dc4a35c2d6b04098548ce02b0e0c0ce1ac0162840586c6b7595818aadc")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "df8145fa7b5ff338760b2ec012b82d48d9cd6c3a42cfd9cbdad62ff07de2b6d2")
+            "7ad70409b2b8166bc067ee9d81c37eb10f709005ec04496f269f8055d07fc38d")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "089df963bdc054049b71a1604c07730e89d494fc4994a0ff5c9170bb4aefa1ce")
+            "4d16f5e4642cdcec456c2ace0f13f8979d9f9e451a384d419e2ff0a834d42aa8")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "d0daab8a7b1deeec8074a4d0c362dbd3d282fdc37828d1f4aca26e811d5ebbbd")
+            "a60d2b75ff7481f0bd2429abacf480dd0875802063141fd7ef3a6385d4c2e495")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "

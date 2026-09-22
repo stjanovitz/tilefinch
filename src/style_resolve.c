@@ -3651,6 +3651,23 @@ bool style_node_pseudo_rules_may_affect_discovery(const Stylesheet *sheet,
     return false;
 }
 
+/* A multiplier, percentage or em line-height is parsed as negative
+   thousandths and becomes device pixels here, once the element's own used
+   font size is known. Shared by elements and pseudo-elements: a consumer sees
+   either pixels, zero for `normal`, or STYLE_LINE_HEIGHT_ZERO. */
+static void resolve_relative_line_height(ComputedStyle *style)
+{
+    if (style->line_height >= 0
+        || style->line_height == STYLE_LINE_HEIGHT_ZERO) return;
+    /* Computed unitless line-height can land just below an integer after
+       its bounded thousandth representation (for example GOV.UK's
+       21px * 1.190476...). Round the used device-pixel height instead of
+       systematically shaving the final pixel from every such line. */
+    style->line_height = style_multiply_add_divide(
+        computed_style_font_size_fixed(style), -style->line_height,
+        32000, 64000);
+}
+
 ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
                              const ComputedStyle *parent)
 {
@@ -3746,15 +3763,7 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
     if (style.margin.left == STYLE_LENGTH_NONE) {
         style.margin.left = style.font_size;
     }
-    if (style.line_height < 0) {
-        /* Computed unitless line-height can land just below an integer after
-           its bounded thousandth representation (for example GOV.UK's
-           21px * 1.190476...). Round the used device-pixel height instead of
-           systematically shaving the final pixel from every such line. */
-        style.line_height = style_multiply_add_divide(
-            computed_style_font_size_fixed(&style), -style.line_height,
-            32000, 64000);
-    }
+    resolve_relative_line_height(&style);
     /* Negative gap values retain an integral percentage until layout has
        the appropriate inline/block percentage basis. */
     unsigned grid_columns = computed_style_grid_column_count(&style);
@@ -4528,6 +4537,7 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
     if (record) style_retained_commit(sheet, node, pseudo);
     resolve_font_size(&style, parent, false);
     resolve_sizing_em_lengths(&style);
+    resolve_relative_line_height(&style);
     resolve_overflow_clip_margin(&style);
     if (!style.generated_expression && style.generated_attr != NULL
         && style.generated_attr_length != 0) {

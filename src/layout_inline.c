@@ -678,7 +678,8 @@ GeneratedPseudoFlow generated_pseudo_flow(
     }
     int content_height = style_content_height(context->sheet, &style, width,
                                               containing_height);
-    if (content_height <= 0 && style.generated_text != NULL
+    if (content_height <= 0 && style.line_height != STYLE_LINE_HEIGHT_ZERO
+        && style.generated_text != NULL
         && style.generated_text_length != 0) {
         const FontFace *face = font_context_face_variant(
             context->fonts, context->web_fonts, style.font_family,
@@ -1268,6 +1269,8 @@ static int line_text_baseline(const LayoutDocument *layout,
         baseline = command->height > 0
             ? command->height * 3 / 4 : 0;
     }
+    if ((command->radius & LAYOUT_TEXT_ZERO_LINE_HEIGHT) != 0)
+        baseline -= command->height / 2;
     return baseline;
 }
 
@@ -1316,7 +1319,8 @@ static void align_line_text_baselines(LineState *line)
         int dy = target - baseline;
         command->y = layout_add_coordinate(command->y, dy);
         int bottom = command->y - line->y + command->height;
-        if (bottom > used_height) used_height = bottom;
+        if ((command->radius & LAYOUT_TEXT_ZERO_LINE_HEIGHT) == 0
+            && bottom > used_height) used_height = bottom;
         command->radius |= LAYOUT_TEXT_BASELINE_ALIGNED;
     }
     if (used_height > line->line_height) line->line_height = used_height;
@@ -1451,7 +1455,8 @@ bool layout_line_clamp_overflow(LineState *line)
 
 void layout_flush_line(LineState *line)
 {
-    if (line->line_height != 0 || line->line_height_fixed != 0) {
+    if (line->line_height != 0 || line->line_height_fixed != 0
+        || line->has_text_character) {
         bool bidi_resolved = layout_bidi_resolve_line(line);
         if (line->bidi_pipeline_expected && !bidi_resolved) {
             /* A bounded/OOM degradation remains logical text. Never route a
@@ -1540,6 +1545,11 @@ void layout_flush_line(LineState *line)
             || line->line_height > layout_fixed_ceil(height_fixed)) {
             height_fixed = layout_fixed_from_integer(line->line_height);
         }
+        if (height_fixed <= 0 && line->strut_fixed > 0
+            && (line->has_text_character
+                || line->layout->count > line->command_start)) {
+            height_fixed = line->strut_fixed;
+        }
         if (line->line_gap != 0) {
             height_fixed = layout_fixed_add(
                 height_fixed, layout_fixed_from_integer(line->line_gap));
@@ -1579,8 +1589,18 @@ void layout_flush_line(LineState *line)
 }
 
 static int inline_style_line_height_fixed(
+    LayoutContext *context, const ComputedStyle *style);
+
+int layout_inline_style_line_height_fixed(
     LayoutContext *context, const ComputedStyle *style)
 {
+    return inline_style_line_height_fixed(context, style);
+}
+
+static int inline_style_line_height_fixed(
+    LayoutContext *context, const ComputedStyle *style)
+{
+    if (style->line_height == STYLE_LINE_HEIGHT_ZERO) return 0;
     const FontFace *face = font_context_face_variant(
         context->fonts, context->web_fonts, style->font_family,
         style->font_italic, style_uses_bold_face(style));
@@ -1601,7 +1621,7 @@ static void force_line_break(LayoutContext *context, LineState *line,
        intervening blank line instead of collapsing into one break. */
     int height_fixed = inline_style_line_height_fixed(context, style);
     line_height_include_fixed(line, height_fixed);
-    if (style->line_height > 0) line->line_gap = 0;
+    if (style->line_height != 0) line->line_gap = 0;
     layout_flush_line(line);
 }
 
@@ -2295,6 +2315,11 @@ bool flow_text(LayoutContext *context, LineState *line,
     if (line_height_fixed < 0) {
         line_height_fixed = layout_fixed_from_integer(7 * scale);
     }
+    /* Keep a positive ink box for rasterization; CSS zero affects only the
+       line box and its leading, not the visibility of the glyphs. */
+    int ink_height_fixed = line_height_fixed;
+    bool zero_line_height = style->line_height == STYLE_LINE_HEIGHT_ZERO;
+    if (zero_line_height) line_height_fixed = 0;
     int wrap_right = line->right;
     StyleTextWrap text_wrap = computed_style_text_wrap(style);
     int available_pixels = line->right - line->start_x;
@@ -2711,7 +2736,7 @@ bool flow_text(LayoutContext *context, LineState *line,
             }
             if (piece_end - piece_at > UINT32_MAX) return false;
             int height_fixed = line_height_fixed;
-            int height = layout_fixed_ceil(height_fixed);
+            int height = layout_fixed_ceil(ink_height_fixed);
             (void) line_y_fixed(line);
             int command_x_fixed = layout_fixed_add(
                 cursor_fixed, space_fixed);
@@ -2725,7 +2750,8 @@ bool flow_text(LayoutContext *context, LineState *line,
             DrawCommand command = {
                 .type = DRAW_TEXT,
                 .x = command_x,
-                .y = line->y + (style->vertical_align == VERTICAL_SUPER
+                .y = line->y - (zero_line_height ? height / 2 : 0)
+                             + (style->vertical_align == VERTICAL_SUPER
                                 ? -style->font_size / 3
                                 : (style->vertical_align == VERTICAL_SUB
                                    ? style->font_size / 4
@@ -2759,6 +2785,8 @@ bool flow_text(LayoutContext *context, LineState *line,
             if (computed_style_kerning_none(style)) {
                 command.radius |= LAYOUT_TEXT_KERNING_NONE;
             }
+            if (zero_line_height)
+                command.radius |= LAYOUT_TEXT_ZERO_LINE_HEIGHT;
             if (first_piece && authored_space_before)
                 command.radius |= LAYOUT_TEXT_FIND_SPACE_BEFORE;
             if (line->find_block_start)
@@ -2844,7 +2872,7 @@ bool flow_text(LayoutContext *context, LineState *line,
             line->letter_boundary_spacing = style->letter_spacing;
             line->text_generation++;
             line_height_include_fixed(line, height_fixed);
-            if (style->line_height > 0) line->line_gap = 0;
+            if (style->line_height != 0) line->line_gap = 0;
             line->pending_space = false;
             if (truncated_for_ellipsis) {
                 static const char marker[] = "\xe2\x80\xa6";
