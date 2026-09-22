@@ -932,7 +932,7 @@ static int test_computed_style_native_cooperation(void)
     budget_init(&budget, 12u * MIB);
     budget_install_lexbor(&budget);
     static const char html[] =
-        "<!doctype html><style>div{color:red}</style><body>"
+        "<!doctype html><style>div{color:red;padding-left:10%}</style><body>"
         "<div><div><div><div><div><div><div><div id=probe>Text";
     PocDocument document = {0};
     Stylesheet sheet = {0};
@@ -955,6 +955,28 @@ static int test_computed_style_native_cooperation(void)
         JS_NewInt64(runtime->context, script_runtime_node_handle(runtime, node)),
         JS_NewString(runtime->context, "color")
     };
+    /* Percentage padding must not trigger a second ancestor cascade. A
+       minimal retained parent box makes the old fallback run; count native
+       checkpoints rather than measuring a noisy wall-clock microbenchmark. */
+    LayoutNodeBox parent_box = {
+        .node = node->parent, .width = 100, .client_width = 100
+    };
+    LayoutDocument layout = {
+        .width = 480, .node_boxes = &parent_box, .node_box_count = 1
+    };
+    runtime->bridge.layout = &layout;
+    js_rt_runtime_arm_watchdog(runtime);
+    JSValue measured = js_computed_style_get(
+        runtime->context, JS_UNDEFINED, 2, args);
+    CHECK(!JS_IsException(measured));
+    JS_FreeValue(runtime->context, measured);
+    size_t color_polls = runtime->watchdog.polls;
+    JS_FreeValue(runtime->context, args[1]);
+    args[1] = JS_NewString(runtime->context, "padding-left");
+    js_rt_runtime_arm_watchdog(runtime);
+    measured = js_computed_style_get(runtime->context, JS_UNDEFINED, 2, args);
+    CHECK(!JS_IsException(measured) && runtime->watchdog.polls == color_polls);
+    JS_FreeValue(runtime->context, measured);
     static const char guarded_source[] =
         "(function(read,handle,property){try{return read(handle,property)}"
         "catch(error){return 'caught'}})";
@@ -1000,6 +1022,7 @@ static int test_computed_style_native_cooperation(void)
     JS_FreeValue(runtime->context, reader);
     JS_FreeValue(runtime->context, args[0]);
     JS_FreeValue(runtime->context, args[1]);
+    runtime->bridge.layout = NULL;
     CHECK(script_runtime_evaluate_diagnostic(runtime,
         "globalThis.pocSummary=getComputedStyle(document.getElementById('probe')).color",
         "<style-after-cancel>", &result)
@@ -2956,8 +2979,11 @@ int main(int argc, char **argv)
         "&&box.x===3&&box.y===4&&box.width===12&&box.height===7"
         "&&rect.style.getPropertyValue('color')==='red'"
         "&&rect.style.width==='12px'&&rect.style.height==='7px'"
-        "&&detachedComputed.getPropertyValue('width')==='12px'"
-        "&&detachedComputed.display==='block'"
+        /* `made` is never attached, so rect stays disconnected. CSSOM gives
+           a disconnected element an empty declaration block: no inline text
+           and no default stands in for a computed value. */
+        "&&detachedComputed.getPropertyValue('width')===''"
+        "&&detachedComputed.display===''&&detachedComputed.length===0"
         "&&html instanceof HTMLDivElement&&!(html instanceof SVGElement)"
         "&&plain instanceof Element&&!(plain instanceof HTMLElement)"
         "&&!(plain instanceof SVGElement)&&plain.namespaceURI===null"

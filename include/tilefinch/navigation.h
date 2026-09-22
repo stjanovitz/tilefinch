@@ -19,6 +19,24 @@
 #define NAVIGATION_URL_LIMIT 2048
 #define NAVIGATION_TITLE_LIMIT 256
 #define NAVIGATION_FRAME_LIMIT 4
+/* A Cloudflare managed challenge runs an obfuscated bytecode interpreter
+   whose working set is far above an ordinary page's. Measured against the
+   live service on 2026-09-21 with packed numeric arrays in the engine: the
+   challenge frame is clean at 8 MiB and above, refuses allocations up to
+   9 MiB, stops refusing at 10 MiB, and at the ordinary 7 MiB limit fails
+   inside its own interpreter with a TypeError that is really an allocation
+   refusal. With this limit the frame ran clean with no refusals in every
+   live run. How much the whole page then needs depends on the challenge the
+   service happens to issue: 24.1 MB in some runs, which fits the PSP's 24 MiB
+   page ceiling, and 28.3 MB in others, which does not. The Budget still
+   decides; this limit only stops the frame from failing when the page has
+   the memory.
+
+   So a child frame which is part of a managed challenge gets this
+   script-heap limit instead of the configured one, when the configured one is
+   lower. It is a limit, not a reservation: every byte is still admitted by
+   the page Budget, and an ordinary page never sees it. */
+#define NAVIGATION_MANAGED_CHALLENGE_JS_HEAP_BYTES (10u * 1024u * 1024u)
 #define NAVIGATION_FRAME_DISCOVERY_LIMIT 8
 /* A single message task may enqueue replies while an earlier burst is still
    pending.  Keep enough fixed metadata for one 16-message inbound burst plus
@@ -681,6 +699,8 @@ struct NavigationSession {
     size_t frames_discovered;
     size_t frames_loaded;
     size_t frames_failed;
+    /* Runtimes given NAVIGATION_MANAGED_CHALLENGE_JS_HEAP_BYTES. */
+    size_t managed_challenge_heap_raises;
     size_t frame_messages_posted;
     size_t frame_messages_delivered;
     size_t frame_messages_to_parent;
@@ -1061,6 +1081,13 @@ typedef enum {
     NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION,
     NAVIGATION_TEST_PARSER_FEED_HARD_FAILURE
 } NavigationParserCheckpointTestFault;
+/* True for a document served by the challenge platform itself (the managed
+   challenge and Turnstile frames), matched on scheme, host and path prefix. */
+bool navigation_url_is_challenge_platform(const char *url);
+/* The script-heap limit a new runtime of this scope and URL would get. */
+size_t navigation_script_heap_limit(const NavigationSession *session,
+                                    ScriptDocumentScope document_scope,
+                                    const char *url);
 #if !defined(__PSP__)
 /* Deterministic host-only seams for the streaming parser's typed outcome
    boundary. Optional checkpoint faults must preserve the server DOM; a feed

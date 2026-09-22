@@ -1155,7 +1155,7 @@ static JSValue js_cookie_set(JSContext *context, JSValueConst this_value,
     }
     const char *cookie = JS_ToCString(context, argv[0]);
     if (cookie == NULL) return JS_EXCEPTION;
-    if (getenv("TILEFINCH_TRACE_COOKIE") != NULL) {
+    if (tilefinch_trace_cookie()) {
         const char *equals = strchr(cookie, '=');
         size_t name_length = equals == NULL ? 0 : (size_t) (equals - cookie);
         const char *attributes = strchr(cookie, ';');
@@ -1192,7 +1192,7 @@ static JSValue js_console_log(JSContext *context, JSValueConst this_value,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || getenv("TILEFINCH_TRACE_CONSOLE") == NULL
+    if (bridge == NULL || !tilefinch_trace_console()
         || bridge->console_messages >= 64) return JS_UNDEFINED;
     bridge->console_messages++;
     const char *level = argc > 0 ? JS_ToCString(context, argv[0]) : NULL;

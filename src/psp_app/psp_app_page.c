@@ -268,10 +268,12 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
        inside begin_navigation for non-PSP callers. */
     if (site_adapter_navigation_requires_stable_typography("GET", url)
         && browser_engine_prepare_navigation_fonts(engine, "GET", url)) {
-        psp_ui_set_chrome_fonts(
+        psp_presentation_rebind_chrome_fonts(
             browser_engine_font_face(engine, FONT_SANS),
             browser_engine_font_face_variant(
-                engine, FONT_METRIC_SANS, false, true));
+                engine, FONT_METRIC_SANS, false, true),
+            ui->browser_ui_scale);
+        psp_report_chrome_glyph_preload();
     }
     bool started = psp_retry_navigation_url_after_reclaim(
         engine, url, maximum_bytes, timeout_ms, record_history);
@@ -622,6 +624,16 @@ bool psp_run_initial_page_load(
         *stopped = user_cancelled;
     psp_navigation_cooperate_end("initial");
     return status == BROWSER_NAVIGATION_JOB_SUCCEEDED;
+}
+
+void psp_report_chrome_glyph_preload(void)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspUiChromeGlyphPreload preload = psp_ui_chrome_glyph_preload();
+    printf("tilefinch-chrome-glyphs: preloaded=%u scale=%u elapsed=%lluus\n",
+           preload.glyphs, preload.scale,
+           (unsigned long long) preload.elapsed_us);
+#endif
 }
 
 BrowserSessionPersistenceLimits psp_site_data_limits(

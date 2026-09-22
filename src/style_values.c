@@ -5,6 +5,7 @@
 #include "style_internal.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1850,6 +1851,21 @@ bool style_parse_gradient(const Stylesheet *sheet, const char *text,
     return true;
 }
 
+static bool style_length_unit_supported(const char *unit)
+{
+    static const char *const units[] = {
+        "px", "em", "rem", "ch", "pt", "pc", "in", "cm", "mm", "q",
+        "vw", "vh", "vi", "vb", "vmin", "vmax",
+        "dvw", "dvh", "dvi", "dvb", "dvmin", "dvmax",
+        "svw", "svh", "svi", "svb", "svmin", "svmax",
+        "lvw", "lvh", "lvi", "lvb", "lvmin", "lvmax",
+        "cqw", "cqh", "cqi", "cqb", "cqmin", "cqmax"
+    };
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++)
+        if (strcasecmp(unit, units[i]) == 0) return true;
+    return false;
+}
+
 /* A shadow length component. Font-relative and CSS math lengths are resolved
    against the cascade's current font basis; percentages remain invalid for
    both box-shadow and text-shadow. Anything outside the explicit unit list is
@@ -1883,22 +1899,7 @@ static bool box_shadow_length(const Stylesheet *sheet, const char *text,
         *value = 0.0;
         return true;
     }
-    static const char *units[] = {
-        "px", "em", "rem", "ch", "pt", "pc", "in", "cm", "mm", "q",
-        "vw", "vh", "vi", "vb",
-        "dvw", "dvh", "dvi", "dvb",
-        "svw", "svh", "svi", "svb",
-        "lvw", "lvh", "lvi", "lvb",
-        "cqw", "cqh", "cqi", "cqb", "cqmin", "cqmax"
-    };
-    bool known = false;
-    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
-        if (strcasecmp(end, units[i]) == 0) {
-            known = true;
-            break;
-        }
-    }
-    if (!known) return false;
+    if (!style_length_unit_supported(end)) return false;
     bool percent = false;
     int pixels = style_parse_length(sheet, text, length, INT_MIN, &percent);
     if (pixels == INT_MIN || percent) return false;
@@ -3714,11 +3715,23 @@ int style_parse_line_height(const Stylesheet *sheet, const char *text,
                              size_t length)
 {
     char value[128];
-    if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)) return 0;
+    if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0))
+        return STYLE_LINE_HEIGHT_INVALID;
+    if (strcasecmp(value, "normal") == 0) return 0;
     char *end = NULL;
     double number = strtod(value, &end);
     if (end != value) {
         while (isspace((unsigned char) *end)) end++;
+        /* The legacy length converter accepts unknown suffixes. Validate
+           zero explicitly before conversion, just as shadow lengths do. */
+        /* A plain number with an unknown suffix (`1banana`) is not a
+           length; the lenient converter below would read it as pixels. */
+        bool unit_known = *end == '\0' || strcmp(end, "%") == 0
+            || style_length_unit_supported(end);
+        if (number == 0.0)
+            return unit_known ? STYLE_LINE_HEIGHT_ZERO
+                              : STYLE_LINE_HEIGHT_INVALID;
+        if (!unit_known && number > 0.0) return STYLE_LINE_HEIGHT_INVALID;
         if (*end == '\0' && number > 0.0 && number <= 10.0) {
             return -(int) (number * 1000.0 + 0.5);
         }
@@ -3737,12 +3750,19 @@ int style_parse_line_height(const Stylesheet *sheet, const char *text,
             return -(int) (number * 1000.0 + 0.5);
         }
     }
+    /* A calculated zero is still an authored zero, not `normal`: the stored
+       zero means `normal`, so both calculated forms need the sentinel too. */
     int thousandths = 0;
     if (style_math_resolve_number_thousandths(
             sheet, value, strlen(value), &thousandths)) {
-        return -thousandths;
+        if (thousandths == 0) return STYLE_LINE_HEIGHT_ZERO;
+        return thousandths < 0 ? STYLE_LINE_HEIGHT_INVALID : -thousandths;
     }
-    return style_parse_length(sheet, text, length, 0, NULL);
+    const int unparsed = INT_MIN + 1;
+    int pixels = style_parse_length(sheet, text, length, unparsed, NULL);
+    /* Negative storage means a multiplier; a negative length is invalid. */
+    if (pixels == unparsed || pixels < 0) return STYLE_LINE_HEIGHT_INVALID;
+    return pixels == 0 ? STYLE_LINE_HEIGHT_ZERO : pixels;
 }
 
 bool style_parse_text_decoration_underline(const Stylesheet *sheet,
@@ -4107,19 +4127,22 @@ static bool parse_font_line_height_component(const Stylesheet *sheet,
     if (suffix == end) {
         if (number > 100.0) return false;
         *line_height = number == 0.0
-                       ? 0 : -(int) (number * 1000.0 + 0.5);
+                       ? STYLE_LINE_HEIGHT_ZERO
+                       : -(int) (number * 1000.0 + 0.5);
         return true;
     }
     if (font_suffix_equal(suffix, end, "%")) {
         if (number > 10000.0) return false;
         *line_height = number == 0.0
-                       ? 0 : -(int) (number * 10.0 + 0.5);
+                       ? STYLE_LINE_HEIGHT_ZERO
+                       : -(int) (number * 10.0 + 0.5);
         return true;
     }
     if (font_suffix_equal(suffix, end, "em")) {
         if (number > 100.0) return false;
         *line_height = number == 0.0
-                       ? 0 : -(int) (number * 1000.0 + 0.5);
+                       ? STYLE_LINE_HEIGHT_ZERO
+                       : -(int) (number * 1000.0 + 0.5);
         return true;
     }
     static const char *fixed_units[] = {
@@ -4130,7 +4153,7 @@ static bool parse_font_line_height_component(const Stylesheet *sheet,
     for (size_t i = 0; i < sizeof(fixed_units) / sizeof(fixed_units[0]); i++) {
         if (font_suffix_equal(suffix, end, fixed_units[i])) {
             int parsed = style_parse_line_height(sheet, text, length);
-            if (parsed < 0) return false;
+            if (parsed < 0 && parsed != STYLE_LINE_HEIGHT_ZERO) return false;
             *line_height = parsed;
             return true;
         }

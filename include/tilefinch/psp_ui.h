@@ -907,7 +907,18 @@ bool psp_ui_page_work_paused(const PspUiState *ui);
  * using the tiny built-in face until this is installed.
  */
 void psp_ui_set_chrome_fonts(
-    const FontFace *regular, const FontFace *bold);
+    const FontFace *regular, const FontFace *bold, unsigned scale);
+/* Rasterize the ASCII chrome set at another scale on the owning thread;
+   the scale setting's handler calls this before the next frame draws. A
+   call from any other thread is ignored. */
+void psp_ui_preload_chrome_scale(unsigned scale);
+/* What the last preload rasterized, for the validation log. */
+typedef struct {
+    unsigned glyphs;
+    unsigned scale;
+    uint64_t elapsed_us;
+} PspUiChromeGlyphPreload;
+PspUiChromeGlyphPreload psp_ui_chrome_glyph_preload(void);
 void psp_ui_clear_chrome_font(void);
 /*
  * `twelve_hour` mirrors PSP_SYSTEMPARAM_ID_INT_TIME_FORMAT: the status

@@ -2584,7 +2584,7 @@ static bool test_large_toast_uses_full_psp_width(void)
     CHECK(font_set_load(
         &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
         NULL, NULL, 1024u * 1024u));
-    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL);
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL, 1u);
     psp_ui_show_status(
         &ui, "YouTube page fetch failed\n"
              "Try correcting PSP date/time, then retry", 60);
@@ -2721,7 +2721,7 @@ static bool test_chrome_retains_bounded_unicode_glyphs(void)
     CHECK(font_set_load(
         &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
         NULL, NULL, 1024u * 1024u));
-    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL);
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL, 1u);
     psp_ui_composite(&ui, proportional, WIDTH, HEIGHT, WIDTH);
     CHECK(memcmp(fallback, proportional, sizeof(fallback)) != 0);
     psp_ui_clear_chrome_font();
@@ -2852,7 +2852,7 @@ static bool test_chrome_vocabulary_resolves_in_the_shipped_subset(void)
     PspUiState ui;
     psp_ui_init(&ui);
     psp_ui_clear_chrome_font();
-    psp_ui_set_chrome_fonts(faces[0], faces[1]);
+    psp_ui_set_chrome_fonts(faces[0], faces[1], 1u);
     psp_ui_set_page(&ui, "Animal \xe2\x88\x92 Wikipedia",
                     "https://en.wikipedia.org", true);
     psp_ui_composite(&ui, minus_frame, WIDTH, HEIGHT, WIDTH);
@@ -3592,7 +3592,7 @@ static bool test_media_play_control_matches_the_page_overlay(void)
     CHECK(font_set_load(
         &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
         NULL, NULL, 1024u * 1024u));
-    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL);
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL, 1u);
     for (size_t at = 0; at < pixels; at++) typeset[at] = background;
     psp_ui_media_composite(&media, typeset, WIDTH, HEIGHT, WIDTH);
     for (int y = BADGE_TOP - 1; y < BADGE_TOP + 39; y++) {
@@ -3639,7 +3639,7 @@ static bool test_media_status_uses_antialiased_chrome_font(void)
     CHECK(font_set_load(
         &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
         NULL, NULL, 1024u * 1024u));
-    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL);
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL, 1u);
     psp_ui_media_composite(
         &media, antialiased, WIDTH, HEIGHT, WIDTH);
 
@@ -3680,7 +3680,7 @@ static bool test_media_subtitle_shadow_tracks_regular_glyphs(void)
     const FontFace *bold = font_set_face_variant(
         &fonts, FONT_SANS, false, true);
     CHECK(regular != NULL && bold != NULL && regular != bold);
-    psp_ui_set_chrome_fonts(regular, bold);
+    psp_ui_set_chrome_fonts(regular, bold, 1u);
 
     const uint16_t background = 0x8410u;
     for (size_t at = 0; at < WIDTH * HEIGHT; at++) frame[at] = background;
@@ -5112,6 +5112,54 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
     return true;
 }
 
+/* The chrome glyph cache is shared with the callback-thread supervisor, so
+   it must not be rebuilt for a binding that changes nothing, and a glyph the
+   Budget refused under pressure must come back once pressure passes while a
+   character the face lacks stays settled. */
+static bool test_chrome_font_cache_binding_and_refusals(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 1024u * 1024u));
+    const FontFace *regular = font_set_face(&fonts, FONT_SANS);
+    psp_ui_clear_chrome_font();
+    psp_ui_set_chrome_fonts(regular, NULL, 1u);
+    size_t after_first = budget.allocation_count;
+    CHECK(psp_ui_chrome_glyph_preload().glyphs > 90u);
+    /* NULL bold means "use regular"; binding the same pair again must not
+       free and rebuild anything. */
+    psp_ui_set_chrome_fonts(regular, NULL, 1u);
+    psp_ui_set_chrome_fonts(regular, regular, 1u);
+    CHECK(budget.allocation_count == after_first);
+
+    /* Fill the other size while the ledger has no room at all. */
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    psp_ui_preload_chrome_scale(2u);
+    /* Only the two spaces (no bitmap to allocate) can load. */
+    CHECK(psp_ui_chrome_glyph_preload().glyphs <= 2u);
+    budget.limit = limit;
+    psp_ui_preload_chrome_scale(2u);
+    CHECK(psp_ui_chrome_glyph_preload().glyphs > 90u);
+
+    /* Repeated refusals settle, but only after the bounded retry count. */
+    psp_ui_clear_chrome_font();
+    psp_ui_set_chrome_fonts(regular, NULL, 1u);
+    budget.limit = budget.current;
+    for (unsigned attempt = 0; attempt < 4u; attempt++)
+        psp_ui_preload_chrome_scale(2u);
+    CHECK(psp_ui_chrome_glyph_preload().glyphs <= 2u);
+    budget.limit = limit;
+    psp_ui_preload_chrome_scale(2u);
+    CHECK(psp_ui_chrome_glyph_preload().glyphs == 0u);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    return true;
+}
+
 int main(void)
 {
     if (!test_page_activation_activity()
@@ -5162,6 +5210,7 @@ int main(void)
         || !test_media_chrome_is_stable_across_motion_sequence()
         || !test_media_first_frame_transition_keeps_bottom_ground_stable()
         || !test_media_committed_seek_keeps_timeline_stable()
+        || !test_chrome_font_cache_binding_and_refusals()
         || !test_native_surfaces_own_the_panel()
         || !test_home_traversal_and_activation()
         || !test_implicit_cursor_handoff()

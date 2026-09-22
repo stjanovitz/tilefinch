@@ -8385,50 +8385,7 @@
       };
     }
   };
-  const sparseComputedProperties = new Set([
-    "cursor",
-    "overscroll-behavior",
-    "overscroll-behavior-x",
-    "overscroll-behavior-y",
-    "overscroll-behavior-inline",
-    "overscroll-behavior-block",
-    "scroll-behavior",
-    "scroll-margin",
-    "scroll-margin-top",
-    "scroll-margin-right",
-    "scroll-margin-bottom",
-    "scroll-margin-left",
-    "scroll-padding",
-    "scroll-padding-top",
-    "scroll-padding-right",
-    "scroll-padding-bottom",
-    "scroll-padding-left",
-    "scroll-snap-align",
-    "scroll-snap-stop",
-    "scroll-snap-type",
-    "scrollbar-color",
-    "scrollbar-width",
-    "user-select",
-    "-webkit-user-select",
-    "touch-action",
-    "text-size-adjust",
-    "-webkit-text-size-adjust",
-    "resize",
-    "text-wrap",
-    "text-wrap-style",
-    "translate",
-    "rotate",
-    "scale",
-    "isolation",
-    "flex",
-    "flex-basis",
-    "content-visibility",
-    "-webkit-line-clamp",
-    "border-start-start-radius",
-    "border-start-end-radius",
-    "border-end-start-radius",
-    "border-end-end-radius",
-  ]),
+  const
     computedSparseValue = (node, name, value) => {
       if (name === "flex-basis") {
         const text = String(value).trim(),
@@ -8478,9 +8435,12 @@
         },
       );
     };
+  let computedStyleLonghandList = null;
   const computedStyleToken = {},
     computedStyleStates = new WeakMap(),
-    computedStyleDefaults = {
+    /* Used only when the host has no cascade to ask: a node the native
+       document does not hold, or a realm with no stylesheet attached. */
+    computedStyleFallbacks = {
       display: "block",
       visibility: "visible",
       opacity: "1",
@@ -8492,30 +8452,58 @@
       contain: "none",
       overflow: "visible",
     },
-    computedStyleProperties = Array.from(new Set([
-      ...Object.keys(computedStyleDefaults).map(__tilefinchCssName),
-      ...sparseComputedProperties,
-    ])).sort(),
-    computedStylePropertyNames = new Set(computedStyleProperties),
     computedStyleState = (value) => {
       const state = computedStyleStates.get(value);
       if (!state) throw new TypeError("Illegal invocation");
       return state;
     },
+    /* Which properties a computed style has is one native table (see
+       computed_style_properties in js_dom_bindings.c). Membership is asked of
+       it directly; the enumerable longhands are fetched once per realm, and
+       only if a page actually enumerates a computed style. */
+    computedStyleLonghands = () =>
+      computedStyleLonghandList ||
+      (computedStyleLonghandList = Object.freeze(
+        __tilefinchComputedStyleSupport())),
+    /* CSSOM gives a declaration block no properties unless its element is
+       connected. The object is live, so this is asked at every use rather
+       than remembered from getComputedStyle() time. */
+    computedStyleRendered = (state) => {
+      const node = state.node,
+        handle = node.__handle;
+      /* One native parent walk settles the ordinary case. Only a node the
+         native tree calls detached needs the script-side answer, which also
+         knows about shadow and virtual parents. */
+      return (Number.isInteger(handle) && handle > 0 &&
+        __tilefinchIsConnected(handle)) || node.isConnected === true;
+    },
+    computedStyleCount = (state) =>
+      computedStyleRendered(state) ? computedStyleLonghands().length : 0,
     computedStyleRead = (state, name) => {
       name = __tilefinchCssName(name);
-      const inline = state.node.style.getPropertyValue(name),
-        computed = state.connected
-          ? __tilefinchComputedStyleGet(
-              state.node.__handle, name, state.pseudo)
-          : "";
-      /* The host resolves custom properties across inline declarations,
-         the author cascade, inheritance, and var() substitution. An empty
-         result is meaningful for a guaranteed-invalid custom value. */
-      if (name.startsWith("--")) return computed;
+      const node = state.node,
+        handle = node.__handle;
+      /* A disconnected element's declaration block is empty. */
+      if (!computedStyleRendered(state)) return "";
+      /* The host resolves the cascade, inheritance, var() substitution and
+         custom properties. An empty custom property is meaningful
+         (guaranteed-invalid). */
+      const computed = Number.isInteger(handle) && handle > 0
+        ? __tilefinchComputedStyleGet(handle, name, state.pseudo)
+        : "";
+      if (computed !== "" || name.startsWith("--"))
+        return computedSparseValue(node, name, computed);
+      /* A miss means the host had nothing to resolve with: the property is
+         one it does not support, the node is virtual, or no stylesheet is
+         attached yet. With a cascade present a supported property never
+         resolves to "", so authored inline text cannot displace a resolved
+         value -- it may say `inherit`, use var() or relative units, or lose
+         to an !important rule. It is a best effort for this case only, and
+         is read here rather than before every lookup. */
       return computedSparseValue(
-        state.node, name,
-        computed || inline || computedStyleDefaults[name] || "");
+        node, name,
+        node.style.getPropertyValue(name) ||
+          computedStyleFallbacks[name] || "");
     },
     computedStyleReadonly = () => {
       throw new DOMException(
@@ -8528,20 +8516,22 @@
     }
     get cssText() { return ""; }
     set cssText(_value) { computedStyleReadonly(); }
-    get length() { computedStyleState(this); return computedStyleProperties.length; }
+    get length() { return computedStyleCount(computedStyleState(this)); }
     get parentRule() { computedStyleState(this); return null; }
     item(index) {
-      computedStyleState(this);
+      const state = computedStyleState(this);
       index = Number(index) >>> 0;
-      return computedStyleProperties[index] || "";
+      return index < computedStyleCount(state)
+        ? computedStyleLonghands()[index] : "";
     }
     getPropertyValue(name) {
       return computedStyleRead(computedStyleState(this), name);
     }
     getPropertyPriority(_name) { computedStyleState(this); return ""; }
     [Symbol.iterator]() {
-      computedStyleState(this);
-      return computedStyleProperties[Symbol.iterator]();
+      const state = computedStyleState(this);
+      return (computedStyleRendered(state)
+        ? computedStyleLonghands() : [])[Symbol.iterator]();
     }
     setProperty(_name, _value, _priority) { computedStyleReadonly(); }
     removeProperty(_name) { computedStyleReadonly(); }
@@ -8557,7 +8547,6 @@
     const target = new CSSStyleDeclaration(computedStyleToken),
       state = {
         node,
-        connected: Number.isInteger(node.__handle) && node.__handle > 0,
         pseudo: pseudo === null ? "" : String(pseudo),
       };
     computedStyleStates.set(target, state);
@@ -8576,24 +8565,28 @@
         deleteProperty() { computedStyleReadonly(); },
         has(object, name) {
           if (typeof name === "string" && /^\d+$/.test(name))
-            return Number(name) < computedStyleProperties.length;
+            return Number(name) < computedStyleCount(state);
+          /* Supported properties are attributes of the declaration whether
+             or not it currently lists any. */
           return (
             name in object ||
             (typeof name === "string" &&
-              computedStylePropertyNames.has(__tilefinchCssName(name)))
+              __tilefinchComputedStyleSupport(__tilefinchCssName(name)))
           );
         },
         ownKeys() {
-          return computedStyleProperties.map((_name, index) => String(index));
+          return computedStyleRendered(state)
+            ? computedStyleLonghands().map((_name, index) => String(index))
+            : [];
         },
         getOwnPropertyDescriptor(_object, name) {
           if (typeof name === "string" && /^\d+$/.test(name)
-              && Number(name) < computedStyleProperties.length) {
+              && Number(name) < computedStyleCount(state)) {
             return {
               configurable: true,
               enumerable: true,
               writable: false,
-              value: computedStyleProperties[Number(name)],
+              value: computedStyleLonghands()[Number(name)],
             };
           }
           return undefined;

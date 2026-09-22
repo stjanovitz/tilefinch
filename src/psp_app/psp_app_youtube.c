@@ -104,6 +104,7 @@ void psp_youtube_preresolve_tick(
     bool pump_allowed)
 {
     if (preresolve == NULL) return;
+    preresolve->pumped_this_tick = false;
     bool candidate = generation != 0 && maximum_height > 0
         && track_preferences != NULL
         && psp_youtube_video_id_valid(focused_video_id);
@@ -215,6 +216,7 @@ void psp_youtube_preresolve_tick(
             (unsigned long long) generation);
     }
     if (!pump_allowed) return;
+    preresolve->pumped_this_tick = true;
     YoutubeResolveJobStatus status =
         youtube_resolve_job_pump(preresolve->job);
     if (status == YOUTUBE_RESOLVE_JOB_PENDING) return;
@@ -302,8 +304,8 @@ static bool psp_youtube_focused_video_id(
 __attribute__((noinline))
 void psp_app_youtube_preresolve_tick(
     PspApp *app, const PspAppFrameState *frame, const PspUiIntent *intent,
-    bool render_job_pending, bool site_data_restore_work,
-    bool offline_download_active, bool input_active)
+    bool render_job_pending, bool offline_download_active,
+    bool input_active)
 {
     if (app == NULL || app->browser == NULL || app->views == NULL
         || app->process == NULL || frame == NULL || intent == NULL) return;
@@ -362,12 +364,6 @@ void psp_app_youtube_preresolve_tick(
                 ? "settled" : "pending");
     }
 #endif
-    bool pump_allowed = intent->action == PSP_UI_ACTION_NONE
-        && intent->pointer_phase == PSP_UI_POINTER_NONE
-        && intent->scroll_delta == 0
-        && !input_active
-        && !frame->page_dirty && !render_job_pending
-        && !site_data_restore_work;
     const NavigationEntry *current =
         navigation_current(app->views->navigation);
     bool eligible = focused_provider_result
@@ -380,6 +376,22 @@ void psp_app_youtube_preresolve_tick(
         && app->browser->media.playback == NULL
         && !offline_download_active
         && !psp_navigation_cooperate_active();
+    /* The declared frame-pump policy decides whether this frame has room
+       for the resolver's browser-thread response work. It names a superset
+       of the eligibility facts above, which matters only to the proof that
+       no two pumps contend: an ineligible resolver returns before pumping. */
+    bool intent_active = intent->action != PSP_UI_ACTION_NONE
+        || intent->pointer_phase != PSP_UI_POINTER_NONE
+        || intent->scroll_delta != 0;
+    /* An ineligible resolver returns before it could pump, so it has no
+       reason to make the frontend sample anything. */
+    bool pump_allowed = eligible && psp_app_frame_pump_admit(
+        app, FRAME_PUMP_PROVIDER_PRERESOLVE,
+        (input_active
+             ? FRAME_FACT_INPUT_BUTTONS | FRAME_FACT_INPUT_INTENT : 0u)
+        | (intent_active ? FRAME_FACT_INPUT_INTENT : 0u)
+        | (frame->page_dirty ? FRAME_FACT_PAGE_DIRTY : 0u)
+        | (render_job_pending ? FRAME_FACT_RENDER_JOB : 0u));
     bool transport_capacity = false;
     YoutubeTrackPreferences track_preferences = {0};
     psp_media_default_track_preferences(
@@ -414,4 +426,8 @@ void psp_app_youtube_preresolve_tick(
         &track_preferences, frame->ui_sample_us,
         thumbnail_settled, eligible,
         transport_capacity, pump_allowed);
+    /* Admission alone is not a slice: an ineligible or idle resolver
+       returns before pumping. */
+    if (preresolve->pumped_this_tick)
+        psp_app_frame_pump_ran(app, FRAME_PUMP_PROVIDER_PRERESOLVE);
 }

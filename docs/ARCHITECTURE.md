@@ -114,6 +114,11 @@ runs concurrently:
 | voice | optional recognizer job | bounded recognition result |
 | clock/watchdog | platform timing or liveness observation | atomics and fixed records |
 
+These are operating-system threads. A page's Web Workers are not: each
+dedicated worker is another QuickJS context on the browser thread (see
+[Realms, workers, and frames](#realms-workers-and-frames)), so creating one
+adds a realm, never a second mutator.
+
 Workers never traverse the DOM, call page allocators, update chrome, or write
 profile state. Cross-thread messages use bounded slots, generation tokens, and
 release/acquire publication. Thread priorities are named together in
@@ -121,6 +126,38 @@ release/acquire publication. Thread priorities are named together in
 system. JPEG entropy decode runs below the browser priority; cancellation
 invalidates its token without waiting, and only the browser thread may adopt
 the finished pixels or trigger the resulting relayout.
+
+The rule is asserted, not only described. The `Budget` intrusive list is
+deliberately unlocked, so a build with `TILEFINCH_OWNER_CHECKS` binds each
+ledger to the first thread that mutates it and reports any other thread which
+allocates, frees, reserves, or reallocates through it. A worker which needs
+page-charged memory uses a `BudgetConcurrentPool`, whose parent reservation
+is taken on the owning thread and whose own small lock covers worker
+allocations; an intentional handoff calls `budget_adopt_current_thread()`.
+Because every page allocation crosses that one choke point, a worker reaching
+into DOM, style, layout, or script state is caught there rather than by a
+corrupted list much later. The first device run with the check enabled found
+exactly such a reach: the loading-UI supervisor, which draws chrome from the
+callback thread while page work runs, rasterized status-text glyphs lazily
+through the engine's font face and so allocated on the page ledger. The
+chrome glyph cache is therefore filled with every printable ASCII glyph at
+the current UI scale on the owning thread when the faces are bound (190
+glyphs, about 30 ms once per binding on the PSP-3000; the scale setting's
+handler fills the other size the same way), and a cache miss on any other
+thread draws the built-in bitmap for that tick instead of loading. Because a
+supervisor frame draws straight from that cache, rebinding and filling it
+hold the supervisor's presentation fence. A validation run now reports
+`tilefinch-owner-checks: budget-violations=0` through a full media journey.
+
+The two environments use the check differently, in keeping with rule 5. It is
+on by default wherever host tests are built, where a violation aborts the
+test; but host engine code creates no threads, so that mostly guards tests
+and future host concurrency. Every worker in the table above exists only on
+the PSP. A PSP build may therefore opt in for a PPSSPP or device qualification
+run: violations are counted, the first eight are logged, and the exit report
+prints `tilefinch-owner-checks: budget-violations=N`. It is off in ordinary
+PSP validation builds because a thread-identity syscall on every allocation
+would distort the timing those builds exist to measure.
 
 ### 3. Commit complete state, never partial state
 
@@ -170,6 +207,88 @@ Parsing, selector matching, scripting, layout, resource decode, tile raster,
 screenshots, offline saves, and installation all expose bounded pumps. The
 main loop spends a quota, presents input-visible progress, and resumes from an
 owned continuation.
+
+#### Optional pumps are admitted by one declared table
+
+The pipeline stages of a frame (input, navigation, runtime, media, raster,
+present) keep fixed positions in the PSP resident loop. The *optional* work
+between them does not get a private predicate at each call site. It is
+admitted through one constant policy table, `src/frame_pumps.c`, whose entries
+are in loop order:
+
+| Pump | Refused while | Yields to | Claims |
+|---|---|---|---|
+| preconnect | (its dwell machine owns eligibility) | — | — |
+| update-session | — | — | Memory Stick |
+| screenshot | — | — | Memory Stick |
+| offline-download | navigation, any media pipeline, a supervised scope | — | Memory Stick, idle slice |
+| site-restore-storage | buttons, paused/dirty/rendering page, navigation, visible or opening media | the three storage writers above, pending or just finished | Memory Stick, idle slice |
+| site-restore-cache | the same, plus network association | the same, plus storage restoration and unfinished baseline fonts | Memory Stick, idle slice |
+| provider-preresolve | any input, dirty/rendering page, navigation, media, a supervised scope | a download; a restore slice this frame | idle slice |
+| page-idle | any input, paused/dirty/rendering page, visible/opening/decoding media | a restore or download slice this frame | idle slice |
+| deferred-image | any input, paused/rendering page, navigation, media, a supervised scope | a download; a restore or page-idle slice this frame | idle slice |
+| baseline-fonts | a preconnect handshake once association has finished | a storage-writer or restore slice this frame | Memory Stick |
+
+The split is deliberate. *Readiness* ("do I have work?") stays with the pump's
+owner. *Admission* ("may I run, given everything else?") is answered only by
+`frame_pumps_admit()`. Immediately before each admission the frontend
+(`src/psp_app/psp_app_frame_pumps.c`) samples only the conditions that pump's
+own entry names and stops at the first one that refuses, so a condition
+changed earlier in the frame is never stale and an idle frame does not pay for
+media, network, or storage predicates no declared relation depends on.
+Pending work is read from its owner at that moment, never inferred from an
+earlier sample, because a writer can start and finish between two admissions.
+The resident loop pays one out-of-line call per site instead of an inline
+predicate chain. That function is instruction-cache ratcheted; the conversion
+made it smaller.
+
+The table governs only work that goes through it, so the wiring is itself
+tested. Every site, including the ones whose entry refuses nothing today,
+asks for admission and records the slice it then consumed; a slice recorded
+without an admission in the same frame is counted as a wiring violation. A
+source contract test requires each pump identifier to be both admitted and
+recorded in the frontend and each pump's work function to sit behind its own
+admission, with the two mandatory callers of site restoration (the navigation
+gate and exit cleanup) named as the only exceptions.
+
+The loop is single-threaded, so pumps never race. They contend: for the
+frame's latency allowance and for the Memory Stick. Each entry therefore
+states what one slice claims, and the host test enumerates every combination
+of frame facts, pending workloads, and in-slice completions, using only the
+admit-then-record calls a real site can make, to compute exactly
+which pump pairs can claim the same resource in one frame. That set is pinned
+with a written reason per pair. Adding a pump, dropping a yield, or claiming a
+new resource changes the computed set and fails the test until the author adds
+a relation or records why the overlap is acceptable. The first version of the
+table recorded several overlaps as *inherited*: contention the per-site
+predicates had allowed by omission. Each has since been decided. A frame
+performs at most one long idle slice, so page-idle yields to a download slice;
+and at most one optional Memory Stick operation, so the baseline font read
+yields to a storage writer or a storage-restore slice, while expendable cache
+restoration waits for the required baseline fonts rather than the reverse.
+What remains pinned is deliberate: pre-resolution may share a frame with a
+page-idle or deferred-image slice, and the three user-started writers (update,
+screenshot, download) do not yield to one another.
+
+Validation builds count admissions that occur behind a later pump, since a
+yield to "a slice this frame" is only meaningful when the loop and the table
+agree on order. At exit they print both violation counts and, per pump, how
+many admissions and slices the run saw and how often it was refused on
+account of another pump rather than a frame fact
+(`tilefinch-frame-pump: name=baseline-fonts admissions=1 slices=1 yields=1`).
+Admissions and slices are the runtime evidence that a site is live rather
+than merely present in the source; a yield is the evidence that a declared
+relation arbitrated something. The `site-restore` emulator scenario boots
+native HOME from a checked-in Memory Stick seed and requires both restore
+phases to take slices and the font read to have yielded to one. Two relations
+have no emulator evidence and rest on the table test alone: cache restoration
+waiting for fonts (on this boot path the association fact holds cache
+restoration back until long after the single font slice) and page-idle
+yielding to a download slice (it needs a live media download).
+Transport descriptors are not a frame resource: the transport worker's
+own slot admission arbitrates them.
+
+#### Resumable jobs
 
 The authoritative layout is a `LayoutBuildJob` with explicit phases: flow,
 compaction, visibility and focus, paint order, spatial indexing, scroll
@@ -303,6 +422,39 @@ shapes, atoms, strings), which is how growth is attributed before the
 footprint guard test trips. The `Intl` polyfill is one of the lazy modules,
 installed on first access to the `Intl` global.
 
+### Realms, workers, and frames
+
+Every script realm belonging to a page runs on the browser thread. There are
+three kinds, and none of them adds a mutator:
+
+| Realm | Bound | Isolation | Communicates by |
+|---|---|---|---|
+| same-origin nested frame | 16 contexts per parent runtime | a QuickJS context sharing the parent's heap and `Budget` | direct object access, as the platform requires |
+| dedicated Web Worker | 4 contexts per page runtime | its own context and global; structured clone across the boundary | messages queued as platform tasks |
+| loaded child document (`<iframe>` navigation) | 4 per page | its own `ScriptRuntime`, document, and image set | a generation-tagged, sequence-numbered message queue pumped by the owner |
+
+A Web Worker is therefore concurrency in the page's programming model, not
+in the engine: `postMessage` crosses a structured-clone boundary into another
+context, and the worker's turn runs when the single event loop reaches its
+task. Its global inherits from `DedicatedWorkerGlobalScope.prototype`; names
+the worker realm does not define resolve read-only through a fallback to the
+owner's platform implementations, which keeps each realm well under 100 KiB
+instead of re-instantiating the platform. Values a worker API returns (encoded bytes,
+fetch responses, permission objects) are created in the worker's realm so
+`instanceof` and brand checks hold there.
+
+A loaded child document is the heavier case. It is parsed, styled, laid out,
+and scripted as its own document with `SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME`,
+then published to its parent as an opaque pixel snapshot at the iframe
+element's box; the parent never reads the child's DOM. A committed child
+mutation marks its snapshot dirty. If the bounded layout or raster allocation
+for the refresh is refused, the dirty bit stays latched while the owning page
+is live and the owner tick retries, scanning past a frame which cannot
+currently publish (for example one with no box) so it cannot starve a later
+one. Trusted input in a child notifies user activation on that realm and every
+ancestor before the event is dispatched, so parent message handlers and child
+handlers observe one activation state.
+
 Nested frames live in `frames.js`, an eager module that only defines an
 installer; `platform.js` invokes it with its private helpers and deletes the
 installer. Same-origin frame evaluation uses a persistent QuickJS context
@@ -321,6 +473,115 @@ discarded during normal bounded draining, and retained callbacks cannot run
 in a retired realm. Worker construction failures return their quota slot;
 settled fetches remove both lifetime and author-signal abort listeners.
 Microtasks and delayed import retries also check the worker's active state.
+
+### Tasks, timers, and activation
+
+One scheduler owns every queued callback, and it distinguishes two things the
+platform also distinguishes. *Timers* (`setTimeout`, `setInterval`, in pages
+and workers alike) run the HTML timer algorithm: each carries a nesting level
+inherited from the timer that scheduled it, and beyond the fifth level a delay
+below 4 ms is clamped to 4 ms, including for intervals and mixed chains.
+*Platform tasks* — IndexedDB steps, promise-returning platform operations,
+performance-observer delivery, worker and `MessagePort` messages — use the
+same bounded queue and quota but never enter the timer algorithm, so browser
+bookkeeping is neither delayed by a page's timer chain nor able to reset it.
+A `MessagePort` delivers one message per task through the listener microtask
+checkpoint and does not schedule its next delivery until that one has
+finished, which preserves FIFO order across an endpoint even when a listener
+posts back synchronously. Author-dispatched events remain synchronous.
+
+User activation is a timed realm state rather than a flag held during one
+dispatch. Trusted input stamps a five-second transient window and a sticky
+"has been active" bit, exposed through `navigator.userActivation`.
+Activation-gated native operations (fullscreen, game audio resume, page
+controls, multiplayer start) ask the realm whether the window is open;
+fullscreen consumes it. A script-initiated navigation snapshots the state at
+the request boundary, because the host may not consume the request until a
+later turn, and that snapshot — not "was there a referrer" — is what request
+context and Fetch Metadata report as user-activated.
+
+### Platform objects keep private identity
+
+Platform interfaces are ordinary bootstrap JavaScript, so their brand must not
+be forgeable or breakable from the page. The convention is uniform: instance
+state lives in a closure-held `WeakMap` captured before author code runs
+(never in `_underscore` properties), constructors reject everything but a
+private token, and receiver checks compare against that captured identity
+rather than `instanceof` or a mutable global such as `window.navigator`. A
+page which replaces `navigator`, poisons a prototype, or calls an accessor on
+a look-alike gets the `TypeError` a browser would raise and cannot disturb the
+real object. Native handoffs follow the same rule: the host captures what a
+lazy module needs (for example the `StorageManager` instance for the
+origin-private file system) before author code and passes it through a
+temporary, immediately deleted global. `Event.isTrusted` is a non-configurable
+own accessor backed by the same private state. New Web API surface is expected
+to follow this pattern.
+
+### Computed style is one generated registry
+
+`getComputedStyle()` reports resolved values for the properties the engine
+supports, and only those: a disconnected element has an empty declaration
+block, and an unsupported name is absent rather than answered from a table of
+initial values. Which properties exist is a single X-macro list,
+`COMPUTED_STYLE_PROPERTIES` in `src/js_dom_bindings.c`. It generates the
+read-only table behind `name in style`, `length`, `item()` and enumeration, the
+`ComputedStylePropertyId` enumeration the getter dispatches on after one
+binary search, and per-row flags: the two sparse families resolved from
+retained authored text, used-geometry properties that need a box, and
+cascade-only properties that may be read after a DOM mutation without laying
+the page out first. Because every serializer arm names an identifier, a value
+cannot resolve for a property the registry does not list; a source check
+covers what the compiler cannot see (strcmp order, no string matching
+returning to the getter, every row having an arm or a family flag).
+
+Values are serialized from `ComputedStyle` fields, never from authored text,
+so `inherit`, `var()`, relative units and `!important` are settled before a
+value is printed. `width`, `height` and percentage padding are used values
+resolved against the real containing block; a pseudo-element or a non-replaced
+inline reports the computed value instead of a box that is not its own. Where
+the cascade retains less than CSS allows (whole-pixel `letter-spacing`,
+keyword-only `vertical-align`, underline as the only decoration line), the
+serialization is exact for what is retained, which is also what is painted.
+Two tests hold this: exact expected values for the cases with logic in them,
+and a checked-in dump of every registered property across a fixture page
+(`tests/fixtures/computed-style-dump.*`), which turns any change to a resolved
+value into a reviewable diff.
+
+### The engine is vendored and changed in place
+
+QuickJS lives at `third_party/quickjs` with Tilefinch's engine changes already
+applied; `cmake/TilefinchDependencies.cmake` pins the SHA-256 of `quickjs.c`
+and `quickjs.h`, and a mismatch fails configure, so an engine change is an
+ordinary reviewed diff plus a pin update. The historical patch files under
+`patches/` survive only as inputs for lab variants, which rebuild a copy of
+the engine in the build directory with selected layers reversed and have
+their own pinned fingerprints. `third_party/quickjs/README.md` lists every
+carried change in application order.
+
+Most of those changes serve the memory ceiling: bounded array growth with a
+near-limit collection instead of a refusal, collection opportunities at
+allocation sites upstream never checks (native string producers, property
+table growth), interruptible compilation, and Latin-1 string storage. The one
+with architectural weight is the compact array family. A dense `Array` built
+only from one-character Latin-1 strings, unsigned or signed bytes, or signed
+16-bit integers is stored packed in a string-shaped backing store — one or two
+bytes per element instead of a boxed value — which is what keeps a decoder's
+or bytecode interpreter's working arrays inside a PSP script heap. The
+representation is invisible to the language, and its invariants are the ones
+every packed representation here must keep:
+
+- the backing store belongs to the array alone. An operation that would hand
+  it to JavaScript (`join('')`) returns a copy, because a string can be
+  interned, concatenated in place, or outlive the array;
+- mutation is copy-on-write whenever the store is shared or interned, and the
+  interpreter's in-place element store is taken only when it is neither;
+- a value the representation cannot hold widens bytes to 16-bit in place, or
+  converts the array to ordinary boxed elements. That conversion is checked
+  against the device-profile array ceiling first, since packed storage admits
+  up to eight times more elements than boxed storage under the same byte cap;
+- re-packing a homogeneous array is an optimization only. It is attempted at
+  power-of-two lengths and large capacity boundaries, and an allocation
+  refusal leaves the boxed array and the append untouched.
 
 Page scripts have source, count, heap, time, and callback-work admission.
 Interrupt checks cover QuickJS execution and native callback boundaries.
@@ -837,16 +1098,9 @@ later frames keep their established cadence. Activating a HOME tile publishes
 preparation. Navigation therefore never needs to hide input receipt while
 background warm-up finishes.
 
-September 4 PPSSPP ordinary-launcher validation measured browser-main to HOME
-at 362.6 ms and interactive-ready at 396.3 ms, versus 735.6/769.3 ms before
-these changes. About 319.6 ms of that difference is the removed synthetic
-clock probe; roughly 53 ms is the remaining reduction, including splash
-presentation waits. This does not establish physical PSP release boot time:
-validation logging and asset diagnostics remain, and emulator storage is not
-a Memory Stick. The validation-only `tilefinch-boot-input` line separately
-records the first actual controller sample and its delay from interactive
-loop entry (30.2 ms without an input script in the final run). Input-script
-file loading adds harness overhead and must not be treated as shipping work.
+The measured boot timeline, and what an emulator measurement of it does and
+does not establish, is recorded in
+[PSP envelope](engineering/PSP_ENVELOPE.md#boot-timeline).
 
 Page fonts follow the same staged boundary, with one presentation invariant:
 the regular sans face used by native HOME is loaded before HOME's first frame,
@@ -886,6 +1140,14 @@ state use temporary files, flushes, versioned records, and atomic publication
 appropriate to PSP FAT behavior. [Storage](STORAGE.md) is the authoritative
 file and write-frequency map.
 
+Session state that pages can write is bounded per kind and keyed by an origin
+the native layer derives from the document URL, never one the page supplies.
+`localStorage` may persist; `sessionStorage` and the origin-private file
+system do not. The latter is a RAM-backed table (32 entries, 64 KiB per file,
+256 KiB total) allocated on first write, available only to secure,
+non-opaque origins while site data is allowed, with writer generations so a
+stream opened before a site-data clear cannot write into the cleared store.
+
 Manifest-backed offline apps extend the same library rather than adding a
 second runtime. Installation serializes the committed document and a bounded
 view of the live same-origin HTTP cache. That view retains typed resource
@@ -911,6 +1173,8 @@ Tilefinch treats evidence as part of the design:
 | Gate | What it proves |
 |---|---|
 | focused unit and fault-injection tests | bounds, rollback, parser policy, reducers, allocators |
+| frame-pump policy proof | every fact, workload, and completion combination; the pinned set of pumps able to contend for one resource in a frame |
+| ledger owner checks | no thread but its owner mutates a `Budget` (aborting on the host; counted in an opted-in PSP run, where the workers exist) |
 | Canvas/WebGL game lane | animation lifecycle, Gamepad sampling, pixel output, indexed geometry and graphics bounds |
 | selected upstream WPT | web-platform behavior against unchanged tests |
 | response-keyed replay | deterministic network inputs and closed request ledgers |
@@ -932,9 +1196,13 @@ The main ownership boundaries are intentionally visible:
 - `src/style*.c`, `src/layout*.c`, `src/render.c`, `src/render/` — visual
   pipeline;
 - `src/js_runtime.c`, `src/js_*`, `src/bootstrap/` — JavaScript and Web APIs;
+- `third_party/quickjs/` — the vendored, in-place-modified engine and the
+  list of changes it carries; `patches/` — historical inputs for lab variants;
 - `src/fetch.c`, `src/fetch/`, `src/request_context.c`, `src/session.c` —
   transport policy and browser session state;
 - `src/media_*.c`, `src/psp_media_*.c`, `src/media_backend_psp.c` — media;
+- `src/frame_pumps.c` — the declared admission policy for optional frame
+  work; `src/psp_app/psp_app_frame_pumps.c` samples its facts;
 - `src/psp_network*.c`, `src/psp_app/` — PSP lifecycle and frontend;
 - `src/update_*.c`, `src/update_launcher_psp.c` — update verification,
   installation, and launch;

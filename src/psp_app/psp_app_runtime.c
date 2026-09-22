@@ -96,11 +96,13 @@ void psp_presentation_bind_chrome_fonts(
     const FontFace *regular = browser_engine_font_face(engine, FONT_SANS);
     if (regular == NULL)
         regular = browser_engine_native_home_font(engine);
-    psp_ui_set_chrome_fonts(
+    psp_presentation_rebind_chrome_fonts(
         regular,
         browser_engine_font_face_variant(
-            engine, FONT_SANS, false, true));
+            engine, FONT_SANS, false, true),
+        presentation->ui.browser_ui_scale);
     presentation->chrome_fonts_bound = true;
+    psp_report_chrome_glyph_preload();
 }
 
 void psp_presentation_unbind_chrome_fonts(
@@ -438,6 +440,7 @@ static PspMediaPresentMode psp_media_present_requested_mode(void)
 PspDisplay psp_display;
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+#include "tilefinch/psp_input_cadence.h"
 typedef struct {
     uint64_t compose_total_us;
     uint64_t compose_max_us;
@@ -464,13 +467,13 @@ typedef struct {
     bool track_menu_state_known;
     bool track_menu_was_open;
     uint64_t cursor_sample_pending_us;
-    uint64_t cursor_sample_previous_us;
-    uint64_t cursor_sample_interval_total_us;
-    uint64_t cursor_sample_interval_max_us;
+    PspInputCadence cursor_cadence;
+    uint64_t cursor_compose_total_us, cursor_compose_max_us;
+    uint64_t cursor_publish_total_us, cursor_publish_max_us;
+    uint32_t cursor_work_samples;
     uint64_t cursor_latency_total_us;
     uint64_t cursor_latency_max_us;
     uint32_t cursor_samples;
-    uint32_t cursor_sample_intervals;
     uint32_t cursor_presentations;
     uint32_t cursor_coalesced_samples;
     uint32_t cursor_over_33ms;
@@ -544,13 +547,25 @@ void psp_report_presentation_cadence(const char *phase)
         metrics->cursor_over_33ms);
     printf(
         "tilefinch-cursor-cadence: phase=%s intervals=%lu "
-        "average=%lluus max=%lluus\n",
+        "average=%lluus max=%lluus segments=%lu\n",
         phase == NULL ? "unknown" : phase,
-        (unsigned long) metrics->cursor_sample_intervals,
-        (unsigned long long) (metrics->cursor_sample_intervals == 0 ? 0
-            : metrics->cursor_sample_interval_total_us
-                / metrics->cursor_sample_intervals),
-        (unsigned long long) metrics->cursor_sample_interval_max_us);
+        (unsigned long) metrics->cursor_cadence.intervals,
+        (unsigned long long) (metrics->cursor_cadence.intervals == 0 ? 0
+            : metrics->cursor_cadence.total_us
+                / metrics->cursor_cadence.intervals),
+        (unsigned long long) metrics->cursor_cadence.max_us,
+        (unsigned long) metrics->cursor_cadence.segments);
+    printf("tilefinch-cursor-work: phase=%s samples=%lu "
+           "compose-average=%lluus compose-max=%lluus "
+           "publish-average=%lluus publish-max=%lluus\n",
+        phase == NULL ? "unknown" : phase,
+        (unsigned long) metrics->cursor_work_samples,
+        (unsigned long long) (metrics->cursor_work_samples == 0 ? 0
+            : metrics->cursor_compose_total_us / metrics->cursor_work_samples),
+        (unsigned long long) metrics->cursor_compose_max_us,
+        (unsigned long long) (metrics->cursor_work_samples == 0 ? 0
+            : metrics->cursor_publish_total_us / metrics->cursor_work_samples),
+        (unsigned long long) metrics->cursor_publish_max_us);
     printf(
         "tilefinch-video-scanout: phase=%s intervals=%lu "
         "average=%lluus max=%lluus "
@@ -592,14 +607,7 @@ void psp_report_presentation_cadence(const char *phase)
 void psp_cursor_latency_sample(uint64_t sampled_us)
 {
     PspPresentationCadence *metrics = &psp_presentation_cadence;
-    if (metrics->cursor_sample_previous_us != 0) {
-        uint64_t interval_us = sampled_us - metrics->cursor_sample_previous_us;
-        metrics->cursor_sample_intervals++;
-        metrics->cursor_sample_interval_total_us += interval_us;
-        if (interval_us > metrics->cursor_sample_interval_max_us)
-            metrics->cursor_sample_interval_max_us = interval_us;
-    }
-    metrics->cursor_sample_previous_us = sampled_us;
+    psp_input_cadence_observe(&metrics->cursor_cadence, true, sampled_us);
     metrics->cursor_samples++;
     if (metrics->cursor_sample_pending_us == 0) {
         metrics->cursor_sample_pending_us = sampled_us;
@@ -608,6 +616,12 @@ void psp_cursor_latency_sample(uint64_t sampled_us)
            user actually experiences when work coalesces multiple moves. */
         metrics->cursor_coalesced_samples++;
     }
+}
+
+void psp_cursor_latency_idle(void)
+{
+    psp_input_cadence_observe(
+        &psp_presentation_cadence.cursor_cadence, false, 0);
 }
 
 void psp_video_scanout_note_discontinuity(void)
@@ -1584,6 +1598,18 @@ bool psp_present_internal(
         .ui_loading_us = ui_timing.loading_us,
         .sequence = sequence
     };
+    if (published && psp_presentation_cadence.cursor_sample_pending_us != 0) {
+        PspPresentationCadence *metrics = &psp_presentation_cadence;
+        uint64_t compose = composite_finished_us - presentation_started_us;
+        uint64_t publish = published_us - composite_finished_us;
+        metrics->cursor_work_samples++;
+        metrics->cursor_compose_total_us += compose;
+        metrics->cursor_publish_total_us += publish;
+        if (compose > metrics->cursor_compose_max_us)
+            metrics->cursor_compose_max_us = compose;
+        if (publish > metrics->cursor_publish_max_us)
+            metrics->cursor_publish_max_us = publish;
+    }
     psp_cadence_published(published);
     if (published && !media_visible) psp_focus_feedback_published(frame, ui);
     if (published && media_visible) {
@@ -2406,6 +2432,46 @@ void psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui)
     cooperate->presenting = 0;
 }
 
+/* Hold the supervisor's presentation fence around a chrome glyph cache
+   change. A supervisor frame draws straight from that cache, so replacing
+   or filling it while a presentation is in flight would let the callback
+   thread read freed or half-built glyph storage. The wait is one
+   presentation at most (a framebuffer copy and a vblank). */
+static bool psp_presentation_fence_acquire(void)
+{
+    PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
+    if (cooperate->active == 0) return false;
+    unsigned waited_ms = 0;
+    while (!__sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u)) {
+        (void) sceKernelDelayThread(1000);
+        if ((++waited_ms & 63u) == 0) psp_log_heartbeat();
+    }
+    __sync_synchronize();
+    return true;
+}
+
+static void psp_presentation_fence_release(bool held)
+{
+    if (!held) return;
+    __sync_synchronize();
+    psp_navigation_cooperate.presenting = 0;
+}
+
+void psp_presentation_rebind_chrome_fonts(
+    const FontFace *regular, const FontFace *bold, unsigned scale)
+{
+    bool held = psp_presentation_fence_acquire();
+    psp_ui_set_chrome_fonts(regular, bold, scale);
+    psp_presentation_fence_release(held);
+}
+
+void psp_presentation_preload_chrome_scale(unsigned scale)
+{
+    bool held = psp_presentation_fence_acquire();
+    psp_ui_preload_chrome_scale(scale);
+    psp_presentation_fence_release(held);
+}
+
 void psp_work_cooperate_begin_media_open(
     PspUiState *ui, const uint16_t *engine_frame,
     const PspUiMediaState *media_ui)
@@ -2748,6 +2814,7 @@ static void psp_work_ui_tick(bool owner_thread)
     int analog_y = scripted ? scripted_input.analog_y : pad.Ly;
     bool analog_active = analog_x < 104 || analog_x > 152
         || analog_y < 104 || analog_y > 152;
+    if (!analog_active) psp_cursor_latency_idle();
     bool priority_handled = false;
     if (owner_thread && cooperate->engine == NULL
         && !cooperate->media_surface && !cooperate->media_detached

@@ -235,6 +235,10 @@ static bool style_property_vertical_align(const StylePropertyParse *parse)
                 style->vertical_align = VERTICAL_TOP;
             } else if (strcmp(resolved, "bottom") == 0) {
                 style->vertical_align = VERTICAL_BOTTOM;
+            } else if (strcmp(resolved, "text-top") == 0) {
+                style->vertical_align = VERTICAL_TEXT_TOP;
+            } else if (strcmp(resolved, "text-bottom") == 0) {
+                style->vertical_align = VERTICAL_TEXT_BOTTOM;
             } else {
                 style->vertical_align = VERTICAL_BASELINE;
             }
@@ -267,8 +271,10 @@ static bool style_property_line_height(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->line_height = style_parse_line_height(sheet, value, value_length);
-        *mask |= S_LINE_HEIGHT;
+    int parsed = style_parse_line_height(sheet, value, value_length);
+    if (parsed == STYLE_LINE_HEIGHT_INVALID) return true;
+    style->line_height = parsed;
+    *mask |= S_LINE_HEIGHT;
     
     return true;
 }

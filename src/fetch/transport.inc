@@ -207,7 +207,7 @@ static bool fetch_hop_configure_cookie(CURL *easy, FetchHopState *hop,
             memcpy(hop->cookie_header, request->cookie, length + 1);
         }
     }
-    const char *cookie_trace = getenv("TILEFINCH_TRACE_COOKIE");
+    const char *cookie_trace = tilefinch_trace_cookie_value();
     if (cookie_trace != NULL) {
         bool has_clearance = strstr(
             hop->cookie_header, "cf_clearance=") != NULL;

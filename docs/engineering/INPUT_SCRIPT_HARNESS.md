@@ -115,6 +115,18 @@ boot URL and validation mode.
 
 ## PPSSPP
 
+`cursor-latency` qualifies native HOME at an explicit 333 MHz (also when the
+clock override is unset/zero). Continuous movement segments exclude the
+script's deliberate idle gaps and cursor-edge clamps. Both sample cadence and
+sample-to-accepted-presentation latency must average at most 20 ms and peak at
+most 34 ms; every sampled move must receive a presentation with no coalescing.
+Explicit other clocks, such as `TILEFINCH_PPSSPP_CPU_MHZ=111`, are pressure
+profiles: timings are reported without claiming stock-clock qualification,
+while presentation accounting and the receiver golden remain mandatory.
+`tilefinch-cursor-work` splits composition from publication (including vblank)
+to diagnose missed refreshes without weakening the stock-clock gate. Each run
+keeps its requested emulator configuration beside its log.
+
 ```sh
 PSPDEV=/path/to/pspdev cmake --preset psp \
   -B build-preset-psp-validation \
@@ -194,6 +206,18 @@ chrome theme, and video scaling.
 Text-entry modals, live navigation, site data, screenshots, and seeded
 collection deletion use separate scenarios because they need external state or
 clock-derived output.
+
+`site-restore` idles on native HOME and must be run with
+`--data-dir tests/fixtures/ppsspp-site-data`, which seeds a profile with
+local-storage persistence and a 1 MB disk cache enabled, one local-storage
+snapshot, and a 120 KiB cache snapshot beside the EBOOT. Its golden is
+trivial; the gate is the validation log, which must show both deferred
+restores completing through the frame-pump policy, the baseline font read
+yielding to a restore slice, and no order or wiring violations. The seed is
+written by `tilefinch-site-data-fixture --write` with the shipping writers,
+and the `tilefinch-site-data-fixture-tests` host test reloads it with the
+shipping readers, so a persistence-format change fails on the host instead of
+turning the emulator run into a restore with nothing to read.
 
 `runtime-input-live` and `runtime-cancel-live` use the bounded cooperative
 runtime fixture. Their goldens preserve action order/counts and captures but

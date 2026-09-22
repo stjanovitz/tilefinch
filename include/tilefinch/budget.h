@@ -6,6 +6,13 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Validation builds assert the ledger's single-owner rule instead of only
+   describing it. Defined PUBLIC on tilefinch_core so every translation unit
+   agrees on the Budget layout. */
+#if defined(TILEFINCH_OWNER_CHECKS) && !defined(__PSP__)
+#include <pthread.h>
+#endif
+
 typedef enum {
     BUDGET_CATEGORY_UNCATEGORIZED = 0,
     BUDGET_CATEGORY_DOM,
@@ -77,7 +84,36 @@ typedef struct {
     size_t pressure_saved_bytes;
     size_t external_reserved;
     size_t external_reserved_peak;
+#if defined(TILEFINCH_OWNER_CHECKS)
+    /* The first thread to mutate the ledger owns it. */
+#if defined(__PSP__)
+    int owner_thread;  /* SceUID */
+#else
+    pthread_t owner_thread;
+#endif
+    bool owner_thread_bound;
+#endif
 } Budget;
+
+/* The Budget intrusive list is deliberately unlocked: only its owning
+   thread may allocate, free, reserve or roll back. Worker threads use a
+   BudgetConcurrentPool. With TILEFINCH_OWNER_CHECKS a mutation from any
+   other thread is reported and counted; on the host it also aborts unless
+   made non-fatal, while the PSP keeps running so the exit report can publish
+   the count. Without it these are no-ops and cost nothing. */
+#if defined(TILEFINCH_OWNER_CHECKS)
+/* Deliberate handoff: the calling thread becomes the owner. */
+void budget_adopt_current_thread(Budget *budget);
+unsigned long budget_owner_violations(void);
+void budget_owner_checks_set_fatal(bool fatal);
+#else
+static inline void budget_adopt_current_thread(Budget *budget)
+{
+    (void) budget;
+}
+static inline unsigned long budget_owner_violations(void) { return 0; }
+static inline void budget_owner_checks_set_fatal(bool fatal) { (void) fatal; }
+#endif
 
 /* A logical charge for memory whose physical storage lives outside the
    Budget heap (for example inline facade tables or a separately synchronized

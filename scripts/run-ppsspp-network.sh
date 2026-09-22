@@ -694,6 +694,10 @@ fi
 # think this is on when it is not.
 software_rendering=False
 graphics_backend="0 (OPENGL)"
+# PPSSPP's OpenGL backend no longer initializes on current macOS; the EBOOT
+# then never starts and the run looks like a browser hang. The host renderer
+# does not affect anything this script checks.
+[ "$(uname -s)" != Darwin ] || graphics_backend="3 (VULKAN)"
 if [ "$ge_present_probe" -eq 1 ] || [ "$local_fixture" -eq 1 ]; then
     # Browser WebGL copies its GE target back into the engine-owned canvas.
     # PPSSPP hardware renderers keep that target in a host FBO, so only the
@@ -765,6 +769,19 @@ stop_emulator() {
                 # `open` process is not its parent. Its unique --log path is
                 # the reliable ownership token for this run.
                 kill $ppsspp_pids 2>/dev/null || true
+                # An emulator sitting in its "graphics backend failed" dialog
+                # ignores SIGTERM, and the wait below would never return.
+                grace=0
+                while [ "$grace" -lt 5 ] \
+                    && pgrep -f -- "--log=$emulator_log" >/dev/null 2>&1; do
+                    sleep 1
+                    grace=$((grace + 1))
+                done
+                ppsspp_pids=$(
+                    pgrep -f -- "--log=$emulator_log" 2>/dev/null || true
+                )
+                [ -n "$ppsspp_pids" ] && kill -9 $ppsspp_pids 2>/dev/null \
+                    || true
             fi
         else
             kill "$emulator_pid" 2>/dev/null || true

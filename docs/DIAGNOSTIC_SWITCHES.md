@@ -17,11 +17,11 @@ the code and its strings ship).
 | `TILEFINCH_TRACE_BASE64` | 1 | `src/diagnostic_trace.h` | host | Expose base64 tracing to the bootstrap. |
 | `TILEFINCH_TRACE_CALLBACK_SOURCE` | 1 | `src/diagnostic_trace.h` | host | Capture the source context of the last uncaught frame callback error. |
 | `TILEFINCH_TRACE_CLIP` | 1 | `src/layout.c` | host | Layout clip tracing. |
-| `TILEFINCH_TRACE_CONSOLE` | 1 | `src/js_runtime/host_primitives.inc` | always | Print page console output (first 64 messages). |
-| `TILEFINCH_TRACE_COOKIE` | 3 | `src/fetch/transport.inc` | always | Cookie store decisions; value `summary` omits URLs, byte counts, and cookie contents. |
-| `TILEFINCH_TRACE_CURL_POOL` | 1 | `src/fetch/response_stream.inc` | host | libcurl concurrent pool metrics. |
+| `TILEFINCH_TRACE_CONSOLE` | 1 | `src/diagnostic_trace.h` | host | Print page console output (first 64 messages). |
+| `TILEFINCH_TRACE_COOKIE` | 1 | `src/diagnostic_trace.h` | host | Cookie store decisions; value `summary` omits URLs, byte counts, and cookie contents. |
+| `TILEFINCH_TRACE_CURL_POOL` | 1 | `src/diagnostic_trace.h` | host | libcurl concurrent pool metrics. |
 | `TILEFINCH_TRACE_DOM` | 1 | `src/interactive_main.c` | always | Dump the DOM after the interactive lab tick loop. |
-| `TILEFINCH_TRACE_DPU` | 2 | `src/diagnostic_trace.h` | always | Evaluate the DPU bootstrap diagnostic module. |
+| `TILEFINCH_TRACE_DPU` | 1 | `src/diagnostic_trace.h` | host | Evaluate the DPU bootstrap diagnostic module. |
 | `TILEFINCH_TRACE_EVAL_SOURCE` | 1 | `src/diagnostic_trace.h` | host | Install the eval-source tracing hook in the page. |
 | `TILEFINCH_TRACE_EVAL_SOURCE_DIR` | 1 | `src/js_runtime/runtime_creation.inc` | host | Directory where the eval-source hook writes evaluated sources (16 max). |
 | `TILEFINCH_TRACE_FINAL_DOM` | 1 | `src/interactive_main.c` | always | Dump the DOM at the end of the interactive lab run. |
@@ -31,20 +31,20 @@ the code and its strings ship).
 | `TILEFINCH_TRACE_FRAME_MESSAGES` | 4 | `src/diagnostic_trace.h` | host | Cross-frame message queue events. |
 | `TILEFINCH_TRACE_FRAME_MESSAGE_DROPS` | 2 | `src/navigation/page_lifecycle.inc` | host | Only dropped/rejected cross-frame messages. |
 | `TILEFINCH_TRACE_GEOMETRY` | 1 | `src/js_runtime/host_primitives.inc` | host | Layout box geometry lookups from script. |
-| `TILEFINCH_TRACE_IMAGES` | 3 | `src/image.c` | always | Image resource events. |
-| `TILEFINCH_TRACE_IMAGE_PROFILE` | 1 | `src/image.c` | always | Image decode timing profile. |
+| `TILEFINCH_TRACE_IMAGES` | 1 | `src/diagnostic_trace.h` | host | Image resource events. |
+| `TILEFINCH_TRACE_IMAGE_PROFILE` | 1 | `src/diagnostic_trace.h` | host | Image decode timing profile. |
 | `TILEFINCH_TRACE_INTERACTION` | 1 | `src/interactive/diagnostics.inc` | always | Interaction state probe in the interactive lab. |
 | `TILEFINCH_TRACE_JS_INTERRUPTS` | 1 | `src/diagnostic_trace.h` | host | QuickJS interrupt and cooperate decisions. |
-| `TILEFINCH_TRACE_JS_PROPERTY_FAULTS` | 1 | `src/js_runtime/runtime_creation.inc` | profile builds | Bounded property tracing; numeric values trace all events, `absent` traces failed `in`, and `fault` traces null/undefined bases (property-fault-trace builds only). |
+| `TILEFINCH_TRACE_JS_PROPERTY_FAULTS` | 1 | `src/diagnostic_trace.h` | host | Bounded property tracing; numeric values trace all events, `absent` traces failed `in`, and `fault` traces null/undefined bases (property-fault-trace builds only). |
 | `TILEFINCH_TRACE_JS_REJECT_STACK` | 1 | `src/budget.c` | host | Backtrace at each refused QuickJS pool request. |
-| `TILEFINCH_TRACE_JS_ROOTS` | 4 | `src/interactive_main.c` | always | Script runtime root reports at frame failure and teardown. |
+| `TILEFINCH_TRACE_JS_ROOTS` | 2 | `src/diagnostic_trace.h` | always | Script runtime root reports at frame failure and teardown. |
 | `TILEFINCH_TRACE_JS_STARTUP` | 1 | `src/diagnostic_trace.h` | host | Per-bootstrap-module timing and the per-module heap census. |
 | `TILEFINCH_TRACE_LAYOUT` | 2 | `src/layout.c` | host | Layout tracing. |
 | `TILEFINCH_TRACE_LAYOUT_CLASS` | 1 | `src/layout.c` | host | Class name whose layout is traced. |
 | `TILEFINCH_TRACE_LAYOUT_PROFILE` | 1 | `src/layout.c` | host | Layout phase profile, including exclusive style/pseudo/intrinsic/margin/text/cooperation flow costs. |
 | `TILEFINCH_TRACE_LAYOUT_SLICES` | 1 | `src/layout.c` | host | Resumable layout slice boundaries. |
 | `TILEFINCH_TRACE_LAZY_SCRIPTS` | 1 | `src/diagnostic_trace.h` | host | Lazy webpack plan memory and factory events. |
-| `TILEFINCH_TRACE_MODULE_ORDER` | 1 | `src/js_module_loader.c` | always | ES module load order. |
+| `TILEFINCH_TRACE_MODULE_ORDER` | 1 | `src/diagnostic_trace.h` | host | ES module load order. |
 | `TILEFINCH_TRACE_MUTATION_JOURNAL` | 2 | `src/navigation/history_runtime.inc` | host | Print each script mutation journal record (kind, element, attribute, exact changed-token count) as layout reuse invalidation consumes it. |
 | `TILEFINCH_TRACE_MUTATION_POLICY` | 1 | `src/diagnostic_trace.h` | host | Mutation classification (resource rebuild, image scan) per DOM change. |
 | `TILEFINCH_TRACE_NAVIGATION_REQUESTS` | 1 | `src/js_runtime/host_primitives.inc` | host | Script-initiated navigations. |
@@ -55,22 +55,22 @@ the code and its strings ship).
 | `TILEFINCH_TRACE_PROVIDER` | 1 | `src/youtube_lite.c` | host | Video provider route timing. |
 | `TILEFINCH_TRACE_PSEUDO_CLASS` | 1 | `src/layout.c` | host | Class name whose pseudo-element layout is traced. |
 | `TILEFINCH_TRACE_RANGE_CLASS` | 1 | `src/layout.c` | host | Class name whose range layout is traced. |
-| `TILEFINCH_TRACE_RAW_COOKIES` | 2 | `src/fetch/trace_session.inc` | always | Refused by trace acquisition; guards against capturing raw cookies. |
-| `TILEFINCH_TRACE_REACT_ERROR` | 1 | `src/script_loader.c` | always | Inject a React error diagnostic into matching bundles. |
+| `TILEFINCH_TRACE_RAW_COOKIES` | 2 | `src/diagnostic_trace.h` | always | Refused by trace acquisition; guards against capturing raw cookies. |
+| `TILEFINCH_TRACE_REACT_ERROR` | 1 | `src/diagnostic_trace.h` | host | Inject a React error diagnostic into matching bundles. |
 | `TILEFINCH_TRACE_REMOTE_MUTATIONS` | 1 | `src/interactive/experimental.inc` | always | Remote (experimental) mutation application. |
-| `TILEFINCH_TRACE_REPLAY_DIAGNOSTICS` | 1 | `src/fetch/trace_replay.inc` | always | HTTP trace replay decisions (always on in validation builds). |
-| `TILEFINCH_TRACE_REQUEST_BODY` | 1 | `src/js_fetch_cors.c` | always | Small page request bodies. |
+| `TILEFINCH_TRACE_REPLAY_DIAGNOSTICS` | 1 | `src/diagnostic_trace.h` | host | HTTP trace replay decisions (always on in validation builds). |
+| `TILEFINCH_TRACE_REQUEST_BODY` | 1 | `src/diagnostic_trace.h` | host | Small page request bodies. |
 | `TILEFINCH_TRACE_RUNTIME_STEPS` | 1 | `src/diagnostic_trace.h` | host | Per-step timing inside a runtime advance. |
-| `TILEFINCH_TRACE_SCRIPT_ATTEMPTS` | 2 | `src/script_loader.c` | always | Every script load attempt by URL. |
-| `TILEFINCH_TRACE_SCRIPT_FAILURES` | 24 | `src/diagnostic_trace.h` | always | Script admission, compile, and execution failures (29 sites). |
-| `TILEFINCH_TRACE_SCRIPT_RESIDENCY` | 1 | `src/js_runtime/evaluation.inc` | always | Script residency phases; the value selects the mode. |
+| `TILEFINCH_TRACE_SCRIPT_ATTEMPTS` | 1 | `src/diagnostic_trace.h` | host | Every script load attempt by URL. |
+| `TILEFINCH_TRACE_SCRIPT_FAILURES` | 2 | `src/diagnostic_trace.h` | always | Script admission, compile, and execution failures (29 sites). |
+| `TILEFINCH_TRACE_SCRIPT_RESIDENCY` | 1 | `src/diagnostic_trace.h` | host | Script residency phases; the value selects the mode. |
 | `TILEFINCH_TRACE_SCROLL` | 1 | `src/diagnostic_trace.h` | host | Script-requested scrolls. |
 | `TILEFINCH_TRACE_SCROLL_WIDTH` | 1 | `src/layout.c` | host | Scroll width computation. |
-| `TILEFINCH_TRACE_SENTINEL` | 2 | `src/script_loader.c` | always | Inject sentinel/submit diagnostics into matching bundles. |
-| `TILEFINCH_TRACE_STARTUP_FAILURE` | 1 | `src/js_module_loader.c` | always | Expose a startup-recovery failure to the page for diagnosis. |
+| `TILEFINCH_TRACE_SENTINEL` | 1 | `src/diagnostic_trace.h` | host | Inject sentinel/submit diagnostics into matching bundles. |
+| `TILEFINCH_TRACE_STARTUP_FAILURE` | 1 | `src/diagnostic_trace.h` | host | Expose a startup-recovery failure to the page for diagnosis. |
 | `TILEFINCH_TRACE_STYLESHEETS` | 14 | `src/resources.c` | host | Stylesheet compile, fragment, and cache decisions (14 sites). |
 | `TILEFINCH_TRACE_TASKS` | 1 | `src/diagnostic_trace.h` | host | Timer and task counters at teardown. |
-| `TILEFINCH_TRACE_WASM` | 1 | `src/js_wasm_bridge.c` | always | WebAssembly export calls and memory growth. |
+| `TILEFINCH_TRACE_WASM` | 1 | `src/diagnostic_trace.h` | host | WebAssembly export calls and memory growth. |
 | `TILEFINCH_TRACE_WORKER_MESSAGES` | 1 | `src/js_runtime/runtime_creation.inc` | host | Worker messages; the value filters by direction. |
 | `TILEFINCH_TRACE_WORKER_SOURCE` | 1 | `src/diagnostic_trace.h` | host | Worker script sources (first 16 KiB). |
 
@@ -82,7 +82,7 @@ the code and its strings ship).
 | `TILEFINCH_DUMP_FRAME_MEMORY` | 2 | `src/interactive_main.c` | always | Print per-frame script runtime memory reports in the interactive lab. |
 | `TILEFINCH_DUMP_JS_MEMORY` | 1 | `src/diagnostic_trace.h` | host | Print QuickJS memory usage at boot-window advances and runtime teardown. |
 | `TILEFINCH_DUMP_JS_POOL` | 2 | `src/diagnostic_trace.h` | host | Print the QuickJS pool class report at runtime teardown. |
-| `TILEFINCH_DUMP_JS_POOL_AT_PEAK` | 1 | `src/budget.c` | always | Print the QuickJS pool report when its peak is reached. |
+| `TILEFINCH_DUMP_JS_POOL_AT_PEAK` | 1 | `src/diagnostic_trace.h` | host | Print the QuickJS pool report when its peak is reached. |
 | `TILEFINCH_DUMP_JS_PROFILE` | 1 | `src/diagnostic_trace.h` | host | Dump the QuickJS execution profile at teardown (profile builds only). |
 
 ## A/B

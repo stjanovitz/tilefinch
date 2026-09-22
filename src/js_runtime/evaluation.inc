@@ -457,7 +457,7 @@ typedef struct {
 
 static const char *script_residency_trace_mode(void)
 {
-    const char *mode = getenv("TILEFINCH_TRACE_SCRIPT_RESIDENCY");
+    const char *mode = tilefinch_trace_script_residency_value();
     return mode == NULL || mode[0] == '\0' ? NULL : mode;
 }
 

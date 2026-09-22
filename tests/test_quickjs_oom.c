@@ -1254,6 +1254,100 @@ static int run_native_string_gc_headroom(void)
     return okay ? 0 : 1;
 }
 
+static int run_optional_numeric_repack_refusal(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JS_SetGCThreshold(runtime, SIZE_MAX);
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+
+    static const char prepare[] =
+        "(()=>{const a=Array(8192).fill(40000);"
+        "for(let i=0;i<4096;i++)a[i]=65;a.length=4096;return a})()";
+    int okay = 1;
+    for (unsigned use_push = 0; use_push < 2; use_push++) {
+        JSValue array = JS_Eval(context, prepare, sizeof(prepare) - 1u,
+                                "<optional-repack-refusal>",
+                                JS_EVAL_TYPE_GLOBAL);
+        JSValue push = JS_IsException(array) ? JS_UNDEFINED
+            : JS_GetPropertyStr(context, array, "push");
+        uint32_t capacity = JS_IsException(array) ? 0u
+            : JS_GetFastArrayCapacityForTest(array);
+        bool case_ok = !JS_IsException(array) && JS_IsFunction(context, push)
+            && capacity >= 4098u;
+
+        JS_RunGC(runtime);
+        JS_SetMemoryLimit(runtime, 1u);
+        int append_result = -1;
+        JSValue call_result = JS_UNDEFINED;
+        if (case_ok && use_push) {
+            JSValue arguments[2] = {
+                JS_NewInt32(context, 66), JS_NewInt32(context, 67)
+            };
+            call_result = JS_Call(context, push, array, 2, arguments);
+            append_result = JS_IsException(call_result) ? -1 : 0;
+        } else if (case_ok) {
+            append_result = JS_SetPropertyUint32(
+                context, array, 4096u, JS_NewInt32(context, 66));
+        }
+        bool had_exception = JS_HasException(context);
+        JS_SetMemoryLimit(runtime, 4u * MIB);
+        if (had_exception)
+            JS_FreeValue(context, JS_GetException(context));
+        case_ok &= append_result >= 0 && !had_exception;
+        JS_FreeValue(context, call_result);
+
+        JSValue length_value = JS_GetPropertyStr(context, array, "length");
+        JSValue first_appended = JS_GetPropertyUint32(context, array, 4096u);
+        JSValue second_appended = use_push
+            ? JS_GetPropertyUint32(context, array, 4097u) : JS_UNDEFINED;
+        int32_t length = -1, first = -1, second = 67;
+        uint32_t capacity_after = JS_GetFastArrayCapacityForTest(array);
+        case_ok &= JS_ToInt32(context, &length, length_value) == 0
+            && JS_ToInt32(context, &first, first_appended) == 0
+            && (!use_push || JS_ToInt32(context, &second, second_appended) == 0)
+            && length == (use_push ? 4098 : 4097)
+            && first == 66 && second == 67
+            && capacity_after == capacity;
+        if (!case_ok) {
+            fprintf(stderr,
+                    "optional repack case=%s result=%d exception=%d "
+                    "length=%d values=%d/%d capacity=%u/%u\n",
+                    use_push ? "push" : "set", append_result,
+                    had_exception, length, first, second,
+                    capacity, capacity_after);
+        }
+        okay &= case_ok;
+        JS_FreeValue(context, second_appended);
+        JS_FreeValue(context, first_appended);
+        JS_FreeValue(context, length_value);
+        JS_FreeValue(context, push);
+        JS_FreeValue(context, array);
+    }
+    JSValue recovery = JS_Eval(context, "6*7", 3,
+                               "<optional-repack-recovery>",
+                               JS_EVAL_TYPE_GLOBAL);
+    int32_t answer = 0;
+    okay &= !JS_IsException(recovery)
+        && JS_ToInt32(context, &answer, recovery) == 0 && answer == 42;
+    JS_FreeValue(context, recovery);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay)
+        fprintf(stderr, "optional compact-array repack refusal failed\n");
+    return okay ? 0 : 1;
+}
+
 static int run_property_growth_gc_headroom(void)
 {
     enum { PROPERTY_COUNT = 128 };
@@ -1835,6 +1929,12 @@ int main(int argc, char **argv)
         return 1;
     }
     puts("QuickJS compact character-array bound: PASS");
+
+    if (run_optional_numeric_repack_refusal() != 0) {
+        fprintf(stderr, "QuickJS optional numeric repack refusal failed\n");
+        return 1;
+    }
+    puts("QuickJS optional numeric repack refusal: PASS");
 
     if (run_native_string_gc_headroom() != 0) {
         fprintf(stderr, "QuickJS native-string GC headroom failed\n");

@@ -155,6 +155,11 @@ ppsspp_bundle=
 ppsspp_bundle_source=
 is_darwin=0
 [ "$(uname -s)" = Darwin ] && is_darwin=1
+# PPSSPP's OpenGL backend no longer initializes on current macOS; the EBOOT
+# then never starts and the run looks like a hang. Nothing measured here
+# depends on the host renderer.
+graphics_backend="0 (OPENGL)"
+[ "$is_darwin" -eq 0 ] || graphics_backend="3 (VULKAN)"
 if [ "$is_darwin" -eq 1 ] && [ "${PPSSPP_LAUNCHSERVICES:-1}" = 0 ]; then
     printf '%s\n' \
         "Direct PPSSPP launch is unsafe on macOS." \
@@ -241,6 +246,16 @@ stop_emulator() {
             # parent; this run's unique --log path is the ownership token.
             ppsspp_pids=$(pgrep -f -- "--log=$emulator_log" 2>/dev/null || true)
             [ -n "$ppsspp_pids" ] && kill $ppsspp_pids 2>/dev/null || true
+            # An emulator sitting in its "graphics backend failed" dialog
+            # ignores SIGTERM, and the wait below would then never return.
+            grace=0
+            while [ "$grace" -lt 5 ] \
+                && pgrep -f -- "--log=$emulator_log" >/dev/null 2>&1; do
+                sleep 1
+                grace=$((grace + 1))
+            done
+            ppsspp_pids=$(pgrep -f -- "--log=$emulator_log" 2>/dev/null || true)
+            [ -n "$ppsspp_pids" ] && kill -9 $ppsspp_pids 2>/dev/null || true
         else
             kill "$emulator_pid" 2>/dev/null || true
         fi
@@ -320,7 +335,7 @@ run_once() {
             "EnableWlan = True" \
             "InfrastructureAutoDNS = True" \
             "[Graphics]" \
-            "GraphicsBackend = 0 (OPENGL)" \
+            "GraphicsBackend = $graphics_backend" \
             "[SystemParam]" \
             "PSPModel = 1" \
             "PSPFirmwareVersion = 660"

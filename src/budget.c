@@ -1,5 +1,11 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
+#include "diagnostic_trace.h"
+#if defined(TILEFINCH_OWNER_CHECKS) && defined(__PSP__)
+#include <pspkernel.h>
+#include "tilefinch/psp_log.h"
+#include "psp_thread_contract.h"
+#endif
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -10,6 +16,80 @@
 
 #if defined(__PSP__)
 #include <pspkernel.h>
+#endif
+
+#if defined(TILEFINCH_OWNER_CHECKS)
+static atomic_ulong budget_owner_violation_count;
+static atomic_bool budget_owner_violation_nonfatal;
+
+/* Access check for the unlocked ledger. Binding is lazy so a Budget may be
+   initialized on one thread and handed, untouched, to the thread that will
+   own it. */
+#if defined(__PSP__)
+typedef int BudgetThreadIdentity;
+#define BUDGET_THREAD_SELF() sceKernelGetThreadId()
+#define BUDGET_THREAD_EQUAL(a, b) ((a) == (b))
+#else
+typedef pthread_t BudgetThreadIdentity;
+#define BUDGET_THREAD_SELF() pthread_self()
+#define BUDGET_THREAD_EQUAL(a, b) (pthread_equal((a), (b)) != 0)
+#endif
+
+static void budget_owner_check(Budget *budget, const char *operation,
+                               BudgetCategory category, size_t size)
+{
+    BudgetThreadIdentity self = BUDGET_THREAD_SELF();
+    if (!budget->owner_thread_bound) {
+        budget->owner_thread = self;
+        budget->owner_thread_bound = true;
+        return;
+    }
+    if (BUDGET_THREAD_EQUAL(budget->owner_thread, self)) return;
+    unsigned long ordinal = atomic_fetch_add(&budget_owner_violation_count, 1);
+    if (ordinal < 8u) {
+#if defined(__PSP__)
+        /* Into the validation log, not only PSPLink's stdout mirror, and
+           with the thread's name: that is what makes the count actionable. */
+        SceKernelThreadInfo info;
+        const char *name = psp_thread_snapshot(self, &info) >= 0
+            ? info.name : "?";
+        psp_log_printf(
+            "tilefinch-owner-check: Budget %p %s category=%s size=%zu from "
+            "thread %s (0x%08x), owner 0x%08x\n", (void *) budget, operation,
+            budget_category_name(category), size, name,
+            (unsigned) self, (unsigned) budget->owner_thread);
+#else
+        fprintf(stderr,
+                "tilefinch-owner-check: Budget %p %s category=%s size=%zu "
+                "from a thread that does not own it\n", (void *) budget,
+                operation, budget_category_name(category), size);
+#endif
+    }
+#if !defined(__PSP__)
+    if (!atomic_load(&budget_owner_violation_nonfatal)) abort();
+#endif
+}
+
+void budget_adopt_current_thread(Budget *budget)
+{
+    if (budget == NULL) return;
+    budget->owner_thread = BUDGET_THREAD_SELF();
+    budget->owner_thread_bound = true;
+}
+
+unsigned long budget_owner_violations(void)
+{
+    return atomic_load(&budget_owner_violation_count);
+}
+
+void budget_owner_checks_set_fatal(bool fatal)
+{
+    atomic_store(&budget_owner_violation_nonfatal, !fatal);
+}
+#define BUDGET_OWNER_CHECK(budget, operation, category, size) \
+    budget_owner_check((budget), (operation), (category), (size))
+#else
+#define BUDGET_OWNER_CHECK(budget, operation, category, size) ((void) 0)
 #endif
 
 #define BUDGET_MAGIC UINT32_C(0x42554447)
@@ -220,6 +300,7 @@ void *budget_malloc_category(Budget *budget, BudgetCategory category,
     if (budget == NULL) {
         return NULL;
     }
+    BUDGET_OWNER_CHECK(budget, "allocation", category, size);
 
     if (size == 0) {
         size = 1;
@@ -269,6 +350,7 @@ void *budget_malloc_cacheline_category(Budget *budget,
                                        size_t size)
 {
     if (budget == NULL) return NULL;
+    BUDGET_OWNER_CHECK(budget, "cache-line allocation", category, size);
     if (size == 0) size = 1;
     if (budget_should_inject_failure(budget)) return NULL;
 
@@ -336,6 +418,7 @@ static void *budget_reserve_external(Budget *budget, BudgetCategory category,
 {
     if (budget == NULL || size == 0
         || size > SIZE_MAX - sizeof(AllocationHeader)) return NULL;
+    BUDGET_OWNER_CHECK(budget, "external reservation", category, size);
     if (budget_should_inject_failure(budget)) return NULL;
     size_t charge = sizeof(AllocationHeader) + size;
     if (charge > budget_remaining(budget)) {
@@ -431,6 +514,7 @@ void *budget_realloc_category(Budget *budget, BudgetCategory category,
         || header_is_cacheline(old_header)) {
         return NULL;
     }
+    BUDGET_OWNER_CHECK(budget, "reallocation", category, size);
     if (size == 0) {
         budget_free(budget, ptr);
         return NULL;
@@ -500,6 +584,8 @@ void budget_free(Budget *budget, void *ptr)
         || header->data.owner != budget) {
         return;
     }
+    BUDGET_OWNER_CHECK(budget, "free", header_category(header),
+                       header->data.size);
 
     size_t size = header->data.size;
     bool cacheline = header_is_cacheline(header);
@@ -1777,7 +1863,7 @@ static void bellard_pool_update_malloc_census(BudgetQuickJSPool *pool,
            as faithfully as ordinary allocations. */
         static int at_peak = -1;
         if (at_peak < 0) {
-            at_peak = getenv("TILEFINCH_DUMP_JS_POOL_AT_PEAK") != NULL;
+            at_peak = tilefinch_dump_js_pool_at_peak();
         }
         if (at_peak
             && pool->js_malloc_peak

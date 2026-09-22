@@ -162,6 +162,10 @@ typedef struct {
     struct FT_MemoryRec_ memory;
     FT_Library library;
     FT_Face face;
+    /* The size the face is currently set to, so a run of loads at one
+       pixel height (a chrome cache fill, a text run) pays FT_Set_Char_Size
+       once rather than per glyph. Zero until first set. */
+    int selected_pixel_height_fixed;
 } FreeTypeWebFace;
 
 static void *freetype_allocate(FT_Memory memory, long size)
@@ -589,8 +593,14 @@ static bool freetype_set_pixel_height_fixed(FreeTypeWebFace *state,
     if (state == NULL || state->face == NULL || pixel_height_fixed <= 0) {
         return false;
     }
-    return FT_Set_Char_Size(state->face, 0, (FT_F26Dot6) pixel_height_fixed,
-                            72, 72) == 0;
+    if (state->selected_pixel_height_fixed == pixel_height_fixed) return true;
+    if (FT_Set_Char_Size(state->face, 0, (FT_F26Dot6) pixel_height_fixed,
+                         72, 72) != 0) {
+        state->selected_pixel_height_fixed = 0;
+        return false;
+    }
+    state->selected_pixel_height_fixed = pixel_height_fixed;
+    return true;
 }
 
 static FT_Int32 freetype_outline_load_flags(void)

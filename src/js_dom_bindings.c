@@ -11,6 +11,7 @@
 #include "js_runtime_internal.h"
 
 #include "tilefinch/platform.h"
+#include "tilefinch_compiler.h"
 #include "tilefinch/media_discovery.h"
 
 #include <lexbor/dom/interfaces/element.h>
@@ -3712,55 +3713,6 @@ static bool property_equal(const char *first, size_t first_length,
     return true;
 }
 
-static bool sparse_scroll_property(const char *name, size_t length)
-{
-    static const char *const properties[] = {
-        "cursor",
-        "overscroll-behavior", "overscroll-behavior-x",
-        "overscroll-behavior-y", "overscroll-behavior-inline",
-        "overscroll-behavior-block",
-        "scroll-behavior",
-        "scroll-margin", "scroll-margin-top", "scroll-margin-right",
-        "scroll-margin-bottom", "scroll-margin-left",
-        "scroll-padding", "scroll-padding-top", "scroll-padding-right",
-        "scroll-padding-bottom", "scroll-padding-left",
-        "scroll-snap-align", "scroll-snap-stop", "scroll-snap-type",
-        "scrollbar-color", "scrollbar-width"
-    };
-    for (size_t i = 0; i < sizeof(properties) / sizeof(properties[0]); i++) {
-        if (property_equal(
-                name, length, properties[i], strlen(properties[i]))) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool sparse_modern_property(const char *name, size_t length)
-{
-    static const char *const properties[] = {
-        "user-select", "-webkit-user-select", "touch-action",
-        "text-size-adjust", "-webkit-text-size-adjust", "resize",
-        "text-wrap", "text-wrap-style", "translate", "rotate", "scale",
-        "isolation", "hyphens", "tab-size", "font-kerning",
-        "text-rendering", "mix-blend-mode", "backdrop-filter",
-        "-webkit-backdrop-filter", "backface-visibility",
-        "transform-style", "color-scheme", "border-image",
-        "border-image-source", "border-image-slice", "border-image-width",
-        "border-image-outset", "border-image-repeat",
-        "border-start-start-radius",
-        "border-start-end-radius", "border-end-start-radius",
-        "border-end-end-radius"
-    };
-    for (size_t i = 0; i < sizeof(properties) / sizeof(properties[0]); i++) {
-        if (property_equal(
-                name, length, properties[i], strlen(properties[i]))) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static uint32_t sparse_modern_property_mask(const char *name, size_t length)
 {
 #define MODERN_PROPERTY(wanted, bit) \
@@ -3905,8 +3857,27 @@ JSValue js_style_get(JSContext *context, JSValueConst this_value,
     return result;
 }
 
+/* Layout records the actual positioning ancestor, which can differ from the
+   DOM parent. Reuse its padding box without another cascade. */
+static int computed_style_positioning_width(
+    DomBridge *bridge, const lxb_dom_node_t *node,
+    const LayoutNodeBox *box, int flow_width)
+{
+    if (box == NULL || box->positioned_ancestor_distance == 0)
+        return flow_width;
+    if (box->positioned_ancestor_distance == UINT8_MAX)
+        return bridge->layout->width;
+    const lxb_dom_node_t *ancestor = node;
+    for (unsigned step = box->positioned_ancestor_distance;
+         step != 0 && ancestor != NULL; step--) ancestor = ancestor->parent;
+    const LayoutNodeBox *parent = ancestor == NULL ? NULL
+        : layout_box_for_node(bridge->layout, ancestor);
+    return parent == NULL ? 0 : parent->client_width;
+}
+
 static bool bridge_computed_style(DomBridge *bridge,
-                                  lxb_dom_node_t *node, ComputedStyle *result)
+                                  lxb_dom_node_t *node, ComputedStyle *result,
+                                  int *containing_width, int *content_width)
 {
     lxb_dom_node_t *ancestors[64];
     size_t count = 0;
@@ -3916,6 +3887,7 @@ static bool bridge_computed_style(DomBridge *bridge,
     }
     ComputedStyle computed = {0};
     bool have_parent = false;
+    int flow_width = bridge->layout == NULL ? 0 : bridge->layout->width;
     while (count != 0) {
         /* Each inherited style can run a substantial selector scan. Native
            calls do not hit VM opcode polls, so service the existing bounded
@@ -3923,9 +3895,36 @@ static bool bridge_computed_style(DomBridge *bridge,
            inside one uninterruptible getComputedStyle call. */
         if (bridge->host != NULL
             && !js_rt_runtime_native_checkpoint(bridge->host)) return false;
-        computed = style_for_node(bridge->stylesheet, ancestors[--count],
+        lxb_dom_node_t *at = ancestors[--count];
+        computed = style_for_node(bridge->stylesheet, at,
                                   have_parent ? &computed : NULL);
         have_parent = true;
+        /* Only geometry readers need this work. Resolve each ancestor's
+           padding while its cascade is already in hand; cancellation stays
+           on the single checked walk above. No scratch styles or second
+           selector pass are needed for nested percentage padding. */
+        if (containing_width != NULL && bridge->layout != NULL) {
+            const LayoutNodeBox *box = layout_box_for_node(bridge->layout, at);
+            /* An inline box or a display: contents element is not a
+               containing block: percentages inside it refer to the nearest
+               block container, so it passes the width through unchanged. */
+            bool container = computed.display != DISPLAY_INLINE
+                && computed.display != DISPLAY_CONTENTS;
+            int basis = computed_style_positioning_width(
+                bridge, at, box, flow_width);
+            *containing_width = basis;
+            if (box != NULL && (container || at == node)) {
+                int left = 0, right = 0;
+                (void) style_length_resolve(bridge->stylesheet,
+                    computed.padding.left, basis, &left);
+                (void) style_length_resolve(bridge->stylesheet,
+                    computed.padding.right, basis, &right);
+                int64_t width = (int64_t) box->client_width
+                    - (left > 0 ? left : 0) - (right > 0 ? right : 0);
+                flow_width = width > 0 ? (int) width : 0;
+            }
+            *content_width = flow_width;
+        }
     }
     *result = computed;
     return true;
@@ -4136,6 +4135,553 @@ static bool svg_presentation_attribute_relevant(
 #undef SVG_TAG
 }
 
+/* Write a scaled integer as the shortest decimal with at most three
+   fractional digits: 2000/1000 -> "2", 1536/512 -> "3", 171/512 -> "0.334". */
+static void computed_style_format_scaled(char *output, size_t output_size,
+                                         unsigned long value,
+                                         unsigned long scale)
+{
+    unsigned long whole = value / scale;
+    unsigned long thousandths =
+        ((value % scale) * 1000ul + scale / 2ul) / scale;
+    if (thousandths >= 1000ul) {
+        whole++;
+        thousandths = 0;
+    }
+    if (thousandths == 0) {
+        snprintf(output, output_size, "%lu", whole);
+        return;
+    }
+    char digits[4];
+    snprintf(digits, sizeof(digits), "%03lu", thousandths);
+    size_t length = 3;
+    while (length > 0 && digits[length - 1] == '0') digits[--length] = '\0';
+    snprintf(output, output_size, "%lu.%s", whole, digits);
+}
+
+/* The properties js_computed_style_get() resolves for an ordinary rendered
+   element, in strcmp order. This one table answers every CSSOM question about
+   the *set* of supported properties -- `name in style`, `length`, `item()`,
+   iteration -- so membership can never drift from a second list kept in
+   script. `longhand` is false for shorthands and legacy aliases, which are
+   attributes of the declaration but are not enumerated.
+
+   It lives in read-only data rather than the realm heap: script asks for the
+   enumeration only when a page actually enumerates a computed style, which is
+   rare, and asks membership questions without materializing anything.
+
+   tests/suites/foundation_document.inc requires every entry to resolve to a
+   non-empty value; add a name here only together with its serializer. */
+enum {
+    /* Resolved from retained authored text or a shared initial value rather
+       than a ComputedStyle field. */
+    CSP_SPARSE_SCROLL = 1u << 0,
+    CSP_SPARSE_MODERN = 1u << 1,
+    /* A used value: needs a layout even when none has been built yet. */
+    CSP_USED_GEOMETRY = 1u << 2,
+    /* Resolves from the current DOM and cascade alone, so a pending DOM
+       mutation does not have to be laid out first. Never a property whose
+       value is a used size or depends on a box. */
+    CSP_STYLE_ONLY    = 1u << 3
+};
+
+/* One row per property: identifier, name, longhand, flags. Rows are in strcmp
+   order of the name, because lookup is a binary search. The enumeration, the
+   table and the identifiers the getter dispatches on are all generated from
+   this list, so a serializer can only be written for a registered property. */
+#define COMPUTED_STYLE_PROPERTIES(X) \
+    X(WEBKIT_APPEARANCE, "-webkit-appearance", false, 0) \
+    X(WEBKIT_BACKDROP_FILTER, "-webkit-backdrop-filter", false, CSP_SPARSE_MODERN) \
+    X(WEBKIT_LINE_CLAMP, "-webkit-line-clamp", true, 0) \
+    X(WEBKIT_TEXT_SIZE_ADJUST, "-webkit-text-size-adjust", false, CSP_SPARSE_MODERN) \
+    X(WEBKIT_USER_SELECT, "-webkit-user-select", false, CSP_SPARSE_MODERN) \
+    X(ALIGN_CONTENT, "align-content", true, 0) \
+    X(ALIGN_ITEMS, "align-items", true, 0) \
+    X(ALIGN_SELF, "align-self", true, 0) \
+    X(APPEARANCE, "appearance", true, 0) \
+    X(ASPECT_RATIO, "aspect-ratio", true, 0) \
+    X(BACKDROP_FILTER, "backdrop-filter", true, CSP_SPARSE_MODERN) \
+    X(BACKFACE_VISIBILITY, "backface-visibility", true, CSP_SPARSE_MODERN) \
+    X(BACKGROUND_CLIP, "background-clip", true, 0) \
+    X(BACKGROUND_COLOR, "background-color", true, CSP_STYLE_ONLY) \
+    X(BACKGROUND_IMAGE, "background-image", true, 0) \
+    X(BACKGROUND_ORIGIN, "background-origin", true, 0) \
+    X(BACKGROUND_POSITION, "background-position", true, 0) \
+    X(BACKGROUND_SIZE, "background-size", true, 0) \
+    X(BORDER_BOTTOM_COLOR, "border-bottom-color", true, 0) \
+    X(BORDER_BOTTOM_LEFT_RADIUS, "border-bottom-left-radius", true, 0) \
+    X(BORDER_BOTTOM_RIGHT_RADIUS, "border-bottom-right-radius", true, 0) \
+    X(BORDER_BOTTOM_STYLE, "border-bottom-style", true, 0) \
+    X(BORDER_BOTTOM_WIDTH, "border-bottom-width", true, 0) \
+    X(BORDER_COLLAPSE, "border-collapse", true, 0) \
+    X(BORDER_END_END_RADIUS, "border-end-end-radius", true, CSP_SPARSE_MODERN) \
+    X(BORDER_END_START_RADIUS, "border-end-start-radius", true, CSP_SPARSE_MODERN) \
+    X(BORDER_IMAGE, "border-image", false, CSP_SPARSE_MODERN) \
+    X(BORDER_IMAGE_OUTSET, "border-image-outset", true, CSP_SPARSE_MODERN) \
+    X(BORDER_IMAGE_REPEAT, "border-image-repeat", true, CSP_SPARSE_MODERN) \
+    X(BORDER_IMAGE_SLICE, "border-image-slice", true, CSP_SPARSE_MODERN) \
+    X(BORDER_IMAGE_SOURCE, "border-image-source", true, CSP_SPARSE_MODERN) \
+    X(BORDER_IMAGE_WIDTH, "border-image-width", true, CSP_SPARSE_MODERN) \
+    X(BORDER_LEFT_COLOR, "border-left-color", true, 0) \
+    X(BORDER_LEFT_STYLE, "border-left-style", true, 0) \
+    X(BORDER_LEFT_WIDTH, "border-left-width", true, 0) \
+    X(BORDER_RADIUS, "border-radius", false, 0) \
+    X(BORDER_RIGHT_COLOR, "border-right-color", true, 0) \
+    X(BORDER_RIGHT_STYLE, "border-right-style", true, 0) \
+    X(BORDER_RIGHT_WIDTH, "border-right-width", true, 0) \
+    X(BORDER_SPACING, "border-spacing", true, 0) \
+    X(BORDER_START_END_RADIUS, "border-start-end-radius", true, CSP_SPARSE_MODERN) \
+    X(BORDER_START_START_RADIUS, "border-start-start-radius", true, CSP_SPARSE_MODERN) \
+    X(BORDER_TOP_COLOR, "border-top-color", true, 0) \
+    X(BORDER_TOP_LEFT_RADIUS, "border-top-left-radius", true, 0) \
+    X(BORDER_TOP_RIGHT_RADIUS, "border-top-right-radius", true, 0) \
+    X(BORDER_TOP_STYLE, "border-top-style", true, 0) \
+    X(BORDER_TOP_WIDTH, "border-top-width", true, 0) \
+    X(BORDER_WIDTH, "border-width", false, 0) \
+    X(BOTTOM, "bottom", true, 0) \
+    X(BOX_SHADOW, "box-shadow", true, 0) \
+    X(BOX_SIZING, "box-sizing", true, 0) \
+    X(CAPTION_SIDE, "caption-side", true, 0) \
+    X(CLIP_PATH, "clip-path", true, 0) \
+    X(COLOR, "color", true, CSP_STYLE_ONLY) \
+    X(COLOR_SCHEME, "color-scheme", true, CSP_SPARSE_MODERN) \
+    X(COLUMN_GAP, "column-gap", true, 0) \
+    X(CONTAIN, "contain", true, 0) \
+    X(CONTENT, "content", true, 0) \
+    X(CONTENT_VISIBILITY, "content-visibility", true, 0) \
+    X(CURSOR, "cursor", true, CSP_SPARSE_SCROLL) \
+    X(DIRECTION, "direction", true, CSP_STYLE_ONLY) \
+    X(DISPLAY, "display", true, CSP_STYLE_ONLY) \
+    X(FILTER, "filter", true, 0) \
+    X(FLEX, "flex", false, 0) \
+    X(FLEX_BASIS, "flex-basis", true, 0) \
+    X(FLEX_DIRECTION, "flex-direction", true, 0) \
+    X(FLEX_GROW, "flex-grow", true, 0) \
+    X(FLEX_SHRINK, "flex-shrink", true, 0) \
+    X(FLEX_WRAP, "flex-wrap", true, 0) \
+    X(FLOAT, "float", true, 0) \
+    X(FONT_FAMILY, "font-family", true, 0) \
+    X(FONT_KERNING, "font-kerning", true, CSP_SPARSE_MODERN) \
+    X(FONT_SIZE, "font-size", true, CSP_STYLE_ONLY) \
+    X(FONT_STYLE, "font-style", true, CSP_STYLE_ONLY) \
+    X(FONT_WEIGHT, "font-weight", true, CSP_STYLE_ONLY) \
+    X(GAP, "gap", false, 0) \
+    X(GRID_TEMPLATE_AREAS, "grid-template-areas", true, 0) \
+    X(GRID_TEMPLATE_COLUMNS, "grid-template-columns", true, 0) \
+    X(GRID_TEMPLATE_ROWS, "grid-template-rows", true, 0) \
+    X(HEIGHT, "height", true, CSP_USED_GEOMETRY) \
+    X(HYPHENS, "hyphens", true, CSP_SPARSE_MODERN) \
+    X(ISOLATION, "isolation", true, CSP_SPARSE_MODERN) \
+    X(JUSTIFY_CONTENT, "justify-content", true, 0) \
+    X(JUSTIFY_ITEMS, "justify-items", true, 0) \
+    X(JUSTIFY_SELF, "justify-self", true, 0) \
+    X(LEFT, "left", true, 0) \
+    X(LETTER_SPACING, "letter-spacing", true, CSP_STYLE_ONLY) \
+    X(LINE_HEIGHT, "line-height", true, CSP_STYLE_ONLY) \
+    X(LIST_STYLE_POSITION, "list-style-position", true, 0) \
+    X(LIST_STYLE_TYPE, "list-style-type", true, 0) \
+    X(MARGIN, "margin", false, 0) \
+    X(MARGIN_BOTTOM, "margin-bottom", true, 0) \
+    X(MARGIN_LEFT, "margin-left", true, 0) \
+    X(MARGIN_RIGHT, "margin-right", true, 0) \
+    X(MARGIN_TOP, "margin-top", true, 0) \
+    X(MAX_HEIGHT, "max-height", true, 0) \
+    X(MAX_WIDTH, "max-width", true, 0) \
+    X(MIN_HEIGHT, "min-height", true, 0) \
+    X(MIN_WIDTH, "min-width", true, 0) \
+    X(MIX_BLEND_MODE, "mix-blend-mode", true, CSP_SPARSE_MODERN) \
+    X(OBJECT_FIT, "object-fit", true, 0) \
+    X(OBJECT_POSITION, "object-position", true, 0) \
+    X(OPACITY, "opacity", true, CSP_STYLE_ONLY) \
+    X(ORDER, "order", true, 0) \
+    X(OUTLINE_COLOR, "outline-color", true, 0) \
+    X(OUTLINE_OFFSET, "outline-offset", true, 0) \
+    X(OUTLINE_STYLE, "outline-style", true, 0) \
+    X(OUTLINE_WIDTH, "outline-width", true, 0) \
+    X(OVERFLOW, "overflow", false, 0) \
+    X(OVERFLOW_X, "overflow-x", true, 0) \
+    X(OVERFLOW_Y, "overflow-y", true, 0) \
+    X(OVERSCROLL_BEHAVIOR, "overscroll-behavior", false, CSP_SPARSE_SCROLL) \
+    X(OVERSCROLL_BEHAVIOR_BLOCK, "overscroll-behavior-block", true, CSP_SPARSE_SCROLL) \
+    X(OVERSCROLL_BEHAVIOR_INLINE, "overscroll-behavior-inline", true, CSP_SPARSE_SCROLL) \
+    X(OVERSCROLL_BEHAVIOR_X, "overscroll-behavior-x", true, CSP_SPARSE_SCROLL) \
+    X(OVERSCROLL_BEHAVIOR_Y, "overscroll-behavior-y", true, CSP_SPARSE_SCROLL) \
+    X(PADDING, "padding", false, 0) \
+    X(PADDING_BOTTOM, "padding-bottom", true, 0) \
+    X(PADDING_LEFT, "padding-left", true, 0) \
+    X(PADDING_RIGHT, "padding-right", true, 0) \
+    X(PADDING_TOP, "padding-top", true, 0) \
+    X(PERSPECTIVE, "perspective", true, 0) \
+    X(PLACE_CONTENT, "place-content", false, 0) \
+    X(PLACE_ITEMS, "place-items", false, 0) \
+    X(PLACE_SELF, "place-self", false, 0) \
+    X(POINTER_EVENTS, "pointer-events", true, CSP_STYLE_ONLY) \
+    X(POSITION, "position", true, 0) \
+    X(RESIZE, "resize", true, CSP_SPARSE_MODERN) \
+    X(RIGHT, "right", true, 0) \
+    X(ROTATE, "rotate", true, CSP_SPARSE_MODERN) \
+    X(ROW_GAP, "row-gap", true, 0) \
+    X(SCALE, "scale", true, CSP_SPARSE_MODERN) \
+    X(SCROLL_BEHAVIOR, "scroll-behavior", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN, "scroll-margin", false, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_BOTTOM, "scroll-margin-bottom", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_LEFT, "scroll-margin-left", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_RIGHT, "scroll-margin-right", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_TOP, "scroll-margin-top", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING, "scroll-padding", false, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_BOTTOM, "scroll-padding-bottom", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_LEFT, "scroll-padding-left", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_RIGHT, "scroll-padding-right", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_TOP, "scroll-padding-top", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_SNAP_ALIGN, "scroll-snap-align", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_SNAP_STOP, "scroll-snap-stop", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_SNAP_TYPE, "scroll-snap-type", true, CSP_SPARSE_SCROLL) \
+    X(SCROLLBAR_COLOR, "scrollbar-color", true, CSP_SPARSE_SCROLL) \
+    X(SCROLLBAR_GUTTER, "scrollbar-gutter", true, 0) \
+    X(SCROLLBAR_WIDTH, "scrollbar-width", true, CSP_SPARSE_SCROLL) \
+    X(TAB_SIZE, "tab-size", true, CSP_SPARSE_MODERN) \
+    X(TABLE_LAYOUT, "table-layout", true, 0) \
+    X(TEXT_ALIGN, "text-align", true, CSP_STYLE_ONLY) \
+    X(TEXT_DECORATION_LINE, "text-decoration-line", true, CSP_STYLE_ONLY) \
+    X(TEXT_INDENT, "text-indent", true, CSP_USED_GEOMETRY) \
+    X(TEXT_OVERFLOW, "text-overflow", true, 0) \
+    X(TEXT_RENDERING, "text-rendering", true, CSP_SPARSE_MODERN) \
+    X(TEXT_SHADOW, "text-shadow", true, 0) \
+    X(TEXT_SIZE_ADJUST, "text-size-adjust", true, CSP_SPARSE_MODERN) \
+    X(TEXT_TRANSFORM, "text-transform", true, CSP_STYLE_ONLY) \
+    X(TEXT_WRAP, "text-wrap", false, CSP_SPARSE_MODERN) \
+    X(TEXT_WRAP_STYLE, "text-wrap-style", true, CSP_SPARSE_MODERN) \
+    X(TOP, "top", true, 0) \
+    X(TOUCH_ACTION, "touch-action", true, CSP_SPARSE_MODERN) \
+    X(TRANSFORM, "transform", true, 0) \
+    X(TRANSFORM_ORIGIN, "transform-origin", true, CSP_USED_GEOMETRY) \
+    X(TRANSFORM_STYLE, "transform-style", true, CSP_SPARSE_MODERN) \
+    X(TRANSITION_DURATION, "transition-duration", true, 0) \
+    X(TRANSLATE, "translate", true, CSP_SPARSE_MODERN) \
+    X(UNICODE_BIDI, "unicode-bidi", true, 0) \
+    X(USER_SELECT, "user-select", true, CSP_SPARSE_MODERN) \
+    X(VERTICAL_ALIGN, "vertical-align", true, CSP_STYLE_ONLY) \
+    X(VISIBILITY, "visibility", true, CSP_STYLE_ONLY) \
+    X(WHITE_SPACE, "white-space", true, CSP_STYLE_ONLY) \
+    X(WIDTH, "width", true, CSP_USED_GEOMETRY) \
+    X(WILL_CHANGE, "will-change", true, 0) \
+    X(WORD_SPACING, "word-spacing", true, CSP_STYLE_ONLY) \
+    X(WRITING_MODE, "writing-mode", true, 0) \
+    X(Z_INDEX, "z-index", true, 0)
+
+typedef enum {
+#define X(id, name, longhand, flags) CSP_##id,
+    COMPUTED_STYLE_PROPERTIES(X)
+#undef X
+    CSP_COUNT,
+    /* Not a registered property: a custom property, an SVG presentation
+       attribute, or a name nothing supports. */
+    CSP_NONE = CSP_COUNT
+} ComputedStylePropertyId;
+
+typedef struct {
+    const char *name;
+    bool longhand;
+    uint8_t flags;
+} ComputedStyleProperty;
+
+static const ComputedStyleProperty computed_style_properties[] = {
+#define X(id, name, longhand, flags) { name, longhand, flags },
+    COMPUTED_STYLE_PROPERTIES(X)
+#undef X
+};
+
+#define COMPUTED_STYLE_PROPERTY_COUNT \
+    (sizeof(computed_style_properties) / sizeof(computed_style_properties[0]))
+
+static ComputedStylePropertyId computed_style_property_find(
+    const char *name)
+{
+    size_t low = 0, high = COMPUTED_STYLE_PROPERTY_COUNT;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2u;
+        int order = strcmp(name, computed_style_properties[middle].name);
+        if (order == 0) return (ComputedStylePropertyId) middle;
+        if (order < 0) high = middle;
+        else low = middle + 1u;
+    }
+    return CSP_NONE;
+}
+
+/* __tilefinchComputedStyleSupport(name) -> whether the declaration has that
+   property (a dashed, lower-case name; custom properties always qualify).
+   __tilefinchComputedStyleSupport()     -> a fresh array of the enumerable
+   longhands, in order. */
+JSValue js_computed_style_support(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc > 0 && !JS_IsUndefined(argv[0])) {
+        const char *name = JS_ToCString(context, argv[0]);
+        if (name == NULL) return JS_EXCEPTION;
+        bool supported = (name[0] == '-' && name[1] == '-')
+            || computed_style_property_find(name) != CSP_NONE;
+        JS_FreeCString(context, name);
+        return JS_NewBool(context, supported);
+    }
+    JSValue names = JS_NewArray(context);
+    if (JS_IsException(names)) return names;
+    uint32_t at = 0;
+    for (size_t i = 0; i < COMPUTED_STYLE_PROPERTY_COUNT; i++) {
+        if (!computed_style_properties[i].longhand) continue;
+        if (JS_SetPropertyUint32(
+                context, names, at++,
+                JS_NewString(context, computed_style_properties[i].name))
+            < 0) {
+            JS_FreeValue(context, names);
+            return JS_EXCEPTION;
+        }
+    }
+    return names;
+}
+
+/* A padding edge is a packed StyleLength: a plain pixel count, or a tagged
+   percentage/math value that means nothing until it is resolved. */
+static bool computed_style_edge_is_fixed(StyleLength edge)
+{
+    return edge >= -STYLE_LENGTH_DIRECT_LIMIT
+        && edge <= STYLE_LENGTH_DIRECT_LIMIT;
+}
+
+/* Used pixels of one edge, sharing the width resolved by the cascade walk. */
+static int computed_style_used_padding(
+    DomBridge *bridge, int containing_width,
+    StyleLength edge)
+{
+    if (computed_style_edge_is_fixed(edge)) return edge < 0 ? 0 : edge;
+    int used = 0;
+    if (!style_length_resolve(
+            bridge->stylesheet, edge,
+            containing_width, &used)
+        || used < 0) used = 0;
+    return used;
+}
+
+static bool computed_style_replaced_inline(const lxb_dom_node_t *node)
+{
+    return node->local_name == LXB_TAG_IMG
+        || node->local_name == LXB_TAG_CANVAS
+        || node->local_name == LXB_TAG_VIDEO
+        || node->local_name == LXB_TAG_SVG;
+}
+
+/* The resolved value of width or height is the used value, in pixels, only
+   for an element that generates a box the property applies to. False means
+   the caller reports the computed value instead: a pseudo-element (its host's
+   box is not its box), `display: none` or `contents`, a non-replaced inline
+   (width and height do not apply to it, whatever was authored), or an element
+   with no layout box yet. */
+static TILEFINCH_OUT_OF_LINE bool computed_style_used_box_size(
+    DomBridge *bridge, const lxb_dom_node_t *node,
+    const ComputedStyle *style, int containing_width,
+    PseudoElement pseudo, bool vertical, char *value, size_t value_size)
+{
+    if (pseudo != PSEUDO_NONE
+        || style->display == DISPLAY_NONE
+        || style->display == DISPLAY_CONTENTS
+        || (style->display == DISPLAY_INLINE
+            && !computed_style_replaced_inline(node))) return false;
+    const LayoutNodeBox *box = bridge->layout == NULL ? NULL
+        : layout_box_for_node(bridge->layout, node);
+    if (box == NULL) return false;
+    int used = vertical ? box->height : box->width;
+    if (!style->box_sizing_border_box) {
+        used -= vertical
+            ? style->border.top + style->border.bottom
+              + computed_style_used_padding(
+                    bridge, containing_width, style->padding.top)
+              + computed_style_used_padding(
+                    bridge, containing_width, style->padding.bottom)
+            : style->border.left + style->border.right
+              + computed_style_used_padding(
+                    bridge, containing_width, style->padding.left)
+              + computed_style_used_padding(
+                    bridge, containing_width, style->padding.right);
+    }
+    if (used < 0) used = 0;
+    snprintf(value, value_size, "%dpx", used);
+    return true;
+}
+
+/* The value of a sparse modern property with no authored declaration on the
+   element. Inherited typography state is retained in the style; everything
+   else reports its initial keyword. */
+static TILEFINCH_OUT_OF_LINE const char *computed_style_sparse_modern_initial(
+    const ComputedStyle *style, ComputedStylePropertyId id)
+{
+    static char tab_size[8];
+    if (id == CSP_TAB_SIZE) {
+        snprintf(tab_size, sizeof(tab_size), "%u",
+                 computed_style_tab_size(style));
+        return tab_size;
+    }
+    if (id == CSP_HYPHENS)
+        return computed_style_hyphens_none(style) ? "none" : "manual";
+    if (id == CSP_FONT_KERNING)
+        return computed_style_kerning_none(style) ? "none" : "auto";
+    if (id == CSP_TEXT_RENDERING)
+        return "auto";
+    if (id == CSP_MIX_BLEND_MODE
+        || id == CSP_COLOR_SCHEME)
+        return "normal";
+    if (id == CSP_BACKFACE_VISIBILITY)
+        return "visible";
+    if (id == CSP_TRANSFORM_STYLE)
+        return "flat";
+    if (id == CSP_BORDER_IMAGE_SLICE)
+        return "100%";
+    if (id == CSP_BORDER_IMAGE_WIDTH)
+        return "1";
+    if (id == CSP_BORDER_IMAGE_OUTSET)
+        return "0";
+    if (id == CSP_BORDER_IMAGE_REPEAT)
+        return "stretch";
+    if (id == CSP_BORDER_IMAGE)
+        return "none 100% / 1 / 0 stretch";
+    /* translate, rotate, scale, backdrop-filter, border-image-source. */
+    return "none";
+}
+
+/* Resolved values for fields the cascade already retains but CSSOM never
+   serialized. Each case decodes the field's stored representation; none of
+   them reads authored text, so `inherit`, `var()`, relative units and
+   !important are already settled by the time a value gets here. Returns
+   false for a property this function does not own. */
+static TILEFINCH_OUT_OF_LINE bool computed_style_serialize_retained(
+    const lxb_dom_node_t *node, const ComputedStyle *style,
+    ComputedStylePropertyId id, char *value, size_t value_size)
+{
+    if (id == CSP_LINE_HEIGHT) {
+        /* `normal` stays a keyword even though layout later picks a number
+           from the face; a length, percentage or multiplier has already been
+           resolved against the element's own font size, in device pixels. */
+        if (style->line_height == STYLE_LINE_HEIGHT_ZERO) {
+            snprintf(value, value_size, "0px");
+        } else if (style->line_height <= 0) {
+            snprintf(value, value_size, "normal");
+        } else {
+            snprintf(value, value_size, "%dpx", style->line_height);
+        }
+    } else if (id == CSP_TEXT_ALIGN) {
+        static const char *const names[] = {
+            "start", "center", "end", "left", "right"
+        };
+        size_t at = style->text_align;
+        snprintf(value, value_size, "%s",
+                 at < sizeof(names) / sizeof(names[0]) ? names[at] : "start");
+    } else if (id == CSP_VERTICAL_ALIGN) {
+        static const char *const names[] = {
+            "baseline", "super", "sub", "middle", "top", "bottom",
+            "text-top", "text-bottom"
+        };
+        size_t at = style->vertical_align;
+        snprintf(value, value_size, "%s",
+                 at < sizeof(names) / sizeof(names[0])
+                     ? names[at] : "baseline");
+    } else if (id == CSP_DIRECTION) {
+        snprintf(value, value_size, "%s",
+                 computed_style_direction_rtl(style) ? "rtl" : "ltr");
+    } else if (id == CSP_WRITING_MODE) {
+        static const char *const names[] = {
+            "horizontal-tb", "vertical-rl", "vertical-lr"
+        };
+        unsigned at = computed_style_writing_mode(style);
+        snprintf(value, value_size, "%s",
+                 at < sizeof(names) / sizeof(names[0])
+                     ? names[at] : "horizontal-tb");
+    } else if (id == CSP_UNICODE_BIDI) {
+        static const char *const names[] = {
+            "normal", "embed", "isolate", "bidi-override",
+            "isolate-override", "plaintext"
+        };
+        size_t at = style->unicode_bidi;
+        snprintf(value, value_size, "%s",
+                 at < sizeof(names) / sizeof(names[0]) ? names[at] : "normal");
+    } else if (id == CSP_LETTER_SPACING) {
+        /* Retained as whole pixels; zero is the `normal` keyword. */
+        if (style->letter_spacing == 0) snprintf(value, value_size, "normal");
+        else snprintf(value, value_size, "%dpx", (int) style->letter_spacing);
+    } else if (id == CSP_WORD_SPACING) {
+        snprintf(value, value_size, "%dpx", style->word_spacing);
+    } else if (id == CSP_TEXT_DECORATION_LINE) {
+        /* Not inherited: only a line this element itself declares. The
+           engine paints underlines alone, so that is the only line kept. */
+        snprintf(value, value_size, "%s",
+                 computed_style_has_text_underline(style)
+                     ? "underline" : "none");
+    } else if (id == CSP_FLEX_GROW) {
+        computed_style_format_scaled(
+            value, value_size,
+            style->flex_grow > 0 ? (unsigned long) style->flex_grow : 0ul,
+            1000ul);
+    } else if (id == CSP_FLEX_SHRINK) {
+        computed_style_format_scaled(
+            value, value_size, (unsigned long) style->flex_shrink, 512ul);
+    } else if (id == CSP_FLEX_BASIS) {
+        if (!style->has_flex_basis) {
+            snprintf(value, value_size, "auto");
+        } else if (style->flex_basis == STYLE_LENGTH_MIN_CONTENT) {
+            snprintf(value, value_size, "min-content");
+        } else if (style->flex_basis == STYLE_LENGTH_MAX_CONTENT) {
+            snprintf(value, value_size, "max-content");
+        } else if (style->flex_basis == STYLE_LENGTH_FIT_CONTENT) {
+            snprintf(value, value_size, "fit-content");
+        } else if (style->flex_basis_percent
+                   && style->flex_basis_offset != 0) {
+            snprintf(value, value_size, "calc(%d%% %c %dpx)",
+                     style->flex_basis,
+                     style->flex_basis_offset < 0 ? '-' : '+',
+                     style->flex_basis_offset < 0
+                         ? -style->flex_basis_offset
+                         : style->flex_basis_offset);
+        } else {
+            snprintf(value, value_size, "%d%s", style->flex_basis,
+                     style->flex_basis_percent ? "%" : "px");
+        }
+    } else if (id == CSP_LIST_STYLE_TYPE) {
+        static const char *const names[] = {
+            NULL, "none", "disc", "circle", "square", "decimal",
+            "decimal-leading-zero", "lower-alpha", "upper-alpha",
+            "lower-roman", "upper-roman"
+        };
+        size_t at = style->list_style_none ? 1u : style->list_style_type;
+        const char *keyword =
+            at < sizeof(names) / sizeof(names[0]) ? names[at] : NULL;
+        if (keyword == NULL) {
+            /* Nothing authored: the user-agent default follows the nearest
+               list container, exactly as marker generation decides it. */
+            keyword = "disc";
+            for (const lxb_dom_node_t *at_node = node; at_node != NULL;
+                 at_node = at_node->parent) {
+                if (at_node->type != LXB_DOM_NODE_TYPE_ELEMENT
+                    || at_node->ns != LXB_NS_HTML) continue;
+                if (at_node->local_name == LXB_TAG_OL) keyword = "decimal";
+                if (at_node->local_name == LXB_TAG_OL
+                    || at_node->local_name == LXB_TAG_UL) break;
+            }
+        }
+        snprintf(value, value_size, "%s", keyword);
+    } else if (id == CSP_LIST_STYLE_POSITION) {
+        snprintf(value, value_size, "%s",
+                 style->list_style_inside ? "inside" : "outside");
+    } else if (id == CSP_TABLE_LAYOUT) {
+        snprintf(value, value_size, "%s",
+                 style->table_layout_fixed ? "fixed" : "auto");
+    } else if (id == CSP_ASPECT_RATIO) {
+        /* The older case owns an authored ratio; this is the initial value. */
+        snprintf(value, value_size, "auto");
+    } else {
+        return false;
+    }
+    return true;
+}
+
 JSValue js_computed_style_get(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv)
@@ -4151,21 +4697,17 @@ JSValue js_computed_style_get(JSContext *context,
     size_t name_length = 0;
     const char *name = JS_ToCStringLen(context, &name_length, argv[1]);
     if (name == NULL) return JS_EXCEPTION;
-    bool used_geometry_property =
-        property_equal(name, name_length, "width", 5)
-        || property_equal(name, name_length, "height", 6)
-        || property_equal(name, name_length, "text-indent", 11)
-        || property_equal(name, name_length, "transform-origin", 16);
+    /* The single lookup every later decision dispatches on. Names arrive
+       dashed and lower-case (__tilefinchCssName). */
+    const ComputedStylePropertyId id = computed_style_property_find(name);
+    const unsigned property_flags =
+        id == CSP_NONE ? 0u : computed_style_properties[id].flags;
+    bool used_geometry_property = (property_flags & CSP_USED_GEOMETRY) != 0;
     /* Hydration often toggles a class and immediately asks whether a node
        is visible. These values resolve from the current DOM/cascade without
        rebuilding geometry. Keep the conservative path for stylesheet changes
        and container-dependent rules, whose cascade needs fresh layout. */
-    bool independent_style_property =
-        property_equal(name, name_length, "display", 7)
-        || property_equal(name, name_length, "visibility", 10)
-        || property_equal(name, name_length, "opacity", 7)
-        || property_equal(name, name_length, "color", 5)
-        || property_equal(name, name_length, "background-color", 16);
+    bool independent_style_property = (property_flags & CSP_STYLE_ONLY) != 0;
     bool style_only = independent_style_property
         && bridge->mutations.count != 0
         && !bridge->mutations.overflowed
@@ -4178,7 +4720,14 @@ JSValue js_computed_style_get(JSContext *context,
         (void) js_rt_bridge_flush_synchronous_layout(bridge);
     }
     ComputedStyle style;
-    if (!bridge_computed_style(bridge, node, &style)) {
+    bool padding_geometry = id == CSP_WIDTH || id == CSP_HEIGHT
+        || id == CSP_PADDING || id == CSP_PADDING_TOP
+        || id == CSP_PADDING_RIGHT || id == CSP_PADDING_BOTTOM
+        || id == CSP_PADDING_LEFT;
+    int containing_width = 0, content_width = 0;
+    if (!bridge_computed_style(bridge, node, &style,
+                               padding_geometry ? &containing_width : NULL,
+                               &content_width)) {
         JS_FreeCString(context, name);
         return js_rt_throw_task_interruption(context, "computed style interrupted");
     }
@@ -4202,12 +4751,15 @@ JSValue js_computed_style_get(JSContext *context,
             pseudo = PSEUDO_AFTER;
         }
         if (pseudo != PSEUDO_NONE) {
-            ComputedStyle parent = style;
+            /* A pseudo-element's containing block is its originating
+               element, whose style this is. */
+            ComputedStyle parent_style = style;
             style = style_for_pseudo(bridge->stylesheet, node, pseudo,
-                                     &parent);
+                                     &parent_style);
         }
         JS_FreeCString(context, pseudo_name);
     }
+    if (pseudo != PSEUDO_NONE) containing_width = content_width;
     /* The bounded grid-template-areas parser accepts up to 511 source
        bytes. Canonical row separators can add a few bytes, so retain enough
        local space to return the complete computed value rather than a
@@ -4228,11 +4780,11 @@ JSValue js_computed_style_get(JSContext *context,
     size_t presentation_length = 0;
     const char *presentation = !retained_presentation && svg_presentation
         ? document_attribute(node, name, &presentation_length) : NULL;
-    bool sparse_scroll = pseudo == PSEUDO_NONE
-        && sparse_scroll_property(name, name_length);
-    bool sparse_modern = pseudo == PSEUDO_NONE
-        && sparse_modern_property(name, name_length);
-    bool retained_scroll = sparse_scroll
+    /* Retained authored text belongs to the element. A pseudo-element still
+       has these properties; it reports their computed or initial value. */
+    bool sparse_scroll = (property_flags & CSP_SPARSE_SCROLL) != 0;
+    bool sparse_modern = (property_flags & CSP_SPARSE_MODERN) != 0;
+    bool retained_scroll = sparse_scroll && pseudo == PSEUDO_NONE
         && (retained_scroll_box_shorthand(
                 bridge->stylesheet, node, name, name_length,
                 value, sizeof(value))
@@ -4241,50 +4793,46 @@ JSValue js_computed_style_get(JSContext *context,
                 value, sizeof(value)));
     if (!retained_scroll
         && sparse_scroll
-        && property_equal(name, name_length, "cursor", 6)) {
-        for (lxb_dom_node_t *at = node->parent;
+        && id == CSP_CURSOR) {
+        /* Inherited: a pseudo-element's parent is its originating element. */
+        for (lxb_dom_node_t *at = pseudo != PSEUDO_NONE ? node : node->parent;
              at != NULL && !retained_scroll; at = at->parent) {
             retained_scroll = style_retained_property_value(
                 bridge->stylesheet, at, name, name_length,
                 value, sizeof(value));
         }
     }
-    bool retained_modern = sparse_modern
+    bool retained_modern = sparse_modern && pseudo == PSEUDO_NONE
         && style_retained_property_value(
             bridge->stylesheet, node,
-            property_equal(name, name_length, "-webkit-user-select", 19)
+            id == CSP_WEBKIT_USER_SELECT
                 ? "user-select"
-                : (property_equal(
-                       name, name_length, "-webkit-text-size-adjust", 24)
+                : (id == CSP_WEBKIT_TEXT_SIZE_ADJUST
                    ? "text-size-adjust" : name),
-            property_equal(name, name_length, "-webkit-user-select", 19)
+            id == CSP_WEBKIT_USER_SELECT
                 ? 11u
-                : (property_equal(
-                       name, name_length, "-webkit-text-size-adjust", 24)
+                : (id == CSP_WEBKIT_TEXT_SIZE_ADJUST
                    ? 16u : name_length),
             value, sizeof(value));
     bool serialize_computed_modern = sparse_modern
-        && (property_equal(name, name_length, "user-select", 11)
-            || property_equal(name, name_length,
-                              "-webkit-user-select", 19)
-            || property_equal(name, name_length, "touch-action", 12)
-            || property_equal(name, name_length, "resize", 6)
-            || property_equal(name, name_length, "text-wrap", 9)
-            || property_equal(name, name_length, "text-wrap-style", 15)
-            || property_equal(name, name_length, "isolation", 9)
-            || property_equal(name, name_length, "text-size-adjust", 16)
-            || property_equal(name, name_length,
-                              "-webkit-text-size-adjust", 24));
+        && (id == CSP_USER_SELECT
+            || id == CSP_WEBKIT_USER_SELECT
+            || id == CSP_TOUCH_ACTION
+            || id == CSP_RESIZE
+            || id == CSP_TEXT_WRAP
+            || id == CSP_TEXT_WRAP_STYLE
+            || id == CSP_ISOLATION
+            || id == CSP_TEXT_SIZE_ADJUST
+            || id == CSP_WEBKIT_TEXT_SIZE_ADJUST);
     bool authored_text_adjust_none = retained_modern
-        && (property_equal(name, name_length, "text-size-adjust", 16)
-            || property_equal(name, name_length,
-                              "-webkit-text-size-adjust", 24))
+        && (id == CSP_TEXT_SIZE_ADJUST
+            || id == CSP_WEBKIT_TEXT_SIZE_ADJUST)
         && strcasecmp(value, "none") == 0;
     bool authored_touch_manipulation = retained_modern
-        && property_equal(name, name_length, "touch-action", 12)
+        && id == CSP_TOUCH_ACTION
         && strcasecmp(value, "manipulation") == 0;
     bool authored_touch_combined = retained_modern
-        && property_equal(name, name_length, "touch-action", 12)
+        && id == CSP_TOUCH_ACTION
         && (strcasecmp(value, "pan-x pan-y") == 0
             || strcasecmp(value, "pan-y pan-x") == 0);
     if (retained_presentation || retained_scroll
@@ -4300,16 +4848,15 @@ JSValue js_computed_style_get(JSContext *context,
         memcpy(value, presentation, presentation_length);
         value[presentation_length] = '\0';
     } else if (sparse_modern) {
-        if (property_equal(name, name_length, "user-select", 11)
-            || property_equal(name, name_length,
-                              "-webkit-user-select", 19)) {
+        if (id == CSP_USER_SELECT
+            || id == CSP_WEBKIT_USER_SELECT) {
             static const char *const values[] = {
                 "auto", "text", "none", "all"
             };
             unsigned mode = computed_style_user_select(&style);
             snprintf(value, sizeof(value), "%s",
                      mode < 4u ? values[mode] : "auto");
-        } else if (property_equal(name, name_length, "touch-action", 12)) {
+        } else if (id == CSP_TOUCH_ACTION) {
             static const char *const values[] = {
                 "auto", "none", "pan-x", "pan-y"
             };
@@ -4318,30 +4865,27 @@ JSValue js_computed_style_get(JSContext *context,
                      : (authored_touch_combined ? "pan-x pan-y"
                      : (style.touch_action < 4u
                         ? values[style.touch_action] : "auto")));
-        } else if (property_equal(name, name_length, "resize", 6)) {
+        } else if (id == CSP_RESIZE) {
             static const char *const values[] = {
                 "none", "both", "horizontal", "vertical"
             };
             snprintf(value, sizeof(value), "%s",
                      style.resize_mode < 4u
                          ? values[style.resize_mode] : "none");
-        } else if (property_equal(name, name_length, "text-wrap", 9)
-                   || property_equal(name, name_length,
-                                     "text-wrap-style", 15)) {
+        } else if (id == CSP_TEXT_WRAP
+                   || id == CSP_TEXT_WRAP_STYLE) {
             StyleTextWrap mode = computed_style_text_wrap(&style);
             snprintf(value, sizeof(value), "%s",
                      mode == STYLE_TEXT_WRAP_BALANCE ? "balance"
                      : (mode == STYLE_TEXT_WRAP_PRETTY ? "pretty"
-                        : (property_equal(name, name_length,
-                                          "text-wrap-style", 15)
+                        : (id == CSP_TEXT_WRAP_STYLE
                            ? "auto" : "wrap")));
-        } else if (property_equal(name, name_length, "isolation", 9)) {
+        } else if (id == CSP_ISOLATION) {
             snprintf(value, sizeof(value), "%s",
                      computed_style_isolation_isolate(&style)
                          ? "isolate" : "auto");
-        } else if (property_equal(name, name_length, "text-size-adjust", 16)
-                   || property_equal(name, name_length,
-                                     "-webkit-text-size-adjust", 24)) {
+        } else if (id == CSP_TEXT_SIZE_ADJUST
+                   || id == CSP_WEBKIT_TEXT_SIZE_ADJUST) {
             if (authored_text_adjust_none) {
                 snprintf(value, sizeof(value), "100%%");
             } else if (style.font_size_unit != 0u) {
@@ -4350,45 +4894,60 @@ JSValue js_computed_style_get(JSContext *context,
             } else {
                 snprintf(value, sizeof(value), "auto");
             }
-        } else if (property_equal(
-                       name, name_length, "border-start-start-radius", 25)
-                   || property_equal(
-                       name, name_length, "border-start-end-radius", 23)
-                   || property_equal(
-                       name, name_length, "border-end-start-radius", 23)
-                   || property_equal(
-                       name, name_length, "border-end-end-radius", 21)) {
-            snprintf(value, sizeof(value), "0px");
+        } else if (id == CSP_BORDER_START_START_RADIUS
+                   || id == CSP_BORDER_START_END_RADIUS
+                   || id == CSP_BORDER_END_START_RADIUS
+                   || id == CSP_BORDER_END_END_RADIUS) {
+            /* Not authored as a logical longhand, so the used value is the
+               physical corner this one maps to under the element's writing
+               mode and direction. The name is border-<block>-<inline>-radius;
+               corners run top-left, top-right, bottom-right, bottom-left. */
+            bool block_start = id == CSP_BORDER_START_START_RADIUS
+                || id == CSP_BORDER_START_END_RADIUS;
+            bool inline_start = (id == CSP_BORDER_START_START_RADIUS
+                                 || id == CSP_BORDER_END_START_RADIUS)
+                != computed_style_direction_rtl(&style);
+            unsigned writing_mode = computed_style_writing_mode(&style);
+            bool top = writing_mode == 0u ? block_start : inline_start;
+            bool left = writing_mode == 0u ? inline_start
+                : (writing_mode == 2u ? block_start : !block_start);
+            snprintf(value, sizeof(value), "%dpx",
+                     style_border_radius_corner(
+                         stylesheet_border_radius_code(
+                             bridge->stylesheet, &style),
+                         top ? (left ? 0u : 1u) : (left ? 3u : 2u)));
         } else {
-            snprintf(value, sizeof(value), "none");
+            /* Nothing authored on this element. `none` is the initial value
+               of only some of these; the rest have a retained inherited
+               state or a different initial keyword. */
+            snprintf(value, sizeof(value), "%s",
+                     computed_style_sparse_modern_initial(&style, id));
         }
     } else if (sparse_scroll) {
         const char *initial =
-            property_equal(name, name_length, "scroll-snap-align", 17)
+            id == CSP_SCROLL_SNAP_ALIGN
                 ? "none"
-            : property_equal(name, name_length, "scroll-snap-stop", 16)
+            : id == CSP_SCROLL_SNAP_STOP
                 ? "normal"
-            : property_equal(name, name_length, "scroll-snap-type", 16)
+            : id == CSP_SCROLL_SNAP_TYPE
                 ? "none"
-            : property_equal(name, name_length, "scrollbar-color", 15)
+            : id == CSP_SCROLLBAR_COLOR
                 ? "auto"
-            : property_equal(name, name_length, "scrollbar-width", 15)
+            : id == CSP_SCROLLBAR_WIDTH
                 ? "auto"
-            : property_equal(name, name_length, "cursor", 6)
+            : id == CSP_CURSOR
                 ? "auto"
-            : property_equal(name, name_length, "scroll-behavior", 15)
+            : id == CSP_SCROLL_BEHAVIOR
                 ? "auto"
-            : property_equal(name, name_length, "overscroll-behavior", 19)
+            : id == CSP_OVERSCROLL_BEHAVIOR
                 ? "auto"
-            : property_equal(name, name_length, "overscroll-behavior-x", 21)
+            : id == CSP_OVERSCROLL_BEHAVIOR_X
                 ? "auto"
-            : property_equal(name, name_length, "overscroll-behavior-y", 21)
+            : id == CSP_OVERSCROLL_BEHAVIOR_Y
                 ? "auto"
-            : property_equal(
-                  name, name_length, "overscroll-behavior-inline", 26)
+            : id == CSP_OVERSCROLL_BEHAVIOR_INLINE
                 ? "auto"
-            : property_equal(
-                  name, name_length, "overscroll-behavior-block", 25)
+            : id == CSP_OVERSCROLL_BEHAVIOR_BLOCK
                 ? "auto"
                 : "0px";
         snprintf(value, sizeof(value), "%s", initial);
@@ -4396,16 +4955,15 @@ JSValue js_computed_style_get(JSContext *context,
         (void) style_custom_property_value(
             bridge->stylesheet, node, pseudo, name, name_length,
             value, sizeof(value));
-    } else if (property_equal(
-                   name, name_length, "transition-duration", 19)) {
+    } else if (id == CSP_TRANSITION_DURATION) {
         (void) bridge_transition_duration(
             bridge, node, value, sizeof(value));
-    } else if (property_equal(name, name_length, "display", 7)) {
+    } else if (id == CSP_DISPLAY) {
         snprintf(value, sizeof(value), "%s", display_names[style.display]);
-    } else if (property_equal(name, name_length, "visibility", 10)) {
+    } else if (id == CSP_VISIBILITY) {
         snprintf(value, sizeof(value), "%s",
                  style.visibility_hidden ? "hidden" : "visible");
-    } else if (property_equal(name, name_length, "opacity", 7)) {
+    } else if (id == CSP_OPACITY) {
         /* Painting keeps opacity in one byte on the PSP. Recover the
            shortest decimal (up to thousandths) which quantizes to that byte
            so common authored values such as .5 and .25 retain their CSS
@@ -4427,21 +4985,19 @@ JSValue js_computed_style_get(JSContext *context,
         }
         if (!formatted) snprintf(value, sizeof(value), "%.3g",
                                  (double) style.opacity / 255.0);
-    } else if (property_equal(name, name_length, "color", 5)) {
+    } else if (id == CSP_COLOR) {
         (void) serialize_computed_color(
             value, sizeof(value), style.color, style.color_alpha);
-    } else if (property_equal(name, name_length, "background-color", 16)) {
+    } else if (id == CSP_BACKGROUND_COLOR) {
         (void) serialize_computed_color(
             value, sizeof(value),
             style.has_background ? style.background : 0,
             style.has_background ? style.background_alpha : 0);
-    } else if (property_equal(name, name_length, "background-origin", 17)
-               || property_equal(name, name_length,
-                                 "background-clip", 15)) {
+    } else if (id == CSP_BACKGROUND_ORIGIN
+               || id == CSP_BACKGROUND_CLIP) {
         const StylePaintStack *paint = stylesheet_paint_stack(
             bridge->stylesheet, computed_style_paint_stack_id(&style));
-        bool origin = property_equal(
-            name, name_length, "background-origin", 17);
+        bool origin = id == CSP_BACKGROUND_ORIGIN;
         StylePaintBox box = origin ? STYLE_PAINT_BOX_PADDING
                                    : STYLE_PAINT_BOX_BORDER;
         if (paint != NULL && paint->background_count != 0
@@ -4457,7 +5013,7 @@ JSValue js_computed_style_get(JSContext *context,
                     ? "padding-box"
                     : (box == STYLE_PAINT_BOX_TEXT
                        ? "text" : "border-box")));
-    } else if (property_equal(name, name_length, "border-spacing", 14)) {
+    } else if (id == CSP_BORDER_SPACING) {
         const StylePaintStack *paint = stylesheet_paint_stack(
             bridge->stylesheet, computed_style_paint_stack_id(&style));
         unsigned x = 0, y = 0;
@@ -4468,14 +5024,14 @@ JSValue js_computed_style_get(JSContext *context,
             y = paint->table_spacing_y;
         }
         snprintf(value, sizeof(value), "%upx %upx", x, y);
-    } else if (property_equal(name, name_length, "background-image", 16)) {
+    } else if (id == CSP_BACKGROUND_IMAGE) {
         if (style.background_image == NULL || style.background_image[0] == '\0') {
             snprintf(value, sizeof(value), "none");
         } else {
             snprintf(value, sizeof(value), "url(\"%s\")",
                      style.background_image);
         }
-    } else if (property_equal(name, name_length, "content", 7)) {
+    } else if (id == CSP_CONTENT) {
         if (!style.generated_content) {
             snprintf(value, sizeof(value), "none");
         } else if (style.generated_text != NULL) {
@@ -4485,7 +5041,7 @@ JSValue js_computed_style_get(JSContext *context,
         } else {
             snprintf(value, sizeof(value), "\"\"");
         }
-    } else if (property_equal(name, name_length, "background-size", 15)) {
+    } else if (id == CSP_BACKGROUND_SIZE) {
         if ((style.background_size_flags
              & STYLE_BACKGROUND_SIZE_EXPLICIT) != 0) {
             char width[24], height[24];
@@ -4497,7 +5053,7 @@ JSValue js_computed_style_get(JSContext *context,
                          style.background_width,
                          (style.background_size_flags
                           & STYLE_BACKGROUND_WIDTH_PERCENT) != 0
-                           ? "%%" : "px");
+                           ? "%" : "px");
             }
             if ((style.background_size_flags
                  & STYLE_BACKGROUND_HEIGHT_AUTO) != 0) {
@@ -4507,7 +5063,7 @@ JSValue js_computed_style_get(JSContext *context,
                          style.background_height,
                          (style.background_size_flags
                           & STYLE_BACKGROUND_HEIGHT_PERCENT) != 0
-                           ? "%%" : "px");
+                           ? "%" : "px");
             }
             snprintf(value, sizeof(value), "%s %s", width, height);
         } else {
@@ -4515,12 +5071,11 @@ JSValue js_computed_style_get(JSContext *context,
                      ? "cover" : (style.background_fit == 2
                                    ? "contain" : "auto"));
         }
-    } else if (property_equal(name, name_length,
-                              "background-position", 19)) {
+    } else if (id == CSP_BACKGROUND_POSITION) {
         snprintf(value, sizeof(value), "%d%% %d%%",
                  style.background_position_x,
                  style.background_position_y);
-    } else if (property_equal(name, name_length, "box-shadow", 10)) {
+    } else if (id == CSP_BOX_SHADOW) {
         size_t box_shadow_count = stylesheet_box_shadow_count(
             bridge->stylesheet, &style);
         if (box_shadow_count == 0) {
@@ -4555,7 +5110,7 @@ JSValue js_computed_style_get(JSContext *context,
                 used += (size_t) written;
             }
         }
-    } else if (property_equal(name, name_length, "text-shadow", 11)) {
+    } else if (id == CSP_TEXT_SHADOW) {
         const StylePaintStack *paint = stylesheet_paint_stack(
             bridge->stylesheet, computed_style_paint_stack_id(&style));
         size_t count = paint != NULL
@@ -4592,7 +5147,7 @@ JSValue js_computed_style_get(JSContext *context,
                 used += (size_t) written;
             }
         }
-    } else if (property_equal(name, name_length, "object-fit", 10)) {
+    } else if (id == CSP_OBJECT_FIT) {
         const char *fit = "fill";
         if (style.object_fit == STYLE_OBJECT_FIT_COVER) fit = "cover";
         else if (style.object_fit == STYLE_OBJECT_FIT_CONTAIN) fit = "contain";
@@ -4601,7 +5156,7 @@ JSValue js_computed_style_get(JSContext *context,
             fit = "scale-down";
         }
         snprintf(value, sizeof(value), "%s", fit);
-    } else if (property_equal(name, name_length, "object-position", 15)) {
+    } else if (id == CSP_OBJECT_POSITION) {
         int x = style_object_position_percent(style.object_position_x);
         int y = style_object_position_percent(style.object_position_y);
         int offset_x = style_object_position_offset(style.object_position_x);
@@ -4613,9 +5168,8 @@ JSValue js_computed_style_get(JSContext *context,
                      "calc(%d%% + %dpx) calc(%d%% + %dpx)",
                      x, offset_x, y, offset_y);
         }
-    } else if (property_equal(name, name_length, "appearance", 10)
-               || property_equal(name, name_length,
-                                 "-webkit-appearance", 18)) {
+    } else if (id == CSP_APPEARANCE
+               || id == CSP_WEBKIT_APPEARANCE) {
         static const char *const appearance_names[] = {
             "none", "auto", "base", "base-select", "button", "checkbox",
             "listbox", "menulist-button", "meter", "progress-bar", "radio",
@@ -4627,7 +5181,7 @@ JSValue js_computed_style_get(JSContext *context,
             appearance = APPEARANCE_NONE;
         }
         snprintf(value, sizeof(value), "%s", appearance_names[appearance]);
-    } else if (property_equal(name, name_length, "justify-self", 12)) {
+    } else if (id == CSP_JUSTIFY_SELF) {
         static const char *const justify_self_names[] = {
             "auto", "start", "center", "end", "stretch", "baseline"
         };
@@ -4638,7 +5192,7 @@ JSValue js_computed_style_get(JSContext *context,
         }
         snprintf(value, sizeof(value), "%s",
                  justify_self_names[justify_self]);
-    } else if (property_equal(name, name_length, "justify-items", 13)) {
+    } else if (id == CSP_JUSTIFY_ITEMS) {
         static const char *const item_names[] = {
             "start", "center", "end", "stretch", "baseline"
         };
@@ -4647,7 +5201,7 @@ JSValue js_computed_style_get(JSContext *context,
             item = ALIGN_STRETCH;
         }
         snprintf(value, sizeof(value), "%s", item_names[item]);
-    } else if (property_equal(name, name_length, "place-self", 10)) {
+    } else if (id == CSP_PLACE_SELF) {
         static const char *const self_names[] = {
             "auto", "start", "center", "end", "stretch", "baseline"
         };
@@ -4665,7 +5219,7 @@ JSValue js_computed_style_get(JSContext *context,
             snprintf(value, sizeof(value), "%s %s",
                      self_names[align], self_names[justify]);
         }
-    } else if (property_equal(name, name_length, "place-items", 11)) {
+    } else if (id == CSP_PLACE_ITEMS) {
         static const char *const item_names[] = {
             "start", "center", "end", "stretch", "baseline"
         };
@@ -4683,7 +5237,7 @@ JSValue js_computed_style_get(JSContext *context,
             snprintf(value, sizeof(value), "%s %s",
                      item_names[align], item_names[justify]);
         }
-    } else if (property_equal(name, name_length, "place-content", 13)) {
+    } else if (id == CSP_PLACE_CONTENT) {
         static const char *const content_names[] = {
             "start", "center", "end", "space-between", "space-around",
             "space-evenly", "stretch"
@@ -4702,21 +5256,21 @@ JSValue js_computed_style_get(JSContext *context,
             snprintf(value, sizeof(value), "%s %s",
                      content_names[align], content_names[justify]);
         }
-    } else if (property_equal(name, name_length, "font-size", 9)) {
+    } else if (id == CSP_FONT_SIZE) {
         int fixed = computed_style_font_size_fixed(&style);
         if ((fixed & 63) == 0) {
             snprintf(value, sizeof(value), "%dpx", fixed / 64);
         } else {
             snprintf(value, sizeof(value), "%.6fpx", fixed / 64.0);
         }
-    } else if (property_equal(name, name_length, "font-family", 11)) {
+    } else if (id == CSP_FONT_FAMILY) {
         FontFamily family = font_family_is_web(style.font_family)
             ? font_family_web_fallback(style.font_family)
             : style.font_family;
         snprintf(value, sizeof(value), "%s",
                  family == FONT_MONOSPACE ? "monospace"
                  : family == FONT_SERIF ? "serif" : "sans-serif");
-    } else if (property_equal(name, name_length, "text-indent", 11)) {
+    } else if (id == CSP_TEXT_INDENT) {
         const LayoutNodeBox *box = bridge->layout == NULL ? NULL
             : layout_box_for_node(bridge->layout, node);
         int used_indent = 0;
@@ -4726,43 +5280,43 @@ JSValue js_computed_style_get(JSContext *context,
             used_indent = 0;
         }
         snprintf(value, sizeof(value), "%dpx", used_indent);
-    } else if (property_equal(name, name_length, "text-overflow", 13)) {
+    } else if (id == CSP_TEXT_OVERFLOW) {
         snprintf(value, sizeof(value), "%s",
                  computed_style_text_overflow_ellipsis(&style)
                    ? "ellipsis" : "clip");
-    } else if (property_equal(name, name_length, "font-weight", 11)) {
+    } else if (id == CSP_FONT_WEIGHT) {
         snprintf(value, sizeof(value), "%u",
                  style.font_weight != 0 ? style.font_weight
                                          : (style.font_bold ? 700u : 400u));
-    } else if (property_equal(name, name_length, "font-style", 10)) {
+    } else if (id == CSP_FONT_STYLE) {
         snprintf(value, sizeof(value), "%s",
                  style.font_italic ? "italic" : "normal");
-    } else if (property_equal(name, name_length, "position", 8)) {
+    } else if (id == CSP_POSITION) {
         snprintf(value, sizeof(value), "%s", style.fixed_position ? "fixed"
                  : style.sticky_position ? "sticky"
                  : style.out_of_flow ? "absolute"
                  : style.relative_position ? "relative" : "static");
-    } else if (property_equal(name, name_length, "top", 3)) {
+    } else if (id == CSP_TOP) {
         if (!style.has_top) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%d%s", style.top,
                       style.inset_percent_mask & STYLE_INSET_TOP_PERCENT
                       ? "%" : "px");
-    } else if (property_equal(name, name_length, "right", 5)) {
+    } else if (id == CSP_RIGHT) {
         if (!style.has_right) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%d%s", style.right,
                       style.inset_percent_mask & STYLE_INSET_RIGHT_PERCENT
                       ? "%" : "px");
-    } else if (property_equal(name, name_length, "bottom", 6)) {
+    } else if (id == CSP_BOTTOM) {
         if (!style.has_bottom) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%d%s", style.bottom,
                       style.inset_percent_mask & STYLE_INSET_BOTTOM_PERCENT
                       ? "%" : "px");
-    } else if (property_equal(name, name_length, "left", 4)) {
+    } else if (id == CSP_LEFT) {
         if (!style.has_left) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%d%s", style.left,
                       style.inset_percent_mask & STYLE_INSET_LEFT_PERCENT
                       ? "%" : "px");
-    } else if (property_equal(name, name_length, "overflow", 8)) {
+    } else if (id == CSP_OVERFLOW) {
         const char *x = style.overflow_x_clip_only ? "clip"
             : computed_style_overflow_x_hidden(&style) ? "hidden"
             : (style.overflow_x_scroll ? "auto" : "visible");
@@ -4770,18 +5324,18 @@ JSValue js_computed_style_get(JSContext *context,
             ? "clip" : (style.overflow_y_scroll ? "auto" : "visible");
         if (strcmp(x, y) == 0) snprintf(value, sizeof(value), "%s", x);
         else snprintf(value, sizeof(value), "%s %s", x, y);
-    } else if (property_equal(name, name_length, "overflow-x", 10)) {
+    } else if (id == CSP_OVERFLOW_X) {
         snprintf(value, sizeof(value), "%s",
                  style.overflow_x_clip_only ? "clip"
                  : computed_style_overflow_x_hidden(&style) ? "hidden"
                  : (style.overflow_x_scroll ? "auto" : "visible"));
-    } else if (property_equal(name, name_length, "overflow-y", 10)) {
+    } else if (id == CSP_OVERFLOW_Y) {
         snprintf(value, sizeof(value), "%s", style.overflow_y_clip_only
                  ? "clip" : (style.overflow_y_scroll ? "auto" : "visible"));
-    } else if (property_equal(name, name_length, "scrollbar-gutter", 16)) {
+    } else if (id == CSP_SCROLLBAR_GUTTER) {
         snprintf(value, sizeof(value), "%s",
                  style.scrollbar_gutter_stable ? "stable" : "auto");
-    } else if (property_equal(name, name_length, "border-radius", 13)) {
+    } else if (id == CSP_BORDER_RADIUS) {
         int code = stylesheet_border_radius_code(
             bridge->stylesheet, &style);
         if (style_border_radius_is_packed(code)) {
@@ -4793,14 +5347,10 @@ JSValue js_computed_style_get(JSContext *context,
         } else {
             snprintf(value, sizeof(value), "%dpx", code);
         }
-    } else if (property_equal(name, name_length,
-                              "border-top-left-radius", 22)
-               || property_equal(name, name_length,
-                                 "border-top-right-radius", 23)
-               || property_equal(name, name_length,
-                                 "border-bottom-right-radius", 26)
-               || property_equal(name, name_length,
-                                 "border-bottom-left-radius", 25)) {
+    } else if (id == CSP_BORDER_TOP_LEFT_RADIUS
+               || id == CSP_BORDER_TOP_RIGHT_RADIUS
+               || id == CSP_BORDER_BOTTOM_RIGHT_RADIUS
+               || id == CSP_BORDER_BOTTOM_LEFT_RADIUS) {
         int code = stylesheet_border_radius_code(
             bridge->stylesheet, &style);
         unsigned corner = name[7] == 't'
@@ -4808,16 +5358,16 @@ JSValue js_computed_style_get(JSContext *context,
             : (name[14] == 'r' ? 2u : 3u);
         snprintf(value, sizeof(value), "%dpx",
                  style_border_radius_corner(code, corner));
-    } else if (property_equal(name, name_length, "border-collapse", 15)) {
+    } else if (id == CSP_BORDER_COLLAPSE) {
         snprintf(value, sizeof(value), "%s",
                  style.table_border_collapse ? "collapse" : "separate");
-    } else if (property_equal(name, name_length, "caption-side", 12)) {
+    } else if (id == CSP_CAPTION_SIDE) {
         snprintf(value, sizeof(value), "%s",
                  style.order >= 200000 ? "bottom" : "top");
-    } else if (property_equal(name, name_length, "outline-width", 13)) {
+    } else if (id == CSP_OUTLINE_WIDTH) {
         snprintf(value, sizeof(value), "%upx",
                  computed_style_outline_width(&style));
-    } else if (property_equal(name, name_length, "outline-style", 13)) {
+    } else if (id == CSP_OUTLINE_STYLE) {
         static const char *const outline_names[] = {
             "none", "solid", "dashed", "dotted"
         };
@@ -4826,10 +5376,10 @@ JSValue js_computed_style_get(JSContext *context,
             outline = STYLE_OUTLINE_NONE;
         }
         snprintf(value, sizeof(value), "%s", outline_names[outline]);
-    } else if (property_equal(name, name_length, "outline-offset", 14)) {
+    } else if (id == CSP_OUTLINE_OFFSET) {
         snprintf(value, sizeof(value), "%dpx",
                  computed_style_outline_offset(&style));
-    } else if (property_equal(name, name_length, "outline-color", 13)) {
+    } else if (id == CSP_OUTLINE_COLOR) {
         uint32_t color = (style.outline_state & STYLE_OUTLINE_CURRENT_COLOR)
             ? style.color : style.outline_color;
         uint8_t alpha = (style.outline_state & STYLE_OUTLINE_CURRENT_COLOR)
@@ -4846,7 +5396,7 @@ JSValue js_computed_style_get(JSContext *context,
                      (unsigned) (color & 255u),
                      (double) alpha / 255.0);
         }
-    } else if (property_equal(name, name_length, "clip-path", 9)) {
+    } else if (id == CSP_CLIP_PATH) {
         unsigned clip = computed_style_clip_path_type(&style);
         if (clip == STYLE_CLIP_PATH_CIRCLE) {
             snprintf(value, sizeof(value), "circle()");
@@ -4865,7 +5415,7 @@ JSValue js_computed_style_get(JSContext *context,
         } else {
             snprintf(value, sizeof(value), "none");
         }
-    } else if (property_equal(name, name_length, "white-space", 11)) {
+    } else if (id == CSP_WHITE_SPACE) {
         static const char *const white_space_names[] = {
             "normal", "nowrap", "pre", "pre-wrap", "pre-line",
             "break-spaces"
@@ -4876,7 +5426,7 @@ JSValue js_computed_style_get(JSContext *context,
             mode = WHITE_SPACE_NORMAL;
         }
         snprintf(value, sizeof(value), "%s", white_space_names[mode]);
-    } else if (property_equal(name, name_length, "text-transform", 14)) {
+    } else if (id == CSP_TEXT_TRANSFORM) {
         static const char *const transform_names[] = {
             "none", "uppercase", "lowercase", "capitalize"
         };
@@ -4886,10 +5436,10 @@ JSValue js_computed_style_get(JSContext *context,
             transform = TEXT_TRANSFORM_NONE;
         }
         snprintf(value, sizeof(value), "%s", transform_names[transform]);
-    } else if (property_equal(name, name_length, "box-sizing", 10)) {
+    } else if (id == CSP_BOX_SIZING) {
         snprintf(value, sizeof(value), "%s",
                  style.box_sizing_border_box ? "border-box" : "content-box");
-    } else if (property_equal(name, name_length, "flex", 4)) {
+    } else if (id == CSP_FLEX) {
         char basis[32];
         if (!style.has_flex_basis) {
             snprintf(basis, sizeof(basis), "auto");
@@ -4906,16 +5456,16 @@ JSValue js_computed_style_get(JSContext *context,
         snprintf(value, sizeof(value), "%.3g %.3g %s",
                  (double) style.flex_grow / 1000.0,
                  (double) style.flex_shrink / 512.0, basis);
-    } else if (property_equal(name, name_length, "flex-direction", 14)) {
+    } else if (id == CSP_FLEX_DIRECTION) {
         static const char *direction_names[] = {
             "row", "row-reverse", "column", "column-reverse"
         };
         snprintf(value, sizeof(value), "%s",
                  direction_names[style.flex_direction]);
-    } else if (property_equal(name, name_length, "flex-wrap", 9)) {
+    } else if (id == CSP_FLEX_WRAP) {
         snprintf(value, sizeof(value), "%s", style.flex_wrap_reverse
                  ? "wrap-reverse" : (style.flex_wrap ? "wrap" : "nowrap"));
-    } else if (property_equal(name, name_length, "justify-content", 15)) {
+    } else if (id == CSP_JUSTIFY_CONTENT) {
         static const char *justify_names[] = {
             "flex-start", "center", "flex-end", "space-between",
             "space-around", "space-evenly", "stretch"
@@ -4925,7 +5475,7 @@ JSValue js_computed_style_get(JSContext *context,
             justify = JUSTIFY_START;
         }
         snprintf(value, sizeof(value), "%s", justify_names[justify]);
-    } else if (property_equal(name, name_length, "align-items", 11)) {
+    } else if (id == CSP_ALIGN_ITEMS) {
         static const char *align_names[] = {
             "flex-start", "center", "flex-end", "stretch", "baseline"
         };
@@ -4934,27 +5484,37 @@ JSValue js_computed_style_get(JSContext *context,
             align = ALIGN_STRETCH;
         }
         snprintf(value, sizeof(value), "%s", align_names[align]);
-    } else if (property_equal(name, name_length, "align-self", 10)) {
+    } else if (id == CSP_ALIGN_SELF) {
         static const char *align_self_names[] = {
             "auto", "flex-start", "center", "flex-end", "stretch",
             "baseline"
         };
         snprintf(value, sizeof(value), "%s",
                  align_self_names[style.align_self]);
-    } else if (property_equal(name, name_length, "align-content", 13)) {
+    } else if (id == CSP_ALIGN_CONTENT) {
         static const char *align_content_names[] = {
             "flex-start", "center", "flex-end", "space-between",
             "space-around", "space-evenly", "stretch"
         };
         snprintf(value, sizeof(value), "%s",
                  align_content_names[style.align_content]);
-    } else if (property_equal(name, name_length, "order", 5)) {
+    } else if (id == CSP_ORDER) {
         snprintf(value, sizeof(value), "%d", style.order);
-    } else if (property_equal(name, name_length, "z-index", 7)) {
+    } else if (id == CSP_Z_INDEX) {
         if (style.has_z_index) snprintf(value, sizeof(value), "%d", style.z_index);
         else snprintf(value, sizeof(value), "auto");
-    } else if (property_equal(name, name_length, "width", 5)) {
-        if (style.has_width) {
+    } else if (id == CSP_WIDTH) {
+        /* The resolved value of width is the used value whenever the element
+           generates a box: a percentage or sizing keyword must come back in
+           pixels. Only an element without a box, or a non-replaced inline,
+           reports its computed value. */
+        if (computed_style_used_box_size(
+                bridge, node, &style, containing_width, pseudo, false,
+                value, sizeof(value))) {
+            /* Used pixels. */
+        } else if (!style.has_width) {
+            snprintf(value, sizeof(value), "auto");
+        } else {
             if (computed_style_width_min_content(&style)) {
                 snprintf(value, sizeof(value), "min-content");
             } else if (computed_style_width_max_content(&style)) {
@@ -4965,20 +5525,8 @@ JSValue js_computed_style_get(JSContext *context,
                 snprintf(value, sizeof(value), "%d%s", style.width,
                          style.width_percent ? "%" : "px");
             }
-        } else {
-            const LayoutNodeBox *box = bridge->layout == NULL ? NULL
-                : layout_box_for_node(bridge->layout, node);
-            if (box != NULL) {
-                int used = box->width;
-                if (!style.box_sizing_border_box) {
-                    used -= style.border.left + style.border.right
-                            + style.padding.left + style.padding.right;
-                }
-                if (used < 0) used = 0;
-                snprintf(value, sizeof(value), "%dpx", used);
-            }
         }
-    } else if (property_equal(name, name_length, "min-width", 9)) {
+    } else if (id == CSP_MIN_WIDTH) {
         if (style.min_width_auto) snprintf(value, sizeof(value), "auto");
         else if (style.min_width == STYLE_LENGTH_MIN_CONTENT)
             snprintf(value, sizeof(value), "min-content");
@@ -4988,7 +5536,7 @@ JSValue js_computed_style_get(JSContext *context,
             snprintf(value, sizeof(value), "fit-content");
         else snprintf(value, sizeof(value), "%d%s", style.min_width,
                       style.min_width_percent ? "%" : "px");
-    } else if (property_equal(name, name_length, "max-width", 9)) {
+    } else if (id == CSP_MAX_WIDTH) {
         if (style.max_width == STYLE_LENGTH_NONE) {
             snprintf(value, sizeof(value), "none");
         } else if (style.max_width == STYLE_LENGTH_MIN_CONTENT) {
@@ -4999,14 +5547,21 @@ JSValue js_computed_style_get(JSContext *context,
             snprintf(value, sizeof(value), "fit-content");
         } else snprintf(value, sizeof(value), "%d%s", style.max_width,
                       style.max_width_percent ? "%" : "px");
-    } else if (property_equal(name, name_length, "height", 6)
-               && style.has_height) {
-        snprintf(value, sizeof(value), "%d%s", style.height,
-                 style.height_percent ? "%" : "px");
-    } else if (property_equal(name, name_length, "min-height", 10)) {
+    } else if (id == CSP_HEIGHT) {
+        if (computed_style_used_box_size(
+                bridge, node, &style, containing_width, pseudo, true,
+                value, sizeof(value))) {
+            /* Used pixels. */
+        } else if (!style.has_height) {
+            snprintf(value, sizeof(value), "auto");
+        } else {
+            snprintf(value, sizeof(value), "%d%s", style.height,
+                     style.height_percent ? "%" : "px");
+        }
+    } else if (id == CSP_MIN_HEIGHT) {
         snprintf(value, sizeof(value), "%d%s", style.min_height,
                  style.min_height_percent ? "%" : "px");
-    } else if (property_equal(name, name_length, "max-height", 10)) {
+    } else if (id == CSP_MAX_HEIGHT) {
         if (style.max_height == STYLE_LENGTH_NONE) {
             snprintf(value, sizeof(value), "none");
         } else if (style.max_height == STYLE_LENGTH_MIN_CONTENT) {
@@ -5014,49 +5569,79 @@ JSValue js_computed_style_get(JSContext *context,
         }
         else snprintf(value, sizeof(value), "%d%s", style.max_height,
                       style.max_height_percent ? "%" : "px");
-    } else if (property_equal(name, name_length, "margin-top", 10)) {
+    } else if (id == CSP_MARGIN_TOP) {
         if (style.margin_top_auto) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%dpx", style.margin.top);
-    } else if (property_equal(name, name_length, "margin-right", 12)) {
+    } else if (id == CSP_MARGIN_RIGHT) {
         if (style.margin_right_auto) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%dpx", style.margin.right);
-    } else if (property_equal(name, name_length, "margin-bottom", 13)) {
+    } else if (id == CSP_MARGIN_BOTTOM) {
         if (style.margin_bottom_auto) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%dpx", style.margin.bottom);
-    } else if (property_equal(name, name_length, "margin-left", 11)) {
+    } else if (id == CSP_MARGIN_LEFT) {
         if (style.margin_left_auto) snprintf(value, sizeof(value), "auto");
         else snprintf(value, sizeof(value), "%dpx", style.margin.left);
-    } else if (property_equal(name, name_length, "padding-top", 11)) {
-        snprintf(value, sizeof(value), "%dpx", style.padding.top);
-    } else if (property_equal(name, name_length, "padding-right", 13)) {
-        snprintf(value, sizeof(value), "%dpx", style.padding.right);
-    } else if (property_equal(name, name_length, "padding-bottom", 14)) {
-        snprintf(value, sizeof(value), "%dpx", style.padding.bottom);
-    } else if (property_equal(name, name_length, "padding-left", 12)) {
-        snprintf(value, sizeof(value), "%dpx", style.padding.left);
-    } else if (property_equal(name, name_length, "padding", 7)) {
+    } else if (id == CSP_MARGIN) {
+        /* Four values, as `padding` reports them; an auto side keeps its
+           keyword. */
+        const int sides[4] = { style.margin.top, style.margin.right,
+                               style.margin.bottom, style.margin.left };
+        const bool automatic[4] = {
+            style.margin_top_auto, style.margin_right_auto,
+            style.margin_bottom_auto, style.margin_left_auto
+        };
+        size_t used = 0;
+        for (unsigned side = 0; side < 4u && used < sizeof(value); side++) {
+            int written = automatic[side]
+                ? snprintf(value + used, sizeof(value) - used, "%sauto",
+                           side == 0 ? "" : " ")
+                : snprintf(value + used, sizeof(value) - used, "%s%dpx",
+                           side == 0 ? "" : " ", sides[side]);
+            if (written < 0) break;
+            used += (size_t) written;
+        }
+    } else if (id == CSP_PADDING_TOP) {
+        snprintf(value, sizeof(value), "%dpx",
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.top));
+    } else if (id == CSP_PADDING_RIGHT) {
+        snprintf(value, sizeof(value), "%dpx",
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.right));
+    } else if (id == CSP_PADDING_BOTTOM) {
+        snprintf(value, sizeof(value), "%dpx",
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.bottom));
+    } else if (id == CSP_PADDING_LEFT) {
+        snprintf(value, sizeof(value), "%dpx",
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.left));
+    } else if (id == CSP_PADDING) {
         snprintf(value, sizeof(value), "%dpx %dpx %dpx %dpx",
-                 style.padding.top, style.padding.right,
-                 style.padding.bottom, style.padding.left);
-    } else if (property_equal(name, name_length, "border-top-width", 16)) {
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.top),
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.right),
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.bottom),
+                 computed_style_used_padding(
+                     bridge, containing_width, style.padding.left));
+    } else if (id == CSP_BORDER_TOP_WIDTH) {
         snprintf(value, sizeof(value), "%dpx", style.border.top);
-    } else if (property_equal(name, name_length, "border-right-width", 18)) {
+    } else if (id == CSP_BORDER_RIGHT_WIDTH) {
         snprintf(value, sizeof(value), "%dpx", style.border.right);
-    } else if (property_equal(name, name_length, "border-bottom-width", 19)) {
+    } else if (id == CSP_BORDER_BOTTOM_WIDTH) {
         snprintf(value, sizeof(value), "%dpx", style.border.bottom);
-    } else if (property_equal(name, name_length, "border-left-width", 17)) {
+    } else if (id == CSP_BORDER_LEFT_WIDTH) {
         snprintf(value, sizeof(value), "%dpx", style.border.left);
-    } else if (property_equal(name, name_length, "border-width", 12)) {
+    } else if (id == CSP_BORDER_WIDTH) {
         snprintf(value, sizeof(value), "%dpx %dpx %dpx %dpx",
                  style.border.top, style.border.right,
                  style.border.bottom, style.border.left);
-    } else if (property_equal(name, name_length, "border-top-style", 16)
-               || property_equal(
-                      name, name_length, "border-right-style", 18)
-               || property_equal(
-                      name, name_length, "border-bottom-style", 19)
-               || property_equal(
-                      name, name_length, "border-left-style", 17)) {
+    } else if (id == CSP_BORDER_TOP_STYLE
+               || id == CSP_BORDER_RIGHT_STYLE
+               || id == CSP_BORDER_BOTTOM_STYLE
+               || id == CSP_BORDER_LEFT_STYLE) {
         static const char *const border_lines[] = {
             "none", "solid", "dashed", "dotted"
         };
@@ -5070,13 +5655,10 @@ JSValue js_computed_style_get(JSContext *context,
             line = STYLE_BORDER_NONE;
         }
         snprintf(value, sizeof(value), "%s", border_lines[line]);
-    } else if (property_equal(name, name_length, "border-top-color", 16)
-               || property_equal(
-                      name, name_length, "border-right-color", 18)
-               || property_equal(
-                      name, name_length, "border-bottom-color", 19)
-               || property_equal(
-                      name, name_length, "border-left-color", 17)) {
+    } else if (id == CSP_BORDER_TOP_COLOR
+               || id == CSP_BORDER_RIGHT_COLOR
+               || id == CSP_BORDER_BOTTOM_COLOR
+               || id == CSP_BORDER_LEFT_COLOR) {
         StyleBorderSide side =
             name[7] == 't' ? STYLE_BORDER_TOP
             : (name[7] == 'r' ? STYLE_BORDER_RIGHT
@@ -5097,7 +5679,7 @@ JSValue js_computed_style_get(JSContext *context,
                      (unsigned) (color & 255u),
                      (double) alpha / 255.0);
         }
-    } else if (property_equal(name, name_length, "transform", 9)) {
+    } else if (id == CSP_TRANSFORM) {
         if (!style.has_transform) {
             snprintf(value, sizeof(value), "none");
         } else {
@@ -5107,8 +5689,7 @@ JSValue js_computed_style_get(JSContext *context,
                      style.transform_y,
                      style.transform_y_percent ? "%" : "px");
         }
-    } else if (property_equal(
-                   name, name_length, "transform-origin", 16)) {
+    } else if (id == CSP_TRANSFORM_ORIGIN) {
         uint16_t x = style_object_position_encode(50, 0);
         uint16_t y = style_object_position_encode(50, 0);
         const StylePaintStack *paint = stylesheet_paint_stack(
@@ -5134,10 +5715,10 @@ JSValue js_computed_style_get(JSContext *context,
                      style_object_position_percent(x),
                      style_object_position_percent(y));
         }
-    } else if (property_equal(name, name_length, "perspective", 11)) {
+    } else if (id == CSP_PERSPECTIVE) {
         snprintf(value, sizeof(value), "%s",
                  style.has_perspective ? "1px" : "none");
-    } else if (property_equal(name, name_length, "filter", 6)) {
+    } else if (id == CSP_FILTER) {
         static const char *const filter_names[] = {
             "none", "grayscale(1)", "invert(1)", "sepia(1)",
             "brightness(1.25)", "brightness(0.75)",
@@ -5159,62 +5740,62 @@ JSValue js_computed_style_get(JSContext *context,
         } else {
             snprintf(value, sizeof(value), "%s", filter_names[filter]);
         }
-    } else if (property_equal(name, name_length, "contain", 7)) {
+    } else if (id == CSP_CONTAIN) {
         snprintf(value, sizeof(value), "%s",
                  style.has_layout_containment ? "paint" : "none");
-    } else if (property_equal(
-                   name, name_length, "content-visibility", 18)) {
+    } else if (id == CSP_CONTENT_VISIBILITY) {
         snprintf(value, sizeof(value), "%s",
                  style.content_visibility == STYLE_CONTENT_VISIBILITY_HIDDEN
                     ? "hidden"
                     : (style.content_visibility
                            == STYLE_CONTENT_VISIBILITY_AUTO
                        ? "auto" : "visible"));
-    } else if (property_equal(
-                   name, name_length, "-webkit-line-clamp", 18)) {
+    } else if (id == CSP_WEBKIT_LINE_CLAMP) {
         unsigned clamp = computed_style_line_clamp(&style);
         if (clamp == 0) snprintf(value, sizeof(value), "none");
         else snprintf(value, sizeof(value), "%u",
                       clamp);
-    } else if (property_equal(name, name_length, "will-change", 11)) {
+    } else if (id == CSP_WILL_CHANGE) {
         snprintf(value, sizeof(value), "%s",
                  style.will_change_transform ? "transform" : "auto");
-    } else if (property_equal(name, name_length, "pointer-events", 14)) {
+    } else if (id == CSP_POINTER_EVENTS) {
         snprintf(value, sizeof(value), "%s",
                  style.pointer_events_none ? "none" : "auto");
-    } else if (property_equal(name, name_length, "float", 5)) {
+    } else if (id == CSP_FLOAT) {
         static const char *const float_names[] = {
             "none", "left", "right"
         };
         size_t mode = style.float_mode;
         if (mode >= sizeof(float_names) / sizeof(float_names[0])) mode = 0;
         snprintf(value, sizeof(value), "%s", float_names[mode]);
-    } else if (property_equal(name, name_length, "aspect-ratio", 12)
+    } else if (id == CSP_ASPECT_RATIO
                && style.aspect_width > 0 && style.aspect_height > 0) {
         snprintf(value, sizeof(value), "%d / %d", style.aspect_width,
                  style.aspect_height);
-    } else if (property_equal(
-                   name, name_length, "grid-template-areas", 19)) {
+    } else if (id == CSP_GRID_TEMPLATE_AREAS) {
         (void) stylesheet_serialize_grid_template_areas(
             bridge->stylesheet, &style, value, sizeof(value));
-    } else if (property_equal(
-                   name, name_length, "grid-template-columns", 21)) {
+    } else if (id == CSP_GRID_TEMPLATE_COLUMNS) {
         (void) stylesheet_serialize_grid_template_tracks(
             bridge->stylesheet, &style, false, value, sizeof(value));
-    } else if (property_equal(
-                   name, name_length, "grid-template-rows", 18)) {
+    } else if (id == CSP_GRID_TEMPLATE_ROWS) {
         (void) stylesheet_serialize_grid_template_tracks(
             bridge->stylesheet, &style, true, value, sizeof(value));
-    } else if (property_equal(name, name_length, "gap", 3)
-               || property_equal(name, name_length, "column-gap", 10)) {
+    } else if (id == CSP_GAP
+               || id == CSP_COLUMN_GAP) {
         if (computed_style_gap_is_percent(style.gap)) {
             snprintf(value, sizeof(value), "%d%%",
                      computed_style_gap_percent(style.gap));
         } else {
             snprintf(value, sizeof(value), "%dpx", style.gap);
         }
-    } else if (property_equal(name, name_length, "row-gap", 7)) {
+    } else if (id == CSP_ROW_GAP) {
         snprintf(value, sizeof(value), "%dpx", style.row_gap);
+    } else {
+        /* Reached only after every older case declined, so none of their
+           paths grew. */
+        (void) computed_style_serialize_retained(
+            node, &style, id, value, sizeof(value));
     }
     JS_FreeCString(context, name);
     return JS_NewString(context, value);

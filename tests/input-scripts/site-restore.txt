@@ -1,0 +1,7 @@
+# Boot native HOME from the tests/fixtures/ppsspp-site-data Memory Stick seed
+# (run with --data-dir) and idle long enough for the deferred local-storage
+# restore, the baseline font load and the disk-cache restore to take their
+# turns on the Memory Stick. The run is judged by the tilefinch-frame-pump
+# and tilefinch-site-data lines of the validation log, not only this trace.
+wait 600
+end

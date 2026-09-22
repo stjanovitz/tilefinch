@@ -554,6 +554,11 @@ typedef struct {
     size_t float_count;
 } PositionedBox;
 
+/* A block container's line-height in 26.6 pixels, or its face's normal
+   height; zero for an authored zero. */
+int layout_inline_style_line_height_fixed(
+    LayoutContext *context, const ComputedStyle *style);
+
 static inline bool layout_style_establishes_fixed_containing_block(
     const ComputedStyle *style)
 {
@@ -581,6 +586,12 @@ typedef struct {
     int line_height;
     int line_height_fixed;
     int line_gap;
+    /* The block container's own line-height (CSS 2.1 strut). Applied when
+       a line's inline content contributed no height at all, so a run with
+       line-height: 0 cannot collapse its parent's line and pull the next
+       block up over it. Other lines keep the engine's content-derived
+       height. Zero when the container is unknown. */
+    int strut_fixed;
     /* The authored first-line indent is distinct from the temporary
        inline-start displacement imposed by active floats. */
     int first_line_indent;

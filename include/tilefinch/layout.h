@@ -80,6 +80,8 @@
    In particular, Find-in-page must not expose a declared-media recovery
    card that Reader/Basic extraction and history serialization omit. */
 #define LAYOUT_TEXT_FIND_EXCLUDED (1 << 26)
+/* Glyph ink may overflow a zero-height CSS line box without advancing flow. */
+#define LAYOUT_TEXT_ZERO_LINE_HEIGHT (1 << 27)
 /* Authored font-weight is retained divided by ten and is bounded at 100.
    Its spare high bit carries the positioned paint phase without growing the
    PSP display list. */
