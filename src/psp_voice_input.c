@@ -1,4 +1,5 @@
 #include "tilefinch/psp_voice_input.h"
+#include "tilefinch/psp_fpu.h"
 
 #include <pspaudio.h>
 #include <pspctrl.h>
@@ -215,6 +216,7 @@ static int voice_decode_cancelled(void *user)
 
 static int voice_decode_thread(SceSize argument_size, void *arguments)
 {
+    psp_fpu_mask_exceptions();
     PspVoiceJob *job = NULL;
     if (arguments != NULL && argument_size == sizeof(job))
         memcpy(&job, arguments, sizeof(job));

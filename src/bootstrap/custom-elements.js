@@ -1,4 +1,6 @@
 (() => {
+  /* Definitions made in any registry, main or scoped. */
+  let definedAnywhere = 0;
   const definitions = new Map(),
     constructors = new Map(),
     waiting = new Map(),
@@ -418,6 +420,7 @@
       }
       definition.registry = this;
       activeDefinitions.set(name, definition);
+      definedAnywhere++;
       activeConstructors.set(constructor, name);
       definitionByConstructor.set(constructor, definition);
       for (const node of descendants(scoped?.document || document))
@@ -1166,6 +1169,9 @@
     );
   };
   globalThis.__tilefinchRestoreCustomElement = (node) => {
+    /* Until some registry defines an element, no node can be custom or
+       failed; wrapping every node must not pay the registry lookup. */
+    if (!definedAnywhere) return node;
     if (globalThis.__tilefinchCustomElementCreationSuppressed) return node;
     const definition = definitionFor(node),
       state = __tilefinchGetCustomState(node.__handle);
@@ -1223,6 +1229,9 @@
     }
   };
   globalThis.__tilefinchCustomElementDisconnected = (root) => {
+    /* Only a custom element has a disconnect reaction, and none exists
+       before the first definition: skip wrapping the removed subtree. */
+    if (!definedAnywhere) return;
     for (const node of descendants(root))
       if (node.__tilefinchCustomElementState === "custom") {
         const definition = definitionFor(node);
@@ -1242,6 +1251,7 @@
       }
   };
   globalThis.__tilefinchCustomElementMoved = (root) => {
+    if (!definedAnywhere) return;
     for (const node of descendants(root)) {
       if (node.__tilefinchCustomElementState !== "custom") continue;
       const definition = definitionFor(node);

@@ -19,7 +19,7 @@ bool script_runtime_dispatch(ScriptRuntime *runtime, const char *selector,
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok) ok = js_rt_runtime_refresh(runtime);
     runtime->result.success = ok;
-    js_rt_runtime_update_result(runtime, result);
+    js_rt_runtime_update_frame_result(runtime, result);
     return ok;
 }
 
@@ -77,7 +77,7 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
                 (long long) handle, event_type, runtime->result.error);
     }
     runtime->result.success = ok;
-    js_rt_runtime_update_result(runtime, result);
+    js_rt_runtime_update_frame_result(runtime, result);
     return ok;
 }
 
@@ -149,7 +149,7 @@ bool script_runtime_dispatch_pointer_node(
     }
 #endif
     runtime->result.success = ok;
-    js_rt_runtime_update_result(runtime, result);
+    js_rt_runtime_update_frame_result(runtime, result);
     return ok;
 }
 
@@ -289,7 +289,7 @@ bool script_runtime_dispatch_input_node(ScriptRuntime *runtime,
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok) ok = js_rt_runtime_refresh(runtime);
     runtime->result.success = ok;
-    js_rt_runtime_update_result(runtime, result);
+    js_rt_runtime_update_frame_result(runtime, result);
     return ok;
 }
 
@@ -328,7 +328,7 @@ bool script_runtime_dispatch_submit_node(ScriptRuntime *runtime,
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok) ok = js_rt_runtime_refresh(runtime);
     runtime->result.success = ok;
-    js_rt_runtime_update_result(runtime, result);
+    js_rt_runtime_update_frame_result(runtime, result);
     return ok;
 }
 

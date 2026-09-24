@@ -1,6 +1,189 @@
 #define NAVIGATION_STREAM_PREVIEW_MINIMUM_BYTES (8u * 1024u)
 #define NAVIGATION_STREAM_PREVIEW_MINIMUM_NODES 48u
-#define NAVIGATION_STREAM_PREVIEW_MAXIMUM_CHECKS 4u
+
+/* The parser is (or may still be) inside a <style> element: the last node
+   in document order is one, or its text. A document nested deeper than the
+   traversal bound is treated as open (no preview checkpoint). */
+static bool navigation_stream_style_element_open(
+    const PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return false;
+    lxb_dom_node_t *node = lxb_dom_interface_node(document->html);
+    for (size_t depth = 0; node->last_child != NULL; depth++) {
+        if (depth == NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) return true;
+        node = node->last_child;
+    }
+    if (node->type == LXB_DOM_NODE_TYPE_TEXT && node->parent != NULL)
+        node = node->parent;
+    return node_name_is(node, "style");
+}
+
+static void navigation_retained_preview_clear(
+    NavigationSession *session, NavigationRetainedPreview *preview)
+{
+    if (preview == NULL) return;
+    Budget *budget = session == NULL ? NULL : session->budget;
+    layout_destroy(&preview->layout);
+    budget_free(budget, preview->text);
+    budget_free(budget, preview->image_commands);
+    budget_free(budget, preview->image_indices);
+    budget_free(budget, preview->image_nodes);
+    memset(preview, 0, sizeof(*preview));
+}
+
+static void navigation_stream_drop_previews(
+    NavigationDocumentStream *stream)
+{
+    if (stream == NULL) return;
+    for (size_t i = 0; i < 2u; i++)
+        navigation_retained_preview_clear(
+            stream->session, &stream->previews[i]);
+}
+
+static NavigationRetainedPreview *navigation_stream_live_preview(
+    NavigationDocumentStream *stream)
+{
+    if (stream == NULL) return NULL;
+    for (size_t i = 0; i < 2u; i++)
+        if (stream->previews[i].live) return &stream->previews[i];
+    return NULL;
+}
+
+/* Copy the preview's text out of the DOM and record how to find each image
+   again, so the layout stays valid while parsing continues. Runs before
+   the paint: a preview that cannot be detached is not offered for
+   retention. */
+static bool navigation_retained_preview_detach(
+    NavigationSession *session, NavigationRetainedPreview *preview,
+    const ImageResources *images)
+{
+    LayoutDocument *layout = &preview->layout;
+    uintptr_t owned = (uintptr_t) layout->generated_text_storage;
+    uintptr_t owned_end = owned + layout->generated_text_used;
+    size_t bytes = 0, image_count = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->image != NULL) image_count++;
+        if (command->type != DRAW_TEXT || command->text == NULL
+            || command->text_length == 0) continue;
+        uintptr_t address = (uintptr_t) command->text;
+        if (owned != 0 && address >= owned && address < owned_end) continue;
+        if (bytes > SIZE_MAX - command->text_length) return false;
+        bytes += command->text_length;
+    }
+    if (image_count > UINT32_MAX || layout->count > UINT32_MAX) return false;
+    if (bytes != 0) {
+        preview->text = budget_malloc(session->budget, bytes);
+        if (preview->text == NULL) return false;
+    }
+    if (image_count != 0) {
+        preview->image_commands = budget_malloc(
+            session->budget, image_count * sizeof(*preview->image_commands));
+        preview->image_indices = budget_malloc(
+            session->budget, image_count * sizeof(*preview->image_indices));
+        preview->image_nodes = budget_malloc(
+            session->budget, image_count * sizeof(*preview->image_nodes));
+        if (preview->image_commands == NULL
+            || preview->image_indices == NULL
+            || preview->image_nodes == NULL) return false;
+    }
+    uintptr_t base = images == NULL ? 0 : (uintptr_t) images->items;
+    size_t table_count = images == NULL ? 0 : images->count;
+    size_t used = 0, image = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        DrawCommand *command = &layout->commands[i];
+        if (command->image != NULL) {
+            uintptr_t address = (uintptr_t) command->image;
+            size_t index = SIZE_MAX;
+            if (base != 0 && address >= base
+                && (address - base) % sizeof(ImageResource) == 0
+                && (address - base) / sizeof(ImageResource) < table_count)
+                index = (address - base) / sizeof(ImageResource);
+            /* An image outside the document table (none are expected) is
+               not tracked; drop it rather than keep a pointer that could
+               move. */
+            if (index == SIZE_MAX) command->image = NULL;
+            preview->image_commands[image] = (uint32_t) i;
+            preview->image_indices[image] =
+                index == SIZE_MAX ? UINT32_MAX : (uint32_t) index;
+            preview->image_nodes[image] =
+                index == SIZE_MAX ? NULL : images->items[index].node;
+            image++;
+        }
+        if (command->type != DRAW_TEXT || command->text == NULL
+            || command->text_length == 0) continue;
+        uintptr_t address = (uintptr_t) command->text;
+        if (owned != 0 && address >= owned && address < owned_end) continue;
+        memcpy(preview->text + used, command->text, command->text_length);
+        command->text = preview->text + used;
+        used += command->text_length;
+    }
+    preview->image_count = image_count;
+    preview->image_base = images == NULL ? NULL : images->items;
+    preview->image_table_count = table_count;
+    return true;
+}
+
+/* Point each image command at its node's current table entry: the table
+   is reallocated as images are discovered, and a script can reorder it. */
+static bool navigation_retained_preview_resolve_images(
+    NavigationRetainedPreview *preview, const ImageResources *images)
+{
+    if (preview == NULL || preview->image_count == 0) return false;
+    const ImageResource *items = images == NULL ? NULL : images->items;
+    size_t count = items == NULL ? 0 : images->count;
+    bool moved = items != preview->image_base
+        || count != preview->image_table_count;
+    bool changed = false;
+    for (size_t i = 0; i < preview->image_count; i++) {
+        DrawCommand *command =
+            &preview->layout.commands[preview->image_commands[i]];
+        lxb_dom_node_t *node = preview->image_nodes[i];
+        const ImageResource *resolved = NULL;
+        size_t index = preview->image_indices[i];
+        if (node != NULL && items != NULL) {
+            if (index < count && items[index].node == node) {
+                resolved = &items[index];
+            } else {
+                for (size_t j = 0; j < count; j++) {
+                    if (items[j].node != node) continue;
+                    resolved = &items[j];
+                    preview->image_indices[i] = (uint32_t) j;
+                    break;
+                }
+            }
+        }
+        /* When the table moved, the old pointer is only compared, never
+           dereferenced. */
+        if (moved || command->image != resolved) {
+            if (command->image != resolved) changed = true;
+            command->image = resolved;
+        }
+    }
+    preview->image_base = items;
+    preview->image_table_count = count;
+    return changed || moved;
+}
+
+/* A preview is worth replacing until its first screen shows real content.
+   Reaching the layout limit is not enough: an off-screen menu drawer in the
+   first bytes of a page can fill the limit while the screen shows only the
+   site header. */
+#define NAVIGATION_PREVIEW_FILLED_COMMANDS 24u
+
+static bool navigation_preview_first_screen_filled(
+    const LayoutDocument *preview, int viewport_height)
+{
+    size_t visible = 0;
+    for (size_t i = 0; preview != NULL && i < preview->count; i++) {
+        const DrawCommand *command = &preview->commands[i];
+        if ((command->type == DRAW_TEXT || command->type == DRAW_IMAGE)
+            && command->y < viewport_height
+            && (int64_t) command->y + command->height > 0
+            && ++visible >= NAVIGATION_PREVIEW_FILLED_COMMANDS) return true;
+    }
+    return false;
+}
 
 static bool navigation_stream_preview_stylesheet_ready(
     const NavigationDocumentStream *stream)
@@ -178,12 +361,73 @@ static bool navigation_stream_preview_may_have_visible_pixels(
    and all preceding DOM are stable while the immutable preview is built. A
    stylesheet encountered later in the body may cause the ordinary
    authoritative repaint but can never mutate or promote this preview. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Why a reader scrolled toward the end of the preview is not getting a
+   deeper one: logged when the reason changes. */
+static void navigation_preview_trace_skip(
+    NavigationDocumentStream *stream, const char *reason)
+{
+    static const char *last_reason;
+    if (stream->session->provisional_reader_y <= 0
+        || navigation_stream_live_preview(stream) == NULL
+        || reason == last_reason) return;
+    last_reason = reason;
+    char line[160];
+    snprintf(line, sizeof(line),
+             "tilefinch-preview-skip: at=%llums reason=%s reader=%d "
+             "bytes=%zu",
+             (unsigned long long) (stream->session->navigation_started_us != 0
+                 ? (navigation_now_us()
+                    - stream->session->navigation_started_us) / 1000u : 0u),
+             reason, stream->session->provisional_reader_y,
+             stream->parsed_body_bytes);
+    tilefinch_platform_log_message(line);
+}
+#define NAVIGATION_PREVIEW_SKIP(stream, reason) \
+    do { navigation_preview_trace_skip((stream), (reason)); return; } \
+    while (0)
+#else
+#define NAVIGATION_PREVIEW_SKIP(stream, reason) return
+#endif
+/* A costly gate refused the policy's decision. */
+#define NAVIGATION_PREVIEW_REFUSE(stream, decision, reason) \
+    do { \
+        preview_policy_refused(&(stream)->preview_policy, (decision), \
+                               (stream)->parsed_body_bytes); \
+        NAVIGATION_PREVIEW_SKIP((stream), (reason)); \
+    } while (0)
+
 static void navigation_stream_try_pre_eof_preview(
     NavigationDocumentStream *stream)
 {
-    if (stream == NULL || stream->session == NULL || stream->parser == NULL
-        || stream->pre_eof_preview_attempted
-        || stream->pre_eof_preview_painted) return;
+    if (stream == NULL || stream->session == NULL || stream->parser == NULL)
+        return;
+    /* What arrived and where the reader is; the policy decides whether a
+       layout is worth spending and how deep (preview_policy.h). */
+    NavigationRetainedPreview *live = navigation_stream_live_preview(stream);
+    int viewport_height = stream->viewport.css_height;
+    int base_limit = viewport_height;
+    int lookahead = (int) ((int64_t) viewport_height
+        * stream->session->progressive_preview_lookahead_percent / 100);
+    base_limit = lookahead > INT_MAX - base_limit
+        ? INT_MAX : base_limit + lookahead;
+    PreviewPolicyInput policy_input = {
+        .parsed_bytes = stream->parsed_body_bytes,
+        .closed_content_elements = stream->closed_content_count,
+        .reader_y = stream->session->provisional_reader_y,
+        .viewport_height = viewport_height,
+        .base_limit_y = base_limit,
+        .live = live != NULL,
+        .live_truncated = live != NULL && live->truncated,
+        .live_content_end_y = live == NULL ? 0 : live->content_end_y,
+        .live_closed_elements = live == NULL ? 0 : live->closed_elements
+    };
+    preview_policy_observe(&stream->preview_policy, &policy_input);
+    PreviewDecision decision =
+        preview_policy_decide(&stream->preview_policy, &policy_input);
+    if (decision.action == PREVIEW_ACTION_NONE)
+        NAVIGATION_PREVIEW_SKIP(stream, decision.reason);
+    int previous_content_end = live == NULL ? 0 : live->content_end_y;
     NavigationSession *session = stream->session;
     PocDocument *document = &stream->parser->document;
     if (session->progressive_paint == NULL
@@ -191,10 +435,8 @@ static void navigation_stream_try_pre_eof_preview(
         || (session->page.loaded
             && !session->progressive_paint_preserves_incumbent)
         || document->html == NULL
-        || (!stream->head_closed && !stream->body_closed)
-        || stream->preview_checkpoint_checks
-             >= NAVIGATION_STREAM_PREVIEW_MAXIMUM_CHECKS) {
-        return;
+        || (!stream->head_closed && !stream->body_closed)) {
+        NAVIGATION_PREVIEW_SKIP(stream, "gate");
     }
     lxb_dom_node_t *body = document_body_node(document);
     if (body == NULL || body->first_child == NULL
@@ -202,18 +444,24 @@ static void navigation_stream_try_pre_eof_preview(
                 < NAVIGATION_STREAM_PREVIEW_MINIMUM_BYTES
             && stream->closed_element_count
                 < NAVIGATION_STREAM_PREVIEW_MINIMUM_NODES)) {
-        return;
+        NAVIGATION_PREVIEW_SKIP(stream, "prefix");
     }
     /* The preload scanner starts render-blocking transfers as soon as their
        tags arrive. Do not synchronously construct or refresh the stylesheet,
        however, until a useful body prefix can actually be painted. A small
        prefix may otherwise spend seconds parsing CSS, consume the one
        refresh attempt, and still have no viewport to present. */
+    /* A <style> element the parser is still inside has only part of its
+       text: compiling or fingerprinting it now would bake a truncated sheet
+       into the checkpoint, and every later continuation would then fail
+       its unchanged-prefix proof. Wait for the next feed. */
+    if (navigation_stream_style_element_open(document))
+        NAVIGATION_PREVIEW_SKIP(stream, "style-open");
     uint64_t fingerprint = 0;
     if (!navigation_stream_stylesheet_fingerprint(
             stream, document, &fingerprint)) {
         session->performance.streaming_preview_style_mismatches++;
-        return;
+        NAVIGATION_PREVIEW_REFUSE(stream, &decision, "fingerprint");
     }
     bool stylesheet_current =
         stream->blocking_stylesheet_ready
@@ -224,51 +472,65 @@ static void navigation_stream_try_pre_eof_preview(
             && stream->blocking_stylesheet_fingerprint_valid) {
             session->performance.streaming_preview_style_mismatches++;
         }
-        if (stream->pre_eof_preview_style_refresh_attempted) return;
-        stream->pre_eof_preview_style_refresh_attempted = true;
-        session->performance.streaming_preview_style_refresh_attempts++;
-        const size_t refresh_estimate = 1u * 1024u * 1024u;
-        const size_t refresh_reserve = 1u * 1024u * 1024u;
-        if (budget_pressure_required(
-                session->budget, refresh_estimate, refresh_reserve)) {
-            session->performance.streaming_preview_pressure_skips++;
-            budget_record_pressure(
-                session->budget, BUDGET_PRESSURE_SPECULATION,
-                refresh_estimate, 0);
-            return;
-        }
-        uint64_t refresh_started = navigation_now_us();
-        bool refreshed = navigation_stream_try_continue_stylesheet(
-            stream, document, fingerprint);
-        if (!refreshed) {
-            long preview_timeout_ms = session->resource_timeout_ms;
-            if (preview_timeout_ms
-                > NAVIGATION_SPECULATIVE_RESOURCE_TIMEOUT_MS) {
-                preview_timeout_ms =
-                    NAVIGATION_SPECULATIVE_RESOURCE_TIMEOUT_MS;
+        if (stream->pre_eof_preview_style_refresh_attempted) {
+            /* The full rebuild is spent, but a later attempt can still
+               append the style and link elements that followed the
+               compiled inputs (per-template body styles); that keeps a
+               refreshed preview styled like the first one. */
+            if (!navigation_stream_try_continue_stylesheet(
+                    stream, document, fingerprint))
+                NAVIGATION_PREVIEW_REFUSE(stream, &decision, "continue");
+        } else {
+            stream->pre_eof_preview_style_refresh_attempted = true;
+            session->performance.streaming_preview_style_refresh_attempts++;
+            const size_t refresh_estimate = 1u * 1024u * 1024u;
+            const size_t refresh_reserve = 1u * 1024u * 1024u;
+            if (budget_pressure_required(
+                    session->budget, refresh_estimate, refresh_reserve)) {
+                session->performance.streaming_preview_pressure_skips++;
+                budget_record_pressure(
+                    session->budget, BUDGET_PRESSURE_SPECULATION,
+                    refresh_estimate, 0);
+                NAVIGATION_PREVIEW_REFUSE(
+                    stream, &decision, "style-pressure");
             }
-            refreshed =
-                navigation_stream_build_blocking_stylesheet_with_timeout(
-                    stream, document, fingerprint, preview_timeout_ms);
+            uint64_t refresh_started = navigation_now_us();
+            tilefinch_platform_trace_step("preview-style-continue");
+            bool refreshed = navigation_stream_try_continue_stylesheet(
+                stream, document, fingerprint);
+            if (!refreshed) {
+                long preview_timeout_ms = session->resource_timeout_ms;
+                if (preview_timeout_ms
+                    > NAVIGATION_SPECULATIVE_RESOURCE_TIMEOUT_MS) {
+                    preview_timeout_ms =
+                        NAVIGATION_SPECULATIVE_RESOURCE_TIMEOUT_MS;
+                }
+                tilefinch_platform_trace_step("preview-style-build");
+                refreshed =
+                    navigation_stream_build_blocking_stylesheet_with_timeout(
+                        stream, document, fingerprint, preview_timeout_ms);
+            }
+            uint64_t refresh_elapsed = navigation_elapsed_us(
+                refresh_started, navigation_now_us());
+            session->performance.streaming_preview_style_refresh_us +=
+                refresh_elapsed;
+            /* A discovery pass can complete while individual external sheets
+               remain transiently unavailable.  Such a sheet is valid for the
+               parser's eventual bounded retry, but it is not a visually safe
+               provisional checkpoint: painting it would flash an unstyled
+               document. */
+            if (!refreshed
+                || !navigation_stream_preview_stylesheet_ready(stream)) {
+                session->performance.streaming_preview_style_refresh_failures++;
+                NAVIGATION_PREVIEW_REFUSE(
+                    stream, &decision, "style-refresh");
+            }
+            session->performance.streaming_preview_style_refreshes++;
         }
-        uint64_t refresh_elapsed = navigation_elapsed_us(
-            refresh_started, navigation_now_us());
-        session->performance.streaming_preview_style_refresh_us +=
-            refresh_elapsed;
-        /* A discovery pass can complete while individual external sheets
-           remain transiently unavailable.  Such a sheet is valid for the
-           parser's eventual bounded retry, but it is not a visually safe
-           provisional checkpoint: painting it would flash an unstyled
-           document. */
-        if (!refreshed
-            || !navigation_stream_preview_stylesheet_ready(stream)) {
-            session->performance.streaming_preview_style_refresh_failures++;
-            return;
-        }
-        session->performance.streaming_preview_style_refreshes++;
     }
     bool partial_stylesheets = stream->blocking_stylesheets.failed != 0;
-    if (!navigation_stream_preview_stylesheet_ready(stream)) return;
+    if (!navigation_stream_preview_stylesheet_ready(stream))
+        NAVIGATION_PREVIEW_REFUSE(stream, &decision, "style-ready");
 
     size_t visibility_nodes = 0;
     session->performance.streaming_preview_visibility_checks++;
@@ -284,15 +546,16 @@ static void navigation_stream_try_pre_eof_preview(
     }
     if (!may_have_visible_pixels) {
         session->performance.streaming_preview_visibility_skips++;
-        return;
+        NAVIGATION_PREVIEW_REFUSE(stream, &decision, "visibility");
     }
 
-    stream->preview_checkpoint_checks++;
+    preview_policy_note_check(&stream->preview_policy, &decision);
     session->performance.streaming_preview_checks++;
 
     size_t preview_node_count = 0;
     if (!navigation_stream_preview_node_count(
-            document, &preview_node_count)) return;
+            document, &preview_node_count))
+        NAVIGATION_PREVIEW_REFUSE(stream, &decision, "node-count");
     size_t estimate =
         navigation_progressive_preview_estimate_nodes(preview_node_count);
     const size_t maximum_speculation = 4u * 1024u * 1024u;
@@ -303,8 +566,8 @@ static void navigation_stream_try_pre_eof_preview(
         session->performance.streaming_preview_pressure_skips++;
         budget_record_pressure(
             session->budget, BUDGET_PRESSURE_SPECULATION, estimate, 0);
-        stream->pre_eof_preview_attempted = true;
-        return;
+        preview_policy_abandon(&stream->preview_policy);
+        NAVIGATION_PREVIEW_SKIP(stream, "estimate");
     }
 
     if (stream->preview_layout_reuse == NULL
@@ -314,7 +577,8 @@ static void navigation_stream_try_pre_eof_preview(
         stream->preview_layout_reuse =
             layout_reuse_cache_create(session->budget);
     }
-    stream->pre_eof_preview_attempted = true;
+    preview_policy_attempt_started(
+        &stream->preview_policy, &decision, stream->parsed_body_bytes);
     session->performance.streaming_preview_attempts++;
     uint64_t attempt_now = navigation_now_us();
     uint64_t attempt_relative =
@@ -328,13 +592,7 @@ static void navigation_stream_try_pre_eof_preview(
     session->performance.streaming_preview_last_attempt_us =
         attempt_relative;
     session->performance.progressive_layout_attempts++;
-    int preview_limit = stream->viewport.css_height;
-    unsigned lookahead_percent =
-        session->progressive_preview_lookahead_percent;
-    int lookahead = (int) (
-        (int64_t) preview_limit * lookahead_percent / 100);
-    if (lookahead > INT_MAX - preview_limit) preview_limit = INT_MAX;
-    else preview_limit += lookahead;
+    int preview_limit = decision.limit_y;
     session->performance.progressive_preview_y_limit = preview_limit;
 
     LayoutDocument preview = {0};
@@ -361,6 +619,7 @@ static void navigation_stream_try_pre_eof_preview(
         stream->preview_layout_reuse, &reuse_before);
     bool truncated = false;
     uint64_t layout_started = navigation_now_us();
+    tilefinch_platform_trace_step("preview-layout");
     bool built = layout_build_context_preview(
         &preview, session->budget, document,
         &stream->blocking_stylesheet, stream->fonts, stream->images,
@@ -380,6 +639,7 @@ static void navigation_stream_try_pre_eof_preview(
         session, &reuse_before, &reuse_after);
     if (!built) {
         session->performance.progressive_layout_failures++;
+        preview_policy_failed(&stream->preview_policy);
         layout_destroy(&preview);
         return;
     }
@@ -463,7 +723,7 @@ static void navigation_stream_try_pre_eof_preview(
             &preview, stream->viewport.css_width,
             stream->viewport.css_height)) {
         session->performance.streaming_preview_empty_raster_skips++;
-        stream->pre_eof_preview_attempted = false;
+        preview_policy_failed(&stream->preview_policy);
         layout_destroy(&preview);
         return;
     }
@@ -492,15 +752,48 @@ static void navigation_stream_try_pre_eof_preview(
             navigation_now_us() - session->navigation_started_us;
     }
 
+    /* Paint the preview from the slot it will be kept in, so the painter
+       may hold on to it; the live one stays intact until this one is on
+       screen. Rows below its content are placeholder, with two screens of
+       them to scroll into while the next preview is laid out. */
+    NavigationRetainedPreview *slot =
+        &stream->previews[live == &stream->previews[0] ? 1 : 0];
+    navigation_retained_preview_clear(session, slot);
+    slot->layout = preview;
+    memset(&preview, 0, sizeof(preview));
+    LayoutDocument *painted_layout = &slot->layout;
+    slot->content_end_y =
+        painted_layout->height > 0 ? painted_layout->height : 1;
+    slot->truncated = truncated;
+    slot->closed_elements = stream->closed_content_count;
+    painted_layout->content_limit_y = slot->content_end_y;
+    if (slot->content_end_y
+            <= INT_MAX - 2 * stream->viewport.css_height)
+        painted_layout->height =
+            slot->content_end_y + 2 * stream->viewport.css_height;
+    tilefinch_platform_trace_step("preview-retain");
+    bool retains = navigation_retained_preview_detach(
+        session, slot, stream->images);
     uint64_t paint_started = navigation_now_us();
+    session->progressive_paint_retains = retains;
     bool painted = session->progressive_paint(
-        session->progressive_paint_opaque, session, &preview);
+        session->progressive_paint_opaque, session, painted_layout);
+    session->progressive_paint_retains = false;
     uint64_t paint_elapsed = navigation_record_slice(
-        session, NAVIGATION_SLICE_PAINT, paint_started, preview.count);
+        session, NAVIGATION_SLICE_PAINT, paint_started,
+        painted_layout->count);
     session->performance.progressive_paint_us += paint_elapsed;
     session->performance.streaming_preview_paint_us += paint_elapsed;
     if (painted) {
-        stream->pre_eof_preview_painted = true;
+        PreviewPaintResult result = {
+            .retained = retains,
+            .content_end_y = slot->content_end_y,
+            .truncated = truncated,
+            .first_screen_filled = navigation_preview_first_screen_filled(
+                painted_layout, stream->viewport.css_height)
+        };
+        preview_policy_painted(&stream->preview_policy, &decision, &result,
+                               previous_content_end);
         session->performance.streaming_preview_paints++;
         session->performance.partial_paints++;
         if (partial_stylesheets) {
@@ -516,10 +809,37 @@ static void navigation_stream_try_pre_eof_preview(
         /* The compositor can decline a structurally valid preview when its
            current viewport is still visually empty. Keep the immutable
            stylesheet checkpoint, but allow a later response prefix to make
-           one more bounded layout/raster attempt. preview_checkpoint_checks
-           remains the hard retry ceiling. */
-        stream->pre_eof_preview_attempted = false;
+           one more bounded layout/raster attempt; the policy's check cap
+           bounds the retries. */
+        preview_policy_failed(&stream->preview_policy);
     }
-    layout_destroy(&preview);
-    (void) truncated;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "tilefinch-preview-paint: at=%llums action=%s phase=%d "
+                 "retains=%d painted=%d limit=%d end=%d truncated=%d "
+                 "reader=%d bytes=%zu layout=%lluus paint=%lluus",
+                 (unsigned long long) (session->navigation_started_us != 0
+                     ? (navigation_now_us() - session->navigation_started_us)
+                           / 1000u : 0u),
+                 decision.action == PREVIEW_ACTION_EXTEND ? "extend"
+                     : decision.action == PREVIEW_ACTION_REFRESH ? "refresh"
+                     : "first",
+                 (int) stream->preview_policy.phase,
+                 retains ? 1 : 0,
+                 painted ? 1 : 0, preview_limit, slot->content_end_y,
+                 truncated ? 1 : 0, session->provisional_reader_y,
+                 stream->parsed_body_bytes,
+                 (unsigned long long) layout_elapsed,
+                 (unsigned long long) paint_elapsed);
+        tilefinch_platform_log_message(line);
+    }
+#endif
+    if (painted && retains) {
+        if (live != NULL) navigation_retained_preview_clear(session, live);
+        slot->live = true;
+    } else {
+        navigation_retained_preview_clear(session, slot);
+    }
 }

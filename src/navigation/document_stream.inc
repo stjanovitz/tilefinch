@@ -393,7 +393,7 @@ static void navigation_stream_preload_scan_tag(
         return;
     }
     if (closing && navigation_span_equal(name, name_length, "head")) {
-        stream->preload_scan_done = true;
+        stream->preload_scan = NAVIGATION_PRELOAD_SCAN_DONE;
         return;
     }
     if (closing) return;
@@ -446,7 +446,7 @@ static void navigation_stream_preload_scan_tag(
        script. Stop rather than speculating against an origin the real parser
        may never use. */
     if (navigation_span_equal(name, name_length, "base")) {
-        stream->preload_scan_disabled = true;
+        stream->preload_scan = NAVIGATION_PRELOAD_SCAN_DISABLED;
         return;
     }
     if (!navigation_span_equal(name, name_length, "link")) return;
@@ -482,52 +482,54 @@ static void navigation_stream_scan_style_preloads(
     NavigationDocumentStream *stream, const unsigned char *data,
     size_t length)
 {
-    if (stream == NULL || data == NULL || stream->preload_scan_done
-        || stream->preload_scan_disabled) return;
-    for (size_t i = 0; i < length && !stream->preload_scan_done
-         && !stream->preload_scan_disabled; i++) {
+    if (stream == NULL || data == NULL) return;
+    for (size_t i = 0; i < length; i++) {
+        NavigationPreloadScanState state = stream->preload_scan;
+        if (state == NAVIGATION_PRELOAD_SCAN_DONE
+            || state == NAVIGATION_PRELOAD_SCAN_DISABLED) return;
         char character = (char) data[i];
-        if (stream->preload_scan_in_comment) {
+        if (state == NAVIGATION_PRELOAD_SCAN_COMMENT) {
             if (character == '-') {
                 if (stream->preload_scan_tag_length < 2) {
                     stream->preload_scan_tag_length++;
                 }
             } else if (character == '>'
                        && stream->preload_scan_tag_length == 2) {
-                stream->preload_scan_in_comment = false;
+                stream->preload_scan = NAVIGATION_PRELOAD_SCAN_TEXT;
                 stream->preload_scan_tag_length = 0;
             } else {
                 stream->preload_scan_tag_length = 0;
             }
             continue;
         }
-        if (!stream->preload_scan_in_tag) {
+        if (state == NAVIGATION_PRELOAD_SCAN_TEXT) {
             if (character == '<') {
-                stream->preload_scan_in_tag = true;
+                stream->preload_scan = NAVIGATION_PRELOAD_SCAN_TAG;
                 stream->preload_scan_tag_length = 1;
                 stream->preload_scan_tag[0] = '<';
             }
             continue;
         }
-        if (stream->preload_scan_tag_length
-            == NAVIGATION_PRELOAD_SCAN_TAG_LIMIT) {
-            stream->preload_scan_tag_overflow = true;
-        } else {
-            stream->preload_scan_tag[
-                stream->preload_scan_tag_length++] = character;
+        if (state == NAVIGATION_PRELOAD_SCAN_TAG) {
+            if (stream->preload_scan_tag_length
+                == NAVIGATION_PRELOAD_SCAN_TAG_LIMIT) {
+                stream->preload_scan = NAVIGATION_PRELOAD_SCAN_TAG_OVERFLOW;
+            } else {
+                stream->preload_scan_tag[
+                    stream->preload_scan_tag_length++] = character;
+            }
         }
-        if (!stream->preload_scan_tag_overflow
+        if (stream->preload_scan == NAVIGATION_PRELOAD_SCAN_TAG
             && stream->preload_scan_tag_length == 4
             && memcmp(stream->preload_scan_tag, "<!--", 4) == 0) {
-            stream->preload_scan_in_comment = true;
-            stream->preload_scan_in_tag = false;
+            stream->preload_scan = NAVIGATION_PRELOAD_SCAN_COMMENT;
             stream->preload_scan_tag_length = 0;
             continue;
         }
         if (stream->preload_scan_raw_text != 0
             && stream->preload_scan_tag_length == 2
             && character != '/') {
-            stream->preload_scan_in_tag = false;
+            stream->preload_scan = NAVIGATION_PRELOAD_SCAN_TEXT;
             stream->preload_scan_tag_length = 0;
             continue;
         }
@@ -542,13 +544,13 @@ static void navigation_stream_scan_style_preloads(
             continue;
         }
         if (character != '>') continue;
-        if (stream->preload_scan_tag_overflow) {
-            stream->preload_scan_disabled = true;
+        if (stream->preload_scan == NAVIGATION_PRELOAD_SCAN_TAG_OVERFLOW) {
+            stream->preload_scan = NAVIGATION_PRELOAD_SCAN_DISABLED;
         } else {
+            /* Leave the tag first: reading it may end the scan. */
+            stream->preload_scan = NAVIGATION_PRELOAD_SCAN_TEXT;
             navigation_stream_preload_scan_tag(stream);
         }
-        stream->preload_scan_in_tag = false;
-        stream->preload_scan_tag_overflow = false;
         stream->preload_scan_tag_length = 0;
     }
 }
@@ -563,16 +565,8 @@ static const char *navigation_normalized_referrer_policy(
     }
     while (length != 0
            && navigation_ascii_whitespace(value[length - 1])) length--;
-    static const char *known[] = {
-        "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (strlen(known[i]) == length
-            && strncasecmp(value, known[i], length) == 0) return known[i];
-    }
-    return NULL;
+    uint8_t code = tilefinch_referrer_policy_code(value, length, true);
+    return code == 0 ? NULL : tilefinch_referrer_policy_name(code);
 }
 
 static bool navigation_scan_document_referrer_policy(
@@ -1067,6 +1061,7 @@ static void navigation_stream_settle_style_preloads(
     NavigationDocumentStream *stream)
 {
     if (stream == NULL || stream->scheduler == NULL) return;
+    size_t waits = 0;
     while (navigation_stream_active_style_preloads(stream) != 0) {
         navigation_stream_progress_preloads(stream, false);
         if (navigation_stream_active_style_preloads(stream) == 0) return;
@@ -1117,6 +1112,12 @@ static void navigation_stream_settle_style_preloads(
         (void) fetch_scheduler_pump_bounded(
             stream->scheduler, NAVIGATION_PRELOAD_CONCURRENCY, 10,
             &quota, &metrics);
+        /* This waits on the network, not on work of its own; a 1 s TLS
+           handshake for the page's CSS bundle otherwise freezes chrome and
+           cancel for as long. A cancelled wait leaves the preloads to the
+           ordered loader, which observes the same cancellation. */
+        if (!tilefinch_platform_cooperate(
+                "stylesheet-preload-wait", ++waits)) return;
     }
 }
 
@@ -1138,6 +1139,7 @@ static void navigation_stream_settle_script_preload(
             break;
         }
     }
+    size_t waits = 0;
     while (target != NULL && target->request_id != 0
            && !target->complete) {
         navigation_stream_progress_preloads(stream, false);
@@ -1176,6 +1178,8 @@ static void navigation_stream_settle_script_preload(
         (void) fetch_scheduler_pump_bounded(
             stream->scheduler, NAVIGATION_PRELOAD_CONCURRENCY, 10,
             &quota, &metrics);
+        if (!tilefinch_platform_cooperate(
+                "script-preload-wait", ++waits)) return;
     }
 }
 

@@ -12,6 +12,13 @@ static bool psp_app_update_trust_configured(
             && config != NULL && config->developer_update_url[0] != '\0');
 }
 
+bool psp_app_update_check_configured(const BrowserProfile *profile,
+                                     const PspBootConfig *config)
+{
+    return browser_profile_update_check_enabled(profile)
+        && psp_app_update_trust_configured(profile, config);
+}
+
 static bool psp_app_boot_override_path(
     const TilefinchInstallPaths *paths, char *output, size_t capacity)
 {
@@ -262,14 +269,10 @@ bool psp_app_edit_developer_update_url(
             &app->browser->profile_store, frame->ui_sample_us);
         psp_update_session_destroy(&app->browser->update_session);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-        if (app->update_check_running != NULL)
-            *app->update_check_running = false;
-        if (app->update_check_pending != NULL)
-            *app->update_check_pending =
-                browser_profile_update_check_enabled(app->browser->profile)
-                && strcmp(app->process->config.trace, "none") == 0
-                && psp_app_update_trust_configured(
-                       app->browser->profile, &app->process->config);
+        psp_update_check_reset(
+            app->update_check, psp_app_update_check_configured(
+                                   app->browser->profile,
+                                   &app->process->config));
 #endif
     }
     printf("tilefinch-update-config: source=in-app configured=%d\n",
@@ -436,6 +439,7 @@ void psp_app_apply_setting(
     const char *content_blocker_path = app->process->storage.content_blocker;
     const char *local_storage_path = app->process->storage.local_storage;
     const char *persistent_cache_path = app->process->storage.persistent_cache;
+    if (psp_app_site_storage_setting(app, frame, intent)) return;
     if (intent->setting.id == PSP_UI_SETTING_NETWORK_PROFILE) {
         unsigned operation = intent->setting.value.unsigned_value;
         int saved = (int) app->process->config.network_profile;
@@ -679,10 +683,10 @@ void psp_app_apply_setting(
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
         /* Re-arm or disarm this boot's deferred check; a check
            already in flight simply completes. */
-        (*app->update_check_pending) = enabled
-            && !(*app->update_check_running)
-            && strcmp(app->process->config.trace, "none") == 0
-            && psp_app_update_trust_configured(profile, &app->process->config);
+        psp_update_check_rearm(
+            app->update_check,
+            enabled && psp_app_update_check_configured(
+                           profile, &app->process->config));
 #endif
         psp_ui_show_status(
             &app->process->presentation.ui, enabled
@@ -700,11 +704,9 @@ void psp_app_apply_setting(
         psp_profile_store_mark_dirty(
             &app->browser->profile_store, frame->ui_sample_us);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-        (*app->update_check_pending) =
-            !(*app->update_check_running)
-            && browser_profile_update_check_enabled(profile)
-            && strcmp(app->process->config.trace, "none") == 0
-            && psp_app_update_trust_configured(profile, &app->process->config);
+        psp_update_check_rearm(
+            app->update_check,
+            psp_app_update_check_configured(profile, &app->process->config));
 #endif
         psp_ui_show_status(
             &app->process->presentation.ui,
@@ -1561,8 +1563,8 @@ void psp_app_apply_setting(
         } else {
             psp_ui_show_status(
                 &app->process->presentation.ui, persist
-                    ? "LOCAL STORAGE SAVES ON EXIT"
-                    : "LOCAL STORAGE STAYS IN THIS SESSION",
+                    ? "RAM STORAGE SAVED AT EXIT"
+                    : "RAM STORAGE NOT SAVED AT EXIT",
             240);
         }
     }

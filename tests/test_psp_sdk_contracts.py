@@ -409,13 +409,17 @@ class PspSdkContractTests(unittest.TestCase):
             manifest)
         session = (ROOT / "include/tilefinch/session.h").read_text(
             encoding="utf-8")
-        self.assertIn("#define BROWSER_STORAGE_ENTRIES 64", session)
+        self.assertIn(
+            "#define BROWSER_SITE_STORAGE_INITIAL_BYTES (32u * 1024u)",
+            session)
+        self.assertIn(
+            "#define BROWSER_SITE_STORAGE_MEMORY_TOTAL_BYTES (1024u * 1024u)",
+            session)
+        self.assertIn(
+            "#define BROWSER_SITE_STORAGE_STICK_SITE_BYTES "
+            "(4u * 1024u * 1024u)", session)
         self.assertIn("#define BROWSER_OFFLINE_CACHE_ENTRY_LIMIT 32u",
                       session)
-        session_source = (ROOT / "src/session.c").read_text(
-            encoding="utf-8")
-        self.assertIn("#define DEFAULT_STORAGE_BYTES (16u * 1024u)",
-                      session_source)
 
         docs_map = (ROOT / "docs/README.md").read_text(encoding="utf-8")
         guide = (ROOT / "docs/GAME_PROFILE.md").read_text(encoding="utf-8")
@@ -499,6 +503,31 @@ class PspSdkContractTests(unittest.TestCase):
             (ROOT / "src/js_webgl_bridge.c").read_text(encoding="utf-8"))
         self.assertNotIn("tilefinch_platform_cooperate(", webgl)
         self.assertIn("sceGuSync(0, 0)", webgl)
+
+    def test_webgl_ge_target_semantics_match_webgl(self):
+        # Both found only on a PSP-3000: PPSSPP and the host software path
+        # passed. sceGuClear builds its fill from the format sceGuDrawBuffer
+        # records (sceGuDrawBufferList records none), so an 8888 WebGL target
+        # set with the list form cleared alpha to 0x80. And sceGuViewport's
+        # negative y scale reverses winding, so WebGL's front face maps to
+        # the opposite GE order.
+        webgl = without_comments(
+            (ROOT / "src/js_webgl_bridge.c").read_text(encoding="utf-8"))
+        self.assertIn("sceGuDrawBuffer(GU_PSM_8888,", webgl)
+        self.assertNotIn("sceGuDrawBufferList(GU_PSM_8888", webgl)
+        self.assertIn("sceGuFrontFace(keep_clockwise ? GU_CCW : GU_CW)", webgl)
+        # GU_TRANSFORM_3D texture coordinates are normalized to the padded
+        # buffer; texel-unit coordinates clamped every sample to one texel.
+        # Rows are at least 16 bytes wide, or the GE samples nothing.
+        self.assertIn("sceGuTexScale(\n                (float) texture->width", webgl)
+        self.assertNotIn("draw_vertices[i].u *= (float) texture->width", webgl)
+        self.assertIn("return stride < 4u ? 4u : stride;", webgl)
+        # Every PSP thread that runs float code masks FPU exception traps.
+        for path in ("src/psp_script_main.c", "src/psp_main.c",
+                     "src/image_decode.c", "src/game_audio.c",
+                     "src/psp_voice_input.c"):
+            self.assertIn("psp_fpu_mask_exceptions();",
+                          (ROOT / path).read_text(encoding="utf-8"), path)
 
     def test_home_exit_returns_callback_thread_to_the_busy_supervisor(self):
         runtime = without_comments(
@@ -623,6 +652,46 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("PSP_HEAP_SIZE_KB(64)", native)
         self.assertLess(native.index("__libcglue_deinit();"),
                         native.index("sceKernelSelfStopUnloadModule(1, 0, NULL)"))
+
+    def test_psplink_report_wait_requires_new_terminal_result(self):
+        waiter = ROOT / "scripts/psplink-await-report.sh"
+        deploy = (ROOT / "scripts/psplink-device.sh").read_text()
+        self.assertIn('"$ROOT/scripts/psplink-await-report.sh"', deploy)
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "tilefinch-validation.txt"
+            report.write_text(
+                "tilefinch-validation: outcome=clean-exit\n"
+                "tilefinch-log: finish outcome=clean-exit healthy=1\n")
+            old_inode = str(report.stat().st_ino)
+
+            def wait(require_script):
+                return subprocess.run(
+                    [str(waiter), str(report), old_inode, "1",
+                     str(require_script)], capture_output=True, text=True)
+
+            self.assertNotEqual(wait(0).returncode, 0,
+                                "a prior run must not satisfy this run")
+            report.rename(Path(temporary) / "tilefinch-validation.previous.txt")
+            report.write_text(
+                "tilefinch-checkpoint: phase=interactive "
+                "name=interactive-ready\n")
+            self.assertNotEqual(wait(0).returncode, 0,
+                                "an in-progress report must not count as a pass")
+            report.write_text(
+                "tilefinch-validation: outcome=clean-exit\n"
+                "tilefinch-log: finish outcome=clean-exit healthy=1\n")
+            self.assertEqual(wait(0).returncode, 0)
+            self.assertNotEqual(wait(1).returncode, 0,
+                                "a clean exit alone is not a completed script")
+            report.write_text(
+                "tilefinch-input-script: outcome=complete steps=4/5\n"
+                "tilefinch-validation: outcome=clean-exit\n"
+                "tilefinch-log: finish outcome=clean-exit healthy=1\n")
+            self.assertEqual(wait(1).returncode, 0)
+            report.write_text(
+                "tilefinch-validation: outcome=halted\n"
+                "tilefinch-log: finish outcome=halted healthy=1\n")
+            self.assertNotEqual(wait(0).returncode, 0)
 
     def test_psplink_slot_stages_matching_components_before_eboot(self):
         stage = ROOT / "scripts/stage-psplink-slot.sh"
@@ -1512,18 +1581,30 @@ class PspSdkContractTests(unittest.TestCase):
             r"REFUSE_IF\(FRAME_FACT_MEDIA_PLAYBACK,\s*"
             r"browser->media\.playback != NULL\)")
         updater = main[
-            main.index("if (update_check_pending"):
+            main.index("if (psp_update_check_armed(&update_check)"):
             main.index("PspUiIntent intent =")]
         self.assertIn(
             "psp_media_reclaim_hidden_pipeline(&browser->media)", updater)
+        # The native home screen is the default landing and is idle, so
+        # the weekly check must not wait for a page to be opened.
+        self.assertIn(
+            "process->presentation.ui.screen == PSP_UI_SCREEN_HOME", updater)
+        # A launch that can never apply an update logs why instead of
+        # silently spending the one-shot, and never reclaims media first.
+        unslotted = updater.index("tilefinch-update-check: skipped=unslotted")
+        self.assertLess(
+            unslotted,
+            updater.index("psp_media_reclaim_hidden_pipeline(&browser->media)"))
+        self.assertIn("tilefinch-update-check: skipped=unavailable", updater)
 
     def test_offline_startup_does_not_wake_network_background_work(self):
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         update = main[
             main.index("bool background_network_allowed ="):
-            main.index("bool update_check_running = false;")]
+            main.index("psp_app_update_check_configured(browser->profile")]
         self.assertIn("!offline_startup", update)
+        self.assertIn("psp_update_check_init(", update)
         self.assertIn("background_network_allowed", update)
         warmup = main[
             main.index("tilefinch-network-warmup: status=started") - 1000:
@@ -1539,6 +1620,39 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("if (native_home_boot) {"):
             main.index("psp_validation_cancel_after_ms = 0;")]
         self.assertIn("psp_offline_store_handle_url(", initial_load)
+
+    def test_update_check_arms_only_through_its_state_machine(self):
+        # The background update check's state lives in PspUpdateCheck
+        # (host-tested in test_psp_update_check.c). Boot latches the boot
+        # facts (offline start, trace, validation-driven updates) there
+        # once, and every later arm passes only the settings half of
+        # eligibility, so no arm site can drop the boot facts again.
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        boot = main[
+            main.index("psp_update_check_init("):
+            main.index("psp_app_update_check_configured(browser->profile")]
+        self.assertIn("background_network_allowed", boot)
+        self.assertIn("validation_update_auto == 0", boot)
+        self.assertIn(".update_check = &update_check", main)
+        settings = without_comments(
+            (ROOT / "src/psp_app/psp_app_settings.c").read_text(
+                encoding="utf-8"))
+        portal = without_comments(
+            (ROOT / "src/psp_app/psp_app_captive_portal.c").read_text(
+                encoding="utf-8"))
+        for source in (main, settings, portal):
+            # The retired pointer/flag spellings must not come back.
+            self.assertNotIn("update_check_pending", source)
+            self.assertNotIn("update_background_allowed", source)
+        arms = re.findall(
+            r"psp_update_check_(?:rearm|reset)\(([^;]*)\);",
+            main + settings)
+        self.assertEqual(len(arms), 4)
+        for arm in arms:
+            self.assertIn("psp_app_update_check_configured(", arm)
+        self.assertIn("psp_update_check_pause(", portal)
+        self.assertIn("psp_update_check_resume(", portal)
 
     def test_quarantined_media_retry_stops_before_resolution(self):
         source = without_comments(
@@ -2409,7 +2523,9 @@ class PspSdkContractTests(unittest.TestCase):
         shadow_prime = source[
             source.index(
                 "static void psp_media_complete_priming_if_ready("):
-            source.index("#else\nvoid psp_media_session_checkpoint")]
+            source.index("static void psp_media_dispatch(",
+                         source.index(
+                             "static void psp_media_complete_priming_if_ready("))]
         self.assertIn("!media->have_frame", shadow_prime)
         self.assertIn("media->pause_boundary_pending", shadow_prime)
         self.assertIn("presentation_preroll_displayed_baseline", shadow_prime)
@@ -2418,6 +2534,12 @@ class PspSdkContractTests(unittest.TestCase):
             shadow_prime.index("PSP_MEDIA_EVENT_PRIME_READY"),
             shadow_prime.index(
                 "psp_media_release_presentation_preroll(media, true)"))
+        self.assertEqual(
+            1, source.count(
+                "static void psp_media_complete_priming_if_ready("))
+        self.assertEqual(
+            1, source.count("void psp_media_finish_synchronous_quiesce("))
+        self.assertEqual(1, source.count("static void psp_media_dispatch_one("))
 
     def test_audio_clock_does_not_count_firmware_queue_as_heard(self):
         """The PSP accepts a deep startup queue. Audible time follows elapsed
@@ -2797,6 +2919,25 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("fetch_scheduler_pump(", pump)
         self.assertNotIn("curl_", pump)
 
+    def test_page_media_probe_preserves_prepared_request_policy(self):
+        """Declared page media carries cookies, Range, referrer, CORS and
+        private-network authority.  The raw fixed-media enqueue deliberately
+        accepts none of those, so the probe must retain its prepared request
+        in a scheduler and delegate only authorized hops to the PSP worker."""
+        source = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        probe = source[
+            source.index("static PspPageMediaProbeStatus psp_media_page_probe("):
+            source.index("static void psp_media_page_track_metadata(")]
+        self.assertIn("fetch_prepare_page_request_context(", probe)
+        self.assertIn("fetch_scheduler_create(", probe)
+        self.assertIn("fetch_scheduler_enable_background_transport(", probe)
+        self.assertIn("fetch_scheduler_enqueue(", probe)
+        self.assertIn("fetch_scheduler_request_progress(", probe)
+        self.assertIn("fetch_scheduler_take(", probe)
+        self.assertNotIn(
+            "fetch_background_transport_enqueue_media_diagnosed(", probe)
+
     def test_native_media_ranges_use_compact_response_metadata(self):
         """A page FetchResult carries bounded CSP, client-hint, header and
         cookie state and is about 14 KiB on the 32-bit target. Media ranges
@@ -2884,6 +3025,20 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn(
             "fetch_background_ensure_stream_capacity()", source,
             "stream buffers must grow only when a real response is admitted")
+        fixed_enqueue = source[
+            source.index(
+                "static uint64_t fetch_background_transport_enqueue_fixed_internal("):
+            source.index(
+                "uint64_t fetch_background_transport_enqueue(")]
+        self.assertIn("fetch_background_ensure_fixed_capacity()", fixed_enqueue)
+        self.assertLess(
+            fixed_enqueue.index("FETCH_BACKGROUND_SLOT_PREPARING"),
+            fixed_enqueue.index("fetch_background_ensure_fixed_capacity()"),
+            "a rejected URL or saturated slot must not allocate 256 KiB slabs")
+        self.assertIn(
+            "slot->private_network.required = request->block_private_network",
+            fixed_enqueue)
+        self.assertIn("slot->private_network.blocked = false", fixed_enqueue)
         preconnect = without_comments(
             (ROOT / "src/fetch/preconnect.inc").read_text(encoding="utf-8"))
         self.assertIn("CURLOPT_NOBODY, 1L", preconnect)
@@ -6980,12 +7135,11 @@ class PspSdkContractTests(unittest.TestCase):
             actions.index("static bool psp_app_resolve_recovery_return_action("):
             actions.index("void psp_app_dispatch_action(")]
         self.assertIn("PSP_UI_ACTION_RECOVERY_RETURN", resolver)
-        self.assertIn("lifecycle_retry_return_back", resolver)
-        self.assertIn("lifecycle_retry_return_forward", resolver)
-        self.assertIn("lifecycle_retry_return_home", resolver)
+        self.assertIn("PSP_RECOVERY_OFFER_RETURN_BACK", resolver)
+        self.assertIn("PSP_RECOVERY_OFFER_RETURN_FORWARD", resolver)
         self.assertIn("PSP_UI_ACTION_FORWARD : PSP_UI_ACTION_BACK", resolver)
         self.assertIn(
-            "lifecycle_retry_available = false", resolver)
+            "recovery_offer = PSP_RECOVERY_OFFER_NONE", resolver)
         heavy = actions[
             actions.index("static void psp_app_dispatch_heavy_action("):
             actions.index("case PSP_UI_ACTION_TOGGLE_BOOKMARK:")]
@@ -7004,7 +7158,7 @@ class PspSdkContractTests(unittest.TestCase):
                       back_branch[local_fragment:])
         self.assertLess(local_fragment,
                         back_branch.index(
-                            "psp_ensure_network_for_navigation(",
+                            "psp_action_network_ready(",
                             local_fragment))
         self.assertLess(local_fragment,
                         back_branch.index("psp_ui_set_loading(",
@@ -7018,8 +7172,8 @@ class PspSdkContractTests(unittest.TestCase):
             heavy.index("case PSP_UI_ACTION_RECOVERY_READER:")]
         self.assertIn("RETURNED TO LAST USABLE PAGE", ordinary_return)
         self.assertIn(
-            "lifecycle_retry_return_back = false", ordinary_return)
-        self.assertIn("lifecycle_retry_return_home", ordinary_return)
+            "recovery_offer = PSP_RECOVERY_OFFER_NONE", ordinary_return)
+        self.assertIn("PSP_RECOVERY_OFFER_RETURN_HOME", ordinary_return)
         self.assertIn("psp_show_native_home(app)", ordinary_return)
         disable = heavy[heavy.index(
             "case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:"):
@@ -7033,8 +7187,8 @@ class PspSdkContractTests(unittest.TestCase):
                        "psp_navigation_present_failure("):
             main.index("static TILEFINCH_COLD_PATH bool "
                        "psp_handle_update_version_intent(")]
-        self.assertIn("lifecycle_retry_return_back = false", ordinary_failure)
-        self.assertIn("lifecycle_retry_return_forward = false", ordinary_failure)
+        self.assertIn("psp_recovery_offer_without_return(", ordinary_failure)
+        self.assertIn("PSP_RECOVERY_OFFER_OVER_INCUMBENT", ordinary_failure)
         blank_recovery = main[
             main.index("static TILEFINCH_OUT_OF_LINE void "
                        "psp_apply_reader_after_navigation_dirty("):
@@ -7050,7 +7204,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("BROWSER_NAVIGATION_RETURN_BACK", unavailable)
         self.assertIn("BROWSER_NAVIGATION_RETURN_FORWARD", unavailable)
         self.assertIn("BROWSER_NAVIGATION_RETURN_NONE", unavailable)
-        self.assertIn("lifecycle_retry_return_home", unavailable)
+        self.assertIn("PSP_RECOVERY_OFFER_RETURN_HOME", unavailable)
         self.assertIn("BROWSER_BLANK_READER_RECOVERY_DEFERRED", blank_recovery)
         basic_prepare = blank_recovery.index(
             "browser_engine_prepare_basic_view_recovery")

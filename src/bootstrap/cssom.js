@@ -1086,7 +1086,17 @@
     let cssomFallback = null;
     const authoredStyle = () =>
         __tilefinchGetAttribute(handle, "style") || "",
+      /* Only a custom element observes its style attribute. Others need
+         no before/after snapshot, which costs two attribute reads per
+         write; undefined marks "not observed" for notifyStyle. */
+      observedStyle = () =>
+        globalThis.__tilefinchCustomElementAttributeChanged &&
+        globalThis.__tilefinchWrap?.(handle)
+          ?.__tilefinchCustomElementState === "custom"
+          ? authoredStyle()
+          : undefined,
       notifyStyle = (oldValue) => {
+        if (oldValue === undefined) return;
         const newValue = authoredStyle();
         if (newValue === oldValue) return;
         globalThis.__tilefinchCustomElementAttributeChanged?.(
@@ -1132,10 +1142,14 @@
         /* Tilefinch currently retains transition timing from inline style.
            Avoid computing the property's old value on the overwhelmingly
            common path where this element has no transition declaration. */
+        /* Inline transition declarations live in the style attribute, so
+           one read and a case-insensitive scan rule them out before the two
+           declaration lookups. */
         const transitionHint =
-          __tilefinchStyleGet(handle, "transition-duration") ||
+          (/transition/i.test(authoredStyle()) &&
+            (__tilefinchStyleGet(handle, "transition-duration") ||
+              __tilefinchStyleGet(handle, "transition"))) ||
           cssomFallback?.get("transition-duration") ||
-          __tilefinchStyleGet(handle, "transition") ||
           cssomFallback?.get("transition");
         if (!transitionHint) return writeRaw(name, value);
         const node = globalThis.__tilefinchWrap?.(handle),
@@ -1202,14 +1216,14 @@
         return authoredStyle();
       },
       set cssText(value) {
-        const oldValue = authoredStyle();
+        const oldValue = observedStyle();
         value = String(value);
         __tilefinchSetAttribute(handle, "style", value);
         globalThis.__tilefinchQueueFocusFixup?.();
         notifyStyle(oldValue);
       },
       setProperty(name, value, priority = "") {
-        const oldValue = authoredStyle();
+        const oldValue = observedStyle();
         try {
         name = cssName(name);
         if (name === "--") return false;
@@ -1315,7 +1329,7 @@
         return match ? "important" : "";
       },
       removeProperty(name) {
-        const oldStyle = authoredStyle();
+        const oldStyle = observedStyle();
         name = cssName(name);
         const old = this.getPropertyValue(name);
         if (name === "flex") clearFlex();

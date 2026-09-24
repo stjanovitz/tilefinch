@@ -153,10 +153,18 @@ typedef struct {
 #define DOM_BRIDGE_NODE_INDEX_MASK SCRIPT_DOM_HANDLE_INDEX_MASK
 #define DOM_BRIDGE_NODE_GENERATION_MAX \
     ((uint32_t) (INT32_MAX >> DOM_BRIDGE_NODE_INDEX_BITS))
+/* Open-addressed pointer -> slot index; twice the slot count keeps the load
+   factor at or below one half. Entries are slot + 1, so zero is empty. */
+#define DOM_BRIDGE_NODE_INDEX_CAPACITY (2u * DOM_BRIDGE_NODE_LIMIT)
 #define SCRIPT_SOURCE_NODE_LIMIT 256
 
 _Static_assert(DOM_BRIDGE_NODE_LIMIT <= DOM_BRIDGE_NODE_INDEX_MASK,
                "DOM bridge node handles must encode every slot");
+_Static_assert(DOM_BRIDGE_NODE_LIMIT <= UINT16_MAX
+                   && (DOM_BRIDGE_NODE_INDEX_CAPACITY
+                       & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u)) == 0
+                   && DOM_BRIDGE_NODE_LIMIT % 32u == 0,
+               "DOM bridge node index entries are 16-bit slot + 1");
 
 typedef struct {
     lxb_dom_node_t *node;
@@ -307,6 +315,34 @@ typedef struct DomBridge {
        bounded PSP handle table to track detached-node correctness. */
     unsigned char node_retention_flags[DOM_BRIDGE_NODE_LIMIT];
     size_t node_count;
+    /* Every non-NULL slot is indexed by its node pointer, so registering a
+       node and finding the handles inside a detached subtree do not scan the
+       slot table. Only register/invalidate write `nodes`, and both keep this
+       index and the reusable-slot bitmap (NULL slots whose generation can
+       still advance) in step. */
+    uint16_t node_index[DOM_BRIDGE_NODE_INDEX_CAPACITY];
+    /* The last element getComputedStyle() cascaded, for consecutive
+       property reads of one declaration. Valid while none of the cascade's
+       inputs moved: connected DOM content (every bridge mutation, including
+       focus, custom-element and form state, bumps the content generation),
+       the sheet and its fullscreen element, and the entry epoch, which each
+       entry into JavaScript bumps: the parser and the host change the DOM
+       and its state only between entries. */
+    struct {
+        const lxb_dom_node_t *node;
+        const void *sheet;
+        uint64_t sheet_generation;
+        uint64_t content_generation;
+        const lxb_dom_node_t *fullscreen_node;
+        uint64_t epoch;
+        ComputedStyle style;
+    } computed_style_memo;
+    uint64_t computed_style_epoch;
+    /* Connected mutations that can change document statistics (anything
+       but attribute, inline-style and canvas-pixel changes); the runtime
+       refreshes the document only when this advances. */
+    size_t stats_mutations;
+    uint32_t node_reusable_bits[DOM_BRIDGE_NODE_LIMIT / 32u];
     /* Shadow carriers are native DOM nodes, but ordinary document/element
        selectors must not cross their tree boundary.  Store encoded handles,
        rather than pointers, so slot generation prevents allocator reuse from
@@ -458,8 +494,7 @@ typedef enum {
     SCRIPT_HOST_MEDIA_RECHECK,
     SCRIPT_HOST_RECORD_RESOURCE_TIMING,
     SCRIPT_HOST_RECORD_NAVIGATION_TIMING,
-    SCRIPT_HOST_PENDING_TIMERS,
-    SCRIPT_HOST_PENDING_NETWORK_REQUESTS,
+    SCRIPT_HOST_PENDING_WORK,
     SCRIPT_HOST_DELIVER_NETWORK,
     SCRIPT_HOST_DETACH_NETWORK,
     SCRIPT_HOST_PUMP_TIMERS,
@@ -667,6 +702,9 @@ size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
 bool js_rt_runtime_refresh(ScriptRuntime *runtime);
 void js_rt_runtime_update_result(ScriptRuntime *runtime,
                                  ScriptResult *result);
+/* The per-frame subset of js_rt_runtime_update_result(): no telemetry. */
+void js_rt_runtime_update_frame_result(ScriptRuntime *runtime,
+                                       ScriptResult *result);
 uint64_t js_rt_monotonic_time_ns(void);
 /* HTML deliberately leaves the transient-activation duration to the user
    agent. Five seconds matches the interoperability window used by major

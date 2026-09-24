@@ -96,7 +96,7 @@ mark help
 tap circle
 tap circle
 
-# Return HOME, then exit from the seven-row root.
+# Return HOME, then exit from the seven-row root (Exit takes a second X).
 tap select
 press 5 up
 tap cross
@@ -107,6 +107,7 @@ tap right
 mark home-moved
 tap select
 press 6 down
+tap cross
 tap cross
 wait 4
 mark exiting

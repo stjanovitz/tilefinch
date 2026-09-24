@@ -29,7 +29,7 @@ The optional audio-only setting selects the adaptive AAC representation at
 route open. It does not request video bytes and does not construct the video
 range, H.264 demux/decoder, or picture surfaces; it reuses the same bounded
 audio transport, buffering, pause, and seek machinery. The setting is sampled
-once per new YouTube route so changing Options cannot mutate a live pipeline.
+once per new YouTube route so changing Settings cannot mutate a live pipeline.
 
 ## Provider document
 

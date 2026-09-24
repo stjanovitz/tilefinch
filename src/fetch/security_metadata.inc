@@ -7,16 +7,8 @@ static bool security_name_is(const char *name, size_t length,
 
 static bool referrer_policy_known(const char *value, size_t length)
 {
-    static const char *const known[] = {
-        "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (strlen(known[i]) == length
-            && strncasecmp(value, known[i], length) == 0) return true;
-    }
-    return false;
+    uint8_t code = tilefinch_referrer_policy_code(value, length, true);
+    return code != 0 && code != TILEFINCH_REFERRER_POLICY_UNKNOWN;
 }
 
 static bool referrer_policy_normalized(const char *value)

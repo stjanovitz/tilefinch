@@ -896,6 +896,55 @@ static int test_international_line_flow(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
 
+    /* dir=ltr (common on every content block of some LTR sites) cannot
+       reorder text without RTL codepoints, so it is not bidi markup. */
+    static const char ltr_markup_page[] =
+        "<!doctype html><div dir=ltr><p dir=auto>left text</p></div>";
+    CHECK(document_parse(
+              &document, budget, ltr_markup_page,
+              sizeof(ltr_markup_page) - 1u, 447)
+          && !document.bidi_text_present
+          && !document.bidi_markup_present
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_paragraphs == 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
+    /* RTL text in one paragraph must not send every other paragraph through
+       the scan, yet an RTL rule that matches an element anywhere keeps the
+       conservative per-paragraph scan (the second page's ASCII paragraph
+       has a direction boundary), and one that matches nothing does not. */
+    static const char mixed_pages[][160] = {
+        "<!doctype html><p>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d world</p>"
+        "<p>left <span>ABC 12</span> right</p>",
+        "<!doctype html><style>.r{direction:rtl;unicode-bidi:isolate}</style>"
+        "<p>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d world</p>"
+        "<p>left <span class=r>ABC 12</span> right</p>",
+        "<!doctype html><style>.missing{direction:rtl;unicode-bidi:isolate}</style>"
+        "<p>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d world</p>"
+        "<p>left <span class=r>ABC 12</span> right</p>"
+    };
+    static const size_t mixed_paragraphs[] = { 1u, 2u, 1u };
+    for (size_t at = 0; at < sizeof(mixed_pages) / sizeof(mixed_pages[0]);
+         at++) {
+        CHECK(document_parse(
+                  &document, budget, mixed_pages[at],
+                  strlen(mixed_pages[at]), 448u + (unsigned) at)
+              && document.bidi_text_present
+              && !document.bidi_markup_present
+              && stylesheet_build(&sheet, budget, &document, 480)
+              && layout_build(
+                  &layout, budget, &document, &sheet, NULL, NULL, 480)
+              && layout.performance.bidi_paragraphs == mixed_paragraphs[at]
+              && layout.bidi_command_count != 0);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+
     /* An oversized paragraph must degrade in logical source order. In
        particular it must never fall back to the historical codepoint
        reversal bit after the bounded UAX #9 pipeline declined the input. */
@@ -1243,6 +1292,84 @@ static int test_has_attribute_dependency_classification(Budget *budget)
               &sheet, "class", 5, "plain", 5, "different", 9));
 
     stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* A prepared query list (one split, rightmost compounds located, fast keys
+   pre-rejecting) must agree with matching each selector's text directly,
+   for every element. */
+static int test_prepared_query_selectors_match_direct(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><body>"
+        "<section id=subject class=subject data-mode=LOUD>"
+        "<div class=a></div><div class='b eligible'></div>"
+        "<div class=eligible title='x, y'></div><div class=nest>"
+        "<b id=deep-selector class=deepchild></b>"
+        "</div></section>"
+        "<section id=adjacent class=next><i class=child></i></section>"
+        "<section id=later><div><b class=deep></b></div></section>"
+        "<div id=pair-a class=pair></div>"
+        "<div id=pair-b class='pair chosen'></div>"
+        "</body>";
+    PocDocument document = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 37));
+    char long_selector[400];
+    size_t used = (size_t) snprintf(long_selector, sizeof(long_selector),
+                                    "section");
+    for (int i = 0; i < 30; i++)
+        used += (size_t) snprintf(long_selector + used,
+                                  sizeof(long_selector) - used, ":not(.zz)");
+    snprintf(long_selector + used, sizeof(long_selector) - used, " b");
+    CHECK(strlen(long_selector) > 256);
+    const char *parts[] = {
+        "section#subject > div.eligible", "div.b", ".pair.chosen",
+        "#pair-b", "b", "B", "section .deep", "section > i.child",
+        "#adjacent + section b", "div:not(.pair)",
+        ".subject:has(> .a + .b)", "[data-mode=LOUD] .eligible",
+        "div.a ~ .eligible", "*", ".nest   >   #deep-selector",
+        "[title='x, y']", "#pair\\-b", ".missing", long_selector,
+        "section > div, .nest b"
+    };
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    size_t compared = 0;
+    for (size_t p = 0; p < sizeof(parts) / sizeof(parts[0]); p++) {
+        StyleQuerySelectorList list;
+        CHECK(style_query_selector_list_prepare(
+            &list, parts[p], strlen(parts[p])));
+        bool comma_list = strcmp(parts[p], "section > div, .nest b") == 0;
+        CHECK(list.count == (comma_list ? 2u : 1u));
+        for (lxb_dom_node_t *node = root; node != NULL;) {
+            bool direct = false;
+            if (comma_list) {
+                direct = style_selector_matches_scoped(
+                             node, "section > div", 13, NULL)
+                    || style_selector_matches_scoped(
+                             node, ".nest b", 7, NULL);
+            } else {
+                direct = style_selector_matches_scoped(
+                    node, parts[p], strlen(parts[p]), NULL);
+            }
+            bool prepared =
+                style_query_selector_list_matches(&list, node, NULL);
+            if (direct != prepared)
+                fprintf(stderr, "prepared selector mismatch: %s\n",
+                        parts[p]);
+            CHECK(direct == prepared);
+            compared += direct ? 1u : 0u;
+            if (node->first_child != NULL) { node = node->first_child; continue; }
+            while (node != NULL && node->next == NULL) node = node->parent;
+            if (node != NULL) node = node->next;
+        }
+    }
+    CHECK(compared > 20u);
+    /* A list longer than the prepared capacity falls back to direct text. */
+    char many[256] = {0};
+    for (int i = 0; i < 17; i++) strcat(many, i == 0 ? "a" : ",a");
+    StyleQuerySelectorList list;
+    CHECK(!style_query_selector_list_prepare(&list, many, strlen(many)));
     document_destroy(&document);
     CHECK(budget->current == 0);
     return 0;

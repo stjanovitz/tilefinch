@@ -3,6 +3,7 @@
    matcher in style_match.c. */
 
 #include "style_internal.h"
+#include "tilefinch/platform.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -428,50 +429,10 @@ static size_t style_selector_compile(const StyleRule *rule,
     size_t length = rule->selector_length;
     trim(&text, &length);
     while (length != 0) {
-        int square = 0;
-        int round = 0;
         size_t split = length;
         char combinator = 0;
-        for (size_t i = length; i != 0; i--) {
-            char value = text[i - 1];
-            if (value == ']') square++;
-            else if (value == '[' && square > 0) square--;
-            else if (value == ')') round++;
-            else if (value == '(' && round > 0) round--;
-            else if (square == 0 && round == 0
-                     && (value == '>' || value == '+' || value == '~')) {
-                split = i - 1;
-                combinator = value;
-                break;
-            } else if (square == 0 && round == 0
-                       && isspace((unsigned char) value)) {
-                size_t escaped = i - 1;
-                size_t backslashes = 0;
-                while (escaped != 0 && text[escaped - 1] == '\\') {
-                    escaped--;
-                    backslashes++;
-                }
-                if ((backslashes & 1u) != 0) continue;
-                size_t right = i;
-                while (right < length
-                       && isspace((unsigned char) text[right])) right++;
-                if (right < length) {
-                    size_t left = i - 1;
-                    while (left != 0
-                           && isspace((unsigned char) text[left - 1])) left--;
-                    if (left != 0 && (text[left - 1] == '>'
-                                      || text[left - 1] == '+'
-                                      || text[left - 1] == '~')) {
-                        split = left - 1;
-                        combinator = text[left - 1];
-                    } else {
-                        split = i - 1;
-                        combinator = ' ';
-                    }
-                    break;
-                }
-            }
-        }
+        (void) style_selector_last_combinator(
+            text, length, &split, &combinator);
         const char *compound = combinator == 0
             ? text : text + split + 1;
         size_t compound_length = combinator == 0
@@ -534,6 +495,12 @@ bool stylesheet_compiled_fragment_build(
     size_t selector_bytes = 0;
     size_t instruction_count = 0;
     for (size_t i = rule_begin; i < rule_end; i++) {
+        /* A page bundle compiles ~1,300 selectors twice here (90 ms on the
+           PSP). The fragment is an optional cache artifact: yield, and give
+           it up when the work is cancelled. */
+        if (((i - rule_begin) & 63u) == 63u
+            && !tilefinch_platform_cooperate("stylesheet-fragment", i))
+            return false;
         const StyleRule *rule = &sheet->rules[i];
         size_t count = style_selector_compile(
             rule, NULL, 0, complex_compounds);
@@ -611,6 +578,11 @@ bool stylesheet_compiled_fragment_build(
     size_t selector_at = 0;
     size_t instruction_at = 0;
     for (size_t i = 0; i < rule_count; i++) {
+        if ((i & 63u) == 63u
+            && !tilefinch_platform_cooperate("stylesheet-fragment", i)) {
+            budget_free(sheet->budget, blob);
+            return false;
+        }
         const StyleRule *rule = &sheet->rules[rule_begin + i];
         size_t count = style_selector_compile(
             rule, NULL, 0, complex_compounds);

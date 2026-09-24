@@ -258,16 +258,9 @@ static StylesheetDocumentResource *document_resource_get_or_add(
 
 static bool stylesheet_referrer_policy_valid(const char *policy)
 {
-    if (policy == NULL) return false;
-    static const char *known[] = {
-        "", "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (strcmp(policy, known[i]) == 0) return true;
-    }
-    return false;
+    return policy != NULL
+        && tilefinch_referrer_policy_code(policy, strlen(policy), false)
+               != TILEFINCH_REFERRER_POLICY_UNKNOWN;
 }
 
 static void stylesheet_referrer_policy_normalize_or_default(
@@ -1227,10 +1220,12 @@ static bool apply_stylesheet_data(ResourceContext *context,
     } else if (fragment_eligible) {
         context->stats->compiled_fragment_misses++;
     }
+    tilefinch_platform_trace_step("css-fragment-build");
     bool fragment_built = fragment_eligible && fragment_rules_reused == 0
         && stylesheet_compiled_fragment_build(
             context->sheet, rules_before, context->sheet->count,
             &new_fragment, &new_fragment_length);
+    tilefinch_platform_trace_step("css-fragment-seed");
     if (fragment_built) {
         /* Seed this first parse too. The final whole-page selector program
            then consumes the same compiled instructions that are retained
@@ -1270,6 +1265,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
                 css_data = fetched->shared_body->data;
             }
         }
+        tilefinch_platform_trace_step("css-artifact-store");
         bool ir_stored = new_ir != NULL
             && browser_session_stylesheet_ir_put_take(
                    context->session, resolved, request_context,
@@ -1992,6 +1988,7 @@ static bool flush_stylesheet_batch(ResourceContext *context)
             if (revalidated) {
                 context->stats->cache_hits++;
             }
+            tilefinch_platform_trace_step("css-settle");
             if (!settle_stylesheet_data(
                     context, pending->url, &provenance, css_data,
                     css_length, 0,
@@ -2392,6 +2389,7 @@ bool stylesheets_append_ordered_suffix_with_context(
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
+    tilefinch_platform_trace_step("css-prelude");
     lxb_dom_node_t *selector_root = nodes[0];
     while (selector_root != NULL && selector_root->parent != NULL) {
         selector_root = selector_root->parent;
@@ -2422,6 +2420,7 @@ bool stylesheets_append_ordered_suffix_with_context(
         ok = resource_work(&context, 1, false)
             && process_stylesheet_node(&context, nodes[i]);
     }
+    tilefinch_platform_trace_step("css-flush");
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(
         &context, "stylesheet suffix continuation cancelled");
@@ -2520,6 +2519,7 @@ bool stylesheets_load_external_tracked_with_context(
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
+    tilefinch_platform_trace_step("css-prelude");
     stylesheet_collect_selector_tokens(
         lxb_dom_interface_node(document->html), context.priority_token_bloom,
         STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
@@ -2553,7 +2553,9 @@ bool stylesheets_load_external_tracked_with_context(
     stylesheet_restore_alternate_themes(&context);
     stylesheet_collect_alternate_themes(
         &context, lxb_dom_interface_node(document->html));
+    tilefinch_platform_trace_step("css-walk");
     bool ok = walk(&context, lxb_dom_interface_node(document->html));
+    tilefinch_platform_trace_step("css-flush");
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(&context,
                                    "stylesheet discovery cancelled");

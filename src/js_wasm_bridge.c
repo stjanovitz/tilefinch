@@ -219,6 +219,15 @@ struct TilefinchWasmInstance {
     /* The finite interpreter ceiling bounds a single call; the host realm's
        existing watchdog bounds aggregate task time across calls/instances. */
     uint32_t call_depth;
+    /* Recently used exported globals. WAMR resolves an export by comparing
+       names across the export table; a game reading a global per frame
+       hits these instead. Global storage lives as long as the instance. */
+    struct {
+        char name[48];
+        wasm_global_inst_t global;
+    } global_cache[4];
+    uint8_t global_cache_count;
+    uint8_t global_cache_next;
 };
 
 typedef struct {
@@ -1142,6 +1151,36 @@ static const char *wasm_global_type_name(wasm_valkind_t kind)
     }
 }
 
+/* An exported global, from the instance's small cache when recently used:
+   WAMR resolves exports by comparing names across the export table, and a
+   game may read a global every frame. Global storage lives as long as the
+   instance, so a cached entry stays valid. */
+static bool wasm_instance_export_global(TilefinchWasmInstance *instance,
+                                        const char *name,
+                                        wasm_global_inst_t *global)
+{
+    enum { CACHE_SLOTS = sizeof(instance->global_cache)
+                         / sizeof(instance->global_cache[0]) };
+    size_t length = strlen(name);
+    for (uint8_t at = 0; at < instance->global_cache_count; at++) {
+        if (strcmp(instance->global_cache[at].name, name) == 0) {
+            *global = instance->global_cache[at].global;
+            return true;
+        }
+    }
+    if (!wasm_runtime_get_export_global_inst(
+            instance->instance, name, global)) return false;
+    if (length < sizeof(instance->global_cache[0].name)
+        && global->global_data != NULL) {
+        uint8_t slot = instance->global_cache_count < CACHE_SLOTS
+            ? instance->global_cache_count++
+            : (uint8_t) (instance->global_cache_next++ % CACHE_SLOTS);
+        memcpy(instance->global_cache[slot].name, name, length + 1u);
+        instance->global_cache[slot].global = *global;
+    }
+    return true;
+}
+
 static JSValue wasm_global_export(
     JSContext *context, TilefinchWasmInstance *instance,
     JSValueConst instance_object, const char *name)
@@ -1196,8 +1235,7 @@ JSValue js_wasm_global_get(
     }
     wasm_global_inst_t global;
     memset(&global, 0, sizeof(global));
-    bool found = wasm_runtime_get_export_global_inst(
-        instance->instance, name, &global);
+    bool found = wasm_instance_export_global(instance, name, &global);
     JS_FreeCString(context, name);
     if (!found || global.global_data == NULL)
         return JS_ThrowTypeError(context, "WebAssembly.Global expected");
@@ -1241,8 +1279,7 @@ JSValue js_wasm_global_set(
     }
     wasm_global_inst_t before;
     memset(&before, 0, sizeof(before));
-    if (!wasm_runtime_get_export_global_inst(
-            instance->instance, name, &before)
+    if (!wasm_instance_export_global(instance, name, &before)
         || before.global_data == NULL) {
         JS_FreeCString(context, name);
         return JS_ThrowTypeError(context, "WebAssembly.Global expected");
@@ -1281,8 +1318,7 @@ JSValue js_wasm_global_set(
     wasm_global_inst_t after;
     memset(&after, 0, sizeof(after));
     if (instance == NULL
-        || !wasm_runtime_get_export_global_inst(
-               instance->instance, name, &after)
+        || !wasm_instance_export_global(instance, name, &after)
         || after.global_data == NULL || !after.is_mutable
         || after.kind != value.kind) {
         JS_FreeCString(context, name);

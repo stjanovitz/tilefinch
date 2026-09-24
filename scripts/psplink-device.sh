@@ -4,7 +4,8 @@ set -eu
 # Fast real-PSP edit loop. The wrapper establishes and verifies the Mac-side
 # usbhostfs_pc bridge automatically before it touches the device.
 #
-#   scripts/psplink-device.sh memory  # zero Memory Stick writes
+#   scripts/psplink-device.sh memory         # zero Memory Stick writes
+#   scripts/psplink-device.sh memory --wait  # require a completed report
 #   scripts/psplink-device.sh slot    # transactional slot-a deploy
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -14,15 +15,21 @@ PSPDEV=${PSPDEV:-}
 JOBS=${JOBS:-8}
 LINK_TIMEOUT_SECONDS=${LINK_TIMEOUT_SECONDS:-8}
 DEPLOY_TIMEOUT_SECONDS=${DEPLOY_TIMEOUT_SECONDS:-30}
+REPORT_TIMEOUT_SECONDS=${PSPLINK_REPORT_TIMEOUT_SECONDS:-300}
 
 usage() {
-    echo "usage: $0 memory | slot" >&2
+    echo "usage: $0 memory [--wait] | slot" >&2
     exit 2
 }
 
 [ "$#" -ge 1 ] || usage
 MODE=$1
 shift
+await_report=0
+if [ "$MODE" = memory ] && [ "$#" -eq 1 ] && [ "$1" = --wait ]; then
+    await_report=1
+    shift
+fi
 [ "$#" -eq 0 ] || usage
 
 [ -n "$PSPDEV" ] || {
@@ -147,6 +154,13 @@ case "$MODE" in
         fi
         require_module_absent Tilefinch
         unload_named_modules tfdeploy
+        previous_report_inode=0
+        if [ "$await_report" -eq 1 ]; then
+            previous_report_inode=$(ls -id \
+                "$HOST_ROOT/tilefinch-validation.txt" 2>/dev/null \
+                | awk 'NR == 1 { print $1 }' || true)
+            [ -n "$previous_report_inode" ] || previous_report_inode=0
+        fi
         load_output=$(run_pspsh \
             "ld host0:/psp-browser-script-dev.prx" \
             "$LINK_TIMEOUT_SECONDS")
@@ -154,6 +168,14 @@ case "$MODE" in
         if printf '%s\n' "$load_output" | \
             grep -q 'Failed to Load/Start module'; then
             exit 1
+        fi
+        if [ "$await_report" -eq 1 ]; then
+            require_script=0
+            [ -z "$input_script" ] || require_script=1
+            "$ROOT/scripts/psplink-await-report.sh" \
+                "$HOST_ROOT/tilefinch-validation.txt" \
+                "$previous_report_inode" "$REPORT_TIMEOUT_SECONDS" \
+                "$require_script"
         fi
         ;;
     slot)

@@ -445,7 +445,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
 #endif
     if (!ok || prepared_callbacks != 0) {
         runtime->result.success = false;
-        js_rt_runtime_update_result(runtime, result);
+        js_rt_runtime_update_frame_result(runtime, result);
         return false;
     }
 
@@ -458,7 +458,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     network_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
     if (!ok || prepared_network_tasks != 0) {
         runtime->result.success = false;
-        js_rt_runtime_update_result(runtime, result);
+        js_rt_runtime_update_frame_result(runtime, result);
         return false;
     }
 
@@ -472,7 +472,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         && !runtime_call_captured(runtime, runtime->page_scroll_flush,
                                   "page scroll dispatch", 0, NULL, NULL)) {
         runtime->result.success = false;
-        js_rt_runtime_update_result(runtime, result);
+        js_rt_runtime_update_frame_result(runtime, result);
         return false;
     }
 
@@ -650,7 +650,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         runtime->timing_metrics.maximum_total_us = advance_us;
 #endif
     runtime->result.success = ok;
-    js_rt_runtime_update_result(runtime, result);
+    js_rt_runtime_update_frame_result(runtime, result);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     runtime_report_heap_failure(runtime);
 #endif

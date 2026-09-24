@@ -224,8 +224,12 @@
   gl.finish();
   const perspectivePixel = new Uint8Array(4);
   gl.readPixels(16, 16, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, perspectivePixel);
+  // Row 0 of the data is v = 0. At this pixel perspective-correct v is about
+  // 0.8, the yellow last row; affine interpolation would give v = 0.5, the
+  // blue row. (Checked against Chromium; the old red expectation matched a
+  // software sampler that flipped rows.)
   const perspectiveCorrect = perspectivePixel[0] > 180
-    && perspectivePixel[1] < 80 && perspectivePixel[2] < 80;
+    && perspectivePixel[1] > 160 && perspectivePixel[2] < 80;
 
   const partial = new Uint8Array(16).fill(0x7d);
   gl.readPixels(-1, -1, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, partial);

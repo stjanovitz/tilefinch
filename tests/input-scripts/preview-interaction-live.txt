@@ -1,0 +1,25 @@
+# Measurement scenario: using the loading page. Square reloads the article
+# (scripted input arms only after the boot navigation). Once its preview is
+# up, two quick Rights focus preview items, Select opens and Circle closes
+# the menu over the loading page, and Cross on the focused item (the site
+# menu toggle, a control) is deferred until the page commits. Only the
+# first three marks capture the screen.
+wait-live 60
+tap-live square
+wait-live 150
+tap-live right
+wait-live 4
+tap-live right
+wait-live 20
+mark-live focus
+tap-live select
+wait-live 60
+mark-live menu-open
+tap-live circle
+wait-live 30
+tap-live cross
+wait-live 60
+wait-page 1
+wait 30
+mark after-load
+end

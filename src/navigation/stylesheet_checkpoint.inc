@@ -1,10 +1,16 @@
 static void navigation_stream_mark_parser_refusal(
     NavigationDocumentStream *stream, NavigationParserRefusalReason reason);
 
+static void navigation_stream_drop_previews(
+    NavigationDocumentStream *stream);
+
 static void navigation_stream_release_blocking_stylesheet(
     NavigationDocumentStream *stream)
 {
     if (stream == NULL) return;
+    /* Retained previews borrow the sheet's web fonts (and, through stream
+       teardown, which releases the sheet first, the DOM). */
+    navigation_stream_drop_previews(stream);
     /* getComputedStyle() may have observed this temporary sheet while a
        parser-blocking script ran.  Clear the runtime bridge before reclaiming
        it so EOF finalization and error teardown never leave a dangling
@@ -162,9 +168,14 @@ static void navigation_stream_capture_stylesheet_inputs(
         stream, inputs, count, overflow);
 }
 
-static bool navigation_stream_try_continue_stylesheet(
+/* Appends the stylesheet inputs that follow an unchanged, already compiled
+   prefix. `document` supplies both the inputs and the Content-Security-Policy
+   that admits them: at commit the parser's document has already been moved
+   into the page, so the stream's own copy is empty. `require_inline` limits
+   the suffix to <style> elements, whose append needs no stream fetch state. */
+static bool navigation_stream_continue_stylesheet_suffix(
     NavigationDocumentStream *stream, PocDocument *document,
-    uint64_t fingerprint)
+    uint64_t fingerprint, bool require_inline)
 {
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_DISABLE_STYLESHEET_CONTINUATION") != NULL) {
@@ -235,6 +246,10 @@ static bool navigation_stream_try_continue_stylesheet(
             break;
         }
     }
+    if (require_inline && !inline_only) {
+        budget_free(stream->session->budget, current);
+        return false;
+    }
     bool settle_suffix_preloads = true;
 #ifndef TILEFINCH_NO_TRACE
     settle_suffix_preloads =
@@ -247,12 +262,12 @@ static bool navigation_stream_try_continue_stylesheet(
     bool appended = inline_only
         ? stylesheet_append_style_elements(
             &stream->blocking_stylesheet, suffix, suffix_count,
-            &stream->parser->document.content_security_policy)
+            &document->content_security_policy)
         : stylesheets_append_ordered_suffix_with_context(
             &stream->blocking_stylesheet, session->budget,
             suffix, suffix_count, stream->resource_base_url,
             stream->document_url, stream->referrer_policy,
-            &stream->parser->document.content_security_policy,
+            &document->content_security_policy,
             session->maximum_stylesheets,
             session->maximum_stylesheet_bytes,
             session->maximum_stylesheet_file_bytes,
@@ -452,6 +467,14 @@ static bool navigation_stream_stylesheet_fingerprint(
     return true;
 }
 
+static bool navigation_stream_try_continue_stylesheet(
+    NavigationDocumentStream *stream, PocDocument *document,
+    uint64_t fingerprint)
+{
+    return navigation_stream_continue_stylesheet_suffix(
+        stream, document, fingerprint, false);
+}
+
 static bool navigation_stream_build_blocking_stylesheet_with_timeout(
     NavigationDocumentStream *stream, PocDocument *document,
     uint64_t fingerprint, long timeout_ms)
@@ -460,13 +483,16 @@ static bool navigation_stream_build_blocking_stylesheet_with_timeout(
         return false;
     }
     NavigationSession *session = stream->session;
+    tilefinch_platform_trace_step("style-release");
     navigation_stream_release_blocking_stylesheet(stream);
     /* Speculative fetches never supply CSS directly. Settle only the style
        entries into the ordinary HTTP cache, then let the ordered stylesheet
        loader perform its normal provenance, media, parse, and cascade work. */
+    tilefinch_platform_trace_step("style-preload-settle");
     if (session->external_resources_enabled) {
         navigation_stream_settle_style_preloads(stream);
     }
+    tilefinch_platform_trace_step("style-compiled-cache");
     if (navigation_compiled_stylesheet_cache_take(
             session, fingerprint, &stream->blocking_stylesheet,
             &stream->blocking_stylesheets)) {
@@ -482,6 +508,7 @@ static bool navigation_stream_build_blocking_stylesheet_with_timeout(
         }
         return true;
     }
+    tilefinch_platform_trace_step("style-base-build");
     bool built = session->external_resources_enabled
         ? stylesheet_build_context_deferred(
               &stream->blocking_stylesheet, session->budget, document,

@@ -16,7 +16,7 @@ static void usage(const char *program)
             "[--forced-dark] "
             "[--max-download-kb N] "
             "[--no-external-resources] "
-            "[--no-progressive-first-paint] "
+            "[--no-progressive-first-paint] [--relayout-preview-us N] "
             "[--wpt-test-rendered] [--hide-cookie-banners] [--reader-mode] "
             "[--script-timeout-ms N] [--probe-script FILE] "
             "[--frame-probe-script FILE] [--frame-probe-event EVENT] "

@@ -1,16 +1,16 @@
 # Contributing to Tilefinch
 
-Issues and pull requests are welcome. Tilefinch is a spare-time project rather
-than a continuously staffed one, so reviews and replies may take a while and
-development may pause between releases. This page is the short version; the
-detailed conventions live in the two documents below.
+Issues and pull requests are welcome. Tilefinch is a spare-time project, so
+reviews and replies may take a while, and development may pause between
+releases. This page is the short version; the detailed conventions are in the
+two documents below.
 
 ## Setup and workflow
 
-Follow [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for toolchain setup, CMake
-presets, and the fast edit loop. Engineering conventions — memory budgets,
-bounded loops, PSP constraints, verification discipline, and commit style —
-are in [AGENTS.md](AGENTS.md); they apply to human contributors too.
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers toolchain setup, CMake
+presets, and the fast edit loop. The engineering conventions (memory budgets,
+bounded loops, PSP constraints, verification discipline, and commit style) are
+in [AGENTS.md](AGENTS.md), and they apply to human contributors too.
 
 ## Test gates
 
@@ -21,8 +21,8 @@ cmake --build build-preset-release
 ctest --test-dir build-preset-release
 ```
 
-Use the release preset for the canonical gate. For a faster loop, configure the
-development preset before using it rather than trusting an old build tree.
+The release preset is the canonical gate. For a faster loop, configure the
+development preset fresh rather than trusting an old build tree.
 
 Two policies to know before touching test baselines:
 
@@ -37,5 +37,5 @@ Two policies to know before touching test baselines:
 
 ## Commits
 
-Imperative subject line, body explaining why. Commit at each passed gate
-rather than batching a session into one commit.
+Write an imperative subject line and a body that explains why. Commit at each
+passed gate rather than batching a session's work into one commit.

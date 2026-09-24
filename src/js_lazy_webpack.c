@@ -805,17 +805,18 @@ static JSValue js_lazy_function_to_string(JSContext *context,
     if (runtime == NULL) {
         return JS_ThrowInternalError(context, "script runtime unavailable");
     }
-    for (ScriptLazyRuntimeBundle *bundle = runtime->lazy_webpack_bundles;
+    /* Wrappers are function objects, and strict equality of objects is
+       identity: a non-object receiver matches none, and the scan (every
+       factory of every bundle, per call) compares pointers. */
+    void *receiver = JS_VALUE_GET_TAG(this_value) == JS_TAG_OBJECT
+        ? JS_VALUE_GET_PTR(this_value) : NULL;
+    for (ScriptLazyRuntimeBundle *bundle = receiver == NULL
+             ? NULL : runtime->lazy_webpack_bundles;
          bundle != NULL; bundle = bundle->next) {
         for (size_t i = 0; i < bundle->factory_count; i++) {
             ScriptLazyRuntimeFactory *factory = &bundle->factories[i];
-            if (!JS_IsUndefined(factory->wrapper)
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
-                && JS_StrictEq(context, this_value, factory->wrapper) == 1) {
-#else
-                && JS_IsStrictEqual(
-                       context, this_value, factory->wrapper)) {
-#endif
+            if (JS_VALUE_GET_TAG(factory->wrapper) == JS_TAG_OBJECT
+                && JS_VALUE_GET_PTR(factory->wrapper) == receiver) {
                 if (!JS_IsUndefined(factory->compiled)) {
                     return JS_Call(context, runtime->function_to_string,
                                    factory->compiled, 0, NULL);

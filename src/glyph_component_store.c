@@ -12,6 +12,7 @@
 #endif
 
 #include "tilefinch/glyph_component.h"
+#include "tilefinch/browser_profile.h"
 #include "tilefinch/sha256.h"
 
 #define GLYPH_INSTALL_IO_CHUNK (16u * 1024u)
@@ -54,6 +55,42 @@ const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(
     TilefinchGlyphPack pack)
 {
     return pack < TILEFINCH_GLYPH_PACK_COUNT ? &glyph_specs[pack] : NULL;
+}
+
+bool tilefinch_glyph_pack_for_language(
+    unsigned language, TilefinchGlyphPack *pack)
+{
+    if (pack == NULL) return false;
+    switch ((BrowserGlyphLanguage) language) {
+        case BROWSER_GLYPH_LANGUAGE_JAPANESE:
+            *pack = TILEFINCH_GLYPH_PACK_JAPANESE;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED:
+            *pack = TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL:
+            *pack = TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_KOREAN:
+            *pack = TILEFINCH_GLYPH_PACK_KOREAN;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_CYRILLIC:
+            *pack = TILEFINCH_GLYPH_PACK_CYRILLIC;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED:
+            *pack = TILEFINCH_GLYPH_PACK_LATIN_EXTENDED;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_ARABIC:
+            *pack = TILEFINCH_GLYPH_PACK_ARABIC;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_HEBREW:
+            *pack = TILEFINCH_GLYPH_PACK_HEBREW;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_COUNT:
+        case BROWSER_GLYPH_LANGUAGE_EMBEDDED:
+        default:
+            return false;
+    }
 }
 
 struct TilefinchGlyphComponentInstall {

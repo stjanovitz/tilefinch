@@ -11,6 +11,8 @@ remain authoritative when a focused manual is narrower.
 - [DEVICE_QUALIFICATION.md](DEVICE_QUALIFICATION.md) — which claims host, PPSSPP, and hardware can prove.
 - [PSP_ENVELOPE.md](PSP_ENVELOPE.md) — memory, CPU-slice, executable-size, and storage budgets.
 - [MEMORY_EXPERIMENTS.md](MEMORY_EXPERIMENTS.md) — accepted and rejected memory experiments, with explicit conditions for revisiting them.
+- [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) — dated host and device performance measurements, kept and reverted experiments, and the engine mechanisms they motivated.
+- [BUILD_SPEED_EXPERIMENT.md](BUILD_SPEED_EXPERIMENT.md) — the measured 2026-09-05 targeted host build-speed experiment.
 
 ## Labs and acceptance
 

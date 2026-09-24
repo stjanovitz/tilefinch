@@ -57,6 +57,10 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
     int right = left + TILEFINCH_TILE_SIZE;
     int bottom = top + TILEFINCH_TILE_SIZE;
     RasterTarget target = tile_raster_target(tile, left, top, right, bottom);
+    if (cache->layout->command_flags != NULL) {
+        (void) overflow_cache_prepare(cache);
+    }
+    tile->overflow_generation = cache->overflow_tile_generation;
     uint32_t page_background = cache->layout->page_background;
     if (cache->forced_dark) {
         page_background = forced_dark_color(
@@ -66,11 +70,31 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
     for (size_t i = 0; i < TILEFINCH_TILE_SIZE * TILEFINCH_TILE_SIZE; i++) {
         tile->pixels[i] = background;
     }
+    /* Below a provisional layout's content the page is still being laid
+       out: show the same checkerboard as an unrasterized tile. */
+    int limit = cache->layout->content_limit_y;
+    if (limit > 0 && limit < bottom) {
+        uint16_t light = cache->forced_dark ? 0x3186u : 0xef7du;
+        uint16_t dark = cache->forced_dark ? 0x2104u : 0xd69au;
+        for (int y = limit > top ? limit : top; y < bottom; y++) {
+            uint16_t *row = tile->pixels
+                + (size_t) (y - top) * TILEFINCH_TILE_SIZE;
+            for (int x = left; x < right; x++)
+                row[x - left] = (((x >> 4) ^ (y >> 4)) & 1) ? dark : light;
+        }
+    }
 
     if (tile->tile_y >= 0
         && (size_t) tile->tile_y < cache->layout->spatial_band_count
         && cache->layout->spatial_band_offsets != NULL) {
         size_t band = (size_t) tile->tile_y;
+        /* Pass 0 paints the tile's ordinary content. While no overflow box
+           is scrolled, pass 1 bakes the per-frame stream (overflow-clipped
+           and late-positioned commands) on top in paint order, exactly as
+           the frame compositor painted it after the tiles, so the result is
+           identical and the frame no longer re-rasterizes it. */
+        int passes = overflow_stream_static(cache) ? 2 : 1;
+        for (int pass = 0; pass < passes; pass++) {
         size_t local = cache->layout->spatial_band_offsets[band];
         size_t local_end = cache->layout->spatial_band_offsets[band + 1];
         size_t global = 0;
@@ -85,12 +109,46 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
             if (local_order < global_order) local++;
             else global++;
             size_t index = cache->layout->paint_order[order];
-            if (cache->layout->command_flags[index]
-                & (LAYOUT_COMMAND_OVERFLOW
-                   | LAYOUT_COMMAND_LATE_POSITIONED)) continue;
+            uint8_t flags = cache->layout->command_flags[index];
+            bool stream = (flags & (LAYOUT_COMMAND_OVERFLOW
+                                    | LAYOUT_COMMAND_LATE_POSITIONED)) != 0;
+            if (stream != (pass == 1)) continue;
+            if (stream) {
+                cache->command_candidates++;
+                cache->overflow_tile_commands++;
+                if ((flags & LAYOUT_COMMAND_OVERFLOW) == 0) {
+                    rasterize_command(cache, &target,
+                                      &cache->layout->commands[index]);
+                    continue;
+                }
+                const OverflowGeometry *geometry =
+                    overflow_cached_geometry(cache, index);
+                if (geometry == NULL || !geometry->found
+                    || geometry->clip_right <= geometry->clip_left
+                    || geometry->clip_bottom <= geometry->clip_top) continue;
+                RasterTarget clipped = target;
+                if (geometry->clip_left > clipped.left)
+                    clipped.left = geometry->clip_left;
+                if (geometry->clip_top > clipped.top)
+                    clipped.top = geometry->clip_top;
+                if (geometry->clip_right < clipped.right)
+                    clipped.right = geometry->clip_right;
+                if (geometry->clip_bottom < clipped.bottom)
+                    clipped.bottom = geometry->clip_bottom;
+                if (clipped.right <= clipped.left
+                    || clipped.bottom <= clipped.top) continue;
+                RoundedClip rounded_clips[MAXIMUM_ROUNDED_CLIPS];
+                clipped.rounded_clips = rounded_clips;
+                clipped.rounded_clip_count = overflow_cached_rounded_clips(
+                    cache, index, rounded_clips, MAXIMUM_ROUNDED_CLIPS);
+                rasterize_command(cache, &clipped,
+                                  &cache->layout->commands[index]);
+                continue;
+            }
             cache->command_candidates++;
             rasterize_command(cache, &target,
                               &cache->layout->commands[index]);
+        }
         }
     } else {
         for (size_t order = 0; order < cache->layout->count; order++) {
@@ -105,16 +163,54 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
         }
     }
     cache->rasterized++;
-    uint64_t elapsed = render_now_us() - started;
+    uint64_t finished = render_now_us();
+    uint64_t elapsed = finished - started;
     cache->raster_us += elapsed;
     if (elapsed > cache->max_raster_us) cache->max_raster_us = elapsed;
+    if (cache->raster_cooperate_phase != NULL) {
+        if (cache->raster_slice_started_us == 0
+            || finished < cache->raster_slice_started_us) {
+            cache->raster_slice_started_us = started;
+        }
+        if (finished - cache->raster_slice_started_us >= UINT64_C(8000)) {
+            (void) tilefinch_platform_cooperate(
+                cache->raster_cooperate_phase, cache->rasterized);
+            cache->raster_slice_started_us = render_now_us();
+        }
+    }
+}
+
+/* Slots beyond the base hold speculative paint-ahead; admit one only while
+   the page keeps this much budget headroom. */
+#define RENDER_TILE_OPTIONAL_RESERVE (2u * 1024u * 1024u)
+
+/* The tile in slot `index`, allocating it when empty. NULL when the slot is
+   empty and may not be filled now (allocation or optional-headroom refusal);
+   callers then fall back to evicting a resident tile. */
+static RenderTile *tile_slot(TileCache *cache, size_t index)
+{
+    RenderTile *tile = cache->tiles[index];
+    if (tile != NULL) return tile;
+    if (index >= RENDER_TILE_BASE_CAPACITY
+        && budget_pressure_required(cache->budget, sizeof(*tile),
+                                    RENDER_TILE_OPTIONAL_RESERVE)) {
+        return NULL;
+    }
+    tile = budget_malloc(cache->budget, sizeof(*tile));
+    if (tile == NULL) return NULL;
+    tile->valid = false;
+    cache->tiles[index] = tile;
+    cache->tiles_allocated++;
+    return tile;
 }
 
 static RenderTile *find_tile(TileCache *cache, int tile_x, int tile_y)
 {
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        RenderTile *tile = &cache->tiles[i];
-        if (tile->valid && tile->tile_x == tile_x && tile->tile_y == tile_y) {
+        RenderTile *tile = cache->tiles[i];
+        if (tile != NULL && tile->valid && tile->tile_x == tile_x
+            && tile->tile_y == tile_y
+            && tile->overflow_generation == cache->overflow_tile_generation) {
             return tile;
         }
     }
@@ -124,8 +220,16 @@ static RenderTile *find_tile(TileCache *cache, int tile_x, int tile_y)
 static RenderTile *tile_victim(TileCache *cache)
 {
     RenderTile *victim = NULL;
+    bool slots_refused = false;
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        RenderTile *tile = &cache->tiles[i];
+        RenderTile *tile = cache->tiles[i];
+        if (tile == NULL) {
+            if (slots_refused) continue;
+            tile = tile_slot(cache, i);
+            if (tile != NULL) return tile;
+            slots_refused = true;
+            continue;
+        }
         if (!tile->valid) return tile;
         if (victim == NULL || tile->last_used < victim->last_used) victim = tile;
     }
@@ -151,8 +255,16 @@ static RenderTile *tile_victim_outside_set(TileCache *cache,
                                            size_t columns, size_t rows)
 {
     RenderTile *victim = NULL;
+    bool slots_refused = false;
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        RenderTile *tile = &cache->tiles[i];
+        RenderTile *tile = cache->tiles[i];
+        if (tile == NULL) {
+            if (slots_refused) continue;
+            tile = tile_slot(cache, i);
+            if (tile != NULL) return tile;
+            slots_refused = true;
+            continue;
+        }
         if (!tile->valid) return tile;
         size_t ordinal = 0;
         bool wanted = tile_frame_ordinal(tile, first_tx, first_ty, columns,
@@ -195,6 +307,8 @@ static bool tile_cache_prepare_layout(TileCache *cache,
                                       const LayoutDocument *layout)
 {
     cache->source_layout = layout;
+    cache->scroll_synced_layout = NULL;
+    cache->overflow_scroll_layout = NULL;
     if (viewport_context_is_scaled(&layout->viewport)) {
         if (!layout_clone_visual(&cache->visual_layout, layout)) return false;
         cache->layout = &cache->visual_layout;
@@ -218,6 +332,11 @@ static void tile_cache_sync_visual_scroll(TileCache *cache)
 {
     if (cache == NULL || !cache->owns_visual_layout
         || cache->source_layout == NULL) return;
+    if (cache->scroll_synced_layout == cache->source_layout
+        && cache->scroll_synced_generation
+               == cache->source_layout->scroll_generation) return;
+    cache->scroll_synced_layout = cache->source_layout;
+    cache->scroll_synced_generation = cache->source_layout->scroll_generation;
     size_t count = cache->source_layout->node_box_count;
     if (count > cache->visual_layout.node_box_count) {
         count = cache->visual_layout.node_box_count;
@@ -245,12 +364,27 @@ bool tile_cache_init(TileCache *cache, Budget *budget,
         return false;
     }
     cache->tiles = budget_calloc(budget, tile_capacity, sizeof(*cache->tiles));
+    cache->tiles_allocated = 0;
+    cache->overflow_scroll_signature = RENDER_OVERFLOW_SIGNATURE_EMPTY;
     if (cache->tiles == NULL) {
         tile_cache_release_visual_layout(cache);
         memset(cache, 0, sizeof(*cache));
         return false;
     }
     cache->tile_capacity = tile_capacity;
+    /* The base screen is reserved up front, as before, so a later allocation
+       failure can never take away a tile the visible frame depends on. */
+    size_t base = tile_capacity < RENDER_TILE_BASE_CAPACITY
+        ? tile_capacity : RENDER_TILE_BASE_CAPACITY;
+    for (size_t i = 0; i < base; i++) {
+        if (tile_slot(cache, i) == NULL) {
+            for (size_t j = 0; j < i; j++) budget_free(budget, cache->tiles[j]);
+            budget_free(budget, cache->tiles);
+            tile_cache_release_visual_layout(cache);
+            memset(cache, 0, sizeof(*cache));
+            return false;
+        }
+    }
     cache->idle_glyph_warming_disabled =
         getenv("TILEFINCH_ENABLE_IDLE_GLYPH_WARM") == NULL;
     cache->glyph_cache = budget_calloc(
@@ -290,8 +424,9 @@ void tile_cache_repaint_glyphs(TileCache *cache)
     tile_cache_cancel_frame_work(cache);
     tile_cache_cancel_idle_work(cache);
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        cache->tiles[i].valid = false;
+        if (cache->tiles[i] != NULL) cache->tiles[i]->valid = false;
     }
+    cache->prefetch_done = false;
     cache->fixed_ready = false;
     cache->fixed_backdrop = false;
     cache->fixed_backdrop_masked = false;
@@ -364,13 +499,23 @@ typedef struct {
     size_t end;
 } PaintOrderCursor;
 
-static bool has_active_vertical_overflow_scroll(const LayoutDocument *layout)
+static bool has_active_vertical_overflow_scroll(TileCache *cache)
 {
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        if (layout->node_boxes[i].clips_y
-            && layout->node_boxes[i].scroll_y != 0) return true;
+    const LayoutDocument *source = cache->source_layout;
+    if (source != NULL && cache->overflow_scroll_layout == source
+        && cache->overflow_scroll_generation == source->scroll_generation)
+        return cache->overflow_scroll_active;
+    const LayoutDocument *layout = cache->layout;
+    bool active = false;
+    for (size_t i = 0; i < layout->node_box_count && !active; i++) {
+        active = layout->node_boxes[i].clips_y
+            && layout->node_boxes[i].scroll_y != 0;
     }
-    return false;
+    cache->overflow_scroll_layout = source;
+    cache->overflow_scroll_generation =
+        source == NULL ? 0 : source->scroll_generation;
+    cache->overflow_scroll_active = active;
+    return active;
 }
 
 static void paint_overlay_command(TileCache *cache, uint16_t *frame,
@@ -385,6 +530,8 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
     if (cache->layout->command_flags != NULL) {
         (void) overflow_cache_prepare(cache);
     }
+    /* Baked into the tiles this frame copied. */
+    if (overflow_stream_static(cache)) return;
     if (cache->layout->command_flags == NULL
         || cache->layout->spatial_band_offsets == NULL) {
         for (size_t order = 0; order < cache->layout->count; order++) {
@@ -436,7 +583,7 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
             cache->layout->spatial_global_count};
     }
     if (cache->layout->overflow_order_count != 0
-        && has_active_vertical_overflow_scroll(cache->layout)) {
+        && has_active_vertical_overflow_scroll(cache)) {
         cursors[cursor_count++] = (PaintOrderCursor) {
             cache->layout->overflow_orders, 0,
             cache->layout->overflow_order_count};
@@ -522,6 +669,10 @@ void tile_cache_destroy(TileCache *cache)
         budget_free(cache->budget, cache->fixed_pixels);
         budget_free(cache->budget, cache->frame_scratch_tile);
         budget_free(cache->budget, cache->glyph_cache);
+        for (size_t i = 0; cache->tiles != NULL && i < cache->tile_capacity;
+             i++) {
+            budget_free(cache->budget, cache->tiles[i]);
+        }
         budget_free(cache->budget, cache->tiles);
         tile_cache_release_visual_layout(cache);
     }
@@ -546,27 +697,23 @@ static bool fixed_screen_command(const TileCache *cache,
     return true;
 }
 
-static bool fixed_range_owns_command(const LayoutDocument *layout,
-                                     size_t range_index,
-                                     size_t command_index)
+/* The innermost fixed range containing a command (SIZE_MAX for none); of
+   equal spans the earlier range owns it. */
+static size_t fixed_command_owner(const LayoutDocument *layout,
+                                  size_t command_index)
 {
-    if (layout == NULL || range_index >= layout->fixed_count) return false;
-    const FixedRange *candidate = &layout->fixed_ranges[range_index];
-    if (command_index < candidate->command_start
-        || command_index >= candidate->command_end) return false;
-    size_t candidate_span = candidate->command_end - candidate->command_start;
-    for (size_t i = 0; i < layout->fixed_count; i++) {
-        if (i == range_index) continue;
-        const FixedRange *other = &layout->fixed_ranges[i];
-        if (command_index < other->command_start
-            || command_index >= other->command_end) continue;
-        size_t other_span = other->command_end - other->command_start;
-        if (other_span < candidate_span
-            || (other_span == candidate_span && i < range_index)) {
-            return false;
+    size_t owner = SIZE_MAX, owner_span = SIZE_MAX;
+    for (size_t i = 0; layout != NULL && i < layout->fixed_count; i++) {
+        const FixedRange *range = &layout->fixed_ranges[i];
+        if (command_index < range->command_start
+            || command_index >= range->command_end) continue;
+        size_t span = range->command_end - range->command_start;
+        if (span < owner_span) {
+            owner = i;
+            owner_span = span;
         }
     }
-    return true;
+    return owner;
 }
 
 typedef struct {
@@ -741,15 +888,17 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     cache->fixed_backdrop_masked = false;
     cache->fixed_cache_bytes = 0;
     int left = viewport_width, top = viewport_height, right = 0, bottom = 0;
-    for (size_t range_index = 0;
-        range_index < cache->layout->fixed_count; range_index++) {
+    /* Global paint order, not range order: stacking between separate
+       fixed elements follows z-index (a z-index:2 drawer above the
+       z-index:1 scrim that follows it in the document). */
+    for (size_t order = 0; order < cache->layout->count; order++) {
+        size_t i = cache->layout->paint_order_count == cache->layout->count
+                   ? cache->layout->paint_order[order] : order;
+        size_t range_index = fixed_command_owner(cache->layout, i);
+        if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
         if (range->scroll_end != INT_MAX) continue;
-        for (size_t order = 0; order < cache->layout->count; order++) {
-            size_t i = cache->layout->paint_order_count == cache->layout->count
-                       ? cache->layout->paint_order[order] : order;
-            if (!fixed_range_owns_command(
-                    cache->layout, range_index, i)) continue;
+        {
             FixedScreenCommand fixed;
             if (!fixed_screen_command_geometry(
                     cache, range, i, viewport_width, viewport_height,
@@ -825,15 +974,17 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         .bottom = bottom
     };
 
-    for (size_t range_index = 0;
-        range_index < cache->layout->fixed_count; range_index++) {
+    /* Global paint order, not range order: stacking between separate
+       fixed elements follows z-index (a z-index:2 drawer above the
+       z-index:1 scrim that follows it in the document). */
+    for (size_t order = 0; order < cache->layout->count; order++) {
+        size_t i = cache->layout->paint_order_count == cache->layout->count
+                   ? cache->layout->paint_order[order] : order;
+        size_t range_index = fixed_command_owner(cache->layout, i);
+        if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
         if (range->scroll_end != INT_MAX) continue;
-        for (size_t order = 0; order < cache->layout->count; order++) {
-            size_t i = cache->layout->paint_order_count == cache->layout->count
-                       ? cache->layout->paint_order[order] : order;
-            if (!fixed_range_owns_command(
-                    cache->layout, range_index, i)) continue;
+        {
             FixedScreenCommand fixed;
             if (!fixed_screen_command_geometry(
                     cache, range, i, viewport_width, viewport_height,
@@ -1072,17 +1223,16 @@ static void paint_fixed_overlays(TileCache *cache, uint16_t *frame,
         .right = viewport_width,
         .bottom = viewport_height
     };
-    for (size_t range_index = 0;
-        range_index < cache->layout->fixed_count; range_index++) {
+    for (size_t order = 0; order < cache->layout->count; order++) {
+        size_t i = cache->layout->paint_order_count == cache->layout->count
+                   ? cache->layout->paint_order[order] : order;
+        size_t range_index = fixed_command_owner(cache->layout, i);
+        if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
         if (bounded_only && range->scroll_end == INT_MAX) continue;
         if (range->scroll_end != INT_MAX
             && scroll_y >= range->scroll_end) continue;
-        for (size_t order = 0; order < cache->layout->count; order++) {
-            size_t i = cache->layout->paint_order_count == cache->layout->count
-                       ? cache->layout->paint_order[order] : order;
-            if (!fixed_range_owns_command(
-                    cache->layout, range_index, i)) continue;
+        {
             FixedScreenCommand fixed;
             if (!fixed_screen_command_geometry(
                     cache, range, i, viewport_width, viewport_height,
@@ -2134,6 +2284,32 @@ static void copy_tile_to_frame(const RenderTile *tile, uint16_t *frame,
     }
 }
 
+/* The classic "not painted yet" pattern: 16 px checks, light greys (dark
+   under forced dark). Scrolling never waits for raster; this marks where
+   content is still coming. */
+static void checkerboard_tile_to_frame(const TileCache *cache, int tile_x,
+                                       int tile_y, uint16_t *frame,
+                                       int scroll_y, int viewport_width,
+                                       int viewport_height)
+{
+    uint16_t light = cache->forced_dark ? 0x3186u : 0xef7du;
+    uint16_t dark = cache->forced_dark ? 0x2104u : 0xd69au;
+    int tile_left = tile_x * TILEFINCH_TILE_SIZE;
+    int tile_top = tile_y * TILEFINCH_TILE_SIZE;
+    int x0 = tile_left < 0 ? 0 : tile_left;
+    int y0 = tile_top < scroll_y ? scroll_y : tile_top;
+    int x1 = tile_left + TILEFINCH_TILE_SIZE < viewport_width
+             ? tile_left + TILEFINCH_TILE_SIZE : viewport_width;
+    int y1 = tile_top + TILEFINCH_TILE_SIZE < scroll_y + viewport_height
+             ? tile_top + TILEFINCH_TILE_SIZE : scroll_y + viewport_height;
+    for (int world_y = y0; world_y < y1; world_y++) {
+        uint16_t *row = frame + (size_t) (world_y - scroll_y) * viewport_width;
+        for (int x = x0; x < x1; x++) {
+            row[x] = (((x >> 4) ^ (world_y >> 4)) & 1) ? dark : light;
+        }
+    }
+}
+
 void tile_cache_cancel_frame_work(TileCache *cache)
 {
     if (cache == NULL) return;
@@ -2319,8 +2495,11 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
 {
     if (cache == NULL || cache->tiles == NULL || viewport_width <= 0
         || viewport_height <= 0 || scroll_y < 0) return false;
-    if (cache->frame_work.pending) tile_cache_cancel_frame_work(cache);
-    cache->frame_work.ready = false;
+    cache->placeholder_tiles = 0;
+    if (!cache->placeholder_missing) {
+        if (cache->frame_work.pending) tile_cache_cancel_frame_work(cache);
+        cache->frame_work.ready = false;
+    }
     uint64_t started = render_now_us();
     tile_cache_sync_visual_scroll(cache);
     scroll_y = viewport_css_to_device(&cache->source_layout->viewport,
@@ -2377,92 +2556,120 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
                                    viewport_height);
             }
         }
-        if (cache->frame_scratch_tile == NULL) {
-            cache->frame_scratch_tile = budget_malloc(
-                cache->budget, sizeof(*cache->frame_scratch_tile));
-        }
-        if (cache->frame_scratch_tile != NULL) {
-            uint64_t required_mask = required_tiles == 64u
-                ? UINT64_MAX : (UINT64_C(1) << required_tiles) - 1u;
-            uint64_t desired = 0;
-            if (cache->last_frame_scroll_valid
-                && scroll_y == cache->last_frame_scroll_y) {
-                desired = resident;
-                size_t desired_count = 0;
-                for (uint64_t bits = desired; bits != 0; bits &= bits - 1u) {
-                    desired_count++;
-                }
-                for (size_t at = required_tiles;
-                     at != 0 && desired_count < cache->tile_capacity;) {
-                    at--;
-                    uint64_t bit = UINT64_C(1) << at;
-                    if (desired & bit) continue;
-                    desired |= bit;
-                    desired_count++;
-                }
-            } else if (cache->last_frame_scroll_valid
-                       && scroll_y < cache->last_frame_scroll_y) {
-                desired = (UINT64_C(1) << cache->tile_capacity) - 1u;
-            } else {
-                size_t first_desired = required_tiles - cache->tile_capacity;
-                desired = required_mask
-                    & ~((UINT64_C(1) << first_desired) - 1u);
-            }
-            uint64_t missing = required_mask & ~resident;
+        if (cache->placeholder_missing) {
             ordinal = 0;
-            for (int ty = first_ty; ty <= last_ty && ok; ty++) {
-                for (int tx = first_tx; tx <= last_tx && ok;
-                     tx++, ordinal++) {
-                    uint64_t bit = UINT64_C(1) << ordinal;
-                    if (!(missing & bit) || (desired & bit)) continue;
-                    RenderTile *scratch = cache->frame_scratch_tile;
-                    scratch->valid = true;
-                    scratch->tile_x = tx;
-                    scratch->tile_y = ty;
-                    scratch->last_used = ++cache->clock;
-                    rasterize_tile(cache, scratch);
-                    copy_tile_to_frame(scratch, frame, scroll_y,
-                                       viewport_width, viewport_height);
-                }
-            }
-            ordinal = 0;
-            for (int ty = first_ty; ty <= last_ty && ok; ty++) {
-                for (int tx = first_tx; tx <= last_tx && ok;
-                     tx++, ordinal++) {
-                    uint64_t bit = UINT64_C(1) << ordinal;
-                    if (!(missing & bit) || !(desired & bit)) continue;
-                    RenderTile *victim = tile_victim_outside_set(
-                        cache, desired, first_tx, first_ty, columns, rows);
-                    RenderTile *tile = render_tile_miss(
-                        cache, tx, ty, victim, false);
-                    if (tile == NULL) { ok = false; break; }
-                    copy_tile_to_frame(tile, frame, scroll_y, viewport_width,
-                                       viewport_height);
+            for (int ty = first_ty; ty <= last_ty; ty++) {
+                for (int tx = first_tx; tx <= last_tx; tx++, ordinal++) {
+                    if ((resident & (UINT64_C(1) << ordinal)) != 0) continue;
+                    checkerboard_tile_to_frame(cache, tx, ty, frame, scroll_y,
+                                               viewport_width,
+                                               viewport_height);
+                    cache->placeholder_tiles++;
                 }
             }
         } else {
-            RenderTile *churn = NULL;
-            ordinal = 0;
-            for (int ty = first_ty; ty <= last_ty && ok; ty++) {
-                for (int tx = first_tx; tx <= last_tx && ok;
-                     tx++, ordinal++) {
-                    if ((resident & (UINT64_C(1) << ordinal)) != 0) continue;
-                    RenderTile *victim = tile_victim(cache);
-                    if (victim != NULL && victim->valid) {
-                        if (churn == NULL) churn = victim;
-                        victim = churn;
+            if (cache->frame_scratch_tile == NULL) {
+                cache->frame_scratch_tile = budget_malloc(
+                    cache->budget, sizeof(*cache->frame_scratch_tile));
+            }
+            if (cache->frame_scratch_tile != NULL) {
+                uint64_t required_mask = required_tiles == 64u
+                    ? UINT64_MAX : (UINT64_C(1) << required_tiles) - 1u;
+                uint64_t desired = 0;
+                if (cache->last_frame_scroll_valid
+                    && scroll_y == cache->last_frame_scroll_y) {
+                    desired = resident;
+                    size_t desired_count = 0;
+                    for (uint64_t bits = desired; bits != 0; bits &= bits - 1u) {
+                        desired_count++;
                     }
-                    RenderTile *tile = render_tile_miss(
-                        cache, tx, ty, victim, false);
-                    if (tile == NULL) { ok = false; break; }
-                    copy_tile_to_frame(tile, frame, scroll_y, viewport_width,
-                                       viewport_height);
+                    for (size_t at = required_tiles;
+                         at != 0 && desired_count < cache->tile_capacity;) {
+                        at--;
+                        uint64_t bit = UINT64_C(1) << at;
+                        if (desired & bit) continue;
+                        desired |= bit;
+                        desired_count++;
+                    }
+                } else if (cache->last_frame_scroll_valid
+                           && scroll_y < cache->last_frame_scroll_y) {
+                    desired = (UINT64_C(1) << cache->tile_capacity) - 1u;
+                } else {
+                    size_t first_desired = required_tiles - cache->tile_capacity;
+                    desired = required_mask
+                        & ~((UINT64_C(1) << first_desired) - 1u);
+                }
+                uint64_t missing = required_mask & ~resident;
+                ordinal = 0;
+                for (int ty = first_ty; ty <= last_ty && ok; ty++) {
+                    for (int tx = first_tx; tx <= last_tx && ok;
+                         tx++, ordinal++) {
+                        uint64_t bit = UINT64_C(1) << ordinal;
+                        if (!(missing & bit) || (desired & bit)) continue;
+                        RenderTile *scratch = cache->frame_scratch_tile;
+                        scratch->valid = true;
+                        scratch->tile_x = tx;
+                        scratch->tile_y = ty;
+                        scratch->last_used = ++cache->clock;
+                        rasterize_tile(cache, scratch);
+                        copy_tile_to_frame(scratch, frame, scroll_y,
+                                           viewport_width, viewport_height);
+                    }
+                }
+                ordinal = 0;
+                for (int ty = first_ty; ty <= last_ty && ok; ty++) {
+                    for (int tx = first_tx; tx <= last_tx && ok;
+                         tx++, ordinal++) {
+                        uint64_t bit = UINT64_C(1) << ordinal;
+                        if (!(missing & bit) || !(desired & bit)) continue;
+                        RenderTile *victim = tile_victim_outside_set(
+                            cache, desired, first_tx, first_ty, columns, rows);
+                        RenderTile *tile = render_tile_miss(
+                            cache, tx, ty, victim, false);
+                        if (tile == NULL) { ok = false; break; }
+                        copy_tile_to_frame(tile, frame, scroll_y, viewport_width,
+                                           viewport_height);
+                    }
+                }
+            } else {
+                RenderTile *churn = NULL;
+                ordinal = 0;
+                for (int ty = first_ty; ty <= last_ty && ok; ty++) {
+                    for (int tx = first_tx; tx <= last_tx && ok;
+                         tx++, ordinal++) {
+                        if ((resident & (UINT64_C(1) << ordinal)) != 0) continue;
+                        RenderTile *victim = tile_victim(cache);
+                        if (victim != NULL && victim->valid) {
+                            if (churn == NULL) churn = victim;
+                            victim = churn;
+                        }
+                        RenderTile *tile = render_tile_miss(
+                            cache, tx, ty, victim, false);
+                        if (tile == NULL) { ok = false; break; }
+                        copy_tile_to_frame(tile, frame, scroll_y, viewport_width,
+                                           viewport_height);
+                    }
                 }
             }
         }
     } else {
         for (int ty = first_ty; ty <= last_ty && ok; ty++) {
             for (int tx = first_tx; tx <= last_tx && ok; tx++) {
+                if (cache->placeholder_missing) {
+                    RenderTile *resident_tile = find_tile(cache, tx, ty);
+                    if (resident_tile == NULL) {
+                        checkerboard_tile_to_frame(
+                            cache, tx, ty, frame, scroll_y, viewport_width,
+                            viewport_height);
+                        cache->placeholder_tiles++;
+                        continue;
+                    }
+                    cache->hits++;
+                    resident_tile->last_used = ++cache->clock;
+                    copy_tile_to_frame(resident_tile, frame, scroll_y,
+                                       viewport_width, viewport_height);
+                    continue;
+                }
                 RenderTile *tile = ensure_tile(cache, tx, ty);
                 if (tile == NULL) { ok = false; break; }
                 copy_tile_to_frame(tile, frame, scroll_y, viewport_width,
@@ -2755,6 +2962,8 @@ void tile_cache_schedule_prefetch_row(TileCache *cache, int world_y,
        count misses. Skip straight to the overlay/glyph stages instead. */
     int last_tile_x = (viewport_width - 1) / TILEFINCH_TILE_SIZE;
     int next_tile_x = 0;
+    size_t extra_rows = 0;
+    int row_step = 1;
     if (cache->last_frame_scroll_valid) {
         int first_y = cache->last_frame_scroll_y / TILEFINCH_TILE_SIZE;
         int last_y = (int) (((int64_t) cache->last_frame_scroll_y
@@ -2763,7 +2972,17 @@ void tile_cache_schedule_prefetch_row(TileCache *cache, int world_y,
         int columns = (cache->last_frame_viewport_width - 1)
                       / TILEFINCH_TILE_SIZE + 1;
         size_t resident = (size_t) (last_y - first_y + 1) * (size_t) columns;
-        if (cache->tile_capacity <= resident) next_tile_x = last_tile_x + 1;
+        if (cache->tile_capacity <= resident) {
+            next_tile_x = last_tile_x + 1;
+        } else {
+            /* Paint ahead as far as spare slots allow, up to two rows: one
+               Page Down moves most of a screen (about two tile rows). */
+            size_t rows_ahead = (cache->tile_capacity - resident)
+                                / (size_t) columns;
+            if (rows_ahead > 2u) rows_ahead = 2u;
+            extra_rows = rows_ahead > 1u ? rows_ahead - 1u : 0u;
+            if (tile_y < first_y) row_step = -1;
+        }
     }
     tile_cache_cancel_idle_work(cache);
     uint64_t generation = cache->idle_work.generation + 1u;
@@ -2774,6 +2993,9 @@ void tile_cache_schedule_prefetch_row(TileCache *cache, int world_y,
         .next_tile_x = next_tile_x,
         .last_tile_x = last_tile_x,
         .generation = generation,
+        .extra_rows = extra_rows,
+        .row_step = row_step,
+        .prefetch_scroll_y = cache->last_frame_scroll_y,
         .pending = true
     };
     cache->idle_jobs_scheduled++;
@@ -3043,7 +3265,11 @@ static void tile_cache_prefetch_tile(TileCache *cache, int tx, int ty)
     int last_x = (cache->last_frame_viewport_width - 1) / TILEFINCH_TILE_SIZE;
     RenderTile *victim = NULL;
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        RenderTile *tile = &cache->tiles[i];
+        RenderTile *tile = cache->tiles[i];
+        if (tile == NULL) {
+            tile = tile_slot(cache, i);
+            if (tile == NULL) continue;
+        }
         if (!tile->valid) { victim = tile; break; }
         if (tile->tile_x >= 0 && tile->tile_x <= last_x
             && tile->tile_y >= first_y && tile->tile_y <= last_y) continue;
@@ -3069,6 +3295,20 @@ static void tile_cache_run_idle_unit(TileCache *cache)
     } else if (work->stage == RENDER_IDLE_WORK_TILES) {
         if (work->next_tile_x <= work->last_tile_x) {
             tile_cache_prefetch_tile(cache, work->next_tile_x++, work->tile_y);
+        }
+        if (work->next_tile_x > work->last_tile_x && work->extra_rows != 0) {
+            int next_y = work->tile_y + work->row_step;
+            int64_t height = cache->layout == NULL ? 0 : cache->layout->height;
+            if (next_y >= 0
+                && (int64_t) next_y * TILEFINCH_TILE_SIZE < height) {
+                work->tile_y = next_y;
+                work->next_tile_x = 0;
+            }
+            work->extra_rows--;
+        }
+        if (work->next_tile_x > work->last_tile_x && work->extra_rows == 0) {
+            cache->prefetch_done = true;
+            cache->prefetch_done_scroll_y = work->prefetch_scroll_y;
         }
         if (work->next_tile_x > work->last_tile_x) {
             if (!cache->overlay_images_prewarm_complete) {
@@ -3183,15 +3423,23 @@ void tile_cache_prefetch_row(TileCache *cache, int world_y, int viewport_width)
     }
 }
 
+bool tile_cache_prefetch_satisfied(const TileCache *cache)
+{
+    return cache != NULL && cache->prefetch_done
+        && cache->last_frame_scroll_valid
+        && cache->prefetch_done_scroll_y == cache->last_frame_scroll_y;
+}
+
 void tile_cache_invalidate_rect(TileCache *cache, int left, int top,
                                 int right, int bottom)
 {
     if (cache == NULL || cache->tiles == NULL || right <= left
         || bottom <= top) return;
     tile_cache_cancel_frame_work(cache);
+    cache->prefetch_done = false;
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        RenderTile *tile = &cache->tiles[i];
-        if (!tile->valid) continue;
+        RenderTile *tile = cache->tiles[i];
+        if (tile == NULL || !tile->valid) continue;
         int tile_left = tile->tile_x * TILEFINCH_TILE_SIZE;
         int tile_top = tile->tile_y * TILEFINCH_TILE_SIZE;
         if (tile_left < right && tile_left + TILEFINCH_TILE_SIZE > left
@@ -3347,6 +3595,15 @@ size_t tile_cache_reclaim_optional(TileCache *cache)
     tile_cache_clear_layout_transients(cache);
     canvas_overlay_cache_clear(cache);
     glyph_cache_clear(cache, true);
+    cache->prefetch_done = false;
+    /* Paint-ahead slots are the first tiles to go; the base screen stays. */
+    for (size_t i = RENDER_TILE_BASE_CAPACITY;
+         cache->tiles != NULL && i < cache->tile_capacity; i++) {
+        if (cache->tiles[i] == NULL) continue;
+        budget_free(cache->budget, cache->tiles[i]);
+        cache->tiles[i] = NULL;
+        cache->tiles_allocated--;
+    }
     overflow_cache_destroy(cache);
     cache->overflow_cache_disabled = false;
     size_t after = budget_remaining(cache->budget);
@@ -3380,6 +3637,8 @@ static void tile_cache_commit_layout(TileCache *cache,
     cache->last_frame_scroll_valid = false;
     tile_cache_release_visual_layout(cache);
     cache->source_layout = layout;
+    cache->scroll_synced_layout = NULL;
+    cache->overflow_scroll_layout = NULL;
     if (visual->budget != NULL) {
         cache->visual_layout = *visual;
         memset(visual, 0, sizeof(*visual));
@@ -3410,8 +3669,9 @@ bool tile_cache_replace_layout(TileCache *cache,
     tile_cache_commit_layout(cache, layout, &visual);
     canvas_overlay_cache_clear(cache);
     for (size_t i = 0; i < cache->tile_capacity; i++) {
-        cache->tiles[i].valid = false;
+        if (cache->tiles[i] != NULL) cache->tiles[i]->valid = false;
     }
+    cache->prefetch_done = false;
     cache->invalidations++;
     return true;
 }

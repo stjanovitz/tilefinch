@@ -706,7 +706,14 @@ struct RenderOverflowCache {
     uint32_t rounded_clip_indices[64];
     size_t rounded_count;
     bool prepared;
+    /* The scroll state scroll_values were last checked against, when it has
+       a name: tiles call prepare once each, and an unchanged generation
+       spares them the walk over every box. */
+    const LayoutDocument *checked_layout;
+    uint32_t checked_generation;
 };
+
+#define RENDER_OVERFLOW_SIGNATURE_EMPTY UINT64_C(14695981039346656037)
 
 static void overflow_cache_destroy(TileCache *cache)
 {
@@ -845,17 +852,58 @@ static size_t overflow_geometry_lower_bound(
     return low;
 }
 
+/* Names the scroll offsets cache->layout holds: the source layout and its
+   scroll_generation, which every scroll change bumps; for a scaled visual
+   copy, the generation last mirrored into it. False when unknown (a visual
+   copy not yet synced). A relayout destroys the overflow cache, so a reused
+   layout address never matches a stale check. */
+static bool overflow_scroll_state(const TileCache *cache,
+                                  const LayoutDocument **layout,
+                                  uint32_t *generation)
+{
+    const LayoutDocument *source = cache->source_layout;
+    if (source == NULL) return false;
+    if (cache->owns_visual_layout) {
+        if (cache->scroll_synced_layout != source) return false;
+        *generation = cache->scroll_synced_generation;
+    } else {
+        if (cache->layout != source) return false;
+        *generation = source->scroll_generation;
+    }
+    *layout = source;
+    return true;
+}
+
 static bool overflow_cache_prepare(TileCache *cache)
 {
     if (cache->overflow_cache_disabled) return false;
     if (cache->overflow_cache == NULL && !overflow_cache_build(cache)) {
         cache->overflow_cache_disabled = true;
         cache->overflow_cache_fallbacks++;
+        if (cache->overflow_static_active) {
+            cache->overflow_static_active = false;
+            cache->overflow_tile_generation++;
+        }
         return false;
+    }
+    if (!cache->overflow_static_active) {
+        cache->overflow_static_active = true;
+        cache->overflow_tile_generation++;
     }
     struct RenderOverflowCache *overflow = cache->overflow_cache;
     const LayoutDocument *layout = cache->layout;
+    const LayoutDocument *state_layout = NULL;
+    uint32_t state_generation = 0;
+    bool named = overflow_scroll_state(cache, &state_layout,
+                                       &state_generation);
     bool changed = !overflow->prepared;
+    if (!changed && named && overflow->checked_layout == state_layout
+        && overflow->checked_generation == state_generation) {
+        cache->overflow_prepare_skips++;
+        return true;
+    }
+    overflow->checked_layout = named ? state_layout : NULL;
+    overflow->checked_generation = state_generation;
     if (!changed) {
         for (size_t i = 0; i < layout->node_box_count; i++) {
             if (overflow->scroll_values[i * 2u]
@@ -868,6 +916,23 @@ static bool overflow_cache_prepare(TileCache *cache)
         }
     }
     if (!changed) return true;
+    /* What tiles bake depends only on which boxes are scrolled and by how
+       much: a rebuild after damage-limited relayout with nothing scrolled
+       keeps every undamaged tile. */
+    uint64_t signature = RENDER_OVERFLOW_SIGNATURE_EMPTY;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        const LayoutNodeBox *box = &layout->node_boxes[i];
+        if (box->scroll_x == 0 && box->scroll_y == 0) continue;
+        const int values[4] = { box->x, box->y, box->scroll_x, box->scroll_y };
+        const unsigned char *bytes = (const unsigned char *) values;
+        for (size_t at = 0; at < sizeof(values); at++) {
+            signature = (signature ^ bytes[at]) * UINT64_C(1099511628211);
+        }
+    }
+    if (signature != cache->overflow_scroll_signature) {
+        cache->overflow_scroll_signature = signature;
+        cache->overflow_tile_generation++;
+    }
     LayoutPositionedClipIndex positioned = {0};
     if (overflow->clip_count != 0 && overflow->geometry_count != 0)
         layout_positioned_clip_index_prepare(layout, &positioned);
@@ -959,6 +1024,20 @@ static const OverflowGeometry *overflow_cached_geometry(
     if (at >= overflow->geometry_count
         || overflow->geometry[at].command_index != command_index) return NULL;
     return &overflow->geometry[at];
+}
+
+/* The per-frame stream (overflow-clipped content, and late-positioned
+   commands that must paint after it) is static while no overflow box is
+   scrolled: it then paints identically into tiles, after their ordinary
+   content, and the composed frame no longer re-rasterizes it. Any scrolled
+   box returns the whole stream to the per-frame path. */
+static bool overflow_stream_static(const TileCache *cache)
+{
+    return cache->overflow_static_active && cache->overflow_cache != NULL
+        && cache->overflow_cache->prepared
+        && cache->layout->command_flags != NULL
+        && cache->layout->spatial_band_offsets != NULL
+        && cache->overflow_scroll_signature == RENDER_OVERFLOW_SIGNATURE_EMPTY;
 }
 
 static bool append_cached_rounded_clip(const LayoutDocument *layout,

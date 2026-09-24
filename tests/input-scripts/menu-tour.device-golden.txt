@@ -1,5 +1,5 @@
 tilefinch-input-script: text-entry=danzeff
-tilefinch-input-script: armed script=input-script.txt steps=93 stall-limit=1800
+tilefinch-input-script: armed script=input-script.txt steps=94 stall-limit=1800
 tilefinch-input-script: mark=boot step=1 screen=home
 tilefinch-input-script: mark=home-first step=5 screen=home
 tilefinch-input-script: mark=tabs-first step=10 screen=tabs
@@ -17,7 +17,7 @@ tilefinch-input-script: mark=page step=25 screen=page
 tilefinch-input-script: step=25 action=focus-down setting=none screen=page list=0 tab=0
 tilefinch-input-script: step=26 action=focus-right setting=none screen=page list=0 tab=0
 tilefinch-input-script: step=27 action=page-down setting=none screen=page list=0 tab=0
-tilefinch-input-script: step=29 action=page-up setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=28 action=page-up setting=none screen=page list=0 tab=0
 tilefinch-input-script: mark=scrolled step=31 screen=page
 tilefinch-input-script: step=31 action=reload setting=none screen=page list=0 tab=0
 tilefinch-input-script: mark=reloaded step=34 screen=page
@@ -36,7 +36,7 @@ tilefinch-input-script: mark=help step=76 screen=help
 tilefinch-input-script: step=80 action=home setting=none screen=home list=0 tab=0
 tilefinch-input-script: mark=home step=83 screen=home
 tilefinch-input-script: mark=home-moved step=86 screen=home
-tilefinch-input-script: step=88 action=exit setting=none screen=home list=0 tab=0
+tilefinch-input-script: step=89 action=exit setting=none screen=home list=0 tab=0
 tilefinch-input-script: covered action=focus-down count=1
 tilefinch-input-script: covered action=focus-right count=1
 tilefinch-input-script: covered action=reload count=1
@@ -56,4 +56,4 @@ tilefinch-input-script: covered action=exit count=1
 tilefinch-input-script: covered setting=browser-ui-scale count=1
 tilefinch-input-script: covered setting=page-font-percent count=1
 tilefinch-input-script: covered setting=reader-font count=1
-tilefinch-input-script: outcome=exit-action steps=89/93 frames=390 held-frames=78 actions=16 settings=3
+tilefinch-input-script: outcome=exit-action steps=90/94 frames=392 held-frames=79 actions=16 settings=3

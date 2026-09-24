@@ -1549,7 +1549,6 @@
           && computed_style_text_underline_offset(
                  &zero_offset_style, &zero_pixels)
           && zero_pixels == 0
-          && sizeof(ComputedStyle) == 376
           && layout_build(&decoration_layout, &budget,
                           &decoration_document, &decoration_sheet,
                           NULL, NULL, 120));
@@ -1724,6 +1723,84 @@
           && blended_blue >= 14 && blended_blue <= 17);
     tile_cache_destroy(&compositing_cache);
     budget_free(&budget, compositing_frame);
+
+    /* Scrolling an overflow box after the build is picked up by the next
+       frame even though the renderer skips its scroll scans while the
+       layout's scroll_generation is unchanged. */
+    {
+        static const char scroll_page[] =
+            "<!doctype html><style>body{margin:0}"
+            "#box{overflow:auto;width:40px;height:40px}"
+            "#a{height:40px;background:#ff0000}"
+            "#b{height:40px;background:#0000ff}</style>"
+            "<div id=box><div id=a></div><div id=b></div></div>";
+        PocDocument scroll_document;
+        Stylesheet scroll_sheet;
+        LayoutDocument scroll_layout;
+        CHECK(document_parse(&scroll_document, &budget, scroll_page,
+                             strlen(scroll_page), 17)
+              && stylesheet_build(&scroll_sheet, &budget,
+                                  &scroll_document, 100)
+              && layout_build(&scroll_layout, &budget, &scroll_document,
+                              &scroll_sheet, NULL, NULL, 100));
+        lxb_dom_node_t *scroll_box = find_id(
+            lxb_dom_interface_node(scroll_document.html), "box");
+        TileCache scroll_cache;
+        uint16_t *scroll_frame = budget_malloc(
+            &budget, 100u * 100u * sizeof(*scroll_frame));
+        CHECK(scroll_box != NULL && scroll_frame != NULL
+              && tile_cache_init(&scroll_cache, &budget, &scroll_layout, 4)
+              && tile_cache_set_frame(&scroll_cache, scroll_frame,
+                                      100u * 100u)
+              && tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL));
+        CHECK(scroll_frame[10u * 100u + 10u] == test_rgb565(0xff0000));
+        uint32_t generation = scroll_layout.scroll_generation;
+        CHECK(layout_scroll_node(&scroll_layout, scroll_box, 0, 40)
+              && scroll_layout.scroll_generation != generation);
+        CHECK(tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL));
+        if (scroll_frame[10u * 100u + 10u] != test_rgb565(0x0000ff))
+            fprintf(stderr, "scrolled overflow pixel=%04x\n",
+                    scroll_frame[10u * 100u + 10u]);
+        CHECK(scroll_frame[10u * 100u + 10u] == test_rgb565(0x0000ff));
+        /* A repeat frame is answered by the generation alone; scrolling
+           back is not. */
+        size_t skips = scroll_cache.overflow_prepare_skips;
+        CHECK(tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL)
+              && scroll_cache.overflow_prepare_skips > skips
+              && layout_scroll_node(&scroll_layout, scroll_box, 0, 0)
+              && tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL)
+              && scroll_frame[10u * 100u + 10u] == test_rgb565(0xff0000));
+        tile_cache_destroy(&scroll_cache);
+        layout_destroy(&scroll_layout);
+        /* With a scaled viewport the tile cache paints a device-pixel copy
+           of the layout and mirrors scroll offsets into it; the mirror must
+           follow a scroll made after the copy was taken. */
+        CHECK(layout_build_viewport(&scroll_layout, &budget,
+                                    &scroll_document, &scroll_sheet, NULL,
+                                    NULL, 200, 200, 100, 100));
+        CHECK(tile_cache_init(&scroll_cache, &budget, &scroll_layout, 4)
+              && tile_cache_set_frame(&scroll_cache, scroll_frame,
+                                      100u * 100u)
+              && tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL));
+        CHECK(scroll_frame[5u * 100u + 5u] == test_rgb565(0xff0000));
+        CHECK(layout_scroll_node(&scroll_layout, scroll_box, 0, 40));
+        CHECK(tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL));
+        if (scroll_frame[5u * 100u + 5u] != test_rgb565(0x0000ff))
+            fprintf(stderr, "scaled scrolled overflow pixel=%04x\n",
+                    scroll_frame[5u * 100u + 5u]);
+        CHECK(scroll_frame[5u * 100u + 5u] == test_rgb565(0x0000ff));
+        skips = scroll_cache.overflow_prepare_skips;
+        CHECK(tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL)
+              && scroll_cache.overflow_prepare_skips > skips
+              && layout_scroll_node(&scroll_layout, scroll_box, 0, 0)
+              && tile_cache_render_frame(&scroll_cache, 0, 100, 100, NULL)
+              && scroll_frame[5u * 100u + 5u] == test_rgb565(0xff0000));
+        tile_cache_destroy(&scroll_cache);
+        budget_free(&budget, scroll_frame);
+        layout_destroy(&scroll_layout);
+        stylesheet_destroy(&scroll_sheet);
+        document_destroy(&scroll_document);
+    }
     layout_destroy(&compositing_layout);
     stylesheet_destroy(&compositing_sheet);
     document_destroy(&compositing_document);

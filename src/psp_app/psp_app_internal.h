@@ -86,6 +86,7 @@
 #include "tilefinch/update.h"
 #include "tilefinch/viewport.h"
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/psp_update_check.h"
 #include "media_backend_psp_policy.h"
 #include "psp_media_pixels.h"
 
@@ -335,7 +336,31 @@ typedef struct {
     unsigned supervised;
     volatile unsigned presenting;
     volatile unsigned provisional_present_requested;
+    /* Page presses not yet applied to the load preview, signed. */
     volatile int provisional_scroll_requests;
+    /* The load preview frame last presented, which periodic supervisor
+       presents repaint instead of the incumbent page. Set and cleared on
+       the browser thread; retire_frame waits out a callback-thread present
+       before the engine frees it. */
+    const uint16_t *volatile page_frame;
+    uint64_t provisional_fill_us;
+    /* While a load is pending the browser loop stays interactive between
+       pumps: it presents (cursor, menus, toasts over the preview) and acts
+       on presses the supervisor forwards, the supervisor remaining the one
+       receiver of button edges.
+
+       Presses for the browser loop, one per entry so a burst made while
+       it was busy stays a burst: written by the supervisor (head), read
+       by the loop (tail); what is left when the load ends goes to the
+       completed-input FIFO. */
+    volatile uint32_t forwarded_pressed[8];
+    volatile unsigned forwarded_head;
+    volatile unsigned forwarded_tail;
+    /* Published by the browser loop each frame; the supervisor presents
+       only once it has gone quiet. */
+    volatile uint64_t owner_frame_us;
+    volatile uint64_t owner_present_us;
+    volatile unsigned owner_page_screen;
     /* Button edges observed while the browser thread is inside a bounded
        page-owned service. The callback thread records them, but never calls
        into the controller or DOM; cooperate_end transfers the FIFO back to
@@ -369,6 +394,8 @@ bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us);
+void psp_load_experience_report(const char *scope, BrowserEngine *engine,
+                                const BrowserNavigationJobMetrics *metrics);
 #endif
 bool psp_present(const uint16_t *frame, const PspUiState *ui);
 bool psp_present_cursor_feedback(
@@ -387,6 +414,7 @@ bool psp_platform_present(
     size_t height, size_t stride_pixels);
 bool psp_platform_cooperate(
     void *context, const char *phase, size_t completed_work_units);
+void psp_platform_retire_frame(void *context, const uint16_t *pixels);
 void psp_work_cooperate_begin(
     PspUiState *ui, const uint16_t *frame,
     bool periodic_present, bool acknowledge_non_cancel_busy,
@@ -405,13 +433,20 @@ void psp_navigation_cooperate_end(const char *scope);
 bool psp_navigation_cooperate_take_media_intent(
     PspUiMediaIntent *intent);
 bool psp_navigation_cooperate_take_page_input(uint32_t *pressed);
+/* Browser loop, each frame of a supervised load: publish liveness and the
+   page-screen state, and take the presses forwarded to it. */
+uint32_t psp_navigation_cooperate_owner_frame(bool page_screen);
+/* Browser loop present during a supervised load: the preview frame (or the
+   incumbent page) under the loop's own UI. */
+bool psp_navigation_cooperate_owner_present(const PspUiState *ui);
 bool psp_navigation_cooperate_active(void);
 bool psp_navigation_cooperate_supervised(void);
 bool psp_navigation_cancel_requested(void);
 const TilefinchCancellation *psp_navigation_cancellation(void);
 uint32_t psp_navigation_observed_buttons(void);
+/* page: delta is a direction and moves one page; otherwise CSS pixels. */
 bool psp_request_provisional_scroll(
-    BrowserEngine *engine, PspUiState *ui, int direction);
+    BrowserEngine *engine, PspUiState *ui, int delta, bool page);
 void psp_background_ui_tick(void);
 const char *psp_user_visible_error(
     const char *detail, long tls_verify_result,
@@ -565,14 +600,24 @@ void psp_find_sync(BrowserEngine *engine, PspUiState *ui,
                    PspUiFindView *view);
 size_t psp_text_input_prepare_voice(void *user);
 uint32_t psp_ui_buttons(uint32_t buttons);
-uint32_t psp_gamepad_standard_buttons(uint32_t buttons);
+
+/* Ends a cooperative scope and adopts the buttons held through it as the
+   previous button state, so a press made inside the scope does not act
+   again on release. The sample must precede the end, which resets the
+   supervisor state it is read from. */
+static inline void psp_navigation_cooperate_end_adopting_buttons(
+    const char *scope, uint32_t *previous_buttons)
+{
+    uint32_t observed = psp_ui_buttons(psp_navigation_observed_buttons());
+    psp_navigation_cooperate_end(scope);
+    *previous_buttons = observed;
+}
 uint32_t psp_gamepad_standard_ui_buttons(uint32_t buttons);
 /* Consume button-down transitions accumulated by the PSP controller service.
    Current held state and analog axes still come from SceCtrlData. */
 uint32_t psp_controller_take_latched_pressed(void);
 PspUiInput psp_ui_input(const SceCtrlData *pad, uint32_t previous_buttons,
                         unsigned elapsed_ms);
-const char *psp_ui_action_name(PspUiAction action);
 const char *psp_ui_action_acknowledgement(PspUiAction action);
 bool psp_present_action_ack(const uint16_t *frame, PspUiState *ui,
                            PspUiAction action, const char *message,
@@ -695,6 +740,13 @@ typedef struct {
     PspUiFindView find_view;
     PspHomeSurface home_surface;
     PspCollectionsSurface collections_surface;
+    /* Settings > Device & storage > Site storage, and the full origins its
+       rows and the Memory Stick offer act on (the UI keeps shortened
+       labels). */
+    PspUiSiteStorageView site_storage_view;
+    char site_storage_origins[PSP_UI_SITE_STORAGE_ROW_LIMIT]
+                            [BROWSER_ORIGIN_LIMIT];
+    char site_storage_offer_origin[BROWSER_ORIGIN_LIMIT];
     bool chrome_fonts_bound;
 } PspPresentationResources;
 
@@ -720,6 +772,7 @@ typedef struct {
     char content_blocker[PSP_STORAGE_PATH_CAPACITY];
     char content_allowlist[PSP_STORAGE_PATH_CAPACITY];
     char offline_library[PSP_STORAGE_PATH_CAPACITY];
+    char site_storage[PSP_STORAGE_PATH_CAPACITY];
 } PspStoragePaths;
 
 /* One operation record, rather than six pointers to main's locals. This is
@@ -904,6 +957,28 @@ typedef struct {
 
 typedef struct PspCaptivePortal PspCaptivePortal;
 
+/* What the failed-load recovery sheet can do. An ordinary failed navigation
+   sits over its incumbent page, so Return only dismisses the sheet. Only a
+   successfully committed blank page needs Return to move history (in the
+   exact direction that restores the originating entry) or, when there is no
+   history predecessor, to reopen native Home. */
+typedef enum {
+    PSP_RECOVERY_OFFER_NONE = 0,
+    PSP_RECOVERY_OFFER_OVER_INCUMBENT,
+    PSP_RECOVERY_OFFER_RETURN_BACK,
+    PSP_RECOVERY_OFFER_RETURN_FORWARD,
+    PSP_RECOVERY_OFFER_RETURN_HOME
+} PspRecoveryOffer;
+
+/* The same offer without a history or Home return: what remains once a
+   later failure overlays the page again or a commit supersedes it. */
+static inline PspRecoveryOffer psp_recovery_offer_without_return(
+    PspRecoveryOffer offer)
+{
+    return offer == PSP_RECOVERY_OFFER_NONE
+        ? PSP_RECOVERY_OFFER_NONE : PSP_RECOVERY_OFFER_OVER_INCUMBENT;
+}
+
 /* Persistent state owned by one interactive-loop invocation. These are
    operation records and counters, not parallel media/network control state. */
 typedef struct {
@@ -922,13 +997,9 @@ typedef struct {
     PspCaptivePortal *captive_portal;
     bool blank_reader_recovery_pending;
     uint64_t blank_reader_recovery_generation;
-    bool lifecycle_retry_available;
-    /* Only a successfully committed blank page needs Recovery Return to move
-       history or restore native Home; ordinary failed navigations still sit
-       over their incumbent. */
-    bool lifecycle_retry_return_back;
-    bool lifecycle_retry_return_forward;
-    bool lifecycle_retry_return_home;
+    /* The failed-load recovery sheet's offer; lifecycle_retry_url is the
+       page Retry reloads while the offer is not NONE. */
+    PspRecoveryOffer recovery_offer;
     uint8_t captive_portal_failure_count;
     char lifecycle_retry_url[NAVIGATION_URL_LIMIT];
     /* Callback-supervisor input waiting for the browser thread to regain a
@@ -1009,17 +1080,27 @@ typedef struct {
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     PspNetwork *network;
     PspNetworkLifecycle *network_lifecycle;
-    bool *update_check_pending;
-    bool *update_check_running;
+    /* This boot's background update-available check. */
+    PspUpdateCheck *update_check;
 #endif
     PspInteractiveState *interactive;
 } PspApp;
+
+/* The profile asks for update checks and a trusted endpoint exists for its
+   channel: the settings half of the update check's eligibility (see
+   tilefinch/psp_update_check.h), used at boot and after every change. */
+bool psp_app_update_check_configured(const BrowserProfile *profile,
+                                     const PspBootConfig *config);
 
 /* Rebuilt every iteration of the interactive loop. */
 typedef struct {
     uint64_t ui_sample_us;
     bool page_dirty;
     bool pointer_activation;
+    /* The activation came from a cursor click on the loading page. */
+    bool preview_pointer;
+    int preview_pointer_x;
+    int preview_pointer_y;
 } PspAppFrameState;
 
 /* src/psp_app/psp_app_captive_portal.c. One user-triggered probe and one
@@ -1062,6 +1143,19 @@ void psp_app_frame_pump_ran(PspApp *app, FramePumpId id);
 bool psp_app_frame_pump_run(PspApp *app, FramePumpId id);
 void psp_app_pump_provider_handoff_reclaim(
     PspApp *app, uint64_t frame_us, bool player_presented);
+/* src/psp_app/psp_app_storage.c */
+void psp_app_site_storage_boot(PspProcessResources *process,
+                               PspBrowserResources *browser);
+void psp_app_site_storage_sync_ui(PspUiState *ui,
+                                  const BrowserSession *session,
+                                  const BrowserProfile *profile,
+                                  const char *url);
+/* Shows a pending Memory Stick offer over the page; true when it opened. */
+bool psp_app_site_storage_poll(PspApp *app);
+void psp_app_site_storage_action(PspApp *app, PspAppFrameState *frame,
+                                 const PspUiIntent *intent);
+bool psp_app_site_storage_setting(PspApp *app, PspAppFrameState *frame,
+                                  const PspUiIntent *intent);
 /* src/psp_app/psp_app_settings.c */
 void psp_app_apply_setting(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);

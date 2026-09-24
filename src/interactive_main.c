@@ -464,6 +464,7 @@ int main(int argc, char **argv)
     bool external_resources = true;
     bool forced_dark = false;
     bool progressive_first_paint = true;
+    uint64_t relayout_preview_us = UINT64_C(150000);
     bool hide_cookie_banners = false;
     bool reader_mode = false;
     bool wpt_test_rendered = false;
@@ -518,6 +519,10 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--no-progressive-first-paint") == 0) {
             progressive_first_paint = false;
+        }
+        else if (strcmp(argv[i], "--relayout-preview-us") == 0
+                 && i + 1 < argc) {
+            relayout_preview_us = strtoull(argv[++i], NULL, 10);
         }
         else if (strcmp(argv[i], "--wpt-test-rendered") == 0) {
             wpt_test_rendered = true;
@@ -921,6 +926,7 @@ int main(int argc, char **argv)
     }
     engine_config->resources.enabled = external_resources;
     engine_config->progressive_first_paint = progressive_first_paint;
+    engine_config->relayout_preview_threshold_us = relayout_preview_us;
     engine_config->resources.maximum_stylesheets = stylesheet_count;
     engine_config->resources.maximum_stylesheet_bytes = stylesheet_bytes;
     engine_config->resources.maximum_stylesheet_file_bytes =
@@ -2181,6 +2187,27 @@ int main(int argc, char **argv)
             && !loop_render(
                 engine, &cache, &navigation, &controller, &media,
                 platform_sim ? NULL : output, NULL))) goto cleanup;
+    {
+        /* Debug aid: TILEFINCH_DEBUG_BOX_CLASS=substr prints the laid-out
+           boxes of elements whose class contains it (first 16). */
+        const char *box_class = getenv("TILEFINCH_DEBUG_BOX_CLASS");
+        const LayoutDocument *boxes = &navigation.page.layout;
+        for (size_t i = 0, shown = 0; box_class != NULL && shown < 16
+                                      && i < boxes->node_box_count; i++) {
+            const LayoutNodeBox *box = &boxes->node_boxes[i];
+            size_t class_length = 0;
+            const char *class_name = box->node == NULL ? NULL
+                : document_attribute(box->node, "class", &class_length);
+            if (class_name == NULL
+                || strstr(class_name, box_class) == NULL) continue;
+            shown++;
+            printf("debug-box class=%.*s xywh=%d,%d,%d,%d content=%d,%d "
+                   "commands=%u..%u\n", (int) class_length, class_name,
+                   box->x, box->y, box->width, box->height,
+                   box->content_width, box->content_height,
+                   box->command_start, box->command_end);
+        }
+    }
     if (!dump_text_metrics(text_metrics_path, &navigation.page.layout)) {
         fprintf(stderr, "could not write text metrics: %s\n",
                 text_metrics_path == NULL ? "" : text_metrics_path);
@@ -2206,6 +2233,10 @@ int main(int argc, char **argv)
                (unsigned long long) job_metrics.maximum_transform_slice_us);
     }
 
+    /* Advances refresh only what the loop acts on; the report reads the
+       diagnostic counters too. */
+    script_runtime_refresh_result(navigation.page.runtime,
+                                  &navigation.page.script_result);
     printf("interactive status=ok title=\"%s\" height=%d scroll-y=%d links=%zu controls=%zu "
            "ticks=%zu callbacks=%zu pending=%zu relayouts=%zu\n",
            navigation.page.document.title, navigation.page.layout.height,
@@ -2282,6 +2313,7 @@ int main(int argc, char **argv)
             printf("deterministic-replay enabled=yes diagnostics=unavailable\n");
         }
     }
+    document_refresh_attribute_totals(&navigation.page.document);
     printf("document-memory nodes=%zu elements=%zu text-nodes=%zu "
            "attributes=%zu attribute-bytes=%zu body-text=%zu\n",
            navigation.page.document.node_count,
@@ -3568,9 +3600,14 @@ int main(int argc, char **argv)
                    child->callback_error_source_context);
         }
     }
+    size_t storage_bytes = 0;
+    BrowserSiteStorageInfo storage_site;
+    for (size_t i = 0; browser_session_site_storage_info(
+                           &session, i, &storage_site); i++)
+        storage_bytes += storage_site.bytes;
     printf("session storage=%zu cookies=%zu cache=%zu cache-hits=%zu "
            "cache-misses=%zu evictions=%zu\n",
-           session.storage_bytes, session.cookie_bytes, session.cache_bytes,
+           storage_bytes, session.cookie_bytes, session.cache_bytes,
            session.cache_hits, session.cache_misses,
            session.cache_evictions);
     printf("session cookie-names=");

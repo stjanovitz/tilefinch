@@ -9,11 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <lexbor/dom/interfaces/node.h>
 
 #include "tilefinch/platform.h"
 #include "../src/js_runtime_internal.h"
+#include "../src/tilefinch_test_faults.h"
 #include "tilefinch/budget_quickjs.h"
 
 #define MIB (1024u * 1024u)
@@ -217,6 +219,298 @@ static int test_job_heap_rejection_is_fatal(void)
           && strcmp(result.summary, "JOB-HEAP-RECOVERED") == 0);
     JS_FreeValue(runtime->context, callback);
     JS_FreeValue(runtime->context, global);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* After parsing, an attribute or inline-style write changes no document
+   statistic but the attribute totals, so the next advance must not pay a
+   whole-document refresh; a structural mutation still does. */
+static int test_attribute_mutation_skips_document_refresh(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><p id=a class=x>Ready</p></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://attribute-refresh.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    size_t attributes = document.attribute_count;
+    CHECK(!document.bidi_markup_present && !document.attribute_totals_stale);
+    /* A refresh attempted now would be refused and fail the page. */
+    script_runtime_test_refuse_next_document_refresh();
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "const p=document.getElementById('a');"
+              "p.setAttribute('dir','rtl');p.style.color='red';"
+              "p.removeAttribute('class');globalThis.pocSummary='ATTR'",
+              "<attribute-mutation>", &result)
+          && strcmp(result.summary, "ATTR") == 0
+          && script_runtime_advance(runtime, 0, 1024, &result)
+          && !script_runtime_document_refresh_failed(runtime));
+    CHECK(document.bidi_markup_present && document.attribute_totals_stale);
+    document_refresh_attribute_totals(&document);
+    CHECK(!document.attribute_totals_stale
+          && document.attribute_count == attributes + 1u);
+    /* A structural mutation refreshes, which consumes the refusal. */
+    (void) script_runtime_evaluate_diagnostic(
+        runtime, "document.body.appendChild(document.createElement('p'))",
+        "<structural-mutation>", &result);
+    (void) script_runtime_advance(runtime, 0, 1024, &result);
+    CHECK(script_runtime_document_refresh_failed(runtime));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* getElementById reads each element's id attribute; renames and removals
+   must be seen at once, and the empty string never matches. */
+static int test_get_element_by_id_tracks_id_changes(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><p id=first>a</p><p id=''>b</p></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000, "https://by-id.test/", NULL,
+        &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "const a=document.getElementById('first'),r=[a!==null,"
+              "document.getElementById('')===null];a.id='second';"
+              "r.push(document.getElementById('first')===null,"
+              "document.getElementById('second')===a);"
+              "a.removeAttribute('id');"
+              "r.push(document.getElementById('second')===null);"
+              "globalThis.pocSummary=r.every(Boolean)?'BY-ID-OK':"
+              "'BY-ID-FAILED:'+r",
+              "<by-id>", &result)
+          && strcmp(result.summary, "BY-ID-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Custom-element hooks skip all work until something is defined; after a
+   definition, wrappers made earlier upgrade, removal still reaches
+   disconnectedCallback, and a re-created wrapper keeps its prototype. */
+static int test_custom_element_hooks_after_first_definition(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><x-early id=early></x-early></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000, "https://custom.test/", NULL,
+        &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const early=document.getElementById('early');"
+              "const d=document.createElement('div');document.body.appendChild(d);"
+              "d.remove();const log=[];class XEarly extends HTMLElement{"
+              "connectedCallback(){log.push('c')}"
+              "disconnectedCallback(){log.push('d')}}"
+              "customElements.define('x-early',XEarly);"
+              "const upgraded=early instanceof XEarly;early.remove();"
+              "document.body.appendChild(early);__tilefinchClearNodeCache();"
+              "const again=document.getElementById('early');"
+              "globalThis.pocSummary=upgraded&&again instanceof XEarly"
+              "&&log.join('')==='cdc'?'CE-OK':'CE:'+upgraded+','"
+              "+(again instanceof XEarly)+','+log.join('');})()",
+              "<custom-element-hooks>", &result)
+          && strcmp(result.summary, "CE-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Script-facing helpers made cheaper must keep their answers: focus leaves
+   an element that became unfocusable (judged on the task's final state),
+   a custom element still observes its style attribute, and cached selector
+   validation still throws for every invalid use. */
+static int test_focus_style_and_selector_helpers(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><div id=list></div>"
+        "<input id=gone><input id=kept><input id=flip></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 6u * MIB, 4000, "https://helpers.test/", NULL,
+        &result);
+    CHECK(runtime != NULL);
+    static const char *const focus_cases[][2] = {
+        { "gone", "document.getElementById('gone').disabled=true;" },
+        { "kept", "" },
+        { "flip", "const f=document.getElementById('flip');"
+                  "f.disabled=true;f.disabled=false;" },
+    };
+    for (size_t i = 0; i < 3; i++) {
+        char script[512];
+        snprintf(script, sizeof(script),
+                 "(()=>{document.getElementById('%s').focus();"
+                 "const list=document.getElementById('list');"
+                 "for(let i=0;i<40;i++){list.textContent=String(i);"
+                 "list.style.width=i+'px';}%s"
+                 "globalThis.pocSummary='queued';})()",
+                 focus_cases[i][0], focus_cases[i][1]);
+        CHECK(script_runtime_evaluate_diagnostic(
+                  runtime, script, "<focus-fixup>", &result));
+        for (int step = 0; step < 4; step++)
+            CHECK(script_runtime_advance(runtime, 20, 64, &result));
+        CHECK(script_runtime_evaluate_diagnostic(
+                  runtime,
+                  "globalThis.pocSummary=document.activeElement===document.body"
+                  "?'body':String(document.activeElement.id)",
+                  "<focus-result>", &result));
+        const char *expected = i == 0 ? "body" : focus_cases[i][0];
+        if (strcmp(result.summary, expected) != 0)
+            fprintf(stderr, "focus case %zu: %s\n", i, result.summary);
+        CHECK(strcmp(result.summary, expected) == 0);
+    }
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const seen=[];class XStyled extends HTMLElement{"
+              "static get observedAttributes(){return['style']}"
+              "attributeChangedCallback(n,o,v){seen.push(n+':'+(o===null)+':'"
+              "+/red/.test(v))}}customElements.define('x-styled',XStyled);"
+              "const x=document.createElement('x-styled');document.body.appendChild(x);"
+              "x.style.color='red';const plain=document.createElement('p');"
+              "plain.style.setProperty('color','blue');const throws=()=>{"
+              "try{document.body.matches('p[');return false}catch(e){"
+              "return e.name==='SyntaxError'}};const t1=throws(),t2=throws();"
+              "const inner=document.createElement('span');x.appendChild(inner);"
+              "const ok=seen.join()==='style:true:true'"
+              "&&plain.style.color==='blue'&&t1&&t2"
+              "&&inner.closest('x-styled')===x&&inner.closest('x-styled')===x"
+              "&&x.matches(':defined')&&inner.closest(':scope')===inner;"
+              "globalThis.pocSummary=ok?'HELPERS-OK':'HELPERS:'+seen.join()"
+              "+','+plain.style.color+','+t1+t2;})()",
+              "<style-and-selectors>", &result)
+          && strcmp(result.summary, "HELPERS-OK") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const a=new Event('x'),b=new Event('y'),"
+              "d=Object.getOwnPropertyDescriptor(a,'isTrusted'),"
+              "el=document.createElement('p');el.className='a b a';"
+              "const r=[d.get===Object.getOwnPropertyDescriptor(b,'isTrusted')"
+              ".get,d.enumerable&&!d.configurable,a.isTrusted===false,"
+              "el.classList.toggle('c')===true,el.className==='a b c',"
+              "el.classList.toggle('a')===false,el.className==='b c',"
+              "el.classList.contains('b'),!el.classList.contains(''),"
+              "el.classList.toggle('b',true)===true,el.className==='b c',"
+              "el.classList.toggle('z',false)===false,el.className==='b c'];"
+              "globalThis.pocSummary=r.every(Boolean)?'TOKENS-OK':"
+              "'TOKENS:'+r})()",
+              "<tokens-and-events>", &result)
+          && strcmp(result.summary, "TOKENS-OK") == 0);
+    /* Canvas size is re-read once per scheduler tick; every attribute path
+       must still reset the bitmap at once through the attribute hook. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const c=document.createElement('canvas');"
+              "document.body.appendChild(c);const x=c.getContext('2d');"
+              "const cleared=()=>x.getImageData(0,0,1,1).data[3]===0;"
+              "const r=[];x.fillRect(0,0,300,150);c.setAttribute('width','40');"
+              "r.push(cleared());x.fillRect(0,0,300,150);c.width=30;"
+              "r.push(cleared());x.fillRect(0,0,300,150);"
+              "c.getAttributeNode('width').value='20';r.push(cleared());"
+              "x.fillRect(0,0,300,150);c.setAttributeNS(null,'height','10');"
+              "r.push(cleared());x.fillRect(0,0,300,150);"
+              "c.removeAttributeNS(null,'height');r.push(cleared());"
+              "x.fillRect(0,0,300,150);c.toggleAttribute('width');"
+              "r.push(cleared(),c.width===300,c.height===150);"
+              "globalThis.pocSummary=r.every(Boolean)?'CANVAS-SIZE-OK':"
+              "'CANVAS-SIZE:'+r})()",
+              "<canvas-size-paths>", &result)
+          && strcmp(result.summary, "CANVAS-SIZE-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Inserting a subtree classifies its resources from the attributes of the
+   elements that can load one; other elements need no attribute lookups.
+   The classification must still see images, posters and stylesheets, and
+   still ignore a non-stylesheet link. */
+static int test_inserted_subtree_resource_classification(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><head></head><body><div id=host></div></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 6u * MIB, 4000, "https://classify.test/", NULL,
+        &result);
+    CHECK(runtime != NULL);
+    static const struct {
+        const char *markup;
+        const char *parent;
+        bool image_scan;
+        bool rebuild;
+    } cases[] = {
+        { "<div><p class=a data-x=1>text <b title=t>b</b></p></div>",
+          "host", false, false },
+        { "<p><span><img src=a.png alt=x></span></p>", "host", true, false },
+        { "<section><video poster=p.png></video></section>", "host",
+          true, false },
+        { "<link rel=stylesheet href=s.css>", "head", false, true },
+        { "<link rel=preload href=s.js as=script>", "head", false, false },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        memset(&runtime->bridge.mutations, 0,
+               sizeof(runtime->bridge.mutations));
+        char script[512];
+        snprintf(script, sizeof(script),
+                 "(()=>{const t=document.createElement('template');"
+                 "t.innerHTML='%s';const n=document.importNode("
+                 "t.content.firstChild,true);(%s).appendChild(n);"
+                 "globalThis.pocSummary='inserted';})()",
+                 cases[i].markup,
+                 strcmp(cases[i].parent, "head") == 0
+                     ? "document.head" : "document.getElementById('host')");
+        CHECK(script_runtime_evaluate_diagnostic(
+                  runtime, script, "<classify>", &result)
+              && strcmp(result.summary, "inserted") == 0);
+        const ScriptMutationJournal *journal = &runtime->bridge.mutations;
+        if (journal->image_resource_scan_required != cases[i].image_scan
+            || journal->resource_rebuild_required != cases[i].rebuild) {
+            fprintf(stderr, "classification case %zu: scan=%d rebuild=%d\n",
+                    i, journal->image_resource_scan_required,
+                    journal->resource_rebuild_required);
+        }
+        CHECK(journal->image_resource_scan_required == cases[i].image_scan
+              && journal->resource_rebuild_required == cases[i].rebuild);
+    }
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -1047,6 +1341,78 @@ static int test_computed_style_native_cooperation(void)
     return 0;
 }
 
+/* Consecutive computed-style reads of one element reuse its cascade; the
+   memo must still see a class change, a sibling that flips :last-child,
+   and a native DOM change made between two entries into JavaScript (as the
+   parser makes), none of which may leave a stale value. */
+static int test_computed_style_memo_invalidation(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><style>p{display:block;color:rgb(0,0,255)}"
+        "p.gone{display:none}p:last-child{color:rgb(255,0,0)}</style>"
+        "<body><div id=host><p id=probe>Text</p></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 31)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://memo.test/", &options,
+        &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const p=document.getElementById('probe'),"
+              "cs=getComputedStyle(p),r=[cs.display==='block',"
+              "cs.color==='rgb(255, 0, 0)'];p.className='gone';"
+              "r.push(cs.display==='none');p.className='';"
+              "r.push(cs.display==='block');const q=document.createElement('p');"
+              "document.getElementById('host').appendChild(q);"
+              "r.push(cs.color==='rgb(0, 0, 255)');q.remove();"
+              "r.push(cs.color==='rgb(255, 0, 0)');"
+              "globalThis.pocSummary=r.every(Boolean)?'MEMO-OK':'MEMO:'+r})()",
+              "<computed-style-memo>", &result)
+          && strcmp(result.summary, "MEMO-OK") == 0);
+    /* Leave a memo for the probe, then append a sibling natively, which
+       bumps no DOM generation, as the parser would between scripts. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=getComputedStyle("
+              "document.getElementById('probe')).color",
+              "<computed-style-before>", &result)
+          && strcmp(result.summary, "rgb(255, 0, 0)") == 0);
+    lxb_dom_node_t *host = find_element_id(
+        lxb_dom_interface_node(document.html), "host");
+    CHECK(host != NULL);
+    lxb_dom_element_t *sibling = lxb_dom_document_create_element(
+        lxb_dom_interface_node(document.html)->owner_document,
+        (const lxb_char_t *) "p", 1, NULL);
+    CHECK(sibling != NULL);
+    lxb_dom_node_insert_child(host, lxb_dom_interface_node(sibling));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=getComputedStyle("
+              "document.getElementById('probe')).color",
+              "<computed-style-after>", &result)
+          && strcmp(result.summary, "rgb(0, 0, 255)") == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_native_dynamic_code_policy(void)
 {
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
@@ -1216,9 +1582,15 @@ int main(int argc, char **argv)
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
+    CHECK(test_computed_style_memo_invalidation() == 0);
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
     CHECK(test_job_heap_rejection_is_fatal() == 0);
+    CHECK(test_attribute_mutation_skips_document_refresh() == 0);
+    CHECK(test_get_element_by_id_tracks_id_changes() == 0);
+    CHECK(test_custom_element_hooks_after_first_definition() == 0);
+    CHECK(test_focus_style_and_selector_helpers() == 0);
+    CHECK(test_inserted_subtree_resource_classification() == 0);
     CHECK(test_blank_recovery_author_work_census() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     CHECK(test_user_activation_expiry() == 0);
@@ -5898,6 +6270,53 @@ int main(int argc, char **argv)
           && result.dom_handle_slots_peak
                < SCRIPT_DOM_HANDLE_SLOT_CAPACITY);
 
+    /* Handle lookup goes through a pointer index. Register live nodes
+       interleaved with detached throwaways, let collection retire the
+       throwaways (deleting index entries between the live ones), then drop
+       every wrapper: re-registering each live node must find its handle. */
+    static const char dom_handle_index_setup[] =
+        "(()=>{const host=document.createElement('div');host.id='hx';"
+        "document.body.appendChild(host);const kept=[];"
+        "for(let i=0;i<2000;i++){const s=document.createElement('span');"
+        "host.appendChild(s);kept.push(s.__handle);"
+        "document.createTextNode('t'+i).__handle;}"
+        "globalThis.__tilefinchIndexKept=kept;__tilefinchClearNodeCache();"
+        "globalThis.pocSummary='DOM-HANDLE-INDEX-SETUP';})()";
+    static const char dom_handle_index_verify[] =
+        "(()=>{__tilefinchClearNodeCache();const kept="
+        "globalThis.__tilefinchIndexKept,seen=new Set();let same=0,i=0;"
+        "for(let c=document.getElementById('hx').firstChild;c;"
+        "c=c.nextSibling,i++){const h=c.__handle;if(h===kept[i])same++;"
+        "seen.add(h);}document.getElementById('hx').remove();"
+        "globalThis.pocSummary=same===2000&&seen.size===2000"
+        "?'DOM-HANDLE-INDEX-OK':'DOM-HANDLE-INDEX-FAILED:'+same+'/'"
+        "+seen.size;})()";
+    size_t index_releases_before = result.dom_handle_wrapper_releases;
+    bool index_setup = script_runtime_evaluate_diagnostic(
+        runtime, dom_handle_index_setup, "<dom-handle-index-setup>",
+        &result);
+    bool index_collected = index_setup
+        && collect_and_drain_finalizers(runtime, &result);
+    if (!index_collected
+        || result.dom_handle_wrapper_releases
+               < index_releases_before + 256) {
+        fprintf(stderr, "DOM handle index setup=%d summary=%s error=%s "
+                "collected=%d releases=%zu->%zu live=%zu\n",
+                index_setup, result.summary, result.error, index_collected,
+                index_releases_before, result.dom_handle_wrapper_releases,
+                result.dom_handle_slots_live);
+    }
+    CHECK(index_collected
+          && result.dom_handle_wrapper_releases
+                 >= index_releases_before + 256);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, dom_handle_index_verify, "<dom-handle-index-verify>",
+              &result));
+    if (strcmp(result.summary, "DOM-HANDLE-INDEX-OK") != 0)
+        fprintf(stderr, "DOM handle index probe: %s error=%s\n",
+                result.summary, result.error);
+    CHECK(strcmp(result.summary, "DOM-HANDLE-INDEX-OK") == 0);
+
     /* Start detached-subtree ownership in a fresh bounded realm so it
        measures its own transient rather than unrelated test-order debt. */
     script_runtime_destroy(runtime);
@@ -6402,6 +6821,65 @@ int main(int argc, char **argv)
     script_runtime_destroy(installed_bytecode_runtime);
     browser_session_destroy(&installed_bytecode_session);
     CHECK(budget.current == bytecode_baseline);
+
+    puts("test: a storage change the Memory Stick refuses reaches the page");
+    {
+        static const char storage_site[] = "https://example.test/";
+        char storage_directory[64];
+        snprintf(storage_directory, sizeof(storage_directory),
+                 "/tmp/tilefinch-js-storage-XXXXXX");
+        BrowserSession storage_session = {0};
+        ScriptRuntimeOptions storage_options = options;
+        storage_options.session = &storage_session;
+        CHECK(mkdtemp(storage_directory) != NULL
+              && browser_session_init(&storage_session, &budget,
+                                      512u * 1024u)
+              && browser_session_site_storage_configure(
+                     &storage_session, storage_directory)
+              && browser_session_site_storage_set_policy(
+                     &storage_session, storage_site,
+                     BROWSER_SITE_STORAGE_STICK));
+        ScriptResult storage_result = {0};
+        ScriptRuntime *storage_runtime = script_runtime_create_configured(
+            &document, &budget, 16u * MIB, 8000, storage_site,
+            &storage_options, &storage_result);
+        CHECK(storage_runtime != NULL
+              && script_runtime_evaluate_diagnostic(
+                     storage_runtime,
+                     "localStorage.setItem('keep','1');"
+                     "localStorage.setItem('other','2')",
+                     "<storage-seed>", &storage_result));
+        /* Refused: the call throws and the items stay. */
+        tilefinch_test_faults()->fail_site_storage_appends = 1;
+        CHECK(script_runtime_evaluate_diagnostic(
+                  storage_runtime,
+                  "(()=>{let name='none';try{localStorage.removeItem('keep')}"
+                  "catch(error){name=error.name}globalThis.pocSummary=name+"
+                  "','+localStorage.getItem('keep')})()",
+                  "<storage-remove-refused>", &storage_result)
+              && strcmp(storage_result.summary, "UnknownError,1") == 0);
+        tilefinch_test_faults()->fail_site_storage_appends = 2;
+        CHECK(script_runtime_evaluate_diagnostic(
+                  storage_runtime,
+                  "(()=>{let name='none';try{localStorage.clear()}"
+                  "catch(error){name=error.name}globalThis.pocSummary=name+"
+                  "','+localStorage.length})()",
+                  "<storage-clear-refused>", &storage_result)
+              && strcmp(storage_result.summary, "UnknownError,2") == 0);
+        /* Accepted: no exception, and the items are gone. */
+        CHECK(script_runtime_evaluate_diagnostic(
+                  storage_runtime,
+                  "localStorage.removeItem('keep');localStorage.clear();"
+                  "globalThis.pocSummary='cleared,'+localStorage.length",
+                  "<storage-clear>", &storage_result)
+              && strcmp(storage_result.summary, "cleared,0") == 0);
+        script_runtime_destroy(storage_runtime);
+        CHECK(browser_session_site_storage_forget(&storage_session,
+                                                  storage_site));
+        browser_session_destroy(&storage_session);
+        rmdir(storage_directory);
+        CHECK(budget.current == bytecode_baseline);
+    }
 
     size_t module_budget_baseline = budget.current;
 

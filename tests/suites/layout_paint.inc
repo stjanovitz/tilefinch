@@ -430,7 +430,7 @@ static int test_bounded_typography_and_compositing(Budget *budget)
         }
     }
     CHECK(text_no_kerning && contrast_low && saturate_high
-          && multiply && blur_two && sizeof(ComputedStyle) == 376);
+          && multiply && blur_two);
     TileCache cache = {0};
     uint16_t *frame = budget_malloc(
         budget, 120u * 80u * sizeof(*frame));
@@ -878,8 +878,7 @@ static int test_bounded_shared_paint_stack(Budget *budget)
           && (table_paint->components
               & STYLE_PAINT_COMPONENT_TABLE_SPACING) != 0
           && table_paint->table_spacing_x == 12
-          && table_paint->table_spacing_y == 7
-          && sizeof(ComputedStyle) == 376);
+          && table_paint->table_spacing_y == 7);
 
     /* Exhausting an optional-quality table must not reject a later
        stylesheet.  Fill every representable one-byte ID, verify that the

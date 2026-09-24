@@ -432,10 +432,10 @@ bool psp_run_initial_page_load(
                     provisional.pixels, provisional.pixel_count);
                 printf(
                     "tilefinch-psp-script: provisional-frame-dumped=%d "
-                    "frame=%zu/%zu y=%d\n",
-                    provisional_dumped ? 1 : 0,
-                    provisional.current_frame + 1u,
-                    provisional.frame_count, provisional.scroll_y);
+                    "y=%d/%d content-end=%d\n",
+                    provisional_dumped ? 1 : 0, provisional.scroll_y,
+                    provisional.maximum_scroll_y,
+                    provisional.content_end_y);
                 psp_log_operation_end(
                     dump_operation, "provisional-frame-dump",
                     provisional_dumped ? "ok" : "failed");
@@ -472,9 +472,12 @@ bool psp_run_initial_page_load(
            (unsigned long long) performance->runtime_us,
            browser_engine_last_error(engine));
 #endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_load_experience_report("initial", engine, &metrics);
+#endif
     printf("tilefinch-navigation-job: initial status=%d pumps=%zu "
            "body=%zuB yields=%zu max-pump=%lluus parser-max=%lluus "
-           "preview=%zu/%zu nav-start=%lluus capture=%lluus first=%lluus "
+           "preview=%zu nav-start=%lluus capture=%lluus first=%lluus "
            "scrolls=%zu y=%d bytes=%zu "
            "headers=%lluus first-body=%lluus first-dom=%lluus "
            "css-preload-timeout=%zuB/%zu/%zu "
@@ -494,7 +497,6 @@ bool psp_run_initial_page_load(
            (unsigned long long) metrics.load.maximum_pump_us,
            (unsigned long long) metrics.load.maximum_parser_pump_us,
            metrics.provisional_paints,
-           metrics.provisional_frame_count,
            (unsigned long long) metrics.navigation_session_started_us,
            (unsigned long long) metrics.provisional_capture_started_us,
            (unsigned long long) metrics.provisional_first_present_us,
@@ -784,9 +786,7 @@ void psp_profile_record_current(
     const NavigationEntry *entry = navigation_current(navigation);
     if (entry == NULL || entry->url == NULL
         || strncmp(entry->url, "tilefinch://", 12u) == 0
-        || strncmp(
-               entry->url, "https://tilefinch.local/",
-               strlen("https://tilefinch.local/")) == 0)
+        || psp_ui_internal_url(entry->url))
         return;
     if (browser_profile_record_history(
             profile, entry->url, entry->title))
@@ -801,9 +801,7 @@ bool psp_recovery_record_current(
         || path == NULL || navigation == NULL) return false;
     const NavigationEntry *entry = navigation_current(navigation);
     if (entry == NULL || entry->url == NULL
-        || strncmp(
-               entry->url, "https://tilefinch.local/",
-               strlen("https://tilefinch.local/")) == 0) {
+        || psp_ui_internal_url(entry->url)) {
         return false;
     }
     bool saved = browser_recovery_save(

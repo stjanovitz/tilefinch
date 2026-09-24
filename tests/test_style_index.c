@@ -811,6 +811,70 @@ static int test_retained_keyless_lost_match(void)
     return 0;
 }
 
+static bool retained_has_entry(const StyleRetainedMatches *table,
+                               const lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++)
+        if (table->entries[i].node == node) return true;
+    return false;
+}
+
+/* Scoped and ancestor invalidation drop exactly the entries of the scope's
+   subtree, or of a node and its ancestors, and keep every other entry. */
+static int test_retained_scoped_invalidation(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>p{color:#123456}div{margin:1px}"
+        "</style><div id=top><div id=left><p id=a>a</p><p id=b>b</p></div>"
+        "<div id=right><p id=c>c</p></div></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const char *const ids[] = {"top", "left", "a", "b", "right", "c"};
+    lxb_dom_node_t *nodes[6];
+    for (size_t i = 0; i < 6; i++) {
+        nodes[i] = find_id(root, ids[i]);
+        CHECK(nodes[i] != NULL);
+    }
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(retained != NULL);
+    (void) style_retained_matches_attach(&sheet, retained);
+    for (int round = 0; round < 2; round++) {
+        for (size_t i = 0; i < 6; i++)
+            (void) style_for_node(&sheet, nodes[i], NULL);
+        for (size_t i = 0; i < 6; i++) CHECK(retained_has_entry(retained, nodes[i]));
+        if (round == 0) {
+            /* Within #left: #left, #a and #b go; #top, #right, #c stay. */
+            style_retained_matches_invalidate_within(retained, nodes[1]);
+            CHECK(!retained_has_entry(retained, nodes[1])
+                  && !retained_has_entry(retained, nodes[2])
+                  && !retained_has_entry(retained, nodes[3]));
+            CHECK(retained_has_entry(retained, nodes[0])
+                  && retained_has_entry(retained, nodes[4])
+                  && retained_has_entry(retained, nodes[5]));
+        } else {
+            /* Ancestors of #c: #c, #right and #top go; #left, #a, #b stay. */
+            style_retained_matches_invalidate_ancestors(retained, nodes[5]);
+            CHECK(!retained_has_entry(retained, nodes[5])
+                  && !retained_has_entry(retained, nodes[4])
+                  && !retained_has_entry(retained, nodes[0]));
+            CHECK(retained_has_entry(retained, nodes[1])
+                  && retained_has_entry(retained, nodes[2])
+                  && retained_has_entry(retained, nodes[3]));
+        }
+    }
+    (void) style_retained_matches_attach(&sheet, NULL);
+    style_retained_matches_destroy(retained);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_quoted_pseudo_element_punctuation(void)
 {
     Budget budget;
@@ -831,6 +895,170 @@ static int test_quoted_pseudo_element_punctuation(void)
     return 0;
 }
 
+/* A rule whose subject compound is :is()/:where() takes a fast key when
+   every option requires it, and selector-list arguments are matched from
+   a per-sheet prepared form. Both must agree with the plain text matcher
+   for every rule and element, and a derived key must be a key every
+   matched element carries. */
+static bool element_has_key(lxb_dom_node_t *node, const StyleRule *rule)
+{
+    const char *key = style_rule_fast_key(rule);
+    size_t key_length = rule->fast_key_length;
+    size_t length = 0;
+    if (rule->type == SELECTOR_ID) {
+        const char *id = document_attribute(node, "id", &length);
+        return id != NULL && length == key_length
+            && memcmp(id, key, key_length) == 0;
+    }
+    if (rule->type == SELECTOR_CLASS) {
+        const char *classes = document_attribute(node, "class", &length);
+        return classes != NULL
+            && class_contains_length(classes, length, key, key_length);
+    }
+    const char *tag = document_element_name(node, &length);
+    return tag != NULL && length == key_length
+        && memcmp(tag, key, key_length) == 0;
+}
+
+static int test_functional_selector_keys(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<div id=host class='a outer'>"
+        "<p class='btn active x'>one</p><p class='btn'>two</p>"
+        "<span class='q y'>three</span><div class='q'><i class=y></i></div>"
+        "<b id=only class=z></b><em class='w1 k l'></em>"
+        "<em class='n'></em><em class='deep k'></em>"
+        "<section class='x'><p class='y m'></p></section></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] =
+        ":is(.btn:first-child,.btn.active){color:#000001}"
+        ":where(.w1){color:#000002}"
+        ":is(div.q,span.q){color:#000003}"
+        ":is(.a,.b){color:#000004}"
+        ":is(#only,#only.z){color:#000005}"
+        ":not(.n){color:#000006}"
+        "p:is(.x .y,.y){color:#000007}"
+        ":is(:is(.deep.k),.k.l){color:#000008}"
+        ":where(.outer :is(.y,.q)){color:#000009}"
+        ":is(.x > .y.m, section .y){color:#00000a}"
+        ":where(:root *){color:#00000b}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    static const struct {
+        const char *selector;
+        const char *key;
+        SelectorType type;
+    } keys[] = {
+        { ":is(.btn:first-child,.btn.active)", "btn", SELECTOR_CLASS },
+        { ":where(.w1)", "w1", SELECTOR_CLASS },
+        { ":is(div.q,span.q)", "q", SELECTOR_CLASS },
+        { ":is(.a,.b)", NULL, SELECTOR_TAG },
+        { ":is(#only,#only.z)", "only", SELECTOR_ID },
+        { ":not(.n)", NULL, SELECTOR_TAG },
+        { "p:is(.x .y,.y)", "p", SELECTOR_TAG },
+        { ":is(:is(.deep.k),.k.l)", "k", SELECTOR_CLASS },
+        { ":where(.outer :is(.y,.q))", NULL, SELECTOR_TAG },
+        { ":is(.x > .y.m, section .y)", "y", SELECTOR_CLASS },
+        { ":where(:root *)", NULL, SELECTOR_TAG },
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const StyleRule *rule = find_rule(&sheet, keys[i].selector);
+        CHECK(rule != NULL);
+        if (keys[i].key == NULL) {
+            if (rule->has_fast_key)
+                fprintf(stderr, "unexpected key for %s\n", keys[i].selector);
+            CHECK(!rule->has_fast_key);
+            continue;
+        }
+        const char *key = style_rule_fast_key(rule);
+        if (key == NULL || rule->type != keys[i].type
+            || rule->fast_key_length != strlen(keys[i].key)
+            || memcmp(key, keys[i].key, rule->fast_key_length) != 0)
+            fprintf(stderr, "wrong key for %s\n", keys[i].selector);
+        CHECK(key != NULL && rule->type == keys[i].type
+              && rule->fast_key_length == strlen(keys[i].key)
+              && memcmp(key, keys[i].key, rule->fast_key_length) == 0);
+    }
+    size_t matches = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t r = 0; r < sheet.count; r++) {
+            const StyleRule *rule = &sheet.rules[r];
+            for (lxb_dom_node_t *node = lxb_dom_interface_node(document.html);
+                 node != NULL;) {
+                if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+                    bool sheet_match =
+                        style_rule_selector_matches(&sheet, r, node);
+                    bool text_match = style_selector_matches(
+                        node, rule->selector, rule->selector_length);
+                    if (sheet_match != text_match)
+                        fprintf(stderr, "mismatch %s\n", rule->selector);
+                    CHECK(sheet_match == text_match);
+                    if (text_match && rule->has_fast_key)
+                        CHECK(element_has_key(node, rule));
+                    matches += text_match ? 1u : 0u;
+                }
+                if (node->first_child != NULL) {
+                    node = node->first_child;
+                    continue;
+                }
+                while (node != NULL && node->next == NULL)
+                    node = node->parent;
+                if (node != NULL) node = node->next;
+            }
+        }
+    }
+    CHECK(matches > 20u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A deferred (var()) declaration block resolves em lengths against an
+   absolute font-size in the same block. Blocks proven to lack font-size
+   skip that per-element scan; one that has it must still use it. */
+static int test_deferred_font_basis(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<div id=parent style='font-size:10px'>"
+        "<div id=with class=f>a</div><div id=without class=g>b</div></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] =
+        ":root{--m:2}"
+        ".f{margin-top:calc(var(--m) * 1em);font-size:20px}"
+        ".g{margin-top:calc(var(--m) * 1em)}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *with = find_id(root, "with");
+    lxb_dom_node_t *without = find_id(root, "without");
+    CHECK(with != NULL && without != NULL);
+    lxb_dom_node_t *parent = find_id(root, "parent");
+    CHECK(parent != NULL);
+    ComputedStyle parent_style = style_for_node(&sheet, parent, NULL);
+    ComputedStyle with_style = style_for_node(&sheet, with, &parent_style);
+    ComputedStyle without_style =
+        style_for_node(&sheet, without, &parent_style);
+    if (with_style.margin.top != 40 || without_style.margin.top != 20)
+        fprintf(stderr, "deferred font basis: %d %d\n",
+                with_style.margin.top, without_style.margin.top);
+    CHECK(with_style.margin.top == 40 && without_style.margin.top == 20);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--retained-handoff-only") == 0)
@@ -842,11 +1070,14 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--retained-focus-only") == 0)
         return test_retained_focus_descendants();
     CHECK(test_retained_range_cache_handoff() == 0);
+    CHECK(test_functional_selector_keys() == 0);
+    CHECK(test_deferred_font_basis() == 0);
     CHECK(test_retained_retirement_probe_holes() == 0);
     CHECK(test_retained_nested_selector_invalidation() == 0);
     CHECK(test_quoted_pseudo_element_punctuation() == 0);
     CHECK(test_retained_focus_descendants() == 0);
     CHECK(test_retained_keyless_lost_match() == 0);
+    CHECK(test_retained_scoped_invalidation() == 0);
     CHECK(test_ancestor_filter_canonical_tokens() == 0);
     CHECK(test_compiled_attribute_and_pseudo_instructions() == 0);
     CHECK(test_quoted_declaration_boundaries() == 0);

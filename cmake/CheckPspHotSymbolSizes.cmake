@@ -38,13 +38,15 @@ endfunction()
 # resident frame-loop footprint. The browser and media compositors are also
 # actual per-frame instruction-cache footprints; psp_ui_composite itself is
 # only their dispatcher and is not a useful hot-path measurement. Re-measured
-# 2026-08-13 after the owner/loop and composition splits.
+# 2026-08-13 after the owner/loop and composition splits; the loop limit was
+# lowered 2026-09-23 (15,008 -> 13,772 B shipping) after the update, screenshot
+# and allowlist handlers moved out as cold paths.
 if(NOT DEFINED PSP_MAIN_LIMIT)
     set(PSP_MAIN_LIMIT 10752)
 endif()
 check_hot_symbol(main ${PSP_MAIN_LIMIT})
 if(NOT DEFINED PSP_INTERACTIVE_LIMIT)
-    set(PSP_INTERACTIVE_LIMIT 15360)
+    set(PSP_INTERACTIVE_LIMIT 14336)
 endif()
 check_hot_symbol(psp_app_run_interactive ${PSP_INTERACTIVE_LIMIT})
 check_hot_symbol(layout_block_impl 36864)

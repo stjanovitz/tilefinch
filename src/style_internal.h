@@ -310,6 +310,32 @@ static inline bool span_equal(const char *text, size_t length,
     return strlen(wanted) == length && memcmp(text, wanted, length) == 0;
 }
 
+/* snprintf(output, size, "%s", text) without the formatter: copies at most
+   size - 1 bytes and always terminates (nothing when size is 0). */
+static inline void style_copy_text(char *output, size_t size,
+                                   const char *text)
+{
+    if (output == NULL || size == 0) return;
+    size_t length = text == NULL ? 0 : strlen(text);
+    if (length >= size) length = size - 1u;
+    if (length != 0) memcpy(output, text, length);
+    output[length] = '\0';
+}
+
+/* Whether the exact bytes of `wanted` occur anywhere in the span. */
+static inline bool span_contains_text(const char *text, size_t length,
+                                      const char *wanted)
+{
+    size_t wanted_length = strlen(wanted);
+    if (text == NULL || wanted_length == 0 || wanted_length > length)
+        return false;
+    for (size_t at = 0; at + wanted_length <= length; at++) {
+        if (text[at] == wanted[0]
+            && memcmp(text + at, wanted, wanted_length) == 0) return true;
+    }
+    return false;
+}
+
 static inline bool span_case_equal(const char *text, size_t length,
                                          const char *wanted)
 {
@@ -628,6 +654,18 @@ static inline StyleTokenBloom style_compound_token_bloom(
     return bloom;
 }
 
+/* End of the selector-list option starting at `start`: the next
+   top-level comma outside quotes, parentheses and brackets, or `length`. */
+size_t style_selector_list_option_end(const char *text, size_t length,
+                                      size_t start);
+/* One complex selector (no top-level commas): the offset of its rightmost
+   compound (SIZE_MAX when not located) and the stylesheet fast key that
+   compound requires (key_length 0 when none). The same analysis the
+   stylesheet stores per rule, for selectors matched outside a rule. */
+bool style_selector_prepare_complex(const char *text, size_t length,
+                                    size_t *rightmost,
+                                    SelectorType *key_type,
+                                    size_t *key_offset, size_t *key_length);
 bool style_selector_matches_profiled(const Stylesheet *sheet,
                                      lxb_dom_node_t *node,
                                      const char *selector,
@@ -804,6 +842,16 @@ static inline void style_rule_set_container_query(StyleRule *rule,
 /* `all:inherit` changes the cascade baseline rather than one property bit.
    Retain it on the compiled declaration without growing StyleDeclaration. */
 #define STYLE_DECLARATION_ALL_INHERIT UINT16_C(32)
+/* The deferred text has no "font-size" at all, so the per-element scan for
+   an absolute font basis (declaration_absolute_font_basis) cannot find one.
+   Set only where proven; absent means scan. */
+#define STYLE_DEFERRED_NO_FONT_SIZE UINT16_C(64)
+_Static_assert((STYLE_DEFERRED_NO_FONT_SIZE
+                & (STYLE_DEFERRED_FONT_RELATIVE
+                   | STYLE_DEFERRED_NON_FONT_RELATIVE
+                   | STYLE_DEFERRED_LOGICAL | STYLE_DEFERRED_DYNAMIC
+                   | STYLE_DEFERRED_CH | STYLE_DECLARATION_ALL_INHERIT))
+                   == 0, "deferred declaration flags must not overlap");
 
 struct StyleDeferredInstruction {
     uint32_t value_offset;
@@ -900,13 +948,79 @@ _Static_assert(sizeof(StyleGridTrackTemplate) == 88,
                "Grid track templates must remain compact");
 _Static_assert(sizeof(StyleGridAreas) == 3555,
                "optional Grid metadata must remain within its PSP budget");
-_Static_assert(sizeof(StyleCustomRule) == 356,
-               "retained sparse-rule metadata must stay padding-neutral");
+_Static_assert(sizeof(StyleCustomRule) == 360,
+               "retained sparse-rule metadata must stay compact");
 
 /* CSS initial font size and the engine's used-font-size clamp (px). */
 #define STYLE_DEFAULT_FONT_PX 16
 #define STYLE_FONT_MIN_PX 6
 #define STYLE_FONT_MAX_PX 128
+
+/* Finds the last top-level combinator of a complex selector: outside []
+   and (), ignoring backslash-escaped spaces. On success *split indexes the
+   combinator character (for a descendant combinator, the whitespace before
+   the rightmost compound) and *combinator is '>', '+', '~' or ' '. Returns
+   false, leaving both untouched, when text is a single compound. Inline:
+   selector matching splits on every non-prepared match. */
+static inline bool style_selector_last_combinator(
+    const char *text, size_t length, size_t *split, char *combinator)
+{
+    int square = 0;
+    int round = 0;
+    for (size_t i = length; i != 0; i--) {
+        char value = text[i - 1];
+        if (value == ']') square++;
+        else if (value == '[' && square > 0) square--;
+        else if (value == ')') round++;
+        else if (value == '(' && round > 0) round--;
+        else if (square == 0 && round == 0
+                 && (value == '>' || value == '+' || value == '~')) {
+            *split = i - 1;
+            *combinator = value;
+            return true;
+        } else if (square == 0 && round == 0
+                   && isspace((unsigned char) value)) {
+            size_t escaped = i - 1;
+            size_t backslashes = 0;
+            while (escaped != 0 && text[escaped - 1] == '\\') {
+                escaped--;
+                backslashes++;
+            }
+            if ((backslashes & 1u) != 0) continue;
+            size_t right = i;
+            while (right < length
+                   && isspace((unsigned char) text[right])) right++;
+            if (right < length) {
+                size_t left = i - 1;
+                while (left != 0
+                       && isspace((unsigned char) text[left - 1])) left--;
+                if (left != 0 && (text[left - 1] == '>'
+                                  || text[left - 1] == '+'
+                                  || text[left - 1] == '~')) {
+                    *split = left - 1;
+                    *combinator = text[left - 1];
+                } else {
+                    *split = i - 1;
+                    *combinator = ' ';
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Where the rightmost compound of a complex selector begins. */
+static inline size_t style_selector_rightmost_compound_start(
+    const char *text, size_t length)
+{
+    size_t split = 0;
+    char combinator = 0;
+    size_t start = style_selector_last_combinator(
+        text, length, &split, &combinator) ? split + 1 : 0;
+    while (start < length && isspace((unsigned char) text[start])) start++;
+    return start;
+}
 
 /* ComputedStyle is retained per cached node; its packing is a PSP memory
    commitment (see the field comments in tilefinch/style.h). */
@@ -1033,7 +1147,6 @@ bool style_parse_grid_area_name(
 int style_parse_font_size(const Stylesheet *sheet, const char *text, size_t length, uint8_t *unit, uint8_t *fraction);
 bool style_parse_font_shorthand(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *font);
 bool style_parse_color(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color);
-uint64_t style_parse_box(const Stylesheet *sheet, const char *text, size_t length, StyleEdges *edges, bool padding);
 bool style_parse_background_size(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
 bool style_parse_background_shorthand_color(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color, uint8_t *alpha, bool *transparent);
 bool style_parse_background_position(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
@@ -1121,6 +1234,11 @@ bool style_compile_deferred_program(Stylesheet *sheet, const char *text,
                                     size_t length, uint32_t *program_offset,
                                     uint16_t *program_count);
 bool style_property_name_is_logical(const char *name, size_t length);
+bool style_apply_deferred_program_basis(
+    Stylesheet *sheet, const char *text, size_t length,
+    uint32_t program_offset, uint16_t program_count, bool important,
+    bool font_size_possible, ComputedStyle *style, uint64_t *mask,
+    uint64_t *mask_high, uint64_t *inherit_mask);
 bool style_apply_deferred_program(
     Stylesheet *sheet, const char *text, size_t length,
     uint32_t program_offset, uint16_t program_count, bool important,

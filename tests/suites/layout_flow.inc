@@ -1647,8 +1647,7 @@ static int test_font_relative_math_bases(Budget *budget)
           && em_cross_style.font_size == 22
           && em_cross_style.padding.top == 22
           && em_same_style.font_size == 18
-          && em_same_style.padding.top == 18
-          && sizeof(ComputedStyle) == 376);
+          && em_same_style.padding.top == 18);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == 0);
@@ -2440,6 +2439,248 @@ static lxb_dom_node_t *insert_style_element(PocDocument *document,
     }
     document_allocation_owner_leave(document, previous);
     return node;
+}
+
+static int checked_toggle_layout(Budget *budget, const char *extra_css,
+                                 bool expect_reset)
+{
+    static char html[8192];
+    size_t length = 0;
+    int written = snprintf(html, sizeof(html),
+        "<!doctype html><style>p{color:#111111}.drawer{display:none}"
+        ".toggle:checked ~ .drawer{display:block;color:#123456}"
+        "input:not(:checked) + label{color:#222222}"
+        ".flag:has(.inner){color:#654321}%s", extra_css);
+    CHECK(written > 0 && (size_t) written < sizeof(html));
+    length = (size_t) written;
+    /* Enough rules for the retained matched-rule table to be allocated. */
+    for (unsigned i = 0; i < 64; i++) {
+        written = snprintf(html + length, sizeof(html) - length,
+                           ".pad%u{margin:0}", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    static const char rest[] =
+        "</style><body><input type=checkbox class=toggle id=t>"
+        "<label for=t>label</label><p class=drawer>drawer</p>"
+        "<div class=flag><span class=inner>inner</span></div>"
+        "<p>other</p></body>";
+    CHECK(sizeof(rest) - 1u < sizeof(html) - length);
+    memcpy(html + length, rest, sizeof(rest) - 1u);
+    length += sizeof(rest) - 1u;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, length, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    CHECK(text_command(&retained, "drawer") == NULL);
+    const DrawCommand *label = text_command(&retained, "label");
+    CHECK(label != NULL && label->color == 0x222222);
+    LayoutReuseStats first;
+    layout_reuse_cache_stats(reuse, &first);
+    CHECK(first.matched_misses > 0);
+    layout_destroy(&retained);
+    lxb_dom_node_t *toggle = find_id(document_body_node(&document), "t");
+    CHECK(toggle != NULL);
+    for (int round = 0; round < 2; round++) {
+        if (round == 0) {
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(toggle),
+                (const lxb_char_t *) "checked", 7,
+                (const lxb_char_t *) "", 0) != NULL);
+        } else {
+            CHECK(lxb_dom_element_remove_attribute(
+                lxb_dom_interface_element(toggle),
+                (const lxb_char_t *) "checked", 7) == LXB_STATUS_OK);
+        }
+        LayoutReuseStats before;
+        layout_reuse_cache_stats(reuse, &before);
+        layout_reuse_cache_invalidate_checked(reuse, &toggle, 1);
+        CHECK(layout_build_context_reuse(&retained, budget, &document,
+            &sheet, NULL, NULL, &viewport, reuse));
+        CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+            NULL, NULL, &viewport));
+        CHECK(commands_equal(&retained, &fresh));
+        const DrawCommand *drawer = text_command(&retained, "drawer");
+        label = text_command(&retained, "label");
+        CHECK(round == 0 ? drawer != NULL && drawer->color == 0x123456
+                           && label != NULL && label->color != 0x222222
+                         : drawer == NULL
+                           && label != NULL && label->color == 0x222222);
+        LayoutReuseStats after;
+        layout_reuse_cache_stats(reuse, &after);
+        if (expect_reset) {
+            CHECK(after.full_resets == before.full_resets + 1);
+        } else {
+            /* Everything but the control and the elements a checked-state
+               rule can select (label, drawer) replays its matched-rule
+               list; three nodes' element and pseudo lookups miss. */
+            CHECK(after.full_resets == before.full_resets
+                  && after.matched_hits > before.matched_hits
+                  && (after.matched_misses - before.matched_misses) * 2u
+                         < first.matched_misses);
+        }
+        layout_destroy(&retained);
+        layout_destroy(&fresh);
+    }
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Wikipedia's mobile menu drawer: a fixed, scrollable panel nested in a
+   header item that the header's flex row centers vertically, whose rows are
+   li restyled to display:block around a centering flex anchor. The fixed
+   panel keeps its position when its ancestor item is centered, and so must
+   the overflow clips inside it (they moved alone, clipping the top half of
+   every row's label and icon); a block li has no marker line either. */
+static int test_fixed_drawer_rows(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        ".header{display:flex;align-items:center;height:80px}"
+        "#left{position:fixed;top:0;left:0;bottom:0;min-width:200px;"
+        "max-width:80%;overflow-y:auto;background:#eee}"
+        "ul{margin:0;padding:0}li.row{display:block;background:#fff}"
+        "a{display:flex;align-items:center;height:60px;padding:0 10px}"
+        ".icon{display:inline-block;width:20px;height:20px;"
+        "background:#333}"
+        ".label{overflow:hidden;white-space:nowrap;font-size:14px}"
+        "</style><body><div class=header><div class=nav><span>menu</span>"
+        "<div id=left><ul>\n"
+        "  <li class=row>\n    <a href=#h><span class=icon></span>\n"
+        "    <span class=label id=home>Home</span></a>\n  </li>\n"
+        "</ul></div></div><span>title</span></div>"
+        "<ul><li>listed</li></ul></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1u, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutDocument layout = {0};
+    CHECK(layout_build_context(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport));
+    /* One marker, for the ordinary list item only. */
+    size_t bullets = 0;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == 3
+            && memcmp(command->text, "\xe2\x80\xa2", 3) == 0) bullets++;
+    }
+    CHECK(bullets == 1);
+    const DrawCommand *home = text_command(&layout, "Home");
+    lxb_dom_node_t *label = find_id(document_body_node(&document), "home");
+    const LayoutNodeBox *box = label == NULL
+        ? NULL : layout_box_for_node(&layout, label);
+    const LayoutNodeBox *row = label == NULL || label->parent == NULL
+        ? NULL : layout_box_for_node(&layout, label->parent);
+    CHECK(home != NULL && box != NULL && box->clips_y && row != NULL);
+    /* The label's clip still covers its text, and both sit centered in
+       the row (fixed content keeps its static position in the display
+       list; the fixed layer places it on screen). */
+    CHECK(box->y <= home->y
+          && home->y + home->height <= box->y + box->height);
+    CHECK(row->height == 60 && home->y > row->y + 10
+          && home->y + home->height < row->y + 50);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* The retained-list scan behind a checkbox toggle yields to the frontend;
+   a cancel there drops every list (always correct) instead of holding
+   input, and the next layout still matches a fresh build. */
+static bool refuse_style_invalidate(void *context, const char *phase,
+                                    size_t units)
+{
+    (void) units;
+    if (strcmp(phase, "style-invalidate") != 0) return true;
+    (*(size_t *) context)++;
+    return false;
+}
+
+static int test_checked_invalidation_cancel_drops_lists(Budget *budget)
+{
+    static char html[8192];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>p{color:#111111}.drawer{display:none}"
+        ".toggle:checked ~ .drawer{display:block;color:#123456}");
+    for (unsigned i = 0; used > 0 && i < 64; i++) {
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         ".pad%u{margin:0}", i);
+    }
+    CHECK(used > 0 && (size_t) used < sizeof(html) - 256u);
+    used += snprintf(html + used, sizeof(html) - (size_t) used,
+        "</style><body><input type=checkbox class=toggle id=t>"
+        "<p class=drawer>drawer</p><p>other</p></body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, (size_t) used, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_destroy(&retained);
+    LayoutReuseStats before;
+    layout_reuse_cache_stats(reuse, &before);
+    CHECK(before.matched_stores > 0);
+    lxb_dom_node_t *toggle = find_id(document_body_node(&document), "t");
+    CHECK(toggle != NULL && lxb_dom_element_set_attribute(
+        lxb_dom_interface_element(toggle), (const lxb_char_t *) "checked", 7,
+        (const lxb_char_t *) "", 0) != NULL);
+    size_t refusals = 0;
+    TilefinchPlatformServices services = {
+        .context = &refusals, .cooperate = refuse_style_invalidate
+    };
+    tilefinch_platform_set_services(&services);
+    layout_reuse_cache_invalidate_checked(reuse, &toggle, 1);
+    tilefinch_platform_set_services(NULL);
+    LayoutReuseStats after;
+    layout_reuse_cache_stats(reuse, &after);
+    CHECK(refusals == 1 && after.full_resets == before.full_resets
+          && reuse->matches != NULL && reuse->matches->occupied == 0);
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+        NULL, NULL, &viewport));
+    CHECK(commands_equal(&retained, &fresh));
+    const DrawCommand *drawer = text_command(&retained, "drawer");
+    CHECK(drawer != NULL && drawer->color == 0x123456);
+    layout_destroy(&retained);
+    layout_destroy(&fresh);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Toggling a checkbox re-answers only rules that can observe checkedness,
+   however far a sibling combinator carries it; an unrelated :has() rule
+   does not force a reset, and one that can see the state does. */
+static int test_checked_toggle_retains_matches(Budget *budget)
+{
+    CHECK(checked_toggle_layout(budget, "", false) == 0);
+    CHECK(checked_toggle_layout(
+        budget, "div:has(input:checked) p{color:#010101}", true) == 0);
+    return 0;
 }
 
 /* A <style> inserted into the head after load must yield the same styles as

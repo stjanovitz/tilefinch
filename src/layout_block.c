@@ -1013,9 +1013,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
 
     /* CSS renders markers only on display:list-item boxes; an li
-       restyled to inline-block/flex/etc. loses its marker (tab bars). */
+       restyled to block, inline-block, flex, etc. loses its marker (tab
+       bars, Wikipedia's menu drawer rows). */
     if (layout_node_name_is(node, "li") && !style->list_style_none
-        && style->display == DISPLAY_BLOCK) {
+        && style->display == DISPLAY_BLOCK && style->list_item) {
         bool ordered = node->parent != NULL
                        && layout_node_name_is(node->parent, "ol");
         int position = 1;
@@ -1127,6 +1128,12 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         size_t cell_count = 0;
         bool have_explicit_row = false;
         bool only_table_cells = true;
+        /* Outside a CSS table (display:table on a non-table element) only
+           an all-cell run matters, so the first other child settles it:
+           an ordinary block must not resolve every child's style twice
+           (100+ references in one list were a 0.1 s stall on the PSP). */
+        bool css_table_container = style->display == DISPLAY_TABLE
+            && !layout_node_name_is(node, "table");
         FlatItemIterator *cell_scan = &scratch->traversal.flat.iterator;
         FlatItem *cell = &scratch->traversal.flat.item;
         flat_iterator_init(cell_scan, context, node, style);
@@ -1142,6 +1149,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (cell->anonymous_text
                 || cell->style.display != DISPLAY_TABLE_CELL) {
                 only_table_cells = false;
+                if (!css_table_container) break;
             }
             cell_count++;
         }

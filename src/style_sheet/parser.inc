@@ -238,22 +238,15 @@ static bool web_font_referrer_policy_normalize(
     const char *policy,
     char normalized[STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY])
 {
-    static const char *known[] = {
-        "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
     if (normalized == NULL) return false;
     normalized[0] = '\0';
-    if (policy == NULL || policy[0] == '\0') return true;
-    size_t length = strlen(policy);
-    if (length >= STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY) return false;
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (!style_font_span_equal(policy, length, known[i])) continue;
-        memcpy(normalized, known[i], strlen(known[i]) + 1u);
-        return true;
-    }
-    return false;
+    if (policy == NULL) return true;
+    uint8_t code = tilefinch_referrer_policy_code(policy, strlen(policy), true);
+    const char *name = tilefinch_referrer_policy_name(code);
+    if (name == NULL
+        || strlen(name) >= STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY) return false;
+    memcpy(normalized, name, strlen(name) + 1u);
+    return true;
 }
 
 static void register_font_face(Stylesheet *sheet, const char *declarations,
@@ -967,6 +960,11 @@ static void style_css_reintern_declarations(Stylesheet *sheet)
     size_t retained = 0;
     size_t table_mask = sheet->declaration_index_slot_count - 1u;
     for (size_t old = 0; old < old_count; old++) {
+        /* Compaction rewrites the table in place and must finish, but a
+           large bundle takes 0.1 s on the PSP: present and sample input.
+           A cancel request persists to the next parse checkpoint. */
+        if ((old & 255u) == 255u)
+            (void) tilefinch_platform_cooperate("stylesheet-reintern", old);
         StyleDeclaration candidate = sheet->declarations[old];
         uint32_t hash = style_declaration_hash(
             &candidate.values, candidate.mask, candidate.mask_high,
@@ -1069,8 +1067,10 @@ static bool style_css_parse_context_finish(StyleCssParseContext *context)
            and rewrite rule indices so the optimization does not increase
            retained page memory. Failure of this optional pass merely keeps
            the already-correct declarations separate. */
+        tilefinch_platform_trace_step("css-reintern");
         style_css_reintern_declarations(sheet);
     }
+    tilefinch_platform_trace_step("css-parse-dispose");
     style_css_parse_context_dispose(context);
     return completed;
 }

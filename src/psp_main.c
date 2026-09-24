@@ -12,6 +12,7 @@
    null transport reports failure), and web fonts. */
 
 #include <pspctrl.h>
+#include "tilefinch/psp_fpu.h"
 #include <pspdisplay.h>
 #include <pspge.h>
 #include <pspkernel.h>
@@ -158,6 +159,7 @@ static void psp_counter(const char *group, const char *name,
 
 int main(int argc, char *argv[])
 {
+    psp_fpu_mask_exceptions();
     psp_setup_callbacks();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
@@ -319,6 +321,7 @@ int main(int argc, char *argv[])
     psp_counter("document", "nodes", document.node_count);
     psp_counter("document", "elements", document.element_count);
     psp_counter("document", "text-nodes", document.text_node_count);
+    document_refresh_attribute_totals(&document);
     psp_counter("document", "attributes", document.attribute_count);
     psp_counter("layout", "width", (unsigned long long) layout.width);
     psp_counter("layout", "scroll-width",

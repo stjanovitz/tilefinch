@@ -259,6 +259,10 @@ typedef struct {
     TilefinchRequestMode page_media_mode;
     TilefinchCredentialsMode page_media_credentials;
     int64_t page_media_node_handle;
+    /* Prepared page-media requests keep their cookie, redirect, CORS and PNA
+       authority on the browser thread. The scheduler delegates only each
+       already-authorized hop to the PSP transport worker. */
+    FetchScheduler *page_media_probe_scheduler;
     uint64_t page_media_probe_request;
     uint64_t page_media_report_us;
     char page_document_url[NAVIGATION_URL_LIMIT];

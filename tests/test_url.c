@@ -228,6 +228,34 @@ int main(void)
     CHECK(!tilefinch_request_allows_lax_cookie(&request));
     CHECK(tilefinch_request_context_analyze(&request, &facts)
           && !facts.allows_lax_cookie && !facts.safe_method);
+    /* Host-within: equal, or a subdomain at a '.' boundary, any case. */
+    CHECK(tilefinch_host_within("example.com", 11, "example.com", 11));
+    CHECK(tilefinch_host_within("a.Example.COM", 13, "example.com", 11));
+    CHECK(!tilefinch_host_within("badexample.com", 14, "example.com", 11));
+    CHECK(!tilefinch_host_within("example.com", 11, "a.example.com", 13));
+    CHECK(tilefinch_host_within("a.example.com:80", 13, "example.com", 11));
+    CHECK(!tilefinch_host_within(NULL, 0, "example.com", 11));
+    /* Referrer-Policy codes are stored, so their order is pinned. */
+    CHECK(tilefinch_referrer_policy_code("", 0, false) == 0);
+    CHECK(strcmp(tilefinch_referrer_policy_name(0), "") == 0);
+    CHECK(tilefinch_referrer_policy_code("no-referrer", 11, false) == 1);
+    CHECK(tilefinch_referrer_policy_code("unsafe-url", 10, false)
+          == TILEFINCH_REFERRER_POLICY_COUNT);
+    CHECK(tilefinch_referrer_policy_code("Strict-Origin", 13, false)
+          == TILEFINCH_REFERRER_POLICY_UNKNOWN);
+    CHECK(tilefinch_referrer_policy_code("Strict-Origin", 13, true) == 6);
+    /* Exact spans only: a prefix of a longer token is not that token. */
+    CHECK(tilefinch_referrer_policy_code("origin-when", 6, false) == 3);
+    CHECK(tilefinch_referrer_policy_code("origin", 5, false)
+          == TILEFINCH_REFERRER_POLICY_UNKNOWN);
+    for (uint8_t code = 0; code <= TILEFINCH_REFERRER_POLICY_COUNT; code++) {
+        const char *name = tilefinch_referrer_policy_name(code);
+        CHECK(name != NULL
+              && tilefinch_referrer_policy_code(name, strlen(name), false)
+                     == code);
+    }
+    CHECK(tilefinch_referrer_policy_name(TILEFINCH_REFERRER_POLICY_COUNT + 1u)
+          == NULL);
     puts("url-tests status=PASS");
     return 0;
 }

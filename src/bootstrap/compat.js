@@ -310,13 +310,16 @@
     removeItem(key) {
       const local = storageKinds.get(this);
       key = String(key);
-      if (storageAvailable) storageRemove(local, key);
-      else storageFallback[local ? 1 : 0].delete(key);
+      // The store keeps an item whose removal it could not record.
+      if (storageAvailable && !storageRemove(local, key))
+        throw new DOMException("Storage could not be changed", "UnknownError");
+      if (!storageAvailable) storageFallback[local ? 1 : 0].delete(key);
     }
     clear() {
       const local = storageKinds.get(this);
-      if (storageAvailable) storageClear(local);
-      else storageFallback[local ? 1 : 0].clear();
+      if (storageAvailable && !storageClear(local))
+        throw new DOMException("Storage could not be changed", "UnknownError");
+      if (!storageAvailable) storageFallback[local ? 1 : 0].clear();
     }
   }
   Object.defineProperty(globalThis, "Storage", {
@@ -420,6 +423,17 @@
       const state = eventStateGet(event);
       if (!state) throw new TypeError("Illegal invocation");
       return state;
+    },
+    /* isTrusted is an unforgeable own attribute whose getter browsers share
+       across events; one descriptor also spares a closure per event. */
+    isTrustedDescriptor = {
+      configurable: false,
+      enumerable: true,
+      get: Object.getOwnPropertyDescriptor({
+        get isTrusted() {
+          return eventState(this).trusted;
+        },
+      }, "isTrusted").get,
     };
   globalThis.Event = class Event {
     constructor(type, options = {}) {
@@ -443,13 +457,7 @@
         path: null,
         trusted: false,
       });
-      Object.defineProperty(this, "isTrusted", {
-        configurable: false,
-        enumerable: true,
-        get() {
-          return eventState(this).trusted;
-        },
-      });
+      Object.defineProperty(this, "isTrusted", isTrustedDescriptor);
     }
     preventDefault() {
       const state = eventState(this);
@@ -1097,8 +1105,10 @@
     }
     return target.isContentEditable;
   };
-  let focusFixupPending = false;
-  globalThis.__tilefinchQueueFocusFixup = () => {
+  let focusFixupPending = false,
+    focusCheckQueued = false;
+  const checkFocusAfterMutations = () => {
+    focusCheckQueued = false;
     const active = document.__activeElement;
     if (
       focusFixupPending ||
@@ -1121,6 +1131,16 @@
       )
         document.__activeElement = document.body;
     });
+  };
+  /* Called for every mutation and inline style write. Whether the focused
+     element survived them is asked once, after the task's mutations, not
+     after each one (isFocusable reads attributes and computed style). */
+  globalThis.__tilefinchQueueFocusFixup = () => {
+    if (focusCheckQueued || focusFixupPending) return;
+    const active = document.__activeElement;
+    if (!active || active === document.body) return;
+    focusCheckQueued = true;
+    queueMicrotask(checkFocusAfterMutations);
   };
   const collapseFocusSelection = (target) => {
     const type = String(target.type || "").toLowerCase();
