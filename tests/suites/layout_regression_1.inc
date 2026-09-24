@@ -18,6 +18,7 @@
           == 0);
     CHECK(test_has_attribute_dependency_classification(&budget) == 0);
     CHECK(test_level_four_selector_matching(&budget) == 0);
+    CHECK(test_prepared_query_selectors_match_direct(&budget) == 0);
     CHECK(test_selector_walk_bounds(&budget) == 0);
     CHECK(test_has_unrelated_scoped_reuse_converges(&budget) == 0);
     CHECK(test_deep_layout_case(&budget, DEEP_LAYOUT_BLOCK, 16, true));
@@ -186,6 +187,9 @@
     CHECK(test_generated_counter_lookup_work(&budget) == 0);
     CHECK(test_retained_matches_reuse(&budget) == 0);
     CHECK(test_stylesheet_append_matches_rebuild(&budget) == 0);
+    CHECK(test_checked_toggle_retains_matches(&budget) == 0);
+    CHECK(test_fixed_drawer_rows(&budget) == 0);
+    CHECK(test_checked_invalidation_cancel_drops_lists(&budget) == 0);
     CHECK(test_overflow_index_uses_nearby_bands(&budget) == 0);
 
     puts("test: font math uses inherited em and computed root rem bases");

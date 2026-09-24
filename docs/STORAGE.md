@@ -70,20 +70,58 @@ smaller. "Writer" names the owning source file.
 | `http-cache.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation (payload further capped by the 1/2/4 MB cache setting) | user setting 0 removes it; "clear cache" removes it | backup rotation; a torn primary is removed after `.bak` recovery |
 | `local-storage.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation | disabling the setting removes it; "clear local storage" removes it | backup rotation, as above |
 | `tls-sessions.bin` (+`.bak`) | `tls_session_store.c` | ≤ 64 KB per generation (≤ 16 hosts × 2 sessions × 4 KB) | "clear HTTP caches" removes it; pruned of expired entries at load and save | backup rotation; a torn primary is removed after `.bak` recovery, and the whole file is a plain miss on any checksum, store-version, or Mbed-TLS-version-pin mismatch |
+| `site-storage/p-<hash>` | `session_site_storage.c` | per site, ≤ 4 MB live data; the log is compacted before it passes twice the dead-record threshold plus live data | **Settings → Device & storage → Site data & storage** deletes one; so does the site's **Clear site data** | append-only checksummed log; compaction writes `.tmp`, then remove + rename, and a load recovers a lone `.tmp` |
+| `site-storage/s-NN`, `session-files` | `session_site_storage.c` | as above | deleted at exit; after a crash, at the next boot (only when the `session-files` marker exists) | as above |
 | `boot-overrides.cfg` | `psp_boot_config.c` | 4 bounded lines | user-managed | tmp + remove + rename |
 | `tilefinch-last-error.txt` | `psp_script_main.c` | one bounded device-error snapshot (URL ≤ 2047 bytes, detail ≤ 1023 bytes) | disabling **Save error reports** removes it; a newer saved failure replaces it | tmp + remove + rename; ordinary failures write only when opted in, while a fatal startup failure writes once regardless because the diagnostic UI may never become available |
 | `themes/*.tfth` | user-provided (two examples ship with first installs) | ≤ 64 directory entries visited and ≤ 12 valid files retained per chooser scan; each file ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only; the directory is scanned only in the chooser and only the selected file is read at boot |
 | `theme.tfth` | legacy user-provided theme | ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only compatibility path for an older Custom selection |
 | `adblock.txt`, `adblock-allow.txt` | user-provided | read-only | user-managed | n/a |
 
-Not everything a page may store reaches this directory. The origin-private
-file system (`navigator.storage.getDirectory()`) is deliberately RAM-only: at
-most 32 files and directories across all origins, 64 KiB per file, 256 KiB in
-total, charged to the session `Budget` and allocated on first write. It is
-never serialized, so it does not survive exit, and it is excluded from the
-site-data snapshot. Per-site **Clear site data** removes that origin's
-entries, **Clear session storage** removes every origin's, and a captive-portal
-session is given an empty store of its own.
+### Site storage
+
+`localStorage`, `sessionStorage`, and the origin-private file system
+(`navigator.storage.getDirectory()`) share one store in the browser session,
+kept per origin and allocated on the first write. By default everything is
+in RAM:
+
+- Each origin starts with a 32 KiB allowance (keys and values both count).
+  When a write would pass it, the allowance doubles in the background, up to
+  512 KiB per site and 1 MiB across all sites, but only while at least 3 MiB
+  of the browser's budget would stay free. An OPFS file in RAM is at most
+  64 KiB.
+- A site that cannot grow gets `QuotaExceededError` for that write, and the
+  browser offers the Memory Stick once: the prompt names the site, how much
+  it has stored and needs, the 4 MB Memory Stick limit, and the free space.
+  **X** keeps the site on the stick for this session, **Triangle** always,
+  **O** keeps it in RAM for the rest of the session. The page may need a
+  reload to retry what failed.
+- On the Memory Stick a site may store 4 MB (1 MB per value, 512 KiB per OPFS
+  file). Only its keys and file offsets stay in RAM; values are read when
+  the page asks. A this-session file is deleted at exit. An always-kept
+  site is loaded on its first use each boot, without its `sessionStorage`.
+
+**Permissions & controls → Site storage** sets a site's standing choice:
+Ask (the default), Memory Stick, or RAM only (never offered).
+**Settings → Device & storage → Site data & storage** lists the sites holding
+data with their size and place; Left/Right changes a site's choice there, and
+X opens it to change the choice or delete its data after a confirmation. The
+same screen turns the offer off for every site and holds the caches,
+**Save RAM storage at exit**, and the clear-all actions. **Clear site data**
+empties a site but keeps its choice. **Clear local storage** removes every site's
+`localStorage`, in RAM, in the snapshot, and on the Memory Stick; sites keep
+their choice and their OPFS files. **Clear session storage** covers every
+site's `sessionStorage` and the OPFS of sites not kept always.
+
+The Memory Stick files are append-only logs. Each record header carries a
+checksum over the header and key, so the index loads without reading
+values; each value carries its own checksum, checked when read. A torn or
+damaged record ends the load, and the next append overwrites it. Dead
+records are compacted away at load and before the log grows too large. A
+captive-portal session gets an empty RAM-only store of its own, and the
+**Save RAM storage at exit** snapshot never includes a site on the Memory
+Stick. That snapshot is off by default, so without a per-site choice nothing
+a page stores reaches the Memory Stick.
 
 Each discipline can briefly hold up to three generations of a file
 (`.tmp` + `.bak` + primary) while a save is in flight; budget accordingly for
@@ -279,6 +317,7 @@ degrading when a pre-flight fails.
 |---|---|---|
 | Browsing, site data off | ~2 MB (settings, recovery, tab session, all generations) | not enforced; writers fail individually and keep the prior generation |
 | Browsing with disk cache and local storage on | + up to 15 MB per enabled store (3 × 5 MB generations during a save; disk-cache payload further capped at 4 MB) | pre-flight in the exit cleanup (`psp_script_main.c`): one whole new generation per enabled store — the configured cache size (1/2/4 MB) plus 5 MB for local storage — else the save is refused with "MEMORY STICK FULL - SITE DATA NOT SAVED" and the prior generation is kept |
+| Keeping a site's storage on the Memory Stick | up to 4 MB per site, plus a transient second copy while its log is compacted | not pre-flighted; the prompt shows the free space, and a failed append fails that write |
 | Saving an offline article | 1.25 MB (1 MB article + 256 KB reserve) | pre-flight in `offline_library_save_article` |
 | Installing an offline web app | previewed document + typed resource pack + icon + 256 KiB | preview measurement and confirmed pre-flight in `offline_library_preview_web_app` / `offline_library_save_web_app` |
 | Downloading an offline video | remaining stream bytes + 8 MB reserve | pre-flight in `offline_download.c` (pauses, does not fail, the item) |
@@ -294,6 +333,10 @@ degrading when a pre-flight fails.
   (`profile.cfg` falls back to `.bak`, so a cut costs at most the save that
   was in flight), tab session (falls back to `.bak`), in-flight video `.part`
   progress (re-measured on next load).
+- **The last few writes**: an always-kept site's Memory Stick storage.
+  Appends are buffered rather than flushed one by one, so a cut can lose
+  the newest records; a torn record is dropped at the next load and every
+  record before it survives.
 - **Lost if the cut lands in the remove-rename window**: `recovery.cfg`
   (start page falls back to the homepage), `tab-hibernation.bin` (that tab's
   history), `boot-overrides.cfg` (written by the one-time compatibility

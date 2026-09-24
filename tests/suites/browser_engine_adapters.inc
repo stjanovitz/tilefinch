@@ -4115,6 +4115,33 @@ static bool test_youtube_watch_metadata_case(
     return matched;
 }
 
+/* JSON escapes in provider data become valid UTF-8: a surrogate pair joins,
+   and a lone low surrogate (which has no UTF-8 form) shows as U+FFFD rather
+   than as invalid bytes. */
+static int test_youtube_lite_escaped_title_is_valid_utf8(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    static const char source[] =
+        "<script>var ytInitialPlayerResponse={"
+        "\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"title\":\"Lone\\udc00 pair\\ud83d\\ude00 end\","
+        "\"author\":\"Fixture channel\","
+        "\"lengthSeconds\":\"19\",\"viewCount\":\"23\"}};</script>";
+    YoutubeLiteDocument document = {0};
+    char error[256] = {0};
+    bool built = youtube_lite_build_document(
+        &budget, "https://www.youtube.com/watch?v=TFTEST00001",
+        source, sizeof(source) - 1, &document, error, sizeof(error));
+    if (!built) fprintf(stderr, "lite escape build: %s\n", error);
+    CHECK(built);
+    CHECK(strstr(document.html,
+                 "Lone\xef\xbf\xbd pair\xf0\x9f\x98\x80 end") != NULL);
+    CHECK(strstr(document.html, "\xf0\x8d") == NULL);
+    youtube_lite_document_destroy(&document);
+    return 0;
+}
+
 static int test_youtube_localized_watch_metadata(void)
 {
     static const char english[] =

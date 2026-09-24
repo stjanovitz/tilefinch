@@ -281,8 +281,8 @@ static BrowserCacheStatus script_module_cache_match(
             tilefinch_platform_monotonic_time_ns(), entry);
 }
 
-static void script_cache_policy(const FetchResult *fetch,
-                                char cache_control[256], char vary[128])
+void script_cache_response_policy(const FetchResult *fetch,
+                                  char cache_control[256], char vary[128])
 {
     cache_control[0] = '\0';
     vary[0] = '\0';
@@ -297,7 +297,7 @@ static void script_cache_store(BrowserSession *session, const char *url,
                                const TilefinchResourceGrant *grant)
 {
     char cache_control[256], vary[128];
-    script_cache_policy(fetch, cache_control, vary);
+    script_cache_response_policy(fetch, cache_control, vary);
     if (fetch_result_share_body(fetch)) {
         (void) browser_session_cache_put_http_shared_classic_script(
             session, url, fetch->shared_body, fetch->etag,
@@ -307,76 +307,35 @@ static void script_cache_store(BrowserSession *session, const char *url,
     }
 }
 
-static void script_module_cache_store(
-    BrowserSession *session, const char *request_url,
-    const char *effective_url, const char *initiator_origin,
-    const char *top_level_url, bool initiator_opaque,
-    TilefinchCredentialsMode credentials, FetchResult *fetch)
-{
-    if (session == NULL || request_url == NULL || effective_url == NULL
-        || initiator_origin == NULL || fetch == NULL) return;
-    char cache_control[256], vary[128];
-    char response_referrer_policy[FETCH_REFERRER_POLICY_LIMIT];
-    bool referrer_policy_header_present = false;
-    if (!fetch_response_referrer_policy(
-            fetch, &referrer_policy_header_present,
-            response_referrer_policy)) return;
-    script_cache_policy(fetch, cache_control, vary);
-    BrowserModuleCacheProvenance provenance = {
-        .effective_url = effective_url,
-        .initiator_origin = initiator_origin,
-        .top_level_url = top_level_url,
-        .initiator_opaque = initiator_opaque,
-        .response_referrer_policy = response_referrer_policy,
-        .credentials = credentials,
-        .cors_validated = true,
-        .cors_redirect_origin_tainted = fetch->redirect_origin_tainted,
-        .javascript_mime_validated = true,
-        .referrer_policy_header_present =
-            referrer_policy_header_present
-    };
-    if (fetch_result_share_body(fetch)) {
-        (void) browser_session_cache_put_http_shared_module(
-            session, request_url, fetch->shared_body, fetch->etag,
-            fetch->last_modified, fetch->content_type,
-            cache_control, vary, tilefinch_platform_monotonic_time_ns(),
-            &provenance);
-    } else {
-        (void) browser_session_cache_put_http_module(
-            session, request_url, (const unsigned char *) fetch->data,
-            fetch->length, fetch->etag, fetch->last_modified,
-            fetch->content_type, cache_control, vary,
-            tilefinch_platform_monotonic_time_ns(), &provenance);
-    }
-}
-
 static void script_cache_revalidate(BrowserSession *session, const char *url,
                                     const FetchResult *fetch,
                                     const TilefinchRequestContext *context,
                                     const TilefinchResourceGrant *grant)
 {
     char cache_control[256], vary[128];
-    script_cache_policy(fetch, cache_control, vary);
+    script_cache_response_policy(fetch, cache_control, vary);
     (void) browser_session_cache_revalidate_classic_script(
         session, url, cache_control, vary,
         tilefinch_platform_monotonic_time_ns(), context, grant);
 }
 
-static bool script_module_cache_revalidate(
+bool script_module_cache_record(
     BrowserSession *session, const char *request_url,
     const char *effective_url, const char *initiator_origin,
     const char *top_level_url, bool initiator_opaque,
-    TilefinchCredentialsMode credentials, const FetchResult *fetch)
+    TilefinchCredentialsMode credentials, FetchResult *fetch,
+    bool revalidate, uint64_t now_ns)
 {
     if (session == NULL || request_url == NULL || effective_url == NULL
-        || initiator_origin == NULL || fetch == NULL) return false;
+        || initiator_origin == NULL || fetch == NULL
+        || (!revalidate && fetch->length == 0)) return false;
     char cache_control[256], vary[128];
     char response_referrer_policy[FETCH_REFERRER_POLICY_LIMIT];
     bool referrer_policy_header_present = false;
     if (!fetch_response_referrer_policy(
             fetch, &referrer_policy_header_present,
             response_referrer_policy)) return false;
-    script_cache_policy(fetch, cache_control, vary);
+    script_cache_response_policy(fetch, cache_control, vary);
     BrowserModuleCacheProvenance provenance = {
         .effective_url = effective_url,
         .initiator_origin = initiator_origin,
@@ -390,9 +349,18 @@ static bool script_module_cache_revalidate(
         .referrer_policy_header_present =
             referrer_policy_header_present
     };
-    return browser_session_cache_revalidate_module(
-        session, request_url, cache_control, vary,
-        tilefinch_platform_monotonic_time_ns(), &provenance);
+    if (revalidate)
+        return browser_session_cache_revalidate_module(
+            session, request_url, cache_control, vary, now_ns, &provenance);
+    if (fetch_result_share_body(fetch))
+        return browser_session_cache_put_http_shared_module(
+            session, request_url, fetch->shared_body, fetch->etag,
+            fetch->last_modified, fetch->content_type,
+            cache_control, vary, now_ns, &provenance);
+    return browser_session_cache_put_http_module(
+        session, request_url, (const unsigned char *) fetch->data,
+        fetch->length, fetch->etag, fetch->last_modified,
+        fetch->content_type, cache_control, vary, now_ns, &provenance);
 }
 
 static const char *script_module_effective_referrer_policy(
@@ -1073,16 +1041,9 @@ static bool attribute_present(lxb_dom_node_t *node, const char *name)
 
 static bool script_referrer_policy_valid(const char *policy)
 {
-    if (policy == NULL || policy[0] == '\0') return policy != NULL;
-    static const char *known[] = {
-        "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (strcmp(policy, known[i]) == 0) return true;
-    }
-    return false;
+    return policy != NULL
+        && tilefinch_referrer_policy_code(policy, strlen(policy), false)
+               != TILEFINCH_REFERRER_POLICY_UNKNOWN;
 }
 
 static void script_referrer_policy_for_node(
@@ -2138,9 +2099,10 @@ static bool execute_external_node(
     }
     if (ok && fetch->status_code == 304) {
         ok = module
-            ? script_module_cache_revalidate(
+            ? script_module_cache_record(
                 session, resolved, response_url, initiator_origin,
-                top_level_url, initiator_opaque, module_credentials, fetch)
+                top_level_url, initiator_opaque, module_credentials, fetch,
+                true, tilefinch_platform_monotonic_time_ns())
             : (script_cache_revalidate(
                    session, resolved, fetch, &request_context,
                    &resource_grant), true);
@@ -2216,9 +2178,10 @@ static bool execute_external_node(
         && (!cors || module)
         && fetch->length != 0) {
         if (module) {
-            script_module_cache_store(
+            (void) script_module_cache_record(
                 session, resolved, response_url, initiator_origin,
-                top_level_url, initiator_opaque, module_credentials, fetch);
+                top_level_url, initiator_opaque, module_credentials, fetch,
+                false, tilefinch_platform_monotonic_time_ns());
         } else {
             script_cache_store(
                 session, resolved, fetch, &request_context,
@@ -2310,21 +2273,7 @@ typedef struct {
     ModuleBodyLease *body_leases;
 } ModuleLoadContext;
 
-static bool replace_first(char *buffer, size_t *length,
-                          const char *needle, const char *replacement)
-{
-    char *at = strstr(buffer, needle);
-    if (at == NULL) return false;
-    size_t offset = (size_t) (at - buffer);
-    size_t needle_length = strlen(needle);
-    size_t replacement_length = strlen(replacement);
-    memmove(buffer + offset + replacement_length,
-            buffer + offset + needle_length,
-            *length - offset - needle_length + 1);
-    memcpy(buffer + offset, replacement, replacement_length);
-    *length += replacement_length - needle_length;
-    return true;
-}
+#include "script_bundle_diagnostics.inc"
 
 static void pipeline_context_destroy(void *opaque)
 {
@@ -2548,10 +2497,11 @@ static bool pipeline_module_load(void *opaque,
                 &resource_grant);
         }
         if (response_ok && fetch->status_code == 304) {
-            response_ok = script_module_cache_revalidate(
+            response_ok = script_module_cache_record(
                 context->session, url, fetch_response_url,
                 initiator_origin, context->top_level_url,
-                initiator_opaque, credentials, fetch);
+                initiator_opaque, credentials, fetch,
+                true, tilefinch_platform_monotonic_time_ns());
         }
         if (response_ok && fetch->status_code == 304 && cached != NULL) {
             snprintf(response_referrer_policy,
@@ -2583,10 +2533,11 @@ static bool pipeline_module_load(void *opaque,
                     fetch->shared_body->data, fetch->shared_body->length)
                 ? fetch->shared_body : NULL;
             if (context->session != NULL && fetch->length != 0) {
-                script_module_cache_store(
+                (void) script_module_cache_record(
                     context->session, url, fetch_response_url,
                     initiator_origin, context->top_level_url,
-                    initiator_opaque, credentials, fetch);
+                    initiator_opaque, credentials, fetch,
+                    false, tilefinch_platform_monotonic_time_ns());
                 selected_body = fetch->shared_body != NULL
                     && script_source_has_terminator(
                         fetch->shared_body->data, fetch->shared_body->length)
@@ -2635,92 +2586,10 @@ static bool pipeline_module_load(void *opaque,
         return false;
     }
     memcpy(response_url, effective_url, effective_length + 1);
-    static const char react_stack_needle[] = "stack:Me(t)";
-    static const char react_stack_diagnostic[] =
-        "stack:(console.error('react-caught',e&&e.name||typeof e,e&&e.message||String(e),e&&e.stack||e),'')";
-    static const char sentinel_start_needle[] =
-        "async function Ms({requirements:e}){let[t,n]=await Promise.all";
-    static const char sentinel_start_diagnostic[] =
-        "async function Ms({requirements:e}){globalThis.__tilefinchSentinelStage='enforcement-start';let[t,n]=await Promise.all";
-    static const char sentinel_done_needle[] =
-        "]);return{proofToken:t,requirements:e,turnstileToken:n}}function Ns";
-    static const char sentinel_done_diagnostic[] =
-        "]);globalThis.__tilefinchSentinelStage='enforcement-done';return{proofToken:t,requirements:e,turnstileToken:n}}function Ns";
-    static const char sentinel_finalize_needle[] =
-        "let a=await Is(H.sentinelChatRequirementsFinalize,i);";
-    static const char sentinel_finalize_diagnostic[] =
-        "globalThis.__tilefinchSentinelStage='finalize-start';let a=await Is(H.sentinelChatRequirementsFinalize,i);globalThis.__tilefinchSentinelStage='finalize-done';";
-    static const char submit_sentinel_needle[] =
-        "ye.current=S,r().then(async e=>{if(Ie.current)return;";
-    static const char submit_sentinel_diagnostic[] =
-        "ye.current=S,globalThis.__tilefinchSentinelStage='submit-sentinel-call',r().then(async e=>{globalThis.__tilefinchSentinelStage='submit-sentinel-resolved';if(Ie.current)return;";
-    static const char submit_after_de_needle[] =
-        ").searchParams)),Ze(d),Ye(!0),t.dataset.submitting=``;";
-    static const char submit_after_de_diagnostic[] =
-        ").searchParams)),globalThis.__tilefinchSentinelStage='submit-after-optimistic',Ze(d),Ye(!0),t.dataset.submitting=``;";
-    static const char submit_before_store_needle[] =
-        "if(_o({conversationState:mt,";
-    static const char submit_before_store_diagnostic[] =
-        "globalThis.__tilefinchSentinelStage='submit-before-store';if(_o({conversationState:mt,";
-    static const char submit_before_rollback_needle[] =
-        "let S=()=>{if(!n&&";
-    static const char submit_before_rollback_diagnostic[] =
-        "globalThis.__tilefinchSentinelStage='submit-before-sentinel';let S=()=>{if(!n&&";
-    static const char dpu_start_needle[] =
-        "Tr=async(e,t,n)=>{let r=e.getReader(),i=$t().getWriter(),a=new TextDecoder";
-    static const char dpu_start_diagnostic[] =
-        "Tr=async(e,t,n)=>{globalThis.__tilefinchDpuStage='reader-start';let r=e.getReader(),i=$t().getWriter(),a=new TextDecoder";
-    static const char dpu_read_needle[] =
-        "let{done:e,value:t}=await r.read();if(e){";
-    static const char dpu_read_diagnostic[] =
-        "let{done:e,value:t}=await r.read();globalThis.__tilefinchDpuStage=e?'read-done':'read-'+String(t?.byteLength ?? -1);if(e){";
-    static const char dpu_write_needle[] =
-        "o&&(n(`client_stream_apply`),await i.write(o))";
-    static const char dpu_write_diagnostic[] =
-        "o&&(n(`client_stream_apply`),globalThis.__tilefinchDpuStage='write-'+String(o.length),await i.write(o),globalThis.__tilefinchDpuStage='write-done')";
-    static const char dpu_catch_needle[] =
-        "}catch(e){throw await i.abort(e).catch(()=>{}),e}finally{";
-    static const char dpu_catch_diagnostic[] =
-        "}catch(e){globalThis.__tilefinchDpuStage='error:'+String(e&&e.message||e);console.error('stream-loop-error',e&&e.stack||e);throw await i.abort(e).catch(()=>{}),e}finally{";
-    bool react_diagnostic = tilefinch_trace_react_error()
-        && strstr(url, "/react-stable-") != NULL;
-    bool sentinel_diagnostic = tilefinch_trace_sentinel()
-        && strstr(url, "/client-shared-") != NULL;
-    bool submit_diagnostic = tilefinch_trace_sentinel()
-        && strstr(url, "/client-C") != NULL
-        && strstr(url, "/client-shared-") == NULL;
-    bool dpu_diagnostic = tilefinch_trace_dpu()
-        && strstr(url, "/client-C") != NULL
-        && strstr(url, "/client-shared-") == NULL;
-    size_t diagnostic_extra = react_diagnostic
-        ? sizeof(react_stack_diagnostic) - sizeof(react_stack_needle) : 0;
-    if (sentinel_diagnostic) {
-        diagnostic_extra +=
-            sizeof(sentinel_start_diagnostic) - sizeof(sentinel_start_needle)
-            + sizeof(sentinel_done_diagnostic) - sizeof(sentinel_done_needle)
-            + sizeof(sentinel_finalize_diagnostic)
-              - sizeof(sentinel_finalize_needle);
-    }
-    if (submit_diagnostic) {
-        diagnostic_extra +=
-            sizeof(submit_sentinel_diagnostic)
-            - sizeof(submit_sentinel_needle)
-            + sizeof(submit_after_de_diagnostic)
-              - sizeof(submit_after_de_needle)
-            + sizeof(submit_before_store_diagnostic)
-              - sizeof(submit_before_store_needle)
-            + sizeof(submit_before_rollback_diagnostic)
-              - sizeof(submit_before_rollback_needle);
-    }
-    if (dpu_diagnostic) {
-        diagnostic_extra += sizeof(dpu_start_diagnostic)
-            - sizeof(dpu_start_needle)
-            + sizeof(dpu_read_diagnostic) - sizeof(dpu_read_needle)
-            + sizeof(dpu_write_diagnostic) - sizeof(dpu_write_needle)
-            + sizeof(dpu_catch_diagnostic) - sizeof(dpu_catch_needle);
-    }
-    bool diagnostic_copy = react_diagnostic || sentinel_diagnostic
-        || submit_diagnostic || dpu_diagnostic;
+    unsigned diagnostics = 0;
+    size_t diagnostic_extra =
+        script_bundle_diagnostics_select(url, &diagnostics);
+    bool diagnostic_copy = diagnostics != 0;
     if (!diagnostic_copy && selected_body != NULL) {
         char *leased_source = NULL;
         if (pipeline_module_lease_body(
@@ -2755,65 +2624,7 @@ static bool pipeline_module_load(void *opaque,
         return false;
     }
     memcpy(copy, selected, selected_length); copy[selected_length] = '\0';
-    if (react_diagnostic) {
-        char *component_stack = strstr(copy, react_stack_needle);
-        if (component_stack != NULL) {
-            size_t offset = (size_t) (component_stack - copy);
-            size_t needle_length = sizeof(react_stack_needle) - 1;
-            size_t replacement_length =
-                sizeof(react_stack_diagnostic) - 1;
-            memmove(copy + offset + replacement_length,
-                    copy + offset + needle_length,
-                    selected_length - offset - needle_length + 1);
-            memcpy(copy + offset, react_stack_diagnostic,
-                   replacement_length);
-            selected_length += replacement_length - needle_length;
-            fprintf(stderr,
-                    "react-error diagnostic: caught value exposed\n");
-        }
-    }
-    if (sentinel_diagnostic) {
-        bool start = replace_first(copy, &selected_length,
-                                   sentinel_start_needle,
-                                   sentinel_start_diagnostic);
-        bool done = replace_first(copy, &selected_length,
-                                  sentinel_done_needle,
-                                  sentinel_done_diagnostic);
-        bool finalize = replace_first(copy, &selected_length,
-                                      sentinel_finalize_needle,
-                                      sentinel_finalize_diagnostic);
-        fprintf(stderr, "sentinel diagnostic: start=%d done=%d finalize=%d\n",
-                start, done, finalize);
-    }
-    if (submit_diagnostic) {
-        bool submit = replace_first(copy, &selected_length,
-                                    submit_sentinel_needle,
-                                    submit_sentinel_diagnostic);
-        bool after_de = replace_first(copy, &selected_length,
-                                      submit_after_de_needle,
-                                      submit_after_de_diagnostic);
-        bool before_store = replace_first(copy, &selected_length,
-                                          submit_before_store_needle,
-                                          submit_before_store_diagnostic);
-        bool before_rollback = replace_first(copy, &selected_length,
-                                             submit_before_rollback_needle,
-                                             submit_before_rollback_diagnostic);
-        fprintf(stderr,
-                "submit sentinel diagnostic: marker=%d optimistic=%d store=%d rollback=%d\n",
-                submit, after_de, before_store, before_rollback);
-    }
-    if (dpu_diagnostic) {
-        bool start = replace_first(copy, &selected_length,
-                                   dpu_start_needle, dpu_start_diagnostic);
-        bool read = replace_first(copy, &selected_length,
-                                  dpu_read_needle, dpu_read_diagnostic);
-        bool write = replace_first(copy, &selected_length,
-                                   dpu_write_needle, dpu_write_diagnostic);
-        bool caught = replace_first(copy, &selected_length,
-                                    dpu_catch_needle, dpu_catch_diagnostic);
-        fprintf(stderr, "DPU diagnostic: start=%d read=%d write=%d catch=%d\n",
-                start, read, write, caught);
-    }
+    script_bundle_diagnostics_apply(diagnostics, copy, &selected_length);
     fetch_result_free(fetch);
     script_cache_source_release(&cached_source);
     result->source = copy;

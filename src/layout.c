@@ -152,10 +152,14 @@ static void layout_release_context(LayoutContext *context, Budget *budget)
         && context->sheet != NULL) {
         style_selector_cooperation_end((Stylesheet *) context->sheet);
     }
+    tilefinch_platform_trace_step("release-variable-cache");
     if (context->style_variable_cache_owned && context->sheet != NULL) {
         style_variable_cache_end((Stylesheet *) context->sheet);
     }
+    tilefinch_platform_trace_step("release-block-scratch");
     layout_free_block_scratch(context);
+    tilefinch_platform_trace_step("release-rest");
+    layout_bidi_release(context, budget);
     for (size_t i = 0; i < context->table_track_count; i++) {
         budget_free(budget, context->table_tracks[i].placements);
     }
@@ -340,6 +344,31 @@ void layout_finish_work_slice(LayoutContext *context)
                 (int) id_length, id == NULL ? "" : id,
                 (int) class_length, class_name == NULL ? "" : class_name);
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Stall attribution: the nodes a long slice spans. */
+    if (elapsed_us >= UINT64_C(60000)) {
+        size_t first_length = 0, last_length = 0, first_class_length = 0;
+        const char *first = document_element_name(
+            context->slice_first_node, &first_length);
+        const char *last = document_element_name(
+            context->slice_last_node, &last_length);
+        const char *first_class = document_attribute(
+            context->slice_first_node, "class", &first_class_length);
+        char message[192];
+        snprintf(message, sizeof(message),
+            "tilefinch-layout-stall: elapsed=%lluus units=%zu "
+            "from=%.*s.%.*s to=%.*s",
+            (unsigned long long) elapsed_us, context->slice_units,
+            (int) (first_length > 16u ? 16u : first_length),
+            first == NULL ? "" : first,
+            (int) (first_class_length > 32u ? 32u : first_class_length),
+            first_class == NULL ? "" : first_class,
+            (int) (last_length > 16u ? 16u : last_length),
+            last == NULL ? "" : last);
+        tilefinch_platform_log_message(message);
+    }
+    context->slice_first_node = context->slice_last_node;
+#endif
     context->slice_units = 0;
     context->slice_started_ns = finished_ns;
 }
@@ -384,6 +413,20 @@ bool layout_cooperate(LayoutContext *context, lxb_dom_node_t *node)
     context->layout->cooperative_yields++;
     LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_COOPERATE);
     bool keep_going = tilefinch_platform_cooperate("layout", completed);
+    if (!keep_going) layout_context_cancel(context);
+    return keep_going;
+}
+
+bool layout_cooperate_timed(LayoutContext *context)
+{
+    if (context == NULL || context->cancelled) return false;
+    uint64_t now = tilefinch_platform_monotonic_time_ns();
+    if (now >= context->slice_started_ns
+        && now - context->slice_started_ns < UINT64_C(8000000)) return true;
+    context->layout->cooperative_yields++;
+    bool keep_going = tilefinch_platform_cooperate(
+        "layout-prepare", context->layout->layout_work_units);
+    context->slice_started_ns = tilefinch_platform_monotonic_time_ns();
     if (!keep_going) layout_context_cancel(context);
     return keep_going;
 }
@@ -504,6 +547,8 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
     cache->selector_has_has_sibling = false;
     cache->has_rule_count = 0;
     cache->has_rules_bounded = false;
+    cache->state_rule_count = 0;
+    cache->state_rules_bounded = false;
     cache->selector_has_focus_within = false;
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
@@ -516,6 +561,12 @@ static void layout_reuse_note_selector_dependencies(
 void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache)
 {
     if (cache != NULL) cache->matches_enabled = true;
+}
+
+void layout_reuse_cache_record_unresolved_visuals(LayoutReuseCache *cache,
+                                                  bool record)
+{
+    if (cache != NULL) cache->record_unresolved_visuals = record;
 }
 
 void layout_reuse_cache_note_stylesheet_appended(
@@ -555,6 +606,15 @@ void layout_reuse_cache_note_stylesheet_appended(
             break;
         }
         cache->has_rules[i] = remap[old];
+    }
+    for (size_t i = 0; i < cache->state_rule_count; i++) {
+        uint32_t old = cache->state_rules[i];
+        if (!lists_valid || remap == NULL || old >= old_count
+            || remap[old] == UINT16_MAX) {
+            cache->state_rules_bounded = true;
+            break;
+        }
+        cache->state_rules[i] = remap[old];
     }
     bool had_has = cache->selector_has_has;
     for (size_t i = 0; i < appended_count; i++) {
@@ -981,6 +1041,36 @@ void layout_reuse_cache_invalidate_focus(
     style_retained_matches_invalidate_ancestors(cache->matches, node);
 }
 
+void layout_reuse_cache_invalidate_checked(
+    LayoutReuseCache *cache, lxb_dom_node_t *const *nodes, size_t count)
+{
+    if (cache == NULL || nodes == NULL || count == 0
+        || cache->state_rules_bounded
+        || cache->matches == NULL || cache->sheet == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    layout_reuse_cache_flush_invalidations(cache);
+    /* Only rules that can observe checkedness change their answer, and the
+       elements they can select are found by those rules' fast keys, however
+       far a sibling or descendant combinator carries the state. Every other
+       retained list replays. Computed styles and measurements are keyed by
+       node, not by the rules that produced them, so they all go; that is
+       the cheap half of style resolution. */
+    layout_reuse_clear_counters(cache);
+    memset(cache->styles, 0, sizeof(cache->styles));
+    memset(cache->font_dependent, 0, sizeof(cache->font_dependent));
+    layout_reuse_clear_sizing_entries(cache);
+    for (size_t i = 0; i < count; i++) {
+        if (nodes[i] != NULL)
+            style_retained_matches_invalidate_within(cache->matches, nodes[i]);
+    }
+    style_retained_matches_invalidate_rules(
+        cache->matches, cache->sheet, cache->state_rules,
+        cache->state_rule_count);
+    cache->stats.scoped_invalidations++;
+}
+
 void layout_reuse_cache_stats(const LayoutReuseCache *cache,
                               LayoutReuseStats *stats)
 {
@@ -1015,6 +1105,10 @@ static void layout_reuse_note_selector_dependencies(
     LayoutReuseCache *cache, const char *selector, uint32_t rule_index)
 {
     if (cache == NULL || selector == NULL) return;
+    /* Every dependency below needs a pseudo-class, a combinator or an
+       attribute selector; most rules (plain classes) have none, and this
+       runs over the whole sheet whenever a new one is bound. */
+    if (strpbrk(selector, ":+~[") == NULL) return;
     if (strstr(selector, ":has(") != NULL) {
         cache->selector_has_has = true;
         if (strchr(selector, '+') != NULL || strchr(selector, '~') != NULL) {
@@ -1025,6 +1119,23 @@ static void layout_reuse_note_selector_dependencies(
             cache->has_rules_bounded = true;
         } else {
             cache->has_rules[cache->has_rule_count++] = rule_index;
+        }
+    }
+    if (strstr(selector, "checked") != NULL
+        || strstr(selector, ":default") != NULL
+        || strstr(selector, ":indeterminate") != NULL
+        || strstr(selector, "valid") != NULL) {
+        /* Custom-property rules are matched afresh whenever a computed
+           style is, so only retained author rules need tracking. A :has()
+           that can see the state can change any ancestor's answer. */
+        if (strstr(selector, ":has(") != NULL) {
+            cache->state_rules_bounded = true;
+        } else if (rule_index != UINT32_MAX) {
+            if (cache->state_rule_count == LAYOUT_REUSE_STATE_RULE_LIMIT) {
+                cache->state_rules_bounded = true;
+            } else {
+                cache->state_rules[cache->state_rule_count++] = rule_index;
+            }
         }
     }
     if (strstr(selector, ":focus-within") != NULL) {
@@ -1090,6 +1201,8 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
     cache->selector_has_structure = false;
     cache->has_rule_count = 0;
     cache->has_rules_bounded = false;
+    cache->state_rule_count = 0;
+    cache->state_rules_bounded = false;
     if (sheet == NULL) return;
     for (size_t i = 0; i < sheet->count; i++) {
         layout_reuse_note_selector_dependencies(
@@ -1280,6 +1393,12 @@ void layout_style_for_node_into(LayoutContext *context,
                                        ComputedStyle *result)
 {
     context->style_resolutions++;
+    /* Every layout path resolves each element's style here, including
+       inline and list content that never reaches a block checkpoint (the
+       article's 595 KB reference list). A declined check leaves the build
+       cancelled for the next block checkpoint to return. */
+    if ((context->style_resolutions & 7u) == 0)
+        (void) layout_cooperate_timed(context);
     /* Open addressing over the fixed bounded array: hash the node pointer
        to a home slot and probe a short window, evicting the oldest stamp in
        the window on a miss.  This is the single owner of the cache keying
@@ -2053,8 +2172,8 @@ bool layout_batch_checkpoint(LayoutContext *context, size_t at,
     if (context == NULL || at + 1 < *checkpoint_at) return true;
     size_t completed = at + 1;
     size_t units = completed > count ? count : completed;
-    units -= *checkpoint_at - 4096;
-    *checkpoint_at = completed + 4096;
+    units -= *checkpoint_at - LAYOUT_BATCH_STRIDE;
+    *checkpoint_at = completed + LAYOUT_BATCH_STRIDE;
     return layout_batch_cooperate(context, units);
 }
 
@@ -2153,9 +2272,16 @@ static bool layout_job_init(LayoutBuildJob *job)
     context->images = job->images;
     context->reuse = job->reuse;
     context->preview_y_limit = job->preview_y_limit;
+    context->record_unresolved_visuals =
+        job->reuse != NULL && job->reuse->record_unresolved_visuals;
     context->document_bidi_text_present = job->document->bidi_text_present;
     context->document_bidi_markup_present =
         job->document->bidi_markup_present;
+    context->slice_started_ns = tilefinch_platform_monotonic_time_ns();
+    tilefinch_platform_trace_step("layout-bidi");
+    layout_bidi_prepare(context, job->budget);
+    tilefinch_platform_trace_step("layout-root-style");
+    if (context->cancelled) return false;
     if (job->stylesheet != NULL) {
         context->style_variable_cache_owned = style_variable_cache_begin(
             (Stylesheet *) job->stylesheet, job->budget);
@@ -2184,7 +2310,9 @@ static bool layout_job_init(LayoutBuildJob *job)
     }
     layout_reuse_cache_prepare(job->reuse, job->stylesheet, job->fonts,
                                job->images, job->viewport_width);
-    context->slice_started_ns = tilefinch_platform_monotonic_time_ns();
+    /* Binding a new sheet and resolving the root style (hundreds of
+       custom properties on Wikipedia) are each tens of ms on the PSP. */
+    if (!layout_cooperate_timed(context)) return false;
     if (job->stylesheet != NULL) {
         context->style_selector_cooperation_owned =
             style_selector_cooperation_begin(
@@ -2213,6 +2341,7 @@ static bool layout_job_init(LayoutBuildJob *job)
             job->html_style.background, job->html_style.background_alpha,
             layout->page_background);
     }
+    if (!layout_cooperate_timed(context)) return false;
     job->body_style = layout_style_for_node(
         context, job->body, &job->html_style);
     if (job->body_style.has_background) {
@@ -2566,6 +2695,21 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
     if (job->status != LAYOUT_BUILD_PENDING) return job->status;
     uint64_t started_us = layout_performance_now_us();
     bool okay = true;
+    static const char *const phase_steps[] = {
+        [LAYOUT_JOB_INIT] = "layout-job-init",
+        [LAYOUT_JOB_FLOW] = "layout-job-flow",
+        [LAYOUT_JOB_COMPACT] = "layout-job-compact",
+        [LAYOUT_JOB_VISIBILITY] = "layout-job-visibility",
+        [LAYOUT_JOB_PAINT_ORDER] = "layout-job-paint-order",
+        [LAYOUT_JOB_SPATIAL_INDEX] = "layout-job-spatial",
+        [LAYOUT_JOB_SCROLL_METADATA] = "layout-job-scroll",
+        [LAYOUT_JOB_FINISH] = "layout-job-finish",
+        [LAYOUT_JOB_CONTAINER_STATE] = "layout-job-container",
+        [LAYOUT_JOB_DONE] = "layout-job-done"
+    };
+    if ((size_t) job->phase < sizeof(phase_steps) / sizeof(phase_steps[0])
+        && phase_steps[job->phase] != NULL)
+        tilefinch_platform_trace_step(phase_steps[job->phase]);
     switch (job->phase) {
     case LAYOUT_JOB_INIT:
         okay = layout_job_init(job);
@@ -2622,6 +2766,9 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
     case LAYOUT_JOB_SCROLL_METADATA:
         okay = layout_build_scroll_metadata(
             &job->layout, job->stylesheet);
+        /* Its only refusal is a declined cooperate checkpoint. */
+        if (!okay && job->context != NULL)
+            layout_context_cancel(job->context);
         if (okay) job->phase = LAYOUT_JOB_FINISH;
         break;
     case LAYOUT_JOB_FINISH:
@@ -2629,12 +2776,16 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
         job->layout.scroll_width = root_scroll_width_after_clipping(
             &job->layout, job->viewport_width);
         job->preview_truncated = job->context->preview_truncated;
+        tilefinch_platform_trace_step("finish-trace");
         layout_job_trace_finished(job);
         job->layout.performance.finalize_us =
             layout_performance_now_us() - started_us;
         layout_job_record_phase(job, started_us);
+        tilefinch_platform_trace_step("finish-capture");
         layout_job_capture_performance(job);
+        tilefinch_platform_trace_step("finish-release");
         layout_release_context(job->context, job->budget);
+        tilefinch_platform_trace_step("finish-released");
         job->context = NULL;
         if (job->probe_pass) {
             job->phase = LAYOUT_JOB_CONTAINER_STATE;
@@ -2679,6 +2830,10 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
     default:
         return job->status;
     }
+    /* A synchronous build pumps its phases back to back; each ending phase
+       (compaction, visibility, ...) is a safe point for the clock check. */
+    if (okay && job->context != NULL
+        && !layout_cooperate_timed(job->context)) okay = false;
     layout_job_record_phase(job, started_us);
     if (!okay || (job->context != NULL && job->context->cancelled)) {
         LayoutBuildStatus failure =
@@ -2934,7 +3089,8 @@ void layout_note_unresolved_external_visual(
     if (context == NULL || context->layout == NULL || node == NULL) return;
     LayoutDocument *layout = context->layout;
     layout->unresolved_external_visuals = true;
-    if (context->preview_y_limit <= 0) return;
+    if (context->preview_y_limit <= 0
+        && !context->record_unresolved_visuals) return;
     for (size_t i = 0; i < layout->visual_priority_count; i++) {
         const ImagePriorityTarget *target =
             &layout->visual_priority_targets[i];
@@ -3056,6 +3212,13 @@ bool layout_clone_visual(LayoutDocument *visual,
     visual->scroll_width = viewport_scale_ceil(source->scroll_width, numerator,
                                                 denominator);
     visual->height = viewport_scale_ceil(source->height, numerator, denominator);
+    /* The placeholder below a provisional layout's content starts at the
+       same place on screen. */
+    if (source->content_limit_y > 0) {
+        visual->content_limit_y = viewport_scale_ceil(
+            source->content_limit_y, numerator, denominator);
+        if (visual->content_limit_y <= 0) visual->content_limit_y = 1;
+    }
     if (!viewport_context_init(&visual->viewport,
                                source->viewport.device_width,
                                source->viewport.device_height,
@@ -3389,37 +3552,45 @@ static bool point_in_rounded_clip(const LayoutDocument *layout,
     return absolute_y * absolute_y < radius_squared - x_squared;
 }
 
+/* Whether (x, y) lands on a region laid out at (region_x, region_y) inside
+   node's ancestors: every clipping ancestor must contain the point, and
+   ancestor scroll offsets move the region. Shared by link and control hit
+   tests so both honour the same clips. */
+static bool layout_region_hit(const LayoutDocument *layout,
+                              const lxb_dom_node_t *node,
+                              int region_x, int region_y,
+                              int width, int height, int x, int y)
+{
+    for (lxb_dom_node_t *parent = node == NULL ? NULL : node->parent;
+         parent != NULL; parent = parent->parent) {
+        const LayoutNodeBox *box = layout_box_for_node(layout, parent);
+        if (box == NULL) continue;
+        int clip_left, clip_top, clip_right, clip_bottom;
+        layout_node_box_clip_rect(
+            box, &clip_left, &clip_top, &clip_right, &clip_bottom);
+        bool outside = (box->clips_x
+                        && (x < clip_left || x >= clip_right))
+                       || (box->clips_y
+                           && (y < clip_top || y >= clip_bottom));
+        if (outside || !point_in_rounded_clip(layout, box, x, y))
+            return false;
+        region_x -= box->scroll_x;
+        region_y -= box->scroll_y;
+    }
+    return x >= region_x && x < region_x + width
+        && y >= region_y && y < region_y + height;
+}
+
 const LinkRegion *layout_link_at(const LayoutDocument *layout, int x, int y)
 {
     if (layout == NULL) return NULL;
     const LinkRegion *hit = NULL;
     for (size_t i = 0; i < layout->link_count; i++) {
         const LinkRegion *link = &layout->links[i];
-        int translated_x = link->x, translated_y = link->y;
-        bool clipped = false;
-        for (lxb_dom_node_t *parent = link->node == NULL ? NULL
-                                      : link->node->parent;
-             parent != NULL; parent = parent->parent) {
-            const LayoutNodeBox *box = layout_box_for_node(layout, parent);
-            if (box == NULL) continue;
-            int clip_left, clip_top, clip_right, clip_bottom;
-            layout_node_box_clip_rect(
-                box, &clip_left, &clip_top, &clip_right, &clip_bottom);
-            bool outside = (box->clips_x
-                            && (x < clip_left || x >= clip_right))
-                           || (box->clips_y
-                               && (y < clip_top || y >= clip_bottom));
-            if (outside || !point_in_rounded_clip(layout, box, x, y)) {
-                clipped = true;
-                break;
-            }
-            translated_x -= box->scroll_x;
-            translated_y -= box->scroll_y;
-        }
-        if (!clipped && x >= translated_x
-            && x < translated_x + link->width && y >= translated_y
-            && y < translated_y + link->height
-            && (hit == NULL || link->z_index >= hit->z_index)) hit = link;
+        if ((hit == NULL || link->z_index >= hit->z_index)
+            && layout_region_hit(layout, link->node, link->x, link->y,
+                                 link->width, link->height, x, y))
+            hit = link;
     }
     return hit;
 }
@@ -3431,31 +3602,11 @@ const ControlRegion *layout_control_at(const LayoutDocument *layout,
     const ControlRegion *hit = NULL;
     for (size_t i = 0; i < layout->control_count; i++) {
         const ControlRegion *control = &layout->controls[i];
-        int translated_x = control->x, translated_y = control->y;
-        bool clipped = false;
-        for (lxb_dom_node_t *parent = control->node == NULL ? NULL
-                                      : control->node->parent;
-             parent != NULL; parent = parent->parent) {
-            const LayoutNodeBox *box = layout_box_for_node(layout, parent);
-            if (box == NULL) continue;
-            int clip_left, clip_top, clip_right, clip_bottom;
-            layout_node_box_clip_rect(
-                box, &clip_left, &clip_top, &clip_right, &clip_bottom);
-            bool outside = (box->clips_x
-                            && (x < clip_left || x >= clip_right))
-                           || (box->clips_y
-                               && (y < clip_top || y >= clip_bottom));
-            if (outside || !point_in_rounded_clip(layout, box, x, y)) {
-                clipped = true;
-                break;
-            }
-            translated_x -= box->scroll_x;
-            translated_y -= box->scroll_y;
-        }
-        if (!clipped && x >= translated_x
-            && x < translated_x + control->width && y >= translated_y
-            && y < translated_y + control->height
-            && (hit == NULL || control->z_index >= hit->z_index)) hit = control;
+        if ((hit == NULL || control->z_index >= hit->z_index)
+            && layout_region_hit(layout, control->node, control->x,
+                                 control->y, control->width,
+                                 control->height, x, y))
+            hit = control;
     }
     return hit;
 }
@@ -3611,6 +3762,8 @@ bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
         if (scroll_y < 0) scroll_y = 0;
         if (scroll_x > maximum_x) scroll_x = maximum_x;
         if (scroll_y > maximum_y) scroll_y = maximum_y;
+        if (box->scroll_x != scroll_x || box->scroll_y != scroll_y)
+            layout->scroll_generation++;
         box->scroll_x = scroll_x;
         box->scroll_y = scroll_y;
         return true;

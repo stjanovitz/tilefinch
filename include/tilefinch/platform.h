@@ -53,6 +53,10 @@ typedef struct {
     bool (*poll_input)(void *context, TilefinchPlatformInput *input);
     bool (*present_rgb565)(void *context, const uint16_t *pixels,
                            size_t width, size_t height, size_t stride_pixels);
+    /* Optional: pixels once presented are about to be freed. A frontend
+       that repaints the last presented frame from another thread stops
+       using them before this returns. */
+    void (*retire_frame)(void *context, const uint16_t *pixels);
     /* Called at deterministic engine work boundaries. Returning false asks
        the current operation to cancel without committing partial state. */
     bool (*cooperate)(void *context, const char *phase,
@@ -74,8 +78,13 @@ bool tilefinch_platform_read_asset(Budget *budget, const char *path,
 bool tilefinch_platform_poll_input(TilefinchPlatformInput *input);
 bool tilefinch_platform_present_rgb565(const uint16_t *pixels, size_t width,
                                     size_t height, size_t stride_pixels);
+void tilefinch_platform_retire_frame(const uint16_t *pixels);
 bool tilefinch_platform_cooperate(const char *phase,
                                size_t completed_work_units);
 void tilefinch_platform_log_message(const char *message);
+/* Validation builds: name a step of engine work so that a visible gap
+   between two cooperate checkpoints can be attributed to the steps that ran
+   inside it (`label` must be a string literal). No-op otherwise. */
+void tilefinch_platform_trace_step(const char *label);
 
 #endif

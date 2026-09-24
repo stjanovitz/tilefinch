@@ -37,6 +37,16 @@ static void canvas_blend_pixel(uint8_t *pixels, size_t at,
                                double global_alpha, int operation,
                                double coverage)
 {
+    /* Opaque source-over and copy produce exactly the source color at full
+       alpha; skip the (soft-float on the PSP) blend. */
+    if ((operation == 1 || operation == 2) && alpha == 255
+        && global_alpha == 1.0 && coverage == 1.0) {
+        pixels[at] = (uint8_t) red;
+        pixels[at + 1u] = (uint8_t) green;
+        pixels[at + 2u] = (uint8_t) blue;
+        pixels[at + 3u] = 255u;
+        return;
+    }
     double source_alpha = ((double) alpha / 255.0) * global_alpha * coverage;
     if (source_alpha < 0.0) source_alpha = 0.0;
     if (source_alpha > 1.0) source_alpha = 1.0;
@@ -546,12 +556,23 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
             work_exhausted = true;
             break;
         }
+        bool opaque = (operation == 1 || operation == 2) && alpha == 255
+            && global_alpha == 1.0;
         for (int y = top; y < bottom; y++) {
-            for (int x = left; x < right; x++) {
-                size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
-                canvas_blend_pixel(pixels, at, red, green, blue, alpha,
-                                   global_alpha, operation, 1.0);
+            size_t row = ((size_t) y * (size_t) width + (size_t) left) * 4u;
+            if (opaque) {
+                uint8_t *at = pixels + row;
+                for (int x = left; x < right; x++, at += 4) {
+                    at[0] = (uint8_t) red;
+                    at[1] = (uint8_t) green;
+                    at[2] = (uint8_t) blue;
+                    at[3] = 255u;
+                }
+                continue;
             }
+            for (int x = left; x < right; x++, row += 4u)
+                canvas_blend_pixel(pixels, row, red, green, blue, alpha,
+                                   global_alpha, operation, 1.0);
         }
     }
     JS_FreeValue(context, command_buffer);

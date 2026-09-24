@@ -678,8 +678,8 @@ static size_t element_sibling_index(lxb_dom_node_t *node, bool same_type,
     return index;
 }
 
-static size_t selector_list_option_end(const char *text, size_t length,
-                                       size_t start)
+size_t style_selector_list_option_end(const char *text, size_t length,
+                                      size_t start)
 {
     unsigned parentheses = 0, brackets = 0;
     char quote = 0;
@@ -702,14 +702,133 @@ static size_t selector_list_option_end(const char *text, size_t length,
     return length;
 }
 
+enum {
+    FUNCTIONAL_ARGUMENT_EMPTY = 0,
+    FUNCTIONAL_ARGUMENT_PREPARED,
+    FUNCTIONAL_ARGUMENT_UNPREPARED
+};
+
+/* The prepared form of a selector-list argument stored in `sheet`, or NULL
+   when it cannot be held (the caller then matches the text directly). */
+static const StyleFunctionalArgument *functional_argument_prepared(
+    const Stylesheet *const_sheet, const char *text, size_t length)
+{
+    if (const_sheet == NULL || length == 0 || length > UINT16_MAX)
+        return NULL;
+    /* A memo only; see the field comment in Stylesheet. */
+    Stylesheet *sheet = (Stylesheet *) const_sheet;
+    if (sheet->functional_argument_generation != sheet->build_generation) {
+        memset(sheet->functional_arguments, 0,
+               sizeof(sheet->functional_arguments));
+        sheet->functional_option_count = 0;
+        sheet->functional_argument_generation = sheet->build_generation;
+    }
+    uintptr_t key = (uintptr_t) text;
+    size_t slot = (size_t) ((key >> 2) ^ (key >> 9) ^ length)
+        % STYLE_FUNCTIONAL_ARGUMENT_CAPACITY;
+    StyleFunctionalArgument *entry = NULL;
+    for (size_t probe = 0; probe < STYLE_FUNCTIONAL_ARGUMENT_CAPACITY;
+         probe++) {
+        StyleFunctionalArgument *candidate = &sheet->functional_arguments[
+            (slot + probe) % STYLE_FUNCTIONAL_ARGUMENT_CAPACITY];
+        if (candidate->state == FUNCTIONAL_ARGUMENT_EMPTY) {
+            entry = candidate;
+            break;
+        }
+        if (candidate->text == text && candidate->length == length) {
+            return candidate->state == FUNCTIONAL_ARGUMENT_PREPARED
+                ? candidate : NULL;
+        }
+    }
+    if (entry == NULL) return NULL;
+    entry->text = text;
+    entry->length = (uint16_t) length;
+    entry->first_option = sheet->functional_option_count;
+    entry->option_count = 0;
+    entry->state = FUNCTIONAL_ARGUMENT_UNPREPARED;
+    /* The same option split as the direct text path below. */
+    for (size_t at = 0; at < length;) {
+        size_t end = style_selector_list_option_end(text, length, at);
+        const char *option = text + at;
+        size_t option_length = end - at;
+        trim(&option, &option_length);
+        at = end + (end < length);
+        if (option_length == 0) continue;
+        if (sheet->functional_option_count
+                >= STYLE_FUNCTIONAL_OPTION_CAPACITY
+            || entry->option_count == UINT8_MAX) {
+            sheet->functional_option_count = entry->first_option;
+            return NULL;
+        }
+        size_t rightmost = SIZE_MAX, key_offset = 0, key_length = 0;
+        SelectorType key_type = SELECTOR_TAG;
+        style_selector_prepare_complex(option, option_length, &rightmost,
+                                       &key_type, &key_offset, &key_length);
+        sheet->functional_options[sheet->functional_option_count++] =
+            (StyleFunctionalOption) {
+                .offset = (uint16_t) (option - text),
+                .length = (uint16_t) option_length,
+                .rightmost = rightmost == SIZE_MAX
+                    ? UINT16_MAX : (uint16_t) rightmost,
+                .key_offset = (uint16_t) key_offset,
+                .key_length = (uint8_t) key_length,
+                .key_type = (uint8_t) key_type
+            };
+        entry->option_count++;
+    }
+    entry->state = FUNCTIONAL_ARGUMENT_PREPARED;
+    return entry;
+}
+
 static bool selector_list_matches_node(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *text, size_t length, unsigned functional_depth,
     const lxb_dom_node_t *scope)
 {
     if (functional_depth >= 8) return false;
+    const StyleFunctionalArgument *prepared =
+        functional_argument_prepared(sheet, text, length);
+    if (prepared != NULL) {
+        /* Each option's fast key rejects an element the full matcher would
+           reject, and matching starts at its located rightmost compound. */
+        StyleMatchSubject subject;
+        bool subject_ready = false;
+        for (size_t i = 0; i < prepared->option_count; i++) {
+            const StyleFunctionalOption *option =
+                &sheet->functional_options[prepared->first_option + i];
+            if (option->key_length != 0) {
+                if (!subject_ready) {
+                    style_match_subject_prepare(node, &subject);
+                    subject_ready = true;
+                }
+                const char *key = text + option->offset + option->key_offset;
+                bool keyed;
+                if (option->key_type == SELECTOR_ID) {
+                    keyed = subject.id != NULL
+                        && subject.id_length == option->key_length
+                        && memcmp(subject.id, key, option->key_length) == 0;
+                } else if (option->key_type == SELECTOR_CLASS) {
+                    keyed = subject.classes != NULL
+                        && class_contains_length(
+                            subject.classes, subject.classes_length,
+                            key, option->key_length);
+                } else {
+                    keyed = subject.tag != NULL
+                        && subject.tag_length == option->key_length
+                        && memcmp(subject.tag, key, option->key_length) == 0;
+                }
+                if (!keyed) continue;
+            }
+            bool located = option->rightmost != UINT16_MAX;
+            if (style_selector_matches_internal(
+                    sheet, node, text + option->offset, option->length,
+                    located ? option->rightmost : 0, located,
+                    functional_depth, 0, scope)) return true;
+        }
+        return false;
+    }
     for (size_t at = 0; at < length;) {
-        size_t end = selector_list_option_end(text, length, at);
+        size_t end = style_selector_list_option_end(text, length, at);
         const char *option = text + at;
         size_t option_length = end - at;
         trim(&option, &option_length);
@@ -949,7 +1068,7 @@ static bool relative_selector_list_matches(
     RelativeSelectorWalk walk = {0};
     bool matched = false;
     for (size_t at = 0; at < length;) {
-        size_t end = selector_list_option_end(text, length, at);
+        size_t end = style_selector_list_option_end(text, length, at);
         const char *option = text + at;
         size_t option_length = end - at;
         trim(&option, &option_length);
@@ -1403,8 +1522,6 @@ static bool style_selector_matches_internal(const Stylesheet *sheet,
     if (functional_depth >= 8 || relationship_depth >= 64) return false;
     trim(&text, &length);
     if (length == 0) return false;
-    int square = 0;
-    int round = 0;
     size_t split = length;
     char combinator = 0;
     if (prepared && prepared_offset != 0 && prepared_offset < length) {
@@ -1421,44 +1538,8 @@ static bool style_selector_matches_internal(const Stylesheet *sheet,
             combinator = ' ';
         }
     } else if (!prepared || prepared_offset >= length) {
-        for (size_t i = length; i != 0; i--) {
-            char value = text[i - 1];
-            if (value == ']') square++;
-            else if (value == '[' && square > 0) square--;
-            else if (value == ')') round++;
-            else if (value == '(' && round > 0) round--;
-            else if (square == 0 && round == 0
-                     && (value == '>' || value == '+' || value == '~')) {
-                split = i - 1; combinator = value; break;
-            } else if (square == 0 && round == 0
-                       && isspace((unsigned char) value)) {
-                size_t escaped = i - 1;
-                size_t backslashes = 0;
-                while (escaped != 0 && text[escaped - 1] == '\\') {
-                    escaped--;
-                    backslashes++;
-                }
-                if ((backslashes & 1u) != 0) continue;
-                size_t right = i;
-                while (right < length
-                       && isspace((unsigned char) text[right])) right++;
-                if (right < length) {
-                    size_t left = i - 1;
-                    while (left != 0
-                           && isspace((unsigned char) text[left - 1])) left--;
-                    if (left != 0 && (text[left - 1] == '>'
-                                      || text[left - 1] == '+'
-                                      || text[left - 1] == '~')) {
-                        split = left - 1;
-                        combinator = text[left - 1];
-                    } else {
-                        split = i - 1;
-                        combinator = ' ';
-                    }
-                    break;
-                }
-            }
-        }
+        (void) style_selector_last_combinator(
+            text, length, &split, &combinator);
     }
     const char *compound = prepared && prepared_offset < length
         ? text + prepared_offset
@@ -1825,4 +1906,48 @@ bool style_selector_matches_scoped(lxb_dom_node_t *node, const char *text,
 {
     return style_selector_matches_internal(
         NULL, node, text, length, 0, false, 0, 0, scope);
+}
+
+bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
+                                       lxb_dom_node_t *node,
+                                       const lxb_dom_node_t *scope)
+{
+    if (list == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    StyleMatchSubject subject;
+    bool subject_ready = false;
+    for (size_t i = 0; i < list->count; i++) {
+        const StyleQuerySelector *item = &list->items[i];
+        if (item->key != NULL) {
+            if (!subject_ready) {
+                style_match_subject_prepare(node, &subject);
+                subject_ready = true;
+            }
+            bool keyed;
+            if (item->key_type == SELECTOR_ID) {
+                keyed = subject.id != NULL
+                    && subject.id_length == item->key_length
+                    && memcmp(subject.id, item->key, item->key_length) == 0;
+            } else if (item->key_type == SELECTOR_CLASS) {
+                keyed = subject.classes != NULL
+                    && class_contains_length(
+                        subject.classes, subject.classes_length,
+                        item->key, item->key_length);
+            } else {
+                keyed = subject.tag != NULL
+                    && subject.tag_length == item->key_length
+                    && memcmp(subject.tag, item->key, item->key_length) == 0;
+            }
+            if (!keyed) continue;
+        }
+        bool matched = item->rightmost != SIZE_MAX
+            ? style_selector_matches_internal(
+                  NULL, node, item->text, item->length, item->rightmost,
+                  true, 0, 0, scope)
+            : style_selector_matches_internal(
+                  NULL, node, item->text, item->length, 0, false, 0, 0,
+                  scope);
+        if (matched) return true;
+    }
+    return false;
 }

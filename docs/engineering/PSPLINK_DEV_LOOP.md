@@ -91,6 +91,17 @@ PSPDEV=/path/to/pspdev scripts/psplink-device.sh memory
 
 The wrapper builds only `psp-browser-script-dev-prx`, bounds PSPLink commands
 so a disconnected device cannot hang the shell, and starts the fresh PRX.
+That command confirms **launch**, not completion: the validation file is
+buffered and can end at `interactive-ready` while the device is still running.
+For a self-terminating `input_script=` or `interactive_validation_ticks=` run,
+use `scripts/psplink-device.sh memory --wait`. It waits for a newly rotated
+report with `tilefinch-log: finish outcome=clean-exit healthy=1` and, when a
+script is configured, its `complete` or `exit-action` outcome. The default
+limit is 300 seconds (`PSPLINK_REPORT_TIMEOUT_SECONDS` overrides it); a
+partial report is never a pass or proof of a crash. If the host0 report does
+not finish, check the live module and PSPLink exception state before
+attributing the result to Tilefinch. An isolated on-card validation directory
+can distinguish a browser failure from a host0 logging failure.
 Exit a running Tilefinch instance normally with HOME first. The wrapper
 deliberately refuses to force-stop it: PSPLink can remove a live module before
 its browser, transport, or codec threads have unwound, leaving too little

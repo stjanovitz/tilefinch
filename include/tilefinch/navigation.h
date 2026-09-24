@@ -195,6 +195,9 @@ typedef struct {
     /* Current-document fact. Session script counters are diagnostic totals
        and can outlive a page; frontend recovery must never consult them. */
     bool script_degradation_observed;
+    /* Script-heap rejections already attributed by the realm-retirement
+       check, so a later check needs a new rejection, not just text. */
+    size_t script_heap_rejections_seen;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *resource_scheduler;
     /* Optional visual resources continue only from owner idle ticks. The
@@ -238,6 +241,25 @@ typedef struct {
     uint64_t compiled_stylesheet_resource_signature;
     uint64_t compiled_stylesheet_build_generation;
     bool compiled_stylesheet_cacheable;
+    /* An in-place relayout of a large page adopted only the screens around
+       the scroll position (layout.content_limit_y); idle work completes it
+       with navigation_complete_layout. */
+    bool layout_provisional;
+    /* Build cost of the last complete layout, which predicts the next. */
+    uint64_t layout_complete_us;
+    /* Consecutive refused completion builds, and when idle work may try
+       again: the wait doubles from half a second to sixteen, since memory
+       pressure passes (tiles and images are reclaimable). */
+    uint8_t layout_completion_failures;
+    uint64_t layout_completion_retry_us;
+    /* Committed without the whole-document image walk: the first complete
+       layout records its unresolved images, backgrounds and masks, which
+       then load nearest-first through the deferred image queue. */
+    bool visual_discovery_pending;
+    /* Masks and backgrounds that discovery found: loaded together in the
+       next idle pass and published with one (provisional) relayout. */
+    ImagePriorityTarget *visual_batch_targets;
+    size_t visual_batch_count;
 } NavigationPage;
 
 typedef struct NavigationSession NavigationSession;
@@ -351,6 +373,10 @@ typedef struct {
     uint64_t runtime_us;
     size_t fast_relayouts;
     size_t full_relayouts;
+    size_t provisional_relayouts;
+    size_t provisional_extensions;
+    size_t provisional_completions;
+    size_t provisional_cancellations;
     size_t resource_fingerprint_scans;
     size_t blocking_stylesheet_builds;
     size_t blocking_stylesheet_reuses;
@@ -370,6 +396,8 @@ typedef struct {
     uint64_t compiled_stylesheet_cache_last_stored_fingerprint;
     uint64_t compiled_stylesheet_cache_last_observed_fingerprint;
     size_t blocking_stylesheet_continuations;
+    /* Commit adopted the preview's sheet by appending body <style>s. */
+    size_t blocking_stylesheet_commit_continuations;
     size_t blocking_stylesheet_continuation_fallbacks;
     /* Continuations refused because the layout viewport moved after the
        streaming sheet was compiled; the sheet is rebuilt at the new width. */
@@ -547,6 +575,9 @@ struct NavigationSession {
        than being refused. Owners of optional work (web fonts) retry such a
        build later instead of marking the work failed. */
     bool layout_build_cancelled;
+    /* In-place relayouts whose last complete layout took at least this long
+       publish the visible screens first (UINT64_MAX: never). */
+    uint64_t relayout_preview_threshold_us;
     size_t loads_started;
     size_t loads_committed;
     size_t loads_cancelled;
@@ -761,6 +792,14 @@ struct NavigationSession {
     NavigationProgressivePaintCallback progressive_paint;
     void *progressive_paint_opaque;
     bool progressive_paint_preserves_incumbent;
+    /* Set only while the paint callback runs for a streaming preview that
+       navigation keeps for scrolling (navigation_load_retained_preview).
+       Any other painted layout is valid only during the callback. */
+    bool progressive_paint_retains;
+    /* The reader's scroll position in the pending document's preview.
+       Streaming previews are laid out far enough to cover it, and a
+       provisional commit lays out from the top through it. */
+    int provisional_reader_y;
     NavigationDeferredImageReadyCallback deferred_image_ready;
     void *deferred_image_ready_opaque;
     /* Prepare content-shape Reader markers on a completed candidate DOM
@@ -1011,6 +1050,18 @@ bool navigation_load_finish(NavigationLoad *load,
                             const NavigationLoadQuota *quota);
 void navigation_load_cancel(NavigationLoad *load, const char *reason);
 void navigation_load_destroy(NavigationLoad *load);
+/* The streaming preview last painted with progressive_paint_retains, or
+   NULL. It stays valid until navigation work runs again: parsing may drop
+   or replace it. Its image pointers are re-resolved on every call (the
+   image table moves as images are discovered); *images_changed reports
+   that a pointer changed, so derived paint caches must be rebuilt. */
+const LayoutDocument *navigation_load_retained_preview(
+    NavigationLoad *load, bool *images_changed);
+/* Resolve a preview link's href against the pending document's base URL,
+   and report whether it names that same document (a fragment link). */
+bool navigation_load_resolve_preview_link(
+    NavigationLoad *load, const char *href, size_t length,
+    char *url, size_t capacity, bool *same_document);
 bool navigation_back(NavigationSession *session, const NavigationEntry **entry);
 bool navigation_forward(NavigationSession *session,
                         const NavigationEntry **entry);
@@ -1173,6 +1224,28 @@ bool navigation_evaluate_external_script(NavigationSession *session,
                                          size_t source_length,
                                          const char *source_url);
 bool navigation_relayout(NavigationSession *session);
+typedef enum {
+    NAVIGATION_LAYOUT_COMPLETION_NONE = 0,
+    NAVIGATION_LAYOUT_COMPLETION_ADOPTED,
+    /* The reader had scrolled toward the placeholder: a larger provisional
+       layout was adopted and the page is still incomplete. */
+    NAVIGATION_LAYOUT_COMPLETION_EXTENDED,
+    NAVIGATION_LAYOUT_COMPLETION_CANCELLED,
+    NAVIGATION_LAYOUT_COMPLETION_FAILED
+} NavigationLayoutCompletion;
+bool navigation_layout_completion_pending(const NavigationSession *session);
+/* The reader is at the bottom of a provisional page's scroll extent: the
+   next step extends the layout they are waiting for, and scrolling further
+   down cannot move the page until it does. */
+bool navigation_layout_completion_awaited(const NavigationSession *session);
+/* One cooperative step toward the complete layout of a provisional page;
+   adopts the result and records its damage like a relayout. */
+NavigationLayoutCompletion navigation_complete_layout(
+    NavigationSession *session);
+/* Completes a provisional layout before a caller that reads the whole page
+   (find, fragment scrolling). False only when the build failed or was
+   cancelled; the provisional layout then stays in place. */
+bool navigation_complete_layout_sync(NavigationSession *session);
 bool navigation_execute_document_scripts_from(
     NavigationSession *session, PocDocument *document);
 bool navigation_execute_document_scripts_streaming_from(

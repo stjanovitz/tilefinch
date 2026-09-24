@@ -1,4 +1,5 @@
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/utf8_encode.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -15,6 +16,7 @@
 #include "tilefinch/request_context.h"
 #include "tilefinch/url.h"
 #include "tilefinch/youtube_lite.h"
+#include "youtube_internal.h"
 
 /*
  * The watch document is fetched only to extract three early config strings --
@@ -158,16 +160,6 @@ static bool youtube_find_key(const char *json, size_t length,
 static bool youtube_object_span(YoutubeJson value,
                                 const char **start, size_t *length);
 
-static bool youtube_header_value_safe(const char *value)
-{
-    if (value == NULL) return false;
-    for (const unsigned char *at = (const unsigned char *) value;
-         *at != '\0'; at++) {
-        if (*at < 0x20u || *at >= 0x7fu) return false;
-    }
-    return true;
-}
-
 static bool youtube_language_tag_safe(const char *value)
 {
     if (value == NULL || value[0] == '\0') return false;
@@ -247,26 +239,6 @@ bool youtube_direct_delivery_admitted(
                  <= YOUTUBE_UNATTESTED_DELIVERY_MAXIMUM_BYTES);
 }
 
-static bool youtube_api_key_safe(const char *value)
-{
-    if (value == NULL || value[0] == '\0') return false;
-    for (const unsigned char *at = (const unsigned char *) value;
-         *at != '\0'; at++) {
-        if (!isalnum(*at) && *at != '-' && *at != '_') return false;
-    }
-    return true;
-}
-
-static void youtube_error(char *error, size_t error_size,
-                          const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
-
 static void json_space(YoutubeJson *json)
 {
     while (json->at < json->end
@@ -288,28 +260,11 @@ static bool json_append_utf8(char *output, size_t output_size,
                              size_t *length, unsigned codepoint)
 {
     unsigned char bytes[4];
-    size_t count = 0;
-    if (codepoint <= 0x7fu) {
-        bytes[count++] = (unsigned char) codepoint;
-    } else if (codepoint <= 0x7ffu) {
-        bytes[count++] = (unsigned char) (0xc0u | (codepoint >> 6));
-        bytes[count++] = (unsigned char) (0x80u | (codepoint & 0x3fu));
-    } else if (codepoint <= 0xffffu) {
-        if (codepoint >= 0xd800u && codepoint <= 0xdfffu) return false;
-        bytes[count++] = (unsigned char) (0xe0u | (codepoint >> 12));
-        bytes[count++] = (unsigned char) (0x80u | ((codepoint >> 6) & 0x3fu));
-        bytes[count++] = (unsigned char) (0x80u | (codepoint & 0x3fu));
-    } else if (codepoint <= 0x10ffffu) {
-        bytes[count++] = (unsigned char) (0xf0u | (codepoint >> 18));
-        bytes[count++] = (unsigned char) (0x80u | ((codepoint >> 12) & 0x3fu));
-        bytes[count++] = (unsigned char) (0x80u | ((codepoint >> 6) & 0x3fu));
-        bytes[count++] = (unsigned char) (0x80u | (codepoint & 0x3fu));
-    } else {
-        return false;
-    }
-    if (*length > output_size - 1u
+    size_t count = tilefinch_utf8_encode(codepoint, bytes);
+    if (count == 0 || *length >= output_size
         || count > output_size - 1u - *length) return false;
-    for (size_t i = 0; i < count; i++) output[(*length)++] = (char) bytes[i];
+    memcpy(output + *length, bytes, count);
+    *length += count;
     return true;
 }
 
@@ -937,11 +892,84 @@ static bool youtube_parse_formats(
     return false;
 }
 
+/* Whether `wanted` has the plain form the fast search below handles: short
+   enough for its decoder and free of quotes, backslashes and controls. */
+static bool youtube_key_plain(const char *wanted, size_t wanted_length)
+{
+    if (wanted_length == 0 || wanted_length >= 95u) return false;
+    for (size_t i = 0; i < wanted_length; i++) {
+        unsigned char byte = (unsigned char) wanted[i];
+        if (byte < 0x20u || byte == '"' || byte == '\\') return false;
+    }
+    return true;
+}
+
+#define YOUTUBE_PLAIN_KEY_LIMIT 8u
+
+/* The first `"<key>":` of each plain key in one pass over `json` (at most
+   YOUTUBE_PLAIN_KEY_LIMIT keys). A plain key is the decoded value of a
+   string only if the string's bytes before its first backslash equal the
+   key's prefix, so the common prefix is compared in place: a full match
+   followed by the closing quote is the literal key; a backslash within the
+   key's length may still decode to it and takes the full decoder; anything
+   else cannot match. Per key the result is what a separate search would
+   find. This replaces an escape-decoding copy at every quote of a response
+   up to several MiB, once per key. */
+static void youtube_find_plain_keys(const char *json, size_t length,
+                                    const char *const *keys, size_t count,
+                                    YoutubeJson *values, bool *found)
+{
+    size_t lengths[YOUTUBE_PLAIN_KEY_LIMIT];
+    if (count > YOUTUBE_PLAIN_KEY_LIMIT) count = YOUTUBE_PLAIN_KEY_LIMIT;
+    for (size_t k = 0; k < count; k++) {
+        lengths[k] = strlen(keys[k]);
+        found[k] = false;
+    }
+    size_t remaining = count;
+    const char *at = json, *end = json + length;
+    while (remaining != 0 && at < end) {
+        const char *quote = memchr(at, '"', (size_t) (end - at));
+        if (quote == NULL) return;
+        const char *text = quote + 1;
+        size_t available = (size_t) (end - text);
+        for (size_t k = 0; k < count; k++) {
+            if (found[k]) continue;
+            size_t wanted_length = lengths[k];
+            const char *wanted = keys[k];
+            size_t common = 0;
+            while (common < wanted_length && common < available
+                   && text[common] == wanted[common]) common++;
+            bool candidate = common < available
+                && ((common == wanted_length && text[common] == '"')
+                    || (common < wanted_length && text[common] == '\\'));
+            if (!candidate) continue;
+            YoutubeJson probe = {quote, end};
+            char key[96];
+            if (json_string(&probe, key, sizeof(key))
+                && strlen(key) == wanted_length
+                && memcmp(key, wanted, wanted_length) == 0) {
+                json_space(&probe);
+                if (probe.at < probe.end && *probe.at++ == ':') {
+                    values[k] = probe;
+                    found[k] = true;
+                    remaining--;
+                }
+            }
+        }
+        at = quote + 1;
+    }
+}
+
 static bool youtube_find_key(const char *json, size_t length,
                              const char *wanted, YoutubeJson *value)
 {
-    YoutubeJson cursor = {json, json + length};
     size_t wanted_length = strlen(wanted);
+    if (youtube_key_plain(wanted, wanted_length)) {
+        bool found = false;
+        youtube_find_plain_keys(json, length, &wanted, 1, value, &found);
+        return found;
+    }
+    YoutubeJson cursor = {json, json + length};
     while (cursor.at < cursor.end) {
         const char *quote = memchr(
             cursor.at, '"', (size_t) (cursor.end - cursor.at));
@@ -1128,14 +1156,19 @@ static void youtube_retain_caption_track(
     }
 }
 
+/* `found_tracks` is the already-located "captionTracks" value, or NULL to
+   search `json` for it. */
 static void youtube_parse_caption_tracks(
-    const char *json, size_t length,
+    const char *json, size_t length, const YoutubeJson *found_tracks,
     const YoutubeTrackPreferences *preferences, YoutubeStream *stream,
     YoutubeCaptionCatalog *catalog)
 {
     YoutubeJson array;
+    if (found_tracks != NULL) array = *found_tracks;
     if (stream == NULL
-        || !youtube_find_key(json, length, "captionTracks", &array)) return;
+        || (found_tracks == NULL
+            && !youtube_find_key(json, length, "captionTracks", &array)))
+        return;
     json_space(&array);
     if (array.at >= array.end || *array.at++ != '[') return;
     const char *preferred = preferences == NULL
@@ -1341,7 +1374,19 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     const char *playability_json = NULL;
     size_t playability_length = 0;
     char status[64] = {0};
-    if (!youtube_find_key(json, length, "playabilityStatus", &value)
+    /* The response-wide keys, located in one pass over up to 2 MiB. */
+    static const char *const top_keys[] = {
+        "playabilityStatus", "videoDetails", "streamingData", "captionTracks"
+    };
+    enum { TOP_PLAYABILITY, TOP_DETAILS, TOP_STREAMING, TOP_CAPTIONS };
+    YoutubeJson top_values[4];
+    bool top_found[4];
+    youtube_find_plain_keys(json, length, top_keys, 4, top_values,
+                            top_found);
+    const YoutubeJson *caption_tracks = top_found[TOP_CAPTIONS]
+        ? &top_values[TOP_CAPTIONS] : NULL;
+    if (top_found[TOP_PLAYABILITY]) value = top_values[TOP_PLAYABILITY];
+    if (!top_found[TOP_PLAYABILITY]
         || !youtube_object_span(
             value, &playability_json, &playability_length)
         || !youtube_find_key(
@@ -1398,8 +1443,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     }
     const char *details_json = NULL;
     size_t details_length = 0;
-    bool have_details =
-        youtube_find_key(json, length, "videoDetails", &value)
+    if (top_found[TOP_DETAILS]) value = top_values[TOP_DETAILS];
+    bool have_details = top_found[TOP_DETAILS]
         && youtube_object_span(value, &details_json, &details_length);
     /*
      * isLiveContent describes provenance and remains true on archived
@@ -1415,7 +1460,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     }
     const char *streaming_json = NULL;
     size_t streaming_length = 0;
-    if (!youtube_find_key(json, length, "streamingData", &value)
+    if (top_found[TOP_STREAMING]) value = top_values[TOP_STREAMING];
+    if (!top_found[TOP_STREAMING]
         || !youtube_object_span(
             value, &streaming_json, &streaming_length)) {
         youtube_error(error, error_size, "format: no stream inventory");
@@ -1435,7 +1481,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     }
     if (active_live && have_hls_manifest) {
         youtube_parse_caption_tracks(
-            json, length, preferences, parsed, caption_catalog);
+            json, length, caption_tracks, preferences, parsed,
+            caption_catalog);
         return youtube_use_live_hls(
             hls_value, parsed, stream, error, error_size);
     }
@@ -1537,7 +1584,7 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         }
     }
     youtube_parse_caption_tracks(
-        json, length, preferences, parsed, caption_catalog);
+        json, length, caption_tracks, preferences, parsed, caption_catalog);
     *stream = *parsed;
     return true;
 }
@@ -1605,13 +1652,6 @@ bool youtube_parse_player_response(
     return youtube_parse_player_response_diagnostic(
         json, length, video_id, maximum_height, NULL,
         stream, error, error_size);
-}
-
-static bool youtube_host_is(const TilefinchUrl *url, const char *host)
-{
-    return strlen(host) == url->host_length
-        && strncasecmp(url->value + url->host_offset,
-                       host, url->host_length) == 0;
 }
 
 bool youtube_watch_url_video_id(
@@ -2265,7 +2305,7 @@ static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
         if (youtube_watch_string(
                 window, window_length, "INNERTUBE_API_KEY",
                 api_key, sizeof(api_key))
-            && youtube_api_key_safe(api_key)) {
+            && youtube_api_token_safe(api_key, false)) {
             snprintf(job->api_key, sizeof(job->api_key), "%s", api_key);
             job->watch_have_api_key = true;
         }
@@ -2608,7 +2648,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
             break;
         }
         if (!youtube_header_value_safe(job->visitor)
-            || !youtube_api_key_safe(job->api_key)) {
+            || !youtube_api_token_safe(job->api_key, false)) {
             youtube_resolve_job_fail(
                 job, "watch: player configuration was unsafe");
             break;
@@ -3107,7 +3147,7 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
         return false;
     }
     if (!youtube_header_value_safe(visitor)
-        || !youtube_api_key_safe(api_key)) {
+        || !youtube_api_token_safe(api_key, false)) {
         youtube_error(
             error, error_size,
             "watch: player configuration was unsafe");

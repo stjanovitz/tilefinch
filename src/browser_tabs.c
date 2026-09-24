@@ -1,5 +1,6 @@
 #include "tilefinch/browser_tabs.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -146,55 +147,51 @@ bool browser_tabs_capture_active(
         || tabs->count == 0 || tabs->active_index >= tabs->count) {
         return false;
     }
-    BrowserTabSnapshot *staged = tab_snapshot_create(tabs);
-    if (staged == NULL) return false;
-    bool valid = true;
+    BrowserTabSlot *slot = &tabs->slots[tabs->active_index];
+    if (slot->snapshot == NULL || slot->hibernated) return false;
+
+    /* Validate the complete source before changing the retained snapshot.
+       Once this pass succeeds the bounded copy below cannot fail, so capture
+       needs no second roughly 9 KiB allocation and remains transactional. */
     if (navigation->history_count == 0) {
         const char *url = navigation->page.document_url;
         const char *title = navigation->page.document.title;
-        valid = tab_reset(
-            staged, url == NULL ? "" : url,
-            title == NULL ? "" : title);
-    } else {
-        size_t start = 0;
-        if (navigation->history_count > BROWSER_TAB_HISTORY_LIMIT) {
-            start = navigation->history_index
-                        >= BROWSER_TAB_HISTORY_LIMIT - 1u
-                ? navigation->history_index
-                      - (BROWSER_TAB_HISTORY_LIMIT - 1u)
-                : 0;
-            if (start + BROWSER_TAB_HISTORY_LIMIT
-                    > navigation->history_count) {
-                start =
-                    navigation->history_count - BROWSER_TAB_HISTORY_LIMIT;
-            }
-        }
-        staged->history_count =
-            navigation->history_count - start < BROWSER_TAB_HISTORY_LIMIT
-            ? navigation->history_count - start
-            : BROWSER_TAB_HISTORY_LIMIT;
-        staged->history_index = navigation->history_index - start;
-        for (size_t index = 0; valid && index < staged->history_count;
-             index++) {
-            const NavigationEntry *source =
-                &navigation->history[start + index];
-            if (!tab_url_valid(source->url) || source->title == NULL) {
-                valid = false;
-                break;
-            }
-            tab_entry_set(
-                &staged->history[index], source->url, source->title,
-                source->scroll_y, source->focus_kind,
-                source->focus_index);
+        if (!tab_url_valid(url) || title == NULL) return false;
+        if (!tab_reset(slot->snapshot, url, title)) return false;
+        tab_slot_title_from_snapshot(slot);
+        return true;
+    }
+
+    if (navigation->history_index >= navigation->history_count) return false;
+    size_t start = 0;
+    if (navigation->history_count > BROWSER_TAB_HISTORY_LIMIT) {
+        start = navigation->history_index
+                    >= BROWSER_TAB_HISTORY_LIMIT - 1u
+            ? navigation->history_index - (BROWSER_TAB_HISTORY_LIMIT - 1u)
+            : 0;
+        if (start + BROWSER_TAB_HISTORY_LIMIT > navigation->history_count) {
+            start = navigation->history_count - BROWSER_TAB_HISTORY_LIMIT;
         }
     }
-    BrowserTabSlot *slot = &tabs->slots[tabs->active_index];
-    if (!valid || slot->snapshot == NULL || slot->hibernated) {
-        budget_free(tabs->budget, staged);
-        return false;
+    size_t count = navigation->history_count - start;
+    if (count > BROWSER_TAB_HISTORY_LIMIT) count = BROWSER_TAB_HISTORY_LIMIT;
+    if (navigation->history_index < start
+        || navigation->history_index - start >= count) return false;
+    for (size_t index = 0; index < count; index++) {
+        const NavigationEntry *source = &navigation->history[start + index];
+        if (!tab_url_valid(source->url) || source->title == NULL) return false;
     }
-    *slot->snapshot = *staged;
-    budget_free(tabs->budget, staged);
+
+    BrowserTabSnapshot *snapshot = slot->snapshot;
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->history_count = count;
+    snapshot->history_index = navigation->history_index - start;
+    for (size_t index = 0; index < count; index++) {
+        const NavigationEntry *source = &navigation->history[start + index];
+        tab_entry_set(
+            &snapshot->history[index], source->url, source->title,
+            source->scroll_y, source->focus_kind, source->focus_index);
+    }
     tab_slot_title_from_snapshot(slot);
     return true;
 }
@@ -469,17 +466,20 @@ static bool tab_session_replace(const char *path, const char *temporary)
     char backup[1024];
     int written = snprintf(backup, sizeof(backup), "%s.bak", path);
     if (written < 0 || (size_t) written >= sizeof(backup)) return false;
-    (void) remove(backup);
-    FILE *existing = fopen(path, "rb");
-    bool had_existing = existing != NULL;
-    if (existing != NULL) fclose(existing);
-    if (had_existing && rename(path, backup) != 0) return false;
-    if (rename(temporary, path) != 0) {
-        if (had_existing) (void) rename(backup, path);
-        return false;
+
+    /* Keep one complete generation throughout publication. POSIX replaces an
+       older backup atomically. FAT can refuse that replacement, so remove
+       only the older backup while the primary is still intact and retry. */
+    bool had_previous = rename(path, backup) == 0;
+    if (!had_previous) {
+        if (errno == ENOENT) return rename(temporary, path) == 0;
+        (void) remove(backup);
+        had_previous = rename(path, backup) == 0;
+        if (!had_previous && errno != ENOENT) return false;
     }
-    if (had_existing) (void) remove(backup);
-    return true;
+    if (rename(temporary, path) == 0) return true;
+    if (had_previous) (void) rename(backup, path);
+    return false;
 }
 
 bool browser_tabs_save_session(
@@ -647,8 +647,12 @@ bool browser_tabs_restore_session(BrowserTabs *tabs, const char *path)
     if (tab_session_restore_file(tabs, path)) return true;
     char backup[1024];
     int written = snprintf(backup, sizeof(backup), "%s.bak", path);
-    return written >= 0 && (size_t) written < sizeof(backup)
-        && tab_session_restore_file(tabs, backup);
+    if (written < 0 || (size_t) written >= sizeof(backup)
+        || !tab_session_restore_file(tabs, backup)) return false;
+    /* A known-missing or corrupt primary must not replace the recovered
+       generation during the next save's rotation. */
+    (void) remove(path);
+    return true;
 }
 
 size_t browser_tabs_resident_bytes(const BrowserTabs *tabs)

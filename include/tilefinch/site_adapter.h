@@ -100,7 +100,6 @@ SiteAdapterLoad *site_adapter_load_begin(
     char *error, size_t error_size);
 SiteAdapterLoadStatus site_adapter_load_pump(
     SiteAdapterLoad *load, const FetchPumpQuota *quota);
-SiteAdapterLoadStatus site_adapter_load_status(const SiteAdapterLoad *load);
 void site_adapter_load_cancel(SiteAdapterLoad *load, const char *reason);
 bool site_adapter_load_take_document(
     SiteAdapterLoad *load, SiteAdapterDocument *document);

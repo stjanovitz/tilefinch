@@ -361,9 +361,8 @@ static void psp_home_set_row(
 
 static bool psp_home_local_url(const char *url)
 {
-    static const char local[] = "https://tilefinch.local/";
     return url == NULL || url[0] == '\0'
-        || strncmp(url, local, sizeof(local) - 1u) == 0
+        || psp_ui_internal_url(url)
         || strncmp(url, "tilefinch://", 12u) == 0;
 }
 

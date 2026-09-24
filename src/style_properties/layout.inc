@@ -85,7 +85,8 @@ static bool style_property_direction(const StylePropertyParse *parse)
         || strcmp(resolved, "unset") == 0
         || strcmp(resolved, "revert") == 0
         || strcmp(resolved, "revert-layer") == 0) return true;
-    if (strcmp(resolved, "rtl") == 0) {
+    bool rtl = strcmp(resolved, "rtl") == 0;
+    if (rtl) {
         parse->style->filter_code |= STYLE_DIRECTION_RTL;
     } else if (strcmp(resolved, "ltr") == 0
                || strcmp(resolved, "initial") == 0) {
@@ -94,7 +95,9 @@ static bool style_property_direction(const StylePropertyParse *parse)
         return true;
     }
     *parse->mask_high |= S2_DIRECTION;
-    parse->sheet->has_bidi_declarations = true;
+    /* Only an RTL direction can reorder text without RTL codepoints; the
+       document's own text scan flags pages that have any. */
+    if (rtl) parse->sheet->has_bidi_declarations = true;
     return true;
 }
 
@@ -122,7 +125,12 @@ static bool style_property_unicode_bidi(const StylePropertyParse *parse)
     }
     parse->style->unicode_bidi = value;
     *parse->mask_high |= S2_UNICODE_BIDI;
-    parse->sheet->has_bidi_declarations = true;
+    /* Embedding, isolation and plaintext are no-ops on text without RTL
+       codepoints or an RTL direction, both of which are flagged elsewhere.
+       Overrides stay flagged conservatively. */
+    if (value == STYLE_UNICODE_BIDI_OVERRIDE
+        || value == STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE)
+        parse->sheet->has_bidi_declarations = true;
     return true;
 }
 

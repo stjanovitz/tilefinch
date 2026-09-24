@@ -3,6 +3,7 @@
    Split out of layout.c. */
 
 #include "layout_internal.h"
+#include "tilefinch/platform.h"
 
 _Static_assert((int) STYLE_MIX_BLEND_NORMAL == (int) LAYOUT_MIX_BLEND_NORMAL,
                "style/layout blend encodings must match");
@@ -741,6 +742,19 @@ bool layout_positioned_command_escapes_clip(
         layout, command_index, clip_box, NULL);
 }
 
+/* A fixed range nested inside the translated subtree keeps its viewport
+   position. One that encloses the subtree (content of a fixed drawer being
+   aligned inside it) is the coordinate space of the move, and must follow
+   it like any other content, together with its clip boxes. */
+static bool translate_fixed_range_nested(const FixedRange *range,
+                                         size_t command_start,
+                                         size_t command_end)
+{
+    return range->command_start >= command_start
+        && range->command_end <= command_end
+        && range->command_start < range->command_end;
+}
+
 void translate_node_subtree(LayoutDocument *layout,
                                    lxb_dom_node_t *node, int dx, int dy)
 {
@@ -752,11 +766,15 @@ void translate_node_subtree(LayoutDocument *layout,
     size_t command_start = root->command_start;
     size_t command_end = root->command_end;
     if (command_end > layout->count) command_end = layout->count;
+    if (command_end - command_start > 2000u)
+        tilefinch_platform_trace_step("layout-translate-subtree");
     for (size_t i = command_start; i < command_end; i++) {
         bool viewport_fixed = false;
         for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
             const FixedRange *range = &layout->fixed_ranges[fixed];
-            if (i >= range->command_start && i < range->command_end) {
+            if (translate_fixed_range_nested(
+                    range, command_start, command_end)
+                && i >= range->command_start && i < range->command_end) {
                 viewport_fixed = true;
                 break;
             }
@@ -794,7 +812,9 @@ void translate_node_subtree(LayoutDocument *layout,
         bool viewport_fixed = false;
         for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
             const FixedRange *range = &layout->fixed_ranges[fixed];
-            if (i >= range->link_start && i < range->link_end) {
+            if (translate_fixed_range_nested(
+                    range, command_start, command_end)
+                && i >= range->link_start && i < range->link_end) {
                 viewport_fixed = true;
                 break;
             }
@@ -813,7 +833,9 @@ void translate_node_subtree(LayoutDocument *layout,
         bool viewport_fixed = false;
         for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
             const FixedRange *range = &layout->fixed_ranges[fixed];
-            if (i >= range->control_start && i < range->control_end) {
+            if (translate_fixed_range_nested(
+                    range, command_start, command_end)
+                && i >= range->control_start && i < range->control_end) {
                 viewport_fixed = true;
                 break;
             }
@@ -826,12 +848,23 @@ void translate_node_subtree(LayoutDocument *layout,
     /*
      * Node boxes are appended post-order, so they are not a simple index
      * interval. Walk this DOM subtree and use the existing box hash rather
-     * than testing every document box with another ancestor walk.
+     * than testing every document box with another ancestor walk. Boxes of
+     * a nested fixed element stay with its (unmoved) commands.
      */
     lxb_dom_node_t *at = node;
     while (at != NULL) {
         LayoutNodeBox *box = layout_box_for_node_mutable(layout, at);
-        if (box != NULL && box->command_start >= command_start
+        bool box_fixed = false;
+        for (size_t fixed = 0; box != NULL && !box_fixed
+                               && fixed < layout->fixed_count; fixed++) {
+            const FixedRange *range = &layout->fixed_ranges[fixed];
+            box_fixed = translate_fixed_range_nested(
+                    range, command_start, command_end)
+                && box->command_start >= range->command_start
+                && box->command_end <= range->command_end;
+        }
+        if (box != NULL && !box_fixed
+            && box->command_start >= command_start
             && box->command_end <= command_end
             && box->positioned_ancestor_distance != UINT8_MAX) {
             box->x += dx;
@@ -943,8 +976,9 @@ static uint32_t paint_tree_split(PaintTreeNode *nodes, uint32_t head,
 static bool paint_order_work(LayoutContext *context, size_t *work)
 {
     (*work)++;
-    if (context == NULL || (*work & 4095u) != 0) return true;
-    return layout_batch_cooperate(context, 4096);
+    if (context == NULL || (*work & (LAYOUT_BATCH_STRIDE - 1u)) != 0)
+        return true;
+    return layout_batch_cooperate(context, LAYOUT_BATCH_STRIDE);
 }
 
 static uint32_t paint_tree_merge(PaintTreeNode *nodes,
@@ -1204,8 +1238,9 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
         if (!paint_order_work(context, &work)) goto cancelled;
     }
     if (output != layout->count) goto cancelled;
-    if (context != NULL && (work & 4095u) != 0
-        && !layout_batch_cooperate(context, work & 4095u)) goto cancelled;
+    if (context != NULL && (work & (LAYOUT_BATCH_STRIDE - 1u)) != 0
+        && !layout_batch_cooperate(
+               context, work & (LAYOUT_BATCH_STRIDE - 1u))) goto cancelled;
     budget_free(layout->budget, stack);
     budget_free(layout->budget, nodes);
     layout->paint_order = order;
@@ -1320,7 +1355,7 @@ bool build_spatial_index(LayoutDocument *layout,
     size_t global_count = 0, overflow_count = 0, total = 0;
     size_t all_overflow_count = 0;
     bool has_overflow = false;
-    size_t checkpoint = 4096;
+    size_t checkpoint = LAYOUT_BATCH_STRIDE;
     for (size_t order = 0; order < layout->paint_order_count; order++) {
         if (!layout_batch_checkpoint(
                 context, order, layout->paint_order_count,
@@ -1368,9 +1403,9 @@ bool build_spatial_index(LayoutDocument *layout,
             }
         }
     }
-    if (context != NULL && (layout->paint_order_count & 4095u) != 0
+    if (context != NULL && (layout->paint_order_count & (LAYOUT_BATCH_STRIDE - 1u)) != 0
         && !layout_batch_cooperate(
-            context, layout->paint_order_count & 4095u)) {
+            context, layout->paint_order_count & (LAYOUT_BATCH_STRIDE - 1u))) {
         budget_free(layout->budget, counts);
         return false;
     }
@@ -1403,7 +1438,7 @@ bool build_spatial_index(LayoutDocument *layout,
         counts[band] = layout->spatial_band_offsets[band];
     }
     size_t global_at = 0, overflow_at = 0, all_overflow_at = 0;
-    checkpoint = 4096;
+    checkpoint = LAYOUT_BATCH_STRIDE;
     for (size_t order = 0; order < layout->paint_order_count; order++) {
         if (!layout_batch_checkpoint(
                 context, order, layout->paint_order_count,
@@ -1446,9 +1481,9 @@ bool build_spatial_index(LayoutDocument *layout,
             }
         }
     }
-    if (context != NULL && (layout->paint_order_count & 4095u) != 0
+    if (context != NULL && (layout->paint_order_count & (LAYOUT_BATCH_STRIDE - 1u)) != 0
         && !layout_batch_cooperate(
-            context, layout->paint_order_count & 4095u)) {
+            context, layout->paint_order_count & (LAYOUT_BATCH_STRIDE - 1u))) {
         budget_free(layout->budget, counts);
         budget_free(layout->budget, all_overflow_orders);
         return false;
@@ -1462,7 +1497,7 @@ bool build_spatial_index(LayoutDocument *layout,
            omitted from the bands. These must still participate in the old
            ink-intersection semantics (including unusual shadow bounds). */
         size_t unbanded_overflow_at = 0;
-        checkpoint = 4096;
+        checkpoint = LAYOUT_BATCH_STRIDE;
         for (size_t at = 0; at < all_overflow_at; at++) {
             if (!layout_batch_checkpoint(context, at, all_overflow_at,
                                          &checkpoint)) {
@@ -1486,7 +1521,7 @@ bool build_spatial_index(LayoutDocument *layout,
                 all_overflow_orders[unbanded_overflow_at++] = (uint32_t) order;
             }
         }
-        checkpoint = 4096;
+        checkpoint = LAYOUT_BATCH_STRIDE;
         size_t late_work = 0;
         for (size_t order = 0; order < layout->paint_order_count; order++) {
             if (!layout_batch_checkpoint(
@@ -1789,6 +1824,8 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
                             const char *phase,
                             lxb_dom_node_t *source)
 {
+    if (layout->count - command_start > 2000u)
+        tilefinch_platform_trace_step("layout-translate-range");
     layout_bidi_translate_commands(layout, command_start, dx);
     for (size_t i = command_start; i < layout->count; i++) {
         layout->commands[i].x += dx;

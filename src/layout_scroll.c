@@ -406,6 +406,8 @@ bool layout_scroll_node_chain(LayoutDocument *layout, lxb_dom_node_t *node,
         int next_y = scroll_apply_axis(
             box->scroll_y, maximum_y < 0 ? 0 : maximum_y,
             rest_y, &next_rest_y);
+        if (next_x != box->scroll_x || next_y != box->scroll_y)
+            layout->scroll_generation++;
         changed |= next_x != box->scroll_x || next_y != box->scroll_y;
         box->scroll_x = next_x;
         box->scroll_y = next_y;

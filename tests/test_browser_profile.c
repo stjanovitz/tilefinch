@@ -147,9 +147,82 @@ static bool glyph_language_roundtrips(BrowserGlyphLanguage language)
     return ok && budget.current == 0;
 }
 
+static int test_site_storage_choices(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    BrowserProfile *loaded = browser_profile_create(&budget);
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/tilefinch-site-storage-%ld.cfg",
+             (long) getpid());
+    /* By default nothing a page stores is written at exit: the RAM
+       snapshot is opt-in and every site is Ask. */
+    CHECK(profile != NULL && loaded != NULL
+          && browser_profile_site_storage_offers(profile)
+          && browser_profile_site_storage_count(profile) == 0
+          && !browser_profile_persist_local_storage(profile));
+    /* Choices are per origin: scheme and port matter, paths do not. */
+    CHECK(browser_profile_set_site_storage_policy(
+              profile, "https://game.test/play", BROWSER_SITE_STORAGE_STICK)
+          && browser_profile_set_site_storage_policy(
+                 profile, "https://news.test:8443/",
+                 BROWSER_SITE_STORAGE_MEMORY_ONLY)
+          && browser_profile_site_storage_policy(
+                 profile, "https://game.test/other")
+                 == BROWSER_SITE_STORAGE_STICK
+          && browser_profile_site_storage_policy(
+                 profile, "http://game.test/") == BROWSER_SITE_STORAGE_ASK
+          && !browser_profile_set_site_storage_policy(
+                 profile, "not a url", BROWSER_SITE_STORAGE_STICK));
+    browser_profile_set_site_storage_offers(profile, false);
+    CHECK(browser_profile_save(profile, path)
+          && browser_profile_load(loaded, path)
+          && !browser_profile_site_storage_offers(loaded)
+          && browser_profile_site_storage_count(loaded) == 2
+          && browser_profile_site_storage_policy(
+                 loaded, "https://news.test:8443/x")
+                 == BROWSER_SITE_STORAGE_MEMORY_ONLY);
+    const char *origin = NULL;
+    BrowserSiteStoragePolicy policy = BROWSER_SITE_STORAGE_ASK;
+    CHECK(browser_profile_site_storage_entry(loaded, 0, &origin, &policy)
+          && strcmp(origin, "https://game.test") == 0
+          && policy == BROWSER_SITE_STORAGE_STICK);
+    /* ASK is the default and removes the entry; the table is bounded. */
+    CHECK(browser_profile_set_site_storage_policy(
+              loaded, "https://game.test/", BROWSER_SITE_STORAGE_ASK)
+          && browser_profile_site_storage_count(loaded) == 1);
+    for (unsigned at = 0; at < BROWSER_PROFILE_STORAGE_SITE_LIMIT - 1u;
+         at++) {
+        char url[64];
+        snprintf(url, sizeof(url), "https://site-%u.test/", at);
+        CHECK(browser_profile_set_site_storage_policy(
+            loaded, url, BROWSER_SITE_STORAGE_STICK));
+    }
+    CHECK(!browser_profile_set_site_storage_policy(
+              loaded, "https://one-more.test/", BROWSER_SITE_STORAGE_STICK)
+          && browser_profile_set_site_storage_policy(
+                 loaded, "https://site-0.test/",
+                 BROWSER_SITE_STORAGE_MEMORY_ONLY));
+    /* A record with a policy that is not stored (ASK) is ignored. */
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL
+          && fputs("TILEFINCH_PROFILE\t1\nSS\thttps%3A%2F%2Fa.test\t0\n"
+                   "SS\thttps%3A%2F%2Fb.test\t1\n", file) >= 0
+          && fclose(file) == 0 && seal_profile(path)
+          && browser_profile_load(profile, path)
+          && browser_profile_site_storage_count(profile) == 1
+          && browser_profile_site_storage_offers(profile));
+    remove(path);
+    browser_profile_destroy(profile);
+    browser_profile_destroy(loaded);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_javascript_site_defaults() == 0);
+    CHECK(test_site_storage_choices() == 0);
     CHECK(BROWSER_GLYPH_LANGUAGE_EMBEDDED == 0
           && BROWSER_GLYPH_LANGUAGE_JAPANESE == 1
           && BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED == 2

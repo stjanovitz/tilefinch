@@ -1,4 +1,5 @@
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/url.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -21,6 +22,11 @@ typedef struct {
     bool always;
 } BrowserReaderSiteScale;
 
+typedef struct {
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    BrowserSiteStoragePolicy policy;
+} BrowserStorageSite;
+
 struct BrowserProfile {
     Budget *budget;
     unsigned ui_scale;
@@ -40,6 +46,9 @@ struct BrowserProfile {
     bool javascript_enabled;
     uint32_t javascript_default_allow_mask;
     bool site_data_allowed;
+    bool site_storage_offers;
+    size_t storage_site_count;
+    BrowserStorageSite storage_sites[BROWSER_PROFILE_STORAGE_SITE_LIMIT];
     size_t javascript_disabled_site_count;
     char javascript_disabled_sites[BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT]
                                   [CONTENT_BLOCKER_HOST_LIMIT];
@@ -342,6 +351,7 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->wave_background = true;
     profile->javascript_enabled = true;
     profile->site_data_allowed = true;
+    profile->site_storage_offers = true;
     return profile;
 }
 
@@ -709,6 +719,17 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
                  sizeof(encoded))
             && fprintf(file, "JSD\t%s\n", encoded) > 0;
     }
+    if (ok) {
+        ok = fprintf(file, "STORE\t%u\n",
+                     profile->site_storage_offers ? 1u : 0u) > 0;
+    }
+    for (size_t i = 0; ok && i < profile->storage_site_count; i++) {
+        char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
+        ok = profile_encode(
+                 profile->storage_sites[i].origin, encoded, sizeof(encoded))
+            && fprintf(file, "SS\t%s\t%u\n", encoded,
+                       (unsigned) profile->storage_sites[i].policy) > 0;
+    }
     for (size_t i = 0;
          ok && i < profile->third_party_cookie_allowed_site_count; i++) {
         char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
@@ -818,7 +839,8 @@ static bool profile_load_internal(
         .tls_session_persistence = true,
         .wave_background = true,
         .javascript_enabled = true,
-        .site_data_allowed = true
+        .site_data_allowed = true,
+        .site_storage_offers = true
     };
     char line[4096];
     bool header = false;
@@ -1089,6 +1111,30 @@ static bool profile_load_internal(
                session-only, so accepting an old record must not silently
                restore a durable HTTPS downgrade exception. */
             continue;
+        } else if (strcmp(line, "STORE") == 0) {
+            loaded->site_storage_offers = strtoul(first, NULL, 10) != 0;
+        } else if (strcmp(line, "SS") == 0 && second != NULL
+                   && loaded->storage_site_count
+                          < BROWSER_PROFILE_STORAGE_SITE_LIMIT) {
+            BrowserStorageSite *site =
+                &loaded->storage_sites[loaded->storage_site_count];
+            unsigned policy = (unsigned) strtoul(second, NULL, 10);
+            char normalized[CONTENT_BLOCKER_HOST_LIMIT];
+            if (profile_decode(first, site->origin, sizeof(site->origin))
+                && tilefinch_url_origin(site->origin, normalized,
+                                        sizeof(normalized))
+                && strcmp(normalized, site->origin) == 0
+                && (policy == BROWSER_SITE_STORAGE_STICK
+                    || policy == BROWSER_SITE_STORAGE_MEMORY_ONLY)) {
+                bool duplicate = false;
+                for (size_t i = 0; i < loaded->storage_site_count; i++)
+                    if (strcmp(loaded->storage_sites[i].origin,
+                               site->origin) == 0) duplicate = true;
+                if (!duplicate) {
+                    site->policy = (BrowserSiteStoragePolicy) policy;
+                    loaded->storage_site_count++;
+                }
+            }
         } else if (strcmp(line, "TPC") == 0) {
             char (*sites)[CONTENT_BLOCKER_HOST_LIMIT] =
                 loaded->third_party_cookie_allowed_sites;
@@ -1398,6 +1444,47 @@ bool browser_profile_javascript_allowed_for_url(
 bool browser_profile_site_data_allowed(const BrowserProfile *profile)
 {
     return profile == NULL || profile->site_data_allowed;
+}
+
+bool browser_profile_site_storage_offers(const BrowserProfile *profile)
+{
+    return profile == NULL || profile->site_storage_offers;
+}
+
+static bool profile_storage_origin(const char *url,
+                                   char origin[CONTENT_BLOCKER_HOST_LIMIT])
+{
+    return url != NULL
+        && tilefinch_url_origin(url, origin, CONTENT_BLOCKER_HOST_LIMIT)
+        && strcmp(origin, "null") != 0;
+}
+
+BrowserSiteStoragePolicy browser_profile_site_storage_policy(
+    const BrowserProfile *profile, const char *url)
+{
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !profile_storage_origin(url, origin))
+        return BROWSER_SITE_STORAGE_ASK;
+    for (size_t i = 0; i < profile->storage_site_count; i++)
+        if (strcmp(profile->storage_sites[i].origin, origin) == 0)
+            return profile->storage_sites[i].policy;
+    return BROWSER_SITE_STORAGE_ASK;
+}
+
+size_t browser_profile_site_storage_count(const BrowserProfile *profile)
+{
+    return profile == NULL ? 0 : profile->storage_site_count;
+}
+
+bool browser_profile_site_storage_entry(
+    const BrowserProfile *profile, size_t index, const char **origin,
+    BrowserSiteStoragePolicy *policy)
+{
+    if (profile == NULL || index >= profile->storage_site_count)
+        return false;
+    if (origin != NULL) *origin = profile->storage_sites[index].origin;
+    if (policy != NULL) *policy = profile->storage_sites[index].policy;
+    return true;
 }
 
 BrowserSearchEngine browser_profile_search_engine(
@@ -1895,6 +1982,41 @@ void browser_profile_set_site_data_allowed(
     BrowserProfile *profile, bool allowed)
 {
     if (profile != NULL) profile->site_data_allowed = allowed;
+}
+
+void browser_profile_set_site_storage_offers(BrowserProfile *profile,
+                                            bool enabled)
+{
+    if (profile != NULL) profile->site_storage_offers = enabled;
+}
+
+bool browser_profile_set_site_storage_policy(
+    BrowserProfile *profile, const char *url,
+    BrowserSiteStoragePolicy policy)
+{
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !profile_storage_origin(url, origin)) return false;
+    size_t found = profile->storage_site_count;
+    for (size_t i = 0; i < profile->storage_site_count; i++)
+        if (strcmp(profile->storage_sites[i].origin, origin) == 0) found = i;
+    if (policy == BROWSER_SITE_STORAGE_ASK) {
+        if (found == profile->storage_site_count) return true;
+        memmove(&profile->storage_sites[found],
+                &profile->storage_sites[found + 1u],
+                (profile->storage_site_count - found - 1u)
+                    * sizeof(profile->storage_sites[0]));
+        memset(&profile->storage_sites[--profile->storage_site_count], 0,
+               sizeof(profile->storage_sites[0]));
+        return true;
+    }
+    if (found == profile->storage_site_count) {
+        if (found >= BROWSER_PROFILE_STORAGE_SITE_LIMIT) return false;
+        snprintf(profile->storage_sites[found].origin,
+                 sizeof(profile->storage_sites[found].origin), "%s", origin);
+        profile->storage_site_count++;
+    }
+    profile->storage_sites[found].policy = policy;
+    return true;
 }
 
 void browser_profile_set_search_engine(

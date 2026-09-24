@@ -1,3 +1,5 @@
+#include "background_slot_policy.h"
+
 static void scheduled_capture_finish(FetchScheduler *scheduler,
                                      ScheduledFetch *item,
                                      bool external_cancel);
@@ -341,7 +343,8 @@ bool fetch_scheduler_enable_background_transport(
                    scheduler->budget))) return false;
     if (enabled && scheduler->background_chunk == NULL) {
         scheduler->background_chunk_capacity =
-            FETCH_BACKGROUND_STREAM_BUFFER_BYTES;
+            fetch_background_scheduler_chunk_capacity(
+                scheduler->maximum_reserved_bytes);
         scheduler->background_chunk = budget_malloc_category(
             scheduler->budget, BUDGET_CATEGORY_RESOURCE,
             scheduler->background_chunk_capacity);
@@ -433,13 +436,19 @@ static bool scheduled_background_hop_supported(ScheduledFetch *item)
                remaining_ms);
 }
 
-static bool scheduled_background_start_hop(ScheduledFetch *item)
+/* `cookie_ready`: the caller configured this hop's cookie header just
+   before (the support probe), so building it again (URL parses and
+   public-suffix walks per cookie) would produce the same header. Later
+   retries rebuild it, since a cookie may expire meanwhile. */
+static bool scheduled_background_start_hop_with(ScheduledFetch *item,
+                                                bool cookie_ready)
 {
     if (item == NULL || !item->background_backend
         || item->background_request_id != 0 || item->hop == NULL) {
         return false;
     }
-    if (!fetch_hop_configure_cookie(
+    if (!cookie_ready
+        && !fetch_hop_configure_cookie(
             NULL, item->hop, &item->request,
             item->hop->redirects == 0)) return false;
     FetchRequest shape = scheduled_background_hop_shape(item);
@@ -456,6 +465,11 @@ static bool scheduled_background_start_hop(ScheduledFetch *item)
     return item->background_request_id != 0;
 }
 
+static bool scheduled_background_start_hop(ScheduledFetch *item)
+{
+    return scheduled_background_start_hop_with(item, false);
+}
+
 static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
                                     ScheduledFetch *item, const char *url,
                                     const char *logical_url,
@@ -463,7 +477,7 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
                                     size_t maximum_bytes, long timeout_ms)
 {
     bool diagnostic_mobile_safari =
-        getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL;
+        fetch_diagnostic_mobile_safari();
     const char *method = source == NULL || source->method == NULL
                          ? "GET" : source->method;
     item->url = scheduler_copy(scheduler->budget, url, 4095);
@@ -668,7 +682,7 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
         /* A full descriptor is transient backpressure, not permission to run
            curl on the browser thread. Later pumps retry the fixed worker
            queue while preserving the scheduler/domain reservation. */
-        (void) scheduled_background_start_hop(item);
+        (void) scheduled_background_start_hop_with(item, true);
         return true;
     }
     item->easy = curl_easy_init();
@@ -797,7 +811,7 @@ static uint64_t fetch_scheduler_enqueue_internal(
     char canonical_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     const char *logical_url = normalized_logical_url;
     bool diagnostic_mobile_safari =
-        getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL;
+        fetch_diagnostic_mobile_safari();
     if (scheduler == NULL) return 0;
     fetch_scheduler_set_error(scheduler, "");
     if (url == NULL || maximum_bytes == 0 || maximum_bytes == SIZE_MAX

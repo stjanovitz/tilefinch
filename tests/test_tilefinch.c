@@ -1369,8 +1369,13 @@ static bool test_streaming_stylesheet_checkpoint_reuse(Budget *budget)
         && navigation.script_parser_blocking == 3
         && navigation.performance.blocking_stylesheet_builds == 2
         && navigation.performance.blocking_stylesheet_reuses == 1
-        && navigation.performance.blocking_stylesheet_adoptions == 0
-        && navigation.performance.blocking_stylesheet_final_reuses == 0
+        /* The trailing <style> is a pure suffix of the checkpoint's inputs:
+           commit appends it to the checkpoint sheet (the probe below proves
+           the later rule wins) instead of parsing every sheet again. */
+        && navigation.performance.blocking_stylesheet_commit_continuations
+             == 1
+        && navigation.performance.blocking_stylesheet_adoptions == 1
+        && navigation.performance.blocking_stylesheet_final_reuses == 1
         && strcmp(navigation.page.script_result.summary,
                   "style-checkpoint:ok") == 0;
     ScriptResult style_probe = {0};
@@ -3377,6 +3382,152 @@ static bool test_layout_cooperate(void *context, const char *phase,
    fixtures preserve their established process-local semantics. */
 #include "suites/foundation_platform.inc"
 #include "suites/foundation_document.inc"
+/* Paint-ahead: with spare tile slots, idle work rasterizes the rows below
+   the presented screen, so one Page Down (238 px) is served from the cache
+   with no raster on the input path. */
+static int test_tile_paint_ahead(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    enum { STRIPES = 40 };
+    DrawCommand commands[STRIPES];
+    for (int i = 0; i < STRIPES; i++) {
+        commands[i] = (DrawCommand) {
+            .x = 0, .y = i * 100, .width = 480, .height = 100,
+            .color = (uint32_t) (0x102030u * (unsigned) (i + 1)) & 0xffffffu,
+            .opacity_scale = 256, .type = DRAW_FILL_RECT
+        };
+    }
+    LayoutDocument layout = {
+        .budget = &budget, .commands = commands, .count = STRIPES,
+        .width = 480, .scroll_width = 480, .height = STRIPES * 100,
+        .page_background = 0xffffff
+    };
+    TileCache cache;
+    uint16_t *frame = budget_malloc(&budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, &budget, &layout, 24)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 395, 480, 272, NULL));
+    /* The engine schedules the row just below the screen after a frame. */
+    tile_cache_schedule_prefetch_row(&cache, 395 + 272 + 127, 480);
+    for (int pumps = 0; pumps < 64 && tile_cache_idle_work_pending(&cache);
+         pumps++) {
+        (void) tile_cache_run_idle_work(&cache, 1000000u, 64u);
+    }
+    /* Three visible rows (twelve tiles) plus two rows ahead. */
+    CHECK(tile_cache_prefetch_satisfied(&cache)
+          && cache.tiles_allocated == 20);
+    size_t misses = cache.misses, rasterized = cache.rasterized;
+    CHECK(tile_cache_render_frame(&cache, 395 + 238, 480, 272, NULL));
+    if (cache.misses != misses || cache.rasterized != rasterized) {
+        fprintf(stderr, "paint-ahead misses=%zu rasterized=%zu tiles=%zu\n",
+                cache.misses - misses, cache.rasterized - rasterized,
+                cache.tiles_allocated);
+    }
+    CHECK(cache.misses == misses && cache.rasterized == rasterized
+          && !tile_cache_prefetch_satisfied(&cache));
+    tile_cache_destroy(&cache);
+    budget_free(&budget, frame);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Separate fixed elements stack by z-index, not by the order their ranges
+   were registered: Wikipedia's z-index:2 menu drawer precedes its
+   z-index:1 page scrim in the document and must paint above it, on both the
+   retained fixed-layer path and the direct overlay path. */
+static int test_fixed_overlays_follow_z_index(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        "#drawer{position:fixed;top:0;left:0;bottom:0;width:200px;"
+        "z-index:2;background:#00ff00}"
+        "#mask{position:fixed;top:0;left:0;right:0;bottom:0;z-index:1;"
+        "background:#ff0000}</style><body><p>page</p>"
+        "<div id=drawer></div><div id=mask></div></body>";
+    for (int direct = 0; direct < 2; direct++) {
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17)
+              && stylesheet_build(&stylesheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &stylesheet,
+                              NULL, NULL, 480));
+        TileCache cache;
+        uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+        CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 24)
+              && tile_cache_set_frame(&cache, frame, 480u * 272u));
+        if (direct) {
+            /* An interleaved bounded range forces the direct path; model
+               that by refusing the retained layer. */
+            cache.fixed_ready = false;
+            setenv("TILEFINCH_DISABLE_FIXED_CACHE", "1", 1);
+        }
+        CHECK(tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+        if (direct) unsetenv("TILEFINCH_DISABLE_FIXED_CACHE");
+        CHECK(frame[100u * 480u + 50u] == 0x07e0u
+              && frame[100u * 480u + 400u] == 0xf800u);
+        tile_cache_destroy(&cache);
+        budget_free(budget, frame);
+        layout_destroy(&layout);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+    }
+    return 0;
+}
+
+/* Placeholder composition: a scrolled frame is composed from resident
+   tiles with a checkerboard for the rest, without rasterizing or disturbing
+   the pending bounded frame job that will fill them in. */
+static int test_tile_placeholder_frame(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    DrawCommand command = {
+        .x = 0, .y = 0, .width = 480, .height = 4000, .color = 0x204080u,
+        .opacity_scale = 256, .type = DRAW_FILL_RECT
+    };
+    LayoutDocument layout = {
+        .budget = &budget, .commands = &command, .count = 1,
+        .width = 480, .scroll_width = 480, .height = 4000,
+        .page_background = 0xffffff
+    };
+    TileCache cache;
+    uint16_t *frame = budget_malloc(&budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, &budget, &layout, 24)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+    uint16_t content = frame[0];
+    /* Scroll far enough that no tile is resident, start the bounded job,
+       then compose the placeholder frame. */
+    CHECK(tile_cache_prepare_frame_bounded(&cache, 2000, 480, 272, 1, 1)
+              == RENDER_FRAME_WORK_PENDING);
+    size_t rasterized = cache.rasterized;
+    cache.placeholder_missing = true;
+    CHECK(tile_cache_render_frame(&cache, 2000, 480, 272, NULL));
+    cache.placeholder_missing = false;
+    /* One tile was rasterized by the job slice; the rest are checkered. */
+    CHECK(cache.rasterized == rasterized && cache.placeholder_tiles != 0
+          && cache.placeholder_tiles < 12 && cache.frame_work.pending);
+    bool checkered = false;
+    for (size_t at = 0; at < 480u * 272u && !checkered; at++)
+        checkered = frame[at] == 0xef7du;
+    CHECK(checkered);
+    /* The job finishes and the complete frame has no checkerboard. */
+    for (int slices = 0; slices < 64 && tile_cache_frame_work_pending(&cache);
+         slices++) {
+        (void) tile_cache_prepare_frame_bounded(&cache, 2000, 480, 272,
+                                                1000000u, 4u);
+    }
+    CHECK(tile_cache_render_frame(&cache, 2000, 480, 272, NULL)
+          && cache.placeholder_tiles == 0 && frame[0] == content
+          && frame[480u * 271u + 479u] == content);
+    tile_cache_destroy(&cache);
+    budget_free(&budget, frame);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 #include "suites/web_runtime_render.inc"
 #include "suites/web_runtime_navigation.inc"
 #include "suites/web_runtime_forms.inc"

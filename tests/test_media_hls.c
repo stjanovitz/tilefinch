@@ -542,6 +542,91 @@ static int test_oversized_live_playlist_stream(void)
     return 0;
 }
 
+/* A small live playlist streamed in pieces parses from its retained text,
+   and the stream's retained buffer stays proportional to the playlist. */
+static int test_small_live_playlist_stream(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    char error[160] = {0};
+    MediaHlsPlaylistStream *stream = media_hls_playlist_stream_create(
+        &budget, "https://media.invalid/live/list.m3u8",
+        error, sizeof(error));
+    CHECK(stream != NULL);
+    static const char first[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:7\n"
+        "#EXTINF:4,\none.ts\n#EXTI";
+    static const char second[] =
+        "NF:4,\ntwo.ts\n#EXTINF:4,\nthree.ts\n";
+    CHECK(media_hls_playlist_stream_feed(
+              stream, (const unsigned char *) first, strlen(first),
+              error, sizeof(error))
+          && media_hls_playlist_stream_feed(
+              stream, (const unsigned char *) second, strlen(second),
+              error, sizeof(error)));
+    CHECK(budget.current < 96u * 1024u);
+    MediaHlsPlaylist *playlist = media_hls_playlist_stream_finish(
+        stream, error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_is_live(playlist)
+          && media_hls_playlist_segment_count(playlist) == 3u
+          && media_hls_playlist_duration_us(playlist) == 12000000u);
+    media_hls_playlist_destroy(playlist);
+    media_hls_playlist_stream_destroy(stream);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+/* The whole-text parser and the incremental stream share one tag reader:
+   both refuse encryption, fMP4 maps and byte ranges with the same message,
+   the stream as soon as the line arrives. Unencrypted keys pass. */
+static int test_unsupported_tags_refused_by_both_parsers(void)
+{
+    static const struct {
+        const char *tag;
+        const char *message;
+    } cases[] = {
+        { "#EXT-X-KEY:METHOD=AES-128,URI=\"k\"",
+          "encrypted HLS is unsupported" },
+        { "#EXT-X-MAP:URI=\"init.mp4\"",
+          "fragmented or byte-range HLS is unsupported" },
+        { "#EXT-X-BYTERANGE:100@0",
+          "fragmented or byte-range HLS is unsupported" },
+        { "#EXT-X-KEY:METHOD=NONE", NULL }
+    };
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char text[256], error[160] = {0};
+        int length = snprintf(
+            text, sizeof(text),
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n%s\n#EXTINF:4,\none.ts\n",
+            cases[i].tag);
+        CHECK(length > 0 && (size_t) length < sizeof(text));
+        MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+            &budget, "https://media.invalid/list.m3u8",
+            (const unsigned char *) text, (size_t) length,
+            error, sizeof(error));
+        CHECK((playlist == NULL) == (cases[i].message != NULL));
+        CHECK(cases[i].message == NULL
+              || strcmp(error, cases[i].message) == 0);
+        media_hls_playlist_destroy(playlist);
+
+        MediaHlsPlaylistStream *stream = media_hls_playlist_stream_create(
+            &budget, "https://media.invalid/list.m3u8",
+            error, sizeof(error));
+        CHECK(stream != NULL);
+        bool fed = media_hls_playlist_stream_feed(
+            stream, (const unsigned char *) text, (size_t) length,
+            error, sizeof(error));
+        CHECK(fed == (cases[i].message == NULL));
+        CHECK(cases[i].message == NULL
+              || strcmp(error, cases[i].message) == 0);
+        media_hls_playlist_stream_destroy(stream);
+    }
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 static int test_live_window_refresh(void)
 {
     Budget budget;
@@ -1017,6 +1102,8 @@ int main(void)
 {
     if (test_playlists() != 0) return 1;
     if (test_oversized_live_playlist_stream() != 0) return 1;
+    if (test_small_live_playlist_stream() != 0) return 1;
+    if (test_unsupported_tags_refused_by_both_parsers() != 0) return 1;
     if (test_streaming_source() != 0) return 1;
     if (test_video_only_primes_before_segment_completion() != 0) return 1;
     if (test_demuxed_track_sources_prime_independently() != 0) return 1;

@@ -40,6 +40,27 @@ static bool navigation_background_images_enabled(void)
 #endif
 }
 
+/* A large page without a script realm commits with only the screens around
+   the top laid out and without the whole-document image walk (together
+   ~20 s of the PlayStation Portable article on the PSP): the reader can
+   scroll, follow links and extend the layout while idle work completes it
+   and the deferred queue loads its images nearest-first. Nothing else
+   reads its geometry in between. */
+#define NAVIGATION_PROVISIONAL_COMMIT_NODES 3000u
+
+static void navigation_queue_discovered_visuals(NavigationSession *session);
+
+static bool navigation_provisional_commit_eligible(
+    const NavigationSession *session,
+    const NavigationDocumentStream *streaming)
+{
+    return streaming != NULL && session->page.runtime == NULL
+        && session->relayout_preview_threshold_us != UINT64_MAX
+        && session->page.document.node_count
+               >= NAVIGATION_PROVISIONAL_COMMIT_NODES
+        && session->viewport.css_height > 0;
+}
+
 static bool navigation_document_may_have_images(
     const PocDocument *document, const Stylesheet *stylesheet)
 {
@@ -885,6 +906,17 @@ static bool navigation_finish_authoritative_layout(
        scripts can then join the page resource table during that attach. */
     session->fonts = fonts;
     session->images = images;
+    /* A complete committed layout's cost predicts in-place relayouts
+       (navigation_attach_layout records later ones); a provisional commit
+       was chosen because the page is slow, and later relayouts are too. */
+    session->page.layout_provisional =
+        session->page.layout.content_limit_y != 0;
+    session->page.layout_complete_us = session->page.layout_provisional
+        ? session->relayout_preview_threshold_us
+        : session->page.layout.performance.total_us;
+    if (!session->page.layout_provisional
+        && session->page.visual_discovery_pending)
+        navigation_queue_discovered_visuals(session);
     bool attach_relayout_requested = false;
     if (session->page.runtime != NULL) {
         navigation_attach_layout(session);
@@ -1185,6 +1217,14 @@ static bool navigation_commit_document(
             session->page.layout_reuse =
                 streaming->preview_layout_reuse;
             streaming->preview_layout_reuse = NULL;
+            /* The preview withholds matched-rule lists while the parser
+               still appends; the committed document is complete, so the
+               page cache may retain them from its first full build on
+               (navigation_ensure_layout_reuse enables them for a cache the
+               page creates itself). Without them every relayout re-ran
+               every selector against every node. */
+            layout_reuse_cache_enable_retained_matches(
+                session->page.layout_reuse);
         } else {
             layout_reuse_cache_destroy(
                 streaming->preview_layout_reuse);
@@ -1257,6 +1297,21 @@ static bool navigation_commit_document(
         session->performance.blocking_stylesheet_fingerprint_us +=
             fingerprint_finished >= fingerprint_started
                 ? fingerprint_finished - fingerprint_started : 0;
+        /* Pages commonly place <style> elements in the body after the
+           preview's stylesheet was compiled (per-template styles). Those are
+           a pure suffix of the same inputs; append them rather than parsing
+           every external sheet again. User CSS already in the sheet is its
+           own cascade origin, so author rules appended after it still order
+           by origin first; the continuation itself refuses user CSS that
+           changed the parse context. */
+        if (fingerprinted
+            && final_fingerprint
+               != streaming->blocking_stylesheet_fingerprint
+            && navigation_stream_continue_stylesheet_suffix(
+                   streaming, &session->page.document, final_fingerprint,
+                   true)) {
+            session->performance.blocking_stylesheet_commit_continuations++;
+        }
         if (fingerprinted
             && final_fingerprint
                == streaming->blocking_stylesheet_fingerprint) {
@@ -1925,7 +1980,10 @@ static bool navigation_commit_document(
     session->performance.markup_image_priority_nodes =
         markup_priority_added;
 
-    bool defer_mutable_document_images = session->external_resources_enabled
+    bool provisional_commit =
+        navigation_provisional_commit_eligible(session, streaming);
+    bool defer_mutable_document_images = !provisional_commit
+        && session->external_resources_enabled
         && streaming != NULL && allow_runtime && session->progressive_paint != NULL
         && navigation_plan_mutable_document_images(session);
     if (defer_mutable_document_images) {
@@ -1983,8 +2041,18 @@ static bool navigation_commit_document(
             && !allow_runtime && streaming == NULL
             && navigation_document_images_are_defer_safe(
                    &session->page.document, &session->page.stylesheet);
-        if ((continue_images_after_paint && !defer_mutable_document_images)
-            || defer_static_document_images) {
+        if (provisional_commit) {
+            /* The viewport's priority visuals are loaded above; the rest
+               are discovered by the first complete layout. */
+            budget_free(session->budget,
+                        session->page.deferred_image_targets);
+            session->page.deferred_image_targets = NULL;
+            session->page.deferred_image_count = 0;
+            session->page.image_continuation_pending = false;
+            session->page.visual_discovery_pending = true;
+        } else if ((continue_images_after_paint
+                    && !defer_mutable_document_images)
+                   || defer_static_document_images) {
             session->page.image_continuation_pending = true;
         } else {
             if (!defer_mutable_document_images) {
@@ -2057,6 +2125,45 @@ static bool navigation_commit_document(
                local document). Include them in the authoritative layout. */
             images = &session->page.images;
         }
+        if (provisional_commit) {
+            layout_destroy(&session->page.layout);
+            memset(&session->page.layout, 0, sizeof(session->page.layout));
+            navigation_ensure_layout_reuse(session);
+            bool truncated = false;
+            /* Through the screen the reader scrolled the load preview to,
+               and two more, so the commit lands where they are reading. */
+            int limit = 3 * session->viewport.css_height;
+            int reader_y = session->provisional_reader_y;
+            if (reader_y > 0 && reader_y <= INT_MAX - limit)
+                limit += reader_y;
+            if (layout_build_context_preview(
+                    &session->page.layout, session->budget,
+                    &session->page.document, &session->page.stylesheet,
+                    fonts, images, &session->viewport,
+                    session->page.layout_reuse, limit, &truncated)) {
+                if (truncated) {
+                    LayoutDocument *layout = &session->page.layout;
+                    layout->content_limit_y =
+                        layout->height > 0 ? layout->height : 1;
+                    layout->height = layout->content_limit_y
+                        + 2 * session->viewport.css_height;
+                    session->performance.provisional_relayouts++;
+                }
+                final_layout_ready = true;
+                uint64_t elapsed = navigation_record_layout_slices(
+                    session, phase_started, &session->page.layout);
+                session->performance.layout_us += elapsed;
+                session->performance.final_layout_us += elapsed;
+            } else {
+                /* Fall back to the ordinary complete build. */
+                layout_destroy(&session->page.layout);
+                memset(&session->page.layout, 0,
+                       sizeof(session->page.layout));
+            }
+        }
+    }
+    if (!final_layout_ready) {
+        phase_started = navigation_now_us();
         if (defer_authoritative_layout && previous_page == NULL
             && !record_history && candidate_prepare == NULL
             && deferred_layout_job != NULL

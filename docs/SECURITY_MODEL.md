@@ -107,7 +107,7 @@ Top-level navigation, frames, scripts, styles, images, fetch/XHR, forms, and
 preloads should create a context instead of independently comparing host
 strings. Response cookies are associated with the URL of the redirect hop that
 supplied them, not unconditionally with the final URL. Redirects remain bounded
-to HTTP(S) and a maximum of five hops in the host transport.
+to HTTP(S) and a maximum of eight hops.
 
 An HTTPS document cannot open an HTTP channel through scripts, stylesheets,
 frames, fonts, fetch/XHR, or other active content. Eligible image and media
@@ -116,8 +116,9 @@ request fails; they never fall back to HTTP. The shared transport applies the
 same rule to the initial request and every explicit redirect hop, so a loader
 cannot omit it and an HTTPS response cannot redirect silently to HTTP. A
 bounded 16-site compatibility table can explicitly permit mixed content for a
-top-level site. It is off by default, available from the Privacy settings, and
-exists only for the running browser session: Tilefinch neither writes grants
+top-level site. It is off by default, set per site under **Page tools → Site
+information → Permissions & controls → Mixed HTTP (session)**, and exists only
+for the running browser session: Tilefinch neither writes grants
 to the Memory Stick nor restores legacy persisted grants after restart. HTTP
 loopback remains potentially trustworthy for local development.
 
@@ -154,6 +155,13 @@ realm epoch and canvas handle. A fresh realm cannot reuse EDRAM pixels merely
 by repeating page-controlled texture identifiers, generations, or dimensions;
 entering the aliased video EDRAM layout invalidates the cache as well.
 
+Live low- and high-entropy client hints are sent only to potentially
+trustworthy HTTP(S) targets: HTTPS, loopback HTTP, and localhost HTTP. A
+`Critical-CH` retry is permitted only when the same final response contains a
+well-formed `Accept-CH` list accepting every requested, supported token. The
+retry remains same-origin, is bounded to one attempt, and cannot inherit a
+request from an untrustworthy redirect hop.
+
 Page fullscreen and game-audio resume are admitted only while the native input
 dispatcher is executing a trusted top-level activation. JavaScript cannot
 manufacture that transient fact, and navigation, suspend, native-media entry,
@@ -187,7 +195,7 @@ The detected page opens in a temporary tab and a temporary session context:
 - media, updates, optional-component installs, offline saves, screenshots,
   tab switching, and access to the ordinary library/history are refused;
 - each page is limited to 512 KiB and a 20-second navigation deadline, the
-  ordinary five-hop redirect bound still applies, and the interactive portal
+  ordinary eight-hop redirect bound still applies, and the interactive portal
   context expires after five minutes.
 
 After a submitted portal navigation, Tilefinch repeats the cookie-free probe.
@@ -213,17 +221,20 @@ expiry, `Secure`, `HttpOnly`, `SameSite` Default/Lax/Strict/None,
 `SameSite=None` and partitioned cookies require `Secure`; insecure origins
 cannot set Secure cookies. Script access excludes HttpOnly values. Cookie names
 and serialized fields reject control, non-ASCII, and invalid token bytes.
+
 The jar holds 32 cookies overall and at most eight for one exact domain;
 insertion evicts the oldest applicable entry so one origin cannot permanently
 deny storage to every other site. Paths through 319 bytes remain inline.
 Exceptional paths through 2,047 bytes use an on-demand session pool capped at
 8 KiB, so accepting a long URL does not enlarge every fixed PSP cookie entry.
+
 Unpartitioned cookies from an embedded cross-site response are neither stored
 nor sent by default, including ordinary `SameSite=None` cookies. `Partitioned`
 cookies remain available under their top-level-site partition. A separate
-bounded 16-site compatibility table may permit ordinary third-party cookies
-for a selected top-level site; top-level cross-site navigation is first-party
-and continues to use the normal SameSite rules.
+bounded 16-site compatibility table, set under **Permissions & controls →
+Third-party cookies** and saved with the profile, may permit ordinary
+third-party cookies for a selected top-level site. Top-level cross-site
+navigation is first-party and continues to use the normal SameSite rules.
 
 Live fetches do not enable libcurl's cookie engine. When a request supplies a
 browser session and immutable request context, the transport takes a bounded
@@ -285,7 +296,7 @@ default, and a disabled category is not read during boot. Their separately
 bounded files are stored unencrypted on the removable Memory Stick, so cached
 page content and local-storage values must be treated as visible to anyone who
 can read that stick. Cookies and `sessionStorage` are never serialized. The
-Site Data panel provides independent clear actions for cache, cookies, local
+**Site data & storage** panel provides independent clear actions for cache, cookies, local
 storage, and session storage. Imports treat the files as untrusted: lengths,
 record counts, normalized HTTP(S) cache keys and origins, response metadata,
 aggregate bytes, and a whole-payload checksum are checked before transactional
@@ -297,6 +308,15 @@ should be disabled or cleared when that physical attacker is in scope.
 Imported response bodies are always stale until HTTP revalidation. Primary and
 backup generations are category-specific, so a cache-only load never commits
 storage and a local-storage-only load never commits cache data.
+
+Site storage reaches the Memory Stick only after the user accepts the offer
+for that site (or chooses **Memory Stick** for it); until then it is RAM-only.
+Its files in `data/site-storage/` are unencrypted and carry the same
+damage-detecting checksums, plus the origin in the header, so a file is never
+loaded for a different site. A this-session file is deleted at exit, or at the
+next boot after a crash. The origin comes from the document URL, as for all
+page-writable state; a captive-portal sign-in gets an empty RAM-only store and
+cannot trigger an offer.
 
 The browser preference profile uses the same primary/backup generation model.
 Each accepted generation must end in an exact byte-count and checksum footer;
@@ -315,41 +335,62 @@ leave it until the next hibernation replaces it or the user deletes it.
 
 ## HTTP trace handling
 
-New captures use HTTP trace format v11. The replay reader intentionally retains
-compatibility with v1--v10 for document and generic-fetch fixtures, but typed
-script, stylesheet, image, and font records older than v10 cannot prove that a
-security-relevant response header was not dropped and therefore fail closed.
-V10 records and requires the response-security-header truncation bit; replay
-reconstructs it before CORS or typed-resource admission. V11 additionally
-binds the once-parsed typed security-header classification
-(present/valid/malformed/duplicate/truncated per field), so replay feeds
-consumers the same typed metadata live responses produce instead of
-re-deriving it from raw header text. Because v8 and older
-records contain
-only the fragmentless wire identity, they may replay only when the current
-normalized logical request has no fragment. V9 additionally binds the exact
-normalized logical request URL and the response's dedicated bounded
-`Referrer-Policy` metadata; same-wire requests with different fragments fail
-closed. V6 fail-closed matching
-binds the canonical fragmentless URL and method, request body length and
-fingerprint, every non-secret transport-shaping field, credential mode and
-immutable request context, and response body length and fingerprint. It also
-attributes each `Set-Cookie` field to the eligible response hop that supplied
-it and declares whether cookie values are redacted or raw. V7 also binds the
-requested Critical-CH token set and its accepting origin, so replay cannot
-silently widen high-entropy hint disclosure. V8 also records redirect-origin
-taint and binds CORS enforcement, same-origin redirect policy, and whether a
-conditional request carries already-validated cached CORS provenance. Because
-older traces cannot prove a same-origin final URL did not traverse another
-origin, pre-v8 CORS records without explicit taint are rejected rather than
-silently treated as safe.
+New captures use HTTP trace format v11. The replay reader stays compatible
+with v1–v10 for document and generic-fetch fixtures, but fails closed wherever
+an older record cannot prove what a newer rule depends on. Each format version
+added a binding:
 
-Live low- and high-entropy client hints are sent only to potentially
-trustworthy HTTP(S) targets: HTTPS, loopback HTTP, and localhost HTTP. A
-`Critical-CH` retry is permitted only when the same final response contains a
-well-formed `Accept-CH` list accepting every requested, supported token. The
-retry remains same-origin, is bounded to one attempt, and cannot inherit a
-request from an untrustworthy redirect hop.
+- **v6** fail-closed matching binds the canonical fragmentless URL and method,
+  request body length and fingerprint, every non-secret transport-shaping
+  field, credential mode and immutable request context, and response body
+  length and fingerprint. It also attributes each `Set-Cookie` field to the
+  eligible response hop that supplied it and declares whether cookie values
+  are redacted or raw.
+- **v7** also binds the requested Critical-CH token set and its accepting
+  origin, so replay cannot silently widen high-entropy hint disclosure.
+- **v8** also records redirect-origin taint and binds CORS enforcement,
+  same-origin redirect policy, and whether a conditional request carries
+  already-validated cached CORS provenance. Older traces cannot prove that a
+  same-origin final URL did not pass through another origin, so pre-v8 CORS
+  records without explicit taint are rejected rather than treated as safe.
+- **v9** binds the exact normalized logical request URL and the response's
+  dedicated bounded `Referrer-Policy` metadata; same-wire requests with
+  different fragments fail closed. Because v8 and older records contain only
+  the fragmentless wire identity, they may replay only when the current
+  normalized logical request has no fragment.
+- **v10** records and requires the response-security-header truncation bit,
+  which replay reconstructs before CORS or typed-resource admission. Typed
+  script, stylesheet, image, and font records older than v10 cannot prove that
+  a security-relevant response header was not dropped, so they fail closed.
+- **v11** binds the once-parsed typed security-header classification
+  (present, valid, malformed, duplicate, or truncated, per field), so replay
+  feeds consumers the same typed metadata live responses produce instead of
+  re-deriving it from raw header text.
+
+The transport-shaping match includes the selected diagnostic browser profile;
+a capture made with Mobile Safari diagnostics cannot replay as the ordinary
+PSP profile even when the caller supplied an identical `User-Agent`. Required
+current-format fields, counts, and numbered entries are parsed strictly and without
+duplicates, and the response body is verified on the same open file descriptor
+before any consumer callback or deferred handoff.
+
+Captured response `Set-Cookie` values are redacted by default. The trace keeps
+cookie names, attributes, and value byte lengths so replay still exercises
+policy and request shape without retaining live session secrets. The trace
+format records whether values are `redacted` or `raw`.
+The fixed redacted seed format supports inline cookie paths only. If a live jar
+contains an exceptional long-path cookie, capture fails before publishing an
+authority file rather than truncating it into a non-replayable or differently
+scoped seed.
+
+Raw values are captured only when the environment variable is exactly
+`TILEFINCH_TRACE_RAW_COOKIES=1`. A raw trace is a session secret: use it only in an
+isolated, access-controlled diagnostic and never commit or share it. Request
+traces store cookie byte counts and selected state indicators rather than the
+request Cookie header itself. Extra application headers are represented by
+lowercased names and value byte lengths; raw values such as bearer tokens are
+not retained. Consequently a trace proves matching request shape, not exact
+authentication-secret equality.
 
 ## Page resource and embedding policy
 
@@ -389,17 +430,18 @@ global before author script. Blob workers are then admitted by `worker-src`
 and compiled only through that retained host path, so they do not reopen a
 general dynamic-compilation primitive.
 
-The present Blob-worker compatibility layer is cooperatively scheduled in the
-page's charged QuickJS runtime. It provides a distinct worker-facing global
-object and hides direct Window/Document bindings, but it does not yet provide a
-separate QuickJS context with independent intrinsic prototypes. Treat it as
-same-author-origin page code, not as a privilege or origin-isolation boundary.
-The public constructor is backed by a first-use bootstrap. Its native compiler
-entry point is installed only for trusted module evaluation, captured by that
-module, and deleted before author execution resumes; the bounded Blob lookup and
-clone helpers are hardened against replacement during eager bootstrap.
-The dedicated-context milestone and its cross-context structured-clone mailbox
-are specified in [the lab qualification guide](engineering/LAB_USAGE.md#managed-challenges-as-a-standards-qualification).
+Each dedicated worker, Blob workers included, runs in its own QuickJS context
+with its own global object and JavaScript intrinsics, inside the page's charged
+runtime and on the browser thread; platform names the worker does not define
+fall back, read-only, to the owner's implementations (see
+[Realms, workers, and frames](ARCHITECTURE.md#realms-workers-and-frames)).
+Direct Window and Document bindings are not visible to it. Treat worker code
+as same-author-origin page code, not as a privilege or origin-isolation
+boundary. The public constructor is backed by a first-use bootstrap. Its native
+compiler entry point is installed only for trusted module evaluation, captured
+by that module, and deleted before author execution resumes, and the bounded
+Blob lookup and clone helpers are hardened against replacement during eager
+bootstrap.
 
 Users can also disable author JavaScript globally or for the current site.
 The per-site deny list is bounded to 16 sites and is consulted before a page
@@ -438,6 +480,26 @@ fail closed. A 304 may reuse cached representation bytes, but it rebuilds the
 typed grant from the cached normalized grant plus the 304 metadata; restrictive
 CORP, `nosniff`, malformed, or truncated revalidation metadata can revoke use.
 
+The in-memory cache retains that grant with its response and matches it only
+under the same top-level partition and requesting principal. Multiple
+authorized representations of the same URL may coexist; a generic cache
+lookup cannot consume them. Compiled classic-script bytecode remains keyed by
+the exact response bytes, so partitions may share an immutable compiled
+artifact only when their independently authorized bodies are byte-identical.
+Module entries additionally retain the immutable top-level site partition;
+opaque-origin modules are not placed in the shared module cache because the
+serialized `null` origin is not a principal. Child runtimes receive the
+top-level document URL at creation and reuse it for fetch, XHR, classic-script,
+and module request/cookie/cache contexts rather than substituting their frame
+URL. Stylesheet and image consumers
+perform the same grant match on reuse, including after a redirect; a unique
+opaque initiator cannot be represented by the bounded serialized principal and
+therefore receives no shared cache hit. The v1 persistent-session format does
+not contain the complete grant, so resource-authorized entries remain
+memory-only rather than being serialized as weaker generic entries. Save/load
+tests pin that fail-closed boundary. Fonts and other generic consumers are not
+covered by this claim.
+
 Page WebSockets cross the same immutable request-authority boundary before the
 worker sees a URL. CSP `connect-src`, HTTPS-to-plaintext mixed-content policy,
 Private Network Access, cookies, Origin, and TLS verification remain native
@@ -464,26 +526,6 @@ encrypted or suitable for secrets, and invitation checksums are typo detection
 rather than authentication. The feature deliberately provides no relay,
 Internet directory, account identity, background listener, or ordinary-page
 escape hatch; see [Direct multiplayer](MULTIPLAYER.md).
-
-The in-memory cache retains that grant with its response and matches it only
-under the same top-level partition and requesting principal. Multiple
-authorized representations of the same URL may coexist; a generic cache
-lookup cannot consume them. Compiled classic-script bytecode remains keyed by
-the exact response bytes, so partitions may share an immutable compiled
-artifact only when their independently authorized bodies are byte-identical.
-Module entries additionally retain the immutable top-level site partition;
-opaque-origin modules are not placed in the shared module cache because the
-serialized `null` origin is not a principal. Child runtimes receive the
-top-level document URL at creation and reuse it for fetch, XHR, classic-script,
-and module request/cookie/cache contexts rather than substituting their frame
-URL. Stylesheet and image consumers
-perform the same grant match on reuse, including after a redirect; a unique
-opaque initiator cannot be represented by the bounded serialized principal and
-therefore receives no shared cache hit. The v1 persistent-session format does
-not contain the complete grant, so resource-authorized entries remain
-memory-only rather than being serialized as weaker generic entries. Save/load
-tests pin that fail-closed boundary. Fonts and other generic consumers are not
-covered by this claim.
 
 Native scheduler/document callbacks are captured in a fixed retained registry
 after bootstrap hardening and before author script runs. Native code calls
@@ -520,31 +562,6 @@ families, and COOP/COEP process isolation are not implemented. The PSP has no
 process sandbox, so CSP reduces page authority inside one engine process; it
 does not contain a memory-safety flaw in the engine.
 
-The transport-shaping match includes the selected diagnostic browser profile;
-a capture made with Mobile Safari diagnostics cannot replay as the ordinary
-PSP profile even when the caller supplied an identical `User-Agent`. Required
-current-format fields, counts, and numbered entries are parsed strictly and without
-duplicates, and the response body is verified on the same open file descriptor
-before any consumer callback or deferred handoff.
-
-Captured response `Set-Cookie` values are redacted by default. The trace keeps
-cookie names, attributes, and value byte lengths so replay still exercises
-policy and request shape without retaining live session secrets. The trace
-format records whether values are `redacted` or `raw`.
-The fixed redacted seed format supports inline cookie paths only. If a live jar
-contains an exceptional long-path cookie, capture fails before publishing an
-authority file rather than truncating it into a non-replayable or differently
-scoped seed.
-
-Raw values are captured only when the environment variable is exactly
-`TILEFINCH_TRACE_RAW_COOKIES=1`. A raw trace is a session secret: use it only in an
-isolated, access-controlled diagnostic and never commit or share it. Request
-traces store cookie byte counts and selected state indicators rather than the
-request Cookie header itself. Extra application headers are represented by
-lowercased names and value byte lengths; raw values such as bearer tokens are
-not retained. Consequently a trace proves matching request shape, not exact
-authentication-secret equality.
-
 ## Native media and visual work bounds
 
 Native media and visual effects retain explicit work and destination bounds.
@@ -567,10 +584,12 @@ content was removed. Network blocking is a separate pre-transport policy
 described in `CONTENT_BLOCKING.md`.
 
 The unified **Page tools → Site information** screen reports the committed
-page's copied TLS version/issuer snapshot and bounded cookie/storage usage for
-that origin. Its permissions child exposes the same scoped compatibility
-grants described above. “Clear data for this site” removes applicable cookies
-and exact-origin local/session storage; “Reset permissions” removes the site's
+page's copied TLS version/issuer snapshot, bounded cookie/storage usage for
+that origin, and whether its storage is in RAM or on the Memory Stick. Its
+**Permissions & controls** child exposes the same scoped compatibility grants
+described above, and **Site storage** opens Site data & storage on this site.
+“Clear data for this site” removes applicable cookies and exact-origin
+local/session storage and OPFS; “Reset permissions” removes the site's
 JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions.
 Both destructive actions require confirmation. Inspection and deletion remain
 available even when global site-data admission is disabled.

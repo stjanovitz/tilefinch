@@ -192,11 +192,7 @@ bool content_blocker_site_from_url(
 
 static bool blocker_host_suffix(const char *host, const char *suffix)
 {
-    size_t host_length = strlen(host), suffix_length = strlen(suffix);
-    if (suffix_length > host_length) return false;
-    const char *tail = host + host_length - suffix_length;
-    return strcmp(tail, suffix) == 0
-        && (tail == host || tail[-1] == '.');
+    return tilefinch_host_within(host, strlen(host), suffix, strlen(suffix));
 }
 
 static uint8_t blocker_destination_type(const char *destination)
@@ -233,16 +229,13 @@ static uint8_t blocker_option_type(const char *option, bool *known)
         || strcasecmp(option, "xhr") == 0) return BLOCKER_TYPE_XHR;
     if (strcasecmp(option, "subdocument") == 0
         || strcasecmp(option, "frame") == 0) return BLOCKER_TYPE_FRAME;
-    /* Media playback and ping/websocket transports do not currently enter
-       this policy seam. Retaining those modifiers would advertise rules
-       that can never fire, so count the complete rule as ignored. */
-    if (strcasecmp(option, "media") == 0
-        || strcasecmp(option, "other") == 0
-        || strcasecmp(option, "ping") == 0
-        || strcasecmp(option, "websocket") == 0) {
-        *known = false;
-        return 0;
-    }
+    /* Media opens and range requests carry TILEFINCH_DESTINATION_MEDIA
+       through the scheduler's blocker check. */
+    if (strcasecmp(option, "media") == 0) return BLOCKER_TYPE_MEDIA;
+    /* Ping and websocket transports do not enter this policy seam, and
+       "other" has no destination mapped to it. Retaining those modifiers
+       would advertise rules that can never fire, so the complete rule is
+       counted as ignored, as any unknown modifier is. */
     *known = false;
     return 0;
 }
@@ -521,14 +514,14 @@ bool content_blocker_configure(ContentBlocker *blocker,
 bool content_blocker_set_allowed_sites(
     ContentBlocker *blocker, const char *const *sites, size_t count)
 {
-    if (blocker == NULL || count > CONTENT_BLOCKER_ALLOW_SITE_LIMIT)
+    if (blocker == NULL || count > CONTENT_BLOCKER_ALLOW_SITE_LIMIT
+        || (sites == NULL && count != 0))
         return false;
     size_t bytes = 0;
     char normalized[CONTENT_BLOCKER_ALLOW_SITE_LIMIT]
                    [CONTENT_BLOCKER_HOST_LIMIT];
     for (size_t i = 0; i < count; i++) {
-        size_t length = sites == NULL || sites[i] == NULL
-            ? 0 : strlen(sites[i]);
+        size_t length = sites[i] == NULL ? 0 : strlen(sites[i]);
         if (!blocker_normalize_host(sites[i], length, normalized[i]))
             return false;
         bytes += length + 1u;
@@ -554,11 +547,10 @@ bool content_blocker_set_allowed_sites(
     return true;
 }
 
+/* `site` is the initiator's content_blocker_site_from_url() result. */
 static bool blocker_site_allowed(const ContentBlocker *blocker,
-                                 const char *initiator_url)
+                                 const char *site)
 {
-    char site[CONTENT_BLOCKER_HOST_LIMIT];
-    if (!content_blocker_site_from_url(initiator_url, site)) return false;
     for (size_t i = 0; i < blocker->allowed_site_count; i++) {
         const char *allowed = blocker->allowed_sites
             + blocker->allowed_offsets[i];
@@ -616,7 +608,9 @@ bool content_blocker_would_block(
         || !content_blocker_site_from_url(request_url, request_site)
         || !content_blocker_site_from_url(initiator_url, initiator_site))
         return false;
-    if (blocker_site_allowed(blocker, initiator_url)) return false;
+    /* The allowed-site check reuses the initiator site computed above
+       rather than parsing the URL and walking the suffix list again. */
+    if (blocker_site_allowed(blocker, initiator_site)) return false;
     bool third_party = strcmp(request_site, initiator_site) != 0;
     bool blocked = false, allowed = false;
     if (blocker->mode == CONTENT_BLOCKER_BASIC) {

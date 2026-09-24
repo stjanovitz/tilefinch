@@ -118,6 +118,10 @@ typedef struct {
        setup. Admission remains bounded and, when the engine owns its tile
        cache, that raster work is promoted into the committed renderer. */
     bool progressive_first_paint;
+    /* In-place relayouts of a page whose last complete layout took at
+       least this long show the screens around the reader first and finish
+       in idle work (UINT64_MAX: always relayout synchronously). */
+    uint64_t relayout_preview_threshold_us;
     size_t tile_capacity;
     /* Optional fonts and deferred images wait for queued startup scripts
        for at most this long after the page's runtime appears; the runtime
@@ -280,9 +284,15 @@ typedef struct {
     size_t incumbent_pages_preserved;
     size_t provisional_paints;
     size_t provisional_scrolls;
-    size_t provisional_frame_count;
     size_t provisional_bytes;
     int provisional_scroll_y;
+    /* How far down the page a reader can bring content on screen while the
+       navigation is still pending: where the deepest preview's laid-out
+       content ends, in page pixels, and when that preview was painted
+       (relative to the navigation start, like
+       provisional_first_present_us). */
+    int provisional_reach_px;
+    uint64_t provisional_reach_us;
     size_t transform_slices;
     size_t transform_quota_overruns;
     size_t irreducible_unit_overruns;
@@ -291,10 +301,15 @@ typedef struct {
 typedef struct {
     const uint16_t *pixels;
     size_t pixel_count;
-    size_t frame_count;
-    size_t current_frame;
     int scroll_y;
     int maximum_scroll_y;
+    /* Where the preview's laid-out content ends; below it, and in tiles
+       not yet rasterized, the frame shows a checkerboard. */
+    int content_end_y;
+    /* The pending document's viewport height in CSS pixels. */
+    int viewport_height;
+    /* Every visible tile is rasterized. */
+    bool complete;
     bool ready;
 } BrowserProvisionalViewport;
 
@@ -404,16 +419,49 @@ const char *browser_engine_pending_navigation_url(
 bool browser_engine_navigation_job_metrics(
     const BrowserEngine *engine, BrowserNavigationJobMetrics *metrics);
 /*
- * A provisional viewport is an immutable raster snapshot, never candidate
- * DOM/controller state. It is available only while an asynchronous
- * navigation remains pending. Page-step scrolling selects another bounded
- * pre-rasterized snapshot; final commit carries only its clamped document
- * scroll coordinate into the authoritative page.
+ * A provisional viewport is one frame of the pending document's streaming
+ * preview, never candidate DOM/controller state. It is available only while
+ * an asynchronous navigation remains pending. Scrolling moves it at once,
+ * showing a checkerboard where tiles are not rasterized yet or content is
+ * not laid out yet; scrolling toward the end of the laid-out content asks
+ * the stream for a deeper preview. Final commit carries the scroll position
+ * into the authoritative page, laid out through it.
  */
 bool browser_engine_provisional_viewport(
     const BrowserEngine *engine, BrowserProvisionalViewport *viewport);
+/* One page (the viewport less the ordinary Page Down overlap), or CSS
+   pixels for analog scrolling. Either moves at once, with a checkerboard
+   where tiles are not rasterized or content is not laid out yet. */
 bool browser_engine_scroll_provisional_page(
     BrowserEngine *engine, int direction);
+bool browser_engine_scroll_provisional_by(BrowserEngine *engine, int delta);
+/* Bounded preview work for frontend checkpoints: rasterize a slice of the
+   missing tiles, then recompose and present (pace these to the display).
+   Returns true while more remain. */
+bool browser_engine_provisional_raster_step(BrowserEngine *engine);
+/* D-pad focus over the preview's visible links and controls (spatial, like
+   a loaded page), drawn as a focus ring and carried into the committed
+   page. */
+bool browser_engine_provisional_focus_direction(
+    BrowserEngine *engine, ControllerFocusDirection direction);
+typedef enum {
+    BROWSER_PREVIEW_ACTIVATION_NONE = 0,
+    /* Nothing was focused; the press focused the first visible item. */
+    BROWSER_PREVIEW_ACTIVATION_FOCUSED,
+    /* A web link: *action navigates there. The caller cancels the pending
+       navigation before executing it. */
+    BROWSER_PREVIEW_ACTIVATION_NAVIGATE,
+    /* A control or same-page link: focused, and activated once the page
+       commits (browser_engine_take_deferred_activation). */
+    BROWSER_PREVIEW_ACTIVATION_DEFERRED
+} BrowserPreviewActivation;
+/* Activate the focused preview item, or the one under a device point. */
+BrowserPreviewActivation browser_engine_provisional_activate(
+    BrowserEngine *engine, bool at_point, int device_x, int device_y,
+    ControllerAction *action);
+/* True once, after a commit that focused an item whose activation waited
+   for the page; the frontend then activates the focused item. */
+bool browser_engine_take_deferred_activation(BrowserEngine *engine);
 bool browser_engine_history_move(BrowserEngine *engine, bool forward);
 bool browser_engine_replace_history(
     BrowserEngine *engine, const NavigationHistoryRecord *records,
@@ -573,6 +621,16 @@ bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact);
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path);
+/*
+ * Compose the frame at the current scroll position from the tiles already
+ * rasterized, drawing a checkerboard where one is still missing, without
+ * rasterizing or disturbing a pending bounded frame job. A frontend publishes
+ * this at once after a scroll so input never waits for raster, then keeps
+ * pumping the job. `placeholders` receives the number of checkerboard tiles
+ * (0 means the frame is complete).
+ */
+bool browser_engine_render_placeholder_frame(BrowserEngine *engine,
+                                             size_t *placeholders);
 typedef enum {
     BROWSER_RENDER_JOB_CANCELLED = -2,
     BROWSER_RENDER_JOB_FAILED = -1,

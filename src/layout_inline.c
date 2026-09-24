@@ -4,6 +4,7 @@
 
 #include "layout_internal.h"
 #include "tilefinch/integer_math.h"
+#include "tilefinch/platform.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -234,7 +235,17 @@ static size_t generated_counter_values(
                 context->layout->budget, count, sizeof(LayoutCounterEntry));
             if (context->counter_entries != NULL) {
                 context->counter_entry_capacity = count;
+                /* The walk resolves a style per element; replay the page's
+                   exact matched-rule lists as layout itself does, so a
+                   relayout does not re-match thousands of elements here. */
+                StyleRetainedMatches *previous_matches =
+                    style_retained_matches_attach(
+                        sheet, reuse != NULL && reuse->sheet == sheet
+                                   ? reuse->matches : NULL);
+                tilefinch_platform_trace_step("layout-counter-index");
                 generated_counter_index_visit(context, root, NULL, 0);
+                (void) style_retained_matches_attach(sheet, previous_matches);
+                tilefinch_platform_trace_step("layout-counter-done");
             }
         }
         if (context->counter_entries != NULL) {
@@ -2137,16 +2148,36 @@ static size_t fitting_text_prefix(const FontFace *face,
 {
     size_t used = 0;
     int width = 0;
+    /* The caller measures the accepted piece as one kerned run, so each
+       step's advance includes the pair kerning with the previous grapheme:
+       width(previous + this) - width(previous). */
+    size_t previous_start = 0, previous_length = 0;
+    int previous_width = 0;
     while (used < length) {
         size_t character = utf8_grapheme_length(
             text + used, length - used);
         if (character == 0) break;
-        int character_width = measured_flow_text_width_fixed(
-            face, metric_family, text + used, character, font_size_fixed,
-            synthetic_bold, metric_bold, scale, 0,
+        TextTransformMode step_transform =
             transform == TEXT_TRANSFORM_CAPITALIZE && used != 0
-                ? TEXT_TRANSFORM_NONE : transform,
-            kerning);
+                ? TEXT_TRANSFORM_NONE : transform;
+        int alone_width = measured_flow_text_width_fixed(
+            face, metric_family, text + used, character, font_size_fixed,
+            synthetic_bold, metric_bold, scale, 0, step_transform, kerning);
+        int character_width = alone_width;
+        if (kerning && previous_length != 0) {
+            TextTransformMode pair_transform =
+                transform == TEXT_TRANSFORM_CAPITALIZE && previous_start != 0
+                    ? TEXT_TRANSFORM_NONE : transform;
+            int pair_width = measured_flow_text_width_fixed(
+                face, metric_family, text + previous_start,
+                previous_length + character, font_size_fixed,
+                synthetic_bold, metric_bold, scale, 0, pair_transform,
+                kerning);
+            character_width = pair_width - previous_width;
+        }
+        previous_start = used;
+        previous_length = character;
+        previous_width = alone_width;
         if (used != 0) {
             int64_t spaced = (int64_t) character_width
                              + (int64_t) letter_spacing * 64;
@@ -3098,6 +3129,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                                          link_url, link_url_length, link_node);
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
+    /* A block's inline content (a menu, a reference list line) can hold
+       hundreds of elements: check the clock without charging work units.
+       A cancelled build is discarded whole. */
+    if ((++context->inline_visits & 3u) == 0
+        && !layout_cooperate_timed(context)) return false;
     ComputedStyle style = layout_style_for_node(context, node, parent);
     if (resolved_hidden != NULL) {
         *resolved_hidden = style.visibility_hidden;

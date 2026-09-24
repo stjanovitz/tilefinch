@@ -20,6 +20,10 @@ static void js_rt_dump_interpreter_stack(void *opaque)
 
 void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
 {
+    /* Every entry into JavaScript starts here. The parser and the host
+       change DOM and state only between entries, so a computed style
+       memoized during one entry is not trusted by the next. */
+    runtime->bridge.computed_style_epoch++;
     watchdog_finish_slice(&runtime->watchdog);
     runtime->watchdog.started_ms = monotonic_time_ms();
     runtime->watchdog.deadline_ms = runtime->timeout_ms
@@ -292,8 +296,7 @@ static const char *const runtime_host_callback_names[
     "__tilefinchMediaRecheck",
     "__tilefinchRecordResourceTiming",
     "__tilefinchRecordNavigationTiming",
-    "__tilefinchPendingTimers",
-    "__tilefinchPendingNetworkRequests",
+    "__tilefinchPendingWork",
     "__tilefinchDeliverNetwork",
     "__tilefinchDetachNetwork",
     "__tilefinchPumpTimers",
@@ -1002,7 +1005,7 @@ bool script_runtime_document_refresh_failed(const ScriptRuntime *runtime)
 
 bool js_rt_runtime_refresh(ScriptRuntime *runtime)
 {
-    if (runtime->result.dom_mutations != runtime->refreshed_mutations) {
+    if (runtime->bridge.stats_mutations != runtime->refreshed_mutations) {
         bool refreshed = true;
 #if !defined(__PSP__)
         if (tilefinch_test_faults()->refuse_next_document_refresh) {
@@ -1019,35 +1022,24 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
                      "could not refresh mutated DOM");
             return false;
         }
-        runtime->refreshed_mutations = runtime->result.dom_mutations;
+        runtime->refreshed_mutations = runtime->bridge.stats_mutations;
     }
     JSValue pending;
-    if (!runtime_call_host(runtime, SCRIPT_HOST_PENDING_TIMERS, 0, NULL, &pending)) {
+    if (!runtime_call_host(runtime, SCRIPT_HOST_PENDING_WORK, 0, NULL,
+                           &pending)) {
         return false;
     }
-    int64_t pending_count = 0;
-    if (JS_ToInt64(runtime->context, &pending_count, pending) < 0) {
+    int64_t pending_work = 0;
+    if (JS_ToInt64(runtime->context, &pending_work, pending) < 0) {
         JS_FreeValue(runtime->context, pending);
         js_rt_record_exception(runtime->context, &runtime->result);
         return false;
     }
     JS_FreeValue(runtime->context, pending);
-    runtime->pending_timer_tasks = pending_count > 0
-        ? (size_t) pending_count : 0;
+    if (pending_work < 0) pending_work = 0;
+    runtime->pending_timer_tasks = (size_t) (pending_work >> 16);
     runtime->result.pending_tasks = runtime->pending_timer_tasks;
-    if (!runtime_call_host(runtime, SCRIPT_HOST_PENDING_NETWORK_REQUESTS, 0, NULL,
-                      &pending)) {
-        return false;
-    }
-    pending_count = 0;
-    if (JS_ToInt64(runtime->context, &pending_count, pending) < 0) {
-        JS_FreeValue(runtime->context, pending);
-        js_rt_record_exception(runtime->context, &runtime->result);
-        return false;
-    }
-    JS_FreeValue(runtime->context, pending);
-    runtime->pending_network_tasks = pending_count > 0
-        ? (size_t) pending_count : 0;
+    runtime->pending_network_tasks = (size_t) (pending_work & 0xffff);
     runtime->result.pending_tasks += runtime->pending_network_tasks;
     runtime->result.pending_tasks += runtime->bridge.async_fetch_count;
     runtime->result.pending_tasks += runtime->bridge.event_source_count;

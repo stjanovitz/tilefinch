@@ -110,11 +110,6 @@ void psp_ui_theme_select(BrowserChromeTheme theme)
     psp_ui_theme_active_palette = psp_ui_theme_palette(theme);
 }
 
-bool psp_ui_theme_custom_available(void)
-{
-    return theme_custom_valid;
-}
-
 const char *psp_ui_theme_custom_label(void)
 {
     return theme_custom_label;

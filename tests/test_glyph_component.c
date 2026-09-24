@@ -5,6 +5,7 @@
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/sha256.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -285,6 +286,41 @@ static bool test_pack_catalog(void)
                         expected[pack].pack_asset) == 0);
     }
     CHECK(tilefinch_glyph_pack_spec(TILEFINCH_GLYPH_PACK_COUNT) == NULL);
+
+    static const struct {
+        BrowserGlyphLanguage language;
+        TilefinchGlyphPack pack;
+    } language_packs[] = {
+        {BROWSER_GLYPH_LANGUAGE_JAPANESE,
+         TILEFINCH_GLYPH_PACK_JAPANESE},
+        {BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED,
+         TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED},
+        {BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL,
+         TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL},
+        {BROWSER_GLYPH_LANGUAGE_KOREAN, TILEFINCH_GLYPH_PACK_KOREAN},
+        {BROWSER_GLYPH_LANGUAGE_CYRILLIC,
+         TILEFINCH_GLYPH_PACK_CYRILLIC},
+        {BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
+         TILEFINCH_GLYPH_PACK_LATIN_EXTENDED},
+        {BROWSER_GLYPH_LANGUAGE_ARABIC, TILEFINCH_GLYPH_PACK_ARABIC},
+        {BROWSER_GLYPH_LANGUAGE_HEBREW, TILEFINCH_GLYPH_PACK_HEBREW}
+    };
+    for (size_t at = 0;
+         at < sizeof(language_packs) / sizeof(language_packs[0]); at++) {
+        TilefinchGlyphPack pack = TILEFINCH_GLYPH_PACK_COLOR_EMOJI;
+        CHECK(tilefinch_glyph_pack_for_language(
+                  (unsigned) language_packs[at].language, &pack)
+              && pack == language_packs[at].pack);
+    }
+    TilefinchGlyphPack unchanged = TILEFINCH_GLYPH_PACK_COLOR_EMOJI;
+    CHECK(!tilefinch_glyph_pack_for_language(
+              BROWSER_GLYPH_LANGUAGE_EMBEDDED, &unchanged)
+          && unchanged == TILEFINCH_GLYPH_PACK_COLOR_EMOJI
+          && !tilefinch_glyph_pack_for_language(
+              BROWSER_GLYPH_LANGUAGE_COUNT, &unchanged)
+          && !tilefinch_glyph_pack_for_language(UINT_MAX, &unchanged)
+          && !tilefinch_glyph_pack_for_language(
+              BROWSER_GLYPH_LANGUAGE_JAPANESE, NULL));
     return true;
 }
 

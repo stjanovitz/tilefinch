@@ -39,10 +39,12 @@ int main(void)
     navigation.history[5].focus_kind = 2;
     navigation.history[5].focus_index = 4;
 
+    size_t allocations_before_tabs = budget.allocation_count;
     BrowserTabs *tabs = browser_tabs_create(&budget, &navigation);
     CHECK(tabs != NULL
           && browser_tabs_count(tabs) == 1
           && browser_tabs_active_index(tabs) == 0
+          && budget.allocation_count == allocations_before_tabs + 2u
           && browser_tabs_owned_bytes() <= 48u * 1024u);
     const BrowserTabSnapshot *first = browser_tabs_active(tabs);
     CHECK(first != NULL
@@ -53,6 +55,19 @@ int main(void)
           && first->history[3].scroll_y == 73
           && first->history[3].focus_kind == 2
           && first->history[3].focus_index == 4);
+    size_t capture_allocations = budget.allocation_count;
+    size_t capture_bytes = budget.current;
+    budget_inject_failure_after(&budget, 0);
+    CHECK(browser_tabs_capture_active(tabs, &navigation));
+    budget_clear_failure_injection(&budget);
+    CHECK(budget.allocation_count == capture_allocations
+          && budget.current == capture_bytes);
+    char *valid_url = navigation.history[5].url;
+    navigation.history[5].url = "";
+    CHECK(!browser_tabs_capture_active(tabs, &navigation)
+          && strcmp(browser_tabs_active(tabs)->history[3].url,
+                    "https://tabs.test/5") == 0);
+    navigation.history[5].url = valid_url;
     CHECK(strcmp(browser_tabs_active_find_query(tabs), "") == 0
           && browser_tabs_set_active_find_query(tabs, "portable console")
           && strcmp(browser_tabs_active_find_query(tabs),
@@ -87,6 +102,15 @@ int main(void)
     snprintf(
         session_path, sizeof(session_path),
         "/tmp/tilefinch-tabs-session-%ld.bin", (long) getpid());
+    char session_backup[180];
+    char session_temporary[180];
+    snprintf(
+        session_backup, sizeof(session_backup), "%s.bak", session_path);
+    snprintf(
+        session_temporary, sizeof(session_temporary), "%s.tmp", session_path);
+    unlink(session_path);
+    unlink(session_backup);
+    unlink(session_temporary);
     size_t resident_before = browser_tabs_resident_bytes(tabs);
     CHECK(!browser_tabs_hibernate(
               tabs, 1, "/missing/tilefinch/tab.bin")
@@ -112,6 +136,43 @@ int main(void)
           && strcmp(browser_tabs_tab(restored, 1)->history[0].url,
                     "https://example.test/") == 0);
     browser_tabs_destroy(restored);
+
+    /* Every successful publication retains the preceding complete session.
+       Recovery from a sole backup must preserve it across the next save, and
+       recovery from a corrupt primary must retire that primary before it can
+       rotate over the good generation. */
+    CHECK(browser_tabs_set_active_find_query(tabs, "new primary")
+          && browser_tabs_save_session(tabs, session_path, hibernation_path)
+          && access(session_backup, F_OK) == 0
+          && unlink(session_path) == 0);
+    BrowserTabs *backup_restored = browser_tabs_create(&budget, &navigation);
+    CHECK(backup_restored != NULL
+          && browser_tabs_restore_session(backup_restored, session_path)
+          && strcmp(browser_tabs_active_find_query(backup_restored),
+                    "portable console") == 0
+          && access(session_path, F_OK) != 0
+          && browser_tabs_set_active_find_query(
+                 backup_restored, "after backup")
+          && browser_tabs_save_session(
+                 backup_restored, session_path, hibernation_path)
+          && access(session_backup, F_OK) == 0);
+    FILE *corrupt_session = fopen(session_path, "wb");
+    CHECK(corrupt_session != NULL
+          && fwrite("broken", 1, 6, corrupt_session) == 6
+          && fclose(corrupt_session) == 0);
+    BrowserTabs *corrupt_restored = browser_tabs_create(&budget, &navigation);
+    CHECK(corrupt_restored != NULL
+          && browser_tabs_restore_session(corrupt_restored, session_path)
+          && strcmp(browser_tabs_active_find_query(corrupt_restored),
+                    "portable console") == 0
+          && access(session_path, F_OK) != 0
+          && browser_tabs_set_active_find_query(
+                 corrupt_restored, "after corrupt primary")
+          && browser_tabs_save_session(
+                 corrupt_restored, session_path, hibernation_path)
+          && access(session_backup, F_OK) == 0);
+    browser_tabs_destroy(corrupt_restored);
+    browser_tabs_destroy(backup_restored);
     budget_inject_failure_after(&budget, 0);
     CHECK(!browser_tabs_rehydrate(tabs, 1, hibernation_path)
           && browser_tabs_hibernated(tabs, 1));
@@ -190,6 +251,8 @@ int main(void)
     browser_tabs_destroy(tabs);
     unlink(hibernation_path);
     unlink(session_path);
+    unlink(session_backup);
+    unlink(session_temporary);
     navigation_destroy(&navigation);
     CHECK(budget_uninstall_lexbor(&budget));
     CHECK(budget.current == 0

@@ -66,4 +66,24 @@ bool tilefinch_url_upgrade_to_https(const char *value, char *output,
    no registrable domain conservatively retain their canonical host. */
 bool tilefinch_url_site_key(const char *value, char *output, size_t output_size);
 
+/* Whether host[0..host_length) equals domain or is a subdomain of it (the
+   match is preceded by '.'), comparing ASCII case-insensitively. Neither
+   span is trimmed or normalized here. */
+bool tilefinch_host_within(const char *host, size_t host_length,
+                           const char *domain, size_t domain_length);
+
+/* Referrer-Policy tokens. A policy code is 0 for the empty (default) policy
+   and 1 + the token's position in the specification's list otherwise. Codes
+   are stored (module-map entries, computed image styles), so the order is
+   fixed; TILEFINCH_REFERRER_POLICY_COUNT is the highest code. */
+#define TILEFINCH_REFERRER_POLICY_COUNT 8u
+#define TILEFINCH_REFERRER_POLICY_UNKNOWN UINT8_MAX
+/* Lowercase token for a code: "" for 0, NULL past the last code. */
+const char *tilefinch_referrer_policy_name(uint8_t code);
+/* Code of the exact token value[0..length) (0 for an empty span), or
+   TILEFINCH_REFERRER_POLICY_UNKNOWN. fold_case compares ASCII
+   case-insensitively; callers trim whitespace themselves. */
+uint8_t tilefinch_referrer_policy_code(const char *value, size_t length,
+                                       bool fold_case);
+
 #endif

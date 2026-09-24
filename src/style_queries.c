@@ -724,6 +724,9 @@ void style_container_units_for_node(Stylesheet *sheet,
     scratch->container_basis_active = false;
     scratch->container_inline_basis = sheet->viewport_width;
     scratch->container_block_basis = sheet->viewport_height;
+    /* No container has been recorded: every lookup below would miss. */
+    if (scratch->container_states == NULL
+        || scratch->container_state_capacity == 0) return;
     unsigned walked = 0;
     for (lxb_dom_node_t *ancestor = node == NULL ? NULL : node->parent;
          ancestor != NULL && walked++ < STYLE_CONTAINER_WALK_LIMIT;

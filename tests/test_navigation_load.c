@@ -951,7 +951,8 @@ static bool test_cross_origin_image_taints_canvas(void)
         "const cg=copy.getContext('2d');cg.drawImage(c,0,0);"
         "let copied='ok';try{cg.getImageData(0,0,1,1)}catch(e){copied=e.name}"
         "return read+'/'+url+'/'+copied};"
-        "globalThis.pocSummary=probe('same')+'|'+probe('cross')";
+        "globalThis.pocSummary=probe('same')+'|'+probe('cross')+'|'"
+        "+probe('same')+'|'+probe('cross')";
     Budget budget;
     budget_init(&budget, 16 * MIB);
     bool installed = budget_install_lexbor(&budget);
@@ -984,6 +985,7 @@ static bool test_cross_origin_image_taints_canvas(void)
         navigation.page.runtime, probe, "<canvas-taint>", &probe_result);
     bool ok = probed
         && strcmp(probe_result.summary,
+                  "ok/ok/ok|SecurityError/SecurityError/SecurityError|"
                   "ok/ok/ok|SecurityError/SecurityError/SecurityError") == 0;
     if (!ok) {
         fprintf(stderr,
@@ -1505,6 +1507,125 @@ static bool test_web_fonts_begin_after_fallback_layout(void)
         && budget_categories_reconcile(&budget);
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+static lxb_dom_node_t *late_style_node(PocDocument *document)
+{
+    lxb_dom_node_t *node = document_body_node(document);
+    for (node = node == NULL ? NULL : node->first_child; node != NULL;
+         node = node->next) {
+        size_t length = 0;
+        const char *id = document_attribute(node, "id", &length);
+        if (id != NULL && length == 4 && memcmp(id, "late", 4) == 0)
+            return node;
+    }
+    return NULL;
+}
+
+/* A <style> in the body after the preview's stylesheet checkpoint is a pure
+   suffix of the stylesheet inputs. Commit must append it to the preview's
+   sheet rather than rebuild every sheet, and must admit it under the page's
+   own Content-Security-Policy (the parser's document has already moved). */
+static bool run_late_body_style(const char *fixture, const char *url,
+                                const char *user_css,
+                                uint32_t expected_color, bool expected_flex)
+{
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    ProgressivePreviewProbe probe = {0};
+    char path[512], error[256] = {0};
+    snprintf(path, sizeof(path), "%s%s", TILEFINCH_TEST_SOURCE_DIR, fixture);
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && navigation_set_progressive_paint_hook(
+               &navigation, capture_progressive_preview, &probe)
+        && fetch_trace_replay_begin(path, error, sizeof(error));
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation_set_stream_delivery(&navigation, 512, 0, 0, 0, 0, 0);
+        if (user_css != NULL)
+            ready = navigation_set_user_css(
+                &navigation, user_css, strlen(user_css));
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, url, 64 * 1024, 1000, 480,
+        NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 512,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 512,
+        .maximum_parser_time_us = 10000
+    };
+    for (size_t i = 0; load != NULL && i < 256; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        (void) navigation_load_pump(load, &quota);
+    }
+    bool loaded = load != NULL && finish_bounded(load, &quota);
+    lxb_dom_node_t *late = loaded
+        ? late_style_node(&navigation.page.document) : NULL;
+    ComputedStyle style = {0};
+    if (late != NULL)
+        style = style_for_node(&navigation.page.stylesheet, late, NULL);
+    bool late_applied = style.display == DISPLAY_FLEX;
+    bool ok = loaded && late != NULL
+        && navigation.performance.streaming_preview_paints == 1
+        && navigation.performance.blocking_stylesheet_builds == 1
+        && navigation.performance.blocking_stylesheet_commit_continuations
+             == 1
+        && navigation.performance.blocking_stylesheet_adoptions == 1
+        /* The head rule survives the append, the body rule obeys CSP, and
+           user CSS keeps its origin (these match a from-scratch build). */
+        && style.color == expected_color
+        && late_applied == expected_flex;
+    if (!ok) {
+        fprintf(stderr,
+                "late-body-style %s loaded=%d late=%d paints=%zu builds=%zu "
+                "commit-continuations=%zu adoptions=%zu color=%06x "
+                "flex=%d error=\"%s\" replay=\"%s\"\n",
+                fixture, loaded, late != NULL,
+                navigation.performance.streaming_preview_paints,
+                navigation.performance.blocking_stylesheet_builds,
+                navigation.performance
+                    .blocking_stylesheet_commit_continuations,
+                navigation.performance.blocking_stylesheet_adoptions,
+                (unsigned) style.color, late_applied,
+                navigation.last_error, error);
+    }
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_commit_appends_late_body_style(void)
+{
+    /* The device always installs user CSS. It is a separate cascade origin
+       that overrides author normal rules whether or not an author suffix is
+       appended after it; a from-scratch build resolves the same values. */
+    static const char user_css[] = "#late{display:block;color:#654321}";
+    return run_late_body_style(
+               "/fixtures/http-late-body-style",
+               "https://late-style.test/document", NULL, 0x123456u, true)
+        && run_late_body_style(
+               "/fixtures/http-late-body-style",
+               "https://late-style.test/document", user_css, 0x654321u,
+               false)
+        && run_late_body_style(
+               "/fixtures/http-late-body-style-csp",
+               "https://late-style-csp.test/document", NULL, 0x123456u,
+               false);
 }
 
 static bool test_streaming_preview_precedes_eof(void)

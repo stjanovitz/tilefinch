@@ -126,7 +126,12 @@ bool psp_update_session_selected_metadata_url(
 void psp_update_session_refresh_ui(
     PspUpdateSession *update, PspUiState *ui)
 {
-    if (update == NULL || ui == NULL) return;
+    /* Only the Update screen shows these fields, and they share storage
+       with the Options network label and site-security text. Publishing
+       them from any other screen overwrote that text every frame (and made
+       Options re-query the firmware for its label every frame). */
+    if (update == NULL || ui == NULL
+        || ui->screen != PSP_UI_SCREEN_UPDATE) return;
     if (!update->available) {
         psp_ui_set_update(
             ui, TILEFINCH_VERSION_STRING,

@@ -130,10 +130,21 @@ static PspPageMediaProbeStatus psp_media_page_probe(
 {
     if (media == NULL) return PSP_PAGE_MEDIA_PROBE_FAILED;
     if (media->page_media_probe_request != 0) {
-        FetchBackgroundProgress progress = {0};
-        if (!fetch_background_transport_progress(
+        if (media->page_media_probe_scheduler == NULL) {
+            media->page_media_probe_request = 0;
+            snprintf(error, error_size, "page %s probe disappeared",
+                     media->page_audio ? "audio" : "video");
+            return PSP_PAGE_MEDIA_PROBE_FAILED;
+        }
+        (void) fetch_scheduler_pump(
+            media->page_media_probe_scheduler, 1u, 0u);
+        FetchRequestProgress progress = {0};
+        if (!fetch_scheduler_request_progress(
+                media->page_media_probe_scheduler,
                 media->page_media_probe_request, &progress)) {
             media->page_media_probe_request = 0;
+            fetch_scheduler_destroy(media->page_media_probe_scheduler);
+            media->page_media_probe_scheduler = NULL;
             snprintf(error, error_size, "page %s probe disappeared",
                      media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;
@@ -141,16 +152,25 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         if (!progress.complete) return PSP_PAGE_MEDIA_PROBE_PENDING;
         FetchResult *result = fetch_result_create(media->budget);
         if (result == NULL) {
+            uint64_t request = media->page_media_probe_request;
+            media->page_media_probe_request = 0;
+            (void) fetch_scheduler_discard(
+                media->page_media_probe_scheduler, request);
+            fetch_scheduler_destroy(media->page_media_probe_scheduler);
+            media->page_media_probe_scheduler = NULL;
             snprintf(error, error_size, "page %s probe budget",
                      media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;
         }
         uint64_t request = media->page_media_probe_request;
         media->page_media_probe_request = 0;
-        bool fetched = fetch_background_transport_take_fetch_result(
-            request, media->budget, result);
+        bool fetched = false;
+        bool taken = fetch_scheduler_take(
+            media->page_media_probe_scheduler, request, &fetched, result);
+        fetch_scheduler_destroy(media->page_media_probe_scheduler);
+        media->page_media_probe_scheduler = NULL;
         PspPageMediaProbeStatus status = psp_media_page_probe_finish(
-            media, result, fetched, error, error_size);
+            media, result, taken && fetched, error, error_size);
         fetch_result_free(result);
         return status;
     }
@@ -198,15 +218,20 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         return PSP_PAGE_MEDIA_PROBE_FAILED;
     }
     if (fetch_background_transport_available()) {
-        FetchBackgroundEnqueueStatus enqueue_status;
-        media->page_media_probe_request =
-            fetch_background_transport_enqueue_media_diagnosed(
-                media->source, request, 1u, 15000, &enqueue_status);
+        media->page_media_probe_scheduler = fetch_scheduler_create(
+            media->budget, 1u, 1u);
+        bool background_ready = media->page_media_probe_scheduler != NULL
+            && fetch_scheduler_enable_background_transport(
+                   media->page_media_probe_scheduler, true);
+        media->page_media_probe_request = background_ready
+            ? fetch_scheduler_enqueue(
+                  media->page_media_probe_scheduler, media->source,
+                  request, 1u, 15000)
+            : 0;
         budget_free(media->budget, prepared);
         if (media->page_media_probe_request == 0) {
-            if (enqueue_status == FETCH_BACKGROUND_ENQUEUE_SATURATED
-                || enqueue_status == FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED)
-                return PSP_PAGE_MEDIA_PROBE_PENDING;
+            fetch_scheduler_destroy(media->page_media_probe_scheduler);
+            media->page_media_probe_scheduler = NULL;
             snprintf(error, error_size, "page %s transport unavailable",
                      media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;

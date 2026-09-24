@@ -1,4 +1,5 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_power_policy.h"
 #include "tilefinch/youtube_subtitles.h"
 #include "../src/psp_ui_theme.h"
@@ -86,6 +87,44 @@ static bool test_page_activation_activity(void)
     CHECK(psp_ui_set_page_activation(&ui, true)
           && psp_ui_set_page_activation(&ui, false)
           && ui.loading && ui.progress_per_mille == 700);
+    return true;
+}
+
+/* The completion line is a dithered accent ramp: pixel x carries weight
+   x*16/width between the two accent ends, offset by the ordered matrix. */
+static bool test_loading_progress_ramp_pixels(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t pixels[WIDTH * HEIGHT];
+    static const unsigned bayer_row0[4] = {0u, 8u, 2u, 10u};
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.toast_frames = 0;
+    psp_ui_set_loading(&ui, true, 1000);
+    ui.chrome_visible = false;
+    psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
+    const PspUiThemePalette *palette = psp_ui_theme_palette(
+        (BrowserChromeTheme) ui.chrome_theme);
+    uint16_t from = palette->accent, to = palette->accent_high;
+    unsigned fr = tilefinch_rgb565_red_code(from);
+    unsigned fg = tilefinch_rgb565_green_code(from);
+    unsigned fb = tilefinch_rgb565_blue_code(from);
+    unsigned tr = tilefinch_rgb565_red_code(to);
+    unsigned tg = tilefinch_rgb565_green_code(to);
+    unsigned tb = tilefinch_rgb565_blue_code(to);
+    for (unsigned x = 0; x < WIDTH; x++) {
+        unsigned weight = x * 16u / WIDTH;
+        unsigned threshold = bayer_row0[x & 3u];
+        unsigned red = (tr * weight + fr * (16u - weight) + threshold) / 16u;
+        unsigned green =
+            (tg * weight + fg * (16u - weight) + threshold) / 16u;
+        unsigned blue = (tb * weight + fb * (16u - weight) + threshold) / 16u;
+        if (red > 31u) red = 31u;
+        if (green > 63u) green = 63u;
+        if (blue > 31u) blue = 31u;
+        uint16_t expected = tilefinch_rgb565_pack_codes(red, green, blue);
+        CHECK(pixels[2 * WIDTH + x] == expected);
+    }
     return true;
 }
 
@@ -1104,8 +1143,26 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.options_selection == 36);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
+    /* Site data & storage with no site list: the Memory Stick rows, the
+       caches, then the clear-all actions, each clear on its second X. */
     CHECK(ui.screen == PSP_UI_SCREEN_DATA_OPTIONS
-          && ui.data_options_selection == 0);
+          && ui.data_options_selection == 0
+          && intent.action == PSP_UI_ACTION_SHOW_SITE_STORAGE);
+    ui.site_storage_offers = true;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!ui.site_storage_offers
+          && intent.setting.id == PSP_UI_SETTING_SITE_STORAGE_OFFERS
+          && !intent.setting.value.boolean);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.persist_local_storage
+          && intent.setting.id == PSP_UI_SETTING_PERSIST_LOCAL_STORAGE
+          && intent.setting.value.boolean);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.live_cache_kib == 1024
@@ -1118,45 +1175,36 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.persistent_cache_mb == 1
           && intent.setting.id == PSP_UI_SETTING_PERSISTENT_CACHE_MB
           && intent.setting.value.unsigned_value == 1);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.persist_local_storage
-          && intent.setting.id == PSP_UI_SETTING_PERSIST_LOCAL_STORAGE
-          && intent.setting.value.boolean);
-    input.pressed = PSP_UI_BUTTON_DOWN;
+    static const struct { uint8_t confirmation; size_t which; } clears[] = {
+        {5, 0}, {6, 1}, {7, 2}, {8, 3}
+    };
+    for (size_t at = 0; at < 4; at++) {
+        input.pressed = PSP_UI_BUTTON_DOWN;
+        (void) psp_ui_update(&ui, &input);
+        input.pressed = PSP_UI_BUTTON_CONFIRM;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(!intent.clear_cache_requested
+              && !intent.clear_cookies_requested
+              && !intent.clear_local_storage_requested
+              && !intent.clear_session_storage_requested
+              && ui.data_clear_confirmation == clears[at].confirmation);
+        intent = psp_ui_update(&ui, &input);
+        bool requested[4] = {
+            intent.clear_cache_requested, intent.clear_cookies_requested,
+            intent.clear_local_storage_requested,
+            intent.clear_session_storage_requested
+        };
+        for (size_t other = 0; other < 4; other++)
+            CHECK(requested[other] == (other == clears[at].which));
+    }
+    /* L/R jumps between sections. */
+    input.pressed = PSP_UI_BUTTON_PAGE_UP;
     (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(!intent.clear_cache_requested
-          && ui.data_clear_confirmation == 4);
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.clear_cache_requested);
-    input.pressed = PSP_UI_BUTTON_DOWN;
+    CHECK(ui.data_options_selection == 4);
     (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(!intent.clear_cookies_requested
-          && ui.data_clear_confirmation == 5);
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.clear_cookies_requested);
-    input.pressed = PSP_UI_BUTTON_DOWN;
+    CHECK(ui.data_options_selection == 2);
     (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(!intent.clear_local_storage_requested
-          && ui.data_clear_confirmation == 6);
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.clear_local_storage_requested);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(!intent.clear_session_storage_requested
-          && ui.data_clear_confirmation == 7);
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.clear_session_storage_requested);
+    CHECK(ui.data_options_selection == 0);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
@@ -1321,21 +1369,35 @@ static bool test_site_information_actions_are_scoped_and_confirmed(void)
     CHECK(intent.action == PSP_UI_ACTION_NONE
           && ui.screen == PSP_UI_SCREEN_PAGE_INFORMATION);
 
+    /* Site storage opens the storage list for this site, and Circle comes
+       back here rather than to Settings. */
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_SHOW_SITE_STORAGE
+          && ui.screen == PSP_UI_SCREEN_DATA_OPTIONS
+          && ui.site_storage_from_site_info);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE_INFORMATION
+          && ui.menu_selection == 1u && !ui.site_storage_from_site_info);
+
     /* Both destructive operations require a second X on the same row. */
-    ui.menu_selection = 1u;
+    ui.menu_selection = 2u;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!intent.clear_site_data_requested
-          && ui.data_clear_confirmation == 2u);
+          && ui.data_clear_confirmation == 3u);
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.clear_site_data_requested
           && !intent.reset_site_permissions_requested
           && ui.data_clear_confirmation == 0u);
 
-    ui.menu_selection = 2u;
+    ui.menu_selection = 3u;
     intent = psp_ui_update(&ui, &input);
     CHECK(!intent.reset_site_permissions_requested
-          && ui.data_clear_confirmation == 3u);
+          && ui.data_clear_confirmation == 4u);
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.reset_site_permissions_requested
           && !intent.clear_site_data_requested
@@ -2147,7 +2209,8 @@ static bool test_panels_draw_the_token_ground(void)
         PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS, PSP_UI_SCREEN_GLYPH_OPTIONS,
         PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS,
         PSP_UI_SCREEN_TABS,
-        PSP_UI_SCREEN_UPDATE, PSP_UI_SCREEN_UPDATE_VERSIONS
+        PSP_UI_SCREEN_UPDATE, PSP_UI_SCREEN_UPDATE_VERSIONS,
+        PSP_UI_SCREEN_STORAGE_SITE, PSP_UI_SCREEN_STORAGE_OFFER
     };
     static const unsigned themes[] = {
         BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
@@ -2188,6 +2251,203 @@ static bool test_panels_draw_the_token_ground(void)
     return true;
 }
 
+static PspUiIntent site_storage_press(PspUiState *ui, uint32_t button)
+{
+    PspUiInput input = {
+        .pressed = button, .analog_x = 128, .analog_y = 128
+    };
+    return psp_ui_update(ui, &input);
+}
+
+/* Exit to XMB takes a second X; nothing else, and no later visit, can
+   complete a half-confirmed exit. */
+static bool test_exit_needs_a_second_press(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.base_screen = PSP_UI_SCREEN_PAGE;
+    PspUiIntent intent = site_storage_press(&ui, PSP_UI_BUTTON_MENU);
+    CHECK(ui.screen == PSP_UI_SCREEN_MENU);
+    ui.menu_selection = 0u;
+    site_storage_press(&ui, PSP_UI_BUTTON_UP);   /* wraps onto Exit */
+    CHECK(ui.menu_selection == PSP_UI_MENU_ITEM_COUNT - 1u);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_NONE
+          && ui.screen == PSP_UI_SCREEN_MENU);
+    /* Moving away and back disarms it. */
+    site_storage_press(&ui, PSP_UI_BUTTON_UP);
+    site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_NONE);
+    /* Closing the menu disarms it too. */
+    site_storage_press(&ui, PSP_UI_BUTTON_CANCEL);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE);
+    site_storage_press(&ui, PSP_UI_BUTTON_MENU);
+    CHECK(ui.menu_selection == PSP_UI_MENU_ITEM_COUNT - 1u);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_NONE);
+    /* Releasing X between the presses keeps it armed. */
+    CHECK(site_storage_press(&ui, 0u).action == PSP_UI_ACTION_NONE
+          && ui.data_clear_confirmation != 0u);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_EXIT);
+    return true;
+}
+
+/* A permission row that cannot change says why instead of doing nothing. */
+static bool test_unavailable_permission_rows_explain(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "Page", "https://news.example/", true);
+    ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
+    ui.javascript_enabled = false;
+    ui.content_blocker_mode = CONTENT_BLOCKER_OFF;
+    ui.menu_selection = 0u;
+    ui.toast_frames = 0u;
+    PspUiIntent intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_NONE && ui.toast_frames != 0
+          && strstr(ui.status, "JAVASCRIPT IS OFF") != NULL);
+    ui.menu_selection = 1u;
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_NONE
+          && strstr(ui.status, "CONTENT BLOCKER IS OFF") != NULL);
+    psp_ui_set_page(&ui, "Blank", "about:blank", false);
+    ui.menu_selection = 2u;
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_NONE
+          && strstr(ui.status, "NOT AVAILABLE") != NULL);
+    return true;
+}
+
+static bool test_site_storage_screens(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "Game", "https://game.test/", true);
+
+    /* The offer: X keeps the site on the stick for this session, Triangle
+       always, O declines; each closes the prompt back to the page. */
+    static const struct {
+        uint32_t button;
+        PspUiAction action;
+    } answers[] = {
+        {PSP_UI_BUTTON_CONFIRM, PSP_UI_ACTION_STORAGE_OFFER_SESSION},
+        {PSP_UI_BUTTON_TOOLBAR, PSP_UI_ACTION_STORAGE_OFFER_ALWAYS},
+        {PSP_UI_BUTTON_CANCEL, PSP_UI_ACTION_STORAGE_OFFER_DECLINE},
+        /* Leaving through the menu is a no, never an unanswered offer. */
+        {PSP_UI_BUTTON_MENU, PSP_UI_ACTION_STORAGE_OFFER_DECLINE}
+    };
+    for (size_t at = 0; at < sizeof(answers) / sizeof(answers[0]); at++) {
+        psp_ui_show_storage_offer(&ui, "https://game.test", 33u * 1024u,
+                                  75u * 1024u, 4u * 1024u * 1024u, true,
+                                  UINT64_C(1288490188));
+        CHECK(ui.screen == PSP_UI_SCREEN_STORAGE_OFFER
+              && strcmp(ui.storage_offer_origin, "https://game.test") == 0
+              && ui.storage_offer_needed == 75u * 1024u);
+        psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+        /* It can open mid-game: presses in the arming window, the Menu
+           button included, are ignored. */
+        for (unsigned tick = 0; tick < PSP_UI_STORAGE_OFFER_ARMING_FRAMES;
+             tick++) {
+            CHECK(site_storage_press(&ui, answers[at].button).action
+                      == PSP_UI_ACTION_NONE
+                  && ui.screen == PSP_UI_SCREEN_STORAGE_OFFER);
+        }
+        /* Directions do not answer. */
+        CHECK(site_storage_press(&ui, PSP_UI_BUTTON_DOWN).action
+                  == PSP_UI_ACTION_NONE
+              && ui.screen == PSP_UI_SCREEN_STORAGE_OFFER);
+        PspUiIntent intent = site_storage_press(&ui, answers[at].button);
+        CHECK(intent.action == answers[at].action
+              && ui.screen != PSP_UI_SCREEN_STORAGE_OFFER);
+        ui.screen = PSP_UI_SCREEN_PAGE;
+    }
+
+    /* The list: sites first. Left/Right change a site's choice in place;
+       X opens its panel, where Delete takes a second X. */
+    PspUiSiteStorageView view = {.count = 2};
+    snprintf(view.stick_free, sizeof(view.stick_free), "1.2 GB free");
+    snprintf(view.rows[0].origin, sizeof(view.rows[0].origin), "game.test");
+    snprintf(view.rows[0].detail, sizeof(view.rows[0].detail),
+             "1.4 MB  Always");
+    view.rows[0].state = BROWSER_SITE_STORAGE_STICK;
+    snprintf(view.rows[1].origin, sizeof(view.rows[1].origin), "news.test");
+    snprintf(view.rows[1].detail, sizeof(view.rows[1].detail), "32 KB  RAM");
+    view.rows[1].state = 3;   /* this session */
+    ui.screen = PSP_UI_SCREEN_DATA_OPTIONS;
+    ui.site_storage = NULL;
+    psp_ui_set_site_storage(&ui, &view);
+    ui.data_options_selection = 1;
+    ui.data_clear_confirmation = 0;
+    ui.site_storage_offers = true;
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    PspUiIntent intent = site_storage_press(&ui, PSP_UI_BUTTON_RIGHT);
+    CHECK(intent.setting.id == PSP_UI_SETTING_SITE_STORAGE_LISTED
+          && intent.list_index == 1
+          && intent.setting.value.unsigned_value
+                 == BROWSER_SITE_STORAGE_STICK);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_LEFT);
+    CHECK(intent.setting.value.unsigned_value == BROWSER_SITE_STORAGE_ASK);
+    /* After the sites comes the offer switch. */
+    site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_SITE_STORAGE_OFFERS
+          && !ui.site_storage_offers);
+    site_storage_press(&ui, PSP_UI_BUTTON_UP);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(ui.screen == PSP_UI_SCREEN_STORAGE_SITE
+          && intent.action == PSP_UI_ACTION_NONE
+          && ui.data_options_selection == 1);
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_SITE_STORAGE_LISTED
+          && intent.list_index == 1
+          && intent.setting.value.unsigned_value
+                 == BROWSER_SITE_STORAGE_STICK);
+    site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_NONE
+          && ui.data_clear_confirmation == 2);
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    site_storage_press(&ui, PSP_UI_BUTTON_CANCEL);
+    CHECK(ui.screen == PSP_UI_SCREEN_STORAGE_SITE
+          && ui.data_clear_confirmation == 1);
+    site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_SITE_STORAGE_DELETE
+          && intent.list_index == 1
+          && ui.screen == PSP_UI_SCREEN_DATA_OPTIONS);
+    /* Wrapping stays inside the rows that exist: 2 sites + 8 fixed. */
+    ui.data_options_selection = 9;
+    site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+    CHECK(ui.data_options_selection == 0);
+    site_storage_press(&ui, PSP_UI_BUTTON_CANCEL);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS && ui.site_storage == NULL);
+
+    /* The per-site row cycles Ask -> Memory Stick -> RAM only -> Ask, and a
+       this-session grant steps to Memory Stick. */
+    static const unsigned expected[] = {
+        BROWSER_SITE_STORAGE_STICK, BROWSER_SITE_STORAGE_MEMORY_ONLY,
+        BROWSER_SITE_STORAGE_ASK
+    };
+    ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
+    ui.menu_selection = 6;
+    ui.site_storage_state = BROWSER_SITE_STORAGE_ASK;
+    for (size_t at = 0; at < 3; at++) {
+        intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+        CHECK(intent.setting.id == PSP_UI_SETTING_SITE_STORAGE_SITE
+              && intent.setting.value.unsigned_value == expected[at]);
+    }
+    ui.site_storage_state = 3;
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.value.unsigned_value == BROWSER_SITE_STORAGE_STICK);
+    return true;
+}
+
 static bool test_page_tools_windows_last_row_above_hint(void)
 {
     enum { WIDTH = 480, HEIGHT = 272 };
@@ -2210,8 +2470,10 @@ static bool test_page_tools_windows_last_row_above_hint(void)
     const PspUiThemePalette *palette =
         psp_ui_theme_palette(BROWSER_CHROME_THEME_FINCH);
     CHECK(palette != NULL);
-    /* The selected last row is windowed into physical row seven. */
-    CHECK(frame[(size_t) 217u * WIDTH + 400u] == palette->accent);
+    /* The selected last row is windowed into physical row seven, and its
+       pill stops short of the scroll-arrow gutter. */
+    CHECK(frame[(size_t) 217u * WIDTH + 300u] == palette->accent
+          && frame[(size_t) 217u * WIDTH + 405u] != palette->accent);
     /* The fixed hint bar remains unobscured by that selection. */
     CHECK(frame[(size_t) 246u * WIDTH + 400u] == palette->hint_bar);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
@@ -2618,6 +2880,39 @@ static bool test_large_toast_uses_full_psp_width(void)
     psp_ui_clear_chrome_font();
     font_set_destroy(&fonts);
     CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
+    return true;
+}
+
+/* A page toast (the loading hint) waits under a menu opened over it; a
+   toast raised in the menu shows there; back on the page the page toast
+   returns. */
+static bool test_page_toast_waits_under_menu(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t menu_plain[WIDTH * HEIGHT];
+    static uint16_t menu_page_toast[WIDTH * HEIGHT];
+    static uint16_t menu_own_toast[WIDTH * HEIGHT];
+    static uint16_t page_plain[WIDTH * HEIGHT];
+    static uint16_t page_toast[WIDTH * HEIGHT];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.toast_frames = 0;
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    psp_ui_composite(&ui, page_plain, WIDTH, HEIGHT, WIDTH);
+    ui.screen = PSP_UI_SCREEN_MENU;
+    psp_ui_composite(&ui, menu_plain, WIDTH, HEIGHT, WIDTH);
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    psp_ui_show_status(&ui, "LOADING - CIRCLE CANCELS", 120);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, page_toast, WIDTH, HEIGHT, WIDTH);
+    ui.screen = PSP_UI_SCREEN_MENU;
+    psp_ui_composite(&ui, menu_page_toast, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(page_plain, page_toast, sizeof(page_plain)) != 0);
+    CHECK(memcmp(menu_plain, menu_page_toast, sizeof(menu_plain)) == 0);
+    psp_ui_show_status(&ui, "BOOKMARK SAVED", 120);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, menu_own_toast, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(menu_plain, menu_own_toast, sizeof(menu_plain)) != 0);
     return true;
 }
 
@@ -5112,6 +5407,93 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
     return true;
 }
 
+/* Media title glyphs the chrome faces cannot serve come from the title
+   face; they are retained, so presenting the same title again allocates
+   nothing, and changing the title face drops them. */
+static bool test_media_title_glyphs_are_retained(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint32_t video[WIDTH * HEIGHT];
+    static uint16_t scratch[WIDTH * HEIGHT];
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 1024u * 1024u));
+    /* No chrome faces bound: every title glyph takes the title face. */
+    psp_ui_clear_chrome_font();
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation = {0};
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set_title_font(&media, font_set_face(&fonts, FONT_SANS));
+    psp_ui_media_set(&media, true, true, false, UINT64_C(5000000),
+                     UINT64_C(20000000), "Retained title glyphs");
+    psp_ui_media_show_controls(&media);
+    size_t before_glyphs = budget.current;
+    psp_ui_media_composite_8888(
+        &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+    size_t after_first = budget.allocation_count;
+    CHECK(budget.current > before_glyphs);
+    psp_ui_media_composite_8888(
+        &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+    CHECK(budget.allocation_count == after_first);
+    psp_ui_media_set_title_font(&media, NULL);
+    CHECK(budget.current == before_glyphs);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    return true;
+}
+
+static bool test_status_sentence_case_keeps_acronyms(void)
+{
+    static const struct { const char *in, *out; } cases[] = {
+        { "RAM STORAGE SAVED AT EXIT", "RAM storage saved at exit" },
+        { "PRESS X TO CHECK FOR UPDATES", "Press X to check for updates" },
+        { "GAME BUTTONS - O IS PRIMARY", "Game buttons - O is primary" },
+        { "ENTER A PUBLIC HTTPS URL", "Enter a public HTTPS URL" },
+        { "WI-FI SIGN-IN  O CANCEL", "Wi-Fi sign-in  O cancel" },
+        { "L/R SECTION   O BACK", "L/R section   O back" },
+        { "TLS TICKET SAVING ON", "TLS ticket saving on" },
+        { "A PAGE IS LOADING", "A page is loading" },
+        { "LOGGING ON - TILEFINCH/DATA", "Logging on - tilefinch/data" },
+        { "Already Sentence Case", "Already Sentence Case" },
+    };
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        char text[64];
+        snprintf(text, sizeof(text), "%s", cases[at].in);
+        psp_ui_status_sentence_case(text);
+        if (strcmp(text, cases[at].out) != 0) {
+            fprintf(stderr, "sentence case: \"%s\" -> \"%s\"\n",
+                    cases[at].in, text);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A pump that re-asserts its status every frame must let the toast settle:
+   the entry motion plays once, and the toast stays up while re-asserted. */
+static bool test_kept_status_settles(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_keep_status(&ui, "SAVING VIDEO  O PAUSE", 120);
+    CHECK(ui.toast_entry_frames != 0 && ui.toast_frames == 120);
+    PspUiInput idle = { .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
+    for (unsigned frame = 0; frame < 30; frame++) {
+        psp_ui_keep_status(&ui, "SAVING VIDEO  O PAUSE", 120);
+        (void) psp_ui_update(&ui, &idle);
+    }
+    CHECK(ui.toast_entry_frames == 0 && ui.toast_frames > 60);
+    /* New text still announces itself. */
+    psp_ui_keep_status(&ui, "DOWNLOAD PAUSED", 120);
+    CHECK(ui.toast_entry_frames != 0
+          && strcmp(ui.status, "DOWNLOAD PAUSED") == 0);
+    return true;
+}
+
 /* The chrome glyph cache is shared with the callback-thread supervisor, so
    it must not be rebuilt for a binding that changes nothing, and a glyph the
    Budget refused under pressure must come back once pressure passes while a
@@ -5176,6 +5558,7 @@ int main(void)
         || !test_wifi_status_bars()
         || !test_legacy_collection_url_classification()
         || !test_native_home_url_classification()
+        || !test_status_sentence_case_keeps_acronyms()
         || !test_tab_placeholder_draws_one_letter()
         || !test_analog_cursor_and_drag()
         || !test_autohide_and_loading()
@@ -5185,11 +5568,15 @@ int main(void)
         || !test_theme_catalog_is_bounded_sorted_and_selectable()
         || !test_panels_draw_the_token_ground()
         || !test_page_tools_windows_last_row_above_hint()
+        || !test_site_storage_screens()
+        || !test_exit_needs_a_second_press()
+        || !test_unavailable_permission_rows_explain()
         || !test_page_chrome_holds_its_edge_over_a_light_page()
         || !test_boot_entrance_becomes_home()
         || !test_cursor_fades_in_and_out()
         || !test_composite_keeps_guards()
         || !test_large_toast_uses_full_psp_width()
+        || !test_page_toast_waits_under_menu()
         || !test_options_hide_page_loading_indicator()
         || !test_opaque_chrome_rows_match_visible_surface()
         || !test_startup_views_are_bounded_and_distinct()
@@ -5211,6 +5598,9 @@ int main(void)
         || !test_media_first_frame_transition_keeps_bottom_ground_stable()
         || !test_media_committed_seek_keeps_timeline_stable()
         || !test_chrome_font_cache_binding_and_refusals()
+        || !test_kept_status_settles()
+        || !test_media_title_glyphs_are_retained()
+        || !test_loading_progress_ramp_pixels()
         || !test_native_surfaces_own_the_panel()
         || !test_home_traversal_and_activation()
         || !test_implicit_cursor_handoff()

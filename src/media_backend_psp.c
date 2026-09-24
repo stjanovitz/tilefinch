@@ -1934,28 +1934,7 @@ static void psp_media_error(char *error, size_t error_size,
 
 static uint64_t psp_media_timestamp_us(uint64_t value, uint32_t timescale)
 {
-    if (timescale == 0) return 0;
-    uint32_t scale_remainder = UINT32_C(1000000) % timescale;
-    if (value <= UINT32_MAX
-        && (uint64_t) (timescale - 1u) * scale_remainder
-               <= UINT32_MAX) {
-        uint32_t small = (uint32_t) value;
-        uint32_t whole = small / timescale;
-        uint32_t remainder = small % timescale;
-        uint32_t scale_whole = UINT32_C(1000000) / timescale;
-        return (uint64_t) whole * UINT32_C(1000000)
-             + (uint64_t) remainder * scale_whole
-             + (remainder * scale_remainder) / timescale;
-    }
-    uint64_t whole = value / timescale;
-    uint64_t remainder = value % timescale;
-    if (whole > UINT64_MAX / UINT64_C(1000000))
-        return UINT64_MAX;
-    uint64_t base = whole * UINT64_C(1000000);
-    uint64_t fraction =
-        remainder * UINT64_C(1000000) / timescale;
-    return fraction > UINT64_MAX - base
-        ? UINT64_MAX : base + fraction;
+    return timescale == 0 ? 0 : media_ticks_to_us(value, timescale);
 }
 
 static uint64_t psp_sample_pts_us(const MediaMp4Sample *sample)

@@ -5,6 +5,7 @@
 #include "js_runtime_internal.h"
 
 #include "tilefinch/platform.h"
+#include "tilefinch/url.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -238,26 +239,12 @@ bool js_rt_runtime_module_root_state_set(
 uint8_t js_rt_runtime_module_referrer_policy_code(const char *policy)
 {
     if (policy == NULL) return UINT8_MAX;
-    if (policy[0] == '\0') return 0;
-    static const char *known[] = {
-        "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (strcmp(policy, known[i]) == 0) return (uint8_t) (i + 1u);
-    }
-    return UINT8_MAX;
+    return tilefinch_referrer_policy_code(policy, strlen(policy), false);
 }
 
 const char *js_rt_runtime_module_referrer_policy_text(uint8_t code)
 {
-    static const char *known[] = {
-        "", "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    return code < sizeof(known) / sizeof(known[0]) ? known[code] : NULL;
+    return tilefinch_referrer_policy_name(code);
 }
 
 static bool runtime_module_referrer_policy_valid(const char *policy)
@@ -955,34 +942,6 @@ bool js_rt_preflight_external_classic_segment(
         runtime, script_node, "error", NULL);
     runtime->promise_rejection_state.active_source = previous_source;
     return false;
-}
-
-bool script_runtime_evaluate_external_module(
-    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
-    const char *source, size_t source_length, const char *request_url,
-    const char *response_url, ScriptResult *result)
-{
-    return script_runtime_evaluate_external_module_credentials(
-        runtime, script_node, source, source_length, request_url,
-        response_url, TILEFINCH_CREDENTIALS_SAME_ORIGIN, result);
-}
-
-bool script_runtime_evaluate_external_module_credentials(
-    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
-    const char *source, size_t source_length, const char *request_url,
-    const char *response_url, TilefinchCredentialsMode credentials,
-    ScriptResult *result)
-{
-    char effective_referrer_policy[BROWSER_MODULE_REFERRER_POLICY_LIMIT] = {0};
-    if (runtime != NULL) {
-        js_rt_module_referrer_policy_for_node(
-            script_node, runtime->bridge.referrer_policy,
-            effective_referrer_policy);
-    }
-    return script_runtime_evaluate_external_module_context(
-        runtime, script_node, source, source_length, request_url,
-        response_url, runtime == NULL ? NULL : effective_referrer_policy,
-        credentials, result);
 }
 
 bool script_runtime_evaluate_external_module_context(

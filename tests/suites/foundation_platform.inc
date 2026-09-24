@@ -359,6 +359,29 @@ static bool test_youtube_player_response_parser(void)
         || stream.duration_ms != 18950 || stream.content_length != 2000
         || stream.bitrate != 200) return false;
 
+    /* Keys are found by their decoded spelling: an escaped key still
+       matches, and key text inside another string's escaped quotes does
+       not. */
+    static const char escaped_keys[] =
+        "{\"note\":\"see \\\"streamingData\\\":{\\\"formats\\\":[]}\","
+        "\"\\u0070layabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"formats\":["
+        "{\"contentLength\":\"2000\",\"bitrate\":200,\"itag\":18,"
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, "
+        "mp4a.40.2\\\"\",\"url\":\"https://rr2.googlevideo.com/escaped.mp4\","
+        "\"approxDurationMs\":\"18950\",\"height\":240,\"width\":320}]}}";
+    if (!youtube_parse_player_response(
+            escaped_keys, strlen(escaped_keys), "TFTEST00002", 360,
+            &stream, error, sizeof(error))) {
+        fprintf(stderr, "youtube escaped keys: %s\n", error);
+        return false;
+    }
+    if (strcmp(stream.media_url,
+               "https://rr2.googlevideo.com/escaped.mp4") != 0) {
+        fprintf(stderr, "youtube escaped keys url: %s\n", stream.media_url);
+        return false;
+    }
+
     static const char adaptive[] =
         "{\"playabilityStatus\":{\"status\":\"OK\"},"
         "\"videoDetails\":{\"title\":\"Fixture artist (테스트)\"},"

@@ -1,6 +1,7 @@
 #include "tilefinch/session.h"
 #include "tilefinch/content_security_policy.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/script_loader.h"
 #include "tilefinch/url.h"
 
 #include <stdio.h>
@@ -270,6 +271,53 @@ static int test_redacted_cookie_seed(Budget *budget)
     CHECK(sequences[1] && sequences[2] && sequences[3] && sequences[4]);
     browser_session_destroy(&rollover);
     CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* Parser-inserted and dynamic module loads both record responses through
+   script_module_cache_record(); what it stores must satisfy the module-map
+   match with the response's cache policy and Referrer-Policy. */
+static int test_module_cache_record_from_fetch(void)
+{
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 16u * 1024u));
+    static char source[] = "export const value = 1;";
+    static const char headers[] =
+        "cache-control: max-age=60\nreferrer-policy: origin\n";
+    FetchResult fetch = {0};
+    fetch.data = source;
+    fetch.length = sizeof(source) - 1u;
+    fetch.status_code = 200;
+    snprintf(fetch.content_type, sizeof(fetch.content_type),
+             "text/javascript");
+    memcpy(fetch.response_headers, headers, sizeof(headers) - 1u);
+    fetch.response_headers_length = sizeof(headers) - 1u;
+    const char *url = "https://cdn.test/module.js";
+    const char *origin = "https://document.test";
+    const char *top = "https://document.test/page";
+
+    FetchResult empty = fetch;
+    empty.length = 0;
+    CHECK(!script_module_cache_record(
+        &session, url, url, origin, top, false,
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, &empty, false, 10));
+    CHECK(script_module_cache_record(
+        &session, url, url, origin, top, false,
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, &fetch, false, 10));
+    const BrowserCacheEntry *entry = NULL;
+    CHECK(browser_session_cache_match_module(
+        &session, url, origin, top, false,
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, 11, &entry) == BROWSER_CACHE_FRESH
+          && entry != NULL
+          && entry->module_javascript_mime_validated
+          && strcmp(entry->module_response_referrer_policy, "origin") == 0);
+    CHECK(script_module_cache_record(
+        &session, url, url, origin, top, false,
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, &fetch, true, 20));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
     return 0;
 }
 
@@ -1608,22 +1656,22 @@ static int test_bounded_origin_private_file_system(Budget *budget)
     CHECK(browser_session_init(&session, budget, 32u * 1024u));
     size_t initialized = budget->current;
     BrowserOpfsView view = {0};
-    CHECK(session.opfs == NULL
+    CHECK(session.site_store == NULL
           && browser_session_opfs_stat(
                  &session, "https://files.test/page", "/", &view)
                  == BROWSER_OPFS_OK
           && view.kind == BROWSER_OPFS_DIRECTORY
-          && session.opfs == NULL && budget->current == initialized);
+          && session.site_store == NULL && budget->current == initialized);
     budget_inject_failure_after(budget, 0);
     CHECK(browser_session_opfs_create(
               &session, "https://files.test/page", "/refused",
               BROWSER_OPFS_FILE) == BROWSER_OPFS_QUOTA_EXCEEDED
-          && session.opfs == NULL && budget->current == initialized);
+          && session.site_store == NULL && budget->current == initialized);
     budget_clear_failure_injection(budget);
     CHECK(browser_session_opfs_create(
               &session, "https://files.test/page", "/saves",
               BROWSER_OPFS_DIRECTORY) == BROWSER_OPFS_OK
-          && session.opfs != NULL
+          && session.site_store != NULL
           && browser_session_opfs_create(
                  &session, "https://files.test/page", "/saves/state.bin",
                  BROWSER_OPFS_FILE) == BROWSER_OPFS_OK);
@@ -1702,7 +1750,7 @@ static int test_bounded_origin_private_file_system(Budget *budget)
               &session, "https://files.test/", "/session.bin",
               BROWSER_OPFS_FILE) == BROWSER_OPFS_OK);
     browser_session_opfs_clear_all(&session);
-    CHECK(session.opfs == NULL && session.opfs_bytes == 0
+    CHECK(session.site_store == NULL
           && browser_session_opfs_stat(
                  &session, "https://files.test/", "/session.bin", &view)
                  == BROWSER_OPFS_NOT_FOUND);
@@ -1744,6 +1792,7 @@ int main(void)
     CHECK(test_resource_cache_partitioning(&budget) == 0);
     CHECK(test_stylesheet_cache_signature_tracks_ram_authority(&budget) == 0);
     CHECK(test_module_cache_provenance() == 0);
+    CHECK(test_module_cache_record_from_fetch() == 0);
     CHECK(test_response_cache_provenance() == 0);
     CHECK(test_typed_response_security_and_request_authority(&budget) == 0);
     CHECK(test_websocket_policy_and_close_payload(&budget) == 0);
@@ -1753,8 +1802,7 @@ int main(void)
     CHECK(browser_session_init(
         &expiry_session, &budget, 32u * 1024u)
           && expiry_session.accounting_bytes
-                 == sizeof(expiry_session.storage)
-                    + sizeof(expiry_session.cookies)
+                 == sizeof(expiry_session.cookies)
                     + sizeof(expiry_session.cache)
                     + sizeof(expiry_session.site_adapter_state)
                     + sizeof(expiry_session.site_adapter_document_cache)
