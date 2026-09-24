@@ -32,6 +32,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_failed_visible_image_retries_after_first_paint);
     RUN_TEST(test_web_fonts_begin_after_fallback_layout);
     RUN_TEST(test_streaming_preview_precedes_eof);
+    RUN_TEST(test_commit_appends_late_body_style);
     RUN_TEST(test_parser_checkpoint_refusals_preserve_server_dom);
     RUN_TEST(test_parser_script_stage_circuit_preserves_actions);
     RUN_TEST(test_parser_transport_failures_do_not_retire_realm);
@@ -56,6 +57,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_candidate_cancel_preserves_late_incumbent_dom);
     RUN_TEST(test_bounded_finalize_preserves_history_pruning);
     RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
+    RUN_TEST(test_provisional_relayout_completes_in_idle_work);
     RUN_TEST(test_candidate_hook_set_is_transactional);
     RUN_TEST(test_script_oom_retains_usable_target);
     RUN_TEST(test_late_script_oom_reveals_staged_page_shell);

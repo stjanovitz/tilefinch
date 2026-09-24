@@ -171,13 +171,74 @@ bool tilefinch_platform_present_rgb565(const uint16_t *pixels, size_t width,
         installed_services.context, pixels, width, height, stride_pixels);
 }
 
+void tilefinch_platform_retire_frame(const uint16_t *pixels)
+{
+    if (pixels == NULL || installed_services.retire_frame == NULL) return;
+    installed_services.retire_frame(installed_services.context, pixels);
+}
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Stall attribution for validation logs: the steps named since the last
+   checkpoint, reported when the gap to the next one is visible. Engine
+   thread only, like the checkpoints themselves. */
+#define STALL_STEP_LIMIT 12u
+static struct {
+    const char *label;
+    uint64_t at_us;
+} stall_steps[STALL_STEP_LIMIT];
+static size_t stall_step_count;
+static uint64_t stall_window_started_us;
+
+static void stall_steps_report(const char *phase, uint64_t now_us)
+{
+    uint64_t gap = now_us - stall_window_started_us;
+    if (stall_window_started_us == 0 || stall_step_count == 0
+        || gap < UINT64_C(100000)) return;
+    char message[512];
+    int used = snprintf(message, sizeof(message),
+                        "tilefinch-stall-steps: gap=%lluus to=%s",
+                        (unsigned long long) gap, phase);
+    for (size_t i = 0; i < stall_step_count && used > 0
+                       && (size_t) used < sizeof(message); i++) {
+        uint64_t end = i + 1 < stall_step_count
+            ? stall_steps[i + 1].at_us : now_us;
+        used += snprintf(message + used, sizeof(message) - (size_t) used,
+                         " %s=%llums", stall_steps[i].label,
+                         (unsigned long long)
+                             ((end - stall_steps[i].at_us) / 1000u));
+    }
+    tilefinch_platform_log_message(message);
+}
+#endif
+
+void tilefinch_platform_trace_step(const char *label)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (label == NULL || stall_step_count == STALL_STEP_LIMIT) return;
+    stall_steps[stall_step_count].label = label;
+    stall_steps[stall_step_count].at_us =
+        tilefinch_platform_monotonic_time_us();
+    stall_step_count++;
+#else
+    (void) label;
+#endif
+}
+
 bool tilefinch_platform_cooperate(const char *phase,
                                size_t completed_work_units)
 {
-    if (installed_services.cooperate == NULL) return true;
-    return installed_services.cooperate(
-        installed_services.context, phase == NULL ? "engine" : phase,
-        completed_work_units);
+    if (phase == NULL) phase = "engine";
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    stall_steps_report(phase, tilefinch_platform_monotonic_time_us());
+    stall_step_count = 0;
+#endif
+    bool result = installed_services.cooperate == NULL
+        || installed_services.cooperate(
+               installed_services.context, phase, completed_work_units);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    stall_window_started_us = tilefinch_platform_monotonic_time_us();
+#endif
+    return result;
 }
 
 void tilefinch_platform_log_message(const char *message)

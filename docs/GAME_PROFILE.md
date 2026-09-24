@@ -245,10 +245,14 @@ readback are outside v1.
 
 ### Storage
 
-`localStorage` and `sessionStorage` share 64 bounded entries and 16 KiB of value
-storage in the browser session. Persistent `localStorage` is a user preference,
-not an author guarantee; games must tolerate a fresh store. Use compact strings
-for settings, unlocked levels, and scores. Do not serialize per-frame state.
+Each origin's `localStorage`, `sessionStorage`, and OPFS share a RAM allowance
+that starts at 32 KiB and grows to at most 512 KiB while the device has memory
+to spare. A write past it throws `QuotaExceededError`; the user may then move
+the site to the Memory Stick (up to 4 MB), after which a retry succeeds.
+Persistent storage is the user's choice, not an author guarantee; games must
+tolerate a fresh store and a failed write. Use compact strings for settings,
+unlocked levels, and scores. Do not serialize per-frame state, and batch
+writes: on the Memory Stick every write appends to a log.
 
 The bounded IndexedDB compatibility layer is useful for feature compatibility,
 but v1 does not promise durable IndexedDB state across an app relaunch. An

@@ -1182,6 +1182,59 @@ fetch_background_ensure_stream_capacity(void)
         : FETCH_BACKGROUND_ENQUEUE_MEMORY;
 }
 
+/* Fixed responses are substantially larger than streaming chunks. Allocate
+   one slab per admitted fixed request instead of retaining both 256 KiB
+   slabs after the first request. The caller owns a PREPARING descriptor, so
+   the worker cannot race this browser-thread-only Budget operation. */
+static FetchBackgroundEnqueueStatus
+fetch_background_ensure_fixed_capacity(void)
+{
+    size_t required = 0;
+    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+        FetchBackgroundSlot *slot = &fetch_background.slots[i];
+        int state = atomic_load_explicit(&slot->state, memory_order_acquire);
+        if (state != FETCH_BACKGROUND_SLOT_FREE && !slot->streaming)
+            required++;
+    }
+    if (required == 0) required = 1u;
+    if (required > FETCH_BACKGROUND_ACTIVE_LIMIT)
+        return FETCH_BACKGROUND_ENQUEUE_SATURATED;
+
+    size_t added = 0;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    size_t allocated_before = 0;
+    for (unsigned i = 0; i < FETCH_BACKGROUND_ACTIVE_LIMIT; i++)
+        if (fetch_background.fixed_buffers[i] != NULL) allocated_before++;
+    bool needs_allocation = required > allocated_before;
+    size_t budget_before = needs_allocation
+        ? fetch_background.budget->current : 0;
+    unsigned free_before = needs_allocation
+        ? (unsigned) sceKernelTotalFreeMemSize() : 0;
+    unsigned largest_before = needs_allocation
+        ? (unsigned) sceKernelMaxFreeMemSize() : 0;
+    uint64_t started_us = needs_allocation
+        ? fetch_background_now_us() : 0;
+#endif
+    FetchBackgroundEnqueueStatus status = fetch_background_fixed_buffers_ensure(
+        fetch_background.budget, fetch_background.fixed_buffers, required,
+        &added);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (needs_allocation) {
+        uint64_t elapsed_us = fetch_background_now_us() - started_us;
+        psp_log_printf(
+            "tilefinch-fixed-slab: required=%zu existing=%zu added=%zu "
+            "status=%d alloc_us=%llu budget=%zu/%zu "
+            "free=%u/%u largest=%u/%u\n",
+            required, allocated_before, added, (int) status,
+            (unsigned long long) elapsed_us, budget_before,
+            fetch_background.budget->current, free_before,
+            (unsigned) sceKernelTotalFreeMemSize(), largest_before,
+            (unsigned) sceKernelMaxFreeMemSize());
+    }
+#endif
+    return status;
+}
+
 static void fetch_background_record_start(bool streaming)
 {
     atomic_uint *started = streaming
@@ -3301,27 +3354,6 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
         return 0;
     }
-    /* Fixed-size media fetches need the larger buffers. Keep them out of the
-       normal browsing footprint and allocate them only on the browser thread,
-       before publishing any descriptor that can reference them. */
-    bool allocated_now[FETCH_BACKGROUND_ACTIVE_LIMIT] = {false};
-    for (unsigned i = 0; i < FETCH_BACKGROUND_ACTIVE_LIMIT; i++) {
-        if (fetch_background.fixed_buffers[i] != NULL) continue;
-        fetch_background.fixed_buffers[i] = budget_malloc_category(
-            fetch_background.budget, BUDGET_CATEGORY_RESOURCE,
-            FETCH_BACKGROUND_MAXIMUM_RESPONSE_BYTES);
-        if (fetch_background.fixed_buffers[i] == NULL) {
-            for (unsigned j = 0; j < FETCH_BACKGROUND_ACTIVE_LIMIT; j++) {
-                if (!allocated_now[j]) continue;
-                budget_free(fetch_background.budget,
-                            fetch_background.fixed_buffers[j]);
-                fetch_background.fixed_buffers[j] = NULL;
-            }
-            if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_MEMORY;
-            return 0;
-        }
-        allocated_now[i] = true;
-    }
     size_t url_length = strlen(url);
     const char *referer = request->referer == NULL ? "" : request->referer;
     size_t referer_length = strlen(referer);
@@ -3341,13 +3373,24 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         if (!atomic_compare_exchange_strong_explicit(
                 &slot->state, &expected, FETCH_BACKGROUND_SLOT_PREPARING,
                 memory_order_acq_rel, memory_order_acquire)) continue;
+        /* Classify the claimed descriptor before counting required slabs;
+           its prior occupant may have been a streaming request. */
+        slot->streaming = false;
+        FetchBackgroundEnqueueStatus capacity =
+            fetch_background_ensure_fixed_capacity();
+        if (capacity != FETCH_BACKGROUND_ENQUEUE_ADMITTED) {
+            atomic_store_explicit(
+                &slot->state, FETCH_BACKGROUND_SLOT_FREE,
+                memory_order_release);
+            if (status != NULL) *status = capacity;
+            return 0;
+        }
         uint32_t generation = fetch_background_generation_next(
             atomic_load_explicit(
                 &slot->generation, memory_order_relaxed));
         atomic_store_explicit(
             &slot->generation, generation, memory_order_release);
         slot->buffer_index = -1;
-        slot->streaming = false;
         slot->single_hop = false;
         slot->transfer_done = false;
         slot->curl_paused = false;
@@ -3365,6 +3408,8 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->send_low_client_hints = false;
         slot->send_client_hints = false;
         slot->suppress_high_client_hints = false;
+        slot->private_network.required = request->block_private_network;
+        slot->private_network.blocked = false;
         slot->validator = request->redirect_url_validator;
         slot->maximum_bytes = maximum_bytes;
         slot->timeout_ms = timeout_ms;
@@ -4022,32 +4067,6 @@ bool fetch_background_transport_take(
 #if LIBCURL_VERSION_NUM >= 0x074400
     (void) curl_multi_wakeup(fetch_background.multi);
 #endif
-    return true;
-}
-
-static bool fetch_background_result_reserve(
-    Budget *budget, FetchResult *result, size_t needed,
-    size_t maximum_bytes)
-{
-    if (needed > maximum_bytes || needed == SIZE_MAX) return false;
-    size_t required = needed + 1u;
-    if (required <= result->capacity) return true;
-    size_t capacity = result->capacity == 0 ? 64u * 1024u : result->capacity;
-    while (capacity < required) {
-        size_t next = capacity > maximum_bytes / 2u
-            ? maximum_bytes + 1u : capacity * 2u;
-        if (next <= capacity) return false;
-        capacity = next;
-    }
-    if (capacity > maximum_bytes + 1u) capacity = maximum_bytes + 1u;
-    char *data = result->data == NULL
-        ? budget_malloc_category(
-              budget, BUDGET_CATEGORY_RESOURCE, capacity)
-        : budget_realloc_category(
-              budget, BUDGET_CATEGORY_RESOURCE, result->data, capacity);
-    if (data == NULL) return false;
-    result->data = data;
-    result->capacity = capacity;
     return true;
 }
 

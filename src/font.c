@@ -1801,6 +1801,10 @@ int font_text_width_for_family_at_size_fixed_mode(
     int64_t denominator = (int64_t) units_per_em * 2048 * 5;
     int64_t numerator = 0;
     unsigned previous = 0;
+    /* stbtt's codepoint kerning and metrics each resolve their codepoints
+       through the cmap; resolving each glyph once and carrying the previous
+       one gives the same values with one lookup per glyph. */
+    int previous_glyph = 0;
     for (size_t at = 0; at < length;) {
         size_t sequence_used = 0;
         int sequence_advance = 0;
@@ -1823,18 +1827,21 @@ int font_text_width_for_family_at_size_fixed_mode(
             at += used;
             continue;
         }
+        unsigned compatible_units = 0;
+        bool compatible = family_compatible_advance(
+            metric_family, codepoint, metric_bold, &compatible_units);
+        int glyph = kerning || !compatible
+            ? stbtt_FindGlyphIndex(info, (int) codepoint) : 0;
         if (kerning && previous != 0) {
-            int kerning = stbtt_GetCodepointKernAdvance(
-                info, (int) previous, (int) codepoint);
+            int kerning = stbtt_GetGlyphKernAdvance(
+                info, previous_glyph, glyph);
             if (!font_width_accumulate(
                     &numerator,
                     (int64_t) kerning * pixel_height_fixed * 2048 * 5)) {
                 return numerator < 0 ? INT_MIN : INT_MAX;
             }
         }
-        unsigned compatible_units = 0;
-        if (family_compatible_advance(
-                metric_family, codepoint, metric_bold, &compatible_units)) {
+        if (compatible) {
             if (!font_width_accumulate(
                     &numerator,
                     (int64_t) compatible_units * pixel_height_fixed
@@ -1843,8 +1850,7 @@ int font_text_width_for_family_at_size_fixed_mode(
             }
         } else {
             int native_units = 0;
-            stbtt_GetCodepointHMetrics(
-                info, (int) codepoint, &native_units, NULL);
+            stbtt_GetGlyphHMetrics(info, glyph, &native_units, NULL);
             if (!font_width_accumulate(
                     &numerator,
                     (int64_t) native_units * pixel_height_fixed
@@ -1859,6 +1865,7 @@ int font_text_width_for_family_at_size_fixed_mode(
             return numerator < 0 ? INT_MIN : INT_MAX;
         }
         previous = codepoint;
+        previous_glyph = glyph;
         at += used;
     }
     return font_width_round_ratio(numerator, denominator);
@@ -2071,9 +2078,12 @@ int font_kerning(const FontFace *face, unsigned left, unsigned right,
     }
 #endif
     if (info == NULL) return 0;
+    /* Most pairs have no kerning: skip the scale and the double lround,
+       whose result would be exactly zero. */
+    int units = stbtt_GetCodepointKernAdvance(info, (int) left, (int) right);
+    if (units == 0) return 0;
     float scale = css_font_scale_fixed(info, pixel_height_fixed);
-    return (int) lround(stbtt_GetCodepointKernAdvance(
-                            info, (int) left, (int) right) * scale);
+    return (int) lround(units * scale);
 }
 
 int font_kerning_at_size_fixed(const FontFace *face, unsigned left,
@@ -2097,9 +2107,10 @@ int font_kerning_at_size_fixed(const FontFace *face, unsigned left,
     }
 #endif
     if (info == NULL) return 0;
+    int units = stbtt_GetCodepointKernAdvance(info, (int) left, (int) right);
+    if (units == 0) return 0;
     float scale = css_font_scale_fixed(info, pixel_height_fixed);
-    return (int) lround(stbtt_GetCodepointKernAdvance(
-                            info, (int) left, (int) right) * scale * 64.0f);
+    return (int) lround(units * scale * 64.0f);
 }
 
 int font_kerning_fixed(const FontFace *face, unsigned left, unsigned right,

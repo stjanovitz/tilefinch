@@ -3,6 +3,7 @@
    Split out of style.c. */
 
 #include "style_internal.h"
+#include "tilefinch/url.h"
 
 #include <math.h>
 #include <limits.h>
@@ -1075,34 +1076,20 @@ bool style_color_parse(const char *text, size_t length,
 
 static const char *style_image_referrer_policy_name(uint8_t policy)
 {
-    static const char *const names[] = {
-        "", "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    return policy < sizeof(names) / sizeof(names[0]) ? names[policy] : NULL;
+    return tilefinch_referrer_policy_name(policy);
 }
+_Static_assert(STYLE_IMAGE_REFERRER_UNSAFE_URL
+                   == TILEFINCH_REFERRER_POLICY_COUNT,
+               "image referrer policies are the shared referrer codes");
 
 static bool style_image_referrer_policy_parse(const char *policy,
                                               uint8_t *parsed)
 {
     if (policy == NULL || parsed == NULL) return false;
-    size_t length = strlen(policy);
-    for (uint8_t candidate = STYLE_IMAGE_REFERRER_DEFAULT;
-         candidate <= STYLE_IMAGE_REFERRER_UNSAFE_URL; candidate++) {
-        const char *name = style_image_referrer_policy_name(candidate);
-        size_t name_length = name == NULL ? 0 : strlen(name);
-        bool equal = name != NULL && name_length == length;
-        for (size_t i = 0; equal && i < length; i++) {
-            equal = tolower((unsigned char) policy[i])
-                    == tolower((unsigned char) name[i]);
-        }
-        if (equal) {
-            *parsed = candidate;
-            return true;
-        }
-    }
-    return false;
+    uint8_t code = tilefinch_referrer_policy_code(policy, strlen(policy), true);
+    if (code == TILEFINCH_REFERRER_POLICY_UNKNOWN) return false;
+    *parsed = code;
+    return true;
 }
 
 bool stylesheet_current_image_source_slot(Stylesheet *sheet,
@@ -3233,47 +3220,6 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
     bool retained = false;
     return style_apply_paint_stack(sheet, style, &stack, &retained)
         && retained;
-}
-
-uint64_t style_parse_box(const Stylesheet *sheet, const char *text,
-                          size_t length, StyleEdges *edges, bool padding)
-{
-    char resolved[STYLE_MATH_SOURCE_CAPACITY];
-    if (!style_resolve_value(
-            sheet, text, length, resolved, sizeof(resolved), 0)) {
-        return 0;
-    }
-    text = resolved;
-    length = strlen(resolved);
-    int values[4] = {0};
-    size_t count = 0;
-    size_t at = 0;
-    for (; at < length && count < 4;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (parentheses == 0 && isspace((unsigned char) text[end])) break;
-            end++;
-        }
-        if (end > at) {
-            int parsed = style_parse_length(
-                sheet, text + at, end - at, INT_MIN, NULL);
-            if (parsed == INT_MIN || (padding && parsed < 0)) return 0;
-            values[count++] = parsed;
-        }
-        at = end;
-    }
-    while (at < length && isspace((unsigned char) text[at])) at++;
-    if (at != length) return 0;
-    if (count == 0) return 0;
-    edges->top = values[0];
-    edges->right = count > 1 ? values[1] : values[0];
-    edges->bottom = count > 2 ? values[2] : values[0];
-    edges->left = count > 3 ? values[3] : edges->right;
-    return padding ? S_PADDING_ALL : S_MARGIN_ALL;
 }
 
 static bool parse_style_length_components(Stylesheet *sheet,

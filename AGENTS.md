@@ -17,9 +17,9 @@ cmake --build build-preset-release -j8
 ctest --test-dir build-preset-release -j8 --output-on-failure
 ```
 
-Release currently registers **148 tests: 147 enabled plus the opt-in
-`tilefinch-device-cost-tests`, which is registered but disabled by default**.
-All enabled tests must pass. The localhost
+Test registration can vary with optional host tooling. All enabled tests must
+pass; `tilefinch-device-cost-tests` is deliberately registered but disabled by
+default. The localhost
 redirect test may report `Skipped` in a sandbox that forbids loopback sockets;
 the update-root proof can likewise skip when its external prerequisite is not
 available. A skip is not a passing substitute for running either gate in an
@@ -35,8 +35,9 @@ ctest --preset dev
 ```
 
 The development preset omits release-only gates such as
-`tilefinch-fidelity-floor-tests`. The legacy `./scripts/dev.sh unit` command
-remains useful for aggregate unit filters. Test counts legitimately differ
+`tilefinch-fidelity-floor-tests`. `./scripts/dev.sh` is the faster targeted
+loop (`dev.sh unit <filter>` for aggregate unit filters); see
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Test counts legitimately differ
 between configurations, so compare a tree against itself, not against another
 tree.
 

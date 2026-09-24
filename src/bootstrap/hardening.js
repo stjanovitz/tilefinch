@@ -96,6 +96,7 @@
       "__tilefinchParserMutationCheckpoint",
       "__tilefinchPendingNetworkRequests",
       "__tilefinchPendingTimers",
+      "__tilefinchPendingWork",
       "__tilefinchPumpTimers",
       "__tilefinchSchedulerSnapshot",
       "__tilefinchRebindDocument",

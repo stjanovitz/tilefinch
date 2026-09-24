@@ -593,6 +593,101 @@ static bool test_bounded_finalize_preserves_history_pruning(void)
     return ok && clean;
 }
 
+/* An in-place relayout of a slow page (a CSS checkbox drawer on a long
+   article) adopts only the screens around the reader, keeps the page's
+   scroll extent, and marks where its content ends; idle completion extends
+   it when the reader nears that edge and finally adopts the full layout,
+   repainting everything below the old edge. */
+static bool test_provisional_relayout_completes_in_idle_work(void)
+{
+    static char html[16384];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}.drawer{display:none}"
+        "#toggle:checked ~ .drawer{display:block}p{margin:0;height:40px}"
+        "</style><body><input type=checkbox id=toggle>"
+        "<label for=toggle>menu</label><p class=drawer>drawer</p>");
+    for (int i = 0; used > 0 && i < 200; i++) {
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<p>para-%d</p>", i);
+    }
+    if (used <= 0 || (size_t) used >= sizeof(html)) return false;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ok = lexbor_installed && navigation_init(&navigation, &budget, 2);
+    uint64_t generation = ok ? navigation_begin(&navigation) : 0;
+    ok = ok && navigation_commit_html(
+        &navigation, generation, "https://provisional.test/", html,
+        (size_t) used, 480, NULL, NULL, true);
+    ok = ok && navigation.page.runtime == NULL
+        && !navigation.page.layout_provisional
+        && navigation.page.layout_complete_us != 0
+        && navigation.page.layout_complete_us
+               == navigation.page.layout.performance.total_us
+        && test_text_command(&navigation.page.layout, "para-199") != NULL;
+    int full_height = ok ? navigation.page.layout.height : 0;
+    lxb_dom_node_t *toggle = ok ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "toggle")
+        : NULL;
+    /* Every relayout of this page counts as slow. */
+    navigation.relayout_preview_threshold_us = 0;
+    ok = ok && toggle != NULL
+        && lxb_dom_element_set_attribute(
+               lxb_dom_interface_element(toggle),
+               (const lxb_char_t *) "checked", 7,
+               (const lxb_char_t *) "", 0) != NULL;
+    if (ok) layout_reuse_cache_reset(navigation.page.layout_reuse);
+    ok = ok && navigation_relayout(&navigation);
+    int limit = ok ? navigation.page.layout.content_limit_y : 0;
+    ok = ok && navigation.page.layout_provisional
+        && navigation_layout_completion_pending(&navigation)
+        && limit >= 3 * 272 && limit < full_height
+        && navigation.page.layout.height >= full_height
+        && test_text_command(&navigation.page.layout, "drawer") != NULL
+        && test_text_command(&navigation.page.layout, "para-199") == NULL
+        && navigation.performance.provisional_relayouts == 1;
+    /* A reader scrolled toward the edge first gets the next screens. */
+    ok = ok && navigation_set_scroll(&navigation, limit - 272)
+        && navigation_complete_layout(&navigation)
+               == NAVIGATION_LAYOUT_COMPLETION_EXTENDED
+        && navigation.page.layout.content_limit_y > limit
+        && navigation.page.layout_provisional;
+    int extended = ok ? navigation.page.layout.content_limit_y : 0;
+    ok = ok && navigation_set_scroll(&navigation, 0)
+        && navigation_complete_layout(&navigation)
+               == NAVIGATION_LAYOUT_COMPLETION_ADOPTED
+        && !navigation.page.layout_provisional
+        && navigation.page.layout.content_limit_y == 0
+        && navigation.relayout_damage_valid
+        && navigation.relayout_damage_top <= extended
+        && navigation.relayout_damage_bottom
+               >= navigation.page.layout.height
+        && navigation_complete_layout(&navigation)
+               == NAVIGATION_LAYOUT_COMPLETION_NONE
+        && navigation.performance.provisional_completions == 1
+        && navigation.performance.provisional_extensions == 1;
+    const DrawCommand *last = ok
+        ? test_text_command(&navigation.page.layout, "para-199") : NULL;
+    DrawCommand completed_last = last == NULL ? (DrawCommand) {0} : *last;
+    size_t completed_count = ok ? navigation.page.layout.count : 0;
+    int completed_height = ok ? navigation.page.layout.height : 0;
+    /* The completed layout is the one a synchronous relayout produces. */
+    navigation.relayout_preview_threshold_us = UINT64_MAX;
+    ok = ok && last != NULL && navigation_relayout(&navigation);
+    last = ok ? test_text_command(&navigation.page.layout, "para-199")
+              : NULL;
+    ok = ok && last != NULL && !navigation.page.layout_provisional
+        && navigation.page.layout.count == completed_count
+        && navigation.page.layout.height == completed_height
+        && last->x == completed_last.x && last->y == completed_last.y
+        && completed_height == full_height + 40;
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_relayout_damage_tracks_paint_only_fields(void)
 {
     static const char html[] =

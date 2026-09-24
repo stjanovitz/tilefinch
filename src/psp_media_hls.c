@@ -793,17 +793,6 @@ void psp_media_hls_pump_delivery(
         now_us, error, sizeof(error));
 }
 
-bool psp_media_hls_is_live(const PspMediaHlsContext *context)
-{
-    if (context == NULL) return false;
-    for (size_t i = 0; i < context->source_count; i++) {
-        MediaHlsStats stats = {0};
-        media_hls_source_stats(context->source[i], &stats);
-        if (stats.live) return true;
-    }
-    return false;
-}
-
 bool psp_media_hls_failed(const PspMediaHlsContext *context)
 {
     if (context == NULL) return false;
@@ -811,13 +800,6 @@ bool psp_media_hls_failed(const PspMediaHlsContext *context)
     for (size_t i = 0; i < context->source_count; i++)
         if (media_hls_source_failed(context->source[i])) return true;
     return false;
-}
-
-bool psp_media_hls_sample_source(
-    PspMediaHlsContext *context, MediaSampleSource *source)
-{
-    return context != NULL && context->source[0] != NULL
-        && media_hls_source_sample_source(context->source[0], source);
 }
 
 bool psp_media_hls_sample_sources(

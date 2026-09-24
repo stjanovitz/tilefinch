@@ -51,7 +51,6 @@ const PspUiThemePalette *psp_ui_theme_palette(BrowserChromeTheme theme);
 void psp_ui_theme_select(BrowserChromeTheme theme);
 bool psp_ui_theme_load_custom_file(
     const char *path, char *error, size_t error_capacity);
-bool psp_ui_theme_custom_available(void);
 
 /* A catalog is short-lived settings state, charged to Budget only while the
    chooser is open. Scanning is bounded and validates each retained file;

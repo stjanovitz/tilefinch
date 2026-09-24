@@ -42,6 +42,9 @@
  * BrowserProfileSuggestion convention: valid until that storage is mutated,
  * which is exactly when the frontend refreshes the view.
  */
+/* Settings > Device & storage > Site data & storage lists at most this
+   many sites; the core keeps choices for more, reachable per site. */
+#define PSP_UI_SITE_STORAGE_ROW_LIMIT 16u
 #define PSP_UI_HOME_TILE_LIMIT 6
 #define PSP_UI_HOME_CONTINUE_LIMIT 4
 #define PSP_UI_HOME_LABEL_CAPACITY 24
@@ -109,6 +112,20 @@ typedef struct {
     const char *empty_message;
     PspUiCollectionsRow rows[PSP_UI_COLLECTIONS_ROW_LIMIT];
 } PspUiCollectionsView;
+
+typedef struct {
+    char origin[48];
+    char detail[32];
+    /* A BrowserSiteStoragePolicy, or 3 for "Memory Stick this session". */
+    uint8_t state;
+} PspUiSiteStorageRow;
+
+/* Filled by the frontend when Site data & storage opens. */
+typedef struct {
+    uint8_t count;
+    char stick_free[32];
+    PspUiSiteStorageRow rows[PSP_UI_SITE_STORAGE_ROW_LIMIT];
+} PspUiSiteStorageView;
 
 typedef struct {
     char name[PSP_UI_TITLE_CAPACITY];
@@ -215,8 +232,21 @@ typedef enum {
     PSP_UI_ACTION_RECOVERY_AUDIO_ONLY,
     PSP_UI_ACTION_RECOVERY_LOWER_QUALITY,
     PSP_UI_ACTION_RECOVERY_RETURN,
+    /* Site data & storage. SHOW asks the frontend to fill the site list;
+       DELETE carries
+       intent.list_index and follows the row's own confirm step. The three
+       answers close the Memory Stick offer. Page content emits none. */
+    PSP_UI_ACTION_SHOW_SITE_STORAGE,
+    PSP_UI_ACTION_SITE_STORAGE_DELETE,
+    PSP_UI_ACTION_STORAGE_OFFER_SESSION,
+    PSP_UI_ACTION_STORAGE_OFFER_ALWAYS,
+    PSP_UI_ACTION_STORAGE_OFFER_DECLINE,
     PSP_UI_ACTION_EXIT
 } PspUiAction;
+
+/* Stable diagnostic spelling shared by the operation journal and validation
+   input harness. Invalid values are reported as "unknown"; NONE is "none". */
+const char *psp_ui_action_name(PspUiAction action);
 
 enum {
     PSP_UI_FAILURE_READER = 1u << 0,
@@ -318,7 +348,12 @@ typedef enum {
     PSP_UI_SETTING_GAMEPAD_FACE_MAPPING,
     PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS,
     PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS,
-    PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS
+    PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS,
+    PSP_UI_SETTING_SITE_STORAGE_OFFERS,
+    /* unsigned_value is a BrowserSiteStoragePolicy: for the current page's
+       site, or (LISTED) for row intent.list_index of Site data & storage. */
+    PSP_UI_SETTING_SITE_STORAGE_SITE,
+    PSP_UI_SETTING_SITE_STORAGE_LISTED
 } PspUiSettingId;
 
 typedef union {
@@ -442,6 +477,10 @@ typedef enum {
     PSP_UI_SCREEN_TABS,
     PSP_UI_SCREEN_TEXT_ENTRY,
     PSP_UI_SCREEN_FIND,
+    /* One site of Site data & storage: its choice, and deleting its data. */
+    PSP_UI_SCREEN_STORAGE_SITE,
+    /* A site outgrew RAM: X this session, Triangle always, O no. */
+    PSP_UI_SCREEN_STORAGE_OFFER,
     /*
      * Native chrome surfaces. Unlike every screen above they are full
      * surfaces rather than overlays over a page: they own the whole panel,
@@ -527,9 +566,6 @@ typedef struct {
     unsigned update_release_available : 1;
     unsigned developer_update_available : 1;
     unsigned update_channel : 2;
-    /* The frontend stepped the clock down or has work pending, so ambient
-       motion must stop until it says otherwise. */
-    unsigned motion_suppressed : 1;
     unsigned javascript_enabled : 1;
     unsigned site_javascript_enabled : 1;
     unsigned site_data_allowed : 1;
@@ -577,6 +613,9 @@ typedef struct {
     unsigned voice_component_progress_plus_one : 10;
     unsigned glyph_language : 4;
     unsigned color_emoji : 1;
+    /* The toast was raised on the page: a page toast (a loading hint, say)
+       waits under a menu opened over it rather than covering it. */
+    unsigned toast_on_page : 1;
     unsigned glyph_component_phase : 3;
     unsigned glyph_component_remove_confirmation : 1;
     /* Same -1..1000 encoding as the voice component above. */
@@ -614,6 +653,13 @@ typedef struct {
     /* Opt-in storage policy; packed beside the bounded loading phase so an
        uncommon setting does not enlarge every composed UI snapshot. */
     uint16_t save_diagnostic_reports : 1;
+    /* The current site's storage: a BrowserSiteStoragePolicy, or 3 for
+       "Memory Stick this session". Then the global offer switch. */
+    uint16_t site_storage_state : 2;
+    uint16_t site_storage_offers : 1;
+    /* Site data & storage was opened from Site information; Back returns
+       there. */
+    uint16_t site_storage_from_site_info : 1;
     uint8_t overlay_animation_frames;
     uint8_t toast_entry_frames;
     /* Focus-settle budget from the theme sheet; drives the focus ring only. */
@@ -705,6 +751,17 @@ typedef struct {
         char update_history_versions[TILEFINCH_UPDATE_HISTORY_LIMIT]
                                     [TILEFINCH_UPDATE_HISTORY_VERSION_CAPACITY];
         char network_profile_label[128];
+        /* The Memory Stick offer; sizes in bytes, free space in KiB. */
+        struct {
+            char storage_offer_origin[80];
+            uint32_t storage_offer_current;
+            uint32_t storage_offer_needed;
+            uint32_t storage_offer_limit;
+            uint32_t storage_offer_free_kib;
+            bool storage_offer_free_known;
+            /* Frames left before the offer accepts an answer. */
+            uint8_t storage_offer_arming;
+        };
         struct {
             char site_tls_version[16];
             char site_tls_issuer[96];
@@ -721,6 +778,7 @@ typedef struct {
         const PspUiTextEntryView *text_entry;
         const PspUiFindView *find_view;
         const TilefinchDiagnosticQrView *diagnostic_qr;
+        const PspUiSiteStorageView *site_storage;
     };
 } PspUiState;
 
@@ -957,6 +1015,10 @@ void psp_ui_set_page_interaction(PspUiState *ui, PspUiCursorShape cursor,
                                  unsigned scrollbar_width);
 void psp_ui_set_focus(PspUiState *ui, bool visible, int x, int y,
                       int width, int height);
+/* For status that a pump re-asserts every frame: shows it once, then only
+   keeps it visible, so it settles instead of replaying its entry motion. */
+void psp_ui_keep_status(PspUiState *ui, const char *status,
+                        unsigned duration_frames);
 void psp_ui_show_status(PspUiState *ui, const char *status,
                         unsigned duration_frames);
 void psp_ui_show_tls_status(
@@ -1018,6 +1080,11 @@ bool psp_ui_legacy_collection_url(
  * and here lets host tests pin the accepted spellings.
  */
 bool psp_ui_native_home_url(const char *url);
+/* Legacy status strings are written in capitals; toasts present them in
+   sentence case. Acronyms, single-letter button names and "Wi-Fi" keep their
+   capitals so "PRESS X TO SAVE URL" reads "Press X to save URL". Text that
+   already contains a lowercase letter is authored casing and is untouched. */
+void psp_ui_status_sentence_case(char *text);
 /* True for the reserved HTTPS origin itself and every path below it.  This
  * is the final guard before the frontend considers a network navigation:
  * an internal URL which no native/generated page recognizes must fail
@@ -1033,6 +1100,18 @@ void psp_ui_set_find(PspUiState *ui, const PspUiFindView *view);
 void psp_ui_clear_find(PspUiState *ui);
 void psp_ui_set_diagnostic_qr(
     PspUiState *ui, const TilefinchDiagnosticQrView *view);
+void psp_ui_set_site_storage(PspUiState *ui,
+                             const PspUiSiteStorageView *view);
+/* "812 KB", "1.4 MB", "3.2 GB". */
+void psp_ui_format_bytes(char *out, size_t capacity, uint64_t bytes);
+/* Opens the Memory Stick offer over the page. It ignores every button for
+   PSP_UI_STORAGE_OFFER_ARMING_FRAMES: it can open in the middle of a game,
+   and those presses are the game's. */
+#define PSP_UI_STORAGE_OFFER_ARMING_FRAMES 30u
+void psp_ui_show_storage_offer(
+    PspUiState *ui, const char *origin, size_t current_bytes,
+    size_t needed_bytes, size_t limit_bytes, bool free_known,
+    uint64_t free_bytes);
 /* Abandon page-directed held/analog input while a candidate navigation owns
    the foreground. The cursor position is retained for the next analog move. */
 void psp_ui_suspend_page_input(PspUiState *ui);

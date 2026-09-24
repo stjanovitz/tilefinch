@@ -42,7 +42,7 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
            not to spend memory on a provisional frame. Keep the established
            preview-pressure diagnostics coherent even though we never enter
            the later layout estimator. */
-        stream->pre_eof_preview_attempted = true;
+        preview_policy_abandon(&stream->preview_policy);
         stream->session->performance.streaming_preview_pressure_skips++;
         budget_record_pressure(
             stream->session->budget, BUDGET_PRESSURE_SPECULATION,
@@ -59,11 +59,13 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
        scanner may inspect already-received bytes beyond that checkpoint.
        Start only fetches here; the normal DOM-derived stylesheet pipeline
        still parses and applies rules in document order. */
+    tilefinch_platform_trace_step("preloads");
     navigation_stream_scan_style_preloads(stream, data, length);
     navigation_stream_launch_preloads(stream);
     navigation_stream_progress_preloads(stream, false);
     bool hard_feed_fault = navigation_test_consume_parser_checkpoint_fault(
         NAVIGATION_TEST_PARSER_FEED_HARD_FAILURE);
+    tilefinch_platform_trace_step("parser-feed");
     if (hard_feed_fault
         || !document_parser_feed(
                stream->parser, (const char *) data, length)) {
@@ -91,6 +93,7 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
                 navigation_now_us() - stream->started_us;
         }
     }
+    tilefinch_platform_trace_step("preview-attempt");
     navigation_stream_try_pre_eof_preview(stream);
     return stream->parser_checkpoint_outcome;
 }
@@ -518,6 +521,7 @@ static bool navigation_load_initialize_document_stream(
 {
     if (load == NULL || stream == NULL) return false;
     memset(stream, 0, sizeof(*stream));
+    preview_policy_init(&stream->preview_policy);
     stream->session = load->session;
     stream->stylesheet_resources.budget = load->session->budget;
     stream->parser = &load->parser;
@@ -1181,6 +1185,7 @@ NavigationLoadStatus navigation_load_pump(
         return load->status;
     }
     FetchPumpMetrics pump = {0};
+    tilefinch_platform_trace_step("network-pump");
     (void) fetch_scheduler_pump_bounded(
         load->scheduler, 1, 10, quota == NULL ? NULL : &quota->fetch, &pump);
     session->performance.network_us += navigation_record_slice(
@@ -1565,7 +1570,8 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
         snprintf(phase_message, sizeof(phase_message),
             "tilefinch-candidate-phases: built=%d layout-pending=%d "
             "script=%lluus style=%lluus resource=%lluus layout=%lluus "
-            "runtime=%lluus counter-rules=%zu nodes=%zu\n",
+            "runtime=%lluus counter-rules=%zu nodes=%zu "
+            "css-commit=%lluus adopted=%zu commit-appends=%zu\n",
             built, load->layout_job != NULL,
             (unsigned long long) candidate->performance.script_us,
             (unsigned long long) candidate->performance.style_us,
@@ -1573,7 +1579,12 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
             (unsigned long long) candidate->performance.layout_us,
             (unsigned long long) candidate->performance.runtime_us,
             candidate->page.stylesheet.count,
-            candidate->page.document.node_count);
+            candidate->page.document.node_count,
+            (unsigned long long)
+                candidate->performance.stylesheet_resource_us,
+            candidate->performance.blocking_stylesheet_adoptions,
+            candidate->performance
+                .blocking_stylesheet_commit_continuations);
         tilefinch_platform_log_message(phase_message);
         snprintf(phase_message, sizeof(phase_message),
             "tilefinch-candidate-images: deferred=%zu runtime=%d attempted=%zu loaded=%zu "
@@ -1967,6 +1978,45 @@ void navigation_load_cancel(NavigationLoad *load, const char *reason)
     navigation_load_set_error(load, NAVIGATION_LOAD_CANCELLED, message);
     navigation_load_release_staging(load, true);
     navigation_load_report_replacement_outcome(load, false);
+}
+
+const LayoutDocument *navigation_load_retained_preview(
+    NavigationLoad *load, bool *images_changed)
+{
+    if (images_changed != NULL) *images_changed = false;
+    if (load == NULL || load->document_stream == NULL) return NULL;
+    NavigationDocumentStream *stream = load->document_stream;
+    NavigationRetainedPreview *live = navigation_stream_live_preview(stream);
+    if (live == NULL) return NULL;
+    bool changed = navigation_retained_preview_resolve_images(
+        live, stream->images);
+    if (images_changed != NULL) *images_changed = changed;
+    return &live->layout;
+}
+
+bool navigation_load_resolve_preview_link(
+    NavigationLoad *load, const char *href, size_t length,
+    char *url, size_t capacity, bool *same_document)
+{
+    if (same_document != NULL) *same_document = false;
+    if (load == NULL || load->document_stream == NULL || href == NULL
+        || length == 0 || length >= NAVIGATION_URL_LIMIT || url == NULL)
+        return false;
+    const NavigationDocumentStream *stream = load->document_stream;
+    char reference[NAVIGATION_URL_LIMIT];
+    memcpy(reference, href, length);
+    reference[length] = '\0';
+    const char *base = stream->resource_base_url[0] != '\0'
+        ? stream->resource_base_url : stream->document_url;
+    if (!fetch_resolve_url(base, reference, url, capacity)) return false;
+    if (same_document != NULL) {
+        const char *hash = strchr(url, '#');
+        size_t document_length = strcspn(stream->document_url, "#");
+        *same_document = hash != NULL
+            && (size_t) (hash - url) == document_length
+            && strncmp(url, stream->document_url, document_length) == 0;
+    }
+    return true;
 }
 
 void navigation_load_destroy(NavigationLoad *load)

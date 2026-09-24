@@ -10,6 +10,9 @@
 #include "tilefinch/layout.h"
 
 #define TILEFINCH_TILE_SIZE LAYOUT_SPATIAL_BAND_HEIGHT
+/* Tiles allocated as ordinarily as the frame itself. Slots past this hold
+   paint-ahead: optional, admitted with budget headroom, reclaimed first. */
+#define RENDER_TILE_BASE_CAPACITY 8u
 #define TILEFINCH_GLYPH_CACHE_ENTRIES 512
 #define TILEFINCH_GLYPH_CACHE_WAYS 4
 #define TILEFINCH_GLYPH_CACHE_BYTES (192u * 1024u)
@@ -29,6 +32,9 @@ typedef struct {
     bool valid;
     int tile_x;
     int tile_y;
+    /* TileCache.overflow_tile_generation when rasterized: a tile holding
+       unscrolled overflow content is stale once any overflow box scrolls. */
+    uint32_t overflow_generation;
     uint64_t last_used;
     uint16_t pixels[TILEFINCH_TILE_SIZE * TILEFINCH_TILE_SIZE];
 } RenderTile;
@@ -112,6 +118,11 @@ typedef struct {
     size_t glyph_candidates;
     size_t glyphs_warmed;
     uint64_t generation;
+    /* Further paint-ahead rows after tile_y, stepping by row_step (+1 below
+       the viewport, -1 above it), while spare tile slots allow. */
+    size_t extra_rows;
+    int row_step;
+    int prefetch_scroll_y;
     bool pending;
     bool startup;
     bool allow_large_images;
@@ -171,7 +182,11 @@ typedef struct {
     const LayoutDocument *source_layout;
     LayoutDocument visual_layout;
     bool owns_visual_layout;
-    RenderTile *tiles;
+    /* Slots, allocated on first use. The first
+       RENDER_TILE_BASE_CAPACITY behave as before; later ones hold paint-ahead
+       and are allocated only with budget headroom and released first. */
+    RenderTile **tiles;
+    size_t tiles_allocated;
     RenderTile *frame_scratch_tile;
     size_t tile_capacity;
     uint64_t clock;
@@ -313,7 +328,42 @@ typedef struct {
     int last_frame_viewport_width;
     int last_frame_viewport_height;
     bool last_frame_scroll_valid;
+    /* Paint-ahead rows finished for the screen at prefetch_done_scroll_y;
+       cleared by any tile invalidation. */
+    bool prefetch_done;
+    int prefetch_done_scroll_y;
+    /* Placeholder composition: draw a checkerboard where a visible tile is
+       not rasterized yet instead of rasterizing it, and leave the pending
+       frame job running. placeholder_tiles counts them for the last frame. */
+    bool placeholder_missing;
+    size_t placeholder_tiles;
+    /* When set, a one-shot full-frame render yields to the frontend under
+       this cooperate phase whenever 8 ms of tile raster has passed (the
+       load preview's first frame is ~0.1 s on the PSP). It never aborts the
+       frame: a cancel request persists to the caller's next checkpoint. */
+    const char *raster_cooperate_phase;
+    uint64_t raster_slice_started_us;
+    /* Bumped whenever which overflow content is baked into tiles may have
+       changed: an overflow box scrolled, or the overflow cache was rebuilt
+       or lost. */
+    uint32_t overflow_tile_generation;
+    uint64_t overflow_scroll_signature;
+    /* Overflow preparations answered by the scroll generation alone. */
+    size_t overflow_prepare_skips;
+    /* Last overflow-cache preparation succeeded, so tiles bake unscrolled
+       overflow content. Survives a cache rebuild; flips only on success
+       after failure or failure after success. */
+    bool overflow_static_active;
+    size_t overflow_tile_commands;
     bool forced_dark;
+    /* Scroll state last mirrored into the visual layout, and last answer to
+       "is any overflow box scrolled vertically", keyed by the source
+       layout and its scroll_generation so idle frames skip both scans. */
+    const LayoutDocument *scroll_synced_layout;
+    uint32_t scroll_synced_generation;
+    const LayoutDocument *overflow_scroll_layout;
+    uint32_t overflow_scroll_generation;
+    bool overflow_scroll_active;
 } TileCache;
 
 bool tile_cache_init(TileCache *cache, Budget *budget,
@@ -388,6 +438,9 @@ void tile_cache_prefetch_row(TileCache *cache, int world_y, int viewport_width);
 void tile_cache_schedule_prefetch_row(TileCache *cache, int world_y,
                                       int viewport_width);
 void tile_cache_cancel_idle_work(TileCache *cache);
+/* True when the paint-ahead rows for the last presented screen are cached
+   (an idle cancel before they finished, or an invalidation, clears it). */
+bool tile_cache_prefetch_satisfied(const TileCache *cache);
 /*
  * Release rebuildable render accelerators without invalidating the current
  * page, resident tiles, or presented framebuffer.  The next frame lazily

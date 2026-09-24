@@ -2117,6 +2117,19 @@ static bool controller_native_default_refresh(BrowserController *controller)
     return controller_native_default_refresh_changed(controller, NULL);
 }
 
+/* A checkbox or radio group flipped: only checked-state rules can answer
+   differently, so the rest of the page's selector matching replays. */
+static bool controller_native_default_refresh_checked(
+    BrowserController *controller, lxb_dom_node_t *const *nodes, size_t count)
+{
+    if (controller == NULL
+        || !document_refresh(&controller->navigation->page.document)) return false;
+    tilefinch_platform_trace_step("checked-invalidate");
+    layout_reuse_cache_invalidate_checked(
+        controller->navigation->page.layout_reuse, nodes, count);
+    return navigation_relayout(controller->navigation);
+}
+
 static lxb_dom_node_t *controller_next_node(lxb_dom_node_t *node,
                                             lxb_dom_node_t *root)
 {
@@ -2252,12 +2265,12 @@ static ControllerNativeDefaultResult controller_toggle_choice(
                 &state_snapshot);
             return CONTROLLER_NATIVE_DEFAULT_FAILED;
         }
-        if (controller_native_default_refresh(controller))
+        if (controller_native_default_refresh_checked(controller, &node, 1))
             return CONTROLLER_NATIVE_DEFAULT_CHANGED;
         (void) controller_checked_set(controller, node, checked, false);
         (void) document_control_checked_restore(
             &controller->navigation->page.document, node, &state_snapshot);
-        (void) controller_native_default_refresh(controller);
+        (void) controller_native_default_refresh_checked(controller, &node, 1);
         return CONTROLLER_NATIVE_DEFAULT_FAILED;
     }
     lxb_dom_node_t *root = lxb_dom_interface_node(
@@ -2316,7 +2329,8 @@ static ControllerNativeDefaultResult controller_toggle_choice(
         }
         return CONTROLLER_NATIVE_DEFAULT_FAILED;
     }
-    if (controller_native_default_refresh(controller))
+    if (controller_native_default_refresh_checked(
+            controller, members, member_count))
         return CONTROLLER_NATIVE_DEFAULT_CHANGED;
     for (size_t at = 0; at < member_count; at++) {
         (void) controller_checked_set(
@@ -2325,7 +2339,8 @@ static ControllerNativeDefaultResult controller_toggle_choice(
             &controller->navigation->page.document, members[at],
             &state_snapshots[at]);
     }
-    (void) controller_native_default_refresh(controller);
+    (void) controller_native_default_refresh_checked(
+        controller, members, member_count);
     return CONTROLLER_NATIVE_DEFAULT_FAILED;
 }
 

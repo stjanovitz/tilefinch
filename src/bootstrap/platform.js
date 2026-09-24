@@ -6,6 +6,20 @@
   const cssSupportsNative = globalThis.__tilefinchCssSupports;
   /* Same cap dom.js applies, for the walks here that only need the bound. */
   const ancestorLimit = globalThis.__tilefinchAncestorLimit;
+  /* Web IDL exposes interface members as enumerable; class syntax defines
+     them non-enumerable, so interfaces written as classes flip them here. */
+  const enumerateInterfaceMembers = (constructor) => {
+    const prototype = constructor.prototype;
+    for (const key of Reflect.ownKeys(prototype)) {
+      if (key === "constructor" || key === Symbol.toStringTag) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+      if (descriptor)
+        Object.defineProperty(prototype, key, {
+          ...descriptor,
+          enumerable: true,
+        });
+    }
+  };
   /* See the matching declarations in dom.js: hardening.js only sees the
      globals that exist when it runs, so anything created on first write has
      to be declared non-enumerable here instead. */
@@ -343,10 +357,21 @@
           !/::part\([^)]*\):(is|where)\(\s*\[/i.test(selector)
         );
       };
+    /* Validation is a dozen regular expressions and a character scan, far
+       more than the native match; pages ask the same few selectors
+       repeatedly (closest() once per ancestor). Remember recent valid
+       ones; an invalid selector is re-checked and throws every time. */
+    const validSelectors = new Set(),
+      validSelectorLimit = 64;
     globalThis.__tilefinchAssertSelector = (value) => {
       value = String(value);
+      if (validSelectors.has(value)) return value;
       if (!selectorSyntaxValid(value))
         throw new DOMException("Invalid selector", "SyntaxError");
+      if (value.length <= 256) {
+        if (validSelectors.size >= validSelectorLimit) validSelectors.clear();
+        validSelectors.add(value);
+      }
       return value;
     };
     const documentQuery = Document.prototype.querySelector,
@@ -355,8 +380,10 @@
       elementQueryAll = Element.prototype.querySelectorAll,
       elementMatches = Element.prototype.matches,
       selectorList = (values) => {
-        const result = Object.create(NodeList.prototype),
-          length = Math.min(Number(values?.length) >>> 0, 16384);
+        /* Same bound as dom.js nodeList: refuse, never truncate. */
+        const length = Number(values?.length) >>> 0;
+        if (length > 16384) throw new RangeError("NodeList limit exceeded");
+        const result = Object.create(NodeList.prototype);
         for (let index = 0; index < length; index++)
           Object.defineProperty(result, index, {
             configurable: true,
@@ -468,35 +495,40 @@
       },
       wrappedElementMatches = function matches(value) {
         value = __tilefinchAssertSelector(value);
-        const compact = value.replace(/\s+/g, "").toLowerCase();
+        return matchesValidSelector(
+          this, value, value.replace(/\s+/g, "").toLowerCase(), value.trim());
+      },
+      /* matches() for a selector already validated, with its compact and
+         trimmed forms computed once by the caller. */
+      matchesValidSelector = (element, value, compact, trimmed) => {
         if (
           compact === ":defined" ||
           compact === ":not(:defined)"
         ) {
           const defined =
-            globalThis.__tilefinchCustomElementIsDefined?.(this) ?? true;
+            globalThis.__tilefinchCustomElementIsDefined?.(element) ?? true;
           return compact === ":defined" ? defined : !defined;
         }
-        if (value.trim() === ":invalid") return invalidElement(this);
-        if (value.trim() === ":valid") {
+        if (trimmed === ":invalid") return invalidElement(element);
+        if (trimmed === ":valid") {
           const internals =
-            globalThis.__tilefinchElementInternalsFor?.(this);
+            globalThis.__tilefinchElementInternalsFor?.(element);
           return (
               !!internals ||
               /^(?:button|fieldset|form|input|select|textarea)$/.test(
-                String(this.localName || ""),
+                String(element.localName || ""),
               )
-            ) && !invalidElement(this);
+            ) && !invalidElement(element);
         }
-        if (value.trim() === ":disabled") {
-          const disabled = customControlDisabled(this);
+        if (trimmed === ":disabled") {
+          const disabled = customControlDisabled(element);
           if (disabled !== null) return disabled;
         }
-        if (value.trim() === ":enabled") {
-          const disabled = customControlDisabled(this);
+        if (trimmed === ":enabled") {
+          const disabled = customControlDisabled(element);
           if (disabled !== null) return !disabled;
         }
-        return elementMatches.call(this, value);
+        return elementMatches.call(element, value);
       },
       scopeMatch = (candidate, origin, selector) => {
         const value = selector.trim();
@@ -515,7 +547,9 @@
       },
       wrappedElementClosest = function closest(value) {
         value = __tilefinchAssertSelector(value);
-        const scoped = value.includes(":scope");
+        const scoped = value.includes(":scope"),
+          compact = value.replace(/\s+/g, "").toLowerCase(),
+          trimmed = value.trim();
         for (
           let at = this, steps = 0;
           at && steps < ancestorLimit;
@@ -524,7 +558,7 @@
           if (
             scoped
               ? scopeMatch(at, this, value)
-              : wrappedElementMatches.call(at, value)
+              : matchesValidSelector(at, value, compact, trimmed)
           )
             return at;
         return null;
@@ -799,27 +833,6 @@
       globalThis.__tilefinchExposeNamedProperty(names[index]);
   };
   globalThis.__tilefinchRefreshNamedProperties();
-  const fields = new Map([["solution", { value: "" }]]);
-  const form = { onsubmit: null, children: [] };
-  form.elements = {
-    namedItem(name) {
-      if (!fields.has(name)) fields.set(name, { value: "" });
-      return fields.get(name);
-    },
-  };
-  form.appendChild = function (element) {
-    this.children.push(element);
-    if (element.name) fields.set(element.name, element);
-    return element;
-  };
-  form.requestSubmit = function () {
-    const event = { target: this, preventDefault() {} };
-    if (typeof this.onsubmit === "function" && this.onsubmit(event) === false)
-      return;
-    globalThis.__tilefinchSubmitted = true;
-    globalThis.pocSummary =
-      "form-submit solution=" + this.elements.namedItem("solution").value;
-  };
   const urlSearchParamLimit = 8192,
     tilefinchUSVString = (value) => {
       const text = String(value);
@@ -6963,16 +6976,8 @@
     configurable: true,
     value: "Screen",
   });
-  for (const constructor of [Screen, ScreenOrientation])
-    for (const key of Reflect.ownKeys(constructor.prototype)) {
-      if (key === "constructor" || key === Symbol.toStringTag) continue;
-      const descriptor = Object.getOwnPropertyDescriptor(
-        constructor.prototype, key);
-      Object.defineProperty(constructor.prototype, key, {
-        ...descriptor,
-        enumerable: true,
-      });
-    }
+  enumerateInterfaceMembers(Screen);
+  enumerateInterfaceMembers(ScreenOrientation);
   const screenValue = new Screen(screenToken);
   globalThis.Screen = Screen;
   globalThis.ScreenOrientation = ScreenOrientation;
@@ -7939,17 +7944,7 @@
       Plugin,
       MimeType,
     ])
-      for (const key of Reflect.ownKeys(constructor.prototype)) {
-        const descriptor = Object.getOwnPropertyDescriptor(
-          constructor.prototype,
-          key,
-        );
-        if (descriptor && key !== "constructor" && key !== Symbol.toStringTag)
-          Object.defineProperty(constructor.prototype, key, {
-            ...descriptor,
-            enumerable: true,
-          });
-      }
+      enumerateInterfaceMembers(constructor);
     globalThis.Navigator = Navigator;
     globalThis.NavigatorUAData = NavigatorUAData;
     globalThis.UserActivation = UserActivation;
@@ -8131,18 +8126,7 @@
         configurable: true,
         value: tag,
       });
-      for (const key of Reflect.ownKeys(constructor.prototype)) {
-        if (key === "constructor" || key === Symbol.toStringTag) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(
-          constructor.prototype,
-          key,
-        );
-        if (descriptor)
-          Object.defineProperty(constructor.prototype, key, {
-            ...descriptor,
-            enumerable: true,
-          });
-      }
+      enumerateInterfaceMembers(constructor);
     }
     Object.defineProperty(Navigator.prototype, "keyboard", {
       configurable: true,
@@ -9849,21 +9833,6 @@
     enumerable: true,
     configurable: true,
   });
-  globalThis.r = {
-    config: {},
-    setup(value) {
-      Object.assign(this.config, value);
-    },
-  };
-  globalThis.mw = {
-    config: {
-      set() {},
-      get() {
-        return undefined;
-      },
-    },
-    loader: { state() {}, implement() {}, load() {} },
-  };
   globalThis.__tilefinchDispatchDOMContentLoaded = () => {
     if (document.readyState === "complete") return;
     const navigationState =

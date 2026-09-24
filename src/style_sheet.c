@@ -14,6 +14,7 @@
 #include <lexbor/tag/tag.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/url.h"
 
 #define STYLE_VARIABLE_CACHE_DEFAULT_ENTRIES 256u
 #define STYLE_VARIABLE_CACHE_MIN_ENTRIES 32u
@@ -1210,9 +1211,12 @@ static bool stylesheet_run_parse_transaction(
     *sheet->resolve_scratch = saved_scratch;
     if (parsed) {
         sheet->rule_batch_dirty = true;
+        tilefinch_platform_trace_step("css-rule-order");
         if (!sheet->rule_batch_active) stylesheet_finalize_rule_order(sheet);
     }
+    tilefinch_platform_trace_step("css-suffix-finish");
     if (own_suffix_state) stylesheet_suffix_state_finish(sheet, parsed);
+    tilefinch_platform_trace_step("css-added");
     return parsed;
 }
 
@@ -1386,10 +1390,12 @@ bool stylesheet_add_css_from_context_capture_ir(
                 builder.length);
     }
 #endif
+    tilefinch_platform_trace_step("css-ir-finish");
     style_parsed_ir_builder_finish(
         &builder, sheet->viewport_width, sheet->viewport_height, length,
         parsed,
         ir_data, ir_length);
+    tilefinch_platform_trace_step("css-ir-done");
     return parsed;
 }
 
@@ -1884,6 +1890,55 @@ bool stylesheet_add_user_css(Stylesheet *sheet, const char *css, size_t length)
     StyleCssTextInput input = {css, length};
     return stylesheet_run_parse_transaction(sheet, NULL, NULL, 1, false,
         NULL, stylesheet_parse_text_body, &input);
+}
+
+static bool style_span_contains_ci(const char *text, size_t length,
+                                   const char *needle)
+{
+    size_t needle_length = strlen(needle);
+    for (size_t at = 0; at + needle_length <= length; at++) {
+        if (strncasecmp(text + at, needle, needle_length) == 0) return true;
+    }
+    return false;
+}
+
+bool stylesheet_direction_change_rules(const Stylesheet *sheet,
+                                       size_t *indices, size_t capacity,
+                                       size_t *count)
+{
+    if (count != NULL) *count = 0;
+    if (sheet == NULL || count == NULL || (indices == NULL && capacity != 0))
+        return false;
+    for (size_t i = 0; i < sheet->count; i++) {
+        const StyleDeclaration *declaration =
+            stylesheet_rule_declaration(sheet, &sheet->rules[i]);
+        if (declaration == NULL) continue;
+        bool changes =
+            ((declaration->mask_high & S2_DIRECTION) != 0
+             && computed_style_direction_rtl(&declaration->values))
+            || ((declaration->mask_high & S2_UNICODE_BIDI) != 0
+                && (declaration->values.unicode_bidi
+                        == STYLE_UNICODE_BIDI_OVERRIDE
+                    || declaration->values.unicode_bidi
+                        == STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE))
+            || (declaration->deferred_declarations != NULL
+                && (style_span_contains_ci(
+                        declaration->deferred_declarations,
+                        declaration->deferred_length, "direction")
+                    || style_span_contains_ci(
+                        declaration->deferred_declarations,
+                        declaration->deferred_length, "unicode-bidi")));
+        if (!changes) continue;
+        if (*count == capacity) return false;
+        indices[(*count)++] = i;
+    }
+    return true;
+}
+
+bool stylesheet_rule_index_matches(const Stylesheet *sheet, size_t index,
+                                   lxb_dom_node_t *node)
+{
+    return style_rule_selector_matches(sheet, index, node);
 }
 
 size_t stylesheet_layout_island_selectors(const Stylesheet *sheet,

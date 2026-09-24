@@ -12,9 +12,10 @@
 
 #define KIB (1024u)
 #define MIB (1024u * 1024u)
-#define BROWSER_PROVISIONAL_FRAME_LIMIT 2u
+#define BROWSER_PAINT_AHEAD_TILE_CAPACITY 24u
 #define BROWSER_PROVISIONAL_FINAL_RESERVE (1u * MIB)
-#define BROWSER_PROVISIONAL_GROW_MAX_ALLOC_US UINT64_C(100000)
+/* Tile raster between frontend checkpoints while a preview is painted. */
+#define BROWSER_PROVISIONAL_RASTER_SLICE_US UINT64_C(6000)
 #define BROWSER_FONT_IDLE_READ_BYTES (16u * KIB)
 #define BROWSER_BLANK_READER_SETTLE_TICKS 12u
 #define BROWSER_RECOVERY_SETTLE_US UINT64_C(250000)
@@ -44,6 +45,32 @@ typedef struct {
     char url[NAVIGATION_URL_LIMIT];
 } BrowserEngineNavigationWork;
 
+/* The load preview on screen. NONE: nothing. FRAME: a frame is presented
+   but nothing can move it (a one-off paint, or the scrollable preview was
+   dropped). LIVE: a tile cache over the stream's retained preview composes
+   any scroll position. FILLING: live, with visible tiles still to
+   rasterize (a checkerboard on screen). */
+typedef enum {
+    BROWSER_PREVIEW_VIEW_NONE = 0,
+    BROWSER_PREVIEW_VIEW_FRAME,
+    BROWSER_PREVIEW_VIEW_LIVE,
+    BROWSER_PREVIEW_VIEW_FILLING
+} BrowserPreviewView;
+
+/* An activation on the preview that waits for the page: IDLE, WAITING for
+   the commit, then READY for the frontend to take once. */
+typedef enum {
+    BROWSER_DEFERRED_ACTIVATION_IDLE = 0,
+    BROWSER_DEFERRED_ACTIVATION_WAITING,
+    BROWSER_DEFERRED_ACTIVATION_READY
+} BrowserDeferredActivation;
+
+static bool browser_preview_view_live(BrowserPreviewView view)
+{
+    return view == BROWSER_PREVIEW_VIEW_LIVE
+        || view == BROWSER_PREVIEW_VIEW_FILLING;
+}
+
 struct BrowserEngine {
     BrowserConfig config;
     Budget budget;
@@ -61,12 +88,31 @@ struct BrowserEngine {
     uint64_t font_publication_retry_us;
     TileCache render;
     TileCache candidate_render;
-    uint16_t *provisional_frames;
-    size_t provisional_frame_count;
-    size_t provisional_current_frame;
+    /* The load preview: one frame, composed at any scroll position from a
+       tile cache over the stream's retained preview layout. The layout is
+       borrowed and revalidated (navigation_load_retained_preview) before
+       every use. A repaint rasterizes into the other cache while the front
+       one keeps serving scrolls, then they swap. */
+    BrowserPreviewView provisional_view;
+    uint16_t *provisional_frame;
     size_t provisional_frame_pixels;
-    int provisional_scroll_positions[BROWSER_PROVISIONAL_FRAME_LIMIT];
-    bool provisional_ready;
+    TileCache provisional_renders[2];
+    /* The cache over provisional_layout (LIVE and FILLING). */
+    unsigned provisional_front;
+    const LayoutDocument *provisional_layout;
+    int provisional_scroll_y;
+    int provisional_maximum_scroll;
+    /* Of the live preview, for the const viewport accessor (which must not
+       read the borrowed layout without revalidating it). */
+    int provisional_content_end;
+    int provisional_viewport_height;
+    /* Focus on the preview (a link or control node of the pending DOM),
+       carried into the committed page; an activation that has to wait for
+       it (a control, a same-page link) runs once the page commits. */
+    lxb_dom_node_t *provisional_focus_node;
+    BrowserDeferredActivation provisional_activation;
+    /* Direction of the last scroll: where paint-ahead goes (+1 below). */
+    int paint_ahead_direction;
     DocumentBacking backing;
     TilefinchDiagnostics diagnostics;
     uint16_t *framebuffer;
@@ -241,7 +287,10 @@ void browser_device_profile_psp3000(BrowserDeviceProfile *profile)
         .recommended_memory_limit = BROWSER_PSP_REALISTIC_CONTENT_LIMIT,
         .minimum_non_page_reserve =
             BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE,
-        .maximum_tile_capacity = 8
+        /* One screen (up to sixteen 128 px tiles at 480x272) plus two rows
+           of paint-ahead. Only the first eight are reserved; the rest are
+           admitted with budget headroom and reclaimed first. */
+        .maximum_tile_capacity = 24
     };
 }
 
@@ -265,8 +314,11 @@ void browser_config_init(BrowserConfig *config,
         .declared_css_width = 0,
         .declared_css_height = 0,
         .progressive_first_paint = true,
-        .tile_capacity = selected.maximum_tile_capacity < 8
-                         ? selected.maximum_tile_capacity : 8,
+        .relayout_preview_threshold_us = UINT64_C(150000),
+        .tile_capacity = selected.maximum_tile_capacity
+                             < BROWSER_PAINT_AHEAD_TILE_CAPACITY
+                         ? selected.maximum_tile_capacity
+                         : BROWSER_PAINT_AHEAD_TILE_CAPACITY,
         .idle_work_budget_us = 500,
         .idle_work_maximum_units = 8,
         .javascript = {
@@ -328,8 +380,10 @@ bool browser_config_apply_psp_memory_profile(
         BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE;
     config->history_capacity = strict ? 8 : 16;
     config->session_cache_limit = strict ? 512u * KIB : 1u * MIB;
-    config->tile_capacity = config->device.maximum_tile_capacity < 8
-        ? config->device.maximum_tile_capacity : 8;
+    config->tile_capacity = config->device.maximum_tile_capacity
+            < BROWSER_PAINT_AHEAD_TILE_CAPACITY
+        ? config->device.maximum_tile_capacity
+        : BROWSER_PAINT_AHEAD_TILE_CAPACITY;
     config->javascript.heap_limit = strict ? 4u * MIB : 5u * MIB;
     size_t script_source_limit = strict ? 1u * MIB : 2u * MIB;
     if (config->javascript.maximum_total_bytes > script_source_limit)
@@ -749,17 +803,50 @@ static bool browser_engine_init_tile_cache(
     return true;
 }
 
+static void browser_engine_drop_provisional_render(BrowserEngine *engine)
+{
+    for (size_t i = 0; i < 2u; i++) {
+        TileCache *cache = &engine->provisional_renders[i];
+        /* The borrowed layout may already be gone; destroying the cache
+           touches only what the cache owns. */
+        if (cache->budget != NULL) tile_cache_destroy(cache);
+        memset(cache, 0, sizeof(*cache));
+    }
+    engine->provisional_layout = NULL;
+    if (browser_preview_view_live(engine->provisional_view))
+        engine->provisional_view = BROWSER_PREVIEW_VIEW_FRAME;
+}
+
+/* The front cache only: a repaint may be rasterizing the other one (a
+   scroll during its cooperative slices reaches here). */
+static void browser_engine_drop_provisional_front(BrowserEngine *engine)
+{
+    TileCache *front = &engine->provisional_renders[engine->provisional_front];
+    if (front->budget != NULL) tile_cache_destroy(front);
+    memset(front, 0, sizeof(*front));
+    engine->provisional_layout = NULL;
+    if (browser_preview_view_live(engine->provisional_view))
+        engine->provisional_view = BROWSER_PREVIEW_VIEW_FRAME;
+}
+
 static void browser_engine_reset_provisional_viewport(BrowserEngine *engine)
 {
     if (engine == NULL) return;
-    budget_free(&engine->budget, engine->provisional_frames);
-    engine->provisional_frames = NULL;
-    engine->provisional_frame_count = 0;
-    engine->provisional_current_frame = 0;
+    browser_engine_drop_provisional_render(engine);
+    if (engine->provisional_frame != NULL)
+        tilefinch_platform_retire_frame(engine->provisional_frame);
+    budget_free(&engine->budget, engine->provisional_frame);
+    engine->provisional_frame = NULL;
     engine->provisional_frame_pixels = 0;
-    memset(engine->provisional_scroll_positions, 0,
-           sizeof(engine->provisional_scroll_positions));
-    engine->provisional_ready = false;
+    engine->provisional_scroll_y = 0;
+    engine->provisional_maximum_scroll = 0;
+    engine->provisional_content_end = 0;
+    engine->provisional_viewport_height = 0;
+    engine->provisional_focus_node = NULL;
+    if (engine->provisional_activation == BROWSER_DEFERRED_ACTIVATION_WAITING)
+        engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_IDLE;
+    engine->provisional_view = BROWSER_PREVIEW_VIEW_NONE;
+    engine->navigation.provisional_reader_y = 0;
 }
 
 static bool browser_engine_initialize_render_shell(
@@ -1004,208 +1091,345 @@ static void browser_engine_commit_candidate_shell(void *opaque)
     engine->candidate_shell_prepared = false;
 }
 
+/* Enough tiles for one screen at any scroll position: one row more than
+   the viewport spans when it starts mid-tile. */
+static size_t browser_engine_provisional_tile_capacity(
+    size_t width, size_t height)
+{
+    size_t columns = (width + TILEFINCH_TILE_SIZE - 1u) / TILEFINCH_TILE_SIZE;
+    size_t rows = (height + TILEFINCH_TILE_SIZE - 1u) / TILEFINCH_TILE_SIZE;
+    return columns * (rows + 1u);
+}
+
+static int browser_engine_provisional_viewport_height(
+    const BrowserEngine *engine, const LayoutDocument *layout)
+{
+    return layout != NULL && layout->viewport.css_height > 0
+        ? layout->viewport.css_height
+        : engine->config.device.framebuffer_height;
+}
+
+static int browser_engine_provisional_clamp(
+    const BrowserEngine *engine, const LayoutDocument *layout, int *maximum)
+{
+    /* The pending document's viewport; the session's is the incumbent's
+       (or unset before a first page). */
+    int viewport_height =
+        browser_engine_provisional_viewport_height(engine, layout);
+    int limit = layout->height > viewport_height
+        ? layout->height - viewport_height : 0;
+    if (maximum != NULL) *maximum = limit;
+    int y = engine->provisional_scroll_y;
+    return y < 0 ? 0 : (y > limit ? limit : y);
+}
+
+/* The front cache is usable only while the stream still offers the layout
+   it was built over; re-resolved image pointers invalidate what it derived
+   from them (scaled clone, decoded-image cache). */
+static TileCache *browser_engine_provisional_front(BrowserEngine *engine)
+{
+    if (!browser_preview_view_live(engine->provisional_view)) return NULL;
+    TileCache *front =
+        &engine->provisional_renders[engine->provisional_front];
+    bool images_changed = false;
+    const LayoutDocument *layout = navigation_load_retained_preview(
+        engine->navigation_work.load, &images_changed);
+    if (layout == NULL || layout != engine->provisional_layout) {
+        browser_engine_drop_provisional_front(engine);
+        return NULL;
+    }
+    if (images_changed) {
+        size_t capacity = front->tile_capacity;
+        tile_cache_destroy(front);
+        memset(front, 0, sizeof(*front));
+        if (!browser_engine_init_tile_cache(
+                engine, front, layout, capacity)) {
+            memset(front, 0, sizeof(*front));
+            browser_engine_drop_provisional_front(engine);
+            return NULL;
+        }
+        tile_cache_set_fast_text_raster(front, true);
+    }
+    return front;
+}
+
+/* A node's first link region, else its first control region, in CSS page
+   coordinates. */
+static bool browser_engine_preview_region(
+    const LayoutDocument *layout, const lxb_dom_node_t *node,
+    int *x, int *y, int *width, int *height, const LinkRegion **link)
+{
+    if (link != NULL) *link = NULL;
+    if (layout == NULL || node == NULL) return false;
+    for (size_t i = 0; i < layout->link_count; i++) {
+        const LinkRegion *region = &layout->links[i];
+        if (region->node != node) continue;
+        *x = region->x; *y = region->y;
+        *width = region->width; *height = region->height;
+        if (link != NULL) *link = region;
+        return true;
+    }
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *region = &layout->controls[i];
+        if (region->node != node) continue;
+        *x = region->x; *y = region->y;
+        *width = region->width; *height = region->height;
+        return true;
+    }
+    return false;
+}
+
+static void browser_engine_paint_provisional_focus(
+    BrowserEngine *engine, const LayoutDocument *layout, int scroll_y)
+{
+    int x = 0, y = 0, width = 0, height = 0;
+    if (engine->provisional_focus_node == NULL
+        || !browser_engine_preview_region(
+               layout, engine->provisional_focus_node,
+               &x, &y, &width, &height, NULL)) return;
+    const ViewportContext *viewport = &layout->viewport;
+    render_paint_focus_outline(
+        engine->provisional_frame, engine->provisional_frame_pixels,
+        engine->config.device.framebuffer_width,
+        engine->config.device.framebuffer_height,
+        viewport_css_to_device(viewport, x),
+        viewport_css_to_device(viewport, y - scroll_y),
+        viewport_css_to_device(viewport, width),
+        viewport_css_to_device(viewport, height));
+}
+
+/* Compose the preview frame at the reader's position from resident tiles,
+   a checkerboard where one is missing, rasterizing at most raster_units
+   first, and present it. */
+static bool browser_engine_compose_provisional(
+    BrowserEngine *engine, size_t raster_units)
+{
+    if (engine->provisional_view == BROWSER_PREVIEW_VIEW_NONE
+        || engine->provisional_frame == NULL)
+        return false;
+    TileCache *front = browser_engine_provisional_front(engine);
+    if (front == NULL) return false;
+    int width = engine->config.device.framebuffer_width;
+    int height = engine->config.device.framebuffer_height;
+    int y = browser_engine_provisional_clamp(
+        engine, engine->provisional_layout,
+        &engine->provisional_maximum_scroll);
+    engine->provisional_scroll_y = y;
+    RenderFrameWorkResult prepared = tile_cache_prepare_frame_bounded(
+        front, y, width, height,
+        raster_units == 0 ? 0 : BROWSER_PROVISIONAL_RASTER_SLICE_US,
+        raster_units);
+    if (prepared == RENDER_FRAME_WORK_FAILED) return false;
+    bool complete = prepared == RENDER_FRAME_WORK_READY;
+    front->placeholder_missing = !complete;
+    bool rendered = tile_cache_set_frame(
+            front, engine->provisional_frame,
+            engine->provisional_frame_pixels)
+        && tile_cache_render_frame(front, y, width, height, NULL);
+    front->placeholder_missing = false;
+    if (!rendered) return false;
+    browser_engine_paint_provisional_focus(
+        engine, engine->provisional_layout, y);
+    engine->provisional_view = complete
+        ? BROWSER_PREVIEW_VIEW_LIVE : BROWSER_PREVIEW_VIEW_FILLING;
+    (void) tilefinch_platform_present_rgb565(
+        engine->provisional_frame, (size_t) width, (size_t) height,
+        (size_t) width);
+    return true;
+}
+
+/* Reject a first frame that is one flat surface or a lone border or
+   placeholder row, structurally rather than by a pixel count: a line of
+   text or a logo marks several scanlines, a rule marks one or two. (A
+   count of two scanlines' worth of pixels rejected a page header logo at
+   929 of 960 and accepted it at 960 on another run, so first paint flipped
+   between about 4 s and the end of the load.) */
+static bool browser_engine_provisional_frame_has_contrast(
+    const uint16_t *frame, size_t width, size_t height)
+{
+    const size_t required_rows = 6u;
+    const size_t required_pixels = width / 2u;
+    size_t contrasting = 0, contrasting_rows = 0;
+    uint16_t background = frame[0];
+    for (size_t row = 0; row < height
+         && (contrasting_rows < required_rows
+             || contrasting < required_pixels); row++) {
+        const uint16_t *line = frame + row * width;
+        size_t before = contrasting;
+        for (size_t x = 0; x < width; x++) {
+            if (line[x] != background) contrasting++;
+        }
+        if (contrasting != before) contrasting_rows++;
+    }
+    return contrasting_rows >= required_rows
+        && contrasting >= required_pixels;
+}
+
 static bool browser_engine_capture_provisional_viewport(
     BrowserEngine *engine, NavigationSession *candidate,
     const LayoutDocument *layout, size_t width, size_t height)
 {
     if (engine == NULL || candidate == NULL || layout == NULL
-        || width == 0 || height == 0
-        || engine->config.tile_capacity == 0
-        || width > SIZE_MAX / height) return false;
-    if (engine->navigation_work.metrics.provisional_capture_started_us == 0) {
-        uint64_t now_us =
-            tilefinch_platform_monotonic_time_us();
-        engine->navigation_work.metrics.provisional_capture_started_us =
-            now_us >= engine->navigation_work.started_us
-                ? now_us - engine->navigation_work.started_us : 0;
+        || width == 0 || height == 0 || width > INT_MAX
+        || height > INT_MAX || width > SIZE_MAX / height) return false;
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (work->metrics.provisional_capture_started_us == 0) {
+        uint64_t now_us = tilefinch_platform_monotonic_time_us();
+        work->metrics.provisional_capture_started_us =
+            now_us >= work->started_us ? now_us - work->started_us : 0;
     }
     size_t pixels = width * height;
     if (pixels > SIZE_MAX / sizeof(uint16_t)) return false;
-    int viewport_height = candidate->viewport.css_height;
-    if (viewport_height <= 0) viewport_height = (int) height;
-    int maximum_scroll = layout->height > viewport_height
-        ? layout->height - viewport_height : 0;
-    /* The retained snapshot window is deliberately one page, not an
-       unbounded alternate document surface. The authoritative page owns
-       deeper scrolling after commit. */
-    if (maximum_scroll > viewport_height) maximum_scroll = viewport_height;
-    size_t desired_frame_count = maximum_scroll > 0
-        ? BROWSER_PROVISIONAL_FRAME_LIMIT : 1u;
-    if (pixels > SIZE_MAX / desired_frame_count
-        || pixels * desired_frame_count > SIZE_MAX / sizeof(uint16_t)) {
-        return false;
-    }
     const size_t frame_bytes = pixels * sizeof(uint16_t);
-    if (budget_pressure_required(
-            &engine->budget, frame_bytes,
-            BROWSER_PROVISIONAL_FINAL_RESERVE)) {
-        budget_record_pressure(
-            &engine->budget, BUDGET_PRESSURE_SPECULATION, frame_bytes, 0);
+    bool retains = candidate->progressive_paint_retains;
+    bool first = engine->provisional_view == BROWSER_PREVIEW_VIEW_NONE;
+    if (engine->provisional_frame == NULL) {
+        if (budget_pressure_required(
+                &engine->budget, frame_bytes,
+                BROWSER_PROVISIONAL_FINAL_RESERVE)) {
+            budget_record_pressure(
+                &engine->budget, BUDGET_PRESSURE_SPECULATION,
+                frame_bytes, 0);
+            return false;
+        }
+        uint64_t alloc_started_us = tilefinch_platform_monotonic_time_us();
+        engine->provisional_frame = budget_malloc_category(
+            &engine->budget, BUDGET_CATEGORY_RENDER, frame_bytes);
+        uint64_t alloc_finished_us = tilefinch_platform_monotonic_time_us();
+        if (alloc_finished_us >= alloc_started_us) {
+            candidate->performance.streaming_preview_frame_alloc_us +=
+                alloc_finished_us - alloc_started_us;
+        }
+        if (engine->provisional_frame == NULL) return false;
+        engine->provisional_frame_pixels = pixels;
+    }
+    size_t capacity =
+        browser_engine_provisional_tile_capacity(width, height);
+    /* Two caches only when there is room for both; otherwise give up
+       scrolling the preview on screen while its successor rasterizes. */
+    if (browser_preview_view_live(engine->provisional_view)
+        && budget_pressure_required(
+               &engine->budget, capacity * sizeof(RenderTile),
+               BROWSER_PROVISIONAL_FINAL_RESERVE)) {
+        browser_engine_drop_provisional_render(engine);
+    }
+    unsigned back_index = browser_preview_view_live(engine->provisional_view)
+        ? engine->provisional_front ^ 1u : 0u;
+    TileCache *back = &engine->provisional_renders[back_index];
+    if (back->budget != NULL) tile_cache_destroy(back);
+    memset(back, 0, sizeof(*back));
+    uint64_t cache_started_us = tilefinch_platform_monotonic_time_us();
+    if (!browser_engine_init_tile_cache(engine, back, layout, capacity)) {
+        memset(back, 0, sizeof(*back));
+        if (first) browser_engine_reset_provisional_viewport(engine);
         return false;
     }
-    browser_engine_reset_provisional_viewport(engine);
-    uint64_t alloc_started_us =
-        tilefinch_platform_monotonic_time_us();
-    engine->provisional_frames = budget_malloc_category(
-        &engine->budget, BUDGET_CATEGORY_RENDER, frame_bytes);
-    uint64_t alloc_finished_us =
-        tilefinch_platform_monotonic_time_us();
-    uint64_t first_alloc_us = alloc_finished_us >= alloc_started_us
-        ? alloc_finished_us - alloc_started_us : 0;
-    candidate->performance.streaming_preview_frame_alloc_us +=
-        first_alloc_us;
-    if (engine->provisional_frames == NULL) return false;
-    engine->provisional_frame_pixels = pixels;
-    engine->provisional_scroll_positions[0] = 0;
-    size_t frame_count = 1;
-
-    size_t capacity = engine->config.tile_capacity;
-    if (capacity > 8) capacity = 8;
-    TileCache preview = {0};
-    bool first_painted = false;
-    uint64_t cache_started_us =
-        tilefinch_platform_monotonic_time_us();
-    if (capacity != 0
-        && browser_engine_init_tile_cache(
-               engine, &preview, layout, capacity)) {
-        uint64_t cache_ready_us =
-            tilefinch_platform_monotonic_time_us();
-        if (cache_ready_us >= cache_started_us) {
-            candidate->performance.streaming_preview_cache_init_us +=
-                cache_ready_us - cache_started_us;
-        }
-        tile_cache_set_fast_text_raster(&preview, true);
-        for (size_t i = 0; i < frame_count; i++) {
-            uint16_t *frame = engine->provisional_frames + i * pixels;
-            uint64_t raster_started_us =
-                tilefinch_platform_monotonic_time_us();
-            bool rendered =
-                tile_cache_set_frame(&preview, frame, pixels)
-                && tile_cache_render_frame(
-                    &preview,
-                    engine->provisional_scroll_positions[i],
-                    (int) width, (int) height, NULL);
-            uint64_t raster_finished_us =
-                tilefinch_platform_monotonic_time_us();
-            if (raster_finished_us >= raster_started_us) {
-                candidate->performance.streaming_preview_raster_us +=
-                    raster_finished_us - raster_started_us;
-            }
-            if (!rendered) {
-                break;
-            }
-            if (i == 0) {
-                /* A structurally nonempty body can still rasterize as one
-                   flat background while its first visible content remains
-                   in a later response chunk. Publishing that frame would
-                   satisfy a timer without giving the user a page. Require a
-                   small, resolution-independent amount of authored visual
-                   contrast and let the streaming parser retry at its next
-                   bounded checkpoint when it is absent. */
-                size_t contrasting = 0;
-                uint16_t background = frame[0];
-                /* Reject a lone border/placeholder row as well as a fully
-                   flat surface. Two scanlines' worth of contrast is still a
-                   tiny resolution-relative threshold for real page text. */
-                const size_t required =
-                    width <= SIZE_MAX / 2u ? width * 2u : 64u;
-                for (size_t pixel = 1;
-                     pixel < pixels && contrasting < required; pixel++) {
-                    if (frame[pixel] != background) contrasting++;
-                }
-                if (contrasting < required) {
-                    candidate->performance
-                        .streaming_preview_empty_raster_skips++;
-                    break;
-                }
-            }
-            __sync_synchronize();
-            engine->provisional_frame_count = i + 1u;
-            if (i == 0) {
-                first_painted = true;
-                engine->provisional_current_frame = 0;
-                engine->provisional_ready = true;
-                BrowserEngineNavigationWork *work =
-                    &engine->navigation_work;
-                work->metrics.provisional_paints++;
-                work->metrics.provisional_frame_count = 1;
-                work->metrics.provisional_bytes =
-                    budget_usable_size(engine->provisional_frames);
-                uint64_t now_us =
-                    tilefinch_platform_monotonic_time_us();
-                work->metrics.provisional_first_present_us =
-                    now_us >= work->started_us
-                        ? now_us - work->started_us : 0;
-                uint64_t present_started_us = now_us;
-                (void) tilefinch_platform_present_rgb565(
-                    frame, width, height, width);
-                uint64_t present_finished_us =
-                    tilefinch_platform_monotonic_time_us();
-                if (present_finished_us >= present_started_us) {
-                    candidate->performance.streaming_preview_present_us +=
-                        present_finished_us - present_started_us;
-                }
-            } else {
-                engine->navigation_work.metrics.provisional_frame_count =
-                    i + 1u;
-            }
-            if (i == 0 && desired_frame_count > 1u) {
-                if (!tilefinch_platform_cooperate(
-                        "provisional-raster", i + 1u)) {
-                    break;
-                }
-                /*
-                 * Never make the useful first viewport wait for the optional
-                 * scroll snapshot. Grow only when the allocator proved cheap
-                 * and the second frame still leaves room for authoritative
-                 * commit state. Slow admission is a direct signal of PSP
-                 * heap pressure/fragmentation and must not create another
-                 * unresponsive interval immediately after first paint.
-                 */
-                size_t grown_bytes = frame_bytes * desired_frame_count;
-                if (first_alloc_us <=
-                        BROWSER_PROVISIONAL_GROW_MAX_ALLOC_US
-                    && !budget_pressure_required(
-                        &engine->budget, grown_bytes - frame_bytes,
-                        BROWSER_PROVISIONAL_FINAL_RESERVE)) {
-                    uint64_t grow_started_us =
-                        tilefinch_platform_monotonic_time_ns()
-                        / UINT64_C(1000);
-                    uint16_t *grown = budget_realloc_category(
-                        &engine->budget, BUDGET_CATEGORY_RENDER,
-                        engine->provisional_frames, grown_bytes);
-                    uint64_t grow_finished_us =
-                        tilefinch_platform_monotonic_time_ns()
-                        / UINT64_C(1000);
-                    if (grow_finished_us >= grow_started_us) {
-                        candidate->performance
-                            .streaming_preview_frame_alloc_us +=
-                            grow_finished_us - grow_started_us;
-                    }
-                    if (grown != NULL) {
-                        engine->provisional_frames = grown;
-                        engine->navigation_work.metrics.provisional_bytes =
-                            budget_usable_size(
-                                engine->provisional_frames);
-                        engine->provisional_scroll_positions[1] =
-                            maximum_scroll;
-                        frame_count = desired_frame_count;
-                    }
-                }
-            } else if (i + 1u < frame_count
-                       && !tilefinch_platform_cooperate(
-                           "provisional-raster", i + 1u)) {
-                break;
-            }
-        }
-        candidate->performance.progressive_decoded_image_builds +=
-            preview.decoded_image_builds;
-        candidate->performance.progressive_scaled_image_builds +=
-            preview.scaled_image_builds;
+    uint64_t cache_ready_us = tilefinch_platform_monotonic_time_us();
+    if (cache_ready_us >= cache_started_us) {
+        candidate->performance.streaming_preview_cache_init_us +=
+            cache_ready_us - cache_started_us;
     }
-    if (preview.budget != NULL) tile_cache_destroy(&preview);
-    if (!first_painted) browser_engine_reset_provisional_viewport(engine);
-    return first_painted;
+    tile_cache_set_fast_text_raster(back, true);
+    /* Rasterize off screen in bounded slices; between them the frontend
+       keeps scrolling (and filling) the preview already on screen, and each
+       slice follows the reader's latest position. */
+    uint64_t raster_started_us = tilefinch_platform_monotonic_time_us();
+    RenderFrameWorkResult prepared = RENDER_FRAME_WORK_PENDING;
+    int y = 0;
+    for (size_t slice = 1; ; slice++) {
+        y = browser_engine_provisional_clamp(engine, layout, NULL);
+        prepared = tile_cache_prepare_frame_bounded(
+            back, y, (int) width, (int) height,
+            BROWSER_PROVISIONAL_RASTER_SLICE_US, SIZE_MAX);
+        if (prepared != RENDER_FRAME_WORK_PENDING) break;
+        if (!tilefinch_platform_cooperate("provisional-raster", slice)) {
+            prepared = RENDER_FRAME_WORK_CANCELLED;
+            break;
+        }
+    }
+    uint64_t raster_finished_us = tilefinch_platform_monotonic_time_us();
+    if (raster_finished_us >= raster_started_us) {
+        candidate->performance.streaming_preview_raster_us +=
+            raster_finished_us - raster_started_us;
+    }
+    candidate->performance.progressive_decoded_image_builds +=
+        back->decoded_image_builds;
+    candidate->performance.progressive_scaled_image_builds +=
+        back->scaled_image_builds;
+    bool composed = prepared == RENDER_FRAME_WORK_READY
+        && tile_cache_set_frame(
+               back, engine->provisional_frame, pixels)
+        && tile_cache_render_frame(
+               back, y, (int) width, (int) height, NULL);
+    /* A structurally nonempty body can still rasterize as one flat
+       background while its first visible content remains in a later
+       response chunk. Publishing that frame would satisfy a timer without
+       giving the user a page; the stream retries at a later checkpoint. */
+    if (composed && first
+        && !browser_engine_provisional_frame_has_contrast(
+               engine->provisional_frame, width, height)) {
+        candidate->performance.streaming_preview_empty_raster_skips++;
+        composed = false;
+    }
+    if (!composed) {
+        tile_cache_destroy(back);
+        memset(back, 0, sizeof(*back));
+        if (first) {
+            browser_engine_reset_provisional_viewport(engine);
+        } else {
+            /* The frame may hold the rejected composition. */
+            (void) browser_engine_compose_provisional(engine, 0);
+        }
+        return false;
+    }
+    browser_engine_paint_provisional_focus(engine, layout, y);
+    __sync_synchronize();
+    if (engine->provisional_view == BROWSER_PREVIEW_VIEW_NONE)
+        engine->provisional_view = BROWSER_PREVIEW_VIEW_FRAME;
+    engine->provisional_scroll_y = y;
+    if (retains) {
+        if (browser_preview_view_live(engine->provisional_view)) {
+            TileCache *old =
+                &engine->provisional_renders[engine->provisional_front];
+            tile_cache_destroy(old);
+            memset(old, 0, sizeof(*old));
+        }
+        engine->provisional_front = back_index;
+        engine->provisional_layout = layout;
+        engine->provisional_view = BROWSER_PREVIEW_VIEW_LIVE;
+        engine->provisional_content_end = layout->content_limit_y != 0
+            ? layout->content_limit_y : layout->height;
+        engine->provisional_viewport_height =
+            browser_engine_provisional_viewport_height(engine, layout);
+        (void) browser_engine_provisional_clamp(
+            engine, layout, &engine->provisional_maximum_scroll);
+    } else {
+        tile_cache_destroy(back);
+        memset(back, 0, sizeof(*back));
+    }
+    work->metrics.provisional_paints++;
+    work->metrics.provisional_bytes =
+        budget_usable_size(engine->provisional_frame);
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
+    uint64_t relative_us = now_us >= work->started_us
+        ? now_us - work->started_us : 0;
+    if (work->metrics.provisional_first_present_us == 0)
+        work->metrics.provisional_first_present_us = relative_us;
+    int reach = layout->content_limit_y != 0
+        ? layout->content_limit_y : layout->height;
+    if (reach > work->metrics.provisional_reach_px) {
+        work->metrics.provisional_reach_px = reach;
+        work->metrics.provisional_reach_us = relative_us;
+    }
+    uint64_t present_started_us = now_us;
+    (void) tilefinch_platform_present_rgb565(
+        engine->provisional_frame, width, height, width);
+    uint64_t present_finished_us = tilefinch_platform_monotonic_time_us();
+    if (present_finished_us >= present_started_us) {
+        candidate->performance.streaming_preview_present_us +=
+            present_finished_us - present_started_us;
+    }
+    return true;
 }
 
 static bool browser_engine_paint_progressive_preview(
@@ -1383,6 +1607,8 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
     }
     navigation_set_progressive_paint_preserves_incumbent(
         navigation, engine->config.progressive_first_paint);
+    navigation->relayout_preview_threshold_us =
+        engine->config.relayout_preview_threshold_us;
     if (!navigation_set_script_execution_policy(
             navigation, &engine->config.javascript.execution_policy)) {
         return set_error_code(
@@ -1915,10 +2141,10 @@ bool browser_engine_set_forced_dark(BrowserEngine *engine, bool enabled)
     if (engine->forced_dark == enabled) return true;
     engine->forced_dark = enabled;
     /*
-     * Provisional frames are immutable snapshots. Retaining one across an
-     * appearance change would briefly reintroduce the old palette during a
-     * pending navigation, so discard it rather than post-processing pixels
-     * whose image provenance has already been lost.
+     * The load preview's frame and tiles are raster products. Keeping them
+     * across an appearance change would briefly reintroduce the old palette
+     * during a pending navigation, so discard them rather than
+     * post-processing pixels whose image provenance has already been lost.
      */
     browser_engine_reset_provisional_viewport(engine);
     if (engine->render_ready) {
@@ -2441,11 +2667,17 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
     } else {
         document_backing_clear(&engine->backing);
     }
-    bool had_provisional = engine->provisional_ready;
+    bool had_provisional =
+        engine->provisional_view != BROWSER_PREVIEW_VIEW_NONE;
     int provisional_scroll_y = had_provisional
-        ? engine->provisional_scroll_positions[
-              engine->provisional_current_frame]
-        : 0;
+        ? engine->provisional_scroll_y : 0;
+    /* The pending DOM becomes the page's, so its nodes stay valid. */
+    lxb_dom_node_t *provisional_focus =
+        had_provisional ? engine->provisional_focus_node : NULL;
+    bool provisional_deferred =
+        provisional_focus != NULL
+        && engine->provisional_activation
+               == BROWSER_DEFERRED_ACTIVATION_WAITING;
     navigation_load_destroy(work->load);
     work->load = NULL;
     site_adapter_load_destroy(work->adapter);
@@ -2464,6 +2696,13 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
                     : navigation_current(
                           &engine->navigation)->scroll_y;
         }
+        /* Focus chosen on the preview stays; an activation that waited
+           for the page runs now (the frontend takes it). */
+        if (provisional_focus != NULL
+            && browser_engine_focus_node(engine, provisional_focus))
+            engine->provisional_activation = provisional_deferred
+                ? BROWSER_DEFERRED_ACTIVATION_READY
+                : BROWSER_DEFERRED_ACTIVATION_IDLE;
         work->status = BROWSER_NAVIGATION_JOB_SUCCEEDED;
         work->metrics.status = work->status;
         work->metrics.completion_per_mille = 1000;
@@ -2524,6 +2763,9 @@ static bool browser_engine_begin_navigation_request(
     }
     browser_engine_store_current_focus(engine);
     browser_engine_store_current_controls(engine);
+    /* A deferred activation belongs to the page that committed it; one the
+       frontend never took must not act on the next page. */
+    engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_IDLE;
     /* Native HOME can become interactive before any page font file is read.
        If the user outruns Wi-Fi association, finish the two-face baseline
        here before the candidate is allowed to measure text. */
@@ -3103,55 +3345,253 @@ bool browser_engine_provisional_viewport(
     if (engine == NULL || viewport == NULL
         || engine->navigation_work.status
                != BROWSER_NAVIGATION_JOB_PENDING
-        || !engine->provisional_ready
-        || engine->provisional_frames == NULL
-        || engine->provisional_frame_count == 0
-        || engine->provisional_current_frame
-               >= engine->provisional_frame_count) {
+        || engine->provisional_view == BROWSER_PREVIEW_VIEW_NONE
+        || engine->provisional_frame == NULL) {
         return false;
     }
     __sync_synchronize();
-    size_t current = engine->provisional_current_frame;
+    bool live = browser_preview_view_live(engine->provisional_view);
     *viewport = (BrowserProvisionalViewport) {
-        .pixels = engine->provisional_frames
-                  + current * engine->provisional_frame_pixels,
+        .pixels = engine->provisional_frame,
         .pixel_count = engine->provisional_frame_pixels,
-        .frame_count = engine->provisional_frame_count,
-        .current_frame = current,
-        .scroll_y = engine->provisional_scroll_positions[current],
-        .maximum_scroll_y =
-            engine->provisional_scroll_positions[
-                engine->provisional_frame_count - 1u],
+        .scroll_y = engine->provisional_scroll_y,
+        .maximum_scroll_y = engine->provisional_maximum_scroll,
+        .content_end_y = live ? engine->provisional_content_end : 0,
+        .viewport_height = live && engine->provisional_viewport_height > 0
+            ? engine->provisional_viewport_height
+            : engine->config.device.framebuffer_height,
+        .complete = engine->provisional_view != BROWSER_PREVIEW_VIEW_FILLING,
         .ready = true
     };
+    return true;
+}
+
+bool browser_engine_scroll_provisional_by(BrowserEngine *engine, int delta)
+{
+    if (engine == NULL || delta == 0
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_PENDING) return false;
+    /* Only a live preview moves; a press on a frame nothing can move stays
+       with the frontend until one is live again. */
+    if (browser_engine_provisional_front(engine) == NULL) return false;
+    (void) browser_engine_provisional_clamp(
+        engine, engine->provisional_layout,
+        &engine->provisional_maximum_scroll);
+    int maximum = engine->provisional_maximum_scroll;
+    int64_t target = (int64_t) engine->provisional_scroll_y + delta;
+    int y = target < 0 ? 0 : (target > maximum ? maximum : (int) target);
+    if (y == engine->provisional_scroll_y) return false;
+    /* Move at once, with a checkerboard where tiles are not rasterized or
+       content is not laid out yet; raster steps fill it in. The stream
+       lays out the next preview, and a provisional commit the page,
+       through where the reader is. */
+    engine->provisional_scroll_y = y;
+    engine->navigation.provisional_reader_y = y;
+    engine->navigation_work.metrics.provisional_scrolls++;
+    engine->navigation_work.metrics.provisional_scroll_y = y;
+    (void) browser_engine_compose_provisional(engine, 0);
     return true;
 }
 
 bool browser_engine_scroll_provisional_page(
     BrowserEngine *engine, int direction)
 {
-    BrowserProvisionalViewport before;
-    if (direction == 0
-        || !browser_engine_provisional_viewport(engine, &before)) {
+    if (engine == NULL || direction == 0
+        || browser_engine_provisional_front(engine) == NULL) return false;
+    /* The same step as Page Down on a loaded page. */
+    const ViewportContext *viewport = &engine->provisional_layout->viewport;
+    int viewport_height =
+        browser_engine_provisional_viewport_height(
+            engine, engine->provisional_layout);
+    int overlap = viewport_height / 8;
+    int minimum_overlap = viewport_device_to_css(viewport, 16);
+    if (overlap < minimum_overlap) overlap = minimum_overlap;
+    int step = viewport_height - overlap;
+    if (step <= 0) return false;
+    return browser_engine_scroll_provisional_by(
+        engine, direction > 0 ? step : -step);
+}
+
+bool browser_engine_provisional_focus_direction(
+    BrowserEngine *engine, ControllerFocusDirection direction)
+{
+    if (engine == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_PENDING
+        || browser_engine_provisional_front(engine) == NULL) return false;
+    const LayoutDocument *layout = engine->provisional_layout;
+    int top = engine->provisional_scroll_y;
+    int bottom = top
+        + browser_engine_provisional_viewport_height(engine, layout);
+    bool backward = direction == CONTROLLER_FOCUS_LEFT
+        || direction == CONTROLLER_FOCUS_UP;
+    bool vertical = direction == CONTROLLER_FOCUS_UP
+        || direction == CONTROLLER_FOCUS_DOWN;
+    int fx = 0, fy = 0, fw = 0, fh = 0;
+    bool from = engine->provisional_focus_node != NULL
+        && browser_engine_preview_region(
+               layout, engine->provisional_focus_node,
+               &fx, &fy, &fw, &fh, NULL)
+        && fy < bottom && fy + fh > top;
+    lxb_dom_node_t *best = NULL;
+    bool best_beam = false;
+    int64_t best_score = INT64_MAX;
+    for (size_t kind = 0; kind < 2; kind++) {
+        size_t count = kind == 0 ? layout->link_count : layout->control_count;
+        for (size_t i = 0; i < count; i++) {
+            lxb_dom_node_t *node;
+            int x, y, width, height;
+            if (kind == 0) {
+                const LinkRegion *r = &layout->links[i];
+                node = r->node; x = r->x; y = r->y;
+                width = r->width; height = r->height;
+            } else {
+                const ControlRegion *r = &layout->controls[i];
+                node = r->node; x = r->x; y = r->y;
+                width = r->width; height = r->height;
+            }
+            /* Only what the reader can see; scrolling reaches the rest. */
+            if (node == NULL || node == engine->provisional_focus_node
+                || width <= 0 || height <= 0
+                || y >= bottom || y + height <= top) continue;
+            int64_t score;
+            bool beam = false;
+            if (!from) {
+                /* Enter at the first visible item, or the last going back. */
+                score = (int64_t) y * 65536 + x;
+                if (backward) score = -score;
+            } else {
+                int64_t from_c = vertical ? (int64_t) fy * 2 + fh
+                                          : (int64_t) fx * 2 + fw;
+                int64_t to_c = vertical ? (int64_t) y * 2 + height
+                                        : (int64_t) x * 2 + width;
+                if (backward ? to_c >= from_c : to_c <= from_c) continue;
+                int64_t primary = to_c > from_c
+                    ? to_c - from_c : from_c - to_c;
+                int from_lo = vertical ? fx : fy;
+                int from_hi = vertical ? fx + fw : fy + fh;
+                int to_lo = vertical ? x : y;
+                int to_hi = vertical ? x + width : y + height;
+                beam = to_lo < from_hi && from_lo < to_hi;
+                int64_t secondary = to_hi <= from_lo ? from_lo - to_hi
+                    : (from_hi <= to_lo ? to_lo - from_hi : 0);
+                score = primary * 1024 + secondary * 64;
+                /* A target on the requested axis beats any diagonal one. */
+                if (best != NULL && best_beam && !beam) continue;
+                if (beam && !best_beam) best_score = INT64_MAX;
+            }
+            if (score >= best_score) continue;
+            best_score = score;
+            best_beam = beam;
+            best = node;
+        }
+    }
+    if (best == NULL) return false;
+    engine->provisional_focus_node = best;
+    engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_IDLE;
+    (void) browser_engine_compose_provisional(engine, 0);
+    return true;
+}
+
+BrowserPreviewActivation browser_engine_provisional_activate(
+    BrowserEngine *engine, bool at_point, int device_x, int device_y,
+    ControllerAction *action)
+{
+    if (action != NULL) memset(action, 0, sizeof(*action));
+    if (engine == NULL || action == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_PENDING
+        || browser_engine_provisional_front(engine) == NULL)
+        return BROWSER_PREVIEW_ACTIVATION_NONE;
+    const LayoutDocument *layout = engine->provisional_layout;
+    lxb_dom_node_t *node = NULL;
+    const LinkRegion *link = NULL;
+    if (at_point) {
+        const ViewportContext *viewport = &layout->viewport;
+        int x = viewport_device_to_css(viewport, device_x);
+        int y = viewport_device_to_css(viewport, device_y)
+            + engine->provisional_scroll_y;
+        /* The topmost region under the cursor: highest z, then latest. */
+        int best_z = INT_MIN;
+        for (size_t i = 0; i < layout->link_count; i++) {
+            const LinkRegion *r = &layout->links[i];
+            if (r->node == NULL || x < r->x || x >= r->x + r->width
+                || y < r->y || y >= r->y + r->height
+                || r->z_index < best_z) continue;
+            best_z = r->z_index;
+            node = r->node;
+            link = r;
+        }
+        for (size_t i = 0; i < layout->control_count; i++) {
+            const ControlRegion *r = &layout->controls[i];
+            if (r->node == NULL || x < r->x || x >= r->x + r->width
+                || y < r->y || y >= r->y + r->height
+                || r->z_index < best_z) continue;
+            best_z = r->z_index;
+            node = r->node;
+            link = NULL;
+        }
+        if (node == NULL) return BROWSER_PREVIEW_ACTIVATION_NONE;
+    } else {
+        int x, y, width, height;
+        node = engine->provisional_focus_node;
+        if (node == NULL
+            || !browser_engine_preview_region(
+                   layout, node, &x, &y, &width, &height, &link)) {
+            /* Nothing focused: the first press focuses, as on a page. */
+            engine->provisional_focus_node = NULL;
+            return browser_engine_provisional_focus_direction(
+                       engine, CONTROLLER_FOCUS_RIGHT)
+                ? BROWSER_PREVIEW_ACTIVATION_FOCUSED
+                : BROWSER_PREVIEW_ACTIVATION_NONE;
+        }
+    }
+    engine->provisional_focus_node = node;
+    bool same_document = false;
+    if (link != NULL && link->url != NULL
+        && navigation_load_resolve_preview_link(
+               engine->navigation_work.load, link->url, link->url_length,
+               action->url, sizeof(action->url), &same_document)
+        && !same_document
+        && (strncmp(action->url, "https://", 8) == 0
+            || strncmp(action->url, "http://", 7) == 0)) {
+        /* Leaving the page: the frontend cancels this load and follows. */
+        action->type = CONTROLLER_ACTION_NAVIGATE;
+        snprintf(action->method, sizeof(action->method), "GET");
+        engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_IDLE;
+        return BROWSER_PREVIEW_ACTIVATION_NAVIGATE;
+    }
+    /* A control, a link within this page, or anything but a plain web
+       link acts on the committed page. */
+    memset(action, 0, sizeof(*action));
+    engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_WAITING;
+    (void) browser_engine_compose_provisional(engine, 0);
+    return BROWSER_PREVIEW_ACTIVATION_DEFERRED;
+}
+
+bool browser_engine_take_deferred_activation(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->provisional_activation
+            != BROWSER_DEFERRED_ACTIVATION_READY) return false;
+    engine->provisional_activation = BROWSER_DEFERRED_ACTIVATION_IDLE;
+    return true;
+}
+
+bool browser_engine_provisional_raster_step(BrowserEngine *engine)
+{
+    if (engine == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_PENDING
+        || engine->provisional_view != BROWSER_PREVIEW_VIEW_FILLING)
+        return false;
+    /* A raster slice (as many tiles as fit), then one recompose. */
+    if (!browser_engine_compose_provisional(engine, SIZE_MAX)) {
+        /* Stop retrying a raster that failed; a scroll composes again. */
+        if (engine->provisional_view == BROWSER_PREVIEW_VIEW_FILLING)
+            engine->provisional_view = BROWSER_PREVIEW_VIEW_LIVE;
         return false;
     }
-    size_t next = before.current_frame;
-    if (direction > 0 && next + 1u < before.frame_count) next++;
-    else if (direction < 0 && next > 0) next--;
-    if (next == before.current_frame) return false;
-    engine->provisional_current_frame = next;
-    __sync_synchronize();
-    engine->navigation_work.metrics.provisional_scrolls++;
-    engine->navigation_work.metrics.provisional_scroll_y =
-        engine->provisional_scroll_positions[next];
-    const uint16_t *frame = engine->provisional_frames
-        + next * engine->provisional_frame_pixels;
-    (void) tilefinch_platform_present_rgb565(
-        frame,
-        (size_t) engine->config.device.framebuffer_width,
-        (size_t) engine->config.device.framebuffer_height,
-        (size_t) engine->config.device.framebuffer_width);
-    return true;
+    return engine->provisional_view == BROWSER_PREVIEW_VIEW_FILLING;
 }
 
 typedef bool (*BrowserEngineLoadOperation)(BrowserEngine *engine,
@@ -3774,11 +4214,28 @@ static bool browser_engine_find_jump(BrowserEngine *engine)
     return navigation_set_scroll(&engine->navigation, target);
 }
 
+/* Adopts the complete layout of a provisional page now, for a caller that
+   reads all of it. The render shell keeps tiles outside the damage. */
+static bool browser_engine_complete_layout(BrowserEngine *engine)
+{
+    /* Not gated by the idle retry backoff: this caller needs it now. */
+    if (!engine->navigation.page.loaded
+        || !engine->navigation.page.layout_provisional)
+        return true;
+    size_t before = engine->navigation.incremental_relayouts;
+    (void) navigation_complete_layout_sync(&engine->navigation);
+    if (engine->navigation.incremental_relayouts == before) return true;
+    (void) controller_rebind_focus(&engine->controller);
+    return browser_engine_apply_layout_damage(engine);
+}
+
 bool browser_engine_find_begin(BrowserEngine *engine, const char *query,
                                BrowserFindSnapshot *snapshot)
 {
     if (snapshot != NULL) memset(snapshot, 0, sizeof(*snapshot));
     if (!browser_engine_input_ready(engine) || query == NULL) return false;
+    /* Find matches every text run, including those below a placeholder. */
+    if (!browser_engine_complete_layout(engine)) return false;
     browser_engine_find_clear(engine);
     if (!page_find_build(
             &engine->find, &engine->budget,
@@ -4416,8 +4873,15 @@ bool browser_engine_render_frame(BrowserEngine *engine,
             TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "frame-write",
             "rendered frame could not be written");
     }
-    if (!previous_scroll_valid || scroll_y != previous_scroll_y) {
-        int prefetch_y = previous_scroll_valid && scroll_y < previous_scroll_y
+    bool scrolled = !previous_scroll_valid || scroll_y != previous_scroll_y;
+    if (scrolled) {
+        engine->paint_ahead_direction =
+            previous_scroll_valid && scroll_y < previous_scroll_y ? -1 : 1;
+    }
+    /* A repaint at the same position (a toast, focus, chrome) follows an
+       idle cancel on the frontend; paint ahead again unless it finished. */
+    if (scrolled || !tile_cache_prefetch_satisfied(&engine->render)) {
+        int prefetch_y = engine->paint_ahead_direction < 0
             ? scroll_y - 1
             : scroll_y + engine->navigation.viewport.css_height
                 + TILEFINCH_TILE_SIZE - 1;
@@ -4450,6 +4914,19 @@ bool browser_engine_render_frame(BrowserEngine *engine,
         "frame-rendered", "", engine->render.frames_rendered,
         engine->render.max_frame_us);
     return true;
+}
+
+bool browser_engine_render_placeholder_frame(BrowserEngine *engine,
+                                             size_t *placeholders)
+{
+    if (placeholders != NULL) *placeholders = 0;
+    if (engine == NULL || !engine->render_ready
+        || !engine->navigation.page.loaded) return false;
+    engine->render.placeholder_missing = true;
+    bool rendered = browser_engine_render_frame(engine, NULL);
+    engine->render.placeholder_missing = false;
+    if (placeholders != NULL) *placeholders = engine->render.placeholder_tiles;
+    return rendered;
 }
 
 BrowserRenderJobStatus browser_engine_render_frame_bounded(
@@ -4581,6 +5058,53 @@ bool browser_engine_run_idle_work(
         (void) tile_cache_run_idle_work(&engine->render,
             engine->config.idle_work_budget_us,
             engine->config.idle_work_maximum_units);
+        return true;
+    }
+    if (navigation_layout_completion_pending(&engine->navigation)
+        && !browser_engine_navigation_pending(engine)) {
+        /* The provisional screens of an in-place relayout are showing; the
+           rest of the page is built here, one attempt per idle slice. Like
+           an optional font batch it holds no author state, so a frontend
+           may abandon it for new input and it simply starts again. Fonts
+           and images wait: their publication would rebuild it anyway.
+           A reader waiting at the bottom for the next screens would only
+           cancel them again by pressing on (and never get them): in that
+           phase a frontend queues further scrolling down instead and still
+           yields to anything else. */
+        bool awaited =
+            navigation_layout_completion_awaited(&engine->navigation);
+        const char *completion_phase = awaited
+                ? "optional-layout-extension-awaited"
+                : "optional-layout-completion";
+        if (!tilefinch_platform_cooperate(completion_phase, 1)) {
+            (void) tilefinch_platform_cooperate(completion_phase, 0);
+            return true;
+        }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t completion_started = tilefinch_platform_monotonic_time_us();
+#endif
+        NavigationLayoutCompletion completion =
+            navigation_complete_layout(&engine->navigation);
+        (void) tilefinch_platform_cooperate(completion_phase, 0);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char completion_message[160];
+        snprintf(completion_message, sizeof(completion_message),
+                 "tilefinch-layout-completion: result=%d elapsed=%lluus "
+                 "limit=%d height=%d awaited=%d",
+                 (int) completion,
+                 (unsigned long long) (tilefinch_platform_monotonic_time_us()
+                                       - completion_started),
+                 engine->navigation.page.layout.content_limit_y,
+                 engine->navigation.page.layout.height,
+                 awaited);
+        tilefinch_platform_log_message(completion_message);
+#endif
+        if (completion == NAVIGATION_LAYOUT_COMPLETION_ADOPTED
+            || completion == NAVIGATION_LAYOUT_COMPLETION_EXTENDED) {
+            (void) controller_rebind_focus(&engine->controller);
+            if (!browser_engine_apply_layout_damage(engine)) return false;
+            if (visual_changed != NULL) *visual_changed = true;
+        }
         return true;
     }
     size_t focus_relayout_generation =

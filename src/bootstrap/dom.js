@@ -2807,7 +2807,11 @@
     classListNode(list).setAttribute("class", values.join(" "));
   const classListDescriptors = Object.getOwnPropertyDescriptors({
       contains(token) {
-        return classListTokens(this).includes(String(token));
+        token = String(token);
+        return token !== "" &&
+          String(classListNode(this).getAttribute("class") || "")
+            .split(/\s+/)
+            .includes(token);
       },
       add(...values) {
         values = values.map(validateClassToken);
@@ -2824,10 +2828,15 @@
       },
       toggle(token, force) {
         token = validateClassToken(token);
-        const present = this.contains(token),
+        /* One parse: the same writes add() and remove() would make. */
+        const tokens = classListTokens(this),
+          present = tokens.includes(token),
           next = force === undefined ? !present : !!force;
-        if (next && !present) this.add(token);
-        else if (!next && present) this.remove(token);
+        if (next && !present) {
+          tokens.push(token);
+          writeClassTokens(this, tokens);
+        } else if (!next && present)
+          writeClassTokens(this, tokens.filter((value) => value !== token));
         return next;
       },
       replace(oldToken, newToken) {
@@ -4784,18 +4793,20 @@
         oldValue = character ? this.textContent : null,
         removedNodes = character ? [] : mutationChildSnapshot(this),
         remote = globalThis.__tilefinchIsVirtualRemote(this),
+        /* Only a remote node writer mirrors root writes; check it before
+           resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          this === document.body
-            ? "d:body"
-            : this === document.documentElement
-              ? "d:html"
-              : this === document.head
-                ? "d:head"
-                : "",
-        root =
-          !!rootKey &&
           globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection;
+          !globalThis.__tilefinchRestoringSection
+            ? this === document.body
+              ? "d:body"
+              : this === document.documentElement
+                ? "d:html"
+                : this === document.head
+                  ? "d:head"
+                  : ""
+            : "",
+        root = !!rootKey;
       if (remote || root)
         __tilefinchRemoteNodeWrite(
           root ? rootKey : this.__tilefinchStableKey,
@@ -4887,18 +4898,20 @@
           ? Array.from(this.childNodes).slice(0, 256)
           : mutationChildSnapshot(this),
         remote = globalThis.__tilefinchIsVirtualRemote(this),
+        /* Only a remote node writer mirrors root writes; check it before
+           resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          this === document.body
-            ? "d:body"
-            : this === document.documentElement
-              ? "d:html"
-              : this === document.head
-                ? "d:head"
-                : "",
-        root =
-          !!rootKey &&
           globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection,
+          !globalThis.__tilefinchRestoringSection
+            ? this === document.body
+              ? "d:body"
+              : this === document.documentElement
+                ? "d:html"
+                : this === document.head
+                  ? "d:head"
+                  : ""
+            : "",
+        root = !!rootKey,
         target =
           String(this.tagName).toLowerCase() === "template"
             ? __tilefinchContent(nativeReceiver.__handle)
@@ -5335,18 +5348,20 @@
           : matching?.value ?? null,
         lowerName = name.toLowerCase(),
         remote = globalThis.__tilefinchIsVirtualRemote(this),
+        /* Only a remote node writer mirrors root writes; check it before
+           resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          this === document.body
-            ? "d:body"
-            : this === document.documentElement
-              ? "d:html"
-              : this === document.head
-                ? "d:head"
-                : "",
-        root =
-          !!rootKey &&
           globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection;
+          !globalThis.__tilefinchRestoringSection
+            ? this === document.body
+              ? "d:body"
+              : this === document.documentElement
+                ? "d:html"
+                : this === document.head
+                  ? "d:head"
+                  : ""
+            : "",
+        root = !!rootKey;
       if (remote || root)
         __tilefinchRemoteNodeWrite(
           root ? rootKey : this.__tilefinchStableKey,
@@ -5477,6 +5492,8 @@
         values.push(record);
         __tilefinchSetAttribute(nativeReceiver.__handle, name, String(value));
       }
+      if (namespace === null)
+        globalThis.__tilefinchCanvasAttributeChanged?.(this, localName);
       globalThis.__tilefinchCustomElementAttributeChanged?.(
         this,
         localName,
@@ -5540,18 +5557,20 @@
           : matching?.value ?? null,
         lowerName = name.toLowerCase(),
         remote = globalThis.__tilefinchIsVirtualRemote(this),
+        /* Only a remote node writer mirrors root writes; check it before
+           resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          this === document.body
-            ? "d:body"
-            : this === document.documentElement
-              ? "d:html"
-              : this === document.head
-                ? "d:head"
-                : "",
-        root =
-          !!rootKey &&
           globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection;
+          !globalThis.__tilefinchRestoringSection
+            ? this === document.body
+              ? "d:body"
+              : this === document.documentElement
+                ? "d:html"
+                : this === document.head
+                  ? "d:head"
+                  : ""
+            : "",
+        root = !!rootKey;
       if (remote || root)
         __tilefinchRemoteNodeWrite(
           root ? rootKey : this.__tilefinchStableKey,
@@ -5638,6 +5657,9 @@
         attributeObjects
           .get(this)
           ?.delete(attributeKey(namespace, removed.localName));
+        if (namespace === null)
+          globalThis.__tilefinchCanvasAttributeChanged?.(
+            this, removed.localName);
         globalThis.__tilefinchCustomElementAttributeChanged?.(
           this,
           removed.localName,
@@ -6178,12 +6200,15 @@
     if (!handle) return null;
     const cached = cachedNode(handle);
     if (cached) return cached;
-    const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
-      stableId = String(__tilefinchGetAttribute(handle, "id") || ""),
-      idKey = stableId && stableId.length <= 128 ? "i:" + stableId : "",
-      stableKey = globalThis.__tilefinchHasRemoteNodeWriter
-        ? sourceKey || idKey
-        : "";
+    /* Stable keys only matter to a remote node writer; without one, skip
+       the two bridge lookups on every wrapper creation. */
+    let stableKey = "";
+    if (globalThis.__tilefinchHasRemoteNodeWriter) {
+      const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
+        stableId = String(__tilefinchGetAttribute(handle, "id") || "");
+      stableKey = sourceKey ||
+        (stableId && stableId.length <= 128 ? "i:" + stableId : "");
+    }
     const retained = stableKey ? stableNodeWrappers.get(stableKey) : null;
     if (retained) {
       retained.__tilefinchRebindHandle(rebindToken, handle);

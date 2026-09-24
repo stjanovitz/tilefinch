@@ -34,6 +34,11 @@ typedef struct {
 
 const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(
     TilefinchGlyphPack pack);
+/* BrowserGlyphLanguage is persisted as an integer in the profile. Keep the
+   translation next to the pack catalog so the settings UI and component
+   session cannot drift. Embedded/invalid language values have no pack. */
+bool tilefinch_glyph_pack_for_language(
+    unsigned language, TilefinchGlyphPack *pack);
 
 /* Resolver checks active then the last signed previous generation. A durable
    uninstall marker suppresses both after an interrupted removal. */

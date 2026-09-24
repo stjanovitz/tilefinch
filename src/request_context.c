@@ -158,11 +158,6 @@ bool tilefinch_request_same_site(const TilefinchRequestContext *context)
         && facts.same_site;
 }
 
-bool tilefinch_request_safe_method(const TilefinchRequestContext *context)
-{
-    return request_method_is_safe(context == NULL ? NULL : context->method);
-}
-
 bool tilefinch_request_sends_credentials(const TilefinchRequestContext *context)
 {
     if (!tilefinch_request_context_valid(context)

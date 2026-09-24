@@ -64,6 +64,9 @@ static void image_trace(const char *reason, const char *source,
     fprintf(stderr, "tilefinch: image %s %.*s\n", reason, (int) length, source);
 }
 
+/* Chrome icons and wordmarks; a larger SVG raster would evict encoded
+   responses from the session cache for a one-off illustration. */
+#define IMAGE_SVG_DECODED_CACHE_BYTES (128u * 1024u)
 #define INLINE_SVG_SOURCE_LIMIT (64u * 1024u)
 #define INLINE_SVG_USE_LIMIT 32u
 #define INLINE_SVG_USE_DEPTH_LIMIT 8u
@@ -2546,7 +2549,17 @@ static ImageDecodedCacheResult image_adopt_decoded_cache(
         return IMAGE_DECODED_CACHE_MISS;
     }
     int target_width = 0, target_height = 0;
-    if (!image_layout_decode_target(
+    /* Rasters are published only when downscaled for a layout target, so
+       they must match this use's target. An entry at its own intrinsic size
+       is an SVG rasterization, which every use of that source shares. */
+    bool intrinsic = cached->decoded_image_width
+                         == cached->decoded_image_source_width
+                     && cached->decoded_image_height
+                         == cached->decoded_image_source_height;
+    if (intrinsic) {
+        target_width = cached->decoded_image_width;
+        target_height = cached->decoded_image_height;
+    } else if (!image_layout_decode_target(
             pending, cached->decoded_image_source_width,
             cached->decoded_image_source_height,
             &target_width, &target_height)
@@ -3022,6 +3035,26 @@ static bool finish_image_fetch(ImageLoadContext *context,
                               .is_background = primary.is_background,
                               .pseudo = primary.pseudo,
                               .owns_pixels = is_svg};
+    if (is_svg && !external_use && pixels != NULL
+        && decoded <= IMAGE_SVG_DECODED_CACHE_BYTES) {
+        /* Rasterizing an SVG is one uninterruptible parse+fill (a 10 KB
+           wordmark costs ~0.4 s on the PSP), and site chrome repeats the
+           same file on every page; share the pixels through the session's
+           decoded-image cache like a downscaled raster. */
+        BrowserSharedBody *pixel_body = browser_shared_body_take(
+            context->budget, pixels, decoded);
+        if (pixel_body != NULL) {
+            resource.pixel_body = pixel_body;
+            if (context->session != NULL && pending->url != NULL) {
+                TilefinchRequestContext request_context =
+                    image_request_context(context, pending->url);
+                (void) browser_session_decoded_image_put(
+                    context->session, pending->url, &request_context,
+                    (const unsigned char *) fetched->data, fetched->length,
+                    pixel_body, width, height, width, height);
+            }
+        }
+    }
     if (!is_svg) {
         resource.encoded = (unsigned char *) fetched->data;
         resource.encoded_body = fetched->shared_body;
@@ -3212,11 +3245,29 @@ static bool finish_one_pending(ImageLoadContext *context, bool wait)
             uint64_t finish_started = image_profile_enabled()
                 ? image_profile_now_us() : 0;
             bool probe_busy = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            bool finish_svg = svg_response(candidate);
+            size_t finish_bytes = candidate->length;
+#endif
             bool finished = finish_image_fetch(
                 context, pending, candidate, success, &probe_busy);
             if (finish_started != 0) {
-                context->images->stats.finish_us +=
-                    image_profile_now_us() - finish_started;
+                uint64_t finish_us = image_profile_now_us() - finish_started;
+                context->images->stats.finish_us += finish_us;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                /* One completion runs between two cooperate checkpoints;
+                   name the resource when it alone is a visible stall. */
+                if (finish_us >= 50000u) {
+                    char message[256];
+                    snprintf(message, sizeof(message),
+                           "tilefinch-image-slow-finish: us=%llu svg=%d "
+                           "bytes=%zu url=%.160s",
+                           (unsigned long long) finish_us,
+                           finish_svg ? 1 : 0, finish_bytes,
+                           pending->url != NULL ? pending->url : "");
+                    tilefinch_platform_log_message(message);
+                }
+#endif
             }
             if (probe_busy) {
                 if (newly_taken) {

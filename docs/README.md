@@ -55,6 +55,11 @@ Tilefinch's documentation has three layers:
 - [Secure in-app updates](SECURE_UPDATES.md): signed Stable/Beta records,
   the explicit unsigned Developer path, producer workflows, A/B installation,
   stable launcher, rollback, and remaining production-enablement gates.
+- [Release process](RELEASE_PROCESS.md): how a binary release is cut, what
+  `scripts/cut-release.sh` automates, and the manual credentialed steps.
+- [Diagnostic switches](DIAGNOSTIC_SWITCHES.md): every `TILEFINCH_*`
+  environment variable the engine reads, generated from the source and
+  checked by a test.
 - [Agent conventions](../AGENTS.md): the gates, ratchets, and engineering
   rules a change has to satisfy.
 

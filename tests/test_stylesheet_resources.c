@@ -1482,6 +1482,26 @@ static bool test_css_images_keep_declaring_source_context(void)
         && replay_stats.served_request_count == 4
         && replay_stats.unmatched_request_count == 0
         && replay_stats.request_shape_mismatch_count == 0;
+    /* The next page with the same SVGs reuses their rasterizations from the
+       session instead of parsing and filling them again. */
+    ImageResources again = {0};
+    ok = ok && images_load_external(
+            &document, &stylesheet, &again, &budget,
+            document_base_url, document_url, "unsafe-url", 8,
+            16u * 1024u, 4096, 4096, 1000, NULL, &session)
+        && again.stats.loaded == 3 && again.stats.decoded_cache_hits == 3
+        && again.count == images.count;
+    for (size_t i = 0; ok && i < again.count; i++) {
+        const ImageResource *first = &images.items[i];
+        const ImageResource *reused = &again.items[i];
+        ok = reused->pixels != NULL && first->pixels != NULL
+            && reused->width == first->width
+            && reused->height == first->height
+            && memcmp(reused->pixels, first->pixels,
+                      (size_t) first->width * (size_t) first->height * 4u)
+                   == 0;
+    }
+    images_destroy(&again);
     if (!ok) {
         fprintf(stderr,
                 "css image provenance cookie='%s' replay='%s' "

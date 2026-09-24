@@ -547,67 +547,73 @@ static bool selector_store_fast_key(StyleRule *rule, SelectorType type,
     return true;
 }
 
-static void selector_assign_fast_key(StyleRule *rule, const char *text,
-                                     size_t length)
+/* Offset of the rightmost compound of a trimmed complex selector, or
+   `length` when there is none. Only that compound describes the candidate
+   element; prefixes describe ancestors or siblings. */
+/* A fast key is stored only when it is escape-free and short enough;
+   the choice below skips any candidate the store would refuse, exactly as
+   a failed store fell through to the next candidate. */
+static bool selector_fast_key_acceptable(const char *key, size_t length)
 {
-    trim(&text, &length);
-    if (length == 0) return;
-    size_t selector_base = (size_t) (text - rule->selector);
+    return key != NULL && length != 0 && length < STYLE_FAST_KEY_CAPACITY
+        && memchr(key, '\\', length) == NULL;
+}
 
-    /* Find the rightmost compound selector. Only that compound describes the
-       candidate element; prefixes describe ancestors or siblings. */
-    size_t start = 0;
+/* Keys a compound requires of its element: every top-level ID and class,
+   its tag, and any key shared by its :is()/:where() options. Bounded; a
+   full set simply keeps the first entries, each still required. */
+#define SELECTOR_REQUIRED_KEY_LIMIT 8u
+typedef struct {
+    SelectorType types[SELECTOR_REQUIRED_KEY_LIMIT];
+    const char *keys[SELECTOR_REQUIRED_KEY_LIMIT];
+    size_t lengths[SELECTOR_REQUIRED_KEY_LIMIT];
+    size_t count;
+} SelectorRequiredKeys;
+
+static void selector_required_keys_add(SelectorRequiredKeys *set,
+                                       SelectorType type, const char *key,
+                                       size_t length)
+{
+    if (!selector_fast_key_acceptable(key, length)
+        || set->count == SELECTOR_REQUIRED_KEY_LIMIT) return;
+    set->types[set->count] = type;
+    set->keys[set->count] = key;
+    set->lengths[set->count] = length;
+    set->count++;
+}
+
+static bool selector_required_keys_contain(const SelectorRequiredKeys *set,
+                                           SelectorType type,
+                                           const char *key, size_t length)
+{
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->types[i] == type && set->lengths[i] == length
+            && memcmp(set->keys[i], key, length) == 0) return true;
+    }
+    return false;
+}
+
+static void selector_compound_functional_keys(const char *compound,
+                                              size_t length, unsigned depth,
+                                              SelectorRequiredKeys *out);
+
+static void selector_compound_required_keys(const char *compound,
+                                            size_t length, unsigned depth,
+                                            SelectorRequiredKeys *set)
+{
+    set->count = 0;
+    if (length == 0) return;
+    if (isalnum((unsigned char) compound[0]) || compound[0] == '-'
+        || compound[0] == '_') {
+        selector_required_keys_add(
+            set, SELECTOR_TAG, compound,
+            skip_selector_identifier(compound, length, 0));
+    }
     int square = 0;
     int round = 0;
-    for (size_t i = length; i != 0; i--) {
-        char value = text[i - 1];
-        if (value == ']') square++;
-        else if (value == '[' && square > 0) square--;
-        else if (value == ')') round++;
-        else if (value == '(' && round > 0) round--;
-        else if (square == 0 && round == 0
-                 && (value == '>' || value == '+' || value == '~')) {
-            start = i;
-            break;
-        } else if (square == 0 && round == 0
-                   && isspace((unsigned char) value)) {
-            size_t escaped = i - 1;
-            size_t backslashes = 0;
-            while (escaped != 0 && text[escaped - 1] == '\\') {
-                escaped--;
-                backslashes++;
-            }
-            if ((backslashes & 1u) != 0) continue;
-            size_t right = i;
-            while (right < length
-                   && isspace((unsigned char) text[right])) right++;
-            if (right < length) {
-                start = right;
-                break;
-            }
-        }
-    }
-    while (start < length && isspace((unsigned char) text[start])) start++;
-    if (start == length) return;
-    if (selector_base + start > UINT16_MAX) return;
-    rule->rightmost_compound_offset = (uint16_t) (selector_base + start);
-
-    const char *tag = NULL;
-    size_t tag_length = 0;
-    if (isalnum((unsigned char) text[start]) || text[start] == '-'
-        || text[start] == '_') {
-        size_t end = skip_selector_identifier(text, length, start);
-        tag = text + start;
-        tag_length = end - start;
-    }
-
-    const char *class_name = NULL;
-    size_t class_length = 0;
-    square = 0;
-    round = 0;
     char quote = 0;
-    for (size_t at = start; at < length; at++) {
-        char value = text[at];
+    for (size_t at = 0; at < length; at++) {
+        char value = compound[at];
         if (quote != 0) {
             if (value == '\\' && at + 1 < length) at++;
             else if (value == quote) quote = 0;
@@ -626,35 +632,231 @@ static void selector_assign_fast_key(StyleRule *rule, const char *text,
         } else if (square == 0 && round == 0
                    && (value == '#' || value == '.')) {
             size_t key_start = at + 1;
-            size_t key_end = skip_selector_identifier(text, length,
+            size_t key_end = skip_selector_identifier(compound, length,
+                                                       key_start);
+            if (key_end == key_start) continue;
+            selector_required_keys_add(
+                set, value == '#' ? SELECTOR_ID : SELECTOR_CLASS,
+                compound + key_start, key_end - key_start);
+            at = key_end - 1;
+        }
+    }
+    SelectorRequiredKeys shared = {0};
+    selector_compound_functional_keys(compound, length, depth, &shared);
+    for (size_t i = 0; i < shared.count; i++)
+        selector_required_keys_add(set, shared.types[i], shared.keys[i],
+                                   shared.lengths[i]);
+}
+
+/* Keys every option of a top-level :is()/:where() in `compound` requires.
+   An element matching the compound matches one option of each, whose
+   subject is this element, so it carries every key all options share. */
+static void selector_compound_functional_keys(const char *compound,
+                                              size_t length, unsigned depth,
+                                              SelectorRequiredKeys *out)
+{
+    out->count = 0;
+    if (depth >= 4) return;
+    int square = 0;
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = compound[at];
+        if (quote != 0) {
+            if (value == '\\' && at + 1 < length) at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (square > 0 && (value == '\'' || value == '"')) {
+            quote = value;
+            continue;
+        }
+        if (value == '[') { square++; continue; }
+        if (value == ']' && square > 0) { square--; continue; }
+        if (square > 0 || value != ':'
+            || (at + 1 < length && compound[at + 1] == ':')) continue;
+        /* The name and parenthesis scan of the compound matcher. */
+        size_t name = at + 1, end = name;
+        while (end < length && name_character(compound[end])) end++;
+        if (end >= length || compound[end] != '(') {
+            at = end == name ? at : end - 1;
+            continue;
+        }
+        int nesting = 1;
+        size_t close = end + 1;
+        while (close < length && nesting != 0) {
+            if (compound[close] == '(') nesting++;
+            else if (compound[close] == ')') nesting--;
+            if (nesting != 0) close++;
+        }
+        if (nesting != 0) return;
+        if (style_pseudo_kind(compound + name, end - name)
+            == STYLE_PSEUDO_IS) {
+            const char *argument = compound + end + 1;
+            size_t argument_length = close - end - 1;
+            trim(&argument, &argument_length);
+            SelectorRequiredKeys shared = {0}, option_keys = {0};
+            bool first = true;
+            for (size_t option_at = 0; argument_length != 0
+                 && option_at < argument_length;) {
+                size_t option_end = style_selector_list_option_end(
+                    argument, argument_length, option_at);
+                const char *option = argument + option_at;
+                size_t option_length = option_end - option_at;
+                trim(&option, &option_length);
+                option_at = option_end + (option_end < argument_length);
+                option_keys.count = 0;
+                if (option_length != 0) {
+                    size_t start = style_selector_rightmost_compound_start(
+                        option, option_length);
+                    if (start < option_length) {
+                        selector_compound_required_keys(
+                            option + start, option_length - start,
+                            depth + 1, &option_keys);
+                    }
+                }
+                if (first) {
+                    shared = option_keys;
+                    first = false;
+                } else {
+                    size_t kept = 0;
+                    for (size_t i = 0; i < shared.count; i++) {
+                        if (!selector_required_keys_contain(
+                                &option_keys, shared.types[i],
+                                shared.keys[i], shared.lengths[i])) continue;
+                        shared.types[kept] = shared.types[i];
+                        shared.keys[kept] = shared.keys[i];
+                        shared.lengths[kept] = shared.lengths[i];
+                        kept++;
+                    }
+                    shared.count = kept;
+                }
+                if (shared.count == 0) break;
+            }
+            for (size_t i = 0; !first && i < shared.count; i++)
+                selector_required_keys_add(out, shared.types[i],
+                                           shared.keys[i],
+                                           shared.lengths[i]);
+        }
+        at = close;
+    }
+}
+
+/* One key from the shared set: an ID, else a class, else a tag. */
+static bool selector_compound_functional_key(const char *compound,
+                                             size_t length, unsigned depth,
+                                             SelectorType *type,
+                                             const char **key,
+                                             size_t *key_length)
+{
+    SelectorRequiredKeys shared = {0};
+    selector_compound_functional_keys(compound, length, depth, &shared);
+    static const SelectorType preference[] = {
+        SELECTOR_ID, SELECTOR_CLASS, SELECTOR_TAG
+    };
+    for (size_t p = 0; p < 3; p++) {
+        for (size_t i = 0; i < shared.count; i++) {
+            if (shared.types[i] != preference[p]) continue;
+            *type = shared.types[i];
+            *key = shared.keys[i];
+            *key_length = shared.lengths[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The key a compound requires: its ID, else its last class, else its tag,
+   else a key shared by its :is()/:where() options. */
+static bool selector_compound_key(const char *compound, size_t length,
+                                  unsigned depth, SelectorType *type,
+                                  const char **key, size_t *key_length)
+{
+    if (length == 0) return false;
+    const char *tag = NULL;
+    size_t tag_length = 0;
+    if (isalnum((unsigned char) compound[0]) || compound[0] == '-'
+        || compound[0] == '_') {
+        size_t end = skip_selector_identifier(compound, length, 0);
+        tag = compound;
+        tag_length = end;
+    }
+    const char *class_name = NULL;
+    size_t class_length = 0;
+    int square = 0;
+    int round = 0;
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = compound[at];
+        if (quote != 0) {
+            if (value == '\\' && at + 1 < length) at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (square > 0 && (value == '\'' || value == '"')) {
+            quote = value;
+        } else if (value == '[') {
+            square++;
+        } else if (value == ']' && square > 0) {
+            square--;
+        } else if (square == 0 && value == '(') {
+            round++;
+        } else if (square == 0 && value == ')' && round > 0) {
+            round--;
+        } else if (square == 0 && round == 0
+                   && (value == '#' || value == '.')) {
+            size_t key_start = at + 1;
+            size_t key_end = skip_selector_identifier(compound, length,
                                                        key_start);
             if (key_end == key_start) continue;
             if (value == '#') {
-                /* Fast keys are compared byte-for-byte with DOM values.
-                   An escaped identifier must first be decoded, so leave it
-                   to the fully correct fallback matcher instead of pruning
-                   the rule from the candidate set under its source spelling
-                   (for example #a\ b matching id="a b"). */
-                if (memchr(text + key_start, '\\',
-                           key_end - key_start) == NULL
-                    && selector_store_fast_key(
-                           rule, SELECTOR_ID, text + key_start,
-                           key_end - key_start)) return;
-            } else {
-                if (memchr(text + key_start, '\\',
-                           key_end - key_start) == NULL) {
-                    class_name = text + key_start;
-                    class_length = key_end - key_start;
+                if (selector_fast_key_acceptable(
+                        compound + key_start, key_end - key_start)) {
+                    *type = SELECTOR_ID;
+                    *key = compound + key_start;
+                    *key_length = key_end - key_start;
+                    return true;
                 }
+            } else if (memchr(compound + key_start, '\\',
+                              key_end - key_start) == NULL) {
+                class_name = compound + key_start;
+                class_length = key_end - key_start;
             }
             at = key_end - 1;
         }
     }
     if (class_name != NULL
-        && selector_store_fast_key(rule, SELECTOR_CLASS, class_name,
-                                   class_length)) return;
-    if (tag != NULL) {
-        (void) selector_store_fast_key(rule, SELECTOR_TAG, tag, tag_length);
+        && selector_fast_key_acceptable(class_name, class_length)) {
+        *type = SELECTOR_CLASS;
+        *key = class_name;
+        *key_length = class_length;
+        return true;
+    }
+    if (tag != NULL && selector_fast_key_acceptable(tag, tag_length)) {
+        *type = SELECTOR_TAG;
+        *key = tag;
+        *key_length = tag_length;
+        return true;
+    }
+    return selector_compound_functional_key(compound, length, depth, type,
+                                            key, key_length);
+}
+
+static void selector_assign_fast_key(StyleRule *rule, const char *text,
+                                     size_t length)
+{
+    trim(&text, &length);
+    if (length == 0) return;
+    size_t selector_base = (size_t) (text - rule->selector);
+    size_t start = style_selector_rightmost_compound_start(text, length);
+    if (start == length) return;
+    if (selector_base + start > UINT16_MAX) return;
+    rule->rightmost_compound_offset = (uint16_t) (selector_base + start);
+    SelectorType type = SELECTOR_TAG;
+    const char *key = NULL;
+    size_t key_length = 0;
+    if (selector_compound_key(text + start, length - start, 0, &type, &key,
+                              &key_length)) {
+        (void) selector_store_fast_key(rule, type, key, key_length);
     }
 }
 
@@ -775,6 +977,11 @@ static bool prepare_rule_declarations(
         }
         if (deferred.dynamic[slot]) {
             stored->deferred_program_reserved |= STYLE_DEFERRED_DYNAMIC;
+        }
+        if (deferred.deferred[slot]
+            && !span_contains_text(declarations, declaration_length,
+                                   "font-size")) {
+            stored->deferred_program_reserved |= STYLE_DEFERRED_NO_FONT_SIZE;
         }
         if (deferred.ch_relative[slot]) {
             stored->deferred_program_reserved |= STYLE_DEFERRED_CH;
@@ -1303,31 +1510,7 @@ static bool supports_implemented_property(Stylesheet *sheet,
     if (retained_presentation_property(name, name_length) != NULL) {
         return true;
     }
-    static const char *const retained_modern[] = {
-        "user-select", "-webkit-user-select", "touch-action",
-        "text-size-adjust", "-webkit-text-size-adjust", "resize",
-        "text-wrap", "text-wrap-style", "translate", "rotate", "scale",
-        "isolation", "hyphens", "tab-size", "font-kerning",
-        "text-rendering", "mix-blend-mode", "backdrop-filter",
-        "-webkit-backdrop-filter", "border-start-start-radius",
-        "border-start-end-radius", "border-end-start-radius",
-        "border-end-end-radius"
-    };
-    for (size_t i = 0;
-         i < sizeof(retained_modern) / sizeof(retained_modern[0]); i++) {
-        if (span_case_equal(name, name_length, retained_modern[i])) {
-            return true;
-        }
-    }
-    if (span_case_equal(name, name_length, "container")
-        || span_case_equal(name, name_length, "container-name")
-        || span_case_equal(name, name_length, "container-type")
-        || span_case_equal(name, name_length, "columns")
-        || span_case_equal(name, name_length, "column-count")
-        || span_case_equal(name, name_length, "column-width")
-        || span_case_equal(name, name_length, "break-inside")) {
-        return true;
-    }
+    if (retained_layout_property(name, name_length) != NULL) return true;
     static const char *const probes[] = {
         "0", "1", "0px", "none", "auto", "normal", "block",
         "visible", "static", "row", "nowrap", "start", "stretch",
@@ -1394,8 +1577,9 @@ static bool supports_retained_layout_value(
         || span_case_equal(value, value_length, "revert-layer")) {
         return true;
     }
-    if (span_case_equal(name, name_length, "user-select")
-        || span_case_equal(name, name_length, "-webkit-user-select")) {
+    /* name is the standard spelling: retained_layout_property() maps the
+       vendor aliases before this runs. */
+    if (span_case_equal(name, name_length, "user-select")) {
         return span_case_equal(value, value_length, "auto")
             || span_case_equal(value, value_length, "text")
             || span_case_equal(value, value_length, "none")
@@ -1410,8 +1594,7 @@ static bool supports_retained_layout_value(
             || span_case_equal(value, value_length, "pan-x pan-y")
             || span_case_equal(value, value_length, "pan-y pan-x");
     }
-    if (span_case_equal(name, name_length, "text-size-adjust")
-        || span_case_equal(name, name_length, "-webkit-text-size-adjust")) {
+    if (span_case_equal(name, name_length, "text-size-adjust")) {
         if (span_case_equal(value, value_length, "auto")
             || span_case_equal(value, value_length, "none")) return true;
         char text[32];
@@ -1734,6 +1917,89 @@ static bool supports_retained_layout_value(
                     || retained_presentation_length(
                         sheet, first, first_length, false)));
     }
+    /* Values the sparse resolver (style_apply_modern_properties) acts on,
+       or accepts and resolves to a stable flat equivalent. */
+    if (span_case_equal(name, name_length, "hyphens")) {
+        return span_case_equal(value, value_length, "none")
+            || span_case_equal(value, value_length, "manual")
+            || span_case_equal(value, value_length, "auto");
+    }
+    if (span_case_equal(name, name_length, "font-kerning")) {
+        return span_case_equal(value, value_length, "auto")
+            || span_case_equal(value, value_length, "normal")
+            || span_case_equal(value, value_length, "none");
+    }
+    if (span_case_equal(name, name_length, "text-rendering")) {
+        return span_case_equal(value, value_length, "auto")
+            || span_case_equal(value, value_length, "optimizeSpeed")
+            || span_case_equal(value, value_length, "optimizeLegibility")
+            || span_case_equal(value, value_length, "geometricPrecision");
+    }
+    if (span_case_equal(name, name_length, "tab-size")) {
+        if (value_length == 0 || value_length > 6) return false;
+        for (size_t i = 0; i < value_length; i++)
+            if (!isdigit((unsigned char) value[i])) return false;
+        return true;
+    }
+    if (span_case_equal(name, name_length, "mix-blend-mode")) {
+        return span_case_equal(value, value_length, "normal")
+            || span_case_equal(value, value_length, "multiply")
+            || span_case_equal(value, value_length, "screen")
+            || span_case_equal(value, value_length, "darken");
+    }
+    if (span_case_equal(name, name_length, "backdrop-filter")) {
+        if (span_case_equal(value, value_length, "none")) return true;
+        if (value_length < 7 || strncasecmp(value, "blur(", 5) != 0
+            || value[value_length - 1] != ')') return false;
+        return retained_presentation_length(
+            sheet, value + 5, value_length - 6, false);
+    }
+    if (span_case_equal(name, name_length, "backface-visibility")) {
+        return span_case_equal(value, value_length, "visible")
+            || span_case_equal(value, value_length, "hidden");
+    }
+    if (span_case_equal(name, name_length, "transform-style")) {
+        return span_case_equal(value, value_length, "flat")
+            || span_case_equal(value, value_length, "preserve-3d");
+    }
+    if (span_case_equal(name, name_length, "color-scheme")) {
+        size_t cursor = 0, start = 0, end = 0, count = 0;
+        while (style_next_top_level(
+                   value, value_length, ' ', &cursor, &start, &end)) {
+            const char *word = value + start;
+            size_t word_length = end - start;
+            if (!span_case_equal(word, word_length, "normal")
+                && !span_case_equal(word, word_length, "light")
+                && !span_case_equal(word, word_length, "dark")
+                && !span_case_equal(word, word_length, "only")) return false;
+            count++;
+        }
+        return count != 0;
+    }
+    if (span_case_equal(name, name_length, "border-image")
+        || span_case_equal(name, name_length, "border-image-source")) {
+        if (span_case_equal(value, value_length, "none")) return true;
+        StyleGradient gradient = {0};
+        size_t gradient_length = value_length;
+        unsigned nesting = 0;
+        for (size_t at = 0; at < value_length; at++) {
+            if (value[at] == '(') nesting++;
+            else if (value[at] == ')' && nesting != 0 && --nesting == 0) {
+                gradient_length = at + 1u;
+                break;
+            }
+        }
+        return style_parse_gradient(sheet, value, gradient_length, &gradient)
+            && gradient.stop_count != 0;
+    }
+    if (span_case_equal(name, name_length, "border-image-slice")
+        || span_case_equal(name, name_length, "border-image-width")
+        || span_case_equal(name, name_length, "border-image-outset")
+        || span_case_equal(name, name_length, "border-image-repeat")) {
+        /* Retained for getComputedStyle; the flat border approximation
+           takes its geometry from the ordinary border properties. */
+        return value_length != 0;
+    }
     if (span_case_equal(name, name_length, "break-inside")) {
         return span_case_equal(value, value_length, "auto")
             || span_case_equal(value, value_length, "avoid")
@@ -1947,54 +2213,11 @@ static bool supports_matches_depth(Stylesheet *sheet, const char *text,
         return retained_presentation_value_supported(
             sheet, name, name_length, value, value_length);
     }
-    if (span_case_equal(name, name_length, "container")
-        || span_case_equal(name, name_length, "container-name")
-        || span_case_equal(name, name_length, "container-type")
-        || span_case_equal(name, name_length, "columns")
-        || span_case_equal(name, name_length, "column-count")
-        || span_case_equal(name, name_length, "column-width")
-        || span_case_equal(name, name_length, "column-gap")
-        || span_case_equal(name, name_length, "break-inside")
-        || span_case_equal(name, name_length, "cursor")
-        || span_case_equal(name, name_length, "overscroll-behavior")
-        || span_case_equal(name, name_length, "overscroll-behavior-x")
-        || span_case_equal(name, name_length, "overscroll-behavior-y")
-        || span_case_equal(name, name_length, "overscroll-behavior-inline")
-        || span_case_equal(name, name_length, "overscroll-behavior-block")
-        || span_case_equal(name, name_length, "scroll-behavior")
-        || span_case_equal(name, name_length, "scroll-margin")
-        || span_case_equal(name, name_length, "scroll-margin-top")
-        || span_case_equal(name, name_length, "scroll-margin-right")
-        || span_case_equal(name, name_length, "scroll-margin-bottom")
-        || span_case_equal(name, name_length, "scroll-margin-left")
-        || span_case_equal(name, name_length, "scroll-padding")
-        || span_case_equal(name, name_length, "scroll-padding-top")
-        || span_case_equal(name, name_length, "scroll-padding-right")
-        || span_case_equal(name, name_length, "scroll-padding-bottom")
-        || span_case_equal(name, name_length, "scroll-padding-left")
-        || span_case_equal(name, name_length, "scroll-snap-align")
-        || span_case_equal(name, name_length, "scroll-snap-stop")
-        || span_case_equal(name, name_length, "scroll-snap-type")
-        || span_case_equal(name, name_length, "scrollbar-color")
-        || span_case_equal(name, name_length, "scrollbar-width")
-        || span_case_equal(name, name_length, "user-select")
-        || span_case_equal(name, name_length, "-webkit-user-select")
-        || span_case_equal(name, name_length, "touch-action")
-        || span_case_equal(name, name_length, "text-size-adjust")
-        || span_case_equal(name, name_length, "-webkit-text-size-adjust")
-        || span_case_equal(name, name_length, "resize")
-        || span_case_equal(name, name_length, "text-wrap")
-        || span_case_equal(name, name_length, "text-wrap-style")
-        || span_case_equal(name, name_length, "translate")
-        || span_case_equal(name, name_length, "rotate")
-        || span_case_equal(name, name_length, "scale")
-        || span_case_equal(name, name_length, "isolation")
-        || span_case_equal(name, name_length, "border-start-start-radius")
-        || span_case_equal(name, name_length, "border-start-end-radius")
-        || span_case_equal(name, name_length, "border-end-start-radius")
-        || span_case_equal(name, name_length, "border-end-end-radius")) {
+    const char *retained_name = retained_layout_property(name, name_length);
+    if (retained_name != NULL) {
         return supports_retained_layout_value(
-            sheet, name, name_length, value, value_length);
+            sheet, retained_name, strlen(retained_name),
+            value, value_length);
     }
     if (supports_variable_syntax(value, value_length)) {
         return supports_implemented_property(sheet, name, name_length);
@@ -2219,4 +2442,87 @@ static unsigned register_layer(Stylesheet *sheet, const char *name,
         }
     }
     return result;
+}
+
+bool style_query_selector_list_prepare(StyleQuerySelectorList *list,
+                                       const char *text, size_t length)
+{
+    if (list == NULL) return false;
+    list->count = 0;
+    if (text == NULL) return true;
+    /* The same top-level comma split as the direct list matcher. */
+    size_t start = 0;
+    int square = 0, round = 0;
+    char quote = 0;
+    bool escaped = false;
+    for (size_t i = 0; i <= length; i++) {
+        char value = i < length ? text[i] : ',';
+        if (quote != 0) {
+            if (escaped) escaped = false;
+            else if (value == '\\') escaped = true;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (i < length && escaped) {
+            escaped = false;
+            continue;
+        }
+        if (i < length && value == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (value == '\'' || value == '"') {
+            quote = value;
+            continue;
+        }
+        if (value == '[') square++;
+        else if (value == ']' && square > 0) square--;
+        else if (value == '(') round++;
+        else if (value == ')' && round > 0) round--;
+        if (value != ',' || square != 0 || round != 0) continue;
+        size_t first = start, last = i;
+        start = i + 1;
+        while (first < last && isspace((unsigned char) text[first])) first++;
+        while (last > first && isspace((unsigned char) text[last - 1])) last--;
+        if (last == first) continue;
+        if (list->count == STYLE_QUERY_SELECTOR_LIMIT) return false;
+        StyleQuerySelector *item = &list->items[list->count++];
+        memset(item, 0, sizeof(*item));
+        item->text = text + first;
+        item->length = last - first;
+        size_t key_offset = 0;
+        style_selector_prepare_complex(
+            item->text, item->length, &item->rightmost, &item->key_type,
+            &key_offset, &item->key_length);
+        if (item->key_length != 0) item->key = item->text + key_offset;
+    }
+    return true;
+}
+
+bool style_selector_prepare_complex(const char *text, size_t length,
+                                    size_t *rightmost,
+                                    SelectorType *key_type,
+                                    size_t *key_offset, size_t *key_length)
+{
+    *rightmost = SIZE_MAX;
+    *key_type = SELECTOR_TAG;
+    *key_offset = 0;
+    *key_length = 0;
+    if (text == NULL || length == 0 || length > UINT16_MAX) return false;
+    StyleRule rule = {0};
+    rule.selector = text;
+    rule.selector_length = length;
+    rule.rightmost_compound_offset = UINT16_MAX;
+    selector_assign_fast_key(&rule, text, length);
+    /* The raw field: these selectors may exceed the 191 bytes whose
+       offsets fit the masked stylesheet encoding. */
+    size_t offset = rule.rightmost_compound_offset;
+    if (offset != UINT16_MAX && offset < length) *rightmost = offset;
+    const char *key = style_rule_fast_key(&rule);
+    if (key != NULL) {
+        *key_type = (SelectorType) rule.type;
+        *key_offset = (size_t) (key - text);
+        *key_length = rule.fast_key_length;
+    }
+    return true;
 }

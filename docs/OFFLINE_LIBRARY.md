@@ -1,31 +1,32 @@
 # Offline library
 
 Tilefinch has a small, explicit offline library for Reader articles, bounded
-web-app snapshots, and videos from its built-in YouTube provider. Nothing is
-scanned or opened during boot. The first **Library** action lazily reads the
+web-app snapshots, and videos from its built-in YouTube provider. Nothing in
+it is scanned or opened during boot; the first **Library** action reads the
 index from `data/offline/`.
 
 ## Reader articles
 
-**Library → Save article for later** takes the current committed document and
-writes a compact Reader snapshot. Headings, paragraphs, lists, block quotes,
-and preformatted regions remain semantic, reflowable HTML; script, author
-style, form state, cookies, event
-handlers, and the live JavaScript realm are not retained. The snapshot has a
-link to the original URL and uses self-contained, reflowable HTML, so opening
-it performs no network request.
+**Page tools → Save article** writes a compact Reader snapshot of the current
+committed document. Headings, paragraphs, lists, block quotes, and
+preformatted regions stay semantic, reflowable HTML; scripts, author styles,
+form state, cookies, event handlers, and the live JavaScript realm are not
+kept. The snapshot is self-contained and links to the original URL, so opening
+it makes no network request.
 
-An article is capped at 1 MiB on disk. The published file is length- and
-checksum-verified before it is parsed again. Saving the same source URL
-replaces its existing library entry instead of consuming another slot. The
-writer checks free space first, records the save date, emits bounded chunks, and cooperatively polls
-Circle so a slow Memory Stick does not make the browser chrome unresponsive.
-At the 12-item combined cap, the library marks its oldest dated item as a
-deletion suggestion instead of silently choosing one for the user.
+- An article is capped at 1 MiB on disk, and the published file's length and
+  checksum are verified before it is parsed again.
+- Saving the same source URL again replaces its library entry instead of
+  taking another slot.
+- The writer checks free space first, records the save date, writes bounded
+  chunks, and polls Circle between them, so a slow Memory Stick does not make
+  the browser chrome unresponsive.
+- At the 12-item combined cap, the library marks its oldest dated item as a
+  suggestion to delete rather than choosing one for you.
 
-This first format intentionally does not archive page images or author CSS.
-That keeps a saved article predictable and useful under the PSP memory limit,
-but it is not a pixel-exact Web archive.
+This format deliberately archives no page images or author CSS. That keeps a
+saved article predictable and useful within the PSP's memory, but it is not a
+pixel-exact web archive.
 
 ## Offline web apps
 
@@ -98,35 +99,35 @@ presentation for now.
 ## YouTube downloads
 
 The lightweight watch page includes **Save video offline**. Tilefinch resolves
-that video through the same provider boundary as native playback, honors the
-current 240p/360p quality option, and downloads the selected direct MP4 video
-and (when needed) audio tracks. Ciphered, DRM-protected, live, unavailable, and
-unsupported formats are refused rather than saved incorrectly.
+the video through the same provider boundary as native playback, honors the
+**Settings → Video → YouTube** quality (240p or 360p), and downloads the
+selected direct MP4 video and, when needed, audio tracks. Ciphered,
+DRM-protected, live, unavailable, and unsupported formats are refused rather
+than saved incorrectly.
 
-Only one download is active at a time. The Downloads section is the manager:
-X pauses or resumes an incomplete item and opens a completed item in the
-native player. Its active row reports percent complete, measured transfer
-speed, and the last sampled free-space reserve; paused and failed rows retain
-the bounded failure reason across restarts.
+Only one download runs at a time, and the **Downloads** section manages them:
+X pauses or resumes an incomplete item and opens a finished one in the native
+player, and **Resume**, **Pause**, **Play**, and **Delete** are all available
+there. The active row shows percent complete, measured transfer speed, and
+the most recently sampled free-space reserve; paused and failed rows keep
+their bounded failure reason across restarts.
 
-Transfers use exact 256 KiB ranged
-chunks, expose at most 32 KiB/2 ms of body work to one UI pump, and write
-directly to `.part` files; a complete stream is renamed into place. **Resume**,
-**Pause**, **Play**, and **Delete** are available from the offline library.
-Restarting after an app or
-power interruption converts an in-progress record to Paused and reconciles
-bounded file sizes, so Resume obtains a fresh expiring YouTube URL and
-continues from the retained byte offset.
+Transfers use exact 256 KiB ranged chunks, give one UI pump at most 32 KiB or
+2 ms of body work, and write straight to `.part` files, renaming a complete
+stream into place. After an app or power interruption, restarting converts an
+in-progress record to Paused and reconciles the bounded file sizes, so Resume
+fetches a fresh, expiring YouTube URL and continues from the saved byte
+offset.
 
-**Settings → Device & storage → Resume saves** is off by default. When enabled, Tilefinch lazily
-opens the offline index after the initial page is ready and resumes the first
-paused or queued video; successful completion then advances through the queue.
-Keeping it off preserves the default no-library-I/O boot path.
+**Settings → Video → Resume saves** is off by default. When it is on,
+Tilefinch opens the offline index after the first page is ready and resumes
+the first paused or queued video, moving through the queue as each one
+finishes. Leaving it off keeps boot free of library I/O.
 
-The fixed range and per-frame pump limits bound Memory Stick and browser-thread
-work. Users control when writes occur by pausing individual items and by the
-off-by-default Resume saves preference; merely viewing Downloads performs no
-payload write.
+The fixed range size and per-frame pump limits bound Memory Stick and
+browser-thread work. You control when writes happen, by pausing individual
+items and through the off-by-default **Resume saves**; just viewing Downloads
+writes nothing.
 
 Each video and audio stream is capped at 512 MiB, the library holds at most 12
 combined items, and a download refuses to begin unless it can retain at least

@@ -33,6 +33,54 @@ static int failures;
             __FILE__, __LINE__, #value); failures++; \
 } } while (0)
 
+static void test_fixed_slab_admission_and_refusal(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    unsigned char *buffers[FETCH_BACKGROUND_ACTIVE_LIMIT] = {NULL};
+    size_t added = 99u;
+
+    CHECK(fetch_background_fixed_buffers_ensure(
+              &budget, buffers, 1u, &added)
+          == FETCH_BACKGROUND_ENQUEUE_ADMITTED);
+    CHECK(added == 1u && buffers[0] != NULL && buffers[1] == NULL);
+    size_t first_charge = budget.current;
+    unsigned char *first = buffers[0];
+
+    budget_inject_failure_after(&budget, 0u);
+    CHECK(fetch_background_fixed_buffers_ensure(
+              &budget, buffers, 2u, &added)
+          == FETCH_BACKGROUND_ENQUEUE_MEMORY);
+    CHECK(added == 0u && buffers[0] == first && buffers[1] == NULL);
+    CHECK(budget.current == first_charge);
+    budget_clear_failure_injection(&budget);
+
+    CHECK(fetch_background_fixed_buffers_ensure(
+              &budget, buffers, 2u, &added)
+          == FETCH_BACKGROUND_ENQUEUE_ADMITTED);
+    CHECK(added == 1u && buffers[0] == first && buffers[1] != NULL);
+    CHECK(fetch_background_fixed_buffers_ensure(
+              &budget, buffers, 2u, &added)
+          == FETCH_BACKGROUND_ENQUEUE_ADMITTED && added == 0u);
+    budget_free(&budget, buffers[1]);
+    budget_free(&budget, buffers[0]);
+    CHECK(budget.current == 0u);
+
+    buffers[0] = NULL;
+    buffers[1] = NULL;
+    budget_inject_failure_after(&budget, 1u);
+    CHECK(fetch_background_fixed_buffers_ensure(
+              &budget, buffers, 2u, &added)
+          == FETCH_BACKGROUND_ENQUEUE_MEMORY);
+    CHECK(added == 0u && buffers[0] == NULL && buffers[1] == NULL);
+    CHECK(budget.current == 0u);
+    budget_clear_failure_injection(&budget);
+    CHECK(fetch_background_fixed_buffers_ensure(
+              &budget, buffers, 3u, &added)
+          == FETCH_BACKGROUND_ENQUEUE_SATURATED);
+    CHECK(budget.current == 0u);
+}
+
 static void test_redirect_cookie_overflow_policy(void)
 {
     CHECK(fetch_background_redirect_cookie_overflow_fatal(
@@ -489,6 +537,11 @@ static void test_stream_consumer_deadline(void)
 
 int main(void)
 {
+    CHECK(fetch_background_scheduler_chunk_capacity(1u) == 1u);
+    CHECK(fetch_background_scheduler_chunk_capacity(4096u) == 4096u);
+    CHECK(fetch_background_scheduler_chunk_capacity(256u * 1024u)
+          == FETCH_BACKGROUND_STREAM_BUFFER_BYTES);
+    test_fixed_slab_admission_and_refusal();
     CHECK(!fetch_background_setup_yield_due(false, 10000, 0));
     CHECK(fetch_background_setup_yield_due(true, 10000, 0));
     CHECK(!fetch_background_setup_yield_due(true, 13999, 10000));

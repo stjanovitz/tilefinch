@@ -1,0 +1,32 @@
+# Measurement scenario, not golden-gated: open a CSS drawer on a long page,
+# then page down every 0.6 s while the rest of the provisional layout is
+# built in idle work. Read tilefinch-control-activation (drawer latency),
+# tilefinch-layout-completion (cancelled=3, adopted=1, extended=2) and
+# tilefinch-scroll-feedback (press to moved frame).
+wait-page 1
+tap-page down
+tap-page left
+wait-page 1
+mark focused
+tap-page cross
+wait-live 20
+mark drawer-open
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+tap-live rtrigger
+wait-live 36
+wait-page 30
+mark settled
+end

@@ -173,7 +173,31 @@ static bool visit_tokens(const TilefinchContentSecurityPolicy *csp,
 typedef struct {
     const TilefinchContentSecurityPolicy *csp;
     const char *url;
+    /* Parsed once per policy evaluation, on first use, rather than once per
+       source token: 0 unknown, 1 parsed, 2 failed. */
+    uint8_t target_state;
+    uint8_t document_state;
+    TilefinchUrl target;
+    TilefinchUrl document;
 } UrlMatch;
+
+static const TilefinchUrl *url_match_target(UrlMatch *match)
+{
+    if (match->target_state == 0) {
+        match->target_state =
+            tilefinch_url_parse(match->url, &match->target) ? 1 : 2;
+    }
+    return match->target_state == 1 ? &match->target : NULL;
+}
+
+static const TilefinchUrl *url_match_document(UrlMatch *match)
+{
+    if (match->document_state == 0) {
+        match->document_state = tilefinch_url_parse(
+            match->csp->document_origin, &match->document) ? 1 : 2;
+    }
+    return match->document_state == 1 ? &match->document : NULL;
+}
 
 static bool scheme_matches(TilefinchUrlScheme source,
                            TilefinchUrlScheme target)
@@ -184,11 +208,12 @@ static bool scheme_matches(TilefinchUrlScheme source,
 }
 
 static bool host_source_matches(const char *token, size_t length,
-                                const UrlMatch *match)
+                                UrlMatch *match)
 {
-    TilefinchUrl target;
-    if (length == 0 || length >= 512
-        || !tilefinch_url_parse(match->url, &target)) return false;
+    if (length == 0 || length >= 512) return false;
+    const TilefinchUrl *parsed_target = url_match_target(match);
+    if (parsed_target == NULL) return false;
+    const TilefinchUrl target = *parsed_target;
     size_t at = 0;
     TilefinchUrlScheme source_scheme = TILEFINCH_URL_SCHEME_INVALID;
     const char *scheme_end = NULL;
@@ -208,11 +233,9 @@ static bool host_source_matches(const char *token, size_t length,
             source_scheme = TILEFINCH_URL_SCHEME_HTTP;
         } else return false;
     } else {
-        TilefinchUrl document;
-        if (!tilefinch_url_parse(match->csp->document_origin, &document)) {
-            return false;
-        }
-        source_scheme = document.scheme;
+        const TilefinchUrl *document = url_match_document(match);
+        if (document == NULL) return false;
+        source_scheme = document->scheme;
     }
     if (!scheme_matches(source_scheme, target.scheme)) return false;
     size_t authority_end = at;
@@ -280,8 +303,7 @@ static bool url_token_matches(const char *token, size_t length, void *opaque)
                                          match->url);
     }
     if (length == 1 && token[0] == '*') {
-        TilefinchUrl parsed;
-        return tilefinch_url_parse(match->url, &parsed);
+        return url_match_target(match) != NULL;
     }
     if (length == 5 && strncasecmp(token, "data:", 5) == 0) {
         return strncasecmp(match->url, "data:", 5) == 0;
@@ -290,15 +312,15 @@ static bool url_token_matches(const char *token, size_t length, void *opaque)
         return strncasecmp(match->url, "blob:", 5) == 0;
     }
     if (length == 6 && strncasecmp(token, "https:", 6) == 0) {
-        TilefinchUrl parsed;
-        return tilefinch_url_parse(match->url, &parsed)
-            && parsed.scheme == TILEFINCH_URL_SCHEME_HTTPS;
+        const TilefinchUrl *parsed = url_match_target(match);
+        return parsed != NULL
+            && parsed->scheme == TILEFINCH_URL_SCHEME_HTTPS;
     }
     if (length == 5 && strncasecmp(token, "http:", 5) == 0) {
-        TilefinchUrl parsed;
-        return tilefinch_url_parse(match->url, &parsed)
-            && (parsed.scheme == TILEFINCH_URL_SCHEME_HTTP
-                || parsed.scheme == TILEFINCH_URL_SCHEME_HTTPS);
+        const TilefinchUrl *parsed = url_match_target(match);
+        return parsed != NULL
+            && (parsed->scheme == TILEFINCH_URL_SCHEME_HTTP
+                || parsed->scheme == TILEFINCH_URL_SCHEME_HTTPS);
     }
     return token[0] != '\'' && host_source_matches(token, length, match);
 }

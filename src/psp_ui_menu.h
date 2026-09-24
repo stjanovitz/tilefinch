@@ -18,9 +18,14 @@
 #define UI_MENU_ROW_HELP 5u
 #define UI_MENU_ROW_EXIT 6u
 #define UI_PAGE_TOOLS_ITEM_COUNT 8u
-#define UI_SITE_CONTROLS_ITEM_COUNT 6u
+#define UI_SITE_CONTROLS_ITEM_COUNT 7u
 #define UI_HELP_ITEM_COUNT 6u
 #define UI_SETTINGS_GROUP_COUNT 7u
+#define UI_SITE_INFO_ACTION_COUNT 4u
+#define UI_SITE_INFO_ROW_SITE_STORAGE 1u
+/* data_clear_confirmation while "Exit to XMB" waits for its second X. No
+   screen's row confirmations reach this value. */
+#define UI_MENU_EXIT_CONFIRMATION 0xE0u
 
 /* Returns true only for screens whose input authority belongs to the menu
    controller. The global Menu button is also routed here from any screen. */

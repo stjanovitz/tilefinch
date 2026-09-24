@@ -308,13 +308,23 @@
           imageCommandBytes: 0,
           paintCommands: [],
           paintCommandValues: 0,
+          sizeCheckedAt: globalThis.__tilefinchNow,
         };
         states.set(canvas, state);
         resetState(state);
       } else {
-        const size = dimensions(canvas);
-        if (size.width !== state.width || size.height !== state.height)
-          resetState(state);
+        /* setAttribute, removeAttribute and the width/height setters reset
+           the state through the attribute hook at once. Re-reading both
+           attributes (two bridge calls) on every drawing call only guards
+           against other attribute paths, so do it once per scheduler tick,
+           or on every call when no tick clock exists. */
+        const tick = globalThis.__tilefinchNow;
+        if (tick === undefined || state.sizeCheckedAt !== tick) {
+          state.sizeCheckedAt = tick;
+          const size = dimensions(canvas);
+          if (size.width !== state.width || size.height !== state.height)
+            resetState(state);
+        }
       }
       return state;
     },
@@ -790,12 +800,32 @@
           Math.abs(state.shadowOffsetX), Math.abs(state.shadowOffsetY),
         )) : 0;
 
-  /* Keep at most one decoded DOM-image snapshot between draw calls. Sprite
-     sheets then avoid repeatedly copying RGBA through QuickJS, while a URL
-     change or another source immediately releases the old bounded snapshot. */
-  let cachedImageSource = null,
-    cachedImageUrl = "",
-    cachedImageSnapshot = null;
+  /* Decoded <img> snapshots between drawImage calls, most recent last, so
+     sprite sheets are not re-copied through QuickJS per draw. A game draws a
+     few sheets in turn, which a single entry turned into a copy per switch.
+     Entries other than the newest are bounded in count and bytes, so this
+     retains at most that much more than one entry did; a source change
+     replaces the element's entry. */
+  const identityTransform = Object.freeze([1, 0, 0, 1, 0, 0]);
+  const imageSnapshots = new Map(),
+    imageSnapshotLimit = 4,
+    imageSnapshotExtraBytes = 512 * 1024;
+  let newestImageSource = null;
+  const rememberImageSnapshot = (source, key, snapshot) => {
+    imageSnapshots.delete(source);
+    imageSnapshots.set(source, { key, snapshot });
+    newestImageSource = source;
+    let extra = -snapshot.pixels.byteLength;
+    for (const entry of imageSnapshots.values())
+      extra += entry.snapshot.pixels.byteLength;
+    for (const [older, entry] of imageSnapshots) {
+      if (older === source) break;
+      if (imageSnapshots.size <= imageSnapshotLimit
+          && extra <= imageSnapshotExtraBytes) break;
+      extra -= entry.snapshot.pixels.byteLength;
+      imageSnapshots.delete(older);
+    }
+  };
 
   class CanvasGradient {
     constructor(kind, values) {
@@ -1903,11 +1933,9 @@
           imageSmoothingQuality: state.imageSmoothingQuality,
           transform: [...state.transform],
           clipRect: [...state.clipRect],
-          clipPaths: state.clipPaths.map((clip) => ({
-            evenOdd: clip.evenOdd,
-            subpaths: clip.subpaths.map((points) =>
-              points.map((point) => ({ ...point }))),
-          })),
+          /* Clip records are created whole by clip() and only read after,
+             so a saved or queued state can share them. */
+          clipPaths: [...state.clipPaths],
           lineDash: [...state.lineDash],
           lineDashOffset: state.lineDashOffset,
         });
@@ -1956,7 +1984,7 @@
       if (!state.pixels) return;
       if (!flushRectCommands(state)) return;
       if (state.clipPaths.length || state.transform.some(
-        (value, index) => value !== [1, 0, 0, 1, 0, 0][index],
+        (value, index) => value !== identityTransform[index],
       )) {
         const path = new Path2D();
         path.rect(x, y, width, height);
@@ -1990,7 +2018,7 @@
       }
       if (
         state.transform.some(
-          (value, index) => value !== [1, 0, 0, 1, 0, 0][index],
+          (value, index) => value !== identityTransform[index],
         )
       ) {
         const path = new Path2D();
@@ -2208,11 +2236,7 @@
             globalAlpha: state.globalAlpha,
             operation: state.globalCompositeOperation,
             clipRect: [...state.clipRect],
-            clipPaths: state.clipPaths.map((clip) => ({
-              evenOdd: clip.evenOdd,
-              subpaths: clip.subpaths.map((points) =>
-                points.map((point) => ({ ...point }))),
-            })),
+            clipPaths: [...state.clipPaths],
           },
         })) return;
       }
@@ -2253,11 +2277,7 @@
           operation: state.globalCompositeOperation,
           lineWidth,
           clipRect: [...state.clipRect],
-          clipPaths: state.clipPaths.map((clip) => ({
-            evenOdd: clip.evenOdd,
-            subpaths: clip.subpaths.map((points) =>
-              points.map((point) => ({ ...point }))),
-          })),
+          clipPaths: [...state.clipPaths],
         },
       })) return;
       const strokePadding = lineWidth / 2 *
@@ -2575,22 +2595,26 @@
         typeof HTMLImageElement === "function" &&
         source instanceof HTMLImageElement
       ) {
-        const sourceUrl = String(source.currentSrc || source.src || "");
-        let snapshot = source === cachedImageSource &&
-            sourceUrl === cachedImageUrl ? cachedImageSnapshot : null;
-        if (!snapshot) snapshot = __tilefinchCanvasImageSource(source.__handle);
-        if (!snapshot) return;
-        if (snapshot !== cachedImageSnapshot) {
+        /* The host's selected source identifies the decoded image; unlike
+           currentSrc it needs no URL resolution on every draw. */
+        const sourceKey = String(
+          __tilefinchImageProperty(source.__handle, 0) ||
+            source.getAttribute("src") || "");
+        const cached = imageSnapshots.get(source);
+        let snapshot = cached && cached.key === sourceKey
+          ? cached.snapshot : null;
+        if (!snapshot) {
+          const decoded = __tilefinchCanvasImageSource(source.__handle);
+          if (!decoded) return;
           snapshot = {
-            width: Number(snapshot.width),
-            height: Number(snapshot.height),
-            pixels: new Uint8ClampedArray(snapshot.pixels),
-            originClean: snapshot.sameOrigin !== false,
+            width: Number(decoded.width),
+            height: Number(decoded.height),
+            pixels: new Uint8ClampedArray(decoded.pixels),
+            originClean: decoded.sameOrigin !== false,
           };
-          cachedImageSource = source;
-          cachedImageUrl = sourceUrl;
-          cachedImageSnapshot = snapshot;
-        }
+          rememberImageSnapshot(source, sourceKey, snapshot);
+        } else if (newestImageSource !== source)
+          rememberImageSnapshot(source, sourceKey, snapshot);
         sourceState = snapshot;
       } else if (source instanceof ImageBitmap) {
         const bitmap = liveBitmapState(source);

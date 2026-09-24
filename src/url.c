@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 static bool ascii_equal_ci(const char *left, const char *right, size_t length)
 {
@@ -313,26 +314,35 @@ static bool append_bytes(char *output, size_t output_size, size_t *used,
     return true;
 }
 
+/* The serialized origin of `value`, already parsed into `url`. */
+static bool url_origin_from_parsed(const char *value, const TilefinchUrl *url,
+                                   char *output, size_t output_size)
+{
+    size_t used = 0;
+    output[0] = '\0';
+    const char *scheme = url->scheme == TILEFINCH_URL_SCHEME_HTTPS
+                         ? "https://" : "http://";
+    if (!append_bytes(output, output_size, &used, scheme, strlen(scheme),
+                      false)
+        || !append_bytes(output, output_size, &used,
+                         value + url->host_offset, url->host_length, true)) {
+        return false;
+    }
+    if (url->port != default_port(url->scheme)) {
+        int written = snprintf(output + used, output_size - used, ":%u",
+                               (unsigned) url->port);
+        if (written < 0 || (size_t) written >= output_size - used) return false;
+    }
+    return true;
+}
+
 bool tilefinch_url_origin(const char *value, char *output, size_t output_size)
 {
     TilefinchUrl url;
     if (output == NULL || output_size == 0) return false;
     output[0] = '\0';
     if (!tilefinch_url_parse(value, &url)) return false;
-    size_t used = 0;
-    const char *scheme = url.scheme == TILEFINCH_URL_SCHEME_HTTPS
-                         ? "https://" : "http://";
-    if (!append_bytes(output, output_size, &used, scheme, strlen(scheme), false)
-        || !append_bytes(output, output_size, &used,
-                         value + url.host_offset, url.host_length, true)) {
-        return false;
-    }
-    if (url.port != default_port(url.scheme)) {
-        int written = snprintf(output + used, output_size - used, ":%u",
-                               (unsigned) url.port);
-        if (written < 0 || (size_t) written >= output_size - used) return false;
-    }
-    return true;
+    return url_origin_from_parsed(value, &url, output, output_size);
 }
 
 typedef struct {
@@ -421,8 +431,10 @@ bool tilefinch_url_normalize(const char *value, char *output,
 {
     TilefinchUrl url;
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    /* One parse serves both the origin and the path/query/fragment. */
     if (output == NULL || output_size == 0 || !tilefinch_url_parse(value, &url)
-        || !tilefinch_url_origin(value, origin, sizeof(origin))) return false;
+        || !url_origin_from_parsed(value, &url, origin, sizeof(origin)))
+        return false;
     size_t used = 0;
     output[0] = '\0';
     if (!append_bytes(output, output_size, &used, origin, strlen(origin), false)
@@ -562,4 +574,43 @@ bool tilefinch_url_site_key(const char *value, char *output, size_t output_size)
     int written = snprintf(output, output_size, "%s://%s", scheme,
                            site_host);
     return written > 0 && (size_t) written < output_size;
+}
+
+static const char *const referrer_policy_names[] = {
+    "", "no-referrer", "no-referrer-when-downgrade", "origin",
+    "origin-when-cross-origin", "same-origin", "strict-origin",
+    "strict-origin-when-cross-origin", "unsafe-url"
+};
+_Static_assert(sizeof(referrer_policy_names) / sizeof(referrer_policy_names[0])
+                   == TILEFINCH_REFERRER_POLICY_COUNT + 1u,
+               "referrer policy codes are 0..COUNT");
+
+const char *tilefinch_referrer_policy_name(uint8_t code)
+{
+    return code <= TILEFINCH_REFERRER_POLICY_COUNT
+        ? referrer_policy_names[code] : NULL;
+}
+
+uint8_t tilefinch_referrer_policy_code(const char *value, size_t length,
+                                       bool fold_case)
+{
+    if (length == 0) return 0;
+    if (value == NULL) return TILEFINCH_REFERRER_POLICY_UNKNOWN;
+    for (uint8_t code = 1; code <= TILEFINCH_REFERRER_POLICY_COUNT; code++) {
+        const char *name = referrer_policy_names[code];
+        if (strlen(name) != length) continue;
+        if (fold_case ? strncasecmp(value, name, length) == 0
+                      : memcmp(value, name, length) == 0) return code;
+    }
+    return TILEFINCH_REFERRER_POLICY_UNKNOWN;
+}
+
+bool tilefinch_host_within(const char *host, size_t host_length,
+                           const char *domain, size_t domain_length)
+{
+    if (host == NULL || domain == NULL || domain_length > host_length)
+        return false;
+    const char *tail = host + host_length - domain_length;
+    return strncasecmp(tail, domain, domain_length) == 0
+        && (tail == host || tail[-1] == '.');
 }

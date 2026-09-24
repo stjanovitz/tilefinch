@@ -81,7 +81,10 @@ static bool style_property_display(const StylePropertyParse *parse)
             } else {
                 recognized = false;
             }
-            if (recognized) *mask |= S_DISPLAY;
+            if (recognized) {
+                style->list_item = strcmp(resolved, "list-item") == 0;
+                *mask |= S_DISPLAY;
+            }
         }
     
     return true;

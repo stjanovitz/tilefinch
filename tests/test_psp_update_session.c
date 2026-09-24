@@ -102,7 +102,27 @@ int main(void)
     budget_init(&budget, 2u * 1024u * 1024u);
     PspUiState ui;
     psp_ui_init(&ui);
+    /* Update text shares storage with other screens' text, so it is only
+       published while the Update screen is showing. */
     PspUpdateSession session = {0};
+    {
+        PspUiState options;
+        psp_ui_init(&options);
+        options.screen = PSP_UI_SCREEN_OPTIONS;
+        snprintf(options.network_profile_label,
+                 sizeof(options.network_profile_label), "%s", "Home Wi-Fi");
+        options.network_profile_label_valid = true;
+        paths.slotted = false;
+        (void) psp_update_session_initialize(
+            &session, &budget, &paths, NULL, &options);
+        CHECK(options.network_profile_label_valid
+              && strcmp(options.network_profile_label, "Home Wi-Fi") == 0);
+        psp_update_session_refresh_ui(&session, &options);
+        CHECK(strcmp(options.network_profile_label, "Home Wi-Fi") == 0);
+        psp_update_session_destroy(&session);
+        memset(&session, 0, sizeof(session));
+    }
+    ui.screen = PSP_UI_SCREEN_UPDATE;
     CHECK(!psp_update_session_initialized(&session));
     CHECK(!psp_update_session_available(&session));
     CHECK(!psp_update_session_active(&session));

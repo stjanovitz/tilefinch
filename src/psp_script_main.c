@@ -9,6 +9,7 @@
  */
 
 #include "psp_app/psp_app_internal.h"
+#include "tilefinch/psp_fpu.h"
 #include "tilefinch/psp_time.h"
 #include "tilefinch/psp_threads.h"
 #include "tilefinch/psp_voice_component_session.h"
@@ -1226,6 +1227,9 @@ static TILEFINCH_COLD_PATH void psp_storage_paths_init(
     tilefinch_install_data_path(
         install_paths, "offline", storage->offline_library,
         sizeof(storage->offline_library));
+    tilefinch_install_data_path(
+        install_paths, "site-storage", storage->site_storage,
+        sizeof(storage->site_storage));
 }
 
 static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
@@ -1513,9 +1517,8 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
         || views->navigation == NULL || interactive == NULL) return;
     /* A hard/cancelled navigation failure still overlays its incumbent; only
        post-commit blank recovery may route Return through history. */
-    interactive->lifecycle_retry_return_back = false;
-    interactive->lifecycle_retry_return_forward = false;
-    interactive->lifecycle_retry_return_home = false;
+    interactive->recovery_offer =
+        psp_recovery_offer_without_return(interactive->recovery_offer);
     if (status != BROWSER_NAVIGATION_JOB_CANCELLED) {
         (void) psp_write_navigation_failure_report(
             "navigation", browser_engine_last_error(browser->engine),
@@ -1552,10 +1555,7 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
         snprintf(interactive->lifecycle_retry_url,
                  sizeof(interactive->lifecycle_retry_url), "%s",
                  process->presentation.ui.url);
-        interactive->lifecycle_retry_available = true;
-        interactive->lifecycle_retry_return_back = false;
-        interactive->lifecycle_retry_return_forward = false;
-        interactive->lifecycle_retry_return_home = false;
+        interactive->recovery_offer = PSP_RECOVERY_OFFER_OVER_INCUMBENT;
         uint8_t actions = 0u;
         if (wifi_sign_in) actions |= PSP_UI_FAILURE_WIFI;
         if (browser_profile_javascript_allowed_for_url(
@@ -1578,29 +1578,32 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
         browser_engine_last_error(browser->engine));
 }
 
-static TILEFINCH_OUT_OF_LINE void psp_clear_recovery_return_target(
-    PspInteractiveState *interactive)
-{
-    if (interactive == NULL) return;
-    interactive->lifecycle_retry_return_back = false;
-    interactive->lifecycle_retry_return_forward = false;
-    interactive->lifecycle_retry_return_home = false;
-}
-
 static TILEFINCH_OUT_OF_LINE void psp_suspend_pending_navigation(
     PspBrowserResources *browser, PspInteractiveState *interactive)
 {
     if (browser == NULL || interactive == NULL) return;
     const char *pending_url =
         browser_engine_pending_navigation_url(browser->engine);
-    interactive->lifecycle_retry_available = pending_url != NULL;
-    psp_clear_recovery_return_target(interactive);
+    interactive->recovery_offer = pending_url != NULL
+        ? PSP_RECOVERY_OFFER_OVER_INCUMBENT : PSP_RECOVERY_OFFER_NONE;
     if (pending_url != NULL) {
         snprintf(interactive->lifecycle_retry_url,
                  sizeof(interactive->lifecycle_retry_url), "%s",
                  pending_url);
     }
     browser_engine_cancel_navigation(browser->engine, "system suspended");
+}
+
+/* The update endpoint the profile's channel selects: the signed channel
+   metadata, or Developer's explicit local URLs. */
+static PspUpdateSessionOptions psp_profile_update_options(
+    const PspProcessResources *process, const PspBrowserResources *browser)
+{
+    return (PspUpdateSessionOptions) {
+        .channel = browser_profile_update_channel(browser->profile),
+        .developer_metadata_url = process->config.developer_update_url,
+        .developer_package_url = process->config.developer_package_url
+    };
 }
 
 /* Release discovery is an explicit, rare Settings action. Keep its network
@@ -1694,15 +1697,20 @@ static TILEFINCH_OUT_OF_LINE void psp_present_blank_reader_unavailable(
     snprintf(app->interactive->lifecycle_retry_url,
              sizeof(app->interactive->lifecycle_retry_url), "%s",
              loaded_url);
-    app->interactive->lifecycle_retry_available = true;
-    BrowserNavigationReturnTarget return_target =
-        browser_engine_last_navigation_return_target(engine);
-    app->interactive->lifecycle_retry_return_back =
-        return_target == BROWSER_NAVIGATION_RETURN_BACK;
-    app->interactive->lifecycle_retry_return_forward =
-        return_target == BROWSER_NAVIGATION_RETURN_FORWARD;
-    app->interactive->lifecycle_retry_return_home =
-        return_target == BROWSER_NAVIGATION_RETURN_NONE;
+    /* The page committed, so Return must restore the entry it came from;
+       with no history predecessor that is native Home. */
+    switch (browser_engine_last_navigation_return_target(engine)) {
+    case BROWSER_NAVIGATION_RETURN_BACK:
+        app->interactive->recovery_offer = PSP_RECOVERY_OFFER_RETURN_BACK;
+        break;
+    case BROWSER_NAVIGATION_RETURN_FORWARD:
+        app->interactive->recovery_offer = PSP_RECOVERY_OFFER_RETURN_FORWARD;
+        break;
+    case BROWSER_NAVIGATION_RETURN_NONE:
+    default:
+        app->interactive->recovery_offer = PSP_RECOVERY_OFFER_RETURN_HOME;
+        break;
+    }
     app->interactive->blank_reader_recovery_pending = false;
     psp_ui_show_failure_recovery_actions(
         ui, "PAGE SCRIPTS STOPPED BEFORE CONTENT APPEARED", actions);
@@ -1721,9 +1729,8 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
     PspUiState *ui = &app->process->presentation.ui;
     /* A successful commit supersedes any recovery provenance from its
        incumbent. Blank post-commit recovery below records the new target. */
-    app->interactive->lifecycle_retry_return_back = false;
-    app->interactive->lifecycle_retry_return_forward = false;
-    app->interactive->lifecycle_retry_return_home = false;
+    app->interactive->recovery_offer =
+        psp_recovery_offer_without_return(app->interactive->recovery_offer);
     const NavigationEntry *loaded_entry =
         navigation_current(app->views->navigation);
     const char *loaded_url = loaded_entry == NULL
@@ -2672,6 +2679,45 @@ void psp_webgl_measurement_mark(const char *mark)
 }
 #endif
 
+/* The loading page's input in a supervised load: the supervisor forwards
+   button edges; on the page it scrolls and cancels itself, so a held button
+   must not also repeat as focus movement here. */
+static TILEFINCH_OUT_OF_LINE void psp_loading_page_take_input(
+    PspUiInput *input, const PspUiState *ui)
+{
+    bool page_screen = ui->screen == PSP_UI_SCREEN_PAGE;
+    input->pressed = psp_navigation_cooperate_owner_frame(page_screen);
+    if (page_screen)
+        input->held &= ~(PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN
+                         | PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN
+                         | PSP_UI_BUTTON_CANCEL);
+}
+
+/* The loading page under this loop's cursor and menus: at once for input,
+   otherwise at the supervisor's pace. */
+static TILEFINCH_OUT_OF_LINE void psp_loading_page_present(
+    const PspUiState *ui, uint64_t *last_present_us, uint64_t now_us,
+    bool urgent)
+{
+    if (!urgent && now_us - *last_present_us
+                       < PSP_NAVIGATION_PRESENT_INTERVAL_US) return;
+    if (psp_navigation_cooperate_owner_present(ui))
+        *last_present_us = now_us;
+}
+
+/* X on a control of the loading page: the commit kept its focus, so act on
+   it now. */
+static TILEFINCH_OUT_OF_LINE void psp_run_deferred_activation(
+    PspApp *app, PspAppFrameState *frame)
+{
+    if (!browser_engine_take_deferred_activation(app->browser->engine))
+        return;
+    PspUiIntent deferred = {0};
+    deferred.action = PSP_UI_ACTION_ACTIVATE;
+    frame->preview_pointer = false;
+    psp_app_dispatch_action(app, frame, &deferred);
+}
+
 static TILEFINCH_OUT_OF_LINE bool psp_dispatch_page_pointer(
     PspApp *app, const PspUiIntent *intent, bool *activate, bool *changed)
 {
@@ -3082,8 +3128,9 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
         psp_site_data_restore_cancel_mask(
             &interactive->site_data_restore,
             BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
-        (void) browser_session_persistence_clear(
-            browser->session, BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
+        bool cleared = browser_session_persistence_clear(
+            browser->session, BROWSER_SESSION_PERSIST_LOCAL_STORAGE)
+            == BROWSER_SESSION_PERSISTENCE_OK;
         BrowserSessionPersistenceStatus status =
             process->persistent_site_data_available
                 ? browser_session_persistence_remove(
@@ -3091,17 +3138,22 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
                 : BROWSER_SESSION_PERSISTENCE_OK;
         psp_ui_show_status(
             &process->presentation.ui,
-            status == BROWSER_SESSION_PERSISTENCE_OK
-                ? "LOCAL STORAGE CLEARED"
-                : "LOCAL FILE COULD NOT BE CLEARED",
+            !cleared ? "SOME DATA COULD NOT BE CLEARED"
+                : status == BROWSER_SESSION_PERSISTENCE_OK
+                    ? "LOCAL STORAGE CLEARED"
+                    : "LOCAL FILE COULD NOT BE CLEARED",
             240);
         return;
     }
     if (intent->clear_session_storage_requested) {
-        browser_session_storage_clear_all(browser->session, false);
-        browser_session_opfs_clear_all(browser->session);
+        bool cleared =
+            browser_session_storage_clear_all(browser->session, false);
+        cleared = browser_session_opfs_clear_all(browser->session)
+            && cleared;
         psp_ui_show_status(
-            &process->presentation.ui, "SESSION STORAGE CLEARED", 180);
+            &process->presentation.ui,
+            cleared ? "SESSION STORAGE CLEARED"
+                    : "SOME DATA COULD NOT BE CLEARED", 180);
         return;
     }
     char site_url[NAVIGATION_URL_LIMIT];
@@ -3173,6 +3225,264 @@ static TILEFINCH_OUT_OF_LINE void psp_boot_input_probe(uint64_t sample_us)
     }
 }
 #endif
+
+/* The Update screen's primary button: install-and-restart, or begin the
+   network check for the selected release. Rare and network-bound, so it
+   stays out of the resident frame loop. */
+static TILEFINCH_COLD_PATH void psp_handle_update_primary(
+    PspProcessResources *process, PspBrowserResources *browser,
+    PspEngineViews *engine_views, PspInteractiveState *interactive
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    , PspNetwork *network, PspNetworkLifecycle *network_lifecycle
+#endif
+)
+{
+    PspUpdatePrimaryResult primary =
+        psp_update_session_primary(
+            &browser->update_session, &process->install_paths);
+    if (primary == PSP_UPDATE_PRIMARY_RESTART_REQUIRED) {
+        psp_exit_plan_request(
+            &interactive->exit, PSP_EXIT_UPDATE_RESTART);
+    } else if (primary
+               == PSP_UPDATE_PRIMARY_CHECK_REQUIRED) {
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+        psp_ui_set_update(
+            &process->presentation.ui, TILEFINCH_VERSION_STRING,
+            "CONNECTING...", "", -1, "", false, true);
+        if (!psp_navigation_cooperate_supervised())
+            psp_present(engine_views->frame, &process->presentation.ui);
+        PspUpdateSessionOptions selected_update =
+            psp_profile_update_options(process, browser);
+        char selected_update_url[768];
+        bool have_selected_update_url =
+            browser->update_session.allow_downgrade
+            ? psp_update_session_selected_metadata_url(
+                  &browser->update_session, selected_update_url,
+                  sizeof(selected_update_url))
+            : psp_update_session_metadata_url(
+                  &selected_update, selected_update_url,
+                  sizeof(selected_update_url));
+        bool network_ready =
+            strcmp(process->config.trace, "none") == 0
+            && have_selected_update_url
+            && psp_ensure_network_for_navigation(
+                   network, network_lifecycle,
+                   (int) process->config.network_profile,
+                   "GET", selected_update_url, false,
+                   engine_views->frame, &process->presentation.ui);
+        psp_ui_set_loading(&process->presentation.ui, false, 0);
+        time_t now = time(NULL);
+        if (network_ready) {
+            (void) psp_update_session_begin_check(
+                &browser->update_session,
+                now > 0 ? (uint64_t) now : 0,
+                now > 0);
+        }
+#else
+        psp_ui_set_update(
+            &process->presentation.ui, TILEFINCH_VERSION_STRING,
+            "LIVE NETWORKING IS NOT IN THIS BUILD",
+            "", -1, "", false, false);
+#endif
+    }
+}
+
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+/* A background update check has just finished. A completed check advances
+   the weekly cadence and records whether a release is waiting (toasting it
+   once per boot); a failed one only logs. Returns whether the chrome
+   changed. */
+static TILEFINCH_COLD_PATH bool psp_finish_update_check(
+    PspProcessResources *process, PspBrowserResources *browser,
+    uint64_t now_us, PspUpdateCheck *check)
+{
+    bool visual_changed = false;
+    TilefinchUpdateClientPhase check_phase =
+        browser->update_session.client_snapshot.phase;
+    bool check_found_release =
+        check_phase == TILEFINCH_UPDATE_CLIENT_AVAILABLE
+        || check_phase == TILEFINCH_UPDATE_CLIENT_DOWNLOADED;
+    if (check_found_release
+        || check_phase
+               == TILEFINCH_UPDATE_CLIENT_UP_TO_DATE) {
+        /* Only a completed check advances the weekly
+           cadence; failed or cancelled attempts stay silent
+           and retry on a later boot. */
+        check->completed++;
+        time_t update_check_done = time(NULL);
+        if (update_check_done > 0)
+            browser_profile_set_update_check_last_unix(
+                browser->profile, (uint64_t) update_check_done);
+        if (check_found_release) {
+            check->available++;
+            browser_profile_set_update_check_available_sequence(
+                browser->profile,
+                browser_profile_update_channel(browser->profile)
+                        == BROWSER_UPDATE_CHANNEL_DEVELOPER
+                    ? TILEFINCH_UPDATE_DEVELOPER_SEQUENCE
+                    : browser->update_session.client_snapshot
+                          .manifest.release_sequence);
+            process->presentation.ui.update_release_available = true;
+            if (!check->toasted) {
+                check->toasted = true;
+                psp_ui_show_status(
+                    &process->presentation.ui, "UPDATE READY - SEE OPTIONS", 240);
+                visual_changed = true;
+            }
+        } else {
+            browser_profile_set_update_check_available_sequence(
+                browser->profile, 0);
+            process->presentation.ui.update_release_available = false;
+        }
+        psp_profile_store_mark_dirty(
+            &browser->profile_store, now_us);
+        printf(
+            "tilefinch-update-check: completed "
+            "available=%d sequence=%llu\n",
+            check_found_release ? 1 : 0,
+            (unsigned long long)
+                browser->update_session.client_snapshot
+                    .manifest.release_sequence);
+    } else {
+        printf(
+            "tilefinch-update-check: failed phase=%u "
+            "status=%u\n",
+            (unsigned) check_phase,
+            (unsigned)
+                browser->update_session.client_snapshot.status);
+    }
+    return visual_changed;
+}
+#endif
+
+/* Advances the pending screenshot PNG writer one slice when the frame-pump
+   policy admits it, reporting progress in tenths and the saved name or
+   failure at the end. Returns whether the status line changed. */
+static TILEFINCH_COLD_PATH bool psp_pump_screenshot(PspApp *app)
+{
+    if (!psp_app_frame_pump_run(app, FRAME_PUMP_SCREENSHOT)) return false;
+    PspProcessResources *process = app->process;
+    PspBrowserResources *browser = app->browser;
+    PspInteractiveState *interactive = app->interactive;
+    bool visual_changed = false;
+    ScreenshotPngStatus screenshot_status =
+        screenshot_png_pump(&interactive->screenshot.writer, 4);
+    unsigned per_mille =
+        screenshot_png_progress_per_mille(&interactive->screenshot.writer);
+    unsigned tenth = per_mille / 100u;
+    if (screenshot_status == SCREENSHOT_PNG_PENDING
+        && tenth > interactive->screenshot.reported_tenth) {
+        interactive->screenshot.reported_tenth = tenth;
+        char screenshot_status_text[40];
+        snprintf(
+            screenshot_status_text,
+            sizeof(screenshot_status_text),
+            "SAVING SCREENSHOT %u%%", tenth * 10u);
+        psp_ui_show_status(
+            &process->presentation.ui, screenshot_status_text, 240);
+        visual_changed = true;
+    } else if (screenshot_status
+                   == SCREENSHOT_PNG_COMPLETE) {
+        char saved_name[48];
+        const char *saved_basename = strrchr(
+            interactive->screenshot.writer.final_path, '/');
+        saved_basename = saved_basename == NULL
+            ? interactive->screenshot.writer.final_path
+            : saved_basename + 1;
+        snprintf(
+            saved_name, sizeof(saved_name),
+            "SAVED %.40s", saved_basename);
+        printf(
+            "tilefinch-screenshot: event=complete path=\"%s\"\n",
+            interactive->screenshot.writer.final_path);
+        budget_free(browser->budget, interactive->screenshot.pixels);
+        interactive->screenshot.pixels = NULL;
+        screenshot_png_cancel(&interactive->screenshot.writer);
+        psp_ui_show_status(
+            &process->presentation.ui, saved_name, 300);
+        visual_changed = true;
+    } else if (screenshot_status == SCREENSHOT_PNG_FAILED) {
+        printf(
+            "tilefinch-screenshot: event=failed error=\"%s\"\n",
+            screenshot_png_error(&interactive->screenshot.writer));
+        /* Ask before the cancel below removes the partial
+           temporary and gives the space back. */
+        bool screenshot_stick_full =
+            psp_screenshot_space_short(process->install_paths.data_dir);
+        budget_free(browser->budget, interactive->screenshot.pixels);
+        interactive->screenshot.pixels = NULL;
+        screenshot_png_cancel(&interactive->screenshot.writer);
+        psp_ui_show_status(
+            &process->presentation.ui,
+            screenshot_stick_full
+                ? "MEMORY STICK FULL - SCREENSHOT NOT SAVED"
+                : "SCREENSHOT SAVE FAILED",
+            240);
+        visual_changed = true;
+    }
+    return visual_changed;
+}
+
+/* Imports the content-blocker allowlist file from the storage card into
+   the profile and reapplies it. Returns whether the page must repaint
+   (only when the import took effect). */
+static TILEFINCH_COLD_PATH bool psp_load_content_blocker_allowlist(
+    PspProcessResources *process, PspBrowserResources *browser,
+    PspEngineViews *engine_views, uint64_t now_us)
+{
+    BrowserProfileAllowlistImport imported = {0};
+    size_t previous_allowed =
+        browser_profile_content_blocker_allowed_site_count(
+            browser->profile);
+    bool loaded =
+        browser_profile_import_content_blocker_allowed_sites(
+            browser->profile, process->storage.content_allowlist, &imported)
+        && psp_content_blocker_apply_allowed_sites(
+               browser->engine, browser->profile);
+    if (!loaded)
+        psp_content_blocker_restore_allowed_site_count(
+            browser->profile, previous_allowed);
+    if (loaded && imported.added != 0)
+        psp_profile_store_mark_dirty(
+            &browser->profile_store, now_us);
+    process->presentation.ui.content_blocker_site_allowed =
+        process->presentation.ui.content_blocker_mode != CONTENT_BLOCKER_OFF
+        && browser_profile_content_blocker_site_allowed(
+               browser->profile, process->presentation.ui.url);
+    if (loaded) {
+        const NavigationEntry *entry =
+            navigation_current(engine_views->navigation);
+        (void) psp_set_presentation_css(
+            browser->engine, &process->presentation.ui,
+            browser->profile,
+            process->presentation.ui.reader_mode
+                || process->presentation.ui.basic_mode,
+            entry == NULL ? process->presentation.ui.url : entry->url,
+            process->presentation.ui.page_font_percent, true);
+        (void) psp_engine_views_refresh(engine_views, browser->engine);
+    }
+    char status[72];
+    if (!loaded) {
+        snprintf(status, sizeof(status),
+                 "ALLOWLIST FILE NOT AVAILABLE");
+    } else if (imported.resident_full) {
+        snprintf(status, sizeof(status),
+                 "ALLOWLIST FULL - %u ADDED",
+                 (unsigned) imported.added);
+    } else {
+        snprintf(status, sizeof(status),
+                 "ALLOWLIST LOADED - %u ADDED",
+                 (unsigned) imported.added);
+    }
+    psp_ui_show_status(&process->presentation.ui, status, 240);
+    printf(
+        "tilefinch-content-blocker: import added=%zu "
+        "duplicate=%zu ignored=%zu full=%s truncated=%s\n",
+        imported.added, imported.duplicate, imported.ignored,
+        imported.resident_full ? "yes" : "no",
+        imported.truncated ? "yes" : "no");
+    return loaded;
+}
 
 /* The resident frame loop. It borrows physical owners and returns only
    cleanup telemetry; lifecycle authority remains in the media and network
@@ -3247,26 +3557,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
      * embedded root; Developer instead requires its explicit local URL.
      * Trace replay and the Options toggle keep either mode inert.
      */
-    unsigned update_check_attempts = 0;
-    unsigned update_check_ratelimited = 0;
-    unsigned update_check_completed = 0;
-    unsigned update_check_available = 0;
+    PspUpdateCheck update_check = {0};
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     bool background_network_allowed = !offline_startup
         && strcmp(process->config.trace, "none") == 0;
-    bool update_check_toasted = false;
-    BrowserUpdateChannel boot_update_channel =
-        browser_profile_update_channel(browser->profile);
-    bool boot_update_trust_configured =
-        tilefinch_update_root_is_configured()
-        || (boot_update_channel == BROWSER_UPDATE_CHANNEL_DEVELOPER
-            && process->config.developer_update_url[0] != '\0');
-    bool update_check_pending =
+    psp_update_check_init(
+        &update_check,
         background_network_allowed
-        && process->config.validation_update_auto == 0
-        && boot_update_trust_configured
-        && browser_profile_update_check_enabled(browser->profile);
-    bool update_check_running = false;
+            && process->config.validation_update_auto == 0,
+        psp_app_update_check_configured(browser->profile, &process->config));
 #endif
 
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -3299,6 +3598,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     unsigned scroll_log_counter = 0;
     bool render_job_pending = false;
     uint64_t render_job_last_progress_us = 0;
+    /* A scrolled frame is on screen with checkerboard tiles still filling. */
+    bool render_placeholder_active = false;
     size_t navigation_pump_boundaries = 0;
     size_t blocker_navigation_baseline =
         startup_blocked_requests;
@@ -3328,6 +3629,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         (uint64_t) process->config.validation_media_stability_seconds
             * UINT64_C(1000000);
     bool media_stability_lifecycle_injected = false;
+    uint64_t loading_present_us = 0;
     uint64_t previous_ui_sample_us =
         (uint64_t) sceKernelGetSystemTimeWide();
     /* HOME has just been latched. Sample its first input without another
@@ -3359,8 +3661,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
         .network = network,
         .network_lifecycle = network_lifecycle,
-        .update_check_pending = &update_check_pending,
-        .update_check_running = &update_check_running,
+        .update_check = &update_check,
 #endif
         .interactive = interactive
     };
@@ -3674,11 +3975,12 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             psp_media_resume(&browser->media);
             psp_ui_show_status(
                 &process->presentation.ui,
-                interactive->lifecycle_retry_available
+                interactive->recovery_offer != PSP_RECOVERY_OFFER_NONE
                     ? "WELCOME BACK - SQUARE RETRIES PAGE"
                     : (resume_network_ready
                            ? "WELCOME BACK" : "RESUMED OFFLINE"),
-                interactive->lifecycle_retry_available ? 360 : 180);
+                interactive->recovery_offer != PSP_RECOVERY_OFFER_NONE
+                    ? 360 : 180);
             printf(
                 "tilefinch-lifecycle: event=recover epoch=%u "
                 "display=%d display-error=0x%08x clock=0x%08x "
@@ -3791,7 +4093,14 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         unsigned media_elapsed_ms = ui_elapsed_ms;
         PspUiInput input = psp_ui_input(
             &pad, interactive->previous_buttons, ui_elapsed_ms);
-        input.pressed |= psp_controller_take_latched_pressed();
+        /* During a supervised load the callback supervisor is the one
+           receiver of button edges (scrolling and Circle act at engine
+           checkpoints) and forwards the rest here; this loop keeps the
+           stick and held buttons. */
+        bool loading_page_input = psp_navigation_cooperate_supervised()
+            && browser_engine_navigation_pending(browser->engine);
+        if (!loading_page_input)
+            input.pressed |= psp_controller_take_latched_pressed();
         uint32_t supervisor_page_pressed = 0;
         bool supervisor_page_input =
             psp_navigation_cooperate_take_page_input(
@@ -3878,6 +4187,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             input.pressed |= supervisor_page_pressed;
             input.held |= supervisor_page_pressed;
         }
+        if (loading_page_input)
+            psp_loading_page_take_input(&input, &process->presentation.ui);
         interactive->previous_buttons = input.held;
         bool gamepad_visual_changed = psp_update_page_gamepad(
             &app, &input, ui_elapsed_ms, frame.ui_sample_us);
@@ -3981,25 +4292,6 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     power_policy->last_transition_us,
                 power_policy->transitions, power_policy->failures);
         }
-        /*
-         * Ambient motion is the first thing to go when the device is
-         * doing something that matters: a stepped-down clock, a page
-         * loading, media open, or an update in flight. The surface says
-         * so by holding still rather than by claiming to be busy.
-         */
-        bool suppress_ambient_motion =
-            power_policy->idle_clock || visible_active_work;
-#ifdef TILEFINCH_PSP_LIVE_NETWORK
-        /* The active-wave baseline spent about 2.0 s of compositor CPU
-           over the 12 s startup scenario (roughly one sixth of the
-           foreground budget) while association was still in flight.
-           Hold the already-painted wave still until APCTL becomes
-           terminal; input and the rest of HOME remain interactive-> */
-        suppress_ambient_motion =
-            suppress_ambient_motion
-            || psp_network_lifecycle_warming(network_lifecycle);
-#endif
-        process->presentation.ui.motion_suppressed = suppress_ambient_motion ? 1u : 0u;
         PspClockWorkerSnapshot power_snapshot = {0};
         if (process->clock_live) {
             psp_clock_worker_snapshot(
@@ -4121,18 +4413,19 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
         /*
          * Fire the boot-latched background check only once the boot
-         * really succeeded, nothing foreground is in flight, the user
+         * really succeeded, nothing foreground is in flight, a page or
+         * the native home screen is showing (not a menu), the user
          * has been idle for the house autohide interval, and an
          * already-joined network is READY. This path never initiates a
          * join; if the network never comes up, the check silently
          * stays pending for this boot.
          */
-        if (update_check_pending
-            && !update_check_running
+        if (psp_update_check_armed(&update_check)
             && loaded && !initial_error_page
             && !process->presentation.ui.loading && !render_job_pending
             && !browser->media.ui.visible
-            && process->presentation.ui.screen == PSP_UI_SCREEN_PAGE
+            && (process->presentation.ui.screen == PSP_UI_SCREEN_PAGE
+                || process->presentation.ui.screen == PSP_UI_SCREEN_HOME)
             && !browser_engine_navigation_pending(browser->engine)
             && !navigation_background_resources_pending(engine_views->navigation)
             && !psp_network_lifecycle_warming(network_lifecycle)
@@ -4140,14 +4433,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             && process->presentation.ui.activity_frames == 0
             && psp_network_lifecycle_ready(network_lifecycle)
             && network->status == PSP_NETWORK_READY) {
-            update_check_pending = false;
+            PspUpdateCheckOutcome update_check_outcome =
+                PSP_UPDATE_CHECK_NOT_STARTED;
             time_t update_check_now = time(NULL);
             if (update_check_now <= 0) {
                 printf("tilefinch-update-check: skipped=no-clock\n");
             } else if (!browser_profile_update_check_due(
                            browser->profile,
                            (uint64_t) update_check_now)) {
-                update_check_ratelimited++;
+                update_check_outcome = PSP_UPDATE_CHECK_RATE_LIMITED;
                 printf(
                     "tilefinch-update-check: skipped=ratelimited "
                     "last=%llu now=%llu\n",
@@ -4155,24 +4449,25 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                         browser_profile_update_check_last_unix(
                             browser->profile),
                     (unsigned long long) update_check_now);
+            } else if (!process->install_paths.slotted) {
+                /* Only an A/B slot install can stage and apply a
+                   package; the update session refuses any other layout
+                   (a plain EBOOT or the dev PRX loop). */
+                printf("tilefinch-update-check: skipped=unslotted\n");
             } else {
                 /* A completed hidden player is only a replay cache. An
                    update check has a larger, foreground-visible download
                    transaction and must not inherit that decoder's native
                    and contiguous-memory footprint. */
                 (void) psp_media_reclaim_hidden_pipeline(&browser->media);
-                if (!psp_update_session_initialized(&browser->update_session))
+                if (!psp_update_session_initialized(&browser->update_session)) {
+                    PspUpdateSessionOptions options =
+                        psp_profile_update_options(process, browser);
                     (void) psp_update_session_initialize(
-                        &browser->update_session, browser->budget, &process->install_paths,
-                        &(PspUpdateSessionOptions) {
-                            .channel =
-                                browser_profile_update_channel(browser->profile),
-                            .developer_metadata_url =
-                                process->config.developer_update_url,
-                            .developer_package_url =
-                                process->config.developer_package_url
-                        },
+                        &browser->update_session, browser->budget,
+                        &process->install_paths, &options,
                         &process->presentation.ui);
+                }
                 if (psp_update_session_available(&browser->update_session)
                     && psp_update_session_begin_check(
                            &browser->update_session,
@@ -4181,14 +4476,16 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                        adopts the new CHECKING phase this frame. */
                     psp_update_session_refresh_ui(
                         &browser->update_session, &process->presentation.ui);
-                    update_check_running = true;
-                    update_check_attempts++;
+                    update_check_outcome = PSP_UPDATE_CHECK_STARTED;
                     printf(
                         "tilefinch-update-check: started "
                         "now=%llu\n",
                         (unsigned long long) update_check_now);
+                } else {
+                    printf("tilefinch-update-check: skipped=unavailable\n");
                 }
             }
+            psp_update_check_fired(&update_check, update_check_outcome);
         }
 #endif
         PspUiIntent intent = {0};
@@ -4198,6 +4495,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         bool navigation_pending =
             browser_engine_navigation_pending(browser->engine);
         if (navigation_pending
+            && process->presentation.ui.screen == PSP_UI_SCREEN_PAGE
             && (input.pressed & PSP_UI_BUTTON_CANCEL) != 0) {
             uint32_t cancel_operation =
                 psp_log_operation_begin("navigation-cancel");
@@ -4223,12 +4521,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             psp_log_operation_end(
                 cancel_operation, "navigation-cancel", "requested");
         }
-        if (navigation_pending) {
-            /* The supervisor acknowledges non-cancel button presses as
-               busy rather than letting an unrelated action race the
-               candidate navigation. The analog cursor remains chrome-
-               local and responsive; its page event is suppressed below
-               until the candidate reaches a terminal state. */
+        if (navigation_pending && !loading_page_input) {
+            /* Without a callback supervisor to receive button edges, the
+               candidate navigation's own loop polls Circle; nothing else
+               may race it. The analog cursor remains chrome-local and
+               responsive; its page event is suppressed below until the
+               candidate reaches a terminal state. (A supervised load
+               forwards presses for the loading page instead.) */
             psp_ui_suspend_page_input(&process->presentation.ui);
             input.pressed = 0;
             input.held = 0;
@@ -4387,15 +4686,11 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         bool update_visual_changed = false;
         if (process->presentation.ui.screen == PSP_UI_SCREEN_UPDATE
             && !psp_update_session_initialized(&browser->update_session)) {
+            PspUpdateSessionOptions options =
+                psp_profile_update_options(process, browser);
             (void) psp_update_session_initialize(
-                &browser->update_session, browser->budget, &process->install_paths,
-                &(PspUpdateSessionOptions) {
-                    .channel = browser_profile_update_channel(browser->profile),
-                    .developer_metadata_url =
-                        process->config.developer_update_url,
-                    .developer_package_url =
-                        process->config.developer_package_url
-                },
+                &browser->update_session, browser->budget,
+                &process->install_paths, &options,
                 &process->presentation.ui);
             update_visual_changed = true;
         }
@@ -4418,59 +4713,12 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         }
         if (intent.update_primary_requested
             && psp_update_session_available(&browser->update_session)) {
-            PspUpdatePrimaryResult primary =
-                psp_update_session_primary(
-                    &browser->update_session, &process->install_paths);
-            if (primary == PSP_UPDATE_PRIMARY_RESTART_REQUIRED) {
-                psp_exit_plan_request(
-                    &interactive->exit, PSP_EXIT_UPDATE_RESTART);
-            } else if (primary
-                       == PSP_UPDATE_PRIMARY_CHECK_REQUIRED) {
+            psp_handle_update_primary(
+                process, browser, engine_views, interactive
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-                psp_ui_set_update(
-                    &process->presentation.ui, TILEFINCH_VERSION_STRING,
-                    "CONNECTING...", "", -1, "", false, true);
-                if (!psp_navigation_cooperate_supervised())
-                    psp_present(engine_views->frame, &process->presentation.ui);
-                PspUpdateSessionOptions selected_update = {
-                    .channel = browser_profile_update_channel(browser->profile),
-                    .developer_metadata_url =
-                        process->config.developer_update_url,
-                    .developer_package_url =
-                        process->config.developer_package_url
-                };
-                char selected_update_url[768];
-                bool have_selected_update_url =
-                    browser->update_session.allow_downgrade
-                    ? psp_update_session_selected_metadata_url(
-                          &browser->update_session, selected_update_url,
-                          sizeof(selected_update_url))
-                    : psp_update_session_metadata_url(
-                          &selected_update, selected_update_url,
-                          sizeof(selected_update_url));
-                bool network_ready =
-                    strcmp(process->config.trace, "none") == 0
-                    && have_selected_update_url
-                    && psp_ensure_network_for_navigation(
-                           network, network_lifecycle,
-                           (int) process->config.network_profile,
-                           "GET", selected_update_url, false,
-                           engine_views->frame, &process->presentation.ui);
-                psp_ui_set_loading(&process->presentation.ui, false, 0);
-                time_t now = time(NULL);
-                if (network_ready) {
-                    (void) psp_update_session_begin_check(
-                        &browser->update_session,
-                        now > 0 ? (uint64_t) now : 0,
-                        now > 0);
-                }
-#else
-                psp_ui_set_update(
-                    &process->presentation.ui, TILEFINCH_VERSION_STRING,
-                    "LIVE NETWORKING IS NOT IN THIS BUILD",
-                    "", -1, "", false, false);
+                , network, network_lifecycle
 #endif
-            }
+            );
             update_visual_changed = true;
         }
         if (update_visual_changed
@@ -4496,71 +4744,28 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             &interactive->exit);
 #endif
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-        if (update_check_running
-            && !psp_update_session_active(&browser->update_session)) {
-            update_check_running = false;
-            TilefinchUpdateClientPhase check_phase =
-                browser->update_session.client_snapshot.phase;
-            bool check_found_release =
-                check_phase == TILEFINCH_UPDATE_CLIENT_AVAILABLE
-                || check_phase == TILEFINCH_UPDATE_CLIENT_DOWNLOADED;
-            if (check_found_release
-                || check_phase
-                       == TILEFINCH_UPDATE_CLIENT_UP_TO_DATE) {
-                /* Only a completed check advances the weekly
-                   cadence; failed or cancelled attempts stay silent
-                   and retry on a later boot. */
-                update_check_completed++;
-                time_t update_check_done = time(NULL);
-                if (update_check_done > 0)
-                    browser_profile_set_update_check_last_unix(
-                        browser->profile, (uint64_t) update_check_done);
-                if (check_found_release) {
-                    update_check_available++;
-                    browser_profile_set_update_check_available_sequence(
-                        browser->profile,
-                        browser_profile_update_channel(browser->profile)
-                                == BROWSER_UPDATE_CHANNEL_DEVELOPER
-                            ? TILEFINCH_UPDATE_DEVELOPER_SEQUENCE
-                            : browser->update_session.client_snapshot
-                                  .manifest.release_sequence);
-                    process->presentation.ui.update_release_available = true;
-                    if (!update_check_toasted) {
-                        update_check_toasted = true;
-                        psp_ui_show_status(
-                            &process->presentation.ui, "UPDATE READY - SEE OPTIONS", 240);
-                        navigation_visual_changed = true;
-                    }
-                } else {
-                    browser_profile_set_update_check_available_sequence(
-                        browser->profile, 0);
-                    process->presentation.ui.update_release_available = false;
-                }
-                psp_profile_store_mark_dirty(
-                    &browser->profile_store, frame.ui_sample_us);
-                printf(
-                    "tilefinch-update-check: completed "
-                    "available=%d sequence=%llu\n",
-                    check_found_release ? 1 : 0,
-                    (unsigned long long)
-                        browser->update_session.client_snapshot
-                            .manifest.release_sequence);
-            } else {
-                printf(
-                    "tilefinch-update-check: failed phase=%u "
-                    "status=%u\n",
-                    (unsigned) check_phase,
-                    (unsigned)
-                        browser->update_session.client_snapshot.status);
-            }
+        if (psp_update_check_running(&update_check)
+            && !psp_update_session_active(&browser->update_session)
+            && psp_update_check_finished(&update_check)) {
+            navigation_visual_changed |= psp_finish_update_check(
+                process, browser, frame.ui_sample_us, &update_check);
         }
 #endif
+        navigation_visual_changed |= psp_app_site_storage_poll(&app);
         frame.page_dirty = color_mode_visual_changed
             || gamepad_visual_changed;
         navigation_visual_changed |= voice_component_visual_changed
             || glyph_component_visual_changed;
         frame.pointer_activation = false;
-        if (!navigation_pending
+        frame.preview_pointer = false;
+        if (navigation_pending
+            && intent.pointer_phase == PSP_UI_POINTER_UP) {
+            /* A click on the loading page acts on its preview. */
+            frame.preview_pointer = true;
+            frame.preview_pointer_x = intent.pointer_x;
+            frame.preview_pointer_y = intent.pointer_y;
+            intent.action = PSP_UI_ACTION_ACTIVATE;
+        } else if (!navigation_pending
             && intent.pointer_phase != PSP_UI_POINTER_NONE) {
             bool pointer_page_changed = false;
             if (!psp_dispatch_page_pointer(
@@ -4568,7 +4773,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 &frame.pointer_activation, &pointer_page_changed)) {
                 frame.pointer_activation = false;
             }
-            frame.page_dirty = pointer_page_changed;
+            frame.page_dirty = pointer_page_changed || frame.page_dirty;
             if (intent.pointer_phase == PSP_UI_POINTER_UP
                 && frame.pointer_activation) {
                 intent.action = PSP_UI_ACTION_ACTIVATE;
@@ -4625,64 +4830,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         }
 
         bool screenshot_visual_changed = false;
-        if (interactive->screenshot.writer.status == SCREENSHOT_PNG_PENDING
-            && psp_app_frame_pump_run(&app, FRAME_PUMP_SCREENSHOT)) {
-            ScreenshotPngStatus screenshot_status =
-                screenshot_png_pump(&interactive->screenshot.writer, 4);
-            unsigned per_mille =
-                screenshot_png_progress_per_mille(&interactive->screenshot.writer);
-            unsigned tenth = per_mille / 100u;
-            if (screenshot_status == SCREENSHOT_PNG_PENDING
-                && tenth > interactive->screenshot.reported_tenth) {
-                interactive->screenshot.reported_tenth = tenth;
-                char screenshot_status_text[40];
-                snprintf(
-                    screenshot_status_text,
-                    sizeof(screenshot_status_text),
-                    "SAVING SCREENSHOT %u%%", tenth * 10u);
-                psp_ui_show_status(
-                    &process->presentation.ui, screenshot_status_text, 240);
-                screenshot_visual_changed = true;
-            } else if (screenshot_status
-                           == SCREENSHOT_PNG_COMPLETE) {
-                char saved_name[48];
-                const char *saved_basename = strrchr(
-                    interactive->screenshot.writer.final_path, '/');
-                saved_basename = saved_basename == NULL
-                    ? interactive->screenshot.writer.final_path
-                    : saved_basename + 1;
-                snprintf(
-                    saved_name, sizeof(saved_name),
-                    "SAVED %.40s", saved_basename);
-                printf(
-                    "tilefinch-screenshot: event=complete path=\"%s\"\n",
-                    interactive->screenshot.writer.final_path);
-                budget_free(browser->budget, interactive->screenshot.pixels);
-                interactive->screenshot.pixels = NULL;
-                screenshot_png_cancel(&interactive->screenshot.writer);
-                psp_ui_show_status(
-                    &process->presentation.ui, saved_name, 300);
-                screenshot_visual_changed = true;
-            } else if (screenshot_status == SCREENSHOT_PNG_FAILED) {
-                printf(
-                    "tilefinch-screenshot: event=failed error=\"%s\"\n",
-                    screenshot_png_error(&interactive->screenshot.writer));
-                /* Ask before the cancel below removes the partial
-                   temporary and gives the space back. */
-                bool screenshot_stick_full =
-                    psp_screenshot_space_short(process->install_paths.data_dir);
-                budget_free(browser->budget, interactive->screenshot.pixels);
-                interactive->screenshot.pixels = NULL;
-                screenshot_png_cancel(&interactive->screenshot.writer);
-                psp_ui_show_status(
-                    &process->presentation.ui,
-                    screenshot_stick_full
-                        ? "MEMORY STICK FULL - SCREENSHOT NOT SAVED"
-                        : "SCREENSHOT SAVE FAILED",
-                    240);
-                screenshot_visual_changed = true;
-            }
-        }
+        if (interactive->screenshot.writer.status == SCREENSHOT_PNG_PENDING)
+            screenshot_visual_changed = psp_pump_screenshot(&app);
 
         psp_app_handle_theme_catalog(&app, &frame, &intent);
         if (intent.setting.id != PSP_UI_SETTING_NONE)
@@ -4693,14 +4842,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                channel; there is no cross-channel fallback. */
             psp_update_session_destroy(&browser->update_session);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-            update_check_running = false;
-            update_check_pending =
-                browser_profile_update_check_enabled(browser->profile)
-                && strcmp(process->config.trace, "none") == 0
-                && (tilefinch_update_root_is_configured()
-                    || (browser_profile_update_channel(browser->profile)
-                            == BROWSER_UPDATE_CHANNEL_DEVELOPER
-                        && process->config.developer_update_url[0] != '\0'));
+            psp_update_check_reset(
+                &update_check, psp_app_update_check_configured(
+                                   browser->profile, &process->config));
 #endif
         }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -4710,58 +4854,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         psp_input_script_observe_page(engine_views);
 #endif
         if (intent.load_content_blocker_allowlist_requested) {
-            BrowserProfileAllowlistImport imported = {0};
-            size_t previous_allowed =
-                browser_profile_content_blocker_allowed_site_count(
-                    browser->profile);
-            bool loaded =
-                browser_profile_import_content_blocker_allowed_sites(
-                    browser->profile, process->storage.content_allowlist, &imported)
-                && psp_content_blocker_apply_allowed_sites(
-                       browser->engine, browser->profile);
-            if (!loaded)
-                psp_content_blocker_restore_allowed_site_count(
-                    browser->profile, previous_allowed);
-            if (loaded && imported.added != 0)
-                psp_profile_store_mark_dirty(
-                    &browser->profile_store, frame.ui_sample_us);
-            process->presentation.ui.content_blocker_site_allowed =
-                process->presentation.ui.content_blocker_mode != CONTENT_BLOCKER_OFF
-                && browser_profile_content_blocker_site_allowed(
-                       browser->profile, process->presentation.ui.url);
-            if (loaded) {
-                const NavigationEntry *entry =
-                    navigation_current(engine_views->navigation);
-                (void) psp_set_presentation_css(
-                    browser->engine, &process->presentation.ui,
-                    browser->profile,
-                    process->presentation.ui.reader_mode
-                        || process->presentation.ui.basic_mode,
-                    entry == NULL ? process->presentation.ui.url : entry->url,
-                    process->presentation.ui.page_font_percent, true);
-                (void) psp_engine_views_refresh(engine_views, browser->engine);
+            if (psp_load_content_blocker_allowlist(
+                    process, browser, engine_views, frame.ui_sample_us))
                 frame.page_dirty = true;
-            }
-            char status[72];
-            if (!loaded) {
-                snprintf(status, sizeof(status),
-                         "ALLOWLIST FILE NOT AVAILABLE");
-            } else if (imported.resident_full) {
-                snprintf(status, sizeof(status),
-                         "ALLOWLIST FULL - %u ADDED",
-                         (unsigned) imported.added);
-            } else {
-                snprintf(status, sizeof(status),
-                         "ALLOWLIST LOADED - %u ADDED",
-                         (unsigned) imported.added);
-            }
-            psp_ui_show_status(&process->presentation.ui, status, 240);
-            printf(
-                "tilefinch-content-blocker: import added=%zu "
-                "duplicate=%zu ignored=%zu full=%s truncated=%s\n",
-                imported.added, imported.duplicate, imported.ignored,
-                imported.resident_full ? "yes" : "no",
-                imported.truncated ? "yes" : "no");
         }
         if (intent.clear_cache_requested
             || intent.clear_cookies_requested
@@ -4778,7 +4873,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             uint32_t scroll_operation = log_scroll
                 ? psp_log_operation_begin("analog-scroll") : 0;
             bool provisional = psp_request_provisional_scroll(
-                browser->engine, &process->presentation.ui, intent.scroll_delta);
+                browser->engine, &process->presentation.ui,
+                intent.scroll_delta, false);
             if (!provisional) {
                 frame.page_dirty = browser_engine_scroll_by(
                     browser->engine, intent.scroll_delta)
@@ -4911,7 +5007,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 if (navigation_status
                         == BROWSER_NAVIGATION_JOB_SUCCEEDED) {
                     interactive->captive_portal_failure_count = 0;
-                    interactive->lifecycle_retry_available = false;
+                    interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
                     process->presentation.ui.page_requests_blocked =
                         page_blocked > UINT32_MAX
                         ? UINT32_MAX : (uint32_t) page_blocked;
@@ -4924,6 +5020,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                         total_blocked > UINT32_MAX
                         ? UINT32_MAX : (uint32_t) total_blocked;
                     psp_apply_reader_after_navigation(&app, &frame);
+                    psp_run_deferred_activation(&app, &frame);
                     bool tab_restored = true;
                     if (interactive->tab_transition.pending) {
                         tab_restored = psp_tabs_finish(
@@ -4994,11 +5091,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                         == BROWSER_NAVIGATION_JOB_SUCCEEDED,
                     navigation_status
                         == BROWSER_NAVIGATION_JOB_CANCELLED);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                psp_load_experience_report(
+                    "follow", browser->engine, &navigation_metrics);
+#endif
                 printf("tilefinch-navigation-job: status=%d "
                        "http=%ld server=\"%.32s\" mitigated=\"%.16s\" "
                        "pumps=%zu body=%zuB yields=%zu "
                        "max-pump=%lluus parser-max=%lluus "
-                       "preview=%zu/%zu first=%lluus "
+                       "preview=%zu first=%lluus "
                        "scrolls=%zu y=%d bytes=%zu "
                        "headers=%lluus first-body=%lluus "
                        "first-dom=%lluus source=%zu nodes=%zu "
@@ -5027,7 +5128,6 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                            navigation_metrics.load
                                .maximum_parser_pump_us,
                        navigation_metrics.provisional_paints,
-                       navigation_metrics.provisional_frame_count,
                        (unsigned long long)
                            navigation_metrics
                                .provisional_first_present_us,
@@ -5179,16 +5279,14 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         if (offline_download_active
             && psp_app_frame_pump_run(&app, FRAME_PUMP_OFFLINE_DOWNLOAD)) {
             psp_ui_set_loading(&process->presentation.ui, true, -1);
-            psp_ui_show_status(&process->presentation.ui, "SAVING VIDEO  O PAUSE", 120);
+            psp_ui_keep_status(&process->presentation.ui, "SAVING VIDEO  O PAUSE", 120);
             psp_work_cooperate_begin(
                 &process->presentation.ui, engine_views->frame, true, true, false,
                 "PAUSING DOWNLOAD...", "offline-download", NULL, NULL);
             bool completed = psp_offline_store_pump(&browser->offline_store);
             bool cancelled = psp_navigation_cancel_requested();
-            uint32_t observed_buttons =
-                psp_ui_buttons(psp_navigation_observed_buttons());
-            psp_navigation_cooperate_end("offline-download");
-            interactive->previous_buttons = observed_buttons;
+            psp_navigation_cooperate_end_adopting_buttons(
+                "offline-download", &interactive->previous_buttons);
             if (cancelled)
                 (void) offline_download_manager_pause(
                     &browser->offline_store.download, offline_download_id);
@@ -5695,10 +5793,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             bool render_cancelled =
                 render_status == BROWSER_RENDER_JOB_CANCELLED;
             if (render_scope) {
-                uint32_t observed_buttons =
-                    psp_ui_buttons(psp_navigation_observed_buttons());
-                psp_navigation_cooperate_end("render-raster-unit");
-                interactive->previous_buttons = observed_buttons;
+                psp_navigation_cooperate_end_adopting_buttons(
+                    "render-raster-unit", &interactive->previous_buttons);
             }
             if (render_status == BROWSER_RENDER_JOB_FAILED) {
                 psp_report_job_failure(
@@ -5727,9 +5823,32 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             } else if (render_status == BROWSER_RENDER_JOB_COMPLETE) {
                 render_job_pending = false;
                 render_job_last_progress_us = 0;
+                render_placeholder_active = false;
                 render_visual_state = canvas_render ? 2u : 1u;
                 (void) psp_engine_views_refresh(engine_views, browser->engine);
             } else {
+                /* Scrolling never waits for raster: publish the new
+                   position at once from resident tiles with a checkerboard
+                   for the rest, then refill as slices land. Only a scroll
+                   earns placeholders; a job pending for in-place damage
+                   (an image arriving) keeps showing the old pixels. */
+                bool scrolled = render_stats != NULL
+                    && render_stats->frame_work.pending
+                    && (!render_stats->last_frame_scroll_valid
+                        || render_stats->frame_work.scroll_y
+                               != render_stats->last_frame_scroll_y);
+                bool progressed = render_placeholder_active
+                    && render_stats != NULL
+                    && render_stats->frame_job_units > units_before;
+                size_t placeholders = 0;
+                if (!canvas_render && (scrolled || progressed)
+                    && browser_engine_render_placeholder_frame(
+                           browser->engine, &placeholders)) {
+                    render_placeholder_active = placeholders != 0;
+                    render_visual_state = 1;
+                    (void) psp_engine_views_refresh(
+                        engine_views, browser->engine);
+                }
                 if (render_job_last_progress_us != 0
                     && render_now_us - render_job_last_progress_us
                            >= PSP_RENDER_JOB_TIMEOUT_US) {
@@ -5761,10 +5880,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             bool external_page =
                 interactive->recovery.entry != NULL
                 && interactive->recovery.entry->url != NULL
-                && strncmp(
-                       interactive->recovery.entry->url,
-                       "https://tilefinch.local/",
-                       strlen("https://tilefinch.local/")) != 0;
+                && !psp_ui_internal_url(interactive->recovery.entry->url);
             if (external_page
                 && (engine_views->navigation->generation
                         != interactive->recovery.observed_generation
@@ -5808,7 +5924,14 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             || (navigation_visual_changed
                 && !cursor_feedback_presented)
             || update_visual_changed || screenshot_visual_changed) {
-            if (!psp_navigation_cooperate_supervised()) {
+            if (psp_navigation_cooperate_supervised()
+                && browser_engine_navigation_pending(browser->engine)) {
+                psp_loading_page_present(
+                    &process->presentation.ui, &loading_present_us,
+                    frame.ui_sample_us,
+                    intent.visual_changed || input.pressed != 0
+                        || frame.page_dirty);
+            } else if (!psp_navigation_cooperate_supervised()) {
                 psp_log_set_phase(PSP_LOG_PHASE_RENDER);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                 unsigned presents_before = psp_display.presents;
@@ -5999,10 +6122,10 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         process->presentation.ui.validation_power_test_phase = 0;
     }
 #endif
-    result.update_check_attempts = update_check_attempts;
-    result.update_check_ratelimited = update_check_ratelimited;
-    result.update_check_completed = update_check_completed;
-    result.update_check_available = update_check_available;
+    result.update_check_attempts = update_check.attempts;
+    result.update_check_ratelimited = update_check.ratelimited;
+    result.update_check_completed = update_check.completed;
+    result.update_check_available = update_check.available;
     result.power_high_ms = power_high_ms;
     result.power_idle_ms = power_idle_ms;
     result.power_transition_ms = power_transition_ms;
@@ -6586,6 +6709,7 @@ static TILEFINCH_COLD_PATH void psp_report_startup_failure(
 
 int main(int argc, char *argv[])
 {
+    psp_fpu_mask_exceptions();
     PspProcessResources process = {0};
     PspBrowserResources browser = {0};
     PspInteractiveState interactive = {
@@ -6695,6 +6819,7 @@ int main(int argc, char *argv[])
         .preferred_date_format = psp_preferred_date_format,
         .cooperate = psp_platform_cooperate,
         .present_rgb565 = psp_platform_present,
+        .retire_frame = psp_platform_retire_frame,
         .log_message = psp_log_message,
     };
     tilefinch_platform_set_services(&services);
@@ -7072,7 +7197,10 @@ int main(int argc, char *argv[])
      */
     engine_config->maximum_document_bytes = 8 * MIB;
     engine_config->navigation_timeout_ms = 30000;
-    engine_config->tile_capacity = 8;
+    /* The device profile's capacity: one screen plus two rows of optional
+       paint-ahead (only the first eight tiles are reserved up front). */
+    engine_config->tile_capacity =
+        engine_config->device.maximum_tile_capacity;
     engine_config->javascript.enabled = true;
     engine_config->javascript.document_scripts_enabled = true;
     engine_config->javascript.heap_limit = (size_t) process.config.heap_mb * MIB;
@@ -7393,6 +7521,9 @@ int main(int argc, char *argv[])
         browser_profile_live_cache_kib(browser.profile);
     process.persistent_site_data_available =
         strcmp(process.config.trace, "none") == 0;
+    /* Before any localStorage snapshot loads, so a site kept on the
+       Memory Stick is never overridden by it. */
+    psp_app_site_storage_boot(&process, &browser);
     size_t live_cache_bytes = (size_t) live_cache_kib * KIB;
     bool live_cache_limit_set =
         browser_session_cache_set_maximum_bytes(browser.session, live_cache_bytes);
@@ -8084,6 +8215,12 @@ report:
            engine_views.navigation->preloads_failed,
            engine_views.navigation->preloads_deferred,
            engine_views.navigation->preloads_headroom_skipped);
+    {
+        /* The views are read-only copies; refresh through the owner. */
+        NavigationSession *owned = browser_engine_navigation(browser.engine);
+        script_runtime_refresh_result(
+            owned->page.runtime, &owned->page.script_result);
+    }
     printf("tilefinch-psp-script: scripts discovered=%zu attempted=%zu "
            "loaded=%zu failed=%zu modules=%zu module-map-hits=%zu "
            "bytes=%zu\n",

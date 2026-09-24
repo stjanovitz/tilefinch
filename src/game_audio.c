@@ -1,4 +1,5 @@
 #include "tilefinch/game_audio.h"
+#include "tilefinch/psp_fpu.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -224,6 +225,7 @@ static bool game_audio_any_voice(TilefinchGameAudio *audio)
 
 static int game_audio_thread(SceSize argument_size, void *arguments)
 {
+    psp_fpu_mask_exceptions();
     TilefinchGameAudio *audio = NULL;
     if (arguments != NULL && argument_size == sizeof(audio))
         memcpy(&audio, arguments, sizeof(audio));

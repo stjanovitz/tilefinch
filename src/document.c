@@ -407,6 +407,56 @@ static bool document_stats_add(size_t *value, size_t amount)
     return true;
 }
 
+/* Tag ids name exactly the elements whose local name is the static string,
+   so these match what name_is() would, without resolving the name. */
+static bool stats_hidden_container(const lxb_dom_node_t *node)
+{
+    return node->local_name == LXB_TAG_SCRIPT
+        || node->local_name == LXB_TAG_STYLE
+        || node->local_name == LXB_TAG_HEAD;
+}
+
+enum {
+    STATS_ATTRIBUTE_POINTER_EVENT = 1u,
+    STATS_ATTRIBUTE_AUTOFOCUS = 2u,
+    STATS_ATTRIBUTE_DIR = 4u,
+    STATS_ATTRIBUTE_KNOWN = 8u,
+    STATS_ATTRIBUTE_MEMO_SIZE = 64u
+};
+
+typedef struct {
+    uintptr_t id;
+    uint8_t flags;
+} StatsAttributeNameMemo;
+
+/* The flags of an attribute's qualified name. A name id is a static index
+   or the address of its interned entry, so it identifies the name within
+   the document; a small memo keyed by it skips re-reading repeated names. */
+static uint8_t stats_attribute_name_flags(const lxb_dom_attr_t *attr,
+                                          StatsAttributeNameMemo *memo)
+{
+    uintptr_t id = attr->qualified_name != 0
+        ? (uintptr_t) attr->qualified_name
+        : (uintptr_t) attr->node.local_name;
+    StatsAttributeNameMemo *entry =
+        &memo[(id ^ (id >> 6) ^ (id >> 12)) % STATS_ATTRIBUTE_MEMO_SIZE];
+    if ((entry->flags & STATS_ATTRIBUTE_KNOWN) != 0 && entry->id == id)
+        return entry->flags;
+    size_t name_length = 0;
+    const lxb_char_t *name = lxb_dom_attr_qualified_name(attr, &name_length);
+    uint8_t flags = STATS_ATTRIBUTE_KNOWN;
+    if (pointer_event_attribute_name(name, name_length))
+        flags |= STATS_ATTRIBUTE_POINTER_EVENT;
+    if (name != NULL && name_length == 9u
+        && memcmp(name, "autofocus", 9u) == 0)
+        flags |= STATS_ATTRIBUTE_AUTOFOCUS;
+    if (name != NULL && name_length == 3u && memcmp(name, "dir", 3u) == 0)
+        flags |= STATS_ATTRIBUTE_DIR;
+    entry->id = id;
+    entry->flags = flags;
+    return flags;
+}
+
 static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
                          DocumentStats *stats)
 {
@@ -415,6 +465,7 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
     size_t body_depth = in_body ? 1u : 0u;
     size_t hidden_depth = hidden ? 1u : 0u;
     size_t visited = 0;
+    StatsAttributeNameMemo name_memo[STATS_ATTRIBUTE_MEMO_SIZE] = {{0}};
     while (node != NULL && node != boundary_parent) {
         if (++visited > DOCUMENT_TRAVERSAL_NODE_LIMIT) return false;
         if ((visited & 255u) == 0
@@ -427,30 +478,27 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
             lxb_dom_element_t *element = lxb_dom_interface_element(node);
             for (lxb_dom_attr_t *attr = element->first_attr;
                  attr != NULL; attr = attr->next) {
-                size_t name_length = 0;
-                const lxb_char_t *attribute_name =
-                    lxb_dom_attr_qualified_name(attr, &name_length);
-                if (pointer_event_attribute_name(
-                        attribute_name, name_length)) {
+                uint8_t flags = stats_attribute_name_flags(attr, name_memo);
+                if ((flags & STATS_ATTRIBUTE_POINTER_EVENT) != 0)
                     stats->pointer_event_attributes_present = true;
-                }
-                if (attribute_name != NULL && name_length == 9u
-                    && memcmp(attribute_name, "autofocus", 9u) == 0) {
+                if ((flags & STATS_ATTRIBUTE_AUTOFOCUS) != 0)
                     stats->autofocus_attribute_present = true;
-                }
-                if (attribute_name != NULL && name_length == 3u
-                    && memcmp(attribute_name, "dir", 3u) == 0) {
+                /* dir="ltr" and dir="auto" cannot reorder text that has
+                   no RTL codepoints (bidi_text_present covers those), and
+                   many LTR sites set dir="ltr" on every content block. */
+                if ((flags & STATS_ATTRIBUTE_DIR) != 0
+                    && attr->value != NULL && attr->value->length == 3u
+                    && strncasecmp((const char *) attr->value->data,
+                                   "rtl", 3u) == 0)
                     stats->bidi_markup_present = true;
-                }
                 if (!document_stats_add(&stats->attributes, 1)
                     || (attr->value != NULL
                         && !document_stats_add(
                             &stats->attribute_value_bytes,
                             attr->value->length))) return false;
             }
-            if (name_is(node, "body")) body_depth++;
-            if (name_is(node, "script") || name_is(node, "style")
-                || name_is(node, "head")) hidden_depth++;
+            if (node->local_name == LXB_TAG_BODY) body_depth++;
+            if (stats_hidden_container(node)) hidden_depth++;
         }
         if (node->type == LXB_DOM_NODE_TYPE_TEXT
             && !document_stats_add(&stats->text_nodes, 1)) return false;
@@ -470,9 +518,8 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
         }
         for (;;) {
             if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-                if (name_is(node, "body")) body_depth--;
-                if (name_is(node, "script") || name_is(node, "style")
-                    || name_is(node, "head")) hidden_depth--;
+                if (node->local_name == LXB_TAG_BODY) body_depth--;
+                if (stats_hidden_container(node)) hidden_depth--;
             }
             if (node->next != NULL) {
                 node = node->next;
@@ -499,8 +546,7 @@ static bool copy_body_text(lxb_dom_node_t *node, bool hidden, char *output,
             return false;
         }
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            if (name_is(node, "script") || name_is(node, "style")
-                || name_is(node, "head")) hidden_depth++;
+            if (stats_hidden_container(node)) hidden_depth++;
         }
         if (node->type == LXB_DOM_NODE_TYPE_TEXT && hidden_depth == 0) {
             size_t length = 0;
@@ -523,8 +569,7 @@ static bool copy_body_text(lxb_dom_node_t *node, bool hidden, char *output,
         }
         for (;;) {
             if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
-                && (name_is(node, "script") || name_is(node, "style")
-                    || name_is(node, "head"))) hidden_depth--;
+                && stats_hidden_container(node)) hidden_depth--;
             if (node->next != NULL) {
                 node = node->next;
                 break;
@@ -806,6 +851,7 @@ bool document_refresh(PocDocument *document)
     document->text_node_count = stats.text_nodes;
     document->attribute_count = stats.attributes;
     document->attribute_value_bytes = stats.attribute_value_bytes;
+    document->attribute_totals_stale = false;
     document->text_bytes = stats.body_bytes;
     document->body_text_node_count = stats.body_text_nodes;
     document->body_text_length = 0;
@@ -1629,6 +1675,35 @@ void document_note_connected_mutation(PocDocument *document)
     if (document == NULL) return;
     document->content_generation++;
     if (document->content_generation == 0) document->content_generation = 1;
+}
+
+void document_note_attribute_mutation(PocDocument *document,
+                                      const char *name, size_t length)
+{
+    if (document == NULL) return;
+    document->attribute_totals_stale = true;
+    if (name == NULL) return;
+    /* Case-insensitive, so a flag is never missed; a removed attribute
+       keeps its flag until the next full refresh, which is conservative. */
+    if ((length >= 7u && strncasecmp(name, "onmouse", 7u) == 0)
+        || (length >= 9u && strncasecmp(name, "onpointer", 9u) == 0))
+        document->pointer_event_attributes_present = true;
+    if (length == 9u && strncasecmp(name, "autofocus", 9u) == 0)
+        document->autofocus_attribute_present = true;
+    if (length == 3u && strncasecmp(name, "dir", 3u) == 0)
+        document->bidi_markup_present = true;
+}
+
+void document_refresh_attribute_totals(PocDocument *document)
+{
+    if (document == NULL || !document->attribute_totals_stale
+        || document->html == NULL) return;
+    DocumentStats stats = {0};
+    if (!gather_stats(lxb_dom_interface_node(document->html), false, false,
+                      &stats)) return;
+    document->attribute_count = stats.attributes;
+    document->attribute_value_bytes = stats.attribute_value_bytes;
+    document->attribute_totals_stale = false;
 }
 
 bool document_set_element_inner_html(PocDocument *document,
@@ -2673,15 +2748,8 @@ static const char *normalized_referrer_policy(const char *value,
     }
     while (length != 0
            && isspace((unsigned char) value[length - 1])) length--;
-    static const char *const known[] = {
-        "no-referrer", "no-referrer-when-downgrade", "origin",
-        "origin-when-cross-origin", "same-origin", "strict-origin",
-        "strict-origin-when-cross-origin", "unsafe-url"
-    };
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
-        if (ascii_span_equal(value, length, known[i])) return known[i];
-    }
-    return NULL;
+    uint8_t code = tilefinch_referrer_policy_code(value, length, true);
+    return code == 0 ? NULL : tilefinch_referrer_policy_name(code);
 }
 
 bool document_referrer_policy(const PocDocument *document,

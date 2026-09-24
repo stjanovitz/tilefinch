@@ -6458,8 +6458,20 @@
         "<navigation-timing-observer>", &performance_observer_result));
     CHECK(strcmp(performance_observer_result.summary,
                  "navigation-pending") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+        performance_observer_runtime,
+        "(()=>{let value=pocSummary;globalThis.__summaryReads=0;"
+        "Object.defineProperty(globalThis,'pocSummary',{configurable:true,"
+        "get(){__summaryReads++;return value},set(next){value=next}})})()",
+        "<result-snapshot-accessor>", &performance_observer_result));
     CHECK(script_runtime_finish_loading(performance_observer_runtime,
                                         &performance_observer_result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        performance_observer_runtime,
+        "(()=>{const reads=__summaryReads;delete globalThis.pocSummary;"
+        "globalThis.pocSummary=String(reads)})()",
+        "<result-snapshot-count>", &performance_observer_result));
+    CHECK(strcmp(performance_observer_result.summary, "2") == 0);
     for (size_t navigation_turn = 0; navigation_turn < 3; navigation_turn++) {
         CHECK(script_runtime_advance(
             performance_observer_runtime, navigation_turn + 8, 8,

@@ -8,12 +8,27 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/captive_portal.h"
 #include "tilefinch/request_context.h"
+#include "tilefinch/site_storage.h"
 
-#define BROWSER_STORAGE_ENTRIES 64
-#define BROWSER_OPFS_ENTRIES 32
+/* Site storage (localStorage, sessionStorage, OPFS) is kept per origin.
+   Every site starts in RAM with a small allowance that grows in the
+   background while the device has memory to spare. A site that outgrows
+   RAM can be moved to the Memory Stick when the user agrees, for this
+   session or always. Byte counts are key plus value (or path plus data). */
+#define BROWSER_SITE_STORAGE_SITES 48u
+#define BROWSER_SITE_STORAGE_ITEMS 1024u
+#define BROWSER_SITE_STORAGE_SITE_ITEMS 256u
+#define BROWSER_SITE_STORAGE_INITIAL_BYTES (32u * 1024u)
+#define BROWSER_SITE_STORAGE_MEMORY_SITE_BYTES (512u * 1024u)
+#define BROWSER_SITE_STORAGE_MEMORY_TOTAL_BYTES (1024u * 1024u)
+/* RAM growth is refused unless this much budget stays free afterwards. */
+#define BROWSER_SITE_STORAGE_GROWTH_RESERVE_BYTES (3u * 1024u * 1024u)
+#define BROWSER_SITE_STORAGE_STICK_SITE_BYTES (4u * 1024u * 1024u)
+#define BROWSER_SITE_STORAGE_STICK_VALUE_BYTES (1024u * 1024u)
+#define BROWSER_SITE_STORAGE_DIRECTORY_LIMIT 192u
 #define BROWSER_OPFS_PATH_LIMIT 256
 #define BROWSER_OPFS_FILE_BYTE_LIMIT (64u * 1024u)
-#define BROWSER_OPFS_TOTAL_BYTE_LIMIT (256u * 1024u)
+#define BROWSER_OPFS_STICK_FILE_BYTE_LIMIT (512u * 1024u)
 #define BROWSER_COOKIE_ENTRIES 32
 #define BROWSER_COOKIE_PER_DOMAIN_LIMIT 8
 #define BROWSER_COOKIE_LONG_PATH_LIMIT 2048
@@ -43,6 +58,7 @@
 struct ContentBlocker;
 struct FetchResponseSecurityMetadata;
 struct BrowserCaptivePortalStash;
+struct BrowserSiteStore;
 
 typedef enum {
     BROWSER_COOKIE_SAME_SITE_DEFAULT = 0,
@@ -51,21 +67,31 @@ typedef enum {
     BROWSER_COOKIE_SAME_SITE_NONE
 } BrowserCookieSameSite;
 
+/* A site ran out of RAM for storage and may be offered the Memory Stick.
+   Sizes are what the prompt shows before anything is written. */
 typedef struct {
     char origin[BROWSER_ORIGIN_LIMIT];
-    char key[BROWSER_KEY_LIMIT];
-    char *value;
-    size_t value_length;
-    bool local;
-} BrowserStorageEntry;
+    size_t current_bytes;
+    size_t needed_bytes;
+    size_t stick_limit_bytes;
+} BrowserSiteStorageRequest;
+
+typedef struct {
+    char origin[BROWSER_ORIGIN_LIMIT];
+    BrowserSiteStorageTier tier;
+    BrowserSiteStoragePolicy policy;
+    size_t bytes;             /* live data this session (0 until loaded) */
+    size_t limit_bytes;       /* RAM allowance, or the Memory Stick limit */
+    size_t item_count;
+    size_t file_bytes;        /* on the Memory Stick, including dead records */
+    bool loaded;
+} BrowserSiteStorageInfo;
 
 typedef enum {
     BROWSER_OPFS_NONE = 0,
     BROWSER_OPFS_FILE = 1,
     BROWSER_OPFS_DIRECTORY = 2
 } BrowserOpfsKind;
-
-struct BrowserOpfsStore;
 
 typedef enum {
     BROWSER_OPFS_OK = 0,
@@ -339,24 +365,22 @@ typedef struct BrowserSession {
     Budget *budget;
     /* Non-owning engine-lifetime request policy. */
     struct ContentBlocker *content_blocker;
-    BrowserStorageEntry storage[BROWSER_STORAGE_ENTRIES];
-    /* Allocated only on the first mutating OPFS operation. Ordinary pages
-       pay one pointer, not the bounded file table. */
-    struct BrowserOpfsStore *opfs;
+    /* localStorage, sessionStorage and OPFS for every origin. Allocated on
+       the first write (or when the Memory Stick tier is configured), so
+       ordinary pages pay one pointer. */
+    struct BrowserSiteStore *site_store;
+    /* Outlives the store, so an OPFS writer from before a clear can never
+       match a recreated file's generation. */
+    uint64_t site_storage_generation;
     BrowserCookieEntry cookies[BROWSER_COOKIE_ENTRIES];
     BrowserCacheEntry cache[BROWSER_CACHE_ENTRIES];
     BrowserSiteAdapterState site_adapter_state;
     BrowserSiteAdapterDocumentCacheEntry site_adapter_document_cache[
         BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES];
     BrowserClientHintEntry client_hints[BROWSER_CLIENT_HINT_ORIGIN_LIMIT];
-    size_t storage_bytes;
-    size_t opfs_bytes;
-    uint64_t opfs_generation_clock;
     size_t cookie_bytes;
     size_t cookie_long_path_bytes;
     size_t cache_bytes;
-    size_t maximum_storage_bytes;
-    size_t maximum_opfs_bytes;
     size_t maximum_cookie_bytes;
     size_t maximum_cookie_long_path_bytes;
     size_t maximum_cache_bytes;
@@ -436,8 +460,6 @@ bool browser_session_mixed_content_site_allowed(
     const BrowserSession *session, const char *url);
 bool browser_session_set_third_party_cookie_site_allowed(
     BrowserSession *session, const char *url, bool allowed);
-bool browser_session_third_party_cookie_site_allowed(
-    const BrowserSession *session, const char *url);
 /* Begins and ends a temporary captive-portal partition. The normal cookie and
    storage tables are restored byte-for-byte; portal data is destroyed. */
 bool browser_session_captive_portal_begin(
@@ -514,18 +536,25 @@ bool browser_session_storage_key(
 bool browser_session_storage_set(BrowserSession *session, const char *url,
                                  bool local, const char *key,
                                  const char *value, size_t value_length);
-void browser_session_storage_remove(BrowserSession *session, const char *url,
+/* Removal from a site kept on the Memory Stick is logged there; when that
+   write fails the entry stays (it would reappear at the next load) and
+   these return false. */
+bool browser_session_storage_remove(BrowserSession *session, const char *url,
                                     bool local, const char *key);
-void browser_session_storage_clear(BrowserSession *session, const char *url,
+bool browser_session_storage_clear(BrowserSession *session, const char *url,
                                    bool local);
-/* Clears every entry in one storage namespace. Passing false clears only
-   sessionStorage; persistent storage code deliberately never calls that
-   form. */
-void browser_session_storage_clear_all(BrowserSession *session, bool local);
-/* A bounded, RAM-backed origin-private file system. Paths are canonical,
-   absolute OPFS paths (root is "/"); the native layer derives the origin
-   from url and never accepts page-supplied authority. */
+/* Clears every entry in one storage namespace, for every site, in RAM and
+   on the Memory Stick. Sites keep their tier and standing choice. */
+bool browser_session_storage_clear_all(BrowserSession *session, bool local);
+/* A bounded origin-private file system in the site's storage. Paths are
+   canonical, absolute OPFS paths (root is "/"); the native layer derives
+   the origin from url and never accepts page-supplied authority. stat
+   returns data only for a site kept in RAM; read always returns it, from a
+   buffer valid until the next storage call on this session. */
 BrowserOpfsResult browser_session_opfs_stat(
+    const BrowserSession *session, const char *url, const char *path,
+    BrowserOpfsView *view);
+BrowserOpfsResult browser_session_opfs_read(
     const BrowserSession *session, const char *url, const char *path,
     BrowserOpfsView *view);
 BrowserOpfsResult browser_session_opfs_create(
@@ -540,7 +569,51 @@ BrowserOpfsResult browser_session_opfs_remove(
 BrowserOpfsResult browser_session_opfs_child(
     const BrowserSession *session, const char *url, const char *parent,
     size_t index, const char **name, BrowserOpfsView *view);
-void browser_session_opfs_clear_all(BrowserSession *session);
+bool browser_session_opfs_clear_all(BrowserSession *session);
+
+/* The Memory Stick tier. Until configured with an existing directory, all
+   site storage stays in RAM and no offers are made. */
+bool browser_session_site_storage_configure(BrowserSession *session,
+                                            const char *directory);
+/* The global "offer the Memory Stick" setting (on by default). */
+void browser_session_site_storage_set_offers(BrowserSession *session,
+                                             bool enabled);
+/* Applies a site's standing choice. STICK moves any RAM data to the
+   Memory Stick now (a site registered at boot loads on first use). ASK and
+   MEMORY_ONLY turn an always-kept site into this-session-only: its data
+   stays readable until exit and is then deleted. */
+bool browser_session_site_storage_set_policy(
+    BrowserSession *session, const char *url,
+    BrowserSiteStoragePolicy policy);
+/* The one pending offer, if a site ran out of RAM. Taking it leaves the
+   site waiting for grant or decline; it is not offered again meanwhile. */
+bool browser_session_site_storage_take_request(
+    BrowserSession *session, BrowserSiteStorageRequest *request);
+/* The user's answer. grant(always=false) moves the site's data to the
+   Memory Stick for this session; always=true is set_policy(STICK). The
+   write that ran out already failed; later writes can succeed. */
+bool browser_session_site_storage_grant(BrowserSession *session,
+                                        const char *url, bool always);
+void browser_session_site_storage_decline(BrowserSession *session,
+                                          const char *url);
+/* Deletes the site's storage everywhere, removes its Memory Stick file and
+   returns it to RAM with policy ASK. */
+bool browser_session_site_storage_forget(BrowserSession *session,
+                                         const char *url);
+/* Cheap: no Memory Stick access. */
+BrowserSiteStorageTier browser_session_site_storage_tier(
+    const BrowserSession *session, const char *url);
+/* Sites with storage or a standing choice, for the Storage menu. */
+size_t browser_session_site_storage_count(const BrowserSession *session);
+bool browser_session_site_storage_info(const BrowserSession *session,
+                                       size_t index,
+                                       BrowserSiteStorageInfo *info);
+bool browser_session_site_storage_info_for(const BrowserSession *session,
+                                           const char *url,
+                                           BrowserSiteStorageInfo *info);
+/* Boot cleanup: this-session-only files left by a run that did not exit
+   cleanly. */
+void browser_site_storage_remove_session_files(const char *directory);
 bool browser_session_cookie_get(const BrowserSession *session,
                                 const char *url, char *output,
                                 size_t output_capacity);

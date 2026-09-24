@@ -2,13 +2,15 @@
 
 Tilefinch provides bounded request blocking and conservative cosmetic hiding
 as performance and comfort features. **Basic blocking and cosmetic hiding are
-on by default.** Both can be changed independently in Options.
+on by default**, and each can be changed independently under **Settings →
+Privacy & security**.
 
 Tilefinch also hides common cookie-consent overlays by default. This is a
-separate cosmetic comfort policy: it remains active when request blocking is
-Off, never clicks an acceptance button, and never creates a consent cookie.
-`Options → Cookie notices` switches between **Hide** and **Show** for the
-current registrable site. At most 16 Show exceptions are retained.
+separate comfort policy: it stays active when request blocking is Off, never
+clicks an acceptance button, and never creates a consent cookie. **Page tools
+→ Site information → Permissions & controls → Cookie notices** switches
+between **Hide** and **Show** for the current registrable site, and at most 16
+Show exceptions are kept.
 
 ## Modes
 
@@ -19,31 +21,31 @@ current registrable site. At most 16 Show exceptions are retained.
 - **Custom** reads `data/adblock.txt`. Switching to Custom fails without
   changing the active mode if the file cannot be read or validated.
 
-`Options → Allow site` bypasses blocking for the current registrable site.
-For example, allowing `en.wikipedia.org` records `wikipedia.org`, so the same
-choice applies to the mobile hostname. The active set retains at most **32**
-sites (about 4 KiB worst case), and request matching never reads the Memory
-Stick. Saved exceptions are deliberately activated only after Tilefinch has
-presented its first stable chrome frame, so profile growth cannot hold the
-screen black during boot.
+**Permissions & controls → Content blocking** bypasses blocking for the
+current registrable site. Allowing `en.wikipedia.org`, for example, records
+`wikipedia.org`, so the choice also covers the mobile hostname. The active set
+holds at most **32** sites (about 4 KiB at worst), and request matching never
+reads the Memory Stick. Saved exceptions are deliberately activated only after
+Tilefinch has shown its first stable chrome frame, so a growing profile cannot
+hold the screen black during boot.
 
-An optional `data/adblock-allow.txt` can contain additional bare hostnames or
-HTTP(S) URLs, one per line; blank lines and lines beginning with `!` or `#` are
-ignored. `Options → Load allowlist` reads and merges that file only when the
-user asks. Import is bounded to 32 KiB and 511 bytes per line, deduplicates
-registrable sites, and stops safely when the 32-site resident set is full.
-Imported entries join the next transactional profile save, so the external
-file is an import source rather than request-time storage.
+An optional `data/adblock-allow.txt` can list more bare hostnames or HTTP(S)
+URLs, one per line; blank lines and lines starting with `!` or `#` are
+ignored. **Settings → Privacy & security → Load allowlist** reads and merges
+that file only when you ask. The import is limited to 32 KiB and 511 bytes per
+line, deduplicates registrable sites, and stops safely when the 32-site set is
+full. Imported entries join the next transactional profile save, so the file
+is a source to import from, not storage consulted at request time.
 
-Changing a site exception immediately reloads the current page so
-already-started network work agrees with the new policy. Cosmetic hiding
-changes immediately and remains an independent switch: turning off **Hide
-page ads** leaves request blocking active.
+Changing a site exception reloads the current page at once, so network work
+already under way agrees with the new policy. Cosmetic hiding also changes at
+once and is an independent switch: turning off **Hide page ads** leaves
+request blocking active.
 
-After a successful load, the bottom bar shows `B` followed by the number of
-requests blocked for that page. The Ad blocking row in Options also carries a
-small cumulative count across successful loads. Only the count is persisted;
-Tilefinch does not retain blocked request URLs or per-site blocking history.
+After a successful load, the bottom bar shows `B` and the number of requests
+blocked on that page, and the **Content blocker** row in Settings shows a
+small running total across successful loads. Only the count is saved;
+Tilefinch keeps no blocked URLs or per-site blocking history.
 
 ## Built-in Basic rules
 
@@ -83,9 +85,9 @@ ins.adsbygoogle
 ```
 
 It is composed in source order with global font scaling and Reader mode, so
-enabling either feature does not discard the others. The option is on by
-default; `Options → Hide page ads` disables only this stylesheet while leaving
-network blocking active.
+turning on either of those does not discard it. It is on by default, and
+**Settings → Privacy & security → Hide page ads** turns off only this
+stylesheet, leaving network blocking active.
 
 ## Cookie notices
 
@@ -99,8 +101,8 @@ to apply when JavaScript inserts a banner after the first paint.
 Tilefinch deliberately does not search button text or automatically choose an
 Accept/Reject control. Doing so would be language-dependent and could grant
 tracking consent without the user seeing it. A site that needs its consent UI
-for functionality can be restored immediately with `Cookie notices → Show`;
-the setting is independent of ad-blocking mode and its Allow-site list.
+for functionality can be restored immediately with **Cookie notices → Show**;
+that setting is independent of the ad-blocking mode and its site exceptions.
 
 ## Custom syntax
 
@@ -121,9 +123,10 @@ Accepted forms are host-suffix block rules (`||host^`), `@@` exceptions,
 hosts-file entries, and bare hostnames. Accepted party modifiers are
 `third-party`/`3p`, `first-party`/`1p`, and their `~` negations. Accepted
 resource modifiers are `script`, `image`, `stylesheet`/`css`, `font`,
-`xmlhttprequest`/`xhr`, and `subdocument`/`frame`. `important` is accepted;
+`xmlhttprequest`/`xhr`, `subdocument`/`frame`, and `media` (video and audio
+opens and range requests). `important` is accepted;
 hostname matching is always ASCII case-insensitive. Rules qualified with
-`media`, `other`, `ping`, or `websocket` are counted as ignored because those
+`other`, `ping`, or `websocket` are counted as ignored because those
 transports do not currently enter this policy seam; retaining them as active
 would advertise protection they cannot provide.
 

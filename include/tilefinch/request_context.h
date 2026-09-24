@@ -109,7 +109,6 @@ bool tilefinch_request_context_analyze(
     const TilefinchRequestContext *context, TilefinchRequestFacts *facts);
 bool tilefinch_request_same_origin(const TilefinchRequestContext *context);
 bool tilefinch_request_same_site(const TilefinchRequestContext *context);
-bool tilefinch_request_safe_method(const TilefinchRequestContext *context);
 bool tilefinch_request_sends_credentials(const TilefinchRequestContext *context);
 bool tilefinch_request_allows_lax_cookie(const TilefinchRequestContext *context);
 const char *tilefinch_request_fetch_site(const TilefinchRequestContext *context);

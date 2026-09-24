@@ -1157,8 +1157,11 @@ static void webgl_sample_texture(const WebglTexture *texture,
     else u = fmaxf(0.0f, fminf(1.0f, u));
     if (texture->repeat_t) v -= floorf(v);
     else v = fmaxf(0.0f, fminf(1.0f, v));
+    /* Row 0 of the uploaded data is v = 0, as in WebGL (UNPACK_FLIP_Y is
+       applied at upload). Sampling (1 - v) drew every texture upside down;
+       Chromium and the PSP GE path both sample v directly. */
     int x = (int) floorf(u * (float) texture->width);
-    int y = (int) floorf((1.0f - v) * (float) texture->height);
+    int y = (int) floorf(v * (float) texture->height);
     if (x >= texture->width) x = texture->width - 1;
     if (y >= texture->height) y = texture->height - 1;
     if (x < 0) x = 0;
@@ -1637,10 +1640,13 @@ static bool webgl_ge_vertex(const WebglDecodedDraw *draw, uint32_t sequence,
         if (!isfinite(position[component]) || !isfinite(color[component])
             || !isfinite(texcoord[component])) *valid = false;
     }
-    if (fabsf(position[3] - 1.0f) > 0.000001f
-        || fabsf(position[0]) > 1048576.0f
-        || fabsf(position[1]) > 1048576.0f
-        || fabsf(position[2]) > 1048576.0f) *valid = false;
+    /* Only finite values reach the range test: an ordered comparison with
+       NaN traps on the PSP FPU unless exceptions are masked. */
+    if (*valid
+        && (fabsf(position[3] - 1.0f) > 0.000001f
+            || fabsf(position[0]) > 1048576.0f
+            || fabsf(position[1]) > 1048576.0f
+            || fabsf(position[2]) > 1048576.0f)) *valid = false;
     *output = (WebglGeVertex) {
         .u = texcoord[0], .v = texcoord[1],
         .color = (uint32_t) webgl_color_byte(color[0] * draw->uniform[0])
@@ -1704,6 +1710,14 @@ static unsigned webgl_power_of_two(unsigned value)
     unsigned result = 1;
     while (result < value && result < 512u) result <<= 1;
     return result;
+}
+
+/* A GE texture row is at least 16 bytes (four 8888 texels): a narrower
+   buffer width sampled nothing on a PSP-3000 (a 1-wide texture drew black). */
+static unsigned webgl_ge_texture_stride(unsigned width)
+{
+    unsigned stride = webgl_power_of_two(width);
+    return stride < 4u ? 4u : stride;
 }
 
 static int webgl_ge_primitive(int mode)
@@ -2132,7 +2146,8 @@ static bool webgl_render_ge(DomBridge *bridge,
             }
         }
         if (retained) continue;
-        size_t bytes = (size_t) webgl_power_of_two((unsigned) textures[i].width)
+        size_t bytes = (size_t) webgl_ge_texture_stride(
+                           (unsigned) textures[i].width)
             * webgl_power_of_two((unsigned) textures[i].height) * 4u;
         if (bytes > texture_capacity - additional_bytes) {
             budget_free(budget, scratch); return false;
@@ -2150,7 +2165,7 @@ static bool webgl_render_ge(DomBridge *bridge,
 #endif
     }
     for (size_t i = 0; i < texture_count; i++) {
-        unsigned stride = webgl_power_of_two((unsigned) textures[i].width);
+        unsigned stride = webgl_ge_texture_stride((unsigned) textures[i].width);
         unsigned padded_height = webgl_power_of_two((unsigned) textures[i].height);
         size_t bytes = (size_t) stride * padded_height * 4u;
         size_t cached = webgl_ge_texture_owner.cached_entries;
@@ -2186,12 +2201,24 @@ static bool webgl_render_ge(DomBridge *bridge,
             };
             uint8_t *destination = (uint8_t *) edram
                 + WEBGL_GE_TEXTURE_OFFSET + entry->offset;
-            memset(destination, 0, bytes);
-            for (int y = 0; y < textures[i].height; y++) memcpy(
-                destination + (size_t) y * stride * 4u,
-                sources[textures[i].source].bytes
-                    + (size_t) y * (size_t) textures[i].width * 4u,
-                (size_t) textures[i].width * 4u);
+            /* Padding repeats the edge texel and the last row, so clamped
+               sampling at a non-power-of-two edge matches the texture
+               instead of fading into zero-filled padding. */
+            size_t width = (size_t) textures[i].width;
+            for (int y = 0; y < textures[i].height; y++) {
+                uint8_t *row = destination + (size_t) y * stride * 4u;
+                memcpy(row, sources[textures[i].source].bytes
+                                + (size_t) y * width * 4u, width * 4u);
+                for (size_t x = width; x < stride; x++)
+                    memcpy(row + x * 4u, row + (width - 1u) * 4u, 4u);
+            }
+            for (unsigned y = (unsigned) textures[i].height;
+                 y < padded_height; y++) {
+                memcpy(destination + (size_t) y * stride * 4u,
+                       destination
+                           + (size_t) (textures[i].height - 1) * stride * 4u,
+                       (size_t) stride * 4u);
+            }
             sceKernelDcacheWritebackRange(destination, bytes);
             webgl_ge_texture_owner.cached_bytes += bytes;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -2207,9 +2234,14 @@ static bool webgl_render_ge(DomBridge *bridge,
     }
     sceGuStart(GU_DIRECT, (void *) ((uintptr_t) webgl_ge_list
                                     | WEBGL_GE_UNCACHED));
-    sceGuDrawBufferList(GU_PSM_8888,
-                        (void *) (uintptr_t) WEBGL_GE_COLOR_OFFSET,
-                        PSP_DISPLAY_STRIDE);
+    /* sceGuDrawBuffer, not sceGuDrawBufferList: PSPSDK's sceGuClear builds
+       its fill from the format sceGuDrawBuffer records. Left at the default
+       5551, a clear writes stencil << 31 and the alpha byte reads back 0x80
+       instead of the 0xff an alpha:false context requires (found on a
+       PSP-3000 with readPixels). The depth buffer is set explicitly next. */
+    sceGuDrawBuffer(GU_PSM_8888,
+                    (void *) (uintptr_t) WEBGL_GE_COLOR_OFFSET,
+                    PSP_DISPLAY_STRIDE);
     sceGuDepthBuffer((void *) (uintptr_t) WEBGL_GE_DEPTH_OFFSET,
                      PSP_DISPLAY_STRIDE);
     sceGuOffset(2048 - width / 2, 2048 - height / 2);
@@ -2552,17 +2584,23 @@ static bool webgl_render_ge(DomBridge *bridge,
         }
         if (texture_index >= 0) {
             const WebglTexture *texture = &textures[texture_index];
-            for (int i = 0; i < count; i++) {
-                draw_vertices[i].u *= (float) texture->width;
-                draw_vertices[i].v *= (float) texture->height;
-            }
             sceGuEnable(GU_TEXTURE_2D);
             sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
             sceGuTexImage(0, texture_strides[texture_index],
                           texture_heights[texture_index],
                           texture_strides[texture_index],
                           texture_addresses[texture_index]);
-            sceGuTexScale(1.0f, 1.0f);
+            /* GU_TRANSFORM_3D texture coordinates are normalized to the
+               padded power-of-two buffer, so WebGL's [0, 1] over the real
+               texture is scaled by width / stride. Pre-multiplying u and v
+               by the texel size (texel units belong to 2D through mode)
+               clamped every sample to the last texel on a PSP-3000. */
+            sceGuTexScale(
+                (float) texture->width
+                    / (float) texture_strides[texture_index],
+                (float) texture->height
+                    / (float) texture_heights[texture_index]);
+            sceGuTexOffset(0.0f, 0.0f);
             sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
             sceGuTexFilter(texture->minimum_filter == 0x2600
                                ? GU_NEAREST : GU_LINEAR,
@@ -2632,7 +2670,12 @@ static bool webgl_render_ge(DomBridge *bridge,
         if (cull) {
             bool keep_clockwise = front_face == 0x0901;
             if (cull_face == 0x0404) keep_clockwise = !keep_clockwise;
-            sceGuFrontFace(keep_clockwise ? GU_CW : GU_CCW);
+            /* keep_clockwise is in WebGL's y-up clip space. sceGuViewport
+               scales y by a negative factor, so on the GE's y-down screen
+               every triangle's winding is reversed: keep the opposite
+               screen order. (Mapped directly, a PSP-3000 kept back faces
+               and drew cubes inside out.) */
+            sceGuFrontFace(keep_clockwise ? GU_CCW : GU_CW);
             sceGuEnable(GU_CULL_FACE);
         } else sceGuDisable(GU_CULL_FACE);
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)

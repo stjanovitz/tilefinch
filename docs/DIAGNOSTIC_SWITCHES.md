@@ -78,6 +78,7 @@ the code and its strings ship).
 
 | Switch | Sites | First site | Device | Purpose |
 |---|---|---|---|---|
+| `TILEFINCH_DEBUG_BOX_CLASS` | 1 | `src/interactive_main.c` | always | Print the final layout boxes (geometry, content size, command range) of up to 16 elements whose class contains this text. |
 | `TILEFINCH_DUMP_BUDGET` | 1 | `src/interactive_main.c` | always | Print Budget categories and large resource allocations after the interactive lab tick loop. |
 | `TILEFINCH_DUMP_FRAME_MEMORY` | 2 | `src/interactive_main.c` | always | Print per-frame script runtime memory reports in the interactive lab. |
 | `TILEFINCH_DUMP_JS_MEMORY` | 1 | `src/diagnostic_trace.h` | host | Print QuickJS memory usage at boot-window advances and runtime teardown. |
@@ -142,7 +143,7 @@ the code and its strings ship).
 
 | Switch | Sites | First site | Device | Purpose |
 |---|---|---|---|---|
-| `TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI` | 4 | `src/fetch/scheduler.inc` | always | Present a mobile Safari identity (viewport, UA hints) to a page for behaviour comparison; host-only diagnostic. |
+| `TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI` | 2 | `src/fetch.c` | always | Present a mobile Safari identity (viewport, UA hints) to a page for behaviour comparison; host-only diagnostic. |
 | `TILEFINCH_ENABLE_IDLE_GLYPH_WARM` | 1 | `src/render.c` | always | Enable idle-time glyph cache warming (off by default). |
 | `TILEFINCH_EXPERIMENTAL_BACKGROUND_IMAGES` | 1 | `src/navigation/commit_transaction.inc` | host | Enable the experimental background-image loading path after paint. Not exercised by the mutable image queue; see review notes. |
 | `TILEFINCH_FORCE_REBUILDS` | 1 | `src/interactive_main.c` | always | Force this many extra style rebuilds in the interactive lab. |

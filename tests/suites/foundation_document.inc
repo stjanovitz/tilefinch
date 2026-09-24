@@ -3525,13 +3525,13 @@
     budget_free(&budget, tight_frame);
     size_t valid_before_damage = 0;
     for (size_t i = 0; i < cache.tile_capacity; i++) {
-        if (cache.tiles[i].valid) valid_before_damage++;
+        if (cache.tiles[i] != NULL && cache.tiles[i]->valid) valid_before_damage++;
     }
     size_t rasterized_before_invalidation = cache.rasterized;
     CHECK(tile_cache_replace_layout_damage(&cache, &layout, 0, 0, 64, 64));
     size_t valid_after_damage = 0;
     for (size_t i = 0; i < cache.tile_capacity; i++) {
-        if (cache.tiles[i].valid) valid_after_damage++;
+        if (cache.tiles[i] != NULL && cache.tiles[i]->valid) valid_after_damage++;
     }
     CHECK(tile_cache_render_frame(&cache, 0, 480, 272, NULL)
           && cache.invalidations == 1

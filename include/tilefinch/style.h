@@ -851,6 +851,10 @@ typedef struct {
     uint8_t will_change_transform : 1;
     uint8_t pointer_events_none : 1;
     uint8_t table_border_collapse : 1;
+    /* display:list-item (the li default); the compact display enum folds it
+       into DISPLAY_BLOCK, but only list items render markers. Uses the last
+       free bit of this byte. */
+    uint8_t list_item : 1;
     uint8_t containing_block_reserved : 2;
     /* This second bitfield byte already existed for grid-auto-flow.  The
        remaining six bits retain the bounded mobile interaction subset
@@ -1746,6 +1750,12 @@ typedef struct {
     /* Offset of an allocation-free rightmost tag/class/id rejection key.
        UINT8_MAX means no safe key. This consumes the final padding byte. */
     uint8_t fast_key_offset;
+    /* Lengths of name, selector and fast key, so the per-node winner scan
+       over these rules needs no strlen or identifier re-scan. */
+    uint8_t name_length;
+    uint8_t selector_length;
+    uint8_t fast_key_length;
+    uint8_t reserved;
     unsigned origin;
     unsigned layer;
     unsigned specificity;
@@ -1778,6 +1788,30 @@ typedef struct {
 } StyleBorderColors;
 
 #define STYLE_RELATIVE_SELECTOR_CACHE_CAPACITY 8u
+
+/* Selector-list arguments of :is(), :where(), :not() and the nth
+   "of S" filters, prepared once per sheet build: each option's span, the
+   offset of its rightmost compound and the fast key that compound needs.
+   Keyed by the argument's address in the sheet's selector storage, which
+   does not move until the sheet is destroyed or rebuilt. */
+#define STYLE_FUNCTIONAL_ARGUMENT_CAPACITY 64u
+#define STYLE_FUNCTIONAL_OPTION_CAPACITY 256u
+typedef struct {
+    uint16_t offset;
+    uint16_t length;
+    uint16_t rightmost;
+    uint16_t key_offset;
+    uint8_t key_length;
+    uint8_t key_type;
+} StyleFunctionalOption;
+
+typedef struct {
+    const char *text;
+    uint16_t length;
+    uint16_t first_option;
+    uint8_t option_count;
+    uint8_t state;
+} StyleFunctionalArgument;
 
 typedef struct {
     const char *text;
@@ -2047,6 +2081,14 @@ typedef struct {
     uint32_t relative_selector_cache_epoch;
     StyleRelativeSelectorCacheEntry relative_selector_cache[
         STYLE_RELATIVE_SELECTOR_CACHE_CAPACITY];
+    /* A memo, not sheet content: filled during matching through const
+       sheets and cleared when build_generation moves. */
+    uint64_t functional_argument_generation;
+    uint16_t functional_option_count;
+    StyleFunctionalArgument functional_arguments[
+        STYLE_FUNCTIONAL_ARGUMENT_CAPACITY];
+    StyleFunctionalOption functional_options[
+        STYLE_FUNCTIONAL_OPTION_CAPACITY];
     /* Inline <style> elements this sheet has ingested, in cascade order, so
        navigation can append a later-inserted <style> without a rebuild.
        Bounded-out means "unknown": every later insertion rebuilds. */
@@ -2407,6 +2449,32 @@ bool style_selector_matches_scoped(lxb_dom_node_t *node,
                                    const char *selector,
                                    size_t selector_length,
                                    const lxb_dom_node_t *scope);
+
+/* A selector list prepared once for matching against many elements, as a
+   querySelector walk does: split at top-level commas, each selector's
+   rightmost compound located, and, where the stylesheet's fast-key rule
+   finds one, a byte-exact tag, ID or class the element must carry. The
+   key only rejects elements the full matcher would reject too. */
+#define STYLE_QUERY_SELECTOR_LIMIT 16u
+typedef struct {
+    const char *text;
+    size_t length;
+    size_t rightmost;
+    const char *key;
+    size_t key_length;
+    SelectorType key_type;
+} StyleQuerySelector;
+typedef struct {
+    StyleQuerySelector items[STYLE_QUERY_SELECTOR_LIMIT];
+    size_t count;
+} StyleQuerySelectorList;
+/* False when the list has more selectors than the limit; the caller then
+   matches the text directly. `text` must outlive the list. */
+bool style_query_selector_list_prepare(StyleQuerySelectorList *list,
+                                       const char *text, size_t length);
+bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
+                                       lxb_dom_node_t *node,
+                                       const lxb_dom_node_t *scope);
 bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
                               size_t query_length);
 bool stylesheet_supports_matches(Stylesheet *sheet, const char *query,
@@ -2418,6 +2486,14 @@ bool style_color_parse(const char *text, size_t length,
                        uint32_t *color, uint8_t *alpha);
 const StyleDeclaration *stylesheet_rule_declaration(
     const Stylesheet *sheet, const StyleRule *rule);
+/* Indices of the rules whose declarations can give an element an RTL
+   direction or a bidi override (var()-deferred ones conservatively). False
+   when more than `capacity` exist. */
+bool stylesheet_direction_change_rules(const Stylesheet *sheet,
+                                       size_t *indices, size_t capacity,
+                                       size_t *count);
+bool stylesheet_rule_index_matches(const Stylesheet *sheet, size_t index,
+                                   lxb_dom_node_t *node);
 size_t stylesheet_retained_bytes(const Stylesheet *sheet);
 /* Resolve a packed fixed/percentage/math length against its CSS percentage
    basis.  This is allocation-free and leaves keyword handling to the

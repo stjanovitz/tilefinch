@@ -1,6 +1,7 @@
 #include "tilefinch/session_persistence.h"
 
 #include "tilefinch/url.h"
+#include "session_site_storage.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -264,13 +265,12 @@ static bool cache_record_size(const BrowserCacheEntry *entry, size_t *size)
     return true;
 }
 
-static bool storage_record_size(const BrowserStorageEntry *entry,
+static bool storage_record_size(const SiteStorageLocalView *entry,
                                 size_t *size)
 {
     size_t total = 0;
-    if (entry == NULL || entry->value == NULL || !entry->local
-        || !field_size(entry->origin, sizeof(entry->origin), &total)
-        || !field_size(entry->key, sizeof(entry->key), &total)
+    if (!field_size(entry->origin, BROWSER_ORIGIN_LIMIT, &total)
+        || !field_size(entry->key, BROWSER_KEY_LIMIT, &total)
         || !blob_size(entry->value_length, &total)
         || total > UINT32_MAX) {
         return false;
@@ -339,16 +339,16 @@ static bool emit_payload(PersistWriter *writer,
         }
     }
     if ((plan->mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
-        for (size_t i = 0; i < BROWSER_STORAGE_ENTRIES; i++) {
-            const BrowserStorageEntry *entry = &session->storage[i];
-            if (entry->value == NULL || !entry->local) continue;
+        size_t cursor = 0;
+        SiteStorageLocalView entry;
+        while (site_storage_next_local(session, &cursor, &entry)) {
             size_t size = 0;
-            if (!storage_record_size(entry, &size)) return false;
+            if (!storage_record_size(&entry, &size)) return false;
             writer_u32(writer, RECORD_LOCAL_STORAGE);
             writer_u32(writer, (uint32_t) size);
-            writer_field(writer, entry->origin);
-            writer_field(writer, entry->key);
-            writer_blob(writer, entry->value, entry->value_length);
+            writer_field(writer, entry.origin);
+            writer_field(writer, entry.key);
+            writer_blob(writer, entry.value, entry.value_length);
         }
     }
     return !writer->failed;
@@ -362,7 +362,7 @@ void browser_session_persistence_limits_default(
         .maximum_file_bytes = BROWSER_SESSION_PERSIST_MAX_FILE_BYTES,
         .maximum_cache_bytes = BROWSER_SESSION_PERSIST_MAX_CACHE_BYTES,
         .maximum_cache_entries = BROWSER_CACHE_ENTRIES,
-        .maximum_local_storage_entries = BROWSER_STORAGE_ENTRIES
+        .maximum_local_storage_entries = BROWSER_SITE_STORAGE_ITEMS
     };
 }
 
@@ -382,7 +382,7 @@ static bool effective_limits(
         && limits->maximum_cache_entries <= BROWSER_CACHE_ENTRIES
         && limits->maximum_local_storage_entries != 0
         && limits->maximum_local_storage_entries
-               <= BROWSER_STORAGE_ENTRIES;
+               <= BROWSER_SITE_STORAGE_ITEMS;
 }
 
 static bool make_path(const char *path, const char *suffix,
@@ -443,14 +443,9 @@ static BrowserSessionPersistenceStatus build_plan(
         }
     }
     if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
-        for (size_t i = 0; i < BROWSER_STORAGE_ENTRIES; i++) {
-            const BrowserStorageEntry *entry = &session->storage[i];
-            if (entry->value != NULL && entry->local
-                && ++plan->storage_count
-                       > limits->maximum_local_storage_entries) {
-                return BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
-            }
-        }
+        plan->storage_count = site_storage_local_count(session);
+        if (plan->storage_count > limits->maximum_local_storage_entries)
+            return BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
     }
     return BROWSER_SESSION_PERSISTENCE_OK;
 }
@@ -562,26 +557,6 @@ static BrowserCacheEntry *cache_entry_direct(BrowserSession *session,
     return NULL;
 }
 
-static bool local_commit_fits(const BrowserSession *target,
-                              const BrowserSession *staging)
-{
-    size_t session_count = 0, session_bytes = 0, local_count = 0;
-    for (size_t i = 0; i < BROWSER_STORAGE_ENTRIES; i++) {
-        const BrowserStorageEntry *entry = &target->storage[i];
-        if (entry->value != NULL && !entry->local) {
-            session_count++;
-            if (entry->value_length > SIZE_MAX - session_bytes) return false;
-            session_bytes += entry->value_length;
-        }
-        if (staging->storage[i].value != NULL
-            && staging->storage[i].local) local_count++;
-    }
-    return session_bytes <= target->maximum_storage_bytes
-        && local_count <= BROWSER_STORAGE_ENTRIES - session_count
-        && staging->storage_bytes
-               <= target->maximum_storage_bytes - session_bytes;
-}
-
 static void commit_staging(BrowserSession *target, BrowserSession *staging,
                            BrowserSessionPersistenceMask mask)
 {
@@ -594,21 +569,7 @@ static void commit_staging(BrowserSession *target, BrowserSession *staging,
         target->clock = staging->clock;
     }
     if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
-        browser_session_storage_clear_all(target, true);
-        for (size_t source = 0; source < BROWSER_STORAGE_ENTRIES; source++) {
-            BrowserStorageEntry *entry = &staging->storage[source];
-            if (entry->value == NULL || !entry->local) continue;
-            for (size_t destination = 0;
-                 destination < BROWSER_STORAGE_ENTRIES; destination++) {
-                if (target->storage[destination].value == NULL) {
-                    target->storage[destination] = *entry;
-                    memset(entry, 0, sizeof(*entry));
-                    break;
-                }
-            }
-        }
-        target->storage_bytes += staging->storage_bytes;
-        staging->storage_bytes = 0;
+        site_storage_adopt_local(target, staging);
     }
 }
 
@@ -1173,7 +1134,7 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
                 break;
             }
             if (load->body_length
-                    > load->staging->maximum_storage_bytes
+                    > BROWSER_SITE_STORAGE_MEMORY_SITE_BYTES
                 || load->body_length + 1u < load->body_length) {
                 load->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
                 break;
@@ -1209,7 +1170,7 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
             BrowserSessionPersistenceMask commit_mask =
                 load->requested_mask & load->stored_mask;
             if ((commit_mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0
-                && !local_commit_fits(load->target, load->staging)) {
+                && !site_storage_local_fits(load->target, load->staging)) {
                 load->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
                 break;
             }
@@ -1286,8 +1247,9 @@ BrowserSessionPersistenceStatus browser_session_persistence_clear(
     }
     if ((mask & BROWSER_SESSION_PERSIST_CACHE) != 0)
         browser_session_cache_clear(session);
-    if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0)
-        browser_session_storage_clear_all(session, true);
+    if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0
+        && !browser_session_storage_clear_all(session, true))
+        return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
     return BROWSER_SESSION_PERSISTENCE_OK;
 }
 

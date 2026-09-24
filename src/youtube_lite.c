@@ -1,4 +1,5 @@
 #include "tilefinch/youtube_lite.h"
+#include "tilefinch/utf8_encode.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -12,6 +13,7 @@
 #include "tilefinch/request_context.h"
 #include "tilefinch/url.h"
 #include "tilefinch/youtube_resolver.h"
+#include "youtube_internal.h"
 
 #define YOUTUBE_LITE_TITLE_LIMIT 256
 #define YOUTUBE_LITE_CHANNEL_LIMIT 128
@@ -63,27 +65,6 @@ typedef struct {
     bool localized_views;
 } YoutubeLiteWatch;
 
-static bool lite_header_value_safe(const char *value)
-{
-    if (value == NULL) return false;
-    for (const unsigned char *at = (const unsigned char *) value;
-         *at != '\0'; at++) {
-        if (*at < 0x20u || *at >= 0x7fu) return false;
-    }
-    return true;
-}
-
-static bool lite_api_token_safe(const char *value, bool allow_dot)
-{
-    if (value == NULL || value[0] == '\0') return false;
-    for (const unsigned char *at = (const unsigned char *) value;
-         *at != '\0'; at++) {
-        if (!isalnum(*at) && *at != '-' && *at != '_'
-            && (!allow_dot || *at != '.')) return false;
-    }
-    return true;
-}
-
 static const char *lite_preferred_language(void)
 {
     static const char *const supported[] = {
@@ -117,28 +98,11 @@ typedef struct {
     bool failed;
 } YoutubeLiteHtml;
 
-static void lite_error(char *error, size_t error_size,
-                       const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
-
-static bool lite_host_is(const TilefinchUrl *url, const char *host)
-{
-    return strlen(host) == url->host_length
-        && strncasecmp(url->value + url->host_offset,
-                       host, url->host_length) == 0;
-}
-
 static bool lite_youtube_host(const TilefinchUrl *url)
 {
-    return lite_host_is(url, "youtube.com")
-        || lite_host_is(url, "www.youtube.com")
-        || lite_host_is(url, "m.youtube.com");
+    return youtube_host_is(url, "youtube.com")
+        || youtube_host_is(url, "www.youtube.com")
+        || youtube_host_is(url, "m.youtube.com");
 }
 
 static bool lite_path_is(const TilefinchUrl *url, const char *path)
@@ -199,29 +163,9 @@ static bool lite_append_utf8(char *output, size_t capacity,
                              size_t *length, unsigned codepoint)
 {
     unsigned char bytes[4];
-    size_t count = 0;
-    if (codepoint <= 0x7fu) {
-        bytes[count++] = (unsigned char) codepoint;
-    } else if (codepoint <= 0x7ffu) {
-        bytes[count++] = (unsigned char) (0xc0u | (codepoint >> 6));
-        bytes[count++] = (unsigned char) (0x80u | (codepoint & 0x3fu));
-    } else if (codepoint <= 0xffffu
-               && (codepoint < 0xd800u || codepoint > 0xdfffu)) {
-        bytes[count++] = (unsigned char) (0xe0u | (codepoint >> 12));
-        bytes[count++] =
-            (unsigned char) (0x80u | ((codepoint >> 6) & 0x3fu));
-        bytes[count++] = (unsigned char) (0x80u | (codepoint & 0x3fu));
-    } else if (codepoint <= 0x10ffffu) {
-        bytes[count++] = (unsigned char) (0xf0u | (codepoint >> 18));
-        bytes[count++] =
-            (unsigned char) (0x80u | ((codepoint >> 12) & 0x3fu));
-        bytes[count++] =
-            (unsigned char) (0x80u | ((codepoint >> 6) & 0x3fu));
-        bytes[count++] = (unsigned char) (0x80u | (codepoint & 0x3fu));
-    } else {
-        return false;
-    }
-    if (count > capacity - 1u - *length) return false;
+    size_t count = tilefinch_utf8_encode(codepoint, bytes);
+    if (count == 0 || *length >= capacity
+        || count > capacity - 1u - *length) return false;
     memcpy(output + *length, bytes, count);
     *length += count;
     return true;
@@ -239,6 +183,31 @@ static bool lite_decode_hex_escape(const char **at, const char *end,
     }
     *at += digits;
     *value = decoded;
+    return true;
+}
+
+/* The code point of a \xHH or \uHHHH escape whose introducer has been
+   consumed, joining a \u surrogate pair. A lone low surrogate has no UTF-8
+   form and becomes U+FFFD, as a browser shows it; a high surrogate without
+   its low half is malformed. */
+static bool lite_decode_escape_codepoint(const char **at, const char *end,
+                                         char escape, unsigned *codepoint)
+{
+    if (!lite_decode_hex_escape(at, end, escape == 'x' ? 2u : 4u, codepoint))
+        return false;
+    if (escape != 'u') return true;
+    if (*codepoint >= 0xdc00u && *codepoint <= 0xdfffu) {
+        *codepoint = 0xfffdu;
+        return true;
+    }
+    if (*codepoint < 0xd800u || *codepoint > 0xdbffu) return true;
+    if ((size_t) (end - *at) < 6u || (*at)[0] != '\\' || (*at)[1] != 'u')
+        return false;
+    *at += 2;
+    unsigned low = 0;
+    if (!lite_decode_hex_escape(at, end, 4u, &low)
+        || low < 0xdc00u || low > 0xdfffu) return false;
+    *codepoint = 0x10000u + ((*codepoint - 0xd800u) << 10) + (low - 0xdc00u);
     return true;
 }
 
@@ -284,19 +253,8 @@ static char *lite_initial_data(Budget *budget, const char *source,
         else if (escape != 'x' && escape != 'u') simple = escape;
         if (escape == 'x' || escape == 'u') {
             unsigned codepoint = 0;
-            if (!lite_decode_hex_escape(
-                    &at, end, escape == 'x' ? 2u : 4u, &codepoint)) goto fail;
-            if (escape == 'u' && codepoint >= 0xd800u
-                && codepoint <= 0xdbffu) {
-                if ((size_t) (end - at) < 6u
-                    || at[0] != '\\' || at[1] != 'u') goto fail;
-                at += 2;
-                unsigned low = 0;
-                if (!lite_decode_hex_escape(&at, end, 4, &low)
-                    || low < 0xdc00u || low > 0xdfffu) goto fail;
-                codepoint = 0x10000u + ((codepoint - 0xd800u) << 10)
-                          + (low - 0xdc00u);
-            }
+            if (!lite_decode_escape_codepoint(&at, end, escape, &codepoint))
+                goto fail;
             if (!lite_append_utf8(
                     decoded, source_length + 1u, &used, codepoint)) goto fail;
         } else {
@@ -381,17 +339,8 @@ static bool lite_json_string_bounded(const char *at, const char *end,
         else if (escape == 't') simple = '\t';
         else if (escape == 'u') {
             unsigned codepoint = 0;
-            if (!lite_decode_hex_escape(&at, end, 4, &codepoint)) return false;
-            if (codepoint >= 0xd800u && codepoint <= 0xdbffu) {
-                if ((size_t) (end - at) < 6u
-                    || at[0] != '\\' || at[1] != 'u') return false;
-                at += 2;
-                unsigned low = 0;
-                if (!lite_decode_hex_escape(&at, end, 4, &low)
-                    || low < 0xdc00u || low > 0xdfffu) return false;
-                codepoint = 0x10000u + ((codepoint - 0xd800u) << 10)
-                          + (low - 0xdc00u);
-            }
+            if (!lite_decode_escape_codepoint(&at, end, 'u', &codepoint))
+                return false;
             if (!full && !lite_append_utf8(
                     output, output_size, &used, codepoint)) {
                 if (!truncate) return false;
@@ -1645,11 +1594,11 @@ static bool lite_build_document_with_comments_decoded(
         || source_length > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES
         || comments_length > YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES
         || (comments_length != 0 && comments_source == NULL)) {
-        lite_error(error, error_size, "invalid bounded YouTube page data");
+        youtube_error(error, error_size, "invalid bounded YouTube page data");
         return false;
     }
     if (route == YOUTUBE_LITE_ROUTE_NONE) {
-        lite_error(error, error_size, "unsupported YouTube lite route");
+        youtube_error(error, error_size, "unsupported YouTube lite route");
         return false;
     }
     *document = (YoutubeLiteDocument) {.budget = budget, .route = route};
@@ -1696,7 +1645,7 @@ static bool lite_build_document_with_comments_decoded(
         if (watch == NULL) {
             if (decoded != NULL && !decoded_borrowed)
                 budget_free(budget, decoded);
-            lite_error(error, error_size,
+            youtube_error(error, error_size,
                        "YouTube watch metadata exceeded its memory bound");
             return false;
         }
@@ -1856,7 +1805,7 @@ static bool lite_build_document_with_comments_decoded(
     if (watch != NULL) budget_free(budget, watch);
     if (!ok || html.failed || html.data == NULL) {
         budget_free(budget, html.data);
-        lite_error(error, error_size,
+        youtube_error(error, error_size,
                    "YouTube lite HTML exceeded its memory bound");
         return false;
     }
@@ -2032,13 +1981,13 @@ static YoutubeLiteBuildWork *lite_build_work_create(
         || source_bytes > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES
         || supplemental_length > YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES
         || (supplemental_length != 0 && supplemental == NULL)) {
-        lite_error(error, error_size, "invalid bounded YouTube build data");
+        youtube_error(error, error_size, "invalid bounded YouTube build data");
         return NULL;
     }
     YoutubeLiteBuildWork *work = budget_calloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*work));
     if (work == NULL) {
-        lite_error(error, error_size,
+        youtube_error(error, error_size,
                    "YouTube cooperative build exceeded its memory bound");
         return NULL;
     }
@@ -2643,9 +2592,9 @@ static bool lite_identity_valid(const YoutubeLiteIdentity *identity)
 {
     return identity != NULL
         && identity->version == YOUTUBE_LITE_IDENTITY_CACHE_VERSION
-        && lite_api_token_safe(identity->api_key, false)
-        && lite_api_token_safe(identity->client_version, true)
-        && lite_header_value_safe(identity->visitor);
+        && youtube_api_token_safe(identity->api_key, false)
+        && youtube_api_token_safe(identity->client_version, true)
+        && youtube_header_value_safe(identity->visitor);
 }
 
 static bool lite_identity_cache_get(
@@ -2684,8 +2633,8 @@ bool youtube_lite_resolver_identity_get(
             YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS)
         || length != sizeof(cached)
         || cached.version != YOUTUBE_LITE_IDENTITY_CACHE_VERSION
-        || !lite_api_token_safe(cached.api_key, false)
-        || !lite_header_value_safe(cached.visitor)) return false;
+        || !youtube_api_token_safe(cached.api_key, false)
+        || !youtube_header_value_safe(cached.visitor)) return false;
     snprintf(identity->api_key, sizeof(identity->api_key), "%s",
              cached.api_key);
     snprintf(identity->visitor, sizeof(identity->visitor), "%s",
@@ -2697,8 +2646,8 @@ static void lite_resolver_identity_cache_put(
     BrowserSession *session, const YoutubeLiteIdentity *identity)
 {
     if (session == NULL || identity == NULL
-        || !lite_api_token_safe(identity->api_key, false)
-        || !lite_header_value_safe(identity->visitor)) return;
+        || !youtube_api_token_safe(identity->api_key, false)
+        || !youtube_header_value_safe(identity->visitor)) return;
     (void) browser_session_site_adapter_state_put(
         session, YOUTUBE_LITE_IDENTITY_CACHE_KEY,
         identity, sizeof(*identity), tilefinch_platform_monotonic_time_ns());
@@ -3148,21 +3097,8 @@ static bool lite_load_decode_pump(YoutubeLiteLoadJob *job)
         else if (escape != 'x' && escape != 'u') simple = escape;
         if (escape == 'x' || escape == 'u') {
             unsigned codepoint = 0;
-            if (!lite_decode_hex_escape(
-                    &at, end, escape == 'x' ? 2u : 4u,
-                    &codepoint)) return false;
-            if (escape == 'u' && codepoint >= 0xd800u
-                && codepoint <= 0xdbffu) {
-                if ((size_t) (end - at) < 6u
-                    || at[0] != '\\' || at[1] != 'u') return false;
-                at += 2;
-                unsigned low = 0;
-                if (!lite_decode_hex_escape(&at, end, 4u, &low)
-                    || low < 0xdc00u || low > 0xdfffu) return false;
-                codepoint = 0x10000u
-                    + ((codepoint - 0xd800u) << 10u)
-                    + (low - 0xdc00u);
-            }
+            if (!lite_decode_escape_codepoint(&at, end, escape, &codepoint))
+                return false;
             if (!lite_append_utf8(
                     job->decoded, length + 1u,
                     &job->decoded_length, codepoint)) return false;
@@ -3416,7 +3352,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         || route == YOUTUBE_LITE_ROUTE_NONE || maximum_source_bytes == 0
         || timeout_ms <= 0
         || strlen(url) >= TILEFINCH_URL_SERIALIZED_LIMIT) {
-        lite_error(error, error_size, "invalid YouTube lite load");
+        youtube_error(error, error_size, "invalid YouTube lite load");
         return NULL;
     }
     if (maximum_source_bytes > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES)
@@ -3424,7 +3360,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     YoutubeLiteLoadJob *job = budget_calloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*job));
     if (job == NULL) {
-        lite_error(error, error_size,
+        youtube_error(error, error_size,
                    "YouTube lightweight load exceeded its memory bound");
         return NULL;
     }
@@ -3442,7 +3378,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     snprintf(job->language, sizeof(job->language), "%s",
              lite_preferred_language());
     if (!lite_fetch_url(url, route, job->fetch_url)) {
-        lite_error(error, error_size, "invalid YouTube search query");
+        youtube_error(error, error_size, "invalid YouTube search query");
         youtube_lite_load_destroy(job);
         return NULL;
     }
@@ -3470,7 +3406,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         snprintf(detail, sizeof(detail), "YouTube network startup failed: %s",
                  scheduler_error[0] == '\0'
                      ? "scheduler unavailable" : scheduler_error);
-        lite_error(error, error_size, detail);
+        youtube_error(error, error_size, detail);
         youtube_lite_load_destroy(job);
         return NULL;
     }
@@ -3505,7 +3441,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         snprintf(
             detail, sizeof(detail), "YouTube request could not start: %s",
             fetch_scheduler_last_error(job->scheduler));
-        lite_error(error, error_size, detail);
+        youtube_error(error, error_size, detail);
         youtube_lite_load_destroy(job);
         return NULL;
     }
@@ -4055,7 +3991,7 @@ bool youtube_lite_load(
     YoutubeLiteDocument *document, char *error, size_t error_size)
 {
     if (document == NULL) {
-        lite_error(error, error_size, "invalid YouTube lite load");
+        youtube_error(error, error_size, "invalid YouTube lite load");
         return false;
     }
     *document = (YoutubeLiteDocument) {0};
@@ -4069,7 +4005,7 @@ bool youtube_lite_load(
     bool loaded = status == YOUTUBE_LITE_LOAD_SUCCEEDED
         && youtube_lite_load_take_document(job, document);
     if (!loaded) {
-        lite_error(error, error_size, "%s",
+        youtube_error(error, error_size, "%s",
                    youtube_lite_load_error(job));
     }
     youtube_lite_load_destroy(job);

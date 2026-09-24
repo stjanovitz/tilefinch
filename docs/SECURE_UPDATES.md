@@ -1,8 +1,8 @@
 # Secure in-app updates
 
 Tilefinch can download and install a new browser release over Wi-Fi without
-requiring the user to remove the Memory Stick. Open **Options → System →
-Version and update** to check manually. Tilefinch shows the available version
+removing the Memory Stick. Open **Settings → Updates → Version and update**
+to check manually. Tilefinch shows the available version
 and release note before downloading, and it never installs or restarts without
 confirmation. Its optional background check only looks for signed release
 metadata while Wi-Fi is already connected; it never downloads the update
@@ -64,8 +64,8 @@ discarded. A remote response cannot select a row or set the journal bit.
 **Nothing remote can turn the unsigned mode on.** The Developer channel needs
 two independent local acts by the person holding the device: a URL entered in
 the native **Developer URL** option (or hand-written into
-`data/boot-overrides.cfg` on the Memory Stick), and then Developer chosen in
-Options → Experimental → Update channel. No server response, redirect,
+`data/boot-overrides.cfg` on the Memory Stick), and then Developer chosen as
+the **Update channel** under **Settings → Advanced & experimental → Experimental**. No server response, redirect,
 release asset, page, script, or update payload can supply either one. A user
 who never configures a URL is never offered Developer by the channel selector
 and never leaves the signed path.
@@ -89,14 +89,6 @@ opt-ins above. Closing it means adding a channel field to the signed manifest, w
 is a release-cut format change and needs its own design pass; it is
 deliberately not attempted here.
 
-The intended experience is a manual `Version / Update` page in Options. It
-adds no browser network request, package scan, or release-metadata read to
-ordinary startup beyond the optional, rate-limited background metadata check
-described under "Background update-available check" below. The stable launcher necessarily reads at most two fixed
-174-byte state records before choosing a slot; it does not hash the active
-slot. A user chooses when to check, reviews a signed release, explicitly
-downloads it, and explicitly restarts into it.
-
 ## Security objective
 
 On Stable and Beta, an attacker who controls a network path, CDN response,
@@ -104,7 +96,7 @@ GitHub account, or release asset must not be able to make the PSP execute an
 unsigned browser or choose a downgrade. A historical signed release is a
 separate explicit local choice. Developer is an explicit local exception,
 described below, that the same attacker cannot reach: it requires physical
-access to the Memory Stick and a deliberate selection in Options. On every
+access to the Memory Stick and a deliberate selection in Settings. On every
 channel, interruption, cancellation, a full Memory Stick, or a bad new build
 must leave the previous browser launchable.
 
@@ -119,11 +111,14 @@ launcher and the release metadata those keys authorize.
 
 ## User experience
 
-Options gains one entry:
-
-```text
-VERSION / UPDATE...
-```
+Updating is manual, from **Settings → Updates → Version and update**. The page
+adds no network request, package scan, or release-metadata read to ordinary
+startup beyond the optional, rate-limited background check described under
+[Background update-available check](#background-update-available-check). The
+stable launcher necessarily reads at most two fixed 174-byte state records
+before choosing a slot, and it does not hash the active slot. You choose when
+to check, review a signed release, explicitly download it, and explicitly
+restart into it.
 
 The page begins with:
 
@@ -172,7 +167,7 @@ the newer signed sequence again.
 ### Stable, beta, and developer channels
 
 Stable is the default and retains the fixed GitHub `latest` metadata URL.
-**Options → Experimental → Update channel** can opt into Beta, whose signed
+The **Update channel** row under **Settings → Advanced & experimental → Experimental** can opt into Beta, whose signed
 metadata lives at the distinct fixed `releases/download/beta/` endpoint.
 There is no automatic fallback between Stable and Beta: a failure remains a
 failure on the selected channel, and changing channels clears any in-memory
@@ -181,8 +176,9 @@ offer before creating a new client.
 Developer is a deliberately conspicuous third choice, and reaching it takes
 two separate local acts, both performed by whoever is holding the PSP:
 
-1. **A locally entered endpoint.** **Options → Experimental → Developer URL**
-   accepts a bounded public `https://` TFUM endpoint and transactionally
+1. **A locally entered endpoint.** The **Developer URL** row under **Settings
+   → Advanced & experimental → Experimental** accepts a bounded public
+   `https://` TFUM endpoint and transactionally
    writes the same `developer_update_url=` key to shared
    `data/boot-overrides.cfg`. It may alternatively be hand-edited off-device,
    over USB or by moving the card. Page content and remote responses cannot
@@ -191,7 +187,7 @@ two separate local acts, both performed by whoever is holding the PSP:
    the package named by its manifest is resolved beside the metadata. The
    optional separate package override remains a configuration-file setting.
 2. **An explicit UI selection.** With a usable URL present, the channel row
-   appears under Options → Experimental → Update channel and must be chosen.
+   appears in the **Update channel** row and must be chosen.
    Without a configured URL, Developer is skipped by the channel selector.
 
 Neither step has a remote trigger, and there is no state a server, page, or
@@ -237,7 +233,7 @@ configured Developer endpoint can supply arbitrary PSP code, read or alter
 shared browser data, and report itself healthy. A/B rollback protects against
 a build that crashes or never reaches the health checkpoint; it cannot make
 malicious native code safe. The two deliberate opt-ins are editing the local
-configuration file and selecting Developer in Options.
+configuration file and selecting Developer in Settings.
 
 This provides a signed TestFlight-like path for public beta builds and a
 low-friction unsigned contributor path without weakening Stable/Beta trust.
@@ -259,9 +255,9 @@ week), timed by the persisted profile record; a check that fails, is
 cancelled, or cannot run does not advance that cadence and produces no UI.
 A stored last-check time in the future (a wrong RTC) resets the cadence
 rather than blocking it. When a check verifies a newer signed release, a
-one-time `UPDATE READY - SEE OPTIONS` notice appears and the
-`Version and update` Options row reads `New` until the running build's own
-sequence catches up. **Options → Update check** (default on) disarms the
+one-time `UPDATE READY - SEE OPTIONS` notice appears and the **Version and
+update** row reads `New` until the running build's own sequence catches up.
+**Settings → Updates → Update check** (default on) disarms the
 whole feature; a root-empty build can contact only its explicitly configured
 Developer endpoint, and a hermetic trace replay never contacts the network.
 
@@ -826,7 +822,8 @@ python3 tools/tilefinch_update_tool.py developer-envelope \
 ```
 
 Host that TFUM and its named TFUP in the same directory, enter the TFUM URL
-under **Options → Experimental → Developer URL**, and select Developer. The
+as the **Developer URL** under **Settings → Advanced & experimental →
+Experimental**, and select Developer. The
 same value can still be set as `developer_update_url=` by editing the file.
 Alternatively, share each file separately from OneDrive and set both links in
 the configuration file:

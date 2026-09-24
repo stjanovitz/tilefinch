@@ -738,6 +738,13 @@ static ScriptRuntime *navigation_create_runtime(
 
 static void navigation_attach_layout(NavigationSession *session)
 {
+    if (session != NULL) {
+        session->page.layout_provisional =
+            session->page.layout.content_limit_y != 0;
+        if (!session->page.layout_provisional)
+            session->page.layout_complete_us =
+                session->page.layout.performance.total_us;
+    }
     if (session != NULL && session->page.deferred_image_targets != NULL) {
         /* Every adopted layout moves boxes, including the relayout that
            publishes a batch, so the viewport distances behind the rank are
@@ -971,6 +978,21 @@ static void navigation_measure_damage(NavigationSession *session,
             damage_add_rect(&left, &top, &right, &bottom, 0, shorter,
                             width, taller - shorter);
         }
+        /* Rows past a provisional limit showed a placeholder rather than
+           commands, so a changed limit repaints them all. */
+        if (old_layout->content_limit_y != new_layout->content_limit_y) {
+            int from = old_layout->content_limit_y;
+            if (from == 0 || (new_layout->content_limit_y != 0
+                              && new_layout->content_limit_y < from))
+                from = new_layout->content_limit_y;
+            int taller = old_layout->height > new_layout->height
+                         ? old_layout->height : new_layout->height;
+            int width = old_layout->width > new_layout->width
+                        ? old_layout->width : new_layout->width;
+            if (taller > from)
+                damage_add_rect(&left, &top, &right, &bottom, 0, from,
+                                width, taller - from);
+        }
     }
     session->relayout_damage_valid = right > left && bottom > top;
     session->relayout_damage_left = left;
@@ -1132,6 +1154,9 @@ static void page_destroy_value(NavigationSession *session,
     page->deferred_image_count = 0;
     page->deferred_image_cursor = 0;
     page->deferred_image_rank_scroll_y = 0;
+    budget_free(session->budget, page->visual_batch_targets);
+    page->visual_batch_targets = NULL;
+    page->visual_batch_count = 0;
     page->deferred_image_rank_valid = false;
     layout_destroy(&page->layout);
     layout_reuse_cache_destroy(page->layout_reuse);
@@ -1252,8 +1277,16 @@ static bool navigation_retire_exhausted_script_realms(
     if (session == NULL || session->page.runtime == NULL) {
         return false;
     }
-    bool explicit_oom =
-        strstr(session->page.script_result.error, "out of memory") != NULL;
+    /* QuickJS reports a refused allocation as "out of memory", which a page
+       can also throw. Only believe the text when the realm's heap actually
+       refused an allocation since the last check. */
+    size_t heap_rejections =
+        script_runtime_heap_rejections(session->page.runtime);
+    bool new_rejection =
+        heap_rejections > session->page.script_heap_rejections_seen;
+    session->page.script_heap_rejections_seen = heap_rejections;
+    bool explicit_oom = new_rejection
+        && strstr(session->page.script_result.error, "out of memory") != NULL;
     size_t remaining = script_runtime_heap_remaining(
         session->page.runtime);
 #ifndef TILEFINCH_NO_TRACE

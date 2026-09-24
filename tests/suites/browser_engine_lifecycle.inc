@@ -10,7 +10,7 @@ static int test_engine_lifecycle(void)
                  == BROWSER_PSP_REALISTIC_CONTENT_LIMIT
           && profile.minimum_non_page_reserve
                  == BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE
-          && profile.maximum_tile_capacity == 8);
+          && profile.maximum_tile_capacity == 24);
 
     BrowserConfig config;
     browser_config_init(&config, &profile);
@@ -19,7 +19,7 @@ static int test_engine_lifecycle(void)
                  == BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE
           && config.history_capacity == 16
           && config.session_cache_limit == 1u * MIB
-          && config.tile_capacity == 8
+          && config.tile_capacity == 24
           && config.progressive_first_paint
           && config.idle_work_budget_us == 500
           && config.idle_work_maximum_units == 8
@@ -32,7 +32,7 @@ static int test_engine_lifecycle(void)
                  == BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE
           && config.history_capacity == 8
           && config.session_cache_limit == 512u * 1024u
-          && config.tile_capacity == 8
+          && config.tile_capacity == 24
           && config.javascript.heap_limit == 4u * MIB
           && config.javascript.maximum_total_bytes == 1u * MIB
           && config.javascript.maximum_file_bytes == 256u * 1024u);
@@ -340,8 +340,7 @@ static int test_engine_lifecycle(void)
           && metrics.non_page_memory_reserve
                  == BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE
           && metrics.session_inline_accounting_bytes
-                 == sizeof(((BrowserSession *) 0)->storage)
-                    + sizeof(((BrowserSession *) 0)->cookies)
+                 == sizeof(((BrowserSession *) 0)->cookies)
                     + sizeof(((BrowserSession *) 0)->cache)
                     + sizeof(((BrowserSession *) 0)->site_adapter_state)
                     + sizeof(((BrowserSession *) 0)
@@ -1032,6 +1031,8 @@ static int test_computed_style_resolved_values(void)
         "#calc0{line-height:calc(0)}#calc0px{line-height:calc(0px)}"
         "#calcdiff{line-height:calc(10px - 10px)}"
         "#calcsix{line-height:calc(2px * 3)}"
+        "@supports (mix-blend-mode: multiply){#supblend{color:red}}"
+        "#supblur{-webkit-backdrop-filter:blur(2px)}"
         "#strut{line-height:20px}#strutzero{line-height:0}"
         "#strutnext{line-height:20px}"
         "#inlwrap{width:400px}#inlpad{padding-left:10%}"
@@ -1062,6 +1063,9 @@ static int test_computed_style_resolved_values(void)
         "<p id=struck>s</p><a id=link href='/x'>l</a><div id=rad>r</div>"
         "<div id=cb><div id=cbwrap><div id=cbabs><div id=cbin>x</div></div>"
         "<div id=cbfix><div id=cbfin>y</div></div></div></div>"
+        "<div id=supblend>s</div><div id=supblur>b</div>"
+        "<div id=inlurl style='background:url(data:image/png;base64,AA) "
+        "no-repeat;color:red;color:blue'>u</div>"
         "<div id=strut><span id=strutzero>t</span></div>"
         "<div id=strutnext>n</div>"
         "<div id=inlwrap><span><span><span id=inlpad>p</span></span>"
@@ -1155,6 +1159,32 @@ static int test_computed_style_resolved_values(void)
            valid declaration, nor read as pixels. */
         "want('badunit','line-height','23px');"
         "want('badunit2','line-height','15px');"
+        /* A `;` inside url() does not end an inline declaration, and the
+           last declaration of a name wins; rewriting one property keeps the
+           others byte for byte. */
+        "{const inl=document.getElementById('inlurl');"
+        "if(inl.style.background!=='url(data:image/png;base64,AA) no-repeat'"
+        "||inl.style.color!=='blue')bad.push('inline='+inl.style.background"
+        "+'/'+inl.style.color);inl.style.color='';"
+        "if(inl.getAttribute('style')!=="
+        "'background:url(data:image/png;base64,AA) no-repeat;')"
+        "bad.push('inline-set='+inl.getAttribute('style'));}"
+        /* @supports and CSS.supports agree with what the cascade retains
+           and applies, including vendor aliases; values the engine does
+           not act on stay unsupported. */
+        "for(const[p,v]of[['backdrop-filter','blur(4px)'],"
+        "['-webkit-backdrop-filter','blur(2px)'],['mix-blend-mode','multiply'],"
+        "['hyphens','auto'],['tab-size','4'],['font-kerning','none'],"
+        "['text-rendering','optimizeLegibility'],['color-scheme','light dark'],"
+        "['backface-visibility','hidden'],['transform-style','preserve-3d'],"
+        "['border-image-source','linear-gradient(red, rgb(0,0,0))'],"
+        "['contain-intrinsic-size','auto 300px'],['user-select','none']])"
+        "if(!CSS.supports(p,v))bad.push('supports '+p);"
+        "for(const[p,v]of[['mix-blend-mode','overlay'],['hyphens','banana'],"
+        "['backdrop-filter','sepia(1)'],['tab-size','4px']])"
+        "if(CSS.supports(p,v))bad.push('over-supports '+p+':'+v);"
+        "want('supblend','color','rgb(255, 0, 0)');"
+        "want('supblur','backdrop-filter','blur(2px)');"
         /* A calculated zero is an authored zero, not `normal`. */
         "want('calc0','line-height','0px');"
         "want('calc0px','line-height','0px');"
@@ -1431,6 +1461,83 @@ static int computed_style_dump(const char *fixture_path,
                 "change is intended, regenerate with --computed-style-dump\n",
                 differences);
     CHECK(differences == 0);
+    return 0;
+}
+
+/* An emergency break (word-break: break-all) fits graphemes with the same
+   pair kerning the line is drawn with. Measured one at a time, a tightly
+   kerned pair such as "AV" looked wider than it is and every line broke a
+   grapheme early: 16 lines here instead of 11. */
+static int test_emergency_break_uses_pair_kerning(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    CHECK(browser_config_set_font_paths(&config,
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Bold.ttf",
+        1536u * 1024u));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}</style>"
+        "<div id=k style='width:64px;font:32px sans-serif;line-height:40px;"
+        "word-break:break-all'>AVAVAVAVAVAVAVAVAVAVAVAVAVAVAVAV</div>";
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://kerning.test/", page, sizeof(page) - 1, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "globalThis.pocSummary=String(document.getElementById('k')"
+        ".getBoundingClientRect().height/40)", "<kerning>", &result)
+        && result.success);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "globalThis.pocSummary", "<kerning-read>", &result));
+    if (strcmp(result.summary, "11") != 0)
+        fprintf(stderr, "emergency-break lines=%s\n", result.summary);
+    CHECK(strcmp(result.summary, "11") == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* An author exception ends only its own script, whatever its message says;
+   fatal engine failures are recognised from what the script hit, not from
+   error text a page controls. */
+static int test_author_error_text_is_not_fatal(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><script>throw new Error('allocation failed: out of "
+        "memory limit, interrupted')</script>"
+        "<script>globalThis.pocSummary='later-script-ran'</script>";
+    CHECK(engine != NULL);
+    bool committed = browser_engine_commit_html(engine,
+        "https://author-error.test/", page, sizeof(page) - 1, true);
+    if (!committed)
+        fprintf(stderr, "author-error commit: %s\n",
+                browser_engine_last_error(engine));
+    CHECK(committed);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(strcmp(navigation->page.script_result.summary,
+                 "later-script-ran") == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
     return 0;
 }
 

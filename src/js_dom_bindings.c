@@ -35,6 +35,88 @@ static int64_t bridge_node_handle(const DomBridge *bridge, size_t slot)
                      | (uint32_t) (slot + 1));
 }
 
+static size_t bridge_node_index_home(const lxb_dom_node_t *node)
+{
+    uintptr_t key = (uintptr_t) node;
+    uint32_t mixed = (uint32_t) (key >> 3);
+#if UINTPTR_MAX > UINT32_MAX
+    mixed ^= (uint32_t) (key >> 35);
+#endif
+    mixed *= UINT32_C(2654435761);
+    return (size_t) mixed & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u);
+}
+
+/* The slot holding `node`, or SIZE_MAX. Compares pointers only: a slot may
+   hold a pointer whose node has since been destroyed. */
+static size_t bridge_node_index_find(const DomBridge *bridge,
+                                     const lxb_dom_node_t *node)
+{
+    if (bridge == NULL || node == NULL) return SIZE_MAX;
+    size_t at = bridge_node_index_home(node);
+    for (size_t probes = 0; probes < DOM_BRIDGE_NODE_INDEX_CAPACITY;
+         probes++) {
+        uint16_t entry = bridge->node_index[at];
+        if (entry == 0u) return SIZE_MAX;
+        if (bridge->nodes[entry - 1u] == node) return entry - 1u;
+        at = (at + 1u) & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u);
+    }
+    return SIZE_MAX;
+}
+
+static void bridge_node_index_insert(DomBridge *bridge, size_t slot)
+{
+    size_t at = bridge_node_index_home(bridge->nodes[slot]);
+    while (bridge->node_index[at] != 0u)
+        at = (at + 1u) & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u);
+    bridge->node_index[at] = (uint16_t) (slot + 1u);
+}
+
+/* Remove `slot` while bridge->nodes[slot] still holds its pointer. Linear
+   probing with backward-shift deletion keeps every run unbroken. */
+static void bridge_node_index_remove(DomBridge *bridge, size_t slot)
+{
+    const size_t mask = DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u;
+    size_t hole = bridge_node_index_home(bridge->nodes[slot]);
+    for (size_t probes = 0;; probes++) {
+        if (probes == DOM_BRIDGE_NODE_INDEX_CAPACITY
+            || bridge->node_index[hole] == 0u) return;
+        if (bridge->node_index[hole] == (uint16_t) (slot + 1u)) break;
+        hole = (hole + 1u) & mask;
+    }
+    for (size_t at = (hole + 1u) & mask; bridge->node_index[at] != 0u;
+         at = (at + 1u) & mask) {
+        size_t home = bridge_node_index_home(
+            bridge->nodes[bridge->node_index[at] - 1u]);
+        /* The entry may fill the hole unless its home lies cyclically in
+           (hole, at]. */
+        bool stays = hole <= at ? home > hole && home <= at
+                                : home > hole || home <= at;
+        if (stays) continue;
+        bridge->node_index[hole] = bridge->node_index[at];
+        hole = at;
+    }
+    bridge->node_index[hole] = 0u;
+}
+
+static void bridge_node_set_reusable(DomBridge *bridge, size_t slot,
+                                     bool reusable)
+{
+    uint32_t bit = UINT32_C(1) << (slot % 32u);
+    if (reusable) bridge->node_reusable_bits[slot / 32u] |= bit;
+    else bridge->node_reusable_bits[slot / 32u] &= ~bit;
+}
+
+/* The lowest NULL slot whose generation can still advance, or SIZE_MAX. */
+static size_t bridge_first_reusable_slot(const DomBridge *bridge)
+{
+    size_t words = (bridge->node_count + 31u) / 32u;
+    for (size_t word = 0; word < words; word++) {
+        uint32_t bits = bridge->node_reusable_bits[word];
+        if (bits != 0u) return word * 32u + (size_t) __builtin_ctz(bits);
+    }
+    return SIZE_MAX;
+}
+
 static void bridge_notify_node_state_retired(DomBridge *bridge,
                                              int64_t handle)
 {
@@ -148,6 +230,7 @@ static int64_t bridge_invalidate_node_slot_impl(
         bridge->fullscreen_node_handle = 0;
         if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
     }
+    bridge_node_index_remove(bridge, slot);
     bridge->nodes[slot] = NULL;
     bridge->node_owner_document_identities[slot] = 0;
     /* Never wrap an incarnation: a wrapped handle could make an arbitrarily
@@ -157,6 +240,9 @@ static int64_t bridge_invalidate_node_slot_impl(
         < DOM_BRIDGE_NODE_GENERATION_MAX) {
         bridge->node_generations[slot]++;
     }
+    bridge_node_set_reusable(
+        bridge, slot,
+        bridge->node_generations[slot] < DOM_BRIDGE_NODE_GENERATION_MAX);
     bridge->node_retention_flags[slot] =
         notify ? 0 : BRIDGE_NODE_PENDING_RETIRE_NOTIFY;
     if (bridge->result != NULL
@@ -369,20 +455,32 @@ void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot)
     (void) bridge_invalidate_node_slot_impl(bridge, slot, true);
 }
 
-static void bridge_notify_pending_node_retirements(DomBridge *bridge)
+/* Deliver the deferred retirement callbacks for the slots one discard
+   retired. Only that discard sets the pending bit, and it always drains its
+   own slots here, so the retire bitmap names every pending slot. */
+static void bridge_notify_pending_node_retirements(
+    DomBridge *bridge, const unsigned char *retire_slots)
 {
-    if (bridge == NULL) return;
-    for (size_t slot = 0; slot < bridge->node_count; slot++) {
-        if ((bridge->node_retention_flags[slot]
-             & BRIDGE_NODE_PENDING_RETIRE_NOTIFY) == 0) continue;
-        bridge->node_retention_flags[slot] &=
-            (unsigned char) ~BRIDGE_NODE_PENDING_RETIRE_NOTIFY;
-        uint32_t generation = bridge->node_generations[slot];
-        if (generation <= 1) continue;
-        int64_t handle = (int64_t) (
-            ((generation - 1u) << DOM_BRIDGE_NODE_INDEX_BITS)
-            | (uint32_t) (slot + 1u));
-        bridge_notify_node_state_retired(bridge, handle);
+    if (bridge == NULL || retire_slots == NULL) return;
+    size_t bytes = (bridge->node_count + 7u) / 8u;
+    for (size_t byte = 0; byte < bytes; byte++) {
+        if (retire_slots[byte] == 0) continue;
+        for (size_t bit = 0; bit < 8u; bit++) {
+            if ((retire_slots[byte] & (1u << bit)) == 0) continue;
+            size_t slot = byte * 8u + bit;
+            /* A callback below may reenter and grow the table. */
+            if (slot >= bridge->node_count
+                || (bridge->node_retention_flags[slot]
+                    & BRIDGE_NODE_PENDING_RETIRE_NOTIFY) == 0) continue;
+            bridge->node_retention_flags[slot] &=
+                (unsigned char) ~BRIDGE_NODE_PENDING_RETIRE_NOTIFY;
+            uint32_t generation = bridge->node_generations[slot];
+            if (generation <= 1) continue;
+            int64_t handle = (int64_t) (
+                ((generation - 1u) << DOM_BRIDGE_NODE_INDEX_BITS)
+                | (uint32_t) (slot + 1u));
+            bridge_notify_node_state_retired(bridge, handle);
+        }
     }
 }
 
@@ -391,24 +489,27 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
     if (bridge == NULL || node == NULL) return 0;
     uintptr_t owner = js_rt_node_owner_identity(node);
     size_t reusable = DOM_BRIDGE_NODE_LIMIT;
-    for (size_t i = 0; i < bridge->node_count; i++) {
-        if (bridge->nodes[i] == node) {
-            if (bridge->node_owner_document_identities[i] == owner) {
-                return bridge_node_handle(bridge, i);
-            }
-            /* An allocator may reuse a just-destroyed address for a node in a
-               different document.  The captured owner prevents an old handle
-               from silently acquiring that new identity. */
-            bridge_invalidate_node_slot(bridge, i);
-            reusable = i;
-        }
-        if (reusable == DOM_BRIDGE_NODE_LIMIT
-            && bridge->nodes[i] == NULL
-            && bridge->node_generations[i] != 0
-            && bridge->node_generations[i]
-                   < DOM_BRIDGE_NODE_GENERATION_MAX) {
-            reusable = i;
-        }
+    size_t existing = bridge_node_index_find(bridge, node);
+    if (existing != SIZE_MAX) {
+        if (bridge->node_owner_document_identities[existing] == owner)
+            return bridge_node_handle(bridge, existing);
+        /* An allocator may reuse a just-destroyed address for a node in a
+           different document.  The captured owner prevents an old handle
+           from silently acquiring that new identity. */
+        bridge_invalidate_node_slot(bridge, existing);
+        /* The retirement callback is JavaScript; it may have registered
+           this node or claimed the freed slot meanwhile. */
+        size_t again = bridge_node_index_find(bridge, node);
+        if (again != SIZE_MAX
+            && bridge->node_owner_document_identities[again] == owner)
+            return bridge_node_handle(bridge, again);
+        if ((bridge->node_reusable_bits[existing / 32u]
+             & (UINT32_C(1) << (existing % 32u))) != 0u)
+            reusable = existing;
+    }
+    if (reusable == DOM_BRIDGE_NODE_LIMIT) {
+        size_t first = bridge_first_reusable_slot(bridge);
+        if (first != SIZE_MAX) reusable = first;
     }
     if (reusable == DOM_BRIDGE_NODE_LIMIT) {
         if (bridge->node_count == DOM_BRIDGE_NODE_LIMIT) {
@@ -431,6 +532,8 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
     }
     bridge->nodes[reusable] = node;
     bridge->node_owner_document_identities[reusable] = owner;
+    bridge_node_set_reusable(bridge, reusable, false);
+    bridge_node_index_insert(bridge, reusable);
     if (bridge->result != NULL) {
         if (bridge->result->dom_handle_slots_live != SIZE_MAX) {
             bridge->result->dom_handle_slots_live++;
@@ -550,18 +653,23 @@ typedef enum {
     BRIDGE_SUBTREE_INDETERMINATE
 } BridgeSubtreeSearchResult;
 
-static BridgeSubtreeSearchResult bridge_live_subtree_contains_node(
-    lxb_dom_node_t *root, const lxb_dom_node_t *candidate,
-    size_t ownership_depth)
+/* Visits every node of `root`'s live subtree, descending into template
+   contents. Returns FOUND when `visit` stops the walk, INDETERMINATE when a
+   bound cuts it short, NOT_FOUND after a complete walk. */
+typedef bool (*BridgeSubtreeVisitor)(void *opaque, lxb_dom_node_t *node);
+
+static BridgeSubtreeSearchResult bridge_live_subtree_visit(
+    lxb_dom_node_t *root, size_t ownership_depth,
+    BridgeSubtreeVisitor visit, void *opaque)
 {
-    if (root == NULL || candidate == NULL) return BRIDGE_SUBTREE_NOT_FOUND;
+    if (root == NULL) return BRIDGE_SUBTREE_NOT_FOUND;
     if (ownership_depth >= 8) return BRIDGE_SUBTREE_INDETERMINATE;
     DomDocumentOrderTraversal traversal = {
         .next = root, .boundary = root
     };
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL; at = dom_document_order_next(&traversal)) {
-        if (at == candidate) return BRIDGE_SUBTREE_FOUND;
+        if (visit(opaque, at)) return BRIDGE_SUBTREE_FOUND;
         if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
             && at->ns == LXB_NS_HTML) {
             size_t name_length = 0;
@@ -573,14 +681,28 @@ static BridgeSubtreeSearchResult bridge_live_subtree_contains_node(
                 lxb_dom_node_t *content = element->content == NULL ? NULL
                     : lxb_dom_interface_node(element->content);
                 BridgeSubtreeSearchResult nested =
-                    bridge_live_subtree_contains_node(
-                        content, candidate, ownership_depth + 1);
+                    bridge_live_subtree_visit(
+                        content, ownership_depth + 1, visit, opaque);
                 if (nested != BRIDGE_SUBTREE_NOT_FOUND) return nested;
             }
         }
     }
     return traversal.next == NULL
         ? BRIDGE_SUBTREE_NOT_FOUND : BRIDGE_SUBTREE_INDETERMINATE;
+}
+
+static bool bridge_subtree_visit_is_candidate(void *opaque,
+                                              lxb_dom_node_t *node)
+{
+    return node == (const lxb_dom_node_t *) opaque;
+}
+
+static BridgeSubtreeSearchResult bridge_live_subtree_contains_node(
+    lxb_dom_node_t *root, const lxb_dom_node_t *candidate)
+{
+    if (root == NULL || candidate == NULL) return BRIDGE_SUBTREE_NOT_FOUND;
+    return bridge_live_subtree_visit(
+        root, 0, bridge_subtree_visit_is_candidate, (void *) candidate);
 }
 
 static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node)
@@ -610,44 +732,41 @@ static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node)
     return root;
 }
 
-static BridgeSubtreeSearchResult bridge_subtree_has_retained_identity(
-    const DomBridge *bridge, const lxb_dom_node_t *root)
+typedef struct {
+    const DomBridge *bridge;
+    unsigned char *retire_slots;
+} BridgeSubtreeHandleScan;
+
+/* Marks each handle slot inside the subtree for retirement; stops at the
+   first slot whose identity is still retained. */
+static bool bridge_subtree_visit_handles(void *opaque, lxb_dom_node_t *node)
 {
-    if (bridge == NULL || root == NULL) return BRIDGE_SUBTREE_INDETERMINATE;
-    for (size_t i = 0; i < bridge->node_count; i++) {
-        if (bridge->nodes[i] == NULL
-            || bridge->node_retention_flags[i] == 0) continue;
-        BridgeSubtreeSearchResult result =
-            bridge_live_subtree_contains_node(
-                (lxb_dom_node_t *) root, bridge->nodes[i], 0);
-        if (result != BRIDGE_SUBTREE_NOT_FOUND) return result;
-    }
-    return BRIDGE_SUBTREE_NOT_FOUND;
+    BridgeSubtreeHandleScan *scan = opaque;
+    size_t slot = bridge_node_index_find(scan->bridge, node);
+    if (slot == SIZE_MAX) return false;
+    if (scan->bridge->node_retention_flags[slot] != 0) return true;
+    scan->retire_slots[slot / 8u] |= (unsigned char) (1u << (slot % 8u));
+    return false;
 }
 
 static size_t bridge_discard_unretained_detached_subtree(
     DomBridge *bridge, lxb_dom_node_t *root)
 {
-    if (bridge == NULL || root == NULL || root->parent != NULL
-        || bridge_subtree_has_retained_identity(bridge, root)
-               != BRIDGE_SUBTREE_NOT_FOUND) return 0;
+    if (bridge == NULL || root == NULL || root->parent != NULL) return 0;
+    /* One walk finds every handle inside the subtree through the pointer
+       index; any still-retained identity keeps the whole subtree. */
+    unsigned char retire_slots[(DOM_BRIDGE_NODE_LIMIT + 7u) / 8u] = {0};
+    BridgeSubtreeHandleScan handle_scan = { bridge, retire_slots };
+    if (bridge_live_subtree_visit(
+            root, 0, bridge_subtree_visit_handles, &handle_scan)
+        != BRIDGE_SUBTREE_NOT_FOUND) return 0;
     unsigned char script_states[SCRIPT_DYNAMIC_NODE_LIMIT] = {0};
     for (size_t i = 0; i < bridge->script_element_count; i++) {
         BridgeSubtreeSearchResult result =
             bridge_live_subtree_contains_node(
-                root, bridge->script_elements[i].node, 0);
+                root, bridge->script_elements[i].node);
         if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
         script_states[i] = result == BRIDGE_SUBTREE_FOUND;
-    }
-    unsigned char retire_slots[(DOM_BRIDGE_NODE_LIMIT + 7u) / 8u] = {0};
-    for (size_t i = 0; i < bridge->node_count; i++) {
-        BridgeSubtreeSearchResult result =
-            bridge_live_subtree_contains_node(
-                root, bridge->nodes[i], 0);
-        if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
-        if (result == BRIDGE_SUBTREE_FOUND) {
-            retire_slots[i / 8u] |= (unsigned char) (1u << (i % 8u));
-        }
     }
     size_t mutation_count =
         bridge->mutations.count < SCRIPT_MUTATION_JOURNAL_LIMIT
@@ -661,7 +780,7 @@ static size_t bridge_discard_unretained_detached_subtree(
         lxb_dom_node_t *scope = bridge->mutations.records[i].scope;
         if (scope == NULL) continue;
         BridgeSubtreeSearchResult result =
-            bridge_live_subtree_contains_node(root, scope, 0);
+            bridge_live_subtree_contains_node(root, scope);
         if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
         if (result == BRIDGE_SUBTREE_FOUND) {
             scope_slots[i / 8u] |= (unsigned char) (1u << (i % 8u));
@@ -671,7 +790,7 @@ static size_t bridge_discard_unretained_detached_subtree(
         lxb_dom_node_t *target = bridge->mutations.records[i].node;
         if (target == NULL) continue;
         BridgeSubtreeSearchResult result =
-            bridge_live_subtree_contains_node(root, target, 0);
+            bridge_live_subtree_contains_node(root, target);
         if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
         if (result == BRIDGE_SUBTREE_FOUND) {
             mutation_slots[i / 8u] |= (unsigned char) (1u << (i % 8u));
@@ -682,12 +801,12 @@ static size_t bridge_discard_unretained_detached_subtree(
         bridge->document->declared_video_card_node == NULL
             ? BRIDGE_SUBTREE_NOT_FOUND
             : bridge_live_subtree_contains_node(
-                  root, bridge->document->declared_video_card_node, 0);
+                  root, bridge->document->declared_video_card_node);
     BridgeSubtreeSearchResult reader_marker =
         bridge->document->reader_declared_video_card_node == NULL
             ? BRIDGE_SUBTREE_NOT_FOUND
             : bridge_live_subtree_contains_node(
-                  root, bridge->document->reader_declared_video_card_node, 0);
+                  root, bridge->document->reader_declared_video_card_node);
     if (declared_marker == BRIDGE_SUBTREE_INDETERMINATE
         || reader_marker == BRIDGE_SUBTREE_INDETERMINATE
         || !document_control_state_discard_subtree(
@@ -754,7 +873,7 @@ static size_t bridge_discard_unretained_detached_subtree(
     /* Cleanup callbacks are JavaScript. Run them only after native teardown
        and handle retirement are complete, so author reentrancy cannot destroy
        the subtree a second time. */
-    bridge_notify_pending_node_retirements(bridge);
+    bridge_notify_pending_node_retirements(bridge, retire_slots);
     return released;
 }
 
@@ -1108,6 +1227,32 @@ static bool selector_list_matches(lxb_dom_node_t *node,
     return false;
 }
 
+/* A query's selector list, prepared once for the whole walk. */
+typedef struct {
+    StyleQuerySelectorList list;
+    bool prepared;
+    const char *text;
+    size_t length;
+} BridgeQuerySelector;
+
+static void bridge_query_selector_prepare(BridgeQuerySelector *query,
+                                          const char *text, size_t length)
+{
+    query->text = text;
+    query->length = length;
+    query->prepared =
+        style_query_selector_list_prepare(&query->list, text, length);
+}
+
+static bool bridge_query_selector_matches(const BridgeQuerySelector *query,
+                                          lxb_dom_node_t *node,
+                                          const lxb_dom_node_t *scope)
+{
+    return query->prepared
+        ? style_query_selector_list_matches(&query->list, node, scope)
+        : selector_list_matches(node, query->text, query->length, scope);
+}
+
 /* Pre-order traversal using DOM parent/sibling links instead of a PSP stack
    frame per nesting level. `boundary` is included when it is also `next`,
    but traversal never escapes through that node's following sibling. */
@@ -1220,11 +1365,13 @@ static lxb_dom_node_t *selector_query(
     if (!bridge_document_order_traversal_init(
             bridge, &traversal, node, boundary)) return NULL;
     size_t shadow_depth = SIZE_MAX;
+    BridgeQuerySelector query;
+    bridge_query_selector_prepare(&query, selector, length);
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL; at = dom_document_order_next(&traversal)) {
         if (bridge_query_node_hidden_by_shadow(
                 bridge, at, boundary, &traversal, &shadow_depth)) continue;
-        if (selector_list_matches(at, selector, length, boundary)
+        if (bridge_query_selector_matches(&query, at, boundary)
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) return at;
     }
@@ -1437,28 +1584,38 @@ static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
         if (++work > MAXIMUM_SUBTREE_WORK) {
             return result | BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT;
         }
-        if (bridge_mutation_node_name_is(node, "style")) {
+        size_t tag_length = 0;
+        const char *tag = document_element_name(node, &tag_length);
+        if (bridge_mutation_name_equal(tag, tag_length, "style")) {
             result |= BRIDGE_MUTATION_RESOURCE_STYLESHEET;
         }
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            bool link = bridge_mutation_name_equal(tag, tag_length, "link");
             bool stylesheet_link =
-                bridge_mutation_node_name_is(node, "link")
-                && bridge_mutation_link_is_stylesheet(node);
+                link && bridge_mutation_link_is_stylesheet(node);
             if (stylesheet_link) {
                 result |= BRIDGE_MUTATION_RESOURCE_STYLESHEET;
             }
+            /* bridge_mutation_resource_attribute() classifies attributes of
+               these elements only; on any other element every lookup below
+               would be answered "none". */
+            bool resource_element = link
+                || bridge_mutation_name_equal(tag, tag_length, "img")
+                || bridge_mutation_name_equal(tag, tag_length, "source")
+                || bridge_mutation_name_equal(tag, tag_length, "video")
+                || bridge_mutation_name_equal(tag, tag_length, "base")
+                || bridge_mutation_name_equal(tag, tag_length, "use");
             static const char *const attributes[] = {
                 "src", "srcset", "data-src", "data-srcset", "href",
                 "xlink:href", "rel", "media", "type", "sizes", "poster"
             };
-            for (size_t i = 0;
-                 i < sizeof(attributes) / sizeof(attributes[0]); i++) {
+            for (size_t i = 0; resource_element
+                 && i < sizeof(attributes) / sizeof(attributes[0]); i++) {
                 /* A connected rel mutation is destructive because its old
                    value may have removed a stylesheet. For an inserted
                    subtree the final rel is fully known; preload, icon and
                    modulepreload links must not masquerade as stylesheets. */
-                if (!stylesheet_link
-                    && bridge_mutation_node_name_is(node, "link")
+                if (!stylesheet_link && link
                     && bridge_mutation_name_equal(
                         attributes[i], strlen(attributes[i]), "rel")) {
                     continue;
@@ -1601,6 +1758,23 @@ static void bridge_mutated_with_relational(
         bridge->result->dom_mutations++;
         bridge->result->relayout_required = true;
     }
+    /* An attribute, inline-style or canvas change leaves every document
+       statistic but the attribute totals intact, so it need not cost a
+       whole-document refresh. While the parser is still inserting nodes,
+       though, that refresh is also what brings the parser's growth into the
+       statistics the streaming checkpoints compare, so keep it until the
+       tree is complete. */
+    bool attribute_only = kind == SCRIPT_MUTATION_ATTRIBUTE
+        || kind == SCRIPT_MUTATION_INLINE_STYLE
+        || kind == SCRIPT_MUTATION_CANVAS;
+    if (attribute_only)
+        document_note_attribute_mutation(
+            bridge->document, attribute, attribute_length);
+    if (!attribute_only || bridge->document == NULL
+        || bridge->document->html == NULL
+        || bridge->document->html->ready_state
+               != LXB_HTML_DOCUMENT_READY_STATE_COMPLETE)
+        bridge->stats_mutations++;
     if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
 
     ScriptMutationJournal *journal = &bridge->mutations;
@@ -1868,12 +2042,14 @@ static void query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
     if (!bridge_document_order_traversal_init(
             bridge, &traversal, node, boundary)) return;
     size_t shadow_depth = SIZE_MAX;
+    BridgeQuerySelector query;
+    bridge_query_selector_prepare(&query, selector, length);
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL && *count < result_limit;
          at = dom_document_order_next(&traversal)) {
         if (bridge_query_node_hidden_by_shadow(
                 bridge, at, boundary, &traversal, &shadow_depth)) continue;
-        if (selector_list_matches(at, selector, length, boundary)
+        if (bridge_query_selector_matches(&query, at, boundary)
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) {
             int64_t handle = js_rt_bridge_register_node(bridge, at);
@@ -1930,12 +2106,14 @@ static void query_count_nodes(DomBridge *bridge, lxb_dom_node_t *node,
     if (!bridge_document_order_traversal_init(
             bridge, &traversal, node, boundary)) return;
     size_t shadow_depth = SIZE_MAX;
+    BridgeQuerySelector query;
+    bridge_query_selector_prepare(&query, selector, length);
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL && *count < limit;
          at = dom_document_order_next(&traversal)) {
         if (bridge_query_node_hidden_by_shadow(
                 bridge, at, boundary, &traversal, &shadow_depth)) continue;
-        if (selector_list_matches(at, selector, length, boundary)
+        if (bridge_query_selector_matches(&query, at, boundary)
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) (*count)++;
     }
@@ -2059,8 +2237,14 @@ static lxb_dom_node_t *find_element_id_exact(DomBridge *bridge,
          at != NULL; at = dom_document_order_next(&traversal)) {
         if (bridge_query_node_hidden_by_shadow(
                 bridge, at, node, &traversal, &shadow_depth)) continue;
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        /* Lexbor keeps each element's id attribute at hand; reading it
+           avoids a by-name attribute search per element. */
+        lxb_dom_attr_t *id =
+            lxb_dom_element_id_attribute(lxb_dom_interface_element(at));
+        if (id == NULL) continue;
         size_t value_length = 0;
-        const char *value = document_attribute(at, "id", &value_length);
+        const lxb_char_t *value = lxb_dom_attr_value(id, &value_length);
         if (value != NULL && value_length == length
             && memcmp(value, identifier, length) == 0) return at;
     }
@@ -2085,7 +2269,8 @@ int argc, JSValueConst *argv)
     const char *identifier = JS_ToCStringLen(context, &length, argv[0]);
     if (identifier == NULL) return JS_EXCEPTION;
     lxb_dom_node_t *root = lxb_dom_interface_node(bridge->document->html);
-    lxb_dom_node_t *found = length <= 128
+    /* getElementById("") is null even when an element has id="". */
+    lxb_dom_node_t *found = length != 0 && length <= 128
         ? find_element_id_exact(bridge, root, identifier, length) : NULL;
     if (found != NULL && !bridge_node_visible(bridge, found)) found = NULL;
     size_t section = 0;
@@ -3814,6 +3999,72 @@ static int serialize_computed_color(char *output, size_t capacity,
                    red, green, blue, (double) alpha / 255.0);
 }
 
+/* One declaration of an inline style attribute. A `;` inside quotes or
+   parentheses (`url(data:image/png;base64,...)`) does not end it. */
+typedef struct {
+    size_t start, end;             /* the whole declaration, without `;` */
+    size_t name_start, name_end;   /* trimmed; name_end == start if none */
+    size_t value_start, value_end; /* trimmed */
+    bool has_colon;
+} InlineDeclaration;
+
+static bool inline_declaration_next(const char *style, size_t length,
+                                    size_t *at, InlineDeclaration *out)
+{
+    if (style == NULL || *at >= length) return false;
+    size_t start = *at, end = start;
+    int parentheses = 0;
+    char quote = '\0';
+    while (end < length) {
+        char character = style[end];
+        if (quote != '\0') {
+            if (character == quote && style[end - 1] != '\\') quote = '\0';
+        } else if (character == '\'' || character == '"') {
+            quote = character;
+        } else if (character == '(') {
+            parentheses++;
+        } else if (character == ')' && parentheses > 0) {
+            parentheses--;
+        } else if (character == ';' && parentheses == 0) {
+            break;
+        }
+        end++;
+    }
+    size_t colon = start;
+    while (colon < end && style[colon] != ':') colon++;
+    InlineDeclaration declaration = {
+        .start = start, .end = end,
+        .name_start = start, .name_end = colon,
+        .value_start = colon < end ? colon + 1 : end, .value_end = end,
+        .has_colon = colon < end
+    };
+    while (declaration.name_start < declaration.name_end
+           && isspace((unsigned char) style[declaration.name_start]))
+        declaration.name_start++;
+    while (declaration.name_end > declaration.name_start
+           && isspace((unsigned char) style[declaration.name_end - 1]))
+        declaration.name_end--;
+    while (declaration.value_start < declaration.value_end
+           && isspace((unsigned char) style[declaration.value_start]))
+        declaration.value_start++;
+    while (declaration.value_end > declaration.value_start
+           && isspace((unsigned char) style[declaration.value_end - 1]))
+        declaration.value_end--;
+    *out = declaration;
+    *at = end + (end < length);
+    return true;
+}
+
+static bool inline_declaration_named(const char *style,
+                                     const InlineDeclaration *declaration,
+                                     const char *wanted, size_t wanted_length)
+{
+    return declaration->has_colon
+        && property_equal(style + declaration->name_start,
+                          declaration->name_end - declaration->name_start,
+                          wanted, wanted_length);
+}
+
 JSValue js_style_get(JSContext *context, JSValueConst this_value,
                      int argc, JSValueConst *argv)
 {
@@ -3827,32 +4078,23 @@ JSValue js_style_get(JSContext *context, JSValueConst this_value,
     if (wanted == NULL) return JS_EXCEPTION;
     size_t style_length = 0;
     const char *style = document_attribute(node, "style", &style_length);
-    JSValue result = JS_NewString(context, "");
-    for (size_t at = 0; style != NULL && at < style_length;) {
-        size_t end = at;
-        while (end < style_length && style[end] != ';') end++;
-        size_t colon = at;
-        while (colon < end && style[colon] != ':') colon++;
-        size_t name_start = at, name_end = colon;
-        while (name_start < name_end
-               && isspace((unsigned char) style[name_start])) name_start++;
-        while (name_end > name_start
-               && isspace((unsigned char) style[name_end - 1])) name_end--;
-        if (colon < end && property_equal(style + name_start,
-                                          name_end - name_start,
-                                          wanted, wanted_length)) {
-            size_t value_start = colon + 1, value_end = end;
-            while (value_start < value_end
-                   && isspace((unsigned char) style[value_start])) value_start++;
-            while (value_end > value_start
-                   && isspace((unsigned char) style[value_end - 1])) value_end--;
-            JS_FreeValue(context, result);
-            result = JS_NewStringLen(context, style + value_start,
-                                     value_end - value_start);
-            break;
-        }
-        at = end + (end < style_length);
+    /* The last declaration of a name wins, as in the cascade. The raw
+       value keeps any !important; script strips the priority itself. */
+    size_t value_start = 0, value_end = 0;
+    bool found = false;
+    InlineDeclaration declaration;
+    for (size_t at = 0;
+         inline_declaration_next(style, style_length, &at, &declaration);) {
+        if (!inline_declaration_named(style, &declaration,
+                                      wanted, wanted_length)) continue;
+        value_start = declaration.value_start;
+        value_end = declaration.value_end;
+        found = true;
     }
+    JSValue result = found
+        ? JS_NewStringLen(context, style + value_start,
+                          value_end - value_start)
+        : JS_NewString(context, "");
     JS_FreeCString(context, wanted);
     return result;
 }
@@ -3939,60 +4181,23 @@ static bool bridge_inline_property(lxb_dom_node_t *node,
     size_t style_length = 0;
     const char *style = document_attribute(node, "style", &style_length);
     bool found = false;
-    for (size_t at = 0; style != NULL && at < style_length;) {
-        size_t end = at;
-        int parentheses = 0;
-        char quote = '\0';
-        while (end < style_length) {
-            char character = style[end];
-            if (quote != '\0') {
-                if (character == quote && (end == 0 || style[end - 1] != '\\')) {
-                    quote = '\0';
-                }
-            } else if (character == '\'' || character == '"') {
-                quote = character;
-            } else if (character == '(') {
-                parentheses++;
-            } else if (character == ')' && parentheses > 0) {
-                parentheses--;
-            } else if (character == ';' && parentheses == 0) {
-                break;
-            }
-            end++;
-        }
-        size_t colon = at;
-        while (colon < end && style[colon] != ':') colon++;
-        size_t name_start = at, name_end = colon;
-        while (name_start < name_end
-               && isspace((unsigned char) style[name_start])) name_start++;
-        while (name_end > name_start
-               && isspace((unsigned char) style[name_end - 1])) name_end--;
-        if (colon < end
-            && property_equal(style + name_start, name_end - name_start,
-                              wanted, wanted_length)) {
-            size_t start = colon + 1, finish = end;
-            while (start < finish
-                   && isspace((unsigned char) style[start])) start++;
+    InlineDeclaration declaration;
+    for (size_t at = 0;
+         inline_declaration_next(style, style_length, &at, &declaration);) {
+        if (!inline_declaration_named(style, &declaration,
+                                      wanted, wanted_length)) continue;
+        size_t start = declaration.value_start;
+        size_t finish = declaration.value_end;
+        /* !important is cascade syntax, not part of the computed value. */
+        if (finish >= start + 10
+            && strncasecmp(style + finish - 10, "!important", 10) == 0) {
+            finish -= 10;
             while (finish > start
                    && isspace((unsigned char) style[finish - 1])) finish--;
-            /* !important is cascade syntax, not part of the computed value. */
-            size_t important = finish;
-            while (important > start
-                   && isspace((unsigned char) style[important - 1])) {
-                important--;
-            }
-            if (important >= start + 10
-                && strncasecmp(style + important - 10, "!important", 10)
-                       == 0) {
-                finish = important - 10;
-                while (finish > start
-                       && isspace((unsigned char) style[finish - 1])) finish--;
-            }
-            *value = style + start;
-            *value_length = finish - start;
-            found = true;
         }
-        at = end + (end < style_length);
+        *value = style + start;
+        *value_length = finish - start;
+        found = true;
     }
     return found;
 }
@@ -4725,11 +4930,41 @@ JSValue js_computed_style_get(JSContext *context,
         || id == CSP_PADDING_RIGHT || id == CSP_PADDING_BOTTOM
         || id == CSP_PADDING_LEFT;
     int containing_width = 0, content_width = 0;
-    if (!bridge_computed_style(bridge, node, &style,
-                               padding_geometry ? &containing_width : NULL,
-                               &content_width)) {
-        JS_FreeCString(context, name);
-        return js_rt_throw_task_interruption(context, "computed style interrupted");
+    /* Geometry reads resolve widths from layout and container-dependent
+       sheets depend on layout too; neither is memoized. */
+    bool memoizable = !padding_geometry
+        && !stylesheet_has_container_queries(bridge->stylesheet)
+        && !bridge->stylesheet->has_container_relative_units;
+    __typeof__(bridge->computed_style_memo) *memo =
+        &bridge->computed_style_memo;
+    uint64_t content_generation = bridge->document == NULL
+        ? 0 : bridge->document->content_generation;
+    if (memoizable && memo->node == node
+        && memo->sheet == (const void *) bridge->stylesheet
+        && memo->sheet_generation == bridge->stylesheet->build_generation
+        && memo->content_generation == content_generation
+        && memo->fullscreen_node == bridge->stylesheet->fullscreen_node
+        && memo->epoch == bridge->computed_style_epoch) {
+        style = memo->style;
+    } else {
+        if (!bridge_computed_style(bridge, node, &style,
+                                   padding_geometry ? &containing_width
+                                                    : NULL,
+                                   &content_width)) {
+            memo->node = NULL;
+            JS_FreeCString(context, name);
+            return js_rt_throw_task_interruption(
+                context, "computed style interrupted");
+        }
+        memo->node = memoizable ? node : NULL;
+        if (memoizable) {
+            memo->sheet = bridge->stylesheet;
+            memo->sheet_generation = bridge->stylesheet->build_generation;
+            memo->content_generation = content_generation;
+            memo->fullscreen_node = bridge->stylesheet->fullscreen_node;
+            memo->epoch = bridge->computed_style_epoch;
+            memo->style = style;
+        }
     }
     PseudoElement pseudo = PSEUDO_NONE;
     if (argc > 2) {
@@ -4802,18 +5037,15 @@ JSValue js_computed_style_get(JSContext *context,
                 value, sizeof(value));
         }
     }
+    /* Vendor aliases are retained under their standard names. */
+    const char *retained_modern_name =
+        id == CSP_WEBKIT_USER_SELECT ? "user-select"
+        : id == CSP_WEBKIT_TEXT_SIZE_ADJUST ? "text-size-adjust"
+        : id == CSP_WEBKIT_BACKDROP_FILTER ? "backdrop-filter" : name;
     bool retained_modern = sparse_modern && pseudo == PSEUDO_NONE
         && style_retained_property_value(
-            bridge->stylesheet, node,
-            id == CSP_WEBKIT_USER_SELECT
-                ? "user-select"
-                : (id == CSP_WEBKIT_TEXT_SIZE_ADJUST
-                   ? "text-size-adjust" : name),
-            id == CSP_WEBKIT_USER_SELECT
-                ? 11u
-                : (id == CSP_WEBKIT_TEXT_SIZE_ADJUST
-                   ? 16u : name_length),
-            value, sizeof(value));
+            bridge->stylesheet, node, retained_modern_name,
+            strlen(retained_modern_name), value, sizeof(value));
     bool serialize_computed_modern = sparse_modern
         && (id == CSP_USER_SELECT
             || id == CSP_WEBKIT_USER_SELECT
@@ -5822,26 +6054,16 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
     const char *old = document_attribute(node, "style", &old_length);
     char updated[1024];
     size_t used = 0;
-    for (size_t at = 0; old != NULL && at < old_length;) {
-        size_t end = at;
-        while (end < old_length && old[end] != ';') end++;
-        size_t colon = at;
-        while (colon < end && old[colon] != ':') colon++;
-        size_t name_start = at, name_end = colon;
-        while (name_start < name_end
-               && isspace((unsigned char) old[name_start])) name_start++;
-        while (name_end > name_start
-               && isspace((unsigned char) old[name_end - 1])) name_end--;
-        bool replace = colon < end
-            && property_equal(old + name_start, name_end - name_start,
-                              wanted, wanted_length);
-        if (!replace && end > at) {
-            size_t span = end - at;
-            if (used + span + 1 >= sizeof(updated)) goto style_too_large;
-            memcpy(updated + used, old + at, span); used += span;
-            updated[used++] = ';';
-        }
-        at = end + (end < old_length);
+    InlineDeclaration declaration;
+    for (size_t at = 0;
+         inline_declaration_next(old, old_length, &at, &declaration);) {
+        if (inline_declaration_named(old, &declaration,
+                                     wanted, wanted_length)
+            || declaration.end == declaration.start) continue;
+        size_t span = declaration.end - declaration.start;
+        if (used + span + 1 >= sizeof(updated)) goto style_too_large;
+        memcpy(updated + used, old + declaration.start, span); used += span;
+        updated[used++] = ';';
     }
     if (value_length != 0) {
         if (used + wanted_length + value_length + 3 >= sizeof(updated)) {

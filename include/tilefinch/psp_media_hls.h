@@ -21,10 +21,7 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
     PspMediaHlsContext *context, char *error, size_t error_size);
 void psp_media_hls_pump_delivery(
     PspMediaHlsContext *context, uint64_t now_us);
-bool psp_media_hls_is_live(const PspMediaHlsContext *context);
 bool psp_media_hls_failed(const PspMediaHlsContext *context);
-bool psp_media_hls_sample_source(
-    PspMediaHlsContext *context, MediaSampleSource *source);
 bool psp_media_hls_sample_sources(
     PspMediaHlsContext *context, MediaSampleSource *video_source,
     MediaSampleSource *audio_source, bool *has_separate_audio);

@@ -1016,6 +1016,113 @@ static bool fixture_describe_failure(void *opaque, char *error,
     return true;
 }
 
+/* Seeking an audio+video file positions each non-video track on its last
+   sample at or before the chosen time (the audio walk keeps a saved
+   cursor). The first audio sample after a mid-file seek must start at or
+   before the returned time and not end before it. */
+/* The 32-bit divide path must round exactly like the 64-bit one: compare
+   both against a 128-bit reference across clock rates and at the edges
+   where the fast path hands over. */
+static bool ticks_to_us_matches_reference(void)
+{
+    static const uint32_t timescales[] = {
+        1, 2, 3, 7, 1000, 1001, 24000, 30000, 44100, 48000, 90000, 96000,
+        1000000, 1000003, 12800000, UINT32_MAX
+    };
+    static const uint64_t edges[] = {
+        0, 1, 89999, 90000, 44099, 0x7fffffffu, UINT32_MAX - 1u,
+        UINT32_MAX, (uint64_t) UINT32_MAX + 1u, UINT64_C(1) << 40,
+        UINT64_MAX / 1000000u, UINT64_MAX - 1u, UINT64_MAX
+    };
+    for (size_t t = 0; t < sizeof(timescales) / sizeof(timescales[0]); t++) {
+        uint32_t timescale = timescales[t];
+        for (size_t e = 0; e < sizeof(edges) / sizeof(edges[0]) + 4096; e++) {
+            uint64_t ticks = e < sizeof(edges) / sizeof(edges[0])
+                ? edges[e]
+                : (uint64_t) (e * 2654435761u) % (UINT64_C(1) << 33);
+            unsigned __int128 exact =
+                (unsigned __int128) ticks * 1000000u / timescale;
+            uint64_t expected = exact > UINT64_MAX
+                ? UINT64_MAX : (uint64_t) exact;
+            if (media_ticks_to_us(ticks, timescale) != expected) {
+                fprintf(stderr, "ticks=%llu timescale=%u got=%llu want=%llu\n",
+                        (unsigned long long) ticks, timescale,
+                        (unsigned long long) media_ticks_to_us(ticks,
+                                                                timescale),
+                        (unsigned long long) expected);
+                return false;
+            }
+        }
+    }
+    return media_ticks_to_us(12345, 0) == UINT64_MAX;
+}
+
+static bool device_fixture_audio_seek(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL || fseek(file, 0, SEEK_END) != 0) {
+        if (file != NULL) fclose(file);
+        return false;
+    }
+    long end = ftell(file);
+    if (end <= 0 || end > 512 * 1024 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return false;
+    }
+    unsigned char *bytes = malloc((size_t) end);
+    bool loaded = bytes != NULL
+        && fread(bytes, 1, (size_t) end, file) == (size_t) end;
+    loaded = fclose(file) == 0 && loaded;
+    if (!loaded) {
+        free(bytes);
+        return false;
+    }
+    Budget budget;
+    budget_init(&budget, 4 * 1024 * 1024);
+    FixtureReader fixture_reader = {.bytes = bytes, .length = (size_t) end};
+    MediaRangeReader reader = {
+        .opaque = &fixture_reader, .length = (size_t) end,
+        .read = fixture_read, .describe_failure = NULL
+    };
+    char error[256] = {0};
+    MediaMp4Demux *demux = media_mp4_open(
+        &budget, &reader, NULL, error, sizeof(error));
+    bool okay = false;
+    uint64_t duration_us = 0;
+    for (size_t at = 0; demux != NULL && at < media_mp4_track_count(demux);
+         at++) {
+        MediaMp4TrackInfo info;
+        if (media_mp4_track_info(demux, at, &info)
+            && info.kind == MEDIA_MP4_TRACK_VIDEO && info.timescale != 0)
+            duration_us = info.duration * UINT64_C(1000000) / info.timescale;
+    }
+    uint64_t actual_us = 0;
+    if (demux != NULL && duration_us > 1000000
+        && media_mp4_seek_us(demux, duration_us / 2, &actual_us)
+        && actual_us > 0) {
+        MediaMp4Sample sample;
+        for (unsigned samples = 0; samples < 256u
+             && media_mp4_next_sample(demux, &sample); samples++) {
+            if (sample.kind != MEDIA_MP4_TRACK_AUDIO) continue;
+            uint64_t start_us = sample.dts * UINT64_C(1000000)
+                / sample.timescale;
+            uint64_t end_us = (sample.dts + sample.duration)
+                * UINT64_C(1000000) / sample.timescale;
+            okay = start_us <= actual_us && end_us + 1000u > actual_us;
+            if (!okay)
+                fprintf(stderr, "audio after seek %llu: %llu-%llu us\n",
+                        (unsigned long long) actual_us,
+                        (unsigned long long) start_us,
+                        (unsigned long long) end_us);
+            break;
+        }
+    }
+    media_mp4_close(demux);
+    okay = okay && budget.current == 0;
+    free(bytes);
+    return okay;
+}
+
 int main(void)
 {
     puts("test: embedded PSP decoder fixtures are admissible");
@@ -1023,6 +1130,10 @@ int main(void)
               TILEFINCH_TEST_MEDIA_FIXTURE_240, 320, 240));
     CHECK(validate_device_media_fixture(
               TILEFINCH_TEST_MEDIA_FIXTURE_360, 640, 360));
+    puts("test: audio tracks seek to their last sample before the target");
+    CHECK(device_fixture_audio_seek(TILEFINCH_TEST_MEDIA_FIXTURE_240));
+    puts("test: tick conversion rounds down exactly and saturates");
+    CHECK(ticks_to_us_matches_reference());
     puts("test: lazy sidx is confined to globally ordered single-track files");
     CHECK(!media_mp4_lazy_sidx_admitted(0)
           && media_mp4_lazy_sidx_admitted(1)

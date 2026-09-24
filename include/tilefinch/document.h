@@ -76,6 +76,10 @@ typedef struct {
     size_t text_node_count;
     size_t attribute_count;
     size_t attribute_value_bytes;
+    /* Attribute-only script mutations skip the whole-document refresh, so
+       the two totals above may lag until document_refresh_attribute_totals()
+       or the next full refresh. Nothing but diagnostics reads them. */
+    bool attribute_totals_stale;
     size_t text_bytes;
     size_t body_text_node_count;
     size_t body_text_length;
@@ -229,6 +233,14 @@ bool document_refresh(PocDocument *document);
    true only when it changed the connected document. */
 bool document_install_static_shell_fallback(PocDocument *document);
 void document_note_connected_mutation(PocDocument *document);
+/* A connected attribute value changed (setAttribute, removeAttribute, an
+   inline style write). No count, text or title statistic can change, so
+   callers need not refresh the document: this folds the name's presence
+   flags in conservatively and marks the attribute totals stale. */
+void document_note_attribute_mutation(PocDocument *document,
+                                      const char *name, size_t length);
+/* Recompute attribute_count/attribute_value_bytes if they are stale. */
+void document_refresh_attribute_totals(PocDocument *document);
 /* Lexbor's document-owned fragment parser is not reentrant with an active
    streaming parse.  This wrapper preserves the streaming parser while
    applying a synchronous element innerHTML mutation. */

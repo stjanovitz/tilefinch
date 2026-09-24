@@ -14,6 +14,9 @@ bool navigation_init(NavigationSession *session, Budget *budget,
     session->history_capacity = history_capacity;
     session->stream_delivery.chunk_bytes = 16384;
     session->progressive_preview_lookahead_percent = 50;
+    /* A relayout that cost a visible fraction of a second shows its first
+       screens first; cheaper pages keep the single synchronous build. */
+    session->relayout_preview_threshold_us = UINT64_C(150000);
     session->performance.low_memory_last_rollback_available = true;
     return true;
 }
@@ -570,6 +573,44 @@ typedef enum {
     NAVIGATION_PARSER_REFUSAL_SCRIPT
 } NavigationParserRefusalReason;
 
+/* The speculative preload scanner's position in the document head. TAG and
+   COMMENT carry their progress in preload_scan_tag/_length; DONE and
+   DISABLED are terminal for the navigation. */
+typedef enum {
+    NAVIGATION_PRELOAD_SCAN_TEXT = 0,
+    NAVIGATION_PRELOAD_SCAN_TAG,
+    /* A tag outgrew preload_scan_tag. Its end is still tracked, quotes
+       included, and then the scanner disables itself: a tag it could not
+       read may have been one that changes how later URLs resolve. */
+    NAVIGATION_PRELOAD_SCAN_TAG_OVERFLOW,
+    NAVIGATION_PRELOAD_SCAN_COMMENT,
+    NAVIGATION_PRELOAD_SCAN_DONE,       /* </head>: nothing left to find */
+    NAVIGATION_PRELOAD_SCAN_DISABLED    /* <base> or an unreadable tag */
+} NavigationPreloadScanState;
+
+/* A painted streaming preview kept so the reader can scroll it while the
+   document streams. Its text is copied out of the DOM (the parser
+   reallocates a text node at the parse frontier as characters arrive), and
+   each image command remembers its node and table index so it can be
+   re-resolved when the image table moves or is reordered. */
+typedef struct {
+    LayoutDocument layout;
+    char *text;
+    uint32_t *image_commands;
+    uint32_t *image_indices;
+    lxb_dom_node_t **image_nodes;
+    size_t image_count;
+    const ImageResource *image_base;
+    size_t image_table_count;
+    /* Where laid-out content ends; rows below it are placeholder. */
+    int content_end_y;
+    /* Stopped at its layout limit: more of the parsed DOM remains. */
+    bool truncated;
+    /* Rendering elements the parser had closed when it was built. */
+    size_t closed_elements;
+    bool live;
+} NavigationRetainedPreview;
+
 typedef struct {
     NavigationSession *session;
     PocDocument *document;
@@ -621,11 +662,7 @@ typedef struct {
     size_t preload_scan_tag_length;
     char preload_scan_quote;
     unsigned preload_scan_raw_text;
-    bool preload_scan_in_tag;
-    bool preload_scan_in_comment;
-    bool preload_scan_tag_overflow;
-    bool preload_scan_done;
-    bool preload_scan_disabled;
+    NavigationPreloadScanState preload_scan;
     NavigationStylesheetEventRecord stylesheet_events[
         NAVIGATION_STYLESHEET_EVENT_LIMIT];
     size_t stylesheet_event_count;
@@ -635,7 +672,9 @@ typedef struct {
     size_t stylesheet_input_count;
     size_t parsed_body_bytes;
     size_t closed_element_count;
-    size_t preview_checkpoint_checks;
+    /* Closed elements that can draw (not style, script, link, meta or
+       template). */
+    size_t closed_content_count;
     /* Parser-blocking JavaScript is useful only while its bounded cumulative
        stage remains healthy. These counters are staging-only: EOF either
        adopts the live realm or commits the still-authoritative server DOM. */
@@ -659,7 +698,10 @@ typedef struct {
     bool parser_script_circuit_open;
     NavigationParserCheckpointOutcome parser_checkpoint_outcome;
     NavigationParserRefusalReason pending_parser_refusal;
-    bool pre_eof_preview_attempted;
-    bool pre_eof_preview_painted;
+    /* When the load preview is (re)built and how deep (preview_policy.h). */
+    PreviewPolicy preview_policy;
     bool pre_eof_preview_style_refresh_attempted;
+    /* Two slots: a new preview is built and painted at its final address
+       while the live one stays scrollable. At most one is live. */
+    NavigationRetainedPreview previews[2];
 } NavigationDocumentStream;

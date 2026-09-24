@@ -77,8 +77,9 @@ int main(void)
     ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
     ui.options_selection = 38;
     intent = psp_ui_update(&ui, &input);
+    /* Site data & storage asks the frontend for its site list. */
     CHECK(ui.screen == PSP_UI_SCREEN_DATA_OPTIONS
-          && intent.action == PSP_UI_ACTION_NONE);
+          && intent.action == PSP_UI_ACTION_SHOW_SITE_STORAGE);
     /*
      * The decoder-program picker, the seventh Experimental row. Browsing it
      * must not emit anything: each press would otherwise be a Memory Stick

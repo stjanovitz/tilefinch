@@ -91,6 +91,22 @@ typedef struct {
    their closing tag. */
 bool document_script_is_parser_blocking(lxb_dom_node_t *element);
 
+/* The Cache-Control and Vary a fetched script is cached under. */
+void script_cache_response_policy(const FetchResult *fetch,
+                                  char cache_control[256], char vary[128]);
+/* Records a fetched module script in the session cache with the provenance
+   a later module-map hit must match: a store of a non-empty body, or with
+   revalidate the 304 refresh of the existing entry. Parser-inserted and
+   dynamic imports share it so both record identical provenance. Returns
+   false when the response's Referrer-Policy metadata is unusable or the
+   cache declined. */
+bool script_module_cache_record(
+    BrowserSession *session, const char *request_url,
+    const char *effective_url, const char *initiator_origin,
+    const char *top_level_url, bool initiator_opaque,
+    TilefinchCredentialsMode credentials, FetchResult *fetch,
+    bool revalidate, uint64_t now_ns);
+
 typedef enum {
     DOCUMENT_SCRIPT_PROCESS_COMPLETE = 0,
     DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE,

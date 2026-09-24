@@ -44,6 +44,13 @@ typedef struct {
     /* A NavigationParserCheckpointTestFault to inject at the next matching
        parser checkpoint (0 = none). Consumed once. */
     unsigned parser_checkpoint_fault;
+    /* Fail this many upcoming Memory Stick site-storage record appends. */
+    unsigned fail_site_storage_appends;
+    /* Fail the rename that puts a compacted site log in place, once. */
+    bool fail_next_site_storage_compact_rename;
+    /* Stop the next compaction right after the original log is moved
+       aside, as a power loss there would. */
+    bool crash_next_site_storage_compact;
     /* Host observation for index-refusal tests: linear node-box lookups.
        Reset by the test; never present on the PSP. */
     unsigned long long layout_node_box_scans;

@@ -25,6 +25,24 @@
 #define PSP_MULTIPLAYER_STUN_PORT 3478u
 #define PSP_MULTIPLAYER_STUN_COOKIE UINT32_C(0x2112a442)
 
+/* Public-endpoint discovery: up to three STUN requests, each allowed 1.5 s,
+   before reporting the LAN/two-code fallback once. */
+typedef enum {
+    PSP_MULTIPLAYER_STUN_IDLE = 0,   /* no request in flight; may retry */
+    PSP_MULTIPLAYER_STUN_PENDING,
+    PSP_MULTIPLAYER_STUN_COMPLETE,   /* invite code emitted */
+    PSP_MULTIPLAYER_STUN_EXHAUSTED   /* fallback reported */
+} PspMultiplayerStun;
+
+/* A host's joining peer: reported to the page as a request, then accepted
+   by the page (a rejection forgets it). Only an accepted candidate is sent
+   APPROVE or may CONFIRM the session. */
+typedef enum {
+    PSP_MULTIPLAYER_CANDIDATE_NONE = 0,
+    PSP_MULTIPLAYER_CANDIDATE_REPORTED,
+    PSP_MULTIPLAYER_CANDIDATE_ACCEPTED
+} PspMultiplayerCandidate;
+
 typedef enum {
     PSP_MULTIPLAYER_COMMAND_SEND = 1,
     PSP_MULTIPLAYER_COMMAND_ACCEPT,
@@ -76,16 +94,12 @@ typedef struct {
     struct sockaddr_in candidate;
     struct sockaddr_in punch_endpoint;
     bool remote_valid;
-    bool candidate_valid;
-    bool candidate_reported;
-    bool candidate_accepted;
+    PspMultiplayerCandidate candidate_state;
     bool punch_valid;
     bool opened;
     bool close_queued;
     unsigned char stun_transaction[12];
-    bool stun_pending;
-    bool stun_complete;
-    bool stun_fallback_reported;
+    PspMultiplayerStun stun;
     unsigned stun_attempts;
     uint64_t started_us;
     uint64_t created_us;
@@ -258,7 +272,7 @@ static bool multiplayer_stun_begin(PspMultiplayerSession *session)
 {
     session->stun_attempts++;
     session->last_stun_us = tilefinch_platform_monotonic_time_us();
-    session->stun_pending = false;
+    session->stun = PSP_MULTIPLAYER_STUN_IDLE;
     unsigned char resolver_storage[1024];
     int resolver = -1;
     struct in_addr address;
@@ -282,14 +296,16 @@ static bool multiplayer_stun_begin(PspMultiplayerSession *session)
     int sent = sceNetInetSendto(
         session->socket, request, sizeof(request), 0,
         (const struct sockaddr *) &endpoint, sizeof(endpoint));
-    session->stun_pending = sent >= 0 && (size_t) sent == sizeof(request);
-    return session->stun_pending;
+    if (sent < 0 || (size_t) sent != sizeof(request)) return false;
+    session->stun = PSP_MULTIPLAYER_STUN_PENDING;
+    return true;
 }
 
 static bool multiplayer_stun_response(
     PspMultiplayerSession *session, const unsigned char *packet, size_t length)
 {
-    if (!session->stun_pending || length < PSP_MULTIPLAYER_STUN_BYTES
+    if (session->stun != PSP_MULTIPLAYER_STUN_PENDING
+        || length < PSP_MULTIPLAYER_STUN_BYTES
         || multiplayer_read_u16(packet) != 0x0101u
         || multiplayer_read_u32(packet + 4) != PSP_MULTIPLAYER_STUN_COOKIE
         || memcmp(packet + 8, session->stun_transaction,
@@ -309,8 +325,7 @@ static bool multiplayer_stun_response(
             uint32_t address = multiplayer_read_u32(packet + at + 4u)
                 ^ PSP_MULTIPLAYER_STUN_COOKIE;
             if (port != 0 && address != 0) {
-                session->stun_pending = false;
-                session->stun_complete = true;
+                session->stun = PSP_MULTIPLAYER_STUN_COMPLETE;
                 multiplayer_emit_invite(session, address, port, "internet");
                 return true;
             }
@@ -396,23 +411,19 @@ static void multiplayer_receive(PspMultiplayerSession *session,
     if (kind == TILEFINCH_MULTIPLAYER_PACKET_HELLO
         && session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST
         && !session->opened) {
-        if (!session->candidate_valid || sender != session->candidate_nonce
+        if (session->candidate_state == PSP_MULTIPLAYER_CANDIDATE_NONE
+            || sender != session->candidate_nonce
             || !multiplayer_same_endpoint(source, &session->candidate)) {
             session->candidate = *source;
             session->candidate_nonce = sender;
-            session->candidate_valid = true;
-            session->candidate_reported = false;
-            session->candidate_accepted = false;
             size_t copy = payload_length < TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT
                 ? payload_length : TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT;
             memcpy(session->candidate_name, payload, copy);
             session->candidate_name[copy] = '\0';
-        }
-        if (!session->candidate_reported) {
             multiplayer_emit_peer(
                 session, TILEFINCH_MULTIPLAYER_EVENT_PEER_REQUEST,
                 source, sender, session->candidate_name, "incoming");
-            session->candidate_reported = true;
+            session->candidate_state = PSP_MULTIPLAYER_CANDIDATE_REPORTED;
         }
         return;
     }
@@ -435,7 +446,8 @@ static void multiplayer_receive(PspMultiplayerSession *session,
     }
     if (kind == TILEFINCH_MULTIPLAYER_PACKET_CONFIRM
         && session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST
-        && session->candidate_accepted && session->remote_valid
+        && session->candidate_state == PSP_MULTIPLAYER_CANDIDATE_ACCEPTED
+        && session->remote_valid
         && multiplayer_same_endpoint(source, &session->remote)
         && sender == session->remote_nonce
         && receiver == session->local_nonce && cookie == session->cookie) {
@@ -492,11 +504,10 @@ static void multiplayer_apply_command(PspMultiplayerSession *session,
                 &session->stop_requested, 1, memory_order_release);
         }
     } else if (command->kind == PSP_MULTIPLAYER_COMMAND_ACCEPT) {
-        if (session->candidate_valid
+        if (session->candidate_state != PSP_MULTIPLAYER_CANDIDATE_NONE
             && command->peer_identity == session->candidate_nonce) {
             if (!command->accepted) {
-                session->candidate_valid = false;
-                session->candidate_reported = false;
+                session->candidate_state = PSP_MULTIPLAYER_CANDIDATE_NONE;
             } else {
                 uint32_t cookie = session->cookie_secret
                     ^ session->local_nonce ^ session->candidate_nonce
@@ -506,7 +517,8 @@ static void multiplayer_apply_command(PspMultiplayerSession *session,
                 session->remote = session->candidate;
                 session->remote_valid = true;
                 session->remote_nonce = session->candidate_nonce;
-                session->candidate_accepted = true;
+                session->candidate_state =
+                    PSP_MULTIPLAYER_CANDIDATE_ACCEPTED;
                 session->last_handshake_us = 0;
             }
         }
@@ -598,7 +610,9 @@ static void multiplayer_periodic(PspMultiplayerSession *session,
             false, NULL, 0);
         session->last_handshake_us = now_us;
     } else if (session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST
-               && session->candidate_accepted && !session->opened
+               && session->candidate_state
+                      == PSP_MULTIPLAYER_CANDIDATE_ACCEPTED
+               && !session->opened
                && now_us - session->last_handshake_us
                       >= UINT64_C(250000)) {
         (void) multiplayer_send_packet(
@@ -697,18 +711,17 @@ static int multiplayer_worker(SceSize arguments, void *argument)
         }
         uint64_t now_us = tilefinch_platform_monotonic_time_us();
         multiplayer_periodic(session, now_us);
-        if (!session->stun_complete && session->stun_pending
+        if (session->stun == PSP_MULTIPLAYER_STUN_PENDING
             && now_us - session->last_stun_us > UINT64_C(1500000))
-            session->stun_pending = false;
-        if (!session->stun_complete && !session->stun_pending
+            session->stun = PSP_MULTIPLAYER_STUN_IDLE;
+        if (session->stun == PSP_MULTIPLAYER_STUN_IDLE
             && session->stun_attempts < 3u
             && now_us - session->last_stun_us >= UINT64_C(250000))
             (void) multiplayer_stun_begin(session);
-        if (!session->stun_complete && !session->stun_pending
-            && session->stun_attempts >= 3u
-            && !session->stun_fallback_reported) {
+        if (session->stun == PSP_MULTIPLAYER_STUN_IDLE
+            && session->stun_attempts >= 3u) {
             multiplayer_status(session, "LAN or two-code fallback");
-            session->stun_fallback_reported = true;
+            session->stun = PSP_MULTIPLAYER_STUN_EXHAUSTED;
         }
     }
 done:

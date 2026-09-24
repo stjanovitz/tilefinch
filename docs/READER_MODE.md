@@ -1,56 +1,61 @@
 # Reader mode
 
-Reader mode is a bounded native presentation for ordinary HTTP(S) pages. It
-keeps the parsed author document, resources, and history entry, appends one
-semantic extracted tree, then applies user-origin CSS through the existing
-BrowserEngine seam. Once that presentation succeeds, Tilefinch retires the
-current page's author JavaScript realms so later script cannot rewrite or
-intercept the extracted view. Turning Reader mode off restores the retained
-author layout without refetching its pixels, but interactive script state does
-not resume; reload the page to run its JavaScript again.
+Reader mode is a bounded native presentation of an ordinary HTTP(S) page. It
+keeps the parsed author document, its resources, and its history entry, adds
+one extracted semantic tree beside them, and styles that tree with user-origin
+CSS through the existing `BrowserEngine` seam. Once the Reader view is shown,
+Tilefinch retires the page's author JavaScript realms, so later scripts cannot
+rewrite or intercept it. Turning Reader mode off restores the retained author
+layout without fetching anything again, but script state does not resume;
+reload the page to run its JavaScript again.
 
-The transform is driven by document shape rather than a hostname allow-list.
-On its first use for a loaded page, a bounded DOM pass classifies the page as
-one of four forms:
+The transform is driven by the document's shape, not a list of hostnames. The
+first time it is used on a loaded page, a bounded DOM pass classifies the page
+as one of four forms:
 
 - **Article:** one text-dense, low-link-density subtree dominates the page.
 - **Listing:** at least eight repeated, evidenced media entries share a list
   container. A matching link alone is insufficient; each entry also needs a
   thumbnail or nearby duration/view metadata.
-- **Media:** the document has a visible playable `<video>`/`<audio>` element
-  or a high-confidence discovered candidate colocated with its primary title.
-  Schema.org and `og:type` media hints alone do not promote a page to Media;
-  promotional metadata would otherwise misclassify ordinary landing pages.
-  Those head hints do veto high-confidence Listing classification, however,
-  so a script-injected player with a related-items rail degrades to Article or
-  Raw rather than hiding its description as a listing. The internal page-kind
-  name remains `watch` for stylesheet and telemetry compatibility.
+- **Media:** the document has a visible, playable `<video>` or `<audio>`
+  element, or a high-confidence discovered candidate next to its primary
+  title. Schema.org and `og:type` media hints alone do not make a page Media,
+  because promotional metadata would misclassify ordinary landing pages. Those
+  hints do veto a high-confidence Listing, however, so a script-injected
+  player with a related-items rail degrades to Article or Raw instead of
+  hiding its description as a listing. The internal page-kind name is still
+  `watch`, for stylesheet and telemetry compatibility.
 - **Raw:** no safe semantic shape was found. Reader mode is unavailable and
   the author presentation remains unchanged.
 
-The pass visits at most 8,192 DOM nodes, tracks at most 128 levels of nesting,
-and retains at most 64 listing entries. Its scratch table is charged to the
-page budget and released immediately. Classification and the DOM markers it
-produces are cached with the loaded page, so scrolling and repainting do not
-repeat the work. Marker installation is journaled: an allocation failure,
-internal-marker collision, or bound refusal removes every marker added by the
-attempt and leaves the author DOM unchanged. Lazy image source promotion
-recognizes only conventional one-pixel sentinels and remains subject to the
-ordinary image count, byte, authorization, and offscreen-defer limits.
+The pass visits at most 8,192 DOM nodes, tracks at most 128 levels of
+nesting, and keeps at most 64 listing entries. Its scratch table is charged to
+the page budget and released straight away. The classification and the DOM
+markers it produces are cached with the loaded page, so scrolling and
+repainting do not repeat the work. Marker installation is journaled: an
+allocation failure, a collision with an internal marker, or a bound refusal
+removes every marker the attempt added and leaves the author DOM unchanged.
+Promoting lazy image sources recognizes only the conventional one-pixel
+placeholders and stays subject to the ordinary image count, byte,
+authorization, and offscreen-deferral limits.
 
-Reader mode is manual by default. Choose **Menu → Page tools → Reader
-mode** to enable it for the current page. **Always use Reader mode** is a
-bounded per-site preference. **Settings → Appearance → Auto Reader** is
-an explicit global opt-in that engages only when the classifier reports a
-high-confidence article, listing, or media page.
+Reader mode is manual by default:
 
-Reader font is a persisted Sans/Serif choice. While Reader mode is active, the
-normal Web pages scale control adjusts Reader text. `Remember size` is off by
-default. When enabled, the profile records only the scale for the page's
-registrable site in a 16-entry move-to-front table; sibling hosts such as
-`en.wikipedia.org` and `m.wikipedia.org` share one value. Disabling the option
-clears the table. Merely opening, closing, or navigating in Reader mode never
-marks the profile dirty, so the default behavior adds no Memory Stick writes.
+- **Menu → Page tools → Reader mode** turns it on for the current page;
+- **Page tools → Site information → Permissions & controls → Always Reader**
+  is a bounded per-site preference;
+- **Settings → Appearance → Auto Reader** is an explicit global opt-in that
+  engages only when the classifier reports a high-confidence article,
+  listing, or media page.
+
+**Reader font** is a saved Sans or Serif choice. While Reader mode is active,
+the normal page text-size control adjusts Reader text. **Remember size** is
+off by default; when it is on, the profile records only the size for the
+page's registrable site, in a 16-entry move-to-front table, so sibling hosts
+such as `en.wikipedia.org` and `m.wikipedia.org` share one value. Turning the
+option off clears the table. Opening, closing, or navigating in Reader mode
+never marks the profile dirty, so the default behavior adds no Memory Stick
+writes.
 
 Limits are deliberate:
 
@@ -75,12 +80,11 @@ after presentation succeeds. The host renderer's `--reader-profile` options
 are older, deterministic CSS fixtures for engineering comparisons; they are
 not the device product's content-shape classifier.
 
-**Library → Save article for later** is deliberately separate from this live
-presentation transform. It serializes a bounded, text-only Reader document
-rather than retaining the page realm or DOM. See
-[Offline library](OFFLINE_LIBRARY.md).
+**Page tools → Save article** is deliberately separate from this live
+presentation. It serializes a bounded, text-only Reader document instead of
+keeping the page's realm or DOM; see [Offline library](OFFLINE_LIBRARY.md).
 
-For a broader fallback which retains bounded, explicit GET/search forms and
-navigation instead of selecting only an article or listing, see
-[Basic view](BASIC_VIEW.md). Reader and Basic share one extracted tree slot;
-neither replaces the authored DOM.
+[Basic view](BASIC_VIEW.md) is a broader fallback that keeps bounded, explicit
+GET and search forms and navigation instead of selecting only an article or
+listing. Reader and Basic share one extracted-tree slot, and neither replaces
+the authored DOM.

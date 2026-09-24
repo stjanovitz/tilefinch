@@ -15,7 +15,16 @@ does not excuse exceeding another.
 | session response cache | 512 KiB | 1 MiB |
 | QuickJS heap | 4 MiB | 5 MiB |
 | total admitted script source | at most 1 MiB | at most 2 MiB |
-| decoded tile capacity | up to 8 | up to 8 |
+| decoded tile capacity | up to 24 (8 reserved) | up to 24 (8 reserved) |
+
+Tiles are 128x128 RGB565 (32 KiB). A 480x272 screen touches twelve to
+sixteen; the first eight are reserved when a page's render shell is built,
+as before. The remaining slots hold the visible remainder and two rows of
+paint-ahead below (or above) the screen: they are allocated on first use
+only while the page keeps 2 MiB of budget headroom, and optional-memory
+reclaim frees them first. On the PlayStation Portable article (2026-09-23,
+PSP-3000) this raised the page's budget peak by about 200 KiB and cut Page
+Down to a complete frame from p50 117 ms to 83 ms.
 
 Both reserve at least 8 MiB outside the page budget for process control,
 network/TLS internals, firmware modules, media, native chrome, stacks, and

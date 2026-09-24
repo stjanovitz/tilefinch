@@ -1,4 +1,4 @@
-script menu-tour.txt steps=93
+script menu-tour.txt steps=94
 mark boot screen=home
 mark home-first screen=home
 mark tabs-first screen=tabs
@@ -35,6 +35,6 @@ mark help screen=help
 step=81 action=home setting=none screen=home menu=0 option=2 group=0 tab=0
 mark home screen=home
 mark home-moved screen=home
-step=89 action=exit setting=none screen=home menu=6 option=2 group=0 tab=0
+step=90 action=exit setting=none screen=home menu=6 option=2 group=0 tab=0
 mark exiting screen=home
-outcome complete frames=396 steps=92/93
+outcome complete frames=398 steps=93/94

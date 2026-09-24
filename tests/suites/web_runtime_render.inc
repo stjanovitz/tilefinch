@@ -1,8 +1,14 @@
 static int test_web_runtime(void)
 {
+    puts("test: tile paint-ahead serves one Page Down from the cache");
+    if (test_tile_paint_ahead() != 0) return 1;
+    puts("test: placeholder frames checker unpainted tiles without raster");
+    if (test_tile_placeholder_frame() != 0) return 1;
     Budget budget;
     budget_init(&budget, 16 * MIB);
     budget_install_lexbor(&budget);
+    puts("test: fixed overlays stack by z-index across fixed elements");
+    if (test_fixed_overlays_follow_z_index(&budget) != 0) return 1;
 
     puts("test: section-state restore refreshes DOM metadata and lazy caches");
     static const char section_state_page[] =
@@ -1562,6 +1568,14 @@ static int test_web_runtime(void)
           && layout_link_at(&geometry_navigation.page.layout, 4, 4) == NULL
           && layout_link_at(&geometry_navigation.page.layout, 20, 20)
               != NULL);
+    /* Nothing is scrolled: the overflow stream is baked into tiles, so a
+       repeated frame rasterizes none of it directly. Scrolling the shell
+       below returns it to the per-frame path. */
+    size_t direct_unscrolled = overflow_cache.overflow_direct_commands;
+    CHECK(tile_cache_render_frame(&overflow_cache, 0, 480, 272, NULL)
+          && overflow_cache.overflow_direct_commands == direct_unscrolled
+          && overflow_cache.overflow_tile_commands > 0
+          && overflow_cache.overflow_prepare_skips > 0);
     int sibling_scroll = sibling_positioned_box->y;
     int maximum_document_scroll = geometry_navigation.page.layout.height - 272;
     if (maximum_document_scroll < 0) maximum_document_scroll = 0;

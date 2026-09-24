@@ -1,0 +1,23 @@
+# Device-visual check of a CSS-only drawer: open the page's first control
+# (Wikipedia mobile's main-menu checkbox label), then save a screenshot
+# through Page tools. Screenshots land in the data directory (host0: in the
+# PRX dev loop), never on the Memory Stick in that loop.
+wait-page 1
+tap-page down
+tap-page left
+wait-page 1
+mark focused
+tap-page cross
+wait-page 2
+mark drawer-open
+wait-page 1
+wait 30
+# Root menu opens on Home (row 0): Page tools is row 2, Screenshot row 5.
+tap select
+press 2 down
+tap cross
+press 5 down
+tap cross
+wait 90
+mark screenshot
+end

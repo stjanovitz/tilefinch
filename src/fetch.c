@@ -1289,6 +1289,17 @@ static struct {
     size_t replay_route_index_count;
 } fetch_trace;
 
+/* The lab's diagnostic mobile-Safari identity. The PSP has no environment,
+   so trace-free builds answer without a getenv per request. */
+static bool fetch_diagnostic_mobile_safari(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    return getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL;
+#endif
+}
+
 #include "fetch/security_metadata.inc"
 #include "fetch/trace_capture.inc"
 #include "fetch/trace_replay.inc"

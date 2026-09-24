@@ -25,7 +25,6 @@ struct PspCaptivePortal {
     unsigned probe_count;
     uint64_t started_us;
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-    bool resume_update_check;
 #endif
     unsigned char body[TILEFINCH_CAPTIVE_PORTAL_PROBE_BODY_LIMIT];
     char original_url[NAVIGATION_URL_LIMIT];
@@ -78,11 +77,7 @@ static void portal_release(PspApp *app)
             portal->request_id, "captive portal operation ended");
     }
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-    if (portal->resume_update_check && app->update_check_pending != NULL
-        && (app->update_check_running == NULL
-            || !*app->update_check_running)) {
-        *app->update_check_pending = true;
-    }
+    if (app->update_check != NULL) psp_update_check_resume(app->update_check);
 #endif
     budget_free(app->browser->budget, portal);
     app->interactive->captive_portal = NULL;
@@ -177,10 +172,7 @@ bool psp_captive_portal_start(PspApp *app, PspAppFrameState *frame)
     app->interactive->captive_portal = portal;
     portal->started_us = (uint64_t) sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-    if (app->update_check_pending != NULL && *app->update_check_pending) {
-        portal->resume_update_check = true;
-        *app->update_check_pending = false;
-    }
+    if (app->update_check != NULL) psp_update_check_pause(app->update_check);
 #endif
     if (!portal_probe_begin(app, portal, false)) {
         portal_release(app);

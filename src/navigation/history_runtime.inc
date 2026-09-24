@@ -402,6 +402,8 @@ bool navigation_scroll_to_fragment(
     if (target == NULL && length == 3u
         && strncasecmp(identifier, "top", 3u) == 0)
         return navigation_set_scroll(session, 0);
+    /* The target may lie below a provisional layout's placeholder. */
+    if (target != NULL) (void) navigation_complete_layout_sync(session);
     const LayoutNodeBox *box = target == NULL ? NULL
         : layout_box_for_node(&session->page.layout, target);
     if (box == NULL) return true;
@@ -1367,9 +1369,210 @@ static size_t navigation_live_deferred_nodes(
     return count;
 }
 
+/* A page without a script realm, whose last complete layout took long
+   enough to be felt, can show the screens around the reader first: nothing
+   else reads its geometry in between, and idle work completes the rest. */
+static bool navigation_relayout_preview_eligible(
+    const NavigationSession *session)
+{
+    return session->page.runtime == NULL
+        && session->relayout_preview_threshold_us != UINT64_MAX
+        && session->page.layout_complete_us
+               >= session->relayout_preview_threshold_us
+        && session->viewport.css_height > 0;
+}
+
+/* The viewport and the two screens below it, so the first page-downs land
+   on laid-out content. A truncated result keeps keep_height as its scroll
+   extent and marks where its content ends. */
+static bool navigation_build_provisional_layout(
+    NavigationSession *session, LayoutDocument *layout, int keep_height)
+{
+    const NavigationEntry *entry = navigation_current(session);
+    int scroll_y = entry == NULL || entry->scroll_y < 0 ? 0 : entry->scroll_y;
+    int limit = scroll_y + 3 * session->viewport.css_height;
+    navigation_ensure_layout_reuse(session);
+    bool truncated = false;
+    layout->performance.cancelled = false;
+    bool built = layout_build_context_preview(
+        layout, session->budget, &session->page.document,
+        &session->page.stylesheet, session->fonts, session->images,
+        &session->viewport, session->page.layout_reuse, limit, &truncated);
+    session->layout_build_cancelled = !built && layout->performance.cancelled;
+    if (!built) return false;
+    if (truncated) {
+        layout->content_limit_y = layout->height > 0 ? layout->height : 1;
+        /* Keep the previous page's extent, and always leave two screens
+           of placeholder to scroll into: reaching them extends the layout
+           (a page committed provisionally has no earlier extent). */
+        int ahead = layout->content_limit_y
+            + 2 * session->viewport.css_height;
+        if (keep_height < ahead) keep_height = ahead;
+        if (layout->height < keep_height) layout->height = keep_height;
+    }
+    return true;
+}
+
+/* After a provisional commit skipped the whole-document image walk, the
+   first complete layout's unresolved visuals become the deferred image
+   queue, loaded nearest the reader first. */
+static void navigation_queue_discovered_visuals(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    page->visual_discovery_pending = false;
+    const LayoutDocument *layout = &page->layout;
+    size_t documents = 0, visuals = 0;
+    for (size_t i = 0; i < layout->visual_priority_count; i++) {
+        if (layout->visual_priority_targets[i].kind
+                == IMAGE_PRIORITY_KIND_DOCUMENT) documents++;
+        else visuals++;
+    }
+    /* Images load lazily, nearest the reader first, through the deferred
+       queue (which handles only image elements). Masks and backgrounds
+       are few distinct icons: one batch in the next idle pass. */
+    if (documents != 0 && page->deferred_image_targets == NULL) {
+        ImagePriorityTarget *targets = budget_malloc(
+            session->budget, documents * sizeof(*targets));
+        if (targets != NULL) {
+            size_t at = 0;
+            for (size_t i = 0; i < layout->visual_priority_count; i++) {
+                if (layout->visual_priority_targets[i].kind
+                    == IMAGE_PRIORITY_KIND_DOCUMENT)
+                    targets[at++] = layout->visual_priority_targets[i];
+            }
+            page->deferred_image_targets = targets;
+            page->deferred_image_count = documents;
+            page->deferred_image_cursor = 0;
+            page->deferred_image_rank_valid = false;
+            page->image_continuation_pending = true;
+        }
+    }
+    if (visuals != 0 && page->visual_batch_targets == NULL) {
+        ImagePriorityTarget *targets = budget_malloc(
+            session->budget, visuals * sizeof(*targets));
+        if (targets != NULL) {
+            size_t at = 0;
+            for (size_t i = 0; i < layout->visual_priority_count; i++) {
+                if (layout->visual_priority_targets[i].kind
+                    != IMAGE_PRIORITY_KIND_DOCUMENT)
+                    targets[at++] = layout->visual_priority_targets[i];
+            }
+            page->visual_batch_targets = targets;
+            page->visual_batch_count = visuals;
+        }
+    }
+}
+
+static bool navigation_layout_provisional(const NavigationSession *session)
+{
+    return session != NULL && session->page.loaded
+        && session->page.layout_provisional;
+}
+
+bool navigation_layout_completion_pending(const NavigationSession *session)
+{
+    return navigation_layout_provisional(session)
+        && navigation_now_us() >= session->page.layout_completion_retry_us;
+}
+
+bool navigation_layout_completion_awaited(const NavigationSession *session)
+{
+    if (!navigation_layout_provisional(session)) return false;
+    const NavigationEntry *entry = navigation_current(session);
+    int64_t scroll_y = entry == NULL || entry->scroll_y < 0
+        ? 0 : entry->scroll_y;
+    int64_t viewport = session->viewport.css_height;
+    /* The same test navigation_complete_layout_step extends on. */
+    return scroll_y + 2 * viewport > session->page.layout.content_limit_y
+        && scroll_y + viewport >= session->page.layout.height;
+}
+
+static NavigationLayoutCompletion navigation_complete_layout_step(
+    NavigationSession *session, bool allow_extend)
+{
+    if (!navigation_layout_provisional(session))
+        return NAVIGATION_LAYOUT_COMPLETION_NONE;
+    uint64_t started = navigation_now_us();
+    const NavigationEntry *entry = navigation_current(session);
+    int scroll_y = entry == NULL || entry->scroll_y < 0 ? 0 : entry->scroll_y;
+    int limit = session->page.layout.content_limit_y;
+    int old_height = session->page.layout.height;
+    /* A reader scrolling toward the placeholder gets the next screens in a
+       fraction of the whole build, which input may preempt again. */
+    bool extend = allow_extend
+        && scroll_y + 2 * session->viewport.css_height > limit;
+    navigation_evict_layout_reuse_under_pressure(session);
+    LayoutDocument next = {0};
+    bool discover = !extend && session->page.visual_discovery_pending;
+    if (discover) {
+        navigation_ensure_layout_reuse(session);
+        layout_reuse_cache_record_unresolved_visuals(
+            session->page.layout_reuse, true);
+    }
+    bool built = extend
+        ? navigation_build_provisional_layout(session, &next, old_height)
+        : navigation_build_layout(
+              session, &next, session->fonts, session->images);
+    if (discover)
+        layout_reuse_cache_record_unresolved_visuals(
+            session->page.layout_reuse, false);
+    if (!built) {
+        if (session->layout_build_cancelled) {
+            session->performance.provisional_cancellations++;
+            return NAVIGATION_LAYOUT_COMPLETION_CANCELLED;
+        }
+        /* A refused build keeps the provisional screens; idle work tries
+           again after a doubling wait. Giving up would leave the page's
+           rest a checkerboard for good. */
+        uint8_t failures = session->page.layout_completion_failures;
+        if (failures < UINT8_MAX) failures++;
+        session->page.layout_completion_failures = failures;
+        unsigned shift = failures > 6u ? 5u : failures - 1u;
+        session->page.layout_completion_retry_us =
+            navigation_now_us() + (UINT64_C(500000) << shift);
+        return NAVIGATION_LAYOUT_COMPLETION_FAILED;
+    }
+    session->page.layout_completion_failures = 0;
+    session->page.layout_completion_retry_us = 0;
+    layout_transfer_scroll_state(&session->page.layout, &next);
+    navigation_measure_damage(session, &session->page.layout, &next);
+    layout_destroy(&session->page.layout);
+    session->page.layout = next;
+    session->incremental_relayouts++;
+    session->performance.fast_relayouts++;
+    uint64_t elapsed = navigation_record_layout_slices(
+        session, started, &session->page.layout);
+    session->performance.layout_us += elapsed;
+    session->performance.relayout_us += elapsed;
+    navigation_attach_layout(session);
+    navigation_clamp_scroll_to_layout(session);
+    if (discover) navigation_queue_discovered_visuals(session);
+    if (session->page.layout_provisional) {
+        session->performance.provisional_extensions++;
+        return NAVIGATION_LAYOUT_COMPLETION_EXTENDED;
+    }
+    session->performance.provisional_completions++;
+    return NAVIGATION_LAYOUT_COMPLETION_ADOPTED;
+}
+
+NavigationLayoutCompletion navigation_complete_layout(
+    NavigationSession *session)
+{
+    return navigation_complete_layout_step(session, true);
+}
+
+bool navigation_complete_layout_sync(NavigationSession *session)
+{
+    NavigationLayoutCompletion result =
+        navigation_complete_layout_step(session, false);
+    return result == NAVIGATION_LAYOUT_COMPLETION_NONE
+        || result == NAVIGATION_LAYOUT_COMPLETION_ADOPTED;
+}
+
 bool navigation_relayout(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
+    tilefinch_platform_trace_step("relayout-prepare");
     session->focus_outline_cache_valid = false;
     session->focus_outline_cache_node = NULL;
     uint64_t started = navigation_now_us();
@@ -1570,8 +1773,14 @@ bool navigation_relayout(NavigationSession *session)
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t relayout_prepared = navigation_now_us();
 #endif
-        bool built = navigation_build_layout(
-            session, &next, session->fonts, session->images);
+        bool provisional = navigation_relayout_preview_eligible(session);
+        bool built = provisional
+            ? navigation_build_provisional_layout(
+                  session, &next, session->page.layout.height)
+            : navigation_build_layout(
+                  session, &next, session->fonts, session->images);
+        if (built && next.content_limit_y != 0)
+            session->performance.provisional_relayouts++;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t relayout_built = navigation_now_us();
 #endif
@@ -2081,7 +2290,8 @@ bool navigation_background_resources_pending(
     return session != NULL && session->page.loaded
         && (fonts_external_loader_pending(
                 &session->page.external_font_loader)
-            || session->page.image_continuation_pending);
+            || session->page.image_continuation_pending
+            || session->page.visual_batch_targets != NULL);
 }
 
 static void navigation_deferred_images_finish(NavigationSession *session);
@@ -2587,7 +2797,10 @@ bool navigation_run_deferred_image_work(NavigationSession *session)
     if (session == NULL || !session->page.loaded) return false;
     if (!session->page.image_continuation_pending
         || session->page.deferred_image_targets == NULL) return true;
+    /* Pages that relayout provisionally show each batch in a fraction of
+       a second and complete in preemptible idle work. */
     if (session->maximum_publication_work_units != 0
+        && !navigation_relayout_preview_eligible(session)
         && session->page.layout.layout_work_units
                > session->maximum_publication_work_units) {
         /* Every batch is published through a full relayout costing about
@@ -2699,6 +2912,39 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
                 session->performance.background_font_relayouts++;
             }
         }
+    }
+    if (session->page.visual_batch_targets != NULL) {
+        NavigationPage *page = &session->page;
+        ImagePriorityTarget *targets = page->visual_batch_targets;
+        size_t count = page->visual_batch_count;
+        page->visual_batch_targets = NULL;
+        page->visual_batch_count = 0;
+        size_t loaded_before = page->images.stats.loaded;
+        bool loaded = images_load_external_priority_targets(
+            &page->document, &page->stylesheet, &page->images, targets,
+            count, session->budget, page->resource_base_url,
+            page->document_url, page->referrer_policy,
+            session->maximum_images, session->maximum_image_bytes,
+            session->maximum_image_file_bytes,
+            session->maximum_decoded_image_bytes,
+            session->resource_timeout_ms, page->resource_scheduler,
+            session->browser_session);
+        budget_free(session->budget, targets);
+        session->images = &page->images;
+        navigation_ensure_layout_reuse(session);
+        layout_reuse_cache_update_images(page->layout_reuse, &page->images);
+        if (loaded && page->images.stats.loaded > loaded_before) {
+            session->performance.background_images_loaded +=
+                page->images.stats.loaded - loaded_before;
+            if (!navigation_relayout(session)) {
+                session->performance.background_image_failures++;
+                return NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
+            }
+            session->performance.background_image_relayouts++;
+        } else if (!loaded) {
+            session->performance.background_image_failures++;
+        }
+        return outcome;
     }
     if (!session->page.image_continuation_pending) return outcome;
     if (session->page.deferred_image_targets != NULL) {

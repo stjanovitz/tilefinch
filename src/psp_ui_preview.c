@@ -342,9 +342,53 @@ int main(int argc, char **argv)
             {"The lost art of C", "https://lobste.rs/s/c", "", true}
         }
     };
+    static PspUiSiteStorageView storage_view = {
+        .count = 3,
+        .stick_free = "1.2 GB free on Memory Stick",
+        .rows = {
+            {"game.example", "1.4 MB  Always", 1},
+            {"notes.example", "210 KB  Session", 3},
+            {"news.example", "32 KB  RAM", 0}
+        }
+    };
     if (strcmp(mode, "menu") == 0) {
         ui.screen = PSP_UI_SCREEN_MENU;
         ui.menu_selection = 3;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "menu-exit") == 0) {
+        ui.screen = PSP_UI_SCREEN_MENU;
+        ui.menu_selection = PSP_UI_MENU_ITEM_COUNT - 1;
+        ui.data_clear_confirmation = 0xE0u;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "page-tools-last") == 0) {
+        ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+        ui.menu_selection = 7;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "site-information") == 0) {
+        ui.screen = PSP_UI_SCREEN_PAGE_INFORMATION;
+        ui.menu_selection = 1;
+        ui.site_cookie_count = 3;
+        ui.site_storage_count = 12;
+        ui.site_data_bytes = 1400u * 1024u;
+        ui.site_storage_state = 1;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "site-storage") == 0
+               || strcmp(mode, "site-storage-caches") == 0
+               || strcmp(mode, "storage-site") == 0) {
+        ui.screen = strcmp(mode, "storage-site") == 0
+            ? PSP_UI_SCREEN_STORAGE_SITE : PSP_UI_SCREEN_DATA_OPTIONS;
+        ui.data_options_selection =
+            strcmp(mode, "site-storage-caches") == 0 ? 8 : 0;
+        ui.site_storage_offers = true;
+        ui.live_cache_kib = 1024;
+        ui.persistent_cache_mb = 4;
+        ui.site_storage = &storage_view;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "storage-offer") == 0) {
+        psp_ui_show_storage_offer(&ui, "https://game.example", 33u * 1024u,
+                                  75u * 1024u, 4u * 1024u * 1024u, true,
+                                  UINT64_C(1288490188));
+        ui.overlay_animation_frames = 0;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "page-tools") == 0) {
         ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;

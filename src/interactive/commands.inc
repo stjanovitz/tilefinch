@@ -1137,6 +1137,14 @@ static bool loop_drain_turn(BrowserEngine *engine,
     bool work_pending = browser_engine_run_idle_work(
         engine, &idle_visual_changed);
     (void) idle_visual_changed;
+    /* The PSP loop pumps the nearest-first image queue in its own frame
+       slot after idle work; so does a drain turn. */
+    bool deferred_visual_changed = false;
+    (void) browser_engine_run_deferred_image_work(
+        engine, &deferred_visual_changed);
+    if (navigation->page.image_continuation_pending
+        && navigation->page.deferred_image_targets != NULL)
+        work_pending = true;
     bool media_changed = false;
     if (!interactive_media_advance(media, navigation, cache, elapsed_ms,
                                    &media_changed)) {

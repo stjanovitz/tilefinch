@@ -126,11 +126,8 @@ static bool update_url_host_matches(
     size_t name_length = strlen(name);
     if (host_length == name_length
         && strncasecmp(host, name, name_length) == 0) return true;
-    return allow_subdomains && host_length > name_length
-        && host[host_length - name_length - 1u] == '.'
-        && strncasecmp(
-               host + host_length - name_length,
-               name, name_length) == 0;
+    return allow_subdomains
+        && tilefinch_host_within(host, host_length, name, name_length);
 }
 
 static bool update_url_is_onedrive_share(const char *url)

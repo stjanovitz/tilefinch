@@ -53,7 +53,7 @@ turns the earlier provisional navigation preview into an interactive document.
 
 `BUTTONS` joins names with `+`: `up`, `down`, `left`, `right`, `cross`,
 `circle`, `triangle`, `square`, `ltrigger`, `rtrigger`, `start`, and `select`.
-The parser accepts at most 256 steps, 20 characters per mark, and 8 KiB per
+The parser accepts at most 256 steps, 19 characters per mark, and 8 KiB per
 file. The boot key accepts only a leaf filename—no separators or `..`.
 
 `hold` holds one chord continuously for the requested frame count. `press`
@@ -229,7 +229,7 @@ and captures for visual inspection. Menu focus now has a separate 150 ms
 emulator gate; menu activation is timed but still requires full relayout.
 Its golden ignores asynchronous action-cursor annotations, not receiver
 order or captures. A passing action golden alone is not a latency budget.
-See [the fidelity evidence limits](../FIDELITY.md#known-evidence-limits).
+See [the performance ledger](PERFORMANCE_LEDGER.md#long-article-layout-cost-and-live-input-evidence-from-2026-09-04).
 
 `wikipedia-search-keyboard-live` starts at the English Main Page, hides
 the toolbar, opens its responsive search icon, then moves the nub to the

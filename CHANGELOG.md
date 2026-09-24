@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.27 — 2026-09-23
+
+- Made long pages usable sooner, with more responsive focus, scrolling, and menus while loading continues.
+- Improved layout, text, and WebGL rendering on complex pages and games.
+- Added per-site storage controls with optional Memory Stick persistence and safer recovery.
+- Reduced browsing and playback overhead, with additional stability fixes.
+
 ## 0.1.26 — 2026-09-21
 
 - Improved page layout and computed-style compatibility on complex sites.

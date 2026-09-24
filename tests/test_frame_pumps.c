@@ -239,7 +239,25 @@ static int test_resource_overlaps_are_pinned(void)
     uint16_t watched = 0;
     for (unsigned id = 0; id < FRAME_PUMP_COUNT; id++)
         watched |= frame_pump_policy((FramePumpId) id)->yields_to_active;
+    /* Admission reads facts only through each policy's blocked_by, so fact
+       sets that block the same pumps behave identically: simulate one
+       representative per distinct blocked set instead of all 2^13. */
+    static bool blocked_seen[1u << FRAME_PUMP_COUNT];
+    static uint32_t representatives[FRAME_FACT_ALL + 1u];
+    size_t representative_count = 0;
+    memset(blocked_seen, 0, sizeof(blocked_seen));
     for (uint32_t facts = 0; facts <= FRAME_FACT_ALL; facts++) {
+        uint16_t blocked = 0;
+        for (unsigned id = 0; id < FRAME_PUMP_COUNT; id++) {
+            if ((facts & frame_pump_policy((FramePumpId) id)->blocked_by) != 0)
+                blocked |= FRAME_PUMP_BIT(id);
+        }
+        if (blocked_seen[blocked]) continue;
+        blocked_seen[blocked] = true;
+        representatives[representative_count++] = facts;
+    }
+    for (size_t r = 0; r < representative_count; r++) {
+        uint32_t facts = representatives[r];
         for (uint32_t work = 0; work < (1u << FRAME_PUMP_COUNT); work++) {
           /* Enumerate every subset of the watched pumps which have work. */
           uint16_t candidates = (uint16_t) (work & watched);

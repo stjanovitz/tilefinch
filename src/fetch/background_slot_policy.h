@@ -5,11 +5,64 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
 
 #define FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS 2u
 #define FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES (16u * 1024u)
 #define FETCH_BACKGROUND_STREAM_PUBLICATION_MAX (48u * 1024u)
+
+/* Every scheduled response is bounded by its byte reservation. The handoff
+   buffer need not be larger than that reservation (notably a one-byte media
+   range probe), while ordinary schedulers retain the 64 KiB ceiling. */
+static inline size_t fetch_background_scheduler_chunk_capacity(
+    size_t maximum_reserved_bytes)
+{
+    return maximum_reserved_bytes < FETCH_BACKGROUND_STREAM_BUFFER_BYTES
+        ? maximum_reserved_bytes : FETCH_BACKGROUND_STREAM_BUFFER_BYTES;
+}
+
+/* Called only by the Budget-owning thread while its new fixed descriptor is
+   PREPARING. Keep previously admitted slabs if a later allocation fails;
+   release only slabs acquired by this attempt. The fixed array and bound are
+   shared with the host ownership test. */
+static inline FetchBackgroundEnqueueStatus
+fetch_background_fixed_buffers_ensure(
+    Budget *budget, unsigned char *buffers[FETCH_BACKGROUND_ACTIVE_LIMIT],
+    size_t required, size_t *added)
+{
+    if (added != NULL) *added = 0;
+    if (budget == NULL || buffers == NULL || required == 0
+        || required > FETCH_BACKGROUND_ACTIVE_LIMIT) {
+        return FETCH_BACKGROUND_ENQUEUE_SATURATED;
+    }
+    size_t allocated = 0;
+    for (size_t i = 0; i < FETCH_BACKGROUND_ACTIVE_LIMIT; i++)
+        if (buffers[i] != NULL) allocated++;
+    if (allocated >= required) return FETCH_BACKGROUND_ENQUEUE_ADMITTED;
+
+    bool allocated_now[FETCH_BACKGROUND_ACTIVE_LIMIT] = {false};
+    for (size_t i = 0;
+         i < FETCH_BACKGROUND_ACTIVE_LIMIT && allocated < required; i++) {
+        if (buffers[i] != NULL) continue;
+        buffers[i] = budget_malloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE,
+            FETCH_BACKGROUND_MAXIMUM_RESPONSE_BYTES);
+        if (buffers[i] == NULL) {
+            for (size_t j = 0; j < FETCH_BACKGROUND_ACTIVE_LIMIT; j++) {
+                if (!allocated_now[j]) continue;
+                budget_free(budget, buffers[j]);
+                buffers[j] = NULL;
+            }
+            if (added != NULL) *added = 0;
+            return FETCH_BACKGROUND_ENQUEUE_MEMORY;
+        }
+        allocated_now[i] = true;
+        allocated++;
+        if (added != NULL) (*added)++;
+    }
+    return FETCH_BACKGROUND_ENQUEUE_ADMITTED;
+}
 
 /* Setup work and firmware services needed by a socket poll run below the
    browser. Keep at least 4 ms between completed 2 ms checkpoint donations;

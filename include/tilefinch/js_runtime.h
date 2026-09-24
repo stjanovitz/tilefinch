@@ -170,6 +170,7 @@ typedef struct {
     long last_network_status;
     char last_network_url[256];
     size_t last_network_response_bytes;
+    /* FNV-1a of the last response body; zero in TILEFINCH_NO_TRACE builds. */
     unsigned long long last_network_body_hash;
     char last_network_content_type[128];
     char last_network_content_encoding[64];
@@ -1056,6 +1057,12 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
    excludes allocator cache capacity and reflects JS_SetMemoryLimit(). */
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
 /* O(1) monotonic count of actual allocator refusals for this realm. */
+/* In builds with tracing compiled out, advances and input dispatch refresh
+   only what the page loop acts on; ScriptResult's diagnostic counters are
+   refreshed at load boundaries and failures. Call this before reporting
+   them. */
+void script_runtime_refresh_result(ScriptRuntime *runtime,
+                                   ScriptResult *result);
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime);
 /* Result of the most recently completed top-level evaluation slice. This is
    an O(1), allocation-free telemetry read used by admission tuning. */
@@ -1410,15 +1417,6 @@ ScriptModuleMapStatus script_runtime_module_map_status(
 /* External module identity and response base differ after redirects. Keep the
    request URL as the module-map key while resolving its imports and exposing
    import.meta.url from response_url. Classic callers may use the typed API. */
-bool script_runtime_evaluate_external_module(
-    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
-    const char *source, size_t source_length, const char *request_url,
-    const char *response_url, ScriptResult *result);
-bool script_runtime_evaluate_external_module_credentials(
-    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
-    const char *source, size_t source_length, const char *request_url,
-    const char *response_url, TilefinchCredentialsMode credentials,
-    ScriptResult *result);
 /* The response policy is the root module's already-computed effective policy:
    its final response override, when present, otherwise the document policy. */
 bool script_runtime_evaluate_external_module_context(

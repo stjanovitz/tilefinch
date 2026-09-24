@@ -914,6 +914,10 @@ typedef struct LayoutDocument {
     int width;
     int scroll_width;
     int height;
+    /* Nonzero for a provisional layout that covers only the page above this
+       y (the rest follows later): rows below it render as a placeholder,
+       and height keeps the previous page's scroll extent. */
+    int content_limit_y;
     ViewportContext viewport;
     uint32_t page_background;
     /* True when this layout encountered an external image, mask, or
@@ -998,6 +1002,9 @@ typedef struct LayoutDocument {
     size_t cooperative_yields;
     lxb_dom_node_t *max_work_slice_node;
     LayoutPerformance performance;
+    /* Bumped whenever an overflow box's scroll offset changes after the
+       build, so per-frame consumers can skip unchanged scroll state. */
+    uint32_t scroll_generation;
 } LayoutDocument;
 
 bool layout_build(LayoutDocument *layout, Budget *budget,
@@ -1067,6 +1074,10 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache);
    the committed page cache opts in: its DOM mutations are journaled, so the
    invalidation applied to retained computed styles also covers the lists. */
 void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache);
+/* Builds using this cache record their unresolved external visuals in
+   LayoutDocument.visual_priority_targets, as bounded previews do. */
+void layout_reuse_cache_record_unresolved_visuals(LayoutReuseCache *cache,
+                                                  bool record);
 /* A journaled class/id attribute change on `node` whose changed tokens are
    `changed_tokens` (from stylesheet_attribute_change_tokens; NULL keeps the
    conservative subtree path). Retained computed styles are invalidated as
@@ -1151,6 +1162,13 @@ void layout_reuse_cache_invalidate_node_scoped(
    whose focus-state assumptions are no longer valid. */
 void layout_reuse_cache_invalidate_focus(
     LayoutReuseCache *cache, lxb_dom_node_t *node);
+/* The checked state of the given checkboxes/radios changed (attribute and
+   checkedness together). Drops the retained matched-rule lists of those
+   controls and of every element a checked-state rule can select, plus all
+   computed styles and measurements; resets when the sheet has :has() or
+   too many state rules to track. */
+void layout_reuse_cache_invalidate_checked(
+    LayoutReuseCache *cache, lxb_dom_node_t *const *nodes, size_t count);
 /* Computed CSS is independent of decoded image resources. Preserve it when
    provisional layout hands off to an image-complete authoritative pass,
    while invalidating only intrinsic/table measurements whose subtrees gained

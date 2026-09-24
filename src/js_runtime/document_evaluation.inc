@@ -383,26 +383,6 @@ bool script_runtime_finish_loading(ScriptRuntime *runtime,
     if (evaluated) evaluated = js_rt_runtime_refresh(runtime);
     if (!evaluated) capture_cached_error_source(runtime);
     runtime->result.dom_content_loaded_dispatched = evaluated;
-    if (evaluated) {
-        JSValue global = JS_GetGlobalObject(runtime->context);
-        JSValue summary = JS_GetPropertyStr(runtime->context, global,
-                                            "pocSummary");
-        if (!JS_IsUndefined(summary)) {
-            const char *text = JS_ToCString(runtime->context, summary);
-            if (text != NULL) {
-                snprintf(runtime->result.summary,
-                         sizeof(runtime->result.summary), "%s", text);
-                JS_FreeCString(runtime->context, text);
-            }
-        }
-        JS_FreeValue(runtime->context, summary);
-        JSValue submitted = JS_GetPropertyStr(runtime->context, global,
-                                              "__tilefinchSubmitted");
-        runtime->result.form_submission_requested =
-            JS_ToBool(runtime->context, submitted) > 0;
-        JS_FreeValue(runtime->context, submitted);
-        JS_FreeValue(runtime->context, global);
-    }
     runtime->result.success = evaluated;
     js_rt_runtime_update_result(runtime, result);
     return evaluated;

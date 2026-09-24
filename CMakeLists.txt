@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.26 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.27 LANGUAGES C)
 
 # Build directories inside the source tree must be named in CMakePresets.json
 # or in the short allowlist below. Sixty-one ad hoc trees (12 GB) accumulated
@@ -48,7 +48,7 @@ if(NOT TILEFINCH_ALLOW_BUILD_DIR
     endif()
 endif()
 
-set(TILEFINCH_RELEASE_SEQUENCE "26" CACHE STRING
+set(TILEFINCH_RELEASE_SEQUENCE "27" CACHE STRING
     "Monotonic signed release sequence compiled into this build")
 set(TILEFINCH_UPDATE_ROOT_V1 "" CACHE FILEPATH
     "Public binary Tilefinch root-v1 metadata embedded into updater builds")
@@ -90,6 +90,9 @@ configure_file(
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(TILEFINCH_UPDATE_ROOT_HEADER
     "${CMAKE_CURRENT_BINARY_DIR}/generated/tilefinch_update_root_data.h")
+# Generated beside the header and copied only on change: rewriting it on
+# every configure would recompile and relink the core each time.
+set(_tilefinch_update_root_staging "${TILEFINCH_UPDATE_ROOT_HEADER}.new")
 if(TILEFINCH_UPDATE_ROOT_V1)
     if(NOT EXISTS "${TILEFINCH_UPDATE_ROOT_V1}")
         message(FATAL_ERROR
@@ -100,14 +103,14 @@ if(TILEFINCH_UPDATE_ROOT_V1)
     execute_process(
         COMMAND ${CMAKE_COMMAND}
             "-DINPUT=${TILEFINCH_UPDATE_ROOT_V1}"
-            "-DOUTPUT=${TILEFINCH_UPDATE_ROOT_HEADER}"
+            "-DOUTPUT=${_tilefinch_update_root_staging}"
             -DNAME=tilefinch_update_root_v1
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/bin2c.cmake"
         COMMAND_ERROR_IS_FATAL ANY)
     message(STATUS
         "Secure updater: embedded public root ${TILEFINCH_UPDATE_ROOT_V1}")
 else()
-    file(WRITE "${TILEFINCH_UPDATE_ROOT_HEADER}"
+    file(WRITE "${_tilefinch_update_root_staging}"
 "/* No release trust root was configured for this build. */
 #include <stddef.h>
 static const unsigned char tilefinch_update_root_v1[1] = {0};
@@ -116,6 +119,8 @@ static const size_t tilefinch_update_root_v1_length = 0;
     message(STATUS
         "Secure updater: disabled until TILEFINCH_UPDATE_ROOT_V1 is configured")
 endif()
+file(COPY_FILE "${_tilefinch_update_root_staging}"
+    "${TILEFINCH_UPDATE_ROOT_HEADER}" ONLY_IF_DIFFERENT)
 
 
 # The build graph is split by ownership. These modules intentionally share

@@ -102,6 +102,7 @@ endif()
 
 add_library(tilefinch_psp_ui STATIC
     src/psp_ui.c
+    src/psp_ui_action.c
     src/psp_ui_theme.c
     src/psp_ui_menu.c
     src/psp_ui_media_8888.c
@@ -377,6 +378,7 @@ if(PSP)
             src/psp_app/psp_app_captive_portal.c
             src/psp_app/psp_app_input.c
             src/psp_app/psp_app_settings.c
+            src/psp_app/psp_app_storage.c
             src/psp_app/psp_app_network.c
             src/psp_app/psp_app_page.c
             src/psp_app/psp_app_runtime.c
@@ -614,7 +616,7 @@ if(PSP)
                 # growth tripwire, not an I-cache claim. Validation retains
                 # extra room for its boot qualifications and log setup.
                 -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,17408,10752>
-                -DPSP_INTERACTIVE_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,20480,15360>
+                -DPSP_INTERACTIVE_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,19456,14336>
                 -DTILEFINCH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckPspHotSymbolSizes.cmake"
             COMMENT "Checking PSP hot-function instruction-cache ratchets")
@@ -738,8 +740,15 @@ if(PSP)
                 add_dependencies(
                     psp-browser-script tilefinch_voice_model_maps)
             endif()
+            # The model is ~8 MiB; recopying it on every relink cost more
+            # than the link. copy_directory_if_different needs CMake 3.26.
+            if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+                set(_tilefinch_voice_copy copy_directory_if_different)
+            else()
+                set(_tilefinch_voice_copy copy_directory)
+            endif()
             add_custom_command(TARGET psp-browser-script POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                COMMAND ${CMAKE_COMMAND} -E ${_tilefinch_voice_copy}
                     "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/voice-model"
                     $<TARGET_FILE_DIR:psp-browser-script>/voice-model
                 COMMENT "Staging offline voice model beside the browser EBOOT")

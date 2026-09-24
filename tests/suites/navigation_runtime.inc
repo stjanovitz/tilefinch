@@ -941,7 +941,7 @@ static bool test_document_script_refresh_failure_stops_following_scripts(void)
 {
     static const char html[] =
         "<!doctype html><body><script>"
-        "document.body.setAttribute('data-mutated','yes')"
+        "document.body.appendChild(document.createElement('p'))"
         "</script><script>globalThis.pocSummary='SECOND-RAN'</script></body>";
     Budget budget;
     budget_init(&budget, 16 * MIB);

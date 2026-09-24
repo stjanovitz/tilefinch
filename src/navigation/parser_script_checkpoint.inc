@@ -584,6 +584,15 @@ static bool navigation_stream_element_closed(void *opaque,
     }
     size_t name_length = 0;
     const char *name = document_element_name(element, &name_length);
+    /* Elements that never draw do not make a deeper preview worthwhile. */
+    bool renders = name != NULL
+        && !(name_length == 5 && memcmp(name, "style", 5) == 0)
+        && !(name_length == 6 && memcmp(name, "script", 6) == 0)
+        && !(name_length == 4 && memcmp(name, "link", 4) == 0)
+        && !(name_length == 4 && memcmp(name, "meta", 4) == 0)
+        && !(name_length == 8 && memcmp(name, "template", 8) == 0);
+    if (renders && stream->closed_content_count != SIZE_MAX)
+        stream->closed_content_count++;
     if (name != NULL && name_length == 4
         && memcmp(name, "head", 4) == 0) {
         stream->head_closed = true;
@@ -592,7 +601,7 @@ static bool navigation_stream_element_closed(void *opaque,
         if (metadata == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
             return false;
         }
-        stream->preview_checkpoint_checks = 0;
+        preview_policy_reopen_checks(&stream->preview_policy);
         navigation_stream_try_pre_eof_preview(stream);
         return true;
     }
@@ -602,7 +611,7 @@ static bool navigation_stream_element_closed(void *opaque,
            browsers may already have painted after the head and a useful body
            prefix. Keep it as a final pre-EOF opportunity. */
         stream->body_closed = true;
-        stream->preview_checkpoint_checks = 0;
+        preview_policy_reopen_checks(&stream->preview_policy);
         navigation_stream_try_pre_eof_preview(stream);
         return true;
     }
@@ -644,8 +653,7 @@ static bool navigation_stream_element_closed(void *opaque,
            opportunity; after paint, or without a compositor, its
            intermediate sheet is unobservable and may be skipped. */
         && (session->progressive_paint == NULL
-            || stream->pre_eof_preview_painted
-            || stream->pre_eof_preview_attempted)) {
+            || !preview_policy_awaiting_first(&stream->preview_policy))) {
         long element_handle = script_runtime_node_weak_handle(
             stream->runtime, element);
         if (element_handle == 0) {
@@ -815,7 +823,7 @@ static bool navigation_stream_element_closed(void *opaque,
             if (!navigation_stream_has_active_style_speculation(stream)) {
                 navigation_stream_progress_preloads(stream, false);
             }
-            stream->preview_checkpoint_checks = 0;
+            preview_policy_reopen_checks(&stream->preview_policy);
             navigation_stream_try_pre_eof_preview(stream);
         }
         return processed || individual_source_limit
@@ -955,8 +963,8 @@ static bool navigation_stream_element_closed(void *opaque,
        stages. Inline scripts have no network wait and usually execute more
        cheaply than a speculative layout, so painting before them would add
        work and author-visible flashing rather than improve first paint. */
-    if (external && !stream->pre_eof_preview_attempted
-        && !stream->pre_eof_preview_painted) {
+    if (external
+        && preview_policy_awaiting_first(&stream->preview_policy)) {
         lxb_dom_node_t *body = document_body_node(document);
         if (body != NULL && body->first_child != NULL) {
             /* Entering the body insertion mode implicitly closes an omitted
@@ -964,9 +972,11 @@ static bool navigation_stream_element_closed(void *opaque,
                need not special-case malformed-but-common document syntax. */
             stream->head_closed = true;
             session->performance.streaming_preview_pre_script_checks++;
-            stream->preview_checkpoint_checks = 0;
+            preview_policy_reopen_checks(&stream->preview_policy);
             navigation_stream_try_pre_eof_preview(stream);
-            if (stream->pre_eof_preview_painted) {
+            if (!preview_policy_awaiting_first(&stream->preview_policy)
+                && stream->preview_policy.phase
+                       != PREVIEW_PHASE_ABANDONED) {
                 session->performance.streaming_preview_pre_script_paints++;
             }
         }
@@ -1132,7 +1142,7 @@ static bool navigation_stream_element_closed(void *opaque,
            executed in order, and no later token has been consumed. Recheck
            the stylesheet fingerprint because the script itself may have
            changed a style/link element synchronously. */
-        stream->preview_checkpoint_checks = 0;
+        preview_policy_reopen_checks(&stream->preview_policy);
         navigation_stream_try_pre_eof_preview(stream);
     }
     return processed || individual_source_limit

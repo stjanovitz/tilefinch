@@ -117,12 +117,20 @@ int main(void)
         blocker, "https://scoped.example/ad.js",
         "https://publisher.example/", "script", "no-cors"));
 
+    /* $media applies to media fetches, and only to them. */
+    CHECK(content_blocker_would_block(
+        blocker, "https://media.example/clip.mp4",
+        "https://publisher.example/", "video", "no-cors"));
+    CHECK(!content_blocker_would_block(
+        blocker, "https://media.example/poster.jpg",
+        "https://publisher.example/", "image", "no-cors"));
+
     ContentBlockerMetrics metrics;
     CHECK(content_blocker_metrics(blocker, &metrics)
           && metrics.mode == CONTENT_BLOCKER_CUSTOM
-          && metrics.rule_count == 4
+          && metrics.rule_count == 5
           && metrics.allow_rule_count == 1
-          && metrics.ignored_rule_count == 4
+          && metrics.ignored_rule_count == 3
           && metrics.requests_blocked == 3
           && metrics.retained_bytes < 192u * 1024u
           && !metrics.truncated);
@@ -153,14 +161,14 @@ int main(void)
         blocker, CONTENT_BLOCKER_CUSTOM, "/tmp/missing-tilefinch-list"));
     CHECK(content_blocker_metrics(blocker, &metrics)
           && metrics.mode == CONTENT_BLOCKER_CUSTOM
-          && metrics.rule_count == 4);
+          && metrics.rule_count == 5);
     budget_inject_failure_after(&budget, 0);
     CHECK(!content_blocker_configure(
         blocker, CONTENT_BLOCKER_CUSTOM, custom_path));
     budget_clear_failure_injection(&budget);
     CHECK(content_blocker_metrics(blocker, &metrics)
           && metrics.mode == CONTENT_BLOCKER_CUSTOM
-          && metrics.rule_count == 4);
+          && metrics.rule_count == 5);
     CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL));
     CHECK(!content_blocker_should_block(
         blocker, "https://ads.example/banner.js",

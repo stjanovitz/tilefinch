@@ -91,31 +91,7 @@ static PlaybackPacketStatus playback_ensure_packet_capacity(
 
 static uint64_t sample_time_us(const MediaMp4Sample *sample)
 {
-    if (sample->timescale == 0) return UINT64_MAX;
-    /* Web video/audio clocks and ordinary clip timestamps fit this path.
-       Decompose the ratio so Allegrex uses its native 32-bit divider instead
-       of __udivdi3 once per pending sample, without changing floor rounding. */
-    uint32_t scale_remainder =
-        UINT32_C(1000000) % sample->timescale;
-    if (sample->dts <= UINT32_MAX
-        && (uint64_t) (sample->timescale - 1u) * scale_remainder
-               <= UINT32_MAX) {
-        uint32_t value = (uint32_t) sample->dts;
-        uint32_t whole = value / sample->timescale;
-        uint32_t remainder = value % sample->timescale;
-        uint32_t scale_whole = UINT32_C(1000000) / sample->timescale;
-        return (uint64_t) whole * UINT32_C(1000000)
-             + (uint64_t) remainder * scale_whole
-             + (remainder * scale_remainder) / sample->timescale;
-    }
-    uint64_t whole = sample->dts / sample->timescale;
-    uint64_t remainder = sample->dts % sample->timescale;
-    if (whole > UINT64_MAX / UINT64_C(1000000)) return UINT64_MAX;
-    uint64_t base = whole * UINT64_C(1000000);
-    uint64_t fraction =
-        remainder * UINT64_C(1000000) / sample->timescale;
-    return fraction > UINT64_MAX - base
-        ? UINT64_MAX : base + fraction;
+    return media_ticks_to_us(sample->dts, sample->timescale);
 }
 
 /*

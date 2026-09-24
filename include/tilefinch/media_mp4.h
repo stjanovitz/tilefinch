@@ -49,6 +49,33 @@ typedef MediaRangeReadStatus (*MediaRangeReadPoll)(
 typedef bool (*MediaRangeResident)(
     void *opaque, uint64_t offset, size_t length);
 
+/* floor(ticks * 1000000 / timescale), saturating at UINT64_MAX; a zero
+   timescale also yields UINT64_MAX, so callers wanting another sentinel test
+   it first. Values below 2^32 at ordinary clock rates take a 32-bit divide
+   path (Allegrex has no 64-bit divider, and __udivdi3 runs per sample); it
+   rounds identically. */
+static inline uint64_t media_ticks_to_us(uint64_t ticks, uint32_t timescale)
+{
+    if (timescale == 0) return UINT64_MAX;
+    uint32_t scale_remainder = UINT32_C(1000000) % timescale;
+    if (ticks <= UINT32_MAX
+        && (uint64_t) (timescale - 1u) * scale_remainder <= UINT32_MAX) {
+        uint32_t small = (uint32_t) ticks;
+        uint32_t whole = small / timescale;
+        uint32_t remainder = small % timescale;
+        uint32_t scale_whole = UINT32_C(1000000) / timescale;
+        return (uint64_t) whole * UINT32_C(1000000)
+             + (uint64_t) remainder * scale_whole
+             + (remainder * scale_remainder) / timescale;
+    }
+    uint64_t whole = ticks / timescale;
+    uint64_t remainder = ticks % timescale;
+    if (whole > UINT64_MAX / UINT64_C(1000000)) return UINT64_MAX;
+    uint64_t base = whole * UINT64_C(1000000);
+    uint64_t fraction = remainder * UINT64_C(1000000) / timescale;
+    return fraction > UINT64_MAX - base ? UINT64_MAX : base + fraction;
+}
+
 typedef struct {
     void *opaque;
     uint64_t length;
@@ -117,6 +144,8 @@ typedef enum {
 typedef struct {
     size_t track_index;
     MediaMp4TrackKind kind;
+    /* File offset of the sample's bytes. Sources without one (HLS) store
+       an opaque identity here that only their own read path interprets. */
     uint64_t offset;
     uint32_t size;
     uint64_t dts;

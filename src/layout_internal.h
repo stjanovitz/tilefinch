@@ -94,6 +94,9 @@ typedef struct {
 /* Four expensive block/style units bound the interval before native input
    gets another safe point; the frontend still throttles cheap pad polls. */
 #define LAYOUT_WORK_QUOTA 4
+/* Whole-display-list passes (paint order, spatial index) checkpoint after
+   this many items: ~20 ms on the PSP for a long article. */
+#define LAYOUT_BATCH_STRIDE 1024u
 /* Auto-table sizing normally inspects every row before placing the first
    one. The ephemeral first-paint pass needs only a representative bounded
    prefix; the authoritative pass still measures every row. */
@@ -314,11 +317,22 @@ struct LayoutReuseCache {
     uint32_t has_rules[LAYOUT_REUSE_HAS_RULE_LIMIT];
     size_t has_rule_count;
     bool has_rules_bounded;
+    /* Indices of rules whose selectors can observe a checkbox or radio's
+       checked state (:checked, [checked], :default, :indeterminate, and the
+       validity pseudo-classes a required control feeds). A toggle drops only
+       the retained lists those rules can select; bounded-out means reset. */
+#define LAYOUT_REUSE_STATE_RULE_LIMIT 128u
+    uint32_t state_rules[LAYOUT_REUSE_STATE_RULE_LIMIT];
+    size_t state_rule_count;
+    bool state_rules_bounded;
     /* The sibling-:has() table pass already ran for this journal. */
     bool structure_pass_done;
     bool selector_has_focus_within;
     bool selector_focus_has_sibling;
     bool selector_has_structure;
+    /* A complete build records unresolved external visuals (as previews
+       always do) for deferred loading after a provisional commit. */
+    bool record_unresolved_visuals;
     /* Exact matched-rule lists for whole documents; page caches only, so the
        streaming preview cache never retains matches across parser appends. */
     struct StyleRetainedMatches *matches;
@@ -426,10 +440,18 @@ typedef struct {
     size_t safe_point_time_yields;
 #endif
     lxb_dom_node_t *slice_last_node;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Stall attribution: where the current slice began. */
+    lxb_dom_node_t *slice_first_node;
+#endif
     /* Nonzero only for the ephemeral first-paint pass. Work whose normal-flow
        origin reaches this CSS y coordinate can be deferred to the
        authoritative build. */
     int preview_y_limit;
+    bool record_unresolved_visuals;
+    /* Inline elements visited, for time-only checkpoints inside a block's
+       inline content (block layout checkpoints once per block). */
+    size_t inline_visits;
     bool preview_truncated;
     /* A grid container may assign a definite stretched row size without
        mutating the retained computed style. The node key makes this safe
@@ -459,6 +481,13 @@ typedef struct {
     bool declared_video_scanned;
     bool document_bidi_text_present;
     bool document_bidi_markup_present;
+    /* layout_bidi_prepare(): when set, a formatting context needs the bidi
+       pipeline only if it is authored bidi, some element can change
+       direction, or it is an ancestor of RTL text (the sorted set below). */
+    bool bidi_prepared;
+    bool bidi_direction_change_possible;
+    lxb_dom_node_t **bidi_rtl_ancestors;
+    size_t bidi_rtl_ancestor_count;
     bool cancelled;
     LayoutReuseCache *reuse;
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
@@ -858,6 +887,8 @@ LayoutBidiFlow *layout_bidi_flow_create(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, bool *attempted);
 void layout_bidi_flow_destroy(LayoutBidiFlow *flow);
+void layout_bidi_prepare(LayoutContext *context, Budget *budget);
+void layout_bidi_release(LayoutContext *context, Budget *budget);
 void layout_bidi_note_text_command(
     LineState *line, size_t command_index,
     const char *text, size_t length, int logical_advance_fixed,
@@ -970,6 +1001,10 @@ int layout_collapsed_block_top_margin(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style);
 bool layout_cooperate(LayoutContext *context, lxb_dom_node_t *node);
+/* A checkpoint for whole-document preparation walks before flow: yields
+   on the clock alone, without charging layout work units (they size later
+   policy such as optional font publication). False once cancelled. */
+bool layout_cooperate_timed(LayoutContext *context);
 bool layout_insert_commands(LayoutContext *context, size_t index,
                             const DrawCommand *commands, size_t count);
 bool layout_insert_command(LayoutContext *context, size_t index,

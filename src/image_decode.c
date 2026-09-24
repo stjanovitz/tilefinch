@@ -2,6 +2,7 @@
    DOM/resource loader translation unit. They change rarely and are costly to
    compile; ordinary image scheduling edits should not rebuild them. */
 #include <stdatomic.h>
+#include "tilefinch/psp_fpu.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -580,6 +581,7 @@ static void image_decode_worker_execute(ImageDecodeWorker *worker)
 #if defined(__PSP__)
 static int image_decode_worker_main(SceSize argument_size, void *arguments)
 {
+    psp_fpu_mask_exceptions();
     ImageDecodeWorker *worker = NULL;
     if (arguments != NULL && argument_size == sizeof(worker))
         memcpy(&worker, arguments, sizeof(worker));

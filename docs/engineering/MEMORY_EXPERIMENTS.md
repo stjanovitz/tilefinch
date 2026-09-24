@@ -7,6 +7,45 @@ teardown and comparable timing—not just a lower allocation number. Raw respons
 captures, browsing journeys and detailed allocation logs stay outside the public
 repository. Measurements below are optimized 64-bit host results, not PSP costs.
 
+## Fixed media response slabs and one-byte page probes (2026-09-22)
+
+The PSP background transport now retains one 256 KiB fixed-response slab
+after its first admitted fixed request and grows to two only if two fixed
+requests coexist. The earlier first-request allocation of both slabs may have
+guaranteed a second lane without a later `malloc` under fragmentation. No
+recorded device run demonstrated two active fixed requests or measured that
+benefit. Media metadata is normally scheduled sequentially, so restoring the
+upfront 512 KiB reservation without such evidence would consume a material
+part of the measured PSP free-block margin.
+
+The production capacity helper is exercised by a host Budget test: first
+admission owns one slab, injected refusal of the second preserves the first
+and its exact Budget charge, retry succeeds, and partial growth from zero
+rolls back to baseline. The test fails when first admission is changed to
+reserve both slabs. Validation EBOOTs log `tilefinch-fixed-slab` only when a
+slab allocation is needed: required and existing counts, outcome, allocation
+microseconds, Budget charge, total free memory, and largest free block before
+and after. The existing transport summary reports `peak-fixed`. Shipping
+builds contain none of the new timing or free-memory calls.
+
+A one-byte page-media range probe used to allocate a 64 KiB scheduler handoff
+chunk. Its scheduler reserves only one response byte; the handoff allocation
+now follows that bound, while ordinary schedulers keep the 64 KiB ceiling.
+This removes 65,535 requested bytes of transient probe storage. The host
+policy test covers the one-byte and ordinary bounds; the optimized host suite
+and named ordinary/validation PSP targets compile and pass. The change does
+not shrink the separate worker-owned streaming pool.
+
+Physical PSP comparison is still needed. In a validation build, open a page
+video, seek to create later range requests, then exercise a source with
+separate audio and video metadata. Record each `tilefinch-fixed-slab` line,
+the final `peak-fixed`, admission deferrals, and displayed-frame maxima. Check
+the page probe's Budget charge on success, cancellation, and allocation
+refusal, including return to its pre-probe baseline. If
+`peak-fixed` reaches two and second-slab allocation produces a visible stall,
+reserve the second slab at the media-loading boundary and compare again.
+Retain raw device logs outside the public repository.
+
 ## Current reference (2026-09-08)
 
 Baseline `f4650dc8` completes the captured six-script article initialization and

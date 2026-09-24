@@ -11,15 +11,15 @@ an intentional change that should update the baseline.
 Usage:
     test_counter_baselines.py <psp-browser-lab> [--update]
 
-With --update (or TILEFINCH_UPDATE_COUNTER_BASELINES=1) the golden file
-tests/counter-baselines.tsv is rewritten from the current build instead
-of being checked; commit the result alongside the change that moved the
-numbers.
+With --update the golden file tests/counter-baselines.tsv is rewritten
+from the current build instead of being checked; commit the result
+alongside the change that moved the numbers. Only the explicit argument
+does this: an environment variable left in a shell would turn the CTest
+gate into a silent rewrite that always passes.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -121,8 +121,6 @@ def main() -> int:
     update = "--update" in arguments
     if update:
         arguments.remove("--update")
-    if os.environ.get("TILEFINCH_UPDATE_COUNTER_BASELINES") == "1":
-        update = True
     if len(arguments) != 1:
         print(__doc__, file=sys.stderr)
         return 2

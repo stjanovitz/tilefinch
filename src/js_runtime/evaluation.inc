@@ -1253,15 +1253,21 @@ static bool evaluate_scripts(JSContext *context, lxb_dom_node_t *node,
         if (state == NULL || state->identity != scripts[index].identity) {
             continue;
         }
+        const ScriptRuntime *runtime = bridge->host;
+        size_t failures_before = bridge->budget->failure_count;
+        size_t heap_rejections_before = runtime == NULL
+            ? 0 : script_runtime_heap_rejections(runtime);
         if (!evaluate_script_node(context, node, result)) {
             result->scripts_failed++;
             /* An uncaught author exception terminates only that script. Keep
                loading the document, but retain genuinely fatal engine and
-               budget failures as pipeline failures. */
-            if (strstr(result->error, "interrupted") != NULL
-                || strstr(result->error, "out of memory") != NULL
-                || strstr(result->error, "memory limit") != NULL
-                || strstr(result->error, "allocation") != NULL) {
+               budget failures as pipeline failures. Decide from what this
+               script actually hit, never from its (author-controlled) error
+               text: `throw Error("allocation failed")` is an author error. */
+            if (runtime == NULL || runtime->watchdog.interrupted
+                || bridge->budget->failure_count != failures_before
+                || script_runtime_heap_rejections(runtime)
+                       != heap_rejections_before) {
                 complete = false;
                 break;
             }

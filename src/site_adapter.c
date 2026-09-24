@@ -537,13 +537,6 @@ SiteAdapterLoadStatus site_adapter_load_pump(
         : load->definition->pump(load->implementation, quota);
 }
 
-SiteAdapterLoadStatus site_adapter_load_status(const SiteAdapterLoad *load)
-{
-    return load == NULL || load->definition == NULL
-        ? SITE_ADAPTER_LOAD_FAILED
-        : load->definition->status(load->implementation);
-}
-
 void site_adapter_load_cancel(SiteAdapterLoad *load, const char *reason)
 {
     if (load != NULL && load->definition != NULL)

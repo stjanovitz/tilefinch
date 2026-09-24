@@ -12,7 +12,14 @@
 #define HLS_QUEUE_VIDEO_BYTES (512u * 1024u)
 #define HLS_QUEUE_AUDIO_BYTES (64u * 1024u)
 #define HLS_ADTS_PARSE_SLICE_BYTES (4u * 1024u)
-#define HLS_TS_PARSE_SLICE_BYTES 188u
+/* MPEG-TS carries timestamps on a 90 kHz clock in 188-byte packets. */
+#define HLS_CLOCK_HZ 90000u
+#define HLS_TS_PACKET_BYTES 188u
+#define HLS_TS_PARSE_SLICE_BYTES HLS_TS_PACKET_BYTES
+/* Durations assumed when the stream gives none: one 25 fps video frame and
+   one 1024-sample AAC frame at 44.1 kHz. */
+#define HLS_FALLBACK_VIDEO_FRAME_TICKS 3600u
+#define HLS_FALLBACK_AUDIO_FRAME_TICKS 2090u
 #define HLS_PARAMETER_SET_BYTES 4096u
 #define HLS_LIVE_EDGE_SEGMENTS 3u
 #define HLS_LIVE_REFRESH_RUNWAY_SEGMENTS 2u
@@ -67,7 +74,12 @@ typedef struct {
 struct MediaHlsPlaylistStream {
     Budget *budget;
     char playlist_url[4096];
-    unsigned char raw[MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES];
+    /* Retained playlist text, grown on demand up to
+       MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES: a live playlist refreshed every few
+       seconds is usually a few KiB, so a fixed 64 KiB buffer was mostly
+       idle allocation on each refresh. */
+    unsigned char *raw;
+    size_t raw_capacity;
     size_t raw_length;
     char line[HLS_STREAM_LINE_BYTES];
     size_t line_length;
@@ -276,13 +288,9 @@ static bool hls_attribute_is(char *line, const char *name,
         && strncmp(value, expected, length) == 0;
 }
 
-static bool hls_line_u64(const char *line, const char *prefix,
-                         uint64_t *value)
+static bool hls_decimal_u64(const char *at, uint64_t *value)
 {
-    size_t prefix_length = strlen(prefix);
-    if (line == NULL || value == NULL
-        || strncmp(line, prefix, prefix_length) != 0) return false;
-    const char *at = line + prefix_length;
+    if (at == NULL || value == NULL) return false;
     uint64_t result = 0;
     bool any = false;
     while (*at >= '0' && *at <= '9') {
@@ -293,6 +301,91 @@ static bool hls_line_u64(const char *line, const char *prefix,
     }
     if (!any || *at != '\0') return false;
     *value = result;
+    return true;
+}
+
+/* Trims HLS horizontal whitespace (and a CR before the LF) from both ends of
+   line[0..length); returns the new length and advances *line. */
+static size_t hls_trim_line(char **line, size_t length)
+{
+    char *at = *line;
+    while (length != 0
+           && (at[length - 1u] == '\r' || at[length - 1u] == ' '
+               || at[length - 1u] == '\t')) length--;
+    while (length != 0 && (*at == ' ' || *at == '\t')) {
+        at++;
+        length--;
+    }
+    *line = at;
+    return length;
+}
+
+typedef enum {
+    HLS_LINE_URI,
+    HLS_LINE_IGNORED,          /* a comment or a tag this player skips */
+    HLS_LINE_STREAM_INF,
+    HLS_LINE_MEDIA,
+    HLS_LINE_EXTINF,
+    HLS_LINE_MEDIA_SEQUENCE,
+    HLS_LINE_TARGET_DURATION,
+    HLS_LINE_DISCONTINUITY,
+    HLS_LINE_END_LIST,
+    HLS_LINE_UNSUPPORTED       /* error is set */
+} HlsLineKind;
+
+/* Recognizes one trimmed, non-empty playlist line after #EXTM3U, for both
+   the whole-text parser and the incremental live stream. *value points just
+   past a valued tag's colon. Encryption (other than METHOD=NONE), fMP4 maps
+   and byte ranges are refused here so both parsers refuse them alike. */
+static HlsLineKind hls_line_kind(char *line, char **value,
+                                 char *error, size_t error_size)
+{
+    static const struct {
+        const char *prefix;
+        uint8_t length;
+        uint8_t kind;
+    } valued[] = {
+        { "#EXT-X-STREAM-INF:", 18u, HLS_LINE_STREAM_INF },
+        { "#EXT-X-MEDIA:", 13u, HLS_LINE_MEDIA },
+        { "#EXTINF:", 8u, HLS_LINE_EXTINF },
+        { "#EXT-X-MEDIA-SEQUENCE:", 22u, HLS_LINE_MEDIA_SEQUENCE },
+        { "#EXT-X-TARGETDURATION:", 22u, HLS_LINE_TARGET_DURATION }
+    };
+    *value = NULL;
+    if (*line != '#') return HLS_LINE_URI;
+    for (size_t i = 0; i < sizeof(valued) / sizeof(valued[0]); i++) {
+        if (strncmp(line, valued[i].prefix, valued[i].length) == 0) {
+            *value = line + valued[i].length;
+            return (HlsLineKind) valued[i].kind;
+        }
+    }
+    if (strcmp(line, "#EXT-X-DISCONTINUITY") == 0)
+        return HLS_LINE_DISCONTINUITY;
+    if (strcmp(line, "#EXT-X-ENDLIST") == 0) return HLS_LINE_END_LIST;
+    if (strncmp(line, "#EXT-X-KEY:", 11u) == 0
+        && strstr(line + 11u, "METHOD=NONE") == NULL) {
+        hls_error(error, error_size, "encrypted HLS is unsupported");
+        return HLS_LINE_UNSUPPORTED;
+    }
+    if (strncmp(line, "#EXT-X-MAP:", 11u) == 0
+        || strncmp(line, "#EXT-X-BYTERANGE:", 17u) == 0) {
+        hls_error(error, error_size,
+                  "fragmented or byte-range HLS is unsupported");
+        return HLS_LINE_UNSUPPORTED;
+    }
+    return HLS_LINE_IGNORED;
+}
+
+static bool hls_target_duration_ms(const char *value, uint32_t *milliseconds,
+                                   char *error, size_t error_size)
+{
+    uint64_t seconds = 0;
+    if (!hls_decimal_u64(value, &seconds)
+        || seconds == 0 || seconds > UINT32_MAX / 1000u) {
+        hls_error(error, error_size, "invalid HLS target duration");
+        return false;
+    }
+    *milliseconds = (uint32_t) seconds * 1000u;
     return true;
 }
 
@@ -410,12 +503,9 @@ MediaHlsPlaylist *media_hls_playlist_parse(
         char *line = cursor;
         char *newline = memchr(cursor, '\n', (size_t) (end - cursor));
         char *line_end = newline == NULL ? end : newline;
-        while (line_end > line
-               && (line_end[-1] == '\r' || line_end[-1] == ' '
-                   || line_end[-1] == '\t')) line_end--;
-        while (line < line_end && (*line == ' ' || *line == '\t')) line++;
+        size_t line_length = hls_trim_line(&line, (size_t) (line_end - line));
+        line_end = line + line_length;
         if (line_end < end) *line_end = '\0';
-        size_t line_length = (size_t) (line_end - line);
         cursor = newline == NULL ? end : newline + 1u;
         if (line_length == 0) continue;
         if (!header) {
@@ -427,22 +517,25 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             header = true;
             continue;
         }
-        if (strncmp(line, "#EXT-X-STREAM-INF:", 18u) == 0) {
+        char *value = NULL;
+        HlsLineKind kind = hls_line_kind(line, &value, error, error_size);
+        if (kind == HLS_LINE_UNSUPPORTED) {
+            media_hls_playlist_destroy(playlist);
+            return NULL;
+        }
+        if (kind == HLS_LINE_STREAM_INF) {
             pending_variant = true;
             pending_bandwidth = 0;
             (void) hls_attribute_unsigned(
-                line + 18u, "BANDWIDTH", &pending_bandwidth);
-            hls_variant_geometry(
-                line + 18u, &pending_width, &pending_height);
+                value, "BANDWIDTH", &pending_bandwidth);
+            hls_variant_geometry(value, &pending_width, &pending_height);
             /* Store this on the following URI entry, like geometry and
                bandwidth. */
-            pending_codecs_compatible =
-                hls_variant_codecs_compatible(line + 18u);
+            pending_codecs_compatible = hls_variant_codecs_compatible(value);
             char *group = NULL;
             size_t group_length = 0;
             pending_audio_group[0] = '\0';
-            if (hls_attribute_text(
-                    line + 18u, "AUDIO", &group, &group_length)) {
+            if (hls_attribute_text(value, "AUDIO", &group, &group_length)) {
                 if (group_length >= sizeof(pending_audio_group)) {
                     hls_error(error, error_size,
                               "HLS audio group exceeds its bound");
@@ -454,14 +547,12 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             }
             continue;
         }
-        if (strncmp(line, "#EXT-X-MEDIA:", 13u) == 0
-            && hls_attribute_is(line + 13u, "TYPE", "AUDIO")) {
+        if (kind == HLS_LINE_MEDIA
+            && hls_attribute_is(value, "TYPE", "AUDIO")) {
             char *group = NULL, *uri = NULL;
             size_t group_length = 0, uri_length = 0;
-            if (!hls_attribute_text(
-                    line + 13u, "GROUP-ID", &group, &group_length)
-                || !hls_attribute_text(
-                    line + 13u, "URI", &uri, &uri_length)
+            if (!hls_attribute_text(value, "GROUP-ID", &group, &group_length)
+                || !hls_attribute_text(value, "URI", &uri, &uri_length)
                 || group_length >= HLS_MASTER_GROUP_BYTES
                 || uri_length > UINT16_MAX
                 || playlist->entry_count >= MEDIA_HLS_MAXIMUM_SEGMENTS) {
@@ -475,7 +566,7 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             entry->text_offset = (uint32_t) (uri - copy);
             entry->text_length = (uint16_t) uri_length;
             entry->default_rendition =
-                hls_attribute_is(line + 13u, "DEFAULT", "YES");
+                hls_attribute_is(value, "DEFAULT", "YES");
             memcpy(entry->audio_group, group, group_length);
             entry->audio_group[group_length] = '\0';
             /* The URI lives inside this retained mutable line. Terminate it
@@ -484,8 +575,8 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             playlist->kind = MEDIA_HLS_PLAYLIST_MASTER;
             continue;
         }
-        if (strncmp(line, "#EXTINF:", 8u) == 0) {
-            if (!hls_parse_decimal_ms(line + 8u, &pending_duration)) {
+        if (kind == HLS_LINE_EXTINF) {
+            if (!hls_parse_decimal_ms(value, &pending_duration)) {
                 hls_error(error, error_size, "invalid HLS segment duration");
                 media_hls_playlist_destroy(playlist);
                 return NULL;
@@ -493,10 +584,8 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             pending_duration_valid = true;
             continue;
         }
-        if (strncmp(line, "#EXT-X-MEDIA-SEQUENCE:", 22u) == 0) {
-            if (!hls_line_u64(
-                    line, "#EXT-X-MEDIA-SEQUENCE:",
-                    &playlist->media_sequence)) {
+        if (kind == HLS_LINE_MEDIA_SEQUENCE) {
+            if (!hls_decimal_u64(value, &playlist->media_sequence)) {
                 hls_error(error, error_size,
                           "invalid HLS media sequence");
                 media_hls_playlist_destroy(playlist);
@@ -504,41 +593,24 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             }
             continue;
         }
-        if (strncmp(line, "#EXT-X-TARGETDURATION:", 22u) == 0) {
-            uint64_t seconds = 0;
-            if (!hls_line_u64(
-                    line, "#EXT-X-TARGETDURATION:", &seconds)
-                || seconds == 0 || seconds > UINT32_MAX / 1000u) {
-                hls_error(error, error_size,
-                          "invalid HLS target duration");
+        if (kind == HLS_LINE_TARGET_DURATION) {
+            if (!hls_target_duration_ms(
+                    value, &playlist->target_duration_ms,
+                    error, error_size)) {
                 media_hls_playlist_destroy(playlist);
                 return NULL;
             }
-            playlist->target_duration_ms = (uint32_t) seconds * 1000u;
             continue;
         }
-        if (strcmp(line, "#EXT-X-DISCONTINUITY") == 0) {
+        if (kind == HLS_LINE_DISCONTINUITY) {
             pending_discontinuity = true;
             continue;
         }
-        if (strcmp(line, "#EXT-X-ENDLIST") == 0) {
+        if (kind == HLS_LINE_END_LIST) {
             playlist->end_list = true;
             continue;
         }
-        if (strncmp(line, "#EXT-X-KEY:", 11u) == 0
-            && strstr(line + 11u, "METHOD=NONE") == NULL) {
-            hls_error(error, error_size, "encrypted HLS is unsupported");
-            media_hls_playlist_destroy(playlist);
-            return NULL;
-        }
-        if (strncmp(line, "#EXT-X-MAP:", 11u) == 0
-            || strncmp(line, "#EXT-X-BYTERANGE:", 17u) == 0) {
-            hls_error(error, error_size,
-                      "fragmented or byte-range HLS is unsupported");
-            media_hls_playlist_destroy(playlist);
-            return NULL;
-        }
-        if (*line == '#') continue;
+        if (kind != HLS_LINE_URI) continue;
         if (line_length > UINT16_MAX
             || playlist->entry_count >= MEDIA_HLS_MAXIMUM_SEGMENTS) {
             hls_error(error, error_size, "HLS playlist has too many entries");
@@ -748,10 +820,25 @@ static bool hls_stream_append_raw(MediaHlsPlaylistStream *stream,
                                   const char *line, size_t length)
 {
     if (stream->raw_overflow) return true;
-    if (length > sizeof(stream->raw) - stream->raw_length
-        || 1u > sizeof(stream->raw) - stream->raw_length - length) {
+    if (length > MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES - stream->raw_length
+        || 1u > MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES - stream->raw_length
+                - length) {
         stream->raw_overflow = true;
         return true;
+    }
+    size_t needed = stream->raw_length + length + 1u;
+    if (needed > stream->raw_capacity) {
+        size_t capacity = stream->raw_capacity == 0
+            ? 4096u : stream->raw_capacity;
+        while (capacity < needed) capacity *= 2u;
+        if (capacity > MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES)
+            capacity = MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES;
+        unsigned char *grown = budget_realloc_category(
+            stream->budget, BUDGET_CATEGORY_NAVIGATION, stream->raw,
+            capacity);
+        if (grown == NULL) return false;
+        stream->raw = grown;
+        stream->raw_capacity = capacity;
     }
     memcpy(stream->raw + stream->raw_length, line, length);
     stream->raw_length += length;
@@ -763,17 +850,14 @@ static bool hls_stream_process_line(MediaHlsPlaylistStream *stream,
                                     char *error, size_t error_size)
 {
     char *line = stream->line;
-    size_t length = stream->line_length;
-    while (length != 0
-           && (line[length - 1u] == '\r' || line[length - 1u] == ' '
-               || line[length - 1u] == '\t')) length--;
-    while (length != 0 && (*line == ' ' || *line == '\t')) {
-        line++;
-        length--;
-    }
+    size_t length = hls_trim_line(&line, stream->line_length);
     line[length] = '\0';
     if (length == 0) return true;
-    (void) hls_stream_append_raw(stream, line, length);
+    if (!hls_stream_append_raw(stream, line, length)) {
+        hls_error(error, error_size,
+                  "HLS playlist stream exceeds memory budget");
+        return false;
+    }
     if (!stream->saw_header) {
         if (strcmp(line, "#EXTM3U") != 0) {
             hls_error(error, error_size, "HLS playlist lacks EXTM3U");
@@ -782,8 +866,12 @@ static bool hls_stream_process_line(MediaHlsPlaylistStream *stream,
         stream->saw_header = true;
         return true;
     }
-    if (strncmp(line, "#EXT-X-STREAM-INF:", 18u) == 0
-        || strncmp(line, "#EXT-X-MEDIA:", 13u) == 0) {
+    char *value = NULL;
+    HlsLineKind kind = hls_line_kind(line, &value, error, error_size);
+    if (kind == HLS_LINE_UNSUPPORTED) return false;
+    /* Any rendition tag marks a master; masters always reparse from the
+       retained text, where only audio renditions matter. */
+    if (kind == HLS_LINE_STREAM_INF || kind == HLS_LINE_MEDIA) {
         stream->saw_master = true;
         if (stream->raw_overflow) {
             hls_error(error, error_size,
@@ -792,29 +880,21 @@ static bool hls_stream_process_line(MediaHlsPlaylistStream *stream,
         }
         return true;
     }
-    if (strncmp(line, "#EXT-X-MEDIA-SEQUENCE:", 22u) == 0) {
-        uint64_t value = 0;
-        if (!hls_line_u64(line, "#EXT-X-MEDIA-SEQUENCE:", &value)) {
+    if (kind == HLS_LINE_MEDIA_SEQUENCE) {
+        uint64_t sequence = 0;
+        if (!hls_decimal_u64(value, &sequence)) {
             hls_error(error, error_size, "invalid HLS media sequence");
             return false;
         }
-        stream->media_sequence = value;
-        stream->next_sequence = value;
+        stream->media_sequence = sequence;
+        stream->next_sequence = sequence;
         return true;
     }
-    if (strncmp(line, "#EXT-X-TARGETDURATION:", 22u) == 0) {
-        uint64_t seconds = 0;
-        if (!hls_line_u64(line, "#EXT-X-TARGETDURATION:", &seconds)
-            || seconds == 0 || seconds > UINT32_MAX / 1000u) {
-            hls_error(error, error_size, "invalid HLS target duration");
-            return false;
-        }
-        stream->target_duration_ms = (uint32_t) seconds * 1000u;
-        return true;
-    }
-    if (strncmp(line, "#EXTINF:", 8u) == 0) {
-        if (!hls_parse_decimal_ms(line + 8u,
-                                  &stream->pending_duration_ms)) {
+    if (kind == HLS_LINE_TARGET_DURATION)
+        return hls_target_duration_ms(
+            value, &stream->target_duration_ms, error, error_size);
+    if (kind == HLS_LINE_EXTINF) {
+        if (!hls_parse_decimal_ms(value, &stream->pending_duration_ms)) {
             hls_error(error, error_size, "invalid HLS segment duration");
             return false;
         }
@@ -822,26 +902,19 @@ static bool hls_stream_process_line(MediaHlsPlaylistStream *stream,
         stream->saw_media = true;
         return true;
     }
-    if (strcmp(line, "#EXT-X-DISCONTINUITY") == 0) {
+    if (kind == HLS_LINE_DISCONTINUITY) {
         stream->pending_discontinuity = true;
         return true;
     }
-    if (strcmp(line, "#EXT-X-ENDLIST") == 0) {
+    if (kind == HLS_LINE_END_LIST) {
         stream->saw_end_list = true;
         return true;
     }
-    if (strncmp(line, "#EXT-X-KEY:", 11u) == 0
-        && strstr(line + 11u, "METHOD=NONE") == NULL) {
-        hls_error(error, error_size, "encrypted HLS is unsupported");
-        return false;
-    }
-    if (strncmp(line, "#EXT-X-MAP:", 11u) == 0
-        || strncmp(line, "#EXT-X-BYTERANGE:", 17u) == 0) {
-        hls_error(error, error_size,
-                  "fragmented or byte-range HLS is unsupported");
-        return false;
-    }
-    if (*line == '#') return true;
+    if (kind != HLS_LINE_URI) return true;
+    /* Within the retained bound the whole-text parser reparses this and
+       rejects a URI without EXTINF. Past it, an oversized live window is
+       compacted from what was retained here, so such a URI is dropped
+       rather than failing a playlist whose recent tail is well formed. */
     if (!stream->pending_duration) return true;
     size_t slot;
     if (stream->segment_count < MEDIA_HLS_RETAINED_LIVE_SEGMENTS) {
@@ -962,7 +1035,8 @@ MediaHlsPlaylist *media_hls_playlist_stream_finish(
     if (!stream->raw_overflow) {
         return media_hls_playlist_parse(
             stream->budget, stream->playlist_url,
-            stream->raw, stream->raw_length, error, error_size);
+            stream->raw != NULL ? stream->raw : (const unsigned char *) "",
+            stream->raw_length, error, error_size);
     }
     if (stream->saw_master || stream->saw_end_list || !stream->saw_media
         || stream->segment_count == 0) {
@@ -1038,6 +1112,7 @@ void media_hls_playlist_stream_destroy(MediaHlsPlaylistStream *stream)
 {
     if (stream == NULL) return;
     Budget *budget = stream->budget;
+    budget_free(budget, stream->raw);
     memset(stream, 0, sizeof(*stream));
     budget_free(budget, stream);
 }
@@ -1168,7 +1243,7 @@ static bool hls_annexb_info(MediaHlsSource *source,
                 source->video_info = (MediaMp4TrackInfo) {
                     .kind = MEDIA_MP4_TRACK_VIDEO,
                     .codec = MEDIA_MP4_FOURCC('a','v','c','1'),
-                    .timescale = 90000u,
+                    .timescale = HLS_CLOCK_HZ,
                     .largest_sample = SWDEC_TS_MAX_AU,
                     .width = width,
                     .height = height,
@@ -1236,12 +1311,13 @@ static void hls_video_callback(void *opaque, const uint8_t *data,
     if (pts90k == SWDEC_TS_NOPTS) {
         pts90k = source->last_video_pts90k == 0
             ? source->segment_base90k
-            : source->last_video_pts90k + 3600u;
+            : source->last_video_pts90k + HLS_FALLBACK_VIDEO_FRAME_TICKS;
     }
     uint32_t duration = source->last_video_pts90k != 0
         && pts90k > source->last_video_pts90k
         && pts90k - source->last_video_pts90k <= UINT32_MAX
-            ? (uint32_t) (pts90k - source->last_video_pts90k) : 3600u;
+            ? (uint32_t) (pts90k - source->last_video_pts90k)
+            : HLS_FALLBACK_VIDEO_FRAME_TICKS;
     source->last_video_pts90k = pts90k;
     (void) hls_queue_push(
         source, MEDIA_MP4_TRACK_VIDEO, MEDIA_PACKET_FORMAT_H264_ANNEX_B,
@@ -1263,7 +1339,7 @@ static void hls_audio_callback(void *opaque, const uint8_t *data,
         source->audio_info = (MediaMp4TrackInfo) {
             .kind = MEDIA_MP4_TRACK_AUDIO,
             .codec = MEDIA_MP4_FOURCC('m','p','4','a'),
-            .timescale = 90000u,
+            .timescale = HLS_CLOCK_HZ,
             .largest_sample = SWDEC_TS_MAX_ADTS,
             .channels = info.channels,
             .sample_rate = info.sample_rate,
@@ -1271,12 +1347,12 @@ static void hls_audio_callback(void *opaque, const uint8_t *data,
         };
         source->audio_info_valid = true;
         source->audio_duration90k =
-            (uint32_t) info.samples_per_frame * 90000u / info.sample_rate;
+            (uint32_t) info.samples_per_frame * HLS_CLOCK_HZ / info.sample_rate;
     }
     uint32_t duration = source->audio_duration90k != 0
         ? source->audio_duration90k : valid_info
-        ? (uint32_t) info.samples_per_frame * 90000u / info.sample_rate
-        : 2090u;
+        ? (uint32_t) info.samples_per_frame * HLS_CLOCK_HZ / info.sample_rate
+        : HLS_FALLBACK_AUDIO_FRAME_TICKS;
     if (!source->segment_origin_valid && pts90k != SWDEC_TS_NOPTS) {
         source->segment_origin_valid = true;
         source->segment_origin90k = pts90k;
@@ -1639,7 +1715,7 @@ MediaHlsSource *media_hls_source_create_track(
     unsigned char *queue = budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, queue_capacity);
     size_t transport_tail_capacity = selection == MEDIA_HLS_TRACK_AUDIO
-        ? SWDEC_TS_MAX_ADTS : 188u;
+        ? SWDEC_TS_MAX_ADTS : HLS_TS_PACKET_BYTES;
     unsigned char *chunk = budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE,
         MEDIA_HLS_TRANSPORT_CHUNK_BYTES + transport_tail_capacity);
@@ -1763,6 +1839,7 @@ bool media_hls_source_update_playlist(
     source->stats.playlist_refreshes++;
     media_hls_playlist_destroy(source->pending_playlist);
     source->pending_playlist = replacement;
+    /* Reload after half the target duration (ms -> us, halved). */
     uint64_t delay = (uint64_t) replacement->target_duration_ms * 500u;
     if (delay < HLS_LIVE_REFRESH_MINIMUM_US)
         delay = HLS_LIVE_REFRESH_MINIMUM_US;
@@ -1794,6 +1871,15 @@ static size_t hls_track_count(const void *opaque)
         + (source->audio_info_valid ? 1u : 0u);
 }
 
+/* A VOD playlist's length on the 90 kHz track clock; live has none. */
+static uint64_t hls_track_duration(const MediaHlsSource *source)
+{
+    if (source->live_session) return 0;
+    uint64_t us = source->playlist->duration_us;
+    return (us / 1000000u) * HLS_CLOCK_HZ
+        + (us % 1000000u) * HLS_CLOCK_HZ / 1000000u;
+}
+
 static bool hls_track_info(const void *opaque, size_t index,
                            MediaMp4TrackInfo *info)
 {
@@ -1802,19 +1888,13 @@ static bool hls_track_info(const void *opaque, size_t index,
     bool audio_first = source->track_selection == MEDIA_HLS_TRACK_AUDIO;
     if (index == 0 && !audio_first && source->video_info_valid) {
         *info = source->video_info;
-        info->duration = source->live_session ? 0
-            : (source->playlist->duration_us / 1000000u) * 90000u
-            + ((source->playlist->duration_us % 1000000u) * 90000u)
-                / 1000000u;
+        info->duration = hls_track_duration(source);
         return true;
     }
     if (((index == 1 && !audio_first) || (index == 0 && audio_first))
         && source->audio_info_valid) {
         *info = source->audio_info;
-        info->duration = source->live_session ? 0
-            : (source->playlist->duration_us / 1000000u) * 90000u
-            + ((source->playlist->duration_us % 1000000u) * 90000u)
-                / 1000000u;
+        info->duration = hls_track_duration(source);
         return true;
     }
     return false;
@@ -1832,12 +1912,14 @@ static bool hls_next_sample(void *opaque, MediaMp4Sample *sample)
         .track_index = queued->kind == MEDIA_MP4_TRACK_AUDIO
             && source->track_selection == MEDIA_HLS_TRACK_MIXED ? 1u : 0u,
         .kind = queued->kind,
+        /* HLS samples have no file offset; offset carries the queue
+           identity that hls_sample_resident checks. */
         .offset = queued->identity,
         .size = queued->payload_length,
         .dts = dts,
         .pts = dts > INT64_MAX ? INT64_MAX : (int64_t) dts,
         .duration = queued->duration90k,
-        .timescale = 90000u,
+        .timescale = HLS_CLOCK_HZ,
         .keyframe = queued->keyframe,
         .packet_format = queued->packet_format
     };

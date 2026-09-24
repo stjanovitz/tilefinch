@@ -161,19 +161,7 @@ static uint64_t swdec_sample_time_us(const MediaMp4Sample *sample)
     if (sample == NULL || sample->timescale == 0) return 0;
     uint64_t value = sample->pts >= 0
         ? (uint64_t) sample->pts : sample->dts;
-    if (sample->timescale == 90000u && value <= UINT32_MAX) {
-        uint32_t ticks = (uint32_t) value;
-        uint32_t seconds = ticks / 90000u;
-        uint32_t remainder = ticks % 90000u;
-        return (uint64_t) seconds * UINT64_C(1000000)
-            + (uint32_t) (remainder * 100u / 9u);
-    }
-    uint64_t whole = value / sample->timescale;
-    uint64_t remainder = value % sample->timescale;
-    if (whole > UINT64_MAX / UINT64_C(1000000)) return UINT64_MAX;
-    uint64_t base = whole * UINT64_C(1000000);
-    uint64_t fraction = remainder * UINT64_C(1000000) / sample->timescale;
-    return fraction > UINT64_MAX - base ? UINT64_MAX : base + fraction;
+    return media_ticks_to_us(value, sample->timescale);
 }
 
 static uint64_t swdec_sample_duration_us(const MediaMp4Sample *sample)

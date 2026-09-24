@@ -23,6 +23,7 @@
 #include "tilefinch/psp_input_script.h"
 #include "tilefinch/psp_ui.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -328,6 +329,10 @@ static bool test_names(void)
     CHECK(strcmp(psp_input_script_action_name(
                      PSP_UI_ACTION_TOGGLE_BASIC),
                  "toggle-basic") == 0);
+    CHECK(strcmp(psp_ui_action_name(PSP_UI_ACTION_NONE), "none") == 0
+          && strcmp(psp_ui_action_name((PspUiAction) -1), "unknown") == 0
+          && strcmp(psp_input_script_action_name((PspUiAction) -1),
+                    "unknown") == 0);
     CHECK(strcmp(psp_input_script_setting_name(
                      PSP_UI_SETTING_PAGE_FONT_PERCENT),
                  "page-font-percent") == 0);
@@ -338,6 +343,45 @@ static bool test_names(void)
                  "option-items") == 0);
     CHECK(strcmp(psp_input_script_button_name(PSP_UI_BUTTON_MENU),
                  "select") == 0);
+    return true;
+}
+
+static bool ends_with(const char *text, const char *suffix)
+{
+    size_t length = strlen(text), suffix_length = strlen(suffix);
+    return length >= suffix_length
+        && strcmp(text + length - suffix_length, suffix) == 0;
+}
+
+/* Every checked-in scenario must load without a warning, not only the few
+   with dedicated tests: a renamed step or an over-long script otherwise
+   surfaces only when someone next runs it on a device. Goldens and traces
+   are outputs, not scenarios. */
+static bool test_every_scenario_loads(const char *directory)
+{
+    DIR *listing = opendir(directory);
+    CHECK(listing != NULL);
+    size_t loaded = 0;
+    bool ok = true;
+    struct dirent *entry;
+    while ((entry = readdir(listing)) != NULL) {
+        const char *name = entry->d_name;
+        if (!ends_with(name, ".txt") || ends_with(name, ".device-golden.txt")
+            || ends_with(name, ".host-trace.txt")) continue;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", directory, name);
+        static PspInputScript script;
+        warning_count = 0;
+        if (!psp_input_script_load(&script, path, record_warning, NULL)
+            || warning_count != 0 || script.step_count == 0) {
+            fprintf(stderr, "FAIL scenario %s: warnings=%zu last=%s\n",
+                    name, warning_count, last_warning);
+            ok = false;
+        }
+        loaded++;
+    }
+    (void) closedir(listing);
+    CHECK(ok && loaded >= 30u);
     return true;
 }
 
@@ -610,6 +654,7 @@ int main(int argc, char **argv)
 
     if (!test_parser() || !test_file_capacity_boundary()
         || !test_stepper() || !test_names() || !test_modal_exhaustion()
+        || !test_every_scenario_loads(directory)
         || !test_live_media_scenario(directory)
         || !test_treadline_long_soak_scenario(directory)
         || !test_treadline_offline_controls_scenario(directory)) return 1;

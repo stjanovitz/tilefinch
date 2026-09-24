@@ -9,6 +9,7 @@
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/gamepad.h"
 #include "tilefinch/omnibox.h"
+#include "tilefinch/site_storage.h"
 
 #define BROWSER_PROFILE_BOOKMARK_LIMIT 32
 #define BROWSER_PROFILE_HISTORY_LIMIT 100
@@ -16,6 +17,7 @@
 #define BROWSER_PROFILE_READER_SITE_LIMIT 16
 #define BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT 16
 #define BROWSER_PROFILE_SECURITY_SITE_LIMIT 16
+#define BROWSER_PROFILE_STORAGE_SITE_LIMIT 16
 #define BROWSER_PROFILE_SUGGESTION_LIMIT 4
 #define BROWSER_PROFILE_URL_LIMIT 1024
 #define BROWSER_PROFILE_TITLE_LIMIT 128
@@ -248,6 +250,15 @@ bool browser_profile_site_javascript_enabled(
 bool browser_profile_javascript_allowed_for_url(
     const BrowserProfile *profile, const char *url);
 bool browser_profile_site_data_allowed(const BrowserProfile *profile);
+/* Offer the Memory Stick when a site's storage outgrows RAM (default on). */
+bool browser_profile_site_storage_offers(const BrowserProfile *profile);
+/* Standing per-origin storage choices; ASK is the default and not stored. */
+BrowserSiteStoragePolicy browser_profile_site_storage_policy(
+    const BrowserProfile *profile, const char *url);
+size_t browser_profile_site_storage_count(const BrowserProfile *profile);
+bool browser_profile_site_storage_entry(
+    const BrowserProfile *profile, size_t index, const char **origin,
+    BrowserSiteStoragePolicy *policy);
 bool browser_profile_third_party_cookie_site_allowed(
     const BrowserProfile *profile, const char *url);
 /* Cookie notices are hidden by default. A bounded per-site exception lets a
@@ -371,6 +382,12 @@ bool browser_profile_set_site_javascript_enabled(
    permission, and is preserved while the site's automatic-Reader bit clears. */
 bool browser_profile_reset_site_permissions(
     BrowserProfile *profile, const char *url);
+void browser_profile_set_site_storage_offers(BrowserProfile *profile,
+                                            bool enabled);
+/* False when the table is full (or the origin is too long to keep). */
+bool browser_profile_set_site_storage_policy(
+    BrowserProfile *profile, const char *url,
+    BrowserSiteStoragePolicy policy);
 void browser_profile_set_site_data_allowed(
     BrowserProfile *profile, bool allowed);
 bool browser_profile_set_third_party_cookie_site_allowed(

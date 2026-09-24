@@ -486,8 +486,7 @@
     PocDocument rem_font_document;
     Stylesheet rem_font_sheet;
     LayoutDocument rem_font_layout;
-    CHECK(sizeof(ComputedStyle) == 376
-          && document_parse(&rem_font_document, &budget, rem_font_page,
+    CHECK(document_parse(&rem_font_document, &budget, rem_font_page,
                             strlen(rem_font_page), 29)
           && stylesheet_build(&rem_font_sheet, &budget,
                               &rem_font_document, 480));

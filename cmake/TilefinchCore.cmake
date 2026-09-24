@@ -4,6 +4,7 @@ set(TILEFINCH_CORE_SOURCES
     src/browser_tabs.c
     src/budget.c
     src/frame_pumps.c
+    src/preview_policy.c
     src/tilefinch_test_faults.c
     src/captive_portal.c
     src/content_blocker.c
@@ -86,6 +87,7 @@ set(TILEFINCH_CORE_SOURCES
     src/script_loader.c
     src/session.c
     src/session_persistence.c
+    src/session_site_storage.c
     src/site_adapter.c
     src/style.c
     src/style_match.c

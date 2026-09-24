@@ -13,11 +13,11 @@ static void js_rt_runtime_finish_slice_state(ScriptRuntime *runtime)
         : (unsigned long) (watchdog_now - runtime->watchdog.started_ms);
 }
 
-void js_rt_runtime_update_result(ScriptRuntime *runtime,
-                                 ScriptResult *result)
+/* What the page loop acts on: the form submission request, uncaught
+   callback errors (which become the page error), and the lab summary. Cheap
+   enough for every frame: a handful of global lookups. */
+static void js_rt_runtime_update_core(ScriptRuntime *runtime, JSValue global)
 {
-    js_rt_runtime_finish_slice_state(runtime);
-    JSValue global = JS_GetGlobalObject(runtime->context);
     JSValue summary = JS_GetPropertyStr(runtime->context, global,
                                         "pocSummary");
     if (!JS_IsUndefined(summary)) {
@@ -34,6 +34,66 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
     runtime->result.form_submission_requested =
         JS_ToBool(runtime->context, submitted) > 0;
     JS_FreeValue(runtime->context, submitted);
+    JSValue uncaught = JS_GetPropertyStr(runtime->context, global,
+                                         "__tilefinchUncaughtErrors");
+    JSValue uncaught_length = JS_GetPropertyStr(runtime->context, uncaught,
+                                                "length");
+    int64_t uncaught_count = 0;
+    (void)JS_ToInt64(runtime->context, &uncaught_count, uncaught_length);
+    int64_t reported_count = 0;
+    JSValue reports = JS_GetPropertyStr(runtime->context, global,
+                                        "__tilefinchUncaughtErrorCount");
+    if (JS_ToInt64(runtime->context, &reported_count, reports) != 0)
+        reported_count = 0;
+    JS_FreeValue(runtime->context, reports);
+    if (reported_count < uncaught_count) reported_count = uncaught_count;
+    if (reported_count > 0) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        bool newly_uncaught = (size_t) reported_count
+            != runtime->result.uncaught_callback_errors;
+#endif
+        runtime->result.uncaught_callback_errors = (size_t) reported_count;
+        JSValue last = uncaught_count > 0 ? JS_GetPropertyUint32(
+            runtime->context, uncaught, (uint32_t) (uncaught_count - 1)) : JS_UNDEFINED;
+        const char *text = uncaught_count > 0 ? JS_ToCString(runtime->context, last) : NULL;
+        if (text != NULL) {
+            snprintf(runtime->result.last_uncaught_callback_error,
+                     sizeof(runtime->result.last_uncaught_callback_error),
+                     "%s", text);
+            if (runtime->result.error[0] == '\0') {
+                snprintf(runtime->result.error,
+                         sizeof(runtime->result.error), "%s", text);
+            }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (newly_uncaught) {
+                char diagnostic[768];
+                snprintf(diagnostic, sizeof(diagnostic),
+                    "tilefinch-script-callback-error: count=%lld "
+                    "heap-remaining=%zu heap-rejections=%zu error=\"%.600s\"",
+                    (long long) uncaught_count,
+                    script_runtime_heap_remaining(runtime),
+                    script_runtime_heap_rejections(runtime), text);
+                tilefinch_platform_log_message(diagnostic);
+            }
+#endif
+            JS_FreeCString(runtime->context, text);
+        } else if (runtime->result.error[0] == '\0') {
+            snprintf(runtime->result.error, sizeof(runtime->result.error),
+                "callback exception (details unavailable)");
+        }
+        JS_FreeValue(runtime->context, last);
+    }
+    JS_FreeValue(runtime->context, uncaught_length);
+    JS_FreeValue(runtime->context, uncaught);
+}
+
+/* Diagnostic counters read by labs, validation reports and traces: dozens
+   of global lookups and string copies. Builds without tracing do not refresh
+   them per frame; they are refreshed at load boundaries, on failures, and
+   by script_runtime_refresh_result(). */
+static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
+                                           JSValue global)
+{
     JSValue xhr_calls = JS_GetPropertyStr(runtime->context, global,
                                           "__tilefinchXHRSendCalls");
     int64_t xhr_call_count = 0;
@@ -116,57 +176,6 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
         }
     }
     JS_FreeValue(runtime->context, reject_stack);
-    JSValue uncaught = JS_GetPropertyStr(runtime->context, global,
-                                         "__tilefinchUncaughtErrors");
-    JSValue uncaught_length = JS_GetPropertyStr(runtime->context, uncaught,
-                                                "length");
-    int64_t uncaught_count = 0;
-    (void)JS_ToInt64(runtime->context, &uncaught_count, uncaught_length);
-    int64_t reported_count = 0;
-    JSValue reports = JS_GetPropertyStr(runtime->context, global,
-                                        "__tilefinchUncaughtErrorCount");
-    if (JS_ToInt64(runtime->context, &reported_count, reports) != 0)
-        reported_count = 0;
-    JS_FreeValue(runtime->context, reports);
-    if (reported_count < uncaught_count) reported_count = uncaught_count;
-    if (reported_count > 0) {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        bool newly_uncaught = (size_t) reported_count
-            != runtime->result.uncaught_callback_errors;
-#endif
-        runtime->result.uncaught_callback_errors = (size_t) reported_count;
-        JSValue last = uncaught_count > 0 ? JS_GetPropertyUint32(
-            runtime->context, uncaught, (uint32_t) (uncaught_count - 1)) : JS_UNDEFINED;
-        const char *text = uncaught_count > 0 ? JS_ToCString(runtime->context, last) : NULL;
-        if (text != NULL) {
-            snprintf(runtime->result.last_uncaught_callback_error,
-                     sizeof(runtime->result.last_uncaught_callback_error),
-                     "%s", text);
-            if (runtime->result.error[0] == '\0') {
-                snprintf(runtime->result.error,
-                         sizeof(runtime->result.error), "%s", text);
-            }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-            if (newly_uncaught) {
-                char diagnostic[768];
-                snprintf(diagnostic, sizeof(diagnostic),
-                    "tilefinch-script-callback-error: count=%lld "
-                    "heap-remaining=%zu heap-rejections=%zu error=\"%.600s\"",
-                    (long long) uncaught_count,
-                    script_runtime_heap_remaining(runtime),
-                    script_runtime_heap_rejections(runtime), text);
-                tilefinch_platform_log_message(diagnostic);
-            }
-#endif
-            JS_FreeCString(runtime->context, text);
-        } else if (runtime->result.error[0] == '\0') {
-            snprintf(runtime->result.error, sizeof(runtime->result.error),
-                "callback exception (details unavailable)");
-        }
-        JS_FreeValue(runtime->context, last);
-    }
-    JS_FreeValue(runtime->context, uncaught_length);
-    JS_FreeValue(runtime->context, uncaught);
     JSValue uncaught_task = JS_GetPropertyStr(
         runtime->context, global, "__tilefinchLastUncaughtTask");
     if (!JS_IsUndefined(uncaught_task)) {
@@ -329,8 +338,39 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
     }
 #undef READ_ROOT
     JS_FreeValue(runtime->context, roots);
+}
+
+void js_rt_runtime_update_result(ScriptRuntime *runtime,
+                                 ScriptResult *result)
+{
+    js_rt_runtime_finish_slice_state(runtime);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    js_rt_runtime_update_core(runtime, global);
+    js_rt_runtime_update_telemetry(runtime, global);
     JS_FreeValue(runtime->context, global);
     if (result != NULL) *result = runtime->result;
+}
+
+void js_rt_runtime_update_frame_result(ScriptRuntime *runtime,
+                                       ScriptResult *result)
+{
+    js_rt_runtime_finish_slice_state(runtime);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    js_rt_runtime_update_core(runtime, global);
+#ifndef TILEFINCH_NO_TRACE
+    /* Hosts, labs and tests read the counters after any advance. Builds
+       with tracing compiled out (the PSP) read them only in reports, which
+       call script_runtime_refresh_result() first. */
+    js_rt_runtime_update_telemetry(runtime, global);
+#endif
+    JS_FreeValue(runtime->context, global);
+    if (result != NULL) *result = runtime->result;
+}
+
+void script_runtime_refresh_result(ScriptRuntime *runtime,
+                                   ScriptResult *result)
+{
+    if (runtime != NULL) js_rt_runtime_update_result(runtime, result);
 }
 
 void script_runtime_telemetry(const ScriptRuntime *runtime,

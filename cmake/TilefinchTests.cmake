@@ -252,6 +252,17 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;security"
         TIMEOUT 30)
 
+    # Per-site storage: RAM allowances and growth, the Memory Stick offer,
+    # both stick tiers across a reboot, torn logs and compaction.
+    tilefinch_add_test_binary(tilefinch-session-site-storage-tests
+        tests/test_session_site_storage.c)
+    target_link_libraries(tilefinch-session-site-storage-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-session-site-storage-tests
+        COMMAND tilefinch-session-site-storage-tests)
+    set_tests_properties(tilefinch-session-site-storage-tests PROPERTIES
+        LABELS "tilefinch;unit;storage"
+        TIMEOUT 30)
     tilefinch_add_test_binary(tilefinch-session-security-tests
         tests/test_session_security.c)
     target_link_libraries(tilefinch-session-security-tests PRIVATE tilefinch_core)
@@ -929,6 +940,8 @@ if(PSP_BROWSER_BUILD_TESTS)
     target_include_directories(tilefinch-fetch-background-ownership-tests
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(tilefinch-fetch-background-ownership-tests
+        PRIVATE tilefinch_core)
     add_test(NAME tilefinch-fetch-background-ownership-tests
         COMMAND tilefinch-fetch-background-ownership-tests)
     set_tests_properties(tilefinch-fetch-background-ownership-tests PROPERTIES
@@ -982,6 +995,55 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-frame-pumps-tests PROPERTIES
         LABELS "tilefinch;unit;psp;state"
         TIMEOUT 60)
+
+    # The background update check's state machine is pure data shared with
+    # the PSP frontend; its eligibility and sign-in pause rules live here.
+    tilefinch_add_test_binary(tilefinch-psp-update-check-tests
+        tests/test_psp_update_check.c)
+    target_link_libraries(tilefinch-psp-update-check-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-update-check-tests
+        COMMAND tilefinch-psp-update-check-tests)
+    set_tests_properties(tilefinch-psp-update-check-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 10)
+
+    # When a streaming load preview is (re)built and how deep: the pure
+    # state machine behind navigation's pre-EOF previews.
+    tilefinch_add_test_binary(tilefinch-preview-policy-tests
+        tests/test_preview_policy.c)
+    target_link_libraries(tilefinch-preview-policy-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-preview-policy-tests
+        COMMAND tilefinch-preview-policy-tests)
+    set_tests_properties(tilefinch-preview-policy-tests PROPERTIES
+        LABELS "tilefinch;unit;state"
+        TIMEOUT 10)
+
+    # Where a button press goes while the PSP input supervisor owns input
+    # (loading page, page service, media); pure routing behind the
+    # supervisor tick.
+    tilefinch_add_test_binary(tilefinch-psp-input-route-tests
+        tests/test_psp_input_route.c)
+    target_link_libraries(tilefinch-psp-input-route-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-input-route-tests
+        COMMAND tilefinch-psp-input-route-tests)
+    set_tests_properties(tilefinch-psp-input-route-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 10)
+
+    # Load-time reach and scroll responsiveness, reported by validation
+    # builds; pure data shared with the PSP frontend.
+    tilefinch_add_test_binary(tilefinch-psp-load-experience-tests
+        tests/test_psp_load_experience.c)
+    target_link_libraries(tilefinch-psp-load-experience-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-load-experience-tests
+        COMMAND tilefinch-psp-load-experience-tests)
+    set_tests_properties(tilefinch-psp-load-experience-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 10)
 
     # The emulator scenario that exercises the restore pumps boots from a
     # checked-in Memory Stick seed. Loading it here with the shipping readers
@@ -1263,6 +1325,13 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(pressure-profile-tests PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         TIMEOUT 30)
+
+    # Lab scenarios: the lab binaries driven by a fixture (and usually a
+    # command file), judged by their output. Their PASS/FAIL expression lists
+    # are spelled out per test because regex lists do not survive being
+    # forwarded through a CMake function; the shared label is applied once,
+    # below, to every test registered between these two snapshots.
+    get_property(_tilefinch_tests_before_lab DIRECTORY PROPERTY TESTS)
 
     add_test(NAME reader-profile-default-none
         COMMAND psp-browser-lab
@@ -1881,6 +1950,11 @@ if(PSP_BROWSER_BUILD_TESTS)
         PASS_REGULAR_EXPRESSION "experimental-node id=\"beta-result\" text=\"110\""
         FAIL_REGULAR_EXPRESSION "interactive failure"
         TIMEOUT 30)
+
+    get_property(_tilefinch_lab_scenarios DIRECTORY PROPERTY TESTS)
+    list(REMOVE_ITEM _tilefinch_lab_scenarios ${_tilefinch_tests_before_lab})
+    set_tests_properties(${_tilefinch_lab_scenarios} PROPERTIES
+        LABELS "tilefinch;lab;scenario")
 
     if(PSP_BROWSER_QUICKJS_NATIVE_TRACE)
         tilefinch_add_test_binary(native-trace-tests

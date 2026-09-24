@@ -3,9 +3,16 @@
 #include "tilefinch/content_blocker.h"
 #include "psp_ui_theme.h"
 
+static void menu_disarm_exit(PspUiState *ui)
+{
+    if (ui->data_clear_confirmation == UI_MENU_EXIT_CONFIRMATION)
+        ui->data_clear_confirmation = 0u;
+}
+
 static void menu_open_overlay(PspUiState *ui, PspUiScreen screen)
 {
     if (ui == NULL) return;
+    menu_disarm_exit(ui);
     ui->screen = screen;
     ui->overlay_animation_frames = PSP_THEME_MOTION_PANEL_FRAMES;
     ui->overlay_motion = 0u;
@@ -26,7 +33,9 @@ static void menu_open_parent(PspUiState *ui, PspUiScreen screen)
 
 static void menu_close(PspUiState *ui)
 {
-    if (ui != NULL) ui->screen = (PspUiScreen) ui->base_screen;
+    if (ui == NULL) return;
+    menu_disarm_exit(ui);
+    ui->screen = (PspUiScreen) ui->base_screen;
 }
 
 bool psp_ui_update_priority(PspUiState *ui, const PspUiInput *input)
@@ -102,6 +111,7 @@ void psp_ui_adopt_priority(PspUiState *ui, const PspUiState *snapshot,
         && ui->chrome_visible == original_chrome_visible)
         ui->chrome_visible = snapshot->chrome_visible;
     ui->menu_selection = snapshot->menu_selection;
+    ui->data_clear_confirmation = snapshot->data_clear_confirmation;
     ui->options_selection = snapshot->options_selection;
     ui->options_group_selection = snapshot->options_group_selection;
     ui->tab_selection = snapshot->tab_selection;
@@ -145,6 +155,8 @@ static bool menu_handle_escape(
         || psp_ui_screen_is_native_surface(ui->screen)) {
         menu_open_overlay(ui, PSP_UI_SCREEN_MENU);
     } else {
+        bool storage_from_site_info = ui->site_storage_from_site_info;
+        ui->site_storage_from_site_info = 0u;
         if (ui->screen == PSP_UI_SCREEN_DIAGNOSTIC_QR)
             intent->action = PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR;
         else if (ui->screen == PSP_UI_SCREEN_FAILURE_RECOVERY)
@@ -155,6 +167,8 @@ static bool menu_handle_escape(
             intent->update_versions_closed = true;
         else if (ui->screen == PSP_UI_SCREEN_THEME_OPTIONS)
             intent->theme_catalog_closed = true;
+        else if (ui->screen == PSP_UI_SCREEN_STORAGE_OFFER)
+            intent->action = PSP_UI_ACTION_STORAGE_OFFER_DECLINE;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
             psp_ui_clear_find(ui);
             intent->action = PSP_UI_ACTION_FIND_CLOSE;
@@ -162,7 +176,10 @@ static bool menu_handle_escape(
         if (ui->screen == PSP_UI_SCREEN_PAGE_TOOLS
             || ui->screen == PSP_UI_SCREEN_SITE_CONTROLS
             || ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION
-            || ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW)
+            || ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW
+            || ((ui->screen == PSP_UI_SCREEN_DATA_OPTIONS
+                 || ui->screen == PSP_UI_SCREEN_STORAGE_SITE)
+                && storage_from_site_info))
             ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         else if (ui->screen == PSP_UI_SCREEN_HELP
                  || ui->screen == PSP_UI_SCREEN_HELP_DETAIL
@@ -175,7 +192,8 @@ static bool menu_handle_escape(
                  || ui->screen == PSP_UI_SCREEN_GLYPH_OPTIONS
                  || ui->screen == PSP_UI_SCREEN_UPDATE
                  || ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS
-                 || ui->screen == PSP_UI_SCREEN_DATA_OPTIONS)
+                 || ui->screen == PSP_UI_SCREEN_DATA_OPTIONS
+                 || ui->screen == PSP_UI_SCREEN_STORAGE_SITE)
             ui->menu_selection = UI_MENU_ROW_SETTINGS;
         else if (ui->screen == PSP_UI_SCREEN_TABS)
             ui->menu_selection = UI_MENU_ROW_TABS;
@@ -225,6 +243,10 @@ static void menu_update_site_controls(
                     intent->setting.id = PSP_UI_SETTING_SITE_JAVASCRIPT;
                     intent->setting.value.boolean =
                         ui->site_javascript_enabled;
+                } else {
+                    psp_ui_show_status(
+                        ui, "JAVASCRIPT IS OFF FOR ALL SITES\n"
+                            "SETTINGS > BROWSING & INPUT", 240);
                 }
                 break;
             case 1:
@@ -236,6 +258,13 @@ static void menu_update_site_controls(
                         PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED;
                     intent->setting.value.boolean =
                         ui->content_blocker_site_allowed;
+                } else if (ui->content_blocker_mode == CONTENT_BLOCKER_OFF) {
+                    psp_ui_show_status(
+                        ui, "CONTENT BLOCKER IS OFF\n"
+                            "SETTINGS > PRIVACY & SECURITY", 240);
+                } else {
+                    psp_ui_show_status(ui, "NOT AVAILABLE ON THIS PAGE",
+                                       180);
                 }
                 break;
             case 2:
@@ -245,6 +274,9 @@ static void menu_update_site_controls(
                         PSP_UI_SETTING_COOKIE_BANNER_HIDDEN;
                     intent->setting.value.boolean =
                         ui->cookie_banner_hidden;
+                } else {
+                    psp_ui_show_status(ui, "NOT AVAILABLE ON THIS PAGE",
+                                       180);
                 }
                 break;
             case 3:
@@ -266,6 +298,21 @@ static void menu_update_site_controls(
                 intent->setting.value.boolean =
                     ui->mixed_content_site_allowed;
                 break;
+            case 6: {
+                /* Ask -> Memory Stick -> RAM only -> Ask; a this-session
+                   grant (3) steps to Memory Stick, making it permanent. */
+                static const uint8_t next[4] = {
+                    BROWSER_SITE_STORAGE_STICK,
+                    BROWSER_SITE_STORAGE_MEMORY_ONLY,
+                    BROWSER_SITE_STORAGE_ASK,
+                    BROWSER_SITE_STORAGE_STICK
+                };
+                ui->site_storage_state = next[ui->site_storage_state];
+                intent->setting.id = PSP_UI_SETTING_SITE_STORAGE_SITE;
+                intent->setting.value.unsigned_value =
+                    ui->site_storage_state;
+                break;
+            }
         }
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
@@ -284,16 +331,15 @@ static void menu_update_site_controls(
 static void menu_update_page_information(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
-    enum { SITE_INFO_ACTION_COUNT = 3 };
     if (pressed & PSP_UI_BUTTON_UP) {
         ui->menu_selection = (uint8_t) (
-            (ui->menu_selection + SITE_INFO_ACTION_COUNT - 1u)
-            % SITE_INFO_ACTION_COUNT);
+            (ui->menu_selection + UI_SITE_INFO_ACTION_COUNT - 1u)
+            % UI_SITE_INFO_ACTION_COUNT);
         ui->data_clear_confirmation = 0u;
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_DOWN) {
         ui->menu_selection = (uint8_t) (
-            (ui->menu_selection + 1u) % SITE_INFO_ACTION_COUNT);
+            (ui->menu_selection + 1u) % UI_SITE_INFO_ACTION_COUNT);
         ui->data_clear_confirmation = 0u;
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
@@ -301,15 +347,22 @@ static void menu_update_page_information(
             ui->data_clear_confirmation = 3u;
             ui->menu_selection = 0u;
             menu_open_child(ui, PSP_UI_SCREEN_SITE_CONTROLS);
+        } else if (ui->menu_selection == UI_SITE_INFO_ROW_SITE_STORAGE) {
+            menu_open_child(ui, PSP_UI_SCREEN_DATA_OPTIONS);
+            ui->data_clear_confirmation = 0u;
+            ui->data_options_selection = 0u;
+            ui->site_storage = NULL;
+            ui->site_storage_from_site_info = 1u;
+            intent->action = PSP_UI_ACTION_SHOW_SITE_STORAGE;
         } else {
             uint8_t confirmation = (uint8_t) (ui->menu_selection + 1u);
             if (ui->data_clear_confirmation != confirmation) {
                 ui->data_clear_confirmation = confirmation;
             } else {
                 intent->clear_site_data_requested =
-                    ui->menu_selection == 1u;
-                intent->reset_site_permissions_requested =
                     ui->menu_selection == 2u;
+                intent->reset_site_permissions_requested =
+                    ui->menu_selection == 3u;
                 ui->data_clear_confirmation = 0u;
             }
         }
@@ -545,6 +598,11 @@ static void menu_update_root(
         intent->visual_changed = true;
         return;
     }
+    /* Exit waits for a second X on its row; any other press disarms it.
+       Frames without a press (a release) leave it armed. */
+    bool exit_armed =
+        ui->data_clear_confirmation == UI_MENU_EXIT_CONFIRMATION;
+    if (pressed != 0u) menu_disarm_exit(ui);
     if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_LEFT)) {
         ui->menu_selection = (uint8_t) (
             (ui->menu_selection + PSP_UI_MENU_ITEM_COUNT - 1u)
@@ -567,6 +625,8 @@ static void menu_update_root(
         } else if (ui->menu_selection == UI_MENU_ROW_HELP) {
             ui->menu_selection = 0u;
             menu_open_child(ui, PSP_UI_SCREEN_HELP);
+        } else if (ui->menu_selection == UI_MENU_ROW_EXIT && !exit_armed) {
+            ui->data_clear_confirmation = UI_MENU_EXIT_CONFIRMATION;
         } else {
             menu_close(ui);
             intent->action = menu_root_action(ui->menu_selection);

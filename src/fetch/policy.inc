@@ -185,12 +185,7 @@ static bool fetch_url_names_local_network(const char *url)
     static const char local_suffix[] = ".local";
     size_t suffix_length = sizeof(local_suffix) - 1u;
     return memchr(host, '.', length) == NULL
-        || (length == local_length
-            && strncasecmp(host, localhost, local_length) == 0)
-        || (length > local_length
-            && host[length - local_length - 1u] == '.'
-            && strncasecmp(host + length - local_length,
-                           localhost, local_length) == 0)
+        || tilefinch_host_within(host, length, localhost, local_length)
         || (length > suffix_length
             && strncasecmp(host + length - suffix_length,
                            local_suffix, suffix_length) == 0);
@@ -855,11 +850,8 @@ bool fetch_origin_blocked(const char *url)
     size_t host_length = strcspn(host, ":");
     for (size_t i = 0; i < fetch_blocked_origin_count; i++) {
         const char *entry = fetch_blocked_origins[i];
-        size_t entry_length = strlen(entry);
-        if (entry_length > host_length) continue;
-        const char *tail = host + host_length - entry_length;
-        if (strncasecmp(tail, entry, entry_length) != 0) continue;
-        if (entry_length == host_length || tail[-1] == '.') return true;
+        if (tilefinch_host_within(host, host_length, entry, strlen(entry)))
+            return true;
     }
     return false;
 }

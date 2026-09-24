@@ -1504,6 +1504,7 @@ int main(int argc, char **argv)
         printf("rendering skipped by analysis policy\n");
     }
     budget_report_categories(&budget, "stable-page", stdout);
+    document_refresh_attribute_totals(&document);
     printf("document title=\"%s\" nodes=%zu elements=%zu text-nodes=%zu "
            "attributes=%zu attribute-bytes=%zu body-text=%zu bytes\n",
            document.title, document.node_count, document.element_count,

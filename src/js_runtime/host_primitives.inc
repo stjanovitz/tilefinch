@@ -984,12 +984,12 @@ static JSValue js_storage_estimate(JSContext *context,
                bridge->session, bridge->document_url, &usage)) {
         return JS_NULL;
     }
+    BrowserSiteStorageInfo site = {0};
     size_t used = usage.storage_bytes > SIZE_MAX - usage.opfs_bytes
         ? SIZE_MAX : usage.storage_bytes + usage.opfs_bytes;
-    size_t quota = bridge->session->maximum_storage_bytes
-                       > SIZE_MAX - bridge->session->maximum_opfs_bytes
-        ? SIZE_MAX : bridge->session->maximum_storage_bytes
-                         + bridge->session->maximum_opfs_bytes;
+    size_t quota = browser_session_site_storage_info_for(
+                       bridge->session, bridge->document_url, &site)
+        ? site.limit_bytes : BROWSER_SITE_STORAGE_INITIAL_BYTES;
     if (quota < used) quota = used;
     JSValue values = JS_NewArray(context);
     if (JS_IsException(values)) return values;
@@ -1107,15 +1107,16 @@ static JSValue js_storage_remove(JSContext *context,
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge->session == NULL || bridge->opaque_origin || argc < 2) {
-        return JS_UNDEFINED;
+        return JS_TRUE;
     }
     bool local = JS_ToBool(context, argv[0]) > 0;
     const char *key = JS_ToCString(context, argv[1]);
     if (key == NULL) return JS_EXCEPTION;
-    browser_session_storage_remove(bridge->session, bridge->document_url,
-                                   local, key);
+    /* False when the Memory Stick refused to record it: the item stays. */
+    bool removed = browser_session_storage_remove(
+        bridge->session, bridge->document_url, local, key);
     JS_FreeCString(context, key);
-    return JS_UNDEFINED;
+    return JS_NewBool(context, removed);
 }
 
 static JSValue js_storage_clear(JSContext *context, JSValueConst this_value,
@@ -1123,11 +1124,12 @@ static JSValue js_storage_clear(JSContext *context, JSValueConst this_value,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge->session != NULL && !bridge->opaque_origin && argc > 0) {
-        browser_session_storage_clear(bridge->session, bridge->document_url,
-                                      JS_ToBool(context, argv[0]) > 0);
-    }
-    return JS_UNDEFINED;
+    if (bridge->session == NULL || bridge->opaque_origin || argc < 1)
+        return JS_TRUE;
+    /* False when some item could not be removed; those stay. */
+    return JS_NewBool(context, browser_session_storage_clear(
+        bridge->session, bridge->document_url,
+        JS_ToBool(context, argv[0]) > 0));
 }
 
 static JSValue js_cookie_get(JSContext *context, JSValueConst this_value,
@@ -1783,7 +1785,7 @@ static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
         }
         result = js_opfs_result(context, status);
     } else if (command == JS_OPFS_READ) {
-        status = browser_session_opfs_stat(
+        status = browser_session_opfs_read(
             bridge->session, bridge->document_url, path, &view);
         if (status == BROWSER_OPFS_OK && view.kind != BROWSER_OPFS_FILE)
             status = BROWSER_OPFS_TYPE_MISMATCH;
@@ -1867,7 +1869,8 @@ static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
         result = js_opfs_result(context, status);
         if (status == BROWSER_OPFS_OK && !JS_IsException(result)) {
             uint32_t output = 1;
-            for (size_t index = 0; index < BROWSER_OPFS_ENTRIES; index++) {
+            for (size_t index = 0;
+                 index < BROWSER_SITE_STORAGE_SITE_ITEMS; index++) {
                 const char *name = NULL;
                 BrowserOpfsResult child = browser_session_opfs_child(
                     bridge->session, bridge->document_url, path,

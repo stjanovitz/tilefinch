@@ -550,37 +550,6 @@ void psp_media_session_checkpoint(
     media->controller_last_mismatch = mismatch;
 }
 
-static void psp_media_dispatch_one(
-    PspMediaSession *media, PspMediaEvent event, const char *checkpoint)
-{
-    if (media == NULL) return;
-    if (event.service_epoch != 0
-        && (event.service_epoch != media->service.epoch
-            || event.service_command != media->service.command)) {
-        if (media->stale_service_completions != UINT32_MAX)
-            media->stale_service_completions++;
-        return;
-    }
-    PspMediaSessionState from = media->machine.state;
-    PspMediaDecision decision = psp_media_machine_transition(
-        &media->machine, &event);
-    if (media->controller_events != UINT32_MAX) media->controller_events++;
-    media->machine = decision.next;
-    if (event.service_epoch != 0)
-        psp_media_service_token_clear(&media->service);
-    if (decision.command != PSP_MEDIA_COMMAND_NONE) {
-        uint64_t now_us = psp_media_now_us(media);
-        (void) psp_media_service_token_begin(
-            &media->service, decision.command, now_us, 0);
-    }
-    psp_media_apply_active_projection(media);
-    uint32_t violations =
-        psp_media_machine_violations(&media->machine);
-    psp_media_controller_trace(
-        media, event.type, from, media->machine.state,
-        violations, checkpoint);
-}
-
 static void psp_media_controller_report(PspMediaSession *media)
 {
     if (media == NULL || media->controller_events == 0) return;
@@ -624,6 +593,58 @@ static void psp_media_controller_report(PspMediaSession *media)
             ? (int) PSP_MEDIA_BACKEND_QUARANTINED
             : (int) PSP_MEDIA_BACKEND_HEALTHY,
         media->controller_trace_count, trace);
+}
+
+#else
+void psp_media_session_checkpoint(
+    PspMediaSession *media, const char *checkpoint)
+{
+    (void) media;
+    (void) checkpoint;
+}
+static void psp_media_controller_report(PspMediaSession *media)
+{
+    (void) media;
+}
+#endif
+
+static void psp_media_dispatch_one(
+    PspMediaSession *media, PspMediaEvent event, const char *checkpoint)
+{
+    if (media == NULL) return;
+    if (event.service_epoch != 0
+        && (event.service_epoch != media->service.epoch
+            || event.service_command != media->service.command)) {
+        if (media->stale_service_completions != UINT32_MAX)
+            media->stale_service_completions++;
+        return;
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspMediaSessionState from = media->machine.state;
+#else
+    (void) checkpoint;
+#endif
+    PspMediaDecision decision = psp_media_machine_transition(
+        &media->machine, &event);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (media->controller_events != UINT32_MAX) media->controller_events++;
+#endif
+    media->machine = decision.next;
+    if (event.service_epoch != 0)
+        psp_media_service_token_clear(&media->service);
+    if (decision.command != PSP_MEDIA_COMMAND_NONE) {
+        uint64_t now_us = psp_media_now_us(media);
+        (void) psp_media_service_token_begin(
+            &media->service, decision.command, now_us, 0);
+    }
+    psp_media_apply_active_projection(media);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint32_t violations =
+        psp_media_machine_violations(&media->machine);
+    psp_media_controller_trace(
+        media, event.type, from, media->machine.state,
+        violations, checkpoint);
+#endif
 }
 
 void psp_media_finish_synchronous_quiesce(
@@ -676,87 +697,6 @@ static void psp_media_complete_priming_if_ready(
     if (media->machine.state != PSP_MEDIA_SESSION_PRIMING)
         psp_media_release_presentation_preroll(media, true);
 }
-#else
-void psp_media_session_checkpoint(
-    PspMediaSession *media, const char *checkpoint)
-{
-    (void) media;
-    (void) checkpoint;
-}
-static void psp_media_dispatch_one(
-    PspMediaSession *media, PspMediaEvent event, const char *checkpoint)
-{
-    (void) checkpoint;
-    if (media == NULL) return;
-    if (event.service_epoch != 0
-        && (event.service_epoch != media->service.epoch
-            || event.service_command != media->service.command)) {
-        if (media->stale_service_completions != UINT32_MAX)
-            media->stale_service_completions++;
-        return;
-    }
-    PspMediaDecision decision = psp_media_machine_transition(
-        &media->machine, &event);
-    media->machine = decision.next;
-    if (event.service_epoch != 0)
-        psp_media_service_token_clear(&media->service);
-    if (decision.command != PSP_MEDIA_COMMAND_NONE) {
-        uint64_t now_us = psp_media_now_us(media);
-        (void) psp_media_service_token_begin(
-            &media->service, decision.command, now_us, 0);
-    }
-    psp_media_apply_active_projection(media);
-}
-void psp_media_finish_synchronous_quiesce(
-    PspMediaSession *media, const char *checkpoint)
-{
-    if (media == NULL
-        || media->machine.state != PSP_MEDIA_SESSION_QUIESCING)
-        return;
-    psp_media_dispatch(media, psp_media_service_completion(
-        media, PSP_MEDIA_EVENT_ADMISSION_STOPPED), checkpoint);
-    psp_media_dispatch(media, psp_media_service_completion(
-        media, PSP_MEDIA_EVENT_TRANSPORT_CANCELLED), checkpoint);
-    if (media_psp_backend_quarantined()) {
-        psp_media_dispatch(media, psp_media_service_completion(
-            media, PSP_MEDIA_EVENT_BACKEND_QUARANTINED), checkpoint);
-    } else {
-        psp_media_dispatch(media, psp_media_service_completion(
-            media, PSP_MEDIA_EVENT_BACKEND_QUIESCED), checkpoint);
-    }
-}
-static void psp_media_complete_priming_if_ready(
-    PspMediaSession *media, const char *checkpoint)
-{
-    if (media == NULL
-        || media->machine.state != PSP_MEDIA_SESSION_PRIMING
-        || media->pause_boundary_pending)
-        return;
-    if (media->audio_only) {
-        uint64_t audio_cursor_us = 0;
-        if (!media_playback_audio_cursor_us(
-                media->playback, &audio_cursor_us)) return;
-        psp_media_dispatch(media, psp_media_service_completion(
-            media, PSP_MEDIA_EVENT_PRIME_READY), checkpoint);
-        if (media->machine.state != PSP_MEDIA_SESSION_PRIMING)
-            psp_media_release_presentation_preroll(media, true);
-        return;
-    }
-    if (!media->have_frame) return;
-    if (media->presentation_preroll_startup) {
-        size_t displayed =
-            media_playback_displayed_video_frames(media->playback);
-        if (!media->presentation_preroll_startup_claimed
-            || displayed <= media->presentation_preroll_displayed_baseline)
-            return;
-    }
-    psp_media_dispatch(media, psp_media_service_completion(
-        media, PSP_MEDIA_EVENT_PRIME_READY), checkpoint);
-    if (media->machine.state != PSP_MEDIA_SESSION_PRIMING)
-        psp_media_release_presentation_preroll(media, true);
-}
-#define psp_media_controller_report(...) ((void) 0)
-#endif
 
 /*
  * Lifecycle service completion may be synchronous (for example, a module
@@ -1086,10 +1026,15 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->subtitle_request_attempted = false;
     psp_ui_media_set_subtitle(&media->ui, NULL);
     if (media->page_media_probe_request != 0) {
-        (void) fetch_background_transport_cancel(
-            media->page_media_probe_request, "page media closed");
+        if (media->page_media_probe_scheduler != NULL) {
+            (void) fetch_scheduler_cancel(
+                media->page_media_probe_scheduler,
+                media->page_media_probe_request, "page media closed");
+        }
         media->page_media_probe_request = 0;
     }
+    fetch_scheduler_destroy(media->page_media_probe_scheduler);
+    media->page_media_probe_scheduler = NULL;
     media->controller_audio_hold = false;
     psp_media_release_presentation_preroll(media, true);
     if (media->have_frame)

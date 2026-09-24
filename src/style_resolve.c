@@ -264,8 +264,9 @@ static bool style_static_staged_content_reveals(
         || style->hidden || (parent != NULL && parent->opacity == 0)) {
         return false;
     }
-    bool primary_heading = style_subtree_has_primary_heading(node);
-    if (!sheet->static_custom_element_fallback && !primary_heading) {
+    /* The bounded subtree walk only when the cheap gate leaves it open. */
+    if (!sheet->static_custom_element_fallback
+        && !style_subtree_has_primary_heading(node)) {
         return false;
     }
     size_t ignored = 0;
@@ -510,10 +511,9 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         paint_dirty |= mode != STYLE_MIX_BLEND_NORMAL;
     }
     if ((mask & STYLE_MODERN_BACKDROP_FILTER) != 0) {
+        /* -webkit-backdrop-filter is retained under this name. */
         bool found = retained_modern_value(
             sheet, node, "backdrop-filter", value);
-        if (!found) found = retained_modern_value(
-            sheet, node, "-webkit-backdrop-filter", value);
         unsigned radius = 0;
         if (found) {
             const char *blur = strstr(value, "blur(");
@@ -1091,6 +1091,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     }
     if (style_element_is_ua_block(node_name, node_name_length)) {
         style.display = DISPLAY_BLOCK;
+        style.list_item = NODE_TAG_IS("li");
     }
     if (NODE_TAG_IS("pre")) {
         style.white_space_mode = WHITE_SPACE_PRE;
@@ -1824,6 +1825,28 @@ void style_retained_matches_invalidate_within(
         style_retained_matches_clear(table);
         return;
     }
+    /* Entries are keyed by element, so the entries inside a scope are those
+       of its current subtree. Forgetting each by direct probe (three
+       pseudo keys, bounded probes) beats sweeping the whole table while the
+       subtree is small; a large one keeps the sweep. */
+    enum { DIRECT_LIMIT = STYLE_RETAINED_MATCH_CAPACITY
+                          / (3u * STYLE_RETAINED_MATCH_PROBE_LIMIT) };
+    size_t elements = 0;
+    const lxb_dom_node_t *walk = scope;
+    while (walk != NULL && elements <= DIRECT_LIMIT) {
+        if (walk->type == LXB_DOM_NODE_TYPE_ELEMENT) elements++;
+        if (walk->first_child != NULL) {
+            walk = walk->first_child;
+            continue;
+        }
+        while (walk != NULL && walk != scope && walk->next == NULL)
+            walk = walk->parent;
+        walk = walk == NULL || walk == scope ? NULL : walk->next;
+    }
+    if (elements <= DIRECT_LIMIT) {
+        style_retained_matches_forget_subtree(table, scope);
+        return;
+    }
     for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
         StyleRetainedMatchEntry *entry = &table->entries[i];
         if (entry->node != NULL
@@ -1842,13 +1865,11 @@ void style_retained_matches_invalidate_ancestors(
         style_retained_matches_clear(table);
         return;
     }
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
-        StyleRetainedMatchEntry *entry = &table->entries[i];
-        if (entry->node != NULL
-            && style_retained_node_within(node, entry->node)) {
-            memset(entry, 0, sizeof(*entry));
-            table->occupied--;
-        }
+    /* The entries of `node` and its ancestors, by direct probe along the
+       ancestor chain rather than a sweep of the whole table. */
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        style_retained_forget_node(table, at);
+        if (table->occupied == 0) return;
     }
 }
 
@@ -1985,6 +2006,15 @@ void style_retained_matches_invalidate_rules(
         }
     }
     for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        /* A full table is ~16k lists on a long article, 70 ms on the PSP.
+           Dropping every list is always correct, so a cancelled scan does
+           exactly that instead of holding input. */
+        if ((i & 2047u) == 2047u
+            && !tilefinch_platform_cooperate("style-invalidate", i)) {
+            table->token_dropped += table->occupied;
+            style_retained_matches_clear(table);
+            return;
+        }
         StyleRetainedMatchEntry *entry = &table->entries[i];
         if (entry->node == NULL) continue;
         StyleMatchSubject subject = {0};
@@ -2487,7 +2517,10 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
                          uint64_t mask, uint64_t mask_high)
 {
     apply_paint_values(sheet, style, values, mask, mask_high);
-    if (mask & S_DISPLAY) style->display = values->display;
+    if (mask & S_DISPLAY) {
+        style->display = values->display;
+        style->list_item = values->list_item;
+    }
     if (mask & S_COLOR) {
         style->color = values->color;
         style->color_alpha = values->color_alpha;
@@ -3188,11 +3221,13 @@ static void apply_style_rule(const Stylesheet *sheet, const StyleRule *rule,
         } else {
             mutable_sheet->deferred_program_instructions += instructions;
         }
-        parsed = style_apply_deferred_program(
+        parsed = style_apply_deferred_program_basis(
             mutable_sheet, declaration->deferred_declarations,
             declaration->deferred_length,
             declaration->deferred_program_offset,
             declaration->deferred_program_count, rule->important,
+            (declaration->deferred_program_reserved
+             & STYLE_DEFERRED_NO_FONT_SIZE) == 0,
             &resolved, &mask, &mask_high, &deferred_inherit);
     } else {
         if (mutable_sheet->deferred_program_fallbacks != UINT64_MAX) {
@@ -3219,11 +3254,13 @@ static void apply_style_rule(const Stylesheet *sheet, const StyleRule *rule,
         deferred_inherit = 0;
         if (declaration->deferred_program_offset != UINT32_MAX
             && !sheet->resolve_scratch->font_ch_basis_active) {
-            parsed = style_apply_deferred_program(
+            parsed = style_apply_deferred_program_basis(
                 mutable_sheet, declaration->deferred_declarations,
                 declaration->deferred_length,
                 declaration->deferred_program_offset,
                 declaration->deferred_program_count, rule->important,
+                (declaration->deferred_program_reserved
+                 & STYLE_DEFERRED_NO_FONT_SIZE) == 0,
                 &resolved, &mask, &mask_high, &deferred_inherit);
         } else {
             parsed = style_parse_declarations(
@@ -3492,8 +3529,11 @@ static ComputedStyle style_apply_node_cascade(
     uint64_t inline_normal_revert_rule_mask_high = 0;
     uint64_t inline_important_revert_rule_mask = 0;
     uint64_t inline_important_revert_rule_mask_high = 0;
-    ComputedStyle inline_important_values = style;
+    /* Only elements with a style attribute need this snapshot of the
+       cascade so far (344 bytes); it is read under the same condition. */
+    ComputedStyle inline_important_values;
     if (inline_css != NULL) {
+        inline_important_values = style;
         if (style_text_has_logical_property(inline_css, length)) {
             style_record_logical_axes(sheet, &style);
         }
@@ -3854,9 +3894,9 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
        responsive and dialog hiding semantics. */
     if (sheet != NULL && style.display == DISPLAY_NONE && !style.hidden
         && !style.fixed_position
-        && style_subtree_has_primary_heading(node)
         && (sheet->static_custom_element_fallback
-            || style_is_direct_main_child(node))) {
+            || style_is_direct_main_child(node))
+        && style_subtree_has_primary_heading(node)) {
         if (!lxb_dom_element_has_attribute(
                 lxb_dom_interface_element(node),
                 (const lxb_char_t *) "hidden", 6u)
@@ -4060,36 +4100,6 @@ static bool focus_selector_probe_range(
     return true;
 }
 
-static size_t focus_selector_rightmost_compound(
-    const char *text, size_t length)
-{
-    size_t start = 0;
-    int square = 0, round = 0;
-    for (size_t i = length; i != 0; i--) {
-        char value = text[i - 1];
-        if (value == ']') square++;
-        else if (value == '[' && square > 0) square--;
-        else if (value == ')') round++;
-        else if (value == '(' && round > 0) round--;
-        else if (square == 0 && round == 0
-                 && (value == '>' || value == '+' || value == '~')) {
-            start = i;
-            break;
-        } else if (square == 0 && round == 0
-                   && isspace((unsigned char) value)) {
-            size_t right = i;
-            while (right < length
-                   && isspace((unsigned char) text[right])) right++;
-            if (right < length) {
-                start = right;
-                break;
-            }
-        }
-    }
-    while (start < length && isspace((unsigned char) text[start])) start++;
-    return start;
-}
-
 static bool focus_selector_side_effects_are_local(
     const Stylesheet *sheet, lxb_dom_node_t *node)
 {
@@ -4133,7 +4143,7 @@ static bool focus_selector_side_effects_are_local(
         const char *selector = rule->selector;
         size_t length = strlen(selector);
         if (strstr(selector, ":focus") == NULL) continue;
-        size_t rightmost = focus_selector_rightmost_compound(
+        size_t rightmost = style_selector_rightmost_compound_start(
             selector, length);
         for (size_t at = 0; at < length; at++) {
             size_t token_length = 0;

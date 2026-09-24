@@ -975,7 +975,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     const char *method = request == NULL || request->method == NULL
                          ? "GET" : request->method;
     bool diagnostic_mobile_safari =
-        getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL;
+        fetch_diagnostic_mobile_safari();
     const char *effective_user_agent = fetch_effective_user_agent(
         request, diagnostic_mobile_safari);
     if (fetch_trace.mode == FETCH_TRACE_REPLAY) {

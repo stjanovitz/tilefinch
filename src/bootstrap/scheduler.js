@@ -89,9 +89,9 @@
       timer.timerAlgorithm = timerAlgorithm;
       timer.nesting = nesting;
       timer.requestedSpan = requestedSpan;
-      timers.push(timer);
+      insertTimer(timer);
     } else {
-      timers.push({
+      insertTimer({
         id, callback, due: registeredAt + span, span, repeat, args, kind,
         timerAlgorithm, nesting, requestedSpan,
       });
@@ -126,6 +126,17 @@
           : 3;
   const timerOrder = (a, b) =>
     a.due - b.due || timerPriority(a) - timerPriority(b) || a.id - b.id;
+  /* `timers` stays in timerOrder: every insertion lands at its sorted
+     place and removals preserve order, so the pump never re-sorts. */
+  function insertTimer(timer) {
+    let low = 0, high = timers.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (timerOrder(timers[middle], timer) <= 0) low = middle + 1;
+      else high = middle;
+    }
+    timers.splice(low, 0, timer);
+  }
   function invokeTimer() {
     /* Detach before calling so author callbacks never observe the reusable
        timer record as `this`. */
@@ -178,17 +189,6 @@
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-observer");
   globalThis.__tilefinchScheduleRenderFixup = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-fixup");
-  if (globalThis.MessageEvent === undefined)
-    globalThis.MessageEvent = class MessageEvent extends Event {
-      constructor(type, options = {}) {
-        super(type, options);
-        this.data = options.data ?? null;
-        this.origin = String(options.origin || "");
-        this.lastEventId = String(options.lastEventId || "");
-        this.source = options.source ?? null;
-        this.ports = Array.isArray(options.ports) ? options.ports : [];
-      }
-    };
   {
     const token = {},
       portBrands = new WeakSet(),
@@ -690,7 +690,6 @@
     const maximum = Math.max(0, Number(maxCallbacks) || 0),
       visible = pageVisible();
     while (ran < maximum) {
-      timers.sort(timerOrder);
       const timerIndex = visible
           ? (timers[0]?.due <= now ? 0 : -1)
           : timers.findIndex((candidate) =>
@@ -728,13 +727,21 @@
             ? Math.max(4, timer.requestedSpan) : timer.requestedSpan;
         }
         timer.due = currentSchedulerTime() + timer.span;
-        timers.push(timer);
+        insertTimer(timer);
       } else releaseTimer(timer);
       retryMessageDrains();
     }
     return ran;
   };
   globalThis.__tilefinchPendingTimers = () => timers.length;
+  /* Both counts the native loop needs after every turn, in one call:
+     pending timers * 65536 + waiting network requests, each capped. */
+  const pendingNetworkRequests = globalThis.__tilefinchPendingNetworkRequests;
+  globalThis.__tilefinchPendingWork = () => {
+    const network = typeof pendingNetworkRequests === "function"
+      ? pendingNetworkRequests() : 0;
+    return Math.min(timers.length, 65535) * 65536 + Math.min(network, 65535);
+  };
   /* Source-free native/lab liveness snapshot. Keep the returned tuple numeric
      and bounded so diagnostics never serialize callbacks, arguments, URLs, or
      challenge payloads. This is called only by the native diagnostic seam. */

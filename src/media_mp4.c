@@ -75,6 +75,14 @@ typedef struct {
     uint64_t dts;
 } Mp4Track;
 
+/* The sample cursor is the tail of Mp4Track from `sample` to `dts`; it is
+   all mp4_track_advance() changes, so a position can be saved and restored
+   without copying the whole track. */
+#define MP4_TRACK_CURSOR_OFFSET offsetof(Mp4Track, sample)
+#define MP4_TRACK_CURSOR_BYTES (sizeof(Mp4Track) - MP4_TRACK_CURSOR_OFFSET)
+_Static_assert(offsetof(Mp4Track, dts) + sizeof(uint64_t) == sizeof(Mp4Track),
+               "the MP4 track cursor must be the struct's tail");
+
 typedef struct {
     uint64_t offset;
     uint64_t length;
@@ -2582,29 +2590,13 @@ bool media_mp4_read_sample_waiting(MediaMp4Demux *demux,
 
 static uint64_t mp4_sample_time_us(const MediaMp4Sample *sample)
 {
-    if (sample->timescale == 0) return UINT64_MAX;
-    uint64_t whole = sample->dts / sample->timescale;
-    uint64_t remainder = sample->dts % sample->timescale;
-    if (whole > UINT64_MAX / UINT64_C(1000000)) return UINT64_MAX;
-    uint64_t base = whole * UINT64_C(1000000);
-    uint64_t fraction =
-        remainder * UINT64_C(1000000) / sample->timescale;
-    return fraction > UINT64_MAX - base
-        ? UINT64_MAX : base + fraction;
+    return media_ticks_to_us(sample->dts, sample->timescale);
 }
 
 static uint64_t mp4_time_units_from_us(uint64_t microseconds,
                                        uint32_t timescale)
 {
-    if (timescale == 0) return UINT64_MAX;
-    uint64_t whole = microseconds / UINT64_C(1000000);
-    uint64_t remainder = microseconds % UINT64_C(1000000);
-    if (whole > UINT64_MAX / timescale) return UINT64_MAX;
-    uint64_t base = whole * timescale;
-    uint64_t fraction =
-        remainder * timescale / UINT64_C(1000000);
-    return fraction > UINT64_MAX - base
-        ? UINT64_MAX : base + fraction;
+    return mp4_rescale_time(microseconds, UINT32_C(1000000), timescale);
 }
 
 static bool media_mp4_seek_internal(MediaMp4Demux *demux,
@@ -2739,16 +2731,21 @@ static bool media_mp4_seek_internal(MediaMp4Demux *demux,
         if (i == video_index) continue;
         Mp4Track *track = &demux->tracks[i];
         mp4_track_rewind(track);
-        Mp4Track selected = *track;
+        /* Remember only the cursor at the last sample at or before the
+           target; this walk can cover every sample of a long track. */
+        unsigned char selected[MP4_TRACK_CURSOR_BYTES];
+        unsigned char *cursor = (unsigned char *) track
+            + MP4_TRACK_CURSOR_OFFSET;
+        memcpy(selected, cursor, sizeof(selected));
         MediaMp4Sample sample;
         uint64_t selected_dts = mp4_time_units_from_us(
             selected_us, track->info.timescale);
         while (mp4_track_peek(track, i, &sample)) {
             if (sample.dts > selected_dts) break;
-            selected = *track;
+            memcpy(selected, cursor, sizeof(selected));
             mp4_track_advance(track);
         }
-        *track = selected;
+        memcpy(cursor, selected, sizeof(selected));
     }
     if (actual_us != NULL) *actual_us = selected_us;
     return true;

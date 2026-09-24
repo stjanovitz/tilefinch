@@ -80,7 +80,8 @@ typedef struct LayoutBlockPaintPlan {
    section needs.  Every member is established before the section runs and is
    never reassigned by it; the sections mutate only through the pointers (and
    through the LayoutContext).  Always passed by pointer -- ComputedStyle is
-   496 bytes and layout_block_impl recurses to depth 48. */
+   344 bytes on PSP (376 on 64-bit hosts) and layout_block_impl recurses to
+   depth 48. */
 typedef struct LayoutBlockFrame {
     lxb_dom_node_t *node;
     ComputedStyle *style;
@@ -129,8 +130,8 @@ bool layout_block_patch_decoration(
 /* --- layout_block.c ----------------------------------------------------- */
 
 /* Margin collapsing recurses over page-controlled depth while holding the
-   largest objects layout has -- a ComputedStyle is 496 bytes, a FlatItem
-   1008 -- so its frames were the widest on the stack, and it counted its own
+   largest objects layout has -- a ComputedStyle is 344 bytes on PSP, a
+   FlatItem 1008 -- so its frames were the widest on the stack, and it counted its own
    depth from zero rather than continuing the layout tree's, which let the
    two budgets sum against pspsdk's 256 KB default with no guard page.  The
    per-level state now lives in the same bounded heap arena layout_block
