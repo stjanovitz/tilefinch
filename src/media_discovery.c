@@ -742,17 +742,30 @@ static bool media_scan_structured_json(
     return !malformed;
 }
 
-bool media_discover_structured_audio(
-    const PocDocument *document, MediaStructuredAudioIndex *index)
+/* Both public indexes retain different candidate capacities, but use the
+   same bounded script walk. Select counter addresses once, outside the walk;
+   do not cast one index layout to the other or add per-node callbacks. */
+static bool media_discover_structured_scripts(
+    const PocDocument *document, MediaStructuredAudioIndex *audio,
+    MediaStructuredVideoIndex *video)
 {
-    if (index == NULL) return false;
-    memset(index, 0, sizeof(*index));
+    if (audio == NULL && video == NULL) return false;
+    if (audio != NULL) memset(audio, 0, sizeof(*audio));
+    else memset(video, 0, sizeof(*video));
     if (document == NULL || document->html == NULL) return false;
+    size_t *inspected_bytes = audio != NULL
+        ? &audio->inspected_bytes : &video->inspected_bytes;
+    size_t *inspected_nodes = audio != NULL
+        ? &audio->inspected_nodes : &video->inspected_nodes;
+    size_t *malformed_scripts = audio != NULL
+        ? &audio->malformed_scripts : &video->malformed_scripts;
+    size_t *truncated_scripts = audio != NULL
+        ? &audio->truncated_scripts : &video->truncated_scripts;
     lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
     size_t dom_nodes = 0;
     for (lxb_dom_node_t *node = root;
          node != NULL && dom_nodes < MEDIA_DISCOVERY_NODE_LIMIT
-         && index->inspected_bytes < MEDIA_DISCOVERY_TEXT_LIMIT;
+         && *inspected_bytes < MEDIA_DISCOVERY_TEXT_LIMIT;
          node = media_walk_next(root, node)) {
         dom_nodes++;
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
@@ -765,65 +778,40 @@ bool media_discover_structured_audio(
             const char *text = document_text_data(child, &length);
             if (text == NULL || length == 0) continue;
             size_t remaining = MEDIA_DISCOVERY_TEXT_LIMIT
-                - index->inspected_bytes;
+                - *inspected_bytes;
             size_t admitted = length < remaining ? length : remaining;
-            size_t malformed_before = index->malformed_scripts;
+            size_t malformed_before = *malformed_scripts;
             (void) media_scan_structured_json(
-                text, admitted, index, NULL);
+                text, admitted, audio, video);
             /* Assignment-only object literals are useful data carriers but
                are not JSON and may legally contain unquoted identifiers.
                Keep them fail-soft without calling that expected syntax a
                malformed JSON document in diagnostics. */
             if (!strict_json) {
-                index->malformed_scripts = malformed_before;
+                *malformed_scripts = malformed_before;
             }
-            index->inspected_bytes += admitted;
-            if (admitted != length) index->truncated_scripts++;
-            if (index->inspected_bytes == MEDIA_DISCOVERY_TEXT_LIMIT) break;
+            *inspected_bytes += admitted;
+            if (admitted != length) (*truncated_scripts)++;
+            if (*inspected_bytes == MEDIA_DISCOVERY_TEXT_LIMIT) break;
         }
     }
     /* DOM visits and JSON containers are separate useful diagnostics. Keep
        the public node count as their bounded sum. */
-    index->inspected_nodes += dom_nodes;
-    return index->candidate_count != 0;
+    *inspected_nodes += dom_nodes;
+    return audio != NULL ? audio->candidate_count != 0
+                         : video->candidate_count != 0;
+}
+
+bool media_discover_structured_audio(
+    const PocDocument *document, MediaStructuredAudioIndex *index)
+{
+    return media_discover_structured_scripts(document, index, NULL);
 }
 
 bool media_discover_structured_video(
     const PocDocument *document, MediaStructuredVideoIndex *index)
 {
-    if (index == NULL) return false;
-    memset(index, 0, sizeof(*index));
-    if (document == NULL || document->html == NULL) return false;
-    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
-    size_t dom_nodes = 0;
-    for (lxb_dom_node_t *node = root;
-         node != NULL && dom_nodes < MEDIA_DISCOVERY_NODE_LIMIT
-         && index->inspected_bytes < MEDIA_DISCOVERY_TEXT_LIMIT;
-         node = media_walk_next(root, node)) {
-        dom_nodes++;
-        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || !media_name_is(node, "script")) continue;
-        bool strict_json = false;
-        if (!media_script_is_data(node, &strict_json)) continue;
-        for (lxb_dom_node_t *child = node->first_child; child != NULL;
-             child = child->next) {
-            size_t length = 0;
-            const char *text = document_text_data(child, &length);
-            if (text == NULL || length == 0) continue;
-            size_t remaining = MEDIA_DISCOVERY_TEXT_LIMIT
-                - index->inspected_bytes;
-            size_t admitted = length < remaining ? length : remaining;
-            size_t malformed_before = index->malformed_scripts;
-            (void) media_scan_structured_json(
-                text, admitted, NULL, index);
-            if (!strict_json) index->malformed_scripts = malformed_before;
-            index->inspected_bytes += admitted;
-            if (admitted != length) index->truncated_scripts++;
-            if (index->inspected_bytes == MEDIA_DISCOVERY_TEXT_LIMIT) break;
-        }
-    }
-    index->inspected_nodes += dom_nodes;
-    return index->candidate_count != 0;
+    return media_discover_structured_scripts(document, NULL, index);
 }
 
 static bool media_copy_bounded_text(

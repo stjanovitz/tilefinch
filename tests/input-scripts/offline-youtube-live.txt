@@ -1,0 +1,62 @@
+# DEVICE JOURNEY -- run with scripts/run-psplink-offline-youtube.sh.
+#
+# YouTube-style playback with no network: the offline library page
+# (https://tilefinch.local/offline) lists one ready item built by
+# tools/make-offline-youtube-fixture.sh (a 60 s 640x360 split-stream clip
+# shaped like itag 134 + 140), and its Play link opens the native player.
+# PPSSPP stops at the firmware decoder boundary, so this needs hardware; it
+# exists so player work can be tested repeatedly without the network.
+#
+# In order: Down focuses Play, Cross opens the video (the offline route
+# autoplays); a 10 s preview while playing, cancelled with Circle; three
+# previews committed with Cross (about +30 s); a rewind to 0, large enough
+# to rebuild the decoder (threshold 30 s), with Right, Right, Cross pressed
+# while it reopens (lands near 20 s, playing); Cross pauses; a preview is
+# cancelled while paused (stays paused); Circle closes the player back to
+# the library page. scripts/verify-psplink-offline-youtube.py checks each
+# mark. No screenshot step: that writes to the Memory Stick.
+wait-live 120
+mark-live library
+tap-live down
+wait-live 20
+tap-live cross
+wait-live 300
+mark-live opened
+tap-live right
+wait-live 30
+mark-live preview
+tap-live circle
+wait-live 180
+mark-live cancelled
+tap-live right
+wait-live 10
+tap-live right
+wait-live 10
+tap-live right
+wait-live 30
+tap-live cross
+wait-live 240
+mark-live committed
+tap-live ltrigger
+wait-live 30
+tap-live cross
+wait-live 2
+tap-live right
+wait-live 2
+tap-live right
+wait-live 2
+tap-live cross
+wait-live 300
+mark-live restarted
+tap-live cross
+wait-live 60
+mark-live paused
+tap-live right
+wait-live 30
+tap-live circle
+wait-live 180
+mark-live paused-cancelled
+tap-live circle
+wait-live 180
+mark-live closed
+end

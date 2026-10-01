@@ -150,6 +150,456 @@
     document_destroy(&ancestor_cycle_document);
     CHECK(budget.current == ancestor_cycle_baseline);
 
+    puts("test: native closest keeps parentElement semantics");
+    size_t closest_baseline = budget.current;
+    static const char closest_page[] =
+        "<!doctype html><body><section id=sec class=s><div id=mid class=m>"
+        "<p id=leaf class=l>t</p></div></section></body>";
+    PocDocument closest_document = {0};
+    ScriptResult closest_result = {0};
+    ScriptRuntimeOptions closest_options = {0};
+    CHECK(document_parse(&closest_document, &budget, closest_page,
+                         strlen(closest_page), 31)
+          && viewport_context_init(
+                 &closest_options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *closest_runtime = script_runtime_create_configured(
+        &closest_document, &budget, 4 * MIB, 1000,
+        "https://example.test/closest", &closest_options, &closest_result);
+    static const char closest_source[] =
+        "(()=>{const leaf=document.getElementById('leaf'),"
+        "mid=document.getElementById('mid'),"
+        "sec=document.getElementById('sec');"
+        "const host=document.createElement('div');host.className='h';"
+        "document.body.append(host);"
+        "const root=host.attachShadow({mode:'open'}),"
+        "inner=document.createElement('span');root.append(inner);"
+        "const outer=document.createElement('div');outer.className='outer';"
+        "const child=document.createElement('p');outer.append(child);"
+        "const loose=document.createElement('i');"
+        "loose.__tilefinchDetachedParent=outer;"
+        "const checks=[leaf.closest('.l')===leaf,leaf.closest('.m')===mid,"
+        "leaf.closest('section.s')===sec,"
+        "leaf.closest('body > section')===sec,"
+        "leaf.closest('x-none, .m')===mid,"
+        "leaf.closest('html')===document.documentElement,"
+        "leaf.closest('#absent')===null,leaf.closest(':scope')===leaf,"
+        "inner.closest('span')===inner,inner.closest('.h')===null,"
+        "inner.closest('div')===null,child.closest('.outer')===outer,"
+        "child.closest('body')===null,loose.closest('.outer')===outer];"
+        "let threw=false;try{leaf.closest('[')}catch(e){"
+        "threw=e.name==='SyntaxError'}checks.push(threw);"
+        "globalThis.pocSummary=checks.every(Boolean)"
+        "?'CLOSEST-OK':'CLOSEST-FAILED:'+checks.join(',');})()";
+    CHECK(closest_runtime != NULL && closest_result.success
+          && script_runtime_evaluate_diagnostic(
+                 closest_runtime, closest_source, "<closest-probe>",
+                 &closest_result));
+    if (strcmp(closest_result.summary, "CLOSEST-OK") != 0)
+        printf("closest summary: %s error: %s\n", closest_result.summary,
+               closest_result.error);
+    CHECK(strcmp(closest_result.summary, "CLOSEST-OK") == 0);
+    script_runtime_destroy(closest_runtime);
+    document_destroy(&closest_document);
+    CHECK(budget.current == closest_baseline);
+
+    puts("test: native node getters answer as the script getters do");
+    size_t getter_baseline = budget.current;
+    static const char getter_page[] =
+        "<!doctype html><!--c--><html><head></head><body><div id=d>"
+        "<p id=p>t<b id=b>x</b></p><svg id=s><circle id=c /></svg>"
+        "</div></body></html>";
+    PocDocument getter_document = {0};
+    ScriptResult getter_result = {0};
+    ScriptRuntimeOptions getter_options = {0};
+    CHECK(document_parse(&getter_document, &budget, getter_page,
+                         strlen(getter_page), 31)
+          && viewport_context_init(
+                 &getter_options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *getter_runtime = script_runtime_create_configured(
+        &getter_document, &budget, 4 * MIB, 1000,
+        "https://getters.test/", &getter_options, &getter_result);
+    static const char getter_source[] =
+        "(()=>{const $=(i)=>document.getElementById(i),d=$('d'),p=$('p'),"
+        "b=$('b'),text=p.firstChild,html=document.documentElement;"
+        "const host=document.createElement('section');d.append(host);"
+        "const root=host.attachShadow({mode:'open'}),inner=document."
+        "createElement('i');root.append(inner);"
+        "const frag=document.createDocumentFragment(),fchild=document."
+        "createElement('u');frag.append(fchild);"
+        "const loose=document.createElement('em');"
+        "const comment=[...document.childNodes].find((n)=>n.nodeType===8);"
+        "const checks=[b.parentNode===p,p.parentNode===d,b.parentElement===p,"
+        "text.parentNode===p,text.nodeType===3,p.nodeType===1,"
+        "document.body.parentElement===html,document.body.parentNode===html,"
+        "html.parentNode===document,html.parentElement===null,"
+        "comment.nodeType===8&&comment.parentNode===document,"
+        "document.head.parentElement===html,"
+        "p.tagName==='P',$('s').tagName==='svg',$('c').tagName==='circle',"
+        "text.tagName===undefined||text.tagName==='',"
+        "inner.parentNode===root,inner.parentElement===null,"
+        "fchild.parentNode===frag,fchild.parentElement===null,"
+        "loose.parentNode===null,loose.parentElement===null,"
+        "d.parentElement===document.body,"
+        "b.parentNode===b.parentNode,"
+        "p.getAttribute('ID')==='p',p.getAttribute('id')==='p',"
+        "p.getAttribute('missing')===null,(()=>{p.setAttribute('data-e','');"
+        "return p.getAttribute('data-e')===''&&p.hasAttribute('DATA-E')})(),"
+        "p.getAttribute({toString(){return 'id'}})==='p',"
+        "(()=>{p.setAttribute('7','n');return p.getAttribute(7)==='n'})(),"
+        "p.getAttribute('\\u00e9')===null,"
+        "(()=>{const s=$('s');s.setAttribute('viewBox','0 0 1 1');"
+        "return s.getAttribute('viewBox')==='0 0 1 1'})(),"
+        "!p.hasAttribute('nope'),"
+        "btoa('')==='',btoa('hello')==='aGVsbG8=',"
+        "btoa('\\u00e9\\u00ff')==='6f8=',"
+        "(()=>{try{btoa('a\\u0100');return false}catch(e){"
+        "return e.name==='InvalidCharacterError'"
+        "&&String(e.message).includes('index=1 code=256')}})(),"
+        "(()=>{const q=document.createElement('div');d.append(q);"
+        "q.setAttribute('a','1');q.setAttribute('b','2');"
+        "const m=q.attributes,n0=m.length,first=m[0];"
+        "q.setAttribute('c','3');const grew=m.length===n0+1"
+        "&&m[2].name==='c'&&m[0]===first;"
+        "q.removeAttribute('a');const shrank=m.length===2&&m[0].name==='b';"
+        "q.setAttributeNS('urn:x','x:k','v');"
+        "const ns=[...m].some((at)=>at.name==='x:k'&&at.value==='v');"
+        "const arr=Array.from(q.attributes).map((at)=>at.name).join();"
+        "q.setAttribute('b','9');const val=m.getNamedItem('b').value==='9';"
+        "return grew&&shrank&&ns&&arr==='b,c,x:k'&&val})()];"
+        "globalThis.__keepB=b;"
+        "globalThis.pocSummary=checks.every(Boolean)?'GETTERS-OK':"
+        "'GETTERS-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    CHECK(getter_runtime != NULL && getter_result.success
+          && script_runtime_evaluate_diagnostic(
+                 getter_runtime, getter_source, "<getter-probe>",
+                 &getter_result));
+    if (strcmp(getter_result.summary, "GETTERS-OK") != 0)
+        printf("getters: %s %s\n", getter_result.summary,
+               getter_result.error);
+    CHECK(strcmp(getter_result.summary, "GETTERS-OK") == 0);
+    static const char local_name_source[] =
+        "(()=>{const p=document.getElementById('p'),"
+        "get=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(p),"
+        "'localName').get,"
+        "checks=[p.localName==='p',"
+        "document.getElementById('s').localName==='svg',"
+        "document.getElementById('c').localName==='circle',"
+        "get.call({tagName:'BORROWED'})==='borrowed'];"
+        "const q=document.createElement('div');"
+        "Object.defineProperty(q,'tagName',{configurable:true,"
+        "get(){return 'OVERRIDE'}});checks.push(q.localName==='override');"
+        "const err=new Error('tag');Object.defineProperty(q,'tagName',"
+        "{configurable:true,get(){throw err}});"
+        "try{q.localName;checks.push(false)}catch(e){checks.push(e===err)}"
+        "const proxy=new Proxy(p,{getOwnPropertyDescriptor(){"
+        "throw new Error('unexpected descriptor trap')}});"
+        "checks.push(get.call(proxy)==='p');"
+        "checks.push(get.call({tagName:'\\u00c9'})==='\\u00e9');"
+        "Object.defineProperty(q,'localName',{value:'author'});"
+        "checks.push(q.localName==='author');"
+        "globalThis.pocSummary=checks.every(Boolean)?'LOCAL-NAME-OK':"
+        "'LOCAL-NAME-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    bool local_name_ok = script_runtime_evaluate_diagnostic(
+              getter_runtime, local_name_source, "<local-name-probe>",
+              &getter_result);
+    if (!local_name_ok) printf("local name exception: %s\n", getter_result.error);
+    CHECK(local_name_ok);
+    if (strcmp(getter_result.summary, "LOCAL-NAME-OK") != 0)
+        printf("local name: %s %s\n", getter_result.summary,
+               getter_result.error);
+    CHECK(strcmp(getter_result.summary, "LOCAL-NAME-OK") == 0);
+    /* After a collection drops the parent's wrapper, the getter builds one
+       that script sees as the same node. */
+    (void) script_runtime_collect_and_trim(getter_runtime);
+    CHECK(script_runtime_evaluate_diagnostic(
+              getter_runtime,
+              "globalThis.pocSummary=(__keepB.parentNode===document."
+              "getElementById('p')&&__keepB.parentNode.id==='p')?"
+              "'REWRAP-OK':'REWRAP-FAILED'",
+              "<getter-rewrap>", &getter_result)
+          && strcmp(getter_result.summary, "REWRAP-OK") == 0);
+    script_runtime_destroy(getter_runtime);
+    document_destroy(&getter_document);
+    CHECK(budget.current == getter_baseline);
+
+    /* The same probes run twice: with the native child/sibling getters,
+       and with them deferring to the script getters (remote mode seen). */
+    puts("test: native sibling getters and wrapper creation match script");
+    static const char sibling_page[] =
+        "<!doctype html><html><head></head><body><div id=k>a<!--m-->"
+        "<span id=s1>s</span>b</div><div id=h><i id=l0></i></div>"
+        "<p id=r>x</p><svg id=g><circle id=c></circle><foreignObject "
+        "id=fo><div id=fd></div></foreignObject></svg><math id=mt><mi "
+        "id=mi>x</mi></math><section id=u></section></body></html>";
+    static const char sibling_source[] =
+        "(()=>{const $=(i)=>document.getElementById(i),k=$('k'),"
+        "a=k.firstChild,m=a.nextSibling,s1=$('s1'),b=k.lastChild;"
+        "const h=$('h'),l0=$('l0'),root=h.attachShadow({mode:'open'}),"
+        "l1=document.createElement('b');h.append(l1);"
+        "const inner=document.createElement('em');root.append(inner);"
+        "const frag=document.createDocumentFragment(),f1=document."
+        "createElement('u'),f2=document.createTextNode('t');"
+        "frag.append(f1,f2);const r=$('r');r.remove();"
+        "class MyEl extends HTMLElement{};customElements.define('my-el',"
+        "MyEl);class XB extends HTMLButtonElement{};customElements.define("
+        "'x-b',XB,{extends:'button'});const u=$('u');u.innerHTML="
+        "'<my-el id=ce></my-el><button is=x-b id=cb></button><span></span>'"
+        ";const ce=u.firstChild,cb=ce.nextSibling,sp=u.lastChild,"
+        "X='http://www.w3.org/1999/xhtml';"
+        "const checks=[a.nodeType===3&&a.data==='a',"
+        "m.nodeType===8&&m instanceof Comment,m.nextSibling===s1,"
+        "s1.previousSibling===m,s1.nextSibling===b,b.data==='b',"
+        "b.nextSibling===null,a.previousSibling===null,k.firstChild===a,"
+        "k.lastChild===b,m.previousSibling===a,a.nextSibling===m,"
+        "a instanceof Text,"
+        "l0.nextSibling===l1,l1.previousSibling===l0,l1.nextSibling===null,"
+        "h.firstChild===l0,h.lastChild===l1,root.firstChild===inner,"
+        "root.lastChild===inner,inner.nextSibling===null,"
+        "inner.previousSibling===null,frag.firstChild===f1,"
+        "f1.nextSibling===f2,f2.previousSibling===f1,frag.lastChild===f2,"
+        "r.nextSibling===null&&r.previousSibling===null,"
+        "r.firstChild.data==='x'&&r.firstChild===r.lastChild,"
+        "document.createElement('p').firstChild===null,"
+        "k instanceof HTMLDivElement&&k.namespaceURI===X&&k.tagName==='DIV',"
+        "a.namespaceURI===null,"
+        "$('g') instanceof SVGElement&&$('c') instanceof SVGElement,"
+        "$('c').namespaceURI==='http://www.w3.org/2000/svg',"
+        "$('fo').tagName==='foreignObject',"
+        "$('fd') instanceof HTMLDivElement&&$('fd').namespaceURI===X,"
+        "$('mi') instanceof Element&&!($('mi') instanceof HTMLElement),"
+        "$('mi').namespaceURI==='http://www.w3.org/1998/Math/MathML',"
+        "ce instanceof MyEl,cb instanceof XB,"
+        "sp instanceof HTMLElement&&!(sp instanceof HTMLDivElement),"
+        "b instanceof Text&&!(b instanceof Element)];"
+        "Object.assign(globalThis,{__k:k,__u:u,__l0:l0,__h:h,__inner:inner,"
+        "__MyEl:MyEl,__XB:XB,__creates:__tilefinchRetentionStats."
+        "wrapperCreates});"
+        "globalThis.pocSummary=checks.every(Boolean)?'SIBLINGS-OK':"
+        "'SIBLINGS-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    /* After a collection drops the unreferenced wrappers, the getters
+       build new ones that are the same nodes with the same prototypes. */
+    static const char sibling_rewrap_source[] =
+        "(()=>{const $=(i)=>document.getElementById(i),a=__k.firstChild,"
+        "m=a.nextSibling,ce=__u.firstChild;"
+        "const checks=[__tilefinchRetentionStats.wrapperCreates>__creates,"
+        "a.data==='a'&&__k.firstChild===a,m.nodeType===8,"
+        "m.nextSibling===$('s1'),$('s1').previousSibling===m,"
+        "__k.lastChild.previousSibling===$('s1'),"
+        "ce===$('ce')&&ce instanceof __MyEl,"
+        "ce.nextSibling===$('cb')&&$('cb') instanceof __XB,"
+        "__l0.nextSibling===__h.lastChild,"
+        "__inner.parentNode.firstChild===__inner];"
+        "globalThis.pocSummary=checks.every(Boolean)?'REWRAP-OK':"
+        "'REWRAP-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    for (int script_getters = 0; script_getters < 2; script_getters++) {
+        size_t sibling_baseline = budget.current;
+        PocDocument sibling_document = {0};
+        ScriptResult sibling_result = {0};
+        ScriptRuntimeOptions sibling_options = {0};
+        CHECK(document_parse(&sibling_document, &budget, sibling_page,
+                             strlen(sibling_page), 31)
+              && viewport_context_init(
+                     &sibling_options.viewport, 480, 272, 480, 272));
+        ScriptRuntime *sibling_runtime = script_runtime_create_configured(
+            &sibling_document, &budget, 4 * MIB, 1000,
+            "https://siblings.test/", &sibling_options, &sibling_result);
+        CHECK(sibling_runtime != NULL && sibling_result.success);
+        if (script_getters)
+            CHECK(script_runtime_evaluate_diagnostic(
+                sibling_runtime, "__tilefinchNoteRemoteWrapper()",
+                "<sibling-script-mode>", &sibling_result));
+        CHECK(script_runtime_evaluate_diagnostic(
+            sibling_runtime, sibling_source, "<sibling-probe>",
+            &sibling_result));
+        if (strcmp(sibling_result.summary, "SIBLINGS-OK") != 0)
+            printf("siblings(%d): %s %s\n", script_getters,
+                   sibling_result.summary, sibling_result.error);
+        CHECK(strcmp(sibling_result.summary, "SIBLINGS-OK") == 0);
+        (void) script_runtime_collect_and_trim(sibling_runtime);
+        CHECK(script_runtime_evaluate_diagnostic(
+            sibling_runtime, sibling_rewrap_source, "<sibling-rewrap>",
+            &sibling_result));
+        if (strcmp(sibling_result.summary, "REWRAP-OK") != 0)
+            printf("sibling rewrap(%d): %s %s\n", script_getters,
+                   sibling_result.summary, sibling_result.error);
+        CHECK(strcmp(sibling_result.summary, "REWRAP-OK") == 0);
+        script_runtime_destroy(sibling_runtime);
+        document_destroy(&sibling_document);
+        CHECK(budget.current == sibling_baseline);
+    }
+
+    /* The adopted owner document belongs to the native node, not to its
+       wrapper: after a collection recreates the wrappers, adopted subtrees,
+       their attributes, nodes inserted or parsed into them later and
+       template contents still report the adopted document. */
+    puts("test: adopted owner documents survive wrapper collection");
+    size_t owner_baseline = budget.current;
+    static const char owner_page[] =
+        "<!doctype html><html><body><template id=t><p x=1><b>q</b></p>"
+        "</template></body></html>";
+    static const char owner_source[] =
+        "(()=>{const d=document,nd=d.implementation.createHTMLDocument(''),"
+        "el=d.createElement('div');el.setAttribute('a','1');"
+        "el.innerHTML='<p q=1><i></i><em><tt></tt></em></p><s></s>';"
+        "nd.adoptNode(el);"
+        "const t=d.getElementById('t'),tp=t.content.firstChild,"
+        "host=d.createElement('section');host.innerHTML='<em><u></u></em>';"
+        "nd.body.appendChild(host);el.__mark=el.firstChild.__mark="
+        "tp.__mark=host.firstChild.__mark=1;const many=[];"
+        "for(let i=0;i<20;i++){const dd=d.implementation.createHTMLDocument"
+        "(''),x=d.createElement('i');x.innerHTML='<b></b>';dd.adoptNode(x);"
+        "if(i%9===0)many.push([x.firstChild,dd])}"
+        "const checks=[el.ownerDocument===nd,el.firstChild.ownerDocument"
+        "===nd,tp.ownerDocument!==d,host.firstChild.ownerDocument===nd];"
+        "Object.assign(globalThis,{__nd:nd,__many:many,"
+        "__i:el.firstChild.firstChild,"
+        "__tb:tp.firstChild,__host:host,__tod:tp.ownerDocument,"
+        "__creates:__tilefinchRetentionStats.wrapperCreates});"
+        "globalThis.pocSummary=checks.every(Boolean)?'OWNER-OK':"
+        "'OWNER-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    static const char owner_rewrap_source[] =
+        "(()=>{const d=document,nd=__nd,p=__i.parentNode,el=p.parentNode,"
+        "s=el.lastChild,tp=__tb.parentNode,em=__host.firstChild;"
+        "const fresh=p.__mark===undefined&&el.__mark===undefined"
+        "&&tp.__mark===undefined&&em.__mark===undefined"
+        "&&__tilefinchRetentionStats.wrapperCreates>__creates;"
+        "const n=d.createElement('u');p.appendChild(n);"
+        "el.insertAdjacentHTML('beforeend','<kbd><var></var></kbd>');"
+        "const kbd=el.lastChild;el.removeChild(kbd);el.removeChild(s);"
+        "tp.insertAdjacentHTML('beforeend','<q></q>');"
+        "const checks=[fresh,el.ownerDocument===nd,p.ownerDocument===nd,"
+        "__i.ownerDocument===nd,el.getAttributeNode('a').ownerDocument===nd,"
+        "p.getAttributeNode('q').ownerDocument===nd,n.ownerDocument===nd,"
+        "s.ownerDocument===nd,kbd.ownerDocument===nd,"
+        "kbd.firstChild.ownerDocument===nd,tp.ownerDocument===__tod,"
+        "__tb.ownerDocument===__tod,tp.lastChild.ownerDocument===__tod,"
+        "tp.getAttributeNode('x').ownerDocument===__tod,"
+        "d.getElementById('t').content.ownerDocument===__tod,"
+        "em.ownerDocument===nd,em.firstChild.ownerDocument===nd,"
+        "d.importNode(tp,true).ownerDocument===d];for(let i=0;i<20;i++){"
+        "const dd=d.implementation.createHTMLDocument(''),"
+        "x=d.createElement('i');dd.adoptNode(x);__many.push([x,dd])}"
+        "checks.push(__many.every(([x,dd])=>(x.parentNode||x)."
+        "ownerDocument===dd&&x.ownerDocument===dd));"
+        "d.body.appendChild(el);checks.push(el.ownerDocument===d,"
+        "p.ownerDocument===d,n.ownerDocument===d,s.ownerDocument===nd);"
+        "globalThis.__creates=__tilefinchRetentionStats.wrapperCreates;"
+        "globalThis.pocSummary=checks.every(Boolean)?'OWNER-REWRAP-OK':"
+        "'OWNER-REWRAP-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    static const char owner_return_source[] =
+        "(()=>{const p=__i.parentNode,el=p.parentNode,em=__i.nextSibling;"
+        "const checks=[__tilefinchRetentionStats.wrapperCreates>__creates,"
+        "el.ownerDocument===document,p.ownerDocument===document,"
+        "__i.ownerDocument===document,em.ownerDocument===document,"
+        "em.firstChild.ownerDocument===document,"
+        "el.getAttributeNode('a').ownerDocument===document,"
+        "__tb.parentNode.ownerDocument===__tod,"
+        "__many.every(([x,dd])=>(x.parentNode||x).ownerDocument===dd)];"
+        "globalThis.pocSummary=checks.every(Boolean)?'OWNER-RETURN-OK':"
+        "'OWNER-RETURN-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
+        ".join(',')})()";
+    {
+        PocDocument owner_document = {0};
+        ScriptResult owner_result = {0};
+        ScriptRuntimeOptions owner_options = {0};
+        CHECK(document_parse(&owner_document, &budget, owner_page,
+                             strlen(owner_page), 29)
+              && viewport_context_init(
+                     &owner_options.viewport, 480, 272, 480, 272));
+        ScriptRuntime *owner_runtime = script_runtime_create_configured(
+            &owner_document, &budget, 4 * MIB, 1000,
+            "https://owners.test/", &owner_options, &owner_result);
+        CHECK(owner_runtime != NULL && owner_result.success);
+        /* The pass after the first collection runs the wrapper
+           finalizers, releasing the dropped adopted nodes, so the next
+           adoptions reuse their documents' tags. */
+        static const char *const owner_stages[][2] = {
+            {owner_source, "OWNER-OK"},
+            {"globalThis.pocSummary='TICK'", "TICK"},
+            {owner_rewrap_source, "OWNER-REWRAP-OK"},
+            {owner_return_source, "OWNER-RETURN-OK"},
+        };
+        for (size_t stage = 0; stage < 4; stage++) {
+            if (stage != 0)
+                (void) script_runtime_collect_and_trim(owner_runtime);
+            bool evaluated = script_runtime_evaluate_diagnostic(
+                owner_runtime, owner_stages[stage][0], "<owner-probe>",
+                &owner_result);
+            if (!evaluated
+                || strcmp(owner_result.summary, owner_stages[stage][1]) != 0)
+                printf("owners(%zu): %s %s\n", stage, owner_result.summary,
+                       owner_result.error);
+            CHECK(evaluated
+                  && strcmp(owner_result.summary,
+                            owner_stages[stage][1]) == 0);
+        }
+        /* Same-document adoption must not materialize an otherwise unseen
+           subtree merely to re-stamp its owner. Cross-document ownership,
+           Attr identity and collection are exercised immediately above. */
+        CHECK(script_runtime_evaluate_diagnostic(
+            owner_runtime,
+            "globalThis.__sameOwner=document.createElement('section');"
+            "__sameOwner.innerHTML='<span a=1><b>text</b></span>'.repeat(64)",
+            "<same-owner-setup>", &owner_result));
+        (void) script_runtime_collect_and_trim(owner_runtime);
+        CHECK(script_runtime_evaluate_diagnostic(
+            owner_runtime,
+            "(()=>{const before=__tilefinchRetentionStats.wrapperCreates;"
+            "const same=document.adoptNode(__sameOwner)===__sameOwner;"
+            "globalThis.pocSummary=same&&__sameOwner.ownerDocument===document"
+            "&&__tilefinchRetentionStats.wrapperCreates===before"
+            "?'SAME-OWNER-OK':'SAME-OWNER-WALKED'})()",
+            "<same-owner-adoption>", &owner_result));
+        if (strcmp(owner_result.summary, "SAME-OWNER-OK") != 0)
+            printf("same owner: %s %s\n", owner_result.summary,
+                   owner_result.error);
+        CHECK(strcmp(owner_result.summary, "SAME-OWNER-OK") == 0);
+        CHECK(script_runtime_evaluate_diagnostic(
+            owner_runtime,
+            "(()=>{const before=__tilefinchRetentionStats.wrapperCreates;"
+            "__tilefinchResyncCustomElementFormState(__sameOwner);"
+            "globalThis.pocSummary="
+            "__tilefinchRetentionStats.wrapperCreates===before"
+            "?'NO-DEFINITION-OK':'NO-DEFINITION-WALKED'})()",
+            "<no-definition-form-resync>", &owner_result));
+        CHECK(strcmp(owner_result.summary, "NO-DEFINITION-OK") == 0);
+        CHECK(script_runtime_evaluate_diagnostic(
+            owner_runtime,
+            "(()=>{let adoptions=0;const disabled=[];"
+            "class Field extends HTMLElement{static formAssociated=true;"
+            "constructor(){super();this.attachInternals()}"
+            "adoptedCallback(){adoptions++}"
+            "formDisabledCallback(value){disabled.push(value)}}"
+            "customElements.define('x-adoption-field',Field);"
+            "const field=document.createElement('x-adoption-field'),"
+            "other=document.implementation.createHTMLDocument(''),"
+            "box=other.createElement('fieldset');"
+            "box.appendChild(field);"
+            "box.removeChild(field);other.adoptNode(field);"
+            "__tilefinchSetAttribute(field.__handle,'disabled','');"
+            "__tilefinchResyncCustomElementFormState(field);"
+            "__tilefinchRemoveAttribute(field.__handle,'disabled');"
+            "__tilefinchResyncCustomElementFormState(field);"
+            "globalThis.pocSummary=adoptions===1"
+            "&&field.ownerDocument===other&&disabled.join(',')==='true,false'"
+            "?'ADOPTION-REACTIONS-OK':'ADOPTION-REACTIONS-FAILED:'"
+            "+adoptions+':'+disabled.join(',')})()",
+            "<adoption-reactions>", &owner_result));
+        if (strcmp(owner_result.summary, "ADOPTION-REACTIONS-OK") != 0)
+            printf("adoption reactions: %s %s\n", owner_result.summary,
+                   owner_result.error);
+        CHECK(strcmp(owner_result.summary, "ADOPTION-REACTIONS-OK") == 0);
+        script_runtime_destroy(owner_runtime);
+        document_destroy(&owner_document);
+        CHECK(budget.current == owner_baseline);
+    }
+
     puts("test: detached reclamation retires only its own journal records");
     size_t journal_scope_baseline = budget.current;
     static const char journal_scope_page[] =
@@ -602,6 +1052,678 @@
     script_runtime_destroy(location_assignment_runtime);
     document_destroy(&location_assignment_document);
     CHECK(budget.current == location_assignment_baseline);
+
+    puts("test: HTMLMetaElement reflects its content attribute");
+    /* The shared native element receiver answered meta.content with the
+       <template> fragment getter (null); ChatGPT's keyboard bootstrap
+       called .includes() on it. */
+    size_t meta_content_baseline = budget.current;
+    static const char meta_content_page[] =
+        "<!doctype html><head><meta name=viewport "
+        "content='width=device-width, initial-scale=1'></head><body><script>"
+        "var m=document.querySelector('meta[name=viewport]');"
+        "var before=m.content;m.content='width=320';"
+        "globalThis.pocSummary=[typeof before,before,m.getAttribute('content'),"
+        "m instanceof HTMLMetaElement,m.name].join('|');"
+        "</script></body>";
+    PocDocument meta_content_document;
+    CHECK(document_parse(&meta_content_document, &budget, meta_content_page,
+                         strlen(meta_content_page), 17));
+    ScriptResult meta_content_result;
+    ScriptRuntime *meta_content_runtime = script_runtime_create(
+        &meta_content_document, &budget, 4 * MIB, 1000,
+        "https://example.test/meta", &meta_content_result);
+    CHECK(meta_content_runtime != NULL
+          && strcmp(meta_content_result.summary,
+                    "string|width=device-width, initial-scale=1|"
+                    "width=320|true|viewport") == 0);
+    script_runtime_destroy(meta_content_runtime);
+    document_destroy(&meta_content_document);
+    CHECK(budget.current == meta_content_baseline);
+
+    puts("test: Element.setHTMLUnsafe replaces children like innerHTML");
+    /* chatgpt.com's partial-update script refused to start its composer
+       without setHTMLUnsafe, then failed to fetch the polyfill on the PSP,
+       so Send was never wired up. Its probe for native declarative partial
+       updates must still see "before" and pick its own transport. */
+    size_t set_html_baseline = budget.current;
+    static const char set_html_page[] =
+        "<!doctype html><body><div id=t><i>old</i></div><script>"
+        "var t=document.getElementById('t');"
+        "t.setHTMLUnsafe('<b>new</b><span>x</span>');"
+        "var p=document.createElement('div');"
+        "p.setHTMLUnsafe('<?start name=\"p\">before<?end>"
+        "<template for=\"p\">after</template>');"
+        "var d=Document.parseHTMLUnsafe('<p id=q>parsed</p>');"
+        "globalThis.pocSummary=[typeof Element.prototype.setHTMLUnsafe,"
+        "t.children.length,t.firstChild.tagName,t.textContent,p.textContent,"
+        "d.getElementById('q').textContent].join('|');"
+        "</script></body>";
+    PocDocument set_html_document;
+    CHECK(document_parse(&set_html_document, &budget, set_html_page,
+                         strlen(set_html_page), 17));
+    ScriptResult set_html_result;
+    ScriptRuntime *set_html_runtime = script_runtime_create(
+        &set_html_document, &budget, 4 * MIB, 1000,
+        "https://example.test/set-html", &set_html_result);
+    CHECK(set_html_runtime != NULL
+          && strcmp(set_html_result.summary,
+                    "function|2|B|newx|before|parsed") == 0);
+    if (set_html_runtime != NULL
+        && strcmp(set_html_result.summary,
+                  "function|2|B|newx|before|parsed") != 0)
+        printf("set-html summary=%s\n", set_html_result.summary);
+    script_runtime_destroy(set_html_runtime);
+    document_destroy(&set_html_document);
+    CHECK(budget.current == set_html_baseline);
+
+    puts("test: DOM APIs chatgpt.com calls without feature tests");
+    /* Found by diffing the member calls in chatgpt.com's bundles against
+       Chromium: its composer positioning calls getAnimations(), and its
+       streaming renderer splits text nodes and clones/intersects ranges.
+       Its frame runtime walks parentNode until null, so document's Node
+       members must be null rather than missing. */
+    size_t chat_api_baseline = budget.current;
+    static const char chat_api_page[] =
+        "<!doctype html><body><p id=p>hello world</p>"
+        "<div id=r><b>a</b><i>b</i><u>c</u></div><script>"
+        "var o=[],p=document.getElementById('p'),r=document.getElementById('r');"
+        "o.push(p.getAnimations().length,document.getAnimations().length,"
+        "typeof KeyframeEffect,typeof reportError);"
+        "var tail=p.firstChild.splitText(5);"
+        "o.push(p.childNodes.length,p.firstChild.data,tail.data,"
+        "tail.previousSibling===p.firstChild);"
+        "var g=document.createRange();"
+        "g.setStartAfter(r.firstChild);g.setEndBefore(r.lastChild);"
+        "var f=g.cloneContents();"
+        "o.push(f.childNodes.length,f.firstChild.tagName,r.childNodes.length,"
+        "g.intersectsNode(r.children[1]),g.intersectsNode(r.firstChild),"
+        "g.intersectsNode(r.lastChild),g.intersectsNode(p));"
+        "p.inert=true;o.push(p.hasAttribute('inert'),p.inert);"
+        "var seen='';addEventListener('error',function(e){seen=e.error;});"
+        "reportError('boom');o.push(seen);"
+        "var a=p.animate([{opacity:0},{opacity:1}],"
+        "{duration:200,delay:50,fill:'both'});"
+        "var t=a.effect.getTiming(),ct=a.effect.getComputedTiming();"
+        "o.push(t.delay,t.duration,t.fill,ct.endTime,ct.activeDuration,"
+        "typeof a.updatePlaybackRate);"
+        "a.updatePlaybackRate(2);o.push(a.playbackRate);"
+        "var st=document.createElement('div').style;"
+        "st.cssText='color:red;margin-top:3px';"
+        "o.push(st.length,st[0],st.item(1),[...st].join(','));"
+        "p.style.cssText='opacity:0.5';o.push(p.style.length,[...p.style][0]);"
+        "var x=document.createElement('div');"
+        "x.innerHTML='<p>ab<b>cd</b></p><p>ef</p>';document.body.appendChild(x);"
+        "var cr=document.createRange();cr.setStart(x.firstChild.firstChild,1);"
+        "cr.setEnd(x.lastChild.firstChild,1);var hold=document.createElement('div');"
+        "hold.appendChild(cr.cloneContents());o.push(hold.innerHTML,x.innerHTML);"
+        "hold.innerHTML='';hold.appendChild(cr.extractContents());"
+        "o.push(hold.innerHTML,x.innerHTML,cr.collapsed,cr.startContainer===x,cr.startOffset);"
+        "var up=0;for(var n=p;n!==null;n=n.parentNode)up++;"
+        "o.push(up,String(document.parentElement),String(document.previousSibling),"
+        "String(document.nextSibling),String(document.nodeValue),"
+        "String(document.textContent),document.hasChildNodes(),"
+        "p.hasChildNodes(),document.createElement('i').hasChildNodes());"
+        "globalThis.pocSummary=o.join('|');"
+        "</script></body>";
+    PocDocument chat_api_document;
+    CHECK(document_parse(&chat_api_document, &budget, chat_api_page,
+                         strlen(chat_api_page), 17));
+    ScriptResult chat_api_result;
+    ScriptRuntime *chat_api_runtime = script_runtime_create(
+        &chat_api_document, &budget, 4 * MIB, 1000,
+        "https://example.test/chat-api", &chat_api_result);
+    static const char chat_api_expected[] =
+        "0|0|function|function|2|hello| world|true|1|I|3|"
+        "true|false|false|false|true|true|boom|50|200|both|250|200|"
+        "function|2|2|color|margin-top|color,margin-top|1|opacity|"
+        "<p>b<b>cd</b></p><p>e</p>|<p>ab<b>cd</b></p><p>ef</p>|"
+        "<p>b<b>cd</b></p><p>e</p>|<p>a</p><p>f</p>|true|true|1|"
+        "4|null|null|null|null|null|true|true|false";
+    CHECK(chat_api_runtime != NULL
+          && strcmp(chat_api_result.summary, chat_api_expected) == 0);
+    if (chat_api_runtime != NULL
+        && strcmp(chat_api_result.summary, chat_api_expected) != 0)
+        printf("chat-api summary=%s\n", chat_api_result.summary);
+    script_runtime_destroy(chat_api_runtime);
+    document_destroy(&chat_api_document);
+    CHECK(budget.current == chat_api_baseline);
+
+    puts("test: unhandled rejection text names a SyntaxError's source");
+    /* chatgpt.com's startup failed on the PSP with a stackless SyntaxError
+       from a deferred compile; the error's fileName/lineNumber/columnNumber
+       are its only location. */
+    size_t rejection_baseline = budget.current;
+    static const char rejection_page[] =
+        "<!doctype html><body><script>"
+        "Promise.reject(Object.assign(new SyntaxError('invalid assignment'),"
+        "{fileName:'https://site.test/m.js',lineNumber:3,columnNumber:14}));"
+        "</script></body>";
+    PocDocument rejection_document;
+    CHECK(document_parse(&rejection_document, &budget, rejection_page,
+                         strlen(rejection_page), 17));
+    ScriptResult rejection_result;
+    ScriptRuntime *rejection_runtime = script_runtime_create(
+        &rejection_document, &budget, 4 * MIB, 1000,
+        "https://site.test/", &rejection_result);
+    CHECK(rejection_runtime != NULL);
+    CHECK(script_runtime_advance(rejection_runtime, 0, 8,
+                                 &rejection_result));
+    if (strstr(rejection_result.last_promise_rejection,
+               "\n@ https://site.test/m.js:3:14") == NULL)
+        printf("rejection text=%s\n", rejection_result.last_promise_rejection);
+    CHECK(strstr(rejection_result.last_promise_rejection,
+                 "\n@ https://site.test/m.js:3:14") != NULL);
+    script_runtime_destroy(rejection_runtime);
+    document_destroy(&rejection_document);
+    CHECK(budget.current == rejection_baseline);
+
+    puts("test: form.elements lists the form's listed controls in tree order");
+    /* chatgpt.com reads form.elements.namedItem() on every composer update;
+       collecting it walked every descendant through script (6 ms a call on
+       the host). The list is the HTML "listed elements" minus image inputs,
+       including fieldset/object and form="" owners outside the form. */
+    {
+        size_t controls_baseline = budget.current;
+        static const char controls_page[] =
+            "<!doctype html><body><input form=f name=before>"
+            "<form id=f><fieldset id=fs><input name=a></fieldset>"
+            "<input type=image name=img><object name=o></object>"
+            "<output name=out></output><div><select name=s></select></div>"
+            "<form id=nested><input name=inner></form></form>"
+            "<input form=f name=ext><textarea name=t2 form=f></textarea>"
+            "<input name=other><script>"
+            "var f=document.getElementById('f'),e=f.elements;"
+            "globalThis.pocSummary=e.map(function(x){return x.name||x.tagName}).join()"
+            "+'|'+e.length+'|'+(e.namedItem('s')&&e.namedItem('s').tagName)"
+            "+'|'+(e.namedItem('img')===null)+'|'+Array.isArray(e)"
+            "+'|'+document.getElementById('fs').elements.map(function(x){return x.name}).join();"
+            "var n=document.createElement('input');n.name='late';f.appendChild(n);"
+            "var c=[f.elements.length];"
+            "document.querySelector('[name=other]').setAttribute('form','f');"
+            "c.push(f.elements.length);n.remove();c.push(f.elements.length);"
+            "c.push(f.elements===f.elements);"
+            "try{f.elements.push(n)}catch(_){}c.push(f.elements.length);"
+            "var d=document.createElement('form');d.appendChild(document.createElement('input'));"
+            "c.push(d.elements.length);d.appendChild(document.createElement('select'));"
+            "c.push(d.elements.length);"
+            "globalThis.pocSummary+='|'+c.join();"
+            "</script></body>";
+        PocDocument controls_document;
+        CHECK(document_parse(&controls_document, &budget, controls_page,
+                             strlen(controls_page), 17));
+        ScriptResult controls_result;
+        ScriptRuntime *controls_runtime = script_runtime_create(
+            &controls_document, &budget, 4 * MIB, 1000,
+            "https://controls.test/", &controls_result);
+        CHECK(controls_runtime != NULL);
+        static const char controls_expected[] =
+            "before,FIELDSET,a,o,out,s,inner,ext,t2|9|SELECT|true|true|a"
+            "|10,11,10,true,10,1,2";
+        if (strcmp(controls_result.summary, controls_expected) != 0)
+            printf("form elements: %s\n", controls_result.summary);
+        CHECK(strcmp(controls_result.summary, controls_expected) == 0);
+        script_runtime_destroy(controls_runtime);
+        document_destroy(&controls_document);
+        CHECK(budget.current == controls_baseline);
+    }
+
+    puts("test: event paths, roots and ancestry match with and without shadow roots");
+    /* Until a realm creates a shadow root, dispatch skips retargeting and
+       getRootNode, contains() and the pre-insert ancestor check walk native
+       parents. The same probe must answer alike on those fast paths and on
+       the script walks a shadow root brings back (a detached host already
+       disables them), and shadow retargeting, closed-root composedPath()
+       and slots must keep working. form.elements survives class/style churn
+       but not id/form/type or tree changes; adoption stamps the Attr objects
+       script holds and a later one takes the adopted document. */
+    {
+        size_t tree_baseline = budget.current;
+#define TREE_PROBE_BODY \
+        "<div id=mid><p><span id=deep>t</span></p></div><form id=f>" \
+        "<div id=box><input id=a name=a><select name=s></select></div>" \
+        "<textarea name=t></textarea></form><form id=g></form>" \
+        "<input id=ext name=ext>"
+#define TREE_PROBE_SCRIPT \
+        "var __probe=function(){var F=[],d=document,b=d.body;function ok(n," \
+        "v){if(!v)F.push(n)}function hre(n,fn){var e=null;try{fn()}catch(x){" \
+        "e=x}ok(n,e&&e.name==='HierarchyRequestError')}" \
+        "var mid=d.getElementById('mid'),deep=d.getElementById('deep')," \
+        "f=d.getElementById('f'),g=d.getElementById('g');" \
+        "var x=d.createElement('div'),y=d.createElement('span');x.append(y);" \
+        "var fr=d.createDocumentFragment(),t=d.createTextNode('t');" \
+        "fr.append(t);var tpl=d.createElement('template');tpl.innerHTML='<i>" \
+        "a</i>';var loose=d.createElement('i'),inner=d.createElement('b')," \
+        "outer=d.createElement('div');loose.append(inner);" \
+        "loose.__tilefinchDetachedParent=outer;ok('g1'," \
+        "deep.getRootNode()===d);ok('g2'," \
+        "d.documentElement.getRootNode()===d);ok('g3',d.getRootNode()===d);" \
+        "ok('g4',y.getRootNode()===x&&x.getRootNode()===x);ok('g5'," \
+        "t.getRootNode()===fr&&fr.getRootNode()===fr);ok('g6'," \
+        "tpl.content.firstChild.getRootNode()===tpl.content);ok('g7'," \
+        "inner.getRootNode()===outer&&loose.getRootNode()===outer);ok('g8'," \
+        "deep.getRootNode({composed:true})===d&&y.getRootNode({composed:true}" \
+        ")===x);ok('c1',b.contains(deep)&&mid.contains(deep)&&deep.contains(d" \
+        "eep));ok('c2',!deep.contains(mid)&&!b.contains(null)&&!b.contains(y)" \
+        ");ok('c3',x.contains(y)&&!y.contains(x));ok('c4'," \
+        "outer.contains(inner)&&!inner.contains(outer));ok('c5'," \
+        "deep.parentNode.contains(deep.firstChild)&&!tpl.contains(tpl.content" \
+        ".firstChild));hre('h1',function(){b.appendChild(b)});hre('h2'," \
+        "function(){deep.appendChild(mid)});hre('h3',function(){" \
+        "y.appendChild(x)});hre('h4',function(){inner.appendChild(outer)});" \
+        "hre('h5',function(){deep.insertBefore(mid,null)});hre('h6'," \
+        "function(){fr.appendChild(fr)});hre('h7',function(){deep.append(b)}" \
+        ");ok('h8',deep.parentNode===mid.firstElementChild||mid.contains(deep" \
+        "));var z=d.createElement('em');x.appendChild(z);" \
+        "y.appendChild(d.createElement('u'));deep.appendChild(z);ok('h9'," \
+        "z.parentNode===deep&&x.childNodes.length===1);" \
+        "var w=d.createElement('q');inner.appendChild(w);ok('h10'," \
+        "w.parentNode===inner);loose.__tilefinchDetachedParent=null;ok('g9'," \
+        "inner.getRootNode()===loose);loose.__tilefinchDetachedParent=outer;" \
+        "var log=[],other=d.createElement('a');function L(n){" \
+        "return function(e){log.push(n+(e.target===deep?'':'!t')+(e.relatedTa" \
+        "rget===other?'':'!r')+(e.composedPath().length===(n==='w'?7:7)?'':'!" \
+        "p'+e.composedPath().length))}}[[window,'w'],[d,'d'],[b,'b'],[mid," \
+        "'m'],[deep,'x']].forEach(function(p){" \
+        "p[0].addEventListener('mouseover',L(p[1]+'c'),true);" \
+        "p[0].addEventListener('mouseover',L(p[1]),false)});" \
+        "var ev=new MouseEvent('mouseover',{bubbles:true,composed:true," \
+        "relatedTarget:other});deep.dispatchEvent(ev);ok('e1'," \
+        "log.join()==='wc,dc,bc,mc,xc,x,m,b,d,w');ok('e2'," \
+        "ev.target===deep&&ev.composedPath().length===0&&ev.relatedTarget===o" \
+        "ther);var seen=[];x.addEventListener('ping',function(e){" \
+        "seen.push(e.target===y,e.composedPath().length,e.currentTarget===x)}" \
+        ");y.dispatchEvent(new Event('ping',{bubbles:true}));ok('e3'," \
+        "seen.join()==='true,2,true');var p3=[];" \
+        "outer.addEventListener('pong',function(e){p3.push(e.target===inner," \
+        "e.composedPath().length)});inner.dispatchEvent(new Event('pong',{" \
+        "bubbles:true}));ok('e4',p3.join()==='true,3');var E=f.elements," \
+        "ext=d.getElementById('ext'),a=d.getElementById('a');a.className='k';" \
+        "a.style.color='red';a.setAttribute('aria-label','q');" \
+        "a.setAttribute('data-x','1');ok('f1',f.elements===E&&E.length===3);" \
+        "a.name='renamed';ok('f2',f.elements.namedItem('renamed')===a);" \
+        "ext.setAttribute('form','f');ok('f3'," \
+        "f.elements.length===4&&f.elements[3]===ext);f.id='f2';ok('f4'," \
+        "f.elements.length===3);f.id='f';ok('f5',f.elements.length===4);" \
+        "ext.removeAttribute('form');ok('f6',f.elements.length===3);" \
+        "a.type='image';ok('f7',f.elements.length===2);a.type='text';ok('f8'," \
+        "f.elements.length===3&&f.elements[0]===a);g.appendChild(a);ok('f9'," \
+        "f.elements.length===2&&g.elements[0]===a);f.prepend(a);ok('f10'," \
+        "f.elements[0]===a&&g.elements.length===0);" \
+        "d.getElementById('box').textContent='';ok('f11'," \
+        "f.elements.length===2);var el=d.createElement('p');" \
+        "el.setAttribute('a','1');el.setAttribute('b','2');" \
+        "var kid=d.createElement('i');kid.setAttribute('c','3');" \
+        "el.append(kid);var A=el.getAttributeNode('a')," \
+        "C=kid.getAttributeNode('c'),nd=d.implementation.createHTMLDocument('" \
+        "');nd.adoptNode(el);ok('a1',el.ownerDocument===nd&&kid.ownerDocument" \
+        "===nd&&A.ownerDocument===nd&&C.ownerDocument===nd);" \
+        "var B=el.getAttributeNode('b');ok('a2'," \
+        "B.ownerDocument===nd&&el.attributes.length===2);" \
+        "el.removeAttribute('a');ok('a3'," \
+        "A.ownerElement===null&&A.ownerDocument===nd);d.adoptNode(el);" \
+        "ok('a4',el.ownerDocument===d&&B.ownerDocument===d&&A.ownerDocument==" \
+        "=nd&&kid.getAttributeNode('c').ownerDocument===d);" \
+        "el.removeAttribute('b');ok('a5'," \
+        "B.ownerDocument===d&&el.attributes.length===0);" \
+        "tpl.innerHTML='<b x=1></b>';var bb=tpl.content.firstChild," \
+        "X=bb.getAttributeNode('x');var od=bb.ownerDocument;ok('a6'," \
+        "od!==d&&X.ownerDocument===od&&tpl.content.firstChild.getAttributeNod" \
+        "e('x')===X);bb.removeAttribute('x');ok('a7',X.ownerDocument===od);" \
+        "var leaf=d.createElement('i'),top=leaf;for(var i=0;i<300;i++){" \
+        "var n=d.createElement('i');n.appendChild(top);top=n}var dh=null;try{" \
+        "leaf.appendChild(d.createElement('b'))}catch(e){dh=e.name}ok('h11'," \
+        "dh==='HierarchyRequestError');return F.length?'FAIL:'+F.join():'OK'}" \
+        ";"
+#define TREE_SHADOW_SCRIPT \
+        "var __shadow=function(){var F=[],d=document,b=d.body;function ok(n," \
+        "v){if(!v)F.push(n)}var host=d.createElement('div');b.append(host);" \
+        "var root=host.attachShadow({mode:'open'})," \
+        "inner=d.createElement('span');root.append(inner);ok('s1'," \
+        "inner.getRootNode()===root&&root.getRootNode()===root&&inner.getRoot" \
+        "Node({composed:true})===d&&host.getRootNode()===d);ok('s2'," \
+        "!host.contains(inner));var log=[];function L(n){return function(e){" \
+        "log.push(n+':'+(e.target===inner?'i':e.target===host?'h':'?')+e.comp" \
+        "osedPath().length)}}inner.addEventListener('hit',L('in'));" \
+        "root.addEventListener('hit',L('r'));host.addEventListener('hit'," \
+        "L('h'));d.addEventListener('hit',L('d'));" \
+        "inner.dispatchEvent(new Event('hit',{bubbles:true,composed:true}));" \
+        "ok('s3',log.join()==='in:i7,r:i7,h:h7,d:h7');log=[];" \
+        "inner.dispatchEvent(new Event('hit',{bubbles:true}));ok('s4'," \
+        "log.join()==='in:i2,r:i2');var h2=d.createElement('div');" \
+        "b.append(h2);var cr=h2.attachShadow({mode:'closed'})," \
+        "in2=d.createElement('b');cr.append(in2);var l2=[];" \
+        "in2.addEventListener('hit',function(e){" \
+        "l2.push('in:'+(e.target===in2)+e.composedPath().length)});" \
+        "d.addEventListener('hit',function(e){" \
+        "if(e.target===h2)l2.push('d:'+e.composedPath().length+(e.composedPat" \
+        "h().indexOf(in2)<0))});in2.dispatchEvent(new Event('hit',{" \
+        "bubbles:true,composed:true}));ok('s5',l2.join()==='in:true7," \
+        "d:5true');var h3=d.createElement('div'),light=d.createElement('i');" \
+        "h3.append(light);b.append(h3);var r3=h3.attachShadow({mode:'open'});" \
+        "r3.innerHTML='<p><slot></slot></p>';" \
+        "var slot=r3.querySelector('slot'),l3=[];slot.addEventListener('hit'," \
+        "function(e){l3.push('slot:'+(e.target===light))});" \
+        "h3.addEventListener('hit',function(e){" \
+        "l3.push('h:'+(e.target===light)+e.composedPath().length)});" \
+        "light.dispatchEvent(new Event('hit',{bubbles:true}));ok('s6'," \
+        "l3.join()==='slot:true,h:true9'&&light.assignedSlot===slot);" \
+        "var other=d.createElement('a'),rt=[];" \
+        "host.addEventListener('mouseover',function(e){" \
+        "rt.push(e.target===host,e.relatedTarget===other)});" \
+        "inner.dispatchEvent(new MouseEvent('mouseover',{bubbles:true," \
+        "composed:true,relatedTarget:other}));ok('s7',rt.join()==='true," \
+        "true');var x=d.createElement('div'),y=d.createElement('i');" \
+        "x.append(y);var e3=null;try{y.appendChild(x)}catch(e){e3=e.name}" \
+        "ok('s8',e3==='HierarchyRequestError');" \
+        "return F.length?'FAIL:'+F.join():'OK'};"
+        static const char *const tree_pages[] = {
+            "<!doctype html><html><body>" TREE_PROBE_BODY "<script>"
+            TREE_PROBE_SCRIPT "globalThis.pocSummary=__probe();"
+            "</script></body></html>",
+            "<!doctype html><html><body>" TREE_PROBE_BODY "<script>"
+            TREE_PROBE_SCRIPT TREE_SHADOW_SCRIPT
+            "document.createElement('div').attachShadow({mode:'open'});"
+            "globalThis.pocSummary=__probe()+'|'+__shadow();"
+            "</script></body></html>",
+        };
+#undef TREE_PROBE_BODY
+#undef TREE_PROBE_SCRIPT
+#undef TREE_SHADOW_SCRIPT
+        static const char *const tree_expected[] = {"OK", "OK|OK"};
+        for (size_t i = 0; i < 2; i++) {
+            PocDocument tree_document;
+            CHECK(document_parse(&tree_document, &budget, tree_pages[i],
+                                 strlen(tree_pages[i]), 17));
+            ScriptResult tree_result;
+            ScriptRuntime *tree_runtime = script_runtime_create(
+                &tree_document, &budget, 4 * MIB, 1000,
+                "https://tree.test/", &tree_result);
+            CHECK(tree_runtime != NULL);
+            if (strcmp(tree_result.summary, tree_expected[i]) != 0)
+                printf("tree probe %zu: %s %s\n", i, tree_result.summary,
+                       tree_result.error);
+            CHECK(strcmp(tree_result.summary, tree_expected[i]) == 0);
+            script_runtime_destroy(tree_runtime);
+            document_destroy(&tree_document);
+        }
+        CHECK(budget.current == tree_baseline);
+    }
+
+    puts("test: transient mutation registrations end at every delivery");
+    /* DOM "notify mutation observers" removes every observer's transient
+       registrations, including observers with no records. Kept, they piled
+       up (64 per observer) on chatgpt.com and every attribute write walked
+       the ancestors once per root: ~840 us a setAttribute on the host. */
+    {
+        size_t transient_baseline = budget.current;
+        static const char transient_page[] =
+            "<!doctype html><body><div id=x><p id=c></p></div><script>"
+            "var log=[],x=document.getElementById('x'),c=document.getElementById('c');"
+            "new MutationObserver(function(r){log.push('A'+r.length)})"
+            ".observe(x,{attributes:true,subtree:true});"
+            "new MutationObserver(function(r){log.push('B'+r.length)})"
+            ".observe(x,{childList:true});"
+            "x.removeChild(c);"
+            "setTimeout(function(){c.setAttribute('late','1');"
+            "setTimeout(function(){globalThis.pocSummary=log.join()},0)},0);"
+            "</script></body>";
+        PocDocument transient_document;
+        CHECK(document_parse(&transient_document, &budget, transient_page,
+                             strlen(transient_page), 17));
+        ScriptResult transient_result;
+        ScriptRuntime *transient_runtime = script_runtime_create(
+            &transient_document, &budget, 4 * MIB, 1000,
+            "https://transient.test/", &transient_result);
+        CHECK(transient_runtime != NULL);
+        for (size_t turn = 0; turn < 8u; turn++)
+            CHECK(script_runtime_advance(transient_runtime, 1, 8,
+                                         &transient_result));
+        if (strcmp(transient_result.summary, "B1") != 0)
+            printf("transient registrations: %s\n", transient_result.summary);
+        CHECK(strcmp(transient_result.summary, "B1") == 0);
+        script_runtime_destroy(transient_runtime);
+        document_destroy(&transient_document);
+        CHECK(budget.current == transient_baseline);
+    }
+
+    puts("test: microtasks wait for the script stack to empty");
+    /* chatgpt.com's signals engine threw "Signals cannot be changed during a
+       computation, render, or adoption frame" because a host path reached
+       from its render drained the microtask queue mid-render. HTML runs the
+       checkpoint only once the JavaScript stack is empty. */
+    {
+        size_t order_baseline = budget.current;
+        static const char order_page[] =
+            "<!doctype html><body><button id=b>b</button><input id=i>"
+            "<script>"
+            "var o=[],b=document.getElementById('b'),i=document.getElementById('i');"
+            "queueMicrotask(()=>o.push('m1'));"
+            "b.addEventListener('click',()=>o.push('click'));"
+            "i.addEventListener('focus',()=>o.push('focus'));"
+            "b.click();i.focus();"
+            "Promise.resolve().then(()=>o.push('m2'));"
+            "b.dispatchEvent(new Event('click'));"
+            "o.push('end');"
+            "setTimeout(()=>{globalThis.pocSummary=o.join()},0);"
+            "</script></body>";
+        PocDocument order_document;
+        CHECK(document_parse(&order_document, &budget, order_page,
+                             strlen(order_page), 17));
+        ScriptResult order_result;
+        ScriptRuntime *order_runtime = script_runtime_create(
+            &order_document, &budget, 4 * MIB, 1000,
+            "https://order.test/", &order_result);
+        CHECK(order_runtime != NULL);
+        for (size_t turn = 0; turn < 8u; turn++)
+            CHECK(script_runtime_advance(order_runtime, 1, 8,
+                                         &order_result));
+        static const char order_expected[] = "click,focus,click,end,m1,m2";
+        if (strcmp(order_result.summary, order_expected) != 0)
+            printf("microtask order: %s\n", order_result.summary);
+        CHECK(strcmp(order_result.summary, order_expected) == 0);
+        script_runtime_destroy(order_runtime);
+        document_destroy(&order_document);
+        CHECK(budget.current == order_baseline);
+    }
+
+    puts("test: the page heap grows under demand and returns what it frees");
+    /* A realm's configured heap is a floor, not a ceiling: on the PSP
+       chatgpt.com's client needs ~12 MB of a 5 MB (+4 MB boot) realm to
+       finish starting. Growth stops where the page Budget would lose its
+       work reserve or at the ceiling, and collections give it back. */
+    {
+        static const char grow_page[] =
+            "<!doctype html><body><script>"
+            "globalThis.hold=[];globalThis.fill=(n)=>{try{"
+            "for(let i=0;i<n;i++)hold.push(new ArrayBuffer(256*1024));"
+            "return 'ok'}catch(e){return String(e)}};"
+            "globalThis.pocSummary='ready';</script></body>";
+        const struct {
+            size_t occupied;   /* Budget taken by other page work */
+            size_t buffers;    /* 256 KiB buffers the page retains */
+            const char *expected;
+        } cases[] = {
+            {0u, 16u, "ok"},                         /* 4 MiB: grows */
+            {0u, 40u, "InternalError: out of memory"}, /* past ceiling */
+            {6u * MIB, 24u, "InternalError: out of memory"}, /* reserve */
+            {9u * MIB, 16u, "ok"}, /* held by a cache that gives way */
+        };
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            size_t grow_baseline = budget.current;
+            void *occupied = cases[c].occupied == 0 ? NULL
+                : budget_malloc(&budget, cases[c].occupied);
+            CHECK(cases[c].occupied == 0 || occupied != NULL);
+            if (c == 3) {
+                grow_test_cache = occupied;
+                grow_test_budget = &budget;
+                occupied = NULL;
+                budget_set_reclaim_hook(&budget, grow_test_reclaim, NULL);
+            }
+            PocDocument grow_document;
+            CHECK(document_parse(&grow_document, &budget, grow_page,
+                                 strlen(grow_page), 17));
+            ScriptResult grow_result;
+            ScriptRuntime *grow_runtime = script_runtime_create(
+                &grow_document, &budget, 2 * MIB, 1000,
+                "https://grow.test/", &grow_result);
+            CHECK(grow_runtime != NULL);
+            size_t reserve = (budget.limit - grow_baseline) / 5u;
+            script_runtime_enable_heap_growth(grow_runtime, 8 * MIB,
+                                              reserve);
+            /* Refusal decisions see the growable headroom, collection
+               triggers only the room under the current limit. */
+            CHECK(c == 2 || c == 3
+                  || script_runtime_heap_available(grow_runtime)
+                         > script_runtime_heap_remaining(grow_runtime) + MIB);
+            char call[64];
+            snprintf(call, sizeof(call), "pocSummary=fill(%zu)",
+                     cases[c].buffers);
+            CHECK(script_runtime_evaluate_diagnostic(
+                grow_runtime, call, "<grow>", &grow_result));
+            ScriptHeapGrowth growth;
+            script_runtime_heap_growth(grow_runtime, &growth);
+            if (strcmp(grow_result.summary, cases[c].expected) != 0
+                || growth.limit > 8 * MIB)
+                printf("heap growth case %zu: %s limit=%zu raises=%zu "
+                       "refusals=%zu free=%zu\n", c, grow_result.summary,
+                       growth.limit, growth.raises, growth.refusals,
+                       budget_remaining(&budget));
+            CHECK(strcmp(grow_result.summary, cases[c].expected) == 0);
+            CHECK(growth.limit <= 8 * MIB);
+            CHECK(c != 0 || (growth.raises != 0 && growth.limit > 4 * MIB));
+            CHECK(c == 0 || c == 3 || growth.refusals != 0);
+            CHECK(c != 3 || (grow_test_cache == NULL && growth.raises != 0));
+            /* Growth never spends the reserve; allocator bookkeeping for
+               the admitted blocks may take a little of it. */
+            if (budget_remaining(&budget) + 128u * 1024u < reserve)
+                printf("heap growth case %zu reserve: free=%zu reserve=%zu "
+                       "limit=%zu budget=%zu\n", c,
+                       budget_remaining(&budget), reserve, growth.limit,
+                       budget.limit);
+            CHECK(budget_remaining(&budget) + 128u * 1024u >= reserve);
+            CHECK(c != 2 || growth.raises != 0);
+            if (c == 0) {
+                /* Dropped: later collections return the growth. */
+                CHECK(script_runtime_evaluate_diagnostic(
+                    grow_runtime, "hold.length=0;pocSummary='dropped'",
+                    "<drop>", &grow_result));
+                for (size_t turn = 0; turn < 600u; turn++)
+                    CHECK(script_runtime_advance(grow_runtime, 1, 4,
+                                                 &grow_result));
+                script_runtime_heap_growth(grow_runtime, &growth);
+                if (growth.returns == 0 || growth.limit > growth.floor + MIB)
+                    printf("heap growth return: limit=%zu floor=%zu "
+                           "returns=%zu\n", growth.limit, growth.floor,
+                           growth.returns);
+                CHECK(growth.returns != 0
+                      && growth.limit <= growth.floor + MIB);
+            }
+            script_runtime_destroy(grow_runtime);
+            document_destroy(&grow_document);
+            budget_free(&budget, occupied);
+            budget_set_reclaim_hook(&budget, NULL, NULL);
+            budget_free(&budget, grow_test_cache);
+            grow_test_cache = NULL;
+            CHECK(budget.current == grow_baseline);
+        }
+    }
+
+    puts("test: queries and tree walkers are not truncated at 128 nodes");
+    /* chatgpt.com's partial-update polyfill finds the answer's
+       <?start name=...> markers with a comment TreeWalker over the whole
+       document; querySelectorAll and TreeWalker stopped at 128 results, so
+       the streamed answer was never applied. */
+    size_t walk_baseline = budget.current;
+    char walk_page[16384];
+    size_t walk_length = (size_t) snprintf(
+        walk_page, sizeof(walk_page), "%s", "<!doctype html><body>");
+    for (int i = 0; i < 300; i++)
+        walk_length += (size_t) snprintf(
+            walk_page + walk_length, sizeof(walk_page) - walk_length,
+            "<div><!--c%d--></div>", i);
+    walk_length += (size_t) snprintf(
+        walk_page + walk_length, sizeof(walk_page) - walk_length, "%s",
+        "<script>var w=document.createTreeWalker(document,128),c=0,last='';"
+        "while(w.nextNode()){c++;last=w.currentNode.nodeValue}"
+        "globalThis.pocSummary=document.querySelectorAll('div').length+'|'"
+        "+c+'|'+last;</script></body>");
+    CHECK(walk_length < sizeof(walk_page));
+    PocDocument walk_document;
+    CHECK(document_parse(&walk_document, &budget, walk_page, walk_length, 17));
+    ScriptResult walk_result;
+    ScriptRuntime *walk_runtime = script_runtime_create(
+        &walk_document, &budget, 4 * MIB, 1000,
+        "https://example.test/walk", &walk_result);
+    CHECK(walk_runtime != NULL
+          && strcmp(walk_result.summary, "300|300|c299") == 0);
+    if (walk_runtime != NULL
+        && strcmp(walk_result.summary, "300|300|c299") != 0)
+        printf("walk summary=%s\n", walk_result.summary);
+    script_runtime_destroy(walk_runtime);
+    document_destroy(&walk_document);
+    CHECK(budget.current == walk_baseline);
+
+    puts("test: NodeFilter, TreeWalker and NodeIterator follow the DOM standard");
+    /* fixtures/dom-traversal.html asserts filters (function and
+       acceptNode), whatToShow, FILTER_REJECT vs FILTER_SKIP, live walking
+       under mutation, NodeIterator reference adjustment on removal, the
+       document root (nodes outside <html>), and 5,000-node walks. */
+    size_t traversal_baseline = budget.current;
+    FILE *traversal_file = fopen(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/dom-traversal.html", "rb");
+    char *traversal_page = NULL;
+    size_t traversal_length = 0;
+    if (traversal_file != NULL) {
+        traversal_page = malloc(64 * 1024);
+        if (traversal_page != NULL)
+            traversal_length = fread(traversal_page, 1, 64 * 1024,
+                                     traversal_file);
+        fclose(traversal_file);
+    }
+    CHECK(traversal_page != NULL && traversal_length > 0
+          && traversal_length < 64 * 1024);
+    PocDocument traversal_document;
+    bool traversal_parsed = traversal_page != NULL
+        && document_parse(&traversal_document, &budget, traversal_page,
+                          traversal_length, 4096);
+    free(traversal_page);
+    CHECK(traversal_parsed);
+    ScriptResult traversal_result;
+    ScriptRuntime *traversal_runtime = !traversal_parsed ? NULL
+        : script_runtime_create(&traversal_document, &budget, 8 * MIB, 5000,
+                                "https://example.test/traversal",
+                                &traversal_result);
+    bool traversal_ok = traversal_runtime != NULL
+        && strcmp(traversal_result.summary, "traversal-ok") == 0;
+    if (!traversal_ok)
+        printf("traversal summary=%s error=%s\n",
+               traversal_runtime != NULL ? traversal_result.summary : "",
+               traversal_runtime != NULL ? traversal_result.error : "");
+    CHECK(traversal_ok);
+    script_runtime_destroy(traversal_runtime);
+    if (traversal_parsed) document_destroy(&traversal_document);
+    CHECK(budget.current == traversal_baseline);
+
+    puts("test: a realm's heap limit grows in bounded steps");
+    size_t grow_baseline = budget.current;
+    static const char grow_page[] = "<!doctype html><p>x</p>";
+    PocDocument grow_document;
+    CHECK(document_parse(&grow_document, &budget, grow_page,
+                         strlen(grow_page), 17));
+    ScriptResult grow_result;
+    ScriptRuntime *grow_runtime = script_runtime_create(
+        &grow_document, &budget, 4 * MIB, 1000,
+        "https://example.test/grow", &grow_result);
+    CHECK(grow_runtime != NULL);
+    size_t grow_before = script_runtime_heap_remaining(grow_runtime);
+    CHECK(script_runtime_grow_heap_limit(grow_runtime, MIB, 5 * MIB)
+          && script_runtime_heap_remaining(grow_runtime)
+                 >= grow_before + MIB - 64u * 1024u);
+    CHECK(!script_runtime_grow_heap_limit(grow_runtime, MIB, 5 * MIB));
+    script_runtime_destroy(grow_runtime);
+    document_destroy(&grow_document);
+    CHECK(budget.current == grow_baseline);
 
     puts("test: deterministic clock advances during synchronous JavaScript");
     size_t deterministic_clock_baseline = budget.current;

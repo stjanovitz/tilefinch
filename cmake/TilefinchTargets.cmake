@@ -19,6 +19,10 @@ if(NOT PSP)
         tools/youtube_resolver_probe.c)
     target_link_libraries(tilefinch-youtube-resolver-probe
         PRIVATE tilefinch_core)
+    add_executable(tilefinch-offline-library-fixture
+        tools/offline_library_fixture.c)
+    target_link_libraries(tilefinch-offline-library-fixture
+        PRIVATE tilefinch_core)
 endif()
 if(NOT PSP AND PSP_BROWSER_BUILD_HOST_MEDIA_LAB)
     find_package(PkgConfig QUIET)
@@ -69,6 +73,12 @@ target_link_libraries(psp-browser-failure-recovery PRIVATE tilefinch_core)
 add_executable(tilefinch-input-latency-bench tools/input_latency_bench.c)
 target_link_libraries(tilefinch-input-latency-bench PRIVATE tilefinch_core)
 
+# JavaScript engine micro-benchmark, host side of the PSP validation mode
+# (boot.cfg validation_js_bench=N). Same kernels, same allocator path.
+add_executable(tilefinch-js-bench tools/js_bench_main.c src/js_bench.c)
+target_link_libraries(tilefinch-js-bench PRIVATE tilefinch_core)
+target_include_directories(tilefinch-js-bench PRIVATE include)
+
 if(PSP)
     # These are host diagnostic frontends. Keep them individually available
     # for unusual toolchain experiments, but do not let a bare PSP aggregate
@@ -77,6 +87,7 @@ if(PSP)
         psp-browser-lab
         psp-browser-interactive-lab
         tilefinch-input-latency-bench
+        tilefinch-js-bench
         PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
@@ -262,6 +273,7 @@ if(PSP)
     target_link_libraries(tilefinch-launcher PRIVATE
         tilefinch_psp_display tilefinch_psp_systemctrl_imports
         ${TILEFINCH_PSP_CRYPTO_LIBRARIES}
+        tilefinch_psp_entropy
         pspdisplay pspge pspctrl psprtc)
     set_target_properties(tilefinch-launcher PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/launcher")
@@ -408,16 +420,50 @@ if(PSP)
             target_sources(psp-browser-script PRIVATE src/psp_transport_probe.c)
             set(_transport_probe_link_options)
             foreach(_symbol curl_multi_perform curl_multi_poll curlx_nonblock gethostbyname connect select recv send
-                            sceKernelWaitSema sceKernelDelayThread sceNetInetSelect)
+                            close sceKernelWaitSema sceKernelDelayThread sceNetInetSelect
+                            mbedtls_ssl_set_session mbedtls_ssl_get_session
+                            mbedtls_ssl_read mbedtls_ssl_handshake)
                 list(APPEND _transport_probe_link_options "LINKER:--wrap=${_symbol}")
             endforeach()
             target_link_options(psp-browser-script PRIVATE ${_transport_probe_link_options})
+        endif()
+        if(PSP_BROWSER_QUICKJS_PGO_GENERATE)
+            # The clean exit writes the engine's profile counters
+            # (TilefinchDependencies.cmake, PSP_BROWSER_QUICKJS_PGO_GENERATE).
+            target_compile_definitions(psp-browser-script PRIVATE
+                TILEFINCH_PSP_PGO_GENERATE=1)
         endif()
         target_link_libraries(psp-browser-script PRIVATE tilefinch_core
             tilefinch_psp_ui tilefinch_psp_display
             tilefinch_psp_media_scale
             tilefinch_psp_media_present
             tilefinch_psp_app_support tilefinch_diagnostic_qr)
+        # Code-layout experiments (PERFORMANCE_LEDGER.md, "Profile-ordered
+        # code layout"). Every function already has its own section
+        # (-ffunction-sections), so a
+        # GNU ld --section-ordering-file places a profiled hot set first and
+        # contiguous in .text, inside as few 8 KiB I-cache ways as it needs.
+        # Link-only: the objects, and so the instructions, are unchanged.
+        # Empty (the default) leaves the link exactly as before.
+        set(PSP_BROWSER_PSP_SECTION_ORDERING_FILE "" CACHE FILEPATH
+            "GNU ld section ordering file for the PSP browser links (experiment)")
+        option(PSP_BROWSER_PSP_LINK_MAP
+            "Write a linker map beside the PSP browser ELF and dev PRX" OFF)
+        set(TILEFINCH_PSP_LAYOUT_LINK_OPTIONS)
+        if(PSP_BROWSER_PSP_SECTION_ORDERING_FILE)
+            list(APPEND TILEFINCH_PSP_LAYOUT_LINK_OPTIONS
+                "LINKER:--section-ordering-file,${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+            set_property(TARGET psp-browser-script APPEND PROPERTY
+                LINK_DEPENDS "${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+        endif()
+        if(TILEFINCH_PSP_LAYOUT_LINK_OPTIONS)
+            target_link_options(psp-browser-script PRIVATE
+                ${TILEFINCH_PSP_LAYOUT_LINK_OPTIONS})
+        endif()
+        if(PSP_BROWSER_PSP_LINK_MAP)
+            target_link_options(psp-browser-script PRIVATE
+                "LINKER:-Map,${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script.map")
+        endif()
         if(TARGET tilefinch-wasm-component)
             # This is a runtime asset, not a link input.  A POST_BUILD copy
             # alone goes stale when only the component changes and the EBOOT
@@ -491,6 +537,7 @@ if(PSP)
                 src/psp_input_script.c
                 src/psp_app/psp_app_input_script.c
                 src/psp_webgl_ge_probe.c
+                src/js_bench.c
                 src/psp_media_fixture.c
                 src/psp_media_range_probe.c
                 src/psp_raster_fixture.c
@@ -536,8 +583,12 @@ if(PSP)
                 src/psp_time.c)
             target_compile_definitions(psp-browser-script PRIVATE
                 TILEFINCH_PSP_LIVE_NETWORK=1)
+            # The DNS stub draws query IDs from the entropy pool in every
+            # transport mode; the owned transport also lists it after
+            # libmbedcrypto for the TLS hook.
             target_link_libraries(psp-browser-script PRIVATE
                 ${TILEFINCH_PSP_TRANSPORT_LIBRARIES}
+                tilefinch_psp_entropy
                 "-Wl,--whole-archive"
                 pspnet pspnet_inet pspnet_apctl pspnet_resolver pspwlan
                 psputility
@@ -586,7 +637,12 @@ if(PSP)
             # mixer thread while JavaScript stalls. Keep validation probes
             # out of the shipping ratchet while allowing measured device-only
             # instrumentation to grow without code-golfing production paths.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4500000)
+            # Raised by 200,000 bytes (user-approved) for the measurement
+            # tiers (work vector, offline replay): validation was within
+            # 1.3 KB of the old 4,500,000-byte limit.
+            # Raised by 280,000 bytes (user-approved) for the -O2 JavaScript
+            # engine (TilefinchDependencies.cmake): 4,548,332 -> 4,824,900.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4980000)
         else()
             # Security-boundary retirement and private lazy Worker compiler
             # installation are native fail-closed paths.  Their measured
@@ -598,7 +654,21 @@ if(PSP)
             # Security hardening for active-document principals and bounded
             # WebAssembly/QuickJS execution measured 4,470,576 bytes. Keep
             # 9,424 bytes of the user-approved 10 KiB growth allowance.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4480000)
+            # Raised by 280,000 bytes (user-approved) for the -O2 JavaScript
+            # engine: first usable input -3.2 s and first answer -6.5 s on
+            # the device (chatgpt-ask); this build 4,647,460 bytes.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4760000)
+        endif()
+        # Local size experiments only (an engine built at -O2 under PPSSPP,
+        # for instance): a build directory that sets this is over the
+        # ratchet by construction and must never be shipped or baselined.
+        set(PSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE "" CACHE STRING
+            "Replace the measured PSP .text ratchet in an experiment build")
+        if(PSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE)
+            message(WARNING "PSP .text ratchet overridden to "
+                "${PSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE} bytes: experiment "
+                "build, not a shippable image")
+            set(TILEFINCH_PSP_TEXT_LIMIT ${PSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE})
         endif()
         add_custom_command(TARGET psp-browser-script POST_BUILD
             COMMAND ${CMAKE_COMMAND}
@@ -616,7 +686,12 @@ if(PSP)
                 # growth tripwire, not an I-cache claim. Validation retains
                 # extra room for its boot qualifications and log setup.
                 -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,17408,10752>
-                -DPSP_INTERACTIVE_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,19456,14336>
+                -DPSP_VALIDATION_LOG=$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>
+                -DPSP_NO_SCRIPT_SAMPLER=$<AND:$<BOOL:${PSP_BROWSER_DISABLE_TRACE}>,$<NOT:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>>>
+                -DPSP_NO_FETCH_TRACE=$<NOT:$<BOOL:${PSP_BROWSER_ENABLE_FETCH_TRACE}>>
+                -DPSP_SHARED_FONT_ZLIB=$<AND:$<BOOL:${PSP_BROWSER_FREETYPE_AVAILABLE}>,$<NOT:$<BOOL:${PSP_BROWSER_SYSTEM_FREETYPE}>>>
+                -DPSP_LOOP_FRAME_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,6144,5120>
+                -DPSP_FRAME_SET_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,19456,14336>
                 -DTILEFINCH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckPspHotSymbolSizes.cmake"
             COMMENT "Checking PSP hot-function instruction-cache ratchets")
@@ -845,6 +920,7 @@ if(PSP)
             if(NOT PSP_BROWSER_CURL_STUB)
                 target_link_libraries(psp-browser-script-dev-prx PRIVATE
                     ${TILEFINCH_PSP_TRANSPORT_LIBRARIES}
+                    tilefinch_psp_entropy
                     "-Wl,--whole-archive"
                     pspnet pspnet_inet pspnet_apctl pspnet_resolver pspwlan
                     psputility
@@ -880,6 +956,16 @@ if(PSP)
                 LINK_DEPENDS
                 "${PSPDEV}/psp/sdk/lib/linkfile.prx"
                 "${PSPDEV}/psp/sdk/lib/prxexports.o")
+            if(TILEFINCH_PSP_LAYOUT_LINK_OPTIONS)
+                target_link_options(psp-browser-script-dev-prx PRIVATE
+                    ${TILEFINCH_PSP_LAYOUT_LINK_OPTIONS})
+                set_property(TARGET psp-browser-script-dev-prx APPEND PROPERTY
+                    LINK_DEPENDS "${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+            endif()
+            if(PSP_BROWSER_PSP_LINK_MAP)
+                target_link_options(psp-browser-script-dev-prx PRIVATE
+                    "LINKER:-Map,${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script-dev.map")
+            endif()
             add_custom_command(TARGET psp-browser-script-dev-prx POST_BUILD
                 COMMAND "${PSPDEV}/bin/psp-fixup-imports"
                     $<TARGET_FILE:psp-browser-script-dev-prx>
@@ -945,6 +1031,211 @@ if(PSP_BROWSER_LIBCURL_TRANSPORT AND NOT PSP)
     target_link_libraries(psp-browser-trace-acquire PRIVATE tilefinch_core)
     add_executable(psp-browser-trace-inventory src/trace_inventory_main.c)
     target_link_libraries(psp-browser-trace-inventory PRIVATE tilefinch_core)
+endif()
+
+# Explicit hardware helper-ABI control. This includes the exact selected VM
+# source once, before qjs's supporting archive objects. No browser target links
+# the fixture, and no CTest entry starts a cross-build or device run.
+if(PSP AND PSP_BROWSER_USE_BELLARD_QUICKJS)
+    add_executable(psp-native-tier-helper-probe EXCLUDE_FROM_ALL
+        benchmarks/native-tier-helper-probe.c src/psp_atomic_shims.c)
+    target_include_directories(psp-native-tier-helper-probe PRIVATE include)
+    target_compile_definitions(psp-native-tier-helper-probe PRIVATE
+        PSP_BROWSER_BELLARD_QUICKJS=1
+        TILEFINCH_HELPER_QUICKJS_SOURCE="${quickjs_SOURCE_DIR}/quickjs.c"
+        "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
+    target_compile_options(psp-native-tier-helper-probe PRIVATE
+        "$<TARGET_PROPERTY:qjs,COMPILE_OPTIONS>")
+    target_link_libraries(psp-native-tier-helper-probe PRIVATE
+        tilefinch_core m psppower)
+    set_target_properties(psp-native-tier-helper-probe PROPERTIES
+        C_EXTENSIONS ON OUTPUT_NAME native-helper-probe.elf)
+    target_link_options(psp-native-tier-helper-probe PRIVATE
+        "-specs=${PSPDEV}/psp/sdk/lib/prxspecs"
+        "LINKER:-q"
+        "LINKER:-T,${PSPDEV}/psp/sdk/lib/linkfile.prx"
+        "${PSPDEV}/psp/sdk/lib/prxexports.o")
+    set_property(TARGET psp-native-tier-helper-probe APPEND PROPERTY LINK_DEPENDS
+        "${PSPDEV}/psp/sdk/lib/linkfile.prx"
+        "${PSPDEV}/psp/sdk/lib/prxexports.o"
+        "${quickjs_SOURCE_DIR}/quickjs.c")
+    add_custom_command(TARGET psp-native-tier-helper-probe POST_BUILD
+        COMMAND "${PSPDEV}/bin/psp-fixup-imports"
+            $<TARGET_FILE:psp-native-tier-helper-probe>
+        COMMAND "${PSPDEV}/bin/psp-prxgen"
+            $<TARGET_FILE:psp-native-tier-helper-probe>
+            "${CMAKE_CURRENT_BINARY_DIR}/native-helper-probe.prx"
+        COMMENT "Generating the isolated host0 helper ABI probe")
+
+    # Actual machine-code lowering remains an explicit host0-only experiment.
+    # The generated interpreter copy must never enter an ordinary browser link.
+    set(native_region_engine "${CMAKE_CURRENT_BINARY_DIR}/native-tier-region-quickjs.c")
+    add_custom_command(OUTPUT "${native_region_engine}"
+        COMMAND "${CMAKE_COMMAND}"
+            "-DINPUT=${quickjs_SOURCE_DIR}/quickjs.c"
+            "-DOUTPUT=${native_region_engine}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/native-tier-region-engine.cmake"
+        DEPENDS "${quickjs_SOURCE_DIR}/quickjs.c"
+            benchmarks/native-tier-region-engine.cmake VERBATIM)
+    set_source_files_properties("${native_region_engine}" PROPERTIES HEADER_FILE_ONLY TRUE)
+    add_executable(psp-native-tier-region-probe EXCLUDE_FROM_ALL
+        benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+        src/psp_atomic_shims.c "${native_region_engine}")
+    target_include_directories(psp-native-tier-region-probe PRIVATE include
+        "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+        "${quickjs_SOURCE_DIR}")
+    target_compile_definitions(psp-native-tier-region-probe PRIVATE
+        PSP_BROWSER_BELLARD_QUICKJS=1 TF_REGION_FRAME_LEASE=1
+        TF_REGION_TABLE_DISPATCH=1 TF_REGION_SEMANTIC_CONTINUATIONS=1
+        TF_REGION_COMPACT_PLAN=1 "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
+    target_compile_options(psp-native-tier-region-probe PRIVATE
+        "$<TARGET_PROPERTY:qjs,COMPILE_OPTIONS>")
+    target_link_libraries(psp-native-tier-region-probe PRIVATE tilefinch_core m psppower)
+    set_target_properties(psp-native-tier-region-probe PROPERTIES
+        C_EXTENSIONS ON OUTPUT_NAME native-region-probe.elf)
+    target_link_options(psp-native-tier-region-probe PRIVATE
+        "-specs=${PSPDEV}/psp/sdk/lib/prxspecs" "LINKER:-q"
+        "LINKER:-T,${PSPDEV}/psp/sdk/lib/linkfile.prx"
+        "${PSPDEV}/psp/sdk/lib/prxexports.o")
+    set_property(TARGET psp-native-tier-region-probe APPEND PROPERTY LINK_DEPENDS
+        "${PSPDEV}/psp/sdk/lib/linkfile.prx" "${PSPDEV}/psp/sdk/lib/prxexports.o")
+    add_custom_command(TARGET psp-native-tier-region-probe POST_BUILD
+        COMMAND "${PSPDEV}/bin/psp-fixup-imports" $<TARGET_FILE:psp-native-tier-region-probe>
+        COMMAND "${PSPDEV}/bin/psp-prxgen" $<TARGET_FILE:psp-native-tier-region-probe>
+            "${CMAKE_CURRENT_BINARY_DIR}/native-region-probe.prx"
+        COMMENT "Generating the isolated host0 Allegrex region probe")
+endif()
+
+# A hand-lowered, real-JSValue ABI experiment, not a browser execution tier.
+# It includes QuickJS internals in its own translation unit. The qjs archive
+# supplies only supporting objects; neither tilefinch_core nor a PSP EBOOT
+# contains this fixture. Explicitly build this target when investigating it.
+if(NOT PSP AND UNIX AND PSP_BROWSER_USE_BELLARD_QUICKJS
+   AND quickjs_SOURCE_DIR STREQUAL tilefinch_quickjs_vendor_dir)
+    function(tilefinch_add_native_tier_probe name)
+        add_executable(${name} EXCLUDE_FROM_ALL ${ARGN} src/budget.c)
+        target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_definitions(${name} PRIVATE PSP_BROWSER_BELLARD_QUICKJS=1
+            "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
+        target_compile_options(${name} PRIVATE -funsigned-char -fwrapv)
+        set_target_properties(${name} PROPERTIES C_EXTENSIONS ON)
+        target_link_libraries(${name} PRIVATE qjs lexbor_static m)
+        if(TILEFINCH_OWNER_CHECKS)
+            target_compile_definitions(${name} PRIVATE TILEFINCH_OWNER_CHECKS=1)
+            target_link_libraries(${name} PRIVATE Threads::Threads)
+        endif()
+    endfunction()
+    tilefinch_add_native_tier_probe(tilefinch-native-tier-helper-probe
+        benchmarks/native-tier-helper-probe.c)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|x86_64|AMD64)$")
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-code-pool-probe
+            benchmarks/native-tier-code-pool-probe.c benchmarks/native-tier-code-pool.c)
+    endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        option(TILEFINCH_NATIVE_TIER_JOB_CENSUS
+            "Compile per-opcode census hooks into the isolated native-tier lab"
+            OFF)
+        set(native_region_engine "${CMAKE_CURRENT_BINARY_DIR}/native-tier-region-quickjs.c")
+        add_custom_command(OUTPUT "${native_region_engine}"
+            COMMAND "${CMAKE_COMMAND}"
+                "-DINPUT=${quickjs_SOURCE_DIR}/quickjs.c"
+                "-DOUTPUT=${native_region_engine}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/native-tier-region-engine.cmake"
+            DEPENDS "${quickjs_SOURCE_DIR}/quickjs.c"
+                benchmarks/native-tier-region-engine.cmake VERBATIM)
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-probe
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        set_source_files_properties("${native_region_engine}" PROPERTIES HEADER_FILE_ONLY TRUE)
+        target_include_directories(tilefinch-native-tier-region-probe PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-reference
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        target_compile_definitions(tilefinch-native-tier-region-reference PRIVATE
+            TF_REGION_INTERPRETER_ONLY=1)
+        target_include_directories(tilefinch-native-tier-region-reference PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-frame-lease
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        target_compile_definitions(tilefinch-native-tier-region-frame-lease PRIVATE
+            TF_REGION_FRAME_LEASE=1)
+        target_include_directories(tilefinch-native-tier-region-frame-lease PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-table-dispatch
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        target_compile_definitions(tilefinch-native-tier-region-table-dispatch PRIVATE
+            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1)
+        target_include_directories(tilefinch-native-tier-region-table-dispatch PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-continuations
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        target_compile_definitions(tilefinch-native-tier-region-continuations PRIVATE
+            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
+            TF_REGION_SEMANTIC_CONTINUATIONS=1)
+        target_include_directories(tilefinch-native-tier-region-continuations PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        # Keep the fixed-layout target above as the timing/ownership control.
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-compact-plan
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        target_compile_definitions(tilefinch-native-tier-region-compact-plan PRIVATE
+            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
+            TF_REGION_SEMANTIC_CONTINUATIONS=1 TF_REGION_COMPACT_PLAN=1)
+        target_include_directories(tilefinch-native-tier-region-compact-plan PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-sized-plan
+            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
+            "${native_region_engine}")
+        target_compile_definitions(tilefinch-native-tier-region-sized-plan PRIVATE
+            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
+            TF_REGION_SEMANTIC_CONTINUATIONS=1 TF_REGION_COMPACT_PLAN=1
+            TF_REGION_COMPACT_PLAN_U32=1)
+        target_include_directories(tilefinch-native-tier-region-sized-plan PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            "${quickjs_SOURCE_DIR}")
+        # Whole-page A/B only. This executable links the isolated interpreter
+        # copy before qjs; the normal lab and every shipping target stay intact.
+        foreach(lane IN ITEMS native reference)
+            set(lab_target "psp-browser-native-tier-${lane}-lab")
+            add_executable(${lab_target} EXCLUDE_FROM_ALL
+                src/interactive_main.c benchmarks/native-tier-region-probe.c
+                benchmarks/native-tier-code-pool.c "${native_region_engine}")
+            target_link_libraries(${lab_target} PRIVATE tilefinch_psp_ui)
+            target_include_directories(${lab_target} PRIVATE
+                "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+                "${quickjs_SOURCE_DIR}")
+            target_compile_definitions(${lab_target} PRIVATE
+                PSP_BROWSER_BELLARD_QUICKJS=1
+                TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
+                TF_REGION_SEMANTIC_CONTINUATIONS=1 TF_REGION_COMPACT_PLAN=1
+                TF_REGION_LIVE_ENGINE=1 CONFIG_TILEFINCH_CALL_COUNTS=1
+                "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
+            if(TILEFINCH_NATIVE_TIER_JOB_CENSUS)
+                target_compile_definitions(${lab_target} PRIVATE
+                    TF_REGION_JOB_CENSUS=1)
+            endif()
+            if(lane STREQUAL reference)
+                target_compile_definitions(${lab_target} PRIVATE TF_REGION_LIVE_DISABLED=1)
+            endif()
+            get_target_property(lab_fonts psp-browser-interactive-lab COMPILE_DEFINITIONS)
+            target_compile_definitions(${lab_target} PRIVATE ${lab_fonts})
+            # Keep optimized machine code while allowing independent PC samples
+            # to resolve interpreter cases to source lines in the lab only.
+            target_compile_options(${lab_target} PRIVATE -funsigned-char -fwrapv
+                -g1)
+            set_target_properties(${lab_target} PROPERTIES C_EXTENSIONS ON)
+        endforeach()
+    endif()
 endif()
 
 if(NOT PSP_BROWSER_USE_BELLARD_QUICKJS)

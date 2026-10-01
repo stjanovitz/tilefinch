@@ -10,6 +10,7 @@
     disabledStateByElement = new WeakMap(),
     stack = [];
   let definitionRunning = false;
+  const formAssociatedLocalNames = [];
   globalThis.__tilefinchCustomElementConstructionStack = stack;
   const reserved = new Set([
     "annotation-xml",
@@ -414,6 +415,8 @@
           formAssociated,
           createUnupgraded: scoped?.createUnupgraded || null,
         };
+        if (formAssociated && !formAssociatedLocalNames.includes(localName))
+          formAssociatedLocalNames.push(localName);
       } finally {
         if (scoped) scoped.definitionRunning = false;
         else definitionRunning = false;
@@ -838,6 +841,16 @@
         return internalsByElement.get(element) || null;
       },
     });
+    /* Candidate tag names for form.elements' native query; each candidate
+       is still checked against its own definition. */
+    Object.defineProperty(globalThis, "__tilefinchFormAssociatedSelector", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value() {
+        return formAssociatedLocalNames.join(",");
+      },
+    });
     Object.defineProperty(
       globalThis,
       "__tilefinchFormAssociatedCustomElement",
@@ -1173,8 +1186,19 @@
        failed; wrapping every node must not pay the registry lookup. */
     if (!definedAnywhere) return node;
     if (globalThis.__tilefinchCustomElementCreationSuppressed) return node;
-    const definition = definitionFor(node),
-      state = __tilefinchGetCustomState(node.__handle);
+    const state = __tilefinchGetCustomState(node.__handle);
+    /* Only a hyphenated name or an is attribute can have a definition; an
+       element neither custom (3) nor failed (1) without one has nothing to
+       restore, so spare every wrapper creation the registry lookup. */
+    if (
+      state !== 3 &&
+      state !== 1 &&
+      !node.__tilefinchCustomElementDefinition &&
+      !String(node.tagName || "").includes("-") &&
+      !node.getAttribute?.("is")
+    )
+      return node;
+    const definition = definitionFor(node);
     if (state === 3 && definition) {
       globalThis.__tilefinchPrepareNativePrototype?.(node);
       Object.setPrototypeOf(node, definition.constructor.prototype);
@@ -1273,6 +1297,10 @@
       enumerable: false,
       writable: false,
       value(root) {
+        /* Like disconnect/move, form-state resync cannot affect a node
+           before any registry has defined a custom element. Detached
+           construction must not wrap the whole subtree at each insertion. */
+        if (!definedAnywhere) return;
         for (const node of descendants(root)) {
           const definition = definitionFor(node);
           synchronizeFormOwner(node, definition);

@@ -9,6 +9,9 @@
 #include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
 #include "tilefinch/user_agent.h"
+#include "tilefinch/work_ledger.h"
+#include "tilefinch/script_split.h"
+#include "tilefinch/script_census.h"
 
 #include "js_runtime_internal.h"
 

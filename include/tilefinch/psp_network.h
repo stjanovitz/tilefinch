@@ -63,6 +63,14 @@ typedef struct {
     bool apctl_initialized;
     bool connect_started;
     bool disconnect_started;
+    /* Join retry state (psp_network_join_action). */
+    unsigned join_attempts;
+    unsigned join_resets;
+    int join_state;
+    uint64_t join_attempt_started_us;
+    uint64_t join_state_started_us;
+    bool join_progressed;
+    bool join_disconnect_requested;
 } PspNetwork;
 
 typedef struct {
@@ -131,6 +139,23 @@ typedef struct {
 } PspNetworkRejoinOperation;
 
 bool psp_network_begin(PspNetwork *network, int profile_index);
+/* Stop a firmware name lookup that has outlived its hard bound
+   (PSP_NETWORK_DNS_HARD_DEADLINE_MS). Cheap when nothing is resolving; the
+   browser thread calls it every frame and at every cooperation checkpoint,
+   because the resolving transport worker cannot rescue itself. */
+void psp_network_dns_guard(void);
+unsigned psp_network_dns_forced_stops(void);
+/* Outcomes of gethostbyname's DNS-over-UDP stub (src/psp_dns_stub.h), for
+   the validation log's transport summary; defined only in
+   TILEFINCH_PSP_VALIDATION_LOG builds. */
+typedef struct {
+    unsigned answered;
+    unsigned retransmitted;
+    unsigned nxdomain;
+    unsigned fallbacks;
+    bool stood_down;
+} PspNetworkDnsStubCounters;
+void psp_network_dns_stub_counters(PspNetworkDnsStubCounters *counters);
 /* Return the next firmware-validated saved connection profile, wrapping at
    the PSP's bounded profile limit. Zero means no saved profile was found. */
 int psp_network_choose_saved_profile(int current, int direction);

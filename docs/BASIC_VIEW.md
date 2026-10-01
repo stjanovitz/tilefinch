@@ -76,7 +76,7 @@ script-free recovery surface, not an alternate live view of an application.
 
 ## Structured data
 
-The first Basic milestone uses only explicit DOM semantics. It does not turn
+Basic view uses only explicit DOM semantics. It does not turn
 arbitrary JSON `contentUrl`, `SearchAction`, product metadata or application
 state into controls. A later structured-data extension should reuse the
 bounded token scanner and admit only explicit Schema.org contexts after each

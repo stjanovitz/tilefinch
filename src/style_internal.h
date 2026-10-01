@@ -8,6 +8,7 @@
    tilefinch/style.h only. */
 
 #include "tilefinch/style.h"
+#include "tilefinch/work_vector.h"
 #include "style_cache_internal.h"
 
 enum {
@@ -511,17 +512,38 @@ struct StyleRuleFilter {
        Image discovery resolves an element's rules only when one of its
        candidate rules has this set. */
     bool discovery;
+    /* STYLE_RULE_SVG_RASTER_* bits: the rule can change what an inline SVG
+       raster resolves. INHERITED (colour, font size, var()) reaches the SVG
+       from any element the rule matches; SIZE (width/height) only from the
+       SVG itself, so only tokens outside the rightmost compound count. */
+    uint8_t svg_raster;
 };
+#define STYLE_RULE_SVG_RASTER_INHERITED UINT8_C(1)
+#define STYLE_RULE_SVG_RASTER_SIZE UINT8_C(2)
 void stylesheet_note_style_source(Stylesheet *sheet,
                                   const lxb_dom_node_t *element);
 /* Rules whose match on some element could change when the class/id tokens
    with the given hashes change on another element. Returns SIZE_MAX when the
    filters are unavailable or more than `capacity` rules qualify. */
+/* Calls `visit` with the identity hash of each class and id the selector
+   tests: every one (`every_position`), or only those it reads on elements
+   other than its subject (before `split`, the rightmost compound, or in a
+   functional argument), leaving out :has() arguments, which the :has()
+   plan scopes. False when some identity cannot be named by a token (a
+   [class]/[id] test, an escape that does not decode). With
+   `attributes_opaque`, attribute selectors' names are visited the same way
+   (stylesheet_identity_attribute_hash), and one this scan cannot name
+   (escaped, namespaced) sets *attributes_opaque. */
+bool style_selector_identity_tokens(const char *text, size_t length,
+                                    size_t split, bool every_position,
+                                    StyleIdentityTokenVisit visit,
+                                    void *context, bool *attributes_opaque);
 size_t stylesheet_rules_affected_by_tokens(
     const Stylesheet *sheet, const uint32_t *hashes, size_t hash_count,
     uint32_t *out, size_t capacity);
 
 typedef struct {
+    const uint32_t *entries;
     uint32_t at;
     uint32_t end;
 } StyleRuleIndexSource;
@@ -691,6 +713,10 @@ void style_container_units_for_node(Stylesheet *sheet,
 void style_relative_selector_cache_begin(Stylesheet *sheet);
 void style_relative_selector_cache_end(Stylesheet *sheet);
 bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet);
+bool stylesheet_prepare_has_rule_index(Stylesheet *sheet);
+/* The sheet's classified :has() rules (style_has_invalidation.c). */
+void style_has_plan_destroy(Stylesheet *sheet);
+size_t style_has_plan_bytes(const Stylesheet *sheet);
 
 typedef struct {
     lxb_dom_node_t *node;
@@ -709,7 +735,57 @@ bool style_rule_selector_matches_subject(
     const Stylesheet *sheet, size_t rule_index, lxb_dom_node_t *node,
     const StyleMatchSubject *subject);
 
+/* An element's class list split once into tokens: a rule-candidate check
+   compares hashes instead of rescanning the whole attribute (utility-class
+   pages carry dozens of classes and test hundreds of candidate rules per
+   element). A set is found by the list's address and length; one scope
+   (see style_class_tokens_scope_begin) trusts that, and a later scope
+   first compares the kept copy of the list, so a set outlives the scope
+   that built it without ever answering for different text. */
+#define STYLE_CLASS_TOKEN_LIMIT 96u
+/* chatgpt.com send -> answer, tokenizations: 8 sets 48,919, 12 sets
+   21,366, 16 sets 16,284 (about 1.3 KB per set on the PSP). */
+#define STYLE_CLASS_TOKEN_SETS 12u
+#define STYLE_CLASS_TOKEN_COPY 512u
+typedef struct {
+    const char *source;
+    size_t length;
+    uint32_t scope;
+    uint16_t count;
+    bool usable;
+    char copy[STYLE_CLASS_TOKEN_COPY];
+    uint32_t hashes[STYLE_CLASS_TOKEN_LIMIT];
+    uint16_t offsets[STYLE_CLASS_TOKEN_LIMIT];
+    uint8_t lengths[STYLE_CLASS_TOKEN_LIMIT];
+    /* Open addressing over the hashes: token index + 1, 0 empty. */
+    uint8_t slots[128];
+} StyleClassTokens;
+
+typedef struct StyleClassTokenCache {
+    StyleClassTokens sets[STYLE_CLASS_TOKEN_SETS];
+    /* The current outermost scope; never zero once a scope has begun. */
+    uint32_t scope;
+    uint8_t next;
+    uint8_t last;
+} StyleClassTokenCache;
+
+/* Whether the subject's class list contains `key`. Within a class-token
+   scope (one style resolution: the DOM cannot change there) the list is
+   tokenized once and cached in the sheet's scratch; elsewhere, and for
+   short lists, a plain scan. */
+bool style_subject_has_class(const Stylesheet *sheet,
+                             const StyleMatchSubject *subject,
+                             const char *key, size_t key_length);
+/* Bracket a stretch in which the DOM does not change. The outermost begin
+   forgets every cached class list: attribute storage can be reused once
+   the DOM changes, so a pointer and length identify a list only inside. */
+void style_class_tokens_scope_begin(const Stylesheet *sheet);
+void style_class_tokens_scope_end(const Stylesheet *sheet);
+
 struct StyleResolveScratch {
+    /* Class-token scopes in progress: class-token sets (on the Stylesheet)
+       are valid only while this is non-zero. */
+    uint32_t class_tokens_depth;
     /* Lexical-only summary. Never cache a DOM match or computed display:
        head/html attributes can change without a stylesheet generation. */
     uint64_t head_script_generation;
@@ -739,8 +815,11 @@ struct StyleResolveScratch {
     bool logical_axes_locked;
     bool logical_axes_mismatch;
     uint8_t logical_axes;
-    /* Transient and owned by one layout build, never by the retained sheet. */
+    /* Transient and owned by one layout build, never by the retained sheet,
+       or lent by `variable_cache_lease` (which may create it on demand) for
+       the lease owner's resolutions. */
     struct StyleVariableCache *variable_cache;
+    struct StyleVariableCacheLease *variable_cache_lease;
     struct StyleAncestorBloomCache *ancestor_bloom_cache;
     struct StyleContainerState *container_states;
     struct StyleContainerMatchCacheEntry *container_match_cache;
@@ -853,6 +932,21 @@ _Static_assert((STYLE_DEFERRED_NO_FONT_SIZE
                    | STYLE_DEFERRED_CH | STYLE_DECLARATION_ALL_INHERIT))
                    == 0, "deferred declaration flags must not overlap");
 
+/* A declaration's values encode as (first word, word count) byte pairs,
+   each followed by that many nonzero 32-bit words; absent words are zero.
+   The worst case alternates zero and nonzero words. */
+#define STYLE_DECLARATION_VALUE_WORDS (sizeof(ComputedStyle) / 4u)
+#define STYLE_DECLARATION_VALUES_ENCODED_MAX \
+    (sizeof(ComputedStyle) + 2u * ((STYLE_DECLARATION_VALUE_WORDS + 1u) / 2u))
+_Static_assert(sizeof(ComputedStyle) % 4u == 0,
+               "declaration values encode whole 32-bit words");
+_Static_assert(sizeof(ComputedStyle) / 4u <= UINT8_MAX,
+               "declaration value word indices must fit one byte");
+_Static_assert(STYLE_DECLARATION_VALUES_ENCODED_MAX <= UINT16_MAX,
+               "encoded declaration values must fit values_length");
+size_t style_declaration_values_encode(const ComputedStyle *values,
+                                       uint8_t *encoded, size_t capacity);
+
 struct StyleDeferredInstruction {
     uint32_t value_offset;
     uint16_t value_length;
@@ -948,8 +1042,12 @@ _Static_assert(sizeof(StyleGridTrackTemplate) == 88,
                "Grid track templates must remain compact");
 _Static_assert(sizeof(StyleGridAreas) == 3555,
                "optional Grid metadata must remain within its PSP budget");
-_Static_assert(sizeof(StyleCustomRule) == 360,
+_Static_assert(sizeof(StyleCustomRule) <= 3u * sizeof(void *) + 24u,
                "retained sparse-rule metadata must stay compact");
+_Static_assert(STYLE_CUSTOM_SELECTOR_CAPACITY <= UINT8_MAX + 1u
+               && STYLE_CUSTOM_NAME_CAPACITY <= UINT8_MAX + 1u
+               && STYLE_CUSTOM_VALUE_CAPACITY <= UINT8_MAX + 1u,
+               "custom rule text lengths must fit their uint8_t fields");
 
 /* CSS initial font size and the engine's used-font-size clamp (px). */
 #define STYLE_DEFAULT_FONT_PX 16
@@ -1075,6 +1173,9 @@ bool style_math_resolve_instructions(const StyleMathInstruction *instructions,
 bool style_math_resolve_number_thousandths(
     const Stylesheet *sheet, const char *text, size_t length,
     int *thousandths);
+bool style_math_resolve_number_thousandths_in(
+    const Stylesheet *sheet, const char *text, size_t length,
+    int minimum, int maximum, int *thousandths);
 bool style_math_identifier_equal(const char *text, size_t length,
                                  const char *wanted);
 bool style_math_candidate(const Stylesheet *sheet, const char *text,

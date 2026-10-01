@@ -348,6 +348,10 @@ bool layout_block_emit_decoration(
                         context->layout, &layer->gradient,
                         &gradient_slot)) continue;
                 command.type = DRAW_FILL_RECT;
+                /* Fills read their corners from radius; only image
+                   commands carry them in scale. */
+                command.radius = command.scale;
+                command.scale = 1;
                 draw_command_set_fill_gradient(&command, gradient_slot);
             } else if (layer->kind == STYLE_PAINT_IMAGE_URL) {
                 resource = images_find_background_source(
@@ -642,8 +646,10 @@ bool layout_block_patch_decoration(
         command->y = outer_y + clip_top;
         command->width = area_width;
         command->height = area_height;
-        command->scale = style_border_radius_adjust(
+        int layer_radius = style_border_radius_adjust(
             plan->border_radius_code, -clip_left);
+        if (command->type == DRAW_FILL_RECT) command->radius = layer_radius;
+        else command->scale = layer_radius;
         if (area_width <= 0 || area_height <= 0) {
             command->width = 0;
             command->opacity_scale = 0;

@@ -1,5 +1,6 @@
 #include "tilefinch_test_common.h"
 #include "../src/psp_network_policy.h"
+#include "../src/psp_navigation_watchdog.h"
 #include "../src/tilefinch_test_faults.h"
 #include "../src/style_cache_internal.h"
 
@@ -348,6 +349,182 @@ static bool test_incremental_parser_boundaries(Budget *budget)
         document_destroy(&baseline);
     }
     return true;
+}
+
+static const DocumentParserInsertion *test_journal_entry_for(
+    const PocDocument *document, const lxb_dom_node_t *node)
+{
+    const DocumentParserInsertionJournal *journal =
+        &document->parser_insertions;
+    for (size_t i = 0; i < journal->count; i++)
+        if (journal->entries[i].node == node) return &journal->entries[i];
+    return NULL;
+}
+
+static bool test_journal_covers(const PocDocument *document,
+                                const lxb_dom_node_t *node)
+{
+    if (test_journal_entry_for(document, node) != NULL) return true;
+    const DocumentParserInsertionJournal *journal =
+        &document->parser_insertions;
+    /* A root covers everything below its parent from its first child on. */
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent)
+        for (size_t i = 0; i < journal->root_count; i++) {
+            if (at->parent != journal->roots[i].parent) continue;
+            for (const lxb_dom_node_t *run = journal->roots[i].first;
+                 run != NULL; run = run->next)
+                if (run == at) return true;
+        }
+    return false;
+}
+
+/* Every node the tree builder connects is journaled in insertion order with
+   its insertion-time siblings, including foster-parented content, without
+   changing the tree; past the journal, insertions fold into subtree roots
+   that still cover them; discarding a detached subtree forgets it. */
+static bool test_parser_insertion_journal(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><html><head><title>J</title></head><body>"
+        "<p id=first>one</p><table id=grid><tr><td>cell</td></tr>stray"
+        "</table><p id=last>two</p></body></html>";
+    size_t length = sizeof(html) - 1u;
+    PocDocument baseline = {0}, armed = {0};
+    DocumentParser parser = {0};
+    bool ok = document_parse(&baseline, budget, html, length, length)
+        && document_parser_begin(&parser, budget);
+    if (ok) document_parser_insertions_arm(&parser.document, true);
+    ok = ok && document_parser_feed(&parser, html, 40)
+        && document_parser_feed(&parser, html + 40, length - 40)
+        && document_parser_end_input(&parser);
+    PocDocument *live = &parser.document;
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(live->html) : NULL;
+    lxb_dom_node_t *first = root == NULL ? NULL : find_id(root, "first");
+    lxb_dom_node_t *grid = root == NULL ? NULL : find_id(root, "grid");
+    lxb_dom_node_t *last = root == NULL ? NULL : find_id(root, "last");
+    lxb_dom_node_t *body = ok ? document_body_node(live) : NULL;
+    lxb_dom_node_t *stray = grid == NULL ? NULL : grid->prev;
+    const DocumentParserInsertion *first_entry =
+        first == NULL ? NULL : test_journal_entry_for(live, first);
+    const DocumentParserInsertion *last_entry =
+        last == NULL ? NULL : test_journal_entry_for(live, last);
+    const DocumentParserInsertion *stray_entry =
+        stray == NULL ? NULL : test_journal_entry_for(live, stray);
+    ok = ok && first_entry != NULL && last_entry != NULL
+        && first_entry->parent == body && first_entry->previous == NULL
+        && first_entry->next == NULL && last_entry->previous == grid
+        && last_entry->next == NULL && first_entry < last_entry
+        && stray != NULL && stray->type == LXB_DOM_NODE_TYPE_TEXT
+        && stray_entry != NULL && stray_entry->parent == body
+        && stray_entry->next == grid
+        && stray_entry->previous == first
+        && live->parser_insertions.root_count == 0u
+        && live->parser_insertions.coalesced == 0u;
+    /* Each connected node below the document appears exactly once, in
+       document order apart from the foster-parented text. The doctype is
+       inserted before any script can exist and is not journaled. */
+    size_t nodes = 0;
+    const DocumentParserInsertion *previous_entry = NULL;
+    lxb_dom_node_t *start = root == NULL ? NULL : root->first_child;
+    if (start != NULL && start->type == LXB_DOM_NODE_TYPE_DOCUMENT_TYPE)
+        start = start->next;
+    for (lxb_dom_node_t *at = start; ok && at != NULL;) {
+        const DocumentParserInsertion *entry =
+            test_journal_entry_for(live, at);
+        ok = entry != NULL && entry->parent == at->parent
+            && (previous_entry == NULL || at == stray
+                || previous_entry == stray_entry || entry > previous_entry);
+        previous_entry = entry;
+        nodes++;
+        if (at->first_child != NULL) { at = at->first_child; continue; }
+        while (at != NULL && at->next == NULL) at = at->parent;
+        if (at != NULL) at = at->next;
+    }
+    ok = ok && nodes == live->parser_insertions.count;
+    ok = ok && document_parser_finish(&parser, &armed)
+        && test_document_equivalent(&baseline, &armed)
+        && armed.parser_insertions.armed
+        && armed.parser_insertions.entries == NULL;
+    document_parser_abort(&parser);
+    document_destroy(&armed);
+    document_destroy(&baseline);
+    if (!ok) {
+        fprintf(stderr, "parser insertion journal order failed\n");
+        return false;
+    }
+
+    /* Unarmed parsing journals nothing. */
+    PocDocument quiet = {0};
+    ok = document_parse(&quiet, budget, html, length, length)
+        && !quiet.parser_insertions.armed
+        && quiet.parser_insertions.entries == NULL
+        && quiet.parser_insertions.recorded == 0u;
+    document_destroy(&quiet);
+    if (!ok) return false;
+
+    /* Overflow: 1,200 <i> plus their text exceed the journal. */
+    enum { WIDE_COUNT = 1200 };
+    size_t capacity = 64u + WIDE_COUNT * 8u;
+    char *wide = malloc(capacity);
+    if (wide == NULL) return false;
+    size_t used = (size_t) snprintf(
+        wide, capacity, "<!doctype html><body><div id=box>");
+    for (int i = 0; i < WIDE_COUNT; i++)
+        used += (size_t) snprintf(wide + used, capacity - used, "<i>x</i>");
+    used += (size_t) snprintf(wide + used, capacity - used,
+                              "</div><p id=after></p>");
+    DocumentParser wide_parser = {0};
+    ok = used < capacity && document_parser_begin(&wide_parser, budget);
+    if (ok) document_parser_insertions_arm(&wide_parser.document, true);
+    ok = ok && document_parser_feed(&wide_parser, wide, used)
+        && document_parser_end_input(&wide_parser);
+    free(wide);
+    live = &wide_parser.document;
+    root = ok ? lxb_dom_interface_node(live->html) : NULL;
+    lxb_dom_node_t *box = root == NULL ? NULL : find_id(root, "box");
+    lxb_dom_node_t *after = root == NULL ? NULL : find_id(root, "after");
+    const DocumentParserInsertionJournal *journal = &live->parser_insertions;
+    ok = ok && box != NULL && after != NULL
+        && journal->count == DOCUMENT_PARSER_INSERTION_LIMIT
+        && journal->root_count >= 1u
+        && journal->root_count <= DOCUMENT_PARSER_INSERTION_ROOT_LIMIT
+        && journal->coalesced > 0u
+        && test_journal_covers(live, after);
+    size_t covered = 0;
+    for (lxb_dom_node_t *item = box == NULL ? NULL : box->first_child;
+         ok && item != NULL; item = item->next) {
+        ok = test_journal_covers(live, item)
+            && test_journal_covers(live, item->first_child);
+        covered++;
+    }
+    ok = ok && covered == WIDE_COUNT;
+    /* A detached subtree is forgotten before it can be destroyed. */
+    if (ok) {
+        BudgetAllocationOwner previous_owner =
+            document_allocation_owner_enter(live);
+        lxb_dom_node_remove(box);
+        document_parser_insertions_discard_subtree(live, box);
+        for (size_t i = 0; ok && i < journal->count; i++) {
+            const DocumentParserInsertion *entry = &journal->entries[i];
+            for (lxb_dom_node_t *at = entry->node; ok && at != NULL;
+                 at = at->parent) ok = at != box;
+            for (lxb_dom_node_t *at = entry->parent; ok && at != NULL;
+                 at = at->parent) ok = at != box;
+            ok = ok && entry->next != box;
+        }
+        for (size_t i = 0; ok && i < journal->root_count; i++)
+            for (lxb_dom_node_t *at = journal->roots[i].first;
+                 ok && at != NULL; at = at->parent) ok = at != box;
+        ok = ok && document_parser_insertions_pending(live)
+            && test_journal_covers(live, after);
+        lxb_dom_node_destroy_deep(box);
+        document_allocation_owner_leave(live, previous_owner);
+        document_parser_insertions_clear(live);
+        ok = ok && !document_parser_insertions_pending(live);
+    }
+    document_parser_abort(&wide_parser);
+    if (!ok) fprintf(stderr, "parser insertion journal overflow failed\n");
+    return ok;
 }
 
 static bool test_parser_scripting_noscript_model(Budget *budget)
@@ -2282,6 +2459,977 @@ static bool test_inline_svg_resource(Budget *budget)
         && app_white_seen && budget->current == 0;
 }
 
+/* Pixels of one resource, copied so they can be compared after the table
+   that owned them has been replaced. */
+typedef struct {
+    unsigned char pixels[24 * 24 * 4];
+    int width;
+    int height;
+} SvgRasterSnapshot;
+
+static bool svg_raster_snapshot(const ImageResources *images,
+                                lxb_dom_node_t *node,
+                                SvgRasterSnapshot *snapshot)
+{
+    const ImageResource *resource = images_find_node(images, node);
+    if (resource == NULL || resource->pixels == NULL
+        || resource->width <= 0 || resource->height <= 0
+        || resource->width > 24 || resource->height > 24) return false;
+    snapshot->width = resource->width;
+    snapshot->height = resource->height;
+    memcpy(snapshot->pixels, resource->pixels,
+           (size_t) resource->width * (size_t) resource->height * 4u);
+    return true;
+}
+
+static bool svg_raster_matches(const ImageResources *images,
+                               lxb_dom_node_t *node,
+                               const SvgRasterSnapshot *snapshot)
+{
+    const ImageResource *resource = images_find_node(images, node);
+    return resource != NULL && resource->pixels != NULL
+        && resource->width == snapshot->width
+        && resource->height == snapshot->height
+        && memcmp(resource->pixels, snapshot->pixels,
+                  (size_t) snapshot->width * (size_t) snapshot->height
+                      * 4u) == 0;
+}
+
+static bool svg_refresh(PocDocument *document, Stylesheet *stylesheet,
+                        ImageResources *images, Budget *budget,
+                        lxb_dom_node_t *const *nodes, size_t count)
+{
+    return images_refresh_external_nodes(
+        document, stylesheet, images, nodes, count, budget,
+        "https://svg-refresh.test/", "https://svg-refresh.test/", NULL,
+        8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+}
+
+/* A table built from scratch for the current DOM, the reference a reused
+   raster must equal byte for byte. */
+static bool svg_fresh_matches(PocDocument *document, Stylesheet *stylesheet,
+                              const ImageResources *images, Budget *budget,
+                              lxb_dom_node_t *const *nodes, size_t count)
+{
+    ImageResources fresh = {0};
+    bool ok = images_load_external(
+        document, stylesheet, &fresh, budget,
+        "https://svg-refresh.test/", "https://svg-refresh.test/", NULL,
+        8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+    for (size_t i = 0; ok && i < count; i++) {
+        SvgRasterSnapshot expected;
+        ok = svg_raster_snapshot(&fresh, nodes[i], &expected)
+            && svg_raster_matches(images, nodes[i], &expected);
+    }
+    images_destroy(&fresh);
+    return ok;
+}
+
+static bool svg_pixel_is(const ImageResources *images, lxb_dom_node_t *node,
+                         unsigned char red, unsigned char blue)
+{
+    const ImageResource *resource = images_find_node(images, node);
+    if (resource == NULL || resource->pixels == NULL) return false;
+    const unsigned char *pixel = resource->pixels
+        + ((size_t) (resource->height / 2) * (size_t) resource->width
+           + (size_t) (resource->width / 2)) * 4u;
+    return pixel[3] > 240
+        && (red > 128 ? pixel[0] > 240 : pixel[0] < 16)
+        && (blue > 128 ? pixel[2] > 240 : pixel[2] < 16);
+}
+
+static bool test_inline_svg_refresh_shares_style_memos(Budget *budget)
+{
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>:root{--tone:#ff0000}"
+        ".base{color:var(--tone)}.blue{--tone:#0000ff}");
+    for (size_t i = 0; i < 64; i++) {
+        int written = snprintf(html + used, sizeof(html) - used,
+                               ".unused%zu{padding:1px}", i);
+        if (written < 0 || (size_t) written >= sizeof(html) - used) return false;
+        used += (size_t) written;
+    }
+    int written = snprintf(html + used, sizeof(html) - used,
+        "</style><body><div id=bar class=base>"
+        "<svg id=a width=8 height=8><path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+        "<svg id=b width=8 height=8><path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+        "</div><div class='base blue'>"
+        "<svg id=c width=8 height=8><path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+        "</div></body>");
+    if (written < 0 || (size_t) written >= sizeof(html) - used) return false;
+    used += (size_t) written;
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool ok = document_parse(&document, budget, html, used, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && images_load_external(&document, &stylesheet, &images, budget,
+            "https://svg-refresh.test/", "https://svg-refresh.test/", NULL,
+            8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *bar = root == NULL ? NULL : find_id(root, "bar");
+    lxb_dom_node_t *nodes[3] = {
+        root == NULL ? NULL : find_id(root, "a"),
+        root == NULL ? NULL : find_id(root, "b"),
+        root == NULL ? NULL : find_id(root, "c")
+    };
+    size_t ancestor_hits = images.stats.node_style_cache_hits;
+    ok = ok && stylesheet.count >= 64 && bar != NULL
+        && nodes[0] != NULL && nodes[1] != NULL && nodes[2] != NULL
+        && svg_refresh(&document, &stylesheet, &images, budget, nodes, 3)
+        && images.stats.node_style_cache_hits >= ancestor_hits + 5u
+        && svg_pixel_is(&images, nodes[0], 255, 0)
+        && svg_pixel_is(&images, nodes[2], 0, 255);
+    /* A new batch must observe changed inherited variables, not retain the
+       prior batch's memoized red value. */
+    ok = ok && lxb_dom_element_set_attribute(lxb_dom_interface_element(bar),
+            (const lxb_char_t *) "class", 5,
+            (const lxb_char_t *) "base blue", 9) != NULL
+        && svg_refresh(&document, &stylesheet, &images, budget, nodes, 3)
+        && svg_pixel_is(&images, nodes[0], 0, 255)
+        && svg_fresh_matches(&document, &stylesheet, &images, budget, nodes, 3);
+    size_t resident = budget->current;
+    SvgRasterSnapshot snapshots[3];
+    for (size_t i = 0; ok && i < 3; i++)
+        ok = svg_raster_snapshot(&images, nodes[i], &snapshots[i]);
+    /* Memo admission is optional, and any later refusal rolls the image
+       transaction back without retaining either memo or partial resources. */
+    for (size_t step = 0; ok && step < 32; step++) {
+        budget_inject_failure_after(budget, step);
+        (void) svg_refresh(&document, &stylesheet, &images, budget, nodes, 3);
+        budget_clear_failure_injection(budget);
+        ok = budget->current == resident;
+        for (size_t i = 0; ok && i < 3; i++)
+            ok = svg_raster_matches(&images, nodes[i], &snapshots[i]);
+    }
+    if (!ok) fprintf(stderr, "SVG refresh ancestor hits before=%zu after=%zu\n",
+                    ancestor_hits, images.stats.node_style_cache_hits);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok && budget->current == baseline;
+}
+
+static bool test_inline_svg_discovery_is_atomic(Budget *budget)
+{
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>body{color:#ff0000}</style><body>"
+        "<svg id=icon width=8 height=8>");
+    for (size_t i = 0; i < 32; i++) {
+        int written = snprintf(html + used, sizeof(html) - used,
+            "<g><path fill=currentColor d='M0 0h8v8H0z'/></g>");
+        if (written < 0 || (size_t) written >= sizeof(html) - used) return false;
+        used += (size_t) written;
+    }
+    int written = snprintf(html + used, sizeof(html) - used,
+        "</svg><svg id=next width=8 height=8>"
+        "<path fill='#0000ff' d='M0 0h8v8H0z'/></svg></body>");
+    if (written < 0 || (size_t) written >= sizeof(html) - used) return false;
+    used += (size_t) written;
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool ok = document_parse(&document, budget, html, used, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && images_load_external(&document, &stylesheet, &images, budget,
+            "https://svg-refresh.test/", "https://svg-refresh.test/", NULL,
+            8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *icon = root == NULL ? NULL : find_id(root, "icon");
+    lxb_dom_node_t *next = root == NULL ? NULL : find_id(root, "next");
+    /* The serializer owns the SVG descendant cascade. Discovery must visit
+       only html, body and the two atomic roots, even when the pseudo-image
+       prefilter returns early. The following sibling must still be loaded. */
+    ok = ok && images.stats.discovery_prefilter_checks == 4u
+        && images.stats.discovery_prefilter_skips == 4u
+        && images.count == 2u
+        && svg_pixel_is(&images, icon, 255, 0)
+        && svg_pixel_is(&images, next, 0, 255);
+    SvgRasterSnapshot expected;
+    ok = ok && svg_raster_snapshot(&images, icon, &expected)
+        && svg_refresh(&document, &stylesheet, &images, budget, &icon, 1u)
+        && svg_raster_matches(&images, icon, &expected);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok && budget->current == baseline;
+}
+
+static bool test_inline_svg_refresh_reuses_unchanged_rasters(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        ".base{color:#ff0000}.base.tint{color:#0000ff}</style><body>"
+        "<div id=bar class=base>"
+        "<i id=a><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 0h16v16H0z'/></svg></i>"
+        "<i id=b><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 0h16v16H0z'/></svg></i>"
+        "<i id=c><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 8L8 0L16 8L8 16z'/></svg></i>"
+        "</div><div class=base>"
+        "<i id=keep><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 8L8 0L16 8L8 16z'/></svg></i>"
+        "</div></body>";
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool ok = document_parse(&document, budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && images_load_external(
+            &document, &stylesheet, &images, budget,
+            "https://svg-refresh.test/", "https://svg-refresh.test/", NULL,
+            8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *bar = ok ? find_id(root, "bar") : NULL;
+    /* The serialized markup carries every attribute, so the identical
+       icons are told apart by their wrappers rather than an id. */
+    lxb_dom_node_t *nodes[3] = {NULL, NULL, NULL};
+    static const char *const wrappers[3] = {"a", "b", "c"};
+    for (size_t i = 0; ok && i < 3; i++) {
+        lxb_dom_node_t *wrapper = find_id(root, wrappers[i]);
+        nodes[i] = wrapper == NULL ? NULL : wrapper->first_child;
+    }
+    lxb_dom_node_t *keep_wrapper = ok ? find_id(root, "keep") : NULL;
+    lxb_dom_node_t *keep = keep_wrapper == NULL
+        ? NULL : keep_wrapper->first_child;
+    SvgRasterSnapshot before[3];
+    SvgRasterSnapshot kept;
+    /* a and b share one raster; c and the untouched keep share another. */
+    ok = ok && bar != NULL && nodes[0] != NULL && nodes[1] != NULL
+        && nodes[2] != NULL && keep != NULL
+        && images.stats.inline_svg_rasterized == 2
+        && svg_raster_snapshot(&images, nodes[0], &before[0])
+        && svg_raster_snapshot(&images, nodes[1], &before[1])
+        && svg_raster_snapshot(&images, nodes[2], &before[2])
+        && svg_raster_snapshot(&images, keep, &kept)
+        && svg_pixel_is(&images, nodes[0], 255, 0);
+    size_t decoded = images.stats.decoded_bytes;
+    size_t attempted = images.stats.attempted;
+    size_t resident = budget->current;
+
+    /* (a) An unchanged refresh reuses both rasters, repeatedly, without
+       drifting the decoded total, the attempt count or the allocator. */
+    for (int round = 0; ok && round < 12; round++) {
+        size_t reused = images.stats.inline_svg_refresh_reused;
+        ok = svg_refresh(&document, &stylesheet, &images, budget, nodes, 3)
+            && images.stats.inline_svg_rasterized == 2
+            && images.stats.inline_svg_refresh_reused == reused + 2
+            && images.stats.decoded_bytes == decoded
+            && images.stats.attempted == attempted
+            && budget->current == resident && images.count == 4;
+        for (size_t i = 0; ok && i < 3; i++) {
+            ok = svg_raster_matches(&images, nodes[i], &before[i]);
+        }
+        ok = ok && svg_raster_matches(&images, keep, &kept);
+    }
+    /* c borrowed from the retained keep, so keep still owns its raster and
+       c is an alias; the retiring a/b raster moved into the new table. */
+    const ImageResource *c = ok ? images_find_node(&images, nodes[2]) : NULL;
+    const ImageResource *k = ok ? images_find_node(&images, keep) : NULL;
+    const ImageResource *a = ok ? images_find_node(&images, nodes[0]) : NULL;
+    const ImageResource *b = ok ? images_find_node(&images, nodes[1]) : NULL;
+    ok = ok && c != NULL && k != NULL && a != NULL && b != NULL
+        && c->pixels == k->pixels && k->owns_pixels && !c->owns_pixels
+        && a->pixels == b->pixels && a->owns_pixels != b->owns_pixels
+        && !a->borrows_previous && !b->borrows_previous
+        && !c->borrows_previous;
+    /* (c) Reused rasters equal a from-scratch decode byte for byte. */
+    ok = ok && svg_fresh_matches(
+        &document, &stylesheet, &images, budget, nodes, 3);
+
+    /* A refused refresh leaves the committed table and its ownership
+       intact at every allocation step, including after borrowing. */
+    for (size_t step = 0; ok && step < 64; step++) {
+        size_t reused = images.stats.inline_svg_refresh_reused;
+        budget_inject_failure_after(budget, step);
+        bool refreshed = svg_refresh(
+            &document, &stylesheet, &images, budget, nodes, 3);
+        budget_clear_failure_injection(budget);
+        ok = budget->current == resident && images.count == 4
+            && images.stats.decoded_bytes == decoded
+            && images.stats.inline_svg_rasterized == 2;
+        for (size_t i = 0; ok && i < 3; i++) {
+            ok = svg_raster_matches(&images, nodes[i], &before[i]);
+        }
+        if (refreshed) {
+            ok = ok && images.stats.inline_svg_refresh_reused == reused + 2;
+            break;
+        }
+    }
+
+    /* (b) An ancestor colour change reaches currentColor: both rasters in
+       the bar are decoded again, the retained keep is untouched. */
+    ok = ok && lxb_dom_element_set_attribute(
+            lxb_dom_interface_element(bar), (const lxb_char_t *) "class", 5,
+            (const lxb_char_t *) "base tint", 9) != NULL
+        && svg_refresh(&document, &stylesheet, &images, budget, nodes, 3)
+        && images.stats.inline_svg_rasterized == 4
+        && images.stats.decoded_bytes == decoded + 16u * 16u * 4u
+        && svg_pixel_is(&images, nodes[0], 0, 255)
+        && svg_pixel_is(&images, nodes[2], 0, 255)
+        && svg_pixel_is(&images, keep, 255, 0)
+        && svg_raster_matches(&images, keep, &kept)
+        && svg_fresh_matches(
+            &document, &stylesheet, &images, budget, nodes, 3);
+
+    /* A size change is a different raster too; the unchanged a/b raster
+       is still reused alongside it. */
+    size_t rasterized = images.stats.inline_svg_rasterized;
+    size_t reused = images.stats.inline_svg_refresh_reused;
+    ok = ok && lxb_dom_element_set_attribute(
+            lxb_dom_interface_element(nodes[2]),
+            (const lxb_char_t *) "width", 5, (const lxb_char_t *) "24", 2)
+            != NULL
+        && lxb_dom_element_set_attribute(
+            lxb_dom_interface_element(nodes[2]),
+            (const lxb_char_t *) "height", 6, (const lxb_char_t *) "24", 2)
+            != NULL
+        && svg_refresh(&document, &stylesheet, &images, budget, nodes, 3)
+        && images.stats.inline_svg_rasterized == rasterized + 1
+        && images.stats.inline_svg_refresh_reused == reused + 1
+        && images_find_node(&images, nodes[2]) != NULL
+        && images_find_node(&images, nodes[2])->width == 24
+        && images_find_node(&images, nodes[2])->height == 24
+        && svg_fresh_matches(
+            &document, &stylesheet, &images, budget, nodes, 3);
+
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok && budget->current == baseline;
+}
+
+static bool image_rebuild_near_budget_load(
+    PocDocument *document, Stylesheet *stylesheet, ImageResources *images,
+    Budget *budget)
+{
+    return images_load_external(
+        document, stylesheet, images, budget,
+        "https://image-rebuild.test/", "https://image-rebuild.test/", NULL,
+        16, 64 * 1024, 32 * 1024, 1024 * 1024, 1000, NULL, NULL);
+}
+
+static bool image_rebuild_near_budget_rebuild(
+    PocDocument *document, Stylesheet *stylesheet, ImageResources *images,
+    Budget *budget)
+{
+    return images_rebuild_external_reusing_rasters(
+        document, stylesheet, images, budget,
+        "https://image-rebuild.test/", "https://image-rebuild.test/", NULL,
+        16, 64 * 1024, 32 * 1024, 1024 * 1024, 1000, NULL, NULL, NULL,
+        NULL, 480, NULL, 0);
+}
+
+/* The image-only rebuild keeps the outgoing table alive so unchanged inline
+   SVG rasters can move into the new one. Everything else in the outgoing
+   table (external images the rebuild decodes again) has to be released
+   before the load, or a page whose images only just fit could not be
+   rebuilt at all: both decodes of every image would be resident at once,
+   where the destroy-first rebuild needed room for one. */
+static bool test_image_rebuild_near_budget_releases_unlent_images(
+    Budget *budget)
+{
+    char html[4096];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}img{display:block}</style>"
+        "<body><svg id=icon width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill='#00ff00' d='M0 0h16v16H0z'/></svg>");
+    static const char *const fills[] = {
+        "d02040", "20d040", "2040d0", "d0d020", "20d0d0", "d020d0"
+    };
+    for (size_t i = 0; used > 0 && i < 6; i++) {
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+            "<img width=128 height=128 src=\"data:image/svg+xml,"
+            "%%3csvg%%20xmlns='http://www.w3.org/2000/svg'%%20width='128'"
+            "%%20height='128'%%3e%%3cpath%%20fill='%%23%s'"
+            "%%20d='M0%%200h128v128H0z'/%%3e%%3c/svg%%3e\">", fills[i]);
+    }
+    size_t baseline = budget->current;
+    size_t limit = budget->limit;
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool ok = used > 0 && (size_t) used < sizeof(html)
+        && document_parse(&document, budget, html, (size_t) used, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480);
+    /* What a destroy-first rebuild needs: a fresh load's peak. */
+    size_t base = budget->current;
+    budget->peak = base;
+    ok = ok && image_rebuild_near_budget_load(
+        &document, &stylesheet, &images, budget);
+    size_t fresh_peak = budget->peak;
+    size_t loaded = images.stats.loaded;
+    ok = ok && images.count == 7 && loaded == 7
+        && images.stats.inline_svg_rasterized == 1
+        && images.stats.decoded_bytes >= 6u * 128u * 128u * 4u;
+    size_t resident = budget->current;
+    lxb_dom_node_t *icon = ok ? find_id(
+        lxb_dom_interface_node(document.html), "icon") : NULL;
+    const ImageResource *icon_image =
+        icon == NULL ? NULL : images_find_node(&images, icon);
+    const unsigned char *icon_pixels =
+        icon_image == NULL ? NULL : icon_image->pixels;
+    ok = ok && icon_pixels != NULL;
+
+    /* Room for the page and one decode of its images, not two. */
+    budget->limit = fresh_peak + 16u * 1024u;
+    ok = ok && budget->limit < resident + (fresh_peak - base)
+        && image_rebuild_near_budget_rebuild(
+            &document, &stylesheet, &images, budget);
+    icon_image = icon == NULL ? NULL : images_find_node(&images, icon);
+    bool near_ok = ok && images.count == 7 && images.stats.loaded == loaded
+        && images.stats.failed == 0
+        && images.stats.inline_svg_refresh_reused == 1
+        && images.stats.inline_svg_rasterized == 0
+        && icon_image != NULL && icon_image->pixels == icon_pixels
+        && budget->current == resident;
+    if (!near_ok) {
+        fprintf(stderr, "near-budget image rebuild: ok=%d count=%zu "
+                "loaded=%zu/%zu failed=%zu svg=%zu/%zu current=%zu "
+                "resident=%zu limit=%zu fresh-peak=%zu\n", (int) ok,
+                images.count, images.stats.loaded, loaded,
+                images.stats.failed, images.stats.inline_svg_refresh_reused,
+                images.stats.inline_svg_rasterized, budget->current,
+                resident, budget->limit, fresh_peak);
+    }
+    budget->limit = limit;
+    ok = near_ok;
+
+    /* With room to spare the raster is still taken over, repeatedly, and
+       the rebuild peaks where a fresh load did, give or take the kept
+       raster and the outgoing entry array. */
+    for (int round = 0; ok && round < 3; round++) {
+        budget->peak = budget->current;
+        ok = image_rebuild_near_budget_rebuild(
+                &document, &stylesheet, &images, budget)
+            && budget->peak <= fresh_peak + 4u * 1024u
+            && images.count == 7 && images.stats.loaded == loaded
+            && images.stats.inline_svg_refresh_reused == 1
+            && images.stats.inline_svg_rasterized == 0
+            && images_find_node(&images, icon) != NULL
+            && images_find_node(&images, icon)->pixels == icon_pixels
+            && budget->current == resident;
+        if (getenv("TILEFINCH_TEST_VERBOSE") != NULL || !ok) {
+            fprintf(stderr, "image rebuild peak: rebuild=%zu fresh=%zu "
+                    "resident=%zu base=%zu\n", budget->peak, fresh_peak,
+                    resident, base);
+        }
+    }
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok && budget->current == baseline;
+}
+
+static bool svg_presentation_step(NavigationSession *navigation,
+                                  const char *script)
+{
+    return script_runtime_evaluate_diagnostic(
+               navigation->page.runtime, script, "<svg-presentation>",
+               &navigation->page.script_result)
+        && script_runtime_consume_relayout(navigation->page.runtime)
+        && navigation_relayout(navigation);
+}
+
+static bool svg_presentation_open(NavigationSession *navigation,
+                                  Budget *budget, const char *html)
+{
+    if (!navigation_init(navigation, budget, 2)) return false;
+    navigation_enable_scripts(navigation, 3 * MIB, 1000);
+    navigation_enable_external_resources(
+        navigation, 2, 32 * 1024, 32 * 1024,
+        8, 64 * 1024, 32 * 1024, 64 * 1024, 1000);
+    uint64_t generation = navigation_begin(navigation);
+    return navigation_commit_html(
+        navigation, generation, "https://svg-presentation.test/", html,
+        strlen(html), 480, NULL, NULL, true);
+}
+
+/* A selected refresh and the following layout share one invalidated cascade:
+   changing the deepest host must not re-resolve every unchanged ancestor for
+   every icon. Root defaults and inherited variables still match a complete
+   authoritative discovery, including hidden/revealed resources. */
+static bool test_inline_svg_refresh_reuses_layout_ancestry(Budget *budget)
+{
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>:root{--ink:red}.tone{color:var(--ink)}"
+        ".blue{--ink:blue}.hidden{display:none}");
+    for (size_t i = 0; i < 64; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                 ".unused%zu{padding:1px}", i);
+    used += (size_t) snprintf(html + used, sizeof(html) - used, "</style><body>");
+    /* The production owner only retains styles on documents of >=256 nodes. */
+    for (size_t i = 0; i < 260; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used, "<i></i>");
+    for (size_t i = 0; i < 16; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used, "<div>");
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+        "<div id=host class=tone>"
+        "<svg id=a width=8 height=8><path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+        "<svg id=b width=8 height=8><path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+        "<svg id=c width=8 height=8><path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+        "</div>");
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ready = svg_presentation_open(&navigation, budget, html);
+    lxb_dom_node_t *root = ready
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *icons[3] = {
+        root == NULL ? NULL : find_id(root, "a"),
+        root == NULL ? NULL : find_id(root, "b"),
+        root == NULL ? NULL : find_id(root, "c")
+    };
+    size_t hits = navigation.page.images.stats.node_style_cache_hits;
+    bool ok = ready && icons[0] != NULL && icons[1] != NULL && icons[2] != NULL
+        && svg_presentation_step(&navigation,
+            "document.getElementById('host').classList.add('blue')")
+        && navigation.page.images.stats.node_style_cache_hits >= hits + 32u
+        && svg_pixel_is(&navigation.page.images, icons[0], 0, 255)
+        && svg_fresh_matches(&navigation.page.document,
+            &navigation.page.stylesheet, &navigation.page.images, budget, icons, 3);
+    SvgRasterSnapshot snapshots[3];
+    for (size_t i = 0; ok && i < 3; i++)
+        ok = svg_raster_snapshot(&navigation.page.images, icons[i], &snapshots[i]);
+    size_t resident = budget->current;
+    for (size_t step = 0; ok && step < 32; step++) {
+        budget_inject_failure_after(budget, step);
+        (void) images_refresh_external_nodes_reusing_layout_styles(
+            &navigation.page.document, &navigation.page.stylesheet,
+            &navigation.page.images, icons, 3, budget,
+            "https://svg-presentation.test/", "https://svg-presentation.test/", NULL,
+            8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL,
+            navigation.page.layout_reuse, navigation.fonts,
+            navigation.viewport.css_width);
+        budget_clear_failure_injection(budget);
+        ok = budget->current == resident;
+        for (size_t i = 0; ok && i < 3; i++)
+            ok = svg_raster_matches(&navigation.page.images, icons[i], &snapshots[i]);
+    }
+    ok = ok && svg_presentation_step(&navigation,
+        "document.getElementById('host').classList.add('hidden')")
+        && images_find_node(&navigation.page.images, icons[0]) == NULL
+        && svg_presentation_step(&navigation,
+            "document.getElementById('host').classList.remove('hidden');"
+            "document.getElementById('host').classList.remove('blue')")
+        && svg_pixel_is(&navigation.page.images, icons[0], 255, 0)
+        && svg_fresh_matches(&navigation.page.document,
+            &navigation.page.stylesheet, &navigation.page.images, budget, icons, 3);
+    if (!ok) fprintf(stderr, "SVG layout ancestry reuse hits=%zu delta=%zu\n",
+        navigation.page.images.stats.node_style_cache_hits,
+        navigation.page.images.stats.node_style_cache_hits - hits);
+    navigation_destroy(&navigation);
+    return ok && budget->current == baseline;
+}
+
+static uint32_t late_init_text_color(const LayoutDocument *layout,
+                                     const char *text);
+
+static bool test_unobserved_data_attribute_style_reuse(Budget *budget)
+{
+    char html[16384];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>p{color:red}"
+        "[data-color] p{color:blue}"
+        "[data-a-very-long-attribute-name-beyond-journal] p{color:green}"
+        "[data-theme]{--tone:blue}#custom{color:var(--tone,red)}"
+        "#label{display:inline-block}#label:before{content:attr(data-label)}"
+        "</style><body><span id=label data-label=OLD></span>"
+        "<p id=custom>CUSTOM</p>");
+    for (size_t i = 0; i < 200; ++i) {
+        int n = snprintf(html + used, sizeof(html) - used, "<p>UNCHANGED</p>");
+        if (n <= 0 || (size_t) n >= sizeof(html) - used) return false;
+        used += (size_t) n;
+    }
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = svg_presentation_open(&navigation, budget, html)
+        && svg_presentation_step(&navigation,
+            "document.documentElement.setAttribute('data-warm','1')");
+    LayoutReuseStats before = {0}, after = {0};
+    lxb_dom_node_t *label = ok ? find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "label") : NULL;
+    const LayoutNodeBox *box = label == NULL ? NULL
+        : layout_box_for_node(&navigation.page.layout, label);
+    int label_width = box == NULL ? -1 : box->width;
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &before);
+    ok = ok && svg_presentation_step(&navigation,
+        "document.documentElement.setAttribute('data-progress','1')");
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &after);
+    if (ok && after.style_misses - before.style_misses > 8u) {
+        fprintf(stderr, "unobserved data attribute style misses=%zu\n",
+                after.style_misses - before.style_misses);
+        ok = false;
+    }
+    ok = ok && svg_presentation_step(&navigation,
+        "document.getElementById('label').setAttribute('data-label','NEW CONTENT')")
+        && command_x(&navigation.page.layout, "NEW") >= 0
+        && command_x(&navigation.page.layout, "CONTENT") >= 0;
+    box = label == NULL ? NULL : layout_box_for_node(&navigation.page.layout, label);
+    ok = ok && box != NULL && label_width > 0 && box->width > label_width
+        && svg_presentation_step(&navigation,
+            "document.documentElement.setAttribute('data-theme','yes')")
+        && late_init_text_color(&navigation.page.layout, "CUSTOM") == 0x0000ff
+        && svg_presentation_step(&navigation,
+            "document.documentElement.setAttribute('data-color','yes')")
+        && late_init_text_color(&navigation.page.layout, "UNCHANGED") == 0x0000ff
+        && svg_presentation_step(&navigation,
+            "document.documentElement.setAttribute('data-a-very-long-attribute-name-beyond-journal','yes')")
+        && late_init_text_color(&navigation.page.layout, "UNCHANGED") == 0x008000;
+    if (!ok) {
+        fprintf(stderr, "data style reuse: misses=%zu new=%d color=%x error=%s\n",
+                after.style_misses - before.style_misses,
+                command_x(&navigation.page.layout, "CONTENT"),
+                late_init_text_color(&navigation.page.layout, "UNCHANGED"),
+                navigation.last_error);
+    }
+    navigation_destroy(&navigation);
+    return ok && budget->current == baseline;
+}
+
+typedef struct {
+    DrawCommand *commands;
+    char *text;
+    size_t count;
+} DataAttributeLayoutSnapshot;
+
+static bool data_attribute_snapshot(const LayoutDocument *layout,
+                                    DataAttributeLayoutSnapshot *snapshot)
+{
+    size_t text_bytes = 0;
+    for (size_t i = 0; i < layout->count; i++)
+        text_bytes += layout->commands[i].text_length;
+    snapshot->commands = malloc((layout->count + 1u) * sizeof(DrawCommand));
+    snapshot->text = malloc(text_bytes + 1u);
+    snapshot->count = layout->count;
+    if (snapshot->commands == NULL || snapshot->text == NULL) return false;
+    size_t used = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        snapshot->commands[i] = layout->commands[i];
+        if (layout->commands[i].text_length != 0)
+            memcpy(snapshot->text + used, layout->commands[i].text,
+                   layout->commands[i].text_length);
+        used += layout->commands[i].text_length;
+    }
+    return true;
+}
+
+/* The retained cascade after `script` must paint exactly what a cascade
+   resolved from scratch over the same DOM paints. */
+static bool data_attribute_step_matches_full(NavigationSession *navigation,
+                                             const char *script,
+                                             LayoutReuseStats *stats)
+{
+    if (!svg_presentation_step(navigation, script)) {
+        fprintf(stderr, "data attribute step failed: %s: %s\n", script,
+                navigation->last_error);
+        return false;
+    }
+    if (stats != NULL)
+        layout_reuse_cache_stats(navigation->page.layout_reuse, stats);
+    DataAttributeLayoutSnapshot retained = {0};
+    bool ok = data_attribute_snapshot(&navigation->page.layout, &retained);
+    layout_reuse_cache_reset(navigation->page.layout_reuse);
+    ok = ok && navigation_relayout(navigation);
+    const LayoutDocument *full = &navigation->page.layout;
+    if (ok && full->count != retained.count) {
+        fprintf(stderr, "data attribute %s: commands %zu retained, %zu full\n",
+                script, retained.count, full->count);
+        ok = false;
+    }
+    size_t text_at = 0;
+    for (size_t i = 0; ok && i < full->count; i++) {
+        const DrawCommand *x = &retained.commands[i], *y = &full->commands[i];
+        if (x->type != y->type || x->x != y->x || x->y != y->y
+            || x->width != y->width || x->height != y->height
+            || x->color != y->color || x->text_length != y->text_length
+            || (y->text_length != 0 && memcmp(
+                    retained.text + text_at, y->text, y->text_length) != 0)) {
+            fprintf(stderr, "data attribute %s: command %zu retained "
+                    "%d,%d %dx%d #%06x '%.*s', full %d,%d %dx%d #%06x "
+                    "'%.*s'\n", script, i, x->x, x->y, x->width, x->height,
+                    (unsigned) x->color, (int) x->text_length,
+                    retained.text + text_at, y->x, y->y, y->width, y->height,
+                    (unsigned) y->color, (int) y->text_length,
+                    y->text == NULL ? "" : y->text);
+            ok = false;
+        }
+        text_at += x->text_length;
+    }
+    free(retained.commands);
+    free(retained.text);
+    return ok;
+}
+
+/* Selector sources beyond the author <style>s -- shadow-tree <style>s,
+   adopted constructed sheets, nesting, functional pseudo-classes and
+   generated attr() content -- must all keep data-* reuse exact. */
+static bool test_data_attribute_reuse_matches_full_cascade(Budget *budget)
+{
+    char html[16384];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>p{color:red;margin:0}"
+        ".nest{&[data-nest] .nt{color:blue}}"
+        ":is(#isbox[data-is]) .ist{color:blue}"
+        ":where(#wh[data-wh]) .wht{color:blue}"
+        "#nt:not([data-not]) .ntt{color:blue}"
+        "#hs:has(>[data-has]) .hst{color:blue}"
+        "#gen{display:inline-block}"
+        "#gen::before{content:\"[\" attr(data-g) \"]\"}"
+        ".data-\\[state\\=open\\]\\:blk[data-state=open]{display:block}"
+        "x-host{display:block}"
+        "</style><body>"
+        "<div id=nest class=nest><p class=nt>NEST</p></div>"
+        "<div id=isbox><p class=ist>IST</p></div>"
+        "<div id=wh><p class=wht>WHT</p></div>"
+        "<div id=nt><p class=ntt>NTT</p></div>"
+        "<div id=hs><span id=hskid></span><p class=hst>HST</p></div>"
+        "<span id=gen data-g=a></span>"
+        "<x-host id=host><p id=light class=light>LIGHT</p></x-host>"
+        "<div id=adopt><p class=adt>ADT</p></div>");
+    for (size_t i = 0; i < 150; ++i) {
+        int n = snprintf(html + used, sizeof(html) - used, "<p>FILLER</p>");
+        if (n <= 0 || (size_t) n >= sizeof(html) - used) return false;
+        used += (size_t) n;
+    }
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = svg_presentation_open(&navigation, budget, html)
+        && data_attribute_step_matches_full(&navigation,
+            "const host=document.getElementById('host');"
+            "const root=host.attachShadow({mode:'open'});"
+            "root.innerHTML='<style>:host([data-state=open]) .sh{color:blue}"
+            "#inner[data-in] .si{color:blue}::slotted([data-sl]){color:blue}"
+            "</style><div id=inner><p class=sh>SHOST</p><p class=si>SIN</p>"
+            "<slot></slot></div>';"
+            "const sheet=new CSSStyleSheet();"
+            "sheet.replaceSync('#adopt[data-ad] .adt{color:blue}');"
+            "document.adoptedStyleSheets=[sheet]", NULL);
+    static const struct {
+        const char *script;
+        const char *text;
+        uint32_t color;
+    } steps[] = {
+        {"document.getElementById('nest').setAttribute('data-nest','')",
+         "NEST", 0x0000ff},
+        {"document.getElementById('isbox').dataset.is='1'", "IST", 0x0000ff},
+        {"document.getElementById('wh').setAttribute('data-wh','1')",
+         "WHT", 0x0000ff},
+        {"document.getElementById('nt').setAttribute('data-not','1')",
+         "NTT", 0xff0000},
+        {"document.getElementById('hskid').setAttribute('data-has','1')",
+         "HST", 0x0000ff},
+        {"document.getElementById('host').shadowRoot.getElementById('inner')"
+         ".setAttribute('data-in','1')", "SIN", 0x0000ff},
+        {"document.getElementById('adopt').setAttribute('data-ad','1')",
+         "ADT", 0x0000ff},
+        /* Neither :host() nor ::slotted() matches natively; the retained and
+           full cascades must still agree. */
+        {"document.getElementById('host').setAttribute('data-state','open')",
+         "SHOST", UINT32_MAX},
+        {"document.getElementById('light').setAttribute('data-sl','1')",
+         "LIGHT", UINT32_MAX},
+        {"document.getElementById('gen').setAttribute('data-g','NEWER TEXT')",
+         "TEXT]", UINT32_MAX},
+    };
+    for (size_t i = 0; ok && i < sizeof(steps) / sizeof(steps[0]); i++) {
+        ok = data_attribute_step_matches_full(
+            &navigation, steps[i].script, NULL);
+        uint32_t color = late_init_text_color(
+            &navigation.page.layout, steps[i].text);
+        if (ok && (color == UINT32_MAX
+                   || (steps[i].color != UINT32_MAX
+                       && color != steps[i].color))) {
+            fprintf(stderr, "data attribute %s: %s color %06x\n",
+                    steps[i].script, steps[i].text, (unsigned) color);
+            ok = false;
+        }
+    }
+    /* An escaped class name is not an attribute selector: an unobserved
+       attribute still keeps the retained cascade. */
+    LayoutReuseStats before = {0}, after = {0};
+    ok = ok && svg_presentation_step(&navigation,
+        "document.documentElement.setAttribute('data-warm','1')");
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &before);
+    ok = ok && data_attribute_step_matches_full(&navigation,
+        "document.documentElement.setAttribute('data-progress','1')", &after);
+    if (ok && after.style_misses - before.style_misses > 8u) {
+        fprintf(stderr, "unobserved data attribute beside escaped class: "
+                "style misses=%zu\n", after.style_misses - before.style_misses);
+        ok = false;
+    }
+    navigation_destroy(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* A class, id or inline-style change that alters only what an inline SVG
+   resolves (an ancestor's colour, a custom property feeding it, a
+   presentation property inside it, its size) must refresh that raster.
+   One that cannot must not re-rasterize, and a page without inline SVG
+   rasters must not refresh images at all. */
+static bool test_inline_svg_presentation_mutations_refresh(Budget *budget)
+{
+#define ICON "<svg width=8 height=8 viewBox='0 0 8 8'>" \
+             "<path fill=currentColor d='M0 0h8v8H0z'/></svg>"
+    static const char html[] =
+        "<!doctype html><style>html,body{margin:0}:root{--ic:#ff0000}"
+        ".host{color:#ff0000}.tint{color:#0000ff}.var{color:var(--ic)}"
+        ".theme{--ic:#0000ff}.sz{width:8px;height:8px}"
+        ".big .sz{width:16px;height:16px}"
+        ".blue{fill:#0000ff}.same{color:#ff0000}.pad{padding-left:1px}"
+        "</style><body>"
+        "<div id=a class=host>" ICON "</div>"
+        "<div id=b class=host>" ICON "</div>"
+        "<div id=c class=var>" ICON "</div>"
+        "<div id=d class=var>" ICON "</div>"
+        "<div id=e class=host><svg class=sz viewBox='0 0 8 8'>"
+        "<path fill=currentColor d='M0 0h8v8H0z'/></svg></div>"
+        "<div id=f class=host><svg width=8 height=8 viewBox='0 0 8 8'>"
+        "<path id=fp fill=currentColor d='M0 0h8v8H0z'/></svg></div>"
+        "</body>";
+#undef ICON
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = svg_presentation_open(&navigation, budget, html);
+    lxb_dom_node_t *root = ok
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *icons[6] = {NULL};
+    static const char *const hosts[6] = {"a", "b", "c", "d", "e", "f"};
+    for (size_t i = 0; ok && i < 6; i++) {
+        lxb_dom_node_t *host = find_id(root, hosts[i]);
+        icons[i] = host == NULL ? NULL : host->first_child;
+        ok = icons[i] != NULL
+            && svg_pixel_is(&navigation.page.images, icons[i], 255, 0);
+    }
+    const ExternalImageStats *stats = &navigation.page.images.stats;
+    const char *failed = ok ? NULL : "setup";
+    static const struct {
+        const char *label;
+        const char *script;
+        size_t icon;
+        unsigned char red;
+        int width;
+    } recolors[] = {
+        {"ancestor class colour",
+         "document.getElementById('a').classList.add('tint')", 0, 0, 8},
+        {"ancestor inline colour",
+         "document.getElementById('b').style.color='#0000ff'", 1, 0, 8},
+        {"class custom property",
+         "document.getElementById('c').classList.add('theme')", 2, 0, 8},
+        {"inline custom property",
+         "document.getElementById('d').style.setProperty('--ic','#0000ff')",
+         3, 0, 8},
+        {"ancestor class size",
+         "document.getElementById('e').classList.add('big')", 4, 255, 16},
+        {"presentation class inside",
+         "document.getElementById('fp').classList.add('blue')", 5, 0, 8},
+    };
+    /* Every case runs, so one report names each missed refresh. */
+    for (size_t i = 0; ok && i < sizeof(recolors) / sizeof(recolors[0]);
+         i++) {
+        size_t scans = navigation.performance.mutation_image_resource_scans;
+        size_t walks = navigation.performance.resource_fingerprint_scans;
+        const ImageResource *icon = NULL;
+        /* The refresh keeps the resource fingerprint: class and style
+           writes cannot change it, so the document is not walked again. */
+        if (!svg_presentation_step(&navigation, recolors[i].script)
+            || navigation.performance.mutation_image_resource_scans
+                   != scans + 1
+            || navigation.performance.resource_fingerprint_scans != walks
+            || (icon = images_find_node(&navigation.page.images,
+                                        icons[recolors[i].icon])) == NULL
+            || icon->width != recolors[i].width
+            || !svg_pixel_is(&navigation.page.images,
+                             icons[recolors[i].icon], recolors[i].red,
+                             255 - recolors[i].red)) {
+            fprintf(stderr, "inline SVG presentation case missed: %s\n",
+                    recolors[i].label);
+            failed = recolors[i].label;
+        }
+    }
+    /* A colour rule that resolves to the same value refreshes, but the
+       raster is reused rather than decoded again. */
+    size_t scans = navigation.performance.mutation_image_resource_scans;
+    size_t rasterized = stats->inline_svg_rasterized;
+    size_t reused = stats->inline_svg_refresh_reused;
+    if (failed == NULL
+        && (!svg_presentation_step(
+                &navigation,
+                "document.getElementById('e').classList.add('same')")
+            || navigation.performance.mutation_image_resource_scans
+                   != scans + 1
+            || stats->inline_svg_rasterized != rasterized
+            || stats->inline_svg_refresh_reused != reused + 1
+            || !svg_pixel_is(&navigation.page.images, icons[4], 255, 0))) {
+        failed = "unchanged colour reuse";
+    }
+    /* A class no colour, size or presentation rule depends on schedules no
+       refresh at all. */
+    scans = navigation.performance.mutation_image_resource_scans;
+    rasterized = stats->inline_svg_rasterized;
+    reused = stats->inline_svg_refresh_reused;
+    if (failed == NULL
+        && (!svg_presentation_step(
+                &navigation,
+                "document.getElementById('a').classList.add('pad');"
+                "document.getElementById('c').id='c2'")
+            || navigation.performance.mutation_image_resource_scans != scans
+            || stats->inline_svg_rasterized != rasterized
+            || stats->inline_svg_refresh_reused != reused
+            || !svg_pixel_is(&navigation.page.images, icons[0], 0, 255))) {
+        failed = "unrelated class";
+    }
+    if (failed != NULL) {
+        fprintf(stderr, "inline SVG presentation mutation failed: %s "
+                "scans=%zu rasterized=%zu reused=%zu error=%s\n", failed,
+                navigation.performance.mutation_image_resource_scans,
+                stats->inline_svg_rasterized,
+                stats->inline_svg_refresh_reused, navigation.last_error);
+    }
+    navigation_destroy(&navigation);
+
+    /* Without inline SVG rasters, neither a colour class nor inline colour
+       and custom-property writes on a container too large for the bounded
+       descendant walk schedule an image refresh. */
+    char plain[8192];
+    size_t used = (size_t) snprintf(
+        plain, sizeof(plain),
+        "<!doctype html><style>.tint{color:#0000ff}.theme{--ic:#0000ff}"
+        "</style><body><div id=box>");
+    for (unsigned i = 0; i < 300u && used < sizeof(plain) - 32u; i++) {
+        used += (size_t) snprintf(plain + used, sizeof(plain) - used,
+                                  "<b>t</b>");
+    }
+    snprintf(plain + used, sizeof(plain) - used, "</div></body>");
+    bool plain_ok = failed == NULL
+        && svg_presentation_open(&navigation, budget, plain);
+    plain_ok = plain_ok
+        && svg_presentation_step(
+               &navigation,
+               "const box=document.getElementById('box');"
+               "box.classList.add('tint');box.classList.add('theme')")
+        && svg_presentation_step(
+               &navigation,
+               "const box2=document.getElementById('box');"
+               "box2.style.color='#ff0000';"
+               "box2.style.setProperty('--ic','#ff0000');"
+               "box2.style.fill='#ff0000'")
+        && navigation.performance.mutation_image_resource_scans == 0;
+    if (failed == NULL && !plain_ok) {
+        fprintf(stderr, "page without inline SVG refreshed images: "
+                "scans=%zu\n",
+                navigation.performance.mutation_image_resource_scans);
+    }
+    if (failed == NULL) navigation_destroy(&navigation);
+    return failed == NULL && plain_ok && budget->current == baseline;
+}
+
 static bool test_visible_inline_svg_priority_resource(Budget *budget)
 {
     static const char html[] =
@@ -3378,6 +4526,21 @@ static bool test_layout_cooperate(void *context, const char *phase,
 }
 
 
+/* A stand-in for an optional cache: the heap-growth test's reclaim hook
+   releases it when the page needs the room. */
+static void *grow_test_cache;
+static Budget *grow_test_budget;
+static size_t grow_test_reclaim(void *opaque, size_t needed)
+{
+    (void) opaque;
+    (void) needed;
+    if (grow_test_cache == NULL || grow_test_budget == NULL) return 0;
+    size_t before = budget_remaining(grow_test_budget);
+    budget_free(grow_test_budget, grow_test_cache);
+    grow_test_cache = NULL;
+    return budget_remaining(grow_test_budget) - before;
+}
+
 /* Suite bodies stay in one translation unit so allocator and callback
    fixtures preserve their established process-local semantics. */
 #include "suites/foundation_platform.inc"
@@ -3473,6 +4636,110 @@ static int test_fixed_overlays_follow_z_index(Budget *budget)
         stylesheet_destroy(&stylesheet);
         document_destroy(&document);
     }
+    return 0;
+}
+
+/* Transparent stroke interiors must not consume per-pixel coverage work. */
+static int test_stroke_interior_work(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    uint64_t fingerprint = UINT64_C(1469598103934665603);
+    int radii[] = {0, 1, 9, 999,
+        style_border_radius_pack(1, 11, 23, 5)};
+    for (size_t radius = 0; radius < 5; radius++) {
+        for (int pattern = 0; pattern < 3; pattern++) {
+            for (int thick = 0; thick < 3; thick++) {
+                DrawCommand command = {
+                    .x = thick == 1 ? 9 : -1,
+                    .y = thick == 1 ? 7 : -1,
+                    .width = thick == 1 ? 77 : 130,
+                    .height = thick == 1 ? 69 : 98,
+                    .color = 0xb32165u, .opacity_scale = thick == 0 ? 26 : 256,
+                    .type = DRAW_STROKE_RECT,
+                    .scale = thick == 0 ? 1 : thick == 1 ? 4 : 60,
+                    .radius = radii[radius],
+                    .image_fit = pattern == 0 ? 0
+                        : pattern == 1 ? LAYOUT_STROKE_DASHED : LAYOUT_STROKE_DOTTED
+                };
+                LayoutDocument layout = {
+                    .budget = &budget, .commands = &command, .count = 1,
+                    .width = 128, .scroll_width = 128, .height = 96,
+                    .page_background = 0x294566u
+                };
+                TileCache cache;
+                uint16_t frame[128u * 96u];
+                CHECK(tile_cache_init(&cache, &budget, &layout, 2)
+                    && tile_cache_set_frame(&cache, frame, 128u * 96u)
+                    && tile_cache_render_frame(&cache, 0, 128, 96, NULL));
+                for (size_t i = 0; i < 128u * 96u; i++) {
+                    fingerprint ^= frame[i];
+                    fingerprint *= UINT64_C(1099511628211);
+                }
+                tile_cache_destroy(&cache);
+            }
+        }
+    }
+    /* Oracle captured from the original per-pixel implementation, covering
+       clipped boxes, per-corner radii, dashes, dots and a filled thick border. */
+    CHECK(fingerprint == UINT64_C(6155321901793420611));
+    DrawCommand command = {
+        .x = -1, .y = -1, .width = 482, .height = 274,
+        .color = 0xb32165u, .opacity_scale = 26,
+        .type = DRAW_STROKE_RECT, .scale = 1, .radius = 1
+    };
+    LayoutDocument layout = {
+        .budget = &budget, .commands = &command, .count = 1,
+        .width = 480, .scroll_width = 480, .height = 272,
+        .page_background = 0x294566u
+    };
+    TileCache cache;
+    uint16_t *frame = budget_malloc(&budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, &budget, &layout, 12)
+        && tile_cache_set_frame(&cache, frame, 480u * 272u)
+        && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+    CHECK(cache.stroke_pixel_tests < 10000);
+    tile_cache_destroy(&cache);
+    budget_free(&budget, frame);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_stroke_rounded_clip(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;background:#294566}"
+        "#clip{width:100px;height:80px;overflow:hidden;border-radius:20px;"
+        "margin:12px 8px}#box{position:relative;left:-9px;top:-7px;"
+        "width:130px;height:90px;border:4px dashed rgba(179,33,101,.4);"
+        "border-radius:30px}</style><body><div id=clip><div id=box>"
+        "</div></div>";
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17)
+          && stylesheet_build(&stylesheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &stylesheet,
+                          NULL, NULL, 480)
+          && layout.overflow_order_count == 1);
+    TileCache cache;
+    uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 24)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+    uint64_t fingerprint = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < 480u * 272u; i++) {
+        fingerprint ^= frame[i];
+        fingerprint *= UINT64_C(1099511628211);
+    }
+    /* Original renderer oracle: a translucent dashed rounded border clipped
+       by a different rounded ancestor must preserve both AA boundaries. */
+    CHECK(fingerprint == UINT64_C(12001725545551004547));
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
     return 0;
 }
 

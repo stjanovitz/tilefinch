@@ -616,10 +616,12 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
         if (psp_hls_playlist_retry_allowed(
                 context->playlist_open_attempts,
                 context->last_transport_retryable)) {
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
             printf("tilefinch-media-hls: event=playlist-retry "
                    "attempt=%u transport=%ld\n",
                    context->playlist_open_attempts,
                    context->last_transport_code);
+#endif
             psp_hls_destroy_playlist_stream(context);
             return PSP_MEDIA_HLS_OPEN_PENDING;
         }

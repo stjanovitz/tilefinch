@@ -84,6 +84,12 @@ typedef struct {
     size_t pressure_saved_bytes;
     size_t external_reserved;
     size_t external_reserved_peak;
+    /* See budget_set_reclaim_hook(). */
+    size_t (*reclaim_hook)(void *opaque, size_t needed_bytes);
+    void *reclaim_opaque;
+    bool reclaim_active;
+    size_t reclaim_calls;
+    size_t reclaimed_bytes;
 #if defined(TILEFINCH_OWNER_CHECKS)
     /* The first thread to mutate the ledger owns it. */
 #if defined(__PSP__)
@@ -155,6 +161,20 @@ typedef struct {
 } BudgetConcurrentPoolMetrics;
 
 void budget_init(Budget *budget, size_t limit);
+/* Optional-memory reclaim. Before refusing an allocation, reallocation or
+   reservation for lack of room, the Budget calls `hook` (on its owning
+   thread) with the shortfall, then retries once. The hook may free Budget
+   allocations that hold only optional, rebuildable data (caches) and returns
+   the bytes it released; it must not allocate and is never re-entered.
+   Injected failures do not call it. This lets an accelerator cache use room
+   the page is not using without ever being the reason an allocation fails.
+   A NULL hook removes it. */
+typedef size_t (*BudgetReclaimHook)(void *opaque, size_t needed_bytes);
+void budget_set_reclaim_hook(Budget *budget, BudgetReclaimHook hook,
+                             void *opaque);
+/* True when at least `free_bytes` are unused, first asking the reclaim hook
+   (once) to release optional cache memory if they are not. */
+bool budget_make_room(Budget *budget, size_t free_bytes);
 void budget_inject_failure_after(Budget *budget, size_t successful_attempts);
 void budget_clear_failure_injection(Budget *budget);
 /* Lexbor's allocator table is process-global. Install refuses to replace an

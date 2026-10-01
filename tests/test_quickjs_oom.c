@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -350,6 +351,77 @@ static int run_dense_join_pressure(void)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    return okay ? 0 : 1;
+}
+
+/* `s += expr` on a local grows the string in place: the pool reports its
+   class capacity as the usable size, and OP_add appends to a string whose
+   only other reference is the local the result replaces (checked `let`
+   stores and non-constant right-hand sides, which OP_add_loc does not
+   cover). Before, every append to a 512..8192-character string allocated
+   and copied the whole string. Aliases, wide characters, atoms and the
+   pool's realloc of engine-used slack keep their values. */
+static int run_string_append_in_place(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    const JSMallocFunctions *allocator = budget_quickjs_pool_allocator();
+    /* Realloc across classes keeps bytes written into reported slack. */
+    JSMallocState state = { .malloc_limit = MIB, .opaque = pool };
+    unsigned char *block = allocator->js_malloc(&state, 1100u);
+    size_t usable = block ? allocator->js_malloc_usable_size(block) : 0;
+    bool slack_ok = usable >= 1100u;
+    if (block && slack_ok) memset(block, 0x5a, usable);
+    block = block ? allocator->js_realloc(&state, block, usable + 1u) : NULL;
+    for (size_t i = 0; block && i < usable; i++)
+        slack_ok = slack_ok && block[i] == 0x5a;
+    if (block) allocator->js_free(&state, block);
+    if (!slack_ok || state.malloc_size != 0) {
+        fprintf(stderr, "string append: slack usable=%zu live=%zu\n",
+                usable, state.malloc_size);
+        return 1;
+    }
+    JSRuntime *rt = JS_NewRuntime2(allocator, pool);
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) return 1;
+    const char contracts[] =
+        "(()=>{const ch=(i)=>String.fromCharCode(97+i%26);"
+        "let s='';for(let i=0;i<6000;i++)s+=ch(i);"
+        "if(s.length!==6000||s.slice(5198,5202)!=='yzab')return 1;"
+        "let t='x'.repeat(700);const alias=t;t+=ch(1);"
+        "if(alias.length!==700||t.length!==701||t[700]!=='b')return 2;"
+        "let u='y'.repeat(900);let v;v=(u+=ch(2));u+=ch(3);"
+        "if(v.length!==901||u.length!==902||v[900]!=='c')return 3;"
+        "let w='z'.repeat(800);w+=String.fromCharCode(0x20ac);w+=ch(0);"
+        "if(w.length!==802||w.charCodeAt(800)!==0x20ac||w[801]!=='a')return 4;"
+        "let k='k'.repeat(600);const o={};o[k]=1;k+=ch(4);"
+        "if(o['k'.repeat(600)]!==1||k.length!==601||o[k]!==undefined)return 5;"
+        "let n='n'.repeat(600);const f=()=>n;n+=ch(5);"
+        "if(f().length!==601)return 6;"
+        "return 0})()";
+    BudgetQuickJSActivity before, after;
+    budget_quickjs_pool_activity(pool, &before);
+    JSValue check = JS_Eval(ctx, contracts, sizeof(contracts) - 1,
+                            "<string-append>", 0);
+    budget_quickjs_pool_activity(pool, &after);
+    int32_t code = -1;
+    if (JS_IsException(check) || JS_ToInt32(ctx, &code, check) != 0)
+        code = -1;
+    JS_FreeValue(ctx, check);
+    /* 6,000 single-character appends: a few dozen class steps, not one
+       allocation per append past 512 characters. Shipping PSP builds keep
+       no activity counters (both snapshots are zero). */
+    uint64_t calls = (after.allocation_calls + after.reallocation_calls)
+        - (before.allocation_calls + before.reallocation_calls);
+    int okay = code == 0 && calls < 400;
+    if (!okay) fprintf(stderr, "string append: code=%d allocations=%llu\n",
+                       code, (unsigned long long) calls);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void) budget_quickjs_pool_trim(pool, 0);
     okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
     return okay ? 0 : 1;
 }
@@ -1847,6 +1919,253 @@ static int run_near_limit_array_growth(void)
 #endif
 }
 
+/* A small module map for the restore tests: sources are compiled from text
+   exactly as the browser loader does, and loads are counted so a test can
+   tell a fresh load from a module the context still had registered. */
+typedef struct {
+    const char *names[3];
+    const char *sources[3];
+    bool available[3];
+    unsigned loads[3];
+} ModuleFixture;
+
+static JSModuleDef *fixture_module_loader(JSContext *ctx, const char *name,
+                                          void *opaque)
+{
+    ModuleFixture *fixture = opaque;
+    for (size_t i = 0; i < 3 && fixture->names[i] != NULL; i++) {
+        if (strcmp(name, fixture->names[i]) != 0) continue;
+        if (!fixture->available[i]) break;
+        fixture->loads[i]++;
+        JSValue value = JS_Eval(ctx, fixture->sources[i],
+                                strlen(fixture->sources[i]), name,
+                                JS_EVAL_TYPE_MODULE
+                                    | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(value)) return NULL;
+        JSModuleDef *module = JS_VALUE_GET_PTR(value);
+        JS_FreeValue(ctx, value);
+        return module;
+    }
+    JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
+    return NULL;
+}
+
+typedef struct {
+    Budget budget;
+    BudgetQuickJSPool *pool;
+    JSRuntime *rt;
+    JSContext *ctx;
+} ModuleRealm;
+
+static bool module_realm_open(ModuleRealm *realm, ModuleFixture *fixture)
+{
+    memset(realm, 0, sizeof(*realm));
+    budget_init(&realm->budget, 8u * MIB);
+    realm->pool = budget_quickjs_pool_create(&realm->budget);
+    if (realm->pool == NULL) return false;
+    realm->rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), realm->pool);
+    if (realm->rt == NULL) return false;
+    JS_SetMaxStackSize(realm->rt, test_stack_limit());
+    realm->ctx = JS_NewContext(realm->rt);
+    if (realm->ctx == NULL) return false;
+    JS_SetModuleLoaderFunc(realm->rt, NULL, fixture_module_loader, fixture);
+    return true;
+}
+
+static bool module_realm_close(ModuleRealm *realm)
+{
+    if (realm->ctx != NULL) JS_FreeContext(realm->ctx);
+    if (realm->rt != NULL) JS_FreeRuntime(realm->rt);
+    if (realm->pool == NULL) return false;
+    (void) budget_quickjs_pool_trim(realm->pool, 0);
+    return budget_quickjs_pool_destroy(realm->pool)
+        && realm->budget.current == 0;
+}
+
+static void clear_exception(JSContext *ctx)
+{
+    JSValue exception = JS_GetException(ctx);
+    JS_FreeValue(ctx, exception);
+}
+
+/* Evaluate `import "<name>"` in a fresh probe module and return
+   globalThis.result, or INT32_MIN when the import did not complete. */
+static int32_t module_import_result(ModuleRealm *realm, const char *name)
+{
+    char source[128];
+    int written = snprintf(source, sizeof(source),
+                           "import \"%s\"; globalThis.done = true;", name);
+    if (written <= 0 || (size_t) written >= sizeof(source)) return INT32_MIN;
+    JSValue promise = JS_Eval(realm->ctx, source, (size_t) written,
+                              "<import-probe>", JS_EVAL_TYPE_MODULE);
+    if (JS_IsException(promise)) {
+        clear_exception(realm->ctx);
+        return INT32_MIN;
+    }
+    JS_FreeValue(realm->ctx, promise);
+    JSContext *job_context = NULL;
+    for (unsigned turns = 0; turns < 64
+         && JS_ExecutePendingJob(realm->rt, &job_context) > 0; turns++) {}
+    JSValue global = JS_GetGlobalObject(realm->ctx);
+    JSValue done = JS_GetPropertyStr(realm->ctx, global, "done");
+    JSValue result = JS_GetPropertyStr(realm->ctx, global, "result");
+    int32_t value = INT32_MIN;
+    if (JS_ToBool(realm->ctx, done) != 1
+        || JS_ToInt32(realm->ctx, &value, result) != 0) value = INT32_MIN;
+    JS_FreeValue(realm->ctx, done);
+    JS_FreeValue(realm->ctx, result);
+    JS_FreeValue(realm->ctx, global);
+    return value;
+}
+
+static uint8_t *module_bytecode(ModuleFixture *fixture, size_t index,
+                                size_t *length)
+{
+    ModuleRealm realm;
+    uint8_t *copy = NULL;
+    *length = 0;
+    if (module_realm_open(&realm, fixture)) {
+        const char *source = fixture->sources[index];
+        JSValue compiled = JS_Eval(realm.ctx, source, strlen(source),
+                                   fixture->names[index],
+                                   JS_EVAL_TYPE_MODULE
+                                       | JS_EVAL_FLAG_COMPILE_ONLY);
+        size_t written = 0;
+        uint8_t *bytes = JS_IsException(compiled) ? NULL
+            : JS_WriteObject(realm.ctx, &written, compiled,
+                             JS_WRITE_OBJ_BYTECODE);
+        if (bytes != NULL && (copy = malloc(written)) != NULL) {
+            memcpy(copy, bytes, written);
+            *length = written;
+        }
+        js_free(realm.ctx, bytes);
+        if (JS_IsException(compiled)) clear_exception(realm.ctx);
+        else JS_FreeValue(realm.ctx, compiled);
+    }
+    if (!module_realm_close(&realm)) {
+        free(copy);
+        return NULL;
+    }
+    memset(fixture->loads, 0, sizeof(fixture->loads));
+    return copy;
+}
+
+/* The browser restores a cached module and falls back to its source when the
+   restore fails (typically under JS heap pressure). A failed read must not
+   leave the half-read module registered: a later import of that URL has to
+   load and compile it, not link the fragment. */
+static int run_module_restore_failure_unregisters(void)
+{
+    ModuleFixture fixture = {
+        .names = { "dep" },
+        .sources = { "export const value = 42; globalThis.result = value;" },
+        .available = { true }
+    };
+    size_t length = 0;
+    uint8_t *bytes = module_bytecode(&fixture, 0, &length);
+    if (bytes == NULL) return 1;
+    int failed = 0;
+    unsigned refusals = 0;
+    for (size_t allowance = 0; allowance <= 65536 && !failed;
+         allowance += 64) {
+        memset(fixture.loads, 0, sizeof(fixture.loads));
+        ModuleRealm realm;
+        if (!module_realm_open(&realm, &fixture)) {
+            failed = 1;
+            module_realm_close(&realm);
+            break;
+        }
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(realm.rt, &usage);
+        JS_SetMemoryLimit(realm.rt, (size_t) usage.malloc_size + allowance);
+        JSValue restored = JS_ReadObject(realm.ctx, bytes, length,
+                                         JS_READ_OBJ_BYTECODE);
+        JS_SetMemoryLimit(realm.rt, 8u * MIB);
+        bool refused = JS_IsException(restored);
+        if (refused) {
+            refusals++;
+            clear_exception(realm.ctx);
+            int32_t result = module_import_result(&realm, "dep");
+            if (result != 42 || fixture.loads[0] != 1) {
+                fprintf(stderr, "module restore refusal at allowance=%zu "
+                        "left it registered: result=%d loads=%u\n",
+                        allowance, (int) result, fixture.loads[0]);
+                failed = 1;
+            }
+        } else {
+            JS_FreeValue(realm.ctx, restored);
+        }
+        if (!module_realm_close(&realm)) failed = 1;
+        if (!refused) break;
+    }
+    free(bytes);
+    if (refusals == 0) failed = 1;
+    return failed;
+}
+
+/* A restored module resolves its imports after the read. When one of them
+   cannot load, it must end up where a failed source compile leaves it:
+   unregistered, so that a retry loads it again once the dependency can. */
+static int run_module_restore_resolution_failure_unregisters(void)
+{
+    ModuleFixture fixture = {
+        .names = { "dep", "main" },
+        .sources = {
+            "export const value = 42;",
+            "import { value } from 'dep'; globalThis.result = value + 1;"
+        },
+        .available = { true, true }
+    };
+    size_t length = 0;
+    uint8_t *bytes = module_bytecode(&fixture, 1, &length);
+    if (bytes == NULL) return 1;
+    int failed = 0;
+    for (int restore = 0; restore <= 1 && !failed; restore++) {
+        memset(fixture.loads, 0, sizeof(fixture.loads));
+        fixture.available[0] = false;
+        ModuleRealm realm;
+        if (!module_realm_open(&realm, &fixture)) {
+            module_realm_close(&realm);
+            failed = 1;
+            break;
+        }
+        bool resolution_failed = false;
+        if (restore) {
+            JSValue module = JS_ReadObject(realm.ctx, bytes, length,
+                                           JS_READ_OBJ_BYTECODE);
+            if (JS_IsException(module)) {
+                clear_exception(realm.ctx);
+            } else {
+                resolution_failed = JS_ResolveModule(realm.ctx, module) < 0;
+                if (resolution_failed) clear_exception(realm.ctx);
+                JS_FreeValue(realm.ctx, module);
+            }
+        } else {
+            const char *source = fixture.sources[1];
+            JSValue module = JS_Eval(realm.ctx, source, strlen(source),
+                                     "main", JS_EVAL_TYPE_MODULE
+                                         | JS_EVAL_FLAG_COMPILE_ONLY);
+            resolution_failed = JS_IsException(module);
+            if (resolution_failed) clear_exception(realm.ctx);
+            else JS_FreeValue(realm.ctx, module);
+        }
+        fixture.available[0] = true;
+        int32_t result = resolution_failed
+            ? module_import_result(&realm, "main") : INT32_MIN;
+        if (!resolution_failed || result != 43 || fixture.loads[1] != 1
+            || fixture.loads[0] != 1) {
+            fprintf(stderr, "module %s resolution failure left it "
+                    "registered: failed=%d result=%d loads=%u/%u\n",
+                    restore ? "restore" : "compile", resolution_failed,
+                    (int) result, fixture.loads[0], fixture.loads[1]);
+            failed = 1;
+        }
+        if (!module_realm_close(&realm)) failed = 1;
+    }
+    free(bytes);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -1857,12 +2176,21 @@ int main(int argc, char **argv)
     }
     if (argc != 1) return 2;
     if (run_bytecode_refusal_atomicity() != 0) return 1;
+    if (run_module_restore_failure_unregisters() != 0) {
+        fprintf(stderr, "QuickJS module restore refusal failed\n");
+        return 1;
+    }
+    if (run_module_restore_resolution_failure_unregisters() != 0) {
+        fprintf(stderr, "QuickJS module restore resolution failed\n");
+        return 1;
+    }
     if (run_sparse_bytecode_atoms() != 0) return 1;
     if (run_near_limit_array_growth() != 0) return 1;
     if (run_cstring_refusal_lifetime() != 0) return 1;
     if (run_source_snapshot_sharing() != 0) return 1;
     if (run_source_span_snapshot() != 0) return 1;
     if (run_dense_join_pressure() != 0) return 1;
+    if (run_string_append_in_place() != 0) return 1;
     if (run_function_source_allocation_pressure(false) != 0
         || run_function_source_allocation_pressure(true) != 0) return 1;
     if (run_automatic_gc_near_limit() != 0) {

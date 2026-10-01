@@ -1642,6 +1642,17 @@ int main(int argc, char **argv)
            scripts.external_script_bytecode_cache_admission_skips,
            scripts.external_script_bytecode_cache_restore_failures,
            scripts.external_script_bytecode_cache_bytes);
+    printf("javascript-module-bytecode hits=%zu misses=%zu stores=%zu "
+           "admission-skips=%zu restore-failures=%zu restored-bytes=%zu "
+           "stored-bytes=%zu restore-us=%llu\n",
+           scripts.module_bytecode_cache_hits,
+           scripts.module_bytecode_cache_misses,
+           scripts.module_bytecode_cache_stores,
+           scripts.module_bytecode_cache_admission_skips,
+           scripts.module_bytecode_cache_restore_failures,
+           scripts.module_bytecode_cache_bytes,
+           scripts.module_bytecode_cache_stored_bytes,
+           scripts.module_bytecode_restore_us);
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
            "connected-preserves=%zu stale-releases=%zu capacity=%u\n",

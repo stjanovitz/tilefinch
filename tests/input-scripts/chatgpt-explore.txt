@@ -1,0 +1,19 @@
+# Explore chatgpt.com: where the nub cursor starts, how far it moves.
+wait-page 60
+mark-page start
+stick-page 10 down
+wait-page 5
+mark-page d10
+stick-page 10 down
+wait-page 5
+mark-page d20
+stick-page 10 left
+wait-page 5
+mark-page l10
+stick-page 20 down
+wait-page 5
+mark-page d40
+stick-page 20 left
+wait-page 5
+mark-page l30
+end

@@ -38,6 +38,16 @@
       }
     },
     {
+      "name": "native-tier-lab",
+      "displayName": "Isolated native-tier whole-page A/B (static host core)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-preset-native-tier",
+      "cacheVariables": {
+        "TILEFINCH_NATIVE_TIER_STATIC_CORE": "ON",
+        "PSP_BROWSER_BUILD_TESTS": "OFF"
+      }
+    },
+    {
       "name": "psp",
       "displayName": "PSP cross-compile with live networking (export PSPDEV first)",
       "inherits": "tilefinch-base",

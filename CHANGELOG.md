@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.28 — 2026-10-01
+
+- Faster loading and responses on JavaScript-heavy sites.
+- More responsive dynamic styling, page updates, and images.
+- Improved navigation reliability and memory handling.
+- Refreshed security data and fixed a JavaScript engine error-path leak.
+
 ## 0.1.27 — 2026-09-23
 
 - Made long pages usable sooner, with more responsive focus, scrolling, and menus while loading continues.

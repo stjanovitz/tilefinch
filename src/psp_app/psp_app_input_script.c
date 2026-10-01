@@ -12,6 +12,9 @@
 
 #include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_input_script.h"
+#include "tilefinch/script_loader.h"
+#include "tilefinch/script_split.h"
+#include "tilefinch/work_vector.h"
 
 /*
  * One interactive loop means one script. File-static storage keeps
@@ -68,6 +71,25 @@ static char psp_input_script_pending_capture_mark[
 static bool psp_input_script_pending_capture_valid;
 static TilefinchInstallPaths psp_input_script_install_paths;
 static const char *psp_input_script_argv0;
+/* Optional page probe evaluated at every mark: <script>.mark.js beside the
+   input script, the body of a function whose return value is logged, with
+   globalThis.__tfMark naming the mark. The device-side counterpart of the
+   lab's `js` command, for state a screenshot cannot show. */
+#define PSP_INPUT_SCRIPT_MARK_JS_LIMIT 8192u
+static char psp_input_script_mark_js[PSP_INPUT_SCRIPT_MARK_JS_LIMIT];
+static char psp_input_script_mark_js_program[
+    PSP_INPUT_SCRIPT_MARK_JS_LIMIT + 256u];
+static ScriptResult psp_input_script_mark_js_result;
+/* Optional readiness probe for `until` steps: <script>.until.js, the body of
+   a function; a truthy result ends the step. Tested from the main loop only,
+   about twice a second, so it never runs inside page script. */
+#define PSP_INPUT_SCRIPT_UNTIL_JS_LIMIT 1024u
+#define PSP_INPUT_SCRIPT_UNTIL_INTERVAL_US 500000ull
+static char psp_input_script_until_js[PSP_INPUT_SCRIPT_UNTIL_JS_LIMIT];
+static char psp_input_script_until_js_program[
+    PSP_INPUT_SCRIPT_UNTIL_JS_LIMIT + 128u];
+static unsigned long long psp_input_script_until_last_us;
+static unsigned psp_input_script_until_checks;
 
 /*
  * A cue transition can expose one bad scanout for only 16--33 ms. PSPLink's
@@ -123,6 +145,40 @@ static void psp_input_script_warning(
            "reason=%s\n",
            path == NULL ? "(null)" : path, line_number,
            reason == NULL ? "unknown" : reason);
+}
+
+/* Reads the probe `<script stem><suffix>` beside the input script into
+   `buffer`, leaving it empty when absent or too large. */
+static void psp_input_script_load_probe(
+    const char *name, const char *suffix,
+    const TilefinchInstallPaths *install_paths, const char *argv0,
+    char *buffer, size_t capacity)
+{
+    buffer[0] = '\0';
+    char probe_name[96];
+    const char *dot = strrchr(name, '.');
+    size_t stem = dot == NULL ? strlen(name) : (size_t) (dot - name);
+    size_t suffix_size = strlen(suffix) + 1u;
+    if (stem >= sizeof(probe_name) - suffix_size) return;
+    memcpy(probe_name, name, stem);
+    memcpy(probe_name + stem, suffix, suffix_size);
+    char probe_path[TILEFINCH_INSTALL_PATH_LIMIT];
+    bool resolved = install_paths != NULL
+        ? tilefinch_install_program_path(
+              install_paths, probe_name, probe_path, sizeof(probe_path))
+        : (psp_sibling_path(probe_path, sizeof(probe_path), argv0,
+                            probe_name), true);
+    FILE *probe = resolved ? fopen(probe_path, "rb") : NULL;
+    if (probe == NULL) return;
+    size_t read = fread(buffer, 1, capacity - 1u, probe);
+    buffer[read] = '\0';
+    /* A truncated probe fails as a confusing SyntaxError at every use;
+       refuse it by name instead. */
+    bool truncated = read == capacity - 1u && fgetc(probe) != EOF;
+    fclose(probe);
+    if (truncated) buffer[0] = '\0';
+    printf("tilefinch-input-script: probe=%s bytes=%zu%s\n",
+           probe_name, read, truncated ? " refused=too-large" : "");
 }
 
 bool psp_input_script_begin(
@@ -185,6 +241,13 @@ bool psp_input_script_begin(
            "stall-limit=%u\n",
            name, (unsigned) psp_input_script.step_count,
            (unsigned) psp_input_script.stall_limit);
+    psp_input_script_load_probe(name, ".mark.js", install_paths, argv0,
+                                psp_input_script_mark_js,
+                                sizeof(psp_input_script_mark_js));
+    psp_input_script_load_probe(name, ".until.js", install_paths, argv0,
+                                psp_input_script_until_js,
+                                sizeof(psp_input_script_until_js));
+    psp_input_script_until_checks = 0;
     return true;
 }
 
@@ -211,6 +274,27 @@ bool psp_input_script_running(void)
 {
     return psp_input_script_armed(&psp_input_script)
         && !psp_input_script.finished;
+}
+
+/* The current step for the frame loop's tilefinch-loop-work record: its
+   index and kind. Fixed-length steps pace the frames by count whatever the
+   page does; an `until` step waits on the page. */
+unsigned psp_input_script_step_now(const char **kind)
+{
+    static const char *const names[] = {
+        "wait", "hold", "press", "mark", "stick", "end", "until"
+    };
+    const PspInputScript *script = &psp_input_script;
+    unsigned index = script->step;
+    if (kind != NULL) {
+        *kind = "done";
+        if (index < script->step_count) {
+            unsigned code = script->steps[index].kind;
+            *kind = code < sizeof(names) / sizeof(names[0])
+                ? names[code] : "other";
+        }
+    }
+    return index;
 }
 
 bool psp_input_script_report_pending(void)
@@ -283,7 +367,10 @@ bool psp_input_script_text_frame(PspUiInput *input)
         psp_input_script_interrupt_by_user();
         return false;
     }
-    if (psp_input_script_frame(input, true, true)) return true;
+    psp_input_script.text_entry_open = true;
+    bool driving = psp_input_script_frame(input, true, true);
+    psp_input_script.text_entry_open = false;
+    if (driving) return true;
     if (!psp_input_script_cancel_exhausted_modal(&psp_input_script, input))
         return false;
     printf("tilefinch-input-script: event=keyboard-input-exhausted step=%u\n",
@@ -311,6 +398,10 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
                    mark, ui->chrome_visible ? 1u : 0u,
                    ui->loading ? 1u : 0u, ui->reader_mode ? 1u : 0u,
                    ui->basic_mode ? 1u : 0u, ui->status);
+        if (ui != NULL)
+            printf("tilefinch-input-cursor: mark=%s x=%d y=%d idle-ms=%u\n",
+                   mark, ui->cursor_x_milli / 1000, ui->cursor_y_milli / 1000,
+                   (unsigned) ui->cursor_idle_ms);
         printf("tilefinch-focus-probe: mark=%s visible=%d rect=%d,%d,%d,%d at-us=%llu\n",
                mark, ui != NULL && ui->has_focus ? 1 : 0,
                ui == NULL ? 0 : ui->focus_x,
@@ -318,6 +409,8 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
                ui == NULL ? 0 : ui->focus_width,
                ui == NULL ? 0 : ui->focus_height,
                (unsigned long long) sceKernelGetSystemTimeWide());
+        /* Every mark, live ones included, splits script time. */
+        script_split_log(mark);
     }
     if (intent == NULL) return;
     PspUiAction action = intent->action;
@@ -340,10 +433,47 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
            (unsigned) intent->tab_index);
 }
 
+static void psp_input_script_test_until(const NavigationSession *navigation)
+{
+    if (!psp_input_script_awaiting_condition(&psp_input_script)
+        || psp_input_script_until_js[0] == '\0'
+        || navigation->page.runtime == NULL) return;
+    unsigned long long now = sceKernelGetSystemTimeWide();
+    if (psp_input_script_until_checks != 0
+        && now - psp_input_script_until_last_us
+               < PSP_INPUT_SCRIPT_UNTIL_INTERVAL_US) return;
+    psp_input_script_until_last_us = now;
+    psp_input_script_until_checks++;
+    int written = snprintf(
+        psp_input_script_until_js_program,
+        sizeof(psp_input_script_until_js_program),
+        "__tilefinchClipboardWrite((function(){%s\n})()?'1':'');",
+        psp_input_script_until_js);
+    memset(&psp_input_script_mark_js_result, 0,
+           sizeof(psp_input_script_mark_js_result));
+    bool ok = written > 0
+        && (size_t) written < sizeof(psp_input_script_until_js_program)
+        && script_runtime_evaluate_probe(
+               navigation->page.runtime, psp_input_script_until_js_program,
+               "<until-js>", &psp_input_script_mark_js_result);
+    unsigned long long finished = sceKernelGetSystemTimeWide();
+    printf("tilefinch-input-probe: step=%u begin-us=%llu end-us=%llu matched=%d success=%d\n",
+           (unsigned) psp_input_script.step, now, finished,
+           psp_input_script_mark_js_result.last_clipboard_text[0] == '1', ok);
+    if (!ok || psp_input_script_mark_js_result.last_clipboard_text[0] != '1')
+        return;
+    printf("tilefinch-input-script: until-met step=%u checks=%u at-us=%llu\n",
+           (unsigned) psp_input_script.step, psp_input_script_until_checks,
+           finished);
+    psp_input_script_until_checks = 0;
+    psp_input_script_satisfy_condition(&psp_input_script);
+}
+
 void psp_input_script_observe_page(
     const PspEngineViews *views)
 {
     const NavigationSession *navigation = views == NULL ? NULL : views->navigation;
+    if (navigation != NULL) psp_input_script_test_until(navigation);
     const char *mark = psp_input_script_mark(&psp_input_script);
     if (mark == NULL || navigation == NULL) return;
     const NavigationPage *page = &navigation->page;
@@ -372,6 +502,17 @@ void psp_input_script_observe_page(
                (int) (id_length < 96 ? id_length : 96), id == NULL ? "" : id,
                (int) (class_length < 128 ? class_length : 128),
                class_name == NULL ? "" : class_name, controller->focus_link_url);
+    }
+    /* Where the nub cursor is, so a live script can be steered onto a
+       target from its own log without a screenshot. */
+    if (controller != NULL) {
+        size_t tag_length = 0;
+        const char *tag = controller->pointer_node == NULL ? NULL
+            : document_element_name(controller->pointer_node, &tag_length);
+        printf("tilefinch-input-pointer: mark=%s x=%d y=%d focus-kind=%d "
+               "node=%.*s\n", mark, controller->pointer_x,
+               controller->pointer_y, (int) controller->focus_kind,
+               (int) (tag == NULL ? 0 : tag_length), tag == NULL ? "" : tag);
     }
     const ExternalImageStats *images = &page->images.stats;
     const char *page_url = navigation_active_document_url(navigation);
@@ -408,6 +549,115 @@ void psp_input_script_observe_page(
            (unsigned long long) page->script_result.execute_us[3],
            (unsigned long long) page->script_result.execute_us[0],
            page->script_result.summary, page->script_result.error);
+    if (page->runtime != NULL) {
+        ScriptHeapGrowth growth;
+        script_runtime_heap_growth(page->runtime, &growth);
+        printf("tilefinch-input-script-heap: mark=%s floor=%zu limit=%zu "
+               "peak-limit=%zu raises=%zu pregrows=%zu refusals=%zu "
+               "returns=%zu source=%zu/%zu source-raises=%zu "
+               "lazy-failures=%zu reentrant-checkpoints=%zu\n",
+               mark, growth.floor, growth.limit, growth.peak_limit,
+               growth.raises, growth.pregrows, growth.refusals,
+               growth.returns,
+               growth.source_committed, growth.source_limit,
+               growth.source_raises, growth.lazy_compile_failures,
+               growth.reentrant_checkpoints);
+    }
+    /* The script time since the previous mark, by function: the page
+       realm, then each child frame's realm (they have their own). */
+    script_runtime_profile_report(page->runtime, mark);
+    for (size_t i = 0; i < page->frame_count; i++) {
+        const NavigationFrame *frame = &page->frames[i];
+        if (!frame->loaded || frame->runtime == NULL) continue;
+        char frame_label[96];
+        snprintf(frame_label, sizeof(frame_label), "%.64s.frame%zu", mark, i);
+        script_runtime_profile_report(frame->runtime, frame_label);
+    }
+    /* Unhandled rejections carry the page's startup failures (chatgpt.com's
+       client swallows none of them into window errors). */
+    printf("tilefinch-input-script-rejections: mark=%s unhandled=%zu "
+           "created=%zu handled=%zu last=\"%.600s\"\n",
+           mark, page->script_result.promise_rejections,
+           page->script_result.promise_rejections_created,
+           page->script_result.promise_rejections_handled,
+           page->script_result.last_promise_rejection);
+    {
+        size_t prefetches = 0, prefetch_hits = 0;
+        script_loader_module_prefetch_totals(&prefetches, &prefetch_hits);
+        printf("tilefinch-input-script-prefetch: mark=%s started=%zu "
+               "consumed=%zu\n", mark, prefetches, prefetch_hits);
+    }
+    if (fetch_trace_active()) {
+        uint64_t opens = 0, reads = 0, bytes = 0, io_us = 0;
+        fetch_trace_replay_io(&opens, &reads, &bytes, &io_us);
+        printf("tilefinch-trace-replay-io: mark=%s opens=%llu reads=%llu "
+               "bytes=%llu us=%llu\n", mark, (unsigned long long) opens,
+               (unsigned long long) reads, (unsigned long long) bytes,
+               (unsigned long long) io_us);
+    }
+    printf("tilefinch-input-script-modules: mark=%s compiled=%zu "
+           "compile-us=%llu restored=%zu restore-us=%llu misses=%zu "
+           "stores=%zu skips=%zu restore-failures=%zu restored-bytes=%zu "
+           "disk-hits=%zu disk-stores=%zu disk-load-us=%llu "
+           "disk-read-us=%llu disk-verify-us=%llu promote-us=%llu "
+           "key-us=%llu parse-us=%llu store-us=%llu source-bytes=%llu "
+           "fetch-us=%llu\n",
+           mark,
+           page->script_result.module_compile_count,
+           page->script_result.module_compile_us,
+           page->script_result.module_bytecode_cache_hits,
+           page->script_result.module_bytecode_restore_us,
+           page->script_result.module_bytecode_cache_misses,
+           page->script_result.module_bytecode_cache_stores,
+           page->script_result.module_bytecode_cache_admission_skips,
+           page->script_result.module_bytecode_cache_restore_failures,
+           page->script_result.module_bytecode_cache_bytes,
+           page->script_result.module_bytecode_disk_hits,
+           page->script_result.module_bytecode_disk_stores,
+           page->script_result.module_bytecode_disk_load_us,
+           page->script_result.module_bytecode_disk_read_us,
+           page->script_result.module_bytecode_disk_verify_us,
+           page->script_result.module_bytecode_promote_us,
+           page->script_result.module_key_us,
+           page->script_result.module_parse_us,
+           page->script_result.module_store_us,
+           page->script_result.module_source_bytes,
+           page->script_result.module_fetch_us);
+    /* Deterministic work counts for the document (LAB_USAGE.md, "Work
+       vector"): the same record the host lab prints. */
+    tilefinch_work_print(mark, navigation);
+    printf("tilefinch-input-script-network: mark=%s requests=%zu "
+           "failures=%zu status=%ld async=%zu/%zu/%zu/%zu/%zu "
+           "form-submit=%d last-url=\"%.160s\"\n",
+           mark, page->script_result.network_requests,
+           page->script_result.network_failures,
+           page->script_result.last_network_status,
+           page->script_result.async_network_queued,
+           page->script_result.async_network_completed,
+           page->script_result.async_network_quota_rejected,
+           page->script_result.async_network_cancelled,
+           page->script_result.async_network_timed_out,
+           page->script_result.form_submission_requested ? 1 : 0,
+           page->script_result.last_network_url);
+    if (psp_input_script_mark_js[0] != '\0' && page->runtime != NULL) {
+        int written = snprintf(
+            psp_input_script_mark_js_program,
+            sizeof(psp_input_script_mark_js_program),
+            "globalThis.__tfMark=%s%.64s%s;"
+            "__tilefinchClipboardWrite(String((function(){%s\n})()));",
+            "\"", mark, "\"", psp_input_script_mark_js);
+        memset(&psp_input_script_mark_js_result, 0,
+               sizeof(psp_input_script_mark_js_result));
+        bool ok = written > 0
+            && (size_t) written < sizeof(psp_input_script_mark_js_program)
+            && script_runtime_evaluate_diagnostic(
+                   page->runtime, psp_input_script_mark_js_program,
+                   "<mark-js>", &psp_input_script_mark_js_result);
+        printf("tilefinch-input-script-mark-js: mark=%s ok=%d "
+               "value=\"%.1500s\" error=\"%.300s\"\n", mark, ok ? 1 : 0,
+               psp_input_script_mark_js_result.last_clipboard_text,
+               psp_input_script_mark_js_result.error);
+    }
     printf("tilefinch-input-script-images: mark=%s cursor=%zu/%zu "
            "job=%d batch=%u attempts=%zu loaded=%zu failed=%zu "
            "bytes=%zu/%zu progress=%zu/%zu/%zu "
@@ -527,6 +777,8 @@ void psp_input_script_capture_named(
     PspInputScriptCapture *capture =
         &psp_input_script_captures[psp_input_script_capture_count++];
     snprintf(capture->mark, sizeof(capture->mark), "%s", mark);
+    printf("tilefinch-input-capture: mark=%s at-us=%llu\n", mark,
+           (unsigned long long) sceKernelGetSystemTimeWide());
     for (size_t y = 0; y < PSP_INPUT_SCRIPT_CAPTURE_HEIGHT; y++) {
         const uint16_t *source = frame + (y * 2u) * stride_pixels;
         uint8_t *destination = capture->pixels

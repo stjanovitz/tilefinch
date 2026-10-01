@@ -1,3 +1,102 @@
+/* Shared DNS-cache lifetime on PSP (curl's default is sixty seconds). */
+#define PSP_FETCH_DNS_CACHE_SECONDS 600L
+
+#if defined(__PSP__)
+/*
+ * The share is used from two threads: the browser thread (page fetches, the
+ * scheduler, preconnects, TLS session import and export) and the transport
+ * worker. Without lock callbacks libcurl updates its DNS cache, connection
+ * pool and TLS session cache unprotected, and the browser thread can preempt
+ * the worker in the middle of an update. One recursive lock covers every
+ * category: the PSP has one core, so finer locks buy no parallelism, and a
+ * single lock cannot deadlock on the order libcurl takes categories in.
+ */
+static SceUID curl_share_semaphore = -1;
+static volatile SceUID curl_share_owner = -1;
+static unsigned curl_share_depth;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Acquisitions, and the ones that found the other thread holding the lock:
+   each of those was a concurrent share update before the lock existed. */
+static volatile unsigned curl_share_lock_count;
+static volatile unsigned curl_share_lock_contended;
+#endif
+
+static void curl_share_lock(CURL *handle, curl_lock_data data,
+                            curl_lock_access access, void *userptr)
+{
+    (void) handle; (void) data; (void) access; (void) userptr;
+    SceUID self = sceKernelGetThreadId();
+    /* Only this thread ever stores its own id here, so reading it without
+       the lock cannot mistake another thread's hold for ours. */
+    if (curl_share_owner == self) {
+        curl_share_depth++;
+        return;
+    }
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    curl_share_lock_count++;
+    if (sceKernelPollSema(curl_share_semaphore, 1) >= 0) {
+        curl_share_owner = self;
+        curl_share_depth = 1;
+        return;
+    }
+    curl_share_lock_contended++;
+#endif
+    if (sceKernelWaitSema(curl_share_semaphore, 1, NULL) < 0) return;
+    curl_share_owner = self;
+    curl_share_depth = 1;
+}
+
+static void curl_share_unlock(CURL *handle, curl_lock_data data,
+                              void *userptr)
+{
+    (void) handle; (void) data; (void) userptr;
+    if (curl_share_depth == 0
+        || curl_share_owner != sceKernelGetThreadId()) return;
+    if (--curl_share_depth == 0) {
+        curl_share_owner = -1;
+        (void) sceKernelSignalSema(curl_share_semaphore, 1);
+    }
+}
+
+static bool curl_share_install_lock(CURLSH *share)
+{
+    curl_share_semaphore = sceKernelCreateSema(
+        "tilefinch_curl_share", 0, 1, 1, NULL);
+    if (curl_share_semaphore < 0) return false;
+    curl_share_owner = -1;
+    curl_share_depth = 0;
+    return curl_share_setopt(share, CURLSHOPT_LOCKFUNC, curl_share_lock)
+               == CURLSHE_OK
+        && curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, curl_share_unlock)
+               == CURLSHE_OK;
+}
+
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+static void fetch_curl_share_lock_counters(unsigned *locks,
+                                           unsigned *contended)
+{
+    if (locks != NULL) *locks = curl_share_lock_count;
+    if (contended != NULL) *contended = curl_share_lock_contended;
+}
+#endif
+
+static void curl_share_remove_lock(void)
+{
+    if (curl_share_semaphore >= 0)
+        (void) sceKernelDeleteSema(curl_share_semaphore);
+    curl_share_semaphore = -1;
+    curl_share_owner = -1;
+    curl_share_depth = 0;
+}
+#else
+static bool curl_share_install_lock(CURLSH *share)
+{
+    (void) share;
+    return true;
+}
+static void curl_share_remove_lock(void) {}
+#endif
+
 static void curl_free_hook(void *pointer)
 {
     budget_concurrent_pool_free(&curl_concurrent_pool, pointer);
@@ -42,6 +141,7 @@ typedef struct {
     TlsSessionStore *store;
     int64_t now;
     uint64_t sequence;
+    size_t added;
 } FetchTlsExportContext;
 
 static CURLcode fetch_tls_session_export_cb(
@@ -54,12 +154,19 @@ static CURLcode fetch_tls_session_export_cb(
     (void) curl; (void) shmac; (void) shmac_len;
     (void) alpn; (void) earlydata_max;
     FetchTlsExportContext *context = userptr;
+    /* Suspend exports a cache that mostly holds what the store already has
+       (imported at start, or exported at the previous suspend). Re-adding
+       it would duplicate entries and rewrite an unchanged file. */
+    if (tls_session_store_contains(
+            context->store, session_key, sdata, sdata_len))
+        return CURLE_OK;
     /* An incrementing sequence gives the store a deterministic recency order
        to break LRU ties within a single export. */
-    (void) tls_session_store_add(
-        context->store, session_key, sdata, sdata_len,
-        (int64_t) valid_until, (int32_t) ietf_tls_id,
-        context->now, ++context->sequence);
+    if (tls_session_store_add(
+            context->store, session_key, sdata, sdata_len,
+            (int64_t) valid_until, (int32_t) ietf_tls_id,
+            context->now, ++context->sequence))
+        context->added++;
     return CURLE_OK;
 }
 
@@ -129,12 +236,13 @@ static void fetch_tls_sessions_import(void)
     }
 }
 
-static void fetch_tls_sessions_export(void)
+static size_t fetch_tls_sessions_export(void)
 {
     if (!fetch_tls_session_persistence_enabled()
-        || fetch_tls_session_store_file[0] == '\0') return;
+        || fetch_tls_session_store_file[0] == '\0') return 0;
     CURL *easy = fetch_tls_share_attached_easy();
-    if (easy == NULL) return;
+    if (easy == NULL) return 0;
+    size_t added = 0;
     TlsSessionStore *store = fetch_tls_session_memory_ensure();
     if (store != NULL) {
         int64_t now = fetch_tls_now_seconds();
@@ -143,15 +251,71 @@ static void fetch_tls_sessions_export(void)
             .sequence = (uint64_t) (now > 0 ? now : 1) << 16
         };
         if (curl_easy_ssls_export(
-                easy, fetch_tls_session_export_cb, &context) == CURLE_OK) {
+                easy, fetch_tls_session_export_cb, &context) == CURLE_OK
+            && context.added != 0) {
             fetch_tls_session_dirty = true;
+            added = context.added;
         }
     }
     curl_easy_cleanup(easy);
+    return added;
+}
+
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Validation census of libcurl's shared session cache: which hosts have a
+   resumable session. Paired with tilefinch-tls-resumption, it separates "no
+   session was ever cached" from "a cached session was not resumed". */
+static CURLcode fetch_tls_census_cb(
+    CURL *curl, void *userptr, const char *session_key,
+    const unsigned char *shmac, size_t shmac_len,
+    const unsigned char *sdata, size_t sdata_len,
+    curl_off_t valid_until, int ietf_tls_id,
+    const char *alpn, size_t earlydata_max)
+{
+    (void) curl; (void) shmac; (void) shmac_len; (void) sdata;
+    (void) earlydata_max;
+    unsigned *count = userptr;
+    (*count)++;
+    psp_log_printf("tilefinch-tls-session: key=%.96s bytes=%u tls=0x%04x "
+                   "alpn=%s valid-until=%lld\n",
+                   session_key == NULL ? "-" : session_key,
+                   (unsigned) sdata_len, (unsigned) ietf_tls_id,
+                   alpn == NULL ? "-" : alpn, (long long) valid_until);
+    return CURLE_OK;
+}
+#endif
+
+void fetch_tls_session_census(void)
+{
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    CURL *easy = fetch_tls_share_attached_easy();
+    if (easy == NULL) {
+        psp_log_printf("tilefinch-tls-session-census: share=absent\n");
+        return;
+    }
+    unsigned count = 0;
+    CURLcode code = curl_easy_ssls_export(easy, fetch_tls_census_cb, &count);
+    psp_log_printf("tilefinch-tls-session-census: sessions=%u code=%d "
+                   "persistence=%d\n", count, (int) code,
+                   fetch_tls_session_persistence_enabled() ? 1 : 0);
+    curl_easy_cleanup(easy);
+#endif
 }
 
 bool fetch_tls_session_store_flush(void)
 {
+    /* A live share holds sessions made since the last export (suspend runs
+       with the transport worker still up). Take them first; the share lock
+       makes this safe while the worker is using the share. */
+    size_t exported = curl_shared_state != NULL
+        ? fetch_tls_sessions_export() : 0;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    psp_log_printf("tilefinch-tls-session: flush live-share=%d exported=%u "
+                   "dirty=%d\n", curl_shared_state != NULL ? 1 : 0,
+                   (unsigned) exported, fetch_tls_session_dirty ? 1 : 0);
+#else
+    (void) exported;
+#endif
     if (!fetch_tls_session_persistence_enabled()
         || !fetch_tls_session_dirty
         || fetch_tls_session_store_file[0] == '\0')
@@ -176,6 +340,7 @@ bool fetch_tls_session_store_clear(void)
 #if !defined(TILEFINCH_PSP_OWNED_TRANSPORT)
 bool fetch_tls_session_store_flush(void) { return true; }
 bool fetch_tls_session_store_clear(void) { return true; }
+void fetch_tls_session_census(void) {}
 #endif
 
 static bool curl_global_acquire(Budget *budget)
@@ -222,6 +387,13 @@ static bool curl_global_acquire(Budget *budget)
            cannot create or configure the share can still perform correct
            transfers through each easy/multi handle's own caches. Never turn
            an unavailable cache into "network request could not start." */
+        /* A share that cannot be locked is not shared safely: go without. */
+        if (curl_shared_state != NULL
+            && !curl_share_install_lock(curl_shared_state)) {
+            (void) curl_share_cleanup(curl_shared_state);
+            curl_shared_state = NULL;
+            curl_share_remove_lock();
+        }
         if (curl_shared_state != NULL) {
             CURLSHcode dns_share = curl_share_setopt(
                 curl_shared_state, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
@@ -239,6 +411,7 @@ static bool curl_global_acquire(Budget *budget)
 #endif
                 (void) curl_share_cleanup(curl_shared_state);
                 curl_shared_state = NULL;
+                curl_share_remove_lock();
             } else {
                 CURLSHcode connection_share = curl_share_setopt(
                     curl_shared_state, CURLSHOPT_SHARE,
@@ -278,6 +451,14 @@ static bool curl_easy_attach_shared_state(CURL *easy)
        resources, media, preconnects, and WebSockets cannot diverge. */
     if (curl_easy_setopt(easy, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4)
         != CURLE_OK) return false;
+    /* The firmware resolver hangs on roughly one lookup in fifteen (see
+       psp_network_dns_guard). libcurl's default sixty-second cache made
+       every video open repeat the same few lookups; a resolved address
+       for these hosts stays valid far longer than one browsing session
+       step, so each hang we avoid is a stall the user never sees. */
+    if (curl_easy_setopt(
+            easy, CURLOPT_DNS_CACHE_TIMEOUT, PSP_FETCH_DNS_CACHE_SECONDS)
+        != CURLE_OK) return false;
 #endif
     return curl_shared_state == NULL
         || curl_easy_setopt(
@@ -292,12 +473,13 @@ static bool curl_global_release(void)
 #if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
         /* Retain the session cache in bounded process memory. Controlled
            suspend/exit owns the only Memory Stick flush. */
-        fetch_tls_sessions_export();
+        (void) fetch_tls_sessions_export();
 #endif
         if (curl_shared_state != NULL) {
             (void) curl_share_cleanup(curl_shared_state);
             curl_shared_state = NULL;
         }
+        curl_share_remove_lock();
         curl_global_cleanup();
         (void) budget_concurrent_pool_metrics(
             &curl_concurrent_pool, &curl_last_pool_metrics);
@@ -563,6 +745,16 @@ static size_t receive_data(char *data, size_t size, size_t count, void *opaque)
     }
     size_t accounted = context->pump_quota_enabled
         ? context->accepted : context->delivered;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (accounted == 0 && received != 0) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-fetch-timeline: stage=first-body-callback writer=%p at-us=%llu",
+                 (void *) context,
+                 (unsigned long long) tilefinch_platform_monotonic_time_us());
+        tilefinch_platform_log_message(message);
+    }
+#endif
     if (accounted > context->maximum_bytes
         || received > context->maximum_bytes - accounted) {
         context->limit_exceeded = true;
@@ -1347,6 +1539,16 @@ static size_t receive_header(char *data, size_t size, size_t count,
                 return 0;
             }
             context->headers_delivered = true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            {
+                char message[160];
+                snprintf(message, sizeof(message),
+                         "tilefinch-fetch-timeline: stage=headers writer=%p at-us=%llu",
+                         (void *) context,
+                         (unsigned long long) tilefinch_platform_monotonic_time_us());
+                tilefinch_platform_log_message(message);
+            }
+#endif
             if (context->metrics != NULL) {
                 context->metrics->headers_delivered = true;
             }

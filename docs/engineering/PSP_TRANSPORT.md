@@ -32,8 +32,8 @@ The same `MBEDTLS_USER_CONFIG_FILE` reaches the TLS library, curl and native
 consumers because role switches can change public structure layouts. Both
 external projects track that header as a configure dependency.
 
-September 4, 2026 ordinary EBOOT measurements (actual `.text`, unchanged
-4,480,000-byte ceiling): original 4,482,252 bytes; client-only TLS 4,446,228;
+Ordinary EBOOT measurements when this footprint landed (actual `.text`,
+unchanged 4,480,000-byte ceiling): original 4,482,252 bytes; client-only TLS 4,446,228;
 unused curl subsystems removed 4,380,568. These are linked measurements, not
 archive-size estimates. Speech extraction is a separate runtime-component
 change, described in the development guide.
@@ -139,7 +139,7 @@ The `net-select` primitive measures the SDK's underlying `sceNetInetSelect`;
 its final diagnostic argument is the requested timeout in microseconds
 (zero is exactly zero, -1 means no timeout), not a socket descriptor.
 
-September 9 physical-PSP measurements reproduced the reported long wall calls:
+Physical-PSP measurements reproduced the reported long wall calls:
 
 | Call | Elapsed | Worker CPU | Relevant evidence |
 | --- | ---: | ---: | --- |
@@ -249,6 +249,116 @@ Everest's verified Curve25519 implementation through
 generic and Everest results against RFC 7748 vectors and requires both paths
 to agree.
 
+### Entropy
+
+Every TLS secret on the PSP — PSA's DRBG seed, curl's CTR_DRBG seed and its
+prediction-resistance reseeds, ECDHE private keys, client randoms — comes from
+mbed TLS's entropy module, so its strong source decides whether a recorded
+session can be decrypted later.
+
+**What was wrong.** The mbed TLS patch originally routed
+`mbedtls_platform_entropy_poll` to libcglue's `getentropy()`, which calls
+`time()`, seeds `sceKernelUtilsMt19937Init` with it and reads MT19937. Its
+output was fully determined by the wall-clock second of the call, so a passive
+observer who knew roughly when a handshake happened could enumerate the seeds.
+
+**What the PSP offers user mode.** Nothing better than timing:
+
+- KIRK's PRNG (command 0xE via `sceUtilsBufferCopyWithRange`) is exported by
+  the kernel `semaphore` library; pspsdk ships only a kernel stub
+  (`libpspsemaphore_660.a`) and a user-mode EBOOT cannot import it. Reaching it
+  through a kernel PRX, kubridge or the savedata `sceChnnlsv` path would tie
+  TLS to custom firmware or undocumented module loading.
+- `sceKernelUtilsMt19937*` is a deterministic PRNG; the OpenPSID, MAC address
+  and battery/analog readings are constant or slow and observable.
+- CP0 Count and the timer registers are kernel-only. The finest clock is the
+  1 MHz system timer, read by syscall.
+
+**The source** (`src/psp_entropy.c`, pure half `src/psp_entropy_pool.c`)
+measures, with that timer, two things a remote observer cannot reconstruct:
+how long 32 read-modify-writes through the *uncached* alias of a 4 KiB buffer
+take (DDR arbitration against the Media Engine, GE and DMA, interrupt entry,
+tick phase), and how long the shortest `sceKernelDelayThread` actually sleeps
+(timer-interrupt latency plus whatever else ran). Batches of 256 work samples
+and 64 sleep samples alternate. Every sample is hashed into a SHA-256 pool;
+credit is assigned per batch:
+
+1. Estimate the per-sample min-entropy as `-log2(p)`, where `p` is the 99%
+   upper confidence bound (z = 2.576, SP 800-90B style) on the hit rate of the
+   best of several predictors: most-common value, repeat at lags 1..8, and a
+   linear-trend guess. Constants, alternations, short cycles and drifting
+   phase between two clocks all score near zero.
+2. Cap that at 1 bit per sample, then divide by 4, rounding down. The samples
+   are not independent and an unanticipated predictor could beat ours; the
+   divisor is the margin for both. A batch therefore earns at most 64 bits
+   (work) or 16 bits (sleep).
+3. Release output only once 256 bits are credited. From then on the pool is a
+   hash generator with a one-way key ratchet after every output, fed the clock
+   on every call; mbed TLS counts its bytes 1:1, as `getrandom()` output is
+   counted after the kernel pool initializes.
+
+Nothing else is credited. The boot context (clock, wall time, free memory,
+thread id, stack address) and the persisted seed file are mixed in only: a
+copied or restored Memory Stick replays them. libcglue's `getentropy()` is not
+used at all.
+
+**Wiring.** `cmake/psp_transport/mbedtls_user_config.h` defines
+`MBEDTLS_NO_PLATFORM_ENTROPY` and `MBEDTLS_ENTROPY_HARDWARE_ALT` (and refuses
+NV seed, an external PSA RNG or disabled default sources), so
+`mbedtls_entropy_init()` registers `mbedtls_hardware_poll`
+(`src/psp_entropy_mbedtls.c`) as the only strong source, for curl's legacy
+context and for PSA's alike. `cmake/PspOwnedTransport.cmake` links the hook and
+the source immediately after `libmbedcrypto.a` on both the transport and the
+crypto interfaces, so the browser, the launcher and the crypto selftest all
+resolve to it. `tests/test_psp_sdk_contracts.py` pins all of this.
+
+**Release policy.** `psp_entropy_configure()` picks one per process:
+
+| Process | Policy | Why |
+|---|---|---|
+| Shipping browser | `REQUIRE_CREDIT` | TLS keys; no output before 256 bits |
+| Validation browser | `PERMIT_UNCREDITED` | runs under PPSSPP, whose instruction-counted clock may earn nothing |
+| Launcher | `PERMIT_UNCREDITED` | `psa_crypto_init()` seeds the RNG, but signature verification never draws from it |
+| Crypto selftest | `PERMIT_UNCREDITED` | known-answer vectors; runs under PPSSPP |
+
+Under `REQUIRE_CREDIT`, one attempt gathers for at most 0.75 s (plus one batch)
+or 128 batches. If it falls short, the poll fails, `psa_crypto_init()` fails and
+curl's global initialization reports failure; the credit already earned is
+kept, so the next request's attempt continues from there. Under
+`PERMIT_UNCREDITED` the pool is released after one attempt either way and the
+report says which.
+
+**Seed file.** `entropy-seed.bin` in the install's data directory: `"TFES"`,
+version 1, 32 seed bytes, then 8 bytes of SHA-256 over the rest (torn-write
+detection only). It is read when the pool first seeds, never at boot, and a
+successor drawn from the pool before any caller output is written back right
+after seeding, so it carries each boot's entropy forward without any boot
+reusing it as output. Missing, wrong-length, damaged or all-zero files are
+ignored.
+
+**DNS query IDs** use `psp_entropy_fill_best_effort()`: the same pool, without
+waiting for credit (the first lookup precedes the first handshake), plus one
+timing sample per call. That is enough for an off-path guess; it is never used
+for keys.
+
+**Cost.** Boot pays nothing. The first seeding runs inside curl's global
+initialization on the browser thread: at least 4 work and 3 sleep batches
+(1,216 samples) when every batch earns the maximum, which should take tens of
+milliseconds, plus one small Memory Stick read and a 48-byte write. After
+release, each mbed TLS entropy poll costs about ten SHA-256 compressions for
+its 128 bytes. Adds about 5 KB of `.text` to the browser and 6 KB to the
+launcher. The actual sample times and estimates are only known from a device
+run:
+
+```text
+tilefinch-entropy: event=seeded mode=credited credited-bits=... target=256 attempts=1 elapsed-us=... seed-file=loaded work-batches=... work-mbits=MIN..MAX work-sample-us=... sleep-batches=... sleep-mbits=MIN..MAX sleep-sample-us=...
+tilefinch-entropy: seed-file=written
+```
+
+`mode=uncredited` on hardware means the jitter estimate fell short within one
+attempt; `event=unseeded` is the shipping build refusing. Either must be
+understood before a release.
+
 ### Connection and session reuse
 
 curl's shared connection and process-local TLS session caches are enabled for
@@ -263,6 +373,24 @@ extends resumption across process launches:
 
 The global **TLS ticket saving** preference disables cross-boot import/export
 and removes the durable generation without disabling live connection reuse.
+
+googlevideo media ranges negotiate TLS 1.2. The media servers send no TLS 1.3
+tickets on `/videoplayback`, so a TLS 1.3 media reconnect is always a full
+handshake (0.5-1.5 s on hardware). A TLS 1.2 ticket arrives inside the
+handshake itself, and a resumed TLS 1.2 handshake does no key exchange and
+verifies no certificate: 70-200 ms on hardware, across launches too. The
+ClientHello hook re-enables the TLS 1.2 tickets libcurl turns off, and every
+googlevideo requester (player ranges and the range probe) asks for TLS 1.2,
+because curl reuses a connection only for requests with the same TLS settings.
+The cost is that a resumed TLS 1.2 connection reuses the ticket's master
+secret instead of a fresh key exchange; certificate and hostname checks on
+the full handshake are unchanged.
+
+The browser thread and the transport worker share one curl share, so it
+carries a single recursive lock for every category (the PSP has one core;
+finer locks buy nothing and one lock cannot deadlock on category order).
+Suspend and exit export the live share into the store before writing it, and
+an unchanged cache neither duplicates entries nor rewrites the file.
 
 The store contains bearer material. It remains on the Memory Stick, is never
 exposed to pages, and is offered only to its recorded site.
@@ -329,6 +457,8 @@ latency claim.
 ## Security invariants
 
 - The system clock must be valid before certificate verification.
+- The shipping build's TLS RNG seeds only from credited timing jitter
+  ([Entropy](#entropy)); nothing time-seeded is ever counted as entropy.
 - CA and hostname verification fail closed.
 - TLS resumption never bypasses ordinary peer verification.
 - A preconnect carries only the pinned User-Agent: no page credentials,

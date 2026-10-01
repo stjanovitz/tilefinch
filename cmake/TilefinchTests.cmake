@@ -18,10 +18,54 @@ if(PSP_BROWSER_BUILD_TESTS)
     find_package(Threads REQUIRED)
     if(NOT PSP)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_test(NAME tilefinch-js-profile-report-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_js_profile_report.py)
+        set_tests_properties(tilefinch-js-profile-report-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-work-vector-report-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_work_vector_report.py)
+        set_tests_properties(tilefinch-work-vector-report-tests PROPERTIES
+            LABELS "tilefinch;unit;performance;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-load-timeline-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_load_timeline.py)
+        set_tests_properties(tilefinch-load-timeline-tests PROPERTIES
+            LABELS "tilefinch;unit;performance;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-native-tier-sample-report-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_tier_sample_report.py)
+        set_tests_properties(tilefinch-native-tier-sample-report-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-native-tier-admission-report-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_tier_admission_report.py)
+        set_tests_properties(tilefinch-native-tier-admission-report-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
+        if(TARGET psp-browser-interactive-lab)
+            add_test(NAME tilefinch-js-profile-accounting-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_js_profile_accounting.py
+                    $<TARGET_FILE:psp-browser-interactive-lab>)
+            set_tests_properties(tilefinch-js-profile-accounting-tests PROPERTIES
+                LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 30)
+            add_test(NAME tilefinch-work-vector-determinism-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_work_vector_determinism.py
+                    $<TARGET_FILE:psp-browser-interactive-lab>)
+            set_tests_properties(tilefinch-work-vector-determinism-tests PROPERTIES
+                LABELS "tilefinch;unit;performance;tooling" TIMEOUT 120)
+        endif()
         add_test(NAME tilefinch-cursor-cadence-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cursor_cadence.py)
         set_tests_properties(tilefinch-cursor-cadence-tests PROPERTIES
+            LABELS "tilefinch;unit;input;performance" TIMEOUT 10)
+        add_test(NAME tilefinch-input-timeline-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_input_timeline.py)
+        set_tests_properties(tilefinch-input-timeline-tests PROPERTIES
             LABELS "tilefinch;unit;input;performance" TIMEOUT 10)
         add_test(NAME tilefinch-bootstrap-generated-check
             COMMAND tilefinch_bootstrap_bytecode_generator --check
@@ -68,9 +112,12 @@ if(PSP_BROWSER_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_psp_sdk_contracts.py
                 ${CMAKE_CURRENT_SOURCE_DIR})
+        # Most cases are source scans, but the QuickJS variant case runs nine
+        # real CMake configures that copy and patch the vendored engine
+        # (~14 s alone, more under a parallel ctest).
         set_tests_properties(tilefinch-psp-sdk-contract-tests PROPERTIES
             LABELS "tilefinch;unit;psp;architecture"
-            TIMEOUT 20)
+            TIMEOUT 60)
         add_test(NAME tilefinch-psp-game-stage-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stage_psp_game.py)
@@ -429,6 +476,19 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;network;streaming"
         TIMEOUT 30)
 
+    if(NOT PSP)
+        tilefinch_add_test_binary(tilefinch-fetch-trace-disabled-tests
+            tests/test_fetch_trace_disabled.c src/fetch.c)
+        target_compile_definitions(tilefinch-fetch-trace-disabled-tests PRIVATE
+            TILEFINCH_NO_FETCH_TRACE=1)
+        target_link_libraries(tilefinch-fetch-trace-disabled-tests PRIVATE
+            tilefinch_core)
+        add_test(NAME tilefinch-fetch-trace-disabled-tests
+            COMMAND tilefinch-fetch-trace-disabled-tests)
+        set_tests_properties(tilefinch-fetch-trace-disabled-tests PROPERTIES
+            LABELS "tilefinch;unit;network;size" TIMEOUT 10)
+    endif()
+
     tilefinch_add_test_binary(tilefinch-style-index-tests tests/test_style_index.c)
     target_link_libraries(tilefinch-style-index-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-style-index-tests COMMAND tilefinch-style-index-tests)
@@ -450,7 +510,8 @@ if(PSP_BROWSER_BUILD_TESTS)
     tilefinch_add_test_binary(tilefinch-browser-engine-tests
         tests/test_browser_engine.c
         tests/test_browser_engine_journeys.c
-        tests/test_browser_engine_interruptions.c)
+        tests/test_browser_engine_interruptions.c
+        tests/test_browser_engine_cleanups.c)
     target_link_libraries(tilefinch-browser-engine-tests PRIVATE tilefinch_core tilefinch_psp_ui)
     target_compile_definitions(tilefinch-browser-engine-tests PRIVATE
         TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -759,10 +820,21 @@ if(PSP_BROWSER_BUILD_TESTS)
     tilefinch_add_test_binary(tilefinch-js-responsiveness-tests
         tests/test_js_responsiveness.c)
     target_link_libraries(tilefinch-js-responsiveness-tests PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-js-responsiveness-tests PRIVATE
+        TILEFINCH_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     add_test(NAME tilefinch-js-responsiveness-tests
         COMMAND tilefinch-js-responsiveness-tests)
     set_tests_properties(tilefinch-js-responsiveness-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;responsiveness"
+        TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-module-bytecode-tests
+        tests/test_module_bytecode.c)
+    target_link_libraries(tilefinch-module-bytecode-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-module-bytecode-tests
+        COMMAND tilefinch-module-bytecode-tests)
+    set_tests_properties(tilefinch-module-bytecode-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;memory"
         TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-canvas-webgl-conformance-tests
@@ -898,6 +970,44 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-quickjs-oom-tests PROPERTIES
             LABELS "tilefinch;unit;javascript;allocator;sanitizer"
             TIMEOUT 30)
+
+        tilefinch_add_test_binary(tilefinch-quickjs-property-creation-tests
+            tests/test_quickjs_property_creation.c)
+        target_link_libraries(tilefinch-quickjs-property-creation-tests
+            PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-quickjs-property-creation-tests
+            COMMAND tilefinch-quickjs-property-creation-tests)
+        set_tests_properties(tilefinch-quickjs-property-creation-tests
+            PROPERTIES
+            LABELS "tilefinch;unit;javascript;memory;sanitizer"
+            TIMEOUT 60)
+
+        tilefinch_add_test_binary(tilefinch-quickjs-native-call-tests
+            tests/test_quickjs_native_calls.c)
+        target_link_libraries(tilefinch-quickjs-native-call-tests
+            PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-quickjs-native-call-tests
+            COMMAND tilefinch-quickjs-native-call-tests)
+        set_tests_properties(tilefinch-quickjs-native-call-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;sanitizer"
+            TIMEOUT 60)
+
+        tilefinch_add_test_binary(tilefinch-quickjs-lazy-function-tests
+            tests/test_quickjs_lazy_functions.c)
+        target_link_libraries(tilefinch-quickjs-lazy-function-tests
+            PRIVATE tilefinch_core)
+        # One iteration per kernel: proves every kernel compiles and runs
+        # on this engine build, so a PSP bench run cannot fail on a kernel
+        # the host never exercised.
+        add_test(NAME tilefinch-js-bench-smoke-tests
+            COMMAND tilefinch-js-bench --scale 0 --repeat 1)
+        set_tests_properties(tilefinch-js-bench-smoke-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript" TIMEOUT 60)
+        add_test(NAME tilefinch-quickjs-lazy-function-tests
+            COMMAND tilefinch-quickjs-lazy-function-tests)
+        set_tests_properties(tilefinch-quickjs-lazy-function-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;memory;sanitizer"
+            TIMEOUT 60)
     endif()
 
     tilefinch_add_test_binary(tilefinch-stylesheet-resource-tests
@@ -996,6 +1106,41 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;state"
         TIMEOUT 60)
 
+    # The work ledger behind tilefinch-loop-work: exclusive nested kinds,
+    # the counted thread only, nothing while disabled.
+    tilefinch_add_test_binary(tilefinch-work-ledger-tests
+        tests/test_work_ledger.c)
+    target_link_libraries(tilefinch-work-ledger-tests
+        PRIVATE tilefinch_core Threads::Threads)
+    add_test(NAME tilefinch-work-ledger-tests
+        COMMAND tilefinch-work-ledger-tests)
+    set_tests_properties(tilefinch-work-ledger-tests PROPERTIES
+        LABELS "tilefinch;unit;state"
+        TIMEOUT 10)
+
+    # The script split behind tilefinch-script-split and the checkpoint
+    # record's split fields: time inside script only, exclusive nested
+    # kinds, poll attribution, the counted thread only.
+    tilefinch_add_test_binary(tilefinch-script-split-tests
+        tests/test_script_split.c)
+    target_link_libraries(tilefinch-script-split-tests
+        PRIVATE tilefinch_core Threads::Threads)
+    add_test(NAME tilefinch-script-split-tests
+        COMMAND tilefinch-script-split-tests)
+    set_tests_properties(tilefinch-script-split-tests PROPERTIES
+        LABELS "tilefinch;unit;state"
+        TIMEOUT 10)
+    if(PSP_BROWSER_USE_BELLARD_QUICKJS)
+        tilefinch_add_test_binary(tilefinch-script-census-tests
+            tests/test_script_census.c)
+        target_link_libraries(tilefinch-script-census-tests
+            PRIVATE tilefinch_core Threads::Threads)
+        add_test(NAME tilefinch-script-census-tests
+            COMMAND tilefinch-script-census-tests)
+        set_tests_properties(tilefinch-script-census-tests PROPERTIES
+            LABELS "tilefinch;unit;state;performance" TIMEOUT 10)
+    endif()
+
     # The background update check's state machine is pure data shared with
     # the PSP frontend; its eligibility and sign-in pause rules live here.
     tilefinch_add_test_binary(tilefinch-psp-update-check-tests
@@ -1031,6 +1176,55 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-psp-input-route-tests)
     set_tests_properties(tilefinch-psp-input-route-tests PROPERTIES
         LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 10)
+
+    # The media session's presentation gate
+    # (psp_media_presentation_gate.h): startup preroll, seek floor and
+    # audio hold.
+    tilefinch_add_test_binary(tilefinch-psp-media-presentation-gate-tests
+        tests/test_psp_media_presentation_gate.c)
+    target_link_libraries(tilefinch-psp-media-presentation-gate-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-media-presentation-gate-tests
+        COMMAND tilefinch-psp-media-presentation-gate-tests)
+    set_tests_properties(tilefinch-psp-media-presentation-gate-tests
+        PROPERTIES LABELS "tilefinch;unit;psp;state" TIMEOUT 10)
+
+    # The media session's scrub and pending-target machines
+    # (psp_media_scrub.h): what the user asked of the timeline across
+    # pipeline rebuilds.
+    tilefinch_add_test_binary(tilefinch-psp-media-scrub-tests
+        tests/test_psp_media_scrub.c)
+    target_link_libraries(tilefinch-psp-media-scrub-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-media-scrub-tests
+        COMMAND tilefinch-psp-media-scrub-tests)
+    set_tests_properties(tilefinch-psp-media-scrub-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state"
+        TIMEOUT 10)
+
+    # The PSP DNS stub's pure half (src/psp_dns_stub.h): query encoding,
+    # reply validation, compression and CNAME bounds, retransmit schedule.
+    tilefinch_add_test_binary(tilefinch-psp-dns-stub-tests
+        tests/test_psp_dns_stub.c)
+    add_test(NAME tilefinch-psp-dns-stub-tests
+        COMMAND tilefinch-psp-dns-stub-tests)
+    set_tests_properties(tilefinch-psp-dns-stub-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;network"
+        TIMEOUT 10)
+
+    # The PSP TLS entropy source's pure half (src/psp_entropy_pool.h):
+    # predictor-based credit, pool framing and ratchet, seed-file format.
+    tilefinch_add_test_binary(tilefinch-psp-entropy-pool-tests
+        tests/test_psp_entropy_pool.c
+        src/psp_entropy_pool.c
+        src/sha256.c)
+    target_include_directories(tilefinch-psp-entropy-pool-tests
+        PRIVATE include)
+    add_test(NAME tilefinch-psp-entropy-pool-tests
+        COMMAND tilefinch-psp-entropy-pool-tests)
+    set_tests_properties(tilefinch-psp-entropy-pool-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;network;security"
         TIMEOUT 10)
 
     # Load-time reach and scroll responsiveness, reported by validation
@@ -1087,6 +1281,19 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     # Python is required above for host test registration.
     if(NOT PSP)
+        if(PSP_BROWSER_USE_BELLARD_QUICKJS)
+            add_test(NAME tilefinch-quickjs-variant-control-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quickjs_variant_control.py)
+            set_tests_properties(tilefinch-quickjs-variant-control-tests PROPERTIES
+                LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
+        endif()
+        add_test(NAME tilefinch-execution-census-report-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_execution_census_report.py)
+        set_tests_properties(tilefinch-execution-census-report-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;performance;tooling"
+            TIMEOUT 10)
         add_test(NAME tilefinch-candidate-acceptance-runner-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_candidate_acceptance_runner.py)

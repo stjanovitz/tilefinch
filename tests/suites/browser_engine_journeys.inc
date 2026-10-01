@@ -526,6 +526,642 @@ int test_script_free_browsing_journey(void)
     return 0;
 }
 
+/* chatgpt.com's composer is a <label> whose click handler focuses the
+   prompt textarea from script. Controller focus stayed on the pressed
+   control, so the PSP frontend's keyboard never opened; it now adopts the
+   script-focused control after an activation. */
+int test_script_focus_adoption(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Composer</title>"
+        "<button autofocus id=open "
+        "onclick=\"document.getElementById('prompt').focus()\">Ask</button>"
+        "<textarea id=prompt></textarea>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://composer.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *open = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html), "open");
+    CHECK(open != NULL && browser_engine_focus_node(engine, open));
+    ControllerAction action = {0};
+    CHECK(browser_engine_activate(engine, &action));
+    ControllerTextInputInfo before = {0};
+    CHECK(!browser_engine_text_input_info(engine, &before)
+        || !before.editable);
+    CHECK(browser_engine_adopt_script_focus(engine));
+    ControllerTextInputInfo after = {0};
+    CHECK(browser_engine_text_input_info(engine, &after)
+        && after.editable && after.multiline);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A transactional navigation keeps the incumbent realm alive until commit.
+   chatgpt.com's home realm (~10 MiB) and its conversation page did not fit
+   the PSP ceiling together, so the new page's modules were refused and the
+   answer never rendered. A large incumbent realm is retired when a
+   navigation begins; a small one keeps its rollback. */
+int test_large_incumbent_realm_retired_for_navigation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 32u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 10u * MIB;
+    config.resources.enabled = false;
+    static const char large[] =
+        "<!doctype html><title>App</title><script>"
+        "var keep=[];for(var i=0;i<2400;i++)keep.push(new Array(256).fill(i));"
+        "</script>";
+    static const char small[] =
+        "<!doctype html><title>Doc</title><script>var x=1;</script>";
+    for (int round = 0; round < 2; round++) {
+        char error[256] = {0};
+        BrowserEngine *engine =
+            browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL);
+        const char *page = round == 0 ? large : small;
+        CHECK(browser_engine_commit_html(engine, "https://app.test/",
+            page, strlen(page), true));
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        CHECK(navigation->page.runtime != NULL);
+        size_t used = script_runtime_heap_used(navigation->page.runtime);
+        CHECK(round == 0 ? used >= 4u * MIB : used < 4u * MIB);
+        CHECK(browser_engine_begin_navigation_url(
+            engine, "https://next.invalid/", 1u * MIB, 1000, true));
+        CHECK(round == 0 ? navigation->page.runtime == NULL
+                         : navigation->page.runtime != NULL);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
+/* The boot-window check is a full collection. chatgpt.com's settled heap
+   never fits back under the base, and the check repeated every 256
+   advances forever: a 1.8 s freeze every few seconds on the PSP. Failed
+   checks now back off. */
+int test_boot_window_check_backs_off(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 4u * MIB;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Heap</title><script>"
+        "var keep=[];for(var i=0;i<1200;i++)keep.push(new Array(256).fill(i));"
+        "</script>";
+    CHECK(setenv("TILEFINCH_JS_BOOT_WINDOW_KB", "2048", 1) == 0);
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://heap.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    for (unsigned tick = 0; tick < 2048u; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 2u, NULL);
+    CHECK(unsetenv("TILEFINCH_JS_BOOT_WINDOW_KB") == 0);
+    size_t checks =
+        script_runtime_boot_window_checks(navigation->page.runtime);
+    if (checks == 0 || checks > 4u)
+        printf("boot-window checks=%zu runtime=%p summary=%s error=%s\n",
+               checks, (void *) navigation->page.runtime,
+               navigation->page.script_result.summary,
+               navigation->page.script_result.error);
+    CHECK(checks != 0 && checks <= 4u);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* ChatGPT's composer focuses its textarea a task after the click, so the
+   frontend watches for script focus while the press's user activation is
+   live. Only a text field is adopted: script focusing a button later must
+   not pull controller focus away from where the user left it. */
+int test_late_script_text_focus_adoption(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Composer</title>"
+        "<button id=open onclick=\"setTimeout(function(){"
+        "document.getElementById('prompt').focus()},0)\">Ask</button>"
+        "<button id=menu onclick=\"setTimeout(function(){"
+        "document.getElementById('other').focus()},0)\">Menu</button>"
+        "<button id=other>Other</button>"
+        "<textarea id=prompt></textarea>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://composer.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *root =
+        lxb_dom_interface_node(navigation->page.document.html);
+    lxb_dom_node_t *menu = test_reader_find_id(root, "menu");
+    CHECK(menu != NULL && browser_engine_focus_node(engine, menu));
+    ControllerAction action = {0};
+    CHECK(browser_engine_activate(engine, &action));
+    for (unsigned tick = 0; tick < 4; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    CHECK(!browser_engine_adopt_script_text_focus(engine));
+    ControllerTextInputInfo info = {0};
+    CHECK(!browser_engine_text_input_info(engine, &info));
+    lxb_dom_node_t *open = test_reader_find_id(root, "open");
+    CHECK(open != NULL && browser_engine_focus_node(engine, open));
+    CHECK(browser_engine_activate(engine, &action));
+    CHECK(!browser_engine_adopt_script_text_focus(engine));
+    for (unsigned tick = 0; tick < 4; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    CHECK(browser_engine_adopt_script_text_focus(engine));
+    CHECK(browser_engine_text_input_info(engine, &info)
+        && info.editable && info.multiline);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* scrollIntoView honours a scroll-margin written as CSS math. chatgpt.com
+   scrolls each new turn into view with scroll-margin-top:max(0px,calc(...
+   env(safe-area-inset-top) ...)) = 26 px; read as 0, the user's bubble
+   scrolled under the sticky header's Log in button. */
+int test_scroll_into_view_resolves_margin_math(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Margin</title><style>body{margin:0}"
+        "#t{height:40px;scroll-margin-top:max(0px,calc(calc(max(1rem, "
+        "env(safe-area-inset-top)) + 3.625rem) + .25rem - 3.25rem))}"
+        "#u{height:40px;scroll-margin-top:clamp(2px,1rem,5px)}"
+        "#s{height:200px;overflow:auto}</style><div id=s>"
+        "<div style='height:600px'></div><div id=t>t</div>"
+        "<div id=u>u</div><div style='height:600px'></div></div>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://margin.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.runtime != NULL);
+    bool margin_ok = script_runtime_evaluate_diagnostic(
+        navigation->page.runtime,
+        "(()=>{const s=document.getElementById('s'),"
+        "rel=e=>Math.round(e.getBoundingClientRect().top"
+        "-s.getBoundingClientRect().top);"
+        "const t=document.getElementById('t');t.scrollIntoView();"
+        "const a=rel(t);"
+        "const u=document.getElementById('u');u.scrollIntoView();"
+        "const b=rel(u);"
+        "if(a!==26||b!==5)throw Error('tops '+a+','+b)})()",
+        "<scroll-margin-math>", &navigation->page.script_result);
+    if (!margin_ok)
+        printf("scroll-margin %s\n", navigation->page.script_result.error);
+    CHECK(margin_ok);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A textarea with rows= is rows lines tall whatever its appearance, and an
+   inline form control answers geometry queries. chatgpt.com's composer
+   (rows=1, appearance:none) collapsed to 0 px empty and 64 px once typed
+   into, overlapping the disclaimer, and its autosizer read a 0 height. */
+int test_textarea_rows_geometry(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Rows</title><style>body{margin:0}"
+        "textarea{line-height:24px;padding:0;border:0;width:100px;margin:0}"
+        "textarea,.r{font:16px sans-serif;line-height:24px}"
+        ".b{display:block}.n{appearance:none}</style>"
+        "<textarea id=block class=b rows=1></textarea>"
+        "<textarea id=plain class='b n' rows=1>typed</textarea>"
+        "<textarea id=three class=b rows=3></textarea>"
+        "<textarea id=native class=b></textarea>"
+        "<div><textarea id=inline rows=1></textarea></div>"
+        "<div id=ref class=r>typed</div>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://rows.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "(()=>{const h=id=>document.getElementById(id)"
+        ".getBoundingClientRect().height,"
+        "got=['block','plain','three','native','inline'].map(h).join();"
+        "if(got!=='24,24,72,64,24')throw Error('heights '+got)})()",
+        "<textarea-rows>", &navigation->page.script_result));
+    /* Control text sits in its line box like ordinary text: 16 px text in
+       a 24 px line starts half the leading below the line's top. It was
+       drawn at the top, above centre (chatgpt.com's composer text sat
+       higher than its send arrow). */
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "globalThis.pocSummary=['plain','ref'].map(id=>Math.round("
+        "document.getElementById(id).getBoundingClientRect().top)).join()",
+        "<text-tops>", &navigation->page.script_result));
+    int plain_top = 0, ref_top = 0;
+    CHECK(sscanf(navigation->page.script_result.summary, "%d,%d",
+                 &plain_top, &ref_top) == 2);
+    int plain_text_y = INT32_MIN, ref_text_y = INT32_MIN;
+    int plain_text_height = 0, ref_text_height = 0;
+    const LayoutDocument *layout = &navigation->page.layout;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_TEXT || command->text_length != 5u
+            || memcmp(command->text, "typed", 5u) != 0) continue;
+        if (command->y < ref_top) {
+            plain_text_y = command->y;
+            plain_text_height = command->height;
+        } else {
+            ref_text_y = command->y;
+            ref_text_height = command->height;
+        }
+    }
+    if (plain_text_y - plain_top != ref_text_y - ref_top
+        || plain_text_height != ref_text_height)
+        printf("textarea text offset=%d/%d div text offset=%d/%d\n",
+               plain_text_y - plain_top, plain_text_height,
+               ref_text_y - ref_top, ref_text_height);
+    CHECK(plain_text_y != INT32_MIN && ref_text_y != INT32_MIN
+          && plain_text_y - plain_top == ref_text_y - ref_top
+          && plain_text_height == ref_text_height);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A definite-height grid shares its free space between fr rows only after
+   content-sized rows take theirs, and never cuts an fr row below its
+   minimum. chatgpt.com's page grid (minmax(4.5rem,1fr) auto 1fr) drew its
+   disclaimer over the composer: the auto row's content was not measured
+   before the fr shares were fixed, the rows after it did not move when it
+   grew, and the fr share overwrote the first row's minimum. */
+int test_grid_fr_rows_share_after_content(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Grid</title><style>body{margin:0}"
+        ".g{display:grid;height:272px;"
+        "grid-template-rows:minmax(72px,1fr) auto 1fr}"
+        ".m{grid-row:2}.d{grid-row:3;align-self:end;height:30px}"
+        "</style>"
+        "<div class=g id=fixed><div class=m style='height:124px'></div>"
+        "<div class=d></div></div>"
+        "<div class=g id=content><div class=m><div style='height:152px'>"
+        "</div></div><div class=d></div></div>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://grid.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "(()=>{const at=id=>{const g=document.getElementById(id),"
+        "o=g.getBoundingClientRect().top;return [...g.children].map(c=>"
+        "Math.round(c.getBoundingClientRect().top-o)).join('/')},"
+        "got=at('fixed')+' '+at('content');"
+        "if(got!=='74/242 72/242')throw Error('rows '+got)})()",
+        "<grid-fr-share>", &navigation->page.script_result));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A definite-height grid stretches its auto rows over the free space, so
+   an item aligned to the centre is centred (chatgpt.com's menu icon sat at
+   the top of its 44 px button). A focus indicator stays inside the boxes
+   that clip its control (its composer textarea overflows a clipping form). */
+int test_grid_auto_row_stretch_and_focus_clip(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Icon</title><style>body{margin:0}"
+        ".b{display:grid;place-items:center;width:44px;height:44px}"
+        ".s{width:24px;height:24px}"
+        ".clip{overflow:clip;width:100px;margin-left:20px}"
+        "input{width:300px;display:block}</style>"
+        "<div class=b id=b><span class=s id=s></span></div>"
+        "<div class=clip><input id=field></div>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://icon.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "(()=>{const b=document.getElementById('b').getBoundingClientRect(),"
+        "s=document.getElementById('s').getBoundingClientRect(),"
+        "got=(s.left-b.left)+','+(s.top-b.top);"
+        "if(got!=='10,10')throw Error('offset '+got)})()",
+        "<grid-auto-stretch>", &navigation->page.script_result));
+    lxb_dom_node_t *field = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html), "field");
+    CHECK(field != NULL && browser_engine_focus_node(engine, field));
+    int x = 0, y = 0, width = 0, height = 0;
+    CHECK(browser_engine_focus_indicator_rect(
+              engine, &x, &y, &width, &height)
+          && x == 20 && width == 100 && height > 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* chatgpt.com's send button is a ::before disc sized only by
+   `inset: 4px` whose rounding is `border-radius: inherit`. The pseudo
+   collapsed to zero height and inherit was ignored, so no button showed. */
+int test_inset_pseudo_disc(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = false;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Send</title><style>body{margin:0}"
+        "b{display:block;position:relative;width:44px;height:44px;"
+        "border-radius:999px}"
+        "b::before{content:'';position:absolute;inset:4px;"
+        "background:#0d0d0d;border-radius:inherit}</style><b></b>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://send.test/",
+        page, sizeof(page) - 1u, true));
+    const LayoutDocument *layout =
+        &browser_engine_navigation(engine)->page.layout;
+    bool disc = false;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_FILL_RECT && command->color == 0x0d0d0d
+            && command->x == 4 && command->y == 4
+            && command->width == 36 && command->height == 36
+            && command->radius != 0) disc = true;
+    }
+    CHECK(disc);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Night mode is the reader's colour-scheme preference: a site's own
+   prefers-color-scheme:dark theme applies (chatgpt.com's white wordmark and
+   menu icon stayed black under the forced-dark pixel transform), both in
+   CSS and in matchMedia. */
+int test_night_mode_prefers_dark(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Scheme</title>"
+        "<meta name=color-scheme content='light dark'><style>"
+        "body{background:#fff}"
+        "@media (prefers-color-scheme:dark){body{background:#000}}"
+        "</style><p>x</p>";
+    static const char probe[] =
+        "(()=>{const got=getComputedStyle(document.body).backgroundColor+"
+        "'|'+matchMedia('(prefers-color-scheme: dark)').matches+"
+        "'|'+matchMedia('(prefers-color-scheme: light)').matches;"
+        "if(got!==globalThis.expected)throw Error('scheme '+got)})()";
+    char error[256] = {0};
+    for (int dark = 0; dark < 2; dark++) {
+        BrowserEngine *engine = browser_engine_create(
+            &config, error, sizeof(error));
+        CHECK(engine != NULL);
+        CHECK(browser_engine_set_forced_dark(engine, dark != 0));
+        CHECK(browser_engine_commit_html(engine, "https://scheme.test/",
+            page, sizeof(page) - 1u, true));
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        CHECK(navigation != NULL && navigation->page.runtime != NULL);
+        CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+            dark ? "globalThis.expected='rgb(0, 0, 0)|true|false'"
+                 : "globalThis.expected='rgb(255, 255, 255)|false|true'",
+            "<scheme-expected>", &navigation->page.script_result));
+        CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+            probe, "<scheme>", &navigation->page.script_result));
+        browser_engine_destroy(engine);
+    }
+    stylesheet_set_prefers_dark_color_scheme(false);
+    return 0;
+}
+
+/* A custom property's var() references resolve where it is declared:
+   chatgpt.com's :root colours were rebuilt under every element that
+   re-declared a lightningcss light/dark toggle. And with deferral on, a
+   form that script submits after async work (chatgpt.com posts the prompt
+   once verification finishes) is handed to the frontend as an action. */
+int test_declared_var_and_script_form_submission(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Form</title><style>"
+        ":root{--m:blue;--a:var(--m)}.c{--m:red;color:var(--a)}</style>"
+        "<p class=c id=c>x</p>"
+        "<form id=f method=post action='/conversation'>"
+        "<input name=prompt value=hi>"
+        "<input type=hidden name=token value=''></form><script>"
+        "setTimeout(function(){var f=document.getElementById('f');"
+        "f.querySelector('[name=token]').remove();"
+        "var t=document.createElement('input');t.type='hidden';"
+        "t.name='token';t.value='tok123';f.append(t);"
+        "var l=document.createElement('input');l.type='hidden';"
+        "l.name='long';l.value='L'.repeat(6000)+'end';f.append(l);"
+        "f.addEventListener('formdata',function(e){"
+        "if(f.method.toLowerCase()!=='post'||"
+        "f.enctype!=='application/x-www-form-urlencoded')return;"
+        "e.formData.set('observer','obs456')},{once:true});"
+        "f.requestSubmit()},0)"
+        "</script>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
+    CHECK(browser_engine_commit_html(engine, "https://form.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "(()=>{const c=getComputedStyle(document.getElementById('c')).color;"
+        "if(c!=='rgb(0, 0, 255)')throw Error('var '+c)})()",
+        "<declared-var>", &navigation->page.script_result));
+    for (unsigned tick = 0; tick < 4; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    ControllerAction action = {0};
+    CHECK(browser_engine_take_script_form_submission(engine, &action)
+        && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strcasecmp(action.method, "POST") == 0
+        && strcmp(action.url, "https://form.test/conversation") == 0
+        && action.body_length != 0);
+    /* ChatGPT's sentinel tokens are several KiB each: the body page script
+       built must be sent whole, not re-serialized into the inline buffer. */
+    const char *body = controller_action_body(&action);
+    size_t body_length = controller_action_body_length(&action);
+    if (strstr(body, "token=tok123") == NULL
+        || strstr(body, "observer=obs456") == NULL
+        || strstr(body, "LLLLend") == NULL)
+        printf("form body length=%zu %.*s\n", body_length, 200, body);
+    CHECK(strstr(body, "token=tok123") != NULL
+        && strstr(body, "observer=obs456") != NULL
+        && strstr(body, "LLLLend") != NULL && body_length > 6000u
+        && strlen(body) == body_length);
+    CHECK(!browser_engine_take_script_form_submission(engine, &action));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A module's static dependencies are requested in parallel once it
+   arrives, and the synchronous graph load consumes those requests instead of
+   issuing its own one at a time (chatgpt.com's serialized imports froze the
+   PSP for 35-53 s). The fixture's dynamic import of late.js pulls a.js and
+   b.js; both must come from prefetches. */
+int test_module_dependency_prefetch(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-module-prefetch",
+        error, sizeof(error)));
+    size_t started_before = 0, consumed_before = 0;
+    script_loader_module_prefetch_totals(&started_before, &consumed_before);
+    CHECK(browser_engine_begin_navigation_url(
+              engine, "http://127.0.0.1:8781/index.html", 65536, 1000, true)
+          && journey_finish_navigation(engine) == 0);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    for (unsigned tick = 0; tick < 64
+         && strcmp(navigation->page.script_result.summary, "late=3") != 0;
+         tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    size_t started = 0, consumed = 0;
+    script_loader_module_prefetch_totals(&started, &consumed);
+    if (strcmp(navigation->page.script_result.summary, "late=3") != 0
+        || started - started_before != 2u
+        || consumed - consumed_before != 2u)
+        fprintf(stderr, "module prefetch summary=%s started=%zu "
+                "consumed=%zu\n", navigation->page.script_result.summary,
+                started - started_before, consumed - consumed_before);
+    CHECK(strcmp(navigation->page.script_result.summary, "late=3") == 0
+          && started - started_before == 2u
+          && consumed - consumed_before == 2u);
+    fetch_trace_end();
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* The PSP defers page-script navigations so they run as cooperative jobs.
+   With deferral on, advancing the runtime must leave the page in place and
+   hand the request to the frontend instead of loading it synchronously. */
+int test_deferred_script_navigation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    static const char page[] =
+        "<!doctype html><title>Recovering</title><p>startup</p><script>"
+        "setTimeout(function(){location.replace('/again')},0)</script>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
+    CHECK(browser_engine_commit_html(engine, "https://recover.test/start",
+        page, sizeof(page) - 1u, true));
+    char url[NAVIGATION_URL_LIMIT] = {0};
+    bool record_history = true;
+    CHECK(!browser_engine_take_script_navigation(
+        engine, url, sizeof(url), &record_history));
+    for (unsigned tick = 0; tick < 4; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    const NavigationEntry *entry = navigation_current(navigation);
+    CHECK(entry != NULL
+        && strcmp(entry->url, "https://recover.test/start") == 0
+        && navigation->page.loaded);
+    CHECK(browser_engine_take_script_navigation(
+        engine, url, sizeof(url), &record_history)
+        && strcmp(url, "https://recover.test/again") == 0
+        && !record_history
+        && strcmp(navigation->pending_navigation_referer,
+                  "https://recover.test/start") == 0);
+    CHECK(!browser_engine_take_script_navigation(
+        engine, url, sizeof(url), &record_history));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 int test_loading_interaction_journey(void)
 {
     BrowserDeviceProfile profile;

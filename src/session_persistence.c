@@ -1245,8 +1245,11 @@ BrowserSessionPersistenceStatus browser_session_persistence_clear(
         || (mask & ~BROWSER_SESSION_PERSIST_ALL) != 0) {
         return BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
     }
-    if ((mask & BROWSER_SESSION_PERSIST_CACHE) != 0)
+    if ((mask & BROWSER_SESSION_PERSIST_CACHE) != 0) {
         browser_session_cache_clear(session);
+        if (!browser_session_module_bytecode_disk_clear(session))
+            return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
+    }
     if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0
         && !browser_session_storage_clear_all(session, true))
         return BROWSER_SESSION_PERSISTENCE_IO_ERROR;

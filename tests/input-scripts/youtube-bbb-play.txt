@@ -1,0 +1,20 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# Big Buck Bunny playback on hardware: the youtube-bbb journey's video, which
+# PPSSPP cannot decode (it stops at the firmware decoder boundary). Run it
+# through the PSPLink loop with boot.cfg carrying
+#   url=https://m.youtube.com/watch?v=aqz-KE-bpKQ
+#   input_script=youtube-bbb-play.txt
+# and read tilefinch-media-first-frame (open to first frame),
+# tilefinch-media-job (decoded, dropped), and tilefinch-media-clock (A/V skew
+# at teardown). The network decides the numbers, so nothing is gated on them.
+# There is deliberately no screenshot step: that writes to the Memory Stick.
+wait 1
+mark-live watch
+tap-live cross
+wait-live 2400
+mark-live played
+tap-live circle
+wait-live 180
+mark closed
+end

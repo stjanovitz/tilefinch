@@ -7,6 +7,427 @@ static bool trace_replay_diagnostics_enabled(void)
 #endif
 }
 
+/* Route-selection decisions (unmatched, exhausted, invalid, rekeyed).  A
+   PSP validation EBOOT has no stderr in its log, so these go to the engine
+   log there; the host keeps stderr. */
+static void trace_replay_decision(const char *format, ...)
+{
+    if (!trace_replay_diagnostics_enabled()) return;
+    char line[512];
+    va_list arguments;
+    va_start(arguments, format);
+    (void) vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+#if defined(__PSP__)
+    tilefinch_platform_log_message(line);
+#else
+    fprintf(stderr, "%s\n", line);
+#endif
+}
+
+/* Lab and validation builds only: a page can mint a fresh random identifier
+   into a request URL on every run (chatgpt.com's conversation stream carries
+   operationId=<uuid>), so the recorded URL can never recur.  When opted in,
+   a query value shaped as a textual UUID (8-4-4-4-12 hexadecimal digits)
+   matches any other UUID-shaped value of the same parameter; the scheme,
+   host, path, parameter names and order, every other value, and the
+   fragment still compare exactly.  Validation EBOOTs set the variable from
+   boot.cfg's trace_volatile_uuids. */
+#ifndef TILEFINCH_NO_FETCH_TRACE
+static bool trace_replay_volatile_uuids(void)
+{
+#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+    return false;
+#else
+    return getenv("TILEFINCH_REPLAY_VOLATILE_UUIDS") != NULL;
+#endif
+}
+
+/* See FetchTrace.replay_pump_us. Validation EBOOTs set the variable from
+   boot.cfg's trace_replay_pump_us. */
+static uint32_t trace_replay_pump_us(void)
+{
+#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+    return 0;
+#else
+    const char *value = getenv("TILEFINCH_REPLAY_PUMP_US");
+    long parsed = value == NULL ? 0 : strtol(value, NULL, 10);
+    return parsed > 0 && parsed <= 1000000 ? (uint32_t) parsed : 0u;
+#endif
+}
+#endif
+
+static bool trace_query_value_is_uuid(const char *value, size_t length)
+{
+    if (length != 36) return false;
+    for (size_t index = 0; index < length; index++) {
+        bool dash = index == 8 || index == 13 || index == 18 || index == 23;
+        if (dash ? value[index] != '-'
+                 : !isxdigit((unsigned char) value[index])) return false;
+    }
+    return true;
+}
+
+/* One query component: [start, stop) up to '&' or the end of the query. */
+static const char *trace_query_component_stop(const char *start,
+                                              const char *end)
+{
+    const char *stop = memchr(start, '&', (size_t) (end - start));
+    return stop == NULL ? end : stop;
+}
+
+/* Length of the component's name prefix including '=', or 0 when its value
+   is not UUID-shaped (the component then compares byte for byte). */
+static size_t trace_query_uuid_name_length(const char *start,
+                                           const char *stop)
+{
+    const char *equals = memchr(start, '=', (size_t) (stop - start));
+    if (equals == NULL
+        || !trace_query_value_is_uuid(
+               equals + 1, (size_t) (stop - equals - 1))) return 0;
+    return (size_t) (equals + 1 - start);
+}
+
+static bool trace_replay_url_equal(const char *recorded,
+                                   const char *requested)
+{
+    if (strcmp(recorded, requested) == 0) return true;
+    if (!fetch_trace.replay_volatile_uuids) return false;
+    const char *recorded_query = strchr(recorded, '?');
+    const char *requested_query = strchr(requested, '?');
+    if (recorded_query == NULL || requested_query == NULL
+        || recorded_query - recorded != requested_query - requested
+        || memcmp(recorded, requested,
+                  (size_t) (recorded_query - recorded)) != 0) return false;
+    const char *recorded_end = recorded_query
+        + strcspn(recorded_query, "#");
+    const char *requested_end = requested_query
+        + strcspn(requested_query, "#");
+    if (strcmp(recorded_end, requested_end) != 0) return false;
+    const char *a = recorded_query + 1, *b = requested_query + 1;
+    for (;;) {
+        const char *a_stop = trace_query_component_stop(a, recorded_end);
+        const char *b_stop = trace_query_component_stop(b, requested_end);
+        size_t a_name = trace_query_uuid_name_length(a, a_stop);
+        size_t b_name = trace_query_uuid_name_length(b, b_stop);
+        bool same = a_name != 0 && a_name == b_name
+            ? memcmp(a, b, a_name) == 0
+            : a_stop - a == b_stop - b
+              && memcmp(a, b, (size_t) (a_stop - a)) == 0;
+        if (!same) return false;
+        if (a_stop == recorded_end || b_stop == requested_end) {
+            return a_stop == recorded_end && b_stop == requested_end;
+        }
+        a = a_stop + 1;
+        b = b_stop + 1;
+    }
+}
+
+static uint64_t trace_hash_bytes(uint64_t hash, const char *bytes,
+                                 size_t length)
+{
+    for (size_t index = 0; index < length; index++) {
+        hash ^= (unsigned char) bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+/* Hashes the URL as trace_replay_url_equal() compares it: with the opt-in,
+   each UUID-shaped query value hashes as one fixed marker byte (a C0
+   control, which a serialized URL never contains). */
+static uint64_t trace_hash_replay_url(uint64_t hash, const char *url)
+{
+    const char *query = fetch_trace.replay_volatile_uuids
+        ? strchr(url, '?') : NULL;
+    if (query == NULL) return trace_hash_bytes(hash, url, strlen(url));
+    const char *end = query + strcspn(query, "#");
+    hash = trace_hash_bytes(hash, url, (size_t) (query + 1 - url));
+    for (const char *component = query + 1;;) {
+        const char *stop = trace_query_component_stop(component, end);
+        size_t name = trace_query_uuid_name_length(component, stop);
+        hash = name != 0
+            ? trace_hash_bytes(trace_hash_bytes(hash, component, name),
+                               "\x01", 1)
+            : trace_hash_bytes(hash, component,
+                               (size_t) (stop - component));
+        if (stop == end) break;
+        hash = trace_hash_bytes(hash, "&", 1);
+        component = stop + 1;
+    }
+    return trace_hash_bytes(hash, end, strlen(end));
+}
+
+/* The other half of the volatile-UUID opt-in: a server echoes the
+   identifiers its client minted (an operation id in the URL, pending
+   message ids in the form body) into the response, and the page discards
+   a response whose identifiers are not its own.  Pair the UUIDs of the
+   recorded request with the live request's -- same field, same text since
+   the previous '&', '?' or UUID, same ordinal -- and rewrite each recorded
+   UUID in the served header snapshot and body to its live partner.  UUIDs
+   have one length, so offsets, lengths and the recorded-body hash check
+   (computed over the retained bytes before rewriting) are unchanged.
+   Any unpaired, conflicting or over-limit case serves the record as
+   retained. */
+#define TRACE_REKEY_UUID_LENGTH 36u
+#define TRACE_REKEY_PAIR_LIMIT 16u
+#define TRACE_REKEY_OCCURRENCE_LIMIT 512u
+#define TRACE_REKEY_CONTEXT_LIMIT 96u
+
+struct TraceReplayRekey {
+    size_t pair_count;
+    char from[TRACE_REKEY_PAIR_LIMIT][TRACE_REKEY_UUID_LENGTH];
+    char to[TRACE_REKEY_PAIR_LIMIT][TRACE_REKEY_UUID_LENGTH];
+    bool conflict;
+    size_t occurrence_count;
+    size_t occurrence_offset[TRACE_REKEY_OCCURRENCE_LIMIT];
+    unsigned char occurrence_pair[TRACE_REKEY_OCCURRENCE_LIMIT];
+};
+
+/* A UUID at text[index] not embedded in a longer hexadecimal run. */
+static bool trace_rekey_uuid_at(const char *text, size_t length,
+                                size_t index)
+{
+    return length - index >= TRACE_REKEY_UUID_LENGTH
+        && trace_query_value_is_uuid(text + index, TRACE_REKEY_UUID_LENGTH)
+        && (index == 0 || !isxdigit((unsigned char) text[index - 1]))
+        && (length - index == TRACE_REKEY_UUID_LENGTH
+            || !isxdigit((unsigned char)
+                             text[index + TRACE_REKEY_UUID_LENGTH]));
+}
+
+/* Finds the next UUID at or after *cursor and the text leading to it since
+   the previous field separator or UUID. */
+static bool trace_rekey_next(const char *text, size_t length,
+                             size_t *cursor, size_t *uuid,
+                             size_t *context)
+{
+    size_t start = *cursor;
+    for (size_t index = *cursor; index < length; index++) {
+        if (text[index] == '&' || text[index] == '?') {
+            start = index + 1;
+            continue;
+        }
+        if (!trace_rekey_uuid_at(text, length, index)) continue;
+        *uuid = index;
+        *context = start;
+        *cursor = index + TRACE_REKEY_UUID_LENGTH;
+        return true;
+    }
+    return false;
+}
+
+static void trace_rekey_add(TraceReplayRekey *rekey, const char *from,
+                            const char *to)
+{
+    if (memcmp(from, to, TRACE_REKEY_UUID_LENGTH) == 0) return;
+    for (size_t pair = 0; pair < rekey->pair_count; pair++) {
+        bool same_from = memcmp(rekey->from[pair], from,
+                                TRACE_REKEY_UUID_LENGTH) == 0;
+        bool same_to = memcmp(rekey->to[pair], to,
+                              TRACE_REKEY_UUID_LENGTH) == 0;
+        if (same_from && same_to) return;
+        if (same_from || same_to) {
+            rekey->conflict = true;
+            return;
+        }
+    }
+    if (rekey->pair_count == TRACE_REKEY_PAIR_LIMIT) {
+        rekey->conflict = true;
+        return;
+    }
+    memcpy(rekey->from[rekey->pair_count], from, TRACE_REKEY_UUID_LENGTH);
+    memcpy(rekey->to[rekey->pair_count], to, TRACE_REKEY_UUID_LENGTH);
+    rekey->pair_count++;
+}
+
+/* Pairs the n-th recorded UUID behind a given context with the n-th live
+   UUID behind the same context. */
+static void trace_rekey_pair_text(TraceReplayRekey *rekey,
+                                  const char *recorded,
+                                  size_t recorded_length,
+                                  const char *live, size_t live_length)
+{
+    size_t recorded_cursor = 0, recorded_uuid = 0, recorded_context = 0;
+    while (!rekey->conflict
+           && trace_rekey_next(recorded, recorded_length, &recorded_cursor,
+                               &recorded_uuid, &recorded_context)) {
+        size_t context_length = recorded_uuid - recorded_context;
+        if (context_length > TRACE_REKEY_CONTEXT_LIMIT) continue;
+        size_t ordinal = 0, cursor = 0, uuid = 0, context = 0;
+        for (size_t scan = 0; trace_rekey_next(
+                 recorded, recorded_length, &scan, &uuid, &context)
+             && uuid < recorded_uuid;) {
+            if (uuid - context == context_length
+                && memcmp(recorded + context, recorded + recorded_context,
+                          context_length) == 0) ordinal++;
+        }
+        while (trace_rekey_next(live, live_length, &cursor, &uuid,
+                                &context)) {
+            if (uuid - context != context_length
+                || memcmp(live + context, recorded + recorded_context,
+                          context_length) != 0) continue;
+            if (ordinal-- != 0) continue;
+            trace_rekey_add(rekey, recorded + recorded_uuid, live + uuid);
+            break;
+        }
+    }
+}
+
+static void trace_replay_rekey_rewrite(const TraceReplayRekey *rekey,
+                                       char *text, size_t length)
+{
+    for (size_t index = 0; rekey != NULL && index < length; index++) {
+        if (!trace_rekey_uuid_at(text, length, index)) continue;
+        for (size_t pair = 0; pair < rekey->pair_count; pair++) {
+            if (memcmp(text + index, rekey->from[pair],
+                       TRACE_REKEY_UUID_LENGTH) != 0) continue;
+            memcpy(text + index, rekey->to[pair], TRACE_REKEY_UUID_LENGTH);
+            break;
+        }
+    }
+}
+
+/* Rewrites the part of the retained body at [offset, offset + length)
+   held in bytes; an occurrence may straddle chunk boundaries. */
+static void trace_replay_rekey_apply(const TraceReplayRekey *rekey,
+                                     size_t offset, unsigned char *bytes,
+                                     size_t length)
+{
+    if (rekey == NULL) return;
+    for (size_t index = 0; index < rekey->occurrence_count; index++) {
+        size_t start = rekey->occurrence_offset[index];
+        if (start >= offset + length) break;
+        if (start + TRACE_REKEY_UUID_LENGTH <= offset) continue;
+        const char *to = rekey->to[rekey->occurrence_pair[index]];
+        size_t first = start > offset ? start : offset;
+        size_t last = start + TRACE_REKEY_UUID_LENGTH < offset + length
+            ? start + TRACE_REKEY_UUID_LENGTH : offset + length;
+        for (size_t at = first; at < last; at++) {
+            bytes[at - offset] = (unsigned char) to[at - start];
+        }
+    }
+}
+
+static void trace_replay_rekey_release(Budget *budget,
+                                       TraceReplayRekey **rekey)
+{
+    if (rekey == NULL || *rekey == NULL) return;
+    budget_free(budget, *rekey);
+    *rekey = NULL;
+}
+
+/* Indexes the retained body's occurrences of paired UUIDs.  Leaves the
+   file at offset zero, as trace_open_body_hash() does. */
+static bool trace_replay_rekey_index_body(TraceReplayRekey *rekey,
+                                          FILE *body, size_t length)
+{
+    enum { BLOCK = 4096 };
+    char window[BLOCK + TRACE_REKEY_UUID_LENGTH + 1];
+    size_t carried = 0, base = 0, first = 0, remaining = length;
+    bool ok = true;
+    while (ok && remaining != 0) {
+        size_t wanted = remaining < BLOCK ? remaining : BLOCK;
+        if (fread(window + carried, 1, wanted, body) != wanted) {
+            ok = false;
+            break;
+        }
+        remaining -= wanted;
+        size_t filled = carried + wanted;
+        /* Decide only positions whose UUID and trailing boundary byte are
+           in the window, or which end the body. */
+        size_t decided = remaining == 0 ? filled
+                                        : filled - TRACE_REKEY_UUID_LENGTH;
+        for (size_t index = first; ok && index < decided; index++) {
+            if (!trace_rekey_uuid_at(window, filled, index)) continue;
+            for (size_t pair = 0; pair < rekey->pair_count; pair++) {
+                if (memcmp(window + index, rekey->from[pair],
+                           TRACE_REKEY_UUID_LENGTH) != 0) continue;
+                if (rekey->occurrence_count
+                        == TRACE_REKEY_OCCURRENCE_LIMIT) {
+                    ok = false;
+                    break;
+                }
+                rekey->occurrence_offset[rekey->occurrence_count] =
+                    base + index;
+                rekey->occurrence_pair[rekey->occurrence_count] =
+                    (unsigned char) pair;
+                rekey->occurrence_count++;
+                break;
+            }
+        }
+        /* Carry the undecided tail behind one decided byte, which is the
+           leading boundary of the next window's first position. */
+        size_t keep_from = decided - 1;
+        carried = filled - keep_from;
+        memmove(window, window + keep_from, carried);
+        base += keep_from;
+        first = 1;
+    }
+    clearerr(body);
+    if (fseek(body, 0, SEEK_SET) != 0) ok = false;
+    return ok;
+}
+
+static TraceReplayRekey *trace_replay_rekey_build(
+    Budget *budget, size_t sequence, TraceReplayScratch *scratch,
+    const char *live_url, const FetchRequest *request,
+    size_t recorded_request_length, uint64_t recorded_request_hash,
+    bool has_request_hash, FetchResult *result, FILE *body,
+    size_t body_length)
+{
+    if (!fetch_trace.replay_volatile_uuids) return NULL;
+    TraceReplayRekey *rekey = budget_calloc(budget, 1, sizeof(*rekey));
+    if (rekey == NULL) return NULL;
+    const char *recorded_query = strchr(scratch->recorded_url, '?');
+    const char *live_query = strchr(live_url, '?');
+    if (recorded_query != NULL && live_query != NULL) {
+        trace_rekey_pair_text(rekey, recorded_query, strlen(recorded_query),
+                              live_query, strlen(live_query));
+    }
+    /* Capture keeps request bodies up to 16 KiB beside the record; use one
+       only when it is exactly the body the record's hash names. */
+    char *recorded_body = NULL;
+    if (!rekey->conflict && request != NULL && request->body != NULL
+        && request->body_length != 0 && has_request_hash
+        && recorded_request_length != 0
+        && recorded_request_length <= TRACE_CAPTURE_REQUEST_BODY_LIMIT
+        && trace_path(scratch->meta_path, sizeof(scratch->meta_path),
+                      sequence, "request")
+        && (recorded_body = budget_malloc(
+                budget, recorded_request_length)) != NULL) {
+        FILE *file = fopen(scratch->meta_path, "rb");
+        bool read = file != NULL
+            && fread(recorded_body, 1, recorded_request_length, file)
+                   == recorded_request_length
+            && fgetc(file) == EOF && !ferror(file);
+        if (file != NULL) (void) fclose(file);
+        if (read && trace_body_hash(recorded_body, recorded_request_length)
+                        == recorded_request_hash) {
+            trace_rekey_pair_text(rekey, recorded_body,
+                                  recorded_request_length, request->body,
+                                  request->body_length);
+        }
+    }
+    budget_free(budget, recorded_body);
+    bool indexed = !rekey->conflict && rekey->pair_count != 0
+        && trace_replay_rekey_index_body(rekey, body, body_length);
+    if (rekey->pair_count != 0 || rekey->conflict) {
+        trace_replay_decision(
+            "HTTP replay volatile-uuid record=%zu pairs=%zu "
+            "occurrences=%zu conflict=%d applied=%d",
+            sequence, rekey->pair_count, rekey->occurrence_count,
+            (int) rekey->conflict, (int) indexed);
+    }
+    if (!indexed) {
+        trace_replay_rekey_release(budget, &rekey);
+        return NULL;
+    }
+    trace_replay_rekey_rewrite(rekey, result->response_headers,
+                               result->response_headers_length);
+    return rekey;
+}
+
 static bool trace_parse_security_metadata(
     const char *value, FetchResponseSecurityMetadata *metadata)
 {
@@ -79,6 +500,7 @@ static bool trace_replay_response_with_scratch(
                        sequence, "body")) {
         return false;
     }
+    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
     FILE *meta = fopen(scratch->meta_path, "rb");
     if (meta == NULL) {
         snprintf(result->error, sizeof(result->error),
@@ -87,7 +509,7 @@ static bool trace_replay_response_with_scratch(
         return false;
     }
     unsigned trace_version = 0;
-    bool method_match = false, url_match = false;
+    bool method_match = false, url_match = false, url_exact = false;
     bool logical_url_seen = false, logical_url_match = false;
     bool recorded_success = true;
     size_t recorded_length = SIZE_MAX, cookie_count = 0;
@@ -184,7 +606,12 @@ static bool trace_replay_response_with_scratch(
         }
         else if (strcmp(scratch->line, "url") == 0) {
             TRACE_SEE(TRACE_V6_URL);
-            url_match = strcmp(equals, url) == 0;
+            url_match = trace_replay_url_equal(equals, url);
+            url_exact = strcmp(equals, url) == 0;
+            if (fetch_trace.replay_volatile_uuids) {
+                snprintf(scratch->recorded_url,
+                         sizeof(scratch->recorded_url), "%s", equals);
+            }
         }
         else if (strcmp(scratch->line, "logical-request-url") == 0) {
             TRACE_SEE(TRACE_V9_LOGICAL_REQUEST_URL);
@@ -196,10 +623,10 @@ static bool trace_replay_response_with_scratch(
                 && tilefinch_url_request_key(
                        scratch->logical_url, scratch->request_key,
                        sizeof(scratch->request_key))
-                && strcmp(scratch->request_key, url) == 0;
+                && trace_replay_url_equal(scratch->request_key, url);
             if (!recorded_logical_valid) trace_fields_valid = false;
             logical_url_match = recorded_logical_valid
-                && strcmp(scratch->logical_url, logical_url) == 0;
+                && trace_replay_url_equal(scratch->logical_url, logical_url);
         }
         else if (strcmp(scratch->line, "success") == 0) {
             TRACE_SEE(TRACE_V6_SUCCESS);
@@ -755,6 +1182,7 @@ static bool trace_replay_response_with_scratch(
         }
     }
     bool meta_ok = !ferror(meta) && fclose(meta) == 0;
+    TRACE_REPLAY_IO_OPEN(meta_started_ns);
     size_t request_length = request == NULL ? 0 : request->body_length;
     const char *request_body = request == NULL || request->body == NULL
                                ? "" : request->body;
@@ -1047,12 +1475,26 @@ static bool trace_replay_response_with_scratch(
                      result->response_referrer_policy);
         }
     }
+    /* Lab and validation builds only: a live page mints fresh tokens into
+       request bodies (chatgpt.com's sentinel), so a recorded POST can only be
+       replayed against a new run with its body identity waived. Validation
+       EBOOTs set the variable from boot.cfg's trace_ignore_request_body. */
+    static int ignore_request_body = -1;
+#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+    ignore_request_body = 0;
+#else
+    if (ignore_request_body < 0)
+        ignore_request_body =
+            getenv("TILEFINCH_REPLAY_IGNORE_REQUEST_BODY") != NULL;
+#endif
+    bool request_body_match = ignore_request_body
+        || ((recorded_request_length == SIZE_MAX
+             || recorded_request_length == request_length)
+            && (!has_request_hash || recorded_request_hash == request_hash));
     bool request_identity_match = method_match && url_match
         && v6_shape_match && v7_shape_match && v8_shape_match
         && v9_shape_match && cache_mode_trace_match
-        && (recorded_request_length == SIZE_MAX
-            || recorded_request_length == request_length)
-        && (!has_request_hash || recorded_request_hash == request_hash)
+        && request_body_match
            /* Client hints are advisory request decoration; a body served
               without them is identical to one served with them for the
               static resources this trace holds.  Engine-supplemental
@@ -1147,6 +1589,14 @@ static bool trace_replay_response_with_scratch(
         fetch_trace.replay_request_shape_mismatch_count++;
     }
     *record_status = TRACE_REPLAY_RECORD_MATCHED;
+    /* A record matched through the UUID query waiver answers for this
+       request's URL, not the recorded identifier; a recorded redirect
+       target is left alone. */
+    if (url_match && !url_exact
+        && trace_replay_url_equal(result->effective_url, url)) {
+        snprintf(result->effective_url, sizeof(result->effective_url), "%s",
+                 url);
+    }
     if (recorded_length > maximum_bytes) {
         result->response_limit_exceeded = true;
         snprintf(result->error, sizeof(result->error),
@@ -1169,7 +1619,9 @@ static bool trace_replay_response_with_scratch(
         writer->replay_expected_body_hash = recorded_response_hash;
         writer->replay_body_hash_required = trace_version >= 6;
     }
+    uint64_t body_started_ns = tilefinch_platform_monotonic_time_ns();
     FILE *body = fopen(scratch->body_path, "rb");
+    TRACE_REPLAY_IO_OPEN(body_started_ns);
     if (body == NULL) {
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay body %zu is missing", sequence);
@@ -1177,8 +1629,16 @@ static bool trace_replay_response_with_scratch(
     }
     if (trace_version >= 6) {
         uint64_t body_hash = 0;
-        if (!trace_open_body_hash(body, recorded_length, &body_hash)
-            || body_hash != recorded_response_hash) {
+        /* One large read per 32 KiB, not per 4 KiB: over host0 each read is
+           a USB round trip. */
+        unsigned char *hash_buffer = budget_malloc(budget, 32u * 1024u);
+        uint64_t hash_started_ns = tilefinch_platform_monotonic_time_ns();
+        bool hashed = trace_open_body_hash_buffer(
+            body, recorded_length, &body_hash, hash_buffer,
+            hash_buffer == NULL ? 0 : 32u * 1024u);
+        TRACE_REPLAY_IO_READ(hash_started_ns, recorded_length);
+        budget_free(budget, hash_buffer);
+        if (!hashed || body_hash != recorded_response_hash) {
             (void) fclose(body);
             snprintf(result->error, sizeof(result->error),
                      "HTTP replay body %zu is corrupt", sequence);
@@ -1197,15 +1657,21 @@ static bool trace_replay_response_with_scratch(
         *rejected = body_ok;
         return false;
     }
+    TraceReplayRekey *rekey = trace_replay_rekey_build(
+        budget, sequence, scratch, url, request, recorded_request_length,
+        recorded_request_hash, has_request_hash, result, body,
+        recorded_length);
     if (writer != NULL && writer->defer_replay_body) {
         writer->deferred_replay_body = body;
         writer->deferred_replay_length = recorded_length;
+        writer->replay_rekey = rekey;
         return true;
     }
     if (writer != NULL && writer->stream != NULL) {
         const FetchStreamOptions *options = writer->stream;
         if (options->on_headers != NULL
             && !options->on_headers(options->opaque, result)) {
+            trace_replay_rekey_release(budget, &rekey);
             fclose(body);
             writer->consumer_failed = true;
             snprintf(result->error, sizeof(result->error),
@@ -1220,6 +1686,7 @@ static bool trace_replay_response_with_scratch(
             ? options->irregular_max_chunk_bytes : options->chunk_bytes;
         if (maximum_chunk == 0) maximum_chunk = 16384;
         if (maximum_chunk > 65536) {
+            trace_replay_rekey_release(budget, &rekey);
             fclose(body);
             snprintf(result->error, sizeof(result->error),
                      "replay stream chunk exceeds 64 KiB ceiling");
@@ -1227,6 +1694,7 @@ static bool trace_replay_response_with_scratch(
         }
         unsigned char *chunk = budget_malloc(budget, maximum_chunk);
         if (chunk == NULL) {
+            trace_replay_rekey_release(budget, &rekey);
             fclose(body);
             snprintf(result->error, sizeof(result->error),
                      "replay stream buffer exceeded shared memory budget");
@@ -1281,7 +1749,17 @@ static bool trace_replay_response_with_scratch(
                             - writer->delivered) {
                 wanted = options->truncate_after_bytes - writer->delivered;
             }
-            if (fread(chunk, 1, wanted, body) != wanted
+            size_t offset = writer->delivered;
+            uint64_t read_started_ns = tilefinch_platform_monotonic_time_ns();
+            size_t read_bytes = fread(chunk, 1, wanted, body);
+            TRACE_REPLAY_IO_READ(read_started_ns, read_bytes);
+            bool read = read_bytes == wanted;
+            if (read) {
+                writer->replay_body_hash = trace_body_hash_with_offset(
+                    (const char *) chunk, wanted, writer->replay_body_hash);
+                trace_replay_rekey_apply(rekey, offset, chunk, wanted);
+            }
+            if (!read
                 || receive_data((char *) chunk, 1, wanted, writer) != wanted) {
                 if (result->error[0] == '\0') {
                     snprintf(result->error, sizeof(result->error),
@@ -1292,8 +1770,6 @@ static bool trace_replay_response_with_scratch(
                 body_ok = false;
                 break;
             }
-            writer->replay_body_hash = trace_body_hash_with_offset(
-                (const char *) chunk, wanted, writer->replay_body_hash);
             if (options->stall_every_chunks != 0
                 && writer->delivered < recorded_length
                 && (writer->metrics == NULL
@@ -1326,23 +1802,32 @@ static bool trace_replay_response_with_scratch(
         }
         bool close_ok = fclose(body) == 0;
         budget_free(budget, chunk);
+        trace_replay_rekey_release(budget, &rekey);
         return body_ok && close_ok;
     }
     result->data = budget_malloc(budget, recorded_length + 1);
     if (result->data == NULL) {
+        trace_replay_rekey_release(budget, &rekey);
         fclose(body);
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay exceeded shared memory budget");
         return false;
     }
-    bool body_ok = fread(result->data, 1, recorded_length, body)
-                       == recorded_length
+    uint64_t read_started_ns = tilefinch_platform_monotonic_time_ns();
+    size_t read = fread(result->data, 1, recorded_length, body);
+    TRACE_REPLAY_IO_READ(read_started_ns, read);
+    bool body_ok = read == recorded_length
                    && fgetc(body) == EOF && !ferror(body)
                    && fclose(body) == 0;
     if (body_ok && trace_version >= 6) {
         body_ok = trace_body_hash(result->data, recorded_length)
                   == recorded_response_hash;
     }
+    if (body_ok) {
+        trace_replay_rekey_apply(rekey, 0, (unsigned char *) result->data,
+                                 recorded_length);
+    }
+    trace_replay_rekey_release(budget, &rekey);
     if (!body_ok) {
         budget_free(budget, result->data);
         result->data = NULL;
@@ -1366,6 +1851,7 @@ static bool trace_record_request_key(
     *valid = false;
     if (!trace_path(scratch->meta_path, sizeof(scratch->meta_path), sequence,
                     "meta")) return false;
+    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
     FILE *meta = fopen(scratch->meta_path, "rb");
     if (meta == NULL) return false;
     bool version_seen = false, method_seen = false, url_seen = false;
@@ -1399,7 +1885,7 @@ static bool trace_record_request_key(
         } else if (strcmp(scratch->line, "url") == 0) {
             if (url_seen) parse_ok = false;
             url_seen = true;
-            url_match = strcmp(equals, url) == 0;
+            url_match = trace_replay_url_equal(equals, url);
         } else if (strcmp(
                        scratch->line,
                        "request-extra-header-shape") == 0) {
@@ -1413,6 +1899,7 @@ static bool trace_record_request_key(
         }
     }
     if (ferror(meta) || fclose(meta) != 0) parse_ok = false;
+    TRACE_REPLAY_IO_OPEN(meta_started_ns);
     *valid = parse_ok && version_seen && method_seen && url_seen
         && (trace_version < 13 || cache_mode_seen);
     return *valid && method_match && url_match
@@ -1430,25 +1917,22 @@ static uint64_t trace_response_key_hash(
     const char *method, const char *url, FetchCacheMode cache_mode)
 {
     uint64_t hash = UINT64_C(1469598103934665603);
-    const char *parts[] = {method, "\n", url};
-    for (size_t part = 0; part < sizeof(parts) / sizeof(parts[0]); part++) {
-        const unsigned char *at = (const unsigned char *) parts[part];
-        while (*at != '\0') {
-            hash ^= *at++;
-            hash *= UINT64_C(1099511628211);
-        }
-    }
+    hash = trace_hash_bytes(hash, method, strlen(method));
+    hash = trace_hash_bytes(hash, "\n", 1);
+    hash = trace_hash_replay_url(hash, url);
     hash ^= (unsigned) cache_mode;
     hash *= UINT64_C(1099511628211);
     return hash;
 }
 
+#ifndef TILEFINCH_NO_FETCH_TRACE
 static bool trace_record_request_key_hash(
     size_t sequence, TraceReplayScratch *scratch, uint64_t *hash)
 {
     if (scratch == NULL || hash == NULL
         || !trace_path(scratch->meta_path, sizeof(scratch->meta_path),
                        sequence, "meta")) return false;
+    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
     FILE *meta = fopen(scratch->meta_path, "rb");
     if (meta == NULL) return false;
     char method[16] = {0};
@@ -1503,6 +1987,7 @@ static bool trace_record_request_key_hash(
         }
     }
     if (ferror(meta) || fclose(meta) != 0) parse_ok = false;
+    TRACE_REPLAY_IO_OPEN(meta_started_ns);
     parse_ok = parse_ok && version_seen && method_seen && url_seen
         && (trace_version < 13 || cache_mode_seen);
     if (parse_ok) {
@@ -1512,6 +1997,7 @@ static bool trace_record_request_key_hash(
     scratch->request_key[0] = '\0';
     return parse_ok;
 }
+#endif
 
 /* Route ranking reads the fields needed to choose a record and rejects the
    impossible successful/failure-state combination before assigning a rank.
@@ -1526,6 +2012,7 @@ static bool trace_response_key_descriptor(
         || !trace_path(scratch->meta_path, sizeof(scratch->meta_path),
                        sequence, "meta")) return false;
     memset(descriptor, 0, sizeof(*descriptor));
+    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
     FILE *meta = fopen(scratch->meta_path, "rb");
     if (meta == NULL) return false;
     bool success_seen = false, status_seen = false;
@@ -1571,6 +2058,7 @@ static bool trace_response_key_descriptor(
     }
     bool meta_ok = !ferror(meta);
     if (fclose(meta) != 0) meta_ok = false;
+    TRACE_REPLAY_IO_OPEN(meta_started_ns);
     valid = valid && meta_ok && success_seen && status_seen
         && !(descriptor->success
              && (descriptor->status == 0
@@ -1579,16 +2067,23 @@ static bool trace_response_key_descriptor(
     return valid;
 }
 
+#ifndef TILEFINCH_NO_FETCH_TRACE
 static void trace_response_key_index_build(void)
 {
-#ifdef __PSP__
-    /* Device replay is validation instrumentation, not page work. Keep it on
-       the allocation-free bounded scan so the lab accelerator can never sit
-       outside the PSP browser budget ledger. */
+#if defined(__PSP__) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* Replay is validation instrumentation, not page work: other PSP builds
+       keep the allocation-free bounded scan. */
     return;
 #else
     size_t count = fetch_trace.replay_record_count;
     if (count == 0 || count > FETCH_TRACE_ROUTE_INDEX_LIMIT) return;
+#if defined(__PSP__)
+    /* Validation device replay: fixed storage, never page Budget or heap. */
+    static TraceReplayScratch static_scratch;
+    TraceReplayRouteIndexEntry *index = trace_replay_static_route_index;
+    TraceReplayScratch *scratch = &static_scratch;
+    memset(index, 0, count * sizeof(*index));
+#else
     TraceReplayRouteIndexEntry *index = calloc(count, sizeof(*index));
     TraceReplayScratch *scratch = calloc(1, sizeof(*scratch));
     if (index == NULL || scratch == NULL) {
@@ -1596,6 +2091,7 @@ static void trace_response_key_index_build(void)
         free(scratch);
         return;
     }
+#endif
     for (size_t sequence = 0; sequence < count; sequence++) {
         TraceResponseKeyDescriptor descriptor;
         uint64_t key_hash = 0;
@@ -1610,11 +2106,14 @@ static void trace_response_key_index_build(void)
             descriptor.success && descriptor.status != 0 ? 2
           : (descriptor.status != 0 ? 1 : 0);
     }
+#if !defined(__PSP__)
     free(scratch);
+#endif
     fetch_trace.replay_route_index = index;
     fetch_trace.replay_route_index_count = count;
 #endif
 }
+#endif
 
 typedef struct {
     size_t sequence;
@@ -1793,6 +2292,10 @@ static bool trace_replay_response(Budget *budget, const char *method,
                         "could not be served",
                         sequence);
                 }
+                trace_replay_decision(
+                    "HTTP response-keyed replay invalid record=%zu "
+                    "method=%.12s url=%.300s error=%.120s",
+                    sequence, method, canonical_url, result->error);
             }
         } else if (selection.exhausted) {
             fetch_trace.replay_conflicting_request_count++;
@@ -1803,18 +2306,20 @@ static bool trace_replay_response(Budget *budget, const char *method,
                 "HTTP response-keyed replay occurrence sequence exhausted "
                 "for %s %s",
                 method, canonical_url);
+            trace_replay_decision(
+                "HTTP response-keyed replay exhausted method=%.12s "
+                "candidates=%zu url=%.420s",
+                method, selection.candidate_count, canonical_url);
         } else {
             fetch_trace.replay_unmatched_request_count++;
             terminal_accounted = true;
             snprintf(result->error, sizeof(result->error),
                      "HTTP response-keyed replay has no record for %s %s",
                      method, canonical_url);
-            if (trace_replay_diagnostics_enabled()) {
-                fprintf(stderr,
-                        "HTTP response-keyed replay unmatched "
-                        "method=%.12s url=%.700s\n",
-                        method, canonical_url);
-            }
+            trace_replay_decision(
+                "HTTP response-keyed replay unmatched method=%.12s "
+                "url=%.420s",
+                method, canonical_url);
         }
     } else {
         bool indexed = fetch_trace.replay_route_index != NULL
@@ -1878,11 +2383,9 @@ static bool trace_replay_response(Budget *budget, const char *method,
                    : "HTTP replay request does not match any unclaimed "
                      "record for %s %s",
                  method, canonical_url);
-        if (trace_replay_diagnostics_enabled()) {
-            fprintf(stderr,
-                    "HTTP replay unmatched method=%.12s url=%.700s\n",
-                    method, canonical_url);
-        }
+        trace_replay_decision(
+            "HTTP replay unmatched method=%.12s url=%.420s",
+            method, canonical_url);
     }
     if (ok) {
         fetch_trace.replay_served_request_count++;

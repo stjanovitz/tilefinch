@@ -29,7 +29,9 @@
     declarationParses = 0,
     retainedKeyframes = 0,
     retainedRules = 0,
-    matchedElements = 0;
+    matchedElements = 0,
+    transitionSnapshots = 0,
+    transitionSnapshotReads = 0;
   if (globalThis.__tilefinchRootCensus)
     Object.defineProperties(globalThis.__tilefinchRootCensus, {
       motionScans: { get: () => scans },
@@ -37,6 +39,8 @@
       motionKeyframes: { get: () => retainedKeyframes },
       motionRules: { get: () => retainedRules },
       motionElements: { get: () => matchedElements },
+      transitionSnapshots: { get: () => transitionSnapshots },
+      transitionSnapshotReads: { get: () => transitionSnapshotReads },
     });
 
   class AnimationEvent extends Event {
@@ -73,6 +77,9 @@
       return limit;
     },
     boundedUtf8Length = (text) => {
+      /* ASCII text, the common case, is one byte per code unit: one native
+         regular-expression pass instead of a loop per character. */
+      if (!/[^\x00-\x7f]/.test(text)) return text.length;
       let bytes = 0;
       for (let at = 0; at < text.length; at++) {
         const code = text.charCodeAt(at);
@@ -596,6 +603,9 @@
         : value,
     collectTreeRoots = (nativeInline) => {
       const roots = [document];
+      /* Without any shadow root there is nothing to find among the
+         document's elements (this query returned every element). */
+      if (globalThis.__tilefinchShadowRootsExist?.() === false) return roots;
       let inspected = 0;
       for (
         let rootIndex = 0;
@@ -695,6 +705,10 @@
             }
           }
         }
+        /* An inline animation takes its frames from these keyframes: with
+           none, and nothing running to stop, inline styles cannot matter. */
+        if (keyframes.size === 0 && active.size === 0 && roots.length === 1)
+          continue;
         /* Inspect bounded native attribute prefixes before creating wrappers.
            Most inline styles are geometry/color, not motion; wrapping all of
            them first can exhaust a tight realm even when no animation applies. */
@@ -879,4 +893,236 @@
     });
   };
   globalThis.__tilefinchBeginMotionObservation = beginObserving;
+
+  /*
+   * Stylesheet transitions. Layout does not animate, but a page that waits
+   * for transitionend after changing a class must still get it, or its menu,
+   * dialog or carousel stays half-way forever. An element is watched once
+   * something listens for its transition events: after each batch of
+   * attribute or inline-style changes, its transitioned properties' computed
+   * values are compared with the last snapshot, and a changed one starts a
+   * transition with the computed duration and delay (cssom.js owns the
+   * event timeline). Bounded to the 64 most recently registered elements.
+   */
+  const TRANSITION_WATCH_LIMIT = 64,
+    /* For `all`: properties pages commonly transition whose computed value
+       does not follow layout (a used height changing with content is not a
+       transition), plus display, which cancels; display stays first. */
+    TRANSITION_SAMPLE = [
+      "display", "opacity", "transform", "visibility", "color",
+      "background-color", "filter", "box-shadow", "max-height", "max-width",
+      "top", "right", "bottom", "left", "margin-top", "margin-left",
+      "translate", "scale", "rotate",
+    ],
+    transitionWatched = new Map(),
+    /* This batch's changed elements (or handles) with the attribute and its
+       old value, flattened in threes; past the limit, or for a change with
+       no element, every watched element is rescanned. */
+    TRANSITION_DIRTY_LIMIT = 16,
+    transitionDirty = [];
+  let transitionCheckQueued = false,
+    transitionDirtyAll = false;
+  const transitionNames = (state) =>
+      state.explicit.length
+        ? TRANSITION_SAMPLE.concat(
+            state.explicit.filter((name) => !TRANSITION_SAMPLE.includes(name)))
+        : TRANSITION_SAMPLE,
+    transitionSnapshot = (element, names) => {
+      transitionSnapshots++;
+      transitionSnapshotReads += names.length;
+      try {
+        return globalThis.__tilefinchTransitionSnapshot(element.__handle, names);
+      } catch {
+        return null;
+      }
+    },
+    /* Records the element's current values as the baseline. The snapshot's
+       own values array is kept, with the name list it answers (state.names
+       only changes when a class names a new property). */
+    transitionBaseline = (element, state) => {
+      let snapshot = transitionSnapshot(element, state.names);
+      if (!snapshot) return;
+      const explicit = snapshot[0].filter((name) =>
+        name !== "all" && name !== "none" && !TRANSITION_SAMPLE.includes(name));
+      if (explicit.some((name) => !state.explicit.includes(name))) {
+        state.explicit = Array.from(new Set(state.explicit.concat(explicit)))
+          .slice(0, 8);
+        state.names = transitionNames(state);
+        snapshot = transitionSnapshot(element, state.names);
+        if (!snapshot) return;
+      }
+      state.values = snapshot[3];
+      state.valueNames = state.names;
+    },
+    /*
+     * Where this batch's changes can reach, or null for everywhere. An
+     * attribute or inline style of element T can change the computed style
+     * of T, its descendants (descendant/child combinators, inheritance) and
+     * the subtrees of its later siblings (sibling combinators, nth-of), all
+     * inside T's parent; a shadow tree sits natively inside its host, so
+     * that covers :host rules too. :has() reaches ancestors and beyond, so a
+     * change the engine's :has classifier cannot rule out rescans everything,
+     * as does one inside a shadow tree (::slotted, :host). The scopes are
+     * element handles.
+     */
+    transitionScopes = () => {
+      const scopes = [];
+      if (transitionDirtyAll) return null;
+      for (let at = 0; at < transitionDirty.length; at += 3) {
+        let target = transitionDirty[at];
+        const name = transitionDirty[at + 1];
+        if (typeof target === "number")
+          target = globalThis.__tilefinchWrap?.(target);
+        if (!target?.isConnected) continue;
+        let scope = target;
+        if (name !== null) {
+          /* A newly watched element (name null) checks only itself. */
+          if (target.getRootNode() !== document) return null;
+          const sensitive = name === undefined
+            ? __tilefinchAttributeChangeMayAffectHas("style")
+            : __tilefinchAttributeChangeMayAffectHas(name,
+                transitionDirty[at + 2], target.getAttribute(name));
+          if (sensitive) return null;
+          scope = target.parentNode;
+          if (!(scope?.__handle > 0)) return null;
+        }
+        if (!scopes.includes(scope.__handle)) {
+          if (scopes.length >= TRANSITION_DIRTY_LIMIT) return null;
+          scopes.push(scope.__handle);
+        }
+      }
+      return scopes;
+    },
+    checkTransitions = () => {
+      transitionCheckQueued = false;
+      let scopes = null;
+      try {
+        scopes = transitionScopes();
+      } catch {}
+      transitionDirty.length = 0;
+      transitionDirtyAll = false;
+      for (const [element, state] of Array.from(transitionWatched)) {
+        if (!element.isConnected) {
+          for (const name of state.running)
+            globalThis.__tilefinchCancelTransition(element, name);
+          transitionWatched.delete(element);
+          continue;
+        }
+        if (scopes && !__tilefinchStyleReach(element.__handle, scopes))
+          continue;
+        const names = state.names,
+          snapshot = transitionSnapshot(element, names);
+        if (!snapshot) continue;
+        const [properties, durations, delays, values] = snapshot,
+          previous = state.values,
+          previousNames = state.valueNames;
+        state.values = values;
+        state.valueNames = names;
+        if (String(values[0] ?? "") === "none") {
+          for (const name of state.running)
+            globalThis.__tilefinchCancelTransition(element, name);
+          state.running.clear();
+          continue;
+        }
+        for (let slot = 1; slot < names.length; slot++) {
+          const name = names[slot],
+            at = previousNames === names ? slot : previousNames.indexOf(name);
+          if (at < 0 || at >= previous.length) continue;
+          const before = String(previous[at] ?? ""),
+            after = String(values[slot] ?? "");
+          if (before === after ||
+              globalThis.__tilefinchInlineTransition(element.__handle, name))
+            continue;
+          let index = -1;
+          for (let at = 0; at < properties.length; at++)
+            if (properties[at] === name || properties[at] === "all")
+              index = at;
+          const duration = index < 0 ? 0 : Math.max(0, durations[index]),
+            delay = index < 0 ? 0 : delays[index];
+          if (duration + delay <= 0) {
+            if (state.running.delete(name))
+              globalThis.__tilefinchCancelTransition(element, name);
+            continue;
+          }
+          state.running.add(name);
+          globalThis.__tilefinchStartTransition(
+            element, name, duration, delay, "stylesheet");
+        }
+        /* A property a class just named in transition-property starts being
+           sampled from here. */
+        const explicit = properties.filter((name) =>
+          name !== "all" && name !== "none" &&
+          !TRANSITION_SAMPLE.includes(name) && !state.explicit.includes(name));
+        if (explicit.length) {
+          state.explicit = state.explicit.concat(explicit).slice(0, 8);
+          state.names = transitionNames(state);
+          transitionBaseline(element, state);
+        }
+      }
+    },
+    /* Restores this turn's logged attribute changes on the element and its
+       ancestors through the host setters (which queue no mutation records),
+       takes the baseline, and reapplies them: the style before the change
+       that the page is about to wait on. */
+    baselineBeforeRecentChanges = (element, state) => {
+      const changes = globalThis.__tilefinchRecentAttributeChanges?.() || [],
+        /* The style attribute stays: rewriting it through the host would
+           drop its CSSOM authorization under a strict CSP. */
+        relevant = changes.filter((change) =>
+          String(change.name).toLowerCase() !== "style" &&
+          (change.target === element || change.target.contains?.(element)));
+      if (!relevant.length) {
+        transitionBaseline(element, state);
+        return;
+      }
+      const current = relevant.map((change) => ({
+        handle: change.target.__handle,
+        name: change.name,
+        value: change.target.getAttribute(change.name),
+      }));
+      const write = (handle, name, value) =>
+        value === null
+          ? __tilefinchRemoveAttribute(handle, name)
+          : __tilefinchSetAttribute(handle, name, String(value));
+      try {
+        for (let at = relevant.length - 1; at >= 0; at--)
+          write(relevant[at].target.__handle, relevant[at].name,
+            relevant[at].oldValue);
+        transitionBaseline(element, state);
+      } finally {
+        for (const change of current)
+          write(change.handle, change.name, change.value);
+      }
+    };
+  /* target: the changed element or its handle; name: the changed attribute
+     (with oldValue), undefined for an inline style write, or null for an
+     element that has just been watched. */
+  globalThis.__tilefinchTransitionsDirty = (target, name, oldValue) => {
+    if (transitionWatched.size === 0) return;
+    if (!target || transitionDirty.length >= TRANSITION_DIRTY_LIMIT * 3)
+      transitionDirtyAll = true;
+    else if (!transitionDirtyAll)
+      transitionDirty.push(target, name, oldValue);
+    if (transitionCheckQueued) return;
+    transitionCheckQueued = true;
+    queueMicrotask(checkTransitions);
+  };
+  globalThis.__tilefinchWatchTransitions = (target, type) => {
+    if (!(target instanceof Element) || !(target.__handle > 0)) return;
+    if (type === "webkitTransitionEnd")
+      target.__tilefinchWebkitTransitionEnd = true;
+    if (transitionWatched.has(target)) return;
+    if (transitionWatched.size >= TRANSITION_WATCH_LIMIT)
+      transitionWatched.delete(transitionWatched.keys().next().value);
+    const state = {
+      names: TRANSITION_SAMPLE,
+      values: [],
+      valueNames: TRANSITION_SAMPLE,
+      explicit: [],
+      running: new Set(),
+    };
+    transitionWatched.set(target, state);
+    baselineBeforeRecentChanges(target, state);
+    globalThis.__tilefinchTransitionsDirty(target, null);
+  };
 })();

@@ -257,6 +257,7 @@ typedef struct {
     uint64_t max_frame_fixed_us;
     size_t frames_rendered;
     uint64_t command_candidates;
+    uint64_t stroke_pixel_tests; /* Host/validation only; zero in ordinary PSP. */
     struct RenderOverflowCache *overflow_cache;
     struct RenderGradientCache *gradient_cache;
     size_t gradient_lut_hits;
@@ -348,6 +349,9 @@ typedef struct {
        or lost. */
     uint32_t overflow_tile_generation;
     uint64_t overflow_scroll_signature;
+    /* The overflow offsets and clips of the fixed layer's commands when it
+       was last validated: an unrelated scroller moving keeps the layer. */
+    uint64_t fixed_overflow_signature;
     /* Overflow preparations answered by the scroll generation alone. */
     size_t overflow_prepare_skips;
     /* Last overflow-cache preparation succeeded, so tiles bake unscrolled

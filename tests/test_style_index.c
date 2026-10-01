@@ -1,12 +1,15 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
 #include "tilefinch/layout.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/render.h"
 #include "tilefinch/style.h"
 #include "../src/style_cache_internal.h"
 #include "../src/style_internal.h"
 
+#include <pthread.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -539,6 +542,165 @@ static int test_deferred_expansion_reuse(void)
     return 0;
 }
 
+/* Atomic-CSS bundles ship thousands of single-property rules of which a
+   page matches about a fifth (chatgpt.com: 712 of 3,432 in this engine).
+   A parsed declaration used to carry a whole ComputedStyle, so each
+   unmatched rule retained more than 400 bytes of values it never applied.
+   Bound the retained and peak cost per distinct unmatched rule, and prove
+   the compact values still resolve exactly for the rules that do match. */
+static int test_unmatched_declaration_footprint(void)
+{
+    enum { RULES = 512 };
+    static const char base_css[] =
+        ".hit{color:#102030}#probe{padding-left:3px}";
+    size_t css_capacity = sizeof(base_css) + RULES * 64u;
+    char *css = malloc(css_capacity);
+    CHECK(css != NULL);
+    size_t used = (size_t) snprintf(css, css_capacity, "%s", base_css);
+    for (unsigned i = 0; i < RULES; i++) {
+        /* Distinct values defeat declaration interning, as they do in a
+           real atomic bundle; four property families vary the layout. */
+        int written;
+        switch (i & 3u) {
+        case 0:
+            written = snprintf(css + used, css_capacity - used,
+                               ".u%u{margin-top:%upx}", i, i + 1u);
+            break;
+        case 1:
+            written = snprintf(css + used, css_capacity - used,
+                               ".u%u{color:#%06x}", i, 0x7919u * i);
+            break;
+        case 2:
+            written = snprintf(css + used, css_capacity - used,
+                               ".u%u{width:%upx}", i, i + 1u);
+            break;
+        default:
+            written = snprintf(css + used, css_capacity - used,
+                               ".u%u{border-radius:%upx}", i, i + 1u);
+            break;
+        }
+        CHECK(written > 0 && (size_t) written < css_capacity - used);
+        used += (size_t) written;
+    }
+    size_t retained[2] = {0}, peak[2] = {0}, rules[2] = {0};
+    for (int variant = 0; variant < 2; variant++) {
+        Budget budget;
+        budget_init(&budget, 16u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        static const char html[] = "<div class='hit u5 u6 u7'>"
+            "<span id=probe class=u4>x</span></div>";
+        CHECK(document_parse(&document, &budget, html,
+                             sizeof(html) - 1u, 17));
+        size_t before = budget.current;
+        budget.peak = budget.current;
+        Stylesheet sheet = {0};
+        CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+        CHECK(stylesheet_add_css(&sheet, variant == 0 ? base_css : css,
+                                 variant == 0 ? strlen(base_css) : used));
+        lxb_dom_node_t *probe = find_id(
+            lxb_dom_interface_node(document.html), "probe");
+        CHECK(probe != NULL && probe->parent != NULL);
+        ComputedStyle outer = style_for_node(&sheet, probe->parent, NULL);
+        ComputedStyle inner = style_for_node(&sheet, probe, &outer);
+        CHECK(sheet.rule_index_ready);
+        CHECK(inner.padding.left == 3);
+        if (variant == 0) {
+            CHECK(outer.color == 0x102030);
+        } else {
+            /* .u5 (color #025d7d) follows .hit in source order; .u6 sets
+               width 7px, .u7 radius 8px and .u4 margin-top 5px. */
+            CHECK(sheet.count == rules[0] + RULES);
+            CHECK(outer.color == 0x025d7d && outer.width == 7
+                  && outer.border_radius == 8);
+            CHECK(inner.margin.top == 5 && inner.color == 0x025d7d);
+        }
+        rules[variant] = sheet.count;
+        retained[variant] = budget.current - before;
+        peak[variant] = budget.peak - before;
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+    free(css);
+    CHECK(retained[1] > retained[0] && peak[1] > peak[0]);
+    size_t retained_per_rule = (retained[1] - retained[0]) / RULES;
+    size_t peak_per_rule = (peak[1] - peak[0]) / RULES;
+    fprintf(stderr, "style-index unmatched-rule bytes retained=%zu "
+            "peak=%zu declaration=%zu\n", retained_per_rule,
+            peak_per_rule, sizeof(StyleDeclaration));
+    CHECK(retained_per_rule < 320u);
+    CHECK(peak_per_rule < 480u);
+    return 0;
+}
+
+/* Scoped custom properties (theme classes, atomic `--x:` rules) and the
+   retained sparse properties are kept as StyleCustomRule records. Those
+   carried fixed 192/48/96-byte selector, name and value buffers whatever
+   the text length: 360 bytes per record, 1,006 records (362,160 bytes, 61%
+   of them unmatched) on the chatgpt.com capture. Bound the per-record cost
+   and check that values, names and selectors still resolve exactly. */
+static int test_custom_rule_footprint(void)
+{
+    enum { RULES = 512 };
+    static const char base_css[] =
+        ".probe{color:var(--tone-7, #000000)}";
+    size_t css_capacity = sizeof(base_css) + RULES * 48u;
+    char *css = malloc(css_capacity);
+    CHECK(css != NULL);
+    size_t used = (size_t) snprintf(css, css_capacity, "%s", base_css);
+    for (unsigned i = 0; i < RULES; i++) {
+        int written = snprintf(css + used, css_capacity - used,
+                               ".v%u{--tone-%u:#%06x}", i, i,
+                               0x7919u * i);
+        CHECK(written > 0 && (size_t) written < css_capacity - used);
+        used += (size_t) written;
+    }
+    size_t retained[2] = {0}, customs[2] = {0};
+    for (int variant = 0; variant < 2; variant++) {
+        Budget budget;
+        budget_init(&budget, 16u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        static const char html[] =
+            "<div class='v7'><span id=probe class=probe>x</span></div>";
+        CHECK(document_parse(&document, &budget, html,
+                             sizeof(html) - 1u, 17));
+        size_t before = budget.current;
+        Stylesheet sheet = {0};
+        CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+        CHECK(stylesheet_add_css(&sheet, variant == 0 ? base_css : css,
+                                 variant == 0 ? strlen(base_css) : used));
+        lxb_dom_node_t *probe = find_id(
+            lxb_dom_interface_node(document.html), "probe");
+        CHECK(probe != NULL && probe->parent != NULL);
+        ComputedStyle outer = style_for_node(&sheet, probe->parent, NULL);
+        ComputedStyle inner = style_for_node(&sheet, probe, &outer);
+        if (variant == 0) {
+            CHECK(inner.color == 0x000000);
+        } else {
+            CHECK(inner.color == 0x7919u * 7u);
+            const StyleCustomRule *last = find_custom_rule(
+                &sheet, ".v511", "--tone-511");
+            CHECK(last != NULL && last->name_length == strlen("--tone-511")
+                  && last->selector_length == strlen(".v511")
+                  && strcmp(last->value, "#f1b8e7") == 0);
+        }
+        customs[variant] = sheet.custom_rule_count;
+        retained[variant] = budget.current - before;
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+    free(css);
+    CHECK(customs[1] == customs[0] + RULES && retained[1] > retained[0]);
+    size_t per_rule = (retained[1] - retained[0]) / RULES;
+    fprintf(stderr, "style-index custom-rule bytes retained=%zu "
+            "record=%zu\n", per_rule, sizeof(StyleCustomRule));
+    CHECK(per_rule < 160u);
+    return 0;
+}
+
 static int test_head_script_dependency_cache(void)
 {
     Budget budget;
@@ -1059,6 +1221,931 @@ static int test_deferred_font_basis(void)
     return 0;
 }
 
+/* Which class/id tokens can change what an inline SVG raster resolves:
+   colour and font size from any matched element, width/height only through
+   an ancestor, custom properties and presentation values (escaped spellings
+   included), opacity only through an ancestor. */
+static int test_svg_raster_token_gate(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>.tint{color:red}.pad{padding:1px}"
+        ".big .sz{width:16px}.w{height:4px}.em{font-size:20px}"
+        ".dark\\:ic{--ic:blue}.\\31 0x{fill:red}.fade{opacity:.5}"
+        ".dim svg{opacity:.5}#hero{stroke:red}</style><p id=p>x</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    (void) style_for_node(&sheet, find_id(
+        lxb_dom_interface_node(document.html), "p"), NULL);
+    static const struct {
+        bool id;
+        const char *token;
+        bool affects;
+    } cases[] = {
+        {false, "tint", true}, {false, "pad", false}, {false, "big", true},
+        {false, "sz", false}, {false, "w", false}, {false, "em", true},
+        {false, "dark:ic", true}, {false, "10x", true},
+        {false, "fade", false}, {false, "dim", true}, {true, "hero", true},
+        {false, "hero", false}, {false, "missing", false},
+    };
+    /* The custom-rule token list is built once per sheet generation. */
+    uint32_t missing = stylesheet_identity_token_hash(false, "missing", 7);
+    CHECK(!stylesheet_tokens_may_affect_svg_raster(&sheet, &missing, 1));
+    size_t before = budget.current;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint32_t token = stylesheet_identity_token_hash(
+            cases[i].id, cases[i].token, strlen(cases[i].token));
+        bool affects = stylesheet_tokens_may_affect_svg_raster(
+            &sheet, &token, 1);
+        if (affects != cases[i].affects)
+            fprintf(stderr, "svg raster token %s: %d\n", cases[i].token,
+                    (int) affects);
+        CHECK(affects == cases[i].affects);
+        /* None of these rules can reveal an image. */
+        CHECK(!stylesheet_tokens_may_affect_discovery(&sheet, &token, 1));
+        CHECK(budget.current == before);
+    }
+    CHECK(sheet.svg_raster_tokens_ready && !sheet.svg_raster_tokens_opaque
+          && sheet.svg_raster_token_count == 4u);
+    /* An identity attribute selector cannot be listed. */
+    CHECK(stylesheet_add_css(&sheet, "[class~=x]{--ic:red}", 20));
+    (void) style_for_node(&sheet, find_id(
+        lxb_dom_interface_node(document.html), "p"), NULL);
+    uint32_t pad = stylesheet_identity_token_hash(false, "pad", 3);
+    CHECK(stylesheet_tokens_may_affect_svg_raster(&sheet, &pad, 1)
+          && sheet.svg_raster_tokens_opaque);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static bool selector_references(const Stylesheet *sheet, const char *name)
+{
+    return stylesheet_selectors_reference_attribute_prefix(
+        sheet, name, name == NULL ? 0 : strlen(name));
+}
+
+static int test_selector_attribute_names(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(!selector_references(&sheet, "data-empty-sheet"));
+    static const char html[] = "<style>[data-exact]{color:red}"
+        "div[DATA-Upper='x'] p{color:red}"
+        ".x:is([data-in-is]){color:red}"
+        ":where(.a [ data-in-where ~= v ]){color:red}"
+        ":not([data-in-not]) .q{color:red}"
+        ".p:has(> [data-in-has]){color:red}"
+        "li:nth-child(2n of [data-in-nth]){color:red}"
+        "[data-dash|=en]{color:red}"
+        "[data-value-escape='a\\]b'] i{color:red}"
+        "[data-long-attribute-name-well-beyond-the-journal]{color:red}"
+        ".data-\\[state\\=open\\]\\:block{display:block}"
+        "[title='[data-quoted]']{color:red}"
+        "[data-theme]{--tone:blue}"
+        "</style><p id=p>x</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    static const struct {
+        const char *name;
+        bool referenced;
+    } cases[] = {
+        {"data-exact", true}, {"data-exac", true}, {"data-", true},
+        {"data-exact-more", false}, {"data-upper", true},
+        {"DATA-UPPER", true}, {"data-in-is", true}, {"data-in-where", true},
+        {"data-in-not", true}, {"data-in-has", true}, {"data-in-nth", true},
+        {"data-dash", true}, {"data-value-escape", true},
+        /* A mutation journal keeps the first 31 bytes of a longer name. */
+        {"data-long-attribute-name-well-", true}, {"data-theme", true},
+        {"data-state", false}, {"data-quoted", false},
+        {"data-missing", false}, {"datum", false}, {"", true},
+    };
+    size_t unbuilt = budget.current;
+    CHECK(!sheet.selector_attribute_names_ready
+          && sheet.selector_attribute_names == NULL);
+    CHECK(!selector_references(&sheet, "data-missing"));
+    /* Built once for this generation; later queries allocate nothing. */
+    size_t built = budget.current;
+    CHECK(sheet.selector_attribute_names_ready
+          && !sheet.selector_attribute_names_opaque
+          && sheet.selector_attribute_name_count == 12u
+          && built - unbuilt >= sheet.selector_attribute_name_bytes
+          && sheet.selector_attribute_name_bytes > 0);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool referenced = selector_references(&sheet, cases[i].name);
+        if (referenced != cases[i].referenced)
+            fprintf(stderr, "selector attribute %s: %d\n", cases[i].name,
+                    (int) referenced);
+        CHECK(referenced == cases[i].referenced);
+        CHECK(budget.current == built);
+    }
+    CHECK(stylesheet_selectors_reference_attribute_prefix(&sheet, NULL, 4));
+    /* A new generation's rules are seen. */
+    CHECK(!selector_references(&sheet, "data-late"));
+    uint64_t generation = sheet.selector_attribute_generation;
+    static const char late[] = "section [data-late]{color:red}";
+    CHECK(stylesheet_add_css(&sheet, late, sizeof(late) - 1u)
+          && selector_references(&sheet, "data-late")
+          && !selector_references(&sheet, "data-missing")
+          && sheet.selector_attribute_generation != generation
+          && sheet.selector_attribute_generation == sheet.build_generation
+          && sheet.selector_attribute_name_count == 13u);
+    /* A rule-count change alone also rebuilds the list. */
+    static const char custom[] = "[data-custom-only]{--x:1}";
+    size_t custom_rules = sheet.custom_rule_count;
+    CHECK(stylesheet_add_css(&sheet, custom, sizeof(custom) - 1u)
+          && sheet.custom_rule_count > custom_rules);
+    sheet.build_generation = sheet.selector_attribute_generation;
+    CHECK(selector_references(&sheet, "data-custom-only"));
+    stylesheet_destroy(&sheet);
+    CHECK(sheet.selector_attribute_names == NULL);
+    /* Scratch holds unique names only: many repeated, interleaved names
+       still list, but more distinct names than the bound turn opaque. */
+    for (unsigned distinct = 0; distinct < 2u; distinct++) {
+        Stylesheet bounded = {0};
+        CHECK(stylesheet_build(&bounded, &budget, &document, 480));
+        size_t capacity = 256u * 1024u, used = 0;
+        char *css = malloc(capacity);
+        CHECK(css != NULL);
+        for (unsigned i = 0; i < 3000u; i++) {
+            int written = snprintf(css + used, capacity - used,
+                ".r%u[data-%s%u]{color:red}", i,
+                distinct ? "distinct-" : "repeat-", distinct ? i : i % 3u);
+            CHECK(written > 0 && (size_t) written < capacity - used);
+            used += (size_t) written;
+        }
+        CHECK(stylesheet_add_css(&bounded, css, used));
+        free(css);
+        CHECK(selector_references(&bounded, "data-missing") == (distinct != 0));
+        CHECK(bounded.selector_attribute_names_opaque == (distinct != 0));
+        CHECK(distinct || (bounded.selector_attribute_name_count == 12u + 3u
+              && selector_references(&bounded, "data-repeat-2")));
+        stylesheet_destroy(&bounded);
+    }
+    /* Names the scan cannot list make every answer conservative. */
+    static const char *const opaque[] = {
+        "[data\\2d esc]{color:red}", "[ns|data-ns]{color:red}",
+        "[*|data-any]{color:red}", "[|data-none]{color:red}",
+    };
+    for (size_t i = 0; i < sizeof(opaque) / sizeof(opaque[0]); i++) {
+        Stylesheet opaque_sheet = {0};
+        CHECK(stylesheet_build(&opaque_sheet, &budget, &document, 480));
+        CHECK(!selector_references(&opaque_sheet, "data-missing"));
+        CHECK(stylesheet_add_css(&opaque_sheet, opaque[i],
+                                 strlen(opaque[i])));
+        bool listed = opaque_sheet.count != 0
+            || opaque_sheet.custom_rule_count != 0;
+        if (listed && (!selector_references(&opaque_sheet, "data-missing")
+                       || !opaque_sheet.selector_attribute_names_opaque
+                       || opaque_sheet.selector_attribute_names != NULL)) {
+            fprintf(stderr, "opaque attribute selector %s answered no\n",
+                    opaque[i]);
+            return 1;
+        }
+        if (!listed) fprintf(stderr, "attribute selector %s not retained\n",
+                             opaque[i]);
+        stylesheet_destroy(&opaque_sheet);
+    }
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A ChatGPT-sized sheet: every unobserved data-* mutation record asks this
+   question during relayout preparation. */
+static int benchmark_selector_attribute_names(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<p id=p>x</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    size_t capacity = 512u * 1024u, used = 0;
+    char *css = malloc(capacity);
+    CHECK(css != NULL);
+    for (unsigned i = 0; i < 5000u; i++) {
+        int written;
+        if (i % 20u == 0)
+            written = snprintf(css + used, capacity - used,
+                ".group[data-state-%u=open] .item-%u{color:red}", i, i);
+        else if (i % 20u == 1)
+            written = snprintf(css + used, capacity - used,
+                ".open-block-%u[data-state=open]{display:block}", i);
+        else
+            written = snprintf(css + used, capacity - used,
+                ".card-%u .title-%u>span{padding:%upx}", i, i, i % 7u);
+        CHECK(written > 0 && (size_t) written < capacity - used);
+        used += (size_t) written;
+    }
+    CHECK(stylesheet_add_css(&sheet, css, used));
+    free(css);
+    CHECK(sheet.count >= 5000u);
+    static const char *const names[] = {
+        "data-message-id", "data-testid", "data-start", "data-end",
+    };
+    uint64_t started = tilefinch_platform_monotonic_time_ns();
+    CHECK(!selector_references(&sheet, names[0]));
+    uint64_t first = tilefinch_platform_monotonic_time_ns() - started;
+    const unsigned iterations = 2000u;
+    started = tilefinch_platform_monotonic_time_ns();
+    for (unsigned i = 0; i < iterations; i++)
+        CHECK(!selector_references(&sheet, names[i % 4u]));
+    uint64_t elapsed = tilefinch_platform_monotonic_time_ns() - started;
+    CHECK(selector_references(&sheet, "data-state"));
+    /* Steady-state list rebuild cost, as after a later sheet append. */
+    const unsigned rebuilds = 50u;
+    uint64_t rebuild_started = tilefinch_platform_monotonic_time_ns();
+    for (unsigned i = 0; i < rebuilds; i++) {
+        sheet.selector_attribute_names_ready = false;
+        CHECK(!selector_references(&sheet, names[1]));
+    }
+    uint64_t rebuild = (tilefinch_platform_monotonic_time_ns()
+                        - rebuild_started) / rebuilds;
+    printf("selector attribute names: rules=%zu first_us=%llu "
+           "rebuild_us=%llu query_ns=%llu names=%u\n", sheet.count,
+           (unsigned long long) (first / 1000u),
+           (unsigned long long) (rebuild / 1000u),
+           (unsigned long long) (elapsed / iterations),
+           (unsigned) sheet.selector_attribute_name_count);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Retained (unsupported-by-cascade) properties are resolved per element
+   after the cascade, one custom-rule candidate at a time; each candidate's
+   class key must hit the element's tokenized list, not rescan it. */
+static int test_retained_properties_share_class_tokens(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char css[4096];
+    size_t used = 0;
+    for (unsigned i = 0; i < 24; i++) {
+        int written = snprintf(css + used, sizeof(css) - used,
+            ".t%u{touch-action:none}.b%u{backdrop-filter:blur(2px)}", i, i);
+        CHECK(written > 0 && (size_t) written < sizeof(css) - used);
+        used += (size_t) written;
+    }
+    static const char body[] =
+        "<p id=target class='filler-one filler-two filler-three "
+        "filler-four t5 b7'>x</p>";
+    char html[6144];
+    int length = snprintf(html, sizeof(html),
+                          "<!doctype html><style>%s</style>%s", css, body);
+    CHECK(length > 0 && (size_t) length < sizeof(html));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, (size_t) length, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html),
+                                   "target");
+    CHECK(node != NULL);
+    uint64_t scans = sheet.selector_class_linear_scans;
+    uint64_t builds = sheet.selector_class_token_builds;
+    ComputedStyle style = style_for_node(&sheet, node, NULL);
+    CHECK(style.touch_action == STYLE_TOUCH_ACTION_NONE && style.has_filter);
+    /* 48 candidate keys: one tokenization, no linear rescans. */
+    CHECK(sheet.selector_class_linear_scans == scans);
+    CHECK(sheet.selector_class_token_builds - builds <= 1);
+    /* A later resolution of the unchanged element recognizes its list by
+       content instead of tokenizing it again. */
+    builds = sheet.selector_class_token_builds;
+    style = style_for_node(&sheet, node, NULL);
+    CHECK(style.touch_action == STYLE_TOUCH_ACTION_NONE && style.has_filter);
+    CHECK(sheet.selector_class_token_builds == builds);
+    /* Different text in the same storage (the address and length a set is
+       found by still match, as when freed attribute memory is reused) must
+       not answer from the earlier scope's tokens. */
+    size_t before_length = 0;
+    char *before = (char *) document_attribute(node, "class", &before_length);
+    static const char rewritten[] =
+        "filler-one filler-two filler-three filler-four x5 x7";
+    CHECK(before != NULL && before_length == sizeof(rewritten) - 1u);
+    memcpy(before, rewritten, before_length);
+    style = style_for_node(&sheet, node, NULL);
+    CHECK(style.touch_action != STYLE_TOUCH_ACTION_NONE && !style.has_filter);
+    CHECK(sheet.selector_class_token_builds == builds + 1u);
+    /* And through the DOM, with new storage. */
+    static const char replaced[] =
+        "filler-one filler-two filler-three filler-four b5 x7";
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+          (const lxb_char_t *) "class", 5, (const lxb_char_t *) replaced,
+          sizeof(replaced) - 1u) != NULL);
+    style = style_for_node(&sheet, node, NULL);
+    CHECK(style.touch_action != STYLE_TOUCH_ACTION_NONE && style.has_filter);
+    static const char restored[] =
+        "filler-one filler-two filler-three filler-four t9 x7";
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+          (const lxb_char_t *) "class", 5, (const lxb_char_t *) restored,
+          sizeof(restored) - 1u) != NULL);
+    style = style_for_node(&sheet, node, NULL);
+    CHECK(style.touch_action == STYLE_TOUCH_ACTION_NONE && !style.has_filter);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The comparison of the utility-class tests below: every field their rules
+   can set, plus the generated boxes. */
+static bool utility_styles_equal(const ComputedStyle *left,
+                                 const ComputedStyle *right)
+{
+    return left->display == right->display
+        && left->color == right->color
+        && left->has_background == right->has_background
+        && left->background == right->background
+        && left->letter_spacing == right->letter_spacing
+        && left->word_spacing == right->word_spacing
+        && left->padding.top == right->padding.top
+        && left->padding.right == right->padding.right
+        && left->padding.bottom == right->padding.bottom
+        && left->padding.left == right->padding.left
+        && left->margin.top == right->margin.top
+        && left->margin.left == right->margin.left
+        && left->opacity == right->opacity
+        && left->touch_action == right->touch_action
+        && left->has_filter == right->has_filter
+        && computed_style_user_select(left)
+            == computed_style_user_select(right)
+        && left->generated_content == right->generated_content
+        && left->generated_text_length == right->generated_text_length
+        && (left->generated_text_length == 0
+            || memcmp(left->generated_text, right->generated_text,
+                      left->generated_text_length) == 0);
+}
+
+static uint32_t utility_next(uint32_t *state)
+{
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    return *state;
+}
+
+enum { UTILITY_CLASSES = 120, UTILITY_ELEMENTS = 48 };
+
+/* One random atomic-CSS class list of `count` tokens, `u<n>` names. */
+static size_t utility_class_list(uint32_t *state, char *out, size_t size,
+                                 unsigned count)
+{
+    size_t used = 0;
+    out[0] = '\0';
+    for (unsigned i = 0; i < count; i++) {
+        int written = snprintf(out + used, size - used, "%su%u",
+                               i == 0 ? "" : " ",
+                               (unsigned) (utility_next(state)
+                                           % UTILITY_CLASSES));
+        if (written <= 0 || (size_t) written >= size - used) break;
+        used += (size_t) written;
+    }
+    return used;
+}
+
+static size_t utility_elements(lxb_dom_node_t *root, lxb_dom_node_t **out,
+                               size_t capacity)
+{
+    size_t count = 0;
+    for (lxb_dom_node_t *at = root; at != NULL && count < capacity;) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) out[count++] = at;
+        if (at->first_child != NULL) { at = at->first_child; continue; }
+        while (at != NULL && at != root && at->next == NULL) at = at->parent;
+        at = at == NULL || at == root ? NULL : at->next;
+    }
+    return count;
+}
+
+/* Elements carrying more keyed classes than the rule-index plan's ranges
+   (atomic CSS) take the merged candidate list; it must select exactly what
+   the unindexed linear scan selects, through random class rewrites, and
+   visit a small fraction of the rules. */
+static int test_utility_class_candidates_match_linear(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static char html[65536];
+    size_t length = 0;
+    int written = snprintf(html, sizeof(html),
+        "<!doctype html><style>*{letter-spacing:1px}div{word-spacing:1px}"
+        "#e3{padding-left:5px}");
+    CHECK(written > 0);
+    length = (size_t) written;
+    for (unsigned i = 0; i < UTILITY_CLASSES; i++) {
+        const char *declaration;
+        switch (i % 12u) {
+        case 0: declaration = "color:#%06x"; break;
+        case 1: declaration = "padding-top:%upx"; break;
+        case 2: declaration = "margin-left:%upx"; break;
+        case 3: declaration = "word-spacing:%upx"; break;
+        case 4: declaration = "background-color:#%06x"; break;
+        case 5: declaration = "touch-action:none;--u%u:1"; break;
+        case 6: declaration = "backdrop-filter:blur(%upx)"; break;
+        case 7: declaration = "user-select:none;padding-right:%upx"; break;
+        case 8: declaration = "display:flex;margin-top:%upx"; break;
+        case 9: declaration = "opacity:0.5;padding-bottom:%upx"; break;
+        case 10: declaration = "letter-spacing:%upx"; break;
+        default: declaration = "color:var(--tone,#%06x)"; break;
+        }
+        char body[96];
+        snprintf(body, sizeof(body), declaration, (i * 2654435761u) % 23u
+                 + (i % 12u == 0 || i % 12u == 4 || i % 12u == 11
+                    ? 0x101010u * (i % 13u) : 1u));
+        written = snprintf(html + length, sizeof(html) - length,
+                           ".u%u{%s}", i, body);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    written = snprintf(html + length, sizeof(html) - length,
+        ".u1.u2{color:#abcdef}.u3 .u4{padding-top:9px}"
+        ".u5>.u6{margin-left:7px}.u7+.u8{word-spacing:6px}"
+        ".u9::before{content:'b';color:#123456}"
+        ".u10::after{content:'a'}.u11.u12::after{content:'c'}"
+        ".u13:has(.u14){background-color:#0f0f0f}"
+        ".u15{--tone:#00ff00}.u16:not(.u17){opacity:0.25}"
+        "div.u18{display:none}[data-k].u19{padding-left:3px}"
+        "</style><body>");
+    CHECK(written > 0);
+    length += (size_t) written;
+    uint32_t state = 20260929u;
+    unsigned depth = 0;
+    for (unsigned i = 0; i < UTILITY_ELEMENTS; i++) {
+        if (depth > 0 && utility_next(&state) % 3u == 0) {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+            depth--;
+        }
+        char classes[1024];
+        unsigned count = utility_next(&state) % 4u == 0
+            ? 1u + utility_next(&state) % 8u
+            : 30u + utility_next(&state) % 50u;
+        utility_class_list(&state, classes, sizeof(classes), count);
+        written = snprintf(html + length, sizeof(html) - length,
+                           "<div id=e%u %sclass='%s'>t%u", i,
+                           i % 5u == 0 ? "data-k " : "", classes, i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+        if (depth < 5 && utility_next(&state) % 2u == 0) {
+            depth++;
+        } else {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+        }
+    }
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, length, 19));
+    Stylesheet indexed = {0}, linear = {0};
+    CHECK(stylesheet_build(&indexed, &budget, &document, 480));
+    CHECK(setenv("TILEFINCH_DISABLE_STYLE_INDEX", "1", 1) == 0);
+    bool linear_built = stylesheet_build(&linear, &budget, &document, 480);
+    CHECK(unsetenv("TILEFINCH_DISABLE_STYLE_INDEX") == 0);
+    CHECK(linear_built);
+    /* The reference scans class lists directly, independent of the
+       class-token sets the indexed sheet keeps between resolutions. */
+    linear.class_tokens_refused = true;
+    lxb_dom_node_t *body = document_body_node(&document);
+    CHECK(body != NULL);
+    size_t compared = 0;
+    for (unsigned round = 0; round < 24; round++) {
+        lxb_dom_node_t *elements[UTILITY_ELEMENTS + 8];
+        size_t count = utility_elements(body, elements,
+                                        UTILITY_ELEMENTS + 8);
+        uint64_t fallbacks = indexed.rule_index_fallbacks;
+        uint64_t candidates = indexed.rule_index_candidates;
+        for (size_t i = 0; i < count; i++) {
+            ComputedStyle parent = {0};
+            ComputedStyle fast = style_for_node(&indexed, elements[i], NULL);
+            ComputedStyle slow = style_for_node(&linear, elements[i], NULL);
+            parent = fast;
+            if (!utility_styles_equal(&fast, &slow)) {
+                printf("utility round %u element %zu diverged\n", round, i);
+                CHECK(false);
+            }
+            for (PseudoElement pseudo = PSEUDO_BEFORE;
+                 pseudo <= PSEUDO_AFTER; pseudo++) {
+                ComputedStyle fast_pseudo = style_for_pseudo(
+                    &indexed, elements[i], pseudo, &parent);
+                ComputedStyle slow_pseudo = style_for_pseudo(
+                    &linear, elements[i], pseudo, &parent);
+                if (!utility_styles_equal(&fast_pseudo, &slow_pseudo)) {
+                    printf("utility round %u element %zu pseudo %d "
+                           "diverged\n", round, i, (int) pseudo);
+                    CHECK(false);
+                }
+            }
+            compared++;
+        }
+        /* Every element resolved through the index, none by the whole-
+           range scan, visiting a small share of the rules. */
+        CHECK(indexed.rule_index_fallbacks == fallbacks);
+        CHECK(indexed.rule_index_candidates - candidates
+              < (uint64_t) count * indexed.count / 2u);
+        /* Rewrite a few class lists: new tokens, same-length swaps. */
+        for (unsigned change = 0; change < 6; change++) {
+            lxb_dom_node_t *node = elements[1u + utility_next(&state)
+                                            % (count - 1u)];
+            size_t old_length = 0;
+            const lxb_char_t *old = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "class", 5, &old_length);
+            char classes[1024];
+            size_t new_length;
+            if (old != NULL && old_length < sizeof(classes)
+                && utility_next(&state) % 2u == 0) {
+                /* Same length and storage size: rotate one digit. */
+                memcpy(classes, old, old_length);
+                classes[old_length] = '\0';
+                char *digit = strpbrk(classes + utility_next(&state)
+                                      % (old_length == 0 ? 1 : old_length),
+                                      "0123456789");
+                if (digit != NULL) *digit = (char) ('0' + (*digit - '0' + 1) % 10);
+                new_length = old_length;
+                if (utility_next(&state) % 2u == 0) {
+                    /* The same storage with other text, as when freed
+                       attribute memory is reused: class-token sets kept
+                       from the resolution just before must not answer. */
+                    (void) style_for_node(&indexed, node, NULL);
+                    (void) style_for_node(&linear, node, NULL);
+                    memcpy((char *) old, classes, old_length);
+                    ComputedStyle fast = style_for_node(&indexed, node, NULL);
+                    ComputedStyle slow = style_for_node(&linear, node, NULL);
+                    if (!utility_styles_equal(&fast, &slow)) {
+                        printf("utility round %u rewritten element "
+                               "diverged\n", round);
+                        CHECK(false);
+                    }
+                    continue;
+                }
+            } else {
+                unsigned tokens = utility_next(&state) % 3u == 0
+                    ? 1u + utility_next(&state) % 6u
+                    : 30u + utility_next(&state) % 50u;
+                new_length = utility_class_list(&state, classes,
+                                                sizeof(classes), tokens);
+            }
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "class", 5,
+                (const lxb_char_t *) classes, new_length) != NULL);
+        }
+    }
+    CHECK(compared > 24u * 40u);
+    stylesheet_destroy(&linear);
+    stylesheet_destroy(&indexed);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Prepared query lists keep the rightmost compound's first attribute: an
+   element without it is rejected before the text matcher, and `[name]`
+   alone is answered by the attribute. Random selectors over a random tree
+   (HTML and SVG attributes, quoted values, escapes, functional arguments)
+   must agree with the unprepared matcher on every element. */
+static int test_query_attribute_keys_match_direct(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char *const names[] = {
+        "data-a", "data-b", "data-role", "title", "hidden", "name"
+    };
+    static const char *const values[] = {"x", "y", "X", "a b", ""};
+    static char html[32768];
+    size_t length = 0;
+    uint32_t state = 7160929u;
+    int written = snprintf(html, sizeof(html), "<!doctype html><body>");
+    CHECK(written > 0);
+    length = (size_t) written;
+    unsigned depth = 0;
+    for (unsigned i = 0; i < 90; i++) {
+        if (depth > 0 && utility_next(&state) % 3u == 0) {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+            depth--;
+        }
+        char attributes[256];
+        size_t used = 0;
+        attributes[0] = '\0';
+        for (unsigned a = 0; a < 6; a++) {
+            if (utility_next(&state) % 3u != 0) continue;
+            written = snprintf(attributes + used, sizeof(attributes) - used,
+                " %s='%s'", names[a],
+                values[utility_next(&state) % (sizeof(values)
+                                               / sizeof(values[0]))]);
+            if (written > 0 && (size_t) written < sizeof(attributes) - used)
+                used += (size_t) written;
+        }
+        if (i % 17u == 5u) {
+            written = snprintf(html + length, sizeof(html) - length,
+                "<svg viewBox='0 0 1 1'%s><rect data-a=x></rect></svg>",
+                attributes);
+        } else {
+            written = snprintf(html + length, sizeof(html) - length,
+                               "<div id=q%u%s>t", i, attributes);
+            if (depth < 5 && utility_next(&state) % 2u == 0) depth++;
+            else {
+                CHECK(written > 0);
+                length += (size_t) written;
+                written = snprintf(html + length, sizeof(html) - length,
+                                   "</div>");
+            }
+        }
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, length, 23));
+    static const char *const selectors[] = {
+        "[data-a]", "[DATA-A]", "[ data-a ]", "[data-a=x]", "[data-a='x']",
+        "[data-a=\"X\" i]", "[data-a~=a]", "[title^=a]", "[data\\-a]",
+        "div[data-b]", "[data-a][data-b]", "[data-a] [data-b]",
+        "[data-a] > [data-role]", "#q3 [data-a]", ":not([data-a])",
+        ":is([data-a],[data-b])", "[data-a]:not([hidden])", "[viewBox]",
+        "[viewbox]", "svg[viewBox] rect", "[data-a], [name]", "[*|data-a]",
+        "[data-a|x]", "[data-missing]", "[hidden] ~ [data-b]",
+        "div:has([data-role]) [title]", "[name=''], .none", "[x-y_z]",
+        "rect[data-a=x]", "[data-role='a b'] + div[data-a]",
+        "div[data-b=\"]\"]", "[data-a", "div:is(.c) [data-b]",
+        "[data-role] :is([data-a], [data-b=x])", ":where([title^=a], [name])",
+        ":is([data-a], .c)", ":is([DATA-A],[data-b])",
+        "div:is( [data-a] , [name] )", ":is([data-a], :is([data-b]))",
+        ":not(:is([data-a]))", ":is(div [data-a], [data-b])",
+        ":is([data-a]):not([data-b])"
+    };
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *elements[256];
+    size_t count = utility_elements(root, elements, 256);
+    CHECK(count > 60u);
+    size_t matched = 0;
+    for (size_t p = 0; p < sizeof(selectors) / sizeof(selectors[0]); p++) {
+        StyleQuerySelectorList list;
+        size_t selector_length = strlen(selectors[p]);
+        CHECK(style_query_selector_list_prepare(&list, selectors[p],
+                                                selector_length));
+        for (size_t i = 0; i < count; i++) {
+            bool direct = false;
+            for (size_t item = 0; item < list.count; item++) {
+                direct = direct || style_selector_matches_scoped(
+                    elements[i], list.items[item].text,
+                    list.items[item].length, NULL);
+            }
+            bool prepared = style_query_selector_list_matches(
+                &list, elements[i], NULL);
+            if (direct != prepared) {
+                fprintf(stderr, "query attribute key mismatch: %s\n",
+                        selectors[p]);
+                CHECK(false);
+            }
+            matched += prepared ? 1u : 0u;
+        }
+    }
+    CHECK(matched > 100u);
+    /* Which attribute each prepared selector keeps. */
+    struct { const char *selector, *attribute; bool complete; } keys[] = {
+        {"[data-a]", "data-a", true}, {"[DATA-A]", "data-a", true},
+        {"[ data-a ]", "data-a", false}, {"[data-a=x]", "data-a", false},
+        {"div[data-b]", "data-b", false},
+        {"[data-a] [data-b]", "data-b", false},
+        {"[viewBox]", "viewbox", true}, {"[data\\-a]", "", false},
+        {":not([data-a])", "", false}, {":is([data-a])", "", false},
+        {"[*|data-a]", "", false}, {"[data-a|x]", "data-a", false},
+        {"div", "", false}
+    };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        StyleQuerySelectorList list;
+        CHECK(style_query_selector_list_prepare(
+            &list, keys[k].selector, strlen(keys[k].selector)));
+        CHECK(list.count == 1u);
+        CHECK(list.items[0].attribute_length == strlen(keys[k].attribute)
+              && memcmp(list.items[0].attribute, keys[k].attribute,
+                        list.items[0].attribute_length) == 0
+              && list.items[0].complete_attribute == keys[k].complete);
+    }
+    /* Which attributes a rightmost :is()/:where() without a top-level test
+       requires one of: every argument's own rightmost attribute, as the
+       text spells it in lower case; otherwise no filter. */
+    struct { const char *selector; const char *names[4]; } any[] = {
+        {"[data-message-role=\"assistant\"] :is([data-a], "
+         "[data-b-c], [data-d=x])", {"data-a", "data-b-c", "data-d"}},
+        {":where([title^=a], [name])", {"title", "name"}},
+        {"div:is( [data-a] , .x [name] )", {"data-a", "name"}},
+        {":is([data-a], .c)", {NULL}},
+        {":is([DATA-A],[data-b])", {NULL}},
+        {":not([data-a], [data-b])", {NULL}},
+        {":is([data-a], :is([data-b]))", {NULL}},
+        {"[data-a]:is([data-b])", {NULL}},
+        {":is([a],[b],[c],[d],[e])", {NULL}},
+        {":is([data\\-a], [b])", {NULL}},
+    };
+    for (size_t k = 0; k < sizeof(any) / sizeof(any[0]); k++) {
+        StyleQuerySelectorList list;
+        CHECK(style_query_selector_list_prepare(
+            &list, any[k].selector, strlen(any[k].selector)));
+        CHECK(list.count == 1u);
+        const StyleQuerySelector *item = &list.items[0];
+        size_t expected = 0;
+        while (expected < 4 && any[k].names[expected] != NULL) expected++;
+        if (item->any_attribute_count != expected) {
+            fprintf(stderr, "any-attribute count %u for %s\n",
+                    (unsigned) item->any_attribute_count, any[k].selector);
+            CHECK(false);
+        }
+        for (size_t a = 0; a < expected; a++) {
+            CHECK(item->any_attribute_length[a]
+                      == strlen(any[k].names[a])
+                  && memcmp(item->text + item->any_attribute_offset[a],
+                            any[k].names[a],
+                            item->any_attribute_length[a]) == 0);
+        }
+    }
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A hostile selector nests :is() as deep as a prepared selector may be long
+   (64 KiB). Preparing it must neither recurse per level nor rescan the
+   tail per level: it runs on a 256 KiB stack (a PSP thread's order of
+   size), where one frame per nesting level overflowed. */
+typedef struct {
+    char *text;
+    size_t length;
+    bool prepared;
+    StyleQuerySelectorList list;
+} DeepSelectorJob;
+
+static void *prepare_deep_selector(void *argument)
+{
+    DeepSelectorJob *job = argument;
+    job->prepared = style_query_selector_list_prepare(&job->list, job->text,
+                                                      job->length);
+    return NULL;
+}
+
+static int prepare_on_small_stack(DeepSelectorJob *job)
+{
+    pthread_attr_t attributes;
+    pthread_t thread;
+    CHECK(pthread_attr_init(&attributes) == 0);
+    CHECK(pthread_attr_setstacksize(&attributes, 256u * 1024u) == 0);
+    CHECK(pthread_create(&thread, &attributes, prepare_deep_selector, job)
+          == 0);
+    CHECK(pthread_join(thread, NULL) == 0);
+    pthread_attr_destroy(&attributes);
+    return 0;
+}
+
+static int test_query_deeply_nested_is_prepares_flat(void)
+{
+    static const char open[] = ":is(";
+    const size_t levels = 13000u;
+    size_t capacity = levels * 6u + 64u;
+    char *text = malloc(capacity);
+    CHECK(text != NULL);
+    size_t length = 0;
+    for (size_t i = 0; i < levels; i++) {
+        memcpy(text + length, open, 4);
+        length += 4;
+    }
+    memcpy(text + length, "[data-a]", 8);
+    length += 8;
+    for (size_t i = 0; i < levels; i++) text[length++] = ')';
+    CHECK(length <= UINT16_MAX);
+    DeepSelectorJob job = {.text = text, .length = length};
+    CHECK(prepare_on_small_stack(&job) == 0);
+    CHECK(job.prepared && job.list.count == 1u);
+    /* A nested argument keeps no filter, however deep. */
+    CHECK(job.list.items[0].any_attribute_count == 0);
+    CHECK(job.list.items[0].attribute_length == 0);
+    /* Wide rather than deep: many arguments, each an :is() of one
+       attribute, still yields no filter (and stays linear). */
+    length = 0;
+    memcpy(text, ":is(", 4);
+    length = 4;
+    for (size_t i = 0; i < 4000u; i++) {
+        memcpy(text + length, i == 0 ? ":is([a])" : ",:is([a])",
+               i == 0 ? 8u : 9u);
+        length += i == 0 ? 8u : 9u;
+    }
+    text[length++] = ')';
+    job = (DeepSelectorJob) {.text = text, .length = length};
+    CHECK(prepare_on_small_stack(&job) == 0);
+    CHECK(job.prepared && job.list.count == 1u
+          && job.list.items[0].any_attribute_count == 0);
+    free(text);
+    return 0;
+}
+
+static int test_class_token_byte_boundaries(void)
+{
+    /* Explicit lengths include embedded NUL and non-ASCII bytes. Pin both
+       sides of a token, prefixes/suffixes, and the uncached/cache parity. */
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    Stylesheet sheet = {0};
+    StyleResolveScratch scratch = {0};
+    sheet.budget = &budget;
+    sheet.resolve_scratch = &scratch;
+    scratch.class_tokens_depth = 1;
+    char storage[68];
+    for (size_t alignment = 0; alignment < 4; alignment++) {
+        char *classes = storage + alignment;
+        for (size_t boundary = 52; boundary < 56; boundary++) {
+            memset(classes, 'x', 64);
+            for (unsigned byte = 0; byte < 256; byte++) {
+                classes[boundary] = (char) byte;
+                memcpy(classes + boundary + 1, "wanted", 6);
+                classes[boundary + 7] = (char) byte;
+                bool expected = isspace((unsigned char) byte) != 0;
+                CHECK(class_contains_length(classes, 64, "wanted", 6)
+                      == expected);
+                CHECK(!class_contains_length(classes, 64, "want", 4));
+                CHECK(!class_contains_length(classes, 64, "anted", 5));
+                StyleMatchSubject subject = {0};
+                subject.classes = classes;
+                subject.classes_length = 64;
+                if (sheet.class_tokens != NULL)
+                    for (size_t i = 0; i < STYLE_CLASS_TOKEN_SETS; i++)
+                        sheet.class_tokens->sets[i].source = NULL;
+                CHECK(style_subject_has_class(&sheet, &subject, "wanted", 6)
+                      == expected);
+            }
+        }
+    }
+    CHECK(class_contains_length("wanted", 6, "wanted", 6));
+    CHECK(!class_contains_length("wanted", 5, "wanted", 6));
+    CHECK(!class_contains_length("wanted other", 12, "wanted other", 12));
+    CHECK(!class_contains_length("", 0, "wanted", 6));
+    budget_free(&budget, sheet.class_tokens);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_full_selector_class_token_reuse(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] =
+        "<!doctype html><style>.wanted.other{color:red}"
+        ":is(.missing,.wanted).other{background-color:blue}</style>"
+        "<p id=target class='filler-one filler-two filler-three filler-four "
+        "filler-five filler-six filler-seven filler-eight wanted other'>x</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    stylesheet_prepare_selector_program(&sheet);
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "target");
+    const StyleRule *rule = find_rule(&sheet, ".wanted.other");
+    CHECK(node != NULL && rule != NULL && sheet.selector_program_ready
+          && sheet.resolve_scratch != NULL && sheet.class_tokens == NULL);
+    /* Matchers share the existing immutable-cascade scope. The candidate
+       filter is deliberately bypassed, so it cannot populate the cache on
+       behalf of an unoptimized full matcher. */
+    sheet.resolve_scratch->class_tokens_depth = 1;
+    uint64_t started = tilefinch_platform_monotonic_time_ns();
+    for (unsigned i = 0; i < 20000; i++)
+        CHECK(style_rule_selector_matches(&sheet, (size_t) (rule - sheet.rules), node));
+    printf("compiled class matching: us=%llu\n", (unsigned long long)
+           ((tilefinch_platform_monotonic_time_ns() - started) / 1000u));
+    CHECK(sheet.class_tokens != NULL);
+    for (size_t i = 0; i < STYLE_CLASS_TOKEN_SETS; i++)
+        sheet.class_tokens->sets[i].source = NULL;
+    static const char functional[] = ":is(.missing,.wanted).other";
+    CHECK(style_selector_matches_profiled(&sheet, node, functional,
+                                          sizeof(functional) - 1));
+    bool populated = false;
+    for (size_t i = 0; i < STYLE_CLASS_TOKEN_SETS; i++)
+        populated |= sheet.class_tokens->sets[i].source != NULL;
+    CHECK(populated);
+    sheet.resolve_scratch->class_tokens_depth = 0;
+    /* No cached text identity may survive a mutation between cascades. */
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+          (const lxb_char_t *) "class", 5,
+          (const lxb_char_t *) "other", 5) != NULL);
+    ComputedStyle style = style_for_node(&sheet, node, NULL);
+    CHECK(style.color != 0xff0000);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--retained-handoff-only") == 0)
@@ -1069,7 +2156,23 @@ int main(int argc, char **argv)
         return test_quoted_pseudo_element_punctuation();
     if (argc == 2 && strcmp(argv[1], "--retained-focus-only") == 0)
         return test_retained_focus_descendants();
+    if (argc == 2 && strcmp(argv[1], "--declaration-footprint-only") == 0)
+        return test_unmatched_declaration_footprint();
+    if (argc == 2 && strcmp(argv[1], "--custom-footprint-only") == 0)
+        return test_custom_rule_footprint();
+    if (argc == 2 && strcmp(argv[1], "--attribute-names-only") == 0)
+        return test_selector_attribute_names();
+    if (argc == 2 && strcmp(argv[1], "--attribute-bench-only") == 0)
+        return benchmark_selector_attribute_names();
+    CHECK(test_selector_attribute_names() == 0);
+    CHECK(benchmark_selector_attribute_names() == 0);
     CHECK(test_retained_range_cache_handoff() == 0);
+    CHECK(test_class_token_byte_boundaries() == 0);
+    CHECK(test_retained_properties_share_class_tokens() == 0);
+    CHECK(test_utility_class_candidates_match_linear() == 0);
+    CHECK(test_query_attribute_keys_match_direct() == 0);
+    CHECK(test_query_deeply_nested_is_prepares_flat() == 0);
+    CHECK(test_full_selector_class_token_reuse() == 0);
     CHECK(test_functional_selector_keys() == 0);
     CHECK(test_deferred_font_basis() == 0);
     CHECK(test_retained_retirement_probe_holes() == 0);
@@ -1086,6 +2189,9 @@ int main(int argc, char **argv)
     CHECK(test_pseudo_absence_proof() == 0);
     CHECK(test_deferred_expansion_reuse() == 0);
     CHECK(test_head_script_dependency_cache() == 0);
+    CHECK(test_unmatched_declaration_footprint() == 0);
+    CHECK(test_custom_rule_footprint() == 0);
+    CHECK(test_svg_raster_token_gate() == 0);
     Budget budget;
     budget_init(&budget, 8u * MIB);
     budget_install_lexbor(&budget);

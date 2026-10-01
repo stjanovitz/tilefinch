@@ -1,0 +1,31 @@
+# Measurement scenario, not golden-gated: the youtube-bbb performance journey
+# (benchmarks/perf-journeys.tsv). It starts on the provider's results for
+# "big buck bunny", opens the first result's details control (the watch
+# document, without playback), pages through the watch page, returns with
+# Circle and pages the restored list. Read tilefinch-load-experience for both
+# documents, tilefinch-scroll-feedback, and the exit cadence. Playback itself
+# is a device measurement: PPSSPP stops at the firmware decoder boundary.
+wait 1
+mark results
+tap right
+wait 1
+mark details
+tap cross
+wait 1
+mark watch
+tap rtrigger
+wait-live 20
+tap rtrigger
+wait-live 20
+tap rtrigger
+wait 1
+mark watch-scrolled
+tap circle
+wait 1
+mark returned
+tap rtrigger
+wait-live 20
+tap rtrigger
+wait 1
+mark settled
+end

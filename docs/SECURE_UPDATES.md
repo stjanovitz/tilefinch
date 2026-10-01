@@ -289,6 +289,8 @@ PSP/GAME/TILEFINCH/
     glyph-emoji-color/
     glyph-cyrillic/
     glyph-latin-extended/
+    glyph-arabic/
+    glyph-hebrew/
       active/
       previous/
   slot-a/
@@ -297,6 +299,8 @@ PSP/GAME/TILEFINCH/
     fonts/
     roots.pem
     boot-defaults.cfg
+    tilefinch-wasm.prx
+    tilefinch-voice.prx
   slot-b/
     ...
 ```
@@ -347,15 +351,15 @@ installer duplicates immutable assets between slots.
 Content-addressed sharing can come later, after rollback and garbage
 collection are proven.
 
-This design assumes `sceKernelLoadExec()` can hand off between homebrew EBOOTs
-under the custom firmware already required to run Tilefinch. Device validation
+This design assumes the custom firmware already required to run Tilefinch can
+hand off between homebrew EBOOTs through the calls above. Device validation
 must cover the supported CFW set. If a firmware refuses that handoff, its safe
 fallback is a documented manual-copy update, not a weaker in-place installer.
 
 ## Cryptographic trust
 
 P-256 ECDSA over SHA-256 is the smallest practical choice for this build. The
-PSP image already links the required mbed TLS 2.28.10 P-256, ECDSA verification,
+PSP image already links the required mbed TLS 3.6.7 P-256, ECDSA verification,
 and streaming SHA-256 routines for HTTPS, so the updater does not need a
 second cryptographic library.
 
@@ -549,8 +553,8 @@ than ZIP or TAR:
 - at most 128 bytes per relative path;
 - no symlinks, absolute paths, backslashes, empty components, `.` or `..`;
 - no duplicate or prefix-colliding paths;
-- an allowlist of EBOOT, fonts, TLS roots, and signed boot
-  defaults.
+- an allowlist of EBOOT, fonts, TLS roots, signed boot defaults, and the
+  slot's WebAssembly and voice PRX modules.
 
 The whole-package size and digest are signed. The download pass verifies both
 while retaining the bounded package table in RAM. The installer can therefore
@@ -689,10 +693,10 @@ An interrupted first implementation simply restarts the download. A future
 Range resume must re-hash the existing prefix and require an exact `206
 Content-Range`; it cannot trust saved hash state blindly.
 
-The current source repository is private. A PSP must not contain a personal
-access token. In-app distribution therefore requires either making releases
-public here or publishing signed artifacts in a separate public,
-release-only repository whose identity is compiled into Tilefinch.
+A PSP must not contain a personal access token. In-app distribution therefore
+requires public release assets: the GitHub owner and repository they are
+fetched from are compiled into Tilefinch (`TILEFINCH_UPDATE_REPOSITORY_OWNER`
+and `TILEFINCH_UPDATE_REPOSITORY_NAME`), and the client sends no credentials.
 
 ## Power-loss-safe A/B transaction
 
@@ -931,6 +935,6 @@ hardware panel recorded in [Release process](RELEASE_PROCESS.md).
 - [GitHub release asset links](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)
 - [GitHub artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
 - [The Update Framework specification](https://theupdateframework.github.io/specification/latest/)
-- [Mbed TLS 2.28 ECDSA API](https://github.com/Mbed-TLS/mbedtls/blob/mbedtls-2.28.10/include/mbedtls/ecdsa.h)
-- [Mbed TLS 2.28 SHA-256 API](https://github.com/Mbed-TLS/mbedtls/blob/mbedtls-2.28.10/include/mbedtls/sha256.h)
+- [Mbed TLS 3.6 ECDSA API](https://github.com/Mbed-TLS/mbedtls/blob/mbedtls-3.6.7/include/mbedtls/ecdsa.h)
+- [Mbed TLS 3.6 SHA-256 API](https://github.com/Mbed-TLS/mbedtls/blob/mbedtls-3.6.7/include/mbedtls/sha256.h)
 - [PSPSDK LoadExec API](https://pspdev.github.io/pspsdk/group__LoadExec.html)

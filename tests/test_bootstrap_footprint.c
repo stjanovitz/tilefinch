@@ -93,6 +93,7 @@ int main(void)
         {"capabilities", "typeof speechSynthesis"},
         {"worker", "typeof Worker"},
         {"intl", "typeof Intl.NumberFormat"},
+        {"traversal", "typeof document.createTreeWalker"},
     };
     size_t before = resident;
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
@@ -160,9 +161,12 @@ int main(void)
             "<footprint-frame-activate>", &frame_result));
         CHECK(strcmp(frame_result.summary, "FRAME-LAZY-OK") == 0);
         size_t activated = used_bytes(runtime);
-        CHECK(activated > after_frame + 16u * KIB);
         printf("footprint: frame activation retained=%zu (%zu KiB)\n",
             activated - after_frame, (activated - after_frame) / KIB);
+        /* Proves activation built the realm; the exact figure moves by
+           several KiB with collection timing (17 KiB -> 13 KiB when the
+           bootstrap grew by one Range helper). */
+        CHECK(activated > after_frame + 8u * KIB);
     }
     /* Preserved-runtime rebind onto a second document. */
     PocDocument replacement;

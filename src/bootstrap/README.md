@@ -44,8 +44,9 @@ The current files intentionally retain the bootstrap's established logical
 boundaries. Moving APIs between modules or changing runtime order should be a
 separate, behavior-reviewed change.
 
-Canvas, IndexedDB, CSS motion, bounded Streams, and bounded capability probes
-are ROM-backed on-demand modules. The capability module exposes the Web Speech
+Canvas, IndexedDB, CSS motion, bounded Streams, bounded capability probes,
+and DOM traversal (NodeFilter, TreeWalker, NodeIterator and the Document
+factories for them) are ROM-backed on-demand modules. The capability module exposes the Web Speech
 shape with an empty engine and a Media Source shape that advertises no
 supported byte-stream types; it does not pretend the PSP implements either
 pipeline. Their standards-visible globals and Canvas prototype entries begin

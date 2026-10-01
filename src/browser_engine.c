@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 
 #define KIB (1024u)
@@ -71,9 +72,15 @@ static bool browser_preview_view_live(BrowserPreviewView view)
         || view == BROWSER_PREVIEW_VIEW_FILLING;
 }
 
+/* Largest url-encoded body a script form submission may send. */
+#define BROWSER_ENGINE_SCRIPT_FORM_BODY_LIMIT (64u * 1024u)
+
 struct BrowserEngine {
     BrowserConfig config;
     Budget budget;
+    /* The last script form submission's body when it outgrew
+       ControllerAction.body; the action points here. */
+    char *script_form_body;
     BrowserSession session;
     ContentBlocker *content_blocker;
     NavigationSession navigation;
@@ -120,10 +127,21 @@ struct BrowserEngine {
     BrowserEngineState state;
     bool session_ready;
     bool navigation_ready;
+    /* A script navigation taken for the frontend keeps its referer and
+       user activation for the navigation job begun next. */
+    bool script_navigation_attributed;
     bool fonts_ready;
     uint64_t startup_deferral_started_us;
     const void *startup_deferral_runtime;
     uint64_t startup_deferral_generation;
+    /* A provisional page's layout completion is running: its cooperative
+       checkpoints may page and paint the committed page (see
+       browser_engine_completion_scroll_page). */
+    bool layout_completion_running;
+    /* A completion-time scroll left tiles to fill; one happened at all
+       (the frame loop then repaints, whatever the completion's outcome). */
+    bool completion_frame_pending;
+    bool completion_scrolled;
     bool font_publication_guarded;
     FontSetFaceMask font_requested_faces;
     FontSetFaceMask font_failed_faces;
@@ -134,6 +152,11 @@ struct BrowserEngine {
     bool candidate_shell_prepared;
     bool replacement_frame_frozen;
     bool forced_dark;
+    /* Whether the committed page declares its own dark rendering, cached
+       per navigation generation (see browser_engine_page_declares_dark). */
+    bool page_dark_valid;
+    bool page_dark;
+    uint64_t page_dark_generation;
     bool youtube_compact_results;
     bool autofocus_pending;
     size_t render_relayout_generation;
@@ -294,6 +317,12 @@ void browser_device_profile_psp3000(BrowserDeviceProfile *profile)
     };
 }
 
+static size_t browser_engine_reclaim_module_bytecode(void *opaque,
+                                                     size_t needed_bytes)
+{
+    return browser_session_module_bytecode_reclaim(opaque, needed_bytes);
+}
+
 void browser_config_init(BrowserConfig *config,
                          const BrowserDeviceProfile *profile)
 {
@@ -307,6 +336,7 @@ void browser_config_init(BrowserConfig *config,
         .memory_limit = selected.recommended_memory_limit,
         .history_capacity = 16,
         .session_cache_limit = 1u * MIB,
+        .module_bytecode_cache_limit = BROWSER_MODULE_BYTECODE_CACHE_BYTES,
         .maximum_document_bytes = 8u * MIB,
         .navigation_timeout_ms = 20000,
         .navigation_replacement_mode =
@@ -380,6 +410,9 @@ bool browser_config_apply_psp_memory_profile(
         BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE;
     config->history_capacity = strict ? 8 : 16;
     config->session_cache_limit = strict ? 512u * KIB : 1u * MIB;
+    config->module_bytecode_cache_limit = strict
+        ? BROWSER_MODULE_BYTECODE_CACHE_STRICT_BYTES
+        : BROWSER_MODULE_BYTECODE_CACHE_BYTES;
     config->tile_capacity = config->device.maximum_tile_capacity
             < BROWSER_PAINT_AHEAD_TILE_CAPACITY
         ? config->device.maximum_tile_capacity
@@ -648,6 +681,9 @@ bool browser_config_validate(const BrowserConfig *config,
     CONFIG_REQUIRE(config->session_cache_limit != 0
                        && config->session_cache_limit < config->memory_limit,
                    "session cache must fit inside the content budget");
+    CONFIG_REQUIRE(config->module_bytecode_cache_limit
+                       < config->memory_limit,
+                   "module bytecode cache must fit inside the content budget");
     CONFIG_REQUIRE(config->maximum_document_bytes != 0
                        && config->navigation_timeout_ms > 0,
                    "navigation limits must be nonzero");
@@ -1151,6 +1187,57 @@ static TileCache *browser_engine_provisional_front(BrowserEngine *engine)
         tile_cache_set_fast_text_raster(front, true);
     }
     return front;
+}
+
+/* Keep a focus indicator inside the padding boxes of the ancestors that
+   clip its control (overflow hidden/clip), as the control itself is.
+   chatgpt.com's composer textarea overflows its rounded form, which clips
+   it; the indicator ran past the pill to the screen edge. A control clipped
+   away entirely keeps its unclipped indicator so focus is never invisible. */
+static void browser_engine_clip_focus_rect(
+    const LayoutDocument *layout, const lxb_dom_node_t *node,
+    int *x, int *y, int *width, int *height)
+{
+    if (layout == NULL || node == NULL) return;
+    int left = *x, top = *y;
+    int right = *x + *width, bottom = *y + *height;
+    size_t steps = 0;
+    for (const lxb_dom_node_t *at = node->parent;
+         at != NULL && steps < 256u; at = at->parent, steps++) {
+        const LayoutNodeBox *box = layout_box_for_node(layout, at);
+        if (box == NULL || (!box->clips_x && !box->clips_y)) continue;
+        if (box->clips_x) {
+            int clip_left = box->x + box->clip_inset_left;
+            int clip_right = clip_left + box->client_width;
+            if (left < clip_left) left = clip_left;
+            if (right > clip_right) right = clip_right;
+        }
+        if (box->clips_y) {
+            int clip_top = box->y + box->clip_inset_top;
+            int clip_bottom = clip_top + box->client_height;
+            if (top < clip_top) top = clip_top;
+            if (bottom > clip_bottom) bottom = clip_bottom;
+        }
+    }
+    if (right <= left || bottom <= top) return;
+    *x = left;
+    *y = top;
+    *width = right - left;
+    *height = bottom - top;
+}
+
+bool browser_engine_focus_indicator_rect(const BrowserEngine *engine,
+                                         int *x, int *y,
+                                         int *width, int *height)
+{
+    if (engine == NULL || x == NULL || y == NULL || width == NULL
+        || height == NULL
+        || !controller_focused_rect(&engine->controller, x, y,
+                                    width, height)) return false;
+    browser_engine_clip_focus_rect(
+        &engine->navigation.page.layout,
+        controller_focused_node(&engine->controller), x, y, width, height);
+    return true;
 }
 
 /* A node's first link region, else its first control region, in CSS page
@@ -1701,6 +1788,17 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
                        "browser session initialization failed");
         goto failed;
     }
+    browser_session_module_bytecode_set_limit(
+        &engine->session, config->module_bytecode_cache_limit);
+    browser_session_module_bytecode_set_disk(
+        &engine->session, config->module_bytecode_disk_dir,
+        config->module_bytecode_disk_write);
+    /* Module bytecode lives in room the page is not using. It is released
+       before the page Budget refuses anything, so it can speed up a revisit
+       but never be the reason an allocation fails. */
+    budget_set_reclaim_hook(&engine->budget,
+                            browser_engine_reclaim_module_bytecode,
+                            &engine->session);
     engine->session_ready = true;
     BROWSER_ENGINE_CREATE_MARK(session_ready_us);
     engine->content_blocker = content_blocker_create(&engine->budget);
@@ -1824,6 +1922,8 @@ bool browser_engine_shutdown(BrowserEngine *engine)
             && budget_active_allocations(&engine->budget, NULL) == 0;
     }
     browser_engine_cancel_navigation(engine, "browser engine shutdown");
+    budget_free(&engine->budget, engine->script_form_body);
+    engine->script_form_body = NULL;
     /* A page cancellation only invalidates the JPEG completion token; it
        deliberately never waits on entropy decoding. Engine teardown is the
        ownership boundary that must join the worker before destroying the
@@ -1857,6 +1957,7 @@ bool browser_engine_shutdown(BrowserEngine *engine)
     if (engine->session_ready) engine->session.content_blocker = NULL;
     content_blocker_destroy(engine->content_blocker);
     engine->content_blocker = NULL;
+    budget_set_reclaim_hook(&engine->budget, NULL, NULL);
     if (engine->session_ready) browser_session_destroy(&engine->session);
     engine->session_ready = false;
     budget_free(&engine->budget, engine->framebuffer);
@@ -2133,11 +2234,92 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
     return true;
 }
 
+static bool element_named(const lxb_dom_node_t *node, const char *name)
+{
+    size_t length = 0;
+    const char *element = node == NULL || node->type
+        != LXB_DOM_NODE_TYPE_ELEMENT
+        ? NULL : document_element_name((lxb_dom_node_t *) node, &length);
+    return element != NULL && length == strlen(name)
+        && strncasecmp(element, name, length) == 0;
+}
+
+static bool color_scheme_lists_dark(const char *value, size_t length)
+{
+    for (size_t at = 0; at + 4u <= length; at++) {
+        if (strncasecmp(value + at, "dark", 4) == 0
+            && (at == 0 || isspace((unsigned char) value[at - 1])
+                || value[at - 1] == ',')
+            && (at + 4u == length
+                || isspace((unsigned char) value[at + 4u])
+                || value[at + 4u] == ',')) return true;
+    }
+    return false;
+}
+
+/* A page that declares a dark rendering of its own (<meta name=
+   "color-scheme"> or a root color-scheme listing dark) already honours
+   night mode through prefers-color-scheme; the forced-dark pixel transform
+   would only fight it (chatgpt.com's logo and menu icon, inline SVG, stayed
+   black on its dark surface). Cached per committed navigation. */
+static bool browser_engine_page_declares_dark(BrowserEngine *engine)
+{
+    NavigationSession *navigation = &engine->navigation;
+    if (!navigation->page.loaded || navigation->page.document.html == NULL)
+        return false;
+    if (engine->page_dark_valid
+        && engine->page_dark_generation == navigation->generation)
+        return engine->page_dark;
+    bool declares = false;
+    lxb_dom_node_t *root = NULL;
+    for (lxb_dom_node_t *child = lxb_dom_interface_node(
+             navigation->page.document.html)->first_child;
+         child != NULL; child = child->next) {
+        if (element_named(child, "html")) {
+            root = child;
+            break;
+        }
+    }
+    if (root == NULL) return false;
+    char value[96];
+    if (style_retained_property_value(
+            &navigation->page.stylesheet, root, "color-scheme",
+            sizeof("color-scheme") - 1u, value, sizeof(value))
+        && color_scheme_lists_dark(value, strlen(value))) declares = true;
+    size_t visited = 0;
+    for (lxb_dom_node_t *section = root->first_child;
+         !declares && section != NULL && visited < 256u;
+         section = section->next, visited++) {
+        if (!element_named(section, "head")) continue;
+        for (lxb_dom_node_t *child = section->first_child;
+             !declares && child != NULL && visited < 256u;
+             child = child->next, visited++) {
+            if (!element_named(child, "meta")) continue;
+            size_t name_length = 0, content_length = 0;
+            const char *name = document_attribute(child, "name", &name_length);
+            const char *content = document_attribute(
+                child, "content", &content_length);
+            declares = name != NULL && content != NULL
+                && name_length == sizeof("color-scheme") - 1u
+                && strncasecmp(name, "color-scheme", name_length) == 0
+                && color_scheme_lists_dark(content, content_length);
+        }
+    }
+    engine->page_dark = declares;
+    engine->page_dark_generation = navigation->generation;
+    engine->page_dark_valid = true;
+    return declares;
+}
+
 bool browser_engine_set_forced_dark(BrowserEngine *engine, bool enabled)
 {
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) {
         return false;
     }
+    /* Night mode is also the reader's colour-scheme preference: sites with
+       their own dark theme select it through prefers-color-scheme. It takes
+       effect as stylesheets are next built. */
+    stylesheet_set_prefers_dark_color_scheme(enabled);
     if (engine->forced_dark == enabled) return true;
     engine->forced_dark = enabled;
     /*
@@ -2746,6 +2928,22 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
     return work->status;
 }
 
+/* A transactional navigation keeps the incumbent realm alive until the
+   candidate commits, so a failure can restore it. A large application realm
+   and its successor don't fit the PSP ceiling together: chatgpt.com's
+   ~10 MiB home realm starved its conversation page, whose modules were
+   refused. Retire a large incumbent realm when a navigation begins; a failed
+   navigation then restores the page without script. */
+#define BROWSER_ENGINE_RETIRE_INCUMBENT_REALM_BYTES (4u * 1024u * 1024u)
+
+static void browser_engine_retire_large_incumbent_realm(BrowserEngine *engine)
+{
+    if (engine->navigation.page.runtime != NULL
+        && script_runtime_heap_used(engine->navigation.page.runtime)
+               >= BROWSER_ENGINE_RETIRE_INCUMBENT_REALM_BYTES)
+        navigation_retire_current_page_scripts(&engine->navigation);
+}
+
 static bool browser_engine_begin_navigation_request(
     BrowserEngine *engine, const char *url, const char *method,
     const char *body, size_t body_length, const char *content_type,
@@ -2781,6 +2979,7 @@ static bool browser_engine_begin_navigation_request(
        script fetches from the page whose link was just activated. */
     (void) navigation_cancel_network_work(
         &engine->navigation, "superseded by a new navigation");
+    browser_engine_retire_large_incumbent_realm(engine);
     /* A candidate navigation keeps the incumbent page alive. End any gesture
        against that page before input is suppressed, so a release after a
        cancelled navigation cannot turn into a stale click. */
@@ -2884,12 +3083,113 @@ static bool browser_engine_begin_navigation_request(
     return true;
 }
 
+void browser_engine_set_defer_script_navigation(BrowserEngine *engine,
+                                                bool defer)
+{
+    if (engine != NULL) engine->navigation.defer_script_navigation = defer;
+}
+
+bool browser_engine_take_script_navigation(BrowserEngine *engine,
+                                           char *url, size_t capacity,
+                                           bool *record_history)
+{
+    if (engine == NULL
+        || !navigation_take_script_navigation(
+               &engine->navigation, url, capacity, record_history))
+        return false;
+    engine->script_navigation_attributed = true;
+    return true;
+}
+
+bool browser_engine_capture_script_navigation_attribution(
+    const BrowserEngine *engine, BrowserScriptNavigationAttribution *out)
+{
+    if (engine == NULL || out == NULL
+        || !engine->script_navigation_attributed
+        || engine->navigation.pending_navigation_referer[0] == '\0')
+        return false;
+    snprintf(out->initiator_url, sizeof(out->initiator_url), "%s",
+             engine->navigation.pending_navigation_referer);
+    out->user_activated =
+        engine->navigation.pending_navigation_user_activated;
+    return true;
+}
+
+void browser_engine_restore_script_navigation_attribution(
+    BrowserEngine *engine, const BrowserScriptNavigationAttribution *attribution)
+{
+    if (engine == NULL || attribution == NULL
+        || attribution->initiator_url[0] == '\0') return;
+    snprintf(engine->navigation.pending_navigation_referer,
+             sizeof(engine->navigation.pending_navigation_referer), "%s",
+             attribution->initiator_url);
+    engine->navigation.pending_navigation_user_activated =
+        attribution->user_activated;
+    engine->script_navigation_attributed = true;
+}
+
+bool browser_engine_take_script_form_submission(BrowserEngine *engine,
+                                               ControllerAction *action)
+{
+    if (engine == NULL || action == NULL
+        || !engine->navigation.defer_script_navigation
+        || !engine->navigation.page.loaded
+        || engine->navigation.page.runtime == NULL) return false;
+    lxb_dom_node_t *form = NULL, *submitter = NULL;
+    char *body = NULL;
+    size_t body_length = 0;
+    bool script_body = script_runtime_take_form_submission_body(
+        engine->navigation.page.runtime, &engine->budget,
+        BROWSER_ENGINE_SCRIPT_FORM_BODY_LIMIT, &body, &body_length);
+    if (!script_runtime_take_form_submission(
+            engine->navigation.page.runtime, &form, &submitter)) {
+        budget_free(&engine->budget, body);
+        return false;
+    }
+    if (!controller_build_form_action(
+            &engine->controller, form, submitter, false, action)
+        || (action->type != CONTROLLER_ACTION_FORM_SUBMIT
+            && action->type != CONTROLLER_ACTION_NAVIGATE)) {
+        budget_free(&engine->budget, body);
+        return false;
+    }
+    /* Send the entry list page script saw, including what its `formdata`
+       listeners added (chatgpt.com's session-observer token), rather than
+       re-serializing the DOM, whose inline buffer drops chatgpt.com's
+       several-KiB sentinel tokens. */
+    if (script_body && action->type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strcasecmp(action->method, "POST") == 0
+        && (action->content_type[0] == '\0'
+            || strncasecmp(action->content_type,
+                           "application/x-www-form-urlencoded", 33) == 0)) {
+        controller_action_clear_body(action);
+        action->body_length = body_length;
+        if (body_length < sizeof(action->body)) {
+            memcpy(action->body, body, body_length + 1);
+        } else {
+            budget_free(&engine->budget, engine->script_form_body);
+            engine->script_form_body = body;
+            action->external_body = body;
+            body = NULL;
+        }
+    }
+    budget_free(&engine->budget, body);
+    return true;
+}
+
 bool browser_engine_begin_navigation_url(
     BrowserEngine *engine, const char *url, size_t maximum_bytes,
     long timeout_ms, bool record_history)
 {
-    if (engine != NULL)
+    if (engine != NULL && !engine->script_navigation_attributed) {
+        engine->navigation.pending_navigation_referer[0] = '\0';
         engine->navigation.pending_navigation_user_activated = false;
+    } else if (engine != NULL
+               && engine->navigation.pending_navigation_referer[0] == '\0') {
+        /* A script without a document initiator is never a typed address. */
+        engine->navigation.pending_navigation_user_activated = false;
+    }
+    if (engine != NULL) engine->script_navigation_attributed = false;
     return browser_engine_begin_navigation_request(
         engine, url, "GET", NULL, 0, NULL,
         maximum_bytes, timeout_ms, record_history);
@@ -2914,7 +3214,8 @@ bool browser_engine_begin_navigation_action(
                  sizeof(engine->navigation.pending_navigation_referer),
                  "%s", current_url);
     }
-    engine->navigation.pending_navigation_user_activated = true;
+    engine->navigation.pending_navigation_user_activated =
+        action->navigation_source == CONTROLLER_NAVIGATION_USER;
     const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
         ? action->method : "GET";
     if (action->type == CONTROLLER_ACTION_NAVIGATE
@@ -2940,7 +3241,7 @@ bool browser_engine_begin_navigation_action(
     }
     bool began = browser_engine_begin_navigation_request(
         engine, action->url, method,
-        action->body_length == 0 ? NULL : action->body,
+        action->body_length == 0 ? NULL : controller_action_body(action),
         action->body_length,
         action->content_type[0] == '\0' ? NULL : action->content_type,
         maximum_bytes, timeout_ms, true);
@@ -3261,6 +3562,17 @@ BrowserNavigationJobStatus browser_engine_navigation_status(
 {
     return engine == NULL ? BROWSER_NAVIGATION_JOB_FAILED
                           : engine->navigation_work.status;
+}
+
+bool browser_engine_parser_script_time(const BrowserEngine *engine,
+                                      uint64_t *used_us, uint64_t *limit_us)
+{
+    if (used_us != NULL) *used_us = 0;
+    if (limit_us != NULL) *limit_us = 0;
+    return engine != NULL
+        && engine->navigation_work.status == BROWSER_NAVIGATION_JOB_PENDING
+        && navigation_load_parser_script_time(
+               engine->navigation_work.load, used_us, limit_us);
 }
 
 bool browser_engine_navigation_pending(const BrowserEngine *engine)
@@ -3624,6 +3936,7 @@ static bool browser_engine_run_load(BrowserEngine *engine,
        only unfinished network embellishment is superseded. */
     (void) navigation_cancel_network_work(
         &engine->navigation, "superseded by a new navigation");
+    browser_engine_retire_large_incumbent_realm(engine);
     engine->autofocus_pending = false;
     browser_engine_cancel_idle_work(engine);
     (void) emit_diagnostic(
@@ -4126,6 +4439,59 @@ bool browser_engine_scroll_page(BrowserEngine *engine, int direction)
                     engine->config.device.framebuffer_height));
 }
 
+/* A layout completion, or a provisional relayout, is building beside the
+   committed page: page presses may scroll and raster it at checkpoints. */
+bool browser_engine_layout_completion_running(const BrowserEngine *engine)
+{
+    return engine != NULL && (engine->layout_completion_running
+                              || engine->navigation.committed_layout_servable);
+}
+
+bool browser_engine_completion_scroll_page(BrowserEngine *engine,
+                                           int direction)
+{
+    if (!browser_engine_layout_completion_running(engine)
+        || !engine->render_ready || !engine->navigation.page.loaded)
+        return false;
+    if (!controller_scroll_page(&engine->controller, direction,
+                                engine->config.device.framebuffer_height))
+        return false;
+    /* Publish the move at once; the checkpoints fill the rest. */
+    engine->completion_frame_pending = true;
+    engine->completion_scrolled = true;
+    (void) browser_engine_render_placeholder_frame(engine, NULL);
+    return true;
+}
+
+bool browser_engine_completion_raster_step(BrowserEngine *engine,
+                                           bool show_progress)
+{
+    if (!browser_engine_layout_completion_running(engine)
+        || !engine->completion_frame_pending || !engine->render_ready
+        || !engine->navigation.page.loaded) return false;
+    size_t before = engine->render.frame_job_units;
+    /* The 8 ms budget bounds the slice; the unit cap only stops a run of
+       cheap tiles from outlasting it. */
+    BrowserRenderJobStatus status =
+        browser_engine_render_frame_bounded(engine, 8000, 16);
+    if (status == BROWSER_RENDER_JOB_COMPLETE) {
+        engine->completion_frame_pending = false;
+        return true;
+    }
+    if (status != BROWSER_RENDER_JOB_PENDING) {
+        engine->completion_frame_pending = false;
+        return false;
+    }
+    return show_progress && engine->render.frame_job_units > before
+        && browser_engine_render_placeholder_frame(engine, NULL);
+}
+
+bool browser_engine_completion_frame_pending(const BrowserEngine *engine)
+{
+    return browser_engine_layout_completion_running(engine)
+        && engine->completion_frame_pending;
+}
+
 bool browser_engine_scroll_to_edge(BrowserEngine *engine, bool bottom)
 {
     if (!browser_engine_input_ready(engine)) return false;
@@ -4458,6 +4824,37 @@ bool browser_engine_activate(BrowserEngine *engine,
     return finished;
 }
 
+static bool browser_engine_adopt_script_focus_of(
+    BrowserEngine *engine, bool text_only)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    static const lxb_char_t focus_attribute[] = "data-tilefinch-focus";
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *control = &layout->controls[i];
+        lxb_dom_node_t *node = control->node;
+        if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || !lxb_dom_element_has_attribute(
+                   lxb_dom_interface_element(node), focus_attribute,
+                   sizeof(focus_attribute) - 1)) continue;
+        if (text_only && control->type != CONTROL_INPUT
+            && control->type != CONTROL_TEXTAREA
+            && control->type != CONTROL_EDITABLE) return false;
+        return controller_focus_node(&engine->controller, node);
+    }
+    return false;
+}
+
+bool browser_engine_adopt_script_focus(BrowserEngine *engine)
+{
+    return browser_engine_adopt_script_focus_of(engine, false);
+}
+
+bool browser_engine_adopt_script_text_focus(BrowserEngine *engine)
+{
+    return browser_engine_adopt_script_focus_of(engine, true);
+}
+
 bool browser_engine_restore_autofocus(BrowserEngine *engine)
 {
     if (!browser_engine_input_ready(engine)) return false;
@@ -4722,7 +5119,8 @@ bool browser_engine_execute_action(BrowserEngine *engine,
                      sizeof(engine->navigation.pending_navigation_referer),
                      "%s", current_url);
         }
-        engine->navigation.pending_navigation_user_activated = true;
+        engine->navigation.pending_navigation_user_activated =
+            action->navigation_source == CONTROLLER_NAVIGATION_USER;
         return browser_engine_load_url_with_limits(
             engine, action->url, maximum_bytes, timeout_ms, true);
     }
@@ -4811,6 +5209,9 @@ bool browser_engine_render_frame(BrowserEngine *engine,
             != engine->navigation.incremental_relayouts
         && !browser_engine_apply_layout_damage(engine)) return false;
     if (!browser_engine_apply_focus_paint(engine)) return false;
+    tile_cache_set_forced_dark(
+        &engine->render,
+        engine->forced_dark && !browser_engine_page_declares_dark(engine));
     const NavigationEntry *entry = navigation_current(&engine->navigation);
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
     bool previous_scroll_valid = engine->render.last_frame_scroll_valid;
@@ -4835,9 +5236,8 @@ bool browser_engine_render_frame(BrowserEngine *engine,
     browser_engine_paint_find_highlights(engine, scroll_y);
     int focus_x = 0, focus_y = 0, focus_width = 0, focus_height = 0;
     ControllerFocusOutline focus_outline = {0};
-    if (controller_focused_rect(
-            &engine->controller, &focus_x, &focus_y,
-            &focus_width, &focus_height)
+    if (browser_engine_focus_indicator_rect(
+            engine, &focus_x, &focus_y, &focus_width, &focus_height)
         && controller_focused_outline_style(
             &engine->controller, &focus_outline)) {
         const ViewportContext *viewport = &engine->navigation.viewport;
@@ -5016,6 +5416,32 @@ bool browser_engine_canvas_frame_pending(const BrowserEngine *engine)
             || tile_cache_canvas_frame_work_pending(&engine->render));
 }
 
+bool browser_engine_page_task_runnable(const BrowserEngine *engine)
+{
+    if (!browser_engine_input_ready(engine)
+        || !engine->navigation.page.loaded) return false;
+    const NavigationPage *page = &engine->navigation.page;
+    if (script_runtime_task_runnable(page->runtime)) return true;
+    for (size_t i = 0; i < page->frame_count; i++) {
+        if (page->frames[i].loaded
+            && script_runtime_task_runnable(page->frames[i].runtime))
+            return true;
+    }
+    return false;
+}
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+bool browser_engine_runnable_state(BrowserEngine *engine,
+                                   ScriptRunnableState *state)
+{
+    if (state != NULL) *state = (ScriptRunnableState) {0};
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready && engine->navigation.page.loaded
+        && script_runtime_runnable_state(
+               engine->navigation.page.runtime, state);
+}
+#endif
+
 bool browser_engine_run_idle_work(
     BrowserEngine *engine, bool *visual_changed)
 {
@@ -5083,8 +5509,17 @@ bool browser_engine_run_idle_work(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t completion_started = tilefinch_platform_monotonic_time_us();
 #endif
+        engine->layout_completion_running = true;
+        engine->completion_scrolled = false;
+        /* A relayout's served press may have left its fill unfinished; that
+           frame is the main loop's now. */
+        engine->completion_frame_pending = false;
         NavigationLayoutCompletion completion =
             navigation_complete_layout(&engine->navigation);
+        engine->layout_completion_running = false;
+        engine->completion_frame_pending = false;
+        if (engine->completion_scrolled && visual_changed != NULL)
+            *visual_changed = true;
         (void) tilefinch_platform_cooperate(completion_phase, 0);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         char completion_message[160];
@@ -5340,7 +5775,12 @@ bool browser_engine_run_idle_work(
     (void) tile_cache_run_idle_work(
         &engine->render, engine->config.idle_work_budget_us,
         engine->config.idle_work_maximum_units);
-    return autofocus_work || font_work
+    bool cache_work = false;
+    if (!layout_still_settling && !autofocus_work
+        && !tile_cache_idle_work_pending(&engine->render))
+        cache_work = browser_session_module_bytecode_disk_maintenance(
+            &engine->session);
+    return cache_work || autofocus_work || font_work
         || navigation_background_resources_pending(&engine->navigation)
         || tile_cache_idle_work_pending(&engine->render);
 }

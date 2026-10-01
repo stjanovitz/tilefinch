@@ -11,6 +11,16 @@
 
 #include "tilefinch/danzeff_input.h"
 #include "tilefinch/psp_log.h"
+#include "tilefinch/work_ledger.h"
+
+/* The modal frames' vblank waits are the owner thread sleeping: the
+   frame loop's work ledger reads them as sleep, not text-entry work. */
+static void text_input_wait_vblank(void)
+{
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_SLEEP);
+    sceDisplayWaitVblankStart();
+    work_ledger_leave(ledger);
+}
 
 #define PSP_SCREEN_WIDTH 480
 #define PSP_SCREEN_HEIGHT 272
@@ -204,7 +214,7 @@ static bool open_keyboard(
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuFinish();
     sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-    sceDisplayWaitVblankStart();
+    text_input_wait_vblank();
     sceGuDisplay(GU_TRUE);
 
     bool initialized = sceUtilityOskInitStart(&params) >= 0;
@@ -242,7 +252,7 @@ static bool open_keyboard(
             default:
                 break;
         }
-        sceDisplayWaitVblankStart();
+        text_input_wait_vblank();
         sceGuSwapBuffers();
     }
     sceGuDisplay(GU_FALSE);
@@ -349,7 +359,7 @@ static bool open_danzeff_keyboard(
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
         psp_log_set_stage("text-entry");
-        sceDisplayWaitVblankStart();
+        text_input_wait_vblank();
         if (text_input_poll(service, &pad) <= 0)
             memset(&pad, 0, sizeof(pad));
     } while ((pad.Buttons & input_buttons) != 0);
@@ -364,7 +374,7 @@ static bool open_danzeff_keyboard(
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
         psp_log_set_stage("text-entry");
-        sceDisplayWaitVblankStart();
+        text_input_wait_vblank();
         if (text_input_poll(service, &pad) <= 0) continue;
         unsigned pressed = pad.Buttons & ~previous_buttons;
         previous_buttons = pad.Buttons;
@@ -538,7 +548,7 @@ static unsigned wait_for_choice(
     do {
         if (text_input_cancel_requested(service)) return 0;
         psp_log_heartbeat();
-        sceDisplayWaitVblankStart();
+        text_input_wait_vblank();
         (void) sceCtrlPeekBufferPositive(&pad, 1);
     } while (pad.Buttons & accepted);
 
@@ -546,7 +556,7 @@ static unsigned wait_for_choice(
     for (;;) {
         if (text_input_cancel_requested(service)) return 0;
         psp_log_heartbeat();
-        sceDisplayWaitVblankStart();
+        text_input_wait_vblank();
         if (sceCtrlPeekBufferPositive(&pad, 1) <= 0) continue;
         unsigned pressed = pad.Buttons & ~previous;
         previous = pad.Buttons;

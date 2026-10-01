@@ -3,7 +3,8 @@
 
 `COMPUTED_STYLE_PROPERTIES` in src/js_dom_bindings.c is the single answer to
 which properties a computed style has: `name in style`, `length`, `item()`,
-enumeration, and the identifiers js_computed_style_get() dispatches on are all
+enumeration, and the identifiers the getter (computed_style_value(), behind
+__tilefinchComputedStyleGet and __tilefinchComputedStyleRead) dispatches on are all
 generated from it. A serializer for an unregistered property therefore does
 not compile. What the compiler cannot see is checked here:
 
@@ -69,7 +70,8 @@ def main() -> int:
 
     handled: set[str] = set()
     for signature in (
-            "JSValue js_computed_style_get(",
+            "static JSValue computed_style_value(",
+            "static bool computed_style_transition_id(",
             "bool computed_style_serialize_retained(",
             "const char *computed_style_sparse_modern_initial("):
         body = function_body(source, signature)

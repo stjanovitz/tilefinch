@@ -178,6 +178,33 @@ static bool test_stepper(void)
     CHECK(script.reached_end && script.finished && !script.stalled);
     CHECK(script.ticks == 5);
 
+    /* `until` idles up to its bound, and ends on the frame after the host
+       reports its condition met. */
+    CHECK(psp_input_script_parse(
+        &script, "until 100\nend\n", "inline", record_warning, NULL));
+    CHECK(script.steps[0].kind == PSP_INPUT_SCRIPT_STEP_UNTIL
+          && script.steps[0].ticks == 100u);
+    CHECK(psp_input_script_awaiting_condition(&script));
+    CHECK(psp_input_script_advance(&script, &input, 0, true));
+    CHECK(psp_input_script_advance(&script, &input, 0, true));
+    psp_input_script_satisfy_condition(&script);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.held == 0);
+    CHECK(!psp_input_script_awaiting_condition(&script));
+    CHECK(!psp_input_script_advance(&script, &input, 0, true));
+    CHECK(script.reached_end && script.ticks == 3u);
+    CHECK(psp_input_script_parse(
+        &script, "until 3\nend\n", "inline", record_warning, NULL));
+    for (int at = 0; at < 3; at++)
+        CHECK(psp_input_script_advance(&script, &input, 0, true));
+    CHECK(!psp_input_script_advance(&script, &input, 0, true)
+          && script.reached_end);
+    /* A condition reported outside an `until` step is ignored. */
+    CHECK(psp_input_script_parse(
+        &script, "wait 2\nuntil 5\nend\n", "inline", record_warning, NULL));
+    psp_input_script_satisfy_condition(&script);
+    CHECK(!script.condition_met);
+
     CHECK(psp_input_script_parse(
         &script, "wait 10\nend\n", "inline", record_warning, NULL));
     psp_input_script_interrupt(&script);
@@ -238,6 +265,27 @@ static bool test_stepper(void)
     CHECK(strcmp(psp_input_script_mark(&script), "moved") == 0);
     CHECK(!psp_input_script_parse(
         &script, "end-page\n", "inline", record_warning, NULL));
+
+    /* A -text step belongs to the on-screen keyboard: ordinary ready main
+       frames hold it, so a keystroke cannot reach the page as an activation
+       while a slow page is still opening the keyboard. */
+    CHECK(psp_input_script_parse(
+        &script, "wait-text 1\nstick-text 1 up-right cross\nend\n",
+        "inline", record_warning, NULL));
+    CHECK(script.steps[0].advance_in_text_entry
+          && script.steps[1].advance_in_text_entry);
+    for (size_t at = 0; at < 5u; at++) {
+        CHECK(psp_input_script_advance_with_page(
+            &script, &input, 0, true, true));
+        CHECK(input.pressed == 0 && script.ticks == 0);
+    }
+    script.text_entry_open = true;
+    CHECK(psp_input_script_advance(&script, &input, 0, true));
+    CHECK(input.pressed == 0 && script.ticks == 1);
+    CHECK(psp_input_script_advance(&script, &input, 0, true));
+    CHECK(input.pressed == PSP_UI_BUTTON_CONFIRM
+          && input.analog_x == 255 && input.analog_y == 0);
+    script.text_entry_open = false;
 
     /* When that held edge synchronously starts work, only its neutral release
        may drain before the explicitly-live sequence. */

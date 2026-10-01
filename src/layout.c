@@ -1,5 +1,6 @@
 #include "tilefinch/layout.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/work_vector.h"
 
 #include "layout_internal.h"
 #include "style_cache_internal.h"
@@ -148,6 +149,10 @@ static void layout_reuse_clear_counters(LayoutReuseCache *cache)
 static void layout_release_context(LayoutContext *context, Budget *budget)
 {
     if (context == NULL) return;
+    /* Every pass, finished or cancelled, releases its context here. */
+    TILEFINCH_WORK_ADD(style_resolutions, context->style_resolutions);
+    TILEFINCH_WORK_ADD(style_cache_hits, context->style_cache_hits);
+    TILEFINCH_WORK_ADD(style_cache_misses, context->style_cache_misses);
     if (context->style_selector_cooperation_owned
         && context->sheet != NULL) {
         style_selector_cooperation_end((Stylesheet *) context->sheet);
@@ -490,6 +495,7 @@ static void layout_reuse_clear_entries(LayoutReuseCache *cache)
     cache->pending_parent_scope = false;
     cache->pending_node_count = 0;
     cache->pending_token_count = 0;
+    memset(&cache->has_pending, 0, sizeof(cache->has_pending));
     cache->font_publication_active = false;
     memset(cache->intrinsic, 0, sizeof(cache->intrinsic));
     if (cache->table_rows != NULL) {
@@ -517,6 +523,7 @@ LayoutReuseCache *layout_reuse_cache_create(Budget *budget)
     LayoutReuseCache *cache = budget_calloc(budget, 1, sizeof(*cache));
     if (cache == NULL) return NULL;
     cache->budget = budget;
+    cache->structure_entries = UINT64_MAX;
     cache->stats.retained_bytes = sizeof(*cache);
     return cache;
 }
@@ -530,6 +537,9 @@ void layout_reuse_cache_destroy(LayoutReuseCache *cache)
         budget_free(budget, cache->table_rows);
     }
     style_retained_matches_destroy(cache->matches);
+    budget_free(budget, cache->identity_tokens);
+    budget_free(budget, cache->identity_names);
+    budget_free(budget, cache->structural_rules);
     memset(cache, 0, sizeof(*cache));
     budget_free(budget, cache);
 }
@@ -544,19 +554,21 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
     cache->images = NULL;
     cache->viewport_width = 0;
     cache->selector_has_has = false;
-    cache->selector_has_has_sibling = false;
-    cache->has_rule_count = 0;
-    cache->has_rules_bounded = false;
     cache->state_rule_count = 0;
     cache->state_rules_bounded = false;
-    cache->selector_has_focus_within = false;
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
+    cache->selector_has_empty = false;
+    cache->empty_key_count = 0;
+    cache->empty_any = false;
+    memset(&cache->structure, 0, sizeof(cache->structure));
     cache->stats.full_resets++;
 }
 
 static void layout_reuse_note_selector_dependencies(
     LayoutReuseCache *cache, const char *selector, uint32_t rule_index);
+static bool layout_reuse_empty_reaches_siblings(
+    const LayoutReuseCache *cache, const lxb_dom_node_t *element);
 
 void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache)
 {
@@ -597,16 +609,8 @@ void layout_reuse_cache_note_stylesheet_appended(
         }
     }
     /* Rule ordinals move when a style element is inserted before an old
-       source. Relational invalidation must follow the same remap as matches. */
-    for (size_t i = 0; i < cache->has_rule_count; i++) {
-        uint32_t old = cache->has_rules[i];
-        if (!lists_valid || remap == NULL || old >= old_count
-            || remap[old] == UINT16_MAX) {
-            cache->has_rules_bounded = true;
-            break;
-        }
-        cache->has_rules[i] = remap[old];
-    }
+       source. Relational invalidation must follow the same remap as matches
+       (the sheet's :has() plan is rebuilt with its has-rule index). */
     for (size_t i = 0; i < cache->state_rule_count; i++) {
         uint32_t old = cache->state_rules[i];
         if (!lists_valid || remap == NULL || old >= old_count
@@ -773,24 +777,259 @@ void layout_reuse_cache_rebind_stylesheet(
     cache->sheet = replacement;
 }
 
+static void layout_reuse_drop_subtree(LayoutReuseCache *cache,
+                                      lxb_dom_node_t *scope,
+                                      bool include_matches)
+{
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node != NULL
+            && layout_node_is_within(entry->node, scope)) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    if (include_matches)
+        style_retained_matches_invalidate_within(cache->matches, scope);
+}
+
+/* One element's own cached styles and lists; its descendants re-key off
+   its style if that changes. */
+static void layout_reuse_drop_element(LayoutReuseCache *cache,
+                                      const lxb_dom_node_t *node,
+                                      bool include_matches)
+{
+    size_t home = layout_pointer_hash((lxb_dom_node_t *) node)
+                  & (LAYOUT_REUSE_STYLE_CAPACITY - 1u);
+    for (size_t probe = 0; probe < 8; probe++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[
+            (home + probe) & (LAYOUT_REUSE_STYLE_CAPACITY - 1u)];
+        if (entry->node == node) memset(entry, 0, sizeof(*entry));
+    }
+    if (include_matches) style_retained_matches_forget_node(cache->matches, node);
+}
+
+#define LAYOUT_REUSE_SHALLOW_CHILD_LIMIT 512u
+
+/* Whether a change to `parent`'s child list can restyle descendants of
+   its children (LayoutReuseCache.structure): a current child, or the one
+   that left (`removed`, NULL when unknown), carries a key of a sibling
+   test that reaches descendants. */
+static bool layout_reuse_structure_deep(const LayoutReuseCache *cache,
+                                        const lxb_dom_node_t *parent,
+                                        const lxb_dom_node_t *removed,
+                                        bool removed_unknown)
+{
+    const StyleStructureKeys *keys = &cache->structure;
+    if (!keys->reaches) return false;
+    if (keys->any) return true;
+    for (size_t i = 0; i < keys->count; i++) {
+        if (!keys->predecessor[i]) continue;
+        if (removed_unknown
+            || style_element_carries_key(removed, keys->keys[i]))
+            return true;
+    }
+    size_t children = 0;
+    for (const lxb_dom_node_t *child = parent->first_child; child != NULL;
+         child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (++children > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT) return true;
+        for (size_t i = 0; i < keys->count; i++) {
+            if (style_element_carries_key(child, keys->keys[i])) return true;
+        }
+    }
+    return false;
+}
+
+/* `parent`'s children changed: `changed` is a child inserted or moved in
+   (its subtree may hold entries from elsewhere), or a changed text node,
+   or NULL; `removed` the child that left (NULL when unknown). Positional
+   pseudo-classes and sibling combinators restyle the parent (its :empty)
+   and its children; their descendants re-key off their styles, unless a
+   sibling test reaches them through a descendant combinator. An :empty
+   test outside :has() can reach the parent's siblings. */
+static bool layout_structural_add(void *context, StyleKeyNames entry)
+{
+    LayoutReuseCache *cache = context;
+    if (entry.key == 0) {
+        cache->structural_unkeyed_names |= entry.names;
+        return true;
+    }
+    if (cache->structural_rule_count == cache->structural_rule_capacity) {
+        size_t grown = cache->structural_rule_capacity == 0
+            ? 16u : cache->structural_rule_capacity * 2u;
+        StyleKeyNames *rules = budget_realloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT, cache->structural_rules,
+            grown * sizeof(*rules));
+        if (rules == NULL) return false;
+        cache->structural_rules = rules;
+        cache->structural_rule_capacity = grown;
+    }
+    cache->structural_rules[cache->structural_rule_count++] = entry;
+    return true;
+}
+
+static int layout_structural_compare(const void *left, const void *right)
+{
+    uint32_t a = ((const StyleKeyNames *) left)->key;
+    uint32_t b = ((const StyleKeyNames *) right)->key;
+    return a < b ? -1 : a > b;
+}
+
+/* The custom-property names structural or sibling tests can change on
+   `element`. */
+static uint64_t layout_structural_names(LayoutReuseCache *cache,
+                                        const lxb_dom_node_t *element)
+{
+    const Stylesheet *sheet = cache->sheet;
+    if (sheet == NULL) return UINT64_MAX;
+    if (!cache->structural_ready || cache->structural_sheet != sheet
+        || cache->structural_generation != sheet->build_generation
+        || cache->structural_custom_count != sheet->custom_rule_count) {
+        cache->structural_rule_count = 0;
+        cache->structural_unkeyed_names = 0;
+        cache->structural_unbounded = !stylesheet_structural_custom_rules(
+            sheet, layout_structural_add, cache);
+        qsort(cache->structural_rules, cache->structural_rule_count,
+              sizeof(*cache->structural_rules), layout_structural_compare);
+        cache->structural_sheet = sheet;
+        cache->structural_generation = sheet->build_generation;
+        cache->structural_custom_count = sheet->custom_rule_count;
+        cache->structural_ready = true;
+    }
+    if (cache->structural_unbounded) return UINT64_MAX;
+    return cache->structural_unkeyed_names
+        | style_element_key_names(element, cache->structural_rules,
+                                  cache->structural_rule_count);
+}
+
+/* Restyling an element alone relies on its descendants re-keying off its
+   computed style, which does not hold the custom properties it passes
+   down. When a change restyles `parent` and its children beside the
+   changed subtree, the styles under each of them that read a custom
+   property a structural or sibling test may now give it must go too. */
+static void layout_reuse_drop_structural_readers(LayoutReuseCache *cache,
+                                                 lxb_dom_node_t *parent)
+{
+    lxb_dom_node_t *reached[LAYOUT_REUSE_SHALLOW_CHILD_LIMIT + 1u];
+    uint64_t names[LAYOUT_REUSE_SHALLOW_CHILD_LIMIT + 1u];
+    size_t count = 0;
+    uint64_t any = 0;
+    uint64_t own = layout_structural_names(cache, parent);
+    if (own != 0) {
+        reached[count] = parent;
+        names[count++] = own;
+        any |= own;
+    }
+    for (lxb_dom_node_t *child = parent->first_child;
+         child != NULL && own != UINT64_MAX; child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        uint64_t bits = layout_structural_names(cache, child);
+        if (bits == 0) continue;
+        if (count == LAYOUT_REUSE_SHALLOW_CHILD_LIMIT + 1u) {
+            /* Too many: every reader under the parent. */
+            reached[0] = parent;
+            names[0] = any | bits;
+            count = 1;
+            break;
+        }
+        reached[count] = child;
+        names[count++] = bits;
+        any |= bits;
+    }
+    if (any == 0) return;
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node == NULL || (entry->variable_reads & any) == 0)
+            continue;
+        for (size_t r = 0; r < count; r++) {
+            if ((entry->variable_reads & names[r]) != 0
+                && layout_node_is_within(entry->node, reached[r])) {
+                memset(entry, 0, sizeof(*entry));
+                break;
+            }
+        }
+    }
+}
+
+static void layout_reuse_invalidate_child_list(
+    LayoutReuseCache *cache, lxb_dom_node_t *parent, lxb_dom_node_t *changed,
+    const lxb_dom_node_t *removed, bool removed_unknown,
+    bool include_matches)
+{
+    bool elements = changed == NULL
+        || changed->type == LXB_DOM_NODE_TYPE_ELEMENT;
+    if (parent->parent != NULL
+        && layout_reuse_empty_reaches_siblings(cache, parent)) {
+        layout_reuse_drop_subtree(cache, parent->parent, include_matches);
+    } else if (elements && layout_reuse_structure_deep(
+                   cache, parent, removed, removed_unknown)) {
+        layout_reuse_drop_subtree(cache, parent, include_matches);
+    } else {
+        layout_reuse_drop_element(cache, parent, include_matches);
+        size_t children = 0;
+        for (lxb_dom_node_t *child = elements ? parent->first_child : NULL;
+             child != NULL; child = child->next) {
+            if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+            if (++children > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT) {
+                layout_reuse_drop_subtree(cache, parent, include_matches);
+                break;
+            }
+            layout_reuse_drop_element(cache, child, include_matches);
+        }
+        layout_reuse_drop_structural_readers(cache, parent);
+        if (changed != NULL && changed->type == LXB_DOM_NODE_TYPE_ELEMENT)
+            layout_reuse_drop_subtree(cache, changed, include_matches);
+    }
+    layout_reuse_cache_invalidate_measurements(cache, parent);
+}
+
 static void layout_reuse_invalidate_scoped_internal(
     LayoutReuseCache *cache, lxb_dom_node_t *node,
     bool text_or_structure_sensitive, bool include_matches)
 {
-    layout_reuse_clear_counters(cache);
+    if (text_or_structure_sensitive && node->parent != NULL
+        && node->parent->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        /* A text or child change at `node` under its parent. */
+        layout_reuse_invalidate_child_list(cache, node->parent, node, NULL,
+                                           false, include_matches);
+        return;
+    }
     lxb_dom_node_t *style_scope = node;
     if ((text_or_structure_sensitive || cache->selector_has_structure)
         && node->parent != NULL) style_scope = node->parent;
-    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
-        LayoutReuseStyleEntry *entry = &cache->styles[i];
-        if (entry->node != NULL
-            && layout_node_is_within(entry->node, style_scope)) {
-            memset(entry, 0, sizeof(*entry));
+    if (!text_or_structure_sensitive && style_scope != node
+        && style_scope->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && !layout_reuse_structure_deep(cache, style_scope, NULL, false)) {
+        /* An attribute read by sibling tests restyles the siblings, and
+           the node's own subtree. */
+        layout_reuse_drop_subtree(cache, node, include_matches);
+        size_t children = 0;
+        for (lxb_dom_node_t *child = style_scope->first_child;
+             child != NULL; child = child->next) {
+            if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+            if (++children > LAYOUT_REUSE_SHALLOW_CHILD_LIMIT) {
+                layout_reuse_drop_subtree(cache, style_scope,
+                                          include_matches);
+                break;
+            }
+            layout_reuse_drop_element(cache, child, include_matches);
         }
+        layout_reuse_drop_element(cache, style_scope, include_matches);
+        layout_reuse_drop_structural_readers(cache, style_scope);
+    } else {
+        layout_reuse_drop_subtree(cache, style_scope, include_matches);
     }
-    if (include_matches) {
-        style_retained_matches_invalidate_within(cache->matches, style_scope);
+    layout_reuse_cache_invalidate_measurements(cache, node);
+}
+
+void layout_reuse_cache_invalidate_measurements(
+    LayoutReuseCache *cache, lxb_dom_node_t *node)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
     }
+    layout_reuse_clear_counters(cache);
     for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
         LayoutIntrinsicCacheEntry *entry = &cache->intrinsic[i];
         if (entry->node != NULL
@@ -823,6 +1062,388 @@ void layout_reuse_cache_invalidate_node_scoped(
         cache, node, text_or_structure_sensitive, true);
 }
 
+/* One element whose :has()-dependent match may move: its retained lists,
+   its computed styles (its descendants miss through their parent's style
+   key if its own changes) and the measurements that include it. */
+static void layout_reuse_has_drop(void *opaque, lxb_dom_node_t *node)
+{
+    LayoutReuseCache *cache = opaque;
+    style_retained_matches_forget_node(cache->matches, node);
+    size_t home = layout_pointer_hash(node)
+                  & (LAYOUT_REUSE_STYLE_CAPACITY - 1u);
+    for (size_t probe = 0; probe < 8; probe++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[
+            (home + probe) & (LAYOUT_REUSE_STYLE_CAPACITY - 1u)];
+        if (entry->node == node) memset(entry, 0, sizeof(*entry));
+    }
+    layout_reuse_cache_invalidate_measurements(cache, node);
+    cache->stats.has_dropped++;
+}
+
+/* Scoped :has() invalidation for one change (style_has_note_change); a
+   change it cannot bound resets the cache. False after a reset. */
+static bool layout_reuse_has_note(LayoutReuseCache *cache,
+                                  lxb_dom_node_t *node, bool structure,
+                                  const char *attribute,
+                                  const uint32_t *tokens, size_t token_count)
+{
+    if (!cache->selector_has_has) return true;
+    StyleHasNoteStats stats = {0};
+    if (cache->sheet == NULL
+#ifndef TILEFINCH_NO_TRACE
+        || getenv("TILEFINCH_DISABLE_HAS_SCOPED_INVALIDATION") != NULL
+#endif
+        || !(structure
+             /* The entries the journal's probe saw the change reach. */
+             ? style_has_note_structure(cache->sheet, node,
+                                        cache->structure_entries,
+                                        cache->structure_serial,
+                                        &cache->has_pending,
+                                        layout_reuse_has_drop, cache, &stats)
+             : style_has_note_change(cache->sheet, node, false, attribute,
+                                     tokens, token_count,
+                                     &cache->has_pending,
+                                     layout_reuse_has_drop, cache,
+                                     &stats))) {
+        layout_reuse_cache_reset(cache);
+        cache->stats.has_fallbacks++;
+        return false;
+    }
+    /* A rule nothing could place wipes the computed styles at the flush. */
+    if (stats.wipes != 0) cache->stats.has_fallbacks++;
+    else cache->stats.has_scoped++;
+    return true;
+}
+
+
+static bool layout_reuse_has_selects(void *opaque,
+                                     const lxb_dom_node_t *node)
+{
+    const LayoutReuseCache *cache = opaque;
+    return style_has_pending_selects(cache->sheet, &cache->has_pending, node);
+}
+
+/* Ancestors shared by many readers are asked once per flush. */
+typedef struct {
+    struct {
+        const lxb_dom_node_t *node;
+        bool selected;
+    } slots[128];
+} LayoutHasSelectMemo;
+
+static bool layout_reuse_has_selects_memo(LayoutReuseCache *cache,
+                                          LayoutHasSelectMemo *memo,
+                                          const lxb_dom_node_t *node)
+{
+    size_t slot = layout_pointer_hash((lxb_dom_node_t *) node) & 127u;
+    if (memo->slots[slot].node == node) return memo->slots[slot].selected;
+    bool selected = layout_reuse_has_selects(cache, node);
+    memo->slots[slot].node = node;
+    memo->slots[slot].selected = selected;
+    return selected;
+}
+
+/* Whether a style reading a custom property a changed :has() or
+   :focus-within rule declares can see the change: the rule's subject
+   passes its custom properties down only to itself and its descendants,
+   so one of the node's ancestors-or-self must be a changed subject, one
+   the walk dropped or one selected by key. */
+static bool layout_reuse_has_reaches_reader(LayoutReuseCache *cache,
+                                            LayoutHasSelectMemo *memo,
+                                            const lxb_dom_node_t *node)
+{
+    const StyleHasPending *pending = &cache->has_pending;
+    if (style_has_pending_names_reach(pending, node)) return true;
+    for (const lxb_dom_node_t *at = node;
+         pending->marked && at != NULL
+         && at->type == LXB_DOM_NODE_TYPE_ELEMENT; at = at->parent)
+        if (layout_reuse_has_selects_memo(cache, memo, at)) return true;
+    return false;
+}
+
+/* The keyed half of the journal's :has() changes: one pass over each
+   table, however many records marked it. */
+static void layout_reuse_has_flush(LayoutReuseCache *cache)
+{
+    StyleHasPending *pending = &cache->has_pending;
+    if (!pending->active) return;
+    size_t dropped = 0;
+    LayoutHasSelectMemo memo;
+    memset(&memo, 0, sizeof(memo));
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node == NULL) continue;
+        bool drop = pending->styles_all;
+        if (!drop && pending->marked)
+            drop = layout_reuse_has_selects_memo(cache, &memo, entry->node);
+        if (!drop && (entry->variable_reads & pending->custom_names) != 0)
+            drop = layout_reuse_has_reaches_reader(cache, &memo,
+                                                   entry->node);
+        if (drop) {
+            memset(entry, 0, sizeof(*entry));
+            dropped++;
+        }
+    }
+    if (pending->unplaced_rule_count != 0) {
+        if (pending->unplaced_rules[0] == UINT32_MAX || cache->sheet == NULL) {
+            style_retained_matches_clear(cache->matches);
+        } else {
+            style_retained_matches_invalidate_rules(
+                cache->matches, cache->sheet, pending->unplaced_rules,
+                pending->unplaced_rule_count);
+        }
+    }
+    if (pending->author_marked) {
+        dropped += style_retained_matches_drop_selected(
+            cache->matches, layout_reuse_has_selects, cache);
+    }
+    if (dropped != 0) {
+        layout_reuse_clear_counters(cache);
+        layout_reuse_clear_sizing_entries(cache);
+    }
+    cache->stats.has_dropped += dropped;
+    cache->stats.has_scans++;
+    memset(&cache->has_pending, 0, sizeof(cache->has_pending));
+}
+
+typedef struct {
+    LayoutReuseCache *cache;
+    const StyleIdentityScan *scan;
+    bool refused;
+} LayoutIdentityCollect;
+
+static void layout_identity_add_token(void *context, uint32_t hash)
+{
+    LayoutIdentityCollect *collect = context;
+    LayoutReuseCache *cache = collect->cache;
+    if (collect->refused) return;
+    if (cache->identity_token_count == cache->identity_token_capacity) {
+        size_t grown = cache->identity_token_capacity == 0
+            ? 64u : cache->identity_token_capacity * 2u;
+        struct LayoutIdentityDependent *tokens = budget_realloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT, cache->identity_tokens,
+            grown * sizeof(*tokens));
+        if (tokens == NULL) {
+            collect->refused = true;
+            return;
+        }
+        cache->identity_tokens = tokens;
+        cache->identity_token_capacity = grown;
+    }
+    cache->identity_tokens[cache->identity_token_count++] =
+        (struct LayoutIdentityDependent) {
+            hash, collect->scan->subject_key, collect->scan->sibling};
+}
+
+static void layout_identity_add_name(void *context, uint32_t hash)
+{
+    LayoutIdentityCollect *collect = context;
+    LayoutReuseCache *cache = collect->cache;
+    if (collect->refused) return;
+    if (cache->identity_name_count == cache->identity_name_capacity) {
+        size_t grown = cache->identity_name_capacity == 0
+            ? 64u : cache->identity_name_capacity * 2u;
+        struct LayoutIdentityNames *names = budget_realloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT, cache->identity_names,
+            grown * sizeof(*names));
+        if (names == NULL) {
+            collect->refused = true;
+            return;
+        }
+        cache->identity_names = names;
+        cache->identity_name_capacity = grown;
+    }
+    cache->identity_names[cache->identity_name_count++] =
+        (struct LayoutIdentityNames) {hash, collect->scan->names};
+}
+
+static int layout_identity_token_compare(const void *left, const void *right)
+{
+    const struct LayoutIdentityDependent *a = left, *b = right;
+    if (a->token != b->token) return a->token < b->token ? -1 : 1;
+    if (a->subject_key != b->subject_key)
+        return a->subject_key < b->subject_key ? -1 : 1;
+    return (int) a->sibling - (int) b->sibling;
+}
+
+static int layout_identity_name_compare(const void *left, const void *right)
+{
+    uint32_t a = ((const struct LayoutIdentityNames *) left)->token;
+    uint32_t b = ((const struct LayoutIdentityNames *) right)->token;
+    return a < b ? -1 : a > b;
+}
+
+/* (Re)builds the identity tables for the bound sheet; false when they
+   cannot scope a class change. */
+static bool layout_identity_prepare(LayoutReuseCache *cache)
+{
+    const Stylesheet *sheet = cache->sheet;
+    if (sheet == NULL) return false;
+    if (cache->identity_sheet == sheet
+        && cache->identity_generation == sheet->build_generation
+        && cache->identity_rule_count == sheet->count
+        && cache->identity_custom_count == sheet->custom_rule_count)
+        return !cache->identity_unbounded;
+    cache->identity_sheet = sheet;
+    cache->identity_generation = sheet->build_generation;
+    cache->identity_rule_count = sheet->count;
+    cache->identity_custom_count = sheet->custom_rule_count;
+    cache->identity_token_count = 0;
+    cache->identity_name_count = 0;
+    LayoutIdentityCollect collect = {.cache = cache};
+    StyleIdentityScan scan = {
+        .nonlocal = layout_identity_add_token,
+        .declares = layout_identity_add_name,
+        .context = &collect
+    };
+    collect.scan = &scan;
+    bool bounded = stylesheet_identity_scan(sheet, &scan);
+    cache->identity_unbounded = !bounded || collect.refused;
+    cache->identity_attributes_opaque = scan.attributes_opaque;
+    if (cache->identity_unbounded) return false;
+    qsort(cache->identity_tokens, cache->identity_token_count,
+          sizeof(*cache->identity_tokens), layout_identity_token_compare);
+    /* Rules repeat (token, key) pairs: keep one of each. */
+    size_t kept = 0;
+    for (size_t i = 0; i < cache->identity_token_count; i++) {
+        if (kept != 0
+            && cache->identity_tokens[kept - 1].token
+                   == cache->identity_tokens[i].token
+            && cache->identity_tokens[kept - 1].subject_key
+                   == cache->identity_tokens[i].subject_key) {
+            cache->identity_tokens[kept - 1].sibling |=
+                cache->identity_tokens[i].sibling;
+            continue;
+        }
+        cache->identity_tokens[kept++] = cache->identity_tokens[i];
+    }
+    cache->identity_token_count = kept;
+    qsort(cache->identity_names, cache->identity_name_count,
+          sizeof(*cache->identity_names), layout_identity_name_compare);
+    /* One row per token, its rules' names merged. */
+    kept = 0;
+    for (size_t i = 0; i < cache->identity_name_count; i++) {
+        if (kept != 0 && cache->identity_names[kept - 1].token
+                             == cache->identity_names[i].token) {
+            cache->identity_names[kept - 1].names |=
+                cache->identity_names[i].names;
+            continue;
+        }
+        cache->identity_names[kept++] = cache->identity_names[i];
+    }
+    cache->identity_name_count = kept;
+    /* Keep only what the tables hold until the sheet changes. */
+    if (cache->identity_token_count != 0
+        && cache->identity_token_count < cache->identity_token_capacity) {
+        struct LayoutIdentityDependent *tokens = budget_realloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT, cache->identity_tokens,
+            cache->identity_token_count * sizeof(*tokens));
+        if (tokens != NULL) {
+            cache->identity_tokens = tokens;
+            cache->identity_token_capacity = cache->identity_token_count;
+        }
+    }
+    if (cache->identity_name_count != 0
+        && cache->identity_name_count < cache->identity_name_capacity) {
+        struct LayoutIdentityNames *names = budget_realloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT, cache->identity_names,
+            cache->identity_name_count * sizeof(*names));
+        if (names != NULL) {
+            cache->identity_names = names;
+            cache->identity_name_capacity = cache->identity_name_count;
+        }
+    }
+    return true;
+}
+
+/* A StyleX marker class on <main> is read by ~100 rules' ancestors. */
+#define LAYOUT_IDENTITY_KEY_LIMIT 512u
+
+static int layout_key_compare(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *) left, b = *(const uint32_t *) right;
+    return a < b ? -1 : a > b;
+}
+
+/* What a change of `tokens` on an element reaches besides the element:
+   the subject keys of the rules reading one of them off their subject
+   (keys[0..*key_count), within the element's subtree, or its parent's
+   when *sibling), and the custom-property names rules keyed by them
+   declare. False when that cannot be bounded: the tables are unbounded,
+   a reading rule's subject carries no key, or more keys than fit. */
+static bool layout_identity_reach(LayoutReuseCache *cache,
+                                  const uint32_t *tokens, size_t count,
+                                  uint32_t *keys, size_t *key_count,
+                                  bool *sibling, uint64_t *names)
+{
+    *names = 0;
+    *key_count = 0;
+    *sibling = false;
+    if (!layout_identity_prepare(cache)) return false;
+    for (size_t t = 0; t < count; t++) {
+        size_t low = 0, high = cache->identity_token_count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2u;
+            if (cache->identity_tokens[middle].token < tokens[t])
+                low = middle + 1u;
+            else high = middle;
+        }
+        for (; low < cache->identity_token_count
+               && cache->identity_tokens[low].token == tokens[t]; low++) {
+            const struct LayoutIdentityDependent *dependent =
+                &cache->identity_tokens[low];
+            if (dependent->subject_key == 0) return false;
+            *sibling |= dependent->sibling;
+            if (*key_count == LAYOUT_IDENTITY_KEY_LIMIT) return false;
+            keys[(*key_count)++] = dependent->subject_key;
+        }
+        low = 0;
+        high = cache->identity_name_count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2u;
+            if (cache->identity_names[middle].token < tokens[t])
+                low = middle + 1u;
+            else high = middle;
+        }
+        for (; low < cache->identity_name_count
+               && cache->identity_names[low].token == tokens[t]; low++)
+            *names |= cache->identity_names[low].names;
+    }
+    qsort(keys, *key_count, sizeof(*keys), layout_key_compare);
+    size_t kept = 0;
+    for (size_t i = 0; i < *key_count; i++)
+        if (kept == 0 || keys[kept - 1] != keys[i]) keys[kept++] = keys[i];
+    *key_count = kept;
+    return true;
+}
+
+/* Drops what a change reaching `keys`/`names` (layout_identity_reach) at
+   `node` leaves stale: the element's own entries, and entries within the
+   node's subtree (its parent's when `sibling`) carrying one of the keys or
+   reading one of the names (a reached subject passes the names it now
+   declares to its descendants, siblings' included). */
+static void layout_reuse_drop_reached(LayoutReuseCache *cache,
+                                      lxb_dom_node_t *node,
+                                      const uint32_t *keys, size_t key_count,
+                                      bool sibling, uint64_t names)
+{
+    lxb_dom_node_t *scope = sibling ? node->parent : node;
+    layout_reuse_drop_element(cache, node, cache->matches == NULL);
+    for (size_t i = 0;
+         (names != 0 || key_count != 0) && i < LAYOUT_REUSE_STYLE_CAPACITY;
+         i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node == NULL
+            || !layout_node_is_within(entry->node, scope)) continue;
+        bool reached = (entry->variable_reads & names) != 0;
+        if (!reached)
+            reached = style_element_carries_any_key(entry->node, keys,
+                                                    key_count);
+        if (reached) memset(entry, 0, sizeof(*entry));
+    }
+    layout_reuse_cache_invalidate_measurements(cache, scope);
+}
+
 void layout_reuse_cache_invalidate_attribute(
     LayoutReuseCache *cache, lxb_dom_node_t *node,
     const uint32_t *changed_tokens, size_t changed_token_count,
@@ -832,17 +1453,40 @@ void layout_reuse_cache_invalidate_attribute(
         layout_reuse_cache_reset(cache);
         return;
     }
-    if (relational_selector_sensitive && cache->selector_has_has) {
-        layout_reuse_cache_reset(cache);
-        return;
-    }
-    if (changed_tokens == NULL || cache->matches == NULL) {
+    if (relational_selector_sensitive
+        && !layout_reuse_has_note(cache, node, false, NULL,
+                                  changed_tokens == NULL ? NULL
+                                                         : changed_tokens,
+                                  changed_token_count)) return;
+    if (changed_tokens == NULL) {
         layout_reuse_invalidate_scoped_internal(
             cache, node, text_or_structure_sensitive, true);
         return;
     }
-    layout_reuse_invalidate_scoped_internal(
-        cache, node, text_or_structure_sensitive, false);
+    uint64_t names = 0;
+    uint32_t keys[LAYOUT_IDENTITY_KEY_LIMIT];  /* 2 KiB of stack */
+    size_t key_count = 0;
+    bool sibling = false;
+    if (!text_or_structure_sensitive
+        && layout_identity_reach(cache, changed_tokens, changed_token_count,
+                                 keys, &key_count, &sibling, &names)
+        && !(sibling && (node->parent == NULL
+                         || node->parent->type
+                                != LXB_DOM_NODE_TYPE_ELEMENT))) {
+        /* The element restyles and its descendants re-key off its style;
+           beyond that the changed tokens reach only the elements carrying
+           a subject key of a rule that reads them, and the readers of the
+           custom properties rules keyed by them declare. */
+        layout_reuse_drop_reached(cache, node, keys, key_count, sibling,
+                                  names);
+        if (key_count == 0) cache->stats.class_scoped++;
+        else cache->stats.class_keyed++;
+    } else {
+        layout_reuse_invalidate_scoped_internal(
+            cache, node, text_or_structure_sensitive, cache->matches == NULL);
+    }
+    /* Retained lists are narrowed by the changed tokens at the flush. */
+    if (cache->matches == NULL) return;
     if (cache->pending_node_count == LAYOUT_REUSE_PENDING_NODE_LIMIT) {
         cache->pending_overflow = true;
     } else {
@@ -869,7 +1513,7 @@ void layout_reuse_cache_invalidate_attribute(
 void layout_reuse_cache_flush_invalidations(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
-    cache->structure_pass_done = false;
+    layout_reuse_has_flush(cache);
     if (!cache->pending_active) return;
     if (cache->matches != NULL) {
         if (cache->pending_overflow || cache->sheet == NULL) {
@@ -904,44 +1548,39 @@ void layout_reuse_cache_detach_matches(const Stylesheet *sheet,
 void layout_reuse_cache_invalidate_structure(LayoutReuseCache *cache,
                                              lxb_dom_node_t *node)
 {
+    layout_reuse_cache_invalidate_tree(cache, node, true);
+}
+
+void layout_reuse_cache_invalidate_tree(LayoutReuseCache *cache,
+                                        lxb_dom_node_t *node, bool relational)
+{
     if (cache == NULL || node == NULL) {
         layout_reuse_cache_reset(cache);
         return;
     }
-    /* A child list changed under `node`. Without :has() the effect is bound
-       to the parent scope (structural pseudo-classes, sibling combinators).
-       With :has() every ancestor may gain or lose a match; their exact
-       lists and computed styles go, and descendants re-key off the changed
-       parent styles. Only :has() with a sibling combinator can reach an
-       ancestor's siblings, which stays a reset. */
-    if (cache->selector_has_has_sibling
-        && (cache->has_rules_bounded || cache->matches == NULL
-            || cache->sheet == NULL)) {
+    /* `node` was inserted, removed or moved, or its child list changed.
+       Without :has() the effect is bound to the parent scope (structural
+       pseudo-classes, sibling combinators). With :has() the answers that
+       can move are found from the changed position (layout_reuse_has_note);
+       descendants re-key off any parent style that changes. */
+    if (relational && !layout_reuse_has_note(cache, node, true, NULL, NULL, 0))
+        return;
+    layout_reuse_invalidate_scoped_internal(cache, node, true, true);
+}
+
+void layout_reuse_cache_invalidate_children(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *parent,
+                                            const lxb_dom_node_t *removed,
+                                            bool relational)
+{
+    if (cache == NULL || parent == NULL) {
         layout_reuse_cache_reset(cache);
         return;
     }
-    layout_reuse_invalidate_scoped_internal(cache, node, true, true);
-    if (!cache->selector_has_has) return;
-    if (cache->selector_has_has_sibling && !cache->structure_pass_done) {
-        /* A :has() reachable through a sibling combinator can change any
-           element's answer; drop exactly the lists those rules' fast keys
-           can select (all of them for a keyless rule), and every computed
-           style, which those answers feed. The lists of everything else
-           replay. Once per journal: nothing resolves between records. */
-        memset(cache->styles, 0, sizeof(cache->styles));
-        style_retained_matches_invalidate_rules(
-            cache->matches, cache->sheet, cache->has_rules,
-            cache->has_rule_count);
-        cache->structure_pass_done = true;
-    }
-    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
-        LayoutReuseStyleEntry *entry = &cache->styles[i];
-        if (entry->node != NULL
-            && layout_node_is_within(node, entry->node)) {
-            memset(entry, 0, sizeof(*entry));
-        }
-    }
-    style_retained_matches_invalidate_ancestors(cache->matches, node);
+    if (relational
+        && !layout_reuse_has_note(cache, parent, true, NULL, NULL, 0)) return;
+    layout_reuse_invalidate_child_list(cache, parent, NULL, removed,
+                                       removed == NULL, true);
 }
 
 void layout_reuse_cache_enable_node_retirement(LayoutReuseCache *cache)
@@ -985,6 +1624,7 @@ void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
         }
     }
     style_retained_matches_forget_subtree(cache->matches, scope);
+    style_has_pending_retire(&cache->has_pending, scope);
     /* A pending token invalidation must not name a node about to die. */
     size_t kept = 0;
     for (size_t i = 0; i < cache->pending_node_count; i++) {
@@ -996,16 +1636,203 @@ void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
     cache->stats.retired_subtrees++;
 }
 
-void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
-                                        lxb_dom_node_t *node,
-                                        bool text_or_structure_sensitive)
+void layout_reuse_cache_invalidate_relational(
+    LayoutReuseCache *cache, lxb_dom_node_t *node, const char *attribute,
+    bool text_or_structure_sensitive)
 {
-    if (cache != NULL && cache->selector_has_has) {
+    if (cache == NULL || node == NULL) {
         layout_reuse_cache_reset(cache);
+        return;
+    }
+    if (!layout_reuse_has_note(cache, node, text_or_structure_sensitive,
+                               attribute, NULL, 0)) return;
+    /* The :has() side is noted; other selectors see an attribute write
+       as any other. */
+    if (attribute != NULL && !text_or_structure_sensitive) {
+        layout_reuse_cache_invalidate_own_attribute(cache, node, attribute);
         return;
     }
     layout_reuse_cache_invalidate_node_scoped(
         cache, node, text_or_structure_sensitive);
+}
+
+void layout_reuse_cache_invalidate_overflow_root(LayoutReuseCache *cache,
+                                                 lxb_dom_node_t *root)
+{
+    if (cache == NULL || root == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    /* Anchors inside the subtree have their subjects inside it too (or
+       keyed anywhere); those at and above it are the walk's. */
+    if (!layout_reuse_has_note(cache, root, true, NULL, NULL, 0)) return;
+    layout_reuse_drop_subtree(cache, root, true);
+    layout_reuse_cache_invalidate_measurements(cache, root);
+    cache->stats.overflow_scoped++;
+}
+
+void layout_reuse_cache_set_structure_filter(LayoutReuseCache *cache,
+                                             uint64_t entries,
+                                             uint32_t serial)
+{
+    if (cache == NULL) return;
+    cache->structure_entries = entries;
+    cache->structure_serial = serial;
+}
+
+void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
+                                        lxb_dom_node_t *node,
+                                        bool text_or_structure_sensitive)
+{
+    layout_reuse_cache_invalidate_relational(
+        cache, node, NULL, text_or_structure_sensitive);
+}
+
+/* Longer journal names may be truncated prefixes (and coalesce). */
+#define LAYOUT_REUSE_PROPERTY_NAME_LIMIT 31u
+
+/* Attributes the style resolver or a pseudo-class reads without an
+   attribute selector naming them, which a selector can then read on
+   elements other than its subject (`input:checked + label`), or which the
+   resolver reads on other elements: form-control state and validity
+   (fieldset/optgroup/select disabling, option display, :checked,
+   :required, :read-only, :placeholder-shown, :default, :in-range...),
+   links, popovers and dialogs, direction and language, a details
+   element's open state (its children), table presentation (cells read
+   the table), and the navigation roles and ARIA states a custom element's
+   fallbacks look up. */
+static bool layout_attribute_reaches_other_elements(const char *name)
+{
+    static const char *const names[] = {
+        "disabled", "multiple", "selected", "dir", "lang", "open", "role",
+        "cellpadding", "cellspacing", "border", "rules", "frame", "align",
+        "valign", "bgcolor", "background", "checked", "required",
+        "readonly", "placeholder", "value", "type", "name", "form", "min",
+        "max", "step", "pattern", "minlength", "maxlength", "href",
+        "popover", "hidden", "inert", "contenteditable", "controls",
+        "aria-expanded", "aria-hidden", "aria-selected", "aria-checked",
+        "aria-disabled", "aria-current", "aria-pressed", "for", "list",
+        "size", "span", "colspan", "rowspan", "start", "reversed",
+    };
+    if (strncmp(name, "data-tilefinch", 14) == 0) return true;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(name, names[i]) == 0) return true;
+    }
+    return false;
+}
+
+void layout_reuse_cache_invalidate_own_attribute(
+    LayoutReuseCache *cache, lxb_dom_node_t *node, const char *attribute)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    size_t length = attribute == NULL ? 0 : strlen(attribute);
+    /* A selector naming the attribute (in any position) can restyle other
+       elements; so can the few attributes the resolver reads elsewhere.
+       Otherwise the attribute is visible only to the element's own
+       cascade (presentational mapping, its own pseudo-class state):
+       its descendants re-key off its style if that changes. */
+    if (length == 0 || length >= LAYOUT_REUSE_PROPERTY_NAME_LIMIT
+        || strcmp(attribute, "class") == 0 || strcmp(attribute, "id") == 0
+        || strcmp(attribute, "style") == 0 || cache->sheet == NULL
+        || layout_attribute_reaches_other_elements(attribute)) {
+        layout_reuse_cache_invalidate_node_scoped(cache, node, false);
+        return;
+    }
+    if (!stylesheet_selectors_reference_attribute_prefix(
+            cache->sheet, attribute, length)) {
+        layout_reuse_drop_element(cache, node, true);
+        layout_reuse_cache_invalidate_measurements(cache, node);
+        cache->stats.own_attribute_scoped++;
+        return;
+    }
+    /* Selectors name it: as for a class change, the element and the
+       subjects of the rules that read it off another element. */
+    uint32_t token = stylesheet_identity_attribute_hash(attribute, length);
+    uint32_t keys[LAYOUT_IDENTITY_KEY_LIMIT];  /* 2 KiB of stack */
+    size_t key_count = 0;
+    bool sibling = false;
+    uint64_t names = 0;
+    if (!layout_identity_reach(cache, &token, 1, keys, &key_count, &sibling,
+                               &names)
+        || cache->identity_attributes_opaque
+        || (sibling && (node->parent == NULL
+                        || node->parent->type != LXB_DOM_NODE_TYPE_ELEMENT))) {
+        layout_reuse_cache_invalidate_node_scoped(cache, node, false);
+        return;
+    }
+    /* Retained match lists test attribute selectors by name. */
+    layout_reuse_drop_reached(cache, node, keys, key_count, sibling, names);
+    if (cache->matches != NULL)
+        style_retained_matches_invalidate_within(cache->matches,
+                                                 sibling ? node->parent
+                                                         : node);
+    cache->stats.own_attribute_keyed++;
+}
+
+void layout_reuse_cache_invalidate_inline_style(
+    LayoutReuseCache *cache, lxb_dom_node_t *node, const char *property,
+    bool relational)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    if (relational) {
+        /* An inline declaration is visible to selectors only as the style
+           attribute. */
+        layout_reuse_cache_invalidate_relational(cache, node, "style", false);
+        return;
+    }
+    /* Unless a selector reads the style attribute, the write changes this
+       element's own cascade (its descendants re-key off its style if that
+       changes) and the custom properties it declares, which descendants
+       read by name, not through its computed style. */
+    bool scoped = cache->sheet != NULL
+        && !stylesheet_selectors_reference_attribute_prefix(
+               cache->sheet, "style", 5);
+    uint64_t names = 0;
+    if (scoped && property != NULL) {
+        size_t length = strlen(property);
+        if (length == 0 || length >= LAYOUT_REUSE_PROPERTY_NAME_LIMIT) {
+            scoped = false;
+        } else if (length > 2 && property[0] == '-' && property[1] == '-') {
+            names = stylesheet_custom_property_name_bits(property, length);
+        }
+    } else if (scoped) {
+        /* The whole attribute: the names it declared when last resolved
+           and the names it declares now. */
+        const LayoutReuseStyleEntry *previous = NULL;
+        size_t home = layout_pointer_hash(node)
+                      & (LAYOUT_REUSE_STYLE_CAPACITY - 1u);
+        for (size_t probe = 0; probe < 8 && previous == NULL; probe++) {
+            const LayoutReuseStyleEntry *entry = &cache->styles[
+                (home + probe) & (LAYOUT_REUSE_STYLE_CAPACITY - 1u)];
+            if (entry->node == node) previous = entry;
+        }
+        size_t length = 0;
+        const char *text = document_attribute(node, "style", &length);
+        if (previous == NULL) scoped = false;
+        else names = previous->inline_variables
+            | (text == NULL ? 0
+               : stylesheet_inline_custom_property_bits(text, length));
+    }
+    if (!scoped) {
+        layout_reuse_cache_invalidate_node_scoped(cache, node, false);
+        return;
+    }
+    layout_reuse_drop_element(cache, node, false);
+    for (size_t i = 0; names != 0 && i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node != NULL && (entry->variable_reads & names) != 0
+            && layout_node_is_within(entry->node, node)) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    layout_reuse_cache_invalidate_measurements(cache, node);
+    cache->stats.inline_style_scoped++;
 }
 
 void layout_reuse_cache_invalidate_focus(
@@ -1015,17 +1842,21 @@ void layout_reuse_cache_invalidate_focus(
         layout_reuse_cache_reset(cache);
         return;
     }
-    if (cache->selector_focus_has_sibling || cache->selector_has_focus_within
-        || cache->selector_has_has) {
-        /* An ancestor's :focus-within / :has(:focus) can change rules on
-           another descendant even without a sibling combinator. Parent
-           style hashes cannot invalidate exact matched-rule lists, and may
-           not change at all when only that descendant is styled. */
+    if (cache->selector_focus_has_sibling) {
+        /* A sibling of the focused element (or of an ancestor) can be
+           styled by it; nothing here scopes those. */
         layout_reuse_cache_reset(cache);
         return;
     }
-    /* Focus, :focus-within, and :has(:focus) without sibling combinators can
-       change the focused subtree and its ancestor chain. Descendant cache
+    /* A :has(:focus) answer moves like any other state a :has() reads, and
+       so does a :focus-within: the :has() plan drops the anchors on this
+       node's ancestor chain and the subjects their rules style (an
+       ancestor's :focus-within can style a descendant whose parent style
+       does not change). */
+    if (!layout_reuse_has_note(cache, node, false, "data-tilefinch-focus",
+                               NULL, 0)) return;
+    /* Focus without sibling combinators or :focus-within can change the
+       focused subtree and its ancestor chain. Descendant cache
        keys include the complete parent style, so a changed inherited or
        geometric ancestor value naturally misses below the first recomputed
        ancestor. Intrinsic measurements touching the node are cleared by the
@@ -1101,6 +1932,71 @@ bool layout_reuse_cache_can_reuse_mutations(const LayoutReuseCache *cache)
     return cache != NULL;
 }
 
+/* The offset of the first `pseudo` (any text) at or after `from` in
+   `selector` outside every :has() argument (those are the scoped :has()
+   invalidation's), or SIZE_MAX. */
+static size_t layout_selector_find_outside_has(const char *selector,
+                                               const char *pseudo,
+                                               size_t from)
+{
+    size_t length = strlen(pseudo);
+    unsigned depth = 0, has_depth = 0;
+    for (const char *at = selector; *at != '\0'; at++) {
+        if (*at == '(') {
+            depth++;
+            if (has_depth == 0 && at - selector >= 4
+                && strncmp(at - 4, ":has", 4) == 0) has_depth = depth;
+        } else if (*at == ')' && depth != 0) {
+            if (depth == has_depth) has_depth = 0;
+            depth--;
+        } else if (has_depth == 0 && (size_t) (at - selector) >= from
+                   && strncmp(at, pseudo, length) == 0) {
+            return (size_t) (at - selector);
+        }
+    }
+    return SIZE_MAX;
+}
+
+static bool layout_selector_pseudo_outside_has(const char *selector,
+                                               const char *pseudo)
+{
+    return layout_selector_find_outside_has(selector, pseudo, 0) != SIZE_MAX;
+}
+
+static void layout_reuse_note_empty_keys(LayoutReuseCache *cache,
+                                         const char *selector,
+                                         const char *pseudo)
+{
+    size_t length = strlen(selector);
+    for (size_t at = layout_selector_find_outside_has(selector, pseudo, 0);
+         at != SIZE_MAX;
+         at = layout_selector_find_outside_has(selector, pseudo, at + 1)) {
+        uint32_t key = style_selector_compound_key_at(selector, length, at);
+        bool present = false;
+        for (size_t i = 0; i < cache->empty_key_count; i++)
+            present = present || cache->empty_keys[i] == key;
+        if (present) continue;
+        if (key == 0 || cache->empty_key_count == LAYOUT_REUSE_EMPTY_KEY_LIMIT)
+            cache->empty_any = true;
+        else
+            cache->empty_keys[cache->empty_key_count++] = key;
+    }
+}
+
+/* Whether a change to `element`'s children can restyle its siblings
+   through an :empty test (see LayoutReuseCache.empty_keys). */
+static bool layout_reuse_empty_reaches_siblings(
+    const LayoutReuseCache *cache, const lxb_dom_node_t *element)
+{
+    if (!cache->selector_has_empty || element == NULL) return false;
+    if (cache->empty_any) return true;
+    for (size_t i = 0; i < cache->empty_key_count; i++) {
+        if (style_element_carries_key(element, cache->empty_keys[i]))
+            return true;
+    }
+    return false;
+}
+
 static void layout_reuse_note_selector_dependencies(
     LayoutReuseCache *cache, const char *selector, uint32_t rule_index)
 {
@@ -1109,17 +2005,28 @@ static void layout_reuse_note_selector_dependencies(
        attribute selector; most rules (plain classes) have none, and this
        runs over the whole sheet whenever a new one is bound. */
     if (strpbrk(selector, ":+~[") == NULL) return;
-    if (strstr(selector, ":has(") != NULL) {
+    /* A :focus-within is a :has() of the focus marker: the sheet's :has()
+       plan scopes both. */
+    if (strstr(selector, ":has(") != NULL
+        || strstr(selector, ":focus-within") != NULL)
         cache->selector_has_has = true;
-        if (strchr(selector, '+') != NULL || strchr(selector, '~') != NULL) {
-            cache->selector_has_has_sibling = true;
-        }
-        if (rule_index == UINT32_MAX
-            || cache->has_rule_count == LAYOUT_REUSE_HAS_RULE_LIMIT) {
-            cache->has_rules_bounded = true;
-        } else {
-            cache->has_rules[cache->has_rule_count++] = rule_index;
-        }
+    if (strchr(selector, '+') != NULL || strchr(selector, '~') != NULL
+        || strstr(selector, "-child") != NULL
+        || strstr(selector, "-of-type") != NULL)
+        style_selector_structure_keys(selector, strlen(selector),
+                                      &cache->structure);
+    /* Only through a sibling combinator (or an `of S` count) can an
+       element's :empty restyle anything outside its own subtree. */
+    if ((strstr(selector, ":empty") != NULL
+         || strstr(selector, ":blank") != NULL)
+        && (layout_selector_pseudo_outside_has(selector, ":empty")
+            || layout_selector_pseudo_outside_has(selector, ":blank"))
+        && (layout_selector_pseudo_outside_has(selector, "+")
+            || layout_selector_pseudo_outside_has(selector, "~")
+            || layout_selector_pseudo_outside_has(selector, " of "))) {
+        cache->selector_has_empty = true;
+        layout_reuse_note_empty_keys(cache, selector, ":empty");
+        layout_reuse_note_empty_keys(cache, selector, ":blank");
     }
     if (strstr(selector, "checked") != NULL
         || strstr(selector, ":default") != NULL
@@ -1137,9 +2044,6 @@ static void layout_reuse_note_selector_dependencies(
                 cache->state_rules[cache->state_rule_count++] = rule_index;
             }
         }
-    }
-    if (strstr(selector, ":focus-within") != NULL) {
-        cache->selector_has_focus_within = true;
     }
     if ((strstr(selector, ":focus") != NULL)
         && (strchr(selector, '+') != NULL
@@ -1195,12 +2099,12 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
     cache->images = images;
     cache->viewport_width = viewport_width;
     cache->selector_has_has = false;
-    cache->selector_has_has_sibling = false;
-    cache->selector_has_focus_within = false;
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
-    cache->has_rule_count = 0;
-    cache->has_rules_bounded = false;
+    cache->selector_has_empty = false;
+    cache->empty_key_count = 0;
+    cache->empty_any = false;
+    memset(&cache->structure, 0, sizeof(cache->structure));
     cache->state_rule_count = 0;
     cache->state_rules_bounded = false;
     if (sheet == NULL) return;
@@ -1249,7 +2153,8 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
                                           lxb_dom_node_t *node,
                                           uint64_t parent_hash,
                                           const ComputedStyle *style,
-                                          bool font_dependent)
+                                          bool font_dependent,
+                                          uint64_t variable_reads)
 {
     if (cache == NULL || node == NULL || style == NULL) return;
     size_t home = layout_pointer_hash(node)
@@ -1278,11 +2183,18 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
     uint8_t bit = (uint8_t) (1u << (replacement % 8u));
     cache->font_dependent[replacement / 8u] &= (uint8_t) ~bit;
     if (font_dependent) cache->font_dependent[replacement / 8u] |= bit;
+    size_t inline_length = 0;
+    const char *inline_style = document_attribute(node, "style",
+                                                  &inline_length);
     cache->styles[replacement] = (LayoutReuseStyleEntry) {
         .node = node,
         .parent_hash = parent_hash,
         .style = *style,
-        .stamp = ++cache->clock
+        .stamp = ++cache->clock,
+        .variable_reads = variable_reads,
+        .inline_variables = inline_style == NULL ? 0
+            : stylesheet_inline_custom_property_bits(inline_style,
+                                                     inline_length)
     };
 }
 
@@ -1343,6 +2255,55 @@ static void layout_resolve_canonical_style(
     }
 }
 
+static LayoutReuseStyleEntry *layout_reuse_entry_for(
+    const LayoutReuseCache *cache, const lxb_dom_node_t *node)
+{
+    size_t home = layout_pointer_hash((lxb_dom_node_t *) node)
+                  & (LAYOUT_REUSE_STYLE_CAPACITY - 1u);
+    for (size_t probe = 0; probe < 8; probe++) {
+        const LayoutReuseStyleEntry *entry = &cache->styles[
+            (home + probe) & (LAYOUT_REUSE_STYLE_CAPACITY - 1u)];
+        if (entry->node == node) return (LayoutReuseStyleEntry *) entry;
+    }
+    return NULL;
+}
+
+bool layout_reuse_pseudo_absent(const LayoutReuseCache *cache,
+                                const Stylesheet *sheet,
+                                const lxb_dom_node_t *node,
+                                PseudoElement pseudo,
+                                const ComputedStyle *parent)
+{
+    if (cache == NULL || sheet == NULL || cache->sheet != sheet
+        || node == NULL || parent == NULL || pseudo == PSEUDO_NONE)
+        return false;
+    const LayoutReuseStyleEntry *entry = layout_reuse_entry_for(cache, node);
+    return entry != NULL
+        && (entry->pseudo_absent & (1u << pseudo)) != 0
+        && memcmp(&entry->style, parent, sizeof(*parent)) == 0;
+}
+
+void layout_reuse_note_pseudo(LayoutReuseCache *cache,
+                              const Stylesheet *sheet,
+                              const lxb_dom_node_t *node,
+                              PseudoElement pseudo,
+                              const ComputedStyle *parent,
+                              const ComputedStyle *result)
+{
+    if (cache == NULL || sheet == NULL || cache->sheet != sheet
+        || node == NULL || parent == NULL || pseudo == PSEUDO_NONE) return;
+    LayoutReuseStyleEntry *entry = layout_reuse_entry_for(cache, node);
+    if (entry == NULL || memcmp(&entry->style, parent, sizeof(*parent)) != 0)
+        return;
+    uint8_t bit = (uint8_t) (1u << pseudo);
+    /* A custom property can change what it generates without restyling
+       the element: such pseudo-elements are always resolved. */
+    if (!result->generated_content && sheet->variable_read_names == 0)
+        entry->pseudo_absent |= bit;
+    else
+        entry->pseudo_absent &= (uint8_t) ~bit;
+}
+
 bool layout_reuse_cache_resolve_style(LayoutReuseCache *cache,
                                       const Stylesheet *sheet,
                                       const FontSet *fonts,
@@ -1356,12 +2317,16 @@ bool layout_reuse_cache_resolve_style(LayoutReuseCache *cache,
     if (layout_reuse_style_get_hashed(
             cache, node, parent_hash, result)) return true;
     bool font_dependent = false;
+    /* The resolution records the custom properties it reads (the focus
+       probe's resolutions included: a superset is safe). */
+    if (sheet != NULL) ((Stylesheet *) sheet)->variable_read_names = 0;
     layout_resolve_canonical_style(
         sheet, fonts, stylesheet_web_font_set(sheet),
         node, parent, result, &font_dependent,
         cache != NULL && cache->sheet == sheet ? cache->matches : NULL);
     layout_reuse_style_put_hashed(
-        cache, node, parent_hash, result, font_dependent);
+        cache, node, parent_hash, result, font_dependent,
+        sheet == NULL ? 0 : sheet->variable_read_names);
     return false;
 }
 
@@ -2544,6 +3509,8 @@ static void layout_job_capture_performance(LayoutBuildJob *job)
         (unsigned long long) context->style_cache_misses,
         context->counter_entry_count, layout->count);
 #endif
+    TILEFINCH_WORK_ADD(layout_passes, 1);
+    TILEFINCH_WORK_ADD(layout_commands, layout->count);
     layout->performance.style_resolutions = context->style_resolutions;
     layout->performance.style_cache_hits = context->style_cache_hits;
     layout->performance.style_cache_misses = context->style_cache_misses;

@@ -462,6 +462,10 @@ static bool navigation_selector_mentions_attribute(
         return true;
     }
     size_t attribute_length = strlen(attribute);
+    /* The renderer journal truncates names. An exact-match negative for
+       such a prefix cannot justify skipping selector/generated-text work. */
+    if (attribute_length >= SCRIPT_MUTATION_ATTRIBUTE_LIMIT - 1u)
+        return true;
     size_t selector_count = sheet->count + sheet->custom_rule_count;
     for (size_t i = 0; i < selector_count; i++) {
         const char *selector = i < sheet->count
@@ -500,12 +504,16 @@ static bool navigation_selector_mentions_attribute(
     }
     for (size_t i = 0; i < sheet->declaration_count; i++) {
         const StyleDeclaration *declaration = &sheet->declarations[i];
-        const ComputedStyle *values = &declaration->values;
-        if (values->generated_attr != NULL
-            && values->generated_attr_length == attribute_length
-            && memcmp(values->generated_attr, attribute,
-                      attribute_length) == 0) {
-            return true;
+        if ((declaration->values_flags
+             & STYLE_DECLARATION_VALUES_GENERATED_ATTR) != 0) {
+            ComputedStyle values;
+            stylesheet_declaration_values(sheet, declaration, &values);
+            if (values.generated_attr != NULL
+                && values.generated_attr_length == attribute_length
+                && memcmp(values.generated_attr, attribute,
+                          attribute_length) == 0) {
+                return true;
+            }
         }
         /* A var()-dependent declaration is resolved against the element at
            match time, so its final attr() name is not necessarily present in
@@ -540,11 +548,32 @@ static bool navigation_head_scripts_are_nonvisual(const NavigationPage *page)
     return style.display == DISPLAY_NONE;
 }
 
+/* The stylesheet's recorded sources are compared by address during style
+   append; one that is freed could be mistaken for a later element at its
+   address, so its sheet stops vouching for any source. */
+static void navigation_retire_style_sources(Stylesheet *sheet,
+                                            const lxb_dom_node_t *root)
+{
+    if (sheet->style_sources_bounded_out) return;
+    for (size_t i = 0; i < sheet->style_source_count; i++) {
+        size_t depth = 0;
+        for (const lxb_dom_node_t *at = sheet->style_source_nodes[i];
+             at != NULL; at = at->parent) {
+            if (at == root || ++depth > 4096) {
+                sheet->style_sources_bounded_out = true;
+                return;
+            }
+        }
+    }
+}
+
 static void navigation_retire_subtree(void *opaque,
                                       const lxb_dom_node_t *root)
 {
     NavigationSession *session = opaque;
-    if (session == NULL || session->page.layout_reuse == NULL) return;
+    if (session == NULL) return;
+    navigation_retire_style_sources(&session->page.stylesheet, root);
+    if (session->page.layout_reuse == NULL) return;
     layout_reuse_cache_retire_subtree(session->page.layout_reuse, root);
 }
 
@@ -797,24 +826,6 @@ static lxb_dom_node_t *navigation_style_owner(lxb_dom_node_t *node)
     return NULL;
 }
 
-static bool navigation_link_is_stylesheet(lxb_dom_node_t *node)
-{
-    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
-        || !node_name_is(node, "link")) return false;
-    size_t length = 0;
-    const char *rel = document_attribute(node, "rel", &length);
-    if (rel == NULL) return false;
-    size_t at = 0;
-    while (at < length) {
-        while (at < length && isspace((unsigned char) rel[at])) at++;
-        size_t begin = at;
-        while (at < length && !isspace((unsigned char) rel[at])) at++;
-        if (at - begin == 10 && strncasecmp(rel + begin, "stylesheet", 10) == 0)
-            return true;
-    }
-    return false;
-}
-
 static lxb_dom_node_t *navigation_document_order_next(
     lxb_dom_node_t *node, const lxb_dom_node_t *root)
 {
@@ -826,10 +837,30 @@ static lxb_dom_node_t *navigation_document_order_next(
     return NULL;
 }
 
-/* An inserted subtree's <style>/<link> stylesheet sources. Returns false
-   when the subtree is too large to inspect or holds a stylesheet source
-   that cannot be appended (a <link>, or a <style> the sheet already knows). */
-static bool navigation_collect_inserted_styles(
+static bool navigation_style_candidate_add(
+    lxb_dom_node_t **candidates, size_t *count, size_t capacity,
+    lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < *count; i++) {
+        if (candidates[i] == node) return true;
+    }
+    if (*count == capacity) return false;
+    candidates[(*count)++] = node;
+    return true;
+}
+
+static bool navigation_is_style_source_candidate(lxb_dom_node_t *node)
+{
+    return node_name_is(node, "style") || navigation_is_stylesheet_link(node)
+        || navigation_is_style_preload(node);
+}
+
+/* A connected subtree's <style> elements and stylesheet or style-preload
+   <link> elements. Returns false when the subtree is too large to inspect,
+   holds a <base> (every URL would resolve anew) or holds a source the sheet
+   already ingested: a subtree the journal records only as moved may have
+   been edited while it was detached. */
+static bool navigation_collect_subtree_sources(
     const Stylesheet *sheet, lxb_dom_node_t *root,
     lxb_dom_node_t **candidates, size_t *count, size_t capacity)
 {
@@ -839,26 +870,101 @@ static bool navigation_collect_inserted_styles(
          at = navigation_document_order_next(at, root)) {
         if (++work > MAXIMUM_SUBTREE_WORK) return false;
         if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (navigation_link_is_stylesheet(at)) return false;
-        if (!node_name_is(at, "style")) continue;
-        if (stylesheet_style_source_known(sheet, at)) return false;
-        bool present = false;
-        for (size_t i = 0; !present && i < *count; i++) {
-            present = candidates[i] == at;
-        }
-        if (present) continue;
-        if (*count == capacity) return false;
-        candidates[(*count)++] = at;
+        if (node_name_is(at, "base")) return false;
+        if (!navigation_is_style_source_candidate(at)) continue;
+        if (stylesheet_style_source_known(sheet, at)
+            || !navigation_style_candidate_add(
+                   candidates, count, capacity, at)) return false;
     }
     return true;
 }
 
+/* Whether the sheet a link names already has its rules applied: the ordered
+   loaders apply one URL once, at its first reference, so a new or changed
+   reference to it is not a plain insertion. Known sources are live here
+   (a freed one leaves the sheet's sources bounded out). */
+static bool navigation_link_url_applied(NavigationSession *session,
+                                        lxb_dom_node_t *link)
+{
+    size_t href_length = 0;
+    const char *href = document_attribute(link, "href", &href_length);
+    if (href == NULL) return false;
+    if (stylesheet_document_resources_link_applied(
+            &session->page.stylesheet_resources,
+            session->page.resource_base_url, href, href_length)) return true;
+    const Stylesheet *sheet = &session->page.stylesheet;
+    for (size_t i = 0; i < sheet->style_source_count; i++) {
+        lxb_dom_node_t *source =
+            (lxb_dom_node_t *) sheet->style_source_nodes[i];
+        if (source == link || !node_name_is(source, "link")) continue;
+        size_t length = 0;
+        const char *other = document_attribute(source, "href", &length);
+        if (other != NULL && length == href_length
+            && memcmp(other, href, length) == 0) return true;
+    }
+    return false;
+}
+
+static const char *navigation_page_document_url(NavigationSession *session)
+{
+    if (session->page.document_url[0] != '\0')
+        return session->page.document_url;
+    const NavigationEntry *entry = navigation_current(session);
+    return entry == NULL ? NULL : entry->url;
+}
+
+typedef struct {
+    NavigationSession *session;
+    lxb_dom_node_t *link;
+} NavigationLinkAppend;
+
+static bool navigation_append_link_source(Stylesheet *sheet, void *opaque)
+{
+    NavigationLinkAppend *input = opaque;
+    NavigationSession *session = input->session;
+    uint64_t started = navigation_now_us();
+    bool loaded = stylesheets_append_ordered_suffix_with_context(
+        sheet, session->budget, &input->link, 1,
+        session->page.resource_base_url,
+        navigation_page_document_url(session),
+        session->page.referrer_policy,
+        &session->page.document.content_security_policy,
+        session->maximum_stylesheets, session->maximum_stylesheet_bytes,
+        session->maximum_stylesheet_file_bytes, session->resource_timeout_ms,
+        session->page.resource_scheduler, session->browser_session,
+        &session->page.stylesheet_resources,
+        &session->page.external_stylesheets);
+    session->performance.style_append_load_us += navigation_now_us() - started;
+    return loaded;
+}
+
+static bool navigation_settle_style_preloads(
+    NavigationSession *session, lxb_dom_node_t *const *nodes, size_t count)
+{
+    return count == 0 || stylesheets_settle_style_preloads_with_context(
+        &session->page.stylesheet, session->budget, nodes, count,
+        session->page.resource_base_url,
+        navigation_page_document_url(session),
+        session->page.referrer_policy,
+        &session->page.document.content_security_policy,
+        session->maximum_stylesheets, session->maximum_stylesheet_bytes,
+        session->maximum_stylesheet_file_bytes, session->resource_timeout_ms,
+        session->page.resource_scheduler, session->browser_session,
+        &session->page.stylesheet_resources,
+        &session->page.external_stylesheets);
+}
+
 /* A page's late initialization commonly inserts small <style> elements one
-   after another. Rebuilding the whole sheet for each costs seconds on the
-   device and resets every retained style answer. When the journal proves
-   the only stylesheet change is newly inserted <style> elements that follow
-   every source the sheet already ingested, append them in place and keep
-   the retained matched-rule lists for elements the new rules cannot select. */
+   after another, and switches a preloaded sheet's <link> to a stylesheet.
+   Rebuilding the whole sheet for each re-parses and re-fetches every
+   source, reloads every image and costs seconds on the device. When the
+   journal proves the only stylesheet change is sources the sheet has not
+   ingested (new <style> blocks, new or newly-stylesheet <link>s, style
+   preloads), insert their rules at their document position in place and
+   keep the retained matched-rule lists for elements the new rules cannot
+   select. Every source the sheet already holds must still be connected, in
+   the same order, and unchanged; image resources the journal cannot account
+   for keep the full rebuild. */
 static bool navigation_style_append_refused(const char *reason)
 {
 #ifndef TILEFINCH_NO_TRACE
@@ -870,136 +976,250 @@ static bool navigation_style_append_refused(const char *reason)
     return false;
 }
 
-static bool navigation_try_append_inserted_styles(
-    NavigationSession *session, const ScriptMutationJournal *mutations)
+/* `images_rebuilt`: this relayout re-derives the whole image table anyway,
+   so image elements the journal cannot account for are not a reason to
+   refuse. */
+static bool navigation_try_append_style_sources(
+    NavigationSession *session, const ScriptMutationJournal *mutations,
+    bool images_rebuilt, bool *images_affected)
 {
     enum { CANDIDATE_LIMIT = 8, ORDER_WALK_LIMIT = 16384 };
+    *images_affected = false;
+    uint64_t walk_started = navigation_now_us();
     if (session == NULL || mutations == NULL || mutations->overflowed
-        || mutations->count == 0) return navigation_style_append_refused("journal");
+        || mutations->retirement_unobserved || mutations->count == 0
+        || (mutations->image_rebuild_required && !images_rebuilt))
+        return navigation_style_append_refused("journal");
     Stylesheet *sheet = &session->page.stylesheet;
     if (sheet->style_sources_bounded_out || sheet->count == 0)
         return navigation_style_append_refused("sources unknown");
     lxb_dom_node_t *candidates[CANDIDATE_LIMIT];
     size_t count = 0;
+    /* Whether every record describes its change exactly. A removal, a move,
+       an innerHTML replacement or an unknown change may also have taken
+       image elements away, which only the fingerprint can rule out. */
+    bool precise = true;
     for (size_t i = 0; i < mutations->count; i++) {
         const ScriptMutationRecord *record = &mutations->records[i];
         lxb_dom_node_t *node = record->node;
         if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT
             || record->kind == SCRIPT_MUTATION_CANVAS) continue;
-        if (node == NULL) return navigation_style_append_refused("retired node");
+        if (node == NULL) {
+            /* Freed since. A freed source bounded the sheet's sources out
+               (navigation_retire_subtree); what it left must not be one. */
+            precise = false;
+            if (record->scope != NULL
+                && (navigation_style_owner(record->scope) != NULL
+                    || stylesheet_style_source_known(sheet, record->scope)))
+                return navigation_style_append_refused("source changed");
+            continue;
+        }
+        if (node_name_is(node, "base"))
+            return navigation_style_append_refused("base");
         lxb_dom_node_t *owner = navigation_style_owner(node);
         if (owner != NULL) {
-            /* Content of an already ingested <style> changed. */
+            /* Content or attributes of an already ingested <style>. */
             if (stylesheet_style_source_known(sheet, owner))
                 return navigation_style_append_refused("known style changed");
-            if (!navigation_node_connected(owner))
-                return navigation_style_append_refused("style detached");
-            bool present = false;
-            for (size_t k = 0; !present && k < count; k++) {
-                present = candidates[k] == owner;
+            if (!navigation_node_connected(owner)) {
+                precise = false;
+                continue;
             }
-            if (!present) {
-                if (count == CANDIDATE_LIMIT) return false;
-                candidates[count++] = owner;
-            }
+            if (!navigation_style_candidate_add(
+                    candidates, &count, CANDIDATE_LIMIT, owner))
+                return navigation_style_append_refused("candidates");
+            continue;
+        }
+        if (node_name_is(node, "link")) {
+            /* A link whose sheet is applied cannot change or leave without
+               taking its rules along. Any other link holds no rule. */
+            if (stylesheet_style_source_known(sheet, node)
+                || navigation_link_url_applied(session, node))
+                return navigation_style_append_refused("applied link changed");
+            if (record->kind != SCRIPT_MUTATION_ATTRIBUTE
+                && record->kind != SCRIPT_MUTATION_INLINE_STYLE
+                && !(record->kind == SCRIPT_MUTATION_CHILD_LIST
+                     && record->inserted_from_detached)) precise = false;
+            if (navigation_node_connected(node)
+                && (navigation_is_stylesheet_link(node)
+                    || navigation_is_style_preload(node))
+                && !navigation_style_candidate_add(
+                       candidates, &count, CANDIDATE_LIMIT, node))
+                return navigation_style_append_refused("candidates");
             continue;
         }
         switch (record->kind) {
         case SCRIPT_MUTATION_CHILD_LIST:
-            if (!record->inserted_from_detached
-                || !navigation_node_connected(node))
-                return navigation_style_append_refused("child list not an insertion");
-            if (!navigation_collect_inserted_styles(
+        case SCRIPT_MUTATION_INNER_HTML:
+            if (record->kind != SCRIPT_MUTATION_CHILD_LIST
+                || !record->inserted_from_detached) precise = false;
+            /* A removal leaves no candidate; the document walk below proves
+               no ingested source went with it. */
+            if (!navigation_node_connected(node)) continue;
+            if (!navigation_collect_subtree_sources(
                     sheet, node, candidates, &count, CANDIDATE_LIMIT))
                 return navigation_style_append_refused("inserted subtree");
             break;
-        case SCRIPT_MUTATION_INNER_HTML:
-            /* The live replacement cannot tell us whether the destroyed
-               subtree contained a stylesheet. Without removal provenance,
-               rebuild rather than retain possibly deleted rules. */
-            return navigation_style_append_refused("innerHTML replacement");
         case SCRIPT_MUTATION_ATTRIBUTE:
         case SCRIPT_MUTATION_INLINE_STYLE:
         case SCRIPT_MUTATION_TEXT:
-            if (node_name_is(node, "link"))
-                return navigation_style_append_refused("link mutation");
+            break;
+        case SCRIPT_MUTATION_UNKNOWN:
+            precise = false;
             break;
         default:
             return navigation_style_append_refused("record kind");
         }
     }
-    if (count == 0) return navigation_style_append_refused("no candidates");
-    /* Cascade order is document order. One walk positions every candidate
-       among the sources the sheet already holds. */
+    const char *document_url = navigation_page_document_url(session);
+    bool fetch_links = session->external_resources_enabled
+        && document_url != NULL && session->page.resource_scheduler != NULL
+        && session->page.resource_base_url[0] != '\0'
+        && session->resource_timeout_ms > 0;
+    /* Cascade order is document order. One walk proves the ingested sources
+       are all still connected and in their recorded order, and positions
+       every candidate among them. */
     lxb_dom_node_t *root = lxb_dom_interface_node(session->page.document.html);
     lxb_dom_node_t *ordered[CANDIDATE_LIMIT];
     size_t after[CANDIDATE_LIMIT];
-    size_t found = 0;
-    size_t seen_sources = 0;
-    size_t steps = 0;
-    for (lxb_dom_node_t *at = root; at != NULL && found < count
-                                      && steps < ORDER_WALK_LIMIT;
-         at = navigation_document_order_next(at, root), steps++) {
-        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        bool candidate = false;
-        for (size_t k = 0; !candidate && k < count; k++) {
-            candidate = candidates[k] == at;
+    size_t found = 0, seen = 0, steps = 0;
+    for (lxb_dom_node_t *at = root; at != NULL;
+         at = navigation_document_order_next(at, root)) {
+        if (++steps > ORDER_WALK_LIMIT)
+            return navigation_style_append_refused("document order");
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || (at->local_name != LXB_TAG_STYLE
+                && at->local_name != LXB_TAG_LINK)) continue;
+        if (seen < sheet->style_source_count
+            && sheet->style_source_nodes[seen] == at) {
+            seen++;
+            continue;
         }
-        if (candidate) {
+        if (stylesheet_style_source_known(sheet, at))
+            return navigation_style_append_refused("source order");
+        for (size_t k = 0; k < count; k++) {
+            if (candidates[k] != at) continue;
             ordered[found] = at;
-            after[found] = seen_sources;
+            after[found] = seen;
             found++;
-        } else if (stylesheet_style_source_known(sheet, at)) {
-            seen_sources++;
+            break;
         }
     }
-    if (found != count) return navigation_style_append_refused("document order");
-    StylesheetAppendResult result;
-    bool lists_valid = true;
-    size_t appended_total = 0;
-    for (size_t k = 0; k < count; k++) {
+    if (seen != sheet->style_source_count)
+        return navigation_style_append_refused("source removed");
+    if (found != count)
+        return navigation_style_append_refused("candidate order");
+    /* The journal describes image changes exactly, or they are ruled out
+       here: otherwise the rebuild must re-derive the image table. */
+    uint64_t fingerprint = 0;
+    if (!navigation_resource_fingerprint(
+            session, &session->page.document, &fingerprint))
+        return navigation_style_append_refused("fingerprint");
+    if (!precise && !images_rebuilt
+        && navigation_fingerprint_part_changed(session, 1))
+        return navigation_style_append_refused("images unaccounted");
+    session->performance.style_append_walk_us +=
+        navigation_now_us() - walk_started;
+    lxb_dom_node_t *preloads[CANDIDATE_LIMIT];
+    size_t preload_count = 0;
+    bool lists_valid = true, context_changed = false, links = false;
+    bool discovery = false;
+    size_t appended_total = 0, appended_sources = 0;
+    for (size_t k = 0; k < found; k++) {
+        lxb_dom_node_t *node = ordered[k];
+        bool style = node_name_is(node, "style");
+        if (!style) {
+            links = true;
+            /* Without external resources a full rebuild ignores links. */
+            if (!fetch_links) continue;
+            if (!navigation_is_stylesheet_link(node)) {
+                preloads[preload_count++] = node;
+                continue;
+            }
+        }
+        /* Earlier candidates that became sources precede this one. */
+        size_t position = after[k];
+        for (size_t j = 0; j < k; j++) {
+            if (stylesheet_style_source_known(sheet, ordered[j])) position++;
+        }
         StylesheetAppendResult step;
-        if (!stylesheet_append_style_elements_tracked(
-                sheet, &ordered[k], 1,
-                &session->page.document.content_security_policy,
-                after[k] + k, &step)) {
+        NavigationLinkAppend link = {session, node};
+        uint64_t load_before = session->performance.style_append_load_us;
+        uint64_t step_started = navigation_now_us();
+        bool appended = style
+            ? stylesheet_append_style_elements_tracked(
+                  sheet, &ordered[k], 1,
+                  &session->page.document.content_security_policy,
+                  position, &step)
+            : stylesheet_append_sources_tracked(
+                  sheet, navigation_append_link_source, &link, position,
+                  &step);
+        if (!appended) {
             session->performance.mutation_style_append_fallbacks++;
             return false;
         }
         /* A parse-context move changes declaration values, which the note
            below already discards; the exact selector answers survive it. */
         bool step_valid = step.remap != NULL && !step.appended_bounded_out;
+        uint64_t note_started = navigation_now_us();
+        uint64_t loaded = session->performance.style_append_load_us
+            - load_before;
+        uint64_t tracked = note_started - step_started;
+        session->performance.style_append_track_us +=
+            tracked > loaded ? tracked - loaded : 0;
         layout_reuse_cache_note_stylesheet_appended(
             session->page.layout_reuse, sheet, step.remap, step.old_count,
             step.appended, step.appended_count, step_valid);
+        uint64_t discovery_started = navigation_now_us();
+        session->performance.style_append_note_us +=
+            discovery_started - note_started;
         lists_valid = lists_valid && step_valid;
+        discovery = discovery || step.appended_bounded_out
+            || stylesheet_rules_affect_discovery(
+                   sheet, step.appended, step.appended_count);
+        session->performance.style_append_discovery_us +=
+            navigation_now_us() - discovery_started;
+        context_changed = context_changed || step.context_changed;
         appended_total += step.appended_count;
-        result = step;
+        appended_sources++;
         stylesheet_append_result_release(sheet, &step);
     }
-    result.remap = NULL;
-    result.appended = NULL; /* released with the last step above */
-    result.appended_count = appended_total;
+    if (!navigation_settle_style_preloads(session, preloads, preload_count)) {
+        session->performance.mutation_style_append_fallbacks++;
+        return false;
+    }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     {
         char message[160];
         snprintf(message, sizeof(message),
-                 "tilefinch-style-append: elements=%zu rules=%zu/%zu lists=%d "
-                 "context-changed=%d",
-                 count, result.appended_count, sheet->count,
-                 (int) lists_valid, (int) result.context_changed);
+                 "tilefinch-style-append: sources=%zu preloads=%zu "
+                 "rules=%zu/%zu lists=%d context-changed=%d",
+                 appended_sources, preload_count, appended_total,
+                 sheet->count, (int) lists_valid, (int) context_changed);
         tilefinch_platform_log_message(message);
     }
+#endif
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL)
+        fprintf(stderr, "style-append sources=%zu preloads=%zu rules=%zu/%zu "
+                "lists=%d context-changed=%d precise=%d\n", appended_sources,
+                preload_count, appended_total, sheet->count, (int) lists_valid,
+                (int) context_changed, (int) precise);
 #endif
     session->page.compiled_stylesheet_cacheable = false;
     if (session->page.runtime != NULL) {
         script_runtime_set_stylesheet(session->page.runtime, sheet);
     }
-    uint64_t fingerprint = 0;
-    if (navigation_resource_fingerprint(
-            session, &session->page.document, &fingerprint)) {
-        session->resource_fingerprint = fingerprint;
-    }
+    session->resource_fingerprint = fingerprint;
+    navigation_note_committed_fingerprint(session);
+    /* A link completes with a load or error event after this relayout. */
+    if (links) session->page.stylesheet_events_swept = false;
+    /* New rules can give existing elements an image or reveal one, as the
+       rebuild's image pass would find; new @font-face rules need loading. */
+    *images_affected = discovery;
+    if (context_changed && session->web_fonts_enabled && document_url != NULL
+        && !navigation_load_web_fonts(session, document_url))
+        session->performance.mutation_style_append_fallbacks++;
     session->performance.mutation_style_appends++;
     return true;
 }
@@ -1013,8 +1233,13 @@ static void navigation_prepare_layout_reuse(
     bool retire = layout_reuse_cache_node_retirement(session->page.layout_reuse);
     LayoutReuseStats before = {0}, after = {0};
     layout_reuse_cache_stats(session->page.layout_reuse, &before);
+    /* An overflowed journal still names where its unrecorded changes are,
+       unless a root was lost or freed nodes went unobserved. */
     bool destructive = full_rebuild || mutations == NULL
-        || mutations->overflowed;
+        || (mutations->overflowed
+            && (mutations->overflow_root_count == 0
+                || mutations->overflow_roots_lost
+                || mutations->retirement_unobserved));
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL) {
         fprintf(stderr, "mutation-journal full-rebuild=%d records=%zu "
@@ -1091,24 +1316,58 @@ static void navigation_prepare_layout_reuse(
             const ScriptMutationRecord *record = &mutations->records[i];
             if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT
                 || record->kind == SCRIPT_MUTATION_CANVAS) continue;
+            /* Its structural :has() notes consider only the entries the
+               bridge's probe saw the writes reach. */
+            layout_reuse_cache_set_structure_filter(
+                session->page.layout_reuse, record->has_entries,
+                mutations->has_serial_mixed ? 0 : mutations->has_serial);
             /* The parent a removed or moved child left: its remaining
                children's structural answers changed. */
             if (record->scope != NULL) {
-                layout_reuse_cache_invalidate_structure(
-                    session->page.layout_reuse, record->scope);
+                layout_reuse_cache_invalidate_children(
+                    session->page.layout_reuse, record->scope, record->node,
+                    record->relational);
             }
             if (record->node == NULL) continue;
             /* <style> content is not rendered; an appended sheet has already
                told the cache which lists the new rules can change. */
             if (navigation_style_owner(record->node) != NULL) continue;
+            /* Unobserved author bookkeeping is not a style mutation. Keep
+               intrinsic/row invalidation because generated content may read
+               attr(data-*), but retain the already resolved cascade. Prefix
+               dependency checks remain conservative for truncated journals;
+               native data-tilefinch state keeps its ordinary semantics. */
+            if (record->kind == SCRIPT_MUTATION_ATTRIBUTE
+                && strncmp(record->attribute, "data-", 5u) == 0
+                && strncmp(record->attribute, "data-tilefinch", 14u) != 0
+                && !stylesheet_selectors_reference_attribute_prefix(
+                    &session->page.stylesheet, record->attribute,
+                    strlen(record->attribute))) {
+                layout_reuse_cache_invalidate_measurements(
+                    session->page.layout_reuse, record->node);
+                continue;
+            }
             if (record->kind == SCRIPT_MUTATION_CHILD_LIST
                 || record->kind == SCRIPT_MUTATION_INNER_HTML
                 || record->kind == SCRIPT_MUTATION_UNKNOWN) {
-                if (retire) {
-                    layout_reuse_cache_invalidate_structure(
-                        session->page.layout_reuse, record->node);
-                } else {
+                /* A child-list record carries the bridge's classification
+                   of the insertion or removal; innerHTML and unknown
+                   changes are always relational. */
+                if (retire && record->kind != SCRIPT_MUTATION_CHILD_LIST) {
+                    /* innerHTML and unknown records name the parent whose
+                       children changed. */
+                    layout_reuse_cache_invalidate_children(
+                        session->page.layout_reuse, record->node, NULL,
+                        record->relational);
+                } else if (retire) {
+                    layout_reuse_cache_invalidate_tree(
+                        session->page.layout_reuse, record->node,
+                        record->relational);
+                } else if (record->relational) {
                     layout_reuse_cache_invalidate_node(
+                        session->page.layout_reuse, record->node, true);
+                } else {
+                    layout_reuse_cache_invalidate_node_scoped(
                         session->page.layout_reuse, record->node, true);
                 }
                 continue;
@@ -1122,18 +1381,43 @@ static void navigation_prepare_layout_reuse(
                        && record->changed_tokens_exact) {
                 layout_reuse_cache_invalidate_attribute(
                     session->page.layout_reuse, record->node,
-                    record->changed_tokens, record->changed_token_count,
-                    false, mutations->relational_selector_sensitive);
-            } else if (mutations->relational_selector_sensitive) {
-                layout_reuse_cache_invalidate_node(
+                    script_mutation_record_tokens(mutations, record),
+                    record->changed_token_count, false, record->relational);
+            } else if (record->kind == SCRIPT_MUTATION_INLINE_STYLE
+                       || (record->kind == SCRIPT_MUTATION_ATTRIBUTE
+                           && strcmp(record->attribute, "style") == 0)) {
+                layout_reuse_cache_invalidate_inline_style(
                     session->page.layout_reuse, record->node,
+                    record->kind == SCRIPT_MUTATION_INLINE_STYLE
+                        ? record->attribute : NULL,
+                    record->relational);
+            } else if (record->relational) {
+                /* Scoped by the record's own classification: an unrelated
+                   relational write in the same turn no longer widens it.
+                   An inline declaration is visible to selectors only as
+                   the style attribute. */
+                layout_reuse_cache_invalidate_relational(
+                    session->page.layout_reuse, record->node,
+                    record->kind == SCRIPT_MUTATION_INLINE_STYLE ? "style"
+                    : record->kind == SCRIPT_MUTATION_ATTRIBUTE
+                        ? record->attribute : NULL,
                     record->kind == SCRIPT_MUTATION_TEXT);
+            } else if (record->kind == SCRIPT_MUTATION_ATTRIBUTE) {
+                layout_reuse_cache_invalidate_own_attribute(
+                    session->page.layout_reuse, record->node,
+                    record->attribute);
             } else {
                 layout_reuse_cache_invalidate_node_scoped(
                     session->page.layout_reuse, record->node,
                     record->kind == SCRIPT_MUTATION_TEXT);
             }
         }
+        layout_reuse_cache_set_structure_filter(session->page.layout_reuse,
+                                                UINT64_MAX, 0);
+        for (size_t i = 0;
+             mutations->overflowed && i < mutations->overflow_root_count; i++)
+            layout_reuse_cache_invalidate_overflow_root(
+                session->page.layout_reuse, mutations->overflow_roots[i]);
         layout_reuse_cache_flush_invalidations(session->page.layout_reuse);
     }
     layout_reuse_cache_stats(session->page.layout_reuse, &after);
@@ -1157,6 +1441,28 @@ static void navigation_prepare_layout_reuse(
         session->performance.layout_reuse_matched_token_dropped +=
             after.matched_token_dropped - before.matched_token_dropped;
     }
+    /* A reset clears nothing of these; they only grow within one cache. */
+    if (after.has_scans >= before.has_scans
+        && after.has_dropped >= before.has_dropped) {
+        session->performance.layout_reuse_has_scoped +=
+            after.has_scoped - before.has_scoped;
+        session->performance.layout_reuse_has_fallbacks +=
+            after.has_fallbacks - before.has_fallbacks;
+        session->performance.layout_reuse_has_dropped +=
+            after.has_dropped - before.has_dropped;
+        session->performance.layout_reuse_has_scans +=
+            after.has_scans - before.has_scans;
+    }
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL)
+        fprintf(stderr, "mutation-journal-reuse full-resets=%zu "
+                "has-scoped=%zu has-fallbacks=%zu has-dropped=%zu "
+                "has-scans=%zu\n", after.full_resets - before.full_resets,
+                after.has_scoped - before.has_scoped,
+                after.has_fallbacks - before.has_fallbacks,
+                after.has_dropped - before.has_dropped,
+                after.has_scans - before.has_scans);
+#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (after.matched_token_invalidations != before.matched_token_invalidations
         || after.matched_token_fallbacks != before.matched_token_fallbacks) {
@@ -1290,6 +1596,30 @@ static size_t navigation_mutation_image_refresh_nodes(
     return count;
 }
 
+/* The fingerprint covers resource elements' names and resource attributes
+   and <style> text. A journal of only class, id, inline-style and other
+   non-resource attribute writes cannot change it, so an image refresh for
+   such a turn (an inline SVG recolour) keeps the committed fingerprint
+   instead of walking the whole document to re-derive it. */
+static bool navigation_mutations_keep_resource_fingerprint(
+    const ScriptMutationJournal *mutations)
+{
+    if (mutations == NULL || mutations->overflowed) return false;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->kind == SCRIPT_MUTATION_INLINE_STYLE) continue;
+        if (record->kind != SCRIPT_MUTATION_ATTRIBUTE) return false;
+        for (size_t a = 0;
+             a < sizeof(resource_fingerprint_attributes)
+                     / sizeof(resource_fingerprint_attributes[0]); a++) {
+            if (strcasecmp(record->attribute,
+                           resource_fingerprint_attributes[a]) == 0)
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool navigation_mutations_are_canvas_paint_only(
     NavigationSession *session, const ScriptMutationJournal *mutations)
 {
@@ -1331,6 +1661,198 @@ static bool navigation_mutations_are_canvas_paint_only(
     session->canvas_paint_damage_pending = true;
     session->incremental_relayouts++;
     return true;
+}
+
+/* Load and error events of stylesheet links and style preloads that
+   settled outside a full rebuild (the parser's preloads, a link the style
+   append lane loaded), dispatched after the relayout committed so their
+   handlers' DOM changes journal for the next one. A full rebuild dispatches
+   its own between loading the sheets and laying out. */
+static bool navigation_settle_style_preloads(
+    NavigationSession *session, lxb_dom_node_t *const *nodes, size_t count);
+
+/* Style preloads no stylesheet pass has seen (inserted after the page's
+   last one) are fetched now, as the rebuild's loader would have. */
+static bool navigation_settle_unseen_style_preloads(
+    NavigationSession *session)
+{
+    enum { SETTLE_LIMIT = 8 };
+    lxb_dom_node_t *pending[SETTLE_LIMIT];
+    size_t count = 0;
+    const StylesheetDocumentResources *resources =
+        &session->page.stylesheet_resources;
+    lxb_dom_node_t *root = lxb_dom_interface_node(session->page.document.html);
+    for (lxb_dom_node_t *node = root; node != NULL && count < SETTLE_LIMIT;
+         node = navigation_next_document_node(root, node)) {
+        if (node->local_name != LXB_TAG_LINK
+            || !navigation_is_style_preload(node)
+            || navigation_is_stylesheet_link(node)) continue;
+        bool seen = false;
+        for (size_t i = 0; !seen && i < resources->style_preload_count; i++)
+            seen = resources->style_preloads[i].element == node;
+        for (size_t i = 0;
+             !seen && i < session->page.stylesheet_event_count; i++)
+            seen = session->page.stylesheet_events[i].element == node;
+        if (!seen) pending[count++] = node;
+    }
+    return navigation_settle_style_preloads(session, pending, count);
+}
+
+static bool navigation_sweep_stylesheet_events(NavigationSession *session)
+{
+    if (session->page.stylesheet_events_swept
+        || session->page.runtime == NULL
+        || !session->external_resources_enabled
+        || session->page.resource_base_url[0] == '\0'
+        || session->page.document.html == NULL) return true;
+    if (session->page.resource_scheduler != NULL
+        && navigation_page_document_url(session) != NULL
+        && !navigation_settle_unseen_style_preloads(session)) return false;
+    return navigation_dispatch_stylesheet_events(
+               session, session->page.resource_base_url)
+        || navigation_retire_exhausted_script_realms(session, false);
+}
+
+static size_t navigation_live_deferred_nodes(
+    const NavigationPage *page, lxb_dom_node_t **nodes);
+
+/* Relayout phase lines go to the validation log on the PSP and, on the
+   host, to stderr under TILEFINCH_TRACE_MUTATION_JOURNAL. A shipping PSP
+   build has neither: it takes no phase stamps and formats nothing. */
+#if defined(TILEFINCH_PSP_VALIDATION_LOG) || !defined(TILEFINCH_NO_TRACE)
+#define NAVIGATION_RELAYOUT_PHASE_LOG 1
+static bool navigation_relayout_phase_log_wanted(void)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    return true;
+#else
+    return getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL;
+#endif
+}
+
+static void navigation_relayout_phase_log_emit(const char *line)
+{
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL)
+        fprintf(stderr, "%s\n", line);
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    tilefinch_platform_log_message(line);
+#endif
+}
+#else
+#define NAVIGATION_RELAYOUT_PHASE_LOG 0
+#endif
+
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+/* A fast relayout's prepare span: the journal and style append (its walk,
+   source loads, order bookkeeping, reuse note, discovery check), the
+   resource decision, reuse invalidation and the image pass, with the styles
+   that pass resolved (the layout build reuses them). */
+static void navigation_log_prepare_phases(
+    NavigationSession *session, uint64_t started, uint64_t append_started,
+    const uint64_t append_before[5], uint64_t decided,
+    uint64_t reuse_prepared, uint64_t images_done,
+    const LayoutReuseStats *images_before,
+    const LayoutReuseStats *images_after, uint64_t events_us)
+{
+    if (!navigation_relayout_phase_log_wanted()) return;
+    /* Styles the layout build resolved after the image pass. */
+    LayoutReuseStats built = {0};
+    layout_reuse_cache_stats(session->page.layout_reuse, &built);
+    const NavigationPerformance *counters = &session->performance;
+    uint64_t append[5] = {
+        counters->style_append_walk_us - append_before[0],
+        counters->style_append_load_us - append_before[1],
+        counters->style_append_track_us - append_before[2],
+        counters->style_append_note_us - append_before[3],
+        counters->style_append_discovery_us - append_before[4]
+    };
+    char line[384];
+    snprintf(line, sizeof(line),
+        "tilefinch-relayout-prepare-phases: journal=%lluus decide=%lluus "
+        "append-walk=%lluus append-load=%lluus append-track=%lluus "
+        "append-note=%lluus append-discovery=%lluus reuse=%lluus "
+        "images=%lluus image-styles=%zu/%zu build-styles=%zu/%zu "
+        "evictions=%zu events=%lluus",
+        (unsigned long long) (append_started - started),
+        (unsigned long long) (decided - append_started),
+        (unsigned long long) append[0], (unsigned long long) append[1],
+        (unsigned long long) append[2], (unsigned long long) append[3],
+        (unsigned long long) append[4],
+        (unsigned long long) (reuse_prepared - decided),
+        (unsigned long long) (images_done - reuse_prepared),
+        images_after->style_hits - images_before->style_hits,
+        images_after->style_misses - images_before->style_misses,
+        built.style_hits - images_after->style_hits,
+        built.style_misses - images_after->style_misses,
+        built.style_evictions,
+        (unsigned long long) events_us);
+    navigation_relayout_phase_log_emit(line);
+}
+#endif
+
+/* The image pass of a full rebuild without the stylesheet passes before
+   it: the sheet is unchanged, so the table it derives is the rebuild's. */
+static bool navigation_rebuild_images(NavigationSession *session)
+{
+    const char *document_url = navigation_page_document_url(session);
+    if (document_url == NULL || session->page.resource_base_url[0] == '\0')
+        return false;
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+    uint64_t started = navigation_now_us();
+#endif
+    /* The job borrows this image table (see the full rebuild). */
+    images_priority_load_destroy(session->page.deferred_image_job);
+    session->page.deferred_image_job = NULL;
+    session->page.deferred_image_batch_count = 0;
+    session->page.deferred_image_publication_age = 0;
+    lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
+    size_t deferred_count =
+        navigation_live_deferred_nodes(&session->page, deferred);
+    /* Retained intrinsic sizes measured against the old table. */
+    layout_reuse_cache_update_images(session->page.layout_reuse, NULL);
+    navigation_ensure_layout_reuse(session);
+    bool loaded = images_rebuild_external_reusing_rasters(
+        &session->page.document, &session->page.stylesheet,
+        &session->page.images, session->budget,
+        session->page.resource_base_url, document_url,
+        session->page.referrer_policy,
+        session->maximum_images, session->maximum_image_bytes,
+        session->maximum_image_file_bytes,
+        session->maximum_decoded_image_bytes,
+        session->resource_timeout_ms,
+        session->page.resource_scheduler,
+        session->browser_session, session->page.layout_reuse,
+        session->fonts, session->viewport.css_width, deferred,
+        deferred_count);
+    session->images = &session->page.images;
+    layout_reuse_cache_update_images(
+        session->page.layout_reuse, session->images);
+    session->performance.mutation_image_rebuilds++;
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+    if (navigation_relayout_phase_log_wanted()) {
+        const ExternalImageStats *stats = &session->page.images.stats;
+        char message[320];
+        snprintf(message, sizeof(message),
+                 "tilefinch-relayout-image-rebuild: images=%lluus loaded=%d "
+                 "count=%zu fetched=%zu decoded-cache=%zu http-cache=%zu "
+                 "svg=%zu/%zu svg-us=%llu/%llu traversal=%lluus "
+                 "styles=%lluus drain=%lluus",
+                 (unsigned long long) (navigation_now_us() - started),
+                 (int) loaded, session->page.images.count, stats->loaded,
+                 stats->decoded_cache_hits, stats->cache_hits,
+                 stats->inline_svg_rasterized,
+                 stats->inline_svg_refresh_reused,
+                 (unsigned long long) stats->inline_svg_serialize_us,
+                 (unsigned long long) stats->inline_svg_rasterize_us,
+                 (unsigned long long) stats->traversal_us,
+                 (unsigned long long) stats->style_resolve_us,
+                 (unsigned long long) stats->drain_us);
+        navigation_relayout_phase_log_emit(message);
+    }
+#endif
+    return loaded;
 }
 
 static bool navigation_relayout_failed(
@@ -1383,14 +1905,16 @@ static bool navigation_relayout_preview_eligible(
 }
 
 /* The viewport and the two screens below it, so the first page-downs land
-   on laid-out content. A truncated result keeps keep_height as its scroll
-   extent and marks where its content ends. */
+   on laid-out content, and at least minimum_limit deep. A truncated result
+   keeps keep_height as its scroll extent and marks where its content ends. */
 static bool navigation_build_provisional_layout(
-    NavigationSession *session, LayoutDocument *layout, int keep_height)
+    NavigationSession *session, LayoutDocument *layout, int keep_height,
+    int minimum_limit)
 {
     const NavigationEntry *entry = navigation_current(session);
     int scroll_y = entry == NULL || entry->scroll_y < 0 ? 0 : entry->scroll_y;
     int limit = scroll_y + 3 * session->viewport.css_height;
+    if (limit < minimum_limit) limit = minimum_limit;
     navigation_ensure_layout_reuse(session);
     bool truncated = false;
     layout->performance.cancelled = false;
@@ -1503,14 +2027,23 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
         && scroll_y + 2 * session->viewport.css_height > limit;
     navigation_evict_layout_reuse_under_pressure(session);
     LayoutDocument next = {0};
-    bool discover = !extend && session->page.visual_discovery_pending;
+    /* Visuals a provisional commit skipped are queued from the first
+       complete layout, whichever step builds it: an extension can reach
+       the end of the document too. */
+    bool discover = session->page.visual_discovery_pending;
     if (discover) {
         navigation_ensure_layout_reuse(session);
         layout_reuse_cache_record_unresolved_visuals(
             session->page.layout_reuse, true);
     }
+    /* Each extension lays the document out from the top, so it goes at
+       least twice as deep as the last: a reader paging to depth D waits
+       for about 2D of layout in total, not one wait every few screens. */
+    int64_t doubled = 2 * (int64_t) limit;
     bool built = extend
-        ? navigation_build_provisional_layout(session, &next, old_height)
+        ? navigation_build_provisional_layout(
+              session, &next, old_height,
+              doubled > INT_MAX ? INT_MAX : (int) doubled)
         : navigation_build_layout(
               session, &next, session->fonts, session->images);
     if (discover)
@@ -1546,7 +2079,8 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
     session->performance.relayout_us += elapsed;
     navigation_attach_layout(session);
     navigation_clamp_scroll_to_layout(session);
-    if (discover) navigation_queue_discovered_visuals(session);
+    if (discover && !session->page.layout_provisional)
+        navigation_queue_discovered_visuals(session);
     if (session->page.layout_provisional) {
         session->performance.provisional_extensions++;
         return NAVIGATION_LAYOUT_COMPLETION_EXTENDED;
@@ -1569,7 +2103,17 @@ bool navigation_complete_layout_sync(NavigationSession *session)
         || result == NAVIGATION_LAYOUT_COMPLETION_ADOPTED;
 }
 
+static bool navigation_relayout_body(NavigationSession *session);
+
 bool navigation_relayout(NavigationSession *session)
+{
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_LAYOUT);
+    bool ok = navigation_relayout_body(session);
+    work_ledger_leave(ledger);
+    return ok;
+}
+
+static bool navigation_relayout_body(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
     tilefinch_platform_trace_step("relayout-prepare");
@@ -1607,18 +2151,52 @@ bool navigation_relayout(NavigationSession *session)
         || mutations.conservative_resource_scan;
     bool full_rebuild = session->style_rebuild_required
         || mutations.resource_rebuild_required;
-    if (mutation_driven && !session->style_rebuild_required
+    /* Re-derive the image table alone, keeping the sheet, its external CSS,
+       stylesheet events and web fonts. */
+    bool image_rebuild = false;
+    bool style_append_tried = mutation_driven
+        && !session->style_rebuild_required
         && mutations.resource_rebuild_required
-#ifndef TILEFINCH_NO_TRACE
-        && getenv("TILEFINCH_DISABLE_STYLE_APPEND") == NULL
+        && !mutations.retirement_unobserved;
+    bool appended_images = false, style_append_done = false;
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+    const NavigationPerformance *counters = &session->performance;
+    uint64_t append_before[5] = {
+        counters->style_append_walk_us, counters->style_append_load_us,
+        counters->style_append_track_us, counters->style_append_note_us,
+        counters->style_append_discovery_us
+    };
+    uint64_t append_started = navigation_now_us();
 #endif
-        && navigation_try_append_inserted_styles(session, &mutations)) {
-        full_rebuild = false;
+    if (style_append_tried) {
+        /* Image causes are settled by the image rebuild; stylesheet causes
+           need the sheet part inserted in place. */
+        bool sheet_settled = !mutations.stylesheet_rebuild_required;
+        if (!sheet_settled
+#ifndef TILEFINCH_NO_TRACE
+            && getenv("TILEFINCH_DISABLE_STYLE_APPEND") == NULL
+#endif
+            && navigation_try_append_style_sources(
+                   session, &mutations, mutations.image_rebuild_required,
+                   &appended_images)) {
+            sheet_settled = true;
+            style_append_done = true;
+        }
+        if (sheet_settled) {
+            full_rebuild = false;
+            image_rebuild = mutations.image_rebuild_required;
+        }
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    bool full_style_rebuild = session->style_rebuild_required;
+#endif
     bool image_resource_scan = mutation_driven
-        && mutations.image_resource_scan_required;
+        && (mutations.image_resource_scan_required || appended_images);
     bool image_resource_refresh = mutation_driven
         && mutations.image_resource_refresh_required;
+    /* The refresh lane re-rasterizes the SVG roots the journal names; a
+       journal that dropped records cannot name them all. */
+    if (mutations.overflowed && image_resource_refresh) image_rebuild = true;
     bool focus_border_paint = false;
     if (mutation_driven
         && navigation_mutations_are_paint_only_focus(
@@ -1642,21 +2220,65 @@ bool navigation_relayout(NavigationSession *session)
     if (mutation_driven && conservative_scan) {
         session->performance.mutation_conservative_scans++;
     }
-    if (full_rebuild || conservative_scan || image_resource_scan
-        || image_resource_refresh) {
+    /* A style append committed a fingerprint of this very DOM. */
+    bool fingerprint_kept = mutation_driven && !full_rebuild
+        && (style_append_done
+            || (!conservative_scan
+                && navigation_mutations_keep_resource_fingerprint(
+                       &mutations)));
+    if ((full_rebuild || conservative_scan || image_resource_scan
+         || image_resource_refresh || image_rebuild) && !fingerprint_kept) {
         if (!navigation_resource_fingerprint(
                 session, &session->page.document, &fingerprint)) {
             return navigation_relayout_failed(session, mutation_driven);
         }
-        if (!full_rebuild && conservative_scan) {
-            full_rebuild = fingerprint != session->resource_fingerprint;
+        /* The journal could not itemize every change. A moved stylesheet
+           source needs the sheet rebuilt; moved image elements need only
+           the image table. */
+        if (!full_rebuild && conservative_scan
+            && fingerprint != session->resource_fingerprint) {
+            if (mutation_driven && !mutations.retirement_unobserved
+                && !navigation_fingerprint_part_changed(session, 0)) {
+                image_rebuild = true;
+            } else {
+                full_rebuild = true;
+            }
         }
     }
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL)
+        fprintf(stderr, "relayout-decision full=%d style-required=%d "
+                "resource-rebuild=%d conservative=%d fingerprint-changed=%d "
+                "image-scan=%d image-refresh=%d overflow=%d records=%zu "
+                "image-rebuild=%d causes=%d/%d\n",
+                (int) full_rebuild, (int) session->style_rebuild_required,
+                (int) mutations.resource_rebuild_required,
+                (int) conservative_scan,
+                (int) (fingerprint != session->resource_fingerprint),
+                (int) image_resource_scan, (int) image_resource_refresh,
+                (int) mutations.overflowed, mutations.count,
+                (int) image_rebuild,
+                (int) mutations.stylesheet_rebuild_required,
+                (int) mutations.image_rebuild_required);
+#endif
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+    uint64_t decided = navigation_now_us();
+#endif
     /* Image discovery below reuses computed styles too. Invalidate the old
        hidden ancestry before that traversal, not only before final layout. */
     if (!full_rebuild)
         navigation_prepare_layout_reuse(session, &mutations, false);
-    if (!full_rebuild && session->external_resources_enabled
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+    uint64_t reuse_prepared = navigation_now_us();
+    LayoutReuseStats images_before = {0}, images_after = {0};
+    layout_reuse_cache_stats(session->page.layout_reuse, &images_before);
+#endif
+    if (!full_rebuild && image_rebuild && session->external_resources_enabled
+        && !navigation_rebuild_images(session)) {
+        /* The table is gone; the full rebuild reloads it with everything. */
+        full_rebuild = true;
+    }
+    if (!full_rebuild && !image_rebuild && session->external_resources_enabled
         && (image_resource_scan || image_resource_refresh)) {
         const char *document_url =
             session->page.document_url[0] == '\0'
@@ -1676,7 +2298,7 @@ bool navigation_relayout(NavigationSession *session)
             if (refresh_cancelled)
                 return navigation_relayout_failed(session, true);
             if (refresh_bounded_out) {
-                full_rebuild = true;
+                image_rebuild = true;
                 images_loaded = false;
             }
             size_t refresh_count = 0;
@@ -1721,7 +2343,7 @@ bool navigation_relayout(NavigationSession *session)
             if (!refresh_bounded_out) {
                 images_loaded =
                     refresh_count == 0
-                    || images_refresh_external_nodes(
+                    || images_refresh_external_nodes_reusing_layout_styles(
                     &session->page.document, &session->page.stylesheet,
                     &session->page.images, refresh, refresh_count,
                     session->budget,
@@ -1732,7 +2354,8 @@ bool navigation_relayout(NavigationSession *session)
                     session->maximum_decoded_image_bytes,
                     session->resource_timeout_ms,
                     session->page.resource_scheduler,
-                    session->browser_session);
+                    session->browser_session, session->page.layout_reuse,
+                    session->fonts, session->viewport.css_width);
             }
         }
         if (images_loaded && scan_for_additions) {
@@ -1756,11 +2379,18 @@ bool navigation_relayout(NavigationSession *session)
         layout_reuse_cache_update_images(
             session->page.layout_reuse, session->images);
         session->performance.mutation_image_resource_scans++;
-        if (!images_loaded) full_rebuild = true;
+        if (!images_loaded && !image_rebuild) full_rebuild = true;
+        if (image_rebuild && !navigation_rebuild_images(session))
+            full_rebuild = true;
     }
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+    uint64_t images_done = navigation_now_us();
+    layout_reuse_cache_stats(session->page.layout_reuse, &images_after);
+#endif
     if (!full_rebuild) {
-        if (image_resource_scan || image_resource_refresh) {
+        if (image_resource_scan || image_resource_refresh || image_rebuild) {
             session->resource_fingerprint = fingerprint;
+            navigation_note_committed_fingerprint(session);
         }
         navigation_evict_layout_reuse_under_pressure(session);
         LayoutDocument next = {0};
@@ -1774,11 +2404,22 @@ bool navigation_relayout(NavigationSession *session)
         uint64_t relayout_prepared = navigation_now_us();
 #endif
         bool provisional = navigation_relayout_preview_eligible(session);
+        /* Without a script realm nothing mutated the DOM the committed
+           layout borrows, so the reader can page through it while the
+           screens around them are rebuilt (seconds deep in a long page). */
+        if (provisional) {
+            session->committed_layout_servable = true;
+            (void) tilefinch_platform_cooperate("page-scroll-servable", 1);
+        }
         bool built = provisional
             ? navigation_build_provisional_layout(
-                  session, &next, session->page.layout.height)
+                  session, &next, session->page.layout.height, 0)
             : navigation_build_layout(
                   session, &next, session->fonts, session->images);
+        if (provisional) {
+            session->committed_layout_servable = false;
+            (void) tilefinch_platform_cooperate("page-scroll-servable", 0);
+        }
         if (built && next.content_limit_y != 0)
             session->performance.provisional_relayouts++;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1825,21 +2466,49 @@ bool navigation_relayout(NavigationSession *session)
         session->performance.relayout_us += elapsed;
         navigation_attach_layout(session);
         navigation_clamp_scroll_to_layout(session);
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+        uint64_t events_started = navigation_now_us();
+#endif
+        if (mutation_driven
+            && !navigation_sweep_stylesheet_events(session)) {
+            session->page.loaded = false;
+            return navigation_relayout_failed(session, true);
+        }
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+        uint64_t events_done = navigation_now_us();
+#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         char relayout_phases[256];
         snprintf(relayout_phases, sizeof(relayout_phases),
-            "tilefinch-relayout-phases: prepare=%lluus build=%lluus transfer=%lluus damage=%lluus destroy=%lluus attach=%lluus",
+            "tilefinch-relayout-phases: prepare=%lluus build=%lluus transfer=%lluus damage=%lluus destroy=%lluus attach=%lluus events=%lluus",
             (unsigned long long) (relayout_prepared - started),
             (unsigned long long) (relayout_built - relayout_prepared),
             (unsigned long long) (relayout_transferred - relayout_built),
             (unsigned long long) (relayout_damaged - relayout_transferred),
             (unsigned long long) (relayout_destroyed - relayout_damaged),
-            (unsigned long long) (navigation_now_us() - relayout_destroyed));
+            (unsigned long long) (events_started - relayout_destroyed),
+            (unsigned long long) (events_done - events_started));
         tilefinch_platform_log_message(relayout_phases);
+#endif
+#if NAVIGATION_RELAYOUT_PHASE_LOG
+        navigation_log_prepare_phases(
+            session, started, append_started, append_before, decided,
+            reuse_prepared, images_done, &images_before, &images_after,
+            events_done - events_started);
 #endif
         return true;
     }
     int old_height = session->page.layout.height;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Full rebuild steps (fast relayouts print tilefinch-relayout-phases). */
+    uint64_t full_steps[7] = {0};
+    size_t full_step = 0;
+#define FULL_RELAYOUT_STEP() \
+    (full_step < 7 ? (void) (full_steps[full_step++] = navigation_now_us()) \
+                   : (void) 0)
+#else
+#define FULL_RELAYOUT_STEP() ((void) 0)
+#endif
     navigation_prepare_layout_reuse(session, &mutations, true);
     navigation_evict_layout_reuse_under_pressure(session);
     fonts_external_loader_cancel(
@@ -1847,6 +2516,7 @@ bool navigation_relayout(NavigationSession *session)
         session->page.resource_scheduler, &session->page.external_fonts);
     layout_destroy(&session->page.layout);
     stylesheet_destroy(&session->page.stylesheet);
+    FULL_RELAYOUT_STEP();
     if (!navigation_build_stylesheet(session)) {
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
@@ -1876,6 +2546,7 @@ bool navigation_relayout(NavigationSession *session)
         lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
         size_t deferred_count = navigation_live_deferred_nodes(&session->page, deferred);
         images_destroy(&session->page.images);
+        FULL_RELAYOUT_STEP();
         if (!stylesheets_load_external_tracked_with_context(
                 &session->page.document, &session->page.stylesheet,
                 session->budget, session->page.resource_base_url, rebuild_url,
@@ -1891,12 +2562,14 @@ bool navigation_relayout(NavigationSession *session)
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
+        FULL_RELAYOUT_STEP();
         if (!navigation_dispatch_stylesheet_events(
                 session, session->page.resource_base_url)
             && !navigation_retire_exhausted_script_realms(session, false)) {
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
+        FULL_RELAYOUT_STEP();
         navigation_ensure_layout_reuse(session);
         if (!images_load_external_reusing_layout_styles_excluding(
                 &session->page.document, &session->page.stylesheet,
@@ -1914,6 +2587,7 @@ bool navigation_relayout(NavigationSession *session)
             return navigation_relayout_failed(session, true);
         }
         session->images = &session->page.images;
+        FULL_RELAYOUT_STEP();
     }
     if (session->user_css_length != 0
         && !stylesheet_add_user_css(&session->page.stylesheet,
@@ -1927,6 +2601,7 @@ bool navigation_relayout(NavigationSession *session)
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
     }
+    FULL_RELAYOUT_STEP();
 #if !defined(__PSP__)
     bool injected_refusal =
         navigation_test_consume_same_document_relayout_refusal();
@@ -1944,6 +2619,7 @@ bool navigation_relayout(NavigationSession *session)
         return navigation_relayout_failed(session, true);
     }
     session->resource_fingerprint = fingerprint;
+    navigation_note_committed_fingerprint(session);
     session->style_rebuild_required = false;
     session->relayout_damage_valid = true;
     session->relayout_damage_left = 0;
@@ -1956,10 +2632,48 @@ bool navigation_relayout(NavigationSession *session)
     if (mutations.resource_rebuild_required) {
         session->performance.mutation_resource_rebuilds++;
     }
+    FULL_RELAYOUT_STEP();
     session->performance.relayout_us += navigation_record_layout_slices(
         session, started, &session->page.layout);
     navigation_attach_layout(session);
     navigation_clamp_scroll_to_layout(session);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        /* Stamps: prepare end, [stylesheet built, external CSS loaded,
+           stylesheet events dispatched, images loaded,] fonts/user CSS,
+           layout built. Without external resources the bracketed stamps
+           are absent: the stylesheet span then includes fonts. */
+        uint64_t end = navigation_now_us();
+        bool external = full_step == 7;
+        uint64_t span[7] = {0};
+        if (external) {
+            for (size_t i = 1; i < 7; i++)
+                span[i] = full_steps[i] - full_steps[i - 1];
+        } else if (full_step == 3) {
+            span[1] = full_steps[1] - full_steps[0];
+            span[6] = full_steps[2] - full_steps[1];
+        }
+        char line[320];
+        snprintf(line, sizeof(line),
+            "tilefinch-relayout-full-phases: prepare=%lluus stylesheet=%lluus "
+            "external-css=%lluus css-events=%lluus images=%lluus "
+            "fonts=%lluus layout=%lluus attach=%lluus style-rebuild=%d "
+            "resource-rebuild=%d overflow=%d conservative=%d "
+            "append-tried=%d",
+            (unsigned long long) (full_steps[0] - started),
+            (unsigned long long) span[1], (unsigned long long) span[2],
+            (unsigned long long) span[3], (unsigned long long) span[4],
+            (unsigned long long) span[5], (unsigned long long) span[6],
+            (unsigned long long) (full_step == 0 ? 0
+                : end - full_steps[full_step - 1]),
+            full_style_rebuild ? 1 : 0,
+            mutations.resource_rebuild_required ? 1 : 0,
+            mutations.overflowed ? 1 : 0,
+            conservative_scan ? 1 : 0, style_append_tried ? 1 : 0);
+        tilefinch_platform_log_message(line);
+    }
+#endif
+#undef FULL_RELAYOUT_STEP
     return true;
 }
 
@@ -3594,6 +4308,10 @@ bool navigation_advance_runtime(NavigationSession *session,
     bool advanced = script_runtime_advance(
         session->page.runtime, elapsed_ms, callback_budget,
         &session->page.script_result);
+    uint64_t page_script_finished = navigation_now_us();
+    if (page_script_finished > runtime_started)
+        session->performance.advance_page_script_us +=
+            page_script_finished - runtime_started;
     /* A top-level realm owns the document transition once it requests one.
        Do not let refresh retirement or stale child-frame work from the
        outgoing document veto that committed replacement in the same tick. */
@@ -3726,12 +4444,21 @@ bool navigation_advance_runtime(NavigationSession *session,
         && session->page.frame_count != 0) {
         (void) navigation_collect_frame_capability_trace(session);
     }
+    uint64_t frames_started = navigation_now_us();
+    if (frames_started > page_script_finished)
+        session->performance.advance_frame_setup_us +=
+            frames_started - page_script_finished;
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];
         if (!frame->loaded || frame->runtime == NULL) continue;
+        uint64_t frame_script_started = navigation_now_us();
         bool frame_advanced = script_runtime_advance(
             frame->runtime, elapsed_ms, callback_budget,
             &frame->script_result);
+        uint64_t frame_script_finished = navigation_now_us();
+        if (frame_script_finished > frame_script_started)
+            session->performance.advance_frame_script_us +=
+                frame_script_finished - frame_script_started;
         /* A child callback may fail after the top realm requested a reload.
            The child belongs to the page being replaced and must not suppress
            that already-published top-level navigation. */
@@ -3779,7 +4506,16 @@ bool navigation_advance_runtime(NavigationSession *session,
                 sizeof(frame->callback_error_source_context));
         }
     }
-    if (!navigation_deliver_frame_messages(session)) {
+    uint64_t messages_started = navigation_now_us();
+    if (messages_started > frames_started)
+        session->performance.advance_frames_us +=
+            messages_started - frames_started;
+    bool messages_delivered = navigation_deliver_frame_messages(session);
+    uint64_t messages_finished = navigation_now_us();
+    if (messages_finished > messages_started)
+        session->performance.advance_messages_us +=
+            messages_finished - messages_started;
+    if (!messages_delivered) {
         if (navigation_retire_exhausted_script_realms(session, false)) {
             session->performance.frame_message_soft_failures++;
             (void) navigation_relayout_static_fallback(session);
@@ -3795,6 +4531,13 @@ bool navigation_advance_runtime(NavigationSession *session,
     }
 consume_script_navigation:
     ;
+    if (session->defer_script_navigation
+        && script_runtime_has_pending_navigation(session->page.runtime)) {
+        session->performance.runtime_us += navigation_record_slice(
+            session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+            callback_budget);
+        return true;
+    }
     char navigation_url[NAVIGATION_URL_LIMIT];
     bool replace = false;
     bool user_activated = false;
@@ -3848,7 +4591,12 @@ consume_script_navigation:
         heap_rejections_after > heap_rejections_before;
     bool ok = true;
     if (relayout_requested) {
+        uint64_t relayout_started = navigation_now_us();
         ok = navigation_relayout(session);
+        uint64_t relayout_finished = navigation_now_us();
+        if (relayout_finished > relayout_started)
+            session->performance.advance_relayout_us +=
+                relayout_finished - relayout_started;
     }
     /* Inspect the successfully settled layout, not the pre-mutation command
        count. Only a real allocator rejection plus blank paint/control output
@@ -3863,6 +4611,31 @@ consume_script_navigation:
     session->performance.runtime_us += navigation_record_slice(
         session, NAVIGATION_SLICE_RUNTIME, runtime_started, callback_budget);
     return ok;
+}
+
+bool navigation_take_script_navigation(NavigationSession *session,
+                                       char *url, size_t capacity,
+                                       bool *record_history)
+{
+    if (session == NULL || url == NULL || capacity == 0
+        || !session->defer_script_navigation || !session->page.loaded
+        || session->page.runtime == NULL) return false;
+    bool replace = false;
+    bool user_activated = false;
+    if (!script_runtime_consume_navigation(session->page.runtime, url,
+                                           capacity, &replace,
+                                           &user_activated)) return false;
+    const char *current_url = navigation_active_document_url(session);
+    if (current_url != NULL) {
+        snprintf(session->pending_navigation_referer,
+                 sizeof(session->pending_navigation_referer), "%s",
+                 current_url);
+        session->pending_navigation_same_origin =
+            navigation_same_origin(current_url, url);
+    }
+    session->pending_navigation_user_activated = user_activated;
+    if (record_history != NULL) *record_history = !replace;
+    return true;
 }
 
 bool navigation_set_gamepad_state(

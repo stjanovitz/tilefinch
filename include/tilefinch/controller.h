@@ -61,9 +61,18 @@ typedef enum {
     CONTROLLER_ACTIVATION_RUNTIME_FAILED
 } ControllerActivationOutcome;
 
+/* Native action provenance, not a page-writable DOM/event field. Script form
+   submissions remain ordinary navigations but never gain the local-network
+   exception reserved for native user navigation. */
+typedef enum {
+    CONTROLLER_NAVIGATION_USER = 0,
+    CONTROLLER_NAVIGATION_SCRIPT
+} ControllerNavigationSource;
+
 typedef struct {
     ControllerActionType type;
     ControllerActivationOutcome activation_outcome;
+    ControllerNavigationSource navigation_source;
     /* An engine-authored adapter may mark a normal navigation link as a
        request for the platform's native provider player. The URL remains the
        canonical web URL; frontends which do not implement the native route
@@ -78,11 +87,34 @@ typedef struct {
     char content_type[64];
     char body[4096];
     size_t body_length;
+    /* Set instead of body when the request body does not fit it (a script
+       form submission carrying several-KiB tokens). Owned by the engine
+       that produced the action and valid until it produces another. */
+    const char *external_body;
     int64_t media_node_handle;
     TilefinchRequestMode media_mode;
     TilefinchCredentialsMode media_credentials;
     MediaDiscoveryKind media_kind;
 } ControllerAction;
+
+static inline const char *controller_action_body(const ControllerAction *action)
+{
+    return action->external_body != NULL ? action->external_body
+                                          : action->body;
+}
+
+static inline size_t controller_action_body_length(
+    const ControllerAction *action)
+{
+    return action->body_length;
+}
+
+static inline void controller_action_clear_body(ControllerAction *action)
+{
+    action->body[0] = '\0';
+    action->body_length = 0;
+    action->external_body = NULL;
+}
 
 typedef struct {
     uint32_t color;

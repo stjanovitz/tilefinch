@@ -1,3 +1,9 @@
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Validation EBOOT only (src/psp_transport_probe.c); absent elsewhere. */
+extern void psp_transport_probe_tls_sessions(char *output, size_t size)
+    __attribute__((weak));
+#endif
+
 /*
  * PSP transport worker.
  *
@@ -327,6 +333,9 @@ typedef struct {
     bool identity_encoding;
     bool raw_gzip_encoding;
     bool force_fresh_connection;
+    bool tls12_session_resumption;
+    /* FetchRequest.stall_abort_seconds: also bounds the wait for headers. */
+    long stall_abort_seconds;
     FetchCacheMode cache_mode;
     bool send_low_client_hints;
     bool send_client_hints;
@@ -507,6 +516,21 @@ static uint64_t fetch_background_make_id(unsigned slot, uint32_t generation)
 {
     return fetch_background_request_id_make(slot, generation);
 }
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static void fetch_background_timeline(const FetchBackgroundSlot *slot,
+                                      const char *stage, int code)
+{
+    char message[192];
+    snprintf(message, sizeof(message),
+             "tilefinch-fetch-timeline: stage=%s background=%llu at-us=%llu code=%d",
+             stage, (unsigned long long) fetch_background_make_id(
+                 (unsigned) (slot - fetch_background.slots),
+                 atomic_load_explicit(&slot->generation, memory_order_relaxed)),
+             (unsigned long long) fetch_background_now_us(), code);
+    tilefinch_platform_log_message(message);
+}
+#endif
 
 static bool fetch_background_slot_matches(
     const FetchBackgroundSlot *slot, uint64_t request_id)
@@ -769,6 +793,9 @@ static size_t fetch_background_receive_header(
                      sizeof(slot->result.content_range), "%s",
                      slot->content_range);
             slot->response_headers_complete = true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            fetch_background_timeline(slot, "headers", (int) slot->header_status);
+#endif
             /* Redirects followed by this worker are not browser-visible
                responses. Keep their fields private until the next status
                line resets them; only terminal snapshots get published. */
@@ -831,6 +858,10 @@ static size_t fetch_background_receive_body(
     }
     unsigned char *buffer = fetch_background_slot_buffer(slot);
     if (buffer == NULL) return 0;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (slot->total_length == 0 && length != 0)
+        fetch_background_timeline(slot, "first-body", 0);
+#endif
     memcpy(buffer + slot->length, data, length);
     slot->length += length;
     slot->total_length += length;
@@ -1070,6 +1101,22 @@ static bool fetch_background_configure_easy(FetchBackgroundSlot *slot)
         || curl_easy_setopt(
                slot->easy, CURLOPT_FRESH_CONNECT,
                slot->force_fresh_connection ? 1L : 0L) != CURLE_OK
+        || (slot->tls12_session_resumption
+            && curl_easy_setopt(
+                   slot->easy, CURLOPT_SSLVERSION,
+                   CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_2)
+                   != CURLE_OK)
+#if defined(TILEFINCH_PSP_HTTP2)
+        /* A video's audio and video ranges start in the same frame. Without
+           this each opened its own connection to the same googlevideo host
+           and paid its own full TLS handshake (0.5-0.8 s wall on hardware)
+           although both negotiate HTTP/2. Wait for the first connection and
+           multiplex onto it. A forced-fresh reconnect deliberately leaves
+           the connection whose rate it is escaping, so it never waits. */
+        || curl_easy_setopt(
+               slot->easy, CURLOPT_PIPEWAIT,
+               slot->force_fresh_connection ? 0L : 1L) != CURLE_OK
+#endif
         /* The worker enforces an active-transport deadline itself. libcurl's
            wall timeout continues while a write callback is paused for the
            browser to parse a prior chunk, incorrectly charging layout/script
@@ -1413,6 +1460,7 @@ static void fetch_background_finish_easy(
         slot->easy, CURLINFO_EFFECTIVE_URL, &effective_url);
     slot->header_status = status;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    fetch_background_timeline(slot, "wire-done", (int) code);
     {
         /* Where a slow or failed hop spent its time. The PSP transport
            resolves and connects synchronously inside curl_multi_perform,
@@ -1505,6 +1553,15 @@ static void fetch_background_finish_easy(
     (void) curl_easy_getinfo(
         slot->easy, CURLINFO_HTTP_VERSION,
         &slot->result.negotiated_http_version);
+    slot->result.connection_id = -1;
+#if LIBCURL_VERSION_NUM >= 0x080200
+    {
+        curl_off_t connection_id = -1;
+        if (curl_easy_getinfo(slot->easy, CURLINFO_CONN_ID, &connection_id)
+                == CURLE_OK)
+            slot->result.connection_id = (long long) connection_id;
+    }
+#endif
 #if LIBCURL_VERSION_NUM >= 0x073200
     (void) curl_easy_getinfo(
         slot->easy, CURLINFO_NUM_CONNECTS, &slot->result.new_connections);
@@ -1517,6 +1574,22 @@ static void fetch_background_finish_easy(
     slot->result.tls_connection_reused = handshake.reused;
     slot->result.tls_handshake_measured = handshake.measured;
     slot->result.tls_handshake_us = handshake.handshake_us;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* One line per connection a media request opened: which request paid
+       for it, and what the handshake cost. */
+    if (slot->result.new_connections > 0
+        && strstr(slot->url, ".googlevideo.com/") != NULL) {
+        psp_log_printf(
+            "tilefinch-media-connection: conn=%lld handshake=%lluus "
+            "measured=%u fresh=%u tls12=%u status=%ld code=%d at=%lluus\n",
+            slot->result.connection_id,
+            (unsigned long long) handshake.handshake_us,
+            handshake.measured ? 1u : 0u,
+            slot->force_fresh_connection ? 1u : 0u,
+            slot->tls12_session_resumption ? 1u : 0u, status, (int) code,
+            (unsigned long long) fetch_background_now_us());
+    }
+#endif
     bool admitted = !slot->private_network.blocked && code == CURLE_OK
         && slot->result.error[0] == '\0'
         && ((status >= 200 && status < 300)
@@ -1702,6 +1775,9 @@ static void fetch_background_start_queued(void)
         atomic_store_explicit(
             &slot->received_body_bytes, 0u, memory_order_release);
         fetch_background_record_start(slot->streaming);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        fetch_background_timeline(slot, "worker-start", 0);
+#endif
         if (!fetch_background_configure_easy(slot)) {
             fetch_background_slot_release_curl(slot);
             if (slot->result.error[0] == '\0') {
@@ -1849,17 +1925,20 @@ static void fetch_background_expire_active_deadlines(void)
                 slot->transfer_done, slot->curl_paused,
                 slot->pause_started_us)) continue;
         bool deadline_expired = now_us >= slot->deadline_us;
-        bool response_stalled = slot->header_status != 0
+        uint64_t stall_window_us = (uint64_t) (
+            slot->stall_abort_seconds > 0
+                ? slot->stall_abort_seconds
+                : FETCH_STALL_LOW_SPEED_SECONDS) * UINT64_C(1000000);
+        bool response_stalled =
+            (slot->header_status != 0 || slot->stall_abort_seconds > 0)
             && now_us >= slot->last_progress_us
-            && now_us - slot->last_progress_us
-                   >= (uint64_t) FETCH_STALL_LOW_SPEED_SECONDS
-                        * UINT64_C(1000000);
+            && now_us - slot->last_progress_us >= stall_window_us;
         if (!deadline_expired && !response_stalled) continue;
         snprintf(
             slot->result.error, sizeof(slot->result.error), "%s",
             deadline_expired
                 ? "background active transport deadline expired"
-                : "background response made no progress for six seconds");
+                : "background response made no progress");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         size_t diagnostic_length = strlen(slot->result.error);
         snprintf(slot->result.error + diagnostic_length,
@@ -2793,7 +2872,12 @@ static int fetch_background_worker_main(SceSize args, void *argp)
 
 bool fetch_background_transport_available(void)
 {
-    return true;
+    /* The worker transport neither records nor replays an HTTP trace. While
+       one is active every user falls back to the traced browser-thread path
+       (the scheduler, page media) or declines optional work (the resolver,
+       HLS, subtitles, preconnect), so a journey never reaches the live
+       network and a capture holds every request its replay will make. */
+    return !fetch_trace_active();
 }
 
 void fetch_background_transport_cooperate(uint64_t now_us)
@@ -2805,13 +2889,14 @@ void fetch_background_transport_cooperate(uint64_t now_us)
         || atomic_load_explicit(&fetch_background.stop_requested, memory_order_acquire)
         || !fetch_background_setup_yield_due(true, now_us,
                     fetch_background.setup_yield_finished_us)) return;
-    /* A poll may itself wait for lower-priority firmware network service.
-       Donate to that service as well; a READY-only test would starve it. */
+    /* Both a poll and a connection setup may be waiting on lower-priority
+       firmware network service (the resolver, TCP, the socket layer) rather
+       than on the CPU. Donate to that service regardless of the worker's own
+       run state. A READY-only test here left the worker WAITING inside DNS
+       or a handshake while the browser's navigation pump spun above the
+       firmware: on hardware the worker made one perform in sixty seconds
+       and the page load expired with zero bytes. */
     fetch_background.setup_yield_finished_us = now_us;
-    SceKernelThreadRunStatus status = { .size = sizeof(status) };
-    if (!atomic_load_explicit(&fetch_background.poll_active, memory_order_acquire)
-        && (sceKernelReferThreadRunStatus(fetch_background.thread, &status) < 0
-            || (status.status & PSP_THREAD_READY) == 0)) return;
     uint64_t started = fetch_background_now_us();
     int result = sceKernelDelayThread(FETCH_BACKGROUND_SETUP_YIELD_US);
     fetch_background.setup_yield_finished_us = fetch_background_now_us();
@@ -3196,6 +3281,8 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->identity_encoding = request->identity_encoding;
         slot->raw_gzip_encoding = request->raw_gzip_encoding;
         slot->force_fresh_connection = request->force_fresh_connection;
+        slot->tls12_session_resumption = request->tls12_session_resumption;
+        slot->stall_abort_seconds = request->stall_abort_seconds;
         slot->cache_mode = request->cache_mode;
         slot->send_low_client_hints = request->send_low_client_hints;
         slot->send_client_hints = request->send_client_hints;
@@ -3405,6 +3492,8 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
            here silently routed every trickle retry back onto the throttled
            HTTP/2 connection it was meant to replace. */
         slot->force_fresh_connection = request->force_fresh_connection;
+        slot->tls12_session_resumption = request->tls12_session_resumption;
+        slot->stall_abort_seconds = request->stall_abort_seconds;
         slot->send_low_client_hints = false;
         slot->send_client_hints = false;
         slot->suppress_high_client_hints = false;
@@ -3609,6 +3698,12 @@ bool fetch_background_transport_metrics(
         .last_running = atomic_load_explicit(
             &fetch_background.last_running, memory_order_relaxed)
     };
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    metrics->setup_yields = fetch_background.setup_yields;
+    metrics->setup_yield_max_us =
+        fetch_background.setup_yield_max_us > UINT_MAX
+            ? UINT_MAX : (unsigned) fetch_background.setup_yield_max_us;
+#endif
     return true;
 }
 
@@ -3752,6 +3847,8 @@ static void fetch_background_copy_media_response(
     destination->tls_connection_reused = source->tls_connection_reused;
     destination->tls12_compatibility_retry =
         source->tls12_compatibility_retry;
+    destination->negotiated_http_version = source->negotiated_http_version;
+    destination->connection_id = source->connection_id;
     snprintf(destination->error, sizeof(destination->error), "%s",
              source->error);
 }
@@ -4600,6 +4697,23 @@ bool fetch_background_transport_shutdown(unsigned timeout_ms)
             final_metrics.worker_poll_max_us,
             final_metrics.worker_loop_max_us);
     }
+    unsigned tls_connections = 0, tls_certificates = 0;
+    fetch_tls_resumption_counters(&tls_connections, &tls_certificates);
+    char tls_sessions[320] = "-";
+    if (psp_transport_probe_tls_sessions != NULL)
+        psp_transport_probe_tls_sessions(tls_sessions, sizeof(tls_sessions));
+    psp_log_printf(
+        "tilefinch-tls-resumption: connections=%u certificates=%u "
+        "resumed=%u media-certificates=%u %s\n", tls_connections,
+        tls_certificates,
+        tls_connections > tls_certificates
+            ? tls_connections - tls_certificates : 0u,
+        fetch_tls_media_certificates(), tls_sessions);
+    fetch_tls_session_census();
+    unsigned share_locks = 0, share_contended = 0;
+    fetch_curl_share_lock_counters(&share_locks, &share_contended);
+    psp_log_printf("tilefinch-curl-share: locks=%u contended=%u\n",
+                   share_locks, share_contended);
 #endif
     (void) sceKernelDeleteThread(fetch_background.thread);
     (void) sceKernelDeleteEventFlag(fetch_background.event);

@@ -334,6 +334,12 @@ void navigation_enable_diagnostic_frame_safari(NavigationSession *session,
     if (session != NULL) session->diagnostic_frame_safari = enabled;
 }
 
+void navigation_set_fixed_script_memory_limits(NavigationSession *session,
+                                               bool fixed)
+{
+    if (session != NULL) session->fixed_script_memory_limits = fixed;
+}
+
 uint64_t navigation_begin(NavigationSession *session)
 {
     if (session == NULL) return 0;
@@ -356,6 +362,7 @@ uint64_t navigation_begin(NavigationSession *session)
        never suppress the next navigation's preview/image continuation. */
     session->performance.partial_paints = 0;
     session->loads_started++;
+    tilefinch_work_begin_document(session);
     return session->generation;
 }
 
@@ -679,6 +686,9 @@ typedef struct {
        stage remains healthy. These counters are staging-only: EOF either
        adopts the live realm or commits the still-authoritative server DOM. */
     uint64_t parser_script_stage_us;
+    /* When the author turn now running began; zero between turns. Lets the
+       frontend show the stage clock while a long script is still running. */
+    uint64_t parser_script_turn_started_us;
     size_t parser_script_stage_work;
     size_t parser_script_consecutive_failures;
     bool head_closed;

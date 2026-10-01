@@ -16,6 +16,7 @@
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/style.h"
 #include "tilefinch/url.h"
+#include "style_cache_internal.h"
 
 #include <quickjs.h>
 #include <lexbor/dom/interface.h>
@@ -32,7 +33,7 @@ void JS_SetPropertyFaultTraceLimit(JSRuntime *runtime, uint32_t limit);
    non-preemptible compile unit. */
 #define SCRIPT_BOOTSTRAP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (275u * 1024u)
 #define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (256u * 1024u)
-#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (384u * 1024u)
+#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (512u * 1024u)
 
 typedef struct {
     const unsigned char *data;
@@ -120,7 +121,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
 #define SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES (128u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 11u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 12u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -278,6 +279,22 @@ typedef struct {
     int scroll_y;
 } ElementScrollIntent;
 
+/* What a retained computed style depends on besides connected DOM
+   content (which the bridge's mutation notes and content generation track):
+   the sheet and its build, the document, its container geometry (compared
+   by content, since every layout pass rebuilds it), the fullscreen element,
+   and the host style generation (document_style_generation(): parser,
+   controller and other native DOM writes, colour scheme). */
+typedef struct {
+    const void *sheet;
+    const void *dom;
+    uint64_t sheet_generation;
+    uint64_t container_generation;
+    uint64_t container_signature;
+    uint64_t host_generation;
+    const lxb_dom_node_t *fullscreen_node;
+} ComputedStyleInputs;
+
 typedef struct DomBridge {
     PocDocument *document;
     Budget *budget;
@@ -314,6 +331,22 @@ typedef struct DomBridge {
        wrapper lease is still live. Sharing the byte avoids enlarging the
        bounded PSP handle table to track detached-node correctness. */
     unsigned char node_retention_flags[DOM_BRIDGE_NODE_LIMIT];
+    /* Per handle slot, the WeakRef the script wrapper cache holds for the
+       live wrapper (a strong reference to the WeakRef only), so native
+       getters can return an existing wrapper. Budget-allocated on first
+       use; NULL when unavailable (the getters then ask script to wrap). */
+    JSValue *wrapper_refs;
+    /* Per handle slot, the adopted owner document's tag: 0 unknown, 1 the
+       script's document, 2 the template contents owner, 3-255 a script-side
+       document the bootstrap names. Keeping it with the native node lets
+       it outlive wrappers. Budget-allocated on the first adoption away from
+       the document (or template contents read); until then every node is
+       the document's, template contents aside. */
+    unsigned char *node_owner_tags;
+    /* Set once a remote node writer was installed or a remote wrapper
+       made: from then on native getters defer to script, which knows
+       virtual (section-remote) nodes. */
+    bool remote_mode_seen;
     size_t node_count;
     /* Every non-NULL slot is indexed by its node pointer, so registering a
        node and finding the handles inside a detached subtree do not scan the
@@ -324,25 +357,133 @@ typedef struct DomBridge {
     /* The last element getComputedStyle() cascaded, for consecutive
        property reads of one declaration. Valid while none of the cascade's
        inputs moved: connected DOM content (every bridge mutation, including
-       focus, custom-element and form state, bumps the content generation),
-       the sheet and its fullscreen element, and the entry epoch, which each
-       entry into JavaScript bumps: the parser and the host change the DOM
-       and its state only between entries. */
+       focus, custom-element and form state, bumps the content generation)
+       and ComputedStyleInputs, which cover native changes made between
+       entries into JavaScript and synchronous layout within one. */
     struct {
         const lxb_dom_node_t *node;
-        const void *sheet;
-        uint64_t sheet_generation;
+        ComputedStyleInputs inputs;
         uint64_t content_generation;
-        const lxb_dom_node_t *fullscreen_node;
-        uint64_t epoch;
         ComputedStyle style;
     } computed_style_memo;
-    uint64_t computed_style_epoch;
+#define COMPUTED_STYLE_CUSTOM_KEY_LIMIT 32u
+    /* Resolved ancestor styles under the memo's validity key: a read starts
+       from its nearest cached ancestor instead of re-running the cascade for
+       the whole chain (siblings share parents, and pages read several nodes
+       per task). Allocated from the page Budget on first use. */
+    struct {
+        ComputedStyleInputs inputs;
+        uint64_t content_generation;
+        /* Registered for node-removal eviction (see document.h); the ring
+           is unusable without it. */
+        bool removal_listening;
+        size_t next;
+        size_t hits;
+        size_t misses;
+        size_t lookup_probes;
+        /* Index+1 chains over the existing 64-entry replacement ring.
+           Zero terminates; this does not enlarge the retained style set. */
+        uint8_t buckets[64];
+        uint8_t links[64];
+        struct ComputedStyleCacheEntry *entries;
+        /* Connected mutations since the last read, as subtrees whose
+           cached styles they can change (see
+           bridge_computed_style_note_mutation); `dirty_all` when that is
+           unknown or the list overflowed. */
+        lxb_dom_node_t *dirty[16];
+        size_t dirty_count;
+        bool dirty_all;
+        /* Elements whose own matched rules may have changed although
+           their descendants' inputs did not (a sibling test, a :has()
+           answer): only their entries go. A kept descendant is checked
+           against its parent's current style before use (parent_key),
+           as the layout reuse cache re-keys off parent styles. */
+        lxb_dom_node_t *shallow[24];
+        size_t shallow_count;
+        /* Keyed :has() subjects of the pending changes
+           (style_has_note_change); `has_active` while it holds any. */
+        StyleHasPending has_pending;
+        bool has_active;
+        /* Bumped by every drop: an entry validated in this epoch is valid
+           without checking its ancestors. */
+        uint32_t epoch;
+        size_t scoped_clears;
+        size_t full_clears;
+        /* var() lookups under the same validity, cleared with the
+           entries (any change can alter a custom property somewhere).
+           The table exists only once a read resolved a var() against a
+           sheet that declares custom properties. */
+        StyleVariableCacheLease variables;
+        /* Selector dependencies of the sheet generation below. */
+        const void *flags_sheet;
+        uint64_t flags_generation;
+        bool flags_has;
+        bool flags_structure;
+        bool flags_focus;
+        /* Sibling combinators or `of S` counts, which make one element's
+           attributes part of its siblings' matches (positional
+           pseudo-classes read only positions); :empty or :blank beside a
+           sibling test, through which a child list can restyle the
+           parent's siblings. */
+        bool flags_sibling;
+        bool flags_empty_sibling;
+        /* A custom-property rule with :has(): a subject's drop takes its
+           subtree. */
+        bool flags_custom_has;
+        bool flags_has_escaped;
+        /* Structural tests that reach descendants (style.h), as keys of
+           the children they concern: all of them for child-list changes,
+           the sibling ones for attribute changes. */
+        StyleStructureKeys structure;
+        StyleStructureKeys sibling_structure;
+        /* Keys of the elements a custom-property rule's structural test
+           (all; sibling only) can switch custom properties on. A custom
+           property is not in ComputedStyle, so such a sibling's subtree
+           goes; `_any` when some test has no key. */
+        uint32_t custom_structure_keys[COMPUTED_STYLE_CUSTOM_KEY_LIMIT];
+        uint32_t custom_sibling_keys[COMPUTED_STYLE_CUSTOM_KEY_LIMIT];
+        uint8_t custom_structure_key_count;
+        uint8_t custom_sibling_key_count;
+        bool custom_structure_any;
+        bool custom_sibling_any;
+        /* Keys of the elements whose :empty a sibling test reads. */
+        uint32_t empty_keys[COMPUTED_STYLE_CUSTOM_KEY_LIMIT];
+        uint8_t empty_key_count;
+        bool empty_any;
+        /* Host style generations that emptied a warm ring, for the lab's
+           style-cache report. */
+        size_t host_clears;
+    } computed_style_cache;
+    /* The last container-state signature computed, by the generation it
+       was computed for (shared by the memo and the ring). */
+    const void *computed_style_container_sheet;
+    uint64_t computed_style_container_generation;
+    uint64_t computed_style_container_signature;
+    /* Set while the transition watcher snapshots an element: computed
+       values resolve from the cascade as it stands rather than forcing the
+       synchronous layout a class change would otherwise cost. */
+    bool computed_style_without_layout;
     /* Connected mutations that can change document statistics (anything
        but attribute, inline-style and canvas-pixel changes); the runtime
        refreshes the document only when this advances. */
     size_t stats_mutations;
+    uint64_t dom_version;
+    /* Advances with dom_version except for attribute, inline-style and
+       canvas changes that cannot move a form control between owners
+       (anything but id, form, type or an internal state attribute). */
+    uint64_t dom_structure_version;
+    /* Native setAttribute calls: total, those writing the value already
+       present, and time spent in the native setter. */
+    size_t attribute_writes;
+    size_t attribute_writes_unchanged;
+    uint64_t attribute_write_ns;
     uint32_t node_reusable_bits[DOM_BRIDGE_NODE_LIMIT / 32u];
+    /* Exhaustion-time slot reclamation: a reentry guard, the exhaustions
+       still to handle without a collection after a futile one (cleared at
+       each entry into JavaScript), and the next such backoff. */
+    bool node_reclaim_active;
+    uint16_t node_reclaim_gc_skip;
+    uint16_t node_reclaim_gc_backoff;
     /* Shadow carriers are native DOM nodes, but ordinary document/element
        selectors must not cross their tree boundary.  Store encoded handles,
        rather than pointers, so slot generation prevents allocator reuse from
@@ -419,6 +560,11 @@ typedef struct DomBridge {
     ImageResources *images;
     ScriptSynchronousLayoutCallback synchronous_layout;
     void *synchronous_layout_opaque;
+    /* Layout the page forced from script (geometry reads, scrollIntoView):
+       engine work inside a script entry that its watchdog also counts. */
+    size_t synchronous_layout_calls;
+    uint64_t synchronous_layout_us;
+    uint64_t synchronous_layout_max_us;
     ScriptNodeRetirementCallback node_retirement;
     void *node_retirement_opaque;
     ElementScrollIntent scroll_intents[DOM_SCROLL_INTENT_LIMIT];
@@ -450,6 +596,7 @@ typedef struct DomBridge {
     size_t script_quota_reserved_bytes;
     size_t maximum_scripts;
     size_t maximum_script_bytes;
+    size_t script_quota_pressure_raises;
     size_t maximum_script_file_bytes;
     bool allow_test_network_primitive_overrides;
     uint64_t dynamic_script_sequence;
@@ -479,6 +626,9 @@ typedef struct {
 typedef struct {
     char *request_url;
     char *response_url;
+    /* Set only for a module first requested by a classic script's
+       import(): that script's base URL, the request's referrer. */
+    char *classic_referrer_url;
     TilefinchCredentialsMode credentials;
     uint16_t parent_index;
     uint8_t effective_referrer_policy;
@@ -494,7 +644,6 @@ typedef enum {
     SCRIPT_HOST_MEDIA_RECHECK,
     SCRIPT_HOST_RECORD_RESOURCE_TIMING,
     SCRIPT_HOST_RECORD_NAVIGATION_TIMING,
-    SCRIPT_HOST_PENDING_WORK,
     SCRIPT_HOST_DELIVER_NETWORK,
     SCRIPT_HOST_DETACH_NETWORK,
     SCRIPT_HOST_PUMP_TIMERS,
@@ -508,9 +657,46 @@ typedef enum {
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
 
+/* Slots of ScriptRuntime.host_state, which scheduler.js sees as a
+   Float64Array (its HOST_* constants): facts the event loop needs every
+   turn, written by the bootstrap when they change. */
+typedef enum {
+    SCRIPT_HOST_STATE_TIMERS = 0,
+    SCRIPT_HOST_STATE_EARLIEST_DUE,
+    SCRIPT_HOST_STATE_NOW,
+    SCRIPT_HOST_STATE_SAMPLED_CLOCK,
+    SCRIPT_HOST_STATE_SCROLL_PENDING,
+    /* The earliest timer's kind (ScriptHostTimerKind), 0 without one. */
+    SCRIPT_HOST_STATE_EARLIEST_KIND,
+    /* The earliest due time of a task (any timer but a frame callback),
+       Infinity without one: a due animation frame at the head must not
+       hide an overdue timeout behind it. */
+    SCRIPT_HOST_STATE_EARLIEST_TASK_DUE,
+    SCRIPT_HOST_STATE_COUNT
+} ScriptHostStateSlot;
+
+/* scheduler.js's timer kinds as SCRIPT_HOST_STATE_EARLIEST_KIND codes (its
+   TIMER_KIND_CODES). The first three are frame callbacks, which a browser
+   runs at a rendering opportunity rather than as soon as they are due. */
+typedef enum {
+    SCRIPT_HOST_TIMER_NONE = 0,
+    SCRIPT_HOST_TIMER_ANIMATION_FRAME,
+    SCRIPT_HOST_TIMER_RENDER_OBSERVER,
+    SCRIPT_HOST_TIMER_RENDER_FIXUP,
+    SCRIPT_HOST_TIMER_TIMEOUT,
+    SCRIPT_HOST_TIMER_INTERVAL,
+    SCRIPT_HOST_TIMER_MESSAGE,
+    SCRIPT_HOST_TIMER_PLATFORM_TASK,
+    SCRIPT_HOST_TIMER_IDLE,
+    SCRIPT_HOST_TIMER_OTHER
+} ScriptHostTimerKind;
+
 #define SCRIPT_WORKER_REALM_LIMIT 4
 #define SCRIPT_FRAME_REALM_LIMIT 16
 #define SCRIPT_CHECKPOINT_CONTINUATION_LIMIT 8
+/* Consecutive turns FinalizationRegistry cleanup may go without a task slot
+   before one is admitted ahead of due tasks. */
+#define SCRIPT_CLEANUP_STARVATION_ADVANCES 4u
 
 struct ScriptRuntime {
     Budget *budget;
@@ -546,7 +732,49 @@ struct ScriptRuntime {
 #endif
     size_t boot_window_peak;
     uint64_t boot_window_advances;
+    uint64_t boot_window_next_check;
+    size_t boot_window_checks;
     uint64_t boot_window_returned_advance;
+    /* Full JS_ComputeMemoryUsage walks paid on this realm. Decisions read
+       the allocator-maintained count; only diagnostics take a census. */
+    size_t heap_censuses;
+    /* Memory-pressure growth (script_runtime_enable_heap_growth): the
+       configured limit is a floor; the realm grows while the page Budget
+       keeps its work reserve free, and gives growth back once collection
+       shows it unused. */
+    size_t reentrant_checkpoints_skipped;
+    /* Interrupt-time sampling profiler (validation builds, or the host with
+       TILEFINCH_TRACE_JS_PROFILE): wall time between polls charged to the
+       innermost script line (self) and to each distinct function on the
+       top frames (inclusive). Bounded; atoms are duplicated on insert. */
+    struct ScriptProfile *profile;
+    bool heap_growth_enabled;
+    size_t heap_growth_floor;
+    size_t heap_growth_ceiling;
+    size_t heap_growth_reserve;
+    size_t heap_growth_bytes;
+    size_t heap_growth_peak_limit;
+    size_t heap_growth_raises;
+    /* Limit raises made ahead of need for collection headroom. */
+    size_t heap_growth_pregrows;
+    /* QuickJS heap bytes right after the latest collection: the live graph
+       collection pacing grows from (0 before the first). */
+    size_t heap_live_after_gc;
+    size_t heap_collections;
+    /* setAttribute calls already cleared from the bridge by profile
+       reports: the tilefinch-work record adds them back. */
+    uint64_t work_attribute_writes_reported;
+    size_t heap_growth_refusals;
+    /* Last refused request: bytes it needed past the limit, and why
+       (1 = page reserve reached, 2 = ceiling, 3 = request exceeds spare). */
+    size_t heap_growth_refused_bytes;
+    uint8_t heap_growth_refused_reason;
+    size_t heap_growth_returns;
+    uint64_t heap_growth_advances;
+    uint64_t heap_growth_next_check;
+    /* Consecutive return checks that returned nothing: each doubles the
+       interval to the next full collection, as the boot window does. */
+    size_t heap_growth_fruitless_checks;
     uint64_t deterministic_gc_advances;
     /* 0=deferred, 1=loading, 2=loaded, 3=failed. Uncommon platform modules
        keep their bytecode in ROM but do not occupy the page heap until a page
@@ -584,7 +812,13 @@ struct ScriptRuntime {
     size_t module_base_count;
     size_t module_base_capacity;
     TilefinchCredentialsMode active_module_credentials;
+    /* Wall time spent in nested module loads (QuickJS resolves imports
+       inside the JS_Eval that compiles the importer), so each module's
+       compile time can exclude its dependencies' fetch and compile. */
+    uint64_t module_nested_ns;
     size_t inline_module_sequence;
+    /* This realm's module bytecode generation; 0 until its first use. */
+    uint32_t module_bytecode_generation;
     /* Captured before author scripts run. Keeping the callable values here
        avoids a global lookup and prevents author replacement of private host
        bridge properties from intercepting native viewport updates. */
@@ -622,6 +856,13 @@ struct ScriptRuntime {
        lifecycle never look them up through the mutable Window object. */
     JSValue host_global;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
+    /* Native-readable bootstrap state, so the per-turn loop and the result
+       snapshot do not enter JS: the timer wheel and scroll flag (external
+       Float64Array memory), and the plain records behind the network-queue
+       and IndexedDB stat views (read as data properties, no getter call). */
+    double host_state[SCRIPT_HOST_STATE_COUNT];
+    JSValue host_network_queue_stats;
+    JSValue host_indexed_db_stats;
     /* Browser-delivered callbacks run with no enclosing author script. Resume
        their bounded listener dispatch only after QuickJS has drained the
        complete microtask checkpoint, before admitting another task. */
@@ -635,6 +876,9 @@ struct ScriptRuntime {
     bool page_visibility_queue[2];
     uint8_t page_visibility_queue_head;
     uint8_t page_visibility_queue_count;
+    /* Consecutive advances which ended with FinalizationRegistry cleanup
+       queued but admitted none because due tasks took every slot. */
+    uint8_t cleanup_starved_advances;
     TilefinchGameAudio *game_audio;
     struct ScriptLazyRuntimeBundle *lazy_webpack_bundles;
     uint32_t next_lazy_webpack_bundle_id;
@@ -706,6 +950,8 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
 void js_rt_runtime_update_frame_result(ScriptRuntime *runtime,
                                        ScriptResult *result);
 uint64_t js_rt_monotonic_time_ns(void);
+/* JS_ComputeMemoryUsage walks every live object; diagnostics only. */
+void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage);
 /* HTML deliberately leaves the transient-activation duration to the user
    agent. Five seconds matches the interoperability window used by major
    engines while keeping privileged actions tightly bounded on the PSP. */
@@ -775,12 +1021,27 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
                                    int evaluation_type,
                                    ScriptCompileSourceKind source_kind,
                                    ScriptResult *result);
+/* As js_rt_evaluate_source_type_at for an external module root: compiles it
+   through js_rt_module_compile_external(). */
+bool js_rt_evaluate_external_module_at(
+    JSContext *context, const char *source, size_t length, const char *name,
+    const char *response_url, const char *module_referrer_policy,
+    TilefinchCredentialsMode module_credentials, ScriptResult *result);
 bool js_rt_evaluate_source(JSContext *context, const char *source,
                            size_t length, const char *name,
                            ScriptResult *result);
 const char *js_rt_bridge_calculated_base_url(DomBridge *bridge);
 
 /* js_module_loader.c helpers used by the sibling translation units. */
+/* Compile one external module record (a root or an imported dependency) the
+   way JS_Eval(JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY) does,
+   including synchronous resolution of its imports, and applying the page's
+   module source-retention policy. Returns the module value or JS_EXCEPTION;
+   *admitted reports whether the compile-admission policy accepted it. */
+JSValue js_rt_module_compile_external(
+    ScriptRuntime *runtime, JSContext *context, const char *source,
+    size_t source_length, const char *module_name, const char *response_url,
+    ScriptResult *result, bool *admitted);
 bool js_rt_module_set_import_meta(JSContext *context, JSValueConst module,
                                   const char *response_url, bool is_main);
 uint8_t js_rt_runtime_module_referrer_policy_code(const char *policy);
@@ -1047,9 +1308,20 @@ lxb_dom_node_t *dom_document_order_next(
 JSValue js_computed_style_get(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
+JSValue js_computed_style_read(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_transition_snapshot(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
 JSValue js_computed_style_support(JSContext *context,
                                   JSValueConst this_value,
                                   int argc, JSValueConst *argv);
+JSValue js_attribute_change_may_affect_has(JSContext *context,
+                                           JSValueConst this_value,
+                                           int argc, JSValueConst *argv);
+JSValue js_style_reach(JSContext *context, JSValueConst this_value,
+                       int argc, JSValueConst *argv);
 JSValue js_dom_append(JSContext *context, JSValueConst this_value,
                       int argc, JSValueConst *argv);
 JSValue js_dom_prepare_dynamic_subtree(JSContext *context,
@@ -1089,6 +1361,11 @@ JSValue js_dom_create_text(JSContext *context,
 JSValue js_dom_descendants(JSContext *context,
                            JSValueConst this_value,
                            int argc, JSValueConst *argv);
+JSValue js_dom_traverse(JSContext *context, JSValueConst this_value,
+                        int argc, JSValueConst *argv);
+JSValue js_dom_observe_parser_insertions(JSContext *context,
+                                         JSValueConst this_value,
+                                         int argc, JSValueConst *argv);
 JSValue js_dom_named_element_ids(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv);
@@ -1121,6 +1398,33 @@ JSValue js_dom_insert_before(JSContext *context,
 JSValue js_dom_is_connected(JSContext *context,
                             JSValueConst this_value,
                             int argc, JSValueConst *argv);
+JSValue js_dom_root_node(JSContext *context, JSValueConst this_value,
+                         int argc, JSValueConst *argv);
+JSValue js_dom_node_owner(JSContext *context, JSValueConst this_value,
+                          int argc, JSValueConst *argv);
+void js_rt_bridge_computed_style_cache_free(DomBridge *bridge);
+void js_rt_bridge_computed_style_cache_forget(DomBridge *bridge);
+/* Bytes the getComputedStyle caches hold (ancestor styles plus the var()
+   table), for the profile report and tests. */
+size_t js_rt_bridge_computed_style_cache_bytes(const DomBridge *bridge);
+/* Whether a retained computed style (ring or memo) names `node`. */
+bool js_rt_bridge_computed_style_cache_holds(const DomBridge *bridge,
+                                             const lxb_dom_node_t *node);
+/* The QuickJS pool's limit-growth hook: `growth` more bytes on top of
+   `live` against `limit`; returns the raised limit, or 0 when refused.
+   Exposed for tests. */
+size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
+                              size_t limit);
+JSValue js_dom_make_fast_getter(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv);
+JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv);
+JSValue js_dom_note_remote_wrapper(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv);
+void js_rt_bridge_wrapper_refs_free(DomBridge *bridge);
+JSValue js_dom_closest(JSContext *context, JSValueConst this_value,
+                       int argc, JSValueConst *argv);
 JSValue js_dom_matches(JSContext *context, JSValueConst this_value,
                        int argc, JSValueConst *argv);
 JSValue js_dom_node_type(JSContext *context,
@@ -1159,6 +1463,16 @@ JSValue js_dom_relation(JSContext *context,
 JSValue js_dom_compare_position(JSContext *context,
                                 JSValueConst this_value,
                                 int argc, JSValueConst *argv);
+JSValue js_dom_is_ancestor(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv);
+JSValue js_dom_selectors_test_attribute(JSContext *context,
+                                        JSValueConst this_value,
+                                        int argc, JSValueConst *argv);
+JSValue js_dom_nearest_id(JSContext *context, JSValueConst this_value,
+                          int argc, JSValueConst *argv);
+JSValue js_dom_next_ancestor_entry(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv);
 JSValue js_dom_release_node_wrapper(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);
@@ -1179,6 +1493,8 @@ JSValue js_dom_set_control_value(JSContext *context,
 JSValue js_dom_parser_form_owner(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv);
+JSValue js_dom_version(JSContext *context, JSValueConst this_value,
+                       int argc, JSValueConst *argv);
 JSValue js_dom_has_parser_form_owners(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv);
@@ -1193,6 +1509,9 @@ JSValue js_dom_set_text(JSContext *context, JSValueConst this_value,
 JSValue js_dom_tag_name(JSContext *context,
                         JSValueConst this_value,
                         int argc, JSValueConst *argv);
+JSValue js_dom_node_identity(JSContext *context,
+                             JSValueConst this_value,
+                             int argc, JSValueConst *argv);
 JSValue js_find_stable_node(JSContext *context,
                             JSValueConst this_value,
                             int argc, JSValueConst *argv);

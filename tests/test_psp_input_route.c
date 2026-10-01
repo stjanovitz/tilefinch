@@ -76,6 +76,19 @@ int main(void)
           == PSP_INPUT_ROUTE_BUSY);
     CHECK(route(media, on_page, PSP_UI_BUTTON_RIGHT, true)
           == PSP_INPUT_ROUTE_STILL_STOPPING);
+    /* A highlighted scrub time: Circle drops it instead of stopping the
+       video, unless a stop is already under way. */
+    PspInputRouteContext highlighted = {
+        .owner = media, .loop = on_page, .pressed = PSP_UI_BUTTON_CANCEL,
+        .acknowledge_busy = true, .media_preview_active = true
+    };
+    CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_MEDIA);
+    highlighted.cancelling = true;
+    CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_STILL_STOPPING);
+    /* The flag means nothing to a loading page. */
+    highlighted.owner = loading;
+    highlighted.cancelling = false;
+    CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_CANCEL);
 
     /* Nothing pressed: nothing to do. */
     CHECK(route(loading, on_page, 0, false) == PSP_INPUT_ROUTE_NONE);
@@ -121,6 +134,49 @@ int main(void)
     awaited.analog_active = false;
     awaited.forward_awaited = false;
     CHECK(psp_input_route(&awaited) == PSP_INPUT_ROUTE_YIELD);
+
+    /* The rest of a provisional layout that lets the supervisor page the
+       committed page: page presses scroll it and the layout keeps going;
+       anything else (a link, the menu, the stick, a chord) still stops it. */
+    PspInputRouteContext served = {
+        .owner = service, .owner_thread = true,
+        .optional_preemptible = true, .scroll_served = true,
+        .pressed = PSP_UI_BUTTON_PAGE_DOWN
+    };
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_SCROLL);
+    served.pressed = PSP_UI_BUTTON_UP;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_SCROLL);
+    served.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_YIELD);
+    served.pressed = PSP_UI_BUTTON_PAGE_DOWN | PSP_UI_BUTTON_MENU;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_YIELD);
+    served.pressed = PSP_UI_BUTTON_DOWN;
+    served.analog_active = true;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_YIELD);
+    /* Waiting at the bottom for that layout, down still queues for the
+       page; up is served. */
+    served.analog_active = false;
+    served.forward_awaited = true;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_QUEUE_PAGE);
+    served.pressed = PSP_UI_BUTTON_PAGE_UP;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_SCROLL);
+    /* A provisional relayout's build is kept, not optional: page presses
+       are served at its checkpoints and anything else waits for the page. */
+    PspInputRouteContext relayout = {
+        .owner = service, .owner_thread = true, .scroll_served = true,
+        .pressed = PSP_UI_BUTTON_PAGE_DOWN
+    };
+    CHECK(psp_input_route(&relayout) == PSP_INPUT_ROUTE_SCROLL);
+    relayout.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_input_route(&relayout) == PSP_INPUT_ROUTE_QUEUE_PAGE);
+    relayout.pressed = PSP_UI_BUTTON_DOWN;
+    relayout.analog_active = true;
+    CHECK(psp_input_route(&relayout) == PSP_INPUT_ROUTE_QUEUE_PAGE);
+    /* Off the browser thread nothing is served or preempted this way. */
+    served.owner_thread = false;
+    served.forward_awaited = false;
+    served.scroll_served = false;
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_QUEUE_PAGE);
 
     puts("psp-input-route-tests status=PASS");
     return 0;

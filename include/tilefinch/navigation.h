@@ -164,6 +164,9 @@ typedef struct {
 typedef struct {
     lxb_dom_node_t *element;
     uint64_t resolved_url_hash;
+    /* Preloading bytes and attaching them as a stylesheet are separate
+       resource completions, even for the same element and URL. */
+    bool preload;
 } NavigationStylesheetEventRecord;
 
 typedef struct {
@@ -235,6 +238,12 @@ typedef struct {
     NavigationStylesheetEventRecord stylesheet_events[
         NAVIGATION_STYLESHEET_EVENT_LIMIT];
     size_t stylesheet_event_count;
+    /* A dispatch pass found no link or style preload awaiting its load or
+       error event. Until then relayouts that rebuild no stylesheet still
+       look for one: a parser-discovered preload settles before the page
+       realm can observe it, and its event must not wait for an unrelated
+       full rebuild. */
+    bool stylesheet_events_swept;
     NavigationMessage messages[NAVIGATION_MESSAGE_LIMIT];
     size_t message_count;
     uint64_t compiled_stylesheet_fingerprint;
@@ -318,6 +327,7 @@ typedef struct {
     uint64_t metadata_us;
     uint64_t runtime_startup_us;
     uint64_t stylesheet_us;
+    uint64_t mutation_checkpoint_us;
     uint64_t stylesheet_fingerprint_us;
     uint64_t process_us;
     uint64_t compile_us;
@@ -337,6 +347,7 @@ typedef struct {
     uint64_t parser_metadata_us;
     uint64_t parser_runtime_startup_us;
     uint64_t parser_stylesheet_us;
+    uint64_t parser_mutation_checkpoint_us;
     uint64_t parser_script_us;
     uint64_t parser_script_compile_us;
     uint64_t parser_script_execute_us;
@@ -364,6 +375,12 @@ typedef struct {
     uint64_t style_us;
     uint64_t resource_us;
     uint64_t stylesheet_resource_us;
+    /* Stylesheet load/error event dispatch (inside stylesheet_resource_us
+       where it runs in the resource phase): the whole pass, and the page's
+       handlers alone. */
+    uint64_t stylesheet_event_us;
+    uint64_t stylesheet_event_handler_us;
+    size_t stylesheet_event_dispatches;
     uint64_t image_resource_us;
     uint64_t font_resource_us;
     uint64_t resource_fingerprint_us;
@@ -371,6 +388,18 @@ typedef struct {
     uint64_t final_layout_us;
     uint64_t relayout_us;
     uint64_t runtime_us;
+    /* Phases of navigation_advance_runtime, wall time: the page realm's
+       script_runtime_advance call, the child-frame pass (of which the
+       frames' own script_runtime_advance calls), cross-frame message
+       delivery, and the rest after the page call. */
+    uint64_t advance_page_script_us;
+    uint64_t advance_frames_us;
+    uint64_t advance_frame_script_us;
+    uint64_t advance_messages_us;
+    /* Between the page call and the frame pass (dynamic frame loading and
+       progress), and the relayout the page requested (whole call). */
+    uint64_t advance_frame_setup_us;
+    uint64_t advance_relayout_us;
     size_t fast_relayouts;
     size_t full_relayouts;
     size_t provisional_relayouts;
@@ -417,6 +446,18 @@ typedef struct {
        of rebuilding it, and attempts that had to fall back. */
     size_t mutation_style_appends;
     size_t mutation_style_append_fallbacks;
+    /* Relayouts that re-derived the image table alone, keeping the sheet,
+       its external CSS, stylesheet events and web fonts (image-only
+       resource changes, or ones the journal could not itemize). */
+    size_t mutation_image_rebuilds;
+    /* Style append time: the document walk and fingerprint that prove it,
+       loading/parsing the new sources, the order bookkeeping around them,
+       the layout reuse note, and the image-discovery rule check. */
+    uint64_t style_append_walk_us;
+    uint64_t style_append_load_us;
+    uint64_t style_append_track_us;
+    uint64_t style_append_note_us;
+    uint64_t style_append_discovery_us;
     size_t mutation_image_resource_scans;
     size_t mutation_conservative_scans;
     size_t mutation_journal_overflows;
@@ -439,6 +480,13 @@ typedef struct {
     size_t layout_reuse_matched_token_invalidations;
     size_t layout_reuse_matched_token_fallbacks;
     size_t layout_reuse_matched_token_dropped;
+    /* Scoped :has() invalidation (LayoutReuseStats has_*): changes handled
+       in scope, changes that fell back to a full reset, elements dropped,
+       and keyed table scans. */
+    size_t layout_reuse_has_scoped;
+    size_t layout_reuse_has_fallbacks;
+    size_t layout_reuse_has_dropped;
+    size_t layout_reuse_has_scans;
     uint64_t response_headers_us;
     uint64_t first_body_byte_us;
     size_t stylesheet_preload_timeout_bytes;
@@ -575,6 +623,10 @@ struct NavigationSession {
        than being refused. Owners of optional work (web fonts) retry such a
        build later instead of marking the work failed. */
     bool layout_build_cancelled;
+    /* A provisional relayout is building its replacement beside the
+       committed layout, which stays intact until the build ends: a frontend
+       may page through it at the build's checkpoints. */
+    bool committed_layout_servable;
     /* In-place relayouts whose last complete layout took at least this long
        publish the visible screens first (UINT64_MAX: never). */
     uint64_t relayout_preview_threshold_us;
@@ -619,6 +671,15 @@ struct NavigationSession {
     FetchStreamOptions stream_delivery;
     unsigned progressive_preview_lookahead_percent;
     uint64_t resource_fingerprint;
+    /* resource_fingerprint's stylesheet-source [0] and image-element [1]
+       parts (see navigation_note_committed_fingerprint): valid while
+       `owner` still equals the committed fingerprint. `last` is the latest
+       traversal. */
+    uint64_t resource_fingerprint_parts[2];
+    uint64_t resource_fingerprint_parts_owner;
+    uint64_t resource_fingerprint_last;
+    uint64_t resource_fingerprint_parts_last[2];
+    bool resource_fingerprint_parts_valid;
     bool style_rebuild_required;
     bool relayout_damage_valid;
     int relayout_damage_left;
@@ -779,9 +840,16 @@ struct NavigationSession {
     bool trace_frame_capabilities;
     bool trace_page_capabilities;
     bool diagnostic_frame_safari;
+    /* Page realms normally let their heap and script-source totals follow
+       memory pressure; tests of the fixed limits turn that off. */
+    bool fixed_script_memory_limits;
     char pending_navigation_referer[NAVIGATION_URL_LIMIT];
     bool pending_navigation_same_origin;
     bool pending_navigation_user_activated;
+    /* Leave a top-level navigation requested by page script pending in the
+       runtime instead of loading it inside navigation_advance_runtime; the
+       frontend takes it and runs an ordinary cooperative navigation job. */
+    bool defer_script_navigation;
     char pending_response_referrer_policy[128];
     char *user_css;
     size_t user_css_length;
@@ -866,6 +934,11 @@ typedef struct {
     size_t safe_sections_ready;
     size_t safe_section_source_bytes;
     FetchStreamMetrics stream;
+    /* Monotonic count that moves whenever the load does anything useful:
+       document bytes, finalize steps, and the candidate page's scripts
+       evaluated and DOM mutations. A watchdog compares successive values
+       to tell a slow, working load from a stuck one. */
+    size_t progress_units;
 } NavigationLoadMetrics;
 
 bool navigation_init(NavigationSession *session, Budget *budget,
@@ -974,6 +1047,10 @@ void navigation_enable_page_capability_trace(NavigationSession *session,
                                              bool enabled);
 void navigation_enable_diagnostic_frame_safari(NavigationSession *session,
                                                bool enabled);
+/* Keep page realms at their configured heap and script-source totals
+   instead of growing them while the page Budget has room. */
+void navigation_set_fixed_script_memory_limits(NavigationSession *session,
+                                               bool fixed);
 void navigation_set_stream_delivery(
     NavigationSession *session, size_t chunk_bytes, uint64_t irregular_seed,
     size_t irregular_max_chunk_bytes, size_t stall_every_chunks,
@@ -1021,6 +1098,11 @@ NavigationLoad *navigation_load_begin_url(
     size_t maximum_bytes, long timeout_ms, int viewport_width,
     const FontSet *fonts, const ImageResources *images,
     bool record_history);
+/* Parser-blocking JavaScript time this load has spent against its stage
+   allowance, including a turn still running. */
+bool navigation_load_parser_script_time(const NavigationLoad *load,
+                                       uint64_t *used_us,
+                                       uint64_t *limit_us);
 NavigationLoad *navigation_load_begin_request(
     NavigationSession *session, uint64_t generation, const char *url,
     const char *method, const char *body, size_t body_length,
@@ -1069,6 +1151,12 @@ const NavigationEntry *navigation_current(const NavigationSession *session);
 /* Returns the committed document's effective URL.  A session-history entry
    retains the originally requested URL while a replayed redirect commits a
    different document, so security and resource policy must use this value. */
+/* Take a top-level navigation page script requested while
+   defer_script_navigation was set, recording its referer and activation for
+   the navigation begun next. */
+bool navigation_take_script_navigation(NavigationSession *session,
+                                       char *url, size_t capacity,
+                                       bool *record_history);
 const char *navigation_active_document_url(
     const NavigationSession *session);
 /*

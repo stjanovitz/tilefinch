@@ -24,6 +24,7 @@
 #include "tilefinch/build_version.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/psp_display.h"
+#include "tilefinch/psp_entropy.h"
 #include "tilefinch/psp_threads.h"
 #include "tilefinch/update.h"
 
@@ -601,6 +602,12 @@ int main(int argc, char **argv)
         return 1;
     }
     (void) mkdir(paths.data_dir, 0777);
+    /* Signature verification calls psa_crypto_init(), which seeds PSA's RNG
+       from the entropy source even though verifying never draws from it.
+       This process creates no secrets, so a device whose timing jitter
+       earns too little credit must still be able to verify and boot. No
+       seed file: the browser owns that. */
+    psp_entropy_configure(NULL, PSP_ENTROPY_PERMIT_UNCREDITED, NULL);
 
     TilefinchUpdateState state;
     if (!tilefinch_update_journal_load(paths.data_dir, &state, NULL)) {

@@ -1,9 +1,8 @@
 # Offline voice model
 
-These are the validated `14M-extra-wide` and `10M-small` English search tiers
-imported from the PSP Search Speech Prototype. They share one PocketSphinx US
-English acoustic model and provide bounded 7,763-entry and 1,463-entry search
-language models. They are intentionally a search/dictation convenience, not
+These are the validated `extra-wide` and `search` (small) English search
+tiers. They share one PocketSphinx US English acoustic model (`en-us/`) and
+provide bounded 7,763-entry and 1,463-entry search language models. They are intentionally a search/dictation convenience, not
 open-vocabulary speech recognition: words outside the selected dictionary
 cannot be returned.
 
@@ -26,17 +25,17 @@ license and provenance notice under `LICENSES/`; the packaging target fails
 if any required payload or license file is absent.
 
 In the standalone PPSSPP lab the extra-wide decoder reached 6.80 MiB of live
-heap and a 6.91 MiB allocator arena, down from 12.82 MiB for the preceding
-fixed/direct representation. The small tier measured 4.88 MiB for both live
-heap and allocator arena. The strict 192-row reservations round these to
+heap and a 6.91 MiB allocator arena. The small tier measured 4.88 MiB for both
+live heap and allocator arena. The strict 192-row reservations round these to
 8 MiB and 6 MiB respectively; larger row sets add their exact storage and
 still require a separate 2 MiB selection margin. A 33-fixture host gate
 produced identical final hypotheses and scores against the
 general-representation oracle. The strict memory profile trades CPU and
 Memory Stick traffic for RAM; physical PSP latency still needs calibration.
-Tilefinch uses the complete 384-row acoustic table by default. The
-off-by-default **Adaptive voice memory** option permits 256- and 192-row
-fallbacks under measured pressure. It chooses the largest extra-wide
+Tilefinch uses the complete 384-row acoustic table by default (**Voice
+memory: Full** on the Experimental screen). Setting **Voice memory** to
+Adaptive permits 256- and 192-row fallbacks under measured pressure. It
+chooses the largest extra-wide
 configuration that fits current total and contiguous heap before considering
 the small tier, loads only one decoder lazily, and evicts the resident decoder
 before page navigation or at a memory-pressure low-water mark.

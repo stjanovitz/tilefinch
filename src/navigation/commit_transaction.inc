@@ -285,16 +285,81 @@ static bool navigation_attribute_equals(
         && strncasecmp(attribute, value, length) == 0;
 }
 
+#define NAVIGATION_MARKUP_IMAGE_ANCESTOR_LIMIT 64u
+
+/* Computed styles of the most recently resolved root-to-image element
+   chain. Sibling images share most of their ancestors, so each candidate
+   resolves only the part of its chain that differs from the previous one. */
+typedef struct {
+    const Stylesheet *sheet;
+    ComputedStyle *styles;
+    lxb_dom_node_t *nodes[NAVIGATION_MARKUP_IMAGE_ANCESTOR_LIMIT];
+    size_t depth;
+    size_t first_hidden;
+} NavigationMarkupImageStyles;
+
+/* The style-aware image traversal never reaches an element below a
+   display:none or engine-hidden ancestor (including the element itself):
+   such an image is never painted. Returns false only when the resolved
+   chain proves that; an unavailable chain keeps the eager markup policy. */
+static bool navigation_markup_image_rendered(
+    NavigationMarkupImageStyles *memo, lxb_dom_node_t *node)
+{
+    if (memo == NULL || memo->sheet == NULL || memo->styles == NULL) {
+        return true;
+    }
+    lxb_dom_node_t *chain[NAVIGATION_MARKUP_IMAGE_ANCESTOR_LIMIT];
+    size_t depth = 0;
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (depth == NAVIGATION_MARKUP_IMAGE_ANCESTOR_LIMIT) return true;
+        chain[depth++] = at;
+    }
+    /* chain[] runs image-to-root; the memo runs root-to-image. */
+    size_t shared = 0;
+    while (shared < depth && shared < memo->depth
+           && memo->nodes[shared] == chain[depth - 1u - shared]) shared++;
+    if (memo->first_hidden < shared) return false;
+    memo->depth = shared;
+    memo->first_hidden = SIZE_MAX;
+    for (size_t level = shared; level < depth; level++) {
+        lxb_dom_node_t *element = chain[depth - 1u - level];
+        memo->styles[level] = style_for_node(
+            memo->sheet, element,
+            level == 0 ? NULL : &memo->styles[level - 1u]);
+        memo->nodes[level] = element;
+        memo->depth = level + 1u;
+        if (memo->styles[level].display == DISPLAY_NONE
+            || memo->styles[level].hidden) {
+            memo->first_hidden = level;
+            return false;
+        }
+    }
+    return true;
+}
+
 /* A speculative layout can be refused precisely when priority matters most.
-   Preserve a useful bounded order without style/layout allocation: explicit
+   Preserve a useful bounded order without layout allocation: explicit
    fetchpriority=high images first, then eager markup images in DOM order.
-   Lazy images remain for the document-wide continuation. */
+   Lazy images remain for the document-wide continuation, and images below
+   hidden markup are left to it too (it never loads them). Resolving their
+   bounded ancestor chains is optional: under allocation refusal every eager
+   markup image stays eligible, as before. */
 static size_t navigation_collect_markup_image_priority(
-    const PocDocument *document, ImagePriorityTarget *targets,
-    size_t capacity, size_t existing_count)
+    Budget *budget, const Stylesheet *sheet, const PocDocument *document,
+    ImagePriorityTarget *targets, size_t capacity, size_t existing_count)
 {
     if (document == NULL || document->html == NULL || targets == NULL
         || existing_count >= capacity) return 0;
+    NavigationMarkupImageStyles memo = {
+        .sheet = sheet,
+        .first_hidden = SIZE_MAX
+    };
+    if (budget != NULL && sheet != NULL) {
+        memo.styles = budget_malloc_category(
+            budget, BUDGET_CATEGORY_STYLE,
+            NAVIGATION_MARKUP_IMAGE_ANCESTOR_LIMIT * sizeof(*memo.styles));
+    }
     size_t count = existing_count;
     lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
     for (unsigned pass = 0; pass < 2 && count < capacity; pass++) {
@@ -307,7 +372,8 @@ static size_t navigation_collect_markup_image_priority(
                     node, "fetchpriority", "high");
                 bool lazy = navigation_attribute_equals(
                     node, "loading", "lazy");
-                if ((pass == 0 && high) || (pass == 1 && !high && !lazy)) {
+                if (((pass == 0 && high) || (pass == 1 && !high && !lazy))
+                    && navigation_markup_image_rendered(&memo, node)) {
                     ImagePriorityTarget candidate = {
                         .node = node,
                         .kind = IMAGE_PRIORITY_KIND_DOCUMENT,
@@ -328,6 +394,7 @@ static size_t navigation_collect_markup_image_priority(
             node = node->next;
         }
     }
+    if (memo.styles != NULL) budget_free(budget, memo.styles);
     return count - existing_count;
 }
 
@@ -339,28 +406,9 @@ static size_t navigation_collect_markup_image_priority(
    skips desktop/hidden variants. */
 static bool navigation_svg_has_renderable_content(lxb_dom_node_t *svg)
 {
-    size_t visited = 0;
-    for (lxb_dom_node_t *node = svg == NULL ? NULL : svg->first_child;
-         node != NULL && visited++ < 64u;) {
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && (node_name_is(node, "path")
-                || node_name_is(node, "rect")
-                || node_name_is(node, "circle")
-                || node_name_is(node, "ellipse")
-                || node_name_is(node, "line")
-                || node_name_is(node, "polyline")
-                || node_name_is(node, "polygon")
-                || node_name_is(node, "use")
-                || node_name_is(node, "text"))) return true;
-        if (node->first_child != NULL) {
-            node = node->first_child;
-            continue;
-        }
-        while (node != svg && node->next == NULL) node = node->parent;
-        if (node == svg) break;
-        node = node->next;
-    }
-    return false;
+    /* Symbols and definitions draw only through <use>, so a sprite sheet
+       does not take one of the bounded early-icon slots. */
+    return image_inline_svg_draws_content(svg, 64u, NULL);
 }
 
 static size_t navigation_collect_markup_svg_priority(
@@ -920,8 +968,12 @@ static bool navigation_finish_authoritative_layout(
     bool attach_relayout_requested = false;
     if (session->page.runtime != NULL) {
         navigation_attach_layout(session);
-        attach_relayout_requested = script_runtime_consume_relayout(
-            session->page.runtime);
+        /* Resource completion handlers run after the resource pass. A
+           preload handler promoting rel to stylesheet (or changing href)
+           still needs another pass even though this layout covers its DOM. */
+        attach_relayout_requested =
+            script_runtime_has_pending_resource_mutations(session->page.runtime)
+            || script_runtime_consume_relayout(session->page.runtime);
     }
     session->page.loaded = true;
     /* Runtime attachment publishes canvas surfaces queued by parser-time
@@ -971,6 +1023,7 @@ static bool navigation_finish_authoritative_layout(
                  "resource fingerprint traversal failed");
         return false;
     }
+    navigation_note_committed_fingerprint(session);
     uint64_t fingerprint_finished = navigation_now_us();
     session->performance.resource_fingerprint_us +=
         fingerprint_finished >= phase_started
@@ -1971,7 +2024,13 @@ static bool navigation_commit_document(
     image_priority_count += markup_priority_added;
     if (pre_image_preview_candidate && layout_priority_count == 0
         && !static_image_plan) {
+        /* A Reader navigation's sheet hides the author article that the raw
+           toggle restores, and the Reader clone aliases those images' shared
+           backing; keep that navigation's markup images eager. */
         size_t raster_added = navigation_collect_markup_image_priority(
+            session->budget,
+            session->prepare_reader_candidates
+                ? NULL : &session->page.stylesheet,
             &session->page.document, image_priority_targets,
             markup_priority_capacity, image_priority_count);
         image_priority_count += raster_added;

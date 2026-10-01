@@ -1281,7 +1281,17 @@ static int test_has_attribute_dependency_classification(Budget *budget)
               &sheet, "title", 5, "before", 6, "after", 5)
           && !stylesheet_attribute_change_may_affect_has(
               &sheet, "class", 5, "same tokens", 11,
-              "same   tokens", 13));
+              "same   tokens", 13)
+          /* The subject compound is not relational. */
+          && !stylesheet_attribute_change_may_affect_has(
+              &sheet, "class", 5, "host", 4, "", 0)
+          /* Atomic-class lists (chatgpt.com writes ~30 tokens a time). */
+          && !stylesheet_attribute_change_may_affect_has(
+              &sheet, "class", 5, "x1a x2b x3c x4d x5e x6f", 23,
+              "x1a x2b x3c x4d x5e x7g", 23)
+          && stylesheet_attribute_change_may_affect_has(
+              &sheet, "class", 5, "x1a x2b x3c x4d x5e x6f", 23,
+              "x1a x2b x3c needle x5e x6f", 26));
     static const char escaped_css[] =
         ".host:has(.escaped\\:token){margin:1px}";
     CHECK(stylesheet_add_css(
@@ -1290,6 +1300,38 @@ static int test_has_attribute_dependency_classification(Budget *budget)
               &sheet, "class", 5, "plain", 5, "escaped:token", 13)
           && !stylesheet_attribute_change_may_affect_has(
               &sheet, "class", 5, "plain", 5, "different", 9));
+    /* Answers for other names are remembered per name (in any case) and
+       forgotten when the :has() rules change. More names than the memo
+       holds keep answering the same. */
+    for (int round = 0; round < 3; round++) {
+        CHECK(stylesheet_attribute_change_may_affect_has(
+                  &sheet, "aria-expanded", 13, NULL, 0, "true", 4)
+              && stylesheet_attribute_change_may_affect_has(
+                  &sheet, "ARIA-Expanded", 13, "false", 5, "true", 4)
+              && !stylesheet_attribute_change_may_affect_has(
+                  &sheet, "title", 5, "before", 6, "after", 5)
+              && !stylesheet_attribute_change_may_affect_has(
+                  &sheet, "TITLE", 5, NULL, 0, "x", 1)
+              && !stylesheet_attribute_change_may_affect_has(
+                  &sheet, "data-state", 10, "a", 1, "b", 1)
+              /* Equal values stay no change at all. */
+              && !stylesheet_attribute_change_may_affect_has(
+                  &sheet, "aria-expanded", 13, "true", 4, "true", 4));
+        for (int filler = 0; filler < 20; filler++) {
+            char name[16];
+            int length = snprintf(name, sizeof(name), "data-f%d", filler);
+            CHECK(!stylesheet_attribute_change_may_affect_has(
+                &sheet, name, (size_t) length, NULL, 0, "1", 1));
+        }
+    }
+    static const char state_css[] = ".host:has([data-state=open]){margin:2px}";
+    CHECK(stylesheet_add_css(&sheet, state_css, sizeof(state_css) - 1)
+          && stylesheet_attribute_change_may_affect_has(
+              &sheet, "data-state", 10, "a", 1, "b", 1)
+          && stylesheet_attribute_change_may_affect_has(
+              &sheet, "aria-expanded", 13, NULL, 0, "true", 4)
+          && !stylesheet_attribute_change_may_affect_has(
+              &sheet, "title", 5, "before", 6, "after", 5));
 
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -1326,7 +1368,8 @@ static int test_prepared_query_selectors_match_direct(Budget *budget)
     CHECK(strlen(long_selector) > 256);
     const char *parts[] = {
         "section#subject > div.eligible", "div.b", ".pair.chosen",
-        "#pair-b", "b", "B", "section .deep", "section > i.child",
+        "#pair-b", ".pair", ".PAIR", "div", " b ", "b", "B",
+        "section .deep", "section > i.child",
         "#adjacent + section b", "div:not(.pair)",
         ".subject:has(> .a + .b)", "[data-mode=LOUD] .eligible",
         "div.a ~ .eligible", "*", ".nest   >   #deep-selector",
@@ -1341,6 +1384,16 @@ static int test_prepared_query_selectors_match_direct(Budget *budget)
             &list, parts[p], strlen(parts[p])));
         bool comma_list = strcmp(parts[p], "section > div, .nest b") == 0;
         CHECK(list.count == (comma_list ? 2u : 1u));
+        if (strcmp(parts[p], "#pair-b") == 0
+            || strcmp(parts[p], ".pair") == 0
+            || strcmp(parts[p], "div") == 0
+            || strcmp(parts[p], " b ") == 0)
+            CHECK(list.items[0].complete_key);
+        if (strcmp(parts[p], ".pair.chosen") == 0
+            || strcmp(parts[p], "div.b") == 0
+            || strcmp(parts[p], "#pair\\-b") == 0
+            || strcmp(parts[p], ".subject:has(> .a + .b)") == 0)
+            CHECK(!list.items[0].complete_key);
         for (lxb_dom_node_t *node = root; node != NULL;) {
             bool direct = false;
             if (comma_list) {
@@ -3076,6 +3129,156 @@ static int test_calculated_unitless_line_height(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == baseline);
+    return 0;
+}
+
+typedef struct {
+    size_t boxes;
+    size_t commands;
+    size_t text_commands;
+    uint64_t style_resolutions;
+    uint64_t text_segments;
+    uint64_t intrinsic_visits;
+    bool found_text;
+} HiddenMarkupCost;
+
+static bool hidden_markup_layout_cost(Budget *budget, const char *body,
+                                      HiddenMarkupCost *cost,
+                                      const char *probe_text)
+{
+    char page[24576];
+    int written = snprintf(page, sizeof(page),
+        "<!doctype html><style>.row{padding:2px;border:1px solid #ccc}"
+        ".row b{font-weight:bold}.closed-by-class{display:none}</style>"
+        "<body><p>VISIBLE paragraph</p>%s</body>", body);
+    if (written < 0 || (size_t) written >= sizeof(page)) return false;
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout;
+    if (!document_parse(&document, budget, page, (size_t) written, 17)
+        || !stylesheet_build(&sheet, budget, &document, 480)
+        || !layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                         480)) return false;
+    *cost = (HiddenMarkupCost) {
+        .boxes = layout.node_box_count,
+        .commands = layout.count,
+        .style_resolutions = layout.performance.style_resolutions,
+        .text_segments = layout.performance.ascii_text_segments,
+        .intrinsic_visits = layout.performance.intrinsic_width_visits
+                            + layout.performance.intrinsic_min_visits
+    };
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_TEXT) continue;
+        cost->text_commands++;
+        if (probe_text != NULL && command->text != NULL
+            && strstr(command->text, probe_text) != NULL) {
+            cost->found_text = true;
+        }
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return budget->current == baseline;
+}
+
+/* chatgpt.com ships ~340 hidden non-SVG nodes (closed dialogs, a hidden
+   sidebar) and a 335-node SVG sprite. Hidden markup must cost one style
+   resolution for its root and nothing else: no boxes, no draw commands,
+   no text segments or glyph work, no intrinsic measurement. SVG <symbol>
+   and <defs> content renders only through <use>. An open dialog, however,
+   is ordinary content, including the common valueless `<dialog open>`. */
+static int test_hidden_markup_costs_nothing(Budget *budget)
+{
+    char rows[12288];
+    size_t used = 0;
+    for (unsigned i = 0; i < 120; i++) {
+        int written = snprintf(rows + used, sizeof(rows) - used,
+            "<div class=row><b>HIDDENTEXT %u</b><a href=#r%u>go</a></div>",
+            i, i);
+        CHECK(written > 0 && (size_t) written < sizeof(rows) - used);
+        used += (size_t) written;
+    }
+    char body[16384];
+    HiddenMarkupCost base = {0};
+    CHECK(hidden_markup_layout_cost(budget, "", &base, NULL));
+    CHECK(base.boxes != 0 && base.text_commands != 0);
+    static const char *const wrappers[][2] = {
+        {"<div style='display:none'>", "</div>"},
+        {"<div class=closed-by-class>", "</div>"},
+        {"<div hidden>", "</div>"},
+        {"<dialog>", "</dialog>"},
+        {"<dialog hidden open>", "</dialog>"},
+        {"<template>", "</template>"},
+    };
+    for (size_t w = 0; w < sizeof(wrappers) / sizeof(wrappers[0]); w++) {
+        int written = snprintf(body, sizeof(body), "%s%s%s",
+                               wrappers[w][0], rows, wrappers[w][1]);
+        CHECK(written > 0 && (size_t) written < sizeof(body));
+        HiddenMarkupCost hidden = {0};
+        CHECK(hidden_markup_layout_cost(budget, body, &hidden,
+                                        "HIDDENTEXT"));
+        if (hidden.found_text || hidden.boxes != base.boxes || hidden.commands != base.commands
+            || hidden.text_commands != base.text_commands
+            || hidden.text_segments != base.text_segments
+            || hidden.intrinsic_visits != base.intrinsic_visits
+            || hidden.style_resolutions > base.style_resolutions + 1u) {
+            fprintf(stderr, "hidden markup %s: boxes %zu/%zu commands "
+                    "%zu/%zu segments %llu/%llu styles %llu/%llu\n",
+                    wrappers[w][0], hidden.boxes, base.boxes,
+                    hidden.commands, base.commands,
+                    (unsigned long long) hidden.text_segments,
+                    (unsigned long long) base.text_segments,
+                    (unsigned long long) hidden.style_resolutions,
+                    (unsigned long long) base.style_resolutions);
+            CHECK(false);
+        }
+    }
+    /* A zero-size sprite sheet whose symbols (with text) are only defined.
+       Its <svg> is one replaced box; nothing inside is laid out. */
+    char sprite[8192];
+    used = 0;
+    for (unsigned i = 0; i < 40; i++) {
+        int written = snprintf(sprite + used, sizeof(sprite) - used,
+            "<symbol id=s%u viewBox='0 0 20 20'><path d='M0 0L%u 10Z'/>"
+            "<text x=1 y=9>HIDDENTEXT %u</text></symbol>", i, i + 1u, i);
+        CHECK(written > 0 && (size_t) written < sizeof(sprite) - used);
+        used += (size_t) written;
+    }
+    HiddenMarkupCost empty_svg = {0};
+    CHECK(hidden_markup_layout_cost(
+        budget, "<svg width=0 height=0 aria-hidden=true><defs></defs></svg>",
+        &empty_svg, NULL));
+    static const char *const sprite_forms[][2] = {
+        {"<svg width=0 height=0 aria-hidden=true><defs>", "</defs></svg>"},
+        {"<svg width=0 height=0 aria-hidden=true>", "</svg>"},
+    };
+    for (size_t f = 0; f < 2; f++) {
+        int written = snprintf(body, sizeof(body), "%s%s%s",
+                               sprite_forms[f][0], sprite,
+                               sprite_forms[f][1]);
+        CHECK(written > 0 && (size_t) written < sizeof(body));
+        HiddenMarkupCost cost = {0};
+        CHECK(hidden_markup_layout_cost(budget, body, &cost, "HIDDENTEXT"));
+        CHECK(!cost.found_text && cost.boxes == empty_svg.boxes
+              && cost.commands == empty_svg.commands
+              && cost.text_commands == base.text_commands
+              && cost.text_segments == base.text_segments
+              && cost.style_resolutions <= empty_svg.style_resolutions);
+    }
+    /* An open dialog is rendered, whether `open` carries a value or not. */
+    static const char *const open_forms[] = {
+        "<dialog open><b>OPENDIALOG</b></dialog>",
+        "<dialog open=''><b>OPENDIALOG</b></dialog>",
+    };
+    for (size_t f = 0; f < 2; f++) {
+        HiddenMarkupCost cost = {0};
+        CHECK(hidden_markup_layout_cost(budget, open_forms[f], &cost,
+                                        "OPENDIALOG"));
+        CHECK(cost.found_text && cost.boxes > base.boxes
+              && cost.text_commands > base.text_commands);
+    }
     return 0;
 }
 

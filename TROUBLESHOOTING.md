@@ -23,9 +23,8 @@ Check the PSP's date and time under **Settings → Date & Time Settings**, then
 retry. HTTPS certificates are valid only for a stated date range, so a PSP
 whose clock has reset to an old date can make a valid site look untrusted.
 Tilefinch keeps the page's failure on the first line of the message and adds
-**Try correcting PSP date/time, then retry** on a second line (or **Set PSP
-date/time, then retry** when the clock is clearly wrong), rather than showing
-a clipped error from the TLS library.
+**Try correcting PSP date/time, then retry** on a second line, rather than
+showing a clipped error from the TLS library.
 
 Tilefinch never bypasses certificate checks and never sets the clock from an
 unauthenticated network source. If the clock is right and the error persists,

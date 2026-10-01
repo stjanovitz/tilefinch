@@ -1,11 +1,18 @@
 (() => {
+  /* Computed-style callers usually already have a canonical CSS name. Let
+     the native matcher reject ASCII capitals before entering the per-code-unit
+     conversion loop. Capture exec directly so author RegExp prototype changes
+     cannot alter this private test; custom-property case remains untouched. */
+  const cssUppercase = RegExp.prototype.exec.bind(/[A-Z]/);
   globalThis.__tilefinchCssName = (name) => {
     const text = String(name);
     if (text.startsWith("--")) return text;
     if (text === "cssFloat") return "float";
+    const uppercase = cssUppercase(text);
+    if (uppercase === null) return text;
     let output = "",
       start = 0;
-    for (let at = 0; at < text.length; at++) {
+    for (let at = uppercase.index; at < text.length; at++) {
       const code = text.charCodeAt(at);
       if (code >= 65 && code <= 90) {
         output += text.slice(start, at) + "-" + String.fromCharCode(code + 32);
@@ -23,19 +30,43 @@
     frameLimit = 240,
     longEffectFrameInterval = 32;
   let effectFramePending = false;
+  /* A declaration block is a list of property names: length, style[i],
+     item(i) and iteration ([...element.style]) all expose them in order.
+     chatgpt.com's streaming renderer spreads a style declaration; without
+     an iterator the proxy answered "" for Symbol.iterator and threw. */
+  const declaredNames = (text) => {
+      const names = [];
+      let depth = 0, start = 0, source = String(text || "");
+      for (let at = 0; at <= source.length && names.length < 128; at++) {
+        const character = source[at];
+        if (character === "(") depth++;
+        else if (character === ")" && depth > 0) depth--;
+        else if (at === source.length || (character === ";" && depth === 0)) {
+          const part = source.slice(start, at), colon = part.indexOf(":");
+          start = at + 1;
+          if (colon <= 0) continue;
+          const name = cssName(part.slice(0, colon).trim());
+          if (name && !names.includes(name)) names.push(name);
+        }
+      }
+      return names;
+    },
+    declarationProxy = (base, names, set) => {
+      base.item = (index) => names()[Number(index) >>> 0] ?? "";
+      return new Proxy(base, {
+        get(target, name) {
+          if (typeof name === "symbol")
+            return name === Symbol.iterator
+              ? function* () { yield* names(); }
+              : undefined;
+          if (name === "length") return names().length;
+          if (/^(?:0|[1-9][0-9]*)$/.test(name)) return names()[Number(name)];
+          return name in target ? target[name] : target.getPropertyValue(name);
+        },
+        set,
+      });
+    };
   const effectKey = (handle, property) => String(handle) + ":" + property;
-  const firstTimeMs = (value) => {
-    const match = String(value || "")
-      .split(",", 1)[0]
-      .trim()
-      .match(/^([0-9]*\.?[0-9]+)(ms|s)$/i);
-    if (!match) return 0;
-    const milliseconds =
-      Number(match[1]) * (match[2].toLowerCase() === "s" ? 1000 : 1);
-    return Number.isFinite(milliseconds)
-      ? Math.min(durationLimit, Math.max(0, milliseconds))
-      : 0;
-  };
   const colorValue = (value) => {
     const text = String(value).trim().toLowerCase();
     let match = text.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
@@ -100,14 +131,226 @@
     }
     return null;
   };
+  /*
+   * The transition lifecycle: transitionrun when a transition is created,
+   * transitionstart after its delay, transitionend after its duration and
+   * transitioncancel when a newer change replaces it. An inline effect's
+   * frames carry its events; without one (a stylesheet transition, or a
+   * value that cannot be interpolated and changes at once) one shared clock
+   * does, so they arrive on time either way. Pages that wait for
+   * transitionend would otherwise wait forever.
+   *
+   * The clock keeps a single timer, due at the earliest pending event, in a
+   * slot reserved for browser clocks: a page that fills the author timer
+   * table cannot strand a transition. A negative delay means the transition
+   * began that long ago, so it ends delay + duration after the change.
+   *
+   * At most transitionRecordLimit transitions run at once. Past it the
+   * oldest is completed early (its transitionend is queued) rather than
+   * dropped, so no page waiting for it is stranded. Starting one re-arms
+   * the clock only when it is due before the armed deadline, without
+   * rescanning the others; the clock scans once when it fires.
+   */
+  const runningTransitions = new Map(),
+    transitionEventLimit = 60000,
+    transitionRecordLimit = 256,
+    /* Diagnostics: records visited by clock scans, early completions,
+       and the running count. */
+    transitionStats = {
+      transitionRecordVisits: 0,
+      transitionEvictions: 0,
+      get transitionsRunning() { return runningTransitions.size; },
+    };
+  Object.defineProperty(globalThis, "__tilefinchTransitionStats", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: transitionStats,
+  });
+  let transitionClock = 0,
+    transitionClockDue = Infinity;
+  const transitionNow = () => {
+      const now = Number(globalThis.__tilefinchSchedulerTime?.());
+      return Number.isFinite(now) ? now : 0;
+    },
+    dispatchTransitionEvent = (node, type, property, elapsedMs) => {
+      try {
+        const init = {
+          bubbles: true,
+          propertyName: property,
+          elapsedTime: Math.max(0, elapsedMs) / 1000,
+        };
+        node.dispatchEvent(new TransitionEvent(type, init));
+        if (type === "transitionend" && node.__tilefinchWebkitTransitionEnd)
+          node.dispatchEvent(new TransitionEvent("webkitTransitionEnd", init));
+      } catch (error) {
+        globalThis.__tilefinchReportUncaught?.(error, "CSS transition event");
+      }
+    },
+    /* Dispatches whatever of one clocked transition is due. A handler may
+       cancel or replace it, so it is looked up again after each event. */
+    advanceTransition = (key, record, now) => {
+      if (runningTransitions.get(key) !== record) return;
+      if (!record.started && now >= record.startAt) {
+        record.started = true;
+        dispatchTransitionEvent(record.node, "transitionstart",
+          record.property, Math.max(0, -record.delay));
+        if (runningTransitions.get(key) !== record) return;
+      }
+      if (record.started && now >= record.endAt) {
+        runningTransitions.delete(key);
+        dispatchTransitionEvent(record.node, "transitionend",
+          record.property, record.duration);
+      }
+    },
+    armTransitionClock = (known = null) => {
+      let due = Infinity;
+      if (known !== null) {
+        due = known;
+      } else {
+        for (const record of runningTransitions.values()) {
+          transitionStats.transitionRecordVisits++;
+          if (record.clocked)
+            due = Math.min(due, record.started ? record.endAt : record.startAt);
+        }
+      }
+      if (transitionClock && due >= transitionClockDue) return;
+      if (transitionClock) globalThis.__tilefinchCancelTimer(transitionClock);
+      transitionClock = 0;
+      transitionClockDue = Infinity;
+      if (!Number.isFinite(due)) return;
+      transitionClock = globalThis.__tilefinchScheduleReservedTask(
+        serviceTransitionClock, Math.max(0, Math.ceil(due - transitionNow())));
+      /* Only a broken reservation refuses; the next arm retries. */
+      if (transitionClock) transitionClockDue = due;
+    },
+    serviceTransitionClock = () => {
+      transitionClock = 0;
+      transitionClockDue = Infinity;
+      const now = transitionNow(),
+        due = [];
+      /* Transitions a handler starts wait for the next service. */
+      for (const [key, record] of runningTransitions) {
+        transitionStats.transitionRecordVisits++;
+        if (record.clocked &&
+            now >= (record.started ? record.endAt : record.startAt))
+          due.push(key, record);
+      }
+      for (let at = 0; at < due.length; at += 2)
+        advanceTransition(due[at], due[at + 1], now);
+      armTransitionClock();
+    },
+    cancelTransition = (key) => {
+      const record = runningTransitions.get(key);
+      if (!record) return;
+      runningTransitions.delete(key);
+      const elapsed = transitionNow() - record.createdAt - record.delay;
+      queueMicrotask(() =>
+        dispatchTransitionEvent(
+          record.node, "transitioncancel", record.property,
+          Math.min(record.duration, Math.max(0, elapsed))));
+    },
+    startTransition = (node, property, duration, delay, source,
+                       effect = null) => {
+      const handle = node?.__handle;
+      if (!(handle > 0)) return;
+      const key = effectKey(handle, property);
+      cancelTransition(key);
+      if (runningTransitions.size >= transitionRecordLimit) {
+        const [oldestKey, oldest] = runningTransitions.entries().next().value;
+        runningTransitions.delete(oldestKey);
+        transitionStats.transitionEvictions++;
+        queueMicrotask(() => {
+          /* An inline transition's frames stop at its end value with it. */
+          if (oldest.effect) finishEffectEarly(oldestKey, oldest.effect);
+          if (!oldest.started)
+            dispatchTransitionEvent(oldest.node, "transitionstart",
+              oldest.property, Math.max(0, -oldest.delay));
+          dispatchTransitionEvent(oldest.node, "transitionend",
+            oldest.property, oldest.duration);
+        });
+      }
+      duration = Math.min(transitionEventLimit, Math.max(0, duration));
+      delay = Math.max(-transitionEventLimit,
+        Math.min(transitionEventLimit, delay));
+      const createdAt = transitionNow(),
+        record = {
+          node, property, duration, delay, source, createdAt,
+          clocked: !effect,
+          effect,
+          started: false,
+          startAt: createdAt + Math.max(0, delay),
+          endAt: createdAt + Math.max(0, delay + duration),
+        };
+      runningTransitions.set(key, record);
+      const current = () => runningTransitions.get(key) === record;
+      queueMicrotask(() => {
+        if (current())
+          dispatchTransitionEvent(node, "transitionrun", property,
+            Math.max(0, -delay));
+      });
+      if (effect) {
+        effect.transition = {
+          started: () => {
+            if (!current() || record.started) return;
+            record.started = true;
+            dispatchTransitionEvent(node, "transitionstart", property,
+              Math.max(0, -delay));
+          },
+          ended: () => {
+            if (!current()) return;
+            runningTransitions.delete(key);
+            dispatchTransitionEvent(node, "transitionend", property, duration);
+          },
+        };
+        return;
+      }
+      armTransitionClock(Math.min(record.startAt, record.endAt));
+    };
+  globalThis.__tilefinchStartTransition = startTransition;
+  globalThis.__tilefinchCancelTransition = (node, property) => {
+    if (node?.__handle > 0) cancelTransition(effectKey(node.__handle, property));
+  };
+  /* The watcher leaves a property to the inline path while it runs. */
+  globalThis.__tilefinchInlineTransition = (handle, property) =>
+    runningTransitions.get(effectKey(handle, property))?.source === "inline";
+  /* One entry of each computed transition list for a property, by the list
+     position that names it (or `all`), cycling shorter lists. */
+  const transitionTimeList = (value) =>
+      String(value || "").split(",").map((item) => {
+        const match = item.trim().match(/^(-?(?:\d+(?:\.\d*)?|\.\d+))(ms|s)$/i);
+        return match
+          ? Number(match[1]) * (match[2].toLowerCase() === "s" ? 1000 : 1)
+          : 0;
+      }),
+    computedTransitionTiming = (node, property) => {
+      const style = getComputedStyle(node),
+        properties = String(style.getPropertyValue("transition-property"))
+          .split(",").map((item) => item.trim().toLowerCase()),
+        durations = transitionTimeList(
+          style.getPropertyValue("transition-duration")),
+        delays = transitionTimeList(style.getPropertyValue("transition-delay"));
+      let index = -1;
+      for (let at = 0; at < properties.length; at++)
+        if (properties[at] === property || properties[at] === "all")
+          index = at;
+      if (index < 0) return null;
+      return {
+        duration: durations[index % durations.length] || 0,
+        delay: delays[index % delays.length] || 0,
+      };
+    };
   const cancelEffect = (key, restore) => {
     const effect = activeEffects.get(key);
     if (!effect) return;
     effect.cancelled = true;
     activeEffects.delete(key);
     authoredTargets.delete(key);
+    if (effect.transition) cancelTransition(key);
     if (restore !== undefined) effect.writeRaw(effect.property, restore);
   };
+  /* The effect frame takes a slot reserved for browser clocks, so a page
+     that fills the author timer table cannot freeze every effect. */
   const requestEffectFrame = () => {
     if (
       effectFramePending ||
@@ -115,83 +358,119 @@
       typeof requestAnimationFrame !== "function"
     )
       return;
-    effectFramePending = true;
-    requestAnimationFrame(runEffectFrame);
+    const reserved = globalThis.__tilefinchScheduleReservedFrame;
+    /* Only a broken reservation refuses; the next request retries. */
+    effectFramePending = !!(typeof reserved === "function"
+      ? reserved(runEffectFrame)
+      : requestAnimationFrame(runEffectFrame));
   };
+  /* The frame visits the effects that were active when it began. Transition
+     events run author handlers in the middle of it, and one may cancel or
+     replace any effect: each is looked up again before it is touched, and a
+     replacement waits for the next frame, so a handler that retargets on
+     every start costs a frame per retarget rather than looping here. */
+  const frameEffects = [];
   function runEffectFrame(now) {
     effectFramePending = false;
     let running = false;
-    activeEffects.forEach((effect, key) => {
-      if (effect.cancelled || effect.state === "idle") {
-        activeEffects.delete(key);
-        authoredTargets.delete(key);
-        return;
-      }
-      if (effect.state === "paused") return;
-      running = true;
-      if (effect.started === undefined) effect.started = now + effect.delay;
-      const elapsed = Math.max(0, now - effect.started);
-      effect.currentTime = elapsed;
-      if (now < effect.started) return;
-      effect.ticks++;
-      const complete =
-          elapsed >= effect.duration * effect.iterations ||
-          effect.ticks >= frameLimit,
-        frameInterval =
-          effect.duration > 64 ? longEffectFrameInterval : 0;
-      /*
-       * rAF remains standards-visible at the scheduler cadence, but a
-       * long-running property effect only dirties style at 30 Hz. On the PSP
-       * every authored style write can require a layout; avoiding duplicate
-       * 16 ms samples halves that steady-state work without delaying short
-       * transitions or their completion frame.
-       */
-      if (
-        !complete &&
-        effect.lastPresented !== undefined &&
-        now - effect.lastPresented < frameInterval
-      )
-        return;
-      const cycle = Math.min(
-          effect.iterations - 1,
-          Math.floor(elapsed / effect.duration),
-        ),
-        cycleTime = elapsed - cycle * effect.duration,
-        linear = Math.min(1, cycleTime / effect.duration);
-      let directed = linear;
-      if (
-        effect.direction === "reverse" ||
-        (effect.direction === "alternate" && cycle % 2 === 1) ||
-        (effect.direction === "alternate-reverse" && cycle % 2 === 0)
-      )
-        directed = 1 - directed;
-      const eased =
-        effect.easing === "linear"
-          ? directed
-          : directed * directed * (3 - 2 * directed);
-      effect.writeRaw(effect.property, effect.interpolate(eased));
-      effect.frames++;
-      effect.lastPresented = now;
-      if (complete) {
-        effect.writeRaw(
-          effect.property,
-          effect.interpolate(
-            effect.direction === "reverse" ||
-              (effect.direction === "alternate" &&
-                effect.iterations % 2 === 0) ||
-              (effect.direction === "alternate-reverse" &&
-                effect.iterations % 2 === 1)
-              ? 0
-              : 1,
-          ),
-        );
-        activeEffects.delete(key);
-        authoredTargets.delete(key);
-        effect.state = "finished";
-        effect.resolve?.(effect);
-      }
-    });
+    for (const [key, effect] of activeEffects) frameEffects.push(key, effect);
+    try {
+      for (let at = 0; at < frameEffects.length; at += 2)
+        if (runEffect(frameEffects[at], frameEffects[at + 1], now))
+          running = true;
+    } finally {
+      frameEffects.length = 0;
+    }
     if (running && activeEffects.size !== 0) requestEffectFrame();
+  }
+  /* One effect's frame; true while it keeps running. */
+  function runEffect(key, effect, now) {
+    if (activeEffects.get(key) !== effect) return false;
+    if (effect.cancelled || effect.state === "idle") {
+      activeEffects.delete(key);
+      authoredTargets.delete(key);
+      return false;
+    }
+    if (effect.state === "paused") return false;
+    if (effect.started === undefined) effect.started = now + effect.delay;
+    const elapsed = Math.max(0, (now - effect.started) * effect.rate);
+    effect.currentTime = elapsed;
+    if (now < effect.started) return true;
+    if (effect.ticks === 0) {
+      effect.transition?.started();
+      if (effect.cancelled || activeEffects.get(key) !== effect)
+        return false;
+    }
+    effect.ticks++;
+    const complete =
+        elapsed >= effect.duration * effect.iterations ||
+        effect.ticks >= frameLimit,
+      frameInterval =
+        effect.duration > 64 ? longEffectFrameInterval : 0;
+    /*
+     * rAF remains standards-visible at the scheduler cadence, but a
+     * long-running property effect only dirties style at 30 Hz. On the PSP
+     * every authored style write can require a layout; avoiding duplicate
+     * 16 ms samples halves that steady-state work without delaying short
+     * transitions or their completion frame.
+     */
+    if (
+      !complete &&
+      effect.lastPresented !== undefined &&
+      now - effect.lastPresented < frameInterval
+    )
+      return true;
+    const cycle = Math.min(
+        effect.iterations - 1,
+        Math.floor(elapsed / effect.duration),
+      ),
+      cycleTime = elapsed - cycle * effect.duration,
+      linear = Math.min(1, cycleTime / effect.duration);
+    let directed = linear;
+    if (
+      effect.direction === "reverse" ||
+      (effect.direction === "alternate" && cycle % 2 === 1) ||
+      (effect.direction === "alternate-reverse" && cycle % 2 === 0)
+    )
+      directed = 1 - directed;
+    const eased =
+      effect.easing === "linear"
+        ? directed
+        : directed * directed * (3 - 2 * directed);
+    effect.writeRaw(effect.property, effect.interpolate(eased));
+    effect.frames++;
+    effect.lastPresented = now;
+    if (complete) {
+      completeEffect(key, effect);
+      effect.transition?.ended();
+    }
+    return true;
+  }
+  /* Writes an effect's end value and retires it. */
+  function completeEffect(key, effect) {
+    effect.writeRaw(
+      effect.property,
+      effect.interpolate(
+        effect.direction === "reverse" ||
+          (effect.direction === "alternate" &&
+            effect.iterations % 2 === 0) ||
+          (effect.direction === "alternate-reverse" &&
+            effect.iterations % 2 === 1)
+          ? 0
+          : 1,
+      ),
+    );
+    activeEffects.delete(key);
+    authoredTargets.delete(key);
+    effect.state = "finished";
+    effect.resolve?.(effect);
+  }
+  /* A transition completed early (the running-transition bound) ends its
+     visual effect too; the caller dispatches its events. */
+  function finishEffectEarly(key, effect) {
+    if (activeEffects.get(key) !== effect || effect.cancelled) return;
+    effect.transition = null;
+    completeEffect(key, effect);
   }
   const scheduleEffect = ({
     handle,
@@ -223,6 +502,7 @@
       restore,
       state: "running",
       currentTime: 0,
+      rate: 1,
       delay,
       duration,
       direction,
@@ -236,6 +516,16 @@
     authoredTargets.set(key, String(to));
     requestEffectFrame();
     return effect;
+  };
+  /* Animations Element.animate started and has not yet finished or
+     cancelled, for getAnimations(). Bounded by effectLimit through
+     scheduleEffect: an animation with no running effect is never listed. */
+  const liveAnimations = new Map();
+  globalThis.__tilefinchElementAnimations = (node) => {
+    const listed = [];
+    for (const [animation, target] of liveAnimations)
+      if (node === null || target === node) listed.push(animation);
+    return listed;
   };
   globalThis.__tilefinchAnimateElement = (node, keyframes, options = {}) => {
     options = options == null ? {} : options;
@@ -295,11 +585,16 @@
       if (effect) effects.push(effect);
       else __tilefinchStyleSet(node.__handle, property, String(to));
     }
-    let resolveFinished;
+    let resolveFinishedPromise;
     const finished = new Promise((resolve) => {
-      resolveFinished = resolve;
-    });
-    let remaining = effects.length;
+        resolveFinishedPromise = resolve;
+      }),
+      resolveFinished = (value) => {
+        liveAnimations.delete(animation);
+        resolveFinishedPromise(value);
+      };
+    let remaining = effects.length,
+      playbackRate = 1;
     for (const effect of effects)
       effect.resolve = () => {
         if (--remaining === 0) resolveFinished(animation);
@@ -315,6 +610,29 @@
       get playState() {
         return effects[0]?.state || "finished";
       },
+      get playbackRate() {
+        return effects[0]?.rate ?? playbackRate;
+      },
+      set playbackRate(value) {
+        this.updatePlaybackRate(value);
+      },
+      /* Keeps each effect's current time and changes how fast it advances
+         from here, as the Web Animations model does. */
+      updatePlaybackRate(value) {
+        const rate = Number(value);
+        if (!Number.isFinite(rate) || rate <= 0) return;
+        playbackRate = rate;
+        const now = performance.now();
+        for (const effect of effects) {
+          if (effect.started !== undefined)
+            effect.started = now - effect.currentTime / rate;
+          effect.rate = rate;
+        }
+      },
+      effect:
+        typeof globalThis.KeyframeEffect === "function"
+          ? new globalThis.KeyframeEffect(node, frames, options)
+          : null,
       finished,
       play() {
         for (const effect of effects) effect.state = "running";
@@ -347,7 +665,15 @@
         resolveFinished(animation);
       },
     };
+    if (animation.effect)
+      globalThis.__tilefinchBindEffectClock?.(animation.effect, () =>
+        effects.length === 0
+          ? null
+          : (effects[0].currentTime || 0) + (effects[0].started === undefined
+              ? 0 : effects[0].delay),
+      );
     if (remaining === 0) resolveFinished(animation);
+    else liveAnimations.set(animation, node);
     return animation;
   };
   const canonicalDisplay = (value) => {
@@ -1111,7 +1437,7 @@
         try {
           if (__tilefinchStyleSet(handle, name, value)) {
             cssomFallback?.delete(name);
-            globalThis.__tilefinchQueueFocusFixup?.();
+            globalThis.__tilefinchQueueFocusFixup?.(handle);
             return true;
           }
         } catch (error) {
@@ -1151,47 +1477,42 @@
               __tilefinchStyleGet(handle, "transition"))) ||
           cssomFallback?.get("transition-duration") ||
           cssomFallback?.get("transition");
-        if (!transitionHint) return writeRaw(name, value);
+        if (!transitionHint) {
+          const written = writeRaw(name, value);
+          globalThis.__tilefinchTransitionsDirty?.(handle);
+          return written;
+        }
         const node = globalThis.__tilefinchWrap?.(handle),
           before = node
             ? getComputedStyle(node).getPropertyValue(name)
             : "";
         if (!writeRaw(name, value) || !node) return true;
-        const duration = firstTimeMs(
-            __tilefinchStyleGet(handle, "transition-duration") ||
-            cssomFallback?.get("transition-duration") ||
-            getComputedStyle(node).getPropertyValue("transition-duration"),
-          ),
-          properties = String(
-            __tilefinchStyleGet(handle, "transition-property") ||
-            cssomFallback?.get("transition-property") ||
-            "all",
-          )
-            .split(",")
-            .map((item) => item.trim()),
-          allowed = properties.includes("all") || properties.includes(name),
-          delay = firstTimeMs(
-            __tilefinchStyleGet(handle, "transition-delay") ||
-            cssomFallback?.get("transition-delay"),
-          );
+        const timing = computedTransitionTiming(node, name);
         if (
-          duration &&
-          allowed &&
+          timing &&
+          Math.max(0, timing.duration) + timing.delay > 0 &&
           before &&
           String(before) !== String(value)
         ) {
-          writeRaw(name, before);
-          const effect = scheduleEffect({
-            handle,
-            property: name,
-            from: before,
-            to: value,
-            duration,
-            delay,
-            writeRaw,
-          });
-          if (!effect) writeRaw(name, value);
+          let effect = null;
+          if (timing.duration > 0) {
+            writeRaw(name, before);
+            effect = scheduleEffect({
+              handle,
+              property: name,
+              from: before,
+              to: value,
+              duration: Math.min(durationLimit, timing.duration),
+              /* A negative delay starts the effect part-way through. */
+              delay: Math.min(durationLimit, timing.delay),
+              writeRaw,
+            });
+            if (!effect) writeRaw(name, value);
+          }
+          startTransition(node, name, timing.duration, timing.delay, "inline",
+            effect);
         }
+        globalThis.__tilefinchTransitionsDirty?.(handle);
         return true;
       },
       clearFlex = () => {
@@ -1219,7 +1540,8 @@
         const oldValue = observedStyle();
         value = String(value);
         __tilefinchSetAttribute(handle, "style", value);
-        globalThis.__tilefinchQueueFocusFixup?.();
+        globalThis.__tilefinchTransitionsDirty?.(handle);
+        globalThis.__tilefinchQueueFocusFixup?.(handle);
         notifyStyle(oldValue);
       },
       setProperty(name, value, priority = "") {
@@ -1344,19 +1666,15 @@
         return old;
       },
     };
-    return new Proxy(base, {
-      get(target, name) {
-        return name in target ? target[name] : target.getPropertyValue(name);
-      },
-      set(target, name, value) {
+    return declarationProxy(base, () => declaredNames(authoredStyle()), (
+      target, name, value) => {
         if (name === "cssText") {
           target.cssText = value;
           return true;
         }
         target.setProperty(name, value);
         return true;
-      },
-    });
+      });
   };
   globalThis.__tilefinchMakeDetachedStyle = (node) => {
     let text = "", values = Object.create(null), priorities = Object.create(null),
@@ -1429,15 +1747,11 @@
         },
       };
     parse(node.getAttribute("style") || "");
-    return new Proxy(base, {
-      get(target, name) {
-        return name in target ? target[name] : target.getPropertyValue(name);
-      },
-      set(target, name, value) {
+    return declarationProxy(base, () => Object.keys(values), (
+      target, name, value) => {
         if (name === "cssText") target.cssText = value;
         else target.setProperty(name, value);
         return true;
-      },
-    });
+      });
   };
 })();

@@ -704,6 +704,13 @@ JSValue JS_ThrowOutOfMemory(JSContext *ctx);
 
 void __JS_FreeValue(JSContext *ctx, JSValue v);
 
+/* Count-only diagnostic build: do not use its wall time as performance data.
+   Covers value API references, not direct internal atom references. */
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+void JS_CensusReference(JSContext *ctx, JSRuntime *rt, int release, int final);
+#endif
+void JS_ReadExecutionCensusReferences(uint32_t function, uint64_t counts[3]);
+
 static inline JSRefCountHeader *__js_rc(void *ptr)
 {
     return (JSRefCountHeader *)((uint32_t *)ptr - 1);
@@ -713,6 +720,9 @@ static inline void JS_FreeValue(JSContext *ctx, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = __js_rc(JS_VALUE_GET_PTR(v));
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+        JS_CensusReference(ctx, NULL, 1, p->ref_count == 1);
+#endif
         if (--p->ref_count <= 0) {
             __JS_FreeValue(ctx, v);
         }
@@ -723,6 +733,9 @@ static inline void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = __js_rc(JS_VALUE_GET_PTR(v));
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+        JS_CensusReference(NULL, rt, 1, p->ref_count == 1);
+#endif
         if (--p->ref_count <= 0) {
             __JS_FreeValueRT(rt, v);
         }
@@ -733,6 +746,9 @@ static inline JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = __js_rc(JS_VALUE_GET_PTR(v));
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+        JS_CensusReference(ctx, NULL, 0, 0);
+#endif
         p->ref_count++;
     }
     return (JSValue)v;
@@ -742,6 +758,9 @@ static inline JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = __js_rc(JS_VALUE_GET_PTR(v));
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+        JS_CensusReference(NULL, rt, 0, 0);
+#endif
         p->ref_count++;
     }
     return (JSValue)v;
@@ -966,6 +985,142 @@ void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 void JS_SetStripInfo(JSRuntime *rt, int flags);
 int JS_GetStripInfo(JSRuntime *rt);
 
+/* Lazy function compilation (Tilefinch). While the threshold is non-zero,
+   scripts and modules compile each inner function whose source text is at
+   least that many bytes long without keeping its bytecode: its captured
+   variables are resolved, but its body is compiled from its source text on
+   its first call. The function is still checked in full (parsed, or
+   validated with preparsing, below), so early errors are reported at
+   compile time. Zero (the default) compiles
+   every function eagerly. The threshold is read when a script or module
+   starts compiling and is remembered for the functions it defers. */
+void JS_SetLazyFunctionThreshold(JSRuntime *rt, uint32_t min_source_bytes);
+uint32_t JS_GetLazyFunctionThreshold(JSRuntime *rt);
+/* Preparsing (Tilefinch, default on): the body of a function that will be
+   kept lazy is validated rather than parsed when the script compiles - it
+   is checked for early errors as the parser checks it, its end is found
+   and the names it may use from enclosing functions are recorded, from
+   which its closure variables are resolved as before. A body the
+   preparser cannot vouch for is parsed. Either way every early error is
+   reported when the script compiles. Off, every body is parsed as
+   described above. */
+void JS_SetLazyFunctionPreparse(JSRuntime *rt, JS_BOOL enabled);
+JS_BOOL JS_GetLazyFunctionPreparse(JSRuntime *rt);
+#ifdef CONFIG_TILEFINCH_LAZY_TOOLS
+/* Host verification (not in device builds): compile every lazy function
+   reachable from a compiled script or module that has not run, including
+   those that compiling reveals. Returns -1 with the first failure's
+   exception pending; *count (if not NULL) receives how many compiled. */
+int JS_CompileLazyFunctions(JSContext *ctx, JSValueConst obj, uint64_t *count);
+#endif
+typedef struct JSLazyFunctionStats {
+    uint64_t deferred;              /* functions compiled without a body */
+    uint64_t deferred_source_bytes; /* their source text */
+    uint64_t restored;              /* deferred functions read by JS_ReadObject */
+    uint64_t compiled;              /* deferred bodies compiled on first call */
+    uint64_t compiled_source_bytes;
+    uint64_t compile_failures;      /* first-call compiles that threw */
+    uint64_t preparsed;             /* deferred functions whose body was scanned */
+    uint64_t preparsed_source_bytes;
+    uint64_t preparse_fallbacks;    /* scans that gave up (the body was parsed) */
+    uint64_t preparse_restarts;     /* compiles repeated without scanning */
+} JSLazyFunctionStats;
+void JS_GetLazyFunctionStats(JSRuntime *rt, JSLazyFunctionStats *stats);
+/* Tilefinch work counters, deterministic for identical execution and
+   cumulative for the runtime. JS_WORK_UNITS is the interrupt budget
+   consumed over every context (one unit per js_poll_interrupts check:
+   calls, backward jumps, bounded compile and native loops); GC_RUNS counts
+   JS_RunGC collections; LAZY_* are JSLazyFunctionStats.compiled and
+   compiled_source_bytes. CALLS (bytecode function entries and resumes)
+   needs a CONFIG_TILEFINCH_CALL_COUNTS or CONFIG_TILEFINCH_OP_COUNTS
+   engine; BYTECODE_OPS (opcodes dispatched) and FLOAT64_BOXES
+   (float64-tagged values the engine created) a CONFIG_TILEFINCH_OP_COUNTS
+   one. Returns the mask (1 << index) of counters this build does not
+   count; those read 0. */
+enum {
+    JS_WORK_UNITS, JS_WORK_POLLS, JS_WORK_GC_RUNS, JS_WORK_CALLS,
+    JS_WORK_BYTECODE_OPS, JS_WORK_FLOAT64_BOXES, JS_WORK_LAZY_COMPILES,
+    JS_WORK_LAZY_BYTES, JS_WORK_COUNT
+};
+int JS_GetWorkCounters(JSRuntime *rt, uint64_t counters[JS_WORK_COUNT]);
+/* Per-opcode dispatch counts (CONFIG_TILEFINCH_OP_COUNTS builds; 0 entries
+   otherwise): names[i]/counts[i] for opcode byte i, capacity >= 256. */
+size_t JS_GetOpcodeCounts(JSRuntime *rt, const char **names,
+                          uint64_t *counts, size_t capacity);
+
+/* Validation-only semantic census. The embedder samples these atomic words
+   independently of interpreter interrupt polls. No clocks or allocations run
+   at dispatch sites. Disabled in ordinary PSP builds. Single owner thread. */
+enum {
+    JS_CENSUS_CALL = 256, JS_CENSUS_NATIVE, JS_CENSUS_GET_PROPERTY,
+    JS_CENSUS_SET_PROPERTY, JS_CENSUS_DEFINE_PROPERTY, JS_CENSUS_ALLOCATE,
+    JS_CENSUS_RELEASE, JS_CENSUS_TO_STRING, JS_CENSUS_CLOSURE,
+    JS_CENSUS_OUTSIDE, JS_CENSUS_GET_OWN, JS_CENSUS_GET_PROTOTYPE,
+    JS_CENSUS_GET_GETTER, JS_CENSUS_GET_EXOTIC, JS_CENSUS_GET_PRIMITIVE,
+    JS_CENSUS_SET_OWN, JS_CENSUS_SET_SETTER, JS_CENSUS_CALL_BYTECODE,
+    JS_CENSUS_CALL_NATIVE, JS_CENSUS_CALL_CAPTURE, JS_CENSUS_CALL_BOUND,
+    JS_CENSUS_CALL_PROXY, JS_CENSUS_FRAME_SETUP, JS_CENSUS_FRAME_ARGUMENTS,
+    JS_CENSUS_FRAME_INITIALIZE, JS_CENSUS_FRAME_CLEANUP,
+    JS_CENSUS_FRAME_SIMPLE, JS_CENSUS_COUNT
+};
+#define JS_EXECUTION_CENSUS_FUNCTION_LIMIT 8192u
+void JS_SetExecutionCensus(JSRuntime *rt, int enabled);
+unsigned JS_ReadExecutionCensus(uintptr_t *native_address);
+uint32_t JS_ReadExecutionCensusFunction(void);
+void JS_ResetExecutionCensusPaths(void);
+size_t JS_ReadExecutionCensusPaths(uint64_t *counts, size_t capacity);
+/* Called once per function/registration epoch on the owner thread; callback
+   copies borrowed labels and must neither allocate in nor reenter QuickJS. */
+typedef uint32_t JSCensusFunction(void *opaque, const char *file,
+    const char *name, int line, int column, int bytecode_bytes);
+void JS_SetExecutionCensusFunctionHook(JSRuntime *rt,
+    JSCensusFunction *hook, void *opaque);
+const char *JS_ExecutionCensusName(unsigned zone);
+
+/* True while any JavaScript or native-function frame is active (Tilefinch). */
+int JS_IsStackActive(JSRuntime *rt);
+/* WeakRef.prototype.deref without a call: the target (a new reference) or
+   undefined, also for a non-WeakRef (Tilefinch DOM getters). */
+JSValue JS_WeakRefDeref(JSContext *ctx, JSValueConst weakref);
+/* Identity of the innermost frame, NULL when none (Tilefinch profiler). */
+const void *JS_GetStackTop(JSRuntime *rt);
+/* Called with begin=1 before and begin=0 after every collection; must not
+   allocate on or re-enter the runtime (Tilefinch profiler GC time). */
+void JS_SetGCHook(JSRuntime *rt, void (*hook)(void *opaque, int begin),
+                  void *opaque);
+/* Called with begin=1 before and begin=0 after every first-call compile of
+   a lazy function body; must not allocate on or re-enter the runtime
+   (Tilefinch script split). */
+void JS_SetLazyCompileHook(JSRuntime *rt,
+                           void (*hook)(void *opaque, int begin),
+                           void *opaque);
+/* Frame `level` below the innermost: borrowed function-name and file atoms
+   and the current line and column, without allocating (Tilefinch sampling
+   profiler); line is -1 for a native (C) function frame. Returns 0 past
+   the outermost frame. */
+int JS_GetStackFrameInfo(JSContext *ctx, int level, JSAtom *func_name,
+                         JSAtom *filename, int *line, int *column);
+/* Frame `level` below the innermost, origin only (Tilefinch script split):
+   JS_FRAME_ORIGIN_NONE past the outermost frame, _NATIVE for a C function,
+   _FILE for bytecode that carries a file name, _ANONYMOUS for bytecode
+   without one (stripped debug info, or a frame with no function object).
+   Unlike JS_GetStackFrameInfo it never decodes the line table. */
+enum {
+    JS_FRAME_ORIGIN_NONE = 0,
+    JS_FRAME_ORIGIN_NATIVE,
+    JS_FRAME_ORIGIN_FILE,
+    JS_FRAME_ORIGIN_ANONYMOUS,
+};
+int JS_GetStackFrameOrigin(JSContext *ctx, int level);
+/* Tilefinch profiler: definition line/column of a frame's function, and
+   per-function call counts (CONFIG_TILEFINCH_CALL_COUNTS builds only). */
+int JS_GetStackFrameDefinition(JSContext *ctx, int level, int *line, int *column);
+typedef void JSProfileBytecodeFunc(void *opaque, JSContext *ctx, JSAtom filename,
+                                   JSAtom func_name, int line, int column,
+                                   uint32_t calls);
+int JS_ProfileForEachBytecode(JSRuntime *rt, JSProfileBytecodeFunc *cb,
+                              void *opaque, int reset);
+
 /* set the [IsHTMLDDA] internal slot */
 void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj);
 
@@ -1008,6 +1163,10 @@ typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
+/* FinalizationRegistry callbacks are tasks, not promise microtasks. The
+   embedder must drain these separately, with a checkpoint after each one. */
+JS_BOOL JS_IsCleanupJobPending(JSRuntime *rt);
+int JS_ExecutePendingCleanupJob(JSRuntime *rt, JSContext **pctx);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 
 /* Object Writer/Reader (currently only used to handle precompiled code) */

@@ -874,6 +874,8 @@ static bool overflow_scroll_state(const TileCache *cache,
     return true;
 }
 
+static uint64_t overflow_fixed_geometry_signature(const TileCache *cache);
+
 static bool overflow_cache_prepare(TileCache *cache)
 {
     if (cache->overflow_cache_disabled) return false;
@@ -896,7 +898,8 @@ static bool overflow_cache_prepare(TileCache *cache)
     uint32_t state_generation = 0;
     bool named = overflow_scroll_state(cache, &state_layout,
                                        &state_generation);
-    bool changed = !overflow->prepared;
+    bool fresh = !overflow->prepared;
+    bool changed = fresh;
     if (!changed && named && overflow->checked_layout == state_layout
         && overflow->checked_generation == state_generation) {
         cache->overflow_prepare_skips++;
@@ -936,10 +939,6 @@ static bool overflow_cache_prepare(TileCache *cache)
     LayoutPositionedClipIndex positioned = {0};
     if (overflow->clip_count != 0 && overflow->geometry_count != 0)
         layout_positioned_clip_index_prepare(layout, &positioned);
-    /* Fixed descendants participate in the same scroll/clip geometry.  A
-       cached fixed layer therefore becomes stale whenever an internal
-       overflow offset changes, even though the viewport itself did not. */
-    cache->fixed_ready = false;
     for (size_t i = 0; i < layout->node_box_count; i++) {
         overflow->scroll_values[i * 2u] = layout->node_boxes[i].scroll_x;
         overflow->scroll_values[i * 2u + 1u] = layout->node_boxes[i].scroll_y;
@@ -1012,6 +1011,14 @@ static bool overflow_cache_prepare(TileCache *cache)
         }
     }
     overflow->prepared = true;
+    /* Fixed descendants participate in the same scroll/clip geometry, so
+       the cached fixed layer is stale when one of their offsets or clips
+       moved -- not when some other scroller did (a 2 px nested scroll
+       beside an open drawer cost a ~0.6 s rebuild of its shadows). */
+    uint64_t fixed_signature = overflow_fixed_geometry_signature(cache);
+    if (fresh || fixed_signature != cache->fixed_overflow_signature)
+        cache->fixed_ready = false;
+    cache->fixed_overflow_signature = fixed_signature;
     return true;
 }
 
@@ -1091,6 +1098,56 @@ static size_t overflow_cached_rounded_clips(const TileCache *cache,
                                         &count)) break;
     }
     return count;
+}
+
+static uint64_t signature_mix_int(uint64_t signature, int64_t value)
+{
+    for (unsigned shift = 0; shift < 64u; shift += 8u) {
+        signature = (signature ^ (uint8_t) ((uint64_t) value >> shift))
+                    * UINT64_C(1099511628211);
+    }
+    return signature;
+}
+
+/* Everything fixed_screen_command_geometry() reads from the overflow cache,
+   for the fixed ranges' overflow commands. */
+static uint64_t overflow_fixed_geometry_signature(const TileCache *cache)
+{
+    const LayoutDocument *layout = cache->layout;
+    uint64_t signature = RENDER_OVERFLOW_SIGNATURE_EMPTY;
+    if (layout->command_flags == NULL) return signature;
+    for (size_t range = 0; range < layout->fixed_count; range++) {
+        const FixedRange *fixed = &layout->fixed_ranges[range];
+        size_t end = fixed->command_end < layout->count
+            ? fixed->command_end : layout->count;
+        for (size_t i = fixed->command_start; i < end; i++) {
+            if (!(layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW))
+                continue;
+            const OverflowGeometry *geometry =
+                overflow_cached_geometry(cache, i);
+            if (geometry == NULL) continue;
+            signature = signature_mix_int(signature, (int64_t) i);
+            signature = signature_mix_int(signature, geometry->found);
+            signature = signature_mix_int(signature, geometry->dx);
+            signature = signature_mix_int(signature, geometry->dy);
+            signature = signature_mix_int(signature, geometry->clip_left);
+            signature = signature_mix_int(signature, geometry->clip_top);
+            signature = signature_mix_int(signature, geometry->clip_right);
+            signature = signature_mix_int(signature, geometry->clip_bottom);
+            RoundedClip clips[MAXIMUM_ROUNDED_CLIPS];
+            size_t count = overflow_cached_rounded_clips(
+                cache, i, clips, MAXIMUM_ROUNDED_CLIPS);
+            signature = signature_mix_int(signature, (int64_t) count);
+            for (size_t clip = 0; clip < count; clip++) {
+                signature = signature_mix_int(signature, clips[clip].x);
+                signature = signature_mix_int(signature, clips[clip].y);
+                signature = signature_mix_int(signature, clips[clip].width);
+                signature = signature_mix_int(signature, clips[clip].height);
+                signature = signature_mix_int(signature, clips[clip].radius);
+            }
+        }
+    }
+    return signature;
 }
 
 static bool raster_target_index(const RasterTarget *target, int x, int y,

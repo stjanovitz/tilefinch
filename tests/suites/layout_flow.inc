@@ -2683,6 +2683,1478 @@ static int test_checked_toggle_retains_matches(Budget *budget)
     return 0;
 }
 
+/* The :has() classification behind scoped invalidation: where each anchor
+   lies relative to the subject, which region its argument reads, and when
+   the argument can read outside that region. */
+static int test_has_plan_classification(Budget *budget)
+{
+    static const struct {
+        const char *selector;
+        StyleHasRelation relation;
+        uint8_t region;
+        bool escapes;
+        bool anchor_keyed;
+    } cases[] = {
+        {".a:has(+ .x)", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_SIBLINGS, false, true},
+        {".a:has(~ .x .y)", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_SIBLINGS, false, true},
+        {".a:has(> .x)", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {".a:has(.x) .b", STYLE_HAS_RELATION_ANCESTOR,
+         STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {".b:where(.a:has(> [hidden]) *)", STYLE_HAS_RELATION_ANCESTOR,
+         STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {".b:where(.a:where(:has(.x)) *)", STYLE_HAS_RELATION_ANCESTOR,
+         STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {".b:not(:has(ul:not(:empty)))", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {":is(:has(.x))", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_DESCENDANTS, false, false},
+        {".b:where(:has(.x:is(:last-child *)))", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_DESCENDANTS, true, true},
+        {".b:has(button:disabled)", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_DESCENDANTS, true, true},
+        {".b:has(~ :nth-child(2 of .x))", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_SIBLINGS, true, true},
+        {".b:has(> :nth-child(1 of p, h1))", STYLE_HAS_RELATION_SELF,
+         STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {".b:has(.x:first-child + :is(p, ul:has(> li)))",
+         STYLE_HAS_RELATION_SELF, STYLE_HAS_REGION_DESCENDANTS, false, true},
+        {".a:has(.x) ~ .b", STYLE_HAS_RELATION_OTHER, 0, false, true},
+        {".b:is(h3:has(button) + * *)", STYLE_HAS_RELATION_OTHER, 0, false,
+         true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char html[256];
+        int written = snprintf(html, sizeof(html),
+            "<!doctype html><style>%s{color:red}</style><p>x</p>",
+            cases[i].selector);
+        CHECK(written > 0 && (size_t) written < sizeof(html));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        ViewportContext viewport;
+        CHECK(document_parse(&document, budget, html, (size_t) written, 19)
+            && viewport_context_init(&viewport, 480, 272, 480, 272)
+            && stylesheet_build_context(&sheet, budget, &document,
+                                        &viewport));
+        StyleHasPlanSummary plan[4];
+        bool bounded = true;
+        size_t count = style_has_plan_summarize(&sheet, plan, 4, &bounded);
+        if (count != 1 || bounded || plan[0].relation != cases[i].relation
+            || (cases[i].relation != STYLE_HAS_RELATION_OTHER
+                && (plan[0].region != cases[i].region
+                    || plan[0].escapes != cases[i].escapes
+                    || plan[0].anchor_keyed != cases[i].anchor_keyed))) {
+            printf("has plan %s: count=%zu bounded=%d relation=%d region=%u "
+                   "escapes=%d anchor-keyed=%d\n", cases[i].selector, count,
+                   (int) bounded, count == 0 ? -1 : (int) plan[0].relation,
+                   count == 0 ? 0u : (unsigned) plan[0].region,
+                   count == 0 ? -1 : (int) plan[0].escapes,
+                   count == 0 ? -1 : (int) plan[0].anchor_keyed);
+            CHECK(false);
+        }
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Tree changes that no :has() argument can end on, or that no anchor can
+   reach, are not relational: the bridge journals them as such. */
+static int test_has_tree_change_classification(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>.a:has(.x){color:red}"
+        ".b:has(~ .y){color:blue}.c:has(> .z:empty){color:green}"
+        ".k:has(> *){color:gray}.w:has(.q:first-child .x){color:olive}"
+        ".s:has(~ .y .x){color:navy}</style>"
+        "<div class=w><div id=P2><div class=q><span class=x>x</span></div>"
+        "</div></div>"
+        "<div><div class=s>s</div><div class=y><div id=deep>d</div></div>"
+        "</div>"
+        "<div class=a><div id=inA>a</div></div>"
+        "<div><div class=b>b</div><div id=afterB>c</div></div>"
+        "<div class=c><span class=z id=Z>t</span></div>"
+        "<div class=k id=K></div><div id=plain>p</div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1u, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    lxb_dom_node_t *body = document_body_node(&document);
+    static const struct {
+        const char *parent;
+        const char *classes;
+        bool after_parent;
+        bool expected;
+        bool first;
+    } cases[] = {
+        {"plain", "q", false, false, false}, /* no feature, no anchor */
+        {"inA", "q", false, false, false},   /* under an anchor, no feature */
+        {"inA", "x", false, true, false},    /* the argument's element */
+        {"afterB", "y", true, true, false},  /* a later sibling of .b */
+        {"K", "q", false, true, false},      /* keyless, anchor parent */
+        /* .q stops being :first-child: its descendant .x moves .w. */
+        {"P2", "z", false, true, true},
+        /* The anchor is an earlier sibling of an ancestor. */
+        {"deep", "x", false, true, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        lxb_dom_node_t *target = find_id(body, cases[i].parent);
+        CHECK(target != NULL);
+        lxb_dom_node_t *parent = cases[i].after_parent ? target->parent
+                                                       : target;
+        BudgetAllocationOwner previous =
+            document_allocation_owner_enter(&document);
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &document.html->dom_document, (const lxb_char_t *) "span", 4,
+            NULL);
+        CHECK(element != NULL && lxb_dom_element_set_attribute(
+            element, (const lxb_char_t *) "class", 5,
+            (const lxb_char_t *) cases[i].classes,
+            strlen(cases[i].classes)) != NULL);
+        lxb_dom_node_t *node = lxb_dom_interface_node(element);
+        if (cases[i].first && parent->first_child != NULL)
+            lxb_dom_node_insert_before(parent->first_child, node);
+        else
+            CHECK(lxb_dom_node_append_child(parent, node)
+                  == LXB_DOM_EXCEPTION_OK);
+        bool relational =
+            stylesheet_tree_change_may_affect_has(&sheet, node, parent);
+        lxb_dom_node_remove(node);
+        lxb_dom_node_destroy_deep(node);
+        document_allocation_owner_leave(&document, previous);
+        if (relational != cases[i].expected) {
+            printf("tree change %zu under %s: relational=%d\n", i,
+                   cases[i].parent, (int) relational);
+            CHECK(false);
+        }
+    }
+    /* Text: only a parent an :empty argument can end on. */
+    lxb_dom_node_t *z = find_id(body, "Z");
+    lxb_dom_node_t *plain = find_id(body, "plain");
+    CHECK(z != NULL && plain != NULL && z->first_child != NULL
+          && plain->first_child != NULL);
+    CHECK(stylesheet_tree_change_may_affect_has(&sheet, z->first_child, z));
+    CHECK(!stylesheet_tree_change_may_affect_has(&sheet, plain->first_child,
+                                                 plain));
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static uint32_t has_fuzz_next(uint32_t *state)
+{
+    *state = *state * 1103515245u + 12345u;
+    return (*state >> 16) & 0x7fffu;
+}
+
+static size_t has_fuzz_elements(lxb_dom_node_t *root, lxb_dom_node_t **out,
+                                size_t capacity)
+{
+    size_t count = 0;
+    lxb_dom_node_t *node = root->first_child;
+    while (node != NULL && count < capacity) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) out[count++] = node;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return count;
+}
+
+typedef struct {
+    const char *css;
+    const char *const *classes;
+    size_t class_count;
+    uint32_t seed;
+    unsigned rounds;
+    /* Check every tree or text change classified as not relational
+       against the actual :has() answers of every surviving element. */
+    bool oracle;
+} HasFuzzConfig;
+
+typedef struct {
+    char text[160];
+    size_t length;
+} HasFuzzSnippet;
+
+/* Every `:has(...)` of the (test's own, simply written) sheet, prefixed
+   with the simple selectors before it in its compound, or before the
+   :is()/:where()/:not() holding it: the answer a rule actually reads, at
+   the elements it reads it at. */
+static size_t has_fuzz_snippets(const char *css, HasFuzzSnippet *out,
+                                size_t capacity)
+{
+    size_t count = 0, length = strlen(css);
+    for (size_t at = 0; at + 5 <= length && count < capacity; at++) {
+        if (strncmp(css + at, ":has(", 5) != 0) continue;
+        size_t close = at + 4, depth = 0;
+        for (; close < length; close++) {
+            if (css[close] == '(') depth++;
+            else if (css[close] == ')' && --depth == 0) break;
+        }
+        size_t begin = at;
+        while (begin > 0 && strchr(" >+~,(}", css[begin - 1]) == NULL)
+            begin--;
+        size_t prefix_end = begin;
+        if (begin > 0 && css[begin - 1] == '(') {
+            /* Inside :is/:where/:not: the enclosing compound's prefix. */
+            prefix_end = begin - 1;
+            while (prefix_end > 0 && css[prefix_end - 1] != ':')
+                prefix_end--;
+            prefix_end = prefix_end == 0 ? 0 : prefix_end - 1;
+            begin = prefix_end;
+            while (begin > 0 && strchr(" >+~,(}", css[begin - 1]) == NULL)
+                begin--;
+        } else {
+            prefix_end = at;
+        }
+        size_t prefix = prefix_end - begin;
+        if (close >= length
+            || prefix + close + 1 - at >= sizeof(out[count].text)) continue;
+        memcpy(out[count].text, css + begin, prefix);
+        memcpy(out[count].text + prefix, css + at, close + 1 - at);
+        out[count].length = prefix + close + 1 - at;
+        out[count].text[out[count].length] = '\0';
+        count++;
+    }
+    return count;
+}
+
+static void has_fuzz_answers(lxb_dom_node_t *const *elements, size_t count,
+                             const HasFuzzSnippet *snippets,
+                             size_t snippet_count, uint8_t *answers)
+{
+    for (size_t e = 0; e < count; e++) {
+        for (size_t k = 0; k < snippet_count; k++) {
+            answers[e * snippet_count + k] = (uint8_t) style_selector_matches(
+                elements[e], snippets[k].text, snippets[k].length);
+        }
+    }
+}
+
+static const char *has_fuzz_class(const HasFuzzConfig *config,
+                                  uint32_t *state)
+{
+    return config->classes[has_fuzz_next(state) % config->class_count];
+}
+
+static lxb_dom_node_t *has_fuzz_create(const HasFuzzConfig *config,
+                                       PocDocument *document,
+                                       uint32_t *state, unsigned serial,
+                                       bool nested)
+{
+    char classes[64], label[16];
+    snprintf(classes, sizeof(classes), "%s %s",
+             has_fuzz_class(config, state), has_fuzz_class(config, state));
+    snprintf(label, sizeof(label), "n%u", serial);
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    lxb_dom_element_t *element = lxb_dom_document_create_element(
+        &document->html->dom_document, (const lxb_char_t *) "div", 3, NULL);
+    lxb_dom_text_t *text = element == NULL ? NULL
+        : lxb_dom_document_create_text_node(
+              &document->html->dom_document, (const lxb_char_t *) label,
+              strlen(label));
+    lxb_dom_node_t *node = NULL;
+    if (text != NULL
+        && lxb_dom_element_set_attribute(
+               element, (const lxb_char_t *) "class", 5,
+               (const lxb_char_t *) classes, strlen(classes)) != NULL
+        && lxb_dom_node_append_child(lxb_dom_interface_node(element),
+                                     lxb_dom_interface_node(text))
+               == LXB_DOM_EXCEPTION_OK)
+        node = lxb_dom_interface_node(element);
+    document_allocation_owner_leave(document, previous);
+    /* Sometimes a small subtree, as frameworks insert. */
+    if (node != NULL && nested && has_fuzz_next(state) % 3u == 0) {
+        lxb_dom_node_t *child = has_fuzz_create(config, document, state,
+                                                serial + 1000u, false);
+        if (child != NULL) {
+            previous = document_allocation_owner_enter(document);
+            (void) lxb_dom_node_append_child(node, child);
+            document_allocation_owner_leave(document, previous);
+        }
+    }
+    return node;
+}
+
+static const char has_fuzz_css[] =
+    ".s1:has(+ .x){color:#100001}.s2:has(~ .x){color:#100002}"
+    ".s3:has(> .x){color:#100003}.s4:has(.x){color:#100004}"
+    ".a5:has(.x) .b5{color:#100005}.a6:has(> .y) > .b6{color:#100006}"
+    ".s7:not(:has(.y)){color:#100007}.s8:is(:has(.x), .zz){color:#100008}"
+    ".s9:where(:has(.x:is(.m *))){color:#100009}"
+    ".a10:has(.y) ~ .b10{color:#10000a}.s11:has(+ .p + .x){color:#10000b}"
+    ".s12:has(> .x:first-child){color:#10000c}"
+    ".s13:has(~ .q .x){color:#10000d}.s14:has([data-on]){color:#10000e}"
+    "div:has(> .x) > .t16{color:#100010}"
+    ".s17:has(~ .x:nth-child(odd)){color:#100011}"
+    ".s18:has(> .y:empty){color:#100012}"
+    ".s19:has(.p:not(:empty)) .b5{color:#100013}"
+    ".s11:has(.q:first-child .x){color:#100014}"
+    ".s4:has(.y) .s1{--tone:#200000;border-left:1px solid var(--tone)}";
+
+/* Random class, attribute, text and tree changes, each followed by exactly
+   the invalidation (and :has() classification) the navigation journal
+   issues, must leave the reused cache rendering what a fresh build
+   renders, without a single full reset. */
+static int has_fuzz_run(Budget *budget, const HasFuzzConfig *config)
+{
+    static char html[16384];
+    uint32_t state = config->seed;
+    int written = snprintf(html, sizeof(html),
+                           "<!doctype html><style>%s", config->css);
+    CHECK(written > 0 && (size_t) written < sizeof(html));
+    size_t length = (size_t) written;
+    for (unsigned i = 0; i < 64; i++) {
+        written = snprintf(html + length, sizeof(html) - length,
+                           ".pad%u{margin:0}", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    written = snprintf(html + length, sizeof(html) - length,
+                       "</style><body>");
+    length += (size_t) written;
+    /* A fixed random tree of 60 elements, up to four deep. */
+    unsigned depth = 0;
+    for (unsigned i = 0; i < 60; i++) {
+        if (depth > 0 && has_fuzz_next(&state) % 3u == 0) {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+            depth--;
+        }
+        written = snprintf(html + length, sizeof(html) - length,
+            "<div class='%s %s'>e%u", has_fuzz_class(config, &state),
+            has_fuzz_class(config, &state), i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+        if (depth < 4 && has_fuzz_next(&state) % 2u == 0) {
+            depth++;
+        } else {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+        }
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, length, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_destroy(&retained);
+    lxb_dom_node_t *body = document_body_node(&document);
+    CHECK(body != NULL);
+    LayoutReuseStats start;
+    layout_reuse_cache_stats(reuse, &start);
+    unsigned serial = 0;
+    static HasFuzzSnippet snippets[32];
+    size_t snippet_count = config->oracle
+        ? has_fuzz_snippets(config->css, snippets, 32) : 0;
+    static uint8_t answers_before[256 * 32], answers_after[256 * 32];
+    for (unsigned round = 0; round < config->rounds; round++) {
+        lxb_dom_node_t *elements[256];
+        size_t count = has_fuzz_elements(body, elements, 256);
+        if (count == 0) {
+            /* A removal took everything: start over under the body. */
+            lxb_dom_node_t *created = has_fuzz_create(
+                config, &document, &state, serial++, true);
+            CHECK(created != NULL && lxb_dom_node_append_child(body, created)
+                                         == LXB_DOM_EXCEPTION_OK);
+            layout_reuse_cache_invalidate_tree(reuse, created, true);
+            count = has_fuzz_elements(body, elements, 256);
+        }
+        lxb_dom_node_t *node = elements[has_fuzz_next(&state) % count];
+        unsigned op = has_fuzz_next(&state) % 7u;
+        if (count < 30) op = 3;
+        bool classified = false, relational = true;
+        if (snippet_count != 0 && op >= 3)
+            has_fuzz_answers(elements, count, snippets, snippet_count,
+                             answers_before);
+        if (op == 0 || op == 1) {
+            /* Toggle one class token. */
+            const char *token = has_fuzz_class(config, &state);
+            size_t old_length = 0;
+            const lxb_char_t *old = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) "class",
+                5, &old_length);
+            char before[256], after[256];
+            snprintf(before, sizeof(before), "%.*s", (int) old_length,
+                     old == NULL ? "" : (const char *) old);
+            char padded[260], needle[40];
+            snprintf(padded, sizeof(padded), " %s ", before);
+            snprintf(needle, sizeof(needle), " %s ", token);
+            char *found = strstr(padded, needle);
+            if (found != NULL) {
+                memmove(found + 1, found + strlen(needle),
+                        strlen(found + strlen(needle)) + 1);
+                snprintf(after, sizeof(after), "%s", padded + 1);
+            } else {
+                snprintf(after, sizeof(after), "%s %s", before, token);
+            }
+            uint32_t tokens[8];
+            size_t token_count = 0;
+            bool exact = stylesheet_attribute_change_tokens(
+                "class", 5, before, strlen(before), after, strlen(after),
+                tokens, 8, &token_count);
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, "class", 5, before, strlen(before), after,
+                strlen(after));
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) "class",
+                5, (const lxb_char_t *) after, strlen(after)) != NULL);
+            layout_reuse_cache_invalidate_attribute(
+                reuse, node, exact ? tokens : NULL, token_count, false,
+                relational);
+        } else if (op == 2) {
+            /* Toggle an attribute only a :has() argument reads. */
+            bool present = lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "data-on", 7);
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, "data-on", 7, present ? "" : NULL, 0,
+                present ? NULL : "", 0);
+            if (present) {
+                CHECK(lxb_dom_element_remove_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "data-on", 7) == LXB_STATUS_OK);
+            } else {
+                CHECK(lxb_dom_element_set_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "data-on", 7,
+                    (const lxb_char_t *) "", 0) != NULL);
+            }
+            if (relational) {
+                layout_reuse_cache_invalidate_relational(reuse, node,
+                                                         "data-on", false);
+            } else {
+                layout_reuse_cache_invalidate_node_scoped(reuse, node, false);
+            }
+        } else if (op == 3) {
+            /* Insert a new element before a random child, or append. */
+            lxb_dom_node_t *created = has_fuzz_create(
+                config, &document, &state, serial++, true);
+            CHECK(created != NULL);
+            if (has_fuzz_next(&state) % 2u == 0) {
+                lxb_dom_node_insert_before(node, created);
+            } else {
+                CHECK(lxb_dom_node_append_child(node, created)
+                      == LXB_DOM_EXCEPTION_OK);
+            }
+            /* Classified after insertion, as the bridge does. */
+            classified = true;
+            uint64_t entries = UINT64_MAX;
+            uint32_t serial = 0;
+            relational = stylesheet_tree_change_has_entries(
+                &sheet, created, created->parent, &entries, &serial);
+            /* The journal notes only the entries the probe saw reached
+               (half the time, to keep the unfiltered path covered). */
+            if (has_fuzz_next(&state) % 2u == 0)
+                layout_reuse_cache_set_structure_filter(reuse, entries,
+                                                        serial);
+            layout_reuse_cache_invalidate_tree(reuse, created, relational);
+            layout_reuse_cache_set_structure_filter(reuse, UINT64_MAX, 0);
+        } else if (op == 6) {
+            /* Move the element under another one outside its subtree;
+               the bridge journals a move as relational. */
+            lxb_dom_node_t *target = elements[has_fuzz_next(&state) % count];
+            bool inside = false;
+            for (lxb_dom_node_t *at = target; at != NULL && !inside;
+                 at = at->parent)
+                inside = at == node;
+            if (inside) continue;
+            lxb_dom_node_t *old_parent = node->parent;
+            /* The bridge probes both positions and the record keeps the
+               union (half the time, to keep the unfiltered path). */
+            uint64_t before_entries = UINT64_MAX, after_entries = UINT64_MAX;
+            uint32_t before_serial = 0, after_serial = 0;
+            bool before_relational = stylesheet_tree_change_has_entries(
+                &sheet, node, old_parent, &before_entries, &before_serial);
+            lxb_dom_node_remove(node);
+            CHECK(lxb_dom_node_append_child(target, node)
+                  == LXB_DOM_EXCEPTION_OK);
+            bool after_relational = stylesheet_tree_change_has_entries(
+                &sheet, node, target, &after_entries, &after_serial);
+            bool relational_move = before_relational || after_relational;
+            if (has_fuzz_next(&state) % 2u == 0 && before_serial != 0
+                && before_serial == after_serial)
+                layout_reuse_cache_set_structure_filter(
+                    reuse, before_entries | after_entries, after_serial);
+            else
+                relational_move = true;
+            layout_reuse_cache_invalidate_children(reuse, old_parent, node,
+                                                   relational_move);
+            layout_reuse_cache_invalidate_tree(reuse, node, relational_move);
+            layout_reuse_cache_set_structure_filter(reuse, UINT64_MAX, 0);
+        } else if (op == 5) {
+            /* Empty or refill the element's text (its :empty state). */
+            lxb_dom_node_t *text = node->first_child;
+            if (text == NULL || text->type != LXB_DOM_NODE_TYPE_TEXT)
+                continue;
+            size_t text_length = 0;
+            (void) lxb_dom_node_text_content(text, &text_length);
+            BudgetAllocationOwner previous =
+                document_allocation_owner_enter(&document);
+            lxb_status_t status = lxb_dom_node_text_content_set(
+                text, (const lxb_char_t *) "e", text_length == 0 ? 1u : 0u);
+            document_allocation_owner_leave(&document, previous);
+            CHECK(status == LXB_STATUS_OK);
+            classified = true;
+            uint64_t entries = UINT64_MAX;
+            uint32_t serial = 0;
+            relational = stylesheet_tree_change_has_entries(
+                &sheet, text, node, &entries, &serial);
+            layout_reuse_cache_set_structure_filter(reuse, entries, serial);
+            if (relational)
+                layout_reuse_cache_invalidate_relational(reuse, text, NULL,
+                                                         true);
+            else
+                layout_reuse_cache_invalidate_node_scoped(reuse, text, true);
+            layout_reuse_cache_set_structure_filter(reuse, UINT64_MAX, 0);
+        } else {
+            /* Remove a subtree: classify it while attached, retire it,
+               then scope its old parent. */
+            lxb_dom_node_t *parent = node->parent;
+            classified = true;
+            uint64_t entries = UINT64_MAX;
+            uint32_t serial = 0;
+            relational = stylesheet_tree_change_has_entries(
+                &sheet, node, parent, &entries, &serial);
+            /* The removed subtree's answers go with it. */
+            for (size_t e = 0; e < count; e++) {
+                for (const lxb_dom_node_t *at = elements[e]; at != NULL;
+                     at = at->parent) {
+                    if (at == node) {
+                        elements[e] = NULL;
+                        break;
+                    }
+                }
+            }
+            layout_reuse_cache_retire_subtree(reuse, node);
+            lxb_dom_node_remove(node);
+            /* The journal names the removed child while it lives. */
+            bool known = has_fuzz_next(&state) % 2u == 0;
+            layout_reuse_cache_set_structure_filter(reuse, entries, serial);
+            layout_reuse_cache_invalidate_children(
+                reuse, parent, known ? node : NULL, relational);
+            layout_reuse_cache_set_structure_filter(reuse, UINT64_MAX, 0);
+            BudgetAllocationOwner previous =
+                document_allocation_owner_enter(&document);
+            lxb_dom_node_destroy_deep(node);
+            document_allocation_owner_leave(&document, previous);
+        }
+        if (snippet_count != 0 && classified && !relational) {
+            size_t kept = 0;
+            for (size_t e = 0; e < count; e++) {
+                if (elements[e] == NULL) continue;
+                for (size_t k = 0; k < snippet_count; k++)
+                    answers_before[kept * snippet_count + k] =
+                        answers_before[e * snippet_count + k];
+                elements[kept++] = elements[e];
+            }
+            has_fuzz_answers(elements, kept, snippets, snippet_count,
+                             answers_after);
+            if (memcmp(answers_before, answers_after,
+                       kept * snippet_count) != 0) {
+                printf("has fuzz round %u op %u: a :has() answer moved on a "
+                       "change classified as not relational\n", round, op);
+                for (size_t e = 0; e < kept; e++) {
+                    for (size_t k = 0; k < snippet_count; k++) {
+                        size_t at = e * snippet_count + k;
+                        if (answers_before[at] == answers_after[at]) continue;
+                        size_t class_length = 0;
+                        const lxb_char_t *classes =
+                            lxb_dom_element_get_attribute(
+                                lxb_dom_interface_element(elements[e]),
+                                (const lxb_char_t *) "class", 5,
+                                &class_length);
+                        printf("  '%.*s' %s: %u -> %u\n", (int) class_length,
+                               classes == NULL ? "" : (const char *) classes,
+                               snippets[k].text, answers_before[at],
+                               answers_after[at]);
+                    }
+                }
+                CHECK(false);
+            }
+        }
+        layout_reuse_cache_flush_invalidations(reuse);
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+            NULL, NULL, &viewport));
+        if (!commands_equal(&retained, &fresh)) {
+            printf("has fuzz round %u op %u diverged\n", round, op);
+            CHECK(false);
+        }
+        layout_destroy(&retained);
+        layout_destroy(&fresh);
+    }
+    LayoutReuseStats end;
+    layout_reuse_cache_stats(reuse, &end);
+    /* Every change stayed scoped and most styles were reused. */
+    if (end.full_resets != start.full_resets || end.has_fallbacks != 0
+        || end.has_scoped <= start.has_scoped
+        || end.style_hits - start.style_hits
+               <= end.style_misses - start.style_misses) {
+        printf("has fuzz resets=%zu/%zu fallbacks=%zu scoped=%zu "
+               "styles=%zu/%zu dropped=%zu scans=%zu\n", start.full_resets,
+               end.full_resets, end.has_fallbacks, end.has_scoped,
+               end.style_hits - start.style_hits,
+               end.style_misses - start.style_misses, end.has_dropped,
+               end.has_scans);
+        CHECK(false);
+    }
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Focus moves and inline custom-property writes, each followed by exactly
+   the invalidation the navigation journal issues for it, must leave the
+   reused cache rendering what a fresh build renders. `scoped` asks that
+   none of them resets the cache and that most styles are reused. */
+typedef struct {
+    const char *css;
+    uint32_t seed;
+    unsigned rounds;
+    bool scoped;
+} StateFuzzConfig;
+
+static const char *const state_fuzz_classes[] = {
+    "mk", "mk2", "mk3", "mk4", "k1", "k3", "k4", "k5", "k6", "k7", "k8",
+    "v1", "v2", "v3", "v4", "d3", "hs", "x", "p", "q",
+};
+#define STATE_FUZZ_CLASS_COUNT \
+    (sizeof(state_fuzz_classes) / sizeof(state_fuzz_classes[0]))
+
+static const char state_fuzz_css[] =
+    ".k1:where(.mk:focus-within *){color:#400001}"
+    ".mk2:focus-within{background-color:#400002}"
+    ".mk3:focus-within .k3{color:#400003}"
+    ".k4:where(.mk:not(:focus-within) *){padding-left:3px}"
+    ".mk:focus-within > .k5{color:#400005}"
+    ".k6:focus{color:#400006}.mk:focus-visible .k7{color:#400007}"
+    ".mk4:focus-within{--fw:#400008}.k8{color:var(--fw,#400009)}"
+    ".v1{color:var(--p1,#500001)}.v2{background-color:var(--p2,#500002)}"
+    ".d3{--p3:var(--p1,#500003)}"
+    ".v3{border-left:1px solid var(--p3,#500004)}"
+    ".hs:has(.x){--p4:#500005}.v4{color:var(--p4,#500006)}"
+    ".p .q{margin-left:2px}";
+
+/* Class and attribute dependencies beyond the subject: ancestor markers
+   keyed by their subjects, sibling reach, attribute selectors off the
+   subject and on it, an unkeyed subject, and custom properties declared
+   through an ancestor token. */
+static const char state_fuzz_reach_css[] =
+    ".p .q{margin-left:2px}.k1:where(.mk *){color:#400021}"
+    ".p + .q{padding-left:1px}.x ~ .v1{margin-top:1px}"
+    ".x:first-child + .k6{color:#400022}"
+    "[data-a] .k3{color:#400023}.k4[data-b]{color:#400024}"
+    "[data-c] + .k7{color:#400025}[data-c] ~ .k8 .v2{color:#400026}"
+    ".mk2 *{margin-bottom:1px}"
+    ".mk3 .v2{--p2:#400027}.v2{background-color:var(--p2,#400028)}"
+    "[data-a] .v3{--p3:#400029}.v3{border-left:1px solid var(--p3,#40002a)}"
+    ".k5.x .v4{color:#40002b}.hs:has(.x){--p4:#500005}"
+    ".v4{color:var(--p4,#500006)}"
+    /* Generated content appearing and disappearing with the element's
+       own, an ancestor's and a sibling's state, and through a custom
+       property only the pseudo-element reads. */
+    ".k6::before{content:'b6'}.mk .k7::after{content:'a7'}"
+    "[data-a] .k8::before{content:'b8'}.x ~ .q::after{content:'aq'}"
+    ".mk4 .v3{--c:'c3'}.v3::after{content:var(--c)}"
+    /* Custom properties sibling reach sets, read by the reached
+       elements' descendants. */
+    ".x + .k6{--sib:#400031}.p ~ .k7{--sib:#400032}"
+    "[data-c] + .k8{--sib:#400033}.k5:first-child{--sib:#400039}"
+    ".x ~ .q,.x ~ .k1,.p ~ .v1,.p ~ .v2,.mk ~ .k3,.mk ~ .v4,.k4 ~ .v3,"
+    "[data-a] ~ .k4,[data-b] ~ .mk2{--sib:#40003b}"
+    ".q{background-color:var(--sib,#400037)}"
+    ".v4{border-left:1px solid var(--sib,#400038)}"
+    /* Readers that are no target, so no target's own style changes. */
+    ".hs,.d3,.mk3{background-color:var(--sib,#40003a)}";
+
+static const char *const state_fuzz_attributes[] = {
+    "data-a", "data-b", "data-c", "data-z", "title",
+};
+
+static const char *state_fuzz_class(uint32_t *state)
+{
+    return state_fuzz_classes[has_fuzz_next(state) % STATE_FUZZ_CLASS_COUNT];
+}
+
+static int state_fuzz_run(Budget *budget, const StateFuzzConfig *config)
+{
+    static char html[16384];
+    uint32_t state = config->seed;
+    int written = snprintf(html, sizeof(html),
+                           "<!doctype html><html style='--p1:#600001'>"
+                           "<style>%s", config->css);
+    CHECK(written > 0 && (size_t) written < sizeof(html));
+    size_t length = (size_t) written;
+    for (unsigned i = 0; i < 64; i++) {
+        written = snprintf(html + length, sizeof(html) - length,
+                           ".pad%u{margin:0}", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    written = snprintf(html + length, sizeof(html) - length,
+                       "</style><body>");
+    length += (size_t) written;
+    unsigned depth = 0;
+    for (unsigned i = 0; i < 60; i++) {
+        if (depth > 0 && has_fuzz_next(&state) % 3u == 0) {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+            depth--;
+        }
+        written = snprintf(html + length, sizeof(html) - length,
+            "<div class='%s %s'>e%u", state_fuzz_class(&state),
+            state_fuzz_class(&state), i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+        if (depth < 5 && has_fuzz_next(&state) % 2u == 0) {
+            depth++;
+        } else {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+        }
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, length, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_destroy(&retained);
+    lxb_dom_node_t *body = document_body_node(&document);
+    lxb_dom_node_t *root = body == NULL ? NULL : body->parent;
+    CHECK(body != NULL && root != NULL
+          && root->type == LXB_DOM_NODE_TYPE_ELEMENT);
+    LayoutReuseStats start;
+    layout_reuse_cache_stats(reuse, &start);
+    lxb_dom_node_t *focused = NULL;
+    static const char *const colors[] = {
+        "#700001", "#700002", "#700003", "#700004"
+    };
+    for (unsigned round = 0; round < config->rounds; round++) {
+        lxb_dom_node_t *elements[256];
+        size_t count = has_fuzz_elements(body, elements, 256);
+        CHECK(count != 0);
+        lxb_dom_node_t *node = elements[has_fuzz_next(&state) % count];
+        unsigned op = has_fuzz_next(&state) % 7u;
+        if (getenv("STATE_FUZZ_TRACE")) { printf("round %u op %u\n", round, op); fflush(stdout); }
+        if (op == 0 || op == 1) {
+            /* Move focus: the old element loses the marker, the new one
+               gains it (sometimes nothing takes it). */
+            lxb_dom_node_t *next = has_fuzz_next(&state) % 5u == 0
+                ? NULL : node;
+            if (next == focused) continue;
+            if (focused != NULL) {
+                CHECK(lxb_dom_element_remove_attribute(
+                    lxb_dom_interface_element(focused),
+                    (const lxb_char_t *) "data-tilefinch-focus", 20)
+                      == LXB_STATUS_OK);
+                layout_reuse_cache_invalidate_focus(reuse, focused);
+            }
+            if (next != NULL) {
+                CHECK(lxb_dom_element_set_attribute(
+                    lxb_dom_interface_element(next),
+                    (const lxb_char_t *) "data-tilefinch-focus", 20,
+                    (const lxb_char_t *) "", 0) != NULL);
+                layout_reuse_cache_invalidate_focus(reuse, next);
+            }
+            focused = next;
+        } else if (op == 2 || op == 3) {
+            /* Rewrite an inline style: custom properties (on the root
+               element half the time), sometimes an ordinary property. */
+            lxb_dom_node_t *target = has_fuzz_next(&state) % 2u == 0
+                ? root : node;
+            char style[160];
+            int used = snprintf(style, sizeof(style), "--p%u:%s;",
+                                1u + has_fuzz_next(&state) % 4u,
+                                colors[has_fuzz_next(&state) % 4u]);
+            if (has_fuzz_next(&state) % 2u == 0)
+                used += snprintf(style + used, sizeof(style) - (size_t) used,
+                                 "--p%u:%s;", 1u + has_fuzz_next(&state) % 4u,
+                                 colors[has_fuzz_next(&state) % 4u]);
+            if (has_fuzz_next(&state) % 3u == 0)
+                used += snprintf(style + used, sizeof(style) - (size_t) used,
+                                 "padding-top:%upx;",
+                                 has_fuzz_next(&state) % 4u);
+            if (has_fuzz_next(&state) % 5u == 0) used = 0;
+            size_t old_length = 0;
+            const lxb_char_t *old = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(target),
+                (const lxb_char_t *) "style", 5, &old_length);
+            char before[256];
+            snprintf(before, sizeof(before), "%.*s", (int) old_length,
+                     old == NULL ? "" : (const char *) old);
+            if (getenv("STATE_FUZZ_TRACE")) { printf(" style '%s' -> '%.*s'\n", before, used, style); fflush(stdout); }
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, "style", 5, before, strlen(before), style,
+                (size_t) used);
+            if (getenv("STATE_FUZZ_TRACE")) { printf(" rel %d\n", relational); fflush(stdout); }
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(target),
+                (const lxb_char_t *) "style", 5, (const lxb_char_t *) style,
+                (size_t) used) != NULL);
+            layout_reuse_cache_invalidate_inline_style(
+                reuse, target, NULL, relational);
+        } else if (op == 5) {
+            /* Write or remove an attribute: some selectors read it off
+               the subject, some on it, one never (data-z, title). The
+               journal's path for a write no :has() reads. */
+            const char *name = state_fuzz_attributes[
+                has_fuzz_next(&state) % (sizeof(state_fuzz_attributes)
+                                         / sizeof(state_fuzz_attributes[0]))];
+            size_t name_length = strlen(name);
+            size_t old_length = 0;
+            const lxb_char_t *old = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) name,
+                name_length, &old_length);
+            bool present = old != NULL;
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, name, name_length,
+                present ? (const char *) old : NULL, old_length,
+                present ? NULL : "1", present ? 0 : 1);
+            if (present) {
+                CHECK(lxb_dom_element_remove_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) name, name_length)
+                      == LXB_STATUS_OK);
+            } else {
+                CHECK(lxb_dom_element_set_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) name, name_length,
+                    (const lxb_char_t *) "1", 1) != NULL);
+            }
+            if (relational)
+                layout_reuse_cache_invalidate_relational(reuse, node, name,
+                                                         false);
+            else
+                layout_reuse_cache_invalidate_own_attribute(reuse, node,
+                                                            name);
+        } else if (op == 6) {
+            /* Replace the whole class list (atomic-CSS style swaps). */
+            size_t old_length = 0;
+            const lxb_char_t *old = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) "class",
+                5, &old_length);
+            char before[256], after[256];
+            snprintf(before, sizeof(before), "%.*s", (int) old_length,
+                     old == NULL ? "" : (const char *) old);
+            size_t used = 0;
+            unsigned tokens_wanted = has_fuzz_next(&state) % 5u;
+            after[0] = '\0';
+            for (unsigned t = 0; t < tokens_wanted; t++)
+                used += (size_t) snprintf(after + used, sizeof(after) - used,
+                                          "%s%s", t == 0 ? "" : " ",
+                                          state_fuzz_class(&state));
+            uint32_t tokens[64];
+            size_t token_count = 0;
+            bool exact = stylesheet_attribute_change_tokens(
+                "class", 5, before, strlen(before), after, strlen(after),
+                tokens, 64, &token_count);
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, "class", 5, before, strlen(before), after,
+                strlen(after));
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) "class",
+                5, (const lxb_char_t *) after, strlen(after)) != NULL);
+            layout_reuse_cache_invalidate_attribute(
+                reuse, node, exact ? tokens : NULL, token_count, false,
+                relational);
+        } else {
+            /* Toggle one class token. */
+            const char *token = state_fuzz_class(&state);
+            size_t old_length = 0;
+            const lxb_char_t *old = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) "class",
+                5, &old_length);
+            char before[256], after[256];
+            snprintf(before, sizeof(before), "%.*s", (int) old_length,
+                     old == NULL ? "" : (const char *) old);
+            char padded[260], needle[40];
+            snprintf(padded, sizeof(padded), " %s ", before);
+            snprintf(needle, sizeof(needle), " %s ", token);
+            char *found = strstr(padded, needle);
+            if (found != NULL) {
+                memmove(found + 1, found + strlen(needle),
+                        strlen(found + strlen(needle)) + 1);
+                snprintf(after, sizeof(after), "%s", padded + 1);
+            } else {
+                snprintf(after, sizeof(after), "%s %s", before, token);
+            }
+            uint32_t tokens[8];
+            size_t token_count = 0;
+            bool exact = stylesheet_attribute_change_tokens(
+                "class", 5, before, strlen(before), after, strlen(after),
+                tokens, 8, &token_count);
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, "class", 5, before, strlen(before), after,
+                strlen(after));
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(node), (const lxb_char_t *) "class",
+                5, (const lxb_char_t *) after, strlen(after)) != NULL);
+            layout_reuse_cache_invalidate_attribute(
+                reuse, node, exact ? tokens : NULL, token_count, false,
+                relational);
+        }
+        layout_reuse_cache_flush_invalidations(reuse);
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+            NULL, NULL, &viewport));
+        if (!commands_equal(&retained, &fresh)) {
+            printf("state fuzz seed %u round %u op %u diverged\n",
+                   config->seed, round, op);
+            CHECK(false);
+        }
+        layout_destroy(&retained);
+        layout_destroy(&fresh);
+    }
+    LayoutReuseStats end;
+    layout_reuse_cache_stats(reuse, &end);
+    printf("state fuzz seed %u: resets=%zu styles=%zu/%zu\n", config->seed,
+           end.full_resets - start.full_resets,
+           end.style_hits - start.style_hits,
+           end.style_misses - start.style_misses);
+    if (config->scoped
+        && (end.full_resets != start.full_resets
+            || end.style_hits - start.style_hits
+                   <= 2u * (end.style_misses - start.style_misses))) {
+        CHECK(false);
+    }
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static lxb_dom_node_t *state_find_id(lxb_dom_node_t *node, const char *id)
+{
+    for (; node != NULL; node = node->next) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            size_t length = 0;
+            const char *value = document_attribute(node, "id", &length);
+            if (value != NULL && length == strlen(id)
+                && memcmp(value, id, length) == 0) return node;
+        }
+        lxb_dom_node_t *found = state_find_id(node->first_child, id);
+        if (found != NULL) return found;
+    }
+    return NULL;
+}
+
+/* One mutation, invalidated as the navigation journal does, must leave
+   the reused cache rendering what a fresh build renders. `step` applies
+   the change and its invalidation. */
+typedef void (*ReachStep)(LayoutReuseCache *reuse, const Stylesheet *sheet,
+                          lxb_dom_node_t *root);
+
+static int reach_case(Budget *budget, const char *label, const char *html,
+                      ReachStep step)
+{
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, strlen(html), 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_destroy(&retained);
+    lxb_dom_node_t *body = document_body_node(&document);
+    CHECK(body != NULL && body->parent != NULL
+          && body->parent->type == LXB_DOM_NODE_TYPE_ELEMENT);
+    /* The <html> element (document.html is the document node). */
+    step(reuse, &sheet, body->parent);
+    layout_reuse_cache_flush_invalidations(reuse);
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+        NULL, NULL, &viewport));
+    bool equal = commands_equal(&retained, &fresh);
+    if (!equal) printf("custom-property reach %s diverged\n", label);
+    layout_destroy(&retained);
+    layout_destroy(&fresh);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return equal ? 0 : 1;
+}
+
+static void reach_set_class(LayoutReuseCache *reuse, const Stylesheet *sheet,
+                            lxb_dom_node_t *root)
+{
+    lxb_dom_node_t *node = state_find_id(root, "a");
+    uint32_t tokens[8];
+    size_t count = 0;
+    bool exact = stylesheet_attribute_change_tokens(
+        "class", 5, "", 0, "on", 2, tokens, 8, &count);
+    bool relational = stylesheet_attribute_change_may_affect_has(
+        sheet, "class", 5, "", 0, "on", 2);
+    (void) lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "on", 2);
+    layout_reuse_cache_invalidate_attribute(reuse, node,
+        exact ? tokens : NULL, count, false, relational);
+}
+
+static void reach_set_attribute(LayoutReuseCache *reuse,
+                                const Stylesheet *sheet,
+                                lxb_dom_node_t *root)
+{
+    lxb_dom_node_t *node = state_find_id(root, "a");
+    bool relational = stylesheet_attribute_change_may_affect_has(
+        sheet, "data-on", 7, NULL, 0, "1", 1);
+    (void) lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+        (const lxb_char_t *) "data-on", 7, (const lxb_char_t *) "1", 1);
+    if (relational)
+        layout_reuse_cache_invalidate_relational(reuse, node, "data-on",
+                                                 false);
+    else
+        layout_reuse_cache_invalidate_own_attribute(reuse, node, "data-on");
+}
+
+static void reach_insert_before(LayoutReuseCache *reuse,
+                                const Stylesheet *sheet,
+                                lxb_dom_node_t *root)
+{
+    lxb_dom_node_t *target = state_find_id(root, "t");
+    lxb_dom_element_t *created = lxb_dom_document_create_element(
+        target->owner_document, (const lxb_char_t *) "div", 3, NULL);
+    lxb_dom_node_insert_before(target, lxb_dom_interface_node(created));
+    bool relational = stylesheet_tree_change_may_affect_has(
+        sheet, lxb_dom_interface_node(created), target->parent);
+    layout_reuse_cache_invalidate_tree(reuse,
+                                       lxb_dom_interface_node(created),
+                                       relational);
+}
+
+static void reach_root_inline(LayoutReuseCache *reuse,
+                              const Stylesheet *sheet, lxb_dom_node_t *root)
+{
+    static const char style[] = "--c:'gen'";
+    bool relational = stylesheet_attribute_change_may_affect_has(
+        sheet, "style", 5, NULL, 0, style, sizeof(style) - 1u);
+    (void) lxb_dom_element_set_attribute(lxb_dom_interface_element(root),
+        (const lxb_char_t *) "style", 5, (const lxb_char_t *) style,
+        sizeof(style) - 1u);
+    layout_reuse_cache_invalidate_inline_style(reuse, root, NULL,
+                                               relational);
+}
+
+/* A custom property a rule declares on an element another element's
+   change reaches (a sibling, a keyed subject) is read by that element's
+   descendants: they restyle although its own computed style does not
+   change. And a pseudo-element whose content reads a custom property is
+   never remembered as generating nothing. */
+static int test_custom_property_widened_reach(Budget *budget)
+{
+    int failed = 0;
+    failed |= reach_case(budget, "sibling class",
+        "<!doctype html><style>.on + .target{--tone:#500011}"
+        ".leaf{color:var(--tone,#500012)}</style><body><div id=a>x</div>"
+        "<div class=target><p class=leaf>leaf</p></div></body>",
+        reach_set_class);
+    failed |= reach_case(budget, "sibling attribute",
+        "<!doctype html><style>[data-on] ~ .target{--tone:#500013}"
+        ".leaf{color:var(--tone,#500014)}</style><body><div id=a>x</div>"
+        "<p>gap</p><div class=target><p class=leaf>leaf</p></div></body>",
+        reach_set_attribute);
+    failed |= reach_case(budget, "descendant class",
+        "<!doctype html><style>.on .target{--tone:#500015}"
+        ".leaf{color:var(--tone,#500016)}</style><body><div id=a>"
+        "<div class=target><p class=leaf>leaf</p></div></div></body>",
+        reach_set_class);
+    failed |= reach_case(budget, "structural sibling",
+        "<!doctype html><style>.target:first-child{--tone:#500017}"
+        ".leaf{color:var(--tone,#500018)}</style><body><section>"
+        "<div class=target id=t><p class=leaf>leaf</p></div></section>"
+        "</body>",
+        reach_insert_before);
+    failed |= reach_case(budget, "pseudo content var",
+        "<!doctype html><html style=\"--c:none\"><style>"
+        ".v::before{content:var(--c)}</style>"
+        "<body><p class=v>text</p></body>",
+        reach_root_inline);
+    CHECK(failed == 0);
+    return 0;
+}
+
+/* A :has() or :focus-within answer that sets a custom property on its
+   anchor restyles the anchor's descendants that read it, although the
+   anchor's own computed style does not change. */
+static int test_custom_property_anchor_invalidation(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>"
+        ".hs:has(.x){--p4:#500005}.v4{color:var(--p4,#500006)}"
+        ".fw:focus-within{--p5:#500007}.v5{color:var(--p5,#500008)}"
+        ".sf:focus-within{--p6:#500009}.v6{color:var(--p6,#50000a)}"
+        "</style><body><div class=hs><div class=v4>t</div>"
+        "<div id=target>u</div></div><div class=fw><p class=v5>v</p>"
+        "<input id=field></div>"
+        /* The focused element is the subject itself (a walk drop, not a
+           keyed selection); its reader descendants must follow. */
+        "<div class=sf id=self tabindex=0><p class=v6>w</p></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1u, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_destroy(&retained);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *target = state_find_id(root, "target");
+    lxb_dom_node_t *field = state_find_id(root, "field");
+    lxb_dom_node_t *self = state_find_id(root, "self");
+    CHECK(target != NULL && field != NULL && self != NULL);
+    for (int step = 0; step < 3; step++) {
+        if (step == 0) {
+            uint32_t tokens[8];
+            size_t token_count = 0;
+            bool exact = stylesheet_attribute_change_tokens(
+                "class", 5, "", 0, "x", 1, tokens, 8, &token_count);
+            bool relational = stylesheet_attribute_change_may_affect_has(
+                &sheet, "class", 5, "", 0, "x", 1);
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(target),
+                (const lxb_char_t *) "class", 5, (const lxb_char_t *) "x", 1)
+                  != NULL);
+            layout_reuse_cache_invalidate_attribute(
+                reuse, target, exact ? tokens : NULL, token_count, false,
+                relational);
+        } else {
+            lxb_dom_node_t *focused = step == 1 ? field : self;
+            if (step == 2) {
+                CHECK(lxb_dom_element_remove_attribute(
+                    lxb_dom_interface_element(field),
+                    (const lxb_char_t *) "data-tilefinch-focus", 20)
+                      == LXB_STATUS_OK);
+                layout_reuse_cache_invalidate_focus(reuse, field);
+            }
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(focused),
+                (const lxb_char_t *) "data-tilefinch-focus", 20,
+                (const lxb_char_t *) "", 0) != NULL);
+            layout_reuse_cache_invalidate_focus(reuse, focused);
+        }
+        layout_reuse_cache_flush_invalidations(reuse);
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+            NULL, NULL, &viewport));
+        if (!commands_equal(&retained, &fresh))
+            printf("custom-property anchor step %d diverged\n", step);
+        CHECK(commands_equal(&retained, &fresh));
+        layout_destroy(&retained);
+        layout_destroy(&fresh);
+    }
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_state_invalidation_matches_fresh(Budget *budget)
+{
+    const StateFuzzConfig configs[] = {
+        {state_fuzz_css, 20260929u, 500, true},
+        {state_fuzz_css, 77u, 500, true},
+        {state_fuzz_css, 4242u, 500, true},
+        {state_fuzz_reach_css, 5150u, 500, true},
+        {state_fuzz_reach_css, 991u, 500, true},
+    };
+    for (size_t i = 0; i < sizeof(configs) / sizeof(configs[0]); i++)
+        CHECK(state_fuzz_run(budget, &configs[i]) == 0);
+    CHECK(test_custom_property_anchor_invalidation(budget) == 0);
+    CHECK(test_custom_property_widened_reach(budget) == 0);
+    return 0;
+}
+
+static int test_has_scoped_invalidation_matches_fresh(Budget *budget)
+{
+    static const char *const broad_classes[] = {
+        "s1", "s2", "s3", "s4", "a5", "b5", "a6", "b6", "s7", "s8", "s9",
+        "a10", "b10", "s11", "s12", "s13", "s14", "t16", "s17", "s18", "s19",
+        "x", "y", "p", "q", "m",
+    };
+    /* Few classes, so anchors, arguments and their positions meet often. */
+    static const char *const dense_classes[] = {
+        "a", "b", "x", "y", "q", "e",
+    };
+    static const char dense_css[] =
+        ".a:has(.x){color:#300001}.a:has(> .y:empty){color:#300002}"
+        ".a:has(.q:first-child .x){color:#300003}.b:has(+ .x){color:#300004}"
+        ".b:has(~ .y .x){color:#300005}.a:has(.x) .b{color:#300006}"
+        ".b:has(.e:not(:empty)) .q{color:#300007}"
+        ".a:has(> .q + .x){color:#300008}.q:has(~ .e:last-child){color:#300009}"
+        ".a:has(.q + .x){color:#30000a}.a:has(.y:last-child){color:#30000b}"
+        ".a:has(.q + .y .x){color:#30000c}"
+        /* Sibling tests on the subject only, and an ancestor test. */
+        ".x:first-child{color:#300013}.y + .q{color:#300014}"
+        ".e:nth-last-child(2){color:#300015}.b ~ .e{color:#300017}"
+        ".a .y{color:#300016}";
+    /* Sibling tests before a descendant combinator, keyed. */
+    static char deep_css[2048];
+    snprintf(deep_css, sizeof(deep_css),
+             "%s.q + .e .x{color:#30000f}.b:first-child .y{color:#300010}"
+             ".e ~ .y > .q{color:#300012}", dense_css);
+    /* An :empty outside :has(): a parent's children restyle its siblings. */
+    static char empty_css[2048];
+    snprintf(empty_css, sizeof(empty_css),
+             "%s.e:empty + .q{color:#30000d}.y:empty ~ .x .b{color:#30000e}"
+             ".y + * .b{color:#300011}",
+             deep_css);
+    /* Custom properties a :has() subject passes to its descendants, read
+       beside and below the subjects (and anchors on the subject itself). */
+    static char custom_css[2048];
+    snprintf(custom_css, sizeof(custom_css),
+             "%s.a:has(.x){--h1:#300021}.b:has(+ .y){--h2:#300022}"
+             ".x:has(> .q){--h3:#300025}.q{color:var(--h1,#300023)}"
+             ".e{background-color:var(--h2,#300024)}"
+             ".y .e{border-color:var(--h3,#300026)}"
+             ".y{color:var(--h3,var(--h1,#300027))}", dense_css);
+    const HasFuzzConfig configs[] = {
+        {custom_css, dense_classes,
+         sizeof(dense_classes) / sizeof(dense_classes[0]), 424242u, 600,
+         true},
+        {has_fuzz_css, broad_classes,
+         sizeof(broad_classes) / sizeof(broad_classes[0]), 20260928u, 400,
+         true},
+        {dense_css, dense_classes,
+         sizeof(dense_classes) / sizeof(dense_classes[0]), 7u, 600, true},
+        {deep_css, dense_classes,
+         sizeof(dense_classes) / sizeof(dense_classes[0]), 1234567u, 600,
+         true},
+        {dense_css, dense_classes,
+         sizeof(dense_classes) / sizeof(dense_classes[0]), 31337u, 600, true},
+        {empty_css, dense_classes,
+         sizeof(dense_classes) / sizeof(dense_classes[0]), 99u, 600, true},
+    };
+    for (size_t i = 0; i < sizeof(configs) / sizeof(configs[0]); i++)
+        CHECK(has_fuzz_run(budget, &configs[i]) == 0);
+    return 0;
+}
+
+/* A child leaving a parent restyles the parent's subtree, not its
+   parent's: siblings of the parent keep their cached styles, unless an
+   :empty test outside :has() lets the parent's children reach them. */
+static int test_children_invalidation_scope(Budget *budget)
+{
+    static const char *const sheets[] = {
+        ".box>span{color:#111111}p{color:#222222}",
+        ".box>span{color:#111111}p{color:#222222}"
+        ".box:empty + p{color:#abcdef}",
+        /* The removed child was the predecessor a sibling test reads. */
+        ".box>span{color:#111111}p{color:#222222}"
+        ".box>.y + * b{color:#abcdef}",
+    };
+    for (size_t variant = 0; variant < 3; variant++) {
+        static char html[8192];
+        int written = snprintf(html, sizeof(html),
+                               "<!doctype html><style>%s", sheets[variant]);
+        CHECK(written > 0 && (size_t) written < sizeof(html));
+        size_t length = (size_t) written;
+        for (unsigned i = 0; i < 64; i++) {
+            written = snprintf(html + length, sizeof(html) - length,
+                               ".pad%u{margin:0}", i);
+            length += (size_t) written;
+        }
+        written = snprintf(html + length, sizeof(html) - length,
+            variant == 2
+                ? "</style><body><div class=box id=box><span id=only class=y>"
+                  "x</span><div><b>bold</b></div></div><p>after</p>"
+                : "</style><body><div class=box id=box>"
+                  "<span id=only>x</span></div><p>after</p>");
+        length += (size_t) written;
+        for (unsigned i = 0; i < 40; i++) {
+            written = snprintf(html + length, sizeof(html) - length,
+                               "<p>p%u</p>", i);
+            length += (size_t) written;
+        }
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        ViewportContext viewport;
+        CHECK(document_parse(&document, budget, html, length, 19)
+            && viewport_context_init(&viewport, 480, 272, 480, 272)
+            && stylesheet_build_context(&sheet, budget, &document,
+                                        &viewport));
+        LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+        CHECK(reuse != NULL);
+        layout_reuse_cache_enable_retained_matches(reuse);
+        LayoutDocument retained = {0}, fresh = {0};
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        layout_destroy(&retained);
+        lxb_dom_node_t *box = find_id(document_body_node(&document), "box");
+        lxb_dom_node_t *only = find_id(document_body_node(&document), "only");
+        CHECK(box != NULL && only != NULL);
+        LayoutReuseStats before, after;
+        layout_reuse_cache_stats(reuse, &before);
+        if (variant == 2) {
+            const DrawCommand *bold = text_command(&retained, "bold");
+            CHECK(bold == NULL || bold->color == 0xabcdef);
+        }
+        layout_reuse_cache_retire_subtree(reuse, only);
+        lxb_dom_node_remove(only);
+        /* The journal names the removed child while it lives. */
+        layout_reuse_cache_invalidate_children(reuse, box, only, false);
+        BudgetAllocationOwner previous =
+            document_allocation_owner_enter(&document);
+        lxb_dom_node_destroy_deep(only);
+        document_allocation_owner_leave(&document, previous);
+        layout_reuse_cache_flush_invalidations(reuse);
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+            NULL, NULL, &viewport));
+        CHECK(commands_equal(&retained, &fresh));
+        const DrawCommand *command = text_command(&retained, "after");
+        CHECK(command != NULL
+              && command->color == (variant == 1 ? 0xabcdef : 0x222222));
+        if (variant == 2) {
+            command = text_command(&retained, "bold");
+            CHECK(command != NULL && command->color != 0xabcdef);
+        }
+        layout_reuse_cache_stats(reuse, &after);
+        /* Only the box restyles (with its children's subtrees when the
+           removed child fed a sibling test), or with :empty everything
+           under body. */
+        size_t misses = after.style_misses - before.style_misses;
+        if (variant == 1 ? misses < 40 : misses > 3) {
+            printf("children scope variant %zu: %zu misses\n", variant,
+                   misses);
+            CHECK(false);
+        }
+        layout_destroy(&retained);
+        layout_destroy(&fresh);
+        layout_reuse_cache_destroy(reuse);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* `.a:has(x) .b`: `x` appearing under `.a` changes `.b`, a descendant of
+   the anchor rather than one of the changed node's ancestors. And a
+   :has() rule no key or walk can place falls back to a counted wipe. */
+static int test_has_descendant_subject_and_fallback(Budget *budget)
+{
+    static const char *const sheets[] = {
+        ".a:has(.x) .b{color:#123456}",
+        ".a:has(.x) ~ *{color:#123456}",
+    };
+    for (size_t variant = 0; variant < 2; variant++) {
+        static char html[4096];
+        int written = snprintf(html, sizeof(html),
+                               "<!doctype html><style>%s", sheets[variant]);
+        CHECK(written > 0 && (size_t) written < sizeof(html));
+        size_t length = (size_t) written;
+        for (unsigned i = 0; i < 64; i++) {
+            written = snprintf(html + length, sizeof(html) - length,
+                               ".pad%u{margin:0}", i);
+            length += (size_t) written;
+        }
+        static const char rest[] =
+            "</style><body><div class=a><div id=slot>slot</div>"
+            "<p class=b>bee</p></div><p>after</p></body>";
+        memcpy(html + length, rest, sizeof(rest) - 1u);
+        length += sizeof(rest) - 1u;
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        ViewportContext viewport;
+        CHECK(document_parse(&document, budget, html, length, 19)
+            && viewport_context_init(&viewport, 480, 272, 480, 272)
+            && stylesheet_build_context(&sheet, budget, &document,
+                                        &viewport));
+        LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+        CHECK(reuse != NULL);
+        layout_reuse_cache_enable_retained_matches(reuse);
+        LayoutDocument retained = {0}, fresh = {0};
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        const char *probe = variant == 0 ? "bee" : "after";
+        const DrawCommand *command = text_command(&retained, probe);
+        CHECK(command != NULL && command->color != 0x123456);
+        layout_destroy(&retained);
+        LayoutReuseStats before, after;
+        layout_reuse_cache_stats(reuse, &before);
+        lxb_dom_node_t *slot = find_id(document_body_node(&document), "slot");
+        CHECK(slot != NULL);
+        lxb_dom_node_t *x = insert_style_element(&document, slot, NULL, "");
+        CHECK(x != NULL);
+        /* A <style> is not rendered; make it an ordinary .x element. */
+        CHECK(lxb_dom_element_set_attribute(
+            lxb_dom_interface_element(x), (const lxb_char_t *) "class", 5,
+            (const lxb_char_t *) "x", 1) != NULL);
+        layout_reuse_cache_invalidate_structure(reuse, x);
+        layout_reuse_cache_flush_invalidations(reuse);
+        CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+        CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+            NULL, NULL, &viewport));
+        command = text_command(&retained, probe);
+        CHECK(command != NULL && command->color == 0x123456);
+        CHECK(commands_equal(&retained, &fresh));
+        layout_reuse_cache_stats(reuse, &after);
+        if (variant == 0) {
+            CHECK(after.full_resets == before.full_resets
+                  && after.has_fallbacks == 0 && after.has_scoped == 1
+                  && after.has_dropped >= 1 && after.has_scans == 1);
+        } else {
+            /* Keyless and off the ancestor chain: every computed style
+               goes (the retained lists the rule can select are found by
+               matching it), counted, without a full reset. */
+            CHECK(after.full_resets == before.full_resets
+                  && after.has_fallbacks == 1 && after.has_scoped == 0);
+        }
+        layout_destroy(&retained);
+        layout_destroy(&fresh);
+        layout_reuse_cache_destroy(reuse);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 /* A <style> inserted into the head after load must yield the same styles as
    a sheet rebuilt from the final document: its rules take their document
    position (before the body's inline styles), earlier rule indices remap,
@@ -2764,8 +4236,14 @@ static int test_stylesheet_append_matches_rebuild(Budget *budget)
     layout_reuse_cache_note_stylesheet_appended(
         reuse, &appended, result.remap, result.old_count, result.appended,
         result.appended_count, true);
-    CHECK(reuse->has_rule_count == 1
-          && strcmp(appended.rules[reuse->has_rules[0]].selector,
+    /* The :has() plan follows the remapped rule ordinals. */
+    StyleHasPlanSummary plan[4];
+    bool plan_bounded = true;
+    CHECK(style_has_plan_summarize(&appended, plan, 4, &plan_bounded) == 1
+          && !plan_bounded
+          && plan[0].relation == STYLE_HAS_RELATION_OTHER
+          && plan[0].subject_keyed
+          && strcmp(appended.rules[plan[0].rule].selector,
                     ".flag:has(.inner) ~ .after") == 0);
     stylesheet_append_result_release(&appended, &result);
     /* Reference: a sheet built from the final document, no reuse. */

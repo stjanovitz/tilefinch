@@ -1893,6 +1893,19 @@ bool psp_ui_set_page_activation(PspUiState *ui, bool active)
     return changed;
 }
 
+bool psp_ui_finish_page_activation(PspUiState *ui, const char *receipt)
+{
+    if (ui == NULL) return false;
+    bool changed = psp_ui_set_page_activation(ui, false);
+    if (receipt != NULL && ui->toast_frames != 0
+        && strcmp(ui->status, receipt) == 0) {
+        ui->toast_frames = 0;
+        ui->toast_entry_frames = 0;
+        changed = true;
+    }
+    return changed;
+}
+
 void psp_ui_set_scroll(PspUiState *ui, int scroll_y, int maximum_scroll_y)
 {
     if (ui == NULL) return;
@@ -1938,6 +1951,22 @@ void psp_ui_keep_status(PspUiState *ui, const char *status,
         return;
     }
     /* Already showing: extend it without replaying the entry motion. */
+    if (ui->toast_frames < duration_frames)
+        ui->toast_frames = (uint16_t) (duration_frames > UINT16_MAX
+            ? UINT16_MAX : duration_frames);
+}
+
+void psp_ui_keep_progress_status(PspUiState *ui, const char *status,
+                                 size_t family_length,
+                                 unsigned duration_frames)
+{
+    if (ui == NULL || status == NULL) return;
+    if (ui->toast_frames == 0) {
+        psp_ui_show_status(ui, status, duration_frames);
+        return;
+    }
+    if (strncmp(ui->status, status, family_length) != 0) return;
+    copy_string(ui->status, sizeof(ui->status), status);
     if (ui->toast_frames < duration_frames)
         ui->toast_frames = (uint16_t) (duration_frames > UINT16_MAX
             ? UINT16_MAX : duration_frames);
@@ -8425,6 +8454,26 @@ void psp_ui_media_commit_seek(PspUiMediaState *media,
     psp_ui_media_show_controls(media);
 }
 
+void psp_ui_media_set_continuation(PspUiMediaState *media,
+                                   uint64_t position_us,
+                                   uint64_t duration_us, bool playing)
+{
+    if (media == NULL || !media->visible || duration_us == 0u) return;
+    media->duration_us = duration_us;
+    media->current_time_us =
+        position_us < duration_us ? position_us : duration_us;
+    media->playing = playing;
+    /* The control bar (not just its ground) is what a resolving player draws
+       while a seek is in progress, so the timeline and any highlight stay on
+       screen through the replacement open. */
+    media->seek_in_progress = true;
+    media->controls_enabled = true;
+    media->play_pause_enabled = true;
+    media->seek_enabled = true;
+    if (!media->seek_preview_active)
+        media_timeline_visual_set(media, media->current_time_us, true);
+}
+
 void psp_ui_media_cancel_seek_preview(PspUiMediaState *media)
 {
     if (media == NULL) return;
@@ -8513,8 +8562,13 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                same frame and caused a visible one-frame hitch on hardware. */
             media->controls_visible = false;
             media->controls_remaining_ms = 0u;
-        } else if (pressed & (PSP_UI_BUTTON_PAGE_UP
-                              | PSP_UI_BUTTON_PAGE_DOWN)) {
+        } else if ((pressed & (PSP_UI_BUTTON_PAGE_UP
+                               | PSP_UI_BUTTON_PAGE_DOWN))
+                   && presentation->audio_track_count != 0) {
+            /* Subtitles always list "Off"; Audio has entries only for a
+               video with alternate tracks. Switching onto an empty Audio
+               tab left a menu where Cross did nothing and every other
+               press (seeks included) was swallowed until Circle. */
             presentation->track_menu_tab ^= 1u;
             count = presentation->track_menu_tab == 0
                 ? presentation->audio_track_count

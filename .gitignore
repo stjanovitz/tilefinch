@@ -28,6 +28,8 @@
 PARAM.SFO
 /psp-validation/validation.txt
 fidelity/
+# Recorded HTTP traces for the performance journeys (benchmarks/perf-journeys.tsv).
+perf/
 benchmarks/node_modules/
 async-network-results/
 async-network-results-current/
@@ -39,9 +41,13 @@ __pycache__/
 # private work area, not in the public source tree.
 /docs/engineering/BROWSING_JOURNEYS.md
 /docs/engineering/RELEASE_*_CHECKS.md
+/.private-investigations/
 
 # Public trust records may be committed under trust/. Private signing
 # material never belongs in this repository.
 /trust/*.pem
 /trust/*.key
 /trust/private/
+
+# Local agent settings are machine-specific and may contain private paths.
+/.claude/

@@ -201,8 +201,12 @@ static bool runtime_evaluate_bootstrap_profiled(
        final "read" column is the serialized bytecode consumed from ROM by
        JS_ReadObject (QuickJS reports it as binary_object_size); it is not
        heap, and with ROM data the code itself is not either. */
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     JSMemoryUsage census_before;
-    if (trace) JS_ComputeMemoryUsage(runtime->runtime, &census_before);
+    if (trace) js_rt_heap_census(runtime, &census_before);
+#else
+    (void) trace;
+#endif
     uint64_t started = js_rt_monotonic_time_ns();
     BootstrapBytecodeResult restored = runtime_evaluate_bootstrap_bytecode(
         runtime, source, length, source_url, bytecode,
@@ -226,6 +230,7 @@ static bool runtime_evaluate_bootstrap_profiled(
         ? runtime->result.host_compile_total_us - compile_before : 0;
     js_rt_saturating_add_u64(bootstrap_total_us, total_us);
     js_rt_saturating_add_u64(bootstrap_compile_us, compile_us);
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     if (trace) {
         fprintf(stderr,
                 "javascript-startup-bootstrap name=\"%s\" bytes=%zu "
@@ -240,7 +245,7 @@ static bool runtime_evaluate_bootstrap_profiled(
                 restored == BOOTSTRAP_BYTECODE_EVALUATED ? "yes" : "no",
                 evaluated ? "yes" : "no");
         JSMemoryUsage census_after;
-        JS_ComputeMemoryUsage(runtime->runtime, &census_after);
+        js_rt_heap_census(runtime, &census_after);
 #define TILEFINCH_CENSUS_DELTA(field) \
         ((long long) (census_after.field - census_before.field))
         fprintf(stderr,
@@ -273,6 +278,7 @@ static bool runtime_evaluate_bootstrap_profiled(
                 TILEFINCH_CENSUS_DELTA(binary_object_size));
 #undef TILEFINCH_CENSUS_DELTA
     }
+#endif
     return evaluated;
 }
 
@@ -288,6 +294,7 @@ typedef enum {
     LAZY_BOOTSTRAP_CAPABILITIES,
     LAZY_BOOTSTRAP_INTL,
     LAZY_BOOTSTRAP_OPFS,
+    LAZY_BOOTSTRAP_TRAVERSAL,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -297,7 +304,8 @@ _Static_assert(LAZY_BOOTSTRAP_COUNT == SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT,
 typedef enum {
     LAZY_BOOTSTRAP_GLOBAL = 0,
     LAZY_BOOTSTRAP_CANVAS_PROTOTYPE,
-    LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE
+    LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE,
+    LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE
 } LazyBootstrapTarget;
 
 typedef struct {
@@ -388,7 +396,14 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"FileSystemSyncAccessHandle", LAZY_BOOTSTRAP_OPFS,
      LAZY_BOOTSTRAP_GLOBAL},
     {"getDirectory", LAZY_BOOTSTRAP_OPFS,
-     LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE}
+     LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE},
+    {"NodeFilter", LAZY_BOOTSTRAP_TRAVERSAL, LAZY_BOOTSTRAP_GLOBAL},
+    {"TreeWalker", LAZY_BOOTSTRAP_TRAVERSAL, LAZY_BOOTSTRAP_GLOBAL},
+    {"NodeIterator", LAZY_BOOTSTRAP_TRAVERSAL, LAZY_BOOTSTRAP_GLOBAL},
+    {"createTreeWalker", LAZY_BOOTSTRAP_TRAVERSAL,
+     LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE},
+    {"createNodeIterator", LAZY_BOOTSTRAP_TRAVERSAL,
+     LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE}
 };
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
@@ -405,6 +420,7 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_CAPABILITIES: return "Browser capabilities";
     case LAZY_BOOTSTRAP_INTL: return "Intl";
     case LAZY_BOOTSTRAP_OPFS: return "Origin-private file system";
+    case LAZY_BOOTSTRAP_TRAVERSAL: return "DOM traversal";
     default: return "Platform feature";
     }
 }
@@ -468,7 +484,9 @@ static JSValue runtime_lazy_bootstrap_target(
         return global;
     }
     const char *constructor_name = target == LAZY_BOOTSTRAP_CANVAS_PROTOTYPE
-        ? "HTMLCanvasElement" : "StorageManager";
+        ? "HTMLCanvasElement"
+        : target == LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE ? "Document"
+        : "StorageManager";
     JSValue constructor = JS_GetPropertyStr(
         context, global, constructor_name);
     JS_FreeValue(context, global);
@@ -505,6 +523,66 @@ static void runtime_remove_lazy_bootstrap_properties(
 static bool runtime_install_lazy_bootstrap_feature(
     ScriptRuntime *runtime, LazyBootstrapFeature feature);
 
+/* Trusted bootstrap attaches its native-readable state (see
+   ScriptRuntime.host_state) to this null-prototype object, which exists only
+   while that bootstrap evaluates. With `with_state`, `state` is a
+   Float64Array over host_state itself. */
+static bool runtime_define_host_channel(ScriptRuntime *runtime,
+                                        bool with_state)
+{
+    JSContext *context = runtime->context;
+    JSValue channel = JS_NewObjectProto(context, JS_NULL);
+    if (JS_IsException(channel)) return false;
+    if (with_state) {
+        JSValue buffer = JS_NewArrayBuffer(
+            context, (uint8_t *) runtime->host_state,
+            sizeof(runtime->host_state), NULL, NULL, false);
+        JSValueConst arguments[3] = { buffer, JS_UNDEFINED, JS_UNDEFINED };
+        JSValue state = JS_IsException(buffer) ? JS_EXCEPTION
+            : JS_NewTypedArray(context, 3, arguments,
+                               JS_TYPED_ARRAY_FLOAT64);
+        JS_FreeValue(context, buffer);
+        if (JS_IsException(state)
+            || JS_DefinePropertyValueStr(context, channel, "state", state,
+                                         0) < 0) {
+            JS_FreeValue(context, channel);
+            return false;
+        }
+    }
+    JSValue global = JS_GetGlobalObject(context);
+    bool defined = JS_DefinePropertyValueStr(
+        context, global, "__tilefinchHostChannel", channel,
+        JS_PROP_CONFIGURABLE) >= 0;
+    JS_FreeValue(context, global);
+    return defined;
+}
+
+/* Keep the record the bootstrap attached as `property` (when it did) and
+   remove the channel before author code can reach it. */
+static bool runtime_take_host_channel(ScriptRuntime *runtime,
+                                      const char *property, JSValue *slot)
+{
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    JSAtom atom = JS_NewAtom(context, "__tilefinchHostChannel");
+    JSValue channel = atom == JS_ATOM_NULL ? JS_UNDEFINED
+        : JS_GetProperty(context, global, atom);
+    JSValue value = JS_IsObject(channel)
+        ? JS_GetPropertyStr(context, channel, property) : JS_UNDEFINED;
+    if (JS_IsObject(value)) {
+        JS_FreeValue(context, *slot);
+        *slot = value;
+    } else {
+        JS_FreeValue(context, value);
+    }
+    JS_FreeValue(context, channel);
+    bool removed = atom != JS_ATOM_NULL
+        && JS_DeleteProperty(context, global, atom, 0) >= 0;
+    if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    JS_FreeValue(context, global);
+    return removed;
+}
+
 static bool runtime_load_lazy_bootstrap(
     ScriptRuntime *runtime, LazyBootstrapFeature feature)
 {
@@ -535,7 +613,8 @@ static bool runtime_load_lazy_bootstrap(
             && js_rt_install_function(
                 runtime->context, global,
                 "__tilefinchQueueCheckpointContinuation",
-                js_queue_checkpoint_continuation, 1);
+                js_queue_checkpoint_continuation, 1)
+            && runtime_define_host_channel(runtime, false);
         if (bridge_ready) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -553,6 +632,11 @@ static bool runtime_load_lazy_bootstrap(
                 runtime->context, global, bridge_atom, 0);
             JS_FreeAtom(runtime->context, bridge_atom);
         }
+        if (bridge_ready
+            && !runtime_take_host_channel(
+                   runtime, "indexedDBStats",
+                   &runtime->host_indexed_db_stats))
+            evaluated = false;
         JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_MOTION) {
         evaluated = runtime_evaluate_bootstrap_profiled(
@@ -694,6 +778,14 @@ static bool runtime_load_lazy_bootstrap(
                          browser_bootstrap_intl_bytecode),
             "<browser-intl-lazy>", &browser_bootstrap_intl_bytecode,
             false, trace, &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_TRAVERSAL) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_traversal,
+                         browser_bootstrap_traversal_bytecode),
+            "<browser-traversal-lazy>",
+            &browser_bootstrap_traversal_bytecode, false, trace,
+            &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_OPFS) {
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom bridge_atom = JS_NewAtom(
@@ -1425,6 +1517,8 @@ static ScriptRuntime *script_runtime_create_internal(
     host->budget = budget;
     host->page_scroll_apply = JS_UNDEFINED;
     host->page_scroll_flush = JS_UNDEFINED;
+    host->host_network_queue_stats = JS_UNDEFINED;
+    host->host_indexed_db_stats = JS_UNDEFINED;
     host->dispatch_at = JS_UNDEFINED;
     host->dispatch_handle = JS_UNDEFINED;
     host->dispatch_activation_handle = JS_UNDEFINED;
@@ -1574,17 +1668,36 @@ static ScriptRuntime *script_runtime_create_internal(
     JS_SetMaxStackSize(host->runtime, stack_limit);
     js_rt_runtime_arm_watchdog(host);
     JS_SetInterruptHandler(host->runtime, interrupt_handler, &host->watchdog);
+    if (script_profile_enabled()) {
+        /* Diagnostic only: a refused allocation leaves profiling off. */
+        host->profile = budget_calloc(budget, 1, sizeof(*host->profile));
+    }
+    JS_SetGCHook(host->runtime, script_runtime_gc_hook, host);
+    JS_SetLazyCompileHook(host->runtime, script_runtime_lazy_compile_hook,
+                          host);
+    /* The page runtime's thread owns the script split (script_split.h).
+       TILEFINCH_SCRIPT_SPLIT=0 leaves it off and =1 keeps the timed kinds
+       without the poll sample, to measure its own cost in one binary. */
+    {
+        const char *split_mode = getenv("TILEFINCH_SCRIPT_SPLIT");
+        bool split_off = split_mode != NULL && strcmp(split_mode, "0") == 0;
+        script_split_set_sampling(split_mode == NULL
+                                  || strcmp(split_mode, "1") != 0);
+        if (!split_off) script_split_set_enabled(true);
+    }
     host->promise_rejection_state.result = &host->result;
     JS_SetHostPromiseRejectionTracker(host->runtime,
                                       promise_rejection_tracker,
                                       &host->promise_rejection_state);
 
     host->context = JS_NewContext(host->runtime);
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     if (host->context != NULL
         && getenv("TILEFINCH_JS_TRAP_ALLOC_SIZE") != NULL) {
         budget_quickjs_pool_set_stack_dump_hook(
             js_rt_dump_interpreter_stack, host);
     }
+#endif
     if (host->context == NULL) {
         snprintf(result->error, sizeof(result->error), "could not create QuickJS context");
         JS_FreeRuntime(host->runtime);
@@ -1968,14 +2081,44 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchMatches",
                                        js_dom_matches, 2)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchClosest",
+                                       js_dom_closest, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchMakeFastGetter",
+                                       js_dom_make_fast_getter, 3)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchMakeFastMethod",
+                                       js_dom_make_fast_method, 4)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchNoteRemoteWrapper",
+                                       js_dom_note_remote_wrapper, 0)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchRelation",
                                        js_dom_relation, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchComparePosition",
                                        js_dom_compare_position, 2)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchIsAncestor",
+                                       js_dom_is_ancestor, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchSelectorsTestAttribute",
+                                       js_dom_selectors_test_attribute, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchNearestId",
+                                       js_dom_nearest_id, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchNextAncestorEntry",
+                                       js_dom_next_ancestor_entry, 3)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchIsConnected",
                                        js_dom_is_connected, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchRootNode",
+                                       js_dom_root_node, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchNodeOwner",
+                                       js_dom_node_owner, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchChildren",
                                        js_dom_children, 1)
@@ -1991,6 +2134,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchNamespaceURI",
                                        js_dom_namespace_uri, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchNodeIdentity",
+                                       js_dom_node_identity, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchParseColor",
                                        js_dom_parse_color, 1)
@@ -2060,6 +2206,12 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDescendants",
                                        js_dom_descendants, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchTraverse",
+                                       js_dom_traverse, 4)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchObserveParserInsertions",
+                                       js_dom_observe_parser_insertions, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchNamedElementIds",
                                        js_dom_named_element_ids, 0)
@@ -2131,6 +2283,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchHasParserFormOwners",
                                        js_dom_has_parser_form_owners, 0)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchDomVersion",
+                                       js_dom_version, 0)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchHeapRemaining",
                                        js_runtime_heap_remaining, 0)
                    && js_rt_install_function(host->context, global,
@@ -2143,8 +2298,20 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchComputedStyleGet",
                                        js_computed_style_get, 2)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchComputedStyleRead",
+                                       js_computed_style_read, 3)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchComputedStyleSupport",
                                        js_computed_style_support, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchTransitionSnapshot",
+                                       js_transition_snapshot, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchAttributeChangeMayAffectHas",
+                                       js_attribute_change_may_affect_has, 3)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchStyleReach",
+                                       js_style_reach, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchStyleSet",
                                        js_style_set, 3)
@@ -2233,6 +2400,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchCryptoRandomFill",
                                        js_crypto_random_fill, 1)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchPrefersDark",
+                                       js_prefers_dark_color_scheme, 0)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchDecodeUtf8Valid",
                                        js_utf8_decode_valid, 2)
                    && js_rt_install_function(host->context, global,
@@ -2253,6 +2423,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchBase64EncodeBytes",
                                        js_base64_encode_bytes, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchBase64EncodeLatin1",
+                                       js_base64_encode_latin1, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchBase64DecodeString",
                                        js_base64_decode_string, 1)
@@ -2483,6 +2656,10 @@ static ScriptRuntime *script_runtime_create_internal(
                 host, LAZY_BOOTSTRAP_INTL);
         }
         if (evaluated) {
+            evaluated = runtime_install_lazy_bootstrap_feature(
+                host, LAZY_BOOTSTRAP_TRAVERSAL);
+        }
+        if (evaluated) {
             bool expose_opfs = !host->bridge.opaque_origin
                 && host->bridge.document_url != NULL
                 && tilefinch_url_potentially_trustworthy(
@@ -2492,6 +2669,7 @@ static ScriptRuntime *script_runtime_create_internal(
                     host, LAZY_BOOTSTRAP_OPFS);
             }
         }
+        if (evaluated) evaluated = runtime_define_host_channel(host, true);
         if (evaluated) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 host, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -2661,6 +2839,10 @@ static ScriptRuntime *script_runtime_create_internal(
                 "<eval-source-diagnostic>");
         }
 #endif
+        if (evaluated) {
+            evaluated = runtime_take_host_channel(
+                host, "networkQueueStats", &host->host_network_queue_stats);
+        }
         /* platform.js retained private media-state helpers in bootstrap
            closures. Remove the temporary bridges before author code; native
            code has already captured their callable values. Worker installs
@@ -2803,6 +2985,7 @@ static ScriptRuntime *script_runtime_create_internal(
         script_runtime_destroy(host);
         return NULL;
     }
+    script_census_attach(host->runtime, budget);
     return host;
 }
 

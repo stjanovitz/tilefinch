@@ -44,8 +44,8 @@ The current qualification establishes these boundaries:
   errors, posts its verification response with HTTP 200, receives a Secure,
   HttpOnly `cf_clearance` cookie, and automatically navigates again with that
   cookie present.
-- The edge nevertheless returns another managed challenge. In the September
-  2026 qualification, five consecutive challenge documents—including the
+- The edge nevertheless returns another managed challenge. In that
+  qualification, five consecutive challenge documents—including the
   second managed challenge—completed their verification requests without a
   JavaScript or callback error, while the Secure/HttpOnly clearance cookie was
   retained and resent. Each follow-up still received a fresh challenge rather
@@ -53,6 +53,18 @@ The current qualification establishes these boundaries:
   and an immediate ECMAScript exception as the remaining cause; it does not
   prove which server-side risk signal or custom-engine policy declined the
   session.
+- A later re-observation found the edge escalating Tilefinch to
+  Turnstile's interactive checkbox (the widget posts `interactiveBegin`;
+  the parent's "Verification successful. Waiting for chatgpt.com to
+  respond" is template text shown while it waits for a person). Tilefinch
+  could not show that checkbox: three generic bugs hid it (width/height
+  hints mapped onto a `<div height="10 em">`, a shrink-wrapped grid that
+  ignored its implicit columns, and iframe snapshots painted at
+  display/frame scale and never re-taken after a resize). With those
+  fixed, the published force-interactive test sitekey renders like
+  Chromium and a click inside the frame completes it. Completing the real
+  checkbox is a human step: the lab must not click it, and whether the
+  edge then serves the application remains unobserved.
 - Chromium controlled through the browser lab reaches the ordinary ChatGPT
   application without being assigned this challenge, so it cannot provide an
   instruction-by-instruction control run. It remains useful for focused Web API
@@ -287,6 +299,147 @@ A page that sets `globalThis.pocSummary` has it printed as
 command and reference numbers in its header. It is a before/after comparison
 tool, not a gate.
 
+### Work vector (`tilefinch-work`)
+
+Host wall time does not transfer to the PSP's 333 MHz in-order MIPS core, so
+a faster lab run is **not acceptance evidence**. Iterate on deterministic
+work counts instead, and use PPSSPP (running the real PSP binary) and the
+device to calibrate what a unit of each costs there. One record carries
+them, printed identically by every tier:
+
+```text
+tilefinch-work: label=<mark> js.work_units=163959 js.polls=17 ... fetch.replay_served=1
+```
+
+- The lab prints it for `work [LABEL]`, after the tables of
+  `profile [LABEL]`, and once as `label=final` in the closing summary.
+- PSP validation builds print it at every input-script mark (label = mark
+  name), under PPSSPP and on the device
+  ([INPUT_SCRIPT_HARNESS.md](INPUT_SCRIPT_HARNESS.md)). Shipping PSP builds
+  compile the record and its tallies out.
+
+Every value is a plain integer count, or `n/a` for a counter the build does
+not compile. There are no timings in it; they stay in their existing lines.
+Field names are append-only. Counters are **cumulative for the current
+document**: the tallies and the session-wide relayout and replay counters
+are rebased when a navigation begins (`navigation_begin`; a cancelled
+navigation rebases too), and the `js.*`/`dom.*` fields belong to the
+committed page realm, which a commit replaces (a mark taken while a new
+document streams still reads the previous realm). Child-frame realms are
+not included. Subtract consecutive marks for the work between them.
+
+| Field | Counts | Source |
+| --- | --- | --- |
+| `js.work_units` | QuickJS interrupt budget consumed: one unit per interrupt check (calls, backward jumps, bounded compile and native loops), over every realm of the page runtime (workers included) | `JS_GetWorkCounters` (vendored engine) |
+| `js.polls` | interrupt-handler polls (one per 10,000 units per context) | same |
+| `js.gc_runs` | QuickJS collections (`JS_RunGC`, automatic or explicit) | same |
+| `js.calls` | bytecode function entries and resumes; `n/a` unless `PSP_BROWSER_JS_CALL_COUNTS` or `PSP_BROWSER_JS_OP_COUNTS` | same |
+| `js.bytecode_ops` | interpreter opcodes dispatched; op-count builds only | same |
+| `js.float64_boxes` | float64-tagged values the engine created (a boxed soft-float double on the PSP); op-count builds only | same |
+| `js.lazy_compiles`, `js.lazy_bytes` | lazy function bodies compiled on first call, and their source bytes | `JSLazyFunctionStats` |
+| `js.native_calls` | calls of profiled host natives; `n/a` unless the sampling profiler is on (`TILEFINCH_TRACE_JS_PROFILE=1` on the host; on by default in validation builds), since only it wraps natives | profiler native table |
+| `js.native.<name>` | the five most-called natives, by calls then registration order (profiler on only) | same |
+| `js.attribute_writes` | native `setAttribute` calls (not cleared by profile reports) | DOM bridge |
+| `js.allocs`, `js.alloc_bytes` | QuickJS allocator malloc + realloc calls and the bytes they requested | `budget_quickjs_pool_activity` |
+| `js.source_bytes` | script source admitted to the realm | script quota |
+| `js.module_compiles`, `js.module_restores` | modules compiled from source, and restored from cached bytecode | runtime result |
+| `dom.mutations` | native DOM mutations | runtime result |
+| `dom.mutation_records` | MutationRecords queued for observers | bootstrap `retentionStats` |
+| `dom.observer_visits` | observers examined per routed mutation | same |
+| `style.resolutions` | layout style resolutions, every pass (previews and cancelled passes included) | `LayoutContext` at release |
+| `style.cache_hits`, `style.cache_misses` | the split of those between the layout style cache and full resolution (see below) | same |
+| `style.rule_queries`, `style.rule_candidates` | rule-index lookups (layout and DOM style queries) and the rules they returned | stylesheet |
+| `style.var_lookups`, `style.var_cache_hits`, `style.var_cache_misses` | custom-property lookups and their cache outcome | stylesheet |
+| `style.selector_matches`, `style.selector_hits` | whole-selector match attempts (rule matching, `matches`/`querySelector`) and successes | selector matcher |
+| `layout.passes`, `layout.commands` | completed layout builds and the draw commands they produced | layout job |
+| `layout.fast_relayouts`, `layout.full_relayouts` | relayouts since the navigation began | `NavigationPerformance` |
+| `raster.tiles`, `raster.commands` | tiles rasterized and the draw commands drawn into them | tile cache |
+| `raster.glyph_misses` | tile-cache glyph cache misses | same |
+| `raster.frames` | frames composed | same |
+| `fetch.load_bytes` | response body bytes the page load pumped | load scheduler |
+| `fetch.image_bytes` | encoded image bytes loaded for the page | page image stats |
+| `fetch.replay_served` | trace-replay records served since the navigation began | `fetch_trace_replay_served_count` |
+| `parse.html_bytes` | HTML bytes fed to the streaming parser (`--fixture` pages bypass it) | document stream |
+| `parse.css_bytes` | CSS text bytes compiled (stylesheets and `<style>` elements) | stylesheet parser |
+
+What is and is not deterministic:
+
+- Identical execution gives an identical record. `tests/test_work_vector_determinism.py`
+  (`tilefinch-work-vector-determinism-tests`) runs a local fixture journey
+  and a `--deterministic-replay-seed` HTTP replay twice each and requires
+  identical vectors; 24 concurrent runs under load also matched.
+- `style.cache_hits`/`style.cache_misses` are keyed by node address, so their
+  split can move by one when allocation interleaving differs; compare
+  `style.resolutions` and pass `--ignore style.cache_` to `--check-equal`.
+- Page script that reads the clock can change behaviour between runs; use
+  `--deterministic-replay-seed` (seeded clock and random) for such pages.
+  Without it, `js.float64_boxes` can differ by a few (a timestamp that
+  happens to be integral is not boxed).
+- `--psp-profile strict|realistic` time-slices each advance (16 ms of host
+  time), so a slower or faster build (an op-count build, a code change)
+  splits tasks across turns differently and a busy page's vector moves by a
+  few percent even with a seed (chatgpt.com's send window: up to ~10% in
+  `js.work_units`). For A/B across builds, omit `--psp-profile` (the lab
+  execution profile has no slice) and pass the explicit memory limits; two
+  builds with identical page behaviour then print identical `js.*` fields.
+- Turning the profiler on changes `js.allocs`/`js.alloc_bytes` and a few
+  `js.work_units` (its reports and native wrappers): compare runs with the
+  same profiler setting.
+- On PPSSPP and the device, `raster.*` and relayout counts follow the frame
+  cadence (a slower target composes fewer frames per mark), and every
+  time-sliced step can split differently; the JS, style and parse fields are
+  the ones to calibrate across tiers. PSP tallies are 32-bit (a per-document
+  count wraps past 4G).
+
+`tools/work_vector_report.py` reads the records from any lab, PPSSPP or
+device log:
+
+```sh
+python3 tools/work_vector_report.py run.log                 # values per label
+python3 tools/work_vector_report.py --steps run.log         # mark-to-mark deltas
+python3 tools/work_vector_report.py before.log after.log    # B and B - A per label
+python3 tools/work_vector_report.py --check-equal --ignore style.cache_ a.log b.log
+```
+
+`--fields js.` narrows any mode to one group. `--check-equal` is the n=2
+determinism check: it exits 1 and lists every differing field unless both
+runs printed the same labels with the same values.
+`scripts/run-buffered-reply-replay.py` keeps each run's vectors in its
+manifest and prints how later runs differ from the first.
+
+**Opcode and float64 counts** are a permanent opt-in engine build, never
+timed (the counters sit in the interpreter dispatch and every float64
+construction). Configure a separate tree, and delete it when done (an
+in-tree directory that `CMakePresets.json` does not name needs the
+override):
+
+```sh
+cmake --preset release -B build-opcounts \
+  -DPSP_BROWSER_JS_OP_COUNTS=ON -DTILEFINCH_ALLOW_BUILD_DIR=ON
+cmake --build build-opcounts --target psp-browser-interactive-lab -j8
+```
+
+`PSP_BROWSER_JS_OP_COUNTS` defines `CONFIG_TILEFINCH_OP_COUNTS` for the
+engine only: `js.calls`, `js.bytecode_ops` and `js.float64_boxes` then read
+numbers instead of `n/a`; every other field is unchanged. The default build
+compiles none of it. Call counts alone come from `PSP_BROWSER_JS_CALL_COUNTS`
+builds (which also fill the profiler's per-function calls table).
+
+An op-count engine also keeps a per-opcode dispatch histogram. With
+`TILEFINCH_JS_OPCODE_HISTOGRAM=1` every `work`/`profile` record is followed
+by `tilefinch-opcodes: label=L op=NAME count=N` lines (cumulative, most
+frequent first); subtract consecutive labels for a window's opcode mix.
+
+**Engine micro-benchmark.** `tilefinch-js-bench` (host) and boot.cfg
+`validation_js_bench=N` (PSP validation build; see the input-script
+harness) run the same synthetic kernels, collection, and compile of a trace's
+JavaScript records, each timed on the platform clock with the engine's work
+counters, and print `tilefinch-js-bench:` lines. `tools/js_bench_compare.py
+host=A ppsspp=B device=C` joins reports into ratio tables: a PPSSPP column
+over the host is the instruction-count ratio, a device column over PPSSPP the
+effective CPI. The host tool's `--only a,b`, `--scale N`, `--repeat R` and
+`--trace DIR` select kernels, iterations, best-of repeats and the trace.
+
 `psp-browser-interactive-lab` exercises the persistent layers together. It retains JavaScript and session state, can advance the bounded timer clock, load quota-controlled same-origin scripts, repeat navigation to exercise HTTP validators and the script cache, drive controller focus/edit/activation, follow GET/POST form actions, and render the resulting page:
 
 `--forced-dark` enables the same role-aware page-color mapping used by the PSP
@@ -294,10 +447,16 @@ night mode. It is intended for deterministic visual captures: page surfaces
 and text are remapped while image pixels remain untouched.
 
 For URL navigation, the persistent lab owns the same bounded external
-stylesheet and image pipeline as the static renderer: at most 6 stylesheets
-(768 KiB total, 256 KiB each) and 12 images (1.5 MiB encoded total, 384 KiB
-each, 3 MiB decoded) with a 15-second per-resource timeout. Resource counts and
-bytes are printed in the final status. Page-owned assets are destroyed on
+stylesheet and image pipeline as the static renderer: at the default 24 MiB
+limit, at most 24 stylesheets (2,112 KiB total, 768 KiB each) and 24 images
+(1.5 MiB encoded total, 512 KiB each, 3 MiB decoded) with a 15-second
+per-resource timeout; a limit of 16 MiB or less with adaptive resources
+tightens those to 4 stylesheets (512 KiB total, 192 KiB each) and 12 images
+(768 KiB encoded, 256 KiB each, 1.5 MiB decoded). `<link rel=preload
+as=style>` responses use a separate lane (the same count, half the stylesheet
+byte total), so preloads can never refuse an active stylesheet; an active link
+for the same URL, mode and credentials replays the preloaded body and takes
+over its charge. Resource counts and bytes are printed in the final status. Page-owned assets are destroyed on
 navigation and reloaded after a DOM relayout; the user stylesheet is retained
 as a session-level cascade layer instead of being lost on that rebuild.
 
@@ -379,6 +538,32 @@ loop frames; page display lists and cached tiles remain untouched. Use
 `--no-loop-capture` to keep rendering and cache telemetry active without
 retaining every intermediate PPM. The `mark-steady` command starts retained
 memory min/max/growth sampling for long-session plateau checks.
+The `script-report` command prints the JavaScript heap census and the
+compile/restore counters of the page that is live at that point; the
+post-load report covers only the first document of a page that reloads itself.
+`--module-bytecode-cache-kb N` overrides the in-memory module bytecode ceiling
+(0 disables it); `--reload 1` loads the page twice through the engine, which
+is how a revisit's restores are measured.
+`--module-cache-dir DIR` adds the persistent tier: modules missing from the
+in-memory cache are restored from files in `DIR` when their key matches;
+`--module-cache-write` also stores newly compiled modules there (never
+overwriting a file). The two runs of a cold/warm comparison use the same
+`DIR`, the first with `--module-cache-write`. Directory accounting visits at
+most eight entries per maintenance slice (2 ms soft time limit, 4,096 entries
+total). Writes wait for accounting to finish; idle work continues the scan
+after presentation/resource work. Compilation never removes entries: a full
+cache (a maximum-size module might not fit, or 512 files) declines the write,
+and idle maintenance then removes this build's oldest records by
+modification time, eight per slice, until the directory is at or under 75%
+of both ceilings, rescanning for the next sixteen candidates as needed. A
+scan that fails or reaches the entry limit defers writes and is retried
+after 64 idle slices, doubling to 4,096. Only the tier's own file names are
+ever removed, and a read-only tier removes nothing. Explicit cache clearing is
+bounded by the same total-entry limit and reports incomplete removal. The
+`javascript-module-bytecode-disk` report line times the whole synchronous
+disk path (`load-us`, split into `read-us` and `verify-us`) apart from
+deserialization (`restore-us` on the line above) and the copy into RAM
+(`promote-us`); compare cold/warm runs by those, not `restore-us` alone.
 `--no-progressive-first-paint` provides a same-build control for measuring the
 provisional first-viewport tradeoff; final rendering and resource policy are
 unchanged.
@@ -439,7 +624,7 @@ paint, and clean pressure rejection without making live requests:
 
 ```sh
 ./benchmarks/run-streaming-corpus.sh \
-  build-bellard-clean-current \
+  build-preset-release \
   /path/to/streaming-corpus \
   /tmp/streaming-corpus
 ```

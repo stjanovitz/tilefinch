@@ -91,7 +91,9 @@ static bool loop_render(BrowserEngine *engine, TileCache *cache,
     }
     uint64_t focus_started = interaction_now_us();
     int x = 0, y = 0, width = 0, height = 0;
-    if (controller_focused_rect(controller, &x, &y, &width, &height)) {
+    (void) controller;
+    if (browser_engine_focus_indicator_rect(
+            engine, &x, &y, &width, &height)) {
         const LayoutDocument *layout = &navigation->page.layout;
         int visual_x = viewport_css_to_device(&layout->viewport, x);
         int visual_y = viewport_css_to_device(
@@ -1051,14 +1053,14 @@ static void loop_help(void)
          "history-controls, "
          "anchor ID, node-text ID, node-attribute ID NAME, "
          "tap X Y, cross|activate, "
-         "type TEXT, backspace, "
+         "type TEXT, backspace, profile [LABEL], work [LABEL], "
          "click SELECTOR, tick [COUNT [MS]], "
          "drain [MAX-TURNS [SETTLE-MS]], "
          "media-status|media-play|media-pause|media-seek SECONDS|"
          "media-open|media-close|media-run [COUNT [MS]], "
          "reader-on|reader-off, "
          "go URL, reload, "
-         "back|circle, forward, mark-steady, help, quit");
+         "back|circle, forward, mark-steady, script-report, help, quit");
     puts("PSP aliases: dpad-up/down scroll, dpad-left/right move focus, "
          "ltrigger goes back, rtrigger goes forward, cross activates");
 }
@@ -1297,10 +1299,18 @@ static bool run_command_loop(FILE *commands, bool interactive,
     loop_print_status(controller, cache, frame_number++);
     if (interactive) loop_help();
 
+    /* A pointer click on anything but a text field completes through the
+       ordinary activation, as on the PSP, so submit buttons submit. */
+    bool pointer_activation_pending = false;
     while (true) {
-        if (interactive) { fputs("psp> ", stdout); fflush(stdout); }
-        if (fgets(scratch->input, sizeof(scratch->input), commands) == NULL)
-            break;
+        if (pointer_activation_pending) {
+            pointer_activation_pending = false;
+            snprintf(scratch->input, sizeof(scratch->input), "activate");
+        } else {
+            if (interactive) { fputs("psp> ", stdout); fflush(stdout); }
+            if (fgets(scratch->input, sizeof(scratch->input), commands)
+                == NULL) break;
+        }
         char *line = trim_line(scratch->input);
         if (line[0] == '\0' || line[0] == '#') continue;
         uint64_t input_started = interaction_now_us();
@@ -1330,6 +1340,44 @@ static bool run_command_loop(FILE *commands, bool interactive,
         if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) break;
         else if (strcmp(line, "help") == 0) { loop_help(); changed = false; }
         else if (strcmp(line, "status") == 0) changed = false;
+        else if (strcmp(line, "script-report") == 0) {
+            /* JavaScript heap and compile census for the page that is live
+               now. The post-load report printed before the loop covers only
+               the first document; a page that reloads itself during startup
+               needs this to measure its replacement document. */
+            const ScriptResult *js = &navigation->page.script_result;
+            printf("script-report loads=%zu runtime=%s\n",
+                   navigation->loads_committed,
+                   navigation->page.runtime == NULL ? "none" : "live");
+            if (navigation->page.runtime != NULL) {
+                script_runtime_report_memory(navigation->page.runtime,
+                                             stdout);
+            }
+            printf("script-modules compiled=%zu compile-us=%llu "
+                   "restored=%zu restore-us=%llu misses=%zu stores=%zu "
+                   "skips=%zu restore-failures=%zu\n",
+                   js->module_compile_count, js->module_compile_us,
+                   js->module_bytecode_cache_hits,
+                   js->module_bytecode_restore_us,
+                   js->module_bytecode_cache_misses,
+                   js->module_bytecode_cache_stores,
+                   js->module_bytecode_cache_admission_skips,
+                   js->module_bytecode_cache_restore_failures);
+            printf("script-compile attempts=%zu source-bytes=%zu "
+                   "total-us=%llu inline=%llu external=%llu module=%llu "
+                   "max-us=%llu max-bytes=%zu\n",
+                   js->host_compile_attempts, js->host_compile_source_bytes,
+                   (unsigned long long) js->host_compile_total_us,
+                   (unsigned long long) js->compile_us[
+                       SCRIPT_COMPILE_SOURCE_INLINE],
+                   (unsigned long long) js->compile_us[
+                       SCRIPT_COMPILE_SOURCE_EXTERNAL],
+                   (unsigned long long) js->compile_us[
+                       SCRIPT_COMPILE_SOURCE_MODULE],
+                   (unsigned long long) js->max_nonpreemptible_compile_us,
+                   js->max_nonpreemptible_compile_bytes);
+            changed = false;
+        }
         else if (strcmp(line, "mark-steady") == 0) {
             steady = true;
             steady_min = steady_max = budget->current;
@@ -1615,9 +1663,14 @@ static bool run_command_loop(FILE *commands, bool interactive,
                         &activate_pointer, &page_changed)
                     && browser_engine_pointer_event(
                         engine, CONTROLLER_POINTER_UP, (int) x, (int) y,
-                        &activate_pointer, &page_changed)
-                    && (!activate_pointer
-                        || browser_engine_pointer_commit_click(engine));
+                        &activate_pointer, &page_changed);
+                if (ok && activate_pointer) {
+                    ControllerTextInputInfo text_info = {0};
+                    if (browser_engine_text_input_info(engine, &text_info)
+                        && text_info.editable)
+                        ok = browser_engine_pointer_commit_click(engine);
+                    else pointer_activation_pending = true;
+                }
             } else {
                 ok = navigation_dispatch_event(
                     navigation, argument, "click");
@@ -1625,6 +1678,19 @@ static bool run_command_loop(FILE *commands, bool interactive,
         } else if (strcmp(line, "type") == 0 && argument != NULL) {
             ok = browser_engine_insert_text(
                 engine, argument, strlen(argument));
+        } else if (strcmp(line, "profile") == 0) {
+            /* Print and clear the page realm's sampling profile (enable
+               with TILEFINCH_TRACE_JS_PROFILE=1), then the work record. */
+            script_runtime_profile_report(navigation->page.runtime,
+                                          argument == NULL ? "lab" : argument);
+            tilefinch_work_print(argument == NULL ? "lab" : argument,
+                                 navigation);
+            ok = true;
+        } else if (strcmp(line, "work") == 0) {
+            /* The deterministic work record (LAB_USAGE.md, "Work vector"). */
+            tilefinch_work_print(argument == NULL ? "lab" : argument,
+                                 navigation);
+            ok = true;
         } else if (strcmp(line, "backspace") == 0) {
             ok = browser_engine_backspace(engine);
         } else if (strcmp(line, "js") == 0 && argument != NULL) {
@@ -1675,6 +1741,46 @@ static bool run_command_loop(FILE *commands, bool interactive,
                         &media_changed);
                 }
             }
+        } else if (strcmp(line, "idle") == 0) {
+            /* One page-idle turn at a time, so a script can place the
+               reader between turns (for example a provisional page's
+               layout extensions while paging). */
+            unsigned count = argument == NULL
+                ? 1u : (unsigned) strtoul(argument, NULL, 10);
+            if (count == 0 || count > 10000) count = 1;
+            for (unsigned i = 0; ok && i < count; i++) {
+                bool visual_changed = false;
+                ok = browser_engine_run_idle_work(engine, &visual_changed);
+            }
+            printf("idle provisional=%d limit=%d height=%d "
+                   "extensions=%zu completions=%zu relayouts=%zu "
+                   "relayout-us=%llu\n",
+                   navigation->page.layout_provisional ? 1 : 0,
+                   navigation->page.layout.content_limit_y,
+                   navigation->page.layout.height,
+                   navigation->performance.provisional_extensions,
+                   navigation->performance.provisional_completions,
+                   navigation->incremental_relayouts,
+                   (unsigned long long)
+                       navigation->performance.relayout_us);
+            const LayoutPerformance *performance =
+                &navigation->page.layout.performance;
+            printf("idle-layout total=%lluus root=%lluus flow=%lluus "
+                   "style=%lluus/%llu hits=%llu misses=%llu bidi=%lluus "
+                   "compact=%lluus paint-order=%lluus spatial=%lluus "
+                   "finalize=%lluus\n",
+                   (unsigned long long) performance->total_us,
+                   (unsigned long long) performance->root_style_us,
+                   (unsigned long long) performance->flow_us,
+                   (unsigned long long) performance->style_resolve_us,
+                   (unsigned long long) performance->style_resolutions,
+                   (unsigned long long) performance->style_cache_hits,
+                   (unsigned long long) performance->style_cache_misses,
+                   (unsigned long long) performance->bidi_us,
+                   (unsigned long long) performance->compact_us,
+                   (unsigned long long) performance->paint_order_us,
+                   (unsigned long long) performance->spatial_index_us,
+                   (unsigned long long) performance->finalize_us);
         } else if (strcmp(line, "drain") == 0) {
             unsigned maximum = 2048, settle_ms = 750;
             if (argument != NULL) {

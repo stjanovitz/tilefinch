@@ -30,6 +30,13 @@ without an updater trust root is always a deliberate choice:
                        exported by the offline key ceremony
   --no-update-root     build with the in-app updater disabled
 
+Exactly one of the following two options is also required: releases ship
+with a JavaScript engine built from a profile of the current engine
+(scripts/train-quickjs-pgo.sh), and leaving it out must be deliberate:
+  --quickjs-pgo DIR    build QuickJS with that profile (configure refuses a
+                       profile trained on a different engine build)
+  --no-quickjs-pgo     build QuickJS without profile feedback
+
 Optional update-channel overrides (defaults come from CMakeLists.txt):
   --update-owner NAME  GitHub owner the device fetches releases from
   --update-repo NAME   GitHub repository the device fetches releases from
@@ -55,6 +62,8 @@ update_root=
 update_root_choice=
 update_owner=
 update_repo=
+pgo_dir=
+pgo_choice=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --update-root)
@@ -65,6 +74,16 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-update-root)
             update_root_choice=none
+            shift
+            ;;
+        --quickjs-pgo)
+            [ "$#" -ge 2 ] || usage
+            pgo_dir=$2
+            pgo_choice=profile
+            shift 2
+            ;;
+        --no-quickjs-pgo)
+            pgo_choice=none
             shift
             ;;
         --update-owner)
@@ -100,6 +119,13 @@ printf '%s\n' "$sequence" | grep -Eq '^[1-9][0-9]*$' \
     || fail "RELEASE_SEQUENCE must be a positive integer, got: $sequence"
 [ -n "$update_root_choice" ] \
     || fail "pass --update-root FILE or an explicit --no-update-root"
+[ -n "$pgo_choice" ] \
+    || fail "pass --quickjs-pgo DIR or an explicit --no-quickjs-pgo"
+if [ "$pgo_choice" = profile ]; then
+    [ -f "$pgo_dir/PROVENANCE" ] \
+        || fail "no PROVENANCE in the QuickJS profile directory: $pgo_dir"
+    pgo_dir=$(CDPATH= cd -- "$pgo_dir" && pwd)
+fi
 if [ "$update_root_choice" = root ]; then
     [ -f "$update_root" ] \
         || fail "update root does not exist: $update_root"
@@ -218,6 +244,13 @@ else
     printf '%s\n' "NOTE: building WITHOUT an update trust root. This build \
 cannot verify or install in-app updates; users of it must update by \
 manually replacing the installation." >&2
+fi
+if [ "$pgo_choice" = profile ]; then
+    set -- "$@" "-DPSP_BROWSER_QUICKJS_PGO_USE=$pgo_dir"
+else
+    printf '%s\n' "NOTE: building the JavaScript engine WITHOUT profile \
+feedback (about 2 s slower to first usable input and 5 s slower to the \
+first chatgpt.com answer on a PSP-3000)." >&2
 fi
 if [ -n "$update_owner" ]; then
     set -- "$@" "-DTILEFINCH_UPDATE_REPOSITORY_OWNER=$update_owner"

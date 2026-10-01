@@ -54,6 +54,49 @@ typedef struct {
     size_t source_action_count;
 } DocumentBodySnapshot;
 
+/* MutationObserver records for nodes the HTML parser inserts. While an
+   observer can see childList changes (armed), each parser insertion into the
+   connected tree is journaled in order with its insertion-time siblings; the
+   script runtime turns the journal into childList records at the microtask
+   checkpoint the parser performs before a parser-blocking script, and once
+   more after EOF. Nothing is recorded and nothing is allocated while unarmed.
+
+   The journal is bounded. Past DOCUMENT_PARSER_INSERTION_LIMIT entries an
+   insertion is folded into a subtree root {parent, first}: "parent gained
+   the children from first onward, and anything inside them". Because the
+   tree builder only appends to open elements, every later insertion under
+   that parent is covered. A root is delivered as one record per child of the
+   run (within the same limit), or, past it, as a record naming the parent
+   itself as added so a subtree scan still reaches everything. When the root
+   slots run out they collapse into one root at the common ancestor. */
+#define DOCUMENT_PARSER_INSERTION_LIMIT 256u
+#define DOCUMENT_PARSER_INSERTION_ROOT_LIMIT 16u
+
+typedef struct {
+    lxb_dom_node_t *parent;
+    lxb_dom_node_t *node;
+    lxb_dom_node_t *previous;
+    lxb_dom_node_t *next;
+} DocumentParserInsertion;
+
+typedef struct {
+    lxb_dom_node_t *parent;
+    lxb_dom_node_t *first;
+} DocumentParserInsertionRoot;
+
+typedef struct {
+    DocumentParserInsertion *entries;
+    size_t count;
+    size_t capacity;
+    DocumentParserInsertionRoot roots[DOCUMENT_PARSER_INSERTION_ROOT_LIMIT];
+    size_t root_count;
+    /* Cumulative diagnostics: insertions journaled exactly, and insertions
+       that could only be reported through a coalesced subtree root. */
+    size_t recorded;
+    size_t coalesced;
+    bool armed;
+} DocumentParserInsertionJournal;
+
 typedef enum {
     DOCUMENT_GLYPH_SCRIPT_HAN = 1u << 0,
     DOCUMENT_GLYPH_SCRIPT_JAPANESE = 1u << 1,
@@ -133,6 +176,7 @@ typedef struct {
        spelling without acquiring browser-chrome activation semantics. */
     lxb_dom_node_t *declared_video_card_node;
     lxb_dom_node_t *reader_declared_video_card_node;
+    DocumentParserInsertionJournal parser_insertions;
 } PocDocument;
 
 static inline bool document_is_declared_video_card(
@@ -189,6 +233,7 @@ typedef struct {
     bool scripting_enabled;
     bool active;
     bool failed;
+    bool input_ended;
 } DocumentParser;
 
 bool document_parser_begin(DocumentParser *parser, Budget *budget);
@@ -213,8 +258,23 @@ bool document_parser_feed(DocumentParser *parser, const char *data,
 void document_parser_set_element_closed_callback(
     DocumentParser *parser, DocumentElementClosedCallback callback,
     void *opaque);
+/* Deliver EOF to the tree builder without finalizing, so a caller can run a
+   last parser mutation checkpoint over the insertions EOF performs while the
+   document is still parser-owned. document_parser_finish does this itself
+   when the caller has not. */
+bool document_parser_end_input(DocumentParser *parser);
 bool document_parser_finish(DocumentParser *parser, PocDocument *document);
 void document_parser_abort(DocumentParser *parser);
+
+/* Parser-insertion journal (see DocumentParserInsertionJournal). Arming is
+   cheap and idempotent; disarming releases the journal. Clearing keeps the
+   armed state and capacity for the next checkpoint. Any native destruction
+   of a detached subtree must discard it from the journal first. */
+void document_parser_insertions_arm(PocDocument *document, bool armed);
+bool document_parser_insertions_pending(const PocDocument *document);
+void document_parser_insertions_clear(PocDocument *document);
+void document_parser_insertions_discard_subtree(PocDocument *document,
+                                                lxb_dom_node_t *root);
 
 /* Scope raw Lexbor mutations to the document that owns the resulting DOM
    allocations. Callers which mutate parser.document outside parser APIs must
@@ -223,6 +283,35 @@ BudgetAllocationOwner document_allocation_owner_enter(
     const PocDocument *document);
 void document_allocation_owner_leave(const PocDocument *document,
                                      BudgetAllocationOwner previous_owner);
+
+/* Host-side style inputs.
+ *
+ * Script DOM writes reach style caches as the bridge's mutation notes. Every
+ * other DOM change (parser, controller, reader mode, native media cards, ...)
+ * advances this process-wide generation instead: page documents route their
+ * Lexbor insertion, removal and attribute callbacks through it, parser input
+ * advances it per fed chunk, and a host input that changes computed style
+ * without touching the DOM calls document_style_changed() directly. Caches
+ * that outlive one script entry key on it. Monotonic; only equality means
+ * "nothing changed". */
+uint64_t document_style_generation(void);
+void document_style_changed(void);
+/* Lexbor writes between these do not advance the generation: the script
+   bridge journals its own writes as mutation notes, and a probe that
+   restores what it changed leaves nothing to see. Nesting is allowed. An
+   unbracketed write is still correct, only conservative. */
+void document_style_quiet_begin(void);
+void document_style_quiet_end(void);
+/* Called for every node Lexbor removes from its parent, including each node
+   of a subtree being destroyed, whatever the cause. A style cache keyed by
+   node address evicts the node here, before the address can be reused.
+   Bounded: registration fails when every slot is taken. */
+typedef void (*DocumentNodeRemovalListener)(void *opaque,
+                                            const lxb_dom_node_t *node);
+bool document_node_removal_listen(DocumentNodeRemovalListener listener,
+                                  void *opaque);
+void document_node_removal_unlisten(DocumentNodeRemovalListener listener,
+                                    void *opaque);
 
 bool document_parse(PocDocument *document, Budget *budget,
                     const char *html, size_t html_length, size_t chunk_size);

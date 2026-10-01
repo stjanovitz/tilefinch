@@ -1540,12 +1540,14 @@ static inline bool psp_media_first_frame_pending(
    first retained frame starts just over half a frame later, the ordinary due
    test would reject it forever and both decoded slots would fill. Admit only
    the already-decoded head, only while a floor is active; the caller releases
-   the floor as soon as that frame is claimed. */
+   the floor as soon as that frame is claimed. A floor at 0 is still a floor:
+   after a backward reopen to the start, B-frame reordering puts the first
+   picture at one frame period, and without the lend it was never due. */
 static inline uint64_t psp_media_seek_take_clock_us(
-    uint64_t clock_us, uint64_t floor_us,
+    uint64_t clock_us, bool floor_active,
     bool have_ready_frame, uint64_t ready_frame_us)
 {
-    return floor_us != 0 && have_ready_frame && ready_frame_us > clock_us
+    return floor_active && have_ready_frame && ready_frame_us > clock_us
         ? ready_frame_us : clock_us;
 }
 

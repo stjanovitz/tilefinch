@@ -493,6 +493,17 @@ static bool parse_color_number(const char **cursor, double *number,
                                bool *percent)
 {
     skip_color_separator(cursor);
+    /* CSS Color 4 "missing" component. It renders as zero; lightningcss
+       and other build tools emit it for achromatic oklch() hues
+       ("oklch(99.1% 0 none)"), which ChatGPT's whole palette uses. */
+    if (strncasecmp(*cursor, "none", 4) == 0
+        && !isalnum((unsigned char) (*cursor)[4])
+        && (*cursor)[4] != '-' && (*cursor)[4] != '_') {
+        *cursor += 4;
+        *number = 0.0;
+        *percent = false;
+        return true;
+    }
     char *end = NULL;
     *number = strtod(*cursor, &end);
     if (end == *cursor) return false;

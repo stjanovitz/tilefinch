@@ -1,0 +1,4 @@
+# Ends a validation_js_bench run: the benchmark ran before this script
+# was armed, so one frame closes the run with a complete outcome.
+wait 1
+end

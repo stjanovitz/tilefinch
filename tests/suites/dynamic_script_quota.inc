@@ -540,7 +540,11 @@ static bool test_oversized_resource_loader_envelope_is_segmented(
     REQUIRE(recognized != NULL && invalid != NULL && unrecognized != NULL);
     char *invalid_statement = strstr(invalid, "segmentEvents.push('two')");
     REQUIRE(invalid_statement != NULL);
-    static const char invalid_syntax[] = "const = 1";
+    /* An error the load itself reports, a malformed number (the scan of a
+       lazily compiled body rejects it too). An error that only a full
+       parse finds, such as "const = 1", is reported by this function's
+       first call when lazy bodies are preparsed. */
+    static const char invalid_syntax[] = "x = 10in []";
     size_t invalid_statement_length = strlen("segmentEvents.push('two')");
     memcpy(invalid_statement, invalid_syntax, sizeof(invalid_syntax) - 1);
     memset(invalid_statement + sizeof(invalid_syntax) - 1, ' ',

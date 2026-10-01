@@ -72,6 +72,111 @@ bool script_runtime_deterministic_replay_diagnostics(
     return true;
 }
 
+/* The scheduler's clock as the pump would read it now. */
+static double runtime_timer_now_ms(ScriptRuntime *runtime)
+{
+    const double *state = runtime->host_state;
+    double now = state[SCRIPT_HOST_STATE_NOW];
+    if (state[SCRIPT_HOST_STATE_SAMPLED_CLOCK] != 0) {
+        double sample = js_rt_scheduler_sample(&runtime->bridge);
+        if (sample >= now) now = sample;
+    }
+    return now;
+}
+
+/* Whether the pump would find a due timer, from the wheel size, head and
+   clock scheduler.js publishes in host_state: the timers are sorted by due
+   time, so an idle head means an idle wheel whatever the visibility. The
+   sampled clock is read exactly as __tilefinchSchedulerNow reports it, just
+   before the pump would have read it: a deadline falling in that gap runs
+   on the next turn, like one falling just after the pump. */
+static bool runtime_timer_due(ScriptRuntime *runtime)
+{
+    const double *state = runtime->host_state;
+    if (state[SCRIPT_HOST_STATE_TIMERS] == 0) return false;
+    return state[SCRIPT_HOST_STATE_EARLIEST_DUE]
+        <= runtime_timer_now_ms(runtime);
+}
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+static bool runtime_timer_is_frame_callback(double kind)
+{
+    return kind >= SCRIPT_HOST_TIMER_ANIMATION_FRAME
+        && kind <= SCRIPT_HOST_TIMER_RENDER_FIXUP;
+}
+#endif
+
+/* Fetch responses this realm delivers whose results are complete. */
+static size_t runtime_responses_ready(const ScriptRuntime *runtime)
+{
+    const DomBridge *bridge = &runtime->bridge;
+    size_t ready = 0;
+    for (size_t i = 0; i < bridge->async_fetch_count; i++) {
+        if (fetch_scheduler_request_complete(
+                bridge->fetch_scheduler, bridge->async_fetches[i].id))
+            ready++;
+    }
+    return ready;
+}
+
+/* The earliest task's deadline minus the scheduler's now, in ms: a due
+   frame callback (requestAnimationFrame and the observer frames) waits
+   for the next rendering opportunity, a due task does not, and one at the
+   head must not hide the other. */
+static double runtime_task_due_in_ms(ScriptRuntime *runtime)
+{
+    const double *state = runtime->host_state;
+    if (state[SCRIPT_HOST_STATE_TIMERS] == 0) return 1e300;
+    return state[SCRIPT_HOST_STATE_EARLIEST_TASK_DUE]
+        - runtime_timer_now_ms(runtime);
+}
+
+bool script_runtime_task_runnable(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->runtime == NULL) return false;
+    if (js_rt_runtime_checkpoint_pending(runtime)
+        || js_rt_dynamic_classic_continuation_pending(runtime))
+        return true;
+    if (runtime_task_due_in_ms(runtime) <= 0) return true;
+    return runtime_responses_ready(runtime) != 0;
+}
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+bool script_runtime_runnable_state(ScriptRuntime *runtime,
+                                   ScriptRunnableState *state)
+{
+    if (state == NULL) return false;
+    *state = (ScriptRunnableState) {0};
+    if (runtime == NULL || runtime->runtime == NULL) return false;
+    const double *host = runtime->host_state;
+    double timers = host[SCRIPT_HOST_STATE_TIMERS];
+    state->timers = timers > 0 ? (size_t) timers : 0u;
+    if (state->timers != 0) {
+        double due_in_ms = host[SCRIPT_HOST_STATE_EARLIEST_DUE]
+            - runtime_timer_now_ms(runtime);
+        if (due_in_ms > -1e9 && due_in_ms < 1e9) {
+            state->timer_known = true;
+            state->timer_due_in_us = (int64_t) (due_in_ms * 1000.0);
+            state->timer_frame_callback = runtime_timer_is_frame_callback(
+                host[SCRIPT_HOST_STATE_EARLIEST_KIND]);
+        }
+    }
+    double task_due_in_ms = runtime_task_due_in_ms(runtime);
+    if (task_due_in_ms > -1e9 && task_due_in_ms < 1e9) {
+        state->task_known = true;
+        state->task_due_in_us = (int64_t) (task_due_in_ms * 1000.0);
+    }
+    state->jobs_pending = js_rt_runtime_checkpoint_pending(runtime);
+    state->cleanup_pending = JS_IsCleanupJobPending(runtime->runtime);
+    state->continuation_pending =
+        js_rt_dynamic_classic_continuation_pending(runtime);
+    state->responses_ready = runtime_responses_ready(runtime);
+    state->requests_in_flight =
+        fetch_scheduler_pending(runtime->bridge.fetch_scheduler);
+    return true;
+}
+#endif
+
 static bool runtime_pump_timers(ScriptRuntime *runtime,
                                 unsigned elapsed_ms,
                                 size_t callback_budget,
@@ -83,10 +188,18 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
         JS_NewInt64(runtime->context, (int64_t) callback_budget)
     };
     JSValue returned = JS_UNDEFINED;
+    /* A zero-budget pump only advances the scheduler's clock: bookkeeping.
+       A budgeted pump runs an author task. */
+    unsigned ledger = work_ledger_enter(callback_budget == 0
+        ? WORK_LEDGER_OTHER : WORK_LEDGER_SCRIPT);
+    unsigned split = callback_budget == 0
+        ? SCRIPT_SPLIT_KIND_COUNT + 1u : script_split_enter(SCRIPT_SPLIT_JS);
     bool ok = !JS_IsException(arguments[0])
         && !JS_IsException(arguments[1])
         && runtime_call_host(runtime, SCRIPT_HOST_PUMP_TIMERS, 2, arguments,
                         &returned);
+    script_split_leave(split);
+    work_ledger_leave(ledger);
     int64_t callbacks = 0;
     if (ok && (JS_ToInt64(runtime->context, &callbacks, returned) < 0
                || callbacks < 0
@@ -144,8 +257,11 @@ bool script_runtime_scheduler_snapshot(
 }
 
 /* Every check costs a full collection, so space them out; the window only
-   needs to return once, shortly after the hydration transient dies. */
+   needs to return once, shortly after the hydration transient dies. A check
+   that can't return it doubles the interval: a large settled heap (1.8 s to
+   collect on the PSP) otherwise froze the page every 256 advances. */
 #define BOOT_WINDOW_CHECK_INTERVAL 256u
+#define BOOT_WINDOW_MAX_CHECK_INTERVAL 16384u
 #define BOOT_WINDOW_MAX_DEFER_ADVANCES 4096u
 
 static void runtime_boot_window_step(ScriptRuntime *runtime)
@@ -155,9 +271,12 @@ static void runtime_boot_window_step(ScriptRuntime *runtime)
         return;
     }
     runtime->boot_window_advances++;
-    if (runtime->boot_window_advances % BOOT_WINDOW_CHECK_INTERVAL != 0) {
+    if (runtime->boot_window_next_check == 0)
+        runtime->boot_window_next_check = BOOT_WINDOW_CHECK_INTERVAL;
+    if (runtime->boot_window_advances < runtime->boot_window_next_check)
         return;
-    }
+    runtime->boot_window_next_check =
+        runtime->boot_window_advances + BOOT_WINDOW_CHECK_INTERVAL;
     /* A temporarily small live heap is not proof that startup has settled.
        Delayed hydration commonly waits on a timer or network response and
        can need the donated space in its next callback. Returning the window
@@ -171,18 +290,31 @@ static void runtime_boot_window_step(ScriptRuntime *runtime)
         && script_runtime_has_pending_author_work(runtime)) {
         return;
     }
+    bool dump = tilefinch_dump_js_memory();
+    uint64_t gc_started_ns = dump ? js_rt_monotonic_time_ns() : 0;
     JS_RunGC(runtime->runtime);
-    JSMemoryUsage usage;
-    memset(&usage, 0, sizeof(usage));
-    JS_ComputeMemoryUsage(runtime->runtime, &usage);
-    if (usage.malloc_size < 0) return;
-    if ((size_t) usage.malloc_size > runtime->boot_window_peak) {
-        runtime->boot_window_peak = (size_t) usage.malloc_size;
-    }
-    if (tilefinch_dump_js_memory()) {
-        fprintf(stderr, "tilefinch: boot-window census advance=%llu live=%lld\n",
-                (unsigned long long) runtime->boot_window_advances,
-                (long long) usage.malloc_size);
+    uint64_t gc_ns = dump ? js_rt_monotonic_time_ns() - gc_started_ns : 0;
+    runtime->boot_window_checks++;
+    uint64_t backoff = BOOT_WINDOW_CHECK_INTERVAL;
+    for (size_t failed = 1; failed < runtime->boot_window_checks
+         && backoff < BOOT_WINDOW_MAX_CHECK_INTERVAL; failed++)
+        backoff *= 2u;
+    runtime->boot_window_next_check = runtime->boot_window_advances + backoff;
+    /* O(1): the allocator shim maintains the malloc_size a census would
+       report. The census walk added 40-60% to this collection's pause on
+       the host, more on the PSP (soft-float per string and shape). */
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    if (live > runtime->boot_window_peak) runtime->boot_window_peak = live;
+    if (dump) {
+        JSMemoryUsage usage;
+        uint64_t census_started_ns = js_rt_monotonic_time_ns();
+        js_rt_heap_census(runtime, &usage);
+        uint64_t census_ns = js_rt_monotonic_time_ns() - census_started_ns;
+        fprintf(stderr, "tilefinch: boot-window census advance=%llu live=%zu "
+                "gc-us=%llu census-us=%llu\n",
+                (unsigned long long) runtime->boot_window_advances, live,
+                (unsigned long long) (gc_ns / 1000u),
+                (unsigned long long) (census_ns / 1000u));
         JS_DumpMemoryUsage(stderr, &usage, runtime->runtime);
     }
     /* Return the window only when the live graph fits the base with the
@@ -190,18 +322,93 @@ static void runtime_boot_window_step(ScriptRuntime *runtime)
        shrunken limit does not immediately re-trigger pressure. */
     size_t reserve = runtime->base_memory_limit / 8u;
     if (reserve > 4u * 1024u * 1024u) reserve = 4u * 1024u * 1024u;
-    if ((size_t) usage.malloc_size + reserve <= runtime->base_memory_limit) {
+    if (live + reserve <= runtime->base_memory_limit) {
         JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
         runtime->boot_window_active = false;
         runtime->boot_window_returned_advance = runtime->boot_window_advances;
         size_t trimmed = budget_quickjs_pool_trim(runtime->quickjs_pool, 8);
         fprintf(stderr,
-                "tilefinch: boot-window returned advance=%llu live=%lld "
+                "tilefinch: boot-window returned advance=%llu live=%zu "
                 "base=%zu window=%zu trimmed=%zu\n",
                 (unsigned long long) runtime->boot_window_advances,
-                (long long) usage.malloc_size, runtime->base_memory_limit,
+                live, runtime->base_memory_limit,
                 runtime->boot_window_bytes, trimmed);
     }
+}
+
+/* The limit that lets automatic collection keep its `growth_pct` spacing:
+   QuickJS re-arms at half the remaining headroom near the limit, so twice
+   the pacing headroom, rounded to growth steps. */
+static size_t runtime_heap_pacing_limit(size_t live, long growth_pct)
+{
+    if (growth_pct <= 100) return live;
+    uint64_t headroom = (uint64_t) live * (uint64_t) (growth_pct - 100) / 50u;
+    uint64_t want = (uint64_t) live + headroom;
+    want += (SCRIPT_HEAP_GROWTH_STEP - want % SCRIPT_HEAP_GROWTH_STEP)
+        % SCRIPT_HEAP_GROWTH_STEP;
+    return want > SIZE_MAX ? SIZE_MAX : (size_t) want;
+}
+
+static long runtime_gc_growth_pct_value = -1;
+
+/* Return memory-pressure growth the live graph no longer uses, so the rest
+   of the page (and the next page) regains that Budget. Same cadence and
+   pending-work deferral as the boot window, which it follows. */
+static void runtime_heap_growth_step(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->runtime == NULL
+        || !runtime->heap_growth_enabled || runtime->boot_window_active
+        || runtime->base_memory_limit <= runtime->heap_growth_floor) {
+        return;
+    }
+    runtime->heap_growth_advances++;
+    if (runtime->heap_growth_next_check == 0)
+        runtime->heap_growth_next_check =
+            runtime->heap_growth_advances + BOOT_WINDOW_CHECK_INTERVAL;
+    if (runtime->heap_growth_advances < runtime->heap_growth_next_check)
+        return;
+    runtime->heap_growth_next_check =
+        runtime->heap_growth_advances + BOOT_WINDOW_CHECK_INTERVAL;
+    if (script_runtime_has_pending_author_work(runtime)) return;
+    JS_RunGC(runtime->runtime);
+    /* Assume this check returns nothing; a return resets the backoff. A
+       settled realm whose growth is still in use (or kept as collection
+       headroom) then collects at 256, 512, ... up to the boot window's
+       longest interval instead of every 256 advances forever. */
+    runtime->heap_growth_fruitless_checks++;
+    uint64_t backoff = BOOT_WINDOW_CHECK_INTERVAL;
+    for (size_t failed = 1; failed < runtime->heap_growth_fruitless_checks
+         && backoff < BOOT_WINDOW_MAX_CHECK_INTERVAL; failed++)
+        backoff *= 2u;
+    runtime->heap_growth_next_check = runtime->heap_growth_advances + backoff;
+    size_t live = budget_quickjs_pool_js_malloc_current(
+        runtime->quickjs_pool);
+    size_t reserve = live / 8u;
+    if (reserve < 2u * SCRIPT_HEAP_GROWTH_STEP)
+        reserve = 2u * SCRIPT_HEAP_GROWTH_STEP;
+    if (reserve > 4u * 1024u * 1024u) reserve = 4u * 1024u * 1024u;
+    size_t target = live > SIZE_MAX - reserve ? SIZE_MAX : live + reserve;
+    target += (SCRIPT_HEAP_GROWTH_STEP - target % SCRIPT_HEAP_GROWTH_STEP)
+        % SCRIPT_HEAP_GROWTH_STEP;
+    /* Keep the collection headroom pre-growth would restore next advance;
+       returning it only brings the collection storm back. Under pressure
+       pre-growth stops, and this returns the rest. */
+    size_t pacing = runtime_heap_pacing_limit(
+        live, runtime_gc_growth_pct_value < 0 ? 125
+                                              : runtime_gc_growth_pct_value);
+    if (pacing > target && runtime->budget != NULL
+        && budget_remaining(runtime->budget) > runtime->heap_growth_reserve)
+        target = pacing;
+    if (target < runtime->heap_growth_floor)
+        target = runtime->heap_growth_floor;
+    if (target >= runtime->base_memory_limit) return;
+    runtime->base_memory_limit = target;
+    runtime->heap_growth_returns++;
+    runtime->heap_growth_fruitless_checks = 0;
+    runtime->heap_growth_next_check =
+        runtime->heap_growth_advances + BOOT_WINDOW_CHECK_INTERVAL;
+    JS_SetMemoryLimit(runtime->runtime, script_runtime_current_limit(runtime));
+    (void) budget_quickjs_pool_trim(runtime->quickjs_pool, 8);
 }
 
 /* Deterministic replay must not let collection timing depend on
@@ -266,6 +473,7 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
            Tests and deterministic replay may still override this explicitly. */
         growth_pct = value == NULL ? 125 : atol(value);
         if (growth_pct < 0) growth_pct = 0;
+        runtime_gc_growth_pct_value = growth_pct;
         value = getenv("TILEFINCH_JS_GC_MIN_SLACK_KB");
         min_slack_kb = value == NULL ? 512 : atol(value);
         if (min_slack_kb < 64) min_slack_kb = 64;
@@ -279,6 +487,18 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
        collections it paces. */
     uint64_t live = budget_quickjs_pool_js_malloc_current(
         runtime->quickjs_pool);
+    /* A growable realm paces from the graph the last collection left, not
+       from the current size: that includes garbage, and re-arming 25% above
+       it every advance would let garbage grow with the limit. A fixed limit
+       already bounds that, so fixed realms keep pacing from the current
+       size. */
+    uint64_t paced = runtime->heap_growth_enabled
+            && runtime->heap_live_after_gc != 0
+            && runtime->heap_live_after_gc < live
+        ? runtime->heap_live_after_gc : live;
+    if (growth_pct > 0)
+        script_runtime_heap_pregrow(
+            runtime, runtime_heap_pacing_limit((size_t) paced, growth_pct));
     uint64_t effective_limit = runtime->base_memory_limit
         + (runtime->boot_window_active ? runtime->boot_window_bytes : 0);
     uint64_t threshold;
@@ -288,25 +508,27 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
         /* The PSP realm and its configured growth percentage fit this path.
            Avoid a software 64-bit division on every scripted loop turn while
            retaining saturating wide arithmetic for host overrides. */
-        if (live <= UINT32_MAX && growth <= UINT32_MAX
-            && (growth == 0 || live <= UINT32_MAX / growth)) {
-            grown = (uint32_t) live * (uint32_t) growth / 100u;
+        if (paced <= UINT32_MAX && growth <= UINT32_MAX
+            && (growth == 0 || paced <= UINT32_MAX / growth)) {
+            grown = (uint32_t) paced * (uint32_t) growth / 100u;
         } else {
             uint64_t product = 0;
 #if defined(__GNUC__) || defined(__clang__)
-            grown = __builtin_mul_overflow(live, growth, &product)
+            grown = __builtin_mul_overflow(paced, growth, &product)
                 ? UINT64_MAX : product / 100u;
 #else
-            grown = growth != 0 && live > UINT64_MAX / growth
-                ? UINT64_MAX : live * growth / 100u;
+            grown = growth != 0 && paced > UINT64_MAX / growth
+                ? UINT64_MAX : paced * growth / 100u;
 #endif
         }
-        uint64_t floor = live + (uint64_t) min_slack_kb * 1024u;
+        uint64_t floor = paced + (uint64_t) min_slack_kb * 1024u;
         threshold = grown > floor ? grown : floor;
     } else {
         threshold = live + (uint64_t) slack_kb * 1024u;
     }
+    bool clamped = false;
     if (effective_limit > 0 && threshold >= effective_limit) {
+        clamped = true;
         static long reserve_kb = -1;
         if (reserve_kb < 0) {
             const char *value = getenv("TILEFINCH_JS_GC_RESERVE_KB");
@@ -325,8 +547,12 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
        advance, even when the preceding collection reclaimed nothing. Allow
        half the remaining headroom to be allocated before the next automatic
        collection. This never raises the allocator's hard limit, and the
-       exhausted-heap case still collects before object creation. */
-    if (threshold <= live && live < effective_limit) {
+       exhausted-heap case still collects before object creation. In a
+       growable realm an unclamped threshold at or below live means garbage
+       has passed its pacing share since the last collection: collect at the
+       next allocation. */
+    if ((clamped || !runtime->heap_growth_enabled)
+        && threshold <= live && live < effective_limit) {
         uint64_t headroom = effective_limit - live;
         threshold = live + headroom / 2u + headroom % 2u;
     }
@@ -384,6 +610,56 @@ static bool runtime_task_slice_available(const ScriptRuntime *runtime,
     return now < started_ns || (now - started_ns) / UINT64_C(1000) < limit;
 }
 
+/* Low-priority JavaScript-engine tasks: never spend the promise-job quota on
+   wrapper cleanup, and never run it inside a continued task. Each cleanup
+   is one task from the caller's budget followed by its own checkpoint.
+   Memory-pressure handle reclamation remains synchronous and independent. */
+static size_t runtime_run_cleanup_tasks(ScriptRuntime *runtime, size_t limit,
+                                        size_t *remaining,
+                                        uint64_t task_slice_started_ns,
+                                        size_t callback_budget, bool *ok)
+{
+    size_t ran_tasks = 0;
+    while (*ok && ran_tasks < limit && *remaining != 0
+           && !js_rt_runtime_checkpoint_pending(runtime)
+           && JS_IsCleanupJobPending(runtime->runtime)
+           && runtime_task_slice_available(runtime, task_slice_started_ns,
+                                           *remaining, callback_budget)) {
+        if (!js_rt_runtime_native_checkpoint(runtime)) { *ok = false; break; }
+        size_t failures = runtime->budget->failure_count;
+        size_t rejections = script_runtime_heap_rejections(runtime);
+        JSContext *context = NULL;
+        BudgetAllocationOwner owner = document_allocation_owner_enter(
+            runtime->document);
+        uint64_t started = js_rt_monotonic_time_ns();
+        size_t polls = runtime->watchdog.polls;
+        unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+        unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
+        script_profile_enter(runtime);
+        int ran = JS_ExecutePendingCleanupJob(runtime->runtime, &context);
+        script_profile_leave(runtime);
+        script_split_leave(split);
+        work_ledger_leave(ledger);
+        document_allocation_owner_leave(runtime->document, owner);
+        js_rt_runtime_record_host_callback(runtime, "<finalizer-task>", started, polls);
+        if (ran == 0) break;
+        ran_tasks++;
+        (*remaining)--;
+        if (ran < 0) {
+            js_rt_record_exception(context != NULL ? context : runtime->context,
+                                    &runtime->result);
+            js_lazy_webpack_recover_failure(runtime);
+            if (runtime_job_exception_is_fatal(runtime, failures, rejections)) {
+                *ok = false;
+                break;
+            }
+            runtime_record_author_job_exception(runtime);
+        }
+        *ok = js_rt_runtime_run_jobs(runtime);
+    }
+    return ran_tasks;
+}
+
 bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                             size_t callback_budget, ScriptResult *result)
 {
@@ -396,10 +672,12 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     size_t webgl_before_frames = runtime->bridge.webgl_native_frames;
     BudgetQuickJSActivity allocator_before = {0};
     budget_quickjs_pool_activity(runtime->quickjs_pool, &allocator_before);
+    runtime->timing_metrics.advance_timer_late_max_us = 0;
 #endif
     runtime_apply_gc_slack(runtime);
     runtime_apply_deterministic_gc(runtime);
     runtime_boot_window_step(runtime);
+    runtime_heap_growth_step(runtime);
     js_rt_runtime_arm_watchdog(runtime);
     if (runtime->bridge.deterministic_clock
         && elapsed_ms != 0) {
@@ -469,6 +747,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
        pair here, after the final position is already observable. A continued
        classic script must remain the only author task until it completes. */
     if (!classic_continuation
+        && runtime->host_state[SCRIPT_HOST_STATE_SCROLL_PENDING] != 0
         && !runtime_call_captured(runtime, runtime->page_scroll_flush,
                                   "page scroll dispatch", 0, NULL, NULL)) {
         runtime->result.success = false;
@@ -481,7 +760,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
        all later tasks to the next host turn instead of reordering them. */
     if (!classic_continuation) {
         phase_started = js_rt_monotonic_time_ns();
+        if (runtime->profile != NULL) runtime->profile->micro_site = 1;
         ok = js_rt_runtime_run_jobs(runtime);
+        if (runtime->profile != NULL) runtime->profile->micro_site = 0;
         microtask_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
     }
     size_t remaining = callback_budget;
@@ -503,6 +784,21 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         remaining--;
         ok = js_rt_runtime_run_jobs(runtime);
     }
+    /* Cleanup normally takes only the slots due tasks leave. A page whose
+       timers or deliveries are due on every turn would then starve it, and
+       with it the release of every collected wrapper's handle slot, for as
+       long as the page stays busy (two frame-rate intervals fill the PSP's
+       two-task turn indefinitely). After a few consecutive starved turns,
+       admit one cleanup ahead of this turn's tasks. */
+    uint64_t cleanup_started_ns = trace_steps ? js_rt_monotonic_time_ns() : 0;
+    size_t cleanups = 0;
+    if (ok && !classic_continuation
+        && runtime->cleanup_starved_advances
+               >= SCRIPT_CLEANUP_STARVATION_ADVANCES) {
+        cleanups = runtime_run_cleanup_tasks(
+            runtime, 1, &remaining, task_slice_started_ns, callback_budget,
+            &ok);
+    }
     size_t callbacks = 0;
     while (ok && remaining != 0
            && runtime_task_slice_available(runtime, task_slice_started_ns,
@@ -520,20 +816,43 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                 js_rt_dynamic_classic_continuation_pending(runtime);
             if (!classic_continuation) {
                 phase_started = js_rt_monotonic_time_ns();
+                if (runtime->profile != NULL) runtime->profile->micro_site = 2;
                 ok = js_rt_runtime_run_jobs(runtime);
+                if (runtime->profile != NULL) runtime->profile->micro_site = 0;
                 microtask_elapsed_ns +=
                     js_rt_monotonic_time_ns() - phase_started;
             }
             continue;
         }
 
-        if (classic_continuation) break;
+        if (classic_continuation || !runtime_timer_due(runtime)) break;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        /* The head of the sorted wheel is the task this pump runs (a
+           hidden page may skip visual timers; then this is approximate). */
+        double timer_late_ms = runtime_timer_now_ms(runtime)
+            - runtime->host_state[SCRIPT_HOST_STATE_EARLIEST_DUE];
+        bool frame_callback = runtime_timer_is_frame_callback(
+            runtime->host_state[SCRIPT_HOST_STATE_EARLIEST_KIND]);
+#endif
         size_t timer_callbacks = 0;
         phase_started = js_rt_monotonic_time_ns();
         ok = runtime_pump_timers(runtime, 0, 1, &timer_callbacks);
         uint64_t timer_turn_ns = js_rt_monotonic_time_ns() - phase_started;
         timer_elapsed_ns += timer_turn_ns;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (timer_callbacks != 0 && frame_callback) {
+            runtime->timing_metrics.frame_callbacks++;
+            if (timer_late_ms > 0)
+                runtime->timing_metrics.frame_callback_late_us +=
+                    (uint64_t) (timer_late_ms * 1000.0);
+        } else if (timer_callbacks != 0 && timer_late_ms > 0) {
+            uint64_t late_us = (uint64_t) (timer_late_ms * 1000.0);
+            runtime->timing_metrics.timer_late_us += late_us;
+            if (late_us > runtime->timing_metrics.advance_timer_late_max_us)
+                runtime->timing_metrics.advance_timer_late_max_us = late_us;
+            if (late_us >= UINT64_C(16667))
+                runtime->timing_metrics.timer_late_frames++;
+        }
         if (timer_callbacks != 0) {
             uint64_t timer_turn_us = timer_turn_ns / UINT64_C(1000);
             runtime->timing_metrics.timer_callbacks += timer_callbacks;
@@ -550,10 +869,32 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         callbacks += timer_callbacks;
         remaining -= timer_callbacks;
         phase_started = js_rt_monotonic_time_ns();
+        if (runtime->profile != NULL) runtime->profile->micro_site = 3;
         ok = js_rt_runtime_run_jobs(runtime);
+        if (runtime->profile != NULL) runtime->profile->micro_site = 0;
         microtask_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
     }
+    if (ok && !classic_continuation && cleanups < 16) {
+        cleanups += runtime_run_cleanup_tasks(
+            runtime, 16 - cleanups, &remaining, task_slice_started_ns,
+            callback_budget, &ok);
+    }
+    /* Only a turn whose tasks left cleanup no slot counts as starved; a
+       continued classic script or an unfinished checkpoint legitimately
+       holds every later task, cleanup included. */
+    if (cleanups != 0 || !JS_IsCleanupJobPending(runtime->runtime)) {
+        runtime->cleanup_starved_advances = 0;
+    } else if (ok && !classic_continuation
+               && !js_rt_runtime_checkpoint_pending(runtime)
+               && runtime->cleanup_starved_advances < UINT8_MAX) {
+        runtime->cleanup_starved_advances++;
+    }
     if (trace_steps) {
+        if (cleanups != 0)
+            fprintf(stderr, "runtime-cleanup tasks=%zu us=%llu pending=%d\n",
+                    cleanups, (unsigned long long)
+                    ((js_rt_monotonic_time_ns()-cleanup_started_ns)/1000u),
+                    JS_IsCleanupJobPending(runtime->runtime));
         fprintf(stderr, "runtime-step phase=network-pump us=%llu\n",
                 (unsigned long long)
                   (network_elapsed_ns / UINT64_C(1000)));

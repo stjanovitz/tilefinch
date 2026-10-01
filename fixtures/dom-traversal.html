@@ -1,0 +1,174 @@
+<!doctype html><!--before--><html><head><title>DOM traversal</title></head><body><div id=a><p id=p1>one<b id=b1>bold</b></p><!--c1--><p id=p2>two</p></div><script>
+(function () {
+  var fails = [];
+  function eq(actual, expected, label) {
+    if (actual !== expected) fails.push(label + ": " + actual + " != " + expected);
+  }
+  function throwsName(run, name, label) {
+    try { run(); fails.push(label + ": no exception"); }
+    catch (error) { eq(error && error.name, name, label); }
+  }
+  function key(node) {
+    if (!node) return "null";
+    if (node === document) return "#document";
+    if (node.nodeType === 1) return node.id || node.nodeName;
+    if (node.nodeType === 3 || node.nodeType === 8) return node.nodeName + ":" + node.nodeValue;
+    return node.nodeName;
+  }
+  function walk(walker, method) {
+    var seen = [], node, guard = 0;
+    while ((node = walker[method || "nextNode"]()) && guard++ < 100) seen.push(key(node));
+    return seen.join(",");
+  }
+  function build(html) {
+    var box = document.createElement("div");
+    box.id = "box";
+    box.innerHTML = html;
+    document.body.appendChild(box);
+    return box;
+  }
+  var F = NodeFilter, a = document.getElementById("a");
+  try {
+    /* NodeFilter is a callback interface object with every constant. */
+    eq(typeof NodeFilter, "function", "NodeFilter type");
+    var constants = { FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3, SHOW_ALL: 4294967295, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_ENTITY_REFERENCE: 16, SHOW_ENTITY: 32, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, SHOW_NOTATION: 2048 };
+    for (var name in constants) eq(NodeFilter[name], constants[name], "NodeFilter." + name);
+    throwsName(function () { new TreeWalker(); }, "TypeError", "TreeWalker constructor");
+    throwsName(function () { new NodeIterator(); }, "TypeError", "NodeIterator constructor");
+
+    /* The document root includes what lies outside <html>. */
+    var all = document.createTreeWalker(document);
+    eq(all.root, document, "document root");
+    eq(all.currentNode, document, "document current");
+    eq(all instanceof TreeWalker, true, "instanceof TreeWalker");
+    eq(Object.prototype.toString.call(all), "[object TreeWalker]", "toStringTag");
+    eq([key(all.nextNode()), key(all.nextNode()), key(all.nextNode())].join(","), "html,#comment:before,HTML", "document order");
+    eq(walk(document.createTreeWalker(document, F.SHOW_COMMENT)), "#comment:before,#comment:c1,#comment:after", "document comments");
+    eq(walk(document.createNodeIterator(document, F.SHOW_COMMENT)), "#comment:before,#comment:c1,#comment:after", "iterator comments");
+    eq(key(document.createNodeIterator(document, F.SHOW_DOCUMENT).nextNode()), "#document", "iterator document root");
+    var back = document.createTreeWalker(document, F.SHOW_COMMENT);
+    back.currentNode = document.lastChild;
+    eq(walk(back, "previousNode"), "#comment:c1,#comment:before", "document previousNode");
+
+    /* whatToShow selects node types without consulting the filter. */
+    eq(walk(document.createTreeWalker(a, F.SHOW_ELEMENT | F.SHOW_TEXT)), "p1,#text:one,b1,#text:bold,p2,#text:two", "element and text");
+    eq(document.createTreeWalker(a, -1).whatToShow, 4294967295, "whatToShow unsigned");
+    var consulted = [];
+    walk(document.createTreeWalker(a, F.SHOW_COMMENT, function (node) { consulted.push(key(node)); return F.FILTER_ACCEPT; }));
+    eq(consulted.join(","), "#comment:c1", "filter sees only shown nodes");
+
+    /* FILTER_REJECT skips a subtree for TreeWalker only; FILTER_SKIP does not. */
+    function reject(node) { return node.id === "p1" ? F.FILTER_REJECT : F.FILTER_ACCEPT; }
+    function skip(node) { return node.id === "p1" ? F.FILTER_SKIP : F.FILTER_ACCEPT; }
+    eq(walk(document.createTreeWalker(a, F.SHOW_ELEMENT, reject)), "p2", "walker reject");
+    eq(walk(document.createTreeWalker(a, F.SHOW_ELEMENT, skip)), "b1,p2", "walker skip");
+    eq(walk(document.createNodeIterator(a, F.SHOW_ELEMENT, reject)), "a,b1,p2", "iterator reject");
+    var rejectBack = document.createTreeWalker(a, F.SHOW_ELEMENT, reject);
+    rejectBack.currentNode = document.getElementById("p2");
+    eq(key(rejectBack.previousNode()), "a", "walker previousNode reject");
+
+    /* An object filter is called as acceptNode with itself as this. */
+    var objectFilter = { calls: 0, acceptNode: function (node) { if (this === objectFilter) objectFilter.calls++; return node.nodeName === "B" ? F.FILTER_ACCEPT : F.FILTER_SKIP; } };
+    var objectWalker = document.createTreeWalker(a, F.SHOW_ELEMENT, objectFilter);
+    eq(objectWalker.filter, objectFilter, "filter getter");
+    eq(walk(objectWalker), "b1", "object filter");
+    eq(objectFilter.calls, 3, "acceptNode this");
+    throwsName(function () { document.createTreeWalker(a, F.SHOW_ALL, {}).nextNode(); }, "TypeError", "missing acceptNode");
+    throwsName(function () { document.createTreeWalker(a, F.SHOW_ALL, 5); }, "TypeError", "primitive filter");
+    throwsName(function () { document.createTreeWalker(null); }, "TypeError", "null root");
+
+    /* Filter reentrancy and exceptions. */
+    var reentrant = document.createTreeWalker(a, F.SHOW_ELEMENT, function () { reentrant.nextNode(); return F.FILTER_ACCEPT; });
+    throwsName(function () { reentrant.nextNode(); }, "InvalidStateError", "reentrant filter");
+    var thrown = false, failing = document.createTreeWalker(a, F.SHOW_ELEMENT, function () { if (!thrown) { thrown = true; throw new RangeError("boom"); } return F.FILTER_ACCEPT; });
+    throwsName(function () { failing.nextNode(); }, "RangeError", "filter exception");
+    eq(key(failing.nextNode()), "p1", "active flag reset");
+
+    /* Structural moves honour currentNode, including outside root. */
+    var moves = document.createTreeWalker(a, F.SHOW_ELEMENT);
+    moves.currentNode = document.getElementById("b1");
+    eq(key(moves.parentNode()), "p1", "parentNode");
+    eq(key(moves.parentNode()), "a", "parentNode to root");
+    eq(key(moves.parentNode()), "null", "parentNode stops at root");
+    eq(key(moves.firstChild()), "p1", "firstChild");
+    moves.currentNode = a;
+    eq(key(moves.lastChild()), "p2", "lastChild");
+    eq(key(moves.previousSibling()), "p1", "previousSibling");
+    eq(key(moves.nextSibling()), "p2", "nextSibling");
+    eq(key(moves.nextSibling()), "null", "nextSibling end");
+    eq(key(moves.previousNode()), "b1", "previousNode descends");
+    throwsName(function () { moves.currentNode = {}; }, "TypeError", "currentNode setter");
+    moves.currentNode = document.body;
+    eq(key(moves.nextNode()), "a", "nextNode from outside root");
+
+    /* Live: walking reflects mutations made while walking. */
+    var live = build("<p id=x1><b id=x1b></b></p><p id=x2></p><p id=x3></p>");
+    var liveWalker = document.createTreeWalker(live, F.SHOW_ELEMENT), seen = [];
+    seen.push(key(liveWalker.nextNode()));
+    var added = document.createElement("i");
+    added.id = "added";
+    document.getElementById("x1").appendChild(added);
+    document.getElementById("x2").remove();
+    var node;
+    while ((node = liveWalker.nextNode())) seen.push(key(node));
+    eq(seen.join(","), "x1,x1b,added,x3", "live walker");
+    var mutating = document.createTreeWalker(live, F.SHOW_ELEMENT, function (candidate) {
+      if (candidate.id === "x1") document.getElementById("x3").remove();
+      return F.FILTER_ACCEPT;
+    });
+    eq(walk(mutating), "x1,x1b,added", "filter mutation");
+    live.remove();
+
+    /* NodeIterator keeps its reference across removals. */
+    var box = build("<p id=y1></p><p id=y2></p><p id=y3></p>");
+    var iterator = document.createNodeIterator(box, F.SHOW_ELEMENT);
+    eq(iterator instanceof NodeIterator, true, "instanceof NodeIterator");
+    eq(key(iterator.nextNode()) + "," + key(iterator.nextNode()), "box,y1", "iterator start");
+    document.getElementById("y1").remove();
+    eq(key(iterator.referenceNode) + "," + iterator.pointerBeforeReferenceNode, "box,false", "removed reference moves back");
+    eq(key(iterator.nextNode()), "y2", "iterator after removal");
+    eq(key(iterator.previousNode()), "y2", "iterator turns around");
+    eq(iterator.pointerBeforeReferenceNode, true, "pointer before");
+    document.getElementById("y2").remove();
+    eq(key(iterator.referenceNode) + "," + iterator.pointerBeforeReferenceNode, "y3,true", "removed reference moves forward");
+    eq(key(iterator.nextNode()), "y3", "iterator continues");
+    box.textContent = "";
+    eq(key(iterator.referenceNode), "box", "bulk removal");
+    box.remove();
+
+  } catch (error) {
+    fails.push("exception: " + (error && error.stack || error));
+  }
+  globalThis.traversalFails = fails;
+})();
+</script><script>
+/* Large documents: no result cap, and nodes whatToShow excludes are passed
+   over natively rather than wrapped (each wrapper holds one of the realm's
+   8,192 node handles until it is collected). 5,000 elements and 4,500
+   comments: every comment is returned, no element is wrapped. */
+var bulk = "";
+for (var i = 0; i < 5000; i++) bulk += "<i class=bulk></i>" + (i < 4500 ? "<!--m" + i + "-->" : "");
+var big = document.createElement("div");
+big.id = "big";
+big.innerHTML = bulk;
+document.body.appendChild(big);
+var bigComments = 0, lastComment = "", bigNode, bigWalker = document.createTreeWalker(document, NodeFilter.SHOW_COMMENT);
+while ((bigNode = bigWalker.nextNode())) { bigComments++; lastComment = bigNode.nodeValue; }
+if (bigComments !== 4503 || lastComment !== "after") traversalFails.push("large walker: " + bigComments + " " + lastComment);
+var bigIterator = document.createNodeIterator(big, NodeFilter.SHOW_COMMENT), iterated = 0;
+while (bigIterator.nextNode()) iterated++;
+while (bigIterator.previousNode()) iterated--;
+if (iterated !== 0 || bigIterator.referenceNode !== big.firstChild.nextSibling) traversalFails.push("large iterator: " + iterated);
+big.remove();
+bigWalker = bigIterator = bigNode = big = null;
+/* One native step is bounded; a walk resumes where the bound stopped it. */
+var sparse = document.createElement("div");
+sparse.innerHTML = "<i></i>".repeat(17000) + "<!--end-->";
+var sparseWalker = document.createTreeWalker(sparse, NodeFilter.SHOW_COMMENT);
+var sparseEnd = sparseWalker.nextNode();
+if (!sparseEnd || sparseEnd.nodeValue !== "end" || sparseWalker.nextNode() !== null) traversalFails.push("sparse walker");
+var sparseIterator = document.createNodeIterator(sparse, NodeFilter.SHOW_COMMENT);
+if (sparseIterator.nextNode() !== sparseEnd || sparseIterator.previousNode() !== sparseEnd || sparseIterator.previousNode() !== null) traversalFails.push("sparse iterator");
+sparse = sparseWalker = sparseIterator = sparseEnd = null;
+globalThis.pocSummary = traversalFails.length ? traversalFails.join(" | ") : "traversal-ok";
+</script></body></html><!--after-->

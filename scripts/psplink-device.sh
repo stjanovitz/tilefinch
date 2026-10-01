@@ -161,10 +161,18 @@ case "$MODE" in
                 | awk 'NR == 1 { print $1 }' || true)
             [ -n "$previous_report_inode" ] || previous_report_inode=0
         fi
+        # Acceptance logs must identify the actual PRX, not just the preset.
+        # A parallel rebuild can otherwise change it between build and load.
+        loaded_prx_hash=$(cmake -E sha256sum "$BUILD_DIR/psp-browser-script-dev.prx")
+        printf 'PSPLink load artifact: %s\n' "$loaded_prx_hash"
         load_output=$(run_pspsh \
             "ld host0:/psp-browser-script-dev.prx" \
             "$LINK_TIMEOUT_SECONDS")
         printf '%s\n' "$load_output"
+        if [ "$loaded_prx_hash" != "$(cmake -E sha256sum "$BUILD_DIR/psp-browser-script-dev.prx")" ]; then
+            echo "PSPLink artifact changed during load; discard this validation run." >&2
+            exit 1
+        fi
         if printf '%s\n' "$load_output" | \
             grep -q 'Failed to Load/Start module'; then
             exit 1

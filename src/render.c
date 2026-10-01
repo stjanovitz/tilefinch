@@ -2,6 +2,7 @@
 #include "tilefinch/integer_math.h"
 #include "tilefinch/pixel_math.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/work_vector.h"
 
 #include <limits.h>
 #include <math.h>
@@ -52,6 +53,9 @@ struct RenderGradientCache {
 static void rasterize_tile(TileCache *cache, RenderTile *tile)
 {
     uint64_t started = render_now_us();
+#ifdef TILEFINCH_WORK_COUNTS
+    uint64_t candidates_before = cache->command_candidates;
+#endif
     int left = tile->tile_x * TILEFINCH_TILE_SIZE;
     int top = tile->tile_y * TILEFINCH_TILE_SIZE;
     int right = left + TILEFINCH_TILE_SIZE;
@@ -163,6 +167,9 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
         }
     }
     cache->rasterized++;
+    TILEFINCH_WORK_ADD(raster_tiles, 1);
+    TILEFINCH_WORK_ADD(raster_commands,
+                       cache->command_candidates - candidates_before);
     uint64_t finished = render_now_us();
     uint64_t elapsed = finished - started;
     cache->raster_us += elapsed;
@@ -2259,6 +2266,7 @@ RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
     cache->frame_us += elapsed;
     if (elapsed > cache->max_frame_us) cache->max_frame_us = elapsed;
     cache->frames_rendered++;
+    TILEFINCH_WORK_ADD(frames, 1);
     return RENDER_CANVAS_FRAME_COMPLETE;
 }
 
@@ -2752,6 +2760,7 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     cache->frame_us += elapsed;
     if (elapsed > cache->max_frame_us) cache->max_frame_us = elapsed;
     cache->frames_rendered++;
+    TILEFINCH_WORK_ADD(frames, 1);
     return ok;
 }
 
@@ -3450,6 +3459,21 @@ void tile_cache_invalidate_rect(TileCache *cache, int left, int top,
     cache->invalidations++;
 }
 
+static bool fixed_commands_intersect(const LayoutDocument *layout,
+                                     int left, int top, int right, int bottom)
+{
+    for (size_t range = 0; range < layout->fixed_count; range++) {
+        const FixedRange *fixed = &layout->fixed_ranges[range];
+        size_t end = fixed->command_end < layout->count
+            ? fixed->command_end : layout->count;
+        for (size_t i = fixed->command_start; i < end; i++) {
+            if (intersects(&layout->commands[i], left, top, right, bottom))
+                return true;
+        }
+    }
+    return false;
+}
+
 bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
                                   int right, int bottom)
 {
@@ -3478,10 +3502,17 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
         &cache->source_layout->viewport, right) + 1;
     int visual_bottom = viewport_css_to_device(
         &cache->source_layout->viewport, bottom) + 1;
-    overflow_cache_destroy(cache);
-    cache->fixed_ready = false;
-    cache->fixed_backdrop = false;
-    cache->fixed_backdrop_masked = false;
+    /* Paint only: colors, opacity and a focus stroke's width change, never
+       boxes, command flags or indices, so the overflow geometry stands. The
+       fixed layer is rebuilt only when a repainted command is one of its
+       own; the damage is the union of the repainted boxes, so any such
+       command intersects it (a drawer's box-shadows take ~0.6 s to redraw). */
+    if (fixed_commands_intersect(cache->layout, visual_left, visual_top,
+                                 visual_right, visual_bottom)) {
+        cache->fixed_ready = false;
+        cache->fixed_backdrop = false;
+        cache->fixed_backdrop_masked = false;
+    }
     tile_cache_invalidate_rect(
         cache, visual_left, visual_top, visual_right, visual_bottom);
     cache->canvas_paint_pending = true;

@@ -91,6 +91,8 @@
     writable: false,
     configurable: false,
   });
+  /* Read directly by the native result snapshot (see compat.js). */
+  globalThis.__tilefinchHostChannel.indexedDBStats = stats;
 
   const fail = (message, name) => new DOMException(message, name);
   const clone = (value) => {

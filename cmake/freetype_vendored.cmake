@@ -7,15 +7,17 @@
 # hostile-input version-gate guesswork: there is exactly one FreeType, pinned by
 # URL + SHA256, on every build.
 #
-# The module set (sfnt + truetype + smooth, plus FreeType's internal gzip for
-# WOFF1) is selected identically for both targets via the FT_CONFIG_MODULES_H
-# override in cmake/freetype/ftmodule-minimal.h.
+# The module set (sfnt + truetype + smooth, with WOFF1 support) is selected
+# identically for both targets via the FT_CONFIG_MODULES_H
+# override in cmake/freetype/ftmodule-minimal.h. WOFF1 uses the same zlib
+# already required by the browser, rather than FreeType's private inflater.
 #
-# Every optional external dependency is disabled EXPLICITLY so that neither
-# target silently links a system library the other lacks (a determinism and
-# portability hazard called out in the plan's risk list).
+# Every other optional external dependency is disabled EXPLICITLY so that
+# neither target silently links a system library the other lacks. zlib is
+# required, never opportunistic: both targets already use it in the core.
 
-set(FT_DISABLE_ZLIB     ON  CACHE BOOL "" FORCE)  # internal gzip only, never system zlib
+set(FT_DISABLE_ZLIB     OFF CACHE BOOL "" FORCE)
+set(FT_REQUIRE_ZLIB     ON  CACHE BOOL "" FORCE)
 set(FT_DISABLE_BZIP2    ON  CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG      ON  CACHE BOOL "" FORCE)
 set(FT_DISABLE_HARFBUZZ ON  CACHE BOOL "" FORCE)

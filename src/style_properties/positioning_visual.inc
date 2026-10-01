@@ -678,6 +678,19 @@ static bool style_radius_tokens(const Stylesheet *sheet,
 
 static bool style_property_border_radius(const StylePropertyParse *parse)
 {
+    /* Not inherited by default, but `inherit` is common on a pseudo-element
+       that fills its box (chatgpt.com's round send button). */
+    if (span_case_equal(parse->value, parse->value_length, "inherit")) {
+        *parse->inherit_mask |= S_BORDER_RADIUS;
+        *parse->mask |= S_BORDER_RADIUS;
+        return true;
+    }
+    if (span_case_equal(parse->value, parse->value_length, "initial")
+        || span_case_equal(parse->value, parse->value_length, "unset")) {
+        parse->style->border_radius = 0;
+        *parse->mask |= S_BORDER_RADIUS;
+        return true;
+    }
     int radii[4] = {0};
     size_t count = 0;
     if (!style_radius_tokens(parse->sheet, parse->value,

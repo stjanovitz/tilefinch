@@ -176,7 +176,7 @@ conversion averaged about 3.9 ms and the page-base copy was about 1.6 ms in
 tail frames. Even removing both entirely would leave that scene around 27–28
 ms, still in the 30 Hz rather than 60 Hz presentation band.
 
-The physical-PSP validation probe now compares the exact 320x180-to-480x270
+The physical-PSP validation probe compares the exact 320x180-to-480x270
 CPU kernel with a direct GE 8888-to-RGB565 back-buffer draw. Across 120
 measured frames after 12 warm-ups, CPU conversion averaged 3.175 ms and its
 following page copy 2.058 ms; the GE path averaged 4.315 ms end to end

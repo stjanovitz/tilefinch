@@ -81,6 +81,20 @@ int layout_control_default_width(lxb_dom_node_t *node)
     }
 }
 
+int layout_textarea_rows_content_height(
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style)
+{
+    if (context == NULL || style == NULL
+        || !layout_node_name_is(node, "textarea")) return 0;
+    int rows = control_ascii_attribute_integer(node, "rows");
+    if (rows <= 0) return 0;
+    if (rows > 64) rows = 64;
+    int line = layout_fixed_ceil(
+        layout_inline_style_line_height_fixed(context, style));
+    if (line <= 0) return 0;
+    return rows * line;
+}
+
 int layout_control_default_height(lxb_dom_node_t *node)
 {
     if (layout_node_name_is(node, "textarea")) return 64;

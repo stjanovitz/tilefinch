@@ -457,7 +457,12 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         int intrinsic = minimum
             ? intrinsic_min_text_width_ignoring_own_width(
                   context, node, parent, measure_limit)
-            : intrinsic_text_width(context, node, parent, measure_limit);
+            /* Positioned roots still own in-flow text. The ordinary
+               intrinsic helper excludes them when measuring an ancestor. */
+            : positioned
+                ? intrinsic_positioned_width(
+                      context, node, parent, measure_limit)
+                : intrinsic_text_width(context, node, parent, measure_limit);
         intrinsic -= margin_left + margin_right;
         if (intrinsic < 0) intrinsic = 0;
         if (maximum) outer_width = intrinsic;
@@ -616,7 +621,12 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
     }
     int native_control_height = layout_control_default_height(node);
+    int textarea_rows_height = style->has_height ? 0
+        : layout_textarea_rows_content_height(context, node, style);
+    if (textarea_rows_height > declared_content_height)
+        declared_content_height = textarea_rows_height;
     if (!style->has_height && native_control_height > 0
+        && textarea_rows_height == 0
         && (style->appearance & STYLE_APPEARANCE_MASK) != APPEARANCE_NONE) {
         int native_content_height = native_control_height
             - style->padding.top - style->padding.bottom
@@ -1959,7 +1969,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     bool table_minimum_height = style->display == DISPLAY_TABLE_ROW
                                 || style->display == DISPLAY_TABLE_CELL
                                 || (context->assigned_flex_node == node
-                                    && context->assigned_flex_minimum);
+                                    && context->assigned_flex_minimum)
+                                || (context->assigned_grid_node == node
+                                    && context->assigned_grid_minimum);
     if (definite_height && declared_height >= 0
         && (!table_minimum_height || line->y < declared_content_bottom)) {
         /* CSS table row/cell heights are minimums: content is allowed to grow
@@ -2172,6 +2184,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             int text_height = computed_style_font_size_fixed(style);
             text_height = text_height > 0
                 ? (text_height + 63) / 64 : 7 * style->font_scale;
+            /* A textarea's first line is a line box: its text is placed in
+               the full line-height like ordinary text, not in a font-height
+               box at the top (which drew it above centre). */
+            if (block_textarea) {
+                int line_height = layout_fixed_ceil(
+                    layout_inline_style_line_height_fixed(context, style));
+                if (line_height > text_height) text_height = line_height;
+            }
             int text_width = outer_width - style->border.left
                              - style->border.right - style->padding.left
                              - style->padding.right;

@@ -455,7 +455,7 @@ static bool lazy_factory_prepare_compile_working_set(
         js_rt_saturating_add_size(&reclaimed, cache_reclaimed);
     }
     page_pressure = budget_remaining(runtime->budget) < page_required;
-    heap_pressure = script_runtime_heap_remaining(runtime) < heap_required;
+    heap_pressure = script_runtime_heap_available(runtime) < heap_required;
     if (!page_pressure && !heap_pressure) {
         if (reclaimed != 0) {
             budget_record_pressure(runtime->budget,

@@ -14,6 +14,7 @@
 #ifndef TILEFINCH_PSP_APP_INTERNAL_H
 #define TILEFINCH_PSP_APP_INTERNAL_H
 
+#include "psp_navigation_watchdog.h"
 #include <pspctrl.h>
 #include <pspdisplay.h>
 #include <pspge.h>
@@ -104,13 +105,16 @@
 #define PSP_MEDIA_PREVIEW_WIDTH 128
 #define PSP_MEDIA_PREVIEW_HEIGHT 72
 #define PSP_RENDER_JOB_BUDGET_US 2000u
+/* A frame that starts with a page task already runnable does not wait for
+   vblank; it yields this long instead, so the lower-priority transport
+   setup, image decode and codec threads still run between busy frames. */
+#define PSP_PAGE_TASK_YIELD_US 2000u
 /* The deadline remains authoritative. A one-tile ceiling left spare time in
    each slice and stretched ordinary focus repaints across extra vblanks. */
 #define PSP_RENDER_JOB_MAXIMUM_TILES 4u
 #define PSP_RENDER_JOB_TIMEOUT_US UINT64_C(2000000)
 /* Large valid documents may finish layout after the old 35-second ceiling.
    Keep one bounded minute; cooperative input/cancellation remain independent. */
-#define PSP_NAVIGATION_JOB_TIMEOUT_US UINT64_C(60000000)
 #define PSP_NETWORK_CONNECT_TIMEOUT_US UINT64_C(45000000)
 /* A HOME tile must hold focus this long (think-time) before its host earns a
    speculative background TCP+TLS connect (docs/engineering/
@@ -368,6 +372,9 @@ typedef struct {
        short burst without making an unexpectedly slow service an unbounded
        input queue. */
     uint32_t pending_page_input[4];
+    /* When each was pressed: a press queued behind a relayout is timed
+       from here, not from its replay. */
+    uint64_t pending_page_input_us[4];
     uint8_t pending_page_input_count;
     uint8_t pending_page_input_dropped;
     /* Latest media command accepted by the callback-thread supervisor while
@@ -412,6 +419,7 @@ bool psp_request_policy_clock(
 bool psp_platform_present(
     void *context, const uint16_t *pixels, size_t width,
     size_t height, size_t stride_pixels);
+void psp_show_page_script_clock(PspUiState *ui, const BrowserEngine *engine);
 bool psp_platform_cooperate(
     void *context, const char *phase, size_t completed_work_units);
 void psp_platform_retire_frame(void *context, const uint16_t *pixels);
@@ -425,14 +433,23 @@ void psp_navigation_cooperate_begin(
 void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
                                  PspUiToolbarInputState *toolbar);
 bool psp_runtime_cooperate_end(uint32_t *observed_buttons);
-void psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui);
+/* The armed scope runs page-idle work for this engine: while it completes a
+   provisional page's layout, page presses scroll that page instead of
+   cancelling the completion (browser_engine_completion_scroll_page). */
+void psp_runtime_cooperate_serve_page_scroll(BrowserEngine *engine);
+/* Refreshes the supervisor's player snapshot during a media scope. A
+   timeline press (scrub, commit, cancel, play/pause) the supervisor holds is
+   moved to *timeline_intent for the browser thread; true when one was. */
+bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
+                                      PspUiMediaIntent *timeline_intent);
 void psp_work_cooperate_begin_media_open(
     PspUiState *ui, const uint16_t *engine_frame,
     const PspUiMediaState *media_ui);
 void psp_navigation_cooperate_end(const char *scope);
 bool psp_navigation_cooperate_take_media_intent(
     PspUiMediaIntent *intent);
-bool psp_navigation_cooperate_take_page_input(uint32_t *pressed);
+bool psp_navigation_cooperate_take_page_input(uint32_t *pressed,
+                                              uint64_t *pressed_us);
 /* Browser loop, each frame of a supervised load: publish liveness and the
    page-screen state, and take the presses forwarded to it. */
 uint32_t psp_navigation_cooperate_owner_frame(bool page_screen);
@@ -983,10 +1000,17 @@ static inline PspRecoveryOffer psp_recovery_offer_without_return(
    operation records and counters, not parallel media/network control state. */
 typedef struct {
     uint32_t previous_buttons;
+    /* Until this time a text field focused by page script opens the
+       keyboard: the activating press's transient user activation. Zero when
+       no activation is waiting on a late focus(). */
+    uint64_t script_text_focus_deadline_us;
     PspUiToolbarInputState toolbar_input;
     TilefinchGamepadCapture gamepad_capture;
     TilefinchGamepadState gamepad_state;
     uint64_t navigation_job_started_us;
+    /* Progress watchdog for the navigation started at the time above;
+       restarted whenever that start time changes. */
+    PspNavigationWatchdog navigation_watchdog;
     PspTabTransition tab_transition;
     PspRecoveryTracker recovery;
     PspExitPlan exit;
@@ -1037,6 +1061,10 @@ typedef struct {
 /* src/psp_app/psp_app_input.c. Callback-thread media input crosses one
    generation-bearing supervisor fence, then returns to the ordinary browser-
    thread receiver through these helpers. */
+/* During a media-open scope: refresh the supervisor's player snapshot and
+   take any timeline press it holds as this loop's deferred intent. */
+void psp_app_refresh_supervisor_media(
+    PspInteractiveState *interactive, const PspUiMediaState *media_ui);
 void psp_app_capture_supervisor_media_intent(
     PspInteractiveState *interactive);
 bool psp_app_dispatch_deferred_media_intent(
@@ -1086,6 +1114,10 @@ typedef struct {
     PspInteractiveState *interactive;
 } PspApp;
 
+/* Opens the keyboard when page script focused a text field after an
+   activation's frame, while that activation is still live. */
+bool psp_open_keyboard_for_late_script_focus(PspApp *app);
+
 /* The profile asks for update checks and a trusted endpoint exists for its
    channel: the settings half of the update check's eligibility (see
    tilefinch/psp_update_check.h), used at boot and after every change. */
@@ -1095,6 +1127,8 @@ bool psp_app_update_check_configured(const BrowserProfile *profile,
 /* Rebuilt every iteration of the interactive loop. */
 typedef struct {
     uint64_t ui_sample_us;
+    /* A press the supervisor queued during page work: when it was made. */
+    uint64_t replayed_press_us;
     bool page_dirty;
     bool pointer_activation;
     /* The activation came from a cursor click on the loading page. */
@@ -1177,6 +1211,7 @@ bool psp_input_script_begin(
     const TilefinchInstallPaths *install_paths, const char *argv0,
     const char *name);
 bool psp_input_script_running(void);
+unsigned psp_input_script_step_now(const char **kind);
 bool psp_input_script_report_pending(void);
 void psp_input_script_interrupt_by_user(void);
 bool psp_input_script_frame(

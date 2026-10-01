@@ -132,6 +132,7 @@ typedef struct {
     bool response_provenance_known;
     bool retained_empty;
     bool apply_rules;
+    bool preload;
     lxb_dom_node_t *element;
     bool cors;
     TilefinchCredentialsMode credentials;
@@ -208,6 +209,15 @@ static bool stylesheet_parse_admitted(ResourceContext *context,
     budget_record_pressure(context->budget, BUDGET_PRESSURE_STYLESHEET,
                            working, 0);
     return false;
+}
+
+/* Style preloads are optional hints with a lane of their own: as many
+   responses as active sheets but half the aggregate bytes. Active links are
+   admitted against their own counters only, so no number of earlier preloads
+   can refuse a page's CSS, while retained preload bodies stay bounded. */
+static size_t style_preload_byte_limit(const ResourceContext *context)
+{
+    return context->maximum_total_bytes / 2u;
 }
 
 static StylesheetDocumentResource *document_resource_find(
@@ -460,6 +470,19 @@ static void document_resource_record_loaded(
        succeeded; the author-visible link must still settle.  A later style
        rebuild simply refetches when a non-empty body was not retained. */
     entry->state = STYLESHEET_DOCUMENT_RESOURCE_LOADED;
+}
+
+/* The first active link replaying a preloaded body takes over its charge. */
+static void style_preload_charge_release(ResourceContext *context,
+                                         StylesheetDocumentResource *entry)
+{
+    if (entry == NULL || !entry->preload_charged) return;
+    ExternalStylesheetStats *stats = context->stats;
+    if (stats->preload_attempted != 0) stats->preload_attempted--;
+    stats->preload_bytes -= entry->preload_charge < stats->preload_bytes
+        ? entry->preload_charge : stats->preload_bytes;
+    entry->preload_charged = false;
+    entry->preload_charge = 0;
 }
 
 static bool document_resource_suppresses(
@@ -1260,10 +1283,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
             /* Sharing trims the fetch buffer before transferring ownership,
                so it may move the bytes.  The artifact cache below must hash
                the post-transfer address, never the append buffer it replaced. */
-            if (fetched->shared_body != NULL
-                && fetched->shared_body->length == css_length) {
-                css_data = fetched->shared_body->data;
-            }
+            css_data = (const unsigned char *) fetched->data;
         }
         tilefinch_platform_trace_step("css-artifact-store");
         bool ir_stored = new_ir != NULL
@@ -1338,7 +1358,7 @@ static bool settle_stylesheet_data(ResourceContext *context,
                                    FetchResult *fetched,
                                    bool use_cached,
                                    BrowserSharedBody *cached_body,
-                                   bool apply_rules,
+                                   bool apply_rules, bool preload,
                                    const TilefinchRequestContext *request_context,
                                    const TilefinchResourceGrant *resource_grant)
 {
@@ -1348,11 +1368,15 @@ static bool settle_stylesheet_data(ResourceContext *context,
             depth, fetched,
             use_cached, cached_body, request_context, resource_grant);
     }
-    if (css_length > context->maximum_total_bytes - context->stats->bytes) {
+    size_t *charged = preload ? &context->stats->preload_bytes
+                              : &context->stats->bytes;
+    size_t limit = preload ? style_preload_byte_limit(context)
+                           : context->maximum_total_bytes;
+    if (css_length > limit - *charged) {
         context->stats->skipped_limit++;
         return true;
     }
-    context->stats->bytes += css_length;
+    *charged += css_length;
     context->stats->loaded++;
     /* Media affects whether CSS participates in the cascade, not whether the
        response is fetched, cached, or completes its link element. */
@@ -1806,6 +1830,21 @@ static void abandon_stylesheet_batch(ResourceContext *context,
     context->pending_count = 0;
 }
 
+static void style_preload_settlement(ResourceContext *context,
+                                     lxb_dom_node_t *element,
+                                     StylesheetDocumentResourceState state)
+{
+    StylesheetDocumentResources *resources = context->document_resources;
+    if (resources == NULL || element == NULL) return;
+    size_t at = 0;
+    while (at < resources->style_preload_count
+           && resources->style_preloads[at].element != element) at++;
+    if (at == STYLESHEET_DOCUMENT_RESOURCE_LIMIT) return;
+    if (at == resources->style_preload_count) resources->style_preload_count++;
+    resources->style_preloads[at].element = element;
+    resources->style_preloads[at].state = state;
+}
+
 static bool flush_stylesheet_batch(ResourceContext *context)
 {
     if (context->pending_count == 0) return true;
@@ -1813,8 +1852,21 @@ static bool flush_stylesheet_batch(ResourceContext *context)
     bool parsed = true;
     for (size_t i = 0; i < context->pending_count; i++) {
         PendingStylesheet *pending = &context->pending[i];
+        /* A preload promoted by a matching active link is that link now. */
+        bool preload_only = pending->preload && !pending->apply_rules;
         FetchResult *fetched = fetch_result_create(context->budget);
         if (fetched == NULL) {
+            if (preload_only) {
+                if (pending->request_id != 0) {
+                    (void) fetch_scheduler_cancel(context->scheduler,
+                        pending->request_id, "preload allocation refused");
+                    (void) fetch_scheduler_discard(context->scheduler,
+                                                   pending->request_id);
+                }
+                context->stats->failed++;
+                pending_stylesheet_release(context, pending);
+                continue;
+            }
             for (size_t j = i; j < context->pending_count; j++) {
                 PendingStylesheet *remaining = &context->pending[j];
                 if (remaining->request_id != 0) {
@@ -1863,11 +1915,15 @@ static bool flush_stylesheet_batch(ResourceContext *context)
         if (!success) {
             if (fetched->timed_out) context->deadline_reached = true;
             context->stats->failed++;
-            document_resource_record_failure(
-                context, pending->url,
-                pending->owns_url ? &pending->url : NULL,
-                fetched, false);
-            if (pending->url == NULL) pending->owns_url = false;
+            /* A preload's quota, mode or transport refusal is its own; only
+               an HTTP error status says the URL itself failed. */
+            if (!preload_only || stylesheet_http_status_is_error(fetched)) {
+                document_resource_record_failure(
+                    context, pending->url,
+                    pending->owns_url ? &pending->url : NULL,
+                    fetched, false);
+                if (pending->url == NULL) pending->owns_url = false;
+            }
         } else {
             TilefinchRequestContext request_context =
                 stylesheet_request_context(
@@ -1942,11 +1998,13 @@ static bool flush_stylesheet_batch(ResourceContext *context)
             if (!success || !provenance.known
                 || provenance.response_url == NULL) {
                 context->stats->failed++;
-                document_resource_record_failure(
-                    context, pending->url,
-                    pending->owns_url ? &pending->url : NULL,
-                    fetched, true);
-                if (pending->url == NULL) pending->owns_url = false;
+                if (!preload_only) {
+                    document_resource_record_failure(
+                        context, pending->url,
+                        pending->owns_url ? &pending->url : NULL,
+                        fetched, true);
+                    if (pending->url == NULL) pending->owns_url = false;
+                }
                 fetch_result_free(fetched);
                 pending_stylesheet_release(context, pending);
                 continue;
@@ -1989,17 +2047,31 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                 context->stats->cache_hits++;
             }
             tilefinch_platform_trace_step("css-settle");
+            /* The link's rules start here in the cascade (a promoted
+               preload's element stands for the link that promoted it). */
+            if (pending->apply_rules && pending->element != NULL) {
+                stylesheet_note_style_source(context->sheet,
+                                             pending->element);
+            }
+            size_t refused_before = context->stats->skipped_limit;
             if (!settle_stylesheet_data(
                     context, pending->url, &provenance, css_data,
                     css_length, 0,
                     retained_data ? NULL : fetched,
                     retained_data,
                     retained_data ? pending->retained_body : NULL,
-                    pending->apply_rules,
+                    pending->apply_rules, preload_only,
                     &request_context,
                     resource_grant_valid ? &resource_grant : NULL)) {
                 parsed = false;
+            } else if (preload_only
+                       && context->stats->skipped_limit != refused_before) {
+                /* Over the preload byte lane: the element errors and nothing
+                   is retained or charged. */
             } else {
+                if (pending->preload)
+                    style_preload_settlement(context, pending->element,
+                        STYLESHEET_DOCUMENT_RESOURCE_LOADED);
                 if (revalidated && resource_grant_valid) {
                     (void) cache_revalidate_fetch(
                         context->session, pending->url, fetched, &provenance,
@@ -2014,12 +2086,33 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                     (void) fetch_result_share_body(fetched);
                     body = fetched->shared_body;
                 }
-                document_resource_record_loaded(
-                    context, pending->url,
-                    pending->owns_url ? &pending->url : NULL,
-                    &provenance, body, css_length, pending->apply_rules,
-                    pending->cors, pending->credentials);
-                if (pending->url == NULL) pending->owns_url = false;
+                /* Preloads never take the ledger rows active links need. */
+                StylesheetDocumentResources *resources =
+                    context->document_resources;
+                size_t reserved =
+                    context->maximum_count < STYLESHEET_DOCUMENT_RESOURCE_LIMIT
+                    ? context->maximum_count
+                    : STYLESHEET_DOCUMENT_RESOURCE_LIMIT;
+                const char *url = pending->url;
+                bool retain = !preload_only || (resources != NULL
+                    && (document_resource_find(resources, url) != NULL
+                        || resources->count
+                               < STYLESHEET_DOCUMENT_RESOURCE_LIMIT
+                                 - reserved));
+                if (retain) {
+                    document_resource_record_loaded(
+                        context, pending->url,
+                        pending->owns_url ? &pending->url : NULL,
+                        &provenance, body, css_length, pending->apply_rules,
+                        pending->cors, pending->credentials);
+                    if (pending->url == NULL) pending->owns_url = false;
+                }
+                StylesheetDocumentResource *entry = preload_only && retain
+                    ? document_resource_find(resources, url) : NULL;
+                if (entry != NULL) {
+                    entry->preload_charged = true;
+                    entry->preload_charge = css_length;
+                }
             }
         }
         fetch_result_free(fetched);
@@ -2055,15 +2148,32 @@ static bool queue_stylesheet_link(ResourceContext *context,
 {
     size_t rel_length = 0;
     const char *rel = document_attribute(node, "rel", &rel_length);
-    if (rel == NULL || !token_contains(rel, rel_length, "stylesheet")) return true;
+    if (rel == NULL) return true;
+    bool stylesheet = token_contains(rel, rel_length, "stylesheet");
+    if (!stylesheet) {
+        size_t as_length = 0;
+        const char *as = document_attribute(node, "as", &as_length);
+        if (!token_contains(rel, rel_length, "preload")
+            || as == NULL || as_length != 5u
+            || strncasecmp(as, "style", 5u) != 0) return true;
+    }
+    if (!stylesheet)
+        style_preload_settlement(context, node,
+            STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE);
     context->stats->discovered++;
     size_t media_length = 0;
     const char *media = document_attribute(node, "media", &media_length);
-    bool apply_rules = media == NULL || media_length == 0
+    bool media_matches = media == NULL || media_length == 0
         || stylesheet_media_matches(context->sheet, media, media_length);
-    if (!apply_rules) {
+    if (!media_matches) {
         context->stats->skipped_media++;
+        if (!stylesheet) {
+            style_preload_settlement(context, node,
+                STYLESHEET_DOCUMENT_RESOURCE_EMPTY);
+            return true;
+        }
     }
+    bool apply_rules = stylesheet && media_matches;
     if (stylesheet_stage_expired(context)) {
         context->stats->deadline_cancelled++;
         return true;
@@ -2109,6 +2219,14 @@ static bool queue_stylesheet_link(ResourceContext *context,
     const char *crossorigin = document_attribute(
         node, "crossorigin", &crossorigin_length);
     bool integrity_present = integrity != NULL && integrity_length != 0;
+    bool cors = crossorigin != NULL;
+    TilefinchCredentialsMode credentials = cors
+        && crossorigin_length == strlen("use-credentials")
+        && strncasecmp(crossorigin, "use-credentials",
+                       crossorigin_length) == 0
+            ? TILEFINCH_CREDENTIALS_INCLUDE
+            : cors ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
+                   : TILEFINCH_CREDENTIALS_INCLUDE;
     uint32_t hash = hash_url(resolved);
     /* SRI is an element-scoped assertion. Do not allow a failed or differently
        annotated link to suppress a later link to the same URL. Ordinary
@@ -2116,15 +2234,41 @@ static bool queue_stylesheet_link(ResourceContext *context,
     StylesheetReferenceState reference_state = integrity_present
         ? STYLESHEET_REFERENCE_NEW
         : stylesheet_reference_note(context, hash, apply_rules);
+    /* Record the URL so a later active stylesheet can promote this queued
+       preload without spending a second request slot. Each preload still
+       verifies its own metadata before receiving its completion event. */
+    if (!stylesheet) reference_state = STYLESHEET_REFERENCE_NEW;
     if (reference_state == STYLESHEET_REFERENCE_DUPLICATE) {
         context->stats->duplicate++;
         return true;
     }
+    ExternalStylesheetStats *stats = context->stats;
     if (reference_state == STYLESHEET_REFERENCE_PROMOTED) {
         context->stats->duplicate++;
+        size_t remaining = stats->bytes < context->maximum_total_bytes
+            ? context->maximum_total_bytes - stats->bytes : 0;
+        size_t wanted = context->maximum_single_bytes < remaining
+            ? context->maximum_single_bytes : remaining;
         for (size_t i = 0; i < context->pending_count; i++) {
             PendingStylesheet *queued = &context->pending[i];
-            if (queued->url != NULL && strcmp(queued->url, resolved) == 0) {
+            size_t queued_integrity_length = 0;
+            if (queued->element != NULL)
+                (void) document_attribute(queued->element, "integrity",
+                                           &queued_integrity_length);
+            if (queued->url != NULL && strcmp(queued->url, resolved) == 0
+                && queued->cors == cors
+                && queued->credentials == credentials
+                && queued_integrity_length == 0) {
+                if (queued->preload && !queued->apply_rules) {
+                    /* Promotion moves the response into the active lane:
+                       it needs an active slot, and a request capped by the
+                       smaller preload allowance must not cap this link. */
+                    if (stats->attempted >= context->maximum_count
+                        || queued->maximum_bytes < wanted) break;
+                    if (stats->preload_attempted != 0)
+                        stats->preload_attempted--;
+                    stats->attempted++;
+                }
                 queued->apply_rules = true;
                 return true;
             }
@@ -2133,14 +2277,23 @@ static bool queue_stylesheet_link(ResourceContext *context,
     StylesheetDocumentResource *document_resource = document_resource_find(
         context->document_resources, resolved);
     if (document_resource_suppresses(context, document_resource)) {
+        if (!stylesheet)
+            style_preload_settlement(context, node, document_resource->state);
         return true;
     }
-    if (context->stats->attempted >= context->maximum_count
-        || context->stats->bytes >= context->maximum_total_bytes) {
+    /* Each lane is admitted against its own charges (see
+       style_preload_byte_limit). A preload refused here only errors its own
+       element; it never records the URL as failed for active links. */
+    size_t *attempted = stylesheet ? &stats->attempted
+                                   : &stats->preload_attempted;
+    size_t charged = stylesheet ? stats->bytes : stats->preload_bytes;
+    size_t byte_limit = stylesheet ? context->maximum_total_bytes
+                                   : style_preload_byte_limit(context);
+    if (*attempted >= context->maximum_count || charged >= byte_limit) {
         context->stats->skipped_limit++;
-        if (document_resource == NULL
+        if (stylesheet && (document_resource == NULL
             || document_resource->state
-                   != STYLESHEET_DOCUMENT_RESOURCE_LOADED) {
+                   != STYLESHEET_DOCUMENT_RESOURCE_LOADED)) {
             document_resource_record_failure(
                 context, resolved, NULL, NULL, true);
         }
@@ -2148,18 +2301,24 @@ static bool queue_stylesheet_link(ResourceContext *context,
     }
     if (context->pending_count == context->batch_limit
         && !flush_stylesheet_batch(context)) return false;
-    size_t remaining = context->maximum_total_bytes - context->stats->bytes;
+    /* The flush settles charges; read this lane's again. */
+    charged = stylesheet ? stats->bytes : stats->preload_bytes;
+    size_t remaining = charged < byte_limit ? byte_limit - charged : 0;
     size_t maximum = context->maximum_single_bytes < remaining
                      ? context->maximum_single_bytes : remaining;
     if (maximum == 0) {
         context->stats->skipped_limit++;
-        document_resource_record_failure(
-            context, resolved, NULL, NULL, true);
+        if (stylesheet)
+            document_resource_record_failure(
+                context, resolved, NULL, NULL, true);
         return true;
     }
     size_t url_length = strlen(resolved);
     char *url = budget_malloc(context->budget, url_length + 1);
-    if (url == NULL) return false;
+    if (url == NULL) {
+        if (!stylesheet) context->stats->failed++;
+        return !stylesheet;
+    }
     memcpy(url, resolved, url_length + 1);
     PendingStylesheet *pending =
         &context->pending[context->pending_count];
@@ -2167,15 +2326,10 @@ static bool queue_stylesheet_link(ResourceContext *context,
     pending->owns_url = true;
     pending->maximum_bytes = maximum;
     pending->apply_rules = apply_rules;
+    pending->preload = !stylesheet;
     pending->element = node;
-    pending->cors = crossorigin != NULL;
-    pending->credentials = pending->cors
-        && crossorigin_length == strlen("use-credentials")
-        && strncasecmp(crossorigin, "use-credentials",
-                       crossorigin_length) == 0
-            ? TILEFINCH_CREDENTIALS_INCLUDE
-            : pending->cors ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
-                            : TILEFINCH_CREDENTIALS_INCLUDE;
+    pending->cors = cors;
+    pending->credentials = credentials;
     TilefinchRequestContext request_context = stylesheet_request_context(
         context, resolved, pending->cors, pending->credentials);
     if (integrity_present
@@ -2202,7 +2356,9 @@ static bool queue_stylesheet_link(ResourceContext *context,
             document_resource->response_referrer_policy)) {
         context->stats->cache_hits++;
         context->document_resources->retained_body_hits++;
-        context->stats->attempted++;
+        if (stylesheet)
+            style_preload_charge_release(context, document_resource);
+        (*attempted)++;
         context->pending_count++;
         return true;
     }
@@ -2235,7 +2391,7 @@ static bool queue_stylesheet_link(ResourceContext *context,
     }
     if (cache_status == BROWSER_CACHE_FRESH) {
         context->stats->cache_hits++;
-        context->stats->attempted++;
+        (*attempted)++;
         context->pending_count++;
         return true;
     } else {
@@ -2256,14 +2412,15 @@ static bool queue_stylesheet_link(ResourceContext *context,
                 context->content_security_policy, NULL,
                 &transport, &prepared, NULL)) {
             pending_stylesheet_release(context, pending);
-            return false;
+            if (!stylesheet) context->stats->failed++;
+            return !stylesheet;
         }
         const FetchRequest *request = fetch_prepared_page_request(&prepared);
         pending->request_id = fetch_scheduler_enqueue(
             context->scheduler, resolved, request, maximum,
             stylesheet_remaining_ms(context));
         if (pending->request_id == 0) {
-            context->stats->attempted++;
+            (*attempted)++;
             context->stats->failed++;
             /* Scheduler admission failure is transient.  Do not materialize a
                full FetchResult merely to classify this known outcome: that
@@ -2275,7 +2432,7 @@ static bool queue_stylesheet_link(ResourceContext *context,
             return true;
         }
     }
-    context->stats->attempted++;
+    (*attempted)++;
     context->pending_count++;
     return true;
 }
@@ -2347,6 +2504,17 @@ static bool walk(ResourceContext *context, lxb_dom_node_t *node)
     }
 }
 
+static bool stylesheets_append_ordered_suffix_impl(
+    Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
+    size_t node_count, const char *base_url, const char *document_url,
+    const char *document_referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, bool rule_batch);
+
 bool stylesheets_append_ordered_suffix_with_context(
     Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
     size_t node_count, const char *base_url, const char *document_url,
@@ -2357,6 +2525,52 @@ bool stylesheets_append_ordered_suffix_with_context(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     StylesheetDocumentResources *resources,
     ExternalStylesheetStats *stats)
+{
+    return stylesheets_append_ordered_suffix_impl(
+        sheet, budget, nodes, node_count, base_url, document_url,
+        document_referrer_policy, content_security_policy, maximum_count,
+        maximum_total_bytes, maximum_single_bytes, timeout_ms, scheduler,
+        session, resources, stats, true);
+}
+
+bool stylesheets_settle_style_preloads_with_context(
+    Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
+    size_t node_count, const char *base_url, const char *document_url,
+    const char *document_referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats)
+{
+    for (size_t i = 0; nodes != NULL && i < node_count; i++) {
+        size_t rel_length = 0, as_length = 0;
+        const char *rel = document_attribute(nodes[i], "rel", &rel_length);
+        const char *as = document_attribute(nodes[i], "as", &as_length);
+        if (!name_is(nodes[i], "link") || rel == NULL
+            || token_contains(rel, rel_length, "stylesheet")
+            || !token_contains(rel, rel_length, "preload")
+            || as == NULL || as_length != 5u
+            || strncasecmp(as, "style", 5u) != 0) return false;
+    }
+    return stylesheets_append_ordered_suffix_impl(
+        sheet, budget, nodes, node_count, base_url, document_url,
+        document_referrer_policy, content_security_policy, maximum_count,
+        maximum_total_bytes, maximum_single_bytes, timeout_ms, scheduler,
+        session, resources, stats, false);
+}
+
+static bool stylesheets_append_ordered_suffix_impl(
+    Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
+    size_t node_count, const char *base_url, const char *document_url,
+    const char *document_referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, bool rule_batch)
 {
     char normalized_document_policy[STYLESHEET_REFERRER_POLICY_LIMIT];
     stylesheet_referrer_policy_normalize_or_default(
@@ -2369,7 +2583,7 @@ bool stylesheets_append_ordered_suffix_with_context(
         || maximum_total_bytes == 0 || maximum_single_bytes == 0
         || timeout_ms <= 0 || scheduler == NULL || stats == NULL
         || (resources != NULL && resources->budget != budget)) return false;
-    if (!stylesheet_begin_rule_batch(sheet)) return false;
+    if (rule_batch && !stylesheet_begin_rule_batch(sheet)) return false;
     ResourceContext context = {
         .sheet = sheet,
         .budget = budget,
@@ -2424,7 +2638,7 @@ bool stylesheets_append_ordered_suffix_with_context(
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(
         &context, "stylesheet suffix continuation cancelled");
-    if (!stylesheet_end_rule_batch(sheet)) ok = false;
+    if (rule_batch && !stylesheet_end_rule_batch(sheet)) ok = false;
     resource_finish_slice(&context);
     double elapsed = resource_now_ms() - context.started_ms;
     if (elapsed < 0.0) elapsed = 0.0;
@@ -2471,6 +2685,14 @@ bool stylesheets_load_external_tracked_with_context(
     memset(stats, 0, sizeof(*stats));
     if (resources != NULL && resources->budget == NULL) {
         resources->budget = budget;
+    }
+    /* This pass walks the current document. Discard old element identities;
+       suffix continuation keeps earlier settlements until the next rebuild. */
+    if (resources != NULL) resources->style_preload_count = 0;
+    /* Preload charges belong to the stats this pass just cleared. */
+    for (size_t i = 0; resources != NULL && i < resources->count; i++) {
+        resources->items[i].preload_charged = false;
+        resources->items[i].preload_charge = 0;
     }
     bool owns_scheduler = scheduler == NULL;
     if (owns_scheduler) {
@@ -3165,6 +3387,27 @@ bool stylesheet_document_resources_prepare_complete_census(
     resources->final_resample_required = false;
     resources->final_resample_completed = true;
     return true;
+}
+
+bool stylesheet_document_resources_link_applied(
+    const StylesheetDocumentResources *resources, const char *base_url,
+    const char *href, size_t href_length)
+{
+    if (resources == NULL || href == NULL || base_url == NULL
+        || href_length >= 2048) return false;
+    char reference[2048];
+    memcpy(reference, href, href_length);
+    reference[href_length] = '\0';
+    char resolved[4096];
+    if (!fetch_resolve_url(base_url, reference, resolved,
+                           sizeof(resolved))) return false;
+    for (size_t i = 0; i < resources->count; i++) {
+        const StylesheetDocumentResource *entry = &resources->items[i];
+        if (entry->url != NULL && strcmp(entry->url, resolved) == 0) {
+            return entry->rules_applied;
+        }
+    }
+    return false;
 }
 
 StylesheetDocumentResourceState stylesheet_document_resources_link_state(

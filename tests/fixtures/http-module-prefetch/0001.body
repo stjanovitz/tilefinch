@@ -1,0 +1,2 @@
+globalThis.pocSummary="main";
+setTimeout(function(){import("./late.js").then(function(m){globalThis.pocSummary="late="+m.v},function(e){globalThis.pocSummary="error="+e})},0);

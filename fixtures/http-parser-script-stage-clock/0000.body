@@ -1,0 +1,1 @@
+<!doctype html><html><head><title>Stage clock</title></head><body><main><script>for(var i=0,x=0;i<400000;i++)x+=i;document.body.setAttribute("data-first","yes")</script><p>Between scripts</p><script>for(var j=0,y=0;j<400000;j++)y+=j;document.body.setAttribute("data-second","yes")</script><h1 id="content">Server content</h1></main></body></html>

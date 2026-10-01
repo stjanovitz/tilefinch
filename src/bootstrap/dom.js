@@ -3,8 +3,6 @@
     scriptAsyncAssigned = globalThis.__tilefinchScriptAsyncAssigned,
     prepareDynamicSubtree = globalThis.__tilefinchPrepareDynamicSubtree,
     appendMany = globalThis.__tilefinchAppendMany,
-    ancestorSetHas = Set.prototype.has,
-    ancestorSetAdd = Set.prototype.add,
     ancestorApply = Reflect.apply,
     numberFrom = Number,
     numberIsFinite = Number.isFinite,
@@ -16,23 +14,127 @@
        so authored deep trees remain usable without making cycles unbounded. */
     ancestorLimit = 256,
     cloneDepthLimit = 64,
+    /* A cycle cannot end, so it always reaches the cap: the bound alone
+       detects it without a Set and two calls per step on every dispatch. */
     boundedAncestorPath = (start, parentOf) => {
-      const path = [],
-        seen = new Set();
+      const path = [];
       for (let at = start; at; at = parentOf(at)) {
-        if (
-          path.length >= ancestorLimit ||
-          ancestorApply(ancestorSetHas, seen, [at])
-        )
+        if (path.length >= ancestorLimit)
           throw new DOMException(
             "Cyclic or excessively deep node ancestry",
             "HierarchyRequestError",
           );
-        ancestorApply(ancestorSetAdd, seen, [at]);
         path.push(at);
       }
       return path;
     };
+  /* Resolve a computed CSS length that may still be written as math
+     (calc/min/max/clamp, env(), rem, %) to pixels, or NaN. Some properties
+     reach script unresolved; chatgpt.com's scroll-margin-top is
+     max(0px,calc(calc(max(1rem,env(safe-area-inset-top))+3.625rem)+...)).
+     Bounded: 256 tokens, 16 levels of nesting. */
+  const cssLengthPixels = (text, fontSize = 16, reference = 0) => {
+    const source = String(text ?? "").trim();
+    if (source === "" || source.length > 1024) return NaN;
+    const tokens = [];
+    const pattern =
+      /\s*(?:([+-]?(?:\d*\.\d+|\d+)(?:e[+-]?\d+)?)([a-z%]*)|([a-z-]+)\(|([-a-z]+)|([()*/,+-]))/giy;
+    let match;
+    while (tokens.length <= 256 && pattern.lastIndex < source.length
+           && (match = pattern.exec(source)) !== null) {
+      if (match[1] !== undefined) {
+        const previous = tokens[tokens.length - 1];
+        /* A sign binds to the number only where an operand may start. */
+        if (/^[+-]/.test(match[1]) && previous
+            && (previous.kind === "number" || previous.value === ")")) {
+          tokens.push({ kind: "op", value: match[1][0] });
+          tokens.push({ kind: "number", value: parseFloat(match[1].slice(1)),
+                        unit: match[2].toLowerCase() });
+        } else
+          tokens.push({ kind: "number", value: parseFloat(match[1]),
+                        unit: match[2].toLowerCase() });
+      } else if (match[3] !== undefined)
+        tokens.push({ kind: "function", value: match[3].toLowerCase() });
+      else if (match[4] !== undefined)
+        tokens.push({ kind: "ident", value: match[4].toLowerCase() });
+      else tokens.push({ kind: "op", value: match[5] });
+    }
+    if (tokens.length > 256 || pattern.lastIndex < source.trimEnd().length)
+      return NaN;
+    const rootSize = 16;
+    const unitPixels = (value, unit) => {
+      switch (unit) {
+        case "": case "px": return value;
+        case "rem": return value * rootSize;
+        case "em": return value * fontSize;
+        case "%": return (value * reference) / 100;
+        case "vw": return (value * innerWidth) / 100;
+        case "vh": return (value * innerHeight) / 100;
+        case "vmin": return (value * mathMin(innerWidth, innerHeight)) / 100;
+        case "vmax": return (value * Math.max(innerWidth, innerHeight)) / 100;
+        case "pt": return (value * 4) / 3;
+        default: return NaN;
+      }
+    };
+    let at = 0;
+    const peek = () => tokens[at];
+    const take = (value) =>
+      tokens[at] && tokens[at].value === value ? (at++, true) : false;
+    const expression = (depth) => {
+      if (depth > 16) return NaN;
+      let value = product(depth);
+      for (;;) {
+        if (take("+")) value += product(depth);
+        else if (take("-")) value -= product(depth);
+        else return value;
+      }
+    };
+    const product = (depth) => {
+      let value = operand(depth);
+      for (;;) {
+        if (take("*")) value *= operand(depth);
+        else if (take("/")) value /= operand(depth);
+        else return value;
+      }
+    };
+    const list = (depth) => {
+      const values = [expression(depth + 1)];
+      while (take(",")) values.push(expression(depth + 1));
+      return take(")") ? values : [NaN];
+    };
+    const operand = (depth) => {
+      const token = peek();
+      if (!token) return NaN;
+      at++;
+      if (token.kind === "number") return unitPixels(token.value, token.unit);
+      if (token.value === "(") {
+        const value = expression(depth + 1);
+        return take(")") ? value : NaN;
+      }
+      if (token.kind !== "function") return NaN;
+      if (token.value === "env") {
+        const name = peek()?.kind === "ident" ? tokens[at++].value : "";
+        let fallback = NaN;
+        if (take(",")) fallback = expression(depth + 1);
+        if (!take(")")) return NaN;
+        return name.startsWith("safe-area-inset-") ? 0
+          : (numberIsFinite(fallback) ? fallback : 0);
+      }
+      const values = list(depth);
+      switch (token.value) {
+        case "calc": return values.length === 1 ? values[0] : NaN;
+        case "min": return mathMin(...values);
+        case "max": return Math.max(...values);
+        case "clamp":
+          return values.length === 3
+            ? Math.max(values[0], mathMin(values[1], values[2])) : NaN;
+        default: return NaN;
+      }
+    };
+    const result = expression(0);
+    return at === tokens.length ? result : NaN;
+  };
+  globalThis.__tilefinchCssLengthPixels = cssLengthPixels;
   Object.defineProperty(globalThis, "__tilefinchBoundedAncestorPath", {
     enumerable: false,
     configurable: false,
@@ -74,7 +176,73 @@
     });
   let dynamicPreparationSuppressed = 0,
     cloneCallDepth = 0,
-    templateContentsOwnerDocument = null;
+    templateContentsOwnerDocument = null,
+    nodeOwnersActive = false;
+  /* A native node's adopted owner document is a tag the bridge keeps per
+     handle (__tilefinchNodeOwner), so it outlives the node's wrappers:
+     1 is this document, 2 the template contents owner, 3-255 the
+     script-side documents listed here. Nodes no adoption tagged (template
+     contents, nodes parsed into an adopted tree) inherit it natively.
+     __tilefinchAdoptedOwner on a wrapper caches it (page script reads
+     ownerDocument thousands of times per interaction), and is the only
+     record for script-side nodes. Until the first adoption away from this
+     document or template contents read, every native node is this
+     document's and the bridge keeps no tags. */
+  const nodeOwnerDocuments = [null, null, null],
+    nodeOwnerTags = new Map(),
+    templateOwnerDocument = () =>
+      templateContentsOwnerDocument ||
+      (templateContentsOwnerDocument =
+        globalThis.__tilefinchNewDocument?.() || null),
+    nodeOwnerTag = (owner) => {
+      if (!owner || owner === document) return 1;
+      if (owner === templateContentsOwnerDocument) return 2;
+      let tag = nodeOwnerTags.get(owner) || nodeOwnerDocuments.indexOf(null, 3);
+      if (nodeOwnerDocuments[tag] === owner) return tag;
+      if (tag < 0 && nodeOwnerDocuments.length >= 19) {
+        // Reuse the tags no node holds any more before growing.
+        const held = new Set(__tilefinchNodeOwner(0));
+        for (let at = 3; at < nodeOwnerDocuments.length; at++)
+          if (!held.has(at)) {
+            nodeOwnerTags.delete(nodeOwnerDocuments[at]);
+            nodeOwnerDocuments[at] = null;
+          }
+        tag = nodeOwnerDocuments.indexOf(null, 3);
+      }
+      if (tag < 0 && nodeOwnerDocuments.length < 256)
+        tag = nodeOwnerDocuments.length;
+      if (tag < 0) return 0;
+      nodeOwnerDocuments[tag] = owner;
+      nodeOwnerTags.set(owner, tag);
+      return tag;
+    },
+    cacheNodeOwner = (node, owner) =>
+      Reflect.defineProperty(node, "__tilefinchAdoptedOwner", {
+        configurable: true,
+        writable: true,
+        value: owner,
+      }),
+    setNodeOwner = (node, owner) => {
+      if (node.__handle > 0 && !globalThis.__tilefinchIsVirtualRemote(node)) {
+        // Tag 0 (253 live documents) leaves only the wrapper's record.
+        const tag = nodeOwnerTag(owner);
+        if (tag > 1 || (tag === 1 && nodeOwnersActive))
+          nodeOwnersActive =
+            __tilefinchNodeOwner(node.__handle, tag) || nodeOwnersActive;
+      }
+      cacheNodeOwner(node, owner);
+    };
+  Object.defineProperty(globalThis, "__tilefinchSetNodeOwner", {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: setNodeOwner,
+  });
+  /* Nodes a native receiver builds come from the native document: a
+     script-side owner's factories would make script-side nodes. Inserting
+     them then adopts them into the receiver's owner. */
+  const factoryDocument = (node) =>
+    node.__handle !== undefined ? document : node.ownerDocument || document;
   const documentListeners = new Map(),
     smoothElementScrolls = new WeakMap();
   globalThis.__tilefinchTaskRealm = "top";
@@ -209,13 +377,32 @@
     handlerDrops: 0,
     observerDrops: 0,
     recordDrops: 0,
+    parserRecordsCoalesced: 0,
+    recordsCoalesced: 0,
     dirtyDrops: 0,
     stateEvictions: 0,
     controlDrops: 0,
+    /* Wrapper churn: a wrapper built for a node whose previous wrapper the
+       collector already finalized is rebuilt work. */
+    wrapperCreates: 0,
+    wrappersFinalized: 0,
+    /* MutationObserver routing work for the native tilefinch-work record:
+       records queued, and observers examined per routed mutation. */
+    mutationRecords: 0,
+    observerVisits: 0,
   };
   globalThis.__tilefinchRetentionStats = retentionStats;
+  /* The lazily loaded traversal module installs the live NodeIterator
+     removal hook once; removals must then be enumerated even when no
+     MutationObserver is registered. */
+  let nodeIteratorHooks = null;
+  globalThis.__tilefinchSetNodeIteratorHooks = (hooks) => {
+    nodeIteratorHooks = hooks;
+    delete globalThis.__tilefinchSetNodeIteratorHooks;
+  };
   const mutationChildSnapshot = (node) => {
-    if (mutationObservers.length === 0 && parserTreeSnapshot === null) return [];
+    if (mutationObservers.length === 0 && !nodeIteratorHooks?.active())
+      return [];
     const values = [];
     let child = node?.firstChild || null;
     while (child && values.length < 256) {
@@ -244,6 +431,7 @@
   globalThis.__tilefinchWeakNodeCache = weakNodeCache;
   const nodeFinalizer = weakNodeCache
     ? new FinalizationRegistry((held) => {
+        retentionStats.wrappersFinalized++;
         const entry = nodeCache.get(held.handle);
         if (entry && entry.lease === held.lease) nodeCache.delete(held.handle);
         __tilefinchReleaseNodeWrapper(held.handle, held.lease);
@@ -277,7 +465,11 @@
   };
   const cacheNode = (handle, wrapper) => {
     handle = Number(handle);
-    const lease = weakNodeCache ? Number(__tilefinchRetainNodeWrapper(handle)) : 0;
+    /* The same WeakRef is the cache entry's and, for native getters, the
+       handle slot's. */
+    const reference = weakNodeCache ? new WeakRef(wrapper) : null,
+      lease = weakNodeCache
+        ? Number(__tilefinchRetainNodeWrapper(handle, reference)) : 0;
     if (!weakNodeCache) {
       nodeCache.set(handle, { wrapper, lease: 0 });
       wrapper.__tilefinchHandleLease = 0;
@@ -291,7 +483,7 @@
     /* The same private record is the cache entry, held value and unregister
        token. It contains only a WeakRef to the wrapper: sharing it must not
        turn finalizer bookkeeping into a strong target-retention cycle. */
-    const entry = { reference: new WeakRef(wrapper), handle, lease };
+    const entry = { reference, handle, lease };
     nodeCache.set(handle, entry);
     registerNodeWrapper(wrapper, entry, entry);
     wrapper.__tilefinchHandleLease = lease;
@@ -308,8 +500,16 @@
   globalThis.__tilefinchBeginTraversal = () => {
     if (globalThis.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
   };
+  /* Until a node has a stable key or is a section-remote stand-in, no
+     wrapper can be virtual-remote (__tilefinchIsVirtualRemote). */
+  let remoteIdentitySeen = false;
+  const noteRemoteWrapper = () => {
+    remoteIdentitySeen = true;
+    __tilefinchNoteRemoteWrapper();
+  };
   const rememberStableWrapper = (key, wrapper) => {
     key = String(key || "");
+    if (key) remoteIdentitySeen = true;
     if (!key || key.length > 192) return;
     /* The section writer can be installed after bootstrap traversal began.
        Promote at the first actual section-aware retention point as well, so
@@ -556,10 +756,12 @@
     return merged;
   };
   globalThis.__tilefinchIsVirtualRemote = (node) =>
-    !!node?.__tilefinchRemote ||
-    (!!node?.__tilefinchStableKey &&
-      Number.isInteger(Number(node.__tilefinchRemoteSection)) &&
-      Number(node.__tilefinchRemoteSection) !== Number(__tilefinchSectionIdentity()));
+    remoteIdentitySeen &&
+    (!!node?.__tilefinchRemote ||
+      (!!node?.__tilefinchStableKey &&
+        Number.isInteger(Number(node.__tilefinchRemoteSection)) &&
+        Number(node.__tilefinchRemoteSection) !==
+          Number(__tilefinchSectionIdentity())));
   const canReadRemoteRelation = (node) =>
     globalThis.__tilefinchHasRemoteNodeWriter &&
     !!node?.__tilefinchStableKey &&
@@ -577,7 +779,8 @@
           ? document.body || node
           : node;
   };
-  const namespacedAttributes = new WeakMap(),
+  const attributeListMemo = new WeakMap(),
+    namespacedAttributes = new WeakMap(),
     attributeObjects = new WeakMap(),
     attributeOrder = new WeakMap(),
     namedNodeMaps = new WeakMap(),
@@ -705,6 +908,14 @@
   };
   class EventTarget {}
   class Node extends EventTarget {}
+  Object.defineProperty(Node.prototype, "hasChildNodes", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: function hasChildNodes() {
+      return this.firstChild != null;
+    },
+  });
   Object.defineProperty(Node.prototype, "isConnected", {
     configurable: true,
     enumerable: true,
@@ -826,6 +1037,18 @@
   });
   class CharacterData extends Node {}
   class Text extends CharacterData {}
+  Text.prototype.splitText = function (offset) {
+    const data = String(this.data);
+    offset = Number(offset) >>> 0;
+    if (offset > data.length)
+      throw new DOMException("Invalid split offset", "IndexSizeError");
+    const tail = (this.ownerDocument || document).createTextNode(
+      data.slice(offset),
+    );
+    this.data = data.slice(0, offset);
+    this.parentNode?.insertBefore(tail, this.nextSibling);
+    return tail;
+  };
   class CDATASection extends Text {}
   class ProcessingInstruction extends CharacterData {}
   class Comment extends CharacterData {}
@@ -938,6 +1161,8 @@
   class HTMLFormElement extends HTMLElement {
     submit() {
       if (globalThis.__tilefinchQueueFormSubmission?.(this, null)) return;
+      globalThis.__tilefinchSubmittedBody =
+        globalThis.__tilefinchSubmissionBody?.(this, null) ?? null;
       globalThis.__tilefinchSubmitted = true;
       globalThis.__tilefinchSubmittedFormHandle = this.__handle;
       globalThis.__tilefinchSubmittedSubmitterHandle = 0;
@@ -969,6 +1194,8 @@
       if (this.dispatchEvent(event)) {
         if (globalThis.__tilefinchQueueFormSubmission?.(this, submitter))
           return;
+        globalThis.__tilefinchSubmittedBody =
+          globalThis.__tilefinchSubmissionBody?.(this, submitter) ?? null;
         globalThis.__tilefinchSubmitted = true;
         globalThis.__tilefinchSubmittedFormHandle = this.__handle;
         globalThis.__tilefinchSubmittedSubmitterHandle = submitter?.__handle || 0;
@@ -986,6 +1213,7 @@
   class HTMLOutputElement extends HTMLElement {}
   class HTMLAnchorElement extends HTMLElement {}
   class HTMLLinkElement extends HTMLElement {}
+  class HTMLMetaElement extends HTMLElement {}
   class HTMLTemplateElement extends HTMLElement {}
   class HTMLDialogElement extends HTMLElement {}
   class HTMLDetailsElement extends HTMLElement {}
@@ -1016,6 +1244,8 @@
   });
   let shadowRootCreated = false;
   const shadowRootForHost = (host) => {
+    /* Only attachShadow registers a root (and sets the flag). */
+    if (!shadowRootCreated) return null;
     if (typeof host === "number")
       return shadowRootByHostHandle.get(Number(host)) || null;
     return shadowRootByHost.get(host) ||
@@ -1143,6 +1373,7 @@
     HTMLOutputElement,
     HTMLAnchorElement,
     HTMLLinkElement,
+    HTMLMetaElement,
     HTMLTemplateElement,
     HTMLDialogElement,
     HTMLDetailsElement,
@@ -1339,7 +1570,23 @@
     globalThis.__tilefinchValidatePreInsert?.(this, child, null);
     throw new DOMException("Node cannot have children", "HierarchyRequestError");
   };
+  const nativeRootNode = globalThis.__tilefinchRootNode;
   Node.prototype.getRootNode = function (options = {}) {
+    /* Until a shadow root exists every root is a tree root: one native walk
+       instead of a wrapper and an instanceof per ancestor. A root with a
+       script-side detached parent takes the walk below. */
+    if (
+      !shadowRootCreated &&
+      typeof nativeRootNode === "function" &&
+      this.__handle > 0 &&
+      !this.__tilefinchDetachedParent
+    ) {
+      const found = Number(nativeRootNode(this.__handle));
+      if (found < 0) return document;
+      const root = found > 0 ? wrap(found) : null;
+      if (root && !root.__tilefinchDetachedParent)
+        return root === document.documentElement ? document : root;
+    }
     let at = this,
       shadow = null,
       steps = 0;
@@ -1679,7 +1926,7 @@
   };
   Element.prototype.insertAdjacentText = function (where, data) {
     const position = adjacentPosition(where),
-      text = this.ownerDocument.createTextNode(String(data));
+      text = factoryDocument(this).createTextNode(String(data));
     if (position === "beforebegin") {
       if (!this.parentNode) return;
       this.parentNode.insertBefore(text, this);
@@ -2039,11 +2286,16 @@
       return null;
     },
     shadowEventPath = (target, composed) => {
-      const originRoot = target?.getRootNode?.() || null;
+      /* Without a shadow root there is no slot, boundary or origin root to
+         compare against: the plain parent chain. */
+      const originRoot = shadowRootCreated
+          ? target?.getRootNode?.() || null
+          : null,
+        documentElement = document.documentElement;
       return boundedAncestorPath(target, (node) => {
         if (node instanceof Document) return null;
-        if (node === document.documentElement) return document;
-        const slot = assignedSlotInternal(node, true);
+        if (node === documentElement) return document;
+        const slot = shadowRootCreated && assignedSlotInternal(node, true);
         if (slot) return slot;
         if (node instanceof ShadowRoot)
           /*
@@ -2093,6 +2345,8 @@
       });
     },
     retargetShadowEvent = (original, current) => {
+      /* Retargeting only ever crosses a shadow root. */
+      if (!shadowRootCreated) return original;
       let target = original;
       for (let steps = 0; target && steps < ancestorLimit; steps++) {
         const root = target.getRootNode?.() || null;
@@ -2312,6 +2566,13 @@
       writable: false,
       value: shadowRootForHost,
     },
+    /* Whether attachShadow has created any root on this page. */
+    __tilefinchShadowRootsExist: {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: () => shadowRootCreated,
+    },
   });
   Object.defineProperties(Element.prototype, {
     slot: {
@@ -2397,7 +2658,22 @@
       );
     return root.querySelectorAll(tag);
   };
+  /* A document has no parent or siblings and no value; these are null, not
+     absent. chatgpt.com's frame runtime walks parentNode until null. */
+  const documentNull = { configurable: true, enumerable: true, get: () => null };
+  const documentIgnoredValue = {
+    configurable: true,
+    enumerable: true,
+    get: () => null,
+    set: () => {},
+  };
   Object.defineProperties(Document.prototype, {
+    parentNode: documentNull,
+    parentElement: documentNull,
+    previousSibling: documentNull,
+    nextSibling: documentNull,
+    nodeValue: documentIgnoredValue,
+    textContent: documentIgnoredValue,
     querySelector: {
       value: __tilefinchDocumentQuerySelector,
       writable: true,
@@ -2681,9 +2957,9 @@
       !this.parentNode
     )
       return;
-    const template = (this.ownerDocument || document).createElement("template");
+    const template = factoryDocument(this).createElement("template");
     template.innerHTML = String(source);
-    const fragment = (this.ownerDocument || document).createDocumentFragment();
+    const fragment = factoryDocument(this).createDocumentFragment();
     for (const child of [...template.content.childNodes])
       fragment.appendChild(child);
     if (position === "beforebegin")
@@ -2695,7 +2971,138 @@
     else
       this.parentNode.insertBefore(fragment, this.nextSibling);
   };
-  const elementPrototype = (tag, nodeType, namespaceURI) => {
+  /* The HTML setters. chatgpt.com's unauthenticated composer refuses to
+     initialize without them and otherwise fetches a polyfill first.
+     Declarative shadow roots are not parsed, so this is innerHTML. */
+  Element.prototype.setHTMLUnsafe = function (html) {
+    this.innerHTML = String(html);
+  };
+  if (typeof ShadowRoot === "function")
+    ShadowRoot.prototype.setHTMLUnsafe = function (html) {
+      this.innerHTML = String(html);
+    };
+  if (typeof Document === "function")
+    Document.parseHTMLUnsafe = function (html) {
+      return new DOMParser().parseFromString(String(html), "text/html");
+    };
+  /* Web Animations introspection over the animations Element.animate
+     started. chatgpt.com calls element.getAnimations().some(...) without a
+     feature test while positioning its composer. Stylesheet transitions are
+     not listed. */
+  /* The animation an effect belongs to supplies its local time; chatgpt.com's
+     streaming renderer reads effect.getComputedTiming().endTime to pace its
+     word reveal. */
+  const effectClocks = new WeakMap();
+  globalThis.__tilefinchBindEffectClock = (effect, clock) => {
+    effectClocks.set(effect, clock);
+  };
+  const timingNumber = (value, fallback) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : fallback;
+  };
+  globalThis.KeyframeEffect = class KeyframeEffect {
+    #target;
+    #keyframes;
+    #timing;
+    constructor(target, keyframes, options) {
+      this.#target = target ?? null;
+      this.#keyframes = Array.isArray(keyframes)
+        ? keyframes.slice(0, 16).map((frame) => ({ ...frame }))
+        : keyframes && typeof keyframes === "object"
+          ? [{ ...keyframes }]
+          : [];
+      const timing =
+        typeof options === "number"
+          ? { duration: options }
+          : options && typeof options === "object"
+            ? options
+            : {};
+      this.#timing = {
+        delay: timingNumber(timing.delay, 0),
+        endDelay: timingNumber(timing.endDelay, 0),
+        fill: ["none", "forwards", "backwards", "both", "auto"].includes(
+          String(timing.fill),
+        )
+          ? String(timing.fill)
+          : "auto",
+        iterationStart: timingNumber(timing.iterationStart, 0),
+        iterations: timingNumber(timing.iterations, 1),
+        duration: timingNumber(timing.duration, 0),
+        direction: [
+          "normal",
+          "reverse",
+          "alternate",
+          "alternate-reverse",
+        ].includes(String(timing.direction))
+          ? String(timing.direction)
+          : "normal",
+        easing: String(timing.easing || "linear"),
+      };
+    }
+    get target() {
+      return this.#target;
+    }
+    getKeyframes() {
+      return this.#keyframes.map((frame) => ({ ...frame }));
+    }
+    getTiming() {
+      return { ...this.#timing };
+    }
+    getComputedTiming() {
+      const timing = this.#timing,
+        activeDuration = timing.duration * timing.iterations,
+        endTime = Math.max(
+          0,
+          timing.delay + activeDuration + timing.endDelay,
+        ),
+        clock = effectClocks.get(this),
+        localTime = clock ? clock() : null;
+      let progress = null,
+        currentIteration = null;
+      if (
+        typeof localTime === "number" &&
+        localTime >= timing.delay &&
+        localTime < timing.delay + activeDuration &&
+        timing.duration > 0
+      ) {
+        const elapsed = localTime - timing.delay;
+        currentIteration = Math.floor(elapsed / timing.duration);
+        progress = (elapsed % timing.duration) / timing.duration;
+      }
+      return {
+        ...timing,
+        activeDuration,
+        endTime,
+        localTime,
+        progress,
+        currentIteration,
+      };
+    }
+  };
+  Element.prototype.getAnimations = function () {
+    return globalThis.__tilefinchElementAnimations?.(this) || [];
+  };
+  if (typeof Document === "function")
+    Document.prototype.getAnimations = function () {
+      return globalThis.__tilefinchElementAnimations?.(null) || [];
+    };
+  globalThis.reportError = function reportError(error) {
+    if (arguments.length < 1)
+      throw new TypeError("reportError requires an argument");
+    globalThis.__tilefinchReportUncaught?.(error, "reportError");
+  };
+  for (const [name, attribute] of [["inert", "inert"]])
+    Object.defineProperty(HTMLElement.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return this.hasAttribute(attribute);
+      },
+      set(value) {
+        this.toggleAttribute(attribute, !!value);
+      },
+    });
+  const uncachedElementPrototype =(tag, nodeType, namespaceURI) => {
     if (nodeType === Node.TEXT_NODE) return Text.prototype;
     if (nodeType === Node.CDATA_SECTION_NODE) return CDATASection.prototype;
     if (nodeType === Node.PROCESSING_INSTRUCTION_NODE)
@@ -2753,6 +3160,8 @@
         return HTMLAnchorElement.prototype;
       case "link":
         return HTMLLinkElement.prototype;
+      case "meta":
+        return HTMLMetaElement.prototype;
       case "template":
         return HTMLTemplateElement.prototype;
       case "dialog":
@@ -2776,6 +3185,21 @@
       default:
         return HTMLElement.prototype;
     }
+  };
+  /* Every wrapper creation asks; an HTML element's answer depends only on
+     its tag name string, so remember it instead of lowercasing and running
+     the switch again. */
+  const htmlPrototypeByTag = new Map();
+  const elementPrototype = (tag, nodeType, namespaceURI) => {
+    if (nodeType !== Node.ELEMENT_NODE || typeof tag !== "string" ||
+        namespaceURI !== "http://www.w3.org/1999/xhtml")
+      return uncachedElementPrototype(tag, nodeType, namespaceURI);
+    let prototype = htmlPrototypeByTag.get(tag);
+    if (!prototype) {
+      prototype = uncachedElementPrototype(tag, nodeType, namespaceURI);
+      if (htmlPrototypeByTag.size < 256) htmlPrototypeByTag.set(tag, prototype);
+    }
+    return prototype;
   };
   globalThis.__tilefinchElementPrototype = elementPrototype;
   const classListOwner = Symbol("classList owner");
@@ -3210,6 +3634,21 @@
       return attribute;
     },
   });
+  /* Adoption stamps the Attr objects script already holds; one created
+     later takes its element's (adopted) document then, so the element's
+     attribute list need not be materialised for every adopted node. */
+  Object.defineProperty(globalThis, "__tilefinchAdoptAttributeObjects", {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: (node, owner) => {
+      const cache = attributeObjects.get(node);
+      if (cache)
+        for (const attribute of cache.values())
+          if (attribute.__tilefinchAttributeOwner === node)
+            attribute.__tilefinchAttributeOwnerDocument = owner;
+    },
+  });
   globalThis.__tilefinchCreateAttribute = (
     ownerDocument,
     qualifiedName,
@@ -3552,7 +3991,20 @@
             : this.tagName;
     },
     get ownerDocument() {
-      return this.__tilefinchAdoptedOwner || document;
+      const known = this.__tilefinchAdoptedOwner;
+      if (known) return known;
+      if (
+        !nodeOwnersActive ||
+        !(this.__handle > 0) ||
+        globalThis.__tilefinchIsVirtualRemote(this)
+      )
+        return document;
+      const tag = __tilefinchNodeOwner(this.__handle),
+        owner =
+          (tag === 2 ? templateOwnerDocument() : nodeOwnerDocuments[tag]) ||
+          document;
+      if (tag) cacheNodeOwner(this, owner);
+      return owner;
     },
     get namespaceURI() {
       return this.__namespaceURI !== undefined
@@ -3727,6 +4179,20 @@
           })();
     },
     contains(other) {
+      /* One native walk up other's tree (form.elements asks this for every
+         control in the document); a root with a script-side detached
+         parent, or a tree left to script, takes the parentElement walk. */
+      if (
+        typeof nativeRootNode === "function" &&
+        other?.__handle > 0 &&
+        this.__handle > 0 &&
+        !other.__tilefinchDetachedParent
+      ) {
+        const found = Number(nativeRootNode(other.__handle, this.__handle));
+        if (found === Number(this.__handle)) return true;
+        if (found < 0) return false;
+        if (found > 0 && !wrap(found)?.__tilefinchDetachedParent) return false;
+      }
       for (
         let at = other, steps = 0;
         at && steps < ancestorLimit;
@@ -3929,6 +4395,16 @@
     getAttributeNS(namespace, name) {
       namespace = normalizeNamespace(namespace);
       name = String(name);
+      /* Dataset reads use the null namespace. For ordinary native HTML
+         attributes the host is authoritative: do not construct the entire
+         NamedNodeMap/Attr graph just to read one value. Keep case-sensitive,
+         qualified, mirrored and remote lookups on the namespace-aware path. */
+      if (namespace === null && name === name.toLowerCase() &&
+          !name.includes(":") && Number(this.__handle) > 0 &&
+          this.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+          !namespacedAttributes.get(this)?.length &&
+          !globalThis.__tilefinchIsVirtualRemote(this))
+        return __tilefinchGetAttribute(this.__handle, name);
       const found = [...this.attributes].find(
         (attribute) =>
           attribute.namespaceURI === namespace &&
@@ -4015,16 +4491,13 @@
           options === false ? "end" : dictionary.block || "start",
         inline = dictionary.inline || "nearest",
         targetStyle = getComputedStyle(this),
-        marginTop =
-          parseFloat(targetStyle.getPropertyValue("scroll-margin-top")) || 0,
-        marginBottom =
-          parseFloat(targetStyle.getPropertyValue("scroll-margin-bottom")) ||
-          0,
-        marginLeft =
-          parseFloat(targetStyle.getPropertyValue("scroll-margin-left")) || 0,
-        marginRight =
-          parseFloat(targetStyle.getPropertyValue("scroll-margin-right")) ||
-          0;
+        targetFont = parseFloat(targetStyle.fontSize) || 16,
+        length = (style, name, font, reference) =>
+          cssLengthPixels(style.getPropertyValue(name), font, reference) || 0,
+        marginTop = length(targetStyle, "scroll-margin-top", targetFont),
+        marginBottom = length(targetStyle, "scroll-margin-bottom", targetFont),
+        marginLeft = length(targetStyle, "scroll-margin-left", targetFont),
+        marginRight = length(targetStyle, "scroll-margin-right", targetFont);
       for (const at of boundedAncestorPath(
         this.parentElement,
         (node) => node.parentElement,
@@ -4039,14 +4512,15 @@
           continue;
         const targetRect = this.getBoundingClientRect(),
           containerRect = at.getBoundingClientRect(),
-          paddingTop =
-            parseFloat(style.getPropertyValue("scroll-padding-top")) || 0,
-          paddingBottom =
-            parseFloat(style.getPropertyValue("scroll-padding-bottom")) || 0,
-          paddingLeft =
-            parseFloat(style.getPropertyValue("scroll-padding-left")) || 0,
-          paddingRight =
-            parseFloat(style.getPropertyValue("scroll-padding-right")) || 0,
+          containerFont = parseFloat(style.fontSize) || 16,
+          paddingTop = length(style, "scroll-padding-top", containerFont,
+                              containerRect.height),
+          paddingBottom = length(style, "scroll-padding-bottom",
+                                 containerFont, containerRect.height),
+          paddingLeft = length(style, "scroll-padding-left", containerFont,
+                               containerRect.width),
+          paddingRight = length(style, "scroll-padding-right", containerFont,
+                                containerRect.width),
           start =
             at.scrollTop +
             targetRect.top -
@@ -4103,11 +4577,11 @@
       if (root && typeof globalThis.scrollTo === "function") {
         const rootStyle = getComputedStyle(root),
           rect = this.getBoundingClientRect(),
-          paddingTop =
-            parseFloat(rootStyle.getPropertyValue("scroll-padding-top")) || 0,
-          paddingBottom =
-            parseFloat(rootStyle.getPropertyValue("scroll-padding-bottom")) ||
-            0,
+          rootFont = parseFloat(rootStyle.fontSize) || 16,
+          paddingTop = length(rootStyle, "scroll-padding-top", rootFont,
+                              Number(globalThis.innerHeight) || 0),
+          paddingBottom = length(rootStyle, "scroll-padding-bottom", rootFont,
+                                 Number(globalThis.innerHeight) || 0),
           viewportHeight =
             Number(globalThis.innerHeight) ||
             Number(globalThis.visualViewport?.height) ||
@@ -4502,7 +4976,10 @@
       this.appendChild(fragment);
     },
     replaceChildren(...values) {
-      const owner = this.ownerDocument || this,
+      const owner =
+          this.__handle !== undefined
+            ? document
+            : this.ownerDocument || this,
         nodes = values.map((value) =>
           value instanceof Node ? value : owner.createTextNode(String(value)),
         ),
@@ -4565,7 +5042,7 @@
     before(...values) {
       const parent = this.parentNode;
       if (!parent) return;
-      const owner = this.ownerDocument || document,
+      const owner = factoryDocument(this),
         nodes = values.map((value) =>
           value instanceof Node ? value : owner.createTextNode(String(value)),
         ),
@@ -4585,7 +5062,7 @@
     after(...values) {
       const parent = this.parentNode;
       if (!parent) return;
-      const owner = this.ownerDocument || document,
+      const owner = factoryDocument(this),
         nodes = values.map((value) =>
           value instanceof Node ? value : owner.createTextNode(String(value)),
         ),
@@ -4825,7 +5302,7 @@
           for (const child of shadowLightChildren(this))
             this.removeChild(child);
           if (value)
-            this.appendChild(this.ownerDocument.createTextNode(value));
+            this.appendChild(document.createTextNode(value));
           result = true;
         } finally {
           dynamicPreparationSuppressed--;
@@ -4871,7 +5348,7 @@
         /* The native shadow backing node is an implementation detail, not
            part of the host's light-DOM serialization. Serialize clones in
            a detached container so this read cannot expose or mutate it. */
-        const container = this.ownerDocument.createElement("div");
+        const container = document.createElement("div");
         dynamicPreparationSuppressed++;
         try {
           for (const child of shadowLightChildren(this))
@@ -4935,7 +5412,7 @@
            which owns its ShadowRoot. Parse elsewhere and replace only the
            light children. Dynamic script preparation stays suppressed,
            matching native innerHTML's inert-script semantics. */
-        const container = this.ownerDocument.createElement("div");
+        const container = document.createElement("div");
         if (!__tilefinchSetInnerHTML(container.__handle, value))
           throw new Error("innerHTML mutation failed");
         const replacements = Array.from(container.childNodes);
@@ -5015,9 +5492,21 @@
     get parentNode() {
       const nativeReceiver = this;
       if (this.__tilefinchDetachedParent) return this.__tilefinchDetachedParent;
-      if (this === document.documentElement) return document;
       if (globalThis.__tilefinchIsVirtualRemote(this)) return this.parentElement;
-      const parent = wrap(__tilefinchRelation(nativeReceiver.__handle, 8));
+      /* Ancestor walks read this once per step: resolve the common case
+         (a parent that already has a wrapper) without the documentElement
+         getter or a nodeType query. */
+      const parentHandle = __tilefinchRelation(nativeReceiver.__handle, 8);
+      if (!parentHandle)
+        return this === document.documentElement
+          ? document
+          : this.parentElement;
+      const cached = cachedNode(parentHandle);
+      if (cached && cached.__tilefinchRemoteNodeType !== 9) return cached;
+      /* <html>, and a comment or doctype beside it, have the native
+         document as their parent: the document object, not a wrapper. */
+      if (__tilefinchNodeType(parentHandle) === 9) return document;
+      const parent = wrap(parentHandle);
       return parent || this.parentElement;
     },
     get firstElementChild() {
@@ -5187,11 +5676,12 @@
     },
     get isConnected() {
       const nativeReceiver = this;
-      for (const at of boundedAncestorPath(
-        this.__tilefinchDetachedParent,
-        (node) => node.__tilefinchDetachedParent || node.parentNode,
-      ))
-        if (at instanceof Document) return true;
+      if (this.__tilefinchDetachedParent)
+        for (const at of boundedAncestorPath(
+          this.__tilefinchDetachedParent,
+          (node) => node.__tilefinchDetachedParent || node.parentNode,
+        ))
+          if (at instanceof Document) return true;
       return (
         globalThis.__tilefinchIsVirtualRemote(this) ||
         __tilefinchIsConnected(nativeReceiver.__handle)
@@ -5237,22 +5727,23 @@
       return nodeList(values);
     },
     get content() {
+      /* This receiver serves every native element, so it must also answer
+         HTMLMetaElement.content (a reflected attribute) rather than the
+         <template> fragment: ChatGPT's keyboard bootstrap reads the
+         viewport meta's content and threw on null. */
+      if (String(this.localName).toLowerCase() === "meta")
+        return this.getAttribute("content") || "";
       const nativeReceiver = this;
       const content = wrap(__tilefinchContent(nativeReceiver.__handle));
-      if (
-        content &&
-        String(this.localName).toLowerCase() === "template" &&
-        typeof globalThis.__tilefinchNewDocument === "function"
-      ) {
-        if (!templateContentsOwnerDocument)
-          templateContentsOwnerDocument =
-            globalThis.__tilefinchNewDocument();
-        globalThis.__tilefinchAdoptNodeOwner?.(
-          content,
-          templateContentsOwnerDocument,
-        );
-      }
+      // Template contents inherit the template contents owner natively;
+      // the first read only has the bridge start keeping owner tags.
+      if (content && !nodeOwnersActive && templateOwnerDocument())
+        setNodeOwner(content, templateContentsOwnerDocument);
       return content;
+    },
+    set content(value) {
+      if (String(this.localName).toLowerCase() === "meta")
+        this.setAttribute("content", String(value));
     },
     get contentWindow() {
       const nativeReceiver = this;
@@ -5275,7 +5766,18 @@
     get attributes() {
       const nativeReceiver = this;
       return namedNodeMapFor(this, () => {
-        const raw = globalThis.__tilefinchIsVirtualRemote(this)
+        /* The NamedNodeMap proxy reads the whole list for every length,
+           index and iteration step; a loop over it was quadratic in native
+           reads. Reuse the list within one task while no script mutation
+           happened (every one bumps the DOM version, as for form.elements;
+           host-native attribute changes happen between tasks). */
+        const remote = globalThis.__tilefinchIsVirtualRemote(this),
+          version = remote ? -1 : __tilefinchDomVersion(),
+          task = activeTaskSequence,
+          memo = remote ? null : attributeListMemo.get(this);
+        if (memo && memo.version === version && memo.task === task)
+          return memo.values;
+        const raw = remote
             ? globalThis.__tilefinchMergeRemoteAttributes(
                 this,
                 __tilefinchRemoteNodeAttributes(
@@ -5306,10 +5808,12 @@
             ),
           current = [...ordinary, ...shadow],
           order = attributeOrder.get(this) || [];
-        return [
+        const values = Object.freeze([
           ...order.filter((attribute) => current.includes(attribute)),
           ...current.filter((attribute) => !order.includes(attribute)),
-        ];
+        ]);
+        if (!remote) attributeListMemo.set(this, { version, task, values });
+        return values;
       });
     },
     get async() {
@@ -6142,6 +6646,24 @@
       return undefined;
     },
   });
+  /* The hottest receiver getters run natively for ordinary nodes; each
+     keeps its script getter above as the fallback for every other case. */
+  for (const [name, kind] of [["parentNode", 0], ["parentElement", 1],
+                              ["tagName", 2], ["nodeType", 3],
+                              ["firstChild", 4], ["lastChild", 5],
+                              ["nextSibling", 6], ["previousSibling", 7]]) {
+    const descriptor = nativeNodeReceiverDescriptors[name];
+    const fast = descriptor?.get &&
+      __tilefinchMakeFastGetter(kind, descriptor.get, "get " + name);
+    if (typeof fast === "function") descriptor.get = fast;
+  }
+  for (const [name, kind] of [["getAttribute", 0]]) {
+    const descriptor = nativeNodeReceiverDescriptors[name];
+    const fast = typeof descriptor?.value === "function" &&
+      __tilefinchMakeFastMethod(kind, descriptor.value, name,
+                                descriptor.value.length);
+    if (typeof fast === "function") descriptor.value = fast;
+  }
   const wrapperListeners = Symbol("wrapper listeners");
   const nativeNodeEventDescriptors = Object.getOwnPropertyDescriptors({
     addEventListener(type, callback, options = false) {
@@ -6150,6 +6672,15 @@
        * handler slot before appending an author listener so first-dispatch
        * ordering matches a handler installed while parsing. */
       inlineEventHandler(this, type, "on" + type);
+      /* Transitions from stylesheets have no timeline of their own: the
+         motion module watches an element once something listens for them. */
+      if (type.startsWith("transition") || type === "webkitTransitionEnd") {
+        try {
+          if (typeof globalThis.__tilefinchWatchTransitions !== "function")
+            globalThis.__tilefinchEnsureMotionBootstrap?.();
+          globalThis.__tilefinchWatchTransitions?.(this, type);
+        } catch {}
+      }
       const retained = listenerMap(this, true);
       const listeners = retained || this[wrapperListeners] || new Map();
       this[wrapperListeners] = listeners;
@@ -6196,6 +6727,55 @@
             Object.defineProperty(node, name, descriptors[name]);
     },
   });
+  /* The rebinding every wrapper's __tilefinchRebindHandle performs once it
+     has swapped its captured handle from `previous` to `handle`. */
+  const rebindWrapper = (node, previous, handle) => {
+    if (previous !== handle) {
+      const handlers = eventHandlerMap(node, false);
+      if (handlers)
+        for (const [type, value] of handlers)
+          if (value?.token === propertyHandlerRecordToken &&
+              value.sourceToken === inlineHandlerRecordToken) {
+            if (value.wrapper)
+              node.removeEventListener(type, value.wrapper, false);
+            handlers.delete(type);
+          }
+    }
+    if (!globalThis.__tilefinchHasRemoteNodeWriter)
+      globalThis.__tilefinchApplyRemoteMutation?.(node, handle);
+    node.__tilefinchRemote = false;
+    node.__tilefinchRemoteSection = Number(__tilefinchSectionIdentity());
+    node.__tilefinchRemoteTagName = String(
+      __tilefinchTagName(handle) || node.__tilefinchRemoteTagName || "",
+    );
+    node.__tilefinchRemoteNodeType = Number(
+      __tilefinchNodeType(handle) || node.__tilefinchRemoteNodeType || 0,
+    );
+    node.__namespaceURI = __tilefinchNamespaceURI(handle);
+    Object.setPrototypeOf(
+      node,
+      nativeElementPrototype(
+        node.__tilefinchRemoteTagName,
+        node.__tilefinchRemoteNodeType,
+        node.__namespaceURI,
+      ),
+    );
+    const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
+      id = String(__tilefinchGetAttribute(handle, "id") || ""),
+      idKey = id && id.length <= 128 ? "i:" + id : "",
+      stable = globalThis.__tilefinchHasRemoteNodeWriter
+        ? sourceKey || idKey
+        : "";
+    node.__tilefinchStableKey =
+      node.__tilefinchQueryKey ||
+      stable ||
+      String(node.__tilefinchStableKey || "");
+    installStyle(node, handle);
+    installClassList(node);
+    cacheNode(handle, node);
+    return node;
+  };
+  const nodeIdentity = ["", 0, null, 0];
   function wrap(handle) {
     if (!handle) return null;
     const cached = cachedNode(handle);
@@ -6204,6 +6784,7 @@
        the two bridge lookups on every wrapper creation. */
     let stableKey = "";
     if (globalThis.__tilefinchHasRemoteNodeWriter) {
+      remoteIdentitySeen = true;
       const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
         stableId = String(__tilefinchGetAttribute(handle, "id") || "");
       stableKey = sourceKey ||
@@ -6215,14 +6796,27 @@
       rememberStableWrapper(stableKey, retained);
       return retained;
     }
-    const namespaceURI = __tilefinchNamespaceURI(handle);
-    const own = {
-      __namespaceURI: namespaceURI,
-      __tilefinchStableKey: stableKey,
-      __tilefinchRemoteSection: Number(__tilefinchSectionIdentity()),
-      __tilefinchRemoteTagName: String(__tilefinchTagName(handle) || ""),
-      __tilefinchRemoteNodeType: Number(__tilefinchNodeType(handle) || 0),
-      __tilefinchRebindHandle(token, next) {
+    retentionStats.wrapperCreates++;
+    /* [tagName || "", nodeType, namespaceURI, section] in one bridge call,
+       refilling one array rather than allocating one per wrapper. */
+    __tilefinchNodeIdentity(handle, nodeIdentity);
+    const tagName = nodeIdentity[0],
+      nodeType = nodeIdentity[1],
+      namespaceURI = nodeIdentity[2],
+      section = nodeIdentity[3];
+    // Start with the final prototype and final descriptor flags. Changing
+    // either after filling the wrapper de-interns QuickJS's large property
+    // shape, leaving a separate shape allocation for every visited element.
+    const node = Object.create(
+      nativeElementPrototype(tagName, nodeType, namespaceURI),
+    );
+    Object.defineProperty(node, "__tilefinchRebindHandle", {
+      enumerable: false,
+      configurable: false,
+      writable: false,
+      /* Only the handle swap needs this wrapper's closure; the rest of the
+         rebinding is shared. */
+      value: function (token, next) {
         if (token !== rebindToken)
           throw new DOMException(
             "Handle rebinding is not exposed to page script",
@@ -6234,66 +6828,14 @@
             previous !== nextHandle ? uncacheNode(previous, this) : 0;
         if (previousLease) __tilefinchReleaseNodeWrapper(previous, previousLease);
         handle = nextHandle;
-        if (previous !== nextHandle) {
-          const handlers = eventHandlerMap(this, false);
-          if (handlers)
-            for (const [type, value] of handlers)
-              if (value?.token === propertyHandlerRecordToken &&
-                  value.sourceToken === inlineHandlerRecordToken) {
-                if (value.wrapper)
-                  this.removeEventListener(type, value.wrapper, false);
-                handlers.delete(type);
-              }
-        }
-        if (!globalThis.__tilefinchHasRemoteNodeWriter)
-          globalThis.__tilefinchApplyRemoteMutation?.(this, handle);
-        this.__tilefinchRemote = false;
-        this.__tilefinchRemoteSection = Number(__tilefinchSectionIdentity());
-        this.__tilefinchRemoteTagName = String(
-          __tilefinchTagName(handle) || this.__tilefinchRemoteTagName || "",
-        );
-        this.__tilefinchRemoteNodeType = Number(
-          __tilefinchNodeType(handle) || this.__tilefinchRemoteNodeType || 0,
-        );
-        this.__namespaceURI = __tilefinchNamespaceURI(handle);
-        Object.setPrototypeOf(
-          this,
-          nativeElementPrototype(
-            this.__tilefinchRemoteTagName,
-            this.__tilefinchRemoteNodeType,
-            this.__namespaceURI,
-          ),
-        );
-        const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
-          id = String(__tilefinchGetAttribute(handle, "id") || ""),
-          idKey = id && id.length <= 128 ? "i:" + id : "",
-          stable = globalThis.__tilefinchHasRemoteNodeWriter
-            ? sourceKey || idKey
-            : "";
-        this.__tilefinchStableKey =
-          this.__tilefinchQueryKey ||
-          stable ||
-          String(this.__tilefinchStableKey || "");
-        installStyle(this, handle);
-        installClassList(this);
-        cacheNode(handle, this);
-        return this;
+        return rebindWrapper(this, previous, nextHandle);
       },
-    };
-    // Start with the final prototype and final descriptor flags. Changing
-    // either after filling the wrapper de-interns QuickJS's large property
-    // shape, leaving a separate shape allocation for every visited element.
-    const node = Object.create(nativeElementPrototype(
-      own.__tilefinchRemoteTagName, own.__tilefinchRemoteNodeType, namespaceURI,
-    ));
-    Object.defineProperty(node, "__tilefinchRebindHandle", {
-      enumerable: false,
-      configurable: false,
-      writable: false,
-      value: own.__tilefinchRebindHandle,
     });
-    delete own.__tilefinchRebindHandle;
-    Object.assign(node, own);
+    node.__namespaceURI = namespaceURI;
+    node.__tilefinchStableKey = stableKey;
+    node.__tilefinchRemoteSection = section;
+    node.__tilefinchRemoteTagName = tagName;
+    node.__tilefinchRemoteNodeType = nodeType;
     Object.defineProperty(node, "__handle", {
       enumerable: false,
       configurable: false,
@@ -6304,8 +6846,14 @@
     // Reserve the slot up front to keep wrapper shapes shared, but allocate
     // a listener map only on registration. Existing retained listeners survive
     // wrapper recreation; overflow maps remain owned by their live wrapper.
+    // Without a stable key only the per-handle map can apply.
     Object.defineProperty(node, wrapperListeners, {
-      value: listenerMap(node, false), writable: true,
+      value: stableKey
+        ? listenerMap(node, false)
+        : nativeNodeListeners.size
+          ? nativeNodeListeners.get(Number(handle)) || null
+          : null,
+      writable: true,
     });
     const exposed =
       typeof globalThis.__tilefinchTraceObject === "function"
@@ -6315,12 +6863,13 @@
           )
         : node;
     cacheNode(handle, exposed);
-    rememberStableWrapper(stableKey, exposed);
+    if (stableKey) rememberStableWrapper(stableKey, exposed);
     globalThis.__tilefinchRestoreCustomElement?.(exposed);
     return exposed;
   }
   globalThis.__tilefinchWrap = wrap;
   globalThis.__tilefinchWrapRemote = (id, tag, section) => {
+    noteRemoteWrapper();
     id = String(id).slice(0, 128);
     if (!id) return null;
     const key = "i:" + id,
@@ -6340,6 +6889,7 @@
     return node;
   };
   globalThis.__tilefinchWrapRemoteSelector = (selector, tag, section) => {
+    noteRemoteWrapper();
     selector = String(selector).slice(0, 128);
     section = Number(section);
     if (!selector) return null;
@@ -6367,6 +6917,7 @@
     section,
     nodeType = Node.ELEMENT_NODE,
   ) => {
+    noteRemoteWrapper();
     key = String(key).slice(0, 95);
     section = Number(section);
     nodeType = Number(nodeType) || Node.ELEMENT_NODE;
@@ -6594,96 +7145,122 @@
     mutationObserverStates = new WeakMap();
   let mutationDeliveryPending = false,
     mutationDeliveryActive = false,
-    parserTreeSnapshot = null;
-  const parserSnapshotLimit = 512,
-    captureParserTree = () => {
-      const snapshot = new Map(),
-        pending = [document];
-      for (let index = 0; index < pending.length; index++) {
-        if (snapshot.size >= parserSnapshotLimit) return null;
-        const parent = pending[index],
-          children = [...(parent?.childNodes || [])];
-        snapshot.set(parent, children);
-        for (const child of children)
-          if (child?.childNodes?.length) pending.push(child);
-      }
-      return snapshot;
+    parserInsertionsArmed = false;
+  /* The native parser journals its own insertions only while some observer
+     can receive childList records (see DocumentParserInsertionJournal);
+     unobserved documents pay nothing during parsing. */
+  const observeParserInsertions = __tilefinchObserveParserInsertions,
+    nativeNodeType = __tilefinchNodeType,
+    syncParserInsertionJournal = () => {
+      const armed = mutationObservers.some((observer) =>
+        mutationObserverStates
+          .get(observer)
+          ?.targets.some((item) => item.options.childList),
+      );
+      if (armed === parserInsertionsArmed) return;
+      parserInsertionsArmed = armed;
+      observeParserInsertions(armed);
     },
-    observesParserTree = (observer) =>
-      mutationObserverStates.get(observer)?.targets.some(
-        (item) =>
-          item.target === document &&
-          item.options.childList &&
-          item.options.subtree,
-      ) || false,
-    updateParserTreeSnapshot = (
-      target,
-      addedNodes,
-      removedNodes,
-    ) => {
-      if (!parserTreeSnapshot) return;
-      parserTreeSnapshot.set(target, [...(target?.childNodes || [])]);
-      const remove = [...removedNodes];
-      while (remove.length) {
-        const node = remove.pop();
-        for (const child of parserTreeSnapshot.get(node) || [])
-          remove.push(child);
-        parserTreeSnapshot.delete(node);
+    parserInsertionNode = (handle) =>
+      !handle ? null : nativeNodeType(handle) === 9 ? document : wrap(handle);
+  /* A delivery holds at most mutationRecordLimit exact records per
+     observer. Further childList changes fold into one trailing record whose
+     addedNodes are a few subtree roots containing every added node (roots
+     merge at their common ancestor, which may be a node that already
+     existed), so an observer that scans addedNodes subtrees still finds
+     everything while memory stays bounded. Removed nodes are kept up to the
+     same bound. Other record types past the limit are dropped and counted. */
+  const mutationRecordLimit = 256,
+    overflowRootLimit = 16,
+    overflowAncestorLimit = 256,
+    overflowCommonAncestor = (left, right) => {
+      const chain = new Set();
+      for (
+        let at = left, steps = 0;
+        at && steps < overflowAncestorLimit;
+        at = at.parentNode, steps++
+      )
+        chain.add(at);
+      for (
+        let at = right, steps = 0;
+        at && steps < overflowAncestorLimit;
+        at = at.parentNode, steps++
+      )
+        if (chain.has(at)) return at;
+      return null;
+    },
+    overflowContains = (root, node) => {
+      for (
+        let at = node, steps = 0;
+        at && steps < overflowAncestorLimit;
+        at = at.parentNode, steps++
+      )
+        if (at === root) return true;
+      return false;
+    },
+    foldOverflowRoot = (roots, node) => {
+      if (!node || roots.some((root) => overflowContains(root, node)))
+        return true;
+      if (roots.length < overflowRootLimit) {
+        roots.push(node);
+        return true;
       }
-      const add = [...addedNodes];
-      while (add.length && parserTreeSnapshot.size < parserSnapshotLimit) {
-        const node = add.shift(),
-          children = [...(node?.childNodes || [])];
-        parserTreeSnapshot.set(node, children);
-        add.push(...children);
+      const merged = overflowCommonAncestor(roots[roots.length - 1], node);
+      if (!merged || merged === document) return false;
+      const kept = roots.filter((root) => !overflowContains(merged, root));
+      roots.length = 0;
+      roots.push(...kept, merged);
+      return true;
+    },
+    foldOverflowRecord = (state, target, addedNodes, removedNodes) => {
+      let record = state.overflowRecord;
+      if (!record) {
+        record = state.overflowRecord = new MutationRecord({
+          type: "childList",
+          target,
+          addedNodes: [],
+          removedNodes: [],
+        });
+        state.records.push(record);
+      } else if (record.target !== target)
+        record.target =
+          overflowCommonAncestor(record.target, target) || record.target;
+      let folded = true;
+      for (const node of addedNodes)
+        folded = foldOverflowRoot(record.addedNodes, node) && folded;
+      for (const node of removedNodes) {
+        if (record.removedNodes.length >= mutationRecordLimit) {
+          folded = false;
+          break;
+        }
+        record.removedNodes.push(node);
       }
+      retentionStats.recordsCoalesced++;
+      return folded;
     };
-  globalThis.__tilefinchParserMutationCheckpoint = () => {
-    if (!mutationObservers.some(observesParserTree)) {
-      parserTreeSnapshot = null;
-      return;
-    }
-    const current = captureParserTree();
-    if (!current) {
-      parserTreeSnapshot = null;
-      return;
-    }
-    const previous = parserTreeSnapshot;
-    parserTreeSnapshot = current;
-    if (!previous) return;
-    for (const [parent, children] of current) {
-      const before = previous.get(parent) || [];
-      for (let index = 0; index < children.length; index++) {
-        const child = children[index];
-        if (before.includes(child)) continue;
-        globalThis.__tilefinchNotifyMutation?.(
-          parent,
-          "childList",
-          null,
-          [child],
-          [],
-          null,
-          children[index - 1] || null,
-          null,
-        );
-      }
-    }
-    for (const [parent, children] of previous) {
-      const after = current.get(parent) || [];
-      for (let index = 0; index < children.length; index++) {
-        const child = children[index];
-        if (after.includes(child)) continue;
-        globalThis.__tilefinchNotifyMutation?.(
-          parent,
-          "childList",
-          null,
-          [],
-          [child],
-          null,
-          children[index - 1] || null,
-          children[index + 1] || null,
-        );
-      }
+  /* Called by the parser's microtask checkpoint before a parser-blocking
+     script and once after EOF, with [parent, node, previous, next] handle
+     quadruples in insertion order. Each becomes the childList record the
+     parser's insertion would have queued; the checkpoint's microtask run
+     then delivers them before the script executes. */
+  globalThis.__tilefinchParserMutationCheckpoint = (batch) => {
+    const length = Math.min(Number(batch?.length) || 0, 0x10000);
+    retentionStats.parserRecordsCoalesced = Number(batch?.coalesced) || 0;
+    if (!parserInsertionsArmed) return;
+    for (let index = 0; index + 3 < length; index += 4) {
+      const parent = parserInsertionNode(batch[index]),
+        node = parserInsertionNode(batch[index + 1]);
+      if (!parent || !node) continue;
+      globalThis.__tilefinchNotifyMutation?.(
+        parent,
+        "childList",
+        null,
+        [node],
+        [],
+        null,
+        parserInsertionNode(batch[index + 2]),
+        parserInsertionNode(batch[index + 3]),
+      );
     }
   };
   globalThis.MutationRecord = class MutationRecord {
@@ -6699,6 +7276,18 @@
       this.oldValue = init.oldValue ?? null;
     }
   };
+  const mutationObserverInterest = (state) => {
+    let interest = 0,
+      subtree = false;
+    for (const { options } of state.targets) {
+      if (options.attributes) interest |= 1;
+      if (options.childList) interest |= 2;
+      if (options.characterData) interest |= 4;
+      if (options.subtree) subtree = true;
+    }
+    state.interest = interest;
+    state.subtree = subtree;
+  };
   globalThis.MutationObserver = class MutationObserver {
     constructor(callback) {
       if (typeof callback !== "function")
@@ -6707,8 +7296,15 @@
         callback,
         targets: [],
         records: [],
+        overflowRecord: null,
         transientRoots: [],
         pending: false,
+        /* Record types some registration takes (bits: attributes 1,
+           childList 2, characterData 4), and
+           whether any observes a subtree (removals then create transient
+           registrations): queueMutationRecords skips the rest unread. */
+        interest: 0,
+        subtree: false,
       });
     }
     observe(target, options = {}) {
@@ -6748,6 +7344,8 @@
       const registration = {
         target,
         targetKey: String(target.__tilefinchStableKey || ""),
+        /* For the native subtree check; see mutationAncestor. */
+        handle: target.__handle > 0 ? target.__handle : 0,
         options: normalized,
       };
       const at = state.targets.findIndex((item) => item.target === target);
@@ -6759,6 +7357,7 @@
         );
       }
       else state.targets.push(registration);
+      mutationObserverInterest(state);
       if (!mutationObservers.includes(this)) {
         /* Observer registrations retain callback closures and target
            wrappers. Sixty-four covers mature test/framework fan-out while
@@ -6766,26 +7365,27 @@
         if (mutationObservers.length < 64) mutationObservers.push(this);
         else retentionStats.observerDrops++;
       }
-      if (observesParserTree(this) && !parserTreeSnapshot)
-        parserTreeSnapshot = captureParserTree();
+      syncParserInsertionJournal();
     }
     disconnect() {
       const state = mutationObserverStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
       state.targets = [];
       state.records = [];
+      state.overflowRecord = null;
       state.transientRoots = [];
       state.pending = false;
+      mutationObserverInterest(state);
       pendingMutationObservers.delete(this);
       const at = mutationObservers.indexOf(this);
       if (at >= 0) mutationObservers.splice(at, 1);
-      if (!mutationObservers.some(observesParserTree))
-        parserTreeSnapshot = null;
+      syncParserInsertionJournal();
     }
     takeRecords() {
       const state = mutationObserverStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
       const records = state.records.splice(0);
+      state.overflowRecord = null;
       return records;
     }
   };
@@ -7458,159 +8058,286 @@
     globalThis.__tilefinchMotionRecheck?.();
     return true;
   };
-  globalThis.__tilefinchNotifyMutation = (
+  /* This turn's attribute changes with their old values, so the transition
+     watcher can recover the style before them for an element whose
+     transitionend listener is added just after its class changed. */
+  const recentAttributeChanges = [];
+  let recentAttributeChangesQueued = false;
+  globalThis.__tilefinchRecentAttributeChanges = () => recentAttributeChanges;
+  const scheduleMutationDelivery = () => {
+    if (!mutationDeliveryPending) {
+      mutationDeliveryPending = true;
+      Promise.resolve().then(() => {
+        mutationDeliveryPending = false;
+        /* DOM "notify mutation observers": the observers pending now, in
+           the order they were queued, each taking its records, ending its
+           transient registrations and then being called. One a callback
+           queues waits for the next round. */
+        const notifySet = [...pendingMutationObservers];
+        pendingMutationObservers.clear();
+        mutationDeliveryActive = true;
+        for (const item of notifySet) {
+          const itemState = mutationObserverStates.get(item);
+          if (!itemState) continue;
+          itemState.pending = false;
+          const records = item.takeRecords();
+          itemState.transientRoots = [];
+          if (records.length)
+            try {
+              globalThis.__tilefinchRunTask(
+                "mutation-observer",
+                itemState.callback,
+                item,
+                [records, item],
+              );
+            } catch (error) {
+              __tilefinchReportUncaught(error, "MutationObserver");
+            }
+        }
+        mutationDeliveryActive = false;
+        /* An observer with no records keeps transient registrations until
+           its next delivery; left in place they accumulated (64 per
+           observer), each an ancestor walk on every mutation. End them
+           once this round's callbacks (which may still reach it through a
+           removed subtree, and so queue it) have run. */
+        for (const item of mutationObservers) {
+          const itemState = mutationObserverStates.get(item);
+          if (itemState && !itemState.pending && itemState.transientRoots.length)
+            itemState.transientRoots = [];
+        }
+        if (pendingSlotRoots.size)
+          flushShadowSlotChanges(true);
+      });
+    }
+  };
+  const clearRecentAttributeChanges = () => {
+      recentAttributeChanges.length = 0;
+      recentAttributeChangesQueued = false;
+    },
+    mutationPromiseResolve = Function.call.bind(Promise.resolve, Promise),
+    mutationPromiseThen = Function.call.bind(Promise.prototype.then),
+    styleSheetAttributeNames = ["disabled", "href", "media", "rel", "type"],
+    nativeIsAncestor = globalThis.__tilefinchIsAncestor,
+    nativeNearestId = globalThis.__tilefinchNearestId,
+    nativeNextAncestorEntry = globalThis.__tilefinchNextAncestorEntry;
+  /* Whether the node with `handle` is on the parentNode chain of the native
+     mutation target, by one native parent-pointer walk instead of a wrapper
+     per ancestor; undefined when only the wrapper walk can tell (either is
+     not an ordinary native node, section-remote nodes). Handles are cached
+     at registration: only section-remote wrappers are ever rebound, and
+     the native walk declines once those exist. */
+  const mutationAncestor = (handle, targetHandle) =>
+    handle > 0 && targetHandle > 0
+      ? nativeIsAncestor(handle, targetHandle)
+      : undefined;
+  /* The next transient registration from `start` the target may be within:
+     one native call passes over those whose roots are not on its chain. */
+  const nextTransient = (transients, start, targetHandle) => {
+    if (!(targetHandle > 0) || start >= transients.length) return start;
+    const next = nativeNextAncestorEntry(targetHandle, transients, start);
+    return next === undefined ? start : next;
+  };
+  /* The wrapper walk behind the checks the native walk cannot answer: the
+     target's ancestors, and their stable keys for registrations that must
+     survive a section swap rebuilding the target's wrappers. */
+  const collectMutationAncestors = (target) => {
+    const nodes = new Set(),
+      keys = new Set();
+    for (
+      let at = target?.parentNode, steps = 0;
+      at && steps < ancestorLimit;
+      at = at.parentNode, steps++
+    ) {
+      nodes.add(at);
+      if (at.__tilefinchStableKey) keys.add(String(at.__tilefinchStableKey));
+    }
+    return { nodes, keys };
+  };
+  /* DOM "queue a mutation record": one record per interested observer.
+     A registration that can neither take this record nor gain a transient
+     registration from it is skipped before any ancestry check, and the
+     target's wrapper-walk ancestors are collected at most once, only for
+     checks the native walk declines. targetHandle: the target's handle
+     when it is an ordinary native node, else 0. */
+  const queueMutationRecords = (
     target,
+    targetHandle,
     type,
     attributeName,
-    addedNodes = [],
-    removedNodes = [],
-    oldValue = null,
-    previousSibling = null,
-    nextSibling = null,
-    attributeNamespace = null,
+    addedNodes,
+    removedNodes,
+    oldValue,
+    previousSibling,
+    nextSibling,
+    attributeNamespace,
   ) => {
-    if (
-      globalThis.__tilefinchRestoringSection ||
-      globalThis.__tilefinchMutationSuppressed
-    )
-      return;
-    if (type === "childList")
-      updateParserTreeSnapshot(target, addedNodes, removedNodes);
-    globalThis.__tilefinchQueueFocusFixup?.();
-    const rootOwned =
-      globalThis.__tilefinchHasRemoteNodeWriter &&
-      (target === document.documentElement ||
-        target === document.head ||
-        target === document.body);
-    if (!rootOwned)
-      for (
-        let at = target, steps = 0;
-        at && steps < ancestorLimit;
-        at = at.parentElement, steps++
-      ) {
-        const id = String(at.getAttribute?.("id") || ""),
-          key = String(
-            at.__tilefinchStableKey ||
-              (id && id.length <= 128 ? "i:" + id : ""),
-          );
-        if (key) {
-          globalThis.__tilefinchDirtyNodeIds?.add(key);
-          break;
-        }
-      }
-    for (const observer of mutationObservers) {
+    const removal = type === "childList" && removedNodes.length > 0,
+      typeBit =
+        type === "attributes" ? 1
+        : type === "childList" ? 2
+        : type === "characterData" ? 4 : 0,
+      targetKey = String(target?.__tilefinchStableKey || ""),
+      filterName = type === "attributes" ? String(attributeName) : "";
+    let connected = null,
+      ancestors = null;
+    /* Indexed loops: a for-of here allocated an iterator per observer and
+       per registration list, on every mutation. The array is read live,
+       as an Array Iterator reads it. */
+    for (let observerIndex = 0; observerIndex < mutationObservers.length;
+         observerIndex++) {
+      const observer = mutationObservers[observerIndex];
+      retentionStats.observerVisits++;
       const observerState = mutationObserverStates.get(observer);
       if (!observerState) continue;
+      /* No registration takes this type or gains a transient one from it,
+         and no transient registration exists: nothing to examine. */
+      if (
+        !(observerState.interest & typeBit) &&
+        !(removal && observerState.subtree) &&
+        observerState.transientRoots.length === 0
+      )
+        continue;
       let matched = false;
       let attributeOldValue = false,
         characterDataOldValue = false;
-      for (const watched of observerState.targets) {
-        const sameStable =
-          watched.targetKey &&
-          String(target?.__tilefinchStableKey || "") === watched.targetKey;
+      const targets = observerState.targets;
+      for (let targetIndex = 0; targetIndex < targets.length; targetIndex++) {
+        const watched = targets[targetIndex],
+          options = watched.options,
+          wanted =
+            (type === "attributes" &&
+              options.attributes &&
+              (!options.attributeFilter ||
+                options.attributeFilter.includes(filterName))) ||
+            (type === "childList" && options.childList) ||
+            (type === "characterData" && options.characterData),
+          transient = removal && options.subtree;
+        if (!wanted && !transient) continue;
         let within =
           target === watched.target ||
-          sameStable ||
-          (watched.target === document && !!target?.isConnected);
-        if (!within && watched.options.subtree) {
-          for (
-            let at = target?.parentNode, steps = 0;
-            at && steps < ancestorLimit;
-            at = at.parentNode, steps++
-          )
-            if (
-              at === watched.target ||
-              (watched.targetKey &&
-                String(at.__tilefinchStableKey || "") === watched.targetKey) ||
-              (watched.target === document && at === document.documentElement)
-            ) {
-              within = true;
-              break;
-            }
+          (!!watched.targetKey && targetKey === watched.targetKey);
+        if (!within && options.subtree && watched.target === document) {
+          if (connected === null)
+            connected = !!target?.isConnected &&
+              (!shadowRootCreated || target.getRootNode() === document);
+          within = connected;
         }
+        if (!within && options.subtree) {
+          /* Native ancestry, like parentNode, stops at a shadow root. */
+          let found = watched.targetKey
+            ? undefined
+            : watched.target === document
+              ? document.documentElement
+                ? mutationAncestor(
+                    document.documentElement.__handle,
+                    targetHandle,
+                  )
+                : targetHandle > 0
+                  ? false
+                  : undefined
+              : mutationAncestor(watched.handle, targetHandle);
+          if (found === undefined) {
+            if (ancestors === null)
+              ancestors = collectMutationAncestors(target);
+            found =
+              ancestors.nodes.has(watched.target) ||
+              (!!watched.targetKey && ancestors.keys.has(watched.targetKey)) ||
+              (watched.target === document &&
+                ancestors.nodes.has(document.documentElement));
+          }
+          within = found;
+        }
+        if (!within) continue;
         /* Removing a subtree creates transient registrations for every
          * applicable subtree observation, even when that observation did
          * not request childList records.  Keep registrations distinct so
          * overlapping oldValue/filter requirements are merged at mutation
          * time rather than lost behind the first match. */
-        if (type === "childList" && removedNodes.length && within &&
-            watched.options.subtree) {
+        if (transient) {
           for (const root of removedNodes) {
             if (observerState.transientRoots.length >= 64) break;
             if (!observerState.transientRoots.some((item) =>
-              item.root === root && item.registration === watched))
+              item.root === root && item.registration === watched)) {
               observerState.transientRoots.push({
                 root,
+                handle: root?.__handle > 0 ? root.__handle : 0,
                 registration: watched,
               });
+              scheduleMutationDelivery();
+            }
           }
         }
-        if (
-          within &&
-          ((type === "attributes" && watched.options.attributes) ||
-            (type === "childList" && watched.options.childList) ||
-            (type === "characterData" && watched.options.characterData))
-        ) {
-          if (
-            type === "attributes" &&
-            watched.options.attributeFilter &&
-            !watched.options.attributeFilter.includes(String(attributeName))
-          )
-            continue;
+        if (wanted) {
           matched = true;
-          attributeOldValue ||= watched.options.attributeOldValue;
-          characterDataOldValue ||= watched.options.characterDataOldValue;
+          attributeOldValue ||= options.attributeOldValue;
+          characterDataOldValue ||= options.characterDataOldValue;
         }
       }
-      for (const transient of observerState.transientRoots) {
+      const transients = observerState.transientRoots;
+      for (
+        let index = nextTransient(transients, 0, targetHandle);
+        index < transients.length;
+        index = nextTransient(transients, index + 1, targetHandle)
+      ) {
+          const transient = transients[index],
+            options = transient.registration.options,
+            wanted =
+              (type === "attributes" &&
+                options.attributes &&
+                (!options.attributeFilter ||
+                  options.attributeFilter.includes(filterName))) ||
+              (type === "childList" && options.childList) ||
+              (type === "characterData" && options.characterData),
+            nested = removal && options.subtree;
+          if (!wanted && !nested) continue;
           let within = target === transient.root;
           if (!within) {
-            for (
-              let at = target?.parentNode, steps = 0;
-              at && steps < ancestorLimit;
-              at = at.parentNode, steps++
-            )
-              if (at === transient.root) {
-                within = true;
-                break;
-              }
+            within = mutationAncestor(transient.handle, targetHandle);
+            if (within === undefined) {
+              if (ancestors === null)
+                ancestors = collectMutationAncestors(target);
+              within = ancestors.nodes.has(transient.root);
+            }
           }
-          const options = transient.registration.options;
-          if (type === "childList" && removedNodes.length && within &&
-              options.subtree) {
+          if (!within) continue;
+          if (nested) {
             for (const root of removedNodes) {
               if (observerState.transientRoots.length >= 64) break;
               if (!observerState.transientRoots.some((item) =>
                 item.root === root &&
-                item.registration === transient.registration))
+                item.registration === transient.registration)) {
                 observerState.transientRoots.push({
                   root,
+                  handle: root?.__handle > 0 ? root.__handle : 0,
                   registration: transient.registration,
                 });
+                scheduleMutationDelivery();
+              }
             }
           }
-          if (
-            within &&
-            ((type === "attributes" && options.attributes) ||
-              (type === "childList" && options.childList) ||
-              (type === "characterData" && options.characterData)) &&
-            !(
-              type === "attributes" &&
-              options.attributeFilter &&
-              !options.attributeFilter.includes(String(attributeName))
-            )
-          ) {
+          if (wanted) {
             matched = true;
             attributeOldValue ||= options.attributeOldValue;
             characterDataOldValue ||= options.characterDataOldValue;
           }
       }
       if (!matched) continue;
-      if (observerState.records.length >= 64) {
-        retentionStats.recordDrops++;
-        continue;
-      }
-      observerState.records.push(new MutationRecord({
+      if (observerState.records.length >= mutationRecordLimit) {
+        if (
+          type !== "childList" ||
+          !foldOverflowRecord(
+            observerState,
+            target,
+            addedNodes,
+            removedNodes,
+          )
+        ) {
+          retentionStats.recordDrops++;
+          continue;
+        }
+      } else {
+        retentionStats.mutationRecords++;
+        observerState.records.push(new MutationRecord({
         type,
         target,
         attributeName: attributeName || null,
@@ -7629,67 +8356,143 @@
                 ? oldValue
                 : null
               : null,
-      }));
+        }));
+      }
       if (!observerState.pending) {
         observerState.pending = true;
         pendingMutationObservers.add(observer);
       }
-      if (!mutationDeliveryPending) {
-        mutationDeliveryPending = true;
-        Promise.resolve().then(() => {
-          mutationDeliveryPending = false;
-          const pending = [...pendingMutationObservers];
-          pendingMutationObservers.clear();
-          mutationDeliveryActive = true;
-          for (const item of pending) {
-            const itemState = mutationObserverStates.get(item);
-            if (!itemState) continue;
-            itemState.pending = false;
-            const records = item.takeRecords();
-            itemState.transientRoots = [];
-            if (records.length)
-              try {
-                globalThis.__tilefinchRunTask(
-                  "mutation-observer",
-                  itemState.callback,
-                  item,
-                  [records, item],
-                );
-              } catch (error) {
-                __tilefinchReportUncaught(error, "MutationObserver");
-              }
-          }
-          mutationDeliveryActive = false;
-          if (pendingSlotRoots.size)
-            flushShadowSlotChanges(true);
-        });
+      scheduleMutationDelivery();
+    }
+  };
+  /* Read-only inputs; each delivered MutationRecord receives its own lists.
+     Attribute/text notifications otherwise allocate two unused arrays. */
+  const emptyMutationNodes = Object.freeze([]);
+  globalThis.__tilefinchNotifyMutation = (
+    target,
+    type,
+    attributeName,
+    addedNodes = emptyMutationNodes,
+    removedNodes = emptyMutationNodes,
+    oldValue = null,
+    previousSibling = null,
+    nextSibling = null,
+    attributeNamespace = null,
+  ) => {
+    if (
+      globalThis.__tilefinchRestoringSection ||
+      globalThis.__tilefinchMutationSuppressed
+    )
+      return;
+    if (type === "childList" && removedNodes.length)
+      nodeIteratorHooks?.removed(
+        target,
+        removedNodes,
+        previousSibling,
+        nextSibling,
+      );
+    /* An ordinary native target: its ancestry can be walked natively. */
+    const handle = target?.__handle,
+      nativeTarget =
+        handle > 0 && !target.__tilefinchDetachedParent ? handle : 0;
+    if (type === "attributes" && attributeNamespace === null && handle > 0) {
+      if (recentAttributeChanges.length >= 64) recentAttributeChanges.shift();
+      recentAttributeChanges.push({ target, name: attributeName, oldValue });
+      if (!recentAttributeChangesQueued) {
+        recentAttributeChangesQueued = true;
+        /* A plain promise job holds the same queue position as
+           queueMicrotask without its page-task wrapper. */
+        mutationPromiseThen(
+          mutationPromiseResolve(),
+          clearRecentAttributeChanges,
+        );
+      }
+      globalThis.__tilefinchTransitionsDirty?.(target, attributeName, oldValue);
+    }
+    globalThis.__tilefinchQueueFocusFixup?.(
+      target,
+      type,
+      attributeName,
+      addedNodes,
+    );
+    const writer = globalThis.__tilefinchHasRemoteNodeWriter;
+    /* Section state's dirty-node key. An ordinary native target takes one
+       native walk to its nearest id instead of a wrapper and an id read per
+       ancestor; stable keys (section-remote nodes), script-side parents and
+       overlong ids keep the wrapper walk. */
+    const nearestId =
+      writer || !nativeTarget ? undefined : nativeNearestId(nativeTarget);
+    if (nearestId !== undefined && nearestId.length <= 128) {
+      if (nearestId) globalThis.__tilefinchDirtyNodeIds?.add("i:" + nearestId);
+    } else if (
+      !writer ||
+      (target !== document.documentElement &&
+        target !== document.head &&
+        target !== document.body)
+    )
+      for (
+        let at = target, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentElement, steps++
+      ) {
+        const id = String(at.getAttribute?.("id") || ""),
+          key = String(
+            at.__tilefinchStableKey ||
+              (id && id.length <= 128 ? "i:" + id : ""),
+          );
+        if (key) {
+          globalThis.__tilefinchDirtyNodeIds?.add(key);
+          break;
+        }
+      }
+    if (mutationObservers.length)
+      queueMutationRecords(
+        target,
+        nativeTarget,
+        type,
+        attributeName,
+        addedNodes,
+        removedNodes,
+        oldValue,
+        previousSibling,
+        nextSibling,
+        attributeNamespace,
+      );
+    globalThis.__tilefinchResizeRecheck?.();
+    /* Names are read only for the mutation kinds that can use them. */
+    let styleSheetMutation = false,
+      motionStyleMutation = false;
+    if (type === "childList") {
+      const targetName = String(target?.localName || "").toLowerCase();
+      styleSheetMutation =
+        targetName === "style" ||
+        mutationListHasStyleSheetNode(addedNodes) ||
+        mutationListHasStyleSheetNode(removedNodes);
+      motionStyleMutation =
+        targetName === "style" ||
+        addedNodes.some(
+          (node) =>
+            node instanceof Element &&
+            String(node.localName || "").toLowerCase() === "style",
+        );
+    } else if (type === "characterData") {
+      styleSheetMutation = motionStyleMutation =
+        String(target?.parentElement?.localName || "").toLowerCase() ===
+        "style";
+    } else if (type === "attributes") {
+      motionStyleMutation = attributeName === "style";
+      if (
+        styleSheetAttributeNames.includes(
+          String(attributeName || "").toLowerCase(),
+        )
+      ) {
+        const targetName = String(target?.localName || "").toLowerCase();
+        styleSheetMutation = targetName === "style" || targetName === "link";
       }
     }
-    globalThis.__tilefinchResizeRecheck?.();
-    const targetName = String(target?.localName || "").toLowerCase(),
-      parentName = String(target?.parentElement?.localName || "").toLowerCase(),
-      styleSheetMutation =
-        (type === "childList" &&
-          (targetName === "style" ||
-            mutationListHasStyleSheetNode(addedNodes) ||
-            mutationListHasStyleSheetNode(removedNodes))) ||
-        (type === "characterData" && parentName === "style") ||
-        (type === "attributes" &&
-          (targetName === "style" || targetName === "link") &&
-          ["disabled", "href", "media", "rel", "type"].includes(
-            String(attributeName || "").toLowerCase(),
-          )),
-      motionStyleMutation =
-        (type === "childList" &&
-          (targetName === "style" ||
-            addedNodes.some(
-              (node) =>
-                node instanceof Element &&
-                String(node.localName || "").toLowerCase() === "style",
-            ))) ||
-        (type === "characterData" && parentName === "style") ||
-        (type === "attributes" && attributeName === "style");
     if (styleSheetMutation) {
+      /* New or changed rules can restyle the focused element anywhere. */
+      globalThis.__tilefinchQueueFocusFixup?.();
       styleSheetGeneration++;
       if (!styleSheetGeneration) styleSheetGeneration = 1;
     }

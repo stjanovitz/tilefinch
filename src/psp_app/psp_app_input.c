@@ -556,6 +556,17 @@ void psp_app_capture_supervisor_media_intent(
     interactive->deferred_media_intent_pending = true;
 }
 
+void psp_app_refresh_supervisor_media(
+    PspInteractiveState *interactive, const PspUiMediaState *media_ui)
+{
+    if (interactive == NULL) return;
+    PspUiMediaIntent intent = {0};
+    if (!psp_work_cooperate_refresh_media(media_ui, &intent)) return;
+    /* One entry, newest wins, exactly as the supervisor's own mailbox. */
+    interactive->deferred_media_intent = intent;
+    interactive->deferred_media_intent_pending = true;
+}
+
 bool psp_app_dispatch_deferred_media_intent(
     PspMediaSession *media, PspInteractiveState *interactive)
 {
@@ -572,7 +583,8 @@ bool psp_app_dispatch_deferred_media_intent(
        it against a NULL demuxer. */
     if (interactive->deferred_media_intent.action
             == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
-        && media->playback == NULL) return false;
+        && media->playback == NULL
+        && !psp_media_continuation_accepts_input(media)) return false;
 
     PspUiMediaIntent intent = interactive->deferred_media_intent;
     interactive->deferred_media_intent_pending = false;

@@ -1,4 +1,5 @@
 #include "tilefinch/platform.h"
+#include "tilefinch/work_ledger.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -232,9 +233,13 @@ bool tilefinch_platform_cooperate(const char *phase,
     stall_steps_report(phase, tilefinch_platform_monotonic_time_us());
     stall_step_count = 0;
 #endif
+    /* A checkpoint's own work (cooperative presentation, input polls) is
+       the browser's, whatever script or layout it interrupts. */
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_OTHER);
     bool result = installed_services.cooperate == NULL
         || installed_services.cooperate(
                installed_services.context, phase, completed_work_units);
+    work_ledger_leave(ledger);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     stall_window_started_us = tilefinch_platform_monotonic_time_us();
 #endif

@@ -302,6 +302,13 @@ static bool provisional_commit_has_text(const LayoutDocument *layout,
 typedef struct {
     char extension_phase[48];
     char completion_phase[48];
+    /* When set, the first checkpoint inside a running completion pages the
+       committed page there, as the PSP supervisor does for a page press. */
+    BrowserEngine *page_during_completion;
+    size_t completion_checkpoints;
+    bool paged;
+    int paged_to;
+    bool servable_announced;
 } ProvisionalPhaseRecorder;
 
 /* Remembers which phase each provisional-layout step ran under. */
@@ -309,6 +316,21 @@ static bool record_provisional_phase(void *context, const char *phase,
                                      size_t completed_work_units)
 {
     ProvisionalPhaseRecorder *recorder = context;
+    BrowserEngine *engine = recorder->page_during_completion;
+    if (engine != NULL
+        && browser_engine_layout_completion_running(engine)) {
+        recorder->completion_checkpoints++;
+        if (!recorder->paged
+            && browser_engine_completion_scroll_page(engine, 1)) {
+            recorder->paged = true;
+            const NavigationEntry *entry =
+                navigation_current(browser_engine_navigation(engine));
+            recorder->paged_to = entry == NULL ? -1 : entry->scroll_y;
+        }
+    }
+    if (phase != NULL && completed_work_units != 0
+        && strcmp(phase, "page-scroll-servable") == 0)
+        recorder->servable_announced = true;
     if (phase == NULL || completed_work_units == 0
         || strncmp(phase, "optional-layout", 15) != 0) return true;
     snprintf(recorder->completion_phase,
@@ -380,19 +402,76 @@ static int test_large_static_page_commits_provisionally(void)
                     "optional-layout-extension-awaited") == 0
           && !navigation_layout_completion_awaited(navigation));
     CHECK(navigation_set_scroll(navigation, 0));
+    /* A page press while the rest of the layout is built pages the page
+       already shown and does not cancel that work: the completion
+       finishes in one attempt and keeps the reader where the press left
+       them. */
+    recorder.page_during_completion = engine;
+    int limit_before_adoption = navigation->page.layout.content_limit_y;
+    size_t cancellations = navigation->performance.provisional_cancellations;
+    bool any_visual_changed = false;
+    for (size_t turns = 0;
+         turns < 64 && navigation_layout_completion_pending(navigation);
+         turns++) {
+        bool visual_changed = false;
+        (void) browser_engine_run_idle_work(engine, &visual_changed);
+        any_visual_changed |= visual_changed;
+    }
+    tilefinch_platform_set_services(NULL);
+    CHECK(strcmp(recorder.completion_phase,
+                 "optional-layout-completion") == 0);
+    const NavigationEntry *paged_entry = navigation_current(navigation);
+    CHECK(recorder.completion_checkpoints > 0 && recorder.paged
+          && recorder.paged_to > 0 && any_visual_changed
+          && navigation->performance.provisional_cancellations
+                 == cancellations
+          && paged_entry != NULL
+          && paged_entry->scroll_y == recorder.paged_to);
+    CHECK(!browser_engine_completion_scroll_page(engine, 1)
+          && !browser_engine_completion_raster_step(engine, true));
+    /* Adoption repaints from the old limit down: the page background and
+       the boxes spanning the limit grew, but the screens above it (where
+       the reader is) keep their tiles. */
+    if (!(navigation->relayout_damage_valid
+          && navigation->relayout_damage_top >= limit_before_adoption - 64))
+        fprintf(stderr, "adoption damage top=%d limit=%d\n",
+                navigation->relayout_damage_top, limit_before_adoption);
+    CHECK(limit_before_adoption > 0 && navigation->relayout_damage_valid
+          && navigation->relayout_damage_top >= limit_before_adoption - 64);
+    CHECK(!navigation->page.layout_provisional
+          && navigation->page.layout.content_limit_y == 0
+          && provisional_commit_has_text(&navigation->page.layout, "899")
+          && navigation->performance.provisional_completions == 1);
+    /* A provisional relayout of the completed page (an image batch's
+       publication) is built beside it: a press pages the committed page at
+       the build's checkpoints, and the rebuilt screens keep that position. */
+    CHECK(navigation_set_scroll(navigation, 0));
+    ProvisionalPhaseRecorder relayout_recorder = {0};
+    relayout_recorder.page_during_completion = engine;
+    TilefinchPlatformServices relayout_recording = {
+        .context = &relayout_recorder,
+        .cooperate = record_provisional_phase };
+    uint64_t preview_threshold = navigation->relayout_preview_threshold_us;
+    navigation->relayout_preview_threshold_us = 0;
+    tilefinch_platform_set_services(&relayout_recording);
+    bool relaid_out = navigation_relayout(navigation);
+    tilefinch_platform_set_services(NULL);
+    navigation->relayout_preview_threshold_us = preview_threshold;
+    paged_entry = navigation_current(navigation);
+    CHECK(relaid_out && relayout_recorder.servable_announced
+          && relayout_recorder.paged && relayout_recorder.paged_to > 0
+          && paged_entry != NULL
+          && paged_entry->scroll_y == relayout_recorder.paged_to
+          && navigation->page.layout_provisional
+          && !navigation->committed_layout_servable
+          && !browser_engine_completion_scroll_page(engine, 1));
     for (size_t turns = 0;
          turns < 64 && navigation_layout_completion_pending(navigation);
          turns++) {
         bool visual_changed = false;
         (void) browser_engine_run_idle_work(engine, &visual_changed);
     }
-    tilefinch_platform_set_services(NULL);
-    CHECK(strcmp(recorder.completion_phase,
-                 "optional-layout-completion") == 0);
-    CHECK(!navigation->page.layout_provisional
-          && navigation->page.layout.content_limit_y == 0
-          && provisional_commit_has_text(&navigation->page.layout, "899")
-          && navigation->performance.provisional_completions == 1);
+    CHECK(!navigation->page.layout_provisional);
     size_t completed_count = navigation->page.layout.count;
     int completed_height = navigation->page.layout.height;
     /* The same page relaid out synchronously. */

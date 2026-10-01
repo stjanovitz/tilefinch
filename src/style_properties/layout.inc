@@ -1514,12 +1514,25 @@ static bool style_property_opacity(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[160];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             char *end = NULL;
             double opacity = strtod(resolved, &end);
-            if (end == resolved) return true;
+            if (end == resolved) {
+                /* calc()/min()/max()/clamp() over numbers, commonly around
+                   a custom property ("calc(1 - var(--progress))"). Values
+                   outside [0, 1] clamp, as for a plain number. */
+                int thousandths = 0;
+                if (!style_math_resolve_number_thousandths_in(
+                        sheet, resolved, strlen(resolved), -10000, 10000,
+                        &thousandths)) return true;
+                if (thousandths < 0) thousandths = 0;
+                if (thousandths > 1000) thousandths = 1000;
+                style->opacity = (uint8_t) ((thousandths * 255 + 500) / 1000);
+                *mask |= S_OPACITY;
+                return true;
+            }
             while (isspace((unsigned char) *end)) end++;
             if (*end == '%') {
                 opacity /= 100.0;
@@ -1975,6 +1988,10 @@ static bool style_property_justify_content(const StylePropertyParse *parse)
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
         && style_parse_justify_content_keyword(resolved, &value)) {
+        const char *keyword = style_alignment_position(resolved);
+        if (value == JUSTIFY_START && strcmp(keyword, "normal") != 0
+            && strcmp(keyword, "initial") != 0)
+            value = JUSTIFY_START_EXPLICIT;
         parse->style->justify_content = (JustifyContent) value;
         *parse->mask |= S_JUSTIFY_CONTENT;
     }

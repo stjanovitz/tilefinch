@@ -29,7 +29,12 @@ typedef struct {
     size_t skipped_nomodule;
     size_t skipped_quota;
     size_t skipped_pressure;
+    size_t module_prefetches;
+    size_t module_prefetch_hits;
     size_t pressure_collections;
+    /* Monotonic time of the last pressure collection: later module
+       requests may collect again once it is a second old. */
+    uint64_t last_pressure_collection_us;
     size_t pressure_reclaimed_bytes;
     size_t pressure_capped_requests;
     /* Complete decoded/cache/network source bytes presented to the script
@@ -177,5 +182,9 @@ bool document_body_scripts_execute(PocDocument *document,
                                    FetchScheduler *scheduler,
                                    ExternalScriptMetrics *metrics,
                                    ScriptResult *result);
+
+/* Process-wide module dependency prefetches started and consumed, for
+   diagnostics. */
+void script_loader_module_prefetch_totals(size_t *prefetches, size_t *hits);
 
 #endif

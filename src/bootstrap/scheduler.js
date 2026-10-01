@@ -14,6 +14,29 @@
     diagnosticString = String,
     diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor,
     timerApply = Reflect.apply;
+  /* Native memory the event loop reads every turn instead of calling into
+     JS (ScriptRuntime.host_state; slot order is ScriptHostStateSlot). */
+  const hostState = globalThis.__tilefinchHostChannel.state,
+    HOST_TIMERS = 0,
+    HOST_EARLIEST_DUE = 1,
+    HOST_NOW = 2,
+    HOST_SAMPLED_CLOCK = 3,
+    HOST_SCROLL_PENDING = 4,
+    HOST_EARLIEST_KIND = 5,
+    HOST_EARLIEST_TASK_DUE = 6;
+  /* ScriptHostTimerKind: the native loop tells frame callbacks, which run
+     at a rendering opportunity, from tasks, which run once due. */
+  const TIMER_KIND_CODES = Object.freeze({
+    __proto__: null,
+    "animation-frame": 1,
+    "render-observer": 2,
+    "render-fixup": 3,
+    timeout: 4,
+    interval: 5,
+    message: 6,
+    "platform-task": 7,
+    idle: 8,
+  });
   Object.defineProperty(globalThis, "__tilefinchDiagnosticLookup", {
     enumerable: false,
     configurable: false,
@@ -40,7 +63,34 @@
     timeoutCallbacks = 0,
     intervalCallbacks = 0;
   const timers = [];
-  const limit = 128;
+  /* The wheel's size and head after every change to `timers`: the native
+     loop skips the timer pump when nothing is due. */
+  const publishTimers = () => {
+    hostState[HOST_TIMERS] = timers.length;
+    hostState[HOST_EARLIEST_DUE] = timers.length ? timers[0].due : Infinity;
+    hostState[HOST_EARLIEST_KIND] = timers.length
+      ? TIMER_KIND_CODES[timers[0].kind] || 9 : 0;
+    /* Sorted by due time: the first timer that is not a frame callback is
+       the earliest task. Frame callbacks at the head are few. */
+    let taskDue = Infinity;
+    for (let i = 0; i < timers.length; i++) {
+      const code = TIMER_KIND_CODES[timers[i].kind] || 9;
+      if (code > 3) {
+        taskDue = timers[i].due;
+        break;
+      }
+    }
+    hostState[HOST_EARLIEST_TASK_DUE] = taskDue;
+  };
+  hostState[HOST_NOW] = now;
+  hostState[HOST_SAMPLED_CLOCK] = usesSampledClock ? 1 : 0;
+  publishTimers();
+  const limit = 128,
+    /* Browser-owned clocks that each keep at most one timer pending (the CSS
+       transition event clock and the property-effect frame) draw on these
+       slots above the author limit, so a page that fills the table cannot
+       strand a transition half-way. */
+    reservedLimit = limit + 4;
   /* The frame loop registers an animation-frame timer every presented frame.
      Reusing retired records and one shared empty argument list keeps the
      steady game loop free of per-frame allocations, which would otherwise
@@ -66,8 +116,10 @@
   Object.defineProperty(globalThis.__tilefinchRootCensus, "timers", {
     get: () => timers.length,
   });
-  function schedule(callback, delay, repeat, args, kind = "timeout") {
-    if (typeof callback !== "function" || timers.length >= limit) return 0;
+  function schedule(callback, delay, repeat, args, kind = "timeout",
+                    reserved = false) {
+    if (typeof callback !== "function" ||
+        timers.length >= (reserved ? reservedLimit : limit)) return 0;
     const id = nextId++;
     const timerAlgorithm = kind === "timeout" || kind === "interval",
       parentNesting = timerAlgorithm && activeTimer?.timerAlgorithm
@@ -114,7 +166,10 @@
       return;
     }
     const at = timers.findIndex((timer) => timer.id === numericId);
-    if (at >= 0) releaseTimer(timers.splice(at, 1)[0]);
+    if (at >= 0) {
+      releaseTimer(timers.splice(at, 1)[0]);
+      publishTimers();
+    }
   }
   const timerPriority = (timer) =>
     timer.kind === "animation-frame"
@@ -136,6 +191,7 @@
       else high = middle;
     }
     timers.splice(low, 0, timer);
+    publishTimers();
   }
   function invokeTimer() {
     /* Detach before calling so author callbacks never observe the reusable
@@ -173,6 +229,11 @@
   globalThis.__tilefinchScheduleTask = (callback) =>
     schedule(callback, 0, false, EMPTY_TIMER_ARGS, "platform-task");
   globalThis.__tilefinchCancelTimer = clear;
+  globalThis.__tilefinchSchedulerTime = currentSchedulerTime;
+  globalThis.__tilefinchScheduleReservedTask = (callback, delay) =>
+    schedule(callback, delay, false, EMPTY_TIMER_ARGS, "platform-task", true);
+  globalThis.__tilefinchScheduleReservedFrame = (callback) =>
+    schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame", true);
   globalThis.setTimeout = scheduleTimeout;
   globalThis.setInterval = scheduleInterval;
   globalThis.clearTimeout = clear;
@@ -594,7 +655,10 @@
       if (next === pageTop) return false;
       pageTop = next;
       visualViewport.pageTop = next;
-      if (notify) pending = true;
+      if (notify) {
+        pending = true;
+        hostState[HOST_SCROLL_PENDING] = 1;
+      }
       return true;
     };
     Object.defineProperties(globalThis, {
@@ -628,9 +692,11 @@
       },
     });
     globalThis.__tilefinchApplyPageScroll = apply;
+    /* The native loop calls this only while HOST_SCROLL_PENDING is set. */
     globalThis.__tilefinchFlushPageScroll = () => {
       if (!pending) return false;
       pending = false;
+      hostState[HOST_SCROLL_PENDING] = 0;
       globalThis.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll")));
       visualViewport.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll")));
       return true;
@@ -686,10 +752,15 @@
     if (usesSampledClock) currentSchedulerTime();
     else now += Math.max(0, Number(elapsed) || 0);
     globalThis.__tilefinchNow = now;
-    let ran = 0;
-    const maximum = Math.max(0, Number(maxCallbacks) || 0),
-      visible = pageVisible();
+    hostState[HOST_NOW] = now;
+    let ran = 0,
+      visible;
+    const maximum = Math.max(0, Number(maxCallbacks) || 0);
     while (ran < maximum) {
+      /* `timers` is sorted by due time: when its head is not due nothing
+         is, whatever the visibility, so the query waits for a due head. */
+      if (!(timers[0]?.due <= now)) break;
+      if (visible === undefined) visible = pageVisible();
       const timerIndex = visible
           ? (timers[0]?.due <= now ? 0 : -1)
           : timers.findIndex((candidate) =>
@@ -699,6 +770,7 @@
       const timer = timerIndex < 0 ? null : timers[timerIndex];
       if (!timer || timer.due > now) break;
       timers.splice(timerIndex, 1);
+      publishTimers();
       /* Per-frame timer kinds reuse one provenance label; author timers keep
          the id-bearing label their uncaught-error diagnostics rely on. */
       const label = timer.kind === "animation-frame"
@@ -734,14 +806,6 @@
     return ran;
   };
   globalThis.__tilefinchPendingTimers = () => timers.length;
-  /* Both counts the native loop needs after every turn, in one call:
-     pending timers * 65536 + waiting network requests, each capped. */
-  const pendingNetworkRequests = globalThis.__tilefinchPendingNetworkRequests;
-  globalThis.__tilefinchPendingWork = () => {
-    const network = typeof pendingNetworkRequests === "function"
-      ? pendingNetworkRequests() : 0;
-    return Math.min(timers.length, 65535) * 65536 + Math.min(network, 65535);
-  };
   /* Source-free native/lab liveness snapshot. Keep the returned tuple numeric
      and bounded so diagnostics never serialize callbacks, arguments, URLs, or
      challenge payloads. This is called only by the native diagnostic seam. */

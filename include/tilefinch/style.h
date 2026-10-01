@@ -195,7 +195,12 @@ enum {
     JUSTIFY_SPACE_BETWEEN,
     JUSTIFY_SPACE_AROUND,
     JUSTIFY_SPACE_EVENLY,
-    JUSTIFY_STRETCH
+    JUSTIFY_STRETCH,
+    /* justify-content written as start/flex-start/left. JUSTIFY_START (0)
+       is the initial "normal": flexbox packs both at the start, but a grid
+       stretches its auto tracks for normal and must not for an explicit
+       start. */
+    JUSTIFY_START_EXPLICIT
 };
 
 typedef uint8_t TextAlign;
@@ -1693,8 +1698,14 @@ typedef enum {
     SELECTOR_ID
 } SelectorType;
 
+/* One interned declaration block. Its parsed ComputedStyle is not stored
+   inline: atomic-CSS bundles set one or two properties per block and a page
+   applies only a fraction of its blocks, so a full ComputedStyle per block
+   was mostly zero bytes that were never read. The values live as runs of
+   nonzero 32-bit words in the stylesheet's declaration value pool and are
+   decoded by stylesheet_declaration_values() into caller storage, exactly
+   (bit for bit) as they were parsed. */
 typedef struct {
-    ComputedStyle values;
     uint64_t mask;
     uint64_t mask_high;
     /* Properties explicitly set to the CSS-wide `inherit` keyword (S_*
@@ -1709,7 +1720,18 @@ typedef struct {
     uint32_t deferred_program_offset;
     uint16_t deferred_program_count;
     uint16_t deferred_program_reserved;
+    /* Byte span of the encoded values in Stylesheet.declaration_values. */
+    uint32_t values_offset;
+    uint16_t values_length;
+    /* STYLE_DECLARATION_VALUES_* summaries of the encoded values, so the
+       whole-sheet and per-pseudo scans need not decode every block. */
+    uint16_t values_flags;
 } StyleDeclaration;
+
+/* StyleDeclaration.values_flags. */
+#define STYLE_DECLARATION_VALUES_GENERATED_CONTENT UINT16_C(1)
+#define STYLE_DECLARATION_VALUES_PAINT_STACK UINT16_C(2)
+#define STYLE_DECLARATION_VALUES_GENERATED_ATTR UINT16_C(4)
 
 typedef struct {
     const char *selector;
@@ -1738,29 +1760,86 @@ typedef struct {
     char value[96];
 } StyleVariable;
 
+/* Text limits of a StyleCustomRule, each including the terminating NUL. A
+   longer selector, name or value is dropped (diagnostic_custom_property_
+   drops), exactly as when these were the sizes of inline buffers. */
+#define STYLE_CUSTOM_SELECTOR_CAPACITY 192u
+#define STYLE_CUSTOM_NAME_CAPACITY 48u
+#define STYLE_CUSTOM_VALUE_CAPACITY 96u
+
 typedef struct {
-    char selector[192];
-    char name[48];
-    char value[96];
+    /* NUL-terminated text in the stylesheet's selector arena, stable until
+       the sheet is destroyed. Most records are short atomic declarations,
+       so fixed inline buffers were mostly unused bytes. */
+    const char *selector;
+    const char *name;
+    const char *value;
     bool important;
     uint8_t pseudo;
-    /* One-based @container definition. This occupies existing alignment
-       padding before origin on both host and PSP builds. */
+    /* One-based @container definition. */
     uint8_t container_query;
     /* Offset of an allocation-free rightmost tag/class/id rejection key.
-       UINT8_MAX means no safe key. This consumes the final padding byte. */
+       UINT8_MAX means no safe key. */
     uint8_t fast_key_offset;
-    /* Lengths of name, selector and fast key, so the per-node winner scan
-       over these rules needs no strlen or identifier re-scan. */
+    /* Lengths of name, selector, fast key and value, so the per-node winner
+       scan over these rules needs no strlen or identifier re-scan. */
     uint8_t name_length;
     uint8_t selector_length;
     uint8_t fast_key_length;
-    uint8_t reserved;
+    uint8_t value_length;
     unsigned origin;
     unsigned layer;
     unsigned specificity;
     unsigned order;
 } StyleCustomRule;
+
+/* Which transition declaration a StyleTransitionRule retains. */
+typedef enum {
+    STYLE_TRANSITION_SHORTHAND,
+    STYLE_TRANSITION_PROPERTY,
+    STYLE_TRANSITION_DURATION,
+    STYLE_TRANSITION_DELAY,
+    STYLE_TRANSITION_TIMING,
+    STYLE_TRANSITION_KIND_COUNT
+} StyleTransitionKind;
+
+/* One authored transition declaration, shorthand or longhand. Layout never
+   reads these; they are retained only so getComputedStyle and the script
+   transition lifecycle see the cascade. Selector and value text live in the
+   stylesheet's selector arena, so a declaration costs this record plus its
+   text rather than a StyleCustomRule's fixed buffers. */
+typedef struct {
+    const char *selector;
+    const char *value;
+    uint16_t selector_length;
+    uint16_t value_length;
+    uint8_t kind;
+    uint8_t pseudo;
+    uint8_t container_query;
+    bool important;
+    unsigned origin;
+    unsigned layer;
+    unsigned specificity;
+    /* Rule order with the declaration's position in its block in the low
+       eight bits, as for StyleCustomRule. */
+    unsigned order;
+} StyleTransitionRule;
+
+#define STYLE_TRANSITION_LIST_LIMIT 8u
+
+/* The computed transition longhands of one element. Lists keep their
+   authored length up to STYLE_TRANSITION_LIST_LIMIT items; an element with
+   nothing authored has the initial single item (all 0s ease 0s). */
+typedef struct {
+    uint8_t property_count;
+    uint8_t duration_count;
+    uint8_t delay_count;
+    uint8_t timing_count;
+    char properties[STYLE_TRANSITION_LIST_LIMIT][40];
+    double duration_ms[STYLE_TRANSITION_LIST_LIMIT];
+    double delay_ms[STYLE_TRANSITION_LIST_LIMIT];
+    char timings[STYLE_TRANSITION_LIST_LIMIT][48];
+} StyleTransitionComputed;
 
 typedef struct {
     char name[STYLE_DIAGNOSTIC_PROPERTY_NAME_CAPACITY];
@@ -1824,12 +1903,17 @@ typedef struct {
     bool matched;
 } StyleRelativeSelectorCacheEntry;
 
+#define STYLE_HAS_ATTRIBUTE_MEMO_NAME 40u
+#define STYLE_HAS_ATTRIBUTE_MEMO_SLOTS 16u
 typedef struct {
     Budget *budget;
     /* Monotonic identity for the sheet contents.  The NavigationPage keeps
        this structure at a stable address across transactional rebuilds, so
        pointer identity alone cannot safely key retained computed styles. */
     uint64_t build_generation;
+    /* Geometry/query inputs change independently of authored CSS and DOM
+       generations, including native layout rebuilds within one JS task. */
+    uint64_t container_state_generation;
     /* CSP style-src applies independently to style attributes and <style>
        blocks. This bit survives transactional sheet moves without retaining
        a pointer into a movable PocDocument. */
@@ -1868,9 +1952,47 @@ typedef struct {
     uint32_t *focus_rule_indices;
     size_t focus_rule_count;
     bool focus_rule_index_ready;
+    /* Rules and custom rules whose selector contains ":has(": an attribute
+       change can only affect those relationally. Rebuilt when the rule set
+       is reordered or grows. */
+    uint32_t *has_rule_indices;
+    size_t has_rule_count;
+    uint32_t *has_custom_rule_indices;
+    size_t has_custom_rule_count;
+    size_t has_rule_index_rules;
+    size_t has_rule_index_custom_rules;
+    bool has_rule_index_ready;
+    /* Hashes of the class names a :has() rule mentions in a relational
+       position (sorted): a class change affects :has() only through them. */
+    uint32_t *has_class_hashes;
+    size_t has_class_hash_count;
+    bool has_class_hashes_ready;
+    /* Recent answers of stylesheet_attribute_change_may_affect_has for
+       attribute names other than class and id, which depend on the :has()
+       rules and the (lower-cased) name alone: a page writes the same few
+       attributes (style, aria-*, data-*) thousands of times, and each
+       answer otherwise scans every :has() rule's text. Emptied with the
+       has-rule index. */
+    struct {
+        char name[STYLE_HAS_ATTRIBUTE_MEMO_NAME];
+        uint8_t length;
+        bool sensitive;
+    } has_attribute_memo[STYLE_HAS_ATTRIBUTE_MEMO_SLOTS];
+    uint8_t has_attribute_memo_count;
+    uint8_t has_attribute_memo_next;
+    /* The :has() rules classified for scoped cache invalidation (where a
+       change can move an answer, and which elements that answer styles;
+       style_has_invalidation.c). Rebuilt with the has-rule index. */
+    struct StyleHasPlan *has_plan;
+    bool has_plan_ready;
     StyleDeclaration *declarations;
     size_t declaration_count;
     size_t declaration_capacity;
+    /* Encoded ComputedStyle values of every declaration (see
+       StyleDeclaration). Only ever addressed by offset, so it may move. */
+    uint8_t *declaration_values;
+    size_t declaration_value_bytes;
+    size_t declaration_value_capacity;
     /* Sparse, optional rollback masks for authored rules that use the
        CSS-wide `revert-rule` keyword. Ordinary pages pay only these three
        words in the sheet rather than two masks in every declaration. */
@@ -1889,6 +2011,9 @@ typedef struct {
     StyleCustomRule *custom_rules;
     size_t custom_rule_count;
     size_t custom_rule_capacity;
+    StyleTransitionRule *transition_rules;
+    size_t transition_rule_count;
+    size_t transition_rule_capacity;
     size_t deferred_bytes;
     size_t important_rule_count;
     char layer_names[STYLE_LAYER_CAPACITY][STYLE_LAYER_NAME_CAPACITY];
@@ -1933,6 +2058,10 @@ typedef struct {
        internal to the style subsystem and saved/restored around nested
        resolutions there. */
     StyleResolveScratch *resolve_scratch;
+    /* Class-token sets for rule-candidate checks during a node cascade
+       (style_subject_has_class), allocated on first use. */
+    struct StyleClassTokenCache *class_tokens;
+    bool class_tokens_refused;
     /* Transient layout-owned cooperation state. Unlike resolve_scratch this
        is not saved/restored around nested property reparsing. */
     bool (*selector_cooperate)(
@@ -2012,6 +2141,10 @@ typedef struct {
     uint64_t variable_cache_misses;
     uint64_t variable_cache_negative_hits;
     uint64_t variable_cache_evictions;
+    /* Custom properties var() looked up since an owner last cleared this
+       (stylesheet_custom_property_name_bits of each name), so a resolved
+       style can record which inherited custom properties it read. */
+    uint64_t variable_read_names;
     size_t variable_cache_peak_bytes;
     uint64_t deferred_rule_applications;
     uint64_t deferred_rule_us;
@@ -2041,6 +2174,10 @@ typedef struct {
     uint64_t selector_subject_cache_hits;
     uint64_t selector_subject_cache_misses;
     uint64_t selector_tag_id_checks;
+    /* Class-list scans by the matcher: whole-list tokenizations for the
+       class-token cache, and linear scans outside it. */
+    uint64_t selector_class_token_builds;
+    uint64_t selector_class_linear_scans;
     uint64_t diagnostic_declarations;
     uint64_t diagnostic_supported_declarations;
     uint64_t diagnostic_rejected_declarations;
@@ -2063,11 +2200,40 @@ typedef struct {
     bool selector_program_attempted;
     bool custom_rule_index_ready;
     bool custom_rule_index_attempted;
+    /* Sorted class/id token hashes of the custom rules (custom properties,
+       SVG presentation values) that can reach an inline SVG raster, built on
+       the first stylesheet_tokens_may_affect_svg_raster() query for this
+       build generation and custom-rule count. Opaque: some such selector's
+       token dependency cannot be listed (or the list could not be built). */
+    uint32_t *svg_raster_tokens;
+    uint32_t svg_raster_token_count;
+    size_t svg_raster_token_rules;
+    uint64_t svg_raster_token_generation;
+    bool svg_raster_tokens_ready;
+    bool svg_raster_tokens_opaque;
+    /* Sorted unique lower-cased attribute names that rule and custom-rule
+       selectors test, built on the first
+       stylesheet_selectors_reference_attribute_prefix() query for this build
+       generation and rule counts: offsets, then NUL-terminated names, in one
+       allocation. Opaque: some name cannot be listed (escaped, namespaced,
+       unparsed) or the bounded list could not be built. */
+    uint32_t *selector_attribute_names;
+    uint32_t selector_attribute_name_count;
+    size_t selector_attribute_name_bytes;
+    size_t selector_attribute_rules;
+    size_t selector_attribute_custom_rules;
+    uint64_t selector_attribute_generation;
+    bool selector_attribute_names_ready;
+    bool selector_attribute_names_opaque;
     bool document_rules_deferred;
     bool rule_batch_active;
     bool rule_batch_dirty;
     bool has_multicolumn_rules;
     bool has_container_relative_units;
+    /* Some image-bearing declaration (background, mask, list-style,
+       border-image, content, cursor) takes its value through var(): a
+       custom-property change can then reveal a new image. */
+    bool image_declarations_use_variables;
     bool has_scroll_interaction_rules;
     bool has_cursor_rules;
     /* Bitset of sparse modern mobile declarations present in this sheet.
@@ -2089,9 +2255,12 @@ typedef struct {
         STYLE_FUNCTIONAL_ARGUMENT_CAPACITY];
     StyleFunctionalOption functional_options[
         STYLE_FUNCTIONAL_OPTION_CAPACITY];
-    /* Inline <style> elements this sheet has ingested, in cascade order, so
-       navigation can append a later-inserted <style> without a rebuild.
-       Bounded-out means "unknown": every later insertion rebuilds. */
+    /* The <style> elements and stylesheet <link> elements whose rules this
+       sheet has ingested, in cascade order with the order of each one's
+       first rule, so navigation can insert a later-added source without a
+       rebuild. A link whose fetch failed or whose rules were deduplicated
+       away may be absent: it contributes no rule. Bounded-out means
+       "unknown": every later insertion rebuilds. */
 #define STYLE_SOURCE_NODE_LIMIT 48u
     const lxb_dom_node_t *style_source_nodes[STYLE_SOURCE_NODE_LIMIT];
     unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
@@ -2195,16 +2364,38 @@ bool stylesheet_append_style_elements_tracked(
     Stylesheet *sheet, lxb_dom_node_t *const *elements, size_t count,
     const TilefinchContentSecurityPolicy *content_security_policy,
     size_t after_source, StylesheetAppendResult *result);
+/* The general form: `append` adds one or more sources (inline blocks,
+   fetched link sheets) at the tail of the sheet, noting each source it
+   ingests; they are then moved to `after_source` like the above. */
+typedef bool (*StylesheetSourceAppender)(Stylesheet *sheet, void *opaque);
+bool stylesheet_append_sources_tracked(
+    Stylesheet *sheet, StylesheetSourceAppender append, void *opaque,
+    size_t after_source, StylesheetAppendResult *result);
+/* Records a <style> or stylesheet <link> element as the source of the rules
+   parsed next (see Stylesheet.style_source_nodes). */
+void stylesheet_note_style_source(Stylesheet *sheet,
+                                  const lxb_dom_node_t *element);
 size_t stylesheet_style_source_count(const Stylesheet *sheet);
 void stylesheet_append_result_release(Stylesheet *sheet,
                                       StylesheetAppendResult *result);
 bool stylesheet_style_source_known(const Stylesheet *sheet,
                                    const lxb_dom_node_t *element);
 const lxb_dom_node_t *stylesheet_last_style_source(const Stylesheet *sheet);
+/* Whether any of the rules at these indices can affect display/visibility
+   or supply an image (see stylesheet_tokens_may_affect_discovery). */
+bool stylesheet_rules_affect_discovery(const Stylesheet *sheet,
+                                       const uint32_t *indices, size_t count);
 /* Whether a class/id change with these token hashes could change which
    elements match a rule able to affect display/visibility or supply an
    image; true whenever the rule filters cannot bound that. */
 bool stylesheet_tokens_may_affect_discovery(
+    const Stylesheet *sheet, const uint32_t *hashes, size_t count);
+/* Whether a class/id change with these token hashes, made outside an
+   inline <svg>, could change what an SVG beneath it resolves for its raster:
+   its inherited colour, font size, SVG presentation values or a custom
+   property, or its own width/height through an ancestor selector. True
+   whenever that cannot be bounded. */
+bool stylesheet_tokens_may_affect_svg_raster(
     const Stylesheet *sheet, const uint32_t *hashes, size_t count);
 /* State which can change how a subsequently parsed stylesheet compiles.
    Incremental appenders compare this before/after their suffix and discard
@@ -2318,6 +2509,23 @@ bool style_focus_change_is_outline_only(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *normal,
     ComputedStyle *focused);
+/* Conservative attribute-selector prefix query, including retained custom
+   rules: true when some selector tests an attribute whose name begins with
+   `name` (ASCII case-insensitive). Escaped/namespace-qualified or unparsed
+   attribute names answer true. This does not classify semantic
+   pseudo-classes such as :checked or :focus. Prefix matching safely accepts
+   a mutation journal's truncated attribute name. Answers from a sorted name
+   set cached per sheet generation, so each query is a binary search. */
+bool stylesheet_selectors_reference_attribute_prefix(
+    const Stylesheet *sheet, const char *name, size_t name_length);
+/* Two bits of a 64-bit set for one custom-property name (ASCII case
+   folded, so a journal's lowercased name finds the author's spelling). A
+   set that lacks either bit of a name never read it. */
+uint64_t stylesheet_custom_property_name_bits(const char *name,
+                                              size_t length);
+/* The name bits of every custom property an inline style declares. */
+uint64_t stylesheet_inline_custom_property_bits(const char *text,
+                                                size_t length);
 /* True when changing one attribute value can alter any selector containing
    :has(), including a changed class/id token outside the relative selector.
    The caller supplies both values before mutating the DOM so removals are
@@ -2339,6 +2547,23 @@ bool stylesheet_attribute_change_may_affect_has(
     const Stylesheet *sheet, const char *name, size_t name_length,
     const char *old_value, size_t old_length,
     const char *new_value, size_t new_length);
+/* True when inserting `node` under `parent` (asked after the insertion),
+   removing it (asked before), or changing a text node's data can move any
+   :has() answer: an argument could end on an element of the node's subtree
+   or on a sibling whose position moves, or read the parent's :empty, and an
+   anchor it could concern is reachable from the parent. A move from another
+   connected parent is not covered: ask for both positions or stay
+   conservative. */
+/* stylesheet_tree_change_may_affect_has, also summarizing which :has()
+   plan entries the change can move: a 64-bit summary (UINT64_MAX when
+   unknown) of the build `serial` names, for layout to note only those. */
+bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
+                                        lxb_dom_node_t *node,
+                                        lxb_dom_node_t *parent,
+                                        uint64_t *entries, uint32_t *serial);
+bool stylesheet_tree_change_may_affect_has(const Stylesheet *sheet,
+                                           lxb_dom_node_t *node,
+                                           lxb_dom_node_t *parent);
 typedef enum {
     STYLE_FOCUS_CHANGE_UNSAFE = 0,
     STYLE_FOCUS_CHANGE_OUTLINE_ONLY,
@@ -2374,6 +2599,13 @@ bool style_custom_property_value(
 bool style_retained_presentation_value(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *name, size_t name_length, char *output, size_t output_size);
+/* The element's computed transition longhands through the cascade: author
+   rules, the style attribute, !important and layers, var() substitution.
+   Always succeeds for a valid node; nothing authored yields the initial
+   values. */
+bool style_transition_computed(
+    const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    StyleTransitionComputed *output);
 /* Resolves any declaration deliberately retained outside ComputedStyle.
    This includes the sparse scroll-container and pointer properties as well
    as SVG presentation values. Callers must use a property collected by the
@@ -2430,6 +2662,9 @@ bool style_container_layout_state_add(Stylesheet *sheet,
                                       int padding_vertical);
 void style_container_layout_state_clear(Stylesheet *sheet);
 uint64_t style_container_layout_state_signature(const Stylesheet *sheet);
+/* The last layout collected container geometry: the page has container
+   queries or container-relative units, possibly only in style attributes. */
+bool style_container_layout_state_present(const Stylesheet *sheet);
 bool computed_style_has_text_underline(const ComputedStyle *style);
 bool computed_style_has_ancestor_text_underline(const ComputedStyle *style);
 /* Returns false for the computed `auto` value, otherwise writes the bounded
@@ -2453,9 +2688,18 @@ bool style_selector_matches_scoped(lxb_dom_node_t *node,
 /* A selector list prepared once for matching against many elements, as a
    querySelector walk does: split at top-level commas, each selector's
    rightmost compound located, and, where the stylesheet's fast-key rule
-   finds one, a byte-exact tag, ID or class the element must carry. The
-   key only rejects elements the full matcher would reject too. */
+   finds one, a byte-exact tag, ID or class the element must carry.
+   A complete key also proves a match for a single plain tag, ID or class.
+   The first attribute the rightmost compound tests is kept too, lowercased
+   as the matcher looks it up: an element without it cannot match, and a
+   selector that is only `[name]` matches exactly the elements with it.
+   Without one, a rightmost compound's `:is()`/`:where()` whose every
+   argument's own rightmost compound tests an attribute keeps those names
+   (offsets into the text, which spells them in lower case): an element
+   carrying none of them cannot match. */
 #define STYLE_QUERY_SELECTOR_LIMIT 16u
+#define STYLE_QUERY_ATTRIBUTE_CAPACITY 64u
+#define STYLE_QUERY_ANY_ATTRIBUTE_LIMIT 4u
 typedef struct {
     const char *text;
     size_t length;
@@ -2463,6 +2707,13 @@ typedef struct {
     const char *key;
     size_t key_length;
     SelectorType key_type;
+    bool complete_key;
+    bool complete_attribute;
+    uint8_t attribute_length;
+    char attribute[STYLE_QUERY_ATTRIBUTE_CAPACITY];
+    uint8_t any_attribute_count;
+    uint8_t any_attribute_length[STYLE_QUERY_ANY_ATTRIBUTE_LIMIT];
+    uint16_t any_attribute_offset[STYLE_QUERY_ANY_ATTRIBUTE_LIMIT];
 } StyleQuerySelector;
 typedef struct {
     StyleQuerySelector items[STYLE_QUERY_SELECTOR_LIMIT];
@@ -2475,6 +2726,11 @@ bool style_query_selector_list_prepare(StyleQuerySelectorList *list,
 bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
                                        lxb_dom_node_t *node,
                                        const lxb_dom_node_t *scope);
+/* The reader's colour-scheme preference, answered to prefers-color-scheme
+   media queries (Tilefinch night mode). Process-wide; the parsed stylesheet
+   IR cache is keyed on it. Defaults to light. */
+void stylesheet_set_prefers_dark_color_scheme(bool dark);
+bool stylesheet_prefers_dark_color_scheme(void);
 bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
                               size_t query_length);
 bool stylesheet_supports_matches(Stylesheet *sheet, const char *query,
@@ -2486,6 +2742,11 @@ bool style_color_parse(const char *text, size_t length,
                        uint32_t *color, uint8_t *alpha);
 const StyleDeclaration *stylesheet_rule_declaration(
     const Stylesheet *sheet, const StyleRule *rule);
+/* Decodes a declaration's parsed values into `values`. A declaration that
+   does not belong to `sheet` decodes as all-zero values (nothing set). */
+void stylesheet_declaration_values(const Stylesheet *sheet,
+                                   const StyleDeclaration *declaration,
+                                   ComputedStyle *values);
 /* Indices of the rules whose declarations can give an element an RTL
    direction or a bidi override (var()-deferred ones conservatively). False
    when more than `capacity` exist. */

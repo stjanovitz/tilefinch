@@ -20,7 +20,7 @@ run the loop safely and understand each constraint.
 
 The PSPLink screen on the device is only half of the connection. On the Mac,
 `usbhostfs_pc` must also be alive: it owns the USB connection, serves `host0:`,
-and exposes the socket used by `pspsh`. A Codex task restart, terminal exit, or
+and exposes the socket used by `pspsh`. A task restart, terminal exit, or
 host reboot can kill that process while the PSP continues to display PSPLink.
 The resulting `connect: Connection refused` is therefore a missing **host
 bridge**, not a reason to power-cycle the PSP.
@@ -81,6 +81,34 @@ provides the canonical bounded command runner.
 
 ## One cycle
 
+### Same-binary JavaScript-profiler comparison
+
+The validation EBOOT enables the JavaScript sampler and call wrappers by
+default. To measure their cost without changing code or binaries, run the same
+input script and page twice with `validation_js_profile=1` and then
+`validation_js_profile=0` in `boot.cfg`. The boot log must report
+`tilefinch-js-profiler: requested=0 enabled=0 set-status=0` for the second
+run. Keep all other settings and the replay input identical, compare the
+completed run's output as well as its timing, and use multiple runs per mode.
+This setting is validation-only; shipping builds ignore it.
+For attribution after the comparison, set `validation_js_profile=1` and
+`validation_js_outlier_us=500000`. The validation log then emits one
+`tilefinch-promise-job` split for each job taking at least 500 ms. Keep this
+off during the profiler-on/off overhead comparison; it adds per-job accounting.
+`trace_ignore_request_body=1` (with `trace=` and `trace_keyed=1`) replays
+recorded POSTs without matching their bodies, as the host lab's
+`TILEFINCH_REPLAY_IGNORE_REQUEST_BODY` does; pages such as chatgpt.com mint
+fresh tokens into them, so their recorded sends otherwise never match. The
+boot log prints `tilefinch-trace-replay: ignore-request-body=1`.
+`trace_volatile_uuids=1` does what the host lab's
+`TILEFINCH_REPLAY_VOLATILE_UUIDS` does: a UUID the page minted into a request
+URL matches the recorded one, and the served response carries the live
+request's UUIDs (chatgpt.com's streamed answer is keyed to its per-send
+`operationId` and pending message ids). The boot log prints
+`tilefinch-trace-replay: volatile-uuids=1`, and each rewritten record logs an
+`HTTP replay volatile-uuid` engine line. Route decisions (`unmatched`,
+`exhausted`, `invalid`) go to the engine log too. Validation builds only.
+
 ### Preferred zero-Memory-Stick cycle
 
 For ordinary iteration, build and load the browser PRX directly from `host0:`:
@@ -125,6 +153,7 @@ Mac while the program runs:
 | scripted input | the leaf named by `input_script=` |
 | captured frames | `frame-*.ppm`, `frame-mark-*.ppm` |
 | on-demand screenshots | `screenshots/` |
+| persistent module bytecode (opt-in) | the directory named by `module_cache_dir=` |
 
 Fonts, roots, and development voice assets are staged beside the PRX by the
 build. The optional software decoder is a separate
@@ -136,6 +165,14 @@ an offline save, screenshot, download, cache, or update action. Logging also
 avoids `sceIoSync("ms0:")` when its derived paths are on `host0:`. Loading the
 module and its assets over USB changes startup timing, so compare host0 runs
 only with host0 runs.
+
+The persistent module bytecode tier is off unless `boot.cfg` names
+`module_cache_dir=`. Point it at `host0:/modcache` so the files land on the
+Mac: `module_cache_write=1` stores compiled modules there, and `0` (the
+default) only reads what a previous run wrote. A cold/warm comparison runs
+twice against the same `module_cache_dir=`, the first run with
+`module_cache_write=1`. A writing run into a full directory removes its
+oldest entries during idle work. Never point a test run at `ms0:`.
 
 ### A script ending inside the keyboard is a failed run
 
@@ -206,8 +243,9 @@ It is unnecessary wear and timing noise for media iteration.
    Why: the profile's `R <video-id> <position-us> <duration-us>` lines persist
    the resume position at exit — including a failed run's seek target. Without
    this reset, the next run resumes at a far cold offset and dies in ways that
-   look like new bugs. `profile-clean.cfg` is the checked-in-to-the-build-dir
-   copy with all `R` positions zeroed.
+   look like new bugs. `profile-clean.cfg` is a copy of `profile.cfg` with
+   every `R` position zeroed that you stage in the served build directory
+   yourself; the build does not generate it.
 4. **Launch**: use the XMB for ordinary/manual slotted tests. The separate
    `tfexec.prx` loop is reserved for validation EBOOTs whose checked
    `exit_to=` handoff returns directly to PSPLink; never use it with a
@@ -226,7 +264,7 @@ It is unnecessary wear and timing noise for media iteration.
    buffered and written once to `host0:/tilefinch-au-dump.bin`. It has no
    `ms0:` fallback, so even this failure diagnostic performs zero Memory Stick
    I/O. Move it out of the served build directory immediately. Format TFAU v1
-   (`build-preset-psp-validation/tfau-diff.py` parses/diffs).
+   (magic `PSP_MEDIA_AU_DUMP_MAGIC` in `src/media_backend_psp.c`).
 
 ### Installed-EBOOT remote cycle
 

@@ -361,6 +361,61 @@ typedef struct {
     bool valid;
 } BrowserClientHintEntry;
 
+/*
+ * In-memory QuickJS bytecode for page ES modules.
+ *
+ * A module's compiled record is keyed by everything that shapes it: the
+ * module-map name QuickJS bakes into the bytecode (the request URL), the
+ * response URL, the network partition (top-level site) that fetched it, the
+ * compile options, and the exact source (length plus SHA-256; the source is
+ * not retained). A hit is therefore only ever the bytecode that compiling
+ * those same bytes would produce, after every fetch, CSP, SRI, CORS and MIME
+ * check has already admitted the bytes.
+ *
+ * Entries are RAM-only compiler artifacts (never persisted), charged to the
+ * page Budget as SESSION memory under their own byte ceiling, and dropped
+ * with the HTTP cache on clear or optional-memory reclaim. The table itself
+ * is allocated on the first store, so a session that never caches a module
+ * pays one pointer.
+ */
+#define BROWSER_MODULE_BYTECODE_ENTRIES 128u
+
+typedef struct {
+    char *module_name;
+    char *response_url;
+    char *partition_key;
+    BrowserSharedBody *bytecode;
+    size_t source_length;
+    /* Bytecode plus key strings, as charged against the ceiling. */
+    size_t charged_bytes;
+    size_t stamp;
+    /* The document realm that last stored or restored this entry. Entries
+       the current realm has used are not evicted to admit another module
+       of the same load: that would trade a certain hit for a later miss. */
+    uint32_t generation;
+    uint32_t compile_flags;
+    uint8_t source_digest[32];
+} BrowserModuleBytecodeEntry;
+
+typedef struct BrowserModuleBytecodeCache {
+    BrowserModuleBytecodeEntry entries[BROWSER_MODULE_BYTECODE_ENTRIES];
+    size_t bytes;
+    size_t clock;
+} BrowserModuleBytecodeCache;
+
+/* Lookup key. The digest is computed at most once per key, and only when a
+   stored entry matches every cheaper field. */
+typedef struct {
+    const char *module_name;
+    const char *response_url;
+    const char *partition_key;
+    const unsigned char *source;
+    size_t source_length;
+    uint32_t compile_flags;
+    uint8_t source_digest[32];
+    bool digest_ready;
+} BrowserModuleBytecodeKey;
+
 typedef struct BrowserSession {
     Budget *budget;
     /* Non-owning engine-lifetime request policy. */
@@ -420,6 +475,54 @@ typedef struct BrowserSession {
     struct BrowserCaptivePortalStash *captive_portal_stash;
     BudgetReservation accounting_reservation;
     size_t accounting_bytes;
+    /* NULL until the first module bytecode store. */
+    BrowserModuleBytecodeCache *module_bytecode;
+    size_t maximum_module_bytecode_bytes;
+    uint32_t module_bytecode_generation;
+    size_t module_bytecode_evictions;
+    /* Optional persistent tier (off unless a directory is configured; see
+       browser_session_module_bytecode_set_disk). */
+    char module_bytecode_disk_dir[160];
+    bool module_bytecode_disk_write;
+    bool module_bytecode_disk_dir_ready;
+    size_t module_bytecode_disk_written;
+    size_t module_bytecode_disk_hits;
+    size_t module_bytecode_disk_misses;
+    size_t module_bytecode_disk_writes;
+    size_t module_bytecode_disk_rejects;
+    /* Files removed: stale engine or temporary files, rejected entries,
+       cache clears. */
+    size_t module_bytecode_disk_removed;
+    /* The directory's own files, counted by the first write's scan (writes
+       only) and kept current after it. */
+    bool module_bytecode_disk_scanned;
+    void *module_bytecode_disk_scan_cursor; /* DIR*, owned until EOF/reset. */
+    size_t module_bytecode_disk_scan_visits;
+    bool module_bytecode_disk_scan_failed;
+    size_t module_bytecode_disk_total_bytes;
+    size_t module_bytecode_disk_file_count;
+    /* A failed or unfinished scan is retried by maintenance after
+       `retry_wait` idle calls; the wait doubles per consecutive failure. */
+    unsigned module_bytecode_disk_retry_wait;
+    unsigned module_bytecode_disk_retry_backoff;
+    /* Eviction (writes on): the oldest of this build's records the last
+       scan saw, newest first, while `evicting` trims the directory to its
+       low-water mark. */
+#define BROWSER_MODULE_BYTECODE_DISK_VICTIMS 16u
+    struct {
+        char name[32]; /* Hex part of the file name. */
+        int64_t mtime;
+    } module_bytecode_disk_victims[BROWSER_MODULE_BYTECODE_DISK_VICTIMS];
+    unsigned module_bytecode_disk_victim_count;
+    bool module_bytecode_disk_evicting;
+    /* Read-only tier after a cache clear: no further reads this session. */
+    bool module_bytecode_disk_suspended;
+    /* Read-only tier: keys whose file was refused, not read again. */
+    unsigned char module_bytecode_disk_refused[8][16];
+    unsigned module_bytecode_disk_refused_count;
+    /* Time spent reading files and verifying them. */
+    uint64_t module_bytecode_disk_read_ns;
+    uint64_t module_bytecode_disk_verify_ns;
 } BrowserSession;
 
 /* Request-private cookie state used while following redirects. The concrete
@@ -737,6 +840,109 @@ bool browser_session_classic_script_bytecode_put(
 void browser_session_classic_script_bytecode_invalidate(
     BrowserSession *session, const char *request_url,
     const unsigned char *source, size_t source_length);
+/* Sets the module bytecode ceiling; zero disables the cache. Lowering it
+   evicts least-recently-used entries until the cache fits. */
+void browser_session_module_bytecode_set_limit(BrowserSession *session,
+                                               size_t maximum_bytes);
+/* A fresh nonzero generation for one document realm. */
+uint32_t browser_session_module_bytecode_generation(BrowserSession *session);
+/* Returns a retained reference to the bytecode for exactly this key, or NULL.
+   A hit marks the entry as used by `generation`. */
+BrowserSharedBody *browser_session_module_bytecode_acquire(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    uint32_t generation);
+/* Whether a store of `bytecode_length` bytes could be admitted now without
+   evicting an entry `generation` has used. An admission hint for skipping
+   serialization, not a reservation. */
+bool browser_session_module_bytecode_may_fit(
+    const BrowserSession *session, const BrowserModuleBytecodeKey *key,
+    size_t bytecode_length, uint32_t generation);
+/* Copies the bytecode into the cache, replacing any entry for the same
+   module name, response URL and partition. Returns false (and changes
+   nothing) when it does not fit the ceiling or an allocation is refused. */
+bool browser_session_module_bytecode_put(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    uint32_t generation, const unsigned char *bytecode,
+    size_t bytecode_length);
+/*
+ * Persistent module bytecode (off by default). With a directory set, a
+ * module missing from RAM is looked up in a file named by a hash of its
+ * complete key (the in-memory key plus this engine build), and, when
+ * `write` is set, a freshly compiled module is written there once: never
+ * overwritten, at most BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT per file
+ * and BROWSER_MODULE_BYTECODE_DISK_SESSION_LIMIT per session. Files carry
+ * their key and payload hashes and are verified before use, so a
+ * truncated, corrupted or foreign file is a miss, never bytecode handed
+ * to the engine. The same fetch/CSP/SRI/CORS admission precedes a disk hit
+ * as a RAM hit. An empty directory disables the tier.
+ *
+ * With writes on, the directory as a whole stays under
+ * BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT bytes and
+ * BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT files across sessions: the
+ * directory accounting removes stale files in bounded maintenance slices.
+ * Writes are declined until accounting completes, or if a ceiling is full;
+ * compiling a module never wipes existing entries to make room. Instead,
+ * idle maintenance that finds the directory full (a maximum-size file
+ * might not fit) removes this build's oldest records (by modification time)
+ * in slices until it is under the LOW_WATER marks, rescanning for more
+ * candidates as needed, so content-hashed module URLs that change on every
+ * deploy cannot freeze the cache. A scan that fails or reaches SCAN_LIMIT
+ * defers writes and is retried with backoff, since the ceilings cannot be
+ * honoured without complete accounting. Only this tier's file names are
+ * ever removed. A refused file (or one the engine cannot restore)
+ * is removed so the next compile replaces it; a read-only tier remembers
+ * it instead. Clearing the cache (browser_session_persistence_clear)
+ * empties the directory, or, read-only, stops reading it for the rest of
+ * the session.
+ */
+#define BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT (2u * 1024u * 1024u)
+#define BROWSER_MODULE_BYTECODE_DISK_SESSION_LIMIT (16u * 1024u * 1024u)
+#define BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT (24u * 1024u * 1024u)
+#define BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT 512u
+#define BROWSER_MODULE_BYTECODE_DISK_SCAN_SLICE 8u
+#define BROWSER_MODULE_BYTECODE_DISK_SCAN_LIMIT 4096u
+#define BROWSER_MODULE_BYTECODE_DISK_LOW_WATER_BYTES \
+    (BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT / 4u * 3u)
+#define BROWSER_MODULE_BYTECODE_DISK_LOW_WATER_FILES \
+    (BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT / 4u * 3u)
+void browser_session_module_bytecode_set_disk(BrowserSession *session,
+                                              const char *directory,
+                                              bool write);
+bool browser_session_module_bytecode_disk_enabled(
+    const BrowserSession *session);
+/* The verified bytecode for this key from disk, charged to the session
+   Budget, or NULL. */
+BrowserSharedBody *browser_session_module_bytecode_disk_load(
+    BrowserSession *session, BrowserModuleBytecodeKey *key);
+/* Whether a store for this key would write (writes on, room left, and no
+   file for it yet): lets the loader skip serializing otherwise. */
+bool browser_session_module_bytecode_disk_wants(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    size_t bytecode_length);
+bool browser_session_module_bytecode_disk_store(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    const unsigned char *bytecode, size_t bytecode_length);
+/* The engine could not restore what disk_load returned for this key: remove
+   the file (writes on) or stop reading it this session. */
+void browser_session_module_bytecode_disk_discard(
+    BrowserSession *session, BrowserModuleBytecodeKey *key);
+/* One bounded slice of accounting, eviction or a due scan retry (writes
+   on, idle work only); true if work was performed. */
+bool browser_session_module_bytecode_disk_maintenance(BrowserSession *session);
+/* Explicit user clear, bounded by SCAN_LIMIT; false on incomplete removal. */
+bool browser_session_module_bytecode_disk_clear(BrowserSession *session);
+/* Drops the entry for this key (after a failed restore). */
+void browser_session_module_bytecode_invalidate(
+    BrowserSession *session, BrowserModuleBytecodeKey *key);
+/* Evicts least-recently-used entries until `target_bytes` are released or
+   the cache is empty; returns the bytes released. Frees only entries (never
+   the table) and allocates nothing, so it is safe as a Budget reclaim hook
+   while an allocation is in progress anywhere, including inside this cache. */
+size_t browser_session_module_bytecode_reclaim(BrowserSession *session,
+                                               size_t target_bytes);
+/* Bytes and entries currently held. */
+size_t browser_session_module_bytecode_bytes(const BrowserSession *session);
+size_t browser_session_module_bytecode_entries(const BrowserSession *session);
 /* Resolves the exact authorized response once and retains either requested
    RAM-only compiler artifact. A NULL output skips that artifact. Returns
    whether the exact backing response exists and leaves room for an artifact;
@@ -830,10 +1036,11 @@ bool browser_session_cache_revalidate_module(
     BrowserSession *session, const char *request_url,
     const char *cache_control, const char *vary, uint64_t now_ns,
     const BrowserModuleCacheProvenance *provenance);
-/* Evicts least-recently-used response entries until at least target_bytes of
-   the shared page Budget has actually become available, or the optional cache
-   is empty. Shared bodies still leased by another subsystem may therefore be
-   evicted without contributing to the returned physical-byte count. */
+/* Evicts least-recently-used response entries, then module bytecode, until
+   at least target_bytes of the shared page Budget has actually become
+   available, or the optional caches are empty. Shared bodies still leased by
+   another subsystem may therefore be evicted without contributing to the
+   returned physical-byte count. */
 size_t browser_session_cache_reclaim(BrowserSession *session,
                                      size_t target_bytes);
 /* Evicts older HTTP entries until a bounded working set can be inserted

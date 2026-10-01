@@ -1,4 +1,9 @@
 #include "psp_media_session_internal.h"
+#include "tilefinch/psp_log.h"
+
+/* Validation EBOOT only (src/psp_transport_probe.c); absent elsewhere. */
+extern void psp_transport_probe_inflight(char *output, size_t size)
+    __attribute__((weak));
 
 void psp_media_publish_track_catalog(PspMediaSession *media)
 {
@@ -34,6 +39,26 @@ void psp_media_publish_track_catalog(PspMediaSession *media)
                     : track->label,
                  track->automatic ? " (auto)" : "");
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Which six caption tracks the menu offers, against which preference:
+       the menu keeps only the best-ranked six of a long YouTube list. */
+    char tracks[192] = {0};
+    size_t used = 0;
+    for (size_t at = 0; at < caption_count && used < sizeof(tracks); at++) {
+        int written = snprintf(
+            tracks + used, sizeof(tracks) - used, "%s%.24s",
+            at == 0 ? "" : ",", media->stream.caption_tracks[at].id);
+        if (written < 0) break;
+        used += (size_t) written;
+    }
+    psp_log_printf(
+        "tilefinch-subtitles: catalog caption-language=%s same-as-audio=%d "
+        "audio-language=%s alternate=%s audio-tracks=%zu tracks=%s\n",
+        media->track_preferences.caption_language,
+        media->track_preferences.caption_same_as_audio ? 1 : 0,
+        media->track_preferences.audio_language,
+        media->track_preferences.alternate_language, audio_count, tracks);
+#endif
 }
 
 #include <stdio.h>
@@ -490,6 +515,7 @@ static bool psp_media_create_audio_http_range(
               } : NULL,
         .url_validator = media->page_audio
             ? NULL : youtube_media_url_supported,
+        .tls12_session_resumption = !media->page_audio,
         .cancel = psp_media_cancel_callback,
         .cancel_opaque = media
     };
@@ -513,7 +539,7 @@ uint64_t psp_media_recovery_position_us(
         /* Preview movement is tentative until the user confirms it. A retry,
            suspend, or close during its decode must restore the position from
            which preview began, not silently commit the highlighted target. */
-        return media->job_preview && media->seek_preview_started
+        return media->job_preview && psp_media_scrub_active(&media->scrub)
             ? media->job_restore_us : media->job_target_us;
     }
     if (media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
@@ -526,9 +552,9 @@ void psp_media_remember_retry_state(
     PspMediaSession *media, bool resume_playing)
 {
     if (media == NULL || media->playback == NULL) return;
-    media->reopen_resume_us = psp_media_recovery_position_us(media);
-    media->reopen_resume_playing = resume_playing;
-    media->reopen_resume_pending = true;
+    psp_media_continuation_reopen(
+        &media->continuation, psp_media_recovery_position_us(media),
+        resume_playing);
 }
 
 /* True while the transaction that is failing is one of the two seek legs or
@@ -549,10 +575,10 @@ void psp_media_job_failed(PspMediaSession *media,
                                  const char *error)
 {
     if (media == NULL) return;
-    media->reopen_reuse_resolved_stream = false;
+    media->continuation.reuse_resolved = false;
     bool opening_failure = psp_media_open_phase(media->job_phase);
     bool seeking_failure = psp_media_seek_phase(media->job_phase);
-    psp_media_release_presentation_preroll(media, true);
+    psp_media_release_presentation_preroll(media);
     /*
      * Sampled before the phase is cleared, because both answers are phase
      * derived: the retry ladder's resume position (which keeps a tentative
@@ -565,10 +591,11 @@ void psp_media_job_failed(PspMediaSession *media,
     bool restoring_preview =
         media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE;
+    bool commit_pending =
+        psp_media_target_commit_pending(&media->pending_target);
     bool tentative_preview = seeking_failure && !restoring_preview
-        && media->job_preview && media->seek_preview_started
-        && (media->ui.seek_preview_active
-            || media->preview_commit_pending);
+        && media->job_preview && psp_media_scrub_active(&media->scrub)
+        && (media->ui.seek_preview_active || commit_pending);
     uint64_t source_us = psp_media_seek_failure_clock_us(
         restoring_preview || tentative_preview,
         media->job_target_us, media->job_restore_us);
@@ -581,7 +608,7 @@ void psp_media_job_failed(PspMediaSession *media,
                operation == NULL ? "unknown" : operation,
                (unsigned long long) media->clock_us,
                (unsigned long long) source_us,
-               (unsigned long long) media->reopen_resume_us);
+               (unsigned long long) media->continuation.position_us);
         media->clock_us = source_us;
     }
     /*
@@ -593,7 +620,7 @@ void psp_media_job_failed(PspMediaSession *media,
      * as UI/intent state and let Cross commit it or Circle cancel it. The
      * ordinary playback pipeline remains valid and no failure panel is owed.
      */
-    if (tentative_preview && !media->preview_commit_pending
+    if (tentative_preview && !commit_pending
         && media->playback != NULL
         && !media_psp_backend_quarantined()) {
         /* The exact thumbnail missed its deadline, but the user has not
@@ -607,8 +634,7 @@ void psp_media_job_failed(PspMediaSession *media,
         media->job_maximum_unit_us = 0;
         media->job_preview = true;
         media->job_resume_playing = false;
-        media->job_resume_open = false;
-        media->reopen_resume_pending = false;
+        psp_media_continuation_clear(&media->continuation);
         media_playback_set_playing(media->playback, false);
         printf("tilefinch-media: preview unavailable operation=%s "
                "action=restore target=%lluus restore=%lluus "
@@ -620,17 +646,15 @@ void psp_media_job_failed(PspMediaSession *media,
         return;
     }
     if (seeking_failure
-        && (restoring_preview
-            || (tentative_preview && media->preview_commit_pending))
-        && media->seek_preview_started
-        && (media->ui.seek_preview_active
-            || media->preview_commit_pending)
+        && (restoring_preview || (tentative_preview && commit_pending))
+        && psp_media_scrub_active(&media->scrub)
+        && (media->ui.seek_preview_active || commit_pending)
         && media->playback != NULL
         && !media_psp_backend_quarantined()) {
-        uint64_t preview_target_us = media->preview_commit_pending
-            ? media->preview_commit_target_us
+        uint64_t preview_target_us = commit_pending
+            ? media->pending_target.target_us
             : media->ui.seek_preview_time_us;
-        bool preview_was_playing = media->seek_preview_was_playing;
+        bool preview_was_playing = media->scrub.was_playing;
         media->job_phase = PSP_MEDIA_JOB_NONE;
         media->job_started_us = 0;
         media->job_phase_started_us = 0;
@@ -638,19 +662,16 @@ void psp_media_job_failed(PspMediaSession *media,
         media->job_maximum_unit_us = 0;
         media->job_preview = false;
         media->job_resume_playing = false;
-        media->job_resume_open = false;
-        media->seek_preview_cancel_pending = false;
-        media->reopen_resume_pending = false;
+        psp_media_continuation_clear(&media->continuation);
         /* Suppress advance's exact-preview coalescer. The target is still
            highlighted, but no second thumbnail transaction is started. */
         media->job_target_us = preview_target_us;
-        media->seek_preview_started = true;
-        media->seek_preview_was_playing = preview_was_playing;
+        psp_media_scrub_retain(&media->scrub, preview_was_playing);
         media_playback_set_playing(media->playback, false);
         psp_ui_media_set(
             &media->ui, true, false, false, media->clock_us,
             psp_media_duration_us(media), media->stream.title);
-        if (media->preview_commit_pending)
+        if (commit_pending)
             psp_ui_media_commit_seek(&media->ui, preview_target_us);
         else
             psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
@@ -670,15 +691,9 @@ void psp_media_job_failed(PspMediaSession *media,
     media->job_maximum_unit_us = 0;
     media->job_preview = false;
     media->job_resume_playing = false;
-    media->job_resume_open = false;
-    media->seek_preview_started = false;
-    media->seek_preview_was_playing = false;
-    media->seek_preview_cancel_pending = false;
-    media->reopen_preview_target_us = 0;
-    media->reopen_preview_pending = false;
-    media->preview_commit_target_us = 0;
-    media->preview_commit_pending = false;
-    media->preview_commit_resume_playing = false;
+    psp_media_continuation_end_resume(&media->continuation);
+    psp_media_scrub_end(&media->scrub);
+    psp_media_target_clear(&media->pending_target);
     psp_ui_media_cancel_seek_preview(&media->ui);
     psp_media_raise_error(media, error, NULL);
     /* Every backend entry point refuses a quarantined firmware decoder for
@@ -749,6 +764,31 @@ static bool psp_media_transport_refresh_needed(
         media->stream.expires_unix, now);
 }
 
+/* What a retry that rebuilds the pipeline carries across it: a committed
+   target, or the scrub target to highlight again, and whether playback
+   resumes. Sampled before the pipeline is destroyed. */
+static bool psp_media_retry_continuation(
+    const PspMediaSession *media, bool *commit_pending,
+    bool *preview_pending, uint64_t *preview_target_us)
+{
+    *commit_pending = psp_media_target_commit_pending(&media->pending_target);
+    *preview_pending = !*commit_pending
+        && psp_media_scrub_active(&media->scrub)
+        && (media->ui.seek_preview_active
+            || media->machine.preview_active
+            || media->job_preview);
+    *preview_target_us = *commit_pending
+        ? media->pending_target.target_us
+        : media->ui.seek_preview_active
+            ? media->ui.seek_preview_time_us
+            : media->job_target_us;
+    return psp_media_retry_preview_should_resume(
+        media->ui.playing, media->job_resume_playing,
+        psp_media_scrub_active(&media->scrub), media->scrub.was_playing)
+        || psp_media_machine_wants_playing(media)
+        || (*commit_pending && media->pending_target.resume_playing);
+}
+
 bool psp_media_retry_transport(
     PspMediaSession *media, const char *operation, const char *error,
     bool delivery_candidate_rejected)
@@ -764,22 +804,10 @@ bool psp_media_retry_transport(
     }
     uint64_t resume_us = psp_media_recovery_position_us(media);
     uint64_t duration_us = psp_media_duration_us(media);
-    bool commit_pending = media->preview_commit_pending;
-    bool preview_pending = !commit_pending
-        && media->seek_preview_started
-        && (media->ui.seek_preview_active
-            || media->machine.preview_active
-            || media->job_preview);
-    uint64_t preview_target_us = commit_pending
-        ? media->preview_commit_target_us
-        : media->ui.seek_preview_active
-            ? media->ui.seek_preview_time_us
-            : media->job_target_us;
-    bool resume_playing = psp_media_retry_preview_should_resume(
-        media->ui.playing, media->job_resume_playing,
-        media->seek_preview_started, media->seek_preview_was_playing)
-        || psp_media_machine_wants_playing(media)
-        || (commit_pending && media->preview_commit_resume_playing);
+    bool commit_pending = false, preview_pending = false;
+    uint64_t preview_target_us = 0;
+    bool resume_playing = psp_media_retry_continuation(
+        media, &commit_pending, &preview_pending, &preview_target_us);
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_CLOSE,
         .retain_pipeline = false
@@ -797,12 +825,10 @@ bool psp_media_retry_transport(
     media->transport_refresh_rearm_us =
         resume_us > UINT64_MAX - UINT64_C(5000000)
             ? UINT64_MAX : resume_us + UINT64_C(5000000);
-    media->reopen_resume_us = resume_us;
-    media->reopen_resume_playing = resume_playing;
-    media->reopen_resume_pending = true;
-    media->reopen_preview_target_us = preview_target_us;
-    media->reopen_preview_pending = preview_pending;
-    media->reopen_reuse_resolved_stream = false;
+    psp_media_continuation_reopen(
+        &media->continuation, resume_us, resume_playing);
+    psp_media_target_after_reopen(
+        &media->pending_target, preview_pending, preview_target_us);
     media->open_service_pending = true;
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_OPEN,
@@ -880,22 +906,10 @@ bool psp_media_retry_240p(
         || psp_media_cancel_requested(media)) return false;
     uint64_t resume_us = psp_media_recovery_position_us(media);
     uint64_t duration_us = psp_media_duration_us(media);
-    bool commit_pending = media->preview_commit_pending;
-    bool preview_pending = !commit_pending
-        && media->seek_preview_started
-        && (media->ui.seek_preview_active
-            || media->machine.preview_active
-            || media->job_preview);
-    uint64_t preview_target_us = commit_pending
-        ? media->preview_commit_target_us
-        : media->ui.seek_preview_active
-            ? media->ui.seek_preview_time_us
-            : media->job_target_us;
-    bool resume_playing = psp_media_retry_preview_should_resume(
-        media->ui.playing, media->job_resume_playing,
-        media->seek_preview_started, media->seek_preview_was_playing)
-        || psp_media_machine_wants_playing(media)
-        || (commit_pending && media->preview_commit_resume_playing);
+    bool commit_pending = false, preview_pending = false;
+    uint64_t preview_target_us = 0;
+    bool resume_playing = psp_media_retry_continuation(
+        media, &commit_pending, &preview_pending, &preview_target_us);
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_CLOSE,
         .retain_pipeline = false
@@ -923,12 +937,10 @@ bool psp_media_retry_240p(
             resume_us > UINT64_MAX - UINT64_C(5000000)
                 ? UINT64_MAX : resume_us + UINT64_C(5000000);
     }
-    media->reopen_resume_us = resume_us;
-    media->reopen_resume_playing = resume_playing;
-    media->reopen_resume_pending = true;
-    media->reopen_preview_target_us = preview_target_us;
-    media->reopen_preview_pending = preview_pending;
-    media->reopen_reuse_resolved_stream = false;
+    psp_media_continuation_reopen(
+        &media->continuation, resume_us, resume_playing);
+    psp_media_target_after_reopen(
+        &media->pending_target, preview_pending, preview_target_us);
     media->quality_fallbacks++;
     media->open_service_pending = true;
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
@@ -1007,7 +1019,8 @@ bool psp_media_open_pump(
         if (media->machine.state != PSP_MEDIA_SESSION_OPENING) {
             psp_media_session_dispatch_event(media, (PspMediaEvent) {
                 .type = PSP_MEDIA_EVENT_OPEN,
-                .autoplay = media->reopen_resume_playing,
+                .autoplay = psp_media_continuation_resume_playing(
+                    &media->continuation),
                 .has_separate_audio = false,
                 .audio_only = media->audio_only
             }, "open-begin");
@@ -1167,10 +1180,15 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
     if (youtube_resolve_job_metrics(media->resolver_job, &resolver)) {
         FetchBackgroundTransportMetrics worker = {0};
         (void) fetch_background_transport_metrics(&worker);
+        char inflight[48] = "-";
+        if (psp_transport_probe_inflight != NULL)
+            psp_transport_probe_inflight(inflight, sizeof(inflight));
         printf("tilefinch-media-resolver: phase=%s client=%zu attempts=%u "
                "request=%d pumps=%zu chunks=%zu response=%zu/%ld "
                "admission=%d waits=%zu slots=%zu/%zu/%zu "
-               "cancel-retired=%zu cached-identity=%d\n",
+               "cancel-retired=%zu cached-identity=%d "
+               "worker=performs:%zu/polls:%zu/headers:%zu/bodies:%zu/"
+               "done:%zu/loop-max:%uus inflight=%s\n",
                resolver.phase, resolver.client_index, resolver.attempts,
                resolver.request_active ? 1 : 0,
                resolver.request_pumps, resolver.request_chunks,
@@ -1179,7 +1197,10 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
                resolver.admission_deferrals,
                worker.occupied_slots, worker.queued_slots,
                worker.running_slots, worker.cancelled_retired,
-               resolver.cached_identity ? 1 : 0);
+               resolver.cached_identity ? 1 : 0,
+               worker.worker_performs, worker.worker_polls,
+               worker.header_callbacks, worker.body_callbacks,
+               worker.completions, worker.worker_loop_max_us, inflight);
     }
     MediaHlsStats hls = {0};
     if (psp_media_hls_stats(media->hls, &hls)) {
@@ -1284,9 +1305,9 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             return true;
         }
         bool reuse_resolved_stream =
-            media->reopen_reuse_resolved_stream
+            media->continuation.reuse_resolved
             && psp_media_resolved_stream_reusable(media);
-        media->reopen_reuse_resolved_stream = reuse_resolved_stream;
+        media->continuation.reuse_resolved = reuse_resolved_stream;
         /* The prepared resolver belongs to this open, but the old pipeline
            does not. Detach it across teardown so pipeline_destroy can retain
            its unconditional rule that every job still attached to a dying
@@ -1356,9 +1377,9 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
     switch (media->job_phase) {
     case PSP_MEDIA_JOB_OPEN_RESOLVE: {
         bool offline_route = psp_media_offline_route(media, media->source);
-        bool reused = media->reopen_reuse_resolved_stream
+        bool reused = media->continuation.reuse_resolved
             && psp_media_resolved_stream_reusable(media);
-        media->reopen_reuse_resolved_stream = false;
+        media->continuation.reuse_resolved = false;
         if (reused) {
             uint64_t now = tilefinch_platform_wall_time_ns()
                 / UINT64_C(1000000000);
@@ -1724,6 +1745,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                   } : NULL,
             .url_validator = media->page_source
                 ? NULL : youtube_media_url_supported,
+            .tls12_session_resumption = !media->page_source,
             .cancel = psp_media_cancel_callback,
             .cancel_opaque = media
         };
@@ -1942,12 +1964,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
            input state and must survive every open phase, including the final
            playback-create refresh where Cross may arrive on the supervisor
            thread. */
-        if (media->preview_commit_pending)
+        if (psp_media_target_commit_pending(&media->pending_target))
             psp_ui_media_commit_seek(
-                &media->ui, media->preview_commit_target_us);
-        else if (media->reopen_preview_pending)
+                &media->ui, media->pending_target.target_us);
+        else if (psp_media_target_highlight_pending(&media->pending_target))
             psp_ui_media_set_seek_preview(
-                &media->ui, media->reopen_preview_target_us);
+                &media->ui, media->pending_target.target_us);
         uint64_t duration_us = psp_media_duration_us(media);
         /* Only an in-process retry, quality fallback, or system resume may
            continue an existing playback transaction. A fresh watch-page open
@@ -1956,16 +1978,26 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
            which is both surprising and less reliable than a clean start. A
            zero/paused recovery already has the desired initial state and
            avoids an unnecessary decoder reset. */
-        bool reopen_resume_available = media->reopen_resume_pending
-            && (media->reopen_resume_us != 0
-                || media->reopen_resume_playing)
+        PspMediaContinuation *continuation = &media->continuation;
+        /* Cross pressed during the reopen is where it resumes, rather than
+           a second seek after the resume seek lands. */
+        if (psp_media_continuation_reopening(continuation)
+            && psp_media_target_commit_pending(&media->pending_target)) {
+            psp_media_continuation_retarget(
+                continuation, media->pending_target.target_us,
+                media->pending_target.resume_playing);
+            psp_media_target_clear(&media->pending_target);
+        }
+        bool reopen_resume_available =
+            psp_media_continuation_reopening(continuation)
+            && (continuation->position_us != 0 || continuation->playing)
             && duration_us != 0;
         if (reopen_resume_available) {
-            media->job_target_us = media->reopen_resume_us > duration_us
-                ? duration_us : media->reopen_resume_us;
-            media->job_resume_playing = media->reopen_resume_playing;
+            media->job_target_us = continuation->position_us > duration_us
+                ? duration_us : continuation->position_us;
+            media->job_resume_playing = continuation->playing;
             media->job_preview = false;
-            media->job_resume_open = true;
+            psp_media_continuation_begin_resume(continuation);
             media->job_phase = PSP_MEDIA_JOB_SEEK_PREPARE;
             media->job_started_us = psp_media_internal_now_us(media);
             media->job_phase_started_us = 0;
@@ -1991,9 +2023,8 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->seek_completions++;
             media->reopen_seek_completion_pending = false;
         }
-        media->reopen_resume_us = 0;
-        media->reopen_resume_playing = false;
-        media->reopen_resume_pending = false;
+        if (!reopen_resume_available)
+            psp_media_continuation_clear(continuation);
         break;
     }
     default:

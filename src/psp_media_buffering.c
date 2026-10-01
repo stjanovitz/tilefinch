@@ -178,7 +178,7 @@ void psp_media_buffering_update(
         psp_media_buffering_begin(media, false, now_us);
     } else if (decision.action == PSP_MEDIA_BUFFER_END) {
         PspMediaPresentationReadiness readiness =
-            media->presentation_preroll_audio_held
+            media->audio_hold.applied
                 ? PSP_MEDIA_PRESENTATION_NEEDS_PRIME
                 : PSP_MEDIA_PRESENTATION_READY;
         psp_media_buffering_end(media, now_us);

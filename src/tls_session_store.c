@@ -204,6 +204,21 @@ static size_t store_serialized_bytes(const TlsSessionStore *store)
     return total;
 }
 
+int tls_session_store_contains(const TlsSessionStore *store, const char *key,
+                               const unsigned char *blob, size_t blob_length)
+{
+    if (store == NULL || key == NULL || blob == NULL) return 0;
+    size_t key_length = strlen(key);
+    for (size_t i = 0; i < store->count; i++) {
+        const TlsStoreEntry *entry = &store->entries[i];
+        if (entry->key_length == key_length
+            && entry->blob_length == blob_length
+            && memcmp(entry->key, key, key_length) == 0
+            && memcmp(entry->blob, blob, blob_length) == 0) return 1;
+    }
+    return 0;
+}
+
 int tls_session_store_add(TlsSessionStore *store, const char *key,
                           const unsigned char *blob, size_t blob_length,
                           int64_t valid_until, int32_t ietf_tls_id,

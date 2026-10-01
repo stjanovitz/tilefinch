@@ -37,7 +37,7 @@ entire game can be installed into Tilefinch's offline library.
 2. Open `examples/treadline-arena/index.html` in Tilefinch.
 3. Open **Page tools → Install offline app**.
 4. Review the installation preview, then choose **Install**.
-5. Launch **Treadline Arena** from the Offline section of the Library.
+5. Launch **Treadline Arena** from the Library's **Saved** section.
 
 The HTML, CSS, JavaScript, icon, and manifest are same-origin and
 self-contained. Once installed, ordinary single-player launch and play require

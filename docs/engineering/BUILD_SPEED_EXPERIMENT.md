@@ -1,4 +1,4 @@
-# Targeted host build-speed experiment — 2026-09-05
+# Targeted host build-speed experiment
 
 Base: `2ad0b27c`, in an isolated worktree with separately copied dependency
 sources. The active main checkout, build directory, and its unfinished changes

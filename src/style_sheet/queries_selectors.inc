@@ -128,6 +128,22 @@ static bool media_colon_exact_match(const Stylesheet *sheet,
     return true;
 }
 
+static bool stylesheet_prefers_dark;
+
+void stylesheet_set_prefers_dark_color_scheme(bool dark)
+{
+    /* Media queries are evaluated when a sheet is built, so the page's
+       rebuild is what restyles; retained computed styles must not wait for
+       it to be noticed. */
+    if (stylesheet_prefers_dark != dark) document_style_changed();
+    stylesheet_prefers_dark = dark;
+}
+
+bool stylesheet_prefers_dark_color_scheme(void)
+{
+    return stylesheet_prefers_dark;
+}
+
 static bool media_clause_matches(const Stylesheet *sheet,
                                  const char *text, size_t length)
 {
@@ -158,7 +174,10 @@ static bool media_clause_matches(const Stylesheet *sheet,
         || strncmp(query, "notscreen", 9) == 0) return false;
     if (strstr(query, "print") != NULL && strstr(query, "screen") == NULL
         && strstr(query, "notprint") == NULL) return false;
-    if (strstr(query, "prefers-color-scheme:dark") != NULL
+    if ((strstr(query, "prefers-color-scheme:dark") != NULL
+         && !stylesheet_prefers_dark)
+        || (strstr(query, "prefers-color-scheme:light") != NULL
+            && stylesheet_prefers_dark)
         || strstr(query, "prefers-reduced-motion:no-preference") != NULL
         || (strstr(query, "prefers-contrast:") != NULL
             && strstr(query, "prefers-contrast:no-preference") == NULL)
@@ -2444,6 +2463,192 @@ static unsigned register_layer(Stylesheet *sheet, const char *name,
     return result;
 }
 
+static void style_query_selector_any_attributes(StyleQuerySelector *item);
+
+/* The first attribute name the rightmost compound tests at its top
+   level, exactly as attribute_matches reads and lowercases it; the matcher
+   rejects the compound when an element lacks it. Escaped, empty and
+   over-long names (which the matcher decodes or refuses) are not kept.
+   One pass over the compound: it never looks inside a functional
+   pseudo-class, so a nested selector costs no more than its length. */
+static void style_query_selector_top_attribute(StyleQuerySelector *item)
+{
+    if (item->rightmost == SIZE_MAX || item->rightmost >= item->length)
+        return;
+    const char *text = item->text;
+    size_t length = item->length;
+    unsigned parentheses = 0;
+    char quote = 0;
+    for (size_t at = item->rightmost; at < length; at++) {
+        char character = text[at];
+        if (quote != 0) {
+            if (character == '\\' && at + 1 < length) at++;
+            else if (character == quote) quote = 0;
+            continue;
+        }
+        if (character == '\'' || character == '"') quote = character;
+        else if (character == '(') parentheses++;
+        else if (character == ')' && parentheses != 0) parentheses--;
+        else if (character == '\\' && at + 1 < length) at++;
+        if (character != '[' || parentheses != 0) continue;
+        /* The same bracket extent compound_matches_depth passes on. */
+        size_t end = at + 1;
+        char inner_quote = 0;
+        while (end < length) {
+            if (inner_quote != 0) {
+                if (text[end] == inner_quote) inner_quote = 0;
+            } else if (text[end] == '\'' || text[end] == '"') {
+                inner_quote = text[end];
+            } else if (text[end] == ']') break;
+            end++;
+        }
+        if (end == length) return;
+        const char *inner = text + at + 1;
+        size_t inner_length = end - at - 1;
+        trim(&inner, &inner_length);
+        size_t name_end = skip_selector_identifier(inner, inner_length, 0);
+        if (name_end == 0 || name_end >= STYLE_QUERY_ATTRIBUTE_CAPACITY - 1u
+            || memchr(inner, '\\', name_end) != NULL) return;
+        for (size_t i = 0; i < name_end; i++)
+            item->attribute[i] = (char) tolower((unsigned char) inner[i]);
+        item->attribute[name_end] = '\0';
+        item->attribute_length = (uint8_t) name_end;
+        item->complete_attribute = item->rightmost == 0 && at == 0
+            && end + 1 == length && inner == text + 1
+            && inner_length == name_end;
+        return;
+    }
+}
+
+/* The ordinary key plus, without a top-level attribute, the names a
+   matches-any pseudo-class requires one of (below). */
+static void style_query_selector_attribute_key(StyleQuerySelector *item)
+{
+    if (item->rightmost == SIZE_MAX || item->rightmost >= item->length)
+        return;
+    style_query_selector_any_attributes(item);
+    style_query_selector_top_attribute(item);
+}
+
+/* For a rightmost compound without a top-level attribute test: the first
+   top-level `:is(` or `:where(` whose every argument is a selector whose
+   own rightmost compound tests an attribute at its top level. The element
+   must match one argument, so it must carry one of those attributes.
+   Names are kept only when the text spells them as the matcher looks them
+   up (lower case, unescaped); anything else keeps no filter. */
+static void style_query_selector_any_attributes(StyleQuerySelector *item)
+{
+    item->any_attribute_count = 0;
+    const char *text = item->text;
+    size_t length = item->length;
+    if (length > UINT16_MAX) return;
+    size_t open = SIZE_MAX, prefix = 0;
+    unsigned parentheses = 0, brackets = 0;
+    char quote = 0;
+    for (size_t at = item->rightmost; at < length; at++) {
+        char character = text[at];
+        if (quote != 0) {
+            if (character == '\\' && at + 1 < length) at++;
+            else if (character == quote) quote = 0;
+            continue;
+        }
+        if (character == '\\') return;
+        if (character == '\'' || character == '"') quote = character;
+        else if (character == '[') {
+            /* A top-level attribute test: the ordinary key covers it. */
+            if (parentheses == 0) return;
+            brackets++;
+        } else if (character == ']' && brackets != 0) brackets--;
+        else if (character == ')' && parentheses != 0) parentheses--;
+        else if (character == '(') {
+            if (parentheses == 0 && brackets == 0 && open == SIZE_MAX) {
+                if (at >= 3 && strncasecmp(text + at - 3, ":is", 3) == 0)
+                    prefix = 3;
+                else if (at >= 6
+                         && strncasecmp(text + at - 6, ":where", 6) == 0)
+                    prefix = 6;
+                else prefix = 0;
+                if (prefix != 0) open = at;
+            }
+            parentheses++;
+        }
+    }
+    if (open == SIZE_MAX) return;
+    /* The argument's extent. */
+    size_t close = open + 1;
+    unsigned depth = 1;
+    quote = 0;
+    for (; close < length && depth != 0; close++) {
+        char character = text[close];
+        if (quote != 0) {
+            if (character == quote) quote = 0;
+            continue;
+        }
+        if (character == '\'' || character == '"') quote = character;
+        else if (character == '(') depth++;
+        else if (character == ')') depth--;
+    }
+    if (depth != 0) return;
+    size_t end = close - 1; /* the matching ')' */
+    size_t start = open + 1;
+    uint8_t count = 0;
+    int square = 0, round = 0;
+    quote = 0;
+    for (size_t at = start; at <= end; at++) {
+        char character = at < end ? text[at] : ',';
+        if (quote != 0) {
+            if (character == quote) quote = 0;
+            continue;
+        }
+        if (character == '\'' || character == '"') {
+            quote = character;
+            continue;
+        }
+        if (character == '[') square++;
+        else if (character == ']' && square > 0) square--;
+        else if (character == '(') round++;
+        else if (character == ')' && round > 0) round--;
+        if (character != ',' || square != 0 || round != 0) continue;
+        const char *argument = text + start;
+        size_t argument_length = at - start;
+        start = at + 1;
+        trim(&argument, &argument_length);
+        if (argument_length == 0
+            || count == STYLE_QUERY_ANY_ATTRIBUTE_LIMIT) return;
+        StyleQuerySelector alternative;
+        memset(&alternative, 0, sizeof(alternative));
+        alternative.text = argument;
+        alternative.length = argument_length;
+        SelectorType key_type;
+        size_t key_offset = 0, key_length = 0;
+        (void) style_selector_prepare_complex(
+            argument, argument_length, &alternative.rightmost, &key_type,
+            &key_offset, &key_length);
+        /* Only the argument's own top-level attribute counts: an
+           argument that is itself :is(...) keeps no filter, and is not
+           analysed further (no recursion, whatever the nesting). */
+        style_query_selector_top_attribute(&alternative);
+        if (alternative.attribute_length == 0) return;
+        /* The name as spelled, which must already be the lowercased key. */
+        const char *name = NULL;
+        for (size_t i = alternative.rightmost == SIZE_MAX
+                 ? 0 : alternative.rightmost;
+             i + alternative.attribute_length < argument_length; i++) {
+            if (argument[i] == '['
+                && memcmp(argument + i + 1, alternative.attribute,
+                          alternative.attribute_length) == 0) {
+                name = argument + i + 1;
+                break;
+            }
+        }
+        if (name == NULL) return;
+        item->any_attribute_offset[count] = (uint16_t) (name - text);
+        item->any_attribute_length[count] = alternative.attribute_length;
+        count++;
+    }
+    item->any_attribute_count = count;
+}
+
 bool style_query_selector_list_prepare(StyleQuerySelectorList *list,
                                        const char *text, size_t length)
 {
@@ -2494,7 +2699,16 @@ bool style_query_selector_list_prepare(StyleQuerySelectorList *list,
         style_selector_prepare_complex(
             item->text, item->length, &item->rightmost, &item->key_type,
             &key_offset, &item->key_length);
-        if (item->key_length != 0) item->key = item->text + key_offset;
+        if (item->key_length != 0) {
+            item->key = item->text + key_offset;
+            /* Fast keys are unescaped and byte-exact. Only the entire
+               selector, not a key extracted from a compound or ancestor,
+               can replace the subsequent full match. */
+            size_t prefix = item->key_type == SELECTOR_TAG ? 0u : 1u;
+            item->complete_key = key_offset == prefix
+                && item->key_length == item->length - prefix;
+        }
+        style_query_selector_attribute_key(item);
     }
     return true;
 }

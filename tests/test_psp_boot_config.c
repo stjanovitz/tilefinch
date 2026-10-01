@@ -42,10 +42,18 @@ int main(void)
     CHECK(config.limit_mb == 32);
     CHECK(config.heap_mb == 5);
     CHECK(config.window_kb == 4096);
-    CHECK(config.file_kb == 384);
+    CHECK(config.lazy_functions == -1);
+    CHECK(config.page_task_yield == -1);
+    CHECK(config.file_kb == 512);
     CHECK(config.css_width == 480);
     CHECK(config.network_profile == 1);
     CHECK(config.validation_media_stability_seconds == 120);
+    CHECK(config.validation_js_profile == 1);
+    CHECK(config.validation_js_outlier_us == 0);
+    CHECK(config.validation_script_split == 2);
+    CHECK(config.validation_execution_census == 0);
+    CHECK(config.trace_ignore_request_body == 0);
+    CHECK(config.trace_volatile_uuids == 0);
     CHECK(!psp_boot_config_automation_requires_engine_first(&config));
     snprintf(config.input_script, sizeof(config.input_script),
              "%s", "menu-tour.txt");
@@ -71,6 +79,71 @@ int main(void)
     config.dump_frame = 0;
     const char *invalid = NULL;
     CHECK(psp_boot_config_validate(&config, &invalid));
+    /* Replay by response key is a flag: only 0 and 1 are accepted. */
+    config.trace_keyed = 2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "trace_keyed") == 0);
+    config.trace_keyed = 1;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.trace_keyed = 0;
+    config.lazy_functions = -2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "lazy_functions") == 0);
+    config.lazy_functions = 0;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.lazy_functions = -1;
+    config.page_task_yield = 2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "page_task_yield") == 0);
+    config.page_task_yield = 0;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.page_task_yield = -1;
+    config.validation_js_profile = 2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "validation_js_profile") == 0);
+    config.validation_js_profile = 1;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_js_outlier_us = -1;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "validation_js_outlier_us") == 0);
+    config.validation_js_outlier_us = 10000001;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "validation_js_outlier_us") == 0);
+    config.validation_js_outlier_us = 500000;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_script_split = 3;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "validation_script_split") == 0);
+    config.validation_script_split = -1;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "validation_script_split") == 0);
+    config.validation_script_split = 0;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_script_split = 2;
+    config.validation_execution_census = 3;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "validation_execution_census") == 0);
+    config.validation_execution_census = 1;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_execution_census = 2;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_execution_census = 0;
+    config.trace_ignore_request_body = 2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "trace_ignore_request_body") == 0);
+    config.trace_ignore_request_body = 0;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.trace_volatile_uuids = 2;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "trace_volatile_uuids") == 0);
+    config.trace_volatile_uuids = 0;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.trace_replay_pump_us = -1;
+    CHECK(!psp_boot_config_validate(&config, &invalid)
+          && strcmp(invalid, "trace_replay_pump_us") == 0);
+    config.trace_replay_pump_us = 16667;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.trace_replay_pump_us = 0;
 
     /* Shipping builds must not inherit a device-test driver from a copied
        boot file. Production choices survive the scrub. */
@@ -78,6 +151,7 @@ int main(void)
     snprintf(shipping.url, sizeof(shipping.url), "%s",
              "https://example.test/watch");
     snprintf(shipping.trace, sizeof(shipping.trace), "%s", "scenario.trace");
+    shipping.trace_keyed = 1;
     snprintf(shipping.input_script, sizeof(shipping.input_script), "%s",
              "media-run.txt");
     snprintf(shipping.exit_to, sizeof(shipping.exit_to), "%s",
@@ -89,6 +163,12 @@ int main(void)
     shipping.dump_frame = 1;
     shipping.exit_after_report = 1;
     shipping.interactive_validation_ticks = 100;
+    shipping.validation_js_profile = 0;
+    shipping.validation_script_split = 1;
+    shipping.validation_execution_census = 1;
+    shipping.trace_ignore_request_body = 1;
+    shipping.trace_volatile_uuids = 1;
+    shipping.trace_replay_pump_us = 16667;
     shipping.validation_cancel_after_ms = 1;
     shipping.validation_preview_scroll = 1;
     shipping.validation_media_play = 1;
@@ -102,6 +182,11 @@ int main(void)
     shipping.validation_power_test_auto = 1;
     shipping.validation_ge_present_probe = 1;
     shipping.validation_webgl_ge_probe = 1;
+    shipping.validation_js_bench = 2;
+    snprintf(shipping.js_bench_only, sizeof(shipping.js_bench_only), "%s",
+             "own_hot_int,binding_move_ref");
+    snprintf(shipping.js_bench_dir, sizeof(shipping.js_bench_dir), "%s",
+             "replay-trace");
     shipping.validation_csc_order_probe = 1;
     shipping.validation_latch_probe = 1;
     shipping.validation_media_range_probe = 1;
@@ -111,13 +196,23 @@ int main(void)
              "https://127.0.0.1/update.tfum");
     shipping.validation_media_refusal_reset = 1;
     shipping.validation_media_reset_mode = PSP_MEDIA_RESET_MODE_NO_TOUCH;
+    snprintf(shipping.trace_capture, sizeof(shipping.trace_capture), "%s",
+             "capture");
     psp_boot_config_disable_automation(&shipping);
+    CHECK(shipping.trace_capture[0] == '\0');
     CHECK(strcmp(shipping.url, TILEFINCH_HOMEPAGE_URL) == 0);
-    CHECK(strcmp(shipping.trace, "none") == 0);
+    CHECK(strcmp(shipping.trace, "none") == 0 && shipping.trace_keyed == 0);
     CHECK(shipping.input_script[0] == '\0' && shipping.exit_to[0] == '\0');
     CHECK(shipping.ticks == 0 && shipping.dump_frame == 0);
     CHECK(shipping.exit_after_report == 0);
     CHECK(shipping.interactive_validation_ticks == 0);
+    CHECK(shipping.validation_js_profile == 1);
+    CHECK(shipping.validation_js_outlier_us == 0);
+    CHECK(shipping.validation_script_split == 2);
+    CHECK(shipping.validation_execution_census == 0);
+    CHECK(shipping.trace_ignore_request_body == 0);
+    CHECK(shipping.trace_volatile_uuids == 0);
+    CHECK(shipping.trace_replay_pump_us == 0);
     CHECK(shipping.validation_cancel_after_ms == 0);
     CHECK(shipping.validation_preview_scroll == 0);
     CHECK(shipping.validation_media_play == 0);
@@ -131,6 +226,9 @@ int main(void)
     CHECK(shipping.validation_power_test_auto == 0);
     CHECK(shipping.validation_ge_present_probe == 0);
     CHECK(shipping.validation_webgl_ge_probe == 0);
+    CHECK(shipping.validation_js_bench == 0);
+    CHECK(shipping.js_bench_dir[0] == '\0');
+    CHECK(shipping.js_bench_only[0] == '\0');
     CHECK(shipping.validation_csc_order_probe == 0);
     CHECK(shipping.validation_latch_probe == 0);
     CHECK(shipping.validation_media_range_probe == 0);
@@ -142,6 +240,7 @@ int main(void)
     CHECK(strcmp(shipping.developer_update_url,
                  "https://updates.example.test/dev/update.tfum") == 0);
 
+    config.validation_js_outlier_us = 0;
     PspBootConfig custom_home = config;
     snprintf(custom_home.url, sizeof(custom_home.url), "%s",
              "https://example.test/start");
@@ -155,15 +254,26 @@ int main(void)
     CHECK(file != NULL);
     CHECK(fputs(
         "limit=40\nnetwork_profile=2\n"
+        "trace_keyed=1\n"
+        "trace_ignore_request_body=1\n"
+        "trace_volatile_uuids=1\n"
+        "trace_replay_pump_us=16667\n"
+        "trace_capture=youtube-bbb_1\n"
         "validation_media_fixture_auto=1\n"
         "validation_media_stability_seconds=900\n"
         "validation_raster_fixture_auto=1\n"
         "validation_ge_present_probe=1\n"
         "validation_webgl_ge_probe=1\n"
+        "validation_js_bench=3\n"
+        "js_bench_dir=replay-trace\n"
+        "js_bench_only=own_hot_int,binding_move_ref\n"
         "validation_csc_order_probe=1\n"
         "validation_latch_probe=1\n"
         "validation_media_range_probe=1\n"
         "validation_update_auto=1\n"
+        "validation_js_profile=0\n"
+        "validation_js_outlier_us=500000\n"
+        "validation_script_split=1\n"
         "validation_update_url=https://127.0.0.1:8443/"
             "tilefinch-update-v1.tfum\n"
         "validation_media_lifecycle_auto=1\n"
@@ -179,6 +289,8 @@ int main(void)
         &config, path, capture_warning, &warning));
     CHECK(config.limit_mb == 40);
     CHECK(config.network_profile == 2);
+    CHECK(config.trace_keyed == 1);
+    CHECK(strcmp(config.trace_capture, "youtube-bbb_1") == 0);
     CHECK(config.validation_media_fixture_auto == 1);
     CHECK(config.validation_media_stability_seconds == 900);
     CHECK(config.validation_raster_fixture_auto == 1);
@@ -186,6 +298,9 @@ int main(void)
        unlike the other probes it must not force an engine-first boot. */
     CHECK(config.validation_ge_present_probe == 1);
     CHECK(config.validation_webgl_ge_probe == 1);
+    CHECK(config.validation_js_bench == 3);
+    CHECK(strcmp(config.js_bench_dir, "replay-trace") == 0);
+    CHECK(strcmp(config.js_bench_only, "own_hot_int,binding_move_ref") == 0);
     /* Same for the colour-order probe: it supplies its own picture from the
        embedded fixture and never navigates. */
     CHECK(config.validation_csc_order_probe == 1);
@@ -194,6 +309,12 @@ int main(void)
        document either, so it too leaves the shipping boot order alone. */
     CHECK(config.validation_media_range_probe == 1);
     CHECK(config.validation_update_auto == 1);
+    CHECK(config.validation_js_profile == 0);
+    CHECK(config.validation_js_outlier_us == 500000);
+    CHECK(config.validation_script_split == 1);
+    CHECK(config.trace_ignore_request_body == 1);
+    CHECK(config.trace_volatile_uuids == 1);
+    CHECK(config.trace_replay_pump_us == 16667);
     CHECK(strcmp(config.validation_update_url,
                  "https://127.0.0.1:8443/tilefinch-update-v1.tfum") == 0);
     CHECK(config.validation_media_lifecycle_auto == 1);
@@ -209,12 +330,23 @@ int main(void)
     CHECK(!psp_boot_config_automation_requires_engine_first(&config)
           || config.validation_media_fixture_auto != 0);
     CHECK(warning.calls == 1);
-    CHECK(warning.line == 18);
+    CHECK(warning.line == 29);
     CHECK(strcmp(warning.key, "mystery") == 0);
     CHECK(strcmp(config.developer_update_url,
                  "https://192.0.2.1/beta/latest.tfum") == 0);
     CHECK(strcmp(config.developer_package_url,
                  "https://1drv.ms/u/s!package-token") == 0);
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    /* A capture is a plain directory beside the EBOOT, never a path, and
+       never recorded while a trace replays. */
+    snprintf(config.trace_capture, sizeof(config.trace_capture), "%s",
+             "../escape");
+    CHECK(!psp_boot_config_validate(&config, &invalid));
+    snprintf(config.trace_capture, sizeof(config.trace_capture), "%s",
+             "capture");
+    snprintf(config.trace, sizeof(config.trace), "%s", "replay-trace");
+    CHECK(!psp_boot_config_validate(&config, &invalid));
+    snprintf(config.trace, sizeof(config.trace), "%s", "none");
     CHECK(psp_boot_config_validate(&config, &invalid));
 
     config.validation_update_url[0] = '\0';

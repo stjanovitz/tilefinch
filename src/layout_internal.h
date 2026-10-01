@@ -260,6 +260,17 @@ typedef struct {
     uint64_t parent_hash;
     ComputedStyle style;
     uint64_t stamp;
+    /* stylesheet_custom_property_name_bits of every custom property its
+       resolution looked up, and of those its own inline style declares:
+       an inline custom-property write drops only the styles that read one
+       of the changed names. */
+    uint64_t variable_reads;
+    uint64_t inline_variables;
+    /* Bit 1 << pseudo: that pseudo-element was resolved from exactly
+       `style` and generates nothing (no custom property read). Dropped
+       with the entry, so any change that could restyle the element
+       re-resolves it. */
+    uint8_t pseudo_absent;
 } LayoutReuseStyleEntry;
 
 /* A viewport preview measures only a bounded prefix of an auto-layout table.
@@ -307,16 +318,54 @@ struct LayoutReuseCache {
     size_t counter_count, counter_capacity;
     bool counter_bounded_out;
     bool selector_has_has;
-    /* A :has() argument or its subject uses a sibling combinator, so a
-       structural change can alter :has() answers off the ancestor chain. */
-    bool selector_has_has_sibling;
-    /* Indices of the sheet's :has() rules, so a structural change can drop
-       exactly the retained lists those rules' fast keys can select instead
-       of resetting; bounded-out (or a :has() custom rule) means reset. */
-#define LAYOUT_REUSE_HAS_RULE_LIMIT 64u
-    uint32_t has_rules[LAYOUT_REUSE_HAS_RULE_LIMIT];
-    size_t has_rule_count;
-    bool has_rules_bounded;
+    /* Class and id tokens the sheet's selectors read on elements other
+       than their subject (sorted by identity hash, with the key that
+       rule's subject carries, 0 for none, and whether it reaches the
+       subject across siblings), and the custom-property names rules keyed
+       by each token declare. A class change restyles its element, the
+       elements in its subtree (its parent's, across siblings) that carry
+       a listed subject key of a changed token, and the styles that read
+       one of those names; an unkeyed subject keeps the subtree scope.
+       Built for `identity_sheet` at its generation and rule counts;
+       `identity_unbounded` when some selector names an identity no token
+       can (class changes then keep the subtree scope). */
+    struct LayoutIdentityDependent {
+        uint32_t token;
+        uint32_t subject_key;
+        bool sibling;
+    } *identity_tokens;
+    size_t identity_token_count, identity_token_capacity;
+    struct LayoutIdentityNames {
+        uint32_t token;
+        uint64_t names;
+    } *identity_names;
+    size_t identity_name_count, identity_name_capacity;
+    const Stylesheet *identity_sheet;
+    uint64_t identity_generation;
+    size_t identity_rule_count, identity_custom_count;
+    bool identity_unbounded;
+    /* Attribute-selector names are listed the same way (keyed by
+       stylesheet_identity_attribute_hash) unless some cannot be. */
+    bool identity_attributes_opaque;
+    /* stylesheet_structural_custom_rules of `structural_sheet` at its
+       generation and custom-rule count: keyed rows sorted by key, and the
+       names of unkeyed subjects. `structural_unbounded` when they could
+       not be listed (every reader then goes). */
+    StyleKeyNames *structural_rules;
+    size_t structural_rule_count, structural_rule_capacity;
+    uint64_t structural_unkeyed_names;
+    const Stylesheet *structural_sheet;
+    uint64_t structural_generation;
+    size_t structural_custom_count;
+    bool structural_ready;
+    bool structural_unbounded;
+    /* layout_reuse_cache_set_structure_filter: the :has() entries the
+       current structure change can reach (UINT64_MAX: all). */
+    uint64_t structure_entries;
+    uint32_t structure_serial;
+    /* Elements a :has() change reaches by key rather than by the walk
+       (style_has_note_change), dropped from both tables at the flush. */
+    StyleHasPending has_pending;
     /* Indices of rules whose selectors can observe a checkbox or radio's
        checked state (:checked, [checked], :default, :indeterminate, and the
        validity pseudo-classes a required control feeds). A toggle drops only
@@ -325,11 +374,20 @@ struct LayoutReuseCache {
     uint32_t state_rules[LAYOUT_REUSE_STATE_RULE_LIMIT];
     size_t state_rule_count;
     bool state_rules_bounded;
-    /* The sibling-:has() table pass already ran for this journal. */
-    bool structure_pass_done;
-    bool selector_has_focus_within;
     bool selector_focus_has_sibling;
     bool selector_has_structure;
+    /* :empty or :blank outside a :has() argument, with a sibling
+       combinator: a parent's child list can then restyle the parent's
+       siblings (`.a:empty + p`), but only a parent carrying the key of a
+       compound holding the test (all of them when one has none). */
+    bool selector_has_empty;
+    /* Which child lists can restyle a child's descendants (sibling tests
+       before a descendant combinator), and through which children. */
+    StyleStructureKeys structure;
+#define LAYOUT_REUSE_EMPTY_KEY_LIMIT 8u
+    uint32_t empty_keys[LAYOUT_REUSE_EMPTY_KEY_LIMIT];
+    uint8_t empty_key_count;
+    bool empty_any;
     /* A complete build records unresolved external visuals (as previews
        always do) for deferred loading after a provisional commit. */
     bool record_unresolved_visuals;
@@ -459,6 +517,9 @@ typedef struct {
     lxb_dom_node_t *assigned_grid_node;
     int assigned_grid_height;
     bool assigned_grid_height_valid;
+    /* The stretched grid height is a minimum: the item sits in a row that
+       may still grow to its content (an fr row, CSS Grid 7.2.4). */
+    bool assigned_grid_minimum;
     LayoutAssignedGridTracks assigned_grid_tracks;
     lxb_dom_node_t *assigned_flex_node;
     int assigned_flex_height;
@@ -495,6 +556,24 @@ typedef struct {
 #endif
 } LayoutContext;
 
+/* A pseudo-element of `node` known, from the reuse cache, to generate
+   nothing when resolved from `parent` (its element's style): layout skips
+   resolving it again. Callers read only generated_content of an absent
+   pseudo-element. */
+bool layout_reuse_pseudo_absent(const LayoutReuseCache *cache,
+                                const Stylesheet *sheet,
+                                const lxb_dom_node_t *node,
+                                PseudoElement pseudo,
+                                const ComputedStyle *parent);
+/* Records a resolution's outcome (sheet->variable_read_names holding the
+   custom properties it read). */
+void layout_reuse_note_pseudo(LayoutReuseCache *cache,
+                              const Stylesheet *sheet,
+                              const lxb_dom_node_t *node,
+                              PseudoElement pseudo,
+                              const ComputedStyle *parent,
+                              const ComputedStyle *result);
+
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
 typedef struct {
     LayoutContext *context;
@@ -518,13 +597,20 @@ static inline ComputedStyle layout_style_for_pseudo(
 {
     LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
     context->pseudo_resolutions++;
+    if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
+                                   pseudo, parent)) {
+        context->pseudo_absence_hits++;
+        return (ComputedStyle) {0};
+    }
     StyleRetainedMatches *previous_matches = style_retained_matches_attach(
         context->sheet,
         context->reuse != NULL && context->reuse->sheet == context->sheet
             ? context->reuse->matches : NULL);
+    ((Stylesheet *) context->sheet)->variable_read_names = 0;
     ComputedStyle result = style_for_layout_pseudo(context->sheet, node, pseudo, parent);
     (void) style_retained_matches_attach(context->sheet, previous_matches);
-    context->pseudo_absence_hits += !result.generated_content && result.font_size == 0;
+    layout_reuse_note_pseudo(context->reuse, context->sheet, node, pseudo,
+                             parent, &result);
     context->pseudo_generated += result.generated_content;
     return result;
 }
@@ -537,7 +623,15 @@ static inline ComputedStyle layout_style_for_pseudo(
     LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
     const ComputedStyle *parent)
 {
-    return style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+    if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
+                                   pseudo, parent))
+        return (ComputedStyle) {0};
+    ((Stylesheet *) context->sheet)->variable_read_names = 0;
+    ComputedStyle result =
+        style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+    layout_reuse_note_pseudo(context->reuse, context->sheet, node, pseudo,
+                             parent, &result);
+    return result;
 }
 #endif
 
@@ -972,6 +1066,11 @@ bool layout_add_control(LayoutDocument *layout, int x, int y, int width, int hei
 ControlType layout_input_control_type(lxb_dom_node_t *node);
 int layout_control_default_width(lxb_dom_node_t *node);
 int layout_control_default_height(lxb_dom_node_t *node);
+/* A textarea's content height from an explicit rows attribute: rows lines
+   of its used line-height, as HTML sizes it whatever its appearance. Zero
+   without a valid rows attribute, which keeps the native default. */
+int layout_textarea_rows_content_height(
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style);
 bool layout_paint_special_input(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int x, int y, int width, int height,
@@ -1101,6 +1200,12 @@ void flat_iterator_init(FlatItemIterator *iterator, LayoutContext *context, lxb_
 void flat_text_link(lxb_dom_node_t *node, lxb_dom_node_t *container, const char **url, size_t *url_length, lxb_dom_node_t **link_node);
 void flex_iterator_init(FlexItemIterator *iterator, LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *plan);
 void flex_order_plan_destroy(FlexOrderPlan *plan);
+/* Widen [*minimum_track, *maximum_track) to cover one item's placement on
+   one axis, relative to the explicit grid: implicit tracks before line 1
+   make *minimum_track negative. */
+void grid_axis_extent(unsigned start, unsigned end, unsigned span,
+                      int explicit_tracks, int *minimum_track,
+                      int *maximum_track);
 void grid_placement_init(GridPlacementState *state, int columns, int rows,
                          const ComputedStyle *container);
 bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,

@@ -1,0 +1,29 @@
+# Explore D-pad focus order on chatgpt.com after it settles.
+wait-page 60
+wait-live 600
+mark-live settled
+tap-live down
+wait-live 30
+mark-live f1
+tap-live down
+wait-live 30
+mark-live f2
+tap-live down
+wait-live 30
+mark-live f3
+tap-live down
+wait-live 30
+mark-live f4
+tap-live down
+wait-live 30
+mark-live f5
+tap-live down
+wait-live 30
+mark-live f6
+tap-live down
+wait-live 30
+mark-live f7
+tap-live down
+wait-live 30
+mark-live f8
+end

@@ -69,6 +69,14 @@ Do not add a bare `add_executable` there, which could leave `dev.sh test` runnin
 a stale executable. Release tests using C `assert` must undefine `NDEBUG` before
 including `<assert.h>`.
 
+Standalone C measurement probes must inherit the target's public compile
+definitions and include paths, preferably through a CMake target linked to
+`tilefinch_core`. For example, `TILEFINCH_OWNER_CHECKS` changes the `Budget`
+structure layout: linking a hand-compiled probe without it against an
+owner-checked library is an ABI mismatch, not a valid pixel or memory oracle.
+When a standalone probe disagrees with CTest, verify its compile flags against
+the build's compile commands before changing an expected result.
+
 Diagnostic flags in `src/diagnostic_trace.h` are sampled once per translation
 unit on the owner thread; set them before launching the host process. They are
 constant false in `TILEFINCH_NO_TRACE` builds. Refresh diagnostic source paths
@@ -145,17 +153,43 @@ These run one behavior in isolation; they do not replace the complete suite.
   replacement, implicit form submission, sliced navigation and a rendered
   result link using a hostname-neutral fixture. `--search-journey-replay TRACE URL`
   applies that journey to a captured Wikipedia homepage and the query `psp`.
-  Its admission settings mirror the installed v0.1.16 configuration; the
+  Its admission settings mirror the installed PSP configuration; the
   qualification runner also supplies the 4 MiB temporary startup window.
   Wikipedia may legitimately redirect an exact query to a disambiguation page;
   the check requires its actionable article link, not a particular results CSS
   class. Capture actual device behavior before diagnosing a host-only pass as
   a fix for an unobserved device failure.
+- `tilefinch-style-index-tests --attribute-names-only` checks the per-sheet
+  set of selector attribute names behind data-* style reuse (prefix lookup,
+  escaped/namespaced opacity, rebuilds, bounds); `--attribute-bench-only`
+  prints its build and query cost on a 5,000-rule sheet;
 - the retained-cache review modes:
   `tilefinch-style-index-tests --retained-handoff-only`,
   `--retained-nested-only`, `--retained-focus-only`, and
   `--quoted-punctuation-only`, plus
   `tilefinch-js-responsiveness-tests --coalesced-tokens-only`;
+- `tilefinch-js-responsiveness-tests --css-name-only` checks canonical CSS
+  property-name fast paths, coercion, custom-property case and camel-case
+  fallback, including resistance to author changes to RegExp.prototype.exec;
+- `tilefinch-js-responsiveness-tests --finalizers-only` queues 330 cyclic
+  finalization records alongside an eight-reaction promise chain. The chain
+  must finish in one 64-job checkpoint without running cleanup callbacks.
+  Cleanups run afterward as low-priority engine tasks (at most 16 per advance,
+  within the existing task budget), with a promise checkpoint after each.
+  The fixture also checks eventual cleanup and teardown with undrained work.
+  `TILEFINCH_TRACE_RUNTIME_STEPS` reports `runtime-cleanup` task counts and
+  elapsed time separately from `runtime-checkpoint`; the existing JS outlier
+  profiler can attribute slow callbacks. Cleanup is not startup work and must
+  not delay resource admission or page recovery. The pre-fix fixture completed
+  only one reaction while 63 cleanup callbacks consumed the checkpoint.
+- `tilefinch-browser-engine-tests --cleanup-drain-only` drives a page through
+  `browser_engine_advance_runtime` at the PSP frame loop's two-task budget.
+  Hosts advance every frame whether or not author work is pending, so an idle
+  page drains its queued wrapper cleanups (and their DOM handle slots) without
+  cleanup counting as author work. A page whose due tasks take every slot
+  (two 16 ms intervals) previously ran no cleanup at all; after four starved
+  turns one cleanup is now admitted ahead of that turn's tasks, so such a page
+  gives up at most one task slot in five turns.
 - `build-preset-release/tilefinch-script-lazy-tests path/to/script.js [...]`
   inspects the supplied script files instead of running the default fixtures.
 - `build-preset-release/tilefinch-quickjs-oom-tests N` runs the allocation
@@ -274,6 +308,25 @@ dispatch control is needed; the control is built from a copy of the vendored
 engine in the binary directory with that layer reversed, checked against a
 pinned fingerprint, and the vendored tree itself is never modified.
 
+### Interpreter timing controls
+
+Setting `validation_execution_census=0` stops the sampler, but does not
+remove the census checks compiled into the validation interpreter. For a
+physical-PSP timing control, configure the same validation tree with
+`-DPSP_BROWSER_EXECUTION_CENSUS=OFF`, rebuild the named PSP targets and the
+PSPLink PRX, and keep the boot configuration, input script and response
+capture unchanged. Compare completed replies and final pixels, not just a
+successful launch. Restore the option to `ON` before collecting family
+attribution. Host builds retain the hooks regardless of this PSP-only
+control; ordinary shipping PSP builds never compile them in.
+
+Keep the runner and binary unchanged until PSPLink reports `Load/Start`.
+The runner prints the PRX's SHA-256 before loading and rejects a changed
+artifact afterward; save that output with the validation log. Never edit
+the shell runner while it is waiting for a report: shells can read its
+remaining commands lazily. Rebuild the next variant only after the previous
+one is resident, and save each completed log and frame before another run.
+
 ### Property-fault and frame-message diagnostics
 
 The portable Bellard baseline has an opt-in lab-only property-read diagnostic.
@@ -355,7 +408,7 @@ python3 benchmarks/measure-incremental-build.py \
 The benchmark temporarily touches source mtimes, restores them afterward,
 requires actual compile evidence for edit samples, and keeps full logs. Do not
 run it against a worktree another process is editing or building. See
-[the September build-speed experiment](engineering/BUILD_SPEED_EXPERIMENT.md)
+[the build-speed experiment](engineering/BUILD_SPEED_EXPERIMENT.md)
 for measured results and remaining costs.
 
 ## Focused suites
@@ -478,9 +531,9 @@ requires completed dynamic scripts without uncaught errors. It reports caught
 heap refusals separately: an allocation refusal is not itself evidence of an
 uncaught initialization failure. The last dynamic-script completion time is
 measured from navigation commit, not from the initial request; it does not
-prove future timers cannot start additional work beyond that window. The old
-240-turn wall-clock-only replay could finish before delayed initialization
-timers became due. It remains available by invoking
+prove future timers cannot start additional work beyond that window. A
+240-turn wall-clock-only replay, which can finish before delayed
+initialization timers become due, remains available by invoking
 `tilefinch-browser-engine-tests --navigation-settle-replay TRACE URL` directly;
 append the bounded turn count to select logical-clock replay. Do not compare
 the two as equivalent amounts of initialization work.
@@ -658,10 +711,9 @@ If an isolated background PPSSPP launch hangs before PSP boot on macOS, sample
 the process before blaming the EBOOT. PPSSPP 1.20.4's OpenGL path can block in
 `Cocoa_GL_SwapWindow` while the window is occluded. The safe launcher accepts
 `--graphics=vulkan`; the input-script runner exposes the same choice with
-`TILEFINCH_PPSSPP_GRAPHICS=vulkan` (default `opengl`). The runner must set both
+`TILEFINCH_PPSSPP_GRAPHICS=vulkan` (default `opengl`). The runner sets both
 the command-line option and append-config `GraphicsBackend` consistently
-(OpenGL 0, Vulkan 3). A former hardcoded OpenGL append-config overrode the
-requested backend; the environment variable alone did not prove Vulkan ran.
+(OpenGL 0, Vulkan 3); the environment variable alone does not prove Vulkan ran.
 Verify Vulkan initialization in PPSSPP's own log, plus a fresh `Booted` line
 and current validation output. Keep the actual host graphics backend identical
 for A/B captures, without foregrounding the window.
@@ -828,9 +880,7 @@ reclaims that state. Never run PRX `module_stop`/stdio cleanup on this path.
 
 The optional signed voice-model download stays model-only. Browser updates
 and first-install trees carry the matching engine PRX with their A/B slot.
-Do not deploy only EBOOT.PBP when testing this change. Older updaters that do
-not admit the new `tilefinch-voice.prx` package path need a full-install upgrade
-or a transitional updater release before distributing a package containing it.
+Do not deploy only EBOOT.PBP when testing this change.
 
 Host loader tests exercise ABI refusal, memory refusal, missing modules,
 repeated use, and stop/unload failures. For actual PSP/PPSSPP module and model
@@ -929,8 +979,8 @@ configuration for every row:
 | combined candidate | 3,730,744 B | +82,132 B (+2.25%) | 1,841,252 B |
 
 The combined image has roughly 2,012 protected return sites and remains below
-the ordinary 4,480,000-byte `.text` ratchet. The five hot-function size
-ratchets also pass. Newlib initializes one process-wide fixed stack guard
+the ordinary 4,760,000-byte `.text` ratchet. The hot-function size ratchets
+also pass. Newlib initializes one process-wide fixed stack guard
 rather than a random per-process guard, so this is useful corruption detection
 and exploit friction, not a desktop-grade randomized canary.
 

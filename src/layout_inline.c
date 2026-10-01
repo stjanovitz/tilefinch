@@ -11,6 +11,53 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Keep the two inline replaced/control paths in the same paint order. The
+   helper allocates no scratch and propagates the first command refusal. */
+static __attribute__((noinline)) bool layout_inline_paint_borders(
+    LayoutDocument *layout, const ComputedStyle *style,
+    int outer_x, int outer_y, int outer_width, int outer_height)
+{
+    if (style->border.top > 0) {
+        DrawCommand border = {
+            .type = DRAW_FILL_RECT, .x = outer_x, .y = outer_y,
+            .width = outer_width, .height = style->border.top,
+            .color = style->border_color,
+            .opacity_scale = alpha_opacity_scale(style->border_alpha)
+        };
+        if (layout_add_command(layout, border) == NULL) return false;
+    }
+    if (style->border.bottom > 0) {
+        DrawCommand border = {
+            .type = DRAW_FILL_RECT, .x = outer_x,
+            .y = outer_y + outer_height - style->border.bottom,
+            .width = outer_width, .height = style->border.bottom,
+            .color = style->border_color,
+            .opacity_scale = alpha_opacity_scale(style->border_alpha)
+        };
+        if (layout_add_command(layout, border) == NULL) return false;
+    }
+    if (style->border.left > 0) {
+        DrawCommand border = {
+            .type = DRAW_FILL_RECT, .x = outer_x, .y = outer_y,
+            .width = style->border.left, .height = outer_height,
+            .color = style->border_color,
+            .opacity_scale = alpha_opacity_scale(style->border_alpha)
+        };
+        if (layout_add_command(layout, border) == NULL) return false;
+    }
+    if (style->border.right > 0) {
+        DrawCommand border = {
+            .type = DRAW_FILL_RECT,
+            .x = outer_x + outer_width - style->border.right,
+            .y = outer_y, .width = style->border.right,
+            .height = outer_height, .color = style->border_color,
+            .opacity_scale = alpha_opacity_scale(style->border_alpha)
+        };
+        if (layout_add_command(layout, border) == NULL) return false;
+    }
+    return true;
+}
+
 static int line_y_fixed(LineState *line)
 {
     if (!line->y_fixed_valid
@@ -1042,6 +1089,14 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
     if (used_height > INT_MAX) used_height = INT_MAX;
     int pseudo_height = forced_border_height > 0
                         ? forced_border_height : (int) used_height;
+    /* The block-axis counterpart of left+right above: an auto-height box
+       placed by both top and bottom (inset: 4px) spans between them.
+       chatgpt.com's send button is such a ::before disc and was never
+       drawn. */
+    if (forced_border_height <= 0 && !style.has_height && style.has_top
+        && style.has_bottom) {
+        pseudo_height = height - style.top - style.bottom;
+    }
     if (pseudo_width <= 0 || pseudo_height <= 0) return true;
     int pseudo_x = style.has_left ? x + style.left
                    : (style.has_right ? x + width - style.right - pseudo_width
@@ -3468,7 +3523,10 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                            ? specified_height
                            : specified_height + vertical_edges;
         } else if (textarea_control || editable_control) {
-            outer_height = 64;
+            int rows_height = layout_textarea_rows_content_height(
+                context, node, &style);
+            outer_height = rows_height > 0
+                ? rows_height + vertical_edges : 64;
         } else if (input_control_type == CONTROL_TOGGLE) {
             outer_height = 18 + vertical_edges;
         } else if (input_control_type == CONTROL_RANGE) {
@@ -3616,44 +3674,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             };
             if (layout_add_command(context->layout, text) == NULL) return false;
         }
-        if (style.border.top > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT, .x = outer_x, .y = outer_y,
-                .width = outer_width, .height = style.border.top,
-                .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
-        if (style.border.bottom > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT, .x = outer_x,
-                .y = outer_y + outer_height - style.border.bottom,
-                .width = outer_width, .height = style.border.bottom,
-                .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
-        if (style.border.left > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT, .x = outer_x, .y = outer_y,
-                .width = style.border.left, .height = outer_height,
-                .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
-        if (style.border.right > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT,
-                .x = outer_x + outer_width - style.border.right,
-                .y = outer_y, .width = style.border.right,
-                .height = outer_height, .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
+        if (!layout_inline_paint_borders(
+                context->layout, &style, outer_x, outer_y,
+                outer_width, outer_height)) return false;
         }
         ControlType control_type = input_control ? input_control_type
                                    : (textarea_control ? CONTROL_TEXTAREA
@@ -3672,6 +3695,36 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                     outer_width < handle ? outer_width : handle,
                     outer_height < handle ? outer_height : handle,
                     CONTROL_RESIZE, node)) return false;
+        }
+        /* Like inline replaced elements, inline form controls need a
+           queryable box: textarea autosizers read scrollHeight and
+           getBoundingClientRect, which answered zero height here. */
+        {
+            int client_width = outer_width - style.border.left
+                               - style.border.right;
+            int client_height = outer_height - style.border.top
+                                - style.border.bottom;
+            if (client_width < 0) client_width = 0;
+            if (client_height < 0) client_height = 0;
+            if (!add_node_box(context->layout, node, outer_x, outer_y,
+                              outer_width, outer_height,
+                              client_width, client_height,
+                              client_width, client_height,
+                              style.padding.left + style.padding.right,
+                              style.padding.top + style.padding.bottom,
+                              false, false, 0, 0,
+                              style.border.left, style.border.top, false,
+                              false, false, true,
+                              inline_control_command_start,
+                              context->layout->count,
+                              inline_control_command_start,
+                              inline_control_command_start,
+                              inline_control_link_start,
+                              context->layout->link_count,
+                              inline_control_region_start,
+                              context->layout->control_count)) {
+                return false;
+            }
         }
         if (!apply_visual_range(
                 context, node, inline_control_command_start,
@@ -3944,44 +3997,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                 return false;
             }
         }
-        if (style.border.top > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT, .x = outer_x, .y = outer_y,
-                .width = outer_width, .height = style.border.top,
-                .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
-        if (style.border.bottom > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT, .x = outer_x,
-                .y = outer_y + outer_height - style.border.bottom,
-                .width = outer_width, .height = style.border.bottom,
-                .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
-        if (style.border.left > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT, .x = outer_x, .y = outer_y,
-                .width = style.border.left, .height = outer_height,
-                .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
-        if (style.border.right > 0) {
-            DrawCommand border = {
-                .type = DRAW_FILL_RECT,
-                .x = outer_x + outer_width - style.border.right,
-                .y = outer_y, .width = style.border.right,
-                .height = outer_height, .color = style.border_color,
-                .opacity_scale = alpha_opacity_scale(style.border_alpha)
-            };
-            if (layout_add_command(context->layout, border) == NULL) return false;
-        }
+        if (!layout_inline_paint_borders(
+                context->layout, &style, outer_x, outer_y,
+                outer_width, outer_height)) return false;
         line_cursor_set(line, replaced_start_x + advance);
         int line_height = style.margin.top + outer_height + style.margin.bottom;
         line_height_include_fixed(

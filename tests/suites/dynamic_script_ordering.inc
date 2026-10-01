@@ -85,7 +85,12 @@ static bool test_dynamic_module_dependency(Budget *budget)
         "import {depValue} from './module-dependency.js';"
         "globalThis.moduleProbe=(document.currentScript===null?"
         "'current-null':'current-set')+':dep-'+depValue;";
-    static const char dependency_source[] = "export const depValue=7;";
+    /* The replay delivers a geometrically grown response. Body sharing can
+       relocate it before prefetch scans these transitive imports. */
+    static const char dependency_source[] =
+        "import {leafValue} from './module-leaf.js';"
+        "export const depValue=leafValue;";
+    static const char leaf_source[] = "export const leafValue=7;";
     static const char append_module[] =
         "const module=document.createElement('script');module.type='module';"
         "module.id='dynamic-module';module.src='/module.js';"
@@ -96,13 +101,19 @@ static bool test_dynamic_module_dependency(Budget *budget)
         "'module:error';});document.head.appendChild(module);"
         "module.setAttribute('referrerpolicy','no-referrer');"
         "globalThis.pocSummary='module:append';";
-    ScriptReplayRecord records[1] = {{
+    ScriptReplayRecord records[2] = {{
         .url = "https://module.test/module-dependency.js",
         .source = dependency_source,
         .referrer_url = "https://module.test/module.js",
         /* Enumerated referrerpolicy attributes are case-insensitive, but
            whitespace is not stripped. The invalid token snapshots the
            document's empty fallback, not the later no-referrer mutation. */
+        .referrer_policy = "",
+        .module = true
+    }, {
+        .url = "https://module.test/module-leaf.js",
+        .source = leaf_source,
+        .referrer_url = "https://module.test/module-dependency.js",
         .referrer_policy = "",
         .module = true
     }};
@@ -112,7 +123,7 @@ static bool test_dynamic_module_dependency(Budget *budget)
     bool fixture_ready = false, replaying = false;
     bool browser_ready = false, navigation_ready = false, ok = true;
 
-    REQUIRE(write_replay_fixture(directory, records, 1));
+    REQUIRE(write_replay_fixture(directory, records, 2));
     fixture_ready = true;
     REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
     replaying = true;
@@ -140,7 +151,7 @@ cleanup:
     if (navigation_ready) navigation_destroy(&navigation);
     if (browser_ready) browser_session_destroy(&browser);
     if (replaying) fetch_trace_end();
-    if (fixture_ready) remove_replay_fixture(directory, 1);
+    if (fixture_ready) remove_replay_fixture(directory, 2);
     if (budget->current != 0) {
         fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
                 budget->current);

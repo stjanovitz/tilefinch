@@ -1,9 +1,19 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/platform.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifndef TILEFINCH_TEST_SOURCE_DIR
 #define TILEFINCH_TEST_SOURCE_DIR "."
@@ -436,6 +446,97 @@ static bool test_accepted_critical_client_hints(void)
                 malformed[i].accept_ch, malformed[i].critical_ch,
                 accepted, sizeof(accepted))
             || accepted[0] != '\0') return false;
+    }
+    return true;
+}
+
+/* Header decisions exactly at their bounds and for every browser-owned
+   extra header name (each validation of a request walks them): a value of
+   the maximum length passes, one byte more or a control byte fails; each
+   forbidden name fails in any case, near misses and ordinary page headers
+   pass. */
+static bool test_request_header_decisions(void)
+{
+    static const struct {
+        size_t offset;
+        size_t maximum;
+    } fields[] = {
+        {offsetof(FetchRequest, content_type), 255},
+        {offsetof(FetchRequest, cookie), 4095},
+        {offsetof(FetchRequest, if_none_match), 191},
+        {offsetof(FetchRequest, if_modified_since), 127},
+        {offsetof(FetchRequest, referer), 4095},
+        {offsetof(FetchRequest, accept), 255},
+        {offsetof(FetchRequest, user_agent), 511},
+        {offsetof(FetchRequest, referrer_policy), 63},
+    };
+    static char value[4200];
+    for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++) {
+        for (size_t length = fields[f].maximum - 1;
+             length <= fields[f].maximum + 1; length++) {
+            memset(value, 'a', length);
+            value[length] = '\0';
+            FetchRequest candidate = request();
+            *(const char **) ((char *) &candidate + fields[f].offset) = value;
+            FetchRequestValidationError error = FETCH_REQUEST_VALIDATION_OK;
+            bool valid = fetch_request_validate(&candidate, &error);
+            if (valid != (length <= fields[f].maximum)
+                || (!valid && error != FETCH_REQUEST_VALIDATION_HEADER_VALUE))
+                return false;
+            if (length > fields[f].maximum) continue;
+            /* A control byte anywhere, the last included. */
+            value[length - 1] = '\x01';
+            if (fetch_request_validate(&candidate, NULL)) return false;
+            value[length - 1] = '\x7f';
+            if (fetch_request_validate(&candidate, NULL)) return false;
+        }
+    }
+    static const char *const forbidden[] = {
+        "accept", "accept-charset", "accept-encoding",
+        "access-control-request-headers", "access-control-request-method",
+        "access-control-request-private-network", "connection",
+        "content-length", "content-type", "cookie", "cookie2", "date", "dnt",
+        "expect", "host", "if-modified-since", "if-none-match", "keep-alive",
+        "origin", "permissions-policy", "referer", "set-cookie",
+        "set-cookie2", "te", "trailer", "transfer-encoding", "upgrade",
+        "upgrade-insecure-requests", "user-agent", "via", "ua", "ua-mobile",
+        "ua-platform", "ua-full-version", "ua-full-version-list", "ua-arch",
+        "ua-bitness", "ua-model", "ua-platform-version", "x-http-method",
+        "x-http-method-override", "x-method-override", "Sec-Fetch-Site",
+        "sec-anything", "Proxy-Authorization", "proxy-x", "USER-AGENT",
+        "Accept"
+    };
+    static const char *const allowed[] = {
+        "accepts", "acceptx", "cookies", "tee", "t", "u", "ua-", "uax",
+        "x-http-methods", "x-method", "sec", "proxy", "oai-device-id",
+        "oai-language", "x-openai-target-path", "authorization",
+        "content-language", "x-requested-with", "via-proxy", "hosts"
+    };
+    char header[128];
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
+        snprintf(header, sizeof(header), "%s: v", forbidden[i]);
+        FetchRequest candidate = request();
+        candidate.extra_headers = header;
+        FetchRequestValidationError error = FETCH_REQUEST_VALIDATION_OK;
+        if (fetch_request_validate(&candidate, &error)
+            || error != FETCH_REQUEST_VALIDATION_EXTRA_HEADERS) {
+            fprintf(stderr, "forbidden header allowed: %s\n", forbidden[i]);
+            return false;
+        }
+        /* The same name after an allowed line. */
+        snprintf(header, sizeof(header), "oai-device-id: 1\n%s: v",
+                 forbidden[i]);
+        if (fetch_request_validate(&candidate, NULL)) return false;
+    }
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        snprintf(header, sizeof(header), "%s: v\noai-language: en-US",
+                 allowed[i]);
+        FetchRequest candidate = request();
+        candidate.extra_headers = header;
+        if (!fetch_request_validate(&candidate, NULL)) {
+            fprintf(stderr, "ordinary header refused: %s\n", allowed[i]);
+            return false;
+        }
     }
     return true;
 }
@@ -1297,6 +1398,423 @@ static bool test_reservation_headroom_gate(void)
     return ok && budget.current == 0;
 }
 
+typedef struct {
+    int listener;
+    int client;
+} SilentServer;
+
+static void *silent_server_run(void *opaque)
+{
+    SilentServer *server = opaque;
+    server->client = accept(server->listener, NULL, NULL);
+    return NULL;
+}
+
+static uint64_t test_now_us(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * UINT64_C(1000000)
+        + (uint64_t) now.tv_nsec / UINT64_C(1000);
+}
+
+/* A module fetch stuck on a connection that accepted the request and never
+   answered held chatgpt.com's synchronous module graph for the whole 15 s
+   deadline, twice. A request that opts into the stall watchdog fails once
+   the window passes with no bytes, leaving the caller time to retry. */
+static bool test_stall_abort_window(void)
+{
+    SilentServer server = {.listener = socket(AF_INET, SOCK_STREAM, 0),
+                           .client = -1};
+    struct sockaddr_in address = {.sin_family = AF_INET,
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t address_length = sizeof(address);
+    if (server.listener < 0
+        || bind(server.listener, (struct sockaddr *) &address,
+                sizeof(address)) != 0
+        || listen(server.listener, 1) != 0
+        || getsockname(server.listener, (struct sockaddr *) &address,
+                       &address_length) != 0) return false;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, silent_server_run, &server) != 0)
+        return false;
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/module.js",
+             (unsigned) ntohs(address.sin_port));
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FetchScheduler *scheduler = fetch_scheduler_create(&budget, 1, 65536);
+    FetchRequest candidate = {.method = "GET", .allow_http_errors = true,
+                              .stall_abort_seconds = 1};
+    FetchResult *result = fetch_result_create(&budget);
+    uint64_t started = test_now_us();
+    bool fetched = scheduler != NULL && result != NULL
+        && fetch_scheduler_request(scheduler, url, &candidate, 4096, 6000,
+                                   result);
+    uint64_t elapsed = test_now_us() - started;
+    if (fetched || elapsed >= UINT64_C(4000000))
+        fprintf(stderr, "stall-abort: fetched=%d elapsed=%lluus\n",
+                fetched ? 1 : 0, (unsigned long long) elapsed);
+    fetch_result_free(result);
+    fetch_scheduler_destroy(scheduler);
+    pthread_join(thread, NULL);
+    if (server.client >= 0) close(server.client);
+    close(server.listener);
+    return !fetched && elapsed < UINT64_C(4000000) && budget.current == 0;
+}
+
+typedef struct {
+    int listener;
+    bool answer;
+} TrickleServer;
+
+/* Accepts one request; when answering, sends headers at once and then the
+   body one byte per 250 ms, so the whole response outlasts a 2 s deadline
+   while never pausing longer than the stall allowance. */
+static void *trickle_server_run(void *opaque)
+{
+    TrickleServer *server = opaque;
+    int client = accept(server->listener, NULL, NULL);
+    if (client < 0) return NULL;
+    char request_bytes[1024];
+    (void) recv(client, request_bytes, sizeof(request_bytes), 0);
+    if (server->answer) {
+        static const char head[] =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+            "Content-Length: 12\r\nConnection: close\r\n\r\n";
+        (void) send(client, head, sizeof(head) - 1u, 0);
+        for (int i = 0; i < 12; i++) {
+            struct timespec pause = {.tv_nsec = 250000000L};
+            nanosleep(&pause, NULL);
+            (void) send(client, &"abcdefghijkl"[i], 1, 0);
+        }
+    } else {
+        struct timespec pause = {.tv_sec = 4};
+        nanosleep(&pause, NULL);
+    }
+    close(client);
+    return NULL;
+}
+
+static bool run_trickle(bool answer, bool *success, FetchResult *result,
+                        Consumer *consumer, uint64_t *elapsed, Budget *budget)
+{
+    TrickleServer server = {.listener = socket(AF_INET, SOCK_STREAM, 0),
+                            .answer = answer};
+    struct sockaddr_in address = {.sin_family = AF_INET,
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t address_length = sizeof(address);
+    if (server.listener < 0
+        || bind(server.listener, (struct sockaddr *) &address,
+                sizeof(address)) != 0
+        || listen(server.listener, 1) != 0
+        || getsockname(server.listener, (struct sockaddr *) &address,
+                       &address_length) != 0) return false;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, trickle_server_run, &server) != 0)
+        return false;
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/answer",
+             (unsigned) ntohs(address.sin_port));
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1, 4096);
+    FetchRequest fetch_request = {.method = "GET"};
+    FetchStreamOptions stream = {.on_headers = headers, .on_body = body,
+                                 .opaque = consumer};
+    uint64_t started = test_now_us();
+    uint64_t id = scheduler == NULL ? 0 : fetch_scheduler_enqueue_stream(
+        scheduler, url, &fetch_request, 4096, 2000, &stream);
+    FetchStreamMetrics metrics = {0};
+    bool taken = false;
+    while (id != 0 && !taken && test_now_us() - started < UINT64_C(8000000)) {
+        (void) fetch_scheduler_pump(scheduler, 1, 10);
+        taken = fetch_scheduler_take_stream(
+            scheduler, id, success, &metrics, result);
+    }
+    *elapsed = test_now_us() - started;
+    fetch_scheduler_destroy(scheduler);
+    pthread_join(thread, NULL);
+    close(server.listener);
+    return taken;
+}
+
+/* chatgpt.com's answer page streams for longer than the navigation
+   deadline while bytes keep flowing; the deadline bounds only the wait for
+   headers. A server that never answers still fails at that deadline. */
+static bool test_stream_deadline_bounds_headers(void)
+{
+    /* A client that gives up closes the socket mid-trickle; report that as
+       a failed case instead of dying on the server's next send. */
+    (void) signal(SIGPIPE, SIG_IGN);
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    Consumer flowing = {0}, silent = {0};
+    bool flowing_success = false, silent_success = true;
+    FetchResult flowing_result = {.budget = &budget};
+    FetchResult silent_result = {.budget = &budget};
+    uint64_t flowing_us = 0, silent_us = 0;
+    bool ran = run_trickle(true, &flowing_success, &flowing_result,
+                           &flowing, &flowing_us, &budget)
+        && run_trickle(false, &silent_success, &silent_result,
+                       &silent, &silent_us, &budget);
+    bool ok = ran && flowing_success && flowing.length == 12
+        && memcmp(flowing.bytes, "abcdefghijkl", 12) == 0
+        && flowing_us > UINT64_C(2500000)
+        && !silent_success && silent_result.timed_out
+        && silent.headers == 0 && silent_us < UINT64_C(3500000);
+    if (!ok)
+        fprintf(stderr,
+                "stream-deadline: ran=%d flowing=%d/%zu %lluus \"%s\" "
+                "silent=%d timed_out=%d %lluus\n",
+                ran ? 1 : 0, flowing_success ? 1 : 0, flowing.length,
+                (unsigned long long) flowing_us, flowing_result.error,
+                silent_success ? 1 : 0, silent_result.timed_out ? 1 : 0,
+                (unsigned long long) silent_us);
+    fetch_result_destroy(&flowing_result);
+    fetch_result_destroy(&silent_result);
+    return ok && budget.current == 0;
+}
+
+/* A page mints fresh UUIDs into a request URL and body on every run and the
+   server echoes them back; the page drops a response carrying another
+   run's identifiers.  TILEFINCH_REPLAY_VOLATILE_UUIDS (lab/validation only)
+   matches UUID-shaped query values as wildcards and rewrites the recorded
+   request's UUIDs to the live request's in the served headers and body.
+   Without it, replay is unchanged; with it, every other URL byte still
+   matches exactly and unpaired or embedded UUIDs are served as recorded. */
+#define VOLATILE_FIXTURE TILEFINCH_TEST_SOURCE_DIR \
+    "/fixtures/http-response-key-volatile-uuid"
+#define RECORDED_OP "11111111-2222-4333-8444-555555555555"
+#define LIVE_OP "01234567-89ab-4cde-8f01-23456789abcd"
+#define LIVE_PENDING "fedcba98-7654-4321-8fed-cba987654321"
+#define LIVE_USER "0f0f0f0f-1e1e-4d2d-8c3c-4b4b4b4b4b4b"
+
+static bool volatile_uuid_fetch(Budget *budget, const char *url,
+                                bool streamed, Consumer *consumer,
+                                FetchResult *result)
+{
+    static const char live_body[] =
+        "prompt=hi&assistantMessageId=pending-" LIVE_PENDING
+        "&userMessageId=" LIVE_USER;
+    FetchRequest fetch_request = {
+        .method = "POST",
+        .body = live_body,
+        .body_length = sizeof(live_body) - 1,
+        .content_type = "application/x-www-form-urlencoded;charset=UTF-8",
+        .send_low_client_hints = true
+    };
+    if (!streamed) {
+        return fetch_request_cancelable(budget, url, &fetch_request, 4096,
+                                        1000, NULL, NULL, result);
+    }
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1, 4096);
+    FetchStreamOptions stream = {
+        .on_headers = headers, .on_body = body, .opaque = consumer,
+        .chunk_bytes = 7
+    };
+    uint64_t id = scheduler == NULL ? 0 : fetch_scheduler_enqueue_stream(
+        scheduler, url, &fetch_request, 4096, 1000, &stream);
+    bool success = false, taken = false;
+    FetchStreamMetrics metrics = {0};
+    for (size_t pump = 0; id != 0 && pump < 256 && !taken; pump++) {
+        (void) fetch_scheduler_pump(scheduler, 1, 0);
+        taken = fetch_scheduler_take_stream(
+            scheduler, id, &success, &metrics, result);
+    }
+    fetch_scheduler_destroy(scheduler);
+    return taken && success;
+}
+
+static bool test_volatile_uuid_replay(void)
+{
+    static const char rekeyed[] =
+        "op=" LIVE_OP ";for=assistant-pending-" LIVE_PENDING
+        "-pending;user=" LIVE_USER
+        ";keep=99999999-9999-4999-8999-999999999999"
+        ";hex=a" RECORDED_OP ";again=" LIVE_OP "\n";
+    const char *live_url =
+        "https://volatile-uuid.test/updates?lightweight=0&operationId="
+        LIVE_OP;
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    char error[256] = {0};
+    FetchTraceReplayStats stats = {0};
+    FetchResult result = {.budget = &budget};
+    Consumer consumer = {0};
+
+    /* Off: a fresh identifier is a different route. */
+    (void) unsetenv("TILEFINCH_REPLAY_VOLATILE_UUIDS");
+    bool ok = fetch_trace_replay_begin_response_keyed(
+            VOLATILE_FIXTURE, error, sizeof(error))
+        && !volatile_uuid_fetch(&budget, live_url, false, NULL, &result)
+        && strstr(result.error, "has no record") != NULL
+        && fetch_trace_replay_stats(&stats)
+        && stats.unmatched_request_count == 1
+        && stats.matched_request_count == 0;
+    fetch_result_destroy(&result);
+    fetch_trace_end();
+
+    /* On: served, identifiers echoed, even across 7-byte chunks. */
+    ok = ok && setenv("TILEFINCH_REPLAY_VOLATILE_UUIDS", "1", 1) == 0
+        && fetch_trace_replay_begin_response_keyed(
+               VOLATILE_FIXTURE, error, sizeof(error));
+    char header[96] = {0};
+    result = (FetchResult) {.budget = &budget};
+    ok = ok && volatile_uuid_fetch(&budget, live_url, true, &consumer,
+                                   &result)
+        && consumer.headers == 1
+        && consumer.length == sizeof(rekeyed) - 1
+        && memcmp(consumer.bytes, rekeyed, sizeof(rekeyed) - 1) == 0
+        && fetch_response_header_value(&result, "x-turn-id", header,
+                                       sizeof(header))
+        && strcmp(header, "pending-" LIVE_PENDING) == 0
+        && strcmp(result.effective_url, live_url) == 0;
+    fetch_result_destroy(&result);
+    result = (FetchResult) {.budget = &budget};
+    ok = ok && volatile_uuid_fetch(&budget, live_url, false, NULL, &result)
+        && result.length == sizeof(rekeyed) - 1
+        && memcmp(result.data, rekeyed, sizeof(rekeyed) - 1) == 0;
+    fetch_result_destroy(&result);
+
+    /* Every non-UUID byte of the URL still keys the route. */
+    static const char *const misses[] = {
+        "https://volatile-uuid.test/updates?lightweight=1&operationId="
+        LIVE_OP,
+        "https://volatile-uuid.test/updates?lightweight=0&operation="
+        LIVE_OP,
+        "https://volatile-uuid.test/updates?lightweight=0&operationId="
+        "not-a-uuid",
+        "https://volatile-uuid.test/updates?operationId=" LIVE_OP
+        "&lightweight=0",
+        "https://volatile-uuid.test/fixed?id=" LIVE_OP "&v=1"
+    };
+    for (size_t index = 0;
+         ok && index < sizeof(misses) / sizeof(misses[0]); index++) {
+        result = (FetchResult) {.budget = &budget};
+        ok = !volatile_uuid_fetch(&budget, misses[index], false, NULL,
+                                  &result)
+            && strstr(result.error, "has no record") != NULL;
+        fetch_result_destroy(&result);
+    }
+    ok = ok && fetch_trace_replay_stats(&stats)
+        && stats.request_count == 7 && stats.matched_request_count == 2
+        && stats.served_request_count == 2
+        && stats.unmatched_request_count == 5
+        && stats.reusable_claim_count == 2
+        && fetch_trace_replay_record_was_claimed(0)
+        && !fetch_trace_replay_record_was_claimed(1);
+    fetch_trace_end();
+    (void) unsetenv("TILEFINCH_REPLAY_VOLATILE_UUIDS");
+    return ok && budget.current == 0;
+}
+
+static uint64_t pacing_now_us;
+
+static uint64_t pacing_clock_ns(void *context)
+{
+    (void) context;
+    return pacing_now_us * UINT64_C(1000);
+}
+
+static bool copy_file(const char *from, const char *to, const char *find,
+                      const char *replace)
+{
+    FILE *in = fopen(from, "rb");
+    if (in == NULL) return false;
+    char text[16384];
+    size_t length = fread(text, 1, sizeof(text) - 1u, in);
+    fclose(in);
+    text[length] = '\0';
+    FILE *out = fopen(to, "wb");
+    if (out == NULL) return false;
+    const char *at = find == NULL ? NULL : strstr(text, find);
+    bool ok = at == NULL
+        ? fwrite(text, 1, length, out) == length
+        : fwrite(text, 1, (size_t) (at - text), out)
+                == (size_t) (at - text)
+            && fputs(replace, out) >= 0
+            && fputs(at + strlen(find), out) >= 0;
+    return fclose(out) == 0 && ok;
+}
+
+/* Pumps until the replayed document is taken; returns the pump count or 0. */
+static size_t pumps_until_taken(Budget *budget, const char *directory,
+                                uint64_t advance_us_per_pump)
+{
+    char error[256] = {0};
+    if (!fetch_trace_replay_begin(directory, error, sizeof(error))) return 0;
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1, 4096);
+    FetchRequest fetch_request = request();
+    uint64_t id = scheduler == NULL ? 0 : fetch_scheduler_enqueue(
+        scheduler, "https://stream.test/document", &fetch_request,
+        4096, 1000);
+    FetchResult result = {.budget = budget};
+    bool success = false;
+    size_t taken = 0;
+    for (size_t i = 1; id != 0 && i <= 64; i++) {
+        pacing_now_us += advance_us_per_pump;
+        (void) fetch_scheduler_pump(scheduler, 1, 0);
+        if (fetch_scheduler_take(scheduler, id, &success, &result)) {
+            taken = success ? i : 0;
+            break;
+        }
+    }
+    fetch_result_destroy(&result);
+    fetch_scheduler_destroy(scheduler);
+    fetch_trace_end();
+    return taken;
+}
+
+/* A recorded response is held for its capture's pumps; with
+   TILEFINCH_REPLAY_PUMP_US it is held for that many pumps' worth of wall
+   time instead, however often the loop pumps. */
+static bool test_replay_holds_by_pumps_or_wall_time(void)
+{
+    char directory[64];
+    snprintf(directory, sizeof(directory), "%s",
+             "/tmp/tilefinch-replay-pacing-XXXXXX");
+    if (mkdtemp(directory) == NULL) return false;
+    char path[128];
+    bool ok = true;
+    static const char *const files[] = {"0000.body", "0000.meta",
+                                        "trace.meta"};
+    for (size_t i = 0; ok && i < 3; i++) {
+        char from[256];
+        snprintf(from, sizeof(from), "%s/fixtures/http-stream/%s",
+                 TILEFINCH_TEST_SOURCE_DIR, files[i]);
+        snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
+        ok = copy_file(from, path, i == 1 ? "async-delay-pumps=0" : NULL,
+                       "async-delay-pumps=5");
+    }
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    TilefinchPlatformServices services = {
+        .monotonic_time_ns = pacing_clock_ns
+    };
+    tilefinch_platform_set_services(&services);
+    pacing_now_us = UINT64_C(5000000);
+    unsetenv("TILEFINCH_REPLAY_PUMP_US");
+    /* Pumps: the fifth pump releases it, whatever the clock says. */
+    size_t by_pumps = ok ? pumps_until_taken(&budget, directory, 0) : 0;
+    /* Wall time: 5 x 10 ms, whether the loop pumps every 2 ms... */
+    setenv("TILEFINCH_REPLAY_PUMP_US", "10000", 1);
+    size_t fast = ok ? pumps_until_taken(&budget, directory, 2000) : 0;
+    /* ... or every 25 ms (it still needs one pump). */
+    size_t slow = ok ? pumps_until_taken(&budget, directory, 25000) : 0;
+    unsetenv("TILEFINCH_REPLAY_PUMP_US");
+    tilefinch_platform_set_services(NULL);
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
+        (void) unlink(path);
+    }
+    (void) rmdir(directory);
+    if (by_pumps != 5 || fast != 25 || slow != 2) {
+        fprintf(stderr, "replay pacing: pumps=%zu fast=%zu slow=%zu\n",
+                by_pumps, fast, slow);
+        return false;
+    }
+    return ok && budget.current == 0;
+}
+
 int main(void)
 {
     static const struct {
@@ -1306,6 +1824,7 @@ int main(void)
         {"ca-bundle", test_ca_bundle_configuration},
         {"critical-client-hints", test_accepted_critical_client_hints},
         {"request-validation", test_request_validation_before_replay},
+        {"request-header-decisions", test_request_header_decisions},
         {"handshake-counters", test_handshake_counter_rendering},
         {"absent-handshake", test_replay_reports_absent_handshake_fields},
         {"retained-failure-delay", test_retained_failure_replay_delay},
@@ -1315,7 +1834,11 @@ int main(void)
         {"buffered-pump-quota", test_buffered_fetch_respects_pump_quota},
         {"allocation-failure", test_allocation_failure},
         {"shared-scheduler-domain", test_lazy_shared_scheduler_domain},
-        {"reservation-headroom", test_reservation_headroom_gate}
+        {"reservation-headroom", test_reservation_headroom_gate},
+        {"stall-abort", test_stall_abort_window},
+        {"stream-deadline", test_stream_deadline_bounds_headers},
+        {"volatile-uuid-replay", test_volatile_uuid_replay},
+        {"replay-pacing", test_replay_holds_by_pumps_or_wall_time}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (!cases[i].run()) {

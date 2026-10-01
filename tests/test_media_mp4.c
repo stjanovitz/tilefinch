@@ -2547,20 +2547,21 @@ int main(void)
           && media_video_frame_is_due(
               &nearest_future, UINT64_C(1495000)));
     CHECK(psp_media_seek_take_clock_us(
-              UINT64_C(1490000), UINT64_C(1490000), true,
-              UINT64_C(1515000))
+              UINT64_C(1490000), true, true, UINT64_C(1515000))
           == UINT64_C(1515000));
     CHECK(psp_media_seek_take_clock_us(
-              UINT64_C(1490000), 0, true, UINT64_C(1515000))
+              UINT64_C(1490000), false, true, UINT64_C(1515000))
           == UINT64_C(1490000));
     CHECK(psp_media_seek_take_clock_us(
-              UINT64_C(1515000), UINT64_C(1490000), true,
-              UINT64_C(1490000))
+              UINT64_C(1515000), true, true, UINT64_C(1490000))
           == UINT64_C(1515000));
     CHECK(psp_media_seek_take_clock_us(
-              UINT64_C(1490000), UINT64_C(1490000), false,
-              UINT64_C(1515000))
+              UINT64_C(1490000), true, false, UINT64_C(1515000))
           == UINT64_C(1490000));
+    /* A floor at 0 (backward reopen to the start): the first B-frame-ordered
+       picture is one period in and must still be lent the clock. */
+    CHECK(psp_media_seek_take_clock_us(0, true, true, UINT64_C(33333))
+          == UINT64_C(33333));
     CHECK(media_video_seek_decide(
               &before_seek, UINT64_C(1500000), true)
           == MEDIA_VIDEO_SEEK_WAIT);

@@ -244,6 +244,64 @@ static const char responsive_page[] =
 #include "suites/layout_paint.inc"
 #include "suites/layout_structure.inc"
 
+static int test_inline_border_command_parity(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    budget_install_lexbor(&budget);
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}input,textarea,img{display:inline;"
+        "width:30px;height:18px;padding:2px;margin:2px;"
+        "border-top:1px solid #5078a080;border-bottom:3px solid #5078a080;"
+        "border-left:4px solid #5078a080;border-right:2px solid #5078a080}"
+        "</style><body><input id=control value=X><img id=image alt=I>"
+        "<textarea id=area>T</textarea></body>";
+    PocDocument document;
+    Stylesheet sheet;
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 42)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    const char *ids[] = {"control", "image", "area"};
+    const LayoutNodeBox *boxes[3];
+    for (size_t i = 0; i < 3; i++) {
+        boxes[i] = layout_box_for_node(
+            &layout, find_id(lxb_dom_interface_node(document.html), ids[i]));
+        CHECK(boxes[i] != NULL);
+    }
+    size_t border_count = 0;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_FILL_RECT || command->color != 0x5078a0u)
+            continue;
+        CHECK(border_count < 12u
+              && command->opacity_scale == alpha_opacity_scale(128u));
+        const LayoutNodeBox *box = boxes[border_count / 4u];
+        /* Existing order is top, bottom, left, right, including corner
+           overlaps; changing it alters translucent border pixels. */
+        unsigned side = (unsigned) (border_count % 4u);
+        CHECK(command->x == box->x + (side == 3u ? box->width - 2 : 0)
+              && command->y == box->y + (side == 1u ? box->height - 3 : 0)
+              && command->width == (side == 2u ? 4 : side == 3u ? 2 : box->width)
+              && command->height == (side == 0u ? 1 : side == 1u ? 3 : box->height));
+        border_count++;
+    }
+    CHECK(border_count == 12u);
+    layout_destroy(&layout);
+    size_t warmed = budget.current;
+    for (size_t refused_after = 0; refused_after < 48u; refused_after++) {
+        budget_inject_failure_after(&budget, refused_after);
+        (void) layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480);
+        budget_clear_failure_injection(&budget);
+        layout_destroy(&layout);
+        CHECK(budget.current == warmed);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 static int test_layout(void)
 {
 #include "suites/layout_regression_1.inc"
@@ -254,5 +312,6 @@ static int test_layout(void)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    CHECK(test_inline_border_command_parity() == 0);
     return test_layout();
 }

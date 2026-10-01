@@ -1,4 +1,5 @@
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/controller.h"
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
@@ -6,6 +7,7 @@
 #include "tilefinch/user_agent.h"
 #include "tilefinch/viewport.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +16,8 @@
 #include <lexbor/dom/interfaces/node.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/runtime_clock.h"
+#include "tilefinch/script_split.h"
 #include "../src/js_runtime_internal.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch/budget_quickjs.h"
@@ -392,6 +396,52 @@ static int test_focus_style_and_selector_helpers(void)
             fprintf(stderr, "focus case %zu: %s\n", i, result.summary);
         CHECK(strcmp(result.summary, expected) == 0);
     }
+    /* Only mutations that can change the focused element (itself, an
+       ancestor, its removal, a style sheet) ask whether it is still
+       focusable; each ask reads its computed style. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const kept=document.getElementById('kept');kept.focus();"
+              "const list=document.getElementById('list'),original="
+              "getComputedStyle;globalThis.focusReads=0;globalThis."
+              "getComputedStyle=function(target){if(target===kept)"
+              "globalThis.focusReads++;return original.apply(this,arguments)};"
+              "for(let i=0;i<12;i++)setTimeout(()=>{list.textContent=String(i);"
+              "list.setAttribute('data-i',String(i))},0);"
+              "setTimeout(()=>{globalThis.unrelatedReads=focusReads;"
+              "document.body.setAttribute('data-x','1')},0);"
+              "setTimeout(()=>{kept.setAttribute('data-y','1')},0);"
+              "globalThis.pocSummary='queued';})()",
+              "<focus-fixup-relevant>", &result));
+    for (int step = 0; step < 4; step++)
+        CHECK(script_runtime_advance(runtime, 20, 64, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=(document.activeElement.id==='kept'"
+              "&&document.getElementById('list').textContent==='11'"
+              "&&unrelatedReads===0&&focusReads===2)?'RELEVANT-ONLY'"
+              ":'READS:'+unrelatedReads+','+focusReads",
+              "<focus-fixup-relevant-result>", &result));
+    if (strcmp(result.summary, "RELEVANT-ONLY") != 0)
+        fprintf(stderr, "focus fixup relevance: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "RELEVANT-ONLY") == 0);
+    /* Removing the focused element's ancestor still moves focus. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const wrap=document.createElement('div'),input="
+              "document.createElement('input');input.id='nested';"
+              "wrap.appendChild(input);document.body.appendChild(wrap);"
+              "input.focus();setTimeout(()=>wrap.remove(),0);"
+              "globalThis.pocSummary='queued';})()",
+              "<focus-fixup-removal>", &result));
+    for (int step = 0; step < 4; step++)
+        CHECK(script_runtime_advance(runtime, 20, 64, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=document.activeElement===document.body"
+              "?'body':String(document.activeElement.id)",
+              "<focus-fixup-removal-result>", &result)
+          && strcmp(result.summary, "body") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "(()=>{const seen=[];class XStyled extends HTMLElement{"
@@ -652,6 +702,283 @@ static int test_gc_pacing_requires_heap_growth(void)
     return 0;
 }
 
+static size_t growth_reclaim_calls;
+static size_t growth_reclaim_count(void *opaque, size_t needed)
+{
+    (void) opaque;
+    (void) needed;
+    growth_reclaim_calls++;
+    return 0;
+}
+
+/* Growth raises the limit by the shortfall the current headroom leaves,
+   not by the whole request: 9 MiB live under a 10 MiB limit fits a 2 MiB
+   request once the limit reaches 11 MiB. A request the ceiling cannot hold
+   is refused without evicting optional caches. */
+static int test_heap_growth_uses_existing_headroom(void)
+{
+    Budget budget;
+    budget_init(&budget, 64u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://growth-headroom.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    runtime->boot_window_active = false;
+    runtime->base_memory_limit = 10u * MIB;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    script_runtime_enable_heap_growth(runtime, 11u * MIB, 4u * MIB);
+    CHECK(runtime->heap_growth_enabled);
+    /* Allocation shape: live below the limit. */
+    CHECK(js_rt_heap_growth_hook(runtime, 9u * MIB, 2u * MIB, 10u * MIB)
+          == 11u * MIB);
+    /* Reallocation shape: the pool passes only the size increase. */
+    runtime->base_memory_limit = 10u * MIB;
+    CHECK(js_rt_heap_growth_hook(runtime, 9u * MIB + 512u * 1024u, 1u * MIB,
+                                 10u * MIB) == 10u * MIB + 512u * 1024u);
+    /* Already within the limit: nothing to raise. */
+    runtime->base_memory_limit = 10u * MIB;
+    CHECK(js_rt_heap_growth_hook(runtime, 8u * MIB, 1u * MIB, 10u * MIB)
+          == 10u * MIB);
+    /* Past the ceiling: refused, and the caches are left alone. */
+    runtime->base_memory_limit = 10u * MIB;
+    growth_reclaim_calls = 0;
+    budget_set_reclaim_hook(&budget, growth_reclaim_count, NULL);
+    size_t refusals = runtime->heap_growth_refusals;
+    CHECK(js_rt_heap_growth_hook(runtime, 9u * MIB, 3u * MIB, 10u * MIB)
+          == 0u);
+    CHECK(runtime->heap_growth_refusals == refusals + 1u
+          && runtime->heap_growth_refused_reason == 2u
+          && growth_reclaim_calls == 0u);
+    budget_set_reclaim_hook(&budget, NULL, NULL);
+    /* End to end: a buffer larger than the ceiling's margin but within
+       the headroom plus that margin is admitted. */
+    JS_RunGC(runtime->runtime);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = live + 1536u * 1024u;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    script_runtime_enable_heap_growth(
+        runtime, runtime->base_memory_limit + 1u * MIB, 4u * MIB);
+    static const char big[] = "globalThis.__big=new ArrayBuffer(2097152);1";
+    JSValue kept = JS_Eval(runtime->context, big, sizeof(big) - 1u,
+                           "<growth-headroom>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(kept));
+    JS_FreeValue(runtime->context, kept);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Attribute writes are counted always but timed only for the profiler: a
+   realm without one reads no clock on this path. */
+static int test_attribute_write_timing_needs_profiler(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body><p id=p>x</p></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://attribute-timing.test/", NULL, &result);
+    CHECK(runtime != NULL && runtime->profile == NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "const p=document.getElementById('p');"
+        "for(let i=0;i<400;i++)p.setAttribute('data-n',String(i))",
+        "<attribute-timing>", &result));
+    CHECK(runtime->bridge.attribute_writes >= 400u);
+    CHECK(runtime->bridge.attribute_write_ns == 0u);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A settled realm whose growth is still in use collects for a return check
+   at a backed-off cadence, not every 256 advances forever. */
+static int test_heap_return_checks_back_off(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 2u * MIB, 4000,
+        "https://return-backoff.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    runtime->boot_window_active = false;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    script_runtime_enable_heap_growth(runtime, 24u * MIB, 4u * MIB);
+    /* Grow past the floor and keep it: nothing can be returned. */
+    static const char keep[] = "globalThis.__keep=new ArrayBuffer(6291456);1";
+    JSValue kept = JS_Eval(runtime->context, keep, sizeof(keep) - 1u,
+                           "<return-backoff>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(kept));
+    JS_FreeValue(runtime->context, kept);
+    CHECK(runtime->base_memory_limit > runtime->heap_growth_floor);
+    size_t collections = runtime->heap_collections;
+    size_t returns = runtime->heap_growth_returns;
+    for (unsigned turn = 0; turn < 4096u; turn++)
+        CHECK(script_runtime_advance(runtime, 1, 4, &result));
+    size_t checks = runtime->heap_collections - collections;
+    if (checks > 5u)
+        printf("return checks: %zu collections in 4096 advances\n", checks);
+    CHECK(runtime->heap_growth_returns == returns);
+    CHECK(checks >= 2u && checks <= 5u);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The boot-window return, collect-and-trim re-arm and the page's
+   remaining-heap probe read the allocator-maintained count: a census on
+   top of the check's collection lengthened a large settled heap's pause by
+   half again. Both outcomes of the headroom rule hold with no census. */
+static int test_heap_decisions_skip_census(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    CHECK(setenv("TILEFINCH_JS_BOOT_WINDOW_KB", "2048", 1) == 0);
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 6u * MIB, 4000,
+        "https://boot-census.test/", NULL, &result);
+    CHECK(unsetenv("TILEFINCH_JS_BOOT_WINDOW_KB") == 0);
+    CHECK(runtime != NULL && runtime->boot_window_active);
+    size_t censuses = runtime->heap_censuses;
+    size_t base = runtime->base_memory_limit;
+    size_t reserve = base / 8u;
+    JS_RunGC(runtime->runtime);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    CHECK(live + reserve + 256u * 1024u < base);
+    /* Retain just past what fits the base with its reserve. */
+    char keep[96];
+    snprintf(keep, sizeof(keep), "globalThis.__keep=new ArrayBuffer(%zu);1",
+             base - reserve - live + 256u * 1024u);
+    JSValue kept = JS_Eval(runtime->context, keep, strlen(keep),
+                           "<boot-census>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(kept));
+    JS_FreeValue(runtime->context, kept);
+    for (unsigned turn = 0; turn < 1024u && runtime->boot_window_checks == 0;
+         turn++)
+        CHECK(script_runtime_advance(runtime, 1, 4, &result));
+    CHECK(runtime->boot_window_checks == 1u && runtime->boot_window_active);
+    CHECK(budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool)
+          + reserve > base);
+    static const char drop[] = "globalThis.__keep=null;1";
+    JSValue dropped = JS_Eval(runtime->context, drop, sizeof(drop) - 1u,
+                              "<boot-census>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(dropped));
+    JS_FreeValue(runtime->context, dropped);
+    for (unsigned turn = 0; turn < 2048u && runtime->boot_window_active;
+         turn++)
+        CHECK(script_runtime_advance(runtime, 1, 4, &result));
+    CHECK(!runtime->boot_window_active
+          && runtime->boot_window_checks == 2u
+          && runtime->boot_window_returned_advance != 0);
+    CHECK(budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool)
+          + reserve <= base);
+    (void) script_runtime_collect_and_trim(runtime);
+    static const char probe[] = "__tilefinchHeapRemaining()";
+    JSValue remaining = JS_Eval(runtime->context, probe, sizeof(probe) - 1u,
+                                "<boot-census>", JS_EVAL_TYPE_GLOBAL);
+    int64_t remaining_bytes = 0;
+    CHECK(JS_ToInt64(runtime->context, &remaining_bytes, remaining) == 0);
+    JS_FreeValue(runtime->context, remaining);
+    CHECK(remaining_bytes > 0 && (size_t) remaining_bytes < base);
+    CHECK(runtime->heap_censuses == censuses);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A growable realm whose limit sits a sliver above its live graph (where
+   give-back used to leave it) must regain collection headroom from spare
+   page Budget, so garbage-heavy work stops collecting the whole heap every
+   few hundred KiB; with no spare Budget above the reserve it must not. */
+static int test_gc_pacing_pregrows_growable_heap(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://gc-headroom.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    runtime->boot_window_active = false;
+    script_runtime_enable_heap_growth(runtime, 24u * MIB, 4u * MIB);
+    CHECK(runtime->heap_growth_enabled);
+    /* A multi-MiB live graph, like a hydrated application's. */
+    static const char keep[] = "globalThis.__keep = new ArrayBuffer(4194304);";
+    JSValue kept = JS_Eval(runtime->context, keep, sizeof(keep) - 1u,
+                           "<test>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(kept));
+    JS_FreeValue(runtime->context, kept);
+    JS_RunGC(runtime->runtime);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = live + 768u * 1024u;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    CHECK(runtime->heap_growth_pregrows >= 1u);
+    CHECK(runtime->base_memory_limit >= live + live / 2u);
+    /* Garbage below the 25% pacing share: no collection. */
+    size_t collections = runtime->heap_collections;
+    static const uint8_t payload[64u * 1024u] = {0};
+    for (size_t made = 0; made + sizeof(payload) < live / 5u;
+         made += sizeof(payload)) {
+        JSValue garbage = JS_NewArrayBufferCopy(
+            runtime->context, payload, sizeof(payload));
+        CHECK(!JS_IsException(garbage));
+        JS_FreeValue(runtime->context, garbage);
+        JSValue cycle = JS_NewObject(runtime->context);
+        CHECK(!JS_IsException(cycle));
+        CHECK(JS_SetPropertyStr(runtime->context, cycle, "self",
+                  JS_DupValue(runtime->context, cycle)) >= 0);
+        JS_FreeValue(runtime->context, cycle);
+    }
+    CHECK(runtime->heap_collections == collections);
+    /* Under pressure the same state stays tight. */
+    JS_RunGC(runtime->runtime);
+    live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = live + 768u * 1024u;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    size_t spare = budget_remaining(&budget) - 4u * MIB + 256u * 1024u;
+    void *occupied = budget_malloc(&budget, spare);
+    CHECK(occupied != NULL);
+    size_t pregrows = runtime->heap_growth_pregrows;
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    CHECK(runtime->heap_growth_pregrows == pregrows);
+    CHECK(runtime->base_memory_limit == live + 768u * 1024u);
+    budget_free(&budget, occupied);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_dom_wrapper_receiver_sharing(void)
 {
     Budget budget;
@@ -669,6 +996,36 @@ static int test_dom_wrapper_receiver_sharing(void)
         &document, &budget, 5u * MIB, 4000,
         "https://wrapper-pressure.test/", NULL, &result);
     CHECK(runtime != NULL);
+    /* A forged receiver can retire its detached node from the intermediate
+       parent property lookup. Native getters must not retain that raw node
+       across author code, nor resolve a different handle on a second read. */
+    static const char retired_parent_receiver[] =
+        "(()=>{function getterFor(node,name){for(let p=node,steps=0;"
+        "p&&steps<16;p=Object.getPrototypeOf(p),steps++){"
+        "const d=Object.getOwnPropertyDescriptor(p,name);if(d)return d.get}"
+        "throw Error('missing getter')}"
+        "for(const name of ['parentNode','parentElement']){"
+        "const n=document.createElement('i'),h=n.__handle,"
+        "lease=n.__tilefinchHandleLease;let released=false,reads=0;"
+        "const receiver={get __handle(){reads++;return h}};"
+        "Object.defineProperty(receiver,'__tilefinchDetachedParent',{get(){"
+        "if(!released)released=__tilefinchReleaseNodeWrapper(h,lease);"
+        "return null}});const getter=getterFor(n,name);"
+        "if(getter.call(receiver)!==null||!released||reads<1)"
+        "throw Error('retired '+name);"
+        "if(__tilefinchReleaseNodeWrapper(h,lease))throw Error('stale lease');}"
+        "const child=document.createElement('i'),parent=document.createElement('b');"
+        "parent.append(child);if(child.parentNode!==parent||"
+        "child.parentElement!==parent)throw Error('ordinary parent');"
+        "const sentinel=Error('parent accessor'),receiver={__handle:child.__handle};"
+        "Object.defineProperty(receiver,'__tilefinchDetachedParent',"
+        "{get(){throw sentinel}});let caught=false;try{"
+        "getterFor(child,'parentNode').call(receiver)"
+        "}catch(e){caught=e===sentinel}if(!caught)throw Error('exception lost');"
+        "globalThis.pocSummary='REENTRANT-PARENT-SAFE';})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, retired_parent_receiver,
+        "<reentrant-parent-receiver>", &result)
+        && strcmp(result.summary, "REENTRANT-PARENT-SAFE") == 0);
     size_t before = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
     JSMemoryUsage wrapper_before, wrapper_after;
     JS_ComputeMemoryUsage(runtime->runtime, &wrapper_before);
@@ -868,6 +1225,147 @@ static int test_runtime_task_time_slice(void)
     return 0;
 }
 
+/* What a frame loop may start a turn for without waiting for vblank: a due
+   task, a microtask checkpoint left pending, never a frame callback. */
+static int test_task_runnable_follows_the_event_loop(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://task-runnable.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    ScriptRunnableState state;
+    CHECK(!script_runtime_task_runnable(runtime));
+    CHECK(script_runtime_runnable_state(runtime, &state) && state.timers == 0);
+    /* An animation frame is not runnable before or after its due time: it
+       waits for a rendering opportunity. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.frames=0;requestAnimationFrame(()=>frames++)",
+        "<raf>", &result));
+    CHECK(!script_runtime_task_runnable(runtime));
+    CHECK(script_runtime_advance(runtime, 20, 0, &result));
+    CHECK(script_runtime_runnable_state(runtime, &state));
+    CHECK(state.timers == 1 && state.timer_known
+          && state.timer_due_in_us <= 0 && state.timer_frame_callback);
+    CHECK(!script_runtime_task_runnable(runtime));
+    /* A due timeout behind the due frame at the head is runnable. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.behind=0;setTimeout(()=>behind++,0)", "<behind>",
+        &result));
+    CHECK(script_runtime_runnable_state(runtime, &state));
+    CHECK(state.timers == 2 && state.timer_frame_callback
+          && state.task_known && state.task_due_in_us <= 0);
+    CHECK(script_runtime_task_runnable(runtime));
+    CHECK(script_runtime_advance(runtime, 0, 4, &result));
+    CHECK(!script_runtime_task_runnable(runtime));
+    /* A due timeout is. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "setTimeout(()=>{let p=Promise.resolve();"
+        "for(let i=0;i<200;i++)p=p.then(()=>{})},0)",
+        "<timeout>", &result));
+    CHECK(script_runtime_task_runnable(runtime));
+    CHECK(script_runtime_runnable_state(runtime, &state));
+    CHECK(state.timer_known && state.timer_due_in_us <= 0
+          && !state.timer_frame_callback && !state.jobs_pending);
+    /* Its 200 chained jobs outlast one bounded checkpoint: the next turn
+       has work before any timer is due. */
+    CHECK(script_runtime_advance(runtime, 0, 4, &result));
+    CHECK(script_runtime_runnable_state(runtime, &state));
+    CHECK(state.timers == 0 && state.jobs_pending);
+    CHECK(script_runtime_task_runnable(runtime));
+    for (unsigned i = 0; i < 8 && script_runtime_task_runnable(runtime); i++)
+        CHECK(script_runtime_advance(runtime, 0, 4, &result));
+    CHECK(!script_runtime_task_runnable(runtime));
+    CHECK(script_runtime_runnable_state(runtime, &state)
+          && !state.jobs_pending);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int32_t page_int(ScriptRuntime *runtime, const char *expression)
+{
+    JSValue value = JS_Eval(runtime->context, expression, strlen(expression),
+                            "<check>", 0);
+    int32_t number = -1;
+    if (JS_ToInt32(runtime->context, &number, value) < 0) number = -1;
+    JS_FreeValue(runtime->context, value);
+    return number;
+}
+
+/* The PSP frame loop starts a turn after a 2 ms yield when page work is
+   already waiting, and after a vblank otherwise. The page's timer clock is
+   virtual there (no sampled wall clock), so early turns must move it by
+   the wall time that passed, never by a whole tick: a timeout or an
+   animation frame may not run ahead of real time while a long promise
+   chain keeps the turns short. */
+static int test_fast_turns_follow_wall_time(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://fast-turns.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(!runtime->bridge.wall_clock_timers);
+    TilefinchRuntimeClock clock = {0};
+    uint64_t wall_us = UINT64_C(1000000);
+    CHECK(script_runtime_advance(
+        runtime, tilefinch_runtime_clock_step(&clock, wall_us, 16), 2,
+        &result));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.chainDone=0;globalThis.frames=0;"
+        "globalThis.timeoutAt=-1;globalThis.turn=0;"
+        "setTimeout(()=>{timeoutAt=turn},100);"
+        "setTimeout(()=>{let p=Promise.resolve();"
+        "for(let i=0;i<1000;i++)p=p.then(()=>{});p.then(()=>{chainDone=1})},0);"
+        "const f=()=>{frames++;requestAnimationFrame(f)};"
+        "requestAnimationFrame(f)",
+        "<fast-turns>", &result));
+    uint64_t started_us = wall_us;
+    int32_t fired_turn = -1;
+    uint64_t fired_us = 0;
+    for (int32_t turn = 1; turn <= 40; turn++) {
+        wall_us += script_runtime_task_runnable(runtime)
+            ? UINT64_C(2000) : UINT64_C(16667);
+        char set_turn[48];
+        snprintf(set_turn, sizeof(set_turn), "turn=%d", (int) turn);
+        CHECK(page_int(runtime, set_turn) == turn);
+        CHECK(script_runtime_advance(
+            runtime, tilefinch_runtime_clock_step(&clock, wall_us, 16), 2,
+            &result));
+        /* Animation frames never outrun a 16 ms frame rate. */
+        CHECK((uint64_t) page_int(runtime, "frames")
+              <= (wall_us - started_us) / UINT64_C(16000) + 1u);
+        if (fired_turn < 0 && page_int(runtime, "timeoutAt") >= 0) {
+            fired_turn = page_int(runtime, "timeoutAt");
+            fired_us = wall_us;
+        }
+    }
+    /* The chain took several short turns, and the 100 ms timeout ran only
+       once 100 ms of wall time had passed. */
+    CHECK(page_int(runtime, "chainDone") == 1);
+    CHECK(fired_turn > 0);
+    CHECK(fired_us - started_us >= UINT64_C(99000));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_blank_recovery_author_work_census(void)
 {
     JSRuntime *quickjs = JS_NewRuntime();
@@ -949,12 +1447,12 @@ static bool collect_and_drain_finalizers(ScriptRuntime *runtime,
                                          ScriptResult *result)
 {
     (void) script_runtime_collect_and_trim(runtime);
-    /* QuickJS schedules FinalizationRegistry cleanup as promise jobs.  The
-       runtime intentionally bounds each checkpoint at 64 jobs, so drain a
-       few checkpoints rather than weakening that production boundary.
-       Repeat collection after cleanup jobs: newly unreachable WeakRef
+    /* Cleanup tasks have their own bounded drain after promise checkpoints.
+       Allow enough turns for the large wrapper-churn fixture without
+       weakening the production task quota. Repeat collection after tasks:
+       newly unreachable WeakRef
        targets are not guaranteed to retire in the first GC cycle. */
-    for (size_t checkpoint = 0; checkpoint < 16; checkpoint++) {
+    for (size_t checkpoint = 0; checkpoint < 64; checkpoint++) {
         if (checkpoint != 0 && checkpoint % 4 == 0)
             (void) script_runtime_collect_and_trim(runtime);
         if (!script_runtime_advance(runtime, 0, 1024, result)) return false;
@@ -1267,6 +1765,9 @@ static int test_computed_style_native_cooperation(void)
     size_t color_polls = runtime->watchdog.polls;
     JS_FreeValue(runtime->context, args[1]);
     args[1] = JS_NewString(runtime->context, "padding-left");
+    /* Retained styles survive entries into JavaScript; a host style change
+       makes each read below walk the whole chain again. */
+    document_style_changed();
     js_rt_runtime_arm_watchdog(runtime);
     measured = js_computed_style_get(runtime->context, JS_UNDEFINED, 2, args);
     CHECK(!JS_IsException(measured) && runtime->watchdog.polls == color_polls);
@@ -1284,6 +1785,7 @@ static int test_computed_style_native_cooperation(void)
     CallbackAbortCooperate probe = {0};
     TilefinchPlatformServices services = { .context = &probe,
         .cooperate = callback_abort_cooperate };
+    document_style_changed();
     js_rt_runtime_arm_watchdog(runtime);
     tilefinch_platform_set_services(&services);
     JSValue value = JS_Call(runtime->context, guarded, JS_UNDEFINED, 3, call_args);
@@ -1306,6 +1808,7 @@ static int test_computed_style_native_cooperation(void)
     JS_FreeCString(runtime->context, caught);
     JS_FreeValue(runtime->context, value);
     JS_FreeValue(runtime->context, conversion);
+    document_style_changed();
     js_rt_runtime_arm_watchdog(runtime);
     runtime->watchdog.deadline_ms = 0;
     value = js_computed_style_get(runtime->context, JS_UNDEFINED, 2, args);
@@ -1413,6 +1916,1346 @@ static int test_computed_style_memo_invalidation(void)
     return 0;
 }
 
+static JSValue test_set_container_width(JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int32_t width = 0;
+    if (argc != 1 || JS_ToInt32(context, &width, argv[0]) < 0)
+        return JS_EXCEPTION;
+    Stylesheet *sheet = (Stylesheet *) bridge->stylesheet;
+    if (width < 0) {
+        style_container_layout_state_clear(sheet);
+        return JS_UNDEFINED;
+    }
+    lxb_dom_node_t *root = find_element_id(
+        lxb_dom_interface_node(bridge->document->html), "container");
+    lxb_dom_node_t *other = find_element_id(
+        lxb_dom_interface_node(bridge->document->html), "other");
+    if (!style_container_layout_state_begin(sheet, bridge->budget, 2)
+        || !style_container_layout_state_add(
+            sheet, root, width, 100, 0, 0)
+        || !style_container_layout_state_add(sheet, other, 50, 100, 0, 0))
+        return JS_ThrowInternalError(context, "container state refused");
+    return JS_UNDEFINED;
+}
+
+static bool host_style_read(ScriptRuntime *runtime, const char *id,
+                            const char *property, const char *expected,
+                            int warm);
+
+/* Container geometry can change within one script entry without a DOM
+   mutation. Both the node memo and inherited-style cache must invalidate,
+   including the variable-resolution lease, while repeated reads stay cheap. */
+static int test_computed_style_container_cache(bool inline_units)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    char html[1024];
+    int html_length = snprintf(html, sizeof(html),
+        "<!doctype html><style>section{container-type:inline-size}"
+        ".shade{--tone:rgb(1,2,3)}p{color:var(--tone);%s}"
+        "@container (min-width:200px){.shade{--tone:rgb(4,5,6)}}"
+        "</style><body><section id=container><div class=shade>"
+        "<p id=x %s>X</p><p id=y %s>Y</p></div></section>"
+        "<section id=other><div class=shade><p id=z %s>Z</p></div></section>",
+        inline_units ? "" : "margin-left:10cqw;padding-left:calc(10cqw + 1px)",
+        inline_units ? "style='margin-left:10cqw;padding-left:calc(10cqw + 1px)'" : "",
+        inline_units ? "style='margin-left:10cqw;padding-left:calc(10cqw + 1px)'" : "",
+        inline_units ? "style='margin-left:10cqw;padding-left:calc(10cqw + 1px)'" : "");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(html_length > 0 && (size_t) html_length < sizeof(html)
+        && document_parse(&document, &budget, html, (size_t) html_length, 31)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(sheet.has_container_relative_units == !inline_units);
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+        && script_execution_policy_for_profile(
+            SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://container-cache.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    CHECK(JS_SetPropertyStr(runtime->context, global, "setContainerWidth",
+        JS_NewCFunction(runtime->context, test_set_container_width,
+            "setContainerWidth", 1)) >= 0);
+    JS_FreeValue(runtime->context, global);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const x=getComputedStyle(document.getElementById('x')),"
+        "y=getComputedStyle(document.getElementById('y')),"
+        "z=getComputedStyle(document.getElementById('z'));const r=[];"
+        "setContainerWidth(100);"
+        "r.push(x.color==='rgb(1, 2, 3)',x.marginLeft==='10px');"
+        "for(let i=0;i<12;i++)r.push(y.color===x.color,"
+        "z.marginLeft==='5px',x.marginLeft==='10px',"
+        "z.paddingLeft==='6px',x.paddingLeft==='11px');"
+        "setContainerWidth(300);"
+        "r.push(x.color==='rgb(4, 5, 6)',x.marginLeft==='30px',"
+        "y.color===x.color,y.marginLeft==='30px');"
+        "setContainerWidth(100);"
+        "r.push(x.color==='rgb(1, 2, 3)',y.marginLeft==='10px');"
+        "setContainerWidth(-1);r.push(x.color==='rgb(1, 2, 3)');"
+        "setContainerWidth(300);r.push(x.color==='rgb(4, 5, 6)',"
+        "y.marginLeft==='30px');"
+        "pocSummary=r.every(Boolean)?'CONTAINER-CACHE-OK':"
+        "r.join(',')+' sizes='+x.marginLeft+'/'+y.marginLeft})()",
+        "<computed-style-container-cache>", &result));
+    if (strcmp(result.summary, "CONTAINER-CACHE-OK") != 0)
+        fprintf(stderr, "container cache: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "CONTAINER-CACHE-OK") == 0);
+    CHECK(runtime->bridge.computed_style_cache.hits >= 12);
+    CHECK(runtime->bridge.computed_style_cache.full_clears >= 5);
+    /* Every layout pass rebuilds the container states. Identical states
+       keep retained styles across entries; changed ones do not. */
+    CHECK(host_style_read(runtime, "x", "color", "rgb(4, 5, 6)", true));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "setContainerWidth(300)", "<container-same>", &result));
+    CHECK(host_style_read(runtime, "x", "color", "rgb(4, 5, 6)", true));
+    CHECK(host_style_read(runtime, "y", "marginLeft", "30px", true));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "setContainerWidth(100)", "<container-changed>", &result));
+    CHECK(host_style_read(runtime, "x", "color", "rgb(1, 2, 3)", false));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* The focused element stays connected when a subtree holding it moves, but
+   it inherits its new ancestors' visibility: moving its ancestor under a
+   visibility:hidden container has to run the focus fixup (focus moves to
+   the body). Insertions under its ancestors that do not contain it still
+   ask nothing. */
+static int test_focus_fixup_follows_moved_subtree(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] =
+        "<!doctype html><style>.shut{visibility:hidden}</style><body>"
+        "<div id=shut class=shut></div><div id=wrap><input id=moved></div>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 31)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://focus-move.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const $=(i)=>document.getElementById(i),input=$('moved'),"
+              "wrap=$('wrap');input.focus();"
+              "const original=globalThis.getComputedStyle;"
+              "globalThis.movedReads=0;globalThis.getComputedStyle="
+              "function(target){if(target===input)globalThis.movedReads++;"
+              "return original.apply(this,arguments)};"
+              "setTimeout(()=>{document.body.appendChild("
+              "document.createElement('p'));wrap.appendChild("
+              "document.createElement('span'));wrap.append('text')},0);"
+              "setTimeout(()=>{globalThis.besideReads=movedReads;"
+              "globalThis.beforeMove=document.activeElement.id;"
+              "$('shut').appendChild(wrap)},0);"
+              "globalThis.pocSummary='queued';})()",
+              "<focus-fixup-move>", &result));
+    for (int step = 0; step < 4; step++)
+        CHECK(script_runtime_advance(runtime, 20, 64, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=[besideReads,beforeMove,"
+              "document.getElementById('moved').isConnected,"
+              "getComputedStyle(document.getElementById('moved')).visibility,"
+              "document.activeElement===document.body?'body':"
+              "String(document.activeElement.id)].join()",
+              "<focus-fixup-move-result>", &result));
+    if (strcmp(result.summary, "0,moved,true,hidden,body") != 0)
+        fprintf(stderr, "focus fixup move: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "0,moved,true,hidden,body") == 0);
+    /* The same move with the focused input inside a shadow tree, whose
+       ancestry the native chain cannot see past the shadow root. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const host=document.createElement('div');"
+              "document.body.appendChild(host);const input="
+              "document.createElement('input');input.id='inner';"
+              "host.attachShadow({mode:'open'}).appendChild(input);"
+              "input.focus();globalThis.shadowBefore=document.activeElement"
+              "===host&&host.shadowRoot.activeElement===input;"
+              "setTimeout(()=>document.getElementById('shut')"
+              ".appendChild(host),0);globalThis.pocSummary='queued';})()",
+              "<focus-fixup-shadow-move>", &result));
+    for (int step = 0; step < 4; step++)
+        CHECK(script_runtime_advance(runtime, 20, 64, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=[shadowBefore,"
+              "document.activeElement===document.body?'body':"
+              "String(document.activeElement.id||document.activeElement."
+              "tagName)].join()",
+              "<focus-fixup-shadow-move-result>", &result));
+    if (strcmp(result.summary, "true,body") != 0)
+        fprintf(stderr, "focus fixup shadow move: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "true,body") == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Reads of different elements reuse resolved ancestor styles; a class
+   change on an ancestor, an inline style on a parent, and a native change
+   between entries must each reach every descendant's inherited value. */
+static int test_computed_style_ancestor_cache(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><style>.a{color:rgb(1,2,3)}.b{color:rgb(4,5,6)}"
+        "section p{font-weight:700}.c p{font-weight:400}</style>"
+        "<body><section id=root class=a><div><div id=mid>"
+        "<p id=x>1</p><p id=y>2</p></div></div></section>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 31)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://cache.test/", &options,
+        &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const $=(i)=>document.getElementById(i),"
+              "x=getComputedStyle($('x')),y=getComputedStyle($('y')),"
+              "r=[x.color==='rgb(1, 2, 3)',y.color==='rgb(1, 2, 3)',"
+              "x.fontWeight==='700'];"
+              "$('root').className='b';"
+              "r.push(y.color==='rgb(4, 5, 6)',x.color==='rgb(4, 5, 6)');"
+              "$('root').classList.add('c');"
+              "r.push(x.fontWeight==='400',y.fontWeight==='400');"
+              "$('mid').style.color='rgb(7, 8, 9)';"
+              "r.push(x.color==='rgb(7, 8, 9)',y.color==='rgb(7, 8, 9)');"
+              "globalThis.pocSummary=r.every(Boolean)?'CACHE-OK':"
+              "'CACHE:'+r})()",
+              "<computed-style-cache>", &result)
+          && strcmp(result.summary, "CACHE-OK") == 0);
+    /* The second element's chain came from the cache. */
+    CHECK(runtime->bridge.computed_style_cache.hits != 0);
+    size_t probes_before = runtime->bridge.computed_style_cache.lookup_probes;
+    size_t hits_before = runtime->bridge.computed_style_cache.hits;
+    uint64_t read_started = tilefinch_platform_monotonic_time_ns();
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const host=document.getElementById('mid'),a=[];"
+        "for(let i=0;i<120;i++){const p=document.createElement('p');"
+        "host.appendChild(p);a.push(p)}"
+        "for(let pass=0;pass<4;pass++){"
+        "for(let i=0;i<120;i++)if(getComputedStyle(a[i]).color!=="
+        "'rgb(7, 8, 9)')throw Error('evicted style');"
+        "for(let i=0;i<1000;i++)if(getComputedStyle(a[80+i%40]).color!=="
+        "'rgb(7, 8, 9)')throw Error('indexed style');"
+        "host.style.color=pass%2?'rgb(7,8,9)':'rgb(10,11,12)';"
+        "for(let i=0;i<120;i++)if(getComputedStyle(a[i]).color!=="
+        "(pass%2?'rgb(7, 8, 9)':'rgb(10, 11, 12)'))throw Error('stale style');"
+        "host.style.color='rgb(7,8,9)'}pocSummary='INDEXED-STYLE-OK'})()",
+        "<computed-style-index>", &result));
+    CHECK(strcmp(result.summary, "INDEXED-STYLE-OK") == 0);
+    size_t probes = runtime->bridge.computed_style_cache.lookup_probes
+        - probes_before;
+    size_t hits = runtime->bridge.computed_style_cache.hits - hits_before;
+    printf("computed-style index: probes=%zu hits=%zu us=%llu\n", probes, hits,
+           (unsigned long long) ((tilefinch_platform_monotonic_time_ns()
+                                   - read_started) / 1000u));
+    CHECK(hits > 4000 && probes < hits * 8u);
+    /* A native class change between entries, as the parser might make. */
+    lxb_dom_node_t *root = find_element_id(
+        lxb_dom_interface_node(document.html), "root");
+    CHECK(root != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=getComputedStyle("
+              "document.getElementById('y')).color",
+              "<computed-style-cache-before>", &result)
+          && strcmp(result.summary, "rgb(7, 8, 9)") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "document.getElementById('mid').style.color='';"
+              "globalThis.pocSummary=getComputedStyle("
+              "document.getElementById('x')).color",
+              "<computed-style-cache-inline-cleared>", &result)
+          && strcmp(result.summary, "rgb(4, 5, 6)") == 0);
+    lxb_dom_element_set_attribute(
+        lxb_dom_interface_element(root), (const lxb_char_t *) "class", 5,
+        (const lxb_char_t *) "a", 1);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=getComputedStyle("
+              "document.getElementById('y')).color",
+              "<computed-style-cache-after>", &result)
+          && strcmp(result.summary, "rgb(1, 2, 3)") == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* The script split (script_split.h) charges the bridge natives page script
+   calls to their kinds, through the ordinary native call path: computed
+   styles, DOM queries (global natives and the querySelector methods),
+   mutations and first-call compiles of lazy bodies; the rest is JS. */
+static int test_script_split_attributes_bridge_work(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><style>.a{color:rgb(1,2,3)}</style>"
+        "<body><section id=root class=a><p id=x>1</p><p id=y>2</p>"
+        "</section>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 31)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://split.test/", &options,
+        &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(script_split_enabled());
+    ScriptSplitTotals before, after, delta;
+    script_split_snapshot(&before);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const x=document.getElementById('x'),r=[];"
+              "for(let i=0;i<3;i++)"
+              "r.push(getComputedStyle(x).color==='rgb(1, 2, 3)');"
+              "r.push(document.querySelectorAll('p').length===2,"
+              "x.querySelector('b')===null,"
+              "x.closest('section')===document.getElementById('root'),"
+              "x.matches('p'));"
+              "x.setAttribute('data-k','1');"
+              /* A body long enough to be compiled lazily on first call. */
+              "const f=new Function('a','let s=0;'+"
+              "'for(let i=0;i<a.length;i++){s+=a.charCodeAt(i)*31;}'.repeat(40)"
+              "+'return s');r.push(f('ab')>0);"
+              "globalThis.pocSummary=r.every(Boolean)?'SPLIT-OK':"
+              "'SPLIT:'+r})()",
+              "<script-split>", &result)
+          && strcmp(result.summary, "SPLIT-OK") == 0);
+    script_split_snapshot(&after);
+    script_split_difference(&after, &before, &delta);
+    printf("script split: js=%llu style=%llu/%llu query=%llu/%llu "
+           "mutate=%llu/%llu compile=%llu/%llu\n",
+           (unsigned long long) delta.us[SCRIPT_SPLIT_JS],
+           (unsigned long long) delta.us[SCRIPT_SPLIT_STYLE],
+           (unsigned long long) delta.calls[SCRIPT_SPLIT_STYLE],
+           (unsigned long long) delta.us[SCRIPT_SPLIT_QUERY],
+           (unsigned long long) delta.calls[SCRIPT_SPLIT_QUERY],
+           (unsigned long long) delta.us[SCRIPT_SPLIT_MUTATE],
+           (unsigned long long) delta.calls[SCRIPT_SPLIT_MUTATE],
+           (unsigned long long) delta.us[SCRIPT_SPLIT_COMPILE],
+           (unsigned long long) delta.calls[SCRIPT_SPLIT_COMPILE]);
+    CHECK(delta.calls[SCRIPT_SPLIT_STYLE] >= 3);
+    CHECK(delta.calls[SCRIPT_SPLIT_QUERY] >= 4);
+    CHECK(delta.calls[SCRIPT_SPLIT_MUTATE] >= 1);
+    /* The engine's lazy-compile hook: new Function's body is compiled on
+       its first call, inside the script. */
+    CHECK(delta.calls[SCRIPT_SPLIT_COMPILE] >= 1);
+    CHECK(delta.calls[SCRIPT_SPLIT_FETCH] == 0);
+    CHECK(delta.us[SCRIPT_SPLIT_JS] > 0);
+    /* Leaving script leaves nothing open. */
+    CHECK(script_split_current() == SCRIPT_SPLIT_KIND_COUNT);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Mutations between reads in one script drop only the cached styles they
+   can change: siblings (sibling combinators, structural pseudo-classes),
+   :has() subjects, and custom properties must still see every change; long
+   class lists match through the token index, and past its capacity through
+   the plain scan. */
+static int test_computed_style_scoped_invalidation(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html), "%s",
+        "<!doctype html><style>"
+        ".on + .next{color:rgb(1,1,1)}"
+        "li:last-child{color:rgb(2,2,2)}"
+        ".box:has(.hot){color:rgb(3,3,3)}"
+        ":root{--c:rgb(4,4,4)}.theme{--c:rgb(5,5,5)}.use{color:var(--c)}"
+        ".k97{color:rgb(6,6,6)}.long-token-name-z{color:rgb(7,7,7)}"
+        "[data-open] .dt{color:rgb(9,9,9)}"
+        "</style><body><div id=dwrap><p id=dt class=dt>d</p></div>"
+        "<div id=pair><p id=first>a</p>"
+        "<p id=second class=next>b</p></div>"
+        "<ul id=list><li id=l1>1</li><li id=l2>2</li></ul>"
+        "<div id=box class=box><span id=kid>k</span></div>"
+        "<section id=wrap><div id=mid><p id=user class=use>u</p></div>"
+        "</section><p id=long class='");
+    for (unsigned i = 0; i < 12u; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "filler-class-%u ", i);
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+                              "long-token-name-z'>l</p><p id=many class='");
+    for (unsigned i = 0; i < 100u; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "k%u ", i);
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+                              "'>m</p></body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 31)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://scoped.test/", &options,
+        &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const $=(i)=>document.getElementById(i),"
+              "c=(i)=>getComputedStyle($(i)).color,r=[];"
+              "r.push(c('second')!=='rgb(1, 1, 1)');"
+              "$('first').className='on';"
+              "r.push(c('second')==='rgb(1, 1, 1)');"
+              "r.push(c('l2')==='rgb(2, 2, 2)',c('l1')!=='rgb(2, 2, 2)');"
+              "const l3=document.createElement('li');$('list').append(l3);"
+              "r.push(c('l2')!=='rgb(2, 2, 2)');"
+              "r.push(c('box')!=='rgb(3, 3, 3)');"
+              "$('kid').className='hot';"
+              "r.push(c('box')==='rgb(3, 3, 3)');"
+              "r.push(c('user')==='rgb(4, 4, 4)');"
+              "$('wrap').className='theme';"
+              "r.push(c('user')==='rgb(5, 5, 5)');"
+              "$('mid').style.setProperty('--c','rgb(8, 8, 8)');"
+              "r.push(c('user')==='rgb(8, 8, 8)');"
+              "$('mid').style.removeProperty('--c');"
+              "r.push(c('user')==='rgb(5, 5, 5)');"
+              "r.push(c('long')==='rgb(7, 7, 7)',c('many')==='rgb(6, 6, 6)');"
+              "$('many').classList.remove('k97');"
+              "r.push(c('many')!=='rgb(6, 6, 6)');"
+              "globalThis.pocSummary=r.every(Boolean)?'SCOPED-OK':"
+              "'SCOPED:'+r.map((v,i)=>v?'':i).filter(String).join(',')})()",
+              "<computed-style-scoped>", &result));
+    if (strcmp(result.summary, "SCOPED-OK") != 0)
+        printf("scoped: %s %s\n", result.summary, result.error);
+    CHECK(strcmp(result.summary, "SCOPED-OK") == 0);
+    /* A data-* attribute no selector tests keeps the cached chain; one a
+       selector tests restyles. */
+    size_t misses_before = runtime->bridge.computed_style_cache.misses;
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=getComputedStyle("
+              "document.getElementById('dt')).color",
+              "<computed-style-data-cold>", &result)
+          && strcmp(result.summary, "rgb(9, 9, 9)") != 0);
+    size_t cold_misses =
+        runtime->bridge.computed_style_cache.misses - misses_before;
+    misses_before = runtime->bridge.computed_style_cache.misses;
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const wrap=document.getElementById('dwrap'),"
+              "dt=document.getElementById('dt'),first=getComputedStyle(dt)"
+              ".color;for(let i=0;i<5;i++){wrap.setAttribute('data-note',"
+              "String(i));document.documentElement.setAttribute('data-state',"
+              "String(i));if(getComputedStyle(dt).color!==first)"
+              "throw Error('unreferenced data attribute restyled')}"
+              "globalThis.pocSummary=first})()",
+              "<computed-style-data-unreferenced>", &result)
+          && strcmp(result.summary, "rgb(9, 9, 9)") != 0);
+    /* The chain read cold above survives the entry and every write. */
+    CHECK(cold_misses != 0
+          && runtime->bridge.computed_style_cache.misses == misses_before);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const wrap=document.getElementById('dwrap'),"
+              "dt=document.getElementById('dt'),before=getComputedStyle(dt)"
+              ".color;wrap.setAttribute('data-open','');const open="
+              "getComputedStyle(dt).color;wrap.removeAttribute('data-open');"
+              "globalThis.pocSummary=before!=='rgb(9, 9, 9)'&&open==="
+              "'rgb(9, 9, 9)'&&getComputedStyle(dt).color===before?"
+              "'DATA-OK':'DATA:'+[before,open]})()",
+              "<computed-style-data-referenced>", &result)
+          && strcmp(result.summary, "DATA-OK") == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A runtime over `html` with its stylesheet built and attached, kept by
+   the caller for cache checks between evaluations. */
+static ScriptRuntime *var_cache_runtime(Budget *budget, PocDocument *document,
+                                        Stylesheet *sheet, const char *html)
+{
+    if (!document_parse(document, budget, html, strlen(html), 31)
+        || !stylesheet_build(sheet, budget, document, 480)) return NULL;
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    if (!viewport_context_init(&viewport, 480, 272, 480, 272)
+        || !script_execution_policy_for_profile(
+            SCRIPT_EXECUTION_PROFILE_LAB, &policy)) return NULL;
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        document, budget, 6u * MIB, 4000, "https://varcache.test/", &options,
+        &result);
+    if (runtime != NULL) script_runtime_set_stylesheet(runtime, sheet);
+    return runtime;
+}
+
+static bool var_cache_eval(ScriptRuntime *runtime, const char *script,
+                           const char *expected)
+{
+    ScriptResult result = {0};
+    if (!script_runtime_evaluate_diagnostic(runtime, script,
+                                            "<computed-style-var-cache>",
+                                            &result)
+        || strcmp(result.summary, expected) != 0) {
+        printf("var cache: expected %s got %s %s\n", expected,
+               result.summary, result.error);
+        return false;
+    }
+    return true;
+}
+
+static bool count_style_layout_flush(void *opaque)
+{
+    (*(size_t *) opaque)++;
+    return false;
+}
+
+/* Names the computed-style getter answers without the element's cascade:
+   one nothing registers (the page reads scroll-margin-block-start; the
+   script falls back to the inline declaration) and custom properties,
+   which come from custom-property rules. Values are unchanged; the
+   cascade miss counter proves no element was resolved. */
+static int test_computed_style_reads_without_cascade(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>:root{--tone: rgb(1, 2, 3)}"
+        ".a{--gap: calc(var(--unit) * 2);--unit:4px}"
+        ".a::before{--mark:'x';content:var(--mark)}"
+        "p{color:var(--tone)}</style><body><div class=a>"
+        "<p id=x style='scroll-margin-block-start: 5px'>1</p>"
+        "<svg><rect id=r fill=red width=1 height=1></rect></svg></div>");
+    CHECK(runtime != NULL);
+    size_t misses = runtime->bridge.computed_style_cache.misses;
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const x=document.getElementById('x'),s=getComputedStyle(x),"
+        "b=getComputedStyle(x.parentElement,'::before');"
+        "pocSummary=[s.getPropertyValue('scroll-margin-block-start'),"
+        "s.getPropertyValue('--tone'),s.getPropertyValue('--gap'),"
+        "s.getPropertyValue('--missing'),b.getPropertyValue('--mark'),"
+        "s.getPropertyValue('no-such-property')].join('|')})()",
+        "5px|rgb(1, 2, 3)|calc(4px * 2)||'x'|"));
+    CHECK(runtime->bridge.computed_style_cache.misses == misses);
+    /* Registered properties and SVG presentation attributes still resolve
+       through the cascade. */
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=getComputedStyle(document.getElementById('x')).color+'|'"
+        "+getComputedStyle(document.getElementById('r')).fill",
+        "rgb(1, 2, 3)|red"));
+    CHECK(runtime->bridge.computed_style_cache.misses > misses);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Misses a script's reads of `id`'s color cost, and whether it reads
+   `expected`. */
+static bool sibling_scope_read(ScriptRuntime *runtime, const char *id,
+                               const char *expected, size_t *misses)
+{
+    char source[256];
+    snprintf(source, sizeof(source),
+             "pocSummary=getComputedStyle(document.getElementById('%s'))"
+             ".color", id);
+    size_t before = runtime->bridge.computed_style_cache.misses;
+    bool ok = var_cache_eval(runtime, source, expected);
+    *misses = runtime->bridge.computed_style_cache.misses - before;
+    return ok;
+}
+
+/* Changes that sibling and positional tests (and :has()) let reach other
+   elements drop those elements' own cached styles; their descendants are
+   checked against the parents' fresh styles, so an unchanged sibling keeps
+   its subtree's chain (layout's reuse cache does the same). Everything a
+   change can restyle still reads fresh: a sibling test reaching
+   descendants, a custom property a sibling or positional rule sets, a
+   :has() subject, and siblings an :empty test reaches. */
+static int test_computed_style_sibling_scopes(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>"
+        ".on + .other{color:rgb(1,1,1)}"
+        ".on + .deep-host .deep{color:rgb(2,2,2)}"
+        ".on + .var-host{--c:rgb(3,3,3)}.var-use{color:var(--c,rgb(9,9,9))}"
+        "li:first-child{color:rgb(4,4,4)}"
+        ".first-var:first-child{--f:rgb(5,5,5)}.f-use{color:var(--f,rgb(8,8,8))}"
+        ".box:has(.hot){color:rgb(6,6,6)}"
+        ".e:empty + .after{color:rgb(7,7,7)}"
+        "</style><body>"
+        "<main><div id=a></div>"
+        "<div id=b><div><div><div><p id=far>x</p></div></div></div></div>"
+        "</main><section><div id=a2></div>"
+        "<div id=h class=deep-host><p id=dp class=deep>d</p></div>"
+        "<div id=v><p id=vp class=var-use>v</p></div></section>"
+        "<ul id=list><li id=l1>1</li><li id=l2><span id=l2s>s</span></li>"
+        "</ul>"
+        "<div id=fl><div id=fv class=first-var><p id=fu class=f-use>f</p>"
+        "</div></div>"
+        "<div class=box id=box><i id=kid>k</i></div>"
+        "<section><div id=e class=e></div><p id=after class=after>t</p>"
+        "</section></body>");
+    CHECK(runtime != NULL);
+    size_t misses = 0;
+    /* Warm the chains. */
+    CHECK(sibling_scope_read(runtime, "far", "rgb(0, 0, 0)", &misses));
+    CHECK(sibling_scope_read(runtime, "dp", "rgb(0, 0, 0)", &misses));
+    CHECK(sibling_scope_read(runtime, "vp", "rgb(9, 9, 9)", &misses));
+    CHECK(sibling_scope_read(runtime, "l2s", "rgb(0, 0, 0)", &misses));
+    CHECK(sibling_scope_read(runtime, "fu", "rgb(5, 5, 5)", &misses));
+    CHECK(sibling_scope_read(runtime, "after", "rgb(7, 7, 7)", &misses));
+    /* A sibling test that matches nothing new: #b and <main> restyle
+       unchanged, #far's chain below them holds. The parent's whole
+       subtree used to go (four more cascades). A test reaching
+       descendants concerns only <section>'s children. */
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('a').className='on';pocSummary='ok'", "ok"));
+    CHECK(sibling_scope_read(runtime, "far", "rgb(0, 0, 0)", &misses));
+    CHECK(misses <= 2);
+    /* What the change does restyle reads fresh. */
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('a2').className='on';pocSummary='ok'",
+        "ok"));
+    CHECK(sibling_scope_read(runtime, "dp", "rgb(2, 2, 2)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('v').className='var-host';pocSummary='ok'",
+        "ok"));
+    CHECK(sibling_scope_read(runtime, "vp", "rgb(9, 9, 9)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('v').before(document.getElementById('a2'));"
+        "pocSummary='ok'", "ok"));
+    CHECK(sibling_scope_read(runtime, "vp", "rgb(3, 3, 3)", &misses));
+    /* Positions: an insertion before the first item restyles l2's
+       subtree only through l2's own style; a positional custom-property
+       rule restyles its element's subtree. */
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('list').prepend("
+        "document.createElement('li'));pocSummary='ok'", "ok"));
+    CHECK(sibling_scope_read(runtime, "l2s", "rgb(0, 0, 0)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('l1').remove();"
+        "document.getElementById('list').firstElementChild.remove();"
+        "pocSummary='ok'", "ok"));
+    CHECK(sibling_scope_read(runtime, "l2s", "rgb(4, 4, 4)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('fl').prepend(document.createElement('b'));"
+        "pocSummary='ok'", "ok"));
+    CHECK(sibling_scope_read(runtime, "fu", "rgb(8, 8, 8)", &misses));
+    /* A :has() answer far from #far drops the subject, not every style. */
+    CHECK(sibling_scope_read(runtime, "far", "rgb(0, 0, 0)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('kid').className='hot';pocSummary='ok'",
+        "ok"));
+    CHECK(sibling_scope_read(runtime, "box", "rgb(6, 6, 6)", &misses));
+    CHECK(sibling_scope_read(runtime, "far", "rgb(0, 0, 0)", &misses));
+    CHECK(misses <= 1);
+    /* An element's :empty read by a sibling test restyles its sibling
+       (the parent's subtree used to be all that went). */
+    CHECK(sibling_scope_read(runtime, "after", "rgb(7, 7, 7)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('e').append('x');pocSummary='ok'", "ok"));
+    CHECK(sibling_scope_read(runtime, "after", "rgb(0, 0, 0)", &misses));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('e').textContent='';pocSummary='ok'",
+        "ok"));
+    CHECK(sibling_scope_read(runtime, "after", "rgb(7, 7, 7)", &misses));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A section replacement detaches the page's document, destroys its tree
+   wholesale (no per-node removal reaches the removal listener) and binds
+   the next one. getComputedStyle's retained styles held the old tree's
+   node addresses; the next mutation note followed them into freed memory
+   (a nondeterministic crash in experimental-section-link-activation).
+   Detaching must forget every retained node. */
+static int test_computed_style_forgets_detached_document(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument first = {0}, second = {0};
+    Stylesheet first_sheet = {0}, second_sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &first, &first_sheet,
+        "<!doctype html><style>.on{color:rgb(1,2,3)}</style><body>"
+        "<main><div id=a class=on><p id=p>x</p></div><div id=b></div>"
+        "</main></body>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=getComputedStyle(document.getElementById('p')).color+"
+        "getComputedStyle(document.getElementById('a')).color",
+        "rgb(1, 2, 3)rgb(1, 2, 3)"));
+    lxb_dom_node_t *root = lxb_dom_interface_node(first.html);
+    lxb_dom_node_t *held[] = {find_element_id(root, "a"),
+                              find_element_id(root, "p")};
+    for (size_t i = 0; i < 2; i++)
+        CHECK(held[i] != NULL
+              && js_rt_bridge_computed_style_cache_holds(&runtime->bridge,
+                                                         held[i]));
+    script_runtime_detach_document(runtime, &first);
+    for (size_t i = 0; i < 2; i++)
+        CHECK(!js_rt_bridge_computed_style_cache_holds(&runtime->bridge,
+                                                       held[i]));
+    stylesheet_destroy(&first_sheet);
+    document_destroy(&first);
+    /* The next document: a mutation note and fresh reads touch only it. */
+    static const char next_html[] =
+        "<!doctype html><style>.on{color:rgb(4,5,6)}</style><body>"
+        "<section><div id=a><p id=p>y</p></div></section></body>";
+    CHECK(document_parse(&second, &budget, next_html, strlen(next_html), 31));
+    CHECK(stylesheet_build(&second_sheet, &budget, &second, 480));
+    ScriptResult result = {0};
+    CHECK(script_runtime_rebind_document(runtime, &second, &result));
+    script_runtime_set_stylesheet(runtime, &second_sheet);
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('a').setAttribute('class','on');"
+        "pocSummary=getComputedStyle(document.getElementById('p')).color",
+        "rgb(4, 5, 6)"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&second_sheet);
+    document_destroy(&second);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_inline_style_scoped_invalidation(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>.watch:has(.hot){color:red}"
+        "#other{color:rgb(1,2,3)}#child{color:var(--tone,blue)}</style>"
+        "<body><div class=watch><span id=edit><i id=child>c</i></span></div>"
+        "<section><span id=other>o</span></section></body>");
+    CHECK(runtime != NULL);
+    size_t full_before = runtime->bridge.computed_style_cache.full_clears;
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const edit=document.getElementById('edit'),"
+        "child=document.getElementById('child'),other=document.getElementById('other');"
+        "for(let i=0;i<8;i++){if(getComputedStyle(other).color!=='rgb(1, 2, 3)')"
+        "throw Error('other');edit.style.setProperty('--tone',i%2?'red':'blue');"
+        "if(getComputedStyle(child).color!==(i%2?'rgb(255, 0, 0)':'rgb(0, 0, 255)'))"
+        "throw Error('inherit');}pocSummary='INLINE-SCOPED-OK'})()",
+        "INLINE-SCOPED-OK"));
+    /* Only the cold cache starts empty. Unrelated :has() selectors must not
+       turn each CSSOM property write into whole-document invalidation. */
+    printf("inline-style cache: full=%zu scoped=%zu misses=%zu\n",
+           runtime->bridge.computed_style_cache.full_clears - full_before,
+           runtime->bridge.computed_style_cache.scoped_clears,
+           runtime->bridge.computed_style_cache.misses);
+    CHECK(runtime->bridge.computed_style_cache.full_clears - full_before == 1);
+    CHECK(!runtime->bridge.mutations.relational_selector_sensitive);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+
+    /* Separate sheets: a plain [style] dependency must not accidentally
+       make the escaped-name case pass by invalidating on its behalf. */
+    for (unsigned escaped = 0; escaped < 2; escaped++) {
+        char html[320];
+        snprintf(html, sizeof(html),
+            "<!doctype html><style>.watch{color:blue}"
+            ".watch:has([%s*='red']){color:red}</style>"
+            "<body><div class=watch id=watch><span id=edit>x</span></div></body>",
+            escaped ? "s\\74 yle" : "style");
+        runtime = var_cache_runtime(&budget, &document, &sheet, html);
+        CHECK(runtime != NULL);
+        CHECK(var_cache_eval(runtime,
+        "(()=>{const p=document.getElementById('watch'),e=document.getElementById('edit');"
+        "if(getComputedStyle(p).color!=='rgb(0, 0, 255)')throw Error('initial');"
+        "e.style.color='red';if(getComputedStyle(p).color!=='rgb(255, 0, 0)')"
+        "throw Error('style selector');e.style.removeProperty('color');"
+        "if(getComputedStyle(p).color!=='rgb(0, 0, 255)')throw Error('remove');"
+        "pocSummary='INLINE-RELATIONAL-OK'})()", "INLINE-RELATIONAL-OK"));
+        CHECK(runtime->bridge.mutations.relational_selector_sensitive);
+        script_runtime_destroy(runtime);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+void style_test_inject_focus_marker_remove_failures(size_t count);
+
+/* One read of #id's `property` in its own entry into JavaScript. It must
+   print `expected`; `warm` says it must be served from retained styles (no
+   cascade miss), 0 that it must cascade again, -1 either. */
+static bool host_style_read(ScriptRuntime *runtime, const char *id,
+                            const char *property, const char *expected,
+                            int warm)
+{
+    char source[192];
+    snprintf(source, sizeof(source),
+             "globalThis.pocSummary=getComputedStyle("
+             "document.getElementById('%s')).%s", id, property);
+    size_t misses = runtime->bridge.computed_style_cache.misses;
+    ScriptResult result = {0};
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime, source, "<host-style-read>", &result);
+    size_t missed = runtime->bridge.computed_style_cache.misses - misses;
+    bool ok = evaluated && strcmp(result.summary, expected) == 0
+        && (warm < 0 || (missed == 0) == (warm != 0));
+    if (!ok)
+        printf("host style read #%s.%s: got '%s' want '%s' misses=%zu "
+               "warm=%d %s\n", id, property, result.summary, expected,
+               missed, (int) warm, result.error);
+    return ok;
+}
+
+static bool host_style_set_attribute(lxb_dom_node_t *node, const char *name,
+                                     const char *value)
+{
+    return node != NULL && lxb_dom_element_set_attribute(
+        lxb_dom_interface_element(node), (const lxb_char_t *) name,
+        strlen(name), (const lxb_char_t *) value, strlen(value)) != NULL;
+}
+
+/* Computed styles are retained across entries into JavaScript. A host turn
+   that changes no style input keeps them; each host-side input drops them:
+   native attribute writes (controller checked state, a focus marker a
+   probe fails to restore), stylesheet loads, colour-scheme and viewport
+   changes, native removal (which also evicts the node), and animation
+   steps. Host writes to detached trees, the focus probe and script's own
+   journaled writes leave the host generation alone. */
+static int test_computed_style_host_generation(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>#a{color:rgb(1,2,3)}.hot #a{color:rgb(4,5,6)}"
+        "#a:focus{color:rgb(7,7,7)}#check:checked+#label{color:rgb(9,9,9)}"
+        "#list p:last-child{color:rgb(8,8,8)}"
+        "@media (max-width:300px){#wrap #a{color:rgb(3,3,3)}}</style>"
+        "<body><div id=wrap><span id=a>a</span></div>"
+        "<input type=checkbox id=check><span id=label>l</span>"
+        "<div id=list><p id=first>1</p><p id=second>2</p></div>"
+        "<div id=stage><div id=fade>f</div></div></body>");
+    CHECK(runtime != NULL);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *a = find_element_id(root, "a");
+    lxb_dom_node_t *wrap = find_element_id(root, "wrap");
+    lxb_dom_node_t *check = find_element_id(root, "check");
+    lxb_dom_node_t *first = find_element_id(root, "first");
+    CHECK(a != NULL && wrap != NULL && check != NULL && first != NULL);
+    ScriptResult result = {0};
+
+    /* Survives entries and an empty host turn. */
+    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", false));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", true));
+    CHECK(script_runtime_advance(runtime, 16, 8, &result));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", true));
+
+    /* A detached construction tree (as for an SVG raster clone) and the
+       focus-state probe, which restores its marker, change nothing. */
+    lxb_dom_element_t *loose = lxb_dom_document_create_element(
+        &document.html->dom_document, (const lxb_char_t *) "div", 3, NULL);
+    lxb_dom_element_t *loose_child = lxb_dom_document_create_element(
+        &document.html->dom_document, (const lxb_char_t *) "i", 1, NULL);
+    CHECK(loose != NULL && loose_child != NULL
+          && host_style_set_attribute(lxb_dom_interface_node(loose),
+                                      "class", "hot")
+          && lxb_dom_node_append_child(lxb_dom_interface_node(loose),
+                 lxb_dom_interface_node(loose_child))
+             == LXB_DOM_EXCEPTION_OK);
+    lxb_dom_node_destroy_deep(lxb_dom_interface_node(loose));
+    ComputedStyle normal, focused;
+    (void) style_focus_change_classify(&sheet, a, NULL, &normal, &focused);
+    CHECK(document_attribute(a, "data-tilefinch-focus", &(size_t){0})
+          == NULL);
+    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", true));
+
+    /* A probe that cannot restore the marker leaves the element focused. */
+    style_test_inject_focus_marker_remove_failures(3);
+    CHECK(style_focus_change_classify(&sheet, a, NULL, &normal, &focused)
+          == STYLE_FOCUS_CHANGE_UNSAFE);
+    style_test_inject_focus_marker_remove_failures(0);
+    CHECK(host_style_read(runtime, "a", "color", "rgb(7, 7, 7)", false));
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(a),
+              (const lxb_char_t *) "data-tilefinch-focus",
+              sizeof("data-tilefinch-focus") - 1u) == LXB_STATUS_OK);
+    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", false));
+
+    /* Native attribute writes: an ancestor class, as the parser or reader
+       mode make, and the checked attribute the controller toggles. */
+    CHECK(host_style_set_attribute(wrap, "class", "hot"));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(4, 5, 6)", false));
+    CHECK(host_style_read(runtime, "label", "color", "rgb(0, 0, 0)", false));
+    CHECK(host_style_read(runtime, "label", "color", "rgb(0, 0, 0)", true));
+    CHECK(host_style_set_attribute(check, "checked", ""));
+    CHECK(host_style_read(runtime, "label", "color", "rgb(9, 9, 9)", false));
+
+    /* A stylesheet load. */
+    static const char loaded[] = "#wrap #a{color:rgb(5,5,5)}";
+    CHECK(stylesheet_add_css(&sheet, loaded, sizeof(loaded) - 1u));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(5, 5, 5)", false));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(5, 5, 5)", true));
+
+    /* A colour-scheme change reaches the generation before any rebuild;
+       a viewport change rebuilds the sheet in place. */
+    uint64_t generation = document_style_generation();
+    bool dark = stylesheet_prefers_dark_color_scheme();
+    stylesheet_set_prefers_dark_color_scheme(!dark);
+    CHECK(document_style_generation() != generation);
+    stylesheet_set_prefers_dark_color_scheme(dark);
+    CHECK(host_style_read(runtime, "a", "color", "rgb(5, 5, 5)", false));
+    stylesheet_destroy(&sheet);
+    CHECK(stylesheet_build(&sheet, &budget, &document, 240));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(3, 3, 3)", false));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(3, 3, 3)", true));
+
+    /* Native removal evicts the node before its address can be reused. */
+    CHECK(host_style_read(runtime, "first", "color", "rgb(0, 0, 0)", false));
+    CHECK(host_style_read(runtime, "second", "color", "rgb(8, 8, 8)",
+                          false));
+    CHECK(js_rt_bridge_computed_style_cache_holds(&runtime->bridge, first));
+    lxb_dom_node_destroy_deep(first);
+    CHECK(!js_rt_bridge_computed_style_cache_holds(&runtime->bridge, first));
+    CHECK(host_style_read(runtime, "second", "color", "rgb(8, 8, 8)",
+                          false));
+
+    /* Animation steps are script writes the host drives: each step
+       restyles the animated element and nothing else. */
+    CHECK(host_style_read(runtime, "a", "color", "rgb(3, 3, 3)", false));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "document.getElementById('fade').animate([{opacity:'0'},"
+        "{opacity:'1'}],{duration:64,iterations:1});"
+        "globalThis.pocSummary=getComputedStyle("
+        "document.getElementById('fade')).opacity",
+        "<host-style-animate>", &result));
+    char before[32];
+    snprintf(before, sizeof(before), "%s", result.summary);
+    CHECK(script_runtime_advance(runtime, 32, 8, &result));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.pocSummary=getComputedStyle("
+        "document.getElementById('fade')).opacity",
+        "<host-style-animate-step>", &result));
+    if (strcmp(result.summary, before) == 0)
+        printf("animation step: opacity stayed %s\n", before);
+    CHECK(strcmp(result.summary, before) != 0);
+    CHECK(host_style_read(runtime, "a", "color", "rgb(3, 3, 3)", true));
+
+    /* Script's own writes are journaled, not host changes. */
+    generation = document_style_generation();
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const list=document.getElementById('list'),"
+        "i=document.createElement('i');list.appendChild(i);"
+        "i.setAttribute('class','x');i.style.color='red';i.textContent='t';"
+        "list.insertBefore(document.createElement('b'),i);"
+        "list.firstChild.remove();list.innerHTML+='<u>u</u>';"
+        "document.getElementById('label').removeAttribute('id');"
+        "globalThis.pocSummary='SCRIPT-WRITES'})()",
+        "<host-style-script-writes>", &result)
+          && strcmp(result.summary, "SCRIPT-WRITES") == 0);
+    CHECK(document_style_generation() == generation);
+
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The streaming parser is a host style input: a sibling it appends ends an
+   earlier element's :last-child match between two entries. */
+static int test_computed_style_parser_insertion(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char head[] =
+        "<!doctype html><style>p{color:rgb(1,1,1)}"
+        "p:last-child{color:rgb(2,2,2)}</style><body><div id=list>"
+        "<p id=a>a</p>";
+    static const char tail[] = "<p id=b>b</p></div></body>";
+    DocumentParser parser = {0};
+    CHECK(document_parser_begin(&parser, &budget)
+          && document_parser_feed(&parser, head, sizeof(head) - 1u));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &parser.document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &parser.document, &budget, 6u * MIB, 4000, "https://parse.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(host_style_read(runtime, "a", "color", "rgb(2, 2, 2)", false));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(2, 2, 2)", true));
+    CHECK(document_parser_feed(&parser, tail, sizeof(tail) - 1u));
+    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 1, 1)", false));
+    CHECK(host_style_read(runtime, "b", "color", "rgb(2, 2, 2)", false));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_parser_abort(&parser);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The engine's own host paths, end to end: a committed page's retained
+   styles survive runtime advances, and follow controller focus moves, a
+   checkbox activation, contenteditable typing and a form value edit. */
+static int test_computed_style_controller_host_changes(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char page[] =
+        "<!doctype html><style>#check:checked+#label{color:rgb(9,9,9)}"
+        "#field:focus{color:rgb(4,5,6)}#edit:empty{color:rgb(1,1,1)}"
+        "#other{color:rgb(7,7,7)}</style><body>"
+        "<p id=other>other</p><form><input type=checkbox id=check>"
+        "<span id=label>label</span><input id=field value=a></form>"
+        "<div id=edit contenteditable></div></body>";
+    static NavigationSession navigation;
+    CHECK(navigation_init(&navigation, &budget, 2));
+    navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+    uint64_t generation = navigation_begin(&navigation);
+    CHECK(navigation_commit_html(&navigation, generation,
+              "https://host-style.test/", page, strlen(page), 480,
+              NULL, NULL, true));
+    ScriptRuntime *runtime = navigation.page.runtime;
+    CHECK(runtime != NULL);
+    lxb_dom_node_t *root =
+        lxb_dom_interface_node(navigation.page.document.html);
+    lxb_dom_node_t *check = find_element_id(root, "check");
+    lxb_dom_node_t *field = find_element_id(root, "field");
+    lxb_dom_node_t *edit = find_element_id(root, "edit");
+    CHECK(check != NULL && field != NULL && edit != NULL);
+    CHECK(host_style_read(runtime, "other", "color", "rgb(7, 7, 7)", false));
+    CHECK(host_style_read(runtime, "label", "color", "rgb(0, 0, 0)", false));
+    CHECK(host_style_read(runtime, "edit", "color", "rgb(1, 1, 1)", false));
+    for (int frame = 0; frame < 3; frame++)
+        CHECK(navigation_advance_runtime(&navigation, 16, 8));
+    CHECK(host_style_read(runtime, "other", "color", "rgb(7, 7, 7)", true));
+    CHECK(host_style_read(runtime, "label", "color", "rgb(0, 0, 0)", true));
+
+    BrowserController controller;
+    ControllerAction action;
+    CHECK(controller_init(&controller, &navigation));
+    /* Activation: the controller writes the checked attribute natively. */
+    CHECK(controller_focus_node(&controller, check)
+          && controller_activate(&controller, &action));
+    CHECK(host_style_read(runtime, "label", "color", "rgb(9, 9, 9)", false));
+    /* A focus move reaches :focus through the page's focus handling. */
+    CHECK(host_style_read(runtime, "field", "color", "rgb(0, 0, 0)", false));
+    CHECK(controller_focus_node(&controller, field));
+    CHECK(host_style_read(runtime, "field", "color", "rgb(4, 5, 6)", false));
+    /* A form value is no style input. */
+    CHECK(host_style_read(runtime, "other", "color", "rgb(7, 7, 7)", -1));
+    CHECK(host_style_read(runtime, "other", "color", "rgb(7, 7, 7)", true));
+    CHECK(controller_insert_text(&controller, "b", 1));
+    CHECK(host_style_read(runtime, "other", "color", "rgb(7, 7, 7)", true));
+    /* Typing into contenteditable replaces its children natively. */
+    CHECK(controller_focus_node(&controller, edit)
+          && controller_insert_text(&controller, "x", 1));
+    CHECK(host_style_read(runtime, "edit", "color", "rgb(0, 0, 0)", false));
+    navigation_destroy(&navigation);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_device_answer_checkpoint(void)
+{
+    char probe[1025];
+    FILE *file = fopen(TILEFINCH_TEST_SOURCE_DIR
+        "/tests/input-scripts/chatgpt-ask.until.js", "rb");
+    CHECK(file != NULL);
+    size_t length = fread(probe, 1, sizeof(probe) - 1, file);
+    CHECK(!ferror(file) && fgetc(file) == EOF);
+    CHECK(fclose(file) == 0 && length <= 1024);
+    probe[length] = '\0';
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body><div data-message-role=assistant>"
+        "<h4>Assistant said:</h4><div role=status>Waiting</div>"
+        "<div id=answer data-assistant-markdown></div></div></body>");
+    CHECK(runtime != NULL);
+    char source[1400];
+    int size = snprintf(source, sizeof(source),
+        "globalThis.__tfMark='sent';globalThis.answerReady=function(){%s};"
+        "pocSummary=String(answerReady())", probe);
+    CHECK(size > 0 && (size_t) size < sizeof(source));
+    CHECK(var_cache_eval(runtime, source, "false"));
+    /* A supervisor can advance past a live MARK before its page diagnostic
+       runs. The second wait must not accept the still-ready home composer
+       merely because __tfMark has not reached 'sent' yet. */
+    CHECK(var_cache_eval(runtime,
+        "globalThis.__tfMark='hook';"
+        "document.documentElement.dataset.octaneHomeBehaviorReady='1';"
+        "pocSummary=String(answerReady())", "true"));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=String(answerReady())", "false"));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('answer').textContent='   ';"
+        "pocSummary=String(answerReady())", "false"));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('answer').textContent='Hello';"
+        "pocSummary=String(answerReady())", "true"));
+    /* Received content can still be behind an author presentation gate.
+       Never certify the reply checkpoint while its turn remains hidden. */
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('answer').parentElement.hidden=true;"
+        "pocSummary=String(answerReady())", "false"));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('answer').parentElement.hidden=false;"
+        "pocSummary=String(answerReady())", "true"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_computed_style_keywords_without_layout(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>.on{position:relative;overflow:clip;"
+        "box-sizing:border-box;z-index:7;display:flex;flex-direction:column;"
+        "flex-wrap:wrap;align-items:center;align-self:center;"
+        "align-content:center;justify-content:center;order:3}</style>"
+        "<body><div id=p>x</div></body>");
+    CHECK(runtime != NULL);
+    size_t flushes = 0;
+    bool dirty = false;
+    runtime->bridge.relayout_dirty = &dirty;
+    script_runtime_set_synchronous_layout_callback(runtime,
+        count_style_layout_flush, &flushes);
+    CHECK(var_cache_eval(runtime,
+        "globalThis.p=document.getElementById('p');"
+        "globalThis.cs=getComputedStyle(p);p.className='on';"
+        "pocSummary=[cs.position,cs.overflowX,cs.overflowY,cs.overflow,"
+        "cs.boxSizing,cs.zIndex,cs.flexDirection,cs.flexWrap,cs.alignItems,"
+        "cs.alignSelf,cs.alignContent,cs.justifyContent,cs.order].join('|')",
+        "relative|clip|clip|clip|border-box|7|column|wrap|center|center|center|center|3"));
+    CHECK(dirty && flushes == 0);
+    /* Separate live declarations share their traps, never their state. */
+    CHECK(var_cache_eval(runtime,
+        "globalThis.other=document.createElement('div');"
+        "document.body.append(other);globalThis.otherStyle=getComputedStyle(other);"
+        "globalThis.styles=[];pocSummary='WARM'", "WARM"));
+    JSMemoryUsage before, after;
+    JS_ComputeMemoryUsage(runtime->runtime, &before);
+    CHECK(var_cache_eval(runtime,
+        "for(let i=0;i<100;i++)styles.push(getComputedStyle(i%2?p:other));"
+        "pocSummary='WRAPPERS'", "WRAPPERS"));
+    JS_ComputeMemoryUsage(runtime->runtime, &after);
+    printf("computed-style wrappers: bytes=%lld\n",
+        (long long) (after.memory_used_size - before.memory_used_size));
+    /* One target, proxy and state per result, not six fresh trap closures. */
+    CHECK(after.memory_used_size - before.memory_used_size < 64 * 1024);
+    CHECK(var_cache_eval(runtime,
+        "if(cs===styles[1]||styles[0].position!=='static'||"
+        "styles[1].position!=='relative')throw Error('shared style state');"
+        "other.className='on';if(otherStyle.position!=='relative')"
+        "throw Error('not live');other.remove();"
+        "if(Object.keys(otherStyle).length||!Object.keys(cs).length||"
+        "!('0' in cs)||('0' in otherStyle))throw Error('shared enumeration');"
+        "pocSummary='STATE-OK'", "STATE-OK"));
+    CHECK(var_cache_eval(runtime, "pocSummary=cs.width", "auto"));
+    CHECK(flushes != 0);
+    flushes = 0;
+    runtime->bridge.mutations.conservative_resource_scan = true;
+    CHECK(var_cache_eval(runtime, "pocSummary=cs.position", "relative"));
+    CHECK(flushes != 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* getComputedStyle's var() table is created by the first read that
+   resolves a var() against a sheet declaring custom properties: plain
+   pages (even with var() fallbacks) never allocate it, and mutation-time
+   clears stay no-ops. Once created it serves repeated reads and still
+   sees custom-property changes through inline style and class changes. */
+static int test_computed_style_var_cache_on_demand(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>p{color:rgb(1,2,3)}"
+        ".f{color:var(--missing, rgb(9, 9, 9))}</style><body>"
+        "<div id=wrap><p id=a>a</p><p id=b class=f>b</p></div></body>");
+    CHECK(runtime != NULL);
+    __typeof__(runtime->bridge.computed_style_cache) *cache =
+        &runtime->bridge.computed_style_cache;
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const $=(i)=>document.getElementById(i),"
+        "c=(i)=>getComputedStyle($(i)).color,r=[];"
+        "r.push(c('a')==='rgb(1, 2, 3)',c('b')==='rgb(9, 9, 9)');"
+        "$('a').className='x';$('wrap').append(document.createElement('p'));"
+        "r.push(c('a')==='rgb(1, 2, 3)',c('b')==='rgb(9, 9, 9)');"
+        "globalThis.pocSummary=r.every(Boolean)?'PLAIN-OK':"
+        "'PLAIN:'+r.map((v,i)=>v?'':i).filter(String).join(',')})()",
+        "PLAIN-OK"));
+    CHECK(cache->entries != NULL && cache->hits != 0);
+    CHECK(cache->variables.cache == NULL && cache->variables.creations == 0
+          && cache->variables.clears == 0);
+    CHECK(style_variable_cache_lease_bytes(&cache->variables) == 0);
+    CHECK(js_rt_bridge_computed_style_cache_bytes(&runtime->bridge) != 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+
+    document = (PocDocument) {0};
+    sheet = (Stylesheet) {0};
+    runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>:root{--c:rgb(4,4,4)}.alt{--c:rgb(5,5,5)}"
+        ".use{color:var(--c)}p{color:rgb(1,2,3)}</style><body>"
+        "<section id=wrap><p id=plain>p</p><div id=mid>"
+        "<p id=u1 class=use>1</p><p id=u2 class=use>2</p></div></section>"
+        "</body>");
+    CHECK(runtime != NULL);
+    cache = &runtime->bridge.computed_style_cache;
+    /* Custom properties alone allocate nothing until a var() resolves. */
+    CHECK(var_cache_eval(runtime,
+        "globalThis.pocSummary=getComputedStyle("
+        "document.getElementById('plain')).color",
+        "rgb(1, 2, 3)"));
+    CHECK(cache->variables.cache == NULL && cache->variables.creations == 0);
+    /* One task: the caches live under one validity (a new evaluation
+       may start a new epoch), so the sibling's lookup reuses the chain. */
+    CHECK(var_cache_eval(runtime,
+        "globalThis.pocSummary=[getComputedStyle("
+        "document.getElementById('u1')).color,getComputedStyle("
+        "document.getElementById('u2')).color].join()",
+        "rgb(4, 4, 4),rgb(4, 4, 4)"));
+    CHECK(cache->variables.cache != NULL && cache->variables.creations == 1);
+    CHECK(style_variable_cache_lease_bytes(&cache->variables) != 0);
+    CHECK(cache->variables.hits != 0);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const $=(i)=>document.getElementById(i),"
+        "c=(i)=>getComputedStyle($(i)).color,r=[];"
+        "document.documentElement.style.setProperty('--c','rgb(8, 8, 8)');"
+        "r.push(c('u1')==='rgb(8, 8, 8)',c('u2')==='rgb(8, 8, 8)');"
+        "$('wrap').className='alt';"
+        "r.push(c('u1')==='rgb(5, 5, 5)',c('u2')==='rgb(5, 5, 5)');"
+        "$('mid').style.setProperty('--c','rgb(6, 6, 6)');"
+        "r.push(c('u2')==='rgb(6, 6, 6)');"
+        "$('mid').style.removeProperty('--c');$('wrap').className='';"
+        "r.push(c('u1')==='rgb(8, 8, 8)');"
+        "globalThis.pocSummary=r.every(Boolean)?'VAR-OK':"
+        "'VAR:'+r.map((v,i)=>v?'':i).filter(String).join(',')})()",
+        "VAR-OK"));
+    CHECK(cache->variables.creations == 1 && cache->variables.clears != 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_native_dynamic_code_policy(void)
 {
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
@@ -1507,6 +3350,47 @@ static int test_native_dynamic_code_policy(void)
     return 0;
 }
 
+/* A connected element moved under a detached parent (a framework parking
+   a subtree in a fragment) left the page: the journal records the removal
+   it is, classified before the move, not an unclassified change of the old
+   parent that forces the whole-document resource scan. */
+static int test_detached_move_is_a_removal(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><div id=a><span id=s>Text</span></div>"
+        "<div id=b><span id=t>More</span></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000, "https://mutation.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    ScriptMutationJournal journal;
+    (void) script_runtime_consume_mutations(runtime, &journal);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "var parked=document.createElement('div');"
+        "parked.appendChild(document.getElementById('s'));"
+        "parked.insertBefore(document.getElementById('t'),null);",
+        "<detached-move>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    size_t removals = 0;
+    for (size_t i = 0; i < journal.count; i++) {
+        const ScriptMutationRecord *record = &journal.records[i];
+        CHECK(record->kind != SCRIPT_MUTATION_UNKNOWN);
+        if (record->kind == SCRIPT_MUTATION_CHILD_LIST && record->node != NULL
+            && record->scope != NULL) removals++;
+    }
+    CHECK(removals == 2 && !journal.conservative_resource_scan
+          && !journal.overflowed);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_coalesced_attribute_tokens(void)
 {
     Budget budget;
@@ -1531,12 +3415,28 @@ static int test_coalesced_attribute_tokens(void)
     CHECK(record != NULL && record->changed_tokens_exact);
     bool first = false, second = false;
     for (size_t i = 0; i < record->changed_token_count; i++) {
-        first |= record->changed_tokens[i] == stylesheet_identity_token_hash(false, "first", 5);
-        second |= record->changed_tokens[i] == stylesheet_identity_token_hash(false, "second", 6);
+        const uint32_t *tokens = script_mutation_record_tokens(&journal, record);
+        first |= tokens[i] == stylesheet_identity_token_hash(false, "first", 5);
+        second |= tokens[i] == stylesheet_identity_token_hash(false, "second", 6);
     }
     CHECK(first && second);
+    /* An atomic-CSS swap of dozens of classes stays exact... */
     CHECK(script_runtime_evaluate_diagnostic(runtime,
-        "p.className='small';p.className='a b c d e f g h i j k l m n o p q r s t';",
+        "p.className='';", "<reset-token-probe>", &result));
+    (void) script_runtime_consume_mutations(runtime, &journal);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.className=Array.from({length:40},(_, i)=>'x'+i).join(' ');"
+        "p.className=Array.from({length:40},(_, i)=>'x'+(i+10)).join(' ');",
+        "<coalesced-atomic-swap>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    record = NULL;
+    for (size_t i = 0; i < journal.count; i++)
+        if (strcmp(journal.records[i].attribute, "class") == 0) record = &journal.records[i];
+    CHECK(record != NULL && record->changed_tokens_exact
+          && record->changed_token_count == 50);
+    /* ...but a record never holds more than the per-record limit. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.className='small';p.className=Array.from({length:70},(_, i)=>'y'+i).join(' ');",
         "<coalesced-token-overflow>", &result));
     CHECK(script_runtime_consume_mutations(runtime, &journal));
     for (size_t i = 0; i < journal.count; i++)
@@ -1546,7 +3446,7 @@ static int test_coalesced_attribute_tokens(void)
         "p.className='';", "<reset-token-probe>", &result));
     (void) script_runtime_consume_mutations(runtime, &journal);
     CHECK(script_runtime_evaluate_diagnostic(runtime,
-        "for(let i=0;i<12;i++)p.className='token'+i;",
+        "for(let i=0;i<70;i++)p.className='token'+i;",
         "<coalesced-union-overflow>", &result));
     CHECK(script_runtime_consume_mutations(runtime, &journal));
     record = NULL;
@@ -1554,7 +3454,689 @@ static int test_coalesced_attribute_tokens(void)
         if (strcmp(journal.records[i].attribute, "class") == 0) record = &journal.records[i];
     CHECK(record != NULL && !record->changed_tokens_exact
           && record->changed_token_count == 0);
+    /* The shared pool is bounded: once a turn has spent it, later class
+       changes are recorded inexact (conservative), never truncated. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.className='';for(let e=0;e<20;e++){const d=document.createElement('div');"
+        "document.body.appendChild(d);}",
+        "<pool-setup>", &result));
+    (void) script_runtime_consume_mutations(runtime, &journal);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "document.querySelectorAll('div').forEach((d,e)=>{"
+        "d.className=Array.from({length:60},(_, i)=>'z'+e+'_'+i).join(' ');});",
+        "<pool-exhaustion>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    size_t exact = 0, inexact = 0;
+    for (size_t i = 0; i < journal.count; i++) {
+        if (strcmp(journal.records[i].attribute, "class") != 0) continue;
+        if (journal.records[i].changed_tokens_exact) {
+            exact++;
+            CHECK(journal.records[i].changed_token_count == 60
+                  && journal.records[i].changed_token_offset + 60u
+                         <= SCRIPT_MUTATION_TOKEN_POOL);
+        } else {
+            inexact++;
+        }
+    }
+    CHECK(exact == SCRIPT_MUTATION_TOKEN_POOL / 60u && exact + inexact == 20
+          && journal.token_count <= SCRIPT_MUTATION_TOKEN_POOL);
+    /* This is a renderer invalidation journal, not MutationObserver's
+       author-visible record queue. Long names share a conservative prefix
+       dependency and must not consume a slot on every repeated write. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=0;i<300;i++){"
+        "p.setAttribute('data-long-render-dependency-attribute-one',String(i));"
+        "p.setAttribute('data-long-render-dependency-attribute-two',String(i));}",
+        "<long-attribute-coalescing>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    CHECK(!journal.overflowed && journal.count == 1);
+    CHECK(strlen(journal.records[0].attribute)
+          == SCRIPT_MUTATION_ATTRIBUTE_LIMIT - 1u);
+    CHECK(!journal.records[0].changed_tokens_exact);
     script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static ScriptRuntime *host_state_runtime(Budget *budget, PocDocument *document,
+                                         ScriptResult *result)
+{
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    if (!document_parse(document, budget, html, sizeof(html) - 1u, 17)
+        || !viewport_context_init(&viewport, 480, 272, 480, 272)
+        || !script_execution_policy_for_profile(
+            SCRIPT_EXECUTION_PROFILE_LAB, &policy)) return NULL;
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true,
+        .allow_test_network_primitive_overrides = true };
+    return script_runtime_create_configured(
+        document, budget, 6u * MIB, 4000, "https://host-state.test/",
+        &options, result);
+}
+
+static bool host_state_eval(ScriptRuntime *runtime, const char *source,
+                            const char *expected, ScriptResult *result)
+{
+    if (script_runtime_evaluate_diagnostic(runtime, source, "<host-state>",
+                                           result)
+        && strcmp(result->summary, expected) == 0) return true;
+    fprintf(stderr, "host state: expected %s got %s %s\n", expected,
+            result->summary, result->error);
+    return false;
+}
+
+/* Advances the scheduler clock by `ms` in either mode: the elapsed argument
+   drives the caller-driven wheel, the platform clock the sampled one. */
+static bool host_state_step(ScriptRuntime *runtime, TimedCooperate *clock,
+                            unsigned ms, ScriptResult *result)
+{
+    clock->now_ns += (uint64_t) ms * UINT64_C(1000000);
+    return script_runtime_advance(runtime, ms, 16, result);
+}
+
+/* The event loop answers "is a timer due" from the wheel size, head and
+   clock scheduler.js publishes in host_state, and flushes page scroll only
+   when the published flag is set. A timer must still run on the exact turn
+   it falls due, a zero-delay chain within one turn, and a hidden page must
+   still pass over its due frame timer to a due author timer. */
+static int test_host_state_timers_and_scroll(bool sampled_clock)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    TimedCooperate clock = { .now_ns = UINT64_C(1000000000) };
+    TilefinchPlatformServices services = {
+        .context = &clock, .monotonic_time_ns = timed_cooperate_clock,
+        .cooperate = timed_cooperate_poll
+    };
+    tilefinch_platform_set_services(&services);
+    script_runtime_configure_wall_clock_timers(sampled_clock);
+    PocDocument document;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = host_state_runtime(&budget, &document, &result);
+    CHECK(runtime != NULL);
+    const double *state = runtime->host_state;
+    CHECK(state[SCRIPT_HOST_STATE_SAMPLED_CLOCK] == (sampled_clock ? 1 : 0));
+    CHECK(host_state_eval(runtime,
+        "globalThis.log=[];setTimeout(()=>log.push('t30'),30);"
+        "globalThis.pocSummary=[typeof __tilefinchHostChannel,"
+        "typeof __tilefinchPendingWork].join()",
+        "undefined,undefined", &result));
+    CHECK(runtime->pending_timer_tasks == 1 && result.pending_tasks == 1
+          && state[SCRIPT_HOST_STATE_TIMERS] == 1);
+    CHECK(host_state_step(runtime, &clock, 29, &result)
+          && host_state_eval(runtime, "pocSummary=log.join()", "", &result));
+    CHECK(host_state_step(runtime, &clock, 1, &result)
+          && host_state_eval(runtime, "pocSummary=log.join()", "t30", &result)
+          && runtime->pending_timer_tasks == 0
+          && state[SCRIPT_HOST_STATE_TIMERS] == 0);
+
+    CHECK(host_state_eval(runtime,
+        "setTimeout(()=>{log.push('a');setTimeout(()=>log.push('b'),0)},0);"
+        "pocSummary=''", "", &result));
+    CHECK(host_state_step(runtime, &clock, 0, &result)
+          && host_state_eval(runtime, "pocSummary=log.join()", "t30,a,b",
+                             &result));
+
+    CHECK(host_state_eval(runtime,
+        "requestAnimationFrame(()=>log.push('raf'));"
+        "setTimeout(()=>log.push('t20'),20);pocSummary=''", "", &result));
+    CHECK(script_runtime_set_page_visibility(runtime, false)
+          && host_state_step(runtime, &clock, 20, &result)
+          && host_state_eval(runtime, "pocSummary=log.join()",
+                             "t30,a,b,t20", &result)
+          && runtime->pending_timer_tasks == 1);
+    CHECK(script_runtime_set_page_visibility(runtime, true)
+          && host_state_step(runtime, &clock, 0, &result)
+          && host_state_eval(runtime, "pocSummary=log.join()",
+                             "t30,a,b,t20,raf", &result));
+
+    CHECK(host_state_eval(runtime,
+        "log.length=0;globalThis.iv=setInterval(()=>log.push('i'),10);"
+        "setTimeout(()=>log.push('late'),1000);pocSummary=''", "",
+        &result));
+    for (int i = 0; i < 3; i++)
+        CHECK(host_state_step(runtime, &clock, 10, &result));
+    CHECK(host_state_eval(runtime, "pocSummary=log.join()", "i,i,i",
+                          &result)
+          && runtime->pending_timer_tasks == 2);
+    CHECK(host_state_eval(runtime, "clearInterval(iv);pocSummary=''", "",
+                          &result)
+          && runtime->pending_timer_tasks == 1
+          && state[SCRIPT_HOST_STATE_TIMERS] == 1);
+    CHECK(host_state_eval(runtime,
+        "for(let id=1;id<64;id++)clearTimeout(id);pocSummary=''", "",
+        &result)
+          && runtime->pending_timer_tasks == 0
+          && state[SCRIPT_HOST_STATE_EARLIEST_DUE] == INFINITY);
+
+    CHECK(host_state_eval(runtime,
+        "globalThis.scrolls=0;addEventListener('scroll',()=>scrolls++);"
+        "visualViewport.addEventListener('scroll',()=>scrolls++);"
+        "pocSummary=''", "", &result)
+          && state[SCRIPT_HOST_STATE_SCROLL_PENDING] == 0);
+    CHECK(script_runtime_set_page_scroll(runtime, 40)
+          && state[SCRIPT_HOST_STATE_SCROLL_PENDING] == 1
+          && host_state_eval(runtime, "pocSummary=scrolls+':'+scrollY",
+                             "0:40", &result));
+    CHECK(host_state_step(runtime, &clock, 0, &result)
+          && state[SCRIPT_HOST_STATE_SCROLL_PENDING] == 0
+          && host_state_step(runtime, &clock, 0, &result)
+          && host_state_eval(runtime, "pocSummary=String(scrolls)", "2",
+                             &result));
+    CHECK(script_runtime_set_page_scroll(runtime, 40)
+          && state[SCRIPT_HOST_STATE_SCROLL_PENDING] == 0);
+
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    script_runtime_configure_wall_clock_timers(false);
+    tilefinch_platform_set_services(NULL);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static bool host_state_network_matches(ScriptRuntime *runtime,
+                                       ScriptResult *result)
+{
+    char expected[256];
+    snprintf(expected, sizeof(expected), "%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu",
+             result->async_network_logical_admitted,
+             result->async_network_logical_completed,
+             result->async_network_logical_rejected,
+             result->async_network_logical_cancelled,
+             result->async_network_logical_timed_out,
+             result->async_network_logical_peak,
+             result->async_network_logical_peak_bytes,
+             result->async_network_active_native,
+             result->async_network_pending_logical);
+    return host_state_eval(runtime,
+        "{const s=__tilefinchNetworkQueueStats;pocSummary=[s.admitted,"
+        "s.completed,s.rejected,s.cancelled,s.timedOut,s.peakCount,"
+        "s.peakBytes,s.active,s.waiting].join()}", expected, result);
+}
+
+/* The result snapshot and the pending-work count read the plain records
+   behind the network-queue and IndexedDB stat views. Every reported field
+   must equal the view the page-side diagnostics read. */
+static int test_host_state_network_and_indexeddb_stats(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = host_state_runtime(&budget, &document, &result);
+    CHECK(runtime != NULL && JS_IsObject(runtime->host_network_queue_stats)
+          && JS_IsUndefined(runtime->host_indexed_db_stats));
+    CHECK(host_state_eval(runtime,
+        "let nextNative=5000;globalThis.__tilefinchFetchAsync=()=>nextNative++;"
+        "globalThis.__tilefinchCancelNetwork=()=>true;"
+        "globalThis.aborts=[];for(let i=0;i<6;i++){const c=new AbortController;"
+        "aborts.push(c);fetch('https://host-state.test/w/'+i,{signal:"
+        "c.signal}).catch(()=>{});}pocSummary=''", "", &result));
+    CHECK(script_runtime_advance(runtime, 0, 16, &result));
+    CHECK(result.async_network_active_native == 4
+          && result.async_network_pending_logical == 2
+          && runtime->pending_network_tasks == 2
+          && result.pending_tasks >= 2
+          && host_state_network_matches(runtime, &result));
+    CHECK(host_state_eval(runtime,
+        "for(const c of aborts)c.abort();pocSummary=''", "", &result)
+          && script_runtime_advance(runtime, 0, 16, &result)
+          && result.async_network_pending_logical == 0
+          && result.async_network_logical_cancelled == 6
+          && runtime->pending_network_tasks == 0
+          && host_state_network_matches(runtime, &result));
+
+    static const char indexeddb_probe[] =
+        "(async()=>{const request=r=>new Promise((ok,fail)=>{r.onsuccess="
+        "()=>ok(r.result);r.onerror=()=>fail(r.error);});"
+        "const opening=indexedDB.open('host-state',1);opening.onupgradeneeded="
+        "()=>opening.result.createObjectStore('items');"
+        "const db=await request(opening),tx=db.transaction('items',"
+        "'readwrite');await request(tx.objectStore('items').put("
+        "'x'.repeat(100),1));await new Promise(ok=>tx.oncomplete=ok);"
+        "db.close();const s=__tilefinchIndexedDBStats;"
+        "pocSummary='IDB:'+[s.opens,s.deletes,s.transactions,s.requests,"
+        "s.records,s.bytes,s.peakBytes,s.quotaErrors].join()+':'+"
+        "typeof __tilefinchHostChannel;})().catch(error=>{pocSummary="
+        "'IDB-ERROR:'+error})";
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_probe, "<host-state-idb>", &result));
+    for (size_t tick = 0; tick < 16
+         && strncmp(result.summary, "IDB", 3) != 0; tick++)
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    char expected[256];
+    snprintf(expected, sizeof(expected),
+             "IDB:%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu:undefined",
+             result.indexed_db_opens, result.indexed_db_deletes,
+             result.indexed_db_transactions, result.indexed_db_requests,
+             result.indexed_db_records, result.indexed_db_bytes,
+             result.indexed_db_peak_bytes, result.indexed_db_quota_errors);
+    if (strcmp(result.summary, expected) != 0)
+        fprintf(stderr, "host state idb: %s != %s\n", result.summary,
+                expected);
+    CHECK(strcmp(result.summary, expected) == 0
+          && JS_IsObject(runtime->host_indexed_db_stats)
+          && result.indexed_db_opens == 1 && result.indexed_db_records == 1
+          && result.indexed_db_bytes > 0);
+
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* URLSearchParams and URL setters convert through Web IDL USVString: a lone
+   surrogate becomes U+FFFD and a valid pair is kept. The conversion is
+   checked against the specification's per-code-unit algorithm on fixed
+   cases and on every string of up to four units over a surrogate-heavy
+   alphabet, and through the public APIs that use it. */
+static int test_usv_string_conversion(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = host_state_runtime(&budget, &document, &result);
+    CHECK(runtime != NULL);
+    static const char probe[] =
+        "{const reference=text=>{let out='';for(let i=0;i<text.length;i++){"
+        "const u=text.charCodeAt(i);if(u>=0xd800&&u<=0xdbff){const n=i+1<"
+        "text.length?text.charCodeAt(i+1):0;if(n>=0xdc00&&n<=0xdfff){"
+        "out+=text[i]+text[i+1];i++;continue;}out+='\\ufffd';}else if(u>="
+        "0xdc00&&u<=0xdfff)out+='\\ufffd';else out+=text[i];}return out;},"
+        "convert=value=>{const p=new URLSearchParams;p.append(value,'');"
+        "return p.keys().next().value;},failures=[];"
+        "const fixed=[['a\\ud800b','a\\ufffdb'],['a\\udc00b','a\\ufffdb'],"
+        "['\\ud83d\\ude00','\\ud83d\\ude00'],['\\udc00\\ud800',"
+        "'\\ufffd\\ufffd'],['\\ud800\\ud83d\\ude00\\udc00x',"
+        "'\\ufffd\\ud83d\\ude00\\ufffdx'],['\\ud800','\\ufffd'],"
+        "['\\udbff','\\ufffd'],['',''],['plain','plain'],"
+        "['caf\\u00e9\\uffff','caf\\u00e9\\uffff']];"
+        "for(const [input,want] of fixed)if(convert(input)!==want)"
+        "failures.push('fixed:'+escape(input));"
+        "const units=['a','\\u00e9','\\ud800','\\udbff','\\udc00','\\udfff',"
+        "'\\ud83d','\\ude00','\\uffff'];let checked=0;"
+        "const walk=(prefix,depth)=>{if(convert(prefix)!==reference(prefix))"
+        "failures.push('walk:'+escape(prefix));checked++;if(depth===4)return;"
+        "for(const unit of units)walk(prefix+unit,depth+1);};walk('',0);"
+        "const params=new URLSearchParams([['k\\ud800','v\\udc00']]);"
+        "params.set('s\\ud83d\\ude00','\\ud83d');"
+        "const surface=[params.get('k\\ud800'),params.has('k\\ufffd'),"
+        "params.toString(),convert(12),convert(null),convert(undefined),"
+        "convert({toString(){return 'o\\udfff'}})];"
+        "const url=new URL('https://host-state.test/');"
+        "url.pathname='/p\\ud800';url.search='?q=\\udc00';"
+        "url.hash='h\\ud83d\\ude00\\ud800';surface.push(url.href);"
+        "const want=['v\\ufffd',true,'k%EF%BF%BD=v%EF%BF%BD&s%F0%9F%98%80="
+        "%EF%BF%BD','12','null','undefined','o\\ufffd','https://host-state."
+        "test/p%EF%BF%BD?q=%EF%BF%BD#h%F0%9F%98%80%EF%BF%BD'];"
+        "surface.forEach((value,index)=>{if(value!==want[index])"
+        "failures.push('surface'+index+':'+escape(String(value)));});"
+        "pocSummary=failures.length?failures.slice(0,4).join('|'):"
+        "'USV-OK:'+checked;}";
+    CHECK(host_state_eval(runtime, probe, "USV-OK:7381", &result));
+    /* ASCII query components already are their UTF-8 decoding. Pin the
+       work bound: the decoder must not materialize one array item per byte.
+       This counter is scoped to construction; the ordinary entry-list push
+       remains visible and is allowed. */
+    static const char ascii_probe[] =
+        "{const text='value'.repeat(2048),push=Array.prototype.push;"
+        "let calls=0,params;Array.prototype.push=function(...values){"
+        "calls++;return Reflect.apply(push,this,values)};try{params="
+        "new URLSearchParams('plain='+text+'&second=a+b')}finally{"
+        "Array.prototype.push=push}pocSummary=params.get('plain')===text&&"
+        "params.get('second')==='a b'&&calls<=4?'URL-ASCII-OK':"
+        "'URL-ASCII-FAILED:'+calls;}";
+    CHECK(host_state_eval(runtime, ascii_probe, "URL-ASCII-OK", &result));
+    static const char url_decode_probe[] =
+        "{const cases=[['q=plain+words','plain words'],['q=%41%2b+A','A+ A'],"
+        "['q=%E2%82A','\\ufffdA'],['q=%GG%','%GG%'],['q=caf\\u00e9',"
+        "'caf\\u00e9'],['q=\\ud83d\\ude00','\\ud83d\\ude00'],"
+        "['q=\\ud800','\\ufffd'],['q=\\u0000\\u007f','\\u0000\\u007f']],"
+        "bad=cases.filter(pair=>new URLSearchParams(pair[0]).get('q')!==pair[1]);"
+        "const cap=256*1024,plain='a'.repeat(cap);let refused='';"
+        "const boundary=new URLSearchParams('q='+plain).get('q')===plain;"
+        "try{new URLSearchParams('q='+plain+'a')}catch(error){refused=error.name}"
+        "pocSummary=!bad.length&&boundary&&refused==='RangeError'?"
+        "'URL-DECODE-BOUNDS-OK':'URL-DECODE-BOUNDS-FAILED:'+"
+        "[bad.length,boundary,refused].join(',');}";
+    CHECK(host_state_eval(runtime, url_decode_probe,
+                          "URL-DECODE-BOUNDS-OK", &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The node-handle table has SCRIPT_DOM_HANDLE_SLOT_CAPACITY slots, and a
+   slot is released only when its wrapper is finalized, which normally waits
+   for a job checkpoint. A single synchronous script that creates more
+   unreferenced wrappers than the table holds must reclaim the dead ones at
+   exhaustion; one that genuinely retains them all must get a clean
+   RangeError from the DOM API, and the realm must recover once they drop. */
+static bool handle_table_eval(ScriptRuntime *runtime, const char *source,
+                              const char *expected, ScriptResult *result)
+{
+    if (script_runtime_evaluate_diagnostic(runtime, source,
+                                           "<handle-table>", result)
+        && strcmp(result->summary, expected) == 0) return true;
+    fprintf(stderr, "handle table: expected %s got %s error=%s live=%zu "
+            "peak=%zu high-water=%zu reuses=%zu exhaustions=%zu "
+            "releases=%zu\n", expected, result->summary, result->error,
+            result->dom_handle_slots_live, result->dom_handle_slots_peak,
+            result->dom_handle_slots_high_water,
+            result->dom_handle_slot_reuses, result->dom_handle_exhaustions,
+            result->dom_handle_wrapper_releases);
+    return false;
+}
+
+static int test_dom_handle_table_exhaustion(void)
+{
+    Budget budget;
+    budget_init(&budget, 48u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><div id=list></div></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 24u * MIB, 60000,
+        "https://handle-table.test/", NULL, &result);
+    CHECK(runtime != NULL);
+
+    /* (a) Well over a table's worth of dead wrappers inside one script:
+       plain garbage, self-cycles that only a collection clears, and whole
+       detached trees walked and then dropped. */
+    size_t exhaustions_before = result.dom_handle_exhaustions;
+    size_t reuses_before = result.dom_handle_slot_reuses;
+    CHECK(handle_table_eval(
+        runtime,
+        "(()=>{let made=0,walked=0,error='';try{"
+        "for(let i=0;i<12000;i++){const node=document.createElement('i');"
+        "if(i&1)node.self=node;made++;}"
+        "for(let round=0;round<16;round++){"
+        "const tree=document.createElement('div');"
+        "tree.innerHTML='<p><b>x</b>y</p>'.repeat(200);"
+        "for(const at of tree.querySelectorAll('*'))"
+        "walked+=at.childNodes.length;}"
+        "}catch(caught){error=String(caught);}"
+        "globalThis.pocSummary=made===12000&&walked===16*200*3&&!error?"
+        "'HANDLE-RECLAIM-OK':'HANDLE-RECLAIM-FAILED:'+made+':'+walked+':'"
+        "+error;})()",
+        "HANDLE-RECLAIM-OK", &result));
+    CHECK(result.dom_handle_exhaustions == exhaustions_before
+          && result.dom_handle_slot_reuses
+               >= reuses_before + SCRIPT_DOM_HANDLE_SLOT_CAPACITY
+          && result.dom_handle_slots_high_water
+               <= SCRIPT_DOM_HANDLE_SLOT_CAPACITY);
+
+    /* (b) Every slot strongly held: creation and walks fail at the API with
+       the exhaustion error, counted, instead of a null deep in bootstrap. */
+    CHECK(handle_table_eval(
+        runtime,
+        "(()=>{const list=document.getElementById('list');"
+        "list.innerHTML='<p>a</p>'.repeat(40);"
+        "globalThis.pocSummary='HANDLE-LIST-READY';})()",
+        "HANDLE-LIST-READY", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    exhaustions_before = result.dom_handle_exhaustions;
+    CHECK(handle_table_eval(
+        runtime,
+        "(()=>{const keep=globalThis.__handleKeep=[];"
+        "const list=document.getElementById('list');"
+        "const clean=(error)=>error instanceof RangeError"
+        "&&/DOM node handle table exhausted/.test(error.message);"
+        "const attempt=(run)=>{try{run();return 'none';}catch(error){"
+        "return clean(error)?'clean':String(error);}};"
+        "const create=attempt(()=>{for(let i=0;i<9000;i++)"
+        "keep.push(document.createElement('b'));});"
+        "const walks=[attempt(()=>list.children.length),"
+        "attempt(()=>list.querySelectorAll('p')),"
+        "attempt(()=>list.firstChild),"
+        "attempt(()=>document.createTextNode('t'))];"
+        "globalThis.pocSummary=create==='clean'&&keep.length>8000"
+        "&&walks.every((w)=>w==='clean')?'HANDLE-EXHAUSTED-CLEAN':"
+        "'HANDLE-EXHAUSTED-FAILED:'+keep.length+':'+create+':'"
+        "+walks.join(',');})()",
+        "HANDLE-EXHAUSTED-CLEAN", &result));
+    CHECK(result.dom_handle_exhaustions >= exhaustions_before + 5);
+
+    /* Releasing them makes the same realm usable again, even before any
+       cleanup job has run. */
+    CHECK(handle_table_eval(
+        runtime,
+        "(()=>{globalThis.__handleKeep=null;let made=0,error='';try{"
+        "for(let i=0;i<9000;i++){document.createElement('u');made++;}"
+        "const list=document.getElementById('list');"
+        "made+=list.children.length+list.querySelectorAll('p').length;"
+        "}catch(caught){error=String(caught);}"
+        "globalThis.pocSummary=made===9080&&!error?'HANDLE-RECOVERED':"
+        "'HANDLE-RECOVER-FAILED:'+made+':'+error;})()",
+        "HANDLE-RECOVERED", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_finalizers_do_not_starve_promises(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u*MIB, 4000, "https://jobs.test/", &result);
+    CHECK(runtime != NULL);
+    static const char source[] =
+        "globalThis.steps=0;globalThis.cleaned=0;globalThis.cleanupPromises=0;"
+        "globalThis.registry=new FinalizationRegistry(()=>{"
+        "if(cleaned!==cleanupPromises)throw Error('missing cleanup checkpoint');"
+        "cleaned++;Promise.resolve().then(()=>cleanupPromises++)});"
+        "for(let i=0;i<330;i++){let x={};x.self=x;registry.register(x,i)}"
+        "Promise.resolve().then(function step(){steps++;"
+        "if(steps<8)Promise.resolve().then(step)});";
+    JSValue value = JS_Eval(runtime->context, source, sizeof(source)-1u,
+                             "<finalizer-pressure>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(value));
+    JS_FreeValue(runtime->context, value);
+    JS_RunGC(runtime->runtime);
+    JS_RunGC(runtime->runtime);
+    uint64_t started = tilefinch_platform_monotonic_time_ns();
+    CHECK(js_rt_runtime_run_jobs(runtime));
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue steps = JS_GetPropertyStr(runtime->context, global, "steps");
+    JSValue cleaned = JS_GetPropertyStr(runtime->context, global, "cleaned");
+    int32_t step_count=0, cleanup_count=0;
+    CHECK(JS_ToInt32(runtime->context, &step_count, steps)==0);
+    CHECK(JS_ToInt32(runtime->context, &cleanup_count, cleaned)==0);
+    printf("finalizer checkpoint: promises=%d cleanups=%d us=%llu\n",
+           step_count, cleanup_count, (unsigned long long)
+           ((tilefinch_platform_monotonic_time_ns()-started)/1000u));
+    JS_FreeValue(runtime->context, steps);
+    JS_FreeValue(runtime->context, cleaned);
+    JS_FreeValue(runtime->context, global);
+    CHECK(step_count == 8 && cleanup_count == 0);
+    for (unsigned i=0;i<64;i++)
+        CHECK(script_runtime_advance(runtime, 0, 16, &result));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "if(cleaned!==330||cleanupPromises!==330)throw Error('cleanup lost');"
+        "pocSummary='CLEANUP-OK'",
+        "<cleanup-complete>", &result));
+    /* Destruction must also release a queue which never got an idle turn. */
+    static const char pending[] =
+        "for(let i=0;i<100;i++){let x={};x.self=x;registry.register(x,i)}";
+    value = JS_Eval(runtime->context, pending, sizeof(pending)-1u,
+                    "<undrained-cleanups>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(value));
+    JS_FreeValue(runtime->context, value);
+    JS_RunGC(runtime->runtime);
+    JS_RunGC(runtime->runtime);
+    CHECK(JS_IsCleanupJobPending(runtime->runtime));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current==0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_mutation_observer_shadow_boundaries(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    const char html[] = "<!doctype html><html><body></body></html>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 4000, "https://observer.test/", &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const m=new MutationObserver(()=>{});"
+        "m.observe(document.body,{attributes:true});"
+        "document.body.setAttribute('data-a','1');"
+        "document.body.setAttribute('data-b','2');"
+        "const records=m.takeRecords();"
+        "if(records.length!==2||records.some(r=>r.addedNodes.length||"
+        "r.removedNodes.length)||records[0].addedNodes===records[1].addedNodes||"
+        "records[0].removedNodes===records[1].removedNodes)"
+        "throw Error('mutation lists shared');m.disconnect();"
+        "for(const mode of ['open','closed']){"
+        "const host=document.createElement('div');document.body.append(host);"
+        "const root=host.attachShadow({mode}),leaf=document.createElement('i');"
+        "root.append(leaf);const outer=new MutationObserver(()=>{}),"
+        "inner=new MutationObserver(()=>{}),doc=new MutationObserver(()=>{});"
+        "outer.observe(host,{attributes:true,childList:true,subtree:true});"
+        "doc.observe(document,{attributes:true,childList:true,subtree:true});"
+        "inner.observe(root,{attributes:true,subtree:true});"
+        "leaf.setAttribute('data-x','1');"
+        "if(outer.takeRecords().length||doc.takeRecords().length||"
+        "inner.takeRecords().length!==1)throw Error('shadow boundary '+mode);"
+        "root.removeChild(leaf);leaf.setAttribute('data-x','2');"
+        "if(inner.takeRecords().length!==1||outer.takeRecords().length)"
+        "throw Error('shadow transient '+mode);"
+        "root.append(leaf);host.remove();doc.takeRecords();"
+        "leaf.setAttribute('data-x','3');"
+        "if(inner.takeRecords().length!==1||outer.takeRecords().length||"
+        "doc.takeRecords().length)throw Error('host transient '+mode);"
+        "outer.disconnect();inner.disconnect();doc.disconnect();host.remove();"
+        "}pocSummary='SHADOW-OBSERVERS-OK'})()",
+        "<shadow-observers>", &result));
+    CHECK(strcmp(result.summary, "SHADOW-OBSERVERS-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_css_property_name_canonical_fast_path(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    const char html[] = "<!doctype html><html><body></body></html>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 4000, "https://css-name.test/", &result);
+    CHECK(runtime != NULL);
+    bool normalized = script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const normalize=__tilefinchCssName,"
+        "original=String.prototype.charCodeAt,exec=RegExp.prototype.exec;"
+        "let scans=0,conversions=0;"
+        "String.prototype.charCodeAt=function(i){scans++;return original.call(this,i)};"
+        "try{for(const value of ['', 'display', 'background-color',"
+        "'scroll-margin-block-start','--MixedCase','width-\\u00c4',"
+        "'width-\\ud83d\\ude00','a'.repeat(2048)]){"
+        "if(normalize(value)!==value)throw Error('canonical value')}"
+        "if(normalize('cssFloat')!=='float')throw Error('cssFloat');"
+        "if(normalize({toString(){conversions++;return 'border-color'}})"
+        "!=='border-color'||conversions!==1)throw Error('conversion');"
+        "if(scans!==0)throw Error('canonical name rescanned:'+scans);"
+        "for(const [value,wanted] of [['marginTop','margin-top'],"
+        "['WebkitTransform','-webkit-transform'],['XML','-x-m-l'],"
+        "['xY-Z','x-y--z']])if(normalize(value)!==wanted)"
+        "throw Error('camel case:'+value);"
+        "if(scans===0)throw Error('fallback untested');"
+        "scans=0;const prefix='a'.repeat(2048);"
+        "if(normalize(prefix+'B')!==prefix+'-b'||scans!==1)"
+        "throw Error('camel prefix rescanned:'+scans);"
+        "RegExp.prototype.exec=function(){throw Error('author exec')};"
+        "if(normalize('border-left')!=='border-left'||"
+        "normalize('borderLeft')!=='border-left')throw Error('intrinsic');"
+        "}finally{String.prototype.charCodeAt=original;RegExp.prototype.exec=exec}"
+        "pocSummary='CSS-NAME-FAST-PATH-OK'})()",
+        "<css-name-fast-path>", &result);
+    if (!normalized) fprintf(stderr, "CSS name normalization: %s\n", result.error);
+    CHECK(normalized);
+    CHECK(strcmp(result.summary, "CSS-NAME-FAST-PATH-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_diagnostic_probe_leaves_jobs_pending(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    const char html[] = "<!doctype html><html><body></body></html>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    size_t document_bytes = budget.current;
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 4000, "https://probe.test/", &result);
+    CHECK(runtime != NULL);
+    Watchdog original_watchdog = runtime->watchdog;
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "globalThis.probeRan=0;Promise.resolve().then(()=>{probeRan++});"
+        "__tilefinchClipboardWrite(String(probeRan))",
+        "<probe-queue>", &result));
+    CHECK(strcmp(result.last_clipboard_text, "0") == 0);
+    CHECK(runtime->watchdog.deadline_ms == original_watchdog.deadline_ms);
+    CHECK(runtime->watchdog.polls == original_watchdog.polls);
+    CHECK(runtime->watchdog.interrupted == original_watchdog.interrupted);
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "__tilefinchClipboardWrite(String(probeRan))",
+        "<probe-pending>", &result));
+    CHECK(strcmp(result.last_clipboard_text, "0") == 0);
+    CHECK(script_runtime_advance(runtime, 0, 16, &result));
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "__tilefinchClipboardWrite(String(probeRan))",
+        "<probe-complete>", &result));
+    CHECK(strcmp(result.last_clipboard_text, "1") == 0);
+    CHECK(!script_runtime_evaluate_probe(runtime,
+        "throw new Error('probe-exception')", "<probe-error>", &result));
+    CHECK(strstr(result.error, "probe-exception") != NULL);
+    runtime->result.interrupted = true;
+    runtime->result.watchdog_polls = 23;
+    runtime->result.watchdog_elapsed_ms = 17;
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "__tilefinchClipboardWrite('recovered')", "<probe-recover>", &result));
+    CHECK(strcmp(result.last_clipboard_text, "recovered") == 0);
+    CHECK(result.interrupted && result.watchdog_polls == 23
+          && result.watchdog_elapsed_ms == 17);
+    script_runtime_limit_execution_for_us(runtime, 1000);
+    CHECK(!script_runtime_evaluate_probe(runtime,
+        "while(true){}", "<probe-timeout>", &result));
+    CHECK(result.interrupted);
+    script_runtime_clear_execution_limit(runtime);
+    script_runtime_destroy(runtime);
+    CHECK(budget.current == document_bytes);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
@@ -1562,9 +4144,46 @@ static int test_coalesced_attribute_tokens(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--task-runnable-only") == 0)
+        return test_task_runnable_follows_the_event_loop();
+    CHECK(test_task_runnable_follows_the_event_loop() == 0);
+    if (argc == 2 && strcmp(argv[1], "--fast-turns-only") == 0)
+        return test_fast_turns_follow_wall_time();
+    CHECK(test_fast_turns_follow_wall_time() == 0);
+    if (argc == 2 && strcmp(argv[1], "--diagnostic-probe-only") == 0)
+        return test_diagnostic_probe_leaves_jobs_pending();
+    CHECK(test_diagnostic_probe_leaves_jobs_pending() == 0);
+    if (argc == 2 && strcmp(argv[1], "--css-name-only") == 0)
+        return test_css_property_name_canonical_fast_path();
+    CHECK(test_css_property_name_canonical_fast_path() == 0);
+    if (argc == 2 && strcmp(argv[1], "--answer-checkpoint-only") == 0)
+        return test_device_answer_checkpoint();
+    CHECK(test_device_answer_checkpoint() == 0);
+    if (argc == 2 && strcmp(argv[1], "--sibling-scopes-only") == 0)
+        return test_computed_style_sibling_scopes();
+    if (argc == 2 && strcmp(argv[1], "--detached-document-only") == 0)
+        return test_computed_style_forgets_detached_document();
+    if (argc == 2 && strcmp(argv[1], "--style-no-cascade-only") == 0)
+        return test_computed_style_reads_without_cascade();
+    if (argc == 2 && strcmp(argv[1], "--script-split-only") == 0)
+        return test_script_split_attributes_bridge_work();
+    if (argc == 2 && strcmp(argv[1], "--style-keywords-only") == 0)
+        return test_computed_style_keywords_without_layout();
+    CHECK(test_computed_style_keywords_without_layout() == 0);
+    if (argc == 2 && strcmp(argv[1], "--finalizers-only") == 0)
+        return test_finalizers_do_not_starve_promises();
+    CHECK(test_finalizers_do_not_starve_promises() == 0);
+    if (argc == 2 && strcmp(argv[1], "--shadow-observers-only") == 0)
+        return test_mutation_observer_shadow_boundaries();
+    CHECK(test_mutation_observer_shadow_boundaries() == 0);
     if (argc == 2 && strcmp(argv[1], "--coalesced-tokens-only") == 0)
         return test_coalesced_attribute_tokens();
+    if (argc == 2 && strcmp(argv[1], "--handle-table-only") == 0)
+        return test_dom_handle_table_exhaustion();
     CHECK(test_coalesced_attribute_tokens() == 0);
+    if (argc == 2 && strcmp(argv[1], "--detached-move-only") == 0)
+        return test_detached_move_is_a_removal();
+    CHECK(test_detached_move_is_a_removal() == 0);
     if (argc == 2 && strcmp(argv[1], "--external-compile-pressure-only") == 0)
         return test_external_compile_reclaims_cycles()
             || test_gc_pacing_requires_heap_growth()
@@ -1574,15 +4193,39 @@ int main(int argc, char **argv)
         return test_runtime_task_time_slice();
     if (argc == 2 && strcmp(argv[1], "--job-heap-rejection-only") == 0)
         return test_job_heap_rejection_is_fatal();
+    if (argc == 2 && strcmp(argv[1], "--host-state-only") == 0)
+        return test_host_state_timers_and_scroll(false)
+            || test_host_state_timers_and_scroll(true)
+            || test_host_state_network_and_indexeddb_stats()
+            || test_usv_string_conversion();
     CHECK(test_external_compile_reclaims_cycles() == 0);
-    CHECK(test_gc_pacing_requires_heap_growth() == 0);
+    CHECK(test_gc_pacing_requires_heap_growth() == 0
+          && test_gc_pacing_pregrows_growable_heap() == 0
+          && test_heap_growth_uses_existing_headroom() == 0
+          && test_heap_return_checks_back_off() == 0
+          && test_heap_decisions_skip_census() == 0
+          && test_attribute_write_timing_needs_profiler() == 0);
     CHECK(test_dom_wrapper_receiver_sharing() == 0);
     CHECK(test_dom_order_without_sibling_wrappers() == 0);
+    CHECK(test_dom_handle_table_exhaustion() == 0);
     CHECK(test_stream_and_xhr_private_state_reclamation() == 0);
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_computed_style_memo_invalidation() == 0);
+    CHECK(test_computed_style_ancestor_cache() == 0);
+    CHECK(test_script_split_attributes_bridge_work() == 0);
+    CHECK(test_computed_style_reads_without_cascade() == 0);
+    CHECK(test_computed_style_sibling_scopes() == 0);
+    CHECK(test_computed_style_forgets_detached_document() == 0);
+    CHECK(test_computed_style_container_cache(false) == 0);
+    CHECK(test_computed_style_container_cache(true) == 0);
+    CHECK(test_computed_style_scoped_invalidation() == 0);
+    CHECK(test_inline_style_scoped_invalidation() == 0);
+    CHECK(test_computed_style_host_generation() == 0);
+    CHECK(test_computed_style_parser_insertion() == 0);
+    CHECK(test_computed_style_controller_host_changes() == 0);
+    CHECK(test_computed_style_var_cache_on_demand() == 0);
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
     CHECK(test_job_heap_rejection_is_fatal() == 0);
@@ -1590,8 +4233,13 @@ int main(int argc, char **argv)
     CHECK(test_get_element_by_id_tracks_id_changes() == 0);
     CHECK(test_custom_element_hooks_after_first_definition() == 0);
     CHECK(test_focus_style_and_selector_helpers() == 0);
+    CHECK(test_focus_fixup_follows_moved_subtree() == 0);
     CHECK(test_inserted_subtree_resource_classification() == 0);
     CHECK(test_blank_recovery_author_work_census() == 0);
+    CHECK(test_host_state_timers_and_scroll(false) == 0);
+    CHECK(test_host_state_timers_and_scroll(true) == 0);
+    CHECK(test_host_state_network_and_indexeddb_stats() == 0);
+    CHECK(test_usv_string_conversion() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     CHECK(test_user_activation_expiry() == 0);
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
@@ -1667,7 +4315,7 @@ int main(int argc, char **argv)
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &realistic)
           && realistic.maximum_host_compile_source_bytes
-               == 384u * 1024u
+               == 512u * 1024u
           && realistic.maximum_advance_time_us == 16000
           && realistic.maximum_host_compile_source_bytes
                > strict.maximum_host_compile_source_bytes);
@@ -2341,12 +4989,16 @@ int main(int argc, char **argv)
 
     puts("test: oversized data script fails visibly and remains counted");
     size_t oversized_data_failed_before = result.dynamic_scripts_failed;
+    /* The 16 KiB src exceeds the serialized URL limit, so the refusal does
+       not depend on heap headroom. The element counts its own events: a
+       prepared script fires exactly one of load and error. */
     static const char oversized_data_script_probe[] =
-        "(()=>{const script=document.createElement('script');"
+        "(()=>{const script=document.createElement('script'),"
+        "events=globalThis.__oversizedDataEvents={script,load:0,error:0};"
         "script.src='data:text/javascript,'+'x'.repeat(16384);"
-        "script.addEventListener('load',()=>{"
+        "script.addEventListener('load',()=>{events.load++;"
         "globalThis.pocSummary='OVERSIZED-DATA-LOADED'});"
-        "script.addEventListener('error',()=>{"
+        "script.addEventListener('error',()=>{events.error++;"
         "globalThis.pocSummary='OVERSIZED-DATA-ERROR'});"
         "document.head.appendChild(script);"
         "globalThis.pocSummary='OVERSIZED-DATA-PENDING';})()";
@@ -2359,6 +5011,24 @@ int main(int argc, char **argv)
     }
     CHECK(oversized_data_ok
           && strcmp(result.summary, "OVERSIZED-DATA-ERROR") == 0
+          && result.dynamic_scripts_failed
+                 == oversized_data_failed_before + 1u);
+    for (size_t tick = 0; oversized_data_ok && tick < 4; tick++) {
+        oversized_data_ok = script_runtime_advance(runtime, 0, 128, &result);
+    }
+    /* Detach the element once settled: it precedes the page's own script in
+       document order, and later host-level completions below would otherwise
+       dispatch their load and error events to its listeners. */
+    static const char oversized_data_settled[] =
+        "(()=>{const events=globalThis.__oversizedDataEvents;"
+        "delete globalThis.__oversizedDataEvents;events.script.remove();"
+        "globalThis.pocSummary='OVERSIZED-DATA-EVENTS:'+events.load+':'+"
+        "events.error})()";
+    CHECK(oversized_data_ok
+          && script_runtime_evaluate_diagnostic(
+                 runtime, oversized_data_settled,
+                 "<oversized-data-settled>", &result)
+          && strcmp(result.summary, "OVERSIZED-DATA-EVENTS:0:1") == 0
           && result.dynamic_scripts_failed
                  == oversized_data_failed_before + 1u);
 
@@ -2548,10 +5218,28 @@ int main(int argc, char **argv)
         "thirdChild);replaced.observe(thirdParent,{childList:true});thirdChild."
         "setAttribute('data-after','yes');await Promise.resolve();await Promise.resolve();"
         "const reobserveClears=!third.some(record=>record.type==='attributes');replaced."
-        "disconnect();parent.remove();secondParent.remove();thirdParent.remove();"
-        "globalThis.pocSummary=propagates&&clearsBeforeCallback&&reobserveClears?"
+        "disconnect();"
+        /* Transient registrations end per observer, just before its own
+           callback: an earlier observer's change to the removed subtree
+           still reaches a later one. */
+        "const fourthParent=document.createElement('div'),fourthChild=document."
+        "createElement('span');fourthParent.appendChild(fourthChild);document.body."
+        "appendChild(fourthParent);const early=[],late=[];let earlyCalls=0;const "
+        "earlier=new MutationObserver(records=>{early.push(...records);if(++earlyCalls"
+        "===1)fourthChild.setAttribute('data-from-earlier','yes')}),later=new "
+        "MutationObserver(records=>late.push(...records));earlier.observe(fourthParent,"
+        "{subtree:true,childList:true,attributes:true});later.observe(fourthParent,"
+        "{subtree:true,childList:true,attributes:true});fourthParent.removeChild("
+        "fourthChild);await Promise.resolve();await Promise.resolve();await Promise."
+        "resolve();const perObserver=late.some(record=>record.type==='attributes'&&"
+        "record.target===fourthChild)&&!early.some(record=>record.type==='attributes');"
+        "earlier.disconnect();later.disconnect();"
+        "parent.remove();secondParent.remove();thirdParent.remove();fourthParent.remove();"
+        "globalThis.pocSummary=propagates&&clearsBeforeCallback&&reobserveClears&&"
+        "perObserver?"
         "'OBSERVER-TRANSIENT-LIFECYCLE-OK':'OBSERVER-TRANSIENT-LIFECYCLE-FAILED:'+"
-        "[propagates,callbacks,lateRecords,reobserveClears].join(',')})().catch(error=>"
+        "[propagates,callbacks,lateRecords,reobserveClears,perObserver].join(',')})()"
+        ".catch(error=>"
         "{globalThis.pocSummary='OBSERVER-TRANSIENT-LIFECYCLE-ERROR:'+String(error&&"
         "error.stack||error)});";
     bool observer_transient_lifecycle_ok = script_runtime_evaluate_diagnostic(
@@ -2566,9 +5254,201 @@ int main(int argc, char **argv)
     CHECK(observer_transient_lifecycle_ok
           && strcmp(result.summary, "OBSERVER-TRANSIENT-LIFECYCLE-OK") == 0);
 
-    lxb_dom_node_t *script = find_script(
-        lxb_dom_interface_node(document.html));
-    CHECK(script != NULL);
+    /* Delivery follows the order observers were queued, not registered,
+       and one a callback queues waits for the next round. */
+    static const char observer_delivery_order_probe[] =
+        "(async()=>{const log=[],a=document.createElement('div'),b=document."
+        "createElement('div'),c=document.createElement('div');document.body.append("
+        "a,b,c);const mo=(name,after)=>new MutationObserver(()=>{log.push(name);"
+        "after&&after()});const C=mo('C'),B=mo('B'),A=mo('A',()=>{if(!log.includes("
+        "'C'))c.setAttribute('data-from-a','1')});C.observe(c,{attributes:true});"
+        "B.observe(b,{attributes:true});A.observe(a,{attributes:true});a."
+        "setAttribute('data-x','1');b.setAttribute('data-x','1');for(let i=0;i<4;"
+        "i++)await Promise.resolve();A.disconnect();B.disconnect();C.disconnect();"
+        "a.remove();b.remove();c.remove();const order=log.join(',');globalThis."
+        "pocSummary=order==='A,B,C'?'OBSERVER-ORDER-OK':'OBSERVER-ORDER-FAILED:'+"
+        "order})().catch(error=>{globalThis.pocSummary='OBSERVER-ORDER-ERROR:'+"
+        "String(error)});";
+    bool observer_order_ok = script_runtime_evaluate_diagnostic(
+        runtime, observer_delivery_order_probe, "<observer-order-probe>",
+        &result);
+    for (size_t tick = 0; observer_order_ok && tick < 16
+         && strcmp(result.summary, "OBSERVER-ORDER-OK") != 0; tick++)
+        observer_order_ok = script_runtime_advance(runtime, 0, 1024, &result);
+    if (strcmp(result.summary, "OBSERVER-ORDER-OK") != 0)
+        fprintf(stderr, "observer order: %s\n", result.summary);
+    CHECK(observer_order_ok
+          && strcmp(result.summary, "OBSERVER-ORDER-OK") == 0);
+
+    /* Mutation-observer interest: fast paths (native ancestor and nearest-id
+       walks, per-registration interest before any ancestry check) keep the
+       records, oldValue merging, transient registrations and the 256-step
+       ancestor bound of the wrapper walks; see queueMutationRecords. */
+    static const char observer_interest_probe[] =
+        "(async()=>{const fails=[],check=(name,ok)=>{if(!ok)fails.push(name)},"
+        "flush=async()=>{for(let i=0;i<4;i++)await Promise.resolve()},"
+        "el=(tag,id)=>{const n=document.createElement(tag);if(id!==undefined)n."
+        "setAttribute('id',id);return n},"
+        "line=r=>r.map(x=>[x.type,x.target&&(x.target.id||x.target.nodeName),x."
+        "attributeName,x.oldValue,x.addedNodes.length,x.removedNodes.length].jo"
+        "in(':')).join('|');"
+        "const root=el('div','mi-root'),mid=el('section'),leaf=el('span','mi-le"
+        "af'),other=el('div','mi-other');"
+        "mid.appendChild(leaf);root.appendChild(mid);document.body.append(root,"
+        "other);"
+        "const dirty=globalThis.__tilefinchDirtyNodeIds;dirty.clear();"
+        "mid.setAttribute('data-a','1');leaf.setAttribute('data-a','1');"
+        "check('dirty-nearest',dirty.has('i:mi-root')&&dirty.has('i:mi-leaf')&&"
+        "dirty.size===2);"
+        "const longId='x'.repeat(129),overlong=el('div',longId),inner=el('i'),e"
+        "mpty=el('b','');"
+        "overlong.appendChild(inner);mid.append(overlong,empty);const text=docu"
+        "ment.createTextNode('a');leaf.appendChild(text);"
+        "dirty.clear();inner.setAttribute('data-a','1');empty.setAttribute('dat"
+        "a-a','1');"
+        "check('dirty-skips',dirty.has('i:mi-root')&&dirty.size===1);"
+        "dirty.clear();text.data='b';check('dirty-text',dirty.has('i:mi-leaf')&"
+        "&dirty.size===1);"
+        "dirty.clear();el('div').setAttribute('data-a','1');check('dirty-none',"
+        "dirty.size===0);"
+        /* Without a section save nothing drains the set: it keeps the first
+           64 keys in insertion order and counts each later add as dropped. */
+        "const stats=globalThis.__tilefinchRetentionStats,drops=stats.dirtyDro"
+        "ps,bound=[];"
+        "for(let i=0;i<70;i++){const n=el('i','mi-bound-'+i);bound.push(n);n.s"
+        "etAttribute('data-a','1')}"
+        "check('dirty-bound',dirty.size===64&&dirty.has('i:mi-bound-0')&&dirty"
+        ".has('i:mi-bound-63')&&!dirty.has('i:mi-bound-64')&&[...dirty][0]==='"
+        "i:mi-bound-0'&&stats.dirtyDrops===drops+12);"
+        "const boundDrops=stats.dirtyDrops;bound[5].setAttribute('data-a','2');"
+        "check('dirty-bound-known',dirty.size===64&&stats.dirtyDrops===boundDr"
+        "ops);dirty.clear();bound[69].setAttribute('data-a','2');"
+        "check('dirty-bound-cleared',dirty.size===1&&dirty.has('i:mi-bound-69'"
+        "));dirty.clear();"
+        "const unrelatedLog=[],unrelated=new MutationObserver(r=>unrelatedLog.p"
+        "ush(...r));"
+        "unrelated.observe(other,{attributes:true,childList:true,characterData:"
+        "true,subtree:true});"
+        "leaf.setAttribute('data-b','1');mid.appendChild(el('u'));text.data='c'"
+        ";await flush();"
+        "check('unrelated',unrelatedLog.length===0);unrelated.disconnect();"
+        "const got=[],filtered=new MutationObserver(r=>got.push(...r));"
+        "filtered.observe(root,{attributes:true,subtree:true,attributeFilter:['"
+        "data-c']});"
+        "filtered.observe(leaf,{attributes:true,attributeOldValue:true});"
+        "leaf.setAttribute('data-c','old');leaf.setAttribute('data-c','new');le"
+        "af.setAttribute('data-d','x');"
+        "mid.setAttribute('data-c','m');mid.setAttribute('data-d','m');root.set"
+        "Attribute('data-c','r');"
+        "other.setAttribute('data-c','o');await flush();filtered.disconnect();"
+        "check('filter-old-value',line(got)==='attributes:mi-leaf:data-c::0:0|a"
+        "ttributes:mi-leaf:data-c:old:0:0|'+"
+        "'attributes:mi-leaf:data-d::0:0|attributes:SECTION:data-c::0:0|attribu"
+        "tes:mi-root:data-c::0:0');"
+        "const listLog=[],list=new MutationObserver(r=>listLog.push(...r));list"
+        ".observe(root,{childList:true,subtree:true});"
+        "mid.setAttribute('data-f','1');text.data='d';mid.appendChild(el('em'))"
+        ";await flush();list.disconnect();"
+        "check('child-list-only',line(listLog)==='childList:SECTION:::1:0');"
+        /* Re-observing a target replaces its options, and with them the
+           record types the observer is asked about. */
+        "const swapLog=[],swap=new MutationObserver(r=>swapLog.push(...r));"
+        "swap.observe(mid,{attributes:true});swap.observe(mid,{childList:true}"
+        ");mid.setAttribute('data-s','1');mid.appendChild(el('b'));"
+        "await flush();swap.disconnect();swap.observe(mid,{characterData:true,"
+        "subtree:true});mid.setAttribute('data-s','2');text.data='s';"
+        "await flush();swap.disconnect();"
+        "check('reobserve-types',line(swapLog)==='childList:SECTION:::1:0|"
+        "characterData:#text:::0:0');"
+        "const attrLog=[],attrs=new MutationObserver(r=>attrLog.push(...r));att"
+        "rs.observe(root,{attributes:true,subtree:true});"
+        "const moved=el('div','mi-moved'),movedChild=el('i');moved.appendChild("
+        "movedChild);mid.appendChild(moved);"
+        "mid.removeChild(leaf);leaf.setAttribute('data-e','1');mid.removeChild("
+        "moved);other.appendChild(moved);"
+        "movedChild.setAttribute('data-e','2');await flush();"
+        "check('transient',line(attrLog)==='attributes:mi-leaf:data-e::0:0|attr"
+        "ibutes:I:data-e::0:0');"
+        "leaf.setAttribute('data-e','3');movedChild.setAttribute('data-e','4');"
+        "await flush();attrs.disconnect();"
+        "check('transient-ends',attrLog.length===2);"
+        "const batch=[],late=new MutationObserver(r=>batch.push(...r));"
+        "mid.setAttribute('data-g','1');late.observe(root,{attributes:true,subt"
+        "ree:true});mid.setAttribute('data-g','2');"
+        "late.disconnect();mid.setAttribute('data-g','3');late.observe(root,{at"
+        "tributes:true,subtree:true,attributeOldValue:true});"
+        "mid.setAttribute('data-g','4');await flush();late.disconnect();"
+        "check('mid-batch',line(batch)==='attributes:SECTION:data-g:3:0:0');"
+        "const docLog=[],doc=new MutationObserver(r=>docLog.push(...r));"
+        "doc.observe(document,{attributes:true,subtree:true,attributeFilter:['d"
+        "ata-h']});"
+        "mid.setAttribute('data-h','1');const loose=el('div'),looseChild=el('sp"
+        "an');loose.appendChild(looseChild);"
+        "looseChild.setAttribute('data-h','1');await flush();doc.disconnect();"
+        "check('document',line(docLog)==='attributes:SECTION:data-h::0:0');"
+        "const chain=[el('div')];for(let i=0;i<260;i++){const c=el('div');c.app"
+        "endChild(chain[0]);chain.unshift(c)}"
+        "const deep=[],bounded=new MutationObserver(r=>deep.push(...r));bounded"
+        ".observe(chain[0],{attributes:true,subtree:true});"
+        "chain[255].setAttribute('data-i','1');chain[256].setAttribute('data-i'"
+        ",'1');chain[257].setAttribute('data-i','1');"
+        "await flush();bounded.disconnect();"
+        "check('ancestor-bound',deep.map(r=>chain.indexOf(r.target)).join(',')="
+        "=='255,256');"
+        "const dataLog=[],data=new MutationObserver(r=>dataLog.push(...r));"
+        "data.observe(root,{characterData:true,characterDataOldValue:true,subtr"
+        "ee:true});"
+        "const midText=document.createTextNode('a');mid.appendChild(midText);mi"
+        "dText.data='b';await flush();data.disconnect();"
+        "check('character-data',dataLog.length===1&&dataLog[0].oldValue==='a'&&"
+        "dataLog[0].target===midText);"
+        /* Replacing one registration must recompute aggregate interest,
+           retain other target kinds, and drop that registration's detached
+           transient roots. Disconnect/reobserve starts with fresh interest. */
+        "const kinds=[],changing=new MutationObserver(r=>kinds.push(...r));"
+        "changing.observe(root,{attributes:true,subtree:true});"
+        "changing.observe(other,{childList:true});"
+        "const removed=el('div');mid.appendChild(removed);removed.remove();"
+        "changing.observe(root,{characterData:true,subtree:true});"
+        "removed.setAttribute('data-k','1');mid.setAttribute('data-k','1');"
+        "midText.data='c';other.appendChild(el('b'));await flush();"
+        "check('replace-interest',kinds.length===2&&kinds[0].type==='character"
+        "Data'&&kinds[1].type==='childList');changing.disconnect();kinds.length=0;"
+        "changing.observe(root,{attributes:true,subtree:true});midText.data='d';"
+        "mid.setAttribute('data-k','2');await flush();changing.disconnect();"
+        "check('reobserve-interest',kinds.length===1&&kinds[0].type==='attributes');"
+        "const fragment=document.createDocumentFragment(),fragmentChild=el('div"
+        "');fragment.appendChild(fragmentChild);"
+        "const fragmentLog=[],fragmentObserver=new MutationObserver(r=>fragment"
+        "Log.push(...r));"
+        "fragmentObserver.observe(fragment,{attributes:true,subtree:true});frag"
+        "mentChild.setAttribute('data-j','1');"
+        "await flush();fragmentObserver.disconnect();"
+        "check('fragment',fragmentLog.length===1&&fragmentLog[0].target===fragm"
+        "entChild);"
+        "root.remove();other.remove();"
+        "globalThis.pocSummary=fails.length?'OBSERVER-INTEREST-FAILED:'+fails.j"
+        "oin(','):'OBSERVER-INTEREST-OK'})()"
+        ".catch(error=>{globalThis.pocSummary='OBSERVER-INTEREST-ERROR:'+String"
+        "(error)+String(error&&error.stack)});";
+    bool observer_interest_ok = script_runtime_evaluate_diagnostic(
+        runtime, observer_interest_probe, "<observer-interest-probe>",
+        &result);
+    for (size_t tick = 0; observer_interest_ok && tick < 16
+         && strcmp(result.summary, "OBSERVER-INTEREST-OK") != 0; tick++)
+        observer_interest_ok = script_runtime_advance(runtime, 0, 1024,
+                                                      &result);
+    if (strcmp(result.summary, "OBSERVER-INTEREST-OK") != 0)
+        fprintf(stderr, "observer interest: %s\n", result.summary);
+    CHECK(observer_interest_ok
+          && strcmp(result.summary, "OBSERVER-INTEREST-OK") == 0);
+
+    /* The page's own script, not whichever element a probe last inserted
+       ahead of it: the completions below dispatch load and error to it. */
+    lxb_dom_node_t *script = find_element_id(
+        lxb_dom_interface_node(document.html), "target");
+    CHECK(script != NULL && script == find_script(
+              lxb_dom_interface_node(document.html)));
     size_t oversized_length =
         strict.maximum_host_compile_source_bytes + 1;
     char *oversized = malloc(oversized_length + 1);
@@ -2661,6 +5541,17 @@ int main(int argc, char **argv)
           && result.external_scripts_loaded == loaded_before_null + 1
           && result.external_scripts_failed == failed_before_null);
 
+    /* Collection decides when dead wrappers' FinalizationRegistry cleanups
+       join the job queue, and one checkpoint runs at most 64 jobs, so a
+       backlog left by earlier probes could otherwise outlast this probe's
+       own checkpoint. Collect now and settle the queue first. */
+    (void) script_runtime_collect_and_trim(runtime);
+    for (size_t tick = 0;
+         tick < 64 && js_rt_runtime_checkpoint_pending(runtime); tick++) {
+        CHECK(js_rt_runtime_run_jobs(runtime));
+    }
+    CHECK(!js_rt_runtime_checkpoint_pending(runtime));
+    js_rt_runtime_update_result(runtime, &result);
     size_t callbacks_before_promise = result.host_callback_calls;
     static const char promise_job[] =
         "Promise.resolve().then(()=>{"
@@ -3287,6 +6178,20 @@ int main(int argc, char **argv)
           && strcmp(result.summary, "FROZEN-BASE-OK") == 0);
     (void) script_runtime_collect_and_trim(runtime);
 
+    static const char ordinary_namespace_read_probe[] =
+        "(()=>{const node=document.createElement('div');"
+        "node.setAttribute('data-probe','first');"
+        "Object.defineProperty(node,'attributes',{get(){throw Error('enumerated')}});"
+        "const first=node.getAttributeNS(null,'data-probe')==='first';"
+        "node.setAttribute('data-probe','second');"
+        "const live=node.getAttributeNS('','data-probe')==='second';"
+        "node.removeAttribute('data-probe');"
+        "globalThis.pocSummary=first&&live&&node.getAttributeNS(null,'data-probe')===null"
+        "?'ORDINARY-NS-READ-OK':'ORDINARY-NS-READ-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, ordinary_namespace_read_probe,
+              "<ordinary-namespace-read-probe>", &result)
+          && strcmp(result.summary, "ORDINARY-NS-READ-OK") == 0);
+
     static const char namespaced_attribute_probe[] =
         "(()=>{const svg=document.createElementNS('http://www.w3.org/2000/svg',"
         "'svg'),use=document.createElementNS('http://www.w3.org/2000/svg','use'),"
@@ -3294,7 +6199,15 @@ int main(int argc, char **argv)
         "use.setAttributeNS(xlink,'xlink:href','#mark');const set="
         "use.getAttributeNS(xlink,'href')==='#mark'"
         "&&use.hasAttributeNS(xlink,'href');use.removeAttributeNS(xlink,'href');"
-        "globalThis.pocSummary=set&&!use.hasAttributeNS(xlink,'href')"
+        "const html=document.createElement('div');html.setAttribute('data-a','plain');"
+        "const sensitive=html.getAttributeNS(null,'DATA-A')===null;"
+        "html.setAttributeNS('urn:test','x:data-a','namespaced');"
+        "const mirrored=html.getAttributeNS('urn:test','data-a')==='namespaced'"
+        "&&html.getAttributeNS(null,'data-a')==='plain';"
+        "use.setAttribute('viewBox','0 0 1 1');"
+        "globalThis.pocSummary=set&&sensitive&&mirrored"
+        "&&use.getAttributeNS(null,'viewBox')==='0 0 1 1'"
+        "&&!use.hasAttributeNS(xlink,'href')"
         "?'NAMESPACE-ATTRIBUTE-OK':'NAMESPACE-ATTRIBUTE-FAILED';})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, namespaced_attribute_probe,
@@ -4603,6 +7516,41 @@ int main(int argc, char **argv)
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, utf8_decoder_probe, "<utf8-decoder-probe>", &result)
           && strcmp(result.summary, "UTF8-DECODER-OK") == 0);
+
+    /* Streamed chunks decode their complete prefix natively and carry an
+       unfinished sequence; every split of valid text reassembles, and an
+       invalid tail still yields its replacement characters (or throws, when
+       fatal) in the call that received it. */
+    static const char utf8_stream_probe[] =
+        "(()=>{const text='\\ufeffA\\u20ac\\u00e9\\ud83d\\ude00B',"
+        "bytes=new TextEncoder().encode(text),codes=value=>Array.from(value,"
+        "char=>char.charCodeAt(0)).join(',');let splits=true;"
+        "for(let a=0;a<=bytes.length;a++)for(let b=a;b<=bytes.length;b++){"
+        "const d=new TextDecoder();const out=d.decode(bytes.subarray(0,a),"
+        "{stream:true})+d.decode(bytes.subarray(a,b),{stream:true})+"
+        "d.decode(bytes.subarray(b));if(out!==text.slice(1))splits=false}"
+        "const kept=new TextDecoder('utf-8',{ignoreBOM:true});const withBom="
+        "kept.decode(bytes.subarray(0,2),{stream:true})+kept.decode("
+        "bytes.subarray(2));const bad=new TextDecoder(),badFirst=codes("
+        "bad.decode(new Uint8Array([65,0xe0,0x80]),{stream:true})),"
+        "badEnd=bad.decode();const cut=new TextDecoder(),cutFirst=cut.decode("
+        "new Uint8Array([65,0xf0,0x9f]),{stream:true}),cutEnd=codes("
+        "cut.decode());const fatal=new TextDecoder('utf-8',{fatal:true});let "
+        "fatalSplit=fatal.decode(new Uint8Array([0xe2,0x82]),{stream:true})+"
+        "fatal.decode(new Uint8Array([0xac]),{stream:true}),fatalError='';"
+        "try{fatal.decode(new Uint8Array([0x41,0xed,0xa0]),{stream:true})}"
+        "catch(error){fatalError=error.name}"
+        "globalThis.pocSummary=splits&&withBom===text&&badFirst==="
+        "'65,65533,65533'&&badEnd===''&&cutFirst==='A'&&cutEnd==='65533'&&"
+        "fatalSplit==='\\u20ac'&&fatalError==='TypeError'?'UTF8-STREAM-OK':"
+        "'UTF8-STREAM-FAILED:'+[splits,withBom===text,badFirst,badEnd,cutFirst,"
+        "cutEnd,fatalSplit,fatalError].join('|')})()";
+    bool utf8_stream_ok = script_runtime_evaluate_diagnostic(
+        runtime, utf8_stream_probe, "<utf8-stream-probe>", &result);
+    if (!utf8_stream_ok || strcmp(result.summary, "UTF8-STREAM-OK") != 0)
+        fprintf(stderr, "utf8 stream probe: ok=%d summary=%s error=%s\n",
+                utf8_stream_ok, result.summary, result.error);
+    CHECK(utf8_stream_ok && strcmp(result.summary, "UTF8-STREAM-OK") == 0);
 
     static const char css_and_message_probe[] =
         "(()=>{const element=document.createElement('div');document.body.append("
@@ -6787,8 +9735,39 @@ int main(int argc, char **argv)
               "text/javascript", "public,max-age=3600", NULL, 1));
     unsigned char *installed_bytecode = NULL;
     size_t installed_bytecode_length = 0;
+    /* Session/cache bodies are byte spans, not C strings. Keep this allocation
+       exact-sized so ASan detects a compiler read beyond the caller's span. */
+    char *installed_source_span = budget_malloc(
+        &budget, sizeof(cached_script_source) - 1u);
+    CHECK(installed_source_span != NULL);
+    memcpy(installed_source_span, cached_script_source,
+           sizeof(cached_script_source) - 1u);
+    size_t installed_compile_baseline = budget.current;
+    for (size_t failure = 0; failure < 8; failure++) {
+        budget_inject_failure_after(&budget, failure);
+        CHECK(!script_compile_classic_bytecode(
+                  &budget, installed_source_span,
+                  sizeof(cached_script_source) - 1u, cached_script_url,
+                  128u * 1024u, &installed_bytecode,
+                  &installed_bytecode_length)
+              && installed_bytecode == NULL && installed_bytecode_length == 0
+              && budget.current == installed_compile_baseline);
+        budget_clear_failure_injection(&budget);
+    }
+    CHECK(!script_compile_classic_bytecode(
+              &budget, installed_source_span, SIZE_MAX, cached_script_url,
+              128u * 1024u, &installed_bytecode, &installed_bytecode_length)
+          && installed_bytecode == NULL && installed_bytecode_length == 0
+          && budget.current == installed_compile_baseline);
+    static const char invalid_compile_span[] = {'{'};
+    CHECK(!script_compile_classic_bytecode(
+              &budget, invalid_compile_span, sizeof(invalid_compile_span),
+              cached_script_url, 128u * 1024u, &installed_bytecode,
+              &installed_bytecode_length)
+          && installed_bytecode == NULL && installed_bytecode_length == 0
+          && budget.current == installed_compile_baseline);
     CHECK(script_compile_classic_bytecode(
-              &budget, cached_script_source,
+              &budget, installed_source_span,
               sizeof(cached_script_source) - 1, cached_script_url,
               128u * 1024u, &installed_bytecode,
               &installed_bytecode_length)
@@ -6798,6 +9777,7 @@ int main(int argc, char **argv)
               (const unsigned char *) cached_script_source,
               sizeof(cached_script_source) - 1, installed_bytecode,
               installed_bytecode_length));
+    budget_free(&budget, installed_source_span);
     budget_free(&budget, installed_bytecode);
     ScriptRuntimeOptions installed_bytecode_options = options;
     installed_bytecode_options.session = &installed_bytecode_session;

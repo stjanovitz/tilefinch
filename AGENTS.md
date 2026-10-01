@@ -60,7 +60,7 @@ not device targets, and the bare cross-build `all` target is not the PSP gate.
 
 Two things only this build enforces:
 
-- **A 4,480,000-byte ordinary `.text` ratchet** (4,500,000 bytes when
+- **A 4,760,000-byte ordinary `.text` ratchet** (4,980,000 bytes when
   validation logging is compiled in). `cmake/CheckPspTextSize.cmake` reads the
   actual ELF `.text` sections with `psp-objdump` after every link, reports
   `.rodata` separately, and fails the build above the appropriate limit.

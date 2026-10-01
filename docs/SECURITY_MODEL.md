@@ -488,7 +488,13 @@ the exact response bytes, so partitions may share an immutable compiled
 artifact only when their independently authorized bodies are byte-identical.
 Module entries additionally retain the immutable top-level site partition;
 opaque-origin modules are not placed in the shared module cache because the
-serialized `null` origin is not a principal. Child runtimes receive the
+serialized `null` origin is not a principal. Module bytecode follows the same
+rules: an entry is keyed by the top-level site, module name and response URL
+plus the SHA-256 of the exact response bytes (the bytes are not retained, so a
+non-cryptographic hash would let a colliding body run another body's code
+after SRI admitted it), it is consulted only after the fetch, CSP, SRI, CORS
+and MIME checks have admitted those bytes, and opaque-origin realms and
+captive sign-ins neither read nor write it. Child runtimes receive the
 top-level document URL at creation and reuse it for fetch, XHR, classic-script,
 and module request/cookie/cache contexts rather than substituting their frame
 URL. Stylesheet and image consumers

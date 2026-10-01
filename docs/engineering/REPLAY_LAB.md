@@ -44,6 +44,48 @@ Selected records are still parsed by the authoritative trace parser. The
 selector does not bypass response hashes, quotas, retained delays, CORS,
 cookies, or cancellation semantics.
 
+### Volatile client identifiers
+
+Some pages mint a fresh identifier into every request and the server echoes
+it into its response. chatgpt.com's send posts to
+`conversation/updates?operationId=<uuid>` with pending message ids in the
+form body, and its streamed answer names the operation and targets the
+pending message element by those ids; the page discards frames for another
+operation. A recorded send therefore never matches a new run, and even a
+matched response is ignored.
+
+Two lab/validation-only opt-ins cover this, both off by default:
+
+- `TILEFINCH_REPLAY_IGNORE_REQUEST_BODY` (`trace_ignore_request_body=1`)
+  stops strict identity from comparing request bodies, which carry fresh
+  tokens.
+- `TILEFINCH_REPLAY_VOLATILE_UUIDS` (`trace_volatile_uuids=1`) makes a
+  query value shaped as a textual UUID (8-4-4-4-12 hex digits) match any
+  UUID in the same parameter. Scheme, host, path, parameter names and
+  order, all other values and the fragment still match byte for byte, so
+  this only widens routes that differ by a minted id. For the record it
+  serves, it pairs each UUID of the recorded request (URL query and the
+  retained `NNNN.request` body, used only when its bytes hash to the
+  record's `request-body-hash`) with the live request's UUID in the same
+  field (same text since the previous `&`, `?` or UUID, same ordinal) and
+  rewrites the recorded values to the live ones in the header snapshot and
+  body as they are served. UUIDs have one length, so lengths, offsets and
+  the recorded-body hash check are unchanged; unpaired UUIDs, UUIDs inside
+  a longer hex run, conflicting pairs and more than 512 occurrences are
+  served as recorded. Each rewrite logs
+  `HTTP replay volatile-uuid record=N pairs=P occurrences=O`.
+
+### Captures must outlast the responses they hold
+
+A request still in flight when capture tears down is recorded as a
+cancellation (`error=request cancelled during scheduler teardown`, usually
+`status=0`, no body), and response-keyed replay serves exactly that. An
+input script whose end condition fires before the answer arrives (for
+example, a check that accepts an empty assistant placeholder) records a
+send without its answer. `run-perf-journeys.py --prepare-trace` lists such
+records; re-capture with an end condition on the content itself before
+using a trace to measure what those requests produce.
+
 ## Closure ledger
 
 The native and Chromium runners emit a bounded ledger with:

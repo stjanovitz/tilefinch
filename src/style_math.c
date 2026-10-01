@@ -221,6 +221,17 @@ bool style_math_resolve_number_thousandths(
     const Stylesheet *sheet, const char *text, size_t length,
     int *thousandths)
 {
+    return style_math_resolve_number_thousandths_in(
+        sheet, text, length, 1, 10000, thousandths);
+}
+
+/* The same scalar seam over an explicit inclusive range, in thousandths.
+   opacity needs 0: "calc(1 - var(--progress))" at progress 1 is a fully
+   transparent drawer scrim, not an invalid declaration. */
+bool style_math_resolve_number_thousandths_in(
+    const Stylesheet *sheet, const char *text, size_t length,
+    int minimum, int maximum, int *thousandths)
+{
     if (text == NULL || length == 0 || thousandths == NULL
         || length >= STYLE_MATH_SOURCE_CAPACITY) return false;
     StyleMathParser parser = {
@@ -234,10 +245,13 @@ bool style_math_resolve_number_thousandths(
     if (parser.failed || root < 0 || parser.at != parser.length) return false;
     const StyleMathNode *node = &parser.nodes[root];
     if (node->type != STYLE_MATH_TYPE_NUMBER || !node->folded
-        || node->a <= 0 || node->a > 10 * STYLE_MATH_Q16) return false;
+        || node->a < -10 * STYLE_MATH_Q16 || node->a > 10 * STYLE_MATH_Q16)
+        return false;
     int64_t scaled = node->a * 1000;
-    int result = (int) ((scaled + STYLE_MATH_Q16 / 2) / STYLE_MATH_Q16);
-    if (result <= 0 || result > 10000) return false;
+    int result = (int) ((scaled + (scaled < 0 ? -STYLE_MATH_Q16 / 2
+                                              : STYLE_MATH_Q16 / 2))
+                        / STYLE_MATH_Q16);
+    if (result < minimum || result > maximum) return false;
     *thousandths = result;
     return true;
 }

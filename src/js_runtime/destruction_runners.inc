@@ -27,6 +27,10 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     }
     budget_free(runtime->bridge.budget, runtime->bridge.media_source);
     runtime->bridge.media_source = NULL;
+    js_rt_bridge_computed_style_cache_free(&runtime->bridge);
+    js_rt_bridge_wrapper_refs_free(&runtime->bridge);
+    budget_free(runtime->bridge.budget, runtime->bridge.node_owner_tags);
+    runtime->bridge.node_owner_tags = NULL;
     js_rt_event_sources_destroy(&runtime->bridge);
     js_rt_websockets_destroy(&runtime->bridge);
     js_rt_multiplayer_destroy(&runtime->bridge);
@@ -102,8 +106,12 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context, runtime->dispatch_at);
         JS_FreeValue(runtime->context, runtime->page_scroll_flush);
         JS_FreeValue(runtime->context, runtime->page_scroll_apply);
+        JS_FreeValue(runtime->context, runtime->host_network_queue_stats);
+        JS_FreeValue(runtime->context, runtime->host_indexed_db_stats);
         runtime->page_scroll_flush = JS_UNDEFINED;
         runtime->page_scroll_apply = JS_UNDEFINED;
+        runtime->host_network_queue_stats = JS_UNDEFINED;
+        runtime->host_indexed_db_stats = JS_UNDEFINED;
         runtime->function_to_string = JS_UNDEFINED;
         runtime->dispatch_submit_handle = JS_UNDEFINED;
         runtime->dom_content_loaded_dispatch = JS_UNDEFINED;
@@ -136,9 +144,19 @@ void script_runtime_destroy(ScriptRuntime *runtime)
                          runtime->frame_realms[slot].global);
             JS_FreeContext(runtime->frame_realms[slot].context);
         }
+        JS_SetGCHook(runtime->runtime, NULL, NULL);
+        JS_SetLazyCompileHook(runtime->runtime, NULL, NULL);
+        if (runtime->profile != NULL) {
+            script_profile_release(runtime->context, runtime->profile);
+            budget_free(budget, runtime->profile);
+            runtime->profile = NULL;
+        }
         JS_FreeContext(runtime->context);
     }
-    if (runtime->runtime != NULL) JS_FreeRuntime(runtime->runtime);
+    if (runtime->runtime != NULL) {
+        script_census_detach(runtime->runtime);
+        JS_FreeRuntime(runtime->runtime);
+    }
     /* Instance finalizers ran above; the idle WebAssembly runtime and its
        pool are released at this boundary, not after each operation. */
     js_wasm_release_idle_runtime();

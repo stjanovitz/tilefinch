@@ -93,6 +93,66 @@ const StyleDeclaration *stylesheet_rule_declaration(
     return &sheet->declarations[rule->declaration_index];
 }
 
+size_t style_declaration_values_encode(const ComputedStyle *values,
+                                       uint8_t *encoded, size_t capacity)
+{
+    if (values == NULL || encoded == NULL
+        || capacity < STYLE_DECLARATION_VALUES_ENCODED_MAX) return 0;
+    const unsigned char *bytes = (const unsigned char *) values;
+    size_t written = 0;
+    size_t word = 0;
+    while (word < STYLE_DECLARATION_VALUE_WORDS) {
+        uint32_t value;
+        memcpy(&value, bytes + word * 4u, sizeof(value));
+        if (value == 0) {
+            word++;
+            continue;
+        }
+        size_t first = word;
+        while (word < STYLE_DECLARATION_VALUE_WORDS) {
+            memcpy(&value, bytes + word * 4u, sizeof(value));
+            if (value == 0) break;
+            word++;
+        }
+        size_t count = word - first;
+        encoded[written++] = (uint8_t) first;
+        encoded[written++] = (uint8_t) count;
+        memcpy(encoded + written, bytes + first * 4u, count * 4u);
+        written += count * 4u;
+    }
+    return written;
+}
+
+void stylesheet_declaration_values(const Stylesheet *sheet,
+                                   const StyleDeclaration *declaration,
+                                   ComputedStyle *values)
+{
+    if (values == NULL) return;
+    memset(values, 0, sizeof(*values));
+    if (sheet == NULL || declaration == NULL
+        || sheet->declaration_values == NULL
+        || declaration->values_offset > sheet->declaration_value_bytes
+        || declaration->values_length
+               > sheet->declaration_value_bytes - declaration->values_offset)
+        return;
+    const uint8_t *encoded =
+        sheet->declaration_values + declaration->values_offset;
+    size_t length = declaration->values_length;
+    unsigned char *bytes = (unsigned char *) values;
+    for (size_t at = 0; length - at >= 2u;) {
+        size_t first = encoded[at];
+        size_t count = encoded[at + 1u];
+        at += 2u;
+        /* The pool is written only by the encoder; a malformed run means
+           memory corruption, so stop rather than write out of bounds. */
+        if (first > STYLE_DECLARATION_VALUE_WORDS
+            || count > STYLE_DECLARATION_VALUE_WORDS - first
+            || count * 4u > length - at) return;
+        memcpy(bytes + first * 4u, encoded + at, count * 4u);
+        at += count * 4u;
+    }
+}
+
 size_t stylesheet_retained_bytes(const Stylesheet *sheet)
 {
     if (sheet == NULL) return 0;
@@ -130,7 +190,14 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
     }
     return sheet->capacity * sizeof(*sheet->rules)
         + sheet->focus_rule_count * sizeof(*sheet->focus_rule_indices)
+        + sheet->has_rule_count * sizeof(*sheet->has_rule_indices)
+        + sheet->has_custom_rule_count
+            * sizeof(*sheet->has_custom_rule_indices)
+        + sheet->has_class_hash_count * sizeof(*sheet->has_class_hashes)
+        + style_has_plan_bytes(sheet)
+        + sheet->selector_attribute_name_bytes
         + sheet->declaration_capacity * sizeof(*sheet->declarations)
+        + sheet->declaration_value_capacity
         + sheet->revert_rule_mask_capacity
             * sizeof(*sheet->revert_rule_masks)
         + sheet->declaration_index_slot_count
@@ -139,6 +206,7 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
         + sheet->selector_storage_bytes
         + sheet->variable_capacity * sizeof(*sheet->variables)
         + sheet->custom_rule_capacity * sizeof(*sheet->custom_rules)
+        + sheet->transition_rule_capacity * sizeof(*sheet->transition_rules)
         + sheet->generated_text_capacity * sizeof(*sheet->generated_texts)
         + sheet->counter_operation_set_capacity
             * sizeof(*sheet->counter_operation_sets)
@@ -181,6 +249,10 @@ void stylesheet_prepare_for_document_reuse(Stylesheet *sheet)
     sheet->relative_selector_cache_epoch = 0;
     memset(sheet->relative_selector_cache, 0,
            sizeof(sheet->relative_selector_cache));
+    /* The source elements belonged to the retired document. */
+    memset(sheet->style_source_nodes, 0, sizeof(sheet->style_source_nodes));
+    sheet->style_source_count = 0;
+    sheet->style_sources_bounded_out = true;
 }
 
 bool computed_style_has_text_underline(const ComputedStyle *style)

@@ -51,13 +51,17 @@ typedef enum {
     /* Frames with the analog stick held in a named cardinal direction. */
     PSP_INPUT_SCRIPT_STEP_ANALOG,
     /* Stop driving and leave through the ordinary report path. */
-    PSP_INPUT_SCRIPT_STEP_END
+    PSP_INPUT_SCRIPT_STEP_END,
+    /* Idle frames that end early once the host reports the script's page
+       condition met: a bounded wait for readiness instead of a fixed one. */
+    PSP_INPUT_SCRIPT_STEP_UNTIL
 } PspInputScriptStepKind;
 
 typedef struct {
     uint8_t kind;
     bool advance_while_busy;
     bool advance_when_painted;
+    bool advance_in_text_entry;
     uint16_t buttons;
     uint16_t ticks;
     uint8_t analog_x;
@@ -80,6 +84,12 @@ typedef struct {
     bool finished;
     bool stalled;
     bool reached_end;
+    /* Set by the host while the on-screen keyboard samples scripted input;
+       -text steps advance only then. */
+    bool text_entry_open;
+    /* Set by the host when the current `until` step's condition holds; the
+       step then ends on its next frame. */
+    bool condition_met;
     /* Borrowed from the current step for exactly the frame it fires on. */
     const char *mark;
 } PspInputScript;
@@ -111,6 +121,10 @@ bool psp_input_script_exit_pending(const PspInputScript *script);
    cancellation once so the modal receiver can unwind and report the failure. */
 bool psp_input_script_cancel_exhausted_modal(
     PspInputScript *script, PspUiInput *input);
+
+/* True while the current step is an `until` wait the host should test. */
+bool psp_input_script_awaiting_condition(const PspInputScript *script);
+void psp_input_script_satisfy_condition(PspInputScript *script);
 
 /* End a run without marking its scripted `end` step as reached. */
 void psp_input_script_interrupt(PspInputScript *script);

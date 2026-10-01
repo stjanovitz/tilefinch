@@ -366,10 +366,26 @@ int main(int argc, char **argv)
         return test_computed_paint_style_does_not_force_layout();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
         return test_computed_style_resolved_values();
+    if (argc == 2 && strcmp(argv[1], "--container-style-only") == 0)
+        return test_computed_style_tracks_container_geometry();
+    if (argc == 2 && strcmp(argv[1], "--css-transitions-only") == 0) {
+        /* Every test runs, so one failure does not hide another. */
+        int failed = test_css_transition_lifecycle();
+        failed |= test_transition_snapshot_refusal_releases_arrays();
+        failed |= test_transition_timer_exhaustion();
+        failed |= test_transition_handler_replacement();
+        failed |= test_transition_negative_delay();
+        failed |= test_transition_watch_scopes();
+        return failed != 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--transition-watch-profile") == 0)
+        return profile_transition_watch();
     if (argc == 4 && strcmp(argv[1], "--computed-style-dump") == 0)
         return computed_style_dump(argv[2], argv[3], NULL);
     if (argc == 5 && strcmp(argv[1], "--computed-style-golden") == 0)
         return computed_style_dump(argv[2], argv[4], argv[3]);
+    if (argc == 2 && strcmp(argv[1], "--cleanup-drain-only") == 0)
+        return test_idle_page_drains_wrapper_cleanups();
     if (argc == 2 && strcmp(argv[1], "--managed-challenge-heap-only") == 0)
         return test_managed_challenge_script_heap();
     if (argc == 2 && strcmp(argv[1], "--deferred-startup-only") == 0)
@@ -392,6 +408,20 @@ int main(int argc, char **argv)
         "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
         0, true, "psp", false) == 0);
     CHECK(test_loading_interaction_journey() == 0);
+    CHECK(test_script_focus_adoption() == 0);
+    CHECK(test_late_script_text_focus_adoption() == 0);
+    CHECK(test_boot_window_check_backs_off() == 0);
+    CHECK(test_idle_page_drains_wrapper_cleanups() == 0);
+    CHECK(test_large_incumbent_realm_retired_for_navigation() == 0);
+    CHECK(test_deferred_script_navigation() == 0);
+    CHECK(test_textarea_rows_geometry() == 0);
+    CHECK(test_scroll_into_view_resolves_margin_math() == 0);
+    CHECK(test_grid_fr_rows_share_after_content() == 0);
+    CHECK(test_grid_auto_row_stretch_and_focus_clip() == 0);
+    CHECK(test_inset_pseudo_disc() == 0);
+    CHECK(test_night_mode_prefers_dark() == 0);
+    CHECK(test_declared_var_and_script_form_submission() == 0);
+    CHECK(test_module_dependency_prefetch() == 0);
     CHECK(test_script_free_browsing_journey() == 0);
     CHECK(test_background_interruption_journey() == 0);
     CHECK(test_deferred_startup_journey() == 0);
@@ -412,6 +442,16 @@ int main(int argc, char **argv)
     CHECK(test_native_text_sync_does_not_relayout_twice() == 0);
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
     CHECK(test_computed_style_resolved_values() == 0);
+    CHECK(test_computed_style_tracks_container_geometry() == 0);
+    CHECK(test_inline_style_mutations_skip_stylesheet_rebuild() == 0);
+    CHECK(test_transition_clock_bounded() == 0);
+    CHECK(test_transition_eviction_inline_once() == 0);
+    CHECK(test_css_transition_lifecycle() == 0);
+    CHECK(test_transition_snapshot_refusal_releases_arrays() == 0);
+    CHECK(test_transition_timer_exhaustion() == 0);
+    CHECK(test_transition_handler_replacement() == 0);
+    CHECK(test_transition_negative_delay() == 0);
+    CHECK(test_transition_watch_scopes() == 0);
     CHECK(test_author_error_text_is_not_fatal() == 0);
     CHECK(test_emergency_break_uses_pair_kerning() == 0);
     CHECK(test_managed_challenge_script_heap() == 0);

@@ -21,6 +21,10 @@
 #define BROWSER_PSP_STRICT_CONTENT_LIMIT (16u * 1024u * 1024u)
 #define BROWSER_PSP_REALISTIC_CONTENT_LIMIT (24u * 1024u * 1024u)
 #define BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE (8u * 1024u * 1024u)
+/* Default module bytecode ceilings (BrowserConfig.module_bytecode_cache_limit).
+   See docs/engineering/MEMORY_EXPERIMENTS.md for the measurement. */
+#define BROWSER_MODULE_BYTECODE_CACHE_BYTES (1024u * 1024u)
+#define BROWSER_MODULE_BYTECODE_CACHE_STRICT_BYTES (512u * 1024u)
 
 typedef enum {
     BROWSER_PSP_MEMORY_STRICT = 0,
@@ -106,6 +110,17 @@ typedef struct {
     size_t memory_limit;
     size_t history_capacity;
     size_t session_cache_limit;
+    /* In-memory ES module bytecode kept across page loads (zero disables).
+       Separate from session_cache_limit: its entries are compiler output,
+       not HTTP responses, and a revisit or self-reload of a module-heavy app
+       hits them where the small response cache holds almost none of its
+       modules. Charged to the same page Budget and reclaimed with it. */
+    size_t module_bytecode_cache_limit;
+    /* Optional persistent module bytecode directory (empty: off, the
+       default) and whether this engine may write to it; see
+       browser_session_module_bytecode_set_disk. */
+    char module_bytecode_disk_dir[160];
+    bool module_bytecode_disk_write;
     size_t maximum_document_bytes;
     long navigation_timeout_ms;
     NavigationReplacementMode navigation_replacement_mode;
@@ -403,6 +418,11 @@ size_t browser_engine_cancel_network_work(
 BrowserNavigationJobStatus browser_engine_navigation_status(
     const BrowserEngine *engine);
 bool browser_engine_navigation_pending(const BrowserEngine *engine);
+/* While a navigation loads: parser-blocking JavaScript time spent against
+   its stage allowance (a running turn included). Pages that exhaust it keep
+   their server content but lose JavaScript, so frontends can show it. */
+bool browser_engine_parser_script_time(const BrowserEngine *engine,
+                                      uint64_t *used_us, uint64_t *limit_us);
 typedef enum {
     BROWSER_NAVIGATION_RETURN_NONE = 0,
     BROWSER_NAVIGATION_RETURN_BACK,
@@ -496,6 +516,27 @@ LayoutScrollbarWidth browser_engine_root_scrollbar_width(
 bool browser_engine_scroll_step(BrowserEngine *engine, int direction,
                                 unsigned held_frames);
 bool browser_engine_scroll_page(BrowserEngine *engine, int direction);
+/*
+ * While a provisional page's layout completion runs (from one of its
+ * cooperative checkpoints), the committed page can still be paged: the
+ * completion reads the document, not the committed layout, the render cache
+ * or the scroll position, and carries the reader's position over when it
+ * adopts. These page and paint without cancelling it; ordinary input calls
+ * cancel idle work and must not be used there. False when no completion is
+ * running or the page did not move / nothing changed.
+ */
+bool browser_engine_layout_completion_running(const BrowserEngine *engine);
+/* One page in direction; paints at once from resident tiles with a
+   checkerboard for the rest. */
+bool browser_engine_completion_scroll_page(BrowserEngine *engine,
+                                           int direction);
+/* One bounded raster slice toward the position a completion-time scroll
+   reached; true when the framebuffer changed: the complete frame, or with
+   show_progress the partial one (a full recompose, so callers ration it). */
+bool browser_engine_completion_raster_step(BrowserEngine *engine,
+                                           bool show_progress);
+/* A completion-time scroll still has tiles to fill. */
+bool browser_engine_completion_frame_pending(const BrowserEngine *engine);
 bool browser_engine_scroll_to_edge(BrowserEngine *engine, bool bottom);
 
 #define BROWSER_FIND_QUERY_LIMIT 96u
@@ -536,6 +577,48 @@ bool browser_engine_backspace(BrowserEngine *engine);
    relayout temporarily left the controller without a focus owner. This does
    not fall back to the first arbitrary control. */
 bool browser_engine_restore_autofocus(BrowserEngine *engine);
+/* Move controller focus to the form control that page script focused (the
+   element carrying data-tilefinch-focus), e.g. a <label> click or a
+   focus() call. True when focus moved. */
+bool browser_engine_adopt_script_focus(BrowserEngine *engine);
+/* The same, but only when script focused a text field. A caller polling
+   after an activation uses it so a later focus() elsewhere can't take
+   controller focus from where the user left it. */
+bool browser_engine_adopt_script_text_focus(BrowserEngine *engine);
+/* The focused region in CSS page coordinates, clipped to the ancestors
+   that clip it (overflow hidden/clip), for drawing a focus indicator. */
+bool browser_engine_focus_indicator_rect(const BrowserEngine *engine,
+                                         int *x, int *y,
+                                         int *width, int *height);
+/* With deferral on, a top-level navigation requested by page script
+   (location.href, location.reload(), ...) stays pending instead of loading
+   synchronously inside browser_engine_advance_runtime, which on the PSP froze
+   the UI for a whole page load. The frontend takes it and begins an ordinary
+   navigation job with browser_engine_begin_navigation_url; the referer and
+   user activation carry over to that job. */
+void browser_engine_set_defer_script_navigation(BrowserEngine *engine,
+                                                bool defer);
+/* With deferral on, a form page script submitted outside a user
+   activation (form.submit(), or requestSubmit() whose submit event was not
+   cancelled, e.g. after an async verification step) is taken as a
+   navigation action for the frontend to begin as a job. Inside an
+   activation the controller consumes it as before. */
+bool browser_engine_take_script_form_submission(BrowserEngine *engine,
+                                               ControllerAction *action);
+bool browser_engine_take_script_navigation(BrowserEngine *engine,
+                                           char *url, size_t capacity,
+                                           bool *record_history);
+/* Preserve the initiator and activation if a platform retries the same
+   deferred script navigation after reclaiming optional memory. A fresh URL
+   navigation must not inherit this attribution. */
+typedef struct {
+    char initiator_url[NAVIGATION_URL_LIMIT];
+    bool user_activated;
+} BrowserScriptNavigationAttribution;
+bool browser_engine_capture_script_navigation_attribution(
+    const BrowserEngine *engine, BrowserScriptNavigationAttribution *out);
+void browser_engine_restore_script_navigation_attribution(
+    BrowserEngine *engine, const BrowserScriptNavigationAttribution *attribution);
 bool browser_engine_activate(BrowserEngine *engine,
                              ControllerAction *action);
 /* Read the focused built-in provider's direct-media target without firing
@@ -655,6 +738,14 @@ BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
 void browser_engine_cancel_render_job(BrowserEngine *engine);
 bool browser_engine_render_frame_pending(const BrowserEngine *engine);
 bool browser_engine_canvas_frame_pending(const BrowserEngine *engine);
+/* Whether the committed page or one of its frames has a task its next
+   runtime advance could run now (script_runtime_task_runnable). */
+bool browser_engine_page_task_runnable(const BrowserEngine *engine);
+/* Validation diagnostics (host and PSP validation builds): the committed
+   page realm's runnable work, see script_runtime_runnable_state. False
+   without a live page realm. */
+bool browser_engine_runnable_state(BrowserEngine *engine,
+                                   ScriptRunnableState *state);
 bool browser_engine_run_idle_work(
     BrowserEngine *engine, bool *visual_changed);
 bool browser_engine_run_deferred_image_work(

@@ -1,6 +1,7 @@
 #include "tilefinch/document.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,6 +138,386 @@ static bool document_control_parser_form_set(
     return true;
 }
 
+/* Parser-insertion journal. Ancestor walks share the traversal ceiling. */
+#define DOCUMENT_PARSER_INSERTION_INITIAL_CAPACITY 64u
+
+/* The document whose tree builder is processing a token with the journal
+   armed. Lexbor's insertion callback receives only the node, and the
+   callback table is installed on the document only for the duration of that
+   token, so ordinary DOM API insertions never reach it. */
+static PocDocument *document_insertion_recorder;
+
+typedef enum {
+    DOCUMENT_ANCESTRY_OUTSIDE,
+    DOCUMENT_ANCESTRY_INSIDE,
+    DOCUMENT_ANCESTRY_UNKNOWN
+} DocumentAncestry;
+
+static DocumentAncestry document_ancestry(const lxb_dom_node_t *ancestor,
+                                          const lxb_dom_node_t *node)
+{
+    for (size_t depth = 0; node != NULL; depth++, node = node->parent) {
+        if (depth >= DOCUMENT_TRAVERSAL_NODE_LIMIT)
+            return DOCUMENT_ANCESTRY_UNKNOWN;
+        if (node == ancestor) return DOCUMENT_ANCESTRY_INSIDE;
+    }
+    return DOCUMENT_ANCESTRY_OUTSIDE;
+}
+
+static size_t document_node_depth(const lxb_dom_node_t *node)
+{
+    size_t depth = 0;
+    while (node != NULL && node->parent != NULL
+           && depth < DOCUMENT_TRAVERSAL_NODE_LIMIT) {
+        node = node->parent;
+        depth++;
+    }
+    return depth;
+}
+
+static lxb_dom_node_t *document_common_ancestor(lxb_dom_node_t *left,
+                                                lxb_dom_node_t *right)
+{
+    size_t left_depth = document_node_depth(left);
+    size_t right_depth = document_node_depth(right);
+    while (left != NULL && left_depth > right_depth) {
+        left = left->parent;
+        left_depth--;
+    }
+    while (right != NULL && right_depth > left_depth) {
+        right = right->parent;
+        right_depth--;
+    }
+    for (size_t steps = 0; left != NULL && right != NULL
+         && steps < DOCUMENT_TRAVERSAL_NODE_LIMIT; steps++) {
+        if (left == right) return left;
+        left = left->parent;
+        right = right->parent;
+    }
+    return NULL;
+}
+
+/* Past the journal, an insertion folds into a root {parent, first} (see
+   DocumentParserInsertionJournal). An insertion anywhere below a root's
+   parent is covered: the tree builder appends only to open elements, so it
+   lies in the run from first onward. Out of root slots, every root and the
+   insertion collapse into one root at their common ancestor, whose run
+   starts at the child leading to the earliest root. */
+static void document_parser_journal_coalesce(PocDocument *document,
+                                             lxb_dom_node_t *node)
+{
+    DocumentParserInsertionJournal *journal = &document->parser_insertions;
+    if (journal->coalesced != SIZE_MAX) journal->coalesced++;
+    for (size_t i = 0; i < journal->root_count; i++) {
+        if (document_ancestry(journal->roots[i].parent, node->parent)
+            == DOCUMENT_ANCESTRY_INSIDE) return;
+    }
+    if (journal->root_count < DOCUMENT_PARSER_INSERTION_ROOT_LIMIT) {
+        journal->roots[journal->root_count++] = (DocumentParserInsertionRoot) {
+            .parent = node->parent,
+            .first = node
+        };
+        return;
+    }
+    lxb_dom_node_t *common = node->parent;
+    for (size_t i = 0; common != NULL && i < journal->root_count; i++)
+        common = document_common_ancestor(common, journal->roots[i].parent);
+    /* Roots and insertions are all connected, so the document itself is the
+       worst case; a failed bounded walk leaves this insertion unreported. */
+    if (common == NULL) return;
+    lxb_dom_node_t *first = journal->roots[0].first;
+    for (size_t depth = 0; first != NULL && first->parent != common
+         && depth < DOCUMENT_TRAVERSAL_NODE_LIMIT; depth++)
+        first = first->parent;
+    if (first == NULL || first->parent != common) return;
+    journal->roots[0] = (DocumentParserInsertionRoot) {
+        .parent = common,
+        .first = first
+    };
+    journal->root_count = 1;
+}
+
+static void document_parser_journal_record(PocDocument *document,
+                                           lxb_dom_node_t *node)
+{
+    DocumentParserInsertionJournal *journal = &document->parser_insertions;
+    if (journal->root_count == 0 && journal->count == journal->capacity
+        && journal->capacity < DOCUMENT_PARSER_INSERTION_LIMIT) {
+        size_t capacity = journal->capacity == 0
+            ? DOCUMENT_PARSER_INSERTION_INITIAL_CAPACITY
+            : journal->capacity * 2u;
+        if (capacity > DOCUMENT_PARSER_INSERTION_LIMIT)
+            capacity = DOCUMENT_PARSER_INSERTION_LIMIT;
+        DocumentParserInsertion *entries = budget_realloc(
+            document->budget, journal->entries,
+            capacity * sizeof(*entries));
+        if (entries != NULL) {
+            journal->entries = entries;
+            journal->capacity = capacity;
+        }
+    }
+    if (journal->root_count != 0 || journal->count == journal->capacity) {
+        document_parser_journal_coalesce(document, node);
+        return;
+    }
+    journal->entries[journal->count++] = (DocumentParserInsertion) {
+        .parent = node->parent,
+        .node = node,
+        .previous = node->prev,
+        .next = node->next
+    };
+    if (journal->recorded != SIZE_MAX) journal->recorded++;
+}
+
+/* Host-side style generation (document.h). One browser thread owns every
+   page DOM, so process-wide state is enough; a change in any page document
+   conservatively reaches every cache. */
+#define DOCUMENT_REMOVAL_LISTENER_LIMIT 8u
+
+static uint64_t document_style_generation_value = 1;
+/* A change seen since the generation was last read. Folding it in lazily
+   leaves a burst of host writes (one parser window, one innerHTML) with a
+   flag test each after the first; the connectivity walk runs only while
+   nothing is pending. */
+static bool document_style_change_pending;
+/* A page document whose Lexbor callbacks could not be routed here: its host
+   writes are invisible, so every read reports a change. */
+static bool document_style_untracked;
+static unsigned document_style_quiet_depth;
+static struct {
+    DocumentNodeRemovalListener listener;
+    void *opaque;
+} document_removal_listeners[DOCUMENT_REMOVAL_LISTENER_LIMIT];
+static const lxb_dom_document_mutation_cb_t *document_style_tree_base;
+static const lxb_dom_document_attr_mutation_cb_t *document_style_attr_base;
+static lxb_dom_document_mutation_cb_t document_style_tree_callbacks;
+static lxb_dom_document_attr_mutation_cb_t document_style_attr_callbacks;
+
+uint64_t document_style_generation(void)
+{
+    if (document_style_change_pending || document_style_untracked) {
+        document_style_change_pending = false;
+        document_style_generation_value++;
+    }
+    return document_style_generation_value;
+}
+
+void document_style_changed(void)
+{
+    document_style_change_pending = true;
+}
+
+void document_style_quiet_begin(void)
+{
+    if (document_style_quiet_depth != UINT_MAX)
+        document_style_quiet_depth++;
+}
+
+void document_style_quiet_end(void)
+{
+    if (document_style_quiet_depth != 0) document_style_quiet_depth--;
+}
+
+bool document_node_removal_listen(DocumentNodeRemovalListener listener,
+                                  void *opaque)
+{
+    if (listener == NULL) return false;
+    for (size_t i = 0; i < DOCUMENT_REMOVAL_LISTENER_LIMIT; i++) {
+        if (document_removal_listeners[i].listener == listener
+            && document_removal_listeners[i].opaque == opaque) return true;
+    }
+    for (size_t i = 0; i < DOCUMENT_REMOVAL_LISTENER_LIMIT; i++) {
+        if (document_removal_listeners[i].listener != NULL) continue;
+        document_removal_listeners[i].listener = listener;
+        document_removal_listeners[i].opaque = opaque;
+        return true;
+    }
+    return false;
+}
+
+void document_node_removal_unlisten(DocumentNodeRemovalListener listener,
+                                    void *opaque)
+{
+    for (size_t i = 0; i < DOCUMENT_REMOVAL_LISTENER_LIMIT; i++) {
+        if (document_removal_listeners[i].listener != listener
+            || document_removal_listeners[i].opaque != opaque) continue;
+        document_removal_listeners[i].listener = NULL;
+        document_removal_listeners[i].opaque = NULL;
+    }
+}
+
+/* Only a change to a tree rooted at a document can restyle anything:
+   detached construction trees (SVG raster clones, fragments being built)
+   and nodes being destroyed off-tree do not count. */
+static void document_style_note_write(const lxb_dom_node_t *node)
+{
+    if (document_style_quiet_depth != 0 || document_style_change_pending
+        || node == NULL) return;
+    for (size_t depth = 0; depth < DOCUMENT_TRAVERSAL_NODE_LIMIT; depth++) {
+        if (node->type == LXB_DOM_NODE_TYPE_DOCUMENT) {
+            document_style_change_pending = true;
+            return;
+        }
+        if (node->parent == NULL) return;
+        node = node->parent;
+    }
+    document_style_change_pending = true;
+}
+
+static lxb_status_t document_style_node_inserted(lxb_dom_node_t *node)
+{
+    document_style_note_write(node);
+    return document_style_tree_base->inserted == NULL ? LXB_STATUS_OK
+        : document_style_tree_base->inserted(node);
+}
+
+static lxb_status_t document_style_node_removed(lxb_dom_node_t *node,
+                                                lxb_dom_node_t *old_parent)
+{
+    for (size_t i = 0; i < DOCUMENT_REMOVAL_LISTENER_LIMIT; i++) {
+        if (document_removal_listeners[i].listener != NULL)
+            document_removal_listeners[i].listener(
+                document_removal_listeners[i].opaque, node);
+    }
+    document_style_note_write(old_parent);
+    return document_style_tree_base->removed == NULL ? LXB_STATUS_OK
+        : document_style_tree_base->removed(node, old_parent);
+}
+
+#define DOCUMENT_STYLE_ATTRIBUTE_HOOK(slot)                                  \
+    static lxb_status_t document_style_attribute_##slot(                    \
+        lxb_dom_element_t *element, lxb_dom_attr_id_t name,                 \
+        const lxb_char_t *old_value, size_t old_length,                     \
+        const lxb_char_t *value, size_t length, lxb_ns_id_t ns)             \
+    {                                                                       \
+        document_style_note_write(lxb_dom_interface_node(element));         \
+        return document_style_attr_base->slot == NULL ? LXB_STATUS_OK       \
+            : document_style_attr_base->slot(element, name, old_value,      \
+                                             old_length, value, length, ns); \
+    }
+DOCUMENT_STYLE_ATTRIBUTE_HOOK(change)
+DOCUMENT_STYLE_ATTRIBUTE_HOOK(append)
+DOCUMENT_STYLE_ATTRIBUTE_HOOK(remove)
+DOCUMENT_STYLE_ATTRIBUTE_HOOK(replace)
+#undef DOCUMENT_STYLE_ATTRIBUTE_HOOK
+
+/* Route a new page document's tree and attribute callbacks through the
+   style generation, keeping Lexbor's own steps behind them. Fragment and
+   template documents copy their owner's tables and so inherit the routing. */
+static void document_style_track(lxb_html_document_t *html)
+{
+    lxb_dom_document_t *dom = &html->dom_document;
+    document_style_changed();
+    if (document_style_tree_base == NULL && dom->mutation != NULL
+        && document_style_attr_base == NULL && dom->attr_mutation != NULL) {
+        document_style_tree_base = dom->mutation;
+        document_style_attr_base = dom->attr_mutation;
+        document_style_tree_callbacks = *dom->mutation;
+        document_style_tree_callbacks.inserted = document_style_node_inserted;
+        document_style_tree_callbacks.removed = document_style_node_removed;
+        document_style_attr_callbacks = (lxb_dom_document_attr_mutation_cb_t) {
+            .change = document_style_attribute_change,
+            .append = document_style_attribute_append,
+            .remove = document_style_attribute_remove,
+            .replace = document_style_attribute_replace
+        };
+    }
+    if (dom->mutation == document_style_tree_base
+        && dom->attr_mutation == document_style_attr_base
+        && document_style_tree_base != NULL) {
+        dom->mutation = &document_style_tree_callbacks;
+        dom->attr_mutation = &document_style_attr_callbacks;
+    } else {
+        document_style_untracked = true;
+    }
+}
+
+static lxb_status_t document_parser_node_inserted(lxb_dom_node_t *node)
+{
+    PocDocument *document = document_insertion_recorder;
+    if (document != NULL && document->html != NULL && node != NULL
+        && node->parent != NULL
+        && document_ancestry(lxb_dom_interface_node(document->html),
+                             node->parent) == DOCUMENT_ANCESTRY_INSIDE) {
+        document_parser_journal_record(document, node);
+    }
+    /* Only the inserted root is a parser insertion. Lexbor then walks its
+       descendants, which exist only when the adoption agency reinserts an
+       existing subtree; they moved with the root. Stop that walk. */
+    return LXB_STATUS_STOP;
+}
+
+static const lxb_dom_document_mutation_cb_t document_parser_insertion_cbs = {
+    .inserted = document_parser_node_inserted
+};
+
+void document_parser_insertions_arm(PocDocument *document, bool armed)
+{
+    if (document == NULL) return;
+    DocumentParserInsertionJournal *journal = &document->parser_insertions;
+    if (!armed && journal->entries != NULL && document->budget != NULL)
+        budget_free(document->budget, journal->entries);
+    if (!armed) {
+        journal->entries = NULL;
+        journal->capacity = 0;
+        journal->count = 0;
+        journal->root_count = 0;
+    }
+    journal->armed = armed;
+}
+
+bool document_parser_insertions_pending(const PocDocument *document)
+{
+    return document != NULL
+        && (document->parser_insertions.count != 0
+            || document->parser_insertions.root_count != 0);
+}
+
+void document_parser_insertions_clear(PocDocument *document)
+{
+    if (document == NULL) return;
+    document->parser_insertions.count = 0;
+    document->parser_insertions.root_count = 0;
+}
+
+void document_parser_insertions_discard_subtree(PocDocument *document,
+                                                lxb_dom_node_t *root)
+{
+    if (!document_parser_insertions_pending(document) || root == NULL)
+        return;
+    DocumentParserInsertionJournal *journal = &document->parser_insertions;
+    size_t write = 0;
+    for (size_t i = 0; i < journal->count; i++) {
+        DocumentParserInsertion entry = journal->entries[i];
+        /* An undecidable ancestry is treated as inside: dropping a record
+           is recoverable, keeping a pointer the caller will free is not. */
+        if (document_ancestry(root, entry.node) != DOCUMENT_ANCESTRY_OUTSIDE
+            || document_ancestry(root, entry.parent)
+                   != DOCUMENT_ANCESTRY_OUTSIDE) continue;
+        if (entry.previous != NULL
+            && document_ancestry(root, entry.previous)
+                   != DOCUMENT_ANCESTRY_OUTSIDE) entry.previous = NULL;
+        if (entry.next != NULL
+            && document_ancestry(root, entry.next)
+                   != DOCUMENT_ANCESTRY_OUTSIDE) entry.next = NULL;
+        journal->entries[write++] = entry;
+    }
+    journal->count = write;
+    write = 0;
+    for (size_t i = 0; i < journal->root_count; i++) {
+        DocumentParserInsertionRoot item = journal->roots[i];
+        if (document_ancestry(root, item.parent)
+            != DOCUMENT_ANCESTRY_OUTSIDE) continue;
+        /* The run survives its first child's removal: restart it at the
+           parent's first child, which still covers every later append. */
+        if (document_ancestry(root, item.first) != DOCUMENT_ANCESTRY_OUTSIDE)
+            item.first = item.parent->first_child;
+        if (item.first == NULL) continue;
+        journal->roots[write++] = item;
+    }
+    journal->root_count = write;
+}
+
 static lxb_html_token_t *document_parser_token(
     lxb_html_tokenizer_t *tokenizer, lxb_html_token_t *token, void *opaque)
 {
@@ -226,8 +607,22 @@ static lxb_html_token_t *document_parser_token(
             self_closing_parent = current;
         }
     }
+    lxb_dom_document_t *dom = parser->document.parser_insertions.armed
+            && parser->document.html != NULL
+        ? &parser->document.html->dom_document : NULL;
+    const lxb_dom_document_mutation_cb_t *mutation =
+        dom == NULL ? NULL : dom->mutation;
+    PocDocument *previous_recorder = document_insertion_recorder;
+    if (dom != NULL) {
+        dom->mutation = &document_parser_insertion_cbs;
+        document_insertion_recorder = &parser->document;
+    }
     lxb_html_token_t *processed = parser->original_token_callback(
         tokenizer, token, parser->original_token_context);
+    if (dom != NULL) {
+        dom->mutation = mutation;
+        document_insertion_recorder = previous_recorder;
+    }
     if (processed != NULL && parser_form != NULL) {
         lxb_dom_node_t *current_after = lxb_html_tree_current_node(tree);
         lxb_dom_node_t *candidate =
@@ -613,6 +1008,8 @@ bool document_parser_begin(DocumentParser *parser, Budget *budget)
     BudgetAllocationOwner previous = budget_allocation_owner_enter(
         budget, parser->document.allocation_owner);
     parser->document.html = lxb_html_document_create();
+    if (parser->document.html != NULL)
+        document_style_track(parser->document.html);
     bool began = parser->document.html != NULL
         && lxb_html_document_parse_chunk_begin(parser->document.html)
                == LXB_STATUS_OK;
@@ -716,6 +1113,9 @@ bool document_parser_feed(DocumentParser *parser, const char *data,
         || (data == NULL && length != 0)
         || length > SIZE_MAX - parser->bytes_fed) return false;
     if (length == 0) return true;
+    /* Tree-builder moves and text appends do not all raise Lexbor
+       callbacks: parser input is a host style change as a whole. */
+    document_style_changed();
     /* A transport may deliver one very large chunk. Lexbor does not yield
        inside its chunk entry point, so feed bounded windows while preserving
        tokenizer continuity and sample cancellation between windows. */
@@ -751,10 +1151,11 @@ bool document_parser_feed(DocumentParser *parser, const char *data,
     return true;
 }
 
-bool document_parser_finish(DocumentParser *parser, PocDocument *document)
+bool document_parser_end_input(DocumentParser *parser)
 {
-    if (parser == NULL || document == NULL || !parser->active
-        || parser->failed) return false;
+    if (parser == NULL || !parser->active || parser->failed) return false;
+    if (parser->input_ended) return true;
+    document_style_changed();
     BudgetAllocationOwner previous = budget_allocation_owner_enter(
         parser->budget, parser->document.allocation_owner);
     lxb_status_t status = lxb_html_document_parse_chunk_end(
@@ -765,14 +1166,33 @@ bool document_parser_finish(DocumentParser *parser, PocDocument *document)
             parser->tokenizer, parser->original_token_callback,
             parser->original_token_context);
     }
-    bool refreshed = status == LXB_STATUS_OK
-        && document_refresh(&parser->document);
+    budget_allocation_owner_leave(parser->budget, previous);
+    if (status != LXB_STATUS_OK) {
+        parser->failed = true;
+        return false;
+    }
+    parser->input_ended = true;
+    return true;
+}
+
+bool document_parser_finish(DocumentParser *parser, PocDocument *document)
+{
+    if (parser == NULL || document == NULL || !parser->active
+        || parser->failed || !document_parser_end_input(parser)) return false;
+    BudgetAllocationOwner previous = budget_allocation_owner_enter(
+        parser->budget, parser->document.allocation_owner);
+    bool refreshed = document_refresh(&parser->document);
     budget_allocation_owner_leave(parser->budget, previous);
     if (!refreshed) {
         parser->failed = true;
         return false;
     }
     parser->active = false;
+    /* No parser insertion can follow EOF. Keep the armed state for the
+       committed document but return the journal's storage now. */
+    bool armed = parser->document.parser_insertions.armed;
+    document_parser_insertions_arm(&parser->document, false);
+    parser->document.parser_insertions.armed = armed;
     *document = parser->document;
     memset(parser, 0, sizeof(*parser));
     return true;
@@ -1993,6 +2413,7 @@ void document_destroy(PocDocument *document)
             budget_free(document->budget, state);
             state = next;
         }
+        budget_free(document->budget, document->parser_insertions.entries);
         budget_free(document->budget, document->title);
         budget_free(document->budget, document->body_text);
         budget_free(document->budget, document->base_href_snapshot);
