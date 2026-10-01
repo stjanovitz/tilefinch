@@ -647,11 +647,13 @@ static bool test_provisional_relayout_completes_in_idle_work(void)
         && test_text_command(&navigation.page.layout, "drawer") != NULL
         && test_text_command(&navigation.page.layout, "para-199") == NULL
         && navigation.performance.provisional_relayouts == 1;
-    /* A reader scrolled toward the edge first gets the next screens. */
+    /* A reader scrolled toward the edge first gets the next screens, at
+       least twice as deep as the last layout: each extension lays out from
+       the top, so doubling bounds the total to about twice the depth. */
     ok = ok && navigation_set_scroll(&navigation, limit - 272)
         && navigation_complete_layout(&navigation)
                == NAVIGATION_LAYOUT_COMPLETION_EXTENDED
-        && navigation.page.layout.content_limit_y > limit
+        && navigation.page.layout.content_limit_y >= 2 * limit - 40
         && navigation.page.layout_provisional;
     int extended = ok ? navigation.page.layout.content_limit_y : 0;
     ok = ok && navigation_set_scroll(&navigation, 0)
@@ -682,6 +684,69 @@ static bool test_provisional_relayout_completes_in_idle_work(void)
         && navigation.page.layout.height == completed_height
         && last->x == completed_last.x && last->y == completed_last.y
         && completed_height == full_height + 40;
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* Visuals a provisional commit left undiscovered are queued from the first
+   complete layout, even when an extension (a reader paging on) is what
+   reaches the end of the document rather than the idle completion. */
+static bool test_extension_reaching_the_end_queues_discovered_visuals(void)
+{
+    static char html[16384];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}.drawer{display:none}"
+        "#toggle:checked ~ .drawer{display:block}p{margin:0;height:40px}"
+        "</style><body><input type=checkbox id=toggle>"
+        "<label for=toggle>menu</label><p class=drawer>drawer</p>");
+    for (int i = 0; used > 0 && i < 200; i++) {
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<p>para-%d</p>", i);
+    }
+    used += snprintf(html + used, sizeof(html) - (size_t) used,
+                     "<img src=\"https://provisional.test/last.png\" "
+                     "width=40 height=40>");
+    if (used <= 0 || (size_t) used >= sizeof(html)) return false;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ok = lexbor_installed && navigation_init(&navigation, &budget, 2);
+    uint64_t generation = ok ? navigation_begin(&navigation) : 0;
+    ok = ok && navigation_commit_html(
+        &navigation, generation, "https://provisional.test/", html,
+        (size_t) used, 480, NULL, NULL, true);
+    lxb_dom_node_t *toggle = ok ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "toggle")
+        : NULL;
+    navigation.relayout_preview_threshold_us = 0;
+    ok = ok && toggle != NULL
+        && lxb_dom_element_set_attribute(
+               lxb_dom_interface_element(toggle),
+               (const lxb_char_t *) "checked", 7,
+               (const lxb_char_t *) "", 0) != NULL;
+    if (ok) layout_reuse_cache_reset(navigation.page.layout_reuse);
+    ok = ok && navigation_relayout(&navigation)
+        && navigation.page.layout_provisional;
+    /* As a provisional commit leaves it: the document's images were not
+       walked, and wait for the first complete layout. */
+    navigation.page.visual_discovery_pending = true;
+    NavigationLayoutCompletion result = NAVIGATION_LAYOUT_COMPLETION_NONE;
+    for (int step = 0; ok && step < 16 && navigation.page.layout_provisional;
+         step++) {
+        ok = navigation_set_scroll(
+            &navigation, navigation.page.layout.content_limit_y - 272);
+        result = navigation_complete_layout(&navigation);
+        ok = ok && (result == NAVIGATION_LAYOUT_COMPLETION_EXTENDED
+                    || result == NAVIGATION_LAYOUT_COMPLETION_ADOPTED);
+    }
+    ok = ok && result == NAVIGATION_LAYOUT_COMPLETION_ADOPTED
+        && !navigation.page.layout_provisional
+        && navigation.performance.provisional_extensions >= 1
+        && !navigation.page.visual_discovery_pending
+        && navigation.page.deferred_image_count == 1;
     navigation_destroy(&navigation);
     bool clean = budget.current == 0;
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;

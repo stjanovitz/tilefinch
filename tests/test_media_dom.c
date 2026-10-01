@@ -31,8 +31,60 @@ static lxb_dom_node_t *find_element_by_id(lxb_dom_node_t *node,
     return NULL;
 }
 
+static int test_structured_scan_parity(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    budget_install_lexbor(&budget);
+    char html[8192];
+    size_t length = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><script type=application/ld+json>{</script>"
+        "<script>window.data={broken}</script>");
+    for (unsigned i = 0; i < 16u; i++) {
+        int written = snprintf(html + length, sizeof(html) - length,
+            "<div>ignored</div><script type=application/ld+json>["
+            "{\"@type\":\"AudioObject\",\"contentUrl\":\"/audio-%u.m4a\"},"
+            "{\"@type\":\"VideoObject\",\"contentUrl\":\"/video-%u.mp4\"}]"
+            "</script>", i, i);
+        CHECK(written >= 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, length, 42));
+    size_t retained = budget.current;
+    MediaStructuredAudioIndex audio;
+    MediaStructuredVideoIndex video;
+    CHECK(media_discover_structured_audio(&document, &audio)
+          && media_discover_structured_video(&document, &video));
+    CHECK(audio.candidate_count == MEDIA_STRUCTURED_AUDIO_CANDIDATE_LIMIT
+          && video.candidate_count == MEDIA_STRUCTURED_VIDEO_CANDIDATE_LIMIT
+          && audio.candidate_overflow == 4u && video.candidate_overflow == 8u
+          && audio.inspected_bytes == video.inspected_bytes
+          && audio.inspected_nodes == video.inspected_nodes
+          && audio.malformed_scripts == 1u && video.malformed_scripts == 1u
+          && audio.truncated_scripts == 0u && video.truncated_scripts == 0u);
+    char url[64];
+    CHECK(media_structured_audio_copy_url(&audio.candidates[11], url, sizeof(url))
+          && strcmp(url, "/audio-11.m4a") == 0
+          && media_structured_video_copy_url(&video.candidates[7], url, sizeof(url))
+          && strcmp(url, "/video-7.mp4") == 0
+          && budget.current == retained);
+    /* Invalid documents clear either result rather than retaining a previous
+       scan. Null result pointers must fail softly as before. */
+    CHECK(!media_discover_structured_audio(NULL, &audio)
+          && !media_discover_structured_video(NULL, &video)
+          && audio.candidate_count == 0u && audio.inspected_bytes == 0u
+          && video.candidate_count == 0u && video.inspected_bytes == 0u
+          && !media_discover_structured_audio(&document, NULL)
+          && !media_discover_structured_video(&document, NULL));
+    document_destroy(&document);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_structured_scan_parity() == 0);
     Budget budget;
     budget_init(&budget, 14u * MIB);
     budget_install_lexbor(&budget);
@@ -410,6 +462,11 @@ int main(void)
           && structured.truncated_scripts == 1u
           && structured.malformed_scripts == 0u
           && structured.candidate_count == 0u);
+    CHECK(!media_discover_structured_video(&large_document, &videos)
+          && videos.inspected_bytes == structured.inspected_bytes
+          && videos.truncated_scripts == structured.truncated_scripts
+          && videos.malformed_scripts == structured.malformed_scripts
+          && videos.candidate_count == 0u);
     document_destroy(&large_document);
     free(large_html);
     CHECK(budget.current == 0);

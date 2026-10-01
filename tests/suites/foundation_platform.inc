@@ -205,6 +205,90 @@ static bool test_psp_network_reinitialization_policy(void)
         || !psp_network_apctl_state_is_associating(5)
         || !psp_network_apctl_state_is_associating(6)
         || psp_network_apctl_state_is_associating(7)) return false;
+    /* A stuck firmware lookup is stopped once, only after the hard bound,
+       and across a wrap of the millisecond clock. */
+    if (psp_network_dns_lookup_overdue(false, 0u, 60000u, false)
+        || psp_network_dns_lookup_overdue(true, 1000u, 3999u, false)
+        || !psp_network_dns_lookup_overdue(true, 1000u, 4000u, false)
+        || psp_network_dns_lookup_overdue(true, 1000u, 9000u, true)
+        || !psp_network_dns_lookup_overdue(
+               true, UINT32_MAX - 1000u, 2000u, false)
+        || psp_network_dns_lookup_overdue(
+               true, UINT32_MAX - 1000u, 1000u, false)) return false;
+    /* Navigation watchdog: a load that keeps progressing survives past the
+       old one-minute total; 30 s without progress, or the cap, expires. */
+    {
+        PspNavigationWatchdog watchdog;
+        psp_navigation_watchdog_start(&watchdog, 1000u, 5u);
+        uint64_t at = 1000u;
+        size_t units = 5u;
+        bool expired = false;
+        for (int step = 0; step < 9 && !expired; step++) {
+            at += 10000000u;
+            units += 100u;
+            expired = psp_navigation_watchdog_expired(&watchdog, at, units);
+        }
+        if (expired) return false;
+        if (psp_navigation_watchdog_expired(
+                &watchdog, at + PSP_NAVIGATION_STALL_US - 1u, units)
+            || !psp_navigation_watchdog_expired(
+                   &watchdog, at + PSP_NAVIGATION_STALL_US, units)) return false;
+        psp_navigation_watchdog_start(&watchdog, 0u, 0u);
+        units = 0u;
+        for (uint64_t t = 1000000u; t < PSP_NAVIGATION_CAP_US;
+             t += 1000000u) {
+            if (psp_navigation_watchdog_expired(&watchdog, t, ++units))
+                return false;
+        }
+        if (!psp_navigation_watchdog_expired(
+                &watchdog, PSP_NAVIGATION_CAP_US, ++units)) return false;
+    }
+    /* Wi-Fi join retry. An attempt that dropped back to DISCONNECTED is
+       reissued after a one-second pause; a Connect that never started
+       after five seconds is reissued; a stuck step is disconnected. */
+    if (psp_network_join_action(0, true, 3184000u, 999999u, 1u)
+            != PSP_NETWORK_JOIN_WAIT
+        || psp_network_join_action(0, true, 4184000u, 1000000u, 1u)
+            != PSP_NETWORK_JOIN_CONNECT
+        || psp_network_join_action(0, false, 4999999u, 4999999u, 1u)
+            != PSP_NETWORK_JOIN_WAIT
+        || psp_network_join_action(0, false, 5000000u, 5000000u, 1u)
+            != PSP_NETWORK_JOIN_CONNECT
+        || psp_network_join_action(6, true, 12000000u, 9999999u, 1u)
+            != PSP_NETWORK_JOIN_WAIT
+        || psp_network_join_action(6, true, 13000000u, 10000000u, 1u)
+            != PSP_NETWORK_JOIN_DISCONNECT
+        || psp_network_join_action(2, true, 11000000u, 10000000u, 2u)
+            != PSP_NETWORK_JOIN_DISCONNECT
+        || psp_network_join_action(5, true, 11000000u, 10000000u, 1u)
+            != PSP_NETWORK_JOIN_DISCONNECT
+        || psp_network_join_action(3, true, 20000000u, 14999999u, 1u)
+            != PSP_NETWORK_JOIN_WAIT
+        || psp_network_join_action(3, true, 20000000u, 15000000u, 1u)
+            != PSP_NETWORK_JOIN_DISCONNECT
+        /* SCANNING and GOT_IP are never acted on. */
+        || psp_network_join_action(1, false, 40000000u, 40000000u, 1u)
+            != PSP_NETWORK_JOIN_WAIT
+        || psp_network_join_action(4, true, 40000000u, 40000000u, 1u)
+            != PSP_NETWORK_JOIN_WAIT
+        /* The attempt budget is finite, and nothing happens before the
+           first Connect. */
+        || psp_network_join_action(
+               0, true, 40000000u, 40000000u, PSP_NETWORK_JOIN_ATTEMPTS)
+            != PSP_NETWORK_JOIN_WAIT
+        || psp_network_join_action(0, false, 40000000u, 40000000u, 0u)
+            != PSP_NETWORK_JOIN_WAIT) return false;
+    /* Every retry fits inside the 45 s connect deadline: the worst case is
+       two stalled key exchanges, each reset after 3 s + 10 s, a pause, and
+       a third join that needs its ordinary 5 s. */
+    if (2u * (3000000u + PSP_NETWORK_JOIN_STEP_STALL_US
+              + PSP_NETWORK_JOIN_RETRY_PAUSE_US) + 5000000u > 45000000u)
+        return false;
+    /* Only a guard-stopped lookup is retried, and only once. */
+    if (!psp_network_dns_should_retry(false, true, 0u)
+        || psp_network_dns_should_retry(false, true, 1u)
+        || psp_network_dns_should_retry(false, false, 0u)
+        || psp_network_dns_should_retry(true, true, 0u)) return false;
     const int profile_results[] = {-1, -1, 0, -1, 0};
     if (psp_network_first_fallback_profile(
             1, 5, test_psp_profile_check,
@@ -1509,6 +1593,10 @@ static int test_foundation(void)
     CHECK(test_large_parser_feed_is_cooperative(&budget));
     CHECK(budget.current == 0);
 
+    puts("test: parser insertion journal for MutationObserver");
+    CHECK(test_parser_insertion_journal(&budget));
+    CHECK(budget.current == 0);
+
     puts("test: scripting-aware noscript parsing");
     CHECK(test_parser_scripting_noscript_model(&budget));
     CHECK(test_parser_inert_script_payload_policy(&budget));
@@ -1565,6 +1653,12 @@ static int test_foundation(void)
     CHECK(test_picture_source_media_selection(&budget));
     puts("test: bounded inline SVG raster resource");
     CHECK(test_inline_svg_resource(&budget));
+    puts("test: mutation refresh reuses unchanged inline SVG rasters");
+    CHECK(test_inline_svg_refresh_reuses_unchanged_rasters(&budget));
+    CHECK(test_image_rebuild_near_budget_releases_unlent_images(&budget));
+    CHECK(test_inline_svg_refresh_shares_style_memos(&budget));
+    CHECK(test_inline_svg_refresh_reuses_layout_ancestry(&budget));
+    CHECK(test_inline_svg_discovery_is_atomic(&budget));
     CHECK(test_visible_inline_svg_priority_resource(&budget));
     CHECK(test_bounded_large_data_svg_resource(&budget));
     puts("test: bounded extreme SVG raster edge");
@@ -2060,6 +2154,19 @@ static int test_foundation(void)
     JS_FreeValue(pool_context, pool_summary);
     JS_FreeValue(pool_context, pool_global);
     CHECK(budget_quickjs_pool_reserved_peak(quickjs_pool) > 0);
+    /* The pool hands out QuickJS's 4 KiB arenas and its >504-byte
+       blocks; the engine carves every small object from those arenas
+       itself, so the 1,000 closures above do not reach the pool one by
+       one. (quickjs.c routes everything to the pool under
+       __SANITIZE_ADDRESS__, JS_MALLOC_LARGE_BLOCKS_ONLY; GCC defines it
+       for AddressSanitizer, Apple clang does not.) */
+    BudgetQuickJSActivity pool_activity;
+    budget_quickjs_pool_activity(quickjs_pool, &pool_activity);
+    CHECK(pool_activity.pool_fresh_blocks > 0
+          && pool_activity.pool_blocks >= pool_activity.pool_fresh_blocks);
+#if !defined(__SANITIZE_ADDRESS__)
+    CHECK(pool_activity.pool_blocks < 1000);
+#endif
     JS_FreeContext(pool_context);
     JS_FreeRuntime(pool_runtime);
     size_t pool_before_trim = budget.current;

@@ -188,8 +188,11 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
         }
     }
     JS_FreeValue(runtime->context, uncaught_task);
-    JSValue network_queue = JS_GetPropertyStr(
-        runtime->context, global, "__tilefinchNetworkQueueStats");
+    /* The records behind __tilefinchNetworkQueueStats and
+       __tilefinchIndexedDBStats: the same values without a getter call per
+       field per advance. */
+    JSValue network_queue = JS_DupValue(
+        runtime->context, runtime->host_network_queue_stats);
 #define READ_NETWORK_QUEUE(field, property)                                  \
     do {                                                                     \
         JSValue value = JS_GetPropertyStr(runtime->context, network_queue,   \
@@ -212,8 +215,8 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
     }
 #undef READ_NETWORK_QUEUE
     JS_FreeValue(runtime->context, network_queue);
-    JSValue indexed_db = JS_GetPropertyStr(
-        runtime->context, global, "__tilefinchIndexedDBStats");
+    JSValue indexed_db = JS_DupValue(
+        runtime->context, runtime->host_indexed_db_stats);
 #define READ_INDEXED_DB(field, property)                                     \
     do {                                                                     \
         JSValue value = JS_GetPropertyStr(runtime->context, indexed_db,      \
@@ -408,6 +411,43 @@ void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
     snprintf(result->error_source_context,
              sizeof(result->error_source_context), "%s",
              runtime->result.error_source_context);
+}
+
+bool script_runtime_take_form_submission_body(ScriptRuntime *runtime,
+                                              Budget *budget,
+                                              size_t maximum_length,
+                                              char **output,
+                                              size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (output != NULL) *output = NULL;
+    if (runtime == NULL || budget == NULL || output == NULL) return false;
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue body = JS_GetPropertyStr(
+        runtime->context, global, "__tilefinchSubmittedBody");
+    bool taken = false;
+    if (JS_IsString(body)) {
+        size_t body_length = 0;
+        const char *text = JS_ToCStringLen(
+            runtime->context, &body_length, body);
+        char *copy = text != NULL && body_length <= maximum_length
+            ? budget_malloc_category(budget, BUDGET_CATEGORY_NAVIGATION,
+                                     body_length + 1u)
+            : NULL;
+        if (copy != NULL) {
+            memcpy(copy, text, body_length);
+            copy[body_length] = '\0';
+            *output = copy;
+            if (length != NULL) *length = body_length;
+            taken = true;
+        }
+        if (text != NULL) JS_FreeCString(runtime->context, text);
+    }
+    JS_FreeValue(runtime->context, body);
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             "__tilefinchSubmittedBody", JS_NULL);
+    JS_FreeValue(runtime->context, global);
+    return taken;
 }
 
 bool script_runtime_take_form_submission(

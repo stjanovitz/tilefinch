@@ -141,6 +141,15 @@ typedef struct {
 } ImagePendingRasterDecode;
 
 typedef struct {
+    lxb_dom_node_t *node;
+    ComputedStyle style;
+} ImageRefreshAncestorStyle;
+enum { IMAGE_REFRESH_ANCESTOR_LIMIT = 8 };
+_Static_assert(sizeof(ImageRefreshAncestorStyle) * IMAGE_REFRESH_ANCESTOR_LIMIT
+                   <= 4096u,
+               "refresh ancestor scratch must remain within 4 KiB");
+
+typedef struct {
     const PocDocument *document;
     ImageResources *images;
     Stylesheet *stylesheet;
@@ -166,6 +175,22 @@ typedef struct {
     bool defer_document_images;
     lxb_dom_node_t *const *deferred_nodes;
     size_t deferred_node_count;
+    /* A refresh builds into a fresh table; this is the outgoing one (read
+       only) and the nodes whose entries it is about to retire. */
+    const ImageResources *refresh_previous;
+    lxb_dom_node_t *const *refresh_retired_nodes;
+    size_t refresh_retired_count;
+    /* A whole-table rebuild: every entry of refresh_previous retires. */
+    bool refresh_retires_all;
+    /* Scratch for a single synchronous refresh batch, never retained by the
+       image table. Only the first eight ancestors are worth memoizing on the
+       PSP; deeper or allocation-refused chains still resolve normally. */
+    ImageRefreshAncestorStyle *refresh_ancestors;
+    size_t refresh_ancestor_capacity;
+    size_t refresh_ancestor_count;
+    uint64_t refresh_document_generation;
+    uint64_t refresh_stylesheet_generation;
+    uint64_t refresh_container_generation;
     PendingImageFetch pending[IMAGE_FETCH_CONCURRENCY];
     ImageOriginHealth unhealthy_origins[
         IMAGE_FETCH_UNHEALTHY_ORIGIN_LIMIT];
@@ -438,6 +463,7 @@ typedef struct {
     Stylesheet *sheet;
     Budget *budget;
     StyleAncestorBloomCache *ancestors;
+    ImageRefreshAncestorStyle *refresh_ancestors;
     bool owned;
     bool selector_owned;
 } ImageStyleCacheScope;
@@ -447,6 +473,7 @@ static void image_style_cache_scope_end(ImageStyleCacheScope *scope)
     if (scope->selector_owned) style_selector_cooperation_end(scope->sheet);
     if (scope->owned) style_variable_cache_end(scope->sheet);
     budget_free(scope->budget, scope->ancestors);
+    budget_free(scope->budget, scope->refresh_ancestors);
 }
 
 static bool image_profile_enabled(void)
@@ -545,6 +572,86 @@ static bool image_name_is(lxb_dom_node_t *node, const char *wanted)
     const char *name = document_element_name(node, &length);
     return name != NULL && strlen(wanted) == length
            && memcmp(name, wanted, length) == 0;
+}
+
+static bool image_name_is_any(lxb_dom_node_t *node,
+                              const char *const *names, size_t count)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    for (size_t i = 0; name != NULL && i < count; i++) {
+        if (strlen(names[i]) == length
+            && strncasecmp(name, names[i], length) == 0) return true;
+    }
+    return false;
+}
+
+bool image_inline_svg_draws_content(lxb_dom_node_t *svg, size_t visit_limit,
+                                    bool *bounded_out)
+{
+    static const char *const drawing[] = {
+        "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
+        "use", "text", "image", "foreignobject"
+    };
+    static const char *const non_rendering[] = {
+        "defs", "symbol", "lineargradient", "radialgradient", "pattern",
+        "clippath", "mask", "marker", "filter", "title", "desc",
+        "metadata", "style", "script"
+    };
+    if (bounded_out != NULL) *bounded_out = false;
+    size_t visited = 0;
+    for (lxb_dom_node_t *node = svg == NULL ? NULL : svg->first_child;
+         node != NULL;) {
+        if (visited++ == visit_limit) {
+            if (bounded_out != NULL) *bounded_out = true;
+            return false;
+        }
+        bool descend = true;
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (image_name_is_any(node, drawing,
+                                  sizeof(drawing) / sizeof(drawing[0]))) {
+                return true;
+            }
+            descend = !image_name_is_any(
+                node, non_rendering,
+                sizeof(non_rendering) / sizeof(non_rendering[0]));
+        }
+        if (descend && node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != svg && node->next == NULL) node = node->parent;
+        if (node == svg) break;
+        node = node->next;
+    }
+    return false;
+}
+
+static bool image_svg_dimension_zero(lxb_dom_node_t *svg, const char *name)
+{
+    size_t length = 0;
+    const char *value = document_attribute(svg, name, &length);
+    if (value == NULL || length == 0) return false;
+    size_t at = 0;
+    while (at < length && isspace((unsigned char) value[at])) at++;
+    if (at == length || value[at] != '0') return false;
+    while (at < length && (value[at] == '0' || value[at] == '.')) at++;
+    if (at + 2u <= length && strncasecmp(value + at, "px", 2) == 0) at += 2u;
+    while (at < length && isspace((unsigned char) value[at])) at++;
+    return at == length;
+}
+
+/* A sprite sheet: a zero-width or zero-height <svg> that only defines
+   symbols. Nothing of it can paint, so it is not an image to decode. */
+static bool image_inline_svg_is_sprite_sheet(lxb_dom_node_t *svg)
+{
+    enum { SPRITE_SHEET_VISIT_LIMIT = 4096 };
+    if (!image_svg_dimension_zero(svg, "width")
+        && !image_svg_dimension_zero(svg, "height")) return false;
+    bool bounded_out = false;
+    return !image_inline_svg_draws_content(
+               svg, SPRITE_SHEET_VISIT_LIMIT, &bounded_out)
+        && !bounded_out;
 }
 
 static uint64_t image_hash_url(const char *url)
@@ -1794,7 +1901,7 @@ static bool inline_svg_apply_presentation_value(
     lxb_dom_node_t *original, lxb_dom_node_t *clone,
     const ComputedStyle *style, const char *name, const char *css_value)
 {
-    char value[sizeof(((StyleCustomRule *) 0)->value)];
+    char value[STYLE_CUSTOM_VALUE_CAPACITY];
     size_t name_length = strlen(name);
     bool from_css = css_value != NULL;
     if (from_css) snprintf(value, sizeof(value), "%s", css_value);
@@ -2016,6 +2123,74 @@ static bool external_svg_materialize_symbol(
     return true;
 }
 
+static bool image_node_in_refresh_set(
+    const lxb_dom_node_t *node, lxb_dom_node_t *const *nodes,
+    size_t node_count);
+
+/* Only a plain inline-SVG raster qualifies: budget-owned pixels at their
+   source size with no encoded body, session lease, canvas or paint role. */
+static bool image_refresh_svg_lendable(const ImageResource *item)
+{
+    return item->pixels != NULL && item->pixel_body == NULL
+        && item->encoded == NULL && item->encoded_body == NULL
+        && !item->is_canvas && item->canvas_native_surface == NULL
+        && !item->is_mask && !item->is_background
+        && item->pseudo == PSEUDO_NONE && item->source_hash == 0
+        && item->width > 0 && item->height > 0
+        && item->width == item->source_width
+        && item->height == item->source_height;
+}
+
+/* A mutation-driven refresh rebuilds into a fresh table, so the hash lookup
+   in load_inline_svg cannot see the outgoing rasters. The serialized markup
+   is the rasterizer's entire input: every presentation value, currentColor
+   and the default viewport (the element's resolved width and height) are
+   written into it before hashing, and image_svg_decode reads nothing else.
+   Equal hashes are therefore the same pixels, exactly as the in-table alias
+   already assumes. Prefer a lender the refresh keeps; its surface outlives
+   the commit, so the new entry stays a plain alias. */
+static const ImageResource *image_refresh_previous_svg(
+    const ImageLoadContext *context, uint64_t hash, bool *retained)
+{
+    *retained = false;
+    const ImageResources *previous = context->refresh_previous;
+    if (previous == NULL) return NULL;
+    if (context->refresh_retires_all) {
+        for (size_t i = 0; i < previous->count; i++) {
+            const ImageResource *item = &previous->items[i];
+            if (item->url_hash == hash && image_refresh_svg_lendable(item))
+                return item;
+        }
+        return NULL;
+    }
+    const ImageResource *match = NULL;
+    for (size_t i = 0; i < previous->count; i++) {
+        const ImageResource *item = &previous->items[i];
+        if (item->url_hash != hash || !image_refresh_svg_lendable(item)) {
+            continue;
+        }
+        if (match == NULL) match = item;
+        if (!image_node_in_refresh_set(
+                item->node, context->refresh_retired_nodes,
+                context->refresh_retired_count)) {
+            *retained = true;
+            return item;
+        }
+    }
+    if (match == NULL) return NULL;
+    for (size_t i = 0; i < previous->count; i++) {
+        const ImageResource *item = &previous->items[i];
+        if (item->pixels == match->pixels
+            && !image_node_in_refresh_set(
+                item->node, context->refresh_retired_nodes,
+                context->refresh_retired_count)) {
+            *retained = true;
+            break;
+        }
+    }
+    return match;
+}
+
 static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
                             const ComputedStyle *style)
 {
@@ -2032,6 +2207,8 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
         return true;
     }
     size_t failures_before = context->budget->failure_count;
+    uint64_t serialize_started = image_profile_enabled()
+        ? image_profile_now_us() : 0;
     InlineSvgBuffer source = {.budget = context->budget};
     if (!inline_svg_serialize_expanded(context, node, style, &source)) {
         budget_free(context->budget, source.data);
@@ -2044,6 +2221,10 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
                                      style == NULL ? 0 : style->color);
     image_trace("inline-svg", source.data, source.length);
     uint64_t hash = image_hash_bytes(source.data, source.length);
+    if (serialize_started != 0) {
+        images->stats.inline_svg_serialize_us +=
+            image_profile_now_us() - serialize_started;
+    }
     const ImageResource *duplicate = image_find_hash(images, hash);
     if (duplicate != NULL) {
         ImageResource alias = *duplicate;
@@ -2059,11 +2240,56 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
     }
     size_t remaining = context->maximum_decoded_bytes
                        - images->stats.decoded_bytes;
+    bool lender_retained = false;
+    const ImageResource *lender =
+        image_refresh_previous_svg(context, hash, &lender_retained);
+    size_t lent_bytes = lender == NULL ? 0
+        : (size_t) lender->width * (size_t) lender->height * 4u;
+    /* A retiring lender's bytes were already deducted from this table's
+       total, so re-charge them exactly as a fresh decode would, against the
+       same quota; a raster that would not fit is left to the decoder to
+       refuse. A retained lender keeps its charge and this is an alias. */
+    if (lender != NULL && (lender_retained || lent_bytes <= remaining)) {
+        ImageResource borrowed = {
+            .node = node, .url_hash = hash, .pixels = lender->pixels,
+            .source_width = lender->source_width,
+            .source_height = lender->source_height,
+            .width = lender->width, .height = lender->height,
+            .borrows_previous = true
+        };
+        budget_free(context->budget, source.data);
+        if (!image_add(images, borrowed)) return false;
+        image_trace(lender_retained ? "inline-svg-refresh-alias"
+                                    : "inline-svg-refresh-adopt", "", 0);
+        images->stats.inline_svg_refresh_reused++;
+        if (lender_retained) {
+            images->stats.duplicate++;
+            return true;
+        }
+        images->stats.attempted++;
+        images->stats.loaded++;
+        images->stats.decoded_bytes += lent_bytes;
+        if (lent_bytes > images->stats.largest_source_decode_bytes) {
+            images->stats.largest_source_decode_bytes = lent_bytes;
+        }
+        if (lent_bytes > images->stats.largest_target_decode_bytes) {
+            images->stats.largest_target_decode_bytes = lent_bytes;
+        }
+        return true;
+    }
     int width = 0, height = 0;
     images->stats.attempted++;
+    images->stats.inline_svg_rasterized++;
+    image_trace("inline-svg-rasterize", source.data, source.length);
+    uint64_t rasterize_started = image_profile_enabled()
+        ? image_profile_now_us() : 0;
     unsigned char *pixels = image_svg_decode(
         source.data, source.length, context->budget, remaining,
         &width, &height);
+    if (rasterize_started != 0) {
+        images->stats.inline_svg_rasterize_us +=
+            image_profile_now_us() - rasterize_started;
+    }
     budget_free(context->budget, source.data);
     if (pixels == NULL || width <= 0 || height <= 0
         || (size_t) width > SIZE_MAX / (size_t) height
@@ -4111,6 +4337,13 @@ static bool image_process_node(
     }
     *traverse = style->display != DISPLAY_NONE && !style->hidden;
     bool atomic_inline_svg = *traverse && image_name_is(node, "svg");
+    if (atomic_inline_svg && image_inline_svg_is_sprite_sheet(node)) {
+        /* Its symbols render through <use> in other SVGs, which serialize
+           the referenced symbol themselves; nothing below it is an HTML
+           resource either. */
+        *traverse = false;
+        return true;
+    }
     bool deferred = context->defer_document_images;
     if (image_name_is(node, "img")) {
         for (size_t i = 0; !deferred && i < context->deferred_node_count; i++)
@@ -4200,6 +4433,11 @@ static bool image_process_node(
                       strlen(style->mask_image), true, false,
                       PSEUDO_NONE)) return false;
     if (!*traverse) return true;
+    /* Inline SVG is decoded as one atomic replaced image. Its serializer
+       already resolved the descendant presentation cascade. Set this before
+       the pseudo-image prefilter can return, or that common fast path walks
+       the descendants again despite having no independent HTML resources. */
+    if (atomic_inline_svg) *traverse = false;
     /* Generated-content images can only come from ::before/::after rules.
        When no such rule that can supply one matches this element, both
        pseudo resolutions are skipped; the exact test on the few flagged
@@ -4276,11 +4514,6 @@ static bool image_process_node(
                           strlen(generated.mask_image), true, false,
                           pseudo)) return false;
     }
-    /* Inline SVG is decoded as one atomic replaced image. Its serializer has
-       already resolved the retained presentation cascade for the complete
-       subtree; walking those descendants again can discover no independently
-       paintable HTML resource and would repeat every computed-style pass. */
-    if (atomic_inline_svg) *traverse = false;
     return true;
 }
 
@@ -4333,12 +4566,55 @@ static bool image_process_refresh_node(
         if (count == MAXIMUM_ANCESTORS) return false;
         ancestors[count++] = at;
     }
-    ComputedStyle parent = {0};
-    bool has_parent = false;
+    /* A retained layout entry is keyed by the exact inherited style. Use
+       the same html inheritance root as complete image discovery/layout,
+       not the uncached embedder entry point's NULL parent. */
+    ComputedStyle parent = context->style_cache == NULL
+        ? (ComputedStyle) {0} : layout_initial_root_style();
+    bool has_parent = context->style_cache != NULL;
+    if (context->refresh_document_generation
+            != context->document->content_generation
+        || context->refresh_stylesheet_generation
+            != context->stylesheet->build_generation
+        || context->refresh_container_generation
+            != context->stylesheet->container_state_generation) {
+        context->refresh_ancestor_count = 0;
+        context->refresh_document_generation = context->document->content_generation;
+        context->refresh_stylesheet_generation = context->stylesheet->build_generation;
+        context->refresh_container_generation = context->stylesheet->container_state_generation;
+    }
+    size_t depth = 0;
     while (count != 0) {
-        parent = style_for_node(
-            context->stylesheet, ancestors[--count],
-            has_parent ? &parent : NULL);
+        lxb_dom_node_t *ancestor = ancestors[--count];
+        if (depth < context->refresh_ancestor_count
+            && context->refresh_ancestors[depth].node == ancestor) {
+            parent = context->refresh_ancestors[depth].style;
+            context->images->stats.node_style_cache_hits++;
+        } else {
+            /* Once the paths diverge, even a later equal pointer must not
+               reuse a result inherited from the old path. */
+            if (depth < context->refresh_ancestor_count)
+                context->refresh_ancestor_count = depth;
+            if (context->style_cache != NULL) {
+                ComputedStyle resolved;
+                bool hit = layout_reuse_cache_resolve_style(
+                    context->style_cache, context->stylesheet, context->fonts,
+                    ancestor, has_parent ? &parent : NULL, &resolved);
+                if (hit) context->images->stats.node_style_cache_hits++;
+                else context->images->stats.node_style_cache_misses++;
+                parent = resolved;
+            } else {
+                parent = style_for_node(context->stylesheet, ancestor,
+                                        has_parent ? &parent : NULL);
+            }
+            if (depth < context->refresh_ancestor_capacity) {
+                context->refresh_ancestors[depth] = (ImageRefreshAncestorStyle) {
+                    .node = ancestor, .style = parent
+                };
+                context->refresh_ancestor_count = depth + 1u;
+            }
+        }
+        depth++;
         has_parent = true;
         /* A complete traversal would never reach a descendant of a hidden
            element. Refreshing one exact resource must retain that rule. */
@@ -4500,7 +4776,7 @@ static bool images_load_external_impl(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
     bool defer_document_images, lxb_dom_node_t *const *deferred_nodes,
-    size_t deferred_node_count)
+    size_t deferred_node_count, const ImageResources *refresh_previous)
 {
     if (deferred_node_count > 128u
         || (deferred_node_count != 0 && deferred_nodes == NULL)) return false;
@@ -4521,8 +4797,12 @@ static bool images_load_external_impl(
     if (maximum_count > MAX_TRACKED_IMAGE_NODES) {
         maximum_count = MAX_TRACKED_IMAGE_NODES;
     }
-    layout_reuse_cache_prepare(
-        style_cache, stylesheet, fonts, images, viewport_width);
+    /* Selected refresh prepared this cache against the stable outgoing table
+       before creating its transactional replacement. Never retain a pointer
+       to that stack-local temporary in the page's cache. */
+    if (!refresh_complete_nodes)
+        layout_reuse_cache_prepare(
+            style_cache, stylesheet, fonts, images, viewport_width);
     bool owns_scheduler = scheduler == NULL;
     if (owns_scheduler) {
         size_t reserved = maximum_single_encoded_bytes;
@@ -4578,6 +4858,11 @@ static bool images_load_external_impl(
         .defer_document_images = defer_document_images,
         .deferred_nodes = deferred_nodes,
         .deferred_node_count = deferred_node_count,
+        .refresh_previous = refresh_complete_nodes || full_traversal
+            ? refresh_previous : NULL,
+        .refresh_retires_all = full_traversal && refresh_previous != NULL,
+        .refresh_retired_nodes = priority_nodes,
+        .refresh_retired_count = priority_node_count,
         .deadline_ms = image_now_ms() + (double) timeout_ms,
         .slice_started_us = tilefinch_platform_monotonic_time_us(),
         .eager_decode_rasters = !full_traversal
@@ -4585,11 +4870,15 @@ static bool images_load_external_impl(
     };
     uint64_t traversal_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
-    /* Large immutable resource walks use layout's bounded variable/selector
-       memos. Small sheets and priority batches keep the allocation-free path.
+    /* Large immutable resource walks and multi-node refresh batches share
+       layout's bounded variable/selector memos. Refreshes otherwise repeat
+       inherited variable resolution through the same ancestors for each SVG.
+       Small sheets and one-node priority loads keep the allocation-free path.
        Refusal preserves uncached matching; nested owners keep their cache,
        and cleanup covers cancellation and every early return. */
-    bool cache_styles = full_traversal && stylesheet->count >= 64u;
+    bool cache_styles = (full_traversal
+        || (refresh_complete_nodes && priority_node_count > 1u))
+        && stylesheet->count >= 64u;
     ImageStyleCacheScope style_scope
         __attribute__((cleanup(image_style_cache_scope_end))) = {
             .sheet = stylesheet, .budget = budget,
@@ -4600,6 +4889,25 @@ static bool images_load_external_impl(
             BUDGET_CATEGORY_RESOURCE, 1, sizeof(*style_scope.ancestors));
         style_scope.selector_owned = style_selector_cooperation_begin(
             stylesheet, image_selector_cooperate, &context, style_scope.ancestors);
+    }
+    if (cache_styles && style_cache == NULL && refresh_complete_nodes
+        && priority_node_count > 1u
+        && priority_nodes[0] != NULL) {
+        size_t capacity = 0;
+        for (lxb_dom_node_t *at = priority_nodes[0]->parent;
+             at != NULL && capacity < IMAGE_REFRESH_ANCESTOR_LIMIT;
+             at = at->parent) {
+            if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) capacity++;
+        }
+        if (capacity != 0) {
+            style_scope.refresh_ancestors = budget_malloc_category(
+                budget, BUDGET_CATEGORY_RESOURCE,
+                capacity * sizeof(*style_scope.refresh_ancestors));
+            if (style_scope.refresh_ancestors != NULL) {
+                context.refresh_ancestors = style_scope.refresh_ancestors;
+                context.refresh_ancestor_capacity = capacity;
+            }
+        }
     }
     bool traversed = true;
     if (full_traversal) {
@@ -4706,7 +5014,7 @@ bool images_load_external(const PocDocument *document, Stylesheet *stylesheet,
         budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        NULL, NULL, 0, false, NULL, 0);
+        NULL, NULL, 0, false, NULL, 0, NULL);
     if (images != NULL) images->priority_staged = false;
     return loaded;
 }
@@ -4742,7 +5050,7 @@ bool images_load_external_reusing_layout_styles_deferred(
         budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        style_cache, fonts, viewport_width, defer_document_images, NULL, 0);
+        style_cache, fonts, viewport_width, defer_document_images, NULL, 0, NULL);
     if (images != NULL) images->priority_staged = false;
     return loaded;
 }
@@ -4762,9 +5070,118 @@ bool images_load_external_reusing_layout_styles_excluding(
         budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        style_cache, fonts, viewport_width, false, deferred_nodes, deferred_node_count);
+        style_cache, fonts, viewport_width, false, deferred_nodes, deferred_node_count, NULL);
     if (images != NULL) images->priority_staged = false;
     return loaded;
+}
+
+static bool image_refresh_lenders_present(
+    const ImageResources *images, const ImageResources *replacement);
+
+/* Before the rebuild loads its replacement, the outgoing table keeps only
+   what the load can lend: plain inline-SVG rasters. Every other entry (an
+   external image, a background, a mask, a canvas) is decoded or rebuilt
+   again by the load, exactly as after the destroy-first rebuild, so its
+   resources are released now rather than held beside their replacements;
+   the rebuild's peak then exceeds the destroy-first one by at most the
+   rasters that were not taken over. A released entry's surface that a kept
+   raster shares passes to the kept entry first. */
+static void image_rebuild_release_unlendable(ImageResources *images)
+{
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource *item = &images->items[i];
+        if (image_refresh_svg_lendable(item) || !item->owns_pixels) continue;
+        for (size_t at = 0; at < images->count; at++) {
+            ImageResource *kept = &images->items[at];
+            if (kept->pixels == item->pixels
+                && image_refresh_svg_lendable(kept)) {
+                kept->owns_pixels = true;
+                item->owns_pixels = false;
+                break;
+            }
+        }
+    }
+    size_t write = 0;
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource item = images->items[i];
+        if (image_refresh_svg_lendable(&item)) {
+            images->items[write++] = item;
+            continue;
+        }
+        image_canvas_native_forget(&item);
+        image_resource_release_owned_pixels(images->budget, &item);
+        if (item.owns_encoded) {
+            if (item.encoded_body != NULL)
+                browser_shared_body_release(item.encoded_body);
+            else
+                budget_free(images->budget, item.encoded);
+        }
+    }
+    images->count = write;
+    for (size_t i = 0; i < 2u; i++) {
+        budget_free(images->budget, images->canvas_depth[i].values);
+        memset(&images->canvas_depth[i], 0, sizeof(images->canvas_depth[i]));
+    }
+}
+
+bool images_rebuild_external_reusing_rasters(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count)
+{
+    if (images == NULL || budget == NULL
+        || (images->budget != NULL && images->budget != budget)) return false;
+    ImageResources replacement = {.budget = budget};
+    const ImageResources *lenders = images->count == 0 ? NULL : images;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_SVG_REFRESH_REUSE") != NULL) lenders = NULL;
+#endif
+    if (lenders == NULL) images_destroy(images);
+    else image_rebuild_release_unlendable(images);
+    bool loaded = images_load_external_impl(
+        document, stylesheet, &replacement, NULL, 0, NULL, 0, true, false,
+        budget, base_url, document_url, referrer_policy, maximum_count,
+        maximum_total_encoded_bytes, maximum_single_encoded_bytes,
+        maximum_decoded_bytes, timeout_ms, scheduler, session,
+        style_cache, fonts, viewport_width, false, deferred_nodes,
+        deferred_node_count, lenders);
+    replacement.priority_staged = false;
+    if (loaded && !image_refresh_lenders_present(images, &replacement))
+        loaded = false;
+    if (!loaded) {
+        /* No borrowed surface may outlive this call: clear the borrowers'
+           claims before releasing the replacement's own resources. */
+        for (size_t i = 0; i < replacement.count; i++) {
+            if (replacement.items[i].borrows_previous)
+                replacement.items[i].owns_pixels = false;
+        }
+        images_destroy(&replacement);
+        images_destroy(images);
+        return false;
+    }
+    /* The first borrower of each outgoing surface becomes its owner; the
+       outgoing table then releases only what nobody borrowed. */
+    for (size_t i = 0; i < replacement.count; i++) {
+        ImageResource *borrowed = &replacement.items[i];
+        if (!borrowed->borrows_previous) continue;
+        borrowed->borrows_previous = false;
+        for (size_t at = 0; at < images->count; at++) {
+            ImageResource *lender = &images->items[at];
+            if (lender->owns_pixels && lender->pixels == borrowed->pixels) {
+                lender->owns_pixels = false;
+                borrowed->owns_pixels = true;
+                break;
+            }
+        }
+    }
+    images_destroy(images);
+    *images = replacement;
+    return true;
 }
 
 bool images_load_external_priority_nodes(
@@ -4784,7 +5201,7 @@ bool images_load_external_priority_nodes(
         maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        NULL, NULL, 0, false, NULL, 0);
+        NULL, NULL, 0, false, NULL, 0, NULL);
     if (loaded && images != NULL) images->priority_staged = true;
     return loaded;
 }
@@ -4860,6 +5277,38 @@ static size_t image_refresh_owned_decoded_bytes(
     return bytes;
 }
 
+/* Each inline-SVG raster owner consumed one attempt from the page's image
+   count when it was rasterized (or adopted by a refresh). Retiring it
+   returns that attempt as its decoded bytes are returned; otherwise every
+   refresh of an unchanged icon would ratchet the count until later
+   refreshes skip the icons outright. */
+static size_t image_refresh_owned_svg_attempts(
+    const ImageResources *images, lxb_dom_node_t *const *nodes,
+    size_t node_count)
+{
+    size_t attempts = 0;
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *item = &images->items[i];
+        if (!item->owns_pixels || !image_refresh_svg_lendable(item)
+            || !image_node_in_refresh_set(item->node, nodes, node_count)) {
+            continue;
+        }
+        bool retained_alias = false;
+        for (size_t alias = 0; alias < images->count; alias++) {
+            const ImageResource *candidate = &images->items[alias];
+            if (alias != i
+                && !image_node_in_refresh_set(
+                    candidate->node, nodes, node_count)
+                && candidate->pixels == item->pixels) {
+                retained_alias = true;
+                break;
+            }
+        }
+        if (!retained_alias) attempts++;
+    }
+    return attempts;
+}
+
 static void image_refresh_transfer_old_ownership(
     ImageResources *images, size_t owner_index,
     lxb_dom_node_t *const *nodes, size_t node_count)
@@ -4881,6 +5330,56 @@ static void image_refresh_transfer_old_ownership(
             owner->owns_encoded = false;
         }
         if (!owner->owns_pixels && !owner->owns_encoded) break;
+    }
+}
+
+/* Cooperation inside the refresh walk may run other owners of the outgoing
+   table. Before the replacement is published, every borrowed surface must
+   still be held there under the same identity; otherwise refuse the refresh
+   (the caller falls back to a full rebuild) rather than publish a pointer
+   that may have been released. */
+static bool image_refresh_lenders_present(
+    const ImageResources *images, const ImageResources *replacement)
+{
+    for (size_t i = 0; i < replacement->count; i++) {
+        const ImageResource *borrowed = &replacement->items[i];
+        if (!borrowed->borrows_previous) continue;
+        bool present = false;
+        for (size_t at = 0; !present && at < images->count; at++) {
+            const ImageResource *lender = &images->items[at];
+            present = lender->pixels == borrowed->pixels
+                && lender->url_hash == borrowed->url_hash
+                && lender->width == borrowed->width
+                && lender->height == borrowed->height
+                && image_refresh_svg_lendable(lender);
+        }
+        if (!present) return false;
+    }
+    return true;
+}
+
+/* Runs after retiring entries have handed their surfaces to retained
+   aliases. A surface a retiring entry still owns would be freed with it, so
+   the first borrower becomes its owner; later borrowers of the same surface
+   stay aliases of that one. Surfaces owned elsewhere remain plain aliases. */
+static void image_refresh_adopt_lent_surfaces(
+    ImageResources *images, ImageResources *replacement,
+    lxb_dom_node_t *const *nodes, size_t node_count)
+{
+    for (size_t i = 0; i < replacement->count; i++) {
+        ImageResource *borrowed = &replacement->items[i];
+        if (!borrowed->borrows_previous) continue;
+        borrowed->borrows_previous = false;
+        for (size_t at = 0; at < images->count; at++) {
+            ImageResource *lender = &images->items[at];
+            if (lender->owns_pixels && lender->pixels == borrowed->pixels
+                && image_node_in_refresh_set(
+                    lender->node, nodes, node_count)) {
+                lender->owns_pixels = false;
+                borrowed->owns_pixels = true;
+                break;
+            }
+        }
     }
 }
 
@@ -4925,23 +5424,28 @@ void images_discard_nodes(
         ? images->stats.decoded_bytes - retired_decoded : 0u;
 }
 
-bool images_refresh_external_nodes(
+bool images_refresh_external_nodes_reusing_layout_styles(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
     Budget *budget, const char *base_url, const char *document_url,
     const char *referrer_policy, size_t maximum_count,
     size_t maximum_total_encoded_bytes,
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
-    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session)
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width)
 {
     if (node_count == 0) return true;
     if (document == NULL || stylesheet == NULL || images == NULL
         || nodes == NULL || budget == NULL || images->budget != budget) {
         return false;
     }
+    layout_reuse_cache_prepare(
+        style_cache, stylesheet, fonts, images, viewport_width);
     size_t retired_encoded = image_refresh_owned_encoded_bytes(
         images, nodes, node_count);
     size_t retired_decoded = image_refresh_owned_decoded_bytes(
+        images, nodes, node_count);
+    size_t retired_attempts = image_refresh_owned_svg_attempts(
         images, nodes, node_count);
     ImageResources replacement = {
         .budget = budget,
@@ -4954,12 +5458,27 @@ bool images_refresh_external_nodes(
     replacement.stats.decoded_bytes =
         retired_decoded <= replacement.stats.decoded_bytes
         ? replacement.stats.decoded_bytes - retired_decoded : 0;
+    replacement.stats.attempted =
+        retired_attempts <= replacement.stats.attempted
+        ? replacement.stats.attempted - retired_attempts : 0;
+    const ImageResources *lenders = images;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_SVG_REFRESH_REUSE") != NULL) lenders = NULL;
+#endif
     if (!images_load_external_impl(
             document, stylesheet, &replacement, nodes, node_count, NULL, 0,
             false, true, budget, base_url, document_url, referrer_policy,
             maximum_count, maximum_total_encoded_bytes,
             maximum_single_encoded_bytes, maximum_decoded_bytes, timeout_ms,
-            scheduler, session, NULL, NULL, 0, false, NULL, 0)) {
+            scheduler, session, style_cache, fonts, viewport_width,
+            false, NULL, 0, lenders)) {
+        /* A cooperative cancellation can interrupt selector resolution. No
+           partially resolved entry may survive into a later retry. */
+        layout_reuse_cache_reset(style_cache);
+        images_destroy(&replacement);
+        return false;
+    }
+    if (!image_refresh_lenders_present(images, &replacement)) {
         images_destroy(&replacement);
         return false;
     }
@@ -4999,6 +5518,7 @@ bool images_refresh_external_nodes(
                 images, i, nodes, node_count);
         }
     }
+    image_refresh_adopt_lent_surfaces(images, &replacement, nodes, node_count);
     size_t write = 0;
     for (size_t i = 0; i < images->count; i++) {
         ImageResource item = images->items[i];
@@ -5030,6 +5550,22 @@ bool images_refresh_external_nodes(
     return true;
 }
 
+bool images_refresh_external_nodes(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
+    Budget *budget, const char *base_url, const char *document_url,
+    const char *referrer_policy, size_t maximum_count,
+    size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session)
+{
+    return images_refresh_external_nodes_reusing_layout_styles(
+        document, stylesheet, images, nodes, node_count, budget, base_url,
+        document_url, referrer_policy, maximum_count, maximum_total_encoded_bytes,
+        maximum_single_encoded_bytes, maximum_decoded_bytes, timeout_ms,
+        scheduler, session, NULL, NULL, 0);
+}
+
 bool images_load_external_priority_targets(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, const ImagePriorityTarget *targets,
@@ -5047,7 +5583,7 @@ bool images_load_external_priority_targets(
         maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        NULL, NULL, 0, false, NULL, 0);
+        NULL, NULL, 0, false, NULL, 0, NULL);
     if (loaded && images != NULL) images->priority_staged = true;
     return loaded;
 }

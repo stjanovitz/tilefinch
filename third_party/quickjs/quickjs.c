@@ -324,8 +324,20 @@ typedef struct {
 /* end JS Malloc */
 
 struct JSRuntime {
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    BOOL execution_census;
+    JSCensusFunction *census_function_hook;
+    void *census_function_opaque;
+    uint32_t census_epoch;
+#endif
     JSMallocContext malloc_ctx;
     const char *rt_info;
+    /* Tilefinch: called with 1 before and 0 after JS_RunGC's collection. */
+    void (*gc_hook)(void *opaque, int begin);
+    void *gc_hook_opaque;
+    /* Tilefinch: called with 1 before and 0 after a lazy body's compile. */
+    void (*lazy_compile_hook)(void *opaque, int begin);
+    void *lazy_compile_hook_opaque;
 
     int atom_hash_size; /* power of two */
     int atom_count;
@@ -390,6 +402,7 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    struct list_head cleanup_job_list; /* HTML JavaScript-engine tasks */
 
     JSModuleNormalizeFunc *module_normalize_func;
     BOOL module_loader_has_attr;
@@ -407,6 +420,27 @@ struct JSRuntime {
     JSSharedArrayBufferFunctions sab_funcs;
     /* see JS_SetStripInfo() */
     uint8_t strip_flags;
+    /* see JS_SetLazyFunctionThreshold() */
+    uint32_t lazy_function_threshold;
+    /* see JS_SetLazyFunctionPreparse() */
+    BOOL lazy_preparse : 8;
+    uint8_t preparse_suspended; /* a compile repeated without preparsing */
+    JSLazyFunctionStats lazy_stats;
+    /* Tilefinch work counters (JS_GetWorkCounters): interrupt budget
+       consumed by polls and by freed contexts, poll and collection
+       counts, and the opt-in call/opcode/float64 counters. */
+    uint64_t tf_poll_work;
+    uint64_t tf_interrupt_polls;
+    uint64_t tf_gc_runs;
+#if defined(CONFIG_TILEFINCH_CALL_COUNTS) || defined(CONFIG_TILEFINCH_OP_COUNTS)
+    uint64_t tf_calls;
+#endif
+#ifdef CONFIG_TILEFINCH_OP_COUNTS
+    uint64_t tf_bytecode_ops;
+    uint64_t tf_float64_boxes;
+    /* Dispatches per (short) opcode byte; see JS_GetOpcodeCounts. */
+    uint64_t tf_opcode_counts[256];
+#endif
     
     /* Shape hash table */
     int shape_hash_bits;
@@ -537,6 +571,13 @@ typedef enum {
    enough to call the interrupt callback often. */
 #define JS_INTERRUPT_COUNTER_INIT 10000
 
+/* JSContext.closure_shape[]: plain functions without and with an
+   auto-initialized 'prototype', and async functions. */
+#define JS_CLOSURE_SHAPE_PLAIN 0
+#define JS_CLOSURE_SHAPE_CONSTRUCTOR 1
+#define JS_CLOSURE_SHAPE_ASYNC 2
+#define JS_CLOSURE_SHAPE_COUNT 3
+
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
     JSRuntime *rt;
@@ -554,6 +595,8 @@ struct JSContext {
     JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
     JSShape *regexp_shape;  /* shape for regexp objects */
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
+    /* shapes of new closures, built on first use (see js_closure_shape) */
+    JSShape *closure_shape[JS_CLOSURE_SHAPE_COUNT];
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -576,6 +619,9 @@ struct JSContext {
 
     /* when the counter reaches zero, JSRutime.interrupt_handler is called */
     int interrupt_counter;
+    /* Tilefinch: interrupt_counter's value at its last reset (0 before the
+       first poll), so base - counter is the budget consumed since. */
+    int tf_counter_base;
 
     struct list_head loaded_modules; /* list of JSModuleDef.link */
 
@@ -588,6 +634,23 @@ struct JSContext {
                              const char *filename, int flags, int scope_idx);
     void *user_opaque;
 };
+
+#ifdef CONFIG_TILEFINCH_OP_COUNTS
+/* Tilefinch op-count builds: count every float64-tagged value the engine
+   creates (a boxed double on the PSP's soft-float NaN-boxing target). The
+   header's constructors are wrapped here, so embedder calls outside this
+   file are not counted. */
+static inline JSValue tf_count_float64(JSContext *ctx, JSValue v)
+{
+    if (JS_VALUE_GET_NORM_TAG(v) == JS_TAG_FLOAT64)
+        ctx->rt->tf_float64_boxes++;
+    return v;
+}
+#define __JS_NewFloat64(ctx, d) tf_count_float64(ctx, (__JS_NewFloat64)(ctx, d))
+#define JS_NewFloat64(ctx, d) tf_count_float64(ctx, (JS_NewFloat64)(ctx, d))
+#define JS_NewInt64(ctx, v) tf_count_float64(ctx, (JS_NewInt64)(ctx, v))
+#define JS_NewUint32(ctx, v) tf_count_float64(ctx, (JS_NewUint32)(ctx, v))
+#endif
 
 typedef union JSFloat64Union {
     double d;
@@ -739,6 +802,26 @@ static void js_free_function_source(JSRuntime *rt, char *source,
     }
 }
 
+/* A function compiled lazily (see JS_SetLazyFunctionThreshold()) has this
+   instead of a body until its first call. It records what the parser needs
+   to compile the body again, alone, exactly as it was compiled in its
+   enclosing function: the text, where its parameter list starts, and the
+   parser state inherited from the enclosing function. Its captured
+   variables are the function's ordinary closure_var list, resolved when the
+   enclosing function was compiled. */
+typedef struct JSLazyFunction {
+    char *source; /* own copy of the text, or NULL: use debug.source */
+    uint32_t source_len;
+    uint32_t param_offset; /* first token of the parameter list, from the text start */
+    uint32_t nested_threshold; /* JS_SetLazyFunctionThreshold() for inner functions */
+    uint8_t func_type; /* JSParseFunctionEnum */
+    uint8_t parent_js_mode;
+    uint8_t parent_func_kind;
+    uint8_t is_module : 1;
+    uint8_t parent_static_init : 1;
+    uint8_t strip_source : 1; /* inner functions are compiled without toString() text */
+} JSLazyFunction;
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t js_mode;
@@ -755,7 +838,14 @@ typedef struct JSFunctionBytecode {
     uint8_t has_debug : 1;
     uint8_t read_only_bytecode : 1;
     uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
-    /* XXX: 10 bits available */
+    /* a lazily compiled function whose body is not compiled yet: see
+       js_lazy_function_of() */
+    uint8_t is_lazy : 1;
+    /* the body of a lazily compiled function, compiled on its first call:
+       byte_code_buf starts an allocation of its own that also holds the
+       constant pool and variable definitions */
+    uint8_t has_lazy_body : 1;
+    /* XXX: 8 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -770,6 +860,14 @@ typedef struct JSFunctionBytecode {
     JSValue *cpool; /* constant pool (self pointer) */
     int cpool_count;
     int closure_var_count;
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    uint32_t census_epoch, census_function;
+#endif
+#ifdef CONFIG_TILEFINCH_CALL_COUNTS
+    /* Tilefinch profiler: JS_CallInternal entries. Before `debug`: a
+       stripped function is allocated only up to offsetof(debug). */
+    uint32_t tf_calls;
+#endif
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
@@ -780,6 +878,15 @@ typedef struct JSFunctionBytecode {
         JSFunctionSource *source_owner;
     } debug;
 } JSFunctionBytecode;
+
+/* While a lazily compiled function has no body (is_lazy), its empty
+   bytecode (byte_code_len, cpool_count, arg_count and var_count are 0)
+   leaves byte_code_buf free to hold its JSLazyFunction, so that functions
+   compiled eagerly pay nothing for the feature. */
+static inline JSLazyFunction *js_lazy_function_of(const JSFunctionBytecode *b)
+{
+    return b->is_lazy ? (JSLazyFunction *)b->byte_code_buf : NULL;
+}
 
 typedef struct JSBoundFunction {
     JSValue func_obj;
@@ -1212,6 +1319,8 @@ static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type);
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p);
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b);
+static int js_lazy_function_compile(JSContext *caller_ctx, JSFunctionBytecode *b);
+static void js_free_lazy_function(JSRuntime *rt, JSLazyFunction *lz);
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
                                   int argc, JSValueConst *argv, int flags);
@@ -1875,18 +1984,174 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
     }
 }
 
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+static unsigned tf_census_zone = JS_CENSUS_OUTSIDE;
+static uintptr_t tf_census_native;
+static uint32_t tf_census_function, tf_census_epoch;
+static uint64_t tf_census_paths[JS_CENSUS_COUNT];
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+static uint64_t tf_census_references[JS_EXECUTION_CENSUS_FUNCTION_LIMIT + 1][3], tf_census_reference_total[3];
+#endif
+typedef struct { unsigned zone; uintptr_t native; BOOL enabled; } TFCensusScope;
+static TFCensusScope tf_census_enter(JSRuntime *rt, unsigned zone,
+                                    uintptr_t native)
+{
+    TFCensusScope scope = { 0, 0, rt->execution_census };
+    if (scope.enabled) {
+        scope.zone = __atomic_load_n(&tf_census_zone, __ATOMIC_RELAXED);
+        scope.native = __atomic_load_n(&tf_census_native, __ATOMIC_RELAXED);
+        /* Final-release helpers belong to frame cleanup. A reentrant call
+           replaces this zone with CALL and then its own opcodes, so its
+           body is not charged to the frame that released the value. */
+        if (scope.zone == JS_CENSUS_FRAME_CLEANUP &&
+            (zone == JS_CENSUS_RELEASE || zone == JS_CENSUS_ALLOCATE))
+            zone = scope.zone;
+        __atomic_store_n(&tf_census_native, native, __ATOMIC_RELAXED);
+        __atomic_store_n(&tf_census_zone, zone, __ATOMIC_RELAXED);
+    }
+    return scope;
+}
+static void tf_census_leave(TFCensusScope *scope)
+{
+    if (!scope->enabled) return;
+    __atomic_store_n(&tf_census_native, scope->native, __ATOMIC_RELAXED);
+    __atomic_store_n(&tf_census_zone, scope->zone, __ATOMIC_RELAXED);
+}
+#define TF_CENSUS(rt, kind, address) \
+    TFCensusScope tf_census_scope __attribute__((cleanup(tf_census_leave))) = \
+        tf_census_enter((rt), (kind), (uintptr_t)(address))
+static inline void tf_census_opcode(JSRuntime *rt, unsigned op)
+{
+    if (rt->execution_census)
+        __atomic_store_n(&tf_census_zone, op, __ATOMIC_RELAXED);
+}
+#define TF_CENSUS_OP(rt, op) tf_census_opcode(rt, op)
+#define TF_CENSUS_PATH(rt, zone) do { \
+    if ((rt)->execution_census && (rt)->census_function_hook) { \
+        tf_census_paths[(zone)]++; \
+        __atomic_store_n(&tf_census_zone, (zone), __ATOMIC_RELAXED); \
+    } \
+} while (0)
+#define TF_CENSUS_EVENT(rt, zone) do { \
+    if ((rt)->execution_census && (rt)->census_function_hook) \
+        tf_census_paths[zone]++; \
+} while (0)
+#else
+#define TF_CENSUS(rt, kind, address) ((void)0)
+#define TF_CENSUS_OP(rt, op) ((void)0)
+#define TF_CENSUS_PATH(rt, zone) ((void)0)
+#define TF_CENSUS_EVENT(rt, zone) ((void)0)
+#endif
+
+void JS_SetExecutionCensus(JSRuntime *rt, int enabled)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    rt->execution_census = !!enabled;
+#else
+    (void)rt; (void)enabled;
+#endif
+}
+
+unsigned JS_ReadExecutionCensus(uintptr_t *native_address)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    unsigned zone = __atomic_load_n(&tf_census_zone, __ATOMIC_RELAXED);
+    *native_address = zone == JS_CENSUS_NATIVE
+        ? __atomic_load_n(&tf_census_native, __ATOMIC_RELAXED) : 0;
+    return zone;
+#else
+    *native_address = 0;
+    return JS_CENSUS_OUTSIDE;
+#endif
+}
+
+uint32_t JS_ReadExecutionCensusFunction(void)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    return __atomic_load_n(&tf_census_function, __ATOMIC_RELAXED);
+#else
+    return 0;
+#endif
+}
+
+void JS_ResetExecutionCensusPaths(void)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    memset(tf_census_paths, 0, sizeof(tf_census_paths));
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+    memset(tf_census_references, 0, sizeof(tf_census_references));
+    memset(tf_census_reference_total, 0, sizeof(tf_census_reference_total));
+#endif
+#endif
+}
+size_t JS_ReadExecutionCensusPaths(uint64_t *counts, size_t capacity)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    if (capacity < JS_CENSUS_COUNT) return 0;
+    memcpy(counts, tf_census_paths, sizeof(tf_census_paths));
+    return JS_CENSUS_COUNT;
+#else
+    (void)counts; (void)capacity;
+    return 0;
+#endif
+}
+
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+void JS_CensusReference(JSContext *ctx, JSRuntime *rt, int release, int final)
+{
+    if (!rt) rt = ctx->rt;
+    if (!rt->execution_census || !rt->census_function_hook) return;
+    uint32_t function = JS_ReadExecutionCensusFunction();
+    unsigned kind = release ? 1u : 0u;
+    tf_census_reference_total[kind]++;
+    if (final) tf_census_reference_total[2]++;
+    if (function <= JS_EXECUTION_CENSUS_FUNCTION_LIMIT) {
+        tf_census_references[function][kind]++;
+        if (final) tf_census_references[function][2]++;
+    }
+}
+#endif
+void JS_ReadExecutionCensusReferences(uint32_t function, uint64_t counts[3])
+{
+#ifdef CONFIG_TILEFINCH_REFCOUNT_CENSUS
+    if (function == UINT32_MAX) memcpy(counts, tf_census_reference_total, sizeof(tf_census_reference_total));
+    else if (function <= JS_EXECUTION_CENSUS_FUNCTION_LIMIT) memcpy(counts, tf_census_references[function], sizeof(tf_census_references[function]));
+    else memset(counts, 0, 3 * sizeof(*counts));
+#else
+    (void)function;
+    memset(counts, 0, 3 * sizeof(*counts));
+#endif
+}
+
+void JS_SetExecutionCensusFunctionHook(JSRuntime *rt,
+    JSCensusFunction *hook, void *opaque)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    rt->census_function_hook = hook;
+    rt->census_function_opaque = opaque;
+    /* Saturation keeps the observer disabled rather than reusing identities. */
+    rt->census_epoch = tf_census_epoch == UINT32_MAX ? 0 : ++tf_census_epoch;
+    if (!rt->census_epoch) rt->census_function_hook = NULL;
+#else
+    (void)rt; (void)hook; (void)opaque;
+#endif
+}
+
 void *js_malloc_rt(JSRuntime *rt, size_t size)
 {
+    TF_CENSUS(rt, JS_CENSUS_ALLOCATE, 0);
     return __js_malloc(&rt->malloc_ctx, size);
 }
 
 void js_free_rt(JSRuntime *rt, void *ptr)
 {
+    TF_CENSUS(rt, JS_CENSUS_RELEASE, 0);
     __js_free(&rt->malloc_ctx, ptr);
 }
 
 void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
 {
+    TF_CENSUS(rt, JS_CENSUS_ALLOCATE, 0);
     return __js_realloc(&rt->malloc_ctx, ptr, size);
 }
 
@@ -2175,6 +2440,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->malloc_ctx.mf = *mf;
     rt->malloc_ctx.malloc_state = ms;
     rt->malloc_gc_threshold = 256 * 1024;
+    rt->lazy_preparse = TRUE;
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -2186,6 +2452,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->string_list);
 #endif
     init_list_head(&rt->job_list);
+    init_list_head(&rt->cleanup_job_list);
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2382,6 +2649,109 @@ int JS_GetStripInfo(JSRuntime *rt)
     return rt->strip_flags;
 }
 
+void JS_SetLazyFunctionThreshold(JSRuntime *rt, uint32_t min_source_bytes)
+{
+    rt->lazy_function_threshold = min_source_bytes;
+}
+
+uint32_t JS_GetLazyFunctionThreshold(JSRuntime *rt)
+{
+    return rt->lazy_function_threshold;
+}
+
+void JS_SetLazyFunctionPreparse(JSRuntime *rt, JS_BOOL enabled)
+{
+    rt->lazy_preparse = (enabled != 0);
+}
+
+JS_BOOL JS_GetLazyFunctionPreparse(JSRuntime *rt)
+{
+    return rt->lazy_preparse;
+}
+
+void JS_GetLazyFunctionStats(JSRuntime *rt, JSLazyFunctionStats *stats)
+{
+    *stats = rt->lazy_stats;
+}
+
+#ifdef CONFIG_TILEFINCH_LAZY_TOOLS
+static int js_compile_lazy_tree(JSContext *ctx, JSFunctionBytecode *b,
+                                uint64_t *count, int depth)
+{
+    int i;
+
+    if (depth > 1000) {
+        JS_ThrowInternalError(ctx, "functions nested too deeply");
+        return -1;
+    }
+    if (b->is_lazy) {
+        if (js_lazy_function_compile(ctx, b))
+            return -1;
+        (*count)++;
+    }
+    for (i = 0; i < b->cpool_count; i++) {
+        JSValueConst v = b->cpool[i];
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE &&
+            js_compile_lazy_tree(ctx, JS_VALUE_GET_PTR(v), count, depth + 1))
+            return -1;
+    }
+    return 0;
+}
+
+int JS_CompileLazyFunctions(JSContext *ctx, JSValueConst obj, uint64_t *count)
+{
+    uint64_t n = 0;
+    JSValueConst func = obj;
+    int ret = 0;
+
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE)
+        func = ((JSModuleDef *)JS_VALUE_GET_PTR(obj))->func_obj;
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_FUNCTION_BYTECODE)
+        ret = js_compile_lazy_tree(ctx, JS_VALUE_GET_PTR(func), &n, 0);
+    if (count)
+        *count = n;
+    return ret;
+}
+#endif
+
+int JS_GetWorkCounters(JSRuntime *rt, uint64_t counters[JS_WORK_COUNT])
+{
+    struct list_head *el;
+    int missing = 0;
+    uint64_t work = rt->tf_poll_work;
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx = list_entry(el, JSContext, link);
+        work += (uint64_t) (ctx->tf_counter_base - ctx->interrupt_counter);
+    }
+    counters[JS_WORK_UNITS] = work;
+    counters[JS_WORK_POLLS] = rt->tf_interrupt_polls;
+    counters[JS_WORK_GC_RUNS] = rt->tf_gc_runs;
+#if defined(CONFIG_TILEFINCH_CALL_COUNTS) || defined(CONFIG_TILEFINCH_OP_COUNTS)
+    counters[JS_WORK_CALLS] = rt->tf_calls;
+#else
+    counters[JS_WORK_CALLS] = 0;
+    missing |= 1 << JS_WORK_CALLS;
+#endif
+#ifdef CONFIG_TILEFINCH_OP_COUNTS
+    counters[JS_WORK_BYTECODE_OPS] = rt->tf_bytecode_ops;
+    counters[JS_WORK_FLOAT64_BOXES] = rt->tf_float64_boxes;
+#else
+    counters[JS_WORK_BYTECODE_OPS] = counters[JS_WORK_FLOAT64_BOXES] = 0;
+    missing |= (1 << JS_WORK_BYTECODE_OPS) | (1 << JS_WORK_FLOAT64_BOXES);
+#endif
+    counters[JS_WORK_LAZY_COMPILES] = rt->lazy_stats.compiled;
+    counters[JS_WORK_LAZY_BYTES] = rt->lazy_stats.compiled_source_bytes;
+    return missing;
+}
+
+
+static JSValue js_finrec_job(JSContext *ctx, int argc, JSValueConst *argv);
+
+BOOL JS_IsCleanupJobPending(JSRuntime *rt)
+{
+    return !list_empty(&rt->cleanup_job_list);
+}
+
 static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
                           int argc, JSValueConst *argv, BOOL no_exception)
 {
@@ -2402,7 +2772,8 @@ static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = JS_DupValue(ctx, argv[i]);
     }
-    list_add_tail(&e->link, &rt->job_list);
+    list_add_tail(&e->link, job_func == js_finrec_job
+                  ? &rt->cleanup_job_list : &rt->job_list);
     return 0;
 }
 
@@ -2423,21 +2794,22 @@ BOOL JS_IsJobPending(JSRuntime *rt)
    if pctx != NULL. It may be NULL if the context was already
    destroyed or if no job was pending. The 'pctx' parameter is now
    absolete. */
-int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+static int js_execute_pending_job(JSRuntime *rt, JSContext **pctx,
+                                  struct list_head *queue)
 {
     JSContext *ctx;
     JSJobEntry *e;
     JSValue res;
     int i, ret;
 
-    if (list_empty(&rt->job_list)) {
+    if (list_empty(queue)) {
         if (pctx)
             *pctx = NULL;
         return 0;
     }
 
     /* get the first pending job and execute it */
-    e = list_entry(rt->job_list.next, JSJobEntry, link);
+    e = list_entry(queue->next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->realm;
     res = ctx->host_retired ? JS_UNDEFINED
@@ -2458,6 +2830,22 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     }
     JS_FreeContext(ctx);
     return ret;
+}
+
+int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+{
+    return js_execute_pending_job(rt, pctx, &rt->job_list);
+}
+
+int JS_ExecutePendingCleanupJob(JSRuntime *rt, JSContext **pctx)
+{
+    /* A host cannot use cleanup tasks to interrupt JavaScript or overtake
+       a promise checkpoint. Each callback is followed by a host checkpoint. */
+    if (rt->current_stack_frame != NULL || JS_IsJobPending(rt)) {
+        if (pctx) *pctx = NULL;
+        return 0;
+    }
+    return js_execute_pending_job(rt, pctx, &rt->cleanup_job_list);
 }
 
 static inline uint32_t atom_get_free(const JSAtomStruct *p)
@@ -2540,14 +2928,17 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
 
-    list_for_each_safe(el, el1, &rt->job_list) {
-        JSJobEntry *e = list_entry(el, JSJobEntry, link);
-        for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        JS_FreeContext(e->realm);
-        js_free_rt(rt, e);
+    struct list_head *queues[2] = { &rt->job_list, &rt->cleanup_job_list };
+    for (int queue = 0; queue < 2; queue++) {
+        list_for_each_safe(el, el1, queues[queue]) {
+            JSJobEntry *e = list_entry(el, JSJobEntry, link);
+            for(i = 0; i < e->argc; i++)
+                JS_FreeValueRT(rt, e->argv[i]);
+            JS_FreeContext(e->realm);
+            js_free_rt(rt, e);
+        }
+        init_list_head(queues[queue]);
     }
-    init_list_head(&rt->job_list);
 
     /* don't remove the weak objects to avoid create new jobs with
        FinalizationRegistry */
@@ -2914,6 +3305,11 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     if (ctx->array_shape)
         mark_func(rt, &ctx->array_shape->header);
 
+    for(i = 0; i < JS_CLOSURE_SHAPE_COUNT; i++) {
+        if (ctx->closure_shape[i])
+            mark_func(rt, &ctx->closure_shape[i]->header);
+    }
+
     if (ctx->arguments_shape)
         mark_func(rt, &ctx->arguments_shape->header);
 
@@ -2935,6 +3331,7 @@ void JS_FreeContext(JSContext *ctx)
     if (--js_rc(ctx)->ref_count > 0)
         return;
     assert(js_rc(ctx)->ref_count == 0);
+    rt->tf_poll_work += (uint64_t) (ctx->tf_counter_base - ctx->interrupt_counter);
 
 #ifdef DUMP_ATOMS
     JS_DumpAtoms(ctx->rt);
@@ -2989,6 +3386,8 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->function_proto);
 
     js_free_shape_null(ctx->rt, ctx->array_shape);
+    for(i = 0; i < JS_CLOSURE_SHAPE_COUNT; i++)
+        js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
     js_free_shape_null(ctx->rt, ctx->arguments_shape);
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
@@ -5463,6 +5862,45 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
     return js_new_string_rope(ctx, op1, op2);
 }
 
+/* True when the flat string 'op1' on the stack is referenced only by the
+   stack and by the local that the opcode at 'pc' stores the next result
+   into (put_loc/set_loc and their checked and short forms). OP_add then
+   owns op1 and may append to it in place: the store drops the local's
+   reference to the same string. Atom strings are never mutated. */
+static BOOL js_add_result_replaces_local(const uint8_t *pc,
+                                         const JSValue *var_buf,
+                                         JSValueConst op1)
+{
+    JSString *p1 = JS_VALUE_GET_STRING(op1);
+    int idx;
+    if (js_rc(p1)->ref_count != 2 || p1->atom_type != 0)
+        return FALSE;
+    switch (pc[0]) {
+    case OP_put_loc:
+    case OP_set_loc:
+    case OP_put_loc_check:
+    case OP_set_loc_check:
+        idx = get_u16(pc + 1);
+        break;
+#if SHORT_OPCODES
+    case OP_put_loc8:
+    case OP_set_loc8:
+        idx = pc[1];
+        break;
+    case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
+        idx = pc[0] - OP_put_loc0;
+        break;
+    case OP_set_loc0: case OP_set_loc1: case OP_set_loc2: case OP_set_loc3:
+        idx = pc[0] - OP_set_loc0;
+        break;
+#endif
+    default:
+        return FALSE;
+    }
+    return JS_VALUE_GET_TAG(var_buf[idx]) == JS_TAG_STRING &&
+        JS_VALUE_GET_PTR(var_buf[idx]) == JS_VALUE_GET_PTR(op1);
+}
+
 /* Shape support */
 
 static inline size_t get_shape_size(size_t hash_size, size_t prop_size)
@@ -6212,14 +6650,18 @@ JSValue JS_NewObject(JSContext *ctx)
     return JS_NewObjectProtoClass(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_CLASS_OBJECT);
 }
 
-static void js_function_set_properties(JSContext *ctx, JSValueConst func_obj,
-                                       JSAtom name, int len)
+/* Returns -1 (exception pending) when a definition fails; the caller
+   then fails the function's creation. */
+static int js_function_set_properties(JSContext *ctx, JSValueConst func_obj,
+                                      JSAtom name, int len)
 {
     /* ES6 feature non compatible with ES5.1: length is configurable */
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_length, JS_NewInt32(ctx, len),
-                           JS_PROP_CONFIGURABLE);
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name,
-                           JS_AtomToString(ctx, name), JS_PROP_CONFIGURABLE);
+    if (JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_length,
+                               JS_NewInt32(ctx, len), JS_PROP_CONFIGURABLE) < 0)
+        return -1;
+    return JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name,
+                                  JS_AtomToString(ctx, name),
+                                  JS_PROP_CONFIGURABLE) < 0 ? -1 : 0;
 }
 
 static BOOL js_class_has_bytecode(JSClassID class_id)
@@ -6336,7 +6778,11 @@ static JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
         JS_FreeValue(ctx, func_obj);
         return JS_EXCEPTION;
     }
-    js_function_set_properties(ctx, func_obj, name_atom, length);
+    if (js_function_set_properties(ctx, func_obj, name_atom, length) < 0) {
+        JS_FreeAtom(ctx, name_atom);
+        JS_FreeValue(ctx, func_obj);
+        return JS_EXCEPTION;
+    }
     JS_FreeAtom(ctx, name_atom);
     return func_obj;
 }
@@ -6389,6 +6835,8 @@ static JSValue js_c_function_data_call(JSContext *ctx, JSValueConst func_obj,
                                        int argc, JSValueConst *argv, int flags)
 {
     JSCFunctionDataRecord *s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
+    TF_CENSUS(ctx->rt, JS_CENSUS_NATIVE, s->func);
+    TF_CENSUS_EVENT(ctx->rt, JS_CENSUS_CALL_NATIVE);
     JSValueConst *arg_buf;
     int i;
 
@@ -6430,8 +6878,11 @@ JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
     for(i = 0; i < data_len; i++)
         s->data[i] = JS_DupValue(ctx, data[i]);
     JS_SetOpaque(func_obj, s);
-    js_function_set_properties(ctx, func_obj,
-                               JS_ATOM_empty_string, length);
+    if (js_function_set_properties(ctx, func_obj,
+                                   JS_ATOM_empty_string, length) < 0) {
+        JS_FreeValue(ctx, func_obj);
+        return JS_EXCEPTION;
+    }
     return func_obj;
 }
 
@@ -6801,6 +7252,7 @@ static void free_zero_refcount(JSRuntime *rt)
 /* called with the ref_count of 'v' reaches zero. */
 void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
+    TF_CENSUS(rt, JS_CENSUS_RELEASE, 0);
     uint32_t tag = JS_VALUE_GET_TAG(v);
 
 #ifdef DUMP_FREE
@@ -7207,7 +7659,13 @@ static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    /* Tilefinch: every collection except JS_FreeRuntime's comes here. */
+    rt->tf_gc_runs++;
+    if (rt->gc_hook)
+        rt->gc_hook(rt->gc_hook_opaque, 1);
     JS_RunGCInternal(rt, TRUE);
+    if (rt->gc_hook)
+        rt->gc_hook(rt->gc_hook_opaque, 0);
 }
 
 /* Return false if not an object or if the object has already been
@@ -7275,6 +7733,17 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     }
     if (!b->read_only_bytecode && b->byte_code_buf) {
         hp->js_func_code_size += b->byte_code_len;
+    }
+    if (b->is_lazy) {
+        const JSLazyFunction *lz = js_lazy_function_of(b);
+        memory_used_count++;
+        js_func_size += sizeof(*lz);
+        if (lz->source) {
+            memory_used_count++;
+            js_func_size += lz->source_len;
+        }
+    } else if (b->has_lazy_body) {
+        memory_used_count++;
     }
     if (b->has_debug) {
         js_func_size += sizeof(*b) - offsetof(JSFunctionBytecode, debug);
@@ -8304,7 +8773,10 @@ static void JS_ThrowInterrupted(JSContext *ctx)
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
+    rt->tf_poll_work += (uint64_t) (ctx->tf_counter_base - ctx->interrupt_counter);
+    rt->tf_interrupt_polls++;
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
+    ctx->tf_counter_base = JS_INTERRUPT_COUNTER_INIT;
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
             JS_ThrowInterrupted(ctx);
@@ -8647,16 +9119,29 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+static JSValue js_call_property_getter(JSContext *ctx, JSProperty *pr,
+                                       JSValueConst receiver)
+{
+    JSValue func;
+    if (!pr->u.getset.getter)
+        return JS_UNDEFINED;
+    /* The getter may delete itself or its prototype during the call. */
+    func = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter));
+    return JS_CallFree(ctx, func, receiver, 0, NULL);
+}
+
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst this_obj,
                                BOOL throw_ref_error)
 {
+    TF_CENSUS(ctx->rt, JS_CENSUS_GET_PROPERTY, 0);
     JSObject *p;
     JSProperty *pr;
     JSShapeProperty *prs;
     uint32_t tag;
 
     tag = JS_VALUE_GET_TAG(obj);
+    TF_CENSUS_PATH(ctx->rt, tag == JS_TAG_OBJECT ? JS_CENSUS_GET_OWN : JS_CENSUS_GET_PRIMITIVE);
     if (unlikely(tag != JS_TAG_OBJECT)) {
         switch(tag) {
         case JS_TAG_NULL:
@@ -8710,14 +9195,8 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             /* found */
             if (unlikely(prs->flags & JS_PROP_TMASK)) {
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
-                    if (unlikely(!pr->u.getset.getter)) {
-                        return JS_UNDEFINED;
-                    } else {
-                        JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
-                        /* Note: the field could be removed in the getter */
-                        func = JS_DupValue(ctx, func);
-                        return JS_CallFree(ctx, func, this_obj, 0, NULL);
-                    }
+                    TF_CENSUS_PATH(ctx->rt, JS_CENSUS_GET_GETTER);
+                    return js_call_property_getter(ctx, pr, this_obj);
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
                     JSValue val = *pr->u.var_ref->pvalue;
                     if (unlikely(JS_IsUninitialized(val)))
@@ -8734,6 +9213,7 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             }
         }
         if (unlikely(p->is_exotic)) {
+            TF_CENSUS_PATH(ctx->rt, JS_CENSUS_GET_EXOTIC);
             /* exotic behaviors */
             if (p->fast_array) {
                 if (__JS_AtomIsTaggedInt(prop)) {
@@ -8793,6 +9273,7 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             }
         }
         p = p->shape->proto;
+        TF_CENSUS_PATH(ctx->rt, JS_CENSUS_GET_PROTOTYPE);
         if (!p)
             break;
     }
@@ -10769,6 +11250,8 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
 int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            JSAtom prop, JSValue val, JSValueConst this_obj, int flags)
 {
+    TF_CENSUS(ctx->rt, JS_CENSUS_SET_PROPERTY, 0);
+    TF_CENSUS_PATH(ctx->rt, JS_CENSUS_SET_OWN);
     JSObject *p, *p1;
     JSShapeProperty *prs;
     JSProperty *pr;
@@ -10822,6 +11305,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             assert(prop == JS_ATOM_length);
             return set_array_length(ctx, p, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+            TF_CENSUS_PATH(ctx->rt, JS_CENSUS_SET_SETTER);
             return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
             /* XXX: already use var_ref->is_const. Cannot simplify use the
@@ -11467,6 +11951,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                       JSAtom prop, JSValueConst val,
                       JSValueConst getter, JSValueConst setter, int flags)
 {
+    TF_CENSUS(ctx->rt, JS_CENSUS_DEFINE_PROPERTY, 0);
     JSObject *p;
     JSShapeProperty *prs;
     JSProperty *pr;
@@ -14707,6 +15192,7 @@ static JSValue js_dtoa2(JSContext *ctx,
 
 static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val, BOOL is_ToPropertyKey)
 {
+    TF_CENSUS(ctx->rt, JS_CENSUS_TO_STRING, 0);
     uint32_t tag;
     char buf[32];
 
@@ -17944,6 +18430,30 @@ static BOOL js_get_fast_array(JSContext *ctx, JSValueConst obj,
     return FALSE;
 }
 
+/* Store 'val' (consumed) at index 'pos' of the array literal being built
+   by OP_append, as JS_DefinePropertyValueUint32(.., JS_PROP_C_W_E) does.
+   When the target is an extensible fast array and 'pos' is its end, that
+   definition always reaches add_fast_array_element() (a fast array keeps
+   no index in its shape, and a C_W_E data definition takes the append
+   path), so go there directly instead of through an index atom,
+   JS_DefineProperty() and JS_CreateProperty(). */
+static int js_append_element(JSContext *ctx, JSValueConst target,
+                             uint32_t pos, JSValue val)
+{
+    const int flags = JS_PROP_C_W_E | JS_PROP_HAS_VALUE |
+        JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE |
+        JS_PROP_HAS_ENUMERABLE;
+
+    if (likely(JS_VALUE_GET_TAG(target) == JS_TAG_OBJECT)) {
+        JSObject *p = JS_VALUE_GET_OBJ(target);
+        if (likely(p->class_id == JS_CLASS_ARRAY && p->fast_array &&
+                   p->extensible && pos == p->u.array.count &&
+                   pos <= JS_ATOM_MAX_INT))
+            return add_fast_array_element(ctx, p, val, flags);
+    }
+    return JS_DefinePropertyValueUint32(ctx, target, pos, val, JS_PROP_C_W_E);
+}
+
 static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
 {
     JSValue iterator, enumobj, method, value;
@@ -17995,8 +18505,8 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
             goto general_case;
         /* Handle fast arrays explicitly */
         for (i = 0; i < count32; i++) {
-            if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos++,
-                                             JS_DupValue(ctx, arrp[i]), JS_PROP_C_W_E) < 0)
+            if (js_append_element(ctx, sp[-3], pos++,
+                                  JS_DupValue(ctx, arrp[i])) < 0)
                 goto exception;
         }
     } else {
@@ -18010,7 +18520,7 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
                 /* value is JS_UNDEFINED */
                 break;
             }
-            if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos++, value, JS_PROP_C_W_E) < 0)
+            if (js_append_element(ctx, sp[-3], pos++, value) < 0)
                 goto exception;
         }
     }
@@ -18499,16 +19009,112 @@ static const uint16_t func_kind_to_class_id[] = {
     [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
 };
 
+/* The shape a new closure of this realm ends with: 'length' and 'name'
+   (configurable), as js_function_set_properties() defines them, then, for
+   a constructor, the auto-initialized writable 'prototype' of
+   JS_DefineAutoInitProperty(). Built once per realm and prototype and kept
+   hashed, so objects that reach the same properties by transitions (native
+   functions have the same two) share it. Returns NULL with the
+   allocation's out-of-memory exception pending when it cannot be built. */
+static JSShape *js_closure_shape(JSContext *ctx, int idx, JSObject *proto)
+{
+    JSShape *sh = ctx->closure_shape[idx];
+
+    if (likely(sh != NULL && sh->proto == proto))
+        return sh;
+    sh = js_new_shape2(ctx, proto, JS_PROP_INITIAL_HASH_SIZE,
+                       idx == JS_CLOSURE_SHAPE_CONSTRUCTOR ? 3 : 2);
+    if (!sh)
+        return NULL;
+    if (add_shape_property(ctx, &sh, NULL, JS_ATOM_length,
+                           JS_PROP_CONFIGURABLE) ||
+        add_shape_property(ctx, &sh, NULL, JS_ATOM_name,
+                           JS_PROP_CONFIGURABLE) ||
+        (idx == JS_CLOSURE_SHAPE_CONSTRUCTOR &&
+         add_shape_property(ctx, &sh, NULL, JS_ATOM_prototype,
+                            JS_PROP_WRITABLE | JS_PROP_AUTOINIT))) {
+        js_free_shape(ctx->rt, sh);
+        return NULL;
+    }
+    js_free_shape_null(ctx->rt, ctx->closure_shape[idx]);
+    ctx->closure_shape[idx] = sh;
+    return sh;
+}
+
+/* A new closure object with its final shape: the 'length', 'name' and
+   (constructor) 'prototype' slots are filled here instead of by three
+   property definitions, each a shape transition and a property-array
+   reallocation. 'name' stays undefined until js_closure() sets it after
+   js_closure2(). Returns JS_UNDEFINED, with nothing allocated or thrown,
+   for the function kinds that keep the general path (generators), and
+   JS_EXCEPTION when an allocation fails: the closure is not created, as
+   when the general path runs out of memory. */
+static JSValue js_closure_from_shape(JSContext *ctx, JSFunctionBytecode *b,
+                                     JSClassID class_id)
+{
+    JSShape *sh;
+    JSValue func_obj;
+    JSObject *p;
+    int idx;
+
+    if (b->func_kind == JS_FUNC_NORMAL)
+        idx = b->has_prototype ? JS_CLOSURE_SHAPE_CONSTRUCTOR :
+            JS_CLOSURE_SHAPE_PLAIN;
+    else if (b->func_kind == JS_FUNC_ASYNC && !b->has_prototype)
+        idx = JS_CLOSURE_SHAPE_ASYNC;
+    else
+        return JS_UNDEFINED;
+    sh = js_closure_shape(ctx, idx, get_proto_obj(ctx->class_proto[class_id]));
+    if (!sh)
+        return JS_EXCEPTION;
+    func_obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), class_id, NULL);
+    if (JS_IsException(func_obj))
+        return func_obj;
+    p = JS_VALUE_GET_OBJ(func_obj);
+    p->prop[0].u.value = JS_NewInt32(ctx, b->defined_arg_count);
+    p->prop[1].u.value = JS_UNDEFINED;
+    if (idx == JS_CLOSURE_SHAPE_CONSTRUCTOR) {
+        p->prop[2].u.init.realm_and_id = (uintptr_t)JS_DupContext(ctx);
+        assert((p->prop[2].u.init.realm_and_id & 3) == 0);
+        p->prop[2].u.init.realm_and_id |= JS_AUTOINIT_ID_PROTOTYPE;
+        p->prop[2].u.init.opaque = NULL;
+        p->is_constructor = TRUE;
+    }
+    return func_obj;
+}
+
 static JSValue js_closure(JSContext *ctx, JSValue bfunc,
                           JSVarRef **cur_var_refs,
                           JSStackFrame *sf, BOOL is_eval)
 {
+    TF_CENSUS(ctx->rt, JS_CENSUS_CLOSURE, 0);
     JSFunctionBytecode *b;
     JSValue func_obj;
     JSAtom name_atom;
+    JSClassID class_id;
 
     b = JS_VALUE_GET_PTR(bfunc);
-    func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
+    class_id = func_kind_to_class_id[b->func_kind];
+    func_obj = js_closure_from_shape(ctx, b, class_id);
+    if (JS_IsObject(func_obj)) {
+        JSValue name;
+        func_obj = js_closure2(ctx, func_obj, b, cur_var_refs, sf, is_eval, NULL);
+        if (JS_IsException(func_obj))
+            goto fail;
+        name_atom = b->func_name;
+        if (name_atom == JS_ATOM_NULL)
+            name_atom = JS_ATOM_empty_string;
+        name = JS_AtomToString(ctx, name_atom);
+        if (JS_IsException(name))
+            goto fail;
+        JS_VALUE_GET_OBJ(func_obj)->prop[1].u.value = name;
+        return func_obj;
+    }
+    if (JS_IsException(func_obj)) {
+        JS_FreeValue(ctx, bfunc);
+        return JS_EXCEPTION;
+    }
+    func_obj = JS_NewObjectClass(ctx, class_id);
     if (JS_IsException(func_obj)) {
         JS_FreeValue(ctx, bfunc);
         return JS_EXCEPTION;
@@ -18521,8 +19127,9 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     name_atom = b->func_name;
     if (name_atom == JS_ATOM_NULL)
         name_atom = JS_ATOM_empty_string;
-    js_function_set_properties(ctx, func_obj, name_atom,
-                               b->defined_arg_count);
+    if (js_function_set_properties(ctx, func_obj, name_atom,
+                                   b->defined_arg_count) < 0)
+        goto fail;
 
     if (b->func_kind & JS_FUNC_GENERATOR) {
         JSValue proto;
@@ -18536,16 +19143,18 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
         proto = JS_NewObjectProto(ctx, ctx->class_proto[proto_class_id]);
         if (JS_IsException(proto))
             goto fail;
-        JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_prototype, proto,
-                               JS_PROP_WRITABLE);
+        if (JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_prototype, proto,
+                                   JS_PROP_WRITABLE) < 0)
+            goto fail;
     } else if (b->has_prototype) {
         /* add the 'prototype' property: delay instantiation to avoid
            creating cycles for every javascript function. The prototype
            object is created on the fly when first accessed */
         JS_SetConstructorBit(ctx, func_obj, TRUE);
-        JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
-                                  JS_AUTOINIT_ID_PROTOTYPE, NULL,
-                                  JS_PROP_WRITABLE);
+        if (JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
+                                      JS_AUTOINIT_ID_PROTOTYPE, NULL,
+                                      JS_PROP_WRITABLE) < 0)
+            goto fail;
     }
     return func_obj;
  fail:
@@ -18735,6 +19344,8 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->arg_buf = (JSValue*)arg_buf;
 
     func = p->u.cfunc.c_function;
+    TF_CENSUS(rt, JS_CENSUS_NATIVE, func.generic);
+    TF_CENSUS_EVENT(rt, JS_CENSUS_CALL_NATIVE);
     switch(cproto) {
     case JS_CFUNC_constructor:
     case JS_CFUNC_constructor_or_func:
@@ -18822,6 +19433,26 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     return ret_val;
 }
 
+/* A call from the interpreter loop (OP_call*, OP_call_method): a native
+   function is entered as JS_CallInternal() would enter it, after the same
+   interrupt poll, without JS_CallInternal()'s frame setup, which is sized
+   for bytecode and costs about fifty instructions per call on the PSP. */
+static inline JSValue js_call_from_bytecode(JSContext *ctx,
+                                            JSValueConst func_obj,
+                                            JSValueConst this_obj,
+                                            int argc, JSValue *argv)
+{
+    if (JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(func_obj)->class_id == JS_CLASS_C_FUNCTION) {
+        if (unlikely(js_poll_interrupts(ctx)))
+            return JS_EXCEPTION;
+        return js_call_c_function(ctx, func_obj, this_obj, argc,
+                                  (JSValueConst *)argv, 0);
+    }
+    return JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
+                           argc, argv, 0);
+}
+
 static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags)
@@ -18876,12 +19507,60 @@ typedef enum {
 #pragma GCC diagnostic ignored "-Wunused-label"
 #endif
 
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+typedef struct { uint32_t previous; BOOL enabled; } TFCensusFunctionScope;
+static TFCensusFunctionScope tf_census_function_scope(JSRuntime *rt)
+{
+    TFCensusFunctionScope scope = { 0, rt->execution_census && rt->census_function_hook };
+    if (scope.enabled)
+        scope.previous = __atomic_load_n(&tf_census_function, __ATOMIC_RELAXED);
+    return scope;
+}
+static void tf_census_function_leave(TFCensusFunctionScope *scope)
+{
+    if (scope->enabled)
+        __atomic_store_n(&tf_census_function, scope->previous, __ATOMIC_RELAXED);
+}
+static void tf_census_function_enter(JSContext *ctx, JSFunctionBytecode *b)
+{
+    JSRuntime *rt = ctx->rt;
+    if (!rt->execution_census || !rt->census_function_hook) return;
+    if (b->census_epoch != rt->census_epoch) {
+        char file[128], name[64];
+        const char *label = JS_AtomGetStr(ctx, name, sizeof(name), b->func_name);
+        /* AtomGetStr is bounded and does not allocate or execute author code. */
+        if (label != name) snprintf(name, sizeof(name), "%s", label);
+        int line = 0, column = 0;
+        if (b->has_debug) {
+            label = JS_AtomGetStr(ctx, file, sizeof(file), b->debug.filename);
+            if (label != file) snprintf(file, sizeof(file), "%s", label);
+            line = find_line_num(ctx, b, -1, &column);
+        } else {
+            snprintf(file, sizeof(file), "%s", "<stripped>");
+        }
+        b->census_function = rt->census_function_hook(rt->census_function_opaque,
+            file, name, line, column, b->byte_code_len);
+        b->census_epoch = rt->census_epoch;
+    }
+    __atomic_store_n(&tf_census_function, b->census_function, __ATOMIC_RELAXED);
+}
+#define TF_CENSUS_FUNCTION_SCOPE(rt) \
+    TFCensusFunctionScope tf_function_scope __attribute__((cleanup(tf_census_function_leave))) = \
+        tf_census_function_scope(rt)
+#define TF_CENSUS_FUNCTION(ctx, b) tf_census_function_enter(ctx, b)
+#else
+#define TF_CENSUS_FUNCTION_SCOPE(rt) ((void)0)
+#define TF_CENSUS_FUNCTION(ctx, b) ((void)0)
+#endif
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValue *argv, int flags)
 {
     JSRuntime *rt = caller_ctx->rt;
+    TF_CENSUS(rt, JS_CENSUS_CALL, 0);
+    TF_CENSUS_FUNCTION_SCOPE(rt);
     JSContext *ctx;
     JSObject *p;
     JSFunctionBytecode *b;
@@ -18892,8 +19571,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSVarRef **var_refs;
     size_t alloca_size;
 
+#ifdef CONFIG_TILEFINCH_OP_COUNTS
+#define TF_COUNT_OP()   (rt->tf_bytecode_ops++, rt->tf_opcode_counts[*pc]++)
+#else
+#define TF_COUNT_OP()   ((void) 0)
+#endif
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      switch (opcode = *pc++)
+#define SWITCH(pc)      switch (TF_COUNT_OP(), TF_CENSUS_OP(rt, *pc), opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -18908,7 +19592,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      goto *dispatch_table[opcode = *pc++];
+#define SWITCH(pc)      goto *dispatch_table[(TF_COUNT_OP(), TF_CENSUS_OP(rt, *pc), opcode = *pc++)];
 #ifdef OPCODE_ASM_LABEL
 #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
 #else
@@ -18928,11 +19612,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf = &s->frame;
             p = JS_VALUE_GET_OBJ(sf->cur_func);
             b = p->u.func.function_bytecode;
+#ifdef CONFIG_TILEFINCH_CALL_COUNTS
+            b->tf_calls++;
+#endif
+#if defined(CONFIG_TILEFINCH_CALL_COUNTS) || defined(CONFIG_TILEFINCH_OP_COUNTS)
+            rt->tf_calls++;
+#endif
             ctx = b->realm;
             /* A retired resume has not produced an interpreter return slot. */
             if (ctx->host_retired)
                 return JS_ThrowTypeError(caller_ctx, "script realm retired");
             var_refs = p->u.func.var_refs;
+            TF_CENSUS_FUNCTION(ctx, b);
             local_buf = arg_buf = sf->arg_buf;
             var_buf = sf->var_buf;
             stack_buf = sf->var_buf + b->var_count;
@@ -18952,6 +19643,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     p = JS_VALUE_GET_OBJ(func_obj);
     if (unlikely(p->class_id != JS_CLASS_BYTECODE_FUNCTION)) {
         JSClassCall *call_func;
+        if (p->class_id != JS_CLASS_C_FUNCTION && p->class_id != JS_CLASS_C_FUNCTION_DATA)
+            TF_CENSUS_PATH(rt, p->class_id == JS_CLASS_PROXY ? JS_CENSUS_CALL_PROXY :
+                p->class_id == JS_CLASS_BOUND_FUNCTION ? JS_CENSUS_CALL_BOUND :
+                js_class_has_bytecode(p->class_id) ? JS_CENSUS_CALL_BYTECODE : JS_CENSUS_CALL_NATIVE);
         call_func = rt->class_array[p->class_id].call;
         if (!call_func) {
         not_a_function:
@@ -18963,14 +19658,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (p->u.func.function_bytecode->realm->host_retired)
         return JS_UNDEFINED;
     b = p->u.func.function_bytecode;
+    TF_CENSUS_PATH(rt, JS_CENSUS_CALL_BYTECODE);
+#ifdef CONFIG_TILEFINCH_CALL_COUNTS
+    b->tf_calls++;
+#endif
+#if defined(CONFIG_TILEFINCH_CALL_COUNTS) || defined(CONFIG_TILEFINCH_OP_COUNTS)
+    rt->tf_calls++;
+#endif
 
-    /* A capture-only getter has no argument, receiver, allocation, or
-       observable interpreter-frame work. Preserve constructor/copy semantics
-       by using the ordinary path whenever call flags are present. */
-    if (likely(flags == 0 && b->byte_code_len == 2 &&
+    /* A capture-only getter neither reads nor writes argv. The C API's
+       COPY_ARGV flag therefore needs no frame either; getters enter through
+       that API. Constructors and generator resumes keep the ordinary path. */
+    if (likely((flags & ~JS_CALL_FLAG_COPY_ARGV) == 0 && b->byte_code_len == 2 &&
                b->closure_var_count >= 1 &&
                b->byte_code_buf[0] == OP_get_var_ref0 &&
                b->byte_code_buf[1] == OP_return)) {
+        TF_CENSUS_FUNCTION(caller_ctx, b);
+        TF_CENSUS_PATH(rt, JS_CENSUS_CALL_CAPTURE);
         return JS_DupValue(caller_ctx, *p->u.func.var_refs[0]->pvalue);
     }
 
@@ -18979,7 +19683,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     } else {
         arg_allocated_size = 0;
     }
+    if (unlikely(b->is_lazy)) {
+        /* first call of a lazily compiled function */
+        if (js_lazy_function_compile(caller_ctx, b))
+            return JS_EXCEPTION;
+        if (argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))
+            arg_allocated_size = b->arg_count;
+    }
 
+    /* Lazy compilation may replace diagnostic fields along with bytecode. */
+    TF_CENSUS_FUNCTION(caller_ctx, b);
+    {
+    TF_CENSUS(rt, JS_CENSUS_FRAME_SETUP, 0);
+    TF_CENSUS_EVENT(rt, JS_CENSUS_FRAME_SETUP);
+    if (!(flags & ~JS_CALL_FLAG_COPY_ARGV) &&
+        b->func_kind == JS_FUNC_NORMAL && !arg_allocated_size &&
+        !b->var_ref_count)
+        TF_CENSUS_EVENT(rt, JS_CENSUS_FRAME_SIMPLE);
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
                                      b->stack_size) +
         sizeof(JSVarRef *) * b->var_ref_count;
@@ -18994,6 +19714,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     local_buf = alloca(alloca_size);
     if (unlikely(arg_allocated_size)) {
+        TF_CENSUS(rt, JS_CENSUS_FRAME_ARGUMENTS, 0);
+        TF_CENSUS_EVENT(rt, JS_CENSUS_FRAME_ARGUMENTS);
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
         for(i = 0; i < n; i++)
@@ -19006,18 +19728,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->var_buf = var_buf;
     sf->arg_buf = arg_buf;
 
-    for(i = 0; i < b->var_count; i++)
-        var_buf[i] = JS_UNDEFINED;
+    {
+        TF_CENSUS(rt, JS_CENSUS_FRAME_INITIALIZE, 0);
+        TF_CENSUS_EVENT(rt, JS_CENSUS_FRAME_INITIALIZE);
+        for(i = 0; i < b->var_count; i++)
+            var_buf[i] = JS_UNDEFINED;
+    }
 
     stack_buf = var_buf + b->var_count;
     sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
-    for(i = 0; i < b->var_ref_count; i++)
-        sf->var_refs[i] = NULL;
+    {
+        TF_CENSUS(rt, JS_CENSUS_FRAME_INITIALIZE, 0);
+        for(i = 0; i < b->var_ref_count; i++)
+            sf->var_refs[i] = NULL;
+    }
     sp = stack_buf;
     pc = b->byte_code_buf;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
+    }
 
  restart:
     for(;;) {
@@ -19320,6 +20050,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
             }
             BREAK;
+            /* The calls below enter native functions directly (see
+               js_call_from_bytecode). A macro rather than edited calls
+               keeps these lines as the lab variants' patches expect. */
+#define JS_CallInternal(caller_ctx, func_obj, this_obj, new_target, \
+                        argc, argv, flags)                           \
+            js_call_from_bytecode(caller_ctx, func_obj, this_obj, argc, argv)
 #if SHORT_OPCODES
         CASE(OP_call0):
         CASE(OP_call1):
@@ -19385,6 +20121,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 *sp++ = ret_val;
             }
             BREAK;
+#undef JS_CallInternal
         CASE(OP_array_from):
             call_argc = get_u16(pc);
             pc += 2;
@@ -20269,18 +21006,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }                                                       \
                                                                         \
                 obj = sp[-1];                                           \
+                TF_CENSUS_PATH(rt, JS_CENSUS_GET_OWN);                   \
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {   \
                     p = JS_VALUE_GET_OBJ(obj);                          \
                     for(;;) {                                           \
                         prs = find_own_property(&pr, p, atom);          \
                         if (prs) {                                      \
                             /* found */                                 \
-                            if (unlikely(prs->flags & JS_PROP_TMASK))   \
+                            if (unlikely(prs->flags & JS_PROP_TMASK)) { \
+                                if ((prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET) \
                                     goto name ## _slow_path;            \
+                                sf->cur_pc = pc;                       \
+                                TF_CENSUS_PATH(rt, JS_CENSUS_GET_GETTER); \
+                                val = js_call_property_getter(ctx, pr, sp[-1]); \
+                                if (unlikely(JS_IsException(val)))     \
+                                    goto exception;                    \
+                                break;                                 \
+                            }                                          \
                             val = JS_DupValue(ctx, pr->u.value);        \
                             break;                                      \
                         }                                               \
                         if (unlikely(p->is_exotic)) {                   \
+                            TF_CENSUS_PATH(rt, JS_CENSUS_GET_EXOTIC);    \
                             /* XXX: should avoid the slow path for arrays \
                                and typed arrays by ensuring that 'prop' is \
                                not numeric */                           \
@@ -20288,6 +21035,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto name ## _slow_path;                    \
                         }                                               \
                         p = p->shape->proto;                            \
+                        TF_CENSUS_PATH(rt, JS_CENSUS_GET_PROTOTYPE);     \
                         if (!p) {                                       \
                             val = JS_UNDEFINED;                         \
                             break;                                      \
@@ -20419,9 +21167,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int ret;
                 JSAtom atom;
+                JSObject *p;
+                JSProperty *pr;
                 atom = get_u32(pc);
                 pc += 4;
 
+                /* A new field of an ordinary extensible object (an object
+                   literal's, or a class field of an ordinary instance):
+                   JS_DefinePropertyValue() would find no property, pass
+                   the exotic and extensibility checks and reach
+                   add_property() with these flags. Other receivers
+                   (Proxy, arrays, non-extensible objects) and
+                   redefinitions take the general path. */
+                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT)) {
+                    p = JS_VALUE_GET_OBJ(sp[-2]);
+                    if (likely(p->class_id == JS_CLASS_OBJECT &&
+                               !p->is_exotic && p->extensible) &&
+                        !find_own_property1(p, atom)) {
+                        pr = add_property(ctx, p, atom, JS_PROP_C_W_E);
+                        if (unlikely(!pr))
+                            goto exception;
+                        pr->u.value = sp[-1];
+                        sp--;
+                        BREAK;
+                    }
+                }
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
                 sp--;
@@ -20901,6 +21671,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-2] = __JS_NewFloat64(ctx, d1 + d2);
                     sp--;
                 } else if (JS_IsString(op1) && JS_IsString(op2)) {
+                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&
+                        js_add_result_replaces_local(pc, var_buf, op1)) {
+                        /* `s += expr` on a let/const-checked or general
+                           local: the only other reference to s is the
+                           local the next opcode overwrites with the
+                           result, so append in place like OP_add_loc. */
+                        JSString *p1 = JS_VALUE_GET_STRING(op1);
+                        BOOL appended;
+                        js_rc(p1)->ref_count = 1;
+                        appended = JS_ConcatStringInPlace(ctx, p1, op2);
+                        js_rc(p1)->ref_count = 2;
+                        if (appended) {
+                            JS_FreeValue(ctx, op2);
+                            sp--;
+                            BREAK;
+                        }
+                    }
                     sp[-2] = JS_ConcatString(ctx, op1, op2);
                     sp--;
                     if (JS_IsException(sp[-1]))
@@ -21871,6 +22658,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->cur_sp = sp;
     } else {
     done:
+        {
+        TF_CENSUS(rt, JS_CENSUS_FRAME_CLEANUP, 0);
+        TF_CENSUS_EVENT(rt, JS_CENSUS_FRAME_CLEANUP);
         if (unlikely(b->var_ref_count != 0)) {
             /* variable references reference the stack: must close them */
             close_var_refs(rt, b, sf);
@@ -21878,6 +22668,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         /* free the local variables and stack */
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
+        }
         }
     }
     rt->current_stack_frame = sf->prev_frame;
@@ -22075,6 +22866,11 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
     int i, arg_buf_len, n;
 
     p = JS_VALUE_GET_OBJ(func_obj);
+    /* first call of a lazily compiled function (not in a retired realm) */
+    if (unlikely(p->u.func.function_bytecode->is_lazy) &&
+        !p->u.func.function_bytecode->realm->host_retired &&
+        js_lazy_function_compile(ctx, p->u.func.function_bytecode))
+        return NULL;
     b = p->u.func.function_bytecode;
     if (b->realm->host_retired) {
         JS_ThrowTypeError(ctx, "script realm retired");
@@ -23121,6 +23917,7 @@ typedef struct {
     int line_num;
     int col_num;
     const uint8_t *buf_start;
+    int first_col; /* column of buf_start */
 } GetLineColCache;
 
 typedef enum JSParseFunctionEnum {
@@ -23286,6 +24083,22 @@ typedef struct JSFunctionDef {
 
     JSModuleDef *module; /* != NULL when parsing a module */
     BOOL has_await; /* TRUE if await is used (used in module eval) */
+
+    /* lazy compilation, see JS_SetLazyFunctionThreshold() */
+    uint32_t lazy_threshold; /* minimum text length of a lazy child, 0: none */
+    unsigned int lazy_ok : 1; /* a kind of function that may be compiled lazily */
+    unsigned int lazy_is_module : 1;
+    unsigned int lazy_parent_static_init : 1;
+    unsigned int lazy_resolving : 1; /* resolving variables of a function kept lazy */
+    unsigned int is_lazy_env : 1; /* synthetic parent of a lazy function being compiled */
+    uint8_t lazy_parent_js_mode;
+    uint8_t lazy_parent_func_kind;
+    uint32_t lazy_span_start; /* the function text in the parse buffer */
+    uint32_t lazy_span_len;
+    uint32_t lazy_param_offset; /* parameter list, from the text start */
+    unsigned int preparsed : 1; /* body skipped: kept lazy, see js_preparse_function_body() */
+    unsigned int preparse_resolving : 1; /* resolving a name its scan recorded */
+    uint32_t preparse_names_pos; /* bytecode offset of those names */
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -23329,6 +24142,11 @@ typedef struct JSParseState {
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
     GetLineColCache get_line_col_cache;
+    BOOL lazy_entry; /* js_parse_function_decl2() compiles a lazy function */
+    /* see js_preparse_function_body() */
+    BOOL preparse_off : 8;     /* parse every body */
+    BOOL preparse_skipped : 8; /* a body was skipped */
+    BOOL preparse_restart : 8; /* compile again without skipping */
     /* Tokens until the next embedder interrupt poll during parsing; see
        next_token().  Zero or negative forces a poll on the next token. */
     uint32_t first_line_column;
@@ -23336,7 +24154,7 @@ typedef struct JSParseState {
 } JSParseState;
 
 typedef struct JSOpCode {
-#ifdef DUMP_BYTECODE
+#if defined(DUMP_BYTECODE) || defined(CONFIG_TILEFINCH_OP_COUNTS) || defined(CONFIG_TILEFINCH_EXECUTION_CENSUS)
     const char *name;
 #endif
     uint8_t size; /* in bytes */
@@ -23349,7 +24167,7 @@ typedef struct JSOpCode {
 
 static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #define FMT(f)
-#ifdef DUMP_BYTECODE
+#if defined(DUMP_BYTECODE) || defined(CONFIG_TILEFINCH_OP_COUNTS) || defined(CONFIG_TILEFINCH_EXECUTION_CENSUS)
 #define DEF(id, size, n_pop, n_push, f) { #id, size, n_pop, n_push, OP_FMT_ ## f },
 #else
 #define DEF(id, size, n_pop, n_push, f) { size, n_pop, n_push, OP_FMT_ ## f },
@@ -23370,6 +24188,65 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #else
 #define short_opcode_info(op) opcode_info[op]
 #endif
+
+const char *JS_ExecutionCensusName(unsigned zone)
+{
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+    if (zone < OP_COUNT) return short_opcode_info(zone).name;
+#endif
+    switch (zone) {
+    case JS_CENSUS_CALL: return "call-setup";
+    case JS_CENSUS_NATIVE: return "native";
+    case JS_CENSUS_GET_PROPERTY: return "get-property";
+    case JS_CENSUS_SET_PROPERTY: return "set-property";
+    case JS_CENSUS_DEFINE_PROPERTY: return "define-property";
+    case JS_CENSUS_ALLOCATE: return "allocate";
+    case JS_CENSUS_RELEASE: return "release";
+    case JS_CENSUS_TO_STRING: return "to-string";
+    case JS_CENSUS_CLOSURE: return "closure";
+    case JS_CENSUS_OUTSIDE: return "outside";
+    case JS_CENSUS_GET_OWN: return "get-own-lookup";
+    case JS_CENSUS_GET_PROTOTYPE: return "get-prototype-hop";
+    case JS_CENSUS_GET_GETTER: return "get-getter-dispatch";
+    case JS_CENSUS_GET_EXOTIC: return "get-exotic";
+    case JS_CENSUS_GET_PRIMITIVE: return "get-primitive";
+    case JS_CENSUS_SET_OWN: return "set-own-lookup";
+    case JS_CENSUS_SET_SETTER: return "set-setter-dispatch";
+    case JS_CENSUS_CALL_BYTECODE: return "call-bytecode-entry";
+    case JS_CENSUS_CALL_NATIVE: return "call-native-entry";
+    case JS_CENSUS_CALL_CAPTURE: return "call-capture-fast";
+    case JS_CENSUS_CALL_BOUND: return "call-bound-entry";
+    case JS_CENSUS_CALL_PROXY: return "call-proxy-entry";
+    case JS_CENSUS_FRAME_SETUP: return "call-frame-setup";
+    case JS_CENSUS_FRAME_ARGUMENTS: return "call-frame-arguments";
+    case JS_CENSUS_FRAME_INITIALIZE: return "call-frame-initialize";
+    case JS_CENSUS_FRAME_CLEANUP: return "call-frame-cleanup";
+    case JS_CENSUS_FRAME_SIMPLE: return "call-frame-simple";
+    default: return "unknown";
+    }
+}
+
+/* Tilefinch op-count builds: the dispatch count of every opcode byte since
+   the runtime was created, with the (short) opcode name. Returns the number
+   of entries written (256), or 0 in a build without CONFIG_TILEFINCH_OP_COUNTS
+   or when 'capacity' is too small. Opcode bytes above OP_COUNT that the
+   final bytecode cannot contain read 0 with a NULL name. */
+size_t JS_GetOpcodeCounts(JSRuntime *rt, const char **names,
+                          uint64_t *counts, size_t capacity)
+{
+#ifdef CONFIG_TILEFINCH_OP_COUNTS
+    if (capacity < 256)
+        return 0;
+    for (int op = 0; op < 256; op++) {
+        counts[op] = rt->tf_opcode_counts[op];
+        names[op] = op < OP_COUNT ? short_opcode_info(op).name : NULL;
+    }
+    return 256;
+#else
+    (void) rt; (void) names; (void) counts; (void) capacity;
+    return 0;
+#endif
+}
 
 static __exception int next_token(JSParseState *s);
 
@@ -23510,6 +24387,8 @@ static int get_line_col_cached(GetLineColCache *s, int *pcol_num, const uint8_t 
                     col_num++;
                 }
             }
+            if (p < s->buf_start)
+                col_num += s->first_col; /* first line of the buffer */
             s->col_num = col_num;
         }
     }
@@ -23552,6 +24431,29 @@ static __attribute__((format(printf, 2, 3))) int js_parse_error(JSParseState *s,
     ret = js_parse_error_v(s, s->token.ptr, fmt, ap);
     va_end(ap);
     return ret;
+}
+
+/* A direct eval found after a function body was skipped: the functions
+   around it cannot be kept lazy (see js_preparse_function_body()). */
+static int js_parse_preparse_restart(JSParseState *s)
+{
+    s->preparse_restart = TRUE;
+    return js_parse_error(s, "compile again without preparsing");
+}
+
+/* After a failed parse: TRUE (and the exception cleared) if it failed
+   because of a direct eval found after function bodies were skipped, and
+   must be done again without skipping. (Skipped bodies were validated:
+   any other error is the script's own.) */
+static BOOL js_parse_preparse_retry(JSParseState *s)
+{
+    JSContext *ctx = s->ctx;
+
+    if (!s->preparse_skipped || !s->preparse_restart)
+        return FALSE;
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    ctx->rt->lazy_stats.preparse_restarts++;
+    return TRUE;
 }
 
 static int js_parse_expect(JSParseState *s, int tok)
@@ -23966,7 +24868,7 @@ static void reparse_ident_token(JSParseState *s)
 }
 
 /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
-static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
+static no_inline JSAtom parse_ident_slow(JSParseState *s, const uint8_t **pp,
                           BOOL *pident_has_escape, int c, BOOL is_private)
 {
     const uint8_t *p, *p1;
@@ -24013,6 +24915,29 @@ static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
     return atom;
 }
 
+
+static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
+                          BOOL *pident_has_escape, int c, BOOL is_private)
+{
+    /* Plain ASCII identifiers are already a contiguous source span. Avoid
+       the slow parser's scratch buffer and a second encoding scan on an atom
+       hit. Unicode/escapes fall back without consuming any source. */
+    if (c < 128 && !is_private && !*pident_has_escape) {
+        const uint8_t *start = *pp - 1, *end = *pp;
+        while (*end < 128 && lre_js_is_ident_next(*end))
+            end++;
+        if (*end < 128 && *end != '\\') {
+            size_t length = (size_t)(end - start);
+            JSAtom atom = __JS_FindAtom(s->ctx->rt, (const char *)start, length,
+                                       JS_ATOM_TYPE_STRING);
+            if (atom == JS_ATOM_NULL)
+                atom = JS_NewAtomLen(s->ctx, (const char *)start, length);
+            *pp = end;
+            return atom;
+        }
+    }
+    return parse_ident_slow(s, pp, pident_has_escape, c, is_private);
+}
 
 static __exception int next_token(JSParseState *s)
 {
@@ -28550,6 +29475,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     emit_op(s, OP_apply_eval);
                     emit_u16(s, fd->scope_level);
                     fd->has_eval_call = TRUE;
+                    if (s->preparse_skipped)
+                        return js_parse_preparse_restart(s);
                     break;
                 default:
                     if (call_type == FUNC_CALL_SUPER_CTOR) {
@@ -28594,6 +29521,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     emit_u16(s, arg_count);
                     emit_u16(s, fd->scope_level);
                     fd->has_eval_call = TRUE;
+                    if (s->preparse_skipped)
+                        return js_parse_preparse_restart(s);
                     break;
                 default:
                     if (call_type == FUNC_CALL_SUPER_CTOR) {
@@ -33288,6 +34217,9 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
         list_add_tail(&fd->link, &parent->child_list);
         fd->js_mode = parent->js_mode;
         fd->parent_scope_level = parent->scope_level;
+        fd->lazy_threshold = parent->lazy_threshold;
+    } else {
+        fd->lazy_threshold = ctx->rt->lazy_function_threshold;
     }
     fd->strip_debug = ((ctx->rt->strip_flags & JS_STRIP_DEBUG) != 0);
     fd->strip_source = ((ctx->rt->strip_flags & (JS_STRIP_DEBUG | JS_STRIP_SOURCE)) != 0);
@@ -34314,7 +35246,11 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         for (idx = fd->scopes[scope_level].first; idx >= 0;) {
             vd = &fd->vars[idx];
             if (vd->var_name == var_name) {
-                if (op == OP_scope_put_var || op == OP_scope_make_ref) {
+                /* A function kept lazy must capture the constant anyway:
+                   its body, compiled later, finds it among its closure
+                   variables and throws the same error from there. */
+                if ((op == OP_scope_put_var || op == OP_scope_make_ref) &&
+                    !s->lazy_resolving) {
                     if (vd->is_const) {
                         dbuf_putc(bc, OP_throw_error);
                         dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
@@ -34437,6 +35373,14 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             }
         }
 
+        /* A name that a scan recorded for a function nested in a lazy
+           function being compiled is not a name the lazy function uses if
+           it is not among its closure variables: those are a superset of
+           its free names (js_preparse_function_body()). A scan of the
+           nested function alone can record more than the scan or parse
+           that made the lazy function; the name needs no closure. */
+        if (s->preparse_resolving && fd->is_lazy_env)
+            goto done;
         /* not found: add a closure for a global variable access */
         idx1 = add_closure_var(ctx, fd, JS_CLOSURE_GLOBAL, 0, var_name,
                               FALSE, FALSE, JS_VAR_NORMAL);
@@ -34642,8 +35586,11 @@ static int resolve_scope_private_field1(JSContext *ctx,
             var_kind = fd->vars[idx].var_kind;
             if (is_ref) {
                 capture_var(fd, &fd->vars[idx]);
+                /* a function kept lazy resolves the private name from its
+                   closure variable later, so that one records the kind */
                 idx = get_closure_var(ctx, s, fd, JS_CLOSURE_LOCAL, idx, var_name,
-                                      TRUE, TRUE, JS_VAR_NORMAL);
+                                      TRUE, TRUE,
+                                      s->lazy_resolving ? var_kind : JS_VAR_NORMAL);
                 if (idx < 0)
                     return -1;
             }
@@ -35474,6 +36421,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         case OP_scope_put_var_init:
             var_name = get_u32(bc_buf + pos + 1);
             scope = get_u16(bc_buf + pos + 5);
+            s->preparse_resolving = s->preparsed && pos >= s->preparse_names_pos;
             pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
                                          NULL, NULL, pos_next);
             /* A failed scope resolution is not a bytecode cursor. */
@@ -37290,24 +38238,13 @@ static void js_share_child_function_source(JSContext *ctx,
     owner->ref_count++;
 }
 
-/* Create children first to resolve variables, then release the definition. */
-static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
-{
-    JSValue func_obj;
-    JSFunctionBytecode *b;
-    struct list_head *el, *el1;
-    int stack_size, scope, idx;
-    int function_size, byte_code_offset, cpool_offset;
-    int closure_var_offset, vardefs_offset;
-    BOOL strip_var_debug;
-    
-    /* Parsing may have stopped between an opcode and its operands. */
-    if (dbuf_error(&fd->byte_code)) {
-        JS_ThrowOutOfMemory(ctx);
-        goto fail;
-    }
 
-    /* recompute scope linkage */
+/* Recompute the scope linkage of 'fd' (its variables were added while
+   parsing). */
+static void js_link_function_scopes(JSFunctionDef *fd)
+{
+    int scope, idx;
+
     for (scope = 0; scope < fd->scope_count; scope++) {
         fd->scopes[scope].first = -1;
     }
@@ -37332,6 +38269,255 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             vd->scope_next = fd->scopes[scope].first;
         }
     }
+}
+
+/*
+ * Lazy function compilation (JS_SetLazyFunctionThreshold()).
+ *
+ * The whole script is parsed as usual, so every early error is reported
+ * when it compiles - unless preparsing (see js_preparse_function_body())
+ * skipped the function's body, in which case only its end and the names
+ * it may use are known, and an early error in it is reported by its first
+ * call. For a function kept lazy, js_create_function() then
+ * resolves the variables of the function and of everything nested in it -
+ * which is what decides the function's closure variables and marks the
+ * enclosing variables it captures - but stops there: no bytecode, constant
+ * pool or line table is produced. The function becomes a stub
+ * JSFunctionBytecode holding its closure variables, name, length, flags,
+ * the line of its definition and its source text.
+ *
+ * On its first call js_lazy_function_compile() parses the text again, alone,
+ * under a synthetic parent (is_lazy_env) that reproduces the parser state
+ * of the enclosing function and offers the stub's closure variables by name,
+ * the way a direct eval sees its caller's variables. Every free name of the
+ * body is among them, so the new bytecode uses the same closure variable
+ * indexes as the stub and the function objects already created from the
+ * stub keep working; the body is then moved into the stub.
+ *
+ * A function is kept lazy only when its variables can be resolved
+ * statically: no direct eval in it or around it, no enclosing 'with'. Class
+ * constructors, field initializers and static blocks, which are compiled
+ * with their class, are always compiled eagerly.
+ */
+
+/* FALSE if 'fd' or a function nested in it calls eval directly; otherwise
+   adds the size of their unresolved bytecode to *code_size */
+static BOOL js_function_def_tree_is_static(JSFunctionDef *fd, size_t *code_size)
+{
+    struct list_head *el;
+
+    if (fd->has_eval_call)
+        return FALSE;
+    *code_size += fd->byte_code.size;
+    list_for_each(el, &fd->child_list) {
+        if (!js_function_def_tree_is_static(list_entry(el, JSFunctionDef, link),
+                                            code_size))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* TRUE if a function defined in 'parent' at 'scope_level' resolves its
+   names statically: no direct eval or 'with' around it, and nothing but
+   a script, module or lazy function compile at the top. */
+static BOOL js_lazy_function_scope_is_static(JSFunctionDef *parent,
+                                             int scope_level)
+{
+    JSFunctionDef *s;
+    int idx;
+
+    for (s = parent; s != NULL; scope_level = s->parent_scope_level, s = s->parent) {
+        if (s->has_eval_call || s->var_object_idx >= 0 ||
+            s->arg_var_object_idx >= 0)
+            return FALSE;
+        for (idx = s->scopes[scope_level].first; idx >= 0;
+             idx = s->vars[idx].scope_next) {
+            if (s->vars[idx].var_name == JS_ATOM__with_)
+                return FALSE;
+        }
+        if (!s->parent && !s->is_lazy_env &&
+            !(s->is_eval && (s->eval_type == JS_EVAL_TYPE_GLOBAL ||
+                             s->eval_type == JS_EVAL_TYPE_MODULE)))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL js_lazy_function_eligible(JSFunctionDef *parent, JSFunctionDef *fd)
+{
+    size_t code_size = 0;
+
+    if (!fd->lazy_ok || parent->lazy_threshold == 0 || fd->strip_debug ||
+        fd->lazy_span_len < parent->lazy_threshold ||
+        fd->lazy_span_len > JS_STRING_LEN_MAX)
+        return FALSE;
+    if (!js_function_def_tree_is_static(fd, &code_size))
+        return FALSE;
+    /* Without Function.prototype.toString() text the stub keeps a copy of
+       its own; do not trade bytecode for more text (comments, whitespace) */
+    if (fd->strip_source && fd->lazy_span_len > code_size)
+        return FALSE;
+    return js_lazy_function_scope_is_static(parent, fd->parent_scope_level);
+}
+
+/* Resolve the variables of 'fd' and of the functions nested in it, as
+   js_create_function() would, without producing their bytecode. */
+static int js_lazy_resolve_variables(JSContext *ctx, JSFunctionDef *fd)
+{
+    struct list_head *el;
+
+    if (dbuf_error(&fd->byte_code)) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    js_link_function_scopes(fd);
+    list_for_each(el, &fd->child_list) {
+        if (js_lazy_resolve_variables(ctx, list_entry(el, JSFunctionDef, link)))
+            return -1;
+    }
+    fd->lazy_resolving = TRUE;
+    return resolve_variables(ctx, fd);
+}
+
+static void js_free_lazy_function(JSRuntime *rt, JSLazyFunction *lz)
+{
+    if (lz) {
+        js_free_rt(rt, lz->source);
+        js_free_rt(rt, lz);
+    }
+}
+
+static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd)
+{
+    JSFunctionBytecode *b = NULL;
+    JSLazyFunction *lz = NULL;
+    const uint8_t *buf_start = fd->get_line_col_cache->buf_start;
+    DynBuf pc2line;
+    int line_num, col_num, function_size;
+
+    if (js_lazy_resolve_variables(ctx, fd))
+        goto fail;
+
+    lz = js_mallocz(ctx, sizeof(*lz));
+    if (!lz)
+        goto fail;
+    lz->param_offset = fd->lazy_param_offset;
+    lz->nested_threshold = fd->lazy_threshold;
+    lz->func_type = fd->func_type;
+    lz->parent_js_mode = fd->lazy_parent_js_mode;
+    lz->parent_func_kind = fd->lazy_parent_func_kind;
+    lz->is_module = fd->lazy_is_module;
+    lz->parent_static_init = fd->lazy_parent_static_init;
+    lz->strip_source = fd->strip_source;
+    if (fd->strip_source || !fd->source ||
+        (uint32_t)fd->source_len != fd->lazy_span_len) {
+        /* Function.prototype.toString() has no text; keep a private copy
+           until the body compiles */
+        lz->source_len = fd->lazy_span_len;
+        lz->source = js_malloc(ctx, max_int(lz->source_len, 1));
+        if (!lz->source)
+            goto fail;
+        memcpy(lz->source, buf_start + fd->lazy_span_start, lz->source_len);
+    }
+    if (lz->param_offset > fd->lazy_span_len) {
+        JS_ThrowInternalError(ctx, "invalid lazy function span");
+        goto fail;
+    }
+
+    /* the line table of a stub only holds the definition line and column */
+    line_num = get_line_col_cached(fd->get_line_col_cache, &col_num,
+                                   buf_start + fd->source_pos);
+    js_dbuf_init(ctx, &pc2line);
+    dbuf_put_leb128(&pc2line, line_num);
+    dbuf_put_leb128(&pc2line, col_num);
+    if (dbuf_error(&pc2line)) {
+        dbuf_free(&pc2line);
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+
+    function_size = sizeof(*b) + fd->closure_var_count * sizeof(*fd->closure_var);
+    b = js_mallocz(ctx, function_size);
+    if (!b) {
+        dbuf_free(&pc2line);
+        goto fail;
+    }
+    js_rc(b)->ref_count = 1;
+    b->is_lazy = 1;
+    b->byte_code_buf = (uint8_t *)lz;
+    b->func_name = fd->func_name;
+    fd->func_name = JS_ATOM_NULL;
+    b->defined_arg_count = fd->defined_arg_count;
+    b->closure_var_count = fd->closure_var_count;
+    if (b->closure_var_count) {
+        b->closure_var = (void *)((uint8_t *)b + sizeof(*b));
+        memcpy(b->closure_var, fd->closure_var,
+               b->closure_var_count * sizeof(*fd->closure_var));
+    }
+    js_free(ctx, fd->closure_var);
+    fd->closure_var = NULL;
+    fd->closure_var_count = 0;
+
+    b->has_debug = 1;
+    b->debug.filename = fd->filename;
+    fd->filename = JS_ATOM_NULL;
+    b->debug.pc2line_buf = pc2line.buf;
+    b->debug.pc2line_len = pc2line.size;
+    if (!fd->strip_source) {
+        b->debug.source = fd->source;
+        b->debug.source_len = fd->source_len;
+        b->debug.source_owner = fd->source_owner;
+        fd->source = NULL;
+        fd->source_owner = NULL;
+    }
+
+    b->has_prototype = fd->has_prototype;
+    b->has_simple_parameter_list = fd->has_simple_parameter_list;
+    b->js_mode = fd->js_mode;
+    b->is_derived_class_constructor = fd->is_derived_class_constructor;
+    b->func_kind = fd->func_kind;
+    b->need_home_object = (fd->home_object_var_idx >= 0 ||
+                           fd->need_home_object);
+    b->new_target_allowed = fd->new_target_allowed;
+    b->super_call_allowed = fd->super_call_allowed;
+    b->super_allowed = fd->super_allowed;
+    b->arguments_allowed = fd->arguments_allowed;
+    b->realm = JS_DupContext(ctx);
+    add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+
+    ctx->rt->lazy_stats.deferred++;
+    ctx->rt->lazy_stats.deferred_source_bytes += fd->lazy_span_len;
+    if (fd->preparsed) {
+        ctx->rt->lazy_stats.preparsed++;
+        ctx->rt->lazy_stats.preparsed_source_bytes += fd->lazy_span_len;
+    }
+    js_free_function_def(ctx, fd);
+    return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
+ fail:
+    js_free_lazy_function(ctx->rt, lz);
+    js_free_function_def(ctx, fd);
+    return JS_EXCEPTION;
+}
+
+/* Create children first to resolve variables, then release the definition. */
+static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+{
+    JSValue func_obj;
+    JSFunctionBytecode *b;
+    struct list_head *el, *el1;
+    int stack_size;
+    int function_size, byte_code_offset, cpool_offset;
+    int closure_var_offset, vardefs_offset;
+    BOOL strip_var_debug;
+    
+    /* Parsing may have stopped between an opcode and its operands. */
+    if (dbuf_error(&fd->byte_code)) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+
+    /* recompute scope linkage */
+    js_link_function_scopes(fd);
 
     /* if the function contains an eval call, the closure variables
        are used to compile the eval and they must be ordered by scope,
@@ -37354,7 +38540,20 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         fd1 = list_entry(el, JSFunctionDef, link);
         cpool_idx = fd1->parent_cpool_idx;
         js_share_child_function_source(ctx, fd, fd1);
-        func_obj = js_create_function(ctx, fd1);
+        if (fd1->preparsed) {
+            /* its body was skipped when it was found eligible; a direct
+               eval around it found later restarts the compile */
+            if (!js_lazy_function_scope_is_static(fd, fd1->parent_scope_level)) {
+                JS_ThrowInternalError(ctx, "preparsed function is not lazy");
+                js_free_function_def(ctx, fd1);
+                goto fail;
+            }
+            func_obj = js_create_lazy_function(ctx, fd1);
+        } else if (js_lazy_function_eligible(fd, fd1)) {
+            func_obj = js_create_lazy_function(ctx, fd1);
+        } else {
+            func_obj = js_create_function(ctx, fd1);
+        }
         if (JS_IsException(func_obj))
             goto fail;
         /* save it in the constant pool */
@@ -37594,6 +38793,15 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         js_free_function_source(rt, b->debug.source, b->debug.source_owner);
     }
 
+    if (b->is_lazy) {
+        js_free_lazy_function(rt, js_lazy_function_of(b));
+        b->is_lazy = 0;
+        b->byte_code_buf = NULL;
+    } else if (b->has_lazy_body) {
+        js_free_rt(rt, b->byte_code_buf);
+        b->byte_code_buf = NULL;
+    }
+
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && js_rc(b)->ref_count != 0) {
         list_add_tail(&b->header.link, &rt->gc_zero_ref_count_list);
@@ -37773,6 +38981,3418 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
     return fd;
 }
 
+/*
+ * Preparsing lazy function bodies (JS_SetLazyFunctionPreparse()).
+ *
+ * A function kept lazy (see "Lazy function compilation" below) needs three
+ * things from its body while the enclosing script compiles: that it is
+ * valid (every early error must be reported before the script runs), where
+ * it ends, and which names it may take from the enclosing functions.
+ * js_preparse_function_body() gets them with a validating preparser, like
+ * V8's: a recursive-descent parser for function bodies that builds nothing
+ * - no atoms for property names, no values for literals, no bytecode, no
+ * nested function definitions - and checks the grammar and the early-error
+ * rules as QuickJS's parser applies them. Its decisions follow the parser's
+ * own: the same token classification by context (strict mode, generator,
+ * async), the same look-ahead (js_parse_skip_parens_token() is mirrored,
+ * regexp heuristic included, for arrows, destructuring and for-loop heads;
+ * simple_next_token() is called directly), the same statement and
+ * expression structure, the same last-opcode rule for assignment targets.
+ * Regexp literals are compiled, number literals converted and escaped or
+ * non-ASCII string and template text decoded by the parser's own functions.
+ *
+ * It accepts a body only when it can tell that the parser accepts it. On
+ * anything outside what it models (private names, eval, with, sloppy-mode
+ * let or function declarations in blocks, escaped or non-ASCII identifiers,
+ * reserved words used as names, conflicting or repeated declarations,
+ * duplicate parameters, a nested "use strict", ...) or anything invalid, it
+ * gives up and the parser parses the body, reporting its errors itself. So
+ * early errors are exactly the parser's; what the preparser does not
+ * know is parsed.
+ *
+ * Declarations are tracked with their scopes (functions, parameters with
+ * expressions, blocks, for heads, catch clauses, classes), and the names
+ * each scope uses but does not declare pass to the enclosing one: what is
+ * left at the body are the names it may take from outside, and 'this',
+ * 'arguments', 'new.target' and 'super' as the pseudo variables the parser
+ * uses for them. The body is replaced by one OP_scope_get_var per name:
+ * resolving the skipped function (js_create_lazy_function()) marks the
+ * enclosing variables it captures and gives the stub its closure
+ * variables, a global reference for a name nothing encloses.
+ *
+ * A body shorter than the lazy threshold, or one whose stub would keep a
+ * private source copy larger than a lower bound of its bytecode (the
+ * JS_STRIP_SOURCE rule of js_lazy_function_eligible()), is parsed.
+ */
+
+#define PP_INLINE_FRAMES 16
+#define PP_INLINE_REFS 96
+#define PP_INLINE_DECLS 32
+#define PP_INLINE_HASH 128 /* power of two */
+#define PP_MAX_FRAMES 2048
+#define PV_INLINE_LABELS 16
+#define PV_INLINE_CONF 128 /* power of two */
+#define PV_MAX_CALL_ARGS 65534
+
+/* A lower bound of the bytecode a parse emits (before variable
+   resolution), for the JS_STRIP_SOURCE rule of js_lazy_function_eligible().
+   A use of a name is a scope_* opcode (7 bytes: atom and scope) after its
+   source position (a 5-byte line_num, shared with the statement when it
+   starts one); a property name is a source position and a get_field (10);
+   a key or literal an opcode with an atom or constant (5); a call a
+   source position and the call (8); a binary or assignment operator a
+   source position and the operator (6); &&, || and ?? two opcodes around a
+   jump (7); a conditional two jumps (10); an initialized binding a store
+   (7); a nested function its closure (5) and return (1). */
+#define PP_NAME_BYTES 7
+#define PP_ATOM_BYTES 5
+#define PP_POS_BYTES 5
+#define PP_CODE(pp, n) ((pp)->code_bytes += (n))
+
+enum {
+    PP_DONE,
+    PP_BAIL,        /* not modeled or invalid: parse the body */
+    PP_ERROR,       /* out of memory or interrupted: exception pending */
+};
+
+enum {
+    PPF_ROOT,       /* the skipped function */
+    PPF_FUNC,       /* function, method, field initializer, static block */
+    PPF_ARROW,
+    PPF_BLOCK,      /* body with parameter expressions, block, class */
+};
+
+/* parse flags, as the parser's */
+#define PV_IN          (1 << 0)  /* PF_IN_ACCEPTED */
+#define PV_CALL        (1 << 1)  /* PF_POSTFIX_CALL */
+#define PV_POW_ALLOWED (1 << 2)
+#define PV_POW_FORBIDDEN (1 << 3)
+
+/* declaration masks, as the parser's */
+#define PV_DECL_FUNC   (1 << 0)
+#define PV_DECL_OTHER  (1 << 2)
+#define PV_DECL_ALL    (PV_DECL_FUNC | PV_DECL_OTHER)
+
+/* what the last opcode of a parsed expression would be (get_lvalue()) */
+enum {
+    PVX_NONE,       /* not an assignment target */
+    PVX_VAR,        /* scope_get_var of a name (not 'this') */
+    PVX_FIELD,      /* get_field, get_array_el, get_super_value */
+    PVX_ARGS,       /* 'arguments' in strict code */
+};
+
+/* kinds of declarations */
+enum {
+    PVD_NONE,       /* assignment pattern: no declaration */
+    PVD_PARAM,
+    PVD_VAR,
+    PVD_FUNC,       /* function declaration at the top of a function body */
+    PVD_LEX,        /* let, const, class, block function (strict) */
+};
+#define PVC_VAR   1     /* var or function declaration */
+#define PVC_PARAM 2
+
+typedef struct {
+    int tok;                    /* the parser's token value */
+    const uint8_t *ptr, *end;   /* text of the token */
+    BOOL nl;                    /* a line break before it (got_lf) */
+    JSAtom atom;                /* identifiers and keywords (owned) */
+    uint8_t sep;                /* templates: '`' at the end, '$' before ${ */
+    uint8_t special;            /* string and template text: 1 escapes or
+                                   non-ASCII */
+} PVToken;
+
+typedef struct {
+    uint8_t kind;
+    uint32_t ref_start;
+    uint32_t decl_start;
+} PPFrame;
+
+typedef struct {
+    JSAtom atom;
+    uint32_t mark;
+} PPHashEntry;
+
+typedef struct {
+    JSAtom name;                /* JS_ATOM_NULL: none */
+    uint8_t brk, cont, regular;
+} PVLabel;
+
+/* a name declared in a function */
+typedef struct {
+    JSAtom atom;
+    uint32_t serial;            /* of the function */
+    uint8_t flags;
+    uint32_t var_seq;           /* when its last var declaration was seen */
+    uint32_t lex_open;          /* open scopes that declare it lexically */
+} PVConf;
+
+typedef struct PVCtx {
+    struct PVCtx *parent;
+    uint32_t serial;            /* declarations of this function */
+    uint32_t label_base;
+    int param_frame;            /* frame of its parameters */
+    int var_frame;              /* frame of its body */
+    uint8_t strict, is_async, is_gen, is_arrow, is_static_init, in_body;
+    uint8_t super_allowed, super_call_allowed, new_target_allowed;
+    uint8_t arguments_allowed;
+} PVCtx;
+
+typedef struct PVScope {
+    struct PVScope *parent;     /* NULL at a function body */
+    uint32_t ref_pos;
+    uint32_t enter_seq;
+    int frame;                  /* -1 until it declares something */
+} PVScope;
+
+typedef struct JSPreparse {
+    JSParseState *s;
+    JSContext *ctx;
+    const uint8_t *end;
+    BOOL is_module, html_comments;
+    int status;                 /* PP_BAIL or PP_ERROR once it stops */
+    int bail_line;              /* where it gave up (diagnostics) */
+
+    PVToken t;                  /* the current token */
+    PVCtx *fn;
+    PVScope *scope;
+
+    PPFrame *fr;
+    uint32_t frame_count, fr_size;
+    JSAtom *refs;
+    uint32_t ref_count, ref_size;
+    JSAtom *decls;
+    uint32_t decl_count, decl_size;
+    PPHashEntry *hash;
+    uint32_t hash_size, stamp;
+    PVLabel *labels;
+    uint32_t label_count, label_size;
+    PVConf *conf;
+    uint32_t conf_size, conf_count, serial_next;
+    uint32_t seq;               /* counts scope entries */
+
+    /* lower bound of the bytecode the body would have */
+    uint32_t code_bytes;
+    BOOL stmt_start;            /* the token starts an expression statement */
+
+    PPFrame fr_inline[PP_INLINE_FRAMES];
+    JSAtom refs_inline[PP_INLINE_REFS];
+    JSAtom decls_inline[PP_INLINE_DECLS];
+    PPHashEntry hash_inline[PP_INLINE_HASH];
+    PVLabel labels_inline[PV_INLINE_LABELS];
+    PVConf conf_inline[PV_INLINE_CONF];
+} JSPreparse;
+
+#define PV_BAIL(v) do { (v)->bail_line = __LINE__; \
+        if ((v)->status == PP_DONE) (v)->status = PP_BAIL; return -1; } while (0)
+#define PV_TRY(x) do { if ((x) < 0) return -1; } while (0)
+
+static int pv_fail1(JSPreparse *v, int ret, int line)
+{
+    if (v->status == PP_DONE) {
+        v->status = ret;
+        v->bail_line = line;
+    }
+    return -1;
+}
+#define pv_fail(v, ret) pv_fail1(v, ret, __LINE__)
+
+static BOOL pp_is_ident_part(int c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '_' || c == '$';
+}
+
+/* U+2028/U+2029 (E2 80 A8/A9) */
+static inline BOOL pp_is_ls_ps(const uint8_t *p, const uint8_t *end)
+{
+    return end - p >= 3 && p[0] == 0xe2 && p[1] == 0x80 &&
+        (p[2] == 0xa8 || p[2] == 0xa9);
+}
+
+/* ---------------------------------------------------------------- tables */
+
+static int pp_grow(JSPreparse *pp, void **pbuf, uint32_t *psize,
+                   size_t elem_size, void *inline_buf, uint32_t max_count)
+{
+    uint32_t new_size = *psize * 2;
+    void *buf;
+
+    if (*psize >= max_count)
+        return PP_BAIL;
+    if (new_size > max_count)
+        new_size = max_count;
+    if (*pbuf == inline_buf) {
+        buf = js_malloc(pp->ctx, new_size * elem_size);
+        if (buf)
+            memcpy(buf, inline_buf, *psize * elem_size);
+    } else {
+        buf = js_realloc(pp->ctx, *pbuf, new_size * elem_size);
+    }
+    if (!buf)
+        return PP_ERROR;
+    *pbuf = buf;
+    *psize = new_size;
+    return PP_DONE;
+}
+
+/* takes the reference to 'atom' */
+static int pp_add_ref(JSPreparse *pp, JSAtom atom)
+{
+    int ret;
+    if (pp->ref_count >= pp->ref_size) {
+        ret = pp_grow(pp, (void **)&pp->refs, &pp->ref_size, sizeof(JSAtom),
+                      pp->refs_inline, UINT32_MAX / 2 / sizeof(JSAtom));
+        if (ret) {
+            JS_FreeAtom(pp->ctx, atom);
+            return pv_fail(pp, ret);
+        }
+    }
+    pp->refs[pp->ref_count++] = atom;
+    return 0;
+}
+
+static int pp_add_pseudo_ref(JSPreparse *pp, JSAtom atom)
+{
+    return pp_add_ref(pp, JS_DupAtom(pp->ctx, atom));
+}
+
+/* Declare 'atom' in frame 'f' (takes the reference). */
+static int pp_declare_in(JSPreparse *pp, uint32_t f, JSAtom atom)
+{
+    uint32_t pos, i;
+    int ret;
+
+    if (pp->decl_count >= pp->decl_size) {
+        ret = pp_grow(pp, (void **)&pp->decls, &pp->decl_size, sizeof(JSAtom),
+                      pp->decls_inline, UINT32_MAX / 2 / sizeof(JSAtom));
+        if (ret) {
+            JS_FreeAtom(pp->ctx, atom);
+            return pv_fail(pp, ret);
+        }
+    }
+    pos = (f + 1 < pp->frame_count) ? pp->fr[f + 1].decl_start : pp->decl_count;
+    if (pos < pp->decl_count) {
+        memmove(pp->decls + pos + 1, pp->decls + pos,
+                (pp->decl_count - pos) * sizeof(JSAtom));
+        for (i = f + 1; i < pp->frame_count; i++)
+            pp->fr[i].decl_start++;
+    }
+    pp->decls[pos] = atom;
+    pp->decl_count++;
+    return 0;
+}
+
+static int pp_push_frame(JSPreparse *pp, int kind, uint32_t ref_start)
+{
+    PPFrame *f;
+    int ret;
+    if (pp->frame_count >= pp->fr_size) {
+        ret = pp_grow(pp, (void **)&pp->fr, &pp->fr_size, sizeof(PPFrame),
+                      pp->fr_inline, PP_MAX_FRAMES);
+        if (ret)
+            return pv_fail(pp, ret);
+    }
+    f = &pp->fr[pp->frame_count++];
+    f->kind = kind;
+    f->ref_start = ref_start;
+    f->decl_start = pp->decl_count;
+    return pp->frame_count - 1;
+}
+
+static uint32_t pp_hash(JSAtom atom, uint32_t mask)
+{
+    return (atom * 0x9e3779b1u) >> 7 & mask;
+}
+
+static PPHashEntry *pp_hash_find(JSPreparse *pp, JSAtom atom)
+{
+    uint32_t mask = pp->hash_size - 1, h = pp_hash(atom, mask);
+    for (;;) {
+        PPHashEntry *e = &pp->hash[h];
+        if ((e->mark >> 1) != pp->stamp || e->atom == atom)
+            return e;
+        h = (h + 1) & mask;
+    }
+}
+
+/* Close the innermost frame: drop the names it declares (and, for a
+   function, the pseudo variables it binds) and the duplicates from its
+   segment of names, which becomes part of the enclosing frame's. */
+static int pp_close_frame(JSPreparse *pp)
+{
+    PPFrame *f = &pp->fr[pp->frame_count - 1];
+    uint32_t n = pp->ref_count - f->ref_start;
+    uint32_t nd = pp->decl_count - f->decl_start;
+    uint32_t i, out, need;
+    static const JSAtom binds_this[] = {
+        JS_ATOM_this, JS_ATOM_new_target, JS_ATOM_home_object,
+        JS_ATOM_this_active_func, JS_ATOM_arguments,
+    };
+    BOOL binds = (f->kind == PPF_FUNC);
+
+    if (n != 0) {
+        need = (n + nd + (binds ? countof(binds_this) : 0)) * 2;
+        if (need > pp->hash_size) {
+            uint32_t size = pp->hash_size;
+            while (size < need)
+                size *= 2;
+            if (pp->hash != pp->hash_inline)
+                js_free(pp->ctx, pp->hash);
+            pp->hash = js_malloc(pp->ctx, size * sizeof(PPHashEntry));
+            if (!pp->hash) {
+                pp->hash = pp->hash_inline;
+                pp->hash_size = PP_INLINE_HASH;
+                memset(pp->hash, 0, sizeof(pp->hash_inline));
+                pp->stamp = 0;
+                return pv_fail(pp, PP_ERROR);
+            }
+            memset(pp->hash, 0, size * sizeof(PPHashEntry));
+            pp->hash_size = size;
+            pp->stamp = 0;
+        }
+        if (++pp->stamp >= (1u << 31)) {
+            memset(pp->hash, 0, pp->hash_size * sizeof(PPHashEntry));
+            pp->stamp = 1;
+        }
+        for (i = 0; i < nd; i++) {
+            PPHashEntry *e = pp_hash_find(pp, pp->decls[f->decl_start + i]);
+            e->atom = pp->decls[f->decl_start + i];
+            e->mark = pp->stamp << 1;
+        }
+        if (binds) {
+            for (i = 0; i < countof(binds_this); i++) {
+                PPHashEntry *e = pp_hash_find(pp, binds_this[i]);
+                e->atom = binds_this[i];
+                e->mark = pp->stamp << 1;
+            }
+        }
+        out = f->ref_start;
+        for (i = f->ref_start; i < pp->ref_count; i++) {
+            JSAtom atom = pp->refs[i];
+            PPHashEntry *e = pp_hash_find(pp, atom);
+            if ((e->mark >> 1) == pp->stamp) {
+                JS_FreeAtom(pp->ctx, atom);
+                continue;
+            }
+            e->atom = atom;
+            e->mark = (pp->stamp << 1) | 1;
+            pp->refs[out++] = atom;
+        }
+        pp->ref_count = out;
+    }
+    for (i = f->decl_start; i < pp->decl_count; i++)
+        JS_FreeAtom(pp->ctx, pp->decls[i]);
+    pp->decl_count = f->decl_start;
+    pp->frame_count--;
+    return 0;
+}
+
+/* ----------------------------------------------------------------- lexer */
+
+/* Check a UTF-8 sequence as the parser decodes it; returns its end. */
+static const uint8_t *pv_utf8(const uint8_t *p)
+{
+    const uint8_t *p_next;
+    uint32_t c = unicode_from_utf8(p, UTF8_CHAR_LEN_MAX, &p_next);
+    if (c > 0x10FFFF)
+        return NULL;
+    return p_next;
+}
+
+/* The rest of a template after '`' or after the '}' of a substitution. */
+static int pv_lex_template(JSPreparse *v, const uint8_t *p, PVToken *t)
+{
+    const uint8_t *end = v->end;
+    t->tok = TOK_TEMPLATE;
+    t->special = 0;
+    t->atom = JS_ATOM_NULL;
+    for (;;) {
+        if (p >= end)
+            PV_BAIL(v);
+        if (*p == '`') {
+            t->sep = '`';
+            t->end = p + 1;
+            return 0;
+        }
+        if (*p == '$' && p + 1 < end && p[1] == '{') {
+            t->sep = '$';
+            t->end = p + 2;
+            return 0;
+        }
+        if (*p == '\\') {
+            t->special = 1;
+            if (p + 1 >= end)
+                PV_BAIL(v);
+            if (p[1] >= 0x80) {
+                p = pv_utf8(p + 1);
+                if (!p)
+                    PV_BAIL(v);
+            } else {
+                p += 2;
+            }
+        } else if (*p >= 0x80) {
+            t->special = 1;
+            p = pv_utf8(p);
+            if (!p)
+                PV_BAIL(v);
+        } else {
+            p++;
+        }
+    }
+}
+
+/* The words that are keywords at least somewhere (the predefined atoms
+   JS_ATOM_null to JS_ATOM_await, in their order), found without an atom
+   lookup: a collision-free hash of the first two and the last letters. */
+static const char pv_keywords[][11] = {
+    "null", "false", "true", "if", "else", "return", "var", "this", "delete",
+    "void", "typeof", "new", "in", "instanceof", "do", "while", "for",
+    "break", "continue", "switch", "case", "default", "throw", "try",
+    "catch", "finally", "function", "debugger", "with", "class", "const",
+    "enum", "export", "extends", "import", "super", "implements",
+    "interface", "let", "package", "private", "protected", "public",
+    "static", "yield", "await",
+};
+static const uint8_t pv_keyword_hash[128] = {
+    1,45,0,0,0,0,0,0,0,0,0,0,19,0,0,0,0,0,34,33,11,36,0,0,0,15,16,31,0,0,0,8,0,0,17,23,44,46,0,0,0,0,0,0,0,4,0,0,21,0,0,25,0,18,0,0,32,2,0,9,38,14,0,0,0,0,0,0,10,13,0,0,28,0,22,0,0,0,0,20,0,0,0,0,0,0,0,40,42,41,0,0,0,26,0,0,0,0,39,0,0,3,0,0,37,35,27,12,5,0,6,0,0,0,0,0,30,0,7,0,0,24,0,0,0,43,0,29,
+};
+
+/* (the table follows quickjs-atom.h) */
+typedef char pv_keywords_check[(JS_ATOM_await - JS_ATOM_null + 1 ==
+                                countof(pv_keywords)) ? 1 : -1];
+
+static JSAtom pv_keyword(const uint8_t *p, size_t len)
+{
+    int k;
+    if (len < 2 || len > 10)
+        return JS_ATOM_NULL;
+    k = pv_keyword_hash[(p[0] * 3 + p[1] * 98 + p[len - 1]) & 127];
+    if (k != 0 && pv_keywords[k - 1][len] == '\0' &&
+        memcmp(pv_keywords[k - 1], p, len) == 0)
+        return JS_ATOM_null + k - 1;
+    return JS_ATOM_NULL;
+}
+
+enum {
+    PVL_CLASSIFY,   /* identifiers: classified, with their atom */
+    PVL_NAME,       /* a property name: not classified, no atom */
+    PVL_LOOK,       /* classified, an atom only for keywords (look-ahead) */
+};
+
+static int pv_classify(JSPreparse *v, PVToken *t, int mode);
+
+/* Next token from 'p' (a '/' is a division). Identifiers are classified
+   unless 'name' (a property name after '.'). */
+static int pv_lex(JSPreparse *v, const uint8_t *p, PVToken *t, int mode)
+{
+    const uint8_t *end = v->end;
+    int c;
+
+    t->nl = FALSE;
+    t->atom = JS_ATOM_NULL;
+    t->special = 0;
+ redo:
+    if (p >= end) {
+        t->tok = TOK_EOF;
+        t->ptr = t->end = p;
+        return 0;
+    }
+    c = *p;
+    t->ptr = p;
+    switch (c) {
+    case ' ': case '\t': case '\v': case '\f':
+        p++;
+        goto redo;
+    case '\n': case '\r':
+        t->nl = TRUE;
+        p++;
+        goto redo;
+    case '/':
+        if (p + 1 < end && p[1] == '/') {
+            p += 2;
+        line_comment:
+            while (p < end && *p != '\n' && *p != '\r') {
+                if (*p >= 0x80) {
+                    if (pp_is_ls_ps(p, end))
+                        PV_BAIL(v);
+                    p = pv_utf8(p);
+                    if (!p)
+                        PV_BAIL(v);
+                } else {
+                    p++;
+                }
+            }
+            goto redo;
+        }
+        if (p + 1 < end && p[1] == '*') {
+            p += 2;
+            for (;;) {
+                if (p + 1 >= end)
+                    PV_BAIL(v);
+                if (p[0] == '*' && p[1] == '/') {
+                    p += 2;
+                    break;
+                }
+                if (*p == '\n' || *p == '\r') {
+                    t->nl = TRUE;
+                } else if (*p >= 0x80) {
+                    /* a sequence at a time, as the parser reads it */
+                    if (pp_is_ls_ps(p, end))
+                        t->nl = TRUE;
+                    p = pv_utf8(p);
+                    if (!p)
+                        PV_BAIL(v);
+                    continue;
+                }
+                p++;
+            }
+            goto redo;
+        }
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_DIV_ASSIGN;
+            p += 2;
+        } else {
+            t->tok = '/';
+            p++;
+        }
+        break;
+    case '\'': case '"':
+        p++;
+        for (;;) {
+            if (p >= end)
+                PV_BAIL(v);
+            c = *p;
+            if (c == t->ptr[0]) {
+                p++;
+                break;
+            }
+            if (c == '\\') {
+                t->special = 1;
+                if (p + 1 >= end)
+                    PV_BAIL(v);
+                c = p[1];
+                /* octal-like escapes: the parser decides by mode */
+                if (c >= '1' && c <= '9')
+                    PV_BAIL(v);
+                if (c == '0' && p + 2 < end && p[2] >= '0' && p[2] <= '9')
+                    PV_BAIL(v);
+                if (c == '\r' && p + 2 < end && p[2] == '\n')
+                    p++;
+                if (c >= 0x80) {
+                    p = pv_utf8(p + 1);
+                    if (!p)
+                        PV_BAIL(v);
+                } else {
+                    p += 2;
+                }
+            } else if (c == '\n' || c == '\r') {
+                PV_BAIL(v);
+            } else if (c >= 0x80) {
+                t->special = 1;
+                p = pv_utf8(p);
+                if (!p)
+                    PV_BAIL(v);
+            } else {
+                p++;
+            }
+        }
+        t->tok = TOK_STRING;
+        break;
+    case '`':
+        PV_TRY(pv_lex_template(v, p + 1, t));
+        t->ptr = p;
+        return 0;
+    case '.':
+        if (p + 1 < end && p[1] >= '0' && p[1] <= '9')
+            goto number;
+        if (p + 2 < end && p[1] == '.' && p[2] == '.') {
+            t->tok = TOK_ELLIPSIS;
+            p += 3;
+        } else {
+            t->tok = '.';
+            p++;
+        }
+        break;
+    case '0': case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8': case '9':
+    number:
+        if (c == '0' && p + 1 < end &&
+            (p[1] == 'x' || p[1] == 'X' || p[1] == 'o' || p[1] == 'O' ||
+             p[1] == 'b' || p[1] == 'B')) {
+            p += 2;
+            while (p < end && pp_is_ident_part(*p))
+                p++;
+        } else {
+            /* legacy octal and leading-zero decimals are errors in strict
+               code */
+            if (c == '0' && v->fn->strict && p + 1 < end &&
+                p[1] >= '0' && p[1] <= '9')
+                PV_BAIL(v);
+            while (p < end && ((*p >= '0' && *p <= '9') || *p == '_'))
+                p++;
+            if (p < end && *p == '.') {
+                p++;
+                while (p < end && ((*p >= '0' && *p <= '9') || *p == '_'))
+                    p++;
+            }
+            if (p < end && (*p == 'e' || *p == 'E')) {
+                p++;
+                if (p < end && (*p == '+' || *p == '-'))
+                    p++;
+                while (p < end && ((*p >= '0' && *p <= '9') || *p == '_'))
+                    p++;
+            }
+            if (p < end && *p == 'n')
+                p++;
+        }
+        if (p < end && (pp_is_ident_part(*p) || *p == '\\' || *p >= 0x80))
+            PV_BAIL(v);
+        t->tok = TOK_NUMBER;
+        t->end = p;
+        /* anything but a plain decimal integer is converted as the parser
+           does, and must end where the scan ended */
+        {
+            const uint8_t *q = t->ptr;
+            BOOL plain = (q[0] != '0' || q + 1 == p);
+            for (; plain && q < p; q++) {
+                if (*q < '0' || *q > '9')
+                    plain = FALSE;
+            }
+            if (!plain) {
+                const char *num_end;
+                JSValue val = js_atof(v->ctx, (const char *)t->ptr, &num_end, 0,
+                                      ATOD_ACCEPT_BIN_OCT |
+                                      ATOD_ACCEPT_LEGACY_OCTAL |
+                                      ATOD_ACCEPT_UNDERSCORES |
+                                      ATOD_ACCEPT_SUFFIX);
+                if (JS_IsException(val))
+                    return pv_fail(v, PP_ERROR); /* out of memory */
+                if (JS_VALUE_IS_NAN(val) ||
+                    (const uint8_t *)num_end != p) {
+                    JS_FreeValue(v->ctx, val);
+                    PV_BAIL(v);
+                }
+                JS_FreeValue(v->ctx, val);
+            }
+        }
+        return 0;
+    case '#':
+        t->tok = TOK_PRIVATE_NAME;
+        p++;
+        break;
+    case '*':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_MUL_ASSIGN;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '*') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_POW_ASSIGN;
+                p += 3;
+            } else {
+                t->tok = TOK_POW;
+                p += 2;
+            }
+        } else {
+            t->tok = '*';
+            p++;
+        }
+        break;
+    case '%':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_MOD_ASSIGN;
+            p += 2;
+        } else {
+            t->tok = '%';
+            p++;
+        }
+        break;
+    case '+':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_PLUS_ASSIGN;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '+') {
+            t->tok = TOK_INC;
+            p += 2;
+        } else {
+            t->tok = '+';
+            p++;
+        }
+        break;
+    case '-':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_MINUS_ASSIGN;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '-') {
+            if (v->html_comments && p + 2 < end && p[2] == '>' &&
+                (t->nl || p == v->s->buf_start)) {
+                /* Annex B: '-->' at the start of a line */
+                p += 3;
+                goto line_comment;
+            }
+            t->tok = TOK_DEC;
+            p += 2;
+        } else {
+            t->tok = '-';
+            p++;
+        }
+        break;
+    case '<':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_LTE;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '<') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_SHL_ASSIGN;
+                p += 3;
+            } else {
+                t->tok = TOK_SHL;
+                p += 2;
+            }
+        } else if (v->html_comments && end - p >= 4 && p[1] == '!' &&
+                   p[2] == '-' && p[3] == '-') {
+            /* Annex B: '<!--' */
+            p += 4;
+            goto line_comment;
+        } else {
+            t->tok = '<';
+            p++;
+        }
+        break;
+    case '>':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_GTE;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '>') {
+            if (p + 2 < end && p[2] == '>') {
+                if (p + 3 < end && p[3] == '=') {
+                    t->tok = TOK_SHR_ASSIGN;
+                    p += 4;
+                } else {
+                    t->tok = TOK_SHR;
+                    p += 3;
+                }
+            } else if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_SAR_ASSIGN;
+                p += 3;
+            } else {
+                t->tok = TOK_SAR;
+                p += 2;
+            }
+        } else {
+            t->tok = '>';
+            p++;
+        }
+        break;
+    case '=':
+        if (p + 1 < end && p[1] == '=') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_STRICT_EQ;
+                p += 3;
+            } else {
+                t->tok = TOK_EQ;
+                p += 2;
+            }
+        } else if (p + 1 < end && p[1] == '>') {
+            t->tok = TOK_ARROW;
+            p += 2;
+        } else {
+            t->tok = '=';
+            p++;
+        }
+        break;
+    case '!':
+        if (p + 1 < end && p[1] == '=') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_STRICT_NEQ;
+                p += 3;
+            } else {
+                t->tok = TOK_NEQ;
+                p += 2;
+            }
+        } else {
+            t->tok = '!';
+            p++;
+        }
+        break;
+    case '&':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_AND_ASSIGN;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '&') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_LAND_ASSIGN;
+                p += 3;
+            } else {
+                t->tok = TOK_LAND;
+                p += 2;
+            }
+        } else {
+            t->tok = '&';
+            p++;
+        }
+        break;
+    case '^':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_XOR_ASSIGN;
+            p += 2;
+        } else {
+            t->tok = '^';
+            p++;
+        }
+        break;
+    case '|':
+        if (p + 1 < end && p[1] == '=') {
+            t->tok = TOK_OR_ASSIGN;
+            p += 2;
+        } else if (p + 1 < end && p[1] == '|') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_LOR_ASSIGN;
+                p += 3;
+            } else {
+                t->tok = TOK_LOR;
+                p += 2;
+            }
+        } else {
+            t->tok = '|';
+            p++;
+        }
+        break;
+    case '?':
+        if (p + 1 < end && p[1] == '?') {
+            if (p + 2 < end && p[2] == '=') {
+                t->tok = TOK_DOUBLE_QUESTION_MARK_ASSIGN;
+                p += 3;
+            } else {
+                t->tok = TOK_DOUBLE_QUESTION_MARK;
+                p += 2;
+            }
+        } else if (p + 1 < end && p[1] == '.' &&
+                   !(p + 2 < end && p[2] >= '0' && p[2] <= '9')) {
+            t->tok = TOK_QUESTION_MARK_DOT;
+            p += 2;
+        } else {
+            t->tok = '?';
+            p++;
+        }
+        break;
+    case '(': case ')': case '[': case ']': case '{': case '}':
+    case ';': case ',': case ':': case '~': case '@':
+        t->tok = c;
+        p++;
+        break;
+    default:
+        if (c < 0x80 && pp_is_ident_part(c)) {
+            p++;
+            while (p < end && pp_is_ident_part(*p))
+                p++;
+            if (p < end && (*p == '\\' || *p >= 0x80))
+                PV_BAIL(v);
+            t->tok = TOK_IDENT;
+            t->end = p;
+            if (mode != PVL_NAME)
+                return pv_classify(v, t, mode);
+            return 0;
+        }
+        /* escapes, non-ASCII identifiers or white space */
+        PV_BAIL(v);
+    }
+    t->end = p;
+    return 0;
+}
+
+/* The atom of an identifier token and the parser's token value for it in
+   the current function (update_token_ident()). */
+static int pv_classify(JSPreparse *v, PVToken *t, int mode)
+{
+    PVCtx *fn = v->fn;
+    size_t len = t->end - t->ptr;
+    JSAtom atom = t->atom;
+
+    if (atom == JS_ATOM_NULL) {
+        atom = pv_keyword(t->ptr, len);
+        if (atom == JS_ATOM_NULL) {
+            t->tok = TOK_IDENT;
+            if (mode == PVL_LOOK)
+                return 0;
+            atom = __JS_FindAtom(v->ctx->rt, (const char *)t->ptr, len,
+                                 JS_ATOM_TYPE_STRING);
+            if (atom == JS_ATOM_NULL) {
+                atom = JS_NewAtomLen(v->ctx, (const char *)t->ptr, len);
+                if (atom == JS_ATOM_NULL)
+                    return pv_fail(v, PP_ERROR);
+            }
+            t->atom = atom;
+            return 0;
+        }
+        t->atom = atom; /* predefined: not counted */
+    }
+    t->tok = TOK_IDENT;
+    if (atom <= JS_ATOM_LAST_KEYWORD ||
+        (atom <= JS_ATOM_LAST_STRICT_KEYWORD && fn->strict) ||
+        (atom == JS_ATOM_yield &&
+         (fn->is_gen ||
+          (fn->is_arrow && !fn->in_body && fn->parent && fn->parent->is_gen))) ||
+        (atom == JS_ATOM_await &&
+         (v->is_module || fn->is_async || fn->is_static_init ||
+          (fn->is_arrow && !fn->in_body && fn->parent &&
+           (fn->parent->is_async || fn->parent->is_static_init)))))
+        t->tok = atom - 1 + TOK_FIRST_KEYWORD;
+    return 0;
+}
+
+/* reparse_ident_token(): the current token read in another function */
+static int pv_reclassify(JSPreparse *v)
+{
+    if (v->t.tok == TOK_IDENT ||
+        (v->t.tok >= TOK_FIRST_KEYWORD && v->t.tok <= TOK_LAST_KEYWORD))
+        return pv_classify(v, &v->t, PVL_CLASSIFY);
+    return 0;
+}
+
+static int pv_poll(JSPreparse *v)
+{
+    JSParseState *s = v->s;
+    JSRuntime *rt = v->ctx->rt;
+    if (unlikely(--s->interrupt_countdown <= 0)) {
+        s->interrupt_countdown = JS_PARSE_INTERRUPT_INTERVAL;
+        if (rt->interrupt_handler &&
+            rt->interrupt_handler(rt, rt->interrupt_opaque)) {
+            js_parse_error(s, "compilation interrupted");
+            return pv_fail(v, PP_ERROR);
+        }
+    }
+    return 0;
+}
+
+static int pv_next(JSPreparse *v)
+{
+    PV_TRY(pv_poll(v));
+    JS_FreeAtom(v->ctx, v->t.atom);
+    v->t.atom = JS_ATOM_NULL;
+    v->stmt_start = FALSE;
+    return pv_lex(v, v->t.end, &v->t, PVL_CLASSIFY);
+}
+
+/* the next token is a property name: not classified */
+static int pv_next_name(JSPreparse *v)
+{
+    PV_TRY(pv_poll(v));
+    JS_FreeAtom(v->ctx, v->t.atom);
+    v->t.atom = JS_ATOM_NULL;
+    v->stmt_start = FALSE;
+    return pv_lex(v, v->t.end, &v->t, PVL_NAME);
+}
+
+/* js_parse_seek_token(): read the token at 'ptr' again */
+static int pv_seek(JSPreparse *v, const uint8_t *ptr, BOOL nl)
+{
+    JS_FreeAtom(v->ctx, v->t.atom);
+    v->t.atom = JS_ATOM_NULL;
+    PV_TRY(pv_lex(v, ptr, &v->t, PVL_CLASSIFY));
+    v->t.nl = nl;
+    return 0;
+}
+
+static int pv_expect(JSPreparse *v, int tok)
+{
+    if (v->t.tok != tok)
+        PV_BAIL(v);
+    return pv_next(v);
+}
+
+/* js_parse_expect_semi() */
+static int pv_semi(JSPreparse *v)
+{
+    if (v->t.tok == ';')
+        return pv_next(v);
+    if (v->t.tok == TOK_EOF || v->t.tok == '}' || v->t.nl)
+        return 0;
+    PV_BAIL(v);
+}
+
+static int pv_peek(JSPreparse *v, BOOL no_line_terminator)
+{
+    const uint8_t *p = v->t.end;
+    return simple_next_token(&p, no_line_terminator);
+}
+
+/* token_is_pseudo_keyword() */
+static BOOL pv_is(JSPreparse *v, JSAtom atom)
+{
+    return v->t.tok == TOK_IDENT && v->t.atom == atom;
+}
+
+/* A regexp literal at the current '/' or '/=': scanned as
+   js_parse_regexp() does and compiled as the parser does. */
+static int pv_regexp_scan(JSPreparse *v, const uint8_t *p, const uint8_t **pbody_end,
+                          const uint8_t **pend)
+{
+    const uint8_t *end = v->end;
+    BOOL in_class = FALSE;
+    int c;
+
+    p++;
+    for (;;) {
+        if (p >= end)
+            PV_BAIL(v);
+        c = *p++;
+        if (c == '\\') {
+            if (p >= end)
+                PV_BAIL(v);
+            c = *p++;
+        } else if (c == '/') {
+            if (!in_class)
+                break;
+        } else if (c == '[') {
+            in_class = TRUE;
+        } else if (c == ']') {
+            in_class = FALSE;
+        }
+        if (c == '\n' || c == '\r')
+            PV_BAIL(v);
+        if (c >= 0x80) {
+            /* decoded as the parser does: no line separators, and no
+               surrogates, which the string conversion would treat
+               differently */
+            const uint8_t *p_next;
+            uint32_t cp = unicode_from_utf8(p - 1, UTF8_CHAR_LEN_MAX, &p_next);
+            if (cp > 0x10FFFF || cp == 0x2028 || cp == 0x2029 ||
+                (cp >= 0xD800 && cp <= 0xDFFF))
+                PV_BAIL(v);
+            p = p_next;
+        }
+    }
+    *pbody_end = p - 1;
+    while (p < end && pp_is_ident_part(*p))
+        p++;
+    if (p < end && (*p >= 0x80 || *p == '\\'))
+        PV_BAIL(v);
+    *pend = p;
+    return 0;
+}
+
+static int pv_regexp(JSPreparse *v)
+{
+    JSContext *ctx = v->ctx;
+    const uint8_t *start = v->t.ptr, *body_end, *end;
+    JSValue body, flags, re;
+
+    if (!ctx->compile_regexp)
+        PV_BAIL(v);
+    PV_TRY(pv_regexp_scan(v, start, &body_end, &end));
+    body = JS_NewStringLen(ctx, (const char *)start + 1, body_end - start - 1);
+    flags = JS_NewStringLen(ctx, (const char *)body_end + 1, end - body_end - 1);
+    if (JS_IsException(body) || JS_IsException(flags)) {
+        JS_FreeValue(ctx, body);
+        JS_FreeValue(ctx, flags);
+        return pv_fail(v, PP_ERROR);
+    }
+    re = ctx->compile_regexp(ctx, body, flags);
+    JS_FreeValue(ctx, body);
+    JS_FreeValue(ctx, flags);
+    if (JS_IsException(re)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        PV_BAIL(v);
+    }
+    JS_FreeValue(ctx, re);
+    v->t.tok = TOK_REGEXP;
+    v->t.end = end;
+    return 0;
+}
+
+/* Escapes and non-ASCII text of a string literal or an untagged template
+   part, decoded as the parser does. 'p' is after the opening delimiter. */
+static int pv_check_text(JSPreparse *v, int sep, const uint8_t *p)
+{
+    JSToken token;
+    const uint8_t *p_end;
+
+    /* (the parser can leave an exception pending from its look-ahead:
+       only a new one is an error of this call, out of memory) */
+    JSValue pending = v->ctx->rt->current_exception;
+
+    token.val = ' ';
+    if (js_parse_string(v->s, sep, FALSE, p, &token, &p_end)) {
+        JSValue now = v->ctx->rt->current_exception;
+        if (JS_VALUE_GET_TAG(now) != JS_VALUE_GET_TAG(pending) ||
+            JS_VALUE_GET_PTR(now) != JS_VALUE_GET_PTR(pending))
+            return pv_fail(v, PP_ERROR);
+        PV_BAIL(v);
+    }
+    JS_FreeValue(v->ctx, token.u.str.str);
+    return 0;
+}
+
+/* --------------------------------------------------- the parser's look-ahead */
+
+/* is_regexp_allowed() */
+static BOOL pv_regexp_allowed(int tok)
+{
+    switch (tok) {
+    case TOK_NUMBER:
+    case TOK_STRING:
+    case TOK_REGEXP:
+    case TOK_DEC:
+    case TOK_INC:
+    case TOK_NULL:
+    case TOK_FALSE:
+    case TOK_TRUE:
+    case TOK_THIS:
+    case ')':
+    case ']':
+    case '}':
+    case TOK_IDENT:
+        return FALSE;
+    default:
+        return TRUE;
+    }
+}
+
+#define PV_SKIP_SEMI       (1 << 0)
+#define PV_SKIP_ELLIPSIS   (1 << 1)
+#define PV_SKIP_FAILED     (-1000)
+
+/* js_parse_skip_parens_token() from the current '(', '[' or '{': the token
+   after its closing bracket, with the same regexp heuristic and the same
+   template handling. PV_SKIP_FAILED where the parser's tokenizer would
+   have stopped on an error (the preparser gives up). */
+static int pv_skip_parens(JSPreparse *v, int *pbits, BOOL no_line_terminator)
+{
+    char state[256];
+    size_t level = 0;
+    int last_tok = 0, tok = TOK_EOF, bits = 0, c, ret = 0;
+    const uint8_t *last_token_ptr;
+    PVToken t = v->t;
+
+    t.atom = JS_ATOM_NULL; /* not owned */
+    state[level++] = 0;
+    for (;;) {
+        switch (t.tok) {
+        case '(':
+        case '[':
+        case '{':
+            if (level >= sizeof(state))
+                goto done;
+            state[level++] = t.tok;
+            break;
+        case ')':
+            if (state[--level] != '(')
+                goto done;
+            break;
+        case ']':
+            if (state[--level] != '[')
+                goto done;
+            break;
+        case '}':
+            c = state[--level];
+            if (c == '`') {
+                if (pv_lex_template(v, t.end, &t) < 0) {
+                    ret = -1;
+                    goto done;
+                }
+                goto handle_template;
+            } else if (c != '{') {
+                goto done;
+            }
+            break;
+        case TOK_TEMPLATE:
+        handle_template:
+            if (t.sep != '`') {
+                if (level >= sizeof(state))
+                    goto done;
+                state[level++] = '`';
+            }
+            break;
+        case TOK_EOF:
+            goto done;
+        case ';':
+            if (level == 2)
+                bits |= PV_SKIP_SEMI;
+            break;
+        case TOK_ELLIPSIS:
+            if (level == 2)
+                bits |= PV_SKIP_ELLIPSIS;
+            break;
+        case TOK_DIV_ASSIGN:
+        case '/':
+            if (pv_regexp_allowed(last_tok)) {
+                const uint8_t *body_end, *end;
+                if (pv_regexp_scan(v, t.ptr, &body_end, &end) < 0) {
+                    ret = -1;
+                    goto done;
+                }
+                t.tok = TOK_REGEXP;
+                t.end = end;
+            }
+            break;
+        }
+        if (t.tok == TOK_IDENT &&
+            (t.atom == JS_ATOM_yield ||
+             (t.end - t.ptr == 2 && t.ptr[0] == 'o' && t.ptr[1] == 'f')))
+            last_tok = TOK_OF;
+        else
+            last_tok = t.tok;
+        last_token_ptr = t.ptr;
+        JS_FreeAtom(v->ctx, t.atom);
+        t.atom = JS_ATOM_NULL;
+        if (pv_poll(v) < 0 || pv_lex(v, t.end, &t, PVL_LOOK) < 0) {
+            ret = -1;
+            goto done;
+        }
+        if (level <= 1) {
+            tok = t.tok;
+            if (t.tok == TOK_IDENT && t.end - t.ptr == 2 && t.ptr[0] == 'o' &&
+                t.ptr[1] == 'f')
+                tok = TOK_OF;
+            if (no_line_terminator &&
+                memchr(last_token_ptr, '\n', t.ptr - last_token_ptr))
+                tok = '\n';
+            break;
+        }
+    }
+ done:
+    JS_FreeAtom(v->ctx, t.atom);
+    if (ret < 0)
+        return PV_SKIP_FAILED;
+    if (pbits)
+        *pbits = bits;
+    return tok;
+}
+
+/* ------------------------------------------------ declarations and labels */
+
+static PVConf *pv_conf_find(JSPreparse *v, JSAtom atom, uint32_t serial)
+{
+    uint32_t mask = v->conf_size - 1;
+    uint32_t h = pp_hash(atom ^ (serial * 0x85ebca6bu), mask);
+    for (;;) {
+        PVConf *e = &v->conf[h];
+        if (e->atom == JS_ATOM_NULL ||
+            (e->atom == atom && e->serial == serial))
+            return e;
+        h = (h + 1) & mask;
+    }
+}
+
+static PVConf *pv_conf_add(JSPreparse *v, JSAtom atom, uint32_t serial)
+{
+    PVConf *e;
+    if ((v->conf_count + 1) * 2 > v->conf_size) {
+        uint32_t i, old_size = v->conf_size, size = old_size * 2;
+        PVConf *old = v->conf, *nconf;
+        nconf = js_mallocz(v->ctx, size * sizeof(PVConf));
+        if (!nconf) {
+            pv_fail(v, PP_ERROR);
+            return NULL;
+        }
+        v->conf = nconf;
+        v->conf_size = size;
+        for (i = 0; i < old_size; i++) {
+            if (old[i].atom != JS_ATOM_NULL)
+                *pv_conf_find(v, old[i].atom, old[i].serial) = old[i];
+        }
+        if (old != v->conf_inline)
+            js_free(v->ctx, old);
+    }
+    e = pv_conf_find(v, atom, serial);
+    if (e->atom == JS_ATOM_NULL) {
+        e->atom = atom;
+        e->serial = serial;
+        e->flags = 0;
+        e->var_seq = 0;
+        e->lex_open = 0;
+        v->conf_count++;
+    }
+    return e;
+}
+
+/* A name that a declaration may not bind here, or that the preparser does
+   not follow as a binding: reserved words, eval, arguments, and the words
+   reserved only in some contexts. */
+static BOOL pv_special_name(JSAtom atom)
+{
+    return atom <= JS_ATOM_LAST_KEYWORD ||
+        atom <= JS_ATOM_await ||
+        atom == JS_ATOM_eval || atom == JS_ATOM_arguments;
+}
+
+/* the frame of the current scope, created on its first declaration */
+static int pv_scope_frame(JSPreparse *v)
+{
+    PVScope *sc = v->scope;
+    int f;
+    if (sc->frame >= 0)
+        return sc->frame;
+    f = pp_push_frame(v, PPF_BLOCK, sc->ref_pos);
+    if (f < 0)
+        return -1;
+    sc->frame = f;
+    return f;
+}
+
+/* Declare 'atom' (not owned), with the redeclaration rules of the
+   parser (js_define_var()): a lexical declaration may not repeat a name
+   declared lexically in its scope, a var declaration hoisted through its
+   scope, or, in a function body, a parameter; a var declaration may not
+   pass a lexical declaration of its name. The preparser gives up on
+   anything else that it does not follow: repeated parameters, a function
+   declaration named like a parameter, a var declaration named like a
+   catch parameter (Annex B). */
+static int pv_declare(JSPreparse *v, JSAtom atom, int kind)
+{
+    PVCtx *fn = v->fn;
+    PVScope *sc = v->scope;
+    PVConf *e;
+    int f;
+    uint32_t i, end;
+
+    if (pv_special_name(atom))
+        PV_BAIL(v);
+    e = pv_conf_add(v, atom, fn->serial);
+    if (!e)
+        return -1;
+    switch (kind) {
+    case PVD_PARAM:
+        if (e->flags)
+            PV_BAIL(v);
+        e->flags = PVC_PARAM;
+        f = fn->param_frame;
+        break;
+    case PVD_VAR:
+    case PVD_FUNC:
+        if (e->lex_open || (kind == PVD_FUNC && (e->flags & PVC_PARAM)))
+            PV_BAIL(v);
+        e->flags |= PVC_VAR;
+        e->var_seq = v->seq;
+        f = fn->var_frame;
+        break;
+    default:
+        if ((e->flags & PVC_VAR) && e->var_seq >= sc->enter_seq)
+            PV_BAIL(v);
+        if (!sc->parent && (e->flags & PVC_PARAM))
+            PV_BAIL(v);
+        f = pv_scope_frame(v);
+        if (f < 0)
+            return -1;
+        /* same scope: a repeated lexical declaration */
+        end = (f + 1 < (int)v->frame_count) ? v->fr[f + 1].decl_start :
+            v->decl_count;
+        for (i = v->fr[f].decl_start; i < end; i++) {
+            if (v->decls[i] == atom)
+                PV_BAIL(v);
+        }
+        e->lex_open++;
+        break;
+    }
+    return pp_declare_in(v, f, JS_DupAtom(v->ctx, atom));
+}
+
+static int pv_push_label(JSPreparse *v, JSAtom name, int brk, int cont,
+                         int regular)
+{
+    PVLabel *l;
+    int ret;
+    if (v->label_count >= v->label_size) {
+        ret = pp_grow(v, (void **)&v->labels, &v->label_size, sizeof(PVLabel),
+                      v->labels_inline, 1u << 20);
+        if (ret)
+            return pv_fail(v, ret);
+    }
+    l = &v->labels[v->label_count++];
+    l->name = name;
+    l->brk = brk;
+    l->cont = cont;
+    l->regular = regular;
+    return 0;
+}
+
+/* emit_break(): the target of break/continue [label] exists */
+static int pv_break_target(JSPreparse *v, JSAtom name, BOOL is_cont)
+{
+    uint32_t i = v->label_count;
+    while (i-- > v->fn->label_base) {
+        PVLabel *l = &v->labels[i];
+        if (is_cont && l->cont &&
+            (name == JS_ATOM_NULL || l->name == name))
+            return 0;
+        if (!is_cont && l->brk &&
+            ((name == JS_ATOM_NULL && !l->regular) || l->name == name))
+            return 0;
+    }
+    PV_BAIL(v);
+}
+
+/* ----------------------------------------------------------- expressions */
+
+static int pv_assign(JSPreparse *v, int flags, int *pinfo);
+static int pv_expr(JSPreparse *v, int flags, int *pinfo);
+static int pv_postfix(JSPreparse *v, int flags, int *pinfo);
+static int pv_unary(JSPreparse *v, int flags, int *pinfo);
+static int pv_statement(JSPreparse *v, int decl_mask);
+static int pv_block(JSPreparse *v);
+static int pv_pattern(JSPreparse *v, int kind, BOOL is_arg, BOOL hasval,
+                      int has_ellipsis, BOOL allow_initializer);
+static int pv_class(JSPreparse *v, BOOL is_expr);
+
+enum {
+    PVF_STATEMENT,  /* function f() {} in a block (strict) */
+    PVF_VAR,        /* function f() {} at the top of a body */
+    PVF_EXPR,
+    PVF_ARROW,
+    PVF_GETTER,
+    PVF_SETTER,
+    PVF_METHOD,
+    PVF_CTOR,
+    PVF_DERIVED_CTOR,
+};
+
+static int pv_function(JSPreparse *v, int func_type, int func_kind,
+                       BOOL is_decl);
+
+static int pv_lvalue(JSPreparse *v, int info)
+{
+    if (info == PVX_FIELD)
+        return 0;
+    if (info == PVX_VAR)
+        return 0; /* not eval, not 'arguments' in strict code */
+    PV_BAIL(v);
+}
+
+static int pv_paren(JSPreparse *v, int *pinfo)
+{
+    PV_TRY(pv_expect(v, '('));
+    PV_TRY(pv_expr(v, PV_IN, pinfo));
+    return pv_expect(v, ')');
+}
+
+/* js_parse_template(): the current token is its first part */
+static int pv_template(JSPreparse *v, BOOL tagged)
+{
+    for (;;) {
+        if (!tagged && v->t.special)
+            PV_TRY(pv_check_text(v, '`', v->t.ptr + 1));
+        PP_CODE(v, PP_ATOM_BYTES);
+        if (v->t.sep == '`')
+            return pv_next(v);
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_expr(v, PV_IN, NULL));
+        if (v->t.tok != '}')
+            PV_BAIL(v);
+        {
+            const uint8_t *start = v->t.ptr;
+            JS_FreeAtom(v->ctx, v->t.atom);
+            v->t.atom = JS_ATOM_NULL;
+            PV_TRY(pv_lex_template(v, v->t.end, &v->t));
+            v->t.nl = FALSE;
+            v->t.ptr = start; /* the part's text starts after the '}' */
+        }
+    }
+}
+
+/* property name kinds (js_parse_property_name()) */
+enum {
+    PVP_IDENT, PVP_VAR, PVP_GET, PVP_SET, PVP_STAR, PVP_ASYNC, PVP_ASYNC_STAR,
+};
+/* what a property name spells, where it matters */
+enum {
+    PVN_OTHER, PVN_COMPUTED, PVN_UNKNOWN, PVN_PROTO, PVN_CONSTRUCTOR,
+    PVN_PROTOTYPE, PVN_STATIC,
+};
+
+static int pv_name_of(const PVToken *t)
+{
+    const uint8_t *p = t->ptr, *e = t->end;
+    if (t->tok == TOK_STRING) {
+        if (t->special)
+            return PVN_UNKNOWN;
+        p++;
+        e--;
+    }
+#define PV_NAME_IS(str) ((size_t)(e - p) == sizeof(str) - 1 && \
+                         !memcmp(p, str, sizeof(str) - 1))
+    if (PV_NAME_IS("__proto__"))
+        return PVN_PROTO;
+    if (PV_NAME_IS("constructor"))
+        return PVN_CONSTRUCTOR;
+    if (PV_NAME_IS("prototype"))
+        return PVN_PROTOTYPE;
+#undef PV_NAME_IS
+    return PVN_OTHER;
+}
+
+static BOOL pv_token_is_ident(int tok)
+{
+    return tok == TOK_IDENT ||
+        (tok >= TOK_FIRST_KEYWORD && tok <= TOK_LAST_KEYWORD);
+}
+
+/* js_parse_property_name(); *pname is what the name spells, *patom the
+   identifier of a shorthand property (owned) */
+static int pv_property_name(JSPreparse *v, BOOL allow_method, BOOL allow_var,
+                            BOOL in_class, int *pname, JSAtom *patom)
+{
+    int prop_type = PVP_IDENT, name = PVN_OTHER;
+    BOOL non_reserved = FALSE;
+    int t;
+
+    *patom = JS_ATOM_NULL;
+    if (allow_method) {
+        if ((pv_is(v, JS_ATOM_get) || pv_is(v, JS_ATOM_set)) &&
+            (!in_class || pv_peek(v, TRUE) != '\n')) {
+            BOOL is_set = pv_is(v, JS_ATOM_set);
+            JSAtom atom = JS_DupAtom(v->ctx, v->t.atom);
+            if (pv_next(v) < 0) {
+                JS_FreeAtom(v->ctx, atom);
+                return -1;
+            }
+            t = v->t.tok;
+            if (t == ':' || t == ',' || t == '}' || t == '(' || t == '=' ||
+                (t == ';' && in_class)) {
+                non_reserved = TRUE;
+                *patom = atom;
+                goto ident_found;
+            }
+            JS_FreeAtom(v->ctx, atom);
+            prop_type = is_set ? PVP_SET : PVP_GET;
+        } else if (v->t.tok == '*') {
+            PV_TRY(pv_next(v));
+            prop_type = PVP_STAR;
+        } else if (pv_is(v, JS_ATOM_async) && pv_peek(v, TRUE) != '\n') {
+            JSAtom atom = JS_DupAtom(v->ctx, v->t.atom);
+            if (pv_next(v) < 0) {
+                JS_FreeAtom(v->ctx, atom);
+                return -1;
+            }
+            t = v->t.tok;
+            if (t == ':' || t == ',' || t == '}' || t == '(' || t == '=') {
+                non_reserved = TRUE;
+                *patom = atom;
+                goto ident_found;
+            }
+            JS_FreeAtom(v->ctx, atom);
+            if (v->t.tok == '*') {
+                PV_TRY(pv_next(v));
+                prop_type = PVP_ASYNC_STAR;
+            } else {
+                prop_type = PVP_ASYNC;
+            }
+        }
+    }
+    if (pv_token_is_ident(v->t.tok)) {
+        non_reserved = (v->t.tok == TOK_IDENT);
+        name = pv_name_of(&v->t);
+        *patom = JS_DupAtom(v->ctx, v->t.atom);
+        PV_TRY(pv_next(v));
+    ident_found:
+        if (non_reserved && prop_type == PVP_IDENT && allow_var) {
+            if (!(v->t.tok == ':' || (v->t.tok == '(' && allow_method)))
+                prop_type = PVP_VAR;
+        }
+    } else if (v->t.tok == TOK_STRING) {
+        if (v->t.special)
+            PV_TRY(pv_check_text(v, v->t.ptr[0], v->t.ptr + 1));
+        name = pv_name_of(&v->t);
+        PV_TRY(pv_next(v));
+    } else if (v->t.tok == TOK_NUMBER) {
+        PV_TRY(pv_next(v));
+    } else if (v->t.tok == '[') {
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_assign(v, PV_IN, NULL));
+        PV_TRY(pv_expect(v, ']'));
+        name = PVN_COMPUTED;
+    } else {
+        PV_BAIL(v); /* private names too */
+    }
+    PP_CODE(v, PP_ATOM_BYTES);
+    if (prop_type != PVP_IDENT && prop_type != PVP_VAR && v->t.tok != '(')
+        PV_BAIL(v);
+    *pname = name;
+    return prop_type;
+}
+
+static int pv_object_literal(JSPreparse *v)
+{
+    BOOL has_proto = FALSE;
+    int prop_type, name;
+    JSAtom atom;
+
+    PV_TRY(pv_next(v));
+    PP_CODE(v, 1);
+    while (v->t.tok != '}') {
+        if (v->t.tok == TOK_ELLIPSIS) {
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_assign(v, PV_IN, NULL));
+            goto next;
+        }
+        prop_type = pv_property_name(v, TRUE, TRUE, FALSE, &name, &atom);
+        if (prop_type < 0) {
+            JS_FreeAtom(v->ctx, atom);
+            return -1;
+        }
+        if (prop_type == PVP_VAR) {
+            /* shorthand: a use of the name */
+            if (pv_special_name(atom) && atom != JS_ATOM_arguments) {
+                JS_FreeAtom(v->ctx, atom);
+                PV_BAIL(v);
+            }
+            if (atom == JS_ATOM_arguments && !v->fn->arguments_allowed) {
+                JS_FreeAtom(v->ctx, atom);
+                PV_BAIL(v);
+            }
+            PP_CODE(v, PP_NAME_BYTES);
+            PV_TRY(pp_add_ref(v, atom));
+        } else if (v->t.tok == '(') {
+            int func_type = PVF_METHOD, func_kind = JS_FUNC_NORMAL;
+            JS_FreeAtom(v->ctx, atom);
+            if (prop_type == PVP_GET)
+                func_type = PVF_GETTER;
+            else if (prop_type == PVP_SET)
+                func_type = PVF_SETTER;
+            else if (prop_type == PVP_STAR)
+                func_kind = JS_FUNC_GENERATOR;
+            else if (prop_type == PVP_ASYNC)
+                func_kind = JS_FUNC_ASYNC;
+            else if (prop_type == PVP_ASYNC_STAR)
+                func_kind = JS_FUNC_ASYNC_GENERATOR;
+            PV_TRY(pv_function(v, func_type, func_kind, FALSE));
+        } else {
+            JS_FreeAtom(v->ctx, atom);
+            PV_TRY(pv_expect(v, ':'));
+            PV_TRY(pv_assign(v, PV_IN, NULL));
+            if (name == PVN_UNKNOWN)
+                PV_BAIL(v);
+            if (name == PVN_PROTO) {
+                if (has_proto)
+                    PV_BAIL(v);
+                has_proto = TRUE;
+            }
+        }
+    next:
+        if (v->t.tok != ',')
+            break;
+        PV_TRY(pv_next(v));
+    }
+    return pv_expect(v, '}');
+}
+
+static int pv_array_literal(JSPreparse *v)
+{
+    PV_TRY(pv_next(v));
+    PP_CODE(v, 1);
+    while (v->t.tok != ']') {
+        if (v->t.tok == ',') {
+            PV_TRY(pv_next(v));
+            continue;
+        }
+        if (v->t.tok == TOK_ELLIPSIS)
+            PV_TRY(pv_next(v));
+        PV_TRY(pv_assign(v, PV_IN, NULL));
+        if (v->t.tok != ',')
+            break;
+        PV_TRY(pv_next(v));
+    }
+    return pv_expect(v, ']');
+}
+
+/* the use of a name as a value */
+static int pv_use(JSPreparse *v, JSAtom atom)
+{
+    PP_CODE(v, v->stmt_start ? PP_NAME_BYTES : PP_NAME_BYTES + PP_POS_BYTES);
+    return pp_add_ref(v, JS_DupAtom(v->ctx, atom));
+}
+
+/* js_parse_postfix_expr() */
+static int pv_postfix(JSPreparse *v, int flags, int *pinfo)
+{
+    BOOL accept_lparen = (flags & PV_CALL) != 0;
+    BOOL has_opt_chain = FALSE, is_super = FALSE;
+    int info = PVX_NONE, call_type = 0; /* 0 normal, 1 new, 2 super */
+    int i;
+
+    if (js_check_stack_overflow(v->ctx->rt, 0))
+        PV_BAIL(v);
+    switch (v->t.tok) {
+    case TOK_NUMBER:
+    case TOK_STRING:
+        if (v->t.tok == TOK_STRING && v->t.special)
+            PV_TRY(pv_check_text(v, v->t.ptr[0], v->t.ptr + 1));
+        PP_CODE(v, PP_ATOM_BYTES);
+        PV_TRY(pv_next(v));
+        break;
+    case TOK_TEMPLATE:
+        PV_TRY(pv_template(v, FALSE));
+        break;
+    case TOK_DIV_ASSIGN:
+    case '/':
+        PV_TRY(pv_regexp(v));
+        PP_CODE(v, PP_ATOM_BYTES);
+        PV_TRY(pv_next(v));
+        break;
+    case '(':
+        PV_TRY(pv_paren(v, &info));
+        break;
+    case TOK_FUNCTION:
+        PV_TRY(pv_function(v, PVF_EXPR, JS_FUNC_NORMAL, FALSE));
+        break;
+    case TOK_CLASS:
+        PV_TRY(pv_class(v, TRUE));
+        break;
+    case TOK_NULL:
+    case TOK_FALSE:
+    case TOK_TRUE:
+        PV_TRY(pv_next(v));
+        break;
+    case TOK_THIS:
+        PP_CODE(v, PP_NAME_BYTES);
+        PV_TRY(pp_add_pseudo_ref(v, JS_ATOM_this));
+        PV_TRY(pv_next(v));
+        break;
+    case TOK_IDENT:
+        {
+            JSAtom atom = v->t.atom;
+            if (atom == JS_ATOM_async && pv_peek(v, TRUE) != '\n') {
+                PV_TRY(pv_next(v));
+                if (v->t.tok == TOK_FUNCTION) {
+                    PV_TRY(pv_function(v, PVF_EXPR, JS_FUNC_ASYNC, FALSE));
+                } else {
+                    PV_TRY(pv_use(v, JS_ATOM_async));
+                    info = PVX_VAR;
+                }
+                break;
+            }
+            /* eval, arguments where it is not allowed, and the words that
+               are identifiers only in some contexts */
+            if (pv_special_name(atom)) {
+                if (atom != JS_ATOM_arguments || !v->fn->arguments_allowed)
+                    PV_BAIL(v);
+            }
+            PV_TRY(pv_use(v, atom));
+            PV_TRY(pv_next(v));
+            info = (atom == JS_ATOM_arguments && v->fn->strict) ?
+                PVX_ARGS : PVX_VAR;
+        }
+        break;
+    case '{':
+        PV_TRY(pv_object_literal(v));
+        break;
+    case '[':
+        PV_TRY(pv_array_literal(v));
+        break;
+    case TOK_NEW:
+        PV_TRY(pv_next(v));
+        if (v->t.tok == '.') {
+            PV_TRY(pv_next(v));
+            if (!pv_is(v, JS_ATOM_target) || !v->fn->new_target_allowed)
+                PV_BAIL(v);
+            PV_TRY(pv_next(v));
+            PP_CODE(v, PP_NAME_BYTES);
+            PV_TRY(pp_add_pseudo_ref(v, JS_ATOM_new_target));
+        } else {
+            PV_TRY(pv_postfix(v, 0, NULL));
+            accept_lparen = TRUE;
+            PP_CODE(v, 3);
+            if (v->t.tok == '(')
+                call_type = 1;
+        }
+        break;
+    case TOK_SUPER:
+        PV_TRY(pv_next(v));
+        PV_TRY(pp_add_pseudo_ref(v, JS_ATOM_this));
+        PV_TRY(pp_add_pseudo_ref(v, JS_ATOM_home_object));
+        if (v->t.tok == '(') {
+            if (!v->fn->super_call_allowed)
+                PV_BAIL(v);
+            PV_TRY(pp_add_pseudo_ref(v, JS_ATOM_this_active_func));
+            PV_TRY(pp_add_pseudo_ref(v, JS_ATOM_new_target));
+            call_type = 2;
+        } else if (v->t.tok == '.' || v->t.tok == '[') {
+            if (!v->fn->super_allowed)
+                PV_BAIL(v);
+            is_super = TRUE;
+        } else {
+            PV_BAIL(v);
+        }
+        break;
+    case TOK_IMPORT:
+        PV_TRY(pv_next(v));
+        if (v->t.tok == '.') {
+            PV_TRY(pv_next(v));
+            if (!pv_is(v, JS_ATOM_meta) || !v->is_module)
+                PV_BAIL(v);
+            PV_TRY(pv_next(v));
+        } else {
+            PV_TRY(pv_expect(v, '('));
+            if (!accept_lparen)
+                PV_BAIL(v);
+            PV_TRY(pv_assign(v, PV_IN, NULL));
+            if (v->t.tok == ',') {
+                PV_TRY(pv_next(v));
+                if (v->t.tok != ')') {
+                    PV_TRY(pv_assign(v, PV_IN, NULL));
+                    if (v->t.tok == ',')
+                        PV_TRY(pv_next(v));
+                }
+            }
+            PV_TRY(pv_expect(v, ')'));
+        }
+        break;
+    default:
+        PV_BAIL(v);
+    }
+
+    for (;;) {
+        BOOL opt = FALSE;
+        if (v->t.tok == TOK_QUESTION_MARK_DOT) {
+            if (!(flags & PV_CALL))
+                PV_BAIL(v);
+            PV_TRY(pv_next_name(v));
+            has_opt_chain = opt = TRUE;
+            if (v->t.tok == '(' && accept_lparen)
+                goto parse_func_call;
+            else if (v->t.tok == '[')
+                goto parse_array_access;
+            else
+                goto parse_property;
+        } else if (v->t.tok == TOK_TEMPLATE && call_type == 0) {
+            if (has_opt_chain)
+                PV_BAIL(v);
+            PV_TRY(pv_template(v, TRUE));
+            PP_CODE(v, PP_POS_BYTES + 3);
+            info = PVX_NONE;
+            is_super = FALSE;
+        } else if (v->t.tok == '(' && accept_lparen) {
+        parse_func_call:
+            PV_TRY(pv_next(v));
+            PP_CODE(v, PP_POS_BYTES + 3);
+            i = 0;
+            while (v->t.tok != ')') {
+                if (++i > PV_MAX_CALL_ARGS)
+                    PV_BAIL(v);
+                if (v->t.tok == TOK_ELLIPSIS)
+                    PV_TRY(pv_next(v));
+                PV_TRY(pv_assign(v, PV_IN, NULL));
+                if (v->t.tok == ')')
+                    break;
+                PV_TRY(pv_expect(v, ','));
+            }
+            PV_TRY(pv_next(v));
+            call_type = 0;
+            info = PVX_NONE;
+            is_super = FALSE;
+        } else if (v->t.tok == '.') {
+            PV_TRY(pv_next_name(v));
+        parse_property:
+            if (!pv_token_is_ident(v->t.tok))
+                PV_BAIL(v); /* private names too */
+            PP_CODE(v, PP_POS_BYTES + PP_ATOM_BYTES);
+            PV_TRY(pv_next(v));
+            info = PVX_FIELD;
+            is_super = FALSE;
+        } else if (v->t.tok == '[') {
+        parse_array_access:
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_expr(v, PV_IN, NULL));
+            PV_TRY(pv_expect(v, ']'));
+            PP_CODE(v, PP_POS_BYTES + 1);
+            info = PVX_FIELD;
+            is_super = FALSE;
+        } else {
+            break;
+        }
+        (void)opt;
+    }
+    if (is_super || call_type != 0)
+        PV_BAIL(v); /* 'super' alone, 'new X' followed by a call type */
+    if (has_opt_chain)
+        info = PVX_NONE;
+    if (pinfo)
+        *pinfo = info;
+    return 0;
+}
+
+/* js_parse_unary() */
+static int pv_unary(JSPreparse *v, int flags, int *pinfo)
+{
+    int info = PVX_NONE, i;
+
+    if (js_check_stack_overflow(v->ctx->rt, 0))
+        PV_BAIL(v);
+    switch (v->t.tok) {
+    case '+':
+    case '-':
+    case '!':
+    case '~':
+    case TOK_VOID:
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_unary(v, PV_POW_FORBIDDEN, NULL));
+        PP_CODE(v, 1);
+        flags = 0;
+        break;
+    case TOK_DEC:
+    case TOK_INC:
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_unary(v, 0, &i));
+        PV_TRY(pv_lvalue(v, i));
+        PP_CODE(v, PP_POS_BYTES + 1);
+        break;
+    case TOK_TYPEOF:
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_unary(v, PV_POW_FORBIDDEN, NULL));
+        PP_CODE(v, 1);
+        flags = 0;
+        break;
+    case TOK_DELETE:
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_unary(v, PV_POW_FORBIDDEN, &i));
+        if ((i == PVX_VAR || i == PVX_ARGS) && v->fn->strict)
+            PV_BAIL(v);
+        PP_CODE(v, 1);
+        flags = 0;
+        break;
+    case TOK_AWAIT:
+        if (!v->fn->is_async || !v->fn->in_body)
+            PV_BAIL(v);
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_unary(v, PV_POW_FORBIDDEN, NULL));
+        PP_CODE(v, 1);
+        flags = 0;
+        break;
+    default:
+        PV_TRY(pv_postfix(v, PV_CALL, &info));
+        if (!v->t.nl && (v->t.tok == TOK_DEC || v->t.tok == TOK_INC)) {
+            PV_TRY(pv_lvalue(v, info));
+            PP_CODE(v, PP_POS_BYTES + 1);
+            PV_TRY(pv_next(v));
+            info = PVX_NONE;
+        }
+        break;
+    }
+    if (flags & (PV_POW_ALLOWED | PV_POW_FORBIDDEN)) {
+        if (v->t.tok == TOK_POW) {
+            if (flags & PV_POW_FORBIDDEN)
+                PV_BAIL(v);
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_unary(v, PV_POW_ALLOWED, NULL));
+            PP_CODE(v, PP_POS_BYTES + 1);
+            info = PVX_NONE;
+        }
+    }
+    if (pinfo)
+        *pinfo = info;
+    return 0;
+}
+
+/* js_parse_expr_binary() */
+static int pv_binary(JSPreparse *v, int level, int flags, int *pinfo)
+{
+    int op;
+    BOOL ok;
+
+    if (level == 0)
+        return pv_unary(v, PV_POW_ALLOWED, pinfo);
+    if (v->t.tok == TOK_PRIVATE_NAME)
+        PV_BAIL(v);
+    PV_TRY(pv_binary(v, level - 1, flags, pinfo));
+    for (;;) {
+        op = v->t.tok;
+        switch (level) {
+        case 1: ok = (op == '*' || op == '/' || op == '%'); break;
+        case 2: ok = (op == '+' || op == '-'); break;
+        case 3: ok = (op == TOK_SHL || op == TOK_SAR || op == TOK_SHR); break;
+        case 4:
+            ok = (op == '<' || op == '>' || op == TOK_LTE || op == TOK_GTE ||
+                  op == TOK_INSTANCEOF || (op == TOK_IN && (flags & PV_IN)));
+            break;
+        case 5:
+            ok = (op == TOK_EQ || op == TOK_NEQ || op == TOK_STRICT_EQ ||
+                  op == TOK_STRICT_NEQ);
+            break;
+        case 6: ok = (op == '&'); break;
+        case 7: ok = (op == '^'); break;
+        case 8: ok = (op == '|'); break;
+        default: abort();
+        }
+        if (!ok)
+            return 0;
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_binary(v, level - 1, flags, NULL));
+        PP_CODE(v, PP_POS_BYTES + 1);
+        if (pinfo)
+            *pinfo = PVX_NONE;
+    }
+}
+
+/* js_parse_logical_and_or() */
+static int pv_logical(JSPreparse *v, int op, int flags, int *pinfo)
+{
+    if (op == TOK_LAND)
+        PV_TRY(pv_binary(v, 8, flags, pinfo));
+    else
+        PV_TRY(pv_logical(v, TOK_LAND, flags, pinfo));
+    if (v->t.tok == op) {
+        for (;;) {
+            PV_TRY(pv_next(v));
+            PP_CODE(v, 7);
+            if (op == TOK_LAND)
+                PV_TRY(pv_binary(v, 8, flags, NULL));
+            else
+                PV_TRY(pv_logical(v, TOK_LAND, flags, NULL));
+            if (v->t.tok != op) {
+                if (v->t.tok == TOK_DOUBLE_QUESTION_MARK)
+                    PV_BAIL(v);
+                break;
+            }
+        }
+        if (pinfo)
+            *pinfo = PVX_NONE;
+    }
+    return 0;
+}
+
+/* js_parse_cond_expr() and js_parse_coalesce_expr() */
+static int pv_cond(JSPreparse *v, int flags, int *pinfo)
+{
+    PV_TRY(pv_logical(v, TOK_LOR, flags, pinfo));
+    if (v->t.tok == TOK_DOUBLE_QUESTION_MARK) {
+        for (;;) {
+            PV_TRY(pv_next(v));
+            PP_CODE(v, 7);
+            PV_TRY(pv_binary(v, 8, flags, NULL));
+            if (v->t.tok != TOK_DOUBLE_QUESTION_MARK)
+                break;
+        }
+        if (pinfo)
+            *pinfo = PVX_NONE;
+    }
+    if (v->t.tok == '?') {
+        PV_TRY(pv_next(v));
+        PP_CODE(v, 10);
+        PV_TRY(pv_assign(v, PV_IN, NULL));
+        PV_TRY(pv_expect(v, ':'));
+        PV_TRY(pv_assign(v, flags & PV_IN, NULL));
+        if (pinfo)
+            *pinfo = PVX_NONE;
+    }
+    return 0;
+}
+
+/* js_parse_assign_expr2() */
+static int pv_assign(JSPreparse *v, int flags, int *pinfo)
+{
+    int info = PVX_NONE, op, bits, tok;
+
+    if (js_check_stack_overflow(v->ctx->rt, 0))
+        PV_BAIL(v);
+    if (pinfo)
+        *pinfo = PVX_NONE;
+    if (v->t.tok == TOK_YIELD) {
+        if (!v->fn->is_gen || !v->fn->in_body)
+            PV_BAIL(v);
+        PV_TRY(pv_next(v));
+        PP_CODE(v, 1);
+        tok = v->t.tok;
+        if (tok != ';' && tok != ')' && tok != ']' && tok != '}' &&
+            tok != ',' && tok != ':' && !v->t.nl) {
+            if (tok == '*')
+                PV_TRY(pv_next(v));
+            PV_TRY(pv_assign(v, flags, NULL));
+        }
+        return 0;
+    } else if (v->t.tok == '(') {
+        tok = pv_skip_parens(v, NULL, TRUE);
+        if (tok == PV_SKIP_FAILED)
+            PV_BAIL(v);
+        if (tok == TOK_ARROW)
+            return pv_function(v, PVF_ARROW, JS_FUNC_NORMAL, FALSE);
+    } else if (pv_is(v, JS_ATOM_async)) {
+        const uint8_t *ptr;
+        BOOL nl;
+        tok = pv_peek(v, TRUE);
+        if (tok == TOK_FUNCTION || tok == '\n')
+            goto next;
+        ptr = v->t.ptr;
+        nl = v->t.nl;
+        PV_TRY(pv_next(v));
+        if (v->t.tok == '(') {
+            tok = pv_skip_parens(v, NULL, TRUE);
+            if (tok == PV_SKIP_FAILED)
+                PV_BAIL(v);
+            if (tok == TOK_ARROW)
+                return pv_function(v, PVF_ARROW, JS_FUNC_ASYNC, FALSE);
+        } else if (v->t.tok == TOK_IDENT && pv_peek(v, TRUE) == TOK_ARROW) {
+            return pv_function(v, PVF_ARROW, JS_FUNC_ASYNC, FALSE);
+        }
+        PV_TRY(pv_seek(v, ptr, nl));
+    } else if (v->t.tok == TOK_IDENT && pv_peek(v, TRUE) == TOK_ARROW) {
+        return pv_function(v, PVF_ARROW, JS_FUNC_NORMAL, FALSE);
+    } else if (v->t.tok == '{' || v->t.tok == '[') {
+        tok = pv_skip_parens(v, &bits, FALSE);
+        if (tok == PV_SKIP_FAILED)
+            PV_BAIL(v);
+        if (tok == '=')
+            return pv_pattern(v, 0, FALSE, FALSE,
+                              bits & PV_SKIP_ELLIPSIS, TRUE);
+    }
+ next:
+    PV_TRY(pv_cond(v, flags, &info));
+    op = v->t.tok;
+    if (op == '=' || (op >= TOK_MUL_ASSIGN && op <= TOK_POW_ASSIGN) ||
+        (op >= TOK_LAND_ASSIGN && op <= TOK_DOUBLE_QUESTION_MARK_ASSIGN)) {
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_lvalue(v, info));
+        /* the store replaces the load of the target */
+        if (op != '=')
+            PP_CODE(v, PP_POS_BYTES + 1);
+        PV_TRY(pv_assign(v, flags, NULL));
+        info = PVX_NONE;
+    }
+    if (pinfo)
+        *pinfo = info;
+    return 0;
+}
+
+/* js_parse_expr2() */
+static int pv_expr(JSPreparse *v, int flags, int *pinfo)
+{
+    BOOL comma = FALSE;
+    for (;;) {
+        PV_TRY(pv_assign(v, flags, pinfo));
+        if (comma && pinfo)
+            *pinfo = PVX_NONE;
+        if (v->t.tok != ',')
+            break;
+        comma = TRUE;
+        PP_CODE(v, 1);
+        PV_TRY(pv_next(v));
+    }
+    return 0;
+}
+
+/* js_parse_destructuring_element(). 'kind' is 0 for an assignment
+   pattern, else the declaration kind of its names. */
+static int pv_pattern(JSPreparse *v, int kind, BOOL is_arg, BOOL hasval,
+                      int has_ellipsis, BOOL allow_initializer)
+{
+    int tok1, bits, info;
+    BOOL has_spread;
+
+    if (js_check_stack_overflow(v->ctx->rt, 0))
+        PV_BAIL(v);
+    if (has_ellipsis < 0) {
+        tok1 = pv_skip_parens(v, &bits, FALSE);
+        if (tok1 == PV_SKIP_FAILED)
+            PV_BAIL(v);
+        has_ellipsis = bits & PV_SKIP_ELLIPSIS;
+    }
+    if (v->t.tok == '{') {
+        PV_TRY(pv_next(v));
+        while (v->t.tok != '}') {
+            int prop_type, name;
+            JSAtom atom;
+            if (v->t.tok == TOK_ELLIPSIS) {
+                if (!has_ellipsis)
+                    PV_BAIL(v);
+                PV_TRY(pv_next(v));
+                if (kind) {
+                    if (v->t.tok != TOK_IDENT)
+                        PV_BAIL(v);
+                    PV_TRY(pv_declare(v, v->t.atom, kind));
+                    PP_CODE(v, PP_NAME_BYTES);
+                    PV_TRY(pv_next(v));
+                } else {
+                    PV_TRY(pv_postfix(v, PV_CALL, &info));
+                    PV_TRY(pv_lvalue(v, info));
+                }
+                if (v->t.tok != '}')
+                    PV_BAIL(v);
+                break;
+            }
+            prop_type = pv_property_name(v, FALSE, TRUE, FALSE, &name, &atom);
+            if (prop_type < 0) {
+                JS_FreeAtom(v->ctx, atom);
+                return -1;
+            }
+            if (prop_type == PVP_IDENT) {
+                JS_FreeAtom(v->ctx, atom);
+                if (v->t.tok != ':')
+                    PV_BAIL(v); /* js_parse_property_name() gave IDENT */
+                PV_TRY(pv_next(v));
+                if (v->t.tok == '[' || v->t.tok == '{') {
+                    tok1 = pv_skip_parens(v, &bits, FALSE);
+                    if (tok1 == PV_SKIP_FAILED)
+                        PV_BAIL(v);
+                    if (tok1 == ',' || tok1 == '=' || tok1 == '}') {
+                        PV_TRY(pv_pattern(v, kind, is_arg, TRUE, -1, TRUE));
+                        if (v->t.tok == '}')
+                            break;
+                        PV_TRY(pv_expect(v, ','));
+                        continue;
+                    }
+                }
+                if (kind) {
+                    if (v->t.tok != TOK_IDENT)
+                        PV_BAIL(v);
+                    PV_TRY(pv_declare(v, v->t.atom, kind));
+                    PP_CODE(v, PP_NAME_BYTES);
+                    PV_TRY(pv_next(v));
+                } else {
+                    PV_TRY(pv_postfix(v, PV_CALL, &info));
+                    PV_TRY(pv_lvalue(v, info));
+                }
+            } else {
+                /* shorthand: the name is the binding or target */
+                int ret;
+                if (kind) {
+                    ret = pv_declare(v, atom, kind);
+                } else if (pv_special_name(atom)) {
+                    v->bail_line = __LINE__;
+                    ret = pv_fail(v, PP_BAIL);
+                } else {
+                    PP_CODE(v, PP_NAME_BYTES);
+                    ret = pp_add_ref(v, JS_DupAtom(v->ctx, atom));
+                }
+                JS_FreeAtom(v->ctx, atom);
+                if (ret < 0)
+                    return -1;
+            }
+            if (v->t.tok == '=') {
+                PV_TRY(pv_next(v));
+                PV_TRY(pv_assign(v, PV_IN, NULL));
+            }
+            if (v->t.tok == '}')
+                break;
+            PV_TRY(pv_expect(v, ','));
+        }
+        PV_TRY(pv_next(v));
+    } else if (v->t.tok == '[') {
+        PV_TRY(pv_next(v));
+        has_spread = FALSE;
+        while (v->t.tok != ']') {
+            if (v->t.tok == TOK_ELLIPSIS) {
+                PV_TRY(pv_next(v));
+                if (v->t.tok == ',' || v->t.tok == ']')
+                    PV_BAIL(v);
+                has_spread = TRUE;
+            }
+            if (v->t.tok == ',') {
+                /* hole */
+            } else {
+                BOOL nested = FALSE;
+                if (v->t.tok == '[' || v->t.tok == '{') {
+                    tok1 = pv_skip_parens(v, &bits, FALSE);
+                    if (tok1 == PV_SKIP_FAILED)
+                        PV_BAIL(v);
+                    if (tok1 == ',' || tok1 == '=' || tok1 == ']') {
+                        if (has_spread && tok1 == '=')
+                            PV_BAIL(v);
+                        PV_TRY(pv_pattern(v, kind, is_arg, TRUE,
+                                          bits & PV_SKIP_ELLIPSIS, TRUE));
+                        nested = TRUE;
+                    }
+                }
+                if (!nested) {
+                    if (kind) {
+                        if (v->t.tok != TOK_IDENT)
+                            PV_BAIL(v);
+                        PV_TRY(pv_declare(v, v->t.atom, kind));
+                        PP_CODE(v, PP_NAME_BYTES);
+                        PV_TRY(pv_next(v));
+                    } else {
+                        PV_TRY(pv_postfix(v, PV_CALL, &info));
+                        PV_TRY(pv_lvalue(v, info));
+                    }
+                    if (v->t.tok == '=' && !has_spread) {
+                        PV_TRY(pv_next(v));
+                        PV_TRY(pv_assign(v, PV_IN, NULL));
+                    }
+                }
+            }
+            if (v->t.tok == ']')
+                break;
+            if (has_spread)
+                PV_BAIL(v);
+            PV_TRY(pv_expect(v, ','));
+        }
+        PV_TRY(pv_next(v));
+    } else {
+        PV_BAIL(v);
+    }
+    if (v->t.tok == '=' && allow_initializer) {
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_assign(v, PV_IN, NULL));
+    } else if (!hasval) {
+        PV_BAIL(v);
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------- functions */
+
+/* a new scope: its frame is created on its first declaration */
+#define PV_ENTER_SCOPE(v, sc) do { (sc)->parent = (v)->scope; \
+        (sc)->ref_pos = (v)->ref_count; (sc)->frame = -1; \
+        (sc)->enter_seq = ++(v)->seq; (v)->scope = (sc); } while (0)
+
+static int pv_leave_scope(JSPreparse *v, PVScope *sc)
+{
+    uint32_t i;
+    v->scope = sc->parent;
+    if (sc->frame < 0)
+        return 0;
+    /* its names (all lexical) are no longer open */
+    for (i = v->fr[sc->frame].decl_start; i < v->decl_count; i++) {
+        PVConf *e = pv_conf_find(v, v->decls[i], v->fn->serial);
+        if (e->atom != JS_ATOM_NULL && e->lex_open)
+            e->lex_open--;
+    }
+    return pp_close_frame(v);
+}
+
+/* The directive prologue of a nested function (js_parse_directives()):
+   "use strict" changes how the body parses; give up on it unless the
+   function is strict already and has simple parameters. */
+static int pv_directives(JSPreparse *v, BOOL simple_params)
+{
+    PVToken t = v->t;
+    BOOL has_semi;
+    int ret = 0;
+
+    t.atom = JS_ATOM_NULL;
+    while (t.tok == TOK_STRING) {
+        BOOL use_strict = (t.end - t.ptr == 12 &&
+                           !memcmp(t.ptr + 1, "use strict", 10));
+        if (pv_lex(v, t.end, &t, PVL_LOOK) < 0) {
+            ret = -1;
+            break;
+        }
+        has_semi = FALSE;
+        switch (t.tok) {
+        case ';':
+            JS_FreeAtom(v->ctx, t.atom);
+            t.atom = JS_ATOM_NULL;
+            if (pv_lex(v, t.end, &t, PVL_LOOK) < 0) {
+                ret = -1;
+                goto done;
+            }
+            has_semi = TRUE;
+            break;
+        case '}':
+        case TOK_EOF:
+            has_semi = TRUE;
+            break;
+        case '(': case '[': case '.': case ',': case '=': case '+':
+        case '-': case '*': case '/': case '%': case '?': case ':':
+            break;
+        default:
+            if (t.nl)
+                has_semi = TRUE;
+            break;
+        }
+        if (use_strict && (has_semi || t.nl)) {
+            if (!v->fn->strict || !simple_params) {
+                v->bail_line = __LINE__;
+                ret = pv_fail(v, PP_BAIL);
+            }
+            goto done;
+        }
+        if (!has_semi)
+            break;
+    }
+ done:
+    JS_FreeAtom(v->ctx, t.atom);
+    return ret;
+}
+
+/* the statements of a function body up to its '}' (not consumed) */
+static int pv_body_statements(JSPreparse *v)
+{
+    while (v->t.tok != '}') {
+        if (v->t.tok == TOK_EOF)
+            PV_BAIL(v);
+        PV_TRY(pv_statement(v, PV_DECL_ALL));
+    }
+    return 0;
+}
+
+/* js_parse_function_decl2(): a nested function from its name (or, for a
+   method or arrow, its parameters) to the end of its body */
+static int pv_function(JSPreparse *v, int func_type, int func_kind,
+                       BOOL is_decl)
+{
+    PVCtx fn1, *fn = &fn1, *parent = v->fn;
+    PVScope body_scope, *saved_scope = v->scope;
+    JSAtom name = JS_ATOM_NULL;
+    BOOL simple = TRUE, is_expr = !is_decl;
+    int nargs = 0, ret, f;
+    uint32_t saved_labels = v->label_count;
+
+    if (js_check_stack_overflow(v->ctx->rt, 0))
+        PV_BAIL(v);
+    if (func_type == PVF_STATEMENT || func_type == PVF_VAR ||
+        func_type == PVF_EXPR) {
+        if (func_kind == JS_FUNC_NORMAL && pv_is(v, JS_ATOM_async) &&
+            pv_peek(v, TRUE) != '\n') {
+            PV_TRY(pv_next(v));
+            func_kind = JS_FUNC_ASYNC;
+        }
+        PV_TRY(pv_next(v));
+        if (v->t.tok == '*') {
+            PV_TRY(pv_next(v));
+            func_kind |= JS_FUNC_GENERATOR;
+        }
+        if (v->t.tok == TOK_IDENT) {
+            if (pv_special_name(v->t.atom))
+                PV_BAIL(v);
+            name = v->t.atom;
+            if (is_decl) {
+                PV_TRY(pv_declare(v, name, func_type == PVF_VAR ? PVD_FUNC :
+                                  PVD_LEX));
+            }
+            name = JS_DupAtom(v->ctx, name);
+            if (pv_next(v) < 0) {
+                JS_FreeAtom(v->ctx, name);
+                return -1;
+            }
+        } else if (func_type != PVF_EXPR) {
+            PV_BAIL(v);
+        }
+    }
+
+    memset(fn, 0, sizeof(*fn));
+    fn->parent = parent;
+    fn->serial = ++v->serial_next;
+    fn->label_base = v->label_count;
+    fn->strict = parent->strict;
+    fn->is_async = (func_kind & JS_FUNC_ASYNC) != 0;
+    fn->is_gen = (func_kind & JS_FUNC_GENERATOR) != 0;
+    fn->is_arrow = (func_type == PVF_ARROW);
+    if (func_type == PVF_ARROW) {
+        fn->new_target_allowed = parent->new_target_allowed;
+        fn->super_call_allowed = parent->super_call_allowed;
+        fn->super_allowed = parent->super_allowed;
+        fn->arguments_allowed = parent->arguments_allowed;
+    } else {
+        BOOL home = (func_type >= PVF_GETTER);
+        fn->new_target_allowed = TRUE;
+        fn->super_call_allowed = (func_type == PVF_DERIVED_CTOR);
+        fn->super_allowed = home;
+        fn->arguments_allowed = TRUE;
+    }
+    f = pp_push_frame(v, func_type == PVF_ARROW ? PPF_ARROW : PPF_FUNC,
+                      v->ref_count);
+    if (f < 0) {
+        JS_FreeAtom(v->ctx, name);
+        return -1;
+    }
+    fn->param_frame = fn->var_frame = f;
+    v->fn = fn;
+    PP_CODE(v, 6);
+    /* a function expression's own name binds inside it */
+    if (name != JS_ATOM_NULL && is_expr) {
+        ret = pp_declare_in(v, f, name);
+        name = JS_ATOM_NULL;
+        if (ret < 0)
+            goto fail;
+    }
+    JS_FreeAtom(v->ctx, name);
+    name = JS_ATOM_NULL;
+
+    body_scope.parent = NULL;
+    body_scope.ref_pos = v->ref_count;
+    body_scope.frame = f;
+    body_scope.enter_seq = ++v->seq;
+    v->scope = &body_scope;
+
+    /* parameters */
+    if (func_type == PVF_ARROW && v->t.tok == TOK_IDENT) {
+        /* x => : the token was read in the enclosing function */
+        if (pv_declare(v, v->t.atom, PVD_PARAM) < 0)
+            goto fail;
+        nargs = 1;
+        if (pv_next(v) < 0)
+            goto fail;
+    } else {
+        if (v->t.tok != '(')
+            goto bail;
+        if (pv_next(v) < 0)
+            goto fail;
+        while (v->t.tok != ')') {
+            BOOL rest = FALSE;
+            if (v->t.tok == TOK_ELLIPSIS) {
+                if (func_type == PVF_SETTER)
+                    goto bail;
+                simple = FALSE;
+                rest = TRUE;
+                if (pv_next(v) < 0)
+                    goto fail;
+            }
+            if (v->t.tok == '[' || v->t.tok == '{') {
+                simple = FALSE;
+                if (pv_pattern(v, PVD_PARAM, TRUE, TRUE, -1, TRUE) < 0)
+                    goto fail;
+            } else if (v->t.tok == TOK_IDENT) {
+                if (pv_declare(v, v->t.atom, PVD_PARAM) < 0)
+                    goto fail;
+                if (pv_next(v) < 0)
+                    goto fail;
+                if (!rest && v->t.tok == '=') {
+                    simple = FALSE;
+                    if (pv_next(v) < 0 || pv_assign(v, PV_IN, NULL) < 0)
+                        goto fail;
+                }
+            } else {
+                goto bail;
+            }
+            nargs++;
+            if (rest && v->t.tok != ')')
+                goto bail;
+            if (v->t.tok == ')')
+                break;
+            if (pv_expect(v, ',') < 0)
+                goto fail;
+        }
+        if ((func_type == PVF_GETTER && nargs != 0) ||
+            (func_type == PVF_SETTER && nargs != 1))
+            goto bail;
+        if (pv_next(v) < 0) /* ')' */
+            goto fail;
+    }
+    /* with parameter expressions, the body's declarations are in a scope
+       of their own */
+    if (!simple) {
+        f = pp_push_frame(v, PPF_BLOCK, v->ref_count);
+        if (f < 0)
+            goto fail;
+        fn->var_frame = f;
+        body_scope.frame = f;
+        body_scope.ref_pos = v->ref_count;
+    }
+    fn->in_body = TRUE;
+
+    if (func_type == PVF_ARROW) {
+        if (v->t.tok != TOK_ARROW || v->t.nl)
+            goto bail;
+        if (pv_next(v) < 0)
+            goto fail;
+        if (v->t.tok != '{') {
+            if (pv_assign(v, PV_IN, NULL) < 0)
+                goto fail;
+            goto done;
+        }
+    }
+    if (v->t.tok != '{')
+        goto bail;
+    if (pv_next(v) < 0)
+        goto fail;
+    if (v->t.tok == TOK_STRING && pv_directives(v, simple) < 0)
+        goto fail;
+    if (pv_body_statements(v) < 0)
+        goto fail;
+    PP_CODE(v, 1);
+    if (pv_next(v) < 0) /* '}', read in this function */
+        goto fail;
+ done:
+    v->scope = saved_scope;
+    v->label_count = saved_labels;
+    if (!simple && pp_close_frame(v) < 0)
+        goto fail1;
+    if (pp_close_frame(v) < 0)
+        goto fail1;
+    v->fn = parent;
+    return pv_reclassify(v);
+ bail:
+    v->bail_line = __LINE__;
+    pv_fail(v, PP_BAIL);
+ fail:
+ fail1:
+    v->fn = parent;
+    v->scope = saved_scope;
+    return -1;
+}
+
+/* class fields and static blocks: functions of their own */
+static int pv_class_init_ctx(JSPreparse *v, PVCtx *fn, BOOL is_static_init)
+{
+    int f;
+    memset(fn, 0, sizeof(*fn));
+    fn->parent = v->fn;
+    fn->serial = ++v->serial_next;
+    fn->label_base = v->label_count;
+    fn->strict = TRUE;
+    fn->is_static_init = is_static_init;
+    fn->in_body = TRUE;
+    fn->new_target_allowed = TRUE;
+    fn->super_allowed = TRUE;
+    f = pp_push_frame(v, PPF_FUNC, v->ref_count);
+    if (f < 0)
+        return -1;
+    fn->param_frame = fn->var_frame = f;
+    PP_CODE(v, 6);
+    return 0;
+}
+
+/* js_parse_class() */
+static int pv_class(JSPreparse *v, BOOL is_expr)
+{
+    PVCtx *fn = v->fn;
+    uint8_t saved_strict = fn->strict;
+    JSAtom class_name = JS_ATOM_NULL;
+    BOOL derived = FALSE, has_ctor = FALSE, is_static;
+    int f = -1, prop_type, name;
+    JSAtom atom;
+    PVCtx fn1;
+    PVScope *saved_scope;
+
+    fn->strict = TRUE;
+    PV_TRY(pv_next(v));
+    if (v->t.tok == TOK_IDENT) {
+        if (pv_special_name(v->t.atom))
+            goto bail;
+        class_name = JS_DupAtom(v->ctx, v->t.atom);
+        if (pv_next(v) < 0)
+            goto fail;
+    } else if (!is_expr) {
+        goto bail;
+    }
+    /* the class's own binding of its name, around its heritage too */
+    f = pp_push_frame(v, PPF_BLOCK, v->ref_count);
+    if (f < 0)
+        goto fail;
+    if (class_name != JS_ATOM_NULL) {
+        if (pp_declare_in(v, f, JS_DupAtom(v->ctx, class_name)) < 0)
+            goto fail;
+    }
+    if (v->t.tok == TOK_EXTENDS) {
+        derived = TRUE;
+        if (pv_next(v) < 0 || pv_postfix(v, PV_CALL, NULL) < 0)
+            goto fail;
+    }
+    if (v->t.tok != '{')
+        goto bail;
+    if (pv_next(v) < 0)
+        goto fail;
+    PP_CODE(v, 6);
+    while (v->t.tok != '}') {
+        if (v->t.tok == ';') {
+            if (pv_next(v) < 0)
+                goto fail;
+            continue;
+        }
+        if (v->t.tok == TOK_EOF)
+            goto bail;
+        is_static = FALSE;
+        prop_type = -1;
+        name = PVN_OTHER;
+        if (v->t.tok == TOK_STATIC) {
+            int next = pv_peek(v, TRUE);
+            if (!(next == ';' || next == '}' || next == '(' || next == '='))
+                is_static = TRUE;
+        }
+        if (is_static) {
+            if (pv_next(v) < 0)
+                goto fail;
+            if (v->t.tok == '{') {
+                /* static block */
+                PVScope body_scope;
+                saved_scope = v->scope;
+                if (pv_class_init_ctx(v, &fn1, TRUE) < 0)
+                    goto fail;
+                v->fn = &fn1;
+                body_scope.parent = NULL;
+                body_scope.ref_pos = v->ref_count;
+                body_scope.frame = fn1.var_frame;
+                body_scope.enter_seq = ++v->seq;
+                v->scope = &body_scope;
+                if (pv_next(v) < 0 || pv_body_statements(v) < 0 ||
+                    pv_next(v) < 0) {
+                    v->fn = fn;
+                    v->scope = saved_scope;
+                    goto fail;
+                }
+                v->fn = fn;
+                v->scope = saved_scope;
+                v->label_count = fn1.label_base;
+                if (pp_close_frame(v) < 0 || pv_reclassify(v) < 0)
+                    goto fail;
+                continue;
+            }
+            if (v->t.tok == ';' || v->t.tok == '=') {
+                is_static = FALSE;
+                prop_type = PVP_IDENT;
+                name = PVN_STATIC;
+            }
+        }
+        if (prop_type < 0) {
+            prop_type = pv_property_name(v, TRUE, FALSE, TRUE, &name, &atom);
+            JS_FreeAtom(v->ctx, atom);
+            if (prop_type < 0)
+                goto fail;
+        }
+        if (name == PVN_UNKNOWN)
+            goto bail;
+        if ((name == PVN_CONSTRUCTOR && !is_static && prop_type != PVP_IDENT) ||
+            (name == PVN_PROTOTYPE && is_static))
+            goto bail;
+        if (prop_type == PVP_GET || prop_type == PVP_SET) {
+            if (pv_function(v, prop_type == PVP_GET ? PVF_GETTER : PVF_SETTER,
+                            JS_FUNC_NORMAL, FALSE) < 0)
+                goto fail;
+        } else if (prop_type == PVP_IDENT && v->t.tok != '(') {
+            /* field */
+            if (name == PVN_CONSTRUCTOR || name == PVN_PROTOTYPE)
+                goto bail;
+            if (v->t.tok == '=') {
+                PVScope body_scope;
+                saved_scope = v->scope;
+                if (pv_class_init_ctx(v, &fn1, FALSE) < 0)
+                    goto fail;
+                v->fn = &fn1;
+                body_scope.parent = NULL;
+                body_scope.ref_pos = v->ref_count;
+                body_scope.frame = fn1.var_frame;
+                body_scope.enter_seq = ++v->seq;
+                v->scope = &body_scope;
+                if (pv_next(v) < 0 || pv_assign(v, PV_IN, NULL) < 0) {
+                    v->fn = fn;
+                    v->scope = saved_scope;
+                    goto fail;
+                }
+                /* the next token was read in the initializer: not
+                   read again */
+                v->fn = fn;
+                v->scope = saved_scope;
+                if (pp_close_frame(v) < 0)
+                    goto fail;
+            }
+            if (pv_semi(v) < 0)
+                goto fail;
+        } else {
+            int func_type = PVF_METHOD, func_kind = JS_FUNC_NORMAL;
+            if (prop_type == PVP_STAR) {
+                func_kind = JS_FUNC_GENERATOR;
+            } else if (prop_type == PVP_ASYNC) {
+                func_kind = JS_FUNC_ASYNC;
+            } else if (prop_type == PVP_ASYNC_STAR) {
+                func_kind = JS_FUNC_ASYNC_GENERATOR;
+            } else if (name == PVN_CONSTRUCTOR && !is_static) {
+                if (has_ctor)
+                    goto bail;
+                has_ctor = TRUE;
+                func_type = derived ? PVF_DERIVED_CTOR : PVF_CTOR;
+            }
+            if (pv_function(v, func_type, func_kind, FALSE) < 0)
+                goto fail;
+        }
+    }
+    /* '}': read still in strict mode */
+    if (pv_next(v) < 0)
+        goto fail;
+    fn->strict = saved_strict;
+    if (pp_close_frame(v) < 0)
+        goto fail2;
+    if (!is_expr) {
+        if (pv_declare(v, class_name, PVD_LEX) < 0)
+            goto fail2;
+    }
+    JS_FreeAtom(v->ctx, class_name);
+    return 0;
+ bail:
+    v->bail_line = __LINE__;
+    pv_fail(v, PP_BAIL);
+ fail:
+    fn->strict = saved_strict;
+ fail2:
+    JS_FreeAtom(v->ctx, class_name);
+    return -1;
+}
+
+/* ------------------------------------------------------------ statements */
+
+/* is_let(): *ptok is TOK_LET if the current token is TOK_LET or a 'let'
+   (an identifier in sloppy code) that starts a declaration, else the
+   current token */
+static int pv_let(JSPreparse *v, int decl_mask, int *ptok)
+{
+    PVToken t;
+
+    *ptok = v->t.tok;
+    if (!(v->t.tok == TOK_IDENT && v->t.atom == JS_ATOM_let))
+        return 0;
+    if (pv_lex(v, v->t.end, &t, PVL_LOOK) < 0)
+        return -1;
+    if (t.tok == '[' ||
+        ((t.tok == '{' || t.tok == TOK_IDENT || t.tok == TOK_LET ||
+          t.tok == TOK_YIELD || t.tok == TOK_AWAIT) &&
+         (!t.nl || (decl_mask & PV_DECL_OTHER))))
+        *ptok = TOK_LET;
+    JS_FreeAtom(v->ctx, t.atom);
+    return 0;
+}
+
+/* js_parse_var() */
+static int pv_var(JSPreparse *v, int flags, int tok)
+{
+    int kind = (tok == TOK_VAR) ? PVD_VAR : PVD_LEX, bits, tok1;
+    for (;;) {
+        if (v->t.tok == TOK_IDENT) {
+            PV_TRY(pv_declare(v, v->t.atom, kind));
+            PV_TRY(pv_next(v));
+            if (v->t.tok == '=') {
+                PV_TRY(pv_next(v));
+                PP_CODE(v, PP_NAME_BYTES);
+                PV_TRY(pv_assign(v, flags, NULL));
+            } else if (tok == TOK_CONST) {
+                PV_BAIL(v);
+            }
+        } else if (v->t.tok == '[' || v->t.tok == '{') {
+            tok1 = pv_skip_parens(v, &bits, FALSE);
+            if (tok1 != '=')
+                PV_BAIL(v);
+            PV_TRY(pv_pattern(v, kind, FALSE, TRUE, bits & PV_SKIP_ELLIPSIS,
+                              TRUE));
+        } else {
+            PV_BAIL(v);
+        }
+        if (v->t.tok != ',')
+            break;
+        PV_TRY(pv_next(v));
+    }
+    return 0;
+}
+
+/* js_parse_for_in_of() from after the '(' */
+static int pv_for_in_of(JSPreparse *v, JSAtom label, BOOL is_async)
+{
+    PVScope sc;
+    int tok = v->t.tok, bits, tok1, info;
+    BOOL is_of;
+
+    PV_ENTER_SCOPE(v, &sc);
+    PV_TRY(pv_push_label(v, label, 1, 1, 0));
+    PV_TRY(pv_let(v, PV_DECL_OTHER, &tok));
+    if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST) {
+        int kind = (tok == TOK_VAR) ? PVD_VAR : PVD_LEX;
+        PV_TRY(pv_next(v));
+        if (v->t.tok == TOK_IDENT) {
+            PV_TRY(pv_declare(v, v->t.atom, kind));
+            PV_TRY(pv_next(v));
+        } else if (v->t.tok == '[' || v->t.tok == '{') {
+            PV_TRY(pv_pattern(v, kind, FALSE, TRUE, -1, FALSE));
+        } else {
+            PV_BAIL(v);
+        }
+    } else if (pv_is(v, JS_ATOM_async)) {
+        PV_BAIL(v);
+    } else {
+        if ((v->t.tok == '[' || v->t.tok == '{') &&
+            ((tok1 = pv_skip_parens(v, &bits, FALSE)) == TOK_IN ||
+             tok1 == TOK_OF)) {
+            PV_TRY(pv_pattern(v, 0, FALSE, TRUE, bits & PV_SKIP_ELLIPSIS,
+                              TRUE));
+        } else {
+            if (v->t.tok == '[' || v->t.tok == '{') {
+                if (tok1 == PV_SKIP_FAILED)
+                    PV_BAIL(v);
+            }
+            PV_TRY(pv_postfix(v, PV_CALL, &info));
+            PV_TRY(pv_lvalue(v, info));
+        }
+    }
+    if (v->t.tok == '=')
+        PV_BAIL(v); /* initializers in for-in heads */
+    if (pv_is(v, JS_ATOM_of)) {
+        is_of = TRUE;
+    } else if (v->t.tok == TOK_IN) {
+        if (is_async)
+            PV_BAIL(v);
+        is_of = FALSE;
+    } else {
+        PV_BAIL(v);
+    }
+    PV_TRY(pv_next(v));
+    if (is_of)
+        PV_TRY(pv_assign(v, PV_IN, NULL));
+    else
+        PV_TRY(pv_expr(v, PV_IN, NULL));
+    PV_TRY(pv_expect(v, ')'));
+    PV_TRY(pv_statement(v, 0));
+    v->label_count--;
+    return pv_leave_scope(v, &sc);
+}
+
+static int pv_block(JSPreparse *v)
+{
+    PVScope sc;
+    PV_TRY(pv_expect(v, '{'));
+    PV_ENTER_SCOPE(v, &sc);
+    while (v->t.tok != '}') {
+        if (v->t.tok == TOK_EOF)
+            PV_BAIL(v);
+        PV_TRY(pv_statement(v, PV_DECL_ALL));
+    }
+    PV_TRY(pv_leave_scope(v, &sc));
+    return pv_next(v);
+}
+
+static int pv_statement1(JSPreparse *v, int decl_mask, JSAtom label);
+
+/* js_parse_statement_or_decl() */
+static int pv_statement(JSPreparse *v, int decl_mask)
+{
+    PVCtx *fn = v->fn;
+    JSAtom label;
+    uint32_t i;
+    int ret;
+
+    if (js_check_stack_overflow(v->ctx->rt, 0))
+        PV_BAIL(v);
+    if (!(v->t.tok == TOK_IDENT && pv_peek(v, FALSE) == ':'))
+        return pv_statement1(v, decl_mask, JS_ATOM_NULL);
+    label = v->t.atom;
+    if (pv_special_name(label))
+        PV_BAIL(v);
+    for (i = fn->label_base; i < v->label_count; i++) {
+        if (v->labels[i].name == label)
+            PV_BAIL(v);
+    }
+    label = JS_DupAtom(v->ctx, label);
+    if (pv_next(v) < 0 || pv_expect(v, ':') < 0) {
+        ret = -1;
+    } else if (v->t.tok != TOK_FOR && v->t.tok != TOK_DO &&
+               v->t.tok != TOK_WHILE) {
+        ret = pv_push_label(v, label, 1, 0, 1);
+        if (ret == 0) {
+            ret = pv_statement(v, 0);
+            v->label_count--;
+        }
+    } else {
+        ret = pv_statement1(v, decl_mask, label);
+    }
+    JS_FreeAtom(v->ctx, label);
+    return ret;
+}
+
+static int pv_statement1(JSPreparse *v, int decl_mask, JSAtom label)
+{
+    PVCtx *fn = v->fn;
+    int tok, bits, info;
+
+    switch (tok = v->t.tok) {
+    case '{':
+        return pv_block(v);
+    case TOK_RETURN:
+        if (fn->is_static_init)
+            PV_BAIL(v);
+        PP_CODE(v, 1);
+        PV_TRY(pv_next(v));
+        if (v->t.tok != ';' && v->t.tok != '}' && !v->t.nl)
+            PV_TRY(pv_expr(v, PV_IN, NULL));
+        return pv_semi(v);
+    case TOK_THROW:
+        PP_CODE(v, 1);
+        PV_TRY(pv_next(v));
+        if (v->t.nl)
+            PV_BAIL(v);
+        PV_TRY(pv_expr(v, PV_IN, NULL));
+        return pv_semi(v);
+    case TOK_LET:
+    case TOK_CONST:
+        if (!(decl_mask & PV_DECL_OTHER))
+            PV_BAIL(v);
+        /* fall through */
+    case TOK_VAR:
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_var(v, PV_IN, tok));
+        return pv_semi(v);
+    case TOK_IF:
+        PP_CODE(v, 5);
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_paren(v, NULL));
+        PV_TRY(pv_statement(v, 0));
+        if (v->t.tok == TOK_ELSE) {
+            PP_CODE(v, 5);
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_statement(v, 0));
+        }
+        return 0;
+    case TOK_WHILE:
+        PP_CODE(v, 5);
+        PV_TRY(pv_push_label(v, label, 1, 1, 0));
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_paren(v, NULL));
+        PV_TRY(pv_statement(v, 0));
+        v->label_count--;
+        return 0;
+    case TOK_DO:
+        PP_CODE(v, 5);
+        PV_TRY(pv_push_label(v, label, 1, 1, 0));
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_statement(v, 0));
+        if (v->t.tok != TOK_WHILE)
+            PV_BAIL(v);
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_paren(v, NULL));
+        if (v->t.tok == ';')
+            PV_TRY(pv_next(v));
+        v->label_count--;
+        return 0;
+    case TOK_FOR:
+        {
+            BOOL is_async = FALSE;
+            PVScope sc;
+            PP_CODE(v, 5);
+            PV_TRY(pv_next(v));
+            bits = 0;
+            if (v->t.tok == '(') {
+                if (pv_skip_parens(v, &bits, FALSE) == PV_SKIP_FAILED)
+                    PV_BAIL(v);
+            } else if (v->t.tok == TOK_AWAIT) {
+                if (!fn->is_async)
+                    PV_BAIL(v);
+                is_async = TRUE;
+                PV_TRY(pv_next(v));
+            }
+            PV_TRY(pv_expect(v, '('));
+            if (!(bits & PV_SKIP_SEMI))
+                return pv_for_in_of(v, label, is_async);
+            PV_ENTER_SCOPE(v, &sc);
+            PV_TRY(pv_let(v, PV_DECL_OTHER, &tok));
+            if (tok != ';') {
+                if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST) {
+                    PV_TRY(pv_next(v));
+                    PV_TRY(pv_var(v, 0, tok));
+                } else {
+                    PV_TRY(pv_expr(v, 0, NULL));
+                }
+            }
+            PV_TRY(pv_expect(v, ';'));
+            PV_TRY(pv_push_label(v, label, 1, 1, 0));
+            if (v->t.tok != ';')
+                PV_TRY(pv_expr(v, PV_IN, NULL));
+            PV_TRY(pv_expect(v, ';'));
+            if (v->t.tok != ')')
+                PV_TRY(pv_expr(v, PV_IN, NULL));
+            PV_TRY(pv_expect(v, ')'));
+            PV_TRY(pv_statement(v, 0));
+            v->label_count--;
+            return pv_leave_scope(v, &sc);
+        }
+    case TOK_BREAK:
+    case TOK_CONTINUE:
+        {
+            JSAtom name = JS_ATOM_NULL;
+            PP_CODE(v, 5);
+            PV_TRY(pv_next(v));
+            if (!v->t.nl && v->t.tok == TOK_IDENT)
+                name = v->t.atom;
+            PV_TRY(pv_break_target(v, name, tok == TOK_CONTINUE));
+            if (name != JS_ATOM_NULL)
+                PV_TRY(pv_next(v));
+            return pv_semi(v);
+        }
+    case TOK_SWITCH:
+        {
+            PVScope sc;
+            BOOL has_default = FALSE, has_case = FALSE;
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_paren(v, NULL));
+            PV_ENTER_SCOPE(v, &sc);
+            PV_TRY(pv_push_label(v, label, 1, 0, 0));
+            PV_TRY(pv_expect(v, '{'));
+            while (v->t.tok != '}') {
+                if (v->t.tok == TOK_CASE) {
+                    for (;;) {
+                        PP_CODE(v, 5);
+                        PV_TRY(pv_next(v));
+                        PV_TRY(pv_expr(v, PV_IN, NULL));
+                        PV_TRY(pv_expect(v, ':'));
+                        if (v->t.tok != TOK_CASE)
+                            break;
+                    }
+                    has_case = TRUE;
+                } else if (v->t.tok == TOK_DEFAULT) {
+                    PV_TRY(pv_next(v));
+                    PV_TRY(pv_expect(v, ':'));
+                    if (has_default)
+                        PV_BAIL(v);
+                    has_default = has_case = TRUE;
+                } else {
+                    if (!has_case || v->t.tok == TOK_EOF)
+                        PV_BAIL(v);
+                    PV_TRY(pv_statement(v, PV_DECL_ALL));
+                }
+            }
+            PV_TRY(pv_next(v));
+            v->label_count--;
+            return pv_leave_scope(v, &sc);
+        }
+    case TOK_TRY:
+        PP_CODE(v, 5);
+        PV_TRY(pv_next(v));
+        PV_TRY(pv_block(v));
+        if (v->t.tok == TOK_CATCH) {
+            PVScope sc;
+            PV_TRY(pv_next(v));
+            PV_ENTER_SCOPE(v, &sc);
+            if (v->t.tok != '{') {
+                PV_TRY(pv_expect(v, '('));
+                if (v->t.tok == TOK_IDENT) {
+                    PV_TRY(pv_declare(v, v->t.atom, PVD_LEX));
+                    PV_TRY(pv_next(v));
+                } else if (v->t.tok == '[' || v->t.tok == '{') {
+                    PV_TRY(pv_pattern(v, PVD_LEX, FALSE, TRUE, -1, TRUE));
+                } else {
+                    PV_BAIL(v);
+                }
+                PV_TRY(pv_expect(v, ')'));
+            }
+            /* the catch block shares the scope of its parameter: a
+               lexical redeclaration of it is an error */
+            PV_TRY(pv_expect(v, '{'));
+            while (v->t.tok != '}') {
+                if (v->t.tok == TOK_EOF)
+                    PV_BAIL(v);
+                PV_TRY(pv_statement(v, PV_DECL_ALL));
+            }
+            PV_TRY(pv_leave_scope(v, &sc));
+            PV_TRY(pv_next(v));
+        } else if (v->t.tok != TOK_FINALLY) {
+            PV_BAIL(v);
+        }
+        if (v->t.tok == TOK_FINALLY) {
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_block(v));
+        }
+        return 0;
+    case ';':
+        return pv_next(v);
+    case TOK_FUNCTION:
+        if (!(decl_mask & PV_DECL_FUNC))
+            PV_BAIL(v);
+        /* a declaration in a block: lexical in strict code (sloppy
+           Annex B semantics are left to the parser) */
+        if (v->scope->parent) {
+            if (!fn->strict)
+                PV_BAIL(v);
+            return pv_function(v, PVF_STATEMENT, JS_FUNC_NORMAL, TRUE);
+        }
+        return pv_function(v, PVF_VAR, JS_FUNC_NORMAL, TRUE);
+    case TOK_IDENT:
+        PV_TRY(pv_let(v, decl_mask, &tok));
+        if (tok == TOK_LET) {
+            if (!(decl_mask & PV_DECL_OTHER))
+                PV_BAIL(v);
+            PV_TRY(pv_next(v));
+            PV_TRY(pv_var(v, PV_IN, tok));
+            return pv_semi(v);
+        }
+        if (pv_is(v, JS_ATOM_async) && pv_peek(v, TRUE) == TOK_FUNCTION) {
+            if (!(decl_mask & PV_DECL_OTHER))
+                PV_BAIL(v);
+            if (v->scope->parent) {
+                if (!fn->strict)
+                    PV_BAIL(v);
+                return pv_function(v, PVF_STATEMENT, JS_FUNC_NORMAL, TRUE);
+            }
+            return pv_function(v, PVF_VAR, JS_FUNC_NORMAL, TRUE);
+        }
+        goto hasexpr;
+    case TOK_CLASS:
+        if (!(decl_mask & PV_DECL_OTHER))
+            PV_BAIL(v);
+        return pv_class(v, FALSE);
+    case TOK_DEBUGGER:
+        PV_TRY(pv_next(v));
+        return pv_semi(v);
+    case TOK_WITH:
+    case TOK_ENUM:
+    case TOK_EXPORT:
+    case TOK_EXTENDS:
+        PV_BAIL(v);
+    default:
+    hasexpr:
+        v->stmt_start = TRUE;
+        PV_TRY(pv_expr(v, PV_IN, &info));
+        PP_CODE(v, 1);
+        return pv_semi(v);
+    }
+}
+
+/* Validate the body that starts at the current token, up to its closing
+   '}' (*pclose), in the function 'fd' being parsed. */
+static int pv_function_body(JSPreparse *v, JSFunctionDef *fd,
+                            const uint8_t **pclose)
+{
+    PVCtx fn1, *fn = &fn1;
+    PVScope body_scope;
+    int i, f;
+
+    memset(fn, 0, sizeof(*fn));
+    fn->serial = ++v->serial_next;
+    fn->strict = (fd->js_mode & JS_MODE_STRICT) != 0;
+    fn->is_async = (fd->func_kind & JS_FUNC_ASYNC) != 0;
+    fn->is_gen = (fd->func_kind & JS_FUNC_GENERATOR) != 0;
+    fn->is_arrow = (fd->func_type == JS_PARSE_FUNC_ARROW);
+    fn->in_body = TRUE;
+    fn->new_target_allowed = fd->new_target_allowed;
+    fn->super_call_allowed = fd->super_call_allowed;
+    fn->super_allowed = fd->super_allowed;
+    fn->arguments_allowed = fd->arguments_allowed;
+    f = pp_push_frame(v, PPF_ROOT, 0);
+    if (f < 0)
+        return -1;
+    fn->param_frame = fn->var_frame = f;
+    v->fn = fn;
+    body_scope.parent = NULL;
+    body_scope.ref_pos = 0;
+    body_scope.frame = f;
+    body_scope.enter_seq = ++v->seq;
+    v->scope = &body_scope;
+    /* its parameters and the names they bind, which the body may not
+       declare again */
+    for (i = 0; i < fd->arg_count; i++) {
+        if (fd->args[i].var_name != JS_ATOM_NULL) {
+            PVConf *e = pv_conf_add(v, fd->args[i].var_name, fn->serial);
+            if (!e)
+                return -1;
+            e->flags = PVC_PARAM;
+        }
+    }
+    for (i = 0; i < fd->var_count; i++) {
+        PVConf *e = pv_conf_add(v, fd->vars[i].var_name, fn->serial);
+        if (!e)
+            return -1;
+        e->flags = PVC_PARAM;
+    }
+    PV_TRY(pv_lex(v, v->s->token.ptr, &v->t, PVL_CLASSIFY));
+    v->t.nl = v->s->got_lf;
+    PV_TRY(pv_body_statements(v));
+    *pclose = v->t.ptr;
+    return 0;
+}
+
+/* Try to skip the body of the lazy function candidate 'fd' (the current
+   token is its first token). Returns 1 if skipped (the current token is
+   then its closing '}'), 0 to parse it, -1 on error. */
+static no_inline int js_preparse_function_body(JSParseState *s,
+                                               JSFunctionDef *fd,
+                                               const uint8_t *func_start)
+{
+    JSContext *ctx = s->ctx;
+    JSRuntime *rt = ctx->rt;
+    JSPreparse pp1, *pp = &pp1;
+    const uint8_t *close = NULL;
+    JSFunctionDef *parent;
+    uint32_t span, i, threshold;
+    int ret, result;
+
+    /* not the function a first-call compile is compiling */
+    if (!rt->lazy_preparse || rt->preparse_suspended || s->preparse_off ||
+        !fd->lazy_ok ||
+        !fd->parent || fd->parent->is_lazy_env || fd->strip_debug ||
+        s->token.val == '}')
+        return 0;
+    threshold = fd->parent->lazy_threshold;
+    if (threshold == 0 || (size_t)(s->buf_end - func_start) < threshold)
+        return 0;
+    /* Under JS_STRIP_SOURCE, whether an enclosing function is kept lazy
+       depends on the size of its bytecode, which includes the bytecode of
+       the functions nested in it: while inside a function that may be kept
+       lazy, parse them too, or skipping them would make it smaller. (The
+       function a first-call compile is compiling is never kept lazy.) */
+    if (fd->strip_source) {
+        for (parent = fd->parent; parent->parent && !parent->parent->is_lazy_env;
+             parent = parent->parent) {
+            if (parent->lazy_ok)
+                return 0;
+        }
+    }
+    if (!js_lazy_function_scope_is_static(fd->parent, fd->parent_scope_level))
+        return 0;
+    /* the parser reports a stack overflow itself */
+    if (js_check_stack_overflow(rt, sizeof(JSPreparse)))
+        return 0;
+    memset(pp, 0, offsetof(JSPreparse, fr_inline));
+    pp->s = s;
+    pp->ctx = ctx;
+    pp->end = s->buf_end;
+    pp->html_comments = s->allow_html_comments;
+    pp->is_module = s->is_module;
+    pp->fr = pp->fr_inline;
+    pp->fr_size = PP_INLINE_FRAMES;
+    pp->refs = pp->refs_inline;
+    pp->ref_size = PP_INLINE_REFS;
+    pp->decls = pp->decls_inline;
+    pp->decl_size = PP_INLINE_DECLS;
+    pp->hash = pp->hash_inline;
+    pp->hash_size = PP_INLINE_HASH;
+    memset(pp->hash_inline, 0, sizeof(pp->hash_inline));
+    pp->labels = pp->labels_inline;
+    pp->label_size = PV_INLINE_LABELS;
+    pp->conf = pp->conf_inline;
+    pp->conf_size = PV_INLINE_CONF;
+    memset(pp->conf_inline, 0, sizeof(pp->conf_inline));
+
+    ret = PP_DONE;
+    if (pv_function_body(pp, fd, &close) < 0) {
+        /* (every failure sets a status: never accept after one) */
+        ret = pp->status != PP_DONE ? pp->status : PP_BAIL;
+    }
+    if (ret == PP_DONE) {
+        /* what js_lazy_function_eligible() requires of the parsed body */
+        span = close + 1 - func_start;
+        if (span < threshold || span > JS_STRING_LEN_MAX ||
+            (fd->strip_source && span > fd->byte_code.size + pp->code_bytes))
+            ret = PP_BAIL;
+    }
+    if (ret == PP_DONE) {
+        /* the root: its names */
+        ret = (pp->frame_count == 1 && pp_close_frame(pp) == 0) ? PP_DONE :
+            (pp->status ? pp->status : PP_BAIL);
+    }
+    if (ret == PP_DONE) {
+        fd->preparse_names_pos = fd->byte_code.size;
+        for (i = 0; i < pp->ref_count; i++) {
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, pp->refs[i]);
+            emit_u16(s, fd->scope_level);
+        }
+        free_token(s, &s->token);
+        s->token.val = '}';
+        s->token.ptr = close;
+        s->buf_ptr = close + 1;
+        s->got_lf = FALSE;
+        fd->preparsed = TRUE;
+        s->preparse_skipped = TRUE;
+        result = 1;
+    } else if (ret == PP_BAIL) {
+        rt->lazy_stats.preparse_fallbacks++;
+        result = 0;
+    } else {
+        result = -1;
+    }
+
+    JS_FreeAtom(ctx, pp->t.atom);
+    for (i = 0; i < pp->ref_count; i++)
+        JS_FreeAtom(ctx, pp->refs[i]);
+    for (i = 0; i < pp->decl_count; i++)
+        JS_FreeAtom(ctx, pp->decls[i]);
+    if (pp->refs != pp->refs_inline)
+        js_free(ctx, pp->refs);
+    if (pp->decls != pp->decls_inline)
+        js_free(ctx, pp->decls);
+    if (pp->fr != pp->fr_inline)
+        js_free(ctx, pp->fr);
+    if (pp->hash != pp->hash_inline)
+        js_free(ctx, pp->hash);
+    if (pp->labels != pp->labels_inline)
+        js_free(ctx, pp->labels);
+    if (pp->conf != pp->conf_inline)
+        js_free(ctx, pp->conf);
+    return result;
+}
+
 /* func_name must be JS_ATOM_NULL for JS_PARSE_FUNC_STATEMENT and
    JS_PARSE_FUNC_EXPR, JS_PARSE_FUNC_ARROW and JS_PARSE_FUNC_VAR */
 static __exception int js_parse_function_decl2(JSParseState *s,
@@ -37789,13 +42409,21 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     int func_idx, lexical_func_idx = -1;
     BOOL has_opt_arg;
     BOOL create_func_var = FALSE;
+    /* compiling the body of a lazy function: the parse starts at its
+       parameter list, and nothing is declared in the (synthetic) parent */
+    BOOL lazy_entry = s->lazy_entry;
+    const uint8_t *param_ptr;
+    uint8_t parent_js_mode, parent_func_kind;
+    BOOL parent_static_init;
 
+    s->lazy_entry = FALSE;
     is_expr = (func_type != JS_PARSE_FUNC_STATEMENT &&
                func_type != JS_PARSE_FUNC_VAR);
 
-    if (func_type == JS_PARSE_FUNC_STATEMENT ||
-        func_type == JS_PARSE_FUNC_VAR ||
-        func_type == JS_PARSE_FUNC_EXPR) {
+    if (!lazy_entry &&
+        (func_type == JS_PARSE_FUNC_STATEMENT ||
+         func_type == JS_PARSE_FUNC_VAR ||
+         func_type == JS_PARSE_FUNC_EXPR)) {
         if (func_kind == JS_FUNC_NORMAL &&
             token_is_pseudo_keyword(s, JS_ATOM_async) &&
             peek_token(s, TRUE) != '\n') {
@@ -37842,7 +42470,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         func_name = JS_DupAtom(ctx, func_name);
     }
 
-    if (fd->is_eval && fd->eval_type == JS_EVAL_TYPE_MODULE &&
+    if (!lazy_entry &&
+        fd->is_eval && fd->eval_type == JS_EVAL_TYPE_MODULE &&
         (func_type == JS_PARSE_FUNC_STATEMENT || func_type == JS_PARSE_FUNC_VAR)) {
         JSGlobalVar *hf;
         hf = find_global_var(fd, func_name);
@@ -37854,7 +42483,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
     }
 
-    if (func_type == JS_PARSE_FUNC_VAR) {
+    if (!lazy_entry && func_type == JS_PARSE_FUNC_VAR) {
         if (!(fd->js_mode & JS_MODE_STRICT)
         && func_kind == JS_FUNC_NORMAL
         &&  find_lexical_decl(ctx, fd, func_name, fd->scope_first, FALSE) < 0
@@ -37893,6 +42522,12 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
     }
 
+    /* what a lazy compile of this function must reproduce */
+    param_ptr = s->token.ptr;
+    parent_js_mode = fd->js_mode;
+    parent_func_kind = fd->func_kind;
+    parent_static_init = (fd->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT);
+
     fd = js_new_function_def(ctx, fd, FALSE, is_expr,
                              s->filename, ptr,
                              &s->get_line_col_cache);
@@ -37904,6 +42539,19 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         *pfd = fd;
     s->cur_func = fd;
     fd->func_name = func_name;
+    /* class constructors, field initializers and static blocks are compiled
+       with their class; everything else can be compiled on its own */
+    fd->lazy_ok = (func_type <= JS_PARSE_FUNC_METHOD && param_ptr >= ptr);
+    fd->lazy_param_offset = param_ptr - ptr;
+    fd->lazy_parent_js_mode = parent_js_mode;
+    fd->lazy_parent_func_kind = parent_func_kind;
+    fd->lazy_parent_static_init = parent_static_init;
+    fd->lazy_is_module = s->is_module;
+    fd->lazy_span_start = ptr - s->buf_start;
+    if (lazy_entry) {
+        /* the text is the lazy function's own; do not copy it again */
+        fd->strip_source = (lazy_entry != 0);
+    }
     /* XXX: test !fd->is_generator is always false */
     fd->has_prototype = (func_type == JS_PARSE_FUNC_STATEMENT ||
                          func_type == JS_PARSE_FUNC_VAR ||
@@ -38178,6 +42826,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             else
                 emit_op(s, OP_return);
 
+            fd->lazy_span_len = s->last_ptr - ptr;
             if (!fd->strip_source) {
                 /* save the function source code */
                 /* the end of the function source code is after the last
@@ -38204,10 +42853,14 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (js_parse_function_check_names(s, fd, func_name))
         goto fail;
 
+    /* a body that will be kept lazy is scanned, not parsed */
+    if (js_preparse_function_body(s, fd, ptr) < 0)
+        goto fail;
     while (s->token.val != '}') {
         if (js_parse_source_element(s))
             goto fail;
     }
+    fd->lazy_span_len = s->buf_ptr - ptr;
     if (!fd->strip_source) {
         /* save the function source code */
         fd->source_len = s->buf_ptr - ptr;
@@ -38234,6 +42887,9 @@ static __exception int js_parse_function_decl2(JSParseState *s,
        by just using next_token() here for normal functions, but it is
        necessary for arrow functions with an expression body. */
     reparse_ident_token(s);
+
+    if (lazy_entry)
+        return 0; /* the caller creates the function object */
 
     /* create the function object */
     {
@@ -38420,6 +43076,7 @@ static void js_parse_init(JSContext *ctx, JSParseState *s,
     s->token.val = ' ';
     s->token.ptr = s->buf_ptr;
 
+    s->get_line_col_cache.first_col = first_line_column;
     s->get_line_col_cache.ptr = s->buf_start;
     s->get_line_col_cache.buf_start = s->buf_start;
     s->get_line_col_cache.line_num = 0;
@@ -38466,6 +43123,312 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 {
     return JS_EvalFunctionInternal(ctx, fun_obj, js_global_this(ctx), NULL, NULL);
 }
+
+/* Move the body compiled for the lazy function 'b' into it, in one
+   allocation that starts at its bytecode. 'nb' has the same closure
+   variables, name, realm and debug identity, which stay the stub's; the rest
+   of it is released. Returns -1 (and leaves both unchanged) if the body
+   cannot be allocated. */
+static int js_lazy_function_adopt_body(JSContext *ctx, JSFunctionBytecode *b,
+                                       JSFunctionBytecode *nb)
+{
+    JSRuntime *rt = ctx->rt;
+    size_t code_size, cpool_size, vardefs_size;
+    uint8_t *body;
+    int i;
+
+    code_size = ((size_t)nb->byte_code_len + 7) & ~(size_t)7;
+    cpool_size = (size_t)nb->cpool_count * sizeof(*nb->cpool);
+    vardefs_size = (size_t)(nb->arg_count + nb->var_count) * sizeof(*nb->vardefs);
+    body = js_malloc(ctx, code_size + cpool_size + vardefs_size);
+    if (!body)
+        return -1;
+    memcpy(body, nb->byte_code_buf, nb->byte_code_len);
+    if (cpool_size)
+        memcpy(body + code_size, nb->cpool, cpool_size);
+    if (vardefs_size)
+        memcpy(body + code_size + cpool_size, nb->vardefs, vardefs_size);
+
+    js_free_lazy_function(rt, js_lazy_function_of(b));
+    b->is_lazy = 0;
+    b->has_lazy_body = 1;
+    b->byte_code_buf = body;
+    b->byte_code_len = nb->byte_code_len;
+    b->cpool = cpool_size ? (JSValue *)(body + code_size) : NULL;
+    b->cpool_count = nb->cpool_count;
+    b->vardefs = vardefs_size ?
+        (JSBytecodeVarDef *)(body + code_size + cpool_size) : NULL;
+    b->arg_count = nb->arg_count;
+    b->var_count = nb->var_count;
+    b->stack_size = nb->stack_size;
+    b->var_ref_count = nb->var_ref_count;
+    b->has_simple_parameter_list = nb->has_simple_parameter_list;
+    if (nb->has_debug) {
+        js_free_rt(rt, b->debug.pc2line_buf);
+        b->debug.pc2line_buf = nb->debug.pc2line_buf;
+        b->debug.pc2line_len = nb->debug.pc2line_len;
+        JS_FreeAtomRT(rt, nb->debug.filename);
+        js_free_function_source(rt, nb->debug.source, nb->debug.source_owner);
+    }
+    /* the bytecode atoms, constants and variable names now belong to 'b' */
+    for(i = 0; i < nb->closure_var_count; i++)
+        JS_FreeAtomRT(rt, nb->closure_var[i].var_name);
+    JS_FreeAtomRT(rt, nb->func_name);
+    JS_FreeContext(nb->realm);
+    remove_gc_object(&nb->header);
+    js_free_rt(rt, nb);
+    return 0;
+}
+
+static BOOL js_lazy_function_body_matches(const JSFunctionBytecode *b,
+                                          const JSFunctionBytecode *nb)
+{
+    int i;
+
+    if (nb->closure_var_count != b->closure_var_count ||
+        nb->func_kind != b->func_kind ||
+        nb->defined_arg_count != b->defined_arg_count ||
+        nb->has_prototype != b->has_prototype ||
+        nb->js_mode != b->js_mode)
+        return FALSE;
+    for(i = 0; i < b->closure_var_count; i++) {
+        if (nb->closure_var[i].var_name != b->closure_var[i].var_name)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* Compile the body of the lazy function 'b' (see js_create_lazy_function()).
+   Returns -1 with an exception if it cannot; the function stays lazy.
+   *pskipped tells whether the bodies of functions nested in it were
+   skipped (see js_preparse_function_body()). */
+static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *b,
+                                     BOOL preparse_off, BOOL *pskipped)
+{
+    JSContext *ctx = b->realm;
+    JSRuntime *rt = ctx->rt;
+    JSLazyFunction *lz = js_lazy_function_of(b);
+    JSParseState s1, *s = &s1;
+    JSFunctionDef *env = NULL, *fd = NULL;
+    JSFunctionSource *owner = NULL;
+    JSValue func_obj;
+    const char *text, *filename = NULL;
+    char *buf = NULL;
+    uint32_t text_len, v;
+    const uint8_t *p, *p_end;
+    int line_num = 0, col_num = 0, i, ret, parsed = FALSE;
+    uint8_t saved_strip = rt->strip_flags;
+    uint32_t saved_threshold = rt->lazy_function_threshold;
+    JSParseFunctionEnum func_type = lz->func_type;
+
+    if (lz->source) {
+        text = lz->source;
+        text_len = lz->source_len;
+    } else {
+        /* adopt the text before sharing it with the nested functions:
+           adoption may move it */
+        if (!b->debug.source_owner && b->debug.source)
+            b->debug.source_owner = js_adopt_function_source(ctx,
+                &b->debug.source, b->debug.source_len);
+        owner = b->debug.source_owner;
+        text = b->debug.source;
+        text_len = b->debug.source_len;
+    }
+    if (!text || lz->param_offset > text_len || !b->has_debug ||
+        !b->debug.pc2line_buf) {
+        JS_ThrowInternalError(ctx, "lazy function has no source");
+        goto fail;
+    }
+    p = b->debug.pc2line_buf;
+    p_end = p + b->debug.pc2line_len;
+    ret = get_leb128(&v, p, p_end);
+    if (ret > 0) {
+        line_num = v;
+        p += ret;
+        ret = get_leb128(&v, p, p_end);
+        col_num = v;
+    }
+    if (ret <= 0) {
+        JS_ThrowInternalError(ctx, "lazy function has no position");
+        goto fail;
+    }
+
+    /* the parser needs a terminated buffer */
+    buf = js_malloc(ctx, (size_t)text_len + 1);
+    if (!buf)
+        goto fail;
+    memcpy(buf, text, text_len);
+    buf[text_len] = '\0';
+    filename = JS_AtomToCString(ctx, b->debug.filename);
+    if (!filename)
+        goto fail;
+
+    /* inner functions follow the policies the enclosing script had */
+    rt->strip_flags = lz->strip_source ? JS_STRIP_SOURCE : 0;
+    rt->lazy_function_threshold = lz->nested_threshold;
+
+    js_parse_init(ctx, s, buf, text_len, filename, col_num);
+    s->preparse_off = preparse_off;
+    parsed = TRUE;
+    s->get_line_col_cache.line_num = line_num;
+    s->is_module = lz->is_module;
+    s->allow_html_comments = !s->is_module;
+
+    env = js_new_function_def(ctx, NULL, TRUE, FALSE, filename,
+                              s->buf_start, &s->get_line_col_cache);
+    if (!env)
+        goto fail;
+    env->is_lazy_env = TRUE;
+    env->eval_type = JS_EVAL_TYPE_GLOBAL;
+    env->js_mode = lz->parent_js_mode;
+    env->func_kind = lz->parent_func_kind;
+    env->func_type = lz->parent_static_init ? JS_PARSE_FUNC_CLASS_STATIC_INIT :
+        JS_PARSE_FUNC_EXPR;
+    env->in_function_body = TRUE;
+    /* inherited by arrow functions, which have the parent's values */
+    env->new_target_allowed = b->new_target_allowed;
+    env->super_call_allowed = b->super_call_allowed;
+    env->super_allowed = b->super_allowed;
+    env->arguments_allowed = b->arguments_allowed;
+    for(i = 0; i < b->closure_var_count; i++) {
+        JSClosureVar *cv = &b->closure_var[i];
+        if (add_closure_var(ctx, env, cv->closure_type, i, cv->var_name,
+                            cv->is_const, cv->is_lexical, cv->var_kind) < 0)
+            goto fail;
+    }
+
+    s->cur_func = env;
+    s->buf_ptr = s->buf_start + lz->param_offset;
+    if (next_token(s))
+        goto fail;
+    /* 'lz' is not used past this point: the parser polls the interrupt
+       handler, and anything that handler runs could compile 'b' first */
+    lz = NULL;
+    s->lazy_entry = TRUE;
+    if (js_parse_function_decl2(s, func_type, b->func_kind,
+                                func_type == JS_PARSE_FUNC_ARROW ?
+                                JS_ATOM_NULL : b->func_name,
+                                s->buf_start, JS_PARSE_EXPORT_NONE, &fd))
+        goto fail;
+    if (s->token.val != TOK_EOF || fd->closure_var_count != 0 ||
+        fd->preparsed) {
+        JS_ThrowInternalError(ctx, "lazy function does not parse alone");
+        goto fail;
+    }
+    /* the closure variables of the function object, in the same order */
+    for(i = 0; i < b->closure_var_count; i++) {
+        JSClosureVar *cv = &b->closure_var[i];
+        if (add_closure_var(ctx, fd,
+                            cv->closure_type == JS_CLOSURE_GLOBAL_REF ?
+                            JS_CLOSURE_GLOBAL_REF : JS_CLOSURE_REF,
+                            i, cv->var_name, cv->is_const, cv->is_lexical,
+                            cv->var_kind) < 0)
+            goto fail;
+    }
+    /* nested functions share the text for Function.prototype.toString() */
+    if (owner && owner->ref_count != UINT32_MAX) {
+        owner->ref_count++;
+        fd->source = (char *)text;
+        fd->source_len = text_len;
+        fd->source_start = 0;
+        fd->source_owner = owner;
+    }
+    func_obj = js_create_function(ctx, fd);
+    fd = NULL; /* freed or turned into func_obj */
+    if (JS_IsException(func_obj))
+        goto fail;
+    if (!b->is_lazy) {
+        /* compiled meanwhile (see above) */
+        JS_FreeValue(ctx, func_obj);
+        ret = 0;
+        goto done;
+    }
+    if (!js_lazy_function_body_matches(b, JS_VALUE_GET_PTR(func_obj))) {
+        JS_FreeValue(ctx, func_obj);
+        JS_ThrowInternalError(ctx, "lazy function compiled differently");
+        goto fail;
+    }
+    if (js_lazy_function_adopt_body(ctx, b, JS_VALUE_GET_PTR(func_obj))) {
+        JS_FreeValue(ctx, func_obj);
+        goto fail;
+    }
+    rt->lazy_stats.compiled++;
+    rt->lazy_stats.compiled_source_bytes += text_len;
+    ret = 0;
+    goto done;
+ fail:
+    if (fd) {
+        /* a function definition still attached to the environment */
+        js_free_function_def(ctx, fd);
+    }
+    ret = -1;
+ done:
+    if (parsed) {
+        free_token(s, &s->token);
+        *pskipped = s->preparse_skipped;
+    }
+    if (env)
+        js_free_function_def(ctx, env);
+    rt->strip_flags = saved_strip;
+    rt->lazy_function_threshold = saved_threshold;
+    JS_FreeCString(ctx, filename);
+    js_free(ctx, buf);
+    if (ret < 0) {
+        /* A parse stopped by the native stack limit or by the interrupt
+           handler fails the call the way running out of stack or being
+           interrupted during execution does, not with the parser's
+           (catchable) SyntaxError. */
+        const char *message = get_prop_string(ctx, rt->current_exception,
+                                              JS_ATOM_message);
+        BOOL overflow = message && strcmp(message, "stack overflow") == 0;
+        BOOL interrupted = message &&
+            strcmp(message, "compilation interrupted") == 0;
+        JS_FreeCString(ctx, message);
+        if (overflow || interrupted) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            if (overflow)
+                JS_ThrowStackOverflow(caller_ctx);
+            else
+                JS_ThrowInterrupted(caller_ctx);
+        }
+    }
+    return ret;
+}
+
+static int js_lazy_function_compile(JSContext *caller_ctx, JSFunctionBytecode *b)
+{
+    JSRuntime *rt = b->realm->rt;
+    BOOL skipped = FALSE, retry;
+    const char *name, *message;
+    int ret;
+
+    if (rt->lazy_compile_hook)
+        rt->lazy_compile_hook(rt->lazy_compile_hook_opaque, 1);
+    ret = js_lazy_function_compile1(caller_ctx, b, FALSE, &skipped);
+    if (ret < 0 && skipped && b->is_lazy) {
+        /* A body skipped inside it could leave a name it uses out of its
+           closure: compile it again without skipping. */
+        name = get_prop_string(caller_ctx, rt->current_exception, JS_ATOM_name);
+        message = get_prop_string(caller_ctx, rt->current_exception,
+                                  JS_ATOM_message);
+        retry = name && message && !strcmp(name, "InternalError") &&
+            (!strcmp(message, "lazy function compiled differently") ||
+             !strcmp(message, "lazy function does not parse alone"));
+        JS_FreeCString(caller_ctx, name);
+        JS_FreeCString(caller_ctx, message);
+        if (retry) {
+            JS_FreeValue(caller_ctx, JS_GetException(caller_ctx));
+            rt->lazy_stats.preparse_restarts++;
+            ret = js_lazy_function_compile1(caller_ctx, b, TRUE, &skipped);
+        }
+    }
+    if (ret < 0)
+        rt->lazy_stats.compile_failures++;
+    if (rt->lazy_compile_hook)
+        rt->lazy_compile_hook(rt->lazy_compile_hook_opaque, 0);
+    return ret;
+}
+
 
 /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
 static JSValue __JS_EvalInternalWithColumn(
@@ -38556,6 +43519,17 @@ static JSValue __JS_EvalInternalWithColumn(
     fail:
         free_token(s, &s->token);
         js_free_function_def(ctx, fd);
+        if (js_parse_preparse_retry(s)) {
+            /* compile it again, parsing every body */
+            if (m)
+                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
+            ctx->rt->preparse_suspended++;
+            ret_val = __JS_EvalInternalWithColumn(ctx, this_obj, input,
+                                                  input_len, filename, flags,
+                                                  scope_idx, first_line_column);
+            ctx->rt->preparse_suspended--;
+            return ret_val;
+        }
         goto fail1;
     }
 
@@ -38987,6 +43961,16 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
         JSModuleDef *m = JS_VALUE_GET_PTR(obj);
         if (js_resolve_module(ctx, m) < 0) {
             js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
+            /* Tilefinch: a source compile whose import resolution fails
+               frees its module, so a later import of that URL loads it
+               again. A module restored from bytecode is already marked
+               resolved here and was left registered with a missing
+               dependency, which linking would dereference. Drop its
+               registration the same way; the caller still owns `obj`. */
+            if (m->link.next) {
+                list_del(&m->link);
+                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
+            }
             return -1;
         }
     }
@@ -39482,6 +44466,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_set_flags(&flags, &idx, b->arguments_allowed, 1);
     bc_set_flags(&flags, &idx, b->has_debug, 1);
     bc_set_flags(&flags, &idx, b->is_direct_or_indirect_eval, 1);
+    bc_set_flags(&flags, &idx, b->is_lazy, 1);
     assert(idx <= 16);
     bc_put_u16(s, flags);
     bc_put_u8(s, b->js_mode);
@@ -39528,7 +44513,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_u16(s, flags);
     }
 
-    if (JS_WriteFunctionBytecode(s, b->byte_code_buf, b->byte_code_len))
+    /* a lazy function has no body yet */
+    if (!b->is_lazy && JS_WriteFunctionBytecode(s, b->byte_code_buf, b->byte_code_len))
         goto fail;
 
     if (b->has_debug) {
@@ -39559,6 +44545,23 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         } else {
             bc_put_leb128(s, 0);
         }
+    }
+    if (b->is_lazy) {
+        const JSLazyFunction *lz = js_lazy_function_of(b);
+        bc_put_u8(s, lz->func_type);
+        bc_put_u8(s, lz->parent_js_mode);
+        bc_put_u8(s, lz->parent_func_kind);
+        flags = idx = 0;
+        bc_set_flags(&flags, &idx, lz->is_module, 1);
+        bc_set_flags(&flags, &idx, lz->parent_static_init, 1);
+        bc_set_flags(&flags, &idx, lz->strip_source, 1);
+        bc_put_u8(s, flags);
+        bc_put_leb128(s, lz->param_offset);
+        bc_put_leb128(s, lz->nested_threshold);
+        /* the text, unless it is the Function.prototype.toString() text */
+        bc_put_leb128(s, lz->source ? lz->source_len : 0);
+        if (lz->source)
+            dbuf_put(&s->dbuf, (const uint8_t *)lz->source, lz->source_len);
     }
 
     s->source_parent = b;
@@ -40423,7 +45426,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     JSValue obj = JS_UNDEFINED;
     uint16_t v16;
     uint8_t v8;
-    int idx, i, local_count;
+    int idx, i, local_count, is_lazy;
     int cpool_offset, byte_code_offset;
     int closure_var_offset, vardefs_offset;
     uint64_t function_size;
@@ -40444,6 +45447,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc.arguments_allowed = bc_get_flags(v16, &idx, 1);
     bc.has_debug = bc_get_flags(v16, &idx, 1);
     bc.is_direct_or_indirect_eval = bc_get_flags(v16, &idx, 1);
+    is_lazy = bc_get_flags(v16, &idx, 1);
     bc.read_only_bytecode = s->is_rom_data;
     if (bc_get_u8(s, &v8))
         goto fail;
@@ -40468,6 +45472,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
     if (bc_get_leb128_int(s, &local_count))
         goto fail;
+    if (is_lazy && (!bc.has_debug || bc.byte_code_len != 0 ||
+                    bc.cpool_count != 0 || local_count != 0 ||
+                    bc.arg_count != 0 || bc.var_count != 0)) {
+        JS_ThrowSyntaxError(ctx, "invalid lazy function");
+        goto fail;
+    }
 
     if (bc.has_debug) {
         function_size = sizeof(*b);
@@ -40565,7 +45575,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
-    {
+    if (!is_lazy) {
         bc_read_trace(s, "bytecode {\n");
         if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
             goto fail;
@@ -40637,6 +45647,59 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+    if (is_lazy) {
+        JSLazyFunction *lz;
+        uint32_t text_len;
+        uint8_t func_type, lazy_flags;
+
+        lz = js_mallocz(ctx, sizeof(*lz));
+        if (!lz)
+            goto fail;
+        b->is_lazy = 1;
+        b->byte_code_buf = (uint8_t *)lz;
+        if (bc_get_u8(s, &func_type) ||
+            bc_get_u8(s, &lz->parent_js_mode) ||
+            bc_get_u8(s, &lz->parent_func_kind) ||
+            bc_get_u8(s, &lazy_flags) ||
+            bc_get_leb128(s, &lz->param_offset) ||
+            bc_get_leb128(s, &lz->nested_threshold) ||
+            bc_get_leb128(s, &lz->source_len))
+            goto fail;
+        idx = 0;
+        lz->func_type = func_type;
+        lz->is_module = bc_get_flags(lazy_flags, &idx, 1);
+        lz->parent_static_init = bc_get_flags(lazy_flags, &idx, 1);
+        lz->strip_source = bc_get_flags(lazy_flags, &idx, 1);
+        if (lz->source_len) {
+            lz->source = js_malloc(ctx, lz->source_len);
+            if (!lz->source)
+                goto fail;
+            if (bc_get_buf(s, (uint8_t *)lz->source, lz->source_len))
+                goto fail;
+            text_len = lz->source_len;
+        } else {
+            text_len = b->debug.source_len;
+        }
+        if (func_type > JS_PARSE_FUNC_METHOD ||
+            (lz->source_len == 0 && !b->debug.source) ||
+            lz->param_offset > text_len || !b->debug.pc2line_len) {
+            JS_ThrowSyntaxError(ctx, "invalid lazy function");
+            goto fail;
+        }
+        for(i = 0; i < b->closure_var_count; i++) {
+            switch(b->closure_var[i].closure_type) {
+            case JS_CLOSURE_LOCAL:
+            case JS_CLOSURE_ARG:
+            case JS_CLOSURE_REF:
+            case JS_CLOSURE_GLOBAL_REF:
+                break;
+            default:
+                JS_ThrowSyntaxError(ctx, "invalid lazy function");
+                goto fail;
+            }
+        }
+        ctx->rt->lazy_stats.restored++;
+    }
     if (b->cpool_count != 0) {
         bc_read_trace(s, "cpool {\n");
         s->source_parent = b;
@@ -40661,7 +45724,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 static JSValue JS_ReadModule(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
-    JSValue obj;
+    JSValue obj = JS_UNDEFINED;
     JSModuleDef *m = NULL;
     JSAtom module_name;
     int i;
@@ -40767,6 +45830,23 @@ static JSValue JS_ReadModule(BCReaderState *s)
     return obj;
  fail:
     if (m) {
+        /* Tilefinch: a module read is registered in ctx->loaded_modules
+           under its name as soon as it is created, and `obj` holds a second
+           reference. Releasing only one left a half-read module listed, so
+           a later import or compile of the same URL found it instead of
+           loading again. Counts read before their table was allocated are
+           cleared first: the finalizer and the GC mark walk them. */
+        if (!m->req_module_entries)
+            m->req_module_entries_count = 0;
+        if (!m->export_entries)
+            m->export_entries_count = 0;
+        if (!m->star_export_entries)
+            m->star_export_entries_count = 0;
+        if (!m->import_entries)
+            m->import_entries_count = 0;
+        if (JS_IsException(m->func_obj))
+            m->func_obj = JS_UNDEFINED;
+        JS_FreeValue(ctx, obj);
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
     }
     return JS_EXCEPTION;
@@ -41676,16 +46756,112 @@ static JSValue JS_ToObjectFree(JSContext *ctx, JSValue val)
     return obj;
 }
 
+/* The six descriptor fields, in the order ToPropertyDescriptor reads
+   them. */
+static const JSAtom js_desc_field_atoms[6] = {
+    JS_ATOM_enumerable, JS_ATOM_configurable, JS_ATOM_value,
+    JS_ATOM_writable, JS_ATOM_get, JS_ATOM_set,
+};
+
+/* js_obj_to_desc() for the usual descriptor, an ordinary object literal:
+   when the object and every object on its prototype chain are ordinary,
+   the chain adds none of the fields and the object's own fields are
+   plain data properties, reading them runs no code, so each is taken
+   from its slot instead of by a JS_HasProperty() and JS_GetProperty()
+   pair per field (up to twelve generic lookups, most of them misses that
+   walk to Object.prototype). Returns 1 when 'd' was filled or an error
+   thrown (with -1 in *pret), 0 when the general path must run. */
+static int js_obj_to_desc_ordinary(JSContext *ctx, JSPropertyDescriptor *d,
+                                   JSObject *p, int *pret)
+{
+    JSProperty *pr[6];
+    JSShapeProperty *prs;
+    JSObject *q;
+    JSValue getter, setter;
+    int i, depth, flags;
+
+    if (p->class_id != JS_CLASS_OBJECT || p->is_exotic)
+        return 0;
+    for (q = p->shape->proto, depth = 0; q != NULL; q = q->shape->proto) {
+        if (++depth > 4 || q->class_id != JS_CLASS_OBJECT || q->is_exotic)
+            return 0;
+        for(i = 0; i < 6; i++) {
+            if (find_own_property1(q, js_desc_field_atoms[i]))
+                return 0;
+        }
+    }
+    for(i = 0; i < 6; i++) {
+        prs = find_own_property(&pr[i], p, js_desc_field_atoms[i]);
+        if (!prs) {
+            pr[i] = NULL;
+        } else if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL) {
+            return 0;
+        }
+    }
+    flags = 0;
+    if (pr[0]) {
+        flags |= JS_PROP_HAS_ENUMERABLE;
+        if (JS_ToBool(ctx, pr[0]->u.value))
+            flags |= JS_PROP_ENUMERABLE;
+    }
+    if (pr[1]) {
+        flags |= JS_PROP_HAS_CONFIGURABLE;
+        if (JS_ToBool(ctx, pr[1]->u.value))
+            flags |= JS_PROP_CONFIGURABLE;
+    }
+    if (pr[2])
+        flags |= JS_PROP_HAS_VALUE;
+    if (pr[3]) {
+        flags |= JS_PROP_HAS_WRITABLE;
+        if (JS_ToBool(ctx, pr[3]->u.value))
+            flags |= JS_PROP_WRITABLE;
+    }
+    getter = JS_UNDEFINED;
+    setter = JS_UNDEFINED;
+    if (pr[4]) {
+        flags |= JS_PROP_HAS_GET;
+        getter = pr[4]->u.value;
+        if (!(JS_IsUndefined(getter) || JS_IsFunction(ctx, getter))) {
+            JS_ThrowTypeError(ctx, "invalid getter");
+            *pret = -1;
+            return 1;
+        }
+    }
+    if (pr[5]) {
+        flags |= JS_PROP_HAS_SET;
+        setter = pr[5]->u.value;
+        if (!(JS_IsUndefined(setter) || JS_IsFunction(ctx, setter))) {
+            JS_ThrowTypeError(ctx, "invalid setter");
+            *pret = -1;
+            return 1;
+        }
+    }
+    if ((flags & (JS_PROP_HAS_SET | JS_PROP_HAS_GET)) &&
+        (flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE))) {
+        JS_ThrowTypeError(ctx, "cannot have setter/getter and value or writable");
+        *pret = -1;
+        return 1;
+    }
+    d->flags = flags;
+    d->value = pr[2] ? JS_DupValue(ctx, pr[2]->u.value) : JS_UNDEFINED;
+    d->getter = JS_DupValue(ctx, getter);
+    d->setter = JS_DupValue(ctx, setter);
+    *pret = 0;
+    return 1;
+}
+
 static int js_obj_to_desc(JSContext *ctx, JSPropertyDescriptor *d,
                           JSValueConst desc)
 {
     JSValue val, getter, setter;
-    int flags;
+    int flags, ret;
 
     if (!JS_IsObject(desc)) {
         JS_ThrowTypeErrorNotAnObject(ctx);
         return -1;
     }
+    if (js_obj_to_desc_ordinary(ctx, d, JS_VALUE_GET_OBJ(desc), &ret))
+        return ret;
     flags = 0;
     val = JS_UNDEFINED;
     getter = JS_UNDEFINED;
@@ -43030,8 +48206,9 @@ static JSValue js_function_bind(JSContext *ctx, JSValueConst this_val,
             len_val = JS_NewInt32(ctx, 0);
         }
     }
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_length,
-                           len_val, JS_PROP_CONFIGURABLE);
+    if (JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_length,
+                               len_val, JS_PROP_CONFIGURABLE) < 0)
+        goto exception;
 
     name1 = JS_GetProperty(ctx, this_val, JS_ATOM_name);
     if (JS_IsException(name1))
@@ -43043,8 +48220,9 @@ static JSValue js_function_bind(JSContext *ctx, JSValueConst this_val,
     name1 = JS_ConcatString3(ctx, "bound ", name1, "");
     if (JS_IsException(name1))
         goto exception;
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name, name1,
-                           JS_PROP_CONFIGURABLE);
+    if (JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name, name1,
+                               JS_PROP_CONFIGURABLE) < 0)
+        goto exception;
     return func_obj;
  exception:
     JS_FreeValue(ctx, func_obj);
@@ -47270,6 +52448,11 @@ static JSValue js_string_fromCharCode(JSContext *ctx, JSValueConst this_val,
     int i;
     StringBuffer b_s, *b = &b_s;
 
+    /* one integer code unit: the string the buffer would end with (a
+       Latin-1 unit is the shared one-character string) without a buffer */
+    if (argc == 1 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)
+        return js_new_string_char(ctx, JS_VALUE_GET_INT(argv[0]) & 0xffff);
+
     string_buffer_init(ctx, b, argc);
 
     for(i = 0; i < argc; i++) {
@@ -47401,6 +52584,15 @@ static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int idx, c;
 
+    /* a flat string and an integer index need no conversions */
+    if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING &&
+               JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {
+        p = JS_VALUE_GET_STRING(this_val);
+        idx = JS_VALUE_GET_INT(argv[0]);
+        if (idx < 0 || idx >= p->len)
+            return JS_NAN;
+        return JS_NewInt32(ctx, string_get(p, idx));
+    }
     val = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(val))
         return val;
@@ -49073,6 +54265,13 @@ static JSValue js_math_imul(JSContext *ctx, JSValueConst this_val,
     uint32_t a, b, c;
     int32_t d;
 
+    if (likely(JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT &&
+               JS_VALUE_GET_TAG(argv[1]) == JS_TAG_INT)) {
+        c = (uint32_t)JS_VALUE_GET_INT(argv[0]) *
+            (uint32_t)JS_VALUE_GET_INT(argv[1]);
+        memcpy(&d, &c, sizeof(d));
+        return JS_NewInt32(ctx, d);
+    }
     if (JS_ToUint32(ctx, &a, argv[0]))
         return JS_EXCEPTION;
     if (JS_ToUint32(ctx, &b, argv[1]))
@@ -55543,7 +60742,10 @@ static int js_create_resolving_functions(JSContext *ctx,
         s->presolved = sr;
         s->promise = JS_DupValue(ctx, promise);
         JS_SetOpaque(obj, s);
-        js_function_set_properties(ctx, obj, JS_ATOM_empty_string, 1);
+        if (js_function_set_properties(ctx, obj, JS_ATOM_empty_string, 1) < 0) {
+            JS_FreeValue(ctx, obj);
+            goto fail;
+        }
         resolving_funcs[i] = obj;
     }
     js_promise_resolve_function_free_resolved(ctx->rt, sr);
@@ -62761,10 +67963,14 @@ static JSValue js_atomics_store(JSContext *ctx,
         }
         v = v32;
     }
-    if (typed_array_is_oob(p))
+    if (typed_array_is_oob(p)) {
+        JS_FreeValue(ctx, ret);
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
-    if (idx >= p->u.array.count)
+    }
+    if (idx >= p->u.array.count) {
+        JS_FreeValue(ctx, ret);
         return JS_ThrowRangeError(ctx, "out-of-bound access");
+    }
 
     ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
     
@@ -63187,6 +68393,16 @@ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_UNDEFINED;
 }
 
+/* Tilefinch: WeakRef.prototype.deref for the host, without a call; the
+   target or undefined (also for a value that is not a WeakRef). */
+JSValue JS_WeakRefDeref(JSContext *ctx, JSValueConst weakref)
+{
+    JSWeakRefData *wrd = JS_GetOpaque(weakref, JS_CLASS_WEAK_REF);
+    if (!wrd || !js_weakref_is_live(wrd->target))
+        return JS_UNDEFINED;
+    return JS_DupValue(ctx, wrd->target);
+}
+
 static const JSCFunctionListEntry js_weakref_proto_funcs[] = {
     JS_CFUNC_DEF("deref", 0, js_weakref_deref ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "WeakRef", JS_PROP_CONFIGURABLE ),
@@ -63414,4 +68630,163 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx)
         return -1;
     JS_FreeValue(ctx, obj);
     return 0;
+}
+
+/* Tilefinch: true while a JavaScript or native-function frame is active on
+   this runtime, i.e. while the host has been called from script. HTML runs
+   a microtask checkpoint only once the JavaScript execution context stack
+   is empty; the host uses this to keep its checkpoints there. */
+int JS_IsStackActive(JSRuntime *rt)
+{
+    return rt->current_stack_frame != NULL;
+}
+
+/* Tilefinch: an identity for the innermost frame (NULL when none), so a
+   host native can tell whether script has been entered since it began. */
+const void *JS_GetStackTop(JSRuntime *rt)
+{
+    return rt->current_stack_frame;
+}
+
+/* Tilefinch: observe collections, e.g. to time them. The hook must not
+   allocate on or re-enter the runtime. */
+void JS_SetGCHook(JSRuntime *rt, void (*hook)(void *opaque, int begin),
+                  void *opaque)
+{
+    rt->gc_hook = hook;
+    rt->gc_hook_opaque = opaque;
+}
+
+/* Tilefinch: observe first-call compiles of lazy function bodies, e.g. to
+   time them. The hook must not allocate on or re-enter the runtime. */
+void JS_SetLazyCompileHook(JSRuntime *rt,
+                           void (*hook)(void *opaque, int begin),
+                           void *opaque)
+{
+    rt->lazy_compile_hook = hook;
+    rt->lazy_compile_hook_opaque = opaque;
+}
+
+/* Tilefinch: describe the frame `level` below the innermost (0) without
+   allocating, so an interrupt handler can sample where time goes. Returns
+   FALSE past the outermost frame. The atoms are borrowed; JS_ATOM_NULL
+   when unknown (a native frame has no file; stripped code has no line). */
+int JS_GetStackFrameInfo(JSContext *ctx, int level, JSAtom *func_name,
+                         JSAtom *filename, int *line, int *column)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSObject *p;
+    int col = 0;
+
+    for (; sf != NULL && level > 0; level--)
+        sf = sf->prev_frame;
+    *func_name = JS_ATOM_NULL;
+    *filename = JS_ATOM_NULL;
+    *line = 0;
+    *column = 0;
+    if (sf == NULL)
+        return FALSE;
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return TRUE;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id)) {
+        *line = -1; /* a native (C) function frame */
+        return TRUE;
+    }
+    {
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        *func_name = b->func_name;
+        if (b->has_debug && !b->is_lazy) {
+            *filename = b->debug.filename;
+            if (sf->cur_pc != NULL) {
+                *line = find_line_num(ctx, b,
+                                      sf->cur_pc - b->byte_code_buf - 1,
+                                      &col);
+                *column = col;
+            }
+        } else if (b->has_debug) {
+            *filename = b->debug.filename;
+        }
+    }
+    return TRUE;
+}
+
+int JS_GetStackFrameOrigin(JSContext *ctx, int level)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    for (; sf != NULL && level > 0; level--)
+        sf = sf->prev_frame;
+    if (sf == NULL)
+        return JS_FRAME_ORIGIN_NONE;
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return JS_FRAME_ORIGIN_ANONYMOUS;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id))
+        return JS_FRAME_ORIGIN_NATIVE;
+    b = p->u.func.function_bytecode;
+    return b->has_debug && b->debug.filename != JS_ATOM_NULL
+        ? JS_FRAME_ORIGIN_FILE : JS_FRAME_ORIGIN_ANONYMOUS;
+}
+
+/* Tilefinch profiler: the definition line/column of frame `level`'s
+   function (0 when unknown, line -1 for a native frame), which tells
+   anonymous functions apart. */
+int JS_GetStackFrameDefinition(JSContext *ctx, int level, int *line, int *column)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSObject *p;
+    int col = 0;
+    for (; sf != NULL && level > 0; level--)
+        sf = sf->prev_frame;
+    *line = 0;
+    *column = 0;
+    if (sf == NULL)
+        return FALSE;
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return TRUE;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id)) {
+        *line = -1;
+        return TRUE;
+    }
+    {
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (b->has_debug && !b->is_lazy && b->debug.pc2line_buf) {
+            *line = find_line_num(ctx, b, (uint32_t) -1, &col);
+            *column = col;
+        }
+    }
+    return TRUE;
+}
+
+/* Tilefinch profiler: visit every live bytecode function with a nonzero
+   call count; reset != 0 clears the counts afterwards. Returns FALSE (and
+   visits nothing) unless built with CONFIG_TILEFINCH_CALL_COUNTS. */
+int JS_ProfileForEachBytecode(JSRuntime *rt, JSProfileBytecodeFunc *cb,
+                              void *opaque, int reset)
+{
+#ifndef CONFIG_TILEFINCH_CALL_COUNTS
+    (void) rt; (void) cb; (void) opaque; (void) reset;
+    return FALSE;
+#else
+    struct list_head *el;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *hdr = list_entry(el, JSGCObjectHeader, link);
+        if (js_rc(hdr)->gc_obj_type != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+            continue;
+        JSFunctionBytecode *b = (JSFunctionBytecode *) hdr;
+        if (b->tf_calls == 0)
+            continue;
+        int line = 0, col = 0;
+        if (b->has_debug && !b->is_lazy && b->debug.pc2line_buf)
+            line = find_line_num(b->realm, b, (uint32_t) -1, &col);
+        cb(opaque, b->realm, b->has_debug ? b->debug.filename : JS_ATOM_NULL,
+           b->func_name, line, col, b->tf_calls);
+        if (reset) b->tf_calls = 0;
+    }
+    return TRUE;
+#endif
 }

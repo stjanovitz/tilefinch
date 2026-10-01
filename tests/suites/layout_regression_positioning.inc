@@ -1801,6 +1801,70 @@
         stylesheet_destroy(&scroll_sheet);
         document_destroy(&scroll_document);
     }
+
+    /* The retained fixed layer is rebuilt when its own overflow content
+       scrolls or is repainted, and kept when an unrelated scroller moves or
+       paint changes elsewhere (a drawer's shadows cost ~0.6 s to redraw). */
+    {
+        static const char fixed_page[] =
+            "<!doctype html><style>body{margin:0}"
+            "#box{overflow:auto;width:40px;height:40px}"
+            "#bar{position:fixed;left:0;top:60px;width:40px;height:40px;"
+            "overflow:auto}"
+            ".a{height:40px;background:#ff0000}"
+            ".b{height:40px;background:#0000ff}</style>"
+            "<div id=box><div class=a></div><div class=b></div></div>"
+            "<div id=bar><div class=a></div><div class=b></div></div>";
+        PocDocument fixed_document;
+        Stylesheet fixed_sheet;
+        LayoutDocument fixed_layout;
+        CHECK(document_parse(&fixed_document, &budget, fixed_page,
+                             strlen(fixed_page), 18)
+              && stylesheet_build(&fixed_sheet, &budget,
+                                  &fixed_document, 100)
+              && layout_build(&fixed_layout, &budget, &fixed_document,
+                              &fixed_sheet, NULL, NULL, 100));
+        lxb_dom_node_t *root = lxb_dom_interface_node(fixed_document.html);
+        lxb_dom_node_t *box = find_id(root, "box");
+        lxb_dom_node_t *bar = find_id(root, "bar");
+        TileCache fixed_cache;
+        uint16_t *fixed_frame = budget_malloc(
+            &budget, 100u * 100u * sizeof(*fixed_frame));
+        CHECK(box != NULL && bar != NULL && fixed_frame != NULL
+              && fixed_layout.fixed_count == 1
+              && tile_cache_init(&fixed_cache, &budget, &fixed_layout, 4)
+              && tile_cache_set_frame(&fixed_cache, fixed_frame,
+                                      100u * 100u)
+              && tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL));
+        CHECK(fixed_cache.fixed_cache_builds == 1
+              && fixed_frame[70u * 100u + 10u] == test_rgb565(0xff0000));
+        CHECK(layout_scroll_node(&fixed_layout, box, 0, 40)
+              && tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL));
+        CHECK(fixed_cache.fixed_cache_builds == 1
+              && fixed_frame[10u * 100u + 10u] == test_rgb565(0x0000ff)
+              && fixed_frame[70u * 100u + 10u] == test_rgb565(0xff0000));
+        /* Fixed commands keep their in-flow layout box (y 40..120 here),
+           the coordinates focus paint damage is reported in. */
+        CHECK(tile_cache_sync_layout_paint(&fixed_cache, 0, 0, 40, 30));
+        CHECK(tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL)
+              && fixed_cache.fixed_cache_builds == 1);
+        CHECK(layout_scroll_node(&fixed_layout, bar, 0, 40)
+              && tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL));
+        if (fixed_frame[70u * 100u + 10u] != test_rgb565(0x0000ff))
+            fprintf(stderr, "scrolled fixed overflow pixel=%04x builds=%zu\n",
+                    fixed_frame[70u * 100u + 10u],
+                    fixed_cache.fixed_cache_builds);
+        CHECK(fixed_cache.fixed_cache_builds == 2
+              && fixed_frame[70u * 100u + 10u] == test_rgb565(0x0000ff));
+        CHECK(tile_cache_sync_layout_paint(&fixed_cache, 0, 50, 40, 70)
+              && tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL)
+              && fixed_cache.fixed_cache_builds == 3);
+        tile_cache_destroy(&fixed_cache);
+        budget_free(&budget, fixed_frame);
+        layout_destroy(&fixed_layout);
+        stylesheet_destroy(&fixed_sheet);
+        document_destroy(&fixed_document);
+    }
     layout_destroy(&compositing_layout);
     stylesheet_destroy(&compositing_sheet);
     document_destroy(&compositing_document);

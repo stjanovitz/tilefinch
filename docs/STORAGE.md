@@ -70,7 +70,8 @@ smaller. "Writer" names the owning source file.
 | `http-cache.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation (payload further capped by the 1/2/4 MB cache setting) | user setting 0 removes it; "clear cache" removes it | backup rotation; a torn primary is removed after `.bak` recovery |
 | `local-storage.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation | disabling the setting removes it; "clear local storage" removes it | backup rotation, as above |
 | `tls-sessions.bin` (+`.bak`) | `tls_session_store.c` | ≤ 64 KB per generation (≤ 16 hosts × 2 sessions × 4 KB) | "clear HTTP caches" removes it; pruned of expired entries at load and save | backup rotation; a torn primary is removed after `.bak` recovery, and the whole file is a plain miss on any checksum, store-version, or Mbed-TLS-version-pin mismatch |
-| `site-storage/p-<hash>` | `session_site_storage.c` | per site, ≤ 4 MB live data; the log is compacted before it passes twice the dead-record threshold plus live data | **Settings → Device & storage → Site data & storage** deletes one; so does the site's **Clear site data** | append-only checksummed log; compaction writes `.tmp`, then remove + rename, and a load recovers a lone `.tmp` |
+| `entropy-seed.bin` | `psp_entropy.c` | 48 B | replaced once per boot, when the TLS entropy pool first seeds | direct overwrite; a torn, damaged or all-zero file is ignored (it is mixed in but never credited, so losing it costs nothing; see [PSP_TRANSPORT.md](engineering/PSP_TRANSPORT.md#entropy)) |
+| `site-storage/p-<hash>` | `session_site_storage.c` | per site, ≤ 4 MB live data; the log is compacted before it passes twice the dead-record threshold plus live data | **Settings → Device & storage → Site data & storage** deletes one; so does the site's **Clear data for this site** | append-only checksummed log; compaction writes `.tmp`, then remove + rename, and a load recovers a lone `.tmp` |
 | `site-storage/s-NN`, `session-files` | `session_site_storage.c` | as above | deleted at exit; after a crash, at the next boot (only when the `session-files` marker exists) | as above |
 | `boot-overrides.cfg` | `psp_boot_config.c` | 4 bounded lines | user-managed | tmp + remove + rename |
 | `tilefinch-last-error.txt` | `psp_script_main.c` | one bounded device-error snapshot (URL ≤ 2047 bytes, detail ≤ 1023 bytes) | disabling **Save error reports** removes it; a newer saved failure replaces it | tmp + remove + rename; ordinary failures write only when opted in, while a fatal startup failure writes once regardless because the diagnostic UI may never become available |
@@ -107,8 +108,8 @@ Ask (the default), Memory Stick, or RAM only (never offered).
 data with their size and place; Left/Right changes a site's choice there, and
 X opens it to change the choice or delete its data after a confirmation. The
 same screen turns the offer off for every site and holds the caches,
-**Save RAM storage at exit**, and the clear-all actions. **Clear site data**
-empties a site but keeps its choice. **Clear local storage** removes every site's
+**Save RAM storage at exit**, and the clear-all actions. **Clear data for this
+site** empties a site but keeps its choice. **Clear local storage** removes every site's
 `localStorage`, in RAM, in the snapshot, and on the Memory Stick; sites keep
 their choice and their OPFS files. **Clear session storage** covers every
 site's `sessionStorage` and the OPFS of sites not kept always.

@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "tilefinch/psp_display.h"
+#include "tilefinch/psp_entropy.h"
 #include "tilefinch/psp_threads.h"
 
 #include "mbedtls/bignum.h"
@@ -195,6 +196,13 @@ static bool crypto_log_publish(void)
 /* Keep PPSSPP/stdout telemetry and mirror the exact same bounded lines to the
    Memory Stick for a physical-device run. */
 #define printf crypto_printf
+
+/* The entropy source's seeding line is the only on-device measurement of
+   how much timing jitter the PSP yields, so it goes to the same log. */
+static void crypto_entropy_report(const char *line)
+{
+    printf("%s\n", line);
+}
 
 static int psp_exit_callback(int arg1, int arg2, void *common)
 {
@@ -763,6 +771,11 @@ int main(int argc, char **argv)
 #endif
            MBEDTLS_VERSION_STRING);
 
+    /* Known-answer vectors do not depend on the DRBG, and this EBOOT runs
+       under PPSSPP, whose emulated clock may earn no credit: release after one
+       bounded attempt and report which way it went. */
+    psp_entropy_configure(NULL, PSP_ENTROPY_PERMIT_UNCREDITED,
+                          crypto_entropy_report);
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&drbg);
     {

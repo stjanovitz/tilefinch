@@ -83,8 +83,21 @@ static void navigation_record_blocking_script_sample(
         < NAVIGATION_BLOCKING_SCRIPT_SAMPLE_LIMIT) {
         performance->blocking_script_samples[
             performance->blocking_script_sample_count++] = *sample;
-    } else {
-        performance->blocking_script_samples_dropped++;
+        return;
+    }
+    /* Keep the slowest scripts once full: a streamed page's costly scripts
+       (chatgpt.com's answer updates) arrive after dozens of cheap ones. */
+    performance->blocking_script_samples_dropped++;
+    size_t fastest = 0;
+    for (size_t i = 1; i < NAVIGATION_BLOCKING_SCRIPT_SAMPLE_LIMIT; i++) {
+        if (performance->blocking_script_samples[i].total_us
+            < performance->blocking_script_samples[fastest].total_us) {
+            fastest = i;
+        }
+    }
+    if (sample->total_us
+        > performance->blocking_script_samples[fastest].total_us) {
+        performance->blocking_script_samples[fastest] = *sample;
     }
 }
 
@@ -221,7 +234,7 @@ static bool navigation_stream_suppress_optional_parser_work(
    parser itself to monopolize that allowance. This is cumulative source/work
    admission, not a second heap or per-file quota. */
 #define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_WORK (1024u * 1024u)
-#define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US 8000000u
+#define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US 20000000u
 #define NAVIGATION_PARSER_SCRIPT_FAILURE_LIMIT 3u
 
 typedef enum {
@@ -309,6 +322,7 @@ static bool navigation_stream_account_parser_script(
     size_t source_work, bool failed, bool completed_cleanly)
 {
     if (stream == NULL) return false;
+    stream->parser_script_turn_started_us = 0;
 #if !defined(__PSP__)
     if (navigation_parser_script_stage_test_elapsed_us != 0u) {
         elapsed_us = navigation_parser_script_stage_test_elapsed_us;
@@ -459,6 +473,7 @@ navigation_stream_prepare_parser_script_allowance(
         allowance->maximum_file_bytes = remaining_work;
     }
     script_runtime_limit_execution_for_us(stream->runtime, remaining_us);
+    stream->parser_script_turn_started_us = navigation_now_us();
     return NAVIGATION_PARSER_SCRIPT_ALLOWANCE_READY;
 }
 
@@ -557,6 +572,39 @@ static bool navigation_stream_finish_parser_mutation_checkpoint(
     if (stream->parser_script_circuit_open) return true;
     return !failed || navigation_stream_suppress_optional_parser_work(
                           stream, NAVIGATION_PARSER_REFUSAL_MUTATION);
+}
+
+/* The parser performs one more microtask checkpoint after EOF so an
+   observer sees what was parsed after the last parser-blocking script (and
+   what EOF itself inserted) while the document is still parser-owned. It
+   shares the stage allowance and failure accounting of a pre-script
+   checkpoint, and costs nothing when the journal is empty. */
+static bool navigation_stream_eof_parser_mutation_checkpoint(
+    NavigationDocumentStream *stream)
+{
+    if (stream == NULL || stream->session == NULL || stream->runtime == NULL
+        || stream->parser == NULL || stream->parser_script_circuit_open
+        || stream->script_disabled_after_failure
+        || !stream->session->scripts_enabled
+        || !stream->session->document_scripts_enabled
+        || !document_parser_insertions_pending(&stream->parser->document)) {
+        return true;
+    }
+    NavigationParserScriptAllowance allowance = {0};
+    NavigationParserScriptAllowanceResult allowance_result =
+        navigation_stream_prepare_parser_script_allowance(
+            stream, 0u, 0u, &allowance);
+    if (allowance_result != NAVIGATION_PARSER_SCRIPT_ALLOWANCE_READY) {
+        return allowance_result == NAVIGATION_PARSER_SCRIPT_ALLOWANCE_SKIPPED;
+    }
+    ScriptRuntime *runtime = stream->runtime;
+    uint64_t started = navigation_now_us();
+    bool refused = navigation_test_consume_parser_checkpoint_fault(
+            NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION)
+        || !script_runtime_parser_mutation_checkpoint(runtime);
+    navigation_stream_finish_parser_script_allowance(runtime);
+    return navigation_stream_finish_parser_mutation_checkpoint(
+        stream, started, allowance.deadline_us, refused);
 }
 
 static NavigationParserCheckpointOutcome
@@ -933,6 +981,7 @@ static bool navigation_stream_element_closed(void *opaque,
             NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION)
         || !script_runtime_parser_mutation_checkpoint(mutation_runtime);
     navigation_stream_finish_parser_script_allowance(mutation_runtime);
+    uint64_t mutation_finished = navigation_now_us();
     if (mutation_refused) {
         return navigation_stream_finish_parser_mutation_checkpoint(
             stream, mutation_started, mutation_allowance.deadline_us, true);
@@ -952,9 +1001,17 @@ static bool navigation_stream_element_closed(void *opaque,
     external = script_shape.external;
     inline_source_bytes = script_shape.inline_source_bytes;
     uint64_t stylesheet_finished = navigation_now_us();
-    session->performance.parser_stylesheet_us +=
-        stylesheet_finished >= stylesheet_started
-            ? stylesheet_finished - stylesheet_started : 0;
+    uint64_t mutation_checkpoint_us =
+        navigation_elapsed_us(mutation_started, mutation_finished);
+    uint64_t stylesheet_us =
+        navigation_elapsed_us(stylesheet_started, stylesheet_finished);
+    /* The observer checkpoint runs author callbacks; report it apart from
+       stylesheet work so page JavaScript is not billed as CSS. */
+    stylesheet_us = stylesheet_us >= mutation_checkpoint_us
+        ? stylesheet_us - mutation_checkpoint_us : 0;
+    session->performance.parser_stylesheet_us += stylesheet_us;
+    session->performance.parser_mutation_checkpoint_us +=
+        mutation_checkpoint_us;
 
     /* An external classic script may spend an appreciable interval waiting
        for its already-discovered response and then compiling/executing it.
@@ -1088,8 +1145,8 @@ static bool navigation_stream_element_closed(void *opaque,
             metadata_started, metadata_finished),
         .runtime_startup_us = navigation_elapsed_us(
             runtime_started, runtime_finished),
-        .stylesheet_us = navigation_elapsed_us(
-            stylesheet_started, stylesheet_finished),
+        .stylesheet_us = stylesheet_us,
+        .mutation_checkpoint_us = mutation_checkpoint_us,
         .stylesheet_fingerprint_us = navigation_elapsed_us(
             fingerprint_started, fingerprint_finished),
         .process_us = process_us,

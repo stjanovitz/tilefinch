@@ -1,0 +1,1 @@
+<!doctype html><title>Classic import</title><body><p id=before>before</p><script>import('/module.js').then(function(m){document.body.setAttribute('data-import',String(m.v))},function(e){document.body.setAttribute('data-import','failed: '+e.message)})</script><p id=after>after</p></body>

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #ifndef TILEFINCH_TEST_SOURCE_DIR
 #define TILEFINCH_TEST_SOURCE_DIR "."
@@ -412,6 +413,56 @@ static bool build_uncompressed_woff(const unsigned char *sfnt,
     }
     *woff = output;
     *woff_length = output_size;
+    return true;
+}
+
+/* Repack the same bounded fixture with actual zlib-compressed tables, so
+   WOFF tests exercise the inflater rather than only the sfnt wrapper. */
+static bool build_compressed_woff(const unsigned char *sfnt,
+                                  size_t sfnt_length,
+                                  unsigned char **woff, size_t *woff_length)
+{
+    if (!build_uncompressed_woff(sfnt, sfnt_length, woff, woff_length)) {
+        return false;
+    }
+    unsigned char *output = *woff;
+    uint16_t tables = read_be16(sfnt + 4);
+    size_t offset = 44u + (size_t) tables * 20u;
+    bool compressed_any = false;
+    for (size_t table = 0; table < tables; table++) {
+        const unsigned char *source = sfnt + 12u + table * 16u;
+        unsigned char *record = output + 44u + table * 20u;
+        size_t length = read_be32(source + 12);
+        const unsigned char *data = sfnt + read_be32(source + 8);
+        uLongf compressed = (uLongf) length;
+        size_t stored = length;
+        if (compress2(output + offset, &compressed, data, (uLong) length,
+                      Z_DEFAULT_COMPRESSION) == Z_OK && compressed < length) {
+            stored = (size_t) compressed;
+            compressed_any = true;
+        } else {
+            memcpy(output + offset, data, length);
+        }
+        store_be32(record + 4, (uint32_t) offset);
+        store_be32(record + 8, (uint32_t) stored);
+        size_t padded = 0;
+        if (!aligned_four(stored, &padded)) {
+            free(output);
+            *woff = NULL;
+            *woff_length = 0;
+            return false;
+        }
+        memset(output + offset + stored, 0, padded - stored);
+        offset += padded;
+    }
+    store_be32(output + 8, (uint32_t) offset);
+    *woff_length = offset;
+    if (!compressed_any) {
+        free(output);
+        *woff = NULL;
+        *woff_length = 0;
+        return false;
+    }
     return true;
 }
 
@@ -1073,6 +1124,37 @@ static bool test_bounded_font_loader(void)
     CHECK(probe_web_font(&budget, woff, woff_length, maximum_backend_bytes,
                          &woff_probe));
     CHECK(font_probes_equal(&raw_probe, &woff_probe));
+
+    unsigned char *compressed_woff = NULL;
+    size_t compressed_length = 0;
+    FontProbe compressed_probe = {0};
+    CHECK(build_compressed_woff(bytes, length,
+                                &compressed_woff, &compressed_length));
+    CHECK(compressed_length < woff_length);
+    CHECK(probe_web_font(&budget, compressed_woff, compressed_length,
+                         maximum_backend_bytes, &compressed_probe));
+    CHECK(font_probes_equal(&raw_probe, &compressed_probe));
+    CHECK(budget.current == baseline);
+    CHECK(test_woff_truncation_boundaries(
+        &budget, compressed_woff, compressed_length, maximum_backend_bytes));
+    uint16_t compressed_tables = read_be16(compressed_woff + 12);
+    bool checked_bad_stream = false;
+    for (size_t table = 0; table < compressed_tables; table++) {
+        const unsigned char *record = compressed_woff + 44u + table * 20u;
+        if (read_be32(record + 8) >= read_be32(record + 12)) continue;
+        size_t offset = read_be32(record + 4);
+        unsigned char saved = compressed_woff[offset];
+        compressed_woff[offset] ^= 0xffu;
+        CHECK(rejected_without_retention(
+            &budget, compressed_woff, compressed_length, maximum_backend_bytes));
+        compressed_woff[offset] = saved;
+        checked_bad_stream = true;
+        break;
+    }
+    CHECK(checked_bad_stream);
+    CHECK(sweep_font_allocation_failures(
+        compressed_woff, compressed_length, maximum_backend_bytes));
+    free(compressed_woff);
 
     unsigned char *fractional_metric_bytes = NULL;
     size_t fractional_metric_length = 0;

@@ -87,6 +87,21 @@ static bool test_page_activation_activity(void)
     CHECK(psp_ui_set_page_activation(&ui, true)
           && psp_ui_set_page_activation(&ui, false)
           && ui.loading && ui.progress_per_mille == 700);
+    /* A JS-handled click may return no native control/navigation action.
+       Completion still removes its receipt, even with no intervening ticks. */
+    psp_ui_set_loading(&ui, false, 1000);
+    const char *receipt = "ACTION RECEIVED - OPENING...";
+    psp_ui_show_status(&ui, receipt, 90);
+    CHECK(psp_ui_set_page_activation(&ui, true));
+    CHECK(psp_ui_finish_page_activation(&ui, receipt));
+    CHECK(!ui.page_activation_busy && ui.toast_frames == 0);
+    /* A real result must survive the receipt cleanup. */
+    psp_ui_show_status(&ui, "REQUEST FAILED", 180);
+    CHECK(psp_ui_set_page_activation(&ui, true));
+    CHECK(psp_ui_finish_page_activation(&ui, receipt));
+    CHECK(ui.toast_frames == 180 && strcmp(ui.status, "REQUEST FAILED") == 0);
+    CHECK(!psp_ui_finish_page_activation(&ui, receipt));
+    CHECK(!psp_ui_finish_page_activation(NULL, receipt));
     return true;
 }
 
@@ -3298,6 +3313,30 @@ static bool test_media_controls_and_composite(void)
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
           && intent.track_index == 0u);
+
+    /* A video with captions but no alternate audio (most of them): the
+       menu opens on Subtitles and the shoulders stay there, so Down then
+       Cross always chooses a track instead of stranding the viewer on an
+       empty Audio tab that swallows every press. */
+    psp_ui_media_set_tracks(
+        &media, NULL, 0u, -1, subtitle_tracks, 2u, -1);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_open && presentation.track_menu_tab == 1u);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_tab == 1u);
+    input.pressed = PSP_UI_BUTTON_PAGE_UP;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_tab == 1u);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == 0u && !presentation.track_menu_open);
+    psp_ui_media_set_tracks(
+        &media, audio_tracks, 2u, 0, subtitle_tracks, 2u, -1);
     psp_ui_media_set_subtitle(&media, "A bounded subtitle line");
     memset(frame, 0, sizeof(frame));
     psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
@@ -3573,6 +3612,88 @@ static bool test_media_controls_and_composite(void)
  * FRAME" with CIRCLE doing nothing, so the mapping from each state to
  * PSP_UI_MEDIA_ACTION_CLOSE is pinned here rather than left to inspection.
  */
+/* A rewind that rebuilds the decoder, or a retry, reopens the video while
+   the viewer is still looking at the same timeline. The open resets the
+   player chrome; the continuation puts back a live timeline so presses made
+   during it become intents instead of being dropped. */
+static bool test_media_continuation_keeps_the_timeline_live(void)
+{
+    PspUiInput right = {
+        .pressed = PSP_UI_BUTTON_RIGHT, .analog_x = 128, .analog_y = 128
+    };
+    PspUiInput cross = {
+        .pressed = PSP_UI_BUTTON_CONFIRM, .analog_x = 128, .analog_y = 128
+    };
+    PspUiInput circle = {
+        .pressed = PSP_UI_BUTTON_CANCEL, .analog_x = 128, .analog_y = 128
+    };
+    const uint64_t duration_us = UINT64_C(60000000);
+    PspUiMediaState media;
+
+    /* Without the continuation an opening player takes no timeline input. */
+    psp_ui_media_init(&media);
+    psp_ui_media_set_resolving(&media, "YouTube video");
+    CHECK(!media.seek_enabled && media.duration_us == 0);
+    CHECK(psp_ui_media_update(&media, &right).action
+          == PSP_UI_MEDIA_ACTION_NONE);
+
+    /* Restarting at 0 s, playing: the bar (not just its ground) is drawn
+       and the timeline sits at the restart's destination. */
+    psp_ui_media_init(&media);
+    psp_ui_media_set_resolving(&media, "YouTube video");
+    psp_ui_media_set_continuation(&media, 0, duration_us, true);
+    CHECK(media.resolving && media.seek_in_progress && media.seek_enabled
+          && media.play_pause_enabled && media.playing
+          && media.duration_us == duration_us
+          && media.current_time_us == 0);
+    /* A destination past the end is clamped to it. */
+    psp_ui_media_set_continuation(
+        &media, duration_us + 1u, duration_us, true);
+    CHECK(media.current_time_us == duration_us);
+    psp_ui_media_set_continuation(&media, 0, duration_us, true);
+
+    /* Directions coalesce into one highlighted time. */
+    PspUiMediaIntent intent = psp_ui_media_update(&media, &right);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
+          && intent.seek_time_us == UINT64_C(10000000));
+    intent = psp_ui_media_update(&media, &right);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
+          && intent.seek_time_us == UINT64_C(20000000));
+    /* A later re-presentation keeps the highlight on screen. */
+    psp_ui_media_set_continuation(&media, 0, duration_us, true);
+    CHECK(media.seek_preview_active
+          && media.seek_preview_time_us == UINT64_C(20000000));
+
+    /* Circle over a highlight drops it; it does not close the video. */
+    intent = psp_ui_media_update(&media, &circle);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW
+          && !media.seek_preview_active);
+
+    /* Highlight then Cross commits that time. */
+    (void) psp_ui_media_update(&media, &right);
+    intent = psp_ui_media_update(&media, &cross);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
+          && intent.seek_time_us == UINT64_C(10000000));
+
+    /* Cross with nothing highlighted is play/pause; Circle then closes. */
+    psp_ui_media_cancel_seek_preview(&media);
+    psp_ui_media_set_continuation(&media, 0, duration_us, true);
+    CHECK(psp_ui_media_update(&media, &cross).action
+          == PSP_UI_MEDIA_ACTION_PLAY_PAUSE);
+    CHECK(psp_ui_media_update(&media, &circle).action
+          == PSP_UI_MEDIA_ACTION_CLOSE);
+
+    /* No duration, or a hidden player: nothing to restore. */
+    psp_ui_media_init(&media);
+    psp_ui_media_set_resolving(&media, "YouTube video");
+    psp_ui_media_set_continuation(&media, 0, 0, true);
+    CHECK(!media.seek_enabled);
+    psp_ui_media_init(&media);
+    psp_ui_media_set_continuation(&media, 0, duration_us, true);
+    CHECK(!media.visible && !media.seek_enabled);
+    return true;
+}
+
 static bool test_media_cancel_closes_from_every_state(void)
 {
     PspUiInput cancel = {
@@ -5494,6 +5615,29 @@ static bool test_kept_status_settles(void)
     return true;
 }
 
+/* A counting status (the page-script clock) updates in place without
+   replaying the toast entry every second, and never displaces an unrelated
+   status another pump is showing. */
+static bool test_progress_status_updates_in_place(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    PspUiInput idle = { .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
+    psp_ui_keep_progress_status(&ui, "PAGE SCRIPTS 3S OF 20S", 12, 60);
+    CHECK(ui.toast_entry_frames != 0
+          && strcmp(ui.status, "PAGE SCRIPTS 3S OF 20S") == 0);
+    for (unsigned frame = 0; frame < 30; frame++)
+        (void) psp_ui_update(&ui, &idle);
+    CHECK(ui.toast_entry_frames == 0);
+    psp_ui_keep_progress_status(&ui, "PAGE SCRIPTS 4S OF 20S", 12, 60);
+    CHECK(ui.toast_entry_frames == 0 && ui.toast_frames >= 60
+          && strcmp(ui.status, "PAGE SCRIPTS 4S OF 20S") == 0);
+    psp_ui_show_status(&ui, "STOPPING PAGE LOAD...", 120);
+    psp_ui_keep_progress_status(&ui, "PAGE SCRIPTS 5S OF 20S", 12, 60);
+    CHECK(strcmp(ui.status, "STOPPING PAGE LOAD...") == 0);
+    return true;
+}
+
 /* The chrome glyph cache is shared with the callback-thread supervisor, so
    it must not be rebuilt for a binding that changes nothing, and a glyph the
    Budget refused under pressure must come back once pressure passes while a
@@ -5584,6 +5728,7 @@ int main(void)
         || !test_chrome_retains_bounded_unicode_glyphs()
         || !test_chrome_vocabulary_resolves_in_the_shipped_subset()
         || !test_media_controls_and_composite()
+        || !test_media_continuation_keeps_the_timeline_live()
         || !test_media_cancel_closes_from_every_state()
         || !test_media_title_uses_unicode_fallback_font()
         || !test_media_play_control_matches_the_page_overlay()
@@ -5599,6 +5744,7 @@ int main(void)
         || !test_media_committed_seek_keeps_timeline_stable()
         || !test_chrome_font_cache_binding_and_refusals()
         || !test_kept_status_settles()
+        || !test_progress_status_updates_in_place()
         || !test_media_title_glyphs_are_retained()
         || !test_loading_progress_ramp_pixels()
         || !test_native_surfaces_own_the_panel()

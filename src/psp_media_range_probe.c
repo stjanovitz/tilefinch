@@ -87,7 +87,8 @@ static bool range_probe_open(
         .timeout_ms = PSP_MEDIA_RANGE_PROBE_TIMEOUT_MS,
         .connect_timeout_ms = PSP_MEDIA_RANGE_PROBE_CONNECT_MS,
         .referer = referer,
-        .url_validator = youtube_media_url_supported
+        .url_validator = youtube_media_url_supported,
+        .tls12_session_resumption = true
     };
     source->range = media_http_range_create(
         budget, session, url, content_length, &options, error, error_size);

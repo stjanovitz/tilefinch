@@ -12,7 +12,45 @@ if(NOT nm_status EQUAL 0)
     message(FATAL_ERROR "psp-nm failed: ${nm_error}")
 endif()
 
-function(check_hot_symbol symbol limit)
+function(check_absent_symbol prefix)
+    set(symbol_types "[Tt]")
+    if(ARGC GREATER 1)
+        set(symbol_types "${ARGV1}")
+    endif()
+    string(REGEX MATCH
+        "${symbol_types}[ \t]+${prefix}(\\.[^ \t\r\n]+)?([\r\n]|$)"
+        row "${nm_output}")
+    if(row)
+        message(FATAL_ERROR
+            "Disabled PSP instrumentation ${prefix} remains in ${PSP_ELF}")
+    endif()
+endfunction()
+
+# FreeType must share the browser's global zlib symbols, not retain a second
+# private (local-text) inflater. Global inflate remains required by HTTPS.
+if(PSP_SHARED_FONT_ZLIB)
+    check_absent_symbol(inflate "t")
+    check_absent_symbol(inflateInit2_ "t")
+    check_absent_symbol(inflate_table "t")
+endif()
+
+# A runtime-off feature can otherwise retain tens of KiB unnoticed while
+# staying under the global ceiling. Pin its absence on the actual linked
+# image, including GCC's cloned (.isra/.constprop) symbol variants.
+if(PSP_NO_SCRIPT_SAMPLER)
+    check_absent_symbol(script_profile_sample)
+    check_absent_symbol(script_profile_charge)
+    check_absent_symbol(youtube_resolve_job_log_response)
+    check_absent_symbol(js_rt_dump_interpreter_stack)
+endif()
+if(PSP_NO_FETCH_TRACE)
+    check_absent_symbol(trace_capture_response)
+    check_absent_symbol(trace_capture_response_at)
+    check_absent_symbol(trace_replay_response)
+    check_absent_symbol(trace_replay_response_with_scratch)
+endif()
+
+function(hot_symbol_size symbol out)
     string(REGEX MATCH
         "[0-9A-Fa-f]+[ \t]+([0-9A-Fa-f]+)[ \t]+[Tt][ \t]+${symbol}([\r\n]|$)"
         row "${nm_output}")
@@ -24,6 +62,11 @@ function(check_hot_symbol symbol limit)
         ".*[ \t]([0-9A-Fa-f]+)[ \t]+[Tt][ \t]+${symbol}([\r\n]|$)"
         "\\1" size_hex "${row}")
     math(EXPR size "0x${size_hex}")
+    set(${out} ${size} PARENT_SCOPE)
+endfunction()
+
+function(check_hot_symbol symbol limit)
+    hot_symbol_size(${symbol} size)
     if(size GREATER limit)
         message(FATAL_ERROR
             "PSP hot function ${symbol} grew to ${size} bytes; measured "
@@ -33,22 +76,63 @@ function(check_hot_symbol symbol limit)
     message(STATUS "PSP hot function ${symbol}: ${size}/${limit} bytes")
 endfunction()
 
+# The code one kind of frame runs through: the sum of its step functions.
+function(check_hot_set label limit)
+    set(total 0)
+    foreach(symbol IN LISTS ARGN)
+        hot_symbol_size(${symbol} size)
+        math(EXPR total "${total} + ${size}")
+    endforeach()
+    if(total GREATER limit)
+        message(FATAL_ERROR
+            "PSP ${label} steps grew to ${total} bytes; measured ceiling is "
+            "${limit}. Move work that does not run every such frame into a "
+            "step behind its own check, or re-measure the device cost before "
+            "raising this ratchet.")
+    endif()
+    message(STATUS "PSP ${label} steps: ${total}/${limit} bytes")
+endfunction()
+
 # These ratchets have deliberately different meanings. `main` is a process
-# growth tripwire over boot and teardown; psp_app_run_interactive is the real
-# resident frame-loop footprint. The browser and media compositors are also
-# actual per-frame instruction-cache footprints; psp_ui_composite itself is
-# only their dispatcher and is not a useful hot-path measurement. Re-measured
-# 2026-08-13 after the owner/loop and composition splits; the loop limit was
-# lowered 2026-09-23 (15,008 -> 13,772 B shipping) after the update, screenshot
-# and allowlist handlers moved out as cold paths.
+# growth tripwire over boot and teardown. The browser and media compositors
+# are actual per-frame instruction-cache footprints; psp_ui_composite itself
+# is only their dispatcher and is not a useful hot-path measurement.
+#
+# The interactive loop is psp_app_run_interactive, a cold driver around
+# psp_loop_frame, one frame's sequence of steps. Work a frame does not always
+# need lives in a psp_loop_* step behind its own check, so what a frame runs
+# is psp_loop_frame plus the steps listed for its kind below; rare steps
+# (suspend/resume, update, downloads, a navigation's end) are unbounded here.
+# The two sets keep the 14,336 B shipping envelope the single loop function
+# was measured against on the device (2026-09-23); psp_loop_frame itself is a
+# tighter tripwire so new work arrives as a named step, not inline.
 if(NOT DEFINED PSP_MAIN_LIMIT)
     set(PSP_MAIN_LIMIT 10752)
 endif()
 check_hot_symbol(main ${PSP_MAIN_LIMIT})
-if(NOT DEFINED PSP_INTERACTIVE_LIMIT)
-    set(PSP_INTERACTIVE_LIMIT 14336)
+if(NOT DEFINED PSP_LOOP_FRAME_LIMIT)
+    set(PSP_LOOP_FRAME_LIMIT 5120)
 endif()
-check_hot_symbol(psp_app_run_interactive ${PSP_INTERACTIVE_LIMIT})
+if(NOT DEFINED PSP_FRAME_SET_LIMIT)
+    set(PSP_FRAME_SET_LIMIT 14336)
+endif()
+check_hot_symbol(psp_loop_frame ${PSP_LOOP_FRAME_LIMIT})
+set(page_frame_steps
+    psp_loop_frame psp_loop_media_frame psp_loop_update_frame
+    psp_loop_home_preconnect psp_loop_pump_navigation psp_loop_render_job
+    psp_loop_track_recovery)
+set(media_frame_steps
+    psp_loop_frame psp_loop_media_frame psp_loop_media_input
+    psp_loop_update_frame psp_loop_track_recovery)
+if(PSP_VALIDATION_LOG)
+    # Scripted input and the power test's tick run every validation frame.
+    list(APPEND page_frame_steps
+        psp_loop_scripted_input psp_loop_power_test_tick)
+    list(APPEND media_frame_steps
+        psp_loop_scripted_input psp_loop_power_test_tick)
+endif()
+check_hot_set("page frame" ${PSP_FRAME_SET_LIMIT} ${page_frame_steps})
+check_hot_set("media frame" ${PSP_FRAME_SET_LIMIT} ${media_frame_steps})
 check_hot_symbol(layout_block_impl 36864)
 check_hot_symbol(psp_ui_composite_browser 4096)
 check_hot_symbol(psp_ui_media_composite_layers 4096)

@@ -45,6 +45,10 @@ typedef struct {
     /* Ordinary HTML media uses the HTTP Range header. Provider streams keep
        the historical query-range form because that is the URL they sign. */
     bool standard_range_header;
+    /* Ask for resumable TLS 1.2 connections (FetchRequest's
+       tls12_session_resumption). Set for googlevideo streams, whose
+       reconnects otherwise repeat a full handshake. */
+    bool tls12_session_resumption;
     /* Select the request representation for an audio-only source. This does
        not change the common range/cache machinery or its bounds. */
     bool audio_only;
@@ -117,6 +121,17 @@ typedef struct {
     size_t window_new_connections;
     size_t window_handshakes;
     uint64_t handshake_max_us;
+    /* The last completed window's negotiated CURL_HTTP_VERSION_*: HTTP/2
+       lets the video and audio ranges share one connection and handshake.
+       tls12_retries counts windows that paid a second full handshake after
+       a TLS 1.3 attempt failed. */
+    long http_version;
+    size_t tls12_retries;
+    /* curl connection id of the last completed window, and how many times
+       it changed: equal video/audio ids mean the two streams share one
+       multiplexed connection (and one TLS handshake). */
+    long long connection_id;
+    size_t connections_seen;
     /* Bytes of the outstanding window the transport has accepted. Sampled at
        call time, not accumulated: it is the only progress a refill shows
        before its window is installed. */

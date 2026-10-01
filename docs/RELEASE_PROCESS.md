@@ -22,12 +22,12 @@ A release is one commit, one version, and one monotonic release sequence:
   may explicitly authorize one older signed sequence for one A/B trial; it
   does not change release numbering or permit a remote downgrade.
 
-The shipped artifacts are:
-
 This production process covers signed Stable/Beta releases. Contributor
 Developer builds use the separate `developer-envelope` workflow in
 [SECURE_UPDATES.md](SECURE_UPDATES.md); they do not consume or advance the
 signed release sequence.
+
+The shipped artifacts are:
 
 | Artifact | Purpose |
 |---|---|
@@ -79,6 +79,11 @@ Remove or replace public documentation links to private logs before publishing,
 while retaining the logs in the private backup for future development. This
 requirement does not authorize rewriting already-published history.
 
+Native-tier and performance investigations follow the same rule: publish
+summaries of findings, measurement limits and conditions for revisiting rejected
+approaches. Keep detailed journals, local evidence paths and internal branch
+references in the private archive and the ignored local investigation directory.
+
 ## Step 1 — finalize the changelog
 
 `CHANGELOG.md` accumulates changes under `## Unreleased`. At cut time, by
@@ -86,34 +91,57 @@ hand, on the release commit:
 
 1. Rename `## Unreleased` to `## <version> — <YYYY-MM-DD>`.
 2. Add a fresh, empty `## Unreleased` section above it.
-3. On the first release only, drop the "no binary release has been
-   published yet" clause from the changelog intro and update the README
-   Install section, which says the same thing.
-4. Commit. The script verifies a `## <version>` heading exists and fails
+3. Commit. The script verifies a `## <version>` heading exists and fails
    the cut if this step was skipped.
 
 The version in `CMakeLists.txt` (`project(psp_browser_tilefinch VERSION …)`)
 must be bumped and committed in the same way; the script cross-checks it
 against the version argument.
 
+## Step 1b — train the JavaScript engine profile
+
+Release builds of the JavaScript engine use profile feedback (PGO); daily
+development builds do not. The profile is valid only for the exact engine
+sources, headers, compiler and flags it was trained on, so train it from the
+release commit, after the changelog commit:
+
+```sh
+cmake --preset psp -B build-pgo-gen -DTILEFINCH_ALLOW_BUILD_DIR=ON \
+    -DTILEFINCH_PSP_VALIDATION_LOG=ON -DPSP_BROWSER_QUICKJS_PGO_GENERATE=ON \
+    -DPSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE=9000000
+cmake --build build-pgo-gen --target psp-browser-script
+scripts/train-quickjs-pgo.sh build-pgo-gen build-pgo-profile perf/traces
+```
+
+Training replays the chatgpt-ask journey under PPSSPP (about two minutes;
+it needs a logged-in GUI session, so it cannot run in CI) and never touches
+a device. Pass the directory to the cut script with `--quickjs-pgo
+build-pgo-profile`; configure refuses a profile whose fingerprint does not
+match the engine being built, because a stale profile makes the engine
+larger and slower than none. `--no-quickjs-pgo` builds without it, as a
+deliberate choice. Measured on a PSP-3000 (PERFORMANCE_LEDGER.md,
+2026-09-29): first usable input on chatgpt.com 39.4 -> 37.4 s, first answer
+about 98 -> 93.5 s.
+
 ## Step 2 — run the cut script
 
 ```sh
 export PSPDEV=/path/to/pspdev
-scripts/cut-release.sh --update-root /offline-export/root-v1.tfur 0.1.0 1
+scripts/cut-release.sh --update-root /offline-export/root-v1.tfur \
+    --quickjs-pgo build-pgo-profile 0.1.0 1
 ```
 
 or, for a deliberately updater-disabled build:
 
 ```sh
-scripts/cut-release.sh --no-update-root 0.1.0 1
+scripts/cut-release.sh --no-update-root --quickjs-pgo build-pgo-profile 0.1.0 1
 ```
 
 `--update-owner` / `--update-repo` override the GitHub location compiled
 into the update client when the signed releases are published somewhere
 other than the CMake defaults (see "Dedicated network path" in
-SECURE_UPDATES.md; the source repository being private forces a public
-release location).
+SECURE_UPDATES.md; the device stores no GitHub token, so the release
+location must be public).
 
 The script stops at the first failure. In order it:
 
@@ -291,8 +319,8 @@ in SECURE_UPDATES.md for the ceremony record.
 
 ## Private local PPSSPP qualification
 
-A signed update can be exercised end to end before any repository or release
-asset is public. The qualification creates throwaway signing keys and a
+A signed update can be exercised end to end before any release asset is
+public. The qualification creates throwaway signing keys and a
 throwaway TLS certificate authority, builds a validation-only PSP install
 which embeds their public halves, serves the exact TFUM and TFUP from a
 loopback HTTPS origin, and runs the stable launcher in an isolated PPSSPP
@@ -315,7 +343,7 @@ run ends; none belongs in `dist/` or source control.
 
 This proves the on-device TLS verifier, signed Stable client, package hash,
 installer, redundant journal, launcher, and health transition without
-granting a private GitHub repository to PPSSPP. It does not qualify the
+contacting GitHub at all. It does not qualify the
 production signing keys, GitHub availability, power-loss behavior, or PSP
 firmware. Those remain separate release gates.
 

@@ -16,8 +16,8 @@ request-send-low-client-hints=1
 request-sec-fetch-user=1
 request-upgrade-insecure=1
 status=200
-length=19768
-response-body-hash=885b520868011308
+length=19806
+response-body-hash=634c91eba9a514ea
 effective-url=https://provisional-commit.test/document
 content-type=text/html; charset=utf-8
 etag=

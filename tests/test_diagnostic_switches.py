@@ -55,6 +55,33 @@ def documented_switches():
 
 
 def main():
+    if "--update-switch" in sys.argv:
+        index = sys.argv.index("--update-switch")
+        name, scope, description = sys.argv[index + 1:index + 4]
+        if name not in switch_sites() or name not in documented_switches():
+            raise ValueError("switch must already be source-backed and documented")
+        rows = []
+        for line in DOC.read_text(encoding="utf-8").splitlines():
+            if line.startswith(f"| `{name}` |"):
+                columns = line.split("|")
+                columns[4], columns[5] = f" {scope} ", f" {description} "
+                line = "|".join(columns)
+            rows.append(line)
+        DOC.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    if "--register-switch" in sys.argv:
+        index = sys.argv.index("--register-switch")
+        name, scope, description = sys.argv[index + 1:index + 4]
+        if not re.fullmatch(r"TILEFINCH_[A-Z0-9_]+", name):
+            raise ValueError("invalid diagnostic switch name")
+        sites = switch_sites()
+        if name not in sites or name in documented_switches():
+            raise ValueError("switch must be a new source-backed read")
+        text = DOC.read_text(encoding="utf-8")
+        row = f"| `{name}` | {len(sites[name])} | `{sites[name][0]}` | {scope} | {description} |\n"
+        lines = text.splitlines(keepends=True)
+        last = max(i for i, line in enumerate(lines) if line.startswith("| `TILEFINCH_"))
+        lines.insert(last + 1, row)
+        DOC.write_text("".join(lines), encoding="utf-8")
     if "--refresh-sites" in sys.argv[2:]:
         refresh_sites()
     read = read_switches()

@@ -520,11 +520,30 @@ static void dump_probe_dom(lxb_dom_node_t *node, unsigned depth,
             const char *id = document_attribute(node, "id", &id_length);
             const char *class_name = document_attribute(node, "class",
                                                         &class_length);
-            printf("probe-dom depth=%u tag=%.*s id=\"%.*s\" class=\"%.*s\"\n",
+            size_t style_length = 0;
+            const char *style = document_attribute(node, "style",
+                                                   &style_length);
+            if (style_length > 160) style_length = 160;
+            printf("probe-dom depth=%u tag=%.*s id=\"%.*s\" class=\"%.*s\" "
+                   "style=\"%.*s\"",
                    depth, (int) name_length, name,
                    (int) id_length, id == NULL ? "" : id,
                    (int) class_length,
-                   class_name == NULL ? "" : class_name);
+                   class_name == NULL ? "" : class_name,
+                   (int) style_length, style == NULL ? "" : style);
+            /* Geometry-bearing attributes (SVG sizing, form controls). */
+            static const char *const extra[] = {
+                "width", "height", "viewBox", "type", "d", "role"
+            };
+            for (size_t e = 0; e < sizeof(extra) / sizeof(extra[0]); e++) {
+                size_t value_length = 0;
+                const char *value = document_attribute(node, extra[e],
+                                                       &value_length);
+                if (value == NULL) continue;
+                if (value_length > 400) value_length = 400;
+                printf(" %s=\"%.*s\"", extra[e], (int) value_length, value);
+            }
+            printf("\n");
             (*remaining)--;
         } else {
             size_t text_length = 0;

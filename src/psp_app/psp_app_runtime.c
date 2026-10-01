@@ -1384,7 +1384,9 @@ static bool psp_present_video_surface(void)
 
 static bool psp_media_seek_holds_scanout(const PspMediaSession *media)
 {
-    if (media == NULL || media->job_resume_open) return false;
+    if (media == NULL
+        || psp_media_continuation_resuming(&media->continuation))
+        return false;
     switch (media->job_phase) {
     case PSP_MEDIA_JOB_SEEK_PREPARE:
     case PSP_MEDIA_JOB_SEEK_PRIME:
@@ -1408,20 +1410,49 @@ static struct {
     uint64_t first_visible_us;
     size_t rendered_frames;
     int action;
+    /* Page presses a later one replaced before their frame completed (a
+       queued burst replays one per frame): each is reported, timed from
+       its own press, when the one that replaced it completes. */
+    struct {
+        uint64_t started_us, first_visible_us;
+    } superseded[8];
+    uint8_t superseded_count;
 } psp_focus_feedback;
+
+static bool psp_focus_feedback_page_action(int action)
+{
+    return action == (int) PSP_UI_ACTION_PAGE_UP
+        || action == (int) PSP_UI_ACTION_PAGE_DOWN;
+}
 
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us)
 {
     if (engine == NULL) {
         psp_focus_feedback.engine = NULL;
+        psp_focus_feedback.superseded_count = 0;
         return;
     }
     const NavigationSession *navigation = browser_engine_navigation(engine);
     const TileCache *render = browser_engine_render_metrics_view(engine);
     if (navigation == NULL || render == NULL) return;
-    if (psp_focus_feedback.engine != NULL)
+    if (psp_focus_feedback.engine != NULL) {
         printf("tilefinch-focus-feedback-incomplete: action=%d reason=superseded\n",
                psp_focus_feedback.action);
+        if (psp_focus_feedback_page_action(psp_focus_feedback.action)
+            && psp_focus_feedback_page_action(action)
+            && psp_focus_feedback.superseded_count
+                   < sizeof(psp_focus_feedback.superseded)
+                         / sizeof(psp_focus_feedback.superseded[0])) {
+            psp_focus_feedback.superseded[
+                psp_focus_feedback.superseded_count].started_us =
+                    psp_focus_feedback.started_us;
+            psp_focus_feedback.superseded[
+                psp_focus_feedback.superseded_count++].first_visible_us =
+                    psp_focus_feedback.first_visible_us;
+        }
+    }
+    if (!psp_focus_feedback_page_action(action))
+        psp_focus_feedback.superseded_count = 0;
     psp_focus_feedback.engine = engine;
     psp_focus_feedback.generation = navigation->generation;
     psp_focus_feedback.started_us = started_us;
@@ -1441,6 +1472,7 @@ static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState
         printf("tilefinch-focus-feedback-incomplete: action=%d reason=navigation\n",
                psp_focus_feedback.action);
         psp_focus_feedback.engine = NULL;
+        psp_focus_feedback.superseded_count = 0;
         return;
     }
     const TileCache *render = browser_engine_render_metrics_view(engine);
@@ -1456,8 +1488,7 @@ static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState
             && render->frames_rendered <= psp_focus_feedback.rendered_frames)
         || browser_engine_render_frame_pending(engine)
         || frame != browser_engine_framebuffer(engine, NULL)) return;
-    if (psp_focus_feedback.action == (int) PSP_UI_ACTION_PAGE_UP
-        || psp_focus_feedback.action == (int) PSP_UI_ACTION_PAGE_DOWN) {
+    if (psp_focus_feedback_page_action(psp_focus_feedback.action)) {
         /* Time from the press to a complete frame at the new position. */
         /* Cumulative render-cache counters; consecutive lines give each
            press's hits (paint-ahead served) and raster misses. */
@@ -1490,6 +1521,19 @@ static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState
                (unsigned long long) render->frame_indicator_us,
                render->overflow_tile_commands,
                render->overflow_direct_commands);
+        for (uint8_t at = 0; at < psp_focus_feedback.superseded_count; at++) {
+            uint64_t started_us = psp_focus_feedback.superseded[at].started_us;
+            uint64_t shown_us =
+                psp_focus_feedback.superseded[at].first_visible_us != 0
+                    ? psp_focus_feedback.superseded[at].first_visible_us
+                    : visible_us;
+            printf("tilefinch-scroll-feedback: action=%d elapsed=%lluus "
+                   "first-visible=%lluus superseded=1\n",
+                   psp_focus_feedback.action,
+                   (unsigned long long) (complete_us - started_us),
+                   (unsigned long long) (shown_us - started_us));
+        }
+        psp_focus_feedback.superseded_count = 0;
         psp_focus_feedback.engine = NULL;
         return;
     }
@@ -2284,6 +2328,8 @@ static PspUiMediaIntent psp_completed_supervisor_media_intent;
 enum { PSP_SUPERVISOR_PAGE_INPUT_LIMIT = 4 };
 static uint32_t psp_completed_supervisor_page_input[
     PSP_SUPERVISOR_PAGE_INPUT_LIMIT];
+static uint64_t psp_completed_supervisor_page_input_us[
+    PSP_SUPERVISOR_PAGE_INPUT_LIMIT];
 static uint8_t psp_completed_supervisor_page_input_count;
 volatile unsigned psp_validation_cancel_after_ms;
 volatile unsigned psp_validation_preview_scroll;
@@ -2454,6 +2500,17 @@ static struct {
     uint64_t last_poll_us;
     bool optional_preemptible;
     bool forward_awaited;
+    /* Inside a provisional layout completion of this engine, whose
+       checkpoints serve page scrolling; serving guards reentry. */
+    BrowserEngine *engine;
+    bool completion;
+    bool serving;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* The oldest press being served, and when its move was first shown,
+       for tilefinch-scroll-feedback. */
+    uint64_t served_press_us;
+    uint64_t served_visible_us;
+#endif
     PspUiToolbarInputState *toolbar;
 } psp_runtime_cooperate;
 
@@ -2469,9 +2526,21 @@ void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
     psp_runtime_cooperate.last_poll_us = 0;
     psp_runtime_cooperate.optional_preemptible = false;
     psp_runtime_cooperate.forward_awaited = false;
+    psp_runtime_cooperate.engine = NULL;
+    psp_runtime_cooperate.completion = false;
+    psp_runtime_cooperate.serving = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_runtime_cooperate.served_press_us = 0;
+    psp_runtime_cooperate.served_visible_us = 0;
+#endif
     atomic_store_explicit(&psp_runtime_cooperate.owner_thread,
                           sceKernelGetThreadId(), memory_order_relaxed);
     atomic_store_explicit(&psp_runtime_cooperate.armed, 1u, memory_order_release);
+}
+
+void psp_runtime_cooperate_serve_page_scroll(BrowserEngine *engine)
+{
+    psp_runtime_cooperate.engine = engine;
 }
 
 bool psp_runtime_cooperate_end(uint32_t *observed_buttons)
@@ -2506,21 +2575,58 @@ void psp_navigation_cooperate_begin(
         "STOPPING PAGE LOAD...", "navigation-begin", engine, NULL);
 }
 
-void psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui)
+/* Presses that only move the timeline; the session can record them as
+   intent while an open is still running. */
+static bool psp_media_timeline_action(PspUiMediaAction action)
+{
+    return action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
+        || action == PSP_UI_MEDIA_ACTION_SEEK
+        || action == PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW
+        || action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE;
+}
+
+bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
+                                      PspUiMediaIntent *timeline_intent)
 {
     PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
+    bool taken = false;
     if (media_ui == NULL || cooperate->active == 0
         || !cooperate->media_surface
         || tilefinch_cancellation_requested(&cooperate->cancellation)
         || !__sync_bool_compare_and_swap(
-               &cooperate->presenting, 0u, 1u)) return;
+               &cooperate->presenting, 0u, 1u)) return false;
     __sync_synchronize();
     if (cooperate->active != 0 && cooperate->media_surface
         && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
+        PspUiMediaIntent pending = cooperate->pending_media_intent;
         cooperate->supervisor_media_ui = *media_ui;
+        /*
+         * An open can run for seconds (a rewind re-resolves its URLs). Hand
+         * timeline presses to the browser thread now rather than at the end
+         * of the scope, so the session's recorded target and this snapshot
+         * agree. The press's own visual is carried onto the fresh snapshot:
+         * the browser thread shows it from the next frame on.
+         */
+        if (timeline_intent != NULL
+            && psp_media_timeline_action(pending.action)) {
+            cooperate->pending_media_intent = (PspUiMediaIntent) {0};
+            PspUiMediaState *snapshot = &cooperate->supervisor_media_ui;
+            if (pending.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK)
+                psp_ui_media_set_seek_preview(snapshot, pending.seek_time_us);
+            else if (pending.action == PSP_UI_MEDIA_ACTION_SEEK)
+                psp_ui_media_commit_seek(snapshot, pending.seek_time_us);
+            else if (pending.action
+                         == PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW)
+                psp_ui_media_cancel_seek_preview(snapshot);
+            else
+                snapshot->playing = !snapshot->playing;
+            *timeline_intent = pending;
+            taken = true;
+        }
     }
     __sync_synchronize();
     cooperate->presenting = 0;
+    return taken;
 }
 
 /* Hold the supervisor's presentation fence around a chrome glyph cache
@@ -2727,6 +2833,46 @@ static void psp_queue_provisional_scroll(
     }
 }
 
+/* Work that serves page presses has begun (a relayout's build, after its
+   images loaded): the leading page presses queued for the page meanwhile
+   are served from its checkpoints rather than replayed after it. A queued
+   press of any other kind keeps its place and everything after it. */
+static void psp_serve_queued_page_scrolls(PspNavigationCooperate *cooperate)
+{
+    if (!cooperate->active || !cooperate->owner_thread_only
+        || !__sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u))
+        return;
+    uint8_t served = 0;
+    while (served < cooperate->pending_page_input_count) {
+        uint32_t pressed = cooperate->pending_page_input[served];
+        if (pressed == 0
+            || (pressed & ~PSP_INPUT_ROUTE_SCROLL_BUTTONS) != 0) break;
+        psp_queue_provisional_scroll(
+            cooperate,
+            (pressed & (PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_PAGE_DOWN)) != 0
+                ? 1 : -1);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t pressed_us = cooperate->pending_page_input_us[served];
+        if (psp_runtime_cooperate.served_press_us == 0
+            || pressed_us < psp_runtime_cooperate.served_press_us)
+            psp_runtime_cooperate.served_press_us = pressed_us;
+#endif
+        served++;
+    }
+    if (served != 0) {
+        uint8_t kept = cooperate->pending_page_input_count - served;
+        memmove(&cooperate->pending_page_input[0],
+                &cooperate->pending_page_input[served],
+                kept * sizeof(cooperate->pending_page_input[0]));
+        memmove(&cooperate->pending_page_input_us[0],
+                &cooperate->pending_page_input_us[served],
+                kept * sizeof(cooperate->pending_page_input_us[0]));
+        cooperate->pending_page_input_count = kept;
+    }
+    __sync_synchronize();
+    cooperate->presenting = 0;
+}
+
 bool psp_request_provisional_scroll(
     BrowserEngine *engine, PspUiState *ui, int delta, bool page)
 {
@@ -2814,8 +2960,16 @@ void psp_navigation_cooperate_end(const char *scope)
                     &psp_completed_supervisor_page_input[1],
                     (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
                         * sizeof(psp_completed_supervisor_page_input[0]));
+                memmove(
+                    &psp_completed_supervisor_page_input_us[0],
+                    &psp_completed_supervisor_page_input_us[1],
+                    (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
+                        * sizeof(psp_completed_supervisor_page_input_us[0]));
                 psp_completed_supervisor_page_input_count--;
             }
+            psp_completed_supervisor_page_input_us[
+                psp_completed_supervisor_page_input_count] =
+                    psp_navigation_cooperate.pending_page_input_us[at];
             psp_completed_supervisor_page_input[
                 psp_completed_supervisor_page_input_count++] =
                     psp_navigation_cooperate.pending_page_input[at];
@@ -2834,8 +2988,15 @@ void psp_navigation_cooperate_end(const char *scope)
                     &psp_completed_supervisor_page_input[1],
                     (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
                         * sizeof(psp_completed_supervisor_page_input[0]));
+                memmove(
+                    &psp_completed_supervisor_page_input_us[0],
+                    &psp_completed_supervisor_page_input_us[1],
+                    (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
+                        * sizeof(psp_completed_supervisor_page_input_us[0]));
                 psp_completed_supervisor_page_input_count--;
             }
+            psp_completed_supervisor_page_input_us[
+                psp_completed_supervisor_page_input_count] = 0;
             psp_completed_supervisor_page_input[
                 psp_completed_supervisor_page_input_count++] =
                     psp_navigation_cooperate.forwarded_pressed[
@@ -2967,11 +3128,13 @@ bool psp_navigation_cooperate_owner_present(const PspUiState *ui)
     return shown;
 }
 
-bool psp_navigation_cooperate_take_page_input(uint32_t *pressed)
+bool psp_navigation_cooperate_take_page_input(uint32_t *pressed,
+                                              uint64_t *pressed_us)
 {
-    if (pressed == NULL
+    if (pressed == NULL || pressed_us == NULL
         || psp_completed_supervisor_page_input_count == 0) return false;
     *pressed = psp_completed_supervisor_page_input[0];
+    *pressed_us = psp_completed_supervisor_page_input_us[0];
     psp_completed_supervisor_page_input_count--;
     if (psp_completed_supervisor_page_input_count != 0) {
         memmove(
@@ -2979,6 +3142,11 @@ bool psp_navigation_cooperate_take_page_input(uint32_t *pressed)
             &psp_completed_supervisor_page_input[1],
             psp_completed_supervisor_page_input_count
                 * sizeof(psp_completed_supervisor_page_input[0]));
+        memmove(
+            &psp_completed_supervisor_page_input_us[0],
+            &psp_completed_supervisor_page_input_us[1],
+            psp_completed_supervisor_page_input_count
+                * sizeof(psp_completed_supervisor_page_input_us[0]));
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     printf("tilefinch-ui-supervisor-input: replay=0x%04x remaining=%u\n",
@@ -3131,10 +3299,14 @@ static void psp_work_ui_tick(bool owner_thread)
         .owner_thread = owner_thread,
         .optional_preemptible = psp_runtime_cooperate.optional_preemptible,
         .forward_awaited = psp_runtime_cooperate.forward_awaited,
+        .scroll_served = owner_thread && psp_runtime_cooperate.completion
+            && psp_runtime_cooperate.engine != NULL,
         .priority_handled = priority_handled,
         .cancelling = tilefinch_cancellation_requested(
             &cooperate->cancellation),
-        .acknowledge_busy = cooperate->acknowledge_non_cancel_busy
+        .acknowledge_busy = cooperate->acknowledge_non_cancel_busy,
+        .media_preview_active = cooperate->media_surface
+            && cooperate->supervisor_media_ui.seek_preview_active
     };
     switch (psp_input_route(&route_context)) {
         case PSP_INPUT_ROUTE_YIELD:
@@ -3144,9 +3316,13 @@ static void psp_work_ui_tick(bool owner_thread)
                 sceKernelGetSystemTimeWide();
             if (ui_pressed != 0 && !priority_handled
                 && cooperate->pending_page_input_count
-                       < PSP_SUPERVISOR_PAGE_INPUT_LIMIT)
+                       < PSP_SUPERVISOR_PAGE_INPUT_LIMIT) {
+                cooperate->pending_page_input_us[
+                    cooperate->pending_page_input_count] =
+                        sceKernelGetSystemTimeWide();
                 cooperate->pending_page_input[
                     cooperate->pending_page_input_count++] = ui_pressed;
+            }
             break;
         case PSP_INPUT_ROUTE_PRIORITY_DONE:
             /* Already applied; replaying Select would immediately close
@@ -3208,7 +3384,12 @@ static void psp_work_ui_tick(bool owner_thread)
                     ? 1 : -1;
             psp_queue_provisional_scroll(cooperate, direction);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-            psp_load_scroll_note_press();
+            /* Load-time scroll telemetry counts the loading page only; a
+               press served during a layout completion is timed instead. */
+            if (cooperate->engine != NULL) psp_load_scroll_note_press();
+            else if (psp_runtime_cooperate.served_press_us == 0)
+                psp_runtime_cooperate.served_press_us =
+                    sceKernelGetSystemTimeWide();
 #endif
             cooperate->input_acknowledgements++;
             acknowledgement_started_us =
@@ -3242,9 +3423,17 @@ static void psp_work_ui_tick(bool owner_thread)
                     &cooperate->pending_page_input[1],
                     (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
                         * sizeof(cooperate->pending_page_input[0]));
+                memmove(
+                    &cooperate->pending_page_input_us[0],
+                    &cooperate->pending_page_input_us[1],
+                    (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
+                        * sizeof(cooperate->pending_page_input_us[0]));
                 cooperate->pending_page_input_count--;
                 cooperate->pending_page_input_dropped++;
             }
+            cooperate->pending_page_input_us[
+                cooperate->pending_page_input_count] =
+                    sceKernelGetSystemTimeWide();
             cooperate->pending_page_input[
                 cooperate->pending_page_input_count++] = ui_pressed;
             cooperate->input_acknowledgements++;
@@ -3343,6 +3532,123 @@ static void psp_work_ui_tick(bool owner_thread)
     cooperate->presenting = 0;
 }
 
+/* A provisional page's layout completion is running on this thread (we
+   are at one of its checkpoints): apply the page presses the supervisor
+   queued to the committed page, fill what they uncovered a slice at a time,
+   and present. The completion keeps its progress. */
+/* Presents the engine frame a completion-time scroll or fill changed. */
+static bool psp_runtime_present_completion_frame(
+    PspNavigationCooperate *cooperate)
+{
+    bool shown = psp_platform_present(
+        cooperate, psp_runtime_cooperate.frame, PSP_SCREEN_WIDTH,
+        PSP_SCREEN_HEIGHT, PSP_SCREEN_WIDTH);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* The same line a main-loop page press reports: press to the first
+       frame at the new position, and to a complete one. */
+    uint64_t pressed_us = psp_runtime_cooperate.served_press_us;
+    if (pressed_us != 0 && shown) {
+        uint64_t shown_us = sceKernelGetSystemTimeWide();
+        if (psp_runtime_cooperate.served_visible_us == 0)
+            psp_runtime_cooperate.served_visible_us = shown_us;
+        if (!browser_engine_completion_frame_pending(
+                psp_runtime_cooperate.engine)) {
+            printf("tilefinch-scroll-feedback: action=completion "
+                   "elapsed=%lluus first-visible=%lluus\n",
+                   (unsigned long long) (shown_us - pressed_us),
+                   (unsigned long long)
+                       (psp_runtime_cooperate.served_visible_us
+                        - pressed_us));
+            psp_runtime_cooperate.served_press_us = 0;
+            psp_runtime_cooperate.served_visible_us = 0;
+        }
+    }
+#endif
+    return shown;
+}
+
+/* Applies queued page presses to the committed page; true when it moved. */
+static bool psp_runtime_apply_completion_scrolls(
+    PspNavigationCooperate *cooperate, BrowserEngine *engine)
+{
+    int requests = __sync_lock_test_and_set(
+        &cooperate->provisional_scroll_requests, 0);
+    int direction = requests > 0 ? 1 : -1;
+    bool moved = false;
+    /* A press at the end of the laid-out extent has nowhere to go until
+       the completion adopts; it is dropped rather than replayed late. */
+    for (int remaining = requests * direction; remaining > 0; remaining--) {
+        if (!browser_engine_completion_scroll_page(engine, direction)) break;
+        moved = true;
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (requests != 0 && !moved
+        && psp_runtime_cooperate.served_visible_us == 0)
+        psp_runtime_cooperate.served_press_us = 0;
+#endif
+    /* The move first: resident tiles and a checkerboard, at once. */
+    if (moved) (void) psp_runtime_present_completion_frame(cooperate);
+    return moved;
+}
+
+static void psp_runtime_serve_completion_scroll(
+    PspNavigationCooperate *cooperate, uint64_t now_us)
+{
+    BrowserEngine *engine = psp_runtime_cooperate.engine;
+    if (!browser_engine_layout_completion_running(engine)
+        || tilefinch_cancellation_requested(&cooperate->cancellation))
+        return;
+    psp_runtime_cooperate.serving = true;
+    (void) psp_runtime_apply_completion_scrolls(cooperate, engine);
+    /* Then the screen the reader paged to is filled before the completion
+       continues: its checkerboard is what they are looking at, and the
+       completion's next checkpoint can be hundreds of milliseconds away
+       (root style, bidi). Input is still sampled every 16 ms and further
+       presses applied; after 500 ms the completion gets its turn. */
+    uint64_t fill_started_us = now_us;
+    uint64_t progress_shown_us = now_us;
+    while (browser_engine_completion_frame_pending(engine)
+           && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
+        uint64_t fill_now_us = sceKernelGetSystemTimeWide();
+        if (fill_now_us - fill_started_us >= UINT64_C(500000)) break;
+        /* A partial frame is a full recompose: show one every 50 ms. */
+        bool show_progress =
+            fill_now_us - progress_shown_us >= UINT64_C(50000);
+        if (browser_engine_completion_raster_step(engine, show_progress)) {
+            (void) psp_runtime_present_completion_frame(cooperate);
+            progress_shown_us = fill_now_us;
+        }
+        if (fill_now_us - psp_runtime_cooperate.last_poll_us
+                >= UINT64_C(16000)) {
+            psp_runtime_cooperate.last_poll_us = fill_now_us;
+            psp_work_ui_tick(true);
+            (void) psp_runtime_apply_completion_scrolls(cooperate, engine);
+        }
+    }
+    cooperate->provisional_fill_us = now_us;
+    psp_runtime_cooperate.serving = false;
+}
+
+/* Parse-time page JavaScript has a bounded allowance (twenty seconds); a
+   page that exhausts it keeps its server content but loses JavaScript. Once
+   a load has spent a few seconds of it, say so, so a long quiet wait reads
+   as work rather than a hang. */
+void psp_show_page_script_clock(PspUiState *ui, const BrowserEngine *engine)
+{
+    uint64_t used_us = 0, limit_us = 0;
+    if (ui == NULL
+        || !browser_engine_parser_script_time(engine, &used_us, &limit_us)
+        || limit_us == 0 || used_us < UINT64_C(3000000)) return;
+    /* Microseconds >> 10 is ~1.024 ms; 977 of those make a second. Keeps
+       software 64-bit division out of the frame path. */
+    uint32_t used_s = (uint32_t) (used_us >> 10) / 977u;
+    uint32_t limit_s = (uint32_t) (limit_us >> 10) / 977u;
+    char text[40];
+    snprintf(text, sizeof(text), "PAGE SCRIPTS %uS OF %uS",
+             (unsigned) used_s, (unsigned) limit_s);
+    psp_ui_keep_progress_status(ui, text, 12u, 45u);
+}
+
 bool psp_platform_cooperate(
     void *context, const char *phase, size_t completed_work_units)
 {
@@ -3357,14 +3663,27 @@ bool psp_platform_cooperate(
         /* Optional work that holds no author state (a font batch, the rest
            of a provisional layout) yields to page input and reruns; see
            psp_input_route() for the extension a reader waits on. */
+        if (phase != NULL && strcmp(phase, "page-scroll-servable") == 0) {
+            /* Not optional: the build is kept, and only page presses are
+               served at its checkpoints (the completion's route). */
+            psp_runtime_cooperate.completion = completed_work_units != 0;
+            if (psp_runtime_cooperate.completion
+                && psp_runtime_cooperate.engine != NULL)
+                psp_serve_queued_page_scrolls(cooperate);
+            return true;
+        }
         bool awaited = phase != NULL
             && strcmp(phase, "optional-layout-extension-awaited") == 0;
+        bool completion = awaited || (phase != NULL
+            && strcmp(phase, "optional-layout-completion") == 0);
         if (phase != NULL
-            && (awaited || strcmp(phase, "optional-font-publication") == 0
-                || strcmp(phase, "optional-layout-completion") == 0)) {
+            && (completion
+                || strcmp(phase, "optional-font-publication") == 0)) {
             psp_runtime_cooperate.optional_preemptible = completed_work_units != 0;
             psp_runtime_cooperate.forward_awaited =
                 awaited && completed_work_units != 0;
+            psp_runtime_cooperate.completion =
+                completion && completed_work_units != 0;
             if (completed_work_units == 0) return true;
         }
         uint64_t now = sceKernelGetSystemTimeWide();
@@ -3385,8 +3704,14 @@ bool psp_platform_cooperate(
             psp_runtime_cooperate.last_poll_us = now;
             psp_work_ui_tick(true);
         }
+        if (cooperate->active && psp_runtime_cooperate.completion
+            && psp_runtime_cooperate.engine != NULL
+            && !psp_runtime_cooperate.serving)
+            psp_runtime_serve_completion_scroll(cooperate, now);
     }
     if (cooperate == NULL || !cooperate->active) return true;
+    if (cooperate->engine != NULL)
+        psp_show_page_script_clock(cooperate->ui, cooperate->engine);
     if (psp_home_exit_pending()
         && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
         tilefinch_cancellation_request(&cooperate->cancellation);
@@ -3548,6 +3873,9 @@ bool psp_platform_cooperate(
     /* Input/presentation above wins first. This never raises transport
        priority and does nothing unless its setup call is still active. */
     if (running) fetch_background_transport_cooperate(now_us);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    psp_network_dns_guard();
+#endif
     return running;
 }
 

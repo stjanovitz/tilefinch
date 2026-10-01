@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tilefinch/psp_media_presentation_gate.h"
+#include "tilefinch/psp_media_scrub.h"
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/cancellation.h"
@@ -119,19 +121,15 @@ typedef struct {
     const TilefinchCancellation *open_cancellation;
     uint64_t generation;
     uint64_t clock_us;
-    /* After a non-preview seek, random-access decode begins at the preceding
-       keyframe. Frames before this floor are prerequisites, not presentation
-       candidates, and stay internal until the requested position is reached. */
-    uint64_t presentation_floor_us;
-    /* Adaptive audio stays at the requested AU while video privately walks
-       from the preceding random-access point to presentation_floor_us. */
-    bool presentation_preroll_audio_held;
-    bool controller_audio_hold;
-    /* Initial playback has no nonzero seek floor. It waits for the bounded
-       decoded-picture queue to fill before audio establishes the clock. */
-    bool presentation_preroll_startup;
-    bool presentation_preroll_startup_claimed;
-    size_t presentation_preroll_displayed_baseline;
+    /* The presentation gate (psp_media_presentation_gate.h). After a
+       non-preview seek, frames before the floor are prerequisites and stay
+       internal. Audio stays at the requested AU while video privately walks
+       from the preceding random-access point to the floor. Initial playback
+       instead waits in the startup preroll for the decoded-picture queue to
+       fill before audio establishes the clock. */
+    PspMediaSeekFloor seek_floor;
+    PspMediaAudioHold audio_hold;
+    PspMediaStartupPreroll startup;
     bool have_frame;
     /* Physical open service has been requested but has not entered its first
        pump phase. Lifecycle authority lives in machine.state. */
@@ -139,9 +137,8 @@ typedef struct {
     bool system_suspended;
     bool system_resume_playing;
     bool suspended_for_internal_view;
-    bool seek_preview_started;
-    bool seek_preview_was_playing;
-    bool seek_preview_cancel_pending;
+    /* The tentative seek the user is making (psp_media_scrub.h). */
+    PspMediaScrub scrub;
     uint16_t *seek_preview_pixels;
     unsigned no_frame_ms;
     unsigned decode_no_progress_ms;
@@ -218,22 +215,15 @@ typedef struct {
        pipeline underneath its range/demux ownership. */
     bool audio_only;
     bool quality_fallback_attempted;
-    uint64_t reopen_resume_us;
-    bool reopen_resume_playing;
-    bool reopen_resume_pending;
-    /* A quality/transport retry that interrupted a tentative scrub restores
-       the committed playback position first, then reissues only the latest
-       highlighted target. This is continuation data for that invoked
-       service, not a parallel lifecycle state. */
-    uint64_t reopen_preview_target_us;
-    bool reopen_preview_pending;
-    uint64_t preview_commit_target_us;
-    bool preview_commit_pending;
-    bool preview_commit_resume_playing;
-    /* A large rewind recreates the firmware backend but may reopen from the
-       already-authorized direct URLs while they remain valid. Consumed by
-       the next open transaction only. */
-    bool reopen_reuse_resolved_stream;
+    /* A playback that outlives its pipeline: where a rebuilt pipeline
+       resumes, then the seek that takes it there (psp_media_scrub.h). */
+    PspMediaContinuation continuation;
+    /* What becomes of a highlighted time at the next safe point: a scrub
+       target a retry interrupted is highlighted again after the committed
+       position is restored, and Cross pressed during a job is committed
+       (psp_media_scrub.h). Continuation data for the invoked service, not a
+       parallel lifecycle state. */
+    PspMediaPendingTarget pending_target;
     /* Validation accounting only; this never selects a lifecycle edge or
        service. A backend-recreating backward seek earns one completion only
        after the replacement pipeline has opened at its target. Keeping this
@@ -426,12 +416,6 @@ typedef struct {
     bool job_resume_playing;
     uint8_t job_prime_ready_mask;
     /*
-     * True while the seek in flight is the one an open performs to reach a
-     * saved or recovered position, rather than one a viewer asked for. Its
-     * decode leg is retired by design: see psp_media_seek_decode_pump.
-     */
-    bool job_resume_open;
-    /*
      * Always-on lifecycle authority. Validation builds retain a read-only
      * projection of displaced flags and owned resources so a device run can
      * detect drift; decoded pictures, range chunks, and audio blocks never
@@ -462,6 +446,10 @@ typedef struct {
     bool startup_trace_first_frame_seen;
     bool startup_trace_first_audio_seen;
     bool startup_trace_presented_seen;
+    /* Why selected captions have not started yet: per-frame admission
+       refusals by gate (not playing, buffering/preroll/refill, reserve, frame
+       budget) and admissions. Reported when the player closes. */
+    uint32_t subtitle_gate_counts[5];
     uint32_t controller_events;
     uint32_t controller_mismatches;
     uint32_t controller_violations;
@@ -509,6 +497,9 @@ void psp_media_suspend(PspMediaSession *media);
 void psp_media_resume(PspMediaSession *media);
 bool psp_media_system_suspended(const PspMediaSession *media);
 bool psp_media_open_work_pending(const PspMediaSession *media);
+/* A playback continuing across a pipeline rebuild whose timeline still takes
+ * input: scrub, commit, cancel, play/pause (psp_media_scrub.h). */
+bool psp_media_continuation_accepts_input(const PspMediaSession *media);
 /* Conservative page-Budget headroom for the selected decoder working set,
    playback packet, and bounded open-time remainder. Used only to decide
    whether optional browser caches need pressure reclamation before open. */

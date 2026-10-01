@@ -1890,6 +1890,104 @@
     browser_session_destroy(&nested_frame_session);
     CHECK(budget.current == 0);
 
+    puts("test: iframe snapshots paint at CSS scale and follow resizes");
+    /* A 100px frame once painted at display/frame scale (4.8x here) and
+       cropped, and a parent-side resize kept drawing the old snapshot
+       squashed into the new box (Cloudflare Turnstile's widget frame). */
+    static const char scale_frame_page[] =
+        "<!doctype html><body style='margin:0'><iframe id='sized' "
+        "src='/child.html' style='border:0;width:100px;height:40px'>"
+        "</iframe></body>";
+    static const char scale_child_page[] =
+        "<!doctype html><body style='margin:0;background:#fff'>"
+        "<div style='width:50px;height:20px;background:#ff0000'></div>"
+        "</body>";
+    static BrowserSession scale_frame_session;
+    static NavigationSession scale_frame_navigation;
+    CHECK(browser_session_init(&scale_frame_session, &budget, 64 * 1024)
+          && navigation_init(&scale_frame_navigation, &budget, 4));
+    navigation_attach_browser_session(&scale_frame_navigation,
+                                      &scale_frame_session);
+    navigation_enable_scripts(&scale_frame_navigation, 6 * MIB, 1000);
+    navigation_enable_document_scripts(&scale_frame_navigation, 8,
+                                       128 * 1024, 128 * 1024, 1000);
+    uint64_t scale_frame_generation = navigation_begin(
+        &scale_frame_navigation);
+    CHECK(navigation_commit_html(
+              &scale_frame_navigation, scale_frame_generation,
+              "https://scale-frame.test/", scale_frame_page,
+              strlen(scale_frame_page), 480, NULL, NULL, true)
+          && navigation_advance_runtime(&scale_frame_navigation, 1, 8)
+          && scale_frame_navigation.page.frame_count == 1);
+    NavigationFrame *scale_frame = &scale_frame_navigation.page.frames[0];
+    if (scale_frame->fetch_pending) {
+        CHECK(fetch_scheduler_cancel(
+                  scale_frame_navigation.page.resource_scheduler,
+                  scale_frame->fetch_request_id, "test supplies child")
+              && fetch_scheduler_discard(
+                  scale_frame_navigation.page.resource_scheduler,
+                  scale_frame->fetch_request_id));
+        scale_frame->fetch_pending = false;
+    }
+    if (scale_frame->retired) {
+        scale_frame->retired = false;
+        CHECK(script_runtime_set_frame_window_state(
+            scale_frame_navigation.page.runtime,
+            scale_frame->parent_handle, true, true, false,
+            "https://scale-frame.test/child.html", true,
+            &scale_frame_navigation.page.script_result));
+    }
+    CHECK(document_parse(&scale_frame->document, &budget, scale_child_page,
+                         sizeof(scale_child_page) - 1, 16));
+    scale_frame->runtime = script_runtime_create_deferred(
+        &scale_frame->document, &budget, 2 * MIB, 1000,
+        "https://scale-frame.test/child.html", NULL,
+        &scale_frame->script_result);
+    CHECK(scale_frame->runtime != NULL);
+    script_runtime_set_images(scale_frame->runtime, &scale_frame->images);
+    scale_frame->loaded = true;
+    scale_frame_navigation.images = &scale_frame_navigation.page.images;
+    CHECK(navigation_test_refresh_frame_presentation(
+        &scale_frame_navigation, scale_frame));
+    const ImageResource *scale_snapshot = NULL;
+    for (size_t i = 0; i < scale_frame_navigation.page.images.count; i++) {
+        const ImageResource *candidate =
+            &scale_frame_navigation.page.images.items[i];
+        if (candidate->node == scale_frame->element && !candidate->is_mask
+            && !candidate->is_background) scale_snapshot = candidate;
+    }
+    CHECK(scale_snapshot != NULL && scale_snapshot->pixels != NULL
+          && scale_snapshot->width == 100 && scale_snapshot->height == 40);
+    /* Red covers the left half of the top 20 rows and nothing else. */
+    const unsigned char *red_pixel = scale_snapshot->pixels
+        + ((size_t) 5 * 100u + 25u) * 4u;
+    const unsigned char *white_pixel = scale_snapshot->pixels
+        + ((size_t) 5 * 100u + 75u) * 4u;
+    const unsigned char *below_pixel = scale_snapshot->pixels
+        + ((size_t) 30 * 100u + 25u) * 4u;
+    CHECK(red_pixel[0] > 200 && red_pixel[1] < 60
+          && white_pixel[0] > 200 && white_pixel[1] > 200
+          && below_pixel[0] > 200 && below_pixel[1] > 200);
+    CHECK(script_runtime_evaluate_diagnostic(
+              scale_frame_navigation.page.runtime,
+              "document.getElementById('sized').style.height='60px'",
+              "https://scale-frame.test/resize.js",
+              &scale_frame_navigation.page.script_result));
+    for (int tick = 0; tick < 4; tick++)
+        CHECK(navigation_advance_runtime(&scale_frame_navigation, 1, 8));
+    scale_snapshot = NULL;
+    for (size_t i = 0; i < scale_frame_navigation.page.images.count; i++) {
+        const ImageResource *candidate =
+            &scale_frame_navigation.page.images.items[i];
+        if (candidate->node == scale_frame->element && !candidate->is_mask
+            && !candidate->is_background) scale_snapshot = candidate;
+    }
+    CHECK(scale_snapshot != NULL && scale_snapshot->width == 100
+          && scale_snapshot->height == 60);
+    navigation_destroy(&scale_frame_navigation);
+    browser_session_destroy(&scale_frame_session);
+    CHECK(budget.current == 0);
+
     puts("test: script pressure admission skips before allocator failure");
     static const char pressure_script_page[] =
         "<!doctype html><title>Pressure</title><body><p>READY</p>"
@@ -2685,8 +2783,9 @@
           && mutation_scripts.dom_mutations >= 4
           && mutation_scripts.events_dispatched >= 2
           && mutation_scripts.performance_now_calls >= 1
-          /* Canvas and Worker are both admitted on first use. */
-          && mutation_scripts.bootstrap_lazy_module_loads == 2
+          /* Canvas, Worker and DOM traversal (its createNodeIterator
+             probe) are each admitted on first use. */
+          && mutation_scripts.bootstrap_lazy_module_loads == 3
           && mutation_scripts.bootstrap_lazy_module_failures == 0
           && mutated.body_text == NULL
           && strcmp(mutation_scripts.summary,

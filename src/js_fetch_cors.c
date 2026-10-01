@@ -5,6 +5,7 @@
    js_runtime_internal.h. */
 #include "js_runtime_internal.h"
 
+#include "tilefinch/script_split.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/multiplayer.h"
 #include "tilefinch/platform.h"
@@ -1190,10 +1191,24 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
     return response;
 }
 
+static JSValue js_fetch_async_setup(JSContext *context, int argc,
+                                    JSValueConst *argv);
+
+/* __tilefinchFetchAsync: request setup is fetch time in the script split
+   (script_split.h). */
 static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
                               int argc, JSValueConst *argv)
 {
     (void) this_value;
+    unsigned split = script_split_enter(SCRIPT_SPLIT_FETCH);
+    JSValue value = js_fetch_async_setup(context, argc, argv);
+    script_split_leave(split);
+    return value;
+}
+
+static JSValue js_fetch_async_setup(JSContext *context, int argc,
+                                    JSValueConst *argv)
+{
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL || bridge->document == NULL || argc < 2) {
         return JS_ThrowTypeError(context, "fetch requires method and URL");
@@ -3127,7 +3142,7 @@ static bool dynamic_admit_compile(ScriptRuntime *runtime,
     }
     budget_pressure = budget_pressure_required(
         runtime->budget, working_bytes, reserve);
-    heap = script_runtime_heap_remaining(runtime);
+    heap = script_runtime_heap_available(runtime);
     heap_pressure = working_bytes > heap
         || reserve > heap - (working_bytes > heap ? heap : working_bytes);
     return !budget_pressure && !heap_pressure;

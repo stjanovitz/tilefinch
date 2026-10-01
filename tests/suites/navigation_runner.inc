@@ -14,11 +14,29 @@ int main(int argc, char **argv)
         puts("static image layout tests passed");
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--hidden-images-only") == 0) {
+        RUN_TEST(test_markup_priority_skips_hidden_images);
+        RUN_TEST(test_svg_sprite_sheet_is_not_an_image);
+        puts("hidden image tests passed");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--style-preload-only") == 0) {
+        RUN_TEST(test_style_preload_event_promotion);
+        RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
+        RUN_TEST(test_stylesheet_sources_insert_in_document_order);
+        RUN_TEST(test_svg_use_swap_refreshes_without_rebuild);
+        RUN_TEST(test_image_only_changes_rebuild_images_alone);
+        RUN_TEST(test_identical_attribute_writes_need_no_relayout);
+        puts("style preload tests passed");
+        return 0;
+    }
     RUN_TEST(test_pump_and_cancel);
     RUN_TEST(test_progressive_preview_is_bounded_and_transient);
     RUN_TEST(test_failed_candidate_rolls_back_presented_preview);
     RUN_TEST(test_progressive_preview_waits_for_external_visuals);
     RUN_TEST(test_markup_priority_survives_preview_pressure);
+    RUN_TEST(test_markup_priority_skips_hidden_images);
+    RUN_TEST(test_svg_sprite_sheet_is_not_an_image);
     RUN_TEST(test_background_images_continue_after_useful_paint);
     RUN_TEST(test_background_image_failure_retains_visible_prefix);
     RUN_TEST(test_static_images_retry_after_transient_idle_failure);
@@ -40,6 +58,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_parser_script_mutation_rebinds_live_node);
     RUN_TEST(test_failed_external_parser_source_counts_as_work);
     RUN_TEST(test_parser_mutation_checkpoint_uses_stage_deadline);
+    RUN_TEST(test_parser_script_stage_clock);
+    RUN_TEST(test_parser_classic_script_import);
+    RUN_TEST(test_parser_insertions_reach_mutation_observers);
     RUN_TEST(test_late_server_actions_refresh_hydration_snapshot);
     RUN_TEST(test_resource_scheduler_refusal_is_not_script_degradation);
     RUN_TEST(test_streaming_preview_skips_inert_prefix_layout);
@@ -58,6 +79,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_bounded_finalize_preserves_history_pruning);
     RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
     RUN_TEST(test_provisional_relayout_completes_in_idle_work);
+    RUN_TEST(test_extension_reaching_the_end_queues_discovered_visuals);
     RUN_TEST(test_candidate_hook_set_is_transactional);
     RUN_TEST(test_script_oom_retains_usable_target);
     RUN_TEST(test_late_script_oom_reveals_staged_page_shell);
@@ -72,6 +94,12 @@ int main(int argc, char **argv)
     RUN_TEST(test_late_oom_static_relayout_refusal_is_transactional);
     RUN_TEST(test_low_memory_replacement_success);
     RUN_TEST(test_streaming_dynamic_stylesheets_are_not_adopted);
+    RUN_TEST(test_style_preload_event_promotion);
+    RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
+    RUN_TEST(test_stylesheet_sources_insert_in_document_order);
+    RUN_TEST(test_svg_use_swap_refreshes_without_rebuild);
+    RUN_TEST(test_image_only_changes_rebuild_images_alone);
+    RUN_TEST(test_identical_attribute_writes_need_no_relayout);
     RUN_TEST(test_dynamic_stylesheet_event_rescan_is_reentrant_safe);
     RUN_TEST(test_stylesheet_event_microtask_exception_is_nonfatal);
     RUN_TEST(test_dynamic_stylesheet_href_base_and_reinsert_lifecycle);

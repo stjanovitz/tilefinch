@@ -2,6 +2,28 @@
    stack when the allocator trap fires, so giant allocations can be
    attributed to page code.  Reenters the VM from inside an allocation;
    host-only, one-shot, best-effort. */
+#ifdef TILEFINCH_NATIVE_TIER_LAB
+static uint64_t js_rt_lab_thread_cpu_ns(void)
+{
+#ifdef CLOCK_THREAD_CPUTIME_ID
+    struct timespec value;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0)
+        return (uint64_t)value.tv_sec * UINT64_C(1000000000)
+            + (uint64_t)value.tv_nsec;
+#endif
+    return 0;
+}
+
+static uint64_t js_rt_lab_realtime_us(void)
+{
+    struct timespec value;
+    if (clock_gettime(CLOCK_REALTIME, &value) != 0) return 0;
+    return (uint64_t)value.tv_sec * UINT64_C(1000000)
+        + (uint64_t)value.tv_nsec / UINT64_C(1000);
+}
+#endif
+
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 static void js_rt_dump_interpreter_stack(void *opaque)
 {
     ScriptRuntime *runtime = opaque;
@@ -17,13 +39,17 @@ static void js_rt_dump_interpreter_stack(void *opaque)
     JS_FreeValue(ctx, stack);
     JS_FreeValue(ctx, error);
 }
+#endif
 
 void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
 {
-    /* Every entry into JavaScript starts here. The parser and the host
-       change DOM and state only between entries, so a computed style
-       memoized during one entry is not trusted by the next. */
-    runtime->bridge.computed_style_epoch++;
+    /* Every entry into JavaScript starts here. Computed styles retained
+       across entries are keyed on the host style generation instead
+       (document_style_generation()), which the parser and native DOM
+       writes between entries advance. */
+    /* References dropped by the previous entry may be collectable now: let
+       its first handle-table exhaustion collect again. */
+    runtime->bridge.node_reclaim_gc_skip = 0;
     watchdog_finish_slice(&runtime->watchdog);
     runtime->watchdog.started_ms = monotonic_time_ms();
     runtime->watchdog.deadline_ms = runtime->timeout_ms
@@ -43,6 +69,7 @@ void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
     runtime->watchdog.interrupted = false;
     runtime->watchdog.slice_started_ns = js_rt_monotonic_time_ns();
     runtime->watchdog.slice_work_units = 0;
+    script_profile_enter(runtime);
 }
 
 void script_runtime_limit_execution_for_us(ScriptRuntime *runtime,
@@ -95,8 +122,61 @@ static void runtime_record_author_job_exception(ScriptRuntime *runtime)
                  ? "JavaScript exception" : runtime->result.error);
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static void runtime_log_reentrant_checkpoint(ScriptRuntime *runtime)
+{
+    static unsigned logged;
+    if (logged >= 6u) return;
+    logged++;
+    char message[400];
+    int length = snprintf(message, sizeof(message),
+                          "tilefinch-reentrant-checkpoint: skipped=%zu stack=",
+                          runtime->reentrant_checkpoints_skipped);
+    for (int level = 0; level < 16 && length > 0
+         && (size_t) length < sizeof(message) - 2u; level++) {
+        JSAtom atom = JS_GetScriptOrModuleName(runtime->context, level);
+        if (atom == JS_ATOM_NULL) continue;
+        const char *name = JS_AtomToCString(runtime->context, atom);
+        JS_FreeAtom(runtime->context, atom);
+        if (name == NULL) break;
+        const char *base = strrchr(name, '/');
+        length += snprintf(message + length, sizeof(message) - (size_t) length,
+                           "%s<", base == NULL ? name : base + 1);
+        JS_FreeCString(runtime->context, name);
+    }
+    tilefinch_platform_log_message(message);
+}
+#endif
+
+#ifdef TILEFINCH_NATIVE_TIER_LAB
+#include "tilefinch/native_tier_lab.h"
+#endif
+static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime);
+
 bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
 {
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+    unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
+    bool ok = runtime_run_jobs_checkpoint(runtime);
+    script_split_leave(split);
+    work_ledger_leave(ledger);
+    return ok;
+}
+
+static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
+{
+    /* HTML performs a microtask checkpoint only once the JavaScript
+       execution context stack is empty. A host path reached from script
+       (a synchronous layout callback, a nested dispatch) leaves queued jobs
+       for the outer checkpoint: running them here executed chatgpt.com's
+       deferred signal writes inside its own render. */
+    if (JS_IsStackActive(runtime->runtime)) {
+        js_rt_saturating_add_size(&runtime->reentrant_checkpoints_skipped, 1);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        runtime_log_reentrant_checkpoint(runtime);
+#endif
+        return true;
+    }
     /*
      * A full browser can usually drain a microtask checkpoint before the
      * next task.  On the PSP, a long promise chain can otherwise monopolize
@@ -104,7 +184,21 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
      * Bound each checkpoint; the next runtime tick continues the queue.
      */
     size_t work = 0;
-    const bool trace_steps = tilefinch_trace_runtime_steps();
+    const bool trace_steps =
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        true;
+#else
+        tilefinch_trace_runtime_steps();
+#endif
+    uint64_t checkpoint_begin_us = trace_steps
+        ? tilefinch_platform_monotonic_time_us() : 0;
+#ifdef TILEFINCH_SCRIPT_SPLIT
+    /* Where the checkpoint's and its longest job's time went
+       (script_split.h), for the record below. */
+    ScriptSplitTotals split_begin = {0}, split_longest = {0};
+    bool split_on = trace_steps && script_split_enabled();
+    if (split_on) script_split_snapshot(&split_begin);
+#endif
     size_t promise_jobs = 0, continuations = 0;
     uint64_t promise_job_us = 0, promise_job_max_us = 0;
     uint64_t continuation_us = 0, continuation_max_us = 0;
@@ -125,8 +219,12 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
                 document_allocation_owner_enter(runtime->document);
             uint64_t continuation_started_ns = trace_steps
                 ? js_rt_monotonic_time_ns() : 0;
+            script_profile_enter(runtime);
+            if (runtime->profile != NULL) runtime->profile->phase = 2;
             JSValue value = JS_Call(
                 runtime->context, callback, JS_UNDEFINED, 0, NULL);
+            script_profile_leave(runtime);
+            if (runtime->profile != NULL) runtime->profile->phase = 0;
             if (trace_steps) {
                 uint64_t elapsed_us =
                     (js_rt_monotonic_time_ns() - continuation_started_ns)
@@ -179,24 +277,114 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
         if (!js_rt_runtime_native_checkpoint(runtime)) return false;
         JSContext *job_context = NULL;
         uint64_t started_ns = js_rt_monotonic_time_ns();
+#ifdef TILEFINCH_NATIVE_TIER_LAB
+        uint64_t tier_epoch_before = 0, tier_calls_before = 0,
+                 tier_completed_before = 0;
+        uint64_t tier_lazy_before_ns = 0;
+        uint64_t tier_cpu_before_ns = trace_steps
+            ? js_rt_lab_thread_cpu_ns() : 0;
+        if (trace_steps) tilefinch_native_tier_job_begin();
+        if (trace_steps)
+            tilefinch_native_tier_snapshot(runtime->runtime,
+                &tier_epoch_before, &tier_calls_before, &tier_completed_before);
+        if (trace_steps)
+            tier_lazy_before_ns = tilefinch_native_tier_lazy_compile_ns();
+#endif
         size_t polls_before = runtime->watchdog.polls;
         size_t failures_before = runtime->budget->failure_count;
         size_t heap_rejections_before =
             script_runtime_heap_rejections(runtime);
         BudgetAllocationOwner previous_owner =
             document_allocation_owner_enter(runtime->document);
+#ifdef TILEFINCH_SCRIPT_SPLIT
+        ScriptSplitTotals split_job_before = {0};
+        if (split_on) script_split_snapshot(&split_job_before);
+#endif
+        script_profile_enter(runtime);
+        ScriptProfileJobSnapshot job_profile = script_profile_job_snapshot(runtime);
+        if (runtime->profile != NULL) {
+            runtime->profile->phase = 1;
+            runtime->profile->job_begin_ns = started_ns;
+        }
+#ifdef TILEFINCH_NATIVE_TIER_LAB
+        uint64_t execute_started_ns = trace_steps
+            ? js_rt_monotonic_time_ns() : 0;
+        uint64_t execute_started_cpu_ns = trace_steps
+            ? js_rt_lab_thread_cpu_ns() : 0;
+#endif
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+        uint32_t census_job = script_census_job_begin(started_ns / UINT64_C(1000));
+#endif
         int executed = JS_ExecutePendingJob(runtime->runtime, &job_context);
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+        uint64_t census_end_us = census_job
+            ? js_rt_monotonic_time_ns() / UINT64_C(1000) : 0;
+#endif
+#ifdef TILEFINCH_NATIVE_TIER_LAB
+        uint64_t execute_elapsed_ns = trace_steps
+            ? js_rt_monotonic_time_ns() - execute_started_ns : 0;
+        uint64_t execute_cpu_ns = trace_steps && execute_started_cpu_ns != 0
+            ? js_rt_lab_thread_cpu_ns() - execute_started_cpu_ns : 0;
+#endif
+        script_profile_leave(runtime);
+        script_profile_job_finish(runtime, job_profile, started_ns);
+        if (runtime->profile != NULL) runtime->profile->phase = 0;
         document_allocation_owner_leave(runtime->document, previous_owner);
         js_rt_runtime_record_host_callback(
             runtime, "<promise-job>", started_ns, polls_before);
         if (trace_steps) {
             uint64_t elapsed_us =
                 (js_rt_monotonic_time_ns() - started_ns) / UINT64_C(1000);
+#ifdef TILEFINCH_NATIVE_TIER_LAB
+            if (elapsed_us >= 5000u) {
+                uint64_t epoch_after = 0, calls_after = 0,
+                         completed_after = 0;
+                tilefinch_native_tier_snapshot(runtime->runtime,
+                    &epoch_after, &calls_after, &completed_after);
+                bool same_owner = tier_epoch_before == 0 ||
+                                  tier_epoch_before == epoch_after;
+                fprintf(stderr,
+                    "tilefinch-native-tier-job wall-us=%llu cpu-us=%llu native-calls=%llu "
+                    "native-instructions=%llu lazy-compile-us=%llu reset=%u begin-us=%llu "
+                    "execute-wall-us=%llu execute-cpu-us=%llu realtime-end-us=%llu\n",
+                    (unsigned long long)elapsed_us,
+                    (unsigned long long)(tier_cpu_before_ns == 0 ? 0 :
+                        (js_rt_lab_thread_cpu_ns() - tier_cpu_before_ns)
+                            / UINT64_C(1000)),
+                    (unsigned long long)(same_owner ? calls_after - tier_calls_before : 0),
+                    (unsigned long long)(same_owner ? completed_after - tier_completed_before : 0),
+                    (unsigned long long)((tilefinch_native_tier_lazy_compile_ns()
+                        - tier_lazy_before_ns) / UINT64_C(1000)),
+                    same_owner ? 0u : 1u,
+                    (unsigned long long)(started_ns / UINT64_C(1000)),
+                    (unsigned long long)(execute_elapsed_ns / UINT64_C(1000)),
+                    (unsigned long long)(execute_cpu_ns / UINT64_C(1000)),
+                    (unsigned long long)js_rt_lab_realtime_us());
+                tilefinch_native_tier_job_report(runtime->runtime, elapsed_us);
+            }
+#endif
             promise_jobs++;
             promise_job_us += elapsed_us;
+#ifdef TILEFINCH_SCRIPT_SPLIT
+            if (split_on && elapsed_us > promise_job_max_us) {
+                ScriptSplitTotals split_job_after;
+                script_split_snapshot(&split_job_after);
+                script_split_difference(&split_job_after, &split_job_before,
+                                        &split_longest);
+            }
+#endif
             if (elapsed_us > promise_job_max_us)
                 promise_job_max_us = elapsed_us;
         }
+#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
+        if (census_job) {
+            /* Emit after the exact job timers close. Diagnostic output is
+               host bookkeeping, not execution of the measured callback. */
+            unsigned census_split = script_split_enter(SCRIPT_SPLIT_HOST);
+            script_census_job_end(census_job, census_end_us);
+            script_split_leave(census_split);
+        }
+#endif
         if (executed < 0) {
             js_rt_record_exception(job_context == NULL ? runtime->context
                                                  : job_context,
@@ -228,15 +416,47 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
         uint64_t wasm_release_us =
             (js_rt_monotonic_time_ns() - wasm_release_started_ns)
             / UINT64_C(1000);
-        fprintf(stderr,
+        uint64_t checkpoint_end_us = tilefinch_platform_monotonic_time_us();
+        /* Keep short device checkpoints silent; wall endpoints let the
+           analyzer assign costly ones to their containing event or advance.
+           Sum/max distinguish many cheap jobs from one indivisible job. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (checkpoint_end_us - checkpoint_begin_us >= 1000u)
+#endif
+        {
+            char message[320 + 2u * (SCRIPT_SPLIT_FORMAT_BYTES + 16u)];
+            int written = snprintf(message, 320,
                 "runtime-checkpoint promise=%zu/%llu/%llu "
-                "continuation=%zu/%llu/%llu recovery=%llu wasm-release=%llu\n",
+                "continuation=%zu/%llu/%llu recovery=%llu wasm-release=%llu "
+                "begin-us=%llu end-us=%llu pending=%d",
                 promise_jobs, (unsigned long long) promise_job_us,
                 (unsigned long long) promise_job_max_us,
                 continuations, (unsigned long long) continuation_us,
                 (unsigned long long) continuation_max_us,
                 (unsigned long long) recovery_us,
-                (unsigned long long) wasm_release_us);
+                (unsigned long long) wasm_release_us,
+                (unsigned long long) checkpoint_begin_us,
+                (unsigned long long) checkpoint_end_us,
+                JS_IsJobPending(runtime->runtime)
+                    || runtime->checkpoint_continuation_count != 0u);
+#ifdef TILEFINCH_SCRIPT_SPLIT
+            if (split_on && written > 0 && written < 320) {
+                ScriptSplitTotals split_end, split_all;
+                char all[SCRIPT_SPLIT_FORMAT_BYTES];
+                char longest[SCRIPT_SPLIT_FORMAT_BYTES];
+                script_split_snapshot(&split_end);
+                script_split_difference(&split_end, &split_begin, &split_all);
+                (void) script_split_format(&split_all, all, sizeof(all));
+                (void) script_split_format(&split_longest, longest,
+                                           sizeof(longest));
+                snprintf(message + written, sizeof(message) - (size_t) written,
+                         " split={%s} longest-split={%s}", all, longest);
+            }
+#else
+            (void) written;
+#endif
+            tilefinch_platform_log_message(message);
+        }
     }
     return true;
 }
@@ -296,7 +516,6 @@ static const char *const runtime_host_callback_names[
     "__tilefinchMediaRecheck",
     "__tilefinchRecordResourceTiming",
     "__tilefinchRecordNavigationTiming",
-    "__tilefinchPendingWork",
     "__tilefinchDeliverNetwork",
     "__tilefinchDetachNetwork",
     "__tilefinchPumpTimers",
@@ -369,8 +588,19 @@ static bool runtime_call_host(ScriptRuntime *runtime,
     if (JS_IsFunction(runtime->context, function)) {
         uint64_t started_ns = js_rt_monotonic_time_ns();
         size_t polls_before = runtime->watchdog.polls;
+        /* The timer pump's caller knows whether it runs a task; a
+           scheduler snapshot is bookkeeping. Everything else runs script. */
+        unsigned ledger = callback == SCRIPT_HOST_PUMP_TIMERS
+                || callback == SCRIPT_HOST_SCHEDULER_SNAPSHOT
+            ? WORK_LEDGER_KIND_COUNT : work_ledger_enter(WORK_LEDGER_SCRIPT);
+        unsigned split = ledger == WORK_LEDGER_KIND_COUNT
+            ? SCRIPT_SPLIT_KIND_COUNT + 1u : script_split_enter(SCRIPT_SPLIT_JS);
+        script_profile_enter(runtime);
         value = JS_Call(runtime->context, function, runtime->host_global,
                         argc, argv);
+        script_profile_leave(runtime);
+        script_split_leave(split);
+        work_ledger_leave(ledger);
         js_rt_runtime_record_host_callback(runtime, name, started_ns,
                                      polls_before);
     } else {
@@ -436,12 +666,103 @@ bool script_runtime_refresh_named_properties(ScriptRuntime *runtime)
                         0, NULL, NULL);
 }
 
+static bool runtime_parser_insertion_append(ScriptRuntime *runtime,
+                                            JSValue batch, uint32_t *at,
+                                            lxb_dom_node_t *const nodes[4])
+{
+    for (size_t k = 0; k < 4; k++) {
+        int64_t handle = nodes[k] == NULL ? 0
+            : js_rt_bridge_register_node(&runtime->bridge, nodes[k]);
+        if (JS_SetPropertyUint32(runtime->context, batch, (*at)++,
+                                 JS_NewInt64(runtime->context, handle)) < 0)
+            return false;
+    }
+    return true;
+}
+
+/* Flatten the parser-insertion journal into [parent, node, previous, next]
+   handle quadruples (0 for an absent or unregistrable node) and empty it.
+   Each coalesced root {parent, first} follows as one quadruple per child of
+   its run while the expansion stays within the journal limit; past that, as
+   the parent reported as added (the document's element for the document),
+   which a subtree scan still covers. */
+static JSValue runtime_parser_insertion_batch(ScriptRuntime *runtime,
+                                              PocDocument *document)
+{
+    JSContext *context = runtime->context;
+    DocumentParserInsertionJournal *journal = &document->parser_insertions;
+    JSValue batch = JS_NewArray(context);
+    if (JS_IsException(batch)) return batch;
+    uint32_t at = 0;
+    bool ok = true;
+    for (size_t i = 0; ok && i < journal->count; i++) {
+        const DocumentParserInsertion *entry = &journal->entries[i];
+        lxb_dom_node_t *const nodes[4] = {
+            entry->parent, entry->node, entry->previous, entry->next
+        };
+        ok = runtime_parser_insertion_append(runtime, batch, &at, nodes);
+    }
+    size_t expansion = DOCUMENT_PARSER_INSERTION_LIMIT;
+    for (size_t i = 0; ok && i < journal->root_count; i++) {
+        lxb_dom_node_t *parent = journal->roots[i].parent;
+        lxb_dom_node_t *first = journal->roots[i].first;
+        size_t run = 0;
+        for (lxb_dom_node_t *child = first;
+             child != NULL && child->parent == parent && run <= expansion;
+             child = child->next) run++;
+        if (first != NULL && first->parent == parent && run <= expansion) {
+            expansion -= run;
+            for (lxb_dom_node_t *child = first; ok && run-- > 0;
+                 child = child->next) {
+                lxb_dom_node_t *const nodes[4] = {
+                    parent, child, child->prev, child->next
+                };
+                ok = runtime_parser_insertion_append(
+                    runtime, batch, &at, nodes);
+            }
+            continue;
+        }
+        lxb_dom_node_t *added = parent;
+        if (parent != NULL && parent->type == LXB_DOM_NODE_TYPE_DOCUMENT) {
+            added = lxb_dom_interface_node(
+                lxb_dom_interface_document(parent)->element);
+        }
+        lxb_dom_node_t *const nodes[4] = { parent, added, NULL, NULL };
+        ok = runtime_parser_insertion_append(runtime, batch, &at, nodes);
+    }
+    document_parser_insertions_clear(document);
+    if (!ok || JS_SetPropertyStr(context, batch, "coalesced",
+                                 JS_NewInt64(context,
+                                             (int64_t) journal->coalesced))
+                   < 0) {
+        JS_FreeValue(context, batch);
+        return JS_EXCEPTION;
+    }
+    return batch;
+}
+
 bool script_runtime_parser_mutation_checkpoint(ScriptRuntime *runtime)
 {
     if (runtime == NULL || runtime->context == NULL) return false;
-    return runtime_call_host(runtime, SCRIPT_HOST_PARSER_MUTATION_CHECKPOINT,
-                        0, NULL, NULL)
-           && js_rt_runtime_run_jobs(runtime);
+    /* With nothing journaled (no observer armed it, or the parser inserted
+       nothing) the checkpoint is only the microtask checkpoint. */
+    if (document_parser_insertions_pending(runtime->document)) {
+        BudgetAllocationOwner previous_owner =
+            document_allocation_owner_enter(runtime->document);
+        JSValue batch = runtime_parser_insertion_batch(
+            runtime, runtime->document);
+        document_allocation_owner_leave(runtime->document, previous_owner);
+        if (JS_IsException(batch)) {
+            js_rt_record_exception(runtime->context, &runtime->result);
+            return false;
+        }
+        bool delivered = runtime_call_host(
+            runtime, SCRIPT_HOST_PARSER_MUTATION_CHECKPOINT, 1,
+            (JSValueConst *) &batch, NULL);
+        JS_FreeValue(runtime->context, batch);
+        if (!delivered) return false;
+    }
+    return js_rt_runtime_run_jobs(runtime);
 }
 
 static bool runtime_call_captured(ScriptRuntime *runtime,
@@ -457,7 +778,13 @@ static bool runtime_call_captured(ScriptRuntime *runtime,
     JSValue global = JS_GetGlobalObject(runtime->context);
     uint64_t started_ns = js_rt_monotonic_time_ns();
     size_t polls_before = runtime->watchdog.polls;
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+    unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
+    script_profile_enter(runtime);
     JSValue value = JS_Call(runtime->context, function, global, argc, argv);
+    script_profile_leave(runtime);
+    script_split_leave(split);
+    work_ledger_leave(ledger);
     js_rt_runtime_record_host_callback(runtime, diagnostic_name, started_ns,
                                  polls_before);
     JS_FreeValue(runtime->context, global);
@@ -677,7 +1004,7 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
        floor, not whatever garbage the last slice left behind. */
     JS_RunGC(runtime->runtime);
     JSMemoryUsage usage;
-    JS_ComputeMemoryUsage(runtime->runtime, &usage);
+    js_rt_heap_census(runtime, &usage);
     if (tilefinch_dump_js_memory()) {
         JS_DumpMemoryUsage(stderr, &usage, runtime->runtime);
         fprintf(stderr, "script-arenas count=%lld capacity=%lld used=%lld\n",
@@ -725,6 +1052,25 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
             (long long) usage.fast_array_elements,
             (long long) usage.binary_object_count,
             (long long) usage.binary_object_size);
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JSLazyFunctionStats lazy;
+    JS_GetLazyFunctionStats(runtime->runtime, &lazy);
+    fprintf(output,
+            "script-lazy-functions deferred=%llu deferred-bytes=%llu "
+            "restored=%llu compiled=%llu compiled-bytes=%llu failures=%llu "
+            "preparsed=%llu preparsed-bytes=%llu preparse-fallbacks=%llu "
+            "preparse-restarts=%llu\n",
+            (unsigned long long) lazy.deferred,
+            (unsigned long long) lazy.deferred_source_bytes,
+            (unsigned long long) lazy.restored,
+            (unsigned long long) lazy.compiled,
+            (unsigned long long) lazy.compiled_source_bytes,
+            (unsigned long long) lazy.compile_failures,
+            (unsigned long long) lazy.preparsed,
+            (unsigned long long) lazy.preparsed_source_bytes,
+            (unsigned long long) lazy.preparse_fallbacks,
+            (unsigned long long) lazy.preparse_restarts);
+#endif
 }
 
 void script_runtime_report_roots(ScriptRuntime *runtime, FILE *output,
@@ -733,7 +1079,7 @@ void script_runtime_report_roots(ScriptRuntime *runtime, FILE *output,
 {
     if (runtime == NULL || runtime->runtime == NULL || output == NULL) return;
     JSMemoryUsage usage;
-    JS_ComputeMemoryUsage(runtime->runtime, &usage);
+    js_rt_heap_census(runtime, &usage);
     const ScriptResult *result = &runtime->result;
     fprintf(output,
             "script-roots phase=%s realm=%s handle=%ld retained=%lld "
@@ -801,6 +1147,80 @@ bool script_runtime_evaluate_diagnostic(ScriptRuntime *runtime,
             result->watchdog_elapsed_ms = previous_watchdog_elapsed_ms;
         }
     }
+    return ok;
+}
+
+static void js_rt_runtime_finish_slice_state(ScriptRuntime *runtime);
+
+bool script_runtime_evaluate_probe(ScriptRuntime *runtime,
+                                   const char *source,
+                                   const char *source_url,
+                                   ScriptResult *result)
+{
+    if (runtime == NULL || source == NULL || source_url == NULL) return false;
+    bool preserve_failure_telemetry = !runtime->result.success;
+    bool previous_interrupted = runtime->result.interrupted;
+    size_t previous_polls = runtime->result.watchdog_polls;
+    unsigned long previous_elapsed = runtime->result.watchdog_elapsed_ms;
+    Watchdog previous_watchdog = runtime->watchdog;
+    js_rt_runtime_arm_watchdog(runtime);
+    bool ok = evaluate_source_type(
+        runtime->context, source, strlen(source), source_url,
+        JS_EVAL_TYPE_GLOBAL, SCRIPT_COMPILE_SOURCE_DIAGNOSTIC,
+        &runtime->result);
+    /* ClipboardWrite stores its bounded result in this bootstrap record.
+       Read only that channel: a full snapshot visits author-visible globals
+       unrelated to the predicate, and can itself execute their getters. */
+    if (ok) {
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSValue clipboard = JS_GetPropertyStr(
+            runtime->context, global, "__tilefinchClipboardStats");
+        JSValue writes = JS_UNDEFINED, text = JS_UNDEFINED;
+        const char *copied = NULL;
+        if (JS_IsException(clipboard)) ok = false;
+        else if (JS_IsObject(clipboard)) {
+            writes = JS_GetPropertyStr(runtime->context, clipboard, "writes");
+            if (JS_IsException(writes)) ok = false;
+            int64_t count = 0;
+            if (ok && JS_ToInt64(runtime->context, &count, writes) < 0)
+                ok = false;
+            if (ok) {
+                text = JS_GetPropertyStr(runtime->context, clipboard, "text");
+                if (JS_IsException(text)) ok = false;
+                else {
+                    copied = JS_ToCString(runtime->context, text);
+                    if (copied == NULL) ok = false;
+                }
+            }
+            if (ok) {
+                if (count >= 0 && (uint64_t) count <= SIZE_MAX)
+                    runtime->result.clipboard_writes = (size_t) count;
+                snprintf(runtime->result.last_clipboard_text,
+                         sizeof(runtime->result.last_clipboard_text),
+                         "%s", copied);
+            }
+        }
+        if (copied != NULL) JS_FreeCString(runtime->context, copied);
+        JS_FreeValue(runtime->context, text);
+        JS_FreeValue(runtime->context, writes);
+        JS_FreeValue(runtime->context, clipboard);
+        JS_FreeValue(runtime->context, global);
+        if (!ok) js_rt_record_exception(runtime->context, &runtime->result);
+    }
+    js_rt_runtime_finish_slice_state(runtime);
+    runtime->result.success = ok;
+    if (preserve_failure_telemetry) {
+        runtime->result.interrupted = previous_interrupted;
+        runtime->result.watchdog_polls = previous_polls;
+        runtime->result.watchdog_elapsed_ms = previous_elapsed;
+    }
+    /* A probe owns a bounded entry, not the interrupted task's deadline or
+       counters. arm_watchdog already finished any preceding active slice;
+       resume its clock from here rather than charging the probe twice. */
+    runtime->watchdog = previous_watchdog;
+    if (runtime->watchdog.slice_started_ns != 0)
+        runtime->watchdog.slice_started_ns = js_rt_monotonic_time_ns();
+    if (result != NULL) *result = runtime->result;
     return ok;
 }
 
@@ -1024,22 +1444,21 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
         }
         runtime->refreshed_mutations = runtime->bridge.stats_mutations;
     }
-    JSValue pending;
-    if (!runtime_call_host(runtime, SCRIPT_HOST_PENDING_WORK, 0, NULL,
-                           &pending)) {
-        return false;
-    }
-    int64_t pending_work = 0;
-    if (JS_ToInt64(runtime->context, &pending_work, pending) < 0) {
-        JS_FreeValue(runtime->context, pending);
-        js_rt_record_exception(runtime->context, &runtime->result);
-        return false;
-    }
-    JS_FreeValue(runtime->context, pending);
-    if (pending_work < 0) pending_work = 0;
-    runtime->pending_timer_tasks = (size_t) (pending_work >> 16);
+    /* Pending timers and waiting network requests, each capped at 65535,
+       read from the bootstrap's native-readable state (no JS entry). */
+    double timers = runtime->host_state[SCRIPT_HOST_STATE_TIMERS];
+    runtime->pending_timer_tasks = timers >= 65535.0 ? 65535u
+        : timers > 0 ? (size_t) timers : 0u;
     runtime->result.pending_tasks = runtime->pending_timer_tasks;
-    runtime->pending_network_tasks = (size_t) (pending_work & 0xffff);
+    int64_t waiting = 0;
+    if (JS_IsObject(runtime->host_network_queue_stats)) {
+        JSValue value = JS_GetPropertyStr(
+            runtime->context, runtime->host_network_queue_stats, "waiting");
+        if (JS_ToInt64(runtime->context, &waiting, value) < 0) waiting = 0;
+        JS_FreeValue(runtime->context, value);
+    }
+    runtime->pending_network_tasks = waiting >= 65535 ? 65535u
+        : waiting > 0 ? (size_t) waiting : 0u;
     runtime->result.pending_tasks += runtime->pending_network_tasks;
     runtime->result.pending_tasks += runtime->bridge.async_fetch_count;
     runtime->result.pending_tasks += runtime->bridge.event_source_count;
@@ -1328,8 +1747,26 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
            exactly when a constrained realm most needs callback headroom. */
         fetch_result_free(fetched);
         fetched = NULL;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char fetch_timeline[192];
+        snprintf(fetch_timeline, sizeof(fetch_timeline),
+               "tilefinch-fetch-timeline: stage=deliver-begin scheduler=%p id=%llu at-us=%llu",
+               (void *) bridge->fetch_scheduler,
+               (unsigned long long) id,
+               (unsigned long long) tilefinch_platform_monotonic_time_us());
+        tilefinch_platform_log_message(fetch_timeline);
+#endif
         bool delivered = runtime_call_host(runtime, SCRIPT_HOST_DELIVER_NETWORK, 18,
                                       arguments, NULL);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        snprintf(fetch_timeline, sizeof(fetch_timeline),
+               "tilefinch-fetch-timeline: stage=deliver-end scheduler=%p id=%llu at-us=%llu success=%d",
+               (void *) bridge->fetch_scheduler,
+               (unsigned long long) id,
+               (unsigned long long) tilefinch_platform_monotonic_time_us(),
+               delivered ? 1 : 0);
+        tilefinch_platform_log_message(fetch_timeline);
+#endif
         for (size_t value = 0; value < 18; value++) {
             JS_FreeValue(runtime->context, arguments[value]);
         }

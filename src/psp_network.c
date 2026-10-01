@@ -1,9 +1,13 @@
 #include "tilefinch/psp_network.h"
+#include "psp_dns_stub.h"
 #include "psp_network_policy.h"
 #include "psp_utility_module_contract.h"
+#include "tilefinch/psp_entropy.h"
+#include "tilefinch/psp_log.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <pspkernel.h>
 #include <pspnet.h>
 #include <pspnet_apctl.h>
@@ -11,10 +15,12 @@
 #include <pspnet_resolver.h>
 #include <psputility_netparam.h>
 #include <pspwlan.h>
+#include <sys/socket.h>
 
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define PROFILE_QUERY_SECURITY (UINT32_C(1) << 0)
 #define PROFILE_QUERY_STATIC_IP (UINT32_C(1) << 1)
@@ -69,6 +75,14 @@
  * process, and a faster, predictable DNS failure is the right behaviour for
  * page loads as well as for video. Resolved addresses land in curl's shared
  * DNS cache, so this cost is paid once per host rather than per request.
+ *
+ * The firmware call is now the fallback. gethostbyname first asks the access
+ * point's DNS servers itself over one UDP socket (psp_dns_stub.h has the
+ * schedule and the reasons), because the firmware resolver sometimes never
+ * returns at all and a stopped lookup's retry can hang too. The firmware
+ * path, with its guard and one retry, runs only when the stub cannot run or
+ * every stub attempt went unanswered or unusable; an NXDOMAIN from the stub
+ * is final.
  */
 #define PSP_DNS_TIMEOUT_SECONDS 2u
 #define PSP_DNS_RETRIES 1
@@ -84,7 +98,10 @@ static uint64_t psp_network_now_us(void)
 /* One resolver scratch buffer, one hostent, one address: gethostbyname is a
    single-result interface by definition and this browser resolves from the
    single transport worker only. Static storage keeps a kilobyte off a stack
-   that is also carrying curl, mbed TLS and the caller's frames. */
+   that is also carrying curl, mbed TLS and the caller's frames. The stub
+   resolver adds no shared buffers: its query, reply and socket live on the
+   calling thread's stack (under 800 bytes against the worker's 256 KiB), and
+   only its diagnostic counters below are process-wide. */
 static unsigned char psp_dns_scratch[PSP_DNS_RESOLVER_BUFFER_BYTES]
     __attribute__((aligned(64)));
 static struct in_addr psp_dns_address;
@@ -93,23 +110,378 @@ static char *psp_dns_aliases[1];
 static char psp_dns_canonical_name[256];
 static struct hostent psp_dns_hostent;
 
+/* The lookup in flight, published for psp_network_dns_guard on the browser
+   thread. The start time is written before the id and the id is withdrawn
+   before the resolver is deleted, so the guard can only stop the lookup whose
+   clock it read (or one that already finished, which firmware ignores). */
+static volatile int psp_dns_active_resolver = -1;
+static volatile uint32_t psp_dns_started_ms;
+static volatile int psp_dns_stop_sent;
+static volatile unsigned psp_dns_forced_stops;
+
+/* Stub outcomes and its stand-down run. Plain counters: should two threads
+   ever resolve at once, a lost increment costs one diagnostic count and at
+   worst moves the stand-down by one lookup. */
+static volatile unsigned psp_dns_stub_answered;
+static volatile unsigned psp_dns_stub_retransmitted;
+static volatile unsigned psp_dns_stub_nxdomain;
+static volatile unsigned psp_dns_stub_fallbacks;
+static volatile unsigned psp_dns_stub_silent_run;
+
+static uint32_t psp_network_now_ms(void)
+{
+    return (uint32_t) (sceKernelGetSystemTimeWide() / 1000u);
+}
+
+void psp_network_dns_guard(void)
+{
+    int resolver_id = psp_dns_active_resolver;
+    if (!psp_network_dns_lookup_overdue(
+            resolver_id >= 0, psp_dns_started_ms, psp_network_now_ms(),
+            psp_dns_stop_sent != 0)) return;
+    psp_dns_stop_sent = 1;
+    if (sceNetResolverStop(resolver_id) >= 0) psp_dns_forced_stops++;
+}
+
+unsigned psp_network_dns_forced_stops(void)
+{
+    return psp_dns_forced_stops;
+}
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+void psp_network_dns_stub_counters(PspNetworkDnsStubCounters *counters)
+{
+    if (counters == NULL) return;
+    counters->answered = psp_dns_stub_answered;
+    counters->retransmitted = psp_dns_stub_retransmitted;
+    counters->nxdomain = psp_dns_stub_nxdomain;
+    counters->fallbacks = psp_dns_stub_fallbacks;
+    counters->stood_down =
+        psp_dns_stub_stood_down(psp_dns_stub_silent_run);
+}
+#endif
+
+/* Each wait is a sceNetInetPoll slice of at most this long, re-checked
+   against the monotonic clock, so no single firmware wait can outlast the
+   schedule by more than a slice. */
+#define PSP_DNS_STUB_POLL_SLICE_MS 50u
+/* A poll that returns at once with nothing to read (a pending socket error,
+   or an early return) must not spin the transport worker for the rest of a
+   window. */
+#define PSP_DNS_STUB_IDLE_DELAY_US 2000
+#define PSP_DNS_STUB_DRAIN_LIMIT 8u
+
+typedef enum {
+    PSP_DNS_LOOKUP_RESOLVED = 0,
+    PSP_DNS_LOOKUP_NXDOMAIN,
+    PSP_DNS_LOOKUP_FALLBACK
+} PspDnsLookupOutcome;
+
+typedef struct {
+    struct sockaddr_in servers[PSP_DNS_STUB_MAX_SERVERS];
+    unsigned server_count;
+    unsigned transmissions;
+    unsigned send_failures;
+    unsigned last_server;
+    bool heard;
+    const char *reason;
+} PspDnsStubRun;
+
+/* The resolvers the access point handed out (or the profile's manual DNS),
+   as APCTL reports them. PPSSPP's emulated AP may fill only the secondary.
+   A duplicate secondary is dropped so the schedule's second server is a
+   real alternative. */
+static unsigned psp_dns_stub_servers(struct sockaddr_in *servers)
+{
+    static const int codes[PSP_DNS_STUB_MAX_SERVERS] = {
+        PSP_NET_APCTL_INFO_PRIMDNS, PSP_NET_APCTL_INFO_SECDNS
+    };
+    unsigned count = 0u;
+    for (unsigned index = 0u; index < PSP_DNS_STUB_MAX_SERVERS; index++) {
+        union SceNetApctlInfo info;
+        memset(&info, 0, sizeof(info));
+        if (sceNetApctlGetInfo(codes[index], &info) < 0) continue;
+        /* The firmware does not promise a terminator in the 16-byte
+           field. */
+        char text[sizeof(info.primaryDns) + 1u];
+        memcpy(text, index == 0u ? info.primaryDns : info.secondaryDns,
+               sizeof(info.primaryDns));
+        text[sizeof(info.primaryDns)] = '\0';
+        struct in_addr address;
+        memset(&address, 0, sizeof(address));
+        if (sceNetInetInetAton(text, &address) == 0
+            || address.s_addr == 0u || address.s_addr == 0xFFFFFFFFu
+            || (count == 1u
+                && servers[0].sin_addr.s_addr == address.s_addr)) continue;
+        struct sockaddr_in *server = &servers[count++];
+        memset(server, 0, sizeof(*server));
+        server->sin_len = (uint8_t) sizeof(*server);
+        server->sin_family = AF_INET;
+        server->sin_port = htons(PSP_DNS_STUB_PORT);
+        server->sin_addr = address;
+    }
+    return count;
+}
+
+/* A reply counts only from port 53 of a server this lookup has already
+   queried; a reply to an earlier transmission is welcome in any window. */
+static int psp_dns_stub_source_server(
+    const PspDnsStubRun *run, unsigned queried,
+    const struct sockaddr_in *source)
+{
+    if (source->sin_family != AF_INET
+        || source->sin_port != htons(PSP_DNS_STUB_PORT)) return -1;
+    for (unsigned index = 0u; index < run->server_count; index++) {
+        if ((queried & (1u << index)) != 0u
+            && run->servers[index].sin_addr.s_addr
+                   == source->sin_addr.s_addr) return (int) index;
+    }
+    return -1;
+}
+
+/* Query IDs come from the TLS entropy pool (tilefinch/psp_entropy.h)
+   without waiting for it to be seeded: the first lookup precedes the first
+   handshake, and an ID need only be unguessable off-path, which the seed
+   file, boot context and per-call timing already make it. (libcglue's
+   getentropy, used before, reseeds MT19937 from time() on every call, so
+   its IDs were a function of the wall-clock second.) Each lookup also sends
+   from a fresh socket, so a fresh source port, which is the other half of
+   spoofing resistance. */
+static uint16_t psp_dns_stub_query_id(void)
+{
+    uint16_t id = 0u;
+    psp_entropy_fill_best_effort(&id, sizeof(id));
+    return id;
+}
+
+static PspDnsLookupOutcome psp_dns_stub_resolve(
+    const char *name, struct in_addr *address, PspDnsStubRun *run)
+{
+    uint8_t query[PSP_DNS_STUB_QUERY_BYTES];
+    uint8_t reply[PSP_DNS_STUB_RESPONSE_BYTES];
+    size_t query_bytes = psp_dns_stub_encode_query(
+        query, sizeof(query), psp_dns_stub_query_id(), name);
+    run->reason = "encode";
+    if (query_bytes == 0u) return PSP_DNS_LOOKUP_FALLBACK;
+    run->server_count = psp_dns_stub_servers(run->servers);
+    run->reason = "no-server";
+    if (run->server_count == 0u) return PSP_DNS_LOOKUP_FALLBACK;
+    int socket_id = sceNetInetSocket(AF_INET, SOCK_DGRAM, 0);
+    run->reason = "socket";
+    if (socket_id < 0) return PSP_DNS_LOOKUP_FALLBACK;
+
+    PspDnsLookupOutcome outcome = PSP_DNS_LOOKUP_FALLBACK;
+    unsigned step = 0u;
+    unsigned dead = 0u;
+    unsigned queried = 0u;
+    unsigned server = 0u;
+    uint32_t wait_ms = 0u;
+    unsigned all_servers = (1u << run->server_count) - 1u;
+    /* Non-blocking, so a readiness report that turns out empty cannot park
+       the worker in recvfrom. */
+    int enabled = 1;
+    run->reason = "nonblock";
+    if (sceNetInetSetsockopt(socket_id, SOL_SOCKET, SO_NONBLOCK, &enabled,
+                             sizeof(enabled)) < 0) goto done;
+    run->reason = "timeout";
+    while (psp_dns_stub_next_send(&step, run->server_count, dead, &server,
+                                  &wait_ms)) {
+        int sent = (int) sceNetInetSendto(
+            socket_id, query, query_bytes, 0,
+            (const struct sockaddr *) &run->servers[server],
+            sizeof(run->servers[server]));
+        if (sent == (int) query_bytes) {
+            queried |= 1u << server;
+            run->transmissions++;
+            run->last_server = server;
+        } else {
+            /* Still wait out the window if an earlier transmission's reply
+               may yet arrive; with nothing outstanding there is nothing to
+               wait for, so a host whose UDP path refuses every send costs
+               no time before the firmware fallback. */
+            run->send_failures++;
+            if (queried == 0u) continue;
+        }
+        uint64_t deadline_us =
+            psp_network_now_us() + (uint64_t) wait_ms * 1000u;
+        for (;;) {
+            uint64_t polled_us = psp_network_now_us();
+            if (polled_us >= deadline_us || (dead & (1u << server)) != 0u)
+                break;
+            uint64_t left_ms = (deadline_us - polled_us + 999u) / 1000u;
+            struct SceNetInetPollfd descriptor = {
+                .fd = socket_id,
+                .events = SCE_NET_INET_POLLIN
+            };
+            int ready = sceNetInetPoll(
+                &descriptor, 1u,
+                (int) (left_ms < PSP_DNS_STUB_POLL_SLICE_MS
+                           ? left_ms : PSP_DNS_STUB_POLL_SLICE_MS));
+            if (ready < 0) {
+                run->reason = "poll";
+                goto done;
+            }
+            unsigned drained = 0u;
+            for (; ready > 0 && drained < PSP_DNS_STUB_DRAIN_LIMIT;
+                 drained++) {
+                struct sockaddr_in source;
+                memset(&source, 0, sizeof(source));
+                socklen_t source_bytes = sizeof(source);
+                int received = (int) sceNetInetRecvfrom(
+                    socket_id, reply, sizeof(reply), 0,
+                    (struct sockaddr *) &source, &source_bytes);
+                if (received <= 0) break;
+                int from = psp_dns_stub_source_server(run, queried, &source);
+                if (from < 0) continue;
+                uint8_t bytes[4];
+                PspDnsStubReply parsed = psp_dns_stub_parse_response(
+                    reply, (size_t) received, query, query_bytes, bytes);
+                if (parsed == PSP_DNS_STUB_IGNORE) continue;
+                run->heard = true;
+                run->last_server = (unsigned) from;
+                if (parsed == PSP_DNS_STUB_ANSWER) {
+                    memcpy(&address->s_addr, bytes, sizeof(bytes));
+                    run->reason = "answer";
+                    outcome = PSP_DNS_LOOKUP_RESOLVED;
+                    goto done;
+                }
+                if (parsed == PSP_DNS_STUB_NXDOMAIN) {
+                    run->reason = "nxdomain";
+                    outcome = PSP_DNS_LOOKUP_NXDOMAIN;
+                    goto done;
+                }
+                if (parsed == PSP_DNS_STUB_TRUNCATED) {
+                    run->reason = "truncated";
+                    goto done;
+                }
+                /* PSP_DNS_STUB_UNUSABLE: stop asking this server. */
+                dead |= 1u << (unsigned) from;
+                run->reason = "unusable";
+                if ((dead & all_servers) == all_servers) goto done;
+            }
+            if (drained == 0u && psp_network_now_us() - polled_us < 1000u)
+                sceKernelDelayThread(PSP_DNS_STUB_IDLE_DELAY_US);
+        }
+    }
+done:
+    (void) sceNetInetClose(socket_id);
+    return outcome;
+}
+
+/* The firmware resolver, bounded from outside by psp_network_dns_guard and
+   retried once when the guard had to stop it. */
+static bool psp_dns_firmware_resolve(const char *name)
+{
+    bool resolved = false;
+    for (unsigned attempt = 0; ; attempt++) {
+        int resolver_id = -1;
+        int created = sceNetResolverCreate(
+            &resolver_id, psp_dns_scratch,
+            (SceSize) sizeof(psp_dns_scratch));
+        if (created < 0) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            psp_log_printf("tilefinch-dns: host=%.64s attempt=%u "
+                           "create=0x%08X\n", name, attempt,
+                           (unsigned) created);
+#endif
+            return false;
+        }
+        psp_dns_started_ms = psp_network_now_ms();
+        psp_dns_stop_sent = 0;
+        __sync_synchronize();
+        psp_dns_active_resolver = resolver_id;
+        int started = sceNetResolverStartNtoA(
+            resolver_id, name, &psp_dns_address,
+            PSP_DNS_TIMEOUT_SECONDS, PSP_DNS_RETRIES);
+        resolved = started >= 0;
+        psp_dns_active_resolver = -1;
+        __sync_synchronize();
+        int deleted = sceNetResolverDelete(resolver_id);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (!resolved || deleted < 0 || psp_dns_stop_sent != 0) {
+            psp_log_printf(
+                "tilefinch-dns: host=%.64s attempt=%u resolver=%d "
+                "start=0x%08X delete=0x%08X stopped=%d elapsed=%ums\n",
+                name, attempt, resolver_id, (unsigned) started,
+                (unsigned) deleted, psp_dns_stop_sent != 0 ? 1 : 0,
+                (unsigned) (psp_network_now_ms() - psp_dns_started_ms));
+        }
+#else
+        (void) deleted;
+#endif
+        if (!psp_network_dns_should_retry(
+                resolved, psp_dns_stop_sent != 0, attempt)) break;
+        memset(&psp_dns_address, 0, sizeof(psp_dns_address));
+    }
+    return resolved;
+}
+
+/* The stub first; the firmware only when the stub could not decide. False
+   means the name does not resolve. */
+static bool psp_dns_resolve(const char *name)
+{
+    if (!psp_dns_stub_owns_name(name)
+        || psp_dns_stub_stood_down(psp_dns_stub_silent_run))
+        return psp_dns_firmware_resolve(name);
+
+    PspDnsStubRun run;
+    memset(&run, 0, sizeof(run));
+    struct in_addr address;
+    memset(&address, 0, sizeof(address));
+    uint64_t started_us = psp_network_now_us();
+    PspDnsLookupOutcome outcome =
+        psp_dns_stub_resolve(name, &address, &run);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* One line for any stub lookup that was not a first-try answer. */
+    if (outcome != PSP_DNS_LOOKUP_RESOLVED || run.transmissions > 1u
+        || run.send_failures != 0u) {
+        psp_log_printf(
+            "tilefinch-dns: stub host=%.64s outcome=%s servers=%u "
+            "server=%u sent=%u send-failures=%u elapsed=%ums\n",
+            name, run.reason, run.server_count, run.last_server,
+            run.transmissions, run.send_failures,
+            (unsigned) ((psp_network_now_us() - started_us) / 1000u));
+    }
+#else
+    (void) started_us;
+#endif
+    if (run.transmissions > 1u) psp_dns_stub_retransmitted++;
+    if (outcome == PSP_DNS_LOOKUP_RESOLVED) {
+        psp_dns_stub_answered++;
+        psp_dns_stub_silent_run = 0u;
+        psp_dns_address = address;
+        return true;
+    }
+    if (outcome == PSP_DNS_LOOKUP_NXDOMAIN) {
+        psp_dns_stub_nxdomain++;
+        psp_dns_stub_silent_run = 0u;
+        return false;
+    }
+    psp_dns_stub_fallbacks++;
+    bool resolved = psp_dns_firmware_resolve(name);
+    /* Only a stub that transmitted and heard nothing is evidence against
+       it; no servers or no socket cost nothing and prove nothing. */
+    if (run.transmissions != 0u) {
+        bool was_down = psp_dns_stub_stood_down(psp_dns_stub_silent_run);
+        psp_dns_stub_silent_run = psp_dns_stub_silence_after(
+            psp_dns_stub_silent_run, run.heard, resolved);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (!was_down && psp_dns_stub_stood_down(psp_dns_stub_silent_run))
+            psp_log_printf("tilefinch-dns: stub stood down after %u "
+                           "silent lookups\n", PSP_DNS_STUB_SILENT_LIMIT);
+#else
+        (void) was_down;
+#endif
+    }
+    return resolved;
+}
+
 struct hostent *gethostbyname(const char *name)
 {
     if (name == NULL || name[0] == '\0') return NULL;
     memset(&psp_dns_address, 0, sizeof(psp_dns_address));
-    if (sceNetInetInetAton(name, &psp_dns_address) == 0) {
-        int resolver_id = -1;
-        if (sceNetResolverCreate(
-                &resolver_id, psp_dns_scratch,
-                (SceSize) sizeof(psp_dns_scratch)) < 0) {
-            return NULL;
-        }
-        int resolved = sceNetResolverStartNtoA(
-            resolver_id, name, &psp_dns_address,
-            PSP_DNS_TIMEOUT_SECONDS, PSP_DNS_RETRIES);
-        (void) sceNetResolverDelete(resolver_id);
-        if (resolved < 0) return NULL;
-    }
+    if (sceNetInetInetAton(name, &psp_dns_address) == 0
+        && !psp_dns_resolve(name)) return NULL;
     snprintf(psp_dns_canonical_name, sizeof(psp_dns_canonical_name),
              "%s", name);
     psp_dns_address_list[0] = (char *) &psp_dns_address;
@@ -269,6 +641,48 @@ static PspNetworkStatus psp_network_fail(PspNetwork *network, int result)
         ? now_us - network->started_us : 0;
     network->status = PSP_NETWORK_FAILED;
     return network->status;
+}
+
+static void psp_network_join_started(
+    PspNetwork *network, uint64_t now_us, bool associating)
+{
+    network->join_attempts++;
+    network->join_attempt_started_us = now_us;
+    network->join_state = network->apctl_state;
+    network->join_state_started_us = now_us;
+    network->join_progressed = associating;
+    network->join_disconnect_requested = false;
+}
+
+/* Rejoin a join APCTL abandoned or stalled in (psp_network_join_action).
+   Returns a negative firmware status only when a rejoin call fails. */
+static int psp_network_join_step(PspNetwork *network, uint64_t now_us)
+{
+    int state = network->apctl_state;
+    if (state != network->join_state) {
+        network->join_state = state;
+        network->join_state_started_us = now_us;
+    }
+    if (psp_network_apctl_state_is_associating(state))
+        network->join_progressed = true;
+    PspNetworkJoinAction action = psp_network_join_action(
+        state, network->join_progressed,
+        now_us - network->join_attempt_started_us,
+        now_us - network->join_state_started_us, network->join_attempts);
+    if (action == PSP_NETWORK_JOIN_DISCONNECT
+        && !network->join_disconnect_requested) {
+        int result = sceNetApctlDisconnect();
+        if (result < 0) return result;
+        network->join_disconnect_requested = true;
+        network->join_resets++;
+        return 0;
+    }
+    if (action == PSP_NETWORK_JOIN_CONNECT) {
+        int result = sceNetApctlConnect(network->profile_index);
+        if (result < 0) return result;
+        psp_network_join_started(network, now_us, false);
+    }
+    return 0;
 }
 
 bool psp_network_begin(PspNetwork *network, int profile_index)
@@ -447,6 +861,7 @@ PspNetworkStatus psp_network_pump(PspNetwork *network,
                in JOINING/GETTING_IP/EAP/KEY_EXCHANGE is rejected by real
                firmware; observe the existing transaction instead. */
             network->connect_started = true;
+            psp_network_join_started(network, now_us, true);
             network->status = PSP_NETWORK_WAITING_FOR_IP;
             break;
         }
@@ -457,6 +872,7 @@ PspNetworkStatus psp_network_pump(PspNetwork *network,
                 network, phase, pump_started_us);
         }
         network->connect_started = true;
+        psp_network_join_started(network, now_us, false);
         network->status = PSP_NETWORK_WAITING_FOR_IP;
         break;
     case PSP_NETWORK_WAITING_FOR_IP:
@@ -467,8 +883,16 @@ PspNetworkStatus psp_network_pump(PspNetwork *network,
             return psp_network_finish_pump(
                 network, phase, pump_started_us);
         }
-        if (network->apctl_state == PSP_NET_APCTL_STATE_GOT_IP)
+        if (network->apctl_state == PSP_NET_APCTL_STATE_GOT_IP) {
             network->status = PSP_NETWORK_READY;
+            break;
+        }
+        result = psp_network_join_step(network, now_us);
+        if (result < 0) {
+            (void) psp_network_fail(network, result);
+            return psp_network_finish_pump(
+                network, phase, pump_started_us);
+        }
         break;
     default:
         (void) psp_network_fail(network, -3);
@@ -661,6 +1085,8 @@ bool psp_network_rejoin_pump(
         }
         network->disconnect_started = false;
         network->connect_started = true;
+        network->join_attempts = 0;
+        psp_network_join_started(network, now_us, false);
         operation->phase = PSP_NETWORK_REJOIN_WAITING_IP;
         operation->phase_started_us = now_us;
         return false;
@@ -668,6 +1094,13 @@ bool psp_network_rejoin_pump(
     if (state == PSP_NET_APCTL_STATE_GOT_IP) {
         network->status = PSP_NETWORK_READY;
         operation->phase = PSP_NETWORK_REJOIN_COMPLETE;
+        return true;
+    }
+    /* A rejoin after resume fails the same ways a first join does. */
+    result = psp_network_join_step(network, now_us);
+    if (result < 0) {
+        operation->native_result = result;
+        operation->phase = PSP_NETWORK_REJOIN_FAILED;
         return true;
     }
     return false;

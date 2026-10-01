@@ -462,7 +462,8 @@ void psp_media_telemetry_report_feed(
         "refill-block=%zu inflight=%zu/%zu "
         "new-conn=%zu/%zu handshakes=%zu/%zu handshake-max=%lluus/%lluus "
         "reconnects=%zu/%zu starved-reconnects=%zu/%zu "
-        "floor=%zu/%zuBps\n",
+        "floor=%zu/%zuBps http=%ld/%ld tls12-retries=%zu/%zu "
+        "conn=%lld/%lld conn-changes=%zu/%zu\n",
         phase == NULL ? "unknown" : phase,
         /* refill-<track> is readahead-requested/windows-installed: a stream
            that never runs its window dry keeps those two within one of each
@@ -482,7 +483,11 @@ void psp_media_telemetry_report_feed(
         video_range.starved_reconnects,
         audio_range.starved_reconnects,
         video_range.minimum_sustained_bytes_per_second,
-        audio_range.minimum_sustained_bytes_per_second);
+        audio_range.minimum_sustained_bytes_per_second,
+        video_range.http_version, audio_range.http_version,
+        video_range.tls12_retries, audio_range.tls12_retries,
+        video_range.connection_id, audio_range.connection_id,
+        video_range.connections_seen, audio_range.connections_seen);
     if (hls_ready) {
         printf(
             "tilefinch-media-hls: phase=%s playlist=%zuB media=%zuB "

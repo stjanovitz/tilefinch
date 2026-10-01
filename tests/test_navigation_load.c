@@ -159,6 +159,22 @@ static bool parser_script_mutation_rebind_replay_begin(void)
         error, sizeof(error));
 }
 
+static bool parser_script_stage_clock_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-parser-script-stage-clock",
+        error, sizeof(error));
+}
+
+static bool parser_classic_import_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-parser-classic-import",
+        error, sizeof(error));
+}
+
 static bool parser_script_mutation_time_replay_begin(void)
 {
     char error[256] = {0};
@@ -166,6 +182,16 @@ static bool parser_script_mutation_time_replay_begin(void)
         TILEFINCH_TEST_SOURCE_DIR
             "/fixtures/http-parser-script-mutation-time",
         error, sizeof(error));
+}
+
+static bool parser_mutation_fixture_replay_begin(const char *fixture)
+{
+    char directory[512];
+    char error[256] = {0};
+    int written = snprintf(directory, sizeof(directory), "%s/fixtures/%s",
+                           TILEFINCH_TEST_SOURCE_DIR, fixture);
+    return written > 0 && (size_t) written < sizeof(directory)
+        && fetch_trace_replay_begin(directory, error, sizeof(error));
 }
 
 static bool parser_script_late_ssr_replay_begin(void)
@@ -569,6 +595,146 @@ static bool test_markup_priority_survives_preview_pressure(void)
     }
     (void) unsetenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW");
     if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* When no bounded preview proves which images are visible, eager <img>
+   elements are prioritized in markup order. Images inside hidden markup
+   (display:none by style or class, [hidden], closed dialogs) are never
+   painted, so they must not be fetched or decoded ahead of the page; the
+   style-aware traversal that follows skips them as well. */
+static bool test_markup_priority_skips_hidden_images(void)
+{
+#define HIDDEN_IMAGE_PNG(seed) "data:image/png;base64," seed
+    static const char html[] =
+        "<!doctype html><title>Hidden images</title><style>"
+        ".gone{display:none}</style><body><p>visible</p>"
+        "<img width=4 height=4 src='" HIDDEN_IMAGE_PNG(
+            "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAPElEQVR4nGNgYOcT"
+            "lVHWMrSwd/NlYOYSlJBX0zWxdvIMYGDjFZFW0jQwt3P1CWbgFBCXU9UxtnL08A8D"
+            "ALkMCBHFwtNPAAAAAElFTkSuQmCC") "'>"
+        "<div style='display:none'><img width=4 height=4 src='"
+        HIDDEN_IMAGE_PNG(
+            "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAPElEQVR4nGNg5OAX"
+            "k1XRNrJ0cPdjYOEWklRQ1zO1cfYKZGDnE5VR1jK0sHfzDWHgEpSQV9M1sXbyDAgH"
+            "AL3sCEEcL2cFAAAAAElFTkSuQmCC") "'></div>"
+        "<div class=gone><img width=4 height=4 src='" HIDDEN_IMAGE_PNG(
+            "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAPElEQVR4nGNg4hQQ"
+            "l1PVMbZy9PBnYOURllLU0DezdfEOYuDgF5NV0TaydHD3C2XgFpJUUNcztXH2CowA"
+            "AMLMCHGzNvmPAAAAAElFTkSuQmCC") "'></div>"
+        "<div hidden><img width=4 height=4 src='" HIDDEN_IMAGE_PNG(
+            "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAPElEQVR4nGNg4hQQ"
+            "l1PVMbZy9PBnYOURllLU0DezdfEOYuDgF5NV0TaydHD3C2XgFpJUUNcztXH2CowA"
+            "AMLMCHGzNvmPAAAAAElFTkSuQmCC") "#a'></div>"
+        "<dialog><img width=4 height=4 src='" HIDDEN_IMAGE_PNG(
+            "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAPElEQVR4nGNg4hQQ"
+            "l1PVMbZy9PBnYOURllLU0DezdfEOYuDgF5NV0TaydHD3C2XgFpJUUNcztXH2CowA"
+            "AMLMCHGzNvmPAAAAAElFTkSuQmCC") "#b'></dialog>"
+        "<img hidden width=4 height=4 src='" HIDDEN_IMAGE_PNG(
+            "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAPElEQVR4nGNg4hQQ"
+            "l1PVMbZy9PBnYOURllLU0DezdfEOYuDgF5NV0TaydHD3C2XgFpJUUNcztXH2CowA"
+            "AMLMCHGzNvmPAAAAAElFTkSuQmCC") "#c'></body>";
+#undef HIDDEN_IMAGE_PNG
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            8, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        (void) setenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW", "1", 1);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://hidden-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t pumps = 0;
+    while (committed && navigation_background_resources_pending(&navigation)
+           && pumps++ < 16u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    const ExternalImageStats *stats = &navigation.page.images.stats;
+    bool ok = committed && navigation.page.loaded
+        && navigation.performance.progressive_layout_attempts == 0
+        && stats->loaded == 1 && stats->attempted == 1
+        && navigation.page.images.count == 1;
+    if (!ok) {
+        fprintf(stderr,
+                "hidden-images committed=%d loaded=%zu attempted=%zu "
+                "tracked=%zu markup=%zu priority-loaded=%zu decoded=%zu "
+                "error=\"%s\"\n",
+                committed, stats->loaded, stats->attempted,
+                navigation.page.images.count,
+                navigation.performance.markup_image_priority_nodes,
+                navigation.performance.progressive_image_priority_loaded,
+                stats->decoded_bytes, navigation.last_error);
+    }
+    (void) unsetenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW");
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* Icon sprite sheets (chatgpt.com ships three) are zero-size inline SVGs
+   whose <symbol>s render only through <use>. The sheet itself draws
+   nothing, so it must not take markup SVG priority slots, image quota or
+   a serialize/decode attempt; the icon that uses a symbol still renders. */
+static bool test_svg_sprite_sheet_is_not_an_image(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Sprite</title><body><p>visible</p>"
+        "<svg width=0 height=0 aria-hidden=true><defs>"
+        "<symbol id=a viewBox='0 0 10 10'><path d='M0 0L10 10L0 10Z'/>"
+        "</symbol><symbol id=b viewBox='0 0 10 10'><rect width=5 height=5/>"
+        "</symbol></defs></svg>"
+        "<svg width=0 height=0><symbol id=c viewBox='0 0 10 10'>"
+        "<circle cx=5 cy=5 r=4/></symbol></svg>"
+        "<svg width=10 height=10><use href='#a'/></svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            8, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        (void) setenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW", "1", 1);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://sprite.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t pumps = 0;
+    while (committed && navigation_background_resources_pending(&navigation)
+           && pumps++ < 16u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    const ExternalImageStats *stats = &navigation.page.images.stats;
+    bool ok = committed && navigation.page.loaded
+        && navigation.performance.markup_image_priority_nodes == 1
+        && stats->discovered == 1 && stats->attempted == 1
+        && stats->loaded == 1 && stats->unsupported == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "svg-sprite committed=%d markup=%zu discovered=%zu "
+                "attempted=%zu loaded=%zu unsupported=%zu error=\"%s\"\n",
+                committed,
+                navigation.performance.markup_image_priority_nodes,
+                stats->discovered, stats->attempted, stats->loaded,
+                stats->unsupported, navigation.last_error);
+    }
+    (void) unsetenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW");
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0
         && budget_active_allocations(&budget, NULL) == 0
@@ -1940,7 +2106,8 @@ static bool test_parser_script_stage_circuit_preserves_actions(void)
         if (work_case == 1u) {
             navigation_test_set_parser_script_stage_work_limit(256u);
         } else if (work_case == 2u) {
-            navigation_test_set_parser_script_stage_elapsed_us(8000000u);
+            /* The whole parser-stage allowance (20 s). */
+            navigation_test_set_parser_script_stage_elapsed_us(20000000u);
         }
         bool loaded = ready && navigation_load_url(
             &navigation, generation, url, 4096, 1000, 480,
@@ -2999,6 +3166,234 @@ static bool test_failed_external_parser_source_counts_as_work(void)
         && budget_categories_reconcile(&budget);
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+/* A parser-blocking classic script may import() a module before the
+   document script pipeline starts. chatgpt.com's inline bootstrap does, and
+   its rejection made the startup watchdog reload every first visit. */
+static bool test_parser_classic_script_import(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_classic_import_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1500);
+        navigation_set_stream_delivery(&navigation, 64, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, "https://classic-import.test/document",
+        64 * 1024, 1500, 480, NULL, NULL, true);
+    for (size_t turn = 0; loaded && navigation.page.runtime != NULL
+                          && turn < 16; turn++) {
+        (void) navigation_advance_runtime(&navigation, 0, 32);
+    }
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t length = 0;
+    const char *value = body == NULL ? NULL : document_attribute(
+        body, "data-import", &length);
+    bool ok = loaded && value != NULL && length == 1u && value[0] == '7';
+    if (!ok) {
+        fprintf(stderr, "classic import ready=%d loaded=%d value=%.*s "
+                "error=\"%s\"\n", ready ? 1 : 0, loaded ? 1 : 0,
+                (int) length, value == NULL ? "" : value,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* Frontends show how much of the parser-stage JavaScript allowance a load
+   has spent (a page that exhausts it loses its JavaScript), and the PSP
+   allowance is twenty seconds: chatgpt.com's conversation page needs ~10 s
+   of parse-time script on the device. */
+static bool test_parser_script_stage_clock(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_stage_clock_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1500);
+        navigation_set_stream_delivery(&navigation, 64, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation,
+        "https://script-stage-clock.test/document", 64 * 1024, 1500, 480,
+        NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 64,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 64,
+        .maximum_parser_time_us = 10000
+    };
+    uint64_t before_used = UINT64_MAX, most_used = 0, limit = 0;
+    bool before_known = load != NULL
+        && navigation_load_parser_script_time(load, &before_used, &limit);
+    for (size_t i = 0; load != NULL && i < 256; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        (void) navigation_load_pump(load, &quota);
+        uint64_t used = 0, pump_limit = 0;
+        if (navigation_load_parser_script_time(load, &used, &pump_limit)) {
+            if (used > most_used) most_used = used;
+            limit = pump_limit;
+        }
+    }
+    bool loaded = load != NULL && finish_bounded(load, &quota);
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t second_length = 0;
+    const char *second = body == NULL ? NULL : document_attribute(
+        body, "data-second", &second_length);
+    bool ok = loaded && second != NULL && second_length == 3u
+        && (!before_known || before_used == 0u)
+        && most_used != 0u && limit == UINT64_C(20000000);
+    if (!ok) {
+        fprintf(stderr,
+                "stage clock ready=%d loaded=%d second=%.*s before=%llu "
+                "most=%llu limit=%llu\n",
+                ready ? 1 : 0, loaded ? 1 : 0, (int) second_length,
+                second == NULL ? "" : second,
+                (unsigned long long) before_used,
+                (unsigned long long) most_used,
+                (unsigned long long) limit);
+    }
+    if (load != NULL) navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_body_attribute_is(lxb_dom_node_t *body, const char *name,
+                                   const char *expected)
+{
+    size_t length = 0;
+    const char *value = body == NULL ? NULL
+        : document_attribute(body, name, &length);
+    bool ok = value != NULL && length == strlen(expected)
+        && memcmp(value, expected, length) == 0;
+    if (!ok)
+        fprintf(stderr, "body %s=\"%.*s\" expected \"%s\"\n", name,
+                (int) length, value == NULL ? "" : value, expected);
+    return ok;
+}
+
+/* Parser-inserted nodes reach MutationObserver however large the document
+   is: an observer created by an inline script sees all 600 parsed parents
+   before the next parser-blocking script runs (the earlier JS tree snapshot
+   gave up past 512 parents and reported nothing), an observer on body sees
+   its direct children, and nodes parsed after the last script arrive at the
+   EOF checkpoint with their insertion-time siblings. Past the bounded
+   journal and the bounded per-observer record queue, coalesced subtree roots
+   still lead an addedNodes scan to every inserted node, for parser and
+   script insertions alike, without dropping records. */
+static bool test_parser_insertions_reach_mutation_observers(void)
+{
+    static const struct {
+        const char *fixture;
+        const char *url;
+    } loads[] = {
+        { "http-parser-mutation-records",
+          "https://parser-mutation-records.test/document" },
+        { "http-parser-mutation-overflow",
+          "https://parser-mutation-overflow.test/document" },
+    };
+    bool all_ok = true;
+    for (size_t load = 0; load < sizeof(loads) / sizeof(loads[0]); load++) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_mutation_fixture_replay_begin(loads[load].fixture);
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 2000);
+            navigation_enable_document_scripts(
+                &navigation, 8, 64 * 1024u, 64 * 1024u, 2000);
+            navigation_set_stream_delivery(
+                &navigation, 509, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation, loads[load].url,
+            256 * 1024, 2000, 480, NULL, NULL, true);
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        bool ok = loaded && navigation.page.loaded
+            && navigation.page.runtime != NULL
+            && !navigation.page.script_degradation_observed
+            && navigation.last_error[0] == '\0';
+        if (load == 0) {
+            ok = test_body_attribute_is(body, "data-many-seen", "600") && ok;
+            ok = test_body_attribute_is(body, "data-body-many-seen", "600")
+                && ok;
+            ok = test_body_attribute_is(
+                     body, "data-tail-seen", "body:before-tail:null") && ok;
+        } else {
+            ok = test_body_attribute_is(body, "data-big", "400/400") && ok;
+            ok = test_body_attribute_is(body, "data-js", "400") && ok;
+            ok = test_body_attribute_is(body, "data-drops", "0") && ok;
+            ok = test_body_attribute_is(body, "data-coalesced", "true") && ok;
+        }
+        if (!ok) {
+            fprintf(stderr,
+                    "parser insertion records fixture=%s ready=%d loaded=%d "
+                    "degraded=%d summary=\"%s\" script-error=\"%s\" "
+                    "error=\"%s\"\n",
+                    loads[load].fixture, ready ? 1 : 0, loaded ? 1 : 0,
+                    navigation.page.script_degradation_observed ? 1 : 0,
+                    navigation.page.script_result.summary,
+                    navigation.page.script_result.error,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && ok && clean;
+    }
+    return all_ok;
 }
 
 static bool test_parser_mutation_checkpoint_uses_stage_deadline(void)

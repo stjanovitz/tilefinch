@@ -54,11 +54,22 @@ typedef struct {
        satisfy a later crossorigin stylesheet request. */
     bool cors_validated;
     TilefinchCredentialsMode credentials;
+    /* A style preload charged this response to the current pass's preload
+       lane; the first active link that replays it takes over the charge. */
+    bool preload_charged;
+    size_t preload_charge;
 } StylesheetDocumentResource;
 
 typedef struct {
     Budget *budget;
     StylesheetDocumentResource items[STYLESHEET_DOCUMENT_RESOURCE_LIMIT];
+    /* Completion belongs to the link, not just its shared response URL:
+       media and integrity can admit one preload while refusing another. */
+    struct {
+        lxb_dom_node_t *element;
+        StylesheetDocumentResourceState state;
+    } style_preloads[STYLESHEET_DOCUMENT_RESOURCE_LIMIT];
+    size_t style_preload_count;
     size_t count;
     size_t retained_body_hits;
     size_t transient_retries;
@@ -122,6 +133,11 @@ typedef struct {
     size_t imports_skipped_conditions;
     size_t imports_skipped_depth;
     size_t bytes;
+    /* <link rel=preload as=style> responses: a separate, smaller lane so
+       optional hints never refuse an active stylesheet. A matching active
+       link moves the charge to attempted/bytes. */
+    size_t preload_attempted;
+    size_t preload_bytes;
     size_t rules_added;
     size_t variables_added;
     size_t batches;
@@ -212,6 +228,11 @@ typedef struct ImageResource {
     PseudoElement pseudo;
     bool owns_pixels;
     bool owns_encoded;
+    /* Set only inside a refresh's replacement table: the pixels are an
+       unchanged inline-SVG raster borrowed from the outgoing table. The
+       refresh commit verifies the lender is still present, hands ownership
+       over when the lender retires, and clears the bit. */
+    bool borrows_previous;
 } ImageResource;
 
 typedef enum {
@@ -285,6 +306,13 @@ typedef struct {
     size_t work_units;
     size_t max_slice_work_units;
     size_t cooperative_yields;
+    /* Inline <svg> rasterizations performed, and those a mutation-driven
+       refresh satisfied from the outgoing table's identical raster. The
+       timings are collected with the image profile. */
+    size_t inline_svg_rasterized;
+    size_t inline_svg_refresh_reused;
+    uint64_t inline_svg_serialize_us;
+    uint64_t inline_svg_rasterize_us;
 } ExternalImageStats;
 
 typedef struct {
@@ -419,6 +447,19 @@ bool stylesheets_append_ordered_suffix_with_context(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     StylesheetDocumentResources *resources,
     ExternalStylesheetStats *stats);
+/* Fetches and settles style preload links (rel=preload as=style, every
+   node) through the same ledger, so their load or error event can be
+   dispatched; the sheet's rules are untouched. */
+bool stylesheets_settle_style_preloads_with_context(
+    Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
+    size_t node_count, const char *base_url, const char *document_url,
+    const char *document_referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats);
 void stylesheet_document_resources_destroy(
     StylesheetDocumentResources *resources);
 /* Retains one successfully fetched speculative stylesheet for the ordinary
@@ -438,6 +479,11 @@ void stylesheet_document_resources_open_final_retry(
    sources are made eligible so that rebuild preserves cascade order. */
 bool stylesheet_document_resources_prepare_complete_census(
     StylesheetDocumentResources *resources);
+/* Whether the sheet a link's href names has had its rules applied (the
+   ordered loaders apply one URL once; a later reference is a duplicate). */
+bool stylesheet_document_resources_link_applied(
+    const StylesheetDocumentResources *resources, const char *base_url,
+    const char *href, size_t href_length);
 /* Resolve a link's bounded href against its document base and return the
    transport ledger state. Present-but-invalid href values are deterministic
    terminal failures, allowing DOM event dispatchers to settle them without
@@ -521,6 +567,19 @@ bool images_load_external_reusing_layout_styles_deferred(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     struct LayoutReuseCache *style_cache, const FontSet *fonts,
     int viewport_width, bool defer_document_images);
+/* images_destroy + images_load_external_reusing_layout_styles_excluding in
+   one step, except that an inline SVG whose serialized markup is unchanged
+   takes over its outgoing raster instead of being rasterized again. On
+   failure the table is left destroyed, as the two-step form would. */
+bool images_rebuild_external_reusing_rasters(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    struct LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count);
 /* Additive discovery excludes at most 128 live deferred targets. New nodes,
    CSS and SVG retain the authoritative traversal. Exclusion pointers are
    borrowed for this synchronous call and never dereferenced by the filter. */
@@ -560,6 +619,20 @@ bool images_refresh_external_nodes(
     size_t maximum_total_encoded_bytes,
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
+/* Same transactional refresh, sharing the owner's already-invalidated style
+   cache with additive discovery and final layout. Uses their canonical html
+   inheritance root. The caller must invalidate mutation-dependent entries
+   before calling, exactly as for complete image discovery. */
+bool images_refresh_external_nodes_reusing_layout_styles(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
+    Budget *budget, const char *base_url, const char *document_url,
+    const char *referrer_policy, size_t maximum_count,
+    size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    struct LayoutReuseCache *style_cache, const FontSet *fonts,
+    int viewport_width);
 /* Allocation-free rollback for trusted native DOM transactions. Removes
    resources owned by the exact nodes, transferring shared backing ownership
    to retained aliases before releasing anything. */
@@ -615,6 +688,14 @@ bool images_decode_worker_shutdown(Budget *budget);
 /* Browser-thread reap for a navigation-cancelled completion. False means a
    lower-priority decode is still running; callers never wait for it. */
 bool images_decode_worker_reap_cancelled(Budget *budget);
+/* Whether an inline <svg> draws anything itself: a shape, text, image,
+   <use> or foreignObject outside the non-rendering containers (<defs>,
+   <symbol>, gradients, patterns, clip paths, masks, markers, filters,
+   metadata). Symbol and definition content renders only through <use>.
+   Visits at most `visit_limit` nodes; when that bound cuts the walk short
+   `*bounded_out` is set and the answer is not a proof either way. */
+bool image_inline_svg_draws_content(lxb_dom_node_t *svg, size_t visit_limit,
+                                    bool *bounded_out);
 const ImageResource *images_find_node(const ImageResources *images,
                                       const lxb_dom_node_t *node);
 const ImageResource *images_find_mask_node(const ImageResources *images,

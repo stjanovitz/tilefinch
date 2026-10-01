@@ -1,3 +1,32 @@
+/* Attribute event entry separately from its checkpoint and DOM refresh.
+   These are nested in input/action wall time, never additional totals. */
+static bool runtime_trace_dispatch_enabled(void)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    return true;
+#else
+    return tilefinch_trace_runtime_steps();
+#endif
+}
+
+static void runtime_trace_dispatch(const char *event, unsigned phase,
+    uint64_t begin, uint64_t call, uint64_t jobs, uint64_t end)
+{
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    char message[256];
+    snprintf(message, sizeof(message),
+        "tilefinch-dispatch-timing: event=%s phase=%u begin-us=%llu end-us=%llu "
+        "handler=%llu jobs=%llu refresh=%llu",
+        event, phase, (unsigned long long) begin, (unsigned long long) end,
+        (unsigned long long) (call - begin),
+        (unsigned long long) (jobs - call),
+        (unsigned long long) (end - jobs));
+    tilefinch_platform_log_message(message);
+#else
+    (void) event; (void) phase; (void) begin; (void) call; (void) jobs; (void) end;
+#endif
+}
+
 bool script_runtime_dispatch(ScriptRuntime *runtime, const char *selector,
                              const char *event_type, ScriptResult *result)
 {
@@ -118,9 +147,9 @@ bool script_runtime_dispatch_pointer_node(
     if (result != NULL) result->event_dispatch_entered = true;
     js_rt_saturating_add_size(
         &runtime->result.event_dispatches_entered, 1u);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t pointer_begin_us = tilefinch_platform_monotonic_time_us();
-#endif
+    bool trace_dispatch = runtime_trace_dispatch_enabled();
+    uint64_t pointer_begin_us = trace_dispatch
+        ? tilefinch_platform_monotonic_time_us() : 0;
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_activation_handle,
         "__tilefinchDispatchActivationHandle", 7, arguments, &returned);
@@ -129,25 +158,16 @@ bool script_runtime_dispatch_pointer_node(
     if (ok) runtime->result.last_event_cancelled =
         JS_ToBool(runtime->context, returned) <= 0;
     JS_FreeValue(runtime->context, returned);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t pointer_call_us = tilefinch_platform_monotonic_time_us();
-#endif
+    uint64_t pointer_call_us = trace_dispatch
+        ? tilefinch_platform_monotonic_time_us() : 0;
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t pointer_jobs_us = tilefinch_platform_monotonic_time_us();
-#endif
+    uint64_t pointer_jobs_us = trace_dispatch
+        ? tilefinch_platform_monotonic_time_us() : 0;
     if (ok) ok = js_rt_runtime_refresh(runtime);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (phase == 5u) {
-        char message[192];
-        snprintf(message, sizeof(message),
-            "tilefinch-pointer-runtime: handler=%lluus jobs=%lluus refresh=%lluus",
-            (unsigned long long) (pointer_call_us - pointer_begin_us),
-            (unsigned long long) (pointer_jobs_us - pointer_call_us),
-            (unsigned long long) (tilefinch_platform_monotonic_time_us() - pointer_jobs_us));
-        tilefinch_platform_log_message(message);
-    }
-#endif
+    if (trace_dispatch)
+        runtime_trace_dispatch("pointer", phase, pointer_begin_us,
+            pointer_call_us, pointer_jobs_us,
+            tilefinch_platform_monotonic_time_us());
     runtime->result.success = ok;
     js_rt_runtime_update_frame_result(runtime, result);
     return ok;
@@ -317,6 +337,8 @@ bool script_runtime_dispatch_submit_node(ScriptRuntime *runtime,
     if (result != NULL) result->event_dispatch_entered = true;
     js_rt_saturating_add_size(
         &runtime->result.event_dispatches_entered, 1u);
+    bool trace_dispatch = runtime_trace_dispatch_enabled();
+    uint64_t begin = trace_dispatch ? tilefinch_platform_monotonic_time_us() : 0;
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_submit_handle,
         "__tilefinchDispatchSubmitHandle", 2, arguments, &returned);
@@ -325,8 +347,13 @@ bool script_runtime_dispatch_submit_node(ScriptRuntime *runtime,
     if (ok) runtime->result.last_event_cancelled =
         JS_ToBool(runtime->context, returned) <= 0;
     JS_FreeValue(runtime->context, returned);
+    uint64_t call = trace_dispatch ? tilefinch_platform_monotonic_time_us() : 0;
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
+    uint64_t jobs = trace_dispatch ? tilefinch_platform_monotonic_time_us() : 0;
     if (ok) ok = js_rt_runtime_refresh(runtime);
+    if (trace_dispatch)
+        runtime_trace_dispatch("submit", 0, begin, call, jobs,
+            tilefinch_platform_monotonic_time_us());
     runtime->result.success = ok;
     js_rt_runtime_update_frame_result(runtime, result);
     return ok;
@@ -345,6 +372,14 @@ bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime)
     return runtime != NULL && (runtime->relayout_dirty
         || runtime->bridge.mutations.count != 0
         || runtime->bridge.mutations.overflowed);
+}
+
+bool script_runtime_has_pending_resource_mutations(const ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && (runtime->bridge.mutations.resource_rebuild_required
+            || runtime->bridge.mutations.image_resource_scan_required
+            || runtime->bridge.mutations.conservative_resource_scan);
 }
 
 bool script_runtime_consume_mutations(ScriptRuntime *runtime,

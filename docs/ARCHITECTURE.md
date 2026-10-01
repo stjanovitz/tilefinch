@@ -1,10 +1,48 @@
 # Architecture
 
-Tilefinch is a C11 web browser for the Sony PSP: a 333 MHz, 32-bit,
-single-core MIPS system with 64 MiB of physical RAM, a 480×272 RGB565 display,
-and no virtual memory. On that machine it fetches HTTPS pages, parses HTML and
-CSS, runs JavaScript, lays out modern mobile sites, rasterizes them, and plays
-video through the PSP firmware or a bounded two-core software decoder.
+Tilefinch is a web browser for the Sony PSP, written in C11. Its target has a
+333 MHz single-core MIPS CPU, 64 MiB of RAM, no virtual memory, and a
+480×272 RGB565 screen: less memory, in total, than a desktop browser gives a
+single tab. On that machine Tilefinch fetches pages over HTTPS and HTTP/2,
+parses HTML and CSS, runs JavaScript, lays out modern mobile sites, rasterizes
+them into tiles, and plays video through the PSP's Media Engine or a bounded
+two-core software decoder.
+
+It aims at the web as it is rather than a curated subset. A page such as
+chatgpt.com loads more than a hundred JavaScript modules, hydrates a
+client-side application, and streams its answer into the document. On the PSP
+all of that (the DOM, the JavaScript heap, styles, layout, and screen tiles)
+has to fit inside a 24 MiB page ceiling, next to a TLS stack, a network worker,
+and whatever the video player is doing.
+
+## What the machine decides
+
+A desktop browser survives a heavy page by having room to spare: swap, spare
+cores, a garbage collector that can wait. The PSP has none of that. Running
+out of memory is not an edge case to log; it is what an ordinary page does
+unless the browser prevents it, and one stalled loop freezes the only core.
+So the constraints are the design:
+
+- **One ledger.** Every page-owned byte is admitted through a single memory
+  budget, and teardown must hand every byte back.
+- **Nothing unbounded.** Every variable-size structure has a fixed maximum
+  or an explicit eviction policy, and a refused allocation is an ordinary
+  outcome with a rollback path.
+- **Everything interruptible.** Parsing, style, layout, script, and network
+  work are resumable and cancellable at deterministic points, so the
+  controller stays live while a page is heavy.
+- **No half-built pages.** A candidate page is assembled beside the current
+  one and replaces it only when it is usable.
+- **Explicit ownership.** Firmware handles, DMA, transport, and
+  browser-thread state each have one owner; other threads publish immutable
+  results.
+- **Honest evidence.** Host tests, the PPSSPP emulator, and the device prove
+  different things, and a pass on one is never taken for another.
+
+The payoff is a browser whose resource policy can be read from the source,
+rather than inferred from whether a large machine happened to survive a page.
+
+### Where the memory goes
 
 Memory on the shipping PSP-3000 build is layered:
 
@@ -16,21 +54,20 @@ Memory on the shipping PSP-3000 build is layered:
   share a 32 MiB envelope, and the ordinary page profile admits at most
   24 MiB.
 
-The constrained target is not a reduced-quality build of a desktop design. It
-shapes the architecture:
+### One tap, end to end
 
-- every page-owned byte is admitted through one memory budget;
-- every variable-size structure has a fixed bound or an explicit eviction
-  policy;
-- long operations are resumable and cancellable at deterministic points;
-- a partially built page never replaces the last usable page;
-- ownership of firmware, DMA, transport, and browser-thread state is explicit;
-- host, emulator, and device validation prove different things and are never
-  treated as interchangeable.
-
-The result is a small browser whose resource policy can be read from the
-source, rather than inferred from whether a large machine happens to survive a
-page.
+Pressing X on a link shows most of the system at once. The native chrome turns
+the press into an input event for `BrowserEngine`, the page ownership
+boundary. The link starts a navigation transaction: request authority decides
+whether and how the fetch may happen, the scheduler hands it to the transport
+worker (curl, Mbed TLS, nghttp2), and response bytes come back as immutable
+chunks. The incremental HTML parser consumes them while the resource scanner
+starts stylesheets and scripts. QuickJS runs the page's scripts against the
+Lexbor DOM on the browser thread, the cascade and resumable layout turn the
+tree into a retained display list, and a bounded tile cache feeds the PSP's
+display and GE. Throughout, every stage is admitted by the budget and can be
+paused for input or abandoned if the user cancels; the page that was on
+screen stays there until the new one is ready.
 
 ## System map
 
@@ -90,6 +127,14 @@ represented by reservations against the same ceiling. Process-lifetime state
 that no page can own, such as the CA bundle and the cross-navigation TLS
 session store, is bounded separately and counted in the device reserve.
 
+Page JavaScript is layered: QuickJS carves every object of up to 504 bytes
+(objects, shapes, property arrays, strings, closures, var refs) from its
+own 4 KiB arenas, whose 8-byte block header is also the reference count
+and GC tag. The QuickJS pool (`budget_quickjs_pool_*`) sees only those
+arenas and the engine's larger blocks, and charges each to the Budget as
+`BUDGET_CATEGORY_JAVASCRIPT`. A per-object allocator change therefore
+belongs in the engine's arena code, not in the pool.
+
 A refused allocation is a normal result. Parser checkpoints, candidate pages,
 layout jobs, cache insertion, and script admission all have rollback or
 bounded-degradation paths. Failure injection exercises those paths, and
@@ -142,17 +187,17 @@ page allocation crosses this one choke point, a worker reaching into DOM,
 style, layout, or script state is caught at the allocation, not later through
 a corrupted list.
 
-The first device run with the check enabled caught exactly that. The
-loading-UI supervisor, which draws chrome from the callback thread while page
-work runs, rasterized status-text glyphs lazily through the engine's font face
-and so allocated on the page ledger. The chrome glyph cache is now filled on
+The loading-UI supervisor, which draws chrome from the callback thread while
+page work runs, is the case the check exists for: rasterizing status-text
+glyphs lazily through the engine's font face would allocate on the page
+ledger from the wrong thread. The chrome glyph cache is therefore filled on
 the owning thread when faces are bound: every printable ASCII glyph at the
 current UI scale, 190 glyphs, about 30 ms per binding on a PSP-3000 (the
 UI-scale setting fills the other size the same way). A miss on any other
 thread draws the built-in bitmap for that tick instead of loading a glyph, and
 binding and filling hold the supervisor's presentation fence because a
 supervisor frame draws straight from the cache. A validation run through a
-full media journey now reports `tilefinch-owner-checks: budget-violations=0`.
+full media journey reports `tilefinch-owner-checks: budget-violations=0`.
 
 The two environments use the check differently, in keeping with rule 5:
 
@@ -496,6 +541,15 @@ the platform does.
   bounded queue and quota but never enter the timer algorithm, so a page's
   timer chain can neither delay browser bookkeeping nor be reset by it.
 
+The page's clock follows wall time. Each runtime advance moves the timer and
+animation-frame clock by the real time since the previous advance, at most one
+16 ms tick, so a loop that turns faster cannot run timers early (a long frame
+lets them fall behind instead of bunching). Frames still begin with the vblank
+wait even when page work is already runnable: replacing it with a 2 ms yield
+saved about half a second after a chatgpt.com send but, on the device, starved
+the lower-priority I/O threads badly enough to cost seconds during load, so
+that yield is an opt-in validation setting (`page_task_yield=1`).
+
 A `MessagePort` delivers one message per task through the listener microtask
 checkpoint and schedules the next delivery only after that one finishes,
 which keeps an endpoint's messages in order even when a listener posts back
@@ -563,6 +617,32 @@ checked-in dump of every registered property across a fixture page
 (`tests/fixtures/computed-style-dump.*`), which turns any change to a resolved
 value into a reviewable diff.
 
+Resolved styles are retained between reads, and between entries into
+JavaScript: a 64-entry ring of ancestor styles plus a one-element memo, both
+keyed on `ComputedStyleInputs` (`src/js_runtime_internal.h`). Script's own
+DOM writes reach them as the bridge's mutation notes, which drop only the
+subtrees they can restyle. Everything else that can change a cascade advances
+the host style generation (`document_style_generation()` in
+`include/tilefinch/document.h`), and a moved generation empties the ring:
+
+- page documents route Lexbor's insertion, removal and attribute callbacks
+  through it, so parser, controller (checked, option and text edits), reader
+  mode, media cards and any other native write to a connected tree counts,
+  and each fed parser chunk counts as a whole;
+- the script bridge brackets its own Lexbor writes
+  (`document_style_quiet_begin`/`_end`), as does the focus-state probe,
+  which restores its marker (a failed restoration counts);
+- the colour-scheme preference counts directly; stylesheet loads, appends,
+  rebuilds and viewport changes move the sheet's build generation;
+- container geometry is compared by the signature of its states, since
+  every layout pass rebuilds them; the fullscreen element and the document
+  are keyed directly.
+
+Lexbor's removal callback also evicts each removed node from every
+registered ring (bounded listeners; a runtime without a slot keeps no ring),
+so a destroyed node's address cannot answer for a new one. Used geometry
+(`width`, `height`, percentage padding) is never retained.
+
 ### QuickJS is vendored and changed in place
 
 QuickJS lives in `third_party/quickjs` with Tilefinch's changes already
@@ -577,7 +657,31 @@ carried change in application order.
 Most of the changes serve the memory ceiling: bounded array growth that
 collects near the limit instead of refusing, collection opportunities at
 allocation sites upstream never checks (native string producers, property
-table growth), interruptible compilation, and Latin-1 string storage.
+table growth), interruptible compilation, and Latin-1 string storage. A
+sole-owned string is appended to in place (the engine's pool reports a block's
+size-class capacity as its usable size), so the `s += x` loops common in
+minified decoders amortize instead of copying the whole string per step.
+
+**Lazy functions and the validating preparser.** A function whose source is at
+least 128 bytes gets no bytecode when its script compiles; its body is compiled
+from source on its first call. At load time such a body is checked by a
+preparser that builds nothing: it follows the real parser's token decisions and
+early-error rules, so a script with a syntax error anywhere is still rejected
+before any of it runs, as the language requires, and it records which
+enclosing variables the body may capture. Anything it does not model falls back
+to the full parser, and a first-call compile whose captures disagree with that
+record fails loudly ("lazy function compiled differently") rather than reading
+the wrong binding. On chatgpt.com this roughly halves module compile time on a
+PSP-3000; `TILEFINCH_JS_PREPARSE=0` restores the full parse for comparisons.
+
+**Build.** The PSP image is optimized for size, except QuickJS, which is built
+at `-O2`: the larger engine was faster on the device despite the instruction
+cache. Release builds add profile-guided optimization trained under PPSSPP on
+a recorded chatgpt.com session (`scripts/train-quickjs-pgo.sh`). The profile is
+fingerprinted on the engine's sources, headers, compiler and flags, configure
+refuses a stale one (a stale profile makes the engine larger and slower than
+none), and `scripts/cut-release.sh` requires an explicit choice. Development
+builds do without it.
 
 The change with architectural weight is the compact array family. A dense
 `Array` built only from one-character Latin-1 strings, unsigned or signed
@@ -624,8 +728,10 @@ boundaries.
   commit restores the snapshot transactionally; a useful replacement that
   succeeds stays authoritative.
 - **Circuit breaker.** One navigation may spend at most 1 MiB of parser-stage
-  source work, eight seconds across its blocking checkpoints, or three
-  consecutive failed scripts. When a bound trips, the remaining blocking
+  source work, twenty seconds across its blocking checkpoints (chatgpt.com's
+  conversation page needs about ten on a PSP-3000; the PSP shows "PAGE
+  SCRIPTS NS OF 20S" once a load has spent three), or three consecutive
+  failed scripts. When a bound trips, the remaining blocking
   scripts are soft-skipped, parsing continues to the end, and the committed
   page is marked Limited. The author realm is then retired for that document,
   so deferred, asynchronous, and dynamic work already queued cannot resume the
@@ -634,7 +740,20 @@ boundaries.
 
 Compiled external scripts and parsed stylesheet fragments may be reused from
 bounded in-memory caches for the life of the process; ordinary browsing never
-writes compiler artifacts to storage. An explicitly installed offline app is
+writes compiler artifacts to storage. External ES modules are compiled records
+too: after a module compiles, its QuickJS bytecode is kept in a separate
+session cache (1 MiB realistic, 512 KiB strict) keyed by module name, response
+URL, top-level site, compile options and the SHA-256 of its exact source, and a
+later load of the same bytes restores it and resolves its imports as a compile
+would. The cache sits after every fetch check. Its bytes are optional: the
+page Budget evicts them before refusing any allocation, so the cache can only
+occupy room the page is not using. Modules of 8 KiB or more are compiled
+without their source text (line tables are kept for stacks); their functions'
+`toString()` returns the native-code form. The trade-off is recorded in
+[the memory experiment ledger](engineering/MEMORY_EXPERIMENTS.md). An opt-in
+persistent tier (the `module_cache_dir` boot setting, off by default) keeps the
+same verified records on storage across launches; a record whose key or
+SHA-256 does not match is ignored and compiled again. An explicitly installed offline app is
 the exception: installation may add bounded, locally generated classic-script
 bytecode beside the retained source. That artifact is bound to the source and
 to a dedicated QuickJS bytecode ABI (not the Tilefinch release version), and
@@ -651,8 +770,20 @@ kinds fail through the API without weakening the page's Budget, origin, CSP,
 or transport policy.
 
 DOM mutations are journaled and coalesced before they trigger style and
-layout. The journal is bounded, and when it fills the engine chooses a safe,
-broader invalidation instead of growing it.
+layout. The journal is bounded (256 records a turn, with a shared pool for the
+class tokens a write changes). When it fills, the engine keeps up to 16 subtree
+roots that hold the unrecorded changes and restyles those, falling back to a
+full reset only when a root cannot be named. A class, id or attribute change
+restyles the element plus the elements that carry the subject key of a rule
+reading it from elsewhere (siblings included); focus moves and inline
+custom-property writes are scoped the same way, by keyed `:focus-within` rules
+and by which retained styles read which custom properties. Each record carries whether it
+can move a `:has()` answer; the sheet's `:has()` rules are classified once
+(where the anchor lies relative to the subject, which region the argument
+reads, which keys each must carry), so a relational change drops only the
+cached styles of elements those answers can style
+(`src/style_has_invalidation.c`), and a changed child list restyles the
+parent and its children unless a sibling test reaches their descendants.
 
 ## Rendering and presentation
 
@@ -733,7 +864,7 @@ geometry. Small path and text shadows use a fixed native sampling pattern;
 complex geometry degrades to one offset sample instead of letting blur work
 grow with page input.
 
-Drawing crosses into native code in batches: up to 64 solid rectangles or 16
+Drawing crosses into native code in batches: up to 32 solid rectangles or 16
 consecutive sprite blits per JavaScript turn, and a separate 16-command queue
 that paths and text share, so an animated chart's geometry and labels cross
 together. All drawing in a turn coalesces into one dirty rectangle, copies
@@ -1151,7 +1282,17 @@ The frontend separates ownership from control:
 | `PspExitPlan` | tagged reason and handoff | teardown obligations |
 | `PspShutdownReport` | independent retained/quarantined obligations | user intent |
 
-`psp_app_run_interactive()` is the resident loop. `psp_browser_close()` first
+`psp_app_run_interactive()` is the resident loop: a cold driver that sets up a
+`PspLoop` (what one frame leaves for the next, plus the borrowed owners), calls
+`psp_loop_frame()` once per frame, and tears down. A frame is a fixed sequence
+of steps whose order is load-bearing (frame pumps admit work by position).
+Work a frame does not always do lives in named `psp_loop_*` steps behind the
+check that guards it: suspend/resume, update checks, a navigation's end, the
+offline download slice, and the validation-only drivers. Steps a page or media
+frame runs every time are hot boundaries measured together by the build (see
+[the PSP envelope](engineering/PSP_ENVELOPE.md)); a new feature that runs every
+frame joins those sets, and one that does not becomes a step behind its own
+check. `psp_browser_close()` first
 drives the media and network machines to safe terminal states, then frees only
 the resources their reports mark releasable. Owners release resources;
 machines decide when release is safe.
@@ -1262,10 +1403,20 @@ Tilefinch treats evidence as part of the design:
 | response-keyed replay | deterministic network inputs and closed request ledgers |
 | Chrome fidelity scoreboard | structural pixel similarity at the PSP viewport |
 | PSP cross-build ratchets | 32-bit ABI, actual `.text`, `.rodata`, stack and hot-symbol size |
+| work record (`tilefinch-work`) | deterministic operation counts, identical on host, PPSSPP and device, for comparing changes without timing noise |
 | PPSSPP | packaged EBOOT, Allegrex execution, deterministic scripted flows |
+| offline device replay | a recorded journey (for example a chatgpt.com load and send) replayed on the PSP from `host0:`, with responses released on a fixed clock so a faster build cannot fake a faster network |
 | physical PSP | firmware, caches, WLAN, Memory Stick, latency, media and lifecycle truth |
 
-Release builds compile logging out. Validation builds aggregate counters in
+Performance claims come from the device. Any relink moves single code paths by
+up to about 40% and a whole journey by about a second (16 KiB instruction
+cache, code placement), so small engine changes are judged with one binary and
+a runtime switch over alternating runs, and ideas that did not pay off on the
+hardware are recorded as rejected in the
+[performance ledger](engineering/PERFORMANCE_LEDGER.md).
+
+Release builds compile logging out, along with HTTP capture and replay (about
+42 KB of code). Validation builds aggregate counters in
 RAM and normally publish one bounded report through PSPLink, avoiding Memory
 Stick traffic during a run; per-event flushing is reserved for localizing
 crashes.

@@ -34,8 +34,7 @@ void psp_media_finish_synchronous_quiesce(
 void psp_media_set_transport_priority(
     PspMediaSession *media, bool active);
 void psp_media_publish_track_catalog(PspMediaSession *media);
-void psp_media_release_presentation_preroll(
-    PspMediaSession *media, bool clear_floor);
+void psp_media_release_presentation_preroll(PspMediaSession *media);
 bool psp_media_begin_startup_preroll(PspMediaSession *media);
 bool psp_media_cancel_requested(const PspMediaSession *media);
 bool psp_media_cancel_callback(void *opaque);

@@ -406,6 +406,13 @@ bool script_runtime_copy_document_url(
     return true;
 }
 
+const TilefinchContentSecurityPolicy *script_runtime_content_security_policy(
+    const ScriptRuntime *runtime)
+{
+    return runtime == NULL || runtime->bridge.document == NULL
+        ? NULL : &runtime->bridge.document->content_security_policy;
+}
+
 bool script_runtime_copy_top_level_url(
     const ScriptRuntime *runtime, char *output, size_t output_size)
 {

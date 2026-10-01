@@ -268,6 +268,8 @@ static bool start_custom_runtime_page(
     navigation_enable_document_scripts(
         navigation, maximum_scripts, maximum_total_bytes,
         maximum_file_bytes, 1000);
+    /* Callers choose these totals to exercise the quota itself. */
+    navigation_set_fixed_script_memory_limits(navigation, true);
     uint64_t generation = navigation_begin(navigation);
     return navigation_commit_html(
         navigation, generation, url, html, strlen(html), 480,

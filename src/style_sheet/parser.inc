@@ -897,7 +897,13 @@ static void style_css_font_fixup_property(
             sheet, value, value_length, &font);
         family = font.font_family;
     }
-    if (parsed) declaration->values.font_family = family;
+    if (!parsed) return;
+    ComputedStyle values;
+    stylesheet_declaration_values(sheet, declaration, &values);
+    if (values.font_family == family) return;
+    values.font_family = family;
+    /* A refused append keeps the earlier, still-valid family resolution. */
+    (void) style_declaration_values_replace(sheet, declaration, &values);
 }
 
 static void style_css_font_fixup_apply(
@@ -966,10 +972,7 @@ static void style_css_reintern_declarations(Stylesheet *sheet)
         if ((old & 255u) == 255u)
             (void) tilefinch_platform_cooperate("stylesheet-reintern", old);
         StyleDeclaration candidate = sheet->declarations[old];
-        uint32_t hash = style_declaration_hash(
-            &candidate.values, candidate.mask, candidate.mask_high,
-            candidate.inherit_mask, candidate.deferred_declarations,
-            candidate.deferred_length);
+        uint32_t hash = style_stored_declaration_hash(sheet, &candidate);
         size_t slot = (size_t) hash & table_mask;
         uint32_t duplicate = UINT32_MAX;
         for (size_t probes = 0;
@@ -978,11 +981,8 @@ static void style_css_reintern_declarations(Stylesheet *sheet)
             uint32_t indexed = sheet->declaration_index_slots[slot];
             if (indexed == UINT32_MAX) break;
             if (indexed < retained
-                && style_declaration_equal(
-                    &sheet->declarations[indexed], &candidate.values,
-                    candidate.mask, candidate.mask_high,
-                    candidate.inherit_mask, candidate.deferred_declarations,
-                    candidate.deferred_length)) {
+                && style_declarations_equal(
+                    sheet, &sheet->declarations[indexed], &candidate)) {
                 duplicate = indexed;
                 break;
             }
@@ -1012,6 +1012,7 @@ static void style_css_reintern_declarations(Stylesheet *sheet)
         if (old < old_count) sheet->rules[i].declaration_index = mapping[old];
     }
     sheet->declaration_count = retained;
+    style_declaration_values_compact(sheet);
     size_t declaration_capacity = 32u;
     while (declaration_capacity < retained
            && declaration_capacity <= SIZE_MAX / 2u) {

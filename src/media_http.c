@@ -51,6 +51,7 @@ struct MediaHttpRange {
     char *referer;
     char range_header[64];
     bool standard_range_header;
+    bool tls12_session_resumption;
     bool audio_only;
     FetchPreparedPageRequest *prepared_request;
     unsigned char *cache;
@@ -320,6 +321,7 @@ static bool range_prepare_request(
     request->connect_timeout_ms = range->connect_timeout_ms;
     request->force_fresh_connection =
         range->window_tracker.reconnects != 0u;
+    request->tls12_session_resumption = range->tls12_session_resumption;
     request->redirect_url_validator = range->url_validator;
     request->redirect_same_origin_only = true;
     return true;
@@ -856,6 +858,9 @@ typedef struct {
     long new_connections;
     bool handshake_measured;
     uint64_t handshake_us;
+    long http_version;
+    long long connection_id;
+    bool tls12_retry;
     bool admitted;
 } RangeFillTransportResult;
 
@@ -870,6 +875,9 @@ static TILEFINCH_OUT_OF_LINE void range_take_background_stream(
     taken->new_connections = result.new_connections;
     taken->handshake_measured = result.tls_handshake_measured;
     taken->handshake_us = result.tls_handshake_us;
+    taken->http_version = result.negotiated_http_version;
+    taken->connection_id = result.connection_id;
+    taken->tls12_retry = result.tls12_compatibility_retry;
     bool values_admitted = range_admit_values(
         range, aligned, aligned + wanted - 1u,
         result.status_code, taken->received, result.content_range,
@@ -894,6 +902,9 @@ static TILEFINCH_OUT_OF_LINE bool range_take_scheduler_stream(
     taken->new_connections = result.new_connections;
     taken->handshake_measured = result.tls_handshake_measured;
     taken->handshake_us = result.tls_handshake_us;
+    taken->http_version = result.negotiated_http_version;
+    taken->connection_id = -1;
+    taken->tls12_retry = result.tls12_compatibility_retry;
     char content_range[128] = {0};
     (void) fetch_response_header_value(
         &result, "content-range", content_range, sizeof(content_range));
@@ -920,6 +931,9 @@ static TILEFINCH_OUT_OF_LINE bool range_take_background_fixed(
     taken->new_connections = result.new_connections;
     taken->handshake_measured = result.tls_handshake_measured;
     taken->handshake_us = result.tls_handshake_us;
+    taken->http_version = result.negotiated_http_version;
+    taken->connection_id = result.connection_id;
+    taken->tls12_retry = result.tls12_compatibility_retry;
     taken->admitted = wanted != 0 && range_admit_values(
         range, aligned, aligned + wanted - 1u,
         result.status_code, result.length, result.content_range,
@@ -943,6 +957,9 @@ static TILEFINCH_OUT_OF_LINE bool range_take_scheduler_fixed(
     taken->new_connections = result.new_connections;
     taken->handshake_measured = result.tls_handshake_measured;
     taken->handshake_us = result.tls_handshake_us;
+    taken->http_version = result.negotiated_http_version;
+    taken->connection_id = -1;
+    taken->tls12_retry = result.tls12_compatibility_retry;
     if (taken->admitted) memcpy(destination, result.data, taken->received);
     fetch_result_destroy(&result);
     return true;
@@ -1046,6 +1063,14 @@ static bool range_fill_install_into(
     if (taken.new_connections > 0)
         range->stats.window_new_connections +=
             (size_t) taken.new_connections;
+    if (taken.http_version != 0)
+        range->stats.http_version = taken.http_version;
+    if (taken.connection_id >= 0) {
+        if (taken.connection_id != range->stats.connection_id)
+            range->stats.connections_seen++;
+        range->stats.connection_id = taken.connection_id;
+    }
+    if (taken.tls12_retry) range->stats.tls12_retries++;
     if (taken.handshake_measured) {
         range->stats.window_handshakes++;
         if (taken.handshake_us > range->stats.handshake_max_us)
@@ -1936,6 +1961,8 @@ MediaHttpRange *media_http_range_create(
     memcpy(range->referer, referer, referer_length);
     range->standard_range_header = options != NULL
         && options->standard_range_header;
+    range->tls12_session_resumption = options != NULL
+        && options->tls12_session_resumption;
     range->audio_only = options != NULL && options->audio_only;
     if (options != NULL && options->page_request_context != NULL) {
         range->prepared_request = budget_malloc_category(
@@ -2018,6 +2045,7 @@ MediaHttpRange *media_http_range_create(
         ? NULL : options->cancel_opaque;
     range->use_background_transport = range->transport == NULL
         && fetch_background_transport_available();
+    range->stats.connection_id = -1;
     range->stats.retained_bytes =
         sizeof(*range) + url_length + range_url_capacity
         + referer_length + cache_bytes;

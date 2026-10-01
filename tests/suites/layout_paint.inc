@@ -1185,6 +1185,44 @@ static int test_background_layers_paint_front_to_back(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == 0);
+
+    /* Layered gradients keep the box's rounded corners. chatgpt.com's dark
+       composer is two gradient layers on a border-radius pill; the layer
+       radius was stored where only image layers read it, so it painted as a
+       square slab. */
+    static const char rounded_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0;"
+        "background:#fff}"
+        "#layers{width:16px;height:16px;border-radius:8px;background-image:"
+        "linear-gradient(#f00,#f00),linear-gradient(#00f,#00f)}"
+        "</style><body><div id=layers></div></body>";
+    PocDocument rounded_document = {0};
+    Stylesheet rounded_sheet = {0};
+    LayoutDocument rounded_layout = {0};
+    TileCache rounded_cache = {0};
+    uint16_t *rounded_frame = budget_malloc(
+        budget, WIDTH * HEIGHT * sizeof(*rounded_frame));
+    CHECK(rounded_frame != NULL
+          && document_parse(&rounded_document, budget, rounded_page,
+                            strlen(rounded_page), 8)
+          && stylesheet_build(&rounded_sheet, budget, &rounded_document, WIDTH)
+          && layout_build(&rounded_layout, budget, &rounded_document,
+                          &rounded_sheet, NULL, NULL, WIDTH)
+          && tile_cache_init(&rounded_cache, budget, &rounded_layout, 4)
+          && tile_cache_set_frame(&rounded_cache, rounded_frame,
+                                  WIDTH * HEIGHT)
+          && tile_cache_render_frame(&rounded_cache, 0, WIDTH, HEIGHT, NULL));
+    uint16_t corner = rounded_frame[0];
+    uint16_t rounded_center = rounded_frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
+    CHECK(corner == 0xffffu
+          && ((rounded_center >> 11) & 0x1fu) > 24u
+          && (rounded_center & 0x1fu) < 4u);
+    tile_cache_destroy(&rounded_cache);
+    budget_free(budget, rounded_frame);
+    layout_destroy(&rounded_layout);
+    stylesheet_destroy(&rounded_sheet);
+    document_destroy(&rounded_document);
+    CHECK(budget->current == 0);
     return 0;
 }
 

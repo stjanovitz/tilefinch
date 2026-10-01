@@ -17,6 +17,18 @@
 #                       seed an exact offline/ directory into the isolated run
 #     --data-dir DIR    seed profile and site-data files into the run's data
 #                       directory (for example tests/fixtures/ppsspp-site-data)
+#     --trace DIR       serve every request from this recorded HTTP trace
+#                       (a --capture-http directory) instead of the network,
+#                       so page loads take the same emulated time every run
+#     --trace-keyed     replay the trace by method and URL rather than strictly
+#                       in capture order (captures whose requests race)
+#     --capture-trace DIR
+#                       record this live run's HTTP exchanges (the PSP's own
+#                       requests) into DIR, which must not exist yet; prepare
+#                       it as a journey trace with run-perf-journeys.py
+#     --boot KEY=VALUE  append a validation boot.cfg key (repeatable), for
+#                       example trace_ignore_request_body=1 or
+#                       validation_js_profile=0
 #     --heap-mb N       validation JavaScript heap override
 #     --script-file-kb N
 #                       validation per-script source override
@@ -24,11 +36,20 @@
 #     --runs N          replay N times and require identical traces (default 1)
 #     --debug-log       add PPSSPP's -d syscall trace to the emulator log
 #     --update-golden   rewrite the golden from this run instead of diffing
+#     --measure         a measurement scenario: pass without a golden (one
+#                       that exists is still enforced); used by
+#                       benchmarks/run-perf-journeys.py
 #
 # Set TILEFINCH_PPSSPP_CPU_MHZ to a positive emulated PSP clock for a
 # deterministic pressure run, or leave it unset/0 for PPSSPP's normal clock.
 # PPSSPP 1.20 renamed the canonical setting to [CPU] CPUSpeed; the older
 # LockedCPUSpeed spelling is silently ignored.
+#
+# Set TILEFINCH_PPSSPP_DEBUGGER_PORT to a loopback port to start PPSSPP's
+# WebSocket debugger with the run, for tools/ppsspp_pc_sampler.py (program
+# counter sampling for code-layout work). The first boot then idles on
+# native HOME until the sampler installs boot.cfg.after-reset and reboots the
+# game. Unset for every gate.
 #
 # Exits 0 only when the EBOOT prints `tilefinch-input-script: outcome=`, the
 # extracted trace matches the golden, and the run reaches
@@ -61,9 +82,14 @@ timeout_seconds=300
 runs=1
 debug_log=0
 update_golden=0
+measure=0
 start_url=
 offline_library=
 data_seed=
+trace_source=
+trace_keyed=0
+capture_target=
+boot_extra=
 heap_mb=
 script_file_kb=
 # PPSSPP's OpenGL backend no longer initializes on current macOS: the emulator
@@ -97,6 +123,15 @@ while [ "$#" -gt 0 ]; do
         --offline-library=*) offline_library=${1#--offline-library=}; shift ;;
         --data-dir) data_seed=$2; shift 2 ;;
         --data-dir=*) data_seed=${1#--data-dir=}; shift ;;
+        --trace) trace_source=$2; shift 2 ;;
+        --trace=*) trace_source=${1#--trace=}; shift ;;
+        --trace-keyed) trace_keyed=1; shift ;;
+        --capture-trace) capture_target=$2; shift 2 ;;
+        --capture-trace=*) capture_target=${1#--capture-trace=}; shift ;;
+        --boot) boot_extra="$boot_extra
+$2"; shift 2 ;;
+        --boot=*) boot_extra="$boot_extra
+${1#--boot=}"; shift ;;
         --heap-mb) heap_mb=$2; shift 2 ;;
         --heap-mb=*) heap_mb=${1#--heap-mb=}; shift ;;
         --script-file-kb) script_file_kb=$2; shift 2 ;;
@@ -107,6 +142,7 @@ while [ "$#" -gt 0 ]; do
         --runs=*) runs=${1#--runs=}; shift ;;
         --debug-log) debug_log=1; shift ;;
         --update-golden) update_golden=1; shift ;;
+        --measure) measure=1; shift ;;
         -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -158,6 +194,30 @@ if [ -n "$offline_library" ]; then
     [ -f "$offline_library/library.bin" ] || {
         printf 'offline library has no library.bin: %s\n' \
             "$offline_library" >&2
+        exit 2
+    }
+fi
+if [ -n "$trace_source" ]; then
+    case "$trace_source" in
+        /*) ;;
+        *) trace_source="$root/$trace_source" ;;
+    esac
+    [ -f "$trace_source/trace.meta" ] || {
+        printf 'trace has no trace.meta: %s\n' "$trace_source" >&2
+        exit 2
+    }
+fi
+if [ "$trace_keyed" -eq 1 ] && [ -z "$trace_source" ]; then
+    printf '%s\n' '--trace-keyed needs --trace' >&2
+    exit 2
+fi
+if [ -n "$capture_target" ]; then
+    [ -z "$trace_source" ] || {
+        printf '%s\n' '--capture-trace records a live run; drop --trace' >&2
+        exit 2
+    }
+    [ ! -e "$capture_target" ] || {
+        printf 'capture target already exists: %s\n' "$capture_target" >&2
         exit 2
     }
 fi
@@ -375,6 +435,7 @@ run_once() {
         cp -R "$component_stage/components/." "$app_dir/components/"
         cp "$component_stage/profile.cfg" "$app_dir/data/profile.cfg"
         cp "$script_source" "$app_dir/slot-a/input-script.txt"
+        script_dir="$app_dir/slot-a"
         config_path="$app_dir/data/boot-overrides.cfg"
         validation_log="$app_dir/data/tilefinch-validation.txt"
     else
@@ -389,12 +450,27 @@ run_once() {
             fi
         done
         cp "$script_source" "$app_dir/input-script.txt"
+        script_dir="$app_dir"
         config_path="$app_dir/boot.cfg"
         validation_log="$app_dir/tilefinch-validation.txt"
     fi
+    # A scenario's readiness and mark probes follow its script's name.
+    for probe in mark until; do
+        probe_source="$root/tests/input-scripts/$scenario.$probe.js"
+        if [ -f "$probe_source" ]; then
+            cp "$probe_source" "$script_dir/input-script.$probe.js"
+        fi
+    done
     if [ -n "$offline_library" ]; then
         mkdir -p "$app_dir/offline"
         cp -R "$offline_library/." "$app_dir/offline/"
+    fi
+    trace_name=none
+    if [ -n "$trace_source" ]; then
+        # Resolved beside the EBOOT (psp_sibling_path), like the data files.
+        trace_name=replay-trace
+        rm -rf "$app_dir/$trace_name"
+        cp -R "$trace_source" "$app_dir/$trace_name"
     fi
     if [ -n "$data_seed" ]; then
         # The unslotted fixture keeps its data files beside the EBOOT
@@ -406,7 +482,8 @@ run_once() {
         printf '%s\n' \
             "# Generated only for the isolated PPSSPP scripted-input run." \
             "url=$start_url" \
-            "trace=none" \
+            "trace=$trace_name" \
+            "trace_keyed=$trace_keyed" \
             "profile=realistic" \
             "network_profile=1" \
             "ticks=0" \
@@ -419,17 +496,39 @@ run_once() {
             "validation_media_play=0" \
             "validation_media_stability_auto=0" \
             "validation_power_test_auto=0"
+        [ -z "$capture_target" ] || printf '%s\n' "trace_capture=capture"
     } >"$config_path"
     [ -z "$heap_mb" ] || printf 'heap_mb=%s\n' "$heap_mb" >>"$config_path"
+    if [ -n "$boot_extra" ]; then
+        printf '%s\n' "$boot_extra" | sed '/^$/d' >>"$config_path"
+    fi
     [ -z "$script_file_kb" ] \
         || printf 'file_kb=%s\n' "$script_file_kb" >>"$config_path"
+    if [ -n "${TILEFINCH_PPSSPP_DEBUGGER_PORT:-}" ]; then
+        # PPSSPP serves its debugger only after a blocking discovery
+        # registration (about a minute without outbound network), so the
+        # first boot idles on native HOME; the sampler renames the real
+        # configuration into place and reboots the game once it connects.
+        mv "$config_path" "$config_path.after-reset"
+        grep -v '^input_script=\|^url=\|^validation_js_bench=' "$config_path.after-reset" \
+            >"$config_path"
+    fi
 
     {
         printf '%s\n' \
             "[General]" \
             "FirstRun = False" \
             "Enable Logging = True" \
-            "AutoRun = True" \
+            "AutoRun = True"
+        # Code-layout profiling (tools/ppsspp_pc_sampler.py): open PPSSPP's
+        # WebSocket debugger on a fixed loopback port for this run only.
+        if [ -n "${TILEFINCH_PPSSPP_DEBUGGER_PORT:-}" ]; then
+            printf '%s\n' \
+                "RemoteDebuggerOnStartup = True" \
+                "RemoteDebuggerLocal = True" \
+                "RemoteISOPort = $TILEFINCH_PPSSPP_DEBUGGER_PORT"
+        fi
+        printf '%s\n' \
             "[CPU]" \
             "CPUSpeed = $ppsspp_cpu_mhz" \
             "[Network]" \
@@ -548,6 +647,20 @@ run_once() {
     for f in "$app_dir"/frame-mark-*.ppm "$app_dir"/data/frame-mark-*.ppm; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
+    # An engine-PGO training build (PSP_BROWSER_QUICKJS_PGO_GENERATE) writes
+    # its .gcda counters to pgo/ beside the EBOOT at its clean exit.
+    find "$home_dir" -name '*.gcda' -type f | while IFS= read -r f; do
+        mkdir -p "$run_result/pgo" && cp "$f" "$run_result/pgo/"
+    done
+    ls -laR "$app_dir" > "$run_result/app-dir.txt" 2>&1 || true
+    if [ -n "$capture_target" ] && [ "$run_index" -eq 1 ]; then
+        if [ -f "$app_dir/capture/trace.meta" ]; then
+            cp -R "$app_dir/capture" "$capture_target"
+            printf 'captured trace: %s\n' "$capture_target"
+        else
+            printf '%s\n' 'capture did not finish (no trace.meta)' >&2
+        fi
+    fi
     # The harness's own lines, in order. Nothing here is wall-clock derived,
     # so the extraction is the whole normalizer.
     sed -n 's/^\(tilefinch-input-script: .*\)$/\1/p' "$validation_log" \
@@ -556,8 +669,10 @@ run_once() {
         printf 'FAIL: run %s never reached a clean exit.\n' "$run_index" >&2
         return 1
     }
+    expect_trace=0
+    [ -z "$trace_source" ] || expect_trace=1
     if [ -z "$start_url" ] && ! grep -q \
-            'tilefinch-boot-order: surface=native-home deferred=no url-override=0 trace=0 validation=0' \
+            "tilefinch-boot-order: surface=native-home deferred=no url-override=0 trace=$expect_trace validation=0" \
             "$validation_log"; then
         printf '%s\n' \
             'FAIL: scripted input did not use the shipping native-HOME boot.' \
@@ -565,7 +680,7 @@ run_once() {
         return 1
     fi
     if [ -n "$start_url" ] && ! grep -q \
-            'tilefinch-boot-order: .*url-override=1 trace=0 validation=0' \
+            "tilefinch-boot-order: .*url-override=1 trace=$expect_trace validation=0" \
             "$validation_log"; then
         printf '%s\n' \
             'FAIL: scripted input did not use the requested direct URL.' \
@@ -928,13 +1043,13 @@ if [ "$update_golden" -eq 1 ]; then
     exit 0
 fi
 
-[ -f "$golden" ] || {
+[ -f "$golden" ] || [ "$measure" -eq 1 ] || {
     printf '%s\n' \
         "missing golden: $golden" \
         "Create it with --update-golden after reviewing the trace." >&2
     exit 1
 }
-if ! diff -u "$golden" "$trace"; then
+if [ -f "$golden" ] && ! diff -u "$golden" "$trace"; then
     printf '\nFAIL: the receiver trace does not match the golden.\n' >&2
     exit 1
 fi

@@ -799,6 +799,28 @@ typedef struct {
     size_t matched_token_affected_rules;
     size_t stylesheet_appends;
     size_t retired_subtrees;
+    /* :has() changes handled by scoped invalidation, and those that fell
+       back to a full reset; elements whose cached style and retained list
+       they dropped (walked anchors plus keyed scans), and the table scans. */
+    size_t has_scoped;
+    size_t has_fallbacks;
+    size_t has_dropped;
+    size_t has_scans;
+    /* Inline-style writes scoped to the element and the styles that read
+       one of its changed custom properties. */
+    size_t inline_style_scoped;
+    /* Attribute writes no selector reads: the element alone. */
+    size_t own_attribute_scoped;
+    /* ... and those selectors read, reaching the element and the elements
+       carrying those rules' subject keys. */
+    size_t own_attribute_keyed;
+    /* Overflowed journals' subtrees restyled instead of a reset. */
+    size_t overflow_scoped;
+    /* Class/id changes whose tokens no selector reads off its subject. */
+    size_t class_scoped;
+    /* ... and those some selectors do, reaching only elements carrying
+       those rules' subject keys. */
+    size_t class_keyed;
 } LayoutReuseStats;
 
 /* Exclusive flow attribution; native placement includes unclassified flow
@@ -1136,6 +1158,13 @@ ComputedStyle layout_initial_root_style(void);
 void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
                                         lxb_dom_node_t *node,
                                         bool text_or_structure_sensitive);
+/* invalidate_node for a change a :has() rule may observe, named by the
+   (possibly truncated, lower-case) attribute it wrote, or NULL when unknown:
+   only :has() rules reading that attribute (or the pseudo-class it drives)
+   move answers, and only at the anchors the change can reach. */
+void layout_reuse_cache_invalidate_relational(
+    LayoutReuseCache *cache, lxb_dom_node_t *node, const char *attribute,
+    bool text_or_structure_sensitive);
 /* Node retirement: once the runtime promises to call retire_subtree for
    every subtree it frees, removals, moves and innerHTML replacements no
    longer have to reset the cache. */
@@ -1146,20 +1175,61 @@ bool layout_reuse_cache_node_retirement(const LayoutReuseCache *cache);
    caller's, through the ordinary scoped invalidation. */
 void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
                                        const lxb_dom_node_t *root);
-/* A child list changed under `node` and every freed node already left the
-   cache: invalidate the parent scope, plus the ancestor chain when the sheet
-   has :has(); resets only for :has() with sibling combinators. */
+/* `node` was inserted, removed or moved, or its child list changed, and
+   every freed node already left the cache: invalidate the parent scope,
+   plus the elements whose :has()-dependent matches the change can move. */
 void layout_reuse_cache_invalidate_structure(LayoutReuseCache *cache,
                                              lxb_dom_node_t *node);
+/* invalidate_structure for a change already classified against the
+   sheet's :has() rules (stylesheet_tree_change_may_affect_has, or true
+   when it could not be): a non-relational one skips the :has() walk. */
+void layout_reuse_cache_invalidate_tree(LayoutReuseCache *cache,
+                                        lxb_dom_node_t *node, bool relational);
+/* `parent`'s child list changed (`removed` left it, NULL when unknown or
+   destroyed; or innerHTML replaced them) and every freed node already
+   left the cache: invalidates the parent and its children (their
+   descendants too when a sibling test reaches them, the parent's siblings
+   when an :empty test can see it), plus, when `relational`, what the
+   :has() rules can move. */
+void layout_reuse_cache_invalidate_children(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *parent,
+                                            const lxb_dom_node_t *removed,
+                                            bool relational);
 /* Mutation journal proved that this change cannot affect a :has() selector;
    invalidate the ordinary subtree/sizing scope without discarding the cache
    merely because unrelated relational rules exist elsewhere in the sheet. */
 void layout_reuse_cache_invalidate_node_scoped(
     LayoutReuseCache *cache, lxb_dom_node_t *node,
     bool text_or_structure_sensitive);
+/* A non-semantic attribute with no selector dependency preserves computed
+   styles. Generated content may still read attr(), so measurements of this
+   subtree and its ancestors must be invalidated. */
+void layout_reuse_cache_invalidate_measurements(
+    LayoutReuseCache *cache, lxb_dom_node_t *node);
 /* Focus/focus-within can change styles on the focused node and any ancestor.
    Retain the cache allocation and dependency metadata, but discard entries
    whose focus-state assumptions are no longer valid. */
+/* A journal that overflowed names subtrees holding the changes it could
+   not record (ScriptMutationJournal overflow_roots): restyle each. */
+void layout_reuse_cache_invalidate_overflow_root(LayoutReuseCache *cache,
+                                                 lxb_dom_node_t *root);
+/* The :has() plan entries the structure changes invalidated next can
+   move, as the journal's record summarizes them (ScriptMutationRecord
+   has_entries, of plan build `serial`); UINT64_MAX restores "all". Only
+   structural notes (insertions, removals, text) read it. */
+void layout_reuse_cache_set_structure_filter(LayoutReuseCache *cache,
+                                             uint64_t entries,
+                                             uint32_t serial);
+/* A write to an attribute of `node` that no :has() reads (`attribute`
+   lowercased, possibly a journal's truncated prefix). */
+void layout_reuse_cache_invalidate_own_attribute(
+    LayoutReuseCache *cache, lxb_dom_node_t *node, const char *attribute);
+/* A script write to `node`'s inline style: the whole style attribute
+   (`property` NULL) or one declaration (`property` names it). `relational`
+   is the journal's :has() classification of the write. */
+void layout_reuse_cache_invalidate_inline_style(
+    LayoutReuseCache *cache, lxb_dom_node_t *node, const char *property,
+    bool relational);
 void layout_reuse_cache_invalidate_focus(
     LayoutReuseCache *cache, lxb_dom_node_t *node);
 /* The checked state of the given checkboxes/radios changed (attribute and

@@ -29,7 +29,7 @@
     }
     for (let i = 0; i < 66; i++)
       new MutationObserver(noop).observe(nodes[0], {attributes:true});
-    for (let i = 0; i < 70; i++) nodes[0].setAttribute('data-n', i);
+    for (let i = 0; i < 300; i++) nodes[0].setAttribute('data-n', i);
     for (let i = 1; i < 20; i++) nodes[i].setAttribute('data-dirty', i);
     for (let i = 0; i < 34; i++) __tilefinchSaveSectionState(i);
     globalThis.pocSummary = 'CAPS-READY';

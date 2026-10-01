@@ -44,6 +44,25 @@ set(TILEFINCH_PSP_TRANSPORT_LIBRARIES
 set(TILEFINCH_PSP_CRYPTO_LIBRARIES mbedcrypto)
 set(TILEFINCH_PSP_TRANSPORT_DEPENDENCY "")
 
+# The PSP entropy source (docs/engineering/PSP_TRANSPORT.md "Entropy"). It is
+# built for every PSP transport mode because the DNS stub draws its query IDs
+# from it; only the owned mbed TLS build below also registers it as the TLS
+# RNG's strong source. It carries its own SHA-256 object: it is linked after
+# libmbedcrypto, whose entropy module is what pulls it in, and an archive
+# scanned earlier (tilefinch_core) cannot satisfy a reference made that late.
+# Both copies define exactly the same symbols, so the linker takes whichever
+# it reaches first and never needs the other.
+if(PSP)
+    add_library(tilefinch_psp_entropy STATIC
+        src/psp_entropy.c
+        src/psp_entropy_pool.c
+        src/sha256.c)
+    target_include_directories(tilefinch_psp_entropy PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(tilefinch_psp_entropy PRIVATE -Wall -Wextra)
+endif()
+
 if(NOT PSP OR PSP_BROWSER_CURL_STUB
    OR NOT TILEFINCH_PSP_TRANSPORT_MODE STREQUAL "OWNED")
     if(PSP AND NOT PSP_BROWSER_CURL_STUB)
@@ -300,6 +319,19 @@ ExternalProject_Add_Step(tilefinch_psp_curl user-config
     DEPENDS "${_transport_mbedtls_config}"
     DEPENDERS configure)
 
+# mbed TLS's MBEDTLS_ENTROPY_HARDWARE_ALT hook. Linked immediately after
+# libmbedcrypto on both interfaces below, so any executable whose link pulls
+# in entropy.o (curl, PSA, the launcher's update verifier, the crypto
+# selftest) resolves mbedtls_hardware_poll to this source and nothing else.
+add_library(tilefinch_psp_entropy_mbedtls STATIC src/psp_entropy_mbedtls.c)
+add_dependencies(tilefinch_psp_entropy_mbedtls tilefinch_psp_mbedtls)
+target_include_directories(tilefinch_psp_entropy_mbedtls PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${_transport_prefix}/include")
+target_compile_definitions(tilefinch_psp_entropy_mbedtls PRIVATE
+    MBEDTLS_USER_CONFIG_FILE="${_transport_mbedtls_config}")
+target_compile_options(tilefinch_psp_entropy_mbedtls PRIVATE -Wall -Wextra)
+
 add_library(tilefinch_psp_transport INTERFACE)
 add_dependencies(tilefinch_psp_transport tilefinch_psp_curl)
 target_include_directories(tilefinch_psp_transport INTERFACE
@@ -323,6 +355,8 @@ target_link_libraries(tilefinch_psp_transport INTERFACE
     "${_transport_prefix}/lib/libmbedtls.a"
     "${_transport_prefix}/lib/libmbedx509.a"
     "${_transport_prefix}/lib/libmbedcrypto.a"
+    tilefinch_psp_entropy_mbedtls
+    tilefinch_psp_entropy
     "${_transport_prefix}/lib/libeverest.a"
     "${_transport_prefix}/lib/libp256m.a"
     z)
@@ -335,6 +369,8 @@ target_compile_definitions(tilefinch_psp_crypto INTERFACE
     MBEDTLS_USER_CONFIG_FILE="${_transport_mbedtls_config}")
 target_link_libraries(tilefinch_psp_crypto INTERFACE
     "${_transport_prefix}/lib/libmbedcrypto.a"
+    tilefinch_psp_entropy_mbedtls
+    tilefinch_psp_entropy
     "${_transport_prefix}/lib/libeverest.a"
     "${_transport_prefix}/lib/libp256m.a")
 

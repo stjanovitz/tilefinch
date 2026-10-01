@@ -77,7 +77,7 @@ _Static_assert(
 static bool script_heap_pressure_required(
     ScriptRuntime *runtime, size_t working_bytes, size_t reserve_bytes)
 {
-    size_t remaining = script_runtime_heap_remaining(runtime);
+    size_t remaining = script_runtime_heap_available(runtime);
     return working_bytes > remaining
         || reserve_bytes > remaining - working_bytes;
 }
@@ -98,8 +98,15 @@ static size_t script_collect_pressure_once(
     size_t budget_reserve_bytes, size_t heap_reserve_bytes,
     ExternalScriptMetrics *metrics)
 {
+    /* One collection per page load, then at most one a second: a page that
+       settled after load leaves garbage a later dynamic import can use
+       (chatgpt.com's Send imported its sentinel with the heap 12 KiB short
+       of the reserve, long after the load-time collection). */
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
     if (budget == NULL || metrics == NULL
-        || metrics->pressure_collections != 0
+        || (metrics->pressure_collections != 0
+            && now_us - metrics->last_pressure_collection_us
+                   < UINT64_C(1000000))
         || (!budget_pressure_required(
                 budget, working_bytes, budget_reserve_bytes)
             && !script_heap_pressure_required(
@@ -111,6 +118,7 @@ static size_t script_collect_pressure_once(
     size_t after = budget_remaining(budget);
     size_t reclaimed = after > before ? after - before : 0;
     metrics->pressure_collections++;
+    metrics->last_pressure_collection_us = now_us;
     if (reclaimed > SIZE_MAX - metrics->pressure_reclaimed_bytes) {
         metrics->pressure_reclaimed_bytes = SIZE_MAX;
     } else {
@@ -156,6 +164,8 @@ static bool script_admit_known_working_set(
     ScriptRuntime *runtime, Budget *budget, size_t working_bytes,
     ExternalScriptMetrics *metrics)
 {
+    /* A page realm's heap grows on demand (script_runtime_heap_available
+       counts that headroom), so no separate growth step is needed here. */
     return script_admit_known_working_set_with_reserve(
         runtime, budget, working_bytes,
         SCRIPT_PRESENTATION_RESERVE_BYTES,
@@ -962,6 +972,8 @@ bool external_scripts_load(NavigationSession *navigation,
             script_cache_store(
                 navigation->browser_session, resolved, fetch,
                 &request_context, &resource_grant);
+            /* Sharing may move the buffer even if its descriptor is refused. */
+            source = fetch->data;
         }
         if (loaded) {
             loaded = navigation_evaluate_external_script(
@@ -2123,8 +2135,9 @@ static bool execute_external_node(
     bool has_lazy_plan = ok && script_lazy_plan_prepare(
         budget, source, source_length, module, &lazy_plan);
     if (has_lazy_plan && fetch->status_code != 304) {
-        if (fetch_result_share_body(fetch)) {
-            source = fetch->data;
+        bool shared = fetch_result_share_body(fetch);
+        source = fetch->data;
+        if (shared) {
             source_body = fetch->shared_body;
         } else {
             script_lazy_webpack_plan_destroy(&lazy_plan);
@@ -2187,6 +2200,7 @@ static bool execute_external_node(
                 session, resolved, fetch, &request_context,
                 &resource_grant);
         }
+        source = fetch->data;
     }
     if (ok) {
         const char *module_policy = module
@@ -2259,11 +2273,32 @@ static bool execute_external_node_live(
     return executed && !script_runtime_document_refresh_failed(runtime);
 }
 
+/* QuickJS loads a module graph one synchronous request at a time: it asks
+   for a module, compiles it, then asks for each static dependency in turn.
+   Over the PSP's Wi-Fi that serialized chatgpt.com's ~70 modules into
+   35-53 s advances with no frame presented. When a module arrives, its
+   static dependencies are requested in parallel; the synchronous load then
+   waits for the matching request instead of starting a new one. A prefetch
+   reserves a small response bound so it cannot starve other requests; one
+   that fails or overflows falls back to the ordinary request. */
+/* A module fetch that receives nothing for this long fails and is retried
+   on a new connection instead of holding the synchronous graph load until
+   the whole deadline. */
+#define MODULE_FETCH_STALL_SECONDS 6L
+#define MODULE_PREFETCH_LIMIT 6u
+#define MODULE_PREFETCH_BYTES (128u * 1024u)
+#define MODULE_PREFETCH_STALE_US UINT64_C(20000000)
+
+typedef struct {
+    uint64_t id;
+    uint64_t started_us;
+    char url[NAVIGATION_URL_LIMIT];
+} ModulePrefetch;
+
 typedef struct {
     ScriptRuntime *runtime;
     Budget *budget;
     BrowserSession *session;
-    const TilefinchContentSecurityPolicy *content_security_policy;
     char document_url[NAVIGATION_URL_LIMIT];
     char top_level_url[NAVIGATION_URL_LIMIT];
     size_t maximum_file_bytes;
@@ -2271,6 +2306,8 @@ typedef struct {
     ExternalScriptMetrics *metrics;
     ExternalScriptMetrics retained_metrics;
     ModuleBodyLease *body_leases;
+    ModulePrefetch prefetches[MODULE_PREFETCH_LIMIT];
+    size_t prefetch_count;
 } ModuleLoadContext;
 
 #include "script_bundle_diagnostics.inc"
@@ -2321,6 +2358,184 @@ static bool pipeline_module_lease_body(ModuleLoadContext *context,
     return true;
 }
 
+/* Why a module request was refused. Page code usually sees only "could
+   not load module"; chatgpt.com's Send failed that way on the PSP. Logged in
+   validation builds and with TILEFINCH_TRACE_SCRIPT_FAILURES. */
+static void module_load_refused(const char *url, const char *reason)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    static unsigned logged;
+    if (logged < 24u) {
+        logged++;
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "tilefinch-module-refused: url=%.100s reason=%.150s",
+                 url == NULL ? "" : url, reason);
+        tilefinch_platform_log_message(message);
+    }
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = tilefinch_trace_script_failures();
+    if (enabled)
+        fprintf(stderr, "module-refused reason=%s url=%s\n", reason,
+                url == NULL ? "<null>" : url);
+#endif
+}
+
+/* A module the page is waiting on must not be refused because other
+   responses briefly hold the scheduler's byte pool (chatgpt.com's page
+   fetches reserve 1 MiB each). Pump until capacity frees, bounded by the
+   request timeout; completed requests release their unused bound. */
+static void script_wait_for_fetch_capacity(FetchScheduler *scheduler,
+                                           size_t bytes, long timeout_ms)
+{
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    uint64_t limit = timeout_ms > 0
+        ? (uint64_t) timeout_ms * UINT64_C(1000) : UINT64_C(15000000);
+    size_t turns = 0;
+    while (fetch_scheduler_enqueue_would_block(scheduler, bytes)
+           && tilefinch_platform_monotonic_time_us() - started < limit) {
+        (void) fetch_scheduler_pump(scheduler, 1, 10);
+        if (!tilefinch_platform_cooperate("fetch", ++turns)) break;
+    }
+    if (turns != 0)
+        fetch_sync_wait_note(tilefinch_platform_monotonic_time_us() - started);
+}
+
+static size_t module_prefetch_total;
+static size_t module_prefetch_hit_total;
+
+void script_loader_module_prefetch_totals(size_t *prefetches, size_t *hits)
+{
+    if (prefetches != NULL) *prefetches = module_prefetch_total;
+    if (hits != NULL) *hits = module_prefetch_hit_total;
+}
+
+static void module_prefetch_remove(ModuleLoadContext *context, size_t index)
+{
+    if (index >= context->prefetch_count) return;
+    memmove(&context->prefetches[index], &context->prefetches[index + 1],
+            (context->prefetch_count - index - 1u)
+                * sizeof(context->prefetches[0]));
+    context->prefetch_count--;
+}
+
+static size_t module_prefetch_find(const ModuleLoadContext *context,
+                                   const char *url)
+{
+    for (size_t i = 0; i < context->prefetch_count; i++)
+        if (strcmp(context->prefetches[i].url, url) == 0) return i;
+    return SIZE_MAX;
+}
+
+/* Release prefetches nobody will consume: the module was loaded some other
+   way, or the request has sat unclaimed for a long time. */
+static void module_prefetch_sweep(ModuleLoadContext *context,
+                                  FetchScheduler *scheduler)
+{
+    uint64_t now = tilefinch_platform_monotonic_time_us();
+    for (size_t i = context->prefetch_count; i != 0; i--) {
+        ModulePrefetch *prefetch = &context->prefetches[i - 1u];
+        if (!script_runtime_module_loaded(context->runtime, prefetch->url)
+            && now - prefetch->started_us < MODULE_PREFETCH_STALE_US)
+            continue;
+        (void) fetch_scheduler_cancel(scheduler, prefetch->id,
+                                      "module prefetch unused");
+        (void) fetch_scheduler_discard(scheduler, prefetch->id);
+        module_prefetch_remove(context, i - 1u);
+    }
+}
+
+static bool module_specifier_prefetchable(const char *specifier,
+                                          size_t length)
+{
+    return length > 2u && length < 512u
+        && (specifier[0] == '/' || strncmp(specifier, "./", 2) == 0
+            || strncmp(specifier, "../", 3) == 0);
+}
+
+/* Static `import ... from "x"`, `import "x"` and `export ... from "x"`
+   specifiers. A match inside a string or comment only costs one bounded
+   speculative request. Template literals (dynamic import()) are skipped. */
+static void module_prefetch_dependencies(
+    ModuleLoadContext *context, FetchScheduler *scheduler,
+    const char *module_url, const char *referrer_policy,
+    const char *document_url, TilefinchCredentialsMode credentials,
+    bool initiator_opaque, const char *initiator_origin,
+    const char *source, size_t length)
+{
+    if (context == NULL || scheduler == NULL || module_url == NULL
+        || source == NULL) return;
+    module_prefetch_sweep(context, scheduler);
+    for (size_t at = 0; at + 6u < length
+         && context->prefetch_count < MODULE_PREFETCH_LIMIT; at++) {
+        size_t keyword = 0;
+        if (memcmp(source + at, "from", 4) == 0) keyword = 4;
+        else if (memcmp(source + at, "import", 6) == 0) keyword = 6;
+        else continue;
+        if (at != 0 && (isalnum((unsigned char) source[at - 1])
+                        || source[at - 1] == '_' || source[at - 1] == '$'
+                        || source[at - 1] == '.'))
+            continue;
+        size_t quote_at = at + keyword;
+        while (quote_at < length && source[quote_at] == ' ') quote_at++;
+        if (quote_at >= length
+            || (source[quote_at] != '"' && source[quote_at] != '\'')) continue;
+        char quote = source[quote_at];
+        size_t end = quote_at + 1u;
+        while (end < length && source[end] != quote && source[end] != '\n'
+               && end - quote_at < 512u) end++;
+        if (end >= length || source[end] != quote) continue;
+        const char *specifier = source + quote_at + 1u;
+        size_t specifier_length = end - quote_at - 1u;
+        at = end;
+        if (!module_specifier_prefetchable(specifier, specifier_length))
+            continue;
+        char relative[512];
+        memcpy(relative, specifier, specifier_length);
+        relative[specifier_length] = '\0';
+        char resolved[NAVIGATION_URL_LIMIT];
+        if (!fetch_resolve_url(module_url, relative, resolved,
+                               sizeof(resolved))
+            || script_runtime_module_loaded(context->runtime, resolved)
+            || module_prefetch_find(context, resolved) != SIZE_MAX)
+            continue;
+        const BrowserCacheEntry *cached = NULL;
+        if (script_module_cache_match(
+                context->session, resolved, initiator_origin,
+                context->top_level_url, initiator_opaque, credentials,
+                &cached) == BROWSER_CACHE_FRESH) continue;
+        if (fetch_scheduler_enqueue_would_block(
+                scheduler, MODULE_PREFETCH_BYTES)) return;
+        TilefinchRequestContext request_context = script_request_context(
+            document_url, context->top_level_url, resolved, true,
+            credentials, initiator_opaque);
+        FetchRequest transport = {
+            .allow_http_errors = true,
+            .send_low_client_hints = true,
+            .accept = "*/*",
+            .stall_abort_seconds = MODULE_FETCH_STALL_SECONDS,
+        };
+        FetchPreparedPageRequest prepared;
+        if (!fetch_prepare_page_request_context(
+                &request_context, module_url, referrer_policy,
+                context->session,
+                script_runtime_content_security_policy(context->runtime),
+                NULL, &transport, &prepared, NULL)) continue;
+        uint64_t id = fetch_scheduler_enqueue(
+            scheduler, resolved, fetch_prepared_page_request(&prepared),
+            MODULE_PREFETCH_BYTES, context->timeout_ms);
+        if (id == 0) return;
+        ModulePrefetch *prefetch =
+            &context->prefetches[context->prefetch_count++];
+        prefetch->id = id;
+        prefetch->started_us = tilefinch_platform_monotonic_time_us();
+        snprintf(prefetch->url, sizeof(prefetch->url), "%s", resolved);
+        context->metrics->module_prefetches++;
+        module_prefetch_total++;
+    }
+}
+
 static bool pipeline_module_load(void *opaque,
                                  const ScriptModuleLoadRequest *module_request,
                                  ScriptModuleLoadResult *result)
@@ -2363,11 +2578,15 @@ static bool pipeline_module_load(void *opaque,
         context->runtime, SCRIPT_QUOTA_NEW_EXECUTABLE,
         context->maximum_file_bytes, context->timeout_ms,
         &quota, &progress_failed);
-    if (progress_failed) return false;
+    if (progress_failed) {
+        module_load_refused(url, "quota-progress");
+        return false;
+    }
     if (quota_status != SCRIPT_QUOTA_RESERVE_GRANTED
         || quota.reserved_bytes == 0) {
         script_runtime_script_quota_abort(context->runtime, &quota);
         context->metrics->skipped_quota++; script_trace_skip(url);
+        module_load_refused(url, "quota-reserve");
         return false;
     }
     size_t response_limit = quota.reserved_bytes;
@@ -2393,10 +2612,12 @@ static bool pipeline_module_load(void *opaque,
                    context->runtime, context->budget, &response_limit,
                    &pressure_capped, context->metrics)) {
         script_runtime_script_quota_abort(context->runtime, &quota);
+        module_load_refused(url, "network-working-set");
         return false;
     }
     context->metrics->attempted++; script_trace_attempt(url);
     const unsigned char *selected = NULL;
+    const char *refusal = NULL;
     size_t selected_length = 0;
     BrowserSharedBody *selected_body = NULL;
     ScriptCacheSource cached_source = {0};
@@ -2428,6 +2649,7 @@ static bool pipeline_module_load(void *opaque,
             .allow_http_errors = true,
             .send_low_client_hints = true,
             .accept = "*/*",
+            .stall_abort_seconds = MODULE_FETCH_STALL_SECONDS,
             .if_none_match = cached == NULL ? NULL : cached->etag,
             .if_modified_since = cached == NULL
                                  ? NULL : cached->last_modified,
@@ -2440,13 +2662,66 @@ static bool pipeline_module_load(void *opaque,
         bool request_ready = fetch_prepare_page_request_context(
             &request_context, module_request->referrer_url,
             module_request->referrer_policy, context->session,
-            context->content_security_policy, NULL, &transport,
+            script_runtime_content_security_policy(context->runtime),
+            NULL, &transport,
             &prepared, NULL);
         const FetchRequest *request = request_ready
             ? fetch_prepared_page_request(&prepared) : NULL;
-        if (request == NULL || !fetch_scheduler_request(scheduler, url, request,
-                                     response_limit, context->timeout_ms,
-                                     fetch)) {
+        size_t prefetched = module_prefetch_find(context, url);
+        bool fetched = false;
+        /* A failure that delivered no body is usually a dead or stalled
+           connection (every HTTP/2 stream on it stalls), so the next
+           attempt opens a new one. */
+        FetchRequest fresh_request = {0};
+        bool use_fresh_connection = false;
+        if (prefetched != SIZE_MAX) {
+            uint64_t prefetch_id = context->prefetches[prefetched].id;
+            module_prefetch_remove(context, prefetched);
+            fetched = fetch_scheduler_wait(scheduler, prefetch_id, fetch)
+                && fetch->status_code >= 200 && fetch->status_code < 300;
+            if (fetched) {
+                context->metrics->module_prefetch_hits++;
+                module_prefetch_hit_total++;
+            } else {
+                use_fresh_connection = fetch->length == 0;
+                fetch_result_free(fetch);
+                fetch = fetch_result_create(context->budget);
+                if (fetch == NULL) {
+                    script_runtime_script_quota_abort(
+                        context->runtime, &quota);
+                    script_cache_source_release(&cached_source);
+                    return false;
+                }
+            }
+        }
+        if (request != NULL) {
+            fresh_request = *request;
+            fresh_request.force_fresh_connection = true;
+        }
+        for (int attempt = 0; !fetched && request != NULL && attempt < 2;
+             attempt++) {
+            script_wait_for_fetch_capacity(
+                scheduler, response_limit, context->timeout_ms);
+            fetched = fetch_scheduler_request(
+                scheduler, url,
+                use_fresh_connection ? &fresh_request : request,
+                response_limit, context->timeout_ms, fetch);
+            /* A transport failure that delivered no body — no response at
+               all, or headers and then a stall — is retried once on a new
+               connection; a stream stuck behind others on one HTTP/2
+               connection stays stuck. */
+            if (fetched || fetch->length != 0 || use_fresh_connection)
+                break;
+            use_fresh_connection = true;
+            fetch_result_free(fetch);
+            fetch = fetch_result_create(context->budget);
+            if (fetch == NULL) {
+                script_runtime_script_quota_abort(context->runtime, &quota);
+                script_cache_source_release(&cached_source);
+                return false;
+            }
+        }
+        if (!fetched) {
             if (tilefinch_trace_script_failures()) {
                 size_t pool_reserved = 0, pool_maximum = 0;
                 size_t slots_active = 0, slots_maximum = 0;
@@ -2466,6 +2741,21 @@ static bool pipeline_module_load(void *opaque,
             if (script_fetch_was_pressure_rejected(fetch, pressure_capped)) {
                 context->metrics->skipped_pressure++;
             }
+            {
+                size_t pool_reserved = 0, pool_maximum = 0;
+                size_t slots_active = 0, slots_maximum = 0;
+                fetch_scheduler_reservation_state(
+                    scheduler, &pool_reserved, &pool_maximum,
+                    &slots_active, &slots_maximum);
+                char reason[200];
+                snprintf(reason, sizeof(reason),
+                         "fetch request=%d limit=%zu pool=%zu/%zu "
+                         "slots=%zu/%zu error=\"%.60s\" scheduler=\"%.60s\"",
+                         request != NULL, response_limit, pool_reserved,
+                         pool_maximum, slots_active, slots_maximum,
+                         fetch->error, fetch_scheduler_last_error(scheduler));
+                module_load_refused(url, reason);
+            }
             script_runtime_script_quota_abort(context->runtime, &quota);
             fetch_result_free(fetch);
             script_cache_source_release(&cached_source);
@@ -2478,6 +2768,7 @@ static bool pipeline_module_load(void *opaque,
         bool response_ok = (fetch->status_code >= 200
                             && fetch->status_code < 300)
             || (fetch->status_code == 304 && cached_source_ready);
+        if (!response_ok) refusal = "status";
         const char *accepted_content_type = fetch->status_code == 304
             && cached != NULL ? cached->content_type : fetch->content_type;
         if (response_ok) {
@@ -2485,6 +2776,7 @@ static bool pipeline_module_load(void *opaque,
                 ? script_module_revalidated_mime_allowed(
                     accepted_content_type, fetch->content_type)
                 : script_module_mime_type_allowed(accepted_content_type);
+            if (!response_ok) refusal = "mime";
         }
         TilefinchResourceGrant resource_grant = {0};
         if (response_ok) {
@@ -2495,6 +2787,7 @@ static bool pipeline_module_load(void *opaque,
             response_ok = script_resource_grant(
                 fetch, &request_context, accepted_content_type, true,
                 &resource_grant);
+            if (!response_ok) refusal = "resource-grant";
         }
         if (response_ok && fetch->status_code == 304) {
             response_ok = script_module_cache_record(
@@ -2511,6 +2804,7 @@ static bool pipeline_module_load(void *opaque,
             bool header_present = false;
             response_ok = fetch_response_referrer_policy(
                 fetch, &header_present, response_referrer_policy);
+            if (!response_ok) refusal = "referrer-policy";
         }
         if (response_ok) {
             script_accept_response_cookies(
@@ -2525,28 +2819,29 @@ static bool pipeline_module_load(void *opaque,
                 context->metrics->cache_hits++;
             }
         } else if (response_ok) {
-            selected = (const unsigned char *) fetch->data;
             selected_length = fetch->length;
             (void) fetch_result_share_body(fetch);
-            selected_body = fetch->shared_body != NULL
-                && script_source_has_terminator(
-                    fetch->shared_body->data, fetch->shared_body->length)
-                ? fetch->shared_body : NULL;
             if (context->session != NULL && fetch->length != 0) {
                 (void) script_module_cache_record(
                     context->session, url, fetch_response_url,
                     initiator_origin, context->top_level_url,
                     initiator_opaque, credentials, fetch,
                     false, tilefinch_platform_monotonic_time_ns());
-                selected_body = fetch->shared_body != NULL
-                    && script_source_has_terminator(
-                        fetch->shared_body->data, fetch->shared_body->length)
-                    ? fetch->shared_body : NULL;
             }
+            /* Both sharing attempts can relocate the response, including a
+               failed descriptor allocation after a successful shrink. */
+            selected = (const unsigned char *) fetch->data;
+            selected_body = fetch->shared_body != NULL
+                && script_source_has_terminator(
+                    fetch->shared_body->data, fetch->shared_body->length)
+                ? fetch->shared_body : NULL;
         }
     }
     if (selected == NULL || selected_length == 0
         || selected_length > response_limit) {
+        module_load_refused(url, selected == NULL
+                                     ? (refusal == NULL ? "response" : refusal)
+                            : selected_length == 0 ? "empty" : "too-large");
         script_runtime_script_quota_abort(context->runtime, &quota);
         if (selected_length > response_limit) {
             context->metrics->skipped_quota++; script_trace_skip(url);
@@ -2555,11 +2850,23 @@ static bool pipeline_module_load(void *opaque,
         script_cache_source_release(&cached_source);
         return false;
     }
+    {
+        const char *module_url = fetch != NULL
+            && fetch->effective_url[0] != '\0'
+            ? fetch->effective_url
+            : (cached != NULL && cached->module_effective_url != NULL
+                   ? cached->module_effective_url : url);
+        module_prefetch_dependencies(
+            context, scheduler, module_url, response_referrer_policy,
+            document_url, credentials, initiator_opaque, initiator_origin,
+            (const char *) selected, selected_length);
+    }
     size_t quota_source_length = selected_length;
     if (!script_runtime_script_quota_commit(
             context->runtime, &quota, quota_source_length)) {
         script_runtime_script_quota_abort(context->runtime, &quota);
         context->metrics->skipped_quota++; script_trace_skip(url);
+        module_load_refused(url, "quota-commit");
         fetch_result_free(fetch);
         script_cache_source_release(&cached_source);
         return false;
@@ -2567,6 +2874,16 @@ static bool pipeline_module_load(void *opaque,
     if (!script_admit_known_working_set(
             context->runtime, context->budget, quota_source_length,
             context->metrics)) {
+        {
+            char reason[160];
+            snprintf(reason, sizeof(reason),
+                     "working-set bytes=%zu budget-remaining=%zu "
+                     "heap-remaining=%zu collections=%zu",
+                     quota_source_length, budget_remaining(context->budget),
+                     script_runtime_heap_remaining(context->runtime),
+                     context->metrics->pressure_collections);
+            module_load_refused(url, reason);
+        }
         fetch_result_free(fetch);
         script_cache_source_release(&cached_source);
         return false;
@@ -2943,6 +3260,48 @@ static void script_plan_initial_admission(
     }
 }
 
+/* One loader context per realm. Parser-blocking classic scripts may call
+   import() before the document pipeline starts (chatgpt.com's inline
+   bootstrap does), so the first of the two to need it installs the context
+   and the other adopts it: replacing it would release module bodies that
+   earlier compiled modules still lease. */
+static ModuleLoadContext *pipeline_module_loader_install(
+    ScriptRuntime *runtime, Budget *budget, BrowserSession *session,
+    const char *document_url, size_t maximum_file_bytes, long timeout_ms)
+{
+    ModuleLoadContext *module_context = script_runtime_module_loader_opaque(
+        runtime, pipeline_module_load);
+    bool installed = module_context != NULL;
+    if (!installed) {
+        module_context = budget_calloc(budget, 1, sizeof(*module_context));
+        if (module_context == NULL) return NULL;
+        module_context->runtime = runtime;
+        module_context->budget = budget;
+        module_context->metrics = &module_context->retained_metrics;
+    }
+    module_context->session = session;
+    /* The loader owns no page scheduler. Its realm creates a bounded view only
+       when a dependency is actually requested, so idle documents and child
+       realms do not each allocate a CURLM/view. The runtime retains the shared
+       scheduler domain across low-memory document replacement. */
+    snprintf(module_context->document_url,
+             sizeof(module_context->document_url), "%s", document_url);
+    if (!script_runtime_copy_top_level_url(
+            runtime, module_context->top_level_url,
+            sizeof(module_context->top_level_url))) {
+        if (!installed) budget_free(budget, module_context);
+        return NULL;
+    }
+    module_context->maximum_file_bytes = maximum_file_bytes;
+    module_context->timeout_ms = timeout_ms;
+    if (!installed) {
+        script_runtime_set_module_loader_owned(
+            runtime, pipeline_module_load, pipeline_module_free,
+            module_context, pipeline_context_destroy);
+    }
+    return module_context;
+}
+
 static bool document_scripts_execute_internal(
     PocDocument *document, ScriptRuntime *runtime, Budget *budget,
     BrowserSession *session, const char *base_url,
@@ -2980,47 +3339,22 @@ static bool document_scripts_execute_internal(
         *metrics = streaming->early;
     }
     size_t script_count = 0, deferred_count = 0;
-    ModuleLoadContext *module_context = budget_calloc(
-        budget, 1, sizeof(*module_context));
+    ScriptExecutionPlan *plan = budget_calloc(
+        budget, 1, sizeof(*plan));
+    if (plan == NULL) return false;
+    ModuleLoadContext *module_context = pipeline_module_loader_install(
+        runtime, budget, session, document_url, maximum_file_bytes,
+        timeout_ms);
     if (module_context == NULL) {
         if (tilefinch_trace_script_failures()) {
             fprintf(stderr, "document-script-module-context-allocation-failure\n");
         }
-        return false;
-    }
-    ScriptExecutionPlan *plan = budget_calloc(
-        budget, 1, sizeof(*plan));
-    if (plan == NULL) {
-        budget_free(budget, module_context);
-        return false;
-    }
-    module_context->runtime = runtime;
-    module_context->budget = budget;
-    module_context->session = session;
-    module_context->content_security_policy =
-        &document->content_security_policy;
-    /* The loader owns no page scheduler. Its realm creates a bounded view only
-       when a dependency is actually requested, so idle documents and child
-       realms do not each allocate a CURLM/view. The runtime retains the shared
-       scheduler domain across low-memory document replacement. */
-    snprintf(module_context->document_url,
-             sizeof(module_context->document_url), "%s", document_url);
-    if (!script_runtime_copy_top_level_url(
-            runtime, module_context->top_level_url,
-            sizeof(module_context->top_level_url))) {
         budget_free(budget, plan);
-        budget_free(budget, module_context);
         return false;
     }
-    module_context->maximum_file_bytes = maximum_file_bytes;
-    module_context->timeout_ms = timeout_ms;
     ExternalScriptMetrics *output_metrics = metrics;
     module_context->retained_metrics = *output_metrics;
-    module_context->metrics = &module_context->retained_metrics;
     metrics = module_context->metrics;
-    script_runtime_set_module_loader_owned(
-        runtime, pipeline_module_load, pipeline_module_free,
-        module_context, pipeline_context_destroy);
     size_t collection_limit = EXTERNAL_SCRIPT_HARD_LIMIT;
     size_t discovered_before_scan = metrics->discovered;
     collect_executable_scripts(runtime, script_root, plan->scripts,
@@ -3204,6 +3538,11 @@ DocumentScriptProcessResult document_scripts_process_closed(
         && script_was_parser_executed(state, element_handle)) {
         return DOCUMENT_SCRIPT_PROCESS_COMPLETE;
     }
+    /* A failed install leaves import() unavailable to this script only;
+       the document pipeline retries it. */
+    (void) pipeline_module_loader_install(
+        runtime, budget, session, document_url, maximum_file_bytes,
+        timeout_ms);
     state->early.discovered++;
     state->early.parser_blocking++;
     if (element_handle == 0) {

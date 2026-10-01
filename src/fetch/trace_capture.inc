@@ -12,10 +12,14 @@ static void trace_replay_claim_record(size_t sequence)
         |= UINT64_C(1) << (sequence % 64u);
 }
 
+#ifndef TILEFINCH_NO_FETCH_TRACE
 static uint64_t trace_wall_time_ms(void)
 {
     return tilefinch_platform_wall_time_ns() / UINT64_C(1000000);
 }
+#endif
+
+#define TRACE_CAPTURE_REQUEST_BODY_LIMIT (16u * 1024u)
 
 static bool trace_path(char *output, size_t capacity, size_t sequence,
                        const char *suffix)
@@ -41,6 +45,7 @@ static bool trace_write_line(FILE *file, const char *name, const char *value)
    rebuild byte-identical Cookie headers without retaining credentials.  An
    expired entry is already absent from the logical jar. Empty values remain
    meaningful and are represented by value-length=0. */
+#ifndef TILEFINCH_NO_FETCH_TRACE
 static bool trace_write_cookie_seed(FILE *file,
                                     const BrowserSession *session)
 {
@@ -105,6 +110,7 @@ static bool trace_write_cookie_seed(FILE *file,
     }
     return index == count;
 }
+#endif
 
 /* Preserve cookie names, attributes, and byte lengths so deterministic replay
    still exercises cookie policy without persisting live session secrets. */
@@ -158,16 +164,23 @@ static uint64_t trace_body_hash_v1(const char *body, size_t length)
         body, length, UINT64_C(1469598103934665603));
 }
 
-static bool trace_open_body_hash(FILE *file, size_t length, uint64_t *hash)
+/* Hashes a trace body file and rewinds it, reading `capacity` bytes at a
+   time from `buffer` (a 4 KiB stack buffer when none is supplied). */
+static bool trace_open_body_hash_buffer(FILE *file, size_t length,
+                                        uint64_t *hash, unsigned char *buffer,
+                                        size_t capacity)
 {
     if (file == NULL || hash == NULL) return false;
-    unsigned char buffer[4096];
+    unsigned char local[4096];
+    if (buffer == NULL || capacity == 0) {
+        buffer = local;
+        capacity = sizeof(local);
+    }
     size_t remaining = length;
     uint64_t value = trace_body_hash("", 0);
     bool ok = true;
     while (remaining != 0) {
-        size_t wanted = remaining < sizeof(buffer) ? remaining
-                                                   : sizeof(buffer);
+        size_t wanted = remaining < capacity ? remaining : capacity;
         if (fread(buffer, 1, wanted, file) != wanted) {
             ok = false;
             break;
@@ -181,6 +194,11 @@ static bool trace_open_body_hash(FILE *file, size_t length, uint64_t *hash)
     if (fseek(file, 0, SEEK_SET) != 0) ok = false;
     if (ok) *hash = value;
     return ok;
+}
+
+static bool trace_open_body_hash(FILE *file, size_t length, uint64_t *hash)
+{
+    return trace_open_body_hash_buffer(file, length, hash, NULL, 0);
 }
 
 static bool trace_file_body_hash(const char *path, size_t length,
@@ -254,6 +272,7 @@ static bool trace_cache_mode_from_header_shape(
     return true;
 }
 
+#ifndef TILEFINCH_NO_FETCH_TRACE
 static void trace_cookie_provenance_clear(void)
 {
     for (size_t i = 0; i < FETCH_TRACE_COOKIE_PROVENANCE_LIMIT; i++) {
@@ -266,6 +285,7 @@ static void trace_cookie_provenance_clear(void)
     fetch_trace.cookie_provenance_evictions = 0;
     fetch_trace.cookie_provenance_allocation_failed = false;
 }
+#endif
 
 static bool trace_cookie_pair_span(const char *text, size_t text_length,
                                    bool set_cookie,
@@ -472,6 +492,7 @@ static size_t trace_cookie_provenance_match(
 typedef struct {
     char meta_path[4096];
     char body_path[4096];
+    char request_path[4096];
     char logical_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char request_key[TILEFINCH_URL_SERIALIZED_LIMIT];
     char header_value[FETCH_EXTRA_HEADERS_MAX + 16];
@@ -539,6 +560,21 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
             result->response_security_headers_truncated)) {
         budget_free(budget, scratch);
         return false;
+    }
+    /* Small request bodies are kept beside the record for diagnosis only
+       (a page's error-report POST says why the page gave up); replay keys
+       on the hash in the meta file and never reads them. */
+    if (request != NULL && request->body != NULL
+        && request->body_length > 0
+        && request->body_length <= TRACE_CAPTURE_REQUEST_BODY_LIMIT
+        && trace_path(scratch->request_path, sizeof(scratch->request_path),
+                      sequence, "request")) {
+        FILE *request_body = fopen(scratch->request_path, "wb");
+        if (request_body != NULL) {
+            (void) fwrite(request->body, 1, request->body_length,
+                          request_body);
+            fclose(request_body);
+        }
     }
     FILE *meta = fopen(scratch->meta_path, "wb");
     FILE *body = body_previously_written
@@ -1041,6 +1077,7 @@ typedef struct {
     char request_client_hint_tokens[1024];
     char request_client_hint_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     char request_extra_header_shape[FETCH_EXTRA_HEADERS_MAX + 16];
+    char recorded_url[TILEFINCH_URL_SERIALIZED_LIMIT];
 } TraceReplayScratch;
 
 typedef enum {

@@ -41,10 +41,9 @@ static bool psp_media_reopen_backward_seek(
         return true;
     }
     media->clock_us = target_us;
-    media->reopen_resume_us = target_us;
-    media->reopen_resume_playing = resume_playing;
-    media->reopen_resume_pending = true;
-    media->reopen_reuse_resolved_stream = reuse_resolved_stream;
+    psp_media_continuation_reopen(
+        &media->continuation, target_us, resume_playing);
+    media->continuation.reuse_resolved = reuse_resolved_stream;
     media->reopen_seek_completion_pending = true;
     media->open_service_pending = true;
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
@@ -83,12 +82,8 @@ bool psp_media_request_seek_with_resume(
        range windows ordinary playback needed. Keep the current picture and
        move only the target marker; Cross below performs one committed seek. */
     if (preview) {
-        if (!media->seek_preview_started) {
-            media->seek_preview_started = true;
-            media->seek_preview_was_playing = resume_playing;
-            media->seek_preview_cancel_pending = false;
+        if (psp_media_scrub_begin(&media->scrub, resume_playing))
             media->job_restore_us = media->clock_us;
-        }
         if (!media->machine.preview_active) {
             psp_media_session_dispatch_event(media, (PspMediaEvent) {
                 .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
@@ -129,7 +124,7 @@ bool psp_media_request_seek_with_resume(
     media->job_actual_us = target_us;
     media->job_prime_audio_us = target_us;
     media->job_prime_ready_mask = 0;
-    psp_media_release_presentation_preroll(media, true);
+    psp_media_release_presentation_preroll(media);
     media->job_preview = false;
     media->job_resume_playing = resume_playing;
     media->ui.playing = false;
@@ -144,7 +139,7 @@ bool psp_media_request_seek_with_resume(
            "resume=%d preview-started=%d phase=%d\n",
            0, (unsigned long long) target_us,
            media->job_resume_playing ? 1 : 0,
-           media->seek_preview_started ? 1 : 0,
+           psp_media_scrub_active(&media->scrub) ? 1 : 0,
            (int) media->job_phase);
     psp_media_session_checkpoint(media, "seek-request");
     return true;
@@ -154,8 +149,8 @@ bool psp_media_request_seek(
     PspMediaSession *media, uint64_t target_us, bool preview)
 {
     bool resume_playing = media != NULL
-        && (media->seek_preview_started
-                ? media->seek_preview_was_playing
+        && (psp_media_scrub_active(&media->scrub)
+                ? media->scrub.was_playing
                 : (media->ui.playing
                    || psp_media_machine_wants_playing(media)));
     return psp_media_request_seek_with_resume(
@@ -235,7 +230,7 @@ void psp_media_cancel_decode(PspMediaSession *media)
 {
     if (media == NULL) return;
     psp_media_buffering_end(media, psp_media_internal_now_us(media));
-    psp_media_release_presentation_preroll(media, true);
+    psp_media_release_presentation_preroll(media);
     if (media->playback != NULL)
         media_playback_set_playing(media->playback, false);
     media->ui.playing = false;
@@ -250,14 +245,12 @@ void psp_media_cancel_decode(PspMediaSession *media)
     media->job_prime_ready_mask = 0;
     media->job_preview = false;
     media->job_resume_playing = false;
-    media->job_resume_open = false;
+    psp_media_continuation_end_resume(&media->continuation);
     media->job_started_us = 0;
     media->job_phase_started_us = 0;
     media->job_units = 0;
     media->job_maximum_unit_us = 0;
-    media->seek_preview_started = false;
-    media->seek_preview_was_playing = false;
-    media->seek_preview_cancel_pending = false;
+    psp_media_scrub_end(&media->scrub);
     psp_ui_media_cancel_seek_preview(&media->ui);
     psp_ui_media_set_buffering(
         &media->ui, false,
@@ -319,7 +312,7 @@ bool psp_media_seek_decode_pump(
         media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE;
     bool cancelled_preview = restore
-        && media->seek_preview_cancel_pending;
+        && psp_media_scrub_cancelling(&media->scrub);
     uint64_t target_us =
         restore ? media->job_restore_us : media->job_target_us;
     if (media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME) {
@@ -360,8 +353,9 @@ bool psp_media_seek_decode_pump(
             return true;
         }
 
-        bool resume_open = media->job_resume_open;
-        media->job_resume_open = false;
+        bool resume_open =
+            psp_media_continuation_resuming(&media->continuation);
+        psp_media_continuation_end_resume(&media->continuation);
         /* AAC frames are independent and the first retained frame is at or
            just after the requested time. Adopt it when it is close enough so
            the later DAC cursor cannot introduce a visible clock step. */
@@ -372,11 +366,11 @@ bool psp_media_seek_decode_pump(
             release_clock_us = media->job_prime_audio_us;
         }
         media->clock_us = release_clock_us;
-        media->presentation_floor_us = target_us;
-        media->presentation_preroll_startup = false;
+        psp_media_seek_floor_arm(&media->seek_floor, target_us);
+        psp_media_startup_end(&media->startup);
         media->job_phase = PSP_MEDIA_JOB_NONE;
         media->job_preview = false;
-        media->seek_preview_started = false;
+        psp_media_scrub_end(&media->scrub);
         bool playing = media->job_resume_playing;
         media->ui.playing = playing;
         media_playback_set_playing(media->playback, playing);
@@ -395,7 +389,7 @@ bool psp_media_seek_decode_pump(
                (unsigned long long) media->job_actual_us,
                (unsigned long long) release_clock_us, playing ? 1 : 0,
                (unsigned) media->job_prime_ready_mask,
-               media->presentation_preroll_audio_held ? 1 : 0,
+               media->audio_hold.applied ? 1 : 0,
                (unsigned long long) (
                    psp_media_internal_now_us(media) - media->job_started_us));
         media->job_started_us = 0;
@@ -463,8 +457,8 @@ bool psp_media_seek_decode_pump(
                facts, rather than blocking the browser thread or declaring
                success after warming the preceding audio keyframe. */
             media->clock_us = target_us;
-            media->presentation_floor_us = target_us;
-            media->presentation_preroll_startup = false;
+            psp_media_seek_floor_arm(&media->seek_floor, target_us);
+            psp_media_startup_end(&media->startup);
             media->job_actual_us = actual_us;
             media->job_prime_audio_us = target_us;
             media->job_prime_ready_mask = 0;
@@ -482,7 +476,7 @@ bool psp_media_seek_decode_pump(
          * the user's real play/pause state and the normal post-seek preroll
          * releases audio at a synchronized boundary.
          */
-        media->presentation_preroll_startup = false;
+        psp_media_startup_end(&media->startup);
         media_playback_set_playing(media->playback, true);
         media->job_phase = restore
             ? PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE
@@ -586,7 +580,7 @@ bool psp_media_seek_decode_pump(
         } else {
             bool playing = restore
                 ? (cancelled_preview
-                    && media->seek_preview_was_playing)
+                    && psp_media_scrub_resume_playing(&media->scrub))
                 : media->job_resume_playing;
             media->ui.playing = playing;
             media_playback_set_playing(media->playback, playing);
@@ -602,10 +596,9 @@ bool psp_media_seek_decode_pump(
             if (!restore)
                 psp_ui_media_commit_seek(&media->ui, target_us);
             media->job_phase = PSP_MEDIA_JOB_NONE;
-            if (!restore) media->seek_preview_started = false;
+            if (!restore || cancelled_preview)
+                psp_media_scrub_end(&media->scrub);
             if (cancelled_preview) {
-                media->seek_preview_started = false;
-                media->seek_preview_cancel_pending = false;
                 psp_ui_media_cancel_seek_preview(&media->ui);
                 psp_media_session_dispatch_event(media, (PspMediaEvent) {
                     .type = PSP_MEDIA_EVENT_PREVIEW_ENDED
@@ -628,9 +621,14 @@ bool psp_media_seek_decode_pump(
     media->job_units++;
     if (unit_us > media->job_maximum_unit_us)
         media->job_maximum_unit_us = unit_us;
-    if (media->job_phase == PSP_MEDIA_JOB_NONE
-        && media->seek_preview_started) {
-        media->seek_preview_started = false;
+    if (media->job_phase == PSP_MEDIA_JOB_NONE) {
+        /* A restore that was not a cancel leaves the preview visible while
+           playback holds, paused, at its original position; anything else
+           that finished here ends the scrub. */
+        if (restore && !cancelled_preview)
+            psp_media_scrub_retain(&media->scrub, media->scrub.was_playing);
+        else
+            psp_media_scrub_end(&media->scrub);
     }
     if (media->job_phase == PSP_MEDIA_JOB_NONE
         && !media->job_preview) {
@@ -638,14 +636,8 @@ bool psp_media_seek_decode_pump(
         media->job_maximum_unit_us = 0;
     }
     if (media->job_phase == PSP_MEDIA_JOB_NONE
-        && restore && !cancelled_preview) {
-        /* The preview remains visible in the UI while playback has been
-           restored to its original position and remains paused. */
-        media->seek_preview_started = true;
-    }
-    if (media->job_phase == PSP_MEDIA_JOB_NONE
         && restore && media->playback == NULL) {
-        media->seek_preview_started = false;
+        psp_media_scrub_end(&media->scrub);
         psp_ui_media_cancel_seek_preview(&media->ui);
         psp_media_session_dispatch_event(media, (PspMediaEvent) {
             .type = PSP_MEDIA_EVENT_PREVIEW_ENDED

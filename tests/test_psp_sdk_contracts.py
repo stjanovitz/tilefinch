@@ -118,6 +118,13 @@ def psp_firmware_backend_destroy(source: str):
         source.index("static bool psp_media_backend_create_track_info(")]
 
 
+def loop_step(source: str, name: str):
+    """Definition of one of the interactive loop's out-of-line frame steps
+    (psp_loop_*), not its prototype."""
+    start = source.rindex(name + "(\n    PspLoop *loop")
+    return source[start:source.index("\n}\n", start)]
+
+
 def frame_pump_policy(name):
     """Source text of one entry in the declared frame-pump policy table."""
     policies = without_comments(
@@ -128,6 +135,98 @@ def frame_pump_policy(name):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_policy_settings_share_reload_without_changing_local_or_failure_paths(self):
+        source = (ROOT / "src/psp_app/psp_app_settings.c").read_text()
+        start = source.index("static void psp_app_reload_after_setting(")
+        helper = source[start:source.index("\n}\n", start) + 3]
+        # Compile the production helper against a fake PSP boundary. This
+        # checks its control flow, not a parallel implementation of it.
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#define NAVIGATION_URL_LIMIT 2048
+#define MIB (1024u * 1024u)
+#define PSP_UI_SCREEN_HOME 1
+#define PSP_PROFILE_PAGE_NONE 0
+typedef struct { char url[2048]; int base_screen; } Ui;
+typedef struct { struct { Ui ui; } presentation; int text_input; } Process;
+typedef struct { void *engine, *profile; } Browser;
+typedef struct { const uint16_t *frame; } Views;
+typedef struct { uint64_t navigation_job_started_us; } Interactive;
+typedef struct { Process *process; Browser *browser; Views *views; Interactive *interactive; } PspApp;
+static int calls, clocks, cancels;
+static bool pending, succeeds;
+static const char *status;
+static const uint16_t *expected_frame, *replacement_frame;
+static const uint16_t **cancel_frame_slot;
+static int psp_profile_page_kind(const char *url) { return strcmp(url, "profile") == 0; }
+static bool psp_offline_url(const char *url) { return strcmp(url, "offline") == 0; }
+static bool browser_engine_navigation_pending(void *engine) { (void)engine; return pending; }
+static void browser_engine_cancel_navigation(void *engine, const char *reason) {
+    (void)engine; if (strcmp(reason, "cancel") != 0) abort(); cancels++;
+    if (cancel_frame_slot) *cancel_frame_slot = replacement_frame;
+}
+static uint64_t sceKernelGetSystemTimeWide(void) { clocks++; return 1234; }
+static bool psp_begin_page_load(void *engine, Ui *ui, void *profile, const uint16_t *frame,
+                                int *input, const char *url, bool history, size_t cap, int timeout) {
+    (void)engine; (void)profile; (void)input;
+    if (strcmp(url, ui->url) || history || cap != 4 * MIB || timeout != 30000) abort();
+    if (frame != expected_frame) abort();
+    calls++; return succeeds;
+}
+static void psp_ui_show_status(Ui *ui, const char *text, int duration) {
+    (void)ui; if (duration != 240) abort(); status = text;
+}
+'''
+        fixture += helper + r'''
+int main(void) {
+    Process process = {0}; Browser browser = {0}; Views views = {0}; Interactive interactive = {0};
+    PspApp app = {&process, &browser, &views, &interactive};
+    const char *urls[] = {"remote", "profile", "offline"};
+    for (int home = 0; home < 2; home++) for (int u = 0; u < 3; u++)
+    for (int success = 0; success < 2; success++) for (int busy = 0; busy < 2; busy++)
+    for (int cancel = 0; cancel < 2; cancel++) {
+        snprintf(process.presentation.ui.url, sizeof(process.presentation.ui.url), "%s", urls[u]);
+        process.presentation.ui.base_screen = home;
+        interactive.navigation_job_started_us = 99;
+        succeeds = success; pending = busy; calls = clocks = cancels = 0;
+        psp_app_reload_after_setting(&app, &views.frame, "reloading", "saved", "failed", cancel ? "cancel" : NULL);
+        bool local = home || u != 0;
+        if (calls != !local || cancels != (!local && busy && cancel)
+            || clocks != (!local && success)
+            || interactive.navigation_job_started_us != (uint64_t)(!local && success ? 1234 : 99)
+            || strcmp(status, local ? "saved" : success ? "reloading" : "failed")) return 1;
+    }
+    /* Policy calls use their action-entry snapshot; security calls use the
+       live field after cancellation. Preserve both, including a null frame. */
+    uint16_t old_surface[1] = {1}, new_surface[1] = {2};
+    process.presentation.ui.base_screen = 0;
+    snprintf(process.presentation.ui.url, sizeof(process.presentation.ui.url), "remote");
+    pending = succeeds = true; views.frame = old_surface;
+    const uint16_t *snapshot = views.frame;
+    cancel_frame_slot = &views.frame; replacement_frame = new_surface; expected_frame = old_surface;
+    psp_app_reload_after_setting(&app, &snapshot, "reloading", "saved", "failed", "cancel");
+    if (views.frame != new_surface) return 1;
+    views.frame = old_surface; expected_frame = new_surface;
+    psp_app_reload_after_setting(&app, &views.frame, "reloading", "saved", "failed", "cancel");
+    return 0;
+}
+'''
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "reload.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-O3", "-std=c11", str(path / "reload.c"),
+                                       "-o", str(path / "reload")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            run = subprocess.run([str(path / "reload")], capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_setup_cpu_donation_preserves_priority_and_input_ownership(self):
         transport = without_comments((ROOT / "src/fetch/background_transport.inc").read_text())
         worker = transport[transport.index("static int fetch_background_worker_main("):
@@ -139,7 +238,11 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("sceKernelGetThreadId() != fetch_background.owner_thread", cooperate)
         self.assertIn("fetch_background.stop_requested", cooperate)
         self.assertIn("fetch_background_setup_yield_due", cooperate)
-        self.assertIn("(status.status & PSP_THREAD_READY) == 0", cooperate)
+        # A demoted setup is usually WAITING on firmware network service
+        # (DNS, TCP, TLS I/O), not READY. A READY-only donation left that
+        # service starved below a spinning navigation pump: one worker
+        # perform in sixty seconds on hardware, and a zero-byte page load.
+        self.assertNotIn("PSP_THREAD_READY", cooperate)
         self.assertIn("&fetch_background.poll_active", cooperate)
         poll_begin = worker.index("&fetch_background.poll_active, true")
         poll_call = worker.index("CURLMcode poll_code = curl_multi_poll(")
@@ -147,7 +250,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(poll_begin, poll_call)
         self.assertLess(poll_call, poll_end)
         self.assertLess(cooperate.index("fetch_background_setup_yield_due"),
-                        cooperate.index("sceKernelReferThreadRunStatus"))
+                        cooperate.index("sceKernelDelayThread("))
         self.assertIn("sceKernelDelayThread(FETCH_BACKGROUND_SETUP_YIELD_US)", cooperate)
         self.assertNotIn("sceKernelChangeThreadPriority", cooperate)
         runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
@@ -175,14 +278,26 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(source.index("memcpy(calls, probe_calls"),
                         source.index('psp_log_printf("tilefinch-transport-call:'))
 
-    def test_navigation_watchdog_is_one_bounded_minute(self):
+    def test_navigation_watchdog_cancels_stalled_not_slow_loads(self):
+        # A fixed one-minute total cancelled chatgpt.com mid-load on
+        # hardware (46-88 s of steady module loading). The watchdog now
+        # expires after 30 s without progress, or at a 3-minute cap.
+        policy = (ROOT / "src/psp_navigation_watchdog.h").read_text()
+        self.assertIn("#define PSP_NAVIGATION_STALL_US UINT64_C(30000000)",
+                      policy)
+        self.assertIn("#define PSP_NAVIGATION_CAP_US UINT64_C(180000000)",
+                      policy)
         header = (ROOT / "src/psp_app/psp_app_internal.h").read_text()
-        self.assertRegex(header, r"#define PSP_NAVIGATION_JOB_TIMEOUT_US UINT64_C\(60000000\)")
+        self.assertNotIn("PSP_NAVIGATION_JOB_TIMEOUT_US", header)
         for path in ("src/psp_script_main.c", "src/psp_app/psp_app_page.c"):
             source = (ROOT / path).read_text()
-            self.assertIn(">= PSP_NAVIGATION_JOB_TIMEOUT_US", source)
+            self.assertIn("psp_navigation_watchdog_expired(", source)
+            self.assertIn("load.progress_units", source)
             self.assertIn("browser_engine_cancel_navigation(", source)
             self.assertIn("tilefinch_platform_cooperate(", source)
+        load = (ROOT / "src/navigation/load_state.inc").read_text()
+        self.assertIn("metrics->progress_units", load)
+        self.assertIn("script_runtime_telemetry(", load)
 
     def test_ordinary_boot_skips_synthetic_clock_work_and_splash_waits(self):
         source = without_comments(
@@ -196,7 +311,7 @@ class PspSdkContractTests(unittest.TestCase):
             main, "psp_present_boot_entrance"))), 1)
         self.assertLess(main.index("media_psp_backend_reserve_pool();"),
                         main.index("browser_engine_create("))
-        self.assertIn("bool fast_page_followup = native_home_boot;", source)
+        self.assertIn("loop->fast_page_followup = native_home_boot;", source)
 
     def test_home_activation_ack_precedes_navigation_preparation(self):
         source = without_comments(
@@ -442,9 +557,27 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(ack.index("if (!shown) return false;"),
                         ack.index("tilefinch-input-ack:"))
         main = without_comments((ROOT / "src/psp_script_main.c").read_text())
-        dispatch = main.index("psp_app_dispatch_action(&app, &frame, &intent)")
-        self.assertIn("psp_ui_set_page_activation(&process->presentation.ui, false)",
-                      main[dispatch:dispatch + 300])
+        dispatch = main.index("psp_app_dispatch_action(app, &frame, &intent)")
+        self.assertIn("psp_ui_finish_page_activation(&process->presentation.ui,",
+                      main[dispatch:dispatch + 500])
+        self.assertIn("intent.action == PSP_UI_ACTION_ACTIVATE ? action_ack : NULL",
+                      main[dispatch:dispatch + 500])
+
+    def test_final_frame_dump_is_opt_in_and_after_measured_interaction(self):
+        main = (ROOT / "src/psp_script_main.c").read_text()
+        start = main.index("PspInteractiveResult interactive_result =")
+        end = main.index("PspShutdownReport shutdown_report =", start)
+        final = main[start:end]
+        # The dump is out of line (main is an instruction-cache ratchet).
+        self.assertLess(final.index("psp_app_run_interactive("),
+                        final.index("psp_dump_final_frame(argv0)"))
+        self.assertIn("#ifdef TILEFINCH_PSP_VALIDATION_LOG", final)
+        self.assertIn("if (process.config.dump_frame != 0)", final)
+        helper_start = main.index("static void psp_dump_final_frame(")
+        helper = main[helper_start:main.index("\n}\n", helper_start)]
+        self.assertIn('"frame-device-final.ppm"', helper)
+        self.assertIn("psp_display_front_buffer(&psp_display)", helper)
+        self.assertNotIn("malloc", final + helper)
 
     def test_runtime_input_cooperation_is_lazy_and_owner_thread_only(self):
         runtime = without_comments(
@@ -656,6 +789,10 @@ class PspSdkContractTests(unittest.TestCase):
     def test_psplink_report_wait_requires_new_terminal_result(self):
         waiter = ROOT / "scripts/psplink-await-report.sh"
         deploy = (ROOT / "scripts/psplink-device.sh").read_text()
+        self.assertIn('loaded_prx_hash=$(cmake -E sha256sum', deploy)
+        self.assertIn('artifact changed during load; discard', deploy)
+        self.assertLess(deploy.index('loaded_prx_hash=$(cmake -E sha256sum'),
+                        deploy.index('"ld host0:/psp-browser-script-dev.prx"'))
         self.assertIn('"$ROOT/scripts/psplink-await-report.sh"', deploy)
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "tilefinch-validation.txt"
@@ -757,9 +894,9 @@ class PspSdkContractTests(unittest.TestCase):
                 'cmake_minimum_required(VERSION 3.24)\nproject(qjs_review NONE)\n'
                 'find_program(PATCH_EXECUTABLE patch REQUIRED)\n'
                 'set(PSP_BROWSER_USE_BELLARD_QUICKJS ON)\n'
-                'set(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH OFF)\n'
-                'set(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY ON)\n'
-                'set(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE OFF)\n' + block +
+                'option(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH "" OFF)\n'
+                'option(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY "" ON)\n'
+                'option(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE "" OFF)\n' + block +
                 'add_custom_target(check_copy ALL COMMAND "${CMAKE_COMMAND}" -E compare_files '
                 '"${quickjs_SOURCE_DIR}/cutils.h" "${tilefinch_quickjs_vendor_dir}/cutils.h")\n')
             command = ["cmake", "-S", str(source), "-B", str(build)]
@@ -778,6 +915,20 @@ class PspSdkContractTests(unittest.TestCase):
             self.assertEqual((build / "quickjs-variant/cutils.h").read_bytes(), support.read_bytes())
             cache = (build / "CMakeCache.txt").read_text()
             self.assertIn(f"TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR:INTERNAL={build}/quickjs-variant", cache)
+            # Baseline engine changes must refresh every variant pin, not only
+            # the vendor fingerprint or this fixture's initial OFF-ON-OFF pin.
+            for capture, compact, trace in (
+                ("ON", "OFF", "OFF"), ("ON", "ON", "ON"),
+                ("ON", "OFF", "ON"), ("OFF", "ON", "ON"),
+                ("OFF", "OFF", "OFF"), ("OFF", "OFF", "ON"),
+            ):
+                with self.subTest(capture=capture, compact=compact, trace=trace):
+                    result = subprocess.run(command + [
+                        f"-DPSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH={capture}",
+                        f"-DPSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY={compact}",
+                        f"-DPSP_BROWSER_JS_PROPERTY_FAULT_TRACE={trace}",
+                    ], capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_incremental_benchmark_checks_selected_engine_not_fetch_override(self):
         spec = importlib.util.spec_from_file_location(
@@ -1252,7 +1403,7 @@ class PspSdkContractTests(unittest.TestCase):
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         suppressed = loop[
             loop.index("if ((!media_open_before || !navigation_still_pending)"):]
-        suppressed = suppressed[:suppressed.index("bool stability_needs_play")]
+        suppressed = suppressed[:suppressed.index("psp_loop_media_validation(")]
         self.assertIn("psp_media_open_watchdog(&browser->media)", suppressed)
         self.assertIn("else if", suppressed)
 
@@ -1558,7 +1709,8 @@ class PspSdkContractTests(unittest.TestCase):
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         download = main[
             main.index("bool offline_download_active ="):
-            main.index("bool runtime_layout_changed = false;")]
+            main.index("bool runtime_layout_changed = false;")] + loop_step(
+                main, "psp_loop_pump_offline_download")
         # The hidden decoder is reclaimed before admission asks whether a
         # pipeline is still resident, so a closed player cannot leave the
         # queued download permanently refused.
@@ -1566,7 +1718,7 @@ class PspSdkContractTests(unittest.TestCase):
             download.index(
                 "psp_media_reclaim_hidden_pipeline(&browser->media)"),
             download.index(
-                "psp_app_frame_pump_run(&app, FRAME_PUMP_OFFLINE_DOWNLOAD)"))
+                "psp_app_frame_pump_run(app, FRAME_PUMP_OFFLINE_DOWNLOAD)"))
         self.assertIn(
             "FACTS_MEDIA_PIPELINE", frame_pump_policy("OFFLINE_DOWNLOAD"))
         policies = (ROOT / "src/frame_pumps.c").read_text(encoding="utf-8")
@@ -1580,9 +1732,7 @@ class PspSdkContractTests(unittest.TestCase):
             binding,
             r"REFUSE_IF\(FRAME_FACT_MEDIA_PLAYBACK,\s*"
             r"browser->media\.playback != NULL\)")
-        updater = main[
-            main.index("if (psp_update_check_armed(&update_check)"):
-            main.index("PspUiIntent intent =")]
+        updater = loop_step(main, "psp_loop_fire_update_check")
         self.assertIn(
             "psp_media_reclaim_hidden_pipeline(&browser->media)", updater)
         # The native home screen is the default landing and is idle, so
@@ -1634,7 +1784,7 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("psp_app_update_check_configured(browser->profile")]
         self.assertIn("background_network_allowed", boot)
         self.assertIn("validation_update_auto == 0", boot)
-        self.assertIn(".update_check = &update_check", main)
+        self.assertIn(".update_check = &loop->update_check", main)
         settings = without_comments(
             (ROOT / "src/psp_app/psp_app_settings.c").read_text(
                 encoding="utf-8"))
@@ -1697,12 +1847,227 @@ class PspSdkContractTests(unittest.TestCase):
             definition:
             source.index("bool psp_media_open_work_pending(", definition)]
         self.assertIn(
-            "bool reopen_resume_available = media->reopen_resume_pending",
-            opening)
+            "psp_media_continuation_reopening(continuation)", opening)
         self.assertIn(
-            "media->job_target_us = media->reopen_resume_us > duration_us",
+            "media->job_target_us = continuation->position_us > duration_us",
             opening)
         self.assertNotIn("BrowserProfileResume", opening)
+
+    def test_tls_sessions_are_saved_after_the_worker_exports_them(self):
+        # libcurl's shared session cache is exported into the store only
+        # when the last libcurl reference is released, and the transport
+        # worker holds that reference until it shuts down. A flush before
+        # the worker's shutdown saved nothing: on hardware no session was
+        # ever persisted, and every launch paid full handshakes to the
+        # YouTube page and API hosts (489 ms -> 190 ms once resumed).
+        stream = without_comments(
+            (ROOT / "src/fetch/response_stream.inc").read_text(
+                encoding="utf-8"))
+        release = stream[
+            stream.index("static bool curl_global_release(void)"):]
+        self.assertIn("fetch_tls_sessions_export();", release[:600])
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        shutdown = main.index("fetch_background_transport_shutdown(4000u)")
+        self.assertIn("fetch_tls_session_store_flush()",
+                      main[shutdown:shutdown + 1200])
+
+    def test_wifi_join_is_retried_while_waiting_for_an_address(self):
+        # Four of about twenty device runs got no address in 45 s: APCTL
+        # dropped a join back to DISCONNECTED (or held KEY_EXCHANGE) and
+        # never retried it. Waiting for an address runs the host-tested
+        # join policy, and every Connect restarts its attempt clock.
+        network = without_comments(
+            (ROOT / "src/psp_network.c").read_text(encoding="utf-8"))
+        waiting = network[network.index("case PSP_NETWORK_WAITING_FOR_IP:"):]
+        waiting = waiting[:waiting.index("default:")]
+        self.assertIn("psp_network_join_step(network, now_us)", waiting)
+        step = network[network.index("static int psp_network_join_step("):]
+        step = step[:step.index("\n}\n")]
+        self.assertIn("psp_network_join_action(", step)
+        self.assertIn("sceNetApctlDisconnect()", step)
+        self.assertIn("psp_network_join_started(network, now_us, false)",
+                      step[step.index("sceNetApctlConnect("):])
+        connecting = network[network.index("case PSP_NETWORK_CONNECTING:"):]
+        connecting = connecting[:connecting.index(
+            "case PSP_NETWORK_WAITING_FOR_IP:")]
+        self.assertEqual(connecting.count("psp_network_join_started("), 2)
+        suite = (ROOT / "tests/suites/foundation_platform.inc").read_text(
+            encoding="utf-8")
+        self.assertIn("psp_network_join_action(", suite)
+
+    def test_curl_share_is_locked_before_it_is_shared(self):
+        # The browser thread (page fetches, scheduler, preconnects, session
+        # import/export) and the transport worker use one curl share. Without
+        # lock callbacks libcurl updated its DNS cache, connection pool and
+        # TLS session cache unprotected across the two threads. The lock is
+        # installed before any category is shared, and a share that cannot
+        # be locked is dropped rather than shared unsafely.
+        stream = without_comments(
+            (ROOT / "src/fetch/response_stream.inc").read_text(
+                encoding="utf-8"))
+        for token in ("CURLSHOPT_LOCKFUNC", "CURLSHOPT_UNLOCKFUNC",
+                      "sceKernelCreateSema", "sceKernelGetThreadId"):
+            self.assertIn(token, stream)
+        acquire = stream[stream.index("static bool curl_global_acquire("):]
+        install = acquire.index("curl_share_install_lock(curl_shared_state)")
+        self.assertLess(install, acquire.index("CURL_LOCK_DATA_DNS"))
+        self.assertLess(install, acquire.index("CURL_LOCK_DATA_CONNECT"))
+        self.assertIn("curl_shared_state = NULL;",
+                      acquire[install:install + 300])
+        release = stream[stream.index("static bool curl_global_release("):]
+        self.assertLess(release.index("curl_share_cleanup(curl_shared_state)"),
+                        release.index("curl_share_remove_lock();"))
+
+    def test_suspend_saves_sessions_made_since_the_last_export(self):
+        # Suspend flushes with the worker still running, so nothing had been
+        # exported since launch and a suspend saved no new session. The flush
+        # exports the live share first, and an unchanged cache neither
+        # duplicates entries nor rewrites the Memory Stick file.
+        stream = without_comments(
+            (ROOT / "src/fetch/response_stream.inc").read_text(
+                encoding="utf-8"))
+        flush = stream[
+            stream.index("bool fetch_tls_session_store_flush(void)\n{"):]
+        self.assertIn("? fetch_tls_sessions_export() : 0;", flush[:200])
+        self.assertLess(flush.index("fetch_tls_sessions_export()"),
+                        flush.index("tls_session_store_save("))
+        callback = stream[
+            stream.index("static CURLcode fetch_tls_session_export_cb("):]
+        self.assertLess(callback.index("tls_session_store_contains("),
+                        callback.index("tls_session_store_add("))
+        export = stream[
+            stream.index("static size_t fetch_tls_sessions_export(void)"):]
+        self.assertIn("context.added != 0", export[:900])
+
+    def test_googlevideo_ranges_resume_tls12_sessions(self):
+        # googlevideo sends no TLS 1.3 tickets on /videoplayback, so every
+        # media reconnect paid a full handshake (0.5-1.5 s on hardware). It
+        # does issue a TLS 1.2 ticket inside the handshake: the ClientHello
+        # hook re-enables the TLS 1.2 tickets libcurl turns off, and every
+        # googlevideo requester asks for TLS 1.2 (a connection is reused only
+        # by requests with the same TLS settings). Device: 6 of 7 media
+        # handshakes resumed, 88-146 ms each.
+        fetch = without_comments(
+            (ROOT / "src/fetch.c").read_text(encoding="utf-8"))
+        hook = fetch[fetch.index("static CURLcode fetch_tls_shape_client_hello("):]
+        self.assertIn("mbedtls_ssl_conf_session_tickets(", hook[:900])
+        self.assertIn("MBEDTLS_SSL_SESSION_TICKETS_ENABLED", hook[:900])
+        for path in ("src/fetch/background_transport.inc",
+                     "src/fetch/transport.inc"):
+            source = without_comments(
+                (ROOT / path).read_text(encoding="utf-8"))
+            at = source.index("tls12_session_resumption\n")
+            self.assertIn("CURL_SSLVERSION_MAX_TLSv1_2",
+                          source[at:at + 300], path)
+        media = without_comments(
+            (ROOT / "src/media_http.c").read_text(encoding="utf-8"))
+        self.assertIn("request->tls12_session_resumption = "
+                      "range->tls12_session_resumption;", media)
+        opener = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        self.assertIn(".tls12_session_resumption = !media->page_audio", opener)
+        self.assertIn(".tls12_session_resumption = !media->page_source", opener)
+        probe = without_comments(
+            (ROOT / "src/psp_media_range_probe.c").read_text(encoding="utf-8"))
+        self.assertIn(".tls12_session_resumption = true", probe)
+
+    def test_traced_sessions_stay_off_the_worker_transport(self):
+        # The worker transport neither records nor replays an HTTP trace, so
+        # a traced journey that used it reached the live network (the YouTube
+        # pre-resolve did) and a capture missed requests. Availability is the
+        # one gate every user consults.
+        background = without_comments(
+            (ROOT / "src/fetch/background_transport.inc").read_text(
+                encoding="utf-8"))
+        available = background[
+            background.index("bool fetch_background_transport_available("):
+            background.index("void fetch_background_transport_cooperate(")]
+        self.assertIn("return !fetch_trace_active();", available)
+        trace = without_comments(
+            (ROOT / "src/fetch/trace_session.inc").read_text(
+                encoding="utf-8"))
+        self.assertIn("return fetch_trace.mode != FETCH_TRACE_OFF;", trace)
+        for relative in ("src/youtube_resolver.c", "src/psp_media_hls.c",
+                         "src/media_http.c"):
+            source = without_comments(
+                (ROOT / relative).read_text(encoding="utf-8"))
+            self.assertIn("fetch_background_transport_available()", source,
+                          relative)
+
+    def test_presses_during_a_restart_become_intent(self):
+        # A rewind that rebuilds the decoder (or a retry) continues the same
+        # playback. Its reopen used to project as an ordinary open, which
+        # disables every timeline control, so Right and Cross pressed while
+        # it ran were dropped and Circle stopped the video.
+        header = (ROOT / "include/tilefinch/psp_media_session.h").read_text(
+            encoding="utf-8")
+        for retired in ("reopen_resume_us", "reopen_resume_playing",
+                        "reopen_resume_pending",
+                        "reopen_reuse_resolved_stream", "job_resume_open"):
+            self.assertNotIn(retired, header)
+        self.assertIn("PspMediaContinuation continuation;", header)
+        source = without_comments(psp_media_session_sources())
+
+        # Every projection and every open step restores the live timeline.
+        projection = source[
+            source.index("static void psp_media_apply_active_projection("):
+            source.index("static void psp_media_dispatch(")]
+        self.assertIn("psp_media_present_continuation(media)", projection)
+        advance = source[
+            source.index("bool psp_media_advance("):
+            source.index("if (psp_media_start_pending_preview_commit(media))")]
+        self.assertLess(
+            advance.index("psp_media_open_pump(media, cancellation)"),
+            advance.index("psp_media_present_continuation(media)"))
+        # The recorded target is drawn over the restored timeline.
+        self.assertLess(
+            advance.index("psp_media_present_continuation(media)"),
+            advance.index("psp_media_target_commit_pending("))
+
+        # Timeline presses are intercepted before the ordinary handlers,
+        # which would start decoder work against a pipeline being rebuilt
+        # (Circle's restore leg would overwrite the open job).
+        execute = source[
+            source.index("void psp_media_execute_intent("):
+            source.index("switch (intent.action)",
+                         source.index("void psp_media_execute_intent("))]
+        self.assertIn("psp_media_continuation_intent(media, intent)", execute)
+        intents = source[
+            source.index("static bool psp_media_continuation_intent("):
+            source.index("void psp_media_execute_intent(")]
+        self.assertIn("psp_media_continuation_accepts_input(media)", intents)
+        self.assertIn("psp_media_target_highlight(", intents)
+        self.assertIn("psp_media_target_cancel_highlight(", intents)
+        self.assertIn("psp_media_continuation_retarget(", intents)
+        self.assertIn("continuation->playing = play", intents)
+        self.assertIn("media->job_resume_playing = play", intents)
+        self.assertNotIn("PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE", intents)
+        self.assertNotIn("psp_media_request_seek", intents)
+
+        # The supervisor hands timeline presses over every frame of an open
+        # (not at the end of the scope), and Circle over a highlight is the
+        # player's, not a stop.
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        refresh = runtime[
+            runtime.index("bool psp_work_cooperate_refresh_media("):
+            runtime.index("void psp_work_cooperate_begin_media_open(")]
+        self.assertIn("psp_media_timeline_action(pending.action)", refresh)
+        self.assertIn("cooperate->pending_media_intent = (PspUiMediaIntent) {0}",
+                      refresh)
+        self.assertIn(".media_preview_active = cooperate->media_surface",
+                      runtime)
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        self.assertIn("psp_app_refresh_supervisor_media(interactive,", main)
+        self.assertNotIn("psp_work_cooperate_refresh_media(", main)
+        app_input = without_comments(
+            (ROOT / "src/psp_app/psp_app_input.c").read_text(
+                encoding="utf-8"))
+        self.assertIn("!psp_media_continuation_accepts_input(media)",
+                      app_input)
 
     def test_media_retry_preserves_seek_target_and_short_resume(self):
         source = without_comments(
@@ -1713,7 +2078,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("media->job_target_us", recovery)
         self.assertIn("media->job_restore_us", recovery)
         self.assertIn("media->job_preview", recovery)
-        self.assertIn("media->seek_preview_started", recovery)
+        self.assertIn("psp_media_scrub_active(&media->scrub)", recovery)
         retry = source[
             source.index("bool psp_media_retry_transport("):
             source.index("bool psp_media_retry_transport_expiry(")]
@@ -1725,14 +2090,15 @@ class PspSdkContractTests(unittest.TestCase):
         open_pump = source[
             source.index("bool psp_media_open_pump("):
             source.index("bool psp_media_open_work_pending(")]
-        self.assertIn("media->reopen_resume_pending", open_pump)
+        self.assertIn("psp_media_continuation_resume_playing(", open_pump)
         self.assertNotIn(
-            "media->reopen_resume_us >= UINT64_C(5000000)", open_pump)
+            "continuation->position_us >= UINT64_C(5000000)", open_pump)
         suspend = source[
             source.index("void psp_media_suspend("):
             source.index("void psp_media_resume(")]
         self.assertIn("psp_media_recovery_position_us(media)", suspend)
-        self.assertIn("media->seek_preview_was_playing", suspend)
+        self.assertIn("psp_media_scrub_resume_playing(&media->scrub)",
+                      suspend)
         close = source[
             source.index("void psp_media_close("):
             source.index("bool psp_media_reclaim_hidden_pipeline(")]
@@ -1821,7 +2187,8 @@ class PspSdkContractTests(unittest.TestCase):
             failed.index("psp_media_remember_retry_state("),
             failed.index("media->job_phase = PSP_MEDIA_JOB_NONE"))
         self.assertIn(
-            "media->seek_preview_cancel_pending = false", failed)
+            "psp_media_scrub_retain(&media->scrub, preview_was_playing)",
+            failed)
         facade = without_comments(
             (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
         route = facade[
@@ -1881,13 +2248,14 @@ class PspSdkContractTests(unittest.TestCase):
         pump = source[
             source.index("bool psp_media_seek_decode_pump("):
             source.index("void psp_media_close(")]
-        self.assertIn("media->seek_preview_cancel_pending", pump)
-        self.assertIn("media->seek_preview_was_playing", pump)
+        self.assertIn("psp_media_scrub_cancelling(&media->scrub)", pump)
+        self.assertIn("psp_media_scrub_resume_playing(&media->scrub)", pump)
         self.assertIn("psp_ui_media_cancel_seek_preview(&media->ui)", pump)
         intents = source[
             source.index("void psp_media_execute_intent("):
             source.index("bool psp_media_advance(")]
-        self.assertIn("media->seek_preview_cancel_pending = true", intents)
+        self.assertIn("psp_media_scrub_request_cancel(&media->scrub)",
+                      intents)
 
     def test_provider_routes_require_an_explicit_play_activation(self):
         source = without_comments(psp_media_session_sources())
@@ -1910,16 +2278,23 @@ class PspSdkContractTests(unittest.TestCase):
             "media, url, backing_generation, PSP_MEDIA_ROUTE_PROVIDER_VIDEO, true",
             " ".join(facade.split()))
         self.assertNotIn(
-            ".autoplay = media->reopen_resume_playing", route)
+            "psp_media_continuation_resume_playing(", route)
         open_source = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
         self.assertNotIn("browser_profile_resume(", open_source)
         resume = open_source[
             open_source.index("bool reopen_resume_available"):
-            open_source.index("media->reopen_resume_us = 0",
+            open_source.index("psp_media_continuation_clear(continuation)",
                               open_source.index("bool reopen_resume_available"))]
-        self.assertIn("media->job_resume_playing = media->reopen_resume_playing",
+        self.assertIn("media->job_resume_playing = continuation->playing",
                       resume)
+        # Cross pressed during the reopen is where it resumes, not a second
+        # seek after the resume seek.
+        fold = open_source[
+            open_source.index("PspMediaContinuation *continuation = "):
+            open_source.index("bool reopen_resume_available")]
+        self.assertIn("psp_media_continuation_retarget(", fold)
+        self.assertIn("psp_media_target_clear(&media->pending_target)", fold)
         wants = source[
             source.index("bool psp_media_machine_wants_playing("):
             source.index("static void psp_media_apply_active_projection(")]
@@ -1992,22 +2367,25 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(
             fallback.index("preview_target_us ="),
             fallback.index("psp_media_pipeline_destroy(media)"))
-        self.assertIn("media->reopen_preview_pending = preview_pending",
-                      fallback)
-        self.assertIn("media->reopen_preview_target_us = preview_target_us",
-                      fallback)
-        self.assertIn("psp_media_machine_wants_playing(media)", fallback)
-        self.assertIn("media->machine.preview_active", fallback)
-        self.assertIn("media->job_preview", fallback)
+        self.assertIn("psp_media_retry_continuation(", fallback)
+        self.assertIn("psp_media_target_after_reopen(", fallback)
+        continuation = open_source[
+            open_source.index("static bool psp_media_retry_continuation("):
+            open_source.index("bool psp_media_retry_transport(")]
+        self.assertIn("psp_media_machine_wants_playing(media)", continuation)
+        self.assertIn("media->machine.preview_active", continuation)
+        self.assertIn("media->job_preview", continuation)
         self.assertIn("media->ui.duration_us = duration_us", fallback)
         transport_retry = open_source[
             open_source.index("bool psp_media_retry_transport("):
             open_source.index("bool psp_media_retry_240p(")]
         self.assertIn("media->ui.duration_us = duration_us", transport_retry)
-        self.assertIn("media->preview_commit_pending", open_source)
-        self.assertIn("media->preview_commit_target_us", open_source)
+        self.assertIn("psp_media_retry_continuation(", transport_retry)
+        self.assertIn("psp_media_target_commit_pending(&media->pending_target)",
+                      open_source)
+        self.assertIn("media->pending_target.target_us", open_source)
         advance = source[source.index("bool psp_media_advance("):]
-        self.assertIn("media->reopen_preview_pending", advance)
+        self.assertIn("psp_media_target_highlight_pending(", advance)
         self.assertIn("psp_ui_media_set_seek_preview(&media->ui, target_us)",
                       advance)
         self.assertIn("psp_media_request_seek(media, target_us, true)",
@@ -2017,24 +2395,24 @@ class PspSdkContractTests(unittest.TestCase):
         open_advance = advance[
             advance.index("bool open_work ="):
             advance.index("if (psp_media_start_pending_preview_commit(media))")]
-        self.assertIn("media->reopen_preview_pending", open_advance)
-        self.assertIn("media->preview_commit_pending", open_advance)
+        self.assertIn("psp_media_target_highlight_pending(", open_advance)
+        self.assertIn("psp_media_target_commit_pending(", open_advance)
         self.assertIn("psp_ui_media_commit_seek(", open_advance)
-        self.assertIn("media->preview_commit_target_us", open_advance)
+        self.assertIn("media->pending_target.target_us", open_advance)
         self.assertIn("psp_ui_media_set_seek_preview(", open_advance)
-        self.assertIn("media->reopen_preview_target_us", open_advance)
 
         commit_case = intents[
             intents.index("case PSP_UI_MEDIA_ACTION_SEEK:"):
             intents.index("case PSP_UI_MEDIA_ACTION_RETRY:")]
-        self.assertIn("media->preview_commit_pending = true", commit_case)
-        self.assertIn("media->reopen_preview_pending = false", commit_case)
+        # A commit supersedes a pending highlight by construction.
+        self.assertIn("psp_media_target_commit(", commit_case)
         self.assertIn("psp_ui_media_commit_seek(", commit_case)
         commit_start = advance.index(
             "psp_media_start_pending_preview_commit(media)")
         self.assertLess(
             commit_start,
-            advance.index("media->reopen_preview_pending", commit_start))
+            advance.index("psp_media_target_highlight_pending(",
+                          commit_start))
 
         open_source = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
@@ -2042,11 +2420,9 @@ class PspSdkContractTests(unittest.TestCase):
             open_source.index("void psp_media_job_failed("):
             open_source.index("static void psp_youtube_log_text(")]
         self.assertIn("bool tentative_preview =", failure)
-        self.assertIn("tentative_preview && !media->preview_commit_pending",
-                      failure)
+        self.assertIn("tentative_preview && !commit_pending", failure)
         self.assertIn("action=restore", failure)
-        self.assertIn("tentative_preview && media->preview_commit_pending",
-                      failure)
+        self.assertIn("tentative_preview && commit_pending", failure)
         self.assertIn("media->job_target_us = preview_target_us", failure)
         self.assertIn("action=retain-target", failure)
         self.assertLess(
@@ -2067,7 +2443,7 @@ class PspSdkContractTests(unittest.TestCase):
                 "PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE",
                 "PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE"):
             self.assertIn(phase, hold)
-        self.assertIn("media->job_resume_open", hold)
+        self.assertIn("psp_media_continuation_resuming(", hold)
         present = runtime[
             runtime.index("bool psp_present_internal("):
             runtime.index("static unsigned psp_local_hour(")]
@@ -2430,7 +2806,7 @@ class PspSdkContractTests(unittest.TestCase):
         # ordinary retry ladders retain their authoritative re-resolution.
         self.assertIn("psp_media_resolved_stream_reusable(media)", sources)
         self.assertIn("event=reuse-resolved-stream", sources)
-        self.assertIn("media->reopen_reuse_resolved_stream = false", sources)
+        self.assertIn("media->continuation.reuse_resolved = false", sources)
 
         # A reused or offline resolve can complete in the same pump that
         # changes the physical phase from NONE to RESOLVE. The controller must
@@ -2456,7 +2832,7 @@ class PspSdkContractTests(unittest.TestCase):
         decode_clock = source[
             source.index("uint64_t psp_media_session_decode_clock_us("):
             source.index("bool psp_media_cancel_requested(")]
-        self.assertIn("media->presentation_preroll_audio_held", decode_clock)
+        self.assertIn("media->audio_hold.applied", decode_clock)
         self.assertIn("media_playback_buffered_until_us", decode_clock)
 
         seek = source[
@@ -2464,7 +2840,9 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("void psp_media_close(")]
         skipped = seek[seek.index("bool decodes_to_the_target ="):]
         skipped = skipped[:skipped.index("media->job_phase = restore")]
-        self.assertIn("media->presentation_floor_us = target_us", skipped)
+        self.assertIn(
+            "psp_media_seek_floor_arm(&media->seek_floor, target_us)",
+            skipped)
         request = source[
             source.index("bool psp_media_request_seek_with_resume("):
             source.index("static bool psp_media_copy_preview(")]
@@ -2476,12 +2854,14 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn(
             "media->machine.state == PSP_MEDIA_SESSION_PLAYING\n"
             "        && !media->machine.preview_active\n"
-            "        && !media->presentation_preroll_audio_held", advance)
+            "        && !media->audio_hold.applied", advance)
         self.assertLess(
             advance.index("media_playback_discard_video_before("),
             advance.index("media_playback_take_video_frame("))
         floor = advance[advance.index("if (received_frame) {"):]
-        self.assertIn("frame.pts_us >= media->presentation_floor_us", floor)
+        self.assertIn(
+            "psp_media_seek_floor_reached(&media->seek_floor, frame.pts_us)",
+            floor)
         self.assertIn(
             "psp_media_complete_priming_if_ready(", floor)
 
@@ -2496,9 +2876,9 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("bool psp_media_begin_startup_preroll("):
             source.index("uint64_t psp_media_session_decode_clock_us(")]
         self.assertIn("media->clock_us != 0", begin)
-        self.assertIn("media->controller_audio_hold = true", begin)
+        self.assertIn("media->audio_hold.wanted = true", begin)
         self.assertIn("psp_media_apply_audio_hold(media)", begin)
-        self.assertIn("media->presentation_preroll_startup = true", begin)
+        self.assertIn("psp_media_startup_begin(", begin)
 
         advance = source[source.index("bool psp_media_advance("):]
         self.assertLess(
@@ -2506,18 +2886,16 @@ class PspSdkContractTests(unittest.TestCase):
             advance.index("media_playback_set_presentation_clock_us("))
         self.assertIn("media_playback_ready_video_start_us", advance)
         prime = advance[
-            advance.index("if (media->presentation_preroll_startup) {"):
+            advance.index("if (psp_media_startup_active(&media->startup)) {"):
             advance.index("if (received_frame) {")]
         self.assertIn("media_playback_ready_video_frames", prime)
         self.assertIn("media_playback_startup_ready_frames", prime)
         self.assertIn("ready >= ready_target", prime)
         self.assertIn("media_playback_displayed_video_frames", prime)
-        self.assertIn("presentation_preroll_startup_claimed", prime)
+        self.assertIn("psp_media_startup_filling(&media->startup)", prime)
         self.assertIn("startup_claim_allowed = true", prime)
         self.assertIn(
-            "displayed\n"
-            "                 > media->presentation_preroll_displayed_baseline",
-            prime)
+            "psp_media_startup_presented(&media->startup, displayed)", prime)
         self.assertIn("psp_media_complete_priming_if_ready(", prime)
 
         shadow_prime = source[
@@ -2528,12 +2906,12 @@ class PspSdkContractTests(unittest.TestCase):
                              "static void psp_media_complete_priming_if_ready("))]
         self.assertIn("!media->have_frame", shadow_prime)
         self.assertIn("media->pause_boundary_pending", shadow_prime)
-        self.assertIn("presentation_preroll_displayed_baseline", shadow_prime)
+        self.assertIn("psp_media_startup_presented(", shadow_prime)
         self.assertIn("PSP_MEDIA_EVENT_PRIME_READY", shadow_prime)
         self.assertLess(
             shadow_prime.index("PSP_MEDIA_EVENT_PRIME_READY"),
             shadow_prime.index(
-                "psp_media_release_presentation_preroll(media, true)"))
+                "psp_media_release_presentation_preroll(media)"))
         self.assertEqual(
             1, source.count(
                 "static void psp_media_complete_priming_if_ready("))
@@ -3233,9 +3611,7 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("fetch_preconnect_pump();")]
         self.assertIn("site_adapter_handles_navigation(", loop)
         self.assertIn('"GET", preconnect_url', loop)
-        warmup = source[
-            source.index("if (network_was_warming"):
-            source.index("if (process->config.interactive_validation_ticks")]
+        warmup = loop_step(source, "psp_loop_report_network_warmup")
         self.assertIn('site_adapter_handles_navigation("GET", url)', warmup)
 
     def test_page_script_networking_keeps_policy_on_bridge_thread(self):
@@ -4733,7 +5109,7 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("psp_media_stability_schedule_seeks(")]
         self.assertIn("PSP_MEDIA_STABILITY_STEADY_DELAY_US", sampler)
         self.assertIn("PSP_MEDIA_SESSION_PLAYING", sampler)
-        self.assertIn("presentation_preroll_audio_held", sampler)
+        self.assertIn("audio_hold.applied", sampler)
         self.assertIn("media_playback_audio_cursor_us(", sampler)
         self.assertNotIn("audio_output_blocks * PSP_MEDIA_AUDIO_SAMPLES", sampler)
 
@@ -6021,10 +6397,8 @@ class PspSdkContractTests(unittest.TestCase):
     def test_cancelled_media_scope_closes_before_the_next_main_present(self):
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
-        scope_end = main[
-            main.index("if (media_open_scope) {"):
-            main.index("psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);",
-                       main.index("if (media_open_scope) {"))]
+        media = loop_step(main, "psp_loop_media_frame")
+        scope_end = media[media.index("if (loop->media_open_scope) {"):]
         self.assertIn("psp_media_close(&browser->media);", scope_end)
         self.assertLess(
             scope_end.index("psp_media_close(&browser->media);"),
@@ -6032,10 +6406,9 @@ class PspSdkContractTests(unittest.TestCase):
             "The player must be hidden in the main thread's own media state "
             "before the cooperate scope is released, or the first ordinary "
             "present after a detached unwind composites the overlay again.")
-        advance = main[
-            main.index("media_visual_changed =\n                "
-                       "psp_media_advance("):
-            main.index("if (media_open_scope) {")]
+        advance = media[
+            media.index("psp_media_advance("):
+            media.index("if (loop->media_open_scope) {")]
         self.assertNotIn(
             "psp_present(", advance,
             "Nothing may present between the open pump returning and the "
@@ -6193,7 +6566,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(
             audio.index("psp_media_pipeline_destroy(media)"),
             audio.index('"track-switch-open"'))
-        self.assertIn("media->reopen_resume_playing = resume_playing", audio)
+        self.assertIn("psp_media_continuation_reopen(", audio)
 
         captions = session[
             session.index("static void psp_media_request_caption_resolution("):
@@ -6216,11 +6589,23 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertNotIn("for (unsigned unit", pump)
         self.assertIn("PSP_MEDIA_SUBTITLE_RESERVE_US", pump)
         self.assertIn("PSP_MEDIA_SUBTITLE_FRAME_ADMISSION_US", pump)
-        self.assertIn("psp_media_source_refilling(media)", pump)
+        # Network playback refills almost every frame; gating captions on it
+        # admitted about one frame in thirty on hardware and a selected track
+        # never finished loading. The decoded reserve is the health signal.
+        self.assertNotIn("psp_media_source_refilling(media)", pump)
 
         advance = session[session.index("bool psp_media_advance("):]
         subtitle_pump = advance.index(
             "psp_media_subtitle_load_pump(media)")
+        # Several bounded parse units per admitted frame, each re-checked
+        # against the frame budget, and none once a unit takes no bytes.
+        subtitle_loop = advance[
+            advance.index("psp_media_subtitle_work_admitted(media,"):
+            subtitle_pump + 400]
+        self.assertIn("PSP_MEDIA_SUBTITLE_UNITS_PER_FRAME", subtitle_loop)
+        self.assertIn("psp_media_subtitle_frame_budget_left(", subtitle_loop)
+        self.assertIn("subtitle_received_bytes == received_before",
+                      subtitle_loop)
         self.assertGreater(
             subtitle_pump,
             advance.index("media_playback_advance_bounded_cancelable("))
@@ -6627,7 +7012,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(
             present.index("bool published = psp_present("),
             present.index("psp_app_pump_provider_handoff_reclaim("))
-        self.assertIn("&app, frame.ui_sample_us, published", present,
+        self.assertIn("app, frame.ui_sample_us, published", present,
                       "Only a successful publication may release the loading handoff")
 
         reclaim = actions[
@@ -6703,15 +7088,76 @@ class PspSdkContractTests(unittest.TestCase):
                       "symbol and its bound.")
         self.assertIn("#define PSP_DNS_TIMEOUT_SECONDS 2u", network)
         self.assertIn("#define PSP_DNS_RETRIES 1", network)
+        # The firmware resolver never returns on about one PSP-3000 lookup
+        # in fifteen, and hangs can be consecutive, so gethostbyname asks
+        # the access point's DNS servers over UDP first. The firmware path
+        # (guard + one retry) is only the fallback, and an NXDOMAIN from
+        # the stub is final.
+        entry = network[
+            network.index("struct hostent *gethostbyname(const char *name)"):
+            network.index("static void psp_network_sample_memory(")]
+        self.assertIn("!psp_dns_resolve(name)", entry)
+        self.assertNotIn("sceNetResolver", entry)
+        chooser = network[
+            network.index("static bool psp_dns_resolve(const char *name)"):
+            network.index("struct hostent *gethostbyname(const char *name)")]
+        fallback = chooser.index(
+            "bool resolved = psp_dns_firmware_resolve(name);")
+        self.assertLess(
+            chooser.index("psp_dns_stub_resolve(name, &address, &run)"),
+            fallback, "The stub must run before the firmware fallback.")
+        self.assertLess(
+            chooser.index("outcome == PSP_DNS_LOOKUP_NXDOMAIN"), fallback)
+        self.assertLess(
+            chooser.index("outcome == PSP_DNS_LOOKUP_RESOLVED"), fallback)
+        stub = network[
+            network.index("static PspDnsLookupOutcome psp_dns_stub_resolve("):
+            network.index("static bool psp_dns_firmware_resolve(")]
+        self.assertNotIn("sceNetResolver", stub)
+        # Every wait is bounded: a non-blocking socket, clock-checked poll
+        # slices, and the socket closed on every exit.
+        self.assertLess(stub.index("SO_NONBLOCK"),
+                        stub.index("sceNetInetRecvfrom("))
+        self.assertIn("sceNetInetPoll(", stub)
+        self.assertIn("psp_dns_stub_next_send(", stub)
+        self.assertLess(stub.index("done:"),
+                        stub.index("sceNetInetClose(socket_id)"))
+        self.assertIn("psp_dns_stub_source_server(run, queried, &source)",
+                      stub)
+        self.assertEqual(1, network.count("sceNetResolverStartNtoA("))
         resolve = network[
-            network.index("struct hostent *gethostbyname(const char *name)"):]
+            network.index("static bool psp_dns_firmware_resolve("):
+            network.index("static bool psp_dns_resolve(const char *name)")]
         self.assertIn(
             "PSP_DNS_TIMEOUT_SECONDS, PSP_DNS_RETRIES", resolve)
         self.assertIn("sceNetResolverDelete(resolver_id)", resolve)
         self.assertLess(
             resolve.index("sceNetResolverDelete(resolver_id)"),
-            resolve.index("if (resolved < 0) return NULL;"),
+            resolve.index("return resolved;"),
             "The resolver object must be released on the failure path too.")
+        # The firmware can ignore its own timeout and never return. The
+        # lookup is published for the browser-thread guard, which stops it
+        # after the hard bound, and a guard-stopped lookup retries once.
+        self.assertLess(
+            resolve.index("psp_dns_started_ms = psp_network_now_ms();"),
+            resolve.index("psp_dns_active_resolver = resolver_id;"))
+        self.assertLess(
+            resolve.index("psp_dns_active_resolver = -1;"),
+            resolve.index("sceNetResolverDelete(resolver_id)"))
+        self.assertIn("psp_network_dns_should_retry(", resolve)
+        guard = network[
+            network.index("void psp_network_dns_guard(void)"):
+            network.index("unsigned psp_network_dns_forced_stops(void)")]
+        self.assertIn("sceNetResolverStop(resolver_id)", guard)
+        self.assertIn("psp_network_dns_lookup_overdue(", guard)
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        self.assertIn("psp_network_dns_guard();", runtime)
+        pump = without_comments(
+            (ROOT / "src/psp_app/psp_app_network.c").read_text(
+                encoding="utf-8"))
+        self.assertIn("psp_network_dns_guard();", pump)
 
     def test_exit_handoff_uses_the_launcher_load_recipe(self):
         handoff = without_comments(
@@ -7271,10 +7717,12 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("psp_app_reload_for_site_security_setting(", branch)
         self.assertNotIn("psp_begin_page_load(", branch)
         helper = settings[
-            settings.index("static void psp_app_reload_for_site_security_setting("):
+            settings.index("static void psp_app_reload_after_setting("):
             settings.index("void psp_app_refresh_network_profile_label(")]
         self.assertIn("base_screen == PSP_UI_SCREEN_HOME", helper)
         self.assertIn("if (started && !local_surface)", helper)
+        self.assertIn("psp_app_reload_after_setting(", helper[
+            helper.index("static void psp_app_reload_for_site_security_setting("):])
 
     def test_x25519_comparison_requires_a_valid_generic_result(self):
         source = without_comments(
@@ -7517,6 +7965,125 @@ class PspSdkContractTests(unittest.TestCase):
         for target in ("tilefinch_psp_mbedtls", "tilefinch_psp_curl"):
             self.assertIn(f"ExternalProject_Add_Step({target} user-config", build)
         self.assertEqual(build.count('DEPENDS "${_transport_mbedtls_config}"'), 2)
+
+    def test_psp_web_crypto_random_uses_the_credited_pool(self):
+        # Without a secure_random platform service the PSP had no source for
+        # crypto.getRandomValues/randomUUID at all, and pages that mint an ID
+        # at startup (chatgpt.com) died before wiring their UI.
+        source = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        self.assertIn(".secure_random = psp_platform_secure_random", source)
+        helper = source[source.index(
+            "static bool psp_platform_secure_random"):]
+        helper = helper[:helper.index("\n}\n")]
+        self.assertIn("psp_entropy_fill(data, length)", helper)
+        self.assertNotIn("best_effort", helper)
+
+    def test_psp_tls_entropy_is_credited_jitter_not_getentropy(self):
+        # libcglue's getentropy() reseeds MT19937 from time() on every call.
+        # It must not reach mbed TLS at all; the only strong source is the
+        # jitter accumulator behind MBEDTLS_ENTROPY_HARDWARE_ALT, which
+        # mbedtls_entropy_init() registers for legacy contexts and PSA alike.
+        config = without_comments(
+            (ROOT / "cmake/psp_transport/mbedtls_user_config.h").read_text(
+                encoding="utf-8"))
+        self.assertIn("#define MBEDTLS_NO_PLATFORM_ENTROPY", config)
+        self.assertIn("#define MBEDTLS_ENTROPY_HARDWARE_ALT", config)
+        for bypass in ("MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES",
+                       "MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG",
+                       "MBEDTLS_ENTROPY_NV_SEED"):
+            self.assertNotIn(f"#define {bypass}", config)
+            self.assertIn(f"defined({bypass})", config)
+        patch = (ROOT / "patches/mbedtls-3.6.6-psp.patch").read_text(
+            encoding="utf-8")
+        self.assertNotIn("getentropy", patch)
+        self.assertNotIn("library/entropy_poll.c", patch)
+        for path in sorted((ROOT / "src").rglob("*.[ch]")):
+            if "generated" in path.parts:
+                continue
+            source = without_comments(path.read_text(encoding="utf-8"))
+            self.assertNotIn("getentropy(", source, str(path))
+
+        hook = without_comments(
+            (ROOT / "src/psp_entropy_mbedtls.c").read_text(encoding="utf-8"))
+        body = hook[hook.rindex("int mbedtls_hardware_poll("):]
+        self.assertIn("if (!psp_entropy_fill(output, length))", body)
+        self.assertIn("return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;", body)
+        self.assertLess(body.index("*output_length = 0;"),
+                        body.index("psp_entropy_fill("))
+
+        # Registered for the PSP build: the hook archive follows
+        # libmbedcrypto on both link interfaces, so every executable whose
+        # link pulls in entropy.o resolves the hook to this source.
+        build = (ROOT / "cmake/PspOwnedTransport.cmake").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "add_library(tilefinch_psp_entropy_mbedtls STATIC "
+            "src/psp_entropy_mbedtls.c)", build)
+        order = re.compile(
+            r'"\$\{_transport_prefix\}/lib/libmbedcrypto\.a"\s+'
+            r"tilefinch_psp_entropy_mbedtls\s+tilefinch_psp_entropy\s")
+        self.assertEqual(len(order.findall(build)), 2)
+        self.assertLess(build.index("add_library(tilefinch_psp_entropy STATIC"),
+                        build.index("if(NOT PSP OR PSP_BROWSER_CURL_STUB"))
+
+        # Credit accounting: 256 bits, at most a quarter bit per sample.
+        pool = (ROOT / "src/psp_entropy_pool.h").read_text(encoding="utf-8")
+        self.assertIn("#define PSP_ENTROPY_TARGET_BITS 256u", pool)
+        self.assertIn("#define PSP_ENTROPY_SAMPLE_CAP_MILLIBITS 1000u", pool)
+        self.assertIn("#define PSP_ENTROPY_SAFETY_DIVISOR 4u", pool)
+
+        # The default refuses output until credited; the refusal path
+        # returns before generating.
+        api = without_comments(
+            (ROOT / "include/tilefinch/psp_entropy.h").read_text(
+                encoding="utf-8"))
+        self.assertIn("PSP_ENTROPY_REQUIRE_CREDIT = 0", api)
+        glue = without_comments(
+            (ROOT / "src/psp_entropy.c").read_text(encoding="utf-8"))
+        fill = glue[glue.index("bool psp_entropy_fill(void *output"):
+                    glue.index("void psp_entropy_fill_best_effort(")]
+        refusal = fill[fill.index('psp_entropy_report_state("unseeded")'):]
+        self.assertLess(refusal.index("return false;"),
+                        refusal.index("psp_entropy_pool_generate("))
+        self.assertNotIn(".policy =", glue[:glue.index(
+            "static uint32_t psp_entropy_samples")])
+
+        # Only processes that never create secrets with it, or that exist
+        # to run under emulation, may release uncredited output.
+        permitting = sorted(
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "src").rglob("*.c")
+            if "PSP_ENTROPY_PERMIT_UNCREDITED" in without_comments(
+                path.read_text(encoding="utf-8"))
+            and path.name != "psp_entropy.c")
+        self.assertEqual(permitting, [
+            "src/psp_crypto_selftest_main.c",
+            "src/psp_script_main.c",
+            "src/update_launcher_psp.c",
+        ])
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        setup = main[main.index("static TILEFINCH_COLD_PATH void "
+                                "psp_entropy_setup("):]
+        setup = setup[:setup.index("\n}\n")]
+        validation = setup.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG")
+        shipping = setup.index("#else", validation)
+        self.assertIn("PSP_ENTROPY_PERMIT_UNCREDITED",
+                      setup[validation:shipping])
+        self.assertIn("PSP_ENTROPY_REQUIRE_CREDIT", setup[shipping:])
+        self.assertNotIn("PSP_ENTROPY_PERMIT_UNCREDITED", setup[shipping:])
+        self.assertLess(main.index("psp_entropy_setup(&process.install_paths)"),
+                        main.index("psp_log_start_watchdog("))
+
+        # DNS query IDs come from the pool, never from the time-seeded MT.
+        network = without_comments(
+            (ROOT / "src/psp_network.c").read_text(encoding="utf-8"))
+        query_id = network[network.index(
+            "static uint16_t psp_dns_stub_query_id(void)"):]
+        query_id = query_id[:query_id.index("\n}\n")]
+        self.assertIn("psp_entropy_fill_best_effort(&id, sizeof(id))",
+                      query_id)
 
     def test_owned_curl_omits_unused_subsystems_but_keeps_browser_hooks(self):
         build = (ROOT / "cmake/PspOwnedTransport.cmake").read_text(

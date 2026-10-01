@@ -9,6 +9,7 @@
 #include "tilefinch/sha256.h"
 #include "tilefinch/tls_session_store.h"
 #include "tilefinch/url.h"
+#include "tilefinch/work_ledger.h"
 
 #include <curl/curl.h>
 
@@ -48,6 +49,11 @@ extern CURLcode curl_easy_impersonate(CURL *handle, const char *target,
 /* The project-owned PSP transport links Mbed TLS directly, so the negotiated
    protocol version and the ClientHello preference lists are reachable through
    libcurl's documented mbedTLS seams without patching either dependency. */
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Validation only: the resumption probe below wraps the verify callback
+   libcurl stores in the configuration's private fields. */
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
+#endif
 #include <mbedtls/ssl.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509.h>
@@ -71,6 +77,7 @@ _Static_assert(MBEDTLS_X509_BADCERT_BAD_KEY == TILEFINCH_TLS_VERIFY_BAD_KEY,
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -321,6 +328,8 @@ static void fetch_cache_mode_headers(
 }
 
 typedef struct FetchHopState FetchHopState;
+/* Replay-only identifier rewrite for a served record (trace_replay.inc). */
+typedef struct TraceReplayRekey TraceReplayRekey;
 
 static const char *fetch_hop_logical_url(const FetchHopState *hop);
 static const char *fetch_hop_wire_url(const FetchHopState *hop);
@@ -379,6 +388,8 @@ typedef struct {
     uint64_t replay_body_hash;
     uint64_t replay_expected_body_hash;
     bool replay_body_hash_required;
+    /* Deferred replay body rewrite, owned by the scheduler item. */
+    TraceReplayRekey *replay_rekey;
 } WriteContext;
 
 static size_t receive_data(char *data, size_t size, size_t count,
@@ -1070,12 +1081,78 @@ static const uint16_t fetch_tls_signature_preference[] = {
     MBEDTLS_TLS1_3_SIG_NONE
 };
 
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+/*
+ * Does a new TLS connection resume a cached session? libcurl offers one
+ * ("SSL reusing session ID") but never says whether the server took it. A
+ * resumed handshake carries no certificate, so Mbed TLS never calls the
+ * verify callback for it: connections set up minus leaf certificates
+ * verified is the resumption count. libcurl installs the same callback on
+ * every configuration before handing it to the SSL_CTX hook, with its
+ * per-connection filter as the context; the wrapper keeps that context and
+ * forwards every call, so verification itself is unchanged.
+ */
+typedef int (*FetchTlsVerify)(void *, mbedtls_x509_crt *, int, uint32_t *);
+static FetchTlsVerify fetch_tls_curl_verify;
+static volatile unsigned fetch_tls_probe_connections;
+static volatile unsigned fetch_tls_probe_certificates;
+/* Leaf certificates naming googlevideo: the media hosts' share of the above,
+   so media resumptions can be told apart from page-host ones. */
+static volatile unsigned fetch_tls_probe_media_certificates;
+
+static bool fetch_tls_certificate_names_media(const mbedtls_x509_crt *crt)
+{
+    static const char needle[] = "googlevideo.com";
+    const unsigned char *subject = crt->subject_raw.p;
+    size_t length = crt->subject_raw.len;
+    for (size_t i = 0; subject != NULL && i + sizeof(needle) - 1u <= length;
+         i++) {
+        if (memcmp(subject + i, needle, sizeof(needle) - 1u) == 0)
+            return true;
+    }
+    return false;
+}
+
+static int fetch_tls_counting_verify(void *context, mbedtls_x509_crt *crt,
+                                     int depth, uint32_t *flags)
+{
+    if (depth == 0) {
+        (void) __sync_fetch_and_add(&fetch_tls_probe_certificates, 1u);
+        if (crt != NULL && fetch_tls_certificate_names_media(crt))
+            (void) __sync_fetch_and_add(
+                &fetch_tls_probe_media_certificates, 1u);
+    }
+    return fetch_tls_curl_verify == NULL
+        ? 0 : fetch_tls_curl_verify(context, crt, depth, flags);
+}
+
+static void fetch_tls_probe_install(mbedtls_ssl_config *config)
+{
+    FetchTlsVerify installed = config->MBEDTLS_PRIVATE(f_vrfy);
+    if (installed == NULL || installed == fetch_tls_counting_verify) return;
+    fetch_tls_curl_verify = installed;
+    config->MBEDTLS_PRIVATE(f_vrfy) = fetch_tls_counting_verify;
+    (void) __sync_fetch_and_add(&fetch_tls_probe_connections, 1u);
+}
+#endif
+
 static CURLcode fetch_tls_shape_client_hello(CURL *easy, void *ssl_config,
                                              void *opaque)
 {
     (void) easy;
     (void) opaque;
     if (ssl_config == NULL) return CURLE_SSL_CONNECT_ERROR;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    fetch_tls_probe_install((mbedtls_ssl_config *) ssl_config);
+#endif
+    /* libcurl turns TLS 1.2 session tickets off for every connection. Turn
+       them back on: without them a TLS 1.2 session can only resume by
+       session ID, which Google's servers do not keep, and googlevideo's
+       TLS 1.2 ticket is the only way a media reconnect avoids a full
+       handshake (it sends no TLS 1.3 tickets on /videoplayback). This runs
+       after libcurl's own setting and before the ClientHello is written. */
+    mbedtls_ssl_conf_session_tickets((mbedtls_ssl_config *) ssl_config,
+                                     MBEDTLS_SSL_SESSION_TICKETS_ENABLED);
     /* Neither call copies its array; both lists have static storage. */
     mbedtls_ssl_conf_groups((mbedtls_ssl_config *) ssl_config,
                             fetch_tls_group_preference);
@@ -1086,6 +1163,30 @@ static CURLcode fetch_tls_shape_client_hello(CURL *easy, void *ssl_config,
     return CURLE_OK;
 }
 #endif /* TILEFINCH_PSP_OWNED_TRANSPORT */
+
+void fetch_tls_resumption_counters(unsigned *connections,
+                                   unsigned *certificates)
+{
+#if defined(TILEFINCH_PSP_OWNED_TRANSPORT) \
+    && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    if (connections != NULL) *connections = fetch_tls_probe_connections;
+    if (certificates != NULL) *certificates = fetch_tls_probe_certificates;
+#else
+    if (connections != NULL) *connections = 0;
+    if (certificates != NULL) *certificates = 0;
+#endif
+}
+
+unsigned fetch_tls_media_certificates(void)
+{
+#if defined(TILEFINCH_PSP_OWNED_TRANSPORT) \
+    && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    return fetch_tls_probe_media_certificates;
+#else
+    return 0;
+#endif
+}
+
 
 static bool fetch_configure_tls(CURL *easy)
 {
@@ -1238,6 +1339,35 @@ typedef struct {
     bool descriptor_valid;
 } TraceReplayRouteIndexEntry;
 
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Device replay is validation instrumentation. Its route index is fixed
+   storage (8 KiB), never a heap or page-Budget allocation; without it every
+   request reopened every record's metadata over host0 (~180 opens each). */
+static TraceReplayRouteIndexEntry
+    trace_replay_static_route_index[FETCH_TRACE_ROUTE_INDEX_LIMIT];
+#define TRACE_REPLAY_ROUTE_INDEX_FREE(index) \
+    ((index) == trace_replay_static_route_index ? (void) 0 : free(index))
+#else
+#define TRACE_REPLAY_ROUTE_INDEX_FREE(index) free(index)
+#endif
+
+/* Replay file I/O cost, so replay measurements can separate the harness from
+   the browser: over PSPLink every open and read is a USB round trip. */
+static struct {
+    uint64_t opens;
+    uint64_t reads;
+    uint64_t bytes;
+    uint64_t us;
+} trace_replay_io;
+#define TRACE_REPLAY_IO_OPEN(started_ns) \
+    (trace_replay_io.opens++, \
+     trace_replay_io.us += \
+         (tilefinch_platform_monotonic_time_ns() - (started_ns)) / 1000u)
+#define TRACE_REPLAY_IO_READ(started_ns, byte_count) \
+    (trace_replay_io.reads++, trace_replay_io.bytes += (byte_count), \
+     trace_replay_io.us += \
+         (tilefinch_platform_monotonic_time_ns() - (started_ns)) / 1000u)
+
 /* Capture-only provenance keeps cookie values in Budget-owned memory and
    writes only equality results to disk. It is deliberately small: the live
    challenge path needs the newest issuances, not an unbounded cookie log. */
@@ -1263,6 +1393,16 @@ static struct {
     size_t replay_record_count;
     bool replay_record_count_authoritative;
     bool replay_response_keyed;
+    /* Lab/validation opt-in (TILEFINCH_REPLAY_VOLATILE_UUIDS), read once
+       when replay begins: client-minted UUIDs in request URLs match any
+       UUID and are echoed into the served response (trace_replay.inc). */
+    bool replay_volatile_uuids;
+    /* Lab/validation opt-in (TILEFINCH_REPLAY_PUMP_US), read once when
+       replay begins: hold a response for its recorded pumps times this
+       many microseconds of wall time instead of for that many pumps, so a
+       loop that pumps more often does not also make the recorded network
+       answer sooner. Zero keeps the pump count. */
+    uint32_t replay_pump_us;
     size_t replay_request_count;
     size_t replay_matched_request_count;
     size_t replay_served_request_count;
@@ -1289,6 +1429,15 @@ static struct {
     size_t replay_route_index_count;
 } fetch_trace;
 
+/* Capture/replay is a build capability, not a dormant shipping mode. Keep the
+   live transport's gates constant when absent so its static trace machinery
+   is unreachable and removed without adding a second networking backend. */
+#ifdef TILEFINCH_NO_FETCH_TRACE
+#define FETCH_TRACE_MODE FETCH_TRACE_OFF
+#else
+#define FETCH_TRACE_MODE fetch_trace.mode
+#endif
+
 /* The lab's diagnostic mobile-Safari identity. The PSP has no environment,
    so trace-free builds answer without a getenv per request. */
 static bool fetch_diagnostic_mobile_safari(void)
@@ -1303,7 +1452,17 @@ static bool fetch_diagnostic_mobile_safari(void)
 #include "fetch/security_metadata.inc"
 #include "fetch/trace_capture.inc"
 #include "fetch/trace_replay.inc"
+#ifdef TILEFINCH_NO_FETCH_TRACE
+#include "fetch/trace_disabled.inc"
+#else
 #include "fetch/trace_session.inc"
+#endif
+
+static void *curl_malloc_hook(size_t size)
+{
+    return budget_concurrent_pool_malloc(&curl_concurrent_pool, size);
+}
+
 #include "fetch/response_stream.inc"
 #include "fetch/transport.inc"
 #include "fetch/scheduler.inc"

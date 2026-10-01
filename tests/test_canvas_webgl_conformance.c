@@ -1052,6 +1052,10 @@ static bool run_deferred_webgl_flush(void)
           && strcmp(result.summary, "WEBGL-CONTEXT-LIMIT") == 0);
     CHECK(script_runtime_advance(runtime, 0, 64, &result));
     (void) script_runtime_collect_and_trim(runtime);
+    /* FinalizationRegistry cleanup is a task, not part of the following
+       diagnostic script's promise checkpoint. Give collected native canvas
+       storage a bounded idle turn before admitting its replacement. */
+    CHECK(script_runtime_advance(runtime, 0, 64, &result));
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "globalThis.collectedReplacement=document.createElement('canvas')"

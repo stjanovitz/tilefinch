@@ -60,6 +60,10 @@ set(TILEFINCH_CORE_SOURCES
     src/layout_scroll.c
     src/layout_table.c
     src/navigation.c
+    src/work_vector.c
+    src/work_ledger.c
+    src/script_split.c
+    src/script_census.c
     src/media_file.c
     src/media_h264_psp_compat.c
     src/media_mp4.c
@@ -90,6 +94,7 @@ set(TILEFINCH_CORE_SOURCES
     src/session_site_storage.c
     src/site_adapter.c
     src/style.c
+    src/style_has_invalidation.c
     src/style_match.c
     src/style_math.c
     src/style_properties.c
@@ -152,7 +157,20 @@ file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-portability-sources.txt"
     CONTENT "${TILEFINCH_PORTABILITY_SOURCE_MANIFEST}\n")
 
-if(PSP)
+set(TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE "" CACHE FILEPATH
+    "Private generated bootstrap with line keys for attribution only")
+if(TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE)
+    if(PSP AND NOT TILEFINCH_PSP_VALIDATION_LOG)
+        message(FATAL_ERROR "Census bootstrap override is forbidden in shipping PSP builds")
+    endif()
+    if(NOT PSP_BROWSER_USE_BELLARD_QUICKJS)
+        message(FATAL_ERROR "Census bootstrap override requires the Bellard engine")
+    endif()
+    list(REMOVE_ITEM TILEFINCH_CORE_SOURCES src/generated/js_bootstrap_bytecode.c)
+    list(APPEND TILEFINCH_CORE_SOURCES "${TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE}")
+endif()
+
+if(PSP OR TILEFINCH_NATIVE_TIER_STATIC_CORE)
     add_library(tilefinch_core STATIC ${TILEFINCH_CORE_SOURCES})
 else()
     # Every host executable used to statically link this large archive.  One
@@ -163,6 +181,9 @@ else()
     # rebuilt before a tool or test is run.
     add_library(tilefinch_core SHARED ${TILEFINCH_CORE_SOURCES})
     set(CMAKE_LINK_DEPENDS_NO_SHARED ON)
+endif()
+if(TILEFINCH_NATIVE_TIER_STATIC_CORE AND NOT PSP)
+    target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_NATIVE_TIER_LAB=1)
 endif()
 target_include_directories(tilefinch_core PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -254,6 +275,10 @@ else()
     find_package(ZLIB REQUIRED)
     target_link_libraries(tilefinch_core PUBLIC ZLIB::ZLIB)
 endif()
+if(DEFINED TILEFINCH_QUICKJS_ENGINE_ID)
+    target_compile_definitions(tilefinch_core PRIVATE
+        TILEFINCH_QUICKJS_ENGINE_ID="${TILEFINCH_QUICKJS_ENGINE_ID}")
+endif()
 if(TARGET tilefinch_wamr)
     target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_HAVE_WAMR=1)
     target_link_libraries(tilefinch_core PRIVATE tilefinch_wamr)
@@ -271,6 +296,9 @@ if(NOT PSP_BROWSER_ENABLE_GIF)
 endif()
 if(PSP_BROWSER_DISABLE_TRACE)
     target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_NO_TRACE=1)
+endif()
+if(NOT PSP_BROWSER_ENABLE_FETCH_TRACE)
+    target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_NO_FETCH_TRACE=1)
 endif()
 if(TILEFINCH_OWNER_CHECKS)
     # PUBLIC: the check adds owner fields to Budget, so every consumer must

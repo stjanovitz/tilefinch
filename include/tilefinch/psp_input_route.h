@@ -23,8 +23,10 @@
  *    first (priority); other presses queue for the page.
  *  - media: the native player's controls.
  * Optional work (a font batch, the rest of a provisional layout) yields to
- * input and reruns, except that scrolling down while the reader waits at
- * the bottom for that very layout queues for the page instead.
+ * input and reruns, with two exceptions for the rest of a provisional
+ * layout: scrolling down while the reader waits at the bottom for that very
+ * layout queues for the page, and other page scrolling is served by the
+ * supervisor from the page already shown, so the layout keeps its progress.
  * Precedence below is the order of the checks in psp_input_route().
  */
 
@@ -56,11 +58,19 @@ typedef struct {
        bottom of the page: scrolling further down cannot move the page, so
        those presses wait for it rather than cancel it. */
     bool forward_awaited;
+    /* The work lets the supervisor page the committed page while it runs
+       (a provisional layout's completion, or a provisional relayout's
+       build, which is not optional). */
+    bool scroll_served;
     /* A native menu or cursor already took this press. */
     bool priority_handled;
     /* A cancellation is already in flight. */
     bool cancelling;
     bool acknowledge_busy;
+    /* The player shows a highlighted scrub time (for example one chosen
+       while a rewind rebuilds the decoder): Circle drops the highlight
+       rather than stopping the video. */
+    bool media_preview_active;
 } PspInputRouteContext;
 
 typedef enum {
@@ -75,7 +85,8 @@ typedef enum {
     PSP_INPUT_ROUTE_CANCEL,
     /* The player's controls. */
     PSP_INPUT_ROUTE_MEDIA,
-    /* Page the loading preview (Up/Down/L/R). */
+    /* Page the loading preview, or the committed page while its layout
+       completes (Up/Down/L/R). */
     PSP_INPUT_ROUTE_SCROLL,
     /* A cancellation is in flight: say it is still stopping. */
     PSP_INPUT_ROUTE_STILL_STOPPING,
@@ -97,10 +108,13 @@ typedef enum {
 static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
 {
     if (c == NULL) return PSP_INPUT_ROUTE_NONE;
+    bool scroll_only = !c->analog_active && c->pressed != 0
+        && (c->pressed & ~PSP_INPUT_ROUTE_SCROLL_BUTTONS) == 0;
+    bool forward_queued = c->forward_awaited && !c->analog_active
+        && (c->pressed & ~PSP_INPUT_ROUTE_FORWARD_BUTTONS) == 0;
     if (c->owner_thread && c->optional_preemptible
         && (c->pressed != 0 || c->analog_active)
-        && !(c->forward_awaited && !c->analog_active
-             && (c->pressed & ~PSP_INPUT_ROUTE_FORWARD_BUTTONS) == 0))
+        && !forward_queued && !(c->scroll_served && scroll_only))
         return PSP_INPUT_ROUTE_YIELD;
     if (c->priority_handled) return PSP_INPUT_ROUTE_PRIORITY_DONE;
     if (c->pressed == 0) return PSP_INPUT_ROUTE_NONE;
@@ -108,6 +122,9 @@ static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
     bool media = c->owner == PSP_INPUT_OWNER_MEDIA;
     if (loading && c->loop != PSP_INPUT_LOOP_ON_PAGE)
         return PSP_INPUT_ROUTE_FORWARD;
+    if (media && c->media_preview_active && !c->cancelling
+        && (c->pressed & PSP_UI_BUTTON_CANCEL) != 0)
+        return PSP_INPUT_ROUTE_MEDIA;
     if ((c->pressed & PSP_UI_BUTTON_CANCEL) != 0 && !c->cancelling)
         return PSP_INPUT_ROUTE_CANCEL;
     if (media && (c->pressed & PSP_INPUT_ROUTE_MEDIA_BUTTONS) != 0
@@ -115,6 +132,8 @@ static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
         return PSP_INPUT_ROUTE_MEDIA;
     if (loading && (c->pressed & PSP_INPUT_ROUTE_SCROLL_BUTTONS) != 0
         && !c->cancelling)
+        return PSP_INPUT_ROUTE_SCROLL;
+    if (c->scroll_served && scroll_only && !forward_queued && !c->cancelling)
         return PSP_INPUT_ROUTE_SCROLL;
     if (c->cancelling) return PSP_INPUT_ROUTE_STILL_STOPPING;
     if (c->owner == PSP_INPUT_OWNER_PAGE_SERVICE)

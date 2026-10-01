@@ -185,6 +185,18 @@ static JSValue js_performance_sample(JSContext *context,
    Otherwise the timer wheel uses this side-effect-free monotonic sample as its
    sole clock. Keeping the domains disjoint prevents owner-supplied elapsed time
    from charging callback wall time a second time. */
+static double js_rt_scheduler_sample(const DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->deterministic_clock
+        || !bridge->wall_clock_timers)
+        return -1.0;
+    uint64_t current = js_rt_monotonic_time_ns();
+    return current >= bridge->performance_origin_ns
+        ? (double) (current - bridge->performance_origin_ns)
+              / 1000000.0
+        : 0.0;
+}
+
 static JSValue js_scheduler_now(JSContext *context,
                                 JSValueConst this_value,
                                 int argc, JSValueConst *argv)
@@ -192,16 +204,9 @@ static JSValue js_scheduler_now(JSContext *context,
     (void) this_value;
     (void) argc;
     (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || bridge->deterministic_clock
-        || !bridge->wall_clock_timers)
-        return JS_NewInt32(context, -1);
-    uint64_t current = js_rt_monotonic_time_ns();
-    double elapsed = current >= bridge->performance_origin_ns
-        ? (double) (current - bridge->performance_origin_ns)
-              / 1000000.0
-        : 0.0;
-    return JS_NewFloat64(context, elapsed);
+    double elapsed = js_rt_scheduler_sample(JS_GetContextOpaque(context));
+    return elapsed < 0 ? JS_NewInt32(context, -1)
+                       : JS_NewFloat64(context, elapsed);
 }
 
 static JSValue js_date_now(JSContext *context, JSValueConst this_value,
@@ -1476,6 +1481,18 @@ static JSValue js_utf8_encode(JSContext *context,
     return result;
 }
 
+/* prefers-color-scheme for matchMedia: the same answer the CSS media
+   evaluator gives (Tilefinch night mode). */
+static JSValue js_prefers_dark_color_scheme(JSContext *context,
+                                            JSValueConst this_value,
+                                            int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    return JS_NewBool(context, stylesheet_prefers_dark_color_scheme());
+}
+
 static JSValue js_crypto_random_fill(JSContext *context,
                                      JSValueConst this_value,
                                      int argc, JSValueConst *argv)
@@ -2091,6 +2108,9 @@ static JSValue js_compression_run(JSContext *context,
     return result;
 }
 
+static JSValue base64_encode_raw(JSContext *context, const uint8_t *bytes,
+                                 size_t length);
+
 static JSValue js_base64_encode_bytes(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv)
@@ -2108,15 +2128,20 @@ static JSValue js_base64_encode_bytes(JSContext *context,
         JS_FreeValue(context, buffer);
         return JS_ThrowRangeError(context, "base64 input exceeds bounded size");
     }
+    JSValue result = base64_encode_raw(context, bytes + offset, length);
+    JS_FreeValue(context, buffer);
+    return result;
+}
+
+static JSValue base64_encode_raw(JSContext *context, const uint8_t *bytes,
+                                 size_t length)
+{
     static const char alphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t output_length = ((length + 2u) / 3u) * 4u;
     char *output = js_malloc(context, output_length + 1u);
-    if (output == NULL) {
-        JS_FreeValue(context, buffer);
-        return JS_EXCEPTION;
-    }
-    size_t source = offset, end = offset + length, destination = 0;
+    if (output == NULL) return JS_EXCEPTION;
+    size_t source = 0, end = length, destination = 0;
     while (source < end) {
         uint32_t a = bytes[source++];
         bool has_b = source < end;
@@ -2132,7 +2157,48 @@ static JSValue js_base64_encode_bytes(JSContext *context,
     output[output_length] = '\0';
     JSValue result = JS_NewStringLen(context, output, output_length);
     js_free(context, output);
-    JS_FreeValue(context, buffer);
+    return result;
+}
+
+/* btoa's work in one pass: the string's code units as bytes, refused at
+   the first unit above 255 (returned as its index, so script can report
+   it exactly as before), otherwise base64. */
+static JSValue js_base64_encode_latin1(JSContext *context,
+                                       JSValueConst this_value,
+                                       int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1) return JS_ThrowTypeError(context, "string required");
+    size_t utf8_length = 0;
+    const char *utf8 = JS_ToCStringLen(context, &utf8_length, argv[0]);
+    if (utf8 == NULL) return JS_EXCEPTION;
+    uint8_t *bytes = js_malloc(context, utf8_length + 1u);
+    if (bytes == NULL) {
+        JS_FreeCString(context, utf8);
+        return JS_EXCEPTION;
+    }
+    size_t used = 0;
+    int64_t bad = -1;
+    for (size_t at = 0; at < utf8_length;) {
+        unsigned char lead = (unsigned char) utf8[at];
+        if (lead < 0x80u) {
+            bytes[used++] = lead;
+            at++;
+        } else if ((lead == 0xC2u || lead == 0xC3u) && at + 1u < utf8_length
+                   && ((unsigned char) utf8[at + 1u] & 0xC0u) == 0x80u) {
+            bytes[used++] = (uint8_t) (((lead & 0x03u) << 6)
+                | ((unsigned char) utf8[at + 1u] & 0x3Fu));
+            at += 2u;
+        } else {
+            /* Code units so far: one per byte written. */
+            bad = (int64_t) used;
+            break;
+        }
+    }
+    JS_FreeCString(context, utf8);
+    JSValue result = bad >= 0 ? JS_NewInt64(context, bad)
+        : base64_encode_raw(context, bytes, used);
+    js_free(context, bytes);
     return result;
 }
 
@@ -2403,11 +2469,82 @@ static JSValue js_compile_inline_event_handler(JSContext *context,
     return function;
 }
 
+static JSValue script_profile_native_value(JSContext *context,
+                                           JSCFunction *function,
+                                           const char *name, int arguments);
+
+#ifdef TILEFINCH_SCRIPT_SPLIT
+/* The bridge natives the script split times (script_split.h): a plain C
+   wrapper per native, so calls keep the engine's direct native path (the
+   profiler's trampoline, when on, wraps the wrapper). */
+#define SCRIPT_SPLIT_NATIVE(function, kind)                                  \
+    static JSValue split_##function(JSContext *context,                      \
+                                    JSValueConst this_value, int argc,       \
+                                    JSValueConst *argv)                      \
+    {                                                                        \
+        unsigned token = script_split_enter(kind);                           \
+        JSValue value = function(context, this_value, argc, argv);           \
+        script_split_leave(token);                                           \
+        return value;                                                        \
+    }
+SCRIPT_SPLIT_NATIVE(js_computed_style_get, SCRIPT_SPLIT_STYLE)
+SCRIPT_SPLIT_NATIVE(js_computed_style_read, SCRIPT_SPLIT_STYLE)
+SCRIPT_SPLIT_NATIVE(js_transition_snapshot, SCRIPT_SPLIT_STYLE)
+SCRIPT_SPLIT_NATIVE(js_dom_query, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_query_all, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_query_count, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_closest, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_matches, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_query_selector_method, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_query_selector_all_method, SCRIPT_SPLIT_QUERY)
+SCRIPT_SPLIT_NATIVE(js_dom_set_attribute, SCRIPT_SPLIT_MUTATE)
+SCRIPT_SPLIT_NATIVE(js_dom_remove_attribute, SCRIPT_SPLIT_MUTATE)
+SCRIPT_SPLIT_NATIVE(js_dom_insert_before, SCRIPT_SPLIT_MUTATE)
+SCRIPT_SPLIT_NATIVE(js_dom_append, SCRIPT_SPLIT_MUTATE)
+SCRIPT_SPLIT_NATIVE(js_dom_remove, SCRIPT_SPLIT_MUTATE)
+SCRIPT_SPLIT_NATIVE(js_style_set, SCRIPT_SPLIT_MUTATE)
+SCRIPT_SPLIT_NATIVE(js_dom_set_inner_html, SCRIPT_SPLIT_MUTATE)
+#undef SCRIPT_SPLIT_NATIVE
+static JSCFunction *script_split_native(JSCFunction *function)
+{
+    static const struct {
+        JSCFunction *function;
+        JSCFunction *wrapper;
+    } natives[] = {
+        { js_computed_style_get, split_js_computed_style_get },
+        { js_computed_style_read, split_js_computed_style_read },
+        { js_transition_snapshot, split_js_transition_snapshot },
+        { js_dom_query, split_js_dom_query },
+        { js_dom_query_all, split_js_dom_query_all },
+        { js_dom_query_count, split_js_dom_query_count },
+        { js_dom_closest, split_js_dom_closest },
+        { js_dom_matches, split_js_dom_matches },
+        { js_dom_query_selector_method, split_js_dom_query_selector_method },
+        { js_dom_query_selector_all_method,
+          split_js_dom_query_selector_all_method },
+        { js_dom_set_attribute, split_js_dom_set_attribute },
+        { js_dom_remove_attribute, split_js_dom_remove_attribute },
+        { js_dom_insert_before, split_js_dom_insert_before },
+        { js_dom_append, split_js_dom_append },
+        { js_dom_remove, split_js_dom_remove },
+        { js_style_set, split_js_style_set },
+        { js_dom_set_inner_html, split_js_dom_set_inner_html },
+    };
+    for (size_t i = 0; i < sizeof(natives) / sizeof(natives[0]); i++)
+        if (natives[i].function == function) return natives[i].wrapper;
+    return function;
+}
+#endif
+
 bool js_rt_install_function(JSContext *context, JSValue global,
                       const char *name, JSCFunction *function,
                       int arguments)
 {
-    JSValue value = JS_NewCFunction(context, function, name, arguments);
+#ifdef TILEFINCH_SCRIPT_SPLIT
+    function = script_split_native(function);
+#endif
+    JSValue value = script_profile_native_value(
+        context, function, name, arguments);
     if (JS_IsException(value)) return false;
     DomBridge *bridge = JS_GetContextOpaque(context);
     bool test_network_override =

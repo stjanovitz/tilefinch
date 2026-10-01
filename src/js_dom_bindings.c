@@ -5,6 +5,7 @@
    binding symbols keep their js_* names so the orchestrator's install chain
    preserves the script-observable property order. */
 #include "style_internal.h"
+#include "style_cache_internal.h"
 #undef budget_malloc
 #undef budget_calloc
 #undef budget_realloc
@@ -216,6 +217,10 @@ JSValue js_dom_register_shadow_root(JSContext *context,
     return JS_TRUE;
 }
 
+static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot);
+static void bridge_reclaim_node_slots(DomBridge *bridge,
+                                      const lxb_dom_node_t *keep);
+
 static int64_t bridge_invalidate_node_slot_impl(
     DomBridge *bridge, size_t slot, bool notify)
 {
@@ -232,7 +237,9 @@ static int64_t bridge_invalidate_node_slot_impl(
     }
     bridge_node_index_remove(bridge, slot);
     bridge->nodes[slot] = NULL;
+    bridge_wrapper_ref_clear(bridge, slot);
     bridge->node_owner_document_identities[slot] = 0;
+    if (bridge->node_owner_tags != NULL) bridge->node_owner_tags[slot] = 0;
     /* Never wrap an incarnation: a wrapped handle could make an arbitrarily
        old JavaScript wrapper refer to an unrelated replacement node.  A slot
        that exhausts its hundreds of thousands of incarnations is retired. */
@@ -459,11 +466,14 @@ void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot)
    retired. Only that discard sets the pending bit, and it always drains its
    own slots here, so the retire bitmap names every pending slot. */
 static void bridge_notify_pending_node_retirements(
-    DomBridge *bridge, const unsigned char *retire_slots)
+    DomBridge *bridge, const unsigned char *retire_slots,
+    size_t first_slot, size_t last_slot)
 {
-    if (bridge == NULL || retire_slots == NULL) return;
+    if (bridge == NULL || retire_slots == NULL || first_slot > last_slot)
+        return;
     size_t bytes = (bridge->node_count + 7u) / 8u;
-    for (size_t byte = 0; byte < bytes; byte++) {
+    if (bytes > last_slot / 8u + 1u) bytes = last_slot / 8u + 1u;
+    for (size_t byte = first_slot / 8u; byte < bytes; byte++) {
         if (retire_slots[byte] == 0) continue;
         for (size_t bit = 0; bit < 8u; bit++) {
             if ((retire_slots[byte] & (1u << bit)) == 0) continue;
@@ -482,6 +492,32 @@ static void bridge_notify_pending_node_retirements(
             bridge_notify_node_state_retired(bridge, handle);
         }
     }
+}
+
+/* The adopted owner tag (see DomBridge.node_owner_tags) of a node no
+   adoption has tagged: the document's for a connected node, the template
+   contents owner's inside template contents, else that of the nearest
+   tagged ancestor of its detached tree. Nodes parsed into an adopted tree
+   thereby take its owner, as the DOM's insert steps adopt them. */
+static unsigned char bridge_node_owner_tag_inherited(
+    const DomBridge *bridge, const lxb_dom_node_t *node)
+{
+    const lxb_dom_node_t *root = node;
+    for (size_t steps = 0; root->parent != NULL; steps++) {
+        if (steps >= DOM_TRAVERSAL_VISIT_LIMIT) return 1;
+        root = root->parent;
+    }
+    if (root->type == LXB_DOM_NODE_TYPE_DOCUMENT) return 1;
+    if (root->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
+        && lxb_dom_interface_document_fragment(root)->host != NULL)
+        return 2;
+    for (const lxb_dom_node_t *at = node->parent;
+         at != NULL && bridge->node_owner_tags != NULL; at = at->parent) {
+        size_t slot = bridge_node_index_find(bridge, at);
+        if (slot != SIZE_MAX && bridge->node_owner_tags[slot] != 0)
+            return bridge->node_owner_tags[slot];
+    }
+    return 1;
 }
 
 int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
@@ -511,6 +547,18 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
         size_t first = bridge_first_reusable_slot(bridge);
         if (first != SIZE_MAX) reusable = first;
     }
+    if (reusable == DOM_BRIDGE_NODE_LIMIT
+        && bridge->node_count == DOM_BRIDGE_NODE_LIMIT) {
+        bridge_reclaim_node_slots(bridge, node);
+        /* Reclamation runs retirement callbacks, which may have registered
+           this node meanwhile. */
+        size_t again = bridge_node_index_find(bridge, node);
+        if (again != SIZE_MAX
+            && bridge->node_owner_document_identities[again] == owner)
+            return bridge_node_handle(bridge, again);
+        size_t first = bridge_first_reusable_slot(bridge);
+        if (first != SIZE_MAX) reusable = first;
+    }
     if (reusable == DOM_BRIDGE_NODE_LIMIT) {
         if (bridge->node_count == DOM_BRIDGE_NODE_LIMIT) {
             if (bridge->result != NULL
@@ -534,6 +582,11 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
     bridge->node_owner_document_identities[reusable] = owner;
     bridge_node_set_reusable(bridge, reusable, false);
     bridge_node_index_insert(bridge, reusable);
+    /* Tag at registration: once script holds the node, removal from its
+       tree must not change its owner. */
+    if (bridge->node_owner_tags != NULL)
+        bridge->node_owner_tags[reusable] =
+            bridge_node_owner_tag_inherited(bridge, node);
     if (bridge->result != NULL) {
         if (bridge->result->dom_handle_slots_live != SIZE_MAX) {
             bridge->result->dom_handle_slots_live++;
@@ -547,6 +600,24 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
     return bridge_node_handle(bridge, reusable);
 }
 
+/* A handle for `node` as a DOM binding returns it: 0 for no node, and a
+   RangeError, rather than a null that bootstrap code would dereference,
+   when the handle table cannot admit the node even after reclamation. */
+static JSValue bridge_throw_handles_exhausted(JSContext *context)
+{
+    return JS_ThrowRangeError(context, "DOM node handle table exhausted");
+}
+
+static JSValue bridge_node_handle_value(JSContext *context,
+                                        DomBridge *bridge,
+                                        lxb_dom_node_t *node)
+{
+    int64_t handle = js_rt_bridge_register_node(bridge, node);
+    if (handle == 0 && bridge != NULL && node != NULL)
+        return bridge_throw_handles_exhausted(context);
+    return JS_NewInt64(context, handle);
+}
+
 lxb_dom_node_t *js_rt_bridge_node_arg(JSContext *context,
                                 DomBridge *bridge, JSValueConst value)
 {
@@ -555,6 +626,25 @@ lxb_dom_node_t *js_rt_bridge_node_arg(JSContext *context,
     size_t slot = 0;
     return js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
         ? bridge->nodes[slot] : NULL;
+}
+
+static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot)
+{
+    if (bridge == NULL || bridge->wrapper_refs == NULL
+        || bridge->host == NULL || bridge->host->runtime == NULL) return;
+    JSValue *ref = &bridge->wrapper_refs[slot];
+    if (JS_IsObject(*ref)) JS_FreeValueRT(bridge->host->runtime, *ref);
+    *ref = JS_UNDEFINED;
+}
+
+/* Before the realm is freed: drop every stored reference and the table. */
+void js_rt_bridge_wrapper_refs_free(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->wrapper_refs == NULL) return;
+    for (size_t slot = 0; slot < DOM_BRIDGE_NODE_LIMIT; slot++)
+        bridge_wrapper_ref_clear(bridge, slot);
+    budget_free(bridge->budget, bridge->wrapper_refs);
+    bridge->wrapper_refs = NULL;
 }
 
 JSValue js_dom_retain_node_wrapper(JSContext *context,
@@ -581,6 +671,22 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
     if (lease == 0) lease = 1;
     bridge->node_wrapper_leases[slot] = lease;
     bridge->node_retention_flags[slot] |= BRIDGE_NODE_LIVE_WRAPPER;
+    /* The wrapper cache's WeakRef for this lease, for native getters. */
+    if (argc > 1 && JS_IsObject(argv[1])) {
+        if (bridge->wrapper_refs == NULL) {
+            bridge->wrapper_refs = budget_calloc(
+                bridge->budget, DOM_BRIDGE_NODE_LIMIT, sizeof(JSValue));
+            if (bridge->wrapper_refs != NULL)
+                for (size_t at = 0; at < DOM_BRIDGE_NODE_LIMIT; at++)
+                    bridge->wrapper_refs[at] = JS_UNDEFINED;
+        }
+        if (bridge->wrapper_refs != NULL) {
+            bridge_wrapper_ref_clear(bridge, slot);
+            bridge->wrapper_refs[slot] = JS_DupValue(context, argv[1]);
+        }
+    } else {
+        bridge_wrapper_ref_clear(bridge, slot);
+    }
     return JS_NewInt64(context, lease);
 }
 
@@ -595,6 +701,45 @@ bool bridge_node_is_connected(const lxb_dom_node_t *node)
 static size_t bridge_discard_unretained_detached_subtree(
     DomBridge *bridge, lxb_dom_node_t *root);
 static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node);
+static bool bridge_subtree_may_contain(lxb_dom_node_t *root,
+                                       const lxb_dom_node_t *node);
+
+/* Ends the live wrapper identity of `slot` and reclaims its detached
+   lifetime tree unless something else retains it. A tree that may contain
+   `keep` (a node native code is still using) is left for the wrapper's own
+   finalizer. Returns the handle slots released. */
+static size_t bridge_release_wrapper_slot(DomBridge *bridge, size_t slot,
+                                          const lxb_dom_node_t *keep)
+{
+    lxb_dom_node_t *node = bridge->nodes[slot];
+    bridge_wrapper_ref_clear(bridge, slot);
+    bridge->node_retention_flags[slot] &=
+        (unsigned char) ~BRIDGE_NODE_LIVE_WRAPPER;
+    if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_NATIVE_PIN) != 0
+        /* Parentless fragments can still be owned by a template element,
+           and Lexbor retains ordinary detached fragments in the document's
+           arena. Keep both until document retirement instead of letting a
+           JavaScript wrapper finalizer guess at native ownership. */
+        || (node->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
+            && node->parent == NULL)
+        || bridge_node_is_connected(node)) {
+        if (bridge->result != NULL
+            && bridge->result->dom_handle_connected_preserves != SIZE_MAX) {
+            bridge->result->dom_handle_connected_preserves++;
+        }
+        return 0;
+    }
+    lxb_dom_node_t *root = bridge_owned_lifetime_root(node);
+    if (keep != NULL && bridge_subtree_may_contain(root, keep)) return 0;
+    size_t released = bridge_discard_unretained_detached_subtree(
+        bridge, root);
+    if (released != 0 && bridge->result != NULL
+        && bridge->result->dom_handle_wrapper_releases != SIZE_MAX) {
+        js_rt_saturating_add_size(
+            &bridge->result->dom_handle_wrapper_releases, released);
+    }
+    return released;
+}
 
 JSValue js_dom_release_node_wrapper(JSContext *context,
                                     JSValueConst this_value,
@@ -616,35 +761,76 @@ JSValue js_dom_release_node_wrapper(JSContext *context,
         }
         return JS_FALSE;
     }
-    lxb_dom_node_t *node = bridge->nodes[slot];
-    bridge->node_retention_flags[slot] &=
-        (unsigned char) ~BRIDGE_NODE_LIVE_WRAPPER;
-    if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_NATIVE_PIN) != 0
-        /* Parentless fragments can still be owned by a template element,
-           and Lexbor retains ordinary detached fragments in the document's
-           arena. Keep both until document retirement instead of letting a
-           JavaScript wrapper finalizer guess at native ownership. */
-        || (node->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
-            && node->parent == NULL)
-        || bridge_node_is_connected(node)) {
-        if (bridge->result != NULL
-            && bridge->result->dom_handle_connected_preserves != SIZE_MAX) {
-            bridge->result->dom_handle_connected_preserves++;
-        }
-        return JS_FALSE;
+    return bridge_release_wrapper_slot(bridge, slot, NULL) != 0
+        ? JS_TRUE : JS_FALSE;
+}
+
+/* Handle slots are released by the wrapper cache's FinalizationRegistry,
+   whose cleanup runs only as a job between tasks. One long synchronous
+   script can therefore fill the table with wrappers that have died but not
+   been finalized. When registration finds the table full, do the release
+   those cleanup jobs would do for every wrapper whose WeakRef has cleared,
+   collecting first when that alone frees too little (a wrapper in a cycle
+   clears only at a collection). The queued cleanup job later finds a
+   retired handle or an ended lease and does nothing. The sweep is linear in
+   the table; a collection that frees little backs off exponentially within
+   one entry into JavaScript, so a genuinely full table cannot turn every
+   refused registration into a collection. */
+#define BRIDGE_RECLAIM_ENOUGH (DOM_BRIDGE_NODE_LIMIT / 64u)
+#define BRIDGE_RECLAIM_BACKOFF_MAX 1024u
+
+static size_t bridge_release_dead_wrappers(DomBridge *bridge,
+                                           const lxb_dom_node_t *keep)
+{
+    JSContext *context = bridge->host->context;
+    size_t released = 0;
+    /* Release callbacks are JavaScript and may grow the table. */
+    for (size_t slot = 0; slot < bridge->node_count; slot++) {
+        if (bridge->wrapper_refs == NULL) break;
+        if ((bridge->node_retention_flags[slot]
+             & BRIDGE_NODE_LIVE_WRAPPER) == 0
+            || bridge->nodes[slot] == NULL
+            || !JS_IsObject(bridge->wrapper_refs[slot])) continue;
+        JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
+        bool live = JS_IsObject(wrapper);
+        JS_FreeValue(context, wrapper);
+        if (!live) released += bridge_release_wrapper_slot(bridge, slot, keep);
     }
-    lxb_dom_node_t *root = bridge_owned_lifetime_root(node);
-    size_t released = bridge_discard_unretained_detached_subtree(
-        bridge, root);
-    if (released != 0) {
-        if (bridge->result != NULL
-            && bridge->result->dom_handle_wrapper_releases != SIZE_MAX) {
-            js_rt_saturating_add_size(
-                &bridge->result->dom_handle_wrapper_releases, released);
+    return released;
+}
+
+static void bridge_reclaim_node_slots(DomBridge *bridge,
+                                      const lxb_dom_node_t *keep)
+{
+    if (bridge->host == NULL || bridge->host->runtime == NULL
+        || bridge->host->context == NULL || bridge->wrapper_refs == NULL
+        || bridge->node_reclaim_active) return;
+    bridge->node_reclaim_active = true;
+    size_t released = bridge_release_dead_wrappers(bridge, keep);
+    if (released < BRIDGE_RECLAIM_ENOUGH) {
+        if (bridge->node_reclaim_gc_skip != 0) {
+            bridge->node_reclaim_gc_skip--;
+        } else {
+            /* As at every explicit full collection: one pass breaks a
+               wrapper self-cycle and the next clears its WeakRef. */
+            JS_RunGC(bridge->host->runtime);
+            JS_RunGC(bridge->host->runtime);
+            released += bridge_release_dead_wrappers(bridge, keep);
+            if (released < BRIDGE_RECLAIM_ENOUGH) {
+                uint32_t backoff = bridge->node_reclaim_gc_backoff == 0
+                    ? 8u : 2u * (uint32_t) bridge->node_reclaim_gc_backoff;
+                if (backoff > BRIDGE_RECLAIM_BACKOFF_MAX)
+                    backoff = BRIDGE_RECLAIM_BACKOFF_MAX;
+                bridge->node_reclaim_gc_backoff = (uint16_t) backoff;
+                bridge->node_reclaim_gc_skip = (uint16_t) backoff;
+            }
         }
-        return JS_TRUE;
     }
-    return JS_FALSE;
+    if (released >= BRIDGE_RECLAIM_ENOUGH) {
+        bridge->node_reclaim_gc_skip = 0;
+        bridge->node_reclaim_gc_backoff = 0;
+    }
+    bridge->node_reclaim_active = false;
 }
 
 typedef enum {
@@ -705,6 +891,16 @@ static BridgeSubtreeSearchResult bridge_live_subtree_contains_node(
         root, 0, bridge_subtree_visit_is_candidate, (void *) candidate);
 }
 
+/* Whether `node` may lie in `root`'s lifetime tree; a walk a bound cut
+   short counts as a possible match. */
+static bool bridge_subtree_may_contain(lxb_dom_node_t *root,
+                                       const lxb_dom_node_t *node)
+{
+    return root == NULL || root == node
+        || bridge_live_subtree_contains_node(root, node)
+               != BRIDGE_SUBTREE_NOT_FOUND;
+}
+
 static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node)
 {
     if (node == NULL) return NULL;
@@ -735,6 +931,9 @@ static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node)
 typedef struct {
     const DomBridge *bridge;
     unsigned char *retire_slots;
+    /* The marked slot range, so retirement need not scan the table. */
+    size_t first_slot;
+    size_t last_slot;
 } BridgeSubtreeHandleScan;
 
 /* Marks each handle slot inside the subtree for retirement; stops at the
@@ -746,6 +945,8 @@ static bool bridge_subtree_visit_handles(void *opaque, lxb_dom_node_t *node)
     if (slot == SIZE_MAX) return false;
     if (scan->bridge->node_retention_flags[slot] != 0) return true;
     scan->retire_slots[slot / 8u] |= (unsigned char) (1u << (slot % 8u));
+    if (slot < scan->first_slot) scan->first_slot = slot;
+    if (slot > scan->last_slot) scan->last_slot = slot;
     return false;
 }
 
@@ -756,7 +957,9 @@ static size_t bridge_discard_unretained_detached_subtree(
     /* One walk finds every handle inside the subtree through the pointer
        index; any still-retained identity keeps the whole subtree. */
     unsigned char retire_slots[(DOM_BRIDGE_NODE_LIMIT + 7u) / 8u] = {0};
-    BridgeSubtreeHandleScan handle_scan = { bridge, retire_slots };
+    BridgeSubtreeHandleScan handle_scan = {
+        bridge, retire_slots, SIZE_MAX, 0
+    };
     if (bridge_live_subtree_visit(
             root, 0, bridge_subtree_visit_handles, &handle_scan)
         != BRIDGE_SUBTREE_NOT_FOUND) return 0;
@@ -797,6 +1000,13 @@ static size_t bridge_discard_unretained_detached_subtree(
             mutations_retired = true;
         }
     }
+    bool overflow_root_retired = false;
+    for (size_t i = 0; i < bridge->mutations.overflow_root_count; i++) {
+        BridgeSubtreeSearchResult result = bridge_live_subtree_contains_node(
+            root, bridge->mutations.overflow_roots[i]);
+        if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
+        if (result == BRIDGE_SUBTREE_FOUND) overflow_root_retired = true;
+    }
     BridgeSubtreeSearchResult declared_marker =
         bridge->document->declared_video_card_node == NULL
             ? BRIDGE_SUBTREE_NOT_FOUND
@@ -832,6 +1042,11 @@ static size_t bridge_discard_unretained_detached_subtree(
              & (unsigned char) (1u << (i % 8u))) == 0) continue;
         bridge->mutations.records[i].scope = NULL;
     }
+    if (overflow_root_retired) {
+        /* The pointer dies; so does the scoped overflow fallback. */
+        bridge->mutations.overflow_root_count = 0;
+        bridge->mutations.overflow_roots_lost = true;
+    }
     if (mutations_retired) {
         for (size_t i = 0; i < mutation_count; i++) {
             if ((mutation_slots[i / 8u]
@@ -845,11 +1060,13 @@ static size_t bridge_discard_unretained_detached_subtree(
            change. */
         if (bridge->node_retirement == NULL) {
             bridge->mutations.overflowed = true;
+            bridge->mutations.retirement_unobserved = true;
         }
     }
     js_rt_script_element_states_purge_marked(bridge, script_states);
     size_t released = 0;
-    for (size_t i = 0; i < bridge->node_count; i++) {
+    for (size_t i = handle_scan.first_slot;
+         i <= handle_scan.last_slot && i < bridge->node_count; i++) {
         if ((retire_slots[i / 8u]
              & (unsigned char) (1u << (i % 8u))) != 0) {
             /* A detached canvas context can be collected without an explicit
@@ -869,11 +1086,16 @@ static size_t bridge_discard_unretained_detached_subtree(
     if (bridge->node_retirement != NULL) {
         bridge->node_retirement(bridge->node_retirement_opaque, root);
     }
+    document_parser_insertions_discard_subtree(bridge->document, root);
+    /* Detached: no style can change, and the removal walk is wasted. */
+    document_style_quiet_begin();
     lxb_dom_node_destroy_deep(root);
+    document_style_quiet_end();
     /* Cleanup callbacks are JavaScript. Run them only after native teardown
        and handle retirement are complete, so author reentrancy cannot destroy
        the subtree a second time. */
-    bridge_notify_pending_node_retirements(bridge, retire_slots);
+    bridge_notify_pending_node_retirements(
+        bridge, retire_slots, handle_scan.first_slot, handle_scan.last_slot);
     return released;
 }
 
@@ -908,7 +1130,10 @@ static void bridge_detach_and_discard_children(
                 memcpy(child_name, name, name_length);
             }
         }
+        /* Published by the caller's INNER_HTML note. */
+        document_style_quiet_begin();
         lxb_dom_node_remove(child);
+        document_style_quiet_end();
         /* A JavaScript-held descendant keeps the complete detached subtree
            alive, including otherwise-unwrapped ancestors.  That preserves
            parent/sibling relationships and lets the subtree be reinserted.
@@ -1169,7 +1394,7 @@ JSValue js_find_stable_node(JSContext *context,
             lxb_dom_interface_node(bridge->document->html), wanted,
             &ordinal, 0);
         if (node == NULL || (unsigned) node->type != wanted_type) node = NULL;
-        return JS_NewInt64(context, js_rt_bridge_register_node(bridge, node));
+        return bridge_node_handle_value(context, bridge, node);
     }
     size_t ordinal = 0, name_length = 0;
     lxb_dom_node_t *node = bridge_element_at_ordinal(
@@ -1177,7 +1402,7 @@ JSValue js_find_stable_node(JSContext *context,
     const char *name = document_element_name(node, &name_length);
     if (name == NULL || strlen(tag_name) != name_length
         || strncasecmp(name, tag_name, name_length) != 0) node = NULL;
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, node));
+    return bridge_node_handle_value(context, bridge, node);
 }
 
 static bool selector_list_matches(lxb_dom_node_t *node,
@@ -1442,6 +1667,31 @@ static bool bridge_mutation_subtree_contains_image(
     return false;
 }
 
+/* Only a document holding inline SVG rasters has a presentation-only raster
+   to go stale; without one, colour and custom-property churn refreshes
+   nothing and must not pay for an image refresh. */
+static bool bridge_mutation_has_inline_svg_rasters(const DomBridge *bridge)
+{
+    return bridge->images != NULL
+        && (bridge->images->stats.inline_svg_rasterized != 0
+            || bridge->images->stats.inline_svg_refresh_reused != 0);
+}
+
+/* Inline-style properties that can change what an SVG beneath resolves for
+   its raster (currentColor, em sizes, inherited presentation values, a
+   custom property one of those reads). */
+static bool bridge_mutation_style_property_affects_svg_raster(
+    const char *name, size_t length)
+{
+    if (name == NULL) return false;
+    if (length > 2 && name[0] == '-' && name[1] == '-') return true;
+    return bridge_mutation_name_equal(name, length, "color")
+        || bridge_mutation_name_equal(name, length, "font")
+        || bridge_mutation_name_equal(name, length, "font-size")
+        || (length >= 4 && strncasecmp(name, "fill", 4) == 0)
+        || (length >= 6 && strncasecmp(name, "stroke", 6) == 0);
+}
+
 static bool bridge_mutation_inside_style(lxb_dom_node_t *node)
 {
     for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
@@ -1457,11 +1707,12 @@ typedef enum {
     BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT = 1u << 2
 } BridgeMutationResourceFlags;
 
-static bool bridge_mutation_link_is_stylesheet(lxb_dom_node_t *node)
+static bool bridge_mutation_link_is_style_resource(lxb_dom_node_t *node)
 {
     size_t length = 0;
     const char *rel = document_attribute(node, "rel", &length);
     if (rel == NULL) return false;
+    bool preload = false;
     size_t at = 0;
     while (at < length) {
         while (at < length && isspace((unsigned char) rel[at])) at++;
@@ -1470,8 +1721,13 @@ static bool bridge_mutation_link_is_stylesheet(lxb_dom_node_t *node)
         if (at - start == sizeof("stylesheet") - 1
             && strncasecmp(rel + start, "stylesheet",
                            sizeof("stylesheet") - 1) == 0) return true;
+        if (at - start == sizeof("preload") - 1
+            && strncasecmp(rel + start, "preload",
+                           sizeof("preload") - 1) == 0) preload = true;
     }
-    return false;
+    const char *as = document_attribute(node, "as", &length);
+    return preload && as != NULL && length == 5u
+        && strncasecmp(as, "style", 5u) == 0;
 }
 
 static BridgeMutationResourceFlags bridge_mutation_resource_attribute(
@@ -1503,13 +1759,15 @@ static BridgeMutationResourceFlags bridge_mutation_resource_attribute(
     if (bridge_mutation_node_name_is(node, "link")) {
         /* A rel transition may remove the sheet which was active before the
            mutation, so it cannot be classified from the new value alone. */
-        if (bridge_mutation_name_equal(name, length, "rel")) {
+        if (bridge_mutation_name_equal(name, length, "rel")
+            || bridge_mutation_name_equal(name, length, "as")) {
             return BRIDGE_MUTATION_RESOURCE_STYLESHEET;
         }
-        return bridge_mutation_link_is_stylesheet(node)
+        return bridge_mutation_link_is_style_resource(node)
                && (bridge_mutation_name_equal(name, length, "href")
                    || bridge_mutation_name_equal(name, length, "media")
                    || bridge_mutation_name_equal(name, length, "crossorigin")
+                   || bridge_mutation_name_equal(name, length, "integrity")
                    || bridge_mutation_name_equal(name, length, "disabled"))
             ? BRIDGE_MUTATION_RESOURCE_STYLESHEET
             : BRIDGE_MUTATION_RESOURCE_NONE;
@@ -1592,7 +1850,7 @@ static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             bool link = bridge_mutation_name_equal(tag, tag_length, "link");
             bool stylesheet_link =
-                link && bridge_mutation_link_is_stylesheet(node);
+                link && bridge_mutation_link_is_style_resource(node);
             if (stylesheet_link) {
                 result |= BRIDGE_MUTATION_RESOURCE_STYLESHEET;
             }
@@ -1613,8 +1871,8 @@ static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
                  && i < sizeof(attributes) / sizeof(attributes[0]); i++) {
                 /* A connected rel mutation is destructive because its old
                    value may have removed a stylesheet. For an inserted
-                   subtree the final rel is fully known; preload, icon and
-                   modulepreload links must not masquerade as stylesheets. */
+                   subtree the final rel is fully known; only stylesheets
+                   and style preloads belong to this resource lane. */
                 if (!stylesheet_link && link
                     && bridge_mutation_name_equal(
                         attributes[i], strlen(attributes[i]), "rel")) {
@@ -1658,6 +1916,12 @@ static bool bridge_mutation_record_equal(
     }
     size_t stored_length = strlen(record->attribute);
     if (attribute == NULL) return stored_length == 0;
+    /* Renderer records retain a conservative dependency prefix, not the
+       author-visible attribute name. Compare the same bounded prefix we
+       store: otherwise every write to a long name occupies another slot.
+       Resource flags are still accumulated from every full-name mutation. */
+    if (attribute_length >= sizeof(record->attribute))
+        attribute_length = sizeof(record->attribute) - 1u;
     if (stored_length != attribute_length) return false;
     for (size_t i = 0; i < attribute_length; i++) {
         if (record->attribute[i]
@@ -1666,32 +1930,140 @@ static bool bridge_mutation_record_equal(
     return true;
 }
 
+static bool bridge_node_within(const lxb_dom_node_t *node,
+                               const lxb_dom_node_t *scope);
+
+/* Adds `root` to the overflow roots, merged past the limit into the
+   deepest ancestor it shares with one of them. */
+static void bridge_mutation_overflow_add(ScriptMutationJournal *journal,
+                                         lxb_dom_node_t *root)
+{
+    for (unsigned merges = 0; merges <= SCRIPT_MUTATION_OVERFLOW_ROOT_LIMIT;
+         merges++) {
+        for (size_t i = 0; i < journal->overflow_root_count; i++)
+            if (bridge_node_within(root, journal->overflow_roots[i])) return;
+        /* Roots the new one contains go. */
+        size_t kept = 0;
+        for (size_t i = 0; i < journal->overflow_root_count; i++)
+            if (!bridge_node_within(journal->overflow_roots[i], root))
+                journal->overflow_roots[kept++] = journal->overflow_roots[i];
+        journal->overflow_root_count = (uint8_t) kept;
+        if (kept < SCRIPT_MUTATION_OVERFLOW_ROOT_LIMIT) {
+            journal->overflow_roots[journal->overflow_root_count++] = root;
+            return;
+        }
+        size_t best = 0, best_depth = 0;
+        lxb_dom_node_t *best_ancestor = NULL;
+        for (size_t i = 0; i < kept; i++) {
+            lxb_dom_node_t *common = journal->overflow_roots[i];
+            while (common != NULL && !bridge_node_within(root, common))
+                common = common->parent;
+            size_t depth = 0;
+            for (lxb_dom_node_t *at = common; at != NULL; at = at->parent)
+                depth++;
+            if (common != NULL && common->type == LXB_DOM_NODE_TYPE_ELEMENT
+                && (best_ancestor == NULL || depth > best_depth)) {
+                best = i;
+                best_depth = depth;
+                best_ancestor = common;
+            }
+        }
+        if (best_ancestor == NULL) break;
+        journal->overflow_roots[best] =
+            journal->overflow_roots[--journal->overflow_root_count];
+        root = best_ancestor;
+    }
+    journal->overflow_roots_lost = true;
+}
+
+/* Where a change the full journal cannot record is contained: the
+   subtree of the element's parent (sibling and :has() reach included),
+   or for a tree or text change of its parent's parent (the parent's own
+   emptiness and position tests too). */
+static void bridge_mutation_overflow_root(ScriptMutationJournal *journal,
+                                          ScriptMutationKind kind,
+                                          lxb_dom_node_t *node)
+{
+    if (journal->overflow_roots_lost) return;
+    lxb_dom_node_t *root = node == NULL ? NULL : node->parent;
+    if (root != NULL && (kind == SCRIPT_MUTATION_CHILD_LIST
+                         || kind == SCRIPT_MUTATION_HEAD_SCRIPT
+                         || kind == SCRIPT_MUTATION_TEXT))
+        root = root->parent;
+    if (root != NULL && root->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+        /* The change is at the top: the document element's subtree. */
+        root = NULL;
+        for (lxb_dom_node_t *at = node; at != NULL; at = at->parent)
+            if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+                && at->parent != NULL
+                && at->parent->type == LXB_DOM_NODE_TYPE_DOCUMENT) root = at;
+    }
+    if (root == NULL || !bridge_node_is_connected(root)) {
+        journal->overflow_roots_lost = true;
+        return;
+    }
+    bridge_mutation_overflow_add(journal, root);
+}
+
 static void bridge_mutation_journal_append(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     const char *attribute, size_t attribute_length,
-    const uint32_t *changed_tokens, size_t changed_token_count)
+    const uint32_t *changed_tokens, size_t changed_token_count,
+    bool relational, uint64_t has_entries, uint32_t has_serial)
 {
     ScriptMutationJournal *journal = &bridge->mutations;
+    if (has_serial != 0) {
+        if (journal->has_serial == 0) journal->has_serial = has_serial;
+        else if (journal->has_serial != has_serial)
+            journal->has_serial_mixed = true;
+    }
     for (size_t reverse = journal->count; reverse != 0; reverse--) {
         ScriptMutationRecord *record = &journal->records[reverse - 1];
         if (bridge_mutation_record_equal(
                 record, kind, node, attribute, attribute_length)) {
+            record->relational |= relational;
+            record->has_entries |= has_serial == 0 ? UINT64_MAX : has_entries;
             /* Coalescing the node/attribute must retain every dependency
                changed during this turn, not just the first write's tokens. */
             if (changed_tokens == NULL
                 || changed_token_count > SCRIPT_MUTATION_TOKEN_LIMIT) {
                 record->changed_tokens_exact = false;
             } else if (record->changed_tokens_exact) {
+                size_t count = record->changed_token_count;
+                const uint32_t *run = journal->tokens
+                    + record->changed_token_offset;
+                size_t added = 0;
+                uint32_t fresh[SCRIPT_MUTATION_TOKEN_LIMIT];
                 for (size_t i = 0; i < changed_token_count; i++) {
-                    size_t at = 0;
-                    while (at < record->changed_token_count
-                           && record->changed_tokens[at] != changed_tokens[i]) at++;
-                    if (at < record->changed_token_count) continue;
-                    if (at == SCRIPT_MUTATION_TOKEN_LIMIT) {
+                    bool present = false;
+                    for (size_t at = 0; at < count && !present; at++)
+                        present = run[at] == changed_tokens[i];
+                    for (size_t at = 0; at < added && !present; at++)
+                        present = fresh[at] == changed_tokens[i];
+                    if (!present) fresh[added++] = changed_tokens[i];
+                }
+                if (added != 0) {
+                    bool at_end = (size_t) record->changed_token_offset
+                        + count == journal->token_count;
+                    size_t start = at_end ? record->changed_token_offset
+                                          : journal->token_count;
+                    if (count + added > SCRIPT_MUTATION_TOKEN_LIMIT
+                        || start + count + added
+                               > SCRIPT_MUTATION_TOKEN_POOL) {
                         record->changed_tokens_exact = false;
-                        break;
+                    } else {
+                        /* A run left behind by relocation stays unused
+                           until the journal is consumed. */
+                        if (!at_end)
+                            memmove(journal->tokens + start, run,
+                                    count * sizeof(*run));
+                        memcpy(journal->tokens + start + count, fresh,
+                               added * sizeof(*fresh));
+                        record->changed_token_offset = (uint16_t) start;
+                        record->changed_token_count =
+                            (uint8_t) (count + added);
+                        journal->token_count = start + count + added;
                     }
-                    record->changed_tokens[record->changed_token_count++] = changed_tokens[i];
                 }
             }
             if (!record->changed_tokens_exact) record->changed_token_count = 0;
@@ -1700,6 +2072,7 @@ static void bridge_mutation_journal_append(
     }
     if (journal->count >= SCRIPT_MUTATION_JOURNAL_LIMIT) {
         journal->overflowed = true;
+        bridge_mutation_overflow_root(journal, kind, node);
         /* Records beyond the fixed journal cannot be independently audited,
            so retain the old whole-document fingerprint oracle. */
         journal->conservative_resource_scan = true;
@@ -1708,6 +2081,8 @@ static void bridge_mutation_journal_append(
     ScriptMutationRecord *record = &journal->records[journal->count++];
     record->kind = kind;
     record->node = node;
+    record->relational = relational;
+    record->has_entries = has_serial == 0 ? UINT64_MAX : has_entries;
     record->inserted_from_detached = false;
     record->scope = NULL;
     record->owner_document_identity = js_rt_node_owner_identity(node);
@@ -1721,15 +2096,46 @@ static void bridge_mutation_journal_append(
     }
     record->attribute[copy_length] = '\0';
     record->changed_tokens_exact = changed_tokens != NULL
-        && changed_token_count <= SCRIPT_MUTATION_TOKEN_LIMIT;
+        && changed_token_count <= SCRIPT_MUTATION_TOKEN_LIMIT
+        && journal->token_count + changed_token_count
+               <= SCRIPT_MUTATION_TOKEN_POOL;
     record->changed_token_count = 0;
+    record->changed_token_offset = (uint16_t) journal->token_count;
     if (record->changed_tokens_exact) {
         record->changed_token_count = (uint8_t) changed_token_count;
-        for (size_t i = 0; i < changed_token_count; i++) {
-            record->changed_tokens[i] = changed_tokens[i];
-        }
+        memcpy(journal->tokens + journal->token_count, changed_tokens,
+               changed_token_count * sizeof(*changed_tokens));
+        journal->token_count += changed_token_count;
     }
 }
+
+static void bridge_computed_style_note_mutation(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length, bool relational,
+    const uint32_t *changed_tokens, size_t changed_token_count);
+
+/* Whether a mutation can change which form owns a control, or whether an
+   element is a listed control at all (form.elements): tree changes, and the
+   id, form and type attributes; an unnamed or internal (custom-element
+   state) attribute stays conservative. Class, style and the rest cannot. */
+static bool bridge_mutation_moves_form_controls(ScriptMutationKind kind,
+                                                const char *attribute,
+                                                size_t length)
+{
+    if (kind == SCRIPT_MUTATION_INLINE_STYLE
+        || kind == SCRIPT_MUTATION_CANVAS) return false;
+    if (kind != SCRIPT_MUTATION_ATTRIBUTE || attribute == NULL) return true;
+    return (length == 2 && strncasecmp(attribute, "id", 2) == 0)
+        || (length == 4 && (strncasecmp(attribute, "form", 4) == 0
+                            || strncasecmp(attribute, "type", 4) == 0))
+        || (length > 14 && strncasecmp(attribute, "data-tilefinch", 14) == 0);
+}
+
+static void bridge_mutated_summarized(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length,
+    bool relational_selector_sensitive, const uint32_t *changed_tokens,
+    size_t changed_token_count, uint64_t has_entries, uint32_t has_serial);
 
 static void bridge_mutated_with_relational(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
@@ -1737,7 +2143,27 @@ static void bridge_mutated_with_relational(
     bool relational_selector_sensitive, const uint32_t *changed_tokens,
     size_t changed_token_count)
 {
+    bridge_mutated_summarized(bridge, kind, node, attribute,
+                              attribute_length, relational_selector_sensitive,
+                              changed_tokens, changed_token_count,
+                              UINT64_MAX, 0);
+}
+
+/* has_entries/has_serial: the :has() entries a tree or text change can
+   move (stylesheet_tree_change_has_entries), kept on its record. */
+static void bridge_mutated_summarized(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length,
+    bool relational_selector_sensitive, const uint32_t *changed_tokens,
+    size_t changed_token_count, uint64_t has_entries, uint32_t has_serial)
+{
     if (bridge == NULL) return;
+    /* Every script mutation, connected or not, invalidates DOM-derived
+       caches kept in the realm (attribute lists). */
+    bridge->dom_version++;
+    if (bridge_mutation_moves_form_controls(kind, attribute,
+                                            attribute_length))
+        bridge->dom_structure_version++;
     /* Mutating a detached construction tree cannot affect layout or the
        connected resource graph. Its eventual insertion is represented by
        one child-list record over the complete subtree. Besides avoiding
@@ -1750,6 +2176,10 @@ static void bridge_mutated_with_relational(
        keeps its already-bound selection. */
     media_declared_video_cache_destroy(bridge->document);
     document_note_connected_mutation(bridge->document);
+    bridge_computed_style_note_mutation(bridge, kind, node, attribute,
+                                        attribute_length,
+                                        relational_selector_sensitive,
+                                        changed_tokens, changed_token_count);
     /* Attribute and tree mutations can change which connected <base href> is
        first. Invalidating conservatively keeps the mutation fast and avoids a
        second subtree walk on the PSP hot path. */
@@ -1780,9 +2210,13 @@ static void bridge_mutated_with_relational(
     ScriptMutationJournal *journal = &bridge->mutations;
     bridge_mutation_journal_append(
         bridge, kind, node, attribute, attribute_length, changed_tokens,
-        changed_token_count);
+        changed_token_count, relational_selector_sensitive, has_entries,
+        has_serial);
 
     bool resource_rebuild = false;
+    /* resource_rebuild's causes: a stylesheet source and/or an image. */
+    bool stylesheet_cause = false;
+    bool image_rebuild = false;
     bool image_resource_scan = false;
     bool image_resource_refresh = false;
     bool conservative_scan = false;
@@ -1790,6 +2224,7 @@ static void bridge_mutated_with_relational(
     case SCRIPT_MUTATION_TEXT:
         if (node == NULL) conservative_scan = true;
         else resource_rebuild = bridge_mutation_inside_style(node);
+        stylesheet_cause = resource_rebuild;
         break;
     case SCRIPT_MUTATION_INLINE_STYLE:
         /* The prior declaration may have owned an image even when the new
@@ -1797,6 +2232,20 @@ static void bridge_mutated_with_relational(
            ordinary geometry/color declarations are layout-only. */
         resource_rebuild = bridge_mutation_style_property_is_resource(
             attribute, attribute_length);
+        image_rebuild = resource_rebuild;
+        /* A custom property never changes the stylesheet: at most it lets
+           a var() image declaration resolve to a new URL. Discover that
+           additively, and only when such a declaration can exist (the
+           sheet uses var() in one, or this element's own inline style may);
+           a no-longer-used image stays owned until teardown. */
+        if (resource_rebuild && attribute != NULL && attribute_length >= 2u
+            && attribute[0] == '-' && attribute[1] == '-') {
+            resource_rebuild = false;
+            image_resource_scan = (bridge->stylesheet != NULL
+                    && bridge->stylesheet->image_declarations_use_variables)
+                || bridge_mutation_inline_style_has_resource(node);
+            break;
+        }
         /* Visibility changes can expose a background URL which the initial
            image walk correctly skipped under display:none/hidden.  Re-scan
            only when this element's final inline declaration actually owns a
@@ -1816,16 +2265,29 @@ static void bridge_mutated_with_relational(
         BridgeMutationResourceFlags flags =
             bridge_mutation_resource_attribute(
                 node, attribute, attribute_length);
-        resource_rebuild =
-            bridge_mutation_name_equal(
-                attribute, attribute_length, "style")
-            || bridge_mutation_node_name_is(node, "style")
+        /* A style attribute is an inline declaration block, not a sheet:
+           a URL (or var() that may resolve to one) in the new value needs
+           additive image discovery, never a stylesheet rebuild. */
+        bool style_attribute = bridge_mutation_name_equal(
+            attribute, attribute_length, "style")
+            && !bridge_mutation_node_name_is(node, "style");
+        if (style_attribute)
+            image_resource_scan =
+                bridge_mutation_inline_style_has_resource(node);
+        resource_rebuild = bridge_mutation_node_name_is(node, "style")
             || (flags & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0;
+        stylesheet_cause = resource_rebuild;
         if ((flags & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0) {
-            if (bridge_mutation_node_name_is(node, "img")) {
+            /* An icon swap (<use href> inside an inline <svg>) changes only
+               that SVG's raster, which the refresh lane re-resolves from its
+               root, sprite fetch included; outside an <svg> a <use> renders
+               nothing. Neither needs the sheet or other images rebuilt. */
+            if (bridge_mutation_node_name_is(node, "img")
+                || bridge_mutation_node_name_is(node, "use")) {
                 image_resource_refresh = true;
             } else {
                 resource_rebuild = true;
+                image_rebuild = true;
             }
         }
         break;
@@ -1838,6 +2300,11 @@ static void bridge_mutated_with_relational(
             && (bridge_mutation_inside_style(node)
                 || (subtree & (BRIDGE_MUTATION_RESOURCE_IMAGE
                                | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0);
+        image_rebuild = node != NULL
+            && (subtree & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0;
+        stylesheet_cause = node != NULL
+            && (bridge_mutation_inside_style(node)
+                || (subtree & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0);
         /* innerHTML may have removed the last resource, which cannot be
            inferred by walking only the replacement subtree. */
         conservative_scan = !resource_rebuild
@@ -1856,9 +2323,13 @@ static void bridge_mutated_with_relational(
             resource_rebuild =
                 (subtree & (BRIDGE_MUTATION_RESOURCE_IMAGE
                             | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0;
+            image_rebuild = (subtree & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0;
+            stylesheet_cause =
+                (subtree & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0;
         } else {
             resource_rebuild =
                 (subtree & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0;
+            stylesheet_cause = resource_rebuild;
             image_resource_scan =
                 (subtree & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0;
         }
@@ -1877,7 +2348,14 @@ static void bridge_mutated_with_relational(
         break;
     }
     /* A class/id change whose tokens no rule able to affect display,
-       visibility or an image depends on cannot reveal or hide an image. */
+       visibility or an image depends on cannot reveal or hide an image.
+       With inline SVG rasters present it must also leave what those SVGs
+       resolve alone: a change inside one always refreshes it, one above
+       one only when a colour, font-size, size, presentation or
+       custom-property rule depends on its tokens (checked last, after the
+       bounded subtree walk has found an SVG to refresh). */
+    bool svg_rasters = node != NULL
+        && bridge_mutation_has_inline_svg_rasters(bridge);
     bool identity_bounded = kind == SCRIPT_MUTATION_ATTRIBUTE
         && changed_tokens != NULL && bridge->stylesheet != NULL
 #ifndef TILEFINCH_NO_TRACE
@@ -1886,7 +2364,13 @@ static void bridge_mutated_with_relational(
         && (bridge_mutation_name_equal(attribute, attribute_length, "class")
             || bridge_mutation_name_equal(attribute, attribute_length, "id"))
         && !stylesheet_tokens_may_affect_discovery(
-               bridge->stylesheet, changed_tokens, changed_token_count);
+               bridge->stylesheet, changed_tokens, changed_token_count)
+        && !(svg_rasters
+             && (bridge_mutation_inside_svg(node)
+                 || (bridge_mutation_subtree_contains_image(bridge, node)
+                     && stylesheet_tokens_may_affect_svg_raster(
+                            bridge->stylesheet, changed_tokens,
+                            changed_token_count))));
     bool descendant_image_sensitive =
         node != NULL && !identity_bounded
         && (bridge_mutation_inside_svg(node)
@@ -1898,16 +2382,22 @@ static void bridge_mutated_with_relational(
                         attribute, attribute_length, "id")
                     || bridge_mutation_name_equal(
                         attribute, attribute_length, "style")
-                    || bridge_mutation_name_equal(
-                        attribute, attribute_length, "color")
+                    || (kind == SCRIPT_MUTATION_ATTRIBUTE
+                        && bridge_mutation_name_equal(
+                               attribute, attribute_length, "color"))
                     || bridge_mutation_name_equal(
                         attribute, attribute_length, "hidden")
                     || (kind == SCRIPT_MUTATION_INLINE_STYLE
                         && (bridge_mutation_name_equal(attribute, attribute_length, "display")
                             || bridge_mutation_name_equal(attribute, attribute_length, "visibility")
-                            || bridge_mutation_name_equal(attribute, attribute_length, "opacity"))))
+                            || bridge_mutation_name_equal(attribute, attribute_length, "opacity")
+                            || (svg_rasters
+                                && bridge_mutation_style_property_affects_svg_raster(
+                                       attribute, attribute_length)))))
                && bridge_mutation_subtree_contains_image(bridge, node)));
     journal->resource_rebuild_required |= resource_rebuild;
+    journal->image_rebuild_required |= resource_rebuild && image_rebuild;
+    journal->stylesheet_rebuild_required |= resource_rebuild && stylesheet_cause;
     journal->image_resource_scan_required |= image_resource_scan;
     journal->image_resource_refresh_required |=
         image_resource_refresh || descendant_image_sensitive;
@@ -1962,7 +2452,7 @@ void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
         if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
         bridge_mutation_journal_append(
             bridge, SCRIPT_MUTATION_CANVAS, node,
-            paint, sizeof(paint) - 1u, NULL, 0);
+            paint, sizeof(paint) - 1u, NULL, 0, false, UINT64_MAX, 0);
         return;
     }
     bridge_mutated_with_relational(
@@ -1976,9 +2466,24 @@ static void bridge_mutated(DomBridge *bridge, ScriptMutationKind kind,
                            const char *attribute,
                            size_t attribute_length)
 {
-    /* Callers without exact pre-mutation state remain conservative. */
-    bridge_mutated_with_relational(
-        bridge, kind, node, attribute, attribute_length, true, NULL, 0);
+    /* Callers without exact pre-mutation state remain conservative. A child
+       inserted (after the fact) or about to be removed, and a text node's
+       data, are classified against the sheet's :has() rules instead; a
+       text write that replaced an element's children cannot be. */
+    bool relational = true;
+    uint64_t has_entries = UINT64_MAX;
+    uint32_t has_serial = 0;
+    if (bridge != NULL && node != NULL && node->parent != NULL
+        && (kind == SCRIPT_MUTATION_CHILD_LIST
+            || kind == SCRIPT_MUTATION_HEAD_SCRIPT
+            || (kind == SCRIPT_MUTATION_TEXT
+                && node->type != LXB_DOM_NODE_TYPE_ELEMENT)))
+        relational = stylesheet_tree_change_has_entries(
+            bridge->stylesheet, node, node->parent, &has_entries,
+            &has_serial);
+    bridge_mutated_summarized(
+        bridge, kind, node, attribute, attribute_length, relational, NULL, 0,
+        has_entries, has_serial);
 }
 
 JSValue js_dom_body(JSContext *context, JSValueConst this_value,
@@ -1992,7 +2497,7 @@ JSValue js_dom_body(JSContext *context, JSValueConst this_value,
                bridge->node_visibility_opaque,
                SCRIPT_NODE_VISIBILITY_DOCUMENT_BODY_SECTION,
                0, 0, LXB_DOM_NODE_TYPE_ELEMENT)) body = NULL;
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, body));
+    return bridge_node_handle_value(context, bridge, body);
 }
 
 JSValue js_dom_document_element(JSContext *context,
@@ -2004,7 +2509,7 @@ JSValue js_dom_document_element(JSContext *context,
     lxb_dom_node_t *root = lxb_dom_interface_node(bridge->document->html);
     lxb_dom_node_t *html = selector_query(
         bridge, root, root, "html", 4);
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, html));
+    return bridge_node_handle_value(context, bridge, html);
 }
 
 JSValue js_dom_query(JSContext *context, JSValueConst this_value,
@@ -2027,12 +2532,17 @@ JSValue js_dom_query(JSContext *context, JSValueConst this_value,
                                              selector, length)
                             : NULL;
     JS_FreeCString(context, selector);
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, found));
+    return bridge_node_handle_value(context, bridge, found);
 }
 
-#define DOM_QUERY_RESULT_LIMIT 128
+/* Results one querySelectorAll or descendant walk may return. Every result
+   takes a node handle slot, so stay well inside the handle table; 128
+   silently truncated ordinary pages (chatgpt.com's partial-update polyfill
+   walks every comment in the document to find its answer's targets). */
+#define DOM_QUERY_RESULT_LIMIT (SCRIPT_DOM_HANDLE_SLOT_CAPACITY / 2u)
 
-static void query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
+/* False when a match could not be given a handle. */
+static bool query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
                             const lxb_dom_node_t *boundary,
                             const char *selector, size_t length,
                             JSContext *context, JSValue array,
@@ -2040,7 +2550,7 @@ static void query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
 {
     DomDocumentOrderTraversal traversal;
     if (!bridge_document_order_traversal_init(
-            bridge, &traversal, node, boundary)) return;
+            bridge, &traversal, node, boundary)) return true;
     size_t shadow_depth = SIZE_MAX;
     BridgeQuerySelector query;
     bridge_query_selector_prepare(&query, selector, length);
@@ -2053,13 +2563,12 @@ static void query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) {
             int64_t handle = js_rt_bridge_register_node(bridge, at);
-            if (handle != 0) {
-                (void) JS_SetPropertyUint32(
-                    context, array, (*count)++,
-                    JS_NewInt64(context, handle));
-            }
+            if (handle == 0) return false;
+            (void) JS_SetPropertyUint32(
+                context, array, (*count)++, JS_NewInt64(context, handle));
         }
     }
+    return true;
 }
 
 JSValue js_dom_query_all(JSContext *context,
@@ -2089,11 +2598,14 @@ JSValue js_dom_query_all(JSContext *context,
         : (requested > DOM_QUERY_RESULT_LIMIT
                ? DOM_QUERY_RESULT_LIMIT : (uint32_t) requested);
     uint32_t count = 0;
-    if (length <= 512 && result_limit != 0) {
-        query_all_nodes(bridge, root, boundary, selector, length,
-                        context, array, &count, result_limit);
-    }
+    bool complete = length > 512 || result_limit == 0
+        || query_all_nodes(bridge, root, boundary, selector, length,
+                           context, array, &count, result_limit);
     JS_FreeCString(context, selector);
+    if (!complete) {
+        JS_FreeValue(context, array);
+        return bridge_throw_handles_exhausted(context);
+    }
     return array;
 }
 
@@ -2162,6 +2674,57 @@ JSValue js_dom_matches(JSContext *context, JSValueConst this_value,
         && selector_list_matches(node, selector, length, node);
     JS_FreeCString(context, selector);
     return JS_NewBool(context, matches);
+}
+
+/* Element.closest() without a wrapper per ancestor: the element, then its
+   element ancestors as parentElement reaches them (stopping at the document,
+   a fragment, a shadow-root carrier, or a hidden parent), with the selector
+   prepared once and each candidate as its own :scope, as matches() does.
+   Returns the first match's handle; 0 for none; or minus the handle of a
+   parentless subtree root, where script continues through a JavaScript-side
+   detached parent if that root has one. */
+#define DOM_CLOSEST_ANCESTOR_LIMIT 256u
+JSValue js_dom_closest(JSContext *context, JSValueConst this_value,
+                       int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    if (node == NULL || argc < 2 || node->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        return JS_NewInt64(context, 0);
+    size_t length = 0;
+    const char *selector = JS_ToCStringLen(context, &length, argv[1]);
+    if (selector == NULL) return JS_EXCEPTION;
+    int64_t found = 0;
+    bool registered = false;
+    if (length <= 512) {
+        BridgeQuerySelector query;
+        bridge_query_selector_prepare(&query, selector, length);
+        lxb_dom_node_t *at = node;
+        for (unsigned steps = 0; steps < DOM_CLOSEST_ANCESTOR_LIMIT;
+             steps++) {
+            if (bridge_query_selector_matches(&query, at, at)) {
+                found = js_rt_bridge_register_node(bridge, at);
+                registered = true;
+                break;
+            }
+            lxb_dom_node_t *parent = at->parent;
+            if (parent == NULL) {
+                found = -js_rt_bridge_register_node(bridge, at);
+                registered = true;
+                break;
+            }
+            if (parent->type != LXB_DOM_NODE_TYPE_ELEMENT
+                || bridge_node_is_shadow_root(bridge, parent)
+                || !bridge_node_visible(bridge, parent)) break;
+            at = parent;
+        }
+    }
+    JS_FreeCString(context, selector);
+    if (registered && found == 0)
+        return bridge_throw_handles_exhausted(context);
+    return JS_NewInt64(context, found);
 }
 
 static bool js_values_strict_equal(JSContext *context,
@@ -2286,8 +2849,8 @@ int argc, JSValueConst *argv)
        an earlier, unmaterialized interval still wins in document order. */
     if (found != NULL && (!indexed || section >= bridge->section_identity)) {
         JS_FreeCString(context, identifier);
-        JSValue handle = JS_NewInt64(
-            context, js_rt_bridge_register_node(bridge, found));
+        JSValue handle = bridge_node_handle_value(context, bridge, found);
+        if (JS_IsException(handle)) return handle;
         JSValue wrapped = js_rt_wrap_dom_handle(context, handle);
         JS_FreeValue(context, handle);
         return wrapped;
@@ -2550,7 +3113,7 @@ JSValue js_dom_relation(JSContext *context,
                   : (relation == 3 ? related->prev : related->parent);
     }
     if (related != NULL && !bridge_node_visible(bridge, related)) related = NULL;
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, related));
+    return bridge_node_handle_value(context, bridge, related);
 }
 
 /* DOM order needs no wrapper for ancestors or siblings. Keep this constant
@@ -2600,6 +3163,157 @@ JSValue js_dom_compare_position(JSContext *context,
     return right->prev == NULL ? JS_NewInt32(context, 2) : JS_UNDEFINED;
 }
 
+/* __tilefinchIsAncestor(ancestor, node): whether ancestor lies on node's
+   parentNode chain within the script walks' 256-step bound, without a
+   wrapper per step (mutation observer subtree checks). undefined when a
+   handle is stale or section-remote nodes make the script chain differ. */
+JSValue js_dom_is_ancestor(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handles[2];
+    size_t slots[2];
+    if (argc < 2 || bridge == NULL || bridge->remote_mode_seen
+        || bridge->remote_node_write != NULL
+        || bridge->node_visibility != NULL) return JS_UNDEFINED;
+    if (JS_ToInt64(context, &handles[0], argv[0]) < 0
+        || JS_ToInt64(context, &handles[1], argv[1]) < 0)
+        return JS_EXCEPTION;
+    if (!js_rt_bridge_node_slot_for_handle(bridge, handles[0], &slots[0])
+        || !js_rt_bridge_node_slot_for_handle(bridge, handles[1], &slots[1]))
+        return JS_UNDEFINED;
+    const lxb_dom_node_t *ancestor = bridge->nodes[slots[0]];
+    const lxb_dom_node_t *node = bridge->nodes[slots[1]];
+    if (bridge_node_is_shadow_root(bridge, node)) return JS_FALSE;
+    const lxb_dom_node_t *at = node->parent;
+    for (unsigned steps = 0; at != NULL && steps < 256u; steps++) {
+        if (at == ancestor) return JS_TRUE;
+        /* The internal host link is not a DOM parentNode edge. */
+        if (bridge_node_is_shadow_root(bridge, at)) break;
+        at = at->parent;
+    }
+    return JS_FALSE;
+}
+
+/* __tilefinchSelectorsTestAttribute(name): whether some selector of the
+   attached sheet tests an attribute whose name begins with `name`
+   (stylesheet_selectors_reference_attribute_prefix); true without a sheet.
+   A data-* attribute no selector tests is author bookkeeping that cannot
+   restyle anything. */
+JSValue js_dom_selectors_test_attribute(JSContext *context,
+                                        JSValueConst this_value,
+                                        int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->stylesheet == NULL || argc < 1)
+        return JS_TRUE;
+    size_t length = 0;
+    const char *name = JS_ToCStringLen(context, &length, argv[0]);
+    if (name == NULL) return JS_EXCEPTION;
+    bool tested = stylesheet_selectors_reference_attribute_prefix(
+        bridge->stylesheet, name, length);
+    JS_FreeCString(context, name);
+    return JS_NewBool(context, tested);
+}
+
+/* __tilefinchNextAncestorEntry(node, entries, start): the first index
+   i >= start whose entries[i].handle is node itself, lies on node's chain
+   as above, or is not a live native handle (script decides those);
+   entries.length when none. One call skips an observer's unrelated
+   transient registrations. undefined as for __tilefinchIsAncestor. The
+   entries are the bootstrap's own plain objects: reading them runs no
+   page code, so the resolved nodes stay valid throughout. */
+JSValue js_dom_next_ancestor_entry(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    uint32_t index = 0, length = 0;
+    size_t slot = 0;
+    if (argc < 3 || bridge == NULL || bridge->remote_mode_seen
+        || bridge->remote_node_write != NULL
+        || bridge->node_visibility != NULL || !JS_IsArray(context, argv[1]))
+        return JS_UNDEFINED;
+    JSValue length_value = JS_GetPropertyStr(context, argv[1], "length");
+    int converted = JS_IsException(length_value) ? -1
+        : JS_ToUint32(context, &length, length_value);
+    JS_FreeValue(context, length_value);
+    if (converted < 0 || JS_ToInt64(context, &handle, argv[0]) < 0
+        || JS_ToUint32(context, &index, argv[2]) < 0) return JS_EXCEPTION;
+    if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        return JS_UNDEFINED;
+    const lxb_dom_node_t *node = bridge->nodes[slot];
+    JSAtom handle_atom = JS_NewAtom(context, "handle");
+    if (handle_atom == JS_ATOM_NULL) return JS_EXCEPTION;
+    for (; index < length; index++) {
+        JSValue entry = JS_GetPropertyUint32(context, argv[1], index);
+        JSValue value = JS_IsObject(entry)
+            ? JS_GetProperty(context, entry, handle_atom) : JS_UNDEFINED;
+        JS_FreeValue(context, entry);
+        int64_t candidate = 0;
+        size_t candidate_slot = 0;
+        bool native = JS_IsNumber(value)
+            && JS_ToInt64(context, &candidate, value) == 0
+            && js_rt_bridge_node_slot_for_handle(bridge, candidate,
+                                                 &candidate_slot);
+        JS_FreeValue(context, value);
+        if (!native) break;
+        const lxb_dom_node_t *root = bridge->nodes[candidate_slot];
+        const lxb_dom_node_t *at = node;
+        for (unsigned steps = 0; at != NULL && at != root && steps < 256u;
+             steps++) {
+            if (bridge_node_is_shadow_root(bridge, at)) {
+                at = NULL;
+                break;
+            }
+            at = at->parent;
+        }
+        if (at == root) break;
+    }
+    JS_FreeAtom(context, handle_atom);
+    return JS_NewUint32(context, index);
+}
+
+/* __tilefinchNearestId(node): the first non-empty id on node's inclusive
+   parentElement chain within 256 steps, "" when none (section state's
+   dirty-node key, without a wrapper per step). undefined where wrapper
+   stable keys may take precedence (section-remote nodes). */
+JSValue js_dom_nearest_id(JSContext *context, JSValueConst this_value,
+                          int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    size_t slot = 0;
+    if (argc < 1 || bridge == NULL || bridge->remote_mode_seen
+        || bridge->remote_node_write != NULL
+        || bridge->node_visibility != NULL) return JS_UNDEFINED;
+    if (JS_ToInt64(context, &handle, argv[0]) < 0) return JS_EXCEPTION;
+    if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        return JS_UNDEFINED;
+    lxb_dom_node_t *at = bridge->nodes[slot];
+    for (unsigned steps = 0; at != NULL && steps < 256u; steps++) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            size_t length = 0;
+            const lxb_char_t *id = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(at), (const lxb_char_t *) "id", 2,
+                &length);
+            if (id != NULL && length > 0)
+                return JS_NewStringLen(context, (const char *) id, length);
+        }
+        /* parentElement stops at a non-element or a shadow-root carrier. */
+        at = at->parent;
+        if (at != NULL && (at->type != LXB_DOM_NODE_TYPE_ELEMENT
+                           || bridge_node_is_shadow_root(bridge, at)))
+            break;
+    }
+    return JS_NewString(context, "");
+}
+
 JSValue js_dom_is_connected(JSContext *context,
                             JSValueConst this_value,
                             int argc, JSValueConst *argv)
@@ -2609,6 +3323,111 @@ JSValue js_dom_is_connected(JSContext *context,
     lxb_dom_node_t *node = argc > 0
         ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
     return bridge_node_is_connected(node) ? JS_TRUE : JS_FALSE;
+}
+
+/* Node.getRootNode() and the pre-insert "inclusive ancestor" check without
+   a wrapper per ancestor. Walks native parents from argv[0]: returns
+   argv[1]'s handle if the walk meets it, -1 on reaching a document, else
+   the handle of the parentless root (script continues through a
+   JavaScript-side detached parent, as closest() does). 0 leaves the walk
+   to script: shadow trees, remote or section-filtered documents, and
+   ancestries past the script walks' 256-step bound. */
+#define DOM_ROOT_NODE_ANCESTOR_LIMIT 256u
+JSValue js_dom_root_node(JSContext *context, JSValueConst this_value,
+                         int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handles[2] = {0, 0};
+    if (bridge == NULL || argc < 1 || bridge->remote_mode_seen
+        || bridge->remote_node_write != NULL
+        || bridge->node_visibility != NULL || bridge->shadow_root_count > 0)
+        return JS_NewInt32(context, 0);
+    if (JS_ToInt64(context, &handles[0], argv[0]) < 0
+        || (argc > 1 && !JS_IsUndefined(argv[1])
+            && JS_ToInt64(context, &handles[1], argv[1]) < 0))
+        return JS_EXCEPTION;
+    size_t slot = 0;
+    if (handles[0] <= 0
+        || !js_rt_bridge_node_slot_for_handle(bridge, handles[0], &slot))
+        return JS_NewInt32(context, 0);
+    lxb_dom_node_t *at = bridge->nodes[slot];
+    lxb_dom_node_t *stop = NULL;
+    if (handles[1] > 0
+        && js_rt_bridge_node_slot_for_handle(bridge, handles[1], &slot))
+        stop = bridge->nodes[slot];
+    for (unsigned steps = 0; at != stop && at->parent != NULL; steps++) {
+        if (steps >= DOM_ROOT_NODE_ANCESTOR_LIMIT)
+            return JS_NewInt32(context, 0);
+        at = at->parent;
+    }
+    if (at == stop) return JS_NewInt64(context, handles[1]);
+    if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT)
+        return JS_NewInt32(context, -1);
+    return bridge_node_handle_value(context, bridge, at);
+}
+
+/* __tilefinchNodeOwner(handle): the node's adopted owner tag, 0 for an
+   unknown handle. (handle, tag) records the tag for that node alone (the
+   bootstrap adopts node by node) and answers whether it could; the first
+   such call allocates the table and tags every registered node.
+   (0) lists the tags 3-255 some node still holds, so the bootstrap can
+   reuse the rest. */
+JSValue js_dom_node_owner(JSContext *context, JSValueConst this_value,
+                          int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    int32_t tag = 0;
+    size_t slot = 0;
+    if (bridge == NULL || argc < 1
+        || JS_ToInt64(context, &handle, argv[0]) < 0)
+        return JS_NewInt32(context, 0);
+    unsigned char *tags = bridge->node_owner_tags;
+    if (handle == 0) {
+        JSValue list = JS_NewArray(context);
+        uint32_t seen[8] = {0}, count = 0;
+        for (size_t at = 0; tags != NULL && !JS_IsException(list)
+             && at < bridge->node_count; at++) {
+            unsigned value = tags[at];
+            if (value < 3 || (seen[value / 32u] & (1u << (value % 32u))))
+                continue;
+            seen[value / 32u] |= 1u << (value % 32u);
+            if (JS_SetPropertyUint32(context, list, count++,
+                                     JS_NewInt32(context, (int32_t) value))
+                < 0) {
+                JS_FreeValue(context, list);
+                return JS_EXCEPTION;
+            }
+        }
+        return list;
+    }
+    if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        return argc > 1 ? JS_FALSE : JS_NewInt32(context, 0);
+    if (argc < 2 || JS_IsUndefined(argv[1])) {
+        unsigned char value = tags != NULL ? tags[slot] : 0;
+        if (value == 0) {
+            value = bridge_node_owner_tag_inherited(
+                bridge, bridge->nodes[slot]);
+            if (tags != NULL) tags[slot] = value;
+        }
+        return JS_NewInt32(context, value);
+    }
+    if (JS_ToInt32(context, &tag, argv[1]) < 0) return JS_EXCEPTION;
+    if (tag < 1 || tag > 255) return JS_FALSE;
+    if (tags == NULL) {
+        tags = budget_calloc(bridge->budget, DOM_BRIDGE_NODE_LIMIT, 1);
+        if (tags == NULL) return JS_FALSE;
+        /* Registered nodes are the document's or template contents'. */
+        for (size_t at = 0; at < bridge->node_count; at++)
+            if (bridge->nodes[at] != NULL)
+                tags[at] = bridge_node_owner_tag_inherited(
+                    bridge, bridge->nodes[at]);
+        bridge->node_owner_tags = tags;
+    }
+    tags[slot] = (unsigned char) tag;
+    return JS_TRUE;
 }
 
 JSValue js_dom_children(JSContext *context, JSValueConst this_value,
@@ -2626,10 +3445,12 @@ JSValue js_dom_children(JSContext *context, JSValueConst this_value,
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         if (!bridge_node_visible(bridge, child)) continue;
         int64_t handle = js_rt_bridge_register_node(bridge, child);
-        if (handle != 0) {
-            (void) JS_SetPropertyUint32(context, array, count++,
-                                        JS_NewInt64(context, handle));
+        if (handle == 0) {
+            JS_FreeValue(context, array);
+            return bridge_throw_handles_exhausted(context);
         }
+        (void) JS_SetPropertyUint32(context, array, count++,
+                                    JS_NewInt64(context, handle));
     }
     return array;
 }
@@ -2649,10 +3470,12 @@ JSValue js_dom_child_nodes(JSContext *context,
          && count < DOM_QUERY_RESULT_LIMIT; child = child->next) {
         if (!bridge_node_visible(bridge, child)) continue;
         int64_t handle = js_rt_bridge_register_node(bridge, child);
-        if (handle != 0) {
-            (void) JS_SetPropertyUint32(context, array, count++,
-                                        JS_NewInt64(context, handle));
+        if (handle == 0) {
+            JS_FreeValue(context, array);
+            return bridge_throw_handles_exhausted(context);
         }
+        (void) JS_SetPropertyUint32(context, array, count++,
+                                    JS_NewInt64(context, handle));
     }
     return array;
 }
@@ -2676,13 +3499,18 @@ JSValue js_dom_document_child_nodes(JSContext *context,
          && count < DOM_QUERY_RESULT_LIMIT; child = child->next) {
         if (!bridge_node_visible(bridge, child)) continue;
         int64_t handle = js_rt_bridge_register_node(bridge, child);
-        if (handle != 0) {
-            (void) JS_SetPropertyUint32(context, array, count++,
-                                        JS_NewInt64(context, handle));
+        if (handle == 0) {
+            JS_FreeValue(context, array);
+            return bridge_throw_handles_exhausted(context);
         }
+        (void) JS_SetPropertyUint32(context, array, count++,
+                                    JS_NewInt64(context, handle));
     }
     return array;
 }
+
+static JSValue bridge_tag_name_value(JSContext *context,
+                                    lxb_dom_node_t *node);
 
 JSValue js_dom_tag_name(JSContext *context,
                         JSValueConst this_value,
@@ -2692,6 +3520,12 @@ JSValue js_dom_tag_name(JSContext *context,
     DomBridge *bridge = JS_GetContextOpaque(context);
     lxb_dom_node_t *node = argc > 0
         ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    return bridge_tag_name_value(context, node);
+}
+
+static JSValue bridge_tag_name_value(JSContext *context,
+                                    lxb_dom_node_t *node)
+{
     size_t length = 0;
     const char *name = node == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT
@@ -2727,6 +3561,86 @@ JSValue js_dom_namespace_uri(JSContext *context,
         : JS_NewStringLen(context, (const char *) uri, length);
 }
 
+static int bridge_dom_node_type(const lxb_dom_node_t *node);
+
+/* An interned (atom) string: every wrapper of a tag or namespace then
+   holds the same string instead of its own copy. */
+static JSValue bridge_interned_string(JSContext *context, const char *chars,
+                                      size_t length)
+{
+    JSAtom atom = JS_NewAtomLen(context, chars, length);
+    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
+    JSValue value = JS_AtomToString(context, atom);
+    JS_FreeAtom(context, atom);
+    return value;
+}
+
+/* __tilefinchNodeIdentity(handle[, array]): a new wrapper's identity in
+   one call, [tagName, nodeType, namespaceURI, section identity], each as
+   __tilefinchTagName (|| ""), __tilefinchNodeType, __tilefinchNamespaceURI
+   and __tilefinchSectionIdentity report it. */
+JSValue js_dom_node_identity(JSContext *context,
+                             JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    bool element = node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT;
+    size_t length = 0;
+    const char *name = element
+        ? (const char *) lxb_dom_element_qualified_name(
+              lxb_dom_interface_element(node), &length)
+        : NULL;
+    char upper[64];
+    if (name != NULL && node->ns == LXB_NS_HTML) {
+        /* As bridge_tag_name_value reports it. */
+        if (length >= sizeof(upper)) length = sizeof(upper) - 1;
+        for (size_t i = 0; i < length; i++)
+            upper[i] = (char) toupper((unsigned char) name[i]);
+        name = upper;
+    }
+    JSValue tag = bridge_interned_string(context, name == NULL ? "" : name,
+                                         name == NULL ? 0 : length);
+    if (JS_IsException(tag)) return tag;
+    JSValue namespace_uri = JS_NULL;
+    const lxb_char_t *uri = !element || node->owner_document == NULL
+        ? NULL : lxb_ns_by_id(node->owner_document->ns, node->ns, &length);
+    if (uri != NULL && length > 0)
+        namespace_uri = bridge_interned_string(
+            context, (const char *) uri, length);
+    /* The caller may pass its own array to refill, sparing an allocation
+       per wrapper. */
+    JSValue identity = JS_IsException(namespace_uri) ? JS_EXCEPTION
+        : argc > 1 && JS_IsArray(context, argv[1]) > 0
+        ? JS_DupValue(context, argv[1]) : JS_NewArray(context);
+    if (JS_IsException(identity)) {
+        JS_FreeValue(context, tag);
+        JS_FreeValue(context, namespace_uri);
+        return JS_EXCEPTION;
+    }
+    /* Each set consumes its value, even when it fails; in index order, so
+       a new array stays a fast array. */
+    if (JS_SetPropertyUint32(context, identity, 0, tag) < 0
+        || JS_SetPropertyUint32(
+               context, identity, 1,
+               JS_NewInt32(context, bridge_dom_node_type(node))) < 0) {
+        JS_FreeValue(context, namespace_uri);
+        JS_FreeValue(context, identity);
+        return JS_EXCEPTION;
+    }
+    if (JS_SetPropertyUint32(context, identity, 2, namespace_uri) < 0
+        || JS_SetPropertyUint32(
+               context, identity, 3,
+               JS_NewInt64(context, bridge == NULL
+                           ? 0 : (int64_t) bridge->section_identity)) < 0) {
+        JS_FreeValue(context, identity);
+        return JS_EXCEPTION;
+    }
+    return identity;
+}
+
 JSValue js_dom_parse_color(JSContext *context,
                            JSValueConst this_value,
                            int argc, JSValueConst *argv)
@@ -2746,6 +3660,328 @@ JSValue js_dom_parse_color(JSContext *context,
         : JS_NULL;
 }
 
+/* The DOM nodeType a native node reports to script. */
+static int bridge_dom_node_type(const lxb_dom_node_t *node)
+{
+    if (node == NULL) return 0;
+    switch (node->type) {
+    case LXB_DOM_NODE_TYPE_ELEMENT: return 1;
+    case LXB_DOM_NODE_TYPE_TEXT: return 3;
+    case LXB_DOM_NODE_TYPE_CDATA_SECTION: return 4;
+    case LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION: return 7;
+    case LXB_DOM_NODE_TYPE_COMMENT: return 8;
+    case LXB_DOM_NODE_TYPE_DOCUMENT: return 9;
+    case LXB_DOM_NODE_TYPE_DOCUMENT_TYPE: return 10;
+    default: return 11;
+    }
+}
+
+/*
+ * Native receiver getters for the hottest node properties. Ancestor walks
+ * read parentNode once per step, and the script getters paid a global
+ * lookup, a virtual-node check and a wrapper-cache lookup in bytecode on
+ * every read. These answer the ordinary case -- a native node of this
+ * realm, no script-side detached parent, no section-remote nodes -- and
+ * call the script getter (data[0]) for everything else, so the two cannot
+ * disagree on anything unusual.
+ */
+enum {
+    FAST_GETTER_PARENT_NODE = 0,
+    FAST_GETTER_PARENT_ELEMENT = 1,
+    FAST_GETTER_TAG_NAME = 2,
+    FAST_GETTER_NODE_TYPE = 3,
+    FAST_GETTER_FIRST_CHILD = 4,
+    FAST_GETTER_LAST_CHILD = 5,
+    FAST_GETTER_NEXT_SIBLING = 6,
+    FAST_GETTER_PREVIOUS_SIBLING = 7,
+    FAST_GETTER_COUNT
+};
+
+/* 1: *node is the receiver's native node; 0: use the script getter;
+   -1: exception. */
+static int fast_getter_receiver(JSContext *context, DomBridge *bridge,
+                                JSValueConst receiver, lxb_dom_node_t **node,
+                                int64_t *resolved_handle)
+{
+    if (bridge == NULL || bridge->remote_mode_seen
+        || bridge->remote_node_write != NULL || !JS_IsObject(receiver))
+        return 0;
+    JSValue handle_value = JS_GetPropertyStr(context, receiver, "__handle");
+    if (JS_IsException(handle_value)) return -1;
+    int64_t handle = 0;
+    bool numeric = JS_IsNumber(handle_value)
+        && JS_ToInt64(context, &handle, handle_value) == 0;
+    JS_FreeValue(context, handle_value);
+    size_t slot = 0;
+    if (!numeric || handle <= 0
+        || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        return 0;
+    *node = bridge->nodes[slot];
+    if (resolved_handle != NULL) *resolved_handle = handle;
+    return 1;
+}
+
+/* A script-side detached parent (JavaScript-only trees) takes the script
+   path. 1: none; 0: present; -1: exception. */
+static int fast_getter_no_detached_parent(JSContext *context,
+                                          JSValueConst receiver)
+{
+    JSValue parent = JS_GetPropertyStr(context, receiver,
+                                       "__tilefinchDetachedParent");
+    if (JS_IsException(parent)) return -1;
+    int present = JS_ToBool(context, parent);
+    JS_FreeValue(context, parent);
+    return present < 0 ? -1 : present ? 0 : 1;
+}
+
+/* The live wrapper the script cache holds for `node`, else a new one from
+   the trusted wrapper; JS_NULL when script would produce none. */
+static JSValue fast_getter_wrapper(JSContext *context, DomBridge *bridge,
+                                   lxb_dom_node_t *node)
+{
+    int64_t handle = js_rt_bridge_register_node(bridge, node);
+    if (handle == 0 && node != NULL)
+        return bridge_throw_handles_exhausted(context);
+    if (handle <= 0) return JS_NULL;
+    size_t slot = 0;
+    if (bridge->wrapper_refs != NULL
+        && js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+        && JS_IsObject(bridge->wrapper_refs[slot])) {
+        JSValue cached = JS_WeakRefDeref(context,
+                                         bridge->wrapper_refs[slot]);
+        if (JS_IsObject(cached)) return cached;
+        JS_FreeValue(context, cached);
+    }
+    JSValue handle_value = JS_NewInt64(context, handle);
+    JSValue wrapped = js_rt_wrap_dom_handle(context, handle_value);
+    JS_FreeValue(context, handle_value);
+    return wrapped;
+}
+
+static bool fast_getter_canonical_name(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    return name != NULL
+        && ((length == 4 && (strncasecmp(name, "html", 4) == 0
+                             || strncasecmp(name, "head", 4) == 0
+                             || strncasecmp(name, "body", 4) == 0)));
+}
+
+static JSValue js_dom_fast_getter(JSContext *context, JSValueConst receiver,
+                                  int argc, JSValueConst *argv, int kind,
+                                  JSValue *data)
+{
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = NULL;
+    int64_t handle = 0;
+    int ready = fast_getter_receiver(context, bridge, receiver, &node, &handle);
+    if (ready < 0) return JS_EXCEPTION;
+    if (ready > 0 && (kind == FAST_GETTER_PARENT_NODE
+                      || kind == FAST_GETTER_PARENT_ELEMENT)) {
+        ready = fast_getter_no_detached_parent(context, receiver);
+        if (ready < 0) return JS_EXCEPTION;
+        /* The property lookup can run author code and retire the node. Use
+           the captured generation-bearing handle, never a second observable
+           receiver lookup or the raw pointer from before the callback. */
+        size_t slot = 0;
+        node = NULL;
+        if (ready > 0 && !bridge->remote_mode_seen
+            && bridge->remote_node_write == NULL) {
+            /* A retired handle has no parent. Falling back would re-enter
+               author code and can return undefined for a forged receiver. */
+            if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+                return JS_NULL;
+            node = bridge->nodes[slot];
+        } else {
+            ready = 0;
+        }
+    }
+    if (ready > 0) {
+        if (kind == FAST_GETTER_NODE_TYPE)
+            return JS_NewInt32(context, bridge_dom_node_type(node));
+        if (kind == FAST_GETTER_TAG_NAME) {
+            if (node->type != LXB_DOM_NODE_TYPE_ELEMENT)
+                return JS_NewString(context, "");
+            return bridge_tag_name_value(context, node);
+        }
+        if (kind >= FAST_GETTER_FIRST_CHILD) {
+            /* Script: wrap(the relation's handle), which the relation
+               already nulls when hidden. A shadow-root carrier is skipped
+               over by script (shadowAdjustedSibling), so it goes there. */
+            lxb_dom_node_t *related =
+                kind == FAST_GETTER_FIRST_CHILD ? node->first_child
+                : kind == FAST_GETTER_LAST_CHILD ? node->last_child
+                : kind == FAST_GETTER_NEXT_SIBLING ? node->next
+                : node->prev;
+            if (related == NULL || !bridge_node_visible(bridge, related))
+                return JS_NULL;
+            if (!bridge_node_is_shadow_root(bridge, related)) {
+                JSValue wrapper = fast_getter_wrapper(context, bridge,
+                                                      related);
+                if (!JS_IsNull(wrapper) && !JS_IsUndefined(wrapper))
+                    return wrapper;
+            }
+            return JS_Call(context, data[0], receiver, 0, NULL);
+        }
+        lxb_dom_node_t *parent = node->parent;
+        bool visible = parent != NULL && bridge_node_visible(bridge, parent);
+        if (kind == FAST_GETTER_PARENT_ELEMENT) {
+            /* Script: wrap(raw parent) instanceof Element, canonicalized;
+               the shadow-root carrier is a DocumentFragment to script. */
+            if (!visible || parent->type != LXB_DOM_NODE_TYPE_ELEMENT
+                || bridge_node_is_shadow_root(bridge, parent))
+                return JS_NULL;
+            if (!fast_getter_canonical_name(parent)) {
+                JSValue wrapper = fast_getter_wrapper(context, bridge,
+                                                      parent);
+                if (!JS_IsNull(wrapper) && !JS_IsUndefined(wrapper))
+                    return wrapper;
+                if (JS_IsException(wrapper)) return wrapper;
+            }
+        } else if (visible) {
+            if (parent->type == LXB_DOM_NODE_TYPE_DOCUMENT) {
+                JSValue global = JS_GetGlobalObject(context);
+                JSValue document = JS_GetPropertyStr(context, global,
+                                                     "document");
+                JS_FreeValue(context, global);
+                return document;
+            }
+            JSValue wrapper = fast_getter_wrapper(context, bridge, parent);
+            if (!JS_IsNull(wrapper) && !JS_IsUndefined(wrapper))
+                return wrapper;
+            if (JS_IsException(wrapper)) return wrapper;
+        }
+    }
+    return JS_Call(context, data[0], receiver, 0, NULL);
+}
+
+/* Host A/B switch: TILEFINCH_DISABLE_FAST_DOM keeps the script getters
+   and methods (lab comparisons); device builds always install. */
+static bool fast_dom_disabled(void)
+{
+#if defined(TILEFINCH_PSP_VALIDATION_LOG) || defined(TILEFINCH_NO_TRACE)
+    return false;
+#else
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("TILEFINCH_DISABLE_FAST_DOM") != NULL;
+    return disabled != 0;
+#endif
+}
+
+/* __tilefinchMakeFastGetter(kind, scriptGetter, name): a native getter
+   for one of the kinds above that falls back to scriptGetter. */
+JSValue js_dom_make_fast_getter(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (fast_dom_disabled()) return JS_UNDEFINED;
+    int32_t kind = -1;
+    if (argc < 3 || JS_ToInt32(context, &kind, argv[0]) < 0
+        || kind < 0 || kind >= FAST_GETTER_COUNT
+        || !JS_IsFunction(context, argv[1])) return JS_UNDEFINED;
+    JSValue getter = JS_NewCFunctionData(context, js_dom_fast_getter, 0,
+                                         kind, 1, &argv[1]);
+    if (JS_IsException(getter)) return getter;
+    JSValue name = JS_ToString(context, argv[2]);
+    if (JS_IsException(name)
+        || JS_DefinePropertyValueStr(context, getter, "name", name,
+                                     JS_PROP_CONFIGURABLE) < 0) {
+        JS_FreeValue(context, getter);
+        return JS_EXCEPTION;
+    }
+    return getter;
+}
+
+/* Native receiver methods, same contract as the getters above. */
+enum {
+    FAST_METHOD_GET_ATTRIBUTE = 0,
+    FAST_METHOD_COUNT
+};
+
+static JSValue js_dom_fast_method(JSContext *context, JSValueConst receiver,
+                                  int argc, JSValueConst *argv, int kind,
+                                  JSValue *data)
+{
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = NULL;
+    if (kind == FAST_METHOD_GET_ATTRIBUTE && argc > 0
+        && JS_IsString(argv[0])) {
+        int ready = fast_getter_receiver(context, bridge, receiver, &node, NULL);
+        if (ready < 0) return JS_EXCEPTION;
+        if (ready > 0 && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && node->ns == LXB_NS_HTML) {
+            size_t length = 0;
+            const char *name = JS_ToCStringLen(context, &length, argv[0]);
+            if (name == NULL) return JS_EXCEPTION;
+            /* HTML names are ASCII-lowercased; anything non-ASCII keeps
+               script's Unicode toLowerCase. */
+            char lowered[128];
+            bool ascii = length < sizeof(lowered);
+            for (size_t i = 0; ascii && i < length; i++) {
+                unsigned char c = (unsigned char) name[i];
+                if (c >= 0x80u) ascii = false;
+                else lowered[i] = (char) tolower(c);
+            }
+            JS_FreeCString(context, name);
+            if (ascii) {
+                size_t value_length = 0;
+                const lxb_char_t *value = lxb_dom_element_get_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) lowered, length, &value_length);
+                bool present = value != NULL
+                    || lxb_dom_element_has_attribute(
+                        lxb_dom_interface_element(node),
+                        (const lxb_char_t *) lowered, length);
+                return !present ? JS_NULL
+                    : JS_NewStringLen(context,
+                                      value == NULL ? "" : (const char *) value,
+                                      value == NULL ? 0 : value_length);
+            }
+        }
+    }
+    return JS_Call(context, data[0], receiver, argc, argv);
+}
+
+/* __tilefinchMakeFastMethod(kind, scriptMethod, name, length). */
+JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (fast_dom_disabled()) return JS_UNDEFINED;
+    int32_t kind = -1, arity = 0;
+    if (argc < 4 || JS_ToInt32(context, &kind, argv[0]) < 0
+        || kind < 0 || kind >= FAST_METHOD_COUNT
+        || !JS_IsFunction(context, argv[1])
+        || JS_ToInt32(context, &arity, argv[3]) < 0) return JS_UNDEFINED;
+    JSValue method = JS_NewCFunctionData(context, js_dom_fast_method, arity,
+                                         kind, 1, &argv[1]);
+    if (JS_IsException(method)) return method;
+    JSValue name = JS_ToString(context, argv[2]);
+    if (JS_IsException(name)
+        || JS_DefinePropertyValueStr(context, method, "name", name,
+                                     JS_PROP_CONFIGURABLE) < 0) {
+        JS_FreeValue(context, method);
+        return JS_EXCEPTION;
+    }
+    return method;
+}
+
+/* Section-remote wrappers exist: native getters defer to script. */
+JSValue js_dom_note_remote_wrapper(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge != NULL) bridge->remote_mode_seen = true;
+    return JS_UNDEFINED;
+}
+
 JSValue js_dom_node_type(JSContext *context,
                          JSValueConst this_value,
                          int argc, JSValueConst *argv)
@@ -2754,23 +3990,150 @@ JSValue js_dom_node_type(JSContext *context,
     DomBridge *bridge = JS_GetContextOpaque(context);
     lxb_dom_node_t *node = argc > 0
         ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
-    int type = node == NULL ? 0
-               : (node->type == LXB_DOM_NODE_TYPE_ELEMENT ? 1
-                  : (node->type == LXB_DOM_NODE_TYPE_TEXT ? 3
-                     : (node->type == LXB_DOM_NODE_TYPE_COMMENT ? 8
-                     : (node->type == LXB_DOM_NODE_TYPE_DOCUMENT ? 9
-                     : (node->type == LXB_DOM_NODE_TYPE_DOCUMENT_TYPE ? 10
-                                                                : 11)))));
-    return JS_NewInt32(context, type);
+    return JS_NewInt32(context, bridge_dom_node_type(node));
 }
 
-static void append_descendants(DomBridge *bridge, lxb_dom_node_t *node,
+/* Live TreeWalker/NodeIterator stepping. Each call walks native links from
+   one node to the next in tree order whose type whatToShow admits, so nodes
+   the walk only passes over never become wrappers and nothing is
+   materialized up front. Shadow-root carriers other than the root are
+   skipped with their subtrees, as in the light tree script sees. A handle
+   is registered only for the node returned; when the realm's handle table
+   is full the step throws rather than return a wrong node. */
+#define DOM_TRAVERSE_MOVE_LIMIT 16384u
+#define DOM_TRAVERSE_LINK_LIMIT DOM_TRAVERSAL_VISIT_LIMIT
+enum {
+    DOM_TRAVERSE_FOLLOWING = 0,
+    DOM_TRAVERSE_FOLLOWING_SKIP_CHILDREN = 1,
+    DOM_TRAVERSE_PRECEDING = 2
+};
+/* Results other than a positive handle. */
+#define DOM_TRAVERSE_NONE 0
+#define DOM_TRAVERSE_ROOT (-1)
+#define DOM_TRAVERSE_UNSUPPORTED (-2)
+#define DOM_TRAVERSE_DOCUMENT (-3)
+/* -(handle + 4): the move ceiling stopped at this unmatched node. */
+
+static bool bridge_traverse_hidden(DomBridge *bridge,
+                                   const lxb_dom_node_t *node,
+                                   const lxb_dom_node_t *root)
+{
+    return node != root && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && bridge->shadow_root_count != 0
+        && bridge_node_is_shadow_root(bridge, node);
+}
+
+static lxb_dom_node_t *bridge_traverse_visible_sibling(
+    DomBridge *bridge, lxb_dom_node_t *node, const lxb_dom_node_t *root,
+    bool forward)
+{
+    for (size_t links = 0; node != NULL && links < DOM_TRAVERSE_LINK_LIMIT;
+         links++) {
+        if (!bridge_traverse_hidden(bridge, node, root)) return node;
+        node = forward ? node->next : node->prev;
+    }
+    return NULL;
+}
+
+/* The node after `at` in tree order, not descending into `at` when asked;
+   climbing stops at `root` exactly as TreeWalker's nextNode does. */
+static lxb_dom_node_t *bridge_traverse_following(
+    DomBridge *bridge, const lxb_dom_node_t *root, lxb_dom_node_t *at,
+    bool skip_children)
+{
+    lxb_dom_node_t *next = skip_children ? NULL
+        : bridge_traverse_visible_sibling(bridge, at->first_child, root, true);
+    if (next != NULL) return next;
+    for (size_t links = 0; at != NULL && links < DOM_TRAVERSE_LINK_LIMIT;
+         links++, at = at->parent) {
+        if (at == root) return NULL;
+        next = bridge_traverse_visible_sibling(bridge, at->next, root, true);
+        if (next != NULL) return next;
+    }
+    return NULL;
+}
+
+/* The node before `at` in tree order, never leaving `root`. */
+static lxb_dom_node_t *bridge_traverse_preceding(
+    DomBridge *bridge, const lxb_dom_node_t *root, lxb_dom_node_t *at)
+{
+    if (at == root) return NULL;
+    lxb_dom_node_t *previous =
+        bridge_traverse_visible_sibling(bridge, at->prev, root, false);
+    if (previous == NULL) return at->parent;
+    for (size_t links = 0; links < DOM_TRAVERSE_LINK_LIMIT; links++) {
+        lxb_dom_node_t *last = bridge_traverse_visible_sibling(
+            bridge, previous->last_child, root, false);
+        if (last == NULL) return previous;
+        previous = last;
+    }
+    return NULL;
+}
+
+JSValue js_dom_traverse(JSContext *context, JSValueConst this_value,
+                        int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t root_handle = 0, from_handle = 0;
+    uint32_t what_to_show = 0;
+    int32_t mode = 0;
+    if (argc < 4 || JS_ToInt64(context, &root_handle, argv[0]) < 0
+        || JS_ToInt64(context, &from_handle, argv[1]) < 0
+        || JS_ToUint32(context, &what_to_show, argv[2]) < 0
+        || JS_ToInt32(context, &mode, argv[3]) < 0) return JS_EXCEPTION;
+    /* Section and remote documents expose a virtual tree that only the
+       script-level DOM accessors model; they walk that instead. */
+    if (bridge == NULL || bridge->document == NULL
+        || bridge->document->html == NULL || bridge->node_visibility != NULL
+        || bridge->remote_descendant_collect != NULL
+        || mode < DOM_TRAVERSE_FOLLOWING || mode > DOM_TRAVERSE_PRECEDING)
+        return JS_NewInt64(context, DOM_TRAVERSE_UNSUPPORTED);
+    lxb_dom_node_t *document_node =
+        lxb_dom_interface_node(bridge->document->html);
+    size_t slot = 0;
+    lxb_dom_node_t *root = root_handle == 0 ? document_node
+        : js_rt_bridge_node_slot_for_handle(bridge, root_handle, &slot)
+            ? bridge->nodes[slot] : NULL;
+    lxb_dom_node_t *at = from_handle == 0 ? root
+        : js_rt_bridge_node_slot_for_handle(bridge, from_handle, &slot)
+            ? bridge->nodes[slot] : NULL;
+    if (root == NULL || at == NULL)
+        return JS_NewInt64(context, DOM_TRAVERSE_UNSUPPORTED);
+    for (size_t moves = 0; moves < DOM_TRAVERSE_MOVE_LIMIT; moves++) {
+        at = mode == DOM_TRAVERSE_PRECEDING
+            ? bridge_traverse_preceding(bridge, root, at)
+            : bridge_traverse_following(
+                  bridge, root, at,
+                  moves == 0 && mode == DOM_TRAVERSE_FOLLOWING_SKIP_CHILDREN);
+        if (at == NULL) return JS_NewInt64(context, DOM_TRAVERSE_NONE);
+        int type = bridge_dom_node_type(at);
+        if (((what_to_show >> (type - 1)) & 1u) != 0u) {
+            if (at == root) return JS_NewInt64(context, DOM_TRAVERSE_ROOT);
+            if (at == document_node)
+                return JS_NewInt64(context, DOM_TRAVERSE_DOCUMENT);
+            return bridge_node_handle_value(context, bridge, at);
+        }
+        if (at == root && mode == DOM_TRAVERSE_PRECEDING)
+            return JS_NewInt64(context, DOM_TRAVERSE_NONE);
+    }
+    /* Neither can be a resumption point: every walk ends at the root, and
+       the document is only ever reached as its own root. */
+    if (at == root || at == document_node)
+        return JS_NewInt64(context, DOM_TRAVERSE_NONE);
+    int64_t handle = js_rt_bridge_register_node(bridge, at);
+    if (handle == 0) return bridge_throw_handles_exhausted(context);
+    return JS_NewInt64(context, -(handle + 4));
+}
+
+/* False when a descendant could not be given a handle. */
+static bool append_descendants(DomBridge *bridge, lxb_dom_node_t *node,
                                int32_t what_to_show, JSContext *context,
                                JSValue array, uint32_t *count)
 {
     DomDocumentOrderTraversal traversal;
     if (!bridge_document_order_traversal_init(
-            bridge, &traversal, node, node)) return;
+            bridge, &traversal, node, node)) return true;
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL && *count < DOM_QUERY_RESULT_LIMIT;
          at = dom_document_order_next(&traversal)) {
@@ -2783,12 +4146,12 @@ static void append_descendants(DomBridge *bridge, lxb_dom_node_t *node,
         if (include && bridge_traversal_node_visible(
                 bridge, at, &traversal)) {
             int64_t handle = js_rt_bridge_register_node(bridge, at);
-            if (handle != 0) {
-                (void) JS_SetPropertyUint32(context, array, (*count)++,
-                                            JS_NewInt64(context, handle));
-            }
+            if (handle == 0) return false;
+            (void) JS_SetPropertyUint32(context, array, (*count)++,
+                                        JS_NewInt64(context, handle));
         }
     }
+    return true;
 }
 
 JSValue js_dom_descendants(JSContext *context,
@@ -2823,9 +4186,27 @@ JSValue js_dom_descendants(JSContext *context,
         JS_FreeValue(context, remote);
     }
     uint32_t count = 0;
-    if (root != NULL) append_descendants(bridge, root, what_to_show,
-                                         context, array, &count);
+    if (root != NULL && !append_descendants(bridge, root, what_to_show,
+                                            context, array, &count)) {
+        JS_FreeValue(context, array);
+        return bridge_throw_handles_exhausted(context);
+    }
     return array;
+}
+
+/* MutationObserver arms the parser-insertion journal while any observer
+   watches childList changes; see DocumentParserInsertionJournal. */
+JSValue js_dom_observe_parser_insertions(JSContext *context,
+                                         JSValueConst this_value,
+                                         int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->document == NULL) return JS_FALSE;
+    int armed = argc > 0 ? JS_ToBool(context, argv[0]) : 0;
+    if (armed < 0) return JS_EXCEPTION;
+    document_parser_insertions_arm(bridge->document, armed != 0);
+    return JS_TRUE;
 }
 
 JSValue js_dom_named_element_ids(JSContext *context,
@@ -2877,8 +4258,8 @@ JSValue js_dom_content(JSContext *context, JSValueConst this_value,
         return JS_NewInt64(context, 0);
     }
     lxb_html_template_element_t *element = lxb_html_interface_template(node);
-    return JS_NewInt64(context, js_rt_bridge_register_node(
-        bridge, lxb_dom_interface_node(element->content)));
+    return bridge_node_handle_value(
+        context, bridge, lxb_dom_interface_node(element->content));
 }
 
 static bool bridge_clear_cloned_node_user_walk(
@@ -2957,6 +4338,7 @@ JSValue js_dom_clone(JSContext *context, JSValueConst this_value,
             at = at->next;
         }
     }
+    document_style_quiet_begin();
     lxb_dom_node_t *clone = node == NULL ? NULL
                                          : lxb_dom_node_clone(node, deep);
     if (clone != NULL
@@ -2966,7 +4348,8 @@ JSValue js_dom_clone(JSContext *context, JSValueConst this_value,
         lxb_dom_node_destroy_deep(clone);
         clone = NULL;
     }
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, clone));
+    document_style_quiet_end();
+    return bridge_node_handle_value(context, bridge, clone);
 }
 
 JSValue js_dom_attributes(JSContext *context,
@@ -3063,7 +4446,7 @@ JSValue js_dom_create(JSContext *context, JSValueConst this_value,
         lxb_dom_node_destroy_deep(node);
         node = NULL;
     }
-    return JS_NewInt64(context, js_rt_bridge_register_node(bridge, node));
+    return bridge_node_handle_value(context, bridge, node);
 }
 
 JSValue js_dom_create_fragment(JSContext *context,
@@ -3075,8 +4458,9 @@ JSValue js_dom_create_fragment(JSContext *context,
     lxb_dom_document_fragment_t *fragment =
         lxb_dom_document_create_document_fragment(
             &bridge->document->html->dom_document);
-    return JS_NewInt64(context, js_rt_bridge_register_node(
-        bridge, fragment == NULL ? NULL : lxb_dom_interface_node(fragment)));
+    return bridge_node_handle_value(
+        context, bridge,
+        fragment == NULL ? NULL : lxb_dom_interface_node(fragment));
 }
 
 JSValue js_dom_create_text(JSContext *context,
@@ -3095,8 +4479,8 @@ JSValue js_dom_create_text(JSContext *context,
               (const lxb_char_t *) data, length)
         : NULL;
     JS_FreeCString(context, data);
-    return JS_NewInt64(context, js_rt_bridge_register_node(
-        bridge, node == NULL ? NULL : lxb_dom_interface_node(node)));
+    return bridge_node_handle_value(
+        context, bridge, node == NULL ? NULL : lxb_dom_interface_node(node));
 }
 
 JSValue js_dom_create_comment(JSContext *context,
@@ -3115,8 +4499,8 @@ JSValue js_dom_create_comment(JSContext *context,
               (const lxb_char_t *) data, length)
         : NULL;
     JS_FreeCString(context, data);
-    return JS_NewInt64(context, js_rt_bridge_register_node(
-        bridge, node == NULL ? NULL : lxb_dom_interface_node(node)));
+    return bridge_node_handle_value(
+        context, bridge, node == NULL ? NULL : lxb_dom_interface_node(node));
 }
 
 JSValue js_dom_set_custom_state(JSContext *context,
@@ -3366,10 +4750,15 @@ JSValue js_dom_set_text(JSContext *context, JSValueConst this_value,
     const char *text = JS_ToCStringLen(context, &length, argv[1]);
     if (text == NULL) return JS_EXCEPTION;
     lxb_status_t status = LXB_STATUS_OK;
+    /* The TEXT note below covers every write here. Brackets stay around
+       Lexbor calls only: discarding a subtree can run JavaScript cleanup,
+       whose native side effects must still count. */
     if (node->type == LXB_DOM_NODE_TYPE_TEXT
         || node->type == LXB_DOM_NODE_TYPE_COMMENT) {
+        document_style_quiet_begin();
         status = lxb_dom_node_text_content_set(
             node, (const lxb_char_t *) text, length);
+        document_style_quiet_end();
     } else {
         /* Element.textContent detaches the previous children; it must not
            destroy Node objects still referenced by author JavaScript.
@@ -3385,10 +4774,13 @@ JSValue js_dom_set_text(JSContext *context, JSValueConst this_value,
         } else {
             while (node->first_child != NULL) {
                 lxb_dom_node_t *removed = node->first_child;
+                document_style_quiet_begin();
                 lxb_dom_node_remove(removed);
+                document_style_quiet_end();
                 (void) bridge_discard_unretained_detached_subtree(
                     bridge, removed);
             }
+            document_style_quiet_begin();
             if (replacement != NULL
                 && lxb_dom_node_append_child(
                        node, lxb_dom_interface_node(replacement))
@@ -3397,6 +4789,7 @@ JSValue js_dom_set_text(JSContext *context, JSValueConst this_value,
                     lxb_dom_interface_node(replacement));
                 status = LXB_STATUS_ERROR;
             }
+            document_style_quiet_end();
         }
     }
     JS_FreeCString(context, text);
@@ -3487,6 +4880,9 @@ static bool bridge_replace_inner_html(
     const char *context_name = div_name;
     if (node->type == LXB_DOM_NODE_TYPE_ELEMENT)
         context_name = document_element_name(node, &context_name_length);
+    /* Every connected change below is published as one INNER_HTML note.
+       Brackets stay around Lexbor calls only (see js_dom_set_text). */
+    document_style_quiet_begin();
     lxb_dom_element_t *container = context_name == NULL ? NULL
         : lxb_dom_document_create_element(
               &bridge->document->html->dom_document,
@@ -3497,10 +4893,12 @@ static bool bridge_replace_inner_html(
         && document_set_element_inner_html(
                bridge->document, container_node,
                html == NULL ? "" : html, length);
+    document_style_quiet_end();
     bool changed = false;
     if (valid) {
         bridge_detach_and_discard_children(bridge, node);
         changed = true;
+        document_style_quiet_begin();
         while (container_node->first_child != NULL) {
             lxb_dom_node_t *child = container_node->first_child;
             lxb_dom_node_remove(child);
@@ -3510,8 +4908,11 @@ static bool bridge_replace_inner_html(
                 break;
             }
         }
+        document_style_quiet_end();
     }
+    document_style_quiet_begin();
     if (container_node != NULL) lxb_dom_node_destroy_deep(container_node);
+    document_style_quiet_end();
     if (changed) {
         /* Fragment parsing does not execute scripts. Register every restored
            source node as already started before publishing the mutation. */
@@ -3685,16 +5086,35 @@ JSValue js_dom_set_attribute(JSContext *context,
     bool old_present = old_value != NULL || lxb_dom_element_has_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length);
-    /* Selector identity is unchanged by writing the same id/class again.
-       Keep the DOM setter and JavaScript observer/custom-element delivery,
-       but do not invalidate the entire style/layout tree for that no-op.
-       Resource and form attributes retain their existing setter effects. */
+    /* Timed only for the profiler; the counts are free. */
+    bool timed = bridge != NULL && bridge->host != NULL
+        && bridge->host->profile != NULL;
+    uint64_t write_started_ns = timed ? js_rt_monotonic_time_ns() : 0;
+    if (bridge != NULL) {
+        bridge->attribute_writes++;
+        if (old_present && old_value_length == value_length
+            && (value_length == 0
+                || memcmp(old_value, value, value_length) == 0))
+            bridge->attribute_writes_unchanged++;
+    }
+    /* Writing the same id, class, inline style, data-* or aria-* value
+       again changes nothing a selector, declaration or layout reads (pages
+       re-apply identical root style blocks on every render). Keep the DOM
+       setter and JavaScript observer/custom-element delivery, but do not
+       invalidate the style/layout tree for that no-op. A style write also
+       revokes CSSOM authorization, so it is a no-op only when that was
+       already revoked. Resource and form attributes retain their existing
+       setter effects. */
     bool unchanged_selector_identity = old_present
         && old_value_length == value_length
         && (value_length == 0
             || memcmp(old_value, value, value_length) == 0)
         && ((name_length == 2 && strncasecmp(name, "id", 2) == 0)
-            || (name_length == 5 && strncasecmp(name, "class", 5) == 0));
+            || (name_length == 5 && strncasecmp(name, "class", 5) == 0)
+            || (name_length == 5 && strncasecmp(name, "style", 5) == 0
+                && !document_style_attribute_cssom_authorized(node))
+            || (name_length > 5 && strncasecmp(name, "data-", 5) == 0)
+            || (name_length > 5 && strncasecmp(name, "aria-", 5) == 0));
     bool relational_selector_sensitive =
         !unchanged_selector_identity && stylesheet_attribute_change_may_affect_has(
             bridge == NULL ? NULL : bridge->stylesheet,
@@ -3713,9 +5133,11 @@ JSValue js_dom_set_attribute(JSContext *context,
             old_present ? old_value_length : 0,
             value, value_length, changed_tokens,
             SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
+    document_style_quiet_begin();
     lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length, (const lxb_char_t *) value, value_length);
+    document_style_quiet_end();
     bool async_attribute = name_length == 5
         && strncasecmp(name, "async", 5) == 0;
     bool source_attribute = name_length == 3
@@ -3742,6 +5164,11 @@ JSValue js_dom_set_attribute(JSContext *context,
     }
     JS_FreeCString(context, value);
     JS_FreeCString(context, name);
+    if (timed) {
+        uint64_t finished_ns = js_rt_monotonic_time_ns();
+        if (finished_ns > write_started_ns)
+            bridge->attribute_write_ns += finished_ns - write_started_ns;
+    }
     return JS_NewBool(context, attribute != NULL);
 }
 
@@ -3798,8 +5225,25 @@ JSValue js_dom_parser_form_owner(JSContext *context,
     lxb_dom_node_t *owner =
         document_control_parser_form_owner(node);
     if (bridge == NULL || owner == NULL) return JS_NULL;
-    int64_t handle = js_rt_bridge_register_node(bridge, owner);
-    return handle > 0 ? JS_NewInt64(context, handle) : JS_NULL;
+    return bridge_node_handle_value(context, bridge, owner);
+}
+
+/* A value that changes whenever the DOM may have: every script mutation
+   plus the parser's growth (node count). Realm caches compare it. */
+JSValue js_dom_version(JSContext *context, JSValueConst this_value,
+                       int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL) return JS_NewFloat64(context, -1.0);
+    double nodes = bridge->document == NULL
+        ? 0.0 : (double) bridge->document->node_count;
+    /* A truthy argument asks for the structural version (form.elements). */
+    uint64_t version = argc > 0 && JS_ToBool(context, argv[0]) > 0
+        ? bridge->dom_structure_version : bridge->dom_version;
+    return JS_NewFloat64(context, (double) version * 16777216.0 + nodes);
 }
 
 JSValue js_dom_has_parser_form_owners(JSContext *context,
@@ -3822,14 +5266,11 @@ JSValue js_runtime_heap_remaining(JSContext *context,
     (void) this_value;
     (void) argc;
     (void) argv;
-    JSMemoryUsage usage;
-    memset(&usage, 0, sizeof(usage));
-    JS_ComputeMemoryUsage(JS_GetRuntime(context), &usage);
-    int64_t remaining =
-        usage.malloc_limit > 0 && usage.malloc_size >= 0
-            && usage.malloc_size < usage.malloc_limit
-        ? usage.malloc_limit - usage.malloc_size : 0;
-    return JS_NewInt64(context, remaining);
+    /* O(1) from the allocator-maintained count; no heap census. */
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    size_t remaining = script_runtime_heap_remaining(
+        bridge == NULL ? NULL : bridge->host);
+    return JS_NewInt64(context, (int64_t) remaining);
 }
 
 JSValue js_dom_remove_attribute(JSContext *context,
@@ -3873,9 +5314,11 @@ JSValue js_dom_remove_attribute(JSContext *context,
         existed ? (old_value == NULL ? "" : (const char *) old_value) : NULL,
         existed ? old_value_length : 0, NULL, 0, changed_tokens,
         SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
+    document_style_quiet_begin();
     lxb_status_t status = lxb_dom_element_remove_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length);
+    document_style_quiet_end();
     if (existed && status == LXB_STATUS_OK) {
         bridge_mutated_with_relational(
             bridge, SCRIPT_MUTATION_ATTRIBUTE, node,
@@ -4117,10 +5560,781 @@ static int computed_style_positioning_width(
     return parent == NULL ? 0 : parent->client_width;
 }
 
+/* A ring of resolved ancestor styles, retained for the page's lifetime:
+   64 x 348 bytes = 22 KiB on the PSP (384 bytes, 24 KiB on 64-bit hosts).
+   ChatGPT send (1251 reads) misses 590 of 5330 lookups at 64, 128 and 256
+   slots alike (594 at 48) in the same 17 ms; misses there come from
+   mutation clears, not capacity. Only a whole-document sweep (715
+   elements, three passes) gains from more (2264 -> 1914 misses, 22 ->
+   17 ms host at 256), which does not pay for 87 KiB on the PSP. A bounded
+   index now avoids scanning the replacement ring on each lookup. */
+#define COMPUTED_STYLE_CACHE_SLOTS 64u
+_Static_assert(COMPUTED_STYLE_CACHE_SLOTS <= UINT8_MAX
+    && (COMPUTED_STYLE_CACHE_SLOTS & (COMPUTED_STYLE_CACHE_SLOTS - 1u)) == 0
+    && sizeof(((DomBridge *) 0)->computed_style_cache.buckets)
+        == COMPUTED_STYLE_CACHE_SLOTS
+    && sizeof(((DomBridge *) 0)->computed_style_cache.links)
+        == COMPUTED_STYLE_CACHE_SLOTS,
+    "computed-style index must match its bounded replacement ring");
+struct ComputedStyleCacheEntry {
+    const lxb_dom_node_t *node;
+    ComputedStyle style;
+    /* computed_style_parent_key() of the parent style it was resolved
+       from, and the cache epoch it was last known valid in. */
+    uint64_t parent_key;
+    uint32_t stamp;
+};
+
+/* The identity of a parent style, as the layout reuse cache keys its
+   entries (layout_style_parent_hash): two 32-bit FNV lanes over the bytes.
+   Unequal padding can only cost a recomputation. */
+static uint64_t computed_style_parent_key(const ComputedStyle *style)
+{
+    if (style == NULL) return UINT64_C(0x9e3779b97f4a7c15);
+    const unsigned char *bytes = (const unsigned char *) style;
+    uint32_t low = UINT32_C(2166136261);
+    uint32_t high = UINT32_C(0x85ebca6b);
+    size_t length = sizeof(*style);
+    while (length >= sizeof(uint32_t)) {
+        uint32_t word = 0;
+        memcpy(&word, bytes, sizeof(word));
+        low = (low ^ word) * UINT32_C(16777619);
+        high = (high ^ (word + UINT32_C(0x9e3779b9)))
+               * UINT32_C(2246822519);
+        bytes += sizeof(word);
+        length -= sizeof(word);
+    }
+    while (length-- != 0) {
+        low = (low ^ *bytes) * UINT32_C(16777619);
+        high = (high ^ (uint32_t) (*bytes++ + 0x9eu)) * UINT32_C(2246822519);
+    }
+    return ((uint64_t) high << 32) | low;
+}
+
+static size_t computed_style_cache_bucket(const lxb_dom_node_t *node)
+{
+    uintptr_t key = (uintptr_t) node >> 3;
+    key ^= key >> 7;
+    key ^= key >> 13;
+    return key & (COMPUTED_STYLE_CACHE_SLOTS - 1u);
+}
+
+static void computed_style_cache_remove(DomBridge *bridge, size_t slot)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    const lxb_dom_node_t *node = cache->entries[slot].node;
+    if (node == NULL) return;
+    uint8_t *link = &cache->buckets[computed_style_cache_bucket(node)];
+    for (size_t visited = 0; *link != 0 && visited < COMPUTED_STYLE_CACHE_SLOTS;
+         visited++) {
+        size_t at = *link - 1u;
+        if (at == slot) {
+            *link = cache->links[at];
+            break;
+        }
+        link = &cache->links[at];
+    }
+    cache->entries[slot].node = NULL;
+    cache->links[slot] = 0;
+}
+
+/* The ancestor cache for this read, emptied when any cascade input moved
+   (the computed-style memo's key); NULL when styles depend on layout
+   (container queries and units) or no Budget room is left. */
+static bool bridge_node_within(const lxb_dom_node_t *node,
+                               const lxb_dom_node_t *scope)
+{
+    for (unsigned depth = 0; node != NULL && depth < 256u;
+         node = node->parent, depth++)
+        if (node == scope) return true;
+    return false;
+}
+
+/* Which selector features the cache's scoped invalidation must respect,
+   as the layout reuse cache reads them (layout_reuse_note_selector_
+   dependencies): :has() can restyle ancestors, structural pseudo-classes
+   and sibling combinators restyle siblings, focus selectors restyle
+   through state the mutation journal does not name. */
+/* The key of the element a structural test in `selector` at `at`
+   concerns: the compound holding `at` (a positional pseudo-class), or the
+   one after it (a sibling combinator). Zero when no key bounds it. */
+static void bridge_computed_style_note_key(uint32_t *keys, uint8_t *count,
+                                           bool *any, uint32_t key)
+{
+    if (key == 0) {
+        *any = true;
+        return;
+    }
+    for (uint8_t i = 0; i < *count; i++)
+        if (keys[i] == key) return;
+    if (*count == COMPUTED_STYLE_CUSTOM_KEY_LIMIT) {
+        *any = true;
+        return;
+    }
+    keys[(*count)++] = key;
+}
+
+/* Every structural test in a custom-property selector, as keys of the
+   elements whose custom properties it can switch: `sibling` only for the
+   tests an attribute change can move (sibling combinators, `of S`
+   counts), otherwise positional pseudo-classes too. */
+static void bridge_computed_style_custom_keys(
+    const char *selector, bool sibling, uint32_t *keys, uint8_t *count,
+    bool *any)
+{
+    size_t length = strlen(selector);
+    for (size_t at = 0; at < length && !*any; at++) {
+        char value = selector[at];
+        if (value == '+' || value == '~') {
+            size_t next = at + 1;
+            while (next < length && isspace((unsigned char) selector[next]))
+                next++;
+            bridge_computed_style_note_key(
+                keys, count, any, next < length
+                    ? style_selector_compound_key_at(selector, length, next)
+                    : 0);
+        } else if (value == ':') {
+            const char *rest = selector + at;
+            bool of = strncmp(rest, ":nth-child(", 11) == 0
+                || strncmp(rest, ":nth-last-child(", 16) == 0;
+            bool positional = strncmp(rest, ":nth-", 5) == 0
+                || strncmp(rest, ":first-", 7) == 0
+                || strncmp(rest, ":last-", 6) == 0
+                || strncmp(rest, ":only-", 6) == 0
+                || strncmp(rest, ":empty", 6) == 0;
+            if (positional && (!sibling || of))
+                bridge_computed_style_note_key(
+                    keys, count, any,
+                    style_selector_compound_key_at(selector, length, at));
+        }
+    }
+}
+
+static void bridge_computed_style_flags(DomBridge *bridge)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    const Stylesheet *sheet = bridge->stylesheet;
+    if (cache->flags_sheet == (const void *) sheet
+        && cache->flags_generation == sheet->build_generation) return;
+    cache->flags_sheet = sheet;
+    cache->flags_generation = sheet->build_generation;
+    cache->flags_has = cache->flags_structure = cache->flags_focus = false;
+    cache->flags_sibling = cache->flags_empty_sibling = false;
+    cache->empty_key_count = 0;
+    cache->empty_any = false;
+    cache->flags_custom_has = cache->flags_has_escaped = false;
+    cache->custom_sibling_key_count = cache->custom_structure_key_count = 0;
+    cache->custom_sibling_any = cache->custom_structure_any = false;
+    memset(&cache->structure, 0, sizeof(cache->structure));
+    memset(&cache->sibling_structure, 0, sizeof(cache->sibling_structure));
+    for (size_t pass = 0; pass < 2; pass++) {
+        size_t count = pass == 0 ? sheet->count : sheet->custom_rule_count;
+        for (size_t i = 0; i < count; i++) {
+            const char *selector = pass == 0 ? sheet->rules[i].selector
+                                             : sheet->custom_rules[i].selector;
+            if (selector == NULL || strpbrk(selector, ":+~") == NULL)
+                continue;
+            if (strstr(selector, ":has(") != NULL) {
+                cache->flags_has = true;
+                if (pass == 1) cache->flags_custom_has = true;
+                /* The :has() classifier compares attribute names as
+                   written; an escaped selector keeps every change
+                   conservative. */
+                if (strchr(selector, '\\') != NULL)
+                    cache->flags_has_escaped = true;
+            }
+            if (strstr(selector, ":focus") != NULL) cache->flags_focus = true;
+            bool empty = strstr(selector, ":empty") != NULL
+                || strstr(selector, ":blank") != NULL;
+            bool sibling = strchr(selector, '+') != NULL
+                || strchr(selector, '~') != NULL
+                || strstr(selector, " of ") != NULL;
+            bool structure = sibling || empty
+                || strstr(selector, ":nth-") != NULL
+                || strstr(selector, ":first-") != NULL
+                || strstr(selector, ":last-") != NULL
+                || strstr(selector, ":only-") != NULL;
+            if (!structure) continue;
+            cache->flags_structure = true;
+            /* An element's :empty can restyle outside its own subtree only
+               through a sibling test (layout_reuse_empty_reaches_siblings):
+               keyed by the compound that tests it. */
+            if (empty && sibling) {
+                cache->flags_empty_sibling = true;
+                size_t length = strlen(selector);
+                for (const char *at = selector; !cache->empty_any
+                     && (at = strpbrk(at, ":")) != NULL; at++) {
+                    if (strncmp(at, ":empty", 6) != 0
+                        && strncmp(at, ":blank", 6) != 0) continue;
+                    bridge_computed_style_note_key(
+                        cache->empty_keys, &cache->empty_key_count,
+                        &cache->empty_any,
+                        style_selector_compound_key_at(
+                            selector, length, (size_t) (at - selector)));
+                }
+            }
+            /* As the layout reuse cache notes them
+               (layout_reuse_note_selector_dependencies). A '+' inside an
+               An+B argument counts too: conservative. */
+            style_selector_structure_keys(selector, strlen(selector),
+                                          &cache->structure);
+            if (sibling) {
+                cache->flags_sibling = true;
+                style_selector_structure_keys(selector, strlen(selector),
+                                              &cache->sibling_structure);
+            }
+            if (pass == 1) {
+                bridge_computed_style_custom_keys(
+                    selector, false, cache->custom_structure_keys,
+                    &cache->custom_structure_key_count,
+                    &cache->custom_structure_any);
+                if (sibling)
+                    bridge_computed_style_custom_keys(
+                        selector, true, cache->custom_sibling_keys,
+                        &cache->custom_sibling_key_count,
+                        &cache->custom_sibling_any);
+            }
+        }
+    }
+}
+
+/* Whether a structural test that reaches descendants (`.a + .b .c`,
+   `tr:last-child > *`) can concern one of `parent`'s children, as
+   layout_reuse_structure_deep asks: then a change to a child restyles its
+   siblings' subtrees, not only the siblings. Past the child bound, assume
+   it can. */
+static bool bridge_computed_style_structure_deep(
+    const StyleStructureKeys *keys, const lxb_dom_node_t *parent)
+{
+    if (!keys->reaches) return false;
+    if (keys->any) return true;
+    size_t children = 0;
+    for (const lxb_dom_node_t *child = parent->first_child; child != NULL;
+         child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (++children > 512u) return true;
+        if (style_element_carries_any_key_unsorted(child, keys->keys, keys->count))
+            return true;
+    }
+    return false;
+}
+
+/* Queue `node` for a subtree drop; false when the list is full. */
+static bool bridge_computed_style_scope(DomBridge *bridge,
+                                        lxb_dom_node_t *node)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    for (size_t i = 0; i < cache->dirty_count; i++)
+        if (cache->dirty[i] == node) return true;
+    if (cache->dirty_count == sizeof(cache->dirty) / sizeof(cache->dirty[0]))
+        return false;
+    cache->dirty[cache->dirty_count++] = node;
+    return true;
+}
+
+/* Queue `node`'s own entry for a drop; false when the list is full. */
+static bool bridge_computed_style_shallow(DomBridge *bridge,
+                                          lxb_dom_node_t *node)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    for (size_t i = 0; i < cache->shallow_count; i++)
+        if (cache->shallow[i] == node) return true;
+    if (cache->shallow_count
+        == sizeof(cache->shallow) / sizeof(cache->shallow[0]))
+        return false;
+    cache->shallow[cache->shallow_count++] = node;
+    return true;
+}
+
+/* An element whose :has()-dependent match may move: its own entry, or its
+   subtree where a custom-property rule can be the one that moves. */
+static void bridge_computed_style_has_drop(void *opaque, lxb_dom_node_t *node)
+{
+    DomBridge *bridge = opaque;
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    bool queued = cache->flags_custom_has
+        ? bridge_computed_style_scope(bridge, node)
+        : bridge_computed_style_shallow(bridge, node);
+    if (!queued) cache->dirty_all = true;
+}
+
+static struct ComputedStyleCacheEntry *computed_style_cache_find(
+    DomBridge *bridge, const lxb_dom_node_t *node);
+
+/* Whether any retained style belongs to `scope` or its subtree. A change
+   whose reach lies inside a subtree nothing was read from has nothing to
+   drop (entries are only added by reads, which apply the drops first). */
+static bool bridge_computed_style_cached_within(const DomBridge *bridge,
+                                                const lxb_dom_node_t *scope)
+{
+    const struct ComputedStyleCacheEntry *entries =
+        bridge->computed_style_cache.entries;
+    for (size_t i = 0; entries != NULL && i < COMPUTED_STYLE_CACHE_SLOTS; i++)
+        if (entries[i].node != NULL
+            && bridge_node_within(entries[i].node, scope)) return true;
+    return false;
+}
+
+/* A change at `node` (`tree`: inserted or about to be removed; otherwise
+   an attribute a sibling test reads) that structural tests let reach its
+   siblings. The siblings' own styles go and their subtrees re-key off
+   them, as in layout's reuse cache, unless a test reaches their
+   descendants or a custom-property rule can switch a sibling's custom
+   properties (not in ComputedStyle: that sibling's subtree goes). False
+   when only the parent's subtree covers it. */
+static bool bridge_computed_style_siblings(DomBridge *bridge,
+                                           lxb_dom_node_t *node,
+                                           lxb_dom_node_t *parent, bool tree)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (parent == NULL || parent->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || bridge_computed_style_structure_deep(
+               tree ? &cache->structure : &cache->sibling_structure, parent))
+        return false;
+    bool custom_any = tree ? cache->custom_structure_any
+                           : cache->custom_sibling_any;
+    const uint32_t *custom_keys = tree ? cache->custom_structure_keys
+                                       : cache->custom_sibling_keys;
+    size_t custom_count = tree ? cache->custom_structure_key_count
+                               : cache->custom_sibling_key_count;
+    if (custom_any || !bridge_computed_style_shallow(bridge, parent)
+        || !bridge_computed_style_scope(bridge, node)) return false;
+    size_t children = 0;
+    for (lxb_dom_node_t *child = parent->first_child; child != NULL;
+         child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT || child == node)
+            continue;
+        if (++children > 512u) return false;
+        if (custom_count != 0
+            && style_element_carries_any_key_unsorted(child, custom_keys,
+                                             custom_count)) {
+            if (!bridge_computed_style_scope(bridge, child)) return false;
+        } else if (computed_style_cache_find(bridge, child) != NULL
+                   && !bridge_computed_style_shallow(bridge, child)) {
+            /* Only a cached sibling has anything to drop. */
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A connected mutation: remember what cached styles it can change, instead
+   of emptying the cache (pages mutate between reads). */
+static void bridge_computed_style_note_mutation(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length, bool relational,
+    const uint32_t *changed_tokens, size_t changed_token_count)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->entries == NULL || cache->dirty_all) return;
+    if (bridge->stylesheet == NULL || node == NULL) {
+        cache->dirty_all = true;
+        return;
+    }
+    /* Retained nodes are followed (below) only while the captured inputs
+       name this document and sheet, as in the flush: otherwise the next
+       read clears everything without touching them. */
+    if (cache->inputs.sheet != (const void *) bridge->stylesheet
+        || cache->inputs.dom != (const void *) (bridge->document == NULL
+                                                ? NULL
+                                                : bridge->document->html))
+        return;
+    bridge_computed_style_flags(bridge);
+    bool known = kind == SCRIPT_MUTATION_ATTRIBUTE
+        || kind == SCRIPT_MUTATION_INLINE_STYLE
+        || kind == SCRIPT_MUTATION_TEXT
+        || kind == SCRIPT_MUTATION_CHILD_LIST
+        || kind == SCRIPT_MUTATION_INNER_HTML;
+    /* Engine state (focus, hover and similar) travels as data-tilefinch-*
+       attributes and can restyle through selectors a subtree scope
+       misses. */
+    bool engine_state = attribute != NULL && attribute_length >= 15u
+        && strncasecmp(attribute, "data-tilefinch-", 15u) == 0;
+    /* Unobserved author bookkeeping, a data-* attribute no selector tests,
+       cannot change a cascade (layout's reuse check treats it the same way;
+       see history_runtime.inc). Engine state keeps its semantics. */
+    if (kind == SCRIPT_MUTATION_ATTRIBUTE && !engine_state
+        && attribute != NULL && attribute_length > 5u
+        && strncasecmp(attribute, "data-", 5u) == 0
+        && !stylesheet_selectors_reference_attribute_prefix(
+               bridge->stylesheet, attribute, attribute_length))
+        return;
+    if (!known || (engine_state && cache->flags_focus)) {
+        cache->dirty_all = true;
+        return;
+    }
+    bool tree = kind == SCRIPT_MUTATION_TEXT
+        || kind == SCRIPT_MUTATION_CHILD_LIST
+        || kind == SCRIPT_MUTATION_INNER_HTML;
+    /* Nothing retained, nothing to drop. */
+    bool retained = false;
+    for (size_t i = 0; !retained && i < COMPUTED_STYLE_CACHE_SLOTS; i++)
+        retained = cache->entries[i].node != NULL;
+    if (!retained) return;
+    /* A change a :has() rule may observe drops the elements whose answers
+       can move, found from the changed position as layout's reuse cache
+       finds them (style_has_invalidation.c), rather than every style. */
+    if (relational && cache->flags_has && cache->flags_has_escaped) {
+        cache->dirty_all = true;
+        return;
+    }
+    if (relational && cache->flags_has) {
+        char name[64];
+        const char *has_attribute = NULL;
+        /* An inline-style record names the CSS property; the attribute a
+           selector can read is `style`. */
+        if (kind == SCRIPT_MUTATION_INLINE_STYLE) {
+            has_attribute = "style";
+        } else if (!tree && attribute != NULL
+                   && attribute_length < sizeof(name)) {
+            for (size_t i = 0; i < attribute_length; i++)
+                name[i] = (char) tolower((unsigned char) attribute[i]);
+            name[attribute_length] = '\0';
+            has_attribute = name;
+        }
+        bool exact_tokens = changed_tokens != NULL
+            && changed_token_count <= SCRIPT_MUTATION_TOKEN_LIMIT;
+        if (
+#ifndef TILEFINCH_NO_TRACE
+            getenv("TILEFINCH_DISABLE_HAS_SCOPED_INVALIDATION") != NULL ||
+#endif
+            !style_has_note_change(
+                bridge->stylesheet, node, tree, has_attribute,
+                exact_tokens ? changed_tokens : NULL,
+                exact_tokens ? changed_token_count : 0,
+                &cache->has_pending, bridge_computed_style_has_drop, bridge,
+                NULL)) {
+            cache->dirty_all = true;
+            return;
+        }
+        cache->has_active = cache->has_pending.active;
+        if (cache->dirty_all) return;
+    }
+    lxb_dom_node_t *scope = node;
+    lxb_dom_node_t *parent = node->parent;
+    /* Everything below reaches at most the grandparent's subtree. */
+    lxb_dom_node_t *reach = parent == NULL ? node
+        : (parent->parent != NULL ? parent->parent : parent);
+    if (!bridge_computed_style_cached_within(bridge, reach)) return;
+    /* A child list or text change can flip the parent's :empty, which a
+       sibling test turns into its siblings' styles: the grandparent's
+       subtree. */
+    bool empty_reaches = tree && cache->flags_empty_sibling && parent != NULL
+        && parent->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && (cache->empty_any
+            || style_element_carries_any_key_unsorted(parent, cache->empty_keys,
+                                             cache->empty_key_count));
+    if (empty_reaches) {
+        scope = parent->parent != NULL ? parent->parent : parent;
+    } else if (kind == SCRIPT_MUTATION_CHILD_LIST
+               && node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        /* An element inserted or about to leave: its subtree, the parent
+           (:empty) and, when structural tests exist, the siblings whose
+           positions move. */
+        if (!cache->flags_structure
+            ? bridge_computed_style_shallow(bridge, parent)
+                && bridge_computed_style_scope(bridge, node)
+            : bridge_computed_style_siblings(bridge, node, parent, true))
+            return;
+        scope = parent;
+    } else if (tree || engine_state) {
+        if (parent != NULL) scope = parent;
+    } else if (cache->flags_sibling && parent != NULL) {
+        /* An attribute can reach other elements' matches only through a
+           sibling combinator or an `of S` count (positional
+           pseudo-classes read positions, :has() is handled above). */
+        if (bridge_computed_style_siblings(bridge, node, parent, false))
+            return;
+        scope = parent;
+    }
+    if (scope == NULL || !bridge_computed_style_scope(bridge, scope))
+        cache->dirty_all = true;
+}
+
+/* The container states' signature for the sheet's current container
+   generation. Every layout pass rebuilds the states (bumping the
+   generation) although they seldom change; retained styles compare what
+   container queries and units can read instead. */
+static uint64_t bridge_container_signature(DomBridge *bridge)
+{
+    const Stylesheet *sheet = bridge->stylesheet;
+    if (bridge->computed_style_container_sheet != (const void *) sheet
+        || bridge->computed_style_container_generation
+               != sheet->container_state_generation) {
+        bridge->computed_style_container_sheet = sheet;
+        bridge->computed_style_container_generation =
+            sheet->container_state_generation;
+        bridge->computed_style_container_signature =
+            style_container_layout_state_signature(sheet);
+    }
+    return bridge->computed_style_container_signature;
+}
+
+/* Whether retained styles keyed by `inputs` still hold; a container
+   generation whose states did not change is adopted in place. */
+static bool computed_style_inputs_hold(DomBridge *bridge,
+                                       ComputedStyleInputs *inputs)
+{
+    const Stylesheet *sheet = bridge->stylesheet;
+    if (inputs->sheet != (const void *) sheet
+        || inputs->dom != (const void *) (bridge->document == NULL ? NULL
+                                          : bridge->document->html)
+        || inputs->sheet_generation != sheet->build_generation
+        || inputs->fullscreen_node != sheet->fullscreen_node
+        || inputs->host_generation != document_style_generation())
+        return false;
+    if (inputs->container_generation == sheet->container_state_generation)
+        return true;
+    if (inputs->container_signature != bridge_container_signature(bridge))
+        return false;
+    inputs->container_generation = sheet->container_state_generation;
+    return true;
+}
+
+static void computed_style_inputs_capture(DomBridge *bridge,
+                                          ComputedStyleInputs *inputs)
+{
+    const Stylesheet *sheet = bridge->stylesheet;
+    *inputs = (ComputedStyleInputs) {
+        .sheet = sheet,
+        .dom = bridge->document == NULL ? NULL : bridge->document->html,
+        .sheet_generation = sheet->build_generation,
+        .container_generation = sheet->container_state_generation,
+        .container_signature = bridge_container_signature(bridge),
+        .host_generation = document_style_generation(),
+        .fullscreen_node = sheet->fullscreen_node
+    };
+}
+
+/* Lexbor is removing `node` from its parent, possibly to destroy it: drop
+   its retained style before the address can name another node. Descendants
+   stay: they are still allocated, and whatever reconnects them is a
+   mutation the cache sees. */
+static void bridge_computed_style_node_removed(void *opaque,
+                                               const lxb_dom_node_t *node)
+{
+    DomBridge *bridge = opaque;
+    if (bridge->computed_style_memo.node == node)
+        bridge->computed_style_memo.node = NULL;
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->entries == NULL) return;
+    /* Queued drops must not name a node whose address can be reused. */
+    style_has_pending_retire(&cache->has_pending, node);
+    for (size_t i = 0; i < cache->shallow_count; i++) {
+        if (cache->shallow[i] != node) continue;
+        cache->shallow[i] = cache->shallow[--cache->shallow_count];
+        break;
+    }
+    uint8_t link = cache->buckets[computed_style_cache_bucket(node)];
+    for (size_t visited = 0; link != 0 && visited < COMPUTED_STYLE_CACHE_SLOTS;
+         visited++) {
+        size_t at = link - 1u;
+        if (cache->entries[at].node == node) {
+            computed_style_cache_remove(bridge, at);
+            return;
+        }
+        link = cache->links[at];
+    }
+}
+
+static struct ComputedStyleCacheEntry *bridge_computed_style_cache(
+    DomBridge *bridge)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (bridge->stylesheet == NULL) return NULL;
+    if (cache->entries == NULL) {
+        /* Entries outlive script entries, so a node must be evicted when
+           Lexbor removes it; without a listener slot there is no ring. */
+        if (!cache->removal_listening) {
+            cache->removal_listening = document_node_removal_listen(
+                bridge_computed_style_node_removed, bridge);
+            if (!cache->removal_listening) return NULL;
+        }
+        cache->entries = budget_calloc(bridge->budget,
+                                       COMPUTED_STYLE_CACHE_SLOTS,
+                                       sizeof(*cache->entries));
+        if (cache->entries == NULL) return NULL;
+        cache->inputs.sheet = NULL;
+    }
+    uint64_t content_generation = bridge->document == NULL
+        ? 0 : bridge->document->content_generation;
+    bool same_inputs = computed_style_inputs_hold(bridge, &cache->inputs);
+    if (cache->has_active && cache->has_pending.styles_all)
+        cache->dirty_all = true;
+    if (same_inputs && cache->content_generation != content_generation
+        && !cache->dirty_all) {
+        /* Only the mutated subtrees' styles can have changed, and the own
+           styles of the elements queued alone: their descendants are
+           checked against their parents' styles when next read. Keyed
+           :has() subjects go alone too, or with their subtrees when a
+           custom-property rule can be what moved. */
+        const lxb_dom_node_t *subjects[COMPUTED_STYLE_CACHE_SLOTS];
+        size_t subject_count = 0;
+        for (size_t i = 0; i < COMPUTED_STYLE_CACHE_SLOTS; i++) {
+            const lxb_dom_node_t *node = cache->entries[i].node;
+            if (node == NULL) continue;
+            bool drop = false;
+            for (size_t d = 0; !drop && d < cache->dirty_count; d++)
+                drop = bridge_node_within(node, cache->dirty[d]);
+            for (size_t d = 0; !drop && d < cache->shallow_count; d++)
+                drop = node == cache->shallow[d];
+            if (!drop && cache->has_active
+                && style_has_pending_selects(bridge->stylesheet,
+                                             &cache->has_pending, node)) {
+                drop = true;
+                if (cache->flags_custom_has)
+                    subjects[subject_count++] = node;
+            }
+            if (drop) computed_style_cache_remove(bridge, i);
+        }
+        for (size_t i = 0; subject_count != 0
+                           && i < COMPUTED_STYLE_CACHE_SLOTS; i++) {
+            const lxb_dom_node_t *node = cache->entries[i].node;
+            for (size_t s = 0; node != NULL && s < subject_count; s++) {
+                if (!bridge_node_within(node, subjects[s])) continue;
+                computed_style_cache_remove(bridge, i);
+                break;
+            }
+        }
+        cache->dirty_count = 0;
+        cache->shallow_count = 0;
+        cache->has_active = false;
+        memset(&cache->has_pending, 0, sizeof(cache->has_pending));
+        cache->content_generation = content_generation;
+        cache->scoped_clears++;
+        cache->epoch++;
+        style_variable_cache_lease_clear(&cache->variables);
+    }
+    if (!same_inputs || cache->content_generation != content_generation) {
+        if (cache->inputs.sheet != NULL
+            && cache->inputs.host_generation != document_style_generation())
+            cache->host_clears++;
+        cache->full_clears++;
+        cache->dirty_count = 0;
+        cache->shallow_count = 0;
+        cache->has_active = false;
+        memset(&cache->has_pending, 0, sizeof(cache->has_pending));
+        cache->epoch++;
+        cache->dirty_all = false;
+        style_variable_cache_lease_clear(&cache->variables);
+        for (size_t i = 0; i < COMPUTED_STYLE_CACHE_SLOTS; i++)
+            cache->entries[i].node = NULL;
+        memset(cache->buckets, 0, sizeof(cache->buckets));
+        memset(cache->links, 0, sizeof(cache->links));
+        computed_style_inputs_capture(bridge, &cache->inputs);
+        cache->content_generation = content_generation;
+        cache->next = 0;
+    }
+    return cache->entries;
+}
+
+void js_rt_bridge_computed_style_cache_free(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    if (bridge->computed_style_cache.removal_listening)
+        document_node_removal_unlisten(bridge_computed_style_node_removed,
+                                       bridge);
+    bridge->computed_style_cache.removal_listening = false;
+    style_variable_cache_lease_release(&bridge->computed_style_cache.variables);
+    budget_free(bridge->budget, bridge->computed_style_cache.entries);
+    bridge->computed_style_cache.entries = NULL;
+    bridge->computed_style_memo.node = NULL;
+}
+
+/* A document is leaving the bridge (script_runtime_detach_document): its
+   tree may next be destroyed wholesale, which removes no node one by one,
+   so the removal listener never evicts them. Forget every retained node
+   and queued drop now, before any address can dangle or be reused; the
+   next read starts from a full clear. */
+void js_rt_bridge_computed_style_cache_forget(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    bridge->computed_style_memo.node = NULL;
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->entries == NULL) return;
+    for (size_t i = 0; i < COMPUTED_STYLE_CACHE_SLOTS; i++)
+        cache->entries[i].node = NULL;
+    memset(cache->buckets, 0, sizeof(cache->buckets));
+    memset(cache->links, 0, sizeof(cache->links));
+    cache->next = 0;
+    cache->dirty_count = 0;
+    cache->shallow_count = 0;
+    cache->dirty_all = false;
+    cache->has_active = false;
+    memset(&cache->has_pending, 0, sizeof(cache->has_pending));
+    /* No captured inputs hold: the next read clears and recaptures. */
+    cache->inputs.sheet = NULL;
+    cache->epoch++;
+    style_variable_cache_lease_clear(&cache->variables);
+}
+
+bool js_rt_bridge_computed_style_cache_holds(const DomBridge *bridge,
+                                             const lxb_dom_node_t *node)
+{
+    if (bridge == NULL || node == NULL) return false;
+    if (bridge->computed_style_memo.node == node) return true;
+    for (size_t i = 0; bridge->computed_style_cache.entries != NULL
+         && i < COMPUTED_STYLE_CACHE_SLOTS; i++)
+        if (bridge->computed_style_cache.entries[i].node == node) return true;
+    return false;
+}
+
+size_t js_rt_bridge_computed_style_cache_bytes(const DomBridge *bridge)
+{
+    if (bridge == NULL) return 0;
+    return (bridge->computed_style_cache.entries == NULL ? 0
+            : COMPUTED_STYLE_CACHE_SLOTS
+                * sizeof(*bridge->computed_style_cache.entries))
+        + style_variable_cache_lease_bytes(
+            &bridge->computed_style_cache.variables);
+}
+
+static struct ComputedStyleCacheEntry *computed_style_cache_find(
+    DomBridge *bridge, const lxb_dom_node_t *node)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    uint8_t link = cache->buckets[computed_style_cache_bucket(node)];
+    for (size_t visited = 0; link != 0 && visited < COMPUTED_STYLE_CACHE_SLOTS;
+         visited++) {
+        size_t at = link - 1u;
+        cache->lookup_probes++;
+        if (cache->entries[at].node == node) return &cache->entries[at];
+        link = cache->links[at];
+    }
+    return NULL;
+}
+
 static bool bridge_computed_style(DomBridge *bridge,
                                   lxb_dom_node_t *node, ComputedStyle *result,
                                   int *containing_width, int *content_width)
 {
+    struct ComputedStyleCacheEntry *cache =
+        bridge_computed_style_cache(bridge);
+    const uint32_t epoch = bridge->computed_style_cache.epoch;
+    if (cache != NULL && containing_width == NULL) {
+        const struct ComputedStyleCacheEntry *hit =
+            computed_style_cache_find(bridge, node);
+        if (hit != NULL && hit->stamp == epoch) {
+            *result = hit->style;
+            /* A hit skips style_for_node's per-node unit basis setup.
+               Inline units may exist without the authored-sheet flag. */
+            style_container_units_for_node(
+                (Stylesheet *) bridge->stylesheet, node);
+            bridge->computed_style_cache.hits++;
+            return true;
+        }
+    }
     lxb_dom_node_t *ancestors[64];
     size_t count = 0;
     for (lxb_dom_node_t *at = node; at != NULL && count < 64;
@@ -4130,16 +6344,80 @@ static bool bridge_computed_style(DomBridge *bridge,
     ComputedStyle computed = {0};
     bool have_parent = false;
     int flow_width = bridge->layout == NULL ? 0 : bridge->layout->width;
+    /* var() lookups resolve by matching custom-property rules up the
+       ancestor chain. A layout build memoizes them per build; this keeps
+       them across reads under the cache's validity (see above). Lending
+       allocates nothing: the first var() lookup creates the table. */
+    __typeof__(bridge->computed_style_cache) *state =
+        &bridge->computed_style_cache;
+    state->variables.budget = bridge->budget;
+    bool variable_cache = cache != NULL && style_variable_cache_attach(
+        (Stylesheet *) bridge->stylesheet, &state->variables);
+    /* Without geometry, start from the nearest ancestor known valid in
+       this epoch. */
+    if (cache != NULL && containing_width == NULL) {
+        for (size_t at = 1; at < count; at++) {
+            const struct ComputedStyleCacheEntry *hit =
+                computed_style_cache_find(bridge, ancestors[at]);
+            if (hit == NULL || hit->stamp != epoch) continue;
+            computed = hit->style;
+            have_parent = true;
+            bridge->computed_style_cache.hits++;
+            count = at;
+            break;
+        }
+    }
     while (count != 0) {
-        /* Each inherited style can run a substantial selector scan. Native
-           calls do not hit VM opcode polls, so service the existing bounded
-           task watchdog between ancestors rather than hiding the whole chain
-           inside one uninterruptible getComputedStyle call. */
-        if (bridge->host != NULL
-            && !js_rt_runtime_native_checkpoint(bridge->host)) return false;
         lxb_dom_node_t *at = ancestors[--count];
-        computed = style_for_node(bridge->stylesheet, at,
-                                  have_parent ? &computed : NULL);
+        struct ComputedStyleCacheEntry *hit = cache == NULL ? NULL
+            : computed_style_cache_find(bridge, at);
+        /* An entry from an earlier epoch still holds when the parent
+           style it was resolved from is the parent's current style: its
+           own inputs are unchanged unless a drop removed it. */
+        uint64_t parent_key = cache == NULL ? 0
+            : computed_style_parent_key(have_parent ? &computed : NULL);
+        if (hit != NULL
+            && (hit->stamp == epoch || hit->parent_key == parent_key)) {
+            computed = hit->style;
+            hit->stamp = epoch;
+            style_container_units_for_node(
+                (Stylesheet *) bridge->stylesheet, at);
+            bridge->computed_style_cache.hits++;
+        } else {
+            /* Each inherited style can run a substantial selector scan.
+               Native calls do not hit VM opcode polls, so service the
+               existing bounded task watchdog between ancestors rather than
+               hiding the whole chain inside one uninterruptible
+               getComputedStyle call. */
+            if (bridge->host != NULL
+                && !js_rt_runtime_native_checkpoint(bridge->host)) {
+                if (variable_cache)
+                    style_variable_cache_detach(
+                        (Stylesheet *) bridge->stylesheet, &state->variables);
+                return false;
+            }
+            computed = style_for_node(bridge->stylesheet, at,
+                                      have_parent ? &computed : NULL);
+            bridge->computed_style_cache.misses++;
+            if (hit != NULL) {
+                /* A stale entry is refreshed in place. */
+                hit->style = computed;
+                hit->parent_key = parent_key;
+                hit->stamp = epoch;
+            } else if (cache != NULL) {
+                __typeof__(bridge->computed_style_cache) *state =
+                    &bridge->computed_style_cache;
+                computed_style_cache_remove(bridge, state->next);
+                cache[state->next].node = at;
+                cache[state->next].style = computed;
+                cache[state->next].parent_key = parent_key;
+                cache[state->next].stamp = epoch;
+                size_t bucket = computed_style_cache_bucket(at);
+                state->links[state->next] = state->buckets[bucket];
+                state->buckets[bucket] = (uint8_t) (state->next + 1u);
+                state->next = (state->next + 1u) % COMPUTED_STYLE_CACHE_SLOTS;
+            }
+        }
         have_parent = true;
         /* Only geometry readers need this work. Resolve each ancestor's
            padding while its cascade is already in hand; cancellation stays
@@ -4168,100 +6446,10 @@ static bool bridge_computed_style(DomBridge *bridge,
             *content_width = flow_width;
         }
     }
+    if (variable_cache)
+        style_variable_cache_detach((Stylesheet *) bridge->stylesheet,
+                                    &state->variables);
     *result = computed;
-    return true;
-}
-
-static bool bridge_inline_property(lxb_dom_node_t *node,
-                                   const char *wanted,
-                                   size_t wanted_length,
-                                   const char **value,
-                                   size_t *value_length)
-{
-    size_t style_length = 0;
-    const char *style = document_attribute(node, "style", &style_length);
-    bool found = false;
-    InlineDeclaration declaration;
-    for (size_t at = 0;
-         inline_declaration_next(style, style_length, &at, &declaration);) {
-        if (!inline_declaration_named(style, &declaration,
-                                      wanted, wanted_length)) continue;
-        size_t start = declaration.value_start;
-        size_t finish = declaration.value_end;
-        /* !important is cascade syntax, not part of the computed value. */
-        if (finish >= start + 10
-            && strncasecmp(style + finish - 10, "!important", 10) == 0) {
-            finish -= 10;
-            while (finish > start
-                   && isspace((unsigned char) style[finish - 1])) finish--;
-        }
-        *value = style + start;
-        *value_length = finish - start;
-        found = true;
-    }
-    return found;
-}
-
-static bool bridge_transition_duration(DomBridge *bridge,
-                                       lxb_dom_node_t *node,
-                                       char *output, size_t output_size)
-{
-    const char *authored = NULL;
-    size_t authored_length = 0;
-    bool shorthand = false;
-    if (!bridge_inline_property(
-            node, "transition-duration", 19,
-            &authored, &authored_length)) {
-        shorthand = bridge_inline_property(
-            node, "transition", 10, &authored, &authored_length);
-    }
-    if (authored == NULL) {
-        snprintf(output, output_size, "0s");
-        return true;
-    }
-    char resolved[256];
-    StyleResolveScratch saved = *bridge->stylesheet->resolve_scratch;
-    bridge->stylesheet->resolve_scratch->resolution_node = node;
-    bridge->stylesheet->resolve_scratch->resolution_pseudo = PSEUDO_NONE;
-    bool valid = style_resolve_value(
-        bridge->stylesheet, authored, authored_length, resolved,
-        sizeof(resolved), 0);
-    *bridge->stylesheet->resolve_scratch = saved;
-    if (!valid) {
-        snprintf(output, output_size, "0s");
-        return true;
-    }
-    const char *text = resolved;
-    size_t length = strlen(resolved);
-    for (size_t at = 0; at < length;) {
-        while (at < length && (isspace((unsigned char) text[at])
-                              || text[at] == ',')) at++;
-        size_t end = at;
-        while (end < length && !isspace((unsigned char) text[end])
-               && text[end] != ',') end++;
-        if (end == at) break;
-        char token[48];
-        size_t token_length = end - at;
-        if (token_length < sizeof(token)) {
-            memcpy(token, text + at, token_length);
-            token[token_length] = '\0';
-            char *unit = NULL;
-            double number = strtod(token, &unit);
-            bool seconds = unit != token && number >= 0.0
-                && ((strcasecmp(unit, "s") == 0)
-                    || (strcasecmp(unit, "ms") == 0));
-            if (seconds) {
-                snprintf(output, output_size, "%.*s",
-                         (int) token_length, text + at);
-                return true;
-            }
-        }
-        /* The first time in each transition shorthand is its duration.
-           A longhand is only a comma-separated list of time values. */
-        at = end;
-        if (!shorthand && at < length && text[at] == ',') continue;
-    }
-    snprintf(output, output_size, "0s");
     return true;
 }
 
@@ -4400,9 +6588,9 @@ enum {
     X(WEBKIT_LINE_CLAMP, "-webkit-line-clamp", true, 0) \
     X(WEBKIT_TEXT_SIZE_ADJUST, "-webkit-text-size-adjust", false, CSP_SPARSE_MODERN) \
     X(WEBKIT_USER_SELECT, "-webkit-user-select", false, CSP_SPARSE_MODERN) \
-    X(ALIGN_CONTENT, "align-content", true, 0) \
-    X(ALIGN_ITEMS, "align-items", true, 0) \
-    X(ALIGN_SELF, "align-self", true, 0) \
+    X(ALIGN_CONTENT, "align-content", true, CSP_STYLE_ONLY) \
+    X(ALIGN_ITEMS, "align-items", true, CSP_STYLE_ONLY) \
+    X(ALIGN_SELF, "align-self", true, CSP_STYLE_ONLY) \
     X(APPEARANCE, "appearance", true, 0) \
     X(ASPECT_RATIO, "aspect-ratio", true, 0) \
     X(BACKDROP_FILTER, "backdrop-filter", true, CSP_SPARSE_MODERN) \
@@ -4445,7 +6633,7 @@ enum {
     X(BORDER_WIDTH, "border-width", false, 0) \
     X(BOTTOM, "bottom", true, 0) \
     X(BOX_SHADOW, "box-shadow", true, 0) \
-    X(BOX_SIZING, "box-sizing", true, 0) \
+    X(BOX_SIZING, "box-sizing", true, CSP_STYLE_ONLY) \
     X(CAPTION_SIDE, "caption-side", true, 0) \
     X(CLIP_PATH, "clip-path", true, 0) \
     X(COLOR, "color", true, CSP_STYLE_ONLY) \
@@ -4460,10 +6648,10 @@ enum {
     X(FILTER, "filter", true, 0) \
     X(FLEX, "flex", false, 0) \
     X(FLEX_BASIS, "flex-basis", true, 0) \
-    X(FLEX_DIRECTION, "flex-direction", true, 0) \
+    X(FLEX_DIRECTION, "flex-direction", true, CSP_STYLE_ONLY) \
     X(FLEX_GROW, "flex-grow", true, 0) \
     X(FLEX_SHRINK, "flex-shrink", true, 0) \
-    X(FLEX_WRAP, "flex-wrap", true, 0) \
+    X(FLEX_WRAP, "flex-wrap", true, CSP_STYLE_ONLY) \
     X(FLOAT, "float", true, 0) \
     X(FONT_FAMILY, "font-family", true, 0) \
     X(FONT_KERNING, "font-kerning", true, CSP_SPARSE_MODERN) \
@@ -4477,7 +6665,7 @@ enum {
     X(HEIGHT, "height", true, CSP_USED_GEOMETRY) \
     X(HYPHENS, "hyphens", true, CSP_SPARSE_MODERN) \
     X(ISOLATION, "isolation", true, CSP_SPARSE_MODERN) \
-    X(JUSTIFY_CONTENT, "justify-content", true, 0) \
+    X(JUSTIFY_CONTENT, "justify-content", true, CSP_STYLE_ONLY) \
     X(JUSTIFY_ITEMS, "justify-items", true, 0) \
     X(JUSTIFY_SELF, "justify-self", true, 0) \
     X(LEFT, "left", true, 0) \
@@ -4498,14 +6686,14 @@ enum {
     X(OBJECT_FIT, "object-fit", true, 0) \
     X(OBJECT_POSITION, "object-position", true, 0) \
     X(OPACITY, "opacity", true, CSP_STYLE_ONLY) \
-    X(ORDER, "order", true, 0) \
+    X(ORDER, "order", true, CSP_STYLE_ONLY) \
     X(OUTLINE_COLOR, "outline-color", true, 0) \
     X(OUTLINE_OFFSET, "outline-offset", true, 0) \
     X(OUTLINE_STYLE, "outline-style", true, 0) \
     X(OUTLINE_WIDTH, "outline-width", true, 0) \
-    X(OVERFLOW, "overflow", false, 0) \
-    X(OVERFLOW_X, "overflow-x", true, 0) \
-    X(OVERFLOW_Y, "overflow-y", true, 0) \
+    X(OVERFLOW, "overflow", false, CSP_STYLE_ONLY) \
+    X(OVERFLOW_X, "overflow-x", true, CSP_STYLE_ONLY) \
+    X(OVERFLOW_Y, "overflow-y", true, CSP_STYLE_ONLY) \
     X(OVERSCROLL_BEHAVIOR, "overscroll-behavior", false, CSP_SPARSE_SCROLL) \
     X(OVERSCROLL_BEHAVIOR_BLOCK, "overscroll-behavior-block", true, CSP_SPARSE_SCROLL) \
     X(OVERSCROLL_BEHAVIOR_INLINE, "overscroll-behavior-inline", true, CSP_SPARSE_SCROLL) \
@@ -4521,7 +6709,7 @@ enum {
     X(PLACE_ITEMS, "place-items", false, 0) \
     X(PLACE_SELF, "place-self", false, 0) \
     X(POINTER_EVENTS, "pointer-events", true, CSP_STYLE_ONLY) \
-    X(POSITION, "position", true, 0) \
+    X(POSITION, "position", true, CSP_STYLE_ONLY) \
     X(RESIZE, "resize", true, CSP_SPARSE_MODERN) \
     X(RIGHT, "right", true, 0) \
     X(ROTATE, "rotate", true, CSP_SPARSE_MODERN) \
@@ -4561,7 +6749,11 @@ enum {
     X(TRANSFORM, "transform", true, 0) \
     X(TRANSFORM_ORIGIN, "transform-origin", true, CSP_USED_GEOMETRY) \
     X(TRANSFORM_STYLE, "transform-style", true, CSP_SPARSE_MODERN) \
+    X(TRANSITION, "transition", false, 0) \
+    X(TRANSITION_DELAY, "transition-delay", true, 0) \
     X(TRANSITION_DURATION, "transition-duration", true, 0) \
+    X(TRANSITION_PROPERTY, "transition-property", true, 0) \
+    X(TRANSITION_TIMING_FUNCTION, "transition-timing-function", true, 0) \
     X(TRANSLATE, "translate", true, CSP_SPARSE_MODERN) \
     X(UNICODE_BIDI, "unicode-bidi", true, 0) \
     X(USER_SELECT, "user-select", true, CSP_SPARSE_MODERN) \
@@ -4572,7 +6764,7 @@ enum {
     X(WILL_CHANGE, "will-change", true, 0) \
     X(WORD_SPACING, "word-spacing", true, CSP_STYLE_ONLY) \
     X(WRITING_MODE, "writing-mode", true, 0) \
-    X(Z_INDEX, "z-index", true, 0)
+    X(Z_INDEX, "z-index", true, CSP_STYLE_ONLY)
 
 typedef enum {
 #define X(id, name, longhand, flags) CSP_##id,
@@ -4611,6 +6803,225 @@ static ComputedStylePropertyId computed_style_property_find(
         else low = middle + 1u;
     }
     return CSP_NONE;
+}
+
+static bool computed_style_transition_id(ComputedStylePropertyId id)
+{
+    return id == CSP_TRANSITION || id == CSP_TRANSITION_DELAY
+        || id == CSP_TRANSITION_DURATION || id == CSP_TRANSITION_PROPERTY
+        || id == CSP_TRANSITION_TIMING_FUNCTION;
+}
+
+/* Computed times serialize in seconds, as browsers do: 300ms is 0.3s. */
+static size_t computed_transition_time(double ms, char *output, size_t size)
+{
+    int written = snprintf(output, size, "%gs", ms / 1000.0);
+    return written < 0 ? 0 : (size_t) written;
+}
+
+static void computed_transition_value(ComputedStylePropertyId id,
+                                      const StyleTransitionComputed *t,
+                                      char *output, size_t size)
+{
+    size_t used = 0;
+    output[0] = '\0';
+    unsigned count = id == CSP_TRANSITION_DELAY ? t->delay_count
+        : id == CSP_TRANSITION_DURATION ? t->duration_count
+        : id == CSP_TRANSITION_TIMING_FUNCTION ? t->timing_count
+        : t->property_count;
+    for (unsigned i = 0; i < count && used + 1u < size; i++) {
+        char item[160];
+        if (id == CSP_TRANSITION_DELAY) {
+            computed_transition_time(t->delay_ms[i], item, sizeof(item));
+        } else if (id == CSP_TRANSITION_DURATION) {
+            computed_transition_time(t->duration_ms[i], item, sizeof(item));
+        } else if (id == CSP_TRANSITION_TIMING_FUNCTION) {
+            snprintf(item, sizeof(item), "%s", t->timings[i]);
+        } else if (id == CSP_TRANSITION_PROPERTY) {
+            snprintf(item, sizeof(item), "%s", t->properties[i]);
+        } else {
+            /* The shorthand pairs each property with the other lists,
+               which repeat to its length. */
+            char duration[40], delay[40];
+            computed_transition_time(
+                t->duration_ms[i % t->duration_count], duration,
+                sizeof(duration));
+            computed_transition_time(
+                t->delay_ms[i % t->delay_count], delay, sizeof(delay));
+            snprintf(item, sizeof(item), "%s %s %s %s", t->properties[i],
+                     duration, t->timings[i % t->timing_count], delay);
+        }
+        int written = snprintf(output + used, size - used, "%s%s",
+                               i == 0 ? "" : ", ", item);
+        if (written < 0 || (size_t) written >= size - used) break;
+        used += (size_t) written;
+    }
+}
+
+/* __tilefinchTransitionSnapshot(handle, names) ->
+   [properties, durations_ms, delays_ms, values]: the transitions whose delay
+   plus duration is positive (empty when there are none) and the computed
+   values of names, resolved without a synchronous layout. The watcher needs
+   those values while no transition applies too: a class can bring the
+   transition and the new value together. */
+JSValue js_transition_snapshot(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0 && bridge != NULL
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    if (bridge == NULL || bridge->stylesheet == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return JS_NULL;
+    StyleTransitionComputed transition;
+    (void) style_transition_computed(bridge->stylesheet, node, PSEUDO_NONE,
+                                     &transition);
+    bool animated = false;
+    for (unsigned i = 0; i < transition.property_count && !animated; i++) {
+        double duration = transition.duration_ms[i % transition.duration_count];
+        double delay = transition.delay_ms[i % transition.delay_count];
+        animated = (duration > 0.0 ? duration : 0.0) + delay > 0.0
+            && strcmp(transition.properties[i], "none") != 0;
+    }
+    JSValue result = JS_NewArray(context);
+    JSValue properties = JS_NewArray(context);
+    JSValue durations = JS_NewArray(context);
+    JSValue delays = JS_NewArray(context);
+    JSValue values = JS_NewArray(context);
+    bool ok = !JS_IsException(result) && !JS_IsException(properties)
+        && !JS_IsException(durations) && !JS_IsException(delays)
+        && !JS_IsException(values);
+    for (unsigned i = 0; ok && animated && i < transition.property_count;
+         i++) {
+        ok = JS_SetPropertyUint32(
+                 context, properties, i,
+                 JS_NewString(context, transition.properties[i])) >= 0
+            && JS_SetPropertyUint32(
+                 context, durations, i,
+                 JS_NewFloat64(context, transition.duration_ms[
+                     i % transition.duration_count])) >= 0
+            && JS_SetPropertyUint32(
+                 context, delays, i,
+                 JS_NewFloat64(context, transition.delay_ms[
+                     i % transition.delay_count])) >= 0;
+    }
+    uint32_t name_count = 0;
+    if (ok && argc > 1 && JS_IsArray(context, argv[1])) {
+        JSValue length_value = JS_GetPropertyStr(context, argv[1], "length");
+        ok = !JS_IsException(length_value)
+            && JS_ToUint32(context, &name_count, length_value) >= 0;
+        JS_FreeValue(context, length_value);
+    }
+    if (name_count > 32) name_count = 32;
+    bool saved = bridge->computed_style_without_layout;
+    bridge->computed_style_without_layout = true;
+    for (uint32_t i = 0; ok && i < name_count; i++) {
+        JSValue name = JS_GetPropertyUint32(context, argv[1], i);
+        if (JS_IsException(name)) { ok = false; break; }
+        JSValueConst arguments[2] = { argv[0], name };
+        JSValue value = js_computed_style_get(context, JS_UNDEFINED, 2,
+                                              arguments);
+        JS_FreeValue(context, name);
+        if (JS_IsException(value)) { ok = false; break; }
+        ok = JS_SetPropertyUint32(context, values, i, value) >= 0;
+    }
+    bridge->computed_style_without_layout = saved;
+    /* JS_SetPropertyUint32 consumes its value whether or not the insertion
+       succeeds, so a list is released here only if it was never offered. */
+    JSValue *lists[4] = { &properties, &durations, &delays, &values };
+    for (uint32_t i = 0; i < 4; i++) {
+        JSValue list = *lists[i];
+        *lists[i] = JS_UNDEFINED;
+        if (ok) ok = JS_SetPropertyUint32(context, result, i, list) >= 0;
+        else JS_FreeValue(context, list);
+    }
+    if (!ok) {
+        JS_FreeValue(context, result);
+        return JS_EXCEPTION;
+    }
+    return result;
+}
+
+/* __tilefinchAttributeChangeMayAffectHas(name, oldValue, newValue) -> whether
+   that attribute change can alter a :has() match anywhere, by the classifier
+   the attribute setter uses for style invalidation (null: absent). Without
+   values (a CSSOM style write) any change of the attribute is assumed. The
+   transition watcher then rescans every element rather than the changed
+   element's parent subtree. */
+JSValue js_attribute_change_may_affect_has(JSContext *context,
+                                           JSValueConst this_value,
+                                           int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (argc < 1) return JS_TRUE;
+    const char *text[3] = { NULL, NULL, NULL };
+    size_t length[3] = { 0, 0, 0 };
+    bool ok = true;
+    for (int i = 0; i < 3 && i < argc && ok; i++) {
+        if (i > 0 && (JS_IsNull(argv[i]) || JS_IsUndefined(argv[i])))
+            continue;
+        text[i] = JS_ToCStringLen(context, &length[i], argv[i]);
+        ok = text[i] != NULL;
+    }
+    bool known = argc >= 3, sensitive = true;
+    /* Class and id tokens need the values; without them stay conservative. */
+    bool tokenized = text[0] != NULL
+        && ((length[0] == 5 && strncasecmp(text[0], "class", 5) == 0)
+            || (length[0] == 2 && strncasecmp(text[0], "id", 2) == 0));
+    if (ok && (known || !tokenized)) {
+        sensitive = stylesheet_attribute_change_may_affect_has(
+            bridge == NULL ? NULL : bridge->stylesheet, text[0], length[0],
+            known ? text[1] : NULL, known ? length[1] : 0,
+            /* Absent to a value no selector names: any change. */
+            known ? text[2] : "\x01", known ? length[2] : 1);
+    }
+    for (int i = 0; i < 3; i++) JS_FreeCString(context, text[i]);
+    return ok ? JS_NewBool(context, sensitive) : JS_EXCEPTION;
+}
+
+/* __tilefinchStyleReach(handle, scopes) -> whether the element is one of the
+   scope elements (handles, at most 16) or inside one, walking the native
+   tree, where a shadow root is a child of its host. An element not under
+   the document, or past the depth bound, answers true: the caller treats
+   true as "may have changed". */
+JSValue js_style_reach(JSContext *context, JSValueConst this_value,
+                       int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0 && bridge != NULL
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    if (node == NULL) return JS_TRUE;
+    lxb_dom_node_t *scopes[16];
+    uint32_t scope_count = 0;
+    if (argc > 1 && JS_IsArray(context, argv[1])) {
+        JSValue length_value = JS_GetPropertyStr(context, argv[1], "length");
+        uint32_t length = 0;
+        bool ok = !JS_IsException(length_value)
+            && JS_ToUint32(context, &length, length_value) >= 0;
+        JS_FreeValue(context, length_value);
+        if (!ok) return JS_EXCEPTION;
+        if (length > 16) return JS_TRUE;
+        for (uint32_t i = 0; i < length; i++) {
+            JSValue value = JS_GetPropertyUint32(context, argv[1], i);
+            if (JS_IsException(value)) return JS_EXCEPTION;
+            lxb_dom_node_t *scope = js_rt_bridge_node_arg(context, bridge,
+                                                          value);
+            JS_FreeValue(context, value);
+            if (scope == NULL) return JS_TRUE;
+            scopes[scope_count++] = scope;
+        }
+    }
+    unsigned depth = 0;
+    for (lxb_dom_node_t *at = node; at != NULL && depth < 4096;
+         at = at->parent, depth++) {
+        for (uint32_t i = 0; i < scope_count; i++)
+            if (at == scopes[i]) return JS_TRUE;
+        if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) return JS_FALSE;
+    }
+    return JS_TRUE;
 }
 
 /* __tilefinchComputedStyleSupport(name) -> whether the declaration has that
@@ -4887,31 +7298,44 @@ static TILEFINCH_OUT_OF_LINE bool computed_style_serialize_retained(
     return true;
 }
 
-JSValue js_computed_style_get(JSContext *context,
-                              JSValueConst this_value,
-                              int argc, JSValueConst *argv)
+/* The value of `name` (dashed, lower-case) on the element `node` for
+   __tilefinchComputedStyleGet and __tilefinchComputedStyleRead; argv[2],
+   when argc > 2, names the pseudo-element. The caller owns `name`. */
+/* A serialized value as a JS string, noting whether it is empty. */
+static JSValue computed_style_string(JSContext *context, const char *text,
+                                     bool *empty)
 {
-    (void) this_value;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    lxb_dom_node_t *node = argc > 0 && bridge != NULL
-        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
-    if (bridge == NULL || bridge->stylesheet == NULL || node == NULL
-        || node->type != LXB_DOM_NODE_TYPE_ELEMENT || argc < 2) {
-        return JS_NewString(context, "");
-    }
-    size_t name_length = 0;
-    const char *name = JS_ToCStringLen(context, &name_length, argv[1]);
-    if (name == NULL) return JS_EXCEPTION;
+    *empty = text[0] == '\0';
+    return JS_NewString(context, text);
+}
+
+static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
+                                    lxb_dom_node_t *node, const char *name,
+                                    size_t name_length, int argc,
+                                    JSValueConst *argv, bool *empty)
+{
+    *empty = false;
     /* The single lookup every later decision dispatches on. Names arrive
        dashed and lower-case (__tilefinchCssName). */
     const ComputedStylePropertyId id = computed_style_property_find(name);
+    const bool custom_property = name_length >= 3 && name[0] == '-'
+        && name[1] == '-';
+    /* A name nothing resolves (not registered, not a custom property, not
+       an SVG presentation attribute this element takes) serializes as ""
+       whatever the cascade says: answer before any layout or cascade. */
+    if (id == CSP_NONE && !custom_property
+        && !svg_presentation_attribute_relevant(node, name, name_length)) {
+        return computed_style_string(context, "", empty);
+    }
     const unsigned property_flags =
         id == CSP_NONE ? 0u : computed_style_properties[id].flags;
     bool used_geometry_property = (property_flags & CSP_USED_GEOMETRY) != 0;
     /* Hydration often toggles a class and immediately asks whether a node
        is visible. These values resolve from the current DOM/cascade without
        rebuilding geometry. Keep the conservative path for stylesheet changes
-       and container-dependent rules, whose cascade needs fresh layout. */
+       and container-dependent rules, whose cascade needs fresh layout.
+       Container-relative units may exist only in style attributes; the
+       last layout's collected container state reveals those too. */
     bool independent_style_property = (property_flags & CSP_STYLE_ONLY) != 0;
     bool style_only = independent_style_property
         && bridge->mutations.count != 0
@@ -4919,10 +7343,76 @@ JSValue js_computed_style_get(JSContext *context,
         && !bridge->mutations.resource_rebuild_required
         && !bridge->mutations.conservative_resource_scan
         && !stylesheet_has_container_queries(bridge->stylesheet)
-        && !bridge->stylesheet->has_container_relative_units;
-    if ((bridge->relayout_dirty != NULL && *bridge->relayout_dirty && !style_only)
-        || (bridge->layout == NULL && used_geometry_property)) {
+        && !style_container_layout_state_present(bridge->stylesheet);
+    /* Transitions and the watcher's snapshots need the cascade, not
+       geometry: only a stylesheet change waiting to be applied forces the
+       flush. */
+    bool cascade_only = computed_style_transition_id(id)
+        || bridge->computed_style_without_layout;
+    bool sheet_stale = bridge->relayout_dirty != NULL
+        && *bridge->relayout_dirty
+        && (bridge->mutations.overflowed
+            || bridge->mutations.resource_rebuild_required
+            || bridge->mutations.conservative_resource_scan);
+    if (cascade_only ? sheet_stale
+        : ((bridge->relayout_dirty != NULL && *bridge->relayout_dirty
+            && !style_only)
+           || (bridge->layout == NULL && used_geometry_property))) {
         (void) js_rt_bridge_flush_synchronous_layout(bridge);
+    }
+    if (custom_property) {
+        /* A custom property's value comes from the custom-property rules
+           of the element and its ancestors (style_custom_property_value),
+           not from the element's computed style: no cascade. */
+        PseudoElement custom_pseudo = PSEUDO_NONE;
+        if (argc > 2) {
+            size_t pseudo_length = 0;
+            const char *pseudo_name =
+                JS_ToCStringLen(context, &pseudo_length, argv[2]);
+            if (pseudo_name == NULL) {
+                return JS_EXCEPTION;
+            }
+            if ((pseudo_length == 8 && memcmp(pseudo_name, "::before", 8) == 0)
+                || (pseudo_length == 7
+                    && memcmp(pseudo_name, ":before", 7) == 0))
+                custom_pseudo = PSEUDO_BEFORE;
+            else if ((pseudo_length == 7
+                      && memcmp(pseudo_name, "::after", 7) == 0)
+                     || (pseudo_length == 6
+                         && memcmp(pseudo_name, ":after", 6) == 0))
+                custom_pseudo = PSEUDO_AFTER;
+            JS_FreeCString(context, pseudo_name);
+        }
+        style_container_units_for_node((Stylesheet *) bridge->stylesheet,
+                                       node);
+        char custom_value[640] = "";
+        (void) style_custom_property_value(
+            bridge->stylesheet, node, custom_pseudo, name, name_length,
+            custom_value, sizeof(custom_value));
+        return computed_style_string(context, custom_value, empty);
+    }
+    if (computed_style_transition_id(id)) {
+        PseudoElement transition_pseudo = PSEUDO_NONE;
+        if (argc > 2) {
+            const char *pseudo_name = JS_ToCString(context, argv[2]);
+            if (pseudo_name == NULL) {
+                return JS_EXCEPTION;
+            }
+            if (strcmp(pseudo_name, "::before") == 0
+                || strcmp(pseudo_name, ":before") == 0)
+                transition_pseudo = PSEUDO_BEFORE;
+            else if (strcmp(pseudo_name, "::after") == 0
+                     || strcmp(pseudo_name, ":after") == 0)
+                transition_pseudo = PSEUDO_AFTER;
+            JS_FreeCString(context, pseudo_name);
+        }
+        StyleTransitionComputed transition;
+        (void) style_transition_computed(bridge->stylesheet, node,
+                                         transition_pseudo, &transition);
+        char transition_value[640];
+        computed_transition_value(id, &transition, transition_value,
+                                  sizeof(transition_value));
+        return computed_style_string(context, transition_value, empty);
     }
     ComputedStyle style;
     bool padding_geometry = id == CSP_WIDTH || id == CSP_HEIGHT
@@ -4930,39 +7420,33 @@ JSValue js_computed_style_get(JSContext *context,
         || id == CSP_PADDING_RIGHT || id == CSP_PADDING_BOTTOM
         || id == CSP_PADDING_LEFT;
     int containing_width = 0, content_width = 0;
-    /* Geometry reads resolve widths from layout and container-dependent
-       sheets depend on layout too; neither is memoized. */
-    bool memoizable = !padding_geometry
-        && !stylesheet_has_container_queries(bridge->stylesheet)
-        && !bridge->stylesheet->has_container_relative_units;
+    /* Used widths still need their geometry walk. Container-dependent
+       cascades are reusable under the container-state generation, after
+       the same synchronous layout flush required above. */
+    bool memoizable = !padding_geometry;
     __typeof__(bridge->computed_style_memo) *memo =
         &bridge->computed_style_memo;
     uint64_t content_generation = bridge->document == NULL
         ? 0 : bridge->document->content_generation;
     if (memoizable && memo->node == node
-        && memo->sheet == (const void *) bridge->stylesheet
-        && memo->sheet_generation == bridge->stylesheet->build_generation
         && memo->content_generation == content_generation
-        && memo->fullscreen_node == bridge->stylesheet->fullscreen_node
-        && memo->epoch == bridge->computed_style_epoch) {
+        && computed_style_inputs_hold(bridge, &memo->inputs)) {
         style = memo->style;
+        style_container_units_for_node(
+            (Stylesheet *) bridge->stylesheet, node);
     } else {
         if (!bridge_computed_style(bridge, node, &style,
                                    padding_geometry ? &containing_width
                                                     : NULL,
                                    &content_width)) {
             memo->node = NULL;
-            JS_FreeCString(context, name);
             return js_rt_throw_task_interruption(
                 context, "computed style interrupted");
         }
         memo->node = memoizable ? node : NULL;
         if (memoizable) {
-            memo->sheet = bridge->stylesheet;
-            memo->sheet_generation = bridge->stylesheet->build_generation;
+            computed_style_inputs_capture(bridge, &memo->inputs);
             memo->content_generation = content_generation;
-            memo->fullscreen_node = bridge->stylesheet->fullscreen_node;
-            memo->epoch = bridge->computed_style_epoch;
             memo->style = style;
         }
     }
@@ -4972,7 +7456,6 @@ JSValue js_computed_style_get(JSContext *context,
         const char *pseudo_name =
             JS_ToCStringLen(context, &pseudo_length, argv[2]);
         if (pseudo_name == NULL) {
-            JS_FreeCString(context, name);
             return JS_EXCEPTION;
         }
         if ((pseudo_length == 8 && memcmp(pseudo_name, "::before", 8) == 0)
@@ -5187,9 +7670,6 @@ JSValue js_computed_style_get(JSContext *context,
         (void) style_custom_property_value(
             bridge->stylesheet, node, pseudo, name, name_length,
             value, sizeof(value));
-    } else if (id == CSP_TRANSITION_DURATION) {
-        (void) bridge_transition_duration(
-            bridge, node, value, sizeof(value));
     } else if (id == CSP_DISPLAY) {
         snprintf(value, sizeof(value), "%s", display_names[style.display]);
     } else if (id == CSP_VISIBILITY) {
@@ -6029,8 +8509,99 @@ JSValue js_computed_style_get(JSContext *context,
         (void) computed_style_serialize_retained(
             node, &style, id, value, sizeof(value));
     }
+    return computed_style_string(context, value, empty);
+}
+
+JSValue js_computed_style_get(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0 && bridge != NULL
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    if (bridge == NULL || bridge->stylesheet == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT || argc < 2) {
+        return JS_NewString(context, "");
+    }
+    size_t name_length = 0;
+    const char *name = JS_ToCStringLen(context, &name_length, argv[1]);
+    if (name == NULL) return JS_EXCEPTION;
+    bool empty = false;
+    JSValue value = computed_style_value(context, bridge, node, name,
+                                         name_length, argc, argv, &empty);
     JS_FreeCString(context, name);
-    return JS_NewString(context, value);
+    return value;
+}
+
+/* __tilefinchComputedStyleRead(handle, name, pseudo) -> the value, or
+   undefined for the script's general path. One call for the common read
+   (getComputedStyle(el).prop), which otherwise canonicalizes the name,
+   asks whether the element is connected and reads the value in three.
+   `name` is canonicalized exactly as __tilefinchCssName does (custom
+   properties as they are, cssFloat, then each ASCII capital to "-" and its
+   lower case). Undefined when the element is not a connected native
+   element (script decides with its own tree), the name is not a string,
+   the value needs script's post-processing (flex-basis and the scroll
+   margins and paddings resolve em terms) or is empty for a non-custom
+   name (script falls back to inline text). */
+JSValue js_computed_style_read(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->stylesheet == NULL || argc < 2
+        || !JS_IsString(argv[1])) return JS_UNDEFINED;
+    lxb_dom_node_t *node = js_rt_bridge_node_arg(context, bridge, argv[0]);
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !bridge_node_is_connected(node)) return JS_UNDEFINED;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(context, &length, argv[1]);
+    if (text == NULL) return JS_EXCEPTION;
+    char canonical[128];
+    size_t used = 0;
+    bool usable = strlen(text) == length;
+    if (!usable) {
+        /* An embedded NUL: the general path decides. */
+    } else if (length >= 2 && text[0] == '-' && text[1] == '-') {
+        usable = length < sizeof(canonical);
+        if (usable) memcpy(canonical, text, used = length);
+    } else if (length == 8 && memcmp(text, "cssFloat", 8) == 0) {
+        memcpy(canonical, "float", used = 5);
+    } else {
+        for (size_t i = 0; usable && i < length; i++) {
+            unsigned char byte = (unsigned char) text[i];
+            bool capital = byte >= 'A' && byte <= 'Z';
+            if (used + (capital ? 2u : 1u) >= sizeof(canonical)) {
+                usable = false;
+                break;
+            }
+            if (capital) {
+                canonical[used++] = '-';
+                canonical[used++] = (char) (byte + 32u);
+            } else {
+                canonical[used++] = (char) byte;
+            }
+        }
+    }
+    JS_FreeCString(context, text);
+    if (!usable) return JS_UNDEFINED;
+    canonical[used] = '\0';
+    bool custom = used >= 2 && canonical[0] == '-' && canonical[1] == '-';
+    if (!custom
+        && ((used == 10 && memcmp(canonical, "flex-basis", 10) == 0)
+            || (used >= 13 && memcmp(canonical, "scroll-margin", 13) == 0)
+            || (used >= 14
+                && memcmp(canonical, "scroll-padding", 14) == 0)))
+        return JS_UNDEFINED;
+    bool empty = false;
+    JSValue value = computed_style_value(context, bridge, node, canonical,
+                                         used, argc, argv, &empty);
+    if (empty && !custom && !JS_IsException(value)) {
+        JS_FreeValue(context, value);
+        return JS_UNDEFINED;
+    }
+    return value;
 }
 
 JSValue js_style_set(JSContext *context, JSValueConst this_value,
@@ -6076,11 +8647,20 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
         updated[used++] = ';';
     }
     updated[used] = '\0';
+    /* CSSOM changes the style attribute, not a selector-visible attribute
+       named after the property. Preserve :has([style]) invalidation while
+       allowing unrelated :has() rules to keep ancestor/sibling caches. The
+       old attribute storage is valid only before the DOM setter below. */
+    bool relational = stylesheet_attribute_change_may_affect_has(
+        bridge == NULL ? NULL : bridge->stylesheet, "style", 5,
+        old, old_length, updated, used);
     lxb_status_t status;
+    document_style_quiet_begin();
     status = lxb_dom_element_set_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) "style", 5,
         (const lxb_char_t *) updated, used) == NULL
         ? LXB_STATUS_ERROR : LXB_STATUS_OK;
+    document_style_quiet_end();
     if (status == LXB_STATUS_OK) {
         uint32_t modern = sparse_modern_property_mask(
             wanted, wanted_length);
@@ -6095,8 +8675,9 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
                 |= sparse_modern_typography_mask(wanted, wanted_length);
         }
         document_style_attribute_set_cssom_authorized(node, true);
-        bridge_mutated(bridge, SCRIPT_MUTATION_INLINE_STYLE, node,
-                       wanted, wanted_length);
+        bridge_mutated_with_relational(
+            bridge, SCRIPT_MUTATION_INLINE_STYLE, node, wanted, wanted_length,
+            relational, NULL, 0);
     }
     JS_FreeCString(context, value);
     JS_FreeCString(context, wanted);
@@ -6147,18 +8728,110 @@ static void bridge_mutation_note_scope(
     }
 }
 
+/* Journals the removal of connected `node` from its parent, classifying
+   its subtree while it is still connected (bridge_mutated() ignores
+   detached construction trees). */
+static void bridge_note_removal(DomBridge *bridge, lxb_dom_node_t *node)
+{
+    BridgeMutationResourceFlags removed_resources =
+        bridge_mutation_resource_subtree(node);
+    ScriptMutationKind removal_kind =
+        bridge_child_mutation_kind(bridge, node->parent, node);
+    bridge_mutated(bridge, removal_kind, node, NULL, 0);
+    bridge_mutation_note_scope(bridge, removal_kind, node, node->parent);
+    if ((removed_resources & (BRIDGE_MUTATION_RESOURCE_IMAGE
+                              | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0) {
+        bridge->mutations.resource_rebuild_required = true;
+        if ((removed_resources & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0)
+            bridge->mutations.image_rebuild_required = true;
+        if ((removed_resources & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0)
+            bridge->mutations.stylesheet_rebuild_required = true;
+        bridge->mutations.image_resource_scan_required = false;
+        if (tilefinch_trace_mutation_policy()) {
+            size_t name_length = 0;
+            const char *name = document_element_name(node, &name_length);
+            fprintf(stderr, "tilefinch: mutation-policy removal node=%.*s "
+                    "flags=%u connected=%d\n", (int) name_length,
+                    name == NULL ? "" : name, (unsigned) removed_resources,
+                    (int) bridge_node_is_connected(node));
+        }
+    }
+}
+
+/* What a connected node about to move leaves behind. */
+typedef struct {
+    /* Journaled as a removal: it moves under a detached parent. */
+    bool departed;
+    /* It moves within the page: the :has() entries its old position can
+       move (stylesheet_tree_change_has_entries), probed before the move. */
+    bool probed;
+    bool relational;
+    uint64_t has_entries;
+    uint32_t has_serial;
+} BridgeDeparture;
+
+/* A connected node about to move under a detached parent leaves the live
+   page: journal it as the removal it is, before the move. One moving
+   within the page has its old position probed now, for the record the
+   move makes. */
+static BridgeDeparture bridge_note_departure(DomBridge *bridge,
+                                             lxb_dom_node_t *parent,
+                                             lxb_dom_node_t *node)
+{
+    BridgeDeparture departure = {0};
+    if (bridge == NULL || node == NULL || node->parent == NULL
+        || !bridge_node_is_connected(node)) return departure;
+    if (!bridge_node_is_connected(parent)) {
+        bridge_note_removal(bridge, node);
+        departure.departed = true;
+        return departure;
+    }
+    departure.probed = true;
+    departure.relational = stylesheet_tree_change_has_entries(
+        bridge->stylesheet, node, node->parent, &departure.has_entries,
+        &departure.has_serial);
+    return departure;
+}
+
 static void bridge_child_inserted(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
-    bool was_detached, lxb_dom_node_t *old_parent)
+    bool was_detached, lxb_dom_node_t *old_parent,
+    BridgeDeparture departure)
 {
     /* A successful move into a detached construction tree still removes
-       content from the live page. Journal its old owner after success. */
+       content from the live page: journaled as a removal before the move
+       (bridge_note_departure), or, unclassified, as its old owner's. */
     if (!was_detached && !bridge_node_is_connected(node)) {
-        bridge_mutated(bridge, SCRIPT_MUTATION_UNKNOWN, old_parent, NULL, 0);
+        if (!departure.departed)
+            bridge_mutated(bridge, SCRIPT_MUTATION_UNKNOWN, old_parent,
+                           NULL, 0);
         return;
     }
     size_t before = bridge->mutations.count;
-    bridge_mutated(bridge, kind, node, NULL, 0);
+    /* A move also changed the parent it left, which the classification
+       of the new position does not see. */
+    if (was_detached) {
+        bridge_mutated(bridge, kind, node, NULL, 0);
+    } else if (departure.probed && node->parent != NULL) {
+        /* Both positions probed: the old one before the move, the new one
+           now. */
+        uint64_t entries = UINT64_MAX;
+        uint32_t serial = 0;
+        bool relational = stylesheet_tree_change_has_entries(
+            bridge->stylesheet, node, node->parent, &entries, &serial);
+        if (serial == 0 || serial != departure.has_serial) {
+            entries = UINT64_MAX;
+            serial = 0;
+        } else {
+            entries |= departure.has_entries;
+        }
+        bridge_mutated_summarized(bridge, kind, node, NULL, 0,
+                                  relational || departure.relational, NULL,
+                                  0, entries, serial);
+    } else {
+        bridge_mutated_with_relational(bridge, kind, node, NULL, 0, true,
+                                       NULL, 0);
+    }
     /* A prior removal/move of this node must win over a later re-insertion.
        Only a newly recorded child mutation can start a transient probe. */
     if ((kind == SCRIPT_MUTATION_CHILD_LIST || kind == SCRIPT_MUTATION_HEAD_SCRIPT)
@@ -6181,9 +8854,13 @@ JSValue js_dom_append(JSContext *context, JSValueConst this_value,
     ScriptMutationKind kind = bridge_child_mutation_kind(bridge, parent, child);
     bool was_detached = !bridge_node_is_connected(child);
     lxb_dom_node_t *old_parent = child->parent;
+    BridgeDeparture departure = bridge_note_departure(bridge, parent, child);
+    document_style_quiet_begin();
     lxb_dom_exception_code_t status = lxb_dom_node_append_child(parent, child);
+    document_style_quiet_end();
     if (status == LXB_DOM_EXCEPTION_OK) {
-        bridge_child_inserted(bridge, kind, child, was_detached, old_parent);
+        bridge_child_inserted(bridge, kind, child, was_detached, old_parent,
+                              departure);
     }
     return JS_NewBool(context, status == LXB_DOM_EXCEPTION_OK);
 }
@@ -6244,14 +8921,19 @@ JSValue js_dom_append_many(JSContext *context,
     for (uint32_t index = 0; index < count; index++) {
         bool was_detached = !bridge_node_is_connected(nodes[index]);
         lxb_dom_node_t *old_parent = nodes[index]->parent;
-        if (lxb_dom_node_append_child(parent, nodes[index])
-            != LXB_DOM_EXCEPTION_OK) {
+        BridgeDeparture departure =
+            bridge_note_departure(bridge, parent, nodes[index]);
+        document_style_quiet_begin();
+        lxb_dom_exception_code_t appended =
+            lxb_dom_node_append_child(parent, nodes[index]);
+        document_style_quiet_end();
+        if (appended != LXB_DOM_EXCEPTION_OK) {
             budget_free(bridge->budget, nodes);
             return JS_FALSE;
         }
         bridge_child_inserted(
             bridge, SCRIPT_MUTATION_CHILD_LIST, nodes[index], was_detached,
-            old_parent);
+            old_parent, departure);
     }
     if (js_rt_dynamic_prepare_subtree(context, parent) < 0) {
         budget_free(bridge->budget, nodes);
@@ -6283,10 +8965,14 @@ JSValue js_dom_insert_before(JSContext *context,
     ScriptMutationKind kind = bridge_child_mutation_kind(bridge, parent, node);
     bool was_detached = !bridge_node_is_connected(node);
     lxb_dom_node_t *old_parent = node->parent;
+    BridgeDeparture departure = bridge_note_departure(bridge, parent, node);
+    document_style_quiet_begin();
     lxb_dom_exception_code_t status = lxb_dom_node_insert_before_spec(
         parent, node, child);
+    document_style_quiet_end();
     if (status == LXB_DOM_EXCEPTION_OK) {
-        bridge_child_inserted(bridge, kind, node, was_detached, old_parent);
+        bridge_child_inserted(bridge, kind, node, was_detached, old_parent,
+                              departure);
     }
     return JS_NewBool(context, status == LXB_DOM_EXCEPTION_OK);
 }
@@ -6299,20 +8985,10 @@ JSValue js_dom_remove(JSContext *context, JSValueConst this_value,
     lxb_dom_node_t *node = argc > 0
                            ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
     if (node == NULL || node->parent == NULL) return JS_FALSE;
-    /* Classify the connected subtree before detaching it. bridge_mutated()
-       deliberately ignores detached construction trees. */
-    BridgeMutationResourceFlags removed_resources =
-        bridge_mutation_resource_subtree(node);
-    ScriptMutationKind removal_kind =
-        bridge_child_mutation_kind(bridge, node->parent, node);
-    bridge_mutated(bridge, removal_kind, node, NULL, 0);
-    bridge_mutation_note_scope(bridge, removal_kind, node, node->parent);
-    if ((removed_resources & (BRIDGE_MUTATION_RESOURCE_IMAGE
-                              | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0) {
-        bridge->mutations.resource_rebuild_required = true;
-        bridge->mutations.image_resource_scan_required = false;
-    }
+    bridge_note_removal(bridge, node);
+    document_style_quiet_begin();
     lxb_dom_node_remove(node);
+    document_style_quiet_end();
     return JS_TRUE;
 }
 

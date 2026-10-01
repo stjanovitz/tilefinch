@@ -689,6 +689,7 @@ bool script_runtime_rebind_remote_document(
     runtime->bridge.remote_node_read = next.node_read;
     runtime->bridge.remote_node_read_opaque = next.node_read_opaque;
     runtime->bridge.remote_node_write = next.node_write;
+    if (next.node_write != NULL) runtime->bridge.remote_mode_seen = true;
     runtime->bridge.remote_node_write_opaque = next.node_write_opaque;
     runtime->bridge.node_visibility = next.node_visibility;
     runtime->bridge.node_visibility_opaque = next.node_visibility_opaque;

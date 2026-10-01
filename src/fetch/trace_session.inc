@@ -336,8 +336,9 @@ static bool fetch_trace_begin(FetchTraceMode mode, const char *directory,
         || !trace_directory_prepare(
                directory, mode == FETCH_TRACE_CAPTURE,
                error, error_size)) return false;
-    free(fetch_trace.replay_route_index);
+    TRACE_REPLAY_ROUTE_INDEX_FREE(fetch_trace.replay_route_index);
     memset(&fetch_trace, 0, sizeof(fetch_trace));
+    memset(&trace_replay_io, 0, sizeof(trace_replay_io));
     fetch_trace.mode = mode;
     snprintf(fetch_trace.directory, sizeof(fetch_trace.directory), "%s",
              directory);
@@ -349,6 +350,10 @@ static bool fetch_trace_begin(FetchTraceMode mode, const char *directory,
         fetch_trace_end();
         return false;
     }
+    /* Read before the route index hashes record keys, so every key of one
+       replay session is computed under the same rule. */
+    fetch_trace.replay_volatile_uuids = trace_replay_volatile_uuids();
+    fetch_trace.replay_pump_us = trace_replay_pump_us();
     return true;
 }
 
@@ -695,6 +700,26 @@ bool fetch_trace_replay_active(void)
     return fetch_trace.mode == FETCH_TRACE_REPLAY;
 }
 
+bool fetch_trace_active(void)
+{
+    return fetch_trace.mode != FETCH_TRACE_OFF;
+}
+
+void fetch_trace_replay_io(uint64_t *opens, uint64_t *reads,
+                           uint64_t *bytes, uint64_t *us)
+{
+    if (opens != NULL) *opens = trace_replay_io.opens;
+    if (reads != NULL) *reads = trace_replay_io.reads;
+    if (bytes != NULL) *bytes = trace_replay_io.bytes;
+    if (us != NULL) *us = trace_replay_io.us;
+}
+
+size_t fetch_trace_replay_served_count(void)
+{
+    return fetch_trace.mode == FETCH_TRACE_REPLAY
+        ? fetch_trace.replay_served_request_count : 0;
+}
+
 bool fetch_trace_replay_stats(FetchTraceReplayStats *stats)
 {
     if (stats == NULL || fetch_trace.mode != FETCH_TRACE_REPLAY) return false;
@@ -749,7 +774,7 @@ void fetch_trace_end(void)
                 "HTTP trace finalization failed; replay authority removed\n");
     }
     trace_cookie_provenance_clear();
-    free(fetch_trace.replay_route_index);
+    TRACE_REPLAY_ROUTE_INDEX_FREE(fetch_trace.replay_route_index);
     memset(&fetch_trace, 0, sizeof(fetch_trace));
 }
 
@@ -813,9 +838,4 @@ static bool trace_activate_for_request(const FetchRequest *request,
     fprintf(stderr, "delayed HTTP trace activation failed: %s\n",
             error[0] == '\0' ? "unknown metadata error" : error);
     return false;
-}
-
-static void *curl_malloc_hook(size_t size)
-{
-    return budget_concurrent_pool_malloc(&curl_concurrent_pool, size);
 }

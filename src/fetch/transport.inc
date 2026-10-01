@@ -978,7 +978,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
         fetch_diagnostic_mobile_safari();
     const char *effective_user_agent = fetch_effective_user_agent(
         request, diagnostic_mobile_safari);
-    if (fetch_trace.mode == FETCH_TRACE_REPLAY) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY) {
         return trace_replay_response(budget, method, logical_url, request,
                                      effective_user_agent,
                                      diagnostic_mobile_safari,
@@ -1083,6 +1083,11 @@ static bool fetch_request_internal(Budget *budget, const char *url,
                easy, CURLOPT_FRESH_CONNECT,
                request != NULL && request->force_fresh_connection
                    ? 1L : 0L) != CURLE_OK
+        || (request != NULL && request->tls12_session_resumption
+            && curl_easy_setopt(
+                   easy, CURLOPT_SSLVERSION,
+                   CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_2)
+                   != CURLE_OK)
         || curl_easy_setopt(
                easy, CURLOPT_TIMEOUT_MS, timeout_ms) != CURLE_OK
         || !fetch_configure_stall_watchdog(easy)
@@ -1146,7 +1151,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
                  "delayed HTTP trace activation failed");
         goto failed;
     }
-    if (stream != NULL && fetch_trace.mode == FETCH_TRACE_CAPTURE) {
+    if (stream != NULL && FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE) {
         size_t sequence = fetch_trace.sequence;
         if (sequence >= FETCH_TRACE_RECORD_LIMIT) {
             trace_capture_invalidate("record limit exceeded", sequence);
@@ -1313,7 +1318,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
             result->capacity = result->length + 1;
         }
     }
-    if (fetch_trace.mode == FETCH_TRACE_CAPTURE && stream == NULL) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE && stream == NULL) {
         size_t sequence = fetch_trace.sequence;
         if (!trace_capture_response(
                 method, url, logical_url, request, effective_user_agent,
@@ -1322,7 +1327,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
                                      sequence);
         }
     }
-    if (fetch_trace.mode == FETCH_TRACE_CAPTURE && stream != NULL) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE && stream != NULL) {
         bool captured = context.has_capture_sequence
             && !context.capture_failed
             && trace_capture_response_at(
@@ -1397,7 +1402,7 @@ failed:
              failed_tls_peer_issuer);
     result->redirect_origin_tainted = redirect_origin_tainted;
     (void) snprintf(result->error, sizeof(result->error), "%s", failure);
-    if (fetch_trace.mode == FETCH_TRACE_CAPTURE && stream == NULL) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE && stream == NULL) {
         size_t sequence = fetch_trace.sequence;
         if (!trace_capture_response(
                 method, url, logical_url, request, effective_user_agent,
@@ -1406,7 +1411,7 @@ failed:
                                      sequence);
         }
     }
-    if (fetch_trace.mode == FETCH_TRACE_CAPTURE && stream != NULL) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE && stream != NULL) {
         bool captured = false;
         if (!context.capture_failed) {
             captured = context.has_capture_sequence
@@ -1511,6 +1516,9 @@ typedef struct {
     bool complete;
     bool success;
     unsigned replay_pumps_remaining;
+    /* With fetch_trace.replay_pump_us: the wall time the response is held
+       until (in addition to one pump). */
+    uint64_t replay_release_us;
     size_t trace_sequence;
     bool has_trace_sequence;
     size_t enqueue_pump_generation;

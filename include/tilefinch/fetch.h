@@ -284,10 +284,19 @@ typedef struct {
      * zero and keep the historical behavior.
      */
     long connect_timeout_ms;
+    /* Seconds an attempt may receive no bytes before it fails (0: only the
+       deadline bounds it). For callers that block on the result and retry,
+       such as the synchronous module loader. */
+    long stall_abort_seconds;
     /* Native retry policy only. A stalled media-range retry uses this to
        escape the exact HTTP/2 connection whose throughput floor fired.
        Ordinary page requests leave it false and retain connection reuse. */
     bool force_fresh_connection;
+    /* Native media only: cap the handshake at TLS 1.2 so a reconnect can
+       resume. googlevideo sends no TLS 1.3 tickets on /videoplayback, but a
+       TLS 1.2 ticket arrives inside the handshake itself, and a resumed
+       TLS 1.2 handshake does no key exchange and verifies no certificate. */
+    bool tls12_session_resumption;
     /* Internal transport snapshot for page-originated PNA enforcement. */
     bool block_private_network;
     /* Transport-level policy, independent of whether cookie is empty.
@@ -567,6 +576,11 @@ typedef struct {
     int worker_priority;
     int last_multi_code;
     int last_running;
+    /* Validation builds: times the browser thread slept to let a demoted
+       connection setup (and the firmware network service it waits on) run,
+       and the longest such sleep. */
+    unsigned setup_yields;
+    unsigned setup_yield_max_us;
 } FetchBackgroundTransportMetrics;
 
 typedef struct {
@@ -576,6 +590,8 @@ typedef struct {
     long transport_code;
     long tls_verify_result;
     long negotiated_http_version;
+    /* curl's CURLINFO_CONN_ID: which connection carried the transfer. */
+    long long connection_id;
     long new_connections;
     FetchTransportTiming transport_timing;
     bool success;
@@ -628,6 +644,10 @@ typedef struct {
     bool tls_connection_reuse_known;
     bool tls_connection_reused;
     bool tls12_compatibility_retry;
+    /* CURL_HTTP_VERSION_* the window's connection negotiated. */
+    long negotiated_http_version;
+    /* curl's CURLINFO_CONN_ID: which connection carried the transfer. */
+    long long connection_id;
     char effective_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char content_length[64];
     char content_range[128];
@@ -1164,6 +1184,15 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
                              const FetchRequest *request,
                              size_t maximum_bytes, long timeout_ms,
                              FetchResult *result);
+/* Waits for a request enqueued earlier, pumping the scheduler with the same
+   cooperation as fetch_scheduler_request, and takes its result. */
+/* Cumulative owner time blocked in synchronous fetch waits (see
+   fetch_scheduler_wait) and their count; fetch_sync_wait_note adds one wait
+   measured by a caller (the script loader's byte-pool capacity wait). */
+void fetch_sync_wait_note(uint64_t elapsed_us);
+void fetch_sync_wait_totals(uint64_t *us, uint64_t *count);
+bool fetch_scheduler_wait(FetchScheduler *scheduler, uint64_t request_id,
+                          FetchResult *result);
 bool fetch_scheduler_cancel(FetchScheduler *scheduler, uint64_t request_id,
                             const char *reason);
 /* Completes every active request as cancelled while retaining each result
@@ -1175,6 +1204,10 @@ size_t fetch_scheduler_cancel_all(
 bool fetch_scheduler_discard(FetchScheduler *scheduler,
                              uint64_t request_id);
 size_t fetch_scheduler_pending(const FetchScheduler *scheduler);
+/* Whether request `request_id` has a complete result waiting to be taken:
+   fetch_scheduler_take would return it now. */
+bool fetch_scheduler_request_complete(const FetchScheduler *scheduler,
+                                      uint64_t request_id);
 /* Handshake attribution for the transport hops this scheduler completed. */
 bool fetch_scheduler_tls_handshake_counters(
     const FetchScheduler *scheduler, FetchTlsHandshakeCounters *counters);
@@ -1198,6 +1231,10 @@ bool fetch_scheduler_reservation_available(const FetchScheduler *scheduler,
                                            size_t reserve_bytes);
 bool fetch_scheduler_uses_virtual_replay(const FetchScheduler *scheduler);
 void fetch_scheduler_destroy(FetchScheduler *scheduler);
+/* Ordinary PSP builds omit capture/replay. These entry points then refuse
+   with an explanatory error, without accessing files or changing sessions;
+   active/statistics queries report inactive/zero. Host, validation and PSP
+   hermetic-replay builds retain it by default. */
 bool fetch_trace_capture_begin(const char *directory, char *error,
                                size_t error_size);
 /* Arms capture to begin immediately before the Nth top-level document
@@ -1249,12 +1286,32 @@ typedef struct {
    browser policy withheld. Every response-keyed request has exactly one of
    the matched, unmatched, conflicting, or invalid terminal outcomes. */
 bool fetch_trace_replay_stats(FetchTraceReplayStats *stats);
+/* O(1) served_request_count of the active replay (0 without one), for the
+   tilefinch-work record. */
+size_t fetch_trace_replay_served_count(void);
+/* Cumulative replay file I/O since the replay began: opens (metadata and
+   bodies), reads, bytes and microseconds spent in them. Diagnostics only. */
+void fetch_trace_replay_io(uint64_t *opens, uint64_t *reads,
+                           uint64_t *bytes, uint64_t *us);
 
 /* True while a hermetic HTTP replay is active.  Consumers may treat
    stale cache entries as authoritative: revalidating against a trace
    whose records are already claimed can only fail, and replay time is
    logical anyway. */
 bool fetch_trace_replay_active(void);
+/* An HTTP trace is recording or replaying. The background transport neither
+   records nor replays, so work that needs it stays off the network then. */
+bool fetch_trace_active(void);
+/* Validation builds on PSP: new TLS connections configured, and leaf
+   certificates verified. A resumed handshake verifies no certificate, so
+   the difference counts resumptions. Zeros elsewhere. */
+void fetch_tls_resumption_counters(unsigned *connections,
+                                   unsigned *certificates);
+/* Validation builds: leaf certificates verified for googlevideo hosts. Media
+   handshakes (transport probe) minus this is the media resumption count. */
+unsigned fetch_tls_media_certificates(void);
+/* Validation builds on PSP: log libcurl's cached TLS sessions. */
+void fetch_tls_session_census(void);
 bool fetch_trace_replay_record_was_claimed(size_t sequence);
 /* Applies an optional redacted initial cookie seed from an active replay to
    the empty session. Legacy traces without a seed are a successful no-op. */
@@ -1266,7 +1323,9 @@ FetchResult *fetch_result_create(Budget *budget);
 /* Converts an owned response payload to the main-thread immutable shared-body
    representation in place.  Existing shared results are accepted only when
    their pointer/length invariant is intact.  The payload remains owned by the
-   FetchResult until its shared_body reference is retained or transferred. */
+   FetchResult until its shared_body reference is retained or transferred.
+   The payload may relocate even on failure (a shrink can succeed before the
+   shared-body descriptor is refused); reacquire borrowed pointers afterward. */
 bool fetch_result_share_body(FetchResult *result);
 void fetch_result_destroy(FetchResult *result);
 void fetch_result_free(FetchResult *result);

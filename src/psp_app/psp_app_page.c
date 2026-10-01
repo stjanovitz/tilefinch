@@ -182,6 +182,10 @@ bool psp_retry_navigation_url_after_reclaim(
     BrowserEngine *engine, const char *url, size_t maximum_bytes,
     long timeout_ms, bool record_history)
 {
+    BrowserScriptNavigationAttribution attribution = {0};
+    bool script_navigation =
+        browser_engine_capture_script_navigation_attribution(
+            engine, &attribution);
     if (browser_engine_begin_navigation_url(
             engine, url, maximum_bytes, timeout_ms, record_history)) {
         return true;
@@ -195,6 +199,9 @@ bool psp_retry_navigation_url_after_reclaim(
         || reclaim.total_bytes == 0) return false;
     printf("tilefinch-navigation-retry: kind=url reclaimed=%zu "
            "first=\"%.160s\"\n", reclaim.total_bytes, first_error);
+    if (script_navigation)
+        browser_engine_restore_script_navigation_attribution(
+            engine, &attribution);
     return browser_engine_begin_navigation_url(
         engine, url, maximum_bytes, timeout_ms, record_history);
 }
@@ -291,6 +298,33 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
     return started;
 }
 
+bool psp_open_keyboard_for_late_script_focus(PspApp *app)
+{
+    PspInteractiveState *interactive = app->interactive;
+    if (interactive->script_text_focus_deadline_us == 0) return false;
+    if ((uint64_t) sceKernelGetSystemTimeWide()
+            > interactive->script_text_focus_deadline_us
+        || app->process->presentation.ui.screen != PSP_UI_SCREEN_PAGE) {
+        interactive->script_text_focus_deadline_us = 0;
+        return false;
+    }
+    BrowserEngine *engine = app->browser->engine;
+    if (browser_engine_navigation_pending(engine)
+        || !browser_engine_adopt_script_text_focus(engine)) return false;
+    interactive->script_text_focus_deadline_us = 0;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-script-text-focus: adopted=1\n");
+#endif
+    (void) psp_engine_views_refresh(app->views, engine);
+    bool submit_focused = false;
+    if (psp_replace_focused_text(
+            engine, app->views->frame, &app->process->presentation.ui,
+            &app->process->text_input, false, &submit_focused))
+        (void) psp_engine_views_refresh(app->views, engine);
+    interactive->previous_buttons = 0;
+    return true;
+}
+
 bool psp_replace_focused_text(
     BrowserEngine *engine, const uint16_t *frame, PspUiState *ui,
     PspTextInputService *text_input, bool voice_requested,
@@ -360,6 +394,15 @@ BrowserNavigationJobQuota psp_navigation_quota(void)
     };
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static uint64_t fetch_sync_wait_now(uint64_t since)
+{
+    uint64_t now = 0;
+    fetch_sync_wait_totals(&now, NULL);
+    return now >= since ? now - since : 0;
+}
+#endif
+
 bool psp_run_initial_page_load(
     BrowserEngine *engine, PspUiState *ui, const uint16_t *frame,
     const char *url, size_t maximum_bytes, long timeout_ms,
@@ -375,6 +418,12 @@ bool psp_run_initial_page_load(
         return false;
     }
     uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t fetch_wait_started = 0;
+    fetch_sync_wait_totals(&fetch_wait_started, NULL);
+#endif
+    PspNavigationWatchdog watchdog;
+    psp_navigation_watchdog_start(&watchdog, started_us, 0);
     BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
     bool provisional_dump_attempted = false;
     bool provisional_dumped = false;
@@ -447,7 +496,8 @@ bool psp_run_initial_page_load(
             ui, true, (int) metrics.completion_per_mille);
         uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
         if (status == BROWSER_NAVIGATION_JOB_PENDING
-            && now_us - started_us >= PSP_NAVIGATION_JOB_TIMEOUT_US) {
+            && psp_navigation_watchdog_expired(
+                   &watchdog, now_us, metrics.load.progress_units)) {
             browser_engine_cancel_navigation(
                 engine, "PSP navigation watchdog expired");
             status = BROWSER_NAVIGATION_JOB_CANCELLED;
@@ -462,7 +512,9 @@ bool psp_run_initial_page_load(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     printf("tilefinch-navigation-phases: network=%lluus parse=%lluus "
            "script=%lluus style=%lluus resource=%lluus layout=%lluus "
-           "runtime=%lluus error=\"%.200s\"\n",
+           "runtime=%lluus fetch-wait=%lluus stylesheet=%lluus "
+           "image=%lluus font=%lluus fingerprint=%lluus "
+           "sheet-events=%lluus/%lluus/%zu error=\"%.200s\"\n",
            (unsigned long long) performance->network_us,
            (unsigned long long) performance->parse_us,
            (unsigned long long) performance->script_us,
@@ -470,7 +522,32 @@ bool psp_run_initial_page_load(
            (unsigned long long) performance->resource_us,
            (unsigned long long) performance->layout_us,
            (unsigned long long) performance->runtime_us,
+           (unsigned long long) (fetch_sync_wait_now(fetch_wait_started)),
+           (unsigned long long) performance->stylesheet_resource_us,
+           (unsigned long long) performance->image_resource_us,
+           (unsigned long long) performance->font_resource_us,
+           (unsigned long long) performance->resource_fingerprint_us,
+           (unsigned long long) performance->stylesheet_event_us,
+           (unsigned long long) performance->stylesheet_event_handler_us,
+           performance->stylesheet_event_dispatches,
            browser_engine_last_error(engine));
+    printf("tilefinch-navigation-parse-phases: feed=%lluus callback=%lluus "
+           "metadata=%lluus runtime-startup=%lluus stylesheet=%lluus "
+           "mutation-checkpoint=%lluus script=%lluus script-compile=%lluus "
+           "script-execute=%lluus eof-metadata=%lluus eof-preload=%lluus "
+           "finish=%lluus\n",
+           (unsigned long long) performance->parser_feed_us,
+           (unsigned long long) performance->parser_callback_us,
+           (unsigned long long) performance->parser_metadata_us,
+           (unsigned long long) performance->parser_runtime_startup_us,
+           (unsigned long long) performance->parser_stylesheet_us,
+           (unsigned long long) performance->parser_mutation_checkpoint_us,
+           (unsigned long long) performance->parser_script_us,
+           (unsigned long long) performance->parser_script_compile_us,
+           (unsigned long long) performance->parser_script_execute_us,
+           (unsigned long long) performance->parser_eof_metadata_us,
+           (unsigned long long) performance->parser_eof_preload_us,
+           (unsigned long long) performance->parser_finish_us);
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_load_experience_report("initial", engine, &metrics);
@@ -488,7 +565,7 @@ bool psp_run_initial_page_load(
            "style-builds=%zu continuation=%zu/%zu/%lluus "
            "rules=%zu+%zu discovery=%lluus context=%lluus append=%lluus "
            "refresh-failures=%zu "
-           "parser=%lluus runtime=%lluus css=%lluus "
+           "parser=%lluus runtime=%lluus css=%lluus observers=%lluus "
            "script=%lluus/%lluus "
            "finalize=%lluus transform=%lluus/%zu/%zu "
            "irreducible=%lluus/%zu elapsed=%lluus\n",
@@ -557,6 +634,7 @@ bool psp_run_initial_page_load(
            (unsigned long long) performance->parser_feed_us,
            (unsigned long long) performance->parser_runtime_startup_us,
            (unsigned long long) performance->parser_stylesheet_us,
+           (unsigned long long) performance->parser_mutation_checkpoint_us,
            (unsigned long long) performance->parser_script_compile_us,
            (unsigned long long) performance->parser_script_execute_us,
            (unsigned long long) metrics.load.finalize_us,
@@ -689,6 +767,7 @@ void psp_report_blocking_script_samples(
         printf("tilefinch-navigation-script: ordinal=%zu external=%d "
                "source=%zuB nodes=%zu mutations=%zu total=%lluus "
                "metadata=%lluus runtime=%lluus stylesheet=%lluus "
+               "observers=%lluus "
                "fingerprint=%lluus process=%lluus compile=%lluus "
                "host-callback=%lluus execute=%lluus ok=%d\n",
                sample->ordinal, sample->external ? 1 : 0,
@@ -698,6 +777,7 @@ void psp_report_blocking_script_samples(
                (unsigned long long) sample->metadata_us,
                (unsigned long long) sample->runtime_startup_us,
                (unsigned long long) sample->stylesheet_us,
+               (unsigned long long) sample->mutation_checkpoint_us,
                (unsigned long long) sample->stylesheet_fingerprint_us,
                (unsigned long long) sample->process_us,
                (unsigned long long) sample->compile_us,
@@ -737,11 +817,15 @@ void psp_report_background_transport_metrics(void)
            metrics.cancelled_retired,
            metrics.last_multi_code,
            metrics.last_running);
+    unsigned tls_connections = 0, tls_certificates = 0;
+    fetch_tls_resumption_counters(&tls_connections, &tls_certificates);
     printf("tilefinch-background-transport-worker: perform-max=%uus "
            "perform-over-33ms=%u perform-over-100ms=%u "
            "setup=%u/%uus steady-max=%uus priority-failures=%u "
            "service-max=%uus poll-max=%uus loop-max=%uus "
-           "run-clocks=%lluus preemptions=%u priority=%d\n",
+           "run-clocks=%lluus preemptions=%u priority=%d "
+           "setup-yields=%u/%uus dns-forced-stops=%u "
+           "tls-connections=%u tls-certificates=%u\n",
            metrics.worker_perform_max_us,
            metrics.worker_perform_over_33ms,
            metrics.worker_perform_over_100ms,
@@ -754,7 +838,18 @@ void psp_report_background_transport_metrics(void)
            metrics.worker_loop_max_us,
            (unsigned long long) metrics.worker_run_clocks,
            metrics.worker_thread_preemptions,
-           metrics.worker_priority);
+           metrics.worker_priority,
+           metrics.setup_yields, metrics.setup_yield_max_us,
+           psp_network_dns_forced_stops(),
+           tls_connections, tls_certificates);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspNetworkDnsStubCounters dns = {0};
+    psp_network_dns_stub_counters(&dns);
+    printf("tilefinch-dns-stub: answered=%u retransmitted=%u nxdomain=%u "
+           "fallbacks=%u stood-down=%d\n",
+           dns.answered, dns.retransmitted, dns.nxdomain, dns.fallbacks,
+           dns.stood_down ? 1 : 0);
+#endif
 }
 
 void psp_report_budget_counters(const Budget *budget,

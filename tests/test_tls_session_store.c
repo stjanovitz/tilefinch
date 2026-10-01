@@ -299,6 +299,28 @@ static int test_crypto_pin_mismatch_is_miss(void)
     return 0;
 }
 
+/* Only an identical key and blob count as already stored. */
+static int test_contains(void)
+{
+    TlsSessionStore *store = tls_session_store_create();
+    CHECK(store != NULL);
+    const unsigned char blob[] = {1, 2, 3, 4};
+    const unsigned char other[] = {1, 2, 3, 5};
+    CHECK(!tls_session_store_contains(store, "a.example:443", blob,
+                                      sizeof(blob)));
+    CHECK(tls_session_store_add(store, "a.example:443", blob, sizeof(blob),
+                                5000, 0x0303, 1000, 1));
+    CHECK(tls_session_store_contains(store, "a.example:443", blob,
+                                     sizeof(blob)));
+    CHECK(!tls_session_store_contains(store, "a.example:443", other,
+                                      sizeof(other)));
+    CHECK(!tls_session_store_contains(store, "b.example:443", blob,
+                                      sizeof(blob)));
+    CHECK(!tls_session_store_contains(store, "a.example:443", blob, 3));
+    tls_session_store_free(store);
+    return 0;
+}
+
 /* A missing file is a plain miss, and remove is idempotent. */
 static int test_missing_is_miss(void)
 {
@@ -323,6 +345,7 @@ int main(void)
         {"version_mismatch_is_miss", test_version_mismatch_is_miss},
         {"crypto_pin_mismatch_is_miss", test_crypto_pin_mismatch_is_miss},
         {"missing_is_miss", test_missing_is_miss},
+        {"contains", test_contains},
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int rc = tests[i].fn();

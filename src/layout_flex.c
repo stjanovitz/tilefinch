@@ -70,7 +70,7 @@ static bool intrinsic_grid_track_widths(
     LayoutContext *context, lxb_dom_node_t *container,
     const ComputedStyle *container_style, int column_override,
     int row_override, int limit, bool minimum_phase, size_t depth,
-    int widths[GRID_TRACK_LIMIT])
+    int widths[GRID_TRACK_LIMIT], int *used_columns)
 {
     if (context == NULL || container == NULL || container_style == NULL
         || widths == NULL || limit <= 0 || context->cancelled) return false;
@@ -92,20 +92,82 @@ static bool intrinsic_grid_track_widths(
     if (rows < 1) rows = 1;
     if (rows > GRID_PLACEMENT_ROW_LIMIT) rows = GRID_PLACEMENT_ROW_LIMIT;
 
+    FlexOrderPlan order;
+    if (!flex_order_plan_build(&order, context, container, container_style)) {
+        return false;
+    }
+    FlexItemIterator scan;
+    FlatItem item;
+    /*
+     * Items placed on implicit columns (grid-column: 2 with no template,
+     * or a negative line) widen the grid exactly as layout_block_grid does.
+     * Sizing only the explicit tracks dropped those items from the grid's
+     * max-content width, so a shrink-wrapped grid squeezed them: the
+     * Turnstile checkbox label wrapped onto a second line. A subgrid's
+     * tracks are its parent's, so an override keeps the explicit count.
+     */
+    int explicit_columns = columns;
+    int column_origin = 0;
+    if (column_override <= 0) {
+        int minimum_column = 0, maximum_column = explicit_columns;
+        flex_iterator_init(&scan, context, container, container_style,
+                           &order);
+        size_t extent_visits = 0;
+        while (flex_iterator_next(&scan, &item)) {
+            if (++extent_visits > GRID_PLACEMENT_ROW_LIMIT * GRID_TRACK_LIMIT)
+                break;
+            (void) stylesheet_resolve_named_grid_area(
+                context->sheet, container_style, &item.style);
+            (void) stylesheet_resolve_named_grid_lines(
+                context->sheet, container_style, &item.style);
+            if (item.style.out_of_flow || item.style.fixed_position)
+                continue;
+            grid_axis_extent(
+                computed_style_grid_column_start(&item.style),
+                computed_style_grid_column_end(&item.style),
+                computed_style_grid_column_span(&item.style),
+                explicit_columns, &minimum_column, &maximum_column);
+        }
+        if (minimum_column < -(GRID_TRACK_LIMIT - 1))
+            minimum_column = -(GRID_TRACK_LIMIT - 1);
+        column_origin = -minimum_column;
+        columns = maximum_column - minimum_column;
+        if (columns > GRID_TRACK_LIMIT) columns = GRID_TRACK_LIMIT;
+        if (columns < 1) columns = 1;
+    }
+
     uint8_t types[GRID_TRACK_LIMIT] = {0};
     int gap = computed_style_resolve_gap(container_style->gap, limit);
     for (int column = 0; column < columns; column++) {
+        int explicit_column = column - column_origin;
+        /* Implicit tracks take grid-auto-columns, alternating with its
+           second value when it names two. */
+        bool implicit = column_override <= 0
+            && (explicit_column < 0 || explicit_column >= explicit_columns);
+        int auto_index = explicit_column < 0
+            ? explicit_column : explicit_column - explicit_columns;
+        uint16_t second = container_style->grid_auto_column_second;
+        bool use_second = implicit && second != 0 && (auto_index & 1) != 0;
         uint8_t type = column_override > 0
             ? GRID_TRACK_AUTO
+            : implicit
+            ? (use_second ? (uint8_t) (second >> 14)
+                          : (uint8_t) container_style->grid_auto_column_type)
             : stylesheet_grid_track_type(
-                context->sheet, container_style, false, (unsigned) column);
+                context->sheet, container_style, false,
+                (unsigned) explicit_column);
         unsigned value = column_override > 0
             ? GRID_TRACK_AUTO_VALUE
+            : implicit
+            ? (use_second ? (unsigned) (second & 0x3fffu)
+                          : (unsigned) container_style->grid_auto_column_value)
             : stylesheet_grid_track_value(
-                context->sheet, container_style, false, (unsigned) column);
-        unsigned floor = column_override > 0 ? 0
+                context->sheet, container_style, false,
+                (unsigned) explicit_column);
+        unsigned floor = column_override > 0 || implicit ? 0
             : stylesheet_grid_track_minimum(
-                context->sheet, container_style, false, (unsigned) column);
+                context->sheet, container_style, false,
+                (unsigned) explicit_column);
         types[column] = type;
         widths[column] = (int) floor;
         if (type == GRID_TRACK_FIXED && (int) value > widths[column]) {
@@ -119,14 +181,10 @@ static bool intrinsic_grid_track_widths(
 
     GridPlacementState placement;
     grid_placement_init(&placement, columns, rows, container_style);
-    placement.explicit_columns = (uint8_t) columns;
+    placement.explicit_columns = (uint8_t) explicit_columns;
     placement.explicit_rows = (uint8_t) rows;
-    FlexOrderPlan order;
-    if (!flex_order_plan_build(&order, context, container, container_style)) {
-        return false;
-    }
-    FlexItemIterator scan;
-    FlatItem item;
+    placement.column_origin = (uint8_t) column_origin;
+    if (used_columns != NULL) *used_columns = columns;
     flex_iterator_init(&scan, context, container, container_style, &order);
     size_t visits = 0;
     bool success = true;
@@ -157,7 +215,7 @@ static bool intrinsic_grid_track_widths(
                     context->sheet, &item.style, true);
             if (!intrinsic_grid_track_widths(
                     context, item.node, &item.style, span, local_rows,
-                    limit, minimum_phase, depth + 1, local)) {
+                    limit, minimum_phase, depth + 1, local, NULL)) {
                 success = false;
                 break;
             }
@@ -224,12 +282,12 @@ static int intrinsic_grid_width(
     const ComputedStyle *style, int limit, bool minimum_phase)
 {
     int widths[GRID_TRACK_LIMIT] = {0};
+    int columns = 1;
     if (!intrinsic_grid_track_widths(
-            context, node, style, 0, 0, limit, minimum_phase, 0, widths)) {
+            context, node, style, 0, 0, limit, minimum_phase, 0, widths,
+            &columns)) {
         return 0;
     }
-    int columns = (int) stylesheet_grid_track_count(
-        context->sheet, style, false);
     if (columns < 1) columns = 1;
     if (columns > GRID_TRACK_LIMIT) columns = GRID_TRACK_LIMIT;
     int gap = computed_style_resolve_gap(style->gap, limit);
@@ -255,10 +313,10 @@ bool intrinsic_grid_subgrid_column_requirements(
     memset(maximums, 0, sizeof(int) * GRID_TRACK_LIMIT);
     return intrinsic_grid_track_widths(
                context, node, style, columns, rows, limit, true, 0,
-               minimums)
+               minimums, NULL)
            && intrinsic_grid_track_widths(
                context, node, style, columns, rows, limit, false, 0,
-               maximums);
+               maximums, NULL);
 }
 
 enum {

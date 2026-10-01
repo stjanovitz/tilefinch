@@ -1,0 +1,39 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# A YouTube music video on real hardware: play, seek forward, then rewind far
+# enough to rebuild the decoder over the network while presses arrive. Run
+# through the PSPLink loop with boot.cfg
+#   url=https://m.youtube.com/watch?v=m7k9UMcHbr0   (KATSEYE "Animal")
+#   input_script=youtube-seek-rewind-play.txt
+# In order: play 20 s; three 10 s previews committed with Cross; a rewind to 0
+# (backward-seek-reopen) with Right and Cross pressed while the reopen runs
+# (expected to land near 10 s, playing); play on; close. Read the
+# tilefinch-media-* lines and the tilefinch-input-script-media marks. The
+# network decides the timings, so nothing is gated. No screenshot step.
+wait 1
+mark-live watch
+tap-live cross
+wait-live 1500
+mark-live playing
+tap-live right
+wait-live 10
+tap-live right
+wait-live 10
+tap-live right
+wait-live 30
+tap-live cross
+wait-live 900
+mark-live committed
+tap-live ltrigger
+wait-live 30
+tap-live cross
+wait-live 30
+tap-live right
+wait-live 10
+tap-live cross
+wait-live 1500
+mark-live after-rewind
+tap-live circle
+wait-live 180
+mark closed
+end

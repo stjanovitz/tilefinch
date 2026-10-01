@@ -67,12 +67,23 @@ bool script_compile_classic_bytecode(
     if (bytecode != NULL) *bytecode = NULL;
     if (bytecode_length != NULL) *bytecode_length = 0;
     if (budget == NULL || source == NULL || source_length == 0
+        || source_length == SIZE_MAX
         || source_url == NULL || source_url[0] == '\0'
         || maximum_bytecode_length == 0 || bytecode == NULL
         || bytecode_length == NULL) return false;
 
+    /* Cache/pack sources are exact byte spans. QuickJS requires a readable
+       trailing NUL even when JS_Eval is passed an explicit length. */
+    char *terminated_source = budget_malloc_category(
+        budget, BUDGET_CATEGORY_JAVASCRIPT, source_length + 1u);
+    if (terminated_source == NULL) return false;
+    memcpy(terminated_source, source, source_length);
+    terminated_source[source_length] = '\0';
     BudgetQuickJSPool *pool = budget_quickjs_pool_create(budget);
-    if (pool == NULL) return false;
+    if (pool == NULL) {
+        budget_free(budget, terminated_source);
+        return false;
+    }
     JSRuntime *runtime = JS_NewRuntime2(
         budget_quickjs_pool_allocator(), pool);
     JSContext *context = NULL;
@@ -102,7 +113,7 @@ bool script_compile_classic_bytecode(
     }
     if (context != NULL) {
         compiled = JS_Eval(
-            context, source, source_length, source_url,
+            context, terminated_source, source_length, source_url,
             JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(compiled)) {
             int write_flags = JS_WRITE_OBJ_BYTECODE;
@@ -140,6 +151,7 @@ bool script_compile_classic_bytecode(
         *bytecode_length = 0;
         okay = false;
     }
+    budget_free(budget, terminated_source);
     return okay;
 }
 
@@ -216,6 +228,14 @@ static size_t runtime_module_index_lookup(const ScriptRuntime *runtime,
     return SIZE_MAX;
 }
 
+bool script_runtime_module_loaded(const ScriptRuntime *runtime,
+                                  const char *request_url)
+{
+    size_t index = runtime_module_index_lookup(runtime, request_url);
+    return index != SIZE_MAX
+        && runtime->module_bases[index].response_url != NULL;
+}
+
 ScriptModuleMapStatus script_runtime_module_map_status(
     const ScriptRuntime *runtime, const char *request_url)
 {
@@ -254,7 +274,8 @@ static bool runtime_module_referrer_policy_valid(const char *policy)
 
 static bool runtime_module_edge_register(
     ScriptRuntime *runtime, const char *request_url,
-    size_t parent_index, const char *effective_referrer_policy,
+    size_t parent_index, const char *classic_referrer_url,
+    const char *effective_referrer_policy,
     TilefinchCredentialsMode credentials, size_t *registered_index)
 {
     if (registered_index != NULL) *registered_index = SIZE_MAX;
@@ -292,10 +313,22 @@ static bool runtime_module_edge_register(
     char *request_copy = budget_malloc(runtime->budget, request_length + 1);
     if (request_copy == NULL) return false;
     memcpy(request_copy, request_url, request_length + 1);
+    char *referrer_copy = NULL;
+    if (parent_index == SIZE_MAX && classic_referrer_url != NULL
+        && classic_referrer_url[0] != '\0') {
+        size_t referrer_length = strlen(classic_referrer_url);
+        referrer_copy = budget_malloc(runtime->budget, referrer_length + 1);
+        if (referrer_copy == NULL) {
+            budget_free(runtime->budget, request_copy);
+            return false;
+        }
+        memcpy(referrer_copy, classic_referrer_url, referrer_length + 1);
+    }
     size_t index = runtime->module_base_count++;
     runtime->module_bases[index] =
         (ScriptModuleBaseEntry) {
             .request_url = request_copy,
+            .classic_referrer_url = referrer_copy,
             .credentials = credentials,
             .parent_index = parent_index == SIZE_MAX
                 ? UINT16_MAX : (uint16_t) parent_index,
@@ -340,7 +373,7 @@ TilefinchCredentialsMode credentials)
 {
     size_t index = SIZE_MAX;
     return runtime_module_edge_register(
-               runtime, request_url, SIZE_MAX,
+               runtime, request_url, SIZE_MAX, NULL,
                effective_referrer_policy == NULL
                    ? "" : effective_referrer_policy,
                credentials, &index)
@@ -384,6 +417,316 @@ char output[BROWSER_MODULE_REFERRER_POLICY_LIMIT])
     snprintf(output, BROWSER_MODULE_REFERRER_POLICY_LIMIT, "%s", selected);
 }
 
+/*
+ * Source retention for page modules.
+ *
+ * QuickJS keeps each function's source text so Function.prototype.toString()
+ * can return it; with shared source spans that is close to one copy of every
+ * compiled module in the page heap (dropping it saves about 1 MB of
+ * chatgpt.com's 11 MB realm, and 1.5 MB of its first-load peak because the
+ * parser no longer copies each nested function's text). JS_STRIP_SOURCE
+ * drops only that text. It keeps the line/column table and file name, so
+ * Error.stack, our uncaught-error reports and the client-fatal-error beacons
+ * some sites send still carry file:line:col. JS_STRIP_DEBUG would also drop
+ * those and is not used for page code.
+ *
+ * What a page loses: toString() of a function compiled from a stripped
+ * module returns QuickJS's NativeFunction form, "function name() {\n
+ * [native code]\n}" (as the specification allows when no source text is
+ * retained). Code that parses its own functions' text - dependency-injection
+ * argument parsing, building a Worker from fn.toString(), self-integrity
+ * checks - would see that form instead. Those patterns belong to classic
+ * scripts and eval/Function bodies far more than to bundled ES modules, and
+ * none of those are stripped. On chatgpt.com's startup (the site that set
+ * this policy) no function compiled from a module had toString() called on it
+ * at all; the one module that reads its own functions' text falls back
+ * cleanly when it finds no location marker. Modules smaller than the
+ * threshold keep their source: they hold under a tenth of a typical graph's
+ * bytes, and a small helper module is where a stringified worker body is
+ * most likely to live.
+ */
+#define SCRIPT_MODULE_STRIP_SOURCE_MINIMUM_BYTES (8u * 1024u)
+
+static int script_module_strip_flags(size_t source_length)
+{
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    return source_length >= SCRIPT_MODULE_STRIP_SOURCE_MINIMUM_BYTES
+        ? JS_STRIP_SOURCE : 0;
+#else
+    (void) source_length;
+    return 0;
+#endif
+}
+
+/*
+ * Module bytecode cache (BrowserModuleBytecodeCache in session.h).
+ *
+ * chatgpt.com loads ~112 modules and reloads itself once during startup, so
+ * the whole graph used to be compiled twice; a revisit compiled it again.
+ * After a module compiles, its record is serialized with JS_WriteObject and
+ * kept in the session, keyed by the module name QuickJS bakes into the
+ * record, the response URL, the top-level site that fetched it, the strip
+ * policy and the exact source. A later load of the same bytes restores it
+ * with JS_ReadObject and then resolves its imports (JS_ResolveModule) the
+ * way JS_Eval does after a compile, so loading, linking, import.meta, dynamic
+ * import and error unwinding take the same path either way. The cache sits
+ * after fetching: every CSP, SRI, CORS, MIME and quota check has already
+ * admitted the bytes, and the compile-admission size policy is applied to a
+ * hit as to a compile. A record that fails to restore is dropped and the
+ * source compiled instead.
+ */
+static bool module_bytecode_key_init(
+    ScriptRuntime *runtime, BrowserModuleBytecodeKey *key,
+    char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT], const char *source,
+    size_t source_length, const char *module_name, const char *response_url,
+    int strip_flags)
+{
+    memset(key, 0, sizeof(*key));
+    /* An opaque origin has no network partition to key by. */
+    if (runtime->session == NULL || response_url == NULL
+        || response_url[0] == '\0'
+        || runtime->session->maximum_module_bytecode_bytes == 0
+        || script_runtime_origin_is_opaque(runtime)
+        || runtime->bridge.top_level_url == NULL
+        || !tilefinch_url_site_key(runtime->bridge.top_level_url, partition,
+                                   TILEFINCH_ORIGIN_SERIALIZED_LIMIT)) {
+        return false;
+    }
+    if (runtime->module_bytecode_generation == 0) {
+        runtime->module_bytecode_generation =
+            browser_session_module_bytecode_generation(runtime->session);
+    }
+    *key = (BrowserModuleBytecodeKey) {
+        .module_name = module_name,
+        .response_url = response_url,
+        .partition_key = partition,
+        .source = (const unsigned char *) source,
+        .source_length = source_length,
+        .compile_flags = (uint32_t) strip_flags
+    };
+    return true;
+}
+
+static void module_bytecode_clear_exception(JSContext *context)
+{
+    JSValue exception = JS_GetException(context);
+    JS_FreeValue(context, exception);
+}
+
+/* Serialize a freshly compiled module into the cache when there is room.
+   Serialization is an optional accelerator beside a compiled module: it is
+   skipped rather than allowed to consume the realm's remaining headroom, and
+   a refusal never affects the module. */
+static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
+                                  BrowserModuleBytecodeKey *key,
+                                  JSValueConst compiled,
+                                  ScriptResult *result)
+{
+    const size_t heap_floor = 64u * 1024u;
+    size_t source_length = key->source_length;
+    size_t heap_reserve = source_length > (SIZE_MAX - heap_floor) / 4u
+        ? SIZE_MAX : heap_floor + source_length * 4u;
+    /* The copy lands in the page Budget; keep the same reserve the script
+       loader keeps for presentation work after scripts. */
+    const size_t budget_reserve = 3u * 1024u * 1024u;
+    size_t budget_left = budget_remaining(runtime->session->budget);
+    size_t minimum_bytecode = source_length / 4u + 1u;
+    /* Either tier may want the bytes: RAM when it can admit them, the
+       optional persistent tier when it has no file for this key yet. */
+    bool ram_wanted = browser_session_module_bytecode_may_fit(
+        runtime->session, key, minimum_bytecode,
+        runtime->module_bytecode_generation);
+    bool disk_wanted = browser_session_module_bytecode_disk_wants(
+        runtime->session, key, minimum_bytecode);
+    if (script_runtime_heap_available(runtime) < heap_reserve
+        || budget_left < budget_reserve
+        || minimum_bytecode > budget_left - budget_reserve
+        || (!ram_wanted && !disk_wanted)) {
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_admission_skips, 1);
+        return;
+    }
+    size_t length = 0;
+    uint8_t *bytecode = JS_WriteObject(context, &length, compiled,
+                                       JS_WRITE_OBJ_BYTECODE);
+    if (bytecode == NULL) {
+        module_bytecode_clear_exception(context);
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_admission_skips, 1);
+        return;
+    }
+    if (disk_wanted && length != 0
+        && browser_session_module_bytecode_disk_store(
+               runtime->session, key, bytecode, length))
+        js_rt_saturating_add_size(&result->module_bytecode_disk_stores, 1);
+    budget_left = budget_remaining(runtime->session->budget);
+    bool stored = ram_wanted && length != 0 && budget_left >= budget_reserve
+        && length <= budget_left - budget_reserve
+        && browser_session_module_bytecode_put(
+               runtime->session, key, runtime->module_bytecode_generation,
+               bytecode, length);
+    js_free(context, bytecode);
+    if (stored) {
+        js_rt_saturating_add_size(&result->module_bytecode_cache_stores, 1);
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_stored_bytes, length);
+    } else {
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_admission_skips, 1);
+    }
+}
+
+/* Restore a cached record. Returns true when it was restored (its import
+   resolution may still have failed: then *module is JS_EXCEPTION with the
+   exception pending, exactly as a compile whose imports fail). Returns false
+   when there was nothing usable to restore. */
+static bool module_bytecode_restore(ScriptRuntime *runtime,
+                                    JSContext *context,
+                                    BrowserModuleBytecodeKey *key,
+                                    ScriptResult *result, bool *admitted,
+                                    JSValue *module)
+{
+    BrowserSharedBody *cached = browser_session_module_bytecode_acquire(
+        runtime->session, key, runtime->module_bytecode_generation);
+    bool from_disk = false;
+    if (cached == NULL
+        && browser_session_module_bytecode_disk_enabled(runtime->session)) {
+        /* The optional persistent tier: a verified file for this exact
+           key, admitted exactly as a RAM hit below. Its synchronous read
+           and verification are timed whether or not they find one. */
+        BrowserSession *session = runtime->session;
+        uint64_t load_started_ns = js_rt_monotonic_time_ns(),
+            read_before = session->module_bytecode_disk_read_ns,
+            verify_before = session->module_bytecode_disk_verify_ns;
+        cached = browser_session_module_bytecode_disk_load(session, key);
+        result->module_bytecode_disk_load_us +=
+            (js_rt_monotonic_time_ns() - load_started_ns) / 1000u;
+        result->module_bytecode_disk_read_us +=
+            (session->module_bytecode_disk_read_ns - read_before) / 1000u;
+        result->module_bytecode_disk_verify_us +=
+            (session->module_bytecode_disk_verify_ns - verify_before) / 1000u;
+        from_disk = cached != NULL;
+    }
+    if (cached == NULL) return false;
+    if (!js_rt_admit_cached_compile_source(
+            context, key->source_length, key->module_name,
+            SCRIPT_COMPILE_SOURCE_MODULE, result)) {
+        /* The same refusal a compile of these bytes would get. */
+        browser_shared_body_release(cached);
+        *module = JS_EXCEPTION;
+        return true;
+    }
+    *admitted = true;
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    JSValue restored = JS_ReadObject(context, cached->data, cached->length,
+                                     JS_READ_OBJ_BYTECODE);
+    uint64_t read_ns = js_rt_monotonic_time_ns();
+    /* Deserialization, successful or not. */
+    result->module_bytecode_restore_us += (read_ns - started_ns) / 1000u;
+    size_t restored_bytes = cached->length;
+    bool restored_module = !JS_IsException(restored)
+        && JS_VALUE_GET_TAG(restored) == JS_TAG_MODULE;
+    if (from_disk && restored_module) {
+        js_rt_saturating_add_size(&result->module_bytecode_disk_hits, 1);
+        /* Keep it in RAM too when there is room, for the next load. */
+        (void) browser_session_module_bytecode_put(
+            runtime->session, key, runtime->module_bytecode_generation,
+            cached->data, cached->length);
+        result->module_bytecode_promote_us +=
+            (js_rt_monotonic_time_ns() - read_ns) / 1000u;
+    }
+    browser_shared_body_release(cached);
+    if (JS_IsException(restored)
+        || JS_VALUE_GET_TAG(restored) != JS_TAG_MODULE) {
+        if (JS_IsException(restored)) {
+            module_bytecode_clear_exception(context);
+        } else {
+            JS_FreeValue(context, restored);
+        }
+        *admitted = false;
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_restore_failures, 1);
+        if (from_disk)
+            browser_session_module_bytecode_disk_discard(runtime->session,
+                                                         key);
+        else
+            browser_session_module_bytecode_invalidate(runtime->session, key);
+        return false;
+    }
+    js_rt_saturating_add_size(&result->module_bytecode_cache_hits, 1);
+    js_rt_saturating_add_size(&result->module_bytecode_cache_bytes,
+                              restored_bytes);
+    /* JS_Eval resolves a compiled module's imports before returning it;
+       do the same here, loading each import through the ordinary loader. */
+    if (JS_ResolveModule(context, restored) < 0) {
+        JS_FreeValue(context, restored);
+        *module = JS_EXCEPTION;
+        return true;
+    }
+    *module = restored;
+    return true;
+}
+
+JSValue js_rt_module_compile_external(
+    ScriptRuntime *runtime, JSContext *context, const char *source,
+    size_t source_length, const char *module_name, const char *response_url,
+    ScriptResult *result, bool *admitted)
+{
+    if (admitted != NULL) *admitted = false;
+    if (runtime == NULL || context == NULL || source == NULL
+        || module_name == NULL || result == NULL || admitted == NULL) {
+        return JS_EXCEPTION;
+    }
+    int strip_flags = script_module_strip_flags(source_length);
+    char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    BrowserModuleBytecodeKey key;
+    uint64_t key_started_ns = js_rt_monotonic_time_ns();
+    bool cacheable = module_bytecode_key_init(
+        runtime, &key, partition, source, source_length, module_name,
+        response_url, strip_flags);
+    result->module_key_us +=
+        (js_rt_monotonic_time_ns() - key_started_ns) / 1000u;
+    if (cacheable) {
+        JSValue restored = JS_UNDEFINED;
+        if (module_bytecode_restore(runtime, context, &key, result,
+                                    admitted, &restored)) {
+            return restored;
+        }
+        js_rt_saturating_add_size(&result->module_bytecode_cache_misses, 1);
+    }
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    /* The strip flag is runtime-wide and read when each function definition
+       is created, so it covers exactly this module's parse. Imports resolved
+       inside JS_Eval run through runtime_module_loader(), which clears it
+       again before anything else can compile. */
+    JSRuntime *js_runtime = JS_GetRuntime(context);
+    int previous_strip = JS_GetStripInfo(js_runtime);
+    JS_SetStripInfo(js_runtime, strip_flags);
+#endif
+    uint64_t parse_started_ns = js_rt_monotonic_time_ns();
+    uint64_t nested_before_ns = runtime->module_nested_ns;
+    JSValue compiled = js_rt_compile_source_type(
+        context, source, source_length, module_name, JS_EVAL_TYPE_MODULE,
+        SCRIPT_COMPILE_SOURCE_MODULE, result, admitted);
+    uint64_t parse_finished_ns = js_rt_monotonic_time_ns();
+    /* Exclusive: imports loaded and compiled inside this JS_Eval are
+       charged to their own modules. */
+    uint64_t nested_ns = runtime->module_nested_ns - nested_before_ns;
+    uint64_t parse_ns = parse_finished_ns - parse_started_ns;
+    result->module_parse_us +=
+        (parse_ns > nested_ns ? parse_ns - nested_ns : 0) / 1000u;
+    result->module_source_bytes += source_length;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JS_SetStripInfo(js_runtime, previous_strip);
+#endif
+    if (cacheable && *admitted && !JS_IsException(compiled)) {
+        module_bytecode_store(runtime, context, &key, compiled, result);
+        result->module_store_us +=
+            (js_rt_monotonic_time_ns() - parse_finished_ns) / 1000u;
+    }
+    return compiled;
+}
+
 static char *runtime_module_normalize(JSContext *context,
                                       const char *base_name,
                                       const char *module_name,
@@ -421,16 +764,20 @@ static char *runtime_module_normalize(JSContext *context,
     if (!fetch_resolve_url(base, module_name, resolved, sizeof(resolved))) {
         return js_strdup(context, module_name);
     }
+    /* A request with no module parent comes from a classic script (or a
+       host evaluation); its base URL is the request's referrer. */
     if (!runtime_module_edge_register(
-            runtime, resolved, parent_index, policy, credentials, NULL)) {
+            runtime, resolved, parent_index,
+            parent_index == SIZE_MAX ? base : NULL, policy, credentials,
+            NULL)) {
         return NULL;
     }
     return js_strdup(context, resolved);
 }
 
-static JSModuleDef *runtime_module_loader(JSContext *context,
-                                          const char *module_name,
-                                          void *opaque)
+static JSModuleDef *runtime_module_load_record(JSContext *context,
+                                               const char *module_name,
+                                               void *opaque)
 {
     ScriptRuntime *runtime = opaque;
     if (runtime->module_load == NULL) {
@@ -447,9 +794,13 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
     uint16_t stored_parent_index =
         runtime->module_bases[module_index].parent_index;
     size_t parent_index = stored_parent_index;
-    if (stored_parent_index == UINT16_MAX
-        || parent_index >= runtime->module_base_count
-        || runtime->module_bases[parent_index].response_url == NULL) {
+    const ScriptModuleBaseEntry *entry = &runtime->module_bases[module_index];
+    const char *referrer = entry->classic_referrer_url;
+    if (stored_parent_index != UINT16_MAX
+        && parent_index < runtime->module_base_count) {
+        referrer = runtime->module_bases[parent_index].response_url;
+    }
+    if (referrer == NULL) {
         JS_ThrowReferenceError(context,
                                "module referrer is missing for '%s'",
                                module_name);
@@ -458,20 +809,17 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
     char request_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char referrer_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char referrer_policy[BROWSER_MODULE_REFERRER_POLICY_LIMIT];
-    const ScriptModuleBaseEntry *entry = &runtime->module_bases[module_index];
-    const ScriptModuleBaseEntry *parent = &runtime->module_bases[parent_index];
     const char *entry_policy = js_rt_runtime_module_referrer_policy_text(
         entry->effective_referrer_policy);
     if (strlen(entry->request_url) >= sizeof(request_url)
-        || strlen(parent->response_url) >= sizeof(referrer_url)
+        || strlen(referrer) >= sizeof(referrer_url)
         || entry_policy == NULL
         || strlen(entry_policy) >= sizeof(referrer_policy)) {
         JS_ThrowRangeError(context, "module request metadata is too large");
         return NULL;
     }
     snprintf(request_url, sizeof(request_url), "%s", entry->request_url);
-    snprintf(referrer_url, sizeof(referrer_url), "%s",
-             parent->response_url);
+    snprintf(referrer_url, sizeof(referrer_url), "%s", referrer);
     snprintf(referrer_policy, sizeof(referrer_policy), "%s",
              entry_policy);
     TilefinchCredentialsMode credentials = entry->credentials;
@@ -487,7 +835,12 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
                 referrer_url);
     }
     ScriptModuleLoadResult loaded = {0};
-    if (!runtime->module_load(runtime->module_opaque, &request, &loaded)
+    uint64_t fetch_started_ns = js_rt_monotonic_time_ns();
+    bool fetched = runtime->module_load(runtime->module_opaque, &request,
+                                        &loaded);
+    runtime->result.module_fetch_us +=
+        (js_rt_monotonic_time_ns() - fetch_started_ns) / 1000u;
+    if (!fetched
         || loaded.source == NULL || loaded.response_url == NULL
         || loaded.response_url[0] == '\0'
         || memchr(loaded.response_referrer_policy, '\0',
@@ -512,13 +865,20 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
     }
     bool admitted = false;
     uint64_t compile_started_ns = js_rt_monotonic_time_ns();
-    JSValue compiled = js_rt_compile_source_type(
-        context, loaded.source, loaded.source_length, module_name,
-        JS_EVAL_TYPE_MODULE,
-        SCRIPT_COMPILE_SOURCE_MODULE, &runtime->result, &admitted);
-    runtime->result.module_compile_us +=
-        (js_rt_monotonic_time_ns() - compile_started_ns) / 1000u;
-    runtime->result.module_compile_count++;
+    uint64_t nested_before_ns = runtime->module_nested_ns;
+    size_t restores_before = runtime->result.module_bytecode_cache_hits;
+    JSValue compiled = js_rt_module_compile_external(
+        runtime, context, loaded.source, loaded.source_length, module_name,
+        loaded.response_url, &runtime->result, &admitted);
+    /* Restores are timed as module_bytecode_restore_us. Exclusive of the
+       imports this compile loaded (each counts its own compile). */
+    if (runtime->result.module_bytecode_cache_hits == restores_before) {
+        uint64_t elapsed_ns = js_rt_monotonic_time_ns() - compile_started_ns;
+        uint64_t nested_ns = runtime->module_nested_ns - nested_before_ns;
+        runtime->result.module_compile_us +=
+            (elapsed_ns > nested_ns ? elapsed_ns - nested_ns : 0) / 1000u;
+        runtime->result.module_compile_count++;
+    }
     if (!admitted) {
         if (runtime->module_release != NULL) {
             runtime->module_release(runtime->module_opaque, &loaded);
@@ -549,12 +909,57 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
     return module;
 }
 
+/* Charges one nested load to the importer's nested total. The load's own
+   imports were added to that total while it ran, but they are already inside
+   its wall time, so the total becomes its value before the load plus the
+   load's inclusive time: every importer up the chain subtracts each
+   descendant exactly once. */
+static JSModuleDef *runtime_module_load_timed(JSContext *context,
+                                              const char *module_name,
+                                              void *opaque)
+{
+    ScriptRuntime *runtime = opaque;
+    uint64_t nested_before_ns =
+        runtime == NULL ? 0 : runtime->module_nested_ns;
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    JSModuleDef *module = runtime_module_load_record(
+        context, module_name, opaque);
+    if (runtime != NULL) {
+        runtime->module_nested_ns = nested_before_ns
+            + (js_rt_monotonic_time_ns() - started_ns);
+    }
+    return module;
+}
+
+static JSModuleDef *runtime_module_loader(JSContext *context,
+                                          const char *module_name,
+                                          void *opaque)
+{
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    /* QuickJS resolves a module's imports inside the JS_Eval that compiled
+       it, i.e. while that module's strip flag is still installed. Nothing
+       loaded or run from here inherits it; the dependency's own compile
+       chooses its flag. */
+    JSRuntime *js_runtime = JS_GetRuntime(context);
+    int previous_strip = JS_GetStripInfo(js_runtime);
+    JS_SetStripInfo(js_runtime, 0);
+    JSModuleDef *module = runtime_module_load_timed(
+        context, module_name, opaque);
+    JS_SetStripInfo(js_runtime, previous_strip);
+    return module;
+#else
+    return runtime_module_load_timed(context, module_name, opaque);
+#endif
+}
+
 void js_rt_runtime_module_metadata_clear(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
     for (size_t i = 0; i < runtime->module_base_count; i++) {
         budget_free(runtime->budget, runtime->module_bases[i].response_url);
         budget_free(runtime->budget, runtime->module_bases[i].request_url);
+        budget_free(runtime->budget,
+                    runtime->module_bases[i].classic_referrer_url);
     }
     budget_free(runtime->budget, runtime->module_bases);
     runtime->module_bases = NULL;
@@ -588,6 +993,13 @@ void script_runtime_set_module_loader_owned(
                            load == NULL ? NULL : runtime_module_normalize,
                            load == NULL ? NULL : runtime_module_loader,
                            load == NULL ? NULL : runtime);
+}
+
+void *script_runtime_module_loader_opaque(
+    const ScriptRuntime *runtime, ScriptModuleLoadCallback load)
+{
+    return runtime != NULL && load != NULL && runtime->module_load == load
+        ? runtime->module_opaque : NULL;
 }
 
 static bool script_runtime_evaluate_external_typed_at(
@@ -739,7 +1151,7 @@ static bool script_runtime_evaluate_external_typed_at(
                     size_t cache_reserve = evaluated_length > (SIZE_MAX - cache_floor) / 4u
                         ? SIZE_MAX : cache_floor + evaluated_length * 4u;
                     bool may_fit =
-                        script_runtime_heap_remaining(runtime) >= cache_reserve
+                        script_runtime_heap_available(runtime) >= cache_reserve
                         && browser_session_classic_script_bytecode_may_fit(
                             runtime->session, classic_cache_url,
                             (const unsigned char *) evaluated_source,
@@ -777,16 +1189,17 @@ static bool script_runtime_evaluate_external_typed_at(
                     runtime->context, compiled, name, evaluated_length,
                     &runtime->result);
             }
+        } else if (module) {
+            evaluated = js_rt_evaluate_external_module_at(
+                runtime->context, evaluated_source, evaluated_length, name,
+                response_url != NULL ? response_url : request_url,
+                module_referrer_policy, module_credentials,
+                &runtime->result);
         } else {
             evaluated = js_rt_evaluate_source_type_at(
                 runtime->context, evaluated_source, evaluated_length, name,
-                module && response_url != NULL ? response_url : request_url,
-                module ? module_referrer_policy : NULL,
-                module ? module_credentials
-                       : TILEFINCH_CREDENTIALS_SAME_ORIGIN,
-                module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL,
-                module ? SCRIPT_COMPILE_SOURCE_MODULE
-                       : SCRIPT_COMPILE_SOURCE_EXTERNAL,
+                request_url, NULL, TILEFINCH_CREDENTIALS_SAME_ORIGIN,
+                JS_EVAL_TYPE_GLOBAL, SCRIPT_COMPILE_SOURCE_EXTERNAL,
                 &runtime->result);
         }
         if (!evaluated) {

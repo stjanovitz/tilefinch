@@ -171,6 +171,52 @@
     navigation_destroy(&realm_navigation);
     CHECK(budget.current == 0);
 
+    puts("test: submit observes click geometry and microtasks");
+    for (unsigned variant = 0; variant < 4; variant++) {
+        static NavigationSession activation_navigation;
+        static const char activation_page[] =
+            "<!doctype html><body><form id=f><button id=send>Send</button></form>"
+            "<div id=box style='width:100px'>BEFORE</div><script>"
+            "var variant=0,order='';"
+            "document.getElementById('send').onclick=function(e){"
+            "order+='click';var b=document.getElementById('box');"
+            "b.style.width='200px';b.textContent='AFTER';"
+            "Promise.resolve().then(function(){order+=',micro'});"
+            "if(variant===2)e.preventDefault();"
+            "if(variant===3)this.remove();};"
+            "document.getElementById('f').onsubmit=function(e){"
+            "e.preventDefault();order+=',submit';"
+            "if(variant===1)order+=','+document.getElementById('box').getBoundingClientRect().width;"
+            "document.getElementById('box').textContent='SUBMITTED';};</script>";
+        CHECK(navigation_init(&activation_navigation, &budget, 2));
+        navigation_enable_scripts(&activation_navigation, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&activation_navigation,
+            navigation_begin(&activation_navigation), "https://example.test/activation",
+            activation_page, strlen(activation_page), 480, NULL, NULL, true));
+        char variant_script[32];
+        snprintf(variant_script, sizeof(variant_script), "variant=%u", variant);
+        CHECK(script_runtime_evaluate_diagnostic(activation_navigation.page.runtime,
+            variant_script, "<activation-variant>", &activation_navigation.page.script_result));
+        BrowserController activation_controller;
+        CHECK(controller_init(&activation_controller, &activation_navigation));
+        CHECK(controller_focus_node(&activation_controller, find_id(
+            lxb_dom_interface_node(activation_navigation.page.document.html), "send")));
+        size_t before = activation_navigation.incremental_relayouts;
+        ControllerAction activation_action;
+        CHECK(controller_activate(&activation_controller, &activation_action));
+        CHECK(!script_runtime_has_pending_mutations(activation_navigation.page.runtime));
+        CHECK(activation_navigation.incremental_relayouts == before + (variant < 2 ? 2u : 1u));
+        CHECK(command_x(&activation_navigation.page.layout,
+                        variant < 2 ? "SUBMITTED" : "AFTER") >= 0);
+        CHECK(script_runtime_evaluate_diagnostic(activation_navigation.page.runtime,
+            "pocSummary=order", "<activation-order>", &activation_navigation.page.script_result));
+        CHECK(strcmp(activation_navigation.page.script_result.summary,
+            variant == 0 ? "click,micro,submit" : variant == 1 ? "click,micro,submit,200"
+                : "click,micro") == 0);
+        navigation_destroy(&activation_navigation);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: nonvisual head scripts preserve observable DOM without body layout");
     static const char *head_script_pages[] = {
         "<!doctype html><title>Head</title><style>p:empty{color:red}"
@@ -539,6 +585,8 @@
           && strcmp(interactive.page.script_result.summary,
                     "ellipsis|hidden|2px|dashed|rgb(18, 52, 86)|-3px|"
                     "inset(7% round 4px)|brightness(0.75)|collapse") == 0);
+    /* An image-bearing inline declaration re-derives the image table
+       alone; the sheet is untouched, so this is not a full rebuild. */
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "document.getElementById('status').style.backgroundImage="
@@ -547,10 +595,10 @@
               &interactive.page.script_result)
           && script_runtime_consume_relayout(interactive.page.runtime)
           && navigation_relayout(&interactive)
-          && interactive.performance.fast_relayouts == 3
-          && interactive.performance.full_relayouts == 1
-          && interactive.performance.mutation_resource_rebuilds == 1
-          && interactive.performance.resource_fingerprint_scans == 2);
+          && interactive.performance.fast_relayouts == 4
+          && interactive.performance.full_relayouts == 0
+          && interactive.performance.mutation_resource_rebuilds == 0
+          && interactive.performance.resource_fingerprint_scans == 1);
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "const script=document.createElement('script');"
@@ -562,9 +610,9 @@
               &interactive.page.script_result)
           && script_runtime_consume_relayout(interactive.page.runtime)
           && navigation_relayout(&interactive)
-          && interactive.performance.fast_relayouts == 4
-          && interactive.performance.full_relayouts == 1
-          && interactive.performance.mutation_resource_rebuilds == 1);
+          && interactive.performance.fast_relayouts == 5
+          && interactive.performance.full_relayouts == 0
+          && interactive.performance.mutation_resource_rebuilds == 0);
     bool adopted_evaluated = script_runtime_evaluate_diagnostic(
         interactive.page.runtime,
         "(()=>{const target=document.createElement('p');"
@@ -582,11 +630,11 @@
     /* The adopted sheet is a script-inserted <style>: it is appended to the
        page sheet in place rather than rebuilding it. */
     if (!adopted_relayout
-        || interactive.performance.fast_relayouts != 5
-        || interactive.performance.full_relayouts != 1
-        || interactive.performance.mutation_resource_rebuilds != 1
+        || interactive.performance.fast_relayouts != 6
+        || interactive.performance.full_relayouts != 0
+        || interactive.performance.mutation_resource_rebuilds != 0
         || interactive.performance.mutation_style_appends != 1
-        || interactive.performance.resource_fingerprint_scans != 3) {
+        || interactive.performance.resource_fingerprint_scans != 2) {
         fprintf(stderr,
                 "constructed stylesheet native probe: eval=%d pending=%d "
                 "relayout=%d fast=%zu full=%zu resource=%zu scans=%zu "
@@ -599,11 +647,11 @@
                 interactive.page.script_result.error);
     }
     CHECK(adopted_relayout
-          && interactive.performance.fast_relayouts == 5
-          && interactive.performance.full_relayouts == 1
-          && interactive.performance.mutation_resource_rebuilds == 1
+          && interactive.performance.fast_relayouts == 6
+          && interactive.performance.full_relayouts == 0
+          && interactive.performance.mutation_resource_rebuilds == 0
           && interactive.performance.mutation_style_appends == 1
-          && interactive.performance.resource_fingerprint_scans == 3);
+          && interactive.performance.resource_fingerprint_scans == 2);
     uint32_t adopted_text_color = UINT32_MAX;
     for (size_t command_at = 0;
          command_at < interactive.page.layout.count; command_at++) {
@@ -626,7 +674,7 @@
     CHECK(navigation_relayout(&interactive));
     CHECK(interactive.performance.mutation_journal_overflows == 0);
     CHECK(interactive.performance.mutation_conservative_scans == 0);
-    CHECK(interactive.performance.resource_fingerprint_scans == 3);
+    CHECK(interactive.performance.resource_fingerprint_scans == 2);
     bool detached_image_evaluated = script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "(()=>{const image=document.createElement('img');"
@@ -643,11 +691,11 @@
     bool detached_image_relayout = detached_image_pending
         && navigation_relayout(&interactive);
     if (!detached_image_relayout
-        || interactive.performance.fast_relayouts != 6
-        || interactive.performance.full_relayouts != 2
+        || interactive.performance.fast_relayouts != 7
+        || interactive.performance.full_relayouts != 1
         || interactive.performance.mutation_image_resource_scans != 0
         || interactive.performance.mutation_journal_overflows != 0
-        || interactive.performance.resource_fingerprint_scans != 4) {
+        || interactive.performance.resource_fingerprint_scans != 3) {
         fprintf(stderr,
                 "detached image probe: eval=%d pending=%d relayout=%d "
                 "fast=%zu full=%zu images=%zu overflow=%zu scans=%zu "
@@ -662,11 +710,11 @@
                 interactive.page.script_result.error);
     }
     CHECK(detached_image_relayout
-          && interactive.performance.fast_relayouts == 7
-          && interactive.performance.full_relayouts == 1
+          && interactive.performance.fast_relayouts == 8
+          && interactive.performance.full_relayouts == 0
           && interactive.performance.mutation_image_resource_scans == 0
           && interactive.performance.mutation_journal_overflows == 0
-          && interactive.performance.resource_fingerprint_scans == 4);
+          && interactive.performance.resource_fingerprint_scans == 3);
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "(()=>{const image=document.querySelector('img.card');"
@@ -677,10 +725,10 @@
               &interactive.page.script_result)
           && script_runtime_consume_relayout(interactive.page.runtime)
           && navigation_relayout(&interactive)
-          && interactive.performance.fast_relayouts == 8
-          && interactive.performance.full_relayouts == 1
+          && interactive.performance.fast_relayouts == 9
+          && interactive.performance.full_relayouts == 0
           && interactive.performance.mutation_image_resource_scans == 0
-          && interactive.performance.resource_fingerprint_scans == 4);
+          && interactive.performance.resource_fingerprint_scans == 3);
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "document.querySelector('img.card').setAttribute("
@@ -689,10 +737,10 @@
               &interactive.page.script_result)
           && script_runtime_consume_relayout(interactive.page.runtime)
           && navigation_relayout(&interactive)
-          && interactive.performance.fast_relayouts == 9
-          && interactive.performance.full_relayouts == 1
-          && interactive.performance.mutation_resource_rebuilds == 1
-          && interactive.performance.resource_fingerprint_scans == 5);
+          && interactive.performance.fast_relayouts == 10
+          && interactive.performance.full_relayouts == 0
+          && interactive.performance.mutation_resource_rebuilds == 0
+          && interactive.performance.resource_fingerprint_scans == 4);
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "setTimeout(()=>{throw new Error('callback-probe')},0)",
@@ -1385,6 +1433,35 @@
               "https://example.test/second", persisted_page,
               strlen(persisted_page), 480, NULL, NULL, true)
           && command_x(&interactive.page.layout, "PERSISTED") >= 0);
+    /* A truncated ARIA name is not proof that no selector can observe it.
+       Both long names deliberately share the renderer journal prefix. */
+    CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+        "var longStyle=document.createElement('style');"
+        "longStyle.textContent='[aria-long-render-dependency-attribute-two=yes]"
+        "{color:#123456}';document.head.appendChild(longStyle);",
+        "<long-attribute-style>", &interactive.page.script_result));
+    CHECK(script_runtime_consume_relayout(interactive.page.runtime)
+          && navigation_relayout(&interactive));
+    size_t long_attribute_overflows = interactive.performance.mutation_journal_overflows;
+    CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+        "var longTarget=document.getElementById('persist');"
+        "for(let i=0;i<300;i++){"
+        "longTarget.setAttribute('aria-long-render-dependency-attribute-one',String(i));"
+        "longTarget.setAttribute('aria-long-render-dependency-attribute-two',String(i));}"
+        "longTarget.setAttribute('aria-long-render-dependency-attribute-two','yes');",
+        "<long-attribute-render>", &interactive.page.script_result));
+    CHECK(script_runtime_consume_relayout(interactive.page.runtime)
+          && navigation_relayout(&interactive));
+    bool long_attribute_color = false;
+    for (size_t i = 0; i < interactive.page.layout.count; i++) {
+        const DrawCommand *command = &interactive.page.layout.commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == 9u
+            && memcmp(command->text, "PERSISTED", 9u) == 0)
+            long_attribute_color = command->color == 0x123456;
+    }
+    CHECK(long_attribute_color
+          && interactive.performance.mutation_journal_overflows
+              == long_attribute_overflows);
     navigation_destroy(&interactive);
     browser_session_destroy(&browser_session);
     CHECK(budget.current == 0);
@@ -1519,15 +1596,39 @@
                         after.stylesheet_appends);
             }
         }
-        /* A stylesheet link still rebuilds. */
+        /* Another module-sized block whose keyed rules do select existing
+           elements (by class, id and tag): exactly their retained lists go,
+           decided through the hashed fast-key set, and they restyle. */
+        {
+            LayoutReuseStats before = {0}, after = {0};
+            layout_reuse_cache_stats(interactive.page.layout_reuse, &before);
+            CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                      "const keyed=document.createElement('style');"
+                      "let text='';for(let i=0;i<40;i++)text+='.gap'+i+'{margin:0}';"
+                      "text+='.b{color:#123123}#host{padding:0}html{margin:0}';"
+                      "keyed.appendChild(document.createTextNode(text));"
+                      "document.head.appendChild(keyed)", "<late-keyed-style>",
+                      &interactive.page.script_result)
+                  && script_runtime_consume_relayout(interactive.page.runtime)
+                  && navigation_relayout(&interactive));
+            layout_reuse_cache_stats(interactive.page.layout_reuse, &after);
+            CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds
+                  && interactive.performance.mutation_style_appends == 3
+                  && late_init_text_color(&interactive.page.layout, "late") == 0x123123
+                  && late_init_text_color(&interactive.page.layout, "middle") == 0x555555
+                  && after.matched_hits > before.matched_hits + 200);
+        }
+        /* A stylesheet link is a new source too: it is inserted in place
+           (this page loads without external resources, so like a rebuild it
+           contributes no rule). */
         CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
                   "const l=document.createElement('link');l.rel='stylesheet';"
                   "l.href='/late.css';document.head.appendChild(l)",
                   "<late-link>", &interactive.page.script_result)
               && script_runtime_consume_relayout(interactive.page.runtime)
               && navigation_relayout(&interactive));
-        CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds + 1
-              && interactive.performance.mutation_style_appends == 2
+        CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds
+              && interactive.performance.mutation_style_appends == 4
               && late_init_text_color(&interactive.page.layout, "middle") == 0x555555);
         navigation_destroy(&interactive);
         browser_session_destroy(&browser_session);
@@ -1688,6 +1789,138 @@
         CHECK(budget.current == 0);
     }
 
+    puts("test: script :has() changes invalidate in scope, per record");
+    {
+        /* Each journal record is classified on its own: an attribute no
+           :has() reads stays scoped even when another record in the same
+           turn is relational, and relational records move only the answers
+           they can reach, with no full reset. */
+        static char has_page[32768];
+        static const char has_head[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<title>Has</title><style>"
+            ".a{color:#111111}"
+            ".sib:has(+ .x){color:#200001}"
+            ".gen:has(~ .y){color:#200002}"
+            ".kid:has(> .z){color:#200003}"
+            ".host:has(.w) .bee{color:#200004}"
+            ".neg:not(:has(.v)){color:#200005}"
+            ".iss:is(:has(.u)){color:#200006}"
+            ".att:has([data-on]){color:#200007}"
+            ".pop:has(.menu:popover-open){color:#200008}";
+        size_t has_length = sizeof(has_head) - 1u;
+        memcpy(has_page, has_head, has_length);
+        for (unsigned i = 0; i < 64; i++) {
+            char rule[32];
+            int written = snprintf(rule, sizeof(rule), ".pad%u{margin:0}", i);
+            CHECK(written > 0 && (size_t) written < sizeof(has_page) - has_length);
+            memcpy(has_page + has_length, rule, (size_t) written);
+            has_length += (size_t) written;
+        }
+        static const char has_body[] =
+            "</style><body>"
+            "<div id=c1><div class=sib>sib</div><div id=nx>nx</div></div>"
+            "<div id=c2><div class=gen>gen</div><div>mid</div></div>"
+            "<div id=c3 class=kid>kid</div>"
+            "<div id=c4 class=host><div id=slot>slot</div>"
+            "<div class=bee>bee</div></div>"
+            "<div id=c5 class=neg>neg</div>"
+            "<div id=c6 class=iss>iss</div>"
+            "<div id=c7 class=att><div id=flag>flag</div>att</div>"
+            "<div id=c8 class=pop><div id=menu class=menu>menu</div>pop</div>"
+            "<p id=probe class=a>probe</p><div id=fill>";
+        CHECK(sizeof(has_body) - 1u < sizeof(has_page) - has_length);
+        memcpy(has_page + has_length, has_body, sizeof(has_body) - 1u);
+        has_length += sizeof(has_body) - 1u;
+        for (unsigned i = 0; i < 300; i++) {
+            char item[40];
+            int written = snprintf(item, sizeof(item), "<p class=a>m%u</p>", i);
+            CHECK(written > 0 && (size_t) written < sizeof(has_page) - has_length);
+            memcpy(has_page + has_length, item, (size_t) written);
+            has_length += (size_t) written;
+        }
+        static const char has_tail[] = "</div></body>";
+        memcpy(has_page + has_length, has_tail, sizeof(has_tail) - 1u);
+        has_length += sizeof(has_tail) - 1u;
+        CHECK(browser_session_init(&browser_session, &budget, 256 * 1024));
+        CHECK(navigation_init(&interactive, &budget, 4));
+        navigation_attach_browser_session(&interactive, &browser_session);
+        navigation_enable_scripts(&interactive, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&interactive);
+        CHECK(navigation_commit_html(&interactive, generation,
+            "https://example.test/has-scoped", has_page, has_length,
+            480, NULL, NULL, true));
+        CHECK(interactive.page.layout_reuse != NULL
+              && late_init_text_color(&interactive.page.layout, "sib") != 0x200001
+              && late_init_text_color(&interactive.page.layout, "neg") == 0x200005
+              && late_init_text_color(&interactive.page.layout, "bee") != 0x200004);
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "document.getElementById('probe').setAttribute('data-x','1')",
+            "<has-bind>", &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        size_t resets = interactive.performance.layout_reuse_full_resets;
+        size_t scoped = interactive.performance.layout_reuse_has_scoped;
+        static const struct {
+            const char *script;
+            const char *text;
+            uint32_t color;
+        } steps[] = {
+            /* A class on the later sibling, with an unrelated title write. */
+            {"document.getElementById('nx').className='x';"
+             "document.getElementById('probe').title='t';", "sib", 0x200001},
+            /* A later sibling inserted, then a child, a descendant under
+               the anchor of a non-subject :has(), and inside :not/:is. */
+            {"var y=document.createElement('div');y.className='y';"
+             "y.textContent='y';document.getElementById('c2').appendChild(y);",
+             "gen", 0x200002},
+            {"var z=document.createElement('span');z.className='z';"
+             "document.getElementById('c3').appendChild(z);", "kid", 0x200003},
+            {"var w=document.createElement('span');w.className='w';"
+             "document.getElementById('slot').appendChild(w);", "bee", 0x200004},
+            {"var v=document.createElement('span');v.className='v';"
+             "document.getElementById('c5').appendChild(v);", "neg", 0x111111},
+            {"var u=document.createElement('span');u.className='u';"
+             "document.getElementById('c6').appendChild(u);", "iss", 0x200006},
+            {"document.getElementById('flag').setAttribute('data-on','');",
+             "att", 0x200007},
+            {"document.getElementById('menu')"
+             ".setAttribute('data-tilefinch-popover-open','');", "pop",
+             0x200008},
+            /* And back: answers lost as well as gained. */
+            {"document.getElementById('nx').className='';", "sib", 0x111111},
+            {"var s=document.getElementById('slot');s.removeChild(s.firstChild"
+             ".nextSibling);", "bee", 0x111111},
+            {"document.getElementById('flag').removeAttribute('data-on');",
+             "att", 0x111111},
+        };
+        for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+            CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                steps[i].script, "<has-step>", &interactive.page.script_result)
+                && script_runtime_consume_relayout(interactive.page.runtime)
+                && navigation_relayout(&interactive));
+            uint32_t color = late_init_text_color(&interactive.page.layout,
+                                                  steps[i].text);
+            uint32_t expected = steps[i].color == 0x111111 ? 0 : steps[i].color;
+            if ((expected != 0 && color != expected)
+                || (expected == 0 && (color & 0xff0000) == 0x200000)
+                || interactive.performance.layout_reuse_full_resets != resets
+                || interactive.performance.layout_reuse_has_fallbacks != 0) {
+                fprintf(stderr, "has step %zu: %s=%06x resets=%zu/%zu "
+                        "fallbacks=%zu\n", i, steps[i].text, color, resets,
+                        interactive.performance.layout_reuse_full_resets,
+                        interactive.performance.layout_reuse_has_fallbacks);
+                CHECK(false);
+            }
+        }
+        CHECK(interactive.performance.layout_reuse_has_scoped > scoped
+              && late_init_text_color(&interactive.page.layout, "probe")
+                     == 0x111111);
+        navigation_destroy(&interactive);
+        browser_session_destroy(&browser_session);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: inline SVG mutations refresh retained raster resources");
     static const char svg_refresh_page[] =
         "<!doctype html><style>html,body{margin:0}#icon{color:#ff0000}"
@@ -1754,6 +1987,12 @@
           && svg_refresh_after->pixels[2] > 240);
     navigation_destroy(&svg_refresh_navigation);
     CHECK(budget.current == 0);
+    puts("test: inline SVG presentation-only mutations refresh rasters");
+    CHECK(test_inline_svg_presentation_mutations_refresh(&budget));
+    puts("test: unobserved data attributes preserve styles, not measurements");
+    CHECK(test_unobserved_data_attribute_style_reuse(&budget));
+    puts("test: data attribute reuse matches a full cascade");
+    CHECK(test_data_attribute_reuse_matches_full_cascade(&budget));
 
     puts("test: large section class changes retain resources and find late images");
     for (unsigned variant = 0; variant < 5; variant++) {

@@ -7,6 +7,19 @@
 typedef struct {
     char url[512];
     char trace[256];
+    /* Replay the trace by method and URL (the lab's response-keyed mode)
+       instead of strictly in capture order, so a capture whose image and
+       stylesheet requests race can be replayed deterministically. */
+    long trace_keyed;
+    /* Validation only: record every HTTP exchange into this directory
+       beside the EBOOT (a --capture-http trace), so a live PSP session can
+       become a journey trace with exactly the requests the PSP makes. */
+    char trace_capture[64];
+    /* Optional persistent module bytecode directory (empty: off) and
+       whether it may be written, e.g. host0:/modcache for device tests
+       that must not write the Memory Stick. */
+    char module_cache_dir[128];
+    long module_cache_write;
     long ticks;
     long tick_ms;
     long limit_mb;
@@ -16,6 +29,15 @@ typedef struct {
     long count;
     long window_kb;
     long gc_growth_pct;
+    /* Page functions of at least this many source bytes compile on first
+       call; 0 compiles eagerly, -1 keeps the engine default. */
+    long lazy_functions;
+    /* 1 lets a frame with page work already runnable yield 2 ms instead of
+       waiting for vblank. Off by default (-1 or 0): on the device it
+       starved lower-priority I/O threads (replay file reads 4.2 -> 13.7 s,
+       first usable input +8 s in two of three runs) for ~0.5 s after the
+       send. */
+    long page_task_yield;
     long script_timeout_ms;
     long css_width;
     long css_height;
@@ -23,6 +45,33 @@ typedef struct {
     long dump_frame;
     long exit_after_report;
     long interactive_validation_ticks;
+    /* Validation only: keep the existing JS sampler enabled by default.
+       Set to 0 for a same-binary profiler-off device comparison. */
+    long validation_js_profile;
+    /* Validation only: report promise jobs at or above this duration in
+       microseconds. Zero leaves the extra per-job accounting disabled. */
+    long validation_js_outlier_us;
+    /* Validation only: the script split (script_split.h). 2 (default)
+       times the bridge kinds and samples JS at VM polls; 1 times the kinds
+       without the poll sample; 0 turns it off. For a same-binary check of
+       what the split's own instrumentation costs. */
+    long validation_script_split;
+    long validation_execution_census;
+    /* Validation only: replay recorded POSTs without matching their bodies
+       (pages mint fresh tokens into them), as the host lab's
+       TILEFINCH_REPLAY_IGNORE_REQUEST_BODY does. */
+    long trace_ignore_request_body;
+    /* Validation only: treat client-minted UUIDs as volatile in replay --
+       a UUID-shaped query value matches any UUID and the served response
+       echoes the live request's UUIDs -- as the host lab's
+       TILEFINCH_REPLAY_VOLATILE_UUIDS does. */
+    long trace_volatile_uuids;
+    /* Validation only: hold each replayed response for its recorded pumps
+       times this many microseconds of wall time rather than for that many
+       pumps (0: pumps), as the host lab's TILEFINCH_REPLAY_PUMP_US does. A
+       loop change that pumps more often then cannot make the recorded
+       network answer sooner. */
+    long trace_replay_pump_us;
     long validation_cancel_after_ms;
     long validation_preview_scroll;
     long validation_media_play;
@@ -104,6 +153,15 @@ typedef struct {
     long validation_ge_present_probe;
     /* Run the validation-only WebGL-to-GE workload probe and exit. */
     long validation_webgl_ge_probe;
+    /* Run the JavaScript engine micro-benchmark (src/js_bench.c) before
+       the first frame, at this iteration scale (0 = one iteration per
+       kernel), then continue booting normally. `js_bench_dir` names an
+       HTTP trace directory beside the EBOOT whose JavaScript records are
+       compiled; empty means the replay trace when one is configured. */
+    long validation_js_bench;
+    char js_bench_dir[128];
+    /* Validation-only comma-separated kernel filter; empty runs all. */
+    char js_bench_only[256];
     /*
      * Decode one picture from the embedded fixture, then re-run the firmware
      * colour conversion over that same picture with a short list of candidate

@@ -1,6 +1,12 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
 #include "diagnostic_trace.h"
+
+/* QuickJS allocator activity counters (budget_quickjs_pool_activity): PSP
+   validation builds and every host build; shipping PSP builds omit them. */
+#if defined(TILEFINCH_PSP_VALIDATION_LOG) || !defined(__PSP__)
+#define BUDGET_QUICKJS_ACTIVITY 1
+#endif
 #if defined(TILEFINCH_OWNER_CHECKS) && defined(__PSP__)
 #include <pspkernel.h>
 #include "tilefinch/psp_log.h"
@@ -267,6 +273,38 @@ void budget_init(Budget *budget, size_t limit)
     budget->limit = limit;
 }
 
+void budget_set_reclaim_hook(Budget *budget, BudgetReclaimHook hook,
+                             void *opaque)
+{
+    if (budget == NULL) return;
+    budget->reclaim_hook = hook;
+    budget->reclaim_opaque = hook == NULL ? NULL : opaque;
+}
+
+/* Whether `charge` more bytes fit, after asking the reclaim hook for the
+   shortfall if they do not. */
+static bool budget_admit_charge(Budget *budget, size_t charge)
+{
+    size_t remaining = budget_remaining(budget);
+    if (charge <= remaining) return true;
+    if (budget->reclaim_hook == NULL || budget->reclaim_active) return false;
+    budget->reclaim_active = true;
+    size_t released = budget->reclaim_hook(
+        budget->reclaim_opaque, charge - remaining);
+    budget->reclaim_active = false;
+    budget->reclaim_calls++;
+    budget->reclaimed_bytes = released > SIZE_MAX - budget->reclaimed_bytes
+        ? SIZE_MAX : budget->reclaimed_bytes + released;
+    return charge <= budget_remaining(budget);
+}
+
+bool budget_make_room(Budget *budget, size_t free_bytes)
+{
+    if (budget == NULL) return false;
+    if (free_bytes <= budget_remaining(budget)) return true;
+    return budget_admit_charge(budget, free_bytes);
+}
+
 void budget_inject_failure_after(Budget *budget, size_t successful_attempts)
 {
     if (budget == NULL) return;
@@ -313,7 +351,7 @@ void *budget_malloc_category(Budget *budget, BudgetCategory category,
         return NULL;
     }
     size_t charge = sizeof(AllocationHeader) + size;
-    if (charge > budget_remaining(budget)) {
+    if (!budget_admit_charge(budget, charge)) {
         budget->failure_count++;
         return NULL;
     }
@@ -367,7 +405,7 @@ void *budget_malloc_cacheline_category(Budget *budget,
         return NULL;
     }
     size_t charge = overhead + padded;
-    if (charge > budget_remaining(budget)) {
+    if (!budget_admit_charge(budget, charge)) {
         budget->failure_count++;
         return NULL;
     }
@@ -421,7 +459,7 @@ static void *budget_reserve_external(Budget *budget, BudgetCategory category,
     BUDGET_OWNER_CHECK(budget, "external reservation", category, size);
     if (budget_should_inject_failure(budget)) return NULL;
     size_t charge = sizeof(AllocationHeader) + size;
-    if (charge > budget_remaining(budget)) {
+    if (!budget_admit_charge(budget, charge)) {
         budget->failure_count++;
         return NULL;
     }
@@ -532,8 +570,18 @@ void *budget_realloc_category(Budget *budget, BudgetCategory category,
     }
     size_t new_charge = sizeof(AllocationHeader) + size;
     if (new_charge > budget->limit - base) {
-        budget->failure_count++;
-        return NULL;
+        /* Ask for room for the growth only; the old block stays charged
+           until realloc succeeds. */
+        if (new_charge <= old_charge
+            || !budget_admit_charge(budget, new_charge - old_charge)) {
+            budget->failure_count++;
+            return NULL;
+        }
+        base = budget->current - old_charge;
+        if (new_charge > budget->limit - base) {
+            budget->failure_count++;
+            return NULL;
+        }
     }
 
     AllocationHeader *new_header = realloc(old_header, sizeof(*new_header) + size);
@@ -1509,10 +1557,12 @@ struct BudgetQuickJSPool {
        boot window must actually cover. */
     size_t js_malloc_peak;
     size_t js_malloc_current;
+    BudgetQuickJSLimitGrowth limit_growth;
+    void *limit_growth_opaque;
     size_t rejection_count;
     size_t largest_request;
     size_t peak_dump_watermark;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#ifdef BUDGET_QUICKJS_ACTIVITY
     size_t rejected_old_bytes;
     size_t rejected_new_bytes;
     size_t rejected_live_bytes;
@@ -1522,6 +1572,11 @@ struct BudgetQuickJSPool {
     uint64_t allocated_bytes;
     uint64_t freed_bytes;
     uint64_t reallocated_bytes;
+    /* Cumulative per-class traffic: blocks handed out, and how many of
+       them needed a fresh Budget allocation (the rest came from a class
+       free list). Slot QUICKJS_POOL_CLASS_COUNT is the direct class. */
+    uint64_t class_allocs[QUICKJS_POOL_CLASS_COUNT + 1];
+    uint64_t class_fresh[QUICKJS_POOL_CLASS_COUNT + 1];
 #endif
 };
 
@@ -1580,6 +1635,7 @@ static void *quickjs_pool_malloc(void *opaque, size_t size)
         return NULL;
     }
     QuickJSPoolHeader *header;
+    bool fresh = false;
     if (class_index != QUICKJS_POOL_DIRECT_CLASS
         && pool->free_lists[class_index] != NULL) {
         /* Cached blocks bypass the underlying Budget allocation, so consume
@@ -1624,13 +1680,19 @@ static void *quickjs_pool_malloc(void *opaque, size_t size)
         if (pool->reserved > pool->reserved_peak) {
             pool->reserved_peak = pool->reserved;
         }
+        fresh = true;
     }
+    (void) fresh;
     header->data.requested = (uint32_t) size;
     header->data.class_index = class_index;
     header->data.magic = QUICKJS_POOL_MAGIC;
     {
         size_t slot = class_index == QUICKJS_POOL_DIRECT_CLASS
             ? QUICKJS_POOL_CLASS_COUNT : class_index;
+#ifdef BUDGET_QUICKJS_ACTIVITY
+        pool->class_allocs[slot]++;
+        if (fresh) pool->class_fresh[slot]++;
+#endif
         pool->live_count[slot]++;
         pool->live_requested[slot] += size;
         pool->live_capacity[slot] += capacity;
@@ -1746,18 +1808,42 @@ static void *quickjs_pool_realloc(void *opaque, void *ptr, size_t size)
     }
     void *replacement = quickjs_pool_malloc(opaque, size);
     if (replacement == NULL) return NULL;
-    memcpy(replacement, ptr, old_size < size ? old_size : size);
+    /* The engine may have written into the class slack it was told about
+       (quickjs_pool_usable_size), so keep the whole old capacity. */
+    memcpy(replacement, ptr, old_capacity < size ? old_capacity : size);
     quickjs_pool_free(opaque, ptr);
     return replacement;
 }
 
-static size_t quickjs_pool_usable_size(const void *ptr)
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+/* The bytes QuickJS asked for: the heap accounting (malloc_size, limits,
+   growth admission) stays on requested sizes. */
+static size_t quickjs_pool_requested_size(const void *ptr)
 {
     if (ptr == NULL) return 0;
     const QuickJSPoolHeader *header =
         (const QuickJSPoolHeader *) ptr - 1;
     return header->data.magic == QUICKJS_POOL_MAGIC
         ? header->data.requested : 0;
+}
+#endif
+
+/* The engine's usable size is the block's class capacity, as a system
+   malloc_usable_size reports its bin: QuickJS appends to a sole-owned
+   string in place and grows arrays and string buffers into that slack.
+   Reporting only the requested size made every `s += c` on a string of
+   512..8192 characters allocate and copy the whole string (the pool is
+   exact, so there was never room). The slack is already reserved and
+   charged to the Budget; realloc preserves it (quickjs_pool_realloc). */
+static size_t quickjs_pool_usable_size(const void *ptr)
+{
+    if (ptr == NULL) return 0;
+    const QuickJSPoolHeader *header =
+        (const QuickJSPoolHeader *) ptr - 1;
+    if (header->data.magic != QUICKJS_POOL_MAGIC) return 0;
+    return header->data.class_index == QUICKJS_POOL_DIRECT_CLASS
+        ? header->data.requested
+        : quickjs_pool_class_sizes[header->data.class_index];
 }
 
 BudgetQuickJSPool *budget_quickjs_pool_create(Budget *budget)
@@ -1780,6 +1866,22 @@ BudgetQuickJSPool *budget_quickjs_pool_create(Budget *budget)
         pool->class_table[size] = (uint8_t) class_index;
     }
     return pool;
+}
+
+#if !defined(__PSP__)
+Budget *budget_quickjs_pool_owner(const BudgetQuickJSPool *pool)
+{
+    return pool == NULL ? NULL : pool->budget;
+}
+#endif
+
+void budget_quickjs_pool_set_limit_growth(BudgetQuickJSPool *pool,
+                                          BudgetQuickJSLimitGrowth grow,
+                                          void *opaque)
+{
+    if (pool == NULL) return;
+    pool->limit_growth = grow;
+    pool->limit_growth_opaque = grow == NULL ? NULL : opaque;
 }
 
 bool budget_quickjs_pool_destroy(BudgetQuickJSPool *pool)
@@ -1895,7 +1997,7 @@ static void bellard_pool_record_reject(const JSMallocState *state,
     if (pool != NULL && pool->rejection_count != SIZE_MAX) {
         pool->rejection_count++;
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#ifdef BUDGET_QUICKJS_ACTIVITY
     if (pool != NULL) {
         pool->rejected_old_bytes = old_size;
         pool->rejected_new_bytes = size;
@@ -2095,17 +2197,35 @@ void budget_quickjs_pool_report_rejects(FILE *stream)
     }
 }
 
+/* A request past the realm limit may still be admitted: the embedder
+   raises the limit while the shared page Budget has room to spare. */
+static bool bellard_pool_growth_admitted(JSMallocState *state,
+                                         size_t old_size, size_t size)
+{
+    if (bellard_growth_allowed(state, old_size, size)) return true;
+    BudgetQuickJSPool *pool = state->opaque;
+    if (pool == NULL || pool->limit_growth == NULL
+        || state->malloc_size > state->malloc_limit) return false;
+    size_t growth = size > old_size ? size - old_size : 0;
+    size_t raised = pool->limit_growth(pool->limit_growth_opaque,
+                                       state->malloc_size, growth,
+                                       state->malloc_limit);
+    if (raised <= state->malloc_limit) return false;
+    state->malloc_limit = raised;
+    return bellard_growth_allowed(state, old_size, size);
+}
+
 static void *bellard_pool_malloc(JSMallocState *state, size_t size)
 {
     /* With a custom allocator Bellard QuickJS delegates enforcement of
        JS_SetMemoryLimit() to these callbacks.  The default allocator performs
        this check itself; omitting it turns the advertised page heap limit into
        telemetry only and lets script consume the entire shared browser budget. */
-    if (size == 0 || !bellard_growth_allowed(state, 0, size)) {
+    if (size == 0 || !bellard_pool_growth_admitted(state, 0, size)) {
         if (size != 0) bellard_pool_record_reject(state, 0, size);
         return NULL;
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#ifdef BUDGET_QUICKJS_ACTIVITY
     BudgetQuickJSPool *activity_pool = state->opaque;
     activity_pool->allocation_calls++;
     activity_pool->allocated_bytes += size;
@@ -2115,7 +2235,7 @@ static void *bellard_pool_malloc(JSMallocState *state, size_t size)
     void *pointer = quickjs_pool_malloc(state->opaque, size);
     if (pointer != NULL) {
         state->malloc_count++;
-        state->malloc_size += quickjs_pool_usable_size(pointer);
+        state->malloc_size += quickjs_pool_requested_size(pointer);
         bellard_pool_update_malloc_census(state->opaque,
                                           state->malloc_size);
     }
@@ -2125,8 +2245,8 @@ static void *bellard_pool_malloc(JSMallocState *state, size_t size)
 static void bellard_pool_free(JSMallocState *state, void *pointer)
 {
     if (pointer != NULL) {
-        size_t freed_size = quickjs_pool_usable_size(pointer);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        size_t freed_size = quickjs_pool_requested_size(pointer);
+#ifdef BUDGET_QUICKJS_ACTIVITY
         BudgetQuickJSPool *activity_pool = state->opaque;
         activity_pool->free_calls++;
         activity_pool->freed_bytes += freed_size;
@@ -2145,18 +2265,18 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     if (pointer == NULL) {
         return size == 0 ? NULL : bellard_pool_malloc(state, size);
     }
-    size_t old_size = quickjs_pool_usable_size(pointer);
+    size_t old_size = quickjs_pool_requested_size(pointer);
     if (old_size == 0) return NULL;
     if (size == 0) {
         bellard_pool_free(state, pointer);
         return NULL;
     }
-    if (!bellard_growth_allowed(state, old_size, size)) {
+    if (!bellard_pool_growth_admitted(state, old_size, size)) {
         bellard_pool_record_reject(state, old_size, size);
         bellard_pool_capture_prefix(pointer, old_size, size);
         return NULL;
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#ifdef BUDGET_QUICKJS_ACTIVITY
     BudgetQuickJSPool *activity_pool = state->opaque;
     activity_pool->reallocation_calls++;
     activity_pool->reallocated_bytes += size;
@@ -2167,7 +2287,7 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     void *resized = quickjs_pool_realloc(state->opaque, pointer, size);
     if (resized == NULL) return NULL;
     state->malloc_size -= old_size;
-    state->malloc_size += quickjs_pool_usable_size(resized);
+    state->malloc_size += quickjs_pool_requested_size(resized);
     bellard_pool_update_malloc_census(state->opaque, state->malloc_size);
     return resized;
 }
@@ -2229,6 +2349,7 @@ static void bellard_pool_note_request(void *opaque, size_t size)
     if (pool == NULL) return;
     if (size > pool->largest_request) {
         pool->largest_request = size;
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
         static long trap = -2;
         if (trap == -2) {
             const char *value = getenv("TILEFINCH_JS_TRAP_ALLOC_SIZE");
@@ -2248,6 +2369,7 @@ static void bellard_pool_note_request(void *opaque, size_t size)
             }
 #endif
         }
+#endif
     }
 }
 
@@ -2273,7 +2395,7 @@ void budget_quickjs_pool_activity(const BudgetQuickJSPool *pool,
     memset(activity, 0, sizeof(*activity));
     if (pool == NULL) return;
     activity->live_bytes = pool->js_malloc_current;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#ifdef BUDGET_QUICKJS_ACTIVITY
     activity->allocation_calls = pool->allocation_calls;
     activity->rejected_old_bytes = pool->rejected_old_bytes;
     activity->rejected_new_bytes = pool->rejected_new_bytes;
@@ -2283,6 +2405,10 @@ void budget_quickjs_pool_activity(const BudgetQuickJSPool *pool,
     activity->allocated_bytes = pool->allocated_bytes;
     activity->freed_bytes = pool->freed_bytes;
     activity->reallocated_bytes = pool->reallocated_bytes;
+    for (size_t slot = 0; slot <= QUICKJS_POOL_CLASS_COUNT; slot++) {
+        activity->pool_blocks += pool->class_allocs[slot];
+        activity->pool_fresh_blocks += pool->class_fresh[slot];
+    }
 #endif
 }
 
@@ -2312,4 +2438,35 @@ void budget_quickjs_pool_report_classes(const BudgetQuickJSPool *pool,
             total_count, total_requested, total_capacity,
             total_capacity - total_requested,
             total_count * sizeof(QuickJSPoolHeader));
+}
+
+void budget_quickjs_pool_report_traffic(const BudgetQuickJSPool *pool,
+                                        const char *label, FILE *output)
+{
+    if (pool == NULL || output == NULL) return;
+    if (label == NULL || label[0] == '\0') label = "-";
+#ifdef BUDGET_QUICKJS_ACTIVITY
+    for (size_t slot = 0; slot <= QUICKJS_POOL_CLASS_COUNT; slot++) {
+        if (pool->class_allocs[slot] == 0 && pool->live_count[slot] == 0)
+            continue;
+        fprintf(output,
+                "tilefinch-js-pool: label=%.64s class=%zu allocs=%llu "
+                "fresh=%llu live=%zu live-requested=%zu live-capacity=%zu "
+                "cached=%u\n",
+                label,
+                slot == QUICKJS_POOL_CLASS_COUNT
+                    ? (size_t) 0 : quickjs_pool_class_sizes[slot],
+                (unsigned long long) pool->class_allocs[slot],
+                (unsigned long long) pool->class_fresh[slot],
+                pool->live_count[slot], pool->live_requested[slot],
+                pool->live_capacity[slot],
+                slot == QUICKJS_POOL_CLASS_COUNT
+                    ? 0u : (unsigned) pool->cached_counts[slot]);
+    }
+#endif
+    fprintf(output,
+            "tilefinch-js-pool: label=%.64s reserved=%zu reserved-peak=%zu "
+            "js-malloc=%zu js-malloc-peak=%zu\n",
+            label, pool->reserved, pool->reserved_peak,
+            pool->js_malloc_current, pool->js_malloc_peak);
 }

@@ -61,7 +61,7 @@ runtime assets or immutable engine data.
   `TILEFINCH_PSP_TRANSPORT_MODE=LEGACY` is a non-release escape hatch.
 - **mbed TLS 3.6.7 LTS**: dual Apache-2.0 / GPL-2.0-or-later; Tilefinch
   elects Apache-2.0. The default PSP release cross-builds the hash-pinned
-  official source archive with a narrow PSP entropy/time portability patch
+  official source archive with a narrow PSP time portability patch
   (`patches/mbedtls-3.6.6-psp.patch`), plus an Allegrex bignum
   multiply-accumulate core (`patches/mbedtls-3.6.6-psp-bnmul.patch`) that
   adds a `maddu`-based `MULADDC` block to `library/bn_mul.h` beside the
@@ -140,8 +140,8 @@ runtime assets or immutable engine data.
 - **TilefinchSans-Regular.ttf / TilefinchSans-Bold.ttf**: checked-in
   Arial/Helvetica-metric fallback faces under the SIL Open Font License 1.1,
   `fonts/LICENSE-TilefinchSans.txt` (Arimo/Tinos/Cousine and Liberation
-  ancestry). Reserved-Font-Name provenance (verified 2026-07-30 against the
-  shipped `name` tables with fontTools): the faces are renamed derivatives
+  ancestry). Reserved-Font-Name provenance (verified against the shipped
+  `name` tables with fontTools): the faces are renamed derivatives
   of Liberation Sans 2.1.5 (version string `Version 2.1.5`; copyright
   "Digitized data copyright (c) 2010 Google Corporation" and "Copyright (c)
   2012 Red Hat, Inc."), itself an Arimo derivative. The ancestors' OFL
@@ -223,7 +223,7 @@ files as `LICENSES/ALPHA_CEPHEI_LICENSE.txt`,
 install tree also carries copies of these component notices proactively, even
 though it deliberately omits the model and dictionaries themselves.
 
-The `tilefinch-psp-install-tree` target now stages all of this
+The `tilefinch-psp-install-tree` target stages all of this
 automatically. The exact upstream texts are checked in under
 `third_party/notices/` (copied from the hash-pinned `_deps` checkouts and
 the PSPDEV SDK's `psp/share/licenses/` tree); `cmake/StagePspInstall.cmake`

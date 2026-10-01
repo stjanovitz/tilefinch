@@ -523,6 +523,18 @@ static void navigation_record_layout_reuse(
 #undef ADD_REUSE_DELTA
     session->performance.layout_reuse_retained_bytes =
         after->retained_bytes;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL
+        && after->style_misses >= before->style_misses)
+        fprintf(stderr, "layout-reuse-build styles=%zu/%zu parent-misses=%zu "
+                "evictions=%zu matched=%zu/%zu\n",
+                after->style_hits - before->style_hits,
+                after->style_misses - before->style_misses,
+                after->style_parent_misses - before->style_parent_misses,
+                after->style_evictions - before->style_evictions,
+                after->matched_hits - before->matched_hits,
+                after->matched_misses - before->matched_misses);
+#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (after->matched_hits != before->matched_hits
         || after->matched_stores != before->matched_stores) {
@@ -733,6 +745,18 @@ static ScriptRuntime *navigation_create_runtime(
     if (runtime != NULL && canvas_images != NULL) {
         script_runtime_set_images(runtime, canvas_images);
     }
+    if (runtime != NULL && session->budget != NULL
+        && !session->fixed_script_memory_limits) {
+        /* The configured heap is a floor. A page that needs more (on the
+           PSP chatgpt.com needs ~12 MB to start and more to send) grows
+           while an eighth of the page Budget stays free for DOM, layout,
+           paint and images (their transient peaks on chatgpt.com were ~2
+           MB each), after optional caches give way, up to three quarters
+           of the Budget. */
+        script_runtime_enable_heap_growth(
+            runtime, session->budget->limit / 4u * 3u,
+            session->budget->limit / 8u);
+    }
     return runtime;
 }
 
@@ -780,8 +804,19 @@ static uint64_t fingerprint_bytes(uint64_t hash, const char *data,
     return hash;
 }
 
+/* Attributes of resource elements the fingerprint covers. */
+static const char *const resource_fingerprint_attributes[] = {
+    "rel", "href", "xlink:href", "src", "srcset",
+    "data-src", "data-srcset", "media", "type", "sizes",
+    "poster"
+};
+
+/* `parts`, when present, also hashes the stylesheet sources (style, link,
+   base and style text) into parts[0] and the image-bearing elements (img,
+   video, source, use) into parts[1], so a changed fingerprint can say which
+   kind of resource moved. */
 static bool resource_fingerprint_node(lxb_dom_node_t *node,
-                                      uint64_t *hash)
+                                      uint64_t *hash, uint64_t *parts)
 {
     if (node == NULL) return true;
     lxb_dom_node_t *boundary_parent = node->parent;
@@ -805,18 +840,21 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
         bool use = name != NULL && name_length == 3
                    && memcmp(name, "use", 3) == 0;
         if (style || link || image || source || base || use) {
+            uint64_t *part = parts == NULL ? NULL
+                : &parts[image || source || use ? 1 : 0];
             *hash = fingerprint_bytes(*hash, name, name_length);
-            const char *attributes[] = {
-                "rel", "href", "xlink:href", "src", "srcset",
-                "data-src", "data-srcset", "media", "type", "sizes",
-                "poster"
-            };
-            for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]);
+            if (part != NULL)
+                *part = fingerprint_bytes(*part, name, name_length);
+            for (size_t i = 0;
+                 i < sizeof(resource_fingerprint_attributes)
+                         / sizeof(resource_fingerprint_attributes[0]);
                  i++) {
                 size_t length = 0;
-                const char *value = document_attribute(node, attributes[i],
-                                                       &length);
+                const char *value = document_attribute(
+                    node, resource_fingerprint_attributes[i], &length);
                 *hash = fingerprint_bytes(*hash, value, length);
+                if (part != NULL)
+                    *part = fingerprint_bytes(*part, value, length);
             }
         }
         if (style) style_depth++;
@@ -824,6 +862,8 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
             size_t length = 0;
             const char *text = document_text_data(node, &length);
             *hash = fingerprint_bytes(*hash, text, length);
+            if (parts != NULL)
+                parts[0] = fingerprint_bytes(parts[0], text, length);
         }
         if (node->first_child != NULL) {
             node = node->first_child;
@@ -846,22 +886,70 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
     return true;
 }
 
-static bool page_resource_fingerprint(const PocDocument *document,
-                                      uint64_t *hash)
+static bool page_resource_fingerprint_split(const PocDocument *document,
+                                            uint64_t *hash, uint64_t *parts)
 {
     if (hash == NULL) return false;
     *hash = 0;
+    if (parts != NULL) parts[0] = parts[1] = 0;
     if (document == NULL || document->html == NULL) return true;
     *hash = UINT64_C(1469598103934665603);
+    if (parts != NULL)
+        parts[0] = parts[1] = UINT64_C(1469598103934665603);
     return resource_fingerprint_node(
-        lxb_dom_interface_node(document->html), hash);
+        lxb_dom_interface_node(document->html), hash, parts);
+}
+
+static bool page_resource_fingerprint(const PocDocument *document,
+                                      uint64_t *hash)
+{
+    return page_resource_fingerprint_split(document, hash, NULL);
+}
+
+/* Pairs the committed fingerprint with its parts when the last traversal
+   produced it; any other commit leaves the parts unknown. */
+static void navigation_note_committed_fingerprint(NavigationSession *session)
+{
+    if (session->resource_fingerprint_last == session->resource_fingerprint) {
+        session->resource_fingerprint_parts[0] =
+            session->resource_fingerprint_parts_last[0];
+        session->resource_fingerprint_parts[1] =
+            session->resource_fingerprint_parts_last[1];
+        session->resource_fingerprint_parts_owner =
+            session->resource_fingerprint;
+        session->resource_fingerprint_parts_valid = true;
+    } else if (session->resource_fingerprint_parts_owner
+               != session->resource_fingerprint) {
+        session->resource_fingerprint_parts_valid = false;
+    }
+}
+
+/* Whether the last traversal differs from the committed fingerprint in
+   `part` (0 stylesheet sources, 1 image elements). Unknown counts as
+   changed. */
+static bool navigation_fingerprint_part_changed(
+    const NavigationSession *session, unsigned part)
+{
+    return !session->resource_fingerprint_parts_valid
+        || session->resource_fingerprint_parts_owner
+               != session->resource_fingerprint
+        || session->resource_fingerprint_parts[part]
+               != session->resource_fingerprint_parts_last[part];
 }
 
 static bool navigation_resource_fingerprint(
     NavigationSession *session, const PocDocument *document, uint64_t *hash)
 {
     if (session != NULL) session->performance.resource_fingerprint_scans++;
-    if (page_resource_fingerprint(document, hash)) return true;
+    uint64_t parts[2] = {0};
+    if (page_resource_fingerprint_split(document, hash, parts)) {
+        if (session != NULL) {
+            session->resource_fingerprint_last = *hash;
+            session->resource_fingerprint_parts_last[0] = parts[0];
+            session->resource_fingerprint_parts_last[1] = parts[1];
+        }
+        return true;
+    }
     if (session != NULL) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "resource fingerprint traversal exceeded %u nodes",
@@ -878,6 +966,7 @@ bool navigation_accept_native_resource_fingerprint(
     if (!navigation_resource_fingerprint(
             session, &session->page.document, &fingerprint)) return false;
     session->resource_fingerprint = fingerprint;
+    navigation_note_committed_fingerprint(session);
     return true;
 }
 
@@ -934,6 +1023,41 @@ static void damage_add_rect(int *left, int *top, int *right, int *bottom,
     damage_add(left, top, right, bottom, &command);
 }
 
+/* A solid box that differs only in height: a wrapper that now holds the
+   rest of the page. Above its old and new bottom edge its corners, border
+   and shadow are unchanged (a gradient stretches, and a filter, rotation or
+   backdrop reaches further, so those repaint whole). */
+static bool draw_command_height_only_change(const DrawCommand *old,
+                                            const DrawCommand *next)
+{
+    if (old->height == next->height || old->image != NULL
+        || (old->type != DRAW_FILL_RECT && old->type != DRAW_SHADOW_RECT
+            && (old->type != DRAW_STROKE_RECT
+                || old->image_fit != LAYOUT_STROKE_SOLID))
+        || draw_command_fill_gradient(old, NULL)
+        || draw_command_filter_code(old) != 0
+        || draw_command_rotation_quadrants(old) != 0
+        || draw_command_backdrop_blur(old) != 0) return false;
+    DrawCommand same_height = *next;
+    same_height.height = old->height;
+    return draw_command_equal(old, &same_height);
+}
+
+static void damage_add_bottom_edges(int *left, int *top, int *right,
+                                    int *bottom, const DrawCommand *old,
+                                    const DrawCommand *next)
+{
+    int old_bottom = old->y + old->height;
+    int next_bottom = next->y + next->height;
+    int shorter = old_bottom < next_bottom ? old_bottom : next_bottom;
+    int taller = old_bottom > next_bottom ? old_bottom : next_bottom;
+    int margin = style_border_radius_maximum(old->radius)
+        + 2 * (old->scale > 0 ? old->scale : 0) + 1;
+    int from = shorter - margin > old->y ? shorter - margin : old->y;
+    damage_add_rect(left, top, right, bottom, old->x, from, old->width,
+                    taller - from);
+}
+
 static void navigation_measure_damage(NavigationSession *session,
                                       const LayoutDocument *old_layout,
                                       const LayoutDocument *new_layout)
@@ -960,11 +1084,34 @@ static void navigation_measure_damage(NavigationSession *session,
             old_end--;
             new_end--;
         }
+        /* Growing a provisional layout keeps every command above its old
+           limit at the same index; only boxes that span the limit grow,
+           and everything below it is damaged by the limit rule. Compare
+           index by index there, so the page background's new height does
+           not repaint the screens the reader is on. */
+        bool extended = old_layout->content_limit_y != 0;
+        size_t aligned = old_end < new_end ? old_end : new_end;
         for (size_t i = prefix; i < old_end; i++) {
+            if (extended && i < aligned) {
+                const DrawCommand *old = &old_layout->commands[i];
+                const DrawCommand *next = &new_layout->commands[i];
+                if (draw_command_equal(old, next)) continue;
+                if (draw_command_height_only_change(old, next)) {
+                    damage_add_bottom_edges(&left, &top, &right, &bottom,
+                                            old, next);
+                    continue;
+                }
+            }
             damage_add(&left, &top, &right, &bottom,
                        &old_layout->commands[i]);
         }
         for (size_t i = prefix; i < new_end; i++) {
+            if (extended && i < aligned
+                && (draw_command_equal(&old_layout->commands[i],
+                                       &new_layout->commands[i])
+                    || draw_command_height_only_change(
+                           &old_layout->commands[i],
+                           &new_layout->commands[i]))) continue;
             damage_add(&left, &top, &right, &bottom,
                        &new_layout->commands[i]);
         }
@@ -1287,7 +1434,9 @@ static bool navigation_retire_exhausted_script_realms(
     session->page.script_heap_rejections_seen = heap_rejections;
     bool explicit_oom = new_rejection
         && strstr(session->page.script_result.error, "out of memory") != NULL;
-    size_t remaining = script_runtime_heap_remaining(
+    /* With memory-pressure growth a small margin under the current limit is
+       normal; exhaustion means the realm cannot obtain more. */
+    size_t remaining = script_runtime_heap_available(
         session->page.runtime);
 #ifndef TILEFINCH_NO_TRACE
     if (tilefinch_trace_script_failures()) {
@@ -1312,6 +1461,22 @@ static bool navigation_retire_exhausted_script_realms(
      * Keeping the ScriptResult makes the degraded state visible in device
      * diagnostics without attempting another allocation in the failed VM.
      */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        ScriptHeapGrowth growth;
+        script_runtime_heap_growth(session->page.runtime, &growth);
+        char message[320];
+        snprintf(message, sizeof(message),
+                 "tilefinch-script-memory-stop: limit=%zu floor=%zu "
+                 "raises=%zu refusals=%zu refused=%zu reason=%u "
+                 "budget-free=%zu remaining=%zu error=\"%.80s\"",
+                 growth.limit, growth.floor, growth.raises, growth.refusals,
+                 growth.refused_bytes, (unsigned) growth.refused_reason,
+                 budget_remaining(session->budget), remaining,
+                 session->page.script_result.error);
+        tilefinch_platform_log_message(message);
+    }
+#endif
     navigation_retire_current_page_scripts(session);
     session->page.script_result.success = false;
     session->page.script_degradation_observed = true;
@@ -1646,6 +1811,10 @@ static void navigation_retire_frame_descendants(
     NavigationSession *session, size_t ancestor_slot,
     const char *reason);
 
+static bool navigation_frame_presentation_dimensions(
+    const NavigationSession *session, const NavigationFrame *frame,
+    int *width, int *height);
+
 static bool navigation_deliver_frame_messages(NavigationSession *session)
 {
     enum {
@@ -1840,6 +2009,22 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
         }
         delivered++;
     }
+    /* The parent can resize an iframe without the child changing (Turnstile
+       shrinks its widget frame from the default 300x150 to 300x65 after the
+       child has painted). A snapshot taken at the old size was then drawn
+       squashed into the new box; re-snapshot at the new size. */
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (frame->retired || !frame->loaded || frame->runtime == NULL
+            || frame->presentation == NULL || frame->presentation_dirty)
+            continue;
+        int width = 0, height = 0;
+        if (navigation_frame_presentation_dimensions(
+                session, frame, &width, &height)
+            && (width != frame->presentation->width
+                || height != frame->presentation->height))
+            frame->presentation_dirty = true;
+    }
     /* A mutating child message may rebuild at most one opaque child snapshot
        per owner tick. Remaining dirty children retain their flag, preventing
        an animation-heavy frame from forcing an unbounded raster cascade. */
@@ -1964,6 +2149,17 @@ static bool navigation_is_stylesheet_link(lxb_dom_node_t *node)
         && navigation_token_contains(rel, rel_length, "stylesheet");
 }
 
+static bool navigation_is_style_preload(lxb_dom_node_t *node)
+{
+    if (!node_name_is(node, "link")) return false;
+    size_t rel_length = 0, as_length = 0;
+    const char *rel = document_attribute(node, "rel", &rel_length);
+    const char *as = document_attribute(node, "as", &as_length);
+    return rel != NULL && as != NULL && as_length == 5u
+        && strncasecmp(as, "style", 5u) == 0
+        && navigation_token_contains(rel, rel_length, "preload");
+}
+
 static lxb_dom_node_t *navigation_next_document_node(lxb_dom_node_t *root,
                                                      lxb_dom_node_t *node)
 {
@@ -2026,27 +2222,29 @@ static bool navigation_resolve_stylesheet_link(
 
 static bool navigation_stylesheet_event_known(
     const NavigationStylesheetEventRecord *records, size_t count,
-    lxb_dom_node_t *node, uint64_t resolved_hash)
+    lxb_dom_node_t *node, uint64_t resolved_hash, bool preload)
 {
     for (size_t i = 0; i < count; i++) {
         if (records[i].element == node
-            && records[i].resolved_url_hash == resolved_hash) return true;
+            && records[i].resolved_url_hash == resolved_hash
+            && records[i].preload == preload) return true;
     }
     return false;
 }
 
 static bool navigation_remember_stylesheet_event(
     NavigationStylesheetEventRecord *records, size_t *count,
-    lxb_dom_node_t *node, uint64_t resolved_hash)
+    lxb_dom_node_t *node, uint64_t resolved_hash, bool preload)
 {
     for (size_t i = 0; i < *count; i++) {
         if (records[i].element != node) continue;
         records[i].resolved_url_hash = resolved_hash;
+        records[i].preload = preload;
         return true;
     }
     if (*count >= NAVIGATION_STYLESHEET_EVENT_LIMIT) return false;
     records[*count] = (NavigationStylesheetEventRecord) {
-        .element = node, .resolved_url_hash = resolved_hash
+        .element = node, .resolved_url_hash = resolved_hash, .preload = preload
     };
     (*count)++;
     return true;
@@ -2068,7 +2266,7 @@ static void navigation_adopt_stylesheet_events(
             node, base_url, resolved, &hash);
         if (hash != 0) {
             (void) navigation_remember_stylesheet_event(
-                records, count, node, hash);
+                records, count, node, hash, false);
         }
     }
 }
@@ -2081,7 +2279,8 @@ static void navigation_prune_stylesheet_events(NavigationPage *page)
     lxb_dom_node_t *root = lxb_dom_interface_node(page->document.html);
     for (lxb_dom_node_t *node = root; node != NULL;
          node = navigation_next_document_node(root, node)) {
-        if (!navigation_is_stylesheet_link(node)) continue;
+        if (!navigation_is_stylesheet_link(node)
+            && !navigation_is_style_preload(node)) continue;
         for (size_t i = 0; i < page->stylesheet_event_count; i++) {
             if (page->stylesheet_events[i].element == node) {
                 connected[i] = true;
@@ -2116,7 +2315,27 @@ static StylesheetDocumentResourceState navigation_stylesheet_link_state(
    dispatched only after the bounded stylesheet ledger reaches a terminal
    state.  Recording the node before calling JavaScript makes re-entrant DOM
    work exactly-once without adding private attributes to the page. */
+static bool navigation_dispatch_stylesheet_events_timed(
+    NavigationSession *session, const char *base_url);
+
+/* Stylesheet load/error events are page JavaScript run inside the resource
+   phase; time them (and the handlers alone) so the resource phase can be
+   split into CSS work and author callbacks. */
 static bool navigation_dispatch_stylesheet_events(
+    NavigationSession *session, const char *base_url)
+{
+    uint64_t started = navigation_now_us();
+    bool result = navigation_dispatch_stylesheet_events_timed(
+        session, base_url);
+    if (session != NULL) {
+        uint64_t finished = navigation_now_us();
+        session->performance.stylesheet_event_us +=
+            finished >= started ? finished - started : 0;
+    }
+    return result;
+}
+
+static bool navigation_dispatch_stylesheet_events_timed(
     NavigationSession *session, const char *base_url)
 {
     if (session == NULL || session->page.runtime == NULL
@@ -2129,23 +2348,36 @@ static bool navigation_dispatch_stylesheet_events(
         lxb_dom_node_t *selected = NULL;
         const char *event_type = NULL;
         uint64_t selected_hash = 0;
+        bool selected_preload = false;
         lxb_dom_node_t *root = lxb_dom_interface_node(
             session->page.document.html);
         for (lxb_dom_node_t *node = root; node != NULL;
              node = navigation_next_document_node(root, node)) {
-            if (!navigation_is_stylesheet_link(node)) continue;
+            bool preload = !navigation_is_stylesheet_link(node);
+            if (preload && !navigation_is_style_preload(node)) continue;
             char resolved[4096];
             uint64_t hash = 0;
             (void) navigation_resolve_stylesheet_link(
                 node, base_url, resolved, &hash);
             if (hash == 0 || navigation_stylesheet_event_known(
                     session->page.stylesheet_events,
-                    session->page.stylesheet_event_count, node, hash)) {
+                    session->page.stylesheet_event_count, node, hash,
+                    preload)) {
                 continue;
             }
             StylesheetDocumentResourceState state =
                 navigation_stylesheet_link_state(
                     session, node, base_url);
+            if (preload) {
+                const StylesheetDocumentResources *resources =
+                    &session->page.stylesheet_resources;
+                state = STYLESHEET_DOCUMENT_RESOURCE_EMPTY;
+                for (size_t i = 0; i < resources->style_preload_count; i++)
+                    if (resources->style_preloads[i].element == node) {
+                        state = resources->style_preloads[i].state;
+                        break;
+                    }
+            }
             if (state != STYLESHEET_DOCUMENT_RESOURCE_LOADED
                 && state
                     != STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE) {
@@ -2153,25 +2385,40 @@ static bool navigation_dispatch_stylesheet_events(
             }
             selected = node;
             selected_hash = hash;
+            selected_preload = preload;
             event_type = state == STYLESHEET_DOCUMENT_RESOURCE_LOADED
                 ? "load" : "error";
             break;
         }
-        if (selected == NULL) return true;
+        if (selected == NULL) {
+            session->page.stylesheet_events_swept = true;
+            return true;
+        }
         if (!navigation_remember_stylesheet_event(
                 session->page.stylesheet_events,
                 &session->page.stylesheet_event_count,
-                selected, selected_hash)) return true;
+                selected, selected_hash, selected_preload)) return true;
         /* Dispatch exactly one callback before rescanning.  Author code and
            its promise jobs may replace the entire head, invalidating every
            other node pointer which existed at selection time. */
-        if (!script_runtime_dispatch_node(
-                session->page.runtime, selected, event_type,
-                &session->page.script_result)) {
+        uint64_t handler_started = navigation_now_us();
+        bool dispatched_ok = script_runtime_dispatch_node(
+            session->page.runtime, selected, event_type,
+            &session->page.script_result);
+        uint64_t handler_finished = navigation_now_us();
+        session->performance.stylesheet_event_handler_us +=
+            handler_finished >= handler_started
+                ? handler_finished - handler_started : 0;
+        session->performance.stylesheet_event_dispatches++;
+        if (!dispatched_ok) {
             (void) navigation_retire_failed_document_refresh(
                 session, session->page.runtime);
             return false;
         }
+        /* A callback can promote this OR another link. Its next completion
+           must follow the ordinary resource-install pass, not URL reuse. */
+        if (script_runtime_has_pending_resource_mutations(
+                session->page.runtime)) return true;
     }
     return true;
 }
@@ -2792,10 +3039,14 @@ static bool navigation_refresh_frame_presentation(
     /* Nested browsing-context snapshots may be attached after this layout is
        committed. Reserve the complete bounded frame capacity first so the
        ImageResource table cannot relocate underneath retained paint data. */
+    /* The snapshot is an image in the parent's CSS pixels: one child CSS
+       pixel per snapshot pixel, and the parent's own scale applies when it
+       draws the image. Using the physical display as the child's device
+       made every frame narrower than the screen paint at display/frame
+       scale (1.6x for Turnstile's 300px widget) and crop. */
     bool okay = images_reserve_capacity(
             &frame->images, session->budget, NAVIGATION_FRAME_LIMIT)
-        && viewport_context_init(
-        &viewport, width, height, device_width, device_height)
+        && viewport_context_init(&viewport, width, height, width, height)
         && stylesheet_build_context(
             &fresh->stylesheet, session->budget, &frame->document,
             &viewport)

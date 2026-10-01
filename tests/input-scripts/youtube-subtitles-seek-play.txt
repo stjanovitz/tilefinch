@@ -1,0 +1,52 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# A long YouTube video with subtitles on real hardware (PPSSPP stops at the
+# firmware decoder boundary). Run through the PSPLink loop with boot.cfg
+#   url=https://m.youtube.com/watch?v=IoDVfXFq5cU   (MrBeast, many caption
+#                                                   tracks and dubbed audio)
+#   input_script=youtube-subtitles-seek-play.txt
+# In order: play; open the track menu with Triangle, switch to the Subtitles
+# tab (the menu opens on Audio when the video has dubs), pick the first
+# track; play on with captions; three 10 s previews committed with Cross;
+# then a rewind to 0 (large enough to rebuild the decoder over the network)
+# with Right and Cross pressed while that reopen runs. Read
+# tilefinch-media-first-frame, tilefinch-subtitle*, tilefinch-media-job
+# seek-complete/backward-seek-reopen/resume-open, and the
+# tilefinch-input-script-media marks. The network decides the timings, so
+# nothing is gated. No screenshot step: that writes to the Memory Stick.
+wait 1
+mark-live watch
+tap-live cross
+wait-live 1500
+mark-live playing
+tap-live triangle
+wait-live 30
+tap-live rtrigger
+wait-live 20
+tap-live down
+wait-live 20
+tap-live cross
+wait-live 900
+mark-live subtitles
+tap-live right
+wait-live 10
+tap-live right
+wait-live 10
+tap-live right
+wait-live 30
+tap-live cross
+wait-live 900
+mark-live committed
+tap-live ltrigger
+wait-live 30
+tap-live cross
+wait-live 30
+tap-live right
+wait-live 10
+tap-live cross
+wait-live 1500
+mark-live after-rewind
+tap-live circle
+wait-live 180
+mark closed
+end

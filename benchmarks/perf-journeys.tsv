@@ -1,0 +1,11 @@
+# PSP performance journeys: benchmarks/run-perf-journeys.py runs each under
+# PPSSPP at 111 MHz; traces live under perf/traces (not committed) and are
+# pinned by trace_sha256. '-' means none. See docs/engineering/PERF_JOURNEYS.md.
+name	script	url	trace	trace_sha256	data_dir	boot	cpu_mhz
+home-menu	menu-tour	-	-	-	-	-	-
+site-restore	site-restore	-	-	-	tests/fixtures/ppsspp-site-data	-	-
+article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
+article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
+article-drawer	drawer-scroll-during-completion-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
+youtube-bbb	youtube-bbb	https://m.youtube.com/results?search_query=big+buck+bunny	youtube-bbb	c6463fcd2f4a5ee3ddd999977591c21550205ad1f6014d520db377d1b63df1ef	-	-	-
+chatgpt-ask	chatgpt-ask	https://chatgpt.com/	chatgpt-ask-send76	6440c59283ec5516a46d7842fc24362a71a3a1c139c563723a8f1625b991c676	-	trace_ignore_request_body=1;trace_volatile_uuids=1;validation_js_profile=0	333

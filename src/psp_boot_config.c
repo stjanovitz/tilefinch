@@ -1,5 +1,6 @@
 #include "tilefinch/psp_boot_config.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,7 @@
 #define PSP_DEFAULT_SCRIPT_HEAP_MB 5L
 #define PSP_DEFAULT_SCRIPT_BOOT_WINDOW_KB 4096L
 #define PSP_DEFAULT_SCRIPT_TOTAL_MB 2L
-#define PSP_DEFAULT_SCRIPT_FILE_KB 384L
+#define PSP_DEFAULT_SCRIPT_FILE_KB 512L
 #define PSP_DEFAULT_CSS_WIDTH 480L
 #define PSP_DEFAULT_CSS_HEIGHT 272L
 
@@ -41,6 +42,8 @@ void psp_boot_config_defaults(PspBootConfig *config)
     /* Two thirds, which is where the fraction was hardcoded. */
     config->validation_media_seek_permille = 667;
     config->validation_media_stability_seconds = 120;
+    config->validation_js_profile = 1;
+    config->validation_script_split = 2;
     config->limit_mb = 32;
     config->heap_mb = PSP_DEFAULT_SCRIPT_HEAP_MB;
     /* Modern bootstraps and managed challenges can require one large,
@@ -55,6 +58,8 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->file_kb = PSP_DEFAULT_SCRIPT_FILE_KB;
     config->count = 256;
     config->gc_growth_pct = 150;
+    config->lazy_functions = -1;
+    config->page_task_yield = -1;
     config->script_timeout_ms = 60000;
     config->css_width = PSP_DEFAULT_CSS_WIDTH;
     config->css_height = PSP_DEFAULT_CSS_HEIGHT;
@@ -65,10 +70,16 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
 {
     if (config == NULL) return;
     bool was_automated = strcmp(config->trace, "none") != 0
+        || config->trace_capture[0] != '\0'
         || config->ticks != 0
         || config->dump_frame != 0
         || config->exit_after_report != 0
         || config->interactive_validation_ticks != 0
+        || config->validation_js_outlier_us != 0
+        || config->validation_execution_census != 0
+        || config->trace_ignore_request_body != 0
+        || config->trace_volatile_uuids != 0
+        || config->trace_replay_pump_us != 0
         || config->validation_cancel_after_ms != 0
         || config->validation_preview_scroll != 0
         || config->validation_media_play != 0
@@ -80,6 +91,7 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
         || config->validation_power_test_auto != 0
         || config->validation_ge_present_probe != 0
         || config->validation_webgl_ge_probe != 0
+        || config->validation_js_bench != 0
         || config->validation_csc_order_probe != 0
         || config->validation_latch_probe != 0
         || config->validation_media_range_probe != 0
@@ -91,10 +103,19 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
         snprintf(config->url, sizeof(config->url), "%s",
                  TILEFINCH_HOMEPAGE_URL);
     snprintf(config->trace, sizeof(config->trace), "none");
+    config->trace_keyed = 0;
+    config->trace_capture[0] = '\0';
     config->ticks = 0;
     config->dump_frame = 0;
     config->exit_after_report = 0;
     config->interactive_validation_ticks = 0;
+    config->validation_js_profile = 1;
+    config->validation_js_outlier_us = 0;
+    config->validation_script_split = 2;
+    config->validation_execution_census = 0;
+    config->trace_ignore_request_body = 0;
+    config->trace_volatile_uuids = 0;
+    config->trace_replay_pump_us = 0;
     config->validation_cancel_after_ms = 0;
     config->validation_preview_scroll = 0;
     config->validation_media_play = 0;
@@ -108,6 +129,9 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->validation_power_test_auto = 0;
     config->validation_ge_present_probe = 0;
     config->validation_webgl_ge_probe = 0;
+    config->validation_js_bench = 0;
+    config->js_bench_dir[0] = '\0';
+    config->js_bench_only[0] = '\0';
     config->validation_csc_order_probe = 0;
     config->validation_latch_probe = 0;
     config->validation_media_range_probe = 0;
@@ -145,6 +169,22 @@ static bool psp_boot_config_load_one(
             snprintf(loaded.url, sizeof(loaded.url), "%s", value);
         } else if (strcmp(line, "trace") == 0) {
             snprintf(loaded.trace, sizeof(loaded.trace), "%s", value);
+        } else if (strcmp(line, "trace_keyed") == 0) {
+            loaded.trace_keyed = atol(value);
+        } else if (strcmp(line, "trace_ignore_request_body") == 0) {
+            loaded.trace_ignore_request_body = atol(value);
+        } else if (strcmp(line, "trace_volatile_uuids") == 0) {
+            loaded.trace_volatile_uuids = atol(value);
+        } else if (strcmp(line, "trace_replay_pump_us") == 0) {
+            loaded.trace_replay_pump_us = atol(value);
+        } else if (strcmp(line, "module_cache_dir") == 0) {
+            snprintf(loaded.module_cache_dir, sizeof(loaded.module_cache_dir),
+                     "%s", value);
+        } else if (strcmp(line, "module_cache_write") == 0) {
+            loaded.module_cache_write = atol(value);
+        } else if (strcmp(line, "trace_capture") == 0) {
+            snprintf(loaded.trace_capture, sizeof(loaded.trace_capture),
+                     "%s", value);
         } else if (strcmp(line, "input_script") == 0) {
             snprintf(loaded.input_script, sizeof(loaded.input_script),
                      "%s", value);
@@ -171,6 +211,10 @@ static bool psp_boot_config_load_one(
             loaded.window_kb = atol(value);
         } else if (strcmp(line, "gc_growth_pct") == 0) {
             loaded.gc_growth_pct = atol(value);
+        } else if (strcmp(line, "lazy_functions") == 0) {
+            loaded.lazy_functions = atol(value);
+        } else if (strcmp(line, "page_task_yield") == 0) {
+            loaded.page_task_yield = atol(value);
         } else if (strcmp(line, "script_timeout_ms") == 0) {
             loaded.script_timeout_ms = atol(value);
         } else if (strcmp(line, "css_width") == 0) {
@@ -194,6 +238,14 @@ static bool psp_boot_config_load_one(
             loaded.exit_after_report = atol(value);
         } else if (strcmp(line, "interactive_validation_ticks") == 0) {
             loaded.interactive_validation_ticks = atol(value);
+        } else if (strcmp(line, "validation_js_profile") == 0) {
+            loaded.validation_js_profile = atol(value);
+        } else if (strcmp(line, "validation_js_outlier_us") == 0) {
+            loaded.validation_js_outlier_us = atol(value);
+        } else if (strcmp(line, "validation_script_split") == 0) {
+            loaded.validation_script_split = atol(value);
+        } else if (strcmp(line, "validation_execution_census") == 0) {
+            loaded.validation_execution_census = atol(value);
         } else if (strcmp(line, "validation_cancel_after_ms") == 0) {
             loaded.validation_cancel_after_ms = atol(value);
         } else if (strcmp(line, "validation_preview_scroll") == 0) {
@@ -222,6 +274,14 @@ static bool psp_boot_config_load_one(
             loaded.validation_ge_present_probe = atol(value);
         } else if (strcmp(line, "validation_webgl_ge_probe") == 0) {
             loaded.validation_webgl_ge_probe = atol(value);
+        } else if (strcmp(line, "validation_js_bench") == 0) {
+            loaded.validation_js_bench = atol(value);
+        } else if (strcmp(line, "js_bench_dir") == 0) {
+            snprintf(loaded.js_bench_dir, sizeof(loaded.js_bench_dir), "%s",
+                     value);
+        } else if (strcmp(line, "js_bench_only") == 0) {
+            snprintf(loaded.js_bench_only, sizeof(loaded.js_bench_only), "%s",
+                     value);
         } else if (strcmp(line, "validation_csc_order_probe") == 0) {
             loaded.validation_csc_order_probe = atol(value);
         } else if (strcmp(line, "validation_latch_probe") == 0) {
@@ -400,6 +460,15 @@ bool psp_boot_config_validate(
         config->gc_growth_pct >= 100 && config->gc_growth_pct <= 400,
         "gc_growth_pct");
     REQUIRE_CONFIG(
+        config->lazy_functions >= -1 && config->lazy_functions <= 65536,
+        "lazy_functions");
+    REQUIRE_CONFIG(
+        config->page_task_yield >= -1 && config->page_task_yield <= 1,
+        "page_task_yield");
+    REQUIRE_CONFIG(
+        config->module_cache_write == 0 || config->module_cache_write == 1,
+        "module_cache_write");
+    REQUIRE_CONFIG(
         config->script_timeout_ms >= 1000
             && config->script_timeout_ms <= 600000,
         "script_timeout_ms");
@@ -450,6 +519,31 @@ bool psp_boot_config_validate(
         config->validation_preview_scroll == 0
             || config->validation_preview_scroll == 1,
         "validation_preview_scroll");
+    REQUIRE_CONFIG(
+        config->trace_keyed == 0 || config->trace_keyed == 1,
+        "trace_keyed");
+    REQUIRE_CONFIG(
+        config->trace_ignore_request_body == 0
+            || config->trace_ignore_request_body == 1,
+        "trace_ignore_request_body");
+    REQUIRE_CONFIG(
+        config->trace_volatile_uuids == 0
+            || config->trace_volatile_uuids == 1,
+        "trace_volatile_uuids");
+    REQUIRE_CONFIG(
+        config->trace_replay_pump_us >= 0
+            && config->trace_replay_pump_us <= 1000000,
+        "trace_replay_pump_us");
+    /* A plain directory name beside the EBOOT, and never while replaying. */
+    bool capture_name_valid = true;
+    for (const char *at = config->trace_capture; *at != '\0'; at++) {
+        if (!isalnum((unsigned char) *at) && *at != '-' && *at != '_')
+            capture_name_valid = false;
+    }
+    REQUIRE_CONFIG(
+        capture_name_valid && (config->trace_capture[0] == '\0'
+                               || strcmp(config->trace, "none") == 0),
+        "trace_capture");
     REQUIRE_CONFIG(
         config->validation_media_play == 0
             || config->validation_media_play == 1,
@@ -502,6 +596,21 @@ bool psp_boot_config_validate(
             || config->validation_power_test_auto == 1,
         "validation_power_test_auto");
     REQUIRE_CONFIG(
+        config->validation_js_profile == 0
+            || config->validation_js_profile == 1,
+        "validation_js_profile");
+    REQUIRE_CONFIG(
+        config->validation_js_outlier_us >= 0
+            && config->validation_js_outlier_us <= 10000000,
+        "validation_js_outlier_us");
+    REQUIRE_CONFIG(
+        config->validation_script_split >= 0
+            && config->validation_script_split <= 2,
+        "validation_script_split");
+    REQUIRE_CONFIG(config->validation_execution_census >= 0
+               && config->validation_execution_census <= 2,
+               "validation_execution_census");
+    REQUIRE_CONFIG(
         config->validation_ge_present_probe == 0
             || config->validation_ge_present_probe == 1,
         "validation_ge_present_probe");
@@ -509,6 +618,9 @@ bool psp_boot_config_validate(
         config->validation_webgl_ge_probe == 0
             || config->validation_webgl_ge_probe == 1,
         "validation_webgl_ge_probe");
+    REQUIRE_CONFIG(
+        config->validation_js_bench >= 0 && config->validation_js_bench <= 64,
+        "validation_js_bench");
     REQUIRE_CONFIG(
         config->validation_csc_order_probe == 0
             || config->validation_csc_order_probe == 1,

@@ -82,6 +82,19 @@ static bool test_private_network_admission(Budget *budget, unsigned port)
     /* An explicitly entered local top-level navigation is the narrow user
        escape hatch. The public-page case above remains protected even when
        its destination is a top-level-looking URL. */
+    context.mode = TILEFINCH_REQUEST_MODE_NAVIGATE;
+    context.destination = TILEFINCH_DESTINATION_DOCUMENT;
+    context.top_level_navigation = true;
+    context.user_activated = true;
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, NULL, NULL, NULL,
+        &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    result = (FetchResult) {.budget = budget};
+    CHECK(!fetch_redirect(budget, url, request, &result)
+          && strstr(result.error, "private network") != NULL);
+    fetch_result_destroy(&result);
+
     context.initiator_url = NULL;
     context.top_level_url = url;
     context.mode = TILEFINCH_REQUEST_MODE_NAVIGATE;
@@ -175,6 +188,98 @@ static bool test_private_network_admission(Budget *budget, unsigned port)
           && strstr(result.error, "private network") != NULL);
     fetch_result_destroy(&result);
     browser_session_destroy(&portal_session);
+    return true;
+}
+
+/* BrowserEngine installs the process-wide Lexbor allocator. Keep this
+   integration exercise after the redirect suite's other document tests so
+   engine teardown does not uninstall their shared test Budget's hooks. */
+static bool test_script_form_private_network_admission(unsigned port)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/final", port);
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    char engine_error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, engine_error,
+                                                 sizeof(engine_error));
+    CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
+    char form_page[512];
+    snprintf(form_page, sizeof(form_page),
+             "<!doctype html><form id=f action='%s' method=get></form>", url);
+    for (unsigned route = 0; route < 2; route++) {
+        CHECK(browser_engine_commit_html(engine, "https://public.example/page",
+            form_page, strlen(form_page), true));
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+            route == 0 ? "document.getElementById('f').submit()"
+                       : "document.getElementById('f').requestSubmit()",
+            "<script-local-form>", &navigation->page.script_result));
+        ControllerAction action = {0};
+        CHECK(browser_engine_take_script_form_submission(engine, &action));
+        CHECK(action.navigation_source == CONTROLLER_NAVIGATION_SCRIPT);
+        if (route == 0) {
+            CHECK(browser_engine_begin_navigation_action(engine, &action,
+                                                         65536, 1000));
+            BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+            for (unsigned pump = 0; pump < 256
+                 && status == BROWSER_NAVIGATION_JOB_PENDING; pump++)
+                status = browser_engine_pump_navigation(engine, NULL);
+            CHECK(status == BROWSER_NAVIGATION_JOB_FAILED);
+        } else {
+            CHECK(!browser_engine_execute_action(engine, &action, 65536, 1000));
+        }
+        CHECK(strstr(browser_engine_last_error(engine), "private network") != NULL);
+    }
+    /* The PSP can retry a deferred location navigation after a startup
+       allocation failure. That retry must retain the public initiator even
+       though the first attempt consumed the pending request context. */
+    CHECK(browser_engine_commit_html(engine, "https://public.example/page",
+        form_page, strlen(form_page), true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    char script[512];
+    snprintf(script, sizeof(script), "location.href='%s'", url);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        script, "<script-local-location>", &navigation->page.script_result));
+    char script_url[NAVIGATION_URL_LIMIT] = {0};
+    bool record_history = false;
+    CHECK(browser_engine_take_script_navigation(engine, script_url,
+        sizeof(script_url), &record_history)
+        && strcmp(script_url, url) == 0);
+    BrowserScriptNavigationAttribution attribution = {0};
+    CHECK(browser_engine_capture_script_navigation_attribution(
+        engine, &attribution)
+        && strcmp(attribution.initiator_url,
+                  "https://public.example/page") == 0);
+    budget_inject_failure_after(navigation->budget, 1u);
+    bool started = browser_engine_begin_navigation_url(
+        engine, script_url, 65536, 1000, record_history);
+    budget_clear_failure_injection(navigation->budget);
+    CHECK(!started && navigation->pending_navigation_referer[0] == '\0');
+    browser_engine_restore_script_navigation_attribution(
+        engine, &attribution);
+    CHECK(browser_engine_begin_navigation_url(
+        engine, script_url, 65536, 1000, record_history));
+    BrowserNavigationJobStatus script_status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (unsigned pump = 0; pump < 256
+         && script_status == BROWSER_NAVIGATION_JOB_PENDING; pump++)
+        script_status = browser_engine_pump_navigation(engine, NULL);
+    CHECK(script_status == BROWSER_NAVIGATION_JOB_FAILED
+        && strstr(browser_engine_last_error(engine), "private network") != NULL);
+    /* Explicitly entering the local address remains allowed. */
+    CHECK(browser_engine_load_url_with_limits(engine, url, 65536, 1000, true));
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics engine_metrics = {0};
+    CHECK(browser_engine_metrics(engine, &engine_metrics)
+        && engine_metrics.budget_current == 0);
+    browser_engine_destroy(engine);
     return true;
 }
 

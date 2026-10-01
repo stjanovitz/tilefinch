@@ -321,6 +321,25 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url, const F
     return false;
 }
 
+void fetch_sync_wait_note(uint64_t elapsed_us)
+{
+    (void) elapsed_us;
+}
+
+void fetch_sync_wait_totals(uint64_t *us, uint64_t *count)
+{
+    if (us != NULL) *us = 0;
+    if (count != NULL) *count = 0;
+}
+
+bool fetch_scheduler_wait(FetchScheduler *scheduler, uint64_t request_id, FetchResult *result)
+{
+    (void) scheduler;
+    (void) request_id;
+    (void) result;
+    return false;
+}
+
 bool fetch_scheduler_cancel(FetchScheduler *scheduler, uint64_t request_id, const char *reason)
 {
     (void) scheduler;
@@ -340,6 +359,14 @@ size_t fetch_scheduler_pending(const FetchScheduler *scheduler)
 {
     (void) scheduler;
     return 0;
+}
+
+bool fetch_scheduler_request_complete(const FetchScheduler *scheduler,
+                                      uint64_t request_id)
+{
+    (void) scheduler;
+    (void) request_id;
+    return false;
 }
 
 void fetch_scheduler_reservation_state(const FetchScheduler *scheduler,
@@ -416,6 +443,11 @@ bool fetch_trace_replay_begin_response_keyed(const char *directory, char *error,
     return false;
 }
 
+bool fetch_trace_active(void)
+{
+    return false;
+}
+
 bool fetch_trace_replay_active(void)
 {
     return false;
@@ -425,6 +457,20 @@ bool fetch_trace_replay_stats(FetchTraceReplayStats *stats)
 {
     (void) stats;
     return false;
+}
+
+size_t fetch_trace_replay_served_count(void)
+{
+    return 0;
+}
+
+void fetch_trace_replay_io(uint64_t *opens, uint64_t *reads,
+                           uint64_t *bytes, uint64_t *us)
+{
+    if (opens != NULL) *opens = 0;
+    if (reads != NULL) *reads = 0;
+    if (bytes != NULL) *bytes = 0;
+    if (us != NULL) *us = 0;
 }
 
 bool fetch_trace_replay_record_was_claimed(size_t sequence)

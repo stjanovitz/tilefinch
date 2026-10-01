@@ -1139,7 +1139,7 @@ static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
    every fill, image and glyph dispatch its instruction-cache footprint.
    The hot-symbol ratchet measures that dispatch. */
 __attribute__((noinline))
-static void rasterize_stroke_rect(RasterTarget *target,
+static void rasterize_stroke_rect(TileCache *cache, RasterTarget *target,
                                   const DrawCommand *command,
                                   int x0, int y0, int x1, int y1)
 {
@@ -1226,13 +1226,49 @@ static void rasterize_stroke_rect(RasterTarget *target,
         dash_y = (int) (((uint32_t) y0 - (uint32_t) command->y)
                         % (uint32_t) period);
     }
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    uint64_t tested_pixels = 0;
+#endif
+    int inner_inset = 0;
+    for (size_t corner = 0; corner < 4; corner++) {
+        if (inner_corner_radii[corner] > inner_inset)
+            inner_inset = inner_corner_radii[corner];
+    }
+    int inner_straight_left = raster_extent_to_int(
+        (int64_t) inner_x + inner_inset);
+    int inner_straight_right = raster_extent_to_int(
+        (int64_t) inner_right - inner_inset);
     for (int y = y0; y < y1; y++) {
         int span_x0 = 0, span_x1 = 0;
         size_t index = 0;
         bool rounded = false;
         if (!raster_target_span(target, y, x0, x1, &span_x0, &span_x1,
                                 &index, &rounded)) continue;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+        tested_pixels += (unsigned) (span_x1 - span_x0);
+#endif
+        /* The central strip of the inner rounded box has full 4/4
+           coverage, so its stroke coverage is exactly zero. Skip it as a
+           span instead of evaluating every transparent interior pixel.
+           Corners keep the original quarter-sample antialiasing, and dash
+           phases remain anchored to x0 rather than the visited pixels. */
+        int skip_left = span_x1, skip_right = span_x1;
+        if (has_inner && y >= inner_y && y < inner_bottom) {
+            skip_left = inner_straight_left > span_x0
+                ? inner_straight_left : span_x0;
+            skip_right = inner_straight_right < span_x1
+                ? inner_straight_right : span_x1;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+            if (skip_right > skip_left)
+                tested_pixels -= (unsigned) (skip_right - skip_left);
+#endif
+        }
         for (int x = span_x0; x < span_x1; x++, index++) {
+            if (x == skip_left && skip_right > skip_left) {
+                index += (size_t) (skip_right - x);
+                x = skip_right;
+                if (x >= span_x1) break;
+            }
             /* Square corners never leave the annulus partially covered,
                so they keep the plain box test and the untouched alpha
                the arm has always used. */
@@ -1267,6 +1303,11 @@ static void rasterize_stroke_rect(RasterTarget *target,
                                : (alpha * coverage + 2u) / 4u);
         }
     }
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    cache->stroke_pixel_tests += tested_pixels;
+#else
+    (void) cache;
+#endif
     return;
 }
 
@@ -1487,7 +1528,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         return;
     }
     if (command->type == DRAW_STROKE_RECT) {
-        rasterize_stroke_rect(target, command, x0, y0, x1, y1);
+        rasterize_stroke_rect(cache, target, command, x0, y0, x1, y1);
         return;
     }
     if (command->type == DRAW_IMAGE) {

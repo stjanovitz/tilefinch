@@ -3,6 +3,9 @@ static bool install_named_function(JSContext *context, JSValue global,
                                    const char *function_name,
                                    JSCFunction *function, int arguments)
 {
+#ifdef TILEFINCH_SCRIPT_SPLIT
+    function = script_split_native(function);
+#endif
     JSValue value = JS_NewCFunction(context, function, function_name,
                                     arguments);
     return !JS_IsException(value)
@@ -76,16 +79,1177 @@ static bool watchdog_cooperate(Watchdog *watchdog)
     return keep_going;
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* An interrupt is uncatchable: it unwinds page script without running its
+   finally blocks, so page invariants kept by try/finally stay broken. */
+static void watchdog_log_interrupt(const Watchdog *watchdog,
+                                   const char *reason, uint64_t now_ms)
+{
+    static unsigned logged;
+    if (logged >= 8u) return;
+    logged++;
+    char message[480];
+    int length = snprintf(message, sizeof(message),
+             "tilefinch-js-interrupt: reason=%s elapsed-ms=%llu polls=%zu "
+             "stack=", reason,
+             (unsigned long long) (now_ms >= watchdog->started_ms
+                 ? now_ms - watchdog->started_ms : 0),
+             watchdog->polls);
+    const ScriptRuntime *owner = (const ScriptRuntime *) (const void *)
+        ((const char *) watchdog - offsetof(ScriptRuntime, watchdog));
+    for (int level = 0; level < 20 && length > 0
+         && (size_t) length < sizeof(message) - 2u; level++) {
+        JSAtom atom = JS_GetScriptOrModuleName(owner->context, level);
+        if (atom == JS_ATOM_NULL) continue;
+        const char *name = JS_AtomToCString(owner->context, atom);
+        JS_FreeAtom(owner->context, atom);
+        if (name == NULL) break;
+        const char *base = strrchr(name, '/');
+        length += snprintf(message + length, sizeof(message) - (size_t) length,
+                           "%s<", base == NULL ? name : base + 1);
+        JS_FreeCString(owner->context, name);
+    }
+    if (length > 0 && (size_t) length < sizeof(message) - 2u)
+        snprintf(message + length, sizeof(message) - (size_t) length,
+                 " sync-layouts=%zu/%llums max=%llums",
+                 owner->bridge.synchronous_layout_calls,
+                 (unsigned long long)
+                     (owner->bridge.synchronous_layout_us / 1000u),
+                 (unsigned long long)
+                     (owner->bridge.synchronous_layout_max_us / 1000u));
+    tilefinch_platform_log_message(message);
+}
+
+/* Names the scripts on the stack of a JavaScript entry that has run for a
+   second: on the device there is no profiler, and a page that keeps the
+   runtime busy otherwise shows up only as long advances. */
+static void watchdog_log_long_task(Watchdog *watchdog, uint64_t elapsed_ms)
+{
+    static unsigned logged;
+    if (logged >= 80u) return;
+    logged++;
+    ScriptRuntime *owner = (ScriptRuntime *) (void *)
+        ((char *) watchdog - offsetof(ScriptRuntime, watchdog));
+    JSContext *context = owner->context;
+    char message[512];
+    int length = snprintf(message, sizeof(message),
+                          "tilefinch-js-sample: entry=%llums stack=",
+                          (unsigned long long) elapsed_ms);
+    char previous[64] = {0};
+    for (int level = 0; level < 24 && length > 0
+         && (size_t) length < sizeof(message) - 2u; level++) {
+        /* Native frames (JSON.stringify, a host callback) have no script
+           name; keep walking past them. */
+        JSAtom atom = JS_GetScriptOrModuleName(context, level);
+        if (atom == JS_ATOM_NULL) continue;
+        const char *name = JS_AtomToCString(context, atom);
+        JS_FreeAtom(context, atom);
+        if (name == NULL) break;
+        const char *base = strrchr(name, '/');
+        base = base == NULL ? name : base + 1;
+        if (strncmp(previous, base, sizeof(previous) - 1u) != 0) {
+            length += snprintf(message + length,
+                               sizeof(message) - (size_t) length,
+                               "%s%.60s", previous[0] == 0 ? "" : "<",
+                               base);
+            snprintf(previous, sizeof(previous), "%s", base);
+        }
+        JS_FreeCString(context, name);
+    }
+    tilefinch_platform_log_message(message);
+}
+#endif
+
+/* Rows per table. Keying by definition line keeps anonymous functions
+   apart, so a page needs many; the profile is allocated only while
+   profiling, from the page Budget (smaller on the PSP). */
+#if defined(__PSP__)
+#define SCRIPT_PROFILE_SLOTS 256u
+#else
+#define SCRIPT_PROFILE_SLOTS 1024u
+#endif
+#define SCRIPT_PROFILE_NATIVES 256u
+#define SCRIPT_PROFILE_DEPTH 12
+typedef struct {
+    JSAtom file;
+    JSAtom function;
+    int line;
+    int column;
+    int defline;  /* definition line/column of the frame's function */
+    int defcol;
+    uint64_t us;
+    uint32_t samples;
+} ScriptProfileSlot;
+struct ScriptProfile {
+    ScriptProfileSlot self[SCRIPT_PROFILE_SLOTS];
+    ScriptProfileSlot inclusive[SCRIPT_PROFILE_SLOTS];
+    /* Microtask-phase attribution (phase 1 = promise job, 2 = checkpoint
+       continuation): inclusive and self per function, and the outermost
+       script frame of the job (its "caller"). */
+    ScriptProfileSlot micro_inclusive[SCRIPT_PROFILE_SLOTS];
+    ScriptProfileSlot micro_outer[SCRIPT_PROFILE_SLOTS];
+    ScriptProfileSlot micro_self[SCRIPT_PROFILE_SLOTS];
+    int phase;
+    int micro_site; /* runtime_loop.inc call site: 1 entry, 2 network, 3 timer */
+    uint64_t micro_us[3];
+    uint32_t micro_samples[3];
+    uint64_t micro_site_us[4];
+    /* The last timed native, for TILEFINCH_JS_PROFILE_OUTLIER_US. */
+    int last_native;
+    uint64_t last_native_end_ns;
+    uint64_t last_native_us;
+    uint64_t last_native_inside_us;
+    uint64_t last_ns;
+    uint64_t total_us;
+    uint64_t unframed_us;
+    uint64_t unframed_pending_us;
+    uint64_t unframed_compile_us;
+    uint64_t unframed_checkpoint_us;
+    uint64_t unframed_entry_us;
+    uint64_t unframed_tail_us;
+    uint64_t profiler_us;
+    unsigned compile_depth;
+    unsigned checkpoint_depth;
+    bool returning_from_script;
+    uint64_t dropped_us;
+    /* Intervals too long to attribute to one stack frame. Keep these
+       separate from sampled script time instead of silently losing them. */
+    uint64_t long_gap_us;
+    uint32_t long_gap_count;
+    uint32_t samples;
+    /* Collections, timed through JS_SetGCHook and kept out of the frame
+       tables: otherwise a collection is charged to whichever frame's
+       allocation happened to trigger it. */
+    uint64_t gc_begin_ns;
+    uint64_t gc_unsampled_us;
+    uint64_t gc_us;
+    uint64_t gc_max_us;
+    uint32_t gc_count;
+    /* Host natives, timed at the call (the sampler polls only in bytecode,
+       so a long native was billed to whichever frame polled next). Self
+       time excludes script the native called back into. */
+    uint64_t native_us[SCRIPT_PROFILE_NATIVES];
+    uint64_t native_self_us;
+    uint64_t job_begin_ns; /* joins opt-in samples to one promise execution */
+    uint32_t native_calls[SCRIPT_PROFILE_NATIVES];
+    /* Script time before a native began, not yet charged to a frame; the
+       next poll adds it (the poll clock restarts when a native returns). */
+    uint64_t pending_script_us;
+    uint32_t native_depth;
+    /* Innermost frame when the running timed native began: a poll that
+       still sees it comes from the native's own checkpoint. */
+    const void *native_stack_top;
+    /* Time charged to slots later replaced when the table was full: the
+       error bound of the (space-saving) self and inclusive tables. */
+    uint64_t evicted_us;
+    /* Host work done inside a poll after sampling (UI cooperation, input,
+       validation logging): not script, so kept out of the next sample. */
+    uint64_t host_us;
+    /* Calls per profiled native for the tilefinch-work record: cumulative,
+       so a report keeps them (these stay last; see script_profile_release). */
+    uint64_t work_native_total;
+    uint32_t work_native_calls[SCRIPT_PROFILE_NATIVES];
+};
+
+typedef struct {
+    JSCFunction *function;
+    const char *name;
+} ScriptProfileNative;
+static ScriptProfileNative script_profile_natives[SCRIPT_PROFILE_NATIVES];
+static size_t script_profile_native_count;
+
+/* Installed on every realm: records the heap left after each collection
+   (the live graph that collection pacing grows from) and times collections
+   for the profiler. Allocation-free. */
+static void script_runtime_gc_hook(void *opaque, int begin)
+{
+    ScriptRuntime *owner = opaque;
+    if (owner == NULL) return;
+    /* Collections nest in nothing that collects, so one token serves. */
+    static unsigned gc_split = SCRIPT_SPLIT_KIND_COUNT + 1u;
+    if (begin) gc_split = script_split_enter(SCRIPT_SPLIT_GC);
+    else script_split_leave(gc_split);
+    if (!begin && owner->quickjs_pool != NULL) {
+        owner->heap_live_after_gc =
+            budget_quickjs_pool_js_malloc_current(owner->quickjs_pool);
+        owner->heap_collections++;
+    }
+    struct ScriptProfile *profile = owner->profile;
+    if (profile == NULL) return;
+    uint64_t now_ns = js_rt_monotonic_time_ns();
+    if (begin) {
+        profile->gc_begin_ns = now_ns;
+        return;
+    }
+    if (profile->gc_begin_ns == 0 || now_ns < profile->gc_begin_ns) return;
+    uint64_t us = (now_ns - profile->gc_begin_ns) / UINT64_C(1000);
+    profile->gc_begin_ns = 0;
+    profile->gc_count++;
+    profile->gc_us += us;
+    profile->gc_unsampled_us += us;
+    if (us > profile->gc_max_us) profile->gc_max_us = us;
+}
+
+/* First-call compiles of lazy bodies are compile time in the script split,
+   exclusive of the script around them. A compile runs no script, so pairs
+   do not nest in practice; a small token stack keeps a nested pair (a
+   collection inside a compile is its own kind) correct anyway. */
+static void script_runtime_lazy_compile_hook(void *opaque, int begin)
+{
+    (void) opaque;
+    static unsigned tokens[8];
+    static unsigned depth;
+    if (begin) {
+        unsigned token = script_split_enter(SCRIPT_SPLIT_COMPILE);
+        if (depth < 8u) tokens[depth] = token;
+        depth++;
+    } else if (depth != 0) {
+        depth--;
+        if (depth < 8u) script_split_leave(tokens[depth]);
+    }
+}
+
+static bool script_profile_enabled(void);
+static void script_profile_emit(const char *message);
+
+/* The host is about to call into script from an empty JavaScript stack:
+   restart the sampler's clock, so host work since the previous entry
+   (layout, rendering, network) is not billed to the first frame that
+   polls in this one. */
+static void script_profile_enter(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->profile == NULL
+        || runtime->runtime == NULL || JS_IsStackActive(runtime->runtime))
+        return;
+    runtime->profile->last_ns = js_rt_monotonic_time_ns();
+}
+
+static JSValue script_profile_native_call(JSContext *context,
+                                          JSValueConst this_value, int argc,
+                                          JSValueConst *argv, int magic,
+                                          JSValue *data)
+{
+    (void) data;
+    const ScriptProfileNative *native = &script_profile_natives[magic];
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *owner = bridge == NULL ? NULL : bridge->host;
+    struct ScriptProfile *profile = owner == NULL ? NULL : owner->profile;
+    if (profile != NULL) {
+        profile->work_native_total++;
+        profile->work_native_calls[magic]++;
+    }
+    if (profile == NULL || profile->native_depth != 0)
+        return native->function(context, this_value, argc, argv);
+    uint64_t begin_ns = js_rt_monotonic_time_ns();
+    /* Close the caller's script interval at the call, so neither this
+       native's time nor script it calls back into inherits it. */
+    uint64_t before_us = profile->last_ns != 0 && begin_ns > profile->last_ns
+        ? (begin_ns - profile->last_ns) / UINT64_C(1000) : 0;
+    /* A longer gap is time outside this entry, as in the sampler. */
+    if (before_us <= UINT64_C(250000))
+        profile->pending_script_us += before_us;
+    else {
+        js_rt_saturating_add_u64(&profile->long_gap_us, before_us);
+        if (profile->long_gap_count != UINT32_MAX) profile->long_gap_count++;
+    }
+    profile->last_ns = begin_ns;
+    uint64_t inside_before =
+        profile->total_us + profile->gc_us + profile->host_us + profile->profiler_us;
+    profile->native_stack_top = JS_GetStackTop(owner->runtime);
+    profile->native_depth++;
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_NATIVE);
+    JSValue value = native->function(context, this_value, argc, argv);
+    work_ledger_leave(ledger);
+    /* The runtime may have released the profile (a report) meanwhile. */
+    profile = owner->profile;
+    if (profile == NULL) return value;
+    profile->native_depth = 0;
+    uint64_t now_ns = js_rt_monotonic_time_ns();
+    uint64_t us = now_ns > begin_ns ? (now_ns - begin_ns) / UINT64_C(1000) : 0;
+    uint64_t inside_after =
+        profile->total_us + profile->gc_us + profile->host_us + profile->profiler_us;
+    uint64_t inside = inside_after > inside_before
+        ? inside_after - inside_before : 0;
+    us = inside < us ? us - inside : 0;
+    profile->native_us[magic] += us;
+    profile->native_self_us += us;
+    profile->native_calls[magic]++;
+    profile->last_ns = now_ns;
+    profile->last_native = magic;
+    profile->last_native_end_ns = now_ns;
+    profile->last_native_us = us;
+    profile->last_native_inside_us = inside;
+    return value;
+}
+
+/* The value js_rt_install_function installs: the native itself, or, while
+   profiling, a timed trampoline carrying the same name and length. */
+static JSValue script_profile_native_value(JSContext *context,
+                                           JSCFunction *function,
+                                           const char *name, int arguments)
+{
+    if (!script_profile_enabled())
+        return JS_NewCFunction(context, function, name, arguments);
+    size_t index = 0;
+    while (index < script_profile_native_count
+           && script_profile_natives[index].function != function)
+        index++;
+    if (index == script_profile_native_count) {
+        if (index == SCRIPT_PROFILE_NATIVES)
+            return JS_NewCFunction(context, function, name, arguments);
+        script_profile_natives[index].function = function;
+        script_profile_natives[index].name = name;
+        script_profile_native_count++;
+    }
+    JSValue value = JS_NewCFunctionData(context, script_profile_native_call,
+                                        arguments, (int) index, 0, NULL);
+    if (JS_IsException(value)) return value;
+    if (JS_DefinePropertyValueStr(context, value, "name",
+                                  JS_NewString(context, name),
+                                  JS_PROP_CONFIGURABLE) < 0) {
+        JS_FreeValue(context, value);
+        return JS_EXCEPTION;
+    }
+    return value;
+}
+
+static bool script_profile_enabled(void)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    const char *setting = getenv("TILEFINCH_VALIDATION_JS_PROFILE");
+    return setting == NULL || strcmp(setting, "0") != 0;
+#elif defined(TILEFINCH_NO_TRACE)
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_JS_PROFILE") != NULL;
+    return enabled != 0;
+#endif
+}
+
+static uint64_t script_profile_outlier_threshold(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return 0;
+#else
+    static long threshold = -1;
+    if (threshold < 0) {
+        const char *value = getenv("TILEFINCH_JS_PROFILE_OUTLIER_US");
+        threshold = value == NULL ? 0 : atol(value);
+        if (threshold < 0) threshold = 0;
+    }
+    return (uint64_t) threshold;
+#endif
+}
+
+typedef struct {
+    uint64_t sampled, native, gc, host, profiler, unframed, long_gap;
+    uint64_t lazy_compiles, lazy_bytes;
+} ScriptProfileJobSnapshot;
+
+static ScriptProfileJobSnapshot script_profile_job_snapshot(ScriptRuntime *runtime)
+{
+    ScriptProfileJobSnapshot snapshot = {0};
+    const struct ScriptProfile *p = runtime->profile;
+    if (p != NULL && script_profile_outlier_threshold() != 0) {
+        JSLazyFunctionStats lazy;
+        JS_GetLazyFunctionStats(runtime->runtime, &lazy);
+        snapshot = (ScriptProfileJobSnapshot) {
+            p->total_us, p->native_self_us, p->gc_us, p->host_us,
+            p->profiler_us, p->unframed_us, p->long_gap_us,
+            lazy.compiled, lazy.compiled_source_bytes};
+    }
+    return snapshot;
+}
+
+static void script_profile_job_finish(ScriptRuntime *runtime,
+    ScriptProfileJobSnapshot before, uint64_t begin_ns)
+{
+    struct ScriptProfile *p = runtime->profile;
+    if (p == NULL) return;
+    p->job_begin_ns = 0;
+    uint64_t threshold = script_profile_outlier_threshold();
+    if (threshold == 0) return;
+    uint64_t wall = (js_rt_monotonic_time_ns() - begin_ns) / 1000u;
+    if (wall < threshold) return;
+    ScriptProfileJobSnapshot after = script_profile_job_snapshot(runtime);
+    char message[448];
+    snprintf(message, sizeof(message),
+        "tilefinch-promise-job: job=%llu wall-us=%llu sampled-us=%llu "
+        "native-us=%llu gc-us=%llu cooperate-us=%llu profiler-us=%llu unframed-us=%llu long-gap-us=%llu "
+        "lazy-compiles=%llu lazy-bytes=%llu",
+        (unsigned long long) begin_ns, (unsigned long long) wall,
+        (unsigned long long) (after.sampled - before.sampled),
+        (unsigned long long) (after.native - before.native),
+        (unsigned long long) (after.gc - before.gc),
+        (unsigned long long) (after.host - before.host),
+        (unsigned long long) (after.profiler - before.profiler),
+        (unsigned long long) (after.unframed - before.unframed),
+        (unsigned long long) (after.long_gap - before.long_gap),
+        (unsigned long long) (after.lazy_compiles - before.lazy_compiles),
+        (unsigned long long) (after.lazy_bytes - before.lazy_bytes));
+    script_profile_emit(message);
+}
+
+/* Ordinary trace-free builds cannot allocate ScriptProfile (see
+   script_profile_enabled). Do not retain a dormant stack sampler, or put
+   its pointer checks on the interrupt path. Validation keeps the sampler
+   even though its general trace switch is off. */
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+static bool script_profile_charge(JSContext *context, ScriptProfileSlot *slots,
+                                  JSAtom file, JSAtom function, int line,
+                                  int column, int defline, int defcol,
+                                  uint64_t us, uint64_t *evicted_us)
+{
+    ScriptProfileSlot *empty = NULL;
+    for (size_t i = 0; i < SCRIPT_PROFILE_SLOTS; i++) {
+        ScriptProfileSlot *slot = &slots[i];
+        if (slot->samples == 0) {
+            if (empty == NULL) empty = slot;
+            continue;
+        }
+        if (slot->file == file && slot->function == function
+            && slot->line == line && slot->column == column
+            && slot->defline == defline && slot->defcol == defcol) {
+            slot->us += us;
+            slot->samples++;
+            return true;
+        }
+    }
+    if (empty == NULL) {
+        /* Full (minified bundles spread one function over many columns):
+           replace the lightest slot and keep its time, so heavy hitters
+           survive and the table never silently drops time. */
+        ScriptProfileSlot *lightest = &slots[0];
+        for (size_t i = 1; i < SCRIPT_PROFILE_SLOTS; i++)
+            if (slots[i].us < lightest->us) lightest = &slots[i];
+        if (evicted_us != NULL) *evicted_us += lightest->us;
+        if (lightest->file != JS_ATOM_NULL)
+            JS_FreeAtom(context, lightest->file);
+        if (lightest->function != JS_ATOM_NULL)
+            JS_FreeAtom(context, lightest->function);
+        uint64_t inherited = lightest->us;
+        uint32_t samples = lightest->samples;
+        lightest->file = file == JS_ATOM_NULL
+            ? file : JS_DupAtom(context, file);
+        lightest->function = function == JS_ATOM_NULL
+            ? function : JS_DupAtom(context, function);
+        lightest->line = line;
+        lightest->column = column;
+        lightest->defline = defline;
+        lightest->defcol = defcol;
+        lightest->us = inherited + us;
+        lightest->samples = samples + 1u;
+        return true;
+    }
+    empty->file = file == JS_ATOM_NULL ? file : JS_DupAtom(context, file);
+    empty->function = function == JS_ATOM_NULL
+        ? function : JS_DupAtom(context, function);
+    empty->line = line;
+    empty->column = column;
+    empty->defline = defline;
+    empty->defcol = defcol;
+    empty->us = us;
+    empty->samples = 1;
+    return true;
+}
+
+/* Allocation-free apart from atom reference counts: runs in the QuickJS
+   interrupt handler. */
+static void script_profile_sample(ScriptRuntime *owner, uint64_t now_ns)
+{
+    struct ScriptProfile *profile = owner->profile;
+    if (profile == NULL) return;
+    uint64_t us = profile->last_ns != 0 && now_ns > profile->last_ns
+        ? (now_ns - profile->last_ns) / UINT64_C(1000) : 0;
+    profile->last_ns = now_ns;
+    /* Collections since the last poll are reported on their own; script
+       time that ran before a timed native is charged here. */
+    uint64_t gc_us = profile->gc_unsampled_us;
+    profile->gc_unsampled_us = 0;
+    us = gc_us < us ? us - gc_us : 0;
+    /* A native that checkpoints (style resolution, task and import
+       boundaries) polls from inside itself: the time since it began is its
+       own, left to its timer; only the script before the call is charged,
+       to the calling frame. */
+    if (profile->native_depth != 0
+        && JS_GetStackTop(owner->runtime) == profile->native_stack_top)
+        us = 0;
+    uint64_t pending_us = profile->pending_script_us;
+    us += pending_us;
+    profile->pending_script_us = 0;
+    /* A gap longer than a slice is time outside this entry. */
+    if (us == 0) return;
+    if (us > UINT64_C(250000)) {
+        js_rt_saturating_add_u64(&profile->long_gap_us, us);
+        if (profile->long_gap_count != UINT32_MAX) profile->long_gap_count++;
+        return;
+    }
+    profile->samples++;
+    profile->total_us += us;
+    int phase = profile->phase;
+    /* TILEFINCH_JS_PROFILE_OUTLIER_US: print the stack and the last native
+       of every sample interval at least that long. */
+    {
+        uint64_t threshold = script_profile_outlier_threshold();
+        if (threshold > 0 && us >= threshold) {
+            char line_buf[1800];
+            int n = snprintf(line_buf, sizeof(line_buf),
+                             "tilefinch-js-outlier us=%llu phase=%d site=%d job=%llu "
+                             "last-native=%s ago-us=%llu native-us=%llu inside-us=%llu stack=",
+                             (unsigned long long) us, phase, profile->micro_site,
+                             (unsigned long long) profile->job_begin_ns,
+                             profile->last_native >= 0
+                                 && (size_t) profile->last_native < script_profile_native_count
+                                 ? script_profile_natives[profile->last_native].name : "-",
+                             (unsigned long long) (now_ns > profile->last_native_end_ns
+                                 ? (now_ns - profile->last_native_end_ns) / 1000u : 0),
+                             (unsigned long long) profile->last_native_us,
+                             (unsigned long long) profile->last_native_inside_us);
+            for (int level = 0; level < 12 && n < (int) sizeof(line_buf) - 140; level++) {
+                JSAtom function = JS_ATOM_NULL, file = JS_ATOM_NULL;
+                int line = 0, column = 0, defline = 0, defcol = 0;
+                if (!JS_GetStackFrameInfo(owner->context, level, &function, &file,
+                                          &line, &column)) break;
+                const char *fs = file == JS_ATOM_NULL ? "?" : JS_AtomToCString(owner->context, file);
+                const char *fn = function == JS_ATOM_NULL ? "" : JS_AtomToCString(owner->context, function);
+                const char *base = fs == NULL ? NULL : strrchr(fs, '/');
+                (void) JS_GetStackFrameDefinition(owner->context, level, &defline, &defcol);
+                n += snprintf(line_buf + n, sizeof(line_buf) - (size_t) n, "%s%.40s:%.24s:%d:%d@%d:%d",
+                              level ? "<" : "", base ? base + 1 : (fs ? fs : "?"),
+                              fn == NULL || fn[0] == 0 ? "anon" : fn, line, column, defline, defcol);
+                if (fs != NULL && file != JS_ATOM_NULL) JS_FreeCString(owner->context, fs);
+                if (fn != NULL && function != JS_ATOM_NULL) JS_FreeCString(owner->context, fn);
+            }
+            script_profile_emit(line_buf);
+        }
+    }
+    if (phase > 0 && phase <= 2) {
+        profile->micro_us[phase] += us;
+        profile->micro_samples[phase]++;
+        if (profile->micro_site >= 0 && profile->micro_site < 4)
+            profile->micro_site_us[profile->micro_site] += us;
+    }
+    /* Inclusive slots are keyed by the function's definition line/column
+       too, so anonymous functions do not merge; recursion is detected by
+       definition, not name. */
+    struct { JSAtom file, function; int defline, defcol; } seen[SCRIPT_PROFILE_DEPTH * 2];
+    size_t seen_count = 0;
+    bool self_done = false;
+    JSAtom outer_function = JS_ATOM_NULL, outer_file = JS_ATOM_NULL;
+    int outer_defline = 0, outer_defcol = 0;
+    bool outer_seen = false;
+    bool outer_complete = false;
+    for (int level = 0; level < 64; level++) {
+        JSAtom function = JS_ATOM_NULL, file = JS_ATOM_NULL;
+        int line = 0, column = 0, defline = 0, defcol = 0;
+        if (!JS_GetStackFrameInfo(owner->context, level, &function, &file,
+                                  &line, &column)) {
+            outer_complete = true;
+            break;
+        }
+        /* A native frame is innermost only when a native polls (task and
+           import checkpoints): the time belongs to the script that called
+           it. */
+        if (line < 0) continue;
+        (void) JS_GetStackFrameDefinition(owner->context, level, &defline,
+                                          &defcol);
+        outer_function = function; outer_file = file;
+        outer_defline = defline; outer_defcol = defcol; outer_seen = true;
+        /* Bootstrap code is stripped of file names and lines: an anonymous
+           bootstrap function is charged as such rather than to its named
+           parent, so bootstrap overhead stays visible. */
+        if (!self_done) {
+            self_done = true;
+            if (!script_profile_charge(owner->context, profile->self, file,
+                                       function, line, column, defline,
+                                       defcol, us, &profile->evicted_us))
+                profile->dropped_us += us;
+            if (phase > 0)
+                (void) script_profile_charge(owner->context,
+                                             profile->micro_self, file,
+                                             function, line, column, defline,
+                                             defcol, us, NULL);
+        }
+        if (seen_count >= SCRIPT_PROFILE_DEPTH * 2) continue;
+        bool repeated = false;
+        for (size_t i = 0; i < seen_count; i++)
+            if (seen[i].file == file && seen[i].function == function
+                && seen[i].defline == defline
+                && seen[i].defcol == defcol) repeated = true;
+        if (repeated) continue;
+        seen[seen_count].function = function;
+        seen[seen_count].file = file;
+        seen[seen_count].defline = defline;
+        seen[seen_count].defcol = defcol;
+        seen_count++;
+        (void) script_profile_charge(owner->context, profile->inclusive,
+                                     file, function, 0, 0, defline, defcol,
+                                     us, NULL);
+        if (phase > 0)
+            (void) script_profile_charge(owner->context,
+                                         profile->micro_inclusive, file,
+                                         function, 0, 0, defline, defcol,
+                                         us, NULL);
+    }
+    if (!self_done) {
+        profile->unframed_us += us;
+        profile->unframed_pending_us += pending_us;
+        if (profile->compile_depth) profile->unframed_compile_us += us - pending_us;
+        else if (profile->returning_from_script) profile->unframed_tail_us += us - pending_us;
+        else if (profile->checkpoint_depth) profile->unframed_checkpoint_us += us - pending_us;
+        else profile->unframed_entry_us += us - pending_us;
+    }
+    if (phase > 0 && outer_seen)
+        (void) script_profile_charge(owner->context, profile->micro_outer,
+                                     outer_file, outer_function, 0, 0,
+                                     outer_defline, outer_defcol, us, NULL);
+    /* The printed stack can end inside a deep framework. The existing
+       walk reaches farther, but also has a cap: explicitly distinguish a
+       complete root from a depth-limited ancestor, never infer a callback
+       identity from the latter. */
+    uint64_t threshold = script_profile_outlier_threshold();
+    if (profile->job_begin_ns != 0 && outer_seen && threshold != 0
+        && us >= threshold) {
+        const char *file = outer_file == JS_ATOM_NULL ? NULL
+            : JS_AtomToCString(owner->context, outer_file);
+        const char *function = outer_function == JS_ATOM_NULL ? NULL
+            : JS_AtomToCString(owner->context, outer_function);
+        const char *base = file == NULL ? NULL : strrchr(file, '/');
+        char message[320];
+        snprintf(message, sizeof(message),
+            "tilefinch-promise-root: job=%llu us=%llu complete=%d at=%.100s:%.60s@%d:%d",
+            (unsigned long long) profile->job_begin_ns,
+            (unsigned long long) us,
+            outer_complete ? 1 : 0,
+            base != NULL ? base + 1 : file != NULL ? file : "<bootstrap>",
+            function != NULL && function[0] ? function : "<anon>",
+            outer_defline, outer_defcol);
+        script_profile_emit(message);
+        if (file != NULL) JS_FreeCString(owner->context, file);
+        if (function != NULL) JS_FreeCString(owner->context, function);
+    }
+}
+
+/* A short callback may return without another VM poll. Close its final
+   interval before host bookkeeping; otherwise the next empty-stack
+   checkpoint inherits that work, or the next entry discards it. */
+static void script_profile_leave(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->profile == NULL
+        || JS_IsStackActive(runtime->runtime)) return;
+    struct ScriptProfile *profile = runtime->profile;
+    uint64_t before = js_rt_monotonic_time_ns();
+    profile->returning_from_script = true;
+    script_profile_sample(runtime, before);
+    profile->returning_from_script = false;
+    uint64_t after = js_rt_monotonic_time_ns();
+    if (after > before) profile->profiler_us += (after - before) / 1000u;
+    profile->last_ns = after;
+}
+#else
+static void script_profile_leave(ScriptRuntime *runtime)
+{
+    (void) runtime;
+}
+#endif
+
+static void script_profile_release(JSContext *context,
+                                   struct ScriptProfile *profile)
+{
+    ScriptProfileSlot *tables[5] = {profile->self, profile->inclusive,
+                                    profile->micro_inclusive,
+                                    profile->micro_outer, profile->micro_self};
+    for (size_t t = 0; t < 5; t++) {
+        for (size_t i = 0; i < SCRIPT_PROFILE_SLOTS; i++) {
+            ScriptProfileSlot *slot = &tables[t][i];
+            if (slot->samples == 0) continue;
+            if (slot->file != JS_ATOM_NULL) JS_FreeAtom(context, slot->file);
+            if (slot->function != JS_ATOM_NULL)
+                JS_FreeAtom(context, slot->function);
+        }
+    }
+    uint64_t last_ns = profile->last_ns;
+    unsigned compile_depth = profile->compile_depth;
+    unsigned checkpoint_depth = profile->checkpoint_depth;
+    memset(profile, 0, offsetof(struct ScriptProfile, work_native_total));
+    profile->last_ns = last_ns;
+    profile->compile_depth = compile_depth;
+    profile->checkpoint_depth = checkpoint_depth;
+}
+
+/* The device log captures engine lines through the platform logger; the
+   host lab prints them. */
+static void script_profile_emit(const char *message)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    tilefinch_platform_log_message(message);
+#elif defined(TILEFINCH_NATIVE_TIER_LAB)
+    /* Whole-page lab diagnostics share one stream with its job trace. The
+       replay runner merges stdout/stderr; splitting a line across buffered
+       stdout and unbuffered stderr corrupts the attribution record. */
+    fprintf(stderr, "%s\n", message);
+#else
+    printf("%s\n", message);
+#endif
+}
+
+/* Rows per table: 12, or TILEFINCH_JS_PROFILE_RANKS (up to SCRIPT_PROFILE_SLOTS) on the
+   host for a deeper look. */
+static int script_profile_ranks(void)
+{
+#if defined(TILEFINCH_PSP_VALIDATION_LOG) || defined(TILEFINCH_NO_TRACE)
+    return 12;
+#else
+    static int ranks = -1;
+    if (ranks < 0) {
+        const char *value = getenv("TILEFINCH_JS_PROFILE_RANKS");
+        ranks = value == NULL ? 12 : atoi(value);
+        if (ranks < 1 || ranks > (int) SCRIPT_PROFILE_SLOTS) ranks = 12;
+    }
+    return ranks;
+#endif
+}
+
+static void script_profile_print_table(JSContext *context, const char *label,
+                                       const char *kind,
+                                       ScriptProfileSlot *slots)
+{
+    for (int rank = 0; rank < script_profile_ranks(); rank++) {
+        ScriptProfileSlot *best = NULL;
+        for (size_t i = 0; i < SCRIPT_PROFILE_SLOTS; i++) {
+            ScriptProfileSlot *slot = &slots[i];
+            if (slot->samples == 0 || slot->line < 0) continue;
+            if (best == NULL || slot->us > best->us) best = slot;
+        }
+        if (best == NULL) break;
+        const char *file = best->file == JS_ATOM_NULL ? NULL
+            : JS_AtomToCString(context, best->file);
+        const char *function = best->function == JS_ATOM_NULL ? NULL
+            : JS_AtomToCString(context, best->function);
+        const char *base = file == NULL ? NULL : strrchr(file, '/');
+        char message[320];
+        snprintf(message, sizeof(message),
+               "tilefinch-js-profile: label=%s %s rank=%d ms=%llu "
+               "samples=%u at=%s:%s:%d:%d fn=%d:%d us=%llu", label, kind, rank,
+               (unsigned long long) (best->us / 1000u), best->samples,
+               base == NULL ? (file == NULL ? "<bootstrap>" : file) : base + 1,
+               function == NULL || function[0] == '\0' ? "<anon>" : function,
+               best->line, best->column, best->defline, best->defcol,
+               (unsigned long long) best->us);
+        script_profile_emit(message);
+        if (file != NULL) JS_FreeCString(context, file);
+        if (function != NULL) JS_FreeCString(context, function);
+        best->line = -1 - best->line; /* mark printed */
+    }
+}
+
+/* Per-function call counts (PSP_BROWSER_JS_CALL_COUNTS builds): the
+   rows are allocated only while a report prints. */
+typedef struct {
+    JSContext *context;
+    JSAtom file;
+    JSAtom function;
+    int line;
+    int column;
+    uint32_t calls;
+} ScriptProfileCallRow;
+#define SCRIPT_PROFILE_CALL_ROWS 16384u
+static ScriptProfileCallRow *script_profile_call_rows;
+static size_t script_profile_call_row_count;
+static uint64_t script_profile_call_total;
+
+static void script_profile_collect_calls(void *opaque, JSContext *ctx,
+                                         JSAtom file, JSAtom function,
+                                         int line, int column, uint32_t calls)
+{
+    (void) opaque;
+    script_profile_call_total += calls;
+    if (script_profile_call_rows == NULL
+        || script_profile_call_row_count == SCRIPT_PROFILE_CALL_ROWS) return;
+    ScriptProfileCallRow *row =
+        &script_profile_call_rows[script_profile_call_row_count++];
+    row->context = ctx;
+    row->file = file;
+    row->function = function;
+    row->line = line;
+    row->column = column;
+    row->calls = calls;
+}
+
+static int script_profile_call_row_compare(const void *a, const void *b)
+{
+    const ScriptProfileCallRow *x = a, *y = b;
+    return x->calls < y->calls ? 1 : x->calls > y->calls ? -1 : 0;
+}
+
+static void script_profile_print_calls(ScriptRuntime *runtime,
+                                       const char *label)
+{
+    script_profile_call_row_count = 0;
+    script_profile_call_total = 0;
+    script_profile_call_rows =
+        malloc(SCRIPT_PROFILE_CALL_ROWS * sizeof(*script_profile_call_rows));
+    if (script_profile_call_rows == NULL) return;
+    if (!JS_ProfileForEachBytecode(runtime->runtime,
+                                   script_profile_collect_calls, NULL, 1)) {
+        free(script_profile_call_rows);
+        script_profile_call_rows = NULL;
+        return;
+    }
+    qsort(script_profile_call_rows, script_profile_call_row_count,
+          sizeof(script_profile_call_rows[0]),
+          script_profile_call_row_compare);
+    char message[320];
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s calls total=%llu functions=%zu",
+             label == NULL ? "" : label,
+             (unsigned long long) script_profile_call_total,
+             script_profile_call_row_count);
+    script_profile_emit(message);
+    int ranks = script_profile_ranks();
+    for (size_t i = 0; i < script_profile_call_row_count && (int) i < ranks;
+         i++) {
+        ScriptProfileCallRow *row = &script_profile_call_rows[i];
+        const char *file = row->file == JS_ATOM_NULL ? NULL
+            : JS_AtomToCString(row->context, row->file);
+        const char *function = row->function == JS_ATOM_NULL ? NULL
+            : JS_AtomToCString(row->context, row->function);
+        const char *base = file == NULL ? NULL : strrchr(file, '/');
+        snprintf(message, sizeof(message),
+                 "tilefinch-js-profile: label=%s calls rank=%zu calls=%u "
+                 "at=%s:%s fn=%d:%d", label == NULL ? "" : label, i,
+                 row->calls,
+                 base == NULL ? (file == NULL ? "<bootstrap>" : file) : base + 1,
+                 function == NULL || function[0] == '\0' ? "<anon>" : function,
+                 row->line, row->column);
+        script_profile_emit(message);
+        if (file != NULL) JS_FreeCString(row->context, file);
+        if (function != NULL) JS_FreeCString(row->context, function);
+    }
+    free(script_profile_call_rows);
+    script_profile_call_rows = NULL;
+}
+
+void script_runtime_profile_report(ScriptRuntime *runtime, const char *label)
+{
+    if (runtime == NULL || runtime->profile == NULL
+        || runtime->context == NULL) return;
+    struct ScriptProfile *profile = runtime->profile;
+    char message[384];
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s samples=%u total-ms=%llu "
+             "evicted-ms=%llu host-ms=%llu gc=%u gc-ms=%llu gc-max-ms=%llu "
+             "total-us=%llu unframed-us=%llu long-gap-us=%llu long-gap-count=%u",
+             label == NULL ? "" : label, profile->samples,
+             (unsigned long long) (profile->total_us / 1000u),
+             (unsigned long long)
+                 ((profile->dropped_us + profile->evicted_us) / 1000u),
+             (unsigned long long) (profile->host_us / 1000u),
+             profile->gc_count,
+             (unsigned long long) (profile->gc_us / 1000u),
+             (unsigned long long) (profile->gc_max_us / 1000u),
+             (unsigned long long) profile->total_us,
+             (unsigned long long) profile->unframed_us,
+             (unsigned long long) profile->long_gap_us,
+             (unsigned) profile->long_gap_count);
+    script_profile_emit(message);
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s unframed pending-us=%llu compile-us=%llu "
+             "checkpoint-us=%llu entry-us=%llu tail-us=%llu profiler-us=%llu",
+             label == NULL ? "" : label,
+             (unsigned long long) profile->unframed_pending_us,
+             (unsigned long long) profile->unframed_compile_us,
+             (unsigned long long) profile->unframed_checkpoint_us,
+             (unsigned long long) profile->unframed_entry_us,
+             (unsigned long long) profile->unframed_tail_us,
+             (unsigned long long) profile->profiler_us);
+    script_profile_emit(message);
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s attribute-writes=%zu "
+             "unchanged=%zu native-ms=%llu", label == NULL ? "" : label,
+             runtime->bridge.attribute_writes,
+             runtime->bridge.attribute_writes_unchanged,
+             (unsigned long long)
+                 (runtime->bridge.attribute_write_ns / UINT64_C(1000000)));
+    script_profile_emit(message);
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s heap live=%zu limit=%zu "
+             "window=%zu growth=%d raises=%zu pregrows=%zu "
+             "refusals=%zu returns=%zu", label == NULL ? "" : label,
+             budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool),
+             runtime->base_memory_limit,
+             runtime->boot_window_active ? runtime->boot_window_bytes : 0,
+             runtime->heap_growth_enabled ? 1 : 0,
+             runtime->heap_growth_raises, runtime->heap_growth_pregrows,
+             runtime->heap_growth_refusals, runtime->heap_growth_returns);
+    script_profile_emit(message);
+    runtime->work_attribute_writes_reported += runtime->bridge.attribute_writes;
+    runtime->bridge.attribute_writes = 0;
+    runtime->bridge.attribute_writes_unchanged = 0;
+    runtime->bridge.attribute_write_ns = 0;
+    uint64_t native_total_us = 0;
+    for (size_t i = 0; i < script_profile_native_count; i++)
+        native_total_us += profile->native_us[i];
+    __typeof__(runtime->bridge.computed_style_cache) *style_cache =
+        &runtime->bridge.computed_style_cache;
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s native-ms=%llu "
+             "style-cache=%zu/%zu clears=%zu/%zu host-clears=%zu bytes=%zu "
+             "var-cache=%zu/%zu var-clears=%zu style-probes=%zu",
+             label == NULL ? "" : label,
+             (unsigned long long) (native_total_us / 1000u),
+             style_cache->hits, style_cache->misses,
+             style_cache->scoped_clears, style_cache->full_clears,
+             style_cache->host_clears,
+             js_rt_bridge_computed_style_cache_bytes(&runtime->bridge),
+             style_cache->variables.hits, style_cache->variables.misses,
+             style_cache->variables.clears, style_cache->lookup_probes);
+    style_cache->hits = 0;
+    style_cache->misses = 0;
+    style_cache->lookup_probes = 0;
+    style_cache->scoped_clears = 0;
+    style_cache->full_clears = 0;
+    style_cache->host_clears = 0;
+    style_cache->variables.hits = 0;
+    style_cache->variables.misses = 0;
+    style_cache->variables.clears = 0;
+    script_profile_emit(message);
+    for (int rank = 0; rank < script_profile_ranks(); rank++) {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < script_profile_native_count; i++)
+            if (profile->native_calls[i] != 0
+                && (best == SIZE_MAX
+                    || profile->native_us[i] > profile->native_us[best]))
+                best = i;
+        if (best == SIZE_MAX || profile->native_us[best] < 1000u) break;
+        snprintf(message, sizeof(message),
+                 "tilefinch-js-profile: label=%s native rank=%d ms=%llu "
+                 "calls=%u at=%s", label == NULL ? "" : label, rank,
+                 (unsigned long long) (profile->native_us[best] / 1000u),
+                 profile->native_calls[best],
+                 script_profile_natives[best].name);
+        script_profile_emit(message);
+        profile->native_calls[best] = 0;
+    }
+    script_profile_print_table(runtime->context, label, "self",
+                               profile->self);
+    script_profile_print_table(runtime->context, label, "inclusive",
+                               profile->inclusive);
+    /* Microtask phase: promise jobs by run_jobs call site, their outermost
+       frames, and inclusive/self time inside them. */
+    snprintf(message, sizeof(message),
+             "tilefinch-js-profile: label=%s microtask promise-job-ms=%llu "
+             "samples=%u continuation-ms=%llu samples=%u "
+             "site-ms other=%llu entry=%llu network=%llu timer=%llu",
+             label == NULL ? "" : label,
+             (unsigned long long) (profile->micro_us[1] / 1000u),
+             profile->micro_samples[1],
+             (unsigned long long) (profile->micro_us[2] / 1000u),
+             profile->micro_samples[2],
+             (unsigned long long) (profile->micro_site_us[0] / 1000u),
+             (unsigned long long) (profile->micro_site_us[1] / 1000u),
+             (unsigned long long) (profile->micro_site_us[2] / 1000u),
+             (unsigned long long) (profile->micro_site_us[3] / 1000u));
+    script_profile_emit(message);
+    script_profile_print_table(runtime->context, label, "micro-outer",
+                               profile->micro_outer);
+    script_profile_print_table(runtime->context, label, "micro-inclusive",
+                               profile->micro_inclusive);
+    script_profile_print_table(runtime->context, label, "micro-self",
+                               profile->micro_self);
+    script_profile_print_calls(runtime, label);
+    script_profile_release(runtime->context, profile);
+}
+
+uint32_t script_runtime_work_counters(const ScriptRuntime *runtime,
+                                      uint64_t work[SCRIPT_WORK_COUNT])
+{
+    uint32_t missing = (1u << SCRIPT_WORK_CALLS)
+        | (1u << SCRIPT_WORK_BYTECODE_OPS) | (1u << SCRIPT_WORK_FLOAT64_BOXES)
+        | (1u << SCRIPT_WORK_NATIVE_CALLS);
+    memset(work, 0, SCRIPT_WORK_COUNT * sizeof(work[0]));
+    if (runtime == NULL) return missing;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    _Static_assert(SCRIPT_WORK_LAZY_BYTES == JS_WORK_LAZY_BYTES
+                   && SCRIPT_WORK_CALLS == JS_WORK_CALLS,
+                   "script work leads with the engine's counters");
+    if (runtime->runtime != NULL)
+        missing = (uint32_t) JS_GetWorkCounters(runtime->runtime, work)
+            | (1u << SCRIPT_WORK_NATIVE_CALLS);
+#endif
+    if (runtime->profile != NULL) {
+        missing &= ~(1u << SCRIPT_WORK_NATIVE_CALLS);
+        work[SCRIPT_WORK_NATIVE_CALLS] = runtime->profile->work_native_total;
+    }
+    work[SCRIPT_WORK_ATTRIBUTE_WRITES] = runtime->work_attribute_writes_reported
+        + runtime->bridge.attribute_writes;
+    BudgetQuickJSActivity activity;
+    budget_quickjs_pool_activity(runtime->quickjs_pool, &activity);
+    work[SCRIPT_WORK_ALLOCS] =
+        activity.allocation_calls + activity.reallocation_calls;
+    work[SCRIPT_WORK_ALLOC_BYTES] =
+        activity.allocated_bytes + activity.reallocated_bytes;
+    work[SCRIPT_WORK_SOURCE_BYTES] = runtime->bridge.script_quota_bytes;
+    work[SCRIPT_WORK_MODULE_COMPILES] = runtime->result.module_compile_count;
+    work[SCRIPT_WORK_MODULE_RESTORES] =
+        runtime->result.module_bytecode_cache_hits;
+    work[SCRIPT_WORK_DOM_MUTATIONS] = runtime->result.dom_mutations;
+    /* MutationObserver routing lives in the bootstrap (dom.js): read its
+       counters as plain numbers, running no script and allocating nothing
+       (the property atoms already exist). */
+    if (runtime->context == NULL || runtime->runtime == NULL
+        || JS_IsStackActive(runtime->runtime))
+        return missing;
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue stats = JS_GetPropertyStr(runtime->context, global,
+                                      "__tilefinchRetentionStats");
+    JS_FreeValue(runtime->context, global);
+    static const char *const names[2] = {"mutationRecords", "observerVisits"};
+    for (size_t i = 0; i < 2 && JS_IsObject(stats); i++) {
+        JSValue value = JS_GetPropertyStr(runtime->context, stats, names[i]);
+        double number = 0;
+        if (JS_IsNumber(value)
+            && JS_ToFloat64(runtime->context, &number, value) == 0
+            && number >= 0)
+            work[SCRIPT_WORK_MUTATION_RECORDS + i] = (uint64_t) number;
+        JS_FreeValue(runtime->context, value);
+    }
+    JS_FreeValue(runtime->context, stats);
+    return missing;
+}
+
+size_t script_runtime_opcode_counts(const ScriptRuntime *runtime,
+                                    const char **names, uint64_t *counts,
+                                    size_t capacity)
+{
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    if (runtime != NULL && runtime->runtime != NULL)
+        return JS_GetOpcodeCounts(runtime->runtime, names, counts, capacity);
+#else
+    (void) runtime; (void) names; (void) counts; (void) capacity;
+#endif
+    return 0;
+}
+
+void script_runtime_report_pool_traffic(const ScriptRuntime *runtime,
+                                        const char *label, FILE *output)
+{
+    if (runtime == NULL) return;
+    budget_quickjs_pool_report_traffic(runtime->quickjs_pool, label, output);
+}
+
+size_t script_runtime_work_top_natives(const ScriptRuntime *runtime,
+                                       size_t limit, const char **names,
+                                       uint64_t *calls)
+{
+    const struct ScriptProfile *profile =
+        runtime == NULL ? NULL : runtime->profile;
+    size_t count = 0;
+    /* Insertion into the short ranked list: by calls, then registration
+       order, so equal counts list deterministically. Marks only. */
+    for (size_t i = 0; profile != NULL && i < script_profile_native_count;
+         i++) {
+        uint32_t value = profile->work_native_calls[i];
+        size_t at = count;
+        while (at > 0 && calls[at - 1] < value) at--;
+        if (value == 0 || at >= limit) continue;
+        if (count < limit) count++;
+        for (size_t j = count - 1; j > at; j--) {
+            calls[j] = calls[j - 1];
+            names[j] = names[j - 1];
+        }
+        calls[at] = value;
+        names[at] = script_profile_natives[i].name;
+    }
+    return count;
+}
+
+static int interrupt_handler_service(JSRuntime *runtime, Watchdog *watchdog,
+                                     uint64_t now_ns, uint64_t now);
+
+/* Which code the JS time since the previous poll most likely belongs to
+   (script_split.h): the innermost bytecode frame's origin, or a built-in
+   that polls from its own bounded loop. Stripped bootstrap functions carry
+   no file name. */
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+static void interrupt_split_sample(ScriptRuntime *owner)
+{
+    if (!script_split_sampling() || owner == NULL || owner->context == NULL)
+        return;
+    bool in_js = script_split_current() == SCRIPT_SPLIT_JS;
+    ScriptSplitSample sample = SCRIPT_SPLIT_SAMPLE_PAGE;
+    /* Origin only: the line (JS_GetStackFrameInfo) would decode the
+       function's pc-to-line table on every poll. */
+    for (int level = 0; level < 4; level++) {
+        int origin = JS_GetStackFrameOrigin(owner->context, level);
+        if (origin == JS_FRAME_ORIGIN_NONE) break;
+        if (origin == JS_FRAME_ORIGIN_NATIVE) {
+            if (level == 0 && in_js) {
+                sample = SCRIPT_SPLIT_SAMPLE_NATIVE;
+                break;
+            }
+            continue;
+        }
+        sample = origin == JS_FRAME_ORIGIN_ANONYMOUS
+            ? SCRIPT_SPLIT_SAMPLE_BOOTSTRAP : SCRIPT_SPLIT_SAMPLE_PAGE;
+        break;
+    }
+    script_split_poll(sample);
+}
+#endif
+
 static int interrupt_handler(JSRuntime *runtime, void *opaque)
 {
-#if !defined(CONFIG_EXECUTION_PROFILE)
-    (void) runtime;
-#endif
     Watchdog *watchdog = opaque;
     uint64_t now_ns = js_rt_monotonic_time_ns();
     uint64_t now = now_ns / UINT64_C(1000000);
     watchdog->polls++;
     watchdog_add_work(watchdog, 1);
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    ScriptRuntime *profiled = (ScriptRuntime *) (void *)
+        ((char *) watchdog - offsetof(ScriptRuntime, watchdog));
+    interrupt_split_sample(profiled);
+    if (profiled->profile != NULL) script_profile_sample(profiled, now_ns);
+    else profiled = NULL;
+    uint64_t sampled_ns = profiled == NULL ? now_ns : js_rt_monotonic_time_ns();
+    if (profiled != NULL && sampled_ns > now_ns)
+        profiled->profile->profiler_us += (sampled_ns - now_ns) / 1000u;
+#endif
+    unsigned split = script_split_enter(SCRIPT_SPLIT_HOST);
+    int verdict = interrupt_handler_service(runtime, watchdog, now_ns, now);
+    script_split_leave(split);
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* The rest of this poll was host work: restart the sampler after it. */
+    if (profiled != NULL && profiled->profile != NULL) {
+        uint64_t after_ns = js_rt_monotonic_time_ns();
+        if (after_ns > sampled_ns)
+            profiled->profile->host_us +=
+                (after_ns - sampled_ns) / UINT64_C(1000);
+        profiled->profile->last_ns = after_ns;
+    }
+#endif
+    return verdict;
+}
+
+static int interrupt_handler_service(JSRuntime *runtime, Watchdog *watchdog,
+                                     uint64_t now_ns, uint64_t now)
+{
+#if !defined(CONFIG_EXECUTION_PROFILE)
+    (void) runtime;
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Sample at most once a second while JavaScript keeps running: one long
+       entry, or a stream of short microtasks that together hold an advance
+       (a 64-job checkpoint of 30 ms jobs is two seconds on Allegrex). */
+    static uint64_t next_sample_ms;
+    if (now >= watchdog->started_ms && now - watchdog->started_ms >= 20u
+        && now >= next_sample_ms) {
+        if (next_sample_ms != 0)
+            watchdog_log_long_task(watchdog, now - watchdog->started_ms);
+        next_sample_ms = now + 1000u;
+    }
+#endif
     /* Four polls amortize cheap calls, but are not a time bound: on Allegrex
        a single VM/native unit can take tens of milliseconds. Service input
        at the next safe poll once the slice has used eight milliseconds. */
@@ -94,6 +1258,9 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
         && now_ns - watchdog->slice_started_ns >= UINT64_C(8000000);
     if ((watchdog->slice_work_units >= 4 || slice_expired)
         && !watchdog_cooperate(watchdog)) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        watchdog_log_interrupt(watchdog, "cooperate", now);
+#endif
 #ifndef TILEFINCH_NO_TRACE
         if (tilefinch_trace_js_interrupts()) {
             fprintf(stderr,
@@ -122,6 +1289,9 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
 #endif
     if (now >= watchdog->deadline_ms) {
         watchdog->interrupted = true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        watchdog_log_interrupt(watchdog, "deadline", now);
+#endif
 #ifndef TILEFINCH_NO_TRACE
         if (tilefinch_trace_js_interrupts()) {
             fprintf(stderr,
@@ -144,8 +1314,11 @@ bool js_rt_runtime_native_checkpoint(ScriptRuntime *runtime)
     /* A native import/export is work inside the current task, not a new
        asynchronous callback. Share the VM's work/time cooperative cadence;
        interrupt_handler still checks the wall deadline on every boundary. */
-    return runtime != NULL && !runtime->watchdog.interrupted
-        && interrupt_handler(runtime->runtime, &runtime->watchdog) == 0;
+    if (runtime == NULL || runtime->watchdog.interrupted) return false;
+    if (runtime->profile != NULL) runtime->profile->checkpoint_depth++;
+    bool okay = interrupt_handler(runtime->runtime, &runtime->watchdog) == 0;
+    if (runtime->profile != NULL) runtime->profile->checkpoint_depth--;
+    return okay;
 }
 
 bool js_rt_runtime_callback_checkpoint(ScriptRuntime *runtime)
@@ -201,7 +1374,7 @@ static void runtime_report_heap_failure(ScriptRuntime *runtime)
     runtime->heap_failure_census_reported = true;
     JSMemoryUsage usage;
     uint64_t started_ns = js_rt_monotonic_time_ns();
-    JS_ComputeMemoryUsage(runtime->runtime, &usage);
+    js_rt_heap_census(runtime, &usage);
     BudgetQuickJSActivity activity;
     budget_quickjs_pool_activity(runtime->quickjs_pool, &activity);
     char diagnostic[768];
@@ -413,6 +1586,35 @@ static void promise_rejection_tracker(JSContext *context,
         }
         JS_FreeCString(context, stack);
     }
+    /* A SyntaxError from a deferred compile (a lazy function's first call,
+       a dynamic import) names its source only through these properties. */
+    JSValue file_value = JS_IsObject(reason)
+        ? JS_GetPropertyStr(context, reason, "fileName") : JS_UNDEFINED;
+    if (JS_IsException(file_value)) {
+        js_rt_clear_formatting_exception(context);
+        file_value = JS_UNDEFINED;
+    }
+    if (JS_IsString(file_value)) {
+        const char *file = JS_ToCString(context, file_value);
+        int32_t line = 0, column = 0;
+        JSValue line_value = JS_GetPropertyStr(context, reason, "lineNumber");
+        JSValue column_value =
+            JS_GetPropertyStr(context, reason, "columnNumber");
+        if (JS_ToInt32(context, &line, line_value) < 0
+            || JS_ToInt32(context, &column, column_value) < 0) {
+            js_rt_clear_formatting_exception(context);
+        }
+        JS_FreeValue(context, line_value);
+        JS_FreeValue(context, column_value);
+        size_t used = strlen(result->last_promise_rejection);
+        if (file != NULL && used + 2 < sizeof(result->last_promise_rejection)) {
+            snprintf(result->last_promise_rejection + used,
+                     sizeof(result->last_promise_rejection) - used,
+                     "\n@ %s:%d:%d", file, (int) line, (int) column);
+        }
+        if (file != NULL) JS_FreeCString(context, file);
+    }
+    JS_FreeValue(context, file_value);
     if (tilefinch_trace_promise_rejections()) {
         fprintf(stderr, "promise-rejection source=\"%s\" reason=\"%s\" "
                 "created=%zu handled=%zu live=%zu undefined=%zu\n",
@@ -699,7 +1901,13 @@ bool js_rt_evaluate_compiled_source(
     }
     BudgetAllocationOwner previous_owner =
         bridge_document_owner_enter(bridge);
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+    unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
+    script_profile_enter(bridge == NULL ? NULL : bridge->host);
     compiled = JS_EvalFunction(context, compiled);
+    script_profile_leave(bridge == NULL ? NULL : bridge->host);
+    script_split_leave(split);
+    work_ledger_leave(ledger);
     bridge_document_owner_leave(bridge, previous_owner);
     if (JS_IsException(compiled)) {
         JS_FreeValue(context, compiled);
@@ -713,6 +1921,61 @@ bool js_rt_evaluate_compiled_source(
         JS_GetRuntime(context), name, source_length, true);
     return true;
 }
+
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+/*
+ * Lazy function compilation (JS_SetLazyFunctionThreshold). An inner function
+ * of a page script or module whose source is at least this long keeps no
+ * bytecode until its first call (and its body is only validated, see
+ * script_lazy_function_preparse() below); most of a
+ * large site's functions never run during a page's life. The functions that
+ * do run are compiled a second time, alone, when first called. See "lazy
+ * function compilation" in docs/engineering/MEMORY_EXPERIMENTS.md for the
+ * measurements behind the threshold. TILEFINCH_JS_LAZY_FUNCTIONS overrides
+ * it (0 compiles everything eagerly). eval() and Function bodies are always
+ * compiled eagerly.
+ */
+#define SCRIPT_LAZY_FUNCTION_MINIMUM_BYTES 128u
+
+static uint32_t script_lazy_function_threshold(void)
+{
+    static bool resolved = false;
+    static uint32_t threshold = SCRIPT_LAZY_FUNCTION_MINIMUM_BYTES;
+    if (!resolved) {
+        const char *value = getenv("TILEFINCH_JS_LAZY_FUNCTIONS");
+        if (value != NULL && value[0] != '\0') {
+            char *end = NULL;
+            unsigned long parsed = strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && parsed <= UINT32_MAX) {
+                threshold = (uint32_t) parsed;
+            }
+        }
+        resolved = true;
+    }
+    return threshold;
+}
+
+/*
+ * Preparsing (JS_SetLazyFunctionPreparse): the body of a function that will
+ * be kept lazy is validated rather than parsed when its script compiles
+ * (checked for early errors, its end found and the names it may take from
+ * enclosing functions recorded), which cuts module compile time by about a
+ * third. Early errors are still reported when the script compiles.
+ * TILEFINCH_JS_PREPARSE=0 parses every body in full, as before, for A/B
+ * comparisons.
+ */
+static bool script_lazy_function_preparse(void)
+{
+    static bool resolved = false;
+    static bool enabled = true;
+    if (!resolved) {
+        const char *value = getenv("TILEFINCH_JS_PREPARSE");
+        if (value != NULL && strcmp(value, "0") == 0) enabled = false;
+        resolved = true;
+    }
+    return enabled;
+}
+#endif
 
 JSValue js_rt_compile_source_type(JSContext *context, const char *source,
                                    size_t length, const char *name,
@@ -768,9 +2031,33 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
         tilefinch_platform_log_message(gc_message);
 #endif
     }
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    /* Read when the parse starts; imports compiled from inside this JS_Eval
+       come back through here and restore it on their way out. */
+    uint32_t previous_lazy_threshold = JS_GetLazyFunctionThreshold(js_runtime);
+    JS_SetLazyFunctionThreshold(js_runtime, script_lazy_function_threshold());
+    JS_SetLazyFunctionPreparse(js_runtime, script_lazy_function_preparse());
+#endif
+    ScriptRuntime *profile_owner = bridge == NULL ? NULL : bridge->host;
+    unsigned compile_ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+    /* A compile entered from outside script (a parser-inserted script or
+       module) is not inside any window this ledger splits; one from inside
+       (dynamic import) is. */
+    unsigned compile_split = script_split_enter(SCRIPT_SPLIT_COMPILE);
+    script_profile_enter(profile_owner);
+    if (profile_owner != NULL && profile_owner->profile != NULL)
+        profile_owner->profile->compile_depth++;
     JSValue value = JS_Eval(
         context, source, length, name == NULL ? "<script>" : name,
         evaluation_type | JS_EVAL_FLAG_COMPILE_ONLY);
+    script_profile_leave(profile_owner);
+    script_split_leave(compile_split);
+    work_ledger_leave(compile_ledger);
+    if (profile_owner != NULL && profile_owner->profile != NULL)
+        profile_owner->profile->compile_depth--;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JS_SetLazyFunctionThreshold(js_runtime, previous_lazy_threshold);
+#endif
     uint64_t compile_finished = js_rt_monotonic_time_ns();
     uint64_t compile_us = compile_finished >= compile_started
         ? (compile_finished - compile_started) / UINT64_C(1000) : 0;
@@ -806,14 +2093,15 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
     return value;
 }
 
-bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
-                             size_t length, const char *name,
-                             const char *module_base_url,
-                             const char *module_referrer_policy,
-                             TilefinchCredentialsMode module_credentials,
-                             int evaluation_type,
-                             ScriptCompileSourceKind source_kind,
-                             ScriptResult *result)
+static bool evaluate_source_type_at(JSContext *context, const char *source,
+                                    size_t length, const char *name,
+                                    const char *module_base_url,
+                                    const char *module_referrer_policy,
+                                    TilefinchCredentialsMode module_credentials,
+                                    int evaluation_type,
+                                    ScriptCompileSourceKind source_kind,
+                                    bool external_module,
+                                    ScriptResult *result)
 {
     DomBridge *bridge = JS_GetContextOpaque(context);
     ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
@@ -837,9 +2125,12 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
     }
     bool admitted = false;
     uint64_t compile_started_us = tilefinch_platform_monotonic_time_us();
-    JSValue value = js_rt_compile_source_type(
-        context, source, length, name, evaluation_type, source_kind,
-        result, &admitted);
+    JSValue value = module && external_module
+        ? js_rt_module_compile_external(
+            runtime, context, source, length, name, base, result, &admitted)
+        : js_rt_compile_source_type(
+            context, source, length, name, evaluation_type, source_kind,
+            result, &admitted);
     if (result != NULL && (unsigned) source_kind < 6u) {
         result->compile_us[source_kind] +=
             tilefinch_platform_monotonic_time_us() - compile_started_us;
@@ -880,7 +2171,15 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
         runtime_configure_property_fault_trace(JS_GetRuntime(context));
     }
 #endif
-    if (!JS_IsException(value)) value = JS_EvalFunction(context, value);
+    if (!JS_IsException(value)) {
+        unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+        unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
+        script_profile_enter(runtime);
+        value = JS_EvalFunction(context, value);
+        script_profile_leave(runtime);
+        script_split_leave(split);
+        work_ledger_leave(ledger);
+    }
     if (result != NULL && (unsigned) source_kind < 6u) {
         result->execute_us[source_kind] +=
             tilefinch_platform_monotonic_time_us() - execute_started_us;
@@ -905,6 +2204,32 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
             runtime, name, SCRIPT_MODULE_MAP_EVALUATED);
     }
     return true;
+}
+
+bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
+                             size_t length, const char *name,
+                             const char *module_base_url,
+                             const char *module_referrer_policy,
+                             TilefinchCredentialsMode module_credentials,
+                             int evaluation_type,
+                             ScriptCompileSourceKind source_kind,
+                             ScriptResult *result)
+{
+    return evaluate_source_type_at(
+        context, source, length, name, module_base_url,
+        module_referrer_policy, module_credentials, evaluation_type,
+        source_kind, false, result);
+}
+
+bool js_rt_evaluate_external_module_at(
+    JSContext *context, const char *source, size_t length, const char *name,
+    const char *response_url, const char *module_referrer_policy,
+    TilefinchCredentialsMode module_credentials, ScriptResult *result)
+{
+    return evaluate_source_type_at(
+        context, source, length, name, response_url, module_referrer_policy,
+        module_credentials, JS_EVAL_TYPE_MODULE, SCRIPT_COMPILE_SOURCE_MODULE,
+        true, result);
 }
 
 static bool evaluate_source_type(JSContext *context, const char *source,
@@ -1155,7 +2480,7 @@ static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
             size_t before = budget_remaining(bridge->budget);
             (void) script_runtime_collect_and_trim(bridge->host);
             size_t after = budget_remaining(bridge->budget);
-            remaining = script_runtime_heap_remaining(bridge->host);
+            remaining = script_runtime_heap_available(bridge->host);
             size_t reclaimed = after > before ? after - before : 0;
             if (remaining < required) {
                 budget_record_pressure(

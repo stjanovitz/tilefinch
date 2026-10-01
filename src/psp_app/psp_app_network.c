@@ -382,6 +382,7 @@ void psp_network_lifecycle_pump(
     uint64_t now_us)
 {
     if (lifecycle == NULL || network == NULL) return;
+    psp_network_dns_guard();
     if (lifecycle->machine.state == PSP_NETWORK_SUPERVISOR_STARTING) {
         if (!psp_network_status_active(network->status)) {
             if (!psp_network_begin(
@@ -578,7 +579,7 @@ void psp_report_network_result(PspNetwork *network)
     printf("tilefinch-network: status=%s failure-phase=%s profile=%d/%d "
            "fallback=%d "
            "apctl=%d native=0x%08x pumps=%zu elapsed=%llums "
-           "max-pump=%lluus/%s\n",
+           "max-pump=%lluus/%s joins=%u join-resets=%u\n",
            psp_network_status_name(network->status),
            psp_network_status_name(network->failure_phase),
            network->requested_profile_index, network->profile_index,
@@ -586,7 +587,8 @@ void psp_report_network_result(PspNetwork *network)
            (unsigned) network->native_result, network->pump_calls,
            (unsigned long long) (network->elapsed_us / 1000u),
            (unsigned long long) network->maximum_pump_us,
-           psp_network_status_name(network->maximum_pump_phase));
+           psp_network_status_name(network->maximum_pump_phase),
+           network->join_attempts, network->join_resets);
     printf("tilefinch-network-profile: queries=0x%08x failed=0x%08x "
            "adopted=0x%08x security=%u static-ip=%d manual-dns=%d proxy=%d "
            "wlan-switch=%d wlan-power=%d\n",

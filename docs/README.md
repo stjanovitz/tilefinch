@@ -3,7 +3,9 @@
 Tilefinch's documentation has three layers:
 
 1. **Release-facing pages at the repository root** — for PSP owners:
-   [README](../README.md) (what it is, install, controls),
+   [README](../README.md) (what it is, install, controls), the
+   [user guide](USER_GUIDE.md) (typing, Reader mode, games, per-site
+   controls),
    [TROUBLESHOOTING](../TROUBLESHOOTING.md), [SECURITY](../SECURITY.md),
    [CHANGELOG](../CHANGELOG.md), [CONTRIBUTING](../CONTRIBUTING.md), and
    [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md).

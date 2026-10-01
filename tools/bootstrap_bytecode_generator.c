@@ -517,10 +517,15 @@ static int emit_bytecode_file(FILE *output)
        (measured 2026-09). Bootstrap exceptions still name the module and the
        function; for line numbers, run the host with
        TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1, which compiles the embedded
-       source with full debug information. */
+       source with full debug information. A device profiling build can keep
+       the line tables instead (TILEFINCH_BOOTSTRAP_KEEP_LINES=1 while
+       regenerating; never commit that output). */
 #if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime != NULL)
-        JS_SetStripInfo(runtime, JS_STRIP_SOURCE | JS_STRIP_DEBUG);
+        JS_SetStripInfo(runtime,
+                        getenv("TILEFINCH_BOOTSTRAP_KEEP_LINES") != NULL
+                            ? JS_STRIP_SOURCE
+                            : JS_STRIP_SOURCE | JS_STRIP_DEBUG);
 #endif
     JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
     if (context == NULL) {

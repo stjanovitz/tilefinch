@@ -354,6 +354,7 @@ bool style_container_layout_state_add(Stylesheet *sheet,
                 .type = type,
                 .occupied = true
             };
+            sheet->container_state_generation++;
             if (STYLE_TRACE(sheet, LAYOUT)) {
                 fprintf(stderr,
                         "style-container-state node=%p type=%u names=%08x "
@@ -372,6 +373,7 @@ bool style_container_layout_state_add(Stylesheet *sheet,
 void style_container_layout_state_clear(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->resolve_scratch == NULL) return;
+    sheet->container_state_generation++;
     StyleResolveScratch *scratch = sheet->resolve_scratch;
     if (scratch->container_states != NULL && sheet->budget != NULL) {
         budget_free(sheet->budget, scratch->container_states);
@@ -387,6 +389,12 @@ void style_container_layout_state_clear(Stylesheet *sheet)
     scratch->container_inline_basis = 0;
     scratch->container_block_basis = 0;
     scratch->container_basis_active = false;
+}
+
+bool style_container_layout_state_present(const Stylesheet *sheet)
+{
+    return sheet != NULL && sheet->resolve_scratch != NULL
+        && sheet->resolve_scratch->container_states != NULL;
 }
 
 uint64_t style_container_layout_state_signature(const Stylesheet *sheet)

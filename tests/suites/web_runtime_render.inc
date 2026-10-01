@@ -4,9 +4,11 @@ static int test_web_runtime(void)
     if (test_tile_paint_ahead() != 0) return 1;
     puts("test: placeholder frames checker unpainted tiles without raster");
     if (test_tile_placeholder_frame() != 0) return 1;
+    if (test_stroke_interior_work() != 0) return 1;
     Budget budget;
     budget_init(&budget, 16 * MIB);
     budget_install_lexbor(&budget);
+    if (test_stroke_rounded_clip(&budget) != 0) return 1;
     puts("test: fixed overlays stack by z-index across fixed elements");
     if (test_fixed_overlays_follow_z_index(&budget) != 0) return 1;
 
@@ -1204,6 +1206,83 @@ static int test_web_runtime(void)
     layout_destroy(&legacy_layout);
     stylesheet_destroy(&legacy_sheet);
     document_destroy(&legacy_document);
+    CHECK(budget.current == 0);
+
+    puts("test: lightningcss light-dark, oklch none, and calc opacity");
+    /* ChatGPT's stylesheet (lightningcss output): every colour is
+       var(--lightningcss-light,A)var(--lightningcss-dark,B) with the light
+       switch set to "initial", achromatic oklch() hues are "none", and its
+       drawer scrim is opacity:calc(1 - var(--progress)) at progress 1. */
+    static const char modern_page[] =
+        "<!doctype html><style>:root{--l:initial;--d: ;"
+        "--c:var(--l,#ff0000)var(--d,#0000ff)}"
+        "#switch{background-color:var(--c)}"
+        "#none-hue{background-color:oklch(50% 0 none)}"
+        "#scrim{--p:1;opacity:calc(1 - var(--p))}"
+        "#quarter{opacity:calc(1 - 0.25)}</style><body>"
+        "<div id=switch>A</div><div id=none-hue>B</div>"
+        "<div id=scrim>C</div><div id=quarter>D</div></body>";
+    PocDocument modern_document;
+    Stylesheet modern_sheet;
+    CHECK(document_parse(&modern_document, &budget, modern_page,
+                         strlen(modern_page), 19)
+          && stylesheet_build(&modern_sheet, &budget, &modern_document, 480));
+    lxb_dom_node_t *modern_root =
+        lxb_dom_interface_node(modern_document.html);
+    ComputedStyle modern_html_style = style_for_node(
+        &modern_sheet, modern_root, NULL);
+    ComputedStyle modern_switch = style_for_node(
+        &modern_sheet, find_id(modern_root, "switch"), &modern_html_style);
+    ComputedStyle modern_none = style_for_node(
+        &modern_sheet, find_id(modern_root, "none-hue"), &modern_html_style);
+    ComputedStyle modern_scrim = style_for_node(
+        &modern_sheet, find_id(modern_root, "scrim"), &modern_html_style);
+    ComputedStyle modern_quarter = style_for_node(
+        &modern_sheet, find_id(modern_root, "quarter"), &modern_html_style);
+    unsigned none_red = (modern_none.background >> 16) & 0xffu;
+    unsigned none_green = (modern_none.background >> 8) & 0xffu;
+    unsigned none_blue = modern_none.background & 0xffu;
+    CHECK(modern_switch.has_background
+          && modern_switch.background == 0xff0000
+          && modern_none.has_background
+          && none_red > 0x50 && none_red < 0x70
+          && none_red == none_green && none_green == none_blue
+          && modern_scrim.opacity == 0
+          && modern_quarter.opacity >= 190 && modern_quarter.opacity <= 192);
+    stylesheet_destroy(&modern_sheet);
+    document_destroy(&modern_document);
+    CHECK(budget.current == 0);
+
+    puts("test: width/height hints map only on replaced and table elements");
+    /* Turnstile's <div height="10 em"> once became a 140px flex container
+       and pushed its checkbox out of the widget frame. */
+    static const char dimension_page[] =
+        "<!doctype html><body><div id=dim-div height='10 em' width=40>x</div>"
+        "<img id=dim-img height='10 em' width='50%'></body>";
+    PocDocument dimension_document;
+    Stylesheet dimension_sheet;
+    CHECK(document_parse(&dimension_document, &budget, dimension_page,
+                         strlen(dimension_page), 18)
+          && stylesheet_build(&dimension_sheet, &budget,
+                              &dimension_document, 480));
+    lxb_dom_node_t *dimension_div = find_id(
+        lxb_dom_interface_node(dimension_document.html), "dim-div");
+    lxb_dom_node_t *dimension_img = find_id(
+        lxb_dom_interface_node(dimension_document.html), "dim-img");
+    CHECK(dimension_div != NULL && dimension_img != NULL);
+    ComputedStyle dimension_div_style = style_for_node(
+        &dimension_sheet, dimension_div, NULL);
+    ComputedStyle dimension_img_style = style_for_node(
+        &dimension_sheet, dimension_img, NULL);
+    CHECK(!dimension_div_style.has_height && !dimension_div_style.has_width
+          && dimension_img_style.has_height
+          && dimension_img_style.height == 10
+          && !dimension_img_style.height_percent
+          && dimension_img_style.has_width
+          && dimension_img_style.width == 50
+          && dimension_img_style.width_percent);
+    stylesheet_destroy(&dimension_sheet);
+    document_destroy(&dimension_document);
     CHECK(budget.current == 0);
 
     puts("test: SVG metadata remains non-rendered under author CSS");

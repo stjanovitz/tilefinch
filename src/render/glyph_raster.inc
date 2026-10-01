@@ -167,6 +167,7 @@ static const FontGlyph *glyph_cache_acquire(TileCache *cache,
         }
     }
     cache->glyph_cache_misses++;
+    TILEFINCH_WORK_ADD(glyph_misses, 1);
     if (!font_glyph_load_at_size(
             face, codepoint, pixel_height, bold, temporary)) {
         return NULL;

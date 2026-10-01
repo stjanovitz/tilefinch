@@ -9,6 +9,8 @@
     CHECK(test_font_publication_preserves_retained_tail(&budget) == 0);
     CHECK(test_text_run_scan_reuse(&budget) == 0);
 
+    puts("test: hidden markup costs one style resolution and no layout");
+    CHECK(test_hidden_markup_costs_nothing(&budget) == 0);
     puts("test: complete node-box indexes prove absence without a scan");
     CHECK(test_node_box_index_absence(&budget) == 0);
 
@@ -188,6 +190,14 @@
     CHECK(test_retained_matches_reuse(&budget) == 0);
     CHECK(test_stylesheet_append_matches_rebuild(&budget) == 0);
     CHECK(test_checked_toggle_retains_matches(&budget) == 0);
+    puts("test: :has() invalidation stays scoped and matches a fresh build");
+    CHECK(test_has_plan_classification(&budget) == 0);
+    CHECK(test_has_tree_change_classification(&budget) == 0);
+    CHECK(test_has_descendant_subject_and_fallback(&budget) == 0);
+    CHECK(test_has_scoped_invalidation_matches_fresh(&budget) == 0);
+    puts("test: focus and custom-property invalidation matches a fresh build");
+    CHECK(test_state_invalidation_matches_fresh(&budget) == 0);
+    CHECK(test_children_invalidation_scope(&budget) == 0);
     CHECK(test_fixed_drawer_rows(&budget) == 0);
     CHECK(test_checked_invalidation_cancel_drops_lists(&budget) == 0);
     CHECK(test_overflow_index_uses_nearby_bands(&budget) == 0);

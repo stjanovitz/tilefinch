@@ -159,6 +159,21 @@ bool option_is_displayed_by_default(lxb_dom_node_t *option)
     return option == (selected == NULL ? first : selected);
 }
 
+/* Skip four ordinary non-space ASCII bytes at once. memcpy keeps unaligned
+   DOM strings valid on Allegrex. The subtraction may conservatively flag an
+   extra byte through borrowing, but never skips whitespace or a locale byte. */
+static size_t style_class_token_end(const char *classes, size_t length, size_t at)
+{
+    while (length - at >= sizeof(uint32_t)) {
+        uint32_t word;
+        memcpy(&word, classes + at, sizeof(word));
+        if ((word & 0x80808080u) != 0
+            || ((word - 0x21212121u) & ~word & 0x80808080u) != 0) break;
+        at += sizeof(word);
+    }
+    while (at < length && !isspace((unsigned char) classes[at])) at++;
+    return at;
+}
 
 bool class_contains_length(const char *classes, size_t length,
                                   const char *wanted,
@@ -166,10 +181,149 @@ bool class_contains_length(const char *classes, size_t length,
 {
     for (size_t at = 0; at < length;) {
         while (at < length && isspace((unsigned char) classes[at])) at++;
-        size_t end = at;
-        while (end < length && !isspace((unsigned char) classes[end])) end++;
+        size_t end = style_class_token_end(classes, length, at);
         if (end - at == wanted_length && memcmp(classes + at, wanted, wanted_length) == 0) return true;
         at = end;
+    }
+    return false;
+}
+
+static uint32_t style_class_token_hash(const char *text, size_t length)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++) {
+        hash ^= (unsigned char) text[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void style_class_tokens_build(StyleClassTokens *tokens,
+                                     const char *classes, size_t length,
+                                     uint32_t scope)
+{
+    tokens->source = classes;
+    tokens->length = length;
+    tokens->scope = scope;
+    /* Only a list whose copy fits can be recognized in a later scope. */
+    if (length <= STYLE_CLASS_TOKEN_COPY) memcpy(tokens->copy, classes, length);
+    tokens->count = 0;
+    tokens->usable = length <= UINT16_MAX;
+    memset(tokens->slots, 0, sizeof(tokens->slots));
+    for (size_t at = 0; tokens->usable && at < length;) {
+        while (at < length && isspace((unsigned char) classes[at])) at++;
+        size_t end = style_class_token_end(classes, length, at);
+        if (end > at) {
+            if (tokens->count == STYLE_CLASS_TOKEN_LIMIT
+                || end - at > UINT8_MAX) {
+                tokens->usable = false;
+                break;
+            }
+            uint32_t hash = style_class_token_hash(classes + at, end - at);
+            tokens->hashes[tokens->count] = hash;
+            tokens->offsets[tokens->count] = (uint16_t) at;
+            tokens->lengths[tokens->count] = (uint8_t) (end - at);
+            tokens->count++;
+            /* At most 96 of 128 slots are ever occupied: probing ends. */
+            size_t slot = hash & 127u;
+            while (tokens->slots[slot] != 0) slot = (slot + 1u) & 127u;
+            tokens->slots[slot] = (uint8_t) tokens->count;
+        }
+        at = end;
+    }
+}
+
+void style_class_tokens_scope_begin(const Stylesheet *sheet)
+{
+    StyleResolveScratch *scratch = sheet == NULL ? NULL
+        : sheet->resolve_scratch;
+    if (scratch == NULL) return;
+    StyleClassTokenCache *cache = sheet->class_tokens;
+    if (scratch->class_tokens_depth == 0 && cache != NULL
+        && ++cache->scope == 0) {
+        for (size_t i = 0; i < STYLE_CLASS_TOKEN_SETS; i++)
+            cache->sets[i].source = NULL;
+        cache->scope = 1;
+    }
+    scratch->class_tokens_depth++;
+}
+
+void style_class_tokens_scope_end(const Stylesheet *sheet)
+{
+    StyleResolveScratch *scratch = sheet == NULL ? NULL
+        : sheet->resolve_scratch;
+    if (scratch != NULL && scratch->class_tokens_depth != 0)
+        scratch->class_tokens_depth--;
+}
+
+bool style_subject_has_class(const Stylesheet *sheet,
+                             const StyleMatchSubject *subject,
+                             const char *key, size_t key_length)
+{
+    if (subject == NULL || subject->classes == NULL) return false;
+    const char *classes = subject->classes;
+    size_t length = subject->classes_length;
+    StyleResolveScratch *scratch = sheet == NULL ? NULL
+        : sheet->resolve_scratch;
+    if (scratch == NULL || scratch->class_tokens_depth == 0 || length < 48u) {
+        STYLE_SELECTOR_COUNT(sheet, selector_class_linear_scans, 1);
+        return class_contains_length(classes, length, key, key_length);
+    }
+    if (sheet->class_tokens == NULL) {
+        /* Built lazily like the rule index; the cast covers only that. */
+        Stylesheet *mutable_sheet = (Stylesheet *) sheet;
+        if (sheet->class_tokens_refused || sheet->budget == NULL)
+            return class_contains_length(classes, length, key, key_length);
+        mutable_sheet->class_tokens = budget_calloc(
+            sheet->budget, 1, sizeof(*sheet->class_tokens));
+        if (sheet->class_tokens == NULL) {
+            mutable_sheet->class_tokens_refused = true;
+            return class_contains_length(classes, length, key, key_length);
+        }
+    }
+    StyleClassTokenCache *cache = sheet->class_tokens;
+    if (cache->scope == 0) cache->scope = 1;
+    StyleClassTokens *tokens = &cache->sets[cache->last];
+    if (tokens->source != classes || tokens->length != length) {
+        tokens = NULL;
+        for (size_t i = 0; i < STYLE_CLASS_TOKEN_SETS; i++) {
+            if (cache->sets[i].source == classes
+                && cache->sets[i].length == length) {
+                tokens = &cache->sets[i];
+                cache->last = (uint8_t) i;
+                break;
+            }
+        }
+    }
+    /* A set from an earlier scope answers only for identical text: the DOM
+       may have changed and reused the storage. */
+    if (tokens != NULL && tokens->scope != cache->scope) {
+        if (length <= STYLE_CLASS_TOKEN_COPY
+            && memcmp(tokens->copy, classes, length) == 0) {
+            tokens->scope = cache->scope;
+        } else {
+            STYLE_SELECTOR_COUNT(sheet, selector_class_token_builds, 1);
+            style_class_tokens_build(tokens, classes, length, cache->scope);
+        }
+    }
+    if (tokens == NULL) {
+        cache->last = cache->next;
+        tokens = &cache->sets[cache->next];
+        cache->next = (uint8_t) ((cache->next + 1u) % STYLE_CLASS_TOKEN_SETS);
+        STYLE_SELECTOR_COUNT(sheet, selector_class_token_builds, 1);
+        style_class_tokens_build(tokens, classes, length, cache->scope);
+    }
+    if (!tokens->usable)
+        return class_contains_length(classes, length, key, key_length);
+    uint32_t hash = style_class_token_hash(key, key_length);
+    for (size_t slot = hash & 127u, probes = 0; probes < 128u;
+         slot = (slot + 1u) & 127u, probes++) {
+        uint8_t entry = tokens->slots[slot];
+        if (entry == 0) return false;
+        size_t i = entry - 1u;
+        if (tokens->hashes[i] == hash && tokens->lengths[i] == key_length
+            && memcmp(classes + tokens->offsets[i], key, key_length) == 0)
+            return true;
     }
     return false;
 }
@@ -808,10 +962,8 @@ static bool selector_list_matches_node(
                         && subject.id_length == option->key_length
                         && memcmp(subject.id, key, option->key_length) == 0;
                 } else if (option->key_type == SELECTOR_CLASS) {
-                    keyed = subject.classes != NULL
-                        && class_contains_length(
-                            subject.classes, subject.classes_length,
-                            key, option->key_length);
+                    keyed = style_subject_has_class(
+                        sheet, &subject, key, option->key_length);
                 } else {
                     keyed = subject.tag != NULL
                         && subject.tag_length == option->key_length
@@ -1369,10 +1521,9 @@ static bool compound_matches_depth(
             const char *wanted = style_identifier_span(text + at, end - at,
                 scratch, sizeof(scratch), &wanted_length);
             if (wanted == NULL
-                || wanted_length == 0 || subject->classes == NULL
-                || !class_contains_length(
-                    subject->classes, subject->classes_length,
-                    wanted, wanted_length)) return false;
+                || wanted_length == 0
+                || !style_subject_has_class(
+                    sheet, subject, wanted, wanted_length)) return false;
             at = end;
         } else if (text[at] == '#') {
             at++;
@@ -1620,10 +1771,14 @@ bool style_selector_matches_profiled(const Stylesheet *sheet,
                                      const char *text, size_t length)
 {
     STYLE_SELECTOR_COUNT(sheet, selector_match_calls, 1);
+    TILEFINCH_WORK_ADD(selector_matches, 1);
     STYLE_SELECTOR_COUNT(sheet, selector_match_characters, length);
     bool matched = style_selector_matches_internal(
         sheet, node, text, length, 0, false, 0, 0, NULL);
-    if (matched) STYLE_SELECTOR_COUNT(sheet, selector_match_successes, 1);
+    if (matched) {
+        STYLE_SELECTOR_COUNT(sheet, selector_match_successes, 1);
+        TILEFINCH_WORK_ADD(selector_match_successes, 1);
+    }
     return matched;
 }
 
@@ -1633,11 +1788,15 @@ bool style_selector_matches_prepared(const Stylesheet *sheet,
                                      size_t rightmost_compound_offset)
 {
     STYLE_SELECTOR_COUNT(sheet, selector_match_calls, 1);
+    TILEFINCH_WORK_ADD(selector_matches, 1);
     STYLE_SELECTOR_COUNT(sheet, selector_match_characters, length);
     bool matched = style_selector_matches_internal(
         sheet, node, text, length, rightmost_compound_offset, true, 0, 0,
         NULL);
-    if (matched) STYLE_SELECTOR_COUNT(sheet, selector_match_successes, 1);
+    if (matched) {
+        STYLE_SELECTOR_COUNT(sheet, selector_match_successes, 1);
+        TILEFINCH_WORK_ADD(selector_match_successes, 1);
+    }
     return matched;
 }
 
@@ -1697,10 +1856,8 @@ static bool style_selector_program_matches_uncached(
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_CLASS) {
-            if (subject->classes == NULL
-                || !class_contains_length(
-                    subject->classes, subject->classes_length,
-                    wanted, wanted_length)) return false;
+            if (!style_subject_has_class(
+                    sheet, subject, wanted, wanted_length)) return false;
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_ID) {
@@ -1870,10 +2027,12 @@ bool style_rule_selector_matches_subject(
             && instruction < sheet->selector_program_instruction_count) {
             STYLE_SELECTOR_COUNT(sheet, selector_compiled_rule_calls, 1);
             STYLE_SELECTOR_COUNT(sheet, selector_match_calls, 1);
+            TILEFINCH_WORK_ADD(selector_matches, 1);
             bool matched = style_selector_program_matches_at(
                 sheet, rule, node, instruction, 0, subject);
             if (matched) {
                 STYLE_SELECTOR_COUNT(sheet, selector_match_successes, 1);
+                TILEFINCH_WORK_ADD(selector_match_successes, 1);
                 STYLE_SELECTOR_COUNT(
                     sheet, selector_compiled_rule_matches, 1);
             }
@@ -1939,6 +2098,26 @@ bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
                     && memcmp(subject.tag, item->key, item->key_length) == 0;
             }
             if (!keyed) continue;
+            if (item->complete_key) return true;
+        }
+        if (item->attribute_length != 0) {
+            if (!lxb_dom_element_has_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) item->attribute,
+                    item->attribute_length)) continue;
+            if (item->complete_attribute) return true;
+        }
+        if (item->any_attribute_count != 0) {
+            bool carries = false;
+            for (uint8_t a = 0; a < item->any_attribute_count && !carries;
+                 a++) {
+                carries = lxb_dom_element_has_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) item->text
+                        + item->any_attribute_offset[a],
+                    item->any_attribute_length[a]);
+            }
+            if (!carries) continue;
         }
         bool matched = item->rightmost != SIZE_MAX
             ? style_selector_matches_internal(

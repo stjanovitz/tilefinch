@@ -1,7 +1,18 @@
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge)
 {
     if (bridge == NULL || bridge->synchronous_layout == NULL) return false;
-    return bridge->synchronous_layout(bridge->synchronous_layout_opaque);
+    uint64_t started = js_rt_monotonic_time_ns();
+    unsigned split = script_split_enter(SCRIPT_SPLIT_LAYOUT);
+    bool flushed = bridge->synchronous_layout(bridge->synchronous_layout_opaque);
+    script_split_leave(split);
+    uint64_t finished = js_rt_monotonic_time_ns();
+    uint64_t elapsed_us = finished >= started
+        ? (finished - started) / UINT64_C(1000) : 0;
+    bridge->synchronous_layout_calls++;
+    bridge->synchronous_layout_us += elapsed_us;
+    if (elapsed_us > bridge->synchronous_layout_max_us)
+        bridge->synchronous_layout_max_us = elapsed_us;
+    return flushed;
 }
 
 static FetchScheduler *bridge_fetch_scheduler_create(
@@ -190,6 +201,34 @@ static void script_element_states_detach_document(
     bridge->script_element_count = output;
 }
 
+/* The configured source total is a floor, not a ceiling. Committed source
+   is compiled and then dropped or stripped, so the total bounds work rather
+   than memory; once past it, a script is still admitted while the page
+   Budget keeps the realm's growth reserve free for the body in flight. On
+   the PSP chatgpt.com's client committed ~2 MiB of modules at startup and
+   every module its send path imports was refused. */
+static void js_rt_bridge_script_bytes_admit(DomBridge *bridge, size_t bytes)
+{
+    const ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL || !runtime->heap_growth_enabled || bytes == 0
+        || runtime->budget == NULL
+        || bridge->script_quota_bytes
+               > SIZE_MAX - bridge->script_quota_reserved_bytes) return;
+    size_t used = bridge->script_quota_bytes
+        + bridge->script_quota_reserved_bytes;
+    if (used <= bridge->maximum_script_bytes
+        && bytes <= bridge->maximum_script_bytes - used) return;
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (free_bytes <= runtime->heap_growth_reserve) return;
+    size_t spare = free_bytes - runtime->heap_growth_reserve;
+    if (bytes > spare) bytes = spare;
+    if (bytes > SIZE_MAX - used) return;
+    if (used + bytes > bridge->maximum_script_bytes) {
+        bridge->maximum_script_bytes = used + bytes;
+        bridge->script_quota_pressure_raises++;
+    }
+}
+
 ScriptQuotaReserveResult js_rt_bridge_script_quota_reserve_bounded(
 DomBridge *bridge, ScriptQuotaCountMode count_mode,
 size_t requested_max_bytes, size_t reservation_ceiling,
@@ -210,6 +249,7 @@ ScriptQuotaReservation *reservation)
 
     size_t desired = requested_max_bytes;
     if (desired > reservation_ceiling) desired = reservation_ceiling;
+    js_rt_bridge_script_bytes_admit(bridge, desired);
     if (desired != 0) {
         if (bridge->script_quota_bytes >= bridge->maximum_script_bytes) {
             js_rt_trace_script_quota_rejection(bridge, "source-bytes");
@@ -256,6 +296,8 @@ ScriptQuotaReserveResult js_rt_bridge_script_quota_reserve_known(
 DomBridge *bridge, ScriptQuotaCountMode count_mode,
 size_t exact_source_bytes, ScriptQuotaReservation *reservation)
 {
+    if (bridge != NULL && exact_source_bytes != SIZE_MAX)
+        js_rt_bridge_script_bytes_admit(bridge, exact_source_bytes);
     if (bridge == NULL || reservation == NULL || reservation->active
         || (count_mode != SCRIPT_QUOTA_NEW_EXECUTABLE
             && count_mode != SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE)
@@ -288,6 +330,10 @@ bool js_rt_bridge_script_quota_expand(
 DomBridge *bridge, ScriptQuotaReservation *reservation,
 size_t exact_source_bytes)
 {
+    if (bridge != NULL && reservation != NULL && reservation->active
+        && exact_source_bytes > reservation->reserved_bytes)
+        js_rt_bridge_script_bytes_admit(
+            bridge, exact_source_bytes - reservation->reserved_bytes);
     if (bridge == NULL || reservation == NULL || !reservation->active
         || exact_source_bytes < reservation->reserved_bytes
         || exact_source_bytes > bridge->maximum_script_bytes
@@ -376,9 +422,12 @@ bool script_execution_policy_for_profile(
         return true;
     case SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC:
         policy->maximum_advance_time_us = 16000;
-        /* The measured 5 MiB realistic realm admits one 384 KiB authored
-           Game Profile script. Strict remains at the smaller 256 KiB unit;
-           both retain a hard per-call bound and the same aggregate quotas. */
+        /* 512 KiB: chatgpt.com's application frame module is 403 KiB, and
+           its home client never becomes ready without it. The page heap now
+           grows toward 10 MiB when the budget allows, which the old 384 KiB
+           unit (sized for a fixed 5 MiB realm) predates. Strict remains at
+           the smaller 256 KiB unit; both retain a hard per-call bound and
+           the same aggregate quotas. */
         policy->maximum_host_compile_source_bytes =
             SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES;
         return true;

@@ -239,9 +239,15 @@ int main(int argc, char **argv)
     }
     YoutubeStream stream = {0};
     char error[256] = {0};
-    bool resolved = youtube_resolve_progressive_mp4(
-        &budget, &session, argv[1], maximum_height, 30000,
-        &stream, error, sizeof(error));
+    /* The device's defaults: English system language, subtitles follow it. */
+    YoutubeTrackPreferences preferences = {0};
+    snprintf(preferences.audio_language, sizeof(preferences.audio_language),
+             "%s", "en");
+    snprintf(preferences.caption_language,
+             sizeof(preferences.caption_language), "%s", "en");
+    bool resolved = youtube_resolve_progressive_mp4_cancelable_with_preferences(
+        &budget, &session, argv[1], maximum_height, 30000, &preferences,
+        NULL, NULL, &stream, error, sizeof(error));
     if (!resolved) {
         fprintf(stderr, "YouTube resolution failed: %s\n", error);
         browser_session_destroy(&session);
@@ -258,6 +264,16 @@ int main(int argc, char **argv)
         stream.audio_itag, stream.audio_content_length, stream.duration_ms,
         stream.client_name, stream.client_attempts,
         stream.watch_bytes, stream.player_bytes, stream.expires_unix);
+    printf("captions=%u selected=%d\n",
+           (unsigned) stream.caption_track_count,
+           (int) stream.selected_caption_track);
+    for (size_t at = 0; at < stream.caption_track_count; at++) {
+        const YoutubeTrack *track = &stream.caption_tracks[at];
+        printf("caption[%zu] id=%s language=%s auto=%d label=%s\n", at,
+               track->id, track->language, track->automatic ? 1 : 0,
+               track->label);
+    }
+    printf("audio-tracks=%u\n", (unsigned) stream.audio_track_count);
     printf("video-url=%s\n", stream.media_url);
     if (stream.split_streams) printf("audio-url=%s\n", stream.audio_url);
     bool downloaded = true;

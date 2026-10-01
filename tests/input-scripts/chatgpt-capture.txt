@@ -1,0 +1,4 @@
+# Load chatgpt.com, let it settle ~90 s, exit cleanly (trace capture).
+wait-live 2700
+mark-live settled
+end

@@ -6,12 +6,16 @@
 #include "tilefinch/platform.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 
+#include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
 #include "diagnostic_trace.h"
 #include "session_site_storage.h"
@@ -2547,6 +2551,925 @@ bool browser_session_classic_script_bytecode_put(
     return true;
 }
 
+/* ---- ES module bytecode (see BrowserModuleBytecodeCache) ---- */
+
+static bool module_bytecode_usable(const BrowserSession *session)
+{
+    /* A captive sign-in runs against an ephemeral partition; like the HTTP
+       cache, compiled artifacts are neither read nor written meanwhile. */
+    return session != NULL && session->budget != NULL
+        && session->maximum_module_bytecode_bytes != 0
+        && session->captive_portal_stash == NULL;
+}
+
+static bool module_bytecode_key_valid(const BrowserModuleBytecodeKey *key)
+{
+    return key != NULL && key->module_name != NULL
+        && key->module_name[0] != '\0' && key->response_url != NULL
+        && key->response_url[0] != '\0' && key->partition_key != NULL
+        && key->partition_key[0] != '\0' && key->source != NULL
+        && key->source_length != 0;
+}
+
+static bool module_bytecode_key_digest(BrowserModuleBytecodeKey *key)
+{
+    if (key->digest_ready) return true;
+    key->digest_ready = tilefinch_sha256_digest(
+        key->source, key->source_length, key->source_digest);
+    return key->digest_ready;
+}
+
+/* Bytecode plus the three key strings. */
+static bool module_bytecode_charge(const BrowserModuleBytecodeKey *key,
+                                   size_t bytecode_length, size_t *charge)
+{
+    const char *parts[3] = {
+        key->module_name, key->response_url, key->partition_key
+    };
+    size_t total = bytecode_length;
+    for (size_t i = 0; i < 3; i++) {
+        size_t length = strlen(parts[i]);
+        if (length >= SIZE_MAX - total) return false;
+        total += length + 1u;
+    }
+    *charge = total;
+    return true;
+}
+
+static bool module_bytecode_same_record(
+    const BrowserModuleBytecodeEntry *entry,
+    const BrowserModuleBytecodeKey *key)
+{
+    return entry->bytecode != NULL
+        && strcmp(entry->module_name, key->module_name) == 0
+        && strcmp(entry->response_url, key->response_url) == 0
+        && strcmp(entry->partition_key, key->partition_key) == 0;
+}
+
+static void module_bytecode_entry_remove(BrowserSession *session,
+                                         BrowserModuleBytecodeEntry *entry)
+{
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    if (cache == NULL || entry == NULL || entry->bytecode == NULL) return;
+    cache->bytes = entry->charged_bytes <= cache->bytes
+        ? cache->bytes - entry->charged_bytes : 0;
+    browser_shared_body_release(entry->bytecode);
+    budget_free(session->budget, entry->module_name);
+    budget_free(session->budget, entry->response_url);
+    budget_free(session->budget, entry->partition_key);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void module_bytecode_release_table_if_empty(BrowserSession *session)
+{
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    if (cache == NULL) return;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        if (cache->entries[i].bytecode != NULL) return;
+    }
+    budget_free(session->budget, cache);
+    session->module_bytecode = NULL;
+}
+
+static void module_bytecode_clear(BrowserSession *session)
+{
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    if (cache == NULL) return;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        module_bytecode_entry_remove(session, &cache->entries[i]);
+    }
+    module_bytecode_release_table_if_empty(session);
+}
+
+/* Least-recently-used entry, skipping those `protected_generation` has used
+   (0 protects nothing). */
+static BrowserModuleBytecodeEntry *module_bytecode_victim(
+    BrowserModuleBytecodeCache *cache, uint32_t protected_generation)
+{
+    BrowserModuleBytecodeEntry *victim = NULL;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        BrowserModuleBytecodeEntry *entry = &cache->entries[i];
+        if (entry->bytecode == NULL
+            || (protected_generation != 0
+                && entry->generation == protected_generation)) continue;
+        if (victim == NULL || entry->stamp < victim->stamp) victim = entry;
+    }
+    return victim;
+}
+
+/* Evicts one least-recently-used entry; returns the bytes it charged. */
+static size_t module_bytecode_evict_one(BrowserSession *session)
+{
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    if (cache == NULL) return 0;
+    BrowserModuleBytecodeEntry *victim = module_bytecode_victim(cache, 0);
+    if (victim == NULL) return 0;
+    size_t charged = victim->charged_bytes;
+    module_bytecode_entry_remove(session, victim);
+    session->module_bytecode_evictions++;
+    module_bytecode_release_table_if_empty(session);
+    return charged == 0 ? 1u : charged;
+}
+
+/* ---- Persistent module bytecode (see browser_session_module_bytecode_
+   set_disk) ---- */
+
+#ifndef TILEFINCH_QUICKJS_ENGINE_ID
+#define TILEFINCH_QUICKJS_ENGINE_ID "unknown-engine"
+#endif
+#define MODULE_BYTECODE_DISK_MAGIC "TFMB"
+#define MODULE_BYTECODE_DISK_VERSION 1u
+#define MODULE_BYTECODE_DISK_HEADER (4u + 4u + 4u + 32u + 32u)
+#define MODULE_BYTECODE_DISK_SUFFIX ".tfmb"
+/* File names start with this much of the engine fingerprint, so a scan can
+   tell another build's files from this one's. */
+#define MODULE_BYTECODE_DISK_ENGINE_PREFIX 8u
+/* Idle maintenance calls before a failed scan is retried, doubling per
+   consecutive failure up to the maximum. */
+#define MODULE_BYTECODE_DISK_RETRY_FIRST 64u
+#define MODULE_BYTECODE_DISK_RETRY_MAX 4096u
+
+static void module_bytecode_disk_close_scan(BrowserSession *session)
+{
+    if (session->module_bytecode_disk_scan_cursor != NULL)
+        closedir(session->module_bytecode_disk_scan_cursor);
+    session->module_bytecode_disk_scan_cursor = NULL;
+}
+
+/* Forgets the directory accounting so the next slice starts a new scan. */
+static void module_bytecode_disk_restart(BrowserSession *session)
+{
+    module_bytecode_disk_close_scan(session);
+    session->module_bytecode_disk_scanned = false;
+    session->module_bytecode_disk_scan_failed = false;
+    session->module_bytecode_disk_scan_visits = 0;
+    session->module_bytecode_disk_total_bytes = 0;
+    session->module_bytecode_disk_file_count = 0;
+    session->module_bytecode_disk_victim_count = 0;
+}
+
+/* Writes stay deferred until a later scan completes: the ceilings cannot be
+   honoured without complete accounting, but a transient Memory Stick error
+   or a directory cleaned up later must not disable writes for good. */
+static void module_bytecode_disk_scan_fail(BrowserSession *session)
+{
+    unsigned wait = session->module_bytecode_disk_retry_backoff;
+    if (wait < MODULE_BYTECODE_DISK_RETRY_FIRST)
+        wait = MODULE_BYTECODE_DISK_RETRY_FIRST;
+    session->module_bytecode_disk_scan_failed = true;
+    session->module_bytecode_disk_retry_wait = wait;
+    session->module_bytecode_disk_retry_backoff =
+        wait < MODULE_BYTECODE_DISK_RETRY_MAX
+            ? wait * 2u : MODULE_BYTECODE_DISK_RETRY_MAX;
+}
+
+void browser_session_module_bytecode_set_disk(BrowserSession *session,
+                                              const char *directory,
+                                              bool write)
+{
+    if (session == NULL) return;
+    module_bytecode_disk_restart(session);
+    session->module_bytecode_disk_dir[0] = '\0';
+    session->module_bytecode_disk_write = false;
+    session->module_bytecode_disk_dir_ready = false;
+    session->module_bytecode_disk_suspended = false;
+    session->module_bytecode_disk_evicting = false;
+    session->module_bytecode_disk_retry_wait = 0;
+    session->module_bytecode_disk_retry_backoff = 0;
+    session->module_bytecode_disk_refused_count = 0;
+    if (directory == NULL || directory[0] == '\0'
+        || strlen(directory) >= sizeof(session->module_bytecode_disk_dir) - 40u)
+        return;
+    snprintf(session->module_bytecode_disk_dir,
+             sizeof(session->module_bytecode_disk_dir), "%s", directory);
+    session->module_bytecode_disk_write = write;
+}
+
+bool browser_session_module_bytecode_disk_enabled(
+    const BrowserSession *session)
+{
+    return module_bytecode_usable(session)
+        && session->module_bytecode_disk_dir[0] != '\0'
+        && !session->module_bytecode_disk_suspended;
+}
+
+static void module_bytecode_disk_put_u32(unsigned char *out, uint32_t value)
+{
+    out[0] = (unsigned char) value;
+    out[1] = (unsigned char) (value >> 8);
+    out[2] = (unsigned char) (value >> 16);
+    out[3] = (unsigned char) (value >> 24);
+}
+
+static uint32_t module_bytecode_disk_get_u32(const unsigned char *in)
+{
+    return (uint32_t) in[0] | ((uint32_t) in[1] << 8)
+        | ((uint32_t) in[2] << 16) | ((uint32_t) in[3] << 24);
+}
+
+/* The complete key: this engine build and pointer width, then every field
+   the RAM entry is keyed by. */
+static bool module_bytecode_disk_key_hash(BrowserModuleBytecodeKey *key,
+                                          unsigned char hash[32])
+{
+    if (!module_bytecode_key_valid(key) || !module_bytecode_key_digest(key))
+        return false;
+    TilefinchSha256 context;
+    tilefinch_sha256_init(&context);
+    unsigned char numbers[12];
+    module_bytecode_disk_put_u32(numbers, (uint32_t) sizeof(void *));
+    module_bytecode_disk_put_u32(numbers + 4, key->compile_flags);
+    module_bytecode_disk_put_u32(numbers + 8, (uint32_t) key->source_length);
+    const char *texts[4] = {
+        TILEFINCH_QUICKJS_ENGINE_ID, key->module_name, key->response_url,
+        key->partition_key
+    };
+    bool ok = true;
+    for (size_t i = 0; ok && i < 4; i++)
+        ok = tilefinch_sha256_update(&context, (const unsigned char *) texts[i],
+                                     strlen(texts[i]) + 1u);
+    ok = ok && tilefinch_sha256_update(&context, numbers, sizeof(numbers))
+        && tilefinch_sha256_update(&context, key->source_digest,
+                                   sizeof(key->source_digest))
+        && tilefinch_sha256_final(&context, hash);
+    return ok;
+}
+
+/* This build's file-name prefix: the engine fingerprint's first characters,
+   file-name safe. */
+static void module_bytecode_disk_engine_prefix(
+    char prefix[MODULE_BYTECODE_DISK_ENGINE_PREFIX + 1u])
+{
+    static const char engine[] = TILEFINCH_QUICKJS_ENGINE_ID;
+    for (size_t i = 0; i < MODULE_BYTECODE_DISK_ENGINE_PREFIX; i++) {
+        char c = i < sizeof(engine) - 1u ? engine[i] : '0';
+        prefix[i] = isalnum((unsigned char) c) ? c : '0';
+    }
+    prefix[MODULE_BYTECODE_DISK_ENGINE_PREFIX] = '\0';
+}
+
+static bool module_bytecode_disk_path(const BrowserSession *session,
+                                      const unsigned char hash[32],
+                                      const char *suffix, char *path,
+                                      size_t capacity)
+{
+    static const char hex[] = "0123456789abcdef";
+    char prefix[MODULE_BYTECODE_DISK_ENGINE_PREFIX + 1u];
+    module_bytecode_disk_engine_prefix(prefix);
+    char name[33];
+    for (size_t i = 0; i < 16; i++) {
+        name[2 * i] = hex[hash[i] >> 4];
+        name[2 * i + 1] = hex[hash[i] & 15u];
+    }
+    name[32] = '\0';
+    int written = snprintf(path, capacity, "%s/%s-%s%s",
+                           session->module_bytecode_disk_dir, prefix, name,
+                           suffix);
+    return written > 0 && (size_t) written < capacity;
+}
+
+static bool module_bytecode_disk_refused(const BrowserSession *session,
+                                         const unsigned char hash[32])
+{
+    unsigned count = session->module_bytecode_disk_refused_count;
+    if (count > 8u) count = 8u;
+    for (unsigned i = 0; i < count; i++)
+        if (memcmp(session->module_bytecode_disk_refused[i], hash, 16) == 0)
+            return true;
+    return false;
+}
+
+/* Takes a removed record out of a completed scan's totals. */
+static void module_bytecode_disk_forget(BrowserSession *session,
+                                        const struct stat *info)
+{
+    session->module_bytecode_disk_removed++;
+    if (info == NULL || !session->module_bytecode_disk_scanned) return;
+    size_t size = info->st_size > 0 ? (size_t) info->st_size : 0;
+    session->module_bytecode_disk_total_bytes -=
+        size < session->module_bytecode_disk_total_bytes
+            ? size : session->module_bytecode_disk_total_bytes;
+    if (session->module_bytecode_disk_file_count != 0)
+        session->module_bytecode_disk_file_count--;
+}
+
+/* Removes one of the directory's files, keeping the scan's totals. */
+static void module_bytecode_disk_remove(BrowserSession *session,
+                                        const char *path)
+{
+    struct stat info;
+    bool known = stat(path, &info) == 0;
+    if (remove(path) != 0) return;
+    module_bytecode_disk_forget(session, known ? &info : NULL);
+}
+
+/* A file that failed verification or restore: writable, remove it so the
+   next compile writes a good one; read-only, stop reading it. */
+static void module_bytecode_disk_refuse(BrowserSession *session,
+                                        const unsigned char hash[32],
+                                        const char *path)
+{
+    session->module_bytecode_disk_rejects++;
+    if (session->module_bytecode_disk_write) {
+        module_bytecode_disk_remove(session, path);
+        return;
+    }
+    if (module_bytecode_disk_refused(session, hash)) return;
+    memcpy(session->module_bytecode_disk_refused[
+               session->module_bytecode_disk_refused_count % 8u], hash, 16);
+    session->module_bytecode_disk_refused_count++;
+}
+
+static bool module_bytecode_disk_name_ours(const char *name, bool *this_build,
+                                           bool *temporary)
+{
+    size_t length = strlen(name);
+    size_t suffix = sizeof(MODULE_BYTECODE_DISK_SUFFIX) - 1u;
+    size_t expected = MODULE_BYTECODE_DISK_ENGINE_PREFIX + 1u + 32u;
+    *temporary = length == expected + 4u
+        && strcmp(name + expected, ".tmp") == 0;
+    bool record = length == expected + suffix
+        && strcmp(name + expected, MODULE_BYTECODE_DISK_SUFFIX) == 0;
+    if ((!record && !*temporary)
+        || name[MODULE_BYTECODE_DISK_ENGINE_PREFIX] != '-') return false;
+    char prefix[MODULE_BYTECODE_DISK_ENGINE_PREFIX + 1u];
+    module_bytecode_disk_engine_prefix(prefix);
+    *this_build = memcmp(name, prefix, MODULE_BYTECODE_DISK_ENGINE_PREFIX)
+        == 0;
+    return true;
+}
+
+/* Keeps the scan's oldest records (newest first), bounded, as eviction
+   candidates: no directory-sized sort. */
+static void module_bytecode_disk_note_victim(BrowserSession *session,
+                                             const char *name, int64_t mtime)
+{
+    unsigned count = session->module_bytecode_disk_victim_count;
+    if (count == BROWSER_MODULE_BYTECODE_DISK_VICTIMS) {
+        if (mtime >= session->module_bytecode_disk_victims[0].mtime) return;
+        memmove(&session->module_bytecode_disk_victims[0],
+                &session->module_bytecode_disk_victims[1],
+                (count - 1u) * sizeof(session->module_bytecode_disk_victims[0]));
+        count--;
+    }
+    unsigned at = count;
+    while (at != 0
+           && session->module_bytecode_disk_victims[at - 1u].mtime < mtime)
+        at--;
+    memmove(&session->module_bytecode_disk_victims[at + 1u],
+            &session->module_bytecode_disk_victims[at],
+            (count - at) * sizeof(session->module_bytecode_disk_victims[0]));
+    memcpy(session->module_bytecode_disk_victims[at].name,
+           name + MODULE_BYTECODE_DISK_ENGINE_PREFIX + 1u, 32);
+    session->module_bytecode_disk_victims[at].mtime = mtime;
+    session->module_bytecode_disk_victim_count = count + 1u;
+}
+
+/* Never rescan a prefix on each pump: keep one cursor, closed at EOF or
+   refusal. Entry and total-visit ceilings also cover unrelated files. */
+static bool module_bytecode_disk_scan_step(BrowserSession *session,
+                                            bool remove_all)
+{
+    if (session->module_bytecode_disk_scanned
+        || session->module_bytecode_disk_scan_failed) return false;
+    DIR *directory = session->module_bytecode_disk_scan_cursor;
+    if (directory == NULL) {
+        directory = opendir(session->module_bytecode_disk_dir);
+        if (directory == NULL) {
+            if (errno != ENOENT) module_bytecode_disk_scan_fail(session);
+            else session->module_bytecode_disk_scanned = true;
+            return true;
+        }
+        session->module_bytecode_disk_scan_cursor = directory;
+    }
+    uint64_t started = tilefinch_platform_monotonic_time_ns();
+    char path[224];
+    for (unsigned i = 0; i < BROWSER_MODULE_BYTECODE_DISK_SCAN_SLICE; i++) {
+        if (session->module_bytecode_disk_scan_visits
+                >= BROWSER_MODULE_BYTECODE_DISK_SCAN_LIMIT) {
+            module_bytecode_disk_scan_fail(session);
+            break;
+        }
+        if (i != 0 && tilefinch_platform_monotonic_time_ns() - started
+                         >= 2000000u) break;
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0) module_bytecode_disk_scan_fail(session);
+            else session->module_bytecode_disk_scanned = true;
+            break;
+        }
+        session->module_bytecode_disk_scan_visits++;
+        bool this_build = false, temporary = false;
+        if (!module_bytecode_disk_name_ours(entry->d_name, &this_build,
+                                            &temporary)) continue;
+        int written = snprintf(path, sizeof(path), "%s/%s",
+                               session->module_bytecode_disk_dir,
+                               entry->d_name);
+        if (written <= 0 || (size_t) written >= sizeof(path)) {
+            module_bytecode_disk_scan_fail(session);
+            break;
+        }
+        if (remove_all || temporary || !this_build) {
+            if (remove(path) == 0) session->module_bytecode_disk_removed++;
+            else if (errno != ENOENT) {
+                module_bytecode_disk_scan_fail(session);
+                break;
+            }
+            continue;
+        }
+        struct stat info;
+        if (stat(path, &info) != 0) {
+            if (errno == ENOENT) continue;
+            module_bytecode_disk_scan_fail(session);
+            break;
+        }
+        uint64_t bytes = info.st_size > 0 ? (uint64_t) info.st_size : 0;
+        size_t current = session->module_bytecode_disk_total_bytes;
+        if (bytes > SIZE_MAX - current) {
+            /* Do not saturate and later subtract: that could undercount an
+               already oversized directory after a rejected entry is removed.
+               Past the ceiling is fine: eviction trims it. */
+            module_bytecode_disk_scan_fail(session);
+            break;
+        }
+        session->module_bytecode_disk_total_bytes = current + (size_t) bytes;
+        session->module_bytecode_disk_file_count++;
+        module_bytecode_disk_note_victim(session, entry->d_name,
+                                         (int64_t) info.st_mtime);
+    }
+    if (session->module_bytecode_disk_scanned)
+        session->module_bytecode_disk_retry_backoff = 0;
+    if (session->module_bytecode_disk_scanned
+        || session->module_bytecode_disk_scan_failed)
+        module_bytecode_disk_close_scan(session);
+    return true;
+}
+
+/* Once a completed scan finds the directory full (a maximum-size file might
+   not fit), removes this build's oldest records, a slice at a time, until
+   both totals are under their low-water marks; rescans when the candidates
+   run out. Idle maintenance only: compiling a module never evicts. */
+static bool module_bytecode_disk_evict_step(BrowserSession *session)
+{
+    if (!session->module_bytecode_disk_evicting) {
+        if (session->module_bytecode_disk_file_count
+                < BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT
+            && session->module_bytecode_disk_total_bytes
+                   <= BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT
+                          - BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT)
+            return false;
+        session->module_bytecode_disk_evicting = true;
+    }
+    uint64_t started = tilefinch_platform_monotonic_time_ns();
+    char prefix[MODULE_BYTECODE_DISK_ENGINE_PREFIX + 1u], path[224];
+    module_bytecode_disk_engine_prefix(prefix);
+    for (unsigned i = 0; i < BROWSER_MODULE_BYTECODE_DISK_SCAN_SLICE; i++) {
+        if (session->module_bytecode_disk_file_count
+                <= BROWSER_MODULE_BYTECODE_DISK_LOW_WATER_FILES
+            && session->module_bytecode_disk_total_bytes
+                   <= BROWSER_MODULE_BYTECODE_DISK_LOW_WATER_BYTES) {
+            session->module_bytecode_disk_evicting = false;
+            return i != 0;
+        }
+        if (session->module_bytecode_disk_victim_count == 0) {
+            module_bytecode_disk_restart(session);
+            return true;
+        }
+        if (i != 0 && tilefinch_platform_monotonic_time_ns() - started
+                         >= 2000000u) break;
+        unsigned last = --session->module_bytecode_disk_victim_count;
+        int written = snprintf(
+            path, sizeof(path), "%s/%s-%.32s%s",
+            session->module_bytecode_disk_dir, prefix,
+            session->module_bytecode_disk_victims[last].name,
+            MODULE_BYTECODE_DISK_SUFFIX);
+        struct stat info;
+        if (written <= 0 || (size_t) written >= sizeof(path)) {
+            module_bytecode_disk_scan_fail(session);
+            return true;
+        }
+        if (stat(path, &info) != 0) {
+            if (errno == ENOENT) continue;
+            module_bytecode_disk_scan_fail(session);
+            return true;
+        }
+        /* Replaced since the scan: no longer the oldest. */
+        if ((int64_t) info.st_mtime
+            != session->module_bytecode_disk_victims[last].mtime) continue;
+        if (remove(path) != 0) {
+            if (errno == ENOENT) continue;
+            module_bytecode_disk_scan_fail(session);
+            return true;
+        }
+        module_bytecode_disk_forget(session, &info);
+    }
+    return true;
+}
+
+bool browser_session_module_bytecode_disk_maintenance(BrowserSession *session)
+{
+    if (!browser_session_module_bytecode_disk_enabled(session)
+        || !session->module_bytecode_disk_write) return false;
+    if (session->module_bytecode_disk_scan_failed) {
+        if (session->module_bytecode_disk_retry_wait > 1u) {
+            session->module_bytecode_disk_retry_wait--;
+            return false;
+        }
+        module_bytecode_disk_restart(session);
+    }
+    if (!session->module_bytecode_disk_scanned)
+        return module_bytecode_disk_scan_step(session, false);
+    return module_bytecode_disk_evict_step(session);
+}
+
+bool browser_session_module_bytecode_disk_clear(BrowserSession *session)
+{
+    if (session == NULL || session->module_bytecode_disk_dir[0] == '\0')
+        return true;
+    module_bytecode_disk_close_scan(session);
+    if (!session->module_bytecode_disk_write) {
+        session->module_bytecode_disk_suspended = true;
+        return true;
+    }
+    module_bytecode_disk_restart(session);
+    session->module_bytecode_disk_evicting = false;
+    /* User-requested deletion, never the module compile path. Each step
+       consumes at least one entry, with a hard aggregate visit bound. */
+    while (module_bytecode_disk_scan_step(session, true)) {}
+    session->module_bytecode_disk_suspended =
+        !session->module_bytecode_disk_scanned;
+    return session->module_bytecode_disk_scanned;
+}
+
+BrowserSharedBody *browser_session_module_bytecode_disk_load(
+    BrowserSession *session, BrowserModuleBytecodeKey *key)
+{
+    unsigned char hash[32];
+    char path[224];
+    if (!browser_session_module_bytecode_disk_enabled(session)
+        || !module_bytecode_disk_key_hash(key, hash)
+        || !module_bytecode_disk_path(session, hash,
+                                      MODULE_BYTECODE_DISK_SUFFIX, path,
+                                      sizeof(path))) return NULL;
+    if (module_bytecode_disk_refused(session, hash)) return NULL;
+    uint64_t read_started = tilefinch_platform_monotonic_time_ns();
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        session->module_bytecode_disk_misses++;
+        session->module_bytecode_disk_read_ns +=
+            tilefinch_platform_monotonic_time_ns() - read_started;
+        return NULL;
+    }
+    unsigned char header[MODULE_BYTECODE_DISK_HEADER];
+    bool ok = fread(header, 1, sizeof(header), file) == sizeof(header)
+        && memcmp(header, MODULE_BYTECODE_DISK_MAGIC, 4) == 0
+        && module_bytecode_disk_get_u32(header + 4)
+               == MODULE_BYTECODE_DISK_VERSION
+        && memcmp(header + 12, hash, 32) == 0;
+    uint32_t length = ok ? module_bytecode_disk_get_u32(header + 8) : 0;
+    ok = ok && length != 0 && length <= BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT;
+    unsigned char *data = ok ? budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_SESSION, length) : NULL;
+    bool allocated = data != NULL;
+    ok = ok && allocated && fread(data, 1, length, file) == length
+        && fgetc(file) == EOF;
+    fclose(file);
+    uint64_t verify_started = tilefinch_platform_monotonic_time_ns();
+    session->module_bytecode_disk_read_ns += verify_started - read_started;
+    unsigned char digest[32];
+    ok = ok && tilefinch_sha256_digest(data, length, digest)
+        && memcmp(digest, header + 44, 32) == 0;
+    session->module_bytecode_disk_verify_ns +=
+        tilefinch_platform_monotonic_time_ns() - verify_started;
+    BrowserSharedBody *body = ok
+        ? browser_shared_body_take(session->budget, data, length) : NULL;
+    if (body == NULL) {
+        budget_free(session->budget, data);
+        /* A Budget refusal says nothing about the file. */
+        if (!ok && (allocated || length == 0
+            || length > BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT))
+            module_bytecode_disk_refuse(session, hash, path);
+        return NULL;
+    }
+    session->module_bytecode_disk_hits++;
+    return body;
+}
+
+void browser_session_module_bytecode_disk_discard(
+    BrowserSession *session, BrowserModuleBytecodeKey *key)
+{
+    unsigned char hash[32];
+    char path[224];
+    if (!browser_session_module_bytecode_disk_enabled(session)
+        || !module_bytecode_disk_key_hash(key, hash)
+        || !module_bytecode_disk_path(session, hash,
+                                      MODULE_BYTECODE_DISK_SUFFIX, path,
+                                      sizeof(path))) return;
+    module_bytecode_disk_refuse(session, hash, path);
+}
+
+bool browser_session_module_bytecode_disk_wants(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    size_t bytecode_length)
+{
+    unsigned char hash[32];
+    char path[224];
+    if (!browser_session_module_bytecode_disk_enabled(session)
+        || !session->module_bytecode_disk_write
+        || bytecode_length > BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT
+        || session->module_bytecode_disk_written
+               > BROWSER_MODULE_BYTECODE_DISK_SESSION_LIMIT - bytecode_length
+        || !module_bytecode_disk_key_hash(key, hash)
+        || !module_bytecode_disk_path(session, hash,
+                                      MODULE_BYTECODE_DISK_SUFFIX, path,
+                                      sizeof(path))) return false;
+    FILE *existing = fopen(path, "rb");
+    if (existing != NULL) {
+        fclose(existing);
+        return false;
+    }
+    /* Accounting only (a failed scan waits for its retry): eviction and
+       retries belong to idle maintenance, not the compile path. */
+    (void) module_bytecode_disk_scan_step(session, false);
+    size_t file_bytes = MODULE_BYTECODE_DISK_HEADER + bytecode_length;
+    return session->module_bytecode_disk_scanned
+        && session->module_bytecode_disk_total_bytes
+               <= BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT - file_bytes
+        && session->module_bytecode_disk_file_count
+               < BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT;
+}
+
+bool browser_session_module_bytecode_disk_store(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    const unsigned char *bytecode, size_t bytecode_length)
+{
+    unsigned char hash[32];
+    char path[224], temporary[232];
+    if (bytecode == NULL || bytecode_length == 0
+        || !browser_session_module_bytecode_disk_wants(session, key,
+                                                       bytecode_length)
+        || !module_bytecode_disk_key_hash(key, hash)
+        || !module_bytecode_disk_path(session, hash,
+                                      MODULE_BYTECODE_DISK_SUFFIX, path,
+                                      sizeof(path))
+        || !module_bytecode_disk_path(session, hash, ".tmp", temporary,
+                                      sizeof(temporary))) return false;
+    if (!session->module_bytecode_disk_dir_ready) {
+        (void) mkdir(session->module_bytecode_disk_dir, 0777);
+        session->module_bytecode_disk_dir_ready = true;
+    }
+    size_t file_bytes = MODULE_BYTECODE_DISK_HEADER + bytecode_length;
+    unsigned char header[MODULE_BYTECODE_DISK_HEADER];
+    memcpy(header, MODULE_BYTECODE_DISK_MAGIC, 4);
+    module_bytecode_disk_put_u32(header + 4, MODULE_BYTECODE_DISK_VERSION);
+    module_bytecode_disk_put_u32(header + 8, (uint32_t) bytecode_length);
+    memcpy(header + 12, hash, 32);
+    if (!tilefinch_sha256_digest(bytecode, bytecode_length, header + 44))
+        return false;
+    FILE *file = fopen(temporary, "wb");
+    if (file == NULL) return false;
+    bool ok = fwrite(header, 1, sizeof(header), file) == sizeof(header)
+        && fwrite(bytecode, 1, bytecode_length, file) == bytecode_length;
+    ok = fclose(file) == 0 && ok;
+    /* Publish complete files only: a reader sees the old state or all of
+       this one, and a crash leaves at most a stray .tmp (removed by the
+       next session's scan). */
+    ok = ok && rename(temporary, path) == 0;
+    if (!ok) {
+        (void) remove(temporary);
+        return false;
+    }
+    session->module_bytecode_disk_written += bytecode_length;
+    session->module_bytecode_disk_writes++;
+    session->module_bytecode_disk_total_bytes += file_bytes;
+    session->module_bytecode_disk_file_count++;
+    return true;
+}
+
+void browser_session_module_bytecode_set_limit(BrowserSession *session,
+                                               size_t maximum_bytes)
+{
+    if (session == NULL || session->budget == NULL) return;
+    session->maximum_module_bytecode_bytes = maximum_bytes;
+    if (maximum_bytes == 0) {
+        module_bytecode_clear(session);
+        return;
+    }
+    while (session->module_bytecode != NULL
+           && session->module_bytecode->bytes > maximum_bytes
+           && module_bytecode_evict_one(session) != 0) {}
+}
+
+uint32_t browser_session_module_bytecode_generation(BrowserSession *session)
+{
+    if (session == NULL) return 0;
+    session->module_bytecode_generation++;
+    if (session->module_bytecode_generation == 0) {
+        session->module_bytecode_generation = 1;
+    }
+    return session->module_bytecode_generation;
+}
+
+BrowserSharedBody *browser_session_module_bytecode_acquire(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    uint32_t generation)
+{
+    if (!module_bytecode_usable(session) || !module_bytecode_key_valid(key)
+        || session->module_bytecode == NULL) return NULL;
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        BrowserModuleBytecodeEntry *entry = &cache->entries[i];
+        if (!module_bytecode_same_record(entry, key)) continue;
+        /* One entry per record: hash the source only for that candidate. */
+        if (entry->source_length != key->source_length
+            || entry->compile_flags != key->compile_flags
+            || !module_bytecode_key_digest(key)
+            || memcmp(entry->source_digest, key->source_digest,
+                      sizeof(entry->source_digest)) != 0) return NULL;
+        entry->stamp = ++cache->clock;
+        entry->generation = generation;
+        return browser_shared_body_retain(entry->bytecode);
+    }
+    return NULL;
+}
+
+bool browser_session_module_bytecode_may_fit(
+    const BrowserSession *session, const BrowserModuleBytecodeKey *key,
+    size_t bytecode_length, uint32_t generation)
+{
+    size_t charge = 0;
+    if (!module_bytecode_usable(session) || !module_bytecode_key_valid(key)
+        || bytecode_length == 0
+        || !module_bytecode_charge(key, bytecode_length, &charge)
+        || charge > session->maximum_module_bytecode_bytes) return false;
+    const BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    if (cache == NULL) return true;
+    size_t retained = 0;
+    bool slot = false;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        const BrowserModuleBytecodeEntry *entry = &cache->entries[i];
+        if (entry->bytecode == NULL
+            || module_bytecode_same_record(entry, key)
+            || entry->generation != generation) {
+            slot = true;
+            continue;
+        }
+        retained = entry->charged_bytes > SIZE_MAX - retained
+            ? SIZE_MAX : retained + entry->charged_bytes;
+    }
+    return slot
+        && retained <= session->maximum_module_bytecode_bytes
+        && charge <= session->maximum_module_bytecode_bytes - retained;
+}
+
+bool browser_session_module_bytecode_put(
+    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    uint32_t generation, const unsigned char *bytecode,
+    size_t bytecode_length)
+{
+    size_t charge = 0;
+    if (bytecode == NULL
+        || !browser_session_module_bytecode_may_fit(
+               session, key, bytecode_length, generation)
+        || !module_bytecode_charge(key, bytecode_length, &charge)
+        || !module_bytecode_key_digest(key)) return false;
+    Budget *budget = session->budget;
+    bool created_table = session->module_bytecode == NULL;
+    if (created_table) {
+        session->module_bytecode = budget_calloc_category(
+            budget, BUDGET_CATEGORY_SESSION, 1,
+            sizeof(*session->module_bytecode));
+        if (session->module_bytecode == NULL) return false;
+    }
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    /* Allocate everything before evicting anything, so a refusal leaves the
+       cache exactly as it was. */
+    const char *texts[3] = {
+        key->module_name, key->response_url, key->partition_key
+    };
+    char *copies[3] = {0};
+    bool copied = true;
+    for (size_t i = 0; i < 3 && copied; i++) {
+        size_t length = strlen(texts[i]);
+        copies[i] = budget_malloc_category(
+            budget, BUDGET_CATEGORY_SESSION, length + 1u);
+        if (copies[i] == NULL) copied = false;
+        else memcpy(copies[i], texts[i], length + 1u);
+    }
+    unsigned char *data = copied ? budget_malloc_category(
+        budget, BUDGET_CATEGORY_SESSION, bytecode_length) : NULL;
+    BrowserSharedBody *body = NULL;
+    if (data != NULL) {
+        memcpy(data, bytecode, bytecode_length);
+        body = browser_shared_body_take(budget, data, bytecode_length);
+        if (body == NULL) budget_free(budget, data);
+    }
+    if (body == NULL) {
+        for (size_t i = 0; i < 3; i++) budget_free(budget, copies[i]);
+        if (created_table) module_bytecode_release_table_if_empty(session);
+        return false;
+    }
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        if (module_bytecode_same_record(&cache->entries[i], key)) {
+            module_bytecode_entry_remove(session, &cache->entries[i]);
+        }
+    }
+    BrowserModuleBytecodeEntry *slot = NULL;
+    for (size_t evictions = 0;
+         evictions <= BROWSER_MODULE_BYTECODE_ENTRIES; evictions++) {
+        slot = NULL;
+        for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+            if (cache->entries[i].bytecode == NULL) {
+                slot = &cache->entries[i];
+                break;
+            }
+        }
+        if (slot != NULL && cache->bytes
+                <= session->maximum_module_bytecode_bytes - charge) break;
+        /* may_fit() established that unprotected entries cover the
+           shortfall; this loop cannot evict one this realm has used. */
+        BrowserModuleBytecodeEntry *victim =
+            module_bytecode_victim(cache, generation);
+        if (victim == NULL) {
+            slot = NULL;
+            break;
+        }
+        module_bytecode_entry_remove(session, victim);
+        session->module_bytecode_evictions++;
+    }
+    if (slot == NULL) {
+        browser_shared_body_release(body);
+        for (size_t i = 0; i < 3; i++) budget_free(budget, copies[i]);
+        module_bytecode_release_table_if_empty(session);
+        return false;
+    }
+    *slot = (BrowserModuleBytecodeEntry) {
+        .module_name = copies[0],
+        .response_url = copies[1],
+        .partition_key = copies[2],
+        .bytecode = body,
+        .source_length = key->source_length,
+        .charged_bytes = charge,
+        .stamp = ++cache->clock,
+        .generation = generation,
+        .compile_flags = key->compile_flags
+    };
+    memcpy(slot->source_digest, key->source_digest,
+           sizeof(slot->source_digest));
+    cache->bytes += charge;
+    return true;
+}
+
+void browser_session_module_bytecode_invalidate(
+    BrowserSession *session, BrowserModuleBytecodeKey *key)
+{
+    if (session == NULL || session->module_bytecode == NULL
+        || !module_bytecode_key_valid(key)) return;
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        if (module_bytecode_same_record(&cache->entries[i], key)) {
+            module_bytecode_entry_remove(session, &cache->entries[i]);
+        }
+    }
+    module_bytecode_release_table_if_empty(session);
+}
+
+size_t browser_session_module_bytecode_reclaim(BrowserSession *session,
+                                               size_t target_bytes)
+{
+    if (session == NULL || session->module_bytecode == NULL) return 0;
+    BrowserModuleBytecodeCache *cache = session->module_bytecode;
+    size_t released = 0;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES
+         && released < target_bytes; i++) {
+        BrowserModuleBytecodeEntry *victim = module_bytecode_victim(cache, 0);
+        if (victim == NULL) break;
+        size_t charged = victim->charged_bytes;
+        module_bytecode_entry_remove(session, victim);
+        session->module_bytecode_evictions++;
+        released = charged > SIZE_MAX - released
+            ? SIZE_MAX : released + charged;
+    }
+    return released;
+}
+
+size_t browser_session_module_bytecode_bytes(const BrowserSession *session)
+{
+    return session == NULL || session->module_bytecode == NULL
+        ? 0 : session->module_bytecode->bytes;
+}
+
+size_t browser_session_module_bytecode_entries(const BrowserSession *session)
+{
+    size_t count = 0;
+    if (session == NULL || session->module_bytecode == NULL) return 0;
+    for (size_t i = 0; i < BROWSER_MODULE_BYTECODE_ENTRIES; i++) {
+        if (session->module_bytecode->entries[i].bytecode != NULL) count++;
+    }
+    return count;
+}
+
 bool browser_session_stylesheet_artifacts_acquire(
     BrowserSession *session, const char *request_url,
     const TilefinchRequestContext *request_context,
@@ -3565,6 +4488,13 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
         size_t after = budget_remaining(session->budget);
         reclaimed = after > before ? after - before : 0;
     }
+    /* Module bytecode is an optional accelerator like the responses above;
+       it goes after them because a hit saves a whole compile. */
+    while (reclaimed < target_bytes
+           && module_bytecode_evict_one(session) != 0) {
+        size_t after = budget_remaining(session->budget);
+        reclaimed = after > before ? after - before : 0;
+    }
     while (reclaimed < target_bytes) {
         BrowserSiteAdapterDocumentCacheEntry *victim = NULL;
         for (size_t i = 0;
@@ -3650,6 +4580,7 @@ void browser_session_cache_clear(BrowserSession *session)
         cache_remove(session, &session->cache[i]);
     }
     browser_session_site_adapter_document_cache_clear(session);
+    module_bytecode_clear(session);
     session->clock = 0;
 }
 
@@ -4021,6 +4952,8 @@ void browser_session_destroy(BrowserSession *session)
         cache_remove(session, &session->cache[i]);
     }
     browser_session_site_adapter_document_cache_clear(session);
+    module_bytecode_clear(session);
+    module_bytecode_disk_close_scan(session);
     budget_reservation_release(&session->accounting_reservation);
     memset(session, 0, sizeof(*session));
 }

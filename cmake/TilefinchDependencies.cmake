@@ -176,6 +176,14 @@ option(TILEFINCH_STRIP_RELEASE_EBOOT
        ${TILEFINCH_STRIP_RELEASE_EBOOT_DEFAULT})
 option(PSP_BROWSER_CURL_STUB
        "On PSP, satisfy fetch.c's curl references with a no-op stub instead of linking the SDK libcurl stack (hermetic replay only)" OFF)
+if(PSP AND NOT TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
+    set(tilefinch_fetch_trace_default OFF)
+else()
+    set(tilefinch_fetch_trace_default ON)
+endif()
+option(PSP_BROWSER_ENABLE_FETCH_TRACE
+    "Include HTTP capture/replay (host labs, validation and hermetic replay builds)"
+    ${tilefinch_fetch_trace_default})
 include(cmake/PspOwnedTransport.cmake)
 set(PSP_BROWSER_PSP_CA_BUNDLE
     "${CMAKE_CURRENT_SOURCE_DIR}/certs/roots.pem" CACHE FILEPATH
@@ -184,6 +192,10 @@ option(PSP_BROWSER_JS_EXECUTION_PROFILE
        "Collect bounded QuickJS opcode, function, and PC hot spots" OFF)
 option(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
        "Trace bounded null/undefined QuickJS property reads (lab diagnostics only)" OFF)
+option(PSP_BROWSER_JS_CALL_COUNTS
+       "Count calls per QuickJS function for the JS profiler's calls table (dev builds)" OFF)
+option(PSP_BROWSER_JS_OP_COUNTS
+       "Count QuickJS calls, dispatched opcodes, and float64 values for the tilefinch-work record (count builds: never time them)" OFF)
 option(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
        "Inline trivial Bellard QuickJS getters that return one captured value" ON)
 option(PSP_BROWSER_QUICKJS_FUNCTION_RECYCLE
@@ -216,6 +228,8 @@ set(PSP_BROWSER_QUICKJS_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/quickjs-ng-v0.15.0-closure-shape-cache.patch")
 set(PSP_BROWSER_LEXBOR_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-partial-document-destroy.patch")
+set(PSP_BROWSER_LEXBOR_FOSTER_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-foster-parent-insertion-events.patch")
 set(PSP_BROWSER_NANOSVG_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-bounded-fixed-edges.patch")
 set(PSP_BROWSER_POCKETSPHINX_SOURCE_DIR "" CACHE PATH
@@ -231,6 +245,7 @@ set(PSP_BROWSER_APPLY_PATCH_SCRIPT
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_QUICKJS_PATCH}"
     "${PSP_BROWSER_LEXBOR_PATCH}"
+    "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
     "${PSP_BROWSER_NANOSVG_PATCH}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-int32.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-no-mmap.patch"
@@ -341,16 +356,19 @@ else()
     set(PSP_BROWSER_LEXBOR_SOURCE_DIR "${lexbor_SOURCE_DIR}")
     set(PSP_BROWSER_LEXBOR_NEEDS_ADD_SUBDIRECTORY OFF)
 endif()
-execute_process(
-    COMMAND "${CMAKE_COMMAND}"
-        -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
-        -DPATCH_FILE=${PSP_BROWSER_LEXBOR_PATCH}
-        -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-        -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-    RESULT_VARIABLE lexbor_patch_result)
-if(NOT lexbor_patch_result EQUAL 0)
-    message(FATAL_ERROR "Could not prepare the Lexbor source")
-endif()
+foreach(lexbor_patch IN ITEMS
+        "${PSP_BROWSER_LEXBOR_PATCH}" "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}")
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+            -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
+            -DPATCH_FILE=${lexbor_patch}
+            -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
+            -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
+        RESULT_VARIABLE lexbor_patch_result)
+    if(NOT lexbor_patch_result EQUAL 0)
+        message(FATAL_ERROR "Could not prepare the Lexbor source")
+    endif()
+endforeach()
 if(PSP_BROWSER_LEXBOR_NEEDS_ADD_SUBDIRECTORY)
     add_subdirectory("${PSP_BROWSER_LEXBOR_SOURCE_DIR}"
                      "${CMAKE_BINARY_DIR}/_deps/lexbor-build"
@@ -374,9 +392,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-        "0ad44ce4195e8b84966f561cd3afd4aa0e9c217094b4eeb083a0007b4b42fa1d")
+        "de3e49b132640635b2a282ca7796e8ecfc8e1401897a4e1838f11bb5f116676a")
     set(tilefinch_quickjs_vendor_h_sha256
-        "225a7d514aa4b380da014588a8181e9e8df82feec752ebb4adde01e16a53605e")
+        "be98f918f36fafc853e404a72d7a8abb622e531bc8e656ff7873e495ef1d7ed4")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
     if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -423,19 +441,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "c4fc025aff4d1b70c493148123691c01f39dce57b0fba85f5ca0e0153ff8e582")
+            "018ad5fc57201cc011bb6bf64048dc20047d63c2d5d4239c4acabe6f2d343c44")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "70eba8290e71fb51eb6fae508391c831c6aaafd9a28e221b90d0dce264d43705")
+            "ae60a551990db8f6e2649b278f6fdd389a445a957aed1734f2af3cc662528690")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "94b72f8d0f40911b44a8224452bfbeedab3b66be63f72814e9e08a196180ea57")
+            "6fdae33097296768d5d2833a78c94a65b18e410e9ab91931aa0459c6a47545be")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "2fad09dc4a35c2d6b04098548ce02b0e0c0ce1ac0162840586c6b7595818aadc")
+            "650b2c67474e8a1a95fa591579b74c62052d66ec3960a426972b14dace8dc828")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "7ad70409b2b8166bc067ee9d81c37eb10f709005ec04496f269f8055d07fc38d")
+            "61f1a2271333d5c347878d893a450be527ec8c940fd54f773cf7226ab146b84e")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "4d16f5e4642cdcec456c2ace0f13f8979d9f9e451a384d419e2ff0a834d42aa8")
+            "bf01c494f17dd18885ae6414c8fce55d9e22dc6fac31ccfe4d83f51c4be1f39f")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "a60d2b75ff7481f0bd2429abacf480dd0875802063141fd7ef3a6385d4c2e495")
+            "5f443a4a1256de43933e4e2459368acb6ff0fab31ed53752f9029d8a90f5c1fc")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -475,7 +493,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
                     single-char-string-buffer repeat-rope-eval latin1-string
                     scope-oom retired-async-state realm-retirement
                     dynamic-code-policy capture-getter-fastpath)
-                execute_process(COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
+                execute_process(COMMAND "${PATCH_EXECUTABLE}" --force --silent -R -p1
                     -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
                     WORKING_DIRECTORY "${tilefinch_quickjs_variant_dir}"
                     COMMAND_ERROR_IS_FATAL ANY)
@@ -483,9 +501,11 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "6242b2751a3c2deac491540a150aba766acd40e2f5e314747df22ab18af7a692")
+                   "72d86d358f4a8416308648df90877380a77ad007be46f15970c6072128cf40cc")
                 message(FATAL_ERROR
-                    "Reversing the QuickJS default stack did not reach the bounded baseline")
+                    "Reversing the QuickJS default stack reached "
+                    "${tilefinch_quickjs_variant_baseline}, not the pinned "
+                    "bounded baseline")
             endif()
             set(tilefinch_quickjs_forward)
             if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
@@ -510,7 +530,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             endif()
             list(APPEND tilefinch_quickjs_forward native-string-gc)
             foreach(layer IN LISTS tilefinch_quickjs_forward)
-                execute_process(COMMAND "${PATCH_EXECUTABLE}" --forward --silent -p1
+                execute_process(COMMAND "${PATCH_EXECUTABLE}" --force --forward --silent -p1
                     -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
                     WORKING_DIRECTORY "${tilefinch_quickjs_variant_dir}"
                     COMMAND_ERROR_IS_FATAL ANY)
@@ -538,6 +558,13 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     endif()
     set(TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR "${quickjs_SOURCE_DIR}"
         CACHE INTERNAL "Actual Bellard engine source selected for this build" FORCE)
+    # Persistent module bytecode is valid only for the engine that wrote it:
+    # key it by the exact interpreter source compiled here.
+    file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c" tilefinch_quickjs_engine_sha256)
+    string(SUBSTRING "${tilefinch_quickjs_engine_sha256}" 0 16
+        tilefinch_quickjs_engine_id)
+    set(TILEFINCH_QUICKJS_ENGINE_ID "${tilefinch_quickjs_engine_id}"
+        CACHE INTERNAL "Fingerprint of the compiled QuickJS source" FORCE)
     add_library(qjs STATIC
         "${quickjs_SOURCE_DIR}/quickjs.c"
         "${quickjs_SOURCE_DIR}/dtoa.c"
@@ -549,13 +576,34 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
         _GNU_SOURCE CONFIG_VERSION="2026-06-04")
     target_compile_definitions(qjs PUBLIC
         TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY=1)
+    option(PSP_BROWSER_EXECUTION_CENSUS
+        "Compile validation-only interpreter census hooks (disable for a clean timing control)" ON)
+    if(NOT PSP OR (TILEFINCH_PSP_VALIDATION_LOG AND PSP_BROWSER_EXECUTION_CENSUS))
+        target_compile_definitions(qjs PUBLIC CONFIG_TILEFINCH_EXECUTION_CENSUS=1)
+        option(PSP_BROWSER_JS_REFCOUNT_CENSUS "Count-only value retain/release diagnostic; timings are not comparable" OFF)
+        if(PSP_BROWSER_JS_REFCOUNT_CENSUS)
+            target_compile_definitions(qjs PUBLIC CONFIG_TILEFINCH_REFCOUNT_CENSUS=1)
+        endif()
+    endif()
     if(NOT PSP)
         # Deterministic host proof that repeated-string eval skips shared rope
-        # nodes while preserving its logical interrupt accounting.
+        # nodes while preserving its logical interrupt accounting; and
+        # JS_CompileLazyFunctions, which the lazy-function tests use to
+        # compile every deferred body of a script.
         target_compile_definitions(qjs PUBLIC
-            CONFIG_TILEFINCH_EVAL_ROPE_TEST=1)
+            CONFIG_TILEFINCH_EVAL_ROPE_TEST=1
+            CONFIG_TILEFINCH_LAZY_TOOLS=1)
     endif()
     target_compile_options(qjs PRIVATE -funsigned-char -fwrapv)
+    if(PSP)
+        # The PSP presets are MinSizeRel (-Os); the JavaScript engine alone
+        # is built at -O2 (it follows the build type's flags, so it wins).
+        # Device, chatgpt-ask offline replay: first usable input -3.2 s,
+        # first answer -6.5 s, module compile 8.29 -> 7.43 s; the device
+        # kernel bench runs most kernels at 0.6-0.9x the -Os time. Cost
+        # ~270 KB of .text (user-approved; the ratchets below include it).
+        target_compile_options(qjs PRIVATE -O2)
+    endif()
     set_target_properties(qjs PROPERTIES C_EXTENSIONS ON)
     if(PSP)
         # newlib PSP accommodations, confined to the vendored VM:
@@ -576,6 +624,12 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
         target_compile_definitions(qjs PUBLIC CONFIG_PROPERTY_FAULT_TRACE=1)
     endif()
+    if(PSP_BROWSER_JS_CALL_COUNTS)
+        target_compile_definitions(qjs PRIVATE CONFIG_TILEFINCH_CALL_COUNTS=1)
+    endif()
+    if(PSP_BROWSER_JS_OP_COUNTS)
+        target_compile_definitions(qjs PRIVATE CONFIG_TILEFINCH_OP_COUNTS=1)
+    endif()
     if(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY)
         target_compile_definitions(qjs PRIVATE
             CONFIG_TILEFINCH_COMPACT_CHAR_ARRAY=1)
@@ -595,6 +649,171 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_LIGHTNING_INCLUDE_DIR}")
         target_compile_definitions(qjs PRIVATE CONFIG_NATIVE_TRACE=1)
         target_link_libraries(qjs PUBLIC "${PSP_BROWSER_LIGHTNING_LIBRARY}")
+    endif()
+    # Profile-guided optimisation of the engine objects on the PSP
+    # (PERFORMANCE_LEDGER.md, "Profile-guided engine build"). Both are off by
+    # default and neither touches any other object.
+    #
+    # GENERATE instruments the engine with arc and value counters (libgcov).
+    # A PSP program never runs exit(), so the browser writes the counters
+    # itself just before its clean-exit record, to pgo/ beside the EBOOT (a
+    # relative path, resolved against the EBOOT's directory). Train under
+    # PPSSPP only: scripts/train-quickjs-pgo.sh. The instrumented image is
+    # far over the .text ratchet (PSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE).
+    #
+    # USE names a directory of the resulting .gcda files. GCC finds a
+    # profile by its object's path, mangled ('/' -> '#') relative to the
+    # build tree (-fprofile-prefix-path), so a profile trained in one build
+    # directory applies in another, but only to the exact engine build it
+    # was trained on (the fingerprint below). Functions the training never
+    # ran stay at the ordinary -O2 (-fprofile-partial-training) rather than
+    # being optimized for size, since other sites run engine paths
+    # chatgpt.com does not.
+    option(PSP_BROWSER_QUICKJS_PGO_GENERATE
+        "Instrument the PSP QuickJS objects for profile collection (training builds)" OFF)
+    set(PSP_BROWSER_QUICKJS_PGO_USE "" CACHE PATH
+        "Directory of QuickJS .gcda profiles to optimize the PSP engine with")
+    if(PSP_BROWSER_QUICKJS_PGO_GENERATE OR PSP_BROWSER_QUICKJS_PGO_USE)
+        if(NOT PSP)
+            message(FATAL_ERROR
+                "PSP_BROWSER_QUICKJS_PGO_* apply to the PSP cross-build only")
+        endif()
+        if(PSP_BROWSER_QUICKJS_PGO_GENERATE AND PSP_BROWSER_QUICKJS_PGO_USE)
+            message(FATAL_ERROR "PSP_BROWSER_QUICKJS_PGO_GENERATE and "
+                "PSP_BROWSER_QUICKJS_PGO_USE are mutually exclusive")
+        endif()
+        # What a profile is valid for: the compiler, every engine source and
+        # header, and the engine's flags and definitions as configured so
+        # far (build-tree paths in the prefix maps excepted). Experiment
+        # flags (PSP_BROWSER_QUICKJS_OPT_FLAGS) are not in it; a change that
+        # alters control flow still fails the compile (-Wcoverage-mismatch
+        # stays an error).
+        set(tilefinch_quickjs_pgo_inputs
+            "compiler=${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
+        file(GLOB tilefinch_quickjs_pgo_files
+            "${quickjs_SOURCE_DIR}/*.c" "${quickjs_SOURCE_DIR}/*.h")
+        list(SORT tilefinch_quickjs_pgo_files)
+        foreach(tilefinch_quickjs_pgo_file IN LISTS tilefinch_quickjs_pgo_files)
+            file(SHA256 "${tilefinch_quickjs_pgo_file}" tilefinch_quickjs_pgo_hash)
+            get_filename_component(tilefinch_quickjs_pgo_name
+                "${tilefinch_quickjs_pgo_file}" NAME)
+            string(APPEND tilefinch_quickjs_pgo_inputs
+                "\n${tilefinch_quickjs_pgo_name}=${tilefinch_quickjs_pgo_hash}")
+        endforeach()
+        string(TOUPPER "${CMAKE_BUILD_TYPE}" tilefinch_quickjs_pgo_config)
+        get_directory_property(tilefinch_quickjs_pgo_dir_options COMPILE_OPTIONS)
+        get_directory_property(tilefinch_quickjs_pgo_dir_defs COMPILE_DEFINITIONS)
+        # The PSP toolchain's directory properties can be appended twice
+        # (seen between otherwise identical trees); a repeated include
+        # directory or definition does not change the compile.
+        list(REMOVE_DUPLICATES tilefinch_quickjs_pgo_dir_options)
+        list(REMOVE_DUPLICATES tilefinch_quickjs_pgo_dir_defs)
+        foreach(tilefinch_quickjs_pgo_property
+                COMPILE_OPTIONS COMPILE_DEFINITIONS INCLUDE_DIRECTORIES
+                C_STANDARD C_EXTENSIONS SOURCES)
+            get_target_property(tilefinch_quickjs_pgo_value qjs
+                ${tilefinch_quickjs_pgo_property})
+            if(tilefinch_quickjs_pgo_property STREQUAL "INCLUDE_DIRECTORIES"
+                    OR tilefinch_quickjs_pgo_property STREQUAL "COMPILE_DEFINITIONS")
+                list(REMOVE_DUPLICATES tilefinch_quickjs_pgo_value)
+            endif()
+            string(APPEND tilefinch_quickjs_pgo_inputs
+                "\n${tilefinch_quickjs_pgo_property}=${tilefinch_quickjs_pgo_value}")
+        endforeach()
+        string(APPEND tilefinch_quickjs_pgo_inputs
+            "\nflags=${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${tilefinch_quickjs_pgo_config}}"
+            "\ndirectory-options=${tilefinch_quickjs_pgo_dir_options}"
+            "\ndirectory-definitions=${tilefinch_quickjs_pgo_dir_defs}")
+        # The prefix maps and absolute paths (SOURCES, INCLUDE_DIRECTORIES)
+        # name the checkout and build tree, not the engine.
+        string(REGEX REPLACE "-f(file|debug|macro)-prefix-map=[^;\n]*;?" ""
+            tilefinch_quickjs_pgo_inputs "${tilefinch_quickjs_pgo_inputs}")
+        # The build tree may sit inside the checkout: map it first.
+        string(REPLACE "${CMAKE_BINARY_DIR}" "<build>"
+            tilefinch_quickjs_pgo_inputs "${tilefinch_quickjs_pgo_inputs}")
+        string(REPLACE "${CMAKE_CURRENT_SOURCE_DIR}" "<source>"
+            tilefinch_quickjs_pgo_inputs "${tilefinch_quickjs_pgo_inputs}")
+        if(DEFINED ENV{PSPDEV} AND NOT "$ENV{PSPDEV}" STREQUAL "")
+            string(REPLACE "$ENV{PSPDEV}" "<pspdev>"
+                tilefinch_quickjs_pgo_inputs "${tilefinch_quickjs_pgo_inputs}")
+        endif()
+        string(SHA256 tilefinch_quickjs_pgo_fingerprint
+            "${tilefinch_quickjs_pgo_inputs}")
+        string(SUBSTRING "${tilefinch_quickjs_pgo_fingerprint}" 0 24
+            tilefinch_quickjs_pgo_fingerprint)
+        set(TILEFINCH_QUICKJS_PGO_FINGERPRINT "${tilefinch_quickjs_pgo_fingerprint}"
+            CACHE INTERNAL "Engine build a QuickJS PGO profile is valid for" FORCE)
+        file(WRITE "${CMAKE_BINARY_DIR}/quickjs-pgo-fingerprint.txt"
+            "${tilefinch_quickjs_pgo_inputs}\n")
+    endif()
+    if(PSP_BROWSER_QUICKJS_PGO_GENERATE)
+        message(WARNING "QuickJS is instrumented for profile collection: "
+            "training build, not a shippable image")
+        target_compile_options(qjs PRIVATE
+            -fprofile-generate=pgo
+            -fprofile-update=single
+            "-fprofile-prefix-path=${CMAKE_BINARY_DIR}")
+        target_link_libraries(qjs PUBLIC gcov)
+    elseif(PSP_BROWSER_QUICKJS_PGO_USE)
+        file(GLOB tilefinch_quickjs_pgo_profiles
+            "${PSP_BROWSER_QUICKJS_PGO_USE}/*.gcda")
+        if(NOT tilefinch_quickjs_pgo_profiles)
+            message(FATAL_ERROR "PSP_BROWSER_QUICKJS_PGO_USE="
+                "${PSP_BROWSER_QUICKJS_PGO_USE} holds no .gcda profiles")
+        endif()
+        # scripts/train-quickjs-pgo.sh records the fingerprint it trained.
+        # GCC looks a function's profile up by an id that includes its
+        # source line, so one line added near the top of quickjs.c loses the
+        # profile of nearly every function below it (measured: 1,230 of
+        # them), and that build's quickjs.c object was 28% larger than with
+        # no profile at all. A profile is valid for exactly one engine build.
+        if(NOT EXISTS "${PSP_BROWSER_QUICKJS_PGO_USE}/PROVENANCE")
+            message(FATAL_ERROR "${PSP_BROWSER_QUICKJS_PGO_USE} has no "
+                "PROVENANCE: cannot tell which engine build the profile was "
+                "trained on (scripts/train-quickjs-pgo.sh writes it)")
+        endif()
+        file(STRINGS "${PSP_BROWSER_QUICKJS_PGO_USE}/PROVENANCE"
+            tilefinch_quickjs_pgo_trained REGEX "^fingerprint=")
+        string(REPLACE "fingerprint=" "" tilefinch_quickjs_pgo_trained
+            "${tilefinch_quickjs_pgo_trained}")
+        if(NOT tilefinch_quickjs_pgo_trained STREQUAL
+           TILEFINCH_QUICKJS_PGO_FINGERPRINT)
+            message(FATAL_ERROR "The QuickJS profile in "
+                "${PSP_BROWSER_QUICKJS_PGO_USE} was trained on engine build "
+                "'${tilefinch_quickjs_pgo_trained}'; this one is "
+                "${TILEFINCH_QUICKJS_PGO_FINGERPRINT} (inputs in "
+                "${CMAKE_BINARY_DIR}/quickjs-pgo-fingerprint.txt). Retrain "
+                "with scripts/train-quickjs-pgo.sh: a stale profile is worse "
+                "than none.")
+        endif()
+        # -fno-reorder-functions: no .text.hot/.text.unlikely function
+        # grouping. The EBOOT's default link script would gather those
+        # sections but the PSPLink PRX's linkfile.prx does not, so the two
+        # would get different layouts; and whole-function ordering was
+        # measured on its own and rejected (PERFORMANCE_LEDGER.md,
+        # "Profile-ordered code layout"). Blocks inside each function are
+        # still laid out by the profile.
+        target_compile_options(qjs PRIVATE
+            "-fprofile-use=${PSP_BROWSER_QUICKJS_PGO_USE}"
+            "-fprofile-prefix-path=${CMAKE_BINARY_DIR}"
+            -fprofile-partial-training
+            -fno-reorder-functions
+            -Werror=coverage-mismatch
+            -Werror=missing-profile)
+        # A new profile must recompile the engine, not only a new source.
+        get_target_property(tilefinch_quickjs_pgo_sources qjs SOURCES)
+        set_property(SOURCE ${tilefinch_quickjs_pgo_sources}
+            APPEND PROPERTY OBJECT_DEPENDS ${tilefinch_quickjs_pgo_profiles})
+    endif()
+    # Engine-only compiler flags for optimisation experiments, applied after
+    # the defaults and the PGO options above, so they can override either;
+    # empty for every preset.
+    set(PSP_BROWSER_QUICKJS_OPT_FLAGS "" CACHE STRING
+        "Extra compile options for the vendored QuickJS objects only")
+    if(PSP_BROWSER_QUICKJS_OPT_FLAGS)
+        separate_arguments(tilefinch_quickjs_opt_flags
+            NATIVE_COMMAND "${PSP_BROWSER_QUICKJS_OPT_FLAGS}")
+        target_compile_options(qjs PRIVATE ${tilefinch_quickjs_opt_flags})
     endif()
 elseif(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/quickjs-ng/CMakeLists.txt")
     execute_process(

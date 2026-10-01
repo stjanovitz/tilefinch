@@ -44,7 +44,9 @@ static void psp_app_finish_focus_action(
        the normal render scheduler, ahead of optional resource work. */
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_focus_feedback_begin(app->browser->engine, (int) intent->action,
-                             frame->ui_sample_us);
+                             frame->replayed_press_us != 0
+                                 ? frame->replayed_press_us
+                                 : frame->ui_sample_us);
 #endif
     BrowserRenderJobStatus rendered = browser_engine_render_frame_bounded(
         app->browser->engine, PSP_RENDER_JOB_BUDGET_US, 4u);
@@ -482,7 +484,9 @@ void psp_app_dispatch_action(
                 if (scrolled)
                     psp_focus_feedback_begin(
                         app->browser->engine, (int) intent->action,
-                        frame->ui_sample_us);
+                        frame->replayed_press_us != 0
+                            ? frame->replayed_press_us
+                            : frame->ui_sample_us);
 #endif
                 frame->page_dirty = scrolled || frame->page_dirty;
             }
@@ -520,6 +524,7 @@ static void psp_app_dispatch_heavy_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
     if (intent == NULL || intent->action == PSP_UI_ACTION_NONE) return;
+    app->interactive->script_text_focus_deadline_us = 0;
     PspUiIntent resolved_home_tab;
     if (psp_app_resolve_home_tab_action(
             app, intent, &resolved_home_tab)) intent = &resolved_home_tab;
@@ -677,18 +682,39 @@ static void psp_app_dispatch_heavy_action(
                             (unsigned) cost->flow_phase_transitions);
                 }
 #endif
-                /* The receipt toast promised an opening. An activation that
-                   changed the page in place (a checkbox drawer, a details
-                   toggle) is complete once it returns, possibly after a long
-                   relayout, so the promise must not outlive it by 1.5 s. */
-                PspUiState *activation_ui = &app->process->presentation.ui;
-                const char *activation_ack =
-                    psp_ui_action_acknowledgement(PSP_UI_ACTION_ACTIVATE);
-                if (activated && action.type == CONTROLLER_ACTION_CONTROL
-                    && activation_ack != NULL
-                    && strcmp(activation_ui->status, activation_ack) == 0) {
-                    activation_ui->toast_frames = 0;
-                    frame->page_dirty = true;
+                /* The press can land on something that focuses a text field
+                   rather than on the field itself: a <label> laid over it
+                   (ChatGPT's composer), or a control whose handler calls
+                   focus(). A phone opens its keyboard for that focus, so
+                   open text entry here too; otherwise the first press looked
+                   like it did nothing and only a second one typed. */
+                if (activated && !focused_text && !enter_only
+                    && action.type == CONTROLLER_ACTION_CONTROL) {
+                    (void) psp_engine_views_refresh(app->views, engine);
+                    (void) browser_engine_adopt_script_focus(engine);
+                    ControllerTextInputInfo focused_after = {0};
+                    if (browser_engine_text_input_info(
+                            engine, &focused_after)
+                        && focused_after.editable) {
+                        bool submit_focused = false;
+                        if (psp_replace_focused_text(
+                                engine, engine_frame,
+                                &app->process->presentation.ui,
+                                &app->process->text_input, false,
+                                &submit_focused)) {
+                            frame->page_dirty = true;
+                            (void) psp_engine_views_refresh(
+                                app->views, engine);
+                        }
+                        app->interactive->previous_buttons = 0;
+                        break;
+                    }
+                    /* The handler may focus the field a task or a module
+                       load later; keep watching while the press's user
+                       activation lasts (5 s, as in Chromium). */
+                    app->interactive->script_text_focus_deadline_us =
+                        (uint64_t) sceKernelGetSystemTimeWide()
+                        + UINT64_C(5000000);
                 }
             }
             if (activated) {
@@ -864,8 +890,7 @@ static void psp_app_dispatch_heavy_action(
                     snprintf(
                         action.method, sizeof(action.method),
                         "%s", "GET");
-                    action.body_length = 0;
-                    action.body[0] = '\0';
+                    controller_action_clear_body(&action);
                     action.content_type[0] = '\0';
                 }
                 /* `tilefinch://home` is the same destination spelled as an
@@ -897,8 +922,7 @@ static void psp_app_dispatch_heavy_action(
                     snprintf(
                         action.method, sizeof(action.method),
                         "%s", "GET");
-                    action.body_length = 0;
-                    action.body[0] = '\0';
+                    controller_action_clear_body(&action);
                     action.content_type[0] = '\0';
                 }
                 if (navigates && psp_offline_url(action.url)) {

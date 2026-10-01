@@ -162,6 +162,16 @@
         this.setAttribute(name, String(value));
       },
     });
+    /* Reflected <meta> attributes. Without the interface, meta.content fell
+       through to a generic null getter; ChatGPT's mobile keyboard bootstrap
+       reads viewport meta.content.includes(...) and threw. */
+    Object.defineProperties(HTMLMetaElement.prototype, {
+      name: reflect("name"),
+      content: reflect("content"),
+      httpEquiv: reflect("http-equiv"),
+      media: reflect("media"),
+      scheme: reflect("scheme"),
+    });
     Object.defineProperties(HTMLLinkElement.prototype, {
       as: reflect("as"),
       integrity: reflect("integrity"),
@@ -745,6 +755,14 @@
       this.submitter = options.submitter ?? null;
     }
   };
+  globalThis.TransitionEvent = class TransitionEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      this.propertyName = String(options.propertyName || "");
+      this.elapsedTime = Math.max(0, Number(options.elapsedTime) || 0);
+      this.pseudoElement = String(options.pseudoElement || "");
+    }
+  };
   globalThis.ToggleEvent = class ToggleEvent extends Event {
     constructor(type, options = {}) {
       super(type, options);
@@ -1132,13 +1150,90 @@
         document.__activeElement = document.body;
     });
   };
-  /* Called for every mutation and inline style write. Whether the focused
-     element survived them is asked once, after the task's mutations, not
-     after each one (isFocusable reads attributes and computed style). */
-  globalThis.__tilefinchQueueFocusFixup = () => {
+  const nativeIsAncestor = globalThis.__tilefinchIsAncestor,
+    nativeIsConnected = globalThis.__tilefinchIsConnected,
+    selectorsTestAttribute = globalThis.__tilefinchSelectorsTestAttribute;
+  /* Whether a child-list insertion under `handle` moved the focused
+     element: one of the inserted nodes is it or contains it (it stays
+     connected but inherits its new ancestors' visibility). Only an
+     insertion under one of its ancestors can; the added nodes are checked
+     only then, so insertions beside or away from it stay cheap. */
+  let rootElementHandle = 0;
+  const focusSubtreeInserted = (handle, added, activeHandle) => {
+    if (!added?.length) return false;
+    if (handle > 0 && nativeIsAncestor(handle, activeHandle) === false) {
+      /* The native chain stops at a shadow root, so this only proves the
+         insertion missed the focused element in the light tree: one native
+         walk to the root element instead of getRootNode's script walk
+         (pages with shadow roots take that on every insertion). A stale or
+         replaced root element answers "relevant". */
+      if (!(rootElementHandle > 0))
+        rootElementHandle = document.documentElement?.__handle || 0;
+      return (
+        !(rootElementHandle > 0) ||
+        nativeIsAncestor(rootElementHandle, activeHandle) !== true
+      );
+    }
+    for (let i = 0; i < added.length; i++) {
+      const nodeHandle = added[i]?.__handle;
+      if (!(nodeHandle > 0) || nodeHandle === activeHandle) return true;
+      if (nativeIsAncestor(nodeHandle, activeHandle) !== false) return true;
+    }
+    return false;
+  };
+  /* Whether a mutation of `target` (a node or a native handle) can change
+     the focused element's focusability: a change to the element itself or
+     an ancestor (attributes, inline style and the inherited visibility
+     they drive), a removal that disconnected it, or an insertion that moved
+     it (a subtree holding it re-parented, e.g. under a hidden container).
+     Other child-list or text changes do not matter; a data-* attribute no
+     selector tests changes nothing. Anything the native tree cannot answer
+     counts as relevant. Structural selectors that restyle through siblings
+     are not followed (isFocusable itself reads only visibility). */
+  const focusMutationRelevant = (target, active, type, name, added) => {
+    const handle = typeof target === "number" ? target : target?.__handle,
+      activeHandle = active.__handle;
+    if (target === active || !(activeHandle > 0)) return true;
+    if (type === "childList" || type === "characterData")
+      return (
+        !nativeIsConnected(activeHandle) ||
+        (type === "childList" &&
+          focusSubtreeInserted(handle, added, activeHandle))
+      );
+    if (
+      type === "attributes" &&
+      /^data-/i.test(name) &&
+      !/^data-tilefinch/i.test(name) &&
+      typeof selectorsTestAttribute === "function" &&
+      !selectorsTestAttribute(name)
+    )
+      return false;
+    if (!(handle > 0) || handle === activeHandle) return true;
+    if (!nativeIsConnected(activeHandle)) return true;
+    if (nativeIsAncestor(handle, activeHandle) !== false) return true;
+    /* The native chain stops at a shadow root: inside a shadow tree the
+       host's ancestors are not seen, so every mutation counts. */
+    return active.getRootNode() !== document;
+  };
+  /* Called for every mutation (with its target, record type, attribute
+     name and, for child lists, the added nodes) and inline style write
+     (with the element's handle); no target:
+     always relevant, e.g. a style sheet change. Whether the focused element
+     survived them is asked once, after the task's mutations, not after
+     each one, and only when one of them could have changed it: isFocusable
+     reads the element's computed visibility, which re-cascades its
+     ancestor chain once other mutations have invalidated the style cache
+     (an answer streaming beside a focused composer did this after every
+     task). */
+  globalThis.__tilefinchQueueFocusFixup = (target, type, name, added) => {
     if (focusCheckQueued || focusFixupPending) return;
     const active = document.__activeElement;
     if (!active || active === document.body) return;
+    if (
+      target !== undefined &&
+      !focusMutationRelevant(target, active, type, name, added)
+    )
+      return;
     focusCheckQueued = true;
     queueMicrotask(checkFocusAfterMutations);
   };
@@ -1558,10 +1653,35 @@
       parentOf = (node) =>
         node?.__tilefinchDetachedParent || node?.parentNode || null,
       childrenOf = (node) => Array.from(node?.childNodes || []),
-      isAncestor = (node, parent) =>
-        boundedAncestorPath(parent, parentOf).some((at) =>
-          sameNode(at, node),
-        );
+      nativeRootNode = globalThis.__tilefinchRootNode,
+      wrapHandle = globalThis.__tilefinchWrap,
+      /* Is `node` an inclusive ancestor of `parent`: one native walk to
+         parent's tree root; a root with a script-side detached parent, or a
+         tree the native leaves to script (shadow, remote), takes the bounded
+         walk, which throws on a cycle or an over-deep chain. */
+      isAncestor = (node, parent) => {
+        if (
+          typeof nativeRootNode === "function" &&
+          parent?.__handle > 0 &&
+          node?.__handle > 0 &&
+          !parent.__tilefinchDetachedParent
+        ) {
+          const found = Number(nativeRootNode(parent.__handle, node.__handle));
+          if (found === Number(node.__handle)) return true;
+          if (found < 0) return false;
+          if (found > 0 && !wrapHandle(found)?.__tilefinchDetachedParent)
+            return false;
+        }
+        for (let at = parent, steps = 0; at; at = parentOf(at), steps++) {
+          if (steps >= ancestorLimit)
+            throw new DOMException(
+              "Cyclic or excessively deep node ancestry",
+              "HierarchyRequestError",
+            );
+          if (sameNode(at, node)) return true;
+        }
+        return false;
+      };
     const validatePreInsert = (
       parent,
       node,
@@ -1763,12 +1883,7 @@
       adoptTreeOwner = (node, owner) => {
         if (!node || node.nodeType === Node.DOCUMENT_NODE) return;
         if ("__detachedOwner" in node) node.__detachedOwner = owner;
-        else
-          Object.defineProperty(node, "__tilefinchAdoptedOwner", {
-            configurable: true,
-            writable: true,
-            value: owner,
-          });
+        else globalThis.__tilefinchSetNodeOwner(node, owner);
         for (const child of node.childNodes || []) adoptTreeOwner(child, owner);
       },
       rawDetachedInsert = (parent, node, child) => {
@@ -2240,14 +2355,19 @@
     Object.defineProperty(Element.prototype, "outerHTML", {
       configurable: true,
       get() {
-        const container = (this.ownerDocument || document).createElement("div");
+        const container = (
+          this.__handle !== undefined ? document : this.ownerDocument || document
+        ).createElement("div");
         container.appendChild(this.cloneNode(true));
         return container.innerHTML;
       },
       set(value) {
         const parent = this.parentNode;
         if (!parent) return;
-        const owner = this.ownerDocument || document,
+        const owner =
+            this.__handle !== undefined
+              ? document
+              : this.ownerDocument || document,
           container = owner.createElement("div");
         container.innerHTML = String(value);
         const added = [...container.childNodes],
@@ -2314,6 +2434,8 @@
       };
       return doc;
     };
+    const doctypeWrap = globalThis.__tilefinchWrap,
+      doctypeRelation = globalThis.__tilefinchRelation;
     const mainDoctype =
       childrenOf(document).find(
         (node) => node.nodeType === Node.DOCUMENT_TYPE_NODE,
@@ -2339,12 +2461,21 @@
           },
         },
         parentElement: { configurable: true, get: () => null },
-        previousSibling: { configurable: true, get: () => null },
+        /* The parsed doctype keeps its native siblings (a comment may sit
+           between it and <html>). */
+        previousSibling: {
+          configurable: true,
+          get() {
+            return this.__detachedParent === document
+              ? doctypeWrap(doctypeRelation(this.__handle, 6)) || null
+              : null;
+          },
+        },
         nextSibling: {
           configurable: true,
           get() {
             return this.__detachedParent === document
-              ? document.documentElement
+              ? doctypeWrap(doctypeRelation(this.__handle, 5)) || null
               : null;
           },
         },
@@ -3495,6 +3626,9 @@
     writable: false,
     configurable: false,
   });
+  /* The native result snapshot and pending-work count read the backing
+     record directly: plain data properties, no getter call per turn. */
+  globalThis.__tilefinchHostChannel.networkQueueStats = networkQueueStats;
   const networkRetainedBytes = (...values) => {
     let total = 128;
     for (const value of values) {

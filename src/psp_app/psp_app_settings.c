@@ -376,21 +376,26 @@ bool psp_app_set_video_decoder(PspApp *app)
 }
 #endif
 
-static void psp_app_reload_for_site_security_setting(
-    PspApp *app, PspAppFrameState *frame,
-    const char *reloading_status, const char *saved_status)
+/* Reload mechanics are identical across policy settings. Keep their status
+   strings and cancellation policy at the caller; a local surface remains a
+   successful no-navigation result rather than a failed reload. */
+static void psp_app_reload_after_setting(
+    PspApp *app, const uint16_t *const *engine_frame,
+    const char *reloading_status, const char *saved_status,
+    const char *failed_status, const char *cancel_reason)
 {
     char reload_url[NAVIGATION_URL_LIMIT];
     snprintf(reload_url, sizeof(reload_url), "%s", app->process->presentation.ui.url);
     bool local_surface = app->process->presentation.ui.base_screen == PSP_UI_SCREEN_HOME
         || psp_profile_page_kind(reload_url) != PSP_PROFILE_PAGE_NONE
         || psp_offline_url(reload_url);
-    if (!local_surface && browser_engine_navigation_pending(app->browser->engine)) {
+    if (cancel_reason != NULL && !local_surface
+        && browser_engine_navigation_pending(app->browser->engine)) {
         browser_engine_cancel_navigation(
-            app->browser->engine, "site security exception changed");
+            app->browser->engine, cancel_reason);
     }
     bool started = local_surface || psp_begin_page_load(
-        app->browser->engine, &app->process->presentation.ui, app->browser->profile, app->views->frame,
+        app->browser->engine, &app->process->presentation.ui, app->browser->profile, *engine_frame,
         &app->process->text_input, reload_url, false, 4 * MIB, 30000);
     if (started && !local_surface) {
         app->interactive->navigation_job_started_us =
@@ -399,8 +404,18 @@ static void psp_app_reload_for_site_security_setting(
     psp_ui_show_status(
         &app->process->presentation.ui,
         started && !local_surface ? reloading_status
-            : (started ? saved_status : "SETTING SAVED - RELOAD FAILED"),
+            : (started ? saved_status : failed_status),
         240);
+}
+
+static void psp_app_reload_for_site_security_setting(
+    PspApp *app, PspAppFrameState *frame,
+    const char *reloading_status, const char *saved_status)
+{
+    psp_app_reload_after_setting(
+        app, &app->views->frame, reloading_status, saved_status,
+        "SETTING SAVED - RELOAD FAILED",
+        "site security exception changed");
     (void) frame;
 }
 
@@ -432,6 +447,8 @@ void psp_app_apply_setting(
     BrowserSession *session = app->browser->session;
     BrowserProfile *profile = app->browser->profile;
     BrowserTabs *tabs = app->browser->tabs;
+    /* Policy toggles retain the action's original publication snapshot;
+       security toggles instead pass the live frame field to the helper. */
     const uint16_t *engine_frame = app->views->frame;
     const char *recovery_path = app->process->storage.recovery;
     const char *tab_hibernation_path = app->process->storage.tab_hibernation;
@@ -734,31 +751,11 @@ void psp_app_apply_setting(
             browser_profile_set_javascript_enabled(profile, enabled);
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, frame->ui_sample_us);
-            char reload_url[NAVIGATION_URL_LIMIT];
-            snprintf(reload_url, sizeof(reload_url), "%s", app->process->presentation.ui.url);
-            bool local_surface =
-                app->process->presentation.ui.base_screen == PSP_UI_SCREEN_HOME
-                || psp_profile_page_kind(reload_url)
-                       != PSP_PROFILE_PAGE_NONE
-                || psp_offline_url(reload_url);
-            bool started = local_surface
-                || psp_begin_page_load(
-                    engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                    reload_url, false, 4 * MIB, 30000);
-            if (started && !local_surface)
-                app->interactive->navigation_job_started_us =
-                    (uint64_t) sceKernelGetSystemTimeWide();
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                started && !local_surface
-                    ? (enabled
-                           ? "JAVASCRIPT ON - RELOADING"
-                           : "JAVASCRIPT OFF - RELOADING")
-                    : (started
-                           ? (enabled ? "JAVASCRIPT ON"
-                                      : "JAVASCRIPT OFF")
-                           : "JAVASCRIPT SAVED - RELOAD FAILED"),
-                240);
+            psp_app_reload_after_setting(
+                app, &engine_frame, enabled ? "JAVASCRIPT ON - RELOADING"
+                             : "JAVASCRIPT OFF - RELOADING",
+                enabled ? "JAVASCRIPT ON" : "JAVASCRIPT OFF",
+                "JAVASCRIPT SAVED - RELOAD FAILED", NULL);
         }
     }
     if (intent->setting.id == PSP_UI_SETTING_SITE_JAVASCRIPT) {
@@ -785,31 +782,11 @@ void psp_app_apply_setting(
         } else {
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, frame->ui_sample_us);
-            char reload_url[NAVIGATION_URL_LIMIT];
-            snprintf(reload_url, sizeof(reload_url), "%s", app->process->presentation.ui.url);
-            bool local_surface =
-                app->process->presentation.ui.base_screen == PSP_UI_SCREEN_HOME
-                || psp_profile_page_kind(reload_url)
-                       != PSP_PROFILE_PAGE_NONE
-                || psp_offline_url(reload_url);
-            bool started = local_surface
-                || psp_begin_page_load(
-                    engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                    reload_url, false, 4 * MIB, 30000);
-            if (started && !local_surface)
-                app->interactive->navigation_job_started_us =
-                    (uint64_t) sceKernelGetSystemTimeWide();
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                started && !local_surface
-                    ? (enabled
-                           ? "SITE JAVASCRIPT ON - RELOADING"
-                           : "SITE JAVASCRIPT OFF - RELOADING")
-                    : (started
-                           ? (enabled ? "SITE JAVASCRIPT ON"
-                                      : "SITE JAVASCRIPT OFF")
-                           : "SITE JAVASCRIPT SAVED - RELOAD FAILED"),
-                240);
+            psp_app_reload_after_setting(
+                app, &engine_frame, enabled ? "SITE JAVASCRIPT ON - RELOADING"
+                             : "SITE JAVASCRIPT OFF - RELOADING",
+                enabled ? "SITE JAVASCRIPT ON" : "SITE JAVASCRIPT OFF",
+                "SITE JAVASCRIPT SAVED - RELOAD FAILED", NULL);
         }
     }
     if (intent->setting.id == PSP_UI_SETTING_SITE_DATA_ALLOWED) {
@@ -821,31 +798,11 @@ void psp_app_apply_setting(
         if (browser_engine_navigation_pending(engine))
             browser_engine_cancel_navigation(
                 engine, "global site-data policy changed");
-        char reload_url[NAVIGATION_URL_LIMIT];
-        snprintf(reload_url, sizeof(reload_url), "%s", app->process->presentation.ui.url);
-        bool local_surface =
-            app->process->presentation.ui.base_screen == PSP_UI_SCREEN_HOME
-            || psp_profile_page_kind(reload_url)
-                   != PSP_PROFILE_PAGE_NONE
-            || psp_offline_url(reload_url);
-        bool started = local_surface
-            || psp_begin_page_load(
-                engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                reload_url, false, 4 * MIB, 30000);
-        if (started && !local_surface)
-            app->interactive->navigation_job_started_us =
-                (uint64_t) sceKernelGetSystemTimeWide();
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            started && !local_surface
-                ? (allowed
-                       ? "SITE DATA ALLOWED - RELOADING"
-                       : "SITE DATA BLOCKED - RELOADING")
-                : (started
-                       ? (allowed ? "SITE DATA ALLOWED"
-                                  : "SITE DATA BLOCKED")
-                       : "SITE DATA SAVED - RELOAD FAILED"),
-            240);
+        psp_app_reload_after_setting(
+            app, &engine_frame, allowed ? "SITE DATA ALLOWED - RELOADING"
+                         : "SITE DATA BLOCKED - RELOADING",
+            allowed ? "SITE DATA ALLOWED" : "SITE DATA BLOCKED",
+            "SITE DATA SAVED - RELOAD FAILED", NULL);
     }
     if (intent->setting.id == PSP_UI_SETTING_MIXED_CONTENT_SITE) {
         bool allowed = intent->setting.value.boolean;

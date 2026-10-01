@@ -26,6 +26,7 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
        checkpoint can report the response prefix containing it. The callback
        may occur anywhere within this chunk; the value is therefore an honest
        chunk-boundary upper bound, never an invented byte offset. */
+    TILEFINCH_WORK_ADD(parser_bytes, length);
     if (length > SIZE_MAX - stream->parsed_body_bytes) {
         stream->parsed_body_bytes = SIZE_MAX;
     } else {
@@ -1104,6 +1105,26 @@ static NavigationLoad *navigation_load_begin_common(
     return load;
 }
 
+bool navigation_load_parser_script_time(const NavigationLoad *load,
+                                       uint64_t *used_us,
+                                       uint64_t *limit_us)
+{
+    if (used_us != NULL) *used_us = 0;
+    if (limit_us != NULL) *limit_us = 0;
+    if (load == NULL || load->document_stream == NULL) return false;
+    const NavigationDocumentStream *stream = load->document_stream;
+    uint64_t used = stream->parser_script_stage_us;
+    if (stream->parser_script_turn_started_us != 0) {
+        uint64_t now = navigation_now_us();
+        uint64_t running = now >= stream->parser_script_turn_started_us
+            ? now - stream->parser_script_turn_started_us : 0;
+        used = running > UINT64_MAX - used ? UINT64_MAX : used + running;
+    }
+    if (used_us != NULL) *used_us = used;
+    if (limit_us != NULL) *limit_us = navigation_parser_script_stage_time_limit_us();
+    return true;
+}
+
 NavigationLoad *navigation_load_begin_request(
     NavigationSession *session, uint64_t generation, const char *url,
     const char *method, const char *body, size_t body_length,
@@ -1191,6 +1212,7 @@ NavigationLoadStatus navigation_load_pump(
     session->performance.network_us += navigation_record_slice(
         session, NAVIGATION_SLICE_NETWORK, started, pump.body_bytes);
     load->metrics.body_bytes += pump.body_bytes;
+    TILEFINCH_WORK_ADD(load_bytes, pump.body_bytes);
     load->metrics.body_callbacks += pump.body_callbacks;
     if (pump.peak_buffered_bytes > load->metrics.peak_buffered_bytes) {
         load->metrics.peak_buffered_bytes = pump.peak_buffered_bytes;
@@ -1395,6 +1417,24 @@ static bool navigation_load_finalize_parse(NavigationLoad *load)
             return false;
         }
         uint64_t started = navigation_now_us();
+        if (!document_parser_end_input(&load->parser)) {
+            navigation_load_set_error(
+                load, NAVIGATION_LOAD_FAILED,
+                "HTML parser finalization failed within the page budget");
+            return false;
+        }
+        /* EOF inserts nodes too, and nothing after the last parser-blocking
+           script has reached an observer yet. The checkpoint accounts its
+           own author time; keep it out of the parser slice. */
+        uint64_t checkpoint_started = navigation_now_us();
+        if (!navigation_stream_eof_parser_mutation_checkpoint(stream)) {
+            load->status = NAVIGATION_LOAD_FAILED;
+            return false;
+        }
+        uint64_t checkpoint_us = navigation_elapsed_us(
+            checkpoint_started, navigation_now_us());
+        started = checkpoint_us > UINT64_MAX - started
+            ? UINT64_MAX : started + checkpoint_us;
         if (!document_parser_finish(&load->parser,
                                     &load->finalized_document)) {
             navigation_load_set_error(
@@ -1913,6 +1953,17 @@ bool navigation_load_metrics(const NavigationLoad *load,
     if (load->status == NAVIGATION_LOAD_PENDING && load->request_id != 0) {
         (void) fetch_scheduler_stream_metrics(
             load->scheduler, load->request_id, &metrics->stream);
+    }
+    metrics->progress_units = metrics->body_bytes
+        + metrics->stream.downloaded_bytes + metrics->finalize_slices
+        + metrics->finalize_work_units;
+    if (load->candidate_session != NULL
+        && load->candidate_session->page.runtime != NULL) {
+        ScriptRuntimeTelemetry telemetry;
+        script_runtime_telemetry(load->candidate_session->page.runtime,
+                                 &telemetry);
+        metrics->progress_units += telemetry.scripts_evaluated
+            + telemetry.dom_mutations;
     }
     if (load->status == NAVIGATION_LOAD_SUCCEEDED) {
         metrics->completion_per_mille = 1000;

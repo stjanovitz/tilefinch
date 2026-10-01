@@ -194,6 +194,9 @@ int main(int argc, char **argv)
         "redirect-cors-trace-taint",
         test_redirect_cors_trace_taint(
             &budget, (unsigned) parsed, argv[4]));
+    RUN_REDIRECT_TEST(
+        "script-form-private-network-admission",
+        test_script_form_private_network_admission((unsigned) parsed));
 #undef RUN_REDIRECT_TEST
     if (budget.current != 0) {
         fprintf(stderr, "redirect-test leaked %zu budget bytes\n",

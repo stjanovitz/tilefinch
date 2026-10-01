@@ -1,0 +1,45 @@
+# chatgpt.com on the PSP: wait until the client is ready (bounded by
+# chatgpt-ask.until.js; its until-met at-us is the first usable input), open
+# the composer with the nub cursor (activation can take ~6 s), type "hi" on
+# Danzeff once it samples input (-text), accept with Start, press the send
+# button, wait for actual assistant response content (second until-met at-us),
+# then capture the answer ten seconds on. DOM readiness is not proof of ink
+# on screen; inspect the captured response frame too.
+# Coordinate precondition: default 100% page font size. A saved host0 profile
+# with enlarged fonts moves the composer; a missed click then waits for text
+# entry and is not a send-performance sample. Back up/restore the host0
+# profile when measuring a clean default run; do not alter the user's Memory
+# Stick profile. Use mark-page/mark-live checkpoints in a diagnostic copy
+# to capture the actual composer placement when this journey stalls.
+wait-live 60
+until-live 6000
+wait-page 60
+mark hook
+wait-live 120
+stick-live 18 left
+stick-live 9 down
+wait-live 15
+tap-live cross
+wait-live 300
+mark tapped
+wait-text 5
+stick-text 1 up-right cross
+wait-text 2
+stick-text 1 up-right circle
+wait-text 2
+hold-text 1 start
+wait-live 60
+mark-live typed
+# Aim for the send button's centre (x 417-461). Nub travel varies by about a
+# frame (~6 px) per run; 48 frames landed at 410-429 and once hit the
+# neighbouring button.
+stick-live 51 right
+wait-live 15
+tap-live cross
+wait-live 300
+mark-live sent
+until-live 6000
+mark-live answer
+wait-live 600
+mark said
+end

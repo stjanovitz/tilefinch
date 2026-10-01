@@ -91,6 +91,26 @@ typedef struct {
     size_t external_script_bytecode_cache_admission_skips;
     size_t external_script_bytecode_cache_restore_failures;
     size_t external_script_bytecode_cache_bytes;
+    /* ES module bytecode (BrowserModuleBytecodeCache). Hits restored a
+       module instead of compiling it; misses compiled one the cache could
+       have served; restored/stored bytes are serialized bytecode. */
+    size_t module_bytecode_cache_hits;
+    size_t module_bytecode_cache_misses;
+    size_t module_bytecode_cache_stores;
+    size_t module_bytecode_cache_admission_skips;
+    size_t module_bytecode_cache_restore_failures;
+    size_t module_bytecode_cache_bytes;
+    size_t module_bytecode_cache_stored_bytes;
+    /* The optional persistent tier: restores and files written. */
+    size_t module_bytecode_disk_hits;
+    size_t module_bytecode_disk_stores;
+    /* Persistent tier: synchronous file read + verification (hits and
+       misses), and copying a disk hit into the RAM cache. */
+    unsigned long long module_bytecode_disk_load_us;
+    unsigned long long module_bytecode_disk_read_us;
+    unsigned long long module_bytecode_disk_verify_us;
+    unsigned long long module_bytecode_promote_us;
+    unsigned long long module_bytecode_restore_us;
     bool dom_content_loaded_dispatched;
     bool form_submission_requested;
     bool relayout_required;
@@ -186,6 +206,14 @@ typedef struct {
        activation changes have a measured target. */
     size_t module_compile_count;
     unsigned long long module_compile_us;
+    /* Inside module_compile_us: the bytecode-cache key (source hash), the
+       QuickJS parse/compile itself, and the in-memory bytecode store. */
+    unsigned long long module_key_us;
+    unsigned long long module_parse_us;
+    unsigned long long module_store_us;
+    unsigned long long module_source_bytes;
+    /* Module source loads (the synchronous module_load callback). */
+    unsigned long long module_fetch_us;
     char last_promise_rejection[2048];
     size_t uncaught_callback_errors;
     char last_uncaught_callback_error[512];
@@ -435,6 +463,16 @@ typedef struct {
     uint64_t js_heap_risen_bytes;
     size_t js_heap_gc_drops;
     size_t js_heap_gc_drop_max_bytes;
+    /* Timer tasks (timeouts, intervals, messages, platform and idle
+       tasks) run later than their due time: the sum, the largest in the
+       latest advance, and how many ran a whole 16 ms frame late. Frame
+       callbacks (animation frames, observer and fixup frames), which run
+       at a rendering opportunity rather than when due, are counted apart. */
+    uint64_t timer_late_us;
+    uint64_t advance_timer_late_max_us;
+    size_t timer_late_frames;
+    size_t frame_callbacks;
+    uint64_t frame_callback_late_us;
 } ScriptRuntimeTimingMetrics;
 
 /* Host-testable admission seam for the process-global PSP GE texture owner.
@@ -538,13 +576,26 @@ typedef struct {
    request the existing full style/resource pipeline, and ambiguous changes
    retain the conservative fingerprint oracle. */
 /* Hydrated acceptance pages can commit just over 64 distinct connected-node
-   changes in one author turn after detached-tree coalescing. 128 keeps those
-   batches typed instead of forcing a whole-document oracle/rebuild, for
-   5,376 additional fixed bytes per active realm over the former 32-record
-   limit (0.021% of the realistic 24 MiB engine ceiling). */
-#define SCRIPT_MUTATION_JOURNAL_LIMIT 128u
+   changes in one author turn after detached-tree coalescing, and
+   chatgpt.com's conversation view swaps in 247 in one turn after a send.
+   An overflowed journal resets layout reuse (every style re-resolves, 90%
+   of them to the same values) and re-derives the image table. 256 records
+   are 21,504 bytes per active realm on the PSP (84 each), 10,752 more
+   than 128 (0.04% of the realistic 24 MiB engine ceiling). */
+#define SCRIPT_MUTATION_JOURNAL_LIMIT 256u
 #define SCRIPT_MUTATION_ATTRIBUTE_LIMIT 32u
-#define SCRIPT_MUTATION_TOKEN_LIMIT 8u
+/* Changed class/id tokens are kept in one pool per journal. StyleX pages
+   (chatgpt.com) swap 10-56 atomic classes per class write, so a small
+   per-record array went inexact on nearly every connected class change and
+   each one restyled its whole subtree and rescanned images. A record holds
+   at most TOKEN_LIMIT tokens; a turn at most TOKEN_POOL in all (relocating
+   a coalesced record's run consumes more); beyond either the record is
+   inexact, which stays conservative. Pool plus 256 records are 18,432
+   bytes on the PSP, 3,072 fewer than inline 8-token arrays. */
+#define SCRIPT_MUTATION_TOKEN_LIMIT 64u
+#define SCRIPT_MUTATION_TOKEN_POOL 1024u
+/* Past the journal's records, the subtrees further changes fell in. */
+#define SCRIPT_MUTATION_OVERFLOW_ROOT_LIMIT 16u
 
 typedef enum {
     SCRIPT_MUTATION_UNKNOWN = 0,
@@ -570,41 +621,118 @@ typedef struct {
        identity instead of dereferencing a target which an earlier mutation in
        the same author turn may already have destroyed. */
     uintptr_t owner_document_identity;
+    /* A full-length buffer is a conservative prefix, including when
+       distinct long names coalesce. Consumers must not prove a dependency
+       absent by comparing it as a complete attribute name. */
     char attribute[SCRIPT_MUTATION_ATTRIBUTE_LIMIT];
     /* For class/id attribute mutations captured with exact before/after
        values: hashes of the classes or ids that changed, so layout can keep
        retained selector answers that no rule can depend on. Other mutations,
        and changes of more tokens than fit, leave `changed_tokens_exact`
        false and stay conservative. */
-    uint32_t changed_tokens[SCRIPT_MUTATION_TOKEN_LIMIT];
+    /* The run [changed_token_offset, +changed_token_count) of the
+       journal's token pool; see script_mutation_record_tokens. */
+    uint16_t changed_token_offset;
     uint8_t changed_token_count;
     bool changed_tokens_exact;
     /* First child-list record was an insertion from a detached tree. Only
        valid within this journal; never inferred from the final DOM alone. */
     bool inserted_from_detached;
+    /* Some write this record coalesces may change a :has() answer
+       (stylesheet_attribute_change_may_affect_has with the exact before and
+       after values; always for tree, text and unclassified changes). The
+       journal's relational_selector_sensitive is the OR of these, except
+       that the focus marker has its own invalidator. */
+    bool relational;
     /* For a removal or move: the connected parent the child left, captured
        while live, so layout can scope the structural change after the child
        has been detached (its own parent pointer is gone) or destroyed (the
        record's node is then NULL). Cleared when that parent is destroyed. */
     lxb_dom_node_t *scope;
+    /* For tree and text changes the bridge probed while the change was
+       visible (stylesheet_tree_change_has_entries): which :has() entries
+       of the journal's plan build (`has_serial`) the writes coalesced here
+       can move, so layout notes only those; UINT64_MAX when unknown. */
+    uint64_t has_entries;
 } ScriptMutationRecord;
 
 typedef struct {
     ScriptMutationRecord records[SCRIPT_MUTATION_JOURNAL_LIMIT];
     size_t count;
+    uint32_t tokens[SCRIPT_MUTATION_TOKEN_POOL];
+    size_t token_count;
+    /* The :has() plan build the records' has_entries index; 0 when none
+       did, or when builds were mixed (every summary then means "all"). */
+    uint32_t has_serial;
+    bool has_serial_mixed;
+    /* Once `overflowed`: connected elements whose subtrees hold every
+       change the records could not (for a change at an element, its
+       parent; for a tree or text change, its parent's parent), merged into
+       common ancestors past the limit. Layout restyles those subtrees
+       instead of everything. `overflow_roots_lost` when one could not be
+       named or a root was later freed: layout then resets. */
+    lxb_dom_node_t *overflow_roots[SCRIPT_MUTATION_OVERFLOW_ROOT_LIMIT];
+    uint8_t overflow_root_count;
+    bool overflow_roots_lost;
     bool overflowed;
     bool resource_rebuild_required;
+    /* Why resource_rebuild_required was raised: a stylesheet source
+       (<style>, stylesheet or style-preload <link>, <base>) and/or an image
+       resource the refresh and additive lanes cannot retire (a removed image,
+       an image-bearing inline declaration, a <source> or poster change). */
+    bool stylesheet_rebuild_required;
+    bool image_rebuild_required;
+    /* A detached subtree was freed while no retirement listener observed
+       it: native pointers the host retains may now dangle. */
+    bool retirement_unobserved;
     bool image_resource_scan_required;
     bool image_resource_refresh_required;
     bool conservative_resource_scan;
     bool relational_selector_sensitive;
 } ScriptMutationJournal;
 
+/* A record's exact changed tokens, or NULL when it has none. */
+static inline const uint32_t *script_mutation_record_tokens(
+    const ScriptMutationJournal *journal, const ScriptMutationRecord *record)
+{
+    return record->changed_tokens_exact
+        ? journal->tokens + record->changed_token_offset : NULL;
+}
+
 typedef struct ScriptRuntime ScriptRuntime;
 
 bool script_runtime_timing_metrics(
     const ScriptRuntime *runtime, ScriptRuntimeTimingMetrics *metrics);
 void script_runtime_timing_metrics_reset(ScriptRuntime *runtime);
+
+/* Validation diagnostics: what the page's event loop could run now, read
+   from native state without entering script. The frame loop samples it
+   before it sleeps, so a wait can be told apart from a wait with work due
+   (docs/engineering/INPUT_SCRIPT_HARNESS.md, "Where a frame's time goes").
+   Host builds and PSP validation builds only. */
+typedef struct {
+    size_t timers;             /* timers, frames, messages, platform tasks */
+    bool timer_known;          /* the earliest due time below is valid */
+    int64_t timer_due_in_us;   /* earliest due minus now; <= 0: due */
+    bool timer_frame_callback; /* ... and it is a frame callback (rAF) */
+    bool task_known;           /* a timer other than a frame callback... */
+    int64_t task_due_in_us;    /* ... its earliest due minus now */
+    bool jobs_pending;         /* promise jobs or checkpoint continuations */
+    bool cleanup_pending;      /* finalization-registry cleanup tasks */
+    size_t responses_ready;    /* fetch responses complete, not delivered */
+    size_t requests_in_flight; /* this realm's requests still in transport */
+    bool continuation_pending; /* a segmented classic script's next slice */
+} ScriptRunnableState;
+
+bool script_runtime_runnable_state(ScriptRuntime *runtime,
+                                   ScriptRunnableState *state);
+
+/* Whether the page's event loop has a task it could run right now: a
+   microtask checkpoint left pending, a segmented classic script's next
+   slice, a due timer task (not a frame callback, which waits for a
+   rendering opportunity), or a complete fetch response to deliver. A frame
+   loop uses it to start the next turn without waiting for vblank. */
+bool script_runtime_task_runnable(ScriptRuntime *runtime);
 uint64_t script_runtime_gc_probe_us(ScriptRuntime *runtime);
 
 /* Temporarily cap newly armed JavaScript watchdog slices to one absolute
@@ -724,7 +852,8 @@ typedef void (*ScriptModuleOpaqueDestroyCallback)(void *opaque);
 bool script_module_mime_type_allowed(const char *content_type);
 /* Compiles one bounded classic script without evaluating it. The returned
    compiler artifact is Budget-owned and remains only an optional accelerator;
-   callers must retain the source as the authoritative fallback. */
+   callers must retain the source as the authoritative fallback. The input is
+   an exact byte span and need not have a readable trailing NUL. */
 bool script_compile_classic_bytecode(
     Budget *budget, const char *source, size_t source_length,
     const char *source_url, size_t maximum_bytecode_length,
@@ -1056,6 +1185,14 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
 /* Remaining active QuickJS heap allowance. Unlike the browser Budget this
    excludes allocator cache capacity and reflects JS_SetMemoryLimit(). */
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
+/* Bytes the realm's QuickJS heap currently holds. */
+size_t script_runtime_heap_used(const ScriptRuntime *runtime);
+/* Raise the realm's QuickJS limit by `additional` bytes, not past
+   `ceiling`. The heap is charged to the page budget, which stays the
+   authority; this only lets a realm whose budget has room keep loading
+   code. False when already at the ceiling. */
+bool script_runtime_grow_heap_limit(ScriptRuntime *runtime,
+                                    size_t additional, size_t ceiling);
 /* O(1) monotonic count of actual allocator refusals for this realm. */
 /* In builds with tracing compiled out, advances and input dispatch refresh
    only what the page loop acts on; ScriptResult's diagnostic counters are
@@ -1064,6 +1201,94 @@ size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
 void script_runtime_refresh_result(ScriptRuntime *runtime,
                                    ScriptResult *result);
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime);
+/* Let the realm's heap limit follow memory pressure instead of a fixed
+   size: the limit set at creation becomes a floor, an allocation past it
+   raises the limit while at least `page_reserve` bytes of the page Budget
+   stay free for DOM, layout, paint and images, never past `ceiling`, and
+   growth is returned when later collections show it unused. */
+void script_runtime_enable_heap_growth(ScriptRuntime *runtime,
+                                       size_t ceiling, size_t page_reserve);
+/* Heap an allocation could still obtain: what remains under the current
+   limit plus the growth memory pressure would still grant. Refusal and
+   exhaustion decisions use this; "collect first" triggers keep using
+   script_runtime_heap_remaining so a realm collects before it grows. */
+size_t script_runtime_heap_available(const ScriptRuntime *runtime);
+/* Print and clear the sampling profile (no-op unless profiling is on). */
+void script_runtime_profile_report(ScriptRuntime *runtime, const char *label);
+/* Deterministic work of one realm (its QuickJS runtime and worker realms)
+   for the tilefinch-work record: plain counts, cumulative since the realm
+   was created, identical for identical execution; never timings. The
+   first eight follow the engine's JS_WORK_* order. Returns the mask
+   (1u << index) of counters this build or realm does not count (they read
+   0): CALLS needs a PSP_BROWSER_JS_CALL_COUNTS or PSP_BROWSER_JS_OP_COUNTS
+   engine, BYTECODE_OPS and FLOAT64_BOXES a PSP_BROWSER_JS_OP_COUNTS one,
+   and NATIVE_CALLS the sampling profiler (natives are wrapped only while
+   it runs). */
+enum {
+    SCRIPT_WORK_UNITS,            /* interrupt-poll budget consumed */
+    SCRIPT_WORK_POLLS,
+    SCRIPT_WORK_GC_RUNS,
+    SCRIPT_WORK_CALLS,
+    SCRIPT_WORK_BYTECODE_OPS,
+    SCRIPT_WORK_FLOAT64_BOXES,
+    SCRIPT_WORK_LAZY_COMPILES,    /* lazy bodies compiled on first call */
+    SCRIPT_WORK_LAZY_BYTES,
+    SCRIPT_WORK_NATIVE_CALLS,     /* profiled host natives called */
+    SCRIPT_WORK_ATTRIBUTE_WRITES, /* native setAttribute calls */
+    SCRIPT_WORK_ALLOCS,           /* QuickJS malloc + realloc calls */
+    SCRIPT_WORK_ALLOC_BYTES,      /* bytes those requested */
+    SCRIPT_WORK_SOURCE_BYTES,     /* script source admitted to the realm */
+    SCRIPT_WORK_MODULE_COMPILES,  /* modules compiled from source */
+    SCRIPT_WORK_MODULE_RESTORES,  /* modules restored from cached bytecode */
+    SCRIPT_WORK_DOM_MUTATIONS,    /* native DOM mutations */
+    SCRIPT_WORK_MUTATION_RECORDS, /* MutationRecords queued for observers */
+    SCRIPT_WORK_OBSERVER_VISITS,  /* observers examined per routed mutation */
+    SCRIPT_WORK_COUNT
+};
+uint32_t script_runtime_work_counters(const ScriptRuntime *runtime,
+                                      uint64_t work[SCRIPT_WORK_COUNT]);
+/* The `limit` most-called profiled natives, by calls then registration
+   order; returns how many were written (0 unless natives_counted). */
+/* Per-opcode dispatch counts of the page realm's engine (op-count builds
+   only; returns 0 entries otherwise): names[i]/counts[i] for opcode byte
+   i, capacity at least 256. Diagnostic: the opcode mix of a journey. */
+size_t script_runtime_opcode_counts(const ScriptRuntime *runtime,
+                                    const char **names, uint64_t *counts,
+                                    size_t capacity);
+size_t script_runtime_work_top_natives(const ScriptRuntime *runtime,
+                                       size_t limit, const char **names,
+                                       uint64_t *calls);
+/* Opt-in allocator census for work marks: the page realm's QuickJS pool
+   per-class traffic as `tilefinch-js-pool:` lines (host and validation
+   builds; see budget_quickjs_pool_report_traffic). */
+void script_runtime_report_pool_traffic(const ScriptRuntime *runtime,
+                                        const char *label, FILE *output);
+typedef struct {
+    size_t floor;
+    size_t limit;
+    size_t peak_limit;
+    size_t grown;
+    size_t raises;
+    size_t pregrows;           /* raises ahead of need, for GC headroom */
+    size_t refusals;
+    size_t returns;
+    size_t source_committed;   /* script source admitted to the realm */
+    size_t source_limit;       /* its current (possibly raised) total */
+    size_t source_raises;
+    size_t refused_bytes;     /* last refused request's shortfall */
+    uint8_t refused_reason;   /* 1 page reserve, 2 ceiling, 3 spare */
+    size_t lazy_compile_failures;
+    size_t reentrant_checkpoints;  /* microtask checkpoints left to the
+                                      outer, empty-stack checkpoint */
+} ScriptHeapGrowth;
+void script_runtime_heap_growth(const ScriptRuntime *runtime,
+                                ScriptHeapGrowth *growth);
+/* Full collections spent checking whether the boot window can be returned. */
+size_t script_runtime_boot_window_checks(const ScriptRuntime *runtime);
+/* Functions this realm compiled lazily (JS_SetLazyFunctionThreshold):
+   deferred without bytecode, and compiled since on their first call. */
+void script_runtime_lazy_function_counts(const ScriptRuntime *runtime,
+                                         size_t *deferred, size_t *compiled);
 /* Result of the most recently completed top-level evaluation slice. This is
    an O(1), allocation-free telemetry read used by admission tuning. */
 bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime);
@@ -1169,6 +1394,12 @@ void script_runtime_invalidate_document_base(ScriptRuntime *runtime);
 /* Copies the current same-document URL after history.push/replaceState.
    Loader owners use this instead of the navigation's original URL when a
    later parser/deferred script resolves a relative resource. */
+/* The Content-Security-Policy of the realm's current document. Loaders that
+   outlive a document commit must read it here, not keep a pointer into the
+   document they were created for: a transactional commit moves the
+   candidate document and frees its storage. */
+const TilefinchContentSecurityPolicy *script_runtime_content_security_policy(
+    const ScriptRuntime *runtime);
 bool script_runtime_copy_document_url(
     const ScriptRuntime *runtime, char *output, size_t output_size);
 bool script_runtime_copy_top_level_url(
@@ -1185,6 +1416,9 @@ void script_runtime_set_module_loader_owned(
     ScriptRuntime *runtime, ScriptModuleLoadCallback load,
     ScriptModuleFreeCallback release, void *opaque,
     ScriptModuleOpaqueDestroyCallback destroy_opaque);
+/* The installed loader's opaque when `load` is the installed callback. */
+void *script_runtime_module_loader_opaque(
+    const ScriptRuntime *runtime, ScriptModuleLoadCallback load);
 /* child_context irreversibly changes the realm to child scope before its
    fallible global setup. parent_same_origin controls whether that child may
    replace the exposed parent.postMessage property; a cross-origin child gets
@@ -1245,6 +1479,16 @@ bool script_runtime_evaluate_diagnostic(ScriptRuntime *runtime,
                                         const char *source,
                                         const char *source_url,
                                         ScriptResult *result);
+/* Trusted synchronous observation between runtime turns. Uses normal compile
+   and watchdog bounds, but does not drain jobs/continuations, refresh the DOM,
+   force collection or take a full telemetry snapshot. Only clipboard output
+   is refreshed in the copied result; other counters retain their current state.
+   Callers own the supplied source's side effects: this is not a sandbox or a
+   guarantee that explicitly invoked author callbacks cannot run. */
+bool script_runtime_evaluate_probe(ScriptRuntime *runtime,
+                                   const char *source,
+                                   const char *source_url,
+                                   ScriptResult *result);
 typedef struct {
     bool measured;
     bool cache_hit;
@@ -1412,6 +1656,9 @@ typedef enum {
 /* A module-map entry is keyed by its resolved request URL. Settled entries
    are reusable by later <script type=module> elements without another
    fetch, compile, evaluation, or executable-quota charge. */
+/* True once the realm has fetched the module at `request_url`. */
+bool script_runtime_module_loaded(const ScriptRuntime *runtime,
+                                  const char *request_url);
 ScriptModuleMapStatus script_runtime_module_map_status(
     const ScriptRuntime *runtime, const char *request_url);
 /* External module identity and response base differ after redirects. Keep the
@@ -1441,6 +1688,9 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
 bool script_runtime_consume_relayout(ScriptRuntime *runtime);
 /* Read-only admission check for rollback-safe optional layout work. */
 bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime);
+/* Resource-completion callbacks can enqueue another resource pass after
+   the current layout was built; attachment must not consume that work. */
+bool script_runtime_has_pending_resource_mutations(const ScriptRuntime *runtime);
 void script_runtime_telemetry(const ScriptRuntime *runtime,
                               ScriptRuntimeTelemetry *telemetry);
 /* Preserve the first author/runtime failure before a bounded parser stage
@@ -1462,6 +1712,15 @@ bool script_runtime_has_pending_media_request(const ScriptRuntime *runtime);
 bool script_runtime_update_media_state(
     ScriptRuntime *runtime, int64_t node_handle, ScriptMediaState state,
     double current_time, double duration);
+/* The url-encoded entry list page script's last form submission sends,
+   after `formdata` listeners ran, in a budget allocation the caller frees;
+   false when there is none, the form is multipart, or it exceeds
+   maximum_length. Clears it. */
+bool script_runtime_take_form_submission_body(ScriptRuntime *runtime,
+                                              Budget *budget,
+                                              size_t maximum_length,
+                                              char **output,
+                                              size_t *length);
 /* Consumes the successful default action of form.submit()/requestSubmit().
    The returned nodes belong to the current document and remain valid only
    until the caller starts another navigation. */

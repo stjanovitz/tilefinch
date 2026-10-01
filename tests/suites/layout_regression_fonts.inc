@@ -91,6 +91,56 @@
     document_destroy(&collapsed_document);
     CHECK(budget.current == 0);
 
+    puts("test: positioned max-content roots measure their own in-flow text");
+    static const char positioned_intrinsic_page[] =
+        "<!doctype html><style>body{margin:0}"
+        ".tip{width:max-content;max-width:300px;box-sizing:border-box;padding:4px 8px;"
+        "border:1px solid;font-size:14px;line-height:18px}"
+        "#fixed-tip{position:fixed;left:200px;top:40px}"
+        "#absolute-tip{position:absolute;left:200px;top:80px}"
+        "#clamped-tip{position:fixed;left:200px;top:120px;max-width:50px}"
+        ".excluded{position:absolute;width:400px;height:1px}"
+        ".hidden{display:none;width:400px;height:1px}"
+        "</style><div id=flow-tip class=tip>Send message</div>"
+        "<div id=fixed-tip class=tip>Send message"
+        "<span class=excluded></span><span class=hidden></span></div>"
+        "<div id=absolute-tip class=tip>Send message"
+        "<span class=excluded></span><span class=hidden></span></div>"
+        "<div id=clamped-tip class=tip>Send message</div>";
+    PocDocument positioned_intrinsic_document;
+    Stylesheet positioned_intrinsic_sheet;
+    LayoutDocument positioned_intrinsic_layout;
+    CHECK(document_parse(&positioned_intrinsic_document, &budget,
+              positioned_intrinsic_page, strlen(positioned_intrinsic_page), 23)
+        && stylesheet_build(&positioned_intrinsic_sheet, &budget,
+              &positioned_intrinsic_document, 480)
+        && layout_build(&positioned_intrinsic_layout, &budget,
+              &positioned_intrinsic_document, &positioned_intrinsic_sheet,
+              NULL, NULL, 480));
+    lxb_dom_node_t *positioned_intrinsic_root = lxb_dom_interface_node(
+        positioned_intrinsic_document.html);
+    const LayoutNodeBox *flow_tip_box = layout_box_for_node(
+        &positioned_intrinsic_layout, find_id(positioned_intrinsic_root, "flow-tip"));
+    const LayoutNodeBox *fixed_tip_box = layout_box_for_node(
+        &positioned_intrinsic_layout, find_id(positioned_intrinsic_root, "fixed-tip"));
+    const LayoutNodeBox *absolute_tip_box = layout_box_for_node(
+        &positioned_intrinsic_layout, find_id(positioned_intrinsic_root, "absolute-tip"));
+    const LayoutNodeBox *clamped_tip_box = layout_box_for_node(
+        &positioned_intrinsic_layout, find_id(positioned_intrinsic_root, "clamped-tip"));
+    CHECK(flow_tip_box != NULL && fixed_tip_box != NULL
+        && absolute_tip_box != NULL && clamped_tip_box != NULL
+        && flow_tip_box->width > 18
+        && flow_tip_box->width < 300
+        && fixed_tip_box->width == flow_tip_box->width
+        && absolute_tip_box->width == flow_tip_box->width
+        && clamped_tip_box->width == 50
+        && fixed_tip_box->content_height == flow_tip_box->content_height
+        && absolute_tip_box->content_height == flow_tip_box->content_height);
+    layout_destroy(&positioned_intrinsic_layout);
+    stylesheet_destroy(&positioned_intrinsic_sheet);
+    document_destroy(&positioned_intrinsic_document);
+    CHECK(budget.current == 0);
+
     puts("test: positioned containing boxes, percentage insets, opposing-edge sizing");
     static const char positioned_page[] =
         "<!doctype html><style>body{margin:0;padding:0}#before{height:30px}"

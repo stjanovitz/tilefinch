@@ -819,6 +819,38 @@ static int presentational_auto_direction(lxb_dom_node_t *root)
     return 0;
 }
 
+/* HTML's rules for parsing dimension values: optional leading whitespace,
+   decimal digits with an optional fraction, then "%" for a percentage;
+   anything else after the number is ignored. Returns 0 when there is no
+   number. Clamped like the CSS length parser. */
+static int presentational_dimension(const char *text, size_t length,
+                                    bool *percent)
+{
+    size_t at = 0;
+    *percent = false;
+    while (at < length && (text[at] == ' ' || text[at] == '\t'
+                           || text[at] == '\n' || text[at] == '\f'
+                           || text[at] == '\r')) at++;
+    double number = 0.0;
+    size_t digits = 0;
+    while (at < length && text[at] >= '0' && text[at] <= '9') {
+        if (number < 32767.0) number = number * 10.0 + (text[at] - '0');
+        at++;
+        digits++;
+    }
+    if (digits == 0) return 0;
+    if (at < length && text[at] == '.') {
+        double scale = 0.1;
+        for (at++; at < length && text[at] >= '0' && text[at] <= '9'; at++) {
+            number += (text[at] - '0') * scale;
+            scale *= 0.1;
+        }
+    }
+    if (at < length && text[at] == '%') *percent = true;
+    if (number > 32767.0) number = 32767.0;
+    return (int) (number + 0.5);
+}
+
 static void apply_presentational_attributes(const Stylesheet *sheet,
                                             lxb_dom_node_t *node,
                                             ComputedStyle *style)
@@ -851,16 +883,50 @@ static void apply_presentational_attributes(const Stylesheet *sheet,
         style->color = color;
         style->color_alpha = 255;
     }
-    value = document_attribute(node, "width", &length);
+    /* HTML maps width/height to the dimension properties only on replaced
+       and table elements, and parses them with the "rules for parsing
+       dimension values": digits, then an optional %, anything after
+       ignored ("10 em" is 10px). Applying them to every element broke
+       Cloudflare's Turnstile widget, whose <div height="10 em"> became a
+       140px flex container and pushed its checkbox out of the 65px frame.
+       SVG width/height are SVG presentation attributes and take CSS
+       lengths. */
+    bool replaced = PRESENTATION_TAG_IS("img")
+                    || PRESENTATION_TAG_IS("iframe")
+                    || PRESENTATION_TAG_IS("embed")
+                    || PRESENTATION_TAG_IS("object")
+                    || PRESENTATION_TAG_IS("video")
+                    || PRESENTATION_TAG_IS("canvas")
+                    || PRESENTATION_TAG_IS("input");
+    bool svg = PRESENTATION_TAG_IS("svg");
+    bool cell = PRESENTATION_TAG_IS("td") || PRESENTATION_TAG_IS("th");
+    bool width_mapped = replaced || svg || cell
+                        || PRESENTATION_TAG_IS("table")
+                        || PRESENTATION_TAG_IS("col")
+                        || PRESENTATION_TAG_IS("colgroup")
+                        || PRESENTATION_TAG_IS("hr");
+    bool height_mapped = replaced || svg || cell
+                         || PRESENTATION_TAG_IS("table")
+                         || PRESENTATION_TAG_IS("tr")
+                         || PRESENTATION_TAG_IS("thead")
+                         || PRESENTATION_TAG_IS("tbody")
+                         || PRESENTATION_TAG_IS("tfoot");
+    value = width_mapped ? document_attribute(node, "width", &length) : NULL;
     if (value != NULL && length != 0) {
-        style->width = style_parse_length(sheet, value, length, 0,
-                                    &style->width_percent);
+        style->width = svg
+            ? style_parse_length(sheet, value, length, 0,
+                                 &style->width_percent)
+            : presentational_dimension(value, length, &style->width_percent);
         style->has_width = style->width > 0;
     }
-    value = document_attribute(node, "height", &length);
+    value = height_mapped
+            ? document_attribute(node, "height", &length) : NULL;
     if (value != NULL && length != 0) {
-        style->height = style_parse_length(sheet, value, length, 0,
-                                     &style->height_percent);
+        style->height = svg
+            ? style_parse_length(sheet, value, length, 0,
+                                 &style->height_percent)
+            : presentational_dimension(value, length,
+                                       &style->height_percent);
         style->has_height = style->height > 0;
     }
     value = document_attribute(node, "align", &length);
@@ -1367,9 +1433,19 @@ typedef struct {
     uint32_t end;
 } StyleRuleIndexRange;
 
+/* Utility-class elements (atomic CSS: one rule per class) can carry more
+   keyed classes than `ranges` holds. Their class buckets' rule indices are
+   then merged, ascending and unique, into a caller's buffer of this many
+   entries instead of scanning the whole rule range. */
+#define STYLE_RULE_INDEX_LIST_CAPACITY 256u
+
 typedef struct {
     StyleRuleIndexRange ranges[STYLE_RULE_INDEX_MAX_SOURCES];
     size_t count;
+    /* The class candidates merged into the caller's buffer when the
+       subject's buckets overflow `ranges`, or NULL. */
+    const uint32_t *list;
+    size_t list_count;
     StyleTokenBloom compound_bloom;
     StyleTokenBloom ancestor_bloom;
     bool ancestor_bloom_ready;
@@ -1470,7 +1546,8 @@ static StyleMatchSubject style_match_subject(
     return subject;
 }
 
-static bool rule_fast_matches(const StyleRule *rule,
+static bool rule_fast_matches(const Stylesheet *sheet,
+                              const StyleRule *rule,
                               const StyleMatchSubject *subject)
 {
     if (!rule->has_fast_key) return true;
@@ -1481,12 +1558,8 @@ static bool rule_fast_matches(const StyleRule *rule,
         return subject->id != NULL && subject->id_length == length
                && memcmp(subject->id, fast_key, length) == 0;
     }
-    if (rule->type == SELECTOR_CLASS) {
-        return subject->classes != NULL
-               && class_contains_length(subject->classes,
-                                        subject->classes_length, fast_key,
-                                        length);
-    }
+    if (rule->type == SELECTOR_CLASS)
+        return style_subject_has_class(sheet, subject, fast_key, length);
     return subject->tag != NULL && subject->tag_length == length
            && memcmp(subject->tag, fast_key, length) == 0;
 }
@@ -1497,7 +1570,7 @@ static bool rule_matches(const Stylesheet *sheet, size_t rule_index,
 {
     return style_container_query_matches(
                sheet, style_rule_container_query(rule), node)
-           && rule_fast_matches(rule, subject)
+           && rule_fast_matches(sheet, rule, subject)
            && style_rule_selector_matches_subject(
                sheet, rule_index, node, subject);
 }
@@ -1590,16 +1663,55 @@ bool style_pseudo_known_absent(const Stylesheet *sheet,
             if (declaration != NULL
                 && ((declaration->inherit_mask & S_CONTENT) != 0
                     || ((declaration->mask & S_CONTENT) != 0
-                        && declaration->values.generated_content)
+                        && (declaration->values_flags
+                            & STYLE_DECLARATION_VALUES_GENERATED_CONTENT)
+                               != 0)
                     || declaration->deferred_declarations != NULL)) return false;
         }
     }
     return true;
 }
 
+/* Every rule index of the subject's class buckets, ascending and unique,
+   into `list`; false when they do not fit. */
+static bool style_rule_gather_class_candidates(
+    const Stylesheet *sheet, const StyleMatchSubject *subject,
+    PseudoElement pseudo, uint32_t *list, size_t capacity, size_t *count)
+{
+    size_t used = 0;
+    size_t at = 0;
+    while (subject->classes != NULL && at < subject->classes_length) {
+        while (at < subject->classes_length
+               && isspace((unsigned char) subject->classes[at])) at++;
+        size_t begin = at;
+        while (at < subject->classes_length
+               && !isspace((unsigned char) subject->classes[at])) at++;
+        if (at == begin) continue;
+        StyleRuleIndexBucket *bucket = style_rule_find_bucket(
+            sheet, SELECTOR_CLASS, subject->classes + begin, at - begin,
+            false, pseudo);
+        if (bucket == NULL) continue;
+        for (uint32_t entry = bucket->first;
+             entry < bucket->first + bucket->count; entry++) {
+            uint32_t index = sheet->rule_index_entries[entry];
+            /* Insertion sort: a bucket is usually one rule here. */
+            size_t slot = used;
+            while (slot != 0 && list[slot - 1] > index) slot--;
+            if (slot != 0 && list[slot - 1] == index) continue;
+            if (used == capacity) return false;
+            memmove(list + slot + 1, list + slot,
+                    (used - slot) * sizeof(*list));
+            list[slot] = index;
+            used++;
+        }
+    }
+    *count = used;
+    return true;
+}
+
 static StyleRuleIndexPlan style_rule_index_plan(
     const Stylesheet *sheet, const StyleMatchSubject *subject,
-    PseudoElement pseudo)
+    PseudoElement pseudo, uint32_t *list, size_t list_capacity)
 {
     StyleRuleIndexPlan plan = {0};
     bool retained = pseudo != PSEUDO_NONE;
@@ -1629,6 +1741,7 @@ static StyleRuleIndexPlan style_rule_index_plan(
         || !style_rule_add_key_source(
             sheet, &plan, SELECTOR_ID, subject->id,
             subject->id_length, pseudo)) return (StyleRuleIndexPlan) {0};
+    size_t keyed_count = plan.count;
     size_t at = 0;
     while (subject->classes != NULL && at < subject->classes_length) {
         while (at < subject->classes_length
@@ -1639,10 +1752,19 @@ static StyleRuleIndexPlan style_rule_index_plan(
         if (at != begin && !style_rule_add_key_source(
                 sheet, &plan, SELECTOR_CLASS, subject->classes + begin,
                 at - begin, pseudo)) {
-            return (StyleRuleIndexPlan) {0};
+            /* Too many class buckets for `ranges`: merge them all into the
+               caller's list, keeping the universal/tag/id ranges. */
+            size_t listed = 0;
+            if (list == NULL || !style_rule_gather_class_candidates(
+                    sheet, subject, pseudo, list, list_capacity, &listed))
+                return (StyleRuleIndexPlan) {0};
+            plan.count = keyed_count;
+            plan.list = list;
+            plan.list_count = listed;
+            break;
         }
     }
-    if (plan.count == 0) {
+    if (plan.count == 0 && plan.list_count == 0) {
         /* Negative answers are common for pseudos. Preserve the empty rule
            set too, while still constructing inherited values on each call. */
         for (size_t phase = 0; phase < 4; phase++) {
@@ -1661,7 +1783,7 @@ static StyleRuleIndexPlan style_rule_index_plan(
         return plan;
     }
     plan.compound_bloom = style_match_subject_bloom(subject);
-    size_t candidate_upper_bound = 0;
+    size_t candidate_upper_bound = plan.list_count;
     for (size_t i = 0; i < plan.count; i++) {
         size_t range_count = plan.ranges[i].end - plan.ranges[i].begin;
         if (range_count > SIZE_MAX - candidate_upper_bound) {
@@ -1696,6 +1818,8 @@ static void style_trace_position_match(const Stylesheet *sheet,
     if (!STYLE_TRACE(sheet, LAYOUT)
         || declaration == NULL
         || (declaration->mask & S_POSITION) == 0) return;
+    ComputedStyle values;
+    stylesheet_declaration_values(sheet, declaration, &values);
     size_t class_length = 0;
     const char *class_name = document_attribute(node, "class",
                                                 &class_length);
@@ -1703,9 +1827,8 @@ static void style_trace_position_match(const Stylesheet *sheet,
         || strstr(class_name, "wm-fallback-layout") == NULL) return;
     fprintf(stderr,
             "style-position-match selector=%s fixed=%d out=%d relative=%d\n",
-            rule->selector, declaration->values.fixed_position,
-            declaration->values.out_of_flow,
-            declaration->values.relative_position);
+            rule->selector, values.fixed_position, values.out_of_flow,
+            values.relative_position);
 }
 
 /* ---- Retained matched-rule table (see style_internal.h). ---------------- */
@@ -1793,6 +1916,39 @@ static void style_retained_forget_node(StyleRetainedMatches *table,
             }
         }
     }
+}
+
+void style_retained_matches_forget_node(StyleRetainedMatches *table,
+                                        const lxb_dom_node_t *node)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0
+        || node == NULL) return;
+    style_retained_forget_node(table, node);
+}
+
+size_t style_retained_matches_drop_selected(
+    StyleRetainedMatches *table,
+    bool (*selects)(void *opaque, const lxb_dom_node_t *node), void *opaque)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0
+        || selects == NULL) return 0;
+    size_t dropped = 0;
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        /* As in style_retained_matches_invalidate_rules: dropping every
+           list is always correct, so a cancelled scan does that. */
+        if ((i & 2047u) == 2047u
+            && !tilefinch_platform_cooperate("style-invalidate", i)) {
+            dropped += table->occupied;
+            style_retained_matches_clear(table);
+            return dropped;
+        }
+        StyleRetainedMatchEntry *entry = &table->entries[i];
+        if (entry->node == NULL || !selects(opaque, entry->node)) continue;
+        memset(entry, 0, sizeof(*entry));
+        table->occupied--;
+        dropped++;
+    }
+    return dropped;
 }
 
 void style_retained_matches_forget_subtree(
@@ -1925,7 +2081,8 @@ static bool style_retained_pseudo_absent(const Stylesheet *sheet,
         if (declaration != NULL
             && ((declaration->inherit_mask & S_CONTENT) != 0
                 || ((declaration->mask & S_CONTENT) != 0
-                    && declaration->values.generated_content)
+                    && (declaration->values_flags
+                        & STYLE_DECLARATION_VALUES_GENERATED_CONTENT) != 0)
                 || declaration->deferred_declarations != NULL)) return false;
     }
     return true;
@@ -1972,6 +2129,84 @@ void style_retained_matches_invalidate_tokens(
         table, sheet, affected, affected_count);
 }
 
+static uint32_t style_retained_key_hash(unsigned type, const char *key,
+                                        size_t length)
+{
+    uint32_t hash = 2166136261u ^ type;
+    for (size_t i = 0; i < length; i++) {
+        hash ^= (unsigned char) key[i];
+        hash *= 16777619u;
+    }
+    return hash | 1u; /* 0 marks an empty slot */
+}
+
+static bool style_retained_key_present(const uint32_t *set, size_t mask,
+                                       uint32_t hash)
+{
+    for (size_t at = hash & mask;; at = (at + 1u) & mask) {
+        if (set[at] == hash) return true;
+        if (set[at] == 0) return false;
+    }
+}
+
+/* The fast keys (id, class or tag of the rightmost compound) of `rules`,
+   hashed into an open-addressed set of 2^n slots at most half full. NULL
+   when a rule has no fast key or the set cannot be allocated. A colliding
+   key only drops a list that could have been kept. */
+static uint32_t *style_retained_fast_key_set(
+    const Stylesheet *sheet, const uint32_t *rules, size_t count,
+    size_t *mask)
+{
+    size_t slots = 16;
+    while (slots < count * 2u) slots *= 2u;
+    uint32_t *set = budget_calloc(sheet->budget, slots, sizeof(*set));
+    if (set == NULL) return NULL;
+    *mask = slots - 1u;
+    for (size_t a = 0; a < count; a++) {
+        const StyleRule *rule = &sheet->rules[rules[a]];
+        const char *key = rule->has_fast_key ? style_rule_fast_key(rule)
+                                             : NULL;
+        if (key == NULL) {
+            budget_free(sheet->budget, set);
+            return NULL;
+        }
+        /* rule_fast_matches reads any other keyed type as a tag. */
+        unsigned type = rule->type == SELECTOR_ID ? SELECTOR_ID
+            : rule->type == SELECTOR_CLASS ? SELECTOR_CLASS : SELECTOR_TAG;
+        uint32_t hash = style_retained_key_hash(
+            type, key, rule->fast_key_length);
+        size_t at = hash & *mask;
+        while (set[at] != 0 && set[at] != hash) at = (at + 1u) & *mask;
+        set[at] = hash;
+    }
+    return set;
+}
+
+/* Whether the subject carries any key of the set: the per-entry answer of
+   rule_fast_matches over every rule the set was built from. */
+static bool style_retained_subject_in_key_set(
+    const StyleMatchSubject *subject, const uint32_t *set, size_t mask)
+{
+    if (subject->id != NULL && style_retained_key_present(set, mask,
+            style_retained_key_hash(SELECTOR_ID, subject->id,
+                                    subject->id_length))) return true;
+    if (subject->tag != NULL && style_retained_key_present(set, mask,
+            style_retained_key_hash(SELECTOR_TAG, subject->tag,
+                                    subject->tag_length))) return true;
+    const char *classes = subject->classes;
+    size_t length = subject->classes == NULL ? 0 : subject->classes_length;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) classes[at])) at++;
+        size_t end = at;
+        while (end < length && !isspace((unsigned char) classes[end])) end++;
+        if (end > at && style_retained_key_present(set, mask,
+                style_retained_key_hash(SELECTOR_CLASS, classes + at,
+                                        end - at))) return true;
+        at = end;
+    }
+    return false;
+}
+
 void style_retained_matches_invalidate_rules(
     StyleRetainedMatches *table, const Stylesheet *sheet,
     const uint32_t *rules, size_t count)
@@ -2005,6 +2240,29 @@ void style_retained_matches_invalidate_rules(
             return;
         }
     }
+    /* A late module sheet brings thousands of rules: testing each against
+       each list (2,275 x ~300 on chatgpt.com) cost 4 s on the PSP. Its fast
+       keys go into one hashed set instead, looked up by the few keys each
+       element carries; keyless rules keep the exact test below. */
+    enum { KEY_SET_MINIMUM = 16 };
+    size_t keyed = 0;
+    for (size_t a = 0; a < count; a++)
+        keyed += sheet->rules[rules[a]].has_fast_key ? 1u : 0u;
+    uint32_t *keyed_rules = NULL, *key_set = NULL;
+    size_t key_mask = 0;
+    if (keyed >= KEY_SET_MINIMUM) {
+        keyed_rules = budget_malloc(sheet->budget,
+                                    keyed * sizeof(*keyed_rules));
+        size_t at = 0;
+        for (size_t a = 0; keyed_rules != NULL && a < count; a++) {
+            if (sheet->rules[rules[a]].has_fast_key)
+                keyed_rules[at++] = rules[a];
+        }
+        key_set = keyed_rules == NULL || at != keyed ? NULL
+            : style_retained_fast_key_set(sheet, keyed_rules, keyed,
+                                          &key_mask);
+        budget_free(sheet->budget, keyed_rules);
+    }
     for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
         /* A full table is ~16k lists on a long article, 70 ms on the PSP.
            Dropping every list is always correct, so a cancelled scan does
@@ -2013,6 +2271,7 @@ void style_retained_matches_invalidate_rules(
             && !tilefinch_platform_cooperate("style-invalidate", i)) {
             table->token_dropped += table->occupied;
             style_retained_matches_clear(table);
+            budget_free(sheet->budget, key_set);
             return;
         }
         StyleRetainedMatchEntry *entry = &table->entries[i];
@@ -2021,10 +2280,14 @@ void style_retained_matches_invalidate_rules(
         style_match_subject_prepare((lxb_dom_node_t *) entry->node, &subject);
         bool drop = root_only && entry->node->parent != NULL
             && entry->node->parent->type == LXB_DOM_NODE_TYPE_DOCUMENT;
+        if (!drop && key_set != NULL)
+            drop = style_retained_subject_in_key_set(
+                &subject, key_set, key_mask);
         for (size_t a = 0; !drop && a < count; a++) {
             const StyleRule *rule = &sheet->rules[rules[a]];
             if (rule->has_fast_key) {
-                drop = rule_fast_matches(rule, &subject);
+                drop = key_set == NULL
+                    && rule_fast_matches(sheet, rule, &subject);
             } else if (!(rule->selector != NULL && rule->selector_length == 5
                          && memcmp(rule->selector, ":root", 5) == 0)) {
                 /* Mutation can remove a match as well as create one. The
@@ -2041,6 +2304,7 @@ void style_retained_matches_invalidate_rules(
             table->token_dropped++;
         }
     }
+    budget_free(sheet->budget, key_set);
 }
 
 void style_retained_matches_remap(StyleRetainedMatches *table,
@@ -2154,7 +2418,8 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         }
         return;
     }
-    if (plan != NULL && plan->ready && plan->count == 0) return;
+    if (plan != NULL && plan->ready && plan->count == 0
+        && plan->list_count == 0) return;
     /* Diagnostics counters only; the match result never depends on them. */
     Stylesheet *mutable_sheet = (Stylesheet *) sheet;
     /* Container geometry can change during a build. Do not memoize its
@@ -2179,11 +2444,14 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         matches.pseudo = (uint8_t) pseudo;
     }
     mutable_sheet->rule_index_queries++;
-    StyleRuleIndexSource sources[STYLE_RULE_INDEX_MAX_SOURCES];
-    size_t source_count = plan != NULL && plan->ready ? plan->count : 0;
+    TILEFINCH_WORK_ADD(style_rule_queries, 1);
+    StyleRuleIndexSource sources[STYLE_RULE_INDEX_MAX_SOURCES + 1u];
+    size_t source_count = plan != NULL && plan->ready
+        ? plan->count + (plan->list_count != 0) : 0;
     if (source_count == 0) {
         mutable_sheet->rule_index_fallbacks++;
         mutable_sheet->rule_index_candidates += end - start;
+        TILEFINCH_WORK_ADD(style_rule_candidates, end - start);
         for (size_t i = start; i < end; i++) {
             const StyleRule *rule = &sheet->rules[i];
             if (rule->pseudo != pseudo
@@ -2203,12 +2471,21 @@ static void style_apply_matching_range(const Stylesheet *sheet,
             *retained = matches;
         return;
     }
-    for (size_t i = 0; i < source_count; i++) {
+    for (size_t i = 0; i < plan->count; i++) {
         sources[i] = (StyleRuleIndexSource) {
+            .entries = sheet->rule_index_entries,
             .at = style_rule_range_lower_bound(
                 sheet->rule_index_entries, plan->ranges[i].begin,
                 plan->ranges[i].end, start),
             .end = plan->ranges[i].end
+        };
+    }
+    if (plan->list_count != 0) {
+        sources[plan->count] = (StyleRuleIndexSource) {
+            .entries = plan->list,
+            .at = style_rule_range_lower_bound(
+                plan->list, 0, (uint32_t) plan->list_count, start),
+            .end = (uint32_t) plan->list_count
         };
     }
 
@@ -2217,7 +2494,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         uint32_t candidate = STYLE_RULE_INDEX_EMPTY;
         for (size_t i = 0; i < source_count; i++) {
             if (sources[i].at >= sources[i].end) continue;
-            uint32_t index = sheet->rule_index_entries[sources[i].at];
+            uint32_t index = sources[i].entries[sources[i].at];
             if ((size_t) index >= end) continue;
             if (candidate == STYLE_RULE_INDEX_EMPTY || index < candidate) {
                 candidate = index;
@@ -2226,8 +2503,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         if (candidate == STYLE_RULE_INDEX_EMPTY) break;
         for (size_t i = 0; i < source_count; i++) {
             while (sources[i].at < sources[i].end
-                   && sheet->rule_index_entries[sources[i].at]
-                        == candidate) {
+                   && sources[i].entries[sources[i].at] == candidate) {
                 sources[i].at++;
             }
         }
@@ -2238,6 +2514,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         }
         previous = candidate;
         mutable_sheet->rule_index_candidates++;
+        TILEFINCH_WORK_ADD(style_rule_candidates, 1);
         if (sheet->rule_filters != NULL
             && style_token_bloom_missing(
                 sheet->rule_filters[candidate].compound,
@@ -3101,6 +3378,9 @@ static void apply_inherit_mask(Stylesheet *sheet, ComputedStyle *style,
     if (inherit_mask & S_OPACITY) {
         style->opacity = parent->opacity;
     }
+    if (inherit_mask & S_BORDER_RADIUS) {
+        style->border_radius = parent->border_radius;
+    }
     if (inherit_mask & S_VISIBILITY) {
         style->visibility_hidden = parent->visibility_hidden;
     }
@@ -3169,8 +3449,10 @@ static void apply_style_rule(const Stylesheet *sheet, const StyleRule *rule,
         style->filter_code = (uint8_t) (
             (style->filter_code & ~STYLE_DIRECTION_RTL) | direction);
     }
+    ComputedStyle declared;
+    stylesheet_declaration_values(sheet, declaration, &declared);
     apply_values((Stylesheet *) sheet, style,
-                 &declaration->values,
+                 &declared,
                  declaration->mask & ~revert_rule_mask,
                  declaration->mask_high & ~revert_rule_mask_high);
     apply_inherit_mask(
@@ -3485,7 +3767,24 @@ static bool style_text_has_logical_property(const char *text, size_t length)
     return false;
 }
 
+static ComputedStyle style_apply_node_cascade_inner(
+    const Stylesheet *sheet, lxb_dom_node_t *node,
+    const ComputedStyle *parent, bool root_element, bool trace_position);
+
+/* One node's cascade: the DOM is fixed for its duration, so class lists
+   tokenized during it stay valid; a fresh outermost scope forgets them. */
 static ComputedStyle style_apply_node_cascade(
+    const Stylesheet *sheet, lxb_dom_node_t *node,
+    const ComputedStyle *parent, bool root_element, bool trace_position)
+{
+    style_class_tokens_scope_begin(sheet);
+    ComputedStyle style = style_apply_node_cascade_inner(
+        sheet, node, parent, root_element, trace_position);
+    style_class_tokens_scope_end(sheet);
+    return style;
+}
+
+static ComputedStyle style_apply_node_cascade_inner(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const ComputedStyle *parent, bool root_element, bool trace_position)
 {
@@ -3509,9 +3808,12 @@ static ComputedStyle style_apply_node_cascade(
     bool record = retained == NULL && style_retained_begin(sheet);
     StyleMatchSubject subject = {0};
     StyleRuleIndexPlan index_plan = {0};
+    uint32_t candidate_list[STYLE_RULE_INDEX_LIST_CAPACITY];
     if (retained == NULL) {
         subject = style_match_subject(sheet, node);
-        index_plan = style_rule_index_plan(sheet, &subject, PSEUDO_NONE);
+        index_plan = style_rule_index_plan(
+            sheet, &subject, PSEUDO_NONE, candidate_list,
+            STYLE_RULE_INDEX_LIST_CAPACITY);
     }
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
@@ -3652,9 +3954,14 @@ static bool style_plan_has_discovery_rule(const Stylesheet *sheet,
                                           PseudoElement pseudo)
 {
     if (!plan->ready) return true;
-    for (size_t i = 0; i < plan->count; i++) {
-        for (uint32_t at = plan->ranges[i].begin; at < plan->ranges[i].end; at++) {
-            uint32_t index = sheet->rule_index_entries[at];
+    for (size_t i = 0; i <= plan->count; i++) {
+        bool listed = i == plan->count;
+        uint32_t begin = listed ? 0 : plan->ranges[i].begin;
+        uint32_t end = listed ? (uint32_t) plan->list_count
+            : plan->ranges[i].end;
+        for (uint32_t at = begin; at < end; at++) {
+            uint32_t index = listed ? plan->list[at]
+                : sheet->rule_index_entries[at];
             if (index >= sheet->count) return true;
             if (!sheet->rule_filters[index].discovery) continue;
             const StyleRule *rule = &sheet->rules[index];
@@ -3683,8 +3990,10 @@ bool style_node_pseudo_rules_may_affect_discovery(const Stylesheet *sheet,
         || sheet->rule_filters == NULL
         || stylesheet_has_container_queries(sheet)) return true;
     StyleMatchSubject subject = style_match_subject(sheet, node);
+    uint32_t list[STYLE_RULE_INDEX_LIST_CAPACITY];
     for (PseudoElement p = PSEUDO_BEFORE; p <= PSEUDO_AFTER; p++) {
-        StyleRuleIndexPlan plan = style_rule_index_plan(sheet, &subject, p);
+        StyleRuleIndexPlan plan = style_rule_index_plan(
+            sheet, &subject, p, list, STYLE_RULE_INDEX_LIST_CAPACITY);
         if (style_plan_has_discovery_rule(sheet, node, &subject, &plan, p))
             return true;
     }
@@ -3708,8 +4017,25 @@ static void resolve_relative_line_height(ComputedStyle *style)
         32000, 64000);
 }
 
+static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
+                                           lxb_dom_node_t *node,
+                                           const ComputedStyle *parent);
+
+/* The whole resolution (cascade, retained modern properties, var() walks)
+   is one class-token scope: those later steps test the same class lists
+   against hundreds of candidate rules. */
 ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
                              const ComputedStyle *parent)
+{
+    style_class_tokens_scope_begin(sheet);
+    ComputedStyle style = style_for_node_scoped(sheet, node, parent);
+    style_class_tokens_scope_end(sheet);
+    return style;
+}
+
+static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
+                                           lxb_dom_node_t *node,
+                                           const ComputedStyle *parent)
 {
     /* The rule index is deliberately lazy: stylesheet_add_css* invalidates
        it and the next resolution rebuilds it here (tests assert this
@@ -3820,9 +4146,12 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
         style.border_color = style.color;
         style.border_alpha = style.color_alpha;
     }
-    size_t open_length = 0;
+    /* `open` is a boolean attribute: Lexbor reports no value for the
+       common valueless `<dialog open>`, so test presence, not a value. */
     if ((style_tag_is(node, "dialog")
-         && document_attribute(node, "open", &open_length) == NULL)
+         && !lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "open", 4))
         || style_tag_is(node, "template")) {
         style.display = DISPLAY_NONE;
     }
@@ -4314,6 +4643,9 @@ StyleFocusChange style_focus_change_classify(
     }
     original_value[original_length] = '\0';
 
+    /* The marker is restored below: the probe is no host style change
+       unless restoration fails. */
+    document_style_quiet_begin();
     bool focused_set = set_focus_marker(node, true);
     bool ok = focused_set;
     if (focused_set) {
@@ -4344,6 +4676,8 @@ StyleFocusChange style_focus_change_classify(
         restored = restore_focus_marker(
             node, originally_focused, original_value, original_length);
     }
+    document_style_quiet_end();
+    if (!restored) document_style_changed();
     style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
     if (!ok || !restored) return STYLE_FOCUS_CHANGE_UNSAFE;
     if (computed_style_equal_without_outline(normal, focused)) {
@@ -4431,6 +4765,7 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
 {
     StyleMatchSubject subject = {0};
     StyleRuleIndexPlan index_plan = {0};
+    uint32_t candidate_list[STYLE_RULE_INDEX_LIST_CAPACITY];
     const StyleRetainedMatchEntry *retained = NULL;
     if (sheet != NULL && node != NULL && pseudo != PSEUDO_NONE) {
         retained = style_retained_lookup(sheet, node, pseudo);
@@ -4444,12 +4779,15 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
             if (style_pseudo_known_absent(sheet, node, pseudo))
                 return (ComputedStyle) {0};
             subject = style_match_subject(sheet, node);
-            index_plan = style_rule_index_plan(sheet, &subject, pseudo);
+            index_plan = style_rule_index_plan(
+                sheet, &subject, pseudo, candidate_list,
+                STYLE_RULE_INDEX_LIST_CAPACITY);
             /* This early exit belongs only to layout. Computed-style callers
                still receive inherited/default values for an absent pseudo.
                No candidate rule exists, so the exact retained list is
                empty: keep that answer across builds. */
-            if (index_plan.ready && index_plan.count == 0) {
+            if (index_plan.ready && index_plan.count == 0
+                && index_plan.list_count == 0) {
                 if (style_retained_begin(sheet)) {
                     style_retained_commit(sheet, node, pseudo);
                 }
@@ -4535,7 +4873,9 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
     sheet->resolve_scratch->current_image_source_slot = 0;
     if (!layout_only && retained == NULL) {
         subject = style_match_subject(sheet, node);
-        index_plan = style_rule_index_plan(sheet, &subject, pseudo);
+        index_plan = style_rule_index_plan(
+            sheet, &subject, pseudo, candidate_list,
+            STYLE_RULE_INDEX_LIST_CAPACITY);
     }
     bool record = retained == NULL && style_retained_begin(sheet);
     for (size_t phase = 0; phase < 4; phase++) {
@@ -4580,13 +4920,21 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
 ComputedStyle style_for_pseudo(const Stylesheet *sheet, lxb_dom_node_t *node,
                                PseudoElement pseudo, const ComputedStyle *parent)
 {
-    return style_resolve_pseudo(sheet, node, pseudo, parent, false);
+    style_class_tokens_scope_begin(sheet);
+    ComputedStyle style = style_resolve_pseudo(
+        sheet, node, pseudo, parent, false);
+    style_class_tokens_scope_end(sheet);
+    return style;
 }
 
 ComputedStyle style_for_layout_pseudo(const Stylesheet *sheet, lxb_dom_node_t *node,
                                       PseudoElement pseudo, const ComputedStyle *parent)
 {
-    return style_resolve_pseudo(sheet, node, pseudo, parent, true);
+    style_class_tokens_scope_begin(sheet);
+    ComputedStyle style = style_resolve_pseudo(
+        sheet, node, pseudo, parent, true);
+    style_class_tokens_scope_end(sheet);
+    return style;
 }
 
 static bool has_ascii_equal(const char *first, const char *second,
@@ -4618,6 +4966,16 @@ static bool has_selector_mentions_attribute(
         if (selector[i] != '[') continue;
         size_t at = i + 1;
         while (at < length && isspace((unsigned char) selector[at])) at++;
+        /* This rejection filter compares plain attribute names; escaped or
+           namespace-qualified names require the full selector parser. Fail
+           open rather than missing e.g. [s\74 yle] after a CSSOM write.
+           Escapes in an attribute value may conservatively lose a cache hit. */
+        for (size_t scan = at; scan < length && selector[scan] != ']'; scan++) {
+            if (selector[scan] == '\\'
+                || (selector[scan] == '|'
+                    && (scan + 1 == length || selector[scan + 1] != '=')))
+                return true;
+        }
         if (at + name_length > length
             || !has_ascii_equal(selector + at, name, name_length)) continue;
         at += name_length;
@@ -4767,6 +5125,161 @@ static bool has_selector_token_is_relational(
     return false;
 }
 
+static uint32_t has_token_hash(const unsigned char *bytes, size_t length)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+/* The identifier after a '.' at `dot`, decoded the way
+   has_selector_mentions_token compares it (escapes resolved). Returns its
+   length, or 0 when it does not fit or is malformed. */
+static size_t has_decode_class(const char *selector, size_t length,
+                               size_t dot, unsigned char *out, size_t cap)
+{
+    size_t at = dot + 1, used = 0;
+    while (at < length) {
+        unsigned char decoded[4];
+        size_t decoded_length = 0;
+        unsigned char value = (unsigned char) selector[at];
+        if (value == '\\') {
+            at++;
+            if (at == length || selector[at] == '\n' || selector[at] == '\r')
+                return 0;
+            unsigned codepoint = 0;
+            size_t digits = 0;
+            while (at < length && digits < 6
+                   && isxdigit((unsigned char) selector[at])) {
+                unsigned char digit = (unsigned char) selector[at++];
+                codepoint = codepoint * 16u
+                    + (isdigit(digit) ? (unsigned) (digit - '0')
+                       : (unsigned) (tolower(digit) - 'a' + 10));
+                digits++;
+            }
+            if (digits == 0) {
+                decoded[0] = (unsigned char) selector[at++];
+                decoded_length = 1;
+            } else {
+                if (at < length && isspace((unsigned char) selector[at])) at++;
+                if (codepoint <= 0x7f) {
+                    decoded[0] = (unsigned char) codepoint;
+                    decoded_length = 1;
+                } else if (codepoint <= 0x7ff) {
+                    decoded[0] = (unsigned char) (0xc0 | (codepoint >> 6));
+                    decoded[1] = (unsigned char) (0x80 | (codepoint & 63));
+                    decoded_length = 2;
+                } else if (codepoint <= 0xffff) {
+                    decoded[0] = (unsigned char) (0xe0 | (codepoint >> 12));
+                    decoded[1] = (unsigned char) (0x80 | ((codepoint >> 6) & 63));
+                    decoded[2] = (unsigned char) (0x80 | (codepoint & 63));
+                    decoded_length = 3;
+                } else if (codepoint <= 0x10ffff) {
+                    decoded[0] = (unsigned char) (0xf0 | (codepoint >> 18));
+                    decoded[1] = (unsigned char) (0x80 | ((codepoint >> 12) & 63));
+                    decoded[2] = (unsigned char) (0x80 | ((codepoint >> 6) & 63));
+                    decoded[3] = (unsigned char) (0x80 | (codepoint & 63));
+                    decoded_length = 4;
+                } else {
+                    return 0;
+                }
+            }
+        } else {
+            if (!has_css_identifier_byte(value)) break;
+            decoded[0] = value;
+            decoded_length = 1;
+            at++;
+        }
+        if (decoded_length > cap - used) return 0;
+        memcpy(out + used, decoded, decoded_length);
+        used += decoded_length;
+    }
+    return used;
+}
+
+static int has_hash_compare(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *) left, b = *(const uint32_t *) right;
+    return a < b ? -1 : a > b;
+}
+
+static bool has_collect_class_hashes(const char *selector, size_t length,
+                                     uint32_t *hashes, size_t capacity,
+                                     size_t *count, bool *overflow)
+{
+    if (!has_selector_contains(selector, length, ":has(")) return true;
+    for (size_t i = 0; i + 1 < length; i++) {
+        if (selector[i] != '.') continue;
+        unsigned char token[256];
+        size_t token_length = has_decode_class(selector, length, i, token,
+                                               sizeof(token));
+        if (token_length == 0) {
+            /* A class too long to hash: answer conservatively. */
+            if (has_css_identifier_byte((unsigned char) selector[i + 1])
+                || selector[i + 1] == '\\') *overflow = true;
+            continue;
+        }
+        if (!has_selector_token_is_relational(selector, length, i)) continue;
+        if (*count == capacity) {
+            *overflow = true;
+            return true;
+        }
+        hashes[(*count)++] = has_token_hash(token, token_length);
+    }
+    return true;
+}
+
+/* Builds sheet->has_class_hashes from the :has() rules. False when the set
+   is unavailable (allocation, or a class the set cannot represent); the
+   caller then scans the rules. */
+static bool has_prepare_class_hashes(Stylesheet *sheet)
+{
+    if (sheet->has_class_hashes_ready) return true;
+    enum { HAS_CLASS_HASH_LIMIT = 4096 };
+    uint32_t *hashes = budget_realloc(sheet->budget, sheet->has_class_hashes,
+                                      HAS_CLASS_HASH_LIMIT * sizeof(*hashes));
+    if (hashes == NULL) return false;
+    sheet->has_class_hashes = hashes;
+    size_t count = 0;
+    bool overflow = false;
+    for (size_t k = 0; k < sheet->has_rule_count && !overflow; k++) {
+        const StyleRule *rule = &sheet->rules[sheet->has_rule_indices[k]];
+        if (rule->selector != NULL)
+            (void) has_collect_class_hashes(rule->selector,
+                                            rule->selector_length, hashes,
+                                            HAS_CLASS_HASH_LIMIT, &count,
+                                            &overflow);
+    }
+    for (size_t k = 0; k < sheet->has_custom_rule_count && !overflow; k++) {
+        const char *selector =
+            sheet->custom_rules[sheet->has_custom_rule_indices[k]].selector;
+        (void) has_collect_class_hashes(selector, strlen(selector), hashes,
+                                        HAS_CLASS_HASH_LIMIT, &count,
+                                        &overflow);
+    }
+    if (overflow) {
+        budget_free(sheet->budget, sheet->has_class_hashes);
+        sheet->has_class_hashes = NULL;
+        sheet->has_class_hash_count = 0;
+        return false;
+    }
+    qsort(hashes, count, sizeof(*hashes), has_hash_compare);
+    if (count == 0) {
+        budget_free(sheet->budget, sheet->has_class_hashes);
+        sheet->has_class_hashes = NULL;
+    } else {
+        uint32_t *shrunk = budget_realloc(sheet->budget, hashes,
+                                          count * sizeof(*hashes));
+        if (shrunk != NULL) sheet->has_class_hashes = shrunk;
+    }
+    sheet->has_class_hash_count = count;
+    sheet->has_class_hashes_ready = true;
+    return true;
+}
+
 static bool has_class_list_contains(
     const char *value, size_t length, const char *token, size_t token_length)
 {
@@ -4859,10 +5372,15 @@ static bool has_selector_attribute_change_sensitive(
         const char *attribute;
         const char *pseudo;
     };
+    /* Every attribute a supported pseudo-class reads (style_match.c). */
     static const struct PseudoAttribute pseudos[] = {
         {"checked", ":checked"}, {"disabled", ":disabled"},
-        {"required", ":required"}, {"readonly", ":read-only"},
-        {"selected", ":checked"}, {"open", ":open"},
+        {"disabled", ":enabled"}, {"required", ":required"},
+        {"required", ":optional"}, {"readonly", ":read-only"},
+        {"selected", ":checked"}, {"open", ":open"}, {"open", ":modal"},
+        {"data-tilefinch-modal", ":modal"},
+        {"data-tilefinch-popover-open", ":popover-open"},
+        {"data-tilefinch-popover-open", ":open"},
         {"href", ":link"}, {"data-tilefinch-focus", ":focus"}
     };
     for (size_t i = 0; i < sizeof(pseudos) / sizeof(pseudos[0]); i++) {
@@ -4883,6 +5401,103 @@ bool stylesheet_attribute_change_may_affect_has(
     if (has_values_equal(
             old_value, old_length, new_value, new_length)) return false;
     if (sheet == NULL || name == NULL || name_length == 0) return true;
+    /* Only rules containing ":has(" can answer yes; scanning every rule's
+       text per write cost chatgpt.com ~145 us a setAttribute on the host
+       (1,157 rules). The index is a memo on a const sheet. */
+    if (stylesheet_prepare_has_rule_index((Stylesheet *) sheet)) {
+        bool is_class = name_length == 5 && has_ascii_equal(name, "class", 5);
+        if (is_class && has_prepare_class_hashes((Stylesheet *) sheet)) {
+            /* A class write matters through [class] selectors or through a
+               changed token the :has() rules mention relationally. */
+            for (size_t k = 0; k < sheet->has_rule_count; k++) {
+                const StyleRule *rule =
+                    &sheet->rules[sheet->has_rule_indices[k]];
+                if (rule->selector != NULL
+                    && has_selector_mentions_attribute(
+                        rule->selector, rule->selector_length, name,
+                        name_length)) return true;
+            }
+            for (size_t k = 0; k < sheet->has_custom_rule_count; k++) {
+                const char *selector = sheet->custom_rules[
+                    sheet->has_custom_rule_indices[k]].selector;
+                if (has_selector_mentions_attribute(
+                        selector, strlen(selector), name, name_length))
+                    return true;
+            }
+            if (sheet->has_class_hash_count == 0) return false;
+            const char *values[2] = {old_value, new_value};
+            size_t lengths[2] = {old_length, new_length};
+            for (size_t side = 0; side < 2; side++) {
+                const char *value = values[side];
+                if (value == NULL) continue;
+                for (size_t at = 0; at < lengths[side];) {
+                    while (at < lengths[side]
+                           && isspace((unsigned char) value[at])) at++;
+                    size_t start = at;
+                    while (at < lengths[side]
+                           && !isspace((unsigned char) value[at])) at++;
+                    size_t token_length = at - start;
+                    if (token_length == 0
+                        || has_class_list_contains(
+                            values[1 - side], lengths[1 - side],
+                            value + start, token_length)) continue;
+                    uint32_t hash = has_token_hash(
+                        (const unsigned char *) value + start, token_length);
+                    if (bsearch(&hash, sheet->has_class_hashes,
+                                sheet->has_class_hash_count,
+                                sizeof(hash), has_hash_compare) != NULL)
+                        return true;
+                }
+            }
+            return false;
+        }
+        /* Apart from class and id, the answer is the name's alone. */
+        bool is_id = name_length == 2 && has_ascii_equal(name, "id", 2);
+        char lowered[STYLE_HAS_ATTRIBUTE_MEMO_NAME];
+        bool memoized = !is_id && name_length < sizeof(lowered);
+        Stylesheet *memo_sheet = (Stylesheet *) sheet;
+        if (memoized) {
+            for (size_t i = 0; i < name_length; i++)
+                lowered[i] = (char) tolower((unsigned char) name[i]);
+            for (uint8_t i = 0; i < memo_sheet->has_attribute_memo_count;
+                 i++) {
+                if (memo_sheet->has_attribute_memo[i].length == name_length
+                    && memcmp(memo_sheet->has_attribute_memo[i].name,
+                              lowered, name_length) == 0)
+                    return memo_sheet->has_attribute_memo[i].sensitive;
+            }
+        }
+        bool sensitive = false;
+        for (size_t k = 0; k < sheet->has_rule_count && !sensitive; k++) {
+            const StyleRule *rule = &sheet->rules[sheet->has_rule_indices[k]];
+            sensitive = rule->selector != NULL
+                && has_selector_attribute_change_sensitive(
+                    rule->selector, rule->selector_length,
+                    name, name_length, old_value, old_length,
+                    new_value, new_length);
+        }
+        for (size_t k = 0; k < sheet->has_custom_rule_count && !sensitive;
+             k++) {
+            const char *selector = sheet->custom_rules[
+                sheet->has_custom_rule_indices[k]].selector;
+            sensitive = has_selector_attribute_change_sensitive(
+                selector, strlen(selector), name, name_length,
+                old_value, old_length, new_value, new_length);
+        }
+        if (memoized) {
+            uint8_t slot = memo_sheet->has_attribute_memo_count
+                    < STYLE_HAS_ATTRIBUTE_MEMO_SLOTS
+                ? memo_sheet->has_attribute_memo_count++
+                : (uint8_t) (memo_sheet->has_attribute_memo_next++
+                             % STYLE_HAS_ATTRIBUTE_MEMO_SLOTS);
+            memcpy(memo_sheet->has_attribute_memo[slot].name, lowered,
+                   name_length);
+            memo_sheet->has_attribute_memo[slot].length =
+                (uint8_t) name_length;
+            memo_sheet->has_attribute_memo[slot].sensitive = sensitive;
+        }
+        return sensitive;
+    }
     for (size_t i = 0; i < sheet->count; i++) {
         const StyleRule *rule = &sheet->rules[i];
         if (rule->selector != NULL

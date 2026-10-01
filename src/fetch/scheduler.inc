@@ -4,6 +4,27 @@ static void scheduled_capture_finish(FetchScheduler *scheduler,
                                      ScheduledFetch *item,
                                      bool external_cancel);
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static void scheduled_timeline(const FetchScheduler *scheduler,
+                                const ScheduledFetch *item, const char *stage)
+{
+    char message[384];
+    snprintf(message, sizeof(message),
+             "tilefinch-fetch-timeline: stage=%s scheduler=%p item=%p writer=%p "
+             "id=%llu background=%llu trace=%lld at-us=%llu bytes=%zu "
+             "measured=%d first-header-us=%lu transport-us=%lu",
+             stage, (const void *) scheduler, (const void *) item,
+             (const void *) &item->writer, (unsigned long long) item->id,
+             (unsigned long long) item->background_request_id,
+             item->has_trace_sequence ? (long long) item->trace_sequence : -1LL,
+             (unsigned long long) tilefinch_platform_monotonic_time_us(),
+             item->result.length, item->result.transport_timing.measured ? 1 : 0,
+             (unsigned long) item->result.transport_timing.first_byte_us,
+             (unsigned long) item->result.transport_timing.total_us);
+    tilefinch_platform_log_message(message);
+}
+#endif
+
 static char *scheduler_copy(Budget *budget, const char *value, size_t limit)
 {
     if (value == NULL) return NULL;
@@ -100,7 +121,7 @@ static void scheduled_fetch_clear(FetchScheduler *scheduler,
         item->background_request_id = 0;
     }
     if (scheduler != NULL && item != NULL && item->active
-        && fetch_trace.mode == FETCH_TRACE_CAPTURE
+        && FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE
         && item->has_trace_sequence && !item->capture_finalized) {
         item->success = false;
         snprintf(item->result.error, sizeof(item->result.error),
@@ -123,6 +144,9 @@ static void scheduled_fetch_clear(FetchScheduler *scheduler,
         (void) fclose(item->replay_file);
         item->replay_file = NULL;
     }
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    trace_replay_rekey_release(scheduler->budget, &item->writer.replay_rekey);
+#endif
     budget_free(scheduler->budget, item->writer.pending);
     budget_free(scheduler->budget, item->replay_buffer);
     fetch_result_destroy(&item->result);
@@ -422,7 +446,7 @@ static FetchRequest scheduled_background_hop_shape(
 static bool scheduled_background_hop_supported(ScheduledFetch *item)
 {
     if (item == NULL || !item->background_allowed || item->hop == NULL
-        || fetch_trace.mode != FETCH_TRACE_OFF
+        || FETCH_TRACE_MODE != FETCH_TRACE_OFF
         || !fetch_background_transport_available()
         || !fetch_background_transport_initialize(item->result.budget)
         || !fetch_hop_configure_cookie(
@@ -462,12 +486,30 @@ static bool scheduled_background_start_hop_with(ScheduledFetch *item,
     item->background_request_id =
         fetch_background_transport_enqueue_hop_stream(
             item->hop->url, &shape, item->reserved_bytes, remaining_ms);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (item->background_request_id != 0)
+        scheduled_timeline(NULL, item, "submit");
+#endif
     return item->background_request_id != 0;
 }
 
 static bool scheduled_background_start_hop(ScheduledFetch *item)
 {
     return scheduled_background_start_hop_with(item, false);
+}
+
+/* A streamed document may keep arriving long after its request deadline:
+   chatgpt.com streams an answer into the page while the parser runs up to
+   20 s of script. The deadline therefore bounds the wait for response
+   headers (scheduled_expire_stream_headers); afterwards the stream only
+   dies when no byte arrives for the same allowance. */
+static long scheduled_stall_seconds(const ScheduledFetch *item,
+                                    long timeout_ms)
+{
+    if (item->request.stall_abort_seconds > 0)
+        return item->request.stall_abort_seconds;
+    if (!item->streaming) return 0;
+    return timeout_ms >= 1000 ? timeout_ms / 1000 : 1;
 }
 
 static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
@@ -614,6 +656,10 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
         .identity_encoding = source != NULL && source->identity_encoding,
         .raw_gzip_encoding = source != NULL && source->raw_gzip_encoding,
         .connect_timeout_ms = source == NULL ? 0 : source->connect_timeout_ms,
+        .stall_abort_seconds =
+            source == NULL ? 0 : source->stall_abort_seconds,
+        .force_fresh_connection =
+            source != NULL && source->force_fresh_connection,
         .block_private_network = source != NULL
             && fetch_request_private_network_protected(source, url),
         .if_none_match = item->if_none_match,
@@ -743,7 +789,18 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
                fetch_connect_timeout_ms(
                    &item->request, timeout_ms)) != CURLE_OK
         || curl_easy_setopt(
-               item->easy, CURLOPT_TIMEOUT_MS, timeout_ms) != CURLE_OK
+               item->easy, CURLOPT_TIMEOUT_MS,
+               item->streaming ? 0L : timeout_ms) != CURLE_OK
+        || curl_easy_setopt(
+               item->easy, CURLOPT_LOW_SPEED_LIMIT,
+               scheduled_stall_seconds(item, timeout_ms) > 0
+                   ? 1L : 0L) != CURLE_OK
+        || curl_easy_setopt(
+               item->easy, CURLOPT_LOW_SPEED_TIME,
+               scheduled_stall_seconds(item, timeout_ms)) != CURLE_OK
+        || curl_easy_setopt(
+               item->easy, CURLOPT_FRESH_CONNECT,
+               item->request.force_fresh_connection ? 1L : 0L) != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_NOSIGNAL, 1L) != CURLE_OK
         || curl_easy_setopt(
@@ -874,7 +931,7 @@ static uint64_t fetch_scheduler_enqueue_internal(
     FetchRequest replay_shape;
     char replay_cookie[FETCH_SET_COOKIE_LIMIT];
     const FetchRequest *trace_request = request;
-    if (fetch_trace.mode == FETCH_TRACE_REPLAY && request != NULL) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY && request != NULL) {
         if (!scheduled_trace_request_shape(
                 url, request, &replay_shape,
                 replay_cookie, sizeof(replay_cookie))) return 0;
@@ -930,7 +987,7 @@ static uint64_t fetch_scheduler_enqueue_internal(
         item->complete = true;
         return item->id;
     }
-    if (fetch_trace.mode == FETCH_TRACE_REPLAY) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY) {
         item->writer = (WriteContext) {
             .result = &item->result,
             .maximum_bytes = maximum_bytes,
@@ -996,7 +1053,33 @@ static uint64_t fetch_scheduler_enqueue_internal(
                               ? 1
                               : (item->result.trace_delay_pumps == 0
                                   ? 1 : item->result.trace_delay_pumps));
+        item->replay_release_us = 0;
+        if (fetch_trace.replay_pump_us != 0
+            && item->replay_pumps_remaining != UINT_MAX) {
+            item->replay_release_us = tilefinch_platform_monotonic_time_us()
+                + (uint64_t) item->replay_pumps_remaining
+                    * fetch_trace.replay_pump_us;
+            item->replay_pumps_remaining = 1;
+        }
         scheduler->pending++;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        /* Replay holds a response for the pumps its capture took (the
+           recorded server and transport time, counted in scheduler pumps,
+           one per runtime advance). A load timeline charges that wait to
+           the recording, not to the browser. */
+        {
+            char message[160];
+            snprintf(message, sizeof(message),
+                     "tilefinch-fetch-timeline: stage=replay-admit "
+                     "scheduler=%p id=%llu at-us=%llu delay-pumps=%u "
+                     "release-us=%llu",
+                     (const void *) scheduler, (unsigned long long) item->id,
+                     (unsigned long long) tilefinch_platform_monotonic_time_us(),
+                     (unsigned) item->result.trace_delay_pumps,
+                     (unsigned long long) item->replay_release_us);
+            tilefinch_platform_log_message(message);
+        }
+#endif
         return item->id;
     }
     if (!scheduled_fetch_prepare(
@@ -1022,7 +1105,7 @@ static uint64_t fetch_scheduler_enqueue_internal(
         item->writer.stream = &item->stream;
         item->writer.metrics = &item->stream_metrics;
     }
-    if (fetch_trace.mode == FETCH_TRACE_CAPTURE) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_CAPTURE) {
         if (item->hop->cookie_header[0] != '\0') {
             item->trace_cookie = scheduler_copy(
                 scheduler->budget, item->hop->cookie_header,
@@ -1078,6 +1161,9 @@ static uint64_t fetch_scheduler_enqueue_internal(
     }
     item->active = true;
     scheduler->pending++;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    scheduled_timeline(scheduler, item, "enqueue");
+#endif
     return item->id;
 }
 
@@ -1152,7 +1238,7 @@ static void scheduled_capture_finish(FetchScheduler *scheduler,
             item->result.redirect_origin_tainted
             || item->hop->origin_tainted;
     }
-    if (fetch_trace.mode != FETCH_TRACE_CAPTURE || item->capture_finalized) {
+    if (FETCH_TRACE_MODE != FETCH_TRACE_CAPTURE || item->capture_finalized) {
         return;
     }
     item->capture_finalized = true;
@@ -1185,6 +1271,22 @@ static void scheduled_capture_finish(FetchScheduler *scheduler,
     }
 }
 
+/* A finished response holds only the body it buffered; the rest of its
+   response bound goes back to the pool. A page fetch() whose result script
+   never read kept chatgpt.com's full 1 MiB bound (half the pool) for the
+   life of the page, so later module requests were refused outright. */
+static void scheduled_release_unused_reservation(FetchScheduler *scheduler,
+                                                 ScheduledFetch *item)
+{
+    size_t retained = item->result.capacity > item->result.length
+        ? item->result.capacity : item->result.length;
+    if (retained >= item->reserved_bytes) return;
+    size_t released = item->reserved_bytes - retained;
+    scheduler->reserved_bytes = scheduler->reserved_bytes >= released
+        ? scheduler->reserved_bytes - released : 0;
+    item->reserved_bytes = retained;
+}
+
 static void scheduled_mark_complete(FetchScheduler *scheduler,
                                     ScheduledFetch *item, bool success,
                                     const char *error,
@@ -1209,7 +1311,11 @@ static void scheduled_mark_complete(FetchScheduler *scheduler,
     if (!success) fetch_result_discard_all_cookie_storage(&item->result);
     item->active = false;
     item->complete = true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    scheduled_timeline(scheduler, item, "ready");
+#endif
     if (scheduler->pending != 0) scheduler->pending--;
+    scheduled_release_unused_reservation(scheduler, item);
 }
 
 static bool scheduled_replay_headers(ScheduledFetch *item)
@@ -1290,10 +1396,13 @@ static bool scheduled_replay_body(FetchScheduler *scheduler,
             wanted = item->stream.truncate_after_bytes - item->replay_offset;
         }
         if (wanted == 0) continue;
-        if (wanted > item->replay_buffer_capacity
-            || item->replay_file == NULL
-            || fread(item->replay_buffer, 1, wanted,
-                     item->replay_file) != wanted) {
+        uint64_t read_started_ns = tilefinch_platform_monotonic_time_ns();
+        bool read_ok = wanted <= item->replay_buffer_capacity
+            && item->replay_file != NULL
+            && fread(item->replay_buffer, 1, wanted,
+                     item->replay_file) == wanted;
+        TRACE_REPLAY_IO_READ(read_started_ns, read_ok ? wanted : 0);
+        if (!read_ok) {
             snprintf(item->result.error, sizeof(item->result.error),
                      "HTTP replay body is corrupt");
             return false;
@@ -1301,6 +1410,9 @@ static bool scheduled_replay_body(FetchScheduler *scheduler,
         item->writer.replay_body_hash = trace_body_hash_with_offset(
             (const char *) item->replay_buffer, wanted,
             item->writer.replay_body_hash);
+        trace_replay_rekey_apply(item->writer.replay_rekey,
+                                 item->replay_offset, item->replay_buffer,
+                                 wanted);
         if (!write_deliver_chunk(
                 &item->writer, item->replay_buffer, wanted)) {
             if (item->result.error[0] == '\0') {
@@ -1377,6 +1489,9 @@ static bool scheduled_retry_tls12_compatibility(
     }
     item->result.tls12_compatibility_retry = true;
     item->error[0] = '\0';
+    if (item->streaming
+        && curl_easy_setopt(item->easy, CURLOPT_TIMEOUT_MS, 0L)
+               != CURLE_OK) return false;
     return curl_multi_add_handle(scheduler->multi, item->easy) == CURLM_OK;
 }
 
@@ -1456,7 +1571,11 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                          "redirect transport could not be rescheduled");
             } else if (!fetch_configure_redirect_hop(
                            item->easy, &item->request, item->hop,
-                           &item->writer, &item->headers)) {
+                           &item->writer, &item->headers)
+                       || (item->streaming
+                           && curl_easy_setopt(
+                                  item->easy, CURLOPT_TIMEOUT_MS, 0L)
+                                  != CURLE_OK)) {
                 item->result.timed_out =
                     fetch_hop_remaining_ms(item->hop) <= 0;
                 snprintf(
@@ -1518,6 +1637,27 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
     scheduled_mark_complete(
         scheduler, item, item->success, item->result.error, false);
     return true;
+}
+
+/* Streams carry no libcurl total timeout (scheduled_stall_seconds), so
+   the request deadline is enforced here until response headers arrive. */
+static size_t scheduled_expire_stream_headers(FetchScheduler *scheduler)
+{
+    size_t expired = 0;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        ScheduledFetch *item = scheduler->items[i];
+        if (item == NULL || !item->active || !item->streaming
+            || item->easy == NULL || item->background_backend
+            || item->transport_complete || item->writer.headers_delivered
+            || fetch_hop_remaining_ms(item->hop) > 0) continue;
+        item->result.timed_out = true;
+        item->result.transport_code = (long) CURLE_OPERATION_TIMEDOUT;
+        scheduled_mark_complete(
+            scheduler, item, false,
+            "response headers exceeded the request deadline", false);
+        expired++;
+    }
+    return expired;
 }
 
 static void scheduled_background_abort(
@@ -1774,7 +1914,7 @@ size_t fetch_scheduler_pump_bounded(
         item->writer.pump_metrics = pump;
     }
     size_t completed = 0;
-    if (fetch_trace.mode == FETCH_TRACE_REPLAY) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY) {
         for (size_t visited = 0; visited < scheduler->capacity
                                  && completed < maximum_completions;
              visited++) {
@@ -1785,6 +1925,9 @@ size_t fetch_scheduler_pump_bounded(
             if (!item->active || item->easy != NULL) continue;
             if (item->result.trace_external_cancel
                 && !item->replay_retained_external_cancel) continue;
+            if (item->replay_release_us != 0
+                && tilefinch_platform_monotonic_time_us()
+                       < item->replay_release_us) continue;
             if (item->replay_pumps_remaining != 0) {
                 item->replay_pumps_remaining--;
                 if (item->replay_pumps_remaining != 0) continue;
@@ -1912,6 +2055,9 @@ size_t fetch_scheduler_pump_bounded(
                 break;
             }
         }
+        if (regular_active) {
+            completed += scheduled_expire_stream_headers(scheduler);
+        }
         int running = 0;
         CURLMcode performed = CURLM_OK;
         if (regular_active && completed < maximum_completions
@@ -1933,8 +2079,11 @@ size_t fetch_scheduler_pump_bounded(
             }
             if (wait_ms != 0) {
                 int descriptors = 0;
-                if (curl_multi_poll(scheduler->multi, NULL, 0,
-                                    (int) wait_ms, &descriptors) == CURLM_OK) {
+                unsigned ledger = work_ledger_enter(WORK_LEDGER_SLEEP);
+                CURLMcode polled = curl_multi_poll(
+                    scheduler->multi, NULL, 0, (int) wait_ms, &descriptors);
+                work_ledger_leave(ledger);
+                if (polled == CURLM_OK) {
                     (void) curl_multi_perform(scheduler->multi, &running);
                 }
             }
@@ -1951,8 +2100,11 @@ size_t fetch_scheduler_pump_bounded(
                 unsigned wait_ms = maximum_wait_ms;
                 if ((uint64_t) wait_ms * 1000u > left_us)
                     wait_ms = (unsigned) left_us / 1000u;
-                if (wait_ms != 0)
+                if (wait_ms != 0) {
+                    unsigned ledger = work_ledger_enter(WORK_LEDGER_SLEEP);
                     fetch_background_transport_wait(wait_ms);
+                    work_ledger_leave(ledger);
+                }
             }
         }
         int remaining = 0;
@@ -2039,6 +2191,9 @@ bool fetch_scheduler_take(FetchScheduler *scheduler, uint64_t request_id,
         ScheduledFetch *item = scheduler->items[i];
         if (item == NULL) continue;
         if (!item->complete || item->id != request_id) continue;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        scheduled_timeline(scheduler, item, "take");
+#endif
         if (item->result.received_body_bytes < item->result.length) {
             item->result.received_body_bytes = item->result.length;
         }
@@ -2124,6 +2279,28 @@ bool fetch_scheduler_request_progress(
     return false;
 }
 
+static bool fetch_scheduler_wait_enqueued(FetchScheduler *scheduler,
+                                          uint64_t id, FetchResult *result);
+
+/* Time the owner spends blocked in a synchronous wait (a response, or byte
+   pool capacity for a module the page waits on). The wait pumps deliveries
+   and cooperates with the UI, so this is the page's blocked time, not
+   network time alone. Diagnostics: separates page-script CPU from waits. */
+static uint64_t fetch_sync_wait_us;
+static uint64_t fetch_sync_wait_count;
+
+void fetch_sync_wait_note(uint64_t elapsed_us)
+{
+    fetch_sync_wait_us += elapsed_us;
+    fetch_sync_wait_count++;
+}
+
+void fetch_sync_wait_totals(uint64_t *us, uint64_t *count)
+{
+    if (us != NULL) *us = fetch_sync_wait_us;
+    if (count != NULL) *count = fetch_sync_wait_count;
+}
+
 bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
                              const FetchRequest *request,
                              size_t maximum_bytes, long timeout_ms,
@@ -2145,6 +2322,38 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
     uint64_t id = fetch_scheduler_enqueue(scheduler, url, request,
                                           maximum_bytes, timeout_ms);
     if (id == 0) return false;
+    return fetch_scheduler_wait_enqueued(scheduler, id, result);
+}
+
+bool fetch_scheduler_wait(FetchScheduler *scheduler, uint64_t id,
+                          FetchResult *result)
+{
+    if (result == NULL) return false;
+    Budget *result_budget = scheduler == NULL
+        ? result->budget : scheduler->budget;
+    memset(result, 0, sizeof(*result));
+    result->budget = result_budget;
+    if (scheduler == NULL || id == 0) return false;
+    return fetch_scheduler_wait_enqueued(scheduler, id, result);
+}
+
+static bool fetch_scheduler_wait_enqueued_loop(FetchScheduler *scheduler,
+                                               uint64_t id,
+                                               FetchResult *result);
+
+static bool fetch_scheduler_wait_enqueued(FetchScheduler *scheduler,
+                                          uint64_t id, FetchResult *result)
+{
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    bool ok = fetch_scheduler_wait_enqueued_loop(scheduler, id, result);
+    fetch_sync_wait_note(tilefinch_platform_monotonic_time_us() - started_us);
+    return ok;
+}
+
+static bool fetch_scheduler_wait_enqueued_loop(FetchScheduler *scheduler,
+                                               uint64_t id,
+                                               FetchResult *result)
+{
     for (;;) {
         bool success = false;
         if (fetch_scheduler_take(scheduler, id, &success, result)) {
@@ -2238,6 +2447,17 @@ size_t fetch_scheduler_pending(const FetchScheduler *scheduler)
     return scheduler == NULL ? 0 : scheduler->pending;
 }
 
+bool fetch_scheduler_request_complete(const FetchScheduler *scheduler,
+                                      uint64_t request_id)
+{
+    if (scheduler == NULL || request_id == 0) return false;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        const ScheduledFetch *item = scheduler->items[i];
+        if (item != NULL && item->id == request_id) return item->complete;
+    }
+    return false;
+}
+
 bool fetch_scheduler_tls_handshake_counters(
     const FetchScheduler *scheduler, FetchTlsHandshakeCounters *counters)
 {
@@ -2308,7 +2528,7 @@ void fetch_scheduler_debug_dump(const FetchScheduler *scheduler,
 
 bool fetch_scheduler_uses_virtual_replay(const FetchScheduler *scheduler)
 {
-    return scheduler != NULL && fetch_trace.mode == FETCH_TRACE_REPLAY;
+    return scheduler != NULL && FETCH_TRACE_MODE == FETCH_TRACE_REPLAY;
 }
 
 void fetch_scheduler_destroy(FetchScheduler *scheduler)

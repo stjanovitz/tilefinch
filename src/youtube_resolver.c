@@ -2238,6 +2238,7 @@ static bool youtube_resolve_job_poll_response(
 static void youtube_resolve_job_log_response(
     const YoutubeResolveJob *job, const char *phase, const char *client)
 {
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     uint64_t now = tilefinch_platform_monotonic_time_ns();
     uint64_t elapsed_us = now >= job->request_started_ns
         ? (now - job->request_started_ns) / UINT64_C(1000) : 0;
@@ -2274,6 +2275,11 @@ static void youtube_resolve_job_log_response(
            (unsigned long long) server_us,
            (unsigned long long) body_us,
            (unsigned long long) timing->total_us);
+#else
+    (void) job;
+    (void) phase;
+    (void) client;
+#endif
 }
 
 static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
@@ -2323,6 +2329,7 @@ static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
         || !job->watch_have_signature_timestamp) return false;
     job->watch_bytes = job->response.length;
     job->watch_status = 0;
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     uint64_t now = tilefinch_platform_monotonic_time_ns();
     uint64_t elapsed_us = now >= job->request_started_ns
         ? (now - job->request_started_ns) / UINT64_C(1000) : 0;
@@ -2330,6 +2337,7 @@ static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
            "bytes=%zu chunks=%zu pumps=%zu elapsed=%lluus\n",
            job->response.length, job->request_chunks, job->request_pumps,
            (unsigned long long) elapsed_us);
+#endif
     (void) fetch_background_transport_cancel(
         job->request_id, "watch configuration prefix complete");
     job->request_id = 0;

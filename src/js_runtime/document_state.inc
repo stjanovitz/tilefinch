@@ -55,6 +55,10 @@ void script_runtime_detach_document(ScriptRuntime *runtime,
         }
     }
     bridge_scroll_intents_detach_document(bridge, owner);
+    /* Retained computed styles hold raw node addresses of whichever
+       document was bound; a detached tree can be destroyed without a
+       per-node removal. */
+    js_rt_bridge_computed_style_cache_forget(bridge);
     script_element_states_detach_document(bridge, document);
 
     size_t source_output = 0;
@@ -150,6 +154,8 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
     runtime->bridge.document_base_dirty = true;
 }
 
+static size_t script_runtime_current_limit(const ScriptRuntime *runtime);
+
 size_t script_runtime_collect_and_trim_phase(
     ScriptRuntime *runtime, ScriptRuntimeCollectPhase phase)
 {
@@ -163,28 +169,25 @@ size_t script_runtime_collect_and_trim_phase(
     }
     /* The trim phase follows both graph passes. Re-arm automatic collection
        from the post-collection live heap before returning cached pages to the
-       shared browser Budget. */
-    JSMemoryUsage usage;
-    memset(&usage, 0, sizeof(usage));
-    JS_ComputeMemoryUsage(runtime->runtime, &usage);
-    if (usage.malloc_size >= 0) {
-        uint64_t current = (uint64_t) usage.malloc_size;
-        uint64_t growth = current >> 1;
-        if (growth < 256u * 1024u) growth = 256u * 1024u;
-        uint64_t threshold = current > UINT64_MAX - growth
-            ? UINT64_MAX : current + growth;
-        if (usage.malloc_limit > 0
-            && threshold >= (uint64_t) usage.malloc_limit) {
-            uint64_t limit = (uint64_t) usage.malloc_limit;
-            uint64_t reserve = limit / 8u;
-            if (reserve > 256u * 1024u) reserve = 256u * 1024u;
-            threshold = limit > reserve ? limit - reserve : current;
-            if (threshold < current) threshold = current;
-        }
-        JS_SetGCThreshold(
-            runtime->runtime,
-            threshold > SIZE_MAX ? SIZE_MAX : (size_t) threshold);
+       shared browser Budget. The allocator maintains malloc_size and every
+       limit change mirrors script_runtime_current_limit(), so this needs no
+       heap census. */
+    uint64_t current =
+        budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    uint64_t growth = current >> 1;
+    if (growth < 256u * 1024u) growth = 256u * 1024u;
+    uint64_t threshold = current > UINT64_MAX - growth
+        ? UINT64_MAX : current + growth;
+    uint64_t limit = script_runtime_current_limit(runtime);
+    if (limit > 0 && threshold >= limit) {
+        uint64_t reserve = limit / 8u;
+        if (reserve > 256u * 1024u) reserve = 256u * 1024u;
+        threshold = limit > reserve ? limit - reserve : current;
+        if (threshold < current) threshold = current;
     }
+    JS_SetGCThreshold(
+        runtime->runtime,
+        threshold > SIZE_MAX ? SIZE_MAX : (size_t) threshold);
     return budget_quickjs_pool_trim(runtime->quickjs_pool, 0);
 }
 
@@ -240,6 +243,18 @@ size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
     return reclaimed;
 }
 
+void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage)
+{
+    runtime->heap_censuses++;
+    JS_ComputeMemoryUsage(runtime->runtime, usage);
+}
+
+size_t script_runtime_heap_used(const ScriptRuntime *runtime)
+{
+    return runtime == NULL || runtime->quickjs_pool == NULL ? 0
+        : budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+}
+
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime)
 {
     if (runtime == NULL || runtime->runtime == NULL
@@ -255,6 +270,206 @@ size_t script_runtime_heap_remaining(const ScriptRuntime *runtime)
     size_t current =
         budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
     return current < limit ? limit - current : 0;
+}
+
+#define SCRIPT_HEAP_GROWTH_STEP (512u * 1024u)
+
+static size_t script_runtime_current_limit(const ScriptRuntime *runtime)
+{
+    size_t limit = runtime->base_memory_limit;
+    if (runtime->boot_window_active) {
+        limit = runtime->boot_window_bytes > SIZE_MAX - limit
+            ? SIZE_MAX : limit + runtime->boot_window_bytes;
+    }
+    return limit;
+}
+
+/* Called by the allocator (no allocation, no JavaScript) when a request
+   would pass the limit. Grows in whole steps so the next allocations do not
+   each ask again, and only while the page Budget keeps its reserve. */
+size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
+                              size_t limit)
+{
+    ScriptRuntime *runtime = opaque;
+    if (runtime == NULL || !runtime->heap_growth_enabled) return 0;
+    /* Only the part of the request the current headroom cannot hold. */
+    size_t needed;
+    uint8_t reason = 3;
+    if (live >= limit) {
+        needed = live - limit;
+        if (growth > SIZE_MAX - needed) goto refuse;
+        needed += growth;
+    } else {
+        needed = growth > limit - live ? growth - (limit - live) : 0;
+    }
+    if (needed == 0) return limit;
+    /* A request the ceiling cannot hold must not cost the optional caches
+       anything. */
+    reason = 2;
+    if (limit >= runtime->heap_growth_ceiling
+        || needed > runtime->heap_growth_ceiling - limit) goto refuse;
+    size_t step = needed <= SCRIPT_HEAP_GROWTH_STEP
+        ? SCRIPT_HEAP_GROWTH_STEP
+        : needed + (SCRIPT_HEAP_GROWTH_STEP - 1u)
+              - (needed + (SCRIPT_HEAP_GROWTH_STEP - 1u))
+                  % SCRIPT_HEAP_GROWTH_STEP;
+    if (step > runtime->heap_growth_ceiling - limit)
+        step = runtime->heap_growth_ceiling - limit;
+    reason = 1;
+    /* Optional caches (module bytecode, responses) give way to the live
+       page before growth is refused. */
+    if (runtime->heap_growth_reserve <= SIZE_MAX - step)
+        (void) budget_make_room(runtime->budget,
+                                runtime->heap_growth_reserve + step);
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (free_bytes <= runtime->heap_growth_reserve) goto refuse;
+    size_t spare = free_bytes - runtime->heap_growth_reserve;
+    reason = 3;
+    if (step > spare) step = spare;
+    if (step < needed || step > SIZE_MAX - runtime->base_memory_limit)
+        goto refuse;
+    runtime->base_memory_limit += step;
+    runtime->heap_growth_bytes += step;
+    runtime->heap_growth_raises++;
+    size_t raised = script_runtime_current_limit(runtime);
+    if (raised > runtime->heap_growth_peak_limit)
+        runtime->heap_growth_peak_limit = raised;
+    return raised;
+refuse:
+    runtime->heap_growth_refusals++;
+    runtime->heap_growth_refused_bytes = needed;
+    runtime->heap_growth_refused_reason = reason;
+    return 0;
+}
+
+/* Collection pacing wants garbage headroom above the live graph, but the
+   limit only grows when an allocation fails it, and a page that mostly
+   allocates garbage never fails it: every collection then reclaims just
+   below a limit that sits a sliver above live, and the realm collects its
+   whole heap every few hundred KiB. Raise the limit toward `want` at a safe
+   point while the page Budget has spare memory above its reserve; under
+   pressure this does nothing and pacing stays tight. Never evicts caches. */
+static void script_runtime_heap_pregrow(ScriptRuntime *runtime, size_t want)
+{
+    if (runtime == NULL || !runtime->heap_growth_enabled
+        || runtime->budget == NULL) return;
+    size_t limit = script_runtime_current_limit(runtime);
+    if (want > runtime->heap_growth_ceiling)
+        want = runtime->heap_growth_ceiling;
+    if (want <= limit) return;
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (free_bytes <= runtime->heap_growth_reserve) return;
+    size_t step = want - limit;
+    size_t spare = free_bytes - runtime->heap_growth_reserve;
+    if (step > spare) step = spare - spare % SCRIPT_HEAP_GROWTH_STEP;
+    if (step < SCRIPT_HEAP_GROWTH_STEP) return;
+    runtime->base_memory_limit += step;
+    runtime->heap_growth_bytes += step;
+    runtime->heap_growth_pregrows++;
+    size_t raised = script_runtime_current_limit(runtime);
+    if (raised > runtime->heap_growth_peak_limit)
+        runtime->heap_growth_peak_limit = raised;
+    JS_SetMemoryLimit(runtime->runtime, raised);
+}
+
+void script_runtime_enable_heap_growth(ScriptRuntime *runtime,
+                                       size_t ceiling, size_t page_reserve)
+{
+    if (runtime == NULL || runtime->quickjs_pool == NULL) return;
+    runtime->heap_growth_enabled = ceiling > runtime->base_memory_limit;
+    runtime->heap_growth_floor = runtime->base_memory_limit;
+    runtime->heap_growth_ceiling = ceiling;
+    runtime->heap_growth_reserve = page_reserve;
+    runtime->heap_growth_peak_limit = script_runtime_current_limit(runtime);
+    budget_quickjs_pool_set_limit_growth(
+        runtime->quickjs_pool,
+        runtime->heap_growth_enabled ? js_rt_heap_growth_hook : NULL,
+        runtime);
+}
+
+size_t script_runtime_heap_available(const ScriptRuntime *runtime)
+{
+    size_t remaining = script_runtime_heap_remaining(runtime);
+    if (runtime == NULL || !runtime->heap_growth_enabled
+        || runtime->budget == NULL) return remaining;
+    size_t limit = script_runtime_current_limit(runtime);
+    if (limit >= runtime->heap_growth_ceiling) return remaining;
+    size_t free_bytes = budget_remaining(runtime->budget);
+    if (free_bytes <= runtime->heap_growth_reserve) return remaining;
+    size_t growable = free_bytes - runtime->heap_growth_reserve;
+    if (growable > runtime->heap_growth_ceiling - limit)
+        growable = runtime->heap_growth_ceiling - limit;
+    return remaining > SIZE_MAX - growable ? SIZE_MAX : remaining + growable;
+}
+
+void script_runtime_heap_growth(const ScriptRuntime *runtime,
+                                ScriptHeapGrowth *growth)
+{
+    if (growth == NULL) return;
+    memset(growth, 0, sizeof(*growth));
+    if (runtime == NULL) return;
+    growth->floor = runtime->heap_growth_enabled
+        ? runtime->heap_growth_floor : runtime->base_memory_limit;
+    growth->limit = script_runtime_current_limit(runtime);
+    growth->peak_limit = runtime->heap_growth_peak_limit;
+    growth->grown = runtime->heap_growth_bytes;
+    growth->raises = runtime->heap_growth_raises;
+    growth->pregrows = runtime->heap_growth_pregrows;
+    growth->refusals = runtime->heap_growth_refusals;
+    growth->returns = runtime->heap_growth_returns;
+    growth->refused_bytes = runtime->heap_growth_refused_bytes;
+    growth->refused_reason = runtime->heap_growth_refused_reason;
+    growth->reentrant_checkpoints = runtime->reentrant_checkpoints_skipped;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    if (runtime->runtime != NULL) {
+        JSLazyFunctionStats stats;
+        JS_GetLazyFunctionStats(runtime->runtime, &stats);
+        growth->lazy_compile_failures = (size_t) stats.compile_failures;
+    }
+#endif
+    growth->source_committed = runtime->bridge.script_quota_bytes;
+    growth->source_limit = runtime->bridge.maximum_script_bytes;
+    growth->source_raises = runtime->bridge.script_quota_pressure_raises;
+}
+
+bool script_runtime_grow_heap_limit(ScriptRuntime *runtime,
+                                    size_t additional, size_t ceiling)
+{
+    if (runtime == NULL || runtime->runtime == NULL || additional == 0
+        || runtime->base_memory_limit >= ceiling) return false;
+    if (additional > ceiling - runtime->base_memory_limit)
+        additional = ceiling - runtime->base_memory_limit;
+    runtime->base_memory_limit += additional;
+    size_t limit = runtime->base_memory_limit;
+    if (runtime->boot_window_active) {
+        limit = runtime->boot_window_bytes > SIZE_MAX - limit
+            ? SIZE_MAX : limit + runtime->boot_window_bytes;
+    }
+    JS_SetMemoryLimit(runtime->runtime, limit);
+    return true;
+}
+
+size_t script_runtime_boot_window_checks(const ScriptRuntime *runtime)
+{
+    return runtime == NULL ? 0 : runtime->boot_window_checks;
+}
+
+void script_runtime_lazy_function_counts(const ScriptRuntime *runtime,
+                                         size_t *deferred, size_t *compiled)
+{
+    size_t deferred_count = 0, compiled_count = 0;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    if (runtime != NULL && runtime->runtime != NULL) {
+        JSLazyFunctionStats stats;
+        JS_GetLazyFunctionStats(runtime->runtime, &stats);
+        deferred_count = (size_t) (stats.deferred + stats.restored);
+        compiled_count = (size_t) stats.compiled;
+    }
+#else
+    (void) runtime;
+#endif
+    if (deferred != NULL) *deferred = deferred_count;
+    if (compiled != NULL) *compiled = compiled_count;
 }
 
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime)

@@ -1004,6 +1004,9 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
                         int progress_per_mille);
 /* Presentation-only activity, distinct from navigation loading. */
 bool psp_ui_set_page_activation(PspUiState *ui, bool active);
+/* End input-receipt feedback after dispatch, without dismissing a newer
+   loading, error, or completion status published by the operation. */
+bool psp_ui_finish_page_activation(PspUiState *ui, const char *receipt);
 /* Scale a bounded 64-bit progress value onto a small UI extent without
    pulling software 64-bit division into a PSP frame. The result is clamped
    to [0, extent]; shifting both operands retains sub-pixel precision for
@@ -1021,6 +1024,12 @@ void psp_ui_keep_status(PspUiState *ui, const char *status,
                         unsigned duration_frames);
 void psp_ui_show_status(PspUiState *ui, const char *status,
                         unsigned duration_frames);
+/* For a status that counts (e.g. seconds): while a toast whose first
+   family_length characters match is showing, replace its text in place
+   without replaying the entry motion. Never displaces a different status. */
+void psp_ui_keep_progress_status(PspUiState *ui, const char *status,
+                                 size_t family_length,
+                                 unsigned duration_frames);
 void psp_ui_show_tls_status(
     PspUiState *ui, const char *headline,
     TilefinchTlsGuidance guidance, unsigned duration_frames);
@@ -1197,6 +1206,12 @@ void psp_ui_media_set_seek_preview(PspUiMediaState *media,
  * authoritative; decoder preparation must not expose the old clock. */
 void psp_ui_media_commit_seek(PspUiMediaState *media,
                               uint64_t target_time_us);
+/* A playback continuing across a pipeline rebuild (a large rewind, a retry)
+ * keeps its timeline while the replacement opens: the same duration, the
+ * position it resumes at, and live seek and play/pause controls. */
+void psp_ui_media_set_continuation(PspUiMediaState *media,
+                                   uint64_t position_us,
+                                   uint64_t duration_us, bool playing);
 void psp_ui_media_cancel_seek_preview(PspUiMediaState *media);
 void psp_ui_media_show_controls(PspUiMediaState *media);
 void psp_ui_media_set_tracks(

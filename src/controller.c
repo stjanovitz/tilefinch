@@ -554,8 +554,7 @@ static bool controller_build_media_action(
         : script_runtime_node_handle(runtime, media);
     action->media_audio_only = audio_only;
     action->media_kind = discovered_kind;
-    action->body[0] = '\0';
-    action->body_length = 0;
+    controller_action_clear_body(action);
     action->type = CONTROLLER_ACTION_MEDIA;
     return true;
 }
@@ -976,6 +975,8 @@ static bool controller_build_form_action_with_outcome(
     }
     memset(action, 0, sizeof(*action));
     action->activation_outcome = initial_outcome;
+    action->navigation_source = dispatch_submit_event
+        ? CONTROLLER_NAVIGATION_USER : CONTROLLER_NAVIGATION_SCRIPT;
     if (dispatch_submit_event
         && (navigation->page.runtime == NULL || native_basic_form)
         && action->activation_outcome
@@ -3684,7 +3685,8 @@ bool controller_execute_action(BrowserController *controller,
                  sizeof(navigation->pending_navigation_referer), "%s",
                  current->url);
     }
-    navigation->pending_navigation_user_activated = true;
+    navigation->pending_navigation_user_activated =
+        action->navigation_source == CONTROLLER_NAVIGATION_USER;
     uint64_t generation = navigation_begin(navigation);
     const char *method = copy.type == CONTROLLER_ACTION_FORM_SUBMIT
                          ? copy.method : "GET";

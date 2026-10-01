@@ -125,7 +125,17 @@ supervisor state.
 
 The shared transport worker carries page, media, update, and preconnect work.
 The only `sceNetResolverStartNtoA` call is curl's `gethostbyname` seam on that
-same worker, so it is covered by the same slot lease. Teardown first closes a
+same worker, so it is covered by the same slot lease. That seam first asks the
+access point's DNS servers (APCTL primary/secondary) itself over one UDP socket
+opened and closed within the call (`src/psp_dns_stub.h`: 400/400/800/800 ms
+alternating servers, 2.4 s total), because the firmware resolver never returns
+on about one PSP-3000 lookup in fifteen and hangs can be consecutive. The
+firmware resolver, stopped by `psp_network_dns_guard` after 3 s and retried
+once, runs only when the stub has no server or socket, gets a truncated reply,
+or gets no usable answer; an NXDOMAIN from the stub is final. Single-label and
+`*.localhost` names skip the stub. A stub that hears nothing for three lookups
+the firmware then resolves stands down for the process, which is what a PPSSPP
+run relying on `TILEFINCH_PPSSPP_HOST_ALIASES` (no emulated UDP DNS) sees. Teardown first closes a
 global admission gate, asks the worker to cancel, and waits for those slots.
 The media machine couples to networking only by retiring its transport slot
 during media quiescence.
@@ -151,8 +161,8 @@ resume-revalidate time. Shipping builds do not carry shadow bookkeeping.
 
 ## Implementation
 
-The reducer is authoritative. The old `network_started` and
-`network_warmup_active` caller flags are gone. `Starting` uses the unchanged
+The reducer is authoritative; callers keep no parallel started/warmup flags.
+`Starting` uses the unchanged
 inner ladder; foreground demand advances cheap rungs within an 8 ms/12-unit
 slice while background warmup advances one unit after input and presentation.
 

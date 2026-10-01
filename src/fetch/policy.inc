@@ -19,27 +19,45 @@ static bool extra_header_name_forbidden(const char *name, size_t length)
         || (length >= 6 && strncasecmp(name, "proxy-", 6) == 0)) {
         return true;
     }
-    static const char *forbidden[] = {
-        "accept", "accept-charset", "accept-encoding",
-        "access-control-request-headers",
-        "access-control-request-method",
-        "access-control-request-private-network",
-        "connection", "content-length", "content-type", "cookie",
-        "cookie2", "date", "dnt", "expect", "host",
-        "if-modified-since", "if-none-match", "keep-alive", "origin",
-        "permissions-policy", "referer", "set-cookie", "set-cookie2",
-        "te", "trailer", "transfer-encoding", "upgrade",
-        "upgrade-insecure-requests", "user-agent", "via",
+    /* Lengths are compared first: most page headers match no length, and
+       every validation of a request (several per fetch) walks this list
+       once per header line. */
+#define FORBIDDEN(name) { name, sizeof(name) - 1u }
+    static const struct {
+        const char *name;
+        size_t length;
+    } forbidden[] = {
+        FORBIDDEN("accept"), FORBIDDEN("accept-charset"),
+        FORBIDDEN("accept-encoding"),
+        FORBIDDEN("access-control-request-headers"),
+        FORBIDDEN("access-control-request-method"),
+        FORBIDDEN("access-control-request-private-network"),
+        FORBIDDEN("connection"), FORBIDDEN("content-length"),
+        FORBIDDEN("content-type"), FORBIDDEN("cookie"),
+        FORBIDDEN("cookie2"), FORBIDDEN("date"), FORBIDDEN("dnt"),
+        FORBIDDEN("expect"), FORBIDDEN("host"),
+        FORBIDDEN("if-modified-since"), FORBIDDEN("if-none-match"),
+        FORBIDDEN("keep-alive"), FORBIDDEN("origin"),
+        FORBIDDEN("permissions-policy"), FORBIDDEN("referer"),
+        FORBIDDEN("set-cookie"), FORBIDDEN("set-cookie2"),
+        FORBIDDEN("te"), FORBIDDEN("trailer"),
+        FORBIDDEN("transfer-encoding"), FORBIDDEN("upgrade"),
+        FORBIDDEN("upgrade-insecure-requests"), FORBIDDEN("user-agent"),
+        FORBIDDEN("via"),
         /* Legacy client-hint spellings are also browser-owned. */
-        "ua", "ua-mobile", "ua-platform", "ua-full-version",
-        "ua-full-version-list", "ua-arch", "ua-bitness", "ua-model",
-        "ua-platform-version",
+        FORBIDDEN("ua"), FORBIDDEN("ua-mobile"), FORBIDDEN("ua-platform"),
+        FORBIDDEN("ua-full-version"), FORBIDDEN("ua-full-version-list"),
+        FORBIDDEN("ua-arch"), FORBIDDEN("ua-bitness"),
+        FORBIDDEN("ua-model"), FORBIDDEN("ua-platform-version"),
         /* Fetch forbids method-override headers which can tunnel a forbidden
            CONNECT/TRACE/TRACK method through an intermediary. */
-        "x-http-method", "x-http-method-override", "x-method-override"
+        FORBIDDEN("x-http-method"), FORBIDDEN("x-http-method-override"),
+        FORBIDDEN("x-method-override")
     };
+#undef FORBIDDEN
     for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
-        if (header_name_equals(name, length, forbidden[i])) return true;
+        if (forbidden[i].length == length
+            && strncasecmp(name, forbidden[i].name, length) == 0) return true;
     }
     return false;
 }
@@ -80,13 +98,13 @@ static bool header_name_character(unsigned char value)
 static bool header_value_valid(const char *value, size_t maximum_length)
 {
     if (value == NULL) return true;
-    size_t length = strlen(value);
-    if (length > maximum_length) return false;
-    for (size_t i = 0; i < length; i++) {
+    /* One pass: the terminator ends it, and a value past the maximum is
+       refused as soon as it is seen to be. */
+    for (size_t i = 0;; i++) {
         unsigned char byte = (unsigned char) value[i];
-        if (byte < 0x20 || byte == 0x7f) return false;
+        if (byte == 0) return true;
+        if (i == maximum_length || byte < 0x20 || byte == 0x7f) return false;
     }
-    return true;
 }
 
 static bool serialized_headers_valid(const char *serialized)
@@ -211,6 +229,7 @@ static bool fetch_request_private_network_protected_with_session(
        protected, so a redirect or DNS rebind to RFC1918 cannot inherit broad
        top-level-navigation authority. */
     if (page != NULL && page->top_level_navigation && page->user_activated
+        && page->initiator_url == NULL
         && fetch_url_names_local_network(page->target_url)) return false;
     if (page == NULL && fetch_request_is_top_level_navigation(request)
         && request->sec_fetch_user) {

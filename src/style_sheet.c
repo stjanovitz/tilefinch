@@ -17,6 +17,12 @@
 #include "tilefinch/url.h"
 
 #define STYLE_VARIABLE_CACHE_DEFAULT_ENTRIES 256u
+/* The getComputedStyle lease is retained for the page's lifetime, unlike
+   a layout build's table. ChatGPT send (1251 reads, 25 clears): 64 entries
+   hit 801 lookups vs 818 at 256 in the same 17 ms (host), for 10 KiB
+   instead of 40 KiB on the PSP (160-byte entries). A whole-document sweep
+   (2145 reads, no clears) is the case that wants more: 24.5 vs 21.8 ms. */
+#define STYLE_VARIABLE_CACHE_LEASE_ENTRIES 64u
 #define STYLE_VARIABLE_CACHE_MIN_ENTRIES 32u
 #define STYLE_VARIABLE_CACHE_MAX_ENTRIES 256u
 #define STYLE_VARIABLE_CACHE_PROBES 8u
@@ -25,6 +31,9 @@
 #define STYLE_PARSED_IR_VERSION UINT16_C(1)
 #define STYLE_PARSED_IR_MAX_BYTES (256u * 1024u)
 #define STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES UINT16_C(1)
+/* Built while prefers-color-scheme answered dark; the IR holds rules
+   selected by media queries, so it is reused only under the same answer. */
+#define STYLE_PARSED_IR_PREFERS_DARK UINT16_C(2)
 
 typedef struct {
     uint32_t magic;
@@ -164,6 +173,7 @@ static bool style_parsed_ir_builder_record(
 
 
 #include "style_sheet/declarations.inc"
+#include "style_sheet/transitions.inc"
 #include "style_sheet/queries_selectors.inc"
 #include "style_sheet/parser.inc"
 
@@ -496,6 +506,291 @@ size_t stylesheet_rules_affected_by_tokens(
     return count;
 }
 
+/* Decodes a CSS identifier with escapes into `out`; false when it does
+   not fit or is malformed. */
+static bool identity_identifier_decode(const char *text, size_t length,
+                                       char *out, size_t capacity,
+                                       size_t *used)
+{
+    size_t written = 0;
+    for (size_t at = 0; at < length;) {
+        unsigned char value = (unsigned char) text[at++];
+        uint32_t codepoint = value;
+        if (value == '\\') {
+            if (at >= length) return false;
+            if (isxdigit((unsigned char) text[at])) {
+                codepoint = 0;
+                for (size_t digits = 0; digits < 6 && at < length
+                     && isxdigit((unsigned char) text[at]); digits++, at++) {
+                    unsigned char digit = (unsigned char) text[at];
+                    codepoint = codepoint * 16u + (isdigit(digit)
+                        ? (uint32_t) (digit - '0')
+                        : (uint32_t) (tolower(digit) - 'a' + 10));
+                }
+                if (at < length && isspace((unsigned char) text[at])) at++;
+                if (codepoint == 0 || codepoint > 0x10ffffu) return false;
+            } else {
+                codepoint = (unsigned char) text[at++];
+            }
+        }
+        unsigned char bytes[4];
+        size_t count = 1;
+        if (codepoint <= 0x7fu || value != '\\') {
+            bytes[0] = (unsigned char) codepoint;
+        } else if (codepoint <= 0x7ffu) {
+            bytes[0] = (unsigned char) (0xc0u | (codepoint >> 6));
+            bytes[1] = (unsigned char) (0x80u | (codepoint & 63u));
+            count = 2;
+        } else if (codepoint <= 0xffffu) {
+            bytes[0] = (unsigned char) (0xe0u | (codepoint >> 12));
+            bytes[1] = (unsigned char) (0x80u | ((codepoint >> 6) & 63u));
+            bytes[2] = (unsigned char) (0x80u | (codepoint & 63u));
+            count = 3;
+        } else {
+            bytes[0] = (unsigned char) (0xf0u | (codepoint >> 18));
+            bytes[1] = (unsigned char) (0x80u | ((codepoint >> 12) & 63u));
+            bytes[2] = (unsigned char) (0x80u | ((codepoint >> 6) & 63u));
+            bytes[3] = (unsigned char) (0x80u | (codepoint & 63u));
+            count = 4;
+        }
+        if (count > capacity - written) return false;
+        memcpy(out + written, bytes, count);
+        written += count;
+    }
+    *used = written;
+    return true;
+}
+
+static bool selector_attribute_name_byte(unsigned char value);
+
+uint32_t stylesheet_identity_attribute_hash(const char *name, size_t length)
+{
+    uint32_t hash = (UINT32_C(2166136261) ^ UINT32_C(0x5b)) * UINT32_C(16777619);
+    for (size_t i = 0; i < length; i++) {
+        hash ^= (unsigned char) tolower((unsigned char) name[i]);
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+bool style_selector_identity_tokens(const char *text, size_t length,
+                                    size_t split, bool every_position,
+                                    StyleIdentityTokenVisit visit,
+                                    void *context, bool *attributes_opaque)
+{
+    if (text == NULL) return true;
+    if (split > length) split = 0;
+    enum { NESTING = 32 };
+    bool has_argument[NESTING] = {false};
+    unsigned depth = 0, has_depth = 0;
+    char quote = 0;
+    unsigned square = 0;
+    bool ok = true;
+    for (size_t at = 0; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\' && at + 1 < length) at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (square != 0) {
+            if (value == '"' || value == '\'') quote = value;
+            else if (value == ']') square--;
+            continue;
+        }
+        if (value == '[') {
+            square++;
+            /* A [class]/[id] test reads identities no token names. */
+            if ((every_position || at < split || depth != 0)
+                && attribute_selector_targets_identity(
+                       text + at + 1u, length - at - 1u)) ok = false;
+            if (attributes_opaque != NULL && has_depth == 0
+                && (every_position || !(at > split && depth == 0))) {
+                size_t begin = at + 1u;
+                while (begin < length && isspace((unsigned char) text[begin]))
+                    begin++;
+                size_t end = begin;
+                while (end < length
+                       && selector_attribute_name_byte(
+                              (unsigned char) text[end])) end++;
+                size_t next = end;
+                while (next < length && isspace((unsigned char) text[next]))
+                    next++;
+                /* `*|`, `|name`, `ns|name` and escaped names. */
+                char match = next < length ? text[next] : '\0';
+                if (end == begin
+                    || !(match == ']' || match == '='
+                         || ((match == '~' || match == '|' || match == '^'
+                              || match == '$' || match == '*')
+                             && next + 1u < length
+                             && text[next + 1u] == '=')))
+                    *attributes_opaque = true;
+                else
+                    visit(context, stylesheet_identity_attribute_hash(
+                        text + begin, end - begin));
+            }
+            continue;
+        }
+        if (value == '(') {
+            bool has = at >= 4 && strncasecmp(text + at - 4, ":has", 4) == 0;
+            if (depth < NESTING) has_argument[depth] = has;
+            if (has) has_depth++;
+            depth++;
+            continue;
+        }
+        if (value == ')') {
+            if (depth != 0) {
+                depth--;
+                if (depth < NESTING && has_argument[depth]) has_depth--;
+            }
+            continue;
+        }
+        if (value == '\\' && at + 1 < length) {
+            at++;
+            continue;
+        }
+        if (value != '.' && value != '#') continue;
+        size_t begin = at + 1u;
+        size_t end = skip_selector_identifier(text, length, begin);
+        if (end == begin) continue;
+        at = end - 1u;
+        bool local = begin > split && depth == 0;
+        if (!every_position && (local || has_depth != 0)) continue;
+        char decoded[256];
+        size_t decoded_length = 0;
+        const char *name = text + begin;
+        size_t name_length = end - begin;
+        if (memchr(name, '\\', name_length) != NULL) {
+            if (!identity_identifier_decode(name, name_length, decoded,
+                                            sizeof(decoded),
+                                            &decoded_length)) {
+                ok = false;
+                continue;
+            }
+            name = decoded;
+            name_length = decoded_length;
+        }
+        visit(context, stylesheet_identity_token_hash(
+            value == '#', name, name_length));
+    }
+    return ok;
+}
+
+/* Whether a selector can match its subject by way of a sibling: a sibling
+   combinator or an :nth-* pseudo-class (whose `of S` reads siblings)
+   anywhere, conservatively including an an+b's '+'. */
+static bool identity_selector_reaches_siblings(const char *text,
+                                               size_t length)
+{
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\' && at + 1 < length) at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (value == '"' || value == '\'') quote = value;
+        else if (value == '\\') at++;
+        else if (value == '+' || value == '~') return true;
+        else if (value == ':' && at + 4 < length
+                 && strncasecmp(text + at + 1, "nth-", 4) == 0) return true;
+    }
+    return false;
+}
+
+typedef struct {
+    StyleIdentityScan *scan;
+    const char *text;
+    size_t length, split;
+    bool ready;
+} IdentityScanSelector;
+
+/* The subject key and sibling reach are worked out for the few selectors
+   that read an identity off their subject. */
+static void identity_scan_visit(void *context, uint32_t hash)
+{
+    IdentityScanSelector *selector = context;
+    StyleIdentityScan *scan = selector->scan;
+    if (!selector->ready) {
+        scan->subject_key = style_selector_compound_key_at(
+            selector->text, selector->length, selector->split);
+        scan->sibling = identity_selector_reaches_siblings(selector->text,
+                                                           selector->length);
+        selector->ready = true;
+    }
+    scan->nonlocal(scan->context, hash);
+}
+
+static bool identity_scan_selector(const char *text, size_t length,
+                                   size_t split, StyleIdentityScan *scan)
+{
+    /* Most selectors are one compound with no functional argument or
+       attribute test (atomic CSS): nothing in them is off the subject. */
+    if (split == 0 && memchr(text, '(', length) == NULL
+        && memchr(text, '[', length) == NULL) return true;
+    IdentityScanSelector selector = {
+        .scan = scan, .text = text, .length = length, .split = split
+    };
+    return style_selector_identity_tokens(text, length, split, false,
+                                          identity_scan_visit, &selector,
+                                          &scan->attributes_opaque);
+}
+
+bool stylesheet_structural_custom_rules(const Stylesheet *sheet,
+                                        StyleKeyNamesVisit visit,
+                                        void *context)
+{
+    for (size_t i = 0; sheet != NULL && i < sheet->custom_rule_count; i++) {
+        const StyleCustomRule *rule = &sheet->custom_rules[i];
+        if (rule->selector == NULL) continue;
+        size_t length = strlen(rule->selector);
+        if (!identity_selector_reaches_siblings(rule->selector, length)
+            && strstr(rule->selector, ":first-") == NULL
+            && strstr(rule->selector, ":last-") == NULL
+            && strstr(rule->selector, ":only-") == NULL
+            && strstr(rule->selector, ":empty") == NULL) continue;
+        StyleKeyNames entry = {
+            style_selector_compound_key_at(
+                rule->selector, length,
+                style_selector_rightmost_compound_start(rule->selector,
+                                                        length)),
+            stylesheet_custom_property_name_bits(rule->name,
+                                                 rule->name_length)
+        };
+        if (!visit(context, entry)) return false;
+    }
+    return true;
+}
+
+bool stylesheet_identity_scan(const Stylesheet *sheet,
+                              StyleIdentityScan *scan)
+{
+    if (sheet == NULL || scan == NULL) return false;
+    for (size_t i = 0; i < sheet->count; i++) {
+        const StyleRule *rule = &sheet->rules[i];
+        if (!identity_scan_selector(rule->selector, rule->selector_length,
+                                    style_rule_rightmost_compound(rule),
+                                    scan)) return false;
+    }
+    for (size_t i = 0; i < sheet->custom_rule_count; i++) {
+        const StyleCustomRule *rule = &sheet->custom_rules[i];
+        size_t length = strlen(rule->selector);
+        if (!identity_scan_selector(
+                rule->selector, length,
+                style_selector_rightmost_compound_start(rule->selector,
+                                                        length),
+                scan)) return false;
+        scan->names = stylesheet_custom_property_name_bits(
+            rule->name, rule->name_length);
+        if (!style_selector_identity_tokens(rule->selector, length, 0, true,
+                                            scan->declares, scan->context,
+                                            &scan->attributes_opaque))
+            return false;
+    }
+    return true;
+}
+
 static bool class_list_has_token(const char *list, size_t length,
                                  const char *token, size_t token_length)
 {
@@ -581,6 +876,49 @@ bool stylesheet_attribute_change_tokens(
     return false;
 }
 
+/* Whether rule `index` can hide or reveal an element or give it an image:
+   what the image pass reads besides image elements themselves. */
+static bool stylesheet_rule_affects_discovery(const Stylesheet *sheet,
+                                              size_t index)
+{
+    const StyleDeclaration *declaration = stylesheet_rule_declaration(
+        sheet, &sheet->rules[index]);
+    const uint64_t discovery_mask = S_DISPLAY | S_VISIBILITY
+        | S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_CONTENT;
+    uint8_t stack_id = 0;
+    if (declaration != NULL && (declaration->values_flags
+            & STYLE_DECLARATION_VALUES_PAINT_STACK) != 0) {
+        ComputedStyle values;
+        stylesheet_declaration_values(sheet, declaration, &values);
+        stack_id = computed_style_paint_stack_id(&values);
+    }
+    const StylePaintStack *stack = stack_id == 0
+        ? NULL : stylesheet_paint_stack(sheet, stack_id);
+    bool stack_images = stack_id != 0
+        && (stack == NULL
+            || (stack->components
+                & (STYLE_PAINT_COMPONENT_BACKGROUND_IMAGE
+                   | STYLE_PAINT_COMPONENT_MASK_IMAGE)) != 0);
+    return declaration == NULL
+        || (declaration->mask & discovery_mask) != 0
+        || (declaration->inherit_mask & discovery_mask) != 0
+        || declaration->deferred_declarations != NULL
+        || declaration->deferred_program_count != 0
+        || stack_images;
+}
+
+bool stylesheet_rules_affect_discovery(const Stylesheet *sheet,
+                                       const uint32_t *indices, size_t count)
+{
+    if (sheet == NULL || (indices == NULL && count != 0)) return true;
+    for (size_t i = 0; i < count; i++) {
+        if (indices[i] >= sheet->count
+            || stylesheet_rule_affects_discovery(sheet, indices[i]))
+            return true;
+    }
+    return false;
+}
+
 static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->budget == NULL || sheet->count == 0
@@ -601,23 +939,19 @@ static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
         style_rule_relational_filter(&sheet->rules[i], &filters[i]);
         const StyleDeclaration *declaration = stylesheet_rule_declaration(
             sheet, &sheet->rules[i]);
-        const uint64_t discovery_mask = S_DISPLAY | S_VISIBILITY
-            | S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_CONTENT;
-        uint8_t stack_id = declaration == NULL
-            ? 0 : computed_style_paint_stack_id(&declaration->values);
-        const StylePaintStack *stack = stack_id == 0
-            ? NULL : stylesheet_paint_stack(sheet, stack_id);
-        bool stack_images = stack_id != 0
-            && (stack == NULL
-                || (stack->components
-                    & (STYLE_PAINT_COMPONENT_BACKGROUND_IMAGE
-                       | STYLE_PAINT_COMPONENT_MASK_IMAGE)) != 0);
-        filters[i].discovery = declaration == NULL
-            || (declaration->mask & discovery_mask) != 0
-            || (declaration->inherit_mask & discovery_mask) != 0
-            || declaration->deferred_declarations != NULL
-            || declaration->deferred_program_count != 0
-            || stack_images;
+        filters[i].discovery = stylesheet_rule_affects_discovery(sheet, i);
+        /* What an inline SVG raster resolves: currentColor and em sizes
+           inherit from any matched element, var() may feed either, and the
+           default viewport reads only the SVG's own width/height. */
+        uint64_t set = declaration == NULL ? 0
+            : declaration->mask | declaration->inherit_mask;
+        filters[i].svg_raster = (uint8_t) (
+            (declaration == NULL || (set & (S_COLOR | S_FONT_SCALE)) != 0
+             || declaration->deferred_declarations != NULL
+             || declaration->deferred_program_count != 0
+                 ? STYLE_RULE_SVG_RASTER_INHERITED : 0)
+            | ((set & (S_WIDTH | S_HEIGHT)) != 0
+                 ? STYLE_RULE_SVG_RASTER_SIZE : 0));
         useful = useful || !style_token_bloom_empty_value(filters[i].compound)
             || !style_token_bloom_empty_value(filters[i].ancestors);
         ancestors_useful = ancestors_useful
@@ -835,8 +1169,12 @@ static void stylesheet_compact_storage(Stylesheet *sheet)
     } while (0)
     STYLE_SHRINK(rules, count, capacity);
     STYLE_SHRINK(declarations, declaration_count, declaration_capacity);
+    STYLE_SHRINK(declaration_values, declaration_value_bytes,
+                 declaration_value_capacity);
     STYLE_SHRINK(variables, variable_count, variable_capacity);
     STYLE_SHRINK(custom_rules, custom_rule_count, custom_rule_capacity);
+    STYLE_SHRINK(transition_rules, transition_rule_count,
+                 transition_rule_capacity);
     STYLE_SHRINK(deferred_instructions, deferred_instruction_count,
                  deferred_instruction_capacity);
     STYLE_SHRINK(generated_texts, generated_text_count,
@@ -1020,6 +1358,14 @@ static void stylesheet_refresh_layer_keys(Stylesheet *sheet)
                 ((unsigned) sheet->layer_ranks[id] << 8) | id;
         }
     }
+    for (size_t i = 0; i < sheet->transition_rule_count; i++) {
+        if (sheet->transition_rules[i].layer == UINT_MAX) continue;
+        unsigned id = sheet->transition_rules[i].layer & UINT8_MAX;
+        if (id < sheet->layer_count) {
+            sheet->transition_rules[i].layer =
+                ((unsigned) sheet->layer_ranks[id] << 8) | id;
+        }
+    }
 }
 
 static void stylesheet_finalize_rule_order(Stylesheet *sheet)
@@ -1028,6 +1374,7 @@ static void stylesheet_finalize_rule_order(Stylesheet *sheet)
     stylesheet_refresh_layer_keys(sheet);
     qsort(sheet->rules, sheet->count, sizeof(*sheet->rules), compare_rules);
     sheet->focus_rule_index_ready = false;
+    sheet->has_rule_index_ready = false;
     update_cascade_ranges(sheet);
     sheet->rule_batch_dirty = false;
 }
@@ -1226,6 +1573,7 @@ static bool stylesheet_parse_text_body(StyleCssParseContext *parse,
                                        const void *opaque)
 {
     const StyleCssTextInput *input = opaque;
+    TILEFINCH_WORK_ADD(css_bytes, input->length);
     return parse_css_range(parse, input->css, 0, input->length);
 }
 
@@ -1282,6 +1630,7 @@ static bool stylesheet_parse_elements_body(StyleCssParseContext *parse,
             size_t length = 0;
             const char *css = document_text_data(child, &length);
             if (css == NULL) continue;
+            TILEFINCH_WORK_ADD(css_bytes, length);
             parsed = parse_css_range(parse, css, 0, length);
         }
     }
@@ -1342,8 +1691,11 @@ static void style_parsed_ir_builder_finish(
             StyleParsedIrHeader header = {
                 .magic = STYLE_PARSED_IR_MAGIC,
                 .version = STYLE_PARSED_IR_VERSION,
-                .flags = builder->has_motion_keyframes
-                    ? STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES : 0,
+                .flags = (uint16_t) (
+                    (builder->has_motion_keyframes
+                         ? STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES : 0)
+                    | (stylesheet_prefers_dark_color_scheme()
+                         ? STYLE_PARSED_IR_PREFERS_DARK : 0)),
                 .viewport_width = (uint32_t) viewport_width,
                 .viewport_height = (uint32_t) viewport_height,
                 .operation_count = (uint32_t) builder->operation_count,
@@ -1410,7 +1762,10 @@ static bool stylesheet_parsed_ir_validate(
     memcpy(&header, ir_data, sizeof(header));
     if (header.magic != STYLE_PARSED_IR_MAGIC
         || header.version != STYLE_PARSED_IR_VERSION
-        || (header.flags & ~STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES) != 0
+        || (header.flags & ~(STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES
+                             | STYLE_PARSED_IR_PREFERS_DARK)) != 0
+        || ((header.flags & STYLE_PARSED_IR_PREFERS_DARK) != 0)
+               != stylesheet_prefers_dark_color_scheme()
         || header.operation_count == 0
         || header.operation_count
                > STYLE_PARSED_IR_MAX_BYTES
@@ -1522,6 +1877,34 @@ const lxb_dom_node_t *stylesheet_last_style_source(const Stylesheet *sheet)
     return sheet->style_source_nodes[sheet->style_source_count - 1];
 }
 
+/* Whether changing the class/id tokens `hashes` on some element can change
+   which elements the rule matches. With own_key false only tokens outside
+   the rightmost compound count: a change on the matched element itself is
+   the caller's concern. */
+static bool style_rule_tokens_may_change_match(
+    const StyleRule *rule, const StyleRuleFilter *filter,
+    const uint32_t *hashes, size_t count, bool own_key)
+{
+    if (filter->relational_opaque || (own_key && !rule->has_fast_key))
+        return true;
+    for (size_t r = 0; r < filter->relational_count; r++) {
+        for (size_t h = 0; h < count; h++) {
+            if (filter->relational_tokens[r] == hashes[h]) return true;
+        }
+    }
+    if (own_key
+        && (rule->type == SELECTOR_CLASS || rule->type == SELECTOR_ID)) {
+        const char *key = style_rule_fast_key(rule);
+        if (key == NULL) return true;
+        uint32_t hash = stylesheet_identity_token_hash(
+            rule->type == SELECTOR_ID, key, rule->fast_key_length);
+        for (size_t h = 0; h < count; h++) {
+            if (hash == hashes[h]) return true;
+        }
+    }
+    return false;
+}
+
 bool stylesheet_tokens_may_affect_discovery(
     const Stylesheet *sheet, const uint32_t *hashes, size_t count)
 {
@@ -1529,25 +1912,467 @@ bool stylesheet_tokens_may_affect_discovery(
     if (sheet->rule_filters == NULL || !sheet->rule_index_ready) return true;
     for (size_t i = 0; i < sheet->count; i++) {
         const StyleRuleFilter *filter = &sheet->rule_filters[i];
-        if (!filter->discovery) continue;
-        const StyleRule *rule = &sheet->rules[i];
-        if (filter->relational_opaque || !rule->has_fast_key) return true;
-        for (size_t r = 0; r < filter->relational_count; r++) {
-            for (size_t h = 0; h < count; h++) {
-                if (filter->relational_tokens[r] == hashes[h]) return true;
-            }
-        }
-        if (rule->type == SELECTOR_CLASS || rule->type == SELECTOR_ID) {
-            const char *key = style_rule_fast_key(rule);
-            if (key == NULL) return true;
-            uint32_t hash = stylesheet_identity_token_hash(
-                rule->type == SELECTOR_ID, key, rule->fast_key_length);
-            for (size_t h = 0; h < count; h++) {
-                if (hash == hashes[h]) return true;
-            }
-        }
+        if (filter->discovery
+            && style_rule_tokens_may_change_match(
+                   &sheet->rules[i], filter, hashes, count, true))
+            return true;
     }
     return false;
+}
+
+typedef struct {
+    uint32_t *hashes;
+    size_t count;
+    size_t capacity;
+} SvgRasterTokenList;
+
+static bool svg_raster_token_add(Stylesheet *sheet, SvgRasterTokenList *list,
+                                 uint32_t hash)
+{
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity == 0 ? 64u : list->capacity * 2u;
+        if (capacity > SIZE_MAX / sizeof(*list->hashes)) return false;
+        uint32_t *grown = budget_realloc(
+            sheet->budget, list->hashes, capacity * sizeof(*grown));
+        if (grown == NULL) return false;
+        list->hashes = grown;
+        list->capacity = capacity;
+    }
+    list->hashes[list->count++] = hash;
+    return true;
+}
+
+static size_t svg_raster_skip_escape(const char *text, size_t length,
+                                     size_t at)
+{
+    /* `at` is the backslash; a hex escape may end in one space, which is
+       part of the escape rather than a descendant combinator. */
+    size_t next = at + 1u;
+    unsigned digit = 0;
+    size_t digits = 0;
+    while (next < length && digits < 6
+           && style_css_hex_digit((unsigned char) text[next], &digit)) {
+        next++;
+        digits++;
+    }
+    if (digits == 0) return next < length ? next + 1u : next;
+    if (next < length && isspace((unsigned char) text[next])) next++;
+    return next;
+}
+
+/* Appends the class/id tokens of one custom-rule selector, unescaped as a
+   live class list spells them. With relational_only, just those outside the
+   rightmost compound or inside a functional pseudo-class. False when the
+   selector's token dependency cannot be listed (an identity attribute
+   selector, `of S`) or the list could not grow. */
+static bool svg_raster_selector_tokens(Stylesheet *sheet, const char *text,
+                                       size_t length, bool relational_only,
+                                       SvgRasterTokenList *list)
+{
+    if (selector_text_has_ci(text, length, ":nth-")
+        && selector_text_has_ci(text, length, " of ")) return false;
+    size_t split = 0;
+    for (int pass = relational_only ? 0 : 1; pass < 2; pass++) {
+        unsigned square = 0, parentheses = 0;
+        char quote = 0;
+        for (size_t at = 0; at < length; at++) {
+            char value = text[at];
+            if (quote != 0) {
+                if (value == '\\') at++;
+                else if (value == quote) quote = 0;
+                continue;
+            }
+            if (value == '\\') {
+                at = svg_raster_skip_escape(text, length, at) - 1u;
+                continue;
+            }
+            if (square != 0) {
+                if (value == '"' || value == '\'') quote = value;
+                else if (value == ']') square--;
+                continue;
+            }
+            bool counted = !relational_only || at < split
+                || parentheses != 0;
+            if (value == '[') {
+                square++;
+                if (pass == 1 && counted
+                    && attribute_selector_targets_identity(
+                           text + at + 1u, length - at - 1u)) return false;
+                continue;
+            }
+            if (value == '(') { parentheses++; continue; }
+            if (value == ')') {
+                if (parentheses != 0) parentheses--;
+                continue;
+            }
+            if (pass == 0) {
+                if (parentheses == 0
+                    && (isspace((unsigned char) value) || value == '>'
+                        || value == '+' || value == '~')) split = at + 1u;
+                continue;
+            }
+            if (value != '.' && value != '#') continue;
+            size_t begin = at + 1u;
+            size_t end = skip_selector_identifier(text, length, begin);
+            if (end == begin) continue;
+            at = end - 1u;
+            if (!counted) continue;
+            const char *token = text + begin;
+            size_t token_length = end - begin;
+            char unescaped[STYLE_CUSTOM_SELECTOR_CAPACITY];
+            if (memchr(token, '\\', token_length) != NULL) {
+                if (!css_unescape_value(token, token_length, unescaped,
+                                        sizeof(unescaped))) return false;
+                token = unescaped;
+                token_length = strlen(unescaped);
+            }
+            if (!svg_raster_token_add(
+                    sheet, list, stylesheet_identity_token_hash(
+                        value == '#', token, token_length))) return false;
+        }
+    }
+    return true;
+}
+
+static int compare_svg_raster_tokens(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *) left, b = *(const uint32_t *) right;
+    return (a > b) - (a < b);
+}
+
+static void stylesheet_prepare_svg_raster_tokens(Stylesheet *sheet)
+{
+    if (sheet->svg_raster_tokens_ready
+        && sheet->svg_raster_token_generation == sheet->build_generation
+        && sheet->svg_raster_token_rules == sheet->custom_rule_count) return;
+    budget_free(sheet->budget, sheet->svg_raster_tokens);
+    sheet->svg_raster_tokens = NULL;
+    sheet->svg_raster_token_count = 0;
+    SvgRasterTokenList list = {0};
+    bool opaque = false;
+    for (size_t i = 0; !opaque && i < sheet->custom_rule_count; i++) {
+        const StyleCustomRule *rule = &sheet->custom_rules[i];
+        bool custom_property = rule->name_length > 2
+            && rule->name[0] == '-' && rule->name[1] == '-';
+        if (!custom_property
+            && retained_presentation_index(
+                   rule->name, rule->name_length) < 0) continue;
+        /* Of the presentation values only opacity is not inherited: it
+           reaches a raster when it matches the SVG itself, whose own class
+           changes always refresh it. */
+        bool relational_only = !custom_property
+            && span_case_equal(rule->name, rule->name_length, "opacity");
+        opaque = rule->selector == NULL
+            || !svg_raster_selector_tokens(
+                   sheet, rule->selector, rule->selector_length,
+                   relational_only, &list);
+    }
+    if (opaque || list.count > UINT32_MAX) {
+        budget_free(sheet->budget, list.hashes);
+        list = (SvgRasterTokenList) {0};
+        opaque = true;
+    } else if (list.count != 0) {
+        qsort(list.hashes, list.count, sizeof(*list.hashes),
+              compare_svg_raster_tokens);
+        size_t unique = 1;
+        for (size_t i = 1; i < list.count; i++) {
+            if (list.hashes[i] != list.hashes[unique - 1u])
+                list.hashes[unique++] = list.hashes[i];
+        }
+        uint32_t *compact = budget_realloc(
+            sheet->budget, list.hashes, unique * sizeof(*compact));
+        if (compact != NULL) list.hashes = compact;
+        list.count = unique;
+    }
+    sheet->svg_raster_tokens = list.hashes;
+    sheet->svg_raster_token_count = (uint32_t) list.count;
+    sheet->svg_raster_tokens_opaque = opaque;
+    sheet->svg_raster_token_generation = sheet->build_generation;
+    sheet->svg_raster_token_rules = sheet->custom_rule_count;
+    sheet->svg_raster_tokens_ready = true;
+}
+
+bool stylesheet_tokens_may_affect_svg_raster(
+    const Stylesheet *const_sheet, const uint32_t *hashes, size_t count)
+{
+    if (const_sheet == NULL || hashes == NULL || count == 0
+        || const_sheet->budget == NULL) return true;
+    if (const_sheet->rule_filters == NULL || !const_sheet->rule_index_ready)
+        return true;
+    for (size_t i = 0; i < const_sheet->count; i++) {
+        const StyleRuleFilter *filter = &const_sheet->rule_filters[i];
+        if (filter->svg_raster != 0
+            && style_rule_tokens_may_change_match(
+                   &const_sheet->rules[i], filter, hashes, count,
+                   (filter->svg_raster & STYLE_RULE_SVG_RASTER_INHERITED)
+                       != 0)) return true;
+    }
+    /* Custom properties and SVG presentation values are custom rules, not
+       indexed rules; their tokens are listed once per sheet generation. */
+    Stylesheet *sheet = (Stylesheet *) const_sheet;
+    stylesheet_prepare_svg_raster_tokens(sheet);
+    if (sheet->svg_raster_tokens_opaque) return true;
+    for (size_t h = 0; h < count; h++) {
+        if (sheet->svg_raster_token_count != 0
+            && bsearch(&hashes[h], sheet->svg_raster_tokens,
+                       sheet->svg_raster_token_count,
+                       sizeof(*sheet->svg_raster_tokens),
+                       compare_svg_raster_tokens) != NULL) return true;
+    }
+    return false;
+}
+
+/* Attribute names borrowed from selector text while the sorted set is built;
+   the set itself keeps only unique lower-cased copies. */
+typedef struct {
+    const char *text;
+    size_t length;
+} SelectorAttributeName;
+
+typedef struct {
+    SelectorAttributeName *names;
+    size_t count;
+    size_t capacity;
+} SelectorAttributeNameList;
+
+/* Bounds on one build: unique names held while scanning, and the retained
+   set. A sheet beyond them answers conservatively. */
+#define STYLE_SELECTOR_ATTRIBUTE_NAME_LIMIT 2048u
+#define STYLE_SELECTOR_ATTRIBUTE_BYTE_LIMIT (64u * 1024u)
+
+static int selector_attribute_lower(unsigned char value)
+{
+    return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
+}
+
+static int compare_selector_attribute_names(const void *left,
+                                            const void *right)
+{
+    const SelectorAttributeName *a = left, *b = right;
+    size_t shared = a->length < b->length ? a->length : b->length;
+    for (size_t i = 0; i < shared; i++) {
+        int x = selector_attribute_lower((unsigned char) a->text[i]);
+        int y = selector_attribute_lower((unsigned char) b->text[i]);
+        if (x != y) return x - y;
+    }
+    return (a->length > b->length) - (a->length < b->length);
+}
+
+/* Sorts the list and drops repeated names (ASCII case-insensitive). */
+static void selector_attribute_names_compact(SelectorAttributeNameList *list)
+{
+    if (list->count < 2u) return;
+    qsort(list->names, list->count, sizeof(*list->names),
+          compare_selector_attribute_names);
+    size_t unique = 1;
+    for (size_t i = 1; i < list->count; i++) {
+        if (compare_selector_attribute_names(
+                &list->names[unique - 1u], &list->names[i]) != 0)
+            list->names[unique++] = list->names[i];
+    }
+    list->count = unique;
+}
+
+static bool selector_attribute_name_byte(unsigned char value)
+{
+    return value >= 0x80 || isalnum(value) || value == '-' || value == '_';
+}
+
+/* Appends the attribute names one selector's attribute selectors test,
+   borrowing the selector text. Escapes and quoted strings outside an
+   attribute selector (escaped Tailwind class names, :lang("x")) are not
+   attribute selectors. False when a name cannot be listed: an escaped or
+   namespace-qualified name, a form this scan does not parse, or a full
+   list. */
+static bool selector_attribute_names_collect(
+    Stylesheet *sheet, const char *text, size_t length,
+    SelectorAttributeNameList *list)
+{
+    /* Most selectors test no attribute at all. */
+    if (memchr(text, '[', length) == NULL) return true;
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == '\\') at++;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (value == '\\') {
+            at = svg_raster_skip_escape(text, length, at) - 1u;
+            continue;
+        }
+        if (value == '"' || value == '\'') {
+            quote = value;
+            continue;
+        }
+        if (value != '[') continue;
+        size_t begin = at + 1u;
+        while (begin < length && isspace((unsigned char) text[begin])) begin++;
+        size_t end = begin;
+        while (end < length
+               && selector_attribute_name_byte((unsigned char) text[end])) {
+            end++;
+        }
+        size_t next = end;
+        while (next < length && isspace((unsigned char) text[next])) next++;
+        /* `*|`, `|name`, `name\..` and `ns|name` all land here. */
+        if (end == begin || next == length) return false;
+        char match = text[next];
+        if (match != ']' && match != '='
+            && !((match == '~' || match == '|' || match == '^'
+                  || match == '$' || match == '*')
+                 && next + 1u < length && text[next + 1u] == '=')) {
+            return false;
+        }
+        const SelectorAttributeName *last = list->count == 0 ? NULL
+            : &list->names[list->count - 1u];
+        bool repeated = last != NULL && last->length == end - begin
+            && memcmp(last->text, text + begin, end - begin) == 0;
+        if (!repeated && list->count == STYLE_SELECTOR_ATTRIBUTE_NAME_LIMIT) {
+            selector_attribute_names_compact(list);
+            if (list->count == STYLE_SELECTOR_ATTRIBUTE_NAME_LIMIT)
+                return false;
+        }
+        if (!repeated && list->count == list->capacity) {
+            size_t capacity = list->capacity == 0 ? 64u : list->capacity * 2u;
+            SelectorAttributeName *grown = budget_realloc(
+                sheet->budget, list->names, capacity * sizeof(*grown));
+            if (grown == NULL) return false;
+            list->names = grown;
+            list->capacity = capacity;
+        }
+        if (!repeated) {
+            list->names[list->count++] = (SelectorAttributeName) {
+                text + begin, end - begin
+            };
+        }
+        /* The value may hold escapes, quotes and brackets of its own. */
+        char value_quote = 0;
+        at = next;
+        for (; at < length; at++) {
+            char inner = text[at];
+            if (value_quote != 0) {
+                if (inner == '\\') at++;
+                else if (inner == value_quote) value_quote = 0;
+            } else if (inner == '\\') {
+                at++;
+            } else if (inner == '"' || inner == '\'') {
+                value_quote = inner;
+            } else if (inner == ']') {
+                break;
+            }
+        }
+        if (at >= length) return false;
+    }
+    return quote == 0;
+}
+
+static void stylesheet_prepare_selector_attribute_names(Stylesheet *sheet)
+{
+    if (sheet->selector_attribute_names_ready
+        && sheet->selector_attribute_generation == sheet->build_generation
+        && sheet->selector_attribute_rules == sheet->count
+        && sheet->selector_attribute_custom_rules
+               == sheet->custom_rule_count) return;
+    budget_free(sheet->budget, sheet->selector_attribute_names);
+    sheet->selector_attribute_names = NULL;
+    sheet->selector_attribute_name_count = 0;
+    sheet->selector_attribute_name_bytes = 0;
+    SelectorAttributeNameList list = {0};
+    bool opaque = false;
+    for (size_t i = 0; !opaque && i < sheet->count; i++) {
+        const StyleRule *rule = &sheet->rules[i];
+        opaque = rule->selector != NULL
+            && !selector_attribute_names_collect(
+                   sheet, rule->selector, rule->selector_length, &list);
+    }
+    for (size_t i = 0; !opaque && i < sheet->custom_rule_count; i++) {
+        const StyleCustomRule *rule = &sheet->custom_rules[i];
+        opaque = rule->selector != NULL
+            && !selector_attribute_names_collect(
+                   sheet, rule->selector, rule->selector_length, &list);
+    }
+    /* One allocation: sorted offsets, then "name\0" bytes. */
+    size_t unique = 0, bytes = 0;
+    if (!opaque) {
+        selector_attribute_names_compact(&list);
+        unique = list.count;
+        for (size_t i = 0; i < unique; i++) bytes += list.names[i].length + 1u;
+        opaque = bytes > STYLE_SELECTOR_ATTRIBUTE_BYTE_LIMIT;
+    }
+    uint32_t *offsets = NULL;
+    if (!opaque && unique != 0) {
+        offsets = budget_realloc(
+            sheet->budget, NULL, unique * sizeof(*offsets) + bytes);
+        opaque = offsets == NULL;
+    }
+    if (offsets != NULL) {
+        char *names = (char *) (offsets + unique);
+        size_t used = 0;
+        for (size_t i = 0; i < unique; i++) {
+            offsets[i] = (uint32_t) used;
+            for (size_t c = 0; c < list.names[i].length; c++) {
+                names[used++] = (char) selector_attribute_lower(
+                    (unsigned char) list.names[i].text[c]);
+            }
+            names[used++] = '\0';
+        }
+        sheet->selector_attribute_names = offsets;
+        sheet->selector_attribute_name_count = (uint32_t) unique;
+        sheet->selector_attribute_name_bytes =
+            unique * sizeof(*offsets) + bytes;
+    }
+    budget_free(sheet->budget, list.names);
+    sheet->selector_attribute_names_opaque = opaque;
+    sheet->selector_attribute_generation = sheet->build_generation;
+    sheet->selector_attribute_rules = sheet->count;
+    sheet->selector_attribute_custom_rules = sheet->custom_rule_count;
+    sheet->selector_attribute_names_ready = true;
+}
+
+/* Orders a listed (lower-case) name against the first name_length bytes of
+   the query: zero when the listed name begins with the query. */
+static int selector_attribute_name_order(const char *listed,
+                                         const char *name,
+                                         size_t name_length)
+{
+    for (size_t i = 0; i < name_length; i++) {
+        int x = (unsigned char) listed[i];
+        int y = selector_attribute_lower((unsigned char) name[i]);
+        if (x != y) return x - y;
+    }
+    return 0;
+}
+
+bool stylesheet_selectors_reference_attribute_prefix(
+    const Stylesheet *const_sheet, const char *name, size_t name_length)
+{
+    if (const_sheet == NULL || name == NULL || name_length == 0) return true;
+    if (const_sheet->count == 0 && const_sheet->custom_rule_count == 0)
+        return false;
+    if (const_sheet->budget == NULL) return true;
+    /* The names are listed once per sheet generation and rule counts. */
+    Stylesheet *sheet = (Stylesheet *) const_sheet;
+    stylesheet_prepare_selector_attribute_names(sheet);
+    if (sheet->selector_attribute_names_opaque) return true;
+    const uint32_t *offsets = sheet->selector_attribute_names;
+    const char *names = (const char *) (offsets
+        + sheet->selector_attribute_name_count);
+    size_t low = 0, high = sheet->selector_attribute_name_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2u;
+        if (selector_attribute_name_order(
+                names + offsets[middle], name, name_length) < 0) {
+            low = middle + 1u;
+        } else {
+            high = middle;
+        }
+    }
+    /* The first name not below the query begins with it, if any does. */
+    return low < sheet->selector_attribute_name_count
+        && selector_attribute_name_order(
+               names + offsets[low], name, name_length) == 0;
 }
 
 void stylesheet_append_result_release(Stylesheet *sheet,
@@ -1576,14 +2401,40 @@ static int stylesheet_compare_revert_order(const void *a, const void *b)
     return (left > right) - (left < right);
 }
 
+typedef struct {
+    lxb_dom_node_t *const *elements;
+    size_t count;
+    const TilefinchContentSecurityPolicy *policy;
+} StyleAppendElementsInput;
+
+static bool stylesheet_append_elements_source(Stylesheet *sheet,
+                                              void *opaque)
+{
+    const StyleAppendElementsInput *input = opaque;
+    return stylesheet_append_style_elements(
+        sheet, input->elements, input->count, input->policy);
+}
+
 bool stylesheet_append_style_elements_tracked(
     Stylesheet *sheet, lxb_dom_node_t *const *elements, size_t count,
     const TilefinchContentSecurityPolicy *content_security_policy,
     size_t after_source, StylesheetAppendResult *result)
 {
+    StyleAppendElementsInput input = {
+        elements, count, content_security_policy
+    };
+    return stylesheet_append_sources_tracked(
+        sheet, stylesheet_append_elements_source, &input, after_source,
+        result);
+}
+
+bool stylesheet_append_sources_tracked(
+    Stylesheet *sheet, StylesheetSourceAppender append, void *opaque,
+    size_t after_source, StylesheetAppendResult *result)
+{
     if (result == NULL) return false;
     memset(result, 0, sizeof(*result));
-    if (sheet == NULL || sheet->budget == NULL) return false;
+    if (sheet == NULL || sheet->budget == NULL || append == NULL) return false;
     size_t old_count = sheet->count;
     size_t old_sources = sheet->style_source_count;
     if (old_count > UINT16_MAX || after_source > old_sources) return false;
@@ -1595,8 +2446,7 @@ bool stylesheet_append_style_elements_tracked(
     }
     uint64_t signature_before = stylesheet_parse_context_signature(sheet);
     unsigned tail_start = sheet->next_order;
-    bool ok = stylesheet_append_style_elements(
-        sheet, elements, count, content_security_policy);
+    bool ok = append(sheet, opaque);
     if (!ok) {
         budget_free(sheet->budget, old_orders);
         return false;
@@ -1631,6 +2481,15 @@ bool stylesheet_append_style_elements_tracked(
                                          : UINT_MAX - UINT8_MAX)
                 | (packed & UINT8_MAX);
         }
+        for (size_t j = 0; j < sheet->transition_rule_count; j++) {
+            unsigned packed = sheet->transition_rules[j].order;
+            unsigned order = stylesheet_inserted_rule_order(
+                packed >> 8, tail_start, boundary, appended_orders);
+            sheet->transition_rules[j].order =
+                (order <= (UINT_MAX >> 8) ? order << 8
+                                         : UINT_MAX - UINT8_MAX)
+                | (packed & UINT8_MAX);
+        }
         for (size_t j = 0; j < sheet->revert_rule_mask_count; j++) {
             sheet->revert_rule_masks[j].order = stylesheet_inserted_rule_order(
                 sheet->revert_rule_masks[j].order, tail_start, boundary,
@@ -1641,6 +2500,15 @@ bool stylesheet_append_style_elements_tracked(
                   sizeof(*sheet->revert_rule_masks),
                   stylesheet_compare_revert_order);
         }
+        stylesheet_drop_selector_program(sheet);
+        stylesheet_drop_rule_index(sheet);
+        stylesheet_drop_custom_rule_index(sheet);
+        stylesheet_finalize_rule_order(sheet);
+    }
+    /* Keep the source list in document order, with first orders matching
+       the moved rules. A source that parsed no rule (an empty block, a
+       sheet whose fetch failed) still takes its place: it is a boundary. */
+    if (boundary != tail_start && !sheet->style_sources_bounded_out) {
         for (size_t s = 0; s < sheet->style_source_count; s++) {
             unsigned order = sheet->style_source_first_order[s];
             if (s >= old_sources) {
@@ -1650,11 +2518,6 @@ bool stylesheet_append_style_elements_tracked(
                 sheet->style_source_first_order[s] = order + appended_orders;
             }
         }
-        stylesheet_drop_selector_program(sheet);
-        stylesheet_drop_rule_index(sheet);
-        stylesheet_drop_custom_rule_index(sheet);
-        stylesheet_finalize_rule_order(sheet);
-        /* Keep the source list in document order as well. */
         size_t new_sources = sheet->style_source_count - old_sources;
         if (new_sources != 0 && after_source < old_sources) {
             const lxb_dom_node_t *nodes[STYLE_SOURCE_NODE_LIMIT];
@@ -1913,13 +2776,17 @@ bool stylesheet_direction_change_rules(const Stylesheet *sheet,
         const StyleDeclaration *declaration =
             stylesheet_rule_declaration(sheet, &sheet->rules[i]);
         if (declaration == NULL) continue;
+        ComputedStyle values = {0};
+        if ((declaration->mask_high & (S2_DIRECTION | S2_UNICODE_BIDI))
+            != 0) {
+            stylesheet_declaration_values(sheet, declaration, &values);
+        }
         bool changes =
             ((declaration->mask_high & S2_DIRECTION) != 0
-             && computed_style_direction_rtl(&declaration->values))
+             && computed_style_direction_rtl(&values))
             || ((declaration->mask_high & S2_UNICODE_BIDI) != 0
-                && (declaration->values.unicode_bidi
-                        == STYLE_UNICODE_BIDI_OVERRIDE
-                    || declaration->values.unicode_bidi
+                && (values.unicode_bidi == STYLE_UNICODE_BIDI_OVERRIDE
+                    || values.unicode_bidi
                         == STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE))
             || (declaration->deferred_declarations != NULL
                 && (style_span_contains_ci(
@@ -1951,8 +2818,11 @@ size_t stylesheet_layout_island_selectors(const Stylesheet *sheet,
         const StyleRule *rule = &sheet->rules[i];
         const StyleDeclaration *declaration = stylesheet_rule_declaration(
             sheet, rule);
-        if (declaration == NULL) continue;
-        DisplayMode display = declaration->values.display;
+        if (declaration == NULL || (declaration->mask & S_DISPLAY) == 0
+            || rule->pseudo != PSEUDO_NONE) continue;
+        ComputedStyle values;
+        stylesheet_declaration_values(sheet, declaration, &values);
+        DisplayMode display = values.display;
         bool island = display == DISPLAY_FLEX
             || display == DISPLAY_INLINE_FLEX
             || display == DISPLAY_GRID
@@ -2064,7 +2934,12 @@ void stylesheet_destroy(Stylesheet *sheet)
         }
         budget_free(sheet->budget, sheet->rules);
         budget_free(sheet->budget, sheet->focus_rule_indices);
+        budget_free(sheet->budget, sheet->has_rule_indices);
+        budget_free(sheet->budget, sheet->has_custom_rule_indices);
+        budget_free(sheet->budget, sheet->has_class_hashes);
+        style_has_plan_destroy(sheet);
         budget_free(sheet->budget, sheet->declarations);
+        budget_free(sheet->budget, sheet->declaration_values);
         budget_free(sheet->budget, sheet->revert_rule_masks);
         budget_free(sheet->budget, sheet->declaration_index_slots);
         StyleTextChunk *chunk = sheet->selector_chunks;
@@ -2075,6 +2950,7 @@ void stylesheet_destroy(Stylesheet *sheet)
         }
         budget_free(sheet->budget, sheet->variables);
         budget_free(sheet->budget, sheet->custom_rules);
+        budget_free(sheet->budget, sheet->transition_rules);
         budget_free(sheet->budget, sheet->conditional_queries);
         if (sheet->paint_storage != NULL) {
             for (size_t block = 0;
@@ -2097,7 +2973,12 @@ void stylesheet_destroy(Stylesheet *sheet)
         budget_free(sheet->budget, sheet->grid_areas);
         budget_free(sheet->budget, sheet->border_color_sets);
         budget_free(sheet->budget, sheet->custom_rule_index);
+        budget_free(sheet->budget, sheet->svg_raster_tokens);
+        budget_free(sheet->budget, sheet->selector_attribute_names);
         budget_free(sheet->budget, sheet->deferred_instructions);
+        budget_free(sheet->budget, sheet->class_tokens);
+        sheet->class_tokens = NULL;
+        sheet->class_tokens_refused = false;
         budget_free(sheet->budget, sheet->resolve_scratch);
         budget_free(sheet->budget, sheet->rule_index_buckets);
         budget_free(sheet->budget, sheet->rule_index_entries);

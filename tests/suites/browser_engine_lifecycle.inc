@@ -983,6 +983,119 @@ static int test_computed_paint_style_does_not_force_layout(void)
     return 0;
 }
 
+/* Container-dependent computed styles are memoized under the sheet's
+   container-state generation. Every change of a container's size must reach
+   both the per-node memo and the ancestor cache, although none of these
+   changes mutates the queried element: a sibling's text, an image's
+   intrinsic size, and the container's own container-type. Each read must
+   agree with the container geometry the same flushed layout reports.
+   `inline_units` moves the cq lengths into a style attribute, leaving the
+   authored sheet with no container query or unit. letter-spacing is read
+   first: it is a style-only property, which may otherwise skip the layout
+   flush and resolve against the previous layout's containers. */
+static int computed_style_container_geometry_case(bool inline_units)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    config.resources.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    char page[1024];
+    int page_length = snprintf(page, sizeof(page),
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0;color:rgb(0, 0, 0)}"
+        "#row{display:flex}#side{flex:none}"
+        "#box{flex:1 1 auto;min-width:0;container-type:inline-size}%s</style>"
+        "<div id=row><div id=side><span id=label></span><img id=pic></div>"
+        "<div id=box><p id=t>t</p><p id=u %s>u</p></div></div>",
+        inline_units ? ""
+            : "@container (min-width:300px){#t{color:rgb(1, 2, 3)}}"
+              "#u{margin-left:10cqw;letter-spacing:2cqw}",
+        inline_units ? "style='margin-left:10cqw;letter-spacing:2cqw'" : "");
+    CHECK(page_length > 0 && (size_t) page_length < sizeof(page));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://container-style.test/", page, (size_t) page_length, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.stylesheet.has_container_relative_units
+          == !inline_units);
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+    ScriptResult result = {0};
+    /* Style reads come first so they, not a geometry read, flush layout.
+       `u` is read before `t` so its entry sits in the ancestor cache while
+       `t` owns the per-node memo, then `u` again through the memo. */
+    char setup[2048];
+    int setup_length = snprintf(setup, sizeof(setup),
+        "globalThis.bad=[];globalThis.widths=[];"
+        "globalThis.box=document.getElementById('box');"
+        "globalThis.check=(tag,contained)=>{"
+        "const u=document.getElementById('u'),t=document.getElementById('t');"
+        "const size=getComputedStyle(u).letterSpacing;"
+        "const first=getComputedStyle(u).marginLeft;"
+        "const color=getComputedStyle(t).color;"
+        "const again=getComputedStyle(u).marginLeft;"
+        "const w=box.clientWidth,basis=contained?w:innerWidth;"
+        "const want=%s&&contained&&w>=300?'rgb(1, 2, 3)':'rgb(0, 0, 0)';"
+        "if(Math.abs(parseFloat(first)-basis/10)>0.51||again!==first"
+        "||Math.abs(parseFloat(size)-basis/50)>0.51||color!==want)"
+        "bad.push(tag+':'+size+'/'+first+'/'+again+'/'+color+'/w='+w);"
+        "widths.push(w);};"
+        "check('initial',true);"
+        /* A sibling's content grows and narrows the container. */
+        "document.getElementById('label').textContent="
+        "'WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW';"
+        "check('sibling-text',true);"
+        "document.getElementById('label').textContent='';"
+        "check('sibling-cleared',true);"
+        /* The container stops being one. */
+        "box.style.containerType='normal';check('not-container',false);"
+        "box.style.containerType='inline-size';check('container-again',true);"
+        /* An image's intrinsic width narrows the container. */
+        "document.getElementById('pic').src='data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAPoAAAABCAAAAADS0uw7AAAADElEQVR42mNgGLEAAAD7"
+        "AAEEc13AAAAAAElFTkSuQmCC';"
+        "check('image-same-task',true);",
+        inline_units ? "false" : "true");
+    CHECK(setup_length > 0 && (size_t) setup_length < sizeof(setup));
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        setup, "<container-style-setup>", &result) && result.success);
+    /* Native work between tasks (resource settlement, a frame's relayout)
+       precedes a read with no intervening script mutation. */
+    for (size_t i = 0; i < 8; i++)
+        (void) navigation_advance_runtime(navigation, 16, 8);
+    (void) navigation_relayout(navigation);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "check('image-next-task',true);"
+        "pocSummary=bad.length?bad.join(' '):'widths='+widths.join(',')",
+        "<container-style-result>", &result) && result.success);
+    if (strncmp(result.summary, "widths=", 7) != 0)
+        fprintf(stderr, "container computed style inline=%d: %s\n",
+                inline_units, result.summary);
+    CHECK(strncmp(result.summary, "widths=", 7) == 0);
+    /* Every step must have moved the container, or the test proves nothing:
+       initial / text / cleared / (viewport basis) / again / image / image. */
+    int widths[7] = {0};
+    CHECK(sscanf(result.summary, "widths=%d,%d,%d,%d,%d,%d,%d", &widths[0],
+        &widths[1], &widths[2], &widths[3], &widths[4], &widths[5],
+        &widths[6]) == 7);
+    CHECK(widths[1] < 300 && widths[0] >= 300 && widths[2] == widths[0]
+        && widths[4] == widths[0] && widths[5] < widths[0]
+        && widths[6] == widths[5]);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_computed_style_tracks_container_geometry(void)
+{
+    CHECK(computed_style_container_geometry_case(false) == 0);
+    CHECK(computed_style_container_geometry_case(true) == 0);
+    return 0;
+}
+
 /* getComputedStyle() reports resolved values, and only for the properties
    the engine supports. Every expectation here is an exact value: a test that
    merely required "not empty" would pass on a table of initial values while
@@ -1461,6 +1574,683 @@ static int computed_style_dump(const char *fixture_path,
                 "change is intended, regenerate with --computed-style-dump\n",
                 differences);
     CHECK(differences == 0);
+    return 0;
+}
+
+/* Stylesheet transitions reach getComputedStyle through the cascade, and a
+   page waiting on transitionend gets it whether the listener came before or
+   after the class change, through an ancestor's class, or from an inline
+   (Swiper-style) transition; `transition: none` and display:none give none. */
+static int test_css_transition_lifecycle(void)
+{
+    static const char page[] =
+        "<!doctype html><html><head><style>"
+        ".panel{opacity:1;transition:opacity 40ms ease-in 10ms,transform 60ms}"
+        ".panel.hide{opacity:0}.panel.move{transform:translateX(10px)}"
+        ".menu{transition:all 50ms}body.open .menu{opacity:.5}"
+        ".none{transition:none}.none.hide{opacity:0}"
+        "#long{transition:-webkit-transform .3s cubic-bezier(.2,.8,.2,1),"
+        "opacity 300ms steps(4,end)}"
+        "#inl{transition:opacity 1s}"
+        "</style></head><body>"
+        "<div id=a class=panel>a</div><div id=b class=panel>b</div>"
+        "<div id=c class=menu>c</div><div id=d class=none>d</div>"
+        "<div id=e class=panel>e</div><div id=long>l</div>"
+        "<div id=inl style='transition: color 2s linear 1s'>i</div>"
+        "<div id=sw>s</div></body></html>";
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://transition.test/", page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+    static const char computed[] =
+        "(()=>{const cs=(id,n)=>getComputedStyle("
+        "document.getElementById(id)).getPropertyValue(n);"
+        "const a=getComputedStyle(document.getElementById('a'));"
+        "globalThis.pocSummary=[cs('a','transition'),"
+        "a.transitionDuration+'/'+a.transitionDelay+'/'+a.transitionProperty"
+        "+'/'+a.transitionTimingFunction,cs('long','transition'),"
+        "cs('inl','transition'),cs('sw','transition')].join(' | ');})()";
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation->page.runtime, computed, "<transition-computed>",
+              &result) && result.success);
+    static const char expected_computed[] =
+        "opacity 0.04s ease-in 0.01s, transform 0.06s ease 0s"
+        " | 0.04s, 0.06s/0.01s, 0s/opacity, transform/ease-in, ease"
+        " | -webkit-transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) 0s,"
+        " opacity 0.3s steps(4, end) 0s"
+        " | color 2s linear 1s | all 0s ease 0s";
+    if (strcmp(result.summary, expected_computed) != 0)
+        fprintf(stderr, "transition computed=%s\n", result.summary);
+    CHECK(strcmp(result.summary, expected_computed) == 0);
+
+    static const char lifecycle[] =
+        "(()=>{const log=[],$=id=>document.getElementById(id);"
+        "const done=()=>{globalThis.pocSummary=log.sort().join(',')};"
+        "const listen=(id,type)=>$(id).addEventListener(type,event=>{"
+        "log.push(id+':'+event.type+':'+event.propertyName+':'"
+        "+event.elapsedTime);done()});"
+        "listen('a','transitionend');listen('a','transitionrun');"
+        "listen('a','transitionstart');$('a').classList.add('hide');"
+        "$('b').classList.add('move');listen('b','transitionend');"
+        "listen('c','transitionend');document.body.classList.add('open');"
+        "listen('d','transitionend');$('d').classList.add('hide');"
+        "listen('e','transitionend');listen('e','transitioncancel');"
+        "$('e').classList.add('hide');"
+        "setTimeout(()=>{$('e').style.display='none'},20);"
+        "$('sw').addEventListener('transitionend',event=>{"
+        "log.push('sw:'+event.propertyName);done()});"
+        "$('sw').style.transitionDuration='80ms';"
+        "$('sw').style.transform='translate3d(-100px, 0px, 0px)';"
+        "log.push('TE:'+typeof TransitionEvent);done()})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation->page.runtime, lifecycle, "<transition-lifecycle>",
+              &result) && result.success);
+    /* e is cancelled by the 20 ms timer, which fires on the 32 ms pump:
+       22 ms into its opacity transition after the 10 ms delay. */
+    static const char expected_events[] =
+        "TE:function,a:transitionend:opacity:0.04,"
+        "a:transitionrun:opacity:0,a:transitionstart:opacity:0,"
+        "b:transitionend:transform:0.06,c:transitionend:opacity:0.05,"
+        "e:transitioncancel:opacity:0.022,sw:transform";
+    for (unsigned tick = 0; tick < 24
+                            && strcmp(result.summary, expected_events) != 0;
+         tick++) {
+        CHECK(script_runtime_advance(navigation->page.runtime, 16, 16,
+                                     &result));
+    }
+    if (strcmp(result.summary, expected_events) != 0)
+        fprintf(stderr, "transition events=%s error=%s\n", result.summary,
+                result.error);
+    CHECK(result.success && strcmp(result.summary, expected_events) == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A transition test page: engine, navigation and a synchronous layout. */
+typedef struct {
+    BrowserEngine *engine;
+    NavigationSession *navigation;
+    ScriptRuntime *runtime;
+} TransitionPage;
+
+static bool transition_page_open(TransitionPage *page, const char *html,
+                                 size_t length)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    page->engine = browser_engine_create(&config, error, sizeof(error));
+    if (page->engine == NULL || !browser_engine_commit_html(page->engine,
+            "https://transition.test/", html, length, true)) return false;
+    page->navigation = browser_engine_navigation(page->engine);
+    page->runtime = page->navigation->page.runtime;
+    script_runtime_set_synchronous_layout_callback(page->runtime,
+        computed_style_test_flush, page->navigation);
+    return true;
+}
+
+static bool transition_page_close(TransitionPage *page)
+{
+    bool shut = browser_engine_shutdown(page->engine);
+    browser_engine_destroy(page->engine);
+    return shut;
+}
+
+/* Evaluates source, then advances 16 ms frames until pocSummary is expected
+   or ticks run out. Prints the mismatch. */
+static bool transition_expect(TransitionPage *page, const char *label,
+                              const char *source, unsigned elapsed_ms,
+                              unsigned ticks, const char *expected)
+{
+    ScriptResult result = {0};
+    if (source != NULL
+        && (!script_runtime_evaluate_diagnostic(page->runtime, source, label,
+                                                &result) || !result.success)) {
+        fprintf(stderr, "%s: evaluation failed: %s\n", label, result.error);
+        return false;
+    }
+    if (source == NULL
+        && !script_runtime_evaluate_diagnostic(page->runtime,
+               "globalThis.pocSummary", label, &result)) return false;
+    for (unsigned tick = 0; tick < ticks
+                            && strcmp(result.summary, expected) != 0;
+         tick++) {
+        if (!script_runtime_advance(page->runtime, elapsed_ms, 16, &result))
+            return false;
+    }
+    if (strcmp(result.summary, expected) != 0) {
+        fprintf(stderr, "%s:\n  want %s\n  got  %s\n  error %s\n", label,
+                expected, result.summary, result.error);
+        return false;
+    }
+    return true;
+}
+
+/* Many simultaneous stylesheet transitions: starting them does not rescan
+   the running set, at most 256 run at once, the oldest past that ends early
+   rather than never, and every one ends and leaves the set. */
+static int test_transition_clock_bounded(void)
+{
+    /* 60 watched elements (under the watcher's 64) times six sampled
+       properties: 360 clocked transitions. The 104 evicted ones end early,
+       so all 360 transitionend events arrive. */
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html), "%s",
+        "<!doctype html><style>.x{position:relative;opacity:1;"
+        "color:rgb(0,0,0);background-color:rgb(0,0,0);top:0;left:0;"
+        "margin-top:0;transition:all 2s}.x.go{opacity:0;color:rgb(1,1,1);"
+        "background-color:rgb(2,2,2);top:1px;left:1px;margin-top:1px}"
+        "</style><body>");
+    for (unsigned i = 0; i < 60u && used < sizeof(html) - 64u; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<div class=x>%u</div>", i);
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+                              "</body>");
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, used));
+    CHECK(transition_expect(&page, "<transition-bound-start>",
+        "(()=>{const s=__tilefinchTransitionStats,all=[...document."
+        "querySelectorAll('.x')];globalThis.__ends=0;"
+        "for(const el of all)el.addEventListener('transitionend',()=>"
+        "{__ends++});s.transitionRecordVisits=0;"
+        "for(const el of all)el.classList.add('go');"
+        "globalThis.pocSummary='started'})()", 16, 1, "started"));
+    CHECK(transition_expect(&page, "<transition-bound-running>",
+        "(()=>{const s=__tilefinchTransitionStats;globalThis.pocSummary="
+        "(s.transitionsRunning===256&&s.transitionEvictions===104&&"
+        "s.transitionRecordVisits<360)?'bounded':"
+        "[s.transitionsRunning,s.transitionEvictions,"
+        "s.transitionRecordVisits,__ends].join(',')})()", 16, 1,
+        "bounded"));
+    CHECK(transition_expect(&page, "<transition-bound-end>",
+        "globalThis.__endCheck=()=>{const s=__tilefinchTransitionStats;"
+        "globalThis.pocSummary=__ends===360&&s.transitionsRunning===0?"
+        "'all-ended':String(__ends)+'/'+s.transitionsRunning};"
+        "setInterval(__endCheck,50);__endCheck()", 100, 40, "all-ended"));
+    CHECK(transition_page_close(&page));
+    return 0;
+}
+
+/* Evaluates source and then check each 16 ms frame until check's summary is
+   expected or ticks run out. Prints the mismatch. */
+static bool transition_poll(TransitionPage *page, const char *source,
+                            const char *check, unsigned ticks,
+                            const char *expected)
+{
+    ScriptResult result = {0};
+    if (source != NULL
+        && (!script_runtime_evaluate_diagnostic(page->runtime, source,
+                                                "<poll-source>", &result)
+            || !result.success)) return false;
+    for (unsigned tick = 0; tick <= ticks; tick++) {
+        if (!script_runtime_evaluate_diagnostic(page->runtime, check,
+                                                "<poll-check>", &result))
+            return false;
+        if (strcmp(result.summary, expected) == 0) return true;
+        if (tick < ticks
+            && !script_runtime_advance(page->runtime, 16, 16, &result))
+            return false;
+    }
+    fprintf(stderr, "poll:\n  want %s\n  got  %s\n", expected,
+            result.summary);
+    return false;
+}
+
+/* An inline (frame-driven) transition that the running-transition bound
+   completes early gets each event once and its effect stops at the end
+   value. */
+static int test_transition_eviction_inline_once(void)
+{
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html), "%s",
+        "<!doctype html><style>.x{position:relative;opacity:1;"
+        "color:rgb(0,0,0);background-color:rgb(0,0,0);top:0;left:0;"
+        "margin-top:0;transition:all 2s}.x.go{opacity:0;color:rgb(1,1,1);"
+        "background-color:rgb(2,2,2);top:1px;left:1px;margin-top:1px}"
+        "</style><body><div id=inl style='opacity:1;"
+        "transition:opacity 2s linear'>i</div>");
+    for (unsigned i = 0; i < 60u && used < sizeof(html) - 64u; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<div class=x>%u</div>", i);
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+                              "</body>");
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, used));
+    static const char show[] =
+        "globalThis.pocSummary=__log.join(',')+'|'+"
+        "__tilefinchTransitionStats.transitionEvictions";
+    CHECK(transition_poll(&page,
+        "(()=>{const el=document.getElementById('inl');globalThis.__log=[];"
+        "for(const t of ['transitionrun','transitionstart','transitionend',"
+        "'transitioncancel'])el.addEventListener(t,e=>__log.push(e.type."
+        "slice(10)));for(const x of document.querySelectorAll('.x'))x."
+        "addEventListener('transitionend',()=>{});el.style.opacity='0'})()",
+        show, 12, "run,start|0"));
+    /* 360 more: the inline one is the oldest and completes early. */
+    CHECK(transition_poll(&page,
+        "for(const x of document.querySelectorAll('.x'))x.classList.add('go')",
+        show, 6, "run,start,end|105"));
+    /* Later frames leave its end value in place. */
+    CHECK(transition_poll(&page, NULL,
+        "globalThis.__seen=(globalThis.__seen||0)+1;globalThis.pocSummary="
+        "__seen>6?__log.join(',')+'|'+Number(document.getElementById('inl')"
+        ".style.opacity):'wait'", 8, "run,start,end|0"));
+    CHECK(transition_page_close(&page));
+    return 0;
+}
+
+/* A style attribute or custom property is an inline declaration, never a
+   stylesheet: changing one must not rebuild the page stylesheet (a full
+   relayout re-parses every rule, images and fonts). A URL in the new value
+   is discovered additively. */
+static int test_inline_style_mutations_skip_stylesheet_rebuild(void)
+{
+    static const char html[] =
+        "<!doctype html><style>.a{color:rgb(1,1,1)}"
+        ".bg{background-image:var(--img)}</style>"
+        "<body><div id=t class=a>t</div><div id=u class=bg>u</div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    NavigationSession *navigation = page.navigation;
+    size_t full_before = navigation->performance.full_relayouts,
+        rebuilds_before = navigation->performance.mutation_resource_rebuilds;
+    static const char *const steps[] = {
+        "document.getElementById('t').setAttribute('style','color:red')",
+        "document.getElementById('t').setAttribute('style',"
+        "'background-image:url(/x.png)')",
+        "document.getElementById('t').removeAttribute('style')",
+        "document.getElementById('u').style.setProperty('--img','none')",
+        "document.documentElement.style.setProperty('--k','1px')",
+    };
+    ScriptResult result = {0};
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        CHECK(script_runtime_evaluate_diagnostic(page.runtime, steps[i],
+                                                 "<inline-style-step>",
+                                                 &result)
+              && result.success);
+        if (script_runtime_consume_relayout(page.runtime))
+            CHECK(navigation_relayout(navigation));
+        if (navigation->performance.full_relayouts != full_before
+            || navigation->performance.mutation_resource_rebuilds
+                   != rebuilds_before)
+            fprintf(stderr, "inline style step %zu rebuilt the sheet\n", i);
+        CHECK(navigation->performance.full_relayouts == full_before
+              && navigation->performance.mutation_resource_rebuilds
+                     == rebuilds_before);
+    }
+    /* A <style> element change still rebuilds (or appends to) the sheet. */
+    CHECK(script_runtime_evaluate_diagnostic(page.runtime,
+              "document.querySelector('style').textContent+="
+              "'.a{color:rgb(2,2,2)}'", "<style-text>", &result)
+          && result.success);
+    if (script_runtime_consume_relayout(page.runtime))
+        CHECK(navigation_relayout(navigation));
+    CHECK(navigation->performance.full_relayouts
+              + navigation->performance.mutation_style_appends
+          > full_before);
+    CHECK(transition_page_close(&page));
+    return 0;
+}
+
+/* __tilefinchTransitionSnapshot hands four fresh arrays to its result. Any
+   of its element insertions can fail: a refused allocation, or (as here,
+   deterministically) an author setter on Array.prototype that throws. Each
+   insertion is failed in turn, and after a collection every array the call
+   built must be gone. (The heap total is too noisy between evaluations to
+   show a few leaked arrays; weak references name each one.) */
+static int test_transition_snapshot_refusal_releases_arrays(void)
+{
+    static const char html[] =
+        "<!doctype html><style>#a{transition:opacity 40ms,transform 60ms 5ms,"
+        "color 1s}</style><body><div id=a>a</div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    ScriptResult result = {0};
+    /* The setters stand in for ordinary insertion until call number
+       __failAt, which throws, and note every array they see. They exist
+       only while __snap runs. */
+    CHECK(script_runtime_evaluate_diagnostic(page.runtime,
+        "(()=>{const define=Object.defineProperty,remove=Reflect."
+        "deleteProperty,snapshot=__tilefinchTransitionSnapshot,"
+        "handle=document.getElementById('a').__handle,"
+        "names=['opacity','transform','color','display'];"
+        "let calls=0,seen=new Set();globalThis.__failAt=-1;"
+        "globalThis.__refs=[];globalThis.__calls=0;"
+        "const note=(value)=>{if(Array.isArray(value)&&!seen.has(value)){"
+        "seen.add(value);define(__refs,__refs.length,{value:new WeakRef(value),"
+        "enumerable:true,configurable:true,writable:true})}},"
+        "install=()=>{for(let i=0;i<8;i++)define(Array.prototype,i,"
+        "{configurable:true,set(value){note(this);note(value);"
+        "if(calls++===__failAt)throw 1;"
+        "define(this,i,{value,writable:true,enumerable:true,"
+        "configurable:true})}})},"
+        "uninstall=()=>{for(let i=0;i<8;i++)remove(Array.prototype,i)};"
+        "globalThis.__snap=()=>{calls=0;seen=new Set();__refs=[];install();"
+        "try{snapshot(handle,names)}catch{}finally{uninstall()}"
+        "seen=null;__calls=calls};__snap();"
+        "globalThis.pocSummary=String(__calls)})()",
+        "<snapshot-setup>", &result) && result.success);
+    unsigned insertions = (unsigned) strtoul(result.summary, NULL, 10);
+    /* 3 transitions x 3 lists, 4 values, 4 result slots. */
+    CHECK(insertions == 17u);
+    unsigned leaks = 0;
+    for (unsigned fail_at = 0; fail_at <= insertions; fail_at++) {
+        char source[64];
+        snprintf(source, sizeof(source), "__failAt=%u;__snap()", fail_at);
+        CHECK(script_runtime_evaluate_diagnostic(page.runtime, source,
+                                                 "<snapshot-refusal>",
+                                                 &result) && result.success);
+        (void) script_runtime_collect_and_trim(page.runtime);
+        CHECK(script_runtime_evaluate_diagnostic(page.runtime,
+            "globalThis.pocSummary=__refs.length+' '+"
+            "__refs.filter(ref=>ref.deref()!==undefined).length",
+            "<snapshot-live>", &result) && result.success);
+        unsigned seen = 0, live = 0;
+        CHECK(sscanf(result.summary, "%u %u", &seen, &live) == 2);
+        CHECK(seen >= 1u && seen <= 5u);
+        if (live != 0) {
+            leaks++;
+            fprintf(stderr, "snapshot insertion %u failed: %u of %u arrays "
+                    "still live\n", fail_at, live, seen);
+        }
+    }
+    CHECK(leaks == 0);
+    CHECK(transition_page_close(&page));
+    return 0;
+}
+
+/* A page that has filled the author timer table (128 slots) still gets every
+   transition event, and neither transition stays registered: #v changes a
+   value that cannot be interpolated (the event clock), #o one that can (the
+   effect frame). Then the page frees its timers and transitions again. */
+static int transition_timer_exhaustion(unsigned free_slots)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<div id=v style='transition:visibility 40ms linear'>v</div>"
+        "<div id=o style='transition:opacity 40ms linear'>o</div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = true;
+    char source[2048];
+    snprintf(source, sizeof(source),
+        "(()=>{const $=id=>document.getElementById(id),log=[];"
+        "globalThis.__phase=1;"
+        "const done=()=>{const inline=['v','o'].map((id,at)=>"
+        "__tilefinchInlineTransition($(id).__handle,"
+        "at?'opacity':'visibility'));"
+        "globalThis.pocSummary=log.slice().sort().join(',')+'|'+inline};"
+        "for(const id of ['v','o'])for(const type of ['transitionrun',"
+        "'transitionstart','transitionend'])$(id).addEventListener(type,"
+        "event=>{log.push(__phase+id+':'+event.type.slice(10));done()});"
+        "const fill=[];let id;while((id=setTimeout(()=>{},1e7)))"
+        "fill.push(id);globalThis.__fill=fill;"
+        "for(let i=0;i<%u;i++)clearTimeout(fill.pop());"
+        "globalThis.__filled=fill.length;"
+        "$('v').style.visibility='hidden';$('o').style.opacity='0';"
+        "done()})()", free_slots);
+    char label[64];
+    snprintf(label, sizeof(label), "<timer-exhaustion free=%u>", free_slots);
+    ok &= transition_expect(&page, label, source, 16, 24,
+        "1o:end,1o:run,1o:start,1v:end,1v:run,1v:start|false,false");
+    snprintf(label, sizeof(label), "<timer-exhaustion-recovery free=%u>",
+             free_slots);
+    ok &= transition_expect(&page, label,
+        "(()=>{for(const id of __fill)clearTimeout(id);__phase=2;"
+        "const $=id=>document.getElementById(id);"
+        "$('v').style.visibility='visible';$('o').style.opacity='1'})()",
+        16, 24,
+        "1o:end,1o:run,1o:start,1v:end,1v:run,1v:start,"
+        "2o:end,2o:run,2o:start,2v:end,2v:run,2v:start|false,false");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+static int test_transition_timer_exhaustion(void)
+{
+    int failed = transition_timer_exhaustion(0);
+    failed |= transition_timer_exhaustion(1);
+    return failed;
+}
+
+/* Transition event handlers run inside the effect frame. A transitionstart
+   handler that retargets the property replaces the running effect; the frame
+   must then leave the replacement alone rather than finish the old effect
+   over it. #late: the first active frame arrives after the whole duration,
+   so start and completion fall in one frame. #chain: each start retargets
+   again, which must cost one frame per replacement, not a loop in one. */
+static int test_transition_handler_replacement(void)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<div id=late style='transition:opacity 40ms linear 20ms'>l</div>"
+        "<div id=chain style='transition:opacity 40ms linear'>c</div>"
+        "</body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = true;
+    ok &= transition_expect(&page, "<late-start-replacement>",
+        "(()=>{const late=document.getElementById('late'),log=[];"
+        "let replaced=false;"
+        "const done=()=>{globalThis.pocSummary=log.join(',')+'|'+"
+        "late.style.opacity+'/'+getComputedStyle(late).opacity+'|'+"
+        "__tilefinchInlineTransition(late.__handle,"
+        "'opacity')};"
+        "for(const type of ['transitionrun','transitionstart',"
+        "'transitionend','transitioncancel'])late.addEventListener(type,"
+        "event=>{log.push(event.type.slice(10));"
+        "if(type==='transitionstart'&&!replaced){replaced=true;"
+        "late.style.opacity='0.2'}done()});"
+        "late.style.opacity='0.5';done()})()", 16, 0, "run|0.5/1|true");
+    /* The first frame fixes the delay's origin; the next one comes 200 ms
+       later, past the delay and the whole duration. */
+    ScriptResult step = {0};
+    ok &= script_runtime_advance(page.runtime, 16, 16, &step)
+          && script_runtime_advance(page.runtime, 200, 16, &step);
+    ok &= transition_expect(&page, "<late-start-replacement-settled>", NULL,
+        16, 24, "run,start,cancel,run,start,end|0.2/0.2|false");
+    ok &= transition_expect(&page, "<chained-start-replacement>",
+        "(()=>{const chain=document.getElementById('chain');"
+        "let frame=0,starts=0,ends=0,most=0,inFrame=0,lastFrame=-1;"
+        "const tick=()=>{frame++;if(frame<200)requestAnimationFrame(tick)};"
+        "requestAnimationFrame(tick);"
+        "chain.addEventListener('transitionstart',()=>{starts++;"
+        "inFrame=frame===lastFrame?inFrame+1:1;lastFrame=frame;"
+        "most=Math.max(most,inFrame);"
+        "if(starts<=5)chain.style.opacity=String(starts/10)});"
+        "chain.addEventListener('transitionend',()=>{ends++;"
+        "globalThis.pocSummary='starts='+starts+' ends='+ends+"
+        "' perFrame='+most+' opacity='+chain.style.opacity});"
+        "globalThis.pocSummary='pending';"
+        "chain.style.opacity='0';})()",
+        16, 40, "starts=6 ends=1 perFrame=1 opacity=0.5");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+/* A negative delay starts a transition part-way through: a 100 ms
+   transition delayed by -80 ms ends 20 ms after the change, and one delayed
+   by the whole duration never runs. Times are scheduler milliseconds after
+   the change, with 10 ms pumps; #v uses the event clock, #o the effect
+   frame (16 ms animation frames, so its times are frame-quantized). */
+static int test_transition_negative_delay(void)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<div id=vp style='transition:visibility 100ms linear 50ms'>a</div>"
+        "<div id=vn style='transition:visibility 100ms linear -80ms'>b</div>"
+        "<div id=vx style='transition:visibility 100ms linear -100ms'>c</div>"
+        "<div id=op style='transition:opacity 100ms linear 50ms'>d</div>"
+        "<div id=on style='transition:opacity 100ms linear -80ms'>e</div>"
+        "<div id=ox style='transition:opacity 100ms linear -100ms'>f</div>"
+        "</body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = true;
+    ok &= transition_expect(&page, "<negative-delay>",
+        "(()=>{const ids=['vp','vn','vx','op','on','ox'],times={},"
+        "t0=__tilefinchNow;"
+        "const done=()=>{globalThis.pocSummary=ids.map(id=>id+':'+"
+        "(times[id]||[]).join('/')).join(' ')};"
+        "for(const id of ids){const node=document.getElementById(id);"
+        "for(const type of ['transitionstart','transitionend'])"
+        "node.addEventListener(type,event=>{(times[id]||(times[id]=[]))"
+        ".push(type.slice(10)+'@'+Math.round(__tilefinchNow-t0)+'e'"
+        "+event.elapsedTime);done()});"
+        "if(id[0]==='v')node.style.visibility='hidden';"
+        "else node.style.opacity='0'}done()})()",
+        10, 30,
+        "vp:start@50e0/end@150e0.1 vn:start@10e0.08/end@20e0.1 vx:"
+        " op:start@80e0/end@180e0.1 on:start@20e0.08/end@40e0.1 ox:");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+/* The stylesheet-transition watcher rescans only elements a batch's changes
+   can reach, but every route a change takes must still start the
+   transition: an ancestor's class (descendant combinator), a preceding
+   sibling's class (sibling combinator), an attribute inside :has() on an
+   element outside the watched subtree, and an ancestor's inline style
+   (inheritance). An attribute no selector can connect to the watched
+   elements snapshots none of them. */
+static int test_transition_watch_scopes(void)
+{
+    static const char html[] =
+        "<!doctype html><style>"
+        ".t{transition:opacity 30ms,visibility 30ms}"
+        "body.dim .a{opacity:.5}"
+        "#flag.on+#list .b{opacity:.4}"
+        "body:has(#u.hot) .c{opacity:.3}"
+        "</style><body><div id=flag></div><div id=list>"
+        "<div id=a class='t a'>a</div><div id=b class='t b'>b</div>"
+        "<div id=c class='t c'>c</div><div id=d class=t>d</div></div>"
+        "<div id=elsewhere><span id=u>u</span></div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = true;
+    ok &= transition_expect(&page, "<watch-scopes-setup>",
+        "(()=>{const log=[];globalThis.__census=()=>"
+        "__tilefinchRootCensus.transitionSnapshots;"
+        "for(const id of ['a','b','c','d'])document.getElementById(id)"
+        ".addEventListener('transitionend',event=>{log.push(id+':'+"
+        "event.propertyName);globalThis.pocSummary=log.sort().join(',')});"
+        "globalThis.pocSummary='watching'})()", 16, 2, "watching");
+    ScriptResult result = {0};
+    ok &= script_runtime_advance(page.runtime, 16, 16, &result);
+    ok &= transition_expect(&page, "<watch-scopes-unrelated>",
+        "(()=>{const before=__census(),u=document.getElementById('u');"
+        "for(let i=0;i<8;i++)u.setAttribute('data-n',String(i));"
+        "Promise.resolve().then(()=>{globalThis.pocSummary="
+        "'unrelated snapshots='+(__census()-before)})})()",
+        16, 0, "unrelated snapshots=0");
+    ok &= transition_expect(&page, "<watch-scopes-ancestor-class>",
+        "document.body.classList.add('dim')", 16, 8, "a:opacity");
+    ok &= transition_expect(&page, "<watch-scopes-sibling-class>",
+        "document.getElementById('flag').classList.add('on')", 16, 8,
+        "a:opacity,b:opacity");
+    ok &= transition_expect(&page, "<watch-scopes-has>",
+        "document.getElementById('u').classList.add('hot')", 16, 8,
+        "a:opacity,b:opacity,c:opacity");
+    ok &= transition_expect(&page, "<watch-scopes-inherited-style>",
+        "document.getElementById('list').style.visibility='hidden'", 16, 8,
+        "a:opacity,a:visibility,b:opacity,b:visibility,c:opacity,"
+        "c:visibility,d:visibility");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+#include <time.h>
+static double transition_profile_now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double) now.tv_sec * 1000.0 + (double) now.tv_nsec / 1e6;
+}
+
+/* Host profile, not a gate: 64 elements that listen for transitionend, then
+   batches of attribute changes, each its own script turn. "unrelated" sets
+   a data attribute outside the watched elements; "ancestor" toggles a class
+   on <body> that no rule names, which still reaches all of them. Reports the
+   snapshots and computed-property reads a batch costs and its host time,
+   against the same page with no listeners. */
+static int profile_transition_watch(void)
+{
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>.t{transition:opacity 200ms}"
+        "body.dim .t{opacity:.5}</style><body><div id=list>");
+    for (unsigned i = 0; i < 64; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<div class=t>%u</div>", i);
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+        "</div><div id=elsewhere><span id=u>u</span></div></body>");
+    static const char *const kinds[] = { "unrelated", "ancestor" };
+    static const char *const changes[] = {
+        "document.getElementById('u').setAttribute('data-n','%u')",
+        "document.body.classList.toggle('x%u')",
+    };
+    for (unsigned kind = 0; kind < 2; kind++)
+    for (unsigned watched = 0; watched < 2; watched++) {
+        TransitionPage page;
+        CHECK(transition_page_open(&page, html, used));
+        ScriptResult result = {0};
+        char setup[256];
+        snprintf(setup, sizeof(setup),
+            "(()=>{if(%u)for(const node of document.querySelectorAll('.t'))"
+            "node.addEventListener('transitionend',()=>{})})()", watched);
+        CHECK(script_runtime_evaluate_diagnostic(page.runtime, setup,
+                                                 "<profile-setup>", &result)
+              && result.success);
+        for (unsigned tick = 0; tick < 4; tick++)
+            CHECK(script_runtime_advance(page.runtime, 16, 16, &result));
+        static const char census[] =
+            "globalThis.pocSummary=(__tilefinchRootCensus.transitionSnapshots"
+            "||0)+' '+(__tilefinchRootCensus.transitionSnapshotReads||0)";
+        CHECK(script_runtime_evaluate_diagnostic(page.runtime, census,
+                                                 "<profile-census>", &result)
+              && result.success);
+        unsigned calls_before = 0, reads_before = 0;
+        CHECK(sscanf(result.summary, "%u %u", &calls_before,
+                     &reads_before) == 2);
+        const unsigned batches = 200;
+        double started = transition_profile_now_ms();
+        for (unsigned batch = 0; batch < batches; batch++) {
+            char source[128];
+            /* Two alternating tokens keep <body>'s class list short. */
+            snprintf(source, sizeof(source), changes[kind],
+                     kind == 0 ? batch : batch % 2u);
+            CHECK(script_runtime_evaluate_diagnostic(page.runtime, source,
+                                                     "<profile-batch>",
+                                                     &result)
+                  && result.success);
+        }
+        double elapsed = transition_profile_now_ms() - started;
+        CHECK(script_runtime_evaluate_diagnostic(page.runtime, census,
+                                                 "<profile-census>", &result)
+              && result.success);
+        unsigned calls = 0, reads = 0;
+        CHECK(sscanf(result.summary, "%u %u", &calls, &reads) == 2);
+        calls -= calls_before;
+        reads -= reads_before;
+        fprintf(stderr, "transition watch profile: %-9s watched=%-2u "
+                "snapshots/batch=%.1f reads/batch=%.1f host ms/batch=%.4f\n",
+                kinds[kind], watched ? 64u : 0u, (double) calls / batches,
+                (double) reads / batches, elapsed / batches);
+        CHECK(transition_page_close(&page));
+    }
     return 0;
 }
 

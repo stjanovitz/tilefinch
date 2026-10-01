@@ -13,9 +13,9 @@ static int grid_relative_line(unsigned encoded, int explicit_tracks)
     return line < 0 ? explicit_tracks + 1 + line : line - 1;
 }
 
-static void grid_axis_extent(unsigned start, unsigned end, unsigned span,
-                             int explicit_tracks, int *minimum_track,
-                             int *maximum_track)
+void grid_axis_extent(unsigned start, unsigned end, unsigned span,
+                      int explicit_tracks, int *minimum_track,
+                      int *maximum_track)
 {
     if (minimum_track == NULL || maximum_track == NULL) return;
     int used_span = span > 0 ? (int) span : 1;
@@ -263,6 +263,183 @@ static void grid_seed_definite_auto_row_contributions(
     }
 }
 
+/* A grid item as laid out, for the fr re-share after layout. */
+typedef struct {
+    int row;
+    int dy;
+    int extent;
+    AlignItems alignment;
+    size_t command_start;
+    size_t link_start;
+    size_t control_start;
+    size_t box_start;
+} GridReshareItem;
+
+#define GRID_RESHARE_ITEM_LIMIT 32
+
+/*
+ * Rows are sized before content-sized rows are measured (only items with a
+ * declared height seed them), so once every item is laid out a definite
+ * grid's rows are resolved again against the final heights and the items
+ * are moved with their rows:
+ *
+ * - Overflowing, its fr rows share the space again, shrinking only and
+ *   never below their minimum or content. chatgpt.com's page grid
+ *   (minmax(4.5rem,1fr) auto 1fr) otherwise pushed its composer onto the
+ *   disclaimer in the last row.
+ * - Underfilled, with align-content normal/stretch and no fr rows, its
+ *   auto rows grow equally to fill it (CSS Grid "stretch auto tracks"), so
+ *   an item aligned to the centre of a one-row icon button is centred.
+ *
+ * End- and centre-aligned items are realigned in a resized row. A
+ * stretched item cannot shrink with its row, so a grid that would shrink
+ * one is left as laid out.
+ */
+static void grid_resolve_final_rows(
+    LayoutContext *context, const ComputedStyle *style,
+    int *row_starts, int *row_extents, int rows,
+    int declared_content_height, int grid_row_origin,
+    int explicit_grid_rows, int declared_grid_rows,
+    uint16_t second_implicit_row,
+    const GridReshareItem *items, size_t item_count)
+{
+    if (rows <= 0 || rows > GRID_PLACEMENT_ROW_LIMIT || item_count == 0)
+        return;
+    int total = row_extents[rows - 1] - row_starts[0];
+    if (total == declared_content_height) return;
+    int heights[GRID_PLACEMENT_ROW_LIMIT];
+    int floors[GRID_PLACEMENT_ROW_LIMIT];
+    unsigned weights[GRID_PLACEMENT_ROW_LIMIT];
+    bool automatic[GRID_PLACEMENT_ROW_LIMIT];
+    bool stretched[GRID_PLACEMENT_ROW_LIMIT];
+    int available = declared_content_height;
+    unsigned total_weight = 0;
+    int automatic_rows = 0;
+    for (int row = 0; row < rows; row++) {
+        heights[row] = row_extents[row] - row_starts[row];
+        floors[row] = 0;
+        weights[row] = 0;
+        stretched[row] = false;
+        if (row > 0) available -= row_starts[row] - row_extents[row - 1];
+        int explicit_row = row - grid_row_origin;
+        uint8_t type = GRID_TRACK_AUTO;
+        unsigned value = 0;
+        if (explicit_row >= 0 && explicit_row < explicit_grid_rows) {
+            grid_defined_row_track(
+                context->sheet, style, (unsigned) explicit_row,
+                (unsigned) declared_grid_rows, second_implicit_row,
+                &type, &value);
+        } else {
+            int implicit = explicit_row < 0
+                ? explicit_row : explicit_row - explicit_grid_rows;
+            bool second = second_implicit_row != 0 && (implicit & 1) != 0;
+            type = second ? (uint8_t) (second_implicit_row >> 14)
+                          : style->grid_auto_row_type;
+            value = second ? second_implicit_row & 0x3fffu
+                           : style->grid_auto_row_value;
+        }
+        automatic[row] = type == GRID_TRACK_AUTO;
+        if (automatic[row]) automatic_rows++;
+        if (type == GRID_TRACK_FLEX && value != 0) {
+            weights[row] = value;
+            total_weight += value;
+            if (explicit_row >= 0 && explicit_row < explicit_grid_rows)
+                floors[row] = (int) stylesheet_grid_track_minimum(
+                    context->sheet, style, true, (unsigned) explicit_row);
+        } else {
+            available -= heights[row];
+        }
+    }
+    for (size_t i = 0; i < item_count; i++) {
+        const GridReshareItem *item = &items[i];
+        if (item->extent > floors[item->row])
+            floors[item->row] = item->extent;
+        if (item->alignment == ALIGN_STRETCH) stretched[item->row] = true;
+    }
+    int resized[GRID_PLACEMENT_ROW_LIMIT];
+    for (int row = 0; row < rows; row++) resized[row] = heights[row];
+    bool changed = false;
+    if (total > declared_content_height && total_weight != 0) {
+        if (available < 0) available = 0;
+        bool floored[GRID_PLACEMENT_ROW_LIMIT] = {false};
+        unsigned sharing_weight = total_weight;
+        int sharing_space = available;
+        for (int pass = 0; pass < rows; pass++) {
+            bool froze = false;
+            for (int row = 0; row < rows; row++) {
+                if (weights[row] == 0 || floored[row]
+                    || sharing_weight == 0) continue;
+                if ((int64_t) floors[row] * sharing_weight
+                        <= (int64_t) sharing_space * weights[row]) continue;
+                floored[row] = true;
+                sharing_space -= floors[row];
+                if (sharing_space < 0) sharing_space = 0;
+                sharing_weight -= weights[row];
+                froze = true;
+            }
+            if (!froze) break;
+        }
+        for (int row = 0; row < rows; row++) {
+            if (weights[row] == 0) continue;
+            int share = floored[row] || sharing_weight == 0 ? floors[row]
+                : tilefinch_mul_div_int(sharing_space, (int) weights[row],
+                                        (int) sharing_weight);
+            if (share < floors[row]) share = floors[row];
+            if (share < heights[row]) {
+                if (stretched[row]) return;
+                resized[row] = share;
+                changed = true;
+            }
+        }
+    } else if (total < declared_content_height && total_weight == 0
+               && automatic_rows != 0
+               && style->align_content == JUSTIFY_STRETCH) {
+        int free_space = declared_content_height - total;
+        int remaining = free_space;
+        for (int row = 0; row < rows; row++) {
+            if (!automatic[row]) continue;
+            int grow = free_space / automatic_rows;
+            if (remaining > grow * automatic_rows) {
+                grow++;
+                remaining--;
+            }
+            resized[row] += grow;
+            changed = true;
+        }
+    }
+    if (!changed) return;
+    int starts[GRID_PLACEMENT_ROW_LIMIT];
+    starts[0] = row_starts[0];
+    for (int row = 1; row < rows; row++) {
+        starts[row] = starts[row - 1] + resized[row - 1]
+            + (row_starts[row] - row_extents[row - 1]);
+    }
+    int applied = 0;
+    for (size_t i = 0; i < item_count; i++) {
+        const GridReshareItem *item = &items[i];
+        int dy = item->dy;
+        if (resized[item->row] != heights[item->row]) {
+            int free_space = resized[item->row] - item->extent;
+            if (free_space < 0) free_space = 0;
+            if (item->alignment == ALIGN_END) dy = free_space;
+            else if (item->alignment == ALIGN_CENTER) dy = free_space / 2;
+        }
+        int needed = starts[item->row] - row_starts[item->row]
+            + dy - item->dy;
+        if (needed != applied) {
+            layout_translate_range(
+                context->layout, item->command_start, item->link_start,
+                item->control_start, item->box_start, 0, needed - applied,
+                "grid-final-rows", NULL);
+            applied = needed;
+        }
+    }
+    for (int row = 0; row < rows; row++) {
+        row_starts[row] = starts[row];
+        row_extents[row] = starts[row] + resized[row];
+    }
+}
+
 bool layout_block_grid_section(LayoutContext *context,
                                const LayoutBlockFrame *frame)
 {
@@ -372,6 +549,11 @@ bool layout_block_grid_section(LayoutContext *context,
             columns = (content_width + grid_column_gap)
                       / (style->grid_min_column_width + grid_column_gap);
         }
+        /* Column tracks that really exist. A grid whose only children are
+           absolutely positioned has none, but layout still runs one
+           placeholder column; an out-of-flow item must not take that
+           zero-width placeholder as its grid area. */
+        int track_columns = columns;
         if (columns < 1) columns = 1;
         int placement_rows = grid_max_row - grid_min_row;
         if (placement_rows < 1) placement_rows = 1;
@@ -769,7 +951,13 @@ bool layout_block_grid_section(LayoutContext *context,
                 }
             }
         } else if (remaining > 0
-                   && style->justify_content == JUSTIFY_STRETCH) {
+                   && (style->justify_content == JUSTIFY_STRETCH
+                       /* The initial "normal" behaves as stretch for grid
+                          (CSS Box Alignment 5.1): auto tracks fill the
+                          container. Without it a grid's single auto column
+                          shrank to its content (ChatGPT's 456px composer
+                          column rendered 328px wide). */
+                       || style->justify_content == JUSTIFY_START)) {
             int automatic = 0;
             for (int column = 0; column < columns; column++) {
                 if (grid_track_stretches(
@@ -902,7 +1090,10 @@ bool layout_block_grid_section(LayoutContext *context,
                     context->sheet, style, true, row);
                 if (minimum != 0) {
                     row_track_heights[row] = (int) minimum;
-                    fixed_space += row_track_heights[row];
+                    /* A flexible row's minimum is a floor on its share of
+                       the free space, not space taken before sharing. */
+                    if (type != GRID_TRACK_FLEX)
+                        fixed_space += row_track_heights[row];
                 }
                 if (type == GRID_TRACK_FIXED) {
                     row_track_heights[row] = (int) value;
@@ -929,30 +1120,69 @@ bool layout_block_grid_section(LayoutContext *context,
             int flex_space = row_available - fixed_space;
             if (flex_space < 0) flex_space = 0;
             if (flex_track_space_definite && flex_rows != 0) {
+                /* CSS Grid "find the size of an fr": a flexible row whose
+                   minimum exceeds its share keeps the minimum and leaves
+                   the sharing, and the rest re-share what remains. Each
+                   pass freezes at least one row, so explicit_rows passes
+                   suffice. */
+                bool floored[GRID_PLACEMENT_ROW_LIMIT] = {false};
+                unsigned sharing_weight = flex_rows;
+                int sharing_space = flex_space;
+                for (unsigned pass = 0; pass < explicit_rows; pass++) {
+                    bool froze = false;
+                    for (unsigned row = 0; row < explicit_rows
+                         && row < GRID_PLACEMENT_ROW_LIMIT; row++) {
+                        uint8_t type = GRID_TRACK_AUTO;
+                        unsigned value = 0;
+                        grid_defined_row_track(
+                            context->sheet, style, row,
+                            (unsigned) declared_grid_rows,
+                            second_implicit_row, &type, &value);
+                        if (type != GRID_TRACK_FLEX || value == 0
+                            || floored[row] || sharing_weight == 0)
+                            continue;
+                        unsigned minimum = stylesheet_grid_track_minimum(
+                            context->sheet, style, true, row);
+                        if (minimum == 0
+                            || (int64_t) minimum * sharing_weight
+                                   <= (int64_t) sharing_space * value)
+                            continue;
+                        floored[row] = true;
+                        row_track_heights[row] = (int) minimum;
+                        sharing_space -= (int) minimum;
+                        if (sharing_space < 0) sharing_space = 0;
+                        sharing_weight -= value;
+                        froze = true;
+                    }
+                    if (!froze) break;
+                }
                 int distributed = 0;
-                for (unsigned row = 0; row < explicit_rows; row++) {
+                for (unsigned row = 0; row < explicit_rows
+                     && row < GRID_PLACEMENT_ROW_LIMIT; row++) {
                     uint8_t type = GRID_TRACK_AUTO;
                     unsigned value = 0;
                     grid_defined_row_track(
                         context->sheet, style, row,
                         (unsigned) declared_grid_rows,
                         second_implicit_row, &type, &value);
-                    if (type != GRID_TRACK_FLEX) continue;
+                    if (type != GRID_TRACK_FLEX || floored[row]) continue;
                     unsigned weight = value;
-                    if (weight == 0) continue;
+                    if (weight == 0 || sharing_weight == 0) continue;
                     row_track_heights[row] = tilefinch_mul_div_int(
-                        flex_space, (int) weight, (int) flex_rows);
+                        sharing_space, (int) weight, (int) sharing_weight);
                     distributed += row_track_heights[row];
                 }
-                for (unsigned row = 0; distributed < flex_space
-                                          && row < explicit_rows; row++) {
+                for (unsigned row = 0; distributed < sharing_space
+                     && row < explicit_rows
+                     && row < GRID_PLACEMENT_ROW_LIMIT; row++) {
                     uint8_t type = GRID_TRACK_AUTO;
                     unsigned value = 0;
                     grid_defined_row_track(
                         context->sheet, style, row,
                         (unsigned) declared_grid_rows,
                         second_implicit_row, &type, &value);
-                    if (type == GRID_TRACK_FLEX && value != 0) {
+                    if (type == GRID_TRACK_FLEX && value != 0
+                        && !floored[row]) {
                         row_track_heights[row]++;
                         distributed++;
                     }
@@ -1071,14 +1301,19 @@ bool layout_block_grid_section(LayoutContext *context,
                     &positioned_item->style);
                 int column_end = computed_style_grid_column_end(
                     &positioned_item->style);
+                /* Lines that do not exist resolve to auto: the padding
+                   edge of the grid container (CSS Grid 11.1). ChatGPT's
+                   header is the sole, absolutely positioned child of a
+                   rows-only grid; it was laid out in a 0px placeholder
+                   column and collapsed to its own padding. */
                 if (column_start > 0
                     && column_start != COMPUTED_GRID_LINE_LAST
-                    && column_start <= columns) {
+                    && column_start <= track_columns) {
                     int first = column_start - 1;
                     int last = column_end > column_start
                                && column_end != COMPUTED_GRID_LINE_LAST
                         ? column_end - 1 : first + 1;
-                    if (last > columns) last = columns;
+                    if (last > track_columns) last = track_columns;
                     area_x = track_starts[first];
                     area_width = 0;
                     for (int column = first; column < last; column++) {
@@ -1132,6 +1367,13 @@ bool layout_block_grid_section(LayoutContext *context,
         placement_state.row_origin = (uint8_t) grid_row_origin;
         FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
         FlatItem *item = &scratch->traversal.flex.item;
+        /* Latest row that already holds a laid-out item: rows after it can
+           still move down when an earlier fr row grows to its content. */
+        int laid_out_row = -1;
+        GridReshareItem reshare_items[GRID_RESHARE_ITEM_LIMIT];
+        size_t reshare_count = 0;
+        bool reshare_possible = !inherited_grid_rows
+            && flex_track_space_definite;
         flex_iterator_init(iterator, context, node, style, grid_order);
         while (flex_iterator_next(iterator, item)) {
             grid_resolve_item_placement(
@@ -1164,6 +1406,7 @@ bool layout_block_grid_section(LayoutContext *context,
             int child_x = track_starts[column];
             int child_bottom = row_top;
             if (item->anonymous_text) {
+                reshare_possible = false;
                 if (!layout_anonymous_text(context, item, node, child_x,
                                            row_top, assigned_cell_width,
                                            &child_bottom)) {
@@ -1418,11 +1661,33 @@ bool layout_block_grid_section(LayoutContext *context,
                     }
                     context->assigned_grid_tracks = assigned;
                 }
+                bool saved_assigned_minimum = context->assigned_grid_minimum;
+                context->assigned_grid_minimum = false;
                 if (definite_cell_height
                     && item_alignment == ALIGN_STRETCH) {
                     context->assigned_grid_node = item->node;
                     context->assigned_grid_height = assigned_cell_height;
                     context->assigned_grid_height_valid = true;
+                    /* In a row that can still grow (a single-row fr item
+                       with no laid-out item in a later row), let content
+                       extend the stretched item so the row grows below. */
+                    int stretch_explicit_row = grid_row - grid_row_origin;
+                    uint8_t stretch_row_type = GRID_TRACK_AUTO;
+                    unsigned stretch_row_value = 0;
+                    if (stretch_explicit_row >= 0
+                        && stretch_explicit_row < explicit_grid_rows) {
+                        grid_defined_row_track(
+                            context->sheet, style,
+                            (unsigned) stretch_explicit_row,
+                            (unsigned) declared_grid_rows,
+                            second_implicit_row, &stretch_row_type,
+                            &stretch_row_value);
+                    }
+                    context->assigned_grid_minimum =
+                        stretch_row_type == GRID_TRACK_FLEX
+                        && stretch_row_value != 0
+                        && item_placement.row_span == 1
+                        && laid_out_row <= grid_row;
                 }
                 bool child_ok = layout_block(
                     context, item->node, &item->parent_style,
@@ -1434,6 +1699,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 context->assigned_grid_height = saved_assigned_height;
                 context->assigned_grid_height_valid =
                     saved_assigned_height_valid;
+                context->assigned_grid_minimum = saved_assigned_minimum;
                 context->assigned_grid_tracks = saved_assigned_tracks;
                 if (!child_ok) {
                     flex_order_plan_destroy(grid_order);
@@ -1441,6 +1707,8 @@ bool layout_block_grid_section(LayoutContext *context,
                 }
                 const LayoutNodeBox *item_box = layout_box_for_node(
                     context->layout, item->node);
+                int item_dy = 0;
+                if (item_box == NULL) reshare_possible = false;
                 if (item_box != NULL) {
                     int dx = 0;
                     int dy = 0;
@@ -1477,6 +1745,28 @@ bool layout_block_grid_section(LayoutContext *context,
                         child_bottom = layout_add_coordinate(
                             child_bottom, dy);
                     }
+                    item_dy = dy;
+                }
+                if (reshare_possible
+                    && (reshare_count == GRID_RESHARE_ITEM_LIMIT
+                        || item_placement.row_span != 1
+                        || grid_row >= GRID_PLACEMENT_ROW_LIMIT
+                        || (reshare_count != 0
+                            && grid_row
+                                < reshare_items[reshare_count - 1].row))) {
+                    reshare_possible = false;
+                }
+                if (reshare_possible) {
+                    reshare_items[reshare_count++] = (GridReshareItem) {
+                        .row = grid_row,
+                        .dy = item_dy,
+                        .extent = child_bottom - item_dy - row_top,
+                        .alignment = item_alignment,
+                        .command_start = item_command_start,
+                        .link_start = item_link_start,
+                        .control_start = item_control_start,
+                        .box_start = item_box_start
+                    };
                 }
             }
             int explicit_row = grid_row - grid_row_origin;
@@ -1493,9 +1783,51 @@ bool layout_block_grid_section(LayoutContext *context,
             if (row_track_heights[grid_row] <= 0
                 && !collapsed_flex_track
                 && child_bottom > row_extents[grid_row]) {
+                int grown = child_bottom - row_extents[grid_row];
                 row_extents[grid_row] = child_bottom;
+                /* Explicit rows were positioned before any content was
+                   measured. A content-sized row that grows must push the
+                   later rows down, as a growing fr row does below, or the
+                   next row's items land on top of it. */
+                if (item_placement.row_span == 1
+                    && laid_out_row <= grid_row) {
+                    for (int later = grid_row + 1; later < initialized_rows;
+                         later++) {
+                        row_starts[later] =
+                            layout_add_coordinate(row_starts[later], grown);
+                        row_extents[later] =
+                            layout_add_coordinate(row_extents[later], grown);
+                    }
+                }
+            } else if (row_type == GRID_TRACK_FLEX && !collapsed_flex_track
+                       && item_placement.row_span == 1
+                       && laid_out_row <= grid_row
+                       && child_bottom > row_extents[grid_row]) {
+                /* An fr row is minmax(auto, <flex>): it is never shorter
+                   than its content (CSS Grid 7.2.4). Its share of the free
+                   space was fixed before content was measured, so grow it
+                   now and move the later rows, none of which holds a
+                   laid-out item yet. ChatGPT's auto/1fr/auto page grid
+                   otherwise drew its disclaimer (row 3) over the composer
+                   whenever the middle row's content outgrew its share. */
+                int grown = child_bottom - row_extents[grid_row];
+                row_extents[grid_row] = child_bottom;
+                for (int later = grid_row + 1; later < initialized_rows;
+                     later++) {
+                    row_starts[later] =
+                        layout_add_coordinate(row_starts[later], grown);
+                    row_extents[later] =
+                        layout_add_coordinate(row_extents[later], grown);
+                }
             }
+            if (grid_row > laid_out_row) laid_out_row = grid_row;
         }
+        if (reshare_possible)
+            grid_resolve_final_rows(
+                context, style, row_starts, row_extents, initialized_rows,
+                declared_content_height, grid_row_origin,
+                explicit_grid_rows, declared_grid_rows,
+                second_implicit_row, reshare_items, reshare_count);
         int grid_bottom = line->y;
         for (int row = 0; row < initialized_rows; row++) {
             if (row_extents[row] > grid_bottom) {

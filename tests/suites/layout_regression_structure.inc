@@ -227,6 +227,137 @@
     tile_cache_destroy(&bounded_before_cache);
     budget_free(&budget, bounded_before_frame);
 
+    puts("test: an fr row grows to its content and moves later rows");
+    static const char fr_grid_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#g{display:grid;width:300px;height:200px;"
+        "grid-template-rows:auto 1fr auto}"
+        "#a{height:50px}#b{height:150px}#c{height:30px}</style><body>"
+        "<div id=g><div id=a></div><div id=b></div><div id=c></div></div>"
+        "</body>";
+    PocDocument fr_grid_document;
+    Stylesheet fr_grid_sheet;
+    LayoutDocument fr_grid_layout;
+    CHECK(document_parse(&fr_grid_document, &budget, fr_grid_page,
+                         strlen(fr_grid_page), 47)
+          && stylesheet_build(&fr_grid_sheet, &budget, &fr_grid_document,
+                              480)
+          && layout_build(&fr_grid_layout, &budget, &fr_grid_document,
+                          &fr_grid_sheet, NULL, NULL, 480));
+    const LayoutNodeBox *fr_last = layout_box_for_node(
+        &fr_grid_layout,
+        find_id(lxb_dom_interface_node(fr_grid_document.html), "c"));
+    CHECK(fr_last != NULL && fr_last->y == 200);
+    layout_destroy(&fr_grid_layout);
+    stylesheet_destroy(&fr_grid_sheet);
+    document_destroy(&fr_grid_document);
+
+    puts("test: grid auto tracks stretch under justify-content normal");
+    /* normal (the initial value) stretches a grid's auto tracks; an
+       explicit start does not. The single auto column of ChatGPT's main
+       column grid shrank to its content without this. */
+    static const char stretch_grid_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        ".g{display:grid;width:300px}.s{justify-content:start}"
+        ".c{height:10px}</style><body>"
+        "<div class=g><div id=normal-item class=c>x</div></div>"
+        "<div class='g s'><div id=start-item class=c>x</div></div>"
+        "</body>";
+    PocDocument stretch_grid_document;
+    Stylesheet stretch_grid_sheet;
+    LayoutDocument stretch_grid_layout;
+    CHECK(document_parse(&stretch_grid_document, &budget, stretch_grid_page,
+                         strlen(stretch_grid_page), 46)
+          && stylesheet_build(&stretch_grid_sheet, &budget,
+                              &stretch_grid_document, 480)
+          && layout_build(&stretch_grid_layout, &budget,
+                          &stretch_grid_document, &stretch_grid_sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *stretch_grid_root =
+        lxb_dom_interface_node(stretch_grid_document.html);
+    const LayoutNodeBox *stretch_normal = layout_box_for_node(
+        &stretch_grid_layout, find_id(stretch_grid_root, "normal-item"));
+    const LayoutNodeBox *stretch_start = layout_box_for_node(
+        &stretch_grid_layout, find_id(stretch_grid_root, "start-item"));
+    CHECK(stretch_normal != NULL && stretch_start != NULL
+          && stretch_normal->width == 300 && stretch_start->width < 60);
+    layout_destroy(&stretch_grid_layout);
+    stylesheet_destroy(&stretch_grid_sheet);
+    document_destroy(&stretch_grid_document);
+
+    puts("test: absolutely positioned grid item without column tracks");
+    /* A rows-only grid whose sole child is absolutely positioned has no
+       column tracks, so grid-column:1 names a line that does not exist and
+       resolves to the container's padding edge (ChatGPT's header). */
+    static const char abspos_grid_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#frame{display:grid;grid-template-rows:auto 1fr auto;"
+        "position:relative;width:300px;height:100px}"
+        "#bar{position:absolute;grid-column:1;grid-row:1;width:100%;"
+        "inset-inline:0;top:0;padding:0 16px;box-sizing:border-box;"
+        "height:20px}</style><body><div id=frame><div id=bar></div></div>"
+        "</body>";
+    PocDocument abspos_grid_document;
+    Stylesheet abspos_grid_sheet;
+    LayoutDocument abspos_grid_layout;
+    CHECK(document_parse(&abspos_grid_document, &budget, abspos_grid_page,
+                         strlen(abspos_grid_page), 45)
+          && stylesheet_build(&abspos_grid_sheet, &budget,
+                              &abspos_grid_document, 480)
+          && layout_build(&abspos_grid_layout, &budget,
+                          &abspos_grid_document, &abspos_grid_sheet,
+                          NULL, NULL, 480));
+    const LayoutNodeBox *abspos_grid_bar = layout_box_for_node(
+        &abspos_grid_layout,
+        find_id(lxb_dom_interface_node(abspos_grid_document.html), "bar"));
+    CHECK(abspos_grid_bar != NULL && abspos_grid_bar->x == 0
+          && abspos_grid_bar->width == 300);
+    layout_destroy(&abspos_grid_layout);
+    stylesheet_destroy(&abspos_grid_sheet);
+    document_destroy(&abspos_grid_document);
+
+    puts("test: shrink-wrapped grid sizes its implicit columns");
+    /* No grid-template-columns, one item at grid-area 1/1 and one at
+       grid-column 2 (Cloudflare Turnstile's checkbox label). The grid's
+       max-content width once counted only the explicit column, so the
+       label in the implicit second column wrapped. */
+    static const char implicit_grid_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0;"
+        "font:14px sans-serif}"
+        "#row{display:flex;width:420px}#grid{display:grid}"
+        "#mark{grid-area:1/1;display:block;width:24px;height:24px}"
+        "#label{grid-column:2;margin-left:8px;display:block}"
+        "#ref{display:inline-block}"
+        "</style><body><div id=row><div id=grid><span id=mark></span>"
+        "<span id=label>Verify you are human</span></div><div>LOGO</div>"
+        "</div><span id=ref>Verify you are human</span></body>";
+    PocDocument implicit_grid_document;
+    Stylesheet implicit_grid_sheet;
+    LayoutDocument implicit_grid_layout;
+    CHECK(document_parse(&implicit_grid_document, &budget,
+                         implicit_grid_page,
+                         strlen(implicit_grid_page), 44)
+          && stylesheet_build(&implicit_grid_sheet, &budget,
+                              &implicit_grid_document, 480)
+          && layout_build(&implicit_grid_layout, &budget,
+                          &implicit_grid_document,
+                          &implicit_grid_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *implicit_grid_root =
+        lxb_dom_interface_node(implicit_grid_document.html);
+    const LayoutNodeBox *implicit_label = layout_box_for_node(
+        &implicit_grid_layout, find_id(implicit_grid_root, "label"));
+    const LayoutNodeBox *implicit_ref = layout_box_for_node(
+        &implicit_grid_layout, find_id(implicit_grid_root, "ref"));
+    const LayoutNodeBox *shrink_grid_box = layout_box_for_node(
+        &implicit_grid_layout, find_id(implicit_grid_root, "grid"));
+    CHECK(implicit_label != NULL && implicit_ref != NULL
+          && shrink_grid_box != NULL);
+    CHECK(implicit_label->height == implicit_ref->height
+          && shrink_grid_box->width >= 24 + 8 + implicit_ref->width - 1);
+    layout_destroy(&implicit_grid_layout);
+    stylesheet_destroy(&implicit_grid_sheet);
+    document_destroy(&implicit_grid_document);
+
     puts("test: fixed percentage width uses viewport containing block");
     static const char fixed_percent_page[] =
         "<!doctype html><style>html,body{margin:0;padding:0}"

@@ -66,6 +66,11 @@ int tls_session_store_add(TlsSessionStore *store, const char *key,
                           int64_t valid_until, int32_t ietf_tls_id,
                           int64_t now, uint64_t last_use);
 
+/* Whether an entry with exactly this key and blob is already stored. A
+ * repeated export of an unchanged session cache adds nothing. */
+int tls_session_store_contains(const TlsSessionStore *store, const char *key,
+                               const unsigned char *blob, size_t blob_length);
+
 /* Replays live entries oldest-last_use first. When now > 0, expired and
  * far-future entries are skipped. Returns the number of entries visited. */
 typedef void (*TlsSessionImportFn)(void *context, const char *key,

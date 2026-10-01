@@ -59,6 +59,7 @@
     trustedMapEntries = Function.call.bind(Map.prototype.entries),
     trustedSetValues = Function.call.bind(Set.prototype.values),
     trustedSetAdd = Function.call.bind(Set.prototype.add),
+    trustedSetHas = Function.call.bind(Set.prototype.has),
     trustedDateTime = Function.call.bind(Date.prototype.getTime),
     trustedRegExpSource = Function.call.bind(
       Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get,
@@ -357,19 +358,39 @@
           !/::part\([^)]*\):(is|where)\(\s*\[/i.test(selector)
         );
       };
-    /* Validation is a dozen regular expressions and a character scan, far
-       more than the native match; pages ask the same few selectors
+    /* Validation is a dozen regular expressions and three character scans,
+       far more than the native match; pages ask the same few selectors
        repeatedly (closest() once per ancestor). Remember recent valid
-       ones; an invalid selector is re-checked and throws every time. */
+       ones, dropping the oldest, so a page that also builds one-off
+       selectors (per-id attribute lookups) does not flush the common ones;
+       an invalid selector is re-checked and throws every time. */
     const validSelectors = new Set(),
-      validSelectorLimit = 64;
+      validSelectorLimit = 256,
+      /* Plain selectors -- type, #id, .class and [attr] / [attr=value]
+         compounds joined by descendant, >, +, ~ or commas, with identifiers
+         that cannot start with a digit and no pseudo-classes or escapes --
+         are valid by construction: one native test instead of the scans.
+         Anything else takes the full check. */
+      plainIdent = String.raw`-?[A-Za-z_][\w-]*`,
+      plainAttribute = String.raw`\[\s*` + plainIdent +
+        String.raw`\s*(?:[~|^$*]?=\s*(?:"[^"\\\n]*"|'[^'\\\n]*'|` +
+        plainIdent + String.raw`)\s*)?\]`,
+      plainSubclass = "(?:[#.]" + plainIdent + "|" + plainAttribute + ")",
+      plainCompound = "(?:(?:" + plainIdent + String.raw`|\*)` +
+        plainSubclass + "*|" + plainSubclass + "+)",
+      plainComplex = plainCompound + String.raw`(?:\s*[>+~]\s*` +
+        plainCompound + String.raw`|\s+` + plainCompound + ")*",
+      plainSelector = new RegExp(String.raw`^\s*` + plainComplex +
+        String.raw`(?:\s*,\s*` + plainComplex + String.raw`)*\s*$`);
     globalThis.__tilefinchAssertSelector = (value) => {
       value = String(value);
       if (validSelectors.has(value)) return value;
-      if (!selectorSyntaxValid(value))
+      if (!(value.length <= 256 && plainSelector.test(value)) &&
+          !selectorSyntaxValid(value))
         throw new DOMException("Invalid selector", "SyntaxError");
       if (value.length <= 256) {
-        if (validSelectors.size >= validSelectorLimit) validSelectors.clear();
+        if (validSelectors.size >= validSelectorLimit)
+          validSelectors.delete(validSelectors.values().next().value);
         validSelectors.add(value);
       }
       return value;
@@ -545,13 +566,42 @@
           return candidate.children.some((child) => sameElement(child, origin));
         return false;
       },
+      /* Selectors matchesValidSelector answers in script, not natively. */
+      scriptMatchedSelectors = new Set([
+        ":defined", ":not(:defined)", ":invalid", ":valid", ":disabled",
+        ":enabled",
+      ]),
       wrappedElementClosest = function closest(value) {
         value = __tilefinchAssertSelector(value);
         const scoped = value.includes(":scope"),
           compact = value.replace(/\s+/g, "").toLowerCase(),
           trimmed = value.trim();
+        let start = this;
+        /* Native walk: one prepared selector and a wrapper only for the
+           result, instead of a wrapper and a selector parse per ancestor.
+           Script-side trees and script-answered selectors keep the loop. */
+        if (
+          !scoped &&
+          !scriptMatchedSelectors.has(compact) &&
+          !scriptMatchedSelectors.has(trimmed) &&
+          !globalThis.__tilefinchHasRemoteNodeWriter &&
+          !this.__tilefinchDetachedParent &&
+          Number(this.__handle) > 0 &&
+          !globalThis.__tilefinchIsVirtualRemote?.(this)
+        ) {
+          const found = Number(__tilefinchClosest(this.__handle, value));
+          if (found === Number(this.__handle)) return this;
+          if (found > 0)
+            return globalThis.__tilefinchCanonicalElement(wrap(found));
+          if (found === 0) return null;
+          /* A parentless native root: continue through its script-side
+             detached parent, as parentElement would. */
+          const parent = wrap(-found)?.__tilefinchDetachedParent;
+          if (!(parent instanceof Element)) return null;
+          start = parent;
+        }
         for (
-          let at = this, steps = 0;
+          let at = start, steps = 0;
           at && steps < ancestorLimit;
           at = at.parentElement, steps++
         )
@@ -834,25 +884,10 @@
   };
   globalThis.__tilefinchRefreshNamedProperties();
   const urlSearchParamLimit = 8192,
-    tilefinchUSVString = (value) => {
-      const text = String(value);
-      let output = "",
-        start = 0;
-      for (let index = 0; index < text.length; index++) {
-        const unit = text.charCodeAt(index);
-        if (unit >= 0xd800 && unit <= 0xdbff) {
-          const next = index + 1 < text.length
-            ? text.charCodeAt(index + 1) : 0;
-          if (next >= 0xdc00 && next <= 0xdfff) {
-            index++;
-            continue;
-          }
-        } else if (unit < 0xdc00 || unit > 0xdfff) continue;
-        output += text.slice(start, index) + "\ufffd";
-        start = index + 1;
-      }
-      return start ? output + text.slice(start) : text;
-    },
+    /* Web IDL USVString: lone surrogates become U+FFFD, pairs are kept.
+       The intrinsic scans natively and returns a well-formed (or 8-bit)
+       string unchanged. */
+    tilefinchUSVString = (value) => trustedStringToWellFormed(String(value)),
     appendURLParamUTF8 = (bytes, codePoint) => {
       if (codePoint <= 0x7f) bytes.push(codePoint);
       else if (codePoint <= 0x7ff)
@@ -928,8 +963,13 @@
       return output;
     },
     decodeURLParam = (value) => {
-      const text = tilefinchUSVString(value).replace(/\+/g, " "),
-        bytes = [];
+      const text = tilefinchUSVString(value).replace(/\+/g, " ");
+      /* Unescaped ASCII is already its decoded UTF-8 representation. Keep
+         the byte ceiling exact; non-ASCII and percent escapes use the
+         bounded decoder below, including malformed UTF-8 replacement. */
+      if (text.length <= 256 * 1024 && !/[%\x80-\uffff]/.test(text))
+        return text;
+      const bytes = [];
       for (let index = 0; index < text.length;) {
         const firstHex = text.charCodeAt(index) === 0x25 && index + 2 < text.length
             ? urlParamHex(text.charCodeAt(index + 1)) : -1,
@@ -1401,6 +1441,28 @@
       0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
       0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
     ];
+    /* Length of a trailing UTF-8 sequence that is a valid prefix still
+       missing bytes (0 when the input ends on a boundary or the tail is
+       invalid, which the decoder reports as usual). */
+    const utf8IncompleteTailLength = (bytes) => {
+      const length = bytes.length;
+      for (let back = 1; back <= 3 && back <= length; back++) {
+        const lead = bytes[length - back];
+        if ((lead & 0xc0) === 0x80) continue;
+        const need = lead >= 0xc2 && lead <= 0xdf ? 1
+          : lead >= 0xe0 && lead <= 0xef ? 2
+          : lead >= 0xf0 && lead <= 0xf4 ? 3 : 0;
+        if (need < back) return 0;
+        if (back >= 2) {
+          const second = bytes[length - back + 1];
+          const lower = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
+          const upper = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
+          if (second < lower || second > upper) return 0;
+        }
+        return back;
+      }
+      return 0;
+    };
     globalThis.TextDecoder = class TextDecoder {
       constructor(label = "utf-8", options = {}) {
         const labelText = trustedString(label);
@@ -1483,6 +1545,29 @@
             bytes, !this.ignoreBOM && !this._bomSeen);
           if (decoded !== null) {
             this._bomSeen = false;
+            return decoded;
+          }
+        } else if (decodeUtf8ValidNative) {
+          /* Streamed chunks: decode the complete, valid prefix natively and
+             carry a trailing sequence that is a valid but unfinished prefix
+             to the next call, as the loop below would. Anything invalid
+             falls through to the loop, so replacement characters and fatal
+             errors appear in the same call as before. */
+          const cut = stream
+            ? bytes.length - utf8IncompleteTailLength(bytes)
+            : bytes.length;
+          const decoded = cut === 0
+            ? ""
+            : decodeUtf8ValidNative(
+                cut === bytes.length ? bytes : bytes.subarray(0, cut),
+                !this.ignoreBOM && !this._bomSeen);
+          if (decoded !== null) {
+            if (stream) {
+              if (cut !== 0) this._bomSeen = true;
+              if (cut !== bytes.length) this._pending = bytes.slice(cut);
+            } else {
+              this._bomSeen = false;
+            }
             return decoded;
           }
         }
@@ -1766,6 +1851,8 @@
   const nativeParserFormOwner = globalThis.__tilefinchParserFormOwner,
     nativeHasParserFormOwners =
       globalThis.__tilefinchHasParserFormOwners,
+    nativeDomVersion = globalThis.__tilefinchDomVersion,
+    formControlCache = new WeakMap(),
     parserFormOwner = (control) => {
       if (!control?.isConnected || control.__handle === undefined)
         return null;
@@ -1782,64 +1869,72 @@
       }
       return parserFormOwner(control) || control?.closest?.("form") || null;
     },
+    /* HTML "listed elements" (image inputs excluded) owned by `form`, in
+       tree order. The native selector engine finds the candidates, so only
+       controls pay for the owner check; walking every descendant through
+       script cost chatgpt.com 6 ms per access on the host (its composer
+       reads form.elements.namedItem() on every update). */
+    listedControlSelector =
+      "button,fieldset,input,object,output,select,textarea",
     formControls = (form) => {
     const values = [],
       seen = new Set(),
       fieldsetOwner = form instanceof HTMLFieldSetElement,
-      append = (child) => {
-        if (seen.has(child)) return;
-        const tag = String(child.tagName || "").toLowerCase(),
-          internals =
-            globalThis.__tilefinchElementInternalsFor?.(child),
-          formAssociated =
-            globalThis.__tilefinchFormAssociatedCustomElement?.(child),
-          formAttribute = child.getAttribute?.("form"),
-          owner = internals
-            ? (() => {
-                try {
-                  return internals.form;
-                } catch (_) {
-                  return null;
-                }
-              })()
-            : formAssociated
-              ? formAttribute
-                ? document.getElementById(formAttribute)
-                : child.closest?.("form")
-            : nativeFormOwner(child);
-        if (
-          (fieldsetOwner || owner === form) &&
-          (tag === "input" ||
-            tag === "textarea" ||
-            tag === "select" ||
-            tag === "button" ||
-            tag === "output" ||
-            !!formAssociated)
-        ) {
-          seen.add(child);
-          values.push(child);
+      customSelector =
+        globalThis.__tilefinchFormAssociatedSelector?.() || "",
+      ownerOf = (child) => {
+        const internals =
+          globalThis.__tilefinchElementInternalsFor?.(child);
+        if (internals) {
+          try {
+            return internals.form;
+          } catch (_) {
+            return null;
+          }
         }
-      };
-    const walk = (node) => {
-      for (const child of node?.children || []) {
-        append(child);
-        walk(child);
-      }
-    };
-    walk(form);
+        if (globalThis.__tilefinchFormAssociatedCustomElement?.(child)) {
+          const formAttribute = child.getAttribute?.("form");
+          return formAttribute
+            ? document.getElementById(formAttribute)
+            : child.closest?.("form");
+        }
+        return nativeFormOwner(child);
+      },
+      listed = (child) => {
+        const tag = String(child.localName || "").toLowerCase();
+        if (tag === "input")
+          return String(child.getAttribute("type") || "").toLowerCase() !==
+            "image";
+        return tag === "button" || tag === "fieldset" || tag === "object" ||
+          tag === "output" || tag === "select" || tag === "textarea" ||
+          !!globalThis.__tilefinchFormAssociatedCustomElement?.(child);
+      },
+      append = (child) => {
+        if (seen.has(child) || !listed(child)) return false;
+        if (!fieldsetOwner && ownerOf(child) !== form) return false;
+        seen.add(child);
+        values.push(child);
+        return true;
+      },
+      selector = customSelector
+        ? listedControlSelector + "," + customSelector
+        : listedControlSelector;
+    for (const child of form.querySelectorAll(selector)) append(child);
+    let outside = false;
     if (!fieldsetOwner && nativeHasParserFormOwners?.())
-      for (const child of document.querySelectorAll(
-        "button,fieldset,input,object,output,select,textarea",
-      ))
-        if (parserFormOwner(child) === form) append(child);
+      for (const child of document.querySelectorAll(selector))
+        if (!form.contains(child) && parserFormOwner(child) === form)
+          outside = append(child) || outside;
     if (!fieldsetOwner && form.id)
       for (const child of document.querySelectorAll("[form]"))
-        if (child.getAttribute("form") === form.id) append(child);
-    values.sort((left, right) => {
-      if (left === right) return 0;
-      const position = left.compareDocumentPosition(right);
-      return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
-    });
+        if (!form.contains(child) && child.getAttribute("form") === form.id)
+          outside = append(child) || outside;
+    if (outside)
+      values.sort((left, right) => {
+        if (left === right) return 0;
+        const position = left.compareDocumentPosition(right);
+        return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+      });
     Object.defineProperty(values, "item", {
       value: (index) => values[Number(index)] ?? null,
     });
@@ -1851,18 +1946,35 @@
         ) ?? null,
     });
     return values;
-  };
+  },
+    /* Membership changes only with the DOM (or a new form-associated
+       definition), so a list is reused until the native structural version
+       moves: tree changes and id/form/type writes, not the class and style
+       churn of a framework update. Like HTMLFormControlsCollection it cannot
+       be modified by the page. */
+    cachedFormControls = (form) => {
+      const version = nativeDomVersion?.(true),
+        custom = globalThis.__tilefinchFormAssociatedSelector?.() || "";
+      if (typeof version !== "number" || version < 0)
+        return formControls(form);
+      const cached = formControlCache.get(form);
+      if (cached && cached.version === version && cached.custom === custom)
+        return cached.values;
+      const values = Object.freeze(formControls(form));
+      formControlCache.set(form, { version, custom, values });
+      return values;
+    };
   Object.defineProperty(HTMLFormElement.prototype, "elements", {
     configurable: true,
     get() {
-      return formControls(this);
+      return cachedFormControls(this);
     },
   });
   Object.defineProperties(HTMLFieldSetElement.prototype, {
     elements: {
       configurable: true,
       get() {
-        return formControls(this);
+        return cachedFormControls(this);
       },
     },
     form: {
@@ -2477,6 +2589,18 @@
         this.toggleAttribute(name, !!value);
       },
     }),
+    reflectedEnumerated = (name, values, missing, invalid = missing) => ({
+      configurable: true,
+      get() {
+        const value = this.getAttribute(name);
+        if (value === null) return missing;
+        const lowered = value.toLowerCase();
+        return values.includes(lowered) ? lowered : invalid;
+      },
+      set(value) {
+        this.setAttribute(name, String(value));
+      },
+    }),
     reflectedInteger = (name, fallback) => ({
       configurable: true,
       get() {
@@ -2985,8 +3109,20 @@
   HTMLInputElement.prototype.stepDown = function (count = 1) {
     stepInput(this, -Number(count));
   };
+  const formEnctype = reflectedEnumerated(
+    "enctype",
+    [
+      "application/x-www-form-urlencoded",
+      "multipart/form-data",
+      "text/plain",
+    ],
+    "application/x-www-form-urlencoded",
+  );
   Object.defineProperties(HTMLFormElement.prototype, {
     noValidate: reflectedBoolean("novalidate"),
+    method: reflectedEnumerated("method", ["get", "post", "dialog"], "get"),
+    enctype: formEnctype,
+    encoding: formEnctype,
   });
   HTMLFormElement.prototype.checkValidity = function () {
     let valid = true;
@@ -3070,6 +3206,7 @@
     "formNoValidate",
     reflectedBoolean("formnovalidate"),
   );
+  const constructingFormData = new WeakSet();
   globalThis.FormData = class FormData {
     constructor(form) {
       this.items = [];
@@ -3101,6 +3238,8 @@
           if (
             tag === "button" ||
             tag === "output" ||
+            tag === "fieldset" ||
+            tag === "object" ||
             type === "submit" ||
             type === "button" ||
             type === "reset" ||
@@ -3138,6 +3277,27 @@
             continue;
           }
           this.append(name, control.value);
+        }
+        /* The entry list is final only after `formdata` listeners have run
+           (HTML "constructing the entry list"): chatgpt.com adds its
+           session-observer token there. Re-entrant construction for the
+           same form is refused, as in browsers. */
+        if (constructingFormData.has(form))
+          throw new DOMException(
+            "The form's entry list is being constructed",
+            "InvalidStateError",
+          );
+        constructingFormData.add(form);
+        try {
+          const event = new Event("formdata", { bubbles: true });
+          Object.defineProperty(event, "formData", {
+            configurable: true,
+            enumerable: true,
+            value: this,
+          });
+          form.dispatchEvent(__tilefinchTrustedEvent(event));
+        } finally {
+          constructingFormData.delete(form);
         }
       }
     }
@@ -3207,6 +3367,27 @@
     [Symbol.iterator]() {
       return this.entries();
     }
+  };
+  /* The url-encoded entry list a script-initiated submission sends, after
+     `formdata` listeners; null for multipart/file forms, which the native
+     serializer handles. */
+  globalThis.__tilefinchSubmissionBody = (form, submitter) => {
+    const enctype = String(
+      submitter?.getAttribute?.("formenctype") ??
+        form.getAttribute("enctype") ??
+        "",
+    ).toLowerCase();
+    if (enctype === "multipart/form-data" || enctype === "text/plain")
+      return null;
+    const data = new FormData(form);
+    const name = submitter?.getAttribute?.("name");
+    if (name) data.append(name, submitter.value ?? "");
+    const params = new URLSearchParams();
+    for (const [key, value] of data) {
+      if (value instanceof Blob) return null;
+      params.append(key, value);
+    }
+    return params.toString();
   };
   globalThis.__tilefinchQueueFormSubmission = (form, submitter) => {
     if (!(form instanceof HTMLFormElement)) return false;
@@ -3782,29 +3963,24 @@
   {
     const htmlNamespace = "http://www.w3.org/1999/xhtml",
       detachedPrototypes = new Map(),
+      adoptAttributeObjects = globalThis.__tilefinchAdoptAttributeObjects,
+      setNodeOwner = globalThis.__tilefinchSetNodeOwner,
       collectAdoption = (node, owner, records) => {
         if (!node || node.nodeType === Node.DOCUMENT_NODE) return;
         const previousOwner = node.ownerDocument || null;
         if ("__detachedOwner" in node) node.__detachedOwner = owner;
+        else setNodeOwner(node, owner);
+        if (node.__handle !== undefined && adoptAttributeObjects)
+          adoptAttributeObjects(node, owner);
         else
-          Object.defineProperty(node, "__tilefinchAdoptedOwner", {
-            configurable: true,
-            writable: true,
-            value: owner,
-          });
-        for (const attribute of node.attributes || [])
-          attribute.__tilefinchAttributeOwnerDocument = owner;
+          for (const attribute of node.attributes || [])
+            attribute.__tilefinchAttributeOwnerDocument = owner;
         if (previousOwner && previousOwner !== owner)
           records.push({ node, oldDocument: previousOwner, newDocument: owner });
         const shadow = globalThis.__tilefinchShadowRootForHost?.(node);
         if (shadow) {
           if ("__detachedOwner" in shadow) shadow.__detachedOwner = owner;
-          else
-            Object.defineProperty(shadow, "__tilefinchAdoptedOwner", {
-              configurable: true,
-              writable: true,
-              value: owner,
-            });
+          else setNodeOwner(shadow, owner);
           for (const child of shadow.childNodes || [])
             collectAdoption(child, owner, records);
         }
@@ -3812,6 +3988,11 @@
           collectAdoption(child, owner, records);
       },
       adoptOwner = (node, owner) => {
+        /* Insertion already keeps a subtree in one node document. Moving
+           it within that document has no adoption steps: do not materialize
+           descendant wrappers or Attr objects merely to re-stamp ownership.
+           Detachment and connection reactions remain with the caller. */
+        if (node?.ownerDocument === owner) return;
         const records = [];
         collectAdoption(node, owner, records);
         globalThis.__tilefinchPrepareCustomElementAdoptions?.(records);
@@ -4966,6 +5147,16 @@
       return __tilefinchDocumentChildNodes().map(wrap);
     },
   });
+  for (const [name, pick] of [
+    ["firstChild", (handles) => handles[0]],
+    ["lastChild", (handles) => handles[handles.length - 1]],
+  ])
+    Object.defineProperty(document, name, {
+      configurable: true,
+      get() {
+        return wrap(pick(__tilefinchDocumentChildNodes()) || 0);
+      },
+    });
   Object.defineProperty(document, "documentElement", {
     configurable: true,
     enumerable: true,
@@ -5119,6 +5310,118 @@
       if (seen.has(at)) return at;
     return document;
   };
+  /* DOM's boundary-point comparison: -1 before, 0 equal, 1 after. */
+  const compareBoundaryPoints = (node, offset, otherNode, otherOffset) => {
+    if (node === otherNode)
+      return offset === otherOffset ? 0 : offset < otherOffset ? -1 : 1;
+    const position = node.compareDocumentPosition(otherNode);
+    if (position & Node.DOCUMENT_POSITION_PRECEDING)
+      return -compareBoundaryPoints(otherNode, otherOffset, node, offset);
+    if (position & Node.DOCUMENT_POSITION_CONTAINED_BY) {
+      let child = otherNode;
+      for (let steps = 0; child && child.parentNode !== node &&
+           steps < ancestorLimit; steps++)
+        child = child.parentNode;
+      const index = Array.prototype.indexOf.call(node.childNodes, child);
+      return index < offset ? 1 : -1;
+    }
+    return -1;
+  };
+  /* The DOM standard's "extract" and "clone the contents" of a range.
+     Partially contained ancestors are cloned shallowly and filled from a
+     subrange; contained children are moved (or deep-cloned). chatgpt.com's
+     streaming renderer extracts ranges that start and end in different
+     elements to commit an answer's final text. */
+  const isCharacterDataNode = (node) =>
+      node?.nodeType === Node.TEXT_NODE ||
+      node?.nodeType === Node.CDATA_SECTION_NODE ||
+      node?.nodeType === Node.COMMENT_NODE ||
+      node?.nodeType === Node.PROCESSING_INSTRUCTION_NODE,
+    rangeNodeLength = (node) =>
+      isCharacterDataNode(node) ? node.data.length : node.childNodes.length,
+    inclusiveAncestor = (ancestorNode, node) =>
+      ancestorNode === node || !!ancestorNode?.contains?.(node),
+    rangeContents = (range, extract, depth) => {
+      if (depth > ancestorLimit)
+        throw new DOMException("Range is too deeply nested",
+                               "NotSupportedError");
+      const start = range.startContainer, startOffset = range.startOffset,
+        end = range.endContainer, endOffset = range.endOffset,
+        owner = start.ownerDocument || document,
+        fragment = owner.createDocumentFragment();
+      if (range.collapsed) return fragment;
+      if (start === end && isCharacterDataNode(start)) {
+        const clone = start.cloneNode(false);
+        clone.data = start.data.substring(startOffset, endOffset);
+        fragment.appendChild(clone);
+        if (extract) start.deleteData(startOffset, endOffset - startOffset);
+        return fragment;
+      }
+      let common = start;
+      for (let steps = 0; !inclusiveAncestor(common, end); steps++) {
+        if (!common.parentNode || steps > ancestorLimit)
+          throw new DOMException("Range has no common ancestor",
+                                 "NotSupportedError");
+        common = common.parentNode;
+      }
+      const children = [...common.childNodes];
+      const firstPartial = inclusiveAncestor(start, end) ? null
+        : children.find((child) => inclusiveAncestor(child, start)) || null;
+      const lastPartial = inclusiveAncestor(end, start) ? null
+        : children.find((child) => inclusiveAncestor(child, end)) || null;
+      const contained = children.filter((child, index) =>
+        compareBoundaryPoints(common, index, start, startOffset) >= 0 &&
+        compareBoundaryPoints(common, index + 1, end, endOffset) <= 0 &&
+        child !== firstPartial && child !== lastPartial);
+      if (contained.some((child) => child.nodeType === Node.DOCUMENT_TYPE_NODE))
+        throw new DOMException("Range contains a doctype",
+                               "HierarchyRequestError");
+      let newNode = start, newOffset = startOffset;
+      if (extract && !inclusiveAncestor(start, end)) {
+        let reference = start;
+        for (let steps = 0; reference.parentNode &&
+             !inclusiveAncestor(reference.parentNode, end) &&
+             steps < ancestorLimit; steps++)
+          reference = reference.parentNode;
+        newNode = reference.parentNode;
+        newOffset = Array.prototype.indexOf.call(newNode.childNodes,
+                                                 reference) + 1;
+      }
+      const partial = (child, fromStart) => {
+        if (isCharacterDataNode(child)) {
+          const clone = child.cloneNode(false);
+          if (fromStart) {
+            clone.data = start.data.substring(startOffset);
+            if (extract)
+              start.deleteData(startOffset, start.data.length - startOffset);
+          } else {
+            clone.data = end.data.substring(0, endOffset);
+            if (extract) end.deleteData(0, endOffset);
+          }
+          fragment.appendChild(clone);
+          return;
+        }
+        const clone = child.cloneNode(false), sub = new Range();
+        fragment.appendChild(clone);
+        if (fromStart) {
+          sub.setStart(start, startOffset);
+          sub.setEnd(child, rangeNodeLength(child));
+        } else {
+          sub.setStart(child, 0);
+          sub.setEnd(end, endOffset);
+        }
+        clone.appendChild(rangeContents(sub, extract, depth + 1));
+      };
+      if (firstPartial) partial(firstPartial, true);
+      for (const child of contained)
+        fragment.appendChild(extract ? child : child.cloneNode(true));
+      if (lastPartial) partial(lastPartial, false);
+      if (extract) {
+        range.setStart(newNode, newOffset);
+        range.setEnd(newNode, newOffset);
+      }
+      return fragment;
+    };
   globalThis.Range = class Range {
     constructor() {
       this.startContainer = document;
@@ -5195,55 +5498,25 @@
       return copy;
     }
     extractContents() {
-      const fragment = document.createDocumentFragment(),
-        start = this.startContainer,
-        end = this.endContainer,
-        startOffset = this.startOffset,
-        endOffset = this.endOffset,
-        isCharacterData = (node) =>
-          node?.nodeType === Node.TEXT_NODE ||
-          node?.nodeType === Node.CDATA_SECTION_NODE ||
-          node?.nodeType === Node.COMMENT_NODE ||
-          node?.nodeType === Node.PROCESSING_INSTRUCTION_NODE;
-      if (start === end) {
-        if (isCharacterData(start)) {
-          const removed = start.data.slice(startOffset, endOffset);
-          start.deleteData(startOffset, endOffset - startOffset);
-          if (removed) fragment.appendChild(document.createTextNode(removed));
-        } else {
-          const selected = [...start.childNodes].slice(startOffset, endOffset);
-          for (const node of selected) fragment.appendChild(node);
-        }
-        this.setEnd(start, startOffset);
-        return fragment;
-      }
-      if (
-        isCharacterData(start) &&
-        isCharacterData(end) &&
-        start.parentNode === end.parentNode
-      ) {
-        const parent = start.parentNode,
-          children = [...parent.childNodes],
-          startIndex = children.indexOf(start),
-          endIndex = children.indexOf(end),
-          startText = start.data.slice(startOffset),
-          endText = end.data.slice(0, endOffset);
-        start.deleteData(startOffset, start.data.length - startOffset);
-        if (startText) fragment.appendChild(document.createTextNode(startText));
-        for (let at = startIndex + 1; at < endIndex; at++)
-          fragment.appendChild(children[at]);
-        end.deleteData(0, endOffset);
-        if (endText) fragment.appendChild(document.createTextNode(endText));
-        this.setEnd(start, startOffset);
-        return fragment;
-      }
-      throw new DOMException(
-        "Complex range extraction is not supported",
-        "NotSupportedError",
-      );
+      return rangeContents(this, true, 0);
     }
     deleteContents() {
-      this.extractContents();
+      rangeContents(this, true, 0);
+    }
+    cloneContents() {
+      return rangeContents(this, false, 0);
+    }
+    intersectsNode(node) {
+      if (!(node instanceof Node)) throw new TypeError("Node required");
+      const parent = node.parentNode;
+      if (!parent) return true;
+      const offset = Array.prototype.indexOf.call(parent.childNodes, node);
+      return (
+        compareBoundaryPoints(parent, offset, this.endContainer,
+                              this.endOffset) < 0 &&
+        compareBoundaryPoints(parent, offset + 1, this.startContainer,
+                              this.startOffset) > 0
+      );
     }
     insertNode(node) {
       if (!(node instanceof Node)) throw new TypeError("Node required");
@@ -5923,11 +6196,7 @@
         Object.defineProperty(node, key, descriptor);
     }
     Object.setPrototypeOf(node, Object.getPrototypeOf(connected));
-    Object.defineProperty(node, "__tilefinchAdoptedOwner", {
-      configurable: true,
-      writable: true,
-      value: document,
-    });
+    globalThis.__tilefinchSetNodeOwner(node, document);
     return node;
   };
   globalThis.DOMParser = class DOMParser {
@@ -6193,7 +6462,10 @@
     errorObserver = null,
   ) => {
     const list = map.get(String(event.type)) || [];
-    for (const item of [...list]) {
+    /* A snapshot, walked by index (no iterator per target and phase). */
+    const items = [...list];
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
       if (!item.active || item.capture !== capture) continue;
       invokeListenerItem(map, list, target, event, item, errorObserver);
       if (event.__immediateStopped) break;
@@ -6538,7 +6810,21 @@
   {
     const states = new Map(),
       limit = 32,
+      dirtyLimit = 64,
       dirtyIds = new Set();
+    /* Every mutation of a keyed subtree lands here, but only a section save
+       drains the set, and a page which never changes section would otherwise
+       grow it by every distinct id it touches. The save serializes at most
+       the first sixteen keys in insertion order, so keeping the first
+       sixty-four leaves room for keys whose nodes are gone by then while
+       bounding retention; later keys count as dropped exactly as the save's
+       own overflow does. */
+    dirtyIds.add = (key) => {
+      if (trustedSetSize(dirtyIds) < dirtyLimit || trustedSetHas(dirtyIds, key))
+        trustedSetAdd(dirtyIds, key);
+      else retentionStats.dirtyDrops++;
+      return dirtyIds;
+    };
     const controlSelector = "input,textarea,select,option";
     const sectionControlValue = (item) => {
       const tag = String(item?.localName || item?.tagName).toLowerCase();
@@ -6811,61 +7097,6 @@
       return this === document ? documentReferrer : "";
     },
   });
-  globalThis.NodeFilter = {
-    SHOW_ALL: 0xffffffff,
-    SHOW_ELEMENT: 1,
-    SHOW_TEXT: 4,
-    SHOW_COMMENT: 128,
-    FILTER_ACCEPT: 1,
-    FILTER_REJECT: 2,
-    FILTER_SKIP: 3,
-  };
-  const traversalHandle = (root) =>
-      root === document
-        ? document.documentElement.__handle
-        : root?.__handle || 0,
-    traversalNodes = (root, whatToShow) => (
-      globalThis.__tilefinchBeginTraversal?.(),
-      __tilefinchDescendants(traversalHandle(root), Number(whatToShow)).map(
-        (value) => (value instanceof Node ? value : wrap(value)),
-      )
-    );
-  document.createNodeIterator = (root, whatToShow = NodeFilter.SHOW_ALL) => {
-    const nodes = traversalNodes(root, whatToShow);
-    let index = 0;
-    return {
-      root,
-      whatToShow,
-      nextNode() {
-        return index < nodes.length ? nodes[index++] : null;
-      },
-      previousNode() {
-        return index > 0 ? nodes[--index] : null;
-      },
-      detach() {},
-    };
-  };
-  document.createTreeWalker = (root, whatToShow = NodeFilter.SHOW_ALL) => {
-    const nodes = traversalNodes(root, whatToShow).filter(
-      (node) => node !== root,
-    );
-    let index = -1;
-    return {
-      root,
-      whatToShow,
-      currentNode: root,
-      nextNode() {
-        if (index + 1 >= nodes.length) return null;
-        this.currentNode = nodes[++index];
-        return this.currentNode;
-      },
-      previousNode() {
-        if (index <= 0) return null;
-        this.currentNode = nodes[--index];
-        return this.currentNode;
-      },
-    };
-  };
   globalThis.window = globalThis;
   globalThis.self = globalThis;
   globalThis.top = globalThis;
@@ -8310,16 +8541,14 @@
       const text = String(input);
       if (text.length > 256 * 1024)
         throw new RangeError("base64 input exceeds bounded size");
-      const bytes = new Uint8Array(text.length);
-      for (let at = 0; at < text.length; at++) {
-        const value = text.charCodeAt(at);
-        if (value > 255)
-          invalidBase64(
-            "btoa length=" + text.length + " index=" + at + " code=" + value,
-          );
-        bytes[at] = value;
-      }
-      return __tilefinchBase64EncodeBytes(bytes);
+      /* One native pass; a number is the index of the first code unit
+         above 255. */
+      const encoded = __tilefinchBase64EncodeLatin1(text);
+      if (typeof encoded === "string") return encoded;
+      invalidBase64(
+        "btoa length=" + text.length + " index=" + encoded + " code=" +
+          text.charCodeAt(encoded),
+      );
     };
     globalThis.atob = (input) => {
       const text = String(input);
@@ -8370,17 +8599,20 @@
     }
   };
   const
+    /* The element's font size, read only for a value that has an em term
+       to resolve: the read costs a cascade the value itself did not. */
+    computedFontSize = (node) =>
+      parseFloat(
+        __tilefinchComputedStyleGet(node.__handle, "font-size", ""),
+      ) || 16,
     computedSparseValue = (node, name, value) => {
       if (name === "flex-basis") {
-        const text = String(value).trim(),
-          fontSize =
-            parseFloat(
-              __tilefinchComputedStyleGet(node.__handle, "font-size", ""),
-            ) || 16;
+        const text = String(value).trim();
         let match = text.match(
           /^calc\(\s*(-?(?:\d+(?:\.\d*)?|\.\d+))px\s*([+-])\s*((?:\d+(?:\.\d*)?|\.\d+))em\s*\)$/i,
         );
         if (match) {
+          const fontSize = computedFontSize(node);
           const result = Math.max(
             0,
             Number(match[1]) +
@@ -8403,14 +8635,12 @@
         !name.startsWith("scroll-padding")
       )
         return value;
-      const fontSize =
-          parseFloat(
-            __tilefinchComputedStyleGet(node.__handle, "font-size", ""),
-          ) || 16,
-        padding = name.startsWith("scroll-padding");
+      const padding = name.startsWith("scroll-padding");
+      let fontSize = 0;
       return String(value).replace(
         /calc\(\s*(-?(?:\d+(?:\.\d*)?|\.\d+))px\s*([+-])\s*((?:\d+(?:\.\d*)?|\.\d+))em\s*\)/gi,
         (_match, pixels, operator, ems) => {
+          if (fontSize === 0) fontSize = computedFontSize(node);
           let result =
             Number(pixels) +
             (operator === "-" ? -1 : 1) * Number(ems) * fontSize;
@@ -8464,9 +8694,15 @@
     computedStyleCount = (state) =>
       computedStyleRendered(state) ? computedStyleLonghands().length : 0,
     computedStyleRead = (state, name) => {
-      name = __tilefinchCssName(name);
       const node = state.node,
         handle = node.__handle;
+      /* The common read in one native call: name, connection and value.
+         Undefined leaves every other case to the path below. */
+      if (typeof name === "string" && Number.isInteger(handle) && handle > 0) {
+        const value = __tilefinchComputedStyleRead(handle, name, state.pseudo);
+        if (value !== undefined) return value;
+      }
+      name = __tilefinchCssName(name);
       /* A disconnected element's declaration block is empty. */
       if (!computedStyleRendered(state)) return "";
       /* The host resolves the cascade, inheritance, var() substitution and
@@ -8525,6 +8761,56 @@
     value: "CSSStyleDeclaration",
   });
   globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+  /* A declaration's state already lives in the private WeakMap. Share the
+     traps instead of allocating six closures for every style wrapper. */
+  const computedStyleHandler = {
+    get(object, name, receiver) {
+      /* Property names are read far more often than indices: test the
+         first character before the pattern. */
+      if (typeof name === "string") {
+        const first = name.charCodeAt(0);
+        if (first >= 48 && first <= 57 && /^\d+$/.test(name))
+          return object.item(Number(name));
+      }
+      return name in object
+        ? Reflect.get(object, name, receiver)
+        : typeof name === "string"
+          ? object.getPropertyValue(name) : undefined;
+    },
+    set() { computedStyleReadonly(); },
+    deleteProperty() { computedStyleReadonly(); },
+    has(object, name) {
+      const state = computedStyleState(object);
+      if (typeof name === "string" && /^\d+$/.test(name))
+        return Number(name) < computedStyleCount(state);
+      /* Supported properties are attributes of the declaration whether
+         or not it currently lists any. */
+      return (
+        name in object ||
+        (typeof name === "string" &&
+          __tilefinchComputedStyleSupport(__tilefinchCssName(name)))
+      );
+    },
+    ownKeys(object) {
+      const state = computedStyleState(object);
+      return computedStyleRendered(state)
+        ? computedStyleLonghands().map((_name, index) => String(index))
+        : [];
+    },
+    getOwnPropertyDescriptor(object, name) {
+      const state = computedStyleState(object);
+      if (typeof name === "string" && /^\d+$/.test(name)
+          && Number(name) < computedStyleCount(state)) {
+        return {
+          configurable: true,
+          enumerable: true,
+          writable: false,
+          value: computedStyleLonghands()[Number(name)],
+        };
+      }
+      return undefined;
+    },
+  };
   globalThis.getComputedStyle = (node, pseudo = null) => {
     if (!node || !node.style)
       throw new TypeError("getComputedStyle requires an Element");
@@ -8534,49 +8820,7 @@
         pseudo: pseudo === null ? "" : String(pseudo),
       };
     computedStyleStates.set(target, state);
-    const proxy = new Proxy(
-      target,
-      {
-        get(object, name, receiver) {
-          if (typeof name === "string" && /^\d+$/.test(name))
-            return object.item(Number(name));
-          return name in object
-            ? Reflect.get(object, name, receiver)
-            : typeof name === "string"
-              ? object.getPropertyValue(name) : undefined;
-        },
-        set() { computedStyleReadonly(); },
-        deleteProperty() { computedStyleReadonly(); },
-        has(object, name) {
-          if (typeof name === "string" && /^\d+$/.test(name))
-            return Number(name) < computedStyleCount(state);
-          /* Supported properties are attributes of the declaration whether
-             or not it currently lists any. */
-          return (
-            name in object ||
-            (typeof name === "string" &&
-              __tilefinchComputedStyleSupport(__tilefinchCssName(name)))
-          );
-        },
-        ownKeys() {
-          return computedStyleRendered(state)
-            ? computedStyleLonghands().map((_name, index) => String(index))
-            : [];
-        },
-        getOwnPropertyDescriptor(_object, name) {
-          if (typeof name === "string" && /^\d+$/.test(name)
-              && Number(name) < computedStyleCount(state)) {
-            return {
-              configurable: true,
-              enumerable: true,
-              writable: false,
-              value: computedStyleLonghands()[Number(name)],
-            };
-          }
-          return undefined;
-        },
-      },
-    );
+    const proxy = new Proxy(target, computedStyleHandler);
     computedStyleStates.set(proxy, state);
     return proxy;
   };
@@ -8763,7 +9007,9 @@
           return value === "none" || (value === "" && false);
         if (name === "pointer" || name === "any-pointer")
           return value === "coarse" || value === "";
-        if (name === "prefers-color-scheme") return value === "light";
+        if (name === "prefers-color-scheme")
+          return value === "" || value ===
+            (globalThis.__tilefinchPrefersDark?.() ? "dark" : "light");
         if (name === "prefers-reduced-motion") return value === "reduce";
         if (name === "prefers-contrast") return value === "no-preference";
         if (name === "color") return value === "" || Number(value) <= 8;

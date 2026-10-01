@@ -22,6 +22,7 @@
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/controller.h"
 #include "tilefinch/document_backing.h"
+#include "tilefinch/work_vector.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
 #include "tilefinch/host_media.h"
@@ -450,6 +451,10 @@ int main(int argc, char **argv)
     size_t font_file_kb_override = 0, font_backend_kb_override = 0;
     size_t resource_timeout_ms = 15000;
     size_t session_cache_kb_override = 0;
+    /* SIZE_MAX keeps the engine default; 0 disables the cache. */
+    size_t module_bytecode_cache_kb = SIZE_MAX;
+    const char *module_cache_dir = NULL;
+    bool module_cache_write = false;
     bool script_file_explicit = false, script_count_explicit = false;
     size_t reloads = 0;
     bool fetch_scripts = false, activate = false, follow_action = false;
@@ -699,6 +704,16 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--session-cache-kb") == 0) {
             session_cache_kb_override = strtoul(argv[++i], NULL, 10);
         }
+        else if (strcmp(argv[i], "--module-bytecode-cache-kb") == 0) {
+            module_bytecode_cache_kb = strtoul(argv[++i], NULL, 10);
+        }
+        else if (strcmp(argv[i], "--module-cache-dir") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 2; }
+            module_cache_dir = argv[++i];
+        }
+        else if (strcmp(argv[i], "--module-cache-write") == 0) {
+            module_cache_write = true;
+        }
         else if (strcmp(argv[i], "--script-heap-mb") == 0) {
             script_heap_mb = strtoul(argv[++i], NULL, 10);
             script_heap_explicit = true;
@@ -880,6 +895,16 @@ int main(int argc, char **argv)
     engine_config->memory_limit = limit_mb * MIB;
     engine_config->history_capacity = history_capacity;
     engine_config->session_cache_limit = session_cache_limit;
+    if (module_bytecode_cache_kb != SIZE_MAX) {
+        engine_config->module_bytecode_cache_limit =
+            module_bytecode_cache_kb * KIB;
+    }
+    if (module_cache_dir != NULL) {
+        snprintf(engine_config->module_bytecode_disk_dir,
+                 sizeof(engine_config->module_bytecode_disk_dir), "%s",
+                 module_cache_dir);
+        engine_config->module_bytecode_disk_write = module_cache_write;
+    }
     engine_config->maximum_document_bytes = max_download_kb * KIB;
     engine_config->navigation_timeout_ms = 30000;
     engine_config->navigation_replacement_mode = low_memory_navigation
@@ -1866,6 +1891,20 @@ int main(int argc, char **argv)
         dump_probe_dom(lxb_dom_interface_node(navigation.page.document.html),
                        0, &remaining);
     }
+    /* Child documents keep their own DOM (shadow trees included, as the
+       display:contents hosts dom.js inserts), which page script in the
+       parent cannot read across origins. */
+    if (getenv("TILEFINCH_TRACE_FRAME_DOM") != NULL) {
+        for (size_t i = 0; i < navigation.page.frame_count; i++) {
+            NavigationFrame *frame = &navigation.page.frames[i];
+            if (!frame->loaded || frame->document.html == NULL) continue;
+            printf("probe-frame-dom index=%zu url=\"%.256s\"\n",
+                   i, frame->url);
+            size_t remaining = 1024;
+            dump_probe_dom(lxb_dom_interface_node(frame->document.html),
+                           0, &remaining);
+        }
+    }
     if (trace_frames
         && !navigation_collect_frame_capability_trace(&navigation)) {
         goto cleanup;
@@ -2450,6 +2489,14 @@ int main(int argc, char **argv)
              navigation.page.images.stats.maximum_no_progress_ms,
            (unsigned long long)
              navigation.page.images.stats.maximum_request_ms);
+    printf("image-inline-svg rasterized=%zu refresh-reused=%zu "
+           "serialize-us=%llu rasterize-us=%llu\n",
+           navigation.page.images.stats.inline_svg_rasterized,
+           navigation.page.images.stats.inline_svg_refresh_reused,
+           (unsigned long long)
+             navigation.page.images.stats.inline_svg_serialize_us,
+           (unsigned long long)
+             navigation.page.images.stats.inline_svg_rasterize_us);
     printf("web-fonts declarations=%zu sources=%zu attempted=%zu loaded=%zu "
            "failed=%zu unsupported=%zu skipped=%zu duplicates=%zu "
            "cache-hits=%zu encoded=%zu retained=%zu deadline=%s/%zu "
@@ -2596,6 +2643,9 @@ int main(int argc, char **argv)
            (unsigned long long) cache.max_prefetch_us,
            cache.overlay_images_prewarmed,
            cache.overflow_images_prewarmed);
+    /* Deterministic work for the page as a whole; the timings above are
+       host wall time and do not transfer to the PSP. */
+    tilefinch_work_print("final", &navigation);
     printf("canvas-fast frames=%zu refusals=%zu total-us=%llu max-us=%llu\n",
            cache.canvas_fast_frames, cache.canvas_fast_refusals,
            (unsigned long long) cache.canvas_fast_us,
@@ -2914,14 +2964,15 @@ int main(int argc, char **argv)
     printf("relayout-policy fingerprints=%zu mutation-fast=%zu "
            "mutation-resource=%zu mutation-images=%zu "
            "mutation-conservative=%zu "
-           "journal-overflows=%zu semantic-skips=%zu focus-outline-skips=%zu "
-           "focus-paint-skips=%zu\n",
+           "journal-overflows=%zu image-rebuilds=%zu semantic-skips=%zu "
+           "focus-outline-skips=%zu focus-paint-skips=%zu\n",
            navigation.performance.resource_fingerprint_scans,
            navigation.performance.mutation_fast_relayouts,
            navigation.performance.mutation_resource_rebuilds,
            navigation.performance.mutation_image_resource_scans,
            navigation.performance.mutation_conservative_scans,
            navigation.performance.mutation_journal_overflows,
+           navigation.performance.mutation_image_rebuilds,
            navigation.performance.semantic_relayout_skips,
            navigation.performance.focus_outline_relayout_skips,
            navigation.performance.focus_paint_relayout_skips);
@@ -2933,7 +2984,8 @@ int main(int argc, char **argv)
            "intrinsic-hits=%zu intrinsic-misses=%zu "
            "table-row-hits=%zu table-row-misses=%zu scoped-invalidations=%zu "
            "full-resets=%zu pressure-evictions=%zu matched=%zu/%zu/%zu "
-           "token=%zu/%zu/%zu style-appends=%zu/%zu retired=%zu\n",
+           "token=%zu/%zu/%zu style-appends=%zu/%zu retired=%zu "
+           "has=%zu/%zu/%zu/%zu\n",
            navigation.performance.layout_reuse_retained_bytes,
            navigation.performance.layout_reuse_style_hits,
            navigation.performance.layout_reuse_style_misses,
@@ -2952,7 +3004,11 @@ int main(int argc, char **argv)
            navigation.performance.layout_reuse_matched_token_dropped,
            navigation.performance.mutation_style_appends,
            navigation.performance.mutation_style_append_fallbacks,
-           reuse_stats.retired_subtrees);
+           reuse_stats.retired_subtrees,
+           navigation.performance.layout_reuse_has_scoped,
+           navigation.performance.layout_reuse_has_fallbacks,
+           navigation.performance.layout_reuse_has_dropped,
+           navigation.performance.layout_reuse_has_scans);
     printf("progressive-paint attempts=%zu skips=%zu failures=%zu "
            "adoptions=%zu "
            "layouts=%zu paints=%zu layout-us=%llu paint-us=%llu "
@@ -3070,6 +3126,44 @@ int main(int argc, char **argv)
            navigation.page.script_result
              .external_script_bytecode_cache_restore_failures,
            navigation.page.script_result.external_script_bytecode_cache_bytes);
+    {
+        const ScriptResult *js = &navigation.page.script_result;
+        const BrowserSession *bytecode_session =
+            browser_engine_session_view(engine);
+        printf("javascript-module-bytecode hits=%zu misses=%zu stores=%zu "
+               "admission-skips=%zu restore-failures=%zu restored-bytes=%zu "
+               "stored-bytes=%zu restore-us=%llu cache-bytes=%zu "
+               "entries=%zu evictions=%zu limit=%zu\n",
+               js->module_bytecode_cache_hits,
+               js->module_bytecode_cache_misses,
+               js->module_bytecode_cache_stores,
+               js->module_bytecode_cache_admission_skips,
+               js->module_bytecode_cache_restore_failures,
+               js->module_bytecode_cache_bytes,
+               js->module_bytecode_cache_stored_bytes,
+               js->module_bytecode_restore_us,
+               browser_session_module_bytecode_bytes(bytecode_session),
+               browser_session_module_bytecode_entries(bytecode_session),
+               bytecode_session == NULL
+                   ? 0 : bytecode_session->module_bytecode_evictions,
+               bytecode_session == NULL
+                   ? 0 : bytecode_session->maximum_module_bytecode_bytes);
+        if (browser_session_module_bytecode_disk_enabled(bytecode_session))
+            printf("javascript-module-bytecode-disk hits=%zu stores=%zu "
+                   "load-us=%llu read-us=%llu verify-us=%llu "
+                   "promote-us=%llu rejects=%zu removed=%zu files=%zu "
+                   "bytes=%zu\n",
+                   js->module_bytecode_disk_hits,
+                   js->module_bytecode_disk_stores,
+                   js->module_bytecode_disk_load_us,
+                   js->module_bytecode_disk_read_us,
+                   js->module_bytecode_disk_verify_us,
+                   js->module_bytecode_promote_us,
+                   bytecode_session->module_bytecode_disk_rejects,
+                   bytecode_session->module_bytecode_disk_removed,
+                   bytecode_session->module_bytecode_disk_file_count,
+                   bytecode_session->module_bytecode_disk_total_bytes);
+    }
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
            "connected-preserves=%zu stale-releases=%zu capacity=%u\n",
@@ -3103,6 +3197,12 @@ int main(int argc, char **argv)
                navigation.last_page_trace);
         printf("previous-page-capability-trace=\"%s\"\n",
                navigation.previous_page_trace);
+    }
+    {
+        size_t prefetches = 0, prefetch_hits = 0;
+        script_loader_module_prefetch_totals(&prefetches, &prefetch_hits);
+        printf("javascript-module-prefetch started=%zu consumed=%zu\n",
+               prefetches, prefetch_hits);
     }
     printf("javascript-network requests=%zu failures=%zu status=%ld "
            "last-url=\"%s\" form-submit=%s\n",

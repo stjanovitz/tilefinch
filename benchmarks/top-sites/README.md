@@ -120,8 +120,8 @@ arbitrary application is supported; a useful destination still needs manual
 task qualification before it enters a release claim.
 
 The live corpus remains opt-in. Capture/comparison tooling and its offline
-check require Python 3 with Pillow available (the bundled Codex workspace
-Python includes it). The tooling itself has a small offline check:
+check require Python 3; install Pillow in the Python environment used to run
+the tooling. The tooling itself has a small offline check:
 
 ```sh
 node benchmarks/top-sites/test-mobile-audit-tools.js
