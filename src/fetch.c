@@ -209,6 +209,8 @@ static bool fetch_private_sockaddr(const struct sockaddr *address)
 /* The fetch implementation is compiled as one private unit because libcurl
    callbacks and trace replay share bounded state.  Responsibility-specific
    seams keep that state reviewable without exporting it. */
+#include "tilefinch/site_identity.h"
+#include "tilefinch_test_faults.h"
 #include "fetch/policy.inc"
 #include "fetch/request_authority.inc"
 #include "tilefinch/user_agent.h"
@@ -388,6 +390,11 @@ typedef struct {
     uint64_t replay_body_hash;
     uint64_t replay_expected_body_hash;
     bool replay_body_hash_required;
+    /* The deferred body is a recorded response that stopped at its byte
+       cap: the scheduler delivers the recorded prefix and then completes
+       the request as the live transport did, a quota failure that still
+       holds the bytes received. */
+    bool replay_limit_truncated;
     /* Deferred replay body rewrite, owned by the scheduler item. */
     TraceReplayRekey *replay_rekey;
 } WriteContext;
@@ -1438,15 +1445,12 @@ static struct {
 #define FETCH_TRACE_MODE fetch_trace.mode
 #endif
 
-/* The lab's diagnostic mobile-Safari identity. The PSP has no environment,
-   so trace-free builds answer without a getenv per request. */
+/* The lab's diagnostic mobile-Safari identity, under the same gate as the
+   realm's (runtime_creation.inc), so requests and the page's navigator agree
+   in every build. Shipping builds answer without a getenv per request. */
 static bool fetch_diagnostic_mobile_safari(void)
 {
-#ifdef TILEFINCH_NO_TRACE
-    return false;
-#else
-    return getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL;
-#endif
+    return tilefinch_lab_getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL;
 }
 
 #include "fetch/security_metadata.inc"

@@ -6,12 +6,13 @@
 Each FILE is the output of tilefinch-js-bench (host) or a PSP validation log
 from a validation_js_bench=N run (PPSSPP or device). The first file is the
 reference; every later column is that run's ns-per-iteration divided by the
-reference's. A PPSSPP column is an instruction-count proxy (about one
-instruction per cycle at 333 MHz, no cache model): its ratio to the host is
-the instruction-count ratio, and a device column divided by the PPSSPP
-column is the device's effective CPI (memory stalls and other device-only
-costs). Kernels whose ratio stands well above the plain int_loop's name a
-cost the slower run pays disproportionately.
+reference's. PPSSPP's emulated timing does not model the physical caches;
+neither a host/PPSSPP ratio nor a device/PPSSPP ratio is a measured hardware
+cycles-per-instruction or cache-miss count. These are elapsed-cost ratios.
+Kernels whose ratio stands well above the plain int_loop's identify costs
+the slower run pays disproportionately, not an exact whole-page speed
+prediction. Match source, iteration counts, allocator and observer settings,
+and retain repeated runs rather than relying on one ratio.
 """
 import re
 import sys

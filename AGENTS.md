@@ -22,8 +22,18 @@ pass; `tilefinch-device-cost-tests` is deliberately registered but disabled by
 default. The localhost
 redirect test may report `Skipped` in a sandbox that forbids loopback sockets;
 the update-root proof can likewise skip when its external prerequisite is not
-available. A skip is not a passing substitute for running either gate in an
+available, and the `tilefinch-treadline-*` Node tests report `Skipped` when
+`node` was not found at configure time. A skip is not a passing substitute for running either gate in an
 ordinary host environment.
+
+Fuzz reproducers and private investigation tests live under the ignored
+`.private-investigations/tests/`, never as inline public test inputs. Public
+clones use the default `TILEFINCH_ENABLE_PRIVATE_TESTS=OFF`; maintainers with
+local private suites enable them with `cmake --preset release
+-DTILEFINCH_ENABLE_PRIVATE_TESTS=ON` before the full gate. An enabled but missing
+private suite must fail configuration, not silently skip coverage. See
+[Optional private tests](docs/DEVELOPMENT.md#optional-private-tests) for registration
+and the public-only gate.
 
 For a faster edit loop, configure rather than trusting a previously-created
 development tree:
@@ -60,7 +70,7 @@ not device targets, and the bare cross-build `all` target is not the PSP gate.
 
 Two things only this build enforces:
 
-- **A 4,760,000-byte ordinary `.text` ratchet** (4,980,000 bytes when
+- **A 4,760,000-byte ordinary `.text` ratchet** (5,500,000 bytes when
   validation logging is compiled in). `cmake/CheckPspTextSize.cmake` reads the
   actual ELF `.text` sections with `psp-objdump` after every link, reports
   `.rodata` separately, and fails the build above the appropriate limit.

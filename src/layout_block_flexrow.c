@@ -37,6 +37,14 @@ bool layout_block_flexrow_section(LayoutContext *context,
     long long total_shrink_weight = 0;
     FlexOrderPlan *row_order = &scratch->row_order;
     *row_order = (FlexOrderPlan) {0};
+    /* A wrapping row sizes each line from that line's own items
+       (flex_line_metrics below); the whole-container totals the pre-scan
+       measures are only read by a single-line row. Measuring every item's
+       basis and min-content here walked the subtree of every card of a
+       long wrapping list, and a load preview could not stop at its depth
+       limit before it. */
+    bool line_sized = style->flex_wrap && !table_row && !css_table_row
+        && !anonymous_cell_row;
     if (flex_row && !replaced_content) {
         if (!flex_order_plan_build(row_order, context, node, style)) {
             return false;
@@ -50,6 +58,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
             if (css_table_row && !item->style.has_width) {
                 css_table_auto_children++;
             }
+            if (line_sized) continue;
             bool previous_intrinsic_pair_mode =
                 context->intrinsic_pair_mode;
             if (!table_row) context->intrinsic_pair_mode = true;
@@ -197,6 +206,12 @@ bool layout_block_flexrow_section(LayoutContext *context,
             }
             if (style->flex_wrap && !table_row
                 && line_items_remaining == 0) {
+                /* A load preview stops at the first line that starts below
+                   its depth limit: later lines cannot move earlier ones. */
+                if (!first_flex_line
+                    && layout_preview_limit_reached(
+                           context, layout_add_coordinate(
+                                        row_bottom, style->row_gap))) break;
                 FlexLineMetrics metrics = flex_line_metrics(
                     context, item_start,
                     &scratch->traversal.flex.lookahead_item,
@@ -415,14 +430,30 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     flex_order_plan_destroy(row_order);
                     return false;
                 }
-            } else if (!layout_block(context, item->node,
-                                     &item->parent_style,
-                                     cursor_x, cursor_y, child_width,
-                                     child_containing_height, true,
-                                     descendant_positioned_box,
-                                     &child_bottom)) {
-                flex_order_plan_destroy(row_order);
-                return false;
+            } else {
+                /* The flex container's content box is the item's containing
+                   block: percentage max-/min-width, padding and margins
+                   resolve against it, not against the main size the line
+                   assigned (CSS Flexbox 9.2 / CSS 2.1 10.1). Guardian's
+                   section title is a `max-width: 74%` flex item; 74% of
+                   its own 107 px basis wrapped "Opinion". */
+                lxb_dom_node_t *saved_basis_node =
+                    context->percentage_basis_node;
+                int saved_basis_width = context->percentage_basis_width;
+                if (!table_row && !css_table_row && !anonymous_cell_row) {
+                    context->percentage_basis_node = item->node;
+                    context->percentage_basis_width = content_width;
+                }
+                bool laid_out = layout_block(
+                    context, item->node, &item->parent_style, cursor_x,
+                    cursor_y, child_width, child_containing_height, true,
+                    descendant_positioned_box, &child_bottom);
+                context->percentage_basis_node = saved_basis_node;
+                context->percentage_basis_width = saved_basis_width;
+                if (!laid_out) {
+                    flex_order_plan_destroy(row_order);
+                    return false;
+                }
             }
             if (child_bottom > row_bottom) row_bottom = child_bottom;
             int painted_right = layout_add_coordinate(

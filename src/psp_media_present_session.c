@@ -8,10 +8,20 @@
 
 #define printf psp_log_printf
 
+/* The staged copy's pixel signature is checked only against the validation
+   build's picture trace (media_psp_backend_note_stage_signature ignores it
+   otherwise), so only that build samples it. */
 static void psp_media_note_stage_signature(
     PspMediaSession *media, const MediaVideoFrame *frame,
     const void *staging, int texture_width, int rows)
 {
+#if !defined(TILEFINCH_PSP_VALIDATION_LOG)
+    (void) media;
+    (void) frame;
+    (void) staging;
+    (void) texture_width;
+    (void) rows;
+#else
     if (media == NULL || frame == NULL || staging == NULL || frame->width <= 0
         || frame->height <= 0 || texture_width < frame->width
         || rows < frame->height) return;
@@ -20,6 +30,7 @@ static void psp_media_note_stage_signature(
         psp_media_surface_signature(
             (const uint32_t *) staging, (unsigned) frame->width,
             (unsigned) frame->height, (unsigned) texture_width));
+#endif
 }
 
 /*
@@ -176,7 +187,9 @@ void psp_media_present_texture_for(
             media->present_stage_width = texture_width;
             media->present_stage_rows = rows;
         } else {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
             uint64_t started_us = psp_media_internal_now_us(media);
+#endif
             if (!(contiguous
                   && psp_media_present_ge_stage_dma(
                          staging, frame->pixels, stage_bytes))) {
@@ -190,11 +203,14 @@ void psp_media_present_texture_for(
             media_playback_note_frame_staged(media->playback, frame);
             psp_media_finish_staged_surface(media);
             psp_media_present_emit_after_release(media);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            /* Read only by the validation media-job report. */
             uint64_t elapsed_us = psp_media_internal_now_us(media) - started_us;
             media->present_stage_frames++;
             media->present_stage_total_us += elapsed_us;
             if (elapsed_us > media->present_stage_max_us)
                 media->present_stage_max_us = elapsed_us;
+#endif
         }
         media->present_stage_identity = frame->identity;
     }
@@ -311,7 +327,9 @@ void psp_media_present_texture_finish(PspMediaSession *media)
     (void) psp_media_pump_present(
         media, psp_media_present_ge_stage_dma_busy,
         PSP_MEDIA_ADVANCE_STAGE_COPY);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t started_us = psp_media_internal_now_us(media);
+#endif
     PspMediaPresentDmaJoin outcome = psp_media_present_ge_stage_dma_join();
     bool joined = outcome == PSP_MEDIA_DMA_JOIN_SUCCESS;
     bool still_live = outcome == PSP_MEDIA_DMA_JOIN_TIMED_OUT_STILL_LIVE;
@@ -387,12 +405,14 @@ void psp_media_present_texture_finish(PspMediaSession *media)
         psp_media_present_release_claimed_surface(media);
     }
     psp_media_present_emit_after_release(media);
-    uint64_t elapsed_us = psp_media_internal_now_us(media) - started_us;
     media->present_stage_async = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t elapsed_us = psp_media_internal_now_us(media) - started_us;
     media->present_stage_frames++;
     media->present_stage_total_us += elapsed_us;
     if (elapsed_us > media->present_stage_max_us)
         media->present_stage_max_us = elapsed_us;
+#endif
 }
 
 size_t psp_media_feed_before_blocking(PspMediaSession *media)

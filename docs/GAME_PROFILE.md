@@ -45,7 +45,9 @@ file rather than silently changing these ceilings.
 For a new game, this is the shortest path to a good PSP build:
 
 1. Design the complete interface at 480×272 and make the initial Play, Help,
-   and settings controls ordinary focusable HTML.
+   and settings controls ordinary focusable HTML. Style focus with CSS
+   outlines and add no focus-event listeners (see
+   [Menus over a live canvas](#menus-over-a-live-canvas)).
 2. Choose one primary renderer: Canvas 2D for sprite- or path-oriented games,
    or WebGL for retained 3D geometry. Keep a static help fallback.
 3. Allocate entity pools, matrices, command records, particles, and audio
@@ -91,16 +93,84 @@ Reaching one subsystem's local limit does not imply that the remaining page
 budget is available, and a budget refusal is a normal result a game must
 survive.
 
-Keep each classic game script at or below the 384 KiB Game Profile admission
-ceiling. Installed apps may precompile at most eight classic scripts and 512
-KiB of admitted source in aggregate; the source remains packaged as the
+### Installed-app heap
+
+An installed app opened from the offline library starts with a larger
+QuickJS heap floor: 9 MiB in the realistic profile and 6 MiB in the strict
+one. On the PSP the floor is the `boot.cfg` key `app_heap_mb` (2-16, default
+9, below `limit_mb`; an app never gets less than `heap_mb`). It is carved out
+of the same page Budget, which does not change, and it reaches only the app's
+top-level realm created by the library launch: frames, the next document in
+the tab, a reload, or an ordinary navigation to the app's own URL all get the
+ordinary heap again. Every page realm may already grow above its floor while
+an eighth of the page Budget stays free, up to three quarters of it; that
+growth still applies above the app floor. What the floor adds is a guarantee
+under pressure: allocations up to it never wait for spare Budget, and garbage
+collection paces with room above the live graph from the first frame.
+QuickJS charges its arenas and large blocks to the page Budget's JavaScript
+category; Budget categories attribute memory and are not sub-limits, so the
+floor is enforced by QuickJS's own limit while every byte still counts
+against the one page Budget. With that Budget held at its growth reserve,
+the launched Treadline realm, about 5.6 MiB in use after its soak, can
+still allocate about 3.3 MiB more (up to its floor, charged to the
+JavaScript category) and is refused past it; at the ordinary floor the same
+allocation is refused. `tilefinch-offline-app-launch-tests` sizes that probe
+from what the game leaves and separately requires at least 2.5 MiB of the
+floor to stay free, so the game cannot quietly grow into it.
+
+The default comes from Treadline's qualification soak opened through the
+offline route on the host (64-bit pointers, realistic 24 MiB profile,
+1,800 frames): the QuickJS heap peaked at 5.09 MB (5.95 MB of arenas in the
+Budget) and everything else at 5.60 MB (layout 2.11, resources 1.92, render
+1.03, session 0.67 with script sources left on the Memory Stick, DOM 0.35),
+11.52 MB for the whole page. At the ordinary 5 MiB floor the realm grew to
+7.5 MiB for collection headroom. A 1 MiB game's restored code takes about
+1.1 MB more heap than Treadline's. At 9 MiB the steady worst case is about
+5.6 MB + 9 MiB of heap with arena overhead (~10.9 MB), 16.5 MB, and about
+20.7 MB while the 4 MiB startup window is open,
+leaving more than the eighth of 24 MiB the page reserve keeps. The strict
+6 MiB floor gives a steady worst case of about 13 MB of its 16 MiB, again
+above that profile's eighth. The PSP-1000
+(32 MB) is unsupported; every supported model (PSP-2000, PSP-3000, PSP Go,
+PSP-E1000) runs the same 64 MB memory mode and page Budget.
+
+Keep each classic game script at or below the 512 KiB Game Profile admission
+ceiling; the strict pressure profile retains its 256 KiB per-script limit.
+On the PSP it is the `boot.cfg` key `file_kb`, which
+`scripts/stage-psp-game.sh` sets to 512 for a staged game. Ordinary web pages
+no longer have a fixed per-script limit: the app's default `file_kb` is 4096,
+a sanity ceiling, and a page script is admitted by the memory its compile
+needs (docs/engineering/PSP_ENVELOPE.md). A game should still stay within
+512 KiB per script: that is what the profile promises a device can compile
+next to a running game's heap. A
+`file_kb` below a game's largest script quietly skips that script: its
+element receives an `error` event and the player sees nothing. Listen for
+script `error` and show a message rather than waiting forever on a loading
+screen, as Treadline does; its `game.js` is about 400 KiB of its 512 KiB.
+Installed apps may precompile at most eight classic scripts and 1 MiB of
+admitted source in aggregate; the source remains packaged as the
 engine-version-independent fallback. Splitting code can improve maintenance,
 but it does not expand the aggregate JavaScript heap or installation budget.
+The restored code itself occupies the script heap: measured on the 64-bit
+host (the PSP's 32-bit pointers make it somewhat smaller), Treadline's ~690 KB
+of source restores to roughly 0.79 MB of QuickJS heap before the game
+allocates anything, and 1 MiB of dense synthetic code to roughly 1.8 MB, so a
+1 MiB game should be designed around the remaining heap, not the package
+limit.
 
 For animation, treat 16.67 ms as the aspirational 60 Hz frame time and 33.33 ms
 as the maximum steady 30 Hz frame time. Device qualification separately counts
 frames above 34 ms. These are performance targets, not scheduler guarantees:
 the browser may skip an animation callback rather than queue a backlog.
+
+Page time is not wall time. On the PSP the page clock that drives
+`requestAnimationFrame()` timestamps, `setTimeout()` and `setInterval()`
+follows the wall clock but advances by at most one 16 ms tick per browser
+loop, and never catches up. A long loop therefore slows page time: a menu
+frame over a live canvas took about 50 ms on a PSP-3000 in October 2026, so
+0.15 s of page time lasted about half a second. Gameplay can accept that
+(a stall slows the game rather than replaying it), but UI rests, debounces
+and key repeat should read `performance.now()` once per frame while they wait.
 
 ## Reliable API subset
 
@@ -167,6 +237,15 @@ state are outside v1. New textures intentionally use `LINEAR` and
 Unsupported shader shapes and excess resources report ordinary WebGL failure
 or bounded context loss so the surrounding page can remain useful.
 
+Shaders are translated to a fixed-function colour, texture × vertex colour ×
+instance colour × one `vec4` uniform or constant, at link time. Control flow
+that depends on per-pixel or per-vertex data, vertex texture lookups,
+non-2D lookups, and a second sampled texture fail `linkProgram()`. Uniform-only
+branches and colour or position math the GE cannot apply link with a
+`WARNING:` program info log naming the construct and line, one
+`console.warn` per program, and the `shaderWarnings` diagnostic counter. An
+empty program info log means the PSP draws exactly what the shader computes.
+
 See [WebGL authoring](WEBGL.md) for exact shader shapes, texture behavior,
 instancing, antialiasing, context restoration, and the PSP GE qualification
 path.
@@ -185,7 +264,26 @@ await navigator.tilefinch?.requestPageControls?.(gameCanvas);
 
 The optional element becomes fullscreen through the existing standards
 lifecycle; omitting it uses the document root. Games must feature-detect the
-extension and fall back to `Element.requestFullscreen()`. Holding **Start + Select** for 0.7
+extension and fall back to `Element.requestFullscreen()`.
+
+The native notice lasts five seconds. A game that claims Page controls again
+later in the same page load (each Deploy, or a resume after a pause menu) can
+ask Tilefinch not to repeat it:
+
+```js
+navigator.tilefinch?.requestPageControls?.(gameCanvas, {notice: "once"});
+```
+
+`"once"` only quiets a repeat. Tilefinch always shows the notice on the first
+entry of each page load, whatever the page asks, and on every manual
+Start+Select entry; it never hides the **Page controls off** or **need an
+active JS page** messages. The scope is the page load rather than the site or
+the session: a reload or a navigation is a new context in which the player may
+not remember the exit chord, and the state lives and dies with the document
+instead of in browser storage. `"always"` (or no option) keeps the notice on
+every entry. The accepted values are listed in
+`navigator.tilefinch.pageControlsNotices`; other browsers and older Tilefinch
+builds ignore the option, so the call needs no separate fallback. Holding **Start + Select** for 0.7
 seconds remains the manual entry fallback and unconditional exit. Navigation, native media,
 suspend, and page retirement also end capture. The firmware HOME callback is
 outside page control and remains a system escape.
@@ -211,6 +309,17 @@ vector. This keeps physics, deterministic snapshots, and old peers independent
 of a player's local preference. Treat directional face inputs as positions,
 not confirm/cancel actions, and leave Start+Select unassigned so the native exit
 chord remains unconditional.
+
+Charge/release controls can use a held-fire bit without growing the packet, but
+they change its meaning: version the simulation protocol and reject old peers.
+Cancel a charge on pause, lost visibility, and local-player handoff. Never let
+game shortcuts consume input intended for a replay-code text field.
+
+For deterministic replays, record the post-input world-space command and bounded
+step duration, plus initial seed/loadout and a simulation version. Verify a
+final digest and report mismatches. Rendering must not consume the gameplay RNG.
+Use fixed RAM rings for killcam frames and input logs; export/import can do
+bounded menu-time work, but automatic capture must not write storage.
 
 Aim assistance should be bounded and local. A fixed actor scan, angular cone,
 and line-of-sight test are appropriate; allocation, spatial-index rebuilding,
@@ -242,6 +351,28 @@ and `resume()` requires trusted activation. Native media and PSP suspend
 release the audio channel while retaining decoded effects. Compressed effects,
 custom processing graphs, audio worklets, long-horizon scheduling, and PCM
 readback are outside v1.
+
+Gain and oscillator-frequency `AudioParam.setValueCurveAtTime()` copy 2–64
+float32 samples into the native mixer. Linear interpolation and the final
+held value continue without JavaScript ticks. The combined start delay and
+duration must fit ten seconds; samples must be finite and within gain 0–4 or
+frequency 1–20,000 Hz. Prepare and reuse effect curves rather than allocating
+them on each shot. Use two samples for a linear pitch sweep; extra samples
+only add setup work unless the effect genuinely changes shape. This bounded
+subset requires a live source, a fixed gain/
+panner graph, zero oscillator detune, and one curve per parameter. Cancel at
+the current time before replacing a curve or switching to target envelopes;
+future cancellation, overlapping curves, and general automation timelines are
+not implemented. The older linear/exponential ramp methods remain immediate
+value setters, not scheduled ramps.
+
+`GainNode.gain.setTargetAtTime()` is the supported envelope: it publishes a
+native target ramp for each source connected through that gain, and the mixer
+thread applies it with no JavaScript ticks. `cancelScheduledValues()` works
+only at the current time. Start the context from the trusted Play press:
+`resume()` without user activation rejects with `NotAllowedError`, and an
+automated run that never presses anything never starts game audio. Treat a
+rejection as "silent until the next Play", not as a reason to retry.
 
 ### Storage
 
@@ -341,6 +472,15 @@ must remain reachable.
   accessibility, but do not mutate DOM text, classes, or transforms every
   frame. Quantize meters and angles so their retained mesh changes only when
   the visible result changes.
+- Draw small in-canvas text as whole-pixel geometry. A 320×180 canvas
+  reaches the screen through the nearest 2:3 scale, so a one-pixel canvas
+  stem is one or two screen pixels depending on its column, while a stem two
+  canvas pixels wide is always three. Fragment shaders are translated to
+  fixed function (the fragment colour is the vertex colour, or the texture
+  times it), so per-fragment logic such as a shader-drawn text shadow cannot
+  run on the PSP: a branch on a varying fails `linkProgram()` with the line
+  named. Emit it as geometry or leave it out. Treadline's 5×7 HUD font is a
+  worked example.
 - Keep player input and the player-controlled actor at presentation cadence.
   If a bounded simulation is still expensive, distribute independent bot AI
   or background planning across frames; never delay local input to make that
@@ -354,15 +494,84 @@ must remain reachable.
   smooth expansion. Testing only the ground projection can collapse an
   elevated camera; testing only the eye permits a nearby wall to fill the
   viewport.
+- Give AI visibility tests a cheap segment/box broad phase before division.
+  Fixed-position destructible cover can use a startup-owned candidate grid;
+  keep live active flags and the exact narrow-phase test, include the largest
+  admitted actor radius, and fall back for larger queries. Test cell edges,
+  every arena, and cover destruction against the original full scan.
+  Rank route candidates before testing their visibility, retain a checked
+  waypoint while its grid cell is unchanged, and invalidate on scenery edits.
+  Goal-based distance fields can share bounded storage across actors when
+  their occupancy rules match; key them by goal and grid revision and check
+  the key again after eviction. Keep actor-specific waypoint/visibility state
+  separate. Preserve traversal order when simplifying a flood-fill loop.
+  Expensive bank-shot strategy need not run at tread cadence: retain per-actor
+  results, recheck on a bounded timer and before firing, and cancel telegraphs
+  immediately when smoke breaks visibility. Never share mutable plan scratch
+  between actors.
+- Prepare a ray's direction, absolute direction and bounds once, not once
+  per candidate. A bounded conservative mask can narrow candidates, but the
+  exact predicate must still decide every intersection. Retest a remembered
+  blocker against the current ray and active geometry *before* constructing
+  the full candidate mask; never reuse the previous visibility answer.
+  Give independent bank-shot faces/legs and waypoints separate blocker slots.
+  Preserve original first-hit order for projectiles. Existing point grids may
+  beat a more general interval-table lookup for small obstacle lists.
+  Validate against identical captured queries, including destruction, gates,
+  cell edges and near-axis arithmetic; compare each result/identity, not just
+  a digest. Time setup separately from query batches and gather visit counts
+  in a separate run so counting does not manufacture a speedup.
+- For finite distances and radii, multiply a value by itself rather than
+  using `value ** 2`: the PSP interpreter's exponent operation enters
+  software `pow()`, unlike multiplication. Measure action frames as well as
+  averages; a cheap-looking numeric expression can dominate a contact loop.
+- Cache final scalar AI parameters when their wave/settings key changes,
+  rather than caching only interpolation weights and repeating soft-float
+  arithmetic for every actor. Preserve the original arithmetic at refresh
+  time and check every parameter and difficulty against the uncached formula.
+  In collision loops, reject on one squared axis before computing the second
+  when it cannot change the exact contact result. Fixed-position crates can
+  use the same candidate-grid recipe as cover; build after placement, retain
+  live active flags, and use a full scan while placement is in progress.
+  For bounded nonnegative grid coordinates, integer conversion can replace a
+  native `Math.floor` call; reject out-of-range coordinates before conversion
+  so truncation cannot turn an outside point into cell zero.
+  For clamped grids, clamp the scaled coordinate before truncating. Preserve
+  non-finite input behavior and verify cell boundaries against the original
+  formula; a bitwise conversion alone wraps large coordinates.
+- Prepack immutable instance tints at startup; keep animated flash/telegraph
+  tints in per-entity scratch. Preserve intermediate float rounding when
+  comparing the instanced and expanded fallback paths. Do not build meter
+  geometry or colors for entities whose presentation does not include it.
+- Skip updates for expired zero-valued timers. Retain stationary surface
+  heights only when all placement, arena-change and network-correction paths
+  initialize them; never reuse them across moving terrain or a new arena.
 - Keep readback, image export, DOM layout queries and mutations, storage
   writes, and asset decoding outside the animation loop.
+- Pre-create bounded audio voices and schedule supported native gain
+  envelopes rather than ticking fades in JavaScript. Profile cancellation,
+  gain reset, attack and release separately: these costs are nested inside
+  shot/impact work, not additional frame phases. Keep isolated sound bursts
+  outside displayed-gameplay measurements. Bootstrap automation should reuse
+  private graph-membership records without per-segment callback closures.
 - Preload only the bounded assets needed for the next screen. Show progress or
   a useful menu while optional resources remain unavailable.
 - Measure on a physical PSP. PPSSPP is a correctness and lifecycle gate, not a
-  performance oracle.
+  performance oracle: at its normal clock it is faster than the device, and
+  at a fixed 111 MHz (`TILEFINCH_PPSSPP_CPU_MHZ=111`) it is slower on
+  CPU-bound work. Use 111 MHz as a deterministic pressure bracket; the
+  physical device decides.
+- For a fixed navigation grid, prepare exact cell/object membership when the
+  arena is placed. Destruction and gate changes can then combine those
+  retained memberships with live active-object bits instead of repeating
+  geometric tests for every cell. Keep the original publication slices and
+  revision boundary: faster preparation must not expose a partial field or
+  change AI reaction timing. This does not replace fresh tank or projectile
+  collision queries.
 
-These are measured constraints rather than stylistic preferences. The current
-Treadline Arena physical-PSP qualification sustained 8,701 displayed gameplay
+These are measured constraints rather than stylistic preferences. The earlier
+Treadline Arena physical-PSP qualification, before the Daily/replay/boss and
+expanded-AI additions, sustained 8,701 displayed gameplay
 pipelines across a 5.5-minute repeated-action soak. Median/p95/worst pipeline
 times were 33.221/33.247/33.280 ms, with no pipeline above 34 ms. Native WebGL
 averaged 2.998 ms (3.650 ms p95, 3.874 ms maximum), canvas conversion averaged
@@ -371,10 +580,117 @@ maximum. Peak page ownership remained at the 9.88 MiB load-time high-water
 mark, no allocation was refused, and post-warm-up retained growth was 45.6 KiB;
 about 4.1 KiB of that was the bounded draw-template state. Authors should
 repeat the measurement for their own scene rather than assume these timings.
-The separate validation-only GE publication probe was pixel-exact but saved
-only about 0.9 ms over CPU conversion plus the page-buffer copy, so the
-tear-free CPU compositor remains the default; reducing per-frame page work is
-the larger opportunity for this workload.
+The expanded game requires fresh hardware qualification; this historical
+result is not a performance claim for its new modes. Later component runs on
+a PSP-3000 (validation build, October 2026, see the
+[performance ledger](engineering/PERFORMANCE_LEDGER.md)) are encouraging but
+are not that qualification: an Onslaught boss wave with real input and audio
+missed 3 of 2,176 two-vblank deadlines (readiness p95 28.2 ms, maximum
+33.7 ms), and the long soak 20 of 2,046 (with the Enhanced lighting, now
+Treadline's only look).
+
+The sections below collect what building Treadline taught about the PSP.
+Figures are dated physical PSP-3000 measurements from the ledger. Several of
+the browser paths involved are still being optimized, so treat them as the
+current cost model rather than promises.
+
+### Clocks and attribution
+
+`performance.now()` costs 65-70 µs per call on the PSP (`Date.now()` 73 µs,
+an ordinary JavaScript call about 2 µs, a soft-float add, multiply or compare
+0.5-1.0 µs). A frame instrumented with phase timers ran about 10 ms slower,
+so phase clocks cannot attribute a 33 ms frame's tail. Keep phase timers out
+of shipping frames; spend a clock read only where a decision depends on it,
+as Treadline does twice per frame to decide whether to defer optional HUD
+work. Count events per frame (shots, hits, particles, route
+searches) and join them to the browser's own frame record instead, or time
+one isolated operation many times outside gameplay. Reading
+`AudioContext.currentTime` costs about 0.1 ms; read it once per scheduling
+decision.
+
+### WebGL cost model
+
+- **Publication.** An eligible canvas is published by the GE by default: one
+  opaque WebGL canvas filling the viewport at the 2:3 scale (a 320×180
+  backing shown at 480×270) with nothing composited above it — no HTML
+  overlay, fixed or sticky element, scroll thumb, or focus outline. The GE
+  scales it into the back buffer in about 0.7 ms instead of the CPU's ~5 ms of
+  conversion and copy, pixel-exact. On Treadline's long soak this cut missed
+  deadlines from 4.1% to 0.5%. A DOM HUD, menu or toast keeps that frame on
+  the CPU compositor, so draw per-frame layers in the canvas and accept the
+  CPU path only while a menu is open.
+- **Instances.** Native WebGL work on a 64-instance boss wave is about
+  2.1 ms per frame, the largest part (0.9 ms) colouring instance vertices.
+  Instances of one draw whose tints are bit-identical share one coloured
+  copy, so a small quantized tint palette is cheaper than per-instance colour
+  variation; unchanged retained geometry drawn without instance colours is
+  read by the GE in place. The JavaScript side is real too: writing eight changing matrix
+  words and four tint words for 64 instances into `Float32Array`s took about
+  1.2 ms. Write constant matrix words once, skip actors that did not move, and
+  prefer fewer, larger draws.
+- **Effects.** Measured per event: one sound start 0.84 ms, a six-particle
+  burst 0.54 ms plus about 0.05 ms per live particle per frame, a decal
+  0.14 ms. A hit frame stacks several of these, which is where the remaining
+  late frames sit. Give optional effects a per-frame budget and drop them
+  before actors, shells or input.
+
+### Allocation and strings
+
+QuickJS frees acyclic garbage by reference counting as soon as it is dropped,
+but a cycle collection walks the whole live heap and can cost more than a
+whole frame on the PSP. Treadline's measured gameplay frames allocate zero
+JavaScript bytes: pools, typed arrays and retained closures are created at
+startup and reused. Tilefinch's QuickJS appends `s += piece` in place when
+`s` is a function-local variable; the same append to an object property,
+closure variable or global copies the whole string every time, which turns
+string building quadratic. Build strings in a local and assign once, and do
+not build them per frame at all.
+
+### Menus over a live canvas
+
+HTML menus over a running WebGL canvas are retained as an overlay and blended
+over every canvas frame. Measured on Treadline's menus (2026-10-04 and
+2026-10-05):
+
+- **No focus-event listeners.** Any `focus`, `blur`, `focusin` or `focusout`
+  listener on the page, even one on `window`, makes every D-pad focus move
+  dispatch all four events through script: 26-28 ms of script plus 3.6 ms of
+  natives per move. With none, focus moves take the native path. Poll
+  `document.activeElement` from the menu's frame loop when a screen must react
+  to focus. Treadline's menu-layout gate fails when the page observes focus
+  events.
+- **Paint-only focus styles.** Style focus with `:focus`/`:focus-visible`
+  CSS. An outline, a uniform border colour or a single zero-offset unblurred
+  inset ring changes paint only: no relayout, and only the damaged rectangle
+  of the overlay is repainted. A Treadline focus move is one 51 ms loop
+  (press to first visible about 70 ms); a border-colour focus in a centred
+  dialog over an animated canvas, 60 ms. Background, text colour, opacity,
+  filter, transform or larger shadow changes take a relayout.
+  `left: 50%; top: 50%; transform: translate(-50%, -50%)` centring stays on the
+  paint-only path; a scaled, rotated, filtered or translucent ancestor does
+  not.
+- **Text changes.** A visible text change repaints only its damage but still
+  costs a relayout: a Range Faults note write is a 114-117 ms loop, of which
+  the relayout is 35-40 ms. Skip writes whose text is unchanged (they still
+  relayout) and write a focus note once focus has rested 150 ms of wall time,
+  not on every step of a held D-pad.
+- **Screen switches.** A switch that changes the panel's box rebuilds the
+  whole overlay in one loop: 241-318 ms of raster for Treadline's panel, a
+  large share of it the 18 px glow shadow. Keep panel geometry stable between
+  screens where you can, and keep large blurred shadows off panels that
+  change size.
+
+### Starting a match
+
+Keep the Play/Deploy press light. On a PSP-3000 Treadline's first frame
+without the menu arrives about 0.5 s after Deploy and steady 33 ms frames
+begin about 0.58 s after it. Most of that first loop is the game's own click
+turn, and about 180 ms of the turn is `music.js` building its segments: work
+of exactly the kind that belongs before the press. Generated arenas are built in bounded
+slices across frames behind a progress screen rather than inside the press.
+Do one-time work such as level generation, geometry upload and pool warm-up
+while the menu is idle or in such slices, start audio and Page controls from
+the press itself, and avoid DOM changes in the same handler.
 
 ## Offline packaging
 
@@ -388,22 +704,33 @@ page has already loaded. It does not crawl links, guess future assets, archive
 cross-origin dependencies, or run a Service Worker. The installation preview
 reports estimated size, captured resources, known unavailable resources,
 display mode, theme color, and whether the operation is Install, Update, or
-Reinstall. It also precompiles up to eight classic scripts from at most 512 KiB
-of admitted source and stores at most 512 KiB of source-bound QuickJS bytecode.
-The packaged source remains the fallback after an engine ABI change or failed
-bytecode restore, so authors do not ship or depend on compiler artifacts.
+Reinstall. It also precompiles up to eight classic scripts from at most 1 MiB
+of admitted source and stores at most 1 MiB of source-bound QuickJS bytecode.
+Scripts beyond either bound are packaged source-only, as is a script whose
+compilation is refused for memory. The packaged source remains the fallback
+after an engine ABI change or failed bytecode restore, so authors do not ship
+or depend on compiler artifacts; after an update **Library → Saved** marks an
+installed game **RECOMPILE** and offers to recompile it from that source
+before it is opened (see
+[After a browser update](OFFLINE_LIBRARY.md#after-a-browser-update)). A precompiled script's source is not held in
+memory after launch; it is read from the Memory Stick only when needed (see
+[Script source on demand](OFFLINE_LIBRARY.md#script-source-on-demand)).
 
 Hard snapshot limits are:
 
 - 1 MiB serialized document;
-- 1 MiB aggregate captured response bodies and no more than 32 resources;
-- a 1,736,704-byte resource-pack envelope including compiler artifacts and
+- 1.5 MiB aggregate captured response bodies (about 1 MiB of script plus
+  512 KiB of CSS, images, fonts and data) and no more than 32 resources;
+- a 2,785,280-byte resource-pack envelope including compiler artifacts and
   bounded metadata;
 - one decoded 16×16 RGBA icon in the native library;
 - 12 total items across the offline library.
 
 Keep HTML, CSS, JavaScript, fonts, images, and PCM effects same-origin and make
-the game usable when an optional resource is listed as unavailable. Opening an
+the game usable when an optional resource is listed as unavailable. The
+snapshot can only capture responses still held by the live memory cache, so a
+game larger than the **Memory cache** setting needs that setting raised
+(for example to 2 MB) before it is loaded for installation. Opening an
 installed app does not itself require or start a network connection. Network
 work begins only when the page explicitly requests it, such as an opt-in
 multiplayer action.

@@ -10,8 +10,12 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/content_security_policy.h"
+#include "tilefinch/text_encoding.h"
 
 typedef struct DocumentControlState DocumentControlState;
+typedef struct DocumentNonceSlot DocumentNonceSlot;
+typedef struct DocumentNonceRegistry DocumentNonceRegistry;
+typedef struct DocumentAdoptedSheets DocumentAdoptedSheets;
 typedef struct MediaDeclaredVideoCache MediaDeclaredVideoCache;
 
 #define DOCUMENT_CONTROL_VALUE_LIMIT 512u
@@ -107,6 +111,27 @@ typedef enum {
     DOCUMENT_GLYPH_SCRIPT_HEBREW = 1u << 6
 } DocumentGlyphScript;
 
+#define DOCUMENT_GLYPH_SCRIPT_KINDS 7u
+#define DOCUMENT_GLYPH_CENSUS_SAMPLES 4u
+/* A script is in meaningful use when the visible text holds at least this
+   many of its codepoints and at least one per DOCUMENT_GLYPH_OFFER_SHARE
+   visible-text bytes. The share keeps a long article's language-picker list
+   ("Русский", "العربية") from counting as the page's own script. */
+#define DOCUMENT_GLYPH_OFFER_MINIMUM 32u
+#define DOCUMENT_GLYPH_OFFER_SHARE 20u
+
+/* Collected by the parser's existing visible-text statistics pass; no extra
+   DOM walk and no font or storage access. `samples[i]` holds the page's
+   codepoints of script bit i at its 1st, 4th, 16th and 64th occurrence
+   (zero where the page had fewer), so a consumer can test real page
+   characters against the active faces: the embedded fonts carry Latin
+   Extended-A/B but not Latin Extended Additional, for example. */
+typedef struct {
+    uint16_t offer_mask;
+    uint32_t samples[DOCUMENT_GLYPH_SCRIPT_KINDS]
+                    [DOCUMENT_GLYPH_CENSUS_SAMPLES];
+} DocumentGlyphCensus;
+
 typedef struct {
     Budget *budget;
     BudgetAllocationOwner allocation_owner;
@@ -130,6 +155,8 @@ typedef struct {
        The PSP frontend uses this compact hint to attach installed fallback
        packs lazily; it is not serialized and causes no storage I/O here. */
     uint16_t glyph_script_mask;
+    /* The same pass's usage census, for the in-page language-pack offer. */
+    DocumentGlyphCensus glyph_census;
     /* Existing parser-census fact that keeps ordinary LTR pages out of the
        paragraph bidi pipeline without a second DOM walk. */
     bool bidi_text_present;
@@ -164,6 +191,10 @@ typedef struct {
     /* Aggregate authored focus intent. The engine carries one bounded
        post-layout autofocus obligation only for documents that need it. */
     bool autofocus_attribute_present;
+    /* Parsed with scripting explicitly disabled (JavaScript off for this
+       page): <noscript> holds ordinary elements and renders. Documents built
+       any other way keep the scripting-aware rule that hides it. */
+    bool noscript_rendered;
     /* Lazily populated, page-lifetime declaration cache. Keeping this on the
        retained document gives layout, image discovery, Reader and activation
        one immutable selection without rescanning large data scripts. */
@@ -177,6 +208,17 @@ typedef struct {
     lxb_dom_node_t *declared_video_card_node;
     lxb_dom_node_t *reader_declared_video_card_node;
     DocumentParserInsertionJournal parser_insertions;
+    /* [[CryptographicNonce]] slots; see document_element_nonce(). */
+    DocumentNonceRegistry *nonce_registry;
+    /* Constructed stylesheets and the adoptedStyleSheets lists naming them;
+       see document_adopted_sheets_active(). NULL until a page adopts one. */
+    DocumentAdoptedSheets *adopted_sheets;
+    /* The document's character encoding (a TilefinchEncoding). Zero is
+       UTF-8, the default for documents not built by a sniffing parser. */
+    uint8_t encoding;
+    /* The process-wide frame-container insertion count when this document's
+       parse began; see document_frames_impossible(). */
+    uint64_t frame_insertions_at_parse;
 } PocDocument;
 
 static inline bool document_is_declared_video_card(
@@ -234,6 +276,19 @@ typedef struct {
     bool active;
     bool failed;
     bool input_ended;
+    /* Encoding sniffing (HTML 13.2.3): BOM, then the transport charset,
+       then a <meta> prescan of the first 1024 bytes, then UTF-8. Bytes are
+       never held back: while fewer than 1024 have arrived and all were
+       ASCII, a declaration found later in that window still switches the
+       decoder. */
+    TilefinchDecoder decoder;
+    uint8_t transport_encoding;
+    bool encoding_decided;
+    bool encoding_tentative;
+    bool input_ascii;
+    size_t encoding_skip;
+    unsigned char *prescan_bytes;
+    size_t prescan_length;
 } DocumentParser;
 
 bool document_parser_begin(DocumentParser *parser, Budget *budget);
@@ -253,6 +308,11 @@ bool document_parser_script_was_truncated(
 /* Preserve the active HTML tree-builder model while discarding only future
    raw script payload text after navigation has shed optional author work. */
 bool document_parser_discard_remaining_script_text(DocumentParser *parser);
+/* The Content-Type charset of the response (tilefinch_encoding_from_content_
+   type). Must precede the first feed; NONE leaves the decision to the BOM
+   and the prescan. */
+bool document_parser_set_transport_encoding(DocumentParser *parser,
+                                            TilefinchEncoding encoding);
 bool document_parser_feed(DocumentParser *parser, const char *data,
                           size_t length);
 void document_parser_set_element_closed_callback(
@@ -276,6 +336,156 @@ void document_parser_insertions_clear(PocDocument *document);
 void document_parser_insertions_discard_subtree(PocDocument *document,
                                                 lxb_dom_node_t *root);
 
+/* HTML nonce attributes. An element's [[CryptographicNonce]] is its nonce
+   attribute until the element is given a slot: by connecting to a document
+   whose header-delivered CSP enabled hiding (the attribute then reads as
+   empty), or by the nonce IDL setter. An author write to the attribute
+   drops the slot again. Elements whose node->user already carries other
+   native state, or past the bounded slot table, keep a visible attribute:
+   hiding is a confidentiality measure, the CSP check stays correct. */
+const char *document_element_nonce(lxb_dom_node_t *element, size_t *length);
+bool document_element_set_nonce(PocDocument *document,
+                                 lxb_dom_node_t *element, const char *value,
+                                 size_t length);
+/* Called once a header-delivered policy is known; hides the nonces of
+   already connected elements and of every element connected later. */
+bool document_nonce_hiding_enable(PocDocument *document);
+/* HTML cloning steps: copy each source element's [[CryptographicNonce]]
+   to its clone (after Lexbor copied attributes and the caller cleared the
+   clone's native state). False when the bounded walk is exceeded. */
+bool document_nonce_clone_subtree(lxb_dom_node_t *source,
+                                  lxb_dom_node_t *clone, bool deep);
+
+/* Constructed stylesheets (new CSSStyleSheet()) and adoptedStyleSheets.
+
+   A constructed sheet's text lives once, in a detached <style> element the
+   script bridge owns and pins while any list adopts it; this registry knows
+   those elements, their text revision, and each adopting root's list (the
+   document, or a shadow root's native carrier). The stylesheet builders
+   parse every active sheet once, after the document's own <style> and
+   <link> sources: however many roots adopt a sheet, its rules enter the
+   cascade once. Tilefinch's cascade is document-wide (shadow trees are not
+   style scopes), so adoption by one root or by fifty is the same cascade.
+
+   The active tier is the adopted sheets of the document and of connected
+   shadow roots: lists in the order they were first set, each list in array
+   order, a sheet at its first appearance. Bounded: a list holds at most
+   DOCUMENT_ADOPTED_SHEETS_PER_ROOT sheets, and the registry at most
+   DOCUMENT_ADOPTION_ROOT_LIMIT lists, DOCUMENT_CONSTRUCTED_SHEET_LIMIT
+   sheets and DOCUMENT_CONSTRUCTED_TEXT_LIMIT bytes of sheet text; a
+   refused registration leaves everything as it was. */
+#define DOCUMENT_ADOPTED_SHEETS_PER_ROOT 16u
+/* Lit gives every component instance's shadow root its class's sheets, so
+   a component page needs one list per live root (MDN: ~100 when its
+   budget admits that many roots, DOM_BRIDGE_SHADOW_ROOT_LIMIT). Kept
+   within uint8_t for the sorted index; the registry exists only on pages
+   that adopt sheets. */
+#define DOCUMENT_ADOPTION_ROOT_LIMIT 128u
+#define DOCUMENT_CONSTRUCTED_SHEET_LIMIT 128u
+#define DOCUMENT_CONSTRUCTED_TEXT_LIMIT (1024u * 1024u)
+#define DOCUMENT_ADOPTED_TIER_LIMIT 64u
+/* Bytes of parsed form (structural IR plus compiled selector fragment)
+   kept for all of a document's constructed sheets together, so a full
+   stylesheet rebuild replays them instead of reparsing. Past it a sheet
+   keeps part of its form, or none, and is reparsed. */
+#define DOCUMENT_CONSTRUCTED_CACHE_LIMIT (640u * 1024u)
+/* Records that `sheet` (a detached <style>) now holds `text_bytes` of text,
+   registering it on first use; its revision advances. False when a bound
+   refuses it (nothing changes). `active` reports whether a connected root
+   adopts it, so the cascade must change. */
+bool document_constructed_sheet_note_text(PocDocument *document,
+                                          lxb_dom_node_t *sheet,
+                                          size_t text_bytes, bool *active);
+/* Whether `text_bytes` of text for `sheet` would fit the text bound. */
+bool document_constructed_sheet_text_fits(const PocDocument *document,
+                                          const lxb_dom_node_t *sheet,
+                                          size_t text_bytes);
+bool document_constructed_sheet_known(const PocDocument *document,
+                                      const lxb_dom_node_t *node);
+/* Replaces `root`'s list (NULL root: the document) with `sheets`, each
+   already registered. An empty list keeps the root registered (see
+   document_adoption_root_known). Sheets no list names
+   any more are written to `released` (capacity
+   DOCUMENT_ADOPTED_SHEETS_PER_ROOT) for the owner to unpin. False when a
+   bound refuses the change (nothing changes). */
+bool document_adoption_set(PocDocument *document, lxb_dom_node_t *root,
+                           lxb_dom_node_t *const *sheets, size_t count,
+                           lxb_dom_node_t **released,
+                           size_t *released_count);
+/* Whether any list adopts `sheet`. */
+bool document_constructed_sheet_adopted(const PocDocument *document,
+                                        const lxb_dom_node_t *sheet);
+/* Whether a list was ever set for shadow-root carrier `root` and the
+   carrier still lives: an emptied list stays registered until its
+   subtree is destroyed. Compares addresses only. */
+bool document_adoption_root_known(const PocDocument *document,
+                                  const lxb_dom_node_t *root);
+/* Whether `node` is a shadow-root carrier whose list is not empty. */
+bool document_adoption_root_has_sheets(const PocDocument *document,
+                                       const lxb_dom_node_t *node);
+/* Whether any shadow root (not the document) adopts a sheet: a cheap
+   guard before per-node document_adoption_root_has_sheets() lookups. */
+bool document_adoption_shadow_roots_present(const PocDocument *document);
+/* The active tier in cascade order, with each sheet's text revision
+   (`revisions` may be NULL). Returns the count, or SIZE_MAX when it does
+   not fit `capacity`. */
+size_t document_adopted_sheets_active(const PocDocument *document,
+                                      lxb_dom_node_t **sheets,
+                                      uint32_t *revisions, size_t capacity);
+/* The document_adopted_tier_hash fold of one tier entry. The page sheet
+   keeps the fold of the entries it parsed (Stylesheet). */
+uint64_t document_adopted_tier_hash(uint64_t hash,
+                                    const lxb_dom_node_t *sheet,
+                                    uint32_t revision);
+/* Identity of everything adoption contributes to the cascade: each active
+   list's root and sheets with their text revisions, in order. 0 when no
+   list is active. */
+uint64_t document_adopted_sheets_signature(const PocDocument *document);
+/* Before `root`'s subtree is destroyed: forgets the lists of roots inside
+   it and the sheets inside it. Sheets no list names any more are written to
+   `released` (up to `capacity`; the count is returned) for unpinning. */
+size_t document_adoptions_discard_subtree(PocDocument *document,
+                                          const lxb_dom_node_t *root,
+                                          lxb_dom_node_t **released,
+                                          size_t capacity);
+/* The adoption lists in cascade order, for scoping: the index-th list's
+   root (NULL: the document), sheets and whether it is active (the document,
+   or a connected shadow root). False past the last list. */
+bool document_adoption_list_at(const PocDocument *document, size_t index,
+                               const lxb_dom_node_t **root,
+                               lxb_dom_node_t *const **sheets, size_t *count,
+                               bool *active);
+/* The parsed form cached for `sheet` at text `revision`: borrowed, valid
+   until the next registry change. False when there is none. */
+bool document_constructed_sheet_cache(const PocDocument *document,
+                                      const lxb_dom_node_t *sheet,
+                                      uint32_t revision,
+                                      const unsigned char **ir,
+                                      size_t *ir_bytes,
+                                      const unsigned char **fragment,
+                                      size_t *fragment_bytes);
+/* Copies a freshly built parsed form for `sheet` at `revision` into the
+   registry (document-owned, charged to style), replacing any older one;
+   within the cache bound, the IR first. A text change drops it. False
+   when nothing was kept. A cache, not document content: stylesheet
+   builders holding a const document may fill it. */
+bool document_constructed_sheet_cache_store(const PocDocument *document,
+                                            const lxb_dom_node_t *sheet,
+                                            uint32_t revision,
+                                            const unsigned char *ir,
+                                            size_t ir_bytes,
+                                            const unsigned char *fragment,
+                                            size_t fragment_bytes);
+/* Counts a parse of `sheet`'s text at `revision`; true from the second
+   parse on, when caching its parsed form starts to pay. */
+bool document_constructed_sheet_note_parse(const PocDocument *document,
+                                           const lxb_dom_node_t *sheet,
+                                           uint32_t revision);
+size_t document_constructed_sheet_cache_bytes(const PocDocument *document);
+/* Registered constructed sheets (diagnostics and tests). */
+size_t document_constructed_sheet_count(const PocDocument *document);
+void document_adopted_sheets_destroy(PocDocument *document);
+
 /* Scope raw Lexbor mutations to the document that owns the resulting DOM
    allocations. Callers which mutate parser.document outside parser APIs must
    use this pair; normal script/controller paths scope this automatically. */
@@ -296,6 +506,13 @@ void document_allocation_owner_leave(const PocDocument *document,
  * "nothing changed". */
 uint64_t document_style_generation(void);
 void document_style_changed(void);
+/* True while no <iframe> or <frame> can be in any of `document`'s trees
+   (connected, detached or template contents): every element is inserted
+   somewhere when created, and page documents count frame-container
+   insertions process-wide, so none has been inserted anywhere since the
+   document's parse began. A document whose insertions are not counted
+   answers false. Lets frame walks skip pages without frames. */
+bool document_frames_impossible(const PocDocument *document);
 /* Lexbor writes between these do not advance the generation: the script
    bridge journals its own writes as mutation notes, and a probe that
    restores what it changed leaves nothing to see. Nesting is allowed. An
@@ -315,6 +532,11 @@ void document_node_removal_unlisten(DocumentNodeRemovalListener listener,
 
 bool document_parse(PocDocument *document, Budget *budget,
                     const char *html, size_t html_length, size_t chunk_size);
+/* document_parse with the response's Content-Type charset (see
+   document_parser_set_transport_encoding). */
+bool document_parse_with_transport_encoding(
+    PocDocument *document, Budget *budget, const char *html,
+    size_t html_length, size_t chunk_size, TilefinchEncoding transport);
 bool document_refresh(PocDocument *document);
 /* When a bounded script pass cannot start authored client-side UI, preserve
    useful static content: materialize a server-authored header navigation or
@@ -340,6 +562,28 @@ bool document_set_element_inner_html(PocDocument *document,
    execution. A partial serialization is never exposed as a fallback. */
 bool document_body_snapshot_capture(PocDocument *document,
                                     DocumentBodySnapshot *snapshot);
+/* The same bounded body with its <script> elements left out: what a page
+   whose realm has been retired can still show (memory rescue). */
+bool document_body_snapshot_capture_without_scripts(
+    PocDocument *document, DocumentBodySnapshot *snapshot);
+/* The server text and actions under <body>, outside script, style,
+   template, svg and noscript: what a reader sees before author script has
+   built anything. One allocation-free walk of at most node_limit nodes
+   (truncated when it stopped there) serves every "does the server page
+   have content" question: heavy pages, the body snapshot and memory
+   rescue. Each caller keeps its own threshold. */
+typedef struct {
+    /* Non-space text bytes, and text bytes with each whitespace run
+       counted once. */
+    size_t text_bytes;
+    size_t collapsed_text_bytes;
+    /* Links with an href, buttons, inputs, selects, textareas and forms. */
+    size_t action_count;
+    bool truncated;
+} DocumentVisibleContent;
+#define DOCUMENT_SNAPSHOT_VISIT_LIMIT 4096u
+DocumentVisibleContent document_body_visible_content(
+    const PocDocument *document, size_t node_limit);
 /* Allocation-free, 4K-node-bounded census used to detect a compact late
    server action without serializing the body at every parser checkpoint. */
 size_t document_body_action_count(const PocDocument *document);
@@ -357,12 +601,39 @@ lxb_dom_node_t *document_body_node(const PocDocument *document);
 const char *document_element_name(lxb_dom_node_t *node, size_t *length);
 const char *document_attribute(lxb_dom_node_t *node, const char *name,
                                size_t *length);
+/* An HTML <meta http-equiv=refresh> (ASCII case-insensitive). */
+bool document_is_refresh_meta(lxb_dom_node_t *node);
 /* CSP distinguishes authored/setAttribute style text from declarations made
    through the CSSOM. Lexbor attribute nodes provide a stable, clone-safe
    provenance slot without adding a page-sized side table. */
 bool document_style_attribute_cssom_authorized(lxb_dom_node_t *node);
 void document_style_attribute_set_cssom_authorized(lxb_dom_node_t *node,
                                                     bool authorized);
+/* Shadow-root carriers: the display:contents element the script bridge
+   appends to a shadow host to hold its shadow tree. Only native code can
+   mark one. Layout walks the flat tree (document_flat_first_child below);
+   a light child the flat tree leaves out (no slot is assigned it, or its
+   slot does not render because it or a shadow ancestor is `hidden`) is
+   also resolved display:none, so no path gives it a box. */
+bool document_mark_shadow_carrier(lxb_dom_node_t *node);
+bool document_node_is_shadow_carrier(const lxb_dom_node_t *node);
+lxb_dom_node_t *document_shadow_carrier_of_host(const lxb_dom_node_t *host);
+/* The nearest carrier at or above `node` (bounded walk), or NULL. */
+lxb_dom_node_t *document_shadow_carrier_containing(
+    const lxb_dom_node_t *node);
+bool document_shadow_light_child_rendered(const lxb_dom_node_t *carrier,
+                                          lxb_dom_node_t *child);
+/* False for a host's light text child the flat tree leaves out. */
+bool document_shadow_text_rendered(lxb_dom_node_t *text);
+/* Flat-tree traversal (DOM 4.2.2.3 / CSS Scoping 2): a shadow host's
+   children are its shadow tree (the carrier), a slot's are its assigned
+   light nodes (else its fallback content), and a light child's parent is
+   its slot. Plain DOM order on pages without shadow trees. Layout walks
+   boxes in this order, so slotted content lays out at its slot. */
+bool document_shadow_trees_present(void);
+lxb_dom_node_t *document_flat_first_child(lxb_dom_node_t *node);
+lxb_dom_node_t *document_flat_next_sibling(lxb_dom_node_t *node);
+lxb_dom_node_t *document_flat_parent(lxb_dom_node_t *node);
 const char *document_control_value(lxb_dom_node_t *node, size_t *length);
 bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
                                 const char *value, size_t length);

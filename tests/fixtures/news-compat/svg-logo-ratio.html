@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width"><style>
+body{margin:0;font:13px sans-serif}
+/* BBC News header: a viewBox-only logo, height from CSS, width auto. */
+.bar{flex:1;display:flex;justify-content:center;height:32px}
+.logo{display:flex;align-items:center;justify-content:center}
+.logo svg{height:30px;width:auto}
+.icon{display:block;height:26px;max-width:248px;fill:currentcolor}
+/* The same logo as a plain block in normal flow. */
+.plain{display:block;height:26px;width:auto;max-width:248px}
+/* Width from CSS, height auto. */
+.wide{display:block;width:56px}
+/* NYT masthead: a viewBox-only inline SVG in a sized block link. */
+.masthead{display:block;width:189px;height:26px;margin:5px auto 0}
+</style></head><body>
+<div class="bar"><div class="logo"><div><a href="/"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 32" class="icon"><path d="M80 0h32v32H80zM40 0h32v32H40zM0 0h32v32H0z"/></svg></a></div></div></div>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 32" class="plain"><path d="M80 0h32v32H80zM40 0h32v32H40zM0 0h32v32H0z"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 32" class="wide"><path d="M80 0h32v32H80zM40 0h32v32H40zM0 0h32v32H0z"/></svg>
+<a class="masthead" href="/"><svg viewBox="0 0 184 25" class="nyt"><path d="M0 0h184v25H0z"/></svg></a>
+</body></html>

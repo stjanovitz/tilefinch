@@ -1,0 +1,26 @@
+# The files of Treadline Arena's offline package, one per line, in the
+# order a PSP loads them: the one list every packaging command, script and
+# test reads. The deferred scripts are the ones index.html loads, which
+# tests/test_offline_app_limits.c reads from index.html itself.
+#
+# A second column, "qualification", marks a file only qualification
+# packages carry: qualification.js, which the page fetches for a
+# ?qualification=... URL. Ordinary packages leave it out, so they hold
+# seven scripts and qualification packages eight, all precompiled within
+# Tilefinch's eight-script limit. multiplayer-web.js is not packaged:
+# index.html writes it only for browsers without Tilefinch's direct
+# multiplayer API, so a PSP page never fetches it.
+#
+# An ordinary package:      awk '!/^#/ && NF == 1' package-files.txt
+# A qualification package:  awk '!/^#/ && NF { print $1 }' package-files.txt
+game.css
+arena-generator.js
+practice.js
+campaign.js
+controls.js
+music.js
+bots.js
+game.js
+qualification.js qualification
+icon.svg
+manifest.webmanifest

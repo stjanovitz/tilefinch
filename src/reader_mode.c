@@ -10,16 +10,51 @@
 
 #include <lexbor/dom/interfaces/element.h>
 
+/* The classifier keeps one scratch record per element, for at most 8,192
+   elements. Its walk may visit eight times as many nodes: text and comment
+   nodes cost no record, and article pages carry about one text node per
+   element (en.wikipedia.org's PlayStation Portable article: 6,130 elements,
+   about 13,000 nodes). */
 #define READER_NODE_LIMIT 8192u
+#define READER_ANALYZE_VISIT_LIMIT 65536u
 #define READER_DEPTH_LIMIT 128u
 #define READER_ENTRY_LIMIT 64u
 #define READER_PART_SCAN_LIMIT 256u
 #define READER_MARKER_LIMIT 640u
 #define READER_LABEL_LIMIT 192u
-#define READER_EXTRACT_NODE_LIMIT 512u
-#define READER_EXTRACT_VISIT_LIMIT 4096u
+/* An extracted view (Reader or Basic) is bounded by what it emits: emitted
+   semantic nodes and escaped markup bytes. Each emitted node costs about
+   1 KiB once presented (October 2026 site census: the parsed clone keeps
+   about 0.6 KiB per node, its laid-out boxes about 0.4 KiB more), so the
+   bound scales with the page budget's free room. A preparation always gets
+   the floor (512 nodes, 256 KiB: the fixed bound before scaling); beyond
+   that, one more node per KiB of room left above a 4 MiB reserve, up to
+   4,096 nodes. The reserve covers what presenting any view costs whatever
+   its size (restyling the raw page and laying out the view before the
+   page's scripts are retired: about 2 MiB on en.wikipedia.org, up to
+   3.3 MiB on the census) plus a margin, so the extra nodes never take the
+   room that step needs. The byte bound follows the node bound at 256 bytes per node
+   (census pages average about 120), between 256 KiB and 1 MiB. The markup
+   buffer grows on demand, so a small page never holds the whole byte bound.
+   Both bounds are fixed when a preparation starts, so the same budget state
+   always yields the same view. */
+#define READER_EXTRACT_NODE_CEILING 4096u
+#define READER_EXTRACT_NODE_COST 1024u
+#define READER_EXTRACT_RESERVE_BYTES (4u * 1024u * 1024u)
+#define READER_EXTRACT_BYTES_PER_NODE 256u
+#define READER_EXTRACT_BYTE_CEILING (1024u * 1024u)
+#define READER_EXTRACT_INITIAL_BYTES (64u * 1024u)
+/* Reader walks only its article or listing root; this bounds its non-emitting
+   wrappers and text at four source nodes per emitted node. */
+#define READER_EXTRACT_VISIT_LIMIT 16384u
+/* Basic view is bounded by what it emits, not by how much wrapper markup
+   precedes the content: a news front page reaches its first story after
+   thousands of layout wrappers (apnews.com: 24,585 nodes). The walk stops as
+   soon as the emitted prefix is full; this only bounds a page of mostly
+   non-emitting nodes, at the same ceiling as other whole-document walks.
+   Every 128 nodes is a cooperative checkpoint. */
+#define READER_BASIC_VISIT_LIMIT 65536u
 #define READER_EXTRACT_DEPTH_LIMIT 64u
-#define READER_EXTRACT_BYTE_LIMIT (256u * 1024u)
 #define READER_EXTRACT_TAIL_RESERVE 2048u
 #define READER_TEXT_WORK_SLICE 4096u
 #define READER_INLINE_STYLE_SCAN_LIMIT 2048u
@@ -78,10 +113,14 @@ typedef struct {
 
 typedef struct {
     const PocDocument *document;
+    Budget *budget;
     char *data;
     size_t length;
+    /* Allocated bytes; grows toward byte_limit. */
     size_t capacity;
+    size_t byte_limit;
     size_t content_limit;
+    size_t node_limit;
     size_t nodes;
     size_t visited_nodes;
     size_t escaped_input_bytes;
@@ -408,13 +447,70 @@ static bool reader_inline_style_hidden(lxb_dom_node_t *node)
         || (opacity.seen && opacity.hidden);
 }
 
+static lxb_dom_node_t *reader_next_within(lxb_dom_node_t *node,
+                                          lxb_dom_node_t *boundary);
+
+static bool reader_attribute_is_ci(lxb_dom_node_t *node, const char *name,
+                                   const char *wanted)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, name, &length);
+    return value != NULL && length == strlen(wanted)
+        && strncasecmp(value, wanted, length) == 0;
+}
+
+/* Collapsed disclosure content: a region the author hid with the `hidden`
+   attribute until the reader opens it, either `hidden=until-found` or the
+   WAI-ARIA disclosure pattern, where the control just before the region names
+   it in aria-controls and reports aria-expanded="false" (MediaWiki's mobile
+   sections hold almost all of an article this way). Reader and Basic retire
+   the page's scripts, so the control could never open it there; both keep
+   the content instead. The control search is bounded to 64 nodes of the
+   immediately preceding element. */
+static bool reader_collapsed_disclosure(lxb_dom_node_t *node)
+{
+    /* The caller has seen the attribute; a bare `hidden` has no value. */
+    size_t length = 0;
+    const char *hidden = document_attribute(node, "hidden", &length);
+    if (hidden != NULL && length == sizeof("until-found") - 1u
+        && strncasecmp(hidden, "until-found", length) == 0) return true;
+    size_t id_length = 0;
+    const char *id = document_attribute(node, "id", &id_length);
+    if (id == NULL || id_length == 0u) return false;
+    lxb_dom_node_t *previous = node->prev;
+    while (previous != NULL && previous->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        previous = previous->prev;
+    lxb_dom_node_t *at = previous;
+    for (size_t visited = 0; at != NULL && visited < 64u;
+         visited++, at = reader_next_within(at, previous)) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || !reader_attribute_is_ci(at, "aria-expanded", "false"))
+            continue;
+        size_t controls_length = 0;
+        const char *controls = document_attribute(
+            at, "aria-controls", &controls_length);
+        for (size_t token = 0; controls != NULL && token < controls_length;) {
+            while (token < controls_length
+                   && isspace((unsigned char) controls[token])) token++;
+            size_t start = token;
+            while (token < controls_length
+                   && !isspace((unsigned char) controls[token])) token++;
+            if (token - start == id_length
+                && memcmp(controls + start, id, id_length) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
 static bool reader_hidden_element(lxb_dom_node_t *node)
 {
     if (reader_name_is(node, "head") || reader_name_is(node, "script")
         || reader_name_is(node, "style") || reader_name_is(node, "template")
         || reader_name_is(node, "noscript")) return true;
     size_t length = 0;
-    if (reader_has_attribute(node, "hidden")) return true;
+    if (reader_has_attribute(node, "hidden")
+        && !reader_collapsed_disclosure(node)) return true;
     const char *aria_hidden = document_attribute(node, "aria-hidden", &length);
     if (aria_hidden != NULL && length == 4u
         && strncasecmp(aria_hidden, "true", 4u) == 0) return true;
@@ -610,20 +706,84 @@ static bool reader_document_head_media_hint(const PocDocument *document)
     return false;
 }
 
+static bool reader_extract_grow(ReaderExtractBuffer *output, size_t needed)
+{
+    if (needed <= output->capacity) return true;
+    if (needed > output->byte_limit) return false;
+    size_t next = output->capacity;
+    while (next < needed)
+        next = next > output->byte_limit / 2u ? output->byte_limit : next * 2u;
+    /* Optional growth never becomes a counted allocation failure: check the
+       room first (with slack for the allocator header). */
+    if (budget_remaining(output->budget) < next - output->capacity + 64u)
+        return false;
+    char *grown = budget_realloc_category(
+        output->budget, BUDGET_CATEGORY_DOM, output->data, next);
+    if (grown == NULL) return false;
+    output->data = grown;
+    output->capacity = next;
+    return true;
+}
+
 static bool reader_extract_append(ReaderExtractBuffer *output,
                                   const char *text, size_t length)
 {
     if (output == NULL || text == NULL) return false;
     size_t limit = output->tail_mode
-        ? output->capacity : output->content_limit;
+        ? output->byte_limit : output->content_limit;
     if (output->length >= limit
         || length > limit - output->length - 1u) {
+        if (!output->tail_mode) output->truncated = true;
+        return false;
+    }
+    /* Content appends keep the tail reserve allocated, so the closing tags
+       and notice after a cut never need to grow the buffer. A refused growth
+       ends the view at this balanced prefix, like the byte bound. */
+    size_t needed = output->length + length + 1u;
+    if (!output->tail_mode) {
+        needed += READER_EXTRACT_TAIL_RESERVE;
+        if (needed > output->byte_limit) needed = output->byte_limit;
+    }
+    if (!reader_extract_grow(output, needed)) {
         if (!output->tail_mode) output->truncated = true;
         return false;
     }
     memcpy(output->data + output->length, text, length);
     output->length += length;
     output->data[output->length] = '\0';
+    return true;
+}
+
+/* Fix one preparation's emitted bounds from the budget's free room and
+   allocate the initial markup buffer. */
+static bool reader_extract_begin(ReaderExtractBuffer *output,
+                                 PocDocument *document, bool basic_mode)
+{
+    *output = (ReaderExtractBuffer) {
+        .document = document,
+        .budget = document->budget,
+        .next_cooperate_at = READER_TEXT_WORK_SLICE,
+        .next_node_cooperate_at = READER_NODE_WORK_SLICE,
+        .basic_mode = basic_mode
+    };
+    size_t remaining = budget_remaining(document->budget);
+    size_t room = remaining > READER_EXTRACT_RESERVE_BYTES
+        ? remaining - READER_EXTRACT_RESERVE_BYTES : 0u;
+    size_t extra = room / READER_EXTRACT_NODE_COST;
+    if (extra > READER_EXTRACT_NODE_CEILING - READER_EXTRACT_NODE_FLOOR)
+        extra = READER_EXTRACT_NODE_CEILING - READER_EXTRACT_NODE_FLOOR;
+    output->node_limit = READER_EXTRACT_NODE_FLOOR + extra;
+    size_t bytes = output->node_limit * READER_EXTRACT_BYTES_PER_NODE;
+    if (bytes < READER_EXTRACT_BYTE_FLOOR) bytes = READER_EXTRACT_BYTE_FLOOR;
+    if (bytes > READER_EXTRACT_BYTE_CEILING)
+        bytes = READER_EXTRACT_BYTE_CEILING;
+    output->byte_limit = bytes;
+    output->content_limit = bytes - READER_EXTRACT_TAIL_RESERVE;
+    output->data = budget_malloc_category(
+        document->budget, BUDGET_CATEGORY_DOM, READER_EXTRACT_INITIAL_BYTES);
+    if (output->data == NULL) return false;
+    output->capacity = READER_EXTRACT_INITIAL_BYTES;
+    output->data[0] = '\0';
     return true;
 }
 
@@ -1177,7 +1337,9 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     if (output == NULL || node == NULL) return false;
     if (output->truncated) return true;
     if (depth > READER_EXTRACT_DEPTH_LIMIT
-        || output->visited_nodes++ >= READER_EXTRACT_VISIT_LIMIT) {
+        || output->visited_nodes++ >= (output->basic_mode
+                                           ? READER_BASIC_VISIT_LIMIT
+                                           : READER_EXTRACT_VISIT_LIMIT)) {
         output->truncated = true;
         return true;
     }
@@ -1220,6 +1382,10 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         || (!output->basic_mode
             && reader_excluded_region(output->document, node)))
         return true;
+    /* Form and control admission counts before this node, so a form the
+       bound cuts through can be withdrawn whole (see below). */
+    const uint16_t forms_checkpoint = output->retained_forms;
+    const uint16_t controls_checkpoint = output->retained_controls;
     bool admitted_form = in_admitted_form;
     if (reader_name_is(node, "form")) {
         admitted_form = false;
@@ -1300,7 +1466,7 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         output->bounded_out = true;
     bool separated_wrapper = !emitted && reader_flattened_block_wrapper(node);
     if ((emitted || marker_emitted)
-        && output->nodes >= READER_EXTRACT_NODE_LIMIT) {
+        && output->nodes >= output->node_limit) {
         /* Preserve a balanced semantic prefix and tell the reader that the
            suffix was intentionally omitted under the device bound. Unknown
            wrapper elements do not consume this scarce emitted-node quota
@@ -1497,6 +1663,17 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
                     &child_meaningful)) return false;
             meaningful = meaningful || child_meaningful;
         }
+    }
+    if (output->truncated && emitted && strcmp(tag, "form") == 0) {
+        /* A shortened Basic view may end mid-page, but never mid-form: a
+           form missing the controls after the cut would submit a different
+           query than the page's own. Withdraw the whole form instead. */
+        reader_extract_rewind(output, checkpoint);
+        output->nodes = nodes_checkpoint;
+        output->mapped_anchors = anchors_checkpoint;
+        output->retained_forms = forms_checkpoint;
+        output->retained_controls = controls_checkpoint;
+        return true;
     }
     if (emitted && strcmp(tag, "img") != 0 && strcmp(tag, "source") != 0
         && strcmp(tag, "input") != 0
@@ -1863,6 +2040,101 @@ static bool reader_mark_entry_parts(const ReaderNodeStat *stats,
     return true;
 }
 
+/* Automatic Reader replaces the page with its extraction, so it engages
+   only on a clear article. The October 2026 site census showed what
+   separates one from a front page, product page or application shell that
+   also has a dense text region:
+   - a page title (an h1) inside the extracted root;
+   - prose: at least five paragraphs of 120 bytes or more of their own text
+     with at most a quarter of it in links, making up at least a third of the
+     root's paragraphs, and with preformatted text, at least half of the
+     root's non-link text (a front page's short teasers and a converter's
+     label paragraphs fail this; reviews in list items do not count);
+   - at most two headline links: h2-h4 headings whose text is mostly a link
+     to another page (npr.org's front page has 44; a heading's own fragment
+     link, as on MDN, is not a headline link).
+   An authored <article> root with a heading needs only the headline rule. */
+#define READER_AUTO_PROSE_PARAGRAPH_BYTES 120u
+#define READER_AUTO_PROSE_PARAGRAPHS 5u
+#define READER_AUTO_HEADLINE_LINKS 2u
+
+static size_t reader_subtree_end(const ReaderNodeStat *stats, size_t count,
+                                 size_t root)
+{
+    /* Records are in document order, so a subtree is contiguous and ends at
+       the first record whose parent precedes the root. */
+    size_t end = root + 1u;
+    while (end < count && stats[end].parent != READER_INVALID_INDEX
+           && stats[end].parent >= root)
+        end++;
+    return end;
+}
+
+static uint32_t reader_own_content(const ReaderNodeStat *stat)
+{
+    return stat->text_bytes > stat->link_bytes
+        ? stat->text_bytes - stat->link_bytes : 0u;
+}
+
+static bool reader_heading_links_away(const ReaderNodeStat *stats,
+                                      size_t count, size_t heading)
+{
+    const ReaderNodeStat *stat = &stats[heading];
+    if (stat->text_bytes == 0u || stat->link_bytes * 2u < stat->text_bytes)
+        return false;
+    lxb_dom_node_t *anchor = NULL;
+    size_t end = reader_subtree_end(stats, count, heading);
+    for (size_t i = heading + 1u; i < end && anchor == NULL; i++)
+        if ((stats[i].own_flags & READER_STAT_OWN_LINK) != 0)
+            anchor = stats[i].node;
+    uint16_t at = stat->parent;
+    for (size_t depth = 0; anchor == NULL && at != READER_INVALID_INDEX
+         && depth < 8u; depth++, at = stats[at].parent)
+        if ((stats[at].own_flags & READER_STAT_OWN_LINK) != 0)
+            anchor = stats[at].node;
+    size_t length = 0;
+    const char *href = anchor == NULL ? NULL
+        : document_attribute(anchor, "href", &length);
+    return href == NULL || length == 0u || href[0] != '#';
+}
+
+static bool reader_article_is_clear(const ReaderNodeStat *stats,
+                                    size_t count, size_t root)
+{
+    if (root >= count) return false;
+    size_t end = reader_subtree_end(stats, count, root);
+    uint32_t prose = 0;
+    size_t paragraphs = 0, prose_paragraphs = 0, headlines = 0, titles = 0;
+    for (size_t i = root; i < end; i++) {
+        const ReaderNodeStat *stat = &stats[i];
+        if ((stat->flags & READER_STAT_EXCLUDED) != 0) continue;
+        if (reader_name_is(stat->node, "h1")) titles++;
+        if ((reader_name_is(stat->node, "h2")
+             || reader_name_is(stat->node, "h3")
+             || reader_name_is(stat->node, "h4"))
+            && reader_heading_links_away(stats, count, i)) headlines++;
+        if (reader_name_is(stat->node, "p")) {
+            paragraphs++;
+            uint32_t own = reader_own_content(stat);
+            if (own >= READER_AUTO_PROSE_PARAGRAPH_BYTES
+                && stat->link_bytes * 4u <= stat->text_bytes) {
+                prose_paragraphs++;
+                prose = reader_add_u32(prose, own);
+            }
+        } else if (reader_name_is(stat->node, "pre")) {
+            prose = reader_add_u32(prose, reader_own_content(stat));
+        }
+    }
+    if (headlines > READER_AUTO_HEADLINE_LINKS) return false;
+    if (reader_name_is(stats[root].node, "article")
+        && (stats[root].flags & READER_STAT_HEADING) != 0) return true;
+    return titles != 0u
+        && prose_paragraphs >= READER_AUTO_PROSE_PARAGRAPHS
+        && prose_paragraphs * 3u >= paragraphs
+        && (uint64_t) prose * 2u
+               >= (uint64_t) reader_own_content(&stats[root]);
+}
+
 static bool reader_prepare_listing(const ReaderNodeStat *stats, size_t count,
                                    ReaderEntry *entries, size_t entry_count,
                                    lxb_dom_node_t *body,
@@ -2087,19 +2359,8 @@ static bool reader_install_extracted_tree(
     if (document == NULL || document->budget == NULL || document->html == NULL
         || body == NULL || stats == NULL || count == 0
         || kind == READER_PAGE_RAW) return false;
-    char *markup = budget_malloc_category(
-        document->budget, BUDGET_CATEGORY_DOM, READER_EXTRACT_BYTE_LIMIT);
-    if (markup == NULL) return false;
-    ReaderExtractBuffer output = {
-        .document = document,
-        .data = markup,
-        .capacity = READER_EXTRACT_BYTE_LIMIT,
-        .content_limit = READER_EXTRACT_BYTE_LIMIT
-            - READER_EXTRACT_TAIL_RESERVE,
-        .next_cooperate_at = READER_TEXT_WORK_SLICE,
-        .next_node_cooperate_at = READER_NODE_WORK_SLICE
-    };
-    markup[0] = '\0';
+    ReaderExtractBuffer output;
+    if (!reader_extract_begin(&output, document, false)) return false;
     bool okay = reader_extract_literal(
         &output, "<header><strong>Reader</strong></header>");
     if (okay && synthesize_declared_video)
@@ -2128,7 +2389,7 @@ static bool reader_install_extracted_tree(
             "Reader view shortened to fit this device.</p>");
     }
     if (!okay) {
-        budget_free(document->budget, markup);
+        budget_free(document->budget, output.data);
         return false;
     }
     bool meaningful = kind == READER_PAGE_LISTING
@@ -2140,7 +2401,7 @@ static bool reader_install_extracted_tree(
             if (output.truncated || output.bounded_out)
                 analysis->bounded_out = true;
         }
-        budget_free(document->budget, markup);
+        budget_free(document->budget, output.data);
         return true;
     }
     if (meaningful_output != NULL) *meaningful_output = true;
@@ -2162,11 +2423,11 @@ static bool reader_install_extracted_tree(
     if (require_complete
         && (output.truncated || output.bounded_out
             || (analysis != NULL && analysis->bounded_out))) {
-        budget_free(document->budget, markup);
+        budget_free(document->budget, output.data);
         return true;
     }
     if (!install) {
-        budget_free(document->budget, markup);
+        budget_free(document->budget, output.data);
         return true;
     }
     lxb_dom_node_t *root = NULL;
@@ -2184,7 +2445,7 @@ static bool reader_install_extracted_tree(
         }
     }
     if (okay && installed_root != NULL) *installed_root = root;
-    budget_free(document->budget, markup);
+    budget_free(document->budget, output.data);
     return okay;
 }
 
@@ -2241,7 +2502,7 @@ static bool reader_document_prepare_internal(
     size_t next_text_cooperate_at = READER_TEXT_WORK_SLICE;
     bool okay = true;
     while (node != NULL && node != boundary) {
-        if (++visited > READER_NODE_LIMIT) {
+        if (++visited > READER_ANALYZE_VISIT_LIMIT) {
             analysis->bounded_out = true;
             break;
         }
@@ -2252,6 +2513,12 @@ static bool reader_document_prepare_internal(
             break;
         }
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (count == capacity && capacity == READER_NODE_LIMIT) {
+                /* The element bound, like the visit bound, keeps the prefix
+                   for manual Reader and rules out automatic Reader. */
+                analysis->bounded_out = true;
+                break;
+            }
             if (count == capacity || depth == READER_DEPTH_LIMIT) {
                 analysis->bounded_out = true;
                 okay = false;
@@ -2296,7 +2563,10 @@ static bool reader_document_prepare_internal(
             if (reader_name_is(node, "h1") || reader_name_is(node, "h2")
                 || reader_name_is(node, "h3"))
                 stat->own_flags |= READER_STAT_HEADING;
-            if (reader_name_is(node, "p")) stat->paragraphs = 1u;
+            /* Like text, a paragraph in hidden or excluded chrome does not
+               count toward any candidate. */
+            if (reader_name_is(node, "p") && hidden_depth == 0
+                && excluded_depth == 0) stat->paragraphs = 1u;
             stat->flags |= stat->own_flags;
             bool media_element = hidden_depth == 0
                 && style_hidden_depth == 0 && excluded_depth == 0
@@ -2534,9 +2804,7 @@ static bool reader_document_prepare_internal(
                but an unseen suffix could change the page kind. Never use that
                partial conclusion for optional auto-engagement. */
             bool auto_article = kind != READER_PAGE_ARTICLE
-                || (article < count
-                    && reader_name_is(stats[article].node, "article")
-                    && (stats[article].flags & READER_STAT_HEADING) != 0);
+                || reader_article_is_clear(stats, count, article);
             analysis->high_confidence = kind != READER_PAGE_RAW
                 && auto_article && !analysis->bounded_out;
             if (okay && install && connect_root && extracted_root != NULL
@@ -2673,23 +2941,11 @@ static bool reader_document_prepare_basic_internal(
         return true;
     lxb_dom_node_t *body = document_body_node(document);
     if (body == NULL) return true;
-    char *markup = budget_malloc_category(
-        document->budget, BUDGET_CATEGORY_DOM, READER_EXTRACT_BYTE_LIMIT);
-    if (markup == NULL) {
+    ReaderExtractBuffer output;
+    if (!reader_extract_begin(&output, document, true)) {
         analysis->bounded_out = true;
         return true;
     }
-    ReaderExtractBuffer output = {
-        .document = document,
-        .data = markup,
-        .capacity = READER_EXTRACT_BYTE_LIMIT,
-        .content_limit = READER_EXTRACT_BYTE_LIMIT
-            - READER_EXTRACT_TAIL_RESERVE,
-        .next_cooperate_at = READER_TEXT_WORK_SLICE,
-        .next_node_cooperate_at = READER_NODE_WORK_SLICE,
-        .basic_mode = true
-    };
-    markup[0] = '\0';
     const MediaDeclaredVideo *declared_video =
         media_declared_video_cached(document);
     bool synthesize_declared_video = declared_video != NULL
@@ -2706,7 +2962,11 @@ static bool reader_document_prepare_basic_internal(
             &output, child, 0u, false, &child_meaningful);
         meaningful = meaningful || child_meaningful;
     }
-    if (okay && !require_complete
+    /* Complete admission refuses any omitted action (form, control,
+       select option or anchor: bounded_out), but a view shortened by its
+       emitted node or byte bound is a balanced, honestly labeled prefix and
+       is admitted. */
+    if (okay && (!require_complete || !output.bounded_out)
         && (output.truncated || output.bounded_out)) {
         output.tail_mode = true;
         okay = reader_extract_literal(
@@ -2727,18 +2987,17 @@ static bool reader_document_prepare_basic_internal(
         ? UINT16_MAX : (uint16_t) output.nodes;
     analysis->retained_forms = output.retained_forms;
     analysis->mapped_anchors = output.mapped_anchors;
-    analysis->bounded_out = output.bounded_out || output.truncated;
+    analysis->bounded_out = output.bounded_out
+        || (output.truncated && !require_complete);
     analysis->extraction_truncated = output.truncated;
     if (meaningful) analysis->kind = READER_PAGE_BASIC;
-    if (!okay || !meaningful
-        || (require_complete
-            && (output.truncated || output.bounded_out))) {
-        budget_free(document->budget, markup);
+    if (!okay || !meaningful || (require_complete && output.bounded_out)) {
+        budget_free(document->budget, output.data);
         if (!okay) analysis->bounded_out = true;
         return okay;
     }
     if (!install) {
-        budget_free(document->budget, markup);
+        budget_free(document->budget, output.data);
         return true;
     }
     ReaderMarkerUndo undo[1];
@@ -2771,7 +3030,7 @@ static bool reader_document_prepare_basic_internal(
         reader_rollback_markers(&journal);
     }
     document_allocation_owner_leave(document, previous);
-    budget_free(document->budget, markup);
+    budget_free(document->budget, output.data);
     if (!okay) {
         *analysis = (ReaderDocumentAnalysis) {
             .prepared = true,

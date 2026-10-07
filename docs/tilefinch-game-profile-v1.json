@@ -41,7 +41,21 @@
     "quantize_visual_state_before_upload": true,
     "local_input_updates_each_present": true,
     "background_simulation": "bounded_staggering_without_input_delay",
-    "long_soak_requires_repeated_action_spikes": true
+    "long_soak_requires_repeated_action_spikes": true,
+    "per_frame_phase_timers": false,
+    "ui_rest_and_repeat_clock": "performance_now",
+    "per_frame_javascript_allocation": false,
+    "string_building": "append_to_function_local",
+    "shared_instance_tints": "quantized_palette",
+    "full_viewport_canvas_publication": "ge_direct_when_nothing_is_composited_above",
+    "focus_event_listeners": false,
+    "focus_styles": [
+      "outline",
+      "uniform_border_color",
+      "single_unblurred_inset_ring"
+    ],
+    "one_time_setup": "menu_time_or_bounded_slices_not_in_the_press",
+    "audio_start": "trusted_play_activation"
   },
   "apis": {
     "canvas_2d": {
@@ -80,14 +94,39 @@
         "mipmaps",
         "stencil",
         "general_framebuffer_attachments"
-      ]
+      ],
+      "fragment_colour_model": "texture2D * vertex_colour * instance_colour * (vec4_uniform | vec4_constant)",
+      "shader_diagnostics": {
+        "link_refused": [
+          "shader_loops",
+          "discard",
+          "derivatives",
+          "per_vertex_or_per_pixel_control_flow",
+          "vertex_texture_lookups",
+          "non_texture2d_lookups",
+          "more_than_one_sampled_texture"
+        ],
+        "linked_with_warning": [
+          "uniform_only_control_flow",
+          "unapplied_colour_math",
+          "unapplied_position_math"
+        ],
+        "channels": [
+          "getProgramInfoLog",
+          "console.warn_once_per_program",
+          "__tilefinchWebGLDiagnostics.shaderRefusals",
+          "__tilefinchWebGLDiagnostics.shaderWarnings"
+        ]
+      }
     },
     "gamepad": {
       "status": "supported",
       "mapping": "standard",
       "controllers": 1,
       "capture_chord": "Start+Select",
-      "request_api": "navigator.tilefinch.requestPageControls(element?)",
+      "request_api": "navigator.tilefinch.requestPageControls(element?, options?)",
+      "request_notice_options": ["always", "once"],
+      "request_notice_once_scope": "page_load_after_first_notice",
       "request_requires_trusted_activation": true,
       "request_uses_fullscreen_lifecycle": true,
       "exit_notice_native": true
@@ -112,7 +151,8 @@
     "animation_frame": {
       "status": "supported",
       "maximum_callbacks_per_presented_frame": 1,
-      "backlog_policy": "skip_elapsed_frames"
+      "backlog_policy": "skip_elapsed_frames",
+      "psp_page_clock_maximum_advance_per_loop_us": 16000
     },
     "web_audio": {
       "status": "bounded_subset",
@@ -124,9 +164,13 @@
         "OscillatorNode"
       ],
       "trusted_activation_required": true,
+      "resume_without_activation_rejects": "NotAllowedError",
       "decoded_formats": [
         "PCM WAV"
-      ]
+      ],
+      "native_value_curves": ["GainNode.gain", "OscillatorNode.frequency"],
+      "curve_requires_live_source_fixed_graph_and_zero_detune": true,
+      "native_target_ramps": ["GainNode.gain"]
     },
     "storage": {
       "local_storage": "bounded_user_persistence_policy",
@@ -193,6 +237,9 @@
       "audio_nodes": 16,
       "decoded_pcm_bytes_total": 524288,
       "mixer_block_frames": 512,
+      "curve_points_minimum": 2,
+      "curve_points_maximum": 64,
+      "curves_per_parameter": 1,
       "schedule_ahead_us": 10000000,
       "minimum_sample_rate_hz": 8000,
       "maximum_sample_rate_hz": 48000,
@@ -213,17 +260,25 @@
       "manifest_bytes": 65536,
       "document_bytes": 1048576,
       "resource_count": 32,
-      "resource_body_bytes_total": 1048576,
-      "classic_script_bytes_each": 393216,
+      "resource_body_bytes_total": 1572864,
+      "classic_script_bytes_each": 524288,
       "classic_script_compile_count": 8,
-      "classic_script_compile_source_bytes": 524288,
-      "classic_script_bytecode_bytes": 524288,
+      "classic_script_compile_source_bytes": 1048576,
+      "classic_script_bytecode_bytes": 1048576,
       "classic_script_source_fallback": true,
-      "resource_pack_bytes": 1736704,
+      "resource_pack_bytes": 2785280,
       "native_icon_width_px": 16,
       "native_icon_height_px": 16,
       "native_icon_rgba_bytes": 1024,
       "library_items": 12
+    },
+    "installed_app": {
+      "javascript_heap_floor_bytes": 9437184,
+      "strict_javascript_heap_floor_bytes": 6291456,
+      "psp_boot_keys": {
+        "app_heap_mb": 9,
+        "file_kb": 512
+      }
     }
   },
   "lifecycle": {

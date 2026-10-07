@@ -8,6 +8,10 @@
 
 #define printf psp_log_printf
 
+/* Every report below is validation-log output (see
+   psp_media_session_internal.h); shipping builds use the inline stubs. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+
 /*
  * Say what limited the unit rate.
  *
@@ -614,3 +618,6 @@ void psp_media_telemetry_report_feed(
         have_audio_cursor ? 1 : 0,
         backend_ready && video_cursor_us != 0 ? 1 : 0);
 }
+#else
+typedef int psp_media_telemetry_validation_only;
+#endif /* TILEFINCH_PSP_VALIDATION_LOG */

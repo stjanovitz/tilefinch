@@ -207,7 +207,7 @@ static void script_element_states_detach_document(
    Budget keeps the realm's growth reserve free for the body in flight. On
    the PSP chatgpt.com's client committed ~2 MiB of modules at startup and
    every module its send path imports was refused. */
-static void js_rt_bridge_script_bytes_admit(DomBridge *bridge, size_t bytes)
+void js_rt_bridge_script_bytes_admit(DomBridge *bridge, size_t bytes)
 {
     const ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
     if (runtime == NULL || !runtime->heap_growth_enabled || bytes == 0
@@ -218,6 +218,10 @@ static void js_rt_bridge_script_bytes_admit(DomBridge *bridge, size_t bytes)
         + bridge->script_quota_reserved_bytes;
     if (used <= bridge->maximum_script_bytes
         && bytes <= bridge->maximum_script_bytes - used) return;
+    /* Compiled-script tables give way before the raise is limited. */
+    if (bytes <= SIZE_MAX - runtime->heap_growth_reserve)
+        (void) budget_make_room(runtime->budget,
+                                runtime->heap_growth_reserve + bytes);
     size_t free_bytes = budget_remaining(runtime->budget);
     if (free_bytes <= runtime->heap_growth_reserve) return;
     size_t spare = free_bytes - runtime->heap_growth_reserve;
@@ -422,14 +426,18 @@ bool script_execution_policy_for_profile(
         return true;
     case SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC:
         policy->maximum_advance_time_us = 16000;
-        /* 512 KiB: chatgpt.com's application frame module is 403 KiB, and
-           its home client never becomes ready without it. The page heap now
-           grows toward 10 MiB when the budget allows, which the old 384 KiB
-           unit (sized for a fixed 5 MiB realm) predates. Strict remains at
-           the smaller 256 KiB unit; both retain a hard per-call bound and
-           the same aggregate quotas. */
+        /* The source ceiling (4 MiB): the page heap grows with the Budget,
+           so whether a unit compiles is a memory question that
+           js_rt_compile_source_admitted answers from the measured compile
+           working set (script_admission.h). The 512 KiB unit this replaced
+           refused app bundles on 17 of 55 census pages. Strict remains at
+           the smaller 256 KiB unit. */
         policy->maximum_host_compile_source_bytes =
             SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES;
+        /* News front pages carry 9-10 thousand elements and walk them
+           all; strict keeps the base table. */
+        policy->dom_handle_slot_capacity =
+            SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC;
         return true;
     default:
         *policy = (ScriptExecutionPolicy) {0};

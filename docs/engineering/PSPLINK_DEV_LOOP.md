@@ -45,6 +45,49 @@ wrapper can establish tracked ownership. `scripts/psplink-device.sh` and the
 YouTube UX harness invoke this check automatically, so their documented
 commands have no manual file-server prerequisite.
 
+For automation, keep a foreground bridge session open for the entire app
+lifecycle. A detached process is not a persistent-session guarantee under an
+automation runner, and bridge disappearance alone does not distinguish runner
+cleanup from a bridge crash:
+
+```sh
+PSPDEV=/path/to/pspdev HOST_ROOT=/absolute/stage scripts/psplink-shell.sh hold
+```
+
+Wait for `PSPLink hold ready` before launching. Keep that command's terminal or
+execution session alive while running other commands with the **same exact
+`HOST_ROOT`**. `hold` watches its recorded bridge PID and served root; loss or
+replacement exits nonzero without silently creating another bridge or killing
+one. It is a host-process lifetime check, not continuous USB/device health
+verification. After normal app retirement and the usual module/thread/memory
+checks, interrupt the hold session. Interrupting it does not itself terminate
+the bridge. Never switch roots or restart the bridge while the app is live:
+its open `host0:` handles, including buffered validation logs, may become
+stale even if a later `ver` succeeds. A lost hold invalidates the run's host-I/O
+continuity; do not resume qualification by silently reconnecting it.
+
+### Host bridge crash during reconnect
+
+A stock `usbhostfs_pc` can crash in `libusb_submit_transfer` when its filesystem
+thread closes the shared USB handle while the async command thread is writing.
+That is a host transport failure, not evidence that Tilefinch crashed. The
+[host lifetime patch](../../tools/psplink-host/README.md) protects that handle
+without serializing the blocking read and write paths:
+
+```sh
+scripts/build-psplink-host.sh --test /path/to/psplinkusb /path/to/host-tools
+PSPDEV=/path/to/pspdev USBHOSTFS=/path/to/host-tools/usbhostfs_pc \
+  HOST_ROOT=/absolute/stage scripts/psplink-shell.sh hold
+```
+
+The builder uses a pinned Git archive, ignores dirty checkout files, runs
+mocked concurrency checks with `--test`, and never installs into the SDK or
+contacts the device. Select it only after normal app exit and retirement
+checks, with the old tracked bridge stopped. `USBHOSTFS` does not automatically
+replace a running bridge. A bridge loss under a live app invalidates host-I/O
+continuity; do not hide it with automatic replacement or reuse a partial
+report as a pass. Preserve the host crash report separately from device logs.
+
 `usbhostfs_pc` binds a local host socket. Sandboxed agent shells may deny that
 operation even while the PSP visibly has PSPLink open. The wrapper detects the
 specific `bind: Operation not permitted` failure, terminates the unusable host
@@ -78,6 +121,13 @@ PSPDEV=/path/to/pspdev scripts/psplink-shell.sh exec 'ver'
 Healthy prints `PSPLink v3.2.1`. Never call `pspsh` bare in automation: a
 missing device can hang instead of returning an error. `psplink-shell.sh`
 provides the canonical bounded command runner.
+
+**Do not type `quit` or `exit` to detach a persistent host console.** Those
+commands are forwarded to PSPLink on the device and return it to XMB; they
+are not host-only disconnects. Close only the host `pspsh` process (for
+example, with a bounded launcher's SIGTERM), after capturing the terminal
+receipt and checking module/thread/memory retirement. Keep the USB bridge
+alive until those checks and any clock restoration are complete.
 
 ## One cycle
 
@@ -153,7 +203,7 @@ Mac while the program runs:
 | scripted input | the leaf named by `input_script=` |
 | captured frames | `frame-*.ppm`, `frame-mark-*.ppm` |
 | on-demand screenshots | `screenshots/` |
-| persistent module bytecode (opt-in) | the directory named by `module_cache_dir=` |
+| persistent compiled scripts (opt-in) | the directory named by `module_cache_dir=`, or `script-cache/` when **Keep compiled scripts** is on |
 
 Fonts, roots, and development voice assets are staged beside the PRX by the
 build. The optional software decoder is a separate
@@ -166,13 +216,88 @@ avoids `sceIoSync("ms0:")` when its derived paths are on `host0:`. Loading the
 module and its assets over USB changes startup timing, so compare host0 runs
 only with host0 runs.
 
-The persistent module bytecode tier is off unless `boot.cfg` names
-`module_cache_dir=`. Point it at `host0:/modcache` so the files land on the
-Mac: `module_cache_write=1` stores compiled modules there, and `0` (the
-default) only reads what a previous run wrote. A cold/warm comparison runs
-twice against the same `module_cache_dir=`, the first run with
-`module_cache_write=1`. A writing run into a full directory removes its
-oldest entries during idle work. Never point a test run at `ms0:`.
+### USB-only installed-game tests
+
+Game tests do not require an HTTP server or Wi-Fi. Build a local fixture with
+the same authenticated offline-package writer used by installs:
+
+```sh
+cmake --build build-preset-release --target tilefinch-offline-library-fixture
+build-preset-release/tilefinch-offline-library-fixture --web-app \
+  /absolute/scratch/offline \
+  'https://game.test/index.html?qualification=input&seed=12345' \
+  examples/treadline-arena \
+  $(awk '!/^#/ && NF { print $1 }' examples/treadline-arena/package-files.txt)
+```
+
+The list is the game's canonical package list,
+`examples/treadline-arena/package-files.txt`. A `?qualification=` URL needs
+the `qualification.js` it marks (the page fetches it); an ordinary package
+uses `awk '!/^#/ && NF == 1'` instead.
+
+The output directory must not already exist. Only the explicitly listed flat
+files are packaged; symlinks and parent paths are refused. The tool reads the
+package back into a fresh session and checks the resource grants—not just the
+bytes—so style/script consumers can use it without falling through to a network
+request. No game files are fetched while creating the fixture.
+
+Preserve any existing `offline/` directory in the served build directory, then
+stage this fixture there as `host0:/offline/`. Set `url=` to the app URL printed
+by the tool, use the ordinary button-input script, set
+`validation_game_audio_mute=1`, and launch with `psplink-device.sh memory --wait`.
+The offline startup route skips network association. Require the log's
+`network: deferred for local startup`, successful CSS/script loading, a rendered
+menu, and a gameplay marker before accepting performance measurements. Compare
+rendered frames with the same game revision and settings; a static HTML shell
+with missing resources is a failed harness run, not fast gameplay.
+
+Validation builds use the same native audio slots as shipping. For an A/B
+comparison, `validation_game_audio_reference=1` selects the JS Web Audio
+reference (`game-audio.js`, compiled only into host and validation builds)
+before runtime creation. The default is `0`; only these exact two values are
+accepted. Selection is
+fixed for each runtime and inherited by subsequent page/frame runtimes.
+Shipping builds clear this validation setting, and saving user settings never
+persists it. Keep output muted with `validation_game_audio_mute=1`; this does
+not turn off the mixer. Compare fresh-process runs of one binary, using the
+same recorded inputs and simulation times. A selected flag alone is not proof
+that the lazy audio backend installed successfully.
+Use `audio-slots-pre`, `audio-slots-post`, and `audio-slots-end` input-script
+marks to request status. These queue bounded requests; the next owner-loop
+checkpoint reports runtime identity, navigation generation, selection, lazy
+installation, and failure state. Require each `queued=1` request and its
+matching deferred receipt, with the requested/selected lane equal to the
+sealed test configuration and post/end `ready=1`. Missing receipts are a
+failed comparison, not permission to inspect a busy runtime from a supervisor.
+Validation builds start with the shipping mixer: `audio-mix`, `audio-const`
+and `audio-auto` all on. For a complete mixer OFF/ON comparison, set all three
+marks (`audio-mix-off/on`, `audio-const-off/on`, `audio-auto-off/on`)
+explicitly before the measurement window.
+
+Keep baseline and candidate packages separately, restore the original `offline/`
+directory and `boot.cfg` afterwards, and never stage these test packages to
+`ms0:`. Installed-package loading and HTTP loading have different startup costs;
+only compare matched USB-only runs when evaluating a gameplay change.
+
+The persistent compiled-script tier (classic scripts and modules) is off
+unless **Keep compiled scripts** is on or `boot.cfg` names
+`module_cache_dir=`, which takes precedence. A host0 launch keeps the data
+directory on the Mac, so the option's `script-cache/` lands there; point
+`module_cache_dir=` at `host0:/...` for a separate directory.
+`module_cache_write=1` lets that directory be written (idle work only), and
+`0` (the default) only reads what a previous run wrote. A cold/warm
+comparison runs twice against the same directory, the first run writing.
+A writing run into a full directory removes its least recently used packs
+during idle work. Never point a test run at `ms0:`.
+`scripts/script-cache-device.sh [BUILD_DIR] [PAGE]` stages exactly that for
+a census page (default `mdn`; not Wikipedia, whose page JavaScript is off by
+default on the PSP, so nothing compiles) and runs the unmodified
+`psplink-device.sh memory --wait` cold and then warm. A validation build
+logs `tilefinch-script-cache: configured ...` at boot and, at every input
+script mark, a `tilefinch-script-cache:` line with the page's compiles and
+compile time, classic hits, misses, queued and idle-time stores, and the
+persistent tier's disk hits, synchronous load time, packs and bytes read
+and written, rejects and evictions.
 
 ### A script ending inside the keyboard is a failed run
 

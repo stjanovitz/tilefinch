@@ -200,6 +200,8 @@ static size_t web_font_sources(const char *text, size_t length,
             }
             end++;
         }
+        /* An unterminated comment ending the value steps past length. */
+        if (end > length) end = length;
         char candidate[2048];
         if (web_font_source_item(text + at, end - at, candidate)) {
             bool duplicate = false;
@@ -434,7 +436,24 @@ static bool selector_list_to_rules(StyleCssParseContext *context,
             && !tilefinch_platform_cooperate(
                 "stylesheet-selectors", at)) return false;
         size_t end = css_selector_item_end(selectors, selector_length, at);
-        if (!selector_to_rule(context, selectors + at, end - at,
+        /* Shadow-tree selectors: :host and ::slotted() reach outside the
+           tree; they are rewritten for the matcher in shadow sources and
+           never match in document ones (CSS Scoping 3). */
+        char shadow_selector[STYLE_SELECTOR_CAPACITY];
+        bool shadow_rewritten = false;
+        const char *item = selectors + at;
+        size_t item_length = end - at;
+        trim(&item, &item_length);
+        if (!style_shadow_selector_rewrite(
+                sheet, item, item_length, shadow_selector,
+                sizeof(shadow_selector), &shadow_rewritten)) {
+            at = end + (end < selector_length);
+            continue;
+        }
+        if (!selector_to_rule(context,
+                              shadow_rewritten ? shadow_selector : selectors + at,
+                              shadow_rewritten ? strlen(shadow_selector)
+                                               : end - at,
                               declarations, declaration_length,
                               &declaration_set)) {
             return false;
@@ -738,7 +757,8 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
             }
             brace++;
         }
-        if (brace == length) break;
+        /* An unterminated comment ending the input steps past length. */
+        if (brace >= length) break;
         if (css[brace] == ';') {
             const char *statement = css + prelude;
             size_t statement_length = brace - prelude;
@@ -779,6 +799,14 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                         ->current_image_source_referrer_policy);
             }
         } else if (parse_style_rules
+                   && css_header_rule(header, header_length, "@property",
+                                      &condition, &condition_length)) {
+            /* Registrations are not replayed from a parsed IR. */
+            style_parsed_ir_builder_disqualify(context);
+            if (!stylesheet_register_property(
+                    sheet, condition, condition_length, css + brace + 1,
+                    close - brace - 1)) return false;
+        } else if (parse_style_rules
             && (css_header_rule(header, header_length, "@keyframes",
                             &condition, &condition_length)
             || css_header_rule(header, header_length, "@-webkit-keyframes",
@@ -807,8 +835,8 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                        depth + 1, font_faces_allowed)) return false;
         } else if (css_header_rule(header, header_length, "@container",
                                    &condition, &condition_length)) {
-            style_parsed_ir_builder_disqualify(context);
             if (!parse_style_rules) {
+                style_parsed_ir_builder_disqualify(context);
                 at = close < length ? close + 1 : length;
                 continue;
             }
@@ -817,11 +845,17 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
             if (!style_register_container_query(
                     sheet, condition, condition_length, previous_query,
                     &query)) return false;
+            /* A replay re-registers the scope; one this sheet could not
+               register is not replayable as the same rules. */
+            if (query == 0) style_parsed_ir_builder_disqualify(context);
+            else style_parsed_ir_builder_container(
+                     context, condition, condition_length);
             if (query != 0) {
                 sheet->current_container_query = query;
                 bool parsed = parse_css_range_nested(
                     context, css, brace + 1, close, depth + 1, false);
                 sheet->current_container_query = previous_query;
+                style_parsed_ir_builder_container(context, NULL, 0);
                 if (!parsed) return false;
             }
         } else if (css_header_rule(header, header_length, "@layer",
@@ -1089,11 +1123,23 @@ static bool collect_styles(
         if (name != NULL && span_equal(name, name_length, "style")
             && tilefinch_csp_allows_inline_style(
                    content_security_policy, node)) {
+            Stylesheet *sheet = context->sheet;
+            unsigned scope_begin = sheet->next_order;
+            bool scoped = document_shadow_carrier_containing(node) != NULL;
+            sheet->parsing_scoped_source = scoped;
             for (lxb_dom_node_t *child = node->first_child; child != NULL; child = child->next) {
                 size_t length = 0;
                 const char *css = document_text_data(child, &length);
                 if (css != NULL
-                    && !parse_css_range(context, css, 0, length)) return false;
+                    && !parse_css_range(context, css, 0, length)) {
+                    sheet->parsing_scoped_source = false;
+                    return false;
+                }
+            }
+            sheet->parsing_scoped_source = false;
+            if (scoped) {
+                stylesheet_note_shadow_scope(sheet, node, scope_begin,
+                                             sheet->next_order);
             }
         }
         if (node->first_child != NULL

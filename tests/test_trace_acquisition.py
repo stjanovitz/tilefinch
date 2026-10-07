@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import os
 import subprocess
 import sys
@@ -97,7 +98,7 @@ if args.method == "GET":
     ]
 
 meta = {
-    "psp-http-trace": "11",
+    "psp-http-trace": "13",
     "cookie-values": "redacted",
     "method": args.method,
     "url": args.url,
@@ -113,8 +114,11 @@ meta = {
     "request-content-type": "",
     "request-cookie-bytes": "0",
     "request-has-cf-clearance": "0",
+    "request-cookie-provenance-count": "0",
+    "request-cookie-provenance-complete": "1",
+    "request-cookie-provenance-evictions": "0",
     "request-extra-header-bytes": "0",
-    "request-extra-header-shape": "",
+    "request-extra-header-shape": "@cache=0;",
     "request-allow-http-errors": "1",
     "request-enforce-cors": "0",
     "request-redirect-same-origin-only": "0",
@@ -160,6 +164,7 @@ meta = {
     "response-security-allow-origin": "",
     "response-header-count": str(len(headers)),
     "set-cookie-count": "1" if cookies else "0",
+    "set-cookies-truncated": "0",
 }
 if mode == "old-version":
     meta["psp-http-trace"] = "9"
@@ -951,6 +956,35 @@ class TraceAcquisitionTests(unittest.TestCase):
         )
         with self.assertRaises(ACQUIRE.AcquisitionError):
             ACQUIRE._trace_inventory(self.source)
+
+
+    def test_request_body_sidecar_must_match_its_record(self) -> None:
+        meta_path = self.source / "0000.meta"
+        original = meta_path.read_text(encoding="utf-8")
+        body = b'{"placement":"side"}'
+        meta_path.write_text(
+            original.replace("request-body-length=0", f"request-body-length={len(body)}")
+            .replace("request-body-hash=cbf29ce484222325",
+                     f"request-body-hash={ACQUIRE._fnv1a64(body)}"),
+            encoding="utf-8",
+        )
+        sidecar = self.source / "0000.request"
+        sidecar.write_bytes(body)
+        ACQUIRE._trace_inventory(self.source)
+        sidecar.write_bytes(body + b" ")
+        with self.assertRaises(ACQUIRE.AcquisitionError):
+            ACQUIRE._trace_inventory(self.source)
+        meta_path.write_text(original, encoding="utf-8")
+        sidecar.write_bytes(body)
+        with self.assertRaises(ACQUIRE.AcquisitionError):
+            ACQUIRE._trace_inventory(self.source)
+
+
+class TraceFormatDriftTests(unittest.TestCase):
+    def test_acquisition_expects_the_trace_version_the_engine_writes(self) -> None:
+        writer = (ROOT / "src" / "fetch" / "trace_capture.inc").read_text(encoding="utf-8")
+        versions = set(re.findall(r'"psp-http-trace=([0-9]+)\\n"', writer))
+        self.assertEqual(versions, {ACQUIRE.CURRENT_TRACE_VERSION})
 
 
 class RecorderPolicyTests(unittest.TestCase):

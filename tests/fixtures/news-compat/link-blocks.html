@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width"><style>
+body{margin:8px;font:16px sans-serif} .blk{display:block} .grid{display:grid;row-gap:12px} .flex{display:flex} .contents{display:contents}
+.g12{display:grid;grid-template-columns:repeat(12,1fr);column-gap:16px} .span{grid-column:1/span 12}
+</style></head><body>
+<a href="/a1">A1 plain inline text</a>
+<a href="/a2" class="blk"><div><h2>A2 block anchor &gt; div &gt; h2</h2></div></a>
+<a href="/a3" class="blk"><div class="grid"><h2>A3 block anchor &gt; grid &gt; h2</h2></div></a>
+<a href="/a4"><div><h2>A4 inline anchor &gt; div &gt; h2</h2></div></a>
+<a href="/a5" class="blk"><div class="flex"><h2>A5 block anchor &gt; flex &gt; h2</h2></div></a>
+<div class="g12"><div class="span"><a href="/a6" class="blk"><div class="grid"><h2>A6 in 12-col grid item</h2></div></a></div></div>
+<div class="g12"><div class="span" style="display:initial"><a href="/a7" class="blk"><div class="grid"><h2>A7 grid item display:initial</h2></div></a></div></div>
+<a href="/a8" class="contents"><div><h2>A8 display:contents anchor</h2></div></a>
+</body></html>

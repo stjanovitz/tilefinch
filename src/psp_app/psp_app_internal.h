@@ -41,6 +41,7 @@
 #endif
 
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/canvas_ge_presenter.h"
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/browser_tabs.h"
 #include "tilefinch/build_version.h"
@@ -76,6 +77,8 @@
 #include "tilefinch/psp_profile_store.h"
 #include "tilefinch/psp_text_input.h"
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_basic_fallback.h"
+#include "tilefinch/psp_reader_policy.h"
 #include "tilefinch/psp_update_session.h"
 #include "tilefinch/psp_voice_component_session.h"
 #include "tilefinch/psp_glyph_component_session.h"
@@ -94,6 +97,18 @@
 /* The device logging redirect. See the file comment: this must come after
    every other header and before any code that logs. */
 #define printf psp_log_printf
+
+/* Validation-only boot.cfg knobs. Builds without the validation log run
+   psp_boot_config_disable_automation() after loading boot.cfg, which zeroes
+   every knob read through this macro (and nothing writes them later), so
+   there it folds to a constant 0 and the compiler drops the scenario
+   drivers each knob gates. The never-taken branch keeps the expression
+   type-checked, as the psp_log stubs do. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#define PSP_VALIDATION_KNOB(value) (value)
+#else
+#define PSP_VALIDATION_KNOB(value) (0 ? (value) : 0)
+#endif
 
 #define PSP_SCREEN_WIDTH 480
 #define PSP_SCREEN_HEIGHT 272
@@ -132,6 +147,13 @@
    least half of that budget for an explicit Play instead of transferring a
    nearly expired speculative attempt. Completed jobs are unaffected. */
 #define PSP_YOUTUBE_PRERESOLVE_PENDING_ADOPT_US UINT64_C(15000000)
+/* The runaway-response guard for every page navigation the app starts
+   (typed URLs, links, forms, history, reloads, the startup page). It
+   matches the engine default: a single 4 MiB cap refused real front
+   pages (CNN's home document is 5.7 MB) before the memory budget, which
+   is the actual page-size policy, could admit or degrade them. */
+#define PSP_NAVIGATION_DOCUMENT_BYTES BROWSER_PSP_APP_DOCUMENT_BYTES
+#define PSP_NAVIGATION_TIMEOUT_MS BROWSER_PSP_APP_NAVIGATION_TIMEOUT_MS
 #define PSP_YOUTUBE_PRERESOLVE_WORKING_BYTES (2u * MIB)
 #define PSP_YOUTUBE_PRERESOLVE_RESERVE_BYTES (1u * MIB)
 #define PSP_YOUTUBE_PRERESOLVE_WATCH_BYTES (1536u * KIB)
@@ -196,6 +218,9 @@ bool psp_set_presentation_css(
 void psp_leave_reader_for_navigation(
     BrowserEngine *engine, PspUiState *ui, const BrowserProfile *profile,
     const char *url);
+/* Sites whose heavy app runs for this session (psp_app_heavy.c). */
+#define PSP_HEAVY_SESSION_SITE_LIMIT 8u
+
 typedef struct {
     bool pending;
     unsigned incumbent_percent;
@@ -442,6 +467,8 @@ void psp_runtime_cooperate_serve_page_scroll(BrowserEngine *engine);
    moved to *timeline_intent for the browser thread; true when one was. */
 bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
                                       PspUiMediaIntent *timeline_intent);
+/* The page toast a media open raises; the scope's end retires it. */
+#define PSP_MEDIA_OPEN_STATUS "OPENING VIDEO  O CANCEL"
 void psp_work_cooperate_begin_media_open(
     PspUiState *ui, const uint16_t *engine_frame,
     const PspUiMediaState *media_ui);
@@ -456,6 +483,9 @@ uint32_t psp_navigation_cooperate_owner_frame(bool page_screen);
 /* Browser loop present during a supervised load: the preview frame (or the
    incumbent page) under the loop's own UI. */
 bool psp_navigation_cooperate_owner_present(const PspUiState *ui);
+/* Replace the busy-work status line the supervisor shows (progress text);
+   matches PspOfflineStore.show_progress. */
+void psp_work_cooperate_show_status(void *context, const char *status);
 bool psp_navigation_cooperate_active(void);
 bool psp_navigation_cooperate_supervised(void);
 bool psp_navigation_cancel_requested(void);
@@ -485,6 +515,9 @@ typedef struct {
 
 typedef struct {
     uint64_t base_us;
+    uint64_t base_cpu_us;
+    uint32_t base_bytes;
+    bool base_cpu_valid;
     uint64_t composite_us;
     uint64_t publish_us;
     uint64_t publish_flush_us;
@@ -555,6 +588,10 @@ typedef struct {
 
 void psp_report_presentation_cadence(const char *phase);
 bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing);
+void psp_present_validation_measure_cpu(bool enabled);
+/* Validation-only owner-thread observation immediately before publication.
+   It must not paint, mutate presentation ownership, or perform output. */
+void psp_present_validation_pre_publish_hook(void (*hook)(uint32_t sequence));
 bool psp_display_validation_timing_snapshot(
     PspDisplayBackendTiming *timing);
 void psp_video_scanout_note_discontinuity(void);
@@ -757,9 +794,9 @@ typedef struct {
     PspUiFindView find_view;
     PspHomeSurface home_surface;
     PspCollectionsSurface collections_surface;
-    /* Settings > Device & storage > Site storage, and the full origins its
-       rows and the Memory Stick offer act on (the UI keeps shortened
-       labels). */
+    /* Settings > Device & storage > Site data & storage, and the full
+       origins its rows and the Memory Stick offer act on (the UI keeps
+       shortened labels). */
     PspUiSiteStorageView site_storage_view;
     char site_storage_origins[PSP_UI_SITE_STORAGE_ROW_LIMIT]
                             [BROWSER_ORIGIN_LIMIT];
@@ -768,6 +805,16 @@ typedef struct {
 } PspPresentationResources;
 
 void psp_presentation_init(PspPresentationResources *presentation);
+/* GE-direct canvas publication: the engine whose frame presents identify,
+   the CPU-path switch (validation A/B) and its counters. */
+void psp_present_canvas_engine_bind(BrowserEngine *engine);
+void psp_present_canvas_ge_enable(bool enabled, bool verify);
+const CanvasGePresenterStats *psp_present_canvas_ge_stats(void);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+void psp_present_validation_vfpu_copy(bool enabled, bool verify);
+void psp_present_validation_vfpu_copy_counts(
+    uint32_t *copies, uint32_t *checks, uint32_t *errors);
+#endif
 void psp_presentation_bind_chrome_fonts(
     PspPresentationResources *presentation, BrowserEngine *engine);
 void psp_presentation_unbind_chrome_fonts(
@@ -790,6 +837,8 @@ typedef struct {
     char content_allowlist[PSP_STORAGE_PATH_CAPACITY];
     char offline_library[PSP_STORAGE_PATH_CAPACITY];
     char site_storage[PSP_STORAGE_PATH_CAPACITY];
+    /* Keep compiled scripts: the persistent compiled-script tier. */
+    char script_cache[PSP_STORAGE_PATH_CAPACITY];
 } PspStoragePaths;
 
 /* One operation record, rather than six pointers to main's locals. This is
@@ -1021,6 +1070,37 @@ typedef struct {
     PspCaptivePortal *captive_portal;
     bool blank_reader_recovery_pending;
     uint64_t blank_reader_recovery_generation;
+    /* "Reload in Basic view": the next commit of basic_reload_url loaded
+       without page JavaScript and is presented in Basic view. */
+    bool basic_reload_pending;
+    char basic_reload_url[NAVIGATION_URL_LIMIT];
+    /* The navigation generation already re-examined for the Basic fallback
+       after its scripts failed post-commit, and the one already prompted
+       (Ask), so neither repeats for one page. */
+    uint64_t basic_failure_examined_generation;
+    uint64_t basic_prompt_generation;
+    /* Heavy pages (psp_app_heavy.c): the navigation generation examined,
+       which offers and statuses it already showed, the page the offer was
+       for, and the sites run for this session. */
+    uint64_t heavy_generation;
+    bool heavy_offer_shown;
+    bool heavy_status_shown;
+    bool heavy_low_memory_shown;
+    bool heavy_rescue_shown;
+    uint64_t heavy_shell_since_us;
+    /* Polls left before the page is weighed again (psp_app_heavy.c). */
+    uint8_t heavy_measure_countdown;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    unsigned heavy_logged_class;
+    size_t heavy_logged_waiting;
+#endif
+    char heavy_offer_url[NAVIGATION_URL_LIMIT];
+    /* The profile the engine's per-site heavy resolver reads
+       (psp_app_heavy_boot). */
+    const BrowserProfile *heavy_profile;
+    size_t heavy_session_site_count;
+    char heavy_session_sites[PSP_HEAVY_SESSION_SITE_LIMIT]
+                           [CONTENT_BLOCKER_HOST_LIMIT];
     /* The failed-load recovery sheet's offer; lifecycle_retry_url is the
        page Retry reloads while the offer is not NONE. */
     PspRecoveryOffer recovery_offer;
@@ -1135,6 +1215,15 @@ typedef struct {
     bool preview_pointer;
     int preview_pointer_x;
     int preview_pointer_y;
+    /* The previous iteration published a canvas frame: this one will
+       render and present again after the page's animation callbacks. */
+    bool canvas_live;
+    /* The previous iteration skipped the page's callbacks for a focus
+       move; this one must run them. */
+    bool runtime_deferred;
+    /* Set by a focus action that presented over a live canvas: skip this
+       iteration's page callbacks (and so its second composition). */
+    bool defer_runtime;
 } PspAppFrameState;
 
 /* src/psp_app/psp_app_captive_portal.c. One user-triggered probe and one
@@ -1186,10 +1275,39 @@ void psp_app_site_storage_sync_ui(PspUiState *ui,
                                   const char *url);
 /* Shows a pending Memory Stick offer over the page; true when it opened. */
 bool psp_app_site_storage_poll(PspApp *app);
+/* src/psp_app/psp_app_page.c (needs PspApp) */
+/* Basic view on the page at url (Page tools, the recovery sheet and the
+   automatic fallback alike). Enabling presents the prepared Basic tree:
+   presentation CSS first, then activation, which retires the page's realms.
+   Disabling puts the raw sheet back. Either way the chrome, the engine
+   views and focus follow, and *page_dirty is set. A refusal leaves the
+   view and the sheet as they were and returns false. */
+bool psp_app_set_basic_view(PspApp *app, const char *url, bool enable,
+                            bool *page_dirty);
+/* src/psp_app/psp_app_heavy.c */
+/* Installs the per-site heavy-page policy on the engine: every page realm
+   starts with its own site's choice (remembered, this session's, else the
+   setting). */
+void psp_app_heavy_boot(BrowserEngine *engine, const BrowserProfile *profile,
+                        PspInteractiveState *interactive, PspUiState *ui);
+bool psp_app_heavy_poll(PspApp *app);
+void psp_app_heavy_action(PspApp *app, PspAppFrameState *frame,
+                          const PspUiIntent *intent);
+bool psp_app_heavy_setting(PspApp *app, PspAppFrameState *frame,
+                           const PspUiIntent *intent);
+/* The recovery sheet over the committed page, titled for a page too heavy
+   for the PSP (src/psp_script_main.c). */
+void psp_present_heavy_recovery(PspApp *app, const char *loaded_url,
+                                const char *detail, uint8_t actions);
 void psp_app_site_storage_action(PspApp *app, PspAppFrameState *frame,
                                  const PspUiIntent *intent);
 bool psp_app_site_storage_setting(PspApp *app, PspAppFrameState *frame,
                                   const PspUiIntent *intent);
+/* Keep compiled scripts: configures the persistent compiled-script tier at
+   boot from the profile (boot.cfg module_cache_dir, a development override,
+   was applied with the engine), and clears it on request. */
+void psp_app_script_cache_boot(PspProcessResources *process,
+                               PspBrowserResources *browser);
 /* src/psp_app/psp_app_settings.c */
 void psp_app_apply_setting(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
@@ -1217,6 +1335,7 @@ void psp_input_script_interrupt_by_user(void);
 bool psp_input_script_frame(
     PspUiInput *input, bool ready, bool page_ready);
 void psp_webgl_measurement_mark(const char *mark);
+void psp_webgl_measurement_main_frame(void);
 bool psp_input_script_busy_frame(PspUiInput *input);
 bool psp_input_script_text_frame(PspUiInput *input);
 void psp_input_script_observe(

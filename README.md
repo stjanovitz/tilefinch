@@ -11,8 +11,8 @@ running on the handheld itself.*
 | Reader mode | Dark mode |
 |---|---|
 | ![The Wikipedia PlayStation Portable article reflowed in Tilefinch Reader mode](docs/wikipedia-reader-mode.png) | ![The Wikipedia PlayStation Portable article rendered with Tilefinch forced dark mode](docs/wikipedia-dark-mode.png) |
-| Five-tab switcher | Danzeff text entry |
-| ![Tilefinch's native tab switcher showing five open pages](docs/native-tabs.png) | ![Tilefinch's Danzeff radial keyboard with bookmark and history suggestions](docs/danzeff-text-entry.png) |
+| WebGL games | Danzeff text entry |
+| [![Treadline Arena on the PSP: the jade player tank in a close fight with blue, yellow, orange and purple bots, with the score, armor and loadout HUD drawn in the canvas](docs/treadline-on-psp.png)](examples/treadline-arena/README.md) | ![Tilefinch's Danzeff radial keyboard with bookmark and history suggestions](docs/danzeff-text-entry.png) |
 
 ## Why
 
@@ -30,9 +30,9 @@ coding agents are capable of. A web browser tests all three.
 | **Tabs and navigation** | Five tabs, bookmarks, history, address and search suggestions, find in page, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default. Custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden without clicking Accept or creating consent cookies; individual sites can be exempted. |
-| **Reader and offline** | Reflow and save articles. Small manifest-backed web apps can be installed for offline use with their icon and the same-origin resources already loaded, then updated, reinstalled, or removed. |
+| **Reader, Basic view and offline** | Reader mode reflows articles; Basic view rescues pages whose scripts fail, keeping their links, tables and simple search forms. Save articles, and install small manifest-backed web apps for offline use with their icon and the same-origin resources already loaded, then update, reinstall, or remove them. |
 | **Text entry** | The PSP system keyboard or the faster Danzeff radial keyboard, with completion from local bookmarks and history. |
-| **Games** | Bounded Canvas 2D and WebGL 1 for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. Two example games are included: [Prism Break 3D](examples/prism-break-3d/) and the two-player [Treadline Arena](examples/treadline-arena/), which pairs PSPs through LAN discovery or numeric invites and ordinary browsers through manual, service-free WebRTC. |
+| **Games** | Bounded Canvas 2D and WebGL 1 for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
 | **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, bounded mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
 | **Native PSP interface** | An immediate home screen, Collections, clock, battery and Wi-Fi status, contextual controls, PNG screenshots, and diagnostics shown as photographable QR codes. |
 | **Optional XMB redirect** | With ARK-4, Sony's Internet Browser icon can launch Tilefinch; holding L opens the original browser instead. |
@@ -77,9 +77,11 @@ coding agents are capable of. A web browser tests all three.
     library would work. Not a sensible target.
 - About 20 MB free on the Memory Stick for everyday browsing and updates.
   - Optional glyph packs take about 1 MB each; the color-emoji pack takes
-    about 5 MB. Tilefinch shows the signed download size before installing.
-    Besides the selected language pack, it can attach up to two other
-    installed packs when a page uses their scripts.
+    about 5 MB. Besides the selected language pack, Tilefinch can attach
+    up to two other installed packs when a page uses their scripts. A page
+    that needs a pack you have not installed offers it in a notice you can
+    ignore; installing from that notice first shows the signed download
+    size and asks again.
   - Installing the optional voice model needs about 19 MB more while the
     verified download and the new copy coexist. Allow 40 MB free if you want
     voice recognition.
@@ -184,8 +186,8 @@ The [user guide](docs/USER_GUIDE.md) covers everyday use in detail:
 - **Typing** with the PSP keyboard or the faster Danzeff layout, with
   completion from your bookmarks and history.
 - **Find in page** from **Menu → Page tools**.
-- **Reader mode** and the **offline library** of saved articles and video
-  downloads.
+- **Reader mode**, **Basic view** for pages whose scripts fail, and the
+  **offline library** of saved articles and video downloads.
 - **Games and page controls**: handing the buttons to a page's Gamepad API,
   fullscreen, game audio, and direct multiplayer.
 - **Screenshots**, what Tilefinch offers **when a page will not load**, and

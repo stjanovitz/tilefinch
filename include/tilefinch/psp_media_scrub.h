@@ -224,6 +224,24 @@ static inline void psp_media_continuation_retarget(
     continuation->playing = playing;
 }
 
+/* At the end of the replacement open: whether it runs a resume seek to the
+   continuation's position (true), or settles as a fresh open (false).
+
+   Every reopen with a known duration resumes through the seek, a paused one
+   to 0:00 included. That case used to skip the seek as "already at its
+   target", but settling as a fresh open made it a passive open: one armed to
+   pause after its poster frame while the decoder was left paused, so no
+   packet was ever fed and the first-frame watchdog failed it five seconds
+   later ("VIDEO FIRST FRAME TIMED OUT"; PSP-3000, an ended 60 s clip looped
+   by the stability harness, 2026-10-06). The resume seek is the path every
+   other reopen takes and leaves the player paused at the target. */
+static inline bool psp_media_continuation_needs_resume_seek(
+    const PspMediaContinuation *continuation, uint64_t duration_us)
+{
+    return psp_media_continuation_reopening(continuation)
+        && duration_us != 0;
+}
+
 /* The open finished and started its resume seek. */
 static inline void psp_media_continuation_begin_resume(
     PspMediaContinuation *continuation)

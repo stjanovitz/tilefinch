@@ -6,16 +6,34 @@ does not excuse exceeding another.
 
 ## Memory profiles
 
-`browser_config_apply_psp_memory_profile()` installs the canonical profiles:
+`browser_config_apply_psp_memory_profile()` installs the canonical profiles.
+Realistic is the PSP application's own configuration
+(`browser_config_apply_psp_app_defaults()`, from the `BROWSER_PSP_APP_*`
+constants that the `boot.cfg` defaults also use); strict is an engineering
+pressure profile:
 
-| Policy | Strict | Realistic |
+| Policy | Strict | Realistic (the PSP app) |
 |---|---:|---:|
-| page content budget | 16 MiB | 24 MiB |
-| retained navigation entries | 8 | 16 |
-| session response cache | 512 KiB | 1 MiB |
+| page content budget | 16 MiB | 32 MiB |
+| retained navigation entries | 8 | 4 |
+| session response cache | 512 KiB | 640 KiB |
 | QuickJS heap | 4 MiB | 5 MiB |
-| total admitted script source | at most 1 MiB | at most 2 MiB |
+| installed-app QuickJS heap floor | 6 MiB | 9 MiB |
+| total admitted script source | at most 1 MiB | memory-based (16 MiB ceiling) |
+| one script | at most 256 KiB | memory-based (4 MiB ceiling) |
 | decoded tile capacity | up to 24 (8 reserved) | up to 24 (8 reserved) |
+
+The PSP application admits a page script by the memory its compile needs,
+not by its size: a compile unit (a whole script, or the largest factory or
+statement of a bundle the browser splits) is admitted when twice its source
+plus 256 KiB fits the QuickJS heap the realm can still grow to while the page
+keeps a 3 MiB presentation reserve. A script may be up to 4 MiB
+(`BROWSER_PSP_APP_SCRIPT_FILE_KB`), a page's scripts up to 16 MiB in all
+(`BROWSER_PSP_APP_SCRIPT_TOTAL_MB`); both are sanity ceilings for hostile
+input. A compile that needs more than planned is stopped by the heap limit
+and refused alone. The measurements and the heavy-page classes are in
+`include/tilefinch/script_admission.h` and
+[MEMORY_EXPERIMENTS.md](MEMORY_EXPERIMENTS.md#accepted-script-admission-by-compile-working-set).
 
 Tiles are 128x128 RGB565 (32 KiB). A 480x272 screen touches twelve to
 sixteen; the first eight are reserved when a page's render shell is built.

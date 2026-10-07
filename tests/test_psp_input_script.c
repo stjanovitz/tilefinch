@@ -22,6 +22,7 @@
  */
 #include "tilefinch/psp_input_script.h"
 #include "tilefinch/psp_ui.h"
+#include "../src/psp_log_capture.h"
 
 #include <dirent.h>
 #include <stdio.h>
@@ -37,6 +38,27 @@
 
 static size_t warning_count;
 static char last_warning[128];
+
+static bool test_timing_log_capture(void)
+{
+    PspLogCapture capture = {0};
+    CHECK(psp_log_capture_append(&capture, "first\n", 6));
+    CHECK(capture.used == 6 && memcmp(capture.bytes, "first\n", 6) == 0);
+    capture.used = sizeof(capture.bytes) - 2;
+    CHECK(!psp_log_capture_append(&capture, "line\n", 5));
+    CHECK(capture.used == sizeof(capture.bytes) - 2 && capture.dropped == 1);
+    CHECK(psp_log_capture_append(&capture, "ok", 2));
+    CHECK(capture.used == sizeof(capture.bytes));
+    CHECK(!psp_log_capture_append(&capture, "x", 1));
+    CHECK(capture.dropped == 2);
+    capture.dropped = SIZE_MAX;
+    CHECK(!psp_log_capture_append(&capture, "x", 1));
+    CHECK(capture.dropped == SIZE_MAX);
+    capture.used = capture.dropped = 0;
+    CHECK(psp_log_capture_append(&capture, "next", 4));
+    CHECK(memcmp(capture.bytes, "next", 4) == 0);
+    return true;
+}
 
 static void record_warning(
     void *context, const char *path, size_t line_number, const char *reason)
@@ -464,19 +486,42 @@ static bool test_treadline_long_soak_scenario(const char *directory)
     warning_count = 0;
     CHECK(psp_input_script_load(
         &script, path, record_warning, NULL));
-    CHECK(script.step_count == 6u && warning_count == 0u);
-    CHECK(script.steps[0].kind == PSP_INPUT_SCRIPT_STEP_WAIT
-          && script.steps[0].advance_while_busy
-          && script.steps[0].ticks == 260u);
-    CHECK(script.steps[1].kind == PSP_INPUT_SCRIPT_STEP_MARK
-          && strcmp(script.steps[1].mark, "webgl-measure-start") == 0);
-    CHECK(script.steps[2].kind == PSP_INPUT_SCRIPT_STEP_WAIT
-          && script.steps[2].advance_while_busy
-          && script.steps[2].ticks == 2700u);
-    CHECK(script.steps[3].kind == PSP_INPUT_SCRIPT_STEP_MARK
-          && strcmp(script.steps[3].mark, "webgl-measure-end") == 0);
-    CHECK(script.steps[4].ticks == 10u
-          && script.steps[5].kind == PSP_INPUT_SCRIPT_STEP_END);
+    CHECK(script.step_count == 14u && warning_count == 0u);
+    /* Real-play entry: wait for the runtime with Deploy focused, then a
+       trusted Cross on Deploy claims Page controls (no browser chrome). */
+    CHECK(script.steps[0].kind == PSP_INPUT_SCRIPT_STEP_UNTIL
+          && script.steps[0].ticks == 900u);
+    CHECK(script.steps[1].kind == PSP_INPUT_SCRIPT_STEP_PRESS
+          && script.steps[1].advance_while_busy
+          && script.steps[1].buttons == PSP_UI_BUTTON_CONFIRM);
+    /* Then the same probe waits for play: Onslaught and Daily forge their
+       arena first, for as long as the seed takes. */
+    CHECK(script.steps[2].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[2].mark, "deployed") == 0
+          && script.steps[3].kind == PSP_INPUT_SCRIPT_STEP_UNTIL
+          && script.steps[3].ticks == 900u);
+    /* The phase-clock profile and its report precede the window, which
+       opens after the Page-controls toast has cleared. */
+    CHECK(script.steps[4].kind == PSP_INPUT_SCRIPT_STEP_WAIT
+          && script.steps[4].ticks == 60u);
+    CHECK(script.steps[5].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[5].mark, "profile-start") == 0
+          && script.steps[6].ticks == 240u
+          && script.steps[7].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[7].mark, "profile-report") == 0
+          && script.steps[8].ticks == 60u);
+    /* Page marks reset the measurement between frames, never inside one. */
+    CHECK(script.steps[9].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && script.steps[9].advance_when_painted
+          && strcmp(script.steps[9].mark, "webgl-measure-start") == 0);
+    CHECK(script.steps[10].kind == PSP_INPUT_SCRIPT_STEP_WAIT
+          && script.steps[10].advance_while_busy
+          && script.steps[10].ticks == 1350u);
+    CHECK(script.steps[11].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && script.steps[11].advance_when_painted
+          && strcmp(script.steps[11].mark, "webgl-measure-end") == 0);
+    CHECK(script.steps[12].ticks == 10u
+          && script.steps[13].kind == PSP_INPUT_SCRIPT_STEP_END);
     return true;
 }
 
@@ -489,7 +534,7 @@ static bool test_treadline_offline_controls_scenario(const char *directory)
     warning_count = 0;
     CHECK(psp_input_script_load(
         &script, path, record_warning, NULL));
-    CHECK(script.step_count == 32u && warning_count == 0u);
+    CHECK(script.step_count == 36u && warning_count == 0u);
     CHECK(script.steps[1].buttons == PSP_UI_BUTTON_MENU
           && script.steps[2].kind == PSP_INPUT_SCRIPT_STEP_PRESS
           && script.steps[2].ticks == 6u
@@ -499,29 +544,32 @@ static bool test_treadline_offline_controls_scenario(const char *directory)
           && script.steps[6].buttons == PSP_UI_BUTTON_CONFIRM);
     CHECK(script.steps[8].kind == PSP_INPUT_SCRIPT_STEP_MARK
           && strcmp(script.steps[8].mark, "offline-open") == 0);
-    CHECK(script.steps[9].buttons == PSP_UI_BUTTON_CONFIRM);
-    CHECK(script.steps[13].kind == PSP_INPUT_SCRIPT_STEP_MARK
-          && strcmp(script.steps[13].mark, "webgl-measure-start") == 0);
-    CHECK(script.steps[15].kind == PSP_INPUT_SCRIPT_STEP_ANALOG
-          && script.steps[15].analog_x == 255u
-          && script.steps[15].analog_y == 128u);
-    CHECK(script.steps[16].buttons
+    /* Quick Match (below the autofocused Continue), then Deploy. */
+    CHECK(script.steps[9].buttons == PSP_UI_BUTTON_DOWN
+          && script.steps[11].buttons == PSP_UI_BUTTON_CONFIRM
+          && script.steps[13].buttons == PSP_UI_BUTTON_CONFIRM);
+    CHECK(script.steps[17].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[17].mark, "webgl-measure-start") == 0);
+    CHECK(script.steps[19].kind == PSP_INPUT_SCRIPT_STEP_ANALOG
+          && script.steps[19].analog_x == 255u
+          && script.steps[19].analog_y == 128u);
+    CHECK(script.steps[20].buttons
           == (PSP_UI_BUTTON_TOOLBAR | PSP_UI_BUTTON_PAGE_DOWN));
-    CHECK(script.steps[18].buttons == PSP_UI_BUTTON_UP
-          && script.steps[20].kind == PSP_INPUT_SCRIPT_STEP_ANALOG
-          && script.steps[20].analog_x == 0u);
-    CHECK(script.steps[21].buttons == PSP_UI_BUTTON_PAGE_UP
-          && script.steps[22].buttons == PSP_UI_BUTTON_DOWN
-          && script.steps[23].buttons
+    CHECK(script.steps[22].buttons == PSP_UI_BUTTON_UP
+          && script.steps[24].kind == PSP_INPUT_SCRIPT_STEP_ANALOG
+          && script.steps[24].analog_x == 0u);
+    CHECK(script.steps[25].buttons == PSP_UI_BUTTON_PAGE_UP
+          && script.steps[26].buttons == PSP_UI_BUTTON_DOWN
+          && script.steps[27].buttons
               == (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_PAGE_DOWN));
-    CHECK(script.steps[25].buttons
+    CHECK(script.steps[29].buttons
           == (PSP_UI_BUTTON_CANCEL | PSP_UI_BUTTON_PAGE_DOWN)
-          && strcmp(script.steps[26].mark, "game-input-end") == 0);
-    CHECK(script.steps[27].buttons
+          && strcmp(script.steps[30].mark, "game-input-end") == 0);
+    CHECK(script.steps[31].buttons
               == (PSP_UI_BUTTON_ADDRESS | PSP_UI_BUTTON_MENU)
-          && script.steps[27].ticks == 45u
-          && strcmp(script.steps[29].mark, "controls-exited") == 0
-          && script.steps[31].kind == PSP_INPUT_SCRIPT_STEP_END);
+          && script.steps[31].ticks == 45u
+          && strcmp(script.steps[33].mark, "controls-exited") == 0
+          && script.steps[35].kind == PSP_INPUT_SCRIPT_STEP_END);
     return true;
 }
 
@@ -700,7 +748,7 @@ int main(int argc, char **argv)
              "%s/menu-tour.host-trace.txt", directory);
     snprintf(trace_path, sizeof(trace_path), "menu-tour.host-trace.produced");
 
-    if (!test_parser() || !test_file_capacity_boundary()
+    if (!test_timing_log_capture() || !test_parser() || !test_file_capacity_boundary()
         || !test_stepper() || !test_names() || !test_modal_exhaustion()
         || !test_every_scenario_loads(directory)
         || !test_live_media_scenario(directory)

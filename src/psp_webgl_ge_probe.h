@@ -40,6 +40,16 @@ typedef struct {
     uint32_t ge_checksum;
     bool available;
     bool pixel_exact;
+    /* Column-strip variants of the same exact row spans: each source row is
+       drawn as strip_texels-wide sprites, strip-major, so the GE texture
+       cache walks down a narrow column instead of across 1280-byte rows. */
+    unsigned strip_variants;
+    unsigned strip_texels[4];
+    uint64_t strip_total_us[4];
+    uint64_t strip_total_max_us[4];
+    uint64_t strip_wait_us[4];
+    size_t strip_mismatches[4];
+    uint64_t dcache_all_us;
 } PspWebglGeConversionProbe;
 
 typedef struct {

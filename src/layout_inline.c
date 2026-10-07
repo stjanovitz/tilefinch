@@ -3,6 +3,7 @@
    Split out of layout.c. */
 
 #include "layout_internal.h"
+#include "layout_block_internal.h"
 #include "tilefinch/integer_math.h"
 #include "tilefinch/platform.h"
 
@@ -698,6 +699,26 @@ bool generated_pseudo_is_flow_block(const ComputedStyle *style)
            || style->display == DISPLAY_TABLE;
 }
 
+/* Collapsible white space alone creates no line box (CSS Text 4.1.1), so
+   the clearfix idiom's content:" " block or table contributes no height.
+   Preserved spaces, and pre-line's segment breaks, do form a line. */
+static bool generated_text_forms_line(const ComputedStyle *style)
+{
+    if (style->generated_text == NULL || style->generated_text_length == 0) {
+        return false;
+    }
+    uint8_t mode = style->white_space_mode;
+    if (mode == WHITE_SPACE_PRE || mode == WHITE_SPACE_PRE_WRAP
+        || mode == WHITE_SPACE_BREAK_SPACES) return true;
+    for (size_t i = 0; i < style->generated_text_length; i++) {
+        char c = style->generated_text[i];
+        if (c == '\n' && mode == WHITE_SPACE_PRE_LINE) return true;
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r'
+            && c != '\f') return true;
+    }
+    return false;
+}
+
 GeneratedPseudoFlow generated_pseudo_flow(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, PseudoElement pseudo,
@@ -711,7 +732,10 @@ GeneratedPseudoFlow generated_pseudo_flow(
         context, node, &style,
         generated_text, sizeof(generated_text));
     resolve_padding(context->sheet, &style, width);
-    const char *trace_class = context->layout->trace_pseudo_class;
+    /* Set only by layout_read_trace_environment, which TILEFINCH_NO_TRACE
+       compiles out. */
+    const char *trace_class = TILEFINCH_TRACE_COMPILED_IN != 0
+        ? context->layout->trace_pseudo_class : NULL;
     if (trace_class != NULL && trace_class[0] != '\0') {
         size_t class_length = 0;
         const char *class_name = document_attribute(
@@ -737,8 +761,7 @@ GeneratedPseudoFlow generated_pseudo_flow(
     int content_height = style_content_height(context->sheet, &style, width,
                                               containing_height);
     if (content_height <= 0 && style.line_height != STYLE_LINE_HEIGHT_ZERO
-        && style.generated_text != NULL
-        && style.generated_text_length != 0) {
+        && generated_text_forms_line(&style)) {
         const FontFace *face = font_context_face_variant(
             context->fonts, context->web_fonts, style.font_family,
             style.font_italic, style_uses_bold_face(&style));
@@ -759,7 +782,9 @@ GeneratedPseudoFlow generated_pseudo_flow(
         .margin_right = style.margin.right,
         .margin_bottom = style.margin.bottom,
         .margin_left = style.margin.left,
-        .border_height = (int) border_height
+        .border_height = (int) border_height,
+        .clear_mode = style.clear_mode,
+        .formatting_root = style.display != DISPLAY_BLOCK
     };
 }
 
@@ -795,35 +820,11 @@ static void size_pseudo_background_command(
     if (command == NULL || style == NULL || image == NULL
         || (style->background_size_flags
             & STYLE_BACKGROUND_SIZE_EXPLICIT) == 0) return;
-    bool width_auto = (style->background_size_flags
-                       & STYLE_BACKGROUND_WIDTH_AUTO) != 0;
-    bool height_auto = (style->background_size_flags
-                        & STYLE_BACKGROUND_HEIGHT_AUTO) != 0;
-    int image_width = width_auto ? 0
-        : ((style->background_size_flags
-            & STYLE_BACKGROUND_WIDTH_PERCENT) != 0
-           ? layout_scale_dimension(area_width, style->background_width, 100)
-           : style->background_width);
-    int image_height = height_auto ? 0
-        : ((style->background_size_flags
-            & STYLE_BACKGROUND_HEIGHT_PERCENT) != 0
-           ? layout_scale_dimension(area_height, style->background_height,
-                                    100)
-           : style->background_height);
-    int natural_width = image_resource_intrinsic_width(image);
-    int natural_height = image_resource_intrinsic_height(image);
-    if (width_auto && height_auto) {
-        image_width = natural_width;
-        image_height = natural_height;
-    } else if (width_auto && image_height > 0 && natural_height > 0) {
-        image_width = layout_scale_dimension(
-            image_height, natural_width, natural_height);
-    } else if (height_auto && image_width > 0 && natural_width > 0) {
-        image_height = layout_scale_dimension(
-            image_width, natural_height, natural_width);
-    }
-    if (image_width < 1) image_width = 1;
-    if (image_height < 1) image_height = 1;
+    int image_width = 0, image_height = 0;
+    layout_background_tile_size(
+        style->background_size_flags, style->background_width,
+        style->background_height, area_width, area_height, image,
+        &image_width, &image_height);
     bool pixels = (style->background_size_flags
                    & STYLE_BACKGROUND_POSITION_PIXELS) != 0;
     int offset_x = pixels ? style->background_position_x
@@ -841,6 +842,49 @@ static void size_pseudo_background_command(
                      : LAYOUT_IMAGE_FIT_SPRITE));
     draw_command_set_image_offset(command, offset_x, offset_y);
     draw_command_set_image_sprite_size(command, image_width, image_height);
+}
+
+/* The advance of one space in `style`'s font: the suffix CSS Counter
+   Styles appends to every list marker ("\u2022 ", "1. "). */
+int layout_style_space_width(LayoutContext *context,
+                             const ComputedStyle *style)
+{
+    if (context == NULL || style == NULL) return 0;
+    const FontFace *face = font_context_face_variant(
+        context->fonts, context->web_fonts, style->font_family,
+        style->font_italic, style_uses_bold_face(style));
+    FontFamily metric_family = font_context_metric_family(
+        context->web_fonts, style->font_family, face);
+    int width_fixed = font_text_width_for_family_at_size_fixed(
+        face, metric_family, " ", 1, computed_style_font_size_fixed(style),
+        style_uses_synthetic_weight(
+            context->fonts, context->web_fonts, style, face),
+        style_uses_bold_face(style));
+    /* Same fallback as intrinsic sizing when the face has no space. */
+    if (width_fixed < 0) width_fixed = 6 * style->font_scale * 64;
+    return layout_fixed_ceil(width_fixed);
+}
+
+/* The ceiled advance of `text` in `style`'s font. */
+static int layout_style_text_width(LayoutContext *context,
+                                   const ComputedStyle *style,
+                                   const char *text, size_t length)
+{
+    if (context == NULL || style == NULL || text == NULL || length == 0) {
+        return 0;
+    }
+    const FontFace *face = font_context_face_variant(
+        context->fonts, context->web_fonts, style->font_family,
+        style->font_italic, style_uses_bold_face(style));
+    FontFamily metric_family = font_context_metric_family(
+        context->web_fonts, style->font_family, face);
+    return measured_text_width(
+        face, metric_family, text, length,
+        computed_style_font_size_fixed(style),
+        style_uses_synthetic_weight(
+            context->fonts, context->web_fonts, style, face),
+        style_uses_bold_face(style), style->font_scale,
+        style->letter_spacing);
 }
 
 int generated_inline_pseudo_width(LayoutContext *context,
@@ -913,6 +957,20 @@ bool flow_generated_inline_pseudo(LayoutContext *context,
     if (!style.generated_content || style.display == DISPLAY_NONE
         || style.hidden) return true;
     bool out_of_flow = style.out_of_flow || style.fixed_position;
+    /* An absolutely positioned pseudo of a non-positioned inline element
+       belongs to the line's containing block; nothing else paints it (the
+       block path, which passes `flowed`, paints its own pseudos). Its
+       static position is the current inline cursor. A positioned inline
+       would be the containing block itself and is left unpainted. */
+    if (style.out_of_flow && !style.fixed_position && flowed == NULL
+        && !parent->relative_position && !parent->sticky_position
+        && !parent->has_transform) {
+        int line_height = line->line_height > 0 ? line->line_height
+                                                : parent->line_height;
+        return paint_pseudo(context, node, parent, pseudo, line->x, line->y,
+                            0, line_height, SIZE_MAX, 0,
+                            &line->positioned_box);
+    }
     bool own_box = style.has_width
         || (style.mask_image != NULL && style.mask_image[0] != '\0')
         || (style.background_image != NULL
@@ -989,7 +1047,8 @@ bool flow_generated_inline_pseudo(LayoutContext *context,
 bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
                          const ComputedStyle *parent, PseudoElement pseudo,
                          int x, int y, int width, int height,
-                         size_t insertion_index, int forced_border_height)
+                         size_t insertion_index, int forced_border_height,
+                         const PositionedBox *containing)
 {
     ComputedStyle style = layout_style_for_pseudo(context, node, pseudo,
                                            parent);
@@ -1001,8 +1060,11 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
         context, node, &style,
         generated_text, sizeof(generated_text));
     resolve_padding(context->sheet, &style, width);
+    /* visibility:hidden boxes keep their geometry (the callers already
+       reserved it) but paint nothing; MDN hides its heading anchors' `#`
+       this way until hover. */
     if (!style.generated_content || style.display == DISPLAY_NONE
-        || style.hidden) return true;
+        || style.hidden || style.visibility_hidden) return true;
     const ImageResource *pseudo_mask = style.mask_image != NULL
                                        && style.mask_image[0] != '\0'
                                        ? images_find_mask_source(
@@ -1067,19 +1129,62 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
         if (text_height < 0) text_height = 7 * style.font_scale;
     }
     bool flow_block = generated_pseudo_is_flow_block(&style);
+    /* CSS 2.1 10.1: an absolutely positioned pseudo is placed in its
+       containing block -- the nearest positioned ancestor's padding box --
+       not in the originating box, which is only that block when the
+       element is itself positioned.  Insets locate the margin edge
+       (10.3.7/10.6.4), so margins and percentages resolve against it too.
+       Guardian's pillar underlines are `a::after` bars anchored to the
+       positioned list item below the link text. */
+    bool contained = style.out_of_flow && !style.fixed_position
+                     && containing != NULL && containing->width > 0
+                     && forced_border_height <= 0;
+    int box_x = x, box_y = y, box_width = width, box_height = height;
+    if (contained) {
+        box_x = containing->x;
+        box_y = containing->y;
+        box_width = containing->width;
+        box_height = containing->height > 0 ? containing->height : height;
+        resolve_margin(context->sheet, &style, box_width);
+        resolve_padding(context->sheet, &style, box_width);
+    }
+    int inset_left = contained ? layout_block_resolve_positioned_inset(
+        context->sheet, style.left, style.inset_percent_mask,
+        STYLE_INSET_LEFT_PERCENT, box_width) : style.left;
+    int inset_right = contained ? layout_block_resolve_positioned_inset(
+        context->sheet, style.right, style.inset_percent_mask,
+        STYLE_INSET_RIGHT_PERCENT, box_width) : style.right;
+    int inset_top = contained ? layout_block_resolve_positioned_inset(
+        context->sheet, style.top, style.inset_percent_mask,
+        STYLE_INSET_TOP_PERCENT, box_height) : style.top;
+    int inset_bottom = contained ? layout_block_resolve_positioned_inset(
+        context->sheet, style.bottom, style.inset_percent_mask,
+        STYLE_INSET_BOTTOM_PERCENT, box_height) : style.bottom;
+    int margin_left = contained ? style.margin.left : 0;
+    int margin_right = contained ? style.margin.right : 0;
+    int margin_top = contained ? style.margin.top : 0;
+    int margin_bottom = contained ? style.margin.bottom : 0;
+    int horizontal_edges = style.padding.left + style.padding.right
+                           + style.border.left + style.border.right;
     int pseudo_width = style.has_width
                        ? resolve_declared_length(
                            context->sheet, style.width,
-                           style.width_percent, width)
+                           style.width_percent, box_width)
+                         + (contained && !style.box_sizing_border_box
+                            ? horizontal_edges : 0)
                        : (flow_block ? width
                           : (text_width > 0
                           ? text_width + style.padding.left
                             + style.padding.right : width));
     if (!style.has_width && style.has_left && style.has_right) {
-        pseudo_width = width - style.left - style.right;
+        pseudo_width = box_width - inset_left - inset_right
+                       - margin_left - margin_right;
+    } else if (contained && !style.has_width && text_width <= 0) {
+        /* Shrink-to-fit of an empty box is its edges alone. */
+        pseudo_width = horizontal_edges;
     }
     int pseudo_content_height = style_content_height(
-        context->sheet, &style, width, height);
+        context->sheet, &style, box_width, box_height);
     if (pseudo_content_height <= 0 && text_height > 0) {
         pseudo_content_height = text_height;
     }
@@ -1095,15 +1200,19 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
        drawn. */
     if (forced_border_height <= 0 && !style.has_height && style.has_top
         && style.has_bottom) {
-        pseudo_height = height - style.top - style.bottom;
+        pseudo_height = box_height - inset_top - inset_bottom
+                        - margin_top - margin_bottom;
     }
     if (pseudo_width <= 0 || pseudo_height <= 0) return true;
-    int pseudo_x = style.has_left ? x + style.left
-                   : (style.has_right ? x + width - style.right - pseudo_width
-                                      : x);
-    int pseudo_y = style.has_top ? y + style.top
+    int pseudo_x = style.has_left ? box_x + inset_left + margin_left
+                   : (style.has_right
+                      ? box_x + box_width - inset_right - margin_right
+                        - pseudo_width
+                      : x + margin_left);
+    int pseudo_y = style.has_top ? box_y + inset_top + margin_top
                    : (style.has_bottom
-                      ? y + height - style.bottom - pseudo_height
+                      ? box_y + box_height - inset_bottom - margin_bottom
+                        - pseudo_height
                       : (pseudo == PSEUDO_AFTER ? y + height - pseudo_height
                                                 : y));
     size_t command_count_before = context->layout->count;
@@ -1171,6 +1280,41 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
             }
         }
     }
+    /* Generated boxes draw their solid border sides like any box (MDN's
+       search-button caret and Guardian's pillar separators are bordered
+       empty pseudos). Square sides only. */
+    for (unsigned side = 0; side < 4u && pseudo_mask == NULL; side++) {
+        int thickness = side == 0 ? style.border.top
+                        : side == 1 ? style.border.right
+                        : side == 2 ? style.border.bottom
+                                    : style.border.left;
+        if (thickness <= 0) continue;
+        DrawCommand edge = {
+            .type = DRAW_FILL_RECT,
+            .x = side == 1 ? pseudo_x + pseudo_width - thickness : pseudo_x,
+            .y = side == 2 ? pseudo_y + pseudo_height - thickness : pseudo_y,
+            .width = side == 1 || side == 3 ? thickness : pseudo_width,
+            .height = side == 0 || side == 2 ? thickness : pseudo_height
+        };
+        uint8_t edge_alpha = 255;
+        edge.color = stylesheet_border_color(
+            context->sheet, &style,
+            side == 0 ? STYLE_BORDER_TOP
+            : side == 1 ? STYLE_BORDER_RIGHT
+            : side == 2 ? STYLE_BORDER_BOTTOM : STYLE_BORDER_LEFT,
+            &edge_alpha);
+        edge.opacity_scale = alpha_opacity_scale(edge_alpha);
+        if (edge.width > pseudo_width) edge.width = pseudo_width;
+        if (edge.height > pseudo_height) edge.height = pseudo_height;
+        if (next_insertion <= context->layout->count) {
+            if (!layout_insert_command(context, next_insertion, edge)) {
+                return false;
+            }
+            next_insertion++;
+        } else if (layout_add_command(context->layout, edge) == NULL) {
+            return false;
+        }
+    }
     if (style.generated_text != NULL && style.generated_text_length != 0) {
         DrawCommand text = {
             .type = DRAW_TEXT,
@@ -1234,6 +1378,200 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
     return true;
 }
 
+/* Fills the inline background placeholder at `index` for the first line
+   fragment of the content after it and inserts one rectangle per later
+   fragment. Each fragment spans the text runs on its line, plus the
+   padding at the box's own start and end: the fill is built from text
+   only, so an image or atomic inline inside the box gets no background
+   behind it. */
+static bool paint_inline_background(LayoutContext *context, LineState *line,
+                                    const ComputedStyle *style, size_t index)
+{
+    LayoutDocument *layout = context->layout;
+    int radius = stylesheet_border_radius_code(context->sheet, style);
+    size_t group_start = SIZE_MAX;
+    int group_left = 0, group_right = 0, group_top = 0, group_bottom = 0;
+    bool first = true;
+    /* Bounded by the content just laid out; the scan revisits nothing. */
+    for (size_t i = index + 1; i <= layout->count; i++) {
+        const DrawCommand *command = i < layout->count
+            ? &layout->commands[i] : NULL;
+        bool text = command != NULL && command->type == DRAW_TEXT
+            && command->width > 0;
+        bool new_line = text && group_start != SIZE_MAX
+            && command->y > group_top + (group_bottom - group_top) / 2;
+        if (group_start != SIZE_MAX && (command == NULL || new_line)) {
+            bool last = command == NULL;
+            /* The fragment's text bounds the content area; padding is
+               added at the box's own start and end only. */
+            int x0 = group_left - (first ? style->padding.left : 0);
+            int x1 = group_right + (last ? style->padding.right : 0);
+            DrawCommand fill = {
+                .type = DRAW_FILL_RECT, .x = x0,
+                .y = group_top - style->padding.top,
+                .width = x1 - x0,
+                .height = group_bottom - group_top + style->padding.top
+                          + style->padding.bottom,
+                .color = style->background, .radius = radius,
+                .opacity_scale = alpha_opacity_scale(style->background_alpha)
+            };
+            if (fill.width < 0) fill.width = 0;
+            if (first) {
+                layout->commands[index] = fill;
+            } else {
+                if (group_start <= line->command_start)
+                    line->command_start++;
+                if (!layout_insert_command(context, group_start, fill))
+                    return false;
+                i++;
+            }
+            first = false;
+            group_start = SIZE_MAX;
+            if (command == NULL) break;
+            command = &layout->commands[i];
+        }
+        if (!text) continue;
+        int command_right = command->x + command->width;
+        int command_bottom = command->y + command->height;
+        if (group_start == SIZE_MAX) {
+            group_start = i;
+            group_left = command->x;
+            group_right = command_right;
+            group_top = command->y;
+            group_bottom = command_bottom;
+            continue;
+        }
+        if (command->x < group_left) group_left = command->x;
+        if (command_right > group_right) group_right = command_right;
+        if (command->y < group_top) group_top = command->y;
+        if (command_bottom > group_bottom) group_bottom = command_bottom;
+    }
+    return true;
+}
+
+LayoutFlexPseudo layout_flex_pseudo_item(LayoutContext *context,
+                                         lxb_dom_node_t *node,
+                                         const ComputedStyle *style,
+                                         PseudoElement pseudo,
+                                         int content_width)
+{
+    LayoutFlexPseudo item = {0};
+    ComputedStyle generated = layout_style_for_pseudo(context, node, pseudo,
+                                                      style);
+    if (!generated.generated_content) return item;
+    char generated_text[STYLE_GENERATED_TEXT_CAPACITY];
+    resolve_generated_expression(context, node, &generated, generated_text,
+                                 sizeof(generated_text));
+    if (!generated.generated_content || generated.display == DISPLAY_NONE
+        || generated.hidden || generated.out_of_flow
+        || generated.fixed_position || generated.float_mode != FLOAT_NONE
+        || !generated.has_width || computed_style_width_max_content(&generated)
+        || (generated.generated_text != NULL
+            && generated.generated_text_length != 0)) return item;
+    resolve_padding(context->sheet, &generated, content_width);
+    resolve_margin(context->sheet, &generated, content_width);
+    int width = resolve_declared_length(
+        context->sheet, generated.width, generated.width_percent,
+        content_width);
+    if (!generated.box_sizing_border_box) {
+        width += generated.padding.left + generated.padding.right
+                 + generated.border.left + generated.border.right;
+    }
+    int height = style_content_height(context->sheet, &generated,
+                                      content_width, 0);
+    if (height < 0) height = 0;
+    height += generated.padding.top + generated.padding.bottom
+              + generated.border.top + generated.border.bottom;
+    if (width <= 0 || height <= 0) return item;
+    item.active = true;
+    item.width = width;
+    item.height = height;
+    item.margin_left = generated.margin.left;
+    item.margin_right = generated.margin.right;
+    item.margin_top = generated.margin.top;
+    item.margin_bottom = generated.margin.bottom;
+    item.outer_width = layout_add_coordinate(
+        layout_add_coordinate(width, item.margin_left), item.margin_right);
+    if (item.outer_width < 0) item.outer_width = 0;
+    return item;
+}
+
+static int layout_flex_pseudo_cross_y(const ComputedStyle *style,
+                                      const LayoutFlexPseudo *item,
+                                      int row_top, int row_bottom)
+{
+    int outer = item->margin_top + item->height + item->margin_bottom;
+    int free_space = row_bottom - row_top - outer;
+    if (free_space < 0) free_space = 0;
+    if (style->align_items == ALIGN_CENTER) {
+        return row_top + free_space / 2 + item->margin_top;
+    }
+    if (style->align_items == ALIGN_END) {
+        return row_top + free_space + item->margin_top;
+    }
+    return row_top + item->margin_top;
+}
+
+bool layout_flex_pseudo_paint(LayoutContext *context, lxb_dom_node_t *node,
+                              const ComputedStyle *style,
+                              const LayoutFlexPseudo *before,
+                              const LayoutFlexPseudo *after,
+                              int content_x, int content_width, int row_top,
+                              int row_bottom, size_t command_start)
+{
+    int reserved_start = before->active
+        ? layout_add_coordinate(before->outer_width, style->gap) : 0;
+    int reserved_end = after->active
+        ? layout_add_coordinate(after->outer_width, style->gap) : 0;
+    /* The in-flow items' extent on the line: what the line painted. */
+    int items_right = layout_add_coordinate(content_x, reserved_start);
+    for (size_t i = command_start; i < context->layout->count; i++) {
+        const DrawCommand *command = &context->layout->commands[i];
+        int right = layout_add_coordinate(command->x, command->width);
+        if (command->width > 0 && right > items_right) items_right = right;
+    }
+    FlatItemIterator iterator;
+    FlatItem item;
+    flat_iterator_init(&iterator, context, node, style);
+    size_t items = 0;
+    lxb_dom_node_t *only = NULL;
+    while (items < 2 && flat_iterator_next(&iterator, &item)) {
+        if (item.style.out_of_flow || item.style.fixed_position) continue;
+        only = items++ == 0 && !item.anonymous_text ? item.node : NULL;
+    }
+    /* space-between with one real item puts it at the end, past the
+       generated item(s) the line also distributes. */
+    if (style->justify_content == JUSTIFY_SPACE_BETWEEN && items == 1
+        && only != NULL && before->active && !after->active) {
+        int end = layout_add_coordinate(content_x, content_width);
+        int shift = end - items_right;
+        if (shift > 0) {
+            translate_node_subtree(context->layout, only, shift, 0);
+            items_right = end;
+        }
+    }
+    if (before->active
+        && !paint_pseudo(context, node, style, PSEUDO_BEFORE,
+                         layout_add_coordinate(content_x,
+                                               before->margin_left),
+                         layout_flex_pseudo_cross_y(style, before, row_top,
+                                                    row_bottom),
+                         before->width, before->height, SIZE_MAX, 0, NULL))
+        return false;
+    if (after->active) {
+        int x = items == 0 ? layout_add_coordinate(content_x, reserved_start)
+                           : layout_add_coordinate(items_right, style->gap);
+        (void) reserved_end;
+        if (!paint_pseudo(context, node, style, PSEUDO_AFTER,
+                          layout_add_coordinate(x, after->margin_left),
+                          layout_flex_pseudo_cross_y(style, after, row_top,
+                                                     row_bottom),
+                          after->width, after->height, SIZE_MAX, 0, NULL))
+            return false;
+    }
+    return true;
+}
+
 static bool flow_generated_block_pseudo(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, PseudoElement pseudo,
@@ -1252,7 +1590,7 @@ static bool flow_generated_block_pseudo(
     if (!paint_pseudo(context, node, parent, pseudo,
                       line->start_x + flow->margin_left, y,
                       width, flow->border_height, SIZE_MAX,
-                      flow->border_height)) {
+                      flow->border_height, NULL)) {
         return false;
     }
     line->y = layout_add_coordinate(
@@ -1340,10 +1678,74 @@ static int line_text_baseline(const LayoutDocument *layout,
     return baseline;
 }
 
+static int inline_style_line_height_fixed(
+    LayoutContext *context, const ComputedStyle *style);
+
+/* Moves one atomic inline box, its descendants and the interaction
+   regions registered after its own box. */
+static void line_translate_atomic(LayoutDocument *layout,
+                                  const LineAtomic *atomic, int dy)
+{
+    if (dy == 0) return;
+    if (atomic->command_end == 0) {
+        translate_node_subtree(layout, atomic->node, 0, dy);
+    } else {
+        for (size_t i = atomic->command_start;
+             i < atomic->command_end && i < layout->count; i++) {
+            layout->commands[i].y =
+                layout_add_coordinate(layout->commands[i].y, dy);
+        }
+        LayoutNodeBox *box = layout_box_for_node_mutable(
+            layout, atomic->node);
+        if (box != NULL) box->y = layout_add_coordinate(box->y, dy);
+    }
+    for (size_t i = atomic->extra_link_start;
+         i < atomic->extra_link_end && i < layout->link_count; i++) {
+        layout->links[i].y = layout_add_coordinate(layout->links[i].y, dy);
+    }
+    for (size_t i = atomic->extra_control_start;
+         i < atomic->extra_control_end && i < layout->control_count; i++) {
+        layout->controls[i].y =
+            layout_add_coordinate(layout->controls[i].y, dy);
+    }
+}
+
+/* CSS 2.1 10.8: text runs align on their baselines, and atomic inline boxes
+   align their own baseline (or, for vertical-align:middle, their midpoint
+   raised by half the parent's x-height) to the line baseline; top/bottom
+   boxes align to the line box edges once its height is known. On a line
+   holding atomic boxes the block's strut takes part as well, which is what
+   leaves the descender gap under an image on a line of its own. */
 static void align_line_text_baselines(LineState *line)
 {
-    if (line == NULL || line->layout == NULL
-        || line->command_start >= line->layout->count) return;
+    if (line == NULL || line->layout == NULL) return;
+    LineAtomicStack *stack = line->atomics;
+    size_t atomic_first = line->atomic_base;
+    size_t atomic_last = stack != NULL ? stack->count : 0;
+    if (atomic_first > atomic_last) atomic_first = atomic_last;
+    if (line->command_start >= line->layout->count) {
+        if (stack != NULL) stack->count = atomic_first;
+        return;
+    }
+    /* Text painted inside an atomic box (a control's value, an image's
+       alt text) moves with that box, not with the line's own text. */
+    for (size_t i = atomic_first; stack != NULL && i < atomic_last; i++) {
+        const LineAtomic *atomic = &stack->entries[i];
+        size_t start = atomic->command_start, end = atomic->command_end;
+        if (end == 0) {
+            const LayoutNodeBox *box = layout_box_for_node(
+                line->layout, atomic->node);
+            if (box == NULL) continue;
+            start = box->command_start;
+            end = box->command_end;
+        }
+        for (size_t c = start; c < end && c < line->layout->count; c++) {
+            DrawCommand *command = &line->layout->commands[c];
+            if (command->type == DRAW_TEXT) {
+                command->radius |= LAYOUT_TEXT_BASELINE_ALIGNED;
+            }
+        }
+    }
     int target = 0;
     for (size_t i = line->command_start; i < line->layout->count; i++) {
         DrawCommand *command = &line->layout->commands[i];
@@ -1351,6 +1753,27 @@ static void align_line_text_baselines(LineState *line)
         int baseline = line_text_baseline(line->layout, command);
         if (baseline > target) target = baseline;
         command->z_index = baseline < INT_MAX ? baseline + 1 : INT_MAX;
+    }
+    int line_baseline = target;
+    bool has_atomics = stack != NULL && atomic_last > atomic_first;
+    /* The strut takes part in every line box with content (CSS 2.1
+       10.8.1): a run of smaller text, or an atomic box, in a block with a
+       larger font still gets the block's line height. */
+    bool strut = (has_atomics || target > 0) && line->strut_baseline > 0
+                 && line->strut_fixed > 0;
+    if (strut && !has_atomics && line->strut_baseline > line_baseline) {
+        line_baseline = line->strut_baseline;
+    }
+    if (has_atomics) {
+        if (strut && line->strut_baseline > line_baseline) {
+            line_baseline = line->strut_baseline;
+        }
+        for (size_t i = atomic_first; i < atomic_last; i++) {
+            const LineAtomic *atomic = &stack->entries[i];
+            if (atomic->mode != LINE_ATOMIC_BASELINE) continue;
+            int anchor = atomic->top - line->y + atomic->baseline;
+            if (anchor > line_baseline) line_baseline = anchor;
+        }
     }
     for (size_t i = line->link_start;
          i < line->layout->link_count; i++) {
@@ -1368,7 +1791,7 @@ static void align_line_text_baselines(LineState *line)
                 && command->z_index > 0) {
                 int baseline = command->z_index - 1;
                 link->y = layout_add_coordinate(
-                    link->y, target - baseline);
+                    link->y, line_baseline - baseline);
             }
         }
         link->url_length &= LAYOUT_LINK_URL_LENGTH_MASK;
@@ -1382,14 +1805,215 @@ static void align_line_text_baselines(LineState *line)
             ? command->z_index - 1 : -1;
         command->z_index = 0;
         if (baseline < 0) continue;
-        int dy = target - baseline;
+        int dy = line_baseline - baseline;
         command->y = layout_add_coordinate(command->y, dy);
         int bottom = command->y - line->y + command->height;
         if ((command->radius & LAYOUT_TEXT_ZERO_LINE_HEIGHT) == 0
             && bottom > used_height) used_height = bottom;
         command->radius |= LAYOUT_TEXT_BASELINE_ALIGNED;
     }
+    if (strut && !has_atomics) {
+        int strut_bottom = line_baseline
+            + layout_fixed_ceil(line->strut_fixed) - line->strut_baseline;
+        if (strut_bottom > used_height) used_height = strut_bottom;
+    }
+    if (has_atomics) {
+        if (strut) {
+            int strut_bottom = line_baseline
+                + layout_fixed_ceil(line->strut_fixed)
+                - line->strut_baseline;
+            if (strut_bottom > used_height) used_height = strut_bottom;
+        }
+        for (size_t i = atomic_first; i < atomic_last; i++) {
+            const LineAtomic *atomic = &stack->entries[i];
+            int top = atomic->top - line->y;
+            if (atomic->mode == LINE_ATOMIC_BASELINE) {
+                int dy = line_baseline - (top + atomic->baseline);
+                line_translate_atomic(line->layout, atomic, dy);
+                top += dy;
+            }
+            int bottom = atomic->mode == LINE_ATOMIC_BOTTOM
+                ? atomic->height : top + atomic->height;
+            if (bottom > used_height) used_height = bottom;
+        }
+        for (size_t i = atomic_first; i < atomic_last; i++) {
+            const LineAtomic *atomic = &stack->entries[i];
+            if (atomic->mode != LINE_ATOMIC_BOTTOM) continue;
+            line_translate_atomic(
+                line->layout, atomic,
+                used_height - (atomic->top - line->y) - atomic->height);
+        }
+    }
+    if (stack != NULL) stack->count = atomic_first;
     if (used_height > line->line_height) line->line_height = used_height;
+}
+
+/* Records an atomic inline box placed at the top of `line` so the line
+   flush can move it to its vertical-align position. `baseline` is the
+   box's own baseline from its margin-box top. Past the bounded stack the
+   box keeps the historical top alignment. */
+static void line_record_atomic(LineState *line, lxb_dom_node_t *node,
+                               const ComputedStyle *style,
+                               const ComputedStyle *parent,
+                               int top, int height, int baseline,
+                               size_t command_start,
+                               size_t extra_link_start,
+                               size_t extra_control_start)
+{
+    LineAtomicStack *stack = line == NULL ? NULL : line->atomics;
+    if (stack == NULL || node == NULL || style == NULL || parent == NULL
+        || height <= 0) return;
+    if (stack->count < line->atomic_base) stack->count = line->atomic_base;
+    if (stack->count >= LINE_ATOMIC_LIMIT) return;
+    uint8_t mode = LINE_ATOMIC_BASELINE;
+    int anchor = baseline;
+    int parent_size = parent->font_size > 0 ? parent->font_size : 16;
+    switch (style->vertical_align) {
+    case VERTICAL_TOP:
+    case VERTICAL_TEXT_TOP:
+        mode = LINE_ATOMIC_TOP;
+        break;
+    case VERTICAL_BOTTOM:
+    case VERTICAL_TEXT_BOTTOM:
+        mode = LINE_ATOMIC_BOTTOM;
+        break;
+    case VERTICAL_MIDDLE:
+        /* The parent's x-height, approximated as 0.52em (Arial/Helvetica,
+           the faces the engine's metrics follow). */
+        anchor = height / 2 + (parent_size * 33 + 64) / 128;
+        break;
+    case VERTICAL_SUPER:
+        anchor = baseline + parent_size / 3;
+        break;
+    case VERTICAL_SUB:
+        anchor = baseline - parent_size / 4;
+        break;
+    default:
+        break;
+    }
+    stack->entries[stack->count++] = (LineAtomic) {
+        .node = node,
+        .command_start = (uint32_t) command_start,
+        .command_end = command_start == SIZE_MAX
+            ? 0u : (uint32_t) line->layout->count,
+        .extra_link_start = (uint32_t) extra_link_start,
+        .extra_link_end = (uint32_t) line->layout->link_count,
+        .extra_control_start = (uint32_t) extra_control_start,
+        .extra_control_end = (uint32_t) line->layout->control_count,
+        .top = top,
+        .height = height,
+        .baseline = anchor,
+        .mode = mode
+    };
+}
+
+/* The baseline of an inline-level block container from its margin-box top:
+   its last line box (the first for buttons, flex and grid containers), or
+   its bottom margin edge when it has none or clips its overflow
+   (CSS 2.1 10.8.1, CSS Flexbox 8.5). */
+static int atomic_block_baseline(const LayoutDocument *layout,
+                                 lxb_dom_node_t *node,
+                                 const ComputedStyle *style,
+                                 int top, int height)
+{
+    bool first = layout_node_name_is(node, "button")
+        || style->display == DISPLAY_INLINE_FLEX
+        || style->display == DISPLAY_INLINE_GRID;
+    /* Only a block container's baseline falls back to its margin edge when
+       it clips; flex and grid containers keep their items' baseline. */
+    if (!first && (style->overflow_x_scroll || style->overflow_y_scroll
+                   || style->overflow_x_clip_only
+                   || style->overflow_y_clip_only)) {
+        return height;
+    }
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box == NULL) return height;
+    bool found = false;
+    int baseline = height;
+    size_t end = box->command_end < layout->count
+        ? box->command_end : layout->count;
+    for (size_t i = box->command_start; i < end; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        int candidate;
+        if (command->type == DRAW_IMAGE) {
+            /* A replaced box in the content sits on its line's baseline
+               with its bottom edge. */
+            candidate = command->y + command->height - top;
+        } else {
+            if (command->type != DRAW_TEXT
+                || !draw_command_text_baseline_aligned(command)) continue;
+            int text = line_text_baseline(layout, command);
+            if (text < 0) continue;
+            candidate = command->y + text - top;
+        }
+        if (!found || (first ? candidate < baseline : candidate > baseline)) {
+            baseline = candidate;
+        }
+        found = true;
+    }
+    /* Replaced descendants (loaded or not) sit on their line's baseline
+       with their bottom edge. Node boxes are appended in post-order, so the
+       descendants' boxes directly precede the container's own. */
+    size_t box_index = (size_t) (box - layout->node_boxes);
+    unsigned visited = 0;
+    for (size_t i = box_index; i-- > 0 && visited < 256u; visited++) {
+        const LayoutNodeBox *descendant = &layout->node_boxes[i];
+        if (descendant->command_start < box->command_start) break;
+        if (descendant->node == NULL || descendant->height <= 0
+            || !(layout_node_name_is(descendant->node, "img")
+                 || layout_node_name_is(descendant->node, "svg")
+                 || layout_node_name_is(descendant->node, "video")
+                 || layout_node_name_is(descendant->node, "canvas")
+                 || layout_node_name_is(descendant->node, "iframe"))) {
+            continue;
+        }
+        int candidate = descendant->y + descendant->height - top;
+        if (!found || (first ? candidate < baseline : candidate > baseline)) {
+            baseline = candidate;
+        }
+        found = true;
+    }
+    if (!found || baseline < 0 || baseline > height) return height;
+    return baseline;
+}
+
+/* The baseline of a single-line form control: its text line, centred in
+   the content box, sits on the control's baseline. */
+static int atomic_control_baseline(LayoutContext *context,
+                                   const ComputedStyle *style,
+                                   int content_offset, int content_height)
+{
+    const FontFace *face = font_context_face_variant(
+        context->fonts, context->web_fonts, style->font_family,
+        style->font_italic, style_uses_bold_face(style));
+    int size_fixed = computed_style_font_size_fixed(style);
+    int line_height = layout_fixed_ceil(
+        font_line_height_fixed_at_size(face, size_fixed));
+    if (line_height <= 0) line_height = 7 * style->font_scale;
+    int baseline = font_line_baseline_at_size(face, size_fixed, line_height);
+    if (baseline < 0) baseline = line_height * 3 / 4;
+    return content_offset + (content_height - line_height) / 2 + baseline;
+}
+
+int layout_inline_strut_baseline(LayoutContext *context,
+                                 const ComputedStyle *style,
+                                 lxb_dom_node_t *node)
+{
+    if (context == NULL || style == NULL) return 0;
+    /* Quirks mode's line height quirk: lines holding only atomic boxes
+       have no strut. */
+    if (node != NULL && node->owner_document != NULL
+        && node->owner_document->compat_mode
+               == LXB_DOM_DOCUMENT_CMODE_QUIRKS) return 0;
+    int line_height = layout_fixed_ceil(
+        inline_style_line_height_fixed(context, style));
+    if (line_height <= 0) return 0;
+    const FontFace *face = font_context_face_variant(
+        context->fonts, context->web_fonts, style->font_family,
+        style->font_italic, style_uses_bold_face(style));
+    int baseline = font_line_baseline_at_size(
+        face, computed_style_font_size_fixed(style), line_height);
+    return baseline > 0 ? baseline : 0;
 }
 
 static int measured_flow_text_width_fixed(
@@ -1651,6 +2275,9 @@ void layout_flush_line(LineState *line)
     line->link_start = line->layout->link_count;
     line->control_start = line->layout->control_count;
     line->node_box_start = line->layout->node_box_count;
+    if (line->atomics != NULL && line->atomics->count > line->atomic_base) {
+        line->atomics->count = line->atomic_base;
+    }
     update_float_bounds(line);
 }
 
@@ -1878,7 +2505,7 @@ int layout_single_text_advance_fixed(
         return layout_fixed_from_integer(used_width);
     }
     size_t length = 0;
-    const char *text = document_text_data(node->first_child, &length);
+    const char *text = layout_text_data(node->first_child, &length);
     if (text == NULL) return layout_fixed_from_integer(used_width);
     const FontFace *face = font_context_face_variant(
         context->fonts, context->web_fonts, style->font_family,
@@ -2282,6 +2909,37 @@ static size_t fitting_line_text_prefix(
         face, metric_family, text, length, font_size_fixed,
         synthetic_bold, metric_bold, scale, letter_spacing,
         available_fixed, transform, kerning);
+}
+
+bool layout_unloaded_image_ratio(lxb_dom_node_t *node,
+                                 const ComputedStyle *style,
+                                 int *ratio_width, int *ratio_height)
+{
+    *ratio_width = 0;
+    *ratio_height = 0;
+    if (node == NULL || style == NULL || !layout_node_name_is(node, "img")
+        || (!style->has_width && !style->has_height)) return false;
+    int width = style->aspect_width, height = style->aspect_height;
+    if (width <= 0 || height <= 0) {
+        width = html_dimension_attribute(node, "width");
+        height = html_dimension_attribute(node, "height");
+    }
+    if (width <= 0 || height <= 0) return false;
+    *ratio_width = width;
+    *ratio_height = height;
+    return true;
+}
+
+ComputedStyle layout_alt_text_flow_style(const ComputedStyle *style)
+{
+    ComputedStyle flow = *style;
+    if (flow.line_height == STYLE_LINE_HEIGHT_ZERO
+        || (flow.line_height < 0 && flow.line_height > -1000)
+        || (flow.line_height > 0
+            && flow.line_height < style->font_size)) {
+        flow.line_height = 0;
+    }
+    return flow;
 }
 
 bool layout_add_replaced_alt_text(
@@ -3061,7 +3719,7 @@ bool flow_subtree_fallback(LayoutContext *context,
             continue;
         }
         size_t length = 0;
-        const char *text = document_text_data(node, &length);
+        const char *text = layout_text_data(node, &length);
         if (text == NULL || length == 0) {
             node = layout_fallback_next(node, root, false);
             continue;
@@ -3173,7 +3831,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (layout_preview_limit_reached(context, line->y)) return true;
     if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
         size_t length = 0;
-        const char *text = document_text_data(node, &length);
+        const char *text = layout_text_data(node, &length);
         for (size_t i = 0; text != NULL && i < length; i++) {
             if (!isspace((unsigned char) text[i])) {
                 line->first_inline_block_collapses_top = false;
@@ -3421,12 +4079,21 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
            above the line when prior normal line heights were fractional. */
         int atomic_y = layout_fixed_ceil(line_y_fixed(line));
         int atomic_bottom = atomic_y;
-        if (!layout_block(context, node, parent, atomic_x, atomic_y, width,
-                          0, true, &line->positioned_box,
-                          &atomic_bottom)) return false;
+        lxb_dom_node_t *saved_basis_node = context->percentage_basis_node;
+        int saved_basis_width = context->percentage_basis_width;
+        context->percentage_basis_node = node;
+        context->percentage_basis_width = line->base_right - line->base_left;
+        bool atomic_placed = layout_block(
+            context, node, parent, atomic_x, atomic_y, width, 0, true,
+            &line->positioned_box, &atomic_bottom);
+        context->percentage_basis_node = saved_basis_node;
+        context->percentage_basis_width = saved_basis_width;
+        if (!atomic_placed) return false;
         const LayoutNodeBox *box = layout_box_for_node(context->layout, node);
         int atomic_height = atomic_bottom - line->y;
         if (atomic_height < 1) atomic_height = 1;
+        size_t atomic_extra_link_start = context->layout->link_count;
+        size_t atomic_extra_control_start = context->layout->control_count;
         if (link_node == node && link_url != NULL && link_url_length != 0) {
             DrawCommand region = {.x = atomic_x, .y = atomic_y,
                                   .width = width, .height = atomic_height};
@@ -3461,6 +4128,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                 atomic_advance_fixed));
         line_height_include_fixed(
             line, layout_fixed_from_integer(atomic_height));
+        line_record_atomic(
+            line, node, &style, parent, line->y, atomic_height,
+            atomic_block_baseline(context->layout, node, &style, line->y,
+                                  atomic_height),
+            SIZE_MAX, atomic_extra_link_start, atomic_extra_control_start);
         line_note_atomic(line, parent);
         return true;
     }
@@ -3486,6 +4158,29 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             ? resolve_declared_length(context->sheet, style.width,
                                       style.width_percent, available)
             : default_width;
+        /* A push button's auto width is its label plus its own padding
+           and borders, like a <button> (HTML 15.5.15-17); the bounded
+           character heuristic ignored both. */
+        bool push_button = input_control
+            && input_control_type == CONTROL_BUTTON && input_type != NULL
+            && ((type_length == 6
+                 && (strncasecmp(input_type, "submit", 6) == 0
+                     || strncasecmp(input_type, "button", 6) == 0))
+                || (type_length == 5
+                    && strncasecmp(input_type, "reset", 5) == 0));
+        if (push_button && !definite_width) {
+            size_t label_length = 0;
+            const char *label = document_attribute(node, "value",
+                                                   &label_length);
+            if (label == NULL || label_length == 0) {
+                label = type_length == 5 ? "RESET"
+                    : (strncasecmp(input_type, "submit", 6) == 0
+                       ? "SUBMIT" : "");
+                label_length = strlen(label);
+            }
+            specified_width = layout_style_text_width(
+                context, &style, label, label_length) + horizontal_edges;
+        }
         int outer_width = definite_width && !style.box_sizing_border_box
                           ? specified_width + horizontal_edges
                           : specified_width;
@@ -3500,10 +4195,18 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             outer_width = resized_width;
             definite_width = true;
         }
+        if (!has_resized_control) {
+            /* min-width/max-width apply to form controls like any other
+               replaced box (weather.gov's search field: 45% capped at
+               11em). */
+            outer_width = constrain_border_box_width(
+                context, node, parent, &style, available, outer_width,
+                NULL);
+        }
         int maximum_outer_width = available - style.margin.left
                                   - style.margin.right;
         int minimum_outer_width = input_control_type == CONTROL_TOGGLE
-            ? horizontal_edges + 18 : 32;
+            ? horizontal_edges + 18 : (push_button ? horizontal_edges : 32);
         if (maximum_outer_width < minimum_outer_width) {
             maximum_outer_width = minimum_outer_width;
         }
@@ -3531,11 +4234,23 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             outer_height = 18 + vertical_edges;
         } else if (input_control_type == CONTROL_RANGE) {
             outer_height = 20 + vertical_edges;
+        } else if (push_button) {
+            /* A push button's content box is one line of its label. An
+               authored line-height is used as is; `normal` follows
+               Chromium's control face (Arial, 1.15em, whole pixels) rather
+               than the fallback face's own line gap: 21px for the default
+               13.33px control font. */
+            int text_height = style.line_height > 0
+                ? layout_fixed_ceil(
+                      inline_style_line_height_fixed(context, &style))
+                : computed_style_font_size_fixed(&style) * 115 / 6400;
+            if (text_height < 1) text_height = 7 * style.font_scale;
+            outer_height = text_height + vertical_edges;
         } else {
             /* Native single-line text controls size their content box from
                the used font size, not from a downloadable face's internal
                line gap. This keeps their UA geometry stable across fallback
-               faces and matches the 22px Chromium text input at 16px. */
+               faces. */
             int text_height = layout_fixed_ceil(
                 computed_style_font_size_fixed(&style));
             if (text_height < 1) text_height = 7 * style.font_scale;
@@ -3668,7 +4383,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                 .radius = (int) style.font_size_fraction
                           << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
                           | (computed_style_kerning_none(&style)
-                             ? LAYOUT_TEXT_KERNING_NONE : 0),
+                             ? LAYOUT_TEXT_KERNING_NONE : 0)
+                          /* Placed by the control; the line moves the
+                             whole control to its baseline. */
+                          | (line->atomics != NULL
+                             ? LAYOUT_TEXT_BASELINE_ALIGNED : 0),
                 .image_fit = text_decoration_bits(&style),
                 .opacity_scale = alpha_opacity_scale(style.color_alpha)
             };
@@ -3737,6 +4456,22 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                           + style.margin.bottom;
         line_height_include_fixed(
             line, layout_fixed_from_integer(line_height));
+        /* Text fields and push buttons sit on their text's baseline;
+           toggles, ranges and multi-line controls on their bottom margin
+           edge (textarea clips its overflow). */
+        int control_baseline = line_height;
+        if (input_control && input_control_type != CONTROL_TOGGLE
+            && input_control_type != CONTROL_RANGE && !special_input) {
+            control_baseline = atomic_control_baseline(
+                context, &style,
+                style.margin.top + style.border.top + style.padding.top,
+                content_height);
+        }
+        line_record_atomic(line, node, &style, parent, line->y,
+                           line_height, control_baseline,
+                           inline_control_command_start,
+                           inline_control_link_start,
+                           inline_control_region_start);
         line_note_atomic(line, parent);
         return true;
     }
@@ -3805,6 +4540,17 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
            responsive logos. The separate attribute read is retained only
            for the explicit zero-width spacer contract above. */
         bool declared_box = style.has_width && style.has_height;
+        int ratio_width = 0, ratio_height = 0;
+        if (!image_available && !declared_box && !zero_width_spacer
+            && layout_unloaded_image_ratio(
+                   node, &style, &ratio_width, &ratio_height)) {
+            /* Reserve the ratio box the loaded image will occupy, so the
+               page does not reflow when it arrives and the alt text paints
+               inside it on one clipped line. */
+            width = ratio_width;
+            height = ratio_height;
+            declared_box = true;
+        }
         if (!image_available && !declared_box && !zero_width_spacer
             && !layout_node_name_is(node, "svg")
             && !layout_node_name_is(node, "video")
@@ -3814,8 +4560,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             size_t alt_length = 0;
             const char *alt = layout_node_name_is(node, "img")
                 ? document_attribute(node, "alt", &alt_length) : NULL;
+            ComputedStyle alt_style = layout_alt_text_flow_style(&style);
             return alt == NULL || alt_length == 0
-                   || flow_text(context, line, alt, alt_length, &style,
+                   || flow_text(context, line, alt, alt_length, &alt_style,
                                 link_url, link_url_length, link_node);
         }
         bool styled_width = style.has_width;
@@ -3874,8 +4621,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             size_t alt_length = 0;
             const char *alt = layout_node_name_is(node, "img")
                 ? document_attribute(node, "alt", &alt_length) : NULL;
+            ComputedStyle alt_style = layout_alt_text_flow_style(&style);
             return alt == NULL || alt_length == 0
-                   || flow_text(context, line, alt, alt_length, &style,
+                   || flow_text(context, line, alt, alt_length, &alt_style,
                                 link_url, link_url_length, link_node);
         }
         int available = line->right - line->start_x;
@@ -3901,6 +4649,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             spacing_fixed = 0;
         }
         if (height < 1) height = 1;
+        size_t replaced_command_start = context->layout->count;
         int replaced_start_x = layout_fixed_ceil(
             layout_fixed_add(line_cursor_fixed(line), spacing_fixed));
         int outer_x = replaced_start_x + style.margin.left;
@@ -4004,6 +4753,10 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         int line_height = style.margin.top + outer_height + style.margin.bottom;
         line_height_include_fixed(
             line, layout_fixed_from_integer(line_height));
+        /* A replaced box's baseline is its bottom margin edge. */
+        line_record_atomic(line, node, &style, parent, line->y, line_height,
+                           line_height, replaced_command_start,
+                           replaced_link_start, replaced_control_start);
         line_note_atomic(line, parent);
         return true;
     }
@@ -4022,10 +4775,10 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                     ? resolve_declared_length(
                         context->sheet, style.width, style.width_percent,
                         line->right - line->start_x)
-                    : mask->width;
+                    : image_resource_intrinsic_width(mask);
         int height = style_pixel_height(context->sheet, &style,
                                         line->right - line->start_x);
-        if (height <= 0) height = mask->height;
+        if (height <= 0) height = image_resource_intrinsic_height(mask);
         int minimum_width = style_minimum_width(
             context->sheet, &style, line->right - line->start_x);
         if (width < minimum_width) width = minimum_width;
@@ -4069,10 +4822,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                    link_url, link_url_length, link_node)) return false;
         if (!paint_pseudo(context, node, &style, PSEUDO_BEFORE,
                           command.x, command.y, command.width, command.height,
-                          pseudo_insertion_index, 0)
+                          pseudo_insertion_index, 0, &line->positioned_box)
             || !paint_pseudo(context, node, &style, PSEUDO_AFTER,
                              command.x, command.y, command.width,
-                             command.height, SIZE_MAX, 0)) return false;
+                             command.height, SIZE_MAX, 0,
+                             &line->positioned_box)) return false;
         line_cursor_set(line, mask_x + width);
         line_height_include_fixed(
             line, layout_fixed_from_integer(height));
@@ -4134,6 +4888,24 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (inline_left_edges > 0) {
         line_cursor_set(line, line->x + inline_left_edges);
     }
+    /* An inline box paints its background behind its content area plus
+       padding, one rectangle per line fragment (CSS 2.1 / Backgrounds 3):
+       MDN's `code` spans and highlighted links. A placeholder reserved
+       before the content keeps the first fragment's paint order without an
+       insertion; later fragments are inserted before their line's text. */
+    size_t inline_background_index = SIZE_MAX;
+    if (style.has_background && style.background_alpha != 0
+        && !select_control && !button_control && !input_control
+        && !textarea_control && !editable_control) {
+        DrawCommand placeholder = {
+            .type = DRAW_FILL_RECT, .x = line->x, .y = line->y,
+            .width = 0, .height = 0, .color = style.background,
+            .opacity_scale = 0
+        };
+        inline_background_index = context->layout->count;
+        if (layout_add_command(context->layout, placeholder) == NULL)
+            return false;
+    }
     if (select_control) {
         lxb_dom_node_t *option = select_display_option(node);
         if (option != NULL
@@ -4141,8 +4913,8 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                             link_url, link_url_length, link_node)) return false;
     } else {
         bool has_flowed_text_child = false;
-        for (lxb_dom_node_t *child = node->first_child; child != NULL;
-             child = child->next) {
+        for (lxb_dom_node_t *child = document_flat_first_child(node);
+             child != NULL; child = document_flat_next_sibling(child)) {
             if (has_flowed_text_child && line->has_text_character) {
                 line->letter_boundary_spacing = style.letter_spacing;
             }
@@ -4167,6 +4939,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (inline_right_edges > 0) {
         line_cursor_set(line, line->x + inline_right_edges);
         line->pending_space = false;
+    }
+    if (inline_background_index != SIZE_MAX
+        && !paint_inline_background(context, line, &style,
+                                    inline_background_index)) {
+        return false;
     }
     bool inline_box_visual =
         style.border.top > 0 || style.border.right > 0

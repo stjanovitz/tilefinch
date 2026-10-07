@@ -62,10 +62,21 @@ int grid_item_minimum_contribution(
  * track instead of presenting one aggregate width for the spanning subgrid
  * item.
  *
- * The engine's existing twelve-track/eight-explicit-row limits keep both the
- * work and scratch fixed.  Recursion follows nested subgrids only and shares
+ * The engine's fixed track and placement-row limits keep both the work and
+ * scratch fixed.  Recursion follows nested subgrids only and shares
  * the layout tree's depth ceiling and cancellation hook.
  */
+static void intrinsic_grid_resolve_placement(
+    LayoutContext *context, lxb_dom_node_t *container,
+    const ComputedStyle *container_style, ComputedStyle *item)
+{
+    (void) container;
+    (void) stylesheet_resolve_named_grid_area(
+        context->sheet, container_style, item);
+    (void) stylesheet_resolve_named_grid_lines(
+        context->sheet, container_style, item);
+}
+
 static bool intrinsic_grid_track_widths(
     LayoutContext *context, lxb_dom_node_t *container,
     const ComputedStyle *container_style, int column_override,
@@ -108,6 +119,7 @@ static bool intrinsic_grid_track_widths(
      */
     int explicit_columns = columns;
     int column_origin = 0;
+    bool locked_items = false;
     if (column_override <= 0) {
         int minimum_column = 0, maximum_column = explicit_columns;
         flex_iterator_init(&scan, context, container, container_style,
@@ -122,6 +134,10 @@ static bool intrinsic_grid_track_widths(
                 context->sheet, container_style, &item.style);
             if (item.style.out_of_flow || item.style.fixed_position)
                 continue;
+            if (grid_item_locked_to_major_axis(&item.style,
+                                               container_style)) {
+                locked_items = true;
+            }
             grid_axis_extent(
                 computed_style_grid_column_start(&item.style),
                 computed_style_grid_column_end(&item.style),
@@ -184,6 +200,13 @@ static bool intrinsic_grid_track_widths(
     placement.explicit_columns = (uint8_t) explicit_columns;
     placement.explicit_rows = (uint8_t) rows;
     placement.column_origin = (uint8_t) column_origin;
+    if (locked_items
+        && !grid_placement_reserve(
+               &placement, context, container, container_style, &order,
+               intrinsic_grid_resolve_placement, &scan, &item)) {
+        flex_order_plan_destroy(&order);
+        return false;
+    }
     if (used_columns != NULL) *used_columns = columns;
     flex_iterator_init(&scan, context, container, container_style, &order);
     size_t visits = 0;
@@ -356,7 +379,9 @@ static bool intrinsic_cache_get(LayoutContext *context,
             return true;
         }
     }
-    if (context->reuse != NULL) {
+    /* A container-query pass cannot vouch for sizes measured under an
+       earlier pass's container geometry. */
+    if (context->reuse != NULL && !context->container_live) {
         size_t reuse_home = intrinsic_cache_home(
             node, limit, kind, ignore_own_width)
             & (LAYOUT_REUSE_INTRINSIC_CAPACITY - 1u);
@@ -596,11 +621,11 @@ static bool intrinsic_wraps_single_atomic(
     const ComputedStyle *parent)
 {
     bool found = false;
-    for (lxb_dom_node_t *child = node == NULL ? NULL : node->first_child;
-         child != NULL; child = child->next) {
+    for (lxb_dom_node_t *child = document_flat_first_child(node);
+         child != NULL; child = document_flat_next_sibling(child)) {
         if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
-            const char *text = document_text_data(child, &length);
+            const char *text = layout_text_data(child, &length);
             if (intrinsic_text_has_visible_character(text, length)) {
                 return false;
             }
@@ -630,7 +655,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
     if (!layout_cooperate(context, node)) return 0;
     if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
         size_t length = 0;
-        const char *text = document_text_data(node, &length);
+        const char *text = layout_text_data(node, &length);
         if (text == NULL) return 0;
         const FontFace *face = font_context_face_variant(
             context->fonts, context->web_fonts, parent->font_family,
@@ -834,7 +859,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                     ? resolve_declared_length(
                         context->sheet, style.width,
                         style.width_percent, limit)
-                    : mask->width;
+                    : image_resource_intrinsic_width(mask);
         int minimum_width = style_minimum_width(context->sheet, &style,
                                                 limit);
         if (width < minimum_width) width = minimum_width;
@@ -884,6 +909,22 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         }
         int after_width = generated_inline_pseudo_width(
             context, node, &style, PSEUDO_AFTER);
+        /* Box-bearing generated items take their outer width and a gap
+           on the line too (layout_flex_pseudo_item). */
+        if (style.flex_direction == FLEX_ROW) {
+            int gap = computed_style_resolve_gap(style.gap, limit);
+            for (int pseudo = 0; pseudo < 2; pseudo++) {
+                LayoutFlexPseudo generated = layout_flex_pseudo_item(
+                    context, node, &style,
+                    pseudo == 0 ? PSEUDO_BEFORE : PSEUDO_AFTER, limit);
+                if (!generated.active) continue;
+                int extra = layout_add_coordinate(
+                    generated.outer_width,
+                    horizontal_flex_items != 0 ? gap : 0);
+                if (after_width > limit - extra) return limit;
+                after_width += extra;
+            }
+        }
         if (inline_width > limit - after_width) return limit;
         block_width = inline_width + after_width;
         block_width += style.border.left + style.border.right
@@ -901,8 +942,8 @@ static int intrinsic_text_width_impl(LayoutContext *context,
     bool pending_boundary_space = false;
     bool has_inline_text = false;
     bool previous_atomic = false;
-    for (lxb_dom_node_t *child = node->first_child; child != NULL;
-         child = child->next) {
+    for (lxb_dom_node_t *child = document_flat_first_child(node);
+         child != NULL; child = document_flat_next_sibling(child)) {
         if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
             && layout_node_name_is(child, "br")) {
             if (inline_width > block_width) block_width = inline_width;
@@ -933,7 +974,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         bool child_has_text = false;
         if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t text_length = 0;
-            const char *text = document_text_data(child, &text_length);
+            const char *text = layout_text_data(child, &text_length);
             if (text != NULL && text_length != 0) {
                 leading_space = isspace((unsigned char) text[0]);
                 trailing_space =
@@ -1068,7 +1109,7 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
     if (!layout_cooperate(context, node)) return 0;
     if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
         size_t length = 0;
-        const char *text = document_text_data(node, &length);
+        const char *text = layout_text_data(node, &length);
         if (text == NULL) return 0;
         if (parent->white_space_mode == WHITE_SPACE_NOWRAP
             || parent->white_space_mode == WHITE_SPACE_PRE) {
@@ -1208,12 +1249,29 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
             context, node, parent, &style, limit, width);
     }
     int widest = 0;
-    for (lxb_dom_node_t *child = node->first_child; child != NULL;
-         child = child->next) {
+    for (lxb_dom_node_t *child = document_flat_first_child(node);
+         child != NULL; child = document_flat_next_sibling(child)) {
         int child_width = intrinsic_min_text_width_internal(
             context, child, &style, limit, false);
         if (child_width > widest) widest = child_width;
         if (widest >= limit) return limit;
+    }
+    /* A row flex container's generated items sit beside its content on
+       the line (layout_flex_pseudo_item): an item never shrinks under
+       them. */
+    if ((style.display == DISPLAY_FLEX || style.display == DISPLAY_INLINE_FLEX)
+        && style.flex_direction == FLEX_ROW) {
+        int gap = computed_style_resolve_gap(style.gap, limit);
+        for (int pseudo = 0; pseudo < 2; pseudo++) {
+            LayoutFlexPseudo generated = layout_flex_pseudo_item(
+                context, node, &style,
+                pseudo == 0 ? PSEUDO_BEFORE : PSEUDO_AFTER, limit);
+            if (!generated.active) continue;
+            int extra = layout_add_coordinate(generated.outer_width,
+                                              widest != 0 ? gap : 0);
+            if (widest > limit - extra) return limit;
+            widest += extra;
+        }
     }
     if (style.display != DISPLAY_CONTENTS
         && style.display != DISPLAY_TABLE_ROW_GROUP
@@ -1278,7 +1336,7 @@ static bool grid_placement_fits(const GridPlacementState *state,
         || row_span < 1 || column_span < 1
         || row + row_span > GRID_PLACEMENT_ROW_LIMIT
         || column + column_span > state->columns) return false;
-    unsigned mask = ((1u << column_span) - 1u) << column;
+    uint32_t mask = ((UINT32_C(1) << column_span) - 1u) << column;
     for (int offset = 0; offset < row_span; offset++) {
         if ((state->occupied[row + offset] & mask) != 0) return false;
     }
@@ -1289,9 +1347,9 @@ static void grid_placement_mark(GridPlacementState *state,
                                 int row, int column,
                                 int row_span, int column_span)
 {
-    unsigned mask = ((1u << column_span) - 1u) << column;
+    uint32_t mask = ((UINT32_C(1) << column_span) - 1u) << column;
     for (int offset = 0; offset < row_span; offset++) {
-        state->occupied[row + offset] |= (uint16_t) mask;
+        state->occupied[row + offset] |= mask;
     }
 }
 
@@ -1303,11 +1361,22 @@ static int grid_line_position(unsigned encoded, int origin,
                     : origin + line - 1;
 }
 
-bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
-                     GridItemPlacement *placement)
+typedef struct {
+    int row;
+    int column;
+    int row_span;
+    int column_span;
+    bool explicit_row;
+    bool explicit_column;
+} GridResolvedArea;
+
+/* Resolve an item's definite lines and spans against the state's explicit
+   grid and origin, clamped into the bounded placement envelope. Axes
+   without a definite line keep position 0 and explicit_* false. */
+static void grid_resolve_area(const GridPlacementState *state,
+                              const ComputedStyle *style,
+                              GridResolvedArea *area)
 {
-    if (state == NULL || style == NULL || placement == NULL
-        || state->columns == 0) return false;
     int column_start = computed_style_grid_column_start(style);
     int column_end = computed_style_grid_column_end(style);
     int column_span = computed_style_grid_column_span(style);
@@ -1363,9 +1432,158 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
     if (column + column_span > state->columns) {
         column = state->columns - column_span;
     }
+    *area = (GridResolvedArea) {
+        .row = row, .column = column,
+        .row_span = row_span, .column_span = column_span,
+        .explicit_row = explicit_row, .explicit_column = explicit_column
+    };
+}
+
+bool grid_item_locked_to_major_axis(const ComputedStyle *style,
+                                    const ComputedStyle *container)
+{
+    if (style == NULL) return false;
+    return computed_style_grid_auto_flow_column(container)
+        ? computed_style_grid_column_start(style) != 0
+          || computed_style_grid_column_end(style) != 0
+        : computed_style_grid_row_start(style) != 0
+          || computed_style_grid_row_end(style) != 0;
+}
+
+/* Earliest minor-axis start that fits a locked item, at or after `from`
+   (sparse packing keeps step-2 items in a track in document order). */
+static int grid_locked_minor_position(const GridPlacementState *state,
+                                      const GridResolvedArea *area,
+                                      int from)
+{
+    if (state->flow_column) {
+        for (int candidate = from;
+             candidate + area->row_span <= GRID_PLACEMENT_ROW_LIMIT;
+             candidate++) {
+            if (grid_placement_fits(state, candidate, area->column,
+                                    area->row_span, area->column_span)) {
+                return candidate;
+            }
+        }
+    } else {
+        for (int candidate = from;
+             candidate + area->column_span <= state->columns;
+             candidate++) {
+            if (grid_placement_fits(state, area->row, candidate,
+                                    area->row_span, area->column_span)) {
+                return candidate;
+            }
+        }
+    }
+    return -1;
+}
+
+bool grid_placement_reserve(GridPlacementState *state, LayoutContext *context,
+                            lxb_dom_node_t *container,
+                            const ComputedStyle *container_style,
+                            const FlexOrderPlan *order,
+                            GridItemPlacementResolver resolve,
+                            FlexItemIterator *iterator, FlatItem *item)
+{
+    if (state == NULL || context == NULL || iterator == NULL
+        || item == NULL || state->columns == 0) return true;
+    state->locked_count = 0;
+    state->locked_next = 0;
+    state->reserved = true;
+    /* Sparse step 2 places each locked item after the earlier locked items
+       of its own track; one cursor per major-axis track. */
+    uint8_t track_cursor[GRID_PLACEMENT_ROW_LIMIT];
+    memset(track_cursor, 0, sizeof(track_cursor));
+    for (int phase = 0; phase < 2; phase++) {
+        flex_iterator_init(iterator, context, container, container_style,
+                           order);
+        while (flex_iterator_next(iterator, item)) {
+            if (context->cancelled) return false;
+            if (resolve != NULL) {
+                resolve(context, container, container_style, &item->style);
+            }
+            if (item->style.out_of_flow || item->style.fixed_position) {
+                continue;
+            }
+            GridResolvedArea area;
+            grid_resolve_area(state, &item->style, &area);
+            bool both = area.explicit_row && area.explicit_column;
+            if (phase == 0) {
+                /* Step 1: items positioned in both axes may overlap; they
+                   only claim their cells for later auto-placement. */
+                if (both
+                    && area.row + area.row_span <= GRID_PLACEMENT_ROW_LIMIT) {
+                    grid_placement_mark(state, area.row, area.column,
+                                        area.row_span, area.column_span);
+                }
+                continue;
+            }
+            bool locked = state->flow_column
+                ? area.explicit_column : area.explicit_row;
+            if (both || !locked) continue;
+            if (state->locked_count == GRID_LOCKED_ITEM_LIMIT) break;
+            /* Step 2: locked items take the earliest free minor-axis
+               position in their track before any auto-placed item. */
+            int track = state->flow_column ? area.column : area.row;
+            int from = state->dense || track < 0
+                       || track >= GRID_PLACEMENT_ROW_LIMIT
+                ? 0 : track_cursor[track];
+            int position = grid_locked_minor_position(state, &area, from);
+            if (position < 0) {
+                state->locked_positions[state->locked_count++] =
+                    GRID_LOCKED_NO_FIT;
+                continue;
+            }
+            state->locked_positions[state->locked_count++] =
+                (uint8_t) position;
+            if (state->flow_column) {
+                grid_placement_mark(state, position, area.column,
+                                    area.row_span, area.column_span);
+            } else {
+                grid_placement_mark(state, area.row, position,
+                                    area.row_span, area.column_span);
+            }
+            if (track >= 0 && track < GRID_PLACEMENT_ROW_LIMIT) {
+                int next = position + (state->flow_column
+                                       ? area.row_span : area.column_span);
+                track_cursor[track] = (uint8_t) (next > UINT8_MAX
+                                                 ? UINT8_MAX : next);
+            }
+        }
+    }
+    return !context->cancelled;
+}
+
+bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
+                     GridItemPlacement *placement)
+{
+    if (state == NULL || style == NULL || placement == NULL
+        || state->columns == 0) return false;
+    GridResolvedArea area;
+    grid_resolve_area(state, style, &area);
+    int row = area.row;
+    int column = area.column;
+    int row_span = area.row_span;
+    int column_span = area.column_span;
+    bool explicit_row = area.explicit_row;
+    bool explicit_column = area.explicit_column;
+    bool locked = !(explicit_row && explicit_column)
+        && (state->flow_column ? explicit_column : explicit_row);
 
     bool found = false;
-    if (explicit_row && explicit_column) {
+    bool reserved_locked = false;
+    if (locked && state->reserved
+        && state->locked_next < state->locked_count) {
+        /* grid_placement_reserve() already chose this item's area and
+           claimed its cells; keep it out of the auto-placement cursor. */
+        uint8_t position = state->locked_positions[state->locked_next++];
+        reserved_locked = true;
+        if (position != GRID_LOCKED_NO_FIT) {
+            if (state->flow_column) row = position;
+            else column = position;
+            found = true;
+        }
+    } else if (explicit_row && explicit_column) {
         /* Explicitly positioned grid items may overlap. Occupancy only
            constrains auto-placement; treating an occupied explicit area as
            a placement failure incorrectly moves later authored items. */
@@ -1435,7 +1653,7 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
         column = state->columns - column_span;
     }
     grid_placement_mark(state, row, column, row_span, column_span);
-    if (!explicit_row || !explicit_column) {
+    if (!reserved_locked && (!explicit_row || !explicit_column)) {
         int next_column = column;
         int next_row = row;
         if (state->flow_column) {
@@ -1565,7 +1783,7 @@ static void stretch_flex_item_cross(LayoutDocument *layout,
 static bool text_has_content(lxb_dom_node_t *node)
 {
     size_t length = 0;
-    const char *text = document_text_data(node, &length);
+    const char *text = layout_text_data(node, &length);
     if (text == NULL) return false;
     for (size_t i = 0; i < length; i++) {
         if (!isspace((unsigned char) text[i])) return true;
@@ -1573,12 +1791,16 @@ static bool text_has_content(lxb_dom_node_t *node)
     return false;
 }
 
+/* The next node in flattened (display:contents-lifted) flat-tree order:
+   a slotted light child continues with the next node assigned to its
+   slot, then after the slot (document_flat_next_sibling). */
 static lxb_dom_node_t *flat_node_after(lxb_dom_node_t *node,
                                        lxb_dom_node_t *container)
 {
     while (node != NULL && node != container) {
-        if (node->next != NULL) return node->next;
-        node = node->parent;
+        lxb_dom_node_t *next = document_flat_next_sibling(node);
+        if (next != NULL) return next;
+        node = document_flat_parent(node);
     }
     return NULL;
 }
@@ -1595,7 +1817,8 @@ static bool flat_parent_style(LayoutContext *context,
     }
     lxb_dom_node_t *path[LAYOUT_TREE_CALL_DEPTH_LIMIT];
     size_t count = 0;
-    for (lxb_dom_node_t *at = parent; at != container; at = at->parent) {
+    for (lxb_dom_node_t *at = parent; at != container;
+         at = document_flat_parent(at)) {
         if (at == NULL || at->type != LXB_DOM_NODE_TYPE_ELEMENT) {
             return false;
         }
@@ -1629,7 +1852,7 @@ void flat_iterator_init(FlatItemIterator *iterator,
     *iterator = (FlatItemIterator) {
         .context = context,
         .container = container,
-        .cursor = container != NULL ? container->first_child : NULL,
+        .cursor = document_flat_first_child(container),
         .container_style = *container_style
     };
 }
@@ -1642,7 +1865,8 @@ bool flat_iterator_next(FlatItemIterator *iterator, FlatItem *item)
         iterator->cursor = flat_node_after(node, iterator->container);
         ComputedStyle parent_style;
         if (!flat_parent_style(iterator->context, iterator->container,
-                               &iterator->container_style, node->parent,
+                               &iterator->container_style,
+                               document_flat_parent(node),
                                &parent_style)) continue;
         if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
             if (!iterator->include_whitespace && !text_has_content(node)) {
@@ -1670,7 +1894,8 @@ bool flat_iterator_next(FlatItemIterator *iterator, FlatItem *item)
             || style.display == DISPLAY_TABLE_ROW_GROUP
             || style.display == DISPLAY_TABLE_HEADER_GROUP
             || style.display == DISPLAY_TABLE_FOOTER_GROUP) {
-            if (node->first_child != NULL) iterator->cursor = node->first_child;
+            lxb_dom_node_t *inside = document_flat_first_child(node);
+            if (inside != NULL) iterator->cursor = inside;
             continue;
         }
         *item = (FlatItem) {
@@ -1826,6 +2051,53 @@ void flat_text_link(lxb_dom_node_t *node, lxb_dom_node_t *container,
     }
 }
 
+/*
+ * HTML lets an <a href> wrap flow content. When the anchor is inline (a
+ * block-in-inline split) or display:contents, it has no box of its own that
+ * could carry the link, so the outermost boxes laid out inside it carry it
+ * instead, as in browsers. Walk from the box's parent to its layout
+ * container: an <a> met on the way owns the box. Deeper boxes have a nearer
+ * container and so never reach the anchor, giving one region per outermost
+ * box rather than one per descendant. A box laid out outside its parent
+ * container's pass (the container is not an ancestor) inherits nothing.
+ */
+bool layout_container_link(const lxb_dom_node_t *node,
+                           const lxb_dom_node_t *container,
+                           const char **url, size_t *url_length,
+                           lxb_dom_node_t **link_node)
+{
+    *url = NULL;
+    *url_length = 0;
+    *link_node = NULL;
+    if (node == NULL || container == NULL) return false;
+    const char *found_url = NULL;
+    size_t found_length = 0;
+    lxb_dom_node_t *found_node = NULL;
+    bool anchor_seen = false;
+    size_t steps = 0;
+    for (lxb_dom_node_t *at = node->parent;
+         at != NULL && steps < LAYOUT_TREE_CALL_DEPTH_LIMIT;
+         at = at->parent, steps++) {
+        if (at == container) {
+            if (found_url == NULL) return false;
+            *url = found_url;
+            *url_length = found_length;
+            *link_node = found_node;
+            return true;
+        }
+        if (anchor_seen || !layout_node_name_is(at, "a")) continue;
+        anchor_seen = true;
+        size_t length = 0;
+        const char *href = document_attribute(at, "href", &length);
+        if (href != NULL && length != 0) {
+            found_url = href;
+            found_length = length;
+            found_node = at;
+        }
+    }
+    return false;
+}
+
 bool layout_anonymous_text(LayoutContext *context,
                                   const FlatItem *item,
                                   lxb_dom_node_t *container,
@@ -1848,7 +2120,7 @@ bool layout_anonymous_text(LayoutContext *context,
         .find_block_start = true
     };
     size_t length = 0;
-    const char *text = document_text_data(item->node, &length);
+    const char *text = layout_text_data(item->node, &length);
     const char *link_url = NULL;
     size_t link_length = 0;
     lxb_dom_node_t *link_node = NULL;
@@ -1933,6 +2205,19 @@ int flex_child_basis(LayoutContext *context, const FlatItem *item,
             basis += edges;
         }
         basis += margins;
+    } else {
+        /* The intrinsic contribution counts percentage padding as zero
+           (cyclic in general), but a flex item's containing block is the
+           definite container: its content-sized base includes the padding
+           resolved against it, as the item is later laid out with. */
+        ComputedStyle zero_basis = item->style;
+        resolve_padding(context->sheet, &zero_basis, 0);
+        int percentage_padding =
+            child_style->padding.left + child_style->padding.right
+            - zero_basis.padding.left - zero_basis.padding.right;
+        if (percentage_padding > 0) {
+            basis = layout_add_coordinate(basis, percentage_padding);
+        }
     }
     if (basis < margins) basis = margins;
     basis = constrain_border_box_width(

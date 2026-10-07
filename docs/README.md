@@ -4,8 +4,8 @@ Tilefinch's documentation has three layers:
 
 1. **Release-facing pages at the repository root** — for PSP owners:
    [README](../README.md) (what it is, install, controls), the
-   [user guide](USER_GUIDE.md) (typing, Reader mode, games, per-site
-   controls),
+   [user guide](USER_GUIDE.md) (typing, Reader mode, language packs, games,
+   per-site controls),
    [TROUBLESHOOTING](../TROUBLESHOOTING.md), [SECURITY](../SECURITY.md),
    [CHANGELOG](../CHANGELOG.md), [CONTRIBUTING](../CONTRIBUTING.md), and
    [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md).
@@ -33,7 +33,8 @@ Tilefinch's documentation has three layers:
 - [Basic view](BASIC_VIEW.md): transactional, action-preserving static
   fallback for degraded server-rendered pages.
 - [Bidirectional text](TEXT_BIDI.md): bounded UAX #9 page layout, Arabic-family
-  shaping, logical/visual mappings, optional glyph packs, and degradation.
+  shaping, logical/visual mappings, optional glyph packs and their in-page
+  install offer, and degradation.
 - [Chrome themes](THEMES.md): built-in palettes, the bounded downloaded-theme
   library, and the interactive color designer.
 - [Game Profile v1](GAME_PROFILE.md): the developer and coding-agent contract

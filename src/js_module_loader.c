@@ -5,6 +5,7 @@
 #include "js_runtime_internal.h"
 
 #include "tilefinch/platform.h"
+#include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
 
 #include <stdio.h>
@@ -332,7 +333,12 @@ static bool runtime_module_edge_register(
             .credentials = credentials,
             .parent_index = parent_index == SIZE_MAX
                 ? UINT16_MAX : (uint16_t) parent_index,
-            .effective_referrer_policy = policy_code
+            .effective_referrer_policy = policy_code,
+            /* A static import inherits its parent's; import() from a
+               classic script inherits that script's. */
+            .csp_grant = parent_index == SIZE_MAX
+                ? runtime->bridge.current_script_csp_grant
+                : runtime->module_bases[parent_index].csp_grant
         };
     if (registered_index != NULL) *registered_index = index;
     return true;
@@ -364,6 +370,31 @@ static bool runtime_module_response_register(
             js_rt_runtime_module_referrer_policy_code(response_referrer_policy);
     }
     return true;
+}
+
+uint8_t script_runtime_module_csp_grant(const ScriptRuntime *runtime,
+                                        const char *module_url)
+{
+    if (runtime == NULL || module_url == NULL) return 0;
+    for (size_t i = 0; i < runtime->module_base_count; i++) {
+        const ScriptModuleBaseEntry *entry = &runtime->module_bases[i];
+        if (strcmp(entry->request_url, module_url) == 0
+            || (entry->response_url != NULL
+                && strcmp(entry->response_url, module_url) == 0))
+            return entry->csp_grant;
+    }
+    return 0;
+}
+
+void js_rt_runtime_module_csp_grant_set(ScriptRuntime *runtime,
+                                        const char *request_url,
+                                        uint8_t grant)
+{
+    size_t index = runtime == NULL || request_url == NULL ? SIZE_MAX
+        : runtime_module_index_lookup(runtime, request_url);
+    if (index != SIZE_MAX
+        && runtime->module_bases[index].parent_index == UINT16_MAX)
+        runtime->module_bases[index].csp_grant = grant;
 }
 
 bool js_rt_runtime_module_root_register(
@@ -444,6 +475,12 @@ char output[BROWSER_MODULE_REFERRER_POLICY_LIMIT])
  * threshold keep their source: they hold under a tenth of a typical graph's
  * bytes, and a small helper module is where a stringified worker body is
  * most likely to live.
+ *
+ * A small module's bytecode therefore carries its text, as every classic
+ * script's does. That is why a no-store module response, like a classic
+ * one, is compiled and run but its bytecode never kept: retaining it would
+ * retain the response. Cacheable responses keep their text in bytecode just
+ * as the HTTP cache may keep the response itself.
  */
 #define SCRIPT_MODULE_STRIP_SOURCE_MINIMUM_BYTES (8u * 1024u)
 
@@ -459,7 +496,7 @@ static int script_module_strip_flags(size_t source_length)
 }
 
 /*
- * Module bytecode cache (BrowserModuleBytecodeCache in session.h).
+ * Module bytecode cache (BrowserScriptBytecodeTable in session.h).
  *
  * chatgpt.com loads ~112 modules and reloads itself once during startup, so
  * the whole graph used to be compiled twice; a revisit compiled it again.
@@ -476,7 +513,7 @@ static int script_module_strip_flags(size_t source_length)
  * source compiled instead.
  */
 static bool module_bytecode_key_init(
-    ScriptRuntime *runtime, BrowserModuleBytecodeKey *key,
+    ScriptRuntime *runtime, BrowserScriptBytecodeKey *key,
     char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT], const char *source,
     size_t source_length, const char *module_name, const char *response_url,
     int strip_flags)
@@ -496,7 +533,7 @@ static bool module_bytecode_key_init(
         runtime->module_bytecode_generation =
             browser_session_module_bytecode_generation(runtime->session);
     }
-    *key = (BrowserModuleBytecodeKey) {
+    *key = (BrowserScriptBytecodeKey) {
         .module_name = module_name,
         .response_url = response_url,
         .partition_key = partition,
@@ -513,35 +550,58 @@ static void module_bytecode_clear_exception(JSContext *context)
     JS_FreeValue(context, exception);
 }
 
+/* The RAM table, then the persistent tier: on a RAM miss the pack for this
+   key's group (if the tier's index names one) is read and verified, at
+   most once per load, and its records copied into RAM, where the lookup is
+   repeated. The synchronous disk work is timed, hit or not. */
+static BrowserSharedBody *script_bytecode_lookup(
+    ScriptRuntime *runtime, BrowserScriptBytecodeKind kind,
+    BrowserScriptBytecodeKey *key, ScriptResult *result, bool *from_disk)
+{
+    *from_disk = false;
+    BrowserSharedBody *cached = browser_session_script_bytecode_acquire(
+        runtime->session, kind, key, runtime->module_bytecode_generation);
+    if (cached != NULL
+        || !browser_session_script_disk_enabled(runtime->session))
+        return cached;
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    if (browser_session_script_disk_promote(
+            runtime->session, kind, key,
+            runtime->module_bytecode_generation)) {
+        cached = browser_session_script_bytecode_acquire(
+            runtime->session, kind, key,
+            runtime->module_bytecode_generation);
+    }
+    result->script_bytecode_disk_load_us +=
+        (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+    *from_disk = cached != NULL;
+    return cached;
+}
+
 /* Serialize a freshly compiled module into the cache when there is room.
    Serialization is an optional accelerator beside a compiled module: it is
    skipped rather than allowed to consume the realm's remaining headroom, and
    a refusal never affects the module. */
 static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
-                                  BrowserModuleBytecodeKey *key,
+                                  BrowserScriptBytecodeKey *key,
                                   JSValueConst compiled,
                                   ScriptResult *result)
 {
-    const size_t heap_floor = 64u * 1024u;
     size_t source_length = key->source_length;
-    size_t heap_reserve = source_length > (SIZE_MAX - heap_floor) / 4u
-        ? SIZE_MAX : heap_floor + source_length * 4u;
-    /* The copy lands in the page Budget; keep the same reserve the script
-       loader keeps for presentation work after scripts. */
-    const size_t budget_reserve = 3u * 1024u * 1024u;
+    size_t heap_reserve = script_admission_work_reserve(
+        source_length, SCRIPT_ADMISSION_STORE_HEAP_MULTIPLIER, SIZE_MAX);
+    /* The copy lands in the page Budget, which keeps the presentation
+       reserve script admission keeps. */
+    const size_t budget_reserve = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES;
     size_t budget_left = budget_remaining(runtime->session->budget);
     size_t minimum_bytecode = source_length / 4u + 1u;
-    /* Either tier may want the bytes: RAM when it can admit them, the
-       optional persistent tier when it has no file for this key yet. */
-    bool ram_wanted = browser_session_module_bytecode_may_fit(
-        runtime->session, key, minimum_bytecode,
-        runtime->module_bytecode_generation);
-    bool disk_wanted = browser_session_module_bytecode_disk_wants(
-        runtime->session, key, minimum_bytecode);
+    /* The persistent tier, when on, writes from the RAM table at idle. */
     if (script_runtime_heap_available(runtime) < heap_reserve
         || budget_left < budget_reserve
         || minimum_bytecode > budget_left - budget_reserve
-        || (!ram_wanted && !disk_wanted)) {
+        || !browser_session_module_bytecode_may_fit(
+               runtime->session, key, minimum_bytecode,
+               runtime->module_bytecode_generation)) {
         js_rt_saturating_add_size(
             &result->module_bytecode_cache_admission_skips, 1);
         return;
@@ -555,12 +615,8 @@ static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
             &result->module_bytecode_cache_admission_skips, 1);
         return;
     }
-    if (disk_wanted && length != 0
-        && browser_session_module_bytecode_disk_store(
-               runtime->session, key, bytecode, length))
-        js_rt_saturating_add_size(&result->module_bytecode_disk_stores, 1);
     budget_left = budget_remaining(runtime->session->budget);
-    bool stored = ram_wanted && length != 0 && budget_left >= budget_reserve
+    bool stored = length != 0 && budget_left >= budget_reserve
         && length <= budget_left - budget_reserve
         && browser_session_module_bytecode_put(
                runtime->session, key, runtime->module_bytecode_generation,
@@ -582,31 +638,13 @@ static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
    when there was nothing usable to restore. */
 static bool module_bytecode_restore(ScriptRuntime *runtime,
                                     JSContext *context,
-                                    BrowserModuleBytecodeKey *key,
+                                    BrowserScriptBytecodeKey *key,
                                     ScriptResult *result, bool *admitted,
                                     JSValue *module)
 {
-    BrowserSharedBody *cached = browser_session_module_bytecode_acquire(
-        runtime->session, key, runtime->module_bytecode_generation);
     bool from_disk = false;
-    if (cached == NULL
-        && browser_session_module_bytecode_disk_enabled(runtime->session)) {
-        /* The optional persistent tier: a verified file for this exact
-           key, admitted exactly as a RAM hit below. Its synchronous read
-           and verification are timed whether or not they find one. */
-        BrowserSession *session = runtime->session;
-        uint64_t load_started_ns = js_rt_monotonic_time_ns(),
-            read_before = session->module_bytecode_disk_read_ns,
-            verify_before = session->module_bytecode_disk_verify_ns;
-        cached = browser_session_module_bytecode_disk_load(session, key);
-        result->module_bytecode_disk_load_us +=
-            (js_rt_monotonic_time_ns() - load_started_ns) / 1000u;
-        result->module_bytecode_disk_read_us +=
-            (session->module_bytecode_disk_read_ns - read_before) / 1000u;
-        result->module_bytecode_disk_verify_us +=
-            (session->module_bytecode_disk_verify_ns - verify_before) / 1000u;
-        from_disk = cached != NULL;
-    }
+    BrowserSharedBody *cached = script_bytecode_lookup(
+        runtime, BROWSER_SCRIPT_BYTECODE_MODULE, key, result, &from_disk);
     if (cached == NULL) return false;
     if (!js_rt_admit_cached_compile_source(
             context, key->source_length, key->module_name,
@@ -626,15 +664,8 @@ static bool module_bytecode_restore(ScriptRuntime *runtime,
     size_t restored_bytes = cached->length;
     bool restored_module = !JS_IsException(restored)
         && JS_VALUE_GET_TAG(restored) == JS_TAG_MODULE;
-    if (from_disk && restored_module) {
-        js_rt_saturating_add_size(&result->module_bytecode_disk_hits, 1);
-        /* Keep it in RAM too when there is room, for the next load. */
-        (void) browser_session_module_bytecode_put(
-            runtime->session, key, runtime->module_bytecode_generation,
-            cached->data, cached->length);
-        result->module_bytecode_promote_us +=
-            (js_rt_monotonic_time_ns() - read_ns) / 1000u;
-    }
+    if (from_disk && restored_module)
+        js_rt_saturating_add_size(&result->script_bytecode_disk_hits, 1);
     browser_shared_body_release(cached);
     if (JS_IsException(restored)
         || JS_VALUE_GET_TAG(restored) != JS_TAG_MODULE) {
@@ -646,16 +677,16 @@ static bool module_bytecode_restore(ScriptRuntime *runtime,
         *admitted = false;
         js_rt_saturating_add_size(
             &result->module_bytecode_cache_restore_failures, 1);
-        if (from_disk)
-            browser_session_module_bytecode_disk_discard(runtime->session,
-                                                         key);
-        else
-            browser_session_module_bytecode_invalidate(runtime->session, key);
+        /* Neither tier keeps what does not restore. */
+        browser_session_module_bytecode_invalidate(runtime->session, key);
+        browser_session_script_disk_discard(
+            runtime->session, BROWSER_SCRIPT_BYTECODE_MODULE, key);
         return false;
     }
     js_rt_saturating_add_size(&result->module_bytecode_cache_hits, 1);
     js_rt_saturating_add_size(&result->module_bytecode_cache_bytes,
                               restored_bytes);
+    js_rt_heavy_note_restored(runtime, key->source_length, from_disk);
     /* JS_Eval resolves a compiled module's imports before returning it;
        do the same here, loading each import through the ordinary loader. */
     if (JS_ResolveModule(context, restored) < 0) {
@@ -670,7 +701,7 @@ static bool module_bytecode_restore(ScriptRuntime *runtime,
 JSValue js_rt_module_compile_external(
     ScriptRuntime *runtime, JSContext *context, const char *source,
     size_t source_length, const char *module_name, const char *response_url,
-    ScriptResult *result, bool *admitted)
+    bool response_no_store, ScriptResult *result, bool *admitted)
 {
     if (admitted != NULL) *admitted = false;
     if (runtime == NULL || context == NULL || source == NULL
@@ -679,7 +710,7 @@ JSValue js_rt_module_compile_external(
     }
     int strip_flags = script_module_strip_flags(source_length);
     char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
-    BrowserModuleBytecodeKey key;
+    BrowserScriptBytecodeKey key;
     uint64_t key_started_ns = js_rt_monotonic_time_ns();
     bool cacheable = module_bytecode_key_init(
         runtime, &key, partition, source, source_length, module_name,
@@ -720,9 +751,16 @@ JSValue js_rt_module_compile_external(
     JS_SetStripInfo(js_runtime, previous_strip);
 #endif
     if (cacheable && *admitted && !JS_IsException(compiled)) {
-        module_bytecode_store(runtime, context, &key, compiled, result);
-        result->module_store_us +=
-            (js_rt_monotonic_time_ns() - parse_finished_ns) / 1000u;
+        if (response_no_store) {
+            /* As for a classic script: no-store asks that the response not
+               be kept, and a small module's bytecode carries its text. */
+            js_rt_saturating_add_size(
+                &result->module_bytecode_cache_no_store_skips, 1);
+        } else {
+            module_bytecode_store(runtime, context, &key, compiled, result);
+            result->module_store_us +=
+                (js_rt_monotonic_time_ns() - parse_finished_ns) / 1000u;
+        }
     }
     return compiled;
 }
@@ -827,6 +865,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
         .request_url = request_url,
         .referrer_url = referrer_url,
         .referrer_policy = referrer_policy,
+        .csp_grant = entry->csp_grant,
         .credentials = credentials
     };
     runtime->active_module_credentials = credentials;
@@ -867,9 +906,12 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
     uint64_t compile_started_ns = js_rt_monotonic_time_ns();
     uint64_t nested_before_ns = runtime->module_nested_ns;
     size_t restores_before = runtime->result.module_bytecode_cache_hits;
+    script_runtime_note_script_source(
+        runtime, loaded.source_length, loaded.source_length);
     JSValue compiled = js_rt_module_compile_external(
         runtime, context, loaded.source, loaded.source_length, module_name,
-        loaded.response_url, &runtime->result, &admitted);
+        loaded.response_url, loaded.response_no_store, &runtime->result,
+        &admitted);
     /* Restores are timed as module_bytecode_restore_us. Exclusive of the
        imports this compile loaded (each counts its own compile). */
     if (runtime->result.module_bytecode_cache_hits == restores_before) {
@@ -1002,15 +1044,592 @@ void *script_runtime_module_loader_opaque(
         ? runtime->module_opaque : NULL;
 }
 
+#ifndef TILEFINCH_NO_TRACE
+/* Site-census diagnosis (TILEFINCH_TRACE_CENSUS): one line per classic
+   external-script bytecode lookup and per store attempt. Lab builds only. */
+static void census_trace_classic_bytecode(const char *record,
+                                          const char *result, size_t bytes,
+                                          size_t bytecode, uint32_t ordinal,
+                                          const char *url)
+{
+    if (!tilefinch_trace_census()) return;
+    printf("census-bytecode-%s result=%s bytes=%zu bytecode=%zu ordinal=%u "
+           "url=%.300s\n", record, result, bytes, bytecode,
+           (unsigned) ordinal, url == NULL ? "" : url);
+}
+#define CENSUS_TRACE_CLASSIC_BYTECODE(record, result, bytes, bytecode,    \
+                                      ordinal, url)                        \
+    census_trace_classic_bytecode(record, result, bytes, bytecode,         \
+                                  ordinal, url)
+#else
+#define CENSUS_TRACE_CLASSIC_BYTECODE(record, result, bytes, bytecode,    \
+                                      ordinal, url)                        \
+    ((void) 0)
+#endif
+
+/*
+ * Classic external-script bytecode (the session's CLASSIC table). Keyed like
+ * a module: compile name, request URL (the HTTP cache key), top-level site,
+ * ResourceLoader segment ordinal, compile type and the SHA-256 of the exact
+ * bytes compiled. The lookup sits after fetching and every CSP, SRI, MIME
+ * and quota check, and a hit passes the same compile-admission size policy
+ * as a compile. An opaque-origin realm has no partition to key by.
+ */
+static bool classic_bytecode_key_init(
+    ScriptRuntime *runtime, BrowserScriptBytecodeKey *key,
+    char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT], const char *source,
+    size_t source_length, const char *name, const char *cache_url,
+    uint32_t ordinal)
+{
+    memset(key, 0, sizeof(*key));
+    if (runtime->session == NULL || source == NULL || source_length == 0
+        || name == NULL || name[0] == '\0' || cache_url == NULL
+        || cache_url[0] == '\0'
+        || runtime->session->maximum_classic_bytecode_bytes == 0
+        /* Not network responses: a data: script's URL is its source and a
+           blob: URL is minted afresh by every page that makes one. */
+        || strncasecmp(cache_url, "data:", 5) == 0
+        || strncasecmp(cache_url, "blob:", 5) == 0
+        || script_runtime_origin_is_opaque(runtime)
+        || runtime->bridge.top_level_url == NULL
+        || !tilefinch_url_site_key(runtime->bridge.top_level_url, partition,
+                                   TILEFINCH_ORIGIN_SERIALIZED_LIMIT)) {
+        return false;
+    }
+    if (runtime->module_bytecode_generation == 0) {
+        runtime->module_bytecode_generation =
+            browser_session_module_bytecode_generation(runtime->session);
+    }
+    *key = (BrowserScriptBytecodeKey) {
+        .module_name = name,
+        .response_url = cache_url,
+        .partition_key = partition,
+        .source = (const unsigned char *) source,
+        .source_length = source_length,
+        .compile_flags = (uint32_t) JS_EVAL_TYPE_GLOBAL,
+        .ordinal = ordinal
+    };
+    return true;
+}
+
+/*
+ * Deferred classic stores.
+ *
+ * Serializing a compiled script (JS_WriteObject) and copying it into the
+ * table used to sit between a script's compile and its execution, on the
+ * load's critical path: 141 ms of host time across the census corpus on a
+ * first visit, an estimated two seconds or more on the PSP for one large
+ * news page. Now the load only queues the store: it digests the source
+ * (the key needs the exact bytes, which are not kept) and retains the
+ * compiled top-level function, which QuickJS would otherwise free once the
+ * script has run. Idle work (script_runtime_store_pending_bytecode)
+ * serializes one queued script per turn into the table.
+ *
+ * The retained function is the cheapest thing that can still be
+ * serialized: no source copy, no early serialization. Its functions are
+ * shared with the closures the script created, so it keeps alive only the
+ * parts of the script nothing else references (typically the top level and
+ * run-once wrappers). Lazily compiled functions the script called during
+ * the load are serialized with their bodies (they would otherwise be
+ * written as stubs that compile on first call): the same functions from the
+ * same bytes, compiled earlier.
+ *
+ * The queue belongs to the realm and dies with it. A page left (or a realm
+ * replaced) before its idle turns stored everything still holds valid
+ * compiles, so teardown stores the oldest of them up to
+ * SCRIPT_BYTECODE_TEARDOWN_FLUSH_BYTES of source and drops the rest: that
+ * bounds what the next navigation pays (serialization is the cheap part of
+ * a store; the source digest was taken during the load). A cache clear
+ * (the session's epoch moves), JavaScript heap pressure, and a queue that
+ * would exceed the table's ceiling or entry count drop queued stores too.
+ */
+typedef struct ScriptBytecodePending {
+    JSValue compiled;
+    /* "name\0url\0partition\0" in one allocation. */
+    char *strings;
+    const char *url;
+    const char *partition;
+    size_t source_length;
+    uint32_t ordinal;
+    uint32_t compile_flags;
+    uint32_t epoch;
+    uint8_t source_digest[32];
+} ScriptBytecodePending;
+
+#define SCRIPT_BYTECODE_PENDING_LIMIT BROWSER_SCRIPT_BYTECODE_ENTRIES
+
+static void pending_bytecode_release(ScriptRuntime *runtime,
+                                     ScriptBytecodePending *entry,
+                                     const char *reason)
+{
+    if (reason != NULL) {
+        runtime->result.external_script_bytecode_deferred_dropped++;
+        CENSUS_TRACE_CLASSIC_BYTECODE("store", reason, entry->source_length,
+                                      0, entry->ordinal, entry->url);
+    }
+    (void) reason;
+    JS_FreeValue(runtime->context, entry->compiled);
+    budget_free(runtime->budget, entry->strings);
+    runtime->bytecode_pending_bytes -=
+        entry->source_length <= runtime->bytecode_pending_bytes
+            ? entry->source_length : runtime->bytecode_pending_bytes;
+}
+
+/* Removes queue entry `at`, keeping the rest in order (oldest first). */
+static void pending_bytecode_remove(ScriptRuntime *runtime, size_t at,
+                                    const char *reason)
+{
+    ScriptBytecodePending *queue = runtime->bytecode_pending;
+    pending_bytecode_release(runtime, &queue[at], reason);
+    memmove(&queue[at], &queue[at + 1u],
+            (runtime->bytecode_pending_count - at - 1u) * sizeof(*queue));
+    runtime->bytecode_pending_count--;
+}
+
+/* An empty queue holds no memory. */
+static void pending_bytecode_trim(ScriptRuntime *runtime)
+{
+    if (runtime->bytecode_pending_count != 0) return;
+    budget_free(runtime->budget, runtime->bytecode_pending);
+    runtime->bytecode_pending = NULL;
+    runtime->bytecode_pending_bytes = 0;
+}
+
+void script_runtime_drop_pending_bytecode(ScriptRuntime *runtime,
+                                          const char *reason)
+{
+    if (runtime == NULL || runtime->context == NULL) return;
+    while (runtime->bytecode_pending_count != 0)
+        pending_bytecode_remove(runtime, runtime->bytecode_pending_count - 1u,
+                                reason);
+    pending_bytecode_trim(runtime);
+}
+
+size_t script_runtime_pending_bytecode_count(const ScriptRuntime *runtime)
+{
+    return runtime == NULL ? 0 : runtime->bytecode_pending_count;
+}
+
+static bool pending_bytecode_same_record(const ScriptBytecodePending *entry,
+                                         const BrowserScriptBytecodeKey *key)
+{
+    return entry->ordinal == key->ordinal
+        && strcmp(entry->strings, key->module_name) == 0
+        && strcmp(entry->url, key->response_url) == 0
+        && strcmp(entry->partition, key->partition_key) == 0;
+}
+
+static bool pending_bytecode_key_digest(BrowserScriptBytecodeKey *key)
+{
+    if (!key->digest_ready)
+        key->digest_ready = key->source != NULL && tilefinch_sha256_digest(
+            key->source, key->source_length, key->source_digest);
+    return key->digest_ready;
+}
+
+/* The queued compile of exactly this key, or JS_UNDEFINED. */
+static JSValue pending_bytecode_lookup(ScriptRuntime *runtime,
+                                       BrowserScriptBytecodeKey *key)
+{
+    for (size_t i = 0; i < runtime->bytecode_pending_count; i++) {
+        ScriptBytecodePending *entry = &runtime->bytecode_pending[i];
+        if (!pending_bytecode_same_record(entry, key)) continue;
+        if (entry->source_length != key->source_length
+            || entry->compile_flags != key->compile_flags
+            || entry->epoch != runtime->session->script_bytecode_epoch
+            || !pending_bytecode_key_digest(key)
+            || memcmp(entry->source_digest, key->source_digest,
+                      sizeof(entry->source_digest)) != 0)
+            return JS_UNDEFINED;
+        return JS_DupValue(runtime->context, entry->compiled);
+    }
+    return JS_UNDEFINED;
+}
+
+/* Heap the realm keeps free while a store is queued or serialized: the
+   module store's reserve. */
+static size_t pending_bytecode_heap_reserve(size_t source_length)
+{
+    return script_admission_work_reserve(
+        source_length, SCRIPT_ADMISSION_STORE_HEAP_MULTIPLIER, SIZE_MAX);
+}
+
+/* Largest classic script source whose compile is queued for the table. A
+   queued compile keeps the script's whole function tree in the realm heap
+   until idle work stores it, and storing it needs about four times its
+   source of heap more. Above this size that is a large share of a 5 MiB
+   realm on exactly the pages that load such bundles: on the second site
+   census no store above it ever completed, at any table ceiling, and
+   queuing gitlab's 1.4 MB bundle moved its realm's out-of-memory point. */
+#define CLASSIC_BYTECODE_ENTRY_SOURCE_LIMIT (768u * 1024u)
+
+/* Queues a freshly compiled classic script's store. Skipped, never
+   affecting the script, when the realm or the table has no room for it. A
+   no-store response (`no_store`) runs from source every time: no-store
+   asks that the response not be kept, and its bytecode carries its source
+   text for Function.prototype.toString. */
+static void classic_bytecode_store(ScriptRuntime *runtime,
+                                   BrowserScriptBytecodeKey *key,
+                                   JSValueConst compiled, bool no_store)
+{
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    size_t source_length = key->source_length;
+    size_t heap_reserve = pending_bytecode_heap_reserve(source_length);
+    /* The copy lands in the page Budget, which keeps the presentation
+       reserve. */
+    const size_t budget_reserve = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES;
+    size_t budget_left = budget_remaining(runtime->session->budget);
+    /* Classic bytecode keeps each function's source text, so it is never
+       much smaller than the source (1.0-1.4x across the site census):
+       checking that much room first avoids a serialization put() refuses.
+       Scripts already queued will need their room too. */
+    size_t minimum_bytecode = source_length;
+    size_t queued = runtime->bytecode_pending_bytes;
+    /* A queued store holds JavaScript heap: give it back before the page
+       runs short, oldest first. */
+    while (runtime->bytecode_pending_count != 0
+           && script_runtime_heap_available(runtime) < heap_reserve) {
+        pending_bytecode_remove(runtime, 0, "drop-heap-pressure");
+        pending_bytecode_trim(runtime);
+        queued = runtime->bytecode_pending_bytes;
+    }
+    const char *skip = NULL;
+    if (no_store) {
+        skip = "skip-no-store";
+    } else if (source_length > CLASSIC_BYTECODE_ENTRY_SOURCE_LIMIT) {
+        skip = "skip-entry-size";
+    } else if (script_runtime_heap_available(runtime) < heap_reserve) {
+        skip = "skip-heap-reserve";
+    } else if (budget_left < budget_reserve
+               || minimum_bytecode > budget_left - budget_reserve) {
+        skip = "skip-budget-reserve";
+    } else if (runtime->bytecode_pending_count
+                   >= SCRIPT_BYTECODE_PENDING_LIMIT
+               || queued > SIZE_MAX - minimum_bytecode
+               || !browser_session_script_bytecode_may_fit(
+                   runtime->session, BROWSER_SCRIPT_BYTECODE_CLASSIC, key,
+                   minimum_bytecode + queued,
+                   runtime->module_bytecode_generation)) {
+        skip = "skip-table-full";
+    }
+    ScriptBytecodePending *slot = NULL;
+    char *strings = NULL;
+    if (skip == NULL && !pending_bytecode_key_digest(key))
+        skip = "skip-digest";
+    if (skip == NULL) {
+        size_t name = strlen(key->module_name) + 1u;
+        size_t url = strlen(key->response_url) + 1u;
+        size_t partition = strlen(key->partition_key) + 1u;
+        if (runtime->bytecode_pending == NULL)
+            runtime->bytecode_pending = budget_malloc_category(
+                runtime->budget, BUDGET_CATEGORY_JAVASCRIPT,
+                SCRIPT_BYTECODE_PENDING_LIMIT
+                    * sizeof(*runtime->bytecode_pending));
+        strings = runtime->bytecode_pending == NULL ? NULL
+            : budget_malloc_category(runtime->budget,
+                                     BUDGET_CATEGORY_JAVASCRIPT,
+                                     name + url + partition);
+        if (strings == NULL) {
+            skip = "skip-queue-allocation";
+            pending_bytecode_trim(runtime);
+        } else {
+            memcpy(strings, key->module_name, name);
+            memcpy(strings + name, key->response_url, url);
+            memcpy(strings + name + url, key->partition_key, partition);
+            /* One queued store per record: the newer compile replaces it. */
+            for (size_t i = 0; i < runtime->bytecode_pending_count; i++) {
+                if (pending_bytecode_same_record(
+                        &runtime->bytecode_pending[i], key)) {
+                    pending_bytecode_remove(runtime, i, NULL);
+                    break;
+                }
+            }
+            slot = &runtime->bytecode_pending[
+                runtime->bytecode_pending_count++];
+            *slot = (ScriptBytecodePending) {
+                .compiled = JS_DupValue(runtime->context, compiled),
+                .strings = strings,
+                .url = strings + name,
+                .partition = strings + name + url,
+                .source_length = source_length,
+                .ordinal = key->ordinal,
+                .compile_flags = key->compile_flags,
+                .epoch = runtime->session->script_bytecode_epoch
+            };
+            memcpy(slot->source_digest, key->source_digest,
+                   sizeof(slot->source_digest));
+            runtime->bytecode_pending_bytes += source_length;
+        }
+    }
+    runtime->result.external_script_bytecode_store_us +=
+        (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+    if (skip != NULL) {
+        runtime->result.external_script_bytecode_cache_admission_skips++;
+        CENSUS_TRACE_CLASSIC_BYTECODE("store", skip, source_length, 0,
+                                      key->ordinal, key->response_url);
+        return;
+    }
+    runtime->result.external_script_bytecode_deferred++;
+    CENSUS_TRACE_CLASSIC_BYTECODE("store", "deferred", source_length, 0,
+                                  key->ordinal, key->response_url);
+}
+
+static void pending_bytecode_publish(const ScriptRuntime *runtime,
+                                     ScriptResult *result)
+{
+    if (result == NULL) return;
+    const ScriptResult *live = &runtime->result;
+    result->external_script_bytecode_cache_stores =
+        live->external_script_bytecode_cache_stores;
+    result->external_script_bytecode_cache_stored_bytes =
+        live->external_script_bytecode_cache_stored_bytes;
+    result->external_script_bytecode_cache_admission_skips =
+        live->external_script_bytecode_cache_admission_skips;
+    result->external_script_bytecode_deferred_dropped =
+        live->external_script_bytecode_deferred_dropped;
+    result->external_script_bytecode_idle_store_us =
+        live->external_script_bytecode_idle_store_us;
+}
+
+/* Stores the oldest queued compile; `stored_label` names a successful store
+   in the census ledger. */
+static bool pending_bytecode_store_oldest(ScriptRuntime *runtime,
+                                          ScriptResult *result_snapshot,
+                                          const char *stored_label);
+
+bool script_runtime_store_pending_bytecode(ScriptRuntime *runtime,
+                                           ScriptResult *result_snapshot)
+{
+    return pending_bytecode_store_oldest(runtime, result_snapshot, "stored");
+}
+
+void script_runtime_flush_pending_bytecode(ScriptRuntime *runtime,
+                                           size_t source_budget)
+{
+    if (runtime == NULL || runtime->context == NULL) return;
+    while (runtime->bytecode_pending_count != 0
+           && runtime->bytecode_pending[0].source_length <= source_budget) {
+        source_budget -= runtime->bytecode_pending[0].source_length;
+        (void) pending_bytecode_store_oldest(runtime, NULL,
+                                             "stored-teardown");
+    }
+    script_runtime_drop_pending_bytecode(runtime, "drop-navigation");
+}
+
+static bool pending_bytecode_store_oldest(ScriptRuntime *runtime,
+                                          ScriptResult *result_snapshot,
+                                          const char *stored_label)
+{
+    if (runtime == NULL || runtime->context == NULL
+        || runtime->bytecode_pending_count == 0) return false;
+    if (runtime->session == NULL || runtime->session->budget == NULL) {
+        script_runtime_drop_pending_bytecode(runtime, "drop-no-session");
+        pending_bytecode_publish(runtime, result_snapshot);
+        return true;
+    }
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    ScriptBytecodePending *entry = &runtime->bytecode_pending[0];
+    if (entry->epoch != runtime->session->script_bytecode_epoch) {
+        pending_bytecode_remove(runtime, 0, "drop-cache-cleared");
+        pending_bytecode_trim(runtime);
+        pending_bytecode_publish(runtime, result_snapshot);
+        return true;
+    }
+    BrowserScriptBytecodeKey key = {
+        .module_name = entry->strings,
+        .response_url = entry->url,
+        .partition_key = entry->partition,
+        .source_length = entry->source_length,
+        .compile_flags = entry->compile_flags,
+        .ordinal = entry->ordinal,
+        .digest_ready = true
+    };
+    memcpy(key.source_digest, entry->source_digest,
+           sizeof(key.source_digest));
+    const size_t budget_reserve = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES;
+    size_t budget_left = budget_remaining(runtime->session->budget);
+    const char *result = NULL;
+    size_t length = 0;
+    if (script_runtime_heap_available(runtime)
+            < pending_bytecode_heap_reserve(entry->source_length)) {
+        result = "skip-heap-reserve";
+    } else if (budget_left < budget_reserve
+               || entry->source_length > budget_left - budget_reserve) {
+        result = "skip-budget-reserve";
+    } else if (!browser_session_script_bytecode_may_fit(
+                   runtime->session, BROWSER_SCRIPT_BYTECODE_CLASSIC, &key,
+                   entry->source_length,
+                   runtime->module_bytecode_generation)) {
+        result = "skip-table-full";
+    } else {
+        uint8_t *bytecode = JS_WriteObject(runtime->context, &length,
+                                           entry->compiled,
+                                           JS_WRITE_OBJ_BYTECODE);
+        if (bytecode == NULL) {
+            JSValue exception = JS_GetException(runtime->context);
+            JS_FreeValue(runtime->context, exception);
+            result = "serialize-failed";
+        } else {
+            budget_left = budget_remaining(runtime->session->budget);
+            bool stored = length != 0 && budget_left >= budget_reserve
+                && length <= budget_left - budget_reserve
+                && browser_session_script_bytecode_put(
+                       runtime->session, BROWSER_SCRIPT_BYTECODE_CLASSIC,
+                       &key, runtime->module_bytecode_generation, bytecode,
+                       length);
+            js_free(runtime->context, bytecode);
+            result = stored ? stored_label : "put-refused";
+        }
+    }
+    bool stored = result == stored_label;
+    if (stored) {
+        runtime->result.external_script_bytecode_cache_stores++;
+        js_rt_saturating_add_size(
+            &runtime->result.external_script_bytecode_cache_stored_bytes,
+            length);
+    } else {
+        runtime->result.external_script_bytecode_cache_admission_skips++;
+    }
+    CENSUS_TRACE_CLASSIC_BYTECODE("store", result, entry->source_length,
+                                  length, entry->ordinal, entry->url);
+    pending_bytecode_remove(runtime, 0, NULL);
+    pending_bytecode_trim(runtime);
+    runtime->result.external_script_bytecode_idle_store_us +=
+        (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+    pending_bytecode_publish(runtime, result_snapshot);
+    return true;
+}
+
+/* Restores the bytecode for `key`, or returns JS_UNDEFINED with nothing
+   pending when there is none or it does not restore (the entry is then
+   dropped). A compile this load queued for storing is used as it is.
+   *admitted is false only when compile admission refused the source,
+   exactly as it would refuse a compile. */
+static JSValue classic_bytecode_restore(ScriptRuntime *runtime,
+                                        BrowserScriptBytecodeKey *key,
+                                        const char *name, bool *admitted,
+                                        bool *disk_hit)
+{
+    *admitted = true;
+    *disk_hit = false;
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    JSValue queued = pending_bytecode_lookup(runtime, key);
+    if (!JS_IsUndefined(queued)) {
+        if (!js_rt_admit_cached_compile_source(
+                runtime->context, key->source_length, name,
+                SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result)) {
+            JS_FreeValue(runtime->context, queued);
+            *admitted = false;
+            return JS_UNDEFINED;
+        }
+        runtime->result.external_script_bytecode_restore_us +=
+            (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+        runtime->result.external_script_bytecode_cache_hits++;
+        runtime->result.external_script_bytecode_pending_hits++;
+        /* Compiled earlier in this realm and still queued for storing. */
+        js_rt_heavy_note_restored(runtime, key->source_length, false);
+        return queued;
+    }
+    bool from_disk = false;
+    BrowserSharedBody *cached = script_bytecode_lookup(
+        runtime, BROWSER_SCRIPT_BYTECODE_CLASSIC, key, &runtime->result,
+        &from_disk);
+    if (cached == NULL) {
+        runtime->result.external_script_bytecode_restore_us +=
+            (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+        return JS_UNDEFINED;
+    }
+    if (!js_rt_admit_cached_compile_source(
+            runtime->context, key->source_length, name,
+            SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result)) {
+        browser_shared_body_release(cached);
+        *admitted = false;
+        return JS_UNDEFINED;
+    }
+    JSValue compiled = JS_ReadObject(runtime->context, cached->data,
+                                     cached->length, JS_READ_OBJ_BYTECODE);
+    runtime->result.external_script_bytecode_restore_us +=
+        (js_rt_monotonic_time_ns() - started_ns) / 1000u;
+    size_t restored_bytes = cached->length;
+    browser_shared_body_release(cached);
+    if (JS_IsException(compiled)) {
+        JSValue exception = JS_GetException(runtime->context);
+        JS_FreeValue(runtime->context, exception);
+        runtime->result.external_script_bytecode_cache_restore_failures++;
+        browser_session_script_bytecode_invalidate(
+            runtime->session, BROWSER_SCRIPT_BYTECODE_CLASSIC, key);
+        browser_session_script_disk_discard(
+            runtime->session, BROWSER_SCRIPT_BYTECODE_CLASSIC, key);
+        return JS_UNDEFINED;
+    }
+    if (from_disk) runtime->result.script_bytecode_disk_hits++;
+    *disk_hit = from_disk;
+    runtime->result.external_script_bytecode_cache_hits++;
+    js_rt_saturating_add_size(
+        &runtime->result.external_script_bytecode_cache_bytes,
+        restored_bytes);
+    js_rt_heavy_note_restored(runtime, key->source_length, from_disk);
+    return compiled;
+}
+
+/* A classic script's fallback encoding is its charset attribute when that
+   names an encoding, else the document's (HTML "fetch a classic script").
+   The response's Content-Type charset is not plumbed this far, so a legacy
+   decode applies only to a source that is not valid UTF-8: a UTF-8 script
+   on a legacy page is never re-decoded, and a legacy one no longer fails
+   to compile on its first non-ASCII string literal. Returns a NUL-ended
+   budget copy, or NULL to evaluate the bytes as they are. */
+static char *js_rt_decode_classic_script_source(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t *length)
+{
+    if (runtime == NULL || source == NULL || length == NULL) return NULL;
+    TilefinchEncoding encoding = TILEFINCH_ENCODING_NONE;
+    size_t charset_length = 0;
+    const char *charset = document_attribute(
+        script_node, "charset", &charset_length);
+    if (charset != NULL) {
+        encoding = tilefinch_encoding_for_label(charset, charset_length);
+    }
+    if (!tilefinch_encoding_decodable(encoding)
+        && runtime->document != NULL) {
+        encoding = (TilefinchEncoding) runtime->document->encoding;
+    }
+    if (!tilefinch_encoding_decodable(encoding)
+        || encoding == TILEFINCH_ENCODING_UTF8
+        || tilefinch_utf8_valid((const unsigned char *) source, *length)) {
+        return NULL;
+    }
+    size_t capacity = tilefinch_decoder_maximum_output(encoding, *length);
+    if (capacity == SIZE_MAX) return NULL;
+    char *decoded = budget_malloc(runtime->budget, capacity + 1u);
+    if (decoded == NULL) return NULL;
+    TilefinchDecoder decoder;
+    tilefinch_decoder_init(&decoder, encoding);
+    const unsigned char *input = (const unsigned char *) source;
+    size_t remaining = *length;
+    size_t written = tilefinch_decoder_decode(
+        &decoder, &input, &remaining, (unsigned char *) decoded, capacity,
+        true);
+    decoded[written] = '\0';
+    *length = written;
+    return decoded;
+}
+
 static bool script_runtime_evaluate_external_typed_at(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *request_url,
     const char *response_url, const char *module_referrer_policy,
     TilefinchCredentialsMode module_credentials, bool module,
     bool dispatch_completion, const char *classic_cache_url,
-    ScriptResult *result)
+    uint32_t classic_ordinal, bool response_no_store, ScriptResult *result)
 {
-    if (runtime == NULL || script_node == NULL || source == NULL) return false;
+    /* A NULL source is an installed app's classic script restored as
+       bytecode only (browser_session_offline_script_*). */
+    if (runtime == NULL || script_node == NULL
+        || (source == NULL
+            && (module || classic_cache_url == NULL
+                || runtime->session == NULL))) return false;
     if (!script_runtime_refresh_named_properties(runtime)) {
         js_rt_runtime_update_result(runtime, result);
         return false;
@@ -1058,6 +1677,22 @@ static bool script_runtime_evaluate_external_typed_at(
     bool page_diagnostic = JS_ToBool(runtime->context, page_trace) == 1;
     JS_FreeValue(runtime->context, page_trace);
     JS_FreeValue(runtime->context, trace_global);
+    /* Its source stays in the app pack and is read only when something
+       needs the bytes: the page-trace wrapper or a failed restore. */
+    BrowserSharedBody *source_lease = NULL;
+    BrowserSharedBody *offline_bytecode = NULL;
+    if (evaluated && source == NULL) {
+        if (!page_diagnostic && dispatch_completion)
+            offline_bytecode = browser_session_offline_script_bytecode(
+                runtime->session, classic_cache_url, source_length);
+        if (offline_bytecode == NULL) {
+            source_lease = browser_session_offline_script_source(
+                runtime->session, classic_cache_url, source_length);
+            if (source_lease == NULL) evaluated = false;
+            else source = (const char *) source_lease->data;
+        }
+        evaluated_source = source;
+    }
     static const char trace_prefix[] = "with(__tilefinchGlobalProxy){";
     static const char trace_suffix[] = "\n}";
     /* A Module is always parsed in strict mode, where a WithStatement is a
@@ -1066,16 +1701,23 @@ static bool script_runtime_evaluate_external_typed_at(
        the proxied host objects installed by page_capability_trace_setup();
        compiling the author's module source unchanged preserves module
        grammar and strict-mode semantics. */
+    char *decoded = NULL;
+    if (evaluated && !module && evaluated_source != NULL) {
+        decoded = js_rt_decode_classic_script_source(
+            runtime, script_node, evaluated_source, &evaluated_length);
+        if (decoded != NULL) evaluated_source = decoded;
+    }
     if (evaluated && page_diagnostic && !module) {
-        evaluated_length = sizeof(trace_prefix) - 1 + source_length
+        size_t body_length = evaluated_length;
+        evaluated_length = sizeof(trace_prefix) - 1 + body_length
                            + sizeof(trace_suffix) - 1;
         instrumented = budget_malloc(runtime->budget, evaluated_length + 1);
         if (instrumented == NULL) evaluated = false;
         else {
             memcpy(instrumented, trace_prefix, sizeof(trace_prefix) - 1);
-            memcpy(instrumented + sizeof(trace_prefix) - 1, source,
-                   source_length);
-            memcpy(instrumented + sizeof(trace_prefix) - 1 + source_length,
+            memcpy(instrumented + sizeof(trace_prefix) - 1, evaluated_source,
+                   body_length);
+            memcpy(instrumented + sizeof(trace_prefix) - 1 + body_length,
                    trace_suffix, sizeof(trace_suffix));
             instrumented[evaluated_length] = '\0';
             evaluated_source = instrumented;
@@ -1084,13 +1726,50 @@ static bool script_runtime_evaluate_external_typed_at(
     if (evaluated) {
         const char *name =
             request_url == NULL ? "<external-script>" : request_url;
-        if (!module && !page_diagnostic && dispatch_completion
-            && classic_cache_url != NULL && runtime->session != NULL) {
-            BrowserSharedBody *cached =
-                browser_session_classic_script_bytecode_acquire(
+        bool classic_cacheable = !module && !page_diagnostic
+            && classic_cache_url != NULL && runtime->session != NULL;
+#ifndef TILEFINCH_NO_TRACE
+        if (!module && !classic_cacheable && tilefinch_trace_census()) {
+            CENSUS_TRACE_CLASSIC_BYTECODE(
+                "lookup",
+                page_diagnostic ? "ineligible-diagnostic"
+                    : classic_cache_url == NULL ? "ineligible-no-cache-url"
+                    : "ineligible-no-session",
+                evaluated_length, 0, classic_ordinal, name);
+        }
+#endif
+        if (classic_cacheable) {
+            /* An installed app's bytecode comes with the app: restored with
+               it (offline_bytecode) or attached to its response entry. */
+            BrowserSharedBody *cached = offline_bytecode;
+            if (cached == NULL && classic_ordinal == 0 && dispatch_completion
+                && evaluated_source != NULL) {
+                cached = browser_session_classic_script_bytecode_acquire(
                     runtime->session, classic_cache_url,
                     (const unsigned char *) evaluated_source,
                     evaluated_length);
+            }
+            char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+            BrowserScriptBytecodeKey key;
+            bool keyed = cached == NULL && classic_bytecode_key_init(
+                runtime, &key, partition, evaluated_source, evaluated_length,
+                name, classic_cache_url, classic_ordinal);
+#ifndef TILEFINCH_NO_TRACE
+            /* Printed once the lookup is over: a persistent-tier read
+               happens inside it. */
+            const char *census_lookup = NULL;
+            if (tilefinch_trace_census()) {
+                JSValue queued = keyed
+                    ? pending_bytecode_lookup(runtime, &key) : JS_UNDEFINED;
+                census_lookup = cached != NULL ? "hit-installed"
+                    : !keyed ? "ineligible-key"
+                    : !JS_IsUndefined(queued) ? "hit-pending"
+                    : browser_session_script_bytecode_diagnose(
+                          runtime->session, BROWSER_SCRIPT_BYTECODE_CLASSIC,
+                          &key);
+                JS_FreeValue(runtime->context, queued);
+            }
+#endif
             JSValue compiled = JS_UNDEFINED;
             bool restored = false;
             bool cache_admitted = true;
@@ -1099,9 +1778,13 @@ static bool script_runtime_evaluate_external_typed_at(
                         runtime->context, evaluated_length, name,
                         SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result);
                 if (cache_admitted) {
+                    uint64_t restore_started_ns = js_rt_monotonic_time_ns();
                     compiled = JS_ReadObject(
                         runtime->context, cached->data, cached->length,
                         JS_READ_OBJ_BYTECODE);
+                    runtime->result.external_script_bytecode_restore_us +=
+                        (js_rt_monotonic_time_ns() - restore_started_ns)
+                        / 1000u;
                     restored = !JS_IsException(compiled);
                 }
                 if (restored) {
@@ -1109,6 +1792,9 @@ static bool script_runtime_evaluate_external_typed_at(
                     js_rt_saturating_add_size(
                         &runtime->result.external_script_bytecode_cache_bytes,
                         cached->length);
+                    /* An installed app's bytecode, restored from RAM. */
+                    js_rt_heavy_note_restored(runtime, evaluated_length,
+                                              false);
                 } else if (cache_admitted) {
                     if (JS_IsException(compiled)) {
                         JSValue exception =
@@ -1120,14 +1806,40 @@ static bool script_runtime_evaluate_external_typed_at(
                     compiled = JS_UNDEFINED;
                     runtime->result
                         .external_script_bytecode_cache_restore_failures++;
-                    browser_session_classic_script_bytecode_invalidate(
-                        runtime->session, classic_cache_url,
-                        (const unsigned char *) evaluated_source,
-                        evaluated_length);
+                    if (evaluated_source == NULL) {
+                        source_lease = browser_session_offline_script_source(
+                            runtime->session, classic_cache_url,
+                            evaluated_length);
+                        if (source_lease != NULL)
+                            source = evaluated_source =
+                                (const char *) source_lease->data;
+                    }
+                    if (evaluated_source != NULL)
+                        browser_session_classic_script_bytecode_invalidate(
+                            runtime->session, classic_cache_url,
+                            (const unsigned char *) evaluated_source,
+                            evaluated_length);
                 }
                 browser_shared_body_release(cached);
+            } else if (keyed) {
+                bool disk_hit = false;
+                compiled = classic_bytecode_restore(
+                    runtime, &key, name, &cache_admitted, &disk_hit);
+                restored = !JS_IsUndefined(compiled);
+#ifndef TILEFINCH_NO_TRACE
+                if (disk_hit) census_lookup = "hit-disk";
+#else
+                (void) disk_hit;
+#endif
             }
-            if (!cache_admitted) {
+#ifndef TILEFINCH_NO_TRACE
+            if (census_lookup != NULL)
+                CENSUS_TRACE_CLASSIC_BYTECODE("lookup", census_lookup,
+                                              evaluated_length, 0,
+                                              classic_ordinal,
+                                              classic_cache_url);
+#endif
+            if (!cache_admitted || (!restored && evaluated_source == NULL)) {
                 evaluated = false;
             } else if (!restored) {
                 bool admitted = false;
@@ -1139,49 +1851,9 @@ static bool script_runtime_evaluate_external_typed_at(
                     &admitted);
                 if (!admitted) {
                     evaluated = false;
-                } else if (!JS_IsException(compiled)) {
-                    size_t bytecode_length = 0;
-                    /* Serialization is an optional accelerator beside a
-                       freshly compiled program. Do not consume the remaining
-                       execution headroom to grow its temporary output buffer.
-                       This is a conservative pressure heuristic, not a size
-                       guarantee; ordinary serialization refusal still unwinds
-                       below without discarding the compiled script. */
-                    const size_t cache_floor = 64u * 1024u;
-                    size_t cache_reserve = evaluated_length > (SIZE_MAX - cache_floor) / 4u
-                        ? SIZE_MAX : cache_floor + evaluated_length * 4u;
-                    bool may_fit =
-                        script_runtime_heap_available(runtime) >= cache_reserve
-                        && browser_session_classic_script_bytecode_may_fit(
-                            runtime->session, classic_cache_url,
-                            (const unsigned char *) evaluated_source,
-                            evaluated_length,
-                            evaluated_length);
-                    uint8_t *bytecode = may_fit
-                        ? JS_WriteObject(
-                            runtime->context, &bytecode_length, compiled,
-                            JS_WRITE_OBJ_BYTECODE)
-                        : NULL;
-                    if (!may_fit) {
-                        runtime->result
-                            .external_script_bytecode_cache_admission_skips++;
-                    }
-                    bool bytecode_stored = bytecode != NULL
-                        && bytecode_length != 0
-                        && browser_session_classic_script_bytecode_put(
-                            runtime->session, classic_cache_url,
-                            (const unsigned char *) evaluated_source,
-                            evaluated_length, bytecode, bytecode_length);
-                    if (bytecode_stored) {
-                        runtime->result
-                            .external_script_bytecode_cache_stores++;
-                    }
-                    if (may_fit && bytecode == NULL) {
-                        JSValue exception =
-                            JS_GetException(runtime->context);
-                        JS_FreeValue(runtime->context, exception);
-                    }
-                    js_free(runtime->context, bytecode);
+                } else if (keyed && !JS_IsException(compiled)) {
+                    classic_bytecode_store(runtime, &key, compiled,
+                                           response_no_store);
                 }
             }
             if (evaluated) {
@@ -1190,11 +1862,14 @@ static bool script_runtime_evaluate_external_typed_at(
                     &runtime->result);
             }
         } else if (module) {
+            bool previous_no_store = runtime->module_root_no_store;
+            runtime->module_root_no_store = response_no_store;
             evaluated = js_rt_evaluate_external_module_at(
                 runtime->context, evaluated_source, evaluated_length, name,
                 response_url != NULL ? response_url : request_url,
                 module_referrer_policy, module_credentials,
                 &runtime->result);
+            runtime->module_root_no_store = previous_no_store;
         } else {
             evaluated = js_rt_evaluate_source_type_at(
                 runtime->context, evaluated_source, evaluated_length, name,
@@ -1224,9 +1899,12 @@ static bool script_runtime_evaluate_external_typed_at(
         evaluated = js_rt_runtime_refresh(runtime);
     }
     budget_free(runtime->budget, instrumented);
+    budget_free(runtime->budget, decoded);
     if (!evaluated) {
         js_rt_capture_error_source_context(source, source_length, request_url,
                                      &runtime->result);
+        browser_shared_body_release(source_lease);
+        source_lease = NULL;
         /* Compilation/evaluation failure is an author-script error, not a
            failed document load.  In a bounded realm the failed evaluation
            may leave unreachable parser objects and wrapper cycles at the
@@ -1247,6 +1925,7 @@ static bool script_runtime_evaluate_external_typed_at(
             previous_rejection_source;
         return false;
     }
+    browser_shared_body_release(source_lease);
     runtime->result.external_script_bytes += source_length;
     if (!dispatch_completion) {
         runtime->result.success = true;
@@ -1287,35 +1966,52 @@ bool script_runtime_evaluate_external_typed(
                                   : runtime->bridge.referrer_policy),
         runtime == NULL ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
                         : runtime->active_module_credentials,
-        module, true, module ? NULL : source_url, result);
+        module, true, module ? NULL : source_url, 0, false, result);
+}
+
+bool js_rt_evaluate_external_classic_dynamic(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *source_url,
+    bool response_no_store)
+{
+    return script_runtime_evaluate_external_typed_at(
+        runtime, script_node, source, source_length, source_url, source_url,
+        runtime == NULL ? NULL : runtime->bridge.referrer_policy,
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, false, true, source_url, 0,
+        response_no_store, NULL);
 }
 
 bool script_runtime_evaluate_external_classic_cached(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *request_url,
-    const char *response_url, ScriptResult *result)
+    const char *response_url, bool response_no_store, ScriptResult *result)
 {
     const char *name = response_url == NULL ? request_url : response_url;
     return script_runtime_evaluate_external_typed_at(
         runtime, script_node, source, source_length, name, name,
         runtime == NULL ? NULL : runtime->bridge.referrer_policy,
-        TILEFINCH_CREDENTIALS_SAME_ORIGIN, false, true, request_url, result);
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, false, true, request_url, 0,
+        response_no_store, result);
 }
 
+/* A segment's bytecode is keyed by its own bytes and its ordinal. */
 bool js_rt_evaluate_external_classic_segment(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *source_url,
-    bool final_segment)
+    size_t segment_index, bool response_no_store, bool final_segment)
 {
     return script_runtime_evaluate_external_typed_at(
         runtime, script_node, source, source_length, source_url, source_url,
         runtime == NULL ? NULL : runtime->bridge.referrer_policy,
-        TILEFINCH_CREDENTIALS_SAME_ORIGIN, false, final_segment, NULL, NULL);
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, false, final_segment,
+        segment_index >= UINT32_MAX - 1u ? NULL : source_url,
+        (uint32_t) segment_index + 1u, response_no_store, NULL);
 }
 
 bool js_rt_preflight_external_classic_segment(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
-    const char *source, size_t source_length, const char *source_url)
+    const char *source, size_t source_length, const char *source_url,
+    size_t segment_index, bool response_no_store)
 {
     if (runtime == NULL || script_node == NULL || source == NULL) return false;
     const char *name =
@@ -1324,12 +2020,48 @@ bool js_rt_preflight_external_classic_segment(
         runtime->promise_rejection_state.active_source;
     runtime->promise_rejection_state.active_source = name;
     js_rt_runtime_arm_watchdog(runtime);
+    /* A compile (queued for storing, or stored bytecode) of exactly these
+       bytes proves they compile; otherwise the compile below is queued, so
+       the segment's evaluation runs it instead of compiling the same bytes
+       a second time. */
+    char partition[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    BrowserScriptBytecodeKey key;
+    bool keyed = source_url != NULL && segment_index < UINT32_MAX - 1u
+        && classic_bytecode_key_init(
+               runtime, &key, partition, source, source_length, name,
+               source_url, (uint32_t) segment_index + 1u);
+    if (keyed) {
+        JSValue queued = pending_bytecode_lookup(runtime, &key);
+        bool found = !JS_IsUndefined(queued);
+        JS_FreeValue(runtime->context, queued);
+        bool from_disk = false;
+        BrowserSharedBody *cached = found ? NULL
+            : script_bytecode_lookup(runtime, BROWSER_SCRIPT_BYTECODE_CLASSIC,
+                                     &key, &runtime->result, &from_disk);
+
+        bool hit = (found || cached != NULL)
+            && js_rt_admit_cached_compile_source(
+                   runtime->context, source_length, name,
+                   SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result);
+        browser_shared_body_release(cached);
+        if (hit) {
+            CENSUS_TRACE_CLASSIC_BYTECODE("preflight",
+                                          from_disk ? "hit-disk" : "hit",
+                                          source_length, 0, key.ordinal,
+                                          source_url);
+            runtime->promise_rejection_state.active_source = previous_source;
+            return true;
+        }
+    }
     bool admitted = false;
     JSValue compiled = js_rt_compile_source_type(
         runtime->context, source, source_length, name, JS_EVAL_TYPE_GLOBAL,
         SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result, &admitted);
     bool ok = admitted && !JS_IsException(compiled);
     if (ok) {
+        if (keyed)
+            classic_bytecode_store(runtime, &key, compiled,
+                                   response_no_store);
         JS_FreeValue(runtime->context, compiled);
         runtime->promise_rejection_state.active_source = previous_source;
         return true;
@@ -1363,6 +2095,18 @@ bool script_runtime_evaluate_external_module_context(
     const char *response_url, const char *effective_referrer_policy,
     TilefinchCredentialsMode credentials, ScriptResult *result)
 {
+    return script_runtime_evaluate_external_module_response(
+        runtime, script_node, source, source_length, request_url,
+        response_url, effective_referrer_policy, credentials, false, result);
+}
+
+bool script_runtime_evaluate_external_module_response(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *request_url,
+    const char *response_url, const char *effective_referrer_policy,
+    TilefinchCredentialsMode credentials, bool response_no_store,
+    ScriptResult *result)
+{
     if (runtime == NULL
         || !runtime_module_referrer_policy_valid(
                effective_referrer_policy)
@@ -1389,7 +2133,8 @@ bool script_runtime_evaluate_external_module_context(
     runtime->active_module_credentials = credentials;
     return script_runtime_evaluate_external_typed_at(
         runtime, script_node, source, source_length, request_url, response_url,
-        effective_referrer_policy, credentials, true, true, NULL, result);
+        effective_referrer_policy, credentials, true, true, NULL, 0,
+        response_no_store, result);
 }
 
 TilefinchCredentialsMode script_runtime_module_credentials(

@@ -701,6 +701,284 @@ static int test_custom_rule_footprint(void)
     return 0;
 }
 
+static size_t custom_property_text(const Stylesheet *sheet,
+                                   lxb_dom_node_t *node, const char *name,
+                                   char *output, size_t output_size)
+{
+    output[0] = '\0';
+    if (!style_custom_property_value(sheet, node, PSEUDO_NONE, name,
+                                     strlen(name), output, output_size))
+        return 0;
+    return strlen(output);
+}
+
+/* Tailwind v4 composes custom properties longer than the former 96-byte
+   value cap (--tw-gradient-stops is 160 bytes, shadow stacks 100 and
+   more), and they were dropped. Values are kept in the sheet's text arena
+   up to STYLE_CUSTOM_VALUE_CAPACITY, long ones under a per-sheet total;
+   anything longer is still ignored, so an earlier declaration wins. */
+static int test_long_custom_property_values(void)
+{
+#define SHADE_LAYER(blur) "0 0 " blur " 0 var(--shade,#000000)"
+#define STACK SHADE_LAYER("8px") "," SHADE_LAYER("4px") "," \
+    SHADE_LAYER("2px") "," SHADE_LAYER("1px")
+    static const char css[] =
+        ".outer{--shade:#ff0000;--stack:" STACK ";"
+        "--fallback:var(--missing,0 0 8px 0 #102030,0 0 4px 0 #102030,"
+        "0 0 2px 0 #102030,0 0 1px 0 #102030,0 0 0 1px #102030,"
+        "0 0 0 2px #102030)}"
+        ".leaf{--shade:#00ff00}"
+        /* GitHub's 170-byte --fontStack-sansSerif, used by font-family. */
+        "#long-name{--font-stack:\"Mona Sans VF\", -apple-system, "
+        "BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans Backtick Fix\", "
+        "\"Noto Sans\", Helvetica, Arial, sans-serif, \"Apple Color Emoji\", "
+        "\"Segoe UI Emoji\";font-family:var(--font-stack)}"
+        /* A seven-item transition list (328 bytes) and a composed filter
+           chain (150 bytes) through var(): each property's parser takes
+           a resolved value up to the substitution capacity. */
+        "#long-transition{--motion:"
+        "color 150ms cubic-bezier(0.4, 0, 0.2, 1),"
+        "background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),"
+        "border-color 150ms cubic-bezier(0.4, 0, 0.2, 1),"
+        "outline-color 150ms cubic-bezier(0.4, 0, 0.2, 1),"
+        "text-decoration-color 150ms cubic-bezier(0.4, 0, 0.2, 1),"
+        "fill 150ms cubic-bezier(0.4, 0, 0.2, 1),"
+        "stroke 150ms cubic-bezier(0.4, 0, 0.2, 1);"
+        "transition:var(--motion)}"
+        "#long-filter{--fx:blur(0px) brightness(100%) contrast(100%) "
+        "grayscale(100%) hue-rotate(0deg) invert(0%) saturate(100%) "
+        "sepia(0%) drop-shadow(0 1px 2px rgb(0 0 0 / 0.1));"
+        "filter:var(--fx)}"
+        "#over{--big:short}#over{--big:";
+#undef STACK
+#undef SHADE_LAYER
+    static const char resolved_stack[] =
+        "0 0 8px 0 #ff0000,0 0 4px 0 #ff0000,"
+        "0 0 2px 0 #ff0000,0 0 1px 0 #ff0000";
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<div id=outer class=outer><span id=inner class=leaf>x</span></div>"
+        "<p id=over></p><p id=long-name></p><p id=long-transition></p>"
+        "<p id=long-filter></p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *outer = find_id(root, "outer");
+    lxb_dom_node_t *inner = find_id(root, "inner");
+    lxb_dom_node_t *over = find_id(root, "over");
+    lxb_dom_node_t *long_name = find_id(root, "long-name");
+    lxb_dom_node_t *long_transition = find_id(root, "long-transition");
+    lxb_dom_node_t *long_filter = find_id(root, "long-filter");
+    CHECK(outer != NULL && inner != NULL && over != NULL
+          && long_name != NULL && long_transition != NULL
+          && long_filter != NULL);
+
+    /* The prefix plus one value past the bound, then a 600-byte value
+       whose var() names resolve to well under the substitution capacity. */
+    size_t over_length = STYLE_CUSTOM_VALUE_CAPACITY + 64u;
+    size_t text_capacity = sizeof(css) + over_length + 2048u;
+    char *text = malloc(text_capacity);
+    CHECK(text != NULL);
+    size_t used = (size_t) snprintf(text, text_capacity, "%s", css);
+    memset(text + used, 'x', over_length);
+    used += over_length;
+    used += (size_t) snprintf(text + used, text_capacity - used,
+                              "}#long-name{--shrinks:");
+    size_t shrinks_start = used;
+    while (used - shrinks_start < 600u) {
+        used += (size_t) snprintf(text + used, text_capacity - used,
+                                  "var(--an-unset-but-very-descriptive-name,"
+                                  "1px) ");
+    }
+    used += (size_t) snprintf(text + used, text_capacity - used, "}");
+    CHECK(used < text_capacity);
+
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    uint64_t drops = sheet.diagnostic_custom_property_drops;
+    CHECK(stylesheet_add_css(&sheet, text, used));
+    free(text);
+
+    char value[640];
+    /* Nested var() with fallbacks inside a 150-byte value resolves on the
+       declaring element; the child inherits that result, so its own
+       --shade override does not leak in. */
+    CHECK(custom_property_text(&sheet, outer, "--stack", value,
+                               sizeof(value)) == strlen(resolved_stack)
+          && strcmp(value, resolved_stack) == 0);
+    CHECK(custom_property_text(&sheet, inner, "--stack", value,
+                               sizeof(value)) == strlen(resolved_stack)
+          && strcmp(value, resolved_stack) == 0);
+    CHECK(custom_property_text(&sheet, inner, "--fallback", value,
+                               sizeof(value)) > 96u
+          && strncmp(value, "0 0 8px 0 #102030,", 18) == 0);
+    /* A value past the bound is ignored: the earlier declaration wins. */
+    CHECK(custom_property_text(&sheet, over, "--big", value,
+                               sizeof(value)) == 5
+          && strcmp(value, "short") == 0);
+    CHECK(sheet.diagnostic_custom_property_drops == drops + 1u);
+    const StyleCustomRule *shrinks = NULL;
+    for (size_t i = 0; i < sheet.custom_rule_count; i++) {
+        if (strcmp(sheet.custom_rules[i].name, "--shrinks") == 0)
+            shrinks = &sheet.custom_rules[i];
+    }
+    CHECK(shrinks != NULL && strlen(shrinks->value) >= 600u);
+    size_t shrunk = custom_property_text(&sheet, long_name, "--shrinks",
+                                         value, sizeof(value));
+    CHECK(shrunk > 0 && shrunk < 200u && strncmp(value, "1px 1px", 7) == 0);
+    ComputedStyle stacked = style_for_node(&sheet, long_name, NULL);
+    CHECK(stacked.font_family == FONT_METRIC_SANS);
+    StyleTransitionComputed motion;
+    CHECK(style_transition_computed(&sheet, long_transition, PSEUDO_NONE,
+                                    &motion));
+    CHECK(motion.property_count == 7 && motion.duration_count == 7
+          && strcmp(motion.properties[0], "color") == 0
+          && strcmp(motion.properties[6], "stroke") == 0
+          && motion.duration_ms[6] == 150.0);
+    ComputedStyle filtered = style_for_node(&sheet, long_filter, NULL);
+    CHECK(filtered.has_filter
+          && (filtered.filter_code & STYLE_FILTER_CODE_MASK)
+             == STYLE_FILTER_GRAYSCALE);
+
+    /* The layout variable cache keeps long resolved values too (in its
+       bounded spill), so inherited lookups hit instead of re-walking. */
+    CHECK(style_variable_cache_begin(&sheet, &budget));
+    size_t cache_bytes = style_variable_cache_bytes(&sheet);
+    CHECK(custom_property_text(&sheet, inner, "--stack", value,
+                               sizeof(value)) == strlen(resolved_stack));
+    uint64_t hits = sheet.variable_cache_hits;
+    CHECK(custom_property_text(&sheet, inner, "--stack", value,
+                               sizeof(value)) == strlen(resolved_stack)
+          && strcmp(value, resolved_stack) == 0
+          && sheet.variable_cache_hits > hits);
+    CHECK(style_variable_cache_bytes(&sheet)
+          <= cache_bytes + STYLE_VARIABLE_CACHE_SPILL_BYTES);
+    style_variable_cache_end(&sheet);
+    stylesheet_destroy(&sheet);
+
+    /* Long values share one per-sheet total: once it is spent, further
+       long declarations are dropped and the sheet's growth stays bounded. */
+    enum { LONG_RULES = 96 };
+    size_t long_value = STYLE_CUSTOM_VALUE_CAPACITY - 1u;
+    size_t many_capacity = LONG_RULES * (long_value + 32u);
+    char *many = malloc(many_capacity);
+    CHECK(many != NULL);
+    size_t many_used = 0;
+    for (unsigned i = 0; i < LONG_RULES; i++) {
+        many_used += (size_t) snprintf(many + many_used,
+                                       many_capacity - many_used,
+                                       "#r%u{--long:", i);
+        memset(many + many_used, 'a' + (char) (i % 26u), long_value);
+        many_used += long_value;
+        many[many_used++] = '}';
+    }
+    CHECK(many_used < many_capacity);
+    Stylesheet bounded = {0};
+    CHECK(stylesheet_build(&bounded, &budget, &document, 480));
+    size_t before = budget.current;
+    drops = bounded.diagnostic_custom_property_drops;
+    CHECK(stylesheet_add_css(&bounded, many, many_used));
+    free(many);
+    size_t kept = 0;
+    for (size_t i = 0; i < bounded.custom_rule_count; i++) {
+        if (strcmp(bounded.custom_rules[i].name, "--long") == 0) kept++;
+    }
+    size_t limit_rules = STYLE_CUSTOM_LONG_VALUE_BYTES / (long_value + 1u);
+    fprintf(stderr, "style-index long custom values kept=%zu dropped=%llu "
+            "growth=%zu\n", kept,
+            (unsigned long long) (bounded.diagnostic_custom_property_drops
+                                  - drops),
+            budget.current - before);
+    CHECK(kept == limit_rules && kept < LONG_RULES
+          && bounded.diagnostic_custom_property_drops
+             == drops + (LONG_RULES - kept));
+    CHECK(budget.current - before
+          < STYLE_CUSTOM_LONG_VALUE_BYTES + 64u * 1024u);
+    stylesheet_destroy(&bounded);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* @property registrations (CSS Properties and Values API): Tailwind v4
+   registers its --tw-* properties and only falls back to a universal
+   reset block behind an @supports query Chromium (and this engine)
+   answers false, so without them --tw-gradient-from-position and
+   friends are undefined and every gradient is invalid. A non-inheriting
+   registration sees only the element's own declaration, else its
+   initial value; an inheriting one inherits and starts from it. */
+static int test_registered_custom_properties(void)
+{
+    static const char css[] =
+        "@property --reg-color{syntax:\"<color>\";inherits:false;"
+        "initial-value:#0000}"
+        "@property --reg-length{syntax:'<length>';inherits:true;"
+        "initial-value:5px}"
+        "@property --reg-any{syntax:\"*\";inherits:false}"
+        /* No initial-value for a typed syntax: invalid, ignored. */
+        "@property --reg-bad{syntax:\"<length>\";inherits:false}"
+        "@layer properties{@supports (-webkit-hyphens:none){"
+        "*{--reg-color:#123456}}}"
+        ".outer{--reg-color:#ff0000;--reg-any:abc;--reg-bad:outer}"
+        ".reset{--reg-length:initial}";
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<div id=outer class=outer><span id=inner>x</span>"
+        "<span id=reset class=reset>y</span></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *outer = find_id(root, "outer");
+    lxb_dom_node_t *inner = find_id(root, "inner");
+    lxb_dom_node_t *reset = find_id(root, "reset");
+    CHECK(outer != NULL && inner != NULL && reset != NULL);
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    uint64_t signature = stylesheet_parse_context_signature(&sheet);
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    CHECK(sheet.registered_property_count == 3
+          && stylesheet_parse_context_signature(&sheet) != signature);
+    char value[64];
+    CHECK(custom_property_text(&sheet, outer, "--reg-color", value,
+                               sizeof(value)) == 7
+          && strcmp(value, "#ff0000") == 0);
+    CHECK(custom_property_text(&sheet, inner, "--reg-color", value,
+                               sizeof(value)) == 5
+          && strcmp(value, "#0000") == 0);
+    CHECK(custom_property_text(&sheet, inner, "--reg-length", value,
+                               sizeof(value)) == 3
+          && strcmp(value, "5px") == 0);
+    CHECK(custom_property_text(&sheet, reset, "--reg-length", value,
+                               sizeof(value)) == 3
+          && strcmp(value, "5px") == 0);
+    CHECK(custom_property_text(&sheet, outer, "--reg-any", value,
+                               sizeof(value)) == 3);
+    CHECK(custom_property_text(&sheet, inner, "--reg-any", value,
+                               sizeof(value)) == 0);
+    CHECK(custom_property_text(&sheet, inner, "--reg-bad", value,
+                               sizeof(value)) == 5
+          && strcmp(value, "outer") == 0);
+    /* Through the layout variable cache as well. */
+    CHECK(style_variable_cache_begin(&sheet, &budget));
+    for (int pass = 0; pass < 2; pass++) {
+        CHECK(custom_property_text(&sheet, inner, "--reg-color", value,
+                                   sizeof(value)) == 5
+              && custom_property_text(&sheet, outer, "--reg-color", value,
+                                      sizeof(value)) == 7
+              && custom_property_text(&sheet, inner, "--reg-any", value,
+                                      sizeof(value)) == 0);
+    }
+    style_variable_cache_end(&sheet);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_head_script_dependency_cache(void)
 {
     Budget budget;
@@ -711,34 +989,61 @@ static int test_head_script_dependency_cache(void)
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
     Stylesheet sheet = {0};
     CHECK(stylesheet_build(&sheet, &budget, &document, 480));
-    static const char css[] = ".observer:has(script) p{color:red}";
+    /* Keyed anchors nothing in the head's path carries, an unkeyed anchor
+       that needs an ancestor <html> lacks, and an escaped selector without
+       :has() (which the old lexical scan refused outright). */
+    static const char css[] =
+        ".observer:has(script) p{color:red}"
+        ".wrap :is(.a,.b):has(+:not(.c)){color:red}"
+        ".esc\\:wide{width:1px}";
     CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
     lxb_dom_node_t *head = lxb_dom_interface_node(
         lxb_html_document_head_element(document.html));
-    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
     uint64_t scans = sheet.head_script_selector_scans;
     CHECK(scans != 0);
-    for (unsigned i = 0; i < 100; i++)
-        CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head));
-    CHECK(sheet.head_script_selector_scans == scans);
-    /* A DOM-only change must still recheck the cached :has subject. */
+    /* The keyed anchor is checked against the live head. */
     CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(head),
         (const lxb_char_t *) "class", 5,
         (const lxb_char_t *) "observer", 8) != NULL);
-    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head));
-    CHECK(sheet.head_script_selector_scans == scans);
+    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
     CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(head),
         (const lxb_char_t *) "class", 5) == LXB_STATUS_OK);
-    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head));
-    /* New stylesheet contents invalidate the lexical summary. */
-    static const char changed[] = "html:has(script){color:blue}";
-    CHECK(stylesheet_add_css(&sheet, changed, sizeof(changed) - 1u));
-    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head));
-    CHECK(sheet.head_script_selector_scans > scans);
-    scans = sheet.head_script_selector_scans;
-    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head));
-    CHECK(sheet.head_script_selector_scans == scans);
-    printf("head selector cache: repeated scans=0 across 100 checks\n");
+    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    /* So is the unkeyed one: <html> class=a matches `:is(.a,.b)` but not
+       `.wrap :is(.a,.b)`; the head under a .wrap <html> does. */
+    lxb_dom_node_t *root = head->parent;
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(root),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "a", 1) != NULL);
+    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(root),
+        (const lxb_char_t *) "class", 5,
+        (const lxb_char_t *) "wrap", 4) != NULL);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(head),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "b", 1) != NULL);
+    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(head),
+        (const lxb_char_t *) "class", 5) == LXB_STATUS_OK);
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(root),
+        (const lxb_char_t *) "class", 5) == LXB_STATUS_OK);
+    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    /* An anchor <html> carries, and a universal one, are refused. */
+    static const char tagged[] = "html:has(script){color:blue}";
+    CHECK(stylesheet_add_css(&sheet, tagged, sizeof(tagged) - 1u));
+    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head, NULL));
+    Stylesheet universal = {0};
+    CHECK(stylesheet_build(&universal, &budget, &document, 480));
+    static const char any[] = ".x>p,:has(> script) p{color:blue}";
+    CHECK(stylesheet_add_css(&universal, any, sizeof(any) - 1u));
+    CHECK(stylesheet_head_scripts_affect_ancestors(&universal, head, NULL));
+    /* A change at the <title> cannot be what `> script` finds. */
+    lxb_dom_node_t *title = head->first_child;
+    while (title != NULL && title->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        title = title->next;
+    CHECK(title != NULL
+          && !stylesheet_head_scripts_affect_ancestors(&universal, head,
+                                                       title));
+    stylesheet_destroy(&universal);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0);
@@ -1810,6 +2115,209 @@ static int test_utility_class_candidates_match_linear(void)
     return 0;
 }
 
+/* Utility CSS escapes its class names (`.w-\[20\%\]`, `.md\:flex`,
+   `.\31 0x`). Those rules are indexed under the decoded class or ID their
+   compound matcher requires, and `:is(.\*\*\:t-3 *)`-style rules carry the
+   ancestor class they require in their ancestor filter, so an element
+   tests about its own classes' rules rather than every escaped rule in the
+   sheet. Every element and pseudo-element must still resolve exactly as the
+   unindexed linear scan resolves it, through random class rewrites. */
+enum { ESCAPED_UTILITIES = 48, ESCAPED_ELEMENTS = 72 };
+
+static size_t escaped_utility_class_list(uint32_t *state, char *out,
+                                         size_t size, unsigned count)
+{
+    static const char *const shapes[] = {
+        "w-[%upx]", "md:p-%u", "hover:c-%u", "dark:c-%u", "1%ux", "x.y%u",
+        "before:c-%u", "**:t-%u", "*:p-%u", "[&_*]:m-%u",
+        "a-very-long-unescaped-utility-class-name-that-is-over-sixty-four-%u",
+        "dark", "plain-%u"
+    };
+    size_t used = 0;
+    out[0] = '\0';
+    for (unsigned i = 0; i < count; i++) {
+        unsigned shape = utility_next(state)
+            % (unsigned) (sizeof(shapes) / sizeof(shapes[0]));
+        char token[96];
+        snprintf(token, sizeof(token), shapes[shape],
+                 (unsigned) (utility_next(state) % ESCAPED_UTILITIES));
+        int written = snprintf(out + used, size - used, "%s%s",
+                               i == 0 ? "" : " ", token);
+        if (written <= 0 || (size_t) written >= size - used) break;
+        used += (size_t) written;
+    }
+    return used;
+}
+
+static int test_escaped_utility_classes_indexed(void)
+{
+    Budget budget;
+    budget_init(&budget, 48u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static char html[262144];
+    size_t length = 0;
+    int written = snprintf(html, sizeof(html),
+        "<!doctype html><style>*{letter-spacing:1px}"
+        ".a\\ b{color:#ff0000}.\\#{color:#00ff00}");
+    CHECK(written > 0);
+    length = (size_t) written;
+    for (unsigned i = 0; i < ESCAPED_UTILITIES; i++) {
+        unsigned v = (i * 2654435761u) % 23u + 1u;
+        written = snprintf(html + length, sizeof(html) - length,
+            ".w-\\[%upx\\]{padding-left:%upx}"
+            ".md\\:p-%u{padding-top:%upx}"
+            ".hover\\:c-%u:hover{color:#%06x}"
+            ".dark\\:c-%u:where(.dark,.dark *){color:#%06x}"
+            ".\\31 %ux{margin-left:%upx}"
+            ".x\\.y%u{word-spacing:%upx}"
+            "#id\\:%u{padding-bottom:%upx}"
+            ".before\\:c-%u::before{content:'b%u';color:#%06x}"
+            ":is(.\\*\\*\\:t-%u *){letter-spacing:%upx}"
+            ":is(.\\*\\:p-%u > *){padding-right:%upx}"
+            ".\\[\\&_\\*\\]\\:m-%u *{margin-top:%upx}"
+            ".a-very-long-unescaped-utility-class-name-that-is-over-sixty-"
+            "four-%u{opacity:0.5}"
+            ".plain-%u{display:flex}",
+            i, v, i, v + 1u, i, 0x010101u * v, i, 0x020202u * v, i, v,
+            i, v, i, v, i, i, 0x030303u * v, i, v, i, v, i, v, i, i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+    }
+    written = snprintf(html + length, sizeof(html) - length,
+                       "</style><body>");
+    CHECK(written > 0);
+    length += (size_t) written;
+    uint32_t state = 20261006u;
+    unsigned depth = 0;
+    for (unsigned i = 0; i < ESCAPED_ELEMENTS; i++) {
+        if (depth > 0 && utility_next(&state) % 3u == 0) {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+            depth--;
+        }
+        char classes[2048];
+        escaped_utility_class_list(&state, classes, sizeof(classes),
+                                   1u + utility_next(&state) % 12u);
+        written = snprintf(html + length, sizeof(html) - length,
+                           "<div id='id:%u' class='%s'>t%u",
+                           (unsigned) (utility_next(&state)
+                                       % ESCAPED_UTILITIES),
+                           classes, i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+        if (depth < 8 && utility_next(&state) % 2u == 0) {
+            depth++;
+        } else {
+            memcpy(html + length, "</div>", 6);
+            length += 6;
+        }
+    }
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, length, 19));
+    Stylesheet indexed = {0}, linear = {0};
+    CHECK(stylesheet_build(&indexed, &budget, &document, 480));
+    CHECK(setenv("TILEFINCH_DISABLE_STYLE_INDEX", "1", 1) == 0);
+    bool linear_built = stylesheet_build(&linear, &budget, &document, 480);
+    CHECK(unsetenv("TILEFINCH_DISABLE_STYLE_INDEX") == 0);
+    CHECK(linear_built);
+    linear.class_tokens_refused = true;
+    /* The escaped and long class/ID rules are indexed under their decoded
+       keys (eight per utility); only the two :is() forms and the
+       descendant-of-utility rule, whose subject is `*`, stay universal.
+       (`.\31 0x` is split at its escape's terminating space by the
+       existing combinator scan, string matcher included, so it keeps the
+       tag key that split gives it.) */
+    stylesheet_prepare_rule_index(&indexed);
+    CHECK(indexed.rule_index_ready);
+    CHECK(indexed.rule_index_derived_keys >= 8u * ESCAPED_UTILITIES);
+    CHECK(indexed.rule_index_universal_count <= 3u * ESCAPED_UTILITIES + 4u);
+    const StyleRule *ancestor_rule = find_rule(&indexed, ":is(.\\*\\*\\:t-3 *)");
+    CHECK(ancestor_rule != NULL && indexed.rule_filters != NULL);
+    StyleTokenBloom required = style_compound_token_bloom(
+        STYLE_SELECTOR_CLASS, "**:t-3", 6);
+    CHECK(!style_token_bloom_missing(
+        required, indexed.rule_filters[ancestor_rule - indexed.rules]
+                      .ancestors));
+    /* Universal-range rules also carry an exact ancestor token; more than
+       63 distinct tokens share mask bits. */
+    CHECK(indexed.rule_filters[ancestor_rule - indexed.rules].ancestor_token
+          != 0 && indexed.rule_ancestor_tokens != NULL
+          && indexed.rule_ancestor_tokens->count
+             > STYLE_RULE_ANCESTOR_TOKEN_BITS);
+    const StyleRule *program_rule = find_rule(&indexed, ".\\[\\&_\\*\\]\\:m-3 *");
+    CHECK(program_rule != NULL
+          && indexed.rule_filters[program_rule - indexed.rules].ancestor_token
+             != 0);
+    lxb_dom_node_t *body = document_body_node(&document);
+    CHECK(body != NULL);
+    StyleAncestorBloomCache ancestors;
+    size_t compared = 0;
+    for (unsigned round = 0; round < 12; round++) {
+        lxb_dom_node_t *elements[ESCAPED_ELEMENTS + 8];
+        size_t count = utility_elements(body, elements,
+                                        ESCAPED_ELEMENTS + 8);
+        uint64_t candidates = indexed.rule_index_candidates;
+        uint64_t rejected = indexed.rule_ancestor_filter_rejections;
+        CHECK(style_selector_cooperation_begin(
+            &indexed, cache_test_cooperate, NULL, &ancestors));
+        for (size_t i = 0; i < count; i++) {
+            ComputedStyle fast = style_for_node(&indexed, elements[i], NULL);
+            ComputedStyle slow = style_for_node(&linear, elements[i], NULL);
+            if (!utility_styles_equal(&fast, &slow)
+                || fast.margin.top != slow.margin.top
+                || fast.margin.bottom != slow.margin.bottom) {
+                printf("escaped round %u element %zu diverged\n", round, i);
+                CHECK(false);
+            }
+            for (PseudoElement pseudo = PSEUDO_BEFORE;
+                 pseudo <= PSEUDO_AFTER; pseudo++) {
+                ComputedStyle fast_pseudo = style_for_pseudo(
+                    &indexed, elements[i], pseudo, &fast);
+                ComputedStyle slow_pseudo = style_for_pseudo(
+                    &linear, elements[i], pseudo, &fast);
+                if (!utility_styles_equal(&fast_pseudo, &slow_pseudo)) {
+                    printf("escaped round %u element %zu pseudo %d "
+                           "diverged\n", round, i, (int) pseudo);
+                    CHECK(false);
+                }
+            }
+            compared++;
+        }
+        style_selector_cooperation_end(&indexed);
+        /* Each resolution (an element and its two pseudo-elements) sees
+           the universal range (the three subject-free rules per utility)
+           plus its own classes' few rules, not the escaped utilities, which
+           used to be candidates for every element (more than five hundred
+           of the sheet's six hundred rules). */
+        uint64_t used = indexed.rule_index_candidates - candidates;
+        if (used >= (uint64_t) count * 3u * (3u * ESCAPED_UTILITIES + 24u)) {
+            printf("escaped round %u: %llu candidates for %zu elements "
+                   "over %zu rules\n", round, (unsigned long long) used,
+                   count, indexed.count);
+            CHECK(false);
+        }
+        CHECK(indexed.rule_ancestor_filter_rejections > rejected);
+        for (unsigned change = 0; change < 8; change++) {
+            lxb_dom_node_t *node = elements[1u + utility_next(&state)
+                                            % (count - 1u)];
+            char classes[2048];
+            size_t new_length = escaped_utility_class_list(
+                &state, classes, sizeof(classes),
+                1u + utility_next(&state) % 12u);
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "class", 5,
+                (const lxb_char_t *) classes, new_length) != NULL);
+        }
+    }
+    CHECK(compared > 12u * 60u);
+    stylesheet_destroy(&linear);
+    stylesheet_destroy(&indexed);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* Prepared query lists keep the rightmost compound's first attribute: an
    element without it is rejected before the text matcher, and `[name]`
    alone is answered by the attribute. Random selectors over a random tree
@@ -2146,6 +2654,159 @@ static int test_full_selector_class_token_reuse(void)
     return 0;
 }
 
+/* Long class lists answer class tests from a token table; a one-bit
+   quick filter (length and end bytes) rejects absent names before
+   hashing them. It must never reject a present one. */
+static int test_class_token_quick_filter(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] =
+        "<!doctype html><p id=target class='container__item "
+        "container__item--type-media-image container_lead-plus-headlines__item "
+        "a b9 card-x zz'>x</p>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 18)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html),
+                                   "target");
+    CHECK(node != NULL);
+    StyleMatchSubject subject;
+    style_match_subject_prepare(node, &subject);
+    static const char *const present[] = {
+        "container__item", "container__item--type-media-image",
+        "container_lead-plus-headlines__item", "a", "b9", "card-x", "zz"
+    };
+    static const char *const absent[] = {
+        "container__items", "container__ite", "b", "card-y", "z",
+        "container_lead-plus-headlines__iten", "A", "card"
+    };
+    sheet.resolve_scratch->class_tokens_depth = 1;
+    for (size_t i = 0; i < sizeof(present) / sizeof(present[0]); i++)
+        CHECK(style_subject_has_class(&sheet, &subject, present[i],
+                                      strlen(present[i])));
+    for (size_t i = 0; i < sizeof(absent) / sizeof(absent[0]); i++)
+        CHECK(!style_subject_has_class(&sheet, &subject, absent[i],
+                                       strlen(absent[i])));
+    sheet.resolve_scratch->class_tokens_depth = 0;
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Compiled descendant and child walks reuse the subjects (tag, id,
+   classes) of the ancestors they visit within one resolution scope. Every
+   element of a nested document must match exactly as it does with the
+   walk preparing each subject afresh (outside any scope). */
+static int test_walk_subject_cache_matches_fresh(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char html[32768];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>.zone .stack>.card .title{color:red}"
+        ".zone>.stack .card>.title{background-color:blue}"
+        "section .card~.card .title{border-top:1px solid red}"
+        "#main .zone .card .title span{color:green}</style>"
+        "<section id=main>");
+    for (int z = 0; z < 6; z++) {
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<div class='zone z%d zone--with-a-long-modifier zone__wrapper'>"
+            "<div class='stack s%d stack--with-a-long-modifier stack__items'>",
+            z, z);
+        for (int c = 0; c < 8; c++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                "<div class='card c%d card--with-a-long-modifier container__item'>"
+                "<p class='title t%d title--with-a-long-modifier headline'>"
+                "<span>x</span></p></div>", c, c);
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "</div></div>");
+    }
+    used += (size_t) snprintf(html + used, sizeof(html) - used, "</section>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 21)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    stylesheet_prepare_rule_index(&sheet);
+    CHECK(sheet.selector_program_ready
+          && sheet.selector_program_rule_count == sheet.count);
+    size_t compared = 0, matched = 0;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    for (lxb_dom_node_t *node = root; node != NULL;) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            for (size_t rule = 0; rule < sheet.count; rule++) {
+                bool fresh = style_rule_selector_matches(&sheet, rule, node);
+                style_class_tokens_scope_begin(&sheet);
+                bool cached = style_rule_selector_matches(&sheet, rule, node);
+                bool again = style_rule_selector_matches(&sheet, rule, node);
+                style_class_tokens_scope_end(&sheet);
+                CHECK(fresh == cached && cached == again);
+                compared++;
+                matched += fresh ? 1u : 0u;
+            }
+        }
+        if (node->first_child != NULL) { node = node->first_child; continue; }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    CHECK(compared > 500u && matched > 50u && sheet.class_tokens != NULL);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A front page's sheet (CNN home: 11,700 rules, about 65,000 selector
+   instructions) must compile whole. The program was capped at 256 KiB
+   (59,678 instructions beside that many rule offsets), so the last 650 rules
+   in document order fell back to text matching, 37% of all selector calls
+   on that page. The cap now covers what the 16-bit offsets can address. */
+static int test_large_sheet_compiles_every_rule(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    size_t capacity = 1400u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = (size_t) snprintf(html, capacity, "<!doctype html><style>");
+    for (unsigned i = 0; i < 7800u && used < capacity - 200u; i++) {
+        used += (size_t) snprintf(
+            html + used, capacity - used,
+            ".zone-%u .stack-%u>.card-%u .title-%u{color:#123456}",
+            i, i, i, i);
+    }
+    used += (size_t) snprintf(html + used, capacity - used,
+                              "</style><p class=card-1>x</p>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 19)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    stylesheet_prepare_selector_program(&sheet);
+    printf("large sheet program: rules=%zu/%zu instructions=%zu bytes=%zu\n",
+           sheet.selector_program_rule_count, sheet.count,
+           sheet.selector_program_instruction_count,
+           sheet.selector_program_bytes);
+    /* More than the former 256 KiB cap held beside this many offsets. */
+    size_t former_cap = (256u * 1024u - sheet.count * sizeof(uint16_t))
+        / sizeof(StyleSelectorInstruction);
+    CHECK(sheet.count == 7800u && sheet.selector_program_ready
+          && sheet.selector_program_instruction_count > former_cap
+          && sheet.selector_program_rule_count == sheet.count
+          && sheet.selector_program_bytes <= 320u * 1024u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    free(html);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--retained-handoff-only") == 0)
@@ -2160,16 +2821,23 @@ int main(int argc, char **argv)
         return test_unmatched_declaration_footprint();
     if (argc == 2 && strcmp(argv[1], "--custom-footprint-only") == 0)
         return test_custom_rule_footprint();
+    if (argc == 2 && strcmp(argv[1], "--long-custom-only") == 0)
+        return test_long_custom_property_values();
+    if (argc == 2 && strcmp(argv[1], "--registered-only") == 0)
+        return test_registered_custom_properties();
     if (argc == 2 && strcmp(argv[1], "--attribute-names-only") == 0)
         return test_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--attribute-bench-only") == 0)
         return benchmark_selector_attribute_names();
+    if (argc == 2 && strcmp(argv[1], "--escaped-utilities-only") == 0)
+        return test_escaped_utility_classes_indexed();
     CHECK(test_selector_attribute_names() == 0);
     CHECK(benchmark_selector_attribute_names() == 0);
     CHECK(test_retained_range_cache_handoff() == 0);
     CHECK(test_class_token_byte_boundaries() == 0);
     CHECK(test_retained_properties_share_class_tokens() == 0);
     CHECK(test_utility_class_candidates_match_linear() == 0);
+    CHECK(test_escaped_utility_classes_indexed() == 0);
     CHECK(test_query_attribute_keys_match_direct() == 0);
     CHECK(test_query_deeply_nested_is_prepares_flat() == 0);
     CHECK(test_full_selector_class_token_reuse() == 0);
@@ -2191,7 +2859,12 @@ int main(int argc, char **argv)
     CHECK(test_head_script_dependency_cache() == 0);
     CHECK(test_unmatched_declaration_footprint() == 0);
     CHECK(test_custom_rule_footprint() == 0);
+    CHECK(test_long_custom_property_values() == 0);
+    CHECK(test_registered_custom_properties() == 0);
     CHECK(test_svg_raster_token_gate() == 0);
+    CHECK(test_large_sheet_compiles_every_rule() == 0);
+    CHECK(test_class_token_quick_filter() == 0);
+    CHECK(test_walk_subject_cache_matches_fresh() == 0);
     Budget budget;
     budget_init(&budget, 8u * MIB);
     budget_install_lexbor(&budget);
@@ -2342,7 +3015,7 @@ int main(int argc, char **argv)
           && indexed.rule_index_ready && indexed.rule_index_bytes != 0
           && indexed.selector_program_ready
           && indexed.selector_program_rule_count == indexed.count
-          && indexed.selector_program_bytes <= 256u * 1024u
+          && indexed.selector_program_bytes <= 320u * 1024u
           && indexed.selector_program_offsets != NULL
           && indexed.selector_program_offsets[secondary_rule_index]
                != UINT16_MAX

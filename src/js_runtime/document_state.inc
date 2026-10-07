@@ -284,9 +284,10 @@ static size_t script_runtime_current_limit(const ScriptRuntime *runtime)
     return limit;
 }
 
-/* Called by the allocator (no allocation, no JavaScript) when a request
-   would pass the limit. Grows in whole steps so the next allocations do not
-   each ask again, and only while the page Budget keeps its reserve. */
+/* Called by the allocator (no JavaScript, and no allocation except the
+   memory-rescue copy on refusal) when a request would pass the limit.
+   Grows in whole steps so the next allocations do not each ask again, and
+   only while the page Budget keeps its reserve. */
 size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
                               size_t limit)
 {
@@ -322,8 +323,13 @@ size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
         (void) budget_make_room(runtime->budget,
                                 runtime->heap_growth_reserve + step);
     size_t free_bytes = budget_remaining(runtime->budget);
-    if (free_bytes <= runtime->heap_growth_reserve) goto refuse;
-    size_t spare = free_bytes - runtime->heap_growth_reserve;
+    /* Headroom already granted under the current limit can still be drawn
+       from the Budget after the raise, so it is not spare: counting it let
+       the realm end up to one unused step below the page reserve. */
+    size_t granted = live < limit ? limit - live : 0;
+    if (free_bytes <= runtime->heap_growth_reserve
+        || free_bytes - runtime->heap_growth_reserve <= granted) goto refuse;
+    size_t spare = free_bytes - runtime->heap_growth_reserve - granted;
     reason = 3;
     if (step > spare) step = spare;
     if (step < needed || step > SIZE_MAX - runtime->base_memory_limit)
@@ -339,6 +345,10 @@ refuse:
     runtime->heap_growth_refusals++;
     runtime->heap_growth_refused_bytes = needed;
     runtime->heap_growth_refused_reason = reason;
+    /* The one exception to "no allocation" here: a bounded copy of the body
+       from the page Budget (never the QuickJS heap), at most a few times
+       per realm. */
+    js_rt_memory_rescue_capture(runtime);
     return 0;
 }
 
@@ -358,9 +368,11 @@ static void script_runtime_heap_pregrow(ScriptRuntime *runtime, size_t want)
         want = runtime->heap_growth_ceiling;
     if (want <= limit) return;
     size_t free_bytes = budget_remaining(runtime->budget);
-    if (free_bytes <= runtime->heap_growth_reserve) return;
+    size_t granted = script_runtime_heap_remaining(runtime);
+    if (free_bytes <= runtime->heap_growth_reserve
+        || free_bytes - runtime->heap_growth_reserve <= granted) return;
     size_t step = want - limit;
-    size_t spare = free_bytes - runtime->heap_growth_reserve;
+    size_t spare = free_bytes - runtime->heap_growth_reserve - granted;
     if (step > spare) step = spare - spare % SCRIPT_HEAP_GROWTH_STEP;
     if (step < SCRIPT_HEAP_GROWTH_STEP) return;
     runtime->base_memory_limit += step;
@@ -370,6 +382,165 @@ static void script_runtime_heap_pregrow(ScriptRuntime *runtime, size_t want)
     if (raised > runtime->heap_growth_peak_limit)
         runtime->heap_growth_peak_limit = raised;
     JS_SetMemoryLimit(runtime->runtime, raised);
+}
+
+/* The automatic-collection growth percentage knob
+   (TILEFINCH_JS_GC_GROWTH_PCT, which the PSP app exports from boot.cfg),
+   read once for the process: -1 when unset, otherwise at least 0. Every
+   reader (the pacing hook, the threshold re-arm, growth returns and
+   deterministic replay) goes through here. */
+static long js_rt_gc_growth_knob(void)
+{
+    static bool resolved;
+    static long knob;
+    if (!resolved) {
+        const char *value = getenv("TILEFINCH_JS_GC_GROWTH_PCT");
+        knob = value == NULL ? -1 : atol(value);
+        if (value != NULL && knob < 0) knob = 0;
+        resolved = true;
+    }
+    return knob;
+}
+
+/* QuickJS's unconstrained threshold growth can reach a realm's hard
+   ceiling before collecting dead cyclic browser state. A 125% live-heap
+   threshold remains logarithmic while there is room, then the reserve
+   clamp (runtime_apply_gc_slack) leaves ordinary event construction
+   headroom. 0 leaves QuickJS's own pacing. */
+#define SCRIPT_GC_DEFAULT_GROWTH_PCT 125
+static long js_rt_gc_growth_pct(void)
+{
+    long knob = js_rt_gc_growth_knob();
+    return knob < 0 ? SCRIPT_GC_DEFAULT_GROWTH_PCT : knob;
+}
+
+/* Lab: a fixed GC-threshold slack in KiB (TILEFINCH_JS_GC_SLACK_KB),
+   0 when unset. */
+static long js_rt_gc_slack_kb(void)
+{
+    static bool resolved;
+    static long slack_kb;
+    if (!resolved) {
+        const char *value = tilefinch_lab_getenv("TILEFINCH_JS_GC_SLACK_KB");
+        slack_kb = value == NULL ? 0 : atol(value);
+        if (slack_kb < 0) slack_kb = 0;
+        resolved = true;
+    }
+    return slack_kb;
+}
+
+/* A full collection marks the whole live graph, so it pays for itself only
+   after enough allocation: at least a sixteenth of the live heap (and 256
+   KiB). Less than that between collections is collection thrash. */
+#define SCRIPT_GC_AMORTIZED_MINIMUM (256u * 1024u)
+/* Starved automatic collections (less than an amortized step of headroom
+   left below the limit) that also freed little, per advance and stage, in
+   a realm that cannot grow: first at QuickJS's own spacing, then only at
+   exhaustion, then not at all until the next advance, when the refusal
+   reports exhaustion. A starved collection that frees a useful amount
+   (garbage churn near the limit) is progress and resets the count. */
+#define SCRIPT_GC_STARVED_STAGE 8u
+#define SCRIPT_GC_INEFFECTIVE_MINIMUM (64u * 1024u)
+
+/* Lab A/B switch: TILEFINCH_JS_GC_PACING=0 restores the collection
+   behavior before amortized pacing (QuickJS's threshold re-arm and the
+   pressure collections before every compile). */
+static bool js_rt_gc_pacing_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *value = tilefinch_lab_getenv("TILEFINCH_JS_GC_PACING");
+        disabled = value != NULL && strcmp(value, "0") == 0;
+    }
+    return disabled != 0;
+}
+
+size_t js_rt_gc_amortized_step(size_t live)
+{
+    size_t step = live / 16u;
+    return step < SCRIPT_GC_AMORTIZED_MINIMUM ? SCRIPT_GC_AMORTIZED_MINIMUM
+                                              : step;
+}
+
+bool js_rt_gc_due(const ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->heap_collections == 0
+        || js_rt_gc_pacing_disabled()) return true;
+    size_t now = script_runtime_heap_used(runtime);
+    size_t after = runtime->heap_live_after_gc;
+    return now > after && now - after >= js_rt_gc_amortized_step(after);
+}
+
+/* After every collection the allocation threshold runs (JS_SetGCPacingHook).
+   QuickJS re-arms at half the remaining headroom, so as live data
+   approaches the limit (a growable realm's limit rises only 512 KiB at a
+   time, when an allocation fails it) the heap is collected every few
+   hundred KiB, each time a full mark of 10-16 MB that frees nothing
+   (xe.com on the PSP: 165 collections, 25.6 s of one 27.7 s task).
+
+   QuickJS's spacing stands while it leaves an amortized step (a sixteenth
+   of the live heap). Below that the heap is starved. Where collections
+   still free garbage (churn), keep QuickJS's spacing: collecting early is
+   what keeps that garbage under the limit. Where they free almost nothing
+   (live data growing toward the limit), collecting early is pure cost: a
+   realm that can still grow collects once per growth step instead of a
+   dozen times; a realm that cannot stops collecting for the rest of the
+   advance after a bounded number, so a heap that truly cannot fit reaches
+   the allocation refusal (and memory rescue) promptly instead of
+   thrashing. The limit itself is never raised here: growth stays on
+   demand, under the page reserve. */
+static size_t js_rt_gc_pacing(void *opaque, size_t live, size_t limit,
+                              size_t proposed)
+{
+    ScriptRuntime *runtime = opaque;
+    if (runtime == NULL || js_rt_gc_growth_pct() == 0
+        || js_rt_gc_pacing_disabled())
+        return proposed;
+    /* QuickJS's own re-arm (half the live heap, or half the remaining
+       headroom near the limit) stands while it leaves an amortized step,
+       and always far from the limit (a small heap early in startup). */
+    if ((proposed > live && proposed - live >= js_rt_gc_amortized_step(live))
+        || (live < limit && live <= limit - live)) {
+        runtime->gc_task_starved = 0;
+        return proposed;
+    }
+    runtime->gc_pacing_starved++;
+    /* Growable: the limit can still take a whole growth step, and has not
+       refused one this advance. */
+    size_t available = script_runtime_heap_available(runtime);
+    size_t remaining = script_runtime_heap_remaining(runtime);
+    bool growable = runtime->heap_growth_enabled
+        && available > remaining
+        && available - remaining >= SCRIPT_HEAP_GROWTH_STEP
+        && runtime->heap_growth_refusals == runtime->gc_advance_refusals;
+    size_t freed = runtime->gc_live_before > live
+        ? runtime->gc_live_before - live : 0;
+    size_t ineffective = live / 64u < SCRIPT_GC_INEFFECTIVE_MINIMUM
+        ? SCRIPT_GC_INEFFECTIVE_MINIMUM : live / 64u;
+    /* Churn: collecting early is what keeps the garbage out of the
+       limit. Keep QuickJS's spacing. */
+    if (freed >= ineffective) {
+        runtime->gc_task_starved = 0;
+        return proposed;
+    }
+    runtime->gc_task_starved++;
+    /* A realm that can still grow collects next one growth step past its
+       current limit: the step is granted on demand (the check above), and
+       a collection then comes before the step after it, so garbage never
+       buys more than one step of limit and a refused step is not preceded
+       by a pointless collection. (A threshold at the limit itself fired at
+       every object allocation once live data sat a few bytes below it.) */
+    if (growable)
+        return limit > SIZE_MAX - SCRIPT_HEAP_GROWTH_STEP
+            ? SIZE_MAX : limit + SCRIPT_HEAP_GROWTH_STEP;
+    /* JS_SetGCThreshold semantics: a threshold at the limit collects only
+       when an object allocation would otherwise not fit. */
+    if (runtime->gc_task_starved <= SCRIPT_GC_STARVED_STAGE) return proposed;
+    if (runtime->gc_task_starved == SCRIPT_GC_STARVED_STAGE + 1u)
+        runtime->gc_pacing_backoffs++;
+    if (runtime->gc_task_starved <= 2u * SCRIPT_GC_STARVED_STAGE)
+        return limit;
+    return SIZE_MAX;
 }
 
 void script_runtime_enable_heap_growth(ScriptRuntime *runtime,
@@ -420,6 +591,18 @@ void script_runtime_heap_growth(const ScriptRuntime *runtime,
     growth->refused_bytes = runtime->heap_growth_refused_bytes;
     growth->refused_reason = runtime->heap_growth_refused_reason;
     growth->reentrant_checkpoints = runtime->reentrant_checkpoints_skipped;
+    growth->collections = runtime->heap_collections;
+    growth->threshold_collections = runtime->gc_threshold_collections;
+    growth->max_advance_collections = runtime->gc_advance_collections_max;
+    size_t open_advance = runtime->heap_collections
+        - runtime->gc_advance_collections_begin;
+    if (open_advance > growth->max_advance_collections)
+        growth->max_advance_collections = open_advance;
+    growth->max_checkpoint_collections =
+        runtime->gc_checkpoint_collections_max;
+    growth->pacing_starved = runtime->gc_pacing_starved;
+    growth->pacing_backoffs = runtime->gc_pacing_backoffs;
+    growth->collection_us = runtime->gc_total_ns / UINT64_C(1000);
 #if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime->runtime != NULL) {
         JSLazyFunctionStats stats;
@@ -474,8 +657,12 @@ void script_runtime_lazy_function_counts(const ScriptRuntime *runtime,
 
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime)
 {
-    return runtime == NULL
-        ? 0 : budget_quickjs_pool_rejection_count(runtime->quickjs_pool);
+    if (runtime == NULL) return 0;
+    /* Rejections inside a compile that was abandoned as a memory refusal
+       left the realm intact; they are not exhaustion. */
+    size_t count = budget_quickjs_pool_rejection_count(runtime->quickjs_pool);
+    return count > runtime->compile_heap_rejections_absorbed
+        ? count - runtime->compile_heap_rejections_absorbed : 0;
 }
 
 bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime)
@@ -487,7 +674,7 @@ size_t script_runtime_inline_execution_reserve(
     const ScriptRuntime *runtime, size_t source_length)
 {
     if (runtime == NULL || runtime->runtime == NULL) return 0;
-    const uint64_t minimum = 512u * 1024u;
+    const uint64_t minimum = SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES;
     const uint64_t maximum = 2u * 1024u * 1024u;
     const uint64_t qualified_minimum = 4u * 1024u * 1024u;
     uint64_t limit = runtime->base_memory_limit;

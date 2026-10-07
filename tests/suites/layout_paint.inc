@@ -108,6 +108,16 @@ static int test_linear_gradient_parse(Budget *budget)
         "background:radial-gradient(circle,#000,#fff)}"
         "#interpolated{background:linear-gradient(in oklab,"
         "lab(50% 40 30),color-mix(in srgb,#2468ac 75%,transparent))}"
+        /* Tailwind v4's `to <side> in oklab` and the method on either side
+           of the direction; a dangling method is still rejected. */
+        "#interpolated-side{background:linear-gradient(to left in oklab,"
+        "#000,#fff)}"
+        "#interpolated-hue{background:linear-gradient("
+        "in oklch longer hue 0.25turn,#000,#fff)}"
+        "#interpolated-radial{background:radial-gradient(circle in oklab,"
+        "#000,#fff)}"
+        "#dangling{background:#0a0b0c;"
+        "background:linear-gradient(to left in,#000,#fff)}"
         "#inherited{background-image:inherit}"
         "</style><body>"
         "<i id=down></i><i id=right></i><i id=corner></i><i id=angled></i>"
@@ -116,6 +126,8 @@ static int test_linear_gradient_parse(Budget *budget)
         "<i id=capped></i><i id=repeating></i>"
         "<i id=turned></i><i id=lonely></i><i id=hinted></i>"
         "<i id=spaced></i><i id=radial></i><i id=interpolated></i>"
+        "<i id=interpolated-side></i><i id=interpolated-hue></i>"
+        "<i id=interpolated-radial></i><i id=dangling></i>"
         "<i id=inherit-parent style='background-image:linear-gradient("
         "to right,#123456,#abcdef)'><b id=inherited></b></i></body>";
     PocDocument document = {0};
@@ -211,6 +223,17 @@ static int test_linear_gradient_parse(Budget *budget)
              == STYLE_BACKGROUND_IMAGE_GRADIENT
           && interpolated->stop_count == 2
           && (interpolated->stop_argb[1] >> 24) == 191);
+    const StyleGradient *interpolated_side = GRADIENT_OF("interpolated-side");
+    const StyleGradient *interpolated_hue = GRADIENT_OF("interpolated-hue");
+    const StyleGradient *interpolated_radial =
+        GRADIENT_OF("interpolated-radial");
+    CHECK(interpolated_side != NULL && interpolated_hue != NULL
+          && interpolated_radial != NULL
+          && (interpolated_side->angle & STYLE_GRADIENT_ANGLE_MASK) == 270
+          && interpolated_side->stop_argb[0] == 0xff000000u
+          && (interpolated_hue->angle & STYLE_GRADIENT_ANGLE_MASK) == 90
+          && (interpolated_radial->angle
+              & STYLE_GRADIENT_RADIAL_CIRCLE) != 0);
     ComputedStyle inherit_parent = style_for_node(
         &sheet, find_id(root, "inherit-parent"), NULL);
     ComputedStyle inherited = style_for_node(
@@ -232,8 +255,35 @@ static int test_linear_gradient_parse(Budget *budget)
                             &modern_color, &modern_alpha)
           && modern_alpha == 255
           && modern_color != 0xff0000 && modern_color != 0x0000ff);
+    /* color-mix() takes the same interpolation methods as a gradient
+       header: oklch (Tailwind v4) and a hue method parse, and XYZ mixes
+       exactly as linear sRGB; an unknown space is still invalid. */
+    static const char *const mixes[] = {
+        "color-mix(in oklch, red, blue)",
+        "color-mix(in oklch longer hue, red 25%, blue)",
+        "color-mix(in xyz, red, blue)",
+        "color-mix(in srgb-linear, red, blue)"
+    };
+    uint32_t mixed[4] = {0};
+    for (size_t i = 0; i < sizeof(mixes) / sizeof(mixes[0]); i++) {
+        uint8_t mixed_alpha = 0;
+        CHECK(style_color_parse(mixes[i], strlen(mixes[i]), &mixed[i],
+                                &mixed_alpha)
+              && mixed_alpha == 255 && mixed[i] != 0xff0000
+              && mixed[i] != 0x0000ff);
+    }
+    CHECK(mixed[2] == mixed[3]);
+    static const char *const bad_mixes[] = {
+        "color-mix(in nowhere, red, blue)",
+        "color-mix(in oklab longer hue, red, blue)",
+        "color-mix(in, red, blue)"
+    };
+    for (size_t i = 0; i < sizeof(bad_mixes) / sizeof(bad_mixes[0]); i++) {
+        CHECK(!style_color_parse(bad_mixes[i], strlen(bad_mixes[i]),
+                                 &modern_color, &modern_alpha));
+    }
 
-    static const char *const rejected[] = {"lonely", "hinted"};
+    static const char *const rejected[] = {"lonely", "hinted", "dangling"};
     for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
         ComputedStyle style = style_for_node(
             &sheet, find_id(root, rejected[i]), NULL);
@@ -1251,13 +1301,20 @@ static int test_box_shadow_parse(Budget *budget)
         "#onelength{box-shadow:1px 1px #000;box-shadow:4px #f00}"
         "#negblur{box-shadow:1px 1px #000;box-shadow:1px 1px -5px #f00}"
         "#twocolors{box-shadow:1px 1px #000;box-shadow:1px 1px #f00 #0f0}"
+        /* Tailwind v4's shadow-md: four transparent `0 0 #0000` layers
+           take no slot, so the two visible ones fit; an all-transparent
+           value is a valid "no shadow" that overrides the earlier one. */
+        "#tailwind{box-shadow:0 0 #0000,0 0 #0000,0 0 #0000,0 0 #0000,"
+        "0 4px 6px -1px #0000001a,0 2px 4px -2px #0000001a}"
+        "#transparent{box-shadow:1px 1px #000;box-shadow:0 0 #0000}"
         "</style><body>"
         "<i id=plain></i><i id=blurred></i><i id=full></i>"
         "<i id=negative></i><i id=leading></i><i id=stacked></i>"
         "<i id=insetting></i><i id=none></i><i id=hostile></i>"
         "<i id=overcap></i><i id=emunit></i><i id=percent></i>"
         "<i id=unitless></i><i id=onelength></i><i id=negblur></i>"
-        "<i id=twocolors></i></body>";
+        "<i id=twocolors></i><i id=tailwind></i><i id=transparent></i>"
+        "</body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     CHECK(document_parse(&document, budget, page, strlen(page), 31)
@@ -1326,6 +1383,14 @@ static int test_box_shadow_parse(Budget *budget)
 
     ComputedStyle no_shadow = SHADOW_OF("none");
     CHECK(SHADOW_COUNT(no_shadow) == 0);
+
+    ComputedStyle tailwind = SHADOW_OF("tailwind");
+    const StyleBoxShadow *tailwind_first = SHADOW_AT(tailwind, 0);
+    CHECK(SHADOW_COUNT(tailwind) == 2 && tailwind_first != NULL
+          && tailwind_first->offset_y == 4 && tailwind_first->spread == -1
+          && tailwind_first->argb == 0x1a000000u);
+    ComputedStyle transparent = SHADOW_OF("transparent");
+    CHECK(SHADOW_COUNT(transparent) == 0);
 
     ComputedStyle hostile = SHADOW_OF("hostile");
     const StyleBoxShadow *hostile_shadow = SHADOW_AT(hostile, 0);
@@ -1734,6 +1799,180 @@ static int test_per_corner_border_radius(Budget *budget)
           && frame[19u * FRAME_WIDTH] != page_background
           && frame[19u * FRAME_WIDTH + 19u] != page_background
           && frame[10u * FRAME_WIDTH + 10u] != page_background);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Tailwind v4 composes its gradient stops and shadow stacks in custom
+   properties longer than the former 96-byte value cap: xe.com's header
+   (`from-blue-850 bg-linear-to-l to-blue-700`) carries a 160-byte
+   --tw-gradient-stops, and a dropped declaration left the strip white.
+   Both the gradient and a var()-composed shadow stack must paint. */
+static int test_long_custom_property_paint(Budget *budget)
+{
+    enum { FRAME_WIDTH = 64, FRAME_HEIGHT = 64 };
+#define TW_STOPS "var(--tw-gradient-via-stops,var(--tw-gradient-position)," \
+    "var(--tw-gradient-from) var(--tw-gradient-from-position)," \
+    "var(--tw-gradient-to) var(--tw-gradient-to-position))"
+    static const char page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0;background:#fff}"
+        "*,:before,:after{--tw-gradient-position:initial;"
+        "--tw-gradient-from:#0000;--tw-gradient-via:#0000;"
+        "--tw-gradient-to:#0000;--tw-gradient-stops:initial;"
+        "--tw-gradient-via-stops:initial;--tw-gradient-from-position:0%;"
+        "--tw-gradient-via-position:50%;--tw-gradient-to-position:100%}"
+        ":root{--color-red:#ff0000;--color-blue:#0000ff}"
+        ".bg-linear-to-r{--tw-gradient-position:to right in oklab;"
+        "background-image:linear-gradient(var(--tw-gradient-stops))}"
+        ".from-red{--tw-gradient-from:var(--color-red);"
+        "--tw-gradient-stops:" TW_STOPS "}"
+        ".to-blue{--tw-gradient-to:var(--color-blue);"
+        "--tw-gradient-stops:" TW_STOPS "}"
+        "#ramp{position:absolute;left:0;top:0;width:32px;height:16px}"
+        ".card-shadow{--card-shadow:0 0 8px 0 var(--shadow-color,#000000),"
+        "0 0 4px 0 var(--shadow-color,#000000),"
+        "0 0 2px 0 var(--shadow-color,#000000);"
+        "box-shadow:var(--card-shadow)}"
+        "#card{position:absolute;left:16px;top:32px;width:32px;height:16px;"
+        "background:#fff}"
+        "</style><body>"
+        "<div id=ramp class='from-red bg-linear-to-r to-blue'></div>"
+        "<div id=card class=card-shadow></div></body>";
+#undef TW_STOPS
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    CHECK(document_parse(&document, budget, page, strlen(page), 13)
+          && stylesheet_build(&sheet, budget, &document, FRAME_WIDTH)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, FRAME_WIDTH));
+    frame = budget_malloc(
+        budget, FRAME_WIDTH * FRAME_HEIGHT * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, FRAME_WIDTH * FRAME_HEIGHT)
+          && tile_cache_render_frame(&cache, 0, FRAME_WIDTH, FRAME_HEIGHT,
+                                     NULL));
+    /* The ramp runs red to blue left to right. */
+    unsigned red[3], blue[3];
+    int columns[3] = {1, 16, 30};
+    for (int i = 0; i < 3; i++) {
+        uint16_t pixel = frame[(size_t) 8 * FRAME_WIDTH + columns[i]];
+        red[i] = (pixel >> 11) & 0x1fu;
+        blue[i] = pixel & 0x1fu;
+    }
+    bool ramp = red[0] > red[1] && red[1] > red[2] && blue[0] < blue[1]
+        && blue[1] < blue[2] && red[0] > 24 && blue[2] > 24;
+    /* The shadow stack darkens the ground beside the card and fades
+       outward; the card itself stays white. */
+#define LUMA(x, y) ((unsigned) ((frame[(size_t) (y) * FRAME_WIDTH + (x)] >> 11) \
+                                & 0x1fu))
+    unsigned edge = LUMA(15, 40), far = LUMA(10, 40), clear = LUMA(2, 40);
+    bool shadow = edge < far && far <= clear && clear == 31u && edge < 24u
+        && LUMA(32, 40) == 31u;
+#undef LUMA
+    if (!ramp || !shadow) {
+        fprintf(stderr, "long custom gradient r=%u/%u/%u b=%u/%u/%u "
+                "shadow=%u/%u/%u\n", red[0], red[1], red[2], blue[0],
+                blue[1], blue[2], edge, far, clear);
+    }
+    CHECK(ramp);
+    CHECK(shadow);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* xe.com's header exactly as Tailwind v4 ships it: the --tw-* defaults
+   come only from @property registrations (the universal reset block sits
+   behind an @supports query this engine, like Chromium, answers false),
+   the position switches to `to left in oklab` behind a gradient-
+   interpolation @supports, and the stops are a 160-byte value. */
+static int test_registered_property_gradient_paint(Budget *budget)
+{
+    enum { FRAME_WIDTH = 64, FRAME_HEIGHT = 16 };
+#define TW_STOPS "var(--tw-gradient-via-stops,var(--tw-gradient-position)," \
+    "var(--tw-gradient-from) var(--tw-gradient-from-position)," \
+    "var(--tw-gradient-to) var(--tw-gradient-to-position))"
+    static const char page[] =
+        "<!doctype html><style>"
+        "@layer properties{@supports (((-webkit-hyphens:none)) and "
+        "(not (margin-trim:inline))) or ((-moz-orient:inline) and "
+        "(not (color:rgb(from red r g b)))){*,::backdrop,:after,:before{"
+        "--tw-gradient-position:initial;--tw-gradient-from:#0000;"
+        "--tw-gradient-via:#0000;--tw-gradient-to:#0000;"
+        "--tw-gradient-stops:initial;--tw-gradient-via-stops:initial;"
+        "--tw-gradient-from-position:0%;--tw-gradient-via-position:50%;"
+        "--tw-gradient-to-position:100%}}}"
+        "html,body{margin:0;padding:0;background:#fff}"
+        ":root{--color-red:#ff0000;--color-blue:#0000ff}"
+        ".bg-linear-to-l{--tw-gradient-position:to left}"
+        "@supports (background-image:linear-gradient(in lab,red,red)){"
+        ".bg-linear-to-l{--tw-gradient-position:to left in oklab}}"
+        ".bg-linear-to-l{background-image:linear-gradient("
+        "var(--tw-gradient-stops))}"
+        ".from-red{--tw-gradient-from:var(--color-red);"
+        "--tw-gradient-stops:" TW_STOPS "}"
+        ".to-blue{--tw-gradient-to:var(--color-blue);"
+        "--tw-gradient-stops:" TW_STOPS "}"
+        "#ramp{width:64px;height:16px}"
+        "@property --tw-gradient-position{syntax:\"*\";inherits:false}"
+        "@property --tw-gradient-from{syntax:\"<color>\";inherits:false;"
+        "initial-value:#0000}"
+        "@property --tw-gradient-via{syntax:\"<color>\";inherits:false;"
+        "initial-value:#0000}"
+        "@property --tw-gradient-to{syntax:\"<color>\";inherits:false;"
+        "initial-value:#0000}"
+        "@property --tw-gradient-stops{syntax:\"*\";inherits:false}"
+        "@property --tw-gradient-via-stops{syntax:\"*\";inherits:false}"
+        "@property --tw-gradient-from-position{"
+        "syntax:\"<length-percentage>\";inherits:false;initial-value:0%}"
+        "@property --tw-gradient-via-position{"
+        "syntax:\"<length-percentage>\";inherits:false;initial-value:50%}"
+        "@property --tw-gradient-to-position{"
+        "syntax:\"<length-percentage>\";inherits:false;initial-value:100%}"
+        "</style><body><div class=from-red>"
+        "<div id=ramp class='bg-linear-to-l to-blue'></div></div></body>";
+#undef TW_STOPS
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    CHECK(document_parse(&document, budget, page, strlen(page), 13)
+          && stylesheet_build(&sheet, budget, &document, FRAME_WIDTH)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, FRAME_WIDTH));
+    frame = budget_malloc(
+        budget, FRAME_WIDTH * FRAME_HEIGHT * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, FRAME_WIDTH * FRAME_HEIGHT)
+          && tile_cache_render_frame(&cache, 0, FRAME_WIDTH, FRAME_HEIGHT,
+                                     NULL));
+    /* The ramp's own --tw-gradient-from is the registered transparent
+       initial value (the parent's red does not inherit), so it runs from
+       transparent at the right edge to blue at the left. */
+    uint16_t left = frame[(size_t) 8 * FRAME_WIDTH + 1];
+    uint16_t right = frame[(size_t) 8 * FRAME_WIDTH + 62];
+    unsigned left_blue = left & 0x1fu, left_red = (left >> 11) & 0x1fu;
+    unsigned right_blue = right & 0x1fu, right_red = (right >> 11) & 0x1fu;
+    bool ramp = left_blue > 24 && left_red < 8
+        && right_red >= 28 && right_blue >= 28;
+    if (!ramp) {
+        fprintf(stderr, "registered gradient left=%04x right=%04x\n",
+                left, right);
+    }
+    CHECK(ramp);
     tile_cache_destroy(&cache);
     budget_free(budget, frame);
     layout_destroy(&layout);

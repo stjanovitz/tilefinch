@@ -208,22 +208,16 @@ static void grid_distribute_intrinsic_extra(
 static void grid_seed_definite_auto_row_contributions(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *container_style, LayoutBlockScratch *scratch,
-    FlexOrderPlan *grid_order, int columns, int placement_rows,
-    int grid_column_origin, int grid_row_origin, int explicit_grid_columns,
-    int explicit_grid_rows, int declared_grid_rows,
+    FlexOrderPlan *grid_order, const GridPlacementState *placement_template,
+    int placement_rows, int grid_row_origin, int explicit_grid_rows,
+    int declared_grid_rows,
     uint16_t second_implicit_row, int content_width,
     int containing_height, int *row_track_heights, int *fixed_space)
 {
     if (context == NULL || node == NULL || container_style == NULL
-        || scratch == NULL || grid_order == NULL
+        || scratch == NULL || grid_order == NULL || placement_template == NULL
         || row_track_heights == NULL || fixed_space == NULL) return;
-    GridPlacementState placement;
-    grid_placement_init(
-        &placement, columns, placement_rows, container_style);
-    placement.explicit_columns = (uint8_t) explicit_grid_columns;
-    placement.explicit_rows = (uint8_t) explicit_grid_rows;
-    placement.column_origin = (uint8_t) grid_column_origin;
-    placement.row_origin = (uint8_t) grid_row_origin;
+    GridPlacementState placement = *placement_template;
     FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
     FlatItem *item = &scratch->traversal.flex.item;
     flex_iterator_init(
@@ -276,6 +270,69 @@ typedef struct {
 } GridReshareItem;
 
 #define GRID_RESHARE_ITEM_LIMIT 32
+
+/* A row-spanning, end/center-aligned item whose rows were not yet final
+   when it was laid out. */
+typedef struct {
+    lxb_dom_node_t *node;
+    int row;
+    int span;
+    int offset;
+    int height;
+    bool center;
+} GridSpanAlignItem;
+
+#define GRID_SPAN_ALIGN_LIMIT 8
+
+/* A laid-out grid item's row and the start of its output ranges. Kept only
+   for grids whose items can arrive out of row order (items with definite
+   rows are placed before auto-placed ones, CSS Grid 8.5), so a row that
+   grows after a later row already holds content can move that content. */
+typedef struct {
+    int row;
+    size_t command_start;
+    size_t link_start;
+    size_t control_start;
+    size_t box_start;
+} GridLaidItem;
+
+typedef struct {
+    GridLaidItem *items;
+    size_t count;
+    size_t capacity;
+} GridLaidItems;
+
+static void grid_laid_items_release(LayoutContext *context,
+                                    GridLaidItems *laid)
+{
+    if (laid->items != NULL) budget_free(context->layout->budget, laid->items);
+    *laid = (GridLaidItems) {0};
+}
+
+/* Row `grown_row` grew by `grown` after items in later rows were laid out:
+   move exactly those items' output down. Each translation runs to the end
+   of the output arrays, so walk the items in layout order and apply the
+   change in the required cumulative offset at each item's start. Returns
+   false when the record is incomplete (the caller keeps later rows fixed,
+   as before). */
+static bool grid_shift_later_rows(LayoutContext *context,
+                                  const GridLaidItems *laid,
+                                  int grown_row, int grown)
+{
+    if (laid->items == NULL || grown == 0) return false;
+    int applied = 0;
+    for (size_t i = 0; i < laid->count; i++) {
+        const GridLaidItem *item = &laid->items[i];
+        int needed = item->row > grown_row ? grown : 0;
+        if (needed == applied) continue;
+        layout_translate_range(
+            context->layout, item->command_start, item->link_start,
+            item->control_start, item->box_start, 0, needed - applied,
+            "grid-row-growth", NULL);
+        applied = needed;
+    }
+    return true;
+}
 
 /*
  * Rows are sized before content-sized rows are measured (only items with a
@@ -461,6 +518,7 @@ bool layout_block_grid_section(LayoutContext *context,
     bool grid = frame->grid;
     size_t grid_children = 0;
     size_t grid_positioned_children = 0;
+    size_t grid_locked_children = 0;
     const LayoutAssignedGridTracks *inherited_grid =
         context->assigned_grid_tracks.node == node
         ? &context->assigned_grid_tracks : NULL;
@@ -517,6 +575,9 @@ bool layout_block_grid_section(LayoutContext *context,
                 continue;
             }
             grid_children++;
+            if (grid_item_locked_to_major_axis(&item->style, style)) {
+                grid_locked_children++;
+            }
             grid_axis_extent(
                 computed_style_grid_column_start(&item->style),
                 computed_style_grid_column_end(&item->style),
@@ -674,15 +735,27 @@ bool layout_block_grid_section(LayoutContext *context,
                 track_widths[column] = track_floors[column];
             }
         }
-        GridPlacementState measured_placement;
-        grid_placement_init(&measured_placement, columns, placement_rows,
+        /* Every placement pass below starts from the same state: the
+           explicit grid plus, when any item is locked to a major-axis
+           track, the areas CSS Grid 8.5 places before auto-placement. */
+        GridPlacementState placement_template;
+        grid_placement_init(&placement_template, columns, placement_rows,
                             style);
-        measured_placement.explicit_columns =
+        placement_template.explicit_columns =
             (uint8_t) explicit_grid_columns;
-        measured_placement.explicit_rows = (uint8_t) explicit_grid_rows;
-        measured_placement.column_origin =
-            (uint8_t) grid_column_origin;
-        measured_placement.row_origin = (uint8_t) grid_row_origin;
+        placement_template.explicit_rows = (uint8_t) explicit_grid_rows;
+        placement_template.column_origin = (uint8_t) grid_column_origin;
+        placement_template.row_origin = (uint8_t) grid_row_origin;
+        if (grid_locked_children != 0
+            && !grid_placement_reserve(
+                   &placement_template, context, node, style, grid_order,
+                   grid_resolve_item_placement,
+                   &scratch->traversal.flex.iterator,
+                   &scratch->traversal.flex.item)) {
+            flex_order_plan_destroy(grid_order);
+            return false;
+        }
+        GridPlacementState measured_placement = placement_template;
         FlexItemIterator *measurement =
             &scratch->traversal.flex.iterator;
         FlatItem *measured_item = &scratch->traversal.flex.item;
@@ -1012,8 +1085,11 @@ bool layout_block_grid_section(LayoutContext *context,
         }
         int track_cursor = content_x + leading_space;
         for (int column = 0; column < columns; column++) {
+            /* An authored 0px or 0fr track stays empty: Guardian's grids
+               bracket their content with `0px` edge tracks. */
             if (track_widths[column] < 1
-                && !(track_types[column] == GRID_TRACK_FLEX
+                && !((track_types[column] == GRID_TRACK_FLEX
+                      || track_types[column] == GRID_TRACK_FIXED)
                      && track_values[column] == 0)) {
                 track_widths[column] = 1;
             }
@@ -1110,9 +1186,8 @@ bool layout_block_grid_section(LayoutContext *context,
             if (flex_track_space_definite && flex_rows != 0) {
                 grid_seed_definite_auto_row_contributions(
                     context, node, style, scratch, grid_order,
-                    columns, placement_rows, grid_column_origin,
-                    grid_row_origin, explicit_grid_columns,
-                    explicit_grid_rows, declared_grid_rows,
+                    &placement_template, placement_rows,
+                    grid_row_origin, explicit_grid_rows, declared_grid_rows,
                     second_implicit_row, content_width,
                     definite_height ? declared_content_height : 0,
                     row_track_heights, &fixed_space);
@@ -1358,20 +1433,31 @@ bool layout_block_grid_section(LayoutContext *context,
                 }
             }
         }
-        GridPlacementState placement_state;
-        grid_placement_init(&placement_state, columns, placement_rows, style);
-        placement_state.explicit_columns =
-            (uint8_t) explicit_grid_columns;
-        placement_state.explicit_rows = (uint8_t) explicit_grid_rows;
-        placement_state.column_origin = (uint8_t) grid_column_origin;
-        placement_state.row_origin = (uint8_t) grid_row_origin;
+        GridPlacementState placement_state = placement_template;
         FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
         FlatItem *item = &scratch->traversal.flex.item;
         /* Latest row that already holds a laid-out item: rows after it can
            still move down when an earlier fr row grows to its content. */
         int laid_out_row = -1;
+        GridLaidItems laid = {0};
+        if (grid_locked_children != 0 && grid_children > 1
+            && grid_children <= SIZE_MAX / sizeof(GridLaidItem)) {
+            /* Transient and optional: without it an out-of-order row only
+               loses the ability to push already laid-out later rows. */
+            laid.items = budget_calloc(context->layout->budget,
+                                       grid_children, sizeof(*laid.items));
+            if (laid.items != NULL) laid.capacity = grid_children;
+        }
         GridReshareItem reshare_items[GRID_RESHARE_ITEM_LIMIT];
         size_t reshare_count = 0;
+        /* Items that span several content-sized rows are laid out before
+           the later rows reach their final height, so their end/center
+           block alignment waits for the rows (CSS Grid 10.4). Guardian's
+           masthead menu button spans the logo and pillar rows and sits at
+           their bottom; aligned at the first row's top it covered the
+           edition picker. Bounded: further items keep start alignment. */
+        GridSpanAlignItem span_align[GRID_SPAN_ALIGN_LIMIT];
+        size_t span_align_count = 0;
         bool reshare_possible = !inherited_grid_rows
             && flex_track_space_definite;
         flex_iterator_init(iterator, context, node, style, grid_order);
@@ -1396,6 +1482,19 @@ bool layout_block_grid_section(LayoutContext *context,
             }
             int row_top = row_starts[grid_row];
             if (layout_preview_limit_reached(context, row_top)) break;
+            if (laid.items != NULL) {
+                if (laid.count < laid.capacity) {
+                    laid.items[laid.count++] = (GridLaidItem) {
+                        .row = grid_row,
+                        .command_start = context->layout->count,
+                        .link_start = context->layout->link_count,
+                        .control_start = context->layout->control_count,
+                        .box_start = context->layout->node_box_count
+                    };
+                } else {
+                    grid_laid_items_release(context, &laid);
+                }
+            }
             int column = item_placement.column;
             int column_span = item_placement.column_span;
             int assigned_cell_width =
@@ -1410,6 +1509,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 if (!layout_anonymous_text(context, item, node, child_x,
                                            row_top, assigned_cell_width,
                                            &child_bottom)) {
+                    grid_laid_items_release(context, &laid);
                     flex_order_plan_destroy(grid_order);
                     return false;
                 }
@@ -1526,6 +1626,7 @@ bool layout_block_grid_section(LayoutContext *context,
                                 column_span, local_rows,
                                 assigned_cell_width,
                                 local_minimums, local_maximums)) {
+                            grid_laid_items_release(context, &laid);
                             flex_order_plan_destroy(grid_order);
                             return false;
                         }
@@ -1689,10 +1790,16 @@ bool layout_block_grid_section(LayoutContext *context,
                         && item_placement.row_span == 1
                         && laid_out_row <= grid_row;
                 }
+                /* The grid area is a grid item's containing block (CSS
+                   Grid 9.1): with definite rows a percentage height inside
+                   the item resolves against the area, not the whole grid.
+                   MDN's play editor (`height:100%`) sits in a 1fr row of a
+                   fixed-height grid and otherwise claimed the full grid. */
                 bool child_ok = layout_block(
                     context, item->node, &item->parent_style,
                     child_x, row_top, grid_child_width,
-                    child_containing_height,
+                    definite_cell_height && assigned_cell_height > 0
+                        ? assigned_cell_height : child_containing_height,
                     !item->style.has_width,
                     descendant_positioned_box, &child_bottom);
                 context->assigned_grid_node = saved_assigned_node;
@@ -1702,6 +1809,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 context->assigned_grid_minimum = saved_assigned_minimum;
                 context->assigned_grid_tracks = saved_assigned_tracks;
                 if (!child_ok) {
+                    grid_laid_items_release(context, &laid);
                     flex_order_plan_destroy(grid_order);
                     return false;
                 }
@@ -1746,6 +1854,20 @@ bool layout_block_grid_section(LayoutContext *context,
                             child_bottom, dy);
                     }
                     item_dy = dy;
+                    if (!definite_cell_height
+                        && item_placement.row_span > 1
+                        && (item_alignment == ALIGN_END
+                            || item_alignment == ALIGN_CENTER)
+                        && span_align_count < GRID_SPAN_ALIGN_LIMIT) {
+                        span_align[span_align_count++] = (GridSpanAlignItem) {
+                            .node = item->node,
+                            .row = grid_row,
+                            .span = item_placement.row_span,
+                            .offset = item_box->y - row_top,
+                            .height = item_box->height,
+                            .center = item_alignment == ALIGN_CENTER
+                        };
+                    }
                 }
                 if (reshare_possible
                     && (reshare_count == GRID_RESHARE_ITEM_LIMIT
@@ -1790,7 +1912,9 @@ bool layout_block_grid_section(LayoutContext *context,
                    later rows down, as a growing fr row does below, or the
                    next row's items land on top of it. */
                 if (item_placement.row_span == 1
-                    && laid_out_row <= grid_row) {
+                    && (laid_out_row <= grid_row
+                        || grid_shift_later_rows(
+                               context, &laid, grid_row, grown))) {
                     for (int later = grid_row + 1; later < initialized_rows;
                          later++) {
                         row_starts[later] =
@@ -1801,8 +1925,11 @@ bool layout_block_grid_section(LayoutContext *context,
                 }
             } else if (row_type == GRID_TRACK_FLEX && !collapsed_flex_track
                        && item_placement.row_span == 1
-                       && laid_out_row <= grid_row
-                       && child_bottom > row_extents[grid_row]) {
+                       && child_bottom > row_extents[grid_row]
+                       && (laid_out_row <= grid_row
+                           || grid_shift_later_rows(
+                                  context, &laid, grid_row,
+                                  child_bottom - row_extents[grid_row]))) {
                 /* An fr row is minmax(auto, <flex>): it is never shorter
                    than its content (CSS Grid 7.2.4). Its share of the free
                    space was fixed before content was measured, so grow it
@@ -1822,12 +1949,29 @@ bool layout_block_grid_section(LayoutContext *context,
             }
             if (grid_row > laid_out_row) laid_out_row = grid_row;
         }
+        grid_laid_items_release(context, &laid);
         if (reshare_possible)
             grid_resolve_final_rows(
                 context, style, row_starts, row_extents, initialized_rows,
                 declared_content_height, grid_row_origin,
                 explicit_grid_rows, declared_grid_rows,
                 second_implicit_row, reshare_items, reshare_count);
+        for (size_t i = 0; i < span_align_count; i++) {
+            const GridSpanAlignItem *span = &span_align[i];
+            int last = span->row + span->span - 1;
+            if (last >= initialized_rows) last = initialized_rows - 1;
+            if (last <= span->row) continue;
+            int area_height = row_extents[last] - row_starts[span->row];
+            int free_space = area_height - span->height;
+            if (free_space <= 0) continue;
+            int target = span->center ? free_space / 2 : free_space;
+            /* `offset` already holds the in-flow placement plus any
+               relative offset; only the alignment shift moves. */
+            if (target != 0) {
+                translate_node_subtree(context->layout, span->node, 0,
+                                       target);
+            }
+        }
         int grid_bottom = line->y;
         for (int row = 0; row < initialized_rows; row++) {
             if (row_extents[row] > grid_bottom) {

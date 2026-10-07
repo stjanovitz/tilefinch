@@ -1,6 +1,7 @@
 (() => {
   const scriptForceAsync = globalThis.__tilefinchScriptForceAsync,
     scriptAsyncAssigned = globalThis.__tilefinchScriptAsyncAssigned,
+    elementNonce = globalThis.__tilefinchElementNonce,
     prepareDynamicSubtree = globalThis.__tilefinchPrepareDynamicSubtree,
     appendMany = globalThis.__tilefinchAppendMany,
     ancestorApply = Reflect.apply,
@@ -134,7 +135,6 @@
     const result = expression(0);
     return at === tokens.length ? result : NaN;
   };
-  globalThis.__tilefinchCssLengthPixels = cssLengthPixels;
   Object.defineProperty(globalThis, "__tilefinchBoundedAncestorPath", {
     enumerable: false,
     configurable: false,
@@ -428,7 +428,6 @@
     weakNodeCache =
       typeof WeakRef === "function" &&
       typeof FinalizationRegistry === "function";
-  globalThis.__tilefinchWeakNodeCache = weakNodeCache;
   const nodeFinalizer = weakNodeCache
     ? new FinalizationRegistry((held) => {
         retentionStats.wrappersFinalized++;
@@ -876,8 +875,36 @@
       }
       return values;
     };
-  const namedWindowProperties = new Set(),
+  const namedWindowProperties = new Map(),
     namedWindowLimit = 128;
+  /* Window named properties: a child navigable's target name answers
+     first (its WindowProxy; frames.js binds the lookup), then an element
+     id. Own Window properties shadow both. */
+  let namedChildNavigable = null;
+  const namedWindowValue = (name) => {
+    const view = namedChildNavigable?.(name);
+    return view !== undefined
+      ? view
+      : document.getElementById(name) || undefined;
+  };
+  globalThis.__tilefinchBindNamedChildNavigables = (lookup) => {
+    delete globalThis.__tilefinchBindNamedChildNavigables;
+    namedChildNavigable = lookup;
+    /* Retire a name exposed for a child navigable that nothing answers. */
+    return (name) => {
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+      if (!namedWindowProperties.has(name)) return;
+      /* A page can replace our accessor with defineProperty, bypassing
+         its setter. Retire only the exact accessor we installed. */
+      if (descriptor?.get !== namedWindowProperties.get(name)) {
+        namedWindowProperties.delete(name);
+        return;
+      }
+      if (namedWindowValue(name) !== undefined) return;
+      namedWindowProperties.delete(name);
+      delete globalThis[name];
+    };
+  };
   globalThis.__tilefinchExposeNamedProperty = (name) => {
     name = String(name || "");
     if (
@@ -887,13 +914,12 @@
       namedWindowProperties.size >= namedWindowLimit ||
       Object.prototype.hasOwnProperty.call(globalThis, name)
     )
-      return;
-    namedWindowProperties.add(name);
-    Object.defineProperty(globalThis, name, {
+      return false;
+    const descriptor = {
       configurable: true,
       enumerable: false,
       get() {
-        return document.getElementById(name) || undefined;
+        return namedWindowValue(name);
       },
       set(value) {
         namedWindowProperties.delete(name);
@@ -904,7 +930,10 @@
           value,
         });
       },
-    });
+    };
+    namedWindowProperties.set(name, descriptor.get);
+    Object.defineProperty(globalThis, name, descriptor);
+    return true;
   };
   class EventTarget {}
   class Node extends EventTarget {}
@@ -916,10 +945,8 @@
       return this.firstChild != null;
     },
   });
-  Object.defineProperty(Node.prototype, "isConnected", {
-    configurable: true,
-    enumerable: true,
-    get() {
+  Object.defineProperty(Node.prototype, "isConnected", Object.getOwnPropertyDescriptor({
+    get isConnected() {
       for (
         let at = this, steps = 0;
         at && steps < ancestorLimit;
@@ -936,7 +963,7 @@
           return true;
       return false;
     },
-  });
+  }, "isConnected"));
   class Attr extends Node {}
   class NamedNodeMap {}
   Node.ELEMENT_NODE = 1;
@@ -1037,7 +1064,7 @@
   });
   class CharacterData extends Node {}
   class Text extends CharacterData {}
-  Text.prototype.splitText = function (offset) {
+  Text.prototype.splitText = function splitText(offset) {
     const data = String(this.data);
     offset = Number(offset) >>> 0;
     if (offset > data.length)
@@ -1057,7 +1084,7 @@
   Object.defineProperty(Element.prototype, "animate", {
     configurable: true,
     writable: true,
-    value(keyframes, options) {
+    value: function animate(keyframes, options = undefined) {
       if (typeof globalThis.__tilefinchAnimateElement !== "function") {
         try {
           globalThis.__tilefinchEnsureMotionBootstrap?.();
@@ -1074,7 +1101,8 @@
       const stack = globalThis.__tilefinchCustomElementConstructionStack;
       if (stack?.length) {
         const element = stack[stack.length - 1];
-        globalThis.__tilefinchPrepareNativePrototype?.(element);
+        globalThis.__tilefinchPrepareNativePrototype?.(
+          element, new.target.prototype);
         Object.setPrototypeOf(element, new.target.prototype);
         return element;
       }
@@ -1084,18 +1112,58 @@
     }
   }
   class HTMLUnknownElement extends HTMLElement {}
-  for (const name of ["title", "lang"]) {
-    Object.defineProperty(HTMLElement.prototype, name, {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return this.getAttribute(name) || "";
-      },
-      set(value) {
-        this.setAttribute(name, String(value));
-      },
-    });
-  }
+  /* Reflected IDL attributes (HTML's "reflect"), for every module: WebIDL
+     members are enumerable, and computed accessor keys give the functions
+     their WebIDL names ("get dir"). The content attribute is the lowercased
+     IDL name unless given. An enumerated attribute reads a known keyword in
+     its canonical case and a missing or invalid value as its default. */
+  const accessor = (name, object) =>
+      Object.getOwnPropertyDescriptor(object, name),
+    reflectString = (idl, attribute = idl.toLowerCase()) =>
+      accessor(idl, {
+        get [idl]() {
+          return this.getAttribute(attribute) || "";
+        },
+        set [idl](value) {
+          this.setAttribute(attribute, String(value));
+        },
+      }),
+    reflectBoolean = (idl, attribute = idl.toLowerCase()) =>
+      accessor(idl, {
+        get [idl]() {
+          return this.hasAttribute(attribute);
+        },
+        set [idl](value) {
+          this.toggleAttribute(attribute, !!value);
+        },
+      }),
+    reflectEnumerated = (idl, keywords, missing = "", invalid = missing,
+                         attribute = idl.toLowerCase()) =>
+      accessor(idl, {
+        get [idl]() {
+          const value = this.getAttribute(attribute);
+          if (value === null) return missing;
+          const keyword = String(value).toLowerCase();
+          return keywords.includes(keyword) ? keyword : invalid;
+        },
+        set [idl](value) {
+          this.setAttribute(attribute, String(value));
+        },
+      }),
+    /* Documents other than the main one (see hardening.js). */
+    secondaryDocumentPrototype = (base) =>
+      globalThis.__tilefinchSecondaryDocumentPrototype?.(base) || base;
+  /* platform.js and compat.js take these; compat.js deletes the global. */
+  globalThis.__tilefinchDomShared = {
+    reflectString,
+    reflectBoolean,
+    reflectEnumerated,
+    secondaryDocumentPrototype,
+  };
+  Object.defineProperties(HTMLElement.prototype, {
+    title: reflectString("title"),
+    lang: reflectString("lang"),
+  });
   class SVGElement extends Element {
     getBBox() {
       const rect = this.getBoundingClientRect(),
@@ -1225,6 +1293,48 @@
   class HTMLVideoElement extends HTMLMediaElement {}
   class HTMLSourceElement extends HTMLElement {}
   class HTMLSlotElement extends HTMLElement {}
+  /* The rest of the HTML standard's element-interface table. None has a
+     member of its own here, so one class body serves them all, and their
+     prototypes share HTMLElement's native wrapper layer (see
+     nativeElementPrototype) instead of each costing a layer of its own. */
+  const sharedLayerPrototypes = [];
+  for (const stem of (
+      "Area Base BR Data DataList DList Directory Embed Font Frame HR " +
+      "Head Heading Html LI Map Marquee Menu Meter Mod OList Object " +
+      "OptGroup Paragraph Param Picture Pre Progress Quote Span Table " +
+      "TableCaption TableCell TableCol TableRow TableSection Time Title " +
+      "Track UList ").trim().split(" ")) {
+    const name = "HTML" + stem + "Element",
+      constructor = { [name]: class extends HTMLElement {} }[name];
+    sharedLayerPrototypes.push(constructor.prototype);
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      writable: true,
+      value: constructor,
+    });
+  }
+  /* " tag=index " into sharedLayerPrototypes, read once per tag name. */
+  const sharedLayerTags =
+    " area=0 base=1 br=2 data=3 datalist=4 dl=5 dir=6 embed=7 font=8 " +
+    "frame=9 hr=10 head=11 h1=12 h2=12 h3=12 h4=12 h5=12 h6=12 html=13 " +
+    "li=14 map=15 marquee=16 menu=17 meter=18 del=19 ins=19 ol=20 " +
+    "object=21 optgroup=22 p=23 param=24 picture=25 pre=26 listing=26 " +
+    "xmp=26 progress=27 blockquote=28 q=28 span=29 table=30 caption=31 " +
+    "td=32 th=32 col=33 colgroup=33 tr=34 thead=35 tbody=35 tfoot=35 " +
+    "time=36 title=37 track=38 ul=39 ";
+  sharedLayerPrototypes.push(HTMLUnknownElement.prototype);
+  /* Elements the table gives plain HTMLElement; any other name that is not
+     a valid custom element name is HTMLUnknownElement. */
+  const plainHTMLElementTags = " abbr acronym address article aside b " +
+    "basefont bdi bdo big center cite code dd dfn dt em figcaption figure " +
+    "footer header hgroup i kbd main mark nav nobr noembed noframes " +
+    "noscript plaintext rb rp rt rtc ruby s samp search section small " +
+    "strike strong sub sup tt u var wbr ";
+  const unknownElementTag = (tag) =>
+    tag.includes("-")
+      ? /^(?:annotation-xml|color-profile|font-face(?:-src|-uri|-format|-name)?|missing-glyph)$/.test(tag) ||
+        !/^[a-z]/.test(tag)
+      : !plainHTMLElementTags.includes(" " + tag + " ");
   class DocumentFragment extends Node {
     constructor() {
       super();
@@ -1273,7 +1383,7 @@
     }
     get activeElement() {
       if (!this.isConnected) return null;
-      const active = this.ownerDocument?.__activeElement || null;
+      const active = (this.ownerDocument === document ? globalThis.__tilefinchActiveElement : null) || null;
       return active && active.getRootNode() === this ? active : null;
     }
     get styleSheets() {
@@ -1477,7 +1587,7 @@
     substringData: {
       configurable: true,
       writable: true,
-      value(offset, count) {
+      value: function substringData(offset, count) {
         if (arguments.length < 2)
           throw new TypeError("substringData requires two arguments");
         offset = characterDataUnsignedLong(offset);
@@ -1490,7 +1600,7 @@
     appendData: {
       configurable: true,
       writable: true,
-      value(data) {
+      value: function appendData(data) {
         if (arguments.length < 1)
           throw new TypeError("appendData requires one argument");
         this.data += String(data);
@@ -1499,7 +1609,7 @@
     insertData: {
       configurable: true,
       writable: true,
-      value(offset, data) {
+      value: function insertData(offset, data) {
         if (arguments.length < 2)
           throw new TypeError("insertData requires two arguments");
         offset = characterDataUnsignedLong(offset);
@@ -1512,7 +1622,7 @@
     deleteData: {
       configurable: true,
       writable: true,
-      value(offset, count) {
+      value: function deleteData(offset, count) {
         if (arguments.length < 2)
           throw new TypeError("deleteData requires two arguments");
         this.replaceData(offset, count, "");
@@ -1521,7 +1631,7 @@
     replaceData: {
       configurable: true,
       writable: true,
-      value(offset, count, data) {
+      value: function replaceData(offset, count, data) {
         if (arguments.length < 3)
           throw new TypeError("replaceData requires three arguments");
         offset = characterDataUnsignedLong(offset);
@@ -1536,7 +1646,7 @@
       },
     },
   });
-  Node.prototype.contains = function (other) {
+  Node.prototype.contains = function contains(other) {
     if (other === null || other === undefined) return false;
     for (
       let at = other, steps = 0;
@@ -1546,7 +1656,7 @@
       if (at === this) return true;
     return false;
   };
-  Node.prototype.normalize = function () {
+  Node.prototype.normalize = function normalize() {
     let previousText = null;
     for (let child = this.firstChild; child; ) {
       const next = child.nextSibling;
@@ -1566,12 +1676,12 @@
       child = next;
     }
   };
-  Node.prototype.appendChild = function (child) {
+  Node.prototype.appendChild = function appendChild(child) {
     globalThis.__tilefinchValidatePreInsert?.(this, child, null);
     throw new DOMException("Node cannot have children", "HierarchyRequestError");
   };
   const nativeRootNode = globalThis.__tilefinchRootNode;
-  Node.prototype.getRootNode = function (options = {}) {
+  Node.prototype.getRootNode = function getRootNode(options = {}) {
     /* Until a shadow root exists every root is a tree root: one native walk
        instead of a wrapper and an instanceof per ancestor. A root with a
        script-side detached parent takes the walk below. */
@@ -1736,7 +1846,7 @@
         },
       });
     };
-  Element.prototype.attachShadow = function (init) {
+  Element.prototype.attachShadow = function attachShadow(init) {
     if (shadowRootForHost(this))
       throw new DOMException(
         "Shadow root already attached",
@@ -1869,14 +1979,14 @@
       shadowDescriptors.querySelectorAll = {
         configurable: true,
         writable: true,
-        value(selector) {
+        value: function querySelectorAll(selector) {
           return detachedShadowQueryAll(this, selector);
         },
       };
       shadowDescriptors.querySelector = {
         configurable: true,
         writable: true,
-        value(selector) {
+        value: function querySelector(selector) {
           return detachedShadowQueryAll(this, selector)[0] || null;
         },
       };
@@ -1885,14 +1995,12 @@
     installShadowHostView(this);
     return root;
   };
-  Object.defineProperty(Element.prototype, "shadowRoot", {
-    configurable: true,
-    enumerable: true,
-    get() {
+  Object.defineProperty(Element.prototype, "shadowRoot", Object.getOwnPropertyDescriptor({
+    get shadowRoot() {
       const root = shadowRootForHost(this);
       return root && shadowModeByRoot.get(root) === "open" ? root : null;
     },
-  });
+  }, "shadowRoot"));
   const adjacentPosition = (value) => {
     const position = String(value).toLowerCase();
     if (
@@ -1907,7 +2015,7 @@
       );
     return position;
   };
-  Element.prototype.insertAdjacentElement = function (where, element) {
+  Element.prototype.insertAdjacentElement = function insertAdjacentElement(where, element) {
     const position = adjacentPosition(where);
     if (!(element instanceof Element))
       throw new TypeError("insertAdjacentElement requires an Element");
@@ -1924,7 +2032,7 @@
     }
     return element;
   };
-  Element.prototype.insertAdjacentText = function (where, data) {
+  Element.prototype.insertAdjacentText = function insertAdjacentText(where, data) {
     const position = adjacentPosition(where),
       text = factoryDocument(this).createTextNode(String(data));
     if (position === "beforebegin") {
@@ -1939,7 +2047,7 @@
       this.parentNode.insertBefore(text, this.nextSibling);
     }
   };
-  Element.prototype.moveBefore = function (node, child) {
+  Element.prototype.moveBefore = function moveBefore(node, child) {
     if (!(node instanceof Node))
       throw new TypeError("moveBefore requires a Node");
     if (child !== null && child !== undefined && !(child instanceof Node))
@@ -1974,17 +2082,7 @@
             ? this.removeAttribute("crossorigin")
             : this.setAttribute("crossorigin", String(value));
         },
-      },
-      booleanReflect = (name) => ({
-        configurable: true,
-        enumerable: true,
-        get() {
-          return this.hasAttribute(name);
-        },
-        set(value) {
-          this.toggleAttribute(name, !!value);
-        },
-      });
+      };
     Object.defineProperty(
       HTMLScriptElement.prototype,
       "crossOrigin",
@@ -1993,18 +2091,74 @@
     Object.defineProperty(
       HTMLScriptElement.prototype,
       "noModule",
-      booleanReflect("nomodule"),
+      reflectBoolean("noModule"),
     );
     Object.defineProperty(
       HTMLLinkElement.prototype,
       "crossOrigin",
       crossOrigin,
     );
+    /* HTMLOrSVGElement.nonce reflects the [[CryptographicNonce]] slot, which
+       outlives the content attribute a header-delivered CSP hides. */
+    const nonce = {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return elementNonce(this.__handle);
+      },
+      set(value) {
+        value = String(value);
+        if (!elementNonce(this.__handle, value))
+          this.setAttribute("nonce", value);
+      },
+    };
+    Object.defineProperty(HTMLElement.prototype, "nonce", nonce);
+    Object.defineProperty(SVGElement.prototype, "nonce", nonce);
+    /* `draggable` is left out on purpose: `'draggable' in element` is the
+       standard drag-and-drop feature test (Modernizr, Amazon's AUI) and
+       Tilefinch has no drag-and-drop input, so exposing it would claim
+       one. */
+    const autofocus = reflectBoolean("autofocus"),
+      loading = reflectEnumerated("loading", ["lazy", "eager"], "eager");
+    Object.defineProperties(HTMLElement.prototype, {
+      dir: reflectEnumerated("dir", ["ltr", "rtl", "auto"]),
+      inputMode: reflectEnumerated("inputMode", [
+        "none", "text", "tel", "url", "email", "numeric", "decimal", "search",
+      ]),
+      accessKey: reflectString("accessKey"),
+      autofocus,
+    });
+    Object.defineProperty(SVGElement.prototype, "autofocus", autofocus);
+    Object.defineProperty(HTMLImageElement.prototype, "loading", loading);
+    Object.defineProperty(HTMLIFrameElement.prototype, "loading", loading);
+    Object.defineProperty(HTMLScriptElement.prototype, "text", accessor("text", {
+      get text() {
+        /* The child text content: Text children only, not descendants. */
+        let text = "";
+        for (let child = this.firstChild; child; child = child.nextSibling)
+          if (child.nodeType === Node.TEXT_NODE) text += child.data;
+        return text;
+      },
+      set text(value) {
+        this.textContent = String(value);
+      },
+    }));
+    /* Script types Tilefinch runs. It has no import maps or speculation
+       rules, so it says so rather than letting polyfills skip themselves. */
+    Object.defineProperty(HTMLScriptElement, "supports", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: { supports(type) {
+        type = String(type);
+        return type === "classic" || type === "module";
+      } }.supports,
+    });
   }
-  Node.prototype.isSameNode = function (other) {
+  Node.prototype.isSameNode = function isSameNode(other) {
     return this === other;
   };
-  Node.prototype.isEqualNode = function (other) {
+  Node.prototype.isEqualNode = function isEqualNode(other) {
     if (
       other === null ||
       other === undefined ||
@@ -2063,7 +2217,7 @@
         values.reverse();
         return values;
       };
-    Node.prototype.compareDocumentPosition = function (other) {
+    Node.prototype.compareDocumentPosition = function compareDocumentPosition(other) {
       if (!(other instanceof Node)) throw new TypeError("Node required");
       if (this === other) return 0;
       if (typeof nativeComparePosition === "function"
@@ -2198,13 +2352,14 @@
     "wheel",
   ]) {
     const name = "on" + type;
-    const descriptor = {
-        configurable: true,
-        enumerable: true,
-        get() {
+    /* Computed accessor keys name the functions "get onclick" and
+       "set onclick" as WebIDL attributes are; literal accessors are already
+       enumerable and configurable. */
+    const descriptor = Object.getOwnPropertyDescriptor({
+        get [name]() {
           return inlineEventHandler(this, type, name);
         },
-        set(value) {
+        set [name](value) {
           const callable = typeof value === "function" ? value : null,
             retained = eventHandlerMap(this, false),
             hasMarkup = typeof this?.getAttribute === "function" &&
@@ -2216,7 +2371,7 @@
           if (!map) return;
           installEventHandler(this, type, callable);
         },
-      };
+      }, name);
     for (const prototype of globalEventHandlerPrototypes)
       if (!(name in prototype))
         Object.defineProperty(prototype, name, descriptor);
@@ -2230,6 +2385,8 @@
       length = numberIsFinite(numericLength) && numericLength > 0
         ? mathMin(mathFloor(numericLength), 0xffffffff)
         : 0;
+    /* The node-handle index space; native results never exceed it, since
+       a walk that runs out of handles throws instead. */
     if (length > 16384)
       throw new RangeError("NodeList limit exceeded");
     const result = Object.create(NodeList.prototype);
@@ -2593,13 +2750,11 @@
       },
     },
   });
-  Object.defineProperty(Text.prototype, "assignedSlot", {
-    configurable: true,
-    enumerable: true,
-    get() {
+  Object.defineProperty(Text.prototype, "assignedSlot", Object.getOwnPropertyDescriptor({
+    get assignedSlot() {
       return assignedSlotInternal(this);
     },
-  });
+  }, "assignedSlot"));
   Object.defineProperties(HTMLSlotElement.prototype, {
     name: {
       configurable: true,
@@ -2614,20 +2769,18 @@
     assignedNodes: {
       configurable: true,
       writable: true,
-      value(options = {}) {
-        return nodeList(
-          assignedNodesInternal(this, !!Object(options).flatten),
-        );
+      /* sequence<Node> in WebIDL: a fresh Array, not a NodeList
+         (MDN's dropdown calls .find on assignedElements()). */
+      value: function assignedNodes(options = {}) {
+        return assignedNodesInternal(this, !!Object(options).flatten);
       },
     },
     assignedElements: {
       configurable: true,
       writable: true,
-      value(options = {}) {
-        return nodeList(
-          assignedNodesInternal(this, !!Object(options).flatten).filter(
-            (node) => node.nodeType === Node.ELEMENT_NODE,
-          ),
+      value: function assignedElements(options = {}) {
+        return assignedNodesInternal(this, !!Object(options).flatten).filter(
+          (node) => node.nodeType === Node.ELEMENT_NODE,
         );
       },
     },
@@ -2635,7 +2788,7 @@
   Object.defineProperty(ShadowRoot.prototype, "getElementById", {
     configurable: true,
     writable: true,
-    value(id) {
+    value: function getElementById(id) {
       return this.querySelector("#" + CSS.escape(String(id)));
     },
   });
@@ -2692,21 +2845,21 @@
       configurable: true,
     },
     getElementsByClassName: {
-      value: function (names) {
+      value: function getElementsByClassName(names) {
         return elementsByClassName(this, names);
       },
       writable: true,
       configurable: true,
     },
     getElementsByTagName: {
-      value: function (tag) {
+      value: function getElementsByTagName(tag) {
         return elementsByTagName(this, tag);
       },
       writable: true,
       configurable: true,
     },
     getElementsByName: {
-      value: function (name) {
+      value: function getElementsByName(name) {
         name = String(name);
         return nodeList(
           Array.from(this.querySelectorAll("[name]")).filter(
@@ -2748,21 +2901,21 @@
       configurable: true,
     },
     getElementsByClassName: {
-      value: function (names) {
+      value: function getElementsByClassName(names) {
         return elementsByClassName(this, names);
       },
       writable: true,
       configurable: true,
     },
     getElementsByTagName: {
-      value: function (tag) {
+      value: function getElementsByTagName(tag) {
         return elementsByTagName(this, tag);
       },
       writable: true,
       configurable: true,
     },
     matches: {
-      value: function (selector) {
+      value: function matches(selector) {
         selector = String(selector);
         const compact = selector.replace(/\s+/g, "").toLowerCase();
         if (
@@ -2786,7 +2939,7 @@
       configurable: true,
     },
     closest: {
-      value: function (selector) {
+      value: function closest(selector) {
         for (
           let at = this, steps = 0;
           at && steps < ancestorLimit;
@@ -2799,18 +2952,21 @@
       configurable: true,
     },
   });
+  /* Whether a form-associated custom element is disabled (its own
+     attribute or a disabled fieldset ancestor), whatever its class's own
+     disabled accessor says; null for any other element. */
   const formAssociatedCustomDisabled = (element) => {
     const internals =
       globalThis.__tilefinchElementInternalsFor?.(element);
     if (
       !globalThis.__tilefinchFormAssociatedCustomElement?.(element)
     )
-      return false;
+      return null;
     if (internals)
       try {
         void internals.form;
       } catch (_) {
-        return false;
+        return null;
       }
     if (element.hasAttribute("disabled")) return true;
     for (
@@ -2825,54 +2981,11 @@
         return true;
     return false;
   };
-  HTMLElement.prototype.focus = function () {
-    if (
-      this.disabled ||
-      formAssociatedCustomDisabled(this) ||
-      document.__activeElement === this
-    )
-      return;
-    const previous = document.__activeElement || document.body;
-    if (previous && previous !== document.body) {
-      previous.dispatchEvent(
-        new FocusEvent("blur", { composed: true, relatedTarget: this }),
-      );
-      previous.dispatchEvent(
-        new FocusEvent("focusout", {
-          bubbles: true,
-          composed: true,
-          relatedTarget: this,
-        }),
-      );
-    }
-    document.__activeElement = this;
-    this.dispatchEvent(
-      new FocusEvent("focus", { composed: true, relatedTarget: previous }),
-    );
-    this.dispatchEvent(
-      new FocusEvent("focusin", {
-        bubbles: true,
-        composed: true,
-        relatedTarget: previous,
-      }),
-    );
-  };
-  HTMLElement.prototype.blur = function () {
-    if (document.__activeElement !== this) return;
-    const next = document.body;
-    this.dispatchEvent(
-      new FocusEvent("blur", { composed: true, relatedTarget: next }),
-    );
-    this.dispatchEvent(
-      new FocusEvent("focusout", {
-        bubbles: true,
-        composed: true,
-        relatedTarget: next,
-      }),
-    );
-    document.__activeElement = next;
-  };
-  HTMLElement.prototype.click = function () {
+  /* For platform.js (:disabled, :enabled) and compat.js (focus), which
+     deletes it. */
+  globalThis.__tilefinchFormAssociatedCustomDisabled =
+    formAssociatedCustomDisabled;
+  HTMLElement.prototype.click = function click() {
     if (this.disabled || formAssociatedCustomDisabled(this)) {
       globalThis.__tilefinchLastClickDefault = "disabled";
       return false;
@@ -2945,7 +3058,7 @@
     else globalThis.__tilefinchLastClickDefault = "none";
     return true;
   };
-  Element.prototype.insertAdjacentHTML = function (position, source) {
+  Element.prototype.insertAdjacentHTML = function insertAdjacentHTML(position, source) {
     position = String(position).toLowerCase();
     if (!["beforebegin", "afterbegin", "beforeend", "afterend"].includes(position))
       throw new DOMException(
@@ -2974,11 +3087,11 @@
   /* The HTML setters. chatgpt.com's unauthenticated composer refuses to
      initialize without them and otherwise fetches a polyfill first.
      Declarative shadow roots are not parsed, so this is innerHTML. */
-  Element.prototype.setHTMLUnsafe = function (html) {
+  Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) {
     this.innerHTML = String(html);
   };
   if (typeof ShadowRoot === "function")
-    ShadowRoot.prototype.setHTMLUnsafe = function (html) {
+    ShadowRoot.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) {
       this.innerHTML = String(html);
     };
   if (typeof Document === "function")
@@ -3079,11 +3192,11 @@
       };
     }
   };
-  Element.prototype.getAnimations = function () {
+  Element.prototype.getAnimations = function getAnimations() {
     return globalThis.__tilefinchElementAnimations?.(this) || [];
   };
   if (typeof Document === "function")
-    Document.prototype.getAnimations = function () {
+    Document.prototype.getAnimations = function getAnimations() {
       return globalThis.__tilefinchElementAnimations?.(null) || [];
     };
   globalThis.reportError = function reportError(error) {
@@ -3182,8 +3295,16 @@
         return HTMLSourceElement.prototype;
       case "slot":
         return HTMLSlotElement.prototype;
-      default:
-        return HTMLElement.prototype;
+      default: {
+        const lower = String(tag).toLowerCase();
+        const at = sharedLayerTags.indexOf(" " + lower + "=");
+        return at >= 0
+          ? sharedLayerPrototypes[
+              Number.parseInt(sharedLayerTags.slice(at + lower.length + 2))]
+          : unknownElementTag(lower)
+            ? HTMLUnknownElement.prototype
+            : HTMLElement.prototype;
+      }
     }
   };
   /* Every wrapper creation asks; an HTML element's answer depends only on
@@ -3201,7 +3322,6 @@
     }
     return prototype;
   };
-  globalThis.__tilefinchElementPrototype = elementPrototype;
   const classListOwner = Symbol("classList owner");
   const classListNode = (list) => {
     const node = list?.[classListOwner];
@@ -3394,10 +3514,8 @@
     writable: false,
     configurable: false,
   });
-  Object.defineProperty(Element.prototype, "style", {
-    configurable: true,
-    enumerable: true,
-    get() {
+  Object.defineProperty(Element.prototype, "style", Object.getOwnPropertyDescriptor({
+    get style() {
       /* Live wrappers normally install an own accessor so the common lookup
          stays cheap. The property is configurable, as the platform requires;
          deleting it must reveal the prototype CSSStyleDeclaration rather than
@@ -3411,11 +3529,11 @@
       }
       return value;
     },
-    set(value) {
+    set style(value) {
       const style = this.style;
       if (style) style.cssText = String(value);
     },
-  });
+  }, "style"));
   const namedNodeMapFor = (owner, read) => {
     let map = namedNodeMaps.get(owner);
     if (map) return map;
@@ -3731,6 +3849,27 @@
       },
     };
   }
+  /* HTML innerText is the rendered text, which the host computes from the
+     computed styles (__tilefinchRenderedText); it answers undefined for an
+     element that is not being rendered, which reads its textContent. */
+  /* The innerText setter: line breaks become <br> elements. */
+  const setInnerText = (element, value) => {
+    const text = value === null ? "" : String(value);
+    if (!/[\r\n]/.test(text)) {
+      element.textContent = text;
+      return;
+    }
+    element.textContent = "";
+    const ownerDocument = element.ownerDocument || document,
+      fragment = ownerDocument.createDocumentFragment(),
+      lines = text.replace(/\r\n?/g, "\n").split("\n");
+    for (let index = 0; index < lines.length; index++) {
+      if (index) fragment.appendChild(ownerDocument.createElement("br"));
+      if (lines[index]) fragment.appendChild(
+        ownerDocument.createTextNode(lines[index]));
+    }
+    element.appendChild(fragment);
+  };
   // Receiver-only operations share function objects across native wrappers.
   // Keep handle/rebinding and listener closures per node, and copy descriptors
   // (not values) so own-property accessors and subclass overrides are preserved.
@@ -3749,10 +3888,16 @@
         this.textContent = value == null ? "" : String(value);
     },
     get innerText() {
-      return this.textContent;
+      if (this.nodeType !== 1) return undefined;
+      const handle = this.__handle,
+        text = Number.isInteger(handle) && handle > 0
+          ? __tilefinchRenderedText(handle)
+          : undefined;
+      return text === undefined ? this.textContent : text;
     },
     set innerText(value) {
-      this.textContent = value;
+      if (this.nodeType === 1) setInnerText(this, value);
+      else this.textContent = value;
     },
     get id() {
       return this.getAttribute("id") || "";
@@ -3816,8 +3961,22 @@
           if (parentTag === "select") break;
         }
       }
+      /* A disabled fieldset ancestor is rare: one native walk rules it out
+         (a script-side tree or a hit keeps the walk below, which also
+         applies the first-legend exception). The script walk cost about a
+         millisecond per read on a PSP, and menus read this per button. */
+      const parent = this.parentElement;
+      if (
+        parent &&
+        !globalThis.__tilefinchHasRemoteNodeWriter &&
+        !parent.__tilefinchDetachedParent &&
+        Number(parent.__handle) > 0 &&
+        !globalThis.__tilefinchIsVirtualRemote?.(parent) &&
+        Number(__tilefinchClosest(parent.__handle, "fieldset[disabled]")) === 0
+      )
+        return false;
       for (
-        let at = this.parentElement, steps = 0;
+        let at = parent, steps = 0;
         at && steps < ancestorLimit;
         at = at.parentElement, steps++
       ) {
@@ -3963,7 +4122,7 @@
       this.__selectionDirection = ["forward", "backward"].includes(direction)
         ? direction
         : "none";
-      document.__tilefinchSelectionChanged?.();
+      globalThis.__tilefinchSelectionChanged?.();
     },
     select() {
       if (this.selectionStart !== null) {
@@ -4427,7 +4586,7 @@
       this.removeAttributeNS(attribute.namespaceURI, attribute.localName);
       return attribute;
     },
-    toggleAttribute(name, force) {
+    toggleAttribute(name, force = undefined) {
       name = String(name);
       if (!name)
         throw new DOMException(
@@ -6192,10 +6351,19 @@
             : "";
       if (prefix) this.removeAttribute(prefix + name);
     },
+    /* CSSOM View: the document's scrolling element (the root element in
+       no-quirks mode) reports and moves the viewport's scroll position. */
     get scrollTop() {
+      if (this === document.documentElement)
+        return Number(globalThis.scrollY) || 0;
       return this.__tilefinchGeometryValue().scrollTop;
     },
     set scrollTop(value) {
+      if (this === document.documentElement) {
+        globalThis.scrollTo(Number(globalThis.scrollX) || 0,
+                            Number(value) || 0);
+        return;
+      }
       const nativeReceiver = this;
       smoothElementScrolls.delete(this);
       const g = this.__tilefinchGeometryValue();
@@ -6209,9 +6377,16 @@
       );
     },
     get scrollLeft() {
+      if (this === document.documentElement)
+        return Number(globalThis.scrollX) || 0;
       return this.__tilefinchGeometryValue().scrollLeft;
     },
     set scrollLeft(value) {
+      if (this === document.documentElement) {
+        globalThis.scrollTo(Number(value) || 0,
+                            Number(globalThis.scrollY) || 0);
+        return;
+      }
       const nativeReceiver = this;
       smoothElementScrolls.delete(this);
       const g = this.__tilefinchGeometryValue();
@@ -6233,6 +6408,11 @@
         return Promise.reject(
           new TypeError("Single scroll argument must be a dictionary"),
         );
+      if (this === document.documentElement) {
+        if (arguments.length === 1) globalThis.scrollTo(xOrOptions);
+        else globalThis.scrollTo(xOrOptions, y);
+        return Promise.resolve();
+      }
       if (
         xOrOptions &&
         typeof xOrOptions === "object" &&
@@ -6400,22 +6580,6 @@
       const targetOwner = this.ownerDocument || document;
       if (oldOwner && targetOwner && oldOwner !== targetOwner)
         globalThis.__tilefinchAdoptNodeOwner?.(child, targetOwner);
-      if (
-        globalThis.__tilefinchTraceTasksEnabled &&
-        child instanceof HTMLIFrameElement
-      ) {
-        const log =
-          globalThis.__tilefinchFrameLifecycle ||
-          (globalThis.__tilefinchFrameLifecycle = []);
-        if (log.length < 16)
-          log.push({
-            action: "append",
-            handle: child.__handle,
-            parent: String(this.tagName || this.nodeName || ""),
-            connected: !!child.isConnected,
-            src: String(child.src || ""),
-          });
-      }
       if (!globalThis.__tilefinchCustomElementMovePreserved)
         globalThis.__tilefinchCustomElementConnected?.(child);
       globalThis.__tilefinchCanvasConnected?.(child);
@@ -6610,26 +6774,11 @@
         return;
       }
       if (
-        document.__activeElement === this ||
-        this.contains(document.__activeElement) ||
-        shadowEventPath(document.__activeElement, true).includes(this)
+        globalThis.__tilefinchActiveElement === this ||
+        this.contains(globalThis.__tilefinchActiveElement) ||
+        shadowEventPath(globalThis.__tilefinchActiveElement, true).includes(this)
       )
-        document.__activeElement = document.body;
-      if (
-        globalThis.__tilefinchTraceTasksEnabled &&
-        this instanceof HTMLIFrameElement
-      ) {
-        const log =
-          globalThis.__tilefinchFrameLifecycle ||
-          (globalThis.__tilefinchFrameLifecycle = []);
-        if (log.length < 16)
-          log.push({
-            action: "remove",
-            handle: this.__handle,
-            parent: String(parent?.tagName || parent?.nodeName || ""),
-            src: String(this.src || ""),
-          });
-      }
+        globalThis.__tilefinchActiveElement = document.body;
       const result = __tilefinchRemove(nativeReceiver.__handle);
       if (result) globalThis.__tilefinchCustomElementDisconnected?.(this);
       if (parent)
@@ -6664,6 +6813,63 @@
                                 descriptor.value.length);
     if (typeof fast === "function") descriptor.value = fast;
   }
+  /* ParentNode.replaceChildren lives on the per-tag native layer for speed;
+     expose the same function where the standard puts it so feature
+     detection on Element.prototype finds it. */
+  Object.defineProperty(Element.prototype, "replaceChildren", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: nativeNodeReceiverDescriptors.replaceChildren.value,
+  });
+  Object.defineProperties(Element.prototype, Object.getOwnPropertyDescriptors({
+    hasAttributes() {
+      /* Lit asks this of every element it walks; answer from the native
+         attribute list instead of materializing a NamedNodeMap. Namespaced
+         attributes are written through to the host list too. */
+      const handle = Number(this.__handle);
+      if (handle > 0 && !globalThis.__tilefinchIsVirtualRemote(this))
+        return __tilefinchAttributes(handle).length !== 0;
+      const attributes = this.attributes;
+      return !!attributes && attributes.length !== 0;
+    },
+    /* CSSOM View checkVisibility over the computed styles Tilefinch keeps.
+       Limits: elements the UA stylesheet hides (head, script, style...) are
+       recognised by name because computed display does not report them;
+       the walk follows parents and shadow hosts, not slot assignment;
+       content-visibility:auto never skips content here. */
+    checkVisibility(options = {}) {
+      if (!this.isConnected) return false;
+      const checkOpacity = !!(options?.checkOpacity || options?.opacityProperty),
+        checkVisibilityCSS =
+          !!(options?.checkVisibilityCSS || options?.visibilityProperty);
+      for (let at = this, steps = 0; at && steps < ancestorLimit; steps++) {
+        if (at.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+            hiddenByDefaultTags.includes(" " + at.localName + " "))
+          return false;
+        const style = getComputedStyle(at),
+          display = style.getPropertyValue("display");
+        if (display === "none" || (at === this && display === "contents"))
+          return false;
+        if (at !== this &&
+            style.getPropertyValue("content-visibility") === "hidden")
+          return false;
+        if (checkOpacity && Number(style.getPropertyValue("opacity")) === 0)
+          return false;
+        if (at === this && checkVisibilityCSS) {
+          const visibility = style.getPropertyValue("visibility");
+          if (visibility && visibility !== "visible") return false;
+        }
+        const parent = at.parentNode;
+        at = parent instanceof ShadowRoot
+          ? parent.host
+          : parent?.nodeType === Node.ELEMENT_NODE ? parent : null;
+      }
+      return true;
+    },
+  }));
+  const hiddenByDefaultTags = " area base basefont datalist head link meta " +
+    "noembed noframes param rp script style template title ";
   const wrapperListeners = Symbol("wrapper listeners");
   const nativeNodeEventDescriptors = Object.getOwnPropertyDescriptors({
     addEventListener(type, callback, options = false) {
@@ -6707,23 +6913,48 @@
     },
   });
   const nativePrototypes = new WeakMap();
-  function nativeElementPrototype(tag, type, namespace) {
-    const base = elementPrototype(tag, type, namespace);
+  const nativeLayer = (base) => {
     let prototype = nativePrototypes.get(base);
     if (!prototype) {
-      prototype = Object.create(base);
-      Object.defineProperties(prototype, nativeNodeEventDescriptors);
-      Object.defineProperties(prototype, nativeNodeReceiverDescriptors);
+      if (sharedLayerPrototypes.includes(base)) {
+        /* A member-less interface: its prototype itself sits above
+           HTMLElement's layer, so its wrappers inherit the same native
+           members without another copy of the layer. */
+        nativeLayer(HTMLElement.prototype);
+        prototype = base;
+      } else {
+        prototype = Object.create(base);
+        Object.defineProperties(prototype, nativeNodeEventDescriptors);
+        Object.defineProperties(prototype, nativeNodeReceiverDescriptors);
+        if (base === HTMLElement.prototype)
+          for (const shared of sharedLayerPrototypes)
+            Object.setPrototypeOf(shared, prototype);
+      }
       nativePrototypes.set(base, prototype);
     }
     return prototype;
+  };
+  function nativeElementPrototype(tag, type, namespace) {
+    return nativeLayer(elementPrototype(tag, type, namespace));
   }
+  /* Keeps the native members on a node whose prototype is about to become
+     `target` (an upgrade). Members that `target`'s own classes define are
+     left to them: an own copy would shadow them, and Lit would save it as
+     an initial property value (MDN's runner got a DOMTokenList for its
+     string `sandbox`). */
   Object.defineProperty(globalThis, "__tilefinchPrepareNativePrototype", {
-    value(node) {
+    value(node, target) {
       if (!(node?.__handle > 0)) return;
+      const classDefined = (name) => {
+        for (let p = target; p && p !== HTMLElement.prototype &&
+             p !== Element.prototype; p = Object.getPrototypeOf(p))
+          if (Object.prototype.hasOwnProperty.call(p, name)) return true;
+        return false;
+      };
       for (const descriptors of [nativeNodeEventDescriptors, nativeNodeReceiverDescriptors])
         for (const name of Object.keys(descriptors))
-          if (!Object.prototype.hasOwnProperty.call(node, name))
+          if (!Object.prototype.hasOwnProperty.call(node, name) &&
+              !(target && classDefined(name)))
             Object.defineProperty(node, name, descriptors[name]);
     },
   });
@@ -7682,8 +7913,6 @@
     };
   }
   {
-    const observers = new Set();
-    let recheckPending = false;
     globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
       constructor(init = {}) {
         Object.assign(this, init);
@@ -7744,47 +7973,96 @@
       while (index < thresholds.length && thresholds[index] <= ratio) index++;
       return index;
     };
-    const computeEntry = (observer, item, time) => {
-      const rect = item.getBoundingClientRect();
-      const rawRoot =
+    /*
+     * Every (observer, target) registration is re-evaluated on each update
+     * (after a layout commit and on scroll), so the page-wide registration
+     * count, not the number of observers, is what costs time. An observer
+     * with no target costs nothing per update and is not retained here;
+     * the Budget-charged JavaScript heap bounds observers like any other
+     * object. Pages commonly create one observer per lazy component
+     * (theguardian.com creates 75).
+     *
+     * An update step evaluates at most UPDATE_SLICE registrations and
+     * continues in the next render-observer task. A registration costs
+     * about 2.7 us of host lab time (mostly its getBoundingClientRect;
+     * entries are built only on a state change), roughly 0.25 ms on the
+     * PSP at the 80-100x calibration, so a step stays near 8 ms there
+     * however many targets a page observes. Notifications are queued as
+     * tasks anyway; a large page receives its later ones a few frames
+     * later instead of in one long step. REGISTRATION_LIMIT bounds a full
+     * pass to 32 steps and the retained state to about 150 KB of heap.
+     */
+    const REGISTRATION_LIMIT = 1024,
+      UPDATE_SLICE = 32,
+      active = new Set(),
+      fresh = [];
+    let registrations = 0,
+      freshAt = 0,
+      pass = null,
+      passRequested = false,
+      updateQueued = false,
+      continuationQueued = false,
+      stepId = 0;
+    const rootBoundsFor = (observer) => {
+      if (observer._boundsStep === stepId) return observer._bounds;
+      const raw =
           observer.root == null || observer.root === document
             ? new DOMRect(0, 0, innerWidth, innerHeight)
             : observer.root.getBoundingClientRect(),
-        margin = resolveMargin(
-          observer._rootMargin,
-          rawRoot.width,
-          rawRoot.height,
-        );
-      const rootBounds = new DOMRect(
-        rawRoot.left - margin[3],
-        rawRoot.top - margin[0],
-        rawRoot.width + margin[1] + margin[3],
-        rawRoot.height + margin[0] + margin[2],
+        margin = resolveMargin(observer._rootMargin, raw.width, raw.height);
+      observer._boundsStep = stepId;
+      return (observer._bounds = [
+        raw.left - margin[3],
+        raw.top - margin[0],
+        raw.width + margin[1] + margin[3],
+        raw.height + margin[0] + margin[2],
+      ]);
+    };
+    /* Queues an entry only when the intersecting state or the threshold
+       index changed; an unchanged target allocates nothing but its rect. */
+    const evaluate = (observer, item, time) => {
+      const rect = item.getBoundingClientRect(),
+        bounds = rootBoundsFor(observer),
+        left = Math.max(rect.left, bounds[0]),
+        top = Math.max(rect.top, bounds[1]),
+        right = Math.min(rect.right, bounds[0] + bounds[2]),
+        bottom = Math.min(rect.bottom, bounds[1] + bounds[3]),
+        interWidth = Math.max(0, right - left),
+        interHeight = Math.max(0, bottom - top),
+        rectArea = rect.width * rect.height,
+        zeroTouch = rectArea === 0 && right >= left && bottom >= top,
+        intersecting = (interWidth > 0 && interHeight > 0) || zeroTouch,
+        ratio =
+          intersecting && rectArea > 0
+            ? (interWidth * interHeight) / rectArea
+            : 0,
+        threshold = thresholdIndex(observer.thresholds, ratio),
+        previous = observer.lastState.get(item);
+      if (
+        previous !== undefined &&
+        previous.intersecting === intersecting &&
+        previous.threshold === threshold
+      )
+        return false;
+      observer.lastState.set(item, { intersecting, threshold });
+      if (observer.records.length >= 128) {
+        retentionStats.recordDrops++;
+        return false;
+      }
+      observer.records.push(
+        new IntersectionObserverEntry({
+          time,
+          target: item,
+          rootBounds: new DOMRect(bounds[0], bounds[1], bounds[2], bounds[3]),
+          boundingClientRect: rect,
+          intersectionRect: intersecting
+            ? new DOMRect(left, top, interWidth, interHeight)
+            : new DOMRect(),
+          isIntersecting: intersecting,
+          intersectionRatio: ratio,
+        }),
       );
-      const left = Math.max(rect.left, rootBounds.left),
-        top = Math.max(rect.top, rootBounds.top),
-        right = Math.min(rect.right, rootBounds.right),
-        bottom = Math.min(rect.bottom, rootBounds.bottom);
-      const interWidth = Math.max(0, right - left),
-        interHeight = Math.max(0, bottom - top);
-      const rectArea = rect.width * rect.height;
-      const zeroTouch = rectArea === 0 && right >= left && bottom >= top;
-      const intersecting = (interWidth > 0 && interHeight > 0) || zeroTouch;
-      const ratio =
-        intersecting && rectArea > 0
-          ? (interWidth * interHeight) / rectArea
-          : 0;
-      return new IntersectionObserverEntry({
-        time,
-        target: item,
-        rootBounds,
-        boundingClientRect: rect,
-        intersectionRect: intersecting
-          ? new DOMRect(left, top, interWidth, interHeight)
-          : new DOMRect(),
-        isIntersecting: intersecting,
-        intersectionRatio: ratio,
-      });
+      return true;
     };
     const scheduleDelivery = (observer) => {
       if (observer.pending || !observer.records.length) return;
@@ -7805,41 +8083,79 @@
         }
       });
     };
-    const deliver = (observer) => {
-      if (!observer.targets.size) return;
-      const time = __tilefinchPerformanceSample(10);
-      for (const item of observer.targets) {
-        const entry = computeEntry(observer, item, time);
-        const state = {
-            intersecting: entry.isIntersecting,
-            threshold: thresholdIndex(
-              observer.thresholds,
-              entry.intersectionRatio,
-            ),
-          },
-          previous = observer.lastState.get(item);
-        if (
-          previous === undefined ||
-          previous.intersecting !== state.intersecting ||
-          previous.threshold !== state.threshold
-        ) {
-          observer.lastState.set(item, state);
-          if (observer.records.length < 128) observer.records.push(entry);
-          else retentionStats.recordDrops++;
+    const step = () => {
+      if (freshAt >= fresh.length && !pass && !passRequested) return;
+      let budget = UPDATE_SLICE,
+        time;
+      const touched = new Set(),
+        visit = (observer, item) => {
+          budget--;
+          if (time === undefined) time = __tilefinchPerformanceSample(10);
+          if (evaluate(observer, item, time)) touched.add(observer);
+        };
+      stepId++;
+      /* First observations go first: a new target owes its initial entry. */
+      while (freshAt < fresh.length && budget > 0) {
+        const observer = fresh[freshAt],
+          item = fresh[freshAt + 1];
+        freshAt += 2;
+        if (observer.targets.has(item) && !observer.lastState.has(item))
+          visit(observer, item);
+      }
+      if (freshAt >= fresh.length) fresh.length = freshAt = 0;
+      while (budget > 0) {
+        if (!pass) {
+          if (!passRequested) break;
+          passRequested = false;
+          pass = { observers: Array.from(active), at: 0, items: null, item: 0 };
+        }
+        const observer = pass.observers[pass.at];
+        if (!observer) {
+          pass = null;
+          continue;
+        }
+        pass.items ||= Array.from(observer.targets);
+        while (pass.item < pass.items.length && budget > 0) {
+          const item = pass.items[pass.item++];
+          if (observer.targets.has(item)) visit(observer, item);
+        }
+        if (pass.item >= pass.items.length) {
+          pass.at++;
+          pass.items = null;
+          pass.item = 0;
         }
       }
-      scheduleDelivery(observer);
+      for (const observer of touched) scheduleDelivery(observer);
+      if (
+        !continuationQueued &&
+        (freshAt < fresh.length || pass || passRequested)
+      ) {
+        continuationQueued = true;
+        (globalThis.__tilefinchScheduleRenderObserver || queueMicrotask)(
+          () => {
+            continuationQueued = false;
+            step();
+          },
+        );
+      }
     };
-    const scheduleRecheck = () => {
-      if (recheckPending) return;
-      recheckPending = true;
-      queueMicrotask(() => {
-        recheckPending = false;
-        for (const observer of observers) deliver(observer);
+    const queueUpdate = (schedule) => {
+      if (updateQueued) return;
+      updateQueued = true;
+      schedule(() => {
+        updateQueued = false;
+        step();
       });
     };
+    /* The update microtask is queued even with nothing observed, as the
+       recheck always has been; recovery policies read a layout commit's
+       pending checkpoint as the page still settling. */
+    const requestPass = () => {
+      if (active.size) passRequested = true;
+      queueUpdate(queueMicrotask);
+    };
     globalThis.__tilefinchIntersectionRecheck = () => {
-      scheduleRecheck();
+      requestPass();
       globalThis.__tilefinchResizeRecheck?.();
     };
     let scrollHooked = false;
@@ -7847,7 +8163,7 @@
       if (scrollHooked || typeof globalThis.addEventListener !== "function")
         return;
       scrollHooked = true;
-      globalThis.addEventListener("scroll", scheduleRecheck, {
+      globalThis.addEventListener("scroll", requestPass, {
         capture: true,
         passive: true,
       });
@@ -7863,8 +8179,6 @@
           !(root instanceof Element)
         )
           throw new TypeError("root must be an Element or Document");
-        if (observers.size >= 64)
-          throw new RangeError("IntersectionObserver limit reached");
         this.callback = callback;
         this.root = root;
         this._rootMargin = parseMargin(options.rootMargin);
@@ -7874,44 +8188,56 @@
         this.lastState = new Map();
         this.records = [];
         this.pending = false;
-        observers.add(this);
       }
       observe(target) {
         if (!(target instanceof Element))
           throw new TypeError("Element required");
         hookScroll();
         if (this.targets.has(target)) return;
-        if (this.targets.size >= 128)
+        if (registrations >= REGISTRATION_LIMIT)
           throw new RangeError("IntersectionObserver target limit reached");
+        registrations++;
         this.targets.add(target);
-        if (!this.pending) {
-          this.pending = true;
-          /*
-           * Preserve the ordinary initial-observation microtask used by the
-           * lightweight runtime. When resize work is pending, place the
-           * intersection sample in the later render-fixup slot so the
-           * platform-mandated ResizeObserver ordering remains truthful.
-           */
-          const resizePending =
-              globalThis.__tilefinchResizeRecheck?.() === true,
-            schedule = resizePending
-              ? globalThis.__tilefinchScheduleRenderFixup || queueMicrotask
-              : queueMicrotask;
-          schedule(() => {
-            this.pending = false;
-            deliver(this);
-          });
+        active.add(this);
+        /* Observe/unobserve churn before the step runs must not grow the
+           queue past the live registrations. */
+        if (fresh.length - freshAt >= 4 * REGISTRATION_LIMIT) {
+          const live = [];
+          for (let at = freshAt; at < fresh.length; at += 2)
+            if (
+              fresh[at].targets.has(fresh[at + 1]) &&
+              !fresh[at].lastState.has(fresh[at + 1])
+            )
+              live.push(fresh[at], fresh[at + 1]);
+          fresh.length = freshAt = 0;
+          fresh.push(...live);
         }
+        fresh.push(this, target);
+        /*
+         * Preserve the ordinary initial-observation microtask used by the
+         * lightweight runtime. When resize work is pending, place the
+         * intersection sample in the later render-fixup slot so the
+         * platform-mandated ResizeObserver ordering remains truthful.
+         */
+        queueUpdate(
+          globalThis.__tilefinchResizeRecheck?.() === true
+            ? globalThis.__tilefinchScheduleRenderFixup || queueMicrotask
+            : queueMicrotask,
+        );
       }
       unobserve(target) {
-        this.targets.delete(target);
+        if (this.targets.delete(target)) {
+          registrations--;
+          if (!this.targets.size) active.delete(this);
+        }
         this.lastState.delete(target);
       }
       disconnect() {
+        registrations -= this.targets.size;
         this.targets.clear();
         this.lastState.clear();
         this.records = [];
-        observers.delete(this);
+        active.delete(this);
       }
       takeRecords() {
         return this.records.splice(0);
@@ -8368,6 +8694,24 @@
   /* Read-only inputs; each delivered MutationRecord receives its own lists.
      Attribute/text notifications otherwise allocate two unused arrays. */
   const emptyMutationNodes = Object.freeze([]);
+  /* Whether a tree change can add, remove or reorder child navigables (an
+     iframe or frame element, or a subtree holding one, searched natively). */
+  const nativeFrameHandles = globalThis.__tilefinchFrameHandles,
+    childNavigableContainer = (node) => {
+      const name = String(node?.localName || "").toLowerCase();
+      return name === "iframe" || name === "frame";
+    },
+    childNavigablesMoved = (nodes) => {
+      for (let index = 0; index < nodes.length; index++) {
+        const node = nodes[index];
+        if (!(node instanceof Element)) continue;
+        if (childNavigableContainer(node)) return true;
+        /* Natively: a wrapper per descendant would keep it alive. */
+        if (node.__handle > 0 && nativeFrameHandles(node.__handle).length)
+          return true;
+      }
+      return false;
+    };
   globalThis.__tilefinchNotifyMutation = (
     target,
     type,
@@ -8459,6 +8803,14 @@
         attributeNamespace,
       );
     globalThis.__tilefinchResizeRecheck?.();
+    if (type === "childList"
+      ? childNavigablesMoved(addedNodes) || childNavigablesMoved(removedNodes)
+      : type === "attributes" &&
+        attributeName === "name" &&
+        childNavigableContainer(target))
+      globalThis.__tilefinchChildNavigablesChanged?.(
+        type === "attributes" ? target : null,
+      );
     /* Names are read only for the mutation kinds that can use them. */
     let styleSheetMutation = false,
       motionStyleMutation = false;

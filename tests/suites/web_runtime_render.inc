@@ -1,3 +1,486 @@
+static int test_canvas_setup_publication(void)
+{
+    enum { W = 480, H = 272, GUARD = 16, SOURCE_STRIDE = 2048 };
+    static _Alignas(16) unsigned char packed[320 * 180 * 4 + 16];
+    static _Alignas(16) unsigned char native_pixels[SOURCE_STRIDE * 180 + 16];
+    static _Alignas(16) uint16_t frame[W * H + 2 * GUARD];
+    static uint16_t expected[W * H + 2 * GUARD];
+    static unsigned char packed_before[sizeof(packed)];
+    static unsigned char native_before[sizeof(native_pixels)];
+    for (size_t i = 0; i < sizeof(packed); i++) packed[i] = (unsigned char) (i * 37u + 11u);
+    for (size_t i = 0; i < sizeof(native_pixels); i++)
+        native_pixels[i] = (unsigned char) (i * 53u + 29u);
+    memcpy(packed_before, packed, sizeof(packed));
+    memcpy(native_before, native_pixels, sizeof(native_pixels));
+    const int widths[] = {4, 12, 40, 320};
+    const int heights[] = {2, 8, 16, 180};
+    size_t admitted = 0, fallback = 0;
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    for (unsigned fixture = 0; fixture < 64; fixture++) {
+        int sw = widths[fixture & 3u], sh = heights[fixture & 3u];
+        int dw = sw / 2 * 3, dh = sh == 180 ? H : sh + sh / 2;
+        int x = fixture & 4u ? 1 : 0;
+        int scroll = fixture & 8u ? 7 : 0;
+        int y = scroll + (fixture & 16u ? 1 : 0);
+        bool use_native = (fixture & 32u) != 0;
+        bool unaligned = (fixture & 12u) == 12u;
+        const unsigned char *source = use_native ? native_pixels : packed;
+        size_t source_stride = use_native ? SOURCE_STRIDE : (size_t) sw * 4u;
+        source += unaligned ? 1u : 0u;
+        ImageCanvasNativeSurface native = {
+            .pixels = source, .stride = source_stride, .authoritative = false
+        };
+        ImageResource image = {
+            .pixels = packed + (unaligned && !use_native ? 1u : 0u),
+            .width = sw, .height = sh, .source_width = sw, .source_height = sh,
+            .is_canvas = true, .canvas_opaque = true,
+            .canvas_native_surface = use_native ? &native : NULL
+        };
+        DrawCommand command = {
+            .image = &image, .x = x, .y = y, .width = dw, .height = dh,
+            .opacity_scale = 256, .type = DRAW_IMAGE,
+            .image_fit = LAYOUT_IMAGE_FIT_STRETCH
+        };
+        uint32_t order = 0;
+        uint8_t flags = 0;
+        LayoutDocument layout = {
+            .budget = &budget, .commands = &command, .count = 1,
+            .paint_order = &order, .paint_order_count = 1,
+            .command_flags = &flags, .width = W, .scroll_width = W, .height = H + scroll
+        };
+        TileCache cache;
+        for (size_t i = 0; i < sizeof(frame) / sizeof(frame[0]); i++) frame[i] = 0x5a5au;
+        CHECK(tile_cache_init(&cache, &budget, &layout, 1)
+              && tile_cache_set_frame(&cache, frame + GUARD, W * H)
+              && tile_cache_render_frame(&cache, scroll, W, H, NULL));
+        /* Admit the borrowed surface only after the initial generic paint:
+           that path deliberately materializes native canvases into RAM. */
+        native.authoritative = use_native;
+        memcpy(expected, frame, sizeof(frame));
+        for (int dy = 0; dy < H; dy++) {
+            int local_y = scroll + dy - y;
+            if (local_y < 0 || local_y >= dh) continue;
+            int sy = local_y * sh / dh;
+            for (int dx = 0; dx < W; dx++) {
+                int local_x = dx - x;
+                if (local_x < 0 || local_x >= dw) continue;
+                int sx = local_x * sw / dw;
+                const unsigned char *pixel = source + (size_t) sy * source_stride + (size_t) sx * 4u;
+                expected[GUARD + (size_t) dy * W + (size_t) dx] = (uint16_t)
+                    (((unsigned) (pixel[0] >> 3) << 11)
+                     | ((unsigned) (pixel[1] >> 2) << 5) | (pixel[2] >> 3));
+            }
+        }
+        /* Publication retains the browser's scroll thumb over the canvas. */
+        if (scroll > 0) {
+            int thumb_height = H * H / layout.height;
+            int thumb_y = scroll * (H - thumb_height) / (layout.height - H);
+            for (int py = 0; py < thumb_height; py++) {
+                for (int px = 0; px < 7; px++) {
+                    if ((py == 0 || py == thumb_height - 1) && (px < 2 || px > 4))
+                        continue;
+                    expected[GUARD + (size_t) (thumb_y + py) * W + W - 8u + px]
+                        = (uint16_t) ((17u << 11) | (34u << 5) | 17u);
+                }
+            }
+        }
+        CHECK(tile_cache_sync_canvas_paint(&cache, x, y, x + dw, y + dh));
+        CHECK(tile_cache_render_canvas_frame_fast(&cache, scroll, W, H)
+              == RENDER_CANVAS_FRAME_COMPLETE);
+        if (memcmp(frame, expected, sizeof(frame)) != 0) {
+            fprintf(stderr, "canvas publication pixel mismatch: fixture=%u\n", fixture);
+            fprintf(stderr, "scroll=%d last=%d setup=%zu command=%d,%d %dx%d source=%dx%d\n",
+                    scroll, cache.last_frame_scroll_y, cache.canvas_setup_frames,
+                    cache.layout->commands[0].x, cache.layout->commands[0].y,
+                    cache.layout->commands[0].width, cache.layout->commands[0].height,
+                    cache.layout->commands[0].image->width, cache.layout->commands[0].image->height);
+            for (size_t at = 0; at < sizeof(frame) / sizeof(frame[0]); at++) {
+                if (frame[at] != expected[at]) {
+                    fprintf(stderr, "first word=%zu actual=%04x expected=%04x\n",
+                            at, frame[at], expected[at]);
+                    break;
+                }
+            }
+            return 1;
+        }
+        bool setup = !unaligned && x % 2 == 0 && x + dw <= W && y - scroll + dh <= H;
+        CHECK(cache.canvas_setup_frames == (setup ? 1u : 0u));
+        admitted += setup; fallback += !setup;
+        /* Revoking native authority selects the canonical packed source,
+           without retaining or materializing the borrowed native pointer. */
+        if (use_native) {
+            native.authoritative = false;
+            CHECK(tile_cache_sync_canvas_paint(&cache, x, y, x + dw, y + dh)
+                  && tile_cache_render_canvas_frame_fast(&cache, scroll, W, H)
+                     == RENDER_CANVAS_FRAME_COMPLETE);
+            int top = y - scroll;
+            if (frame[GUARD + (size_t) top * W + (size_t) x]
+                  != (uint16_t) (((unsigned) (packed[0] >> 3) << 11)
+                                 | ((unsigned) (packed[1] >> 2) << 5) | (packed[2] >> 3)))
+                fprintf(stderr, "revoked native fixture=%u pixel=%04x packed=%04x\n",
+                        fixture, frame[GUARD + (size_t) top * W + (size_t) x],
+                        (unsigned) (((unsigned) (packed[0] >> 3) << 11)
+                                    | ((unsigned) (packed[1] >> 2) << 5) | (packed[2] >> 3)));
+            CHECK(frame[GUARD + (size_t) top * W + (size_t) x]
+                  == (uint16_t) (((unsigned) (packed[0] >> 3) << 11)
+                                 | ((unsigned) (packed[1] >> 2) << 5) | (packed[2] >> 3))
+                  && image.canvas_native_surface == &native);
+        }
+        tile_cache_destroy(&cache);
+        CHECK(budget.current == 0);
+    }
+    CHECK(admitted != 0 && fallback != 0
+          && memcmp(packed, packed_before, sizeof(packed)) == 0
+          && memcmp(native_pixels, native_before, sizeof(native_pixels)) == 0);
+    return 0;
+}
+
+
+/* Deferred canvas publication: an eligible full-viewport native canvas frame
+   leaves the RAM canvas rectangle untouched and records exactly what the GE
+   presenter needs; materializing then yields the pixels the CPU path would
+   have written. Anything painted above the canvas, a newer surface, or a
+   disabled switch keeps the ordinary path. */
+static int test_canvas_deferred_publication(void)
+{
+    enum { W = 480, H = 272, SOURCE_STRIDE = 2048 };
+    static _Alignas(16) unsigned char native_pixels[SOURCE_STRIDE * 180];
+    static _Alignas(16) unsigned char packed[320 * 180 * 4];
+    static _Alignas(16) uint16_t frame[W * H];
+    static uint16_t expected[W * H];
+    for (size_t i = 0; i < sizeof(native_pixels); i++)
+        native_pixels[i] = (unsigned char) (i * 53u + 29u);
+    for (size_t i = 0; i < sizeof(packed); i++)
+        packed[i] = (unsigned char) (i * 37u + 11u);
+    for (int dy = 0; dy < H; dy++) {
+        int sy = dy * 180 / H;
+        for (int dx = 0; dx < W; dx++) {
+            const unsigned char *pixel = native_pixels
+                + (size_t) sy * SOURCE_STRIDE + (size_t) (dx * 320 / W) * 4u;
+            expected[(size_t) dy * W + (size_t) dx] = (uint16_t)
+                (((unsigned) (pixel[0] >> 3) << 11)
+                 | ((unsigned) (pixel[1] >> 2) << 5) | (pixel[2] >> 3));
+        }
+    }
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    /* 0 eligible, 1 engine refused (decoration), 2 overlay above the canvas,
+       3 switch off, 4 eligible then the surface moves on. */
+    for (unsigned scenario = 0; scenario < 5u; scenario++) {
+        ImageCanvasNativeSurface native = {
+            .pixels = native_pixels, .stride = SOURCE_STRIDE,
+            .authoritative = false
+        };
+        ImageResource image = {
+            .pixels = packed, .width = 320, .height = 180,
+            .source_width = 320, .source_height = 180,
+            .is_canvas = true, .canvas_opaque = true,
+            .canvas_native_surface = &native
+        };
+        DrawCommand commands[2] = {
+            { .image = &image, .x = 0, .y = 0, .width = W, .height = H,
+              .opacity_scale = 256, .type = DRAW_IMAGE,
+              .image_fit = LAYOUT_IMAGE_FIT_STRETCH },
+            { .x = 8, .y = 8, .width = 32, .height = 8,
+              .color = 0xffffffu, .opacity_scale = 256, .type = DRAW_FILL_RECT }
+        };
+        uint32_t order[2] = {0, 1};
+        uint8_t flags[2] = {0, 0};
+        size_t count = scenario == 2u ? 2u : 1u;
+        LayoutDocument layout = {
+            .budget = &budget, .commands = commands, .count = count,
+            .paint_order = order, .paint_order_count = count,
+            .command_flags = flags, .width = W, .scroll_width = W, .height = H
+        };
+        TileCache cache;
+        CHECK(tile_cache_init(&cache, &budget, &layout, 1)
+              && tile_cache_set_frame(&cache, frame, W * H)
+              && tile_cache_render_frame(&cache, 0, W, H, NULL));
+        native.authoritative = true;
+        /* Poison the canvas rectangle: a deferred frame must not touch it. */
+        for (size_t i = 0; i < (size_t) W * H; i++) frame[i] = 0x5a5au;
+        tile_cache_set_canvas_defer(scenario != 3u);
+        cache.canvas_defer_allowed = scenario != 1u;
+        uint32_t serial = image_canvas_native_serial();
+        CHECK(tile_cache_sync_canvas_paint(&cache, 0, 0, W, H)
+              && tile_cache_render_canvas_frame_fast(&cache, 0, W, H)
+                 == RENDER_CANVAS_FRAME_COMPLETE);
+        const RenderCanvasDeferral *deferral =
+            tile_cache_canvas_deferral(&cache);
+        bool expect_deferred = scenario == 0u || scenario == 4u;
+        if ((deferral != NULL) != expect_deferred) {
+            fprintf(stderr, "deferral scenario=%u deferred=%d\n", scenario,
+                    deferral != NULL);
+            return 1;
+        }
+        if (!expect_deferred) {
+            /* The ordinary path converted the canvas (an overlay rectangle
+               may sit on top in scenario 2). */
+            CHECK(frame[(size_t) 100 * W + 100] == expected[(size_t) 100 * W + 100]
+                  && tile_cache_canvas_materialize(&cache));
+            if (scenario != 2u)
+                CHECK(memcmp(frame, expected, sizeof(frame)) == 0);
+        } else {
+            CHECK(deferral->source == native_pixels
+                  && deferral->source_stride == SOURCE_STRIDE
+                  && deferral->source_width == 320
+                  && deferral->source_height == 180
+                  && deferral->x == 0 && deferral->y == 0
+                  && deferral->width == W && deferral->height == H
+                  && deferral->serial == serial
+                  && frame[0] == 0x5a5au && frame[W * H - 1] == 0x5a5au
+                  && cache.canvas_deferrals == 1u);
+            if (scenario == 0u) {
+                CHECK(tile_cache_canvas_materialize(&cache)
+                      && tile_cache_canvas_deferral(&cache) == NULL
+                      && cache.canvas_materializations == 1u
+                      && memcmp(frame, expected, sizeof(frame)) == 0
+                      && tile_cache_canvas_materialize(&cache));
+            } else {
+                image_canvas_native_serial_advance();
+                CHECK(!tile_cache_canvas_materialize(&cache)
+                      && tile_cache_canvas_deferral(&cache) == NULL
+                      && cache.canvas_materialize_failures == 1u
+                      && !cache.last_frame_scroll_valid
+                      && cache.canvas_paint_pending
+                      && frame[0] == 0x5a5au);
+                /* The forced repaint (generic tile path) covers the frame
+                   again. */
+                CHECK(tile_cache_render_frame(&cache, 0, W, H, NULL)
+                      && frame[0] != 0x5a5au
+                      && frame[(size_t) 100 * W + 100] != 0x5a5au
+                      && frame[W * H - 1] != 0x5a5au);
+            }
+        }
+        tile_cache_set_canvas_defer(false);
+        tile_cache_destroy(&cache);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
+
+#include "tilefinch/canvas_ge_presenter.h"
+
+/* Fake GE backend: reproduces the CPU kernel into the back buffer the way
+   the PSP GE list does, and lets each case choose the outcome. */
+typedef struct {
+    int result;            /* forced scale() result when nonzero sentinel */
+    bool use_result;
+    bool busy;
+    unsigned scale_calls, busy_calls, fail_calls;
+    const char *fail_reason;
+    uint16_t expected[480 * 272];
+} FakeCanvasGe;
+
+static int fake_canvas_ge_scale(void *context, uint16_t *back,
+                                const RenderCanvasDeferral *d,
+                                unsigned top, unsigned end,
+                                uint64_t *elapsed_us)
+{
+    FakeCanvasGe *fake = context;
+    fake->scale_calls++;
+    if (elapsed_us != NULL) *elapsed_us = 700u;
+    if (fake->use_result) return fake->result;
+    /* Like the device backend: a moved-on surface is refused untouched. */
+    if (d->serial != image_canvas_native_serial()) return 0;
+    for (unsigned y = top; y < end; y++)
+        memcpy(back + (size_t) y * 512u, fake->expected + (size_t) y * 480u,
+               480u * sizeof(*back));
+    return 1;
+}
+
+static bool fake_canvas_ge_busy(void *context)
+{
+    FakeCanvasGe *fake = context;
+    fake->busy_calls++;
+    return fake->busy;
+}
+
+static void fake_canvas_ge_fail(void *context, const char *reason)
+{
+    FakeCanvasGe *fake = context;
+    fake->fail_calls++;
+    fake->fail_reason = reason;
+}
+
+/* Builds one deferred full-viewport canvas frame (poisoned RAM rectangle). */
+static bool canvas_presenter_frame(TileCache *cache, Budget *budget,
+                                   LayoutDocument *layout, DrawCommand *command,
+                                   uint32_t *order, uint8_t *flags,
+                                   ImageResource *image,
+                                   ImageCanvasNativeSurface *native,
+                                   unsigned char *native_pixels,
+                                   unsigned char *packed, uint16_t *frame)
+{
+    *native = (ImageCanvasNativeSurface) {
+        .pixels = native_pixels, .stride = 2048, .authoritative = false };
+    *image = (ImageResource) {
+        .pixels = packed, .width = 320, .height = 180,
+        .source_width = 320, .source_height = 180,
+        .is_canvas = true, .canvas_opaque = true,
+        .canvas_native_surface = native };
+    *command = (DrawCommand) {
+        .image = image, .x = 0, .y = 0, .width = 480, .height = 272,
+        .opacity_scale = 256, .type = DRAW_IMAGE,
+        .image_fit = LAYOUT_IMAGE_FIT_STRETCH };
+    *order = 0;
+    *flags = 0;
+    *layout = (LayoutDocument) {
+        .budget = budget, .commands = command, .count = 1,
+        .paint_order = order, .paint_order_count = 1, .command_flags = flags,
+        .width = 480, .scroll_width = 480, .height = 272 };
+    if (!tile_cache_init(cache, budget, layout, 1)
+        || !tile_cache_set_frame(cache, frame, 480u * 272u)
+        || !tile_cache_render_frame(cache, 0, 480, 272, NULL)) return false;
+    native->authoritative = true;
+    for (size_t i = 0; i < 480u * 272u; i++) frame[i] = 0x5a5au;
+    cache->canvas_defer_allowed = true;
+    return tile_cache_sync_canvas_paint(cache, 0, 0, 480, 272)
+        && tile_cache_render_canvas_frame_fast(cache, 0, 480, 272)
+               == RENDER_CANVAS_FRAME_COMPLETE;
+}
+
+static int test_canvas_ge_presenter(void)
+{
+    static _Alignas(16) unsigned char native_pixels[2048 * 180];
+    static _Alignas(16) unsigned char packed[320 * 180 * 4];
+    static _Alignas(16) uint16_t frame[480 * 272];
+    static uint16_t back[512 * 272];
+    static FakeCanvasGe fake;
+    for (size_t i = 0; i < sizeof(native_pixels); i++)
+        native_pixels[i] = (unsigned char) (i * 53u + 29u);
+    memset(packed, 0x11, sizeof(packed));
+    memset(&fake, 0, sizeof(fake));
+    for (int dy = 0; dy < 272; dy++)
+        for (int dx = 0; dx < 480; dx++) {
+            const unsigned char *pixel = native_pixels
+                + (size_t) (dy * 180 / 272) * 2048 + (size_t) (dx * 2 / 3) * 4;
+            fake.expected[(size_t) dy * 480 + (size_t) dx] = (uint16_t)
+                (((unsigned) (pixel[0] >> 3) << 11)
+                 | ((unsigned) (pixel[1] >> 2) << 5) | (pixel[2] >> 3));
+        }
+    CanvasGeBackend backend = {
+        .scale = fake_canvas_ge_scale, .busy = fake_canvas_ge_busy,
+        .fail = fake_canvas_ge_fail, .context = &fake };
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    TileCache cache;
+    LayoutDocument layout;
+    DrawCommand command;
+    uint32_t order;
+    uint8_t flags;
+    ImageResource image;
+    ImageCanvasNativeSurface native;
+#define PRESENTER_FRAME() canvas_presenter_frame( \
+        &cache, &budget, &layout, &command, &order, &flags, &image, &native, \
+        native_pixels, packed, frame)
+#define PUBLISH(owner, top, end) canvas_ge_presenter_publish( \
+        &presenter, &cache, frame, back, 512u, 480u, (top), (end), (owner))
+    CanvasGePresenter presenter;
+
+    puts("test: GE presenter publishes a deferred frame and verifies it");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, true);
+    CHECK(tile_cache_canvas_defer_enabled() && PRESENTER_FRAME()
+          && tile_cache_canvas_deferral(&cache) != NULL);
+    memset(back, 0, sizeof(back));
+    CHECK(PUBLISH(true, 20u, 272u) == CANVAS_GE_PRESENT_PUBLISHED
+          && fake.scale_calls == 1u && presenter.stats.presents == 1u
+          && presenter.stats.verify_frames == 1u
+          && presenter.stats.verify_mismatches == 0u
+          && presenter.stats.verify_pixels == 252u * 480u
+          && back[0] == 0u /* rows above row_top stay the caller's */
+          && back[(size_t) 100 * 512 + 7] == fake.expected[100 * 480 + 7]
+          && memcmp(frame, fake.expected, sizeof(frame)) == 0);
+    tile_cache_destroy(&cache);
+
+    puts("test: GE presenter refuses a deferred frame off the owner thread");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    fake.scale_calls = 0;
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(false, 0u, 272u) == CANVAS_GE_PRESENT_REFUSE
+          && fake.scale_calls == 0u && presenter.stats.foreign_refusals == 1u
+          && frame[0] == 0x5a5au
+          && tile_cache_canvas_deferral(&cache) != NULL);
+    /* Readback (thumbnail, PPM, generic render) materializes it exactly. */
+    CHECK(tile_cache_canvas_materialize(&cache)
+          && memcmp(frame, fake.expected, sizeof(frame)) == 0
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.scale_calls == 0u);
+    tile_cache_destroy(&cache);
+
+    puts("test: GE presenter falls back to the CPU frame when refused");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    fake.use_result = true;
+    fake.result = 0;
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && presenter.stats.ge_refusals == 1u
+          && presenter.stats.materializations == 1u
+          && memcmp(frame, fake.expected, sizeof(frame)) == 0
+          && !presenter.failed);
+    tile_cache_destroy(&cache);
+
+    puts("test: GE presenter latches a failed submit and holds the buffer");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    fake.result = -1;
+    fake.busy = true;
+    fake.fail_calls = 0;
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_REFUSE
+          && presenter.failed && presenter.stats.failures == 1u
+          && fake.fail_calls == 1u && fake.fail_reason != NULL
+          && !tile_cache_canvas_defer_enabled());
+    /* While the old submission may still run, nothing is published, not
+       even an ordinary (non-deferred) frame. */
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_REFUSE
+          && presenter.stats.busy_refusals == 1u);
+    fake.busy = false;
+    unsigned calls = fake.scale_calls;
+    /* Once it is gone the deferred frame takes the CPU path; re-enabling
+       cannot clear the latch. */
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.scale_calls == calls
+          && memcmp(frame, fake.expected, sizeof(frame)) == 0);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    CHECK(!tile_cache_canvas_defer_enabled());
+    tile_cache_destroy(&cache);
+
+    puts("test: GE presenter repaints when the surface moved on");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    fake.use_result = false;
+    CHECK(PRESENTER_FRAME());
+    image_canvas_native_serial_advance();
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_REFUSE
+          && presenter.stats.ge_refusals == 1u
+          && presenter.stats.materialize_failures == 1u
+          && !cache.last_frame_scroll_valid && cache.canvas_paint_pending
+          && tile_cache_canvas_deferral(&cache) == NULL
+          && frame[0] == 0x5a5au);
+    tile_cache_destroy(&cache);
+
+    puts("test: GE presenter disabled leaves frames on the CPU path");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, false, false);
+    fake.scale_calls = 0;
+    CHECK(!tile_cache_canvas_defer_enabled() && PRESENTER_FRAME()
+          && tile_cache_canvas_deferral(&cache) == NULL
+          && memcmp(frame, fake.expected, sizeof(frame)) == 0
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.scale_calls == 0u);
+    tile_cache_destroy(&cache);
+#undef PRESENTER_FRAME
+#undef PUBLISH
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_web_runtime(void)
 {
     puts("test: tile paint-ahead serves one Page Down from the cache");
@@ -5,6 +488,10 @@ static int test_web_runtime(void)
     puts("test: placeholder frames checker unpainted tiles without raster");
     if (test_tile_placeholder_frame() != 0) return 1;
     if (test_stroke_interior_work() != 0) return 1;
+    puts("test: canvas setup admission preserves production pixels, guards and borrowed sources");
+    if (test_canvas_setup_publication() != 0) return 1;
+    if (test_canvas_deferred_publication() != 0) return 1;
+    if (test_canvas_ge_presenter() != 0) return 1;
     Budget budget;
     budget_init(&budget, 16 * MIB);
     budget_install_lexbor(&budget);
@@ -22,8 +509,12 @@ static int test_web_runtime(void)
     CHECK(document_parse(&section_state_document, &budget,
                          section_state_page,
                          sizeof(section_state_page) - 1, 17));
+    /* The realm must hold the bootstrap (about 1.96 MiB resident) plus the
+       64-wrapper probe below (about 58 KiB); 2 MiB left too little headroom
+       once WebIDL-correct function names and Document.prototype members
+       added ~25 KiB to the bootstrap. */
     ScriptRuntime *section_state_runtime = script_runtime_create_deferred(
-        &section_state_document, &budget, 2 * MIB, 1000,
+        &section_state_document, &budget, 2 * MIB + MIB / 4, 1000,
         "https://section-state.test/", NULL, &section_state_result);
     size_t saved_section_state = 0;
     bool section_long_ok = section_state_runtime != NULL
@@ -741,6 +1232,307 @@ static int test_web_runtime(void)
           && overlay_frame[7u * 16u + 7u] == test_rgb565(0x205090));
     tile_cache_destroy(&overlay_cache);
     CHECK(budget.current == 0);
+
+    puts("test: a viewport-sized menu panel over a live canvas is retained");
+    {
+        enum { MW = 480, MH = 272 };
+        static uint16_t menu_frame[MW * MH];
+        static uint16_t menu_expected[MW * MH];
+        static unsigned char menu_canvas_pixels[4 * 2 * 4];
+        for (size_t pixel = 0; pixel < 8u; pixel++) {
+            menu_canvas_pixels[pixel * 4u] = 0x18;
+            menu_canvas_pixels[pixel * 4u + 1u] = 0x38;
+            menu_canvas_pixels[pixel * 4u + 2u] = 0x78;
+            menu_canvas_pixels[pixel * 4u + 3u] = 0xff;
+        }
+        ImageResource menu_canvas = {
+            .pixels = menu_canvas_pixels, .source_width = 4,
+            .source_height = 2, .width = 4, .height = 2,
+            .is_canvas = true, .canvas_opaque = true
+        };
+        /* 440x200 = 88,000 pixels: above the former 32,768 cap, plus
+           twelve disjoint HUD labels: more than the eight retained
+           regions, which used to send every frame down the slow path. */
+        enum { MENU_COMMANDS = 3 + 12 };
+        DrawCommand menu_commands[MENU_COMMANDS] = {
+            {.image=&menu_canvas, .x=0, .y=0, .width=MW, .height=MH,
+             .opacity_scale=256, .type=DRAW_IMAGE,
+             .image_fit=LAYOUT_IMAGE_FIT_STRETCH},
+            {.color=0x102b38, .x=20, .y=40, .width=440, .height=200,
+             .opacity_scale=256, .type=DRAW_FILL_RECT},
+            {.color=0x3ad7b6, .x=40, .y=60, .width=120, .height=24,
+             .opacity_scale=256, .type=DRAW_FILL_RECT}
+        };
+        for (int label = 0; label < 12; label++)
+            menu_commands[3 + label] = (DrawCommand) {
+                .color = 0xe0e0e0, .x = 4 + (label % 6) * 78,
+                .y = label < 6 ? 6 : 252, .width = 40, .height = 12,
+                .opacity_scale = 256, .type = DRAW_FILL_RECT};
+        uint32_t menu_order[MENU_COMMANDS];
+        uint8_t menu_flags[MENU_COMMANDS] = {0};
+        for (uint32_t at = 0; at < MENU_COMMANDS; at++) menu_order[at] = at;
+        LayoutDocument menu_layout = {
+            .budget = &budget, .commands = menu_commands,
+            .count = MENU_COMMANDS,
+            .paint_order = menu_order, .paint_order_count = MENU_COMMANDS,
+            .command_flags = menu_flags, .width = MW, .scroll_width = MW,
+            .height = MH, .page_background = 0
+        };
+        TileCache menu_cache;
+        CHECK(tile_cache_init(&menu_cache, &budget, &menu_layout, 2)
+              && tile_cache_set_frame(&menu_cache, menu_frame, MW * MH)
+              && tile_cache_render_frame(&menu_cache, 0, MW, MH, NULL));
+        memcpy(menu_expected, menu_frame, sizeof(menu_frame));
+        for (int frame = 0; frame < 3; frame++) {
+            CHECK(tile_cache_sync_canvas_paint(&menu_cache, 0, 0, MW, MH)
+                  && tile_cache_render_canvas_frame_fast(
+                         &menu_cache, 0, MW, MH)
+                         == RENDER_CANVAS_FRAME_COMPLETE
+                  && menu_cache.canvas_overlay_ready
+                  && menu_cache.canvas_overlay_region_count
+                         <= TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT
+                  && menu_cache.canvas_overlay_pixel_count <= (size_t) MW * MH
+                  && menu_cache.canvas_overlay_builds == 1u
+                  && memcmp(menu_frame, menu_expected,
+                            sizeof(menu_frame)) == 0);
+        }
+        CHECK(menu_frame[(size_t) 100 * MW + 100] == test_rgb565(0x102b38)
+              && menu_frame[(size_t) 70 * MW + 50] == test_rgb565(0x3ad7b6)
+              && menu_frame[(size_t) 10 * MW + 10] != test_rgb565(0x183878)
+              && menu_frame[(size_t) 30 * MW + 10] == test_rgb565(0x183878));
+        tile_cache_destroy(&menu_cache);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: box-shadow edge and core runs match the per-pixel distance field");
+    {
+        /* Glows of many sizes, blurs and radii (including the clamped
+           pill and a shadow narrower than its blur), partly off screen,
+           rasterized into tiles (opaque target) and into a retained canvas
+           overlay (alpha target), with and without the separable runs. */
+        enum { SW = 200, SH = 120, SHADOWS = 9 };
+        static uint16_t fast_frame[SW * SH], reference_frame[SW * SH];
+        static unsigned char shadow_canvas_pixels[4 * 2 * 4];
+        for (size_t pixel = 0; pixel < 8u; pixel++) {
+            shadow_canvas_pixels[pixel * 4u] = 0x30;
+            shadow_canvas_pixels[pixel * 4u + 1u] = 0x18;
+            shadow_canvas_pixels[pixel * 4u + 2u] = 0x60;
+            shadow_canvas_pixels[pixel * 4u + 3u] = 0xff;
+        }
+        ImageResource shadow_canvas = {
+            .pixels = shadow_canvas_pixels, .source_width = 4,
+            .source_height = 2, .width = 4, .height = 2,
+            .is_canvas = true, .canvas_opaque = true
+        };
+        static const int geometry[SHADOWS][6] = {
+            /* x, y, width, height, blur, radius */
+            {10, 8, 90, 50, 9, 0}, {120, 6, 70, 40, 18, 10},
+            {-20, 70, 80, 60, 6, 30}, {150, 80, 70, 60, 3, 2},
+            {60, 30, 100, 64, 18, 100}, {20, 90, 40, 20, 12, 4},
+            {100, 100, 36, 30, 17, 0}, {170, -10, 60, 30, 1, 8},
+            {40, 40, 120, 50, 31, 12}
+        };
+        for (int layer = 0; layer < 2; layer++) {
+            DrawCommand commands[1 + SHADOWS];
+            commands[0] = (DrawCommand) {
+                .image = &shadow_canvas, .x = 0, .y = 0, .width = SW,
+                .height = SH, .opacity_scale = 256, .type = DRAW_IMAGE,
+                .image_fit = LAYOUT_IMAGE_FIT_STRETCH};
+            for (int at = 0; at < SHADOWS; at++) {
+                int blur = geometry[at][4];
+                commands[1 + at] = (DrawCommand) {
+                    .color = at % 2 == 0 ? 0x3ad7b6u : 0xffd76fu,
+                    .x = geometry[at][0] - 2 * blur,
+                    .y = geometry[at][1] - 2 * blur,
+                    .width = geometry[at][2] + 4 * blur,
+                    .height = geometry[at][3] + 4 * blur,
+                    .scale = blur, .radius = geometry[at][5],
+                    .opacity_scale = (uint16_t) (at % 3 == 0 ? 256 : 72),
+                    .type = DRAW_SHADOW_RECT,
+                    /* Every other glow is clipped to outside its box: the
+                       reference then tests coverage at every pixel instead
+                       of skipping the box interior and its core. */
+                    .image_fit = at % 2 == 1 ? LAYOUT_SHADOW_OUTSIDE_BOX
+                                             : 0};
+            }
+            uint32_t order[1 + SHADOWS];
+            uint8_t flags[1 + SHADOWS] = {0};
+            for (uint32_t at = 0; at < 1 + SHADOWS; at++) order[at] = at;
+            /* layer 0: tiles over a solid page; 1: the canvas overlay. */
+            size_t first = layer == 0 ? 1u : 0u;
+            LayoutDocument shadow_layout = {
+                .budget = &budget, .commands = commands + first,
+                .count = 1 + SHADOWS - first, .paint_order = order,
+                .paint_order_count = 1 + SHADOWS - first,
+                .command_flags = flags, .width = SW, .scroll_width = SW,
+                .height = SH, .page_background = 0x102030
+            };
+            for (int reference = 0; reference < 2; reference++) {
+                tilefinch_test_faults()->shadow_reference_raster =
+                    reference != 0;
+                uint16_t *frame = reference ? reference_frame : fast_frame;
+                memset(frame, 0, sizeof(fast_frame));
+                TileCache shadow_cache;
+                CHECK(tile_cache_init(&shadow_cache, &budget,
+                                      &shadow_layout, 8)
+                      && tile_cache_set_frame(&shadow_cache, frame, SW * SH)
+                      && tile_cache_render_frame(&shadow_cache, 0, SW, SH,
+                                                 NULL));
+                if (layer == 1) {
+                    CHECK(tile_cache_sync_canvas_paint(
+                              &shadow_cache, 0, 0, SW, SH)
+                          && tile_cache_render_canvas_frame_fast(
+                                 &shadow_cache, 0, SW, SH)
+                                 == RENDER_CANVAS_FRAME_COMPLETE
+                          && shadow_cache.canvas_overlay_ready);
+                }
+                tile_cache_destroy(&shadow_cache);
+            }
+            tilefinch_test_faults()->shadow_reference_raster = false;
+            size_t differing = 0;
+            for (size_t at = 0; at < (size_t) SW * SH; at++)
+                differing += fast_frame[at] != reference_frame[at];
+            if (differing != 0)
+                fprintf(stderr, "shadow layer %d: %zu pixels differ\n",
+                        layer, differing);
+            CHECK(differing == 0 && budget.current == 0);
+        }
+        /* A clipped glow leaves its box's interior untouched and still
+           paints outside it, over tiles and into the retained overlay. */
+        for (int layer = 0; layer < 2; layer++) {
+            DrawCommand commands[2];
+            commands[0] = (DrawCommand) {
+                .image = &shadow_canvas, .x = 0, .y = 0, .width = SW,
+                .height = SH, .opacity_scale = 256, .type = DRAW_IMAGE,
+                .image_fit = LAYOUT_IMAGE_FIT_STRETCH};
+            commands[1] = (DrawCommand) {
+                /* The box is 40,30 120x60; the command box is it
+                   inflated by the blur. */
+                .color = 0x3ad7b6u, .x = 40 - 18, .y = 30 - 18,
+                .width = 120 + 36, .height = 60 + 36, .scale = 18,
+                .radius = 10, .opacity_scale = 256, .type = DRAW_SHADOW_RECT,
+                .image_fit = LAYOUT_SHADOW_OUTSIDE_BOX};
+            uint32_t order[2] = {0, 1};
+            uint8_t flags[2] = {0};
+            size_t first = layer == 0 ? 1u : 0u;
+            LayoutDocument clipped_layout = {
+                .budget = &budget, .commands = commands + first,
+                .count = 2 - first, .paint_order = order,
+                .paint_order_count = 2 - first, .command_flags = flags,
+                .width = SW, .scroll_width = SW, .height = SH,
+                .page_background = 0x102030
+            };
+            memset(fast_frame, 0, sizeof(fast_frame));
+            TileCache clipped_cache;
+            CHECK(tile_cache_init(&clipped_cache, &budget, &clipped_layout, 8)
+                  && tile_cache_set_frame(&clipped_cache, fast_frame, SW * SH)
+                  && tile_cache_render_frame(&clipped_cache, 0, SW, SH, NULL));
+            if (layer == 1) {
+                CHECK(tile_cache_sync_canvas_paint(
+                          &clipped_cache, 0, 0, SW, SH)
+                      && tile_cache_render_canvas_frame_fast(
+                             &clipped_cache, 0, SW, SH)
+                             == RENDER_CANVAS_FRAME_COMPLETE);
+            }
+            uint16_t ground = layer == 0 ? test_rgb565(0x102030)
+                                         : test_rgb565(0x301860);
+            /* Inside the box (centre, its first row, within a rounded
+               corner) and just outside it (above, left, past the corner). */
+            CHECK(fast_frame[(size_t) 60 * SW + 100] == ground
+                  && fast_frame[(size_t) 30 * SW + 100] == ground
+                  && fast_frame[(size_t) 34 * SW + 46] == ground
+                  && fast_frame[(size_t) 31 * SW + 41] != ground
+                  && fast_frame[(size_t) 29 * SW + 100] != ground
+                  && fast_frame[(size_t) 60 * SW + 39] != ground);
+            tile_cache_destroy(&clipped_cache);
+        }
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: translucent overlay blit matches the reference blend for every RGB565 code");
+    {
+        /* A 256x256 canvas holds every RGB565 code once; translucent
+           panels of several colours/opacities are blitted over it. The
+           expected pixel is the reference source-over formula on the
+           retained overlay colour and alpha. */
+        enum { BW = 256, BH = 256 };
+        static uint16_t blit_frame[BW * BH];
+        static unsigned char blit_canvas_pixels[BW * BH * 4];
+        for (unsigned code = 0; code < 65536u; code++) {
+            unsigned r = (code >> 11) & 31u, g = (code >> 5) & 63u, b = code & 31u;
+            blit_canvas_pixels[code * 4u] = (unsigned char) (r << 3);
+            blit_canvas_pixels[code * 4u + 1u] = (unsigned char) (g << 2);
+            blit_canvas_pixels[code * 4u + 2u] = (unsigned char) (b << 3);
+            blit_canvas_pixels[code * 4u + 3u] = 0xff;
+        }
+        ImageResource blit_canvas = {
+            .pixels = blit_canvas_pixels, .source_width = BW,
+            .source_height = BH, .width = BW, .height = BH,
+            .is_canvas = true, .canvas_opaque = true
+        };
+        static const uint32_t colors[] = {0x04121e, 0xffd76f, 0x3ad7b6};
+        static const unsigned opacities[] = {238, 128, 51, 3};
+        for (size_t c = 0; c < 3u; c++) {
+            for (size_t o = 0; o < 4u; o++) {
+                DrawCommand blit_commands[] = {
+                    {.image=&blit_canvas, .x=0, .y=0, .width=BW, .height=BH,
+                     .opacity_scale=256, .type=DRAW_IMAGE,
+                     .image_fit=LAYOUT_IMAGE_FIT_STRETCH},
+                    {.color=colors[c], .x=0, .y=0, .width=BW, .height=BH,
+                     .opacity_scale=(uint16_t) opacities[o],
+                     .type=DRAW_FILL_RECT}
+                };
+                uint32_t blit_order[] = {0, 1};
+                uint8_t blit_flags[] = {0, 0};
+                LayoutDocument blit_layout = {
+                    .budget = &budget, .commands = blit_commands, .count = 2,
+                    .paint_order = blit_order, .paint_order_count = 2,
+                    .command_flags = blit_flags, .width = BW,
+                    .scroll_width = BW, .height = BH, .page_background = 0
+                };
+                TileCache blit_cache;
+                CHECK(tile_cache_init(&blit_cache, &budget, &blit_layout, 2)
+                      && tile_cache_set_frame(&blit_cache, blit_frame, BW * BH)
+                      && tile_cache_render_frame(&blit_cache, 0, BW, BH, NULL)
+                      && tile_cache_sync_canvas_paint(&blit_cache, 0, 0, BW, BH)
+                      && tile_cache_render_canvas_frame_fast(
+                             &blit_cache, 0, BW, BH)
+                             == RENDER_CANVAS_FRAME_COMPLETE
+                      && blit_cache.canvas_overlay_ready
+                      && blit_cache.canvas_overlay_region_count == 1u);
+                size_t checked = 0;
+                for (unsigned code = 0; code < 65536u; code++) {
+                    unsigned alpha = blit_cache.canvas_overlay_alpha[code];
+                    uint16_t over = blit_cache.canvas_overlay_pixels[code];
+                    uint16_t expected = (uint16_t) code;
+                    if (alpha == 255u) expected = over;
+                    else if (alpha != 0u) {
+                        unsigned inverse = 255u - alpha;
+                        unsigned sr = tilefinch_rgb5_to_u8(over >> 11);
+                        unsigned sg = tilefinch_rgb6_to_u8((over >> 5) & 63u);
+                        unsigned sb = tilefinch_rgb5_to_u8(over & 31u);
+                        unsigned dr = tilefinch_rgb5_to_u8(code >> 11);
+                        unsigned dg = tilefinch_rgb6_to_u8((code >> 5) & 63u);
+                        unsigned db = tilefinch_rgb5_to_u8(code & 31u);
+                        expected = tilefinch_rgb565_pack_u8(
+                            tilefinch_div255_u16(sr * alpha + dr * inverse + 127u),
+                            tilefinch_div255_u16(sg * alpha + dg * inverse + 127u),
+                            tilefinch_div255_u16(sb * alpha + db * inverse + 127u));
+                        checked++;
+                    }
+                    if (blit_frame[code] != expected) {
+                        fprintf(stderr, "overlay blit code=%04x alpha=%u over=%04x "
+                                "got=%04x expected=%04x\n", code, alpha, over,
+                                blit_frame[code], expected);
+                        return 1;
+                    }
+                }
+                CHECK(checked == 65536u);
+                tile_cache_destroy(&blit_cache);
+                CHECK(budget.current == 0);
+            }
+        }
+    }
 
     puts("test: transient decoded-image OOM retries after tile pressure");
     DrawCommand retry_image_command = {

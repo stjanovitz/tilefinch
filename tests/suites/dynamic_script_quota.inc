@@ -270,8 +270,11 @@ cleanup:
 static bool test_dynamic_byte_reservation_waits_for_actual_length(
     Budget *budget)
 {
+    /* A network response holds no source bytes while in flight: both
+       requests start at once and each is admitted against its exact length
+       when it arrives, in arrival order. */
     const char *test_name =
-        "dynamic byte reservation waits for actual peer length";
+        "dynamic responses hold no source quota while in flight";
     static const char empty_page[] =
         "<!doctype html><head></head><body></body>";
     static const char append_scripts[] =
@@ -322,14 +325,25 @@ static bool test_dynamic_byte_reservation_waits_for_actual_length(
     REQUIRE(strcmp(navigation.page.script_result.summary,
                    "quota-overlap:pending") == 0);
     REQUIRE(navigation.page.script_result.dynamic_scripts_queued == 2u);
-    REQUIRE(navigation.page.script_result.dynamic_scripts_started == 1u);
+    REQUIRE(navigation.page.script_result.dynamic_scripts_started == 2u);
     REQUIRE(navigation.page.script_result.dynamic_scripts_quota_rejected
             == 0u);
     size_t advances = 0;
-    REQUIRE(advance_until(
-        &navigation,
-        "quota-overlap:execute:a,load:a,execute:b,load:b",
-        32, &advances));
+    /* Both are in flight; they run in arrival order. */
+    for (size_t step = 0; step < 32u
+         && strcmp(navigation.page.script_result.summary,
+                   "quota-overlap:execute:a,load:a,execute:b,load:b") != 0
+         && strcmp(navigation.page.script_result.summary,
+                   "quota-overlap:execute:b,load:b,execute:a,load:a") != 0;
+         step++) {
+        REQUIRE(navigation_advance_runtime(&navigation, 1, 1));
+        advances = step + 1u;
+    }
+    REQUIRE(strcmp(navigation.page.script_result.summary,
+                   "quota-overlap:execute:a,load:a,execute:b,load:b") == 0
+            || strcmp(navigation.page.script_result.summary,
+                      "quota-overlap:execute:b,load:b,execute:a,load:a")
+                   == 0);
     REQUIRE(navigation.page.script_result.dynamic_scripts_started == 2u);
     REQUIRE(navigation.page.script_result.dynamic_scripts_completed == 2u);
     REQUIRE(navigation.page.script_result.dynamic_scripts_failed == 0u);
@@ -362,15 +376,17 @@ static bool test_dynamic_scheduler_backpressure_retries(Budget *budget)
         "<!doctype html><head></head><body></body>";
     static const char append_scripts[] =
         "globalThis.schedulerEvents=[];"
-        "for(const name of ['a','b','c']){"
+        "for(const name of ['a','b','c','d','e','f']){"
         "const script=document.createElement('script');"
         "script.src='/'+name+'.js';"
+        "const report=()=>{const loads=schedulerEvents.filter("
+        "e=>e.startsWith('load:')).length;const errors=schedulerEvents"
+        ".filter(e=>e.startsWith('error:')).length;"
+        "globalThis.pocSummary='scheduler:loads='+loads+',errors='+errors;};"
         "script.addEventListener('load',()=>{"
-        "schedulerEvents.push('load:'+name);"
-        "globalThis.pocSummary='scheduler:'+schedulerEvents.join(',');});"
+        "schedulerEvents.push('load:'+name);report();});"
         "script.addEventListener('error',()=>{"
-        "schedulerEvents.push('error:'+name);"
-        "globalThis.pocSummary='scheduler:'+schedulerEvents.join(',');});"
+        "schedulerEvents.push('error:'+name);report();});"
         "document.head.appendChild(script);}"
         "globalThis.pocSummary='scheduler:pending';";
     static const char a_source[] =
@@ -379,13 +395,29 @@ static bool test_dynamic_scheduler_backpressure_retries(Budget *budget)
         "globalThis.schedulerEvents.push('execute:b');";
     static const char c_source[] =
         "globalThis.schedulerEvents.push('execute:c');";
-    ScriptReplayRecord records[3] = {
+    static const char d_source[] =
+        "globalThis.schedulerEvents.push('execute:d');";
+    static const char e_source[] =
+        "globalThis.schedulerEvents.push('execute:e');";
+    static const char f_source[] =
+        "globalThis.schedulerEvents.push('execute:f');";
+    /* Six scripts against SCRIPT_DYNAMIC_INFLIGHT_REQUESTS (4) in flight:
+       the first four start, the rest wait for a completion and then start
+       without an error event. The delayed first response holds its slot
+       but not the others'. */
+    ScriptReplayRecord records[6] = {
         {.url = "https://scheduler-backpressure.test/a.js",
-         .source = a_source, .delay_pumps = 4},
+         .source = a_source, .delay_pumps = 6},
         {.url = "https://scheduler-backpressure.test/b.js",
          .source = b_source},
         {.url = "https://scheduler-backpressure.test/c.js",
-         .source = c_source}
+         .source = c_source},
+        {.url = "https://scheduler-backpressure.test/d.js",
+         .source = d_source},
+        {.url = "https://scheduler-backpressure.test/e.js",
+         .source = e_source},
+        {.url = "https://scheduler-backpressure.test/f.js",
+         .source = f_source}
     };
     char directory[128] = {0}, error[256] = {0};
     BrowserSession browser = {0};
@@ -393,7 +425,7 @@ static bool test_dynamic_scheduler_backpressure_retries(Budget *budget)
     bool fixture_ready = false, replaying = false;
     bool browser_ready = false, navigation_ready = false, ok = true;
 
-    REQUIRE(write_replay_fixture(directory, records, 3));
+    REQUIRE(write_replay_fixture(directory, records, 6));
     fixture_ready = true;
     REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
     replaying = true;
@@ -402,13 +434,14 @@ static bool test_dynamic_scheduler_backpressure_retries(Budget *budget)
     REQUIRE(start_custom_runtime_page(
         &navigation, budget, &browser,
         "https://scheduler-backpressure.test/", empty_page,
-        3, 48u * MIB, 8u * MIB));
+        6, 2u * MIB, 512u * 1024u));
     navigation_ready = true;
     REQUIRE(evaluate(
         &navigation, append_scripts, "<append-scheduler-backpressure>"));
     REQUIRE(navigation_advance_runtime(&navigation, 1, 1));
-    REQUIRE(navigation.page.script_result.dynamic_scripts_queued == 3u);
-    if (navigation.page.script_result.dynamic_scripts_started != 1u) {
+    REQUIRE(navigation.page.script_result.dynamic_scripts_queued == 6u);
+    if (navigation.page.script_result.dynamic_scripts_started < 4u
+        || navigation.page.script_result.dynamic_scripts_started == 6u) {
         fprintf(stderr,
                 "%s started=%zu completed=%zu failed=%zu pending=%zu\n",
                 test_name,
@@ -417,15 +450,17 @@ static bool test_dynamic_scheduler_backpressure_retries(Budget *budget)
                 navigation.page.script_result.dynamic_scripts_failed,
                 navigation.page.script_result.pending_tasks);
     }
-    REQUIRE(navigation.page.script_result.dynamic_scripts_started == 1u);
+    /* At most SCRIPT_DYNAMIC_INFLIGHT_REQUESTS are in flight; a request
+       that completed in this turn frees a slot for the next. */
+    REQUIRE(navigation.page.script_result.dynamic_scripts_started
+                >= SCRIPT_DYNAMIC_INFLIGHT_REQUESTS
+            && navigation.page.script_result.dynamic_scripts_started < 6u);
     REQUIRE(navigation.page.script_result.dynamic_scripts_failed == 0u);
     size_t advances = 0;
     REQUIRE(advance_until(
-        &navigation,
-        "scheduler:execute:a,load:a,execute:b,load:b,execute:c,load:c",
-        48, &advances));
-    REQUIRE(navigation.page.script_result.dynamic_scripts_started == 3u);
-    REQUIRE(navigation.page.script_result.dynamic_scripts_completed == 3u);
+        &navigation, "scheduler:loads=6,errors=0", 48, &advances));
+    REQUIRE(navigation.page.script_result.dynamic_scripts_started == 6u);
+    REQUIRE(navigation.page.script_result.dynamic_scripts_completed == 6u);
     REQUIRE(navigation.page.script_result.dynamic_scripts_failed == 0u);
     REQUIRE(navigation.page.script_result.network_failures == 0u);
 
@@ -433,13 +468,394 @@ cleanup:
     if (navigation_ready) navigation_destroy(&navigation);
     if (browser_ready) browser_session_destroy(&browser);
     if (replaying) fetch_trace_end();
-    if (fixture_ready) remove_replay_fixture(directory, 3);
+    if (fixture_ready) remove_replay_fixture(directory, 6);
     if (budget->current != 0) {
         fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
                 budget->current);
         ok = false;
     }
     return ok;
+}
+
+/* m.vk.ru: a tracker host answered nothing for over five seconds while the
+   app's own chunks waited behind it. With the PSP app's source limits, a
+   stalled dynamic response must not hold the source quota or the response
+   bound the scripts after it need. */
+static bool test_stalled_dynamic_script_does_not_block_later_ones(
+    Budget *budget)
+{
+    const char *test_name = "a stalled dynamic script does not block others";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char append_scripts[] =
+        "globalThis.stallEvents=[];"
+        "for(const name of ['tracker','app','vendor']){"
+        "const script=document.createElement('script');"
+        "script.src='/'+name+'.js';"
+        "script.addEventListener('load',()=>{"
+        "stallEvents.push('load:'+name);"
+        "globalThis.pocSummary='stall:'+stallEvents.join(',');});"
+        "script.addEventListener('error',()=>{"
+        "stallEvents.push('error:'+name);"
+        "globalThis.pocSummary='stall:'+stallEvents.join(',');});"
+        "document.head.appendChild(script);}"
+        "globalThis.pocSummary='stall:pending';";
+    char *app_source = make_padded_script_source(
+        "globalThis.stallEvents.push('execute:app');", 300u * 1024u);
+    char *vendor_source = make_padded_script_source(
+        "globalThis.stallEvents.push('execute:vendor');", 400u * 1024u);
+    static const char tracker_source[] =
+        "globalThis.stallEvents.push('execute:tracker');";
+    ScriptReplayRecord records[3] = {
+        {.url = "https://stalled-tracker.test/tracker.js",
+         .source = tracker_source, .delay_pumps = 40},
+        {.url = "https://stalled-tracker.test/app.js",
+         .source = app_source},
+        {.url = "https://stalled-tracker.test/vendor.js",
+         .source = vendor_source}
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(app_source != NULL && vendor_source != NULL);
+    REQUIRE(write_replay_fixture(directory, records, 3));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://stalled-tracker.test/",
+        empty_page, 8, 2u * MIB, 512u * 1024u));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation, append_scripts, "<append-stall>"));
+    REQUIRE(navigation_advance_runtime(&navigation, 1, 1));
+    REQUIRE(navigation.page.script_result.dynamic_scripts_started == 3u);
+    size_t advances = 0;
+    /* Both later scripts run long before the tracker answers. */
+    REQUIRE(advance_until(
+        &navigation,
+        "stall:execute:app,load:app,execute:vendor,load:vendor", 12,
+        &advances));
+    REQUIRE(advance_until(
+        &navigation,
+        "stall:execute:app,load:app,execute:vendor,load:vendor,"
+        "execute:tracker,load:tracker", 64, &advances));
+    REQUIRE(navigation.page.script_result.dynamic_scripts_failed == 0u);
+    REQUIRE(navigation.page.script_result.dynamic_scripts_quota_rejected
+            == 0u);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 3);
+    free(vendor_source);
+    free(app_source);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+/* A script admitted on the planned (median) compile working set whose
+   compile needs far more is stopped by the realm's heap limit and refused
+   like a script that never fit: an error event on its element, no realm
+   retirement, and the next script runs. A literal table of small objects
+   compiles at about eleven times its source (10.8 MB for 949 KB on the
+   host), against a plan of about two. */
+static bool test_compile_over_heap_is_refused_with_realm_intact(
+    Budget *budget)
+{
+    const char *test_name = "a compile over the heap is refused alone";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char append_scripts[] =
+        "globalThis.heavyEvents=[];"
+        "for(const name of ['table','after']){"
+        "const script=document.createElement('script');"
+        "script.src='/'+name+'.js';script.async=false;"
+        "script.addEventListener('load',()=>{"
+        "heavyEvents.push('load:'+name);"
+        "globalThis.pocSummary='heavy:'+heavyEvents.join(',');});"
+        "script.addEventListener('error',()=>{"
+        "heavyEvents.push('error:'+name);"
+        "globalThis.pocSummary='heavy:'+heavyEvents.join(',');});"
+        "document.head.appendChild(script);}"
+        "globalThis.pocSummary='heavy:pending';";
+    static const char after_source[] =
+        "globalThis.heavyEvents.push('execute:after:'"
+        "+(typeof globalThis.table));";
+    size_t entries = 60000u, capacity = entries * 24u + 64u, used = 0;
+    char *table_source = malloc(capacity);
+    if (table_source != NULL) {
+        used = (size_t) snprintf(table_source, capacity,
+                                 "globalThis.table=[");
+        for (size_t i = 0; i < entries && used < capacity; i++) {
+            used += (size_t) snprintf(table_source + used, capacity - used,
+                                      "%s{a:%zu,b:\"x\"}",
+                                      i == 0 ? "" : ",", i);
+        }
+        if (used < capacity)
+            used += (size_t) snprintf(table_source + used, capacity - used,
+                                      "];");
+    }
+    ScriptReplayRecord records[2] = {
+        {.url = "https://heavy-compile.test/table.js",
+         .source = table_source},
+        {.url = "https://heavy-compile.test/after.js",
+         .source = after_source}
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(table_source != NULL && used > 900u * 1024u && used < capacity);
+    REQUIRE(write_replay_fixture(directory, records, 2));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://heavy-compile.test/",
+        empty_page, 8, 16u * MIB, 4u * MIB));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation, append_scripts, "<append-heavy>"));
+    size_t advances = 0;
+    REQUIRE(advance_until(
+        &navigation,
+        "heavy:error:table,execute:after:undefined,load:after", 32,
+        &advances));
+    REQUIRE(navigation.page.runtime != NULL);
+    REQUIRE(!navigation.page.script_degradation_observed);
+    REQUIRE(navigation.page.script_result.host_compile_memory_abandoned
+            == 1u);
+    REQUIRE(navigation.page.script_result.host_compile_memory_refusals
+            == 1u);
+    REQUIRE(strstr(navigation.page.script_result.error,
+                   "out of memory") == NULL);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 2);
+    free(table_source);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+/* The embedder's per-site answer for the gate page's site; any other URL
+   (a wrong one passed to the resolver) refuses, which the cases notice. */
+static ScriptHeavyPolicy heavy_gate_site_policy(void *opaque, const char *url)
+{
+    return strcmp(url, "https://heavy-gate.test/") == 0
+        ? *(const ScriptHeavyPolicy *) opaque : SCRIPT_HEAVY_POLICY_REFUSE;
+}
+
+/* Heavy pages: on an empty page under the ASK policy, a big dynamic
+   script that makes the page's script weight heavy waits, complete but not
+   run, until the answer; a small script keeps running meanwhile. Run
+   executes it; refuse fails it with an error event. RUN never holds.
+   With `stale_default`, the session's default is another site's choice and
+   `policy` comes from the per-site resolver: the realm must start with the
+   resolver's answer, not the default, before any poll could correct it. */
+static bool run_heavy_gate_case(Budget *budget, ScriptHeavyPolicy policy,
+                                int answer, const char *expected,
+                                const ScriptHeavyPolicy *stale_default)
+{
+    const char *test_name = "heavy page gate";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char append_scripts[] =
+        "globalThis.heavyGate=[];"
+        "for(const name of ['app','small']){"
+        "const script=document.createElement('script');"
+        "script.src='/'+name+'.js';"
+        "script.addEventListener('load',()=>{heavyGate.push('load:'+name);"
+        "globalThis.pocSummary='gate:'+heavyGate.join(',');});"
+        "script.addEventListener('error',()=>{heavyGate.push('error:'+name);"
+        "globalThis.pocSummary='gate:'+heavyGate.join(',');});"
+        "document.head.appendChild(script);}"
+        "globalThis.pocSummary='gate:pending';";
+    char *app_source = make_padded_script_source(
+        "globalThis.heavyGate.push('execute:app');", 2u * MIB);
+    static const char small_source[] =
+        "globalThis.heavyGate.push('execute:small');";
+    ScriptReplayRecord records[2] = {
+        {.url = "https://heavy-gate.test/app.js", .source = app_source},
+        {.url = "https://heavy-gate.test/small.js", .source = small_source,
+         .delay_pumps = 2}
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(app_source != NULL);
+    REQUIRE(write_replay_fixture(directory, records, 2));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page_heavy(
+        &navigation, budget, &browser, "https://heavy-gate.test/",
+        empty_page, 8, 16u * MIB, 4u * MIB,
+        stale_default != NULL ? *stale_default : policy,
+        stale_default != NULL ? heavy_gate_site_policy : NULL, &policy));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation, append_scripts, "<append-gate>"));
+    ScriptHeavyState state;
+    if (policy == SCRIPT_HEAVY_POLICY_ASK) {
+        size_t advances = 0;
+        REQUIRE(advance_until(&navigation,
+                              "gate:execute:small,load:small", 24,
+                              &advances));
+        /* The big body takes several transport turns to arrive. */
+        for (size_t i = 0; i < 64u; i++) {
+            REQUIRE(script_runtime_heavy_state(navigation.page.runtime,
+                                               &state));
+            if (state.waiting) break;
+            REQUIRE(navigation_advance_runtime(&navigation, 1, 1));
+        }
+        REQUIRE(strcmp(navigation.page.script_result.summary,
+                       "gate:execute:small,load:small") == 0);
+        REQUIRE(script_runtime_heavy_state(navigation.page.runtime, &state));
+        if (!state.waiting) {
+            fprintf(stderr, "heavy gate state class=%d waiting=%zu/%zu "
+                    "script=%zu estimate=%u text=%zu answered=%d "
+                    "summary=%s\n", (int) state.page_class,
+                    state.waiting_scripts, state.waiting_bytes,
+                    state.script_bytes, (unsigned) state.estimate_ms,
+                    state.visible_text_bytes, (int) state.answered,
+                    navigation.page.script_result.summary);
+        }
+        REQUIRE(state.waiting && state.waiting_scripts == 1u
+                && state.waiting_bytes == 2u * MIB);
+        REQUIRE(state.page_class == SCRIPT_HEAVY_CLASS_SHELL
+                || state.page_class == SCRIPT_HEAVY_CLASS_OVER);
+        REQUIRE(state.visible_text_bytes == 0u);
+        REQUIRE(state.estimate_ms >= SCRIPT_HEAVY_START_MS);
+        REQUIRE(script_runtime_answer_heavy(navigation.page.runtime,
+                                            answer != 0));
+    }
+    REQUIRE(advance_until(&navigation, expected, 96, NULL));
+    REQUIRE(script_runtime_heavy_state(navigation.page.runtime, &state));
+    REQUIRE(!state.waiting && state.waiting_scripts == 0u);
+    REQUIRE(state.refused_scripts
+            == (policy == SCRIPT_HEAVY_POLICY_ASK && answer == 0 ? 1u : 0u));
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 2);
+    free(app_source);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+/* A script refused as too large for the page (here over the realm's
+   per-script ceiling) makes the page over the best case, so the PSP app
+   explains it instead of leaving a silent empty shell (Bluesky's app bundle
+   is over the 4 MiB ceiling). */
+static bool test_oversized_script_marks_page_over(Budget *budget)
+{
+    const char *test_name = "an oversized script marks the page over";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char append_script[] =
+        "const s=document.createElement('script');s.src='/app.js';"
+        "s.addEventListener('error',()=>{globalThis.pocSummary='big:error'});"
+        "s.addEventListener('load',()=>{globalThis.pocSummary='big:load'});"
+        "document.head.appendChild(s);globalThis.pocSummary='big:pending';";
+    char *app_source = make_padded_script_source(
+        "globalThis.ranBig=true;", 200u * 1024u);
+    ScriptReplayRecord record = {
+        .url = "https://oversized.test/app.js", .source = app_source
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(app_source != NULL);
+    REQUIRE(write_replay_fixture(directory, &record, 1));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://oversized.test/",
+        empty_page, 4, 2u * MIB, 64u * 1024u));
+    navigation_ready = true;
+    ScriptHeavyState state;
+    REQUIRE(script_runtime_heavy_state(navigation.page.runtime, &state)
+            && state.page_class == SCRIPT_HEAVY_CLASS_NONE);
+    REQUIRE(evaluate(&navigation, append_script, "<append-oversized>"));
+    REQUIRE(advance_until(&navigation, "big:error", 64, NULL));
+    REQUIRE(script_runtime_heavy_state(navigation.page.runtime, &state));
+    REQUIRE(state.page_class == SCRIPT_HEAVY_CLASS_OVER
+            && state.oversized_scripts == 1u
+            && state.oversized_bytes == 200u * 1024u && !state.waiting);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 1);
+    free(app_source);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool test_heavy_page_gate(Budget *budget)
+{
+    /* The previous site was always allowed (RUN), or the setting is Basic
+       view (REFUSE) while this site is always allowed. */
+    const ScriptHeavyPolicy previous_site_run = SCRIPT_HEAVY_POLICY_RUN;
+    const ScriptHeavyPolicy setting_refuse = SCRIPT_HEAVY_POLICY_REFUSE;
+    return run_heavy_gate_case(
+               budget, SCRIPT_HEAVY_POLICY_ASK, 1,
+               "gate:execute:small,load:small,execute:app,load:app", NULL)
+        && run_heavy_gate_case(
+               budget, SCRIPT_HEAVY_POLICY_ASK, 0,
+               "gate:execute:small,load:small,error:app", NULL)
+        && run_heavy_gate_case(
+               budget, SCRIPT_HEAVY_POLICY_RUN, 1,
+               "gate:execute:small,load:small,execute:app,load:app", NULL)
+        && run_heavy_gate_case(
+               budget, SCRIPT_HEAVY_POLICY_ASK, 0,
+               "gate:execute:small,load:small,error:app",
+               &previous_site_run)
+        && run_heavy_gate_case(
+               budget, SCRIPT_HEAVY_POLICY_RUN, 1,
+               "gate:execute:small,load:small,execute:app,load:app",
+               &setting_refuse);
 }
 
 static char *make_resource_loader_envelope(size_t padding_per_statement)

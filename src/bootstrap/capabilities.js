@@ -218,4 +218,116 @@
   globalThis.MediaSource = MediaSource;
   globalThis.SourceBuffer = SourceBuffer;
   globalThis.SourceBufferList = SourceBufferList;
+
+  /* document.fonts. Pages cannot create FontFace objects here, so every
+     document's set is empty and settled: ready is resolved, check() is true
+     (no face in the set needs loading) and load() resolves with no faces.
+     Page @font-face rules still load natively; they are just not exposed as
+     FontFace objects. The loading events never fire. */
+  const fontSetToken = {},
+    fontSets = createPrivateWeakMap(),
+    fontSetSlots = createPrivateWeakMap(),
+    /* The cascade's own font shorthand grammar. */
+    fontShorthandValid = globalThis.__tilefinchFontShorthandValid;
+  const requireFontSet = (value) => {
+    const slots = fontSetSlots.get(value);
+    if (!slots) throw new TypeError("Illegal invocation");
+    return slots;
+  };
+  const parseFont = (font) => {
+    if (!fontShorthandValid(String(font)))
+      throw new DOMException("Could not parse font", "SyntaxError");
+  };
+  class FontFaceSet extends EventTarget {
+    constructor(token) {
+      if (token !== fontSetToken) throw new TypeError("Illegal constructor");
+      super();
+      const slots = { loading: null, loadingdone: null, loadingerror: null };
+      fontSetSlots.set(this, slots);
+      slots.ready = Promise.resolve(this);
+    }
+    get ready() { return requireFontSet(this).ready; }
+    get status() { requireFontSet(this); return "loaded"; }
+    get size() { requireFontSet(this); return 0; }
+    add(face) {
+      requireFontSet(this);
+      throw new TypeError("Argument 1 is not a FontFace");
+    }
+    delete(face) { requireFontSet(this); return false; }
+    has(face) { requireFontSet(this); return false; }
+    clear() { requireFontSet(this); }
+    check(font, text) { requireFontSet(this); parseFont(font); return true; }
+    load(font, text) {
+      try {
+        requireFontSet(this);
+        parseFont(font);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return Promise.resolve([]);
+    }
+    forEach(callback, thisArg) {
+      requireFontSet(this);
+      if (typeof callback !== "function")
+        throw new TypeError("callback is not a function");
+    }
+    values() { requireFontSet(this); return [].values(); }
+  }
+  FontFaceSet.prototype.keys = FontFaceSet.prototype.values;
+  FontFaceSet.prototype.entries = FontFaceSet.prototype.values;
+  FontFaceSet.prototype[Symbol.iterator] = FontFaceSet.prototype.values;
+  for (const type of ["loading", "loadingdone", "loadingerror"])
+    Object.defineProperty(FontFaceSet.prototype, "on" + type, {
+      configurable: true,
+      enumerable: true,
+      get() { return requireFontSet(this)[type]; },
+      set(value) {
+        requireFontSet(this)[type] = typeof value === "function" ? value : null;
+      },
+    });
+  const DocumentInterface = globalThis.Document;
+  if (typeof DocumentInterface === "function")
+    Object.defineProperty(DocumentInterface.prototype, "fonts", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof DocumentInterface))
+          throw new TypeError("Illegal invocation");
+        let set = fontSets.get(this);
+        if (!set) fontSets.set(this, (set = new FontFaceSet(fontSetToken)));
+        return set;
+      },
+    });
+
+  /* Event Timing's interface, for feature detection. Tilefinch records no
+     event or first-input entries, so PerformanceObserver.supportedEntryTypes
+     does not list them and no instance ever exists. */
+  class PerformanceEventTiming extends PerformanceEntry {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+  }
+  const noEventTiming = function () {
+    throw new TypeError("Illegal invocation");
+  };
+  for (const name of [
+    "processingStart", "processingEnd", "cancelable", "target",
+    "interactionId",
+  ])
+    Object.defineProperty(PerformanceEventTiming.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get: noEventTiming,
+    });
+  PerformanceEventTiming.prototype.toJSON = noEventTiming;
+  for (const [constructor, tag] of [
+    [FontFaceSet, "FontFaceSet"],
+    [PerformanceEventTiming, "PerformanceEventTiming"],
+  ])
+    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: tag,
+    });
+  globalThis.FontFaceSet = FontFaceSet;
+  globalThis.PerformanceEventTiming = PerformanceEventTiming;
 })();

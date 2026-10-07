@@ -3,6 +3,7 @@
 #include "../src/psp_navigation_watchdog.h"
 #include "../src/tilefinch_test_faults.h"
 #include "../src/style_cache_internal.h"
+#include "tilefinch/work_vector.h"
 
 #include <stdarg.h>
 
@@ -44,6 +45,12 @@ static bool test_cache_put_stylesheet(BrowserSession *session,
             session, url, &context, url, "");
     browser_shared_body_release(body);
     return stored;
+}
+
+/* The engine's Budget reclaim hook: compiled-script tables give way. */
+static size_t test_reclaim_script_bytecode(void *opaque, size_t needed)
+{
+    return browser_session_script_bytecode_reclaim(opaque, needed);
 }
 
 static bool test_cache_put_classic_script(
@@ -240,6 +247,9 @@ static bool test_document_equivalent(PocDocument *left,
         && left->element_count == right->element_count
         && left->text_bytes == right->text_bytes
         && left->glyph_script_mask == right->glyph_script_mask
+        && left->glyph_census.offer_mask == right->glyph_census.offer_mask
+        && memcmp(left->glyph_census.samples, right->glyph_census.samples,
+                  sizeof(left->glyph_census.samples)) == 0
         && left->bidi_text_present == right->bidi_text_present
         && left->bidi_markup_present == right->bidi_markup_present
         && strcmp(left->title, right->title) == 0
@@ -561,6 +571,7 @@ static bool test_parser_scripting_noscript_model(Budget *budget)
     return ok;
 }
 
+
 static bool test_parser_inert_script_payload_policy(Budget *budget)
 {
     static const char html[] =
@@ -627,6 +638,179 @@ static bool test_parser_inert_script_payload_policy(Budget *budget)
         lxb_dom_document_destroy_text(large->owner_document, large_text);
     document_parser_abort(&parser);
     document_destroy(&document);
+    return ok;
+}
+
+/* Lexbor collects a token that spans input windows (a <style> or <script>
+   body) in one temporary buffer sized to the largest such token. That
+   buffer, the token pools and the parser itself must not stay resident: the
+   buffer is trimmed between windows, a script body that is certain to be
+   truncated is dropped while it streams, and the finished document releases
+   its streaming parser while innerHTML still works. */
+enum {
+    PARSER_STORAGE_STYLE_RULES = 40000,
+    PARSER_STORAGE_SCRIPT_LINES = 90000,
+    PARSER_STORAGE_FEED = 32u * 1024u,
+    PARSER_STORAGE_INLINE_LIMIT = 384u * 1024u
+};
+
+static size_t test_tokenizer_capacity(const DocumentParser *parser)
+{
+    const lxb_html_tokenizer_t *tokenizer = parser->tokenizer;
+    return tokenizer == NULL || tokenizer->start == NULL ? 0
+        : (size_t) (tokenizer->end - tokenizer->start);
+}
+
+static char *test_large_token_page(size_t *length, size_t *style_bytes,
+                                   size_t *script_offset)
+{
+    static const char head[] = "<!doctype html><head><style id=sheet>";
+    static const char rule[] = ".r{color:red}\n";
+    static const char middle[] =
+        "</style></head><body><p id=before>before</p><script id=bundle>";
+    static const char line[] = "var x = 1;\n";
+    static const char tail[] =
+        "</script><div id=target>old</div><p id=after>after</p></body>";
+    size_t rules = (sizeof(rule) - 1u) * PARSER_STORAGE_STYLE_RULES;
+    size_t lines = (sizeof(line) - 1u) * PARSER_STORAGE_SCRIPT_LINES;
+    size_t total = sizeof(head) - 1u + rules + sizeof(middle) - 1u + lines
+        + sizeof(tail) - 1u;
+    char *html = malloc(total);
+    if (html == NULL) return NULL;
+    char *at = html;
+    memcpy(at, head, sizeof(head) - 1u);
+    at += sizeof(head) - 1u;
+    for (size_t i = 0; i < PARSER_STORAGE_STYLE_RULES; i++) {
+        memcpy(at, rule, sizeof(rule) - 1u);
+        at += sizeof(rule) - 1u;
+    }
+    memcpy(at, middle, sizeof(middle) - 1u);
+    at += sizeof(middle) - 1u;
+    *script_offset = (size_t) (at - html);
+    for (size_t i = 0; i < PARSER_STORAGE_SCRIPT_LINES; i++) {
+        memcpy(at, line, sizeof(line) - 1u);
+        at += sizeof(line) - 1u;
+    }
+    memcpy(at, tail, sizeof(tail) - 1u);
+    *length = total;
+    *style_bytes = rules;
+    return html;
+}
+
+static bool test_parser_releases_large_token_storage(Budget *budget)
+{
+    size_t length = 0, style_bytes = 0, script_offset = 0;
+    char *html = test_large_token_page(&length, &style_bytes,
+                                       &script_offset);
+    if (html == NULL) return false;
+    DocumentParser parser = {0};
+    PocDocument document = {0};
+    bool ok = document_parser_begin(&parser, budget)
+        && document_parser_set_scripting(&parser, true)
+        && document_parser_set_inert_script_policy(
+               &parser, false, 256u * 1024u, PARSER_STORAGE_INLINE_LIMIT);
+    size_t fed = 0;
+    size_t after_style_capacity = SIZE_MAX;
+    size_t mid_script_capacity = SIZE_MAX;
+    size_t script_midpoint = script_offset
+        + (length - script_offset) * 3u / 4u;
+    while (ok && fed < length) {
+        size_t chunk = length - fed < PARSER_STORAGE_FEED
+            ? length - fed : PARSER_STORAGE_FEED;
+        ok = document_parser_feed(&parser, html + fed, chunk);
+        fed += chunk;
+        if (after_style_capacity == SIZE_MAX && fed >= script_offset) {
+            after_style_capacity = test_tokenizer_capacity(&parser);
+        }
+        if (mid_script_capacity == SIZE_MAX && fed >= script_midpoint) {
+            mid_script_capacity = test_tokenizer_capacity(&parser);
+        }
+    }
+    lxb_dom_node_t *bundle = ok ? find_id(
+        lxb_dom_interface_node(parser.document.html), "bundle") : NULL;
+    bool truncated = bundle != NULL
+        && document_parser_script_was_truncated(&parser, bundle);
+    ok = ok && document_parser_finish(&parser, &document);
+    size_t dom_bytes = budget->categories[BUDGET_CATEGORY_DOM].current;
+    bool parser_released = ok
+        && document.html->dom_document.parser == NULL;
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *sheet = root == NULL ? NULL : find_id(root, "sheet");
+    size_t sheet_bytes = 0;
+    if (sheet != NULL && sheet->first_child != NULL) {
+        (void) document_text_data(sheet->first_child, &sheet_bytes);
+    }
+    lxb_dom_node_t *target = root == NULL ? NULL : find_id(root, "target");
+    static const char replacement[] = "<b id=fresh>fresh</b>";
+    bool inner = target != NULL && document_set_element_inner_html(
+        &document, target, replacement, sizeof(replacement) - 1u);
+    /* The fragment parser it creates is compact and kept for reuse. */
+    size_t fragment_parser_bytes =
+        budget->categories[BUDGET_CATEGORY_DOM].current > dom_bytes
+        ? budget->categories[BUDGET_CATEGORY_DOM].current - dom_bytes : 0;
+    inner = inner && document.html->dom_document.parser != NULL
+        && fragment_parser_bytes < 160u * 1024u;
+    ok = ok && after_style_capacity <= 64u * 1024u
+        && mid_script_capacity <= PARSER_STORAGE_INLINE_LIMIT + 32u * 1024u
+        && truncated && sheet_bytes == style_bytes
+        && parser_released && dom_bytes < style_bytes + 512u * 1024u
+        && inner && find_id(root, "fresh") != NULL
+        && find_id(root, "after") != NULL;
+    if (!ok) {
+        fprintf(stderr,
+                "large token storage after-style=%zu mid-script=%zu "
+                "truncated=%d sheet=%zu/%zu dom=%zu released=%d inner=%d "
+                "fragment-parser=%zu\n",
+                after_style_capacity, mid_script_capacity, truncated,
+                sheet_bytes, style_bytes, dom_bytes, parser_released, inner,
+                fragment_parser_bytes);
+    }
+    document_parser_abort(&parser);
+    document_destroy(&document);
+
+    /* With scripting disabled an executable body is discarded as it
+       streams; the same page then parses to an equivalent document whether
+       it arrives in one call or in small windows. */
+    PocDocument whole = {0}, windowed = {0};
+    DocumentParser inert = {0};
+    ok = ok && document_parse(&whole, budget, html, length, length)
+        && document_parser_begin(&inert, budget)
+        && document_parser_set_scripting(&inert, false)
+        && document_parser_set_inert_script_policy(
+               &inert, true, 256u * 1024u, PARSER_STORAGE_INLINE_LIMIT);
+    fed = 0;
+    mid_script_capacity = SIZE_MAX;
+    while (ok && fed < length) {
+        size_t chunk = length - fed < 4096u ? length - fed : 4096u;
+        ok = document_parser_feed(&inert, html + fed, chunk);
+        fed += chunk;
+        if (mid_script_capacity == SIZE_MAX && fed >= script_midpoint) {
+            mid_script_capacity = test_tokenizer_capacity(&inert);
+        }
+    }
+    ok = ok && mid_script_capacity <= 64u * 1024u
+        && document_parser_finish(&inert, &windowed);
+    lxb_dom_node_t *whole_sheet = ok ? find_id(
+        lxb_dom_interface_node(whole.html), "sheet") : NULL;
+    lxb_dom_node_t *windowed_sheet = ok ? find_id(
+        lxb_dom_interface_node(windowed.html), "sheet") : NULL;
+    size_t whole_length = 0, windowed_length = 0;
+    const char *whole_text = whole_sheet == NULL ? NULL
+        : document_text_data(whole_sheet->first_child, &whole_length);
+    const char *windowed_text = windowed_sheet == NULL ? NULL
+        : document_text_data(windowed_sheet->first_child, &windowed_length);
+    ok = ok && whole_text != NULL && windowed_text != NULL
+        && whole_length == style_bytes && windowed_length == style_bytes
+        && memcmp(whole_text, windowed_text, style_bytes) == 0
+        && find_id(lxb_dom_interface_node(windowed.html), "after") != NULL;
+    if (!ok) {
+        fprintf(stderr, "inert large token mid-script=%zu sheet=%zu/%zu\n",
+                mid_script_capacity, windowed_length, whole_length);
+    }
+    document_parser_abort(&inert);
+    document_destroy(&windowed);
+    document_destroy(&whole);
+    free(html);
     return ok;
 }
 
@@ -1759,10 +1943,13 @@ static bool test_streaming_navigation_optional_work_shed(Budget *main_budget)
     bool loaded = replay_ready && navigation_load_url(
         &navigation, generation, "https://stream.test/document", 4096,
         1000, 480, NULL, NULL, true);
+    /* Whether external resources were shed with the realm depends only on
+       how much of the 4 MiB the parser left (the large-document pressure
+       shed takes both, a refused realm only itself); both are the same
+       static-page degradation, so only the realm is asserted. */
     bool ok = loaded && navigation.page.loaded
         && strcmp(navigation.page.document.title, "Stream & split") == 0
         && navigation.page.runtime == NULL
-        && navigation.page.resource_scheduler == NULL
         && navigation.performance.optional_work_sheds == 1;
     if (!ok) {
         fprintf(stderr,
@@ -2346,6 +2533,97 @@ static bool test_deep_document_resource_walkers(Budget *budget)
     return ok && budget->current == baseline;
 }
 
+/* SVG presentation attributes are CSS values: `fill="var(--x)"` takes the
+   element's custom property (Guardian's masthead logo), and a fallback
+   applies when the property is missing. A color function the rasterizer
+   cannot parse (MDN's light-dark() logo fill) is settled first, whether
+   the CSS or the attribute's var() produced it (utility-CSS colour tokens
+   are oklch()), and a fallback may itself be a var(). */
+static bool test_inline_svg_presentation_var(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        ":root{--logo-ink:#00ff00;--brand:oklch(62.8% 0.2577 29.23)}"
+        "</style><body>"
+        "<svg id=token width=8 height=8 viewBox='0 0 8 8' "
+        "fill='var(--brand)' xmlns='http://www.w3.org/2000/svg'>"
+        "<path d='M0 0h8v8H0z'/></svg>"
+        "<svg id=nested width=8 height=8 viewBox='0 0 8 8' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        "<path fill='var(--missing, var(--logo-ink))' d='M0 0h8v8H0z'/>"
+        "</svg>"
+        "<svg id=invalid width=8 height=8 viewBox='0 0 8 8' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        "<path fill='var(--missing)' d='M0 0h8v8H0z'/></svg>"
+        "<svg id=logo width=8 height=8 viewBox='0 0 8 8' "
+        "fill='var(--logo-ink)' xmlns='http://www.w3.org/2000/svg'>"
+        "<path d='M0 0h8v8H0z'/></svg>"
+        "<svg id=fallback width=8 height=8 viewBox='0 0 8 8' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        "<path fill='var(--missing, #0000ff)' d='M0 0h8v8H0z'/></svg>"
+        "<svg id=scheme width=8 height=8 viewBox='0 0 8 8' "
+        "style='fill:light-dark(#ff0000,#00ffff)' "
+        "xmlns='http://www.w3.org/2000/svg'><path d='M0 0h8v8H0z'/></svg>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool ok = document_parse(&document, budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && images_load_external(
+            &document, &stylesheet, &images, budget,
+            "https://inline-svg-var.test/", "https://inline-svg-var.test/",
+            NULL, 8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+    const ImageResource *logo = ok ? images_find_node(&images, find_id(
+        lxb_dom_interface_node(document.html), "logo")) : NULL;
+    const ImageResource *fallback = ok ? images_find_node(&images, find_id(
+        lxb_dom_interface_node(document.html), "fallback")) : NULL;
+    const ImageResource *scheme = ok ? images_find_node(&images, find_id(
+        lxb_dom_interface_node(document.html), "scheme")) : NULL;
+    const ImageResource *token = ok ? images_find_node(&images, find_id(
+        lxb_dom_interface_node(document.html), "token")) : NULL;
+    const ImageResource *nested = ok ? images_find_node(&images, find_id(
+        lxb_dom_interface_node(document.html), "nested")) : NULL;
+    const ImageResource *invalid = ok ? images_find_node(&images, find_id(
+        lxb_dom_interface_node(document.html), "invalid")) : NULL;
+    ok = ok && token != NULL && image_resource_available(token)
+        && token->pixels[0] > 240 && token->pixels[1] < 32
+        && token->pixels[2] < 32 && token->pixels[3] > 240
+        && nested != NULL && image_resource_available(nested)
+        && nested->pixels[0] < 16 && nested->pixels[1] > 240
+        && nested->pixels[2] < 16
+        /* Unset: the initial black fill, not an unknown colour's grey. */
+        && invalid != NULL && image_resource_available(invalid)
+        && invalid->pixels[0] < 16 && invalid->pixels[1] < 16
+        && invalid->pixels[2] < 16 && invalid->pixels[3] > 240;
+    if (!ok && token != NULL && token->pixels != NULL)
+        fprintf(stderr, "svg var fill: token=%u,%u,%u,%u\n",
+                token->pixels[0], token->pixels[1], token->pixels[2],
+                token->pixels[3]);
+    if (!ok && invalid != NULL && invalid->pixels != NULL)
+        fprintf(stderr, "svg var fill: invalid=%u,%u,%u,%u\n",
+                invalid->pixels[0], invalid->pixels[1], invalid->pixels[2],
+                invalid->pixels[3]);
+    ok = ok && scheme != NULL && image_resource_available(scheme)
+        && scheme->pixels[0] > 240 && scheme->pixels[1] < 16
+        && scheme->pixels[2] < 16;
+    ok = ok && logo != NULL && fallback != NULL
+        && image_resource_available(logo)
+        && image_resource_available(fallback)
+        && logo->pixels[0] < 16 && logo->pixels[1] > 240
+        && logo->pixels[2] < 16 && logo->pixels[3] > 240
+        && fallback->pixels[0] < 16 && fallback->pixels[1] < 16
+        && fallback->pixels[2] > 240;
+    if (!ok && logo != NULL && logo->pixels != NULL)
+        fprintf(stderr, "svg var fill: logo=%u,%u,%u,%u\n",
+                logo->pixels[0], logo->pixels[1], logo->pixels[2],
+                logo->pixels[3]);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok;
+}
+
 static bool test_inline_svg_resource(Budget *budget)
 {
     static const char html[] =
@@ -2826,16 +3104,20 @@ static bool image_rebuild_near_budget_rebuild(
         NULL, 480, NULL, 0);
 }
 
-/* The image-only rebuild keeps the outgoing table alive so unchanged inline
-   SVG rasters can move into the new one. Everything else in the outgoing
-   table (external images the rebuild decodes again) has to be released
-   before the load, or a page whose images only just fit could not be
-   rebuilt at all: both decodes of every image would be resident at once,
-   where the destroy-first rebuild needed room for one. */
+/* The image-only rebuild keeps the outgoing table alive so unchanged SVG
+   rasters can move into the new one. Everything else in the outgoing table
+   (images the rebuild decodes again: here SVG rasters whose markup outweighs
+   them, so they keep no markup) has to be released before the load, or a
+   page whose images only just fit could not be rebuilt at all: both decodes
+   of every image would be resident at once, where the destroy-first rebuild
+   needed room for one. */
 static bool test_image_rebuild_near_budget_releases_unlent_images(
     Budget *budget)
 {
-    char html[4096];
+    static char html[65536];
+    char padding[8400];
+    memset(padding, 'x', sizeof(padding) - 1u);
+    padding[sizeof(padding) - 1u] = '\0';
     int used = snprintf(html, sizeof(html),
         "<!doctype html><style>body{margin:0}img{display:block}</style>"
         "<body><svg id=icon width=16 height=16 viewBox='0 0 16 16'>"
@@ -2845,10 +3127,12 @@ static bool test_image_rebuild_near_budget_releases_unlent_images(
     };
     for (size_t i = 0; used > 0 && i < 6; i++) {
         used += snprintf(html + used, sizeof(html) - (size_t) used,
-            "<img width=128 height=128 src=\"data:image/svg+xml,"
-            "%%3csvg%%20xmlns='http://www.w3.org/2000/svg'%%20width='128'"
-            "%%20height='128'%%3e%%3cpath%%20fill='%%23%s'"
-            "%%20d='M0%%200h128v128H0z'/%%3e%%3c/svg%%3e\">", fills[i]);
+            "<img width=64 height=64 src=\"data:image/svg+xml,"
+            "%%3csvg%%20xmlns='http://www.w3.org/2000/svg'%%20width='64'"
+            "%%20height='64'%%3e%%3cdesc%%3e%s%%3c/desc%%3e"
+            "%%3cpath%%20fill='%%23%s'"
+            "%%20d='M0%%200h64v64H0z'/%%3e%%3c/svg%%3e\">", padding,
+            fills[i]);
     }
     size_t baseline = budget->current;
     size_t limit = budget->limit;
@@ -2867,7 +3151,7 @@ static bool test_image_rebuild_near_budget_releases_unlent_images(
     size_t loaded = images.stats.loaded;
     ok = ok && images.count == 7 && loaded == 7
         && images.stats.inline_svg_rasterized == 1
-        && images.stats.decoded_bytes >= 6u * 128u * 128u * 4u;
+        && images.stats.decoded_bytes >= 6u * 64u * 64u * 4u;
     size_t resident = budget->current;
     lxb_dom_node_t *icon = ok ? find_id(
         lxb_dom_interface_node(document.html), "icon") : NULL;
@@ -4357,7 +4641,7 @@ static const char page[] =
     "This malformed-ish page <b>still parses and wraps across a narrow device."
     "</div><p>Second <a href='/next'>link for scrolling</a>.</p>"
     "<script>const xs=[1,2,3].map(x=>x*2);globalThis.pocSummary="
-    "`${document.title}:${xs.join('-')}:${document.nodeCount}`;</script>";
+    "`${document.title}:${xs.join('-')}:`;</script>";
 
 static bool attribute_equals(lxb_dom_node_t *node, const char *name,
                              const char *wanted)
@@ -4494,10 +4778,854 @@ static uint32_t late_init_text_color(const LayoutDocument *layout,
     return UINT32_MAX;
 }
 
+/* Constructed stylesheets (Lit's static styles, shared through
+   adoptedStyleSheets). Each script leaves its verdict in pocSummary. */
+static bool constructed_sheet_step(NavigationSession *navigation,
+                                   const char *script, const char *expected)
+{
+    bool ok = svg_presentation_step(navigation, script);
+    const char *summary = navigation->page.script_result.summary;
+    if (!ok || strcmp(summary, expected) != 0) {
+        fprintf(stderr, "constructed sheet step: ok=%d summary=%s error=%s "
+                "navigation=%s\n", (int) ok, summary,
+                navigation->page.script_result.error, navigation->last_error);
+        return false;
+    }
+    return true;
+}
+
+/* Constructed-sheet steps build and parse sheets of a few hundred
+   kilobytes under the session's 1 s script watchdog. That is a backstop,
+   not the subject, but with the real clock a loaded host stretched one
+   step past it and the step ended "InternalError: interrupted". These
+   sessions run on a counting clock (1 us per read) from open to close, so
+   the watchdog and the layout slices count clock reads instead. */
+static TestCountingClock constructed_sheet_clock;
+static const TilefinchPlatformServices constructed_sheet_clock_services = {
+    .context = &constructed_sheet_clock,
+    .wall_time_ns = test_counting_clock_wall_ns,
+    .monotonic_time_ns = test_counting_clock_ns
+};
+
+static void constructed_sheet_close(NavigationSession *navigation)
+{
+    navigation_destroy(navigation);
+    tilefinch_platform_set_services(NULL);
+}
+
+static bool constructed_sheet_open(NavigationSession *navigation,
+                                   Budget *budget, const char *body)
+{
+    constructed_sheet_clock = (TestCountingClock) {.step_ns = UINT64_C(1000)};
+    tilefinch_platform_set_services(&constructed_sheet_clock_services);
+    char html[8192];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>p{color:#000000}x-host{display:block}"
+        "</style><body>%s", body);
+    if (used <= 0 || (size_t) used >= sizeof(html)) return false;
+    for (size_t i = 0; i < 40; i++) {
+        int n = snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<p>FILLER</p>");
+        if (n <= 0 || (size_t) n >= sizeof(html) - (size_t) used) return false;
+        used += n;
+    }
+    return svg_presentation_open(navigation, budget, html);
+}
+
+/* Real browsers have no rule cap: a Lit component whose shared sheet has
+   more than 1,024 rules must still render, and insertRule must keep
+   working past that count. A Tailwind escape (\') is not a quote. */
+static bool test_constructed_sheet_without_rule_cap(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<x-host id=host></x-host><p class=r1400>DOC1400</p>"
+        "<p class=\"tw['a']\">ESCAPED</p>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const host=document.getElementById('host');"
+        "const root=host.attachShadow({mode:'open'});"
+        "root.innerHTML='<p class=r1400>SHADOW1400</p>';"
+        "let css='';"
+        "for(let i=0;i<1500;i++)css+='.r'+i+'{color:#'"
+        "+(i===1400?'0000ff':'ff0000')+'}';"
+        "const sheet=new CSSStyleSheet(),escaped=new CSSStyleSheet();"
+        "let errors=[];"
+        "try{sheet.replaceSync(css)}catch(error){errors.push(error.message)}"
+        "try{escaped.replaceSync(String.raw`.tw\\[\\'a\\'\\]{color:#0000ff}`)}"
+        "catch(error){errors.push(error.message)}"
+        "root.adoptedStyleSheets=[sheet];"
+        "document.adoptedStyleSheets=[sheet,escaped];"
+        "const replaced=sheet.cssRules.length===1500"
+        "&&escaped.cssRules.length===1;let at=-1;"
+        "try{at=sheet.insertRule('.late{color:#00ff00}',1500)}"
+        "catch(error){errors.push(error.message)}"
+        "const inserted=at===1500&&sheet.cssRules.length===1501"
+        "&&sheet.cssRules[1500].selectorText==='.late';"
+        "if(inserted)sheet.deleteRule(1500);"
+        "const grown=new CSSStyleSheet();"
+        "try{for(let i=0;i<1100;i++)grown.insertRule('.g'+i+'{color:red}',i)}"
+        "catch(error){errors.push('grow:'+error.message)}"
+        "const deleted=sheet.cssRules.length===1500"
+        "&&sheet.cssRules[1499].selectorText==='.r1499';"
+        "globalThis.pocSummary=replaced&&inserted&&deleted"
+        "&&grown.cssRules.length===1100?'RULES-OK':"
+        "'RULES-FAILED:'+JSON.stringify({errors,rules:sheet.cssRules.length,"
+        "escaped:escaped.cssRules.length,grown:grown.cssRules.length})})()",
+        "RULES-OK");
+    uint32_t shadow = late_init_text_color(&navigation.page.layout,
+                                           "SHADOW1400");
+    uint32_t document_color = late_init_text_color(&navigation.page.layout,
+                                                   "DOC1400");
+    uint32_t escaped = late_init_text_color(&navigation.page.layout,
+                                            "ESCAPED");
+    if (ok && (shadow != 0x0000ff || document_color != 0x0000ff
+               || escaped != 0x0000ff)) {
+        fprintf(stderr, "constructed rule cap colours: shadow=%06x "
+                "document=%06x escaped=%06x\n", (unsigned) shadow,
+                (unsigned) document_color, (unsigned) escaped);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* Past the text bound a sheet applies its complete leading rules, as an
+   oversized <link> sheet does, instead of throwing; cssRules lists exactly
+   those rules, and insertRule past the bound refuses without changing
+   them. */
+static bool test_constructed_sheet_text_bound_prefix(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<p class=first>FIRST</p><p class=last>LAST</p>");
+    tilefinch_test_faults()->css_statement_max_source_bytes = 0;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const pad='x'.repeat(90);"
+        "let css='.first{color:#0000ff}';"
+        "for(let i=0;i<3000;i++)css+='.f'+i+'{--pad:'+pad+'}';"
+        "css+='.last{color:#0000ff}';"
+        "const sheet=new CSSStyleSheet();let threw=false;"
+        "try{sheet.replaceSync(css)}catch(error){threw=error.name}"
+        "document.adoptedStyleSheets=[sheet];"
+        "const rules=sheet.cssRules,count=rules.length,"
+        "text=Array.from(rules,rule=>rule.cssText).join('\\n'),"
+        "prefix=!threw&&count>1&&count<3002"
+        "&&rules[0].selectorText==='.first'"
+        "&&rules[count-1].cssText.endsWith('}')"
+        "&&rules[count-1].cssText.startsWith('.f')"
+        "&&text.length<=262144&&css.length>262144;"
+        "let refused=false;"
+        "try{sheet.insertRule('.over{--pad:'+pad+pad+pad+'}',count)}"
+        "catch(error){refused=error.name==='QuotaExceededError'}"
+        "const unchanged=sheet.cssRules.length===count;"
+        "sheet.deleteRule(count-1);"
+        "const room=sheet.insertRule('.room{color:red}',count-1)===count-1"
+        "&&sheet.cssRules.length===count;"
+        "globalThis.pocSummary=prefix&&refused&&unchanged&&room"
+        "?'BOUND-OK':'BOUND-FAILED:'+JSON.stringify({threw,count,"
+        "refused,unchanged,room})})()", "BOUND-OK");
+    uint32_t first = late_init_text_color(&navigation.page.layout, "FIRST");
+    uint32_t last = late_init_text_color(&navigation.page.layout, "LAST");
+    if (ok && (first != 0x0000ff || last != 0x000000)) {
+        fprintf(stderr, "constructed text bound colours: first=%06x "
+                "last=%06x\n", (unsigned) first, (unsigned) last);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    ok = ok && tilefinch_test_faults()->css_statement_max_source_bytes
+        <= 256u * 1024u + 1u;
+    return ok && budget->current == baseline;
+}
+
+/* Chunking is a work bound, not a stricter source quota: whitespace and
+   discarded imports can span chunks while the joined rule text still fits.
+   Only actual EOF may implicitly close an unfinished block. */
+static bool test_constructed_sheet_scan_chunks(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, "<p>CHUNKS</p>");
+    tilefinch_test_faults()->css_statement_max_source_bytes = 0;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const sheet=new CSSStyleSheet(),space=' '.repeat(90000);"
+        "sheet.replaceSync('.a{}'+space+'.b{}'+space+'.c{}'+space);"
+        "const whitespace=sheet.cssRules.length===3"
+        "&&sheet.cssRules[2].selectorText==='.c';"
+        "sheet.replaceSync('@import url(a);'.repeat(20000)+'.after{}');"
+        "const imports=sheet.cssRules.length===1"
+        "&&sheet.cssRules[0].selectorText==='.after';"
+        "sheet.replaceSync('.first{}'+'.partial{--pad:'+'x'.repeat(300000)+'}');"
+        "const partial=sheet.cssRules.length===1"
+        "&&sheet.cssRules[0].cssText==='.first{}';"
+        "sheet.replaceSync('.eof{color:red');"
+        "const eof=sheet.cssRules.length===1"
+        "&&sheet.cssRules[0].cssText==='.eof{color:red}';"
+        "sheet.replaceSync('a{}'.repeat(12000));"
+        "const dense=sheet.__rules.length===12000;"
+        "sheet.replaceSync('.unicode{--x:😀é}.last{}');"
+        "const unicode=sheet.cssRules.length===2"
+        "&&sheet.cssRules[1].cssText==='.last{}';"
+        "let authorTails=true;for(const tail of [' '.repeat(512),"
+        "'/* ignored */'.repeat(128),'bare-fragment '.repeat(100)]){"
+        "const node=document.createElement('style');"
+        "node.textContent='.near{--pad:'+'x'.repeat(256*1024-48)+'}'+tail;"
+        "document.head.appendChild(node);try{const author=node.sheet;"
+        "author.deleteRule(0);author.insertRule('.after{}',0);"
+        "authorTails=authorTails&&author.cssRules.length===1}"
+        "catch(e){authorTails=false}node.remove()}"
+        "let refused=false;try{sheet.insertRule('.big{--x:'+'x'.repeat(300000)+'}')}"
+        "catch(e){refused=e.name==='QuotaExceededError'}"
+        "document.adoptedStyleSheets=[sheet];"
+        "globalThis.pocSummary=whitespace&&imports&&partial&&eof&&dense&&unicode"
+        "&&authorTails&&refused&&sheet.cssRules.length===2?'CHUNKS-OK':"
+        "'CHUNKS-FAILED:'+JSON.stringify({whitespace,imports,partial,eof,dense,"
+        "unicode,authorTails,refused})})()", "CHUNKS-OK");
+    ok = ok && tilefinch_test_faults()->css_statement_max_source_bytes
+        <= 256u * 1024u + 1u;
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+static bool constructed_sheet_colours(const LayoutDocument *layout,
+                                      const char *prefix, size_t count,
+                                      uint32_t expected)
+{
+    for (size_t i = 0; i < count; i++) {
+        char text[32];
+        snprintf(text, sizeof(text), "%s%zu", prefix, i);
+        uint32_t colour = late_init_text_color(layout, text);
+        if (colour != expected) {
+            fprintf(stderr, "constructed sheet colour %s=%06x, want %06x\n",
+                    text, (unsigned) colour, (unsigned) expected);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* One sheet adopted by many shadow roots is parsed once: its rules enter
+   the page cascade once, more adopters change nothing, and a replaceSync
+   reparses it once, not once per adopter. */
+static bool test_constructed_sheet_shared_by_roots(Budget *budget)
+{
+    char body[2048];
+    size_t used = 0;
+    for (size_t i = 0; i < 30; i++)
+        used += (size_t) snprintf(body + used, sizeof(body) - used,
+                                  "<x-host id=h%zu></x-host>", i);
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, body);
+    const Stylesheet *page = &navigation.page.stylesheet;
+    size_t rules_before = ok ? page->count : 0;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const sheet=new CSSStyleSheet();"
+        "globalThis.sharedCss=pad=>{let css='.shared{color:#'+pad+'}';"
+        "for(let i=0;i<30;i++)css+='.pad'+i+'{margin-left:'+i+'px}';"
+        "return css};"
+        "sheet.replaceSync(sharedCss('0000ff'));globalThis.sharedSheet=sheet;"
+        "globalThis.adoptRoots=(from,to)=>{for(let i=from;i<to;i++){"
+        "const root=document.getElementById('h'+i).attachShadow({mode:'open'});"
+        "root.innerHTML='<p class=shared>SHADOW'+i+'</p>';"
+        "root.adoptedStyleSheets=[sheet]}};adoptRoots(0,20);"
+        "globalThis.pocSummary='SHARED-OK'})()", "SHARED-OK");
+    size_t shared_rules = ok ? page->count - rules_before : 0;
+    size_t full_before = navigation.performance.full_relayouts;
+    if (ok && shared_rules != 31) {
+        fprintf(stderr, "20 adopters added %zu rules, want 31\n",
+                shared_rules);
+        ok = false;
+    }
+    ok = ok && constructed_sheet_colours(
+        &navigation.page.layout, "SHADOW", 20, 0x0000ff);
+    /* Ten more adopters: no new rule, no rebuild. */
+    ok = ok && constructed_sheet_step(&navigation,
+        "adoptRoots(20,30);globalThis.pocSummary='MORE-OK'", "MORE-OK");
+    if (ok && (page->count - rules_before != 31
+               || navigation.performance.full_relayouts != full_before)) {
+        fprintf(stderr, "30 adopters: rules=%zu full=%zu->%zu\n",
+                page->count - rules_before, full_before,
+                navigation.performance.full_relayouts);
+        ok = false;
+    }
+    ok = ok && constructed_sheet_colours(
+        &navigation.page.layout, "SHADOW", 30, 0x0000ff);
+    /* Every adopter takes an update; the sheet is still parsed once. */
+    ok = ok && constructed_sheet_step(&navigation,
+        "sharedSheet.replaceSync(sharedCss('00ff00'));"
+        "globalThis.pocSummary='REPLACE-OK'", "REPLACE-OK");
+    if (ok && page->count - rules_before != 31) {
+        fprintf(stderr, "replaceSync: rules=%zu, want 31\n",
+                page->count - rules_before);
+        ok = false;
+    }
+    ok = ok && constructed_sheet_colours(
+        &navigation.page.layout, "SHADOW", 30, 0x00ff00);
+    ok = ok && constructed_sheet_step(&navigation,
+        "sharedSheet.insertRule('.shared{color:#ff00ff}',"
+        "sharedSheet.cssRules.length);globalThis.pocSummary='INSERT-OK'",
+        "INSERT-OK");
+    ok = ok && constructed_sheet_colours(
+        &navigation.page.layout, "SHADOW", 30, 0xff00ff);
+    ok = ok && constructed_sheet_step(&navigation,
+        "sharedSheet.deleteRule(sharedSheet.cssRules.length-1);"
+        "globalThis.pocSummary='DELETE-OK'", "DELETE-OK");
+    ok = ok && constructed_sheet_colours(
+        &navigation.page.layout, "SHADOW", 30, 0x00ff00);
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* Adopted sheets follow the root's own sheets in array order, leave the
+   cascade when dropped or when their shadow root leaves the page, and
+   never appear in the document tree. A sheet only shadow roots adopt
+   styles only their trees, as encapsulation confines it. */
+static bool test_constructed_sheet_order_and_removal(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<style>.own{color:#ff0000}</style><p class=own>OWN</p>"
+        "<x-host id=host></x-host><p class=inner>LIGHT</p>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const sheet=css=>{const s=new CSSStyleSheet();"
+        "s.replaceSync(css);return s};globalThis.makeSheet=sheet;"
+        "globalThis.green=sheet('.own{color:#00ff00}');"
+        "globalThis.blue=sheet('.own{color:#0000ff}');"
+        "globalThis.styles=document.querySelectorAll('style').length;"
+        "document.adoptedStyleSheets=[green,blue];"
+        "const root=document.getElementById('host').attachShadow({mode:'open'});"
+        "root.innerHTML='<style>.inner{color:#ff0000}</style>"
+        "<p class=inner>INNER</p>';globalThis.shadow=root;"
+        "root.adoptedStyleSheets=[sheet('.inner{color:#0000ff}')];"
+        "globalThis.pocSummary=document.querySelectorAll('style').length"
+        "===styles&&root.childNodes.length===2?'ORDER-OK':'ORDER-DOM:'"
+        "+document.querySelectorAll('style').length+'/'+styles+'/'"
+        "+root.childNodes.length})()", "ORDER-OK");
+    uint32_t own = late_init_text_color(&navigation.page.layout, "OWN");
+    uint32_t inner = late_init_text_color(&navigation.page.layout, "INNER");
+    uint32_t light = late_init_text_color(&navigation.page.layout, "LIGHT");
+    /* LIGHT matches .inner outside the shadow tree: neither the root's
+       adopted sheet nor its own <style> reaches it (both are scoped). */
+    if (ok && (own != 0x0000ff || inner != 0x0000ff || light != 0x000000)) {
+        fprintf(stderr, "adopted order: own=%06x inner=%06x light=%06x\n",
+                (unsigned) own, (unsigned) inner, (unsigned) light);
+        ok = false;
+    }
+    ok = ok && constructed_sheet_step(&navigation,
+        "document.adoptedStyleSheets=[blue,green];"
+        "globalThis.pocSummary='SWAP-OK'", "SWAP-OK");
+    own = late_init_text_color(&navigation.page.layout, "OWN");
+    if (ok && own != 0x00ff00) {
+        fprintf(stderr, "adopted swap: own=%06x\n", (unsigned) own);
+        ok = false;
+    }
+    ok = ok && constructed_sheet_step(&navigation,
+        "document.adoptedStyleSheets=[];shadow.adoptedStyleSheets=[];"
+        "globalThis.pocSummary='DROP-OK'", "DROP-OK");
+    own = late_init_text_color(&navigation.page.layout, "OWN");
+    inner = late_init_text_color(&navigation.page.layout, "INNER");
+    if (ok && (own != 0xff0000 || inner != 0xff0000)) {
+        fprintf(stderr, "adopted drop: own=%06x inner=%06x\n",
+                (unsigned) own, (unsigned) inner);
+        ok = false;
+    }
+    /* A shadow root that leaves the page takes its sheets along. */
+    ok = ok && constructed_sheet_step(&navigation,
+        "shadow.adoptedStyleSheets=[makeSheet('.inner{color:#00ff00}')];"
+        "globalThis.pocSummary='READOPT-OK'", "READOPT-OK");
+    inner = late_init_text_color(&navigation.page.layout, "INNER");
+    size_t with_host = navigation.page.stylesheet.count;
+    if (ok && inner != 0x00ff00) {
+        fprintf(stderr, "adopted readopt: inner=%06x\n", (unsigned) inner);
+        ok = false;
+    }
+    ok = ok && constructed_sheet_step(&navigation,
+        "document.getElementById('host').remove();"
+        "globalThis.pocSummary='HOST-GONE'", "HOST-GONE");
+    /* Two rules leave: the root's own <style> and its adopted sheet. */
+    if (ok && (navigation.page.stylesheet.count + 2 != with_host
+               || late_init_text_color(&navigation.page.layout, "INNER")
+                      != UINT32_MAX)) {
+        fprintf(stderr, "adopted host removal: rules %zu -> %zu\n",
+                with_host, navigation.page.stylesheet.count);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* Dense shared sheets exercise the span fallback while root-local order
+   and allocation refusal preserve the committed confinement metadata. */
+static bool test_constructed_sheet_root_order_and_refusal(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<x-host id=a></x-host><x-host id=b></x-host><p class=part>LIGHT</p>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{globalThis.red=new CSSStyleSheet();red.replaceSync("
+        "'.part{color:#ff0000}'.repeat(140)+"
+        "'.custom{--ink:#ff0000;color:var(--ink)}');"
+        "globalThis.blue=new CSSStyleSheet();blue.replaceSync("
+        "'.part{color:#0000ff}'.repeat(140)+"
+        "'.custom{--ink:#0000ff;color:var(--ink)}');"
+        "for(const id of ['a','b']){const r=document.getElementById(id)"
+        ".attachShadow({mode:'open'});r.innerHTML='<p class=part>PART'"
+        "+id.toUpperCase()+'</p><p class=custom>CUSTOM'+id.toUpperCase()"
+        "+'</p>';globalThis[id]=r}"
+        "a.adoptedStyleSheets=[red,blue];b.adoptedStyleSheets=[blue,red];"
+        "globalThis.pocSummary='ROOT-ORDER'})()", "ROOT-ORDER");
+    ok = ok && late_init_text_color(&navigation.page.layout, "PARTA") == 0x0000ff
+        && late_init_text_color(&navigation.page.layout, "PARTB") == 0xff0000;
+    ok = ok && late_init_text_color(&navigation.page.layout, "CUSTOMA") == 0x0000ff
+        && late_init_text_color(&navigation.page.layout, "CUSTOMB") == 0xff0000;
+    if (!ok) fprintf(stderr, "opposite adopted root order failed\n");
+    ok = ok && data_attribute_step_matches_full(&navigation,
+        "b.adoptedStyleSheets=[red,blue]", NULL);
+    ok = ok && late_init_text_color(&navigation.page.layout, "PARTB") == 0x0000ff;
+    Stylesheet *sheet = &navigation.page.stylesheet;
+    const lxb_dom_node_t *root = NULL;
+    lxb_dom_node_t *const *list = NULL;
+    size_t length = 0;
+    bool active = false;
+    /* Drop one root without rebuilding. Refusing the replacement metadata
+       must leave the old confinement intact, not publish global rules. */
+    ok = ok && document_adoption_list_at(&navigation.page.document, 1,
+        &root, &list, &length, &active) && root != NULL;
+    ok = ok && document_adoption_set(&navigation.page.document,
+        (lxb_dom_node_t *) root, NULL, 0, NULL, NULL);
+    const void *old_roots = sheet->adopted_scope_roots;
+    uint64_t old_mask = sheet->adopted_shadow_only_mask;
+    size_t old_count = sheet->adopted_scope_root_count;
+    size_t limit = budget->limit;
+    budget->limit = budget->current;
+    bool updated = stylesheet_set_adopted_scopes(sheet,
+        &navigation.page.document, NULL, 0, NULL, NULL);
+    budget->limit = limit;
+    ok = ok && !updated && sheet->adopted_scope_roots == old_roots
+        && sheet->adopted_shadow_only_mask == old_mask
+        && sheet->adopted_scope_root_count == old_count;
+    if (!ok) fprintf(stderr, "adopted scope/order refusal failed\n");
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+static bool test_constructed_sheet_scope_refusal_keeps_document(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<style>.base{color:#123456}</style><x-host id=a></x-host>"
+        "<p id=base class=base>BASE</p><p id=public class=public>PUBLIC</p>"
+        "<p id=private class=private>PRIVATE</p>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const shared=new CSSStyleSheet(),confined=new CSSStyleSheet();"
+        "shared.replaceSync('.public{--paint:#0000ff;color:var(--paint)}');"
+        "confined.replaceSync('.private{color:#ff0000}');"
+        "document.adoptedStyleSheets=[shared];"
+        "const root=document.getElementById('a').attachShadow({mode:'open'});"
+        "root.innerHTML='<p id=shadow class=private>SHADOW</p>';"
+        "root.adoptedStyleSheets=[confined];"
+        "globalThis.pocSummary='SCOPE-READY'})()", "SCOPE-READY");
+    Stylesheet candidate = {0};
+    tilefinch_test_faults()->refuse_next_adopted_scope_table = true;
+    bool built = ok && stylesheet_build(&candidate, budget,
+        &navigation.page.document, 480);
+    tilefinch_test_faults()->refuse_next_adopted_scope_table = false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(navigation.page.document.html);
+    ok = ok && built && candidate.adopted_scopes_failed;
+    if (ok) {
+        ComputedStyle base = style_for_node(&candidate, find_id(root, "base"), NULL);
+        ComputedStyle public = style_for_node(&candidate, find_id(root, "public"), NULL);
+        ComputedStyle private = style_for_node(&candidate, find_id(root, "private"), NULL);
+        ok = base.color == 0x123456 && public.color == 0x0000ff
+            && private.color != 0xff0000;
+        if (!ok) fprintf(stderr, "refused scope colors=%06x/%06x/%06x mask=%llu\n",
+            base.color, public.color, private.color,
+            (unsigned long long) candidate.adopted_document_mask);
+        ok = ok && stylesheet_set_adopted_scopes(&candidate,
+            &navigation.page.document, NULL, 0, NULL, NULL)
+            && !candidate.adopted_scopes_failed;
+        lxb_dom_node_t *carrier = document_shadow_carrier_of_host(find_id(root, "a"));
+        ComputedStyle shadow = style_for_node(&candidate,
+            find_id(carrier, "shadow"), NULL);
+        private = style_for_node(&candidate, find_id(root, "private"), NULL);
+        ok = ok && shadow.color == 0xff0000 && private.color != 0xff0000;
+        if (!ok) fprintf(stderr, "recovered scope colors=%06x/%06x carrier=%d\n",
+            shadow.color, private.color, carrier != NULL);
+        /* A formerly confined sheet gaining document scope must not be
+           hidden by the old index partition during another refusal. */
+        const lxb_dom_node_t *adopter = NULL;
+        lxb_dom_node_t *const *list = NULL;
+        size_t count = 0;
+        bool active = false;
+        lxb_dom_node_t *global_sheets[2] = {0};
+        ok = ok && document_adoption_list_at(&navigation.page.document, 0,
+            &adopter, &list, &count, &active) && adopter == NULL && count == 1;
+        if (ok) global_sheets[0] = list[0];
+        ok = ok && document_adoption_list_at(&navigation.page.document, 1,
+            &adopter, &list, &count, &active) && adopter == carrier && count == 1;
+        if (ok) global_sheets[1] = list[0];
+        ok = ok && document_adoption_set(&navigation.page.document, NULL,
+            global_sheets, 2, NULL, NULL)
+            && document_adoption_set(&navigation.page.document, carrier,
+                NULL, 0, NULL, NULL);
+        size_t limit = budget->limit;
+        budget->limit = budget->current;
+        bool updated = ok && stylesheet_set_adopted_scopes(&candidate,
+            &navigation.page.document, NULL, 0, NULL, NULL);
+        budget->limit = limit;
+        private = style_for_node(&candidate, find_id(root, "private"), NULL);
+        ok = ok && !updated && private.color == 0xff0000;
+    }
+    if (!ok) fprintf(stderr, "scope refusal lost document styles: built=%d\n", built);
+    stylesheet_destroy(&candidate);
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+static bool test_constructed_sheet_source_bound_keeps_confinement(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = true;
+    for (size_t sources = STYLE_SOURCE_NODE_LIMIT - 2u;
+         ok && sources <= STYLE_SOURCE_NODE_LIMIT + 1u; sources++) {
+        char body[4096];
+        size_t used = 0;
+        for (size_t i = 0; i < sources; i++)
+            used += (size_t) snprintf(body + used, sizeof(body) - used,
+                "<style>.base{color:#123456}</style>");
+        (void) snprintf(body + used, sizeof(body) - used,
+            "<x-host id=a></x-host><p id=base class=base>BASE</p>"
+            "<p id=private class=private>PRIVATE</p>"
+            "<p id=second class=second>SECOND</p>");
+        ok = constructed_sheet_open(&navigation, budget, body)
+            && constructed_sheet_step(&navigation,
+                "(()=>{const first=new CSSStyleSheet(),second=new CSSStyleSheet();"
+                "first.replaceSync('.private{color:#ff0000}');"
+                "second.replaceSync('.second{color:#0000ff}');"
+                "const root=document.getElementById('a').attachShadow({mode:'open'});"
+                "root.innerHTML='<p id=shadow class=private>SHADOW</p>';"
+                "root.adoptedStyleSheets=[first,second];"
+                "globalThis.pocSummary='BOUND-READY'})()", "BOUND-READY");
+        Stylesheet candidate = {0};
+        ok = ok && stylesheet_build(&candidate, budget,
+            &navigation.page.document, 480);
+        if (ok) {
+            lxb_dom_node_t *root = lxb_dom_interface_node(navigation.page.document.html);
+            ComputedStyle base = style_for_node(&candidate, find_id(root, "base"), NULL);
+            ComputedStyle private = style_for_node(&candidate, find_id(root, "private"), NULL);
+            ComputedStyle second = style_for_node(&candidate, find_id(root, "second"), NULL);
+            ok = base.color == 0x123456 && private.color != 0xff0000
+                && second.color != 0x0000ff;
+            if (ok && candidate.adopted_source_count != 0) {
+                lxb_dom_node_t *carrier = document_shadow_carrier_of_host(find_id(root, "a"));
+                ComputedStyle shadow = style_for_node(&candidate,
+                    find_id(carrier, "shadow"), NULL);
+                ok = shadow.color == 0xff0000;
+            }
+            if (!ok) fprintf(stderr,
+                "source-bound confinement failed at %zu sources: colors=%06x/%06x/%06x tracked=%u adopted=%u bounded=%d mask=%llu\n",
+                sources, base.color, private.color, second.color,
+                candidate.style_source_count, candidate.adopted_source_count,
+                candidate.style_sources_bounded_out,
+                (unsigned long long) candidate.adopted_shadow_only_mask);
+        }
+        stylesheet_destroy(&candidate);
+        constructed_sheet_close(&navigation);
+        ok = ok && budget->current == baseline;
+    }
+    return ok;
+}
+
+static bool test_constructed_sheet_scope_moves(Budget *budget)
+{
+    char body[2048];
+    size_t used = (size_t) snprintf(body, sizeof(body),
+        "<x-host id=a></x-host><x-host id=b></x-host>");
+    /* The layout reuse owner retains styles only on pages of >=256 nodes. */
+    for (size_t i = 0; i < 230; i++)
+        used += (size_t) snprintf(body + used, sizeof(body) - used, "<i></i>");
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, body);
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const s=new CSSStyleSheet();s.replaceSync("
+        "'.part{color:#0000ff}');globalThis.scoped=s;"
+        "for(const id of ['a','b']){const root=document.getElementById(id)"
+        ".attachShadow({mode:'open'});root.innerHTML="
+        "'<p class=part>PART'+id.toUpperCase()+'</p>';globalThis[id]=root}"
+        "a.adoptedStyleSheets=[s];globalThis.pocSummary='SCOPE-A'})()",
+        "SCOPE-A");
+    uint32_t a = late_init_text_color(&navigation.page.layout, "PARTA");
+    uint32_t b = late_init_text_color(&navigation.page.layout, "PARTB");
+    size_t rules = navigation.page.stylesheet.count;
+    size_t full = navigation.performance.full_relayouts;
+    if (ok && (a != 0x0000ff || b != 0x000000)) {
+        fprintf(stderr, "scope a: a=%06x b=%06x\n", (unsigned) a,
+                (unsigned) b);
+        ok = false;
+    }
+    ok = ok && data_attribute_step_matches_full(&navigation,
+        "b.adoptedStyleSheets=[scoped]", NULL);
+    a = late_init_text_color(&navigation.page.layout, "PARTA");
+    b = late_init_text_color(&navigation.page.layout, "PARTB");
+    if (ok && (a != 0x0000ff || b != 0x0000ff
+               || navigation.page.stylesheet.count != rules)) {
+        fprintf(stderr, "scope a+b: a=%06x b=%06x rules=%zu/%zu\n",
+                (unsigned) a, (unsigned) b,
+                navigation.page.stylesheet.count, rules);
+        ok = false;
+    }
+    ok = ok && data_attribute_step_matches_full(&navigation,
+        "a.adoptedStyleSheets=[]", NULL);
+    a = late_init_text_color(&navigation.page.layout, "PARTA");
+    b = late_init_text_color(&navigation.page.layout, "PARTB");
+    if (ok && (a != 0x000000 || b != 0x0000ff)) {
+        fprintf(stderr, "scope b: a=%06x b=%06x\n", (unsigned) a,
+                (unsigned) b);
+        ok = false;
+    }
+    /* Adopted by the document too, it applies everywhere. */
+    ok = ok && data_attribute_step_matches_full(&navigation,
+        "document.adoptedStyleSheets=[scoped]", NULL);
+    a = late_init_text_color(&navigation.page.layout, "PARTA");
+    if (ok && a != 0x0000ff) {
+        fprintf(stderr, "scope document: a=%06x\n", (unsigned) a);
+        ok = false;
+    }
+    /* None of it reparsed the sheet. The data_attribute steps run a
+       second, unretained relayout each, which is not a sheet rebuild. */
+    if (ok && navigation.page.stylesheet.count != rules) {
+        fprintf(stderr, "scope moves: rules %zu -> %zu, full %zu -> %zu\n",
+                rules, navigation.page.stylesheet.count, full,
+                navigation.performance.full_relayouts);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* A full stylesheet rebuild replays an adopted sheet's cached parsed form
+   instead of reparsing its text (container scopes included); the form is
+   kept from the second parse on, a text change drops it, and teardown
+   returns it. */
+static bool test_constructed_sheet_parse_cache(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<style id=own>.own{color:#ff0000}</style><p class=own>OWN</p>"
+        "<p class=cached>CACHED</p><p class=after>AFTER</p>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{let css='.cached{color:#0000ff}';"
+        "for(let i=0;i<200;i++)css+='.pad'+i+'{margin-left:'+i+'px}';"
+        "css+='@container (min-width:10px){.inside{display:none}}"
+        "@media (min-width:1px){.after{color:#00ff00}}';"
+        "globalThis.cachedCss=css;const s=new CSSStyleSheet();"
+        "s.replaceSync(css);globalThis.cachedSheet=s;"
+        "document.adoptedStyleSheets=[s];"
+        "globalThis.pocSummary='CACHE-ADOPT'})()", "CACHE-ADOPT");
+    size_t rules = navigation.page.stylesheet.count;
+    /* Parsed once, nothing is cached; a document <style> change rebuilds
+       the whole sheet, the second parse, which keeps the form. */
+    bool uncached = document_constructed_sheet_cache_bytes(
+        &navigation.page.document) == 0;
+    ok = ok && constructed_sheet_step(&navigation,
+        "document.getElementById('own').textContent="
+        "'.own{color:#ff0000}';globalThis.pocSummary='FIRST'", "FIRST");
+    size_t cached_bytes = document_constructed_sheet_cache_bytes(
+        &navigation.page.document);
+    if (ok && (!uncached || cached_bytes == 0
+               || cached_bytes > DOCUMENT_CONSTRUCTED_CACHE_LIMIT)) {
+        fprintf(stderr, "parse cache: uncached=%d then %zu bytes\n",
+                (int) uncached, cached_bytes);
+        ok = false;
+    }
+    /* The next rebuild replays it. */
+    size_t full = navigation.performance.full_relayouts;
+    uint64_t css_before = tilefinch_work_tally.css_bytes;
+    ok = ok && constructed_sheet_step(&navigation,
+        "document.getElementById('own').textContent="
+        "'.own{color:#ff00ff}';globalThis.pocSummary='REBUILD'", "REBUILD");
+    uint64_t rebuilt = tilefinch_work_tally.css_bytes - css_before;
+    if (ok && (navigation.performance.full_relayouts == full
+               || rebuilt >= 1000u
+               || navigation.page.stylesheet.count != rules
+               || late_init_text_color(&navigation.page.layout, "CACHED")
+                      != 0x0000ff
+               || late_init_text_color(&navigation.page.layout, "AFTER")
+                      != 0x00ff00
+               || late_init_text_color(&navigation.page.layout, "OWN")
+                      != 0xff00ff)) {
+        fprintf(stderr, "parse cache rebuild: full %zu->%zu css=%llu "
+                "rules %zu->%zu\n", full,
+                navigation.performance.full_relayouts,
+                (unsigned long long) rebuilt, rules,
+                navigation.page.stylesheet.count);
+        ok = false;
+    }
+    /* New text: the stale form is dropped and the sheet parsed again. */
+    ok = ok && constructed_sheet_step(&navigation,
+        "cachedSheet.replaceSync(cachedCss.replace('#0000ff','#00ffff'));"
+        "document.getElementById('own').textContent='.own{color:#ff0000}';"
+        "globalThis.pocSummary='REPARSE'", "REPARSE");
+    if (ok && late_init_text_color(&navigation.page.layout, "CACHED")
+                  != 0x00ffff) {
+        fprintf(stderr, "parse cache: stale form replayed\n");
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* Elements outside every adopting shadow root never see a shadow-scoped
+   adopted rule as a rule-index candidate: a component sheet costs the
+   light DOM nothing, however many of its classes the page also uses. */
+static bool test_constructed_sheet_index_scoping(Budget *budget)
+{
+    char body[4096];
+    size_t used = (size_t) snprintf(body, sizeof(body),
+        "<x-host id=host></x-host>");
+    for (size_t i = 0; i < 100; i++)
+        used += (size_t) snprintf(body + used, sizeof(body) - used,
+                                  "<p class=lit>LIGHT%zu</p>", i);
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, body);
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{globalThis.root=document.getElementById('host')"
+        ".attachShadow({mode:'open'});"
+        "root.innerHTML='<p class=lit>INNER</p>';"
+        "globalThis.pocSummary='SHADOW'})()", "SHADOW");
+    /* Candidates of one full restyle, retained styles discarded. */
+    uint64_t before = tilefinch_work_tally.style_rule_candidates;
+    layout_reuse_cache_reset(navigation.page.layout_reuse);
+    ok = ok && navigation_relayout(&navigation);
+    uint64_t plain = tilefinch_work_tally.style_rule_candidates - before;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{let css='';for(let i=0;i<200;i++)"
+        "css+='.lit{margin-left:'+(i%3)+'px}';"
+        "css+='.lit{color:#0000ff}';const s=new CSSStyleSheet();"
+        "s.replaceSync(css);root.adoptedStyleSheets=[s];"
+        "globalThis.pocSummary='SCOPED'})()", "SCOPED");
+    before = tilefinch_work_tally.style_rule_candidates;
+    layout_reuse_cache_reset(navigation.page.layout_reuse);
+    ok = ok && navigation_relayout(&navigation);
+    uint64_t scoped = tilefinch_work_tally.style_rule_candidates - before;
+    uint32_t inner = late_init_text_color(&navigation.page.layout, "INNER");
+    uint32_t light = late_init_text_color(&navigation.page.layout, "LIGHT7");
+    /* INNER and its ancestors may consider the 201 rules; 100 light
+       paragraphs would add 20,100. */
+    if (ok && (scoped > plain + 2000u || inner != 0x0000ff
+               || light != 0x000000)) {
+        fprintf(stderr, "index scoping: candidates %llu -> %llu "
+                "inner=%06x light=%06x\n", (unsigned long long) plain,
+                (unsigned long long) scoped, (unsigned) inner,
+                (unsigned) light);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* A var() lookup for an element outside every adopting shadow root never
+   scans the custom-property rules of a shadow-only adopted sheet. */
+static bool test_constructed_sheet_custom_index_scoping(Budget *budget)
+{
+    char body[4096];
+    size_t used = (size_t) snprintf(body, sizeof(body),
+        "<style>:root{--tone:#000000}.lit{color:var(--tone)}</style>"
+        "<x-host id=host></x-host>");
+    for (size_t i = 0; i < 100; i++)
+        used += (size_t) snprintf(body + used, sizeof(body) - used,
+                                  "<p class=lit>LIGHT%zu</p>", i);
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, body);
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{globalThis.root=document.getElementById('host')"
+        ".attachShadow({mode:'open'});"
+        "root.innerHTML='<p class=lit>INNER</p>';"
+        "let css='';for(let i=0;i<200;i++)css+='.lit{--tone:#00ff00}';"
+        "css+='.lit{--tone:#0000ff}';const s=new CSSStyleSheet();"
+        "s.replaceSync(css);root.adoptedStyleSheets=[s];"
+        "globalThis.pocSummary='CUSTOM'})()", "CUSTOM");
+    size_t before = navigation.page.stylesheet.variable_rule_candidates;
+    layout_reuse_cache_reset(navigation.page.layout_reuse);
+    ok = ok && navigation_relayout(&navigation);
+    size_t scanned = navigation.page.stylesheet.variable_rule_candidates
+        - before;
+    uint32_t inner = late_init_text_color(&navigation.page.layout, "INNER");
+    uint32_t light = late_init_text_color(&navigation.page.layout, "LIGHT7");
+    /* 101 paragraphs read --tone; scanning the 201 scoped declarations
+       for the 100 light ones would add 20,100. */
+    if (ok && (scanned > 3000u || inner != 0x0000ff || light != 0x000000)) {
+        fprintf(stderr, "custom index scoping: scanned %zu inner=%06x "
+                "light=%06x\n", scanned, (unsigned) inner, (unsigned) light);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* A sheet no list adopts and no script references is collected, native
+   element and registration included; teardown returns every byte. */
+static bool test_constructed_sheet_lifetime(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<p class=kept>KEPT</p>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{for(let i=0;i<3;i++){const s=new CSSStyleSheet();"
+        "s.replaceSync('.gone'+i+'{color:red}');"
+        "document.adoptedStyleSheets=[s]}"
+        "const kept=new CSSStyleSheet();kept.replaceSync("
+        "'.kept{color:#0000ff}');document.adoptedStyleSheets=[kept];"
+        "globalThis.pocSummary='LIFETIME-OK'})()", "LIFETIME-OK");
+    size_t registered = document_constructed_sheet_count(
+        &navigation.page.document);
+    for (int round = 0; ok && round < 3; round++) {
+        (void) script_runtime_collect_and_trim(navigation.page.runtime);
+        /* Wrapper finalization runs as a job between tasks. */
+        ok = script_runtime_evaluate_diagnostic(
+                 navigation.page.runtime, "void 0", "<collect>",
+                 &navigation.page.script_result)
+            && script_runtime_advance(navigation.page.runtime, 16, 32,
+                                      &navigation.page.script_result);
+        if (script_runtime_consume_relayout(navigation.page.runtime))
+            ok = ok && navigation_relayout(&navigation);
+    }
+    size_t collected = document_constructed_sheet_count(
+        &navigation.page.document);
+    uint32_t kept = late_init_text_color(&navigation.page.layout, "KEPT");
+    if (ok && (registered != 4 || collected != 1 || kept != 0x0000ff)) {
+        fprintf(stderr, "constructed lifetime: registered=%zu "
+                "collected=%zu kept=%06x\n", registered, collected,
+                (unsigned) kept);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    if (ok && budget->current != baseline)
+        fprintf(stderr, "constructed lifetime: %zu bytes after teardown\n",
+                budget->current - baseline);
+    return ok && budget->current == baseline;
+}
+
 static bool test_layout_cooperate(void *context, const char *phase,
                                   size_t completed_work_units)
 {
     LayoutCooperateProbe *probe = context;
+    /* layout_cooperate_timed yields here only after eight milliseconds of
+       preparation, so whether it happens at all depends on machine load.
+       Let it continue without counting it, or a loaded run would cancel a
+       relayout the test expects to finish (and shift every count below). */
+    if (strcmp(phase, "layout-prepare") == 0) return true;
     bool index_phase = strcmp(phase, "layout-index") == 0;
     bool resource_phase = strcmp(phase, "resource") == 0;
     bool script_phase = strcmp(phase, "script") == 0;
@@ -4795,6 +5923,8 @@ static int test_tile_placeholder_frame(void)
     return 0;
 }
 
+#include "suites/web_runtime_hidden_mutations.inc"
+#include "suites/web_runtime_relayout_reuse.inc"
 #include "suites/web_runtime_render.inc"
 #include "suites/web_runtime_navigation.inc"
 #include "suites/web_runtime_forms.inc"

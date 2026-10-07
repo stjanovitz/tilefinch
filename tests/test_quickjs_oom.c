@@ -37,6 +37,86 @@ static int interrupt_repeat_eval(JSRuntime *runtime, void *opaque)
     return interrupt->polls >= interrupt->stop_after;
 }
 
+static int run_float_array_indexed_stores(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+    const char source[] =
+        "(()=>{const values=[0,-0,1,-1,16777217,2147483647,-2147483648,"
+        "1/3,NaN,Infinity,-Infinity,undefined,null,true,'1.25'];"
+        "for(const C of [Float32Array,Float64Array]){"
+        "const a=new C(values.length),expected=new ArrayBuffer(a.byteLength),"
+        "view=new DataView(expected),width=C.BYTES_PER_ELEMENT;"
+        "for(let i=0;i<values.length;i++){a[i]=values[i];"
+        "if(width===4)view.setFloat32(i*width,Number(values[i]),true);"
+        "else view.setFloat64(i*width,Number(values[i]),true);}"
+        "const actual=new Uint8Array(a.buffer),wanted=new Uint8Array(expected);"
+        "for(let i=0;i<actual.length;i++)if(actual[i]!==wanted[i])"
+        "throw Error('numeric representation '+C.name+' '+i);"
+        "let converted=0;const object={valueOf(){converted++;return 2.5}};"
+        "a[0]=object;a[-1]=object;a[a.length]=object;"
+        "if(a[0]!==2.5||converted!==3||a[-1]!==undefined)"
+        "throw Error('conversion order');"
+        "let threw=false;try{a[0]={valueOf(){throw Error('original')}}}"
+        "catch(e){threw=e.message==='original'}"
+        "if(!threw)throw Error('lost coercion exception');"
+        "threw=false;try{a[0]=1n}catch(e){threw=e instanceof TypeError}"
+        "if(!threw)throw Error('numeric BigInt accepted');"
+        "const detached=new C(2),buffer=detached.buffer;buffer.transfer();"
+        "detached[0]=1;detached[1]=.5;"
+        "if(detached.length!==0||detached[0]!==undefined)"
+        "throw Error('detached write');"
+        "const during=new C(2);during[0]={valueOf(){"
+        "during.buffer.transfer();return 9}};"
+        "if(during.length!==0)throw Error('detach during coercion');"
+        "const resizable=new ArrayBuffer(width*2,{maxByteLength:width*4}),"
+        "tracking=new C(resizable);tracking[1]=.25;"
+        "resizable.resize(0);tracking[0]=1;"
+        "resizable.resize(width*4);tracking[3]=16777217;"
+        "tracking[0]={valueOf(){resizable.resize(0);return 3}};"
+        "if(tracking.length!==0)throw Error('resize during coercion');"
+        "const fixedBuffer=new ArrayBuffer(width*2,{maxByteLength:width*4}),"
+        "fixed=new C(fixedBuffer,0,2);fixed[0]=.25;"
+        "fixedBuffer.resize(width);fixed[0]=9;"
+        "if(fixed.length!==0||new C(fixedBuffer)[0]!==.25)"
+        "throw Error('out-of-bounds fixed view');"
+        "Object.preventExtensions(a);a[0]=.5;"
+        "if(a[0]!==.5)throw Error('non-extensible view');"
+        "let trapped=0;const proxy=new Proxy(a,{set(t,k,v){"
+        "trapped++;return Reflect.set(t,k,v,t)}});proxy[1]=.75;"
+        "if(trapped!==1||a[1]!==.75)throw Error('proxy bypass');"
+        "const revoked=Proxy.revocable(a,{});revoked.revoke();"
+        "threw=false;try{revoked.proxy[0]=1}catch(e){threw=e instanceof TypeError}"
+        "if(!threw)throw Error('revoked proxy');"
+        "}return true})()";
+    int okay = 1;
+    {
+        JSValue result = JS_Eval(context, source, sizeof(source) - 1,
+                                "<float-array-stores>", JS_EVAL_TYPE_GLOBAL);
+        okay = !JS_IsException(result) && JS_ToBool(context, result) == 1;
+        if (!okay) {
+            JSValue exception = JS_GetException(context);
+            const char *message = JS_ToCString(context, exception);
+            fprintf(stderr, "float array indexed stores: %s\n",
+                    message == NULL ? "unknown failure" : message);
+            JS_FreeCString(context, message);
+            JS_FreeValue(context, exception);
+        }
+        JS_FreeValue(context, result);
+    }
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    return okay ? 0 : 1;
+}
+
 static int run_reallocation_peak_census(void)
 {
     Budget budget;
@@ -1607,6 +1687,64 @@ static int run_parse_failure_boundary(size_t successful_allocations)
     return 0;
 }
 
+/* A parse that loses a bytecode-buffer allocation fails with "out of
+   memory", never with a SyntaxError about the author's code: the emitter
+   keeps going after a refused growth, and the parser used to read the lost
+   opcode back as an invalid assignment target. Returns 1 on a SyntaxError
+   (or an unclean unwind), 0 otherwise; *refused counts boundaries that
+   failed at all. */
+static int run_parse_failure_is_out_of_memory(size_t successful_allocations,
+                                              size_t *refused)
+{
+    char source[16384];
+    size_t used = (size_t) snprintf(source, sizeof(source),
+        "(()=>{var o={},x=0,y=1;");
+    for (int i = 0; i < 400 && used < sizeof(source) - 64u; i++)
+        used += (size_t) snprintf(source + used, sizeof(source) - used,
+                                  "o.p%d=x+%d;y=o.p%d;", i, i, i);
+    used += (size_t) snprintf(source + used, sizeof(source) - used,
+                              "return y;})()");
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+    int failed = 0;
+    budget_inject_failure_after(&budget, successful_allocations);
+    JSValue compiled = JS_Eval(
+        context, source, used, "<parse-oom-message>",
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    budget_clear_failure_injection(&budget);
+    if (JS_IsException(compiled)) {
+        (*refused)++;
+        JSValue exception = JS_GetException(context);
+        const char *text = JS_ToCString(context, exception);
+        /* Too little memory may remain for an error object at all; the
+           failure under test is a SyntaxError blaming the source. */
+        if (text != NULL && strstr(text, "SyntaxError") != NULL) {
+            fprintf(stderr, "parse refused after %zu allocations reported "
+                    "\"%s\"\n", successful_allocations,
+                    text == NULL ? "(none)" : text);
+            failed = 1;
+        }
+        JS_FreeCString(context, text);
+        JS_FreeValue(context, exception);
+    } else {
+        JS_FreeValue(context, compiled);
+    }
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void) budget_quickjs_pool_trim(pool, 0);
+    if (!budget_quickjs_pool_destroy(pool) || budget.current != 0) return 1;
+    return failed;
+}
+
 static int run_retired_callable_contract(void)
 {
     static const char *sources[] = {
@@ -2166,6 +2304,421 @@ static int run_module_restore_resolution_failure_unregisters(void)
     return failed;
 }
 
+/* Guarded allocator for the regexp-compiler and function-compile refusal
+   sweeps.  Every block
+   carries a trailing guard; bytes past the requested size (fresh growth and
+   guard alike) read as 0xff, so a never-written jump-chain slot reads as -1
+   and an overrun is a clean, detectable guard change rather than a wild
+   write.  Allocation number `refuse_from` and every later growth fail;
+   with `refuse_min` set, only requests of at least that many bytes do (a
+   memory ceiling refuses a big buffer's growth while small blocks still
+   fit), and with `refuse_count` set only that many allocations from
+   `refuse_from` on do (a refusal the code ignores and recovers from). */
+#define REGEXP_GUARD_BYTES 32u
+typedef struct {
+    size_t calls;
+    size_t refuse_from;
+    size_t live;
+    unsigned corrupted;
+    size_t refuse_min;
+    size_t refuse_count;
+} RegexpGuardState;
+
+typedef struct {
+    size_t size;
+    size_t pad;
+} RegexpGuardHeader;
+
+static bool regexp_guard_intact(const RegexpGuardHeader *header)
+{
+    const unsigned char *guard =
+        (const unsigned char *)(header + 1) + header->size;
+    for (size_t i = 0; i < REGEXP_GUARD_BYTES; i++)
+        if (guard[i] != 0xffu) return false;
+    return true;
+}
+
+static void *regexp_guard_place(RegexpGuardState *state,
+                                RegexpGuardHeader *header, size_t old_size,
+                                size_t size)
+{
+    if (header == NULL) return NULL;
+    header->size = size;
+    unsigned char *user = (unsigned char *)(header + 1);
+    if (size > old_size)
+        memset(user + old_size, 0xff, size - old_size);
+    memset(user + size, 0xff, REGEXP_GUARD_BYTES);
+    (void) state;
+    return user;
+}
+
+static bool regexp_guard_refuse(RegexpGuardState *state, size_t size)
+{
+    size_t call = state->calls++;
+    return call >= state->refuse_from && size >= state->refuse_min
+        && (state->refuse_count == 0
+            || call - state->refuse_from < state->refuse_count);
+}
+
+static void *regexp_guard_malloc(JSMallocState *ms, size_t size)
+{
+    RegexpGuardState *state = ms->opaque;
+    if (regexp_guard_refuse(state, size)) return NULL;
+    RegexpGuardHeader *header =
+        malloc(sizeof(*header) + size + REGEXP_GUARD_BYTES);
+    if (header == NULL) return NULL;
+    state->live++;
+    return regexp_guard_place(state, header, 0, size);
+}
+
+static void regexp_guard_free(JSMallocState *ms, void *ptr)
+{
+    RegexpGuardState *state = ms->opaque;
+    if (ptr == NULL) return;
+    RegexpGuardHeader *header = (RegexpGuardHeader *)ptr - 1;
+    if (!regexp_guard_intact(header)) state->corrupted++;
+    state->live--;
+    free(header);
+}
+
+static void *regexp_guard_realloc(JSMallocState *ms, void *ptr, size_t size)
+{
+    RegexpGuardState *state = ms->opaque;
+    if (ptr == NULL) return regexp_guard_malloc(ms, size);
+    if (size == 0) {
+        regexp_guard_free(ms, ptr);
+        return NULL;
+    }
+    RegexpGuardHeader *header = (RegexpGuardHeader *)ptr - 1;
+    if (!regexp_guard_intact(header)) state->corrupted++;
+    size_t old_size = header->size;
+    if (size > old_size && regexp_guard_refuse(state, size)) return NULL;
+    RegexpGuardHeader *moved =
+        realloc(header, sizeof(*header) + size + REGEXP_GUARD_BYTES);
+    if (moved == NULL) return NULL;
+    return regexp_guard_place(state, moved, old_size, size);
+}
+
+static size_t regexp_guard_usable_size(const void *ptr)
+{
+    (void) ptr;
+    return 0;
+}
+
+static const JSMallocFunctions regexp_guard_functions = {
+    regexp_guard_malloc, regexp_guard_free, regexp_guard_realloc,
+    regexp_guard_usable_size,
+};
+
+/* One RegExp construction with growth refused from host allocation number
+   `refuse_after` on (counted from the call).  Returns 0 when the compile
+   either succeeds or raises cleanly with every guard intact; *completed
+   reports whether the refusal point lay past the compile. */
+static int run_regexp_compile_refusal(size_t refuse_after, bool *completed)
+{
+    RegexpGuardState state = { 0, (size_t) -1, 0, 0 };
+    JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+    if (runtime == NULL) return 1;
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) { JS_FreeRuntime(runtime); return 1; }
+    /* A class with properties of strings compiles through the string-list
+       emitter: one split/goto pair per string, patched as it goes. */
+    static const char maker[] =
+        "(function(){return new RegExp('\\\\p{RGI_Emoji}|:([a-z0-9_]+):',"
+        "'giv')})";
+    JSValue make = JS_Eval(context, maker, sizeof(maker) - 1u,
+                           "<regexp-refusal>", JS_EVAL_TYPE_GLOBAL);
+    int failed = JS_IsException(make);
+    if (!failed) {
+        JSValue tester = JS_UNDEFINED;
+        state.refuse_from = state.calls + refuse_after;
+        JSValue regexp = JS_Call(context, make, JS_UNDEFINED, 0, NULL);
+        *completed = !JS_IsException(regexp);
+        state.refuse_from = (size_t) -1;
+        if (JS_IsException(regexp)) {
+            JSValue exception = JS_GetException(context);
+            JS_FreeValue(context, exception);
+        } else {
+            /* A compile that fit must also match correctly. */
+            static const char check[] =
+                "(function(r){return '\\u{1F600} :ok:'.match(r).join()})";
+            tester = JS_Eval(context, check, sizeof(check) - 1u,
+                             "<regexp-check>", JS_EVAL_TYPE_GLOBAL);
+            JSValue result = JS_IsException(tester) ? JS_EXCEPTION
+                : JS_Call(context, tester, JS_UNDEFINED, 1, &regexp);
+            const char *text = JS_IsException(result) ? NULL
+                : JS_ToCString(context, result);
+            failed = text == NULL || strcmp(text, "\xF0\x9F\x98\x80,:ok:") != 0;
+            if (failed)
+                fprintf(stderr, "regexp refusal: match was %s\n",
+                        text == NULL ? "(exception)" : text);
+            JS_FreeCString(context, text);
+            JS_FreeValue(context, result);
+        }
+        JS_FreeValue(context, tester);
+        JS_FreeValue(context, regexp);
+    }
+    JS_FreeValue(context, make);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    if (state.corrupted != 0) {
+        fprintf(stderr,
+                "regexp refusal after %zu allocations overran %u block(s)\n",
+                refuse_after, state.corrupted);
+        failed = 1;
+    }
+    if (state.live != 0) failed = 1;
+    return failed;
+}
+
+/* A large function body whose compile runs every bytecode pass: forward
+   and backward jumps of every size (labels, loops, switch, try/catch,
+   optional chains), atoms the peephole optimizer rewrites or drops
+   (typeof comparisons, .length, push/drop pairs), and enough source lines
+   for a long line table. */
+static char *function_compile_source(unsigned blocks)
+{
+    size_t capacity = 2048u + (size_t) blocks * 720u;
+    char *source = malloc(capacity);
+    if (source == NULL) return NULL;
+    size_t used = (size_t) snprintf(source, capacity,
+        "var gl = 5;\n"
+        "function big(a) {\n  var o = {}, s = 0, t = '';\n"
+        "  for (var i = 0; i < a; i++) {\n");
+    for (unsigned b = 0; b < blocks && used < capacity; b++) {
+        used += (size_t) snprintf(source + used, capacity - used,
+            "    L%u: { if (typeof a === 'undefined') break L%u;\n"
+            "      o.p%u = (o.p%u || 0) + i; s += o.p%u; 'unused';\n"
+            "      if (s > 1e9) { t += 'big'; } else if (s < -1e9) t += 's';"
+            " else t += '%u';\n"
+            "      switch ((i + %u) & 3) { case 0: s++; break; case 1: s--;"
+            " break; case 2: s += 2; break; default: s -= 2; }\n"
+            "      for (var j%u = 0; j%u < 2; j%u++) { if (j%u === 1) continue;"
+            " s += j%u + t.length; }\n"
+            "      try { s += o?.q%u?.r ?? %u; } catch (e) { s = -1; }\n"
+            "      s += ((x) => x + i + o.p%u + gl)(1);\n"
+            "      s = a ? s : -s; }\n",
+            b, b, b, b, b, b % 10u, b, b, b, b, b, b, b, b, b);
+    }
+    /* once: classes (constructor patch, private brand), for-in/of (moved
+       loop code), defaulted destructuring, a switch default patch and
+       closures two levels deep */
+    used += (size_t) snprintf(source + used, capacity - used,
+        "  }\n"
+        "  class C { #p = 1; constructor(v) { this.v = v; }\n"
+        "    get p() { return this.#p + this.v; } }\n"
+        "  for (var k in o) s += k.length;\n"
+        "  for (var v of [1, 2]) s += v;\n"
+        "  var { a1 = 1, b1 = 2 } = o; s += a1 + b1;\n"
+        "  switch (s & 1) { default: s += 1; case 5: s += 2; }\n"
+        "  var f = function(y) { return function(z) { return y + z + a + gl; };"
+        " };\n"
+        "  s += new C(2).p + f(1)(2);\n"
+        "  return s + ':' + t.length;\n}\n");
+    if (used >= capacity) { free(source); return NULL; }
+    return source;
+}
+
+/* Refused growth while a function is compiled must fail the compile with
+   "out of memory" or, when the refusal is survivable, produce a function
+   that runs correctly; it must never write past the end of a buffer that
+   did not grow (resolve_labels() moved the code after a short jump by a
+   negative length - a saved GitLab page lazily compiling a large function
+   under the PSP page ceiling crashed in that memmove), leave the parser's
+   scope stack unbalanced (an unchecked push_scope() made the matching pop
+   leave the parent scope; the scope index -1 then read far outside the
+   scope array and looped forever), keep a closure variable or constant
+   pool index of -1, or report a SyntaxError for a full heap.
+   One fresh runtime per refusal point: the function big() is defined
+   lazily (its body compiles on the first call) or eagerly (the refusal
+   covers the script's compile), allocation `point` of that call and
+   either every later one or only that one are refused, for every request
+   or only requests of at least `refuse_min` bytes. Returns 0 when clean;
+   *reached tells whether the call made allocation `point` at all. */
+static int run_function_compile_refusal_point(const char *source,
+                                              const char *expected,
+                                              size_t refuse_min,
+                                              size_t refuse_count, bool lazy,
+                                              size_t point, bool *reached)
+{
+    RegexpGuardState state = { 0, (size_t) -1, 0, 0, 0, 0 };
+    JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+    if (runtime == NULL) return 1;
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    /* only what big() uses: thousands of runtimes are made */
+    JSContext *context = JS_NewContextRaw(runtime);
+    if (context == NULL || JS_AddIntrinsicBaseObjects(context) != 0
+        || JS_AddIntrinsicEval(context) != 0) {
+        if (context != NULL) JS_FreeContext(context);
+        JS_FreeRuntime(runtime);
+        return 1;
+    }
+    int failed = 0;
+    static const char call[] = "big(3)";
+    JSLazyFunctionStats before, after;
+    JSValue result = JS_UNDEFINED, big = JS_UNDEFINED;
+    if (lazy) {
+        JS_SetLazyFunctionThreshold(runtime, 1u);
+        JSValue defined = JS_Eval(context, source, strlen(source),
+                                  "<compile-lazy>", JS_EVAL_TYPE_GLOBAL);
+        failed = JS_IsException(defined);
+        JS_FreeValue(context, defined);
+        JSValue global = JS_GetGlobalObject(context);
+        big = JS_GetPropertyStr(context, global, "big");
+        JS_FreeValue(context, global);
+    } else {
+        JS_SetLazyFunctionThreshold(runtime, 0u);
+    }
+    JS_GetLazyFunctionStats(runtime, &before);
+    size_t start = state.calls;
+    if (!failed) {
+        state.refuse_min = refuse_min;
+        state.refuse_count = refuse_count;
+        state.refuse_from = start + point;
+        if (!lazy) {
+            JSValue defined = JS_Eval(context, source, strlen(source),
+                                      "<compile-eager>", JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(defined)) result = JS_EXCEPTION;
+            JS_FreeValue(context, defined);
+        }
+        if (lazy) {
+            /* called directly: the first allocations are the compile's */
+            JSValue three = JS_NewInt32(context, 3);
+            result = JS_Call(context, big, JS_UNDEFINED, 1, &three);
+        } else if (!JS_IsException(result)) {
+            result = JS_Eval(context, call, sizeof(call) - 1u,
+                             "<compile-call>", JS_EVAL_TYPE_GLOBAL);
+        }
+        state.refuse_from = (size_t) -1;
+        *reached = state.calls - start > point;
+    }
+    JS_GetLazyFunctionStats(runtime, &after);
+    if (!failed && JS_IsException(result)) {
+        JSValue exception = JS_GetException(context);
+        /* An error object may not fit at all (nothing, or null, is thrown
+           then); anything else must be an honest "out of memory", not a
+           syntax error or a broken body. */
+        const char *text = JS_IsUninitialized(exception)
+            || JS_IsNull(exception) ? NULL : JS_ToCString(context, exception);
+        if (text != NULL && strstr(text, "out of memory") == NULL) {
+            fprintf(stderr, "compile refused at %zu (min %zu, count %zu, "
+                    "%s) reported \"%s\"\n", point, refuse_min, refuse_count,
+                    lazy ? "lazy" : "eager", text);
+            failed = 1;
+        }
+        if (lazy && text != NULL && after.compiled == before.compiled
+            && after.memory_failures == before.memory_failures) {
+            fprintf(stderr, "lazy compile refused at %zu (min %zu, count "
+                    "%zu) was not counted as a memory failure\n", point,
+                    refuse_min, refuse_count);
+            failed = 1;
+        }
+        JS_FreeCString(context, text);
+        JS_FreeValue(context, exception);
+        /* with memory back, the function compiles and runs */
+        if (!lazy) {
+            JSValue defined = JS_Eval(context, source, strlen(source),
+                                      "<compile-eager>", JS_EVAL_TYPE_GLOBAL);
+            JS_FreeValue(context, defined);
+        }
+        result = JS_Eval(context, call, sizeof(call) - 1u, "<compile-call>",
+                         JS_EVAL_TYPE_GLOBAL);
+    }
+    if (!failed) {
+        const char *text = JS_IsException(result) ? NULL
+            : JS_ToCString(context, result);
+        if (text == NULL || strcmp(text, expected) != 0) {
+            fprintf(stderr, "compile refused at %zu (min %zu, count %zu, %s):"
+                    " big(3) was %s, not %s\n", point, refuse_min,
+                    refuse_count, lazy ? "lazy" : "eager",
+                    text == NULL ? "(exception)" : text, expected);
+            failed = 1;
+        }
+        JS_FreeCString(context, text);
+    }
+    JS_FreeValue(context, result);
+    JS_FreeValue(context, big);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    if (state.corrupted != 0 || state.live != 0) {
+        fprintf(stderr, "compile refused at %zu (min %zu, count %zu, %s): "
+                "%u block(s) overrun, %zu leaked\n", point, refuse_min,
+                refuse_count, lazy ? "lazy" : "eager", state.corrupted,
+                state.live);
+        failed = 1;
+    }
+    return failed;
+}
+
+/* Many three-part loop heads with names not seen before: the parser's
+   lookahead scan of each `for (...)` head is the first to intern them, so
+   a refused allocation can land inside the scan, before it has seen the
+   ';' that tells the loop from a for-in/of. */
+static char *for_heads_source(unsigned loops)
+{
+    size_t capacity = 256u + (size_t) loops * 120u;
+    char *source = malloc(capacity);
+    if (source == NULL) return NULL;
+    size_t used = (size_t) snprintf(source, capacity,
+        "function big(a) {\n  var s = 0;\n");
+    for (unsigned n = 0; n < loops && used < capacity; n++)
+        used += (size_t) snprintf(source + used, capacity - used,
+            "  for (var headName%u = %u; headName%u < %u + 1; headName%u++)"
+            " s += a + headName%u;\n", n, n, n, n, n, n);
+    used += (size_t) snprintf(source + used, capacity - used,
+        "  return s + ':' + a;\n}\n");
+    if (used >= capacity) { free(source); return NULL; }
+    return source;
+}
+
+/* Every refusal point of one source and refusal kind (see above), until
+   the call makes no allocation at the point; *points is their number. */
+static int run_function_compile_refusal(bool for_heads, size_t refuse_min,
+                                        size_t refuse_count, bool lazy,
+                                        size_t *points)
+{
+    char *source = for_heads ? for_heads_source(400u)
+        : function_compile_source(24u);
+    if (source == NULL) return 1;
+    int failed = 0;
+    /* The reference result, with nothing refused. */
+    char *expected = NULL;
+    {
+        JSRuntime *runtime = JS_NewRuntime();
+        JSContext *context = runtime ? JS_NewContext(runtime) : NULL;
+        if (context != NULL) {
+            JS_SetMaxStackSize(runtime, test_stack_limit());
+            JSValue defined = JS_Eval(context, source, strlen(source),
+                                      "<compile-reference>",
+                                      JS_EVAL_TYPE_GLOBAL);
+            JSValue result = JS_IsException(defined) ? JS_EXCEPTION
+                : JS_Eval(context, "big(3)", 6u, "<compile-call>",
+                          JS_EVAL_TYPE_GLOBAL);
+            JS_FreeValue(context, defined);
+            const char *text = JS_IsException(result) ? NULL
+                : JS_ToCString(context, result);
+            expected = text == NULL ? NULL : strdup(text);
+            JS_FreeCString(context, text);
+            JS_FreeValue(context, result);
+            JS_FreeContext(context);
+        }
+        if (runtime != NULL) JS_FreeRuntime(runtime);
+    }
+    if (expected == NULL) failed = 1;
+    size_t point = 0;
+    for (bool reached = true; !failed && reached; point++) {
+        reached = false;
+        failed = run_function_compile_refusal_point(
+            source, expected, refuse_min, refuse_count, lazy, point,
+            &reached);
+    }
+    *points = point;
+    free(expected);
+    free(source);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -2175,6 +2728,54 @@ int main(int argc, char **argv)
         return run_failure_boundary((size_t) requested);
     }
     if (argc != 1) return 2;
+    if (run_float_array_indexed_stores() != 0) return 1;
+
+    /* Refused bytecode growth inside the regexp compiler must raise, not
+       patch jump offsets past the end of the buffer (a saved Mastodon page
+       compiling its emoji pattern under the PSP heap ceiling overran it). */
+    {
+        bool completed = false;
+        size_t boundary = 0;
+        for (; boundary < 4096 && !completed; boundary++) {
+            if (run_regexp_compile_refusal(boundary, &completed) != 0)
+                return 1;
+        }
+        if (!completed) {
+            fprintf(stderr, "regexp refusal sweep never completed\n");
+            return 1;
+        }
+        printf("QuickJS regexp compile refusal boundaries: PASS (%zu)\n",
+               boundary);
+    }
+    /* Likewise for the passes that compile a function, lazily on its
+       first call and eagerly. */
+    {
+        static const size_t mins[] = { 4096u, 256u, 0u };
+        for (size_t m = 0; m < sizeof(mins) / sizeof(mins[0]); m++) {
+            for (size_t count = 0; count <= 1u; count++) {
+                for (int lazy = 1; lazy >= 0; lazy--) {
+                    size_t points = 0;
+                    if (run_function_compile_refusal(false, mins[m], count,
+                                                     lazy != 0, &points) != 0)
+                        return 1;
+                    printf("QuickJS %s function compile refusal boundaries "
+                           "(requests >= %zu, %s): PASS (%zu)\n",
+                           lazy ? "lazy" : "eager", mins[m],
+                           count ? "one refused" : "all later refused",
+                           points);
+                }
+            }
+        }
+        /* a refusal inside the `for (...)` lookahead scan */
+        for (int lazy = 1; lazy >= 0; lazy--) {
+            size_t points = 0;
+            if (run_function_compile_refusal(true, 0u, 1u, lazy != 0,
+                                             &points) != 0)
+                return 1;
+            printf("QuickJS %s loop-head scan refusal boundaries: PASS "
+                   "(%zu)\n", lazy ? "lazy" : "eager", points);
+        }
+    }
     if (run_bytecode_refusal_atomicity() != 0) return 1;
     if (run_module_restore_failure_unregisters() != 0) {
         fprintf(stderr, "QuickJS module restore refusal failed\n");
@@ -2237,6 +2838,17 @@ int main(int argc, char **argv)
         }
     }
     puts("QuickJS parse OOM boundaries: PASS");
+
+    size_t parse_refusals = 0;
+    for (size_t boundary = 0; boundary <= 2048; boundary++) {
+        if (run_parse_failure_is_out_of_memory(boundary, &parse_refusals)
+            != 0) return 1;
+    }
+    if (parse_refusals == 0) {
+        fprintf(stderr, "no boundary refused the assignment parse\n");
+        return 1;
+    }
+    puts("QuickJS parse OOM reported as out of memory: PASS");
 
     for (size_t allowance = 0; allowance <= 65536; allowance += 64) {
         if (run_scope_resolution_memory_limit(allowance) != 0) {

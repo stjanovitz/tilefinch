@@ -107,6 +107,27 @@ scripts off everywhere. **Page tools → Site information → Permissions &
 controls → JavaScript** turns scripts off (or back on) for just that site,
 while **Settings → Browsing & input → JavaScript** remains the global switch.
 
+If a large site stays empty with a script error, check the `file_kb=` line
+of your `boot.cfg` (or `data/boot-overrides.cfg`). It is the largest single
+script Tilefinch accepts, in KiB, and the default is 4096. Older versions
+shipped `file_kb=512`, which refuses the app bundles of many sites; this
+version replaces exactly that old default once, the first time it starts,
+and adds a `#file_kb-migrated-from=512` line so it never does so again. A
+value you chose yourself, including 512 set after that line, is never
+changed. A boot.cfg managed by `scripts/stage-psp-game.sh` keeps its 512
+KiB Game Profile ceiling.
+
+## A site misbehaves after it updates
+
+With **Keep compiled scripts** on, Tilefinch reuses scripts it compiled on
+an earlier visit, but only for exactly the same script text, so an updated
+site normally just compiles its new scripts. If a site still misbehaves
+after an update (or after a Tilefinch update), clear the compiled-script
+cache: **Settings → Device & storage → Site data & storage → Clear compiled
+scripts**, or turn **Keep compiled scripts** off, which removes its files.
+**Clear data for this site** on the site's **Site information** removes only
+that site's. Deleting the `data/script-cache/` folder over USB does the same.
+
 ## A site forgets your settings, saved games, or logins
 
 Tilefinch keeps what sites store (`localStorage`, `sessionStorage`, and site
@@ -162,6 +183,7 @@ Everything you own is in `PSP/GAME/TILEFINCH/data/`:
 | `http-cache.bin` | Optional disk cache (off by default) |
 | `local-storage.bin` | Optional snapshot of in-memory local storage (off by default) |
 | `site-storage/` | Storage for sites you allowed on the Memory Stick |
+| `script-cache/` | Compiled scripts, with **Keep compiled scripts** on (off by default; at most 8 MB) |
 | `update-state.0` / `.1` | The update journal; leave these alone |
 | `update/` | Staged update downloads |
 | `offline/` | Saved articles and downloaded videos |
@@ -176,8 +198,8 @@ its size limit, and how much free space each feature needs.
 
 Delete `data/profile.cfg` to reset every setting, bookmark, and history
 entry. For a completely fresh start, also delete `recovery.cfg`,
-`http-cache.bin`, `local-storage.bin`, the `site-storage/` folder, and
-`boot-overrides.cfg`. All of them
+`http-cache.bin`, `local-storage.bin`, the `site-storage/` and
+`script-cache/` folders, and `boot-overrides.cfg`. All of them
 are recreated with defaults. Some of these files keep one previous generation
 beside them as a crash-safety copy (`profile.cfg.bak`, `http-cache.bin.bak`,
 `local-storage.bin.bak`); delete the `.bak` file too, or the browser restores

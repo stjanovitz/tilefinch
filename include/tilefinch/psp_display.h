@@ -197,6 +197,33 @@ bool psp_display_begin(PspDisplay *display, const PspDisplayBackend *backend);
  * added that forgets to leave the video surface first.
  */
 uint16_t *psp_display_back_buffer(const PspDisplay *display);
+
+typedef enum {
+    PSP_DISPLAY_ROW_COPY_REFUSED = -1,
+    PSP_DISPLAY_ROW_COPY_MEMCPY = 0,
+    PSP_DISPLAY_ROW_COPY_VFPU = 1
+} PspDisplayRowCopyResult;
+
+/* Copy the half-open [top, end) band from the canonical, tightly packed
+   480x272 RGB565 frame into the reserved 512-stride page back buffer. The
+   source must be distinct from that back buffer. No padding, other rows,
+   cache ownership or presentation state changes. Empty bands are no-ops.
+   vfpu_eligible MUST describe the calling thread's VFPU permission, not just
+   the executable: supervisor/callback threads must pass false. Misalignment
+   and non-Allegrex builds retain memcpy. Borrowed VFPU state is preserved. */
+PspDisplayRowCopyResult psp_display_copy_rgb565_rows(
+    PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end,
+    bool vfpu_eligible);
+
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Run before opting a VFPU-capable owner thread into the copy candidate.
+   Uses the real source/back buffer and performs the requested copy; call
+   only while that band may be composed. Returns zero only after a VFPU copy
+   with exact pixels, preserved borrowed registers/prefixes and unchanged
+   padding/other-row hash. Bits: 1 refused, 2 pixels, 4 state, 8 untouched. */
+unsigned psp_display_validation_probe_row_copy(
+    PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end);
+#endif
 uint16_t *psp_display_front_buffer(const PspDisplay *display);
 
 /*

@@ -143,7 +143,11 @@ static bool glyph_prefilter(TileCache *cache, const FontFace *face,
     return true;
 }
 
-static const FontGlyph *glyph_cache_acquire(TileCache *cache,
+/* Out of line, as it has always been compiled: with the lab-only idle glyph
+   prewarm compiled out, rasterize_truetype_text is its sole caller and GCC
+   would otherwise fold this cache path into the text rasterizer. */
+static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
+                                            TileCache *cache,
                                             const FontFace *face,
                                             unsigned codepoint,
                                             int pixel_height, bool bold,
@@ -250,6 +254,101 @@ static void blend_authored_glyph_pixel(
     blend_authored_glyph_at_index(target, index, color, alpha);
 }
 
+/* Glyph coverage into a target with plain source-over. One command's ink
+   resolves to the same colour at every pixel (raster_target_color and the
+   normal blend mode depend only on the command and the target), so it is
+   resolved once and its channels extracted once; each pixel then takes
+   blend_at_index's arithmetic in the same order. Exact by construction. */
+typedef struct {
+    uint16_t packed;
+    unsigned red;
+    unsigned green;
+    unsigned blue;
+} GlyphInk;
+
+static void glyph_ink_init(GlyphInk *ink, uint32_t color)
+{
+    ink->packed = rgb565(color);
+    ink->red = (color >> 16) & 0xffu;
+    ink->green = (color >> 8) & 0xffu;
+    ink->blue = color & 0xffu;
+}
+
+/* blend_rgb565 with the source channels already extracted. */
+static inline __attribute__((always_inline))
+uint16_t glyph_ink_blend(const GlyphInk *ink, uint16_t destination,
+                         unsigned alpha)
+{
+    unsigned inverse = 255u - alpha;
+    unsigned red = tilefinch_div255_u16(
+        ink->red * alpha + tilefinch_rgb5_to_u8(
+            tilefinch_rgb565_red_code(destination)) * inverse + 127u);
+    unsigned green = tilefinch_div255_u16(
+        ink->green * alpha + tilefinch_rgb6_to_u8(
+            tilefinch_rgb565_green_code(destination)) * inverse + 127u);
+    unsigned blue = tilefinch_div255_u16(
+        ink->blue * alpha + tilefinch_rgb5_to_u8(
+            tilefinch_rgb565_blue_code(destination)) * inverse + 127u);
+    return tilefinch_rgb565_pack_u8(red, green, blue);
+}
+
+/* blend_at_index for a normal-mode ink. */
+static inline __attribute__((always_inline))
+void glyph_ink_at(const GlyphInk *ink, uint16_t *pixels, uint8_t *coverage,
+                  size_t index, unsigned alpha)
+{
+    if (coverage != NULL) {
+        unsigned destination_alpha = coverage[index];
+        if (alpha == 255u || destination_alpha == 0u) {
+            pixels[index] = ink->packed;
+            coverage[index] = (uint8_t) alpha;
+            return;
+        }
+        if (destination_alpha == 255u) {
+            pixels[index] = glyph_ink_blend(ink, pixels[index], alpha);
+            return;
+        }
+        unsigned output_alpha = alpha + tilefinch_div255_u16(
+            destination_alpha * (255u - alpha) + 127u);
+        unsigned effective = (unsigned) (((uint64_t) (alpha * 255u)
+            * blend_reciprocals[output_alpha]) >> 32);
+        pixels[index] = glyph_ink_blend(ink, pixels[index], effective);
+        coverage[index] = (uint8_t) output_alpha;
+        return;
+    }
+    pixels[index] = alpha == 255u
+        ? ink->packed : glyph_ink_blend(ink, pixels[index], alpha);
+}
+
+/* One row of an upright, plain-coverage glyph whose clipped span on this
+   row is [span_x0, span_x1) starting at row_index: the per-pixel loop of
+   rasterize_truetype_text, including its synthetic-bold second sample. */
+__attribute__((noinline))
+static void glyph_ink_row(const GlyphInk *ink, RasterTarget *target,
+                          size_t row_index, int span_x0, int span_x1,
+                          int x0, const unsigned char *row, int width,
+                          unsigned opacity_scale, bool bold)
+{
+    uint16_t *pixels = target->pixels;
+    uint8_t *coverage = target->alpha;
+    for (int column = 0; column < width; column++) {
+        unsigned alpha = row[column] * opacity_scale / 256u;
+        if (alpha == 0) continue;
+        int x = x0 + column;
+        if (x >= span_x0 && x < span_x1)
+            glyph_ink_at(ink, pixels, coverage,
+                         row_index + (size_t) (x - span_x0), alpha);
+        if (bold) {
+            unsigned bold_alpha = alpha / 2u;
+            int bold_x = x + 1;
+            if (bold_alpha != 0 && bold_x >= span_x0 && bold_x < span_x1)
+                glyph_ink_at(ink, pixels, coverage,
+                             row_index + (size_t) (bold_x - span_x0),
+                             bold_alpha);
+        }
+    }
+}
+
 static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                     const DrawCommand *command)
 {
@@ -305,6 +404,14 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
     }
     size_t bidi_at = 0;
     bool rtl = bidi_command == NULL && draw_command_text_rtl(command);
+    bool ink_rows = rotation == 0 && !synthetic_italic
+        && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL;
+#ifndef __PSP__
+    ink_rows = ink_rows && !tilefinch_test_faults()->raster_span_reference;
+#endif
+    GlyphInk ink;
+    if (ink_rows) glyph_ink_init(&ink, raster_target_color(target,
+                                                           command->color));
     size_t rtl_number_at = 0, rtl_number_end = 0;
     for (size_t at = rtl ? command->text_length : 0;
          bidi_command != NULL ? bidi_at < bidi_command->glyph_count
@@ -423,6 +530,14 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                     row_base + last_column + (synthetic_bold ? 2 : 1)
                         + (italic_fraction != 0u ? 1 : 0),
                     &span_x0, &span_x1, &row_index, &rounded)) continue;
+            if (ink_rows && smoothed && !rounded && glyph->colors == NULL) {
+                glyph_ink_row(&ink, target, row_index, span_x0, span_x1,
+                              row_base, glyph->pixels
+                                  + (size_t) row * (size_t) glyph->width,
+                              glyph->width, command->opacity_scale,
+                              synthetic_bold);
+                continue;
+            }
             for (int column = first_column; column <= last_column; column++) {
                 unsigned alpha = 0;
                 size_t glyph_at = 0;

@@ -12,6 +12,8 @@
 #include "tilefinch/layout.h"
 #include "tilefinch/style.h"
 #include "tilefinch/remote_selector.h"
+#include "tilefinch/script_admission.h"
+#include "tilefinch/validation_cpu.h"
 
 /* QuickJS parsing/bytecode generation is a dependency call. The vendored
    parser polls the watchdog, but admission still needs a hard byte ceiling
@@ -43,6 +45,10 @@ typedef struct {
        checkpoint). Zero is unbounded. A single task may exceed this target;
        it is never interrupted/replayed to meet a scheduling deadline. */
     uint64_t maximum_advance_time_us;
+    /* Ceiling of the native DOM handle table. Zero selects
+       SCRIPT_DOM_HANDLE_SLOT_CAPACITY; larger values (at most
+       SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX) let the table grow on demand. */
+    size_t dom_handle_slot_capacity;
 } ScriptExecutionPolicy;
 
 typedef enum {
@@ -61,7 +67,12 @@ typedef enum {
     SCRIPT_COMPILE_ADMISSION_REJECTED_PROJECTED_TIME,
     /* Admitted, but the watchdog (deadline or cooperate stop) aborted the
        compile through the parser's bounded interrupt polls. */
-    SCRIPT_COMPILE_ADMISSION_ABORTED_WATCHDOG
+    SCRIPT_COMPILE_ADMISSION_ABORTED_WATCHDOG,
+    /* Refused for memory: either the unit's smallest possible compile
+       working set did not fit the realm's heap (refused before compiling),
+       or the compile itself ran into the heap limit and was abandoned with
+       the realm intact (script_admission.h). */
+    SCRIPT_COMPILE_ADMISSION_REJECTED_MEMORY
 } ScriptCompileAdmission;
 
 bool script_execution_policy_for_profile(
@@ -75,6 +86,15 @@ bool script_execution_policy_for_profile(
 #define SCRIPT_DOM_HANDLE_INDEX_MASK \
     ((1u << SCRIPT_DOM_HANDLE_INDEX_BITS) - 1u)
 #define SCRIPT_DOM_HANDLE_SLOT_CAPACITY 8192u
+/* The realistic PSP profile (32 MiB page envelope) may grow the table once a
+   page holds more live nodes than the base capacity: 16,384 less one 32-slot
+   word, the largest multiple of 32 the 14-bit slot field encodes. The base
+   table is allocated at creation exactly as before; the extra slots (about
+   21 bytes each on the PSP, plus the lazily allocated wrapper references)
+   are Budget-admitted only when a page needs them. */
+#define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC 16352u
+#define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX \
+    SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC
 
 typedef struct {
     bool success;
@@ -91,26 +111,42 @@ typedef struct {
     size_t external_script_bytecode_cache_admission_skips;
     size_t external_script_bytecode_cache_restore_failures;
     size_t external_script_bytecode_cache_bytes;
-    /* ES module bytecode (BrowserModuleBytecodeCache). Hits restored a
+    /* Classic bytecode serialized into the session table; the time spent
+       looking it up (source digest included) and restoring it, successfully
+       or not; and the time spent storing it (serialization, digest, copy). */
+    size_t external_script_bytecode_cache_stored_bytes;
+    unsigned long long external_script_bytecode_restore_us;
+    unsigned long long external_script_bytecode_store_us;
+    /* Stores are deferred: a compiled script is queued during the load
+       (store_us is then the queueing: source digest and bookkeeping) and
+       serialized into the table by idle work (idle_store_us). A queued
+       script the same load evaluates again (a ResourceLoader segment after
+       its preflight) runs from the queue (pending_hits, also counted as
+       hits). Dropped: discarded unserialized (navigation away, JavaScript
+       heap pressure, a cache clear). */
+    size_t external_script_bytecode_deferred;
+    size_t external_script_bytecode_deferred_dropped;
+    size_t external_script_bytecode_pending_hits;
+    unsigned long long external_script_bytecode_idle_store_us;
+    /* ES module bytecode (BrowserScriptBytecodeTable). Hits restored a
        module instead of compiling it; misses compiled one the cache could
        have served; restored/stored bytes are serialized bytecode. */
     size_t module_bytecode_cache_hits;
     size_t module_bytecode_cache_misses;
     size_t module_bytecode_cache_stores;
     size_t module_bytecode_cache_admission_skips;
+    /* Compiled modules not kept because their response was no-store. */
+    size_t module_bytecode_cache_no_store_skips;
     size_t module_bytecode_cache_restore_failures;
     size_t module_bytecode_cache_bytes;
     size_t module_bytecode_cache_stored_bytes;
-    /* The optional persistent tier: restores and files written. */
-    size_t module_bytecode_disk_hits;
-    size_t module_bytecode_disk_stores;
-    /* Persistent tier: synchronous file read + verification (hits and
-       misses), and copying a disk hit into the RAM cache. */
-    unsigned long long module_bytecode_disk_load_us;
-    unsigned long long module_bytecode_disk_read_us;
-    unsigned long long module_bytecode_disk_verify_us;
-    unsigned long long module_bytecode_promote_us;
     unsigned long long module_bytecode_restore_us;
+    /* The persistent compiled-script tier (classic and module): restores
+       whose record this load read from disk, and the synchronous pack reads,
+       verification and copies into RAM, whether or not they hit. Writes are
+       idle work and appear in the session's BrowserScriptDiskStats. */
+    size_t script_bytecode_disk_hits;
+    unsigned long long script_bytecode_disk_load_us;
     bool dom_content_loaded_dispatched;
     bool form_submission_requested;
     bool relayout_required;
@@ -123,6 +159,11 @@ typedef struct {
     size_t dom_handle_wrapper_releases;
     size_t dom_handle_connected_preserves;
     size_t dom_handle_stale_releases;
+    /* Current slot-table size, and how often it grew or was refused
+       growth by the Budget (see ScriptExecutionPolicy). */
+    size_t dom_handle_slot_capacity;
+    size_t dom_handle_growths;
+    size_t dom_handle_growth_refusals;
     size_t geometry_queries;
     size_t geometry_retained_fast_paths;
     size_t geometry_ancestor_visits;
@@ -172,6 +213,15 @@ typedef struct {
     size_t dynamic_scripts_nomodule_skipped;
     size_t dynamic_script_bytes;
     size_t dynamic_scripts_quota_rejected;
+    /* Host-lab census of cloned script elements (always zero on the PSP):
+       clones of started and of not-started scripts, started clones later
+       inserted into the document (whose execution the copied "already
+       started" flag suppressed), and clones refused because the bounded
+       script-state table could not record them. */
+    size_t script_clones_started;
+    size_t script_clones_unstarted;
+    size_t script_clones_suppressed;
+    size_t script_clones_refused;
     /* Compile (parse to bytecode, or bytecode restore) and top-level
        execution time by source kind, so a page whose scripts dominate
        its runtime can be read as compile-bound or execution-bound. */
@@ -264,6 +314,12 @@ typedef struct {
     size_t host_compile_projected_rejected_bytes;
     size_t host_compile_watchdog_aborts;
     size_t host_compile_watchdog_aborted_bytes;
+    /* Compiles refused for memory (SCRIPT_COMPILE_ADMISSION_REJECTED_MEMORY),
+       also counted in host_compile_rejections; the in-compile share is the
+       compiles abandoned at the heap limit. */
+    size_t host_compile_memory_refusals;
+    size_t host_compile_memory_refused_bytes;
+    size_t host_compile_memory_abandoned;
     size_t host_compile_source_limit_bytes;
     ScriptCompileAdmission last_compile_admission;
     ScriptCompileSourceKind last_compile_source_kind;
@@ -347,6 +403,14 @@ typedef struct {
     size_t lazy_webpack_syntax_preflight_failures;
     size_t lazy_webpack_syntax_preflight_source_bytes;
     uint64_t lazy_webpack_syntax_preflight_total_us;
+    /* Lazy webpack bundle records (script_runtime_lazy_webpack_plan):
+       keyed lookups, hits (planner skipped), records queued for storing,
+       and the time spent planning or restoring plans (lookups and digests
+       included). */
+    size_t lazy_webpack_record_lookups;
+    size_t lazy_webpack_record_hits;
+    size_t lazy_webpack_record_queued;
+    uint64_t lazy_webpack_plan_total_us;
 } ScriptResult;
 
 typedef struct {
@@ -423,6 +487,10 @@ typedef struct {
 
 bool script_runtime_webgl_native_metrics(
     ScriptWebglNativeMetrics *metrics);
+/* Cheap validation counter snapshot, without sorting timing samples. Use at
+   batch boundaries; metrics() remains the post-window percentile report. */
+bool script_runtime_webgl_native_counters(
+    ScriptWebglNativeMetrics *metrics);
 void script_runtime_webgl_native_metrics_reset(void);
 
 /* Validation-only event-loop phase census. The timer-callback interval
@@ -475,6 +543,7 @@ typedef struct {
     uint64_t frame_callback_late_us;
 } ScriptRuntimeTimingMetrics;
 
+
 /* Host-testable admission seam for the process-global PSP GE texture owner.
    Production cache metadata uses the same transition helper.  A changed
    realm epoch or canvas handle must clear both retained counters before any
@@ -502,6 +571,8 @@ bool script_runtime_webgl_cache_admit(
    The admission state is public only so host tests can pin eviction and
    incarnation semantics; page code cannot observe or select any part of it. */
 #define SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT 4u
+/* Cache hits the PSP GE may draw from the retained block itself per frame. */
+#define SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT 8u
 #define SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS 40u
 #define SCRIPT_WEBGL_GEOMETRY_CACHE_BYTE_LIMIT (64u * 1024u)
 
@@ -649,6 +720,9 @@ typedef struct {
        has been detached (its own parent pointer is gone) or destroyed (the
        record's node is then NULL). Cleared when that parent is destroyed. */
     lxb_dom_node_t *scope;
+    /* The removal that set `scope` took the child from after every element
+       sibling: the siblings left kept their positions from the start. */
+    bool removed_last;
     /* For tree and text changes the bridge probed while the change was
        visible (stylesheet_tree_change_has_entries): which :has() entries
        of the journal's plan build (`has_serial`) the writes coalesced here
@@ -700,10 +774,45 @@ static inline const uint32_t *script_mutation_record_tokens(
 }
 
 typedef struct ScriptRuntime ScriptRuntime;
+/* Validation-only owner-thread CPU brackets around entire batches. Host and
+   ordinary builds refuse measurement and expose zero metrics. */
+bool script_runtime_validation_cpu_measure(ScriptRuntime *runtime, bool enabled);
+bool script_runtime_validation_cpu_metrics(const ScriptRuntime *runtime,
+                                           ScriptRuntimeCpuMetrics *out);
 
 bool script_runtime_timing_metrics(
     const ScriptRuntime *runtime, ScriptRuntimeTimingMetrics *metrics);
 void script_runtime_timing_metrics_reset(ScriptRuntime *runtime);
+/* Suppress routine checkpoint tracing in a validation timing window, not
+   exceptions or failure diagnostics. Shipping/host builds are unaffected. */
+void script_runtime_suppress_checkpoint_trace(ScriptRuntime *runtime, bool suppress);
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Intrusive native-boundary attribution, enabled explicitly by a validation
+   mark. Durations include argument collection and native service, and nest
+   inside the page callback. No script-visible hook or shipping counters. */
+#define SCRIPT_GAME_AUDIO_NATIVE_COMMANDS 13u
+typedef struct {
+    uint64_t command_us[SCRIPT_GAME_AUDIO_NATIVE_COMMANDS];
+    uint32_t command_calls[SCRIPT_GAME_AUDIO_NATIVE_COMMANDS];
+    uint32_t nested_calls;
+} ScriptGameAudioNativeMetrics;
+void script_runtime_game_audio_native_measure(bool enabled);
+void script_runtime_game_audio_native_take(ScriptGameAudioNativeMetrics *metrics);
+#if defined(__PSP__)
+/* Instances sharing a colored slice when their tints match (on by default);
+   off gives every colored instance its own slice, as before. */
+void script_runtime_webgl_validation_tint_share(bool enabled);
+void script_runtime_webgl_validation_tint_counts(uint64_t *instances,
+                                                 uint64_t *slices);
+/* Cache hits drawn from the retained block (on by default); off copies
+   every hit into the frame's scratch vertices first, as before. */
+void script_runtime_webgl_validation_direct_geometry(bool enabled);
+void script_runtime_webgl_validation_direct_counts(uint64_t *direct,
+                                                   uint64_t *retired);
+bool script_runtime_webgl_validation_history(ScriptRuntime *runtime, bool restore);
+#endif
+#endif
 
 /* Validation diagnostics: what the page's event loop could run now, read
    from native state without entering script. The frame loop samples it
@@ -733,6 +842,11 @@ bool script_runtime_runnable_state(ScriptRuntime *runtime,
    rendering opportunity), or a complete fetch response to deliver. A frame
    loop uses it to start the next turn without waiting for vblank. */
 bool script_runtime_task_runnable(ScriptRuntime *runtime);
+/* Head frame callback's remaining virtual timer-clock milliseconds. This
+   native mirror read never invokes author code. Refuses wall-clock wheels,
+   ordinary task heads, and unavailable deadlines. */
+bool script_runtime_frame_clock_delay_ms(ScriptRuntime *runtime,
+                                         unsigned *delay_ms);
 uint64_t script_runtime_gc_probe_us(ScriptRuntime *runtime);
 
 /* Temporarily cap newly armed JavaScript watchdog slices to one absolute
@@ -829,6 +943,8 @@ typedef struct {
     /* Effective policy inherited from the referring module response. */
     const char *referrer_policy;
     TilefinchCredentialsMode credentials;
+    /* CSP grant inherited from the graph's root script. */
+    uint8_t csp_grant;
 } ScriptModuleLoadRequest;
 typedef struct {
     char *source;
@@ -840,6 +956,9 @@ typedef struct {
     /* Normalized policy selected from the final response only. Empty means
        that the referring module's effective policy remains inherited. */
     char response_referrer_policy[BROWSER_MODULE_REFERRER_POLICY_LIMIT];
+    /* The response's Cache-Control carried no-store: the module runs, but
+       its compiled bytecode is not kept. */
+    bool response_no_store;
 } ScriptModuleLoadResult;
 typedef bool (*ScriptModuleLoadCallback)(void *opaque,
                                          const ScriptModuleLoadRequest *request,
@@ -1076,6 +1195,11 @@ typedef struct {
        callers must leave this false: native realm primitives are otherwise
        installed non-writable, non-configurable, and non-enumerable. */
     bool allow_test_network_primitive_overrides;
+    /* Trusted audio backend selection, not a page-visible capability. Browser
+       configuration selects native slots; zero-initialized standalone callers
+       retain the reference JavaScript implementation for differential tests.
+       Shipping PSP builds omit the reference and always use native slots. */
+    bool game_audio_internal_slots;
     /* Applied only after trusted browser bootstrap evaluation. */
     bool dynamic_code_disabled;
     ScriptDocumentScope document_scope;
@@ -1137,6 +1261,24 @@ bool script_runtime_deterministic_replay_diagnostics(
    arguments, URLs, or page values cross this diagnostic seam. */
 bool script_runtime_scheduler_snapshot(
     ScriptRuntime *runtime, ScriptSchedulerSnapshot *snapshot);
+
+typedef struct {
+    bool selected_native;
+    bool lazy_installed;
+    bool native_present;
+    bool failed;
+} ScriptGameAudioStatus;
+
+/* Read-only, allocation-free observation; never triggers lazy installation.
+   Call only on the runtime's owner thread with a live runtime, outside
+   execution/retirement/destruction. This is not a cross-thread query and
+   supplies no synchronization or lifetime protection. Returns false for a
+   NULL runtime/output, zeroing any provided output for a NULL runtime.
+   native_present alone is not success: failed initialization may retain an
+   arena until teardown. Native success also requires selected_native,
+   lazy_installed, and !failed. */
+bool script_runtime_game_audio_status(
+    const ScriptRuntime *runtime, ScriptGameAudioStatus *status);
 
 ScriptRuntime *script_runtime_create(PocDocument *document, Budget *budget,
                                      size_t js_memory_limit,
@@ -1213,6 +1355,111 @@ void script_runtime_enable_heap_growth(ScriptRuntime *runtime,
    exhaustion decisions use this; "collect first" triggers keep using
    script_runtime_heap_remaining so a realm collects before it grows. */
 size_t script_runtime_heap_available(const ScriptRuntime *runtime);
+/* Deferred classic bytecode stores (js_module_loader.c). One idle turn:
+   serializes the oldest queued compile into the session's classic table;
+   returns whether a queued store was handled. Only between scripts, from
+   idle work. The store counters are copied into `result` (the realm's
+   snapshot; no script turn need follow). */
+bool script_runtime_store_pending_bytecode(ScriptRuntime *runtime,
+                                           ScriptResult *result);
+/* Discards every queued store (counted as dropped, with `reason` in the
+   census ledger). Teardown does this. */
+void script_runtime_drop_pending_bytecode(ScriptRuntime *runtime,
+                                          const char *reason);
+/* Teardown: stores queued compiles, oldest first, while their sources total
+   at most `source_budget` bytes, and drops the rest. */
+#define SCRIPT_BYTECODE_TEARDOWN_FLUSH_BYTES (256u * 1024u)
+void script_runtime_flush_pending_bytecode(ScriptRuntime *runtime,
+                                           size_t source_budget);
+size_t script_runtime_pending_bytecode_count(const ScriptRuntime *runtime);
+
+/*
+ * Heavy pages (include/tilefinch/script_admission.h). The realm weighs the
+ * author script it loads: every external, module and dynamic script it
+ * compiles counts, and a dynamic script of at least SCRIPT_HEAVY_UNIT_BYTES
+ * counts from the moment its body arrives. With the ASK policy, once the
+ * page is a heavy empty shell or the waiting scripts cannot fit, those big
+ * dynamic scripts wait (complete, but not run) until
+ * script_runtime_answer_heavy(); smaller scripts keep running. REFUSE
+ * fails them with an error event instead, as a script that did not load.
+ * RUN, the default, never holds anything; the state is still reported.
+ */
+typedef enum {
+    SCRIPT_HEAVY_POLICY_RUN = 0,
+    SCRIPT_HEAVY_POLICY_ASK,
+    SCRIPT_HEAVY_POLICY_REFUSE
+} ScriptHeavyPolicy;
+
+/* An embedder's per-site policy: the answer for a realm whose top-level
+   page is `url`. */
+typedef ScriptHeavyPolicy (*ScriptHeavyPolicyResolver)(void *opaque,
+                                                       const char *url);
+
+typedef struct {
+    ScriptHeavyClass page_class;
+    /* Big dynamic scripts are waiting for script_runtime_answer_heavy(). */
+    bool waiting;
+    /* The user (or policy) has answered for this page. */
+    bool answered;
+    bool allowed;
+    /* Author script source this page has compiled or is holding, and the
+       part restored from cached bytecode (RAM tables or, of that, the
+       Memory Stick tier) instead of compiled. */
+    size_t script_bytes;
+    size_t restored_bytes;
+    size_t disk_restored_bytes;
+    size_t waiting_bytes;
+    size_t waiting_scripts;
+    size_t refused_scripts;
+    /* Scripts refused as too large for the page (at least these bytes). */
+    size_t oversized_scripts;
+    size_t oversized_bytes;
+    size_t largest_unit_bytes;
+    /* PSP time to start the page's scripts (run plus waiting), and the
+       waiting scripts alone. */
+    uint32_t estimate_ms;
+    uint32_t waiting_ms;
+    /* Planned heap growth for the waiting scripts, and the heap the realm
+       can still reach. */
+    size_t memory_needed;
+    size_t memory_free;
+    size_t visible_text_bytes;
+} ScriptHeavyState;
+
+void script_runtime_set_heavy_policy(ScriptRuntime *runtime,
+                                     ScriptHeavyPolicy policy);
+/* Counts `bytes` of author source this realm is about to compile; called by
+   the loaders for external and module scripts. */
+void script_runtime_note_script_source(ScriptRuntime *runtime, size_t bytes,
+                                       size_t largest_unit_bytes);
+bool script_runtime_heavy_state(ScriptRuntime *runtime,
+                                ScriptHeavyState *state);
+/* Records a script refused because it is too large for the page: over the
+   per-script source ceiling, or its compile cannot fit the heap. Such a
+   page is over the best case (SCRIPT_HEAVY_CLASS_OVER). */
+void script_runtime_note_oversized_script(ScriptRuntime *runtime,
+                                          size_t bytes);
+/* Measures the text the server sent once the page commits, before later
+   author scripts change it (navigation commit). */
+void script_runtime_heavy_commit(ScriptRuntime *runtime);
+/* Memory rescue for a committed top-level page. Once armed, the first time
+   the realm's heap is refused more memory the runtime copies the body as it
+   stands then, without its scripts (bounded by the body snapshot limit,
+   from the page Budget, at most SCRIPT_MEMORY_RESCUE_CAPTURES times per
+   realm). An app that runs out of memory often tears the server-rendered
+   page down in the same task (React unmounts its root on an uncaught
+   error), so this is the last moment the content still exists. The
+   navigation pump takes the copy after each turn: it restores it when the
+   turn ended with the body degraded, and frees it otherwise. */
+#define SCRIPT_MEMORY_RESCUE_CAPTURES 3u
+void script_runtime_arm_memory_rescue(ScriptRuntime *runtime);
+/* Moves the copy taken since the last call (if any) into `snapshot`; the
+   caller destroys it. */
+bool script_runtime_take_memory_rescue(ScriptRuntime *runtime,
+                                       DocumentBodySnapshot *snapshot);
+/* Run (true) or refuse (false) the scripts waiting now and any later big
+   ones on this page. Returns false when nothing was waiting. */
+bool script_runtime_answer_heavy(ScriptRuntime *runtime, bool run);
 /* Print and clear the sampling profile (no-op unless profiling is on). */
 void script_runtime_profile_report(ScriptRuntime *runtime, const char *label);
 /* Deterministic work of one realm (its QuickJS runtime and worker realms)
@@ -1280,6 +1527,18 @@ typedef struct {
     size_t lazy_compile_failures;
     size_t reentrant_checkpoints;  /* microtask checkpoints left to the
                                       outer, empty-stack checkpoint */
+    /* Collections: all, those the allocation threshold ran, the most in
+       one advance and in one microtask checkpoint, starved collections
+       (less than an amortized step left), automatic collection backed off
+       for the rest of an advance, and total collection time (timed builds;
+       0 in shipping builds). */
+    size_t collections;
+    size_t threshold_collections;
+    size_t max_advance_collections;
+    size_t max_checkpoint_collections;
+    size_t pacing_starved;
+    size_t pacing_backoffs;
+    uint64_t collection_us;
 } ScriptHeapGrowth;
 void script_runtime_heap_growth(const ScriptRuntime *runtime,
                                 ScriptHeapGrowth *growth);
@@ -1489,6 +1748,27 @@ bool script_runtime_evaluate_probe(ScriptRuntime *runtime,
                                    const char *source,
                                    const char *source_url,
                                    ScriptResult *result);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Trusted validation predicate already compiled in the page realm. Uses the
+   normal watchdog but neither compiles source nor drains pending jobs. Names
+   are bounded to 96 bytes; explicit predicate side effects remain the caller's
+   responsibility, just as with evaluate_probe. */
+bool script_runtime_call_boolean_probe(ScriptRuntime *runtime,
+                                       const char *function_name,
+                                       bool *matched);
+/* Validation only: copy an own, non-accessor 32-bit typed-array data packet
+   without evaluating page code. Refuses proxies, detached/short views and
+   pending exceptions. The fixed packet name is not a browser API. */
+#define SCRIPT_VALIDATION_FRAME_WORD_LIMIT 96u
+bool script_runtime_copy_validation_frame_words(
+    ScriptRuntime *runtime, uint32_t *words, size_t count,
+    uint64_t *performance_origin_us);
+#endif
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Post-window only: report bounded native phase records, refusing captures
+   with overflow, unbalanced scopes or failed clocks. Never called per frame. */
+bool script_runtime_validation_phase_report(ScriptRuntime *runtime, FILE *out);
+#endif
 typedef struct {
     bool measured;
     bool cache_hit;
@@ -1564,6 +1844,18 @@ lxb_dom_node_t *script_runtime_node_handle_resolve_connected(
    same node through the parser-oriented loader a second time. */
 bool script_runtime_dynamic_script_is_scheduled(
     const ScriptRuntime *runtime, const lxb_dom_node_t *node);
+/* The document loader starts `node` (it has a src attribute or source
+   text): set "already started" on its native state, when it has one, so a
+   later clone copies the flag. Never allocates state. */
+void script_runtime_script_mark_started(ScriptRuntime *runtime,
+                                        const lxb_dom_node_t *node);
+/* HTML's parser-inserted flag for CSP 'strict-dynamic': false only for a
+   script element the realm created (createElement, cloned from one). */
+bool script_runtime_script_parser_inserted(
+    const ScriptRuntime *runtime, const lxb_dom_node_t *node);
+/* The CSP grant a module's own imports carry (zero when unknown). */
+uint8_t script_runtime_module_csp_grant(const ScriptRuntime *runtime,
+                                        const char *module_url);
 /* Reserve before acquiring a cache body or starting a fetch. Borrowed cache
    metadata may first be inspected to request its exact body length. A
    DEFERRED result means another in-flight script temporarily owns all
@@ -1603,6 +1895,10 @@ bool script_runtime_set_page_visibility(ScriptRuntime *runtime, bool visible);
    fullscreen element detached by author mutation. */
 bool script_runtime_page_fullscreen_active(ScriptRuntime *runtime);
 bool script_runtime_exit_page_fullscreen(ScriptRuntime *runtime);
+/* Called once per Page controls entry. True when the native entry notice
+   must be shown: always the first time in a document, and on later entries
+   unless the claim asked for {notice: "once"}. Consumes that request. */
+bool script_runtime_take_page_controls_notice(ScriptRuntime *runtime);
 void script_runtime_suspend_game_audio(ScriptRuntime *runtime);
 bool script_runtime_dispatch(ScriptRuntime *runtime, const char *selector,
                              const char *event_type, ScriptResult *result);
@@ -1643,10 +1939,14 @@ bool script_runtime_evaluate_external_typed(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *source_url,
     bool module, ScriptResult *result);
+/* A classic external script from the network or the HTTP cache. Its
+   compiled bytecode is kept in the session's classic table for a later
+   visit unless `response_no_store` (the response's Cache-Control carried
+   no-store, or it is not a network response at all). */
 bool script_runtime_evaluate_external_classic_cached(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *request_url,
-    const char *response_url, ScriptResult *result);
+    const char *response_url, bool response_no_store, ScriptResult *result);
 typedef enum {
     SCRIPT_MODULE_MAP_MISSING = 0,
     SCRIPT_MODULE_MAP_LOADING,
@@ -1671,6 +1971,16 @@ bool script_runtime_evaluate_external_module_context(
     const char *source, size_t source_length, const char *request_url,
     const char *response_url, const char *effective_referrer_policy,
     TilefinchCredentialsMode credentials, ScriptResult *result);
+/* The same for a fetched root module: a no-store response (its
+   Cache-Control) runs but keeps no compiled bytecode, like a classic
+   script's. Imports report their own responses through
+   ScriptModuleLoadResult.response_no_store. */
+bool script_runtime_evaluate_external_module_response(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *request_url,
+    const char *response_url, const char *effective_referrer_policy,
+    TilefinchCredentialsMode credentials, bool response_no_store,
+    ScriptResult *result);
 /* The module loader reads this while compiling an active root module so the
    root script's credentials mode also applies to every transitive import. */
 TilefinchCredentialsMode script_runtime_module_credentials(
@@ -1685,7 +1995,52 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
     const struct ScriptLazyWebpackPlan *plan,
     void *source_lease, ScriptSourceLeaseReleaseCallback release_source,
     ScriptResult *result);
+/* Plans a classic script for the lazy webpack path. When the session holds
+   a bundle record for exactly these bytes (top-level site, request URL and
+   length first; the SHA-256 only for such a candidate) the plan is restored
+   from it with from_record set and the planner does not run. Otherwise the
+   planner runs. Neither checks the factories' syntax: each factory is
+   compiled, and checked, when it first runs. Returns whether a plan was
+   made; destroy it with script_lazy_webpack_plan_destroy. */
+bool script_runtime_lazy_webpack_plan(
+    ScriptRuntime *runtime, Budget *budget, const char *request_url,
+    const char *source, size_t source_length,
+    struct ScriptLazyWebpackPlan *plan);
+/* The planning decision both script loaders make (parser-inserted and
+   dynamic scripts): plans, as script_runtime_lazy_webpack_plan, only a
+   classic script of at least SCRIPT_LAZY_WEBPACK_MINIMUM_BYTES, and keeps
+   the plan only when its factories are at least half the source (below
+   that the planning and registry overhead does not pay). The lab switch
+   TILEFINCH_DISABLE_LAZY_WEBPACK turns the path off. */
+#define SCRIPT_LAZY_WEBPACK_MINIMUM_BYTES (128u * 1024u)
+bool script_runtime_lazy_webpack_plan_eligible(
+    ScriptRuntime *runtime, Budget *budget, const char *request_url,
+    const char *source, size_t source_length, bool module,
+    struct ScriptLazyWebpackPlan *plan);
+/* Where an evaluated bundle's record may be stored: the HTTP cache key, the
+   response body holding exactly the evaluated bytes (retained while the
+   record waits for its digest) and whether the response was no-store
+   (never recorded). */
+typedef struct {
+    const char *request_url;
+    BrowserSharedBody *body;
+    bool no_store;
+} ScriptLazyBundleRecordTarget;
+/* script_runtime_evaluate_external_lazy_webpack, which also queues a bundle
+   record of a planner-made plan once its registration has compiled
+   (`record` NULL: never). */
+ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *source_url,
+    const struct ScriptLazyWebpackPlan *plan,
+    const ScriptLazyBundleRecordTarget *record,
+    void *source_lease, ScriptSourceLeaseReleaseCallback release_source,
+    ScriptResult *result);
 bool script_runtime_consume_relayout(ScriptRuntime *runtime);
+/* True once after author script connected a <meta http-equiv=refresh>
+   (or changed one's http-equiv/content), or inserted a subtree too large
+   to inspect: the document's declarative refresh must be looked for again. */
+bool script_runtime_take_refresh_meta_mutation(ScriptRuntime *runtime);
 /* Read-only admission check for rollback-safe optional layout work. */
 bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime);
 /* Resource-completion callbacks can enqueue another resource pass after
@@ -1738,6 +2093,9 @@ void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
                                  int device_height);
 void script_runtime_set_images(ScriptRuntime *runtime,
                                ImageResources *images);
+/* Whether this realm has attached any shadow root (so shadow composition
+   can change what renders; see document_shadow_light_child_rendered). */
+bool script_runtime_has_shadow_roots(const ScriptRuntime *runtime);
 void script_runtime_set_stylesheet(ScriptRuntime *runtime,
                                    const Stylesheet *stylesheet);
 void script_runtime_set_synchronous_layout_callback(

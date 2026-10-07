@@ -1,0 +1,1 @@
+<!doctype html><title>Assign</title><p>Assigning.</p><script>setTimeout(function(){location.assign('/target')},0)</script>

@@ -7,14 +7,14 @@ static int test_engine_lifecycle(void)
           && profile.framebuffer_width == 480
           && profile.framebuffer_height == 272
           && profile.recommended_memory_limit
-                 == BROWSER_PSP_REALISTIC_CONTENT_LIMIT
+                 == BROWSER_PSP_RECOMMENDED_CONTENT_LIMIT
           && profile.minimum_non_page_reserve
                  == BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE
           && profile.maximum_tile_capacity == 24);
 
     BrowserConfig config;
     browser_config_init(&config, &profile);
-    CHECK(config.memory_limit == BROWSER_PSP_REALISTIC_CONTENT_LIMIT
+    CHECK(config.memory_limit == BROWSER_PSP_RECOMMENDED_CONTENT_LIMIT
           && config.non_page_memory_reserve
                  == BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE
           && config.history_capacity == 16
@@ -25,6 +25,7 @@ static int test_engine_lifecycle(void)
           && config.idle_work_maximum_units == 8
           && config.javascript.heap_limit == 4u * MIB
           && config.javascript.maximum_total_bytes == 4u * MIB
+          && config.javascript.maximum_file_bytes == 512u * 1024u
           && browser_config_apply_psp_memory_profile(
                  &config, BROWSER_PSP_MEMORY_STRICT)
           && config.memory_limit == BROWSER_PSP_STRICT_CONTENT_LIMIT
@@ -37,11 +38,21 @@ static int test_engine_lifecycle(void)
           && config.javascript.maximum_total_bytes == 1u * MIB
           && config.javascript.maximum_file_bytes == 256u * 1024u);
     browser_config_init(&config, &profile);
+    config.javascript.maximum_file_bytes = 1u * MIB;
+    /* Realistic is the PSP app's own configuration. */
     CHECK(browser_config_apply_psp_memory_profile(
               &config, BROWSER_PSP_MEMORY_REALISTIC)
-          && config.javascript.heap_limit == 5u * MIB
-          && config.javascript.maximum_total_bytes == 2u * MIB
-          && config.javascript.maximum_file_bytes == 384u * 1024u);
+          && config.memory_limit
+                 == (size_t) BROWSER_PSP_APP_MEMORY_LIMIT_MB * MIB
+          && config.history_capacity == BROWSER_PSP_APP_HISTORY_CAPACITY
+          && config.javascript.heap_limit
+                 == (size_t) BROWSER_PSP_APP_SCRIPT_HEAP_MB * MIB
+          && config.javascript.maximum_total_bytes
+                 == (size_t) BROWSER_PSP_APP_SCRIPT_TOTAL_MB * MIB
+          && config.javascript.maximum_file_bytes
+                 == (size_t) BROWSER_PSP_APP_SCRIPT_FILE_KB * 1024u
+          && config.javascript.execution_policy.maximum_host_compile_source_bytes
+                 == 4u * MIB);
     config.memory_limit = 16u * MIB;
     config.session_cache_limit = 512u * 1024u;
     config.maximum_document_bytes = 2u * MIB;
@@ -181,10 +192,15 @@ static int test_engine_lifecycle(void)
     CHECK(pointer_navigation->page.layout.link_count != 0);
     const LinkRegion *pointer_link =
         &pointer_navigation->page.layout.links[0];
+    /* Aim at the link's centre: device/CSS rounding must not land the
+       probe on the box edge (the text sits on the baseline it shares with
+       the taller inputs beside it). */
     int pointer_device_x = viewport_css_to_device(
-        &pointer_navigation->viewport, pointer_link->x + 1);
+        &pointer_navigation->viewport,
+        pointer_link->x + pointer_link->width / 2);
     int pointer_device_y = viewport_css_to_device(
-        &pointer_navigation->viewport, pointer_link->y + 1);
+        &pointer_navigation->viewport,
+        pointer_link->y + pointer_link->height / 2);
     size_t pointer_relayouts = pointer_navigation->incremental_relayouts;
     bool pointer_activate = true, pointer_page_changed = true;
     CHECK(browser_engine_pointer_event(
@@ -1691,6 +1707,12 @@ static bool transition_page_open(TransitionPage *page, const char *html,
     BrowserConfig config;
     browser_config_init(&config, &profile);
     config.javascript.enabled = true;
+    /* Transition events are checked against scheduler milliseconds. The
+       PSP profile's 16 ms advance target lets a turn start a further task
+       only while wall time remains, so on a loaded host an event task slid
+       to the next 10 ms advance (vn ended @30 instead of @20). The yield
+       target is not what these tests are about. */
+    config.javascript.execution_policy.maximum_advance_time_us = 0;
     char error[256] = {0};
     page->engine = browser_engine_create(&config, error, sizeof(error));
     if (page->engine == NULL || !browser_engine_commit_html(page->engine,
@@ -3466,6 +3488,83 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
     return 0;
 }
 
+/* Bold text loads only the bold face its family draws with: sans-serif uses
+   DejaVu Sans Bold and Arial/Helvetica use TilefinchSans Bold, so a page
+   that uses one of them must not stage the other (77 or 98 KB). */
+static int test_optional_bold_faces_follow_page_families(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    char sans[512], serif[512], italic[512], bold[512];
+    char serif_bold[512], metric[512], metric_bold[512];
+    snprintf(sans, sizeof(sans), "%s/fonts/DejaVuSans-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(serif, sizeof(serif), "%s/fonts/DejaVuSerif-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(italic, sizeof(italic),
+             "%s/fonts/DejaVuSans-Oblique-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(bold, sizeof(bold), "%s/fonts/DejaVuSans-Bold-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(serif_bold, sizeof(serif_bold),
+             "%s/fonts/DejaVuSerif-Bold-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(metric, sizeof(metric), "%s/fonts/TilefinchSans-Regular.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(metric_bold, sizeof(metric_bold),
+             "%s/fonts/TilefinchSans-Bold.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    CHECK(browser_config_set_font_paths(
+              &config, sans, serif, italic, bold, serif_bold,
+              metric, metric_bold, 1536u * 1024u));
+    browser_config_set_staged_font_loading(&config, true);
+
+    static const char *const pages[] = {
+        "<!doctype html><body><p style='font:bold 16px sans-serif'>"
+        "Generic sans bold</p><p style='font:16px Arial'>Arial regular</p>",
+        "<!doctype html><body><p style='font:700 16px Arial, sans-serif'>"
+        "Arial bold</p><p style='font:16px sans-serif'>Generic regular</p>",
+    };
+    for (size_t page = 0; page < 2; page++) {
+        char error[256] = {0};
+        BrowserEngine *engine = browser_engine_create(
+            &config, error, sizeof(error));
+        CHECK(engine != NULL);
+        for (size_t i = 0;
+             i < 4 && !browser_engine_baseline_fonts_ready(engine); i++)
+            CHECK(browser_engine_pump_baseline_fonts(engine));
+        CHECK(browser_engine_baseline_fonts_ready(engine)
+              && browser_engine_commit_html(
+                  engine, "https://font.test/", pages[page],
+                  strlen(pages[page]), true));
+        for (size_t i = 0; i < 64; i++) {
+            bool changed = false;
+            (void) browser_engine_run_idle_work(engine, &changed);
+            if (changed) CHECK(browser_engine_render_frame(engine, NULL));
+        }
+        const FontSet *fonts = browser_engine_fonts(engine);
+        bool generic = page == 0;
+        if (fonts->sans_bold.loaded != generic
+            || fonts->metric_sans_bold.loaded == generic)
+            fprintf(stderr, "bold faces for page %zu: sans=%d metric=%d\n",
+                    page, fonts->sans_bold.loaded,
+                    fonts->metric_sans_bold.loaded);
+        CHECK(fonts->sans_bold.loaded == generic
+              && fonts->metric_sans_bold.loaded == !generic
+              && !fonts->serif_bold.loaded
+              && browser_engine_render_frame(engine, NULL)
+              && browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
 static int test_deferred_image_relayout_requests_repaint(void)
 {
     BrowserDeviceProfile profile;
@@ -3632,7 +3731,7 @@ static bool actionable_has_attribute(lxb_dom_node_t *node,
     return document_attribute(node, name, &ignored) != NULL;
 }
 
-static int test_same_document_and_script_free_defaults(void)
+static int test_same_document_and_script_free_defaults_on_clock(void)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -4365,6 +4464,23 @@ static int test_same_document_and_script_free_defaults(void)
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;
+}
+
+/* The deliberately endless handlers above end at the 200 ms script
+   watchdog, which reads the platform monotonic clock. With the real clock a
+   host stall of 200 ms during the page's setup script also ended that
+   script ("fragment setup failed: InternalError: interrupted"; reproduced
+   by stopping the process for 400 ms at a time, 25 of 30 runs). On the
+   CPU-paced clock (tilefinch_test_clocks.h) the watchdog counts only this
+   process's CPU time: each endless handler still runs for 200 ms of it,
+   and a stall no longer counts against the setup script. */
+static int test_same_document_and_script_free_defaults(void)
+{
+    TestCpuPacedClock clock;
+    test_cpu_paced_clock_install(&clock);
+    int failed = test_same_document_and_script_free_defaults_on_clock();
+    tilefinch_platform_set_services(NULL);
+    return failed;
 }
 
 /* Same-document events run synchronously inside the URL/history bridge.  The

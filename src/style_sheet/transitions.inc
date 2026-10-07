@@ -384,6 +384,9 @@ bool style_transition_computed(
             if (rule->pseudo != (uint8_t) pseudo
                 || !style_container_query_matches(
                        sheet, rule->container_query, node)
+                || !style_adopted_rule_in_scope(
+                       sheet, rule->order >> 8, rule->selector,
+                       rule->selector_length, node, NULL)
                 || !style_selector_matches_profiled(
                        sheet, node, rule->selector, rule->selector_length))
                 continue;
@@ -445,7 +448,7 @@ bool style_transition_computed(
             continue;
         const char *value = rule->value;
         size_t value_length = rule->value_length;
-        char resolved[256];
+        char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (transition_value_has_var(value, value_length)) {
             StyleResolveScratch *scratch = sheet->resolve_scratch;
             if (scratch == NULL) continue;

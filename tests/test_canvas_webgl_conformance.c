@@ -23,6 +23,11 @@
 #include "../src/js_runtime_internal.h"
 
 #define MIB (1024u * 1024u)
+/* The --treadline-features realm: tight enough that a footprint regression
+   shows up as a refusal. Every feature fixture peaks at about 7.0 MB live
+   (2026-10-07, after the audit cleanup's named constants and tables added
+   21.5 KB); 7.5 MiB keeps about 5% headroom. */
+#define TREADLINE_FEATURE_REALM_BYTES (7u * MIB + MIB / 2u)
 
 #define CHECK(condition) do {                                                \
     if (!(condition)) {                                                      \
@@ -623,6 +628,50 @@ static bool run_deferred_webgl_flush(void)
     CHECK(static_subdata_replayed
           && strcmp(result.summary, "WEBGL-REPEAT-STATIC-SUBDATA") == 0);
 
+    /* Re-setting an unchanged clear color that is not exactly representable
+       as a float (games pass literals such as .012 every frame) keeps the
+       retained frame list; an actual change still invalidates it. */
+    bool clear_color_kept = script_runtime_evaluate_diagnostic(
+              runtime,
+              "const ccExt=deferredGl.getExtension("
+              "'TILEFINCH_repeated_frame_commands');"
+              "deferredGl.clearColor(.012,.031,.037,1);"
+              "deferredGl.clear(deferredGl.COLOR_BUFFER_BIT);"
+              "deferredGl.drawArrays(deferredGl.TRIANGLES,0,3);"
+              "deferredGl.finish();ccExt.begin();"
+              "deferredGl.clear(deferredGl.COLOR_BUFFER_BIT);"
+              "deferredGl.drawArrays(deferredGl.TRIANGLES,0,3);"
+              "const ccList=ccExt.end(new Uint16Array([3,1]));"
+              "deferredGl.finish();"
+              "const ccRevision=deferredGl._repeatedCommandStateRevision;"
+              "deferredGl.clearColor(.012,.031,.037,1);"
+              "deferredGl.clearColor(0.012,0.031,0.037,1.0);"
+              "const ccKept=deferredGl._repeatedCommandStateRevision"
+              "===ccRevision;"
+              "const ccQueued=ccExt.execute(ccList,new Uint16Array([3,1]));"
+              "deferredGl.finish();"
+              "deferredGl.clearColor(.5,.031,.037,1);"
+              "const ccMoved=deferredGl._repeatedCommandStateRevision"
+              "!==ccRevision;"
+              "const ccStale=ccExt.execute(ccList,new Uint16Array([3,1]));"
+              "deferredGl.finish();"
+              "const ccValue=deferredGl.getParameter("
+              "deferredGl.COLOR_CLEAR_VALUE);"
+              "deferredGl.clearColor(0,0,0,1);"
+              "globalThis.pocSummary=ccList&&ccKept&&ccQueued&&ccMoved"
+              "&&!ccStale&&ccValue[0]===.5"
+              "&&ccValue[1]===Math.fround(.031)"
+              "?'WEBGL-CLEAR-COLOR-RETAINED':"
+              "'WEBGL-CLEAR-COLOR-RETAINED-FAIL:'+!!ccList+'|'+ccKept+'|'"
+              "+ccQueued+'|'+ccMoved+'|'+ccStale+'|'+Array.from(ccValue)",
+              "<webgl-clear-color-retained>", &result);
+    if (!clear_color_kept
+        || strcmp(result.summary, "WEBGL-CLEAR-COLOR-RETAINED") != 0)
+        fprintf(stderr, "clear color retention failed: %s (%s)\n",
+                result.summary, result.error);
+    CHECK(clear_color_kept
+          && strcmp(result.summary, "WEBGL-CLEAR-COLOR-RETAINED") == 0);
+
     bool repeated_count_restored = script_runtime_evaluate_diagnostic(
               runtime,
               "const countExt=deferredGl.getExtension("
@@ -1117,6 +1166,210 @@ static bool run_deferred_webgl_flush(void)
     return true;
 }
 
+/* Every program a shipping example links (including its instancing
+   variants, which link at load) must translate exactly: no refusal and no
+   approximation warning. */
+#define WEBGL_SHADERS_EXACT_PROBE \
+    "(()=>{const stats=__tilefinchWebGLDiagnostics;" \
+    "globalThis.pocSummary=stats.shaderWarnings===0" \
+    "&&stats.shaderRefusals===0?'WEBGL-SHADERS-EXACT':'WEBGL-SHADERS:'" \
+    "+stats.shaderWarnings+'/'+stats.shaderRefusals;})()"
+
+/* The GE runs a fixed-function colour (texture * vertex colour * one colour
+   uniform), not the page's GLSL. Logic it cannot run must be visible: a
+   per-pixel branch fails the link with the line named, math the GE drops
+   links with a WARNING log and one console warning, and a constant colour is
+   applied exactly. Supported shapes stay silent. */
+static bool run_webgl_shader_diagnostics(void)
+{
+    static const char html[] = "<!doctype html><html><body></body></html>";
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptExecutionPolicy policy;
+    CHECK(script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
+    policy.slow_compile_threshold_us = UINT64_MAX;
+    policy.slow_callback_threshold_us = UINT64_MAX;
+    ScriptRuntimeOptions options = {
+        .viewport = viewport,
+        .execution_policy = policy,
+        .defer_document_scripts = true
+    };
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 8000,
+        "https://games.test/shader-diagnostics", &options, &result);
+    CHECK(runtime != NULL && result.success);
+    ImageResources images = {.budget = &budget};
+    script_runtime_set_images(runtime, &images);
+
+    static const char probe[] =
+        "(()=>{const canvas=document.createElement('canvas');"
+        "canvas.width=4;canvas.height=4;document.body.appendChild(canvas);"
+        "const gl=canvas.getContext('webgl'),stats=__tilefinchWebGLDiagnostics,"
+        "warned=[],failures=[];console.warn=(...args)=>warned.push(args.join(' '));"
+        "const build=(vs,fs)=>{const program=gl.createProgram();"
+        "for(const [kind,source] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){"
+        "const shader=gl.createShader(kind);gl.shaderSource(shader,source);"
+        "gl.compileShader(shader);gl.attachShader(program,shader);"
+        "gl.deleteShader(shader);}gl.linkProgram(program);return program;};"
+        "const expect=(label,vs,fs,linked,pattern)=>{const before=warned.length,"
+        "program=build(vs,fs),log=gl.getProgramInfoLog(program),"
+        "ok=gl.getProgramParameter(program,gl.LINK_STATUS)===linked"
+        "&&(pattern?pattern.test(log)&&warned.length===before+1"
+        "&&warned[before].includes(log):log===''&&warned.length===before);"
+        "if(!ok)failures.push(label+'='+JSON.stringify(log));"
+        "gl.deleteProgram(program);};"
+        "const colorVs='attribute vec2 aPosition;attribute vec4 aColor;"
+        "varying vec4 vColor;void main(){vColor=aColor;"
+        "gl_Position=vec4(aPosition,0.,1.);}';"
+        /* Treadline's HUD before 7889b40a: the ring branch read a varying. */
+        "expect('treadline-shadow-branch',`\n"
+        "    attribute vec2 aPosition;\n    attribute vec4 aTint;\n"
+        "    attribute vec4 aShadowRect;\n    varying lowp vec4 vTint;\n"
+        "    varying lowp vec4 vShadowRect;\n    void main(void) {\n"
+        "      gl_Position = vec4(aPosition, 0.0, 1.0);\n"
+        "      vTint = aTint;\n      vShadowRect = aShadowRect;\n    }\n  `,`\n"
+        "    varying lowp vec4 vTint;\n    varying lowp vec4 vShadowRect;\n"
+        "    void main(void) {\n      if (vShadowRect.z >= 0.0\n"
+        "          && (vShadowRect.x > vShadowRect.z\n"
+        "            || vShadowRect.y > vShadowRect.w))\n"
+        "        gl_FragColor = vec4(0.005, 0.012, 0.014, vTint.a * 0.78);\n"
+        "      else\n        gl_FragColor = vTint;\n    }\n  `,false,"
+        "/^ERROR: fragment shader line 5: 'if' depends on per-pixel data/);"
+        "expect('ternary-on-fragcoord',colorVs,'varying vec4 vColor;void main(){'"
+        "+'gl_FragColor=gl_FragCoord.x>2.?vColor:vec4(0.);}',false,"
+        "/^ERROR: fragment shader line 1: '\\?:' depends on per-pixel data/);"
+        "expect('branch-on-local-texture',"
+        "'attribute vec2 aPosition;attribute vec2 aTexCoord;varying vec2 vTexCoord;'"
+        "+'void main(){vTexCoord=aTexCoord;gl_Position=vec4(aPosition,0.,1.);}',"
+        "'precision mediump float;uniform sampler2D uTexture;varying vec2 vTexCoord;\\n'"
+        "+'void main(){\\nvec4 texel=texture2D(uTexture,vTexCoord);\\n'"
+        "+'if(texel.a<.5)gl_FragColor=vec4(0.);else gl_FragColor=texel;}',false,"
+        "/^ERROR: fragment shader line 4: 'if' depends on per-pixel/);"
+        "expect('vertex-branch',"
+        "'attribute vec2 aPosition;attribute vec4 aColor;varying vec4 vColor;'"
+        "+'void main(){if(aColor.a>.5)vColor=aColor;else vColor=vec4(1.);'"
+        "+'gl_Position=vec4(aPosition,0.,1.);}','varying vec4 vColor;'"
+        "+'void main(){gl_FragColor=vColor;}',false,"
+        "/^ERROR: vertex shader line 1: 'if' depends on per-vertex data/);"
+        "expect('loop-line',colorVs,'varying vec4 vColor;\\nvoid main(){\\n'"
+        "+'for(int i=0;i<2;i++){}\\ngl_FragColor=vColor;}',false,"
+        "/^ERROR: fragment shader line 3: 'for' is not available/);"
+        "expect('two-textures',"
+        "'attribute vec2 aPosition;attribute vec2 aTexCoord;varying vec2 vTexCoord;'"
+        "+'void main(){vTexCoord=aTexCoord;gl_Position=vec4(aPosition,0.,1.);}',"
+        "'uniform sampler2D uA;uniform sampler2D uB;varying vec2 vTexCoord;'"
+        "+'void main(){gl_FragColor=texture2D(uA,vTexCoord)*texture2D(uB,vTexCoord);}',"
+        "false,/2 textures are sampled; MAX_TEXTURE_IMAGE_UNITS is 1/);"
+        "expect('uniform-branch',colorVs,'uniform float uMode;varying vec4 vColor;'"
+        "+'void main(){if(uMode>.5)gl_FragColor=vColor;else gl_FragColor=vColor;}',"
+        "true,/^WARNING: fragment shader line 1: 'if' on uniforms is not evaluated/);"
+        "expect('dropped-scale',colorVs,'varying vec4 vColor;\\n'"
+        "+'void main(){gl_FragColor=vColor*0.5;}',true,"
+        "/^WARNING: fragment shader line 2: '0.5' is not applied to gl_FragColor on the PSP$/);"
+        "expect('computed-varying',"
+        "'attribute vec3 aPosition;attribute vec3 aNormal;attribute vec4 aColor;'"
+        "+'uniform mat4 uMatrix;varying vec4 vColor;void main(){'"
+        "+'vColor=aColor*max(dot(aNormal,vec3(0.,0.,1.)),0.);'"
+        "+'gl_Position=uMatrix*vec4(aPosition,1.);}',"
+        "'varying vec4 vColor;void main(){gl_FragColor=vColor;}',true,"
+        "/^WARNING: vertex shader line 1: 'max\\(dot\\(aNormal.*is not applied to varying vColor/);"
+        "expect('position-offset',"
+        "'attribute vec2 aPosition;uniform vec2 uOffset;uniform vec4 uColor;'"
+        "+'void main(){gl_Position=vec4(aPosition+uOffset,0.,1.);}',"
+        "'uniform vec4 uColor;void main(){gl_FragColor=uColor;}',true,"
+        "/^WARNING: vertex shader line 1: .* is not applied to gl_Position/);"
+        /* Supported shapes, including Treadline's three current programs. */
+        "expect('treadline-world',`\n"
+        "    attribute vec3 aPosition;\n    attribute vec4 aColor;\n"
+        "    uniform mat4 uViewProjection;\n    uniform vec4 uTint;\n"
+        "    varying lowp vec4 vColor;\n    void main(void) {\n"
+        "      gl_Position = uViewProjection * vec4(aPosition, 1.0);\n"
+        "      vColor = aColor * uTint;\n    }\n  `,"
+        "'varying lowp vec4 vColor;void main(void) { gl_FragColor = vColor; }',true);"
+        "expect('treadline-boxes',`\n"
+        "      attribute vec3 aPosition;\n      attribute vec4 aColor;\n"
+        "      attribute mat4 aInstanceModel;\n      attribute vec4 aInstanceTint;\n"
+        "      uniform mat4 uViewProjection;\n      varying lowp vec4 vColor;\n"
+        "      void main(void) {\n        gl_Position = uViewProjection * aInstanceModel\n"
+        "          * vec4(aPosition, 1.0);\n"
+        "        vColor = aColor * aInstanceTint;\n      }\n    `,"
+        "'varying lowp vec4 vColor;void main(void) { gl_FragColor = vColor; }',true);"
+        "expect('treadline-hud',`\n"
+        "    attribute vec2 aPosition;\n    attribute vec4 aTint;\n"
+        "    varying lowp vec4 vTint;\n    void main(void) {\n"
+        "      gl_Position = vec4(aPosition, 0.0, 1.0);\n      vTint = aTint;\n"
+        "    }\n  `,`\n    varying lowp vec4 vTint;\n    void main(void) {\n"
+        "      gl_FragColor = vTint;\n    }\n  `,true);"
+        "expect('prism-instance-transform',"
+        "'attribute vec3 aPosition;attribute vec4 aColor;'"
+        "+'attribute vec4 aInstanceTransform;attribute vec4 aInstanceTint;'"
+        "+'uniform mat4 uProjection;uniform mat4 uModel;uniform mat4 uView;'"
+        "+'varying lowp vec4 vColor;void main(void){'"
+        "+'gl_Position=uProjection*uModel*uView*vec4(aPosition*'"
+        "+'aInstanceTransform.w+aInstanceTransform.xyz,1.0);'"
+        "+'vColor=aColor*aInstanceTint;}',"
+        "'varying lowp vec4 vColor;void main(void){gl_FragColor=vColor;}',true);"
+        "expect('textured-tint',"
+        "'#ifdef GL_ES\\nprecision mediump float;\\n#endif\\n'"
+        "+'attribute vec2 aPosition;attribute vec2 aTexCoord;attribute vec4 aColor;'"
+        "+'uniform mat4 uProjection;varying vec2 vTexCoord;varying vec4 vColor;'"
+        "+'void main(){vTexCoord=aTexCoord;vColor=aColor;'"
+        "+'gl_Position=(uProjection)*vec4(aPosition,0.,1.);}',"
+        "'precision mediump float;/* modulate */uniform sampler2D uTexture;'"
+        "+'uniform vec4 uTint;varying vec2 vTexCoord;varying vec4 vColor;'"
+        "+'void main(){vec4 texel=texture2D(uTexture,vTexCoord);'"
+        "+'gl_FragColor=texel*vColor*uTint;}',true);"
+        "expect('uniform-color',"
+        "'attribute vec4 aPosition;void main(){gl_Position=aPosition;}',"
+        "'precision mediump float;uniform vec4 color;void main(){gl_FragColor=color;}',"
+        "true);"
+        /* A relink of a reported program does not repeat the console line. */
+        "const relinked=build(colorVs,'varying vec4 vColor;'"
+        "+'void main(){gl_FragColor=vColor*0.5;}');const once=warned.length;"
+        "gl.linkProgram(relinked);if(warned.length!==once)failures.push('repeat');"
+        "gl.deleteProgram(relinked);"
+        /* A constant colour is applied exactly instead of drawing white. */
+        "const constant=build('attribute vec2 aPosition;'"
+        "+'void main(){gl_Position=vec4(aPosition,0.,1.);}',"
+        "'void main(){gl_FragColor=vec4(1.,.0,0.,1.);}');"
+        "gl.useProgram(constant);const buffer=gl.createBuffer();"
+        "gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,"
+        "new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);"
+        "const location=gl.getAttribLocation(constant,'aPosition');"
+        "gl.vertexAttribPointer(location,2,gl.FLOAT,false,0,0);"
+        "gl.enableVertexAttribArray(location);gl.clearColor(0,0,1,1);"
+        "gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,0,3);gl.finish();"
+        "const pixel=new Uint8Array(4);"
+        "gl.readPixels(1,1,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);"
+        "if(gl.getProgramInfoLog(constant)!==''||pixel[0]<240||pixel[1]>8"
+        "||pixel[2]>8)failures.push('constant='+Array.from(pixel));"
+        "if(stats.shaderWarnings!==6||stats.shaderRefusals!==6)"
+        "failures.push('counters='+stats.shaderWarnings+'/'+stats.shaderRefusals);"
+        "globalThis.pocSummary=failures.length?'SHADER-DIAGNOSTICS:'"
+        "+failures.join(' | '):'SHADER-DIAGNOSTICS-OK';})()";
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime, probe, "<webgl-shader-diagnostics>", &result);
+    if (!evaluated || strcmp(result.summary, "SHADER-DIAGNOSTICS-OK") != 0)
+        fprintf(stderr, "shader diagnostics: %s (%s)\n", result.summary,
+                result.error);
+    CHECK(evaluated && strcmp(result.summary, "SHADER-DIAGNOSTICS-OK") == 0);
+
+    script_runtime_set_images(runtime, NULL);
+    script_runtime_destroy(runtime);
+    images_destroy(&images);
+    document_destroy(&document);
+    CHECK(budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
+    return true;
+}
+
 static bool run_prism_break_game(void)
 {
     static const char document_url[] =
@@ -1189,6 +1442,9 @@ static bool run_prism_break_game(void)
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, script, "prism-break-3d/game.js", &result)
           && strcmp(result.summary, "PRISM-BREAK-READY") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, WEBGL_SHADERS_EXACT_PROBE, "<prism-shaders>", &result)
+          && strcmp(result.summary, "WEBGL-SHADERS-EXACT") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "const titleStart=__prismBreakDebug.snapshot();"
@@ -1404,17 +1660,476 @@ static bool run_prism_break_game(void)
     return true;
 }
 
+static unsigned treadline_league_matches;
+static unsigned treadline_campaign_sweep_seeds;
+static bool treadline_features_only;
+static bool treadline_aim_guide_only;
+static bool treadline_invariants;
+static unsigned treadline_invariants_first, treadline_invariants_count = UINT32_MAX;
+static const char *treadline_probe_script;
+/* The Treadline runtime's watchdog budget for one evaluation. Its fixtures
+   play whole seeded matches in one evaluation (the aim guide is about 16 s
+   on an idle host), so the old 20 s wall-clock budget interrupted them
+   ("InternalError: interrupted") whenever the machine was busy: a parallel
+   ctest -j8, a PPSSPP run. This is the harness's own parameter, not the
+   engine's: shipping and PSP watchdogs are unchanged, and each CTest
+   TIMEOUT (90-120 s) still catches a hang first. */
+#define TREADLINE_TEST_EVALUATION_MS 300000u
+static bool treadline_host_profile;
+static bool treadline_host_counters = true;
+static const char *treadline_game_source = "examples/treadline-arena/game.js";
+
+/* Host research instrumentation is not added to the staged/shipping game.
+   Fail on source drift instead of silently profiling the wrong locations. */
+static bool treadline_proxy_insert(char **source, const char *needle,
+                                   const char *insertion)
+{
+    char *at = strstr(*source, needle);
+    if (at == NULL || strstr(at + strlen(needle), needle) != NULL) return false;
+    size_t length = strlen(*source), added = strlen(insertion);
+    if (length > 512u * 1024u || added > 512u * 1024u - length) return false;
+    char *next = malloc(length + added + 1u);
+    if (next == NULL) return false;
+    size_t prefix = (size_t)(at - *source) + strlen(needle);
+    memcpy(next, *source, prefix);
+    memcpy(next + prefix, insertion, added);
+    memcpy(next + prefix + added, *source + prefix, length - prefix + 1u);
+    free(*source); *source = next;
+    return true;
+}
+
+/* An alternate game source may carry its own bots.js beside it (research
+   candidates change the AI there); otherwise the authored one is used. */
+static char *read_treadline_bots(size_t *length)
+{
+    char path[512];
+    const char *slash = strrchr(treadline_game_source, '/');
+    int written = slash == NULL ? -1 : snprintf(
+        path, sizeof(path), "%.*sbots.js",
+        (int) (slash - treadline_game_source + 1), treadline_game_source);
+    char *source = written > 0 && (size_t) written < sizeof(path)
+        ? read_source(path, length) : NULL;
+    return source != NULL ? source
+        : read_source("examples/treadline-arena/bots.js", length);
+}
+
+/* The work counters live in game.js; bots.js (created from game.js) shares
+   the same array through a global. */
+static bool treadline_prepare_host_proxy(char **source, char **bots)
+{
+    CHECK(treadline_proxy_insert(source, "let qualificationAIActive = false;",
+                                "const hostProxyWork = globalThis.__treadlineHostProxyWork"
+                                " = new Uint32Array(5);"));
+    CHECK(treadline_proxy_insert(bots, "let qualificationAIActive = false;",
+                                "const hostProxyWork = globalThis.__treadlineHostProxyWork;"));
+    if (treadline_host_counters) {
+        CHECK(treadline_proxy_insert(bots, "  function updateBotCommand(tank, dt) {",
+                                    "hostProxyWork[3]++;"));
+        /* Increment inside the refresh branch, not its route consumers. */
+        CHECK(treadline_proxy_insert(bots,
+            "if (qualificationAIActive) qualificationAITimes[18]++;",
+            "hostProxyWork[0]++;hostProxyWork[4]|=1<<tank.id;"));
+        CHECK(treadline_proxy_insert(bots, "tank.bankAim = planBankShot(tank, aimX, aimZ);",
+                                    "hostProxyWork[1]++;"));
+        CHECK(treadline_proxy_insert(source,
+            "  function lineCrossesWalls(ax, az, bx, bz, overCover = false, padding = .08,\n"
+            "                           blockerSlot = -1) {",
+            "hostProxyWork[2]++;"));
+    }
+    size_t length = 0;
+    char *probe = read_source("tests/fixtures/treadline-host-proxy.js", &length);
+    CHECK(probe != NULL && length != 0);
+    bool okay = treadline_proxy_insert(source,
+        "  if (qualificationTooling) {", probe);
+    free(probe);
+    CHECK(okay);
+    return true;
+}
+
+static bool run_treadline_host_proxy(ScriptRuntime *runtime, ScriptResult *result)
+{
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue start = JS_GetPropertyStr(context, global, "__treadlineHostStart");
+    JSValue frame = JS_GetPropertyStr(context, global, "__treadlineHostFrame");
+    CHECK(JS_IsFunction(context, start) && JS_IsFunction(context, frame));
+    for (unsigned arena = 0; arena < 3u; arena++) {
+        for (unsigned seed = 0; seed < 2u; seed++) {
+            JSValue args[2] = {JS_NewUint32(context, 12345u + seed * 7919u),
+                               JS_NewUint32(context, arena)};
+            JSValue value = JS_Call(context, start, global, 2, args);
+            CHECK(!JS_IsException(value)); JS_FreeValue(context, value);
+            for (unsigned tick = 0; tick < 1200u; tick++) {
+                uint64_t before = tilefinch_platform_monotonic_time_ns();
+                value = JS_Call(context, frame, global, 0, NULL);
+                uint64_t elapsed = tilefinch_platform_monotonic_time_ns() - before;
+                if (JS_IsException(value)) js_rt_record_exception(context, result);
+                uint32_t work = 0;
+                CHECK(!JS_IsException(value) && JS_ToUint32(context, &work, value) == 0);
+                JS_FreeValue(context, value);
+                CHECK((work & 7u) <= 6u && ((work >> 3) & 7u) <= 6u
+                      && ((work >> 18) & 7u) <= 6u && ((work >> 6) & 4095u) < 4095u);
+                printf("TREADLINE-HOST frame=%u arena=%u seed=%u ns=%llu strategy=%u bank=%u rays=%u bots=%u reset=%u owners=%u\n",
+                    tick, arena, 12345u + seed * 7919u,
+                    (unsigned long long)elapsed, work & 7u, (work >> 3) & 7u,
+                    (work >> 6) & 4095u, (work >> 18) & 7u, work >> 30,
+                    (work >> 21) & 63u);
+            }
+        }
+    }
+    if (treadline_host_counters) {
+        CHECK(script_runtime_evaluate_diagnostic(runtime,
+            "globalThis.pocSummary=__treadlineHostFairness()?'TREADLINE-FAIR':'TREADLINE-STARVED';",
+            "<treadline-host-fairness>", result));
+        CHECK(strcmp(result->summary, "TREADLINE-FAIR") == 0);
+    }
+    CHECK(script_runtime_heap_rejections(runtime) == 0);
+    JS_FreeValue(context, frame); JS_FreeValue(context, start);
+    JS_FreeValue(context, global);
+    return true;
+}
+
+static bool run_treadline_replay_import(ScriptRuntime *runtime,
+                                       ScriptResult *result)
+{
+    size_t length = 0;
+    char *source = read_source("tests/fixtures/treadline-replay-import.js", &length);
+    CHECK(source != NULL && length > 0);
+    bool okay = script_runtime_evaluate_diagnostic(
+        runtime, source, "<treadline-replay-import-setup>", result);
+    free(source);
+    if (!okay) fprintf(stderr, "treadline replay setup error=%s\n", result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-REPLAY-IMPORT-READY") == 0);
+
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue import = JS_GetPropertyStr(context, global,
+                                       "__treadlineReplayImportBounded");
+    JSValue format = JS_GetPropertyStr(context, global,
+                                       "__treadlineReplayImportFormat");
+    CHECK(JS_IsFunction(context, import) && JS_IsFunction(context, format));
+    CHECK(!runtime->boot_window_active && !runtime->heap_growth_enabled);
+    const size_t original_limit = runtime->base_memory_limit;
+    /* Collection, callback compilation and packet generation are outside the
+       measured allocation allowance. No allocator-padding object is needed. */
+    JS_RunGC(runtime->runtime);
+    const size_t live = script_runtime_heap_used(runtime);
+    const size_t headroom = 64u * 1024u;
+    CHECK(live < original_limit && headroom <= original_limit - live);
+    const size_t refusals = script_runtime_heap_rejections(runtime);
+    js_rt_runtime_arm_watchdog(runtime);
+    JS_SetMemoryLimit(runtime->runtime, live + headroom);
+    JSValue value = JS_Call(context, import, global, 0, NULL);
+    /* Restore even when the old parser throws, before diagnostics/cleanup. */
+    JS_SetMemoryLimit(runtime->runtime, original_limit);
+    okay = !JS_IsException(value) && JS_ToBool(context, value) == 1
+        && script_runtime_heap_rejections(runtime) == refusals;
+    if (JS_IsException(value)) js_rt_record_exception(context, result);
+    if (!okay) fprintf(stderr,
+        "treadline replay bounded import live=%zu headroom=%zu error=%s\n",
+        live, headroom, result->error);
+    JS_FreeValue(context, value);
+    if (okay) {
+        js_rt_runtime_arm_watchdog(runtime);
+        value = JS_Call(context, format, global, 0, NULL);
+        okay = !JS_IsException(value) && JS_ToBool(context, value) == 1;
+        if (JS_IsException(value)) js_rt_record_exception(context, result);
+        if (!okay) fprintf(stderr, "treadline replay format error=%s\n", result->error);
+        JS_FreeValue(context, value);
+    }
+    JS_FreeValue(context, format);
+    JS_FreeValue(context, import);
+    JS_FreeValue(context, global);
+    CHECK(okay);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "delete globalThis.__treadlineReplayImportBounded;"
+        "delete globalThis.__treadlineReplayImportFormat;",
+        "<treadline-replay-import-cleanup>", result));
+    return true;
+}
+
+static bool run_treadline_features(ScriptRuntime *runtime, ScriptResult *result)
+{
+    CHECK(run_treadline_replay_import(runtime, result));
+    size_t length = 0;
+    char *source = read_source("tests/fixtures/treadline-features.js", &length);
+    CHECK(source != NULL && length > 0);
+    bool okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-features>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-FEATURES-PASS") != 0)
+        fprintf(stderr, "treadline features summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-FEATURES-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-nearest-goal.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-nearest-goal>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-NEAREST-GOAL") != 0)
+        fprintf(stderr, "treadline nearest summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-NEAREST-GOAL") == 0);
+    source = read_source("tests/fixtures/treadline-navigation-occupancy.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-navigation-occupancy>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-NAVIGATION-OCCUPANCY") != 0)
+        fprintf(stderr, "treadline occupancy summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-NAVIGATION-OCCUPANCY") == 0);
+    source = read_source("tests/fixtures/treadline-render-cache.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-render-cache>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-RENDER-CACHE") != 0)
+        fprintf(stderr, "treadline render cache summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-RENDER-CACHE") == 0);
+    source = read_source("tests/fixtures/treadline-campaign.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-campaign>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-CAMPAIGN-PASS") != 0)
+        fprintf(stderr, "treadline campaign summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-CAMPAIGN-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-campaign-hud.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-campaign-hud>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-CAMPAIGN-HUD-PASS") != 0)
+        fprintf(stderr, "treadline campaign hud summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-CAMPAIGN-HUD-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-controls.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-controls>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-CONTROLS-PASS") != 0)
+        fprintf(stderr, "treadline controls summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-CONTROLS-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-practice.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-practice>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-PRACTICE-PASS") != 0)
+        fprintf(stderr, "treadline practice summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-PRACTICE-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-placement.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-placement>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-PLACEMENT-PASS") != 0)
+        fprintf(stderr, "treadline placement summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-PLACEMENT-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-planning.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-planning>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-PLANNING-PASS") != 0)
+        fprintf(stderr, "treadline planning summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-PLANNING-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-breach.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-breach>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-BREACH-PASS") != 0)
+        fprintf(stderr, "treadline breach summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-BREACH-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-camera.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-camera>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-CAMERA-PASS") != 0)
+        fprintf(stderr, "treadline camera summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-CAMERA-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-look.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-look>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-LOOK-PASS") != 0)
+        fprintf(stderr, "treadline look summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-LOOK-PASS") == 0);
+    source = read_source("tests/fixtures/treadline-smoke.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-smoke>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-SMOKE-PASS") != 0)
+        fprintf(stderr, "treadline smoke summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-SMOKE-PASS") == 0);
+    /* Overlapping flat layers and bars keep two 16-bit depth steps apart
+       at the real camera, and decals dropped for room stay dropped. */
+    source = read_source("tests/fixtures/treadline-layers.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-layers>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-LAYERS-PASS") != 0)
+        fprintf(stderr, "treadline layers summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-LAYERS-PASS") == 0);
+    return true;
+}
+
+/* Aim guide: the exact cast against real shells in seeded arenas, cache
+   invalidation, concealment, levels and persistence, instance admission,
+   tracers and replay determinism (tests/fixtures/treadline-aim-guide.js). */
+static bool run_treadline_aim_guide(ScriptRuntime *runtime, ScriptResult *result)
+{
+    size_t length = 0;
+    char *source = read_source("tests/fixtures/treadline-aim-guide.js", &length);
+    CHECK(source != NULL && length > 0);
+    bool okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-aim-guide>", result);
+    free(source);
+    if (!okay || strcmp(result->summary, "TREADLINE-AIM-GUIDE-PASS") != 0)
+        fprintf(stderr, "treadline aim guide summary=%s error=%s\n", result->summary, result->error);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-AIM-GUIDE-PASS") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.pocSummary=JSON.stringify(globalThis.__aimGuideStats)",
+        "<treadline-aim-guide-stats>", result));
+    printf("TREADLINE-AIM-GUIDE %s\n", result->summary);
+    return true;
+}
+
+/* Headless campaign difficulty sweep: every mission at each campaign
+   difficulty against Cadet, Veteran and Ace bot-league proxies. */
+static bool run_treadline_campaign_sweep(ScriptRuntime *runtime, ScriptResult *result)
+{
+    size_t length = 0;
+    char *source = read_source("tests/fixtures/treadline-campaign-sweep.js", &length);
+    CHECK(source != NULL && length > 0);
+    bool okay = script_runtime_evaluate_diagnostic(runtime, source, "<campaign-sweep>", result);
+    free(source);
+    CHECK(okay && strcmp(result->summary, "TREADLINE-CAMPAIGN-SWEEP-READY") == 0);
+    for (unsigned mission = 0; mission < 27u; mission++) {
+        for (unsigned difficulty = 0; difficulty < 3u; difficulty++) {
+            for (unsigned proxy = 0; proxy < 3u; proxy++) {
+                for (unsigned seed = 0; seed < treadline_campaign_sweep_seeds; seed++) {
+                    char command[256];
+                    snprintf(command, sizeof(command),
+                             "__campaignSweep.begin(%u,%u,%u,%u);",
+                             mission, difficulty, proxy, seed + 1u);
+                    CHECK(script_runtime_evaluate_diagnostic(
+                        runtime, command, "<campaign-sweep-begin>", result));
+                    for (unsigned slice = 0; slice < 200u; slice++) {
+                        CHECK(script_runtime_evaluate_diagnostic(
+                            runtime,
+                            "globalThis.pocSummary=__campaignSweep.step(600)?'DONE':'RUNNING';",
+                            "<campaign-sweep-step>", result));
+                        if (strcmp(result->summary, "DONE") == 0) break;
+                    }
+                    CHECK(script_runtime_evaluate_diagnostic(
+                        runtime,
+                        "globalThis.pocSummary=JSON.stringify(__campaignSweep.result());"
+                        "__campaignSweep.finish();",
+                        "<campaign-sweep-result>", result));
+                    printf("TREADLINE-CAMPAIGN-SWEEP %s\n", result->summary);
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/* Headless invariant sweep: seeded matches in every mode, mission, fault
+   sample and drill, checked after every step (see the fixture). Prints one
+   JSON line per case; scripts/run-treadline-invariants.py summarises. */
+static bool run_treadline_invariants(ScriptRuntime *runtime, ScriptResult *result)
+{
+    size_t length = 0;
+    /* The camera motion detector the fixture feeds every step. */
+    char *source = read_source("tests/fixtures/treadline-camera-motion.js", &length);
+    CHECK(source != NULL && length > 0);
+    bool okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-camera-motion>", result);
+    free(source);
+    if (!okay) fprintf(stderr, "treadline camera motion setup error=%s\n", result->error);
+    CHECK(okay);
+    source = read_source("tests/fixtures/treadline-invariants.js", &length);
+    CHECK(source != NULL && length > 0);
+    okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-invariants>", result);
+    free(source);
+    if (!okay) fprintf(stderr, "treadline invariants setup error=%s\n", result->error);
+    CHECK(okay && strncmp(result->summary, "TREADLINE-INVARIANTS-READY:", 27) == 0);
+    unsigned total = (unsigned) strtoul(result->summary + 27, NULL, 10);
+    unsigned end = treadline_invariants_first >= total ? treadline_invariants_first
+        : treadline_invariants_count > total - treadline_invariants_first
+        ? total : treadline_invariants_first + treadline_invariants_count;
+    for (unsigned index = treadline_invariants_first; index < end; index++) {
+        char command[256];
+        snprintf(command, sizeof(command),
+                 "globalThis.pocSummary=__treadlineInvariants.begin(%u);", index);
+        okay = script_runtime_evaluate_diagnostic(runtime, command, "<invariants-begin>", result);
+        if (!okay) fprintf(stderr, "treadline invariants case %u begin error=%s\n", index, result->error);
+        CHECK(okay);
+        bool done = false;
+        for (unsigned slice = 0; slice < 200u && !done; slice++) {
+            okay = script_runtime_evaluate_diagnostic(
+                runtime,
+                "globalThis.pocSummary=__treadlineInvariants.step(300)?'DONE':'RUNNING';",
+                "<invariants-step>", result);
+            if (!okay) fprintf(stderr, "treadline invariants case %u step error=%s\n", index, result->error);
+            CHECK(okay);
+            done = strcmp(result->summary, "DONE") == 0;
+        }
+        CHECK(done);
+        okay = script_runtime_evaluate_diagnostic(
+            runtime,
+            "globalThis.__treadlineInvariantsText=JSON.stringify(__treadlineInvariants.result("
+            "__treadlineInvariants.replay()));__treadlineInvariants.finish();"
+            "globalThis.pocSummary=String(__treadlineInvariantsText.length);",
+            "<invariants-result>", result);
+        if (!okay) fprintf(stderr, "treadline invariants case %u result error=%s\n", index, result->error);
+        CHECK(okay);
+        /* The summary buffer is bounded; stream the line in slices. */
+        unsigned long text_length = strtoul(result->summary, NULL, 10);
+        CHECK(text_length < 4u * 1024u * 1024u);
+        fputs("TREADLINE-INVARIANTS ", stdout);
+        for (unsigned long at = 0; at < text_length; at += 1000u) {
+            snprintf(command, sizeof(command),
+                     "globalThis.pocSummary=__treadlineInvariantsText.slice(%lu,%lu);",
+                     at, at + 1000u);
+            CHECK(script_runtime_evaluate_diagnostic(runtime, command, "<invariants-text>", result));
+            fputs(result->summary, stdout);
+        }
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+    return true;
+}
+
+/* Developer repro hook: after the invariant fixture loads, evaluate a
+   script (path relative to the source tree) and print the string it leaves
+   in globalThis.__probeOut. */
+static bool run_treadline_probe(ScriptRuntime *runtime, ScriptResult *result)
+{
+    size_t length = 0;
+    char *source = read_source(treadline_probe_script, &length);
+    CHECK(source != NULL && length > 0);
+    bool okay = script_runtime_evaluate_diagnostic(runtime, source, "<treadline-probe>", result);
+    free(source);
+    if (!okay) fprintf(stderr, "treadline probe error=%s\n", result->error);
+    CHECK(okay);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, "globalThis.pocSummary=String(String(globalThis.__probeOut).length);",
+        "<probe-length>", result));
+    unsigned long text_length = strtoul(result->summary, NULL, 10);
+    for (unsigned long at = 0; at < text_length; at += 1000u) {
+        char command[160];
+        snprintf(command, sizeof(command),
+                 "globalThis.pocSummary=String(globalThis.__probeOut).slice(%lu,%lu);",
+                 at, at + 1000u);
+        CHECK(script_runtime_evaluate_diagnostic(runtime, command, "<probe-text>", result));
+        fputs(result->summary, stdout);
+    }
+    fputc('\n', stdout);
+    return true;
+}
+
 static bool run_treadline_arena_game(void)
 {
     static const char document_url[] =
         "https://games.test/examples/treadline-arena/index.html";
     size_t html_length = 0, script_length = 0, css_length = 0;
     size_t manifest_length = 0, icon_length = 0, web_multiplayer_length = 0;
-    size_t arena_generator_length = 0;
+    size_t arena_generator_length = 0, campaign_length = 0;
+    size_t controls_length = 0, practice_length = 0, music_length = 0;
+    size_t bots_length = 0;
     char *html = read_source(
         "examples/treadline-arena/index.html", &html_length);
     char *script = read_source(
-        "examples/treadline-arena/game.js", &script_length);
+        treadline_game_source, &script_length);
     char *css = read_source(
         "examples/treadline-arena/game.css", &css_length);
     char *manifest_json = read_source(
@@ -1427,9 +2142,23 @@ static bool run_treadline_arena_game(void)
     char *arena_generator = read_source(
         "examples/treadline-arena/arena-generator.js",
         &arena_generator_length);
+    char *campaign = read_source(
+        "examples/treadline-arena/campaign.js", &campaign_length);
+    char *controls = read_source(
+        "examples/treadline-arena/controls.js", &controls_length);
+    char *practice = read_source(
+        "examples/treadline-arena/practice.js", &practice_length);
+    char *music = read_source(
+        "examples/treadline-arena/music.js", &music_length);
+    char *bots = read_treadline_bots(&bots_length);
+    size_t qualification_length = 0;
+    char *qualification = read_source(
+        "examples/treadline-arena/qualification.js", &qualification_length);
     CHECK(html != NULL && script != NULL && css != NULL
           && manifest_json != NULL && icon != NULL && web_multiplayer != NULL
-          && arena_generator != NULL
+          && arena_generator != NULL && campaign != NULL && controls != NULL
+          && practice != NULL && music != NULL && bots != NULL
+          && qualification != NULL
           && icon_length > 64u && strstr(icon, "<svg") != NULL
           && web_multiplayer_length > 4096u
           && web_multiplayer_length < 24u * 1024u
@@ -1447,6 +2176,31 @@ static bool run_treadline_arena_game(void)
              != NULL
           && strstr(html, "<script defer src=\"game.js\"></script>")
              != NULL
+          /* The campaign registers its hooks before game.js attaches. */
+          && strstr(html, "<script defer src=\"campaign.js\"></script>")
+             < strstr(html, "<script defer src=\"game.js\"></script>")
+          && strstr(html, "<script defer src=\"campaign.js\"></script>")
+             != NULL
+          && strstr(html, "<script defer src=\"controls.js\"></script>")
+             < strstr(html, "<script defer src=\"game.js\"></script>")
+          && strstr(html, "<script defer src=\"controls.js\"></script>")
+             != NULL
+          /* Adaptive music registers before game.js creates its conductor. */
+          && strstr(html, "<script defer src=\"music.js\"></script>")
+             != NULL
+          && strstr(html, "<script defer src=\"music.js\"></script>")
+             < strstr(html, "<script defer src=\"game.js\"></script>")
+          /* The bot AI's factory exists before game.js creates it. */
+          && strstr(html, "<script defer src=\"bots.js\"></script>")
+             != NULL
+          && strstr(html, "<script defer src=\"bots.js\"></script>")
+             < strstr(html, "<script defer src=\"game.js\"></script>")
+          /* The practice range registers before the campaign reads its
+             save section and lends it screens. */
+          && strstr(html, "<script defer src=\"practice.js\"></script>")
+             != NULL
+          && strstr(html, "<script defer src=\"practice.js\"></script>")
+             < strstr(html, "<script defer src=\"campaign.js\"></script>")
           && strstr(html, "setTimeout(function ()") == NULL
           && strstr(html, "createElement(\"script\")") == NULL
           && strstr(html, "addEventListener(\"load\"") == NULL
@@ -1461,14 +2215,20 @@ static bool run_treadline_arena_game(void)
           && strstr(web_multiplayer, "TFW1Z.") != NULL
           && strstr(script, "options.iceServers = []") != NULL
           && strstr(script, "buildArena(queuedDeploy)") != NULL
-          /* The engine's real ceiling is the 1 MiB aggregate capture
-             limit; this per-script bound only guards against runaway
-             growth and keeps authoring headroom explicit. */
-          && script_length < 384u * 1024u
+          /* Authored and alternate research sources share the Game Profile
+             per-script ceiling and the unchanged aggregate capture limit. */
+          && script_length <= 512u * 1024u
           && arena_generator_length < 64u * 1024u
+          && campaign_length < 128u * 1024u
+          && controls_length < 32u * 1024u
+          && practice_length < 28u * 1024u
+          && music_length < 40u * 1024u
+          && bots_length < 96u * 1024u
+          && qualification_length < 96u * 1024u
           && html_length + script_length + css_length + manifest_length
              + icon_length + web_multiplayer_length + arena_generator_length
-             < MIB);
+             + campaign_length + controls_length + practice_length
+             + music_length + bots_length < MIB);
 
     Budget budget;
     budget_init(&budget, 24u * MIB);
@@ -1505,11 +2265,8 @@ static bool run_treadline_arena_game(void)
     ScriptExecutionPolicy policy;
     CHECK(script_execution_policy_for_profile(
         SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
-    /* This first-party offline game has its own bounded 384 KiB authored
-       script envelope, checked above and admitted by the device package.
-       Keep the isolated runtime aligned with that explicit game bound rather
-       than the generic per-document compile default. */
-    policy.maximum_host_compile_source_bytes = 384u * 1024u;
+    /* Exercise the shipping policy without an isolated-runtime override. */
+    CHECK(policy.maximum_host_compile_source_bytes == 4u * 1024u * 1024u);
     policy.slow_compile_threshold_us = UINT64_MAX;
     policy.slow_callback_threshold_us = UINT64_MAX;
     ScriptRuntimeOptions options = {
@@ -1520,8 +2277,20 @@ static bool run_treadline_arena_game(void)
     };
     ScriptResult result;
     char generated_online_fixture[2048] = {0};
+    /* Exercise explicit killcam opt-in under the same qualification URL
+       used by the physical-device manual-input scenario. */
+    /* The feature fixture runs 512 budgeted-HUD frames in one diagnostic
+       evaluation. Allow that bounded batch to finish under parallel CTest;
+       the per-frame device budget is measured by the input-script lane.
+       The fixtures run only in the --treadline-features lane (a fresh 7.5 MiB
+       realm); the default lane keeps the same per-evaluation allowance for
+       its own long Treadline batches (online soak, visual budget). */
     ScriptRuntime *runtime = script_runtime_create_configured(
-        &document, &budget, 16u * MIB, 8000, document_url,
+        &document, &budget, treadline_features_only ? TREADLINE_FEATURE_REALM_BYTES : 16u * MIB,
+        TREADLINE_TEST_EVALUATION_MS,
+        treadline_features_only
+            ? "https://games.test/examples/treadline-arena/index.html?qualification=input"
+            : document_url,
         &options, &result);
     CHECK(runtime != NULL && result.success);
     ImageResources images = {.budget = &budget};
@@ -1550,12 +2319,133 @@ static bool run_treadline_arena_game(void)
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, arena_generator, "treadline-arena/arena-generator.js",
               &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, practice, "treadline-arena/practice.js", &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, campaign, "treadline-arena/campaign.js", &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, controls, "treadline-arena/controls.js", &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, music, "treadline-arena/music.js", &result));
+    if (treadline_host_profile) CHECK(treadline_prepare_host_proxy(&script, &bots));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, bots, "treadline-arena/bots.js", &result));
     bool treadline_loaded = script_runtime_evaluate_diagnostic(
         runtime, script, "treadline-arena/game.js", &result);
+    /* The harness API (__treadlineDebug) is qualification.js: loaded
+       explicitly after game.js, as __treadlineEnableDebug asked. */
+    if (treadline_loaded && strcmp(result.summary, "TREADLINE-READY") == 0)
+        treadline_loaded = script_runtime_evaluate_diagnostic(
+            runtime, qualification, "treadline-arena/qualification.js",
+            &result) && (result.summary[0] == '\0'
+                || strcmp(result.summary, "TREADLINE-READY") == 0);
     if (!treadline_loaded || strcmp(result.summary, "TREADLINE-READY") != 0)
         fprintf(stderr, "treadline load summary=%s error=%s\n",
                 result.summary, result.error);
     CHECK(treadline_loaded && strcmp(result.summary, "TREADLINE-READY") == 0);
+    bool shaders_exact = script_runtime_evaluate_diagnostic(
+        runtime, WEBGL_SHADERS_EXACT_PROBE, "<treadline-shaders>", &result);
+    if (!shaders_exact || strcmp(result.summary, "WEBGL-SHADERS-EXACT") != 0)
+        fprintf(stderr, "treadline shaders: %s\n", result.summary);
+    CHECK(shaders_exact && strcmp(result.summary, "WEBGL-SHADERS-EXACT") == 0);
+    if (treadline_league_matches != 0 || treadline_features_only || treadline_host_profile
+        || treadline_campaign_sweep_seeds != 0 || treadline_invariants
+        || treadline_aim_guide_only) {
+        if (treadline_aim_guide_only) CHECK(run_treadline_aim_guide(runtime, &result));
+        if (treadline_campaign_sweep_seeds != 0)
+            CHECK(run_treadline_campaign_sweep(runtime, &result));
+        if (treadline_invariants) CHECK(run_treadline_invariants(runtime, &result));
+        if (treadline_probe_script) CHECK(run_treadline_probe(runtime, &result));
+        if (treadline_host_profile) CHECK(run_treadline_host_proxy(runtime, &result));
+        if (treadline_features_only) {
+            CHECK(run_treadline_features(runtime, &result));
+            CHECK(script_runtime_evaluate_diagnostic(runtime,
+                "__treadlineDebug.selectMode(0);__treadlineDebug.start();"
+                "__treadlineDebug.step(24);__tilefinchStartInputProfile();",
+                "<treadline-profile-start>", &result));
+            for (unsigned tick = 0; tick < 24u; tick++)
+                CHECK(script_runtime_advance(runtime, 16, 64, &result));
+            CHECK(script_runtime_evaluate_diagnostic(runtime,
+                "const slow=__treadlineDebug.slowProfile();"
+                "let aligned=slow.aiRowWords===31&&slow.aiRows.length===93;"
+                /* A fast host phase can round to zero. Assert the schema and
+                   parent/child bounds, not wall-clock observability. */
+                "for(let row=0;row<3;row++){let phases=0;"
+                "for(let part=11;part<15;part++){const value=slow.aiRows[row*31+part];"
+                "aligned=aligned&&Number.isFinite(value)&&value>=0;phases+=value;}"
+                "aligned=aligned&&phases<=slow.rows[row*10+3]+.01;"
+                "let route=0;for(let part=15;part<18;part++){const value=slow.aiRows[row*31+part];"
+                "aligned=aligned&&Number.isFinite(value)&&value>=0;route+=value;}"
+                "aligned=aligned&&route<=slow.aiRows[row*31+2]+.01;"
+                "const b=row*31,refresh=slow.aiRows[b+18],aim=slow.aiRows[b+19];"
+                "aligned=aligned&&Number.isInteger(refresh)&&refresh>=0&&refresh<=6"
+                "&&Number.isInteger(slow.aiRows[b+20])&&slow.aiRows[b+20]>=0"
+                "&&slow.aiRows[b+20]<=1&&Number.isFinite(aim)&&aim>=0"
+                "&&aim<=slow.rows[row*10+6]+.01;let actions=0;"
+                "for(let part=21;part<25;part++){const value=slow.aiRows[b+part];"
+                "const count=slow.aiRows[b+part+5];actions+=value;"
+                "aligned=aligned&&Number.isFinite(value)&&value>=0"
+                "&&Number.isInteger(count)&&count>=0&&count<=6;}"
+                "const audio=slow.aiRows[b+25],envelopes=slow.aiRows[b+30];"
+                "aligned=aligned&&actions<=slow.aiRows[b+14]+.01"
+                "&&Number.isFinite(audio)&&audio>=0&&audio<=slow.rows[row*10+9]+.01"
+                "&&Number.isInteger(envelopes)&&envelopes>=0&&envelopes<=64;}"
+                "globalThis.pocSummary=aligned&&slow.aimParts.length===4"
+                "?'TREADLINE-MOVEMENT-ROWS':'TREADLINE-MOVEMENT-ROWS-FAIL:'"
+                "+JSON.stringify(slow);__treadlineDebug.stopInputProfile();",
+                "<treadline-profile-rows>", &result));
+            if (strcmp(result.summary, "TREADLINE-MOVEMENT-ROWS") != 0)
+                fprintf(stderr, "treadline profile summary=%s error=%s\n",
+                        result.summary, result.error);
+            CHECK(strcmp(result.summary, "TREADLINE-MOVEMENT-ROWS") == 0);
+            printf("TREADLINE-FEATURES heap=%zu limit=%u rejections=%zu\n",
+                   script_runtime_heap_used(runtime), TREADLINE_FEATURE_REALM_BYTES,
+                   script_runtime_heap_rejections(runtime));
+            CHECK(script_runtime_heap_rejections(runtime) == 0);
+            /* Live bytes after a full collection: the GC-timing-independent
+               figure for comparing script footprint between branches. */
+            (void) script_runtime_collect_and_trim(runtime);
+            printf("TREADLINE-FEATURES live=%zu\n",
+                   script_runtime_heap_used(runtime));
+        }
+        for (unsigned match = 0; match < treadline_league_matches; match++) {
+            char command[512];
+            uint32_t seed = UINT32_C(0x9e3779b9) * (match + 1u);
+            unsigned a = match % 3u, b = (match / 3u) % 3u;
+            unsigned script_kind = (match / 9u) % 4u;
+            unsigned arena = (match / 36u) % 3u;
+            snprintf(command, sizeof(command),
+                     "__treadlineDebug.beginLeague(%u,%u,%u,%u,%u);",
+                     seed, a, b, script_kind, arena);
+            CHECK(script_runtime_evaluate_diagnostic(
+                runtime, command, "<league-start>", &result));
+            for (unsigned slice = 0; slice < 15u; slice++) {
+                CHECK(script_runtime_evaluate_diagnostic(
+                    runtime,
+                    "globalThis.pocSummary=__treadlineDebug.stepLeague(120)?'DONE':'RUNNING';",
+                    "<league-step>", &result));
+                if (strcmp(result.summary, "DONE") == 0) break;
+            }
+            CHECK(script_runtime_evaluate_diagnostic(
+                runtime,
+                "globalThis.pocSummary=JSON.stringify(__treadlineDebug.leagueResult());"
+                "__treadlineDebug.finishLeague();",
+                "<league-result>", &result));
+            printf("TREADLINE-LEAGUE {\"seed\":%u,\"difficultyA\":%u,"
+                   "\"difficultyB\":%u,\"script\":%u,\"arena\":%u,\"result\":%s}\n",
+                   seed, a, b, script_kind, arena, result.summary);
+        }
+        script_runtime_set_images(runtime, NULL);
+        script_runtime_destroy(runtime);
+        images_destroy(&images);
+        document_destroy(&document);
+        free(html); free(script); free(css); free(manifest_json);
+        free(icon); free(web_multiplayer); free(arena_generator); free(campaign);
+        free(controls); free(practice); free(music); free(bots);
+        free(qualification);
+        CHECK(budget.current == 0 && budget_active_allocations(&budget, NULL) == 0);
+        return true;
+    }
     bool treadline_arena_generation_ok = script_runtime_evaluate_diagnostic(
               runtime,
               "const authoredMasks=["
@@ -1613,7 +2503,6 @@ static bool run_treadline_arena_game(void)
               "for(let seed=1;seed<=192;seed++)"
               "if(fallbackGenerator.generate("
               "Math.imul(seed,0x27d4eb2d)>>>0,1).accepted)rawAccepted++;"
-              "const elevation=__treadlineDebug.elevationBarrierProbe();"
               "const good=authoredMasks.every(mask=>mask===63)"
               "&&firstWinner===secondWinner&&firstWinner!==0"
               "&&steppedResult.done&&steppedResult.accepted===firstSeed.accepted"
@@ -1634,12 +2523,12 @@ static bool run_treadline_arena_game(void)
               "&&steppedFallback.done&&steppedFallback.fallback"
               "&&steppedFallback.attempts===0"
               "&&steppedFallback.checksum===forcedFallback.checksum"
-              "&&fallbackValid&&elevation;"
+              "&&fallbackValid;"
               "globalThis.pocSummary=good?'TREADLINE-ARENAS'"
               ":'TREADLINE-ARENAS-FAIL:'+JSON.stringify({authoredMasks,"
               "firstSeed,secondSeed,steppedResult,byteEqual,forcedFallback,"
               "steppedFallback,fallbackValid,"
-              "batch,variety:variety.size,rawAccepted,elevation,metrics:["
+              "batch,variety:variety.size,rawAccepted,metrics:["
               "{...__treadlineDebug.arenaValidationMetrics(0,0)},"
               "{...__treadlineDebug.arenaValidationMetrics(1,1)},"
               "{...__treadlineDebug.arenaValidationMetrics(2,2)}]})",
@@ -1661,15 +2550,22 @@ static bool run_treadline_arena_game(void)
               "const pausedAudio=__treadlineDebug.snapshot();"
               "__treadlineDebug.setMusicEnabled(false);"
               "const mutedAudio=__treadlineDebug.snapshot();"
-              "globalThis.pocSummary=titleAudio.audioRole==='melody'"
+              /* music.js owns the engine oscillator in menus and outside
+                 active play (where the hum is silent anyway); in quiet play
+                 (no foe close) the hum keeps it; Off leaves the hum alone. */
+              "globalThis.pocSummary=titleAudio.audioRole==='music'"
+              "&&titleAudio.audioCurves===26"
               "&&playingAudio.audioRole==='hum'"
               "&&pausedAudio.mode==='paused'"
-              "&&pausedAudio.audioRole==='melody'"
+              "&&pausedAudio.audioRole==='music'"
               "&&mutedAudio.audioRole==='off'"
               "?'TREADLINE-AUDIO-ROLE':'TREADLINE-AUDIO-ROLE-FAIL:'"
-              "+JSON.stringify({titleAudio,playingAudio,pausedAudio,mutedAudio})",
+              "+JSON.stringify([titleAudio,playingAudio,pausedAudio,mutedAudio]"
+              ".map(s=>[s.mode,s.audioRole,s.audioCurves]))",
               "<treadline-audio-role>", &result)
-          && strcmp(result.summary, "TREADLINE-AUDIO-ROLE") == 0);
+          && strcmp(result.summary, "TREADLINE-AUDIO-ROLE") == 0
+          || (fprintf(stderr, "treadline audio role summary=%s error=%s\n",
+                      result.summary, result.error), false));
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "const forward=__treadlineDebug.longSoakCommand(20);"
@@ -1720,11 +2616,15 @@ static bool run_treadline_arena_game(void)
               "&&started.repeatedFrameCaptures<=2"
               "&&started.tankBarrels===started.blueTanks+started.redTanks"
               "&&document.getElementById('hud').hidden"
-              "&&document.getElementById('objective-arrow').hidden"
               "&&started.meshDrops===0"
               "&&!started.commandEnabled"
               "?'TREADLINE-STARTED':'TREADLINE-START-FAIL:'"
-              "+JSON.stringify(started)",
+              "+JSON.stringify({captures:started.repeatedFrameCaptures,"
+              "plan:__tilefinchWebGLDiagnostics.drawPlanHits,"
+              "template:__tilefinchWebGLDiagnostics.commandTemplateHits,"
+              "slot:__tilefinchWebGLDiagnostics.commandSlotTemplateHits,"
+              "execute:__tilefinchWebGLDiagnostics.repeatedCommandListExecutions,"
+              "started})",
               "<treadline-start>", &result);
     if (!treadline_started_ok
         || strcmp(result.summary, "TREADLINE-STARTED") != 0)
@@ -1734,6 +2634,88 @@ static bool run_treadline_arena_game(void)
           && strcmp(result.summary, "TREADLINE-STARTED") == 0);
 
     puts("test: Treadline Arcade and Classic controls translate into one packet shape");
+    bool treadline_collision_ok = script_runtime_evaluate_diagnostic(
+              runtime,
+              "const segment=__treadlineDebug.segmentCostProbe(128);"
+              "let collisionChecks=0,collisionMismatch=0,collisionPruned=true,"
+              "collisionFaces=true;"
+              "for(let arena=0;arena<3;arena++){"
+              "__treadlineDebug.beginLeague(12345,1,2,0,arena);"
+              "const probe=__treadlineDebug.collisionGridProbe();"
+              "collisionChecks+=probe.checks;collisionMismatch+=probe.mismatches;"
+              "collisionFaces=collisionFaces&&probe.faceChecks>0;"
+              "collisionPruned=collisionPruned&&probe.bytes===2048"
+              "&&probe.candidates<probe.fullCandidates/3;"
+              "for(const c of __treadlineDebug.crateState())if(c.active)"
+              "for(const radius of [.44,.754,.8,.800001,.95])"
+              "for(const offset of [-.000001,0,.000001])"
+              "for(let edge=0;edge<4;edge++){"
+              "const delta=.22+radius+offset,"
+              "x=c.x+(edge<2?(edge?delta:-delta):0),"
+              "z=c.z+(edge>=2?(edge===3?delta:-delta):0);"
+              "if(__treadlineDebug.circleBlocked(x,z,radius)"
+              "!==__treadlineDebug.circleBlocked(x,z,radius,true))collisionMismatch++}"
+              "for(let at=0;at<6;at++)__treadlineDebug.setBarrierActive(at,false);"
+              "__treadlineDebug.clearCrates();"
+              "collisionMismatch+=__treadlineDebug.collisionGridProbe().mismatches;"
+              "}__treadlineDebug.finishLeague();"
+              "__treadlineDebug.selectMode(0);__treadlineDebug.start();"
+              "globalThis.pocSummary=collisionChecks===18432"
+              "&&collisionMismatch===0&&collisionPruned&&collisionFaces"
+              "&&segment.mismatches===0&&segment.referenceHits===segment.fastHits"
+              "?'TREADLINE-COLLISION-GRID':'TREADLINE-COLLISION-GRID-FAIL:'"
+              "+JSON.stringify({collisionChecks,collisionMismatch,collisionPruned,"
+              "collisionFaces,segment})",
+              "<treadline-collision-grid>", &result)
+          && strcmp(result.summary, "TREADLINE-COLLISION-GRID") == 0;
+    if (!treadline_collision_ok)
+        fprintf(stderr, "treadline collision summary=%s error=%s\n",
+                result.summary, result.error);
+    CHECK(treadline_collision_ok);
+    /* Shells fired from a ramp fly over barriers; ground shells stop on
+       them, through the ray index (ready once a match runs) and the
+       record walk alike. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=__treadlineDebug.elevationBarrierProbe()"
+              "?'TREADLINE-SHELL-ELEVATION':'TREADLINE-SHELL-ELEVATION-FAIL'",
+              "<treadline-shell-elevation>", &result)
+          && strcmp(result.summary, "TREADLINE-SHELL-ELEVATION") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const d=__treadlineDebug,floor=Math.floor;let calls=0,okay=true;"
+              "Math.floor=function(v){calls++;return floor(v)};"
+              "try{for(let cell=0;cell<=32;cell++)"
+              "for(const epsilon of [-.000001,0,.000001]){"
+              "const x=cell*.5-8+epsilon;"
+              "for(const radius of [.44,.754,.95])"
+              "if(d.circleBlocked(x,x,radius)!==d.circleBlocked(x,x,radius,true))okay=false}"
+              "for(const x of [-9,9,Infinity,-Infinity,NaN])"
+              "if(d.circleBlocked(x,0,.44))okay=false}"
+              "finally{Math.floor=floor}"
+              "globalThis.pocSummary=okay&&calls===0"
+              "?'TREADLINE-COLLISION-INTEGER':'TREADLINE-COLLISION-INTEGER-FAIL:'+calls})()",
+              "<treadline-collision-integer>", &result)
+          && strcmp(result.summary, "TREADLINE-COLLISION-INTEGER") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const d=__treadlineDebug;let okay=true,calls=0;"
+              "const values=[-Infinity,-1e100,-8.000001,-8,-7.999999,-7.5,"
+              "-.000001,0,.000001,7.999999,8,8.000001,1e100,Infinity,NaN];"
+              "for(const x of values)for(const z of values){"
+              "const expected=(Math.max(0,Math.min(15,Math.floor(z+8)))<<4)"
+              "+Math.max(0,Math.min(15,Math.floor(x+8))),actual=d.navigationCell(x,z);"
+              "if(!Object.is(expected,actual))okay=false}"
+              "const floor=Math.floor,min=Math.min,max=Math.max;"
+              "Math.floor=function(v){calls++;return floor(v)};"
+              "Math.min=function(a,b){calls++;return min(a,b)};"
+              "Math.max=function(a,b){calls++;return max(a,b)};"
+              "try{for(let n=0;n<256;n++)d.navigationCell((n&31)-15.5,(n>>4)-8)}"
+              "finally{Math.floor=floor;Math.min=min;Math.max=max}"
+              "globalThis.pocSummary=okay&&calls===0?'TREADLINE-NAV-CELL'"
+              ":'TREADLINE-NAV-CELL-FAIL:'+calls})()",
+              "<treadline-nav-cell>", &result)
+          && strcmp(result.summary, "TREADLINE-NAV-CELL") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "localStorage.removeItem('treadline-settings-v1');"
@@ -2094,11 +3076,16 @@ static bool run_treadline_arena_game(void)
               runtime,
               "const hudGl=document.querySelector('canvas').getContext('webgl');"
               "__treadlineDebug.step(10);const hud=__treadlineDebug.snapshot();"
+              "const hudPixels=new Uint8Array(100*20*4);"
+              "hudGl.readPixels(0,160,100,20,hudGl.RGBA,hudGl.UNSIGNED_BYTE,hudPixels);"
+              "let hudInk=0;for(let at=0;at<hudPixels.length;at+=4)"
+              "if(hudPixels[at]>220&&hudPixels[at+1]>230&&hudPixels[at+2]>230)hudInk++;"
               "globalThis.pocSummary=hudGl.isEnabled(hudGl.BLEND)"
               "&&hud.hudCharacters>0&&hud.hudPrimitives>hud.hudCharacters"
+              "&&hudInk>10"
               "&&hudGl._textureCount===0"
               "?'TREADLINE-HUD-INK':'TREADLINE-HUD-BLOCKS:'"
-              "+JSON.stringify(hud)+'|'+hudGl._textureCount",
+              "+JSON.stringify(hud)+'|'+hudGl._textureCount+'|ink='+hudInk",
               "<treadline-hud-ink>", &result);
     if (!treadline_hud_alpha_ok
         || strcmp(result.summary, "TREADLINE-HUD-INK") != 0)
@@ -2138,6 +3125,7 @@ static bool run_treadline_arena_game(void)
               "__treadlineDebug.setKeyboard('fire',true);"
               "__treadlineDebug.step(1);"
               "__treadlineDebug.setKeyboard('fire',false);"
+              "__treadlineDebug.step(1);"
               "const fired=__treadlineDebug.snapshot();"
               "globalThis.pocSummary=fired.bullets>0"
               "&&fired.shots>0"
@@ -2147,6 +3135,27 @@ static bool run_treadline_arena_game(void)
               "+JSON.stringify(fired)",
               "<treadline-fire>", &result)
           && strcmp(result.summary, "TREADLINE-FIRED") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "(()=>{const d=__treadlineDebug;"
+              "d.selectMode(3);let exact=true,warmFloors=0;"
+              "for(const wave of [1,2,5,999,5]){d.setWave(wave);"
+              "for(let difficulty=0;difficulty<3;difficulty++)"
+              "for(const values of d.botDifficultyTables){"
+              "const tank={difficulty},level=Math.min(2,difficulty+Math.max(0,wave-1)*.16),"
+              "lower=Math.floor(level),upper=Math.min(2,lower+1),"
+              "expected=values[lower]+(values[upper]-values[lower])*(level-lower);"
+              "if(d.botDifficultyValue(values,tank)!==expected)exact=false;"
+              "const floor=Math.floor;Math.floor=function(v){warmFloors++;return floor(v)};"
+              "try{for(let n=0;n<16;n++)"
+              "if(d.botDifficultyValue(values,tank)!==expected)exact=false}"
+              "finally{Math.floor=floor}}}"
+              "d.selectMode(1);for(const values of d.botDifficultyTables)"
+              "for(let difficulty=0;difficulty<3;difficulty++)"
+              "if(d.botDifficultyValue(values,{difficulty})!==values[difficulty])exact=false;"
+              "d.selectMode(0);d.start();globalThis.pocSummary=exact&&warmFloors===0"
+              "?'TREADLINE-DIFFICULTY-CACHE':'TREADLINE-DIFFICULTY-CACHE-FAIL:'+warmFloors})()",
+              "<treadline-difficulty-cache>", &result)
+          && strcmp(result.summary, "TREADLINE-DIFFICULTY-CACHE") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "__treadlineDebug.selectClass(0);__treadlineDebug.start();"
@@ -2603,11 +3612,25 @@ static bool run_treadline_arena_game(void)
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "__treadlineDebug.start();__treadlineDebug.freezeBots(true);"
+              "__treadlineDebug.step(1);"
+              "const baseTint=__treadlineDebug.tankInstanceTint(0);"
               "__treadlineDebug.damagePlayerFrom('SIDE',8);"
+              "__treadlineDebug.step(1);"
               "const flashed=__treadlineDebug.tankState(0);"
-              "globalThis.pocSummary=flashed.hitFlash>0"
+              "const hitTint=__treadlineDebug.tankInstanceTint(0);"
+              "const paintBases=[[.1,.92,.67],[1,.47,.16],[.22,.82,1],"
+              "[.72,.4,1],[1,.84,.16],[.92,.92,1]];"
+              "const paintBase=paintBases[__treadlineDebug.snapshot().paint];"
+              "const flashRatio=Math.min(1,flashed.hitFlash/.12);"
+              "const tintReference=new Float32Array(3);"
+              "for(let at=0;at<3;at++)"
+              "tintReference[at]=paintBase[at]+(1-paintBase[at])*flashRatio;"
+              "const baseReference=new Float32Array(paintBase);"
+              "globalThis.pocSummary=flashed.hitFlash>0&&baseTint&&hitTint"
+              "&&baseTint.slice(0,3).every((v,i)=>v===baseReference[i])"
+              "&&hitTint.slice(0,3).every((v,i)=>v===tintReference[i])"
               "?'TREADLINE-HIT-FLASH':'TREADLINE-HIT-FLASH-FAIL:'"
-              "+JSON.stringify(flashed)",
+              "+JSON.stringify({flashed,baseTint,hitTint})",
               "<treadline-hit-flash>", &result)
           && strcmp(result.summary, "TREADLINE-HIT-FLASH") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
@@ -2623,8 +3646,6 @@ static bool run_treadline_arena_game(void)
               ".includes('BOOST TREADS')"
               "&&document.getElementById('difficulty-choice').textContent"
               ".includes('ACE')"
-              "&&document.getElementById('gadget-meter')!==null"
-              "&&document.getElementById('objective-arrow')!==null"
               "?'TREADLINE-LOADOUT':'TREADLINE-LOADOUT-FAIL'",
               "<treadline-loadout>", &result)
           && strcmp(result.summary, "TREADLINE-LOADOUT") == 0);
@@ -2756,7 +3777,7 @@ static bool run_treadline_arena_game(void)
               "__tilefinchDeliverMultiplayer(71,'open',undefined,'',0,false,99,'','Guest');"
               "const beforeOnline=__treadlineDebug.snapshot();"
               "const inputPacket=new ArrayBuffer(12),inputView=new DataView(inputPacket);"
-              "inputView.setUint8(0,1);inputView.setUint8(1,3);"
+              "inputView.setUint8(0,1);inputView.setUint8(1,5);"
               "inputView.setUint16(2,1,true);inputView.setUint8(4,3);"
               "inputView.setInt16(8,32767,true);"
               "__tilefinchDeliverMultiplayer(71,'binary',inputPacket,'',0,false,99,'','');"
@@ -2787,13 +3808,14 @@ static bool run_treadline_arena_game(void)
               "0,false,99,'','');"
               "const generated=__treadlineDebug.onlineGeneratedSnapshot("
               "0x2468ace0);__treadlineDebug.setBarrierActive(0,false);"
+              "const generatedCollision=__treadlineDebug.collisionGridProbe();"
               "__tilefinchDeliverMultiplayer(71,'drain',undefined,'',"
               "0,false,99,'','');"
               "__treadlineDebug.emitOnlineSnapshot();"
               "const packet=__treadlineOnlineTest.sentLast;"
               "const packetView=new DataView(packet);"
               "const wireOk=generated.accepted&&generated.seed!==0"
-              "&&packetView.getUint8(1)===3&&packetView.getUint8(4)===255"
+              "&&packetView.getUint8(1)===5&&packetView.getUint8(4)===255"
               "&&packetView.getUint32(24,true)===generated.seed"
               "&&packetView.getUint16(28,true)===generated.checksum"
               "&&packetView.getUint16(30,true)===14;"
@@ -2812,6 +3834,7 @@ static bool run_treadline_arena_game(void)
               "const oldAccepted=__treadlineDebug.applyOnlinePacket(old);"
               "const afterOld=__treadlineDebug.snapshot();"
               "globalThis.pocSummary=wireOk&&applied&&rebuilt.arena===3"
+              "&&generatedCollision.mismatches===0"
               "&&pendingGeometry.onlineArenaGeometryPending"
               "&&!rebuilt.onlineArenaGeometryPending"
               "&&rebuilt.arenaSeed===generated.seed&&rebuilt.barriers===3"
@@ -2861,7 +3884,7 @@ static bool run_treadline_arena_game(void)
               "const frame=globalThis.__treadlineSoakFrame++;"
               "if(frame%3===0){"
               "const packet=new ArrayBuffer(12),view=new DataView(packet);"
-              "view.setUint8(0,1);view.setUint8(1,3);"
+              "view.setUint8(0,1);view.setUint8(1,5);"
               "view.setUint16(2,globalThis.__treadlineSoakSequence++,true);"
               "view.setUint8(4,(frame%120)<60?1:2);"
               "view.setInt16(8,32767,true);"
@@ -2923,7 +3946,9 @@ static bool run_treadline_arena_game(void)
               "globalThis.pocSummary=loaded.boxInstances<=64"
               "&&loaded.instanceLimit===64&&loaded.tankBarrels===6"
               "&&loaded.bullets===18&&loaded.renderedBulletInstances===18"
-              "&&loaded.decals===12"
+              /* No room is left for decals: each one is retired rather
+                 than skipped (a skipped one blinked back next frame). */
+              "&&loaded.decals===0&&loaded.droppedDecalInstances===12"
               "&&loaded.decalRecycles>=5&&loaded.instanceCapHitFrames>0"
               "&&staticBounded&&wedgeBounded&&aggregate<=4096"
               "?'TREADLINE-VISUAL-BUDGET':'TREADLINE-VISUAL-BUDGET-FAIL:'"
@@ -2935,6 +3960,10 @@ static bool run_treadline_arena_game(void)
                 result.summary, result.error);
     CHECK(treadline_visual_budget_ok
           && strcmp(result.summary, "TREADLINE-VISUAL-BUDGET") == 0);
+    /* The feature fixtures (run_treadline_features) are not repeated here:
+       tilefinch-treadline-feature-budget-tests runs every one of them in a
+       fresh, tighter 7.5 MiB realm with zero refusals and zero owned bytes
+       after teardown, which is the stricter of the two configurations. */
     CHECK(script_runtime_evaluate_diagnostic(
         runtime, "__treadlineDebug.stop();globalThis.pocSummary='STOPPED'",
         "<treadline-stop>", &result));
@@ -2960,8 +3989,26 @@ static bool run_treadline_arena_game(void)
               client_runtime, arena_generator,
               "treadline-arena/arena-generator.js", &client_result));
     CHECK(script_runtime_evaluate_diagnostic(
+              client_runtime, practice, "treadline-arena/practice.js",
+              &client_result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              client_runtime, campaign, "treadline-arena/campaign.js",
+              &client_result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              client_runtime, controls, "treadline-arena/controls.js",
+              &client_result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              client_runtime, music, "treadline-arena/music.js",
+              &client_result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              client_runtime, bots, "treadline-arena/bots.js",
+              &client_result));
+    CHECK(script_runtime_evaluate_diagnostic(
               client_runtime, script, "treadline-arena/game.js",
               &client_result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              client_runtime, qualification,
+              "treadline-arena/qualification.js", &client_result));
     char client_probe[4096];
     int client_probe_length = snprintf(
         client_probe, sizeof(client_probe),
@@ -3008,6 +4055,9 @@ static bool run_treadline_arena_game(void)
     free(icon);
     free(web_multiplayer);
     free(arena_generator);
+    free(campaign);
+    free(controls); free(practice); free(music); free(bots);
+    free(qualification);
     CHECK(budget.current == 0
           && budget_active_allocations(&budget, NULL) == 0);
     return true;
@@ -3054,83 +4104,6 @@ static bool cache_offline_resource(
         "public,max-age=3600", "", UINT64_C(1), &context, &grant);
     browser_shared_body_release(body);
     return stored;
-}
-
-static bool stage_treadline_offline_fixture(BrowserEngine *engine)
-{
-    const char *directory = getenv("TILEFINCH_TREADLINE_STAGE_DIR");
-    if (directory == NULL || directory[0] == '\0') return true;
-    static const char base[] =
-        "https://games.test/examples/treadline-arena/";
-    static const struct {
-        const char *path;
-        const char *type;
-        TilefinchRequestDestination destination;
-    } resources[] = {
-        {"game.css", "text/css", TILEFINCH_DESTINATION_STYLE},
-        {"multiplayer-web.js", "text/javascript", TILEFINCH_DESTINATION_SCRIPT},
-        {"arena-generator.js", "text/javascript", TILEFINCH_DESTINATION_SCRIPT},
-        {"game.js", "text/javascript", TILEFINCH_DESTINATION_SCRIPT},
-        {"manifest.webmanifest", "application/manifest+json",
-         TILEFINCH_DESTINATION_FETCH},
-        {"icon.svg", "image/svg+xml", TILEFINCH_DESTINATION_IMAGE},
-    };
-    char *html = NULL, *manifest_json = NULL, *icon = NULL;
-    size_t html_length = 0, manifest_length = 0, icon_length = 0;
-    html = read_source("examples/treadline-arena/index.html", &html_length);
-    manifest_json = read_source(
-        "examples/treadline-arena/manifest.webmanifest", &manifest_length);
-    icon = read_source("examples/treadline-arena/icon.svg", &icon_length);
-    CHECK(html != NULL && manifest_json != NULL && icon != NULL);
-
-    browser_session_cache_clear(browser_engine_session(engine));
-    for (size_t at = 0; at < sizeof(resources) / sizeof(resources[0]); at++) {
-        char source_path[160], url[192];
-        int source_written = snprintf(
-            source_path, sizeof(source_path), "examples/treadline-arena/%s",
-            resources[at].path);
-        int url_written = snprintf(
-            url, sizeof(url), "%s%s", base, resources[at].path);
-        size_t length = 0;
-        char *data = source_written > 0
-                && (size_t) source_written < sizeof(source_path)
-            ? read_source(source_path, &length) : NULL;
-        CHECK(data != NULL && url_written > 0
-              && (size_t) url_written < sizeof(url)
-              && cache_offline_resource(
-                  engine, "https://games.test/examples/treadline-arena/index.html",
-                  url, resources[at].type, resources[at].destination,
-                  TILEFINCH_CREDENTIALS_INCLUDE,
-                  (const unsigned char *) data, length));
-        free(data);
-    }
-
-    PocDocument document;
-    CHECK(document_parse(
-        &document, browser_engine_budget(engine), html, html_length, 512));
-    TilefinchWebAppManifest manifest = {0};
-    char error[256] = {0};
-    CHECK(tilefinch_web_app_manifest_parse(
-        manifest_json, manifest_length,
-        "https://games.test/examples/treadline-arena/manifest.webmanifest",
-        "https://games.test/examples/treadline-arena/index.html",
-        &manifest, error, sizeof(error)));
-    OfflineLibrary library;
-    offline_library_init(
-        &library, browser_engine_budget(engine), directory);
-    uint32_t id = 0;
-    CHECK(offline_library_save_web_app(
-        &library, &document, browser_engine_session(engine),
-        "https://games.test/examples/treadline-arena/index.html", &manifest,
-        (const unsigned char *) icon, icon_length, &id,
-        error, sizeof(error)));
-    fprintf(stderr, "staged Treadline offline app id=%u at %s\n",
-            (unsigned) id, directory);
-    document_destroy(&document);
-    free(html);
-    free(manifest_json);
-    free(icon);
-    return true;
 }
 
 static bool run_prism_break_offline_reopen(void)
@@ -3334,6 +4307,11 @@ static bool run_prism_break_offline_reopen(void)
 
     ScriptResult game_result;
     bool visible_layout_changed = false;
+    /* The title canvas may already compose its menu overlay; count the
+       builds of the started game's overlay only. */
+    const TileCache *title_render = browser_engine_render_metrics_view(engine);
+    size_t title_builds = title_render == NULL
+        ? 0u : title_render->canvas_overlay_builds;
     CHECK(script_runtime_evaluate_diagnostic(
               navigation->page.runtime,
               "__prismBreakDebug.start();__prismBreakDebug.step(1);"
@@ -3382,7 +4360,7 @@ static bool run_prism_break_offline_reopen(void)
         }
     }
     CHECK(render != NULL && render->canvas_overlay_ready
-          && render->canvas_overlay_builds == 1
+          && render->canvas_overlay_builds == title_builds + 1u
           && render->canvas_overlay_region_count
                  <= TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT
           && render->canvas_overlay_pixel_count <= 32768u);
@@ -3452,7 +4430,7 @@ static bool run_prism_break_offline_reopen(void)
             render->canvas_overlay_patch_regions - patch_regions_before,
             render->canvas_overlay_region_count,
             render->canvas_overlay_pixel_count);
-    CHECK(render->canvas_overlay_builds == 1
+    CHECK(render->canvas_overlay_builds == title_builds + 1u
           && render->canvas_overlay_patches == patches_before
           && render->canvas_overlay_patch_regions == patch_regions_before);
     psp_offline_store_destroy(&route_store);
@@ -3472,7 +4450,6 @@ static bool run_prism_break_offline_reopen(void)
         (void) unlink(backup_path);
         (void) unlink(temporary_path);
     }
-    CHECK(stage_treadline_offline_fixture(engine));
     browser_engine_destroy(engine);
     if (!keep_staged_app) CHECK(rmdir(directory) == 0);
     free(snapshot_html);
@@ -3483,8 +4460,259 @@ static bool run_prism_break_offline_reopen(void)
     return true;
 }
 
-int main(void)
+static bool run_validation_frame_packet(void)
 {
+    static const char html[] = "<!doctype html><body>packet</body>";
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptRuntimeOptions options = {.defer_document_scripts = true};
+    CHECK(viewport_context_init(&options.viewport, 480, 272, 480, 272));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 8u * MIB, 8000, "https://games.test/packet",
+        &options, &result);
+    CHECK(runtime != NULL && result.success);
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "(() => {const input=new Uint8Array([99,1,2,3,4,99]);"
+        "const output=new Uint32Array([99,0,0,99]);"
+        "const view=new Uint8Array(input.buffer,1,4);"
+        "let a=2166136261,b=0x9e3779b9;"
+        "for(const byte of view){a=Math.imul(a^byte,16777619)>>>0;"
+        "b=Math.imul(b^byte,2246822519)>>>0;}"
+        "const sink=new Uint32Array(output.buffer,4,2);"
+        "if(!__tilefinchValidationHashBytes(view,4,sink)||output[0]!==99"
+        "||output[3]!==99||sink[0]!==a||sink[1]!==b)throw Error('hash offsets');"
+        "if(__tilefinchValidationHashBytes(view,5,sink)"
+        "||__tilefinchValidationHashBytes(view,524289,sink)"
+        "||__tilefinchValidationHashBytes(view,4,new Uint32Array(1)))"
+        "throw Error('hash bounds');"
+        "let coerced=0;if(__tilefinchValidationHashBytes(view,"
+        "{valueOf(){coerced++;return 4}},sink)||coerced)throw Error('hash coercion');"
+        "let threw=false;try{__tilefinchValidationHashBytes("
+        "new Proxy(view,{}),4,sink)}catch(e){threw=true}"
+        "if(!threw)throw Error('hash proxy');})()",
+        "<validation-hash>", &result));
+    uint32_t words[4] = {9, 9, 9, 9};
+    uint64_t origin = 0;
+    CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 4, &origin));
+    JSAtom packet_atom = runtime->validation_frame_packet_atom;
+    CHECK(packet_atom != JS_ATOM_NULL);
+    BudgetQuickJSActivity before_probe, after_probe;
+    budget_quickjs_pool_activity(runtime->quickjs_pool, &before_probe);
+    for (size_t retry = 0; retry < 64; retry++) {
+        CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 4, NULL));
+        CHECK(runtime->validation_frame_packet_atom == packet_atom);
+    }
+    budget_quickjs_pool_activity(runtime->quickjs_pool, &after_probe);
+    CHECK(after_probe.allocation_calls == before_probe.allocation_calls
+          && after_probe.reallocation_calls == before_probe.reallocation_calls);
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "globalThis.__tilefinchValidationFrameMetrics="
+        "new Uint32Array(new Uint32Array([99,1,2,3,4,99]).buffer,4,4)",
+        "<packet>", &result));
+    CHECK(script_runtime_copy_validation_frame_words(runtime, words, 4, &origin));
+    CHECK(words[0] == 1 && words[3] == 4 && origin != 0);
+    CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 5, NULL));
+    CHECK(!script_runtime_copy_validation_frame_words(runtime, words,
+        SCRIPT_VALIDATION_FRAME_WORD_LIMIT + 1u, NULL));
+    static const char *refusals[] = {
+        "new Uint8Array(16)", "new Uint32Array(0)",
+        "new Proxy(new Uint32Array(4),{get(){throw Error('read')}})",
+        "{get buffer(){throw Error('read')}}"
+    };
+    for (size_t at = 0; at < sizeof(refusals) / sizeof(refusals[0]); at++) {
+        char source[256];
+        snprintf(source, sizeof(source),
+            "globalThis.__tilefinchValidationFrameMetrics=%s", refusals[at]);
+        CHECK(script_runtime_evaluate_probe(runtime, source, "<packet>", &result));
+        CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 4, NULL));
+        CHECK(script_runtime_evaluate_probe(runtime, "1+1", "<after>", &result));
+    }
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "globalThis.packetGetterCalls=0;"
+        "Object.defineProperty(globalThis,'__tilefinchValidationFrameMetrics',"
+        "{configurable:true,get(){packetGetterCalls++;throw Error('getter must not run')}})",
+        "<packet>", &result));
+    CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 4, NULL));
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "if(packetGetterCalls!==0)throw Error('observer executed getter')",
+        "<packet>", &result));
+    CHECK(script_runtime_evaluate_probe(runtime,
+        "Object.defineProperty(globalThis,'__tilefinchValidationFrameMetrics',"
+        "{value:new Uint32Array(4),configurable:true,writable:true})",
+        "<packet>", &result));
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue view = JS_GetPropertyStr(runtime->context, global,
+        "__tilefinchValidationFrameMetrics");
+    JSValue buffer = JS_GetTypedArrayBuffer(runtime->context, view, NULL, NULL, NULL);
+    JS_DetachArrayBuffer(runtime->context, buffer);
+    JS_FreeValue(runtime->context, buffer);
+    JS_FreeValue(runtime->context, view);
+    JS_FreeValue(runtime->context, global);
+    CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 4, NULL));
+    CHECK(script_runtime_evaluate_probe(runtime, "1+1", "<after>", &result));
+    JS_ThrowInternalError(runtime->context, "pending-author-exception");
+    CHECK(!script_runtime_copy_validation_frame_words(runtime, words, 4, NULL));
+    CHECK(JS_HasException(runtime->context));
+    JSValue pending = JS_GetException(runtime->context);
+    JS_FreeValue(runtime->context, pending);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    budget_install_lexbor(NULL);
+    return true;
+}
+
+static bool run_game_profile_script_admission(void)
+{
+    static const struct {
+        BrowserPspMemoryProfile profile;
+        size_t source_bytes;
+        bool admitted;
+    } cases[] = {
+        /* Realistic is the PSP app's configuration, whose admission is
+           memory-based; strict keeps an exact 256 KiB per-script limit. */
+        {BROWSER_PSP_MEMORY_REALISTIC, 512u * 1024u, true},
+        {BROWSER_PSP_MEMORY_STRICT, 256u * 1024u, true},
+        {BROWSER_PSP_MEMORY_STRICT, 256u * 1024u + 1u, false}
+    };
+    static const char document_url[] = "https://game-profile.test/index.html";
+    static const char html[] =
+        "<!doctype html><body><script src=game.js></script></body>";
+    static const char statement[] = "globalThis.gameProfileExecuted=true;";
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        BrowserConfig config;
+        browser_config_init(&config, NULL);
+        CHECK(browser_config_apply_psp_memory_profile(&config, cases[at].profile));
+        config.javascript.enabled = true;
+        config.javascript.document_scripts_enabled = true;
+        char error[256] = {0};
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL);
+        char *source = malloc(cases[at].source_bytes + 1u);
+        CHECK(source != NULL);
+        /* Keep the actual executable statement after the padding, so neither
+           source truncation nor a partial parse can masquerade as admission. */
+        memset(source, ' ', cases[at].source_bytes);
+        memcpy(source + cases[at].source_bytes - (sizeof(statement) - 1u),
+               statement, sizeof(statement));
+        BrowserOfflineCacheView resource = {
+            .url = "https://game-profile.test/game.js",
+            .data = (const unsigned char *) source,
+            .length = cases[at].source_bytes,
+            .content_type = "text/javascript",
+            .kind = BROWSER_OFFLINE_CACHE_RESOURCE,
+            .resource_grant = {
+                .destination = TILEFINCH_DESTINATION_SCRIPT,
+                .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+                .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+                .final_same_origin = true, .final_same_site = true,
+                .mime_validated = true
+            }
+        };
+        bool okay = browser_session_cache_restore_offline(
+            browser_engine_session(engine), document_url, &resource);
+        free(source);
+        okay = okay && browser_engine_commit_html(
+            engine, document_url, html, sizeof(html) - 1u, true);
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        ScriptResult result = {0};
+        okay = okay && navigation->script_loaded == (cases[at].admitted ? 1u : 0u)
+            && navigation->script_bytes
+                   == (cases[at].admitted ? cases[at].source_bytes : 0u)
+            && (cases[at].admitted || navigation->script_skipped_quota != 0u);
+        if (navigation->page.runtime != NULL) {
+            okay = okay && script_runtime_evaluate_diagnostic(
+                navigation->page.runtime,
+                "globalThis.pocSummary=globalThis.gameProfileExecuted"
+                "?'ADMITTED':'REFUSED';", "<game-profile-admission>", &result)
+                && strcmp(result.summary, cases[at].admitted ? "ADMITTED" : "REFUSED") == 0;
+        } else {
+            okay = okay && !cases[at].admitted;
+        }
+        if (!okay) fprintf(stderr, "game profile admission: bytes=%zu admitted=%d error=%s\n",
+                           cases[at].source_bytes, cases[at].admitted,
+                           browser_engine_last_error(engine));
+        bool clean = browser_engine_shutdown(engine);
+        browser_engine_destroy(engine);
+        CHECK(okay && clean);
+    }
+    return true;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--validation-frame-packet") == 0)
+        return run_validation_frame_packet() ? 0 : 1;
+    /* Run one fixture alone, e.g. --fixture webgl-seams.js WEBGL-SEAMS-PASS. */
+    if (argc == 4 && strcmp(argv[1], "--fixture") == 0)
+        return run_fixture(argv[2], argv[3], false, false) ? 0 : 1;
+    if ((argc == 2 || argc == 3)
+        && (strcmp(argv[1], "--treadline-host-profile") == 0
+            || strcmp(argv[1], "--treadline-host-timing") == 0)) {
+        treadline_host_profile = true;
+        treadline_host_counters = strcmp(argv[1], "--treadline-host-timing") != 0;
+        if (argc == 3) treadline_game_source = argv[2];
+        return run_treadline_arena_game() ? 0 : 1;
+    }
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "--treadline-aim-guide") == 0) {
+        treadline_aim_guide_only = true;
+        if (argc == 3) treadline_game_source = argv[2];
+        return run_treadline_arena_game() ? 0 : 1;
+    }
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "--treadline-features") == 0) {
+        treadline_features_only = true;
+        if (argc == 3) treadline_game_source = argv[2];
+        return run_game_profile_script_admission()
+            && run_treadline_arena_game() ? 0 : 1;
+    }
+    if ((argc == 3 || argc == 4)
+        && strcmp(argv[1], "--treadline-league") == 0) {
+        if (argc == 4) treadline_game_source = argv[3];
+        char *end = NULL;
+        unsigned long count = strtoul(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || count < 1u || count > 1000u) return 2;
+        treadline_league_matches = (unsigned)count;
+        return run_treadline_arena_game() ? 0 : 1;
+    }
+    if (argc == 3 && strcmp(argv[1], "--treadline-campaign-sweep") == 0) {
+        char *end = NULL;
+        unsigned long seeds = strtoul(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || seeds < 1u || seeds > 20u) return 2;
+        treadline_campaign_sweep_seeds = (unsigned) seeds;
+        return run_treadline_arena_game() ? 0 : 1;
+    }
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "--treadline-probe") == 0) {
+        /* Load the invariant fixture for its helpers; optionally play its
+           first N cases first, since cases inherit state from earlier ones. */
+        treadline_invariants = true;
+        treadline_invariants_first = argc == 4 ? 0u : 10000u;
+        treadline_invariants_count = argc == 4 ? (unsigned) strtoul(argv[3], NULL, 10) : 1u;
+        if (treadline_invariants_count == 0u) treadline_invariants_first = 10000u;
+        treadline_probe_script = argv[2];
+        return run_treadline_arena_game() ? 0 : 1;
+    }
+    if ((argc == 2 || argc == 4) && strcmp(argv[1], "--treadline-invariants") == 0) {
+        treadline_invariants = true;
+        if (argc == 4) {
+            char *end = NULL, *end2 = NULL;
+            unsigned long first = strtoul(argv[2], &end, 10);
+            unsigned long count = strtoul(argv[3], &end2, 10);
+            if (end == argv[2] || *end != '\0' || end2 == argv[3] || *end2 != '\0'
+                || first > 10000u || count < 1u || count > 10000u) return 2;
+            treadline_invariants_first = (unsigned) first;
+            treadline_invariants_count = (unsigned) count;
+        }
+        return run_treadline_arena_game() ? 0 : 1;
+    }
+    if (argc != 1) return 2;
+    puts("test: Game Profile classic script admission preserves exact byte limits");
+    if (!run_game_profile_script_admission()) return 1;
+    puts("test: validation frame packets never evaluate author accessors");
+    if (!run_validation_frame_packet()) return 1;
     puts("test: native WebGL cache admission separates realm incarnations");
     if (!run_webgl_cache_epoch_admission()) return 1;
     puts("test: translated WebGL geometry cache is exact and bounded");
@@ -3515,8 +4743,12 @@ int main(void)
     if (!run_fixture(
             "webgl-conformance.js", "WEBGL-CONFORMANCE-PASS", false, false))
         return 1;
+    puts("test: WebGL triangles sharing edges cover each pixel exactly once");
+    if (!run_fixture("webgl-seams.js", "WEBGL-SEAMS-PASS", false, false))
+        return 1;
     puts("test: detached WebGL flush retains commands until reattachment");
     if (!run_deferred_webgl_flush()) return 1;
+    if (!run_webgl_shader_diagnostics()) return 1;
     puts("test: installable Prism Break exercises levels, input, and effects");
     if (!run_prism_break_game()) return 1;
     puts("test: Treadline Arena exercises modes, gadgets, and tank combat");

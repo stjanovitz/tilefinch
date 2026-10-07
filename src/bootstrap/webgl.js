@@ -59,6 +59,7 @@
       contexts: 0,
       lostContexts: 0,
       shaderRefusals: 0,
+      shaderWarnings: 0,
       drawCalls: 0,
       instancedDrawCalls: 0,
       instances: 0,
@@ -243,8 +244,11 @@
       if (current !== output) output.set(current);
       return output;
     },
+    /* Comments become spaces of the same length, so offsets into the
+       stripped text still give the author's line numbers. */
     shaderText = (source) => String(source).replace(
-      /\/\*[\s\S]*?\*\/|\/\/[^\n\r]*/g, " ",
+      /\/\*[\s\S]*?\*\/|\/\/[^\n\r]*/g,
+      (comment) => comment.replace(/[^\n]/g, " "),
     ),
     declarations = (source, keyword) => {
       const found = [], expression = new RegExp(
@@ -275,6 +279,268 @@
         vectors += consumed;
       }
       return vectors;
+    },
+    /* Link-time shader check. translateProgram picks the GE inputs from
+       declarations and names; scanShader and inspectProgram read what the
+       shader computes, so logic the GE cannot run is refused or reported
+       instead of silently drawing the vertex colour. Both run once per link,
+       never on the draw path, and every scan is bounded by SCAN_TOKENS. */
+    SCAN_TOKENS = 256,
+    scanShader = (text, perData) => {
+      text = text.replace(/^[ \t]*#.*$/gm, "");
+      const tokens = [], at = [], pattern =
+        /[A-Za-z_]\w*|(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|&&|\|\||[-+*\/<>=!]=|\S/g,
+        tainted = new Set(perData), functions = new Set(),
+        assigned = new Map(), flow = [];
+      for (let match; (match = pattern.exec(text));) {
+        tokens.push(match[0]); at.push(match.index);
+      }
+      for (const match of text.matchAll(
+        /\b(?:void|float|int|bool|[bi]?vec[234]|mat[234])\s+(\w+)\s*\(/g))
+        if (match[1] !== "main") functions.add(match[1]);
+      /* Helper results are treated as per-pixel data: a helper may read a
+         varying without receiving it as an argument. */
+      const perToken = (token) => tainted.has(token) || functions.has(token)
+        || /^texture/.test(token);
+      let depth = 0;
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token === "{") depth++;
+        else if (token === "}") depth--;
+        else if (/^(for|while|do|discard|dFdx|dFdy|fwidth)$/.test(token))
+          flow.push({ keyword: token, index: at[i], refused: true });
+        else if (token === "if" || token === "?") {
+          let from = i + 1, to = from, open = 0;
+          if (token === "if") {
+            for (; to < tokens.length && to - i < SCAN_TOKENS; to++)
+              if (tokens[to] === "(") open++;
+              else if (tokens[to] === ")" && --open === 0) break;
+          } else {
+            for (to = from = i; from > 0 && i - from < SCAN_TOKENS; from--) {
+              const previous = tokens[from - 1];
+              if (previous === ")") open++;
+              else if (previous === "(") { if (!open) break; open--; }
+              else if (!open && /^([;{},=]|return|[-+*\/]=)$/.test(previous))
+                break;
+            }
+          }
+          const condition = tokens.slice(from, to);
+          flow.push({ keyword: token === "?" ? "?:" : "if", index: at[i],
+            perData: condition.length >= SCAN_TOKENS - 1
+              || condition.some(perToken) });
+        } else if (functions.has(token) && !depth && tokens[i + 1] === "(") {
+          for (let j = i + 2; j < tokens.length && tokens[j] !== ")"
+              && j - i < SCAN_TOKENS; j++)
+            if (/^[,)[]$/.test(tokens[j + 1])) tainted.add(tokens[j]);
+        } else if (/^[A-Za-z_]/.test(token) && tokens[i - 1] !== ".") {
+          let j = i + 1, partial = false;
+          if (tokens[j] === ".") { j += 2; partial = true; }
+          else if (tokens[j] === "[") {
+            while (j < tokens.length && tokens[j] !== "]" && j - i < SCAN_TOKENS)
+              j++;
+            j++; partial = true;
+          }
+          if (!/^[-+*\/]?=$/.test(tokens[j] || "")) continue;
+          let end = j + 1;
+          for (let open = 0; end < tokens.length && end - j < SCAN_TOKENS; end++) {
+            const next = tokens[end];
+            if (next === "(") open++;
+            else if (next === ")") open--;
+            else if (!open && (next === ";" || next === ",")) break;
+          }
+          const rhs = tokens.slice(j + 1, end),
+            truncated = end - j >= SCAN_TOKENS;
+          if (!assigned.has(token)) assigned.set(token, []);
+          assigned.get(token).push({ index: at[i], rhs,
+            partial: partial || truncated || tokens[j] !== "=" });
+          if (truncated || rhs.some(perToken)) tainted.add(token);
+        }
+      }
+      return { text, tokens, at, flow, assigned,
+        line: (index) => text.slice(0, index).split("\n").length };
+    },
+    /* Splits an expression at top-level `*`, unwrapping whole-factor
+       parentheses, so `(uA * uB) * p` and `uA * uB * p` read alike. */
+    shaderFactors = (tokens, depth = 0) => {
+      const factors = [];
+      let open = 0, start = 0;
+      for (let i = 0; i <= tokens.length; i++) {
+        const token = tokens[i];
+        if (token === "(") open++;
+        else if (token === ")") open--;
+        else if (i === tokens.length || (token === "*" && !open)) {
+          const factor = tokens.slice(start, i);
+          let closes = 0, whole = factor[0] === "(" && depth < 4;
+          for (let k = 0; whole && k < factor.length; k++) {
+            closes += factor[k] === "(" ? 1 : factor[k] === ")" ? -1 : 0;
+            if (!closes && k < factor.length - 1) whole = false;
+          }
+          factors.push(...(whole
+            ? shaderFactors(factor.slice(1, -1), depth + 1) : [factor]));
+          start = i + 1;
+        }
+      }
+      return factors;
+    },
+    inspectProgram = (vs, fs, t) => {
+      const errors = [], warnings = [],
+        varyings = declarations(fs, "varying").entries.map((e) => e.name),
+        samplers = t.uniforms.filter((e) => e.type === "sampler2D")
+          .map((e) => e.name),
+        vertex = scanShader(vs, t.attributes.map((e) => e.name)),
+        fragment = scanShader(fs,
+          [...varyings, "gl_FragCoord", "gl_FrontFacing", "gl_PointCoord"]),
+        report = (list, scan, index, text) => list.push(
+          (list === errors ? "ERROR: " : "WARNING: ")
+          + (scan === vertex ? "vertex" : "fragment") + " shader line "
+          + scan.line(index) + ": " + text),
+        quote = (tokens) => {
+          const text = tokens.join("");
+          return "'" + (text.length > 48 ? text.slice(0, 45) + "..." : text) + "'";
+        },
+        number = (token) => /^\.?\d/.test(token || "") ? Number(token) : NaN,
+        sampled = new Set();
+      let constant = null, exact = true, sampleIndex = 0;
+      for (const scan of [vertex, fragment]) {
+        const unit = scan === vertex ? "vertex" : "pixel";
+        for (const entry of scan.flow) {
+          if (entry.refused)
+            report(errors, scan, entry.index,
+              `'${entry.keyword}' is not available on the PSP GE`);
+          else if (entry.perData)
+            report(errors, scan, entry.index, `'${entry.keyword}' depends on `
+              + `per-${unit} data; the PSP GE cannot branch per ${unit}`);
+          else {
+            report(warnings, scan, entry.index, `'${entry.keyword}' on `
+              + "uniforms is not evaluated on the PSP; its branches are "
+              + "ignored");
+            exact = false;
+          }
+        }
+        scan.tokens.forEach((token, i) => {
+          if (!/^texture/.test(token) || scan.tokens[i + 1] !== "(") return;
+          if (scan === vertex || token !== "texture2D")
+            report(errors, scan, scan.at[i], `'${token}' is not available; `
+              + "only texture2D in the fragment shader is");
+          else {
+            sampled.add(scan.tokens[i + 2]);
+            sampleIndex = scan.at[i];
+          }
+        });
+      }
+      if (sampled.size > 1)
+        report(errors, fragment, sampleIndex,
+          `${sampled.size} textures are sampled; MAX_TEXTURE_IMAGE_UNITS is 1`);
+      if (errors.length) return { errors, warnings };
+
+      /* The GE colour is texture * vertex colour * instance colour * one
+         colour uniform or constant. Every factor of gl_FragColor, and of the
+         varyings it reads, must be one of those. The factors also choose
+         the inputs: names only guess (aVertexPosition contains "tex"). */
+      const output = fragment.assigned.get("gl_FragColor") || [],
+        attribute = (name) => t.attributes.find((entry) =>
+          entry.name === name && entry.type !== "mat4"),
+        colorUniform = (name) => t.uniforms.find((entry) =>
+          entry.name === name && entry.type === "vec4"),
+        colors = new Set(), uniformColors = new Set(), varyingUses = [],
+        unapplied = (scan, index, factor, target) => {
+          report(warnings, scan, index,
+            `${quote(factor)} is not applied to ${target} on the PSP`);
+          exact = false;
+        },
+        readFragment = (tokens, index, depth) => {
+          for (const factor of shaderFactors(tokens)) {
+            const [name] = factor, single = factor.length === 1,
+              local = single && fragment.assigned.get(name);
+            if (single && varyings.includes(name))
+              varyingUses.push({ name, index });
+            else if (single && colorUniform(name)) uniformColors.add(name);
+            else if (local?.length === 1 && !local[0].partial && depth < 4)
+              readFragment(local[0].rhs, local[0].index, depth + 1);
+            else if (name === "texture2D" && factor.length === 6
+                && samplers.includes(factor[2]) && factor[3] === ","
+                && varyings.includes(factor[4]))
+              varyingUses.push({ name: factor[4], index, texture: true });
+            else if (name === "vec4" && !constant
+                && (factor.length === 4 || factor.length === 10)
+                && factor.every((token, k) => k < 2 || k === factor.length - 1
+                  || (k % 2 ? token === "," : number(token) >= 0))) {
+              const values = factor.filter((_, k) => k > 1 && !(k % 2))
+                .map((token) => Math.min(1, number(token)));
+              constant = new Float32Array(values.length === 1
+                ? [values[0], values[0], values[0], values[0]] : values);
+            } else unapplied(fragment, index, factor, "gl_FragColor");
+          }
+        };
+      let instanceRead = false, textureRead = false;
+      if (output.length !== 1 || output[0].partial) {
+        report(warnings, fragment, output[0]?.index ?? 0, "gl_FragColor is "
+          + "written in parts or more than once; only one whole write is "
+          + "translated");
+        exact = false;
+      } else readFragment(output[0].rhs, output[0].index, 0);
+      for (const use of varyingUses) {
+        const writes = vertex.assigned.get(use.name),
+          write = writes?.length === 1 && !writes[0].partial && writes[0];
+        if (!write) {
+          report(warnings, writes ? vertex : fragment,
+            writes?.[0].index ?? use.index, `varying ${use.name} needs one `
+              + "whole write in the vertex shader");
+          exact = false;
+        } else if (use.texture) {
+          textureRead = true;
+          const entry = attribute(write.rhs.join(""));
+          if (entry) t.texcoord = entry;
+          else unapplied(vertex, write.index, write.rhs, "texture coordinates");
+        } else for (const factor of shaderFactors(write.rhs)) {
+          const name = factor.join(""), entry = attribute(name);
+          if (entry && entry === t.instanceColor) instanceRead = true;
+          else if (entry) colors.add(entry);
+          else if (colorUniform(name)) uniformColors.add(name);
+          else unapplied(vertex, write.index, factor, `varying ${use.name}`);
+        }
+      }
+      if (colors.size > 1 || uniformColors.size + !!constant > 1) {
+        report(warnings, fragment, output[0].index, "the PSP applies one "
+          + "colour attribute and one colour uniform or constant; the rest "
+          + "are not applied");
+        exact = false;
+      }
+      if (colors.size) t.color = [...colors][0];
+      if (uniformColors.size)
+        t.uniformColor = colorUniform([...uniformColors][0]);
+      /* A fully recognised colour drops the inputs it never reads. */
+      if (exact) {
+        if (!colors.size) t.color = null;
+        if (!instanceRead) t.instanceColor = null;
+        if (!uniformColors.size) t.uniformColor = null;
+        t.usesTexture = textureRead;
+      }
+      t.constantColor = t.uniformColor ? null : constant;
+
+      /* gl_Position must be a matrix chain ending in the position attribute,
+         vec4(position, 0, 1), or the documented instance-transform form. */
+      const position = vertex.assigned.get("gl_Position") || [],
+        p = t.position.name, m = t.instanceTransform?.name;
+      if (position.length !== 1 || position[0].partial)
+        report(warnings, vertex, position[0]?.index ?? 0, "gl_Position is "
+          + "written in parts or more than once; only one whole write is "
+          + "translated");
+      else for (const factor of shaderFactors(position[0].rhs)) {
+        const name = factor.join(""), close = factor.lastIndexOf(","),
+          inner = factor.slice(2, factor.indexOf(",")).join(""),
+          tail = factor.slice(factor.indexOf(",") + 1, -1)
+            .filter((token) => token !== ",").map(number);
+        if (t.matrices.some((entry) => entry.name === name)
+            || name === t.instanceMatrix?.name || name === p
+            || (factor[0] === "vec4" && close > 0
+              && (inner === p || (m && inner === `${p}*${m}.w+${m}.xyz`))
+              && tail.every((value, k) => value === (k < tail.length - 1
+                ? 0 : 1)))) continue;
+        report(warnings, vertex, position[0].index, quote(factor)
+          + " is not applied to gl_Position on the PSP");
+      }
+      return { errors, warnings };
     },
     glTypeFor = (name) => ({
       float: constants.FLOAT, vec2: constants.FLOAT_VEC2,
@@ -517,14 +783,15 @@
         : role === "color" ? /colou?r|tint/i : /tex|uv/i;
       const candidates = attributes.filter((entry) => entry.type !== "mat4"
         && pattern.test(entry.name));
-      if (candidates.length) return candidates[0];
-      if (role === "position") {
-        const expression = /gl_Position\s*=([^;]+)/.exec(source)?.[1] || "";
-        return attributes.find((entry) => entry.type !== "mat4" &&
-          new RegExp("\\b" + entry.name + "\\b").test(expression))
-          || attributes.find((entry) => entry.type !== "mat4") || null;
-      }
-      return null;
+      if (role !== "position") return candidates[0] || null;
+      /* An attribute gl_Position actually reads beats a name match:
+         "aTexCoord" matches /coord/ but is not the position. */
+      const expression = /gl_Position\s*=([^;]+)/.exec(source)?.[1] || "",
+        read = attributes.filter((entry) => entry.type !== "mat4" &&
+          new RegExp("\\b" + entry.name + "\\b").test(expression));
+      return read.find((entry) => candidates.includes(entry)) || read[0]
+        || candidates[0]
+        || attributes.find((entry) => entry.type !== "mat4") || null;
     },
     translateProgram = (program) => {
       const vertex = program._shaders.find((shader) =>
@@ -588,14 +855,23 @@
         return { error: "Shader does not expose a fixed-function position/color output" };
       if (matrices.length > 4)
         return { error: "Position transform exceeds the four-matrix PSP limit" };
-      if (/\b(discard|dFdx|dFdy|fwidth)\b/.test(fs)
-          || /\b(for|while|do)\s*\(/.test(vs + "\n" + fs))
-        return { error: "Dynamic shader control flow is not available on the PSP GE" };
-      if (usesTexture && (!sampler || !texcoord))
+      const translation = { attributes, uniforms, position, color, texcoord,
+          instanceMatrix, instanceColor, instanceTransform, matrices,
+          sampler, uniformColor, usesTexture },
+        findings = inspectProgram(vs, fs, translation);
+      if (findings.errors.length) return { error: findings.errors.join("\n") };
+      if (translation.usesTexture && (!sampler || !translation.texcoord))
         return { error: "Texture shaders require a sampler and texture-coordinate attribute" };
-      return { attributes, uniforms, position, color, texcoord,
-        instanceMatrix, instanceColor, instanceTransform, matrices,
-        sampler, uniformColor, usesTexture };
+      translation.warnings = findings.warnings;
+      return translation;
+    },
+    /* A refused or approximated program is reported on the console once,
+       so an author who never reads the info log still sees it. */
+    reportProgram = (program) => {
+      if (!program._log || program._reported) return;
+      program._reported = true;
+      globalThis.console?.warn?.(
+        "WebGL program " + program._id + ": " + program._log);
     };
 
   class WebGLRenderingContext {
@@ -2163,7 +2439,7 @@
       const translation = translateProgram(program);
       if (translation.error) {
         program._linked = false; program._log = translation.error;
-        diagnostics.shaderRefusals++; return;
+        diagnostics.shaderRefusals++; reportProgram(program); return;
       }
       const used = new Set();
       program._attributes = translation.attributes.map((entry, natural) => {
@@ -2184,7 +2460,7 @@
       if (program._attributes.some((entry) => entry.location < 0)) {
         program._linked = false;
         program._log = "Attribute locations exceed the PSP WebGL limits";
-        diagnostics.shaderRefusals++;
+        diagnostics.shaderRefusals++; reportProgram(program);
         return;
       }
       program._uniforms = translation.uniforms;
@@ -2212,7 +2488,9 @@
         ? program._attributes.find((entry) =>
           entry.name === translation.instanceTransform.name)?.location ?? -1
         : -1;
-      program._translation = translation; program._linked = true; program._log = "";
+      program._translation = translation; program._linked = true;
+      program._log = translation.warnings.join("\n");
+      if (program._log) { diagnostics.shaderWarnings++; reportProgram(program); }
       program._linkRevision++;
       program._matrixRevision = 1;
       program._combinedMatrixRevision = 0;
@@ -2682,10 +2960,13 @@
           || !Number.isFinite(b) || !Number.isFinite(a)) {
         this._setError(constants.INVALID_VALUE); return;
       }
-      r = Math.max(0, Math.min(1, r));
-      g = Math.max(0, Math.min(1, g));
-      b = Math.max(0, Math.min(1, b));
-      a = Math.max(0, Math.min(1, a));
+      /* Compare in the stored Float32 precision: a double such as .012 is
+         never equal to its float, so a game re-setting an unchanged color
+         every frame would otherwise invalidate its retained frame list. */
+      r = Math.fround(Math.max(0, Math.min(1, r)));
+      g = Math.fround(Math.max(0, Math.min(1, g)));
+      b = Math.fround(Math.max(0, Math.min(1, b)));
+      a = Math.fround(Math.max(0, Math.min(1, a)));
       if (this._clearColor[0] === r && this._clearColor[1] === g
           && this._clearColor[2] === b && this._clearColor[3] === a) return;
       this._clearColor[0] = r; this._clearColor[1] = g;
@@ -3030,7 +3311,7 @@
           instanceTransform, maximumInstanceCount: instanceCount,
           uniformColorValue: translation.uniformColor
             ? program._uniformValues.get(translation.uniformColor.name)
-            : DEFAULT_UNIFORM_COLOR,
+            : translation.constantColor || DEFAULT_UNIFORM_COLOR,
           commandTemplateU32: null,
           commandTemplateI32: null,
           commandTemplateRevision: 0,

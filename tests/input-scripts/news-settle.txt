@@ -1,0 +1,16 @@
+# Load a large news page, capture the top and two page-downs, then let
+# post-load work (late scripts, web fonts, deferred images) settle so its
+# relayouts are measured too.
+wait-live 60
+wait-page 60
+mark-page top
+tap-page rtrigger
+wait-page 45
+mark-page p1
+tap-page rtrigger
+wait-page 45
+mark-page p2
+wait-live 900
+wait-page 30
+mark-page settled
+end

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep private development journals out of the public source tree."""
+"""Keep private investigations and development journals out of public sources."""
 
 from pathlib import Path
 import subprocess
@@ -10,6 +10,7 @@ PRIVATE_EXACT_PATHS = {
     "docs/engineering/BROWSING_JOURNEYS.md",
 }
 IGNORE_RULES = {
+    "/.private-investigations/",
     "/docs/engineering/BROWSING_JOURNEYS.md",
     "/docs/engineering/RELEASE_*_CHECKS.md",
 }
@@ -17,7 +18,8 @@ IGNORE_RULES = {
 
 def tracked_paths(root: Path) -> list[str]:
     result = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--", "docs/engineering"],
+        ["git", "-C", str(root), "ls-files", "-z", "--", "docs/engineering",
+         ".private-investigations"],
         check=True,
         capture_output=True,
     )
@@ -47,11 +49,18 @@ def main() -> int:
             str(path.relative_to(root))
             for path in (root / "docs" / "engineering").glob("*.md")
         ]
+        tracked.extend(
+            str(path.relative_to(root))
+            for path in (root / ".private-investigations").rglob("*")
+            if path.is_file()
+        )
     rejected = []
     for path in tracked:
-        private = path in PRIVATE_EXACT_PATHS or (
-            path.startswith("docs/engineering/RELEASE_")
-            and path.endswith("_CHECKS.md")
+        private = (
+            path.startswith(".private-investigations/")
+            or path in PRIVATE_EXACT_PATHS
+            or (path.startswith("docs/engineering/RELEASE_")
+                and path.endswith("_CHECKS.md"))
         )
         # A deletion in the working tree describes the prospective commit,
         # even before it is staged. Do not mistake its old index entry for a
@@ -59,12 +68,12 @@ def main() -> int:
         if private and (root / path).exists():
             rejected.append(path)
     if rejected:
-        print("public-tree hygiene: private development logs are tracked:",
+        print("public-tree hygiene: private files are tracked:",
               file=sys.stderr)
         for path in sorted(rejected):
             print(f"  {path}", file=sys.stderr)
         return 1
-    print("PASS: public tree contains no private development logs")
+    print("PASS: public tree contains no private investigation files or logs")
     return 0
 
 

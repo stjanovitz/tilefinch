@@ -90,6 +90,39 @@ static size_t media_unknown_feature_count(const char *query)
     return unknown;
 }
 
+/* A media feature's length value. The query text runs on past it, so a
+   math function (calc, min, max, clamp) is handed to the length parser as
+   its balanced extent alone; MDN's layout breakpoints are written as
+   `(width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))`. Relative units
+   use the initial font size, as media queries require. */
+static bool media_math_function_at(const char *value, size_t length,
+                                   size_t *name_length)
+{
+    size_t name = 0;
+    while (name < length && isalpha((unsigned char) value[name])) name++;
+    if (name >= length || value[name] != '(') return false;
+    *name_length = name;
+    return (name == 4 && strncmp(value, "calc", 4) == 0)
+        || (name == 3 && (strncmp(value, "min", 3) == 0
+                          || strncmp(value, "max", 3) == 0))
+        || (name == 5 && strncmp(value, "clamp", 5) == 0);
+}
+
+static int media_length_value(const Stylesheet *sheet, const char *value,
+                              size_t length, int fallback)
+{
+    size_t name = 0;
+    if (value == NULL || !media_math_function_at(value, length, &name))
+        return style_parse_length(sheet, value, length, fallback, NULL);
+    int depth = 0;
+    for (size_t i = name; i < length && i < 256u; i++) {
+        if (value[i] == '(') depth++;
+        else if (value[i] == ')' && --depth == 0)
+            return style_parse_length(sheet, value, i + 1u, fallback, NULL);
+    }
+    return fallback;
+}
+
 static bool media_colon_ranges_match(const Stylesheet *sheet,
                                      const char *query,
                                      const char *feature,
@@ -101,8 +134,8 @@ static bool media_colon_ranges_match(const Stylesheet *sheet,
          match = strstr(match + feature_length, feature)) {
         const char *value = match + feature_length;
         int fallback = minimum ? 0 : 32767;
-        int threshold = style_parse_length(NULL, value, strlen(value), fallback,
-                                     NULL);
+        int threshold = media_length_value(NULL, value, strlen(value),
+                                           fallback);
         if ((minimum && actual < threshold)
             || (!minimum && actual > threshold)) return false;
     }
@@ -121,8 +154,8 @@ static bool media_colon_exact_match(const Stylesheet *sheet,
             continue;
         }
         const char *value = match + feature_length;
-        int threshold = style_parse_length(sheet, value, strlen(value),
-                                           INT_MIN, NULL);
+        int threshold = media_length_value(sheet, value, strlen(value),
+                                           INT_MIN);
         if (threshold == INT_MIN || actual != threshold) return false;
     }
     return true;
@@ -164,6 +197,22 @@ static bool media_clause_matches(const Stylesheet *sheet,
             &((Stylesheet *) sheet)->diagnostic_unknown_media_features,
             unknown);
         return false;
+    }
+    /* A leading `not` negates the whole query (Media Queries 4: `not` before
+       a media type or a parenthesized condition). Without this MDN's
+       `@media not (width <= 769px)` desktop heading anchors matched on the
+       480 px handheld.  An unknown feature above already made the query
+       false, which `not` does not invert. */
+    if (strncmp(query, "not", 3) == 0
+        && (query[3] == '(' || strncmp(query + 3, "all", 3) == 0
+            || strncmp(query + 3, "screen", 6) == 0
+            || strncmp(query + 3, "print", 5) == 0)) {
+        size_t at = 0;
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        if (at + 3 <= length) {
+            return !media_clause_matches(sheet, text + at + 3,
+                                         length - at - 3);
+        }
     }
     /* Media types are evaluated before their feature tail.  The device is a
        screen/all environment, so the common responsive-image sentinel
@@ -209,8 +258,8 @@ static bool media_clause_matches(const Stylesheet *sheet,
                 const char *value = match + strlen(pattern);
                 if ((operation == 2 || operation == 3)
                     && *value == '=') continue;
-                int threshold = style_parse_length(sheet, value, strlen(value), 0,
-                                             NULL);
+                int threshold = media_length_value(sheet, value,
+                                                   strlen(value), 0);
                 range_recognized = true;
                 if ((operation == 0 && actual < threshold)
                     || (operation == 1 && actual > threshold)
@@ -227,16 +276,32 @@ static bool media_clause_matches(const Stylesheet *sheet,
                 if ((operation == 2 || operation == 3)
                     && match > query && match[-1] == '=') continue;
                 const char *start = match;
-                while (start > query) {
+                if (start > query && start[-1] == ')') {
+                    /* `calc(...) < width`: back over the balanced call. */
+                    int depth = 0;
+                    const char *at = start;
+                    while (at > query && (size_t) (match - at) < 256u) {
+                        at--;
+                        if (*at == ')') depth++;
+                        else if (*at == '(' && --depth == 0) break;
+                    }
+                    while (at > query && isalpha((unsigned char) at[-1]))
+                        at--;
+                    size_t name = 0;
+                    if (depth == 0
+                        && media_math_function_at(
+                               at, (size_t) (match - at), &name))
+                        start = at;
+                }
+                while (start == match && start > query) {
                     unsigned char character = (unsigned char) start[-1];
                     if (!(isalnum(character) || character == '.'
                           || character == '%' || character == '-')) break;
                     start--;
                 }
                 if (start == match) continue;
-                int threshold = style_parse_length(sheet, start,
-                                             (size_t) (match - start), 0,
-                                             NULL);
+                int threshold = media_length_value(
+                    sheet, start, (size_t) (match - start), 0);
                 range_recognized = true;
                 if ((operation == 0 && threshold < actual)
                     || (operation == 1 && threshold > actual)
@@ -286,6 +351,15 @@ static bool media_clause_matches(const Stylesheet *sheet,
 
 static bool media_matches(const Stylesheet *sheet, const char *text, size_t length)
 {
+    /* Media Queries 4, section 2.1: an empty media query list evaluates to
+       true. CSS-in-JS runtimes such as Stitches wrap whole theme blocks in
+       a bare `@media{...}`; refusing it dropped every custom property and
+       size those blocks carry. */
+    size_t content = 0;
+    while (content < length && isspace((unsigned char) text[content])) {
+        content++;
+    }
+    if (content == length) return true;
     for (size_t at = 0; at < length;) {
         size_t end = at;
         int parentheses = 0;
@@ -2049,7 +2123,7 @@ static bool supports_selector_pseudo(const char *name, size_t length)
         "last-child", "last-of-type", "link", "modal", "not", "nth-child",
         "nth-last-child", "nth-last-of-type", "nth-of-type", "only-child",
         "only-of-type", "open", "optional", "popover-open", "required",
-        "root", "visited", "where", "-moz-any", "-webkit-any",
+        "root", "visited", "where", "-moz-any", "-webkit-any", "host",
         "before", "after", "marker"
     };
     for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {

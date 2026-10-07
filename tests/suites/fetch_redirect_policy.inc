@@ -17,6 +17,31 @@ static bool test_redirect_callback_abort_classification(void)
     return true;
 }
 
+/* Fidelity symmetric exclusions: a host entry blocks that host and its
+   subdomains; a host/path-prefix entry blocks only that route. */
+static bool test_blocked_origin_routes(void)
+{
+    const char *entries[] = {
+        "mdnplay.dev", "developer.mozilla.org/pong/"
+    };
+    fetch_set_blocked_origins(entries, 2);
+    CHECK(fetch_origin_blocked("https://mdnplay.dev/x"));
+    CHECK(fetch_origin_blocked("https://e4bb.mdnplay.dev/runner.html?a=1"));
+    CHECK(!fetch_origin_blocked("https://notmdnplay.dev/"));
+    CHECK(fetch_origin_blocked("https://developer.mozilla.org/pong/get"));
+    CHECK(fetch_origin_blocked(
+        "https://developer.mozilla.org:443/pong/click?x=1"));
+    CHECK(!fetch_origin_blocked("https://developer.mozilla.org/pong"));
+    CHECK(!fetch_origin_blocked(
+        "https://developer.mozilla.org/en-US/docs/pong/get"));
+    CHECK(!fetch_origin_blocked("https://developer.mozilla.org/static/a.js"));
+    CHECK(!fetch_origin_blocked("https://example.org/pong/get"));
+    fetch_set_blocked_origins(NULL, 0);
+    CHECK(!fetch_origin_blocked("https://mdnplay.dev/x"));
+    CHECK(!fetch_origin_blocked("https://developer.mozilla.org/pong/get"));
+    return true;
+}
+
 static bool test_private_network_admission(Budget *budget, unsigned port)
 {
     char url[256];

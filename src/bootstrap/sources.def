@@ -61,6 +61,9 @@ BOOTSTRAP_SOURCE(browser_bootstrap_opfs, "opfs.js",
                  "<browser-opfs>", browser_bootstrap_opfs_bytecode)
 BOOTSTRAP_SOURCE(browser_bootstrap_traversal, "traversal.js",
                  "<browser-traversal>", browser_bootstrap_traversal_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_game_audio_slots, "game-audio-slots.js",
+                 "<browser-game-audio-slots>",
+                 browser_bootstrap_game_audio_slots_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,

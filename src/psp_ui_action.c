@@ -41,6 +41,10 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
             return "confirm-offline-app";
         case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return "cancel-offline-app";
+        case PSP_UI_ACTION_RECOMPILE_OFFLINE_APP:
+            return "recompile-offline-app";
+        case PSP_UI_ACTION_OPEN_OFFLINE_APP_ANYWAY:
+            return "open-offline-app-anyway";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "show-offline";
         case PSP_UI_ACTION_SHOW_DOWNLOADS: return "show-downloads";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "show-screenshots";
@@ -79,6 +83,9 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_RECOVERY_LOWER_QUALITY:
             return "recovery-lower-quality";
         case PSP_UI_ACTION_RECOVERY_RETURN: return "recovery-return";
+        case PSP_UI_ACTION_RECOVERY_BASIC: return "recovery-basic";
+        case PSP_UI_ACTION_RECOVERY_RELOAD_BASIC:
+            return "recovery-reload-basic";
         case PSP_UI_ACTION_SHOW_SITE_STORAGE: return "show-site-storage";
         case PSP_UI_ACTION_SITE_STORAGE_DELETE: return "site-storage-delete";
         case PSP_UI_ACTION_STORAGE_OFFER_SESSION:
@@ -87,6 +94,10 @@ const char *psp_ui_action_name(PspUiAction action)
             return "storage-offer-always";
         case PSP_UI_ACTION_STORAGE_OFFER_DECLINE:
             return "storage-offer-decline";
+        case PSP_UI_ACTION_HEAVY_RUN_SESSION: return "heavy-run-session";
+        case PSP_UI_ACTION_HEAVY_RUN_ALWAYS: return "heavy-run-always";
+        case PSP_UI_ACTION_HEAVY_CANCEL: return "heavy-cancel";
+        case PSP_UI_ACTION_HEAVY_STOP_SCRIPTS: return "heavy-stop-scripts";
         case PSP_UI_ACTION_EXIT: return "exit";
     }
     return "unknown";

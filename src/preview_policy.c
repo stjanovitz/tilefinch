@@ -50,11 +50,27 @@ PreviewDecision preview_policy_decide(const PreviewPolicy *policy,
     int base = input->base_limit_y > 0 ? input->base_limit_y : 1;
     int64_t viewport = input->viewport_height > 0 ? input->viewport_height : 0;
     PreviewDecision decision = {0};
+    bool empty_retry = false;
+    if (policy->empty_attempts != 0
+        && (policy->phase == PREVIEW_PHASE_NONE
+            || policy->phase == PREVIEW_PHASE_FIRST_SCREEN)) {
+        size_t elements = input->closed_content_elements
+                >= policy->empty_elements
+            ? input->closed_content_elements - policy->empty_elements : 0;
+        size_t bytes = input->parsed_bytes >= policy->empty_bytes
+            ? input->parsed_bytes - policy->empty_bytes : 0;
+        size_t byte_wait = policy->empty_bytes > PREVIEW_POLICY_REFRESH_BYTES
+            ? policy->empty_bytes : PREVIEW_POLICY_REFRESH_BYTES;
+        if (elements < policy->empty_wait_elements && bytes < byte_wait)
+            return preview_policy_none("empty");
+        empty_retry = true;
+    }
     switch (policy->phase) {
         case PREVIEW_PHASE_NONE:
             decision.action = PREVIEW_ACTION_FIRST;
             decision.limit_y = base;
-            decision.fresh = growth >= PREVIEW_POLICY_REFRESH_BYTES;
+            decision.fresh = empty_retry
+                || growth >= PREVIEW_POLICY_REFRESH_BYTES;
             break;
         case PREVIEW_PHASE_FIRST_SCREEN:
             if (growth < PREVIEW_POLICY_REFRESH_BYTES)
@@ -201,6 +217,27 @@ void preview_policy_abandon(PreviewPolicy *policy)
     if (policy == NULL) return;
     policy->building = false;
     policy->phase = PREVIEW_PHASE_ABANDONED;
+}
+
+void preview_policy_empty(PreviewPolicy *policy,
+                          const PreviewDecision *decision,
+                          size_t closed_content_elements, bool covered)
+{
+    if (policy == NULL) return;
+    policy->building = false;
+    if (decision == NULL || decision->action == PREVIEW_ACTION_EXTEND)
+        return;
+    policy->empty_wait_elements = covered
+        ? PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT
+        : policy->empty_attempts == 0
+        ? PREVIEW_POLICY_EMPTY_ELEMENTS
+        : (policy->empty_wait_elements
+                   <= PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT / 2u
+               ? policy->empty_wait_elements * 2u
+               : PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT);
+    if (policy->empty_attempts != UINT_MAX) policy->empty_attempts++;
+    policy->empty_elements = closed_content_elements;
+    policy->empty_bytes = policy->attempt_bytes;
 }
 
 bool preview_policy_awaiting_first(const PreviewPolicy *policy)

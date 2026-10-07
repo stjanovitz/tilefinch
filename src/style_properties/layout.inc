@@ -285,7 +285,7 @@ static bool style_property_grid_template_rows(
 
 static bool style_property_grid_template(const StylePropertyParse *parse)
 {
-    char resolved[384];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) {
         return true;
@@ -444,6 +444,11 @@ static bool style_property_grid_column(const StylePropertyParse *parse)
                    && style_parse_grid_line_or_name(
                           sheet, slash + 1, strlen(slash + 1),
                           &end_line, &end_span, &end_name));
+            /* A lone <custom-ident> also names the end edge (CSS Grid
+               8.4): `grid-column: title` is title / title. */
+            if (parsed && slash == NULL && start_name != 0) {
+                end_name = start_name;
+            }
             if (parsed) {
                 computed_style_set_grid_column_start(
                     style, start_line != 0
@@ -537,6 +542,9 @@ static bool style_property_grid_row(const StylePropertyParse *parse)
                && style_parse_grid_line_or_name(
                       parse->sheet, slash + 1, strlen(slash + 1),
                       &end_line, &end_span, &end_name));
+        if (parsed && slash == NULL && start_name != 0) {
+            end_name = start_name;
+        }
         if (parsed) {
             computed_style_set_grid_row_start(
                 parse->style,
@@ -1217,6 +1225,10 @@ static bool parse_sizing_dimension_length(
         sheet, resolved, strlen(resolved), value, percent);
 }
 
+/* min-/max-width and -height are not inherited, so the CSS-wide keywords
+   initial/unset/revert yield their initial value (auto, or none for the
+   maxima); MDN unsets its desktop sidebar's `max-height: calc(100vh - …)`
+   on narrow screens and the kept cap clipped its table of contents. */
 static bool style_property_min_width(const StylePropertyParse *parse)
 {
     Stylesheet *sheet = parse->sheet;
@@ -1224,7 +1236,7 @@ static bool style_property_min_width(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            if (style_length_is_auto(sheet, value, value_length)) {
+            if (style_noninherited_length_is_auto(sheet, value, value_length)) {
             style->min_width_auto = true;
             style->min_width = 0;
             style->min_width_percent = false;
@@ -1270,7 +1282,7 @@ static bool style_property_min_height(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            if (style_length_is_auto(sheet, value, value_length)) {
+            if (style_noninherited_length_is_auto(sheet, value, value_length)) {
             style->min_height = 0;
             style->min_height_percent = false;
             *mask |= S_MIN_HEIGHT;
@@ -1295,7 +1307,7 @@ static bool style_property_max_width(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            bool unbounded = style_length_is_auto(sheet, value, value_length)
+            bool unbounded = style_noninherited_length_is_auto(sheet, value, value_length)
                          || style_keyword(sheet, value, value_length,
                                           "none");
         bool min_content = style_keyword(
@@ -1346,7 +1358,7 @@ static bool style_property_max_height(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        bool unbounded = style_length_is_auto(sheet, value, value_length)
+        bool unbounded = style_noninherited_length_is_auto(sheet, value, value_length)
                          || style_keyword(sheet, value, value_length,
                                           "none");
         bool min_content = style_keyword(
@@ -1514,7 +1526,7 @@ static bool style_property_opacity(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[160];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             char *end = NULL;
@@ -1566,7 +1578,7 @@ static bool style_property_transform(const StylePropertyParse *parse)
 static bool style_property_fixed_containing_block(
     const StylePropertyParse *parse)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -2297,7 +2309,7 @@ static bool parse_counter_operations(
     Stylesheet *sheet, const char *value, size_t value_length,
     int default_value, uint8_t *operation_id)
 {
-    char resolved[160];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, value, value_length, resolved,
                              sizeof(resolved), 0)) return true;
     const char *at = resolved;

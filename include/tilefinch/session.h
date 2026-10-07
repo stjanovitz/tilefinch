@@ -362,23 +362,41 @@ typedef struct {
 } BrowserClientHintEntry;
 
 /*
- * In-memory QuickJS bytecode for page ES modules.
+ * In-memory QuickJS bytecode for page scripts, in three tables of the same
+ * shape: one for ES modules, one for classic external scripts, and one for
+ * lazy webpack bundle records (BROWSER_SCRIPT_BYTECODE_LAZY_BUNDLE, below).
  *
- * A module's compiled record is keyed by everything that shapes it: the
- * module-map name QuickJS bakes into the bytecode (the request URL), the
- * response URL, the network partition (top-level site) that fetched it, the
+ * A compiled record is keyed by everything that shapes it: the name QuickJS
+ * bakes into the bytecode (a module's module-map name, a classic script's
+ * file name), the request URL (classic) or response URL (module) it came
+ * from, the network partition (top-level site) that fetched it, the segment
+ * ordinal (classic ResourceLoader segments; 0 for a whole script), the
  * compile options, and the exact source (length plus SHA-256; the source is
  * not retained). A hit is therefore only ever the bytecode that compiling
  * those same bytes would produce, after every fetch, CSP, SRI, CORS and MIME
  * check has already admitted the bytes.
  *
- * Entries are RAM-only compiler artifacts (never persisted), charged to the
- * page Budget as SESSION memory under their own byte ceiling, and dropped
- * with the HTTP cache on clear or optional-memory reclaim. The table itself
- * is allocated on the first store, so a session that never caches a module
- * pays one pointer.
+ * Entries are compiler artifacts kept in RAM (the opt-in persistent tier,
+ * browser_session_script_disk_configure, copies them to disk), charged to the
+ * page Budget as SESSION memory under each table's own byte ceiling, and
+ * dropped with the HTTP cache on clear or optional-memory reclaim, or by
+ * the Budget reclaim hook before the page Budget refuses an allocation.
+ * They outlive the HTTP responses they were compiled from: the source
+ * digest, not the response entry, decides validity. Each table is
+ * allocated on its first store, so a session that never caches a script
+ * pays one pointer per table.
  */
-#define BROWSER_MODULE_BYTECODE_ENTRIES 128u
+#define BROWSER_SCRIPT_BYTECODE_ENTRIES 128u
+
+typedef enum {
+    BROWSER_SCRIPT_BYTECODE_MODULE = 0,
+    BROWSER_SCRIPT_BYTECODE_CLASSIC,
+    /* Not bytecode: lazy webpack bundle records (see
+       browser_session_lazy_bundle_record_queue). The same table shape,
+       keyed the same way, in a table of its own. */
+    BROWSER_SCRIPT_BYTECODE_LAZY_BUNDLE,
+    BROWSER_SCRIPT_BYTECODE_KINDS
+} BrowserScriptBytecodeKind;
 
 typedef struct {
     char *module_name;
@@ -390,21 +408,44 @@ typedef struct {
     size_t charged_bytes;
     size_t stamp;
     /* The document realm that last stored or restored this entry. Entries
-       the current realm has used are not evicted to admit another module
+       the current realm has used are not evicted to admit another script
        of the same load: that would trade a certain hit for a later miss. */
     uint32_t generation;
     uint32_t compile_flags;
+    uint32_t ordinal;
+    /* Unique per stored record (the table's serial clock): lets the
+       persistent tier's writer tell a slot it is writing from its reuse. */
+    uint32_t serial;
+    /* BrowserScriptDiskState: whether the persistent tier still has to
+       write this record. */
+    uint8_t disk_state;
     uint8_t source_digest[32];
-} BrowserModuleBytecodeEntry;
+} BrowserScriptBytecodeEntry;
 
-typedef struct BrowserModuleBytecodeCache {
-    BrowserModuleBytecodeEntry entries[BROWSER_MODULE_BYTECODE_ENTRIES];
+typedef enum {
+    /* Not for the persistent tier (it is off, read-only, or the record
+       could not be written). */
+    BROWSER_SCRIPT_DISK_NONE = 0,
+    /* Stored while the tier writes: idle work will write its pack. */
+    BROWSER_SCRIPT_DISK_DIRTY,
+    /* In a pack on disk (written or read this session). */
+    BROWSER_SCRIPT_DISK_CLEAN
+} BrowserScriptDiskState;
+
+typedef struct BrowserScriptBytecodeTable {
+    BrowserScriptBytecodeEntry entries[BROWSER_SCRIPT_BYTECODE_ENTRIES];
     size_t bytes;
     size_t clock;
-} BrowserModuleBytecodeCache;
+    uint32_t serial_clock;
+} BrowserScriptBytecodeTable;
 
 /* Lookup key. The digest is computed at most once per key, and only when a
-   stored entry matches every cheaper field. */
+   stored entry matches every cheaper field; a key whose digest is already
+   known (digest_ready) needs no source. For a classic script,
+   module_name is the compile name and response_url the request URL (the
+   HTTP cache key); `ordinal` is 1 + the ResourceLoader segment index, or 0.
+   One record exists per (module_name, response_url, partition_key,
+   ordinal): a store with other bytes or flags replaces it. */
 typedef struct {
     const char *module_name;
     const char *response_url;
@@ -412,9 +453,10 @@ typedef struct {
     const unsigned char *source;
     size_t source_length;
     uint32_t compile_flags;
+    uint32_t ordinal;
     uint8_t source_digest[32];
     bool digest_ready;
-} BrowserModuleBytecodeKey;
+} BrowserScriptBytecodeKey;
 
 typedef struct BrowserSession {
     Budget *budget;
@@ -475,54 +517,37 @@ typedef struct BrowserSession {
     struct BrowserCaptivePortalStash *captive_portal_stash;
     BudgetReservation accounting_reservation;
     size_t accounting_bytes;
+    /* NULL unless an installed app restored classic scripts as bytecode
+       only (browser_session_offline_deferred_*). */
+    struct BrowserOfflineDeferredScripts *offline_deferred;
+    /* On-demand source reads that failed (pack missing or corrupt). */
+    size_t offline_deferred_failures;
     /* NULL until the first module bytecode store. */
-    BrowserModuleBytecodeCache *module_bytecode;
+    BrowserScriptBytecodeTable *module_bytecode;
     size_t maximum_module_bytecode_bytes;
     uint32_t module_bytecode_generation;
     size_t module_bytecode_evictions;
-    /* Optional persistent tier (off unless a directory is configured; see
-       browser_session_module_bytecode_set_disk). */
-    char module_bytecode_disk_dir[160];
-    bool module_bytecode_disk_write;
-    bool module_bytecode_disk_dir_ready;
-    size_t module_bytecode_disk_written;
-    size_t module_bytecode_disk_hits;
-    size_t module_bytecode_disk_misses;
-    size_t module_bytecode_disk_writes;
-    size_t module_bytecode_disk_rejects;
-    /* Files removed: stale engine or temporary files, rejected entries,
-       cache clears. */
-    size_t module_bytecode_disk_removed;
-    /* The directory's own files, counted by the first write's scan (writes
-       only) and kept current after it. */
-    bool module_bytecode_disk_scanned;
-    void *module_bytecode_disk_scan_cursor; /* DIR*, owned until EOF/reset. */
-    size_t module_bytecode_disk_scan_visits;
-    bool module_bytecode_disk_scan_failed;
-    size_t module_bytecode_disk_total_bytes;
-    size_t module_bytecode_disk_file_count;
-    /* A failed or unfinished scan is retried by maintenance after
-       `retry_wait` idle calls; the wait doubles per consecutive failure. */
-    unsigned module_bytecode_disk_retry_wait;
-    unsigned module_bytecode_disk_retry_backoff;
-    /* Eviction (writes on): the oldest of this build's records the last
-       scan saw, newest first, while `evicting` trims the directory to its
-       low-water mark. */
-#define BROWSER_MODULE_BYTECODE_DISK_VICTIMS 16u
-    struct {
-        char name[32]; /* Hex part of the file name. */
-        int64_t mtime;
-    } module_bytecode_disk_victims[BROWSER_MODULE_BYTECODE_DISK_VICTIMS];
-    unsigned module_bytecode_disk_victim_count;
-    bool module_bytecode_disk_evicting;
-    /* Read-only tier after a cache clear: no further reads this session. */
-    bool module_bytecode_disk_suspended;
-    /* Read-only tier: keys whose file was refused, not read again. */
-    unsigned char module_bytecode_disk_refused[8][16];
-    unsigned module_bytecode_disk_refused_count;
-    /* Time spent reading files and verifying them. */
-    uint64_t module_bytecode_disk_read_ns;
-    uint64_t module_bytecode_disk_verify_ns;
+    /* Classic external scripts: the same table shape and rules, its own
+       ceiling (set by browser_session_init to
+       BROWSER_CLASSIC_BYTECODE_CACHE_BYTES, by the engine from its
+       config). Realms share module_bytecode_generation. */
+    BrowserScriptBytecodeTable *classic_bytecode;
+    size_t maximum_classic_bytecode_bytes;
+    size_t classic_bytecode_evictions;
+    /* Advances whenever compiled scripts are cleared (the cache clear,
+       teardown, or one site's data): a realm's deferred store or a bundle
+       record queued before then is dropped, not stored. */
+    uint32_t script_bytecode_epoch;
+    /* The optional persistent compiled-script tier (NULL unless a
+       directory is configured; see browser_session_script_disk_configure). */
+    struct BrowserScriptDisk *script_disk;
+    /* Lazy webpack bundle records (BROWSER_SCRIPT_BYTECODE_LAZY_BUNDLE):
+       a table of their own with its own small ceiling, and the records
+       still being digested at idle (NULL when none). */
+    BrowserScriptBytecodeTable *lazy_bundle_records;
+    size_t maximum_lazy_bundle_record_bytes;
+    size_t lazy_bundle_record_evictions;
+    struct BrowserLazyBundlePending *lazy_bundle_pending;
 } BrowserSession;
 
 /* Request-private cookie state used while following redirects. The concrete
@@ -826,13 +851,13 @@ BrowserSharedBody *browser_shared_body_take(Budget *budget,
                                             size_t length);
 BrowserSharedBody *browser_shared_body_retain(BrowserSharedBody *body);
 void browser_shared_body_release(BrowserSharedBody *body);
+/* Classic-script bytecode attached to an HTTP response entry. Only an
+   installed offline app's restore attaches it (the app's working set is
+   reserved in the response cache for its launch); page scripts use the
+   session's classic bytecode table (BrowserScriptBytecodeTable) instead. */
 BrowserSharedBody *browser_session_classic_script_bytecode_acquire(
     BrowserSession *session, const char *request_url,
     const unsigned char *source, size_t source_length);
-bool browser_session_classic_script_bytecode_may_fit(
-    BrowserSession *session, const char *request_url,
-    const unsigned char *source, size_t source_length,
-    size_t minimum_bytecode_length);
 bool browser_session_classic_script_bytecode_put(
     BrowserSession *session, const char *request_url,
     const unsigned char *source, size_t source_length,
@@ -840,106 +865,281 @@ bool browser_session_classic_script_bytecode_put(
 void browser_session_classic_script_bytecode_invalidate(
     BrowserSession *session, const char *request_url,
     const unsigned char *source, size_t source_length);
+/* Whether a Cache-Control value carries the no-store directive. */
+bool browser_session_cache_control_no_store(const char *cache_control);
+
+/* Classic-script bytecode ceilings: browser_session_init applies the
+   first, and the engine's profiles one or the other
+   (BrowserConfig.classic_bytecode_cache_limit). Bytes, not entries, bind:
+   on the second census at 1.5 MiB a ticked revisit hit 327 of 492 classic
+   lookups with 101 + 172 stores skipped for a full table; at 3 MiB it hits
+   457 of 495 with none skipped (4 MiB adds nothing there) and the table
+   never held more than 83 entries. The table is optional memory: the
+   Budget reclaim hook and the script pressure checks evict it before the
+   page needs the room. See docs/STORAGE.md and
+   docs/engineering/MEMORY_EXPERIMENTS.md. */
+#define BROWSER_CLASSIC_BYTECODE_CACHE_BYTES (3072u * 1024u)
+#define BROWSER_CLASSIC_BYTECODE_CACHE_STRICT_BYTES (1536u * 1024u)
+
+/*
+ * Lazy webpack bundle records (src/session_lazy_bundle.c).
+ *
+ * A lazily split webpack bundle (src/js_lazy_webpack.c) costs a whole-
+ * bundle pass on every load before any factory runs: the planner's lexer
+ * pass that finds the factories. A record keeps its outcome, the factory
+ * table, for one exact byte sequence. It vouches for no factory's syntax:
+ * each factory is compiled, and checked, when it first runs. The engine
+ * (js_lazy_webpack.c) owns the record's format; the session stores it as
+ * an opaque payload in the LAZY_BUNDLE table, keyed like a classic script
+ * (a fixed record name, the request URL, the top-level site, and the length
+ * and SHA-256 of the exact bytes), so the persistent compiled-script tier
+ * keeps records across restarts when it is on, and the cache clear, site
+ * clear, optional-memory reclaim, Budget reclaim hook and teardown drop
+ * them with the bytecode.
+ *
+ * A lookup digests the bytes only when a record for the same site, URL and
+ * length exists, so a first visit never hashes. A store needs the digest,
+ * so it is queued here with a reference to the response body and digested
+ * at idle, BROWSER_LAZY_BUNDLE_HASH_SLICE bytes per call, off the load's
+ * critical path. The clears above drop queued records. The reclaims go to
+ * them first: a queued record whose reference is the last one on its body
+ * has its digest finished there and then (CPU only) and releases the body,
+ * so memory pressure costs the hash it deferred, never the record.
+ */
+#define BROWSER_LAZY_BUNDLE_RECORD_DEFAULT_BYTES (96u * 1024u)
+#define BROWSER_LAZY_BUNDLE_PENDING_LIMIT 16u
+/* Body bytes all queued records may reference together. */
+#define BROWSER_LAZY_BUNDLE_PENDING_BYTES (8u * 1024u * 1024u)
+#define BROWSER_LAZY_BUNDLE_HASH_SLICE (64u * 1024u)
+
+/* Queues a record for `body` (exactly the key's source bytes): retains the
+   body and copies the key strings and the payload. With the key's digest
+   already known (digest_ready) the record is stored at once. False, with
+   nothing retained, when the session cannot keep it (table off, captive
+   sign-in, queue full, allocation refused). */
+bool browser_session_lazy_bundle_record_queue(
+    BrowserSession *session, const BrowserScriptBytecodeKey *key,
+    BrowserSharedBody *body, uint32_t generation,
+    const unsigned char *record, size_t record_length);
+/* One slice of idle work: digests up to BROWSER_LAZY_BUNDLE_HASH_SLICE
+   bytes of the oldest queued record, storing it when complete. True if it
+   did work. */
+bool browser_session_lazy_bundle_record_maintenance(BrowserSession *session);
+size_t browser_session_lazy_bundle_pending_count(
+    const BrowserSession *session);
+/* Drops queued records (of one top-level site, or all with NULL). */
+void browser_session_lazy_bundle_pending_clear(BrowserSession *session,
+                                               const char *partition);
+/* Releases the bodies of queued records that hold their last reference,
+   oldest first, until `target_bytes` are released, finishing each one's
+   digest first so the record itself is kept (stored at the next idle
+   turn). Returns the body bytes released. Frees only, allocates nothing:
+   the Budget reclaim hook calls it. */
+size_t browser_session_lazy_bundle_pending_reclaim(BrowserSession *session,
+                                                   size_t target_bytes);
+
+/*
+ * Script bytecode tables (BrowserScriptBytecodeTable), by kind. The
+ * browser_session_module_bytecode_* functions below are the MODULE table's.
+ */
+/* Sets a table's ceiling; zero disables it. Lowering it evicts least-
+   recently-used entries until the table fits. */
+void browser_session_script_bytecode_set_limit(
+    BrowserSession *session, BrowserScriptBytecodeKind kind,
+    size_t maximum_bytes);
+/* A retained reference to the bytecode for exactly this key, or NULL. A hit
+   marks the entry as used by `generation`. */
+BrowserSharedBody *browser_session_script_bytecode_acquire(
+    BrowserSession *session, BrowserScriptBytecodeKind kind,
+    BrowserScriptBytecodeKey *key, uint32_t generation);
+/* Whether a store of `bytecode_length` bytes could be admitted now without
+   evicting an entry `generation` has used: an admission hint. */
+bool browser_session_script_bytecode_may_fit(
+    const BrowserSession *session, BrowserScriptBytecodeKind kind,
+    const BrowserScriptBytecodeKey *key, size_t bytecode_length,
+    uint32_t generation);
+/* Copies the bytecode in, replacing the entry for the same record. Returns
+   false (and changes nothing) when it does not fit or an allocation is
+   refused. */
+bool browser_session_script_bytecode_put(
+    BrowserSession *session, BrowserScriptBytecodeKind kind,
+    BrowserScriptBytecodeKey *key, uint32_t generation,
+    const unsigned char *bytecode, size_t bytecode_length);
+/* Drops the entry for this key's record (after a failed restore). */
+void browser_session_script_bytecode_invalidate(
+    BrowserSession *session, BrowserScriptBytecodeKind kind,
+    BrowserScriptBytecodeKey *key);
+/* Releases compiled-script memory until `target_bytes` are released or
+   nothing is left: the bundle-record queue, then least-recently-used
+   classic and module entries (from the larger table first), then bundle
+   records. Returns the bytes released. Frees only entries (never a table)
+   and allocates nothing, so it is safe as the engine's Budget reclaim hook
+   while an allocation is in progress anywhere, including inside a table. */
+size_t browser_session_script_bytecode_reclaim(BrowserSession *session,
+                                               size_t target_bytes);
+size_t browser_session_script_bytecode_bytes(
+    const BrowserSession *session, BrowserScriptBytecodeKind kind);
+size_t browser_session_script_bytecode_entries(
+    const BrowserSession *session, BrowserScriptBytecodeKind kind);
+#ifndef TILEFINCH_NO_TRACE
+/* Site-census diagnosis: "hit", "miss-no-record", "miss-changed-source",
+   "miss-flags" or "ineligible-*" for this key, without touching LRU. */
+const char *browser_session_script_bytecode_diagnose(
+    BrowserSession *session, BrowserScriptBytecodeKind kind,
+    BrowserScriptBytecodeKey *key);
+#endif
+
 /* Sets the module bytecode ceiling; zero disables the cache. Lowering it
    evicts least-recently-used entries until the cache fits. */
 void browser_session_module_bytecode_set_limit(BrowserSession *session,
                                                size_t maximum_bytes);
 /* A fresh nonzero generation for one document realm. */
 uint32_t browser_session_module_bytecode_generation(BrowserSession *session);
-/* Returns a retained reference to the bytecode for exactly this key, or NULL.
-   A hit marks the entry as used by `generation`. */
-BrowserSharedBody *browser_session_module_bytecode_acquire(
-    BrowserSession *session, BrowserModuleBytecodeKey *key,
-    uint32_t generation);
 /* Whether a store of `bytecode_length` bytes could be admitted now without
    evicting an entry `generation` has used. An admission hint for skipping
    serialization, not a reservation. */
 bool browser_session_module_bytecode_may_fit(
-    const BrowserSession *session, const BrowserModuleBytecodeKey *key,
+    const BrowserSession *session, const BrowserScriptBytecodeKey *key,
     size_t bytecode_length, uint32_t generation);
 /* Copies the bytecode into the cache, replacing any entry for the same
    module name, response URL and partition. Returns false (and changes
    nothing) when it does not fit the ceiling or an allocation is refused. */
 bool browser_session_module_bytecode_put(
-    BrowserSession *session, BrowserModuleBytecodeKey *key,
+    BrowserSession *session, BrowserScriptBytecodeKey *key,
     uint32_t generation, const unsigned char *bytecode,
     size_t bytecode_length);
 /*
- * Persistent module bytecode (off by default). With a directory set, a
- * module missing from RAM is looked up in a file named by a hash of its
- * complete key (the in-memory key plus this engine build), and, when
- * `write` is set, a freshly compiled module is written there once: never
- * overwritten, at most BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT per file
- * and BROWSER_MODULE_BYTECODE_DISK_SESSION_LIMIT per session. Files carry
- * their key and payload hashes and are verified before use, so a
- * truncated, corrupted or foreign file is a miss, never bytecode handed
- * to the engine. The same fetch/CSP/SRI/CORS admission precedes a disk hit
- * as a RAM hit. An empty directory disables the tier.
+ * The persistent compiled-script tier (off by default): QuickJS bytecode of
+ * page scripts, classic and module, kept across browser restarts in one
+ * directory (src/session_script_disk.c). The PSP application turns it on
+ * with Settings > Device & storage > Site data & storage > Keep compiled
+ * scripts (data/script-cache); boot.cfg's module_cache_dir names another
+ * directory for development, and the lab takes --script-cache-dir.
  *
- * With writes on, the directory as a whole stays under
- * BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT bytes and
- * BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT files across sessions: the
- * directory accounting removes stale files in bounded maintenance slices.
- * Writes are declined until accounting completes, or if a ceiling is full;
- * compiling a module never wipes existing entries to make room. Instead,
- * idle maintenance that finds the directory full (a maximum-size file
- * might not fit) removes this build's oldest records (by modification time)
- * in slices until it is under the LOW_WATER marks, rescanning for more
- * candidates as needed, so content-hashed module URLs that change on every
- * deploy cannot freeze the cache. A scan that fails or reaches SCAN_LIMIT
- * defers writes and is retried with backoff, since the ceilings cannot be
- * honoured without complete accounting. Only this tier's file names are
- * ever removed. A refused file (or one the engine cannot restore)
- * is removed so the next compile replaces it; a read-only tier remembers
- * it instead. Clearing the cache (browser_session_persistence_clear)
- * empties the directory, or, read-only, stops reading it for the rest of
- * the session.
+ * - One pack file per record group (table kind, compile name, URL and
+ *   top-level site): every RAM record of that group, each with its ordinal,
+ *   compile flags, source length and source SHA-256, and a CRC-32 of the
+ *   whole file. A file is verified completely before any of it is used, so
+ *   a truncated, corrupt or foreign file is a miss, never bytecode handed
+ *   to the engine; one that fails (or whose bytecode the engine cannot
+ *   restore) is removed when the tier writes.
+ * - File names and the group hash carry this engine build's fingerprint,
+ *   pointer width and TILEFINCH_QUICKJS_BYTECODE_ABI: another build never
+ *   reads a pack, and the sweep removes it.
+ * - An index file is read once, on first use; a key it does not name costs
+ *   no card access. A RAM miss reads the named pack whole (at most once per
+ *   page load) and copies its records into the RAM table, where the lookup
+ *   that follows finds them. Reads come after the same fetch, CSP, SRI,
+ *   CORS and MIME admission as a RAM hit.
+ * - Writes are idle work only (browser_session_script_disk_maintenance):
+ *   a pack is written from the RAM table's records stored while the tier
+ *   writes, at most BROWSER_SCRIPT_DISK_WRITE_SLICE bytes per call, to a
+ *   temporary name renamed into place when complete. Least recently used
+ *   packs are removed first to stay under the size ceiling (default
+ *   BROWSER_SCRIPT_DISK_DEFAULT_BYTES) and the file-count ceiling, one per
+ *   call. The first maintenance calls of a writing session sweep the
+ *   directory, removing other builds' packs, stray temporary files, the
+ *   retired per-module tier's files and packs the index does not name.
+ * - Nothing is written during a captive sign-in or while site data is not
+ *   allowed, and no-store responses, data:/blob: scripts and opaque-origin
+ *   realms never reach the RAM tables the tier writes from. Clearing the
+ *   cache empties the directory (a read-only tier stops reading instead);
+ *   a site's data clear removes its packs.
+ * - A host build refuses a PSP device path (anything before a ':'), so no
+ *   test or lab run can reach the Memory Stick.
  */
-#define BROWSER_MODULE_BYTECODE_DISK_FILE_LIMIT (2u * 1024u * 1024u)
-#define BROWSER_MODULE_BYTECODE_DISK_SESSION_LIMIT (16u * 1024u * 1024u)
-#define BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT (24u * 1024u * 1024u)
-#define BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT 512u
-#define BROWSER_MODULE_BYTECODE_DISK_SCAN_SLICE 8u
-#define BROWSER_MODULE_BYTECODE_DISK_SCAN_LIMIT 4096u
-#define BROWSER_MODULE_BYTECODE_DISK_LOW_WATER_BYTES \
-    (BROWSER_MODULE_BYTECODE_DISK_TOTAL_LIMIT / 4u * 3u)
-#define BROWSER_MODULE_BYTECODE_DISK_LOW_WATER_FILES \
-    (BROWSER_MODULE_BYTECODE_DISK_FILE_COUNT_LIMIT / 4u * 3u)
-void browser_session_module_bytecode_set_disk(BrowserSession *session,
-                                              const char *directory,
-                                              bool write);
-bool browser_session_module_bytecode_disk_enabled(
-    const BrowserSession *session);
-/* The verified bytecode for this key from disk, charged to the session
-   Budget, or NULL. */
-BrowserSharedBody *browser_session_module_bytecode_disk_load(
-    BrowserSession *session, BrowserModuleBytecodeKey *key);
-/* Whether a store for this key would write (writes on, room left, and no
-   file for it yet): lets the loader skip serializing otherwise. */
-bool browser_session_module_bytecode_disk_wants(
-    BrowserSession *session, BrowserModuleBytecodeKey *key,
-    size_t bytecode_length);
-bool browser_session_module_bytecode_disk_store(
-    BrowserSession *session, BrowserModuleBytecodeKey *key,
-    const unsigned char *bytecode, size_t bytecode_length);
-/* The engine could not restore what disk_load returned for this key: remove
-   the file (writes on) or stop reading it this session. */
-void browser_session_module_bytecode_disk_discard(
-    BrowserSession *session, BrowserModuleBytecodeKey *key);
-/* One bounded slice of accounting, eviction or a due scan retry (writes
-   on, idle work only); true if work was performed. */
-bool browser_session_module_bytecode_disk_maintenance(BrowserSession *session);
-/* Explicit user clear, bounded by SCAN_LIMIT; false on incomplete removal. */
-bool browser_session_module_bytecode_disk_clear(BrowserSession *session);
+#define BROWSER_SCRIPT_DISK_DEFAULT_BYTES (8u * 1024u * 1024u)
+#define BROWSER_SCRIPT_DISK_FILE_LIMIT (2u * 1024u * 1024u)
+#define BROWSER_SCRIPT_DISK_FILE_COUNT_LIMIT 256u
+#define BROWSER_SCRIPT_DISK_WRITE_SLICE (16u * 1024u)
+#define BROWSER_SCRIPT_DISK_SCAN_SLICE 8u
+#define BROWSER_SCRIPT_DISK_SCAN_LIMIT 4096u
+#define BROWSER_SCRIPT_DISK_DIRECTORY_LIMIT 160u
+
+typedef struct BrowserScriptDisk BrowserScriptDisk;
+
+typedef struct {
+    size_t files;
+    uint64_t bytes;
+    /* Index reads and writes; pack reads (whole files) and their bytes;
+       records copied into RAM; lookups the index did not name. */
+    size_t index_reads;
+    size_t index_writes;
+    size_t index_misses;
+    size_t reads;
+    uint64_t read_bytes;
+    size_t promoted;
+    /* Packs refused (verification or restore) and files removed. */
+    size_t rejects;
+    size_t removed;
+    size_t evictions;
+    /* Packs written, all bytes written (packs and index), groups not
+       written (too large or refused by the card), restarted and failed
+       writes, clears. */
+    size_t writes;
+    uint64_t written_bytes;
+    size_t skipped;
+    size_t write_restarts;
+    size_t write_failures;
+    size_t clears;
+    uint64_t read_ns;
+    uint64_t verify_ns;
+    uint64_t write_ns;
+} BrowserScriptDiskStats;
+
+/* Sets (or, with an empty or NULL directory, turns off) the tier. Turning
+   it off removes nothing; clear first to empty it. A zero maximum selects
+   the default. False if the directory is refused or the tier's state
+   (about 10 KiB) cannot be allocated. */
+bool browser_session_script_disk_configure(BrowserSession *session,
+                                           const char *directory, bool write,
+                                           size_t maximum_bytes);
+/* Saves pending index changes and frees the tier (teardown). */
+void browser_session_script_disk_release(BrowserSession *session);
+bool browser_session_script_disk_enabled(const BrowserSession *session);
+/* Writes allowed now: on, writable, site data allowed, no captive sign-in. */
+bool browser_session_script_disk_writable(const BrowserSession *session);
+/* On a RAM miss for `key`: reads the pack its group's index entry names,
+   at most once per load (document realm), verifies it and copies its
+   records into the RAM table, cooperating at bounded read/verify boundaries
+   and between promotions; cancellation permits a same-generation retry
+   under `generation`. True if the key's own record (by ordinal) was
+   copied; the caller then looks it up in RAM, where the digest decides. */
+bool browser_session_script_disk_promote(BrowserSession *session,
+                                         BrowserScriptBytecodeKind kind,
+                                         const BrowserScriptBytecodeKey *key,
+                                         uint32_t generation);
+/* The engine could not restore a record that came from this key's pack:
+   remove the pack (writes on) or stop reading it this session. */
+void browser_session_script_disk_discard(BrowserSession *session,
+                                         BrowserScriptBytecodeKind kind,
+                                         const BrowserScriptBytecodeKey *key);
+/* One bounded slice of idle work: the index load, a pack write slice, the
+   sweep, an index save, an eviction or a new pack. True if it did work. */
+bool browser_session_script_disk_maintenance(BrowserSession *session);
+/* Explicit user clear: every pack and the index. False on incomplete
+   removal (the tier then stops reading for the session). */
+bool browser_session_script_disk_clear(BrowserSession *session);
+/* Removes the packs of one top-level site (a partition key from
+   tilefinch_url_site_key). A read-only tier cannot remove them: it stops
+   reading for the session instead, as an explicit clear does. */
+bool browser_session_script_disk_clear_site(BrowserSession *session,
+                                            const char *partition);
+/* Bytes and packs on disk, loading the index if needed; false when the
+   tier is off. */
+bool browser_session_script_disk_usage(BrowserSession *session,
+                                       uint64_t *bytes, size_t *files);
+void browser_session_script_disk_stats(const BrowserSession *session,
+                                       BrowserScriptDiskStats *stats);
+/* Removes every RAM record of one top-level site, in every table and in
+   the bundle-record queue, and advances script_bytecode_epoch so no
+   realm's deferred store queued before the clear writes that site's
+   scripts back. */
+void browser_session_script_bytecode_clear_partition(
+    BrowserSession *session, const char *partition);
 /* Drops the entry for this key (after a failed restore). */
 void browser_session_module_bytecode_invalidate(
-    BrowserSession *session, BrowserModuleBytecodeKey *key);
-/* Evicts least-recently-used entries until `target_bytes` are released or
-   the cache is empty; returns the bytes released. Frees only entries (never
-   the table) and allocates nothing, so it is safe as a Budget reclaim hook
-   while an allocation is in progress anywhere, including inside this cache. */
-size_t browser_session_module_bytecode_reclaim(BrowserSession *session,
-                                               size_t target_bytes);
+    BrowserSession *session, BrowserScriptBytecodeKey *key);
 /* Bytes and entries currently held. */
 size_t browser_session_module_bytecode_bytes(const BrowserSession *session);
 size_t browser_session_module_bytecode_entries(const BrowserSession *session);
@@ -983,6 +1183,10 @@ bool browser_session_decoded_image_acquire(
     BrowserDecodedImage *decoded);
 /* Retains one immutable RGBA surface under the response cache's existing
    byte and LRU bounds. The caller keeps its lease on every return path. */
+/* Drops the cached decoded copy that is this body (a page replaced it with
+   a surface of another size), so no later page adopts a stale size. */
+void browser_session_decoded_image_forget(BrowserSession *session,
+                                          const BrowserSharedBody *pixels);
 bool browser_session_decoded_image_put(
     BrowserSession *session, const char *request_url,
     const TilefinchRequestContext *request_context,
@@ -1066,6 +1270,40 @@ size_t browser_session_cache_collect_offline_same_origin(
 bool browser_session_cache_restore_offline(
     BrowserSession *session, const char *document_url,
     const BrowserOfflineCacheView *view);
+/* Installed-app classic scripts restored as bytecode only. Each record has
+   the response's authority (grant, type, response URL) and its bytecode, but
+   not its body: the source stays in the app pack at `pack_path` and is read
+   on demand, verified against `source_hash`
+   (browser_session_script_source_hash), by anything that needs the bytes.
+   Reading one restores it as an ordinary cache entry with its bytecode.
+   One app's set at a time: begin replaces any earlier set. */
+#define BROWSER_SESSION_SOURCE_HASH_SEED UINT64_C(1469598103934665603)
+uint64_t browser_session_script_source_hash(uint64_t hash, const void *data,
+                                            size_t length);
+bool browser_session_offline_deferred_begin(
+    BrowserSession *session, const char *document_url,
+    const char *pack_path);
+/* `view->data` is ignored; `view->length` is the source length. The set
+   takes over the caller's reference to `bytecode` on success. */
+bool browser_session_offline_deferred_add(
+    BrowserSession *session, const BrowserOfflineCacheView *view,
+    uint64_t source_hash, uint64_t offset, BrowserSharedBody *bytecode);
+void browser_session_offline_deferred_clear(BrowserSession *session);
+/* Deferred classic scripts whose source has not been read (0 without a
+   set); each on-demand read removes one. */
+size_t browser_session_offline_deferred_pending(const BrowserSession *session);
+/* A fresh hit for a deferred classic script under `context`, without
+   reading its source. */
+bool browser_session_offline_script_match(
+    BrowserSession *session, const char *url,
+    const TilefinchRequestContext *context, size_t *length);
+/* Retained bytecode of a deferred script, or NULL. */
+BrowserSharedBody *browser_session_offline_script_bytecode(
+    BrowserSession *session, const char *url, size_t length);
+/* Retained source body of a (possibly deferred) restored classic script,
+   reading and restoring it if needed; NULL when unavailable. */
+BrowserSharedBody *browser_session_offline_script_source(
+    BrowserSession *session, const char *url, size_t length);
 void browser_session_destroy(BrowserSession *session);
 
 #endif

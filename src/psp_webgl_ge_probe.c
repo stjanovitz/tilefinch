@@ -56,7 +56,7 @@
 #define PROBE_CONVERSION_SOURCE_WIDTH 320u
 #define PROBE_CONVERSION_SOURCE_HEIGHT 180u
 #define PROBE_CONVERSION_DEST_WIDTH 480u
-#define PROBE_CONVERSION_DEST_HEIGHT 270u
+#define PROBE_CONVERSION_DEST_HEIGHT 272u
 
 _Static_assert(PROBE_COLOR_OFFSET == (size_t) 0x0cc000,
                "the probe color surface must follow three page buffers");
@@ -600,36 +600,26 @@ static void probe_fill_conversion_source(uint32_t *color)
     sceKernelDcacheWritebackRange(color, PROBE_COLOR_BYTES);
 }
 
-/* The exact common shipping kernel: a 320x180 drawing buffer is expanded by
-   nearest neighbour to 480x270, with every fourth source-pixel group becoming
-   p0,p0,p1,p2,p2,p3 and repeated destination rows copied instead of converted
-   twice. Keep this probe-local; it measures the current path without making
-   the validation object part of shipping render ownership. */
+/* Match actual gameplay publication: 320x180 to 480x272, not the historical
+   480x270 approximation. Reused source rows are copied, never converted twice.
+   Conversion is a probe, not permission to alter production ownership. */
 static void probe_cpu_convert_3_to_2(
     uint16_t *destination, const uint32_t *source)
 {
-    for (unsigned source_y = 0, destination_y = 0;
-         source_y < PROBE_CONVERSION_SOURCE_HEIGHT;
-         source_y += 4u, destination_y += 6u) {
+    unsigned previous_y = UINT_MAX;
+    for (unsigned destination_y = 0;
+         destination_y < PROBE_CONVERSION_DEST_HEIGHT; destination_y++) {
+        unsigned source_y = destination_y * PROBE_CONVERSION_SOURCE_HEIGHT
+            / PROBE_CONVERSION_DEST_HEIGHT;
         uint16_t *output = destination
             + (size_t) destination_y * PROBE_CONVERSION_DEST_WIDTH;
         const uint32_t *input = source
             + (size_t) source_y * PSP_DISPLAY_STRIDE;
-        probe_cpu_convert_row(output, input);
-        memcpy(output + PROBE_CONVERSION_DEST_WIDTH, output,
-               PROBE_CONVERSION_DEST_WIDTH * sizeof(*output));
-        probe_cpu_convert_row(
-            output + PROBE_CONVERSION_DEST_WIDTH * 2u,
-            input + PSP_DISPLAY_STRIDE);
-        probe_cpu_convert_row(
-            output + PROBE_CONVERSION_DEST_WIDTH * 3u,
-            input + PSP_DISPLAY_STRIDE * 2u);
-        memcpy(output + PROBE_CONVERSION_DEST_WIDTH * 4u,
-               output + PROBE_CONVERSION_DEST_WIDTH * 3u,
-               PROBE_CONVERSION_DEST_WIDTH * sizeof(*output));
-        probe_cpu_convert_row(
-            output + PROBE_CONVERSION_DEST_WIDTH * 5u,
-            input + PSP_DISPLAY_STRIDE * 3u);
+        if (source_y == previous_y)
+            memcpy(output, output - PROBE_CONVERSION_DEST_WIDTH,
+                PROBE_CONVERSION_DEST_WIDTH * sizeof(*output));
+        else probe_cpu_convert_row(output, input);
+        previous_y = source_y;
     }
 }
 
@@ -688,23 +678,37 @@ static bool probe_ge_convert_3_to_2(
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
     sceGuTexScale(1.0f, 1.0f); sceGuTexOffset(0.0f, 0.0f);
     sceGuTexFlush();
-    ProbeTextureVertex *vertices = sceGuGetMemory(2 * sizeof(*vertices));
+    /* Match the CPU's floor-based row replication, not a floating-point
+       180/272 interpolation. Each source row owns an exact integer span.
+       The horizontal quarter-texel bias compensates for GE pixel-center
+       sampling, reproducing floor(2*x/3) without boundary-rounding ties. */
+    const unsigned vertex_count = PROBE_CONVERSION_SOURCE_HEIGHT * 2u;
+    ProbeTextureVertex *vertices = sceGuGetMemory(
+        vertex_count * sizeof(*vertices));
     if (vertices == NULL) {
         (void) sceGuFinish();
         (void) sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT);
         return false;
     }
-    vertices[0] = (ProbeTextureVertex) {
-        0, 0, 0xffffffffu, 0, 0, 0};
-    vertices[1] = (ProbeTextureVertex) {
-        PROBE_CONVERSION_SOURCE_WIDTH, PROBE_CONVERSION_SOURCE_HEIGHT,
-        0xffffffffu,
-        PROBE_CONVERSION_DEST_WIDTH, PROBE_CONVERSION_DEST_HEIGHT, 0};
+    for (unsigned y = 0; y < PROBE_CONVERSION_SOURCE_HEIGHT; y++) {
+        unsigned top = (y * PROBE_CONVERSION_DEST_HEIGHT
+                        + PROBE_CONVERSION_SOURCE_HEIGHT - 1u)
+                       / PROBE_CONVERSION_SOURCE_HEIGHT;
+        unsigned bottom = ((y + 1u) * PROBE_CONVERSION_DEST_HEIGHT
+                           + PROBE_CONVERSION_SOURCE_HEIGHT - 1u)
+                          / PROBE_CONVERSION_SOURCE_HEIGHT;
+        vertices[y * 2u] = (ProbeTextureVertex) {
+            -.25f, (float) y, 0xffffffffu, 0, (float) top, 0};
+        vertices[y * 2u + 1u] = (ProbeTextureVertex) {
+            PROBE_CONVERSION_SOURCE_WIDTH - .25f, (float) (y + 1u),
+            0xffffffffu,
+            PROBE_CONVERSION_DEST_WIDTH, (float) bottom, 0};
+    }
     sceGuDrawArray(
         GU_SPRITES,
         GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
             | GU_TRANSFORM_2D,
-        2, NULL, vertices);
+        (int) vertex_count, NULL, vertices);
     int list_bytes = sceGuFinish();
     uint64_t submitted = probe_now();
     if (list_bytes <= 0
@@ -716,6 +720,137 @@ static bool probe_ge_convert_3_to_2(
     if (submit_us != NULL) *submit_us = submitted - started;
     if (wait_us != NULL) *wait_us = synchronized - submitted;
     if (total_us != NULL) *total_us = completed - started;
+    return true;
+}
+
+typedef struct {
+    float u;
+    float v;
+    int16_t x;
+    int16_t y;
+    int16_t z;
+    int16_t pad;
+} ProbeStripVertex;
+
+#define PROBE_STRIP_MIN_TEXELS 16u
+#define PROBE_STRIP_VERTICES \
+    (PROBE_CONVERSION_SOURCE_HEIGHT \
+     * (PROBE_CONVERSION_SOURCE_WIDTH / PROBE_STRIP_MIN_TEXELS) * 2u)
+static ProbeStripVertex __attribute__((aligned(64)))
+    probe_strip_vertices[PROBE_STRIP_VERTICES];
+
+/* Same exact integer row spans and quarter-texel horizontal bias as the row
+   probe, cut into strip_texels-wide column strips (strip-major order). An
+   even strip width keeps every strip edge on an integer destination column
+   (3/2 per texel). Returns the vertex count. */
+static unsigned probe_fill_strip_vertices(unsigned strip_texels)
+{
+    unsigned count = 0;
+    for (unsigned sx = 0; sx < PROBE_CONVERSION_SOURCE_WIDTH;
+         sx += strip_texels) {
+        unsigned ex = sx + strip_texels;
+        for (unsigned y = 0; y < PROBE_CONVERSION_SOURCE_HEIGHT; y++) {
+            unsigned top = (y * PROBE_CONVERSION_DEST_HEIGHT
+                            + PROBE_CONVERSION_SOURCE_HEIGHT - 1u)
+                           / PROBE_CONVERSION_SOURCE_HEIGHT;
+            unsigned bottom = ((y + 1u) * PROBE_CONVERSION_DEST_HEIGHT
+                               + PROBE_CONVERSION_SOURCE_HEIGHT - 1u)
+                              / PROBE_CONVERSION_SOURCE_HEIGHT;
+            probe_strip_vertices[count++] = (ProbeStripVertex) {
+                (float) sx - .25f, (float) y,
+                (int16_t) (sx * 3u / 2u), (int16_t) top, 0, 0};
+            probe_strip_vertices[count++] = (ProbeStripVertex) {
+                (float) ex - .25f, (float) (y + 1u),
+                (int16_t) (ex * 3u / 2u), (int16_t) bottom, 0, 0};
+        }
+    }
+    sceKernelDcacheWritebackRange(
+        probe_strip_vertices, count * sizeof(probe_strip_vertices[0]));
+    return count;
+}
+
+static bool probe_ge_convert_strips(
+    uint16_t *page, uint32_t *color, unsigned vertex_count,
+    uint64_t *wait_us, uint64_t *total_us)
+{
+    uintptr_t base = (uintptr_t) sceGeEdramGetAddr() & PROBE_PHYSICAL_MASK;
+    uintptr_t target = (uintptr_t) page & PROBE_PHYSICAL_MASK;
+    if (target < base || target - base >= PSP_DISPLAY_EDRAM_BYTES)
+        return false;
+    uint64_t started = probe_now();
+    if (sceGuStart(GU_DIRECT, probe_uncached_list()) < 0) return false;
+    sceGuDrawBufferList(
+        GU_PSM_5650, (void *) (target - base), PSP_DISPLAY_STRIDE);
+    sceGuOffset(
+        2048 - PROBE_CONVERSION_DEST_WIDTH / 2,
+        2048 - PROBE_CONVERSION_DEST_HEIGHT / 2);
+    sceGuViewport(
+        2048, 2048,
+        PROBE_CONVERSION_DEST_WIDTH, PROBE_CONVERSION_DEST_HEIGHT);
+    sceGuScissor(
+        0, 0, PROBE_CONVERSION_DEST_WIDTH, PROBE_CONVERSION_DEST_HEIGHT);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDisable(GU_DEPTH_TEST); sceGuDepthMask(GU_TRUE);
+    sceGuDisable(GU_ALPHA_TEST); sceGuDisable(GU_BLEND);
+    sceGuDisable(GU_DITHER); sceGuEnable(GU_TEXTURE_2D);
+    sceGuPixelMask(0u);
+    sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
+    sceGuTexImage(0, 512, 256, PSP_DISPLAY_STRIDE, color);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f); sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFlush();
+    sceGuDrawArray(
+        GU_SPRITES,
+        GU_TEXTURE_32BITF | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
+        (int) vertex_count, NULL, probe_strip_vertices);
+    int list_bytes = sceGuFinish();
+    uint64_t submitted = probe_now();
+    if (list_bytes <= 0
+        || sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT) < 0) return false;
+    uint64_t synchronized = probe_now();
+    if (wait_us != NULL) *wait_us = synchronized - submitted;
+    if (total_us != NULL) *total_us = synchronized - started;
+    return true;
+}
+
+static bool probe_conversion_strips(
+    uint16_t *page, const uint16_t *cpu, uint32_t *color,
+    PspWebglGeConversionProbe *result, unsigned *synchronizations)
+{
+    static const unsigned widths[4] = {320u, 64u, 32u, 16u};
+    size_t page_bytes = PSP_DISPLAY_BUFFER_PIXELS * sizeof(*page);
+    uint64_t dcache_started = probe_now();
+    sceKernelDcacheWritebackInvalidateAll();
+    result->dcache_all_us = probe_now() - dcache_started;
+    for (unsigned variant = 0; variant < 4u; variant++) {
+        unsigned vertex_count = probe_fill_strip_vertices(widths[variant]);
+        result->strip_texels[variant] = widths[variant];
+        /* Poison the target so a skipped strip cannot pass as a match. */
+        memset(page, 0x5a, page_bytes);
+        sceKernelDcacheWritebackInvalidateRange(page, page_bytes);
+        unsigned total_frames = PROBE_WARMUP_FRAMES + PROBE_MEASURED_FRAMES;
+        for (unsigned frame = 0; frame < total_frames; frame++) {
+            uint64_t wait_us = 0, total_us = 0;
+            if (!probe_ge_convert_strips(
+                    page, color, vertex_count, &wait_us, &total_us))
+                return false;
+            (*synchronizations)++;
+            if (frame < PROBE_WARMUP_FRAMES) continue;
+            result->strip_total_us[variant] += total_us;
+            result->strip_wait_us[variant] += wait_us;
+            if (total_us > result->strip_total_max_us[variant])
+                result->strip_total_max_us[variant] = total_us;
+        }
+        sceKernelDcacheInvalidateRange(page, page_bytes);
+        for (unsigned y = 0; y < PROBE_CONVERSION_DEST_HEIGHT; y++)
+            for (unsigned x = 0; x < PROBE_CONVERSION_DEST_WIDTH; x++)
+                if (page[(size_t) y * PSP_DISPLAY_STRIDE + x]
+                    != cpu[(size_t) y * PROBE_CONVERSION_DEST_WIDTH + x])
+                    result->strip_mismatches[variant]++;
+        result->strip_variants = variant + 1u;
+    }
     return true;
 }
 
@@ -777,7 +912,8 @@ static bool probe_conversion_cost(
     result->frames = PROBE_MEASURED_FRAMES;
     result->available = true;
     result->pixel_exact = result->mismatched_pixels == 0;
-    return true;
+    return probe_conversion_strips(page, cpu, color, result,
+                                   synchronizations);
 }
 
 static bool probe_composite_page(uint16_t *page, uint32_t *color)
@@ -897,6 +1033,11 @@ bool psp_webgl_ge_probe_run(
             color, &report->conversion, &report->synchronizations)) {
         snprintf(report->detail, sizeof(report->detail),
                  "GE conversion cost probe failed");
+        passed = false;
+    }
+    if (passed && !report->conversion.pixel_exact) {
+        snprintf(report->detail, sizeof(report->detail),
+                 "GE conversion differs from the CPU pixel oracle");
         passed = false;
     }
     if (passed && !probe_composite_page(page_destination, color)) {

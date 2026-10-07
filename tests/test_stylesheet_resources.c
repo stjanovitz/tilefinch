@@ -348,6 +348,9 @@ typedef struct {
     size_t request_cookie_bytes;
     long status;
     bool request_send_low_client_hints;
+    /* Non-NULL records a failed transfer (success=0) with this error, the
+       way a capture records a response that stopped at its byte cap. */
+    const char *error;
 } StylesheetReplayRecord;
 
 static uint64_t stylesheet_replay_body_hash(const char *data, size_t length)
@@ -385,9 +388,9 @@ static bool write_stylesheet_replay_record(
         meta,
         "psp-http-trace=10\n"
         "cookie-values=redacted\n"
-        "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=1\n"
+        "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=%d\n"
         "async-delay-pumps=0\nexternal-cancel=0\n"
-        "transport-timeout=0\nredirect-origin-tainted=0\nerror=\n"
+        "transport-timeout=0\nredirect-origin-tainted=0\nerror=%s\n"
         "request-body-length=0\n"
         "request-body-hash=cbf29ce484222325\n"
         "request-content-type=\n"
@@ -421,6 +424,8 @@ static bool write_stylesheet_replay_record(
         "response-header-count=%zu\n"
         "set-cookie-count=0\nresponse-header-0=content-type: %s\n",
         record->url, record->url,
+        record->error == NULL ? 1 : 0,
+        record->error == NULL ? "" : record->error,
         record->request_cookie_bytes,
         record->request_if_none_match == NULL
             ? "" : record->request_if_none_match,
@@ -1573,14 +1578,21 @@ static bool test_css_data_svg_mask_uses_bounded_image_pipeline(void)
     return ok && clean;
 }
 
+/* "name.jpg.webp" names its original, so the cheaper sibling is fetched
+   ("name.jpg", never "name.jpg.jpg"); a bare "name.webp" names no sibling
+   and is fetched as written. */
 static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
 {
     static const char html[] =
         "<!doctype html><body><img id=hero "
-        "src='image?id=hero.webp&quality=80'>";
+        "src='image?id=hero.jpg.webp&quality=80'>"
+        "<img id=card src='news/480/card.jpg.webp'>"
+        "<img id=plain src='plain.webp'>";
     static const char document_url[] = "https://image.example/page";
     static const char jpeg_url[] =
         "https://image.example/image?id=hero.jpg&quality=80";
+    static const char card_url[] = "https://image.example/news/480/card.jpg";
+    static const char plain_url[] = "https://image.example/plain.webp";
     static const char svg[] =
         "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='1'>"
         "<rect width='2' height='1' fill='#123456'/></svg>";
@@ -1596,6 +1608,38 @@ static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
         .url = jpeg_url,
         .body = svg,
         .effective_url = jpeg_url,
+        .content_type = "image/svg+xml",
+        .request_accept = image_accept,
+        .request_sec_fetch_dest = "image",
+        .request_sec_fetch_mode = "no-cors",
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "strict-origin-when-cross-origin",
+        .status = 200,
+        .request_send_low_client_hints = true
+    }, {
+        .url = card_url,
+        .body = svg,
+        .effective_url = card_url,
+        .content_type = "image/svg+xml",
+        .request_accept = image_accept,
+        .request_sec_fetch_dest = "image",
+        .request_sec_fetch_mode = "no-cors",
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "strict-origin-when-cross-origin",
+        .status = 200,
+        .request_send_low_client_hints = true
+    }, {
+        .url = plain_url,
+        .body = svg,
+        .effective_url = plain_url,
         .content_type = "image/svg+xml",
         .request_accept = image_accept,
         .request_sec_fetch_dest = "image",
@@ -1630,12 +1674,12 @@ static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
         ok = replaying && images_load_external(
             &document, &stylesheet, &images, &budget,
             document_url, document_url, "strict-origin-when-cross-origin",
-            2, 4096, 2048, 4096, 1000, NULL, NULL)
+            4, 4096, 2048, 4096, 1000, NULL, NULL)
             && fetch_trace_replay_stats(&replay_stats);
     }
-    ok = ok && images.stats.compatible_format_rewrites == 1
-        && images.stats.loaded == 1 && images.stats.unsupported == 0
-        && replay_stats.matched_request_count == 1
+    ok = ok && images.stats.compatible_format_rewrites == 2
+        && images.stats.loaded == 3 && images.stats.unsupported == 0
+        && replay_stats.matched_request_count == 3
         && replay_stats.unmatched_request_count == 0;
     if (!ok) {
         fprintf(stderr,
@@ -1645,6 +1689,118 @@ static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
                 images.stats.loaded, images.stats.unsupported,
                 replay_stats.matched_request_count,
                 replay_stats.unmatched_request_count);
+    }
+    if (replaying) fetch_trace_end();
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (replay_written) remove_stylesheet_replay(
+        replay_directory, sizeof(replay) / sizeof(replay[0]));
+    return ok && clean;
+}
+
+/* A news header carries twenty-odd inline-SVG glyphs before its first
+   photograph. Icon-sized rasters (and short data: placeholders) must not
+   spend the per-page image count meant for network images; a large inline
+   SVG still counts, and once the count is spent only icons are admitted. */
+static bool test_icon_images_do_not_spend_image_count(void)
+{
+#define ICON(colour) "<svg width='16' height='16' viewBox='0 0 16 16'>" \
+    "<rect width='16' height='16' fill='" colour "'/></svg>"
+#define PANEL(colour) "<svg width='200' height='100'>" \
+    "<rect width='200' height='100' fill='" colour "'/></svg>"
+    static const char html[] =
+        "<!doctype html><body>"
+        ICON("#100000") ICON("#200000") ICON("#300000") ICON("#400000")
+        ICON("#500000") ICON("#600000")
+        "<img id=placeholder src=\"data:image/svg+xml,%3Csvg "
+        "xmlns='http://www.w3.org/2000/svg' width='1' height='1'%3E%3C/svg%3E\">"
+        "<img id=photo src='photo.png'>"
+        PANEL("#010000") PANEL("#020000")
+        ICON("#700000")
+        "</body>";
+#undef ICON
+#undef PANEL
+    static const char document_url[] = "https://news.example/page";
+    static const char photo_url[] = "https://news.example/photo.png";
+    static const char svg[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'>"
+        "<rect width='4' height='3' fill='#123456'/></svg>";
+    static const char image_accept[] =
+#if defined(TILEFINCH_DISABLE_GIF)
+        "image/png,image/jpeg,image/webp,image/svg+xml,image/*;q=0.8,"
+        "*/*;q=0.5";
+#else
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "image/*;q=0.8,*/*;q=0.5";
+#endif
+    static const StylesheetReplayRecord replay[] = {{
+        .url = photo_url,
+        .body = svg,
+        .effective_url = photo_url,
+        .content_type = "image/svg+xml",
+        .request_accept = image_accept,
+        .request_sec_fetch_dest = "image",
+        .request_sec_fetch_mode = "no-cors",
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "strict-origin-when-cross-origin",
+        .status = 200,
+        .request_send_low_client_hints = true
+    }};
+    char replay_directory[128] = {0};
+    bool replay_written = write_stylesheet_replay(
+        replay_directory, replay, sizeof(replay) / sizeof(replay[0]));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    FetchTraceReplayStats replay_stats = {0};
+    char replay_error[256] = {0};
+    bool replaying = false;
+    bool ok = replay_written && installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    if (ok) {
+        replaying = fetch_trace_replay_begin(
+            replay_directory, replay_error, sizeof(replay_error));
+        /* Two counted images: the photograph and the first panel. */
+        ok = replaying && images_load_external(
+            &document, &stylesheet, &images, &budget,
+            document_url, document_url, "strict-origin-when-cross-origin",
+            2, 4096, 2048, 1024 * 1024, 1000, NULL, NULL)
+            && fetch_trace_replay_stats(&replay_stats);
+    }
+    lxb_dom_node_t *photo = ok ? find_element_id(
+        lxb_dom_interface_node(document.html), "photo") : NULL;
+    const ImageResource *photo_image = photo == NULL
+        ? NULL : images_find_node(&images, photo);
+    size_t panels = 0, icons = 0;
+    for (size_t i = 0; i < images.count; i++) {
+        if (images.items[i].width == 200) panels++;
+        if (images.items[i].width == 16) icons++;
+    }
+    ok = ok && photo_image != NULL && photo_image->width == 4
+        && replay_stats.matched_request_count == 1
+        && icons == 7 && panels == 1
+        && images.stats.count_exempt == 9
+        && images.stats.attempted == 11
+        && images.stats.skipped_limit == 1;
+    if (!ok) {
+        fprintf(stderr,
+                "icon count replay='%s' photo=%d icons=%zu panels=%zu "
+                "attempted=%zu exempt=%zu skipped=%zu requests=%zu\n",
+                replay_error, photo_image != NULL, icons, panels,
+                images.stats.attempted, images.stats.count_exempt,
+                images.stats.skipped_limit,
+                replay_stats.matched_request_count);
     }
     if (replaying) fetch_trace_end();
     images_destroy(&images);
@@ -2095,6 +2251,213 @@ static bool test_stylesheet_pressure_omits_optional_sheet(void)
     return ok && clean;
 }
 
+/* Synthetic sheet shapes: many short rules, long selector lists sharing a
+   declaration block, a :root block of custom properties (unused ones are
+   dropped at parse), rules nested in matching @media blocks, and rules whose
+   declarations are all distinct. */
+enum {
+    SHEET_SHORT_RULES,
+    SHEET_LONG_RULES,
+    SHEET_CUSTOM_PROPERTIES,
+    SHEET_MEDIA_RULES,
+    SHEET_UNIQUE_DECLARATIONS,
+    SHEET_SHAPE_COUNT
+};
+
+static char *synthetic_sheet_page(int shape, size_t count, size_t *length,
+                                  size_t *css_offset, size_t *css_length)
+{
+    static const char head[] = "<!doctype html><style>";
+    static const char tail[] =
+        "</style><body><div class=card-1><span id=probe "
+        "class='container__title-text r1 m1'>probe</span></div></body>";
+    size_t capacity = sizeof(head) + sizeof(tail) + count * 400u + 64u;
+    char *html = malloc(capacity);
+    if (html == NULL) return NULL;
+    size_t at = (size_t) snprintf(html, capacity, "%s", head);
+    *css_offset = at;
+    if (shape == SHEET_CUSTOM_PROPERTIES) {
+        at += (size_t) snprintf(html + at, capacity - at, ":root{");
+    }
+    for (size_t i = 0; i < count && at < capacity; i++) {
+        int written = 0;
+        switch (shape) {
+        case SHEET_SHORT_RULES:
+            written = snprintf(html + at, capacity - at,
+                               ".r%zu{color:#123456}\n", i + 1u);
+            break;
+        case SHEET_LONG_RULES:
+            written = snprintf(
+                html + at, capacity - at,
+                ".card-%zu .container__headline-text--emphasis>a:hover,"
+                ".card-%zu .container__title-text,"
+                ".card-%zu .container__item--type-section .link{"
+                "color:#123456;font-weight:700;text-decoration:underline;"
+                "letter-spacing:.01em;margin:0 0 4px;padding:2px 4px;"
+                "line-height:1.25;display:block;"
+                "border-bottom:1px solid #ccc;font-size:15px}\n",
+                i + 1u, i + 1u, i + 1u);
+            break;
+        case SHEET_CUSTOM_PROPERTIES:
+            written = snprintf(html + at, capacity - at,
+                               "--token-color-%zu:#%06zx;", i, i & 0xffffffu);
+            break;
+        case SHEET_MEDIA_RULES:
+            written = snprintf(html + at, capacity - at,
+                               "@media (max-width:600px){.m%zu{display:flex;"
+                               "gap:4px}}\n", i + 1u);
+            break;
+        default:
+            written = snprintf(
+                html + at, capacity - at,
+                ".u%zu a,.u%zu b{color:#%06zx;margin:%zupx %zupx;"
+                "padding:%zupx;width:%zupx;height:%zupx;font-size:%zupx;"
+                "line-height:%zupx;border:%zupx solid #%06zx;z-index:%zu}\n",
+                i, i, i & 0xffffffu, i % 97u, i % 89u, i % 83u, i % 79u,
+                i % 73u, i % 71u + 8u, i % 67u + 9u, i % 7u,
+                (i * 7u) & 0xffffffu, i);
+            break;
+        }
+        if (written < 0) {
+            free(html);
+            return NULL;
+        }
+        at += (size_t) written;
+    }
+    if (shape == SHEET_CUSTOM_PROPERTIES && at < capacity) {
+        at += (size_t) snprintf(html + at, capacity - at, "}");
+    }
+    *css_length = at - *css_offset;
+    if (at < capacity) {
+        at += (size_t) snprintf(html + at, capacity - at, "%s", tail);
+    }
+    if (at >= capacity) {
+        free(html);
+        return NULL;
+    }
+    *length = at;
+    return html;
+}
+
+/* Style bytes that loading the page's author CSS retains once the rule
+   index exists, the cost admission must bound. */
+static bool synthetic_sheet_style_bytes(const char *html, size_t length,
+                                        size_t *style_bytes)
+{
+    Budget budget;
+    budget_init(&budget, 64u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    bool ok = installed
+        && document_parse(&document, &budget, html, length, 4096)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    size_t before = budget.categories[BUDGET_CATEGORY_STYLE].current;
+    ok = ok && stylesheets_load_external_tracked(
+        &document, &stylesheet, &budget, "https://fixture.test/page",
+        4, 4096, 4096, 1000, NULL, NULL, &resources, &stats);
+    lxb_dom_node_t *probe = ok ? find_element_id(
+        lxb_dom_interface_node(document.html), "probe") : NULL;
+    if (probe != NULL) (void) style_for_node(&stylesheet, probe, NULL);
+    size_t after = budget.categories[BUDGET_CATEGORY_STYLE].current;
+    ok = ok && probe != NULL && stats.skipped_pressure == 0
+        && budget.failure_count == 0;
+    *style_bytes = after > before ? after - before : 0;
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_stylesheet_cost_estimate_bounds_parsed_cost(void)
+{
+    static const size_t counts[] = {300u, 3000u, 12000u};
+    bool ok = true;
+    for (int shape = 0; ok && shape < SHEET_SHAPE_COUNT; shape++) {
+        for (size_t c = 0; ok && c < sizeof(counts) / sizeof(counts[0]);
+             c++) {
+            size_t length = 0, css_offset = 0, css_length = 0;
+            char *html = synthetic_sheet_page(shape, counts[c], &length,
+                                              &css_offset, &css_length);
+            size_t retained = 0;
+            ok = html != NULL
+                && synthetic_sheet_style_bytes(html, length, &retained);
+            size_t estimate = html == NULL ? 0
+                : stylesheet_source_cost_estimate(html + css_offset,
+                                                  css_length);
+            /* An upper bound for every shape. Long real-world rules are
+               not over-reserved the way the former 3x-of-source guess was
+               (it refused cnn.com's 2 MiB sheet with 6 MiB to spare). */
+            ok = ok && retained <= estimate
+                && (shape != SHEET_LONG_RULES || counts[c] < 3000u
+                    || estimate < 3u * css_length);
+            if (!ok) {
+                fprintf(stderr,
+                        "stylesheet estimate shape=%d count=%zu source=%zu "
+                        "retained=%zu estimate=%zu\n",
+                        shape, counts[c], css_length, retained, estimate);
+            }
+            free(html);
+        }
+    }
+    return ok;
+}
+
+/* A sheet whose parsed cost fits beside the layout reserve is admitted
+   even when three times its source would not fit. */
+static bool test_stylesheet_admission_uses_parsed_cost(void)
+{
+    size_t length = 0, css_offset = 0, css_length = 0;
+    char *html = synthetic_sheet_page(SHEET_LONG_RULES, 3000u, &length,
+                                      &css_offset, &css_length);
+    if (html == NULL) return false;
+    size_t estimate = stylesheet_source_cost_estimate(
+        html + css_offset, css_length);
+    Budget budget;
+    budget_init(&budget, 64u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    bool ok = installed && estimate < 3u * css_length
+        && document_parse(&document, &budget, html, length, 4096)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    size_t original_limit = budget.limit;
+    if (ok) {
+        budget.limit = budget.current + 2u * MIB + estimate
+            + (3u * css_length - estimate) / 2u;
+        ok = stylesheets_load_external_tracked(
+            &document, &stylesheet, &budget, "https://fixture.test/page",
+            4, 4096, 4096, 1000, NULL, NULL, &resources, &stats);
+    }
+    lxb_dom_node_t *probe = ok ? find_element_id(
+        lxb_dom_interface_node(document.html), "probe") : NULL;
+    ComputedStyle style = probe == NULL ? (ComputedStyle) {0}
+        : style_for_node(&stylesheet, probe, NULL);
+    budget.limit = original_limit;
+    ok = ok && stats.skipped_pressure == 0 && budget.failure_count == 0
+        && style.color == 0x123456 && style.display == DISPLAY_BLOCK;
+    if (!ok) {
+        fprintf(stderr,
+                "stylesheet parsed-cost admission source=%zu estimate=%zu "
+                "skipped=%zu failures=%zu color=%06x\n",
+                css_length, estimate, stats.skipped_pressure,
+                budget.failure_count, (unsigned) style.color);
+    }
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    free(html);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
 {
     static const char page[] = "https://fixture.test/page";
@@ -2115,7 +2478,11 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
     Stylesheet stylesheet = {0};
     StylesheetDocumentResources resources = {.budget = &budget};
     ExternalStylesheetStats stats = {0};
-    unsigned char *large_bytes = budget_calloc(&budget, LARGE_BYTES, 1u);
+    /* 5,000 rule blocks: parsing them would cost megabytes. */
+    unsigned char *large_bytes = budget_malloc(&budget, LARGE_BYTES);
+    for (size_t i = 0; large_bytes != NULL && i < LARGE_BYTES; i++) {
+        large_bytes[i] = (unsigned char) ".a{}"[i % 4u];
+    }
     unsigned char *late_bytes = budget_malloc(&budget, sizeof(late_css) - 1u);
     if (late_bytes != NULL) {
         memcpy(late_bytes, late_css, sizeof(late_css) - 1u);
@@ -2140,8 +2507,9 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
     browser_shared_body_release(late_body);
     size_t original_limit = budget.limit;
     if (ok) {
-        /* The 20 KiB sheet needs a 60 KiB parse allowance and is refused;
-           the minimum 32 KiB allowance for the tiny late sheet still fits. */
+        /* The 20 KiB sheet's 5,000 rules need a multi-megabyte parse
+           allowance and are refused; the minimum 32 KiB allowance for the
+           tiny late sheet still fits. */
         budget.limit = budget.current + 3u * MIB + 55u * 1024u;
         ok = stylesheets_load_external_tracked(
             &document, &stylesheet, &budget, page, 4, LARGE_BYTES,
@@ -2502,6 +2870,285 @@ static bool test_complete_selector_census_reopens_retained_sources_once(void)
         && resources.items[1].rules_applied;
 }
 
+/* A capture records a response that stopped at its byte cap as a failed
+   transfer holding the bytes received. Only the complete rules of that
+   prefix may apply: never the rule, declaration, string, comment or @media
+   block the cap cut through. */
+static bool test_truncated_sheet_applies_only_complete_rules(void)
+{
+    static const char document_url[] = "https://document.example/page.html";
+    static const char stylesheet_url[] = "https://document.example/big.css";
+    static const char html[] =
+        "<!doctype html><link rel=stylesheet href=big.css>"
+        "<body><div id=a>a</div><div id=b>b</div><div id=c>c</div>"
+        "<div id=d>d</div><div id=z>z</div></body>";
+    static const struct {
+        const char *name;
+        const char *body;
+        size_t rules;
+        uint32_t colors[4];
+    } cases[] = {
+        { "mid-rule",
+          "#a{color:#010101}#b{color:#020202}#c{col",
+          2, { 0x010101, 0x020202, 0, 0 } },
+        { "mid-declaration",
+          "#a{color:#010101}#b{color:#020202;background:#0",
+          1, { 0x010101, 0, 0, 0 } },
+        { "inside-media",
+          "#a{color:#010101}@media (min-width:1px){#b{color:#020202}"
+          "#c{color:#030303}#d{co",
+          1, { 0x010101, 0, 0, 0 } },
+        { "inside-string",
+          "#a{color:#010101}#b{color:#020202}#c{content:\"}#d{color:#040404}",
+          2, { 0x010101, 0x020202, 0, 0 } },
+        { "inside-comment",
+          "#a{color:#010101}/* x */#b{color:#020202}/* #c{color:#030303} ",
+          2, { 0x010101, 0x020202, 0, 0 } },
+        { "after-complete-media",
+          "@media (min-width:1px){#a{color:#010101}}#b{color:#020202}#c",
+          2, { 0x010101, 0x020202, 0, 0 } },
+    };
+    const char *ids[4] = { "a", "b", "c", "d" };
+    bool all = true;
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]);
+         index++) {
+        StylesheetReplayRecord replay[] = {{
+            .url = stylesheet_url,
+            .body = cases[index].body,
+            .effective_url = stylesheet_url,
+            .request_referer = document_url,
+            .request_sec_fetch_site = "same-origin",
+            .request_credential_origin = document_url,
+            .request_initiator_url = document_url,
+            .request_referrer_source = document_url,
+            .request_referrer_policy = "unsafe-url",
+            .response_cache_control = "max-age=3600",
+            .status = 200,
+            .error = "response quota exceeded"
+        }};
+        char replay_directory[128] = {0};
+        bool replay_written = write_stylesheet_replay(
+            replay_directory, replay, 1);
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession session = {0};
+        bool session_ready = false;
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        StylesheetDocumentResources resources = {0};
+        ExternalStylesheetStats stats = {0};
+        bool replaying = false;
+        session_ready = installed
+            && browser_session_init(&session, &budget, 512u * 1024u);
+        bool ok = replay_written && session_ready
+            && document_parse(&document, &budget, html, sizeof(html) - 1u,
+                              17)
+            && stylesheet_build(&stylesheet, &budget, &document, 480);
+        size_t rules_before = stylesheet.count;
+        if (ok) {
+            char error[256] = {0};
+            replaying = fetch_trace_replay_begin(
+                replay_directory, error, sizeof(error));
+            ok = replaying && stylesheets_load_external_tracked_with_context(
+                &document, &stylesheet, &budget, document_url, document_url,
+                "unsafe-url", 4, 4096, 4096, 1000, NULL, &session,
+                &resources, &stats);
+        }
+        size_t kept = stylesheet_complete_rules_prefix(
+            cases[index].body, strlen(cases[index].body));
+        const StylesheetDocumentResource *resource =
+            find_stylesheet_resource(&resources, stylesheet_url);
+        ok = ok && stats.loaded == 1 && stats.terminal_failures == 0
+            && stats.truncated == 1
+            && stats.truncated_received_bytes == strlen(cases[index].body)
+            && stats.truncated_applied_bytes == kept
+            && resource != NULL && resource->truncated
+            && resource->state == STYLESHEET_DOCUMENT_RESOURCE_LOADED
+            && resource->length == kept
+            && stylesheet.count - rules_before == cases[index].rules;
+        /* 0 means "no author rule": the color of the never-styled #z. */
+        lxb_dom_node_t *unstyled = ok ? find_element_id(
+            lxb_dom_interface_node(document.html), "z") : NULL;
+        uint32_t initial = unstyled == NULL ? 0
+            : style_for_node(&stylesheet, unstyled, NULL).color;
+        ok = ok && unstyled != NULL;
+        for (size_t at = 0; ok && at < 4; at++) {
+            lxb_dom_node_t *node = find_element_id(
+                lxb_dom_interface_node(document.html), ids[at]);
+            ComputedStyle computed = style_for_node(&stylesheet, node, NULL);
+            uint32_t expected = cases[index].colors[at] == 0
+                ? initial : cases[index].colors[at];
+            ok = node != NULL && computed.color == expected;
+        }
+        /* The cut response is this document's, never the HTTP cache's. */
+        const BrowserCacheEntry *cached = NULL;
+        ok = ok && browser_session_cache_match_http(
+                       &session, stylesheet_url, UINT64_C(2), &cached)
+                   == BROWSER_CACHE_MISS;
+        if (replaying) fetch_trace_end();
+        stylesheet_document_resources_destroy(&resources);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+        if (session_ready) browser_session_destroy(&session);
+        bool clean = budget.current == 0;
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        if (replay_written) remove_stylesheet_replay(replay_directory, 1);
+        if (!ok || !clean) {
+            fprintf(stderr, "truncated stylesheet case %s failed "
+                    "(rules=%zu loaded=%zu terminal=%zu truncated=%zu "
+                    "clean=%d)\n", cases[index].name,
+                    stylesheet.count, stats.loaded,
+                    stats.terminal_failures, stats.truncated, (int) clean);
+            all = false;
+        }
+    }
+    return all;
+}
+
+/* A stylesheet past its profile's large-sheet per-file cap is admitted by
+   memory: with Budget room it arrives whole and its last rule applies; in a
+   tight Budget the request keeps the cap, as before. gitlab.com's
+   application.css is 1,017,243 bytes against the PSP's 768 KiB cap. */
+static bool test_large_sheet_admitted_by_memory(void)
+{
+    static const char document_url[] = "https://document.example/page.html";
+    static const char stylesheet_url[] = "https://document.example/big.css";
+    static const char html[] =
+        "<!doctype html><link rel=stylesheet href=big.css>"
+        "<body><div id=z>z</div></body>";
+    static const char last_rule[] = "#z{color:#0a0b0c}";
+    const size_t floor_bytes = 512u * 1024u;
+    const size_t filler_rules = 600u * 1024u / 24u;
+    size_t body_capacity = filler_rules * 24u + sizeof(last_rule);
+    char *body = malloc(body_capacity);
+    if (body == NULL) return false;
+    size_t length = 0;
+    for (size_t i = 0; i < filler_rules; i++) {
+        length += (size_t) snprintf(body + length, body_capacity - length,
+                                    ".f%06zu{color:#123456}", i);
+    }
+    memcpy(body + length, last_rule, sizeof(last_rule));
+    length += sizeof(last_rule) - 1u;
+    static const struct {
+        const char *name;
+        size_t budget_bytes;
+        bool admitted;
+    } cases[] = {
+        { "room", 32u * MIB, true },
+        { "tight", 5u * MIB, false },
+    };
+    bool all = length > floor_bytes;
+    for (size_t index = 0; all && index < sizeof(cases) / sizeof(cases[0]);
+         index++) {
+        StylesheetReplayRecord replay[] = {{
+            .url = stylesheet_url,
+            .body = body,
+            .effective_url = stylesheet_url,
+            .request_referer = document_url,
+            .request_sec_fetch_site = "same-origin",
+            .request_credential_origin = document_url,
+            .request_initiator_url = document_url,
+            .request_referrer_source = document_url,
+            .request_referrer_policy = "unsafe-url",
+            .response_cache_control = "max-age=3600",
+            .status = 200
+        }};
+        char replay_directory[128] = {0};
+        bool replay_written = write_stylesheet_replay(
+            replay_directory, replay, 1);
+        Budget budget;
+        budget_init(&budget, cases[index].budget_bytes);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession session = {0};
+        bool session_ready = installed
+            && browser_session_init(&session, &budget, 64u * 1024u);
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        StylesheetDocumentResources resources = {0};
+        ExternalStylesheetStats stats = {0};
+        bool replaying = false;
+        bool ok = replay_written && session_ready
+            && document_parse(&document, &budget, html, sizeof(html) - 1u,
+                              17)
+            && stylesheet_build(&stylesheet, &budget, &document, 480);
+        if (ok) {
+            char error[256] = {0};
+            replaying = fetch_trace_replay_begin(
+                replay_directory, error, sizeof(error));
+            ok = replaying && stylesheets_load_external_tracked_with_context(
+                &document, &stylesheet, &budget, document_url, document_url,
+                "unsafe-url", 4, 4u * MIB, floor_bytes, 5000, NULL,
+                &session, &resources, &stats);
+        }
+        lxb_dom_node_t *target = ok ? find_element_id(
+            lxb_dom_interface_node(document.html), "z") : NULL;
+        bool styled = target != NULL
+            && style_for_node(&stylesheet, target, NULL).color == 0x0a0b0c;
+        ok = ok && target != NULL && styled == cases[index].admitted
+            && stats.loaded == (cases[index].admitted ? 1u : 0u)
+            && stats.truncated == 0;
+        if (replaying) fetch_trace_end();
+        stylesheet_document_resources_destroy(&resources);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+        if (session_ready) browser_session_destroy(&session);
+        bool clean = budget.current == 0;
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        if (replay_written) remove_stylesheet_replay(replay_directory, 1);
+        if (!ok || !clean) {
+            fprintf(stderr, "large sheet case %s failed (styled=%d loaded=%zu "
+                    "truncated=%zu terminal=%zu clean=%d)\n",
+                    cases[index].name, (int) styled, stats.loaded,
+                    stats.truncated, stats.terminal_failures, (int) clean);
+            all = false;
+        }
+    }
+    free(body);
+    return all;
+}
+
+static bool test_complete_rules_prefix_scanner(void)
+{
+    static const struct {
+        const char *css;
+        size_t expected;
+    } cases[] = {
+        { "", 0 },
+        { "a{}", 3 },
+        { "a{} b", 3 },
+        { "@import url(x.css);a{", 19 },
+        { "@import url(x.css) screen", 0 },
+        { "@import url(x;y.css);b{}", 24 },
+        { "@import \"x;y.css\";", 18 },
+        { "a{background:url(x}y.png)}b{", 26 },
+        { "a{background:url(x}y.png", 0 },
+        { "a{content:'\\'}'}b{}c", 19 },
+        { "a\\{b{}c{", 6 },
+        { "a{x:1}\\", 6 },
+        { "@media x{a{}b{}}c{d{}", 16 },
+        { "@supports (x:y){a{}", 0 },
+        { "a{}/*}*/b{}/*", 11 },
+        { "a{}\"unterminated\nb{}", 20 },
+        /* A stray top-level brace is part of the next rule's prelude. */
+        { "a{} } b{}c", 9 },
+        { "a{} }", 3 },
+        /* Parentheses hide a top-level ';'. */
+        { "@media (x;y){a{}}b", 17 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t got = stylesheet_complete_rules_prefix(
+            cases[i].css, strlen(cases[i].css));
+        if (got != cases[i].expected) {
+            fprintf(stderr, "complete-rules prefix case %zu (%s): got %zu "
+                    "expected %zu\n", i, cases[i].css, got,
+                    cases[i].expected);
+            return false;
+        }
+    }
+    return stylesheet_complete_rules_prefix(NULL, 4) == 0;
+}
+
 int main(void)
 {
 #define RUN_TEST(test) do {                                                  \
@@ -2527,6 +3174,7 @@ int main(void)
     RUN_TEST(test_css_images_keep_declaring_source_context);
     RUN_TEST(test_css_data_svg_mask_uses_bounded_image_pipeline);
     RUN_TEST(test_webp_url_uses_same_origin_jpeg_sibling);
+    RUN_TEST(test_icon_images_do_not_spend_image_count);
     RUN_TEST(test_css_paint_layers_keep_distinct_resources);
     RUN_TEST(test_invalid_href_has_terminal_state);
     RUN_TEST(test_blocker_bypasses_fresh_cached_stylesheet);
@@ -2534,11 +3182,16 @@ int main(void)
     RUN_TEST(test_cors_stylesheet_reuses_document_preload);
     RUN_TEST(test_stylesheet_pressure_omits_optional_sheet);
     RUN_TEST(test_pressure_skipped_sheet_preserves_later_byte_quota);
+    RUN_TEST(test_stylesheet_cost_estimate_bounds_parsed_cost);
+    RUN_TEST(test_stylesheet_admission_uses_parsed_cost);
     RUN_TEST(test_compiled_fragment_reuses_external_css_with_new_inline_css);
     RUN_TEST(test_parsed_ir_is_viewport_bound_and_fails_closed);
     RUN_TEST(test_ir_capture_bounds_transient_storage);
     RUN_TEST(test_uncacheable_retained_css_skips_ir_capture);
     RUN_TEST(test_complete_selector_census_reopens_retained_sources_once);
+    RUN_TEST(test_complete_rules_prefix_scanner);
+    RUN_TEST(test_truncated_sheet_applies_only_complete_rules);
+    RUN_TEST(test_large_sheet_admitted_by_memory);
 #undef RUN_TEST
     puts("stylesheet resource tests passed");
     return 0;

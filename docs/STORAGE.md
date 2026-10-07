@@ -73,11 +73,138 @@ smaller. "Writer" names the owning source file.
 | `entropy-seed.bin` | `psp_entropy.c` | 48 B | replaced once per boot, when the TLS entropy pool first seeds | direct overwrite; a torn, damaged or all-zero file is ignored (it is mixed in but never credited, so losing it costs nothing; see [PSP_TRANSPORT.md](engineering/PSP_TRANSPORT.md#entropy)) |
 | `site-storage/p-<hash>` | `session_site_storage.c` | per site, ≤ 4 MB live data; the log is compacted before it passes twice the dead-record threshold plus live data | **Settings → Device & storage → Site data & storage** deletes one; so does the site's **Clear data for this site** | append-only checksummed log; compaction writes `.tmp`, then remove + rename, and a load recovers a lone `.tmp` |
 | `site-storage/s-NN`, `session-files` | `session_site_storage.c` | as above | deleted at exit; after a crash, at the next boot (only when the `session-files` marker exists) | as above |
+| `script-cache/<build>-<hash>.tfsc`, `script-cache/index.tfsi` | `session_script_disk.c` | 8 MB of packs in all (each at most 2 MiB, at most 256), plus an index of at most 9 KB; one `.tmp` pack while a write is in flight | **Keep compiled scripts** off (removes them all), **Clear compiled scripts**, **Clear HTTP caches**, a site's **Clear data for this site** (its packs), least recently used first when full, and the sweep (another build's packs, stray `.tmp`, packs the index does not name) | each pack: written to `.tmp` in idle slices, then remove + rename; index: tmp + remove + rename, and a loader that finds only a complete `index.tfsi.tmp` uses it; a pack or index that fails its CRC-32 is a miss and is removed |
 | `boot-overrides.cfg` | `psp_boot_config.c` | 4 bounded lines | user-managed | tmp + remove + rename |
 | `tilefinch-last-error.txt` | `psp_script_main.c` | one bounded device-error snapshot (URL ≤ 2047 bytes, detail ≤ 1023 bytes) | disabling **Save error reports** removes it; a newer saved failure replaces it | tmp + remove + rename; ordinary failures write only when opted in, while a fatal startup failure writes once regardless because the diagnostic UI may never become available |
 | `themes/*.tfth` | user-provided (two examples ship with first installs) | ≤ 64 directory entries visited and ≤ 12 valid files retained per chooser scan; each file ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only; the directory is scanned only in the chooser and only the selected file is read at boot |
 | `theme.tfth` | legacy user-provided theme | ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only compatibility path for an older Custom selection |
 | `adblock.txt`, `adblock-allow.txt` | user-provided | read-only | user-managed | n/a |
+
+### Compiled script caches
+
+Compiled QuickJS bytecode of page scripts is kept for the session in two
+in-memory tables (`session.c`, `BrowserScriptBytecodeTable`), one for ES
+modules and one for classic external scripts. By default neither is written
+to the Memory Stick (`http-cache.bin` holds response bodies only): installed
+offline apps carry their own bytecode, and the opt-in **Keep compiled
+scripts** tier below is the only other on-card bytecode.
+
+| Table | Ceiling | Key | Dropped by |
+|---|---|---|---|
+| ES modules | 1 MiB (512 KiB strict profile), `BrowserConfig.module_bytecode_cache_limit` | module-map name, response URL, top-level site, strip flags, SHA-256 of the exact source | LRU to admit a store, clear cache, optional-memory reclaim, the Budget reclaim hook, teardown |
+| Classic external scripts | 3 MiB (1.5 MiB strict profile), `BrowserConfig.classic_bytecode_cache_limit`; a script over 768 KiB of source is not stored | compile name, request URL, top-level site, ResourceLoader segment ordinal, compile type, SHA-256 of the exact source | as above |
+| Lazy webpack bundle records (not bytecode; below) | 96 KiB, `BROWSER_LAZY_BUNDLE_RECORD_DEFAULT_BYTES` | a fixed record name, request URL, top-level site, record format, SHA-256 of the exact source | as above, and the reclaims take them last |
+
+Both are charged to the page Budget as `SESSION` memory, at most 128 entries
+each, and the table itself is allocated on the first store. An entry outlives
+the HTTP response it was compiled from: the response cache (640 KiB on the PSP,
+shared with images and stylesheets) used to carry classic bytecode and lost
+nearly all of it before a revisit. A lookup hashes the fetched bytes and
+reuses bytecode only for byte-identical source; bytecode is never used to
+satisfy a request. Before the page Budget refuses an allocation, the engine's
+reclaim hook evicts least-recently-used entries from the fuller table, and the
+script loader makes room the same way before it caps or skips a page script
+for memory pressure, so the caches can slow nothing but a later revisit. A store needs 3 MiB of Budget
+headroom beyond the copy and `64 KiB + 4 x source` of JavaScript heap, and
+entries the current document used are not evicted to admit more of the same
+load (the first scripts of a load are kept and hit on the next).
+
+A classic script is stored after the load, not during it: the load only
+hashes the source and keeps the compiled script, and the page's idle work
+serializes one queued script per quiet turn into the table. A ResourceLoader
+segment's evaluation runs the compile its preflight queued. The queue is the
+page's own JavaScript memory: a page left before its idle turns stores the
+oldest queued scripts, up to 256 KiB of their source, as it closes and drops
+the rest (the next visit compiles those again and stores them then); a cache
+clear and JavaScript heap pressure drop queued stores too. Because a classic
+script is serialized after it has run, the functions it called during the
+load are stored compiled rather than as text to compile on first call: the
+entry is larger (about 1.5 times, against 1.1 times the source when stored
+at compile time) and a revisit skips those compiles. Module bytecode is
+stored when the module compiles, because linking it rewrites the compiled
+record before any idle turn could serialize it.
+
+A lazily split webpack bundle (`js_lazy_webpack.c`; see
+[ARCHITECTURE.md](ARCHITECTURE.md#lazy-webpack-bundles)) has no bytecode in
+these tables; its factories compile when they first run. Every load of one
+plans the whole bundle (a lexer pass that finds the factories). A bundle
+record (`src/session_lazy_bundle.c`) keeps the plan of one exact byte
+sequence: the factory table (32 bytes plus 12 per factory). It says nothing
+about the factories' syntax, which is checked when each factory first
+compiles, on every load. A later load of the same bytes on the same site
+skips the planner; anything else, including a record from another bytecode
+ABI, engine build, release or record format, plans as a first visit does. A
+lookup hashes the
+bytes only when a record for the same site, URL and length exists, so a
+first visit hashes nothing; the record of a first visit is queued with a
+reference to the response body and digested at idle, 64 KiB per quiet turn,
+then stored. The queue (at most 16 records and 8 MiB of referenced bodies)
+belongs to the session and is dropped by a cache clear, a site's data clear
+and teardown. Both reclaims go to it first: a queued record holding the last
+reference to its body has its digest finished there and then (CPU only, no
+allocation) and lets the body go, so memory pressure costs the deferred
+hash, not the record. No-store responses are never recorded.
+
+A response whose `Cache-Control` carries `no-store` runs from source every
+time, whether it is a classic script, a module root or an imported module;
+its bytecode is not kept (it contains source text, for
+`Function.prototype.toString`: every classic script's, and that of modules
+under 8 KiB, which keep their text for that reason; larger modules are
+compiled without it). `data:` and `blob:` scripts, opaque-origin
+documents and captive sign-ins never use the classic table. Installed offline
+apps keep their own source-bound bytecode in `.app.pack` (see
+[`data/offline/`](#dataoffline--offline-library)); restored into the response
+cache for the app's launch, it is consulted before the table.
+
+#### Keep compiled scripts (persistent tier, off by default)
+
+**Settings → Device & storage → Site data & storage → Keep compiled
+scripts** keeps the compiled scripts of the two tables, and the lazy webpack
+bundle records, in `data/script-cache/` across restarts, so a page visited before an exit or a
+power-off restores its scripts instead of compiling them. It is off by
+default; the row shows the space its files use, **Clear compiled scripts**
+empties it, and turning it off removes its files. boot.cfg's
+`module_cache_dir=` (and `module_cache_write=1`) names another directory
+for development and then takes precedence over the menu.
+
+- One pack per group of records that share a table, compile name, URL and
+  top-level site: a MediaWiki `load.php` response and its segments are one
+  file. A pack holds each record's segment ordinal, compile flags, source
+  length and SHA-256 with its bytecode, and ends with a CRC-32 of the file.
+  The file name starts with this build's engine fingerprint, and the group
+  hash covers the fingerprint, pointer width and bytecode ABI, so packs of
+  another build are never read and are swept.
+- The index (`index.tfsi`) lists the packs with their size, a hash of their
+  top-level site and when they were last used. It is read once, the first
+  time the tier is used; a script it does not name costs no card access.
+- On a RAM miss for a script whose group the index names, the whole pack is
+  read at most once per page load, its CRC checked, and its records copied
+  into the RAM table, where the lookup finds them by source digest exactly as a RAM
+  hit (after the same fetch, CSP, SRI, CORS and MIME admission). A pack
+  that fails the check, or whose bytecode does not restore, is removed and
+  the script compiles.
+- Writing is idle work only: after the page's idle turns have stored its
+  scripts in RAM, further idle turns write the RAM records not yet on the
+  card, 16 KiB per turn, to `<pack>.tmp`, and rename it into place when it
+  is complete; the index is saved once nothing is left to write. Before a
+  write, least recently used packs are removed, one per turn, until the new
+  pack fits under 8 MB and 256 files. A group larger than 2 MiB stays in RAM
+  only.
+- The first idle turns of a session that writes sweep the directory in
+  bounded slices (8 entries, 2 ms) and remove other builds' packs, stray
+  `.tmp` files, the retired per-module tier's `.tfmb` records and packs the
+  index does not name (a pack published just before a crash or power cut).
+- Nothing is written during a captive sign-in or while **Cookies & storage**
+  blocks site data, and no-store responses, `data:`/`blob:` scripts and
+  opaque-origin documents never reach the tables it writes from.
+
+8 MB holds the compiled scripts of about 30 median script pages of the
+2026-10 site census (146 KiB of source each, about 1.5 times that in
+bytecode) or five of its heaviest (1.45 MiB of source at the 90th
+percentile), against 12-18 MB for all 55 pages. Writing it is a few seconds
+of idle Memory Stick time spread over many pages; see the
+[performance ledger](engineering/PERFORMANCE_LEDGER.md) for what a restart
+saves.
 
 ### Site storage
 
@@ -246,13 +373,24 @@ Install/update uses the shared
 and preflights the signed download and candidate space through the PSP-safe
 free-space helper.
 
+The in-page language-pack offer ([TEXT_BIDI.md](TEXT_BIDI.md#in-page-install-offer))
+adds no storage path. Deciding whether to show it reads nothing for ordinary
+pages; for a page whose census qualifies it runs the resolver's few `stat`
+calls once, and it never writes. Its **Install** is the menu's install above.
+**Don't ask again** answers and the **Offer language packs** switch are one
+append-only `GLYPHASK` record (a pack bit mask, then 1 for Off) in
+`profile.cfg`, written only while something is declined or the switch is
+Off; older builds ignore it. The size question reads signed metadata into
+RAM only. Which sites were already offered is session memory
+and never persisted.
+
 ### `data/offline/` — offline library
 
 | Path | Writer | Size bound | Evicted by | Discipline |
 |---|---|---|---|---|
 | `library.bin` (+`.bak`) | `offline_library.c` | ≤ 32 KB | never (12-item index) | backup rotation; loader tries primary, `.tmp`, then `.bak` |
 | `<id>.article.html` (+`.bak`) | `offline_library.c` | ≤ 1 MB each | user delete; replaced when the same URL is saved again | backup rotation; length + FNV checksum verified on read |
-| `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1 MiB/32 same-origin responses + 512 KiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed |
+| `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1.5 MiB/32 same-origin responses + 1 MiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed; while an app runs, a precompiled script's source is read back from `.app.pack` on demand and verified against a 64-bit FNV hash taken at launch; Library → Saved → Recompile (after an update changed the compiler) writes a complete new generation the same way and removes the old one only after the index names the new one |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
 
@@ -319,8 +457,10 @@ degrading when a pre-flight fails.
 | Browsing, site data off | ~2 MB (settings, recovery, tab session, all generations) | not enforced; writers fail individually and keep the prior generation |
 | Browsing with disk cache and local storage on | + up to 15 MB per enabled store (3 × 5 MB generations during a save; disk-cache payload further capped at 4 MB) | pre-flight in the exit cleanup (`psp_script_main.c`): one whole new generation per enabled store — the configured cache size (1/2/4 MB) plus 5 MB for local storage — else the save is refused with "MEMORY STICK FULL - SITE DATA NOT SAVED" and the prior generation is kept |
 | Keeping a site's storage on the Memory Stick | up to 4 MB per site, plus a transient second copy while its log is compacted | not pre-flighted; the prompt shows the free space, and a failed append fails that write |
+| Keep compiled scripts | up to 8 MB, plus one pack (at most 2 MiB) in flight | not pre-flighted; a write the card refuses is dropped and that group stays in RAM for the session |
 | Saving an offline article | 1.25 MB (1 MB article + 256 KB reserve) | pre-flight in `offline_library_save_article` |
-| Installing an offline web app | previewed document + typed resource pack + icon + 256 KiB | preview measurement and confirmed pre-flight in `offline_library_preview_web_app` / `offline_library_save_web_app` |
+| Recompiling an offline web app | the current markup + pack + icon + 256 KiB | pre-flight and a 256 KiB re-check after the new generation is written, in `offline_library_recompile_web_app` |
+| Installing an offline web app | previewed document + typed resource pack + icon + 256 KiB | preview measurement; confirmed pre-flight (document + captured bodies + icon + 256 KiB) and a 256 KiB re-check after the streamed pack is written, in `offline_library_preview_web_app` / `offline_library_save_web_app` |
 | Downloading an offline video | remaining stream bytes + 8 MB reserve | pre-flight in `offline_download.c` (pauses, does not fail, the item) |
 | Downloading + staging an update for a release of size *P* | `2 × P + 4 MB` (≤ 68 MB at the 32 MB package ceiling) | pre-flights in `update_client.c` and `update_installer.c` |
 | Taking a screenshot | 1 MB (one ≈ 385 KB capture plus headroom) | pre-flight in `psp_screenshot_destination`; total stored captures are still unbounded |
@@ -338,6 +478,11 @@ degrading when a pre-flight fails.
   Appends are buffered rather than flushed one by one, so a cut can lose
   the newest records; a torn record is dropped at the next load and every
   record before it survives.
+- **A cache, rebuilt as you browse**: `script-cache/`. A cut during a pack
+  write leaves a `.tmp` the next sweep removes; a cut in the index's
+  remove-rename window leaves its complete `.tmp`, which the next start
+  reads; packs written after the last index save are removed by the next
+  sweep and compiled again.
 - **Lost if the cut lands in the remove-rename window**: `recovery.cfg`
   (start page falls back to the homepage), `tab-hibernation.bin` (that tab's
   history), `boot-overrides.cfg` (written by the one-time compatibility

@@ -234,12 +234,18 @@ static const unsigned char *image_pixels_for_command(
     bool wants_scaled = !image->is_canvas
         && command->image_fit == LAYOUT_IMAGE_FIT_STRETCH
         && (scaled_width != image->width || scaled_height != image->height);
-    bool direct_scaled_jpeg = false;
-    if (command->image_fit == LAYOUT_IMAGE_FIT_COVER
-        && image->pixels == NULL && image->encoded != NULL
-        && image->encoded_length >= 2u
-        && image->encoded[0] == 0xffu && image->encoded[1] == 0xd8u
-        && image->width > 0 && image->height > 0
+    /* A raster still held encoded is decoded straight at the size it is
+       painted when that is smaller (any format: the decoders reduce while
+       decoding), instead of at its resource size and then point-sampled.
+       Each painted size is its own scaled-cache entry, so a later, larger
+       paint decodes again at that size rather than enlarging this one. */
+    bool encoded_raster = !image->is_canvas && image->pixels == NULL
+        && image->encoded != NULL && image->encoded_length != 0
+        && image->width > 0 && image->height > 0;
+    bool direct_scaled = encoded_raster && wants_scaled
+        && scaled_width > 0 && scaled_height > 0
+        && scaled_width <= image->width && scaled_height <= image->height;
+    if (command->image_fit == LAYOUT_IMAGE_FIT_COVER && encoded_raster
         && command->width > 0 && command->height > 0
         && (size_t) command->width
                <= SIZE_MAX / (size_t) image->height
@@ -262,10 +268,12 @@ static const unsigned char *image_pixels_for_command(
                 + (product % (size_t) image->height != 0));
             scaled_height = command->height;
         }
-        direct_scaled_jpeg = scaled_width > 0 && scaled_height > 0
-            && scaled_width < image->width
-            && scaled_height < image->height;
-        wants_scaled = direct_scaled_jpeg;
+        direct_scaled = scaled_width > 0 && scaled_height > 0
+            && scaled_width <= image->width
+            && scaled_height <= image->height
+            && (scaled_width < image->width
+                || scaled_height < image->height);
+        wants_scaled = direct_scaled;
     }
     bool scaled_failed = false;
     if (wants_scaled) {
@@ -288,7 +296,7 @@ static const unsigned char *image_pixels_for_command(
         }
     }
 
-    if (direct_scaled_jpeg && !scaled_failed) {
+    if (direct_scaled && !scaled_failed) {
         ImageResource decode_target = *image;
         decode_target.width = scaled_width;
         decode_target.height = scaled_height;
@@ -327,7 +335,7 @@ static const unsigned char *image_pixels_for_command(
     const unsigned char *source = decoded_image_pixels(
         cache, image, temporary_decoded);
     if (source == NULL) return NULL;
-    if (wants_scaled && !direct_scaled_jpeg && !scaled_failed
+    if (wants_scaled && !direct_scaled && !scaled_failed
         && command->width > 0 && command->height > 0) {
         size_t width = (size_t) scaled_width;
         size_t height = (size_t) scaled_height;
@@ -1069,6 +1077,40 @@ static int rounded_rect_distance_half(int x, int y, int rect_x, int rect_y,
    and inlining this body -- the distance field and its smoothstep -- charges
    every fill, stroke and glyph dispatch the I-cache footprint of the
    rarest arm. The hot-symbol ratchet measures that dispatch. */
+/* Shadow coverage of one pixel, already scaled by alpha (0 = nothing). */
+static unsigned shadow_pixel_alpha(int x, int y, int shadow_x, int shadow_y,
+                                   int shadow_width, int shadow_height,
+                                   int radius, int blur, unsigned alpha)
+{
+    int distance = rounded_rect_distance_half(
+        x, y, shadow_x, shadow_y, shadow_width, shadow_height, radius);
+    unsigned coverage;
+    if (blur == 0) {
+        if (distance >= 0) return 0;
+        coverage = 256u;
+    } else {
+        /* CSS defines the blur radius as a Gaussian of standard
+           deviation blur/2, whose visible transition spans roughly
+           one blur radius either side of the shadow edge.  In
+           half-pixel units that is [-2*blur, +2*blur], which is also
+           exactly how far the command box was inflated. */
+        int reach = 2 * blur;
+        if (distance >= reach) return 0;
+        if (distance <= -reach) coverage = 256u;
+        else {
+            int t = (reach - distance) * 256 / (2 * reach);
+            if (t < 0) t = 0;
+            if (t > 256) t = 256;
+            coverage = (unsigned) (t * t * (768 - 2 * t)) / 65536u;
+            if (coverage > 256u) coverage = 256u;
+        }
+    }
+    unsigned blended = alpha * coverage / 256u;
+    return blended > 255u ? 255u : blended;
+}
+
+enum { SHADOW_EDGE_TABLE = 128 };
+
 __attribute__((noinline))
 static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
                              int x0, int y0, int x1, int y1, unsigned alpha)
@@ -1088,47 +1130,189 @@ static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
     int shadow_width = (int) shadow_width64;
     int shadow_height = (int) shadow_height64;
     int radius = command->radius;
+    /* Separable structure of the distance field. With cx = |2(x -
+       shadow_x) + 1 - width| - (width - 2r) (half pixels, likewise cy) and
+       T = min(0, 2r - 2*blur), a pixel with cx <= T and cy <= T is fully
+       covered (distance <= T - 2r <= -2*blur). Within the rows where
+       cy <= T the distance is a function of cx alone, and within the
+       columns where cx <= T one of cy alone. So the core is a constant,
+       the left and right edges repeat one row of coverage, the top and
+       bottom edges one value per row, and only the corners need the
+       distance per pixel. Each pixel gets the same blend as before. */
+    bool core = blur > 0;
+#ifndef __PSP__
+    core = core && !tilefinch_test_faults()->shadow_reference_raster;
+#endif
+    int core_x0 = 0, core_x1 = 0, core_y0 = 0, core_y1 = 0;
+    if (core) {
+        int64_t r = radius < 0 ? 0 : radius;
+        int64_t limit = shadow_width < shadow_height
+            ? shadow_width / 2 : shadow_height / 2;
+        if (r > limit) r = limit;
+        int64_t t = 2 * r - 2 * (int64_t) blur;
+        if (t > 0) t = 0;
+        /* |2d + 1 - size| <= K, K = T + size - 2r, for d = x - shadow_x:
+           d in [ceil((size - 1 - K) / 2), floor((size - 1 + K) / 2)].
+           size - 1 - K = 2r - 1 - T >= -1, so (n + 1) / 2 is the ceiling. */
+        int64_t kx = t + shadow_width - 2 * r;
+        int64_t ky = t + shadow_height - 2 * r;
+        int64_t bx = shadow_width - 1 + kx, by = shadow_height - 1 + ky;
+        core = kx >= 0 && ky >= 0 && bx >= 0 && by >= 0;
+        if (core) {
+            core_x0 = raster_extent_to_int(
+                shadow_x + (shadow_width - kx) / 2);
+            core_x1 = raster_extent_to_int(shadow_x + bx / 2 + 1);
+            core_y0 = raster_extent_to_int(
+                shadow_y + (shadow_height - ky) / 2);
+            core_y1 = raster_extent_to_int(shadow_y + by / 2 + 1);
+            core = core_x0 < core_x1 && core_y0 < core_y1;
+        }
+    }
+    /* Left and right edge coverage, filled on first use (any core row). */
+    uint8_t edges[2][SHADOW_EDGE_TABLE];
+    bool edges_ready = false;
+    bool edges_fit = core
+        && (int64_t) core_x0 - command->x <= SHADOW_EDGE_TABLE
+        && (int64_t) command->x + command->width - core_x1
+               <= SHADOW_EDGE_TABLE;
+    bool direct = target->alpha != NULL
+        && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL;
+    /* Clipped to outside the border box (the shadow rect): a pixel keeps
+       the share of its shadow the box does not cover, with the box's
+       coverage computed exactly as its background fill computes it. Rows
+       skip the box's fully covered interior, which holds the whole core. */
+    bool outside_box = command->image_fit == LAYOUT_SHADOW_OUTSIDE_BOX;
+    bool skip_interior = outside_box;
+#ifndef __PSP__
+    skip_interior = skip_interior
+        && !tilefinch_test_faults()->shadow_reference_raster;
+#endif
+    int box_radii[4];
+    int64_t box_right = (int64_t) shadow_x + shadow_width;
+    int64_t box_bottom = (int64_t) shadow_y + shadow_height;
+    if (outside_box)
+        style_border_radius_resolve_corners(
+            radius, shadow_width, shadow_height, box_radii);
+    uint32_t sources[4];
+    uint16_t resolved[4];
     for (int y = y0; y < y1; y++) {
         int span_x0 = 0, span_x1 = 0;
         size_t index = 0;
         bool rounded = false;
         if (!raster_target_span(target, y, x0, x1, &span_x0, &span_x1,
                                 &index, &rounded)) continue;
+        for (unsigned k = 0; k < 4u; k++) {
+            sources[k] = rgb565_dither_source(command->color, (int) k, y);
+            resolved[k] = rgb565(raster_target_color(target, sources[k]));
+        }
+        bool core_row = core && y >= core_y0 && y < core_y1;
+        unsigned row_value = 0;
+        if (core && !core_row)
+            row_value = shadow_pixel_alpha(
+                core_x0, y, shadow_x, shadow_y, shadow_width,
+                shadow_height, radius, blur, alpha);
+        if (core_row && edges_fit && !edges_ready) {
+            for (int at = 0; at < SHADOW_EDGE_TABLE; at++) {
+                edges[0][at] = (uint8_t) shadow_pixel_alpha(
+                    command->x + at, core_y0, shadow_x, shadow_y,
+                    shadow_width, shadow_height, radius, blur, alpha);
+                edges[1][at] = (uint8_t) shadow_pixel_alpha(
+                    core_x1 + at, core_y0, shadow_x, shadow_y,
+                    shadow_width, shadow_height, radius, blur, alpha);
+            }
+            edges_ready = true;
+        }
+        /* The core columns carry one coverage on this row: write them as
+           one run, with the same per-pixel choice as the loop below. */
+        int interior_x0 = span_x1, interior_x1 = span_x1;
+        bool box_row = outside_box && y >= shadow_y && y < box_bottom;
+        if (box_row && skip_interior) {
+            int left_inset = 0, right_inset = 0;
+            if (y < (int64_t) shadow_y + box_radii[0])
+                left_inset = box_radii[0];
+            if (y >= box_bottom - box_radii[3] && box_radii[3] > left_inset)
+                left_inset = box_radii[3];
+            if (y < (int64_t) shadow_y + box_radii[1])
+                right_inset = box_radii[1];
+            if (y >= box_bottom - box_radii[2] && box_radii[2] > right_inset)
+                right_inset = box_radii[2];
+            int64_t left = (int64_t) shadow_x + left_inset;
+            int64_t right = box_right - right_inset;
+            if (left < span_x0) left = span_x0;
+            if (right > span_x1) right = span_x1;
+            if (left < right) {
+                interior_x0 = (int) left;
+                interior_x1 = (int) right;
+            }
+        }
+        int run_x0 = span_x1, run_x1 = span_x1;
+        unsigned run_value = core_row ? alpha : row_value;
+        bool runs = true;
+#ifndef __PSP__
+        runs = !tilefinch_test_faults()->raster_span_reference;
+#endif
+        if (core && direct && !rounded && run_value != 0 && runs) {
+            run_x0 = core_x0 > span_x0 ? core_x0 : span_x0;
+            run_x1 = core_x1 < span_x1 ? core_x1 : span_x1;
+            if (run_x1 <= run_x0) run_x0 = run_x1 = span_x1;
+            /* The core columns of a row through the box lie inside it:
+               nothing paints there, so no run. */
+            if (box_row) run_x0 = run_x1 = span_x1;
+        }
         for (int x = span_x0; x < span_x1; x++, index++) {
+            if (x == interior_x0 && interior_x1 > interior_x0) {
+                index += (size_t) (interior_x1 - x);
+                x = interior_x1;
+                x--;
+                index--;
+                continue;
+            }
+            if (x == run_x0) {
+                for (; x < run_x1; x++, index++) {
+                    unsigned phase = (unsigned) x & 3u;
+                    if (target->alpha[index] == 0) {
+                        target->pixels[index] = resolved[phase];
+                        target->alpha[index] = (uint8_t) run_value;
+                    } else {
+                        blend_at_index(target, index, sources[phase],
+                                       run_value);
+                    }
+                }
+                x--;
+                index--;
+                continue;
+            }
             if (rounded
                 && !point_in_rounded_clips(target->rounded_clips,
                                            target->rounded_clip_count,
                                            x, y)) continue;
-            int distance = rounded_rect_distance_half(
-                x, y, shadow_x, shadow_y, shadow_width, shadow_height,
-                radius);
-            unsigned coverage;
-            if (blur == 0) {
-                if (distance >= 0) continue;
-                coverage = 256u;
-            } else {
-                /* CSS defines the blur radius as a Gaussian of standard
-                   deviation blur/2, whose visible transition spans roughly
-                   one blur radius either side of the shadow edge.  In
-                   half-pixel units that is [-2*blur, +2*blur], which is also
-                   exactly how far the command box was inflated. */
-                int reach = 2 * blur;
-                if (distance >= reach) continue;
-                if (distance <= -reach) coverage = 256u;
-                else {
-                    int t = (reach - distance) * 256 / (2 * reach);
-                    if (t < 0) t = 0;
-                    if (t > 256) t = 256;
-                    coverage = (unsigned) (t * t * (768 - 2 * t)) / 65536u;
-                    if (coverage > 256u) coverage = 256u;
-                }
-            }
-            unsigned blended = alpha * coverage / 256u;
+            unsigned blended;
+            bool core_column = core && x >= core_x0 && x < core_x1;
+            if (core_row && core_column) blended = alpha;
+            else if (core_column) blended = row_value;
+            else if (core_row && edges_ready)
+                blended = x < core_x0 ? edges[0][x - command->x]
+                                      : edges[1][x - core_x1];
+            else
+                blended = shadow_pixel_alpha(
+                    x, y, shadow_x, shadow_y, shadow_width, shadow_height,
+                    radius, blur, alpha);
             if (blended == 0) continue;
-            if (blended > 255u) blended = 255u;
-            blend_at_index(target, index,
-                           rgb565_dither_source(command->color, x, y),
-                           blended);
+            if (box_row && x >= shadow_x && x < box_right) {
+                unsigned covered = rounded_rect_coverage_quarters(
+                    x, y, shadow_x, shadow_y, shadow_width, shadow_height,
+                    box_radii);
+                blended = (blended * (4u - covered) + 2u) / 4u;
+                if (blended == 0) continue;
+            }
+            unsigned phase = (unsigned) x & 3u;
+            if (direct && target->alpha[index] == 0) {
+                /* What blend_at_index stores over a transparent pixel. */
+                target->pixels[index] = resolved[phase];
+                target->alpha[index] = (uint8_t) blended;
+            } else {
+                blend_at_index(target, index, sources[phase], blended);
+            }
         }
     }
 }
@@ -1238,6 +1422,19 @@ static void rasterize_stroke_rect(TileCache *cache, RasterTarget *target,
         (int64_t) inner_x + inner_inset);
     int inner_straight_right = raster_extent_to_int(
         (int64_t) inner_right - inner_inset);
+    /* Rows past every corner band of a rounded box are straight: the outer
+       box covers each pixel of the row fully, and the inner box covers its
+       whole width fully, so the coverage test can only answer 4 outside
+       the inner box and 0 inside it. Corner bands keep the test. */
+    bool straight_rows = has_radius && !dashed;
+#ifndef __PSP__
+    straight_rows = straight_rows
+        && !tilefinch_test_faults()->raster_span_reference;
+#endif
+    int64_t outer_top = command->y;
+    int64_t outer_bottom = outer_top + command->height;
+    int64_t outer_left = command->x;
+    int64_t outer_right = outer_left + command->width;
     for (int y = y0; y < y1; y++) {
         int span_x0 = 0, span_x1 = 0;
         size_t index = 0;
@@ -1253,11 +1450,37 @@ static void rasterize_stroke_rect(TileCache *cache, RasterTarget *target,
            Corners keep the original quarter-sample antialiasing, and dash
            phases remain anchored to x0 rather than the visited pixels. */
         int skip_left = span_x1, skip_right = span_x1;
-        if (has_inner && y >= inner_y && y < inner_bottom) {
-            skip_left = inner_straight_left > span_x0
-                ? inner_straight_left : span_x0;
-            skip_right = inner_straight_right < span_x1
-                ? inner_straight_right : span_x1;
+        /* [full_left, full_right): columns of this row outside every outer
+           corner square, where the outer coverage is 4. */
+        int64_t full_left = outer_right, full_right = outer_right;
+        bool inner_row = has_inner && y >= inner_y && y < inner_bottom;
+        if (straight_rows) {
+            int left_inset = 0, right_inset = 0;
+            if (y < outer_top + corner_radii[0]) left_inset = corner_radii[0];
+            if (y >= outer_bottom - corner_radii[3]
+                && corner_radii[3] > left_inset) left_inset = corner_radii[3];
+            if (y < outer_top + corner_radii[1]) right_inset = corner_radii[1];
+            if (y >= outer_bottom - corner_radii[2]
+                && corner_radii[2] > right_inset) right_inset = corner_radii[2];
+            full_left = outer_left + left_inset;
+            full_right = outer_right - right_inset;
+        }
+        bool inner_straight = straight_rows && inner_row
+            && (!has_inner_radius
+                || ((int64_t) y >= (int64_t) inner_y
+                        + (inner_corner_radii[0] > inner_corner_radii[1]
+                           ? inner_corner_radii[0] : inner_corner_radii[1])
+                    && (int64_t) y < (int64_t) inner_bottom
+                        - (inner_corner_radii[2] > inner_corner_radii[3]
+                           ? inner_corner_radii[2] : inner_corner_radii[3])));
+        if (inner_row) {
+            int straight_left = inner_straight ? inner_x : inner_straight_left;
+            int straight_right = inner_straight
+                ? inner_right : inner_straight_right;
+            skip_left = straight_left > span_x0
+                ? straight_left : span_x0;
+            skip_right = straight_right < span_x1
+                ? straight_right : span_x1;
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
             if (skip_right > skip_left)
                 tested_pixels -= (unsigned) (skip_right - skip_left);
@@ -1273,7 +1496,10 @@ static void rasterize_stroke_rect(TileCache *cache, RasterTarget *target,
                so they keep the plain box test and the untouched alpha
                the arm has always used. */
             unsigned coverage = 4u;
-            if (has_radius) {
+            if (has_radius && x >= full_left && x < full_right
+                && !(inner_row && x >= inner_x && x < inner_right)) {
+                /* Outer coverage 4, outside the inner box: 4. */
+            } else if (has_radius) {
                 coverage = rounded_stroke_coverage_quarters(
                     x, y, &stroke_geometry);
                 if (coverage == 0) continue;
@@ -1489,32 +1715,58 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
             return;
         }
         if (alpha == 0) return;
+        BlendMemo memo;
+        bool spans = true;
+#ifndef __PSP__
+        spans = !tilefinch_test_faults()->raster_span_reference;
+#endif
+        blend_memo_reset(&memo);
+        int64_t top = command->y;
+        int64_t bottom = top + command->height;
         for (int y = y0; y < y1; y++) {
             int span_x0 = 0, span_x1 = 0;
             size_t index = 0;
             bool rounded = false;
             if (!raster_target_span(target, y, x0, x1, &span_x0, &span_x1,
                                     &index, &rounded)) continue;
-            /* Square corners keep the pre-antialiasing inner loop: coverage
-               is 4/4 everywhere and (alpha * 4 + 2) / 4 is alpha, so the
-               shared body would pay a branch and a multiply-divide per
-               pixel to arrive back at the value it started with. Output is
-               bit-identical either way. */
-            if (!has_radius) {
-                for (int x = span_x0; x < span_x1; x++, index++) {
-                    if (rounded
-                        && !point_in_rounded_clips(
-                               target->rounded_clips,
-                               target->rounded_clip_count, x, y)) continue;
-                    blend_surface_at_index(
-                        target, index, command->color, alpha);
-                }
-                continue;
+            /* Columns outside every corner square this row crosses are
+               fully covered: the coverage test can only answer 4 there,
+               and (alpha * 4 + 2) / 4 is alpha. Square corners cover the
+               whole span. Only the corners pay the per-pixel test. */
+            int64_t inner_x0 = span_x0, inner_x1 = span_x1;
+            if (has_radius) {
+                int left_inset = 0, right_inset = 0;
+                if (y < top + corner_radii[0]) left_inset = corner_radii[0];
+                if (y >= bottom - corner_radii[3]
+                    && corner_radii[3] > left_inset)
+                    left_inset = corner_radii[3];
+                if (y < top + corner_radii[1]) right_inset = corner_radii[1];
+                if (y >= bottom - corner_radii[2]
+                    && corner_radii[2] > right_inset)
+                    right_inset = corner_radii[2];
+                int64_t left = (int64_t) command->x + left_inset;
+                int64_t right = (int64_t) command->x + command->width
+                    - right_inset;
+                if (left > inner_x0) inner_x0 = left;
+                if (right < inner_x1) inner_x1 = right;
+                if (inner_x1 < inner_x0) inner_x1 = inner_x0;
             }
+            if (rounded || !spans) inner_x0 = inner_x1 = span_x1;
             for (int x = span_x0; x < span_x1; x++, index++) {
-                unsigned coverage = rounded_rect_coverage_quarters(
-                    x, y, command->x, command->y,
-                    command->width, command->height, corner_radii);
+                if (x == inner_x0 && inner_x1 > inner_x0) {
+                    /* The interior span, then the far corner. */
+                    int count = (int) (inner_x1 - inner_x0);
+                    fill_interior_span(target, index, count, command->color,
+                                       alpha, &memo);
+                    x += count - 1;
+                    index += (size_t) count - 1u;
+                    continue;
+                }
+                unsigned coverage = has_radius
+                    ? rounded_rect_coverage_quarters(
+                          x, y, command->x, command->y,
+                          command->width, command->height, corner_radii)
+                    : 4u;
                 if (coverage == 0) continue;
                 if (rounded
                     && !point_in_rounded_clips(target->rounded_clips,

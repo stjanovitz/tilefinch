@@ -28,6 +28,7 @@
       "__tilefinchCurrentScriptForStable",
       "__tilefinchCurrentDocumentURL",
       "__tilefinchSecureContext",
+      "__tilefinchDocumentDomainValid",
       "__tilefinchDiagnosticLookup",
       "__tilefinchDispatchActivationHandle",
       "__tilefinchDispatchAt",
@@ -42,11 +43,8 @@
       "__tilefinchFetchWorkerScript",
       "__tilefinchFetchWorkerScriptSync",
       "__tilefinchFocusEventsObserved",
-      "__tilefinchFocusObserverDelta",
       "__tilefinchInvokeEventTargetCheckpointed",
       "__tilefinchIsProxy",
-      "__tilefinchGameAudioCommand",
-      "__tilefinchGameAudioDecode",
       "__tilefinchGetTextPrefix",
       "__tilefinchGetStyleAttributePrefix",
       "__tilefinchMarkNativeFunction",
@@ -78,10 +76,11 @@
       "__tilefinchWrapRemoteRelation",
       "__tilefinchWrapRemoteSelector",
       "__tilefinchWrapRemoteStable",
-      /* Host entry points the event loop invokes by name on every tick (see
-         runtime_call in src/js_runtime/event_loop.inc and friends).  They
-         were left writable, so page script could replace any of them and
-         take over the tick.  __tilefinchReceiveMessage is deliberately absent:
+      /* Entry points invoked through the global object by name: by native
+         code (runtime_call in src/js_runtime/event_loop.inc and friends) or
+         by later bootstrap modules (the motion, resize and trusted-event
+         hooks). Left writable, page script could replace one and take over
+         that call.  __tilefinchReceiveMessage is deliberately absent:
          tests/suites/web_runtime_forms.inc overrides it to exercise a
          failing realm. */
       "__tilefinchCommitSameDocument",
@@ -97,8 +96,6 @@
       "__tilefinchMotionRecheck",
       "__tilefinchBeginMotionObservation",
       "__tilefinchParserMutationCheckpoint",
-      "__tilefinchPendingNetworkRequests",
-      "__tilefinchPendingTimers",
       "__tilefinchPumpTimers",
       "__tilefinchSchedulerSnapshot",
       "__tilefinchRebindDocument",
@@ -115,6 +112,9 @@
       "__tilefinchTrustedString",
       "__tilefinchUpdateGamepad",
     ]);
+  /* Set by the host for host and validation realms only; the probes it
+     enabled are published by now. */
+  deleteProperty(globalThis, "__tilefinchTestProbes");
   const markNative = globalThis.__tilefinchMarkNativeFunction,
     markInterface = (constructor) => {
       if (typeof constructor !== "function") return;
@@ -197,6 +197,104 @@
       /* A host-defined non-configurable property is already as hard as this
          page-realm pass can make it. */
     }
+  }
+  /* WebIDL puts Document members on Document.prototype: in browsers the
+     document's only own property is the [LegacyUnforgeable] location, and
+     document.createElement === Document.prototype.createElement. The
+     bootstrap modules build the main document's members as own properties
+     beside the native bridge; move them here, once, after the last module,
+     named as WebIDL names them ("createElement", "get body"). Lookups then
+     cost one more prototype hop (unmeasurable next to the bridge call).
+     Secondary documents (DOMParser, createHTMLDocument, frames) are separate
+     objects whose own members predate this move; the prototype returned by
+     __tilefinchSecondaryDocumentPrototype keeps every moved name resolving
+     for them exactly as it did before, instead of to the main document's
+     closures. */
+  {
+    const mainDocument = globalThis.document,
+      DocumentPrototype = globalThis.Document?.prototype,
+      getPrototypeOf = Object.getPrototypeOf,
+      createObject = Object.create,
+      moved = [],
+      inheritedDescriptor = (key) => {
+        for (let at = DocumentPrototype; at; at = getPrototypeOf(at)) {
+          const descriptor = getDescriptor(at, key);
+          if (descriptor) return descriptor;
+        }
+        return undefined;
+      },
+      rename = (value, name) => {
+        if (typeof value === "function" && value.name !== name)
+          defineProperty(value, "name", { value: name, configurable: true });
+      };
+    if (mainDocument && DocumentPrototype)
+      for (const key of nativeOwnKeys(mainDocument)) {
+        if (typeof key !== "string" || key === "location") continue;
+        const own = getDescriptor(mainDocument, key);
+        if (!own || !own.configurable) continue;
+        const previous =
+          key in DocumentPrototype ? inheritedDescriptor(key) : undefined;
+        if (
+          previous &&
+          ("value" in own
+            ? own.value === previous.value
+            : own.get === previous.get && own.set === previous.set)
+        ) {
+          /* Already the prototype's own function (getElementById). */
+          deleteProperty(mainDocument, key);
+          continue;
+        }
+        let descriptor;
+        if (!("value" in own)) {
+          rename(own.get, "get " + key);
+          rename(own.set, "set " + key);
+          descriptor = {
+            get: own.get,
+            set: own.set,
+            enumerable: true,
+            configurable: true,
+          };
+        } else if (typeof own.value === "function") {
+          rename(own.value, key);
+          descriptor = {
+            value: own.value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          };
+        } else {
+          /* Constant attributes (nodeType, compatMode...) become getters. */
+          const value = own.value;
+          descriptor = getDescriptor({ get [key]() { return value; } }, key);
+        }
+        defineProperty(DocumentPrototype, key, descriptor);
+        deleteProperty(mainDocument, key);
+        moved.push(key, previous);
+      }
+    const secondaryPrototypes = new Map();
+    defineProperty(globalThis, "__tilefinchSecondaryDocumentPrototype", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: (base) => {
+        let prototype = secondaryPrototypes.get(base);
+        if (!prototype) {
+          prototype = createObject(base);
+          for (let at = 0; at < moved.length; at += 2)
+            defineProperty(
+              prototype,
+              moved[at],
+              moved[at + 1] || {
+                value: undefined,
+                writable: true,
+                configurable: true,
+              },
+            );
+          secondaryPrototypes.set(base, prototype);
+        }
+        return prototype;
+      },
+    });
   }
   /* Native bridge entry points are implementation slots, not Web globals.
      They are deliberately non-enumerable, but reflection APIs expose

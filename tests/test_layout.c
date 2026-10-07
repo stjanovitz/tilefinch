@@ -243,6 +243,8 @@ static const char responsive_page[] =
 #include "suites/layout_flow.inc"
 #include "suites/layout_paint.inc"
 #include "suites/layout_structure.inc"
+#include "suites/layout_news_compat.inc"
+#include "suites/layout_site_parity.inc"
 
 static int test_inline_border_command_parity(void)
 {
@@ -313,5 +315,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     CHECK(test_inline_border_command_parity() == 0);
+    CHECK(test_news_compat() == 0);
+    CHECK(test_site_parity() == 0);
     return test_layout();
 }

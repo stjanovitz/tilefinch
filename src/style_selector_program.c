@@ -26,7 +26,7 @@ void stylesheet_drop_selector_program(Stylesheet *sheet)
     sheet->selector_program_attempted = false;
 }
 
-#define STYLE_SELECTOR_PROGRAM_BUDGET (256u * 1024u)
+#define STYLE_SELECTOR_PROGRAM_BUDGET (320u * 1024u)
 #define STYLE_COMPILED_FRAGMENT_MAGIC UINT32_C(0x54465346)
 #define STYLE_COMPILED_FRAGMENT_VERSION UINT16_C(2)
 #define STYLE_COMPILED_FRAGMENT_MAX_BYTES (256u * 1024u)

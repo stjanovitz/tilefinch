@@ -1,4 +1,5 @@
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/glyph_component_store.h"
 #include "tilefinch/url.h"
 
 #include <ctype.h>
@@ -43,6 +44,8 @@ struct BrowserProfile {
     bool persist_local_storage;
     bool tls_session_persistence;
     bool save_diagnostic_reports;
+    /* Off by default: compiled scripts stay in RAM for the session. */
+    bool keep_compiled_scripts;
     bool javascript_enabled;
     uint32_t javascript_default_allow_mask;
     bool site_data_allowed;
@@ -82,10 +85,17 @@ struct BrowserProfile {
     BrowserReaderFont reader_font;
     bool remember_reader_site_scale;
     bool reader_auto_mode;
+    BrowserBasicFallbackMode basic_fallback_mode;
+    BrowserHeavyPagesMode heavy_pages_mode;
+    size_t heavy_site_count;
+    char heavy_sites[BROWSER_PROFILE_HEAVY_SITE_LIMIT]
+                    [CONTENT_BLOCKER_HOST_LIMIT];
     bool update_check_enabled;
     BrowserUpdateChannel update_channel;
     BrowserGlyphLanguage glyph_language;
     bool color_emoji;
+    uint16_t glyph_offer_declined_mask;
+    bool glyph_offers_off;
     bool wave_background;
     uint64_t update_check_last_unix;
     uint64_t update_check_available_sequence;
@@ -679,6 +689,14 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
                      (unsigned) profile->glyph_language,
                      profile->color_emoji ? 1u : 0u) > 0;
     }
+    if (ok && (profile->glyph_offer_declined_mask != 0
+               || profile->glyph_offers_off)) {
+        /* Append-only, written only once an offer was declined or turned
+           off: older builds ignore the key and never show the offer. */
+        ok = fprintf(file, "GLYPHASK\t%u\t%u\n",
+                     (unsigned) profile->glyph_offer_declined_mask,
+                     profile->glyph_offers_off ? 1u : 0u) > 0;
+    }
     if (ok) {
         /* Appended after UPDCHK: an older build ignores the unknown key and
            a newer build reading an older file keeps the default. */
@@ -706,6 +724,11 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = fprintf(
             file, "DIAG\t%u\n",
             profile->save_diagnostic_reports ? 1u : 0u) > 0;
+    }
+    if (ok) {
+        /* Append-only and default-off, like DIAG. */
+        ok = fprintf(file, "SCRIPTCACHE\t%u\n",
+                     profile->keep_compiled_scripts ? 1u : 0u) > 0;
     }
     if (ok) {
         ok = fprintf(file, "JSDEFAULT\t%u\n",
@@ -747,11 +770,25 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
             && fprintf(file, "CBV\t%s\n", encoded) > 0;
     }
     if (ok) {
+        /* The fourth field (Basic view fallback) is newer; older readers
+           take the leading digit of "auto\tbasic" for Auto Reader. */
         ok = fprintf(
-            file, "READER\t%u\t%u\t%u\n",
+            file, "READER\t%u\t%u\t%u\t%u\n",
             (unsigned) profile->reader_font,
             profile->remember_reader_site_scale ? 1u : 0u,
-            profile->reader_auto_mode ? 1u : 0u) > 0;
+            profile->reader_auto_mode ? 1u : 0u,
+            (unsigned) profile->basic_fallback_mode) > 0;
+    }
+    if (ok) {
+        /* Append-only: older builds ignore HEAVY and HS records. */
+        ok = fprintf(file, "HEAVY\t%u\n",
+                     (unsigned) profile->heavy_pages_mode) > 0;
+    }
+    for (size_t i = 0; ok && i < profile->heavy_site_count; i++) {
+        char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
+        ok = profile_encode(profile->heavy_sites[i], encoded,
+                            sizeof(encoded))
+            && fprintf(file, "HS\t%s\n", encoded) > 0;
     }
     for (size_t i = 0;
          ok && i < profile->reader_site_count; i++) {
@@ -1082,11 +1119,36 @@ static bool profile_load_internal(
         } else if (strcmp(line, "DIAG") == 0) {
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->save_diagnostic_reports = first[0] == '1';
+        } else if (strcmp(line, "SCRIPTCACHE") == 0) {
+            if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
+                loaded->keep_compiled_scripts = first[0] == '1';
         } else if (strcmp(line, "JSDEFAULT") == 0) {
             /* Only the defined bit is admitted; malformed/future records
                retain the safe default rather than granting an exception. */
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->javascript_default_allow_mask = (uint32_t) (first[0] - '0');
+        } else if (strcmp(line, "HEAVY") == 0) {
+            unsigned long mode = strtoul(first, NULL, 10);
+            if (mode < (unsigned long) BROWSER_HEAVY_PAGES_MODE_COUNT)
+                loaded->heavy_pages_mode = (BrowserHeavyPagesMode) mode;
+        } else if (strcmp(line, "HS") == 0
+                   && loaded->heavy_site_count
+                          < BROWSER_PROFILE_HEAVY_SITE_LIMIT) {
+            char *site = loaded->heavy_sites[loaded->heavy_site_count];
+            if (profile_decode(first, site, CONTENT_BLOCKER_HOST_LIMIT)
+                && profile_valid_block_site(site)) {
+                bool duplicate = false;
+                for (size_t i = 0; i < loaded->heavy_site_count; i++) {
+                    if (strcmp(loaded->heavy_sites[i], site) == 0) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) loaded->heavy_site_count++;
+                else memset(site, 0, CONTENT_BLOCKER_HOST_LIMIT);
+            } else {
+                memset(site, 0, CONTENT_BLOCKER_HOST_LIMIT);
+            }
         } else if (strcmp(line, "JSD") == 0
                    && loaded->javascript_disabled_site_count
                           < BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT) {
@@ -1193,6 +1255,12 @@ static bool profile_load_internal(
                 loaded->glyph_language = language;
             if (second != NULL)
                 loaded->color_emoji = strtoul(second, NULL, 10) != 0;
+        } else if (strcmp(line, "GLYPHASK") == 0) {
+            unsigned long mask = strtoul(first, NULL, 10);
+            loaded->glyph_offer_declined_mask = (uint16_t) (
+                mask & ((1ul << TILEFINCH_GLYPH_PACK_COUNT) - 1ul));
+            if (second != NULL)
+                loaded->glyph_offers_off = strtoul(second, NULL, 10) != 0;
         } else if (strcmp(line, "READER") == 0 && second != NULL) {
             char *third = strchr(second, '\t');
             if (third != NULL) *third++ = '\0';
@@ -1201,8 +1269,16 @@ static bool profile_load_internal(
             if (profile_valid_reader_font(font)) loaded->reader_font = font;
             loaded->remember_reader_site_scale =
                 strtoul(second, NULL, 10) != 0;
+            char *fourth = third == NULL ? NULL : strchr(third, '\t');
+            if (fourth != NULL) *fourth++ = '\0';
             if (third != NULL)
                 loaded->reader_auto_mode = strtoul(third, NULL, 10) != 0;
+            if (fourth != NULL) {
+                unsigned long mode = strtoul(fourth, NULL, 10);
+                if (mode < (unsigned long) BROWSER_BASIC_FALLBACK_MODE_COUNT)
+                    loaded->basic_fallback_mode =
+                        (BrowserBasicFallbackMode) mode;
+            }
             if (!loaded->remember_reader_site_scale) {
                 loaded->reader_site_count = 0;
                 memset(loaded->reader_sites, 0, sizeof(loaded->reader_sites));
@@ -1412,6 +1488,11 @@ bool browser_profile_save_diagnostic_reports(
     const BrowserProfile *profile)
 {
     return profile != NULL && profile->save_diagnostic_reports;
+}
+
+bool browser_profile_keep_compiled_scripts(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->keep_compiled_scripts;
 }
 
 bool browser_profile_javascript_enabled(const BrowserProfile *profile)
@@ -1689,6 +1770,32 @@ bool browser_profile_reader_auto_mode(const BrowserProfile *profile)
     return profile != NULL && profile->reader_auto_mode;
 }
 
+BrowserHeavyPagesMode browser_profile_heavy_pages_mode(
+    const BrowserProfile *profile)
+{
+    return profile == NULL ? BROWSER_HEAVY_PAGES_ASK
+                           : profile->heavy_pages_mode;
+}
+
+bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
+                                        const char *url)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !content_blocker_site_from_url(url, site))
+        return false;
+    for (size_t i = 0; i < profile->heavy_site_count; i++) {
+        if (strcmp(profile->heavy_sites[i], site) == 0) return true;
+    }
+    return false;
+}
+
+BrowserBasicFallbackMode browser_profile_basic_fallback_mode(
+    const BrowserProfile *profile)
+{
+    return profile == NULL ? BROWSER_BASIC_FALLBACK_AUTOMATIC
+                           : profile->basic_fallback_mode;
+}
+
 bool browser_profile_update_check_enabled(const BrowserProfile *profile)
 {
     return profile == NULL || profile->update_check_enabled;
@@ -1711,6 +1818,17 @@ BrowserGlyphLanguage browser_profile_glyph_language(
 bool browser_profile_color_emoji(const BrowserProfile *profile)
 {
     return profile != NULL && profile->color_emoji;
+}
+
+uint16_t browser_profile_glyph_offer_declined_mask(
+    const BrowserProfile *profile)
+{
+    return profile == NULL ? 0 : profile->glyph_offer_declined_mask;
+}
+
+bool browser_profile_glyph_offers_enabled(const BrowserProfile *profile)
+{
+    return profile != NULL && !profile->glyph_offers_off;
 }
 
 uint64_t browser_profile_update_check_last_unix(
@@ -1796,6 +1914,20 @@ void browser_profile_set_color_emoji(
     if (profile != NULL) profile->color_emoji = enabled;
 }
 
+void browser_profile_set_glyph_offers_enabled(
+    BrowserProfile *profile, bool enabled)
+{
+    if (profile != NULL) profile->glyph_offers_off = !enabled;
+}
+
+void browser_profile_set_glyph_offer_declined_mask(
+    BrowserProfile *profile, uint16_t mask)
+{
+    if (profile != NULL)
+        profile->glyph_offer_declined_mask = (uint16_t) (
+            mask & ((1u << TILEFINCH_GLYPH_PACK_COUNT) - 1u));
+}
+
 void browser_profile_set_update_check_last_unix(
     BrowserProfile *profile, uint64_t unix_seconds)
 {
@@ -1875,6 +2007,12 @@ void browser_profile_set_save_diagnostic_reports(
     BrowserProfile *profile, bool enabled)
 {
     if (profile != NULL) profile->save_diagnostic_reports = enabled;
+}
+
+void browser_profile_set_keep_compiled_scripts(BrowserProfile *profile,
+                                               bool enabled)
+{
+    if (profile != NULL) profile->keep_compiled_scripts = enabled;
 }
 
 void browser_profile_set_javascript_enabled(
@@ -1957,6 +2095,8 @@ bool browser_profile_reset_site_permissions(
     profile_remove_exact_site(
         profile->cookie_banner_visible_sites,
         &profile->cookie_banner_visible_site_count, site);
+    profile_remove_exact_site(profile->heavy_sites,
+                              &profile->heavy_site_count, site);
     profile_remove_exact_site(
         profile->content_blocker_allowed_sites,
         &profile->content_blocker_allowed_site_count, site);
@@ -2185,6 +2325,44 @@ void browser_profile_set_remember_reader_site_scale(
                    * sizeof(profile->reader_sites[0]));
         profile->reader_site_count = kept;
     }
+}
+
+bool browser_profile_set_heavy_pages_mode(
+    BrowserProfile *profile, BrowserHeavyPagesMode mode)
+{
+    if (profile == NULL || (unsigned) mode
+            >= (unsigned) BROWSER_HEAVY_PAGES_MODE_COUNT) return false;
+    profile->heavy_pages_mode = mode;
+    return true;
+}
+
+bool browser_profile_set_heavy_site_allowed(
+    BrowserProfile *profile, const char *url, bool allowed)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !content_blocker_site_from_url(url, site))
+        return false;
+    bool present = browser_profile_heavy_site_allowed(profile, url);
+    if (!allowed) {
+        profile_remove_exact_site(profile->heavy_sites,
+                                  &profile->heavy_site_count, site);
+        return true;
+    }
+    if (present) return true;
+    if (profile->heavy_site_count >= BROWSER_PROFILE_HEAVY_SITE_LIMIT)
+        return false;
+    snprintf(profile->heavy_sites[profile->heavy_site_count++],
+             CONTENT_BLOCKER_HOST_LIMIT, "%s", site);
+    return true;
+}
+
+bool browser_profile_set_basic_fallback_mode(
+    BrowserProfile *profile, BrowserBasicFallbackMode mode)
+{
+    if (profile == NULL || (unsigned) mode
+            >= (unsigned) BROWSER_BASIC_FALLBACK_MODE_COUNT) return false;
+    profile->basic_fallback_mode = mode;
+    return true;
 }
 
 void browser_profile_set_reader_auto_mode(

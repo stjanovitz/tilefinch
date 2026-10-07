@@ -29,6 +29,8 @@ set(BUILD_SHARED_LIBS   OFF CACHE BOOL "" FORCE)
 
 set(PSP_BROWSER_FREETYPE_MINIMAL_MODULES
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/freetype/ftmodule-minimal.h")
+set(PSP_BROWSER_FREETYPE_OPTIONS
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/freetype/ftoption-tilefinch.h")
 
 if(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/freetype/CMakeLists.txt")
     # Offline mirror, matching how lexbor / quickjs-ng / stb / dejavu-fonts are
@@ -54,7 +56,8 @@ if(TARGET freetype)
     # the backend actually needs and lets the linker drop the unreferenced
     # driver/renderer objects from every final binary.
     target_compile_definitions(freetype PRIVATE
-        "FT_CONFIG_MODULES_H=\"${PSP_BROWSER_FREETYPE_MINIMAL_MODULES}\"")
+        "FT_CONFIG_MODULES_H=\"${PSP_BROWSER_FREETYPE_MINIMAL_MODULES}\""
+        "FT_CONFIG_OPTIONS_H=\"${PSP_BROWSER_FREETYPE_OPTIONS}\"")
     if(PSP)
         # psp-gcc rejects -fPIC under -mabi=eabi (the same accommodation the
         # lexbor static port needs); a trailing -fno-pic wins if anything up

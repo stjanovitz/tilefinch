@@ -97,7 +97,8 @@ bool fetch_prepare_page_request(
         .destination = descriptor->destination,
         .initiator_opaque = security_context->opaque_origin,
         .top_level_navigation = descriptor->top_level_navigation,
-        .user_activated = descriptor->user_activated
+        .user_activated = descriptor->user_activated,
+        .csp_grant = descriptor->csp_grant
     };
     TilefinchRequestFacts facts;
     if (!tilefinch_request_context_analyze(&storage->context, &facts)) {
@@ -131,6 +132,21 @@ bool fetch_prepare_page_request(
     }
 
     storage->request = descriptor->transport;
+    /* Per-site identity is a document property (site_identity.h): a
+       top-level navigation takes it from its target, and everything a
+       document requests, including third-party subresources and child
+       frames, presents its top-level document's identity, which is also
+       what that document's realms report as navigator.userAgent. An
+       explicit transport User-Agent (native services, diagnostics) wins. */
+    if (storage->request.user_agent == NULL) {
+        const char *identity_url = descriptor->top_level_navigation
+            ? descriptor->target_url
+            : (security_context->top_level_url != NULL
+                ? security_context->top_level_url
+                : security_context->document_url);
+        storage->request.user_agent =
+            site_identity_user_agent_override(identity_url);
+    }
     /* Accept-CH is an origin-scoped browsing-session policy, not merely a
        navigation-retry detail.  Once accepted, matching script, image,
        stylesheet, frame, and Fetch/XHR requests carry the same bounded hints
@@ -239,6 +255,7 @@ bool fetch_prepare_page_request_context(
         .destination = context->destination,
         .top_level_navigation = context->top_level_navigation,
         .user_activated = context->user_activated,
+        .csp_grant = context->csp_grant,
         .transport = transport == NULL ? (FetchRequest) {0} : *transport
     };
     return fetch_prepare_page_request(

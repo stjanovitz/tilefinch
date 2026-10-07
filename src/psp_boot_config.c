@@ -7,14 +7,19 @@
 #include <string.h>
 
 #include "media_backend_psp_policy.h"
+#include "tilefinch/browser_engine.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/update.h"
 
-#define PSP_DEFAULT_SCRIPT_HEAP_MB 5L
-#define PSP_DEFAULT_SCRIPT_BOOT_WINDOW_KB 4096L
-#define PSP_DEFAULT_SCRIPT_TOTAL_MB 2L
-#define PSP_DEFAULT_SCRIPT_FILE_KB 512L
+/* The defaults are the PSP app profile the host lab also uses
+   (BROWSER_PSP_APP_* in tilefinch/browser_engine.h). */
+#define PSP_DEFAULT_SCRIPT_HEAP_MB ((long) BROWSER_PSP_APP_SCRIPT_HEAP_MB)
+#define PSP_DEFAULT_APP_HEAP_MB ((long) BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB)
+#define PSP_DEFAULT_SCRIPT_BOOT_WINDOW_KB \
+    ((long) BROWSER_PSP_APP_SCRIPT_BOOT_WINDOW_KB)
+#define PSP_DEFAULT_SCRIPT_TOTAL_MB ((long) BROWSER_PSP_APP_SCRIPT_TOTAL_MB)
+#define PSP_DEFAULT_SCRIPT_FILE_KB ((long) BROWSER_PSP_APP_SCRIPT_FILE_KB)
 #define PSP_DEFAULT_CSS_WIDTH 480L
 #define PSP_DEFAULT_CSS_HEIGHT 272L
 
@@ -44,8 +49,10 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->validation_media_stability_seconds = 120;
     config->validation_js_profile = 1;
     config->validation_script_split = 2;
-    config->limit_mb = 32;
+    config->validation_gc_pacing = 1;
+    config->limit_mb = (long) BROWSER_PSP_APP_MEMORY_LIMIT_MB;
     config->heap_mb = PSP_DEFAULT_SCRIPT_HEAP_MB;
+    config->app_heap_mb = PSP_DEFAULT_APP_HEAP_MB;
     /* Modern bootstraps and managed challenges can require one large,
        short-lived VM allocation even when their settled graph is much
        smaller.  This window is an allocator ceiling, not a reservation: all
@@ -56,11 +63,11 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->window_kb = PSP_DEFAULT_SCRIPT_BOOT_WINDOW_KB;
     config->total_mb = PSP_DEFAULT_SCRIPT_TOTAL_MB;
     config->file_kb = PSP_DEFAULT_SCRIPT_FILE_KB;
-    config->count = 256;
-    config->gc_growth_pct = 150;
+    config->count = (long) BROWSER_PSP_APP_SCRIPT_COUNT;
+    config->gc_growth_pct = (long) BROWSER_PSP_APP_GC_GROWTH_PERCENT;
     config->lazy_functions = -1;
     config->page_task_yield = -1;
-    config->script_timeout_ms = 60000;
+    config->script_timeout_ms = (long) BROWSER_PSP_APP_SCRIPT_TIMEOUT_MS;
     config->css_width = PSP_DEFAULT_CSS_WIDTH;
     config->css_height = PSP_DEFAULT_CSS_HEIGHT;
     config->network_profile = 1;
@@ -69,14 +76,22 @@ void psp_boot_config_defaults(PspBootConfig *config)
 void psp_boot_config_disable_automation(PspBootConfig *config)
 {
     if (config == NULL) return;
+    /* Any key reset below away from its reset value marks a boot.cfg an
+       automated run left behind, whose url is not the user's. */
     bool was_automated = strcmp(config->trace, "none") != 0
+        || config->trace_keyed != 0
         || config->trace_capture[0] != '\0'
         || config->ticks != 0
         || config->dump_frame != 0
         || config->exit_after_report != 0
         || config->interactive_validation_ticks != 0
+        || config->validation_game_audio_reference != 0
+        || config->validation_js_profile != 1
         || config->validation_js_outlier_us != 0
+        || config->validation_game_audio_mute != 0
+        || config->validation_script_split != 2
         || config->validation_execution_census != 0
+        || config->validation_gc_pacing != 1
         || config->trace_ignore_request_body != 0
         || config->trace_volatile_uuids != 0
         || config->trace_replay_pump_us != 0
@@ -84,7 +99,9 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
         || config->validation_preview_scroll != 0
         || config->validation_media_play != 0
         || config->validation_media_stability_auto != 0
+        || config->validation_media_stability_seconds != 120
         || config->validation_media_lifecycle_auto != 0
+        || config->validation_media_seek_permille != 667
         || config->validation_media_au_dump != 0
         || config->validation_media_fixture_auto != 0
         || config->validation_raster_fixture_auto != 0
@@ -92,6 +109,8 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
         || config->validation_ge_present_probe != 0
         || config->validation_webgl_ge_probe != 0
         || config->validation_js_bench != 0
+        || config->js_bench_dir[0] != '\0'
+        || config->js_bench_only[0] != '\0'
         || config->validation_csc_order_probe != 0
         || config->validation_latch_probe != 0
         || config->validation_media_range_probe != 0
@@ -111,8 +130,11 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->interactive_validation_ticks = 0;
     config->validation_js_profile = 1;
     config->validation_js_outlier_us = 0;
+    config->validation_game_audio_mute = 0;
+    config->validation_game_audio_reference = 0;
     config->validation_script_split = 2;
     config->validation_execution_census = 0;
+    config->validation_gc_pacing = 1;
     config->trace_ignore_request_body = 0;
     config->trace_volatile_uuids = 0;
     config->trace_replay_pump_us = 0;
@@ -201,6 +223,8 @@ static bool psp_boot_config_load_one(
             loaded.limit_mb = atol(value);
         } else if (strcmp(line, "heap_mb") == 0) {
             loaded.heap_mb = atol(value);
+        } else if (strcmp(line, "app_heap_mb") == 0) {
+            loaded.app_heap_mb = atol(value);
         } else if (strcmp(line, "total_mb") == 0) {
             loaded.total_mb = atol(value);
         } else if (strcmp(line, "file_kb") == 0) {
@@ -240,10 +264,26 @@ static bool psp_boot_config_load_one(
             loaded.interactive_validation_ticks = atol(value);
         } else if (strcmp(line, "validation_js_profile") == 0) {
             loaded.validation_js_profile = atol(value);
+        } else if (strcmp(line, "validation_game_audio_mute") == 0) {
+            loaded.validation_game_audio_mute = atol(value);
+        } else if (strcmp(line, "validation_game_audio_reference") == 0) {
+            /* Do not let atol turn a typo into a successful OFF selection. */
+            const char *end = value + strlen(value);
+            size_t tail = raw_length - (size_t) (end - line);
+            bool complete_value = tail == 1u || (tail == 2u && end[1] == '\n');
+            if (!complete_value || (strcmp(value, "0") != 0 && strcmp(value, "1") != 0)) {
+                if (warning != NULL)
+                    warning(warning_context, path, line_number, line);
+                complete = false;
+                break;
+            }
+            loaded.validation_game_audio_reference = value[0] == '1' ? 1 : 0;
         } else if (strcmp(line, "validation_js_outlier_us") == 0) {
             loaded.validation_js_outlier_us = atol(value);
         } else if (strcmp(line, "validation_script_split") == 0) {
             loaded.validation_script_split = atol(value);
+        } else if (strcmp(line, "validation_gc_pacing") == 0) {
+            loaded.validation_gc_pacing = atol(value);
         } else if (strcmp(line, "validation_execution_census") == 0) {
             loaded.validation_execution_census = atol(value);
         } else if (strcmp(line, "validation_cancel_after_ms") == 0) {
@@ -319,6 +359,27 @@ bool psp_boot_config_load(
                config, backup, warning, warning_context);
 }
 
+/* Replaces `path` with the written `temporary`, keeping the previous file
+   as `backup` until the rename lands (the PSP's rename cannot replace). */
+static bool boot_config_publish(const char *temporary, const char *path,
+                                const char *backup)
+{
+    bool had_previous = rename(path, backup) == 0;
+    if (!had_previous) {
+        if (errno == ENOENT) return rename(temporary, path) == 0;
+        (void) remove(backup);
+        had_previous = rename(path, backup) == 0;
+        if (!had_previous && errno != ENOENT) {
+            remove(temporary);
+            return false;
+        }
+    }
+    if (rename(temporary, path) == 0) return true;
+    if (had_previous) (void) rename(backup, path);
+    remove(temporary);
+    return false;
+}
+
 bool psp_boot_config_write_overrides(
     const PspBootConfig *config, const char *path)
 {
@@ -354,20 +415,7 @@ bool psp_boot_config_write_overrides(
         remove(temporary);
         return false;
     }
-    bool had_previous = rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) {
-            remove(temporary);
-            return false;
-        }
-    }
-    if (rename(temporary, path) == 0) return true;
-    if (had_previous) (void) rename(backup, path);
-    remove(temporary);
-    return false;
+    return boot_config_publish(temporary, path, backup);
 }
 
 unsigned psp_boot_config_drop_invalid_developer_urls(PspBootConfig *config)
@@ -446,8 +494,11 @@ bool psp_boot_config_validate(
     REQUIRE_CONFIG(
         config->heap_mb >= 2 && config->heap_mb <= 32, "heap_mb");
     REQUIRE_CONFIG(
-        config->total_mb >= 1 && config->total_mb <= 16
-            && config->total_mb <= config->heap_mb,
+        config->app_heap_mb >= 2 && config->app_heap_mb <= 16
+            && config->app_heap_mb < config->limit_mb,
+        "app_heap_mb");
+    REQUIRE_CONFIG(
+        config->total_mb >= 1 && config->total_mb <= 16,
         "total_mb");
     REQUIRE_CONFIG(
         config->file_kb >= 64 && config->file_kb <= 4096
@@ -599,6 +650,12 @@ bool psp_boot_config_validate(
         config->validation_js_profile == 0
             || config->validation_js_profile == 1,
         "validation_js_profile");
+    REQUIRE_CONFIG(config->validation_game_audio_mute == 0
+               || config->validation_game_audio_mute == 1,
+               "validation_game_audio_mute");
+    REQUIRE_CONFIG(config->validation_game_audio_reference == 0
+               || config->validation_game_audio_reference == 1,
+               "validation_game_audio_reference");
     REQUIRE_CONFIG(
         config->validation_js_outlier_us >= 0
             && config->validation_js_outlier_us <= 10000000,
@@ -607,6 +664,9 @@ bool psp_boot_config_validate(
         config->validation_script_split >= 0
             && config->validation_script_split <= 2,
         "validation_script_split");
+    REQUIRE_CONFIG(
+        config->validation_gc_pacing == 0 || config->validation_gc_pacing == 1,
+        "validation_gc_pacing");
     REQUIRE_CONFIG(config->validation_execution_census >= 0
                && config->validation_execution_census <= 2,
                "validation_execution_census");
@@ -674,4 +734,104 @@ bool psp_boot_config_automation_requires_engine_first(
         || config->validation_media_fixture_auto != 0
         || config->validation_raster_fixture_auto != 0
         || config->ticks > 0;
+}
+
+long psp_boot_config_default_file_kb(void)
+{
+    return PSP_DEFAULT_SCRIPT_FILE_KB;
+}
+
+/* A boot.cfg is small; a larger file is not one this migration rewrites. */
+#define BOOT_CONFIG_MIGRATION_MAX_BYTES (16u * 1024u)
+
+static bool boot_config_line_is(const char *line, size_t length,
+                                const char *text)
+{
+    while (length != 0
+           && (line[length - 1u] == '\n' || line[length - 1u] == '\r'))
+        length--;
+    return strlen(text) == length && memcmp(line, text, length) == 0;
+}
+
+PspBootConfigMigration psp_boot_config_migrate_file_kb(const char *path)
+{
+    if (path == NULL) return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
+    char sibling[TILEFINCH_INSTALL_PATH_LIMIT + 32u];
+    int written = snprintf(sibling, sizeof(sibling),
+                           "%s.tilefinch-game-stage", path);
+    if (written <= 0 || (size_t) written >= sizeof(sibling))
+        return PSP_BOOT_CONFIG_MIGRATION_FAILED;
+    FILE *marker = fopen(sibling, "rb");
+    if (marker != NULL) {
+        (void) fclose(marker);
+        return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
+    static char text[BOOT_CONFIG_MIGRATION_MAX_BYTES + 1u];
+    size_t length = fread(text, 1, BOOT_CONFIG_MIGRATION_MAX_BYTES + 1u,
+                          file);
+    bool read_ok = !ferror(file);
+    (void) fclose(file);
+    if (!read_ok) return PSP_BOOT_CONFIG_MIGRATION_FAILED;
+    if (length > BOOT_CONFIG_MIGRATION_MAX_BYTES
+        || memchr(text, '\0', length) != NULL)
+        return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
+    text[length] = '\0';
+    /* The loader takes the last file_kb line; total_mb likewise. */
+    const char *effective = NULL;
+    size_t effective_length = 0;
+    long total_mb = PSP_DEFAULT_SCRIPT_TOTAL_MB;
+    for (const char *line = text; *line != '\0';) {
+        const char *end = strchr(line, '\n');
+        size_t line_length = end == NULL ? strlen(line)
+                                         : (size_t) (end - line) + 1u;
+        if (boot_config_line_is(line, line_length,
+                                PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK))
+            return PSP_BOOT_CONFIG_MIGRATION_ALREADY;
+        if (line_length >= 8u && memcmp(line, "file_kb=", 8u) == 0) {
+            effective = line;
+            effective_length = line_length;
+        } else if (line_length >= 9u && memcmp(line, "total_mb=", 9u) == 0) {
+            total_mb = atol(line + 9u);
+        }
+        line += line_length;
+    }
+    if (effective == NULL
+        || !boot_config_line_is(effective, effective_length, "file_kb=512")
+        || total_mb * 1024L < PSP_DEFAULT_SCRIPT_FILE_KB)
+        return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
+
+    char temporary[TILEFINCH_INSTALL_PATH_LIMIT + 8u];
+    char backup[TILEFINCH_INSTALL_PATH_LIMIT + 8u];
+    written = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    if (written <= 0 || (size_t) written >= sizeof(temporary))
+        return PSP_BOOT_CONFIG_MIGRATION_FAILED;
+    written = snprintf(backup, sizeof(backup), "%s.bak", path);
+    if (written <= 0 || (size_t) written >= sizeof(backup))
+        return PSP_BOOT_CONFIG_MIGRATION_FAILED;
+    FILE *out = fopen(temporary, "wb");
+    if (out == NULL) return PSP_BOOT_CONFIG_MIGRATION_FAILED;
+    size_t before = (size_t) (effective - text);
+    const char *after = effective + effective_length;
+    bool crlf = effective_length >= 2u
+        && effective[effective_length - 2u] == '\r';
+    const char *eol = crlf ? "\r\n" : "\n";
+    bool ok = fwrite(text, 1, before, out) == before
+        && fprintf(out, "file_kb=%ld%s", PSP_DEFAULT_SCRIPT_FILE_KB, eol) > 0
+        && fwrite(after, 1, strlen(after), out) == strlen(after)
+        && (length == 0 || text[length - 1u] == '\n'
+            || fputs(eol, out) >= 0)
+        && fprintf(out,
+                   "# Memory-based script admission replaced the old "
+                   "file_kb=512 default.%s%s%s",
+                   eol, PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK, eol) > 0
+        && fflush(out) == 0;
+    if (fclose(out) != 0) ok = false;
+    if (!ok) {
+        remove(temporary);
+        return PSP_BOOT_CONFIG_MIGRATION_FAILED;
+    }
+    return boot_config_publish(temporary, path, backup)
+        ? PSP_BOOT_CONFIG_MIGRATION_DONE : PSP_BOOT_CONFIG_MIGRATION_FAILED;
 }

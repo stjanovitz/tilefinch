@@ -10,6 +10,7 @@
 #endif
 
 #include "tilefinch/danzeff_input.h"
+#include "tilefinch/bot_wall.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/offline_library.h"
@@ -74,11 +75,14 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 #define UI_BROWSER_CHROME_CACHE_BOTTOM_HEIGHT 29
 #define UI_AUTOHIDE_FRAMES 240u
 #define UI_TOAST_DEFAULT_FRAMES 180u
+#define UI_TOAST_TIMED 0x8000u
+/* Language & emoji: language, emoji, the two pack rows, offers, reset. */
+#define UI_GLYPH_OPTION_ROWS 6u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 45u
+#define UI_OPTIONS_ITEM_COUNT 47u
 #else
-#define UI_OPTIONS_ITEM_COUNT 43u
+#define UI_OPTIONS_ITEM_COUNT 45u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -245,7 +249,9 @@ typedef enum {
     UI_OPTION_GAMEPAD_FACE_MAPPING,
     UI_OPTION_SAVE_PLAYBACK_POSITIONS,
     UI_OPTION_CLEAR_PLAYBACK_POSITIONS,
-    UI_OPTION_SAVE_DIAGNOSTIC_REPORTS
+    UI_OPTION_SAVE_DIAGNOSTIC_REPORTS,
+    UI_OPTION_BASIC_FALLBACK,
+    UI_OPTION_HEAVY_PAGES
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -308,7 +314,9 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_GAMEPAD_FACE_MAPPING,
     UI_OPTION_SAVE_PLAYBACK_POSITIONS,
     UI_OPTION_CLEAR_PLAYBACK_POSITIONS,
-    UI_OPTION_SAVE_DIAGNOSTIC_REPORTS
+    UI_OPTION_SAVE_DIAGNOSTIC_REPORTS,
+    UI_OPTION_BASIC_FALLBACK,
+    UI_OPTION_HEAVY_PAGES
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -338,6 +346,8 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_GAMEPAD_FACE_MAPPING:
         case UI_OPTION_JAVASCRIPT:
         case UI_OPTION_SEARCH_ENGINE:
+        case UI_OPTION_BASIC_FALLBACK:
+        case UI_OPTION_HEAVY_PAGES:
             return "BROWSING & INPUT";
         case UI_OPTION_VIDEO_SCALING:
         case UI_OPTION_YOUTUBE_QUALITY:
@@ -449,6 +459,10 @@ static const char *ui_option_description(UiOptionId option)
             return "Remember Reader size for this site";
         case UI_OPTION_READER_AUTO_MODE:
             return "Use Reader automatically on clear matches";
+        case UI_OPTION_BASIC_FALLBACK:
+            return "When page scripts fail and leave it blank";
+        case UI_OPTION_HEAVY_PAGES:
+            return "When a site needs a large app to start";
         case UI_OPTION_CUSTOM_HOMEPAGE:
             return "Use your bookmark launch page";
         case UI_OPTION_HISTORY:
@@ -1883,6 +1897,16 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
     }
 }
 
+bool psp_ui_retract_chrome_for_page_fullscreen(PspUiState *ui,
+                                               bool page_fullscreen_active)
+{
+    if (ui == NULL || !page_fullscreen_active || ui->page_fullscreen
+        || !ui->chrome_visible || ui->screen != PSP_UI_SCREEN_PAGE)
+        return false;
+    ui->chrome_visible = false;
+    return true;
+}
+
 bool psp_ui_set_page_activation(PspUiState *ui, bool active)
 {
     if (ui == NULL) return false;
@@ -1978,6 +2002,8 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
     if (ui == NULL) return;
     ui->tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
     ui->captive_portal_suggested = false;
+    ui->glyph_offer_plus_one = 0;
+    ui->heavy_scripts_suggested = false;
     copy_string(ui->status, sizeof(ui->status), status);
     unsigned frames = duration_frames == 0
         ? UI_TOAST_DEFAULT_FRAMES : duration_frames;
@@ -1986,12 +2012,158 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
     ui->toast_on_page = ui->screen == PSP_UI_SCREEN_PAGE;
 }
 
+void psp_ui_dismiss_status(PspUiState *ui, const char *status)
+{
+    if (ui == NULL || status == NULL || ui->toast_frames == 0
+        || strcmp(ui->status, status) != 0) return;
+    ui->toast_frames = 0;
+    ui->toast_entry_frames = 0;
+    ui->status[0] = '\0';
+}
+
+void psp_ui_show_status_ms(PspUiState *ui, const char *status,
+                           unsigned duration_ms)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status(ui, status, 2u);
+    if (duration_ms > 60000u) duration_ms = 60000u;
+    ui->toast_frames = (uint16_t) (UI_TOAST_TIMED | (duration_ms / 4u));
+}
+
 void psp_ui_show_wifi_sign_in_status(
     PspUiState *ui, const char *headline, unsigned duration_frames)
 {
     if (ui == NULL) return;
     psp_ui_show_status(ui, headline, duration_frames);
     ui->captive_portal_suggested = true;
+}
+
+void psp_ui_show_glyph_offer(PspUiState *ui, uint8_t pack)
+{
+    const TilefinchGlyphPackSpec *spec =
+        tilefinch_glyph_pack_spec((TilefinchGlyphPack) pack);
+    if (ui == NULL || spec == NULL) return;
+    char headline[PSP_UI_STATUS_CAPACITY];
+    snprintf(headline, sizeof(headline), "This page uses %s text.",
+             spec->label);
+    psp_ui_show_status_ms(ui, headline, PSP_UI_GLYPH_OFFER_MS);
+    ui->glyph_offer_plus_one = (uint8_t) (pack + 1u);
+}
+
+bool psp_ui_glyph_offer_visible(const PspUiState *ui)
+{
+    return ui != NULL && ui->glyph_offer_plus_one != 0
+        && ui->toast_frames != 0;
+}
+
+/* Real time the offer has been up, from its timed toast budget. */
+static bool ui_glyph_offer_armed(const PspUiState *ui)
+{
+    if (!(ui->toast_frames & UI_TOAST_TIMED)) return true;
+    unsigned left_ms = (ui->toast_frames & (UI_TOAST_TIMED - 1u)) * 4u;
+    return left_ms + PSP_UI_GLYPH_OFFER_ARMING_MS <= PSP_UI_GLYPH_OFFER_MS;
+}
+
+/* The offer takes X (open the confirmation) and Triangle (Don't ask
+   again) once armed. Circle is never taken: it stays Back and closes the
+   offer, which would otherwise outlive the page it was about. */
+static TILEFINCH_OUT_OF_LINE bool ui_update_glyph_offer(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    if (ui->screen != PSP_UI_SCREEN_PAGE) return false;
+    uint8_t pack = (uint8_t) (ui->glyph_offer_plus_one - 1u);
+    if (pressed & PSP_UI_BUTTON_CANCEL) {
+        ui->glyph_offer_plus_one = 0;
+        ui->toast_frames = 0;
+        intent->visual_changed = true;
+        return false;
+    }
+    if (!ui_glyph_offer_armed(ui)) return false;
+    PspUiGlyphOfferAnswer answer = PSP_UI_GLYPH_OFFER_NONE;
+    if (pressed & PSP_UI_BUTTON_CONFIRM)
+        answer = PSP_UI_GLYPH_OFFER_CONFIRM;
+    else if (pressed & PSP_UI_BUTTON_TOOLBAR)
+        answer = PSP_UI_GLYPH_OFFER_NEVER;
+    if (answer == PSP_UI_GLYPH_OFFER_NONE) return false;
+    intent->glyph_offer_answer = (uint8_t) answer;
+    intent->glyph_component_pack = pack;
+    ui->glyph_offer_plus_one = 0;
+    ui->toast_frames = 0;
+    if (answer == PSP_UI_GLYPH_OFFER_CONFIRM) {
+        ui->glyph_confirm_bytes = 0;
+        ui->glyph_confirm_phase = PSP_UI_GLYPH_CONFIRM_CHECKING;
+        ui->glyph_confirm_pack = pack;
+        ui->glyph_confirm_message[0] = '\0';
+        ui->cursor_visible = false;
+        ui_open_overlay(ui, PSP_UI_SCREEN_GLYPH_OFFER);
+    }
+    intent->visual_changed = true;
+    return true;
+}
+
+bool psp_ui_glyph_offer_confirming(const PspUiState *ui, uint8_t *pack)
+{
+    if (ui == NULL || ui->screen != PSP_UI_SCREEN_GLYPH_OFFER) return false;
+    if (pack != NULL) *pack = ui->glyph_confirm_pack;
+    return true;
+}
+
+void psp_ui_set_glyph_offer_size(PspUiState *ui, uint8_t pack,
+                                 uint64_t bytes)
+{
+    uint8_t showing = 0;
+    if (!psp_ui_glyph_offer_confirming(ui, &showing) || showing != pack)
+        return;
+    ui->glyph_confirm_bytes = bytes > UINT32_MAX
+        ? UINT32_MAX : (uint32_t) bytes;
+    ui->glyph_confirm_phase = PSP_UI_GLYPH_CONFIRM_READY;
+}
+
+void psp_ui_set_glyph_offer_error(PspUiState *ui, uint8_t pack,
+                                  const char *message)
+{
+    uint8_t showing = 0;
+    if (!psp_ui_glyph_offer_confirming(ui, &showing) || showing != pack)
+        return;
+    snprintf(ui->glyph_confirm_message,
+             sizeof(ui->glyph_confirm_message), "%s",
+             message == NULL || message[0] == '\0'
+                 ? "SIGNED PACK DOWNLOAD UNAVAILABLE" : message);
+    psp_ui_status_sentence_case(ui->glyph_confirm_message);
+    ui->glyph_confirm_phase = PSP_UI_GLYPH_CONFIRM_ERROR;
+}
+
+/* Modal like the Memory Stick offer: only X (once the signed size is
+   shown) and O answer it. */
+static TILEFINCH_OUT_OF_LINE void ui_update_glyph_confirm(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    uint8_t pack = ui->glyph_confirm_pack;
+    PspUiGlyphOfferAnswer answer = PSP_UI_GLYPH_OFFER_NONE;
+    if (pressed & PSP_UI_BUTTON_CANCEL)
+        answer = PSP_UI_GLYPH_OFFER_CANCEL;
+    else if ((pressed & PSP_UI_BUTTON_CONFIRM)
+             && ui->glyph_confirm_phase == PSP_UI_GLYPH_CONFIRM_READY)
+        answer = PSP_UI_GLYPH_OFFER_INSTALL;
+    if (answer == PSP_UI_GLYPH_OFFER_NONE) return;
+    intent->glyph_offer_answer = (uint8_t) answer;
+    intent->glyph_component_pack = pack;
+    intent->glyph_component_primary_requested =
+        answer == PSP_UI_GLYPH_OFFER_INSTALL;
+    ui_close_overlay(ui);
+    intent->visual_changed = true;
+}
+
+bool psp_ui_show_site_blocked_status(PspUiState *ui, const char *site,
+                                     unsigned duration_frames)
+{
+    char notice[PSP_UI_STATUS_CAPACITY];
+    if (ui == NULL
+        || !tilefinch_bot_wall_notice(site, notice, sizeof(notice))) {
+        return false;
+    }
+    psp_ui_show_status(ui, notice, duration_frames);
+    return true;
 }
 
 void psp_ui_show_tls_status(
@@ -2180,13 +2352,26 @@ void psp_ui_show_offline_app_preview(
     ui_open_overlay(ui, PSP_UI_SCREEN_OFFLINE_APP_PREVIEW);
 }
 
+void psp_ui_show_offline_app_offer(
+    PspUiState *ui, const PspUiOfflineAppPreview *preview)
+{
+    if (ui == NULL || preview == NULL) return;
+    ui->base_screen = (uint8_t) PSP_UI_SCREEN_COLLECTIONS;
+    ui->offline_app_preview = preview;
+    ui->menu_selection = 0u;
+    ui_open_overlay(ui, PSP_UI_SCREEN_OFFLINE_APP_PREVIEW);
+}
+
 void psp_ui_show_failure_recovery_actions(
     PspUiState *ui, const char *detail, uint8_t available_actions)
 {
     if (ui == NULL) return;
     ui->base_screen = (uint8_t) (psp_ui_screen_is_native_surface(ui->screen)
         ? ui->screen : PSP_UI_SCREEN_PAGE);
-    ui->failure_actions = available_actions;
+    _Static_assert(PSP_UI_FAILURE_RELOAD_BASIC < (1u << 7),
+                   "failure actions outgrew their seven bits");
+    ui->failure_recovery_heavy = false;
+    ui->failure_actions = (uint8_t) (available_actions & 0x7fu);
     ui->menu_selection = 0u;
     snprintf(ui->status, sizeof(ui->status), "%s",
              detail == NULL || detail[0] == '\0'
@@ -2346,6 +2531,36 @@ void psp_ui_show_storage_offer(
     ui->storage_offer_arming = PSP_UI_STORAGE_OFFER_ARMING_FRAMES;
     ui->cursor_visible = false;
     ui_open_overlay(ui, PSP_UI_SCREEN_STORAGE_OFFER);
+}
+
+void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
+                             size_t script_bytes, uint32_t estimate_ms)
+{
+    if (ui == NULL || site == NULL) return;
+    snprintf(ui->heavy_offer_site, sizeof(ui->heavy_offer_site), "%s", site);
+    ui->heavy_offer_script_bytes = ui_clamp_u32(script_bytes);
+    uint32_t seconds = (estimate_ms + 500u) / 1000u;
+    ui->heavy_offer_seconds = (uint16_t) (seconds > UINT16_MAX
+                                              ? UINT16_MAX : seconds);
+    ui->heavy_offer_arming = PSP_UI_STORAGE_OFFER_ARMING_FRAMES;
+    ui->cursor_visible = false;
+    ui_open_overlay(ui, PSP_UI_SCREEN_HEAVY_OFFER);
+}
+
+void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
+                                      unsigned duration_frames)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status(ui, status, duration_frames);
+    ui->heavy_scripts_suggested = true;
+}
+
+void psp_ui_show_heavy_recovery(PspUiState *ui, const char *detail,
+                                uint8_t actions)
+{
+    if (ui == NULL) return;
+    psp_ui_show_failure_recovery_actions(ui, detail, actions);
+    ui->failure_recovery_heavy = true;
 }
 
 static int analog_scroll_delta(PspUiState *ui, const PspUiInput *input)
@@ -2745,7 +2960,9 @@ enum {
     UI_SITE_DATA_SAVE_AT_EXIT,
     UI_SITE_DATA_MEMORY_CACHE,
     UI_SITE_DATA_DISK_CACHE,
+    UI_SITE_DATA_COMPILED_SCRIPTS,
     UI_SITE_DATA_CLEAR_CACHE,
+    UI_SITE_DATA_CLEAR_COMPILED,
     UI_SITE_DATA_CLEAR_COOKIES,
     UI_SITE_DATA_CLEAR_LOCAL,
     UI_SITE_DATA_CLEAR_SESSION,
@@ -2876,6 +3093,10 @@ static TILEFINCH_OUT_OF_LINE void ui_update_site_data(
                 intent->setting.id = PSP_UI_SETTING_PERSISTENT_CACHE_MB;
                 intent->setting.value.unsigned_value =
                     ui->persistent_cache_mb;
+            } else if (row == UI_SITE_DATA_COMPILED_SCRIPTS) {
+                ui->keep_compiled_scripts = !ui->keep_compiled_scripts;
+                intent->setting.id = PSP_UI_SETTING_KEEP_COMPILED_SCRIPTS;
+                intent->setting.value.boolean = ui->keep_compiled_scripts;
             } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
                 uint8_t confirmation = (uint8_t) (selection + 1u);
                 if (ui->data_clear_confirmation != confirmation) {
@@ -2884,6 +3105,8 @@ static TILEFINCH_OUT_OF_LINE void ui_update_site_data(
                     ui->data_clear_confirmation = 0;
                     intent->clear_cache_requested =
                         row == UI_SITE_DATA_CLEAR_CACHE;
+                    intent->clear_compiled_scripts_requested =
+                        row == UI_SITE_DATA_CLEAR_COMPILED;
                     intent->clear_cookies_requested =
                         row == UI_SITE_DATA_CLEAR_COOKIES;
                     intent->clear_local_storage_requested =
@@ -2945,6 +3168,22 @@ static TILEFINCH_OUT_OF_LINE void ui_update_storage_site(
     intent->visual_changed = true;
 }
 
+static TILEFINCH_OUT_OF_LINE void ui_update_heavy_offer(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    PspUiAction answer = PSP_UI_ACTION_NONE;
+    if (pressed & PSP_UI_BUTTON_CONFIRM)
+        answer = PSP_UI_ACTION_HEAVY_RUN_SESSION;
+    else if (pressed & PSP_UI_BUTTON_TOOLBAR)
+        answer = PSP_UI_ACTION_HEAVY_RUN_ALWAYS;
+    else if (pressed & PSP_UI_BUTTON_CANCEL)
+        answer = PSP_UI_ACTION_HEAVY_CANCEL;
+    if (answer == PSP_UI_ACTION_NONE) return;
+    intent->action = answer;
+    ui_close_overlay(ui);
+    intent->visual_changed = true;
+}
+
 static TILEFINCH_OUT_OF_LINE void ui_update_storage_offer(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
@@ -2993,10 +3232,19 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             ? ui->cursor_fade + 1u : ui->cursor_fade - 1u;
         intent.visual_changed = true;
     }
-    if (ui->toast_frames > 0) {
+    if (ui->toast_frames & UI_TOAST_TIMED) {
+        /* A timed toast counts real time, whatever the frame rate. */
+        unsigned spent = input->elapsed_ms == 0 ? 16u : input->elapsed_ms;
+        unsigned left = ui->toast_frames & (UI_TOAST_TIMED - 1u);
+        spent = spent < 4u ? 1u : spent / 4u;
+        ui->toast_frames = (uint16_t) (spent >= left
+            ? 1u : UI_TOAST_TIMED | (left - spent));
+    }
+    if (ui->toast_frames > 0 && !(ui->toast_frames & UI_TOAST_TIMED)) {
         ui->toast_frames--;
         if (ui->toast_frames == 0) {
             ui->captive_portal_suggested = false;
+            ui->glyph_offer_plus_one = 0;
             intent.visual_changed = true;
         }
     }
@@ -3065,6 +3313,11 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             ui->cursor_visible = false;
     }
 
+    if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER
+        && ui->heavy_offer_arming != 0) {
+        ui->heavy_offer_arming--;
+        return intent;
+    }
     if (ui->screen == PSP_UI_SCREEN_STORAGE_OFFER
         && ui->storage_offer_arming != 0) {
         ui->storage_offer_arming--;
@@ -3079,6 +3332,25 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         if (psp_ui_menu_update(ui, pressed, &intent)) return intent;
     }
 
+    if (psp_ui_glyph_offer_visible(ui)
+        && ui_update_glyph_offer(ui, pressed, &intent)) return intent;
+
+    if (ui->heavy_scripts_suggested && ui->toast_frames != 0
+        && ui->screen == PSP_UI_SCREEN_PAGE) {
+        if (pressed & PSP_UI_BUTTON_CONFIRM) {
+            ui->heavy_scripts_suggested = false;
+            ui->toast_frames = 0;
+            intent.action = PSP_UI_ACTION_HEAVY_STOP_SCRIPTS;
+            intent.visual_changed = true;
+            return intent;
+        }
+        if (pressed & PSP_UI_BUTTON_CANCEL) {
+            ui->heavy_scripts_suggested = false;
+            ui->toast_frames = 0;
+            intent.visual_changed = true;
+            return intent;
+        }
+    }
     if (ui->captive_portal_suggested && ui->toast_frames != 0) {
         if (pressed & PSP_UI_BUTTON_CONFIRM) {
             ui->captive_portal_suggested = false;
@@ -3188,13 +3460,14 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_PAGE_UP)) {
             ui->glyph_component_remove_confirmation = false;
             ui->glyph_options_selection =
-                (ui->glyph_options_selection + 3u) % 4u;
+                (ui->glyph_options_selection + UI_GLYPH_OPTION_ROWS - 1u)
+                % UI_GLYPH_OPTION_ROWS;
             intent.visual_changed = true;
         } else if (pressed & (PSP_UI_BUTTON_DOWN
                               | PSP_UI_BUTTON_PAGE_DOWN)) {
             ui->glyph_component_remove_confirmation = false;
             ui->glyph_options_selection =
-                (ui->glyph_options_selection + 1u) % 4u;
+                (ui->glyph_options_selection + 1u) % UI_GLYPH_OPTION_ROWS;
             intent.visual_changed = true;
         } else if (pressed & PSP_UI_BUTTON_CANCEL) {
             if (ui->glyph_component_remove_confirmation) {
@@ -3225,7 +3498,20 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             intent.setting.id = PSP_UI_SETTING_COLOR_EMOJI;
             intent.setting.value.boolean = ui->color_emoji;
             intent.visual_changed = true;
-        } else if (ui->glyph_options_selection >= 2u
+        } else if (ui->glyph_options_selection == 4u
+                   && (pressed & (PSP_UI_BUTTON_LEFT
+                                  | PSP_UI_BUTTON_RIGHT
+                                  | PSP_UI_BUTTON_CONFIRM))) {
+            ui->glyph_offers_off = !ui->glyph_offers_off;
+            intent.setting.id = PSP_UI_SETTING_GLYPH_OFFERS;
+            intent.setting.value.boolean = !ui->glyph_offers_off;
+            intent.visual_changed = true;
+        } else if (ui->glyph_options_selection == 5u
+                   && (pressed & PSP_UI_BUTTON_CONFIRM)) {
+            intent.setting.id = PSP_UI_SETTING_GLYPH_OFFERS_RESET;
+            intent.visual_changed = true;
+        } else if ((ui->glyph_options_selection == 2u
+                    || ui->glyph_options_selection == 3u)
                    && (pressed & (PSP_UI_BUTTON_CONFIRM
                                   | PSP_UI_BUTTON_RELOAD))) {
             TilefinchGlyphPack pack = TILEFINCH_GLYPH_PACK_COLOR_EMOJI;
@@ -3497,8 +3783,16 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         ui_update_storage_site(ui, pressed, &intent);
         return intent;
     }
+    if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER) {
+        ui_update_heavy_offer(ui, pressed, &intent);
+        return intent;
+    }
     if (ui->screen == PSP_UI_SCREEN_STORAGE_OFFER) {
         ui_update_storage_offer(ui, pressed, &intent);
+        return intent;
+    }
+    if (ui->screen == PSP_UI_SCREEN_GLYPH_OFFER) {
+        ui_update_glyph_confirm(ui, pressed, &intent);
         return intent;
     }
 
@@ -3585,6 +3879,26 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     intent.setting.id = PSP_UI_SETTING_READER_AUTO_MODE;
                     intent.setting.value.boolean = ui->reader_auto_mode;
                     break;
+                case UI_OPTION_HEAVY_PAGES: {
+                    int count = (int) BROWSER_HEAVY_PAGES_MODE_COUNT;
+                    int selected = (int) ui->heavy_pages_mode % count;
+                    selected = (selected + count + direction) % count;
+                    ui->heavy_pages_mode = (unsigned) selected;
+                    intent.setting.id = PSP_UI_SETTING_HEAVY_PAGES;
+                    intent.setting.value.heavy_pages_mode =
+                        (BrowserHeavyPagesMode) selected;
+                    break;
+                }
+                case UI_OPTION_BASIC_FALLBACK: {
+                    int count = (int) BROWSER_BASIC_FALLBACK_MODE_COUNT;
+                    int selected = (int) ui->basic_fallback_mode % count;
+                    selected = (selected + count + direction) % count;
+                    ui->basic_fallback_mode = (unsigned) selected;
+                    intent.setting.id = PSP_UI_SETTING_BASIC_FALLBACK;
+                    intent.setting.value.basic_fallback_mode =
+                        (BrowserBasicFallbackMode) selected;
+                    break;
+                }
                 case UI_OPTION_CUSTOM_HOMEPAGE:
                     ui->custom_homepage_enabled =
                         !ui->custom_homepage_enabled;
@@ -4168,6 +4482,7 @@ bool psp_ui_intent_predispatch_is_complete(const PspUiIntent *intent)
         && !intent->clear_cookies_requested
         && !intent->clear_local_storage_requested
         && !intent->clear_session_storage_requested
+        && !intent->clear_compiled_scripts_requested
         && !intent->update_primary_requested
         && !intent->update_cancel_requested;
 }
@@ -4909,13 +5224,16 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
     static const char *const operations[] = {
-        "Install offline app", "Update offline app", "Reinstall offline app"
+        "Install offline app", "Update offline app", "Reinstall offline app",
+        "Recompile offline app"
     };
     static const char *const modes[] = {
         "Browser", "Minimal UI", "Standalone", "Fullscreen"
     };
-    unsigned operation = preview == NULL || preview->operation >= 3u
+    unsigned operation = preview == NULL
+            || preview->operation > PSP_UI_OFFLINE_APP_RECOMPILE
         ? 0u : preview->operation;
+    bool recompile = operation == PSP_UI_OFFLINE_APP_RECOMPILE;
     unsigned mode = preview == NULL || preview->display_mode >= 4u
         ? 0u : preview->display_mode;
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
@@ -4925,18 +5243,23 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
                    box.x + 16, box.y + 54, preview->name, 48, accent, 2);
     char size_line[64], resource_line[72], mode_line[48];
     uint64_t kib = (preview->estimated_bytes + 1023u) / 1024u;
+    const char *size_label = recompile ? "Saved size" : "Estimated size";
     if (kib < 1024u)
-        snprintf(size_line, sizeof(size_line),
-                 "Estimated size: %llu KB", (unsigned long long) kib);
+        snprintf(size_line, sizeof(size_line), "%s: %llu KB", size_label,
+                 (unsigned long long) kib);
     else
-        snprintf(size_line, sizeof(size_line),
-                 "Estimated size: %llu.%01llu MB",
-                 (unsigned long long) (kib / 1024u),
+        snprintf(size_line, sizeof(size_line), "%s: %llu.%01llu MB",
+                 size_label, (unsigned long long) (kib / 1024u),
                  (unsigned long long) ((kib % 1024u) * 10u / 1024u));
-    snprintf(resource_line, sizeof(resource_line),
-             "%u captured  |  %u unavailable",
-             (unsigned) preview->captured_resources,
-             (unsigned) preview->unavailable_resources);
+    if (recompile)
+        snprintf(resource_line, sizeof(resource_line),
+                 "%u scripts to recompile",
+                 (unsigned) preview->captured_resources);
+    else
+        snprintf(resource_line, sizeof(resource_line),
+                 "%u captured  |  %u unavailable",
+                 (unsigned) preview->captured_resources,
+                 (unsigned) preview->unavailable_resources);
     snprintf(mode_line, sizeof(mode_line), "Display: %s", modes[mode]);
     draw_text(pixels, width, height, stride,
               box.x + 16, box.y + 84, size_line, 54,
@@ -4961,13 +5284,17 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
     draw_text_with_font(
         pixels, width, height, stride,
         box.x + 16, box.y + 177,
-        preview->unavailable_resources == 0
+        recompile
+            ? "Saved by an older browser. Recompiling now avoids a slow "
+              "first start."
+            : preview->unavailable_resources == 0
             ? "Only already-loaded same-origin resources are included."
             : "Unavailable resources may still need a network connection.",
         64, box.x + box.width - 16, muted, 1, NULL, false);
     draw_text(pixels, width, height, stride,
               box.x + 16, box.y + box.height - 20,
-              "X Confirm   O Back", 24, muted, 1);
+              recompile ? "X Recompile   Square Open anyway   O Back"
+                        : "X Confirm   O Back", 44, muted, 1);
 }
 
 static size_t ui_failure_labels(
@@ -4976,7 +5303,11 @@ static size_t ui_failure_labels(
     size_t count = 0;
 #define ADD_FAILURE_LABEL(text_) \
     do { if (count < capacity) labels[count++] = (text_); } while (0)
-    ADD_FAILURE_LABEL("Retry");
+    if (!ui->failure_recovery_heavy) ADD_FAILURE_LABEL("Retry");
+    if (ui->failure_actions & PSP_UI_FAILURE_BASIC_VIEW)
+        ADD_FAILURE_LABEL("Show Basic view");
+    if (ui->failure_actions & PSP_UI_FAILURE_RELOAD_BASIC)
+        ADD_FAILURE_LABEL("Reload in Basic view");
     if (ui->failure_actions & PSP_UI_FAILURE_READER)
         ADD_FAILURE_LABEL("Try Reader mode");
     if (ui->failure_actions & PSP_UI_FAILURE_WIFI)
@@ -5003,15 +5334,21 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
     draw_text_bold(pixels, width, height, stride,
-                   box.x + 15, box.y + 13, "Page did not open", 34,
+                   box.x + 15, box.y + 13,
+                   ui->failure_recovery_heavy ? "Too heavy for the PSP"
+                                              : "Page did not open", 34,
                    PSP_THEME_WARN, 2);
     draw_text_with_font(
         pixels, width, height, stride, box.x + 15, box.y + 48,
         ui->status, 64, box.x + box.width - 15, muted, 1, NULL, false);
-    const char *labels[7] = {0};
-    size_t count = ui_failure_labels(ui, labels, 7u);
+    const char *labels[9] = {0};
+    size_t count = ui_failure_labels(ui, labels, 9u);
     int top = box.y + 70;
+    /* Rows share the space between the detail and the hint bar. */
+    int available = box.height - 70 - 22;
     int row_height = count > 6u ? 23 : 25;
+    if (count != 0u && row_height * (int) count > available)
+        row_height = available / (int) count;
     for (size_t at = 0; at < count; at++) {
         UiRect row = {box.x + 11, top + (int) at * row_height,
                       box.width - 22, row_height - 2};
@@ -5334,6 +5671,20 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         case UI_OPTION_READER_AUTO_MODE:
             *label = "Auto Reader";
             *value = ui->reader_auto_mode ? "On" : "Off";
+            break;
+        case UI_OPTION_HEAVY_PAGES:
+            *label = "Heavy pages";
+            *value = ui->heavy_pages_mode == BROWSER_HEAVY_PAGES_RUN
+                ? "Run"
+                : (ui->heavy_pages_mode == BROWSER_HEAVY_PAGES_BASIC
+                       ? "Basic view" : "Ask");
+            break;
+        case UI_OPTION_BASIC_FALLBACK:
+            *label = "Basic view fallback";
+            *value = ui->basic_fallback_mode == BROWSER_BASIC_FALLBACK_ASK
+                ? "Ask"
+                : (ui->basic_fallback_mode == BROWSER_BASIC_FALLBACK_OFF
+                       ? "Off" : "Automatic");
             break;
         case UI_OPTION_CUSTOM_HOMEPAGE:
             *label = "Home page";
@@ -5896,7 +6247,7 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
     bool downloadable = tilefinch_glyph_pack_for_language(
         ui->glyph_language, &language_pack);
     char language_state[32], emoji_state[32];
-    char rows[4][64];
+    char rows[UI_GLYPH_OPTION_ROWS][64];
     snprintf(rows[0], sizeof(rows[0]), "Language  %s",
              ui_glyph_language_name(ui->glyph_language));
     snprintf(rows[1], sizeof(rows[1]), "Emoji  %s",
@@ -5908,8 +6259,11 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
     snprintf(rows[3], sizeof(rows[3]), "Color emoji pack  %s",
              ui_glyph_pack_state(
                  ui, TILEFINCH_GLYPH_PACK_COLOR_EMOJI, emoji_state));
-    for (size_t at = 0; at < 4u; at++) {
-        int row_y = box.y + 58 + (int) at * 34;
+    snprintf(rows[4], sizeof(rows[4]), "Offer language packs  %s",
+             ui->glyph_offers_off ? "Off" : "Ask");
+    snprintf(rows[5], sizeof(rows[5]), "%s", "Reset declined offers");
+    for (size_t at = 0; at < UI_GLYPH_OPTION_ROWS; at++) {
+        int row_y = box.y + 54 + (int) at * 28;
         bool selected = at == ui->glyph_options_selection;
         if (selected)
             fill_round_rect(
@@ -5923,7 +6277,10 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
             2, NULL, false);
     }
     const char *hint = "Left/Right choose   O Back";
-    if (ui->glyph_options_selection >= 2u) {
+    if (ui->glyph_options_selection == 5u) {
+        hint = "X Reset   O Back";
+    } else if (ui->glyph_options_selection == 2u
+               || ui->glyph_options_selection == 3u) {
         TilefinchGlyphPack pack = ui->glyph_options_selection == 2u
             ? language_pack : TILEFINCH_GLYPH_PACK_COLOR_EMOJI;
         bool available = ui->glyph_options_selection != 2u || downloadable;
@@ -6206,7 +6563,10 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
             pixels, width, height, stride, box.x + box.width - 14,
             box.y + 19, view->stick_free, 30, muted, 1, false);
     }
-    enum { LINE_LIMIT = 4 + PSP_UI_SITE_STORAGE_ROW_LIMIT + 1 + 8 };
+    enum {
+        LINE_LIMIT = 4 + PSP_UI_SITE_STORAGE_ROW_LIMIT + 1
+            + UI_SITE_DATA_FIXED_ROWS
+    };
     UiSiteDataLine lines[LINE_LIMIT];
     size_t count = 0;
     size_t sites = ui_site_data_sites(ui);
@@ -6218,8 +6578,9 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
                                              (int) at};
     static const char *const fixed[UI_SITE_DATA_FIXED_ROWS] = {
         "Offer Memory Stick", "Save RAM storage at exit", "Memory cache",
-        "Disk cache", "Clear HTTP caches", "Clear cookies",
-        "Clear local storage", "Clear session storage"
+        "Disk cache", "Keep compiled scripts", "Clear HTTP caches",
+        "Clear compiled scripts", "Clear cookies", "Clear local storage",
+        "Clear session storage"
     };
     for (size_t at = 0; at < UI_SITE_DATA_FIXED_ROWS; at++) {
         if (at == UI_SITE_DATA_OFFER)
@@ -6241,7 +6602,7 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
     size_t end = first + UI_SITE_DATA_VISIBLE_LINES < count
         ? first + UI_SITE_DATA_VISIBLE_LINES : count;
     int right = box.x + box.width - 36;
-    char live[16], disk[16];
+    char live[16], disk[16], compiled[16];
     if (ui->live_cache_kib < 1024u)
         snprintf(live, sizeof(live), "%u KB", ui->live_cache_kib);
     else
@@ -6250,6 +6611,14 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
         snprintf(disk, sizeof(disk), "Off");
     else
         snprintf(disk, sizeof(disk), "%u MB", ui->persistent_cache_mb);
+    /* On, it shows the Memory Stick space its files use. */
+    if (!ui->keep_compiled_scripts)
+        snprintf(compiled, sizeof(compiled), "Off");
+    else if (ui->compiled_scripts_kib == 0)
+        snprintf(compiled, sizeof(compiled), "On");
+    else
+        psp_ui_format_bytes(compiled, sizeof(compiled),
+                            (uint64_t) ui->compiled_scripts_kib * 1024u);
     for (size_t at = first; at < end; at++) {
         int line_y = box.y + 49 + (int) (at - first) * 21;
         int row = lines[at].row;
@@ -6292,6 +6661,8 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
             value = live;
         else if (fixed_row == UI_SITE_DATA_DISK_CACHE)
             value = disk;
+        else if (fixed_row == UI_SITE_DATA_COMPILED_SCRIPTS)
+            value = compiled;
         draw_text_with_font(
             pixels, width, height, stride, box.x + 18, line_y,
             armed ? "Press X again to clear" : lines[at].label, 32,
@@ -6312,8 +6683,10 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
             muted, 3);
     const char *hint = ui->data_clear_confirmation != 0
         ? "X Confirm clear   O Cancel"
-        : (selection < sites ? "X Open   Left/Right change   O Back"
-                             : "X or Left/Right change   L/R section");
+        : selection < sites ? "X Open   Left/Right change   O Back"
+        : selection == sites + UI_SITE_DATA_COMPILED_SCRIPTS
+            ? "Faster revisits; uses Memory Stick space"
+            : "X or Left/Right change   L/R section";
     draw_text(pixels, width, height, stride, box.x + 16,
               box.y + box.height - 22, hint, 40, muted, 2);
 }
@@ -6373,6 +6746,99 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_site(
               focus == 0u ? "X or Left/Right change   O Back"
                           : "X Delete   O Back",
               34, muted, 2);
+}
+
+/* The language-pack confirmation, in the Memory Stick offer's panel
+   style: the size comes from the signed metadata, never the catalog. */
+static TILEFINCH_OUT_OF_LINE void draw_glyph_confirm(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t text, uint16_t muted)
+{
+    const TilefinchGlyphPackSpec *spec =
+        tilefinch_glyph_pack_spec((TilefinchGlyphPack) ui->glyph_confirm_pack);
+    if (spec == NULL) return;
+    UiRect box = {50, 66, width - 100, 140};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 22);
+    char title[64], size[16];
+    bool ready = ui->glyph_confirm_phase == PSP_UI_GLYPH_CONFIRM_READY;
+    if (ready) {
+        psp_ui_format_bytes(size, sizeof(size), ui->glyph_confirm_bytes);
+        snprintf(title, sizeof(title), "Install %s pack (%s)?",
+                 spec->label, size);
+    } else {
+        snprintf(title, sizeof(title), "Install %s pack?", spec->label);
+    }
+    int right = box.x + box.width - 14;
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 14, title, sizeof(title), right, text, 2,
+                        NULL, true);
+    const char *body = ui->glyph_confirm_phase == PSP_UI_GLYPH_CONFIRM_ERROR
+        ? ui->glyph_confirm_message
+        : ready ? "Signed download, verified before it is"
+                : "Checking size...";
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 54, body, 48, right,
+                        PSP_THEME_TEXT_BODY, 2, NULL, false);
+    if (ready)
+        draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                            box.y + 76, "saved to the Memory Stick.", 48,
+                            right, PSP_THEME_TEXT_BODY, 2, NULL, false);
+    draw_text(pixels, width, height, stride, box.x + 16,
+              box.y + box.height - 22,
+              ready ? "X Install   O Cancel"
+                    : ui->glyph_confirm_phase == PSP_UI_GLYPH_CONFIRM_ERROR
+                        ? "O Close" : "O Cancel",
+              24, muted, 2);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t text, uint16_t muted)
+{
+    UiRect box = {40, 34, width - 80, 204};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 22);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 14, "This site is a large app", 28,
+                   text, 2);
+    char size[16], line[96];
+    psp_ui_format_bytes(size, sizeof(size), ui->heavy_offer_script_bytes);
+    int right = box.x + box.width - 14;
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 52, ui->heavy_offer_site, 48, right,
+                        text, 2, NULL, false);
+    snprintf(line, sizeof(line), "It needs about %s of script.", size);
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 78, line, 48, right, PSP_THEME_TEXT_BODY,
+                        2, NULL, false);
+    if (ui->heavy_offer_seconds >= 60u) {
+        snprintf(line, sizeof(line),
+                 "It may take about %u min to start.",
+                 (unsigned) (ui->heavy_offer_seconds + 30u) / 60u);
+    } else {
+        snprintf(line, sizeof(line), "It may take about %u s to start.",
+                 (unsigned) ui->heavy_offer_seconds);
+    }
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 100, line, 48, right, PSP_THEME_TEXT_BODY,
+                        2, NULL, false);
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 126, "Start it anyway?", 48, right,
+                        PSP_THEME_TEXT_BODY, 2, NULL, false);
+    draw_text_with_font(pixels, width, height, stride, box.x + 16,
+                        box.y + 152,
+                        "Large apps can run out of PSP memory.",
+                        96, right, muted, 1, NULL, false);
+    draw_text(pixels, width, height, stride, box.x + 16,
+              box.y + box.height - 22,
+              "X This session   Triangle Always   O Not now", 46, muted, 2);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_storage_offer(
@@ -7017,7 +7483,8 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
     const PspUiCollectionsRow *selected =
         ui->collections_selection < rows
             ? &ui->collections->rows[ui->collections_selection] : NULL;
-    const char *primary = "X OPEN";
+    const char *primary = selected != NULL && selected->needs_recompile
+        ? "X RECOMPILE" : "X OPEN";
     if (ui->collections_section == PSP_UI_COLLECTION_DOWNLOADS
         && selected != NULL) {
         if (selected->offline_state == OFFLINE_ITEM_DOWNLOADING)
@@ -7423,6 +7890,70 @@ void psp_ui_status_sentence_case(char *text)
     }
 }
 
+/* The language-pack offer: the toast's shape and motion with a third line
+   for the question. Lines step down to scale 1 when the chosen chrome
+   scale cannot fit the longest label ("Traditional Chinese"). */
+static TILEFINCH_OUT_OF_LINE void draw_glyph_offer(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent)
+{
+    const TilefinchGlyphPackSpec *spec =
+        tilefinch_glyph_pack_spec(
+            (TilefinchGlyphPack) (ui->glyph_offer_plus_one - 1u));
+    if (spec == NULL) return;
+    char question[96];
+    snprintf(question, sizeof(question),
+             "Install the %s language pack?", spec->label);
+    static const char hint[] = "X Install...   Triangle Don't ask again";
+    const char *lines[3] = {ui->status, question, hint};
+    int scale = browser_ui_scale(ui);
+    int text_width = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        text_width = 0;
+        for (size_t at = 0; at < 3u; at++) {
+            int line = chrome_text_width_bytes(
+                lines[at], strlen(lines[at]), scale, at == 0u);
+            if (line > text_width) text_width = line;
+        }
+        if (scale == 1 || text_width <= width - 48) break;
+        scale = 1;
+    }
+    int box_width = text_width + 24;
+    if (box_width > width - 24) box_width = width - 24;
+    int line_step = scale == 2 ? 22 : 16;
+    int box_height = 3 * line_step + (scale == 2 ? 8 : 6);
+    int reserved_bottom = ui->chrome_visible ? browser_bottom_height(ui) : 0;
+    UiRect box = { (width - box_width) / 2,
+                   height - reserved_bottom - box_height - 8,
+                   box_width, box_height };
+    unsigned toast_frames = ui->toast_entry_frames;
+    if (toast_frames > PSP_THEME_MOTION_TOAST_FRAMES)
+        toast_frames = PSP_THEME_MOTION_TOAST_FRAMES;
+    box.y += (int) ui_toast_rise[toast_frames];
+    fill_round_rect(
+        pixels, width, height, stride,
+        (UiRect) {box.x + 2, box.y + 3, box.width, box.height},
+        PSP_THEME_RADIUS_PANEL, rgb565(0, 0, 0), 2);
+    fill_round_rect(pixels, width, height, stride, box,
+                    PSP_THEME_RADIUS_PANEL, PSP_THEME_PANEL, 4);
+    fill_round_edge_bar(pixels, width, height, stride, box,
+                        PSP_THEME_RADIUS_PANEL, 4, accent);
+    /* A line that was measured to fit is drawn without a right bound: the
+       ellipsis reserve would otherwise clip its last word. */
+    int right = text_width <= box.width - 22
+        ? 0x3fffffff : box.x + box.width - 10;
+    const uint16_t colors[3] = {
+        PSP_THEME_TEXT, PSP_THEME_TEXT_BODY, PSP_THEME_TEXT_MUTED
+    };
+    int y = box.y + (scale == 2 ? 5 : 4);
+    for (size_t at = 0; at < 3u; at++) {
+        draw_text_with_font(pixels, width, height, stride, box.x + 12,
+                            y + (int) at * line_step, lines[at],
+                            sizeof(question), right, colors[at], scale,
+                            NULL, at == 0u);
+    }
+}
+
 static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
                        int height, int stride, uint16_t panel,
                        uint16_t accent, uint16_t text)
@@ -7431,6 +7962,11 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
     /* A menu's own feedback shows over it; a page toast raised before the
        menu opened waits until the page is back. */
     if (ui->screen != PSP_UI_SCREEN_PAGE && ui->toast_on_page) return;
+    if (ui->glyph_offer_plus_one != 0) {
+        if (ui->screen == PSP_UI_SCREEN_PAGE)
+            draw_glyph_offer(ui, pixels, width, height, stride, accent);
+        return;
+    }
     char presented[PSP_UI_STATUS_CAPACITY];
     copy_string(presented, sizeof(presented), ui->status);
     psp_ui_status_sentence_case(presented);
@@ -7459,6 +7995,8 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
     }
     if (ui->captive_portal_suggested)
         second_line = "X Open Wi-Fi sign-in  O Cancel";
+    if (ui->heavy_scripts_suggested)
+        second_line = "X Stop page scripts  O Keep reading";
     bool multiline = second_line != NULL && second_line[0] != '\0';
     int scale = browser_ui_scale(ui);
     if (multiline && scale > 1) {
@@ -7665,6 +8203,10 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
             ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_STORAGE_OFFER) {
         draw_storage_offer(ui, pixels, width, height, stride, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_GLYPH_OFFER) {
+        draw_glyph_confirm(ui, pixels, width, height, stride, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER) {
+        draw_heavy_offer(ui, pixels, width, height, stride, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_OPTIONS) {
         draw_options(ui, pixels, width, height, stride, panel, accent, text,
                      muted);

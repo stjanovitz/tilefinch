@@ -108,6 +108,7 @@ release commit, after the changelog commit:
 ```sh
 cmake --preset psp -B build-pgo-gen -DTILEFINCH_ALLOW_BUILD_DIR=ON \
     -DTILEFINCH_PSP_VALIDATION_LOG=ON -DPSP_BROWSER_QUICKJS_PGO_GENERATE=ON \
+    -DPSP_BROWSER_EXECUTION_CENSUS=OFF \
     -DPSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE=9000000
 cmake --build build-pgo-gen --target psp-browser-script
 scripts/train-quickjs-pgo.sh build-pgo-gen build-pgo-profile perf/traces
@@ -115,7 +116,12 @@ scripts/train-quickjs-pgo.sh build-pgo-gen build-pgo-profile perf/traces
 
 Training replays the chatgpt-ask journey under PPSSPP (about two minutes;
 it needs a logged-in GUI session, so it cannot run in CI) and never touches
-a device. Pass the directory to the cut script with `--quickjs-pgo
+a device. Disable the validation-only execution census while training: its
+engine hooks are absent from shipping builds and would produce an incompatible
+profile. The isolated training profile explicitly selects Run for heavy
+pages and waits out the transient Stop shortcut before opening the composer;
+it does not change the shipping Ask default, timing journeys or user settings.
+Pass the directory to the cut script with `--quickjs-pgo
 build-pgo-profile`; configure refuses a profile whose fingerprint does not
 match the engine being built, because a stale profile makes the engine
 larger and slower than none. `--no-quickjs-pgo` builds without it, as a

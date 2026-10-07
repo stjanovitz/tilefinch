@@ -613,7 +613,7 @@
         || check_region->height < 18 || check_region->height > 32
         || slider_region->width != 160
         || slider_region->height < 20 || slider_region->height > 32
-        || send_region->width != 44) {
+        || send_region->width <= 32 || send_region->width >= 96) {
         fprintf(
             stderr,
             "native regions check=%p:%d:%dx%d slider=%p:%d:%dx%d "
@@ -646,7 +646,9 @@
           && count_region != NULL && count_region->type == CONTROL_INPUT
           && choice_region != NULL && choice_region->type == CONTROL_SELECT
           && send_region != NULL && send_region->type == CONTROL_BUTTON
-          && send_region->width == 44
+          /* Its measured label plus padding and borders; the exact
+             pixels follow the font (Chromium: 54px for SEND). */
+          && send_region->width > 32 && send_region->width < 96
           && reset_region != NULL && reset_region->type == CONTROL_BUTTON);
     bool toggle_stroke = false;
     for (size_t i = 0;
@@ -1774,8 +1776,11 @@
           && document_parse(&outer_frame->document, &budget,
                             nested_outer_page,
                             sizeof(nested_outer_page) - 1, 16));
+    /* The outer document's realm also hosts the inner frame's WindowProxy
+       realm; 2 MiB left under 100 KiB once the bootstrap grew (see the
+       remote binding isolation test), which this test is not about. */
     outer_frame->runtime = script_runtime_create_deferred(
-        &outer_frame->document, &budget, 2 * MIB, 1000,
+        &outer_frame->document, &budget, 3 * MIB, 1000,
         "https://nested-frame.test/outer.html", NULL,
         &outer_frame->script_result);
     CHECK(outer_frame->runtime != NULL
@@ -1827,8 +1832,12 @@
           && document_parse(&inner_frame->document, &budget,
                             nested_inner_page,
                             sizeof(nested_inner_page) - 1, 16));
+    /* 3 MiB: this realm only needs room for the bootstrap plus a small
+       script; 2 MiB stopped fitting once the bootstrap gained the HTML
+       element interfaces (2026-10). Bootstrap growth is guarded directly
+       by tilefinch-bootstrap-footprint-tests. */
     inner_frame->runtime = script_runtime_create_deferred(
-        &inner_frame->document, &budget, 2 * MIB, 1000,
+        &inner_frame->document, &budget, 3 * MIB, 1000,
         "https://nested-frame.test/inner.html", NULL,
         &inner_frame->script_result);
     CHECK(inner_frame->runtime != NULL
@@ -2056,6 +2065,96 @@
     browser_session_destroy(&pressure_browser_session);
     CHECK(budget.current == 0);
 
+    /* The same page, with the room the scripts need held by compiled-script
+       tables instead: the tables are optional memory, so they are evicted
+       and both scripts run (before, both were skipped for pressure). */
+    puts("test: script pressure evicts compiled-script tables first");
+    static BrowserSession table_browser_session;
+    static NavigationSession table_navigation;
+    static unsigned char table_bytecode[1024 * 1024];
+    BudgetReservation table_reservation = {0};
+    CHECK(browser_session_init(&table_browser_session, &budget, 64 * 1024)
+          && test_cache_put_classic_script(
+              &table_browser_session, "https://pressure.test/",
+              "https://pressure.test/pressure.js", pressure_script_source,
+              sizeof(pressure_script_source) - 1)
+          && navigation_init(&table_navigation, &budget, 2));
+    navigation_attach_browser_session(&table_navigation,
+                                      &table_browser_session);
+    navigation_enable_scripts(&table_navigation, 3 * MIB, 1000);
+    navigation_enable_document_scripts(&table_navigation, 2,
+                                       64 * 1024, 32 * 1024, 1000);
+    table_navigation.defer_document_script_pipeline = true;
+    uint64_t table_generation = navigation_begin(&table_navigation);
+    CHECK(navigation_commit_html(
+              &table_navigation, table_generation,
+              "https://pressure.test/", pressure_script_page,
+              strlen(pressure_script_page), 480, NULL, NULL, true));
+    (void) script_runtime_collect_and_trim(table_navigation.page.runtime);
+    browser_session_script_bytecode_set_limit(
+        &table_browser_session, BROWSER_SCRIPT_BYTECODE_CLASSIC, 6 * MIB);
+    uint32_t table_realm = browser_session_module_bytecode_generation(
+        &table_browser_session);
+    static const char *const table_urls[4] = {
+        "https://other.test/a.js", "https://other.test/b.js",
+        "https://other.test/c.js", "https://other.test/d.js"
+    };
+    for (size_t i = 0; i < 4; i++) {
+        BrowserScriptBytecodeKey table_key = {
+            .module_name = table_urls[i],
+            .response_url = table_urls[i],
+            .partition_key = "https://other.test",
+            .source = (const unsigned char *) table_urls[i],
+            .source_length = strlen(table_urls[i])
+        };
+        CHECK(browser_session_script_bytecode_put(
+            &table_browser_session, BROWSER_SCRIPT_BYTECODE_CLASSIC,
+            &table_key, table_realm, table_bytecode,
+            sizeof(table_bytecode)));
+    }
+    size_t table_remaining = budget_remaining(&budget);
+    CHECK(table_remaining > 2 * MIB
+          && budget_reservation_acquire(
+              &table_reservation, &budget, BUDGET_CATEGORY_RESOURCE,
+              table_remaining - 256 * 1024));
+    budget_set_reclaim_hook(&budget, test_reclaim_script_bytecode,
+                            &table_browser_session);
+    size_t table_failures_before = budget.failure_count;
+    bool table_executed = navigation_execute_document_scripts_from(
+        &table_navigation, &table_navigation.page.document);
+    bool table_diagnostic = table_executed
+        && script_runtime_evaluate_diagnostic(
+            table_navigation.page.runtime,
+            "globalThis.pocSummary=globalThis.inlinePressureScriptRan?"
+            "'inline-pressure-ran':'inline-pressure-missing'",
+            "https://pressure.test/verify-inline.js",
+            &table_navigation.page.script_result);
+    if (!table_diagnostic || table_navigation.script_skipped_pressure != 0) {
+        fprintf(stderr, "table pressure: skipped=%zu loaded=%zu "
+                "entries=%zu summary=%s\n",
+                table_navigation.script_skipped_pressure,
+                table_navigation.script_loaded,
+                browser_session_script_bytecode_entries(
+                    &table_browser_session,
+                    BROWSER_SCRIPT_BYTECODE_CLASSIC),
+                table_navigation.page.script_result.summary);
+    }
+    CHECK(table_diagnostic
+          && table_navigation.script_discovered == 2
+          && table_navigation.script_skipped_pressure == 0
+          && table_navigation.script_loaded == 1
+          && budget.failure_count == table_failures_before
+          && browser_session_script_bytecode_entries(
+                 &table_browser_session,
+                 BROWSER_SCRIPT_BYTECODE_CLASSIC) < 4
+          && strcmp(table_navigation.page.script_result.summary,
+                    "inline-pressure-ran") == 0);
+    budget_set_reclaim_hook(&budget, NULL, NULL);
+    budget_reservation_release(&table_reservation);
+    navigation_destroy(&table_navigation);
+    browser_session_destroy(&table_browser_session);
+    CHECK(budget.current == 0);
+
     puts("test: cached nested stylesheet imports and range media");
     static const char import_page[] =
         "<!doctype html><link rel=stylesheet href=/styles/root.css>"
@@ -2274,6 +2373,123 @@
     stylesheet_destroy(&split_sheet);
     document_destroy(&split_document);
     CHECK(budget.current == 0);
+
+    puts("test: large stylesheets keep DOM-relevant rules past 256");
+    {
+        /* itch.io and reuters.com ship 640-770 KB sheets. Below the first
+           screen, the rules sizing their inline SVG icons (and hiding a
+           banner at mobile widths) sat after more than 256 other rules that
+           also match the page, and were dropped although the sheet's rule
+           ceiling was far from spent: the icons drew 300 px wide. */
+        enum { FILLER = 520, RELEVANT = 300 };
+        size_t page_capacity = 64u * 1024u;
+        char *page = budget_malloc(&budget, page_capacity);
+        size_t css_capacity = 600u * 1024u;
+        unsigned char *css = budget_malloc(&budget, css_capacity);
+        CHECK(page != NULL && css != NULL);
+        size_t page_length = (size_t) snprintf(
+            page, page_capacity,
+            "<!doctype html><link rel=stylesheet href=/big.css><body>");
+        /* Push every relevant element past the 512-node first-screen
+           census so only the whole-document census can admit its rules. */
+        for (int i = 0; i < FILLER; i++) {
+            page_length += (size_t) snprintf(
+                page + page_length, page_capacity - page_length, "<i></i>");
+        }
+        for (int i = 0; i < RELEVANT; i++) {
+            page_length += (size_t) snprintf(
+                page + page_length, page_capacity - page_length,
+                "<b class=r%d></b>", i);
+        }
+        page_length += (size_t) snprintf(
+            page + page_length, page_capacity - page_length,
+            "<svg id=big-icon class=icon viewBox='0 0 21 21'></svg>"
+            "</body>");
+        CHECK(page_length < page_capacity);
+        size_t css_length = 0;
+        for (int i = 0; i < 512; i++) {
+            css_length += (size_t) snprintf(
+                (char *) css + css_length, css_capacity - css_length,
+                ".head-%d{color:red}", i);
+        }
+        for (int i = 0; i < RELEVANT; i++) {
+            css_length += (size_t) snprintf(
+                (char *) css + css_length, css_capacity - css_length,
+                ".r%d{padding-top:1px}", i);
+        }
+        css_length += (size_t) snprintf(
+            (char *) css + css_length, css_capacity - css_length,
+            ".icon{width:21px;height:21px}/*");
+        /* A comment pads the source over the 512 KiB large-sheet
+           threshold; the 5% tail allowance lands inside it. */
+        while (css_length < 560u * 1024u) css[css_length++] = 'x';
+        css_length += (size_t) snprintf(
+            (char *) css + css_length, css_capacity - css_length, "*/");
+        PocDocument big_document;
+        Stylesheet big_sheet;
+        static BrowserSession big_session;
+        ExternalStylesheetStats big_stats;
+        CHECK(document_parse(&big_document, &budget, page, page_length, 512)
+              && stylesheet_build(&big_sheet, &budget, &big_document, 480)
+              && browser_session_init(&big_session, &budget, 1024 * 1024)
+              && test_cache_put_stylesheet(
+                  &big_session, "https://big-sheet.test/big.css",
+                  css, css_length, NULL)
+              && stylesheets_load_external(
+                  &big_document, &big_sheet, &budget,
+                  "https://big-sheet.test/page", 8, 1024 * 1024,
+                  1024 * 1024, 1000, NULL, &big_session, &big_stats));
+        lxb_dom_node_t *icon = find_id(
+            lxb_dom_interface_node(big_document.html), "big-icon");
+        ComputedStyle icon_style = style_for_node(&big_sheet, icon, NULL);
+        CHECK(icon != NULL && big_stats.loaded == 1);
+        CHECK(icon_style.has_width && icon_style.width == 21
+              && icon_style.has_height && icon_style.height == 21);
+        /* The head's 512 absent selectors stay admitted, the sheet stays
+           bounded, and nothing else past the head was taken. */
+        CHECK(big_sheet.count <= 512u + RELEVANT + 1u
+              && big_sheet.count >= 512u + RELEVANT);
+        stylesheet_destroy(&big_sheet);
+        document_destroy(&big_document);
+        browser_session_destroy(&big_session);
+        budget_free(&budget, css);
+        budget_free(&budget, page);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: an empty media query list matches all");
+    {
+        /* Media Queries 4 section 2.1. Stitches (washingtonpost.com) wraps
+           its theme custom properties and component sizes in `@media{`. */
+        static const char empty_media_page[] =
+            "<!doctype html><style>--sxs{--sxs:0 t}"
+            "@media{:root,.t{--icon:20px}.b{padding-left:7px}}"
+            "@media   {.c{padding-right:5px}}"
+            ".a{width:var(--icon);height:var(--icon)}</style>"
+            "<body><svg id=empty-media-icon class='a b c' "
+            "viewBox='0 0 16 16'></svg></body>";
+        PocDocument empty_media_document;
+        Stylesheet empty_media_sheet;
+        CHECK(document_parse(&empty_media_document, &budget,
+                             empty_media_page, strlen(empty_media_page), 17)
+              && stylesheet_build(&empty_media_sheet, &budget,
+                                  &empty_media_document, 480));
+        lxb_dom_node_t *icon = find_id(
+            lxb_dom_interface_node(empty_media_document.html),
+            "empty-media-icon");
+        ComputedStyle icon_style = style_for_node(
+            &empty_media_sheet, icon, NULL);
+        CHECK(icon != NULL && icon_style.has_width && icon_style.width == 20
+              && icon_style.has_height && icon_style.height == 20
+              && icon_style.padding.left == 7
+              && icon_style.padding.right == 5);
+        CHECK(stylesheet_media_matches(&empty_media_sheet, "", 0)
+              && stylesheet_media_matches(&empty_media_sheet, "  ", 2)
+              && !stylesheet_media_matches(&empty_media_sheet, "print", 5));
+        stylesheet_destroy(&empty_media_sheet);
+        document_destroy(&empty_media_document);
+        CHECK(budget.current == 0);
+    }
 
     puts("test: bounded selector admission retains attribute-only rules");
     PocDocument attribute_document;
@@ -2811,8 +3027,12 @@
           && command_x(&mutation_layout, "DOM") >
              command_x(&mutation_layout, "LIVE"));
     ScriptResult computed_style_result;
+    /* 3 MiB: this realm only needs room for the bootstrap plus a small
+       script; 2 MiB stopped fitting once the bootstrap gained the HTML
+       element interfaces (2026-10). Bootstrap growth is guarded directly
+       by tilefinch-bootstrap-footprint-tests. */
     ScriptRuntime *computed_style_runtime = script_runtime_create_deferred(
-        &mutated, &budget, 2 * MIB, 1000, "https://example.test/",
+        &mutated, &budget, 3 * MIB, 1000, "https://example.test/",
         NULL, &computed_style_result);
     CHECK(computed_style_runtime != NULL);
     script_runtime_set_stylesheet(computed_style_runtime, &mutation_sheet);
@@ -4216,7 +4436,7 @@
               "worker.onmessage=event=>{const workerCounts=event.data;"
               "worker.terminate();URL.revokeObjectURL(url);"
               "setTimeout(()=>{pocSummary=[a,b,workerCounts,"
-              "__tilefinchPendingTimers()].join(':')},10)}})()",
+              "__tilefinchSchedulerSnapshot()[2]].join(':')},10)}})()",
               "<active-interval-cancel>", &interval_cancel_result));
     for (size_t interval_turn = 0; interval_turn < 12; interval_turn++) {
         CHECK(script_runtime_advance(
@@ -4461,6 +4681,14 @@
         &worker_import_document, &budget, 4 * MIB, 1000,
         "https://worker-network.test/page/", NULL,
         &worker_import_result);
+    /* The script fetch must fail without the network. Left to the live
+       transport it failed only once the host resolver answered for
+       worker-network.test, which took two to four of the 16 turns in
+       210 loaded runs but depends on the resolver, not on this code. The
+       injected failure completes the request in the scheduler at enqueue;
+       it still reaches the page only through the asynchronous delivery
+       path, on a later turn, which is what this test is about. */
+    fetch_inject_failure_once(FETCH_INJECT_TLS);
     CHECK(worker_import_runtime != NULL
           && script_runtime_evaluate_diagnostic(
               worker_import_runtime,
@@ -4470,12 +4698,14 @@
               "filename==='https://worker-network.test/page/missing-worker.js'"
               "?'WORKER-NETWORK-ASYNC-OK':'WORKER-NETWORK-ASYNC-BAD';worker."
               "terminate()}})()",
-              "<worker-network-async>", &worker_import_result));
+              "<worker-network-async>", &worker_import_result)
+          && strcmp(worker_import_result.summary, "pending") == 0);
     for (size_t worker_turn = 0; worker_turn < 16; worker_turn++) {
         CHECK(script_runtime_advance(
             worker_import_runtime, worker_turn, 16,
             &worker_import_result));
     }
+    fetch_inject_failure_once(FETCH_INJECT_NONE);
     if (strcmp(worker_import_result.summary,
                "WORKER-NETWORK-ASYNC-OK") != 0) {
         fprintf(stderr, "worker network summary=%s error=%s\n",
@@ -5181,6 +5411,52 @@
     }
     CHECK(strcmp(worker_performance_result.summary,
                  "PERMISSIONS-QUERY-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Permissions answer registry names and reject unknown ones");
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    memset(&worker_performance_result, 0,
+           sizeof(worker_performance_result));
+    worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 4 * MIB, 1000,
+        "https://permissions-registry.test/", NULL,
+        &worker_performance_result);
+    /* The names a bot-detection script walks (the Permissions Registry and
+       the earlier PermissionName enum) resolve "denied"; a name no
+       registry knows still rejects with a TypeError. */
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';const names=['accelerometer',"
+              "'accessibility-events','ambient-light-sensor','background-sync',"
+              "'bluetooth','clipboard','device-info','gyroscope','magnetometer',"
+              "'midi','payment-handler','push','speaker','geolocation'];"
+              "Promise.all(names.map(name=>navigator.permissions.query({name})"
+              ".then(s=>s instanceof PermissionStatus&&s.name===name&&"
+              "s.state==='denied',e=>'rejected:'+name))).then(values=>"
+              "navigator.permissions.query({name:'no-such-permission'}).then("
+              "()=>'resolved',e=>e instanceof TypeError).then(unknown=>{"
+              "const bad=values.filter(v=>v!==true);pocSummary=!bad.length&&"
+              "unknown===true?'PERMISSIONS-REGISTRY-OK':'PERMISSIONS-REGISTRY-"
+              "BAD:'+JSON.stringify({bad,unknown})}))})()",
+              "<permissions-registry>", &worker_performance_result));
+    for (size_t turn = 0; turn < 8; turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, turn, 16,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary,
+               "PERMISSIONS-REGISTRY-OK") != 0) {
+        fprintf(stderr, "permissions registry summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "PERMISSIONS-REGISTRY-OK") == 0);
     script_runtime_destroy(worker_performance_runtime);
     document_destroy(&worker_performance_document);
     CHECK(budget.current == 0);
@@ -6600,11 +6876,15 @@
           && document_parse(&child_message_document, &budget,
                             child_message_page,
                             strlen(child_message_page), 16));
+    /* Both realms keep headroom over the eager bootstrap; at exactly
+       2 MiB the parent's message callback ran out of memory once the
+       bootstrap grew by a few KiB (document.links/anchors,
+       scrollingElement, rendered innerText). */
     ScriptRuntime *parent_message_runtime = script_runtime_create(
-        &parent_message_document, &budget, 2 * MIB, 1000,
+        &parent_message_document, &budget, 2 * MIB + MIB / 4, 1000,
         "https://parent.test/", &parent_message_result);
     ScriptRuntime *child_message_runtime = script_runtime_create_deferred(
-        &child_message_document, &budget, 2 * MIB, 1000,
+        &child_message_document, &budget, 2 * MIB + MIB / 4, 1000,
         "https://child.test/", NULL, &child_message_result);
     MessageTestTarget message_target = {
         parent_message_runtime, &parent_message_result
@@ -6738,8 +7018,11 @@
           && browser_session_cookie_set_context(
                  &opaque_message_session, &opaque_seed_context,
                  "secret=COOKIE_SECRET; Secure; SameSite=None"));
+    /* 3 MiB: the bootstrap alone leaves a 2 MiB realm almost no headroom,
+       so this child-frame setup passed or ran out of memory depending on
+       how unrelated bootstrap bytecode happened to pack. */
     ScriptRuntime *opaque_message_runtime = script_runtime_create_deferred(
-        &child_message_document, &budget, 2 * MIB, 1000,
+        &child_message_document, &budget, 3 * MIB, 1000,
         opaque_url, &opaque_message_session, &opaque_message_result);
     CHECK(opaque_message_runtime != NULL
           && script_runtime_configure_messaging(
@@ -6817,5 +7100,10 @@
     document_destroy(&parent_message_document);
     CHECK(budget.current == 0);
 
+    /* Last: it installs its own budget for the parser. */
+    CHECK(test_hidden_mutation_relayouts() == 0);
+    CHECK(test_relayout_style_reuse() == 0);
+    CHECK(test_relayout_style_table_sizing() == 0);
+    CHECK(test_full_rebuild_shares_discovery_styles() == 0);
     return 0;
 }

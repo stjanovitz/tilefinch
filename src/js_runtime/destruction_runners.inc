@@ -2,12 +2,34 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
     Budget *budget = runtime->budget;
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_gc()) {
+        ScriptHeapGrowth growth;
+        script_runtime_heap_growth(runtime, &growth);
+        fprintf(stderr,
+                "tilefinch-gc-summary collections=%zu threshold=%zu "
+                "max-advance=%zu max-checkpoint=%zu "
+                "starved=%zu backoffs=%zu gc-us=%llu live=%zu limit=%zu "
+                "peak-limit=%zu raises=%zu pregrows=%zu refusals=%zu "
+                "returns=%zu\n",
+                growth.collections, growth.threshold_collections,
+                growth.max_advance_collections,
+                growth.max_checkpoint_collections,
+                growth.pacing_starved, growth.pacing_backoffs,
+                (unsigned long long) growth.collection_us,
+                script_runtime_heap_used(runtime), growth.limit,
+                growth.peak_limit, growth.raises, growth.pregrows,
+                growth.refusals, growth.returns);
+    }
+#endif
     /* Defense in depth only: lookup admission also compares the unforgeable
        realm epoch, so correctness never depends on teardown running. */
     js_webgl_realm_epoch_release(&runtime->bridge);
     if (runtime->bridge.stylesheet != NULL)
         ((Stylesheet *) runtime->bridge.stylesheet)->fullscreen_node = NULL;
     runtime->bridge.fullscreen_node_handle = 0;
+    audio_slots_retire(runtime);
+    document_body_snapshot_destroy(&runtime->memory_rescue);
     tilefinch_game_audio_destroy(runtime->game_audio);
     runtime->game_audio = NULL;
     if (tilefinch_trace_tasks()) {
@@ -63,6 +85,10 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         script_runtime_report_memory(runtime, stderr);
     }
     if (runtime->context != NULL) {
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+        JS_FreeAtom(runtime->context, runtime->validation_frame_packet_atom);
+        runtime->validation_frame_packet_atom = JS_ATOM_NULL;
+#endif
         while (runtime->checkpoint_continuation_count != 0u) {
             size_t slot = runtime->checkpoint_continuation_head;
             JS_FreeValue(runtime->context,
@@ -72,6 +98,10 @@ void script_runtime_destroy(ScriptRuntime *runtime)
                 (slot + 1u) % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT);
             runtime->checkpoint_continuation_count--;
         }
+        /* Queued bytecode stores hold this realm's compiled scripts: store
+           a bounded share now, before they go. */
+        script_runtime_flush_pending_bytecode(
+            runtime, SCRIPT_BYTECODE_TEARDOWN_FLUSH_BYTES);
         js_lazy_webpack_bundles_destroy(runtime);
         JS_FreeValue(runtime->context,
                      runtime->bridge.trusted_stable_script_wrap);
@@ -96,6 +126,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context,
                      runtime->page_visibility_host_apply);
         JS_FreeValue(runtime->context, runtime->fullscreen_host_exit);
+        JS_FreeValue(runtime->context, runtime->document_all_cache);
         JS_FreeValue(runtime->context, runtime->opfs_storage_manager);
         JS_FreeValue(runtime->context, runtime->game_audio_host_suspend);
         JS_FreeValue(runtime->context, runtime->game_audio_host_complete);
@@ -119,9 +150,11 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->media_update = JS_UNDEFINED;
         runtime->page_visibility_host_apply = JS_UNDEFINED;
         runtime->fullscreen_host_exit = JS_UNDEFINED;
+        runtime->document_all_cache = JS_UNDEFINED;
         runtime->opfs_storage_manager = JS_UNDEFINED;
         runtime->game_audio_host_suspend = JS_UNDEFINED;
         runtime->game_audio_host_complete = JS_UNDEFINED;
+        audio_slots_release_values(runtime);
         runtime->dispatch_input_handle = JS_UNDEFINED;
         runtime->dispatch_activation_handle = JS_UNDEFINED;
         runtime->dispatch_handle = JS_UNDEFINED;
@@ -145,6 +178,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
             JS_FreeContext(runtime->frame_realms[slot].context);
         }
         JS_SetGCHook(runtime->runtime, NULL, NULL);
+        JS_SetGCPacingHook(runtime->runtime, NULL, NULL);
         JS_SetLazyCompileHook(runtime->runtime, NULL, NULL);
         if (runtime->profile != NULL) {
             script_profile_release(runtime->context, runtime->profile);
@@ -157,6 +191,11 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         script_census_detach(runtime->runtime);
         JS_FreeRuntime(runtime->runtime);
     }
+    /* Every opaque finalizer has run while its Budget owner remained live;
+       wrapper finalizers were the last users of the handle table. */
+    js_rt_bridge_node_table_free(&runtime->bridge);
+    budget_free(budget, runtime->game_audio_slots);
+    runtime->game_audio_slots = NULL;
     /* Instance finalizers ran above; the idle WebAssembly runtime and its
        pool are released at this boundary, not after each operation. */
     js_wasm_release_idle_runtime();
@@ -166,6 +205,9 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     if (runtime->module_opaque_destroy != NULL) {
         runtime->module_opaque_destroy(runtime->module_opaque);
     }
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    budget_free(budget, runtime->validation_phases);
+#endif
     budget_free(budget, runtime);
 }
 

@@ -29,6 +29,19 @@ typedef struct {
     PspOfflineAppPreparation *app_preparation;
     uint32_t last_active_id;
     char status[80];
+    /* Optional: shows progress text (install, preview, recompile) while
+       that work runs, e.g. on the PSP's busy-work status line. */
+    void (*show_progress)(void *context, const char *status);
+    void *show_progress_context;
+    /* Library row activation of an app with stale bytecode: the app the
+       recompile offer is shown for, and one the user chose to open anyway. */
+    uint32_t recompile_offer_id;
+    uint32_t open_anyway_id;
+    /* The installed app the current document was opened from: its source
+       URL and the navigation generation that committed it. Installing that
+       page again reuses the stored manifest metadata and icon. */
+    char opened_app_url[OFFLINE_LIBRARY_URL_LIMIT];
+    uint64_t opened_app_generation;
 } PspOfflineStore;
 
 void psp_offline_store_init(
@@ -56,5 +69,15 @@ void psp_offline_store_destroy(PspOfflineStore *store);
 const char *psp_offline_store_status(const PspOfflineStore *store);
 const unsigned char *psp_offline_store_app_icon(
     PspOfflineStore *store, uint32_t id);
+/* Opening `id` from the Library: true when its bytecode is stale and the
+   recompile offer (psp_offline_store_app_preview, operation
+   PSP_UI_OFFLINE_APP_RECOMPILE) was prepared instead. False once the user
+   chose to open it anyway. */
+bool psp_offline_store_offer_recompile(PspOfflineStore *store, uint32_t id);
+/* The offer's answers. Recompile publishes a new generation (new id). */
+bool psp_offline_store_recompile_app(PspOfflineStore *store, uint32_t id,
+                                     uint32_t *new_id);
+uint32_t psp_offline_store_take_offer(PspOfflineStore *store,
+                                      bool open_anyway);
 
 #endif

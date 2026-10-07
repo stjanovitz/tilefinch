@@ -1331,6 +1331,7 @@ static bool test_external_fonts_bypass_generic_cache(void)
     return true;
 }
 
+
 int main(void)
 {
     if (!test_bounded_font_loader()

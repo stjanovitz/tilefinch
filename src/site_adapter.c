@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "tilefinch/site_identity.h"
 #include "tilefinch/youtube_lite.h"
 
 typedef struct SiteAdapterDefinition SiteAdapterDefinition;
@@ -160,6 +161,8 @@ static bool youtube_metrics(
         .build_slices = youtube.build_slices,
         .transform_quota_overruns =
             youtube.transform_quota_overruns,
+        .maximum_transform_slice_bytes =
+            youtube.maximum_transform_slice_bytes,
         .network_us = youtube.network_us,
         .build_us = youtube.build_us,
         .request_wall_us = youtube.request_wall_us,
@@ -233,7 +236,11 @@ static bool google_search_query(
         at += span + 1u;
         left -= span + 1u;
     }
-    return !raw && *query != NULL && *query_length <= 384u;
+    /* tilefinch_raw=1 is the compatibility page's "Try Google anyway"
+       marker; the navigation loader strips it and opts the session in
+       before any request is built. Once opted in, searches go to Google. */
+    return !raw && !site_identity_google_opted_in()
+        && *query != NULL && *query_length <= 384u;
 }
 
 static bool google_search_matches(const char *url)
@@ -315,6 +322,8 @@ static void *google_search_begin(
         load->status = SITE_ADAPTER_LOAD_FAILED;
         return load;
     }
+    /* The fixed markup is under 2 KiB; two worst-case query copies add
+       4608 bytes. */
     size_t capacity = 7168u;
     char *html = budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, capacity);
@@ -325,6 +334,12 @@ static void *google_search_begin(
                      "Google compatibility page exceeded its memory bound");
         return NULL;
     }
+    /* Shown once, after a Google search the session had opted into was
+       refused and the browser fell back here (site_identity.h). */
+    const char *refusal = site_identity_take_google_refusal_note()
+        ? "<p id=compat-refused role=status><b>Google didn't accept this"
+          " search.</b> Tilefinch is using its compatibility page again.</p>"
+        : "";
     int length = snprintf(
         html, capacity,
         "<!doctype html><html><head><meta charset=utf-8>"
@@ -339,7 +354,8 @@ static void *google_search_begin(
         "margin-top:9px;padding:10px;border:1px solid #5f9dcc;"
         "background:#173a54;color:#fff;text-decoration:none}"
         "small{display:block;color:#a7bdcf;margin-top:14px}"
-        "</style></head><body><main><h1>Google needs JavaScript</h1>"
+        "#compat-refused{color:#ffd27a}"
+        "</style></head><body><main><h1>Google needs JavaScript</h1>%s"
         "<p>Google no longer sends search results in its basic HTML response."
         " Tilefinch can open a script-light search instead.</p>"
         "<form action='https://lite.duckduckgo.com/lite/' method=get>"
@@ -349,9 +365,14 @@ static void *google_search_begin(
         "<form action='https://www.google.com/search' method=get>"
         "<input type=hidden name=q value=\"%s\">"
         "<input type=hidden name=tilefinch_raw value=1>"
-        "<button id=compat-google type=submit>Try Google anyway</button></form>"
-        "<small>Your query is sent to DuckDuckGo only after you choose the"
-        " first action.</small></main></body></html>", display, display);
+        "<button id=compat-google type=submit"
+        " aria-describedby=compat-google-warning>Try Google anyway</button>"
+        "<small id=compat-google-warning>Slower: Google runs a browser check"
+        " first (several seconds on the PSP), and Google may still refuse."
+        "</small></form>"
+        "<small>Nothing is sent until you choose. A Google choice lasts until"
+        " Tilefinch restarts.</small></main></body></html>",
+        refusal, display, display);
     if (length < 0 || (size_t) length >= capacity) {
         budget_free(budget, html);
         snprintf(load->error, sizeof(load->error), "%s",

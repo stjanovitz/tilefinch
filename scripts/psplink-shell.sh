@@ -57,7 +57,7 @@ esac
 }
 
 usage() {
-    echo "usage: $0 ready | exec 'pspsh command'" >&2
+    echo "usage: $0 ready | hold | exec 'pspsh command'" >&2
     exit 2
 }
 
@@ -187,6 +187,38 @@ ensure_ready() {
     return 1
 }
 
+hold_bridge() {
+    ensure_ready
+    held_pid=$(sed -n '1p' "$BRIDGE_PID")
+    case "$held_pid" in ''|*[!0-9]*)
+        echo "PSPLink hold lost the recorded bridge PID." >&2
+        return 1 ;;
+    esac
+    # Keep the automation session observable/alive. After admission, never
+    # call ensure_ready again: replacing a lost bridge invalidates live host0
+    # descriptors even if a subsequent version probe would succeed.
+    trap 'exit 0' INT TERM
+    hold_announced=false
+    while :; do
+        current_pid=$(sed -n '1p' "$BRIDGE_PID" 2>/dev/null) || current_pid=
+        if [ "$current_pid" != "$held_pid" ] \
+            || ! recorded_bridge_serves_host_root; then
+            echo "PSPLink hold lost bridge PID/root ownership; not replacing it." >&2
+            return 1
+        fi
+        if ! kill -0 "$held_pid" 2>/dev/null; then
+            echo "PSPLink held bridge exited; not replacing it." >&2
+            return 1
+        fi
+        if [ "$hold_announced" = false ]; then
+            printf 'PSPLink hold ready; host0: %s; bridge PID: %s\n' \
+                "$HOST_ROOT" "$held_pid"
+            hold_announced=true
+        fi
+        sleep "$POLL_SLEEP"
+    done
+}
+
 [ "$#" -ge 1 ] || usage
 mode=$1
 shift
@@ -195,6 +227,10 @@ case "$mode" in
         [ "$#" -eq 0 ] || usage
         ensure_ready
         printf 'PSPLink ready; host0: %s\n' "$HOST_ROOT"
+        ;;
+    hold)
+        [ "$#" -eq 0 ] || usage
+        hold_bridge
         ;;
     exec)
         [ "$#" -eq 1 ] || usage

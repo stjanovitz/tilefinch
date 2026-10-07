@@ -340,11 +340,19 @@ void navigation_set_fixed_script_memory_limits(NavigationSession *session,
     if (session != NULL) session->fixed_script_memory_limits = fixed;
 }
 
+void navigation_arm_next_top_level_heap(NavigationSession *session,
+                                        size_t heap_limit)
+{
+    if (session != NULL) session->next_top_level_js_heap = heap_limit;
+}
+
 uint64_t navigation_begin(NavigationSession *session)
 {
     if (session == NULL) return 0;
+    navigation_refresh_supersede(session);
     session->generation++;
     if (session->generation == 0) session->generation++;
+    navigation_hand_history_replace(session);
     session->cancelled = false;
     session->navigation_started_us = navigation_now_us();
     session->last_http_status = 0;
@@ -356,6 +364,7 @@ uint64_t navigation_begin(NavigationSession *session)
     session->last_tls12_compatibility_retry = false;
     session->last_tls_version[0] = '\0';
     session->last_tls_peer_issuer[0] = '\0';
+    session->last_bot_wall_vendor[0] = '\0';
     session->last_error[0] = '\0';
     /* Direct navigation_commit_html callers do not pass through the
        asynchronous load-state metric reset. A prior provisional paint must
@@ -413,9 +422,31 @@ static bool history_push(NavigationSession *session, const char *url,
     return true;
 }
 
+/* historyHandling "replace": the current entry becomes url/title (a fresh
+   entry: no scroll, focus or form state). Allocates first, so a refusal
+   leaves history untouched. */
+static bool history_replace_current(NavigationSession *session,
+                                    const char *url, const char *title)
+{
+    if (session->history_count == 0
+        || session->history_index >= session->history_count)
+        return history_push(session, url, title);
+    NavigationEntry entry = {0};
+    entry.url = bounded_copy(session->budget, url, NAVIGATION_URL_LIMIT);
+    entry.title = bounded_copy(session->budget, title,
+                               NAVIGATION_TITLE_LIMIT);
+    if (entry.url == NULL || entry.title == NULL) {
+        entry_destroy(session->budget, &entry);
+        return false;
+    }
+    entry_destroy(session->budget, &session->history[session->history_index]);
+    session->history[session->history_index] = entry;
+    return true;
+}
+
 static bool page_capability_trace_setup(NavigationSession *session)
 {
-    if (!session->trace_page_capabilities) return true;
+    if (!NAVIGATION_TRACES_PAGE_CAPABILITIES(session)) return true;
     static const char setup[] =
         "(()=>{const seen=new Map(),missing=new Set(),events=[],first=[],shapes=new Map(),traced=new WeakMap(),rawByProxy=new WeakMap();"
         "const state=globalThis.__tilefinchPageTrace={seen,missing,events,first,shapes,observerEntryTypes:[],domQueries:[],domMutations:[]};const record=name=>{const count=seen.get(name)||0;seen.set(name,count+1);if(count===0&&first.length<512)first.push(name);if(events.length===512)events.shift();events.push(name);},shape=(name,value)=>{if(!shapes.has(name))shapes.set(name,value===null?'null':typeof value);};globalThis.addEventListener('error',()=>{if(state.failureEvents===undefined){state.failureEvents=events.slice(-128);state.failureFirst=first.slice()}},{capture:true});"
@@ -513,7 +544,7 @@ static bool page_capability_trace_setup(NavigationSession *session)
 
 static void page_capability_trace_report(NavigationSession *session)
 {
-    if (!session->trace_page_capabilities || session->page.runtime == NULL)
+    if (!NAVIGATION_TRACES_PAGE_CAPABILITIES(session) || session->page.runtime == NULL)
         return;
     static const char report[] =
         "{const t=__tilefinchPageTrace;globalThis.__tilefinchPageSummaryBeforeTrace=globalThis.pocSummary;const missing=[...t.missing].filter(name=>!/^global[.][A-Za-z0-9]{5,}=?$/.test(name)).sort(),events=t.failureEvents||t.events,first=t.failureFirst||t.first,important=first.filter(name=>!name.includes(':global.')||/(Worker|Blob|URL|Stream|Observer|WebAssembly|Intl|crypto|performance|navigator|trustedTypes|Trusted)/.test(name)),types=[...t.shapes].filter(([name])=>/^(?:(?:new|call):)?(?:navigator|performance|crypto|Blob|URL|Worker|ReadableStream|trustedTypes|Trusted)/.test(name)).slice(0,24).map(([name,type])=>name+':'+type);globalThis.pocSummary='types='+types.join(',')+'|observer-types='+t.observerEntryTypes.join(',')+'|xhr-header='+(globalThis.__tilefinchXHRLastHeaderRead||'none')+'|first='+important.slice(0,48).join(',')+'|tail='+events.slice(-32).join(',')+'|missing='+missing.join(',')+'|dom-queries='+t.domQueries.join(',')+'|dom-mutations='+t.domMutations.join(',');}";
@@ -533,7 +564,7 @@ static void page_capability_trace_report(NavigationSession *session)
 
 bool navigation_collect_page_capability_trace(NavigationSession *session)
 {
-    if (session == NULL || !session->trace_page_capabilities
+    if (session == NULL || !NAVIGATION_TRACES_PAGE_CAPABILITIES(session)
         || session->page.runtime == NULL) return false;
     page_capability_trace_report(session);
     return session->last_page_trace[0] != '\0';
@@ -549,6 +580,8 @@ typedef struct {
     bool cors;
     bool render_blocking_style;
     TilefinchCredentialsMode credentials;
+    /* The CSP grant the parser's element will carry (nonce, integrity). */
+    uint8_t csp_grant;
     bool launched;
     bool complete;
 } NavigationPreload;

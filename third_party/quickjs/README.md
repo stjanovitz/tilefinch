@@ -19,8 +19,17 @@ and every engine change was reviewable only as a patch file. Now an engine
 change is an ordinary diff.
 
 `cmake/TilefinchDependencies.cmake` pins the SHA-256 of `quickjs.c` and
-`quickjs.h`; a mismatch fails configure. An intentional engine change
-updates the pins in the same commit (the error prints the new values).
+`quickjs.h`, and one combined fingerprint of the other sources whose
+change can alter compiled bytecode (`quickjs-atom.h`, `quickjs-opcode.h`,
+`libregexp.c`/`.h`, `libregexp-opcode.h`, `libunicode.c`/`.h`,
+`libunicode-table.h`, `dtoa.c`/`.h`: regexp literals are compiled at parse
+time and their programs are serialized into cached bytecode). A mismatch
+fails configure. An intentional engine change updates the pins in the same
+commit (the error prints the new values). `TILEFINCH_QUICKJS_ENGINE_ID`,
+which keys the persistent compiled-script tier and lazy bundle records,
+hashes the compiled `quickjs.c` together with that combined fingerprint.
+The lab variants' pins cover only their `quickjs.c` (the other sources are
+copied unchanged), so they move only when `quickjs.c` or a patch does.
 
 Host and validation builds can also enable an independent execution census
 (`CONFIG_TILEFINCH_EXECUTION_CENSUS`). Its C-only API enables per-runtime
@@ -41,6 +50,17 @@ defines the CPU/wall-time denominators, refusal/overflow reporting and the
 mandatory sampler-off comparison: the validation tags have a measurable
 Allegrex cost. This is diagnostic evidence, not a new author-visible API or
 an optimization of the interpreter.
+
+Numeric primitive indexed writes to in-bounds Float32Array/Float64Array views
+run directly in the interpreter. Int32-to-float32 writes avoid an unnecessary
+intermediate double conversion on soft-float targets. Non-numeric values and
+out-of-bounds indices retain the full property path, including coercion before
+the bounds check; proxies are never admitted. Detached and resized views use
+the engine's existing synchronously updated element count. The optimized-host
+parity fixture covers byte representations, reentrant coercion, detach/resize,
+fixed out-of-bounds views, non-extensible views, and proxies.
+The lab variant reconstruction carries this path as an unconditional layer;
+its reverse/apply hashes are checked for all seven control combinations.
 
 ## Changes carried, in application order over upstream
 
@@ -120,7 +140,15 @@ longer depend on them.
     direct-eval mechanism), so it compiles to the same closure layout and is
     moved into the stub. A first-call compile stopped by the native stack
     limit or the interrupt handler fails the call as execution would (stack
-    overflow, uncatchable interrupt) and leaves the function lazy. Functions
+    overflow, uncatchable interrupt) and leaves the function lazy. One
+    refused for lack of memory (`JS_ThrowOutOfMemory` was reached during the
+    compile) also fails uncatchably, as "out of memory", and leaves the
+    function lazy: the page sees only a call fail, and a page that catches
+    and retries it (React's render loop retries a unit of work that threw)
+    would otherwise recompile the body on every turn, each attempt refused
+    again, until the script watchdog stopped it. Counted in
+    `JSLazyFunctionStats.memory_failures`; the lab-variant baseline and
+    variant pins moved with this change. Functions
     near a direct eval or inside `with`, class constructors, field
     initializers and static blocks are always compiled eagerly. Two
     resolution details keep the captured set exact: assigning an enclosing
@@ -131,6 +159,66 @@ longer depend on them.
     for its lazy state, so eagerly compiled functions are no larger.
     `tests/test_quickjs_lazy_functions.c` runs every case lazily and
     eagerly.
+
+The regexp compiler (`libregexp.c`) stops at a refused bytecode growth
+before patching a jump offset. Upstream emitted a split or goto, then wrote
+its offset back at the returned position without checking the buffer's
+error flag. After a refused realloc that position is at or past the end
+of the buffer, and the string-list emitter's goto chain was never written,
+so the patch overran the heap or followed garbage links. A
+class with properties of strings (`\p{RGI_Emoji}` under `v`) reached it on
+a saved Mastodon page at the PSP script-heap ceiling. The string-list
+emitter, the alternation patch and the quantifier scan now raise "out of
+memory" instead. `tests/test_quickjs_oom.c` sweeps every refusal point of
+that compile under a guarded allocator.
+
+The bytecode emitter keeps going after its buffer refuses a growth (the
+buffer's error flag is checked when the function is created), so a parse
+can read back a lost opcode first: `get_lvalue` then took it for an
+invalid assignment target and the compile failed with "SyntaxError:
+invalid assignment left-hand side", blaming the page's code for a full
+heap (seen on the saved bbc-sport census page at the script-heap ceiling).
+`js_parse_error_v` now reports "out of memory" whenever the current
+function's bytecode buffer has lost an allocation.
+`tests/test_quickjs_oom.c` sweeps a parse of many assignments through its
+refusal points and accepts no SyntaxError. The lab-variant baseline and
+variant pins moved with this change.
+
+Compiling a function now fails cleanly with "out of memory" (uncatchably
+for a lazy body's first call) wherever an allocation is refused, instead
+of carrying on with state that no longer matches its buffers. A saved
+GitLab census page lazily compiling a large function at a 26-32 MiB page
+limit died with SIGBUS in `memmove` under `js_create_function`:
+`resolve_labels` keeps writing after its output buffer refuses a growth,
+so the addresses it had recorded for relocations and short jumps pointed
+past the end, and the short-jump pass moved the code by a negative
+length. Its failure path also freed the output and kept the input,
+releasing the atoms of instructions the optimizer had already dropped a
+second time. It now stops at the first refused growth, keeps the output
+and releases the unconsumed input's atoms, and checks the line table. The
+same refusal sweep found more of the pattern, all present upstream:
+`push_scope` failures (unchecked by nearly every caller) let the matching
+`pop_scope` leave the parent scope, so scope -1 was emitted as 65535 and
+`has_with_scope` looped forever over memory outside the scope array; a
+failed push now unwinds with its pops and marks the bytecode lost. A child
+function whose constant-pool slot could not be allocated was stored at
+index -1; the variable passes record closure-variable index -1 (as 65535)
+when one cannot be added, so `js_create_function`, and the lazy stub's
+resolution, now fail on any "out of memory" thrown while they run. The
+class constructor, private-brand and `switch` default patches skip a
+buffer that lost a write; a label that could not be allocated is not
+indexed. An atom table that cannot grow raises "out of memory" (upstream
+`JS_NewAtomStr` returned the null atom silently, "XXX: should generate an
+exception"), and `js_parse_error_v` reports "out of memory" for any parse
+that has thrown it: the `for (...)` lookahead scan ignores a token it
+could not make and misread a three-part loop as a for-in/of.
+`tests/test_quickjs_oom.c` sweeps every refusal point of a lazy
+first-call compile and of an eager script compile of a large function
+(every later request refused, or only one; all sizes, or only requests of
+256 or 4096 bytes and more) and of loop heads with new names, under the
+guarded allocator, and requires an honest "out of memory" or a correct
+result, intact guards and no leaks. The lab-variant baseline and variant
+pins moved with this change.
 
 Plain, unescaped ASCII identifiers are interned directly from their source
 span. An existing atom needs neither a temporary identifier copy nor a second
@@ -362,6 +450,27 @@ so its difference from malloc usage must not be described as reclaimable memory.
     without one) without decoding the line table, so the script split's
     per-poll sample costs a few loads instead of a pc-to-line walk.
 
+31. `locale-date-shape` (not a patch layer) — `Date.prototype.toLocaleString`,
+    `toLocaleDateString` and `toLocaleTimeString` produce browser en-US
+    shapes (`10/1/2026, 9:05:00 AM`, no zero padding of month, day or
+    hour), the same text the Intl polyfill's default `DateTimeFormat`
+    formats, so `date.toLocaleDateString() === new
+    Intl.DateTimeFormat().format(date)` holds as it does in browsers. The
+    lab-variant baseline and variant pins moved with this change.
+
+32. `gc-pacing-hook` (not a patch layer) — `JS_SetGCPacingHook` lets the
+    embedding choose the threshold automatic collection re-arms at after
+    each collection the allocation threshold runs: the hook gets the heap
+    that collection left, the memory limit and QuickJS's own next threshold
+    (live plus half of it, or half the remaining headroom near the limit)
+    and returns the one to use. `JS_GetGCThreshold` reads the threshold and
+    `JS_GetGCCause` tells a `JS_SetGCHook` observer whether the running
+    collection is the allocation threshold's (`JS_GC_CAUSE_THRESHOLD`) or
+    any other `JS_RunGC` (`JS_GC_CAUSE_EXPLICIT`). Without a hook the
+    re-arm is unchanged. Tilefinch's pacing (`js_rt_gc_pacing`) uses it to
+    stop near-limit collection thrash. The lab-variant baseline and variant
+    pins moved with this change.
+
 FinalizationRegistry callbacks use a separate runtime-owned job list. The
 host drains it through `JS_ExecutePendingCleanupJob` as bounded tasks after
 promise checkpoints, not as promise reactions. Both queues retain their
@@ -385,5 +494,5 @@ patches are history only; configure refuses
 ## Updating upstream
 
 Fetch the new upstream tree, re-apply the changes above (or port them),
-copy the engine files here, and update both pins. Keep this README's list
+copy the engine files here, and update every pin. Keep this README's list
 in step with what the tree actually contains.

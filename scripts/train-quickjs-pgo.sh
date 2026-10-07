@@ -32,11 +32,22 @@ done
 gcov_tool="$PSPDEV/bin/psp-gcov-tool"
 grep -q '^PSP_BROWSER_QUICKJS_PGO_GENERATE:BOOL=ON$' "$build/CMakeCache.txt" || {
     echo "$build is not an instrumented (PGO_GENERATE) build" >&2; exit 2; }
+grep -q '^PSP_BROWSER_EXECUTION_CENSUS:BOOL=OFF$' "$build/CMakeCache.txt" || {
+    echo "Disable PSP_BROWSER_EXECUTION_CENSUS for a shipping-compatible PGO profile" >&2
+    exit 2; }
 trace="$corpus/chatgpt-ask-send76"
 [ -d "$trace" ] || { echo "missing trace $trace" >&2; exit 2; }
 work="$build/pgo-training"
 rm -rf "$work"
 mkdir -p "$work"
+mkdir -p "$work/data"
+cp "$root/tests/fixtures/ppsspp-pgo/profile.cfg" "$work/data/profile.cfg"
+# Let the transient large-page Stop shortcut expire before the first Cross.
+# Derive the journey rather than maintaining a second copy of its input route.
+awk '!waited && $0 == "wait-page 60" {
+    print "wait-page 1200"; waited = 1; next
+} { print }' "$root/tests/input-scripts/chatgpt-ask.txt" \
+    >"$work/data/input-script.txt"
 
 run() {  # run NAME RUNNER-ARGS...: one scripted run; keep its counters
     name=$1; shift
@@ -52,6 +63,7 @@ run() {  # run NAME RUNNER-ARGS...: one scripted run; keep its counters
 }
 
 run journey --script chatgpt-ask --url https://chatgpt.com/ \
+    --data-dir "$work/data" \
     --trace "$trace" --trace-keyed --boot trace_ignore_request_body=1 \
     --boot trace_volatile_uuids=1 --boot validation_js_profile=0
 grep -q 'tilefinch-input-script: outcome=complete' "$work/journey.log" || {

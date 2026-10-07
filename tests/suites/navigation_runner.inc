@@ -6,12 +6,23 @@ int main(int argc, char **argv)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--legacy-charset-only") == 0) {
+        RUN_TEST(test_legacy_charset_documents_decode);
+        puts("legacy charset tests passed");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--static-image-layout-only") == 0) {
         RUN_TEST(test_static_images_retry_after_transient_idle_failure);
         RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
         RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
         RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
         puts("static image layout tests passed");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--image-retarget-only") == 0) {
+        RUN_TEST(test_display_retarget_follows_painted_size);
+        RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
+        puts("image retarget tests passed");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--hidden-images-only") == 0) {
@@ -31,6 +42,8 @@ int main(int argc, char **argv)
         return 0;
     }
     RUN_TEST(test_pump_and_cancel);
+    RUN_TEST(test_display_retarget_follows_painted_size);
+    RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
     RUN_TEST(test_progressive_preview_is_bounded_and_transient);
     RUN_TEST(test_failed_candidate_rolls_back_presented_preview);
     RUN_TEST(test_progressive_preview_waits_for_external_visuals);
@@ -57,7 +70,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_parser_script_stage_watchdog_and_failure_reset);
     RUN_TEST(test_parser_script_mutation_rebinds_live_node);
     RUN_TEST(test_failed_external_parser_source_counts_as_work);
-    RUN_TEST(test_parser_mutation_checkpoint_uses_stage_deadline);
+    RUN_TEST(test_parser_mutation_checkpoint_uses_stage_deadline_counted);
     RUN_TEST(test_parser_script_stage_clock);
     RUN_TEST(test_parser_classic_script_import);
     RUN_TEST(test_parser_insertions_reach_mutation_observers);
@@ -88,8 +101,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_caught_allocation_keeps_gradient_presentation);
     RUN_TEST(test_caught_allocation_keeps_bounded_reader_runtime);
     RUN_TEST(test_caught_large_allocation_does_not_reveal_raw_app_shell);
+    RUN_TEST(test_memory_exhaustion_restores_torn_down_server_page);
+    RUN_TEST(test_memory_refusal_keeps_intact_page_and_realm);
     RUN_TEST(test_late_script_oom_frees_queued_frame_messages);
     RUN_TEST(test_cross_origin_image_taints_canvas);
+    RUN_TEST(test_legacy_charset_documents_decode);
     RUN_TEST(test_authored_oom_text_does_not_trigger_static_recovery);
     RUN_TEST(test_late_oom_static_relayout_refusal_is_transactional);
     RUN_TEST(test_low_memory_replacement_success);

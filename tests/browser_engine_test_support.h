@@ -4,6 +4,7 @@
 #include "tilefinch/script_loader.h"
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/platform.h"
+#include "tilefinch_test_clocks.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

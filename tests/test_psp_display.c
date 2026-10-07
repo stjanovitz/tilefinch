@@ -561,9 +561,99 @@ static bool test_cursor_cadence_excludes_idle_but_not_slow_motion(void)
     return true;
 }
 
+static bool test_row_copy_preserves_pixels_padding_and_display_state(void)
+{
+    static _Alignas(16) uint16_t frame[
+        PSP_DISPLAY_SCREEN_WIDTH * PSP_DISPLAY_SCREEN_HEIGHT + 8u];
+    static const unsigned bands[][2] = {
+        {0u, PSP_DISPLAY_SCREEN_HEIGHT}, {19u, 251u}, {0u, 1u},
+        {PSP_DISPLAY_SCREEN_HEIGHT - 1u, PSP_DISPLAY_SCREEN_HEIGHT},
+        {0u, 0u}, {PSP_DISPLAY_SCREEN_HEIGHT, PSP_DISPLAY_SCREEN_HEIGHT}
+    };
+    for (size_t i = 0; i < sizeof(frame) / sizeof(frame[0]); i++)
+        frame[i] = (uint16_t) (i * 197u ^ i >> 7u);
+    CHECK(fake_reset());
+    PspDisplay display;
+    CHECK(psp_display_begin(&display, &fake_backend));
+    for (unsigned source_offset = 0; source_offset < 2u; source_offset++) {
+        for (unsigned destination_offset = 0; destination_offset < 2u;
+             destination_offset++) {
+            display.base = fake.memory + destination_offset;
+            for (unsigned eligible = 0; eligible < 2u; eligible++) {
+                for (size_t b = 0; b < sizeof(bands) / sizeof(bands[0]); b++) {
+                    memset(fake.memory, 0xa5, PSP_DISPLAY_EDRAM_BYTES);
+                    uint16_t *back = psp_display_back_buffer(&display);
+                    const uint16_t *source = frame + source_offset;
+                    CHECK(psp_display_copy_rgb565_rows(
+                        &display, source, bands[b][0], bands[b][1],
+                        eligible != 0u) == PSP_DISPLAY_ROW_COPY_MEMCPY);
+                    for (unsigned y = 0; y < PSP_DISPLAY_SCREEN_HEIGHT; y++) {
+                        for (unsigned x = 0; x < PSP_DISPLAY_STRIDE; x++) {
+                            bool copied = y >= bands[b][0] && y < bands[b][1]
+                                && x < PSP_DISPLAY_SCREEN_WIDTH;
+                            uint16_t expected = copied
+                                ? source[(size_t) y * PSP_DISPLAY_SCREEN_WIDTH + x]
+                                : UINT16_C(0xa5a5);
+                            CHECK(back[(size_t) y * PSP_DISPLAY_STRIDE + x]
+                                  == expected);
+                        }
+                    }
+                    if (destination_offset != 0u)
+                        CHECK(fake.memory[0] == UINT16_C(0xa5a5));
+                    CHECK(back[PSP_DISPLAY_BUFFER_PIXELS] == UINT16_C(0xa5a5));
+                    CHECK(psp_display_back_buffer(&display) == back);
+                    CHECK(display.presents == 0u && display.back_buffer == 0u);
+                    CHECK(fake.flush_calls == 0 && fake.present_calls == 0
+                          && fake.vblank_waits == 0);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool test_row_copy_refuses_invalid_or_overlapping_bands(void)
+{
+    static uint16_t frame[PSP_DISPLAY_SCREEN_WIDTH * PSP_DISPLAY_SCREEN_HEIGHT];
+    CHECK(fake_reset());
+    PspDisplay display;
+    CHECK(psp_display_begin(&display, &fake_backend));
+    memset(fake.memory, 0xa5, PSP_DISPLAY_EDRAM_BYTES);
+    CHECK(psp_display_copy_rgb565_rows(NULL, frame, 0, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_rgb565_rows(&display, NULL, 0, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_rgb565_rows(&display, frame, 2, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_rgb565_rows(&display, frame, 0,
+        PSP_DISPLAY_SCREEN_HEIGHT + 1u, true) == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_rgb565_rows(&display, frame, UINT32_MAX,
+        UINT32_MAX, true) == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_rgb565_rows(&display, fake.memory, 0, 1, false)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_rgb565_rows(&display, fake.memory + 8u, 0, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    display.base = fake.memory + 8u;
+    CHECK(psp_display_copy_rgb565_rows(&display, fake.memory, 0, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    display.surface = PSP_DISPLAY_SURFACE_RGBA8888;
+    CHECK(psp_display_copy_rgb565_rows(&display, frame, 0, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    display.surface = PSP_DISPLAY_SURFACE_RGB565;
+    display.base = NULL;
+    CHECK(psp_display_copy_rgb565_rows(&display, frame, 0, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    for (size_t i = 0; i < PSP_DISPLAY_EDRAM_BYTES / sizeof(*fake.memory); i++)
+        CHECK(fake.memory[i] == UINT16_C(0xa5a5));
+    CHECK(fake.flush_calls == 0 && fake.present_calls == 0);
+    return true;
+}
+
 int main(void)
 {
-    bool ok = test_cursor_cadence_excludes_idle_but_not_slow_motion()
+    bool ok = test_row_copy_preserves_pixels_padding_and_display_state()
+        && test_row_copy_refuses_invalid_or_overlapping_bands()
+        && test_cursor_cadence_excludes_idle_but_not_slow_motion()
         && test_publish_uses_next_frame_and_claims_the_mode()
         && test_rejected_present_is_a_failure_not_a_frame()
         && test_buffers_rotate_and_stay_distinct()

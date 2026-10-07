@@ -225,9 +225,9 @@ typedef struct {
 
 /* A subgrid consumes only the parent tracks covered by its own grid area.
    Carry that settled slice through the recursive layout call instead of
-   retaining another track table on every computed style.  Twelve is the
-   engine's existing explicit-column bound; row spans are already clamped to
-   eight, so the same arrays cover both axes. */
+   retaining another track table on every computed style.  The bound is the
+   engine's explicit-track bound on either axis; longer row spans are clamped
+   to it where the slice is filled. */
 #define LAYOUT_ASSIGNED_GRID_TRACK_LIMIT GRID_TRACK_REPEAT_LIMIT
 typedef struct {
     lxb_dom_node_t *node;
@@ -243,7 +243,11 @@ typedef struct {
     int row_gap;
 } LayoutAssignedGridTracks;
 
+/* A cache starts with this many style entries and grows, by powers of
+   two up to the limit, when a build walks more styled elements than it
+   holds (layout_reuse_fit_styles). */
 #define LAYOUT_REUSE_STYLE_CAPACITY 1024u
+#define LAYOUT_REUSE_STYLE_CAPACITY_LIMIT 4096u
 #define LAYOUT_REUSE_PENDING_NODE_LIMIT 32u
 #define LAYOUT_REUSE_PENDING_TOKEN_LIMIT 32u
 #define LAYOUT_REUSE_INTRINSIC_CAPACITY 128u
@@ -271,7 +275,13 @@ typedef struct {
        with the entry, so any change that could restyle the element
        re-resolves it. */
     uint8_t pseudo_absent;
+    /* LAYOUT_REUSE_FONT_DEPENDENT: the style read font metrics (`ch`);
+       LAYOUT_REUSE_CONTAINER_DEPENDENT: it consulted a container query and
+       is not reused while a pass logs container-query evaluations. */
+    uint8_t dependent;
 } LayoutReuseStyleEntry;
+#define LAYOUT_REUSE_FONT_DEPENDENT 1u
+#define LAYOUT_REUSE_CONTAINER_DEPENDENT 2u
 
 /* A viewport preview measures only a bounded prefix of an auto-layout table.
    Retain each completed row's intrinsic contribution, rather than the
@@ -304,8 +314,11 @@ struct LayoutReuseCache {
     const ImageResources *images;
     int viewport_width;
     uint64_t clock;
-    LayoutReuseStyleEntry styles[LAYOUT_REUSE_STYLE_CAPACITY];
-    uint8_t font_dependent[(LAYOUT_REUSE_STYLE_CAPACITY + 7u) / 8u];
+    /* style_mask + 1 entries (a power of two), and the live entries the
+       builds since the last fit evicted. */
+    LayoutReuseStyleEntry *styles;
+    size_t style_mask;
+    size_t style_shortfall;
     bool font_publication_active;
     LayoutIntrinsicCacheEntry intrinsic[LAYOUT_REUSE_INTRINSIC_CAPACITY];
     LayoutReuseTableRowEntry *table_rows;
@@ -384,6 +397,13 @@ struct LayoutReuseCache {
     /* Which child lists can restyle a child's descendants (sibling tests
        before a descendant combinator), and through which children. */
     StyleStructureKeys structure;
+    /* Where a test counting from the end of the siblings can sit: what
+       appending a later (hidden) sibling can restyle. */
+    StyleTrailingKeys trailing;
+    /* What :has() arguments can see of an inserted subtree. These two are
+       scanned from the sheet when first needed (hidden_facts_ready). */
+    StyleHasArgumentKeys has_arguments;
+    bool hidden_facts_ready;
 #define LAYOUT_REUSE_EMPTY_KEY_LIMIT 8u
     uint32_t empty_keys[LAYOUT_REUSE_EMPTY_KEY_LIMIT];
     uint8_t empty_key_count;
@@ -410,6 +430,44 @@ struct LayoutReuseCache {
     bool pending_overflow;
     bool pending_parent_scope;
 };
+
+/* Atomic inline boxes (inline-blocks, replaced elements, form controls)
+   placed on the line being built. They are laid out at the line top and
+   moved to their vertical-align position when the line is flushed. Lines
+   nest (an inline-block holds lines of its own), so the entries form one
+   bounded stack per layout: a line owns the entries above the depth it
+   started at and pops them when it flushes. */
+#define LINE_ATOMIC_LIMIT 64
+enum {
+    LINE_ATOMIC_BASELINE,
+    LINE_ATOMIC_TOP,
+    LINE_ATOMIC_BOTTOM
+};
+typedef struct {
+    lxb_dom_node_t *node;
+    /* When command_end is nonzero the box is these commands plus the
+       node's own box (replaced elements and form controls paint their
+       background and borders around the box range); otherwise the node's
+       retained subtree is moved. */
+    uint32_t command_start;
+    uint32_t command_end;
+    /* Interaction regions registered outside the node's own box range. */
+    uint32_t extra_link_start;
+    uint32_t extra_link_end;
+    uint32_t extra_control_start;
+    uint32_t extra_control_end;
+    /* Margin-box top (absolute) and height. */
+    int top;
+    int height;
+    /* Distance from the margin-box top to the point that sits on the line
+       baseline (the box baseline, or its middle for vertical-align:middle). */
+    int baseline;
+    uint8_t mode;
+} LineAtomic;
+typedef struct {
+    size_t count;
+    LineAtomic entries[LINE_ATOMIC_LIMIT];
+} LineAtomicStack;
 
 typedef struct {
     LayoutDocument *layout;
@@ -507,6 +565,11 @@ typedef struct {
        authoritative build. */
     int preview_y_limit;
     bool record_unresolved_visuals;
+    /* This pass owns the sheet's container-query log: containers record
+       their content box as layout learns it, and nothing measured by an
+       earlier pass (reused container-dependent styles, intrinsic sizes,
+       table rows) stands in for an evaluation the log would miss. */
+    bool container_live;
     /* Inline elements visited, for time-only checkpoints inside a block's
        inline content (block layout checkpoints once per block). */
     size_t inline_visits;
@@ -524,6 +587,29 @@ typedef struct {
     lxb_dom_node_t *assigned_flex_node;
     int assigned_flex_height;
     bool assigned_flex_minimum;
+    /* Floats and inline-blocks are laid out at their own (shrink-to-fit or
+       declared) width, but their percentage margins, padding and
+       min/max-width still refer to the containing block (CSS 2.1 10.2,
+       10.3.5, 10.3.9). Keyed by node like the assigned flex/grid sizes
+       above. */
+    lxb_dom_node_t *percentage_basis_node;
+    int percentage_basis_width;
+    /* Bottom-anchored absolutely positioned boxes placed while their
+       containing block's height was still auto (layout_block): moved to
+       the block's final padding-box bottom once it is known. Bounded; an
+       overflowing record keeps the old placement. */
+#define LAYOUT_BOTTOM_FIXUP_LIMIT 16u
+    struct {
+        lxb_dom_node_t *node;
+        lxb_dom_node_t *containing_node;
+        int assumed_bottom;
+    } bottom_fixups[LAYOUT_BOTTOM_FIXUP_LIMIT];
+    size_t bottom_fixup_count;
+    LineAtomicStack line_atomics;
+    /* The block whose descendants layout_block is currently placing. A box
+       reached through an inline or display:contents <a href> between it and
+       this container belongs to that link (see layout_container_link). */
+    lxb_dom_node_t *link_container;
     /* Per-command blur is separately bounded by radius and raster area.
        This counter bounds their aggregate per-frame work; overflow disables
        the cosmetic effect for the whole layout so fixed chrome can return to
@@ -715,6 +801,13 @@ typedef struct {
        block up over it. Other lines keep the engine's content-derived
        height. Zero when the container is unknown. */
     int strut_fixed;
+    /* The strut's baseline from the line top, used to align atomic inline
+       boxes on lines without text (CSS 2.1 10.8.1). Zero in quirks-mode
+       documents, whose image-only lines have no strut. */
+    int strut_baseline;
+    /* The block's atomic-inline stack and the depth this line owns from. */
+    LineAtomicStack *atomics;
+    size_t atomic_base;
     /* The authored first-line indent is distinct from the temporary
        inline-start displacement imposed by active floats. */
     int first_line_indent;
@@ -802,6 +895,10 @@ typedef struct {
     int margin_bottom;
     int margin_left;
     int border_height;
+    ClearMode clear_mode;
+    /* A table, flow-root, flex or grid box roots its own formatting
+       context: margins never collapse through it, even when empty. */
+    bool formatting_root;
 } GeneratedPseudoFlow;
 
 typedef struct {
@@ -845,10 +942,24 @@ typedef struct {
 #define GRID_PLACEMENT_ROW_LIMIT 64
 
 /* Grid auto-placement is transient and deliberately fixed-size. One word per
-   possible row is an occupancy bitmap for the twelve supported columns; no
+   possible row is an occupancy bitmap for the supported columns; no
    placement matrix or per-item retained allocation reaches the page. */
+_Static_assert(GRID_TRACK_LIMIT < 32,
+               "grid occupancy rows are 32-bit column bitmaps");
+/* Items locked to a major-axis track (a definite row in row flow) whose
+   minor-axis position the reservation pass records; later locked items are
+   placed in document order like before. */
+#define GRID_LOCKED_ITEM_LIMIT 64
+#define GRID_LOCKED_NO_FIT UINT8_MAX
 typedef struct {
-    uint16_t occupied[GRID_PLACEMENT_ROW_LIMIT];
+    uint32_t occupied[GRID_PLACEMENT_ROW_LIMIT];
+    /* Minor-axis start of each locked item, in placement order, chosen by
+       grid_placement_reserve() before any auto-placed item (CSS Grid 8.5
+       steps 1-2). Their cells are already in `occupied`. */
+    uint8_t locked_positions[GRID_LOCKED_ITEM_LIMIT];
+    uint8_t locked_count;
+    uint8_t locked_next;
+    bool reserved;
     uint8_t columns;
     uint8_t rows;
     uint8_t explicit_columns;
@@ -1057,6 +1168,11 @@ bool flow_text(LayoutContext *context, LineState *line, const char *text, size_t
 int generated_inline_pseudo_width(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo);
 bool flow_generated_inline_pseudo(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, LineState *line, const char *link_url, size_t link_url_length, lxb_dom_node_t *link_node, bool *flowed);
 bool generated_pseudo_is_flow_block(const ComputedStyle *style);
+int layout_inline_strut_baseline(LayoutContext *context,
+                                 const ComputedStyle *style,
+                                 lxb_dom_node_t *node);
+int layout_style_space_width(LayoutContext *context,
+                             const ComputedStyle *style);
 size_t list_marker_text(ListStyleType type, int position,
                         char *output, size_t capacity);
 const char *layout_retain_generated_text(
@@ -1115,7 +1231,34 @@ bool layout_positioned_command_escapes_clip(
     const LayoutNodeBox *clip_box);
 bool layout_tree_enter(LayoutContext *context, lxb_dom_node_t *node, const char *phase);
 bool node_effectively_disabled(lxb_dom_node_t *node);
-bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, int x, int y, int width, int height, size_t insertion_index, int forced_border_height);
+/* A row flex container's box-bearing generated item (see layout_block). */
+typedef struct {
+    bool active;
+    int width;
+    int height;
+    int margin_left;
+    int margin_right;
+    int margin_top;
+    int margin_bottom;
+    int outer_width;
+} LayoutFlexPseudo;
+LayoutFlexPseudo layout_flex_pseudo_item(LayoutContext *context,
+                                         lxb_dom_node_t *node,
+                                         const ComputedStyle *style,
+                                         PseudoElement pseudo,
+                                         int content_width);
+bool layout_flex_pseudo_paint(LayoutContext *context, lxb_dom_node_t *node,
+                              const ComputedStyle *style,
+                              const LayoutFlexPseudo *before,
+                              const LayoutFlexPseudo *after,
+                              int content_x, int content_width, int row_top,
+                              int row_bottom, size_t command_start);
+/* Paints a box-bearing or out-of-flow ::before/::after of `node` at the
+   originating box (x, y, width, height). `containing` is the absolutely
+   positioned containing block for an out-of-flow pseudo (the nearest
+   positioned ancestor's padding box, or the node's own when it is
+   positioned); NULL keeps the originating box. */
+bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, int x, int y, int width, int height, size_t insertion_index, int forced_border_height, const PositionedBox *containing);
 bool resolve_computed_length(const Stylesheet *sheet, int value, bool percent, int reference, int *resolved);
 bool style_maximum_width(const Stylesheet *sheet, const ComputedStyle *style, int containing_width, int *maximum);
 void constrain_replaced_content_size(
@@ -1134,6 +1277,9 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
                           const ComputedStyle *table_style,
                           int available_width);
 const char *first_text_data(lxb_dom_node_t *node, size_t *length);
+/* A text node's data as layout sees it: empty for a shadow host's light
+   text the flat tree leaves out (document_shadow_text_rendered). */
+const char *layout_text_data(lxb_dom_node_t *node, size_t *length);
 int distribute_flex_rows(LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *order_plan, int declared, int *stretch_free, size_t *stretch_lines);
 int flex_child_basis(LayoutContext *context, const FlatItem *item, int content_width);
 int flex_child_row_minimum(LayoutContext *context, const FlatItem *item, int content_width, bool css_table_row);
@@ -1162,6 +1308,18 @@ int measured_text_width(const FontFace *face, FontFamily metric_family, const ch
 bool layout_add_replaced_alt_text(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int x, int y, int width, int height);
+/* An <img> whose pixels have not arrived (or never will) still has a box
+   when its size follows from one specified dimension and a preferred aspect
+   ratio: CSS aspect-ratio, else the ratio HTML maps from positive width and
+   height attributes. Returns that ratio as a stand-in intrinsic size, or
+   false when the element must fall back to inline alt text. */
+bool layout_unloaded_image_ratio(lxb_dom_node_t *node,
+                                 const ComputedStyle *style,
+                                 int *ratio_width, int *ratio_height);
+/* Inline alt text for an <img> without a box flows as ordinary text; an
+   authored line-height below one line (BBC wraps images in line-height:0)
+   would stack every wrapped line on the first, so it uses `normal`. */
+ComputedStyle layout_alt_text_flow_style(const ComputedStyle *style);
 int resolve_declared_length(const Stylesheet *sheet, int value, bool percent, int reference);
 int constrain_border_box_width(
     LayoutContext *context, lxb_dom_node_t *node,
@@ -1198,6 +1356,7 @@ bool layout_resolve_visibility(LayoutContext *context);
 void clear_line_floats(LineState *line, ClearMode clear);
 void flat_iterator_init(FlatItemIterator *iterator, LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *container_style);
 void flat_text_link(lxb_dom_node_t *node, lxb_dom_node_t *container, const char **url, size_t *url_length, lxb_dom_node_t **link_node);
+bool layout_container_link(const lxb_dom_node_t *node, const lxb_dom_node_t *container, const char **url, size_t *url_length, lxb_dom_node_t **link_node);
 void flex_iterator_init(FlexItemIterator *iterator, LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *plan);
 void flex_order_plan_destroy(FlexOrderPlan *plan);
 /* Widen [*minimum_track, *maximum_track) to cover one item's placement on
@@ -1210,6 +1369,25 @@ void grid_placement_init(GridPlacementState *state, int columns, int rows,
                          const ComputedStyle *container);
 bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
                      GridItemPlacement *placement);
+/* True when the item has a definite position in the grid's major axis
+   (its row for row flow, its column for column flow). */
+bool grid_item_locked_to_major_axis(const ComputedStyle *style,
+                                    const ComputedStyle *container);
+typedef void (*GridItemPlacementResolver)(
+    LayoutContext *context, lxb_dom_node_t *container,
+    const ComputedStyle *container_style, ComputedStyle *item);
+/* Run CSS Grid 8.5 steps 1-2 on an initialized state: claim the areas of
+   items with definite positions in both axes, then place the items locked
+   to a major-axis track, so the sequential grid_place_item() pass that
+   follows auto-places the remaining items around both. Iterates the items
+   twice with the caller's iterator storage; returns false only when the
+   layout was cancelled. */
+bool grid_placement_reserve(GridPlacementState *state, LayoutContext *context,
+                            lxb_dom_node_t *container,
+                            const ComputedStyle *container_style,
+                            const FlexOrderPlan *order,
+                            GridItemPlacementResolver resolve,
+                            FlexItemIterator *iterator, FlatItem *item);
 void layout_finish_work_slice(LayoutContext *context);
 void layout_flush_line(LineState *line);
 void layout_scale_range(LayoutDocument *layout, size_t command_start, size_t link_start, size_t control_start, size_t node_box_start, int origin_x_twice, int origin_y_twice, uint8_t scale_q6, lxb_dom_node_t *source);

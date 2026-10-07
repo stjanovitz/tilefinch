@@ -28,9 +28,25 @@ as one of four forms:
 - **Raw:** no safe semantic shape was found. Reader mode is unavailable and
   the author presentation remains unchanged.
 
-The pass visits at most 8,192 DOM nodes, tracks at most 128 levels of
-nesting, and keeps at most 64 listing entries. Its scratch table is charged to
-the page budget and released straight away. The classification and the DOM
+The pass keeps a scratch record for at most 8,192 elements, visits at most
+65,536 nodes (text nodes need no record, and an encyclopedia article has
+about one per element), tracks at most 128 levels of nesting, and keeps at
+most 64 listing entries. Its scratch table is charged to the page budget and
+released straight away. Paragraphs, like text, count only outside hidden and
+excluded regions (navigation, headers, footers, asides and forms).
+
+Collapsed sections count as content. A region the author hid with the
+`hidden` attribute until it is opened, either `hidden=until-found` or a
+region named by the `aria-controls` of an `aria-expanded="false"` control just
+before it (the WAI-ARIA disclosure pattern, which mobile Wikipedia uses for
+every section after the lead), is extracted like visible content. Reader and
+Basic view retire the page's scripts, so the control could never open it
+there. Content hidden any other way stays out.
+
+The extracted tree shares [Basic view's emitted bounds](BASIC_VIEW.md#bounds-and-transactions):
+at least 512 nodes and 256 KiB of markup, and up to 4,096 nodes and 1 MiB
+when the page has the memory to show them. Reader walks at most 16,384 nodes
+of its article or listing root. The classification and the DOM
 markers it produces are cached with the loaded page, so scrolling and
 repainting do not repeat the work. Marker installation is journaled: an
 allocation failure, a collision with an internal marker, or a bound refusal
@@ -46,7 +62,49 @@ Reader mode is manual by default:
   is a bounded per-site preference;
 - **Settings → Appearance → Auto Reader** is an explicit global opt-in that
   engages only when the classifier reports a high-confidence article,
-  listing, or media page.
+  listing, or media page. It is checked once, when a page finishes loading,
+  and switches the page to Reader straight away (it does not ask first).
+
+Auto Reader decides page by page:
+
+- When it switches a page to Reader, a short note says so: "Reader view
+  (Auto Reader)" and "Select, Page tools, Reader mode: full page". It clears
+  by itself like other status notes. Circle stays Back, as on any page.
+- Reader that Auto Reader turned on belongs to that page. Following a link
+  leaves it, and the destination gets its own check: a front page reached
+  from an automatically shown article appears as it is.
+- Reader you turn on yourself (Page tools, Always Reader, or the recovery
+  sheet's Reader choice) stays on as you follow links, as before. Turning an
+  automatic Reader off and on again in Page tools makes it yours.
+- Back and Forward leave Reader and check the page again, as history
+  entries do not record which view they were shown in. A page Auto Reader
+  showed in Reader is shown in Reader again; one you switched yourself is
+  not.
+- The blank-page Reader fallback is not Auto Reader: like a choice you
+  make, its Reader carries over to the next link.
+
+High confidence needs the whole page: if the classifier walk or the
+extraction reached a bound, Auto Reader leaves the page alone, because the
+unseen rest could change the page's kind and a shortened Reader view would
+hide the rest of the article. An article is high-confidence only when its
+extracted root looks like one clear article:
+
+- it has a page title (an `h1`), or the root is an authored `<article>` with
+  a heading;
+- it is mostly prose: at least five paragraphs with 120 bytes or more of
+  their own text and at most a quarter of it in links, at least a third of
+  the root's paragraphs, and, with preformatted text, at least half of the
+  root's non-link text;
+- it has at most two headline links: `h2` to `h4` headings whose text is
+  mostly a link to another page. A heading's link to its own fragment, as
+  on documentation pages, is not a headline link.
+
+On the October 2026 census of 55 popular pages, the BBC and Guardian
+articles and an MDN reference page qualify, and no front page, product page,
+store, forecast or application page does. Wikipedia's PlayStation Portable
+article would qualify by shape, but its Reader view needs about 5,100 nodes,
+more than the 4,096-node bound, so it stays manual. A Wiktionary entry is
+made of lists rather than paragraphs and stays manual too.
 
 **Reader font** is a saved Sans or Serif choice. While Reader mode is active,
 the normal page text-size control adjusts Reader text. **Remember size** is
@@ -65,8 +123,8 @@ Limits are deliberate:
 - at most 16 registrable sites are retained, with the least-recently changed
   entry evicted;
 - built-in `tilefinch.local` pages do not admit Reader mode;
-- following a page link while Reader mode is active carries the bounded base
-  Reader sheet into the destination, prepares its content-shape markers after
+- following a page link while Reader you turned on is active carries the
+  bounded base Reader sheet into the destination, prepares its content-shape markers after
   parsing, and performs one authoritative Reader layout. The loading chrome
   says `LOADING READER PAGE` while the candidate is pending;
 - cancellation or failure restores the incumbent page's Reader adapter and
@@ -84,7 +142,16 @@ not the device product's content-shape classifier.
 presentation. It serializes a bounded, text-only Reader document instead of
 keeping the page's realm or DOM; see [Offline library](OFFLINE_LIBRARY.md).
 
-[Basic view](BASIC_VIEW.md) is a broader fallback that keeps bounded, explicit
-GET and search forms and navigation instead of selecting only an article or
-listing. Reader and Basic share one extracted-tree slot, and neither replaces
-the authored DOM.
+## How this differs from Basic view
+
+Reader mode is for pages that work: it keeps only the main article, listing
+or media, and Auto Reader is an opt-in that engages on high-confidence pages
+even when nothing failed. [Basic view](BASIC_VIEW.md) is for pages that do
+not work: it keeps nearly all of the page's real content, including
+navigation links, tables and bounded GET and search forms, and its automatic
+fallback (on by default) engages only when scripts failed and left the page
+blank, hidden or unusable. Both retire the page's scripts until a reload, and
+they share one extracted-tree slot: a page has one or the other, Basic is
+tried first on failure, and neither replaces the authored DOM.
+[Reader mode vs Basic view](USER_GUIDE.md#reader-mode-vs-basic-view)
+compares them side by side.

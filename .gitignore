@@ -14,8 +14,10 @@
 !tests/visual/search-form/results-middle.png
 !tests/visual/search-form/results-lower.png
 !tests/visual/search-form/results-end.png
+!tests/visual/treadline/*.png
 !docs/wikipedia-on-psp.png
 !docs/big-buck-bunny-player.png
+!docs/treadline-on-psp.png
 !docs/psp-validation-frame.png
 !docs/engineering/frame-mid.png
 !docs/engineering/frame-top.png

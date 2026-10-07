@@ -1,6 +1,7 @@
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/controller.h"
 #include "tilefinch/document.h"
+#include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/sha256.h"
@@ -91,6 +92,48 @@ static JSValue timed_promise_job(JSContext *context, int argc,
     TimedCooperate *probe = JS_GetContextOpaque(context);
     probe->now_ns += UINT64_C(10000000);
     return JS_UNDEFINED;
+}
+
+/* A clock held at the instant it was installed, for one evaluation whose
+   checks compare two reads of it. Game-audio scheduling reads currentTime
+   (performance.now()) once in the page and again when it converts a start
+   time to a delay; with the real clock a loaded host could stall the page
+   between the two reads for longer than the 5 ms lead the check gives the
+   oscillator, which then started at once. The held values are real
+   instants, so the runtime's clock never moves backwards. */
+typedef struct {
+    uint64_t monotonic_ns;
+    uint64_t wall_ns;
+} HeldClock;
+
+static uint64_t held_clock_monotonic_ns(void *context)
+{
+    return ((const HeldClock *) context)->monotonic_ns;
+}
+
+static uint64_t held_clock_wall_ns(void *context)
+{
+    return ((const HeldClock *) context)->wall_ns;
+}
+
+static bool evaluate_with_held_clock(ScriptRuntime *runtime,
+                                     const char *source, const char *name,
+                                     ScriptResult *result)
+{
+    HeldClock held = {
+        .monotonic_ns = tilefinch_platform_monotonic_time_ns(),
+        .wall_ns = tilefinch_platform_wall_time_ns()
+    };
+    TilefinchPlatformServices services = {
+        .context = &held,
+        .wall_time_ns = held_clock_wall_ns,
+        .monotonic_time_ns = held_clock_monotonic_ns
+    };
+    tilefinch_platform_set_services(&services);
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime, source, name, result);
+    tilefinch_platform_set_services(NULL);
+    return evaluated;
 }
 
 static int test_user_activation_expiry(void)
@@ -312,6 +355,52 @@ static int test_get_element_by_id_tracks_id_changes(void)
 /* Custom-element hooks skip all work until something is defined; after a
    definition, wrappers made earlier upgrade, removal still reaches
    disconnectedCallback, and a re-created wrapper keeps its prototype. */
+/* HTML document.domain setter: a parent domain that is not a public suffix
+   is accepted (a no-op in an origin-keyed agent cluster, so the getter keeps
+   the host); public suffixes, unrelated hosts and malformed values still
+   throw SecurityError. */
+static int test_document_domain_setter(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://m.example.co.uk/path", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const bad=[];const throws=(v)=>{try{document.domain=v;"
+              "return false}catch(e){return e instanceof DOMException&&"
+              "e.name==='SecurityError'}};"
+              "for(const v of ['example.co.uk','EXAMPLE.co.uk','m.example.co.uk'])"
+              "if(throws(v))bad.push('accept:'+v);"
+              "for(const v of ['co.uk','uk','other.co.uk','ample.co.uk',"
+              "'x.m.example.co.uk','','example.co.uk:443','example.co.uk/x',"
+              "'a@example.co.uk','127.0.0.1','[::1]'])"
+              "if(!throws(v))bad.push('refuse:'+v);"
+              "if(document.domain!=='m.example.co.uk')bad.push('getter:'"
+              "+document.domain);"
+              "if(typeof globalThis.__tilefinchDocumentDomainValid==='function'&&"
+              "Object.keys(globalThis).includes('__tilefinchDocumentDomainValid'))"
+              "bad.push('enumerable');"
+              "globalThis.pocSummary=bad.length?'DOMAIN:'+bad.join(','):"
+              "'DOMAIN-OK';})()",
+              "<document-domain-setter>", &result));
+    if (strcmp(result.summary, "DOMAIN-OK") != 0) {
+        fprintf(stderr, "document.domain probe: %s\n", result.summary);
+    }
+    CHECK(strcmp(result.summary, "DOMAIN-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_custom_element_hooks_after_first_definition(void)
 {
     Budget budget;
@@ -979,6 +1068,212 @@ static int test_gc_pacing_pregrows_growable_heap(void)
     return 0;
 }
 
+/* Collection thrash near the heap limit (xe.com on the PSP: 165 full
+   collections, 25.6 s of one 27.7 s task, each marking ~12 MB that was
+   almost all live). One realm per case: `live` MiB retained, its limit a
+   sliver above that, automatic collection paced as the PSP app paces it.
+   TILEFINCH_JS_GC_PACING=0 restores the old pacing; these fail there. */
+typedef struct {
+    Budget budget;
+    PocDocument document;
+    ScriptResult result;
+    ScriptRuntime *runtime;
+    size_t live;
+} GcThrashRealm;
+
+static int gc_thrash_open(GcThrashRealm *realm, size_t keep_bytes,
+                          size_t headroom, size_t ceiling_above_live)
+{
+    memset(realm, 0, sizeof(*realm));
+    budget_init(&realm->budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&realm->budget));
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&realm->document, &realm->budget, html,
+                         sizeof(html) - 1u, 17));
+    realm->runtime = script_runtime_create_with_session(
+        &realm->document, &realm->budget, 5u * MIB, 60000,
+        "https://gc-thrash.test/", NULL, &realm->result);
+    ScriptRuntime *runtime = realm->runtime;
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &realm->result));
+    runtime->boot_window_active = false;
+    runtime->base_memory_limit = 16u * MIB;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    char keep[96];
+    snprintf(keep, sizeof(keep), "globalThis.__keep=new ArrayBuffer(%zu);1",
+             keep_bytes);
+    JSValue kept = JS_Eval(runtime->context, keep, strlen(keep),
+                           "<gc-thrash>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(kept));
+    JS_FreeValue(runtime->context, kept);
+    JS_RunGC(runtime->runtime);
+    realm->live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = realm->live + headroom;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    if (ceiling_above_live != 0)
+        script_runtime_enable_heap_growth(
+            runtime, realm->live + ceiling_above_live, 4u * MIB);
+    /* Mid-task, as on the device: an advance's pre-growth is not coming,
+       and QuickJS has re-armed at half the headroom. */
+    CHECK(script_runtime_advance(runtime, 16, 4, &realm->result));
+    runtime->base_memory_limit = realm->live + headroom;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    JS_SetGCThreshold(runtime->runtime, realm->live + headroom / 2u);
+    return 0;
+}
+
+static int gc_thrash_close(GcThrashRealm *realm)
+{
+    script_runtime_destroy(realm->runtime);
+    document_destroy(&realm->document);
+    CHECK(realm->budget.current == 0
+          && budget_uninstall_lexbor(&realm->budget));
+    return 0;
+}
+
+/* `source` runs as one task; returns its collections, *threw = exception. */
+static size_t gc_thrash_run(GcThrashRealm *realm, const char *source,
+                            bool *threw, char *message, size_t message_size)
+{
+    ScriptRuntime *runtime = realm->runtime;
+    size_t before = runtime->heap_collections;
+    JSValue value = JS_Eval(runtime->context, source, strlen(source),
+                            "<gc-thrash>", JS_EVAL_TYPE_GLOBAL);
+    *threw = JS_IsException(value);
+    if (message_size != 0) message[0] = '\0';
+    if (*threw) {
+        JSValue error = JS_GetException(runtime->context);
+        const char *text = JS_ToCString(runtime->context, error);
+        if (text != NULL && message_size != 0)
+            snprintf(message, message_size, "%s", text);
+        if (text != NULL) JS_FreeCString(runtime->context, text);
+        JS_FreeValue(runtime->context, error);
+    }
+    JS_FreeValue(runtime->context, value);
+    return runtime->heap_collections - before;
+}
+
+/* Live data grows toward the ceiling with the page Budget to spare: the
+   limit used to rise 512 KiB at a time on demand, with QuickJS halving its
+   headroom to each step (about a dozen full collections per step). Past
+   the ceiling the realm must still run out of memory promptly. */
+static int test_gc_thrash_live_growth_reaches_refusal(void)
+{
+    GcThrashRealm realm;
+    CHECK(gc_thrash_open(&realm, 4u * MIB, 768u * 1024u, 6u * MIB) == 0);
+    bool threw = false;
+    char message[128];
+    size_t collections = gc_thrash_run(&realm,
+        "const k=[];for(let i=0;;i++)k.push({i:i,s:'x'+i});",
+        &threw, message, sizeof(message));
+    ScriptRuntime *runtime = realm.runtime;
+    printf("gc-thrash live-growth: live=%zu collections=%zu limit=%zu "
+           "refusals=%zu reason=%u error=\"%s\"\n", realm.live,
+           collections, runtime->base_memory_limit,
+           runtime->heap_growth_refusals,
+           (unsigned) runtime->heap_growth_refused_reason, message);
+    /* QuickJS throws null when even the error object does not fit. */
+    CHECK(threw && (message[0] == '\0' || strcmp(message, "null") == 0
+                    || strstr(message, "out of memory") != NULL));
+    CHECK(runtime->heap_growth_refusals >= 1u
+          && runtime->heap_growth_refused_reason == 2u);
+    CHECK(runtime->base_memory_limit <= realm.live + 6u * MIB);
+    CHECK(budget_remaining(&realm.budget) >= 4u * MIB);
+    CHECK(collections <= 24u);
+    return gc_thrash_close(&realm);
+}
+
+/* About 50 MB of cyclic garbage over ~6 MiB live, in one task, 768 KiB
+   below a limit that could grow. Collections that free garbage are kept
+   (that is what holds churn under the limit): the garbage must not buy
+   itself more limit, and the page reserve holds. */
+static int test_gc_thrash_garbage_churn_stays_under_limit(void)
+{
+    GcThrashRealm realm;
+    CHECK(gc_thrash_open(&realm, 4u * MIB, 768u * 1024u, 20u * MIB) == 0);
+    bool threw = false;
+    char message[128];
+    size_t collections = gc_thrash_run(&realm,
+        "for(let i=0;i<56000;i++){const o={a:new Array(32).fill(i)};"
+        "o.self=o;}1", &threw, message, sizeof(message));
+    ScriptRuntime *runtime = realm.runtime;
+    printf("gc-thrash churn: live=%zu collections=%zu limit=%zu "
+           "error=\"%s\"\n", realm.live, collections,
+           runtime->base_memory_limit, message);
+    CHECK(!threw && collections >= 4u);
+    CHECK(runtime->base_memory_limit <= realm.live + 768u * 1024u);
+    CHECK(budget_remaining(&realm.budget) >= 4u * MIB);
+    return gc_thrash_close(&realm);
+}
+
+/* The same churn in a realm that cannot grow, its headroom below an
+   amortized step: each collection frees what the churn left, so this is
+   progress, not exhaustion. It must finish, never backing off into a
+   refusal. */
+static int test_gc_thrash_starved_churn_completes(void)
+{
+    GcThrashRealm realm;
+    CHECK(gc_thrash_open(&realm, 4u * MIB, 384u * 1024u, 0) == 0);
+    bool threw = false;
+    char message[128];
+    size_t collections = gc_thrash_run(&realm,
+        "for(let i=0;i<14000;i++){const o={a:new Array(32).fill(i)};"
+        "o.self=o;}1", &threw, message, sizeof(message));
+    ScriptRuntime *runtime = realm.runtime;
+    printf("gc-thrash starved churn: collections=%zu error=\"%s\"\n",
+           collections, message);
+    CHECK(!threw);
+    CHECK(collections >= 1u);
+    return gc_thrash_close(&realm);
+}
+
+/* External scripts compiled near the current limit, with growth to spare:
+   the compile-pressure collection ran before every one (forty full
+   collections that free nothing); now it waits until it is due. */
+static int test_gc_thrash_compile_pressure_amortized(void)
+{
+    GcThrashRealm realm;
+    CHECK(gc_thrash_open(&realm, 4u * MIB, 256u * 1024u, 20u * MIB) == 0);
+    ScriptRuntime *runtime = realm.runtime;
+    size_t length = 64u * 1024u;
+    char *source = malloc(length + 64u);
+    CHECK(source != NULL);
+    memcpy(source, "/*", 2u);
+    memset(source + 2u, 'x', length - 2u);
+    int tail = snprintf(source + length, 64u,
+                        "*/globalThis.__n=(globalThis.__n|0)+1;");
+    size_t total = length + (size_t) tail;
+    size_t before = runtime->heap_collections;
+    for (unsigned i = 0; i < 40u; i++) {
+        ScriptResult result = {0};
+        bool admitted = false;
+        JSValue compiled = js_rt_compile_source_type(
+            runtime->context, source, total,
+            "https://gc-thrash.test/chunk.js", JS_EVAL_TYPE_GLOBAL,
+            SCRIPT_COMPILE_SOURCE_EXTERNAL, &result, &admitted);
+        CHECK(admitted && !JS_IsException(compiled));
+        JSValue ran = JS_EvalFunction(runtime->context, compiled);
+        CHECK(!JS_IsException(ran));
+        JS_FreeValue(runtime->context, ran);
+    }
+    free(source);
+    size_t collections = runtime->heap_collections - before;
+    printf("gc-thrash compile pressure: compiles=40 collections=%zu\n",
+           collections);
+    CHECK(collections <= 8u);
+    return gc_thrash_close(&realm);
+}
+
+static int test_gc_thrash(void)
+{
+    /* Every case runs (and prints its counts) even after a failure. */
+    int failed = test_gc_thrash_live_growth_reaches_refusal();
+    failed |= test_gc_thrash_garbage_churn_stays_under_limit();
+    failed |= test_gc_thrash_starved_churn_completes();
+    failed |= test_gc_thrash_compile_pressure_amortized();
+    return failed;
+}
+
 static int test_dom_wrapper_receiver_sharing(void)
 {
     Budget budget;
@@ -1041,8 +1336,11 @@ static int test_dom_wrapper_receiver_sharing(void)
         "globalThis.wrapperProbe=document.querySelectorAll('p');"
         "for(const n of wrapperProbe)void n.classList;"
         "(()=>{const a=wrapperProbe[0],b=wrapperProbe[1];"
-        "const x=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'id'),"
-        "y=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(b),'id');"
+        /* <p> wrappers share HTMLParagraphElement.prototype, which sits
+           above the native layer holding the receiver descriptors. */
+        "const inherited=(o,k)=>{for(let at=Object.getPrototypeOf(o);at;"
+        "at=Object.getPrototypeOf(at)){const d=Object.getOwnPropertyDescriptor"
+        "(at,k);if(d)return d}},x=inherited(a,'id'),y=inherited(b,'id');"
         "if(Object.getPrototypeOf(a)!==Object.getPrototypeOf(b)||"
         "Object.prototype.hasOwnProperty.call(a,'id'))throw Error('unshared prototype');"
         "if(wrapperProbe.length!==48||x.get!==y.get||x.set!==y.set||"
@@ -1225,6 +1523,79 @@ static int test_runtime_task_time_slice(void)
     return 0;
 }
 
+static bool runtime_string_is(ScriptRuntime *runtime, const char *expression,
+                              const char *expected)
+{
+    JSValue value = JS_Eval(runtime->context, expression, strlen(expression),
+                            "<check>", 0);
+    const char *text = JS_ToCString(runtime->context, value);
+    bool equal = text != NULL && strcmp(text, expected) == 0;
+    if (!equal) fprintf(stderr, "%s = %s\n", expression, text ? text : "?");
+    JS_FreeCString(runtime->context, text);
+    JS_FreeValue(runtime->context, value);
+    return equal;
+}
+
+/* theguardian.com creates one IntersectionObserver per lazy island (75);
+   the old 64-observer cap threw. The bound is page-wide registrations,
+   which is what each update re-evaluates, and an update step evaluates a
+   bounded slice so many targets never make one long step. */
+static int test_intersection_observer_registration_budget(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://io-budget.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.io={initial:0,slice:-1,refused:false,again:false,"
+        "calls:0,afterScroll:-1,error:''};"
+        "const els=[];for(let i=0;i<1100;i++){const d=document."
+        "createElement('div');document.body.appendChild(d);els.push(d)}"
+        "const proto=Object.getPrototypeOf(els[0]),"
+        "rect=proto.getBoundingClientRect;"
+        "proto.getBoundingClientRect=function(){io.calls++;"
+        "return rect.call(this)};"
+        "try{for(let i=0;i<200;i++)new IntersectionObserver(entries=>{"
+        "io.initial+=entries.length}).observe(els[i]);"
+        "const big=new IntersectionObserver(()=>{});"
+        "try{for(let i=200;i<1100;i++)big.observe(els[i])}"
+        "catch(error){io.refused=error instanceof RangeError&&"
+        "/target limit/.test(error.message)}"
+        "big.disconnect();const late=new IntersectionObserver(()=>{});"
+        "late.observe(els[1099]);io.again=true;late.disconnect()}"
+        "catch(error){io.error=String(error)}"
+        "Promise.resolve().then(()=>{io.slice=io.calls})",
+        "<io-budget>", &result));
+    /* The first step ran in the microtask checkpoint: one slice only. */
+    CHECK(runtime_string_is(runtime, "JSON.stringify([io.error,io.refused,"
+                            "io.again,io.slice])",
+                            "[\"\",true,true,32]"));
+    for (unsigned i = 0; i < 12; i++)
+        CHECK(script_runtime_advance(runtime, 16, 16, &result));
+    /* Every first observation arrived, one per observer. */
+    CHECK(runtime_string_is(runtime, "String(io.initial)", "200"));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "io.calls=0;dispatchEvent(new Event('scroll'));"
+        "Promise.resolve().then(()=>{io.afterScroll=io.calls})",
+        "<io-scroll>", &result));
+    CHECK(runtime_string_is(runtime, "String(io.afterScroll)", "32"));
+    for (unsigned i = 0; i < 12; i++)
+        CHECK(script_runtime_advance(runtime, 16, 16, &result));
+    /* The pass finished over later tasks: every registration once. */
+    CHECK(runtime_string_is(runtime, "String(io.calls)", "200"));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* What a frame loop may start a turn for without waiting for vblank: a due
    task, a microtask checkpoint left pending, never a frame callback. */
 static int test_task_runnable_follows_the_event_loop(void)
@@ -1242,18 +1613,24 @@ static int test_task_runnable_follows_the_event_loop(void)
     CHECK(runtime != NULL);
     CHECK(script_runtime_advance(runtime, 16, 4, &result));
     ScriptRunnableState state;
+    unsigned frame_delay_ms = 99;
     CHECK(!script_runtime_task_runnable(runtime));
+    CHECK(!script_runtime_frame_clock_delay_ms(runtime, &frame_delay_ms));
     CHECK(script_runtime_runnable_state(runtime, &state) && state.timers == 0);
     /* An animation frame is not runnable before or after its due time: it
        waits for a rendering opportunity. */
     CHECK(script_runtime_evaluate_diagnostic(runtime,
         "globalThis.frames=0;requestAnimationFrame(()=>frames++)",
         "<raf>", &result));
+    CHECK(script_runtime_frame_clock_delay_ms(runtime, &frame_delay_ms)
+          && frame_delay_ms == 16);
     CHECK(!script_runtime_task_runnable(runtime));
     CHECK(script_runtime_advance(runtime, 20, 0, &result));
     CHECK(script_runtime_runnable_state(runtime, &state));
     CHECK(state.timers == 1 && state.timer_known
           && state.timer_due_in_us <= 0 && state.timer_frame_callback);
+    CHECK(script_runtime_frame_clock_delay_ms(runtime, &frame_delay_ms)
+          && frame_delay_ms == 0);
     CHECK(!script_runtime_task_runnable(runtime));
     /* A due timeout behind the due frame at the head is runnable. */
     CHECK(script_runtime_evaluate_diagnostic(runtime,
@@ -1274,6 +1651,7 @@ static int test_task_runnable_follows_the_event_loop(void)
     CHECK(script_runtime_runnable_state(runtime, &state));
     CHECK(state.timer_known && state.timer_due_in_us <= 0
           && !state.timer_frame_callback && !state.jobs_pending);
+    CHECK(!script_runtime_frame_clock_delay_ms(runtime, &frame_delay_ms));
     /* Its 200 chained jobs outlast one bounded checkpoint: the next turn
        has work before any timer is due. */
     CHECK(script_runtime_advance(runtime, 0, 4, &result));
@@ -1326,6 +1704,34 @@ static int test_fast_turns_follow_wall_time(void)
     CHECK(script_runtime_advance(
         runtime, tilefinch_runtime_clock_step(&clock, wall_us, 16), 2,
         &result));
+    /* A canvas publication's fast followup can arrive 1ms before the next
+       virtual rAF deadline. Wait that remainder rather than consuming the
+       followup on an empty turn and then waiting an entire vblank. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.earlyFrames=0;requestAnimationFrame(()=>earlyFrames++)",
+        "<early-frame>", &result));
+    unsigned required_ms = 0;
+    CHECK(script_runtime_frame_clock_delay_ms(runtime, &required_ms)
+          && required_ms == 16);
+    uint32_t wait_us = UINT32_MAX;
+    TilefinchRuntimeClock before_wait = clock;
+    CHECK(tilefinch_runtime_clock_frame_wait(
+        &clock, wall_us + 15000u, 16, required_ms, &wait_us));
+    CHECK(wait_us == 1000u && clock.last_us == before_wait.last_us
+          && clock.carry_us == before_wait.carry_us);
+    wall_us += 15000u + wait_us;
+    CHECK(script_runtime_advance(runtime,
+        tilefinch_runtime_clock_step(&clock, wall_us, 16), 2, &result));
+    CHECK(page_int(runtime, "earlyFrames") == 1);
+    CHECK(!script_runtime_frame_clock_delay_ms(runtime, &required_ms));
+    CHECK(!tilefinch_runtime_clock_frame_wait(
+        &clock, wall_us, 16, 17, &wait_us));
+    CHECK(tilefinch_runtime_clock_frame_wait(
+        &clock, wall_us + 16000u, 16, 16, &wait_us) && wait_us == 0);
+    clock.carry_us = 400u;
+    CHECK(tilefinch_runtime_clock_frame_wait(
+        &clock, wall_us + 15000u, 16, 16, &wait_us) && wait_us == 600u);
+    clock.carry_us = 0;
     CHECK(script_runtime_evaluate_diagnostic(runtime,
         "globalThis.chainDone=0;globalThis.frames=0;"
         "globalThis.timeoutAt=-1;globalThis.turn=0;"
@@ -3730,6 +4136,154 @@ static int test_host_state_network_and_indexeddb_stats(void)
     return 0;
 }
 
+/* The real scheduler behind the JavaScript queue, replayed from a fixture:
+   more requests than the shared scheduler admits at once (two 1 MiB
+   response reservations here) all start in FIFO order and all complete
+   (completion order is the transport's, as in a browser); a
+   request aborted while queued never starts; a cross-origin no-cors request
+   is sent and resolves to an opaque response; one with a non-safelisted
+   header is still sent, without it (the request-no-cors guard drops it);
+   one with a non-safelisted method, or whose opaque body exceeds 64 KiB,
+   is a TypeError, as is a non-safelisted header reaching the native
+   backstop directly; and
+   detaching the document with requests
+   both on the wire and queued rejects all of them, starts none of the
+   queued ones, and leaves no scheduler reservation or Budget bytes. */
+static int test_network_queue_replay(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char trace_error[256] = {0};
+    CHECK(fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-fetch-queue",
+        trace_error, sizeof(trace_error)));
+    static const char html[] = "<!doctype html><body>Queue</body>";
+    PocDocument document;
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true,
+        .allow_test_network_primitive_overrides = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000, "https://queue.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    static const char probe[] =
+        "(async()=>{const real=globalThis.__tilefinchFetchAsync;"
+        "globalThis.starts=[];globalThis.__tilefinchFetchAsync="
+        "function(...args){const id=real.apply(this,args);"
+        "if(Number(id)!==0)starts.push(String(args[1]));return id;};"
+        "const order=[],requests=[];for(let i=0;i<8;i++)requests.push("
+        "fetch('/q/'+i).then(r=>r.text()).then(text=>order.push(text),"
+        "error=>order.push('error:'+error.message)));"
+        "const queued=__tilefinchNetworkQueueStats.waiting,"
+        "aborter=new AbortController,aborted=fetch('/q/never',{signal:"
+        "aborter.signal}).then(()=>'resolved',error=>error.name);"
+        "aborter.abort();const pixel=fetch('https://pixel.example/p.gif',"
+        "{mode:'no-cors',credentials:'include'}).then(r=>[r.type,r.status,"
+        "r.url===''&&[...r.headers].length===0].join(),error=>'error:'+error),"
+        "header=fetch('https://pixel.example/p.gif',{mode:'no-cors',"
+        "headers:{'x-probe':'1'}}).then(()=>'resolved',error=>error.name),"
+        "put=fetch('https://pixel.example/p.gif',{mode:'no-cors',"
+        "method:'PUT'}).then(()=>'resolved',error=>error.name),"
+        "big=fetch('https://pixel.example/big.bin',{mode:'no-cors'})"
+        ".then(r=>r.type,error=>error.name),"
+        "backstop=(()=>{try{real('GET','https://pixel.example/p.gif',undefined,"
+        "'','x-probe: 1','no-cors','same-origin');return 'started'}"
+        "catch(error){return error.name}})();"
+        "await Promise.all(requests);"
+        "globalThis.pocSummary=['QUEUE',starts.filter(url=>url.includes('/q/'))"
+        ".map(url=>url.slice(-3)).join(),order.slice().sort().join(),queued,"
+        "await aborted,"
+        "starts.some(url=>url.endsWith('/never')),await pixel,"
+        "(await header,starts.filter(url=>url.endsWith('/p.gif')).length),"
+        "await put,await big,backstop].join('|');})().catch(error=>{globalThis.pocSummary="
+        "'QUEUE-ERROR:'+String(error)+String(error&&error.stack||'')});";
+    bool ok = script_runtime_evaluate_diagnostic(
+        runtime, probe, "<network-queue-replay>", &result);
+    for (size_t tick = 0; ok && tick < 256
+         && strncmp(result.summary, "QUEUE", 5) != 0; tick++) {
+        ok = script_runtime_advance(runtime, 4, 64, &result);
+    }
+    static const char expected[] =
+        "QUEUE|q/0,q/1,q/2,q/3,q/4,q/5,q/6,q/7|q0,q1,q2,q3,q4,q5,q6,q7|6|"
+        "AbortError|false|opaque,0,true|"
+        "2|TypeError|TypeError|TypeError";
+    if (!ok || strcmp(result.summary, expected) != 0) {
+        fprintf(stderr, "network queue replay: ok=%d summary=%s error=%s "
+                "trace=%s\n", ok, result.summary, result.error, trace_error);
+    }
+    CHECK(ok && strcmp(result.summary, expected) == 0);
+
+    static const char teardown_probe[] =
+        "globalThis.teardown=[];starts.length=0;for(let i=0;i<8;i++)"
+        "teardown.push(fetch('/t/'+i).then(()=>'resolved',"
+        "error=>error.name));globalThis.pocSummary='TEARDOWN:'+starts.length"
+        "+':'+__tilefinchNetworkQueueStats.waiting;";
+    /* The shared scheduler's response reservation admits two at once; the
+       other six wait in the JavaScript FIFO. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, teardown_probe, "<network-queue-teardown>", &result)
+          && strcmp(result.summary, "TEARDOWN:2:6") == 0);
+    CHECK(script_runtime_advance(runtime, 4, 64, &result));
+    size_t reserved = 0, domain_active = 0;
+    fetch_scheduler_reservation_state(
+        runtime->bridge.fetch_scheduler, &reserved, NULL, &domain_active,
+        NULL);
+    CHECK(fetch_scheduler_pending(runtime->bridge.fetch_scheduler) == 2
+          && reserved != 0 && domain_active == 2
+          && runtime->bridge.async_fetch_count == 2
+          && result.async_network_pending_logical == 6);
+    script_runtime_detach_document(runtime, &document);
+    static const char settled_probe[] =
+        "Promise.all(teardown).then(values=>{globalThis.pocSummary="
+        "'SETTLED:'+values.join()+':'+starts.length;});";
+    ok = script_runtime_evaluate_diagnostic(
+        runtime, settled_probe, "<network-queue-settled>", &result);
+    for (size_t tick = 0; ok && tick < 16; tick++) {
+        ok = script_runtime_advance(runtime, 50, 64, &result);
+    }
+    static const char settled[] =
+        "SETTLED:TypeError,TypeError,TypeError,TypeError,TypeError,"
+        "TypeError,TypeError,TypeError:2";
+    if (!ok || strcmp(result.summary, settled) != 0) {
+        fprintf(stderr, "network queue teardown: ok=%d summary=%s error=%s\n",
+                ok, result.summary, result.error);
+    }
+    fetch_scheduler_reservation_state(
+        runtime->bridge.fetch_scheduler, &reserved, NULL, &domain_active,
+        NULL);
+    if (fetch_scheduler_pending(runtime->bridge.fetch_scheduler) != 0
+        || reserved != 0 || domain_active != 0
+        || runtime->bridge.async_fetch_count != 0
+        || result.async_network_active_native != 0
+        || result.async_network_pending_logical != 0) {
+        fprintf(stderr, "network queue teardown residue: pending=%zu "
+                "reserved=%zu domain=%zu native=%zu active=%zu logical=%zu\n",
+                fetch_scheduler_pending(runtime->bridge.fetch_scheduler),
+                reserved, domain_active, runtime->bridge.async_fetch_count,
+                result.async_network_active_native,
+                result.async_network_pending_logical);
+    }
+    CHECK(ok && strcmp(result.summary, settled) == 0
+          && fetch_scheduler_pending(runtime->bridge.fetch_scheduler) == 0
+          && reserved == 0 && domain_active == 0
+          && runtime->bridge.async_fetch_count == 0
+          && result.async_network_active_native == 0
+          && result.async_network_pending_logical == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    fetch_trace_end();
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* URLSearchParams and URL setters convert through Web IDL USVString: a lone
    surrogate becomes U+FFFD and a valid pair is kept. The conversion is
    checked against the specification's per-code-unit algorithm on fixed
@@ -3927,6 +4481,185 @@ static int test_dom_handle_table_exhaustion(void)
     return 0;
 }
 
+/* A news front page holds 9-10 thousand live elements and walks them all
+   (apnews.com: 9,322). The realistic PSP profile grows the handle table on
+   demand to SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC; strict keeps the
+   base table. Growth is Budget-admitted, a refusal is the ordinary clean
+   exhaustion, and teardown returns every byte. */
+static ScriptRuntime *handle_scaling_runtime(
+    PocDocument *document, Budget *budget, ScriptExecutionProfile profile,
+    ScriptResult *result)
+{
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    if (!viewport_context_init(&viewport, 480, 272, 480, 272)
+        || !script_execution_policy_for_profile(profile, &policy))
+        return NULL;
+    ScriptRuntimeOptions options = {
+        .viewport = viewport,
+        .execution_policy = policy,
+    };
+    return script_runtime_create_configured(
+        document, budget, 24u * MIB, 60000, "https://handle-scale.test/",
+        &options, result);
+}
+
+static int test_dom_handle_table_scales_with_profile(void)
+{
+    static const char walk[] =
+        "(()=>{const keep=globalThis.__walkKeep=[];let error='';try{"
+        "const visit=(node)=>{for(let at=node.firstElementChild;at;"
+        "at=at.nextElementSibling){keep.push(at);visit(at);}};"
+        "keep.push(document.documentElement);visit(document.documentElement);"
+        "}catch(caught){error=(caught instanceof RangeError"
+        "&&/DOM node handle table exhausted/.test(caught.message))"
+        "?'clean':String(caught);}"
+        "globalThis.pocSummary=error?'WALK-'+error+':'+keep.length"
+        ":'WALK-OK:'+keep.length;})()";
+    /* 12,000 connected elements plus html, head and body. */
+    size_t html_capacity = 64u + 12000u * 11u;
+    char *html = malloc(html_capacity);
+    CHECK(html != NULL);
+    size_t length = (size_t) snprintf(html, html_capacity,
+                                      "<!doctype html><body>");
+    for (size_t i = 0; i < 12000u; i++) {
+        memcpy(html + length, "<i></i>", 7u);
+        length += 7u;
+    }
+    html[length] = '\0';
+    static const struct {
+        ScriptExecutionProfile profile;
+        const char *expected;
+        size_t capacity;
+    } cases[] = {
+        { SCRIPT_EXECUTION_PROFILE_PSP_STRICT, "WALK-clean:",
+          SCRIPT_DOM_HANDLE_SLOT_CAPACITY },
+        { SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, "WALK-OK:12003",
+          SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        Budget budget;
+        budget_init(&budget, 64u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document;
+        CHECK(document_parse(&document, &budget, html, length, 17));
+        ScriptResult result = {0};
+        ScriptRuntime *runtime = handle_scaling_runtime(
+            &document, &budget, cases[c].profile, &result);
+        CHECK(runtime != NULL);
+        CHECK(result.dom_handle_slot_capacity
+              == SCRIPT_DOM_HANDLE_SLOT_CAPACITY);
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, walk, "<handle-walk>", &result));
+        if (strncmp(result.summary, cases[c].expected,
+                    strlen(cases[c].expected)) != 0) {
+            fprintf(stderr, "handle scaling profile=%d: %s capacity=%zu "
+                    "growths=%zu refusals=%zu exhaustions=%zu\n",
+                    (int) cases[c].profile, result.summary,
+                    result.dom_handle_slot_capacity,
+                    result.dom_handle_growths,
+                    result.dom_handle_growth_refusals,
+                    result.dom_handle_exhaustions);
+            CHECK(false);
+        }
+        CHECK(result.dom_handle_slot_capacity == cases[c].capacity);
+        if (cases[c].capacity == SCRIPT_DOM_HANDLE_SLOT_CAPACITY) {
+            CHECK(result.dom_handle_growths == 0
+                  && result.dom_handle_exhaustions != 0);
+        } else {
+            CHECK(result.dom_handle_growths == 1
+                  && result.dom_handle_exhaustions == 0
+                  && result.dom_handle_slots_high_water >= 12003u);
+            /* Exhaustion at the grown size is the same clean RangeError,
+               and the realm recovers once the nodes are released. */
+            CHECK(script_runtime_evaluate_diagnostic(
+                runtime,
+                "(()=>{const keep=globalThis.__extraKeep=[];let error='';"
+                "try{for(let i=0;i<8000;i++)"
+                "keep.push(document.createElement('b'));}catch(caught){"
+                "error=caught instanceof RangeError&&/DOM node handle table "
+                "exhausted/.test(caught.message)?'clean':String(caught);}"
+                "globalThis.pocSummary='EXTRA-'+error+':'+keep.length;})()",
+                "<handle-exhaust>", &result));
+            CHECK(strncmp(result.summary, "EXTRA-clean:", 12) == 0
+                  && result.dom_handle_exhaustions != 0
+                  && result.dom_handle_slot_capacity
+                         == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC);
+            CHECK(script_runtime_evaluate_diagnostic(
+                runtime,
+                "(()=>{globalThis.__extraKeep=null;let made=0;"
+                "for(let i=0;i<2000;i++){document.createElement('u');made++;}"
+                "globalThis.pocSummary='RECOVERED:'+made;})()",
+                "<handle-recover>", &result)
+                  && strcmp(result.summary, "RECOVERED:2000") == 0);
+        }
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        script_runtime_destroy(runtime);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+
+    /* A growth the Budget refuses leaves the full base table intact and
+       reports a clean exhaustion; nothing leaks. */
+    {
+        Budget budget;
+        budget_init(&budget, 64u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document;
+        static const char small[] = "<!doctype html><body></body>";
+        CHECK(document_parse(&document, &budget, small,
+                             sizeof(small) - 1u, 17));
+        ScriptResult result = {0};
+        ScriptRuntime *runtime = handle_scaling_runtime(
+            &document, &budget, SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
+            &result);
+        CHECK(runtime != NULL);
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "(()=>{const keep=globalThis.__fill=[];"
+            "for(let i=0;i<8150;i++)keep.push(document.createElement('b'));"
+            "globalThis.pocSummary='FILLED:'+keep.length;})()",
+            "<handle-fill>", &result)
+              && strcmp(result.summary, "FILLED:8150") == 0);
+        size_t limit = budget.limit;
+        budget.limit = budget.current + 160u * 1024u;
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "(()=>{const keep=globalThis.__fill;let error='';try{"
+            "for(let i=0;i<200;i++)keep.push(document.createElement('s'));"
+            "}catch(caught){error=caught instanceof RangeError?'clean'"
+            ":String(caught);}"
+            "globalThis.pocSummary='REFUSED-'+error;})()",
+            "<handle-refused>", &result));
+        budget.limit = limit;
+        if (strcmp(result.summary, "REFUSED-clean") != 0
+            || result.dom_handle_growth_refusals == 0
+            || result.dom_handle_slot_capacity
+                   != SCRIPT_DOM_HANDLE_SLOT_CAPACITY) {
+            fprintf(stderr, "handle growth refusal: %s capacity=%zu "
+                    "refusals=%zu\n", result.summary,
+                    result.dom_handle_slot_capacity,
+                    result.dom_handle_growth_refusals);
+            CHECK(false);
+        }
+        /* With room again, the next registration grows the table. */
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "(()=>{const keep=globalThis.__fill;"
+            "for(let i=0;i<200;i++)keep.push(document.createElement('q'));"
+            "globalThis.pocSummary='GREW:'+keep.length;})()",
+            "<handle-grew>", &result)
+              && result.dom_handle_slot_capacity
+                     == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC);
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        script_runtime_destroy(runtime);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    free(html);
+    return 0;
+}
+
 static int test_finalizers_do_not_starve_promises(void)
 {
     Budget budget;
@@ -4104,6 +4837,10 @@ static int test_diagnostic_probe_leaves_jobs_pending(void)
     Watchdog original_watchdog = runtime->watchdog;
     CHECK(script_runtime_evaluate_probe(runtime,
         "globalThis.probeRan=0;Promise.resolve().then(()=>{probeRan++});"
+        "globalThis.directProbe=function(){return this===globalThis&&probeRan===1};"
+        "globalThis.throwProbe=function(){throw new Error('direct-probe-error')};"
+        "globalThis.loopProbe=function(){while(true){}};"
+        "globalThis.notCallable=7;"
         "__tilefinchClipboardWrite(String(probeRan))",
         "<probe-queue>", &result));
     CHECK(strcmp(result.last_clipboard_text, "0") == 0);
@@ -4114,7 +4851,29 @@ static int test_diagnostic_probe_leaves_jobs_pending(void)
         "__tilefinchClipboardWrite(String(probeRan))",
         "<probe-pending>", &result));
     CHECK(strcmp(result.last_clipboard_text, "0") == 0);
+    size_t compile_attempts = runtime->result.host_compile_attempts;
+    bool matched = true;
+    for (unsigned i = 0; i < 32; i++) {
+        CHECK(script_runtime_call_boolean_probe(runtime, "directProbe", &matched));
+        CHECK(!matched);
+        CHECK(runtime->result.host_compile_attempts == compile_attempts);
+    }
+    CHECK(runtime->watchdog.deadline_ms == original_watchdog.deadline_ms);
+    CHECK(runtime->watchdog.polls == original_watchdog.polls);
     CHECK(script_runtime_advance(runtime, 0, 16, &result));
+    CHECK(script_runtime_call_boolean_probe(runtime, "directProbe", &matched));
+    CHECK(matched && runtime->result.host_compile_attempts == compile_attempts);
+    CHECK(!script_runtime_call_boolean_probe(runtime, "missingProbe", &matched));
+    CHECK(!matched);
+    CHECK(!script_runtime_call_boolean_probe(runtime, "notCallable", &matched));
+    CHECK(!matched);
+    CHECK(!script_runtime_call_boolean_probe(runtime, "throwProbe", &matched));
+    CHECK(!matched && strstr(runtime->result.error, "direct-probe-error") != NULL);
+    char long_name[98];
+    memset(long_name, 'x', sizeof(long_name) - 1u);
+    long_name[sizeof(long_name) - 1u] = '\0';
+    CHECK(!script_runtime_call_boolean_probe(runtime, long_name, &matched));
+    CHECK(!matched);
     CHECK(script_runtime_evaluate_probe(runtime,
         "__tilefinchClipboardWrite(String(probeRan))",
         "<probe-complete>", &result));
@@ -4125,12 +4884,19 @@ static int test_diagnostic_probe_leaves_jobs_pending(void)
     runtime->result.interrupted = true;
     runtime->result.watchdog_polls = 23;
     runtime->result.watchdog_elapsed_ms = 17;
+    CHECK(script_runtime_call_boolean_probe(runtime, "directProbe", &matched));
+    CHECK(matched && runtime->result.interrupted
+          && runtime->result.watchdog_polls == 23
+          && runtime->result.watchdog_elapsed_ms == 17);
+    runtime->result.success = false;
     CHECK(script_runtime_evaluate_probe(runtime,
         "__tilefinchClipboardWrite('recovered')", "<probe-recover>", &result));
     CHECK(strcmp(result.last_clipboard_text, "recovered") == 0);
     CHECK(result.interrupted && result.watchdog_polls == 23
           && result.watchdog_elapsed_ms == 17);
     script_runtime_limit_execution_for_us(runtime, 1000);
+    CHECK(!script_runtime_call_boolean_probe(runtime, "loopProbe", &matched));
+    CHECK(!matched && runtime->result.interrupted);
     CHECK(!script_runtime_evaluate_probe(runtime,
         "while(true){}", "<probe-timeout>", &result));
     CHECK(result.interrupted);
@@ -4179,7 +4945,8 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--coalesced-tokens-only") == 0)
         return test_coalesced_attribute_tokens();
     if (argc == 2 && strcmp(argv[1], "--handle-table-only") == 0)
-        return test_dom_handle_table_exhaustion();
+        return test_dom_handle_table_exhaustion()
+            || test_dom_handle_table_scales_with_profile();
     CHECK(test_coalesced_attribute_tokens() == 0);
     if (argc == 2 && strcmp(argv[1], "--detached-move-only") == 0)
         return test_detached_move_is_a_removal();
@@ -4189,8 +4956,13 @@ int main(int argc, char **argv)
             || test_gc_pacing_requires_heap_growth()
             || test_dom_wrapper_receiver_sharing()
             || test_dom_order_without_sibling_wrappers();
+    if (argc == 2 && strcmp(argv[1], "--gc-thrash-only") == 0)
+        return test_gc_thrash();
     if (argc == 2 && strcmp(argv[1], "--task-time-slice-only") == 0)
         return test_runtime_task_time_slice();
+    if (argc == 2
+        && strcmp(argv[1], "--intersection-observer-budget-only") == 0)
+        return test_intersection_observer_registration_budget();
     if (argc == 2 && strcmp(argv[1], "--job-heap-rejection-only") == 0)
         return test_job_heap_rejection_is_fatal();
     if (argc == 2 && strcmp(argv[1], "--host-state-only") == 0)
@@ -4198,6 +4970,8 @@ int main(int argc, char **argv)
             || test_host_state_timers_and_scroll(true)
             || test_host_state_network_and_indexeddb_stats()
             || test_usv_string_conversion();
+    if (argc == 2 && strcmp(argv[1], "--network-queue-only") == 0)
+        return test_network_queue_replay();
     CHECK(test_external_compile_reclaims_cycles() == 0);
     CHECK(test_gc_pacing_requires_heap_growth() == 0
           && test_gc_pacing_pregrows_growable_heap() == 0
@@ -4205,12 +4979,15 @@ int main(int argc, char **argv)
           && test_heap_return_checks_back_off() == 0
           && test_heap_decisions_skip_census() == 0
           && test_attribute_write_timing_needs_profiler() == 0);
+    CHECK(test_gc_thrash() == 0);
     CHECK(test_dom_wrapper_receiver_sharing() == 0);
     CHECK(test_dom_order_without_sibling_wrappers() == 0);
     CHECK(test_dom_handle_table_exhaustion() == 0);
+    CHECK(test_dom_handle_table_scales_with_profile() == 0);
     CHECK(test_stream_and_xhr_private_state_reclamation() == 0);
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
+    CHECK(test_intersection_observer_registration_budget() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_computed_style_memo_invalidation() == 0);
     CHECK(test_computed_style_ancestor_cache() == 0);
@@ -4231,6 +5008,7 @@ int main(int argc, char **argv)
     CHECK(test_job_heap_rejection_is_fatal() == 0);
     CHECK(test_attribute_mutation_skips_document_refresh() == 0);
     CHECK(test_get_element_by_id_tracks_id_changes() == 0);
+    CHECK(test_document_domain_setter() == 0);
     CHECK(test_custom_element_hooks_after_first_definition() == 0);
     CHECK(test_focus_style_and_selector_helpers() == 0);
     CHECK(test_focus_fixup_follows_moved_subtree() == 0);
@@ -4239,6 +5017,7 @@ int main(int argc, char **argv)
     CHECK(test_host_state_timers_and_scroll(false) == 0);
     CHECK(test_host_state_timers_and_scroll(true) == 0);
     CHECK(test_host_state_network_and_indexeddb_stats() == 0);
+    CHECK(test_network_queue_replay() == 0);
     CHECK(test_usv_string_conversion() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     CHECK(test_user_activation_expiry() == 0);
@@ -4315,7 +5094,7 @@ int main(int argc, char **argv)
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &realistic)
           && realistic.maximum_host_compile_source_bytes
-               == 512u * 1024u
+               == 4u * 1024u * 1024u
           && realistic.maximum_advance_time_us == 16000
           && realistic.maximum_host_compile_source_bytes
                > strict.maximum_host_compile_source_bytes);
@@ -4652,7 +5431,47 @@ int main(int argc, char **argv)
                  runtime, page_controls_target, &result)
           && strcmp(result.summary, "PAGE-CONTROLS-REQUESTED") == 0
           && script_runtime_page_fullscreen_active(runtime)
+          && script_runtime_take_page_controls_notice(runtime)
           && script_runtime_exit_page_fullscreen(runtime));
+
+    puts("test: page-controls notice may quiet only repeats in a document");
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "const quiet=document.createElement('button');"
+              "quiet.id='page-controls-quiet';document.body.append(quiet);"
+              "quiet.addEventListener('click',()=>navigator.tilefinch."
+              "requestPageControls(undefined,{notice:'once'}).then(()=>"
+              "globalThis.pocSummary='PAGE-CONTROLS-QUIET'));"
+              "globalThis.pocSummary=navigator.tilefinch.pageControlsNotices"
+              ".join(',')==='always,once'&&Object.isFrozen(navigator."
+              "tilefinch.pageControlsNotices)?'NOTICE-DETECTABLE':'NOTICE-BAD';",
+              "<page-controls-notice-setup>", &result)
+          && strcmp(result.summary, "NOTICE-DETECTABLE") == 0);
+    lxb_dom_node_t *page_controls_quiet = find_element_id(
+        lxb_dom_interface_node(document.html), "page-controls-quiet");
+    /* A repeat that asks for {notice: "once"} is quiet. */
+    CHECK(page_controls_quiet != NULL
+          && script_runtime_dispatch_activation_node(
+                 runtime, page_controls_quiet, &result)
+          && strcmp(result.summary, "PAGE-CONTROLS-QUIET") == 0
+          && script_runtime_page_fullscreen_active(runtime)
+          && !script_runtime_take_page_controls_notice(runtime)
+          && script_runtime_exit_page_fullscreen(runtime));
+    /* The request is consumed: a later plain claim announces again. */
+    CHECK(script_runtime_dispatch_activation_node(
+              runtime, page_controls_target, &result)
+          && strcmp(result.summary, "PAGE-CONTROLS-REQUESTED") == 0
+          && script_runtime_take_page_controls_notice(runtime)
+          && script_runtime_exit_page_fullscreen(runtime));
+    /* A document that has not shown the notice yet (a fresh bridge) shows
+       it even when its first claim asks for "once". */
+    runtime->bridge.page_controls_notice_shown = false;
+    CHECK(script_runtime_dispatch_activation_node(
+              runtime, page_controls_quiet, &result)
+          && strcmp(result.summary, "PAGE-CONTROLS-QUIET") == 0
+          && script_runtime_take_page_controls_notice(runtime)
+          && script_runtime_exit_page_fullscreen(runtime)
+          && script_runtime_take_page_controls_notice(NULL));
 
     puts("test: transient user activation reaches microtasks and navigation");
     /* Earlier cases deliberately exercise trusted page controls on this
@@ -5670,6 +6489,15 @@ int main(int argc, char **argv)
         "'visibilitychange',()=>__visibilityEdges.push("
         "document.visibilityState));requestAnimationFrame(()=>__hiddenRaf++);"
         "setTimeout(()=>__hiddenTimer++,0);";
+    /* This runtime uses the PSP strict policy, whose 16 ms advance target
+       lets a turn start a second task only while wall time remains. Each
+       advance below must run the visibility edge and then the due timer or
+       frame callback in the same turn; on a loaded host the edge alone could
+       use the 16 ms and push the callback to a later turn. The yield target
+       is not what these checks are about, so lift it for this block. */
+    uint64_t visibility_advance_target_us =
+        runtime->bridge.execution_policy.maximum_advance_time_us;
+    runtime->bridge.execution_policy.maximum_advance_time_us = 0;
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, visibility_setup, "<visibility-setup>", &result));
     CHECK(script_runtime_set_page_visibility(runtime, false));
@@ -5720,6 +6548,8 @@ int main(int argc, char **argv)
                  "'VISIBILITY-QUEUED-VISIBLE-FAILED'",
                  "<visibility-queued-visible>", &result)
           && strcmp(result.summary, "VISIBILITY-QUEUED-VISIBLE-OK") == 0);
+    runtime->bridge.execution_policy.maximum_advance_time_us =
+        visibility_advance_target_us;
 
     puts("test: page fullscreen requires native user activation");
     static const char fullscreen_setup[] =
@@ -5814,13 +6644,13 @@ int main(int argc, char **argv)
         "osc=context.createOscillator();gain.gain.value=.5;pan.pan.value=1;"
         "osc.frequency.value=11025;osc.connect(gain).connect(pan).connect("
         "context.destination);globalThis.__gameOscEnded=0;"
-        "globalThis.__gameSynthGain=gain;"
+        "globalThis.__gameSynthGain=gain;globalThis.__gameSynthPan=pan;"
         "osc.onended=()=>__gameOscEnded++;const now=context.currentTime;"
         "osc.start(now+.005);osc.stop(now+.008);"
         "globalThis.pocSummary=osc.type==='sine'&&pan.pan.value===1"
         "?'GAME-AUDIO-SYNTHESIS-STARTED':"
         "'GAME-AUDIO-SYNTHESIS-FAILED'})()";
-    CHECK(script_runtime_evaluate_diagnostic(
+    CHECK(evaluate_with_held_clock(
               runtime, game_audio_synthesis_probe,
               "<game-audio-synthesis>", &result)
           && strcmp(result.summary, "GAME-AUDIO-SYNTHESIS-STARTED") == 0);
@@ -5855,13 +6685,17 @@ int main(int argc, char **argv)
         "(()=>{const context=__gameAudioBuffer._context,gain=__gameSynthGain,"
         "osc=context.createOscillator();gain.gain.value=0;"
         "osc.frequency.value=440;osc.connect(gain).connect(context.destination);"
-        "osc.start();const now=context.currentTime;gain.gain.cancelScheduledValues(now);"
-        "gain.gain.setValueAtTime(0,now);gain.gain.setTargetAtTime(.5,now,.002);"
-        "gain.gain.setTargetAtTime(0,now+.02,.004);"
+        "osc.start();const now=context.currentTime;gain.gain.setValueAtTime(0,now);"
+        "const dispatch=context._forSourcesThrough;"
+        "context._forSourcesThrough=()=>{throw Error('automation callback dispatch')};"
+        "try{gain.gain.cancelScheduledValues(now);"
+        "gain.gain.setTargetAtTime(.5,now,.002);"
+        "gain.gain.setTargetAtTime(0,now+.02,.004)}"
+        "finally{context._forSourcesThrough=dispatch}"
         "globalThis.__gameEnvelopeOsc=osc;globalThis.pocSummary="
         "typeof gain.gain.setTargetAtTime==='function'"
         "?'GAME-AUDIO-ENVELOPE-SCHEDULED':'GAME-AUDIO-ENVELOPE-MISSING'})()";
-    CHECK(script_runtime_evaluate_diagnostic(
+    CHECK(evaluate_with_held_clock(
               runtime, game_audio_envelope_probe,
               "<game-audio-envelope>", &result)
           && strcmp(result.summary, "GAME-AUDIO-ENVELOPE-SCHEDULED") == 0);
@@ -5891,16 +6725,151 @@ int main(int argc, char **argv)
         }
     }
     CHECK(envelope_peak > 4000 && envelope_tail < 128);
+    puts("test: copied gain and pitch curves progress without page advances");
+    static const char game_audio_curve_probe[] =
+        "(()=>{const c=__gameAudioBuffer._context,g=__gameSynthGain,"
+        "o=__gameEnvelopeOsc;o.frequency.value=220;"
+        "g.gain.cancelScheduledValues(0);g.gain.value=0;"
+        "const now=c.currentTime,"
+        "gain=new Float32Array([0,.5,0]),pitch=new Float32Array([220,880]);"
+        "g.gain.setValueCurveAtTime(gain,now,.02);"
+        "o.frequency.setValueCurveAtTime(pitch,now,.02);"
+        "gain.fill(0);pitch.fill(1);globalThis.__gameCurveOsc=o;"
+        "let checks=0;const refuses=(fn,name)=>{try{fn()}catch(e){"
+        "if(e.name===name)checks++}};"
+        "refuses(()=>g.gain.setValueCurveAtTime([0,1],now,.01),'NotSupportedError');"
+        "refuses(()=>g.gain.setValueCurveAtTime([0],now,.01),'InvalidStateError');"
+        "refuses(()=>g.gain.setValueCurveAtTime([0,NaN],now,.01),'TypeError');"
+        "refuses(()=>g.gain.setValueCurveAtTime([0,1],now,0),'RangeError');"
+        "refuses(()=>g.gain.setValueCurveAtTime(new Float32Array(65),now,.01),"
+        "'QuotaExceededError');"
+        "refuses(()=>o.frequency.setValueCurveAtTime([220,880],now,11),"
+        "'NotSupportedError');"
+        "const cmd=__tilefinchGameAudioCommand,marker={};"
+        "if(cmd(11,o._voice,1,new Float64Array([220,880]),1,1,0,.01)===false)checks++;"
+        "refuses(()=>cmd(11,o._voice,1,new Float32Array([NaN,880]),1,1,0,.01),'TypeError');"
+        "try{cmd(11,o._voice,1,pitch,1,1,{valueOf(){throw marker}},.01)}"
+        "catch(e){if(e===marker)checks++}"
+        "const detached=new Float32Array([220,880]);"
+        "refuses(()=>cmd(11,o._voice,1,detached,1,1,{valueOf(){"
+        "detached.buffer.transfer();return 0}},.01),'TypeError');"
+        "globalThis.pocSummary=checks===10?'GAME-AUDIO-CURVES-SCHEDULED':'CURVE-BOUNDS-FAILED'})()";
     CHECK(script_runtime_evaluate_diagnostic(
-              runtime,
-              "__gameEnvelopeOsc.stop();globalThis.pocSummary="
-              "'GAME-AUDIO-ENVELOPE-STOPPED'",
-              "<game-audio-envelope-stop>", &result)
-          && strcmp(result.summary, "GAME-AUDIO-ENVELOPE-STOPPED") == 0
+              runtime, game_audio_curve_probe, "<game-audio-curves>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-CURVES-SCHEDULED") == 0);
+    int curve_peak = 0, curve_tail = 0;
+    size_t curve_early_edges = 0, curve_late_edges = 0;
+    int16_t curve_previous = 0;
+    for (size_t block = 0; block < 4u; block++) {
+        CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+            game_audio_envelope_samples, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES));
+        for (size_t frame = 0; frame < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES; frame++) {
+            int sample = game_audio_envelope_samples[frame * 2u];
+            int magnitude = sample < 0 ? -sample : sample;
+            if (magnitude > curve_peak) curve_peak = magnitude;
+            if (block == 3u && magnitude > curve_tail) curve_tail = magnitude;
+            if (sample != 0 && curve_previous != 0
+                && (sample < 0) != (curve_previous < 0)) {
+                if (block == 0u && frame < 256u) curve_early_edges++;
+                if (block == 1u && frame < 256u) curve_late_edges++;
+            }
+            curve_previous = (int16_t) sample;
+        }
+    }
+    CHECK(curve_peak > 7000 && curve_tail == 0
+          && curve_late_edges > curve_early_edges);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "(()=>{const o=__gameCurveOsc,g=__gameSynthGain;"
+              "o.frequency.cancelScheduledValues(0);g.gain.cancelScheduledValues(0);"
+              "g.gain.value=.25;o.frequency.value=220;"
+              "g.gain.setValueCurveAtTime([.25,.25],0,.005);"
+              "o.frequency.setValueCurveAtTime([220,880],0,.005);"
+              "globalThis.pocSummary='GAME-AUDIO-CURVES-CANCELLED'})()",
+              "<game-audio-curve-cancel>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-CURVES-CANCELLED") == 0);
+    CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+        game_audio_envelope_samples, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES));
+    CHECK(game_audio_envelope_samples[100] != 0);
+    CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+        game_audio_envelope_samples, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES));
+    size_t held_pitch_edges = 0;
+    int held_previous = 0;
+    for (size_t frame = 1; frame < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES; frame++) {
+        int after = game_audio_envelope_samples[frame * 2u];
+        if (held_previous != 0 && after != 0
+            && (held_previous < 0) != (after < 0))
+            held_pitch_edges++;
+        if (after != 0) held_previous = after;
+    }
+    CHECK(held_pitch_edges >= 18u && held_pitch_edges <= 22u);
+    puts("test: direct gain automation skips constant mix resolution; chains stay live");
+    puts("test: game audio schedules at a returned currentTime without rereading the clock");
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "(()=>{const g=__gameSynthGain,c=g.context,curve=new Float32Array([.25,.25]);"
+              "const original=performance.now;let reads=0;"
+              "performance.now=function(){reads++;return original.call(performance)};"
+              "let due=false,future=false,later=-1;"
+              "try{g.gain.cancelScheduledValues(0);const now=c.currentTime;reads=0;"
+              "g.gain.cancelScheduledValues(now);g.gain.setValueCurveAtTime(curve,now,.005);"
+              "due=reads===0;reads=0;g.gain.cancelScheduledValues(0);"
+              "g.gain.setTargetAtTime(.2,c.currentTime+.25,.01);"
+              "future=reads===2;later=c.currentTime-now}"
+              "finally{performance.now=original;g.gain.cancelScheduledValues(0)}"
+              "globalThis.pocSummary=due&&future&&later>=0?'GAME-AUDIO-DUE-NOW':"
+              "'GAME-AUDIO-CLOCK-'+due+'-'+future+'-'+later})()",
+              "<game-audio-due-now>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-DUE-NOW") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "(()=>{const o=__gameCurveOsc,g=__gameSynthGain,c=g.context;"
+              "g.gain.cancelScheduledValues(0);"
+              "const original=Math.min;let clamps=0;"
+              "Math.min=function(a,b){clamps++;return original(a,b)};"
+              "try{g.gain.setValueCurveAtTime(new Float32Array([.25,.25]),0,.005)}"
+              "finally{Math.min=original}"
+              "const direct=clamps===0;g.gain.cancelScheduledValues(0);"
+              "const downstream=c.createGain(),pan=__gameSynthPan;"
+              "downstream.gain.value=.5;pan.pan.value=-1;"
+              "g.connect(downstream).connect(pan).connect(c.destination);"
+              "g.gain.setValueCurveAtTime(new Float32Array([.25,.25]),0,.005);"
+              "globalThis.__gameCurveDownstream=downstream;"
+              "globalThis.pocSummary=direct?'GAME-AUDIO-DIRECT-MIX':"
+              "'GAME-AUDIO-REDUNDANT-MIX'})()",
+              "<game-audio-direct-mix>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-DIRECT-MIX") == 0);
+    CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+        game_audio_envelope_samples, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES));
+    int chained_gain_peak = 0;
+    for (size_t frame = 0; frame < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES; frame++) {
+        int sample = game_audio_envelope_samples[frame * 2u];
+        int magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > chained_gain_peak) chained_gain_peak = magnitude;
+        CHECK(game_audio_envelope_samples[frame * 2u + 1u] == 0);
+    }
+    CHECK(chained_gain_peak > 3900 && chained_gain_peak <= 4096);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "__gameSynthGain.gain.cancelScheduledValues(0);"
+              "__gameCurveDownstream.gain.value=.25;"
+              "__gameSynthGain.gain.setValueCurveAtTime(new Float32Array([.25,.25]),0,.005);"
+              "globalThis.pocSummary='GAME-AUDIO-CHAIN-CHANGED'",
+              "<game-audio-chain-changed>", &result));
+    CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+        game_audio_envelope_samples, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES));
+    int changed_gain_peak = 0;
+    for (size_t frame = 0; frame < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES; frame++) {
+        int sample = game_audio_envelope_samples[frame * 2u];
+        int magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > changed_gain_peak) changed_gain_peak = magnitude;
+        CHECK(game_audio_envelope_samples[frame * 2u + 1u] == 0);
+    }
+    CHECK(changed_gain_peak > 1950 && changed_gain_peak <= 2048);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+              "__gameCurveOsc.stop();__gameSynthGain.gain.cancelScheduledValues(0);"
+              "globalThis.pocSummary='GAME-AUDIO-CURVES-STOPPED'",
+              "<game-audio-curve-stop>", &result)
           && script_runtime_advance(runtime, 0, 4, &result));
     static const char game_audio_loop_probe[] =
         "(()=>{const context=__gameAudioBuffer._context,source="
-        "context.createBufferSource(),pan=context.createStereoPanner();"
+        "context.createBufferSource(),pan=__gameSynthPan;"
         "source.buffer=__gameAudioBuffer;source.loop=true;"
         "source.loopStart=1/44100;source.loopEnd=3/44100;"
         "source.connect(pan).connect(context.destination);source.start();"
@@ -5931,6 +6900,28 @@ int main(int argc, char **argv)
         "for(let i=0;i<4;i++){const source=context.createBufferSource();"
         "source.buffer=__gameAudioBuffer;source.loop=true;"
         "source.connect(context.destination);source.start();sources.push(source)}"
+        "sources[0].connect(__gameSynthGain).connect(context.destination);"
+        "const firstMix=sources[0]._updateMix,otherMix=sources[1]._updateMix;"
+        "let firstUpdates=0,otherUpdates=0;"
+        "sources[0]._updateMix=()=>firstUpdates++;"
+        "sources[1]._updateMix=()=>otherUpdates++;"
+        "__gameSynthGain.gain.value=.3;"
+        "const mixFiltered=firstUpdates===1&&otherUpdates===0;"
+        "const unrelatedTarget=sources[2]._target;let unrelatedVisits=0;"
+        "Object.defineProperty(sources[2],'_target',{configurable:true,"
+        "get(){unrelatedVisits++;return unrelatedTarget}});"
+        "__gameSynthGain.gain.value=.31;"
+        "const graphRetained=unrelatedVisits===0;"
+        "Object.defineProperty(sources[2],'_target',{configurable:true,"
+        "writable:true,value:unrelatedTarget});"
+        "sources[0].connect(context.destination);"
+        "sources[1].connect(__gameSynthGain);firstUpdates=otherUpdates=0;"
+        "__gameSynthGain.gain.value=.32;"
+        "const graphReconnected=firstUpdates===0&&otherUpdates===1;"
+        "sources[1].disconnect();firstUpdates=otherUpdates=0;"
+        "__gameSynthGain.gain.value=.33;"
+        "const graphDisconnected=firstUpdates===0&&otherUpdates===0;"
+        "sources[0]._updateMix=firstMix;sources[1]._updateMix=otherMix;"
         "let bounded=false;try{const extra=context.createBufferSource();"
         "extra.buffer=__gameAudioBuffer;extra.connect(context.destination);"
         "extra.start()}catch(error){bounded=error.name==='QuotaExceededError'}"
@@ -5939,7 +6930,8 @@ int main(int argc, char **argv)
         "let pinned=false;try{const pending=context.createBufferSource();"
         "pending.buffer=__gameAudioBuffer;pending.connect(context.destination);"
         "pending.start()}catch(error){pinned=error.name==='QuotaExceededError'}"
-        "globalThis.pocSummary=bounded&&pinned"
+        "globalThis.pocSummary=bounded&&pinned&&mixFiltered&&graphRetained"
+        "&&graphReconnected&&graphDisconnected"
         "?'GAME-AUDIO-BOUNDS-OK':'GAME-AUDIO-BOUNDS-FAILED'})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, game_audio_bounds_probe,
@@ -6771,8 +7763,7 @@ int main(int argc, char **argv)
         "let rejected=true;for(const value of bad){const command="
         "new Float64Array(base);command[0]=value;rejected="
         "rejected&&!__tilefinchCanvasRasterRectBatch(pixels,2,2,command);}"
-        "const points=new Float64Array([0,0,1,0]),empty=new Float64Array(),"
-        "identity=new Float64Array([1,0,0,1,0,0]);"
+        "const points=new Float64Array([0,0,1,0]),empty=new Float64Array();"
         "rejected=rejected&&!__tilefinchCanvasRasterPath(pixels,2,2,points,"
         "true,false,0,0,0,255,1,1,1,0,0,10,empty,0,"
         "new Float64Array([NaN,0,2,2]),empty,empty);"
@@ -6784,9 +7775,6 @@ int main(int argc, char **argv)
         "new Uint8ClampedArray(4),1,1,0,0,1,1,0,0,1,1,false,1,1,"
         "new Float64Array([1,0,0,1,Number.MAX_VALUE,0]),"
         "new Float64Array([0,0,2,2]),empty);"
-        "rejected=rejected&&!__tilefinchCanvasRasterText(pixels,2,2,'x',"
-        "Number.MAX_VALUE,1,8,0,false,false,0,0,0,255,1,1,false,1,identity,"
-        "new Float64Array([0,0,2,2]),1,empty);"
         "globalThis.pocSummary=rejected?'CANVAS-NUMERIC-BOUNDARY-OK':"
         "'CANVAS-NUMERIC-BOUNDARY-FAILED';})()";
     CHECK(script_runtime_evaluate_diagnostic(
@@ -6980,9 +7968,9 @@ int main(int argc, char **argv)
         "__tilefinchNetworkQueueStats;globalThis.__tilefinchFetchAsync=nativeFetch;"
         "globalThis.__tilefinchCancelNetwork=nativeCancel;"
         "globalThis.pocSummary=fifo&&bodies.every(value=>value==='ok')"
-        "&&cancelName==='AbortError'&&countQuota==='RangeError'"
+        "&&cancelName==='AbortError'&&countQuota==='TypeError'"
         "&&xhrDeferred&&xhrQuotaError&&!xhrQuotaReentered"
-        "&&abortReleased&&byteQuota==='RangeError'&&queuedBeforeTimeout&&timeoutEvent"
+        "&&abortReleased&&byteQuota==='TypeError'&&queuedBeforeTimeout&&timeoutEvent"
         "&&uploadOk&&progressShapeOk&&timingOk&&nativeDeferred&&deferredBody==='ok'"
         "&&xhr.readyState===4&&xhr.status===0&&stats.peakCount===128"
         "&&stats.rejected===3&&stats.rejectedBytes>=1"
@@ -8053,7 +9041,7 @@ int main(int argc, char **argv)
         "const lockedResult=await lockedValue,queuedBeforeRelease="
         "!queuedSettled;await lockedDone;const queuedResult=await queuedValue;"
         "await queuedDone;Array.prototype.includes=originalIncludes;"
-        "const timersBefore=__tilefinchPendingTimers(),timers=[];for(let i=0;"
+        "const timersBefore=__tilefinchSchedulerSnapshot()[2],timers=[];for(let i=0;"
         "i<160;i++){const id=setTimeout(()=>{},1000);if(!id)break;timers.push(id)}"
         "let saturatedName='',replacementFinished=false;const saturated="
         "db.transaction('records'),replacementReady=new Promise((resolve,reject)"
@@ -8405,7 +9393,7 @@ int main(int argc, char **argv)
     static const char entry_point_hardening_probe[] =
         "(()=>{const lazy=['__tilefinchSubmittedFormHandle',"
         "'__tilefinchSubmittedSubmitterHandle','__tilefinchFragmentInsertCount',"
-        "'__tilefinchFragmentInsertText','__tilefinchLastFramePost',"
+        "'__tilefinchFragmentInsertText',"
         "'__tilefinchBase64Error','__tilefinchSelectedControl',"
         "'__tilefinchParentAppendBypass','__tilefinchMutationSuppressed',"
         "'__tilefinchNow'],"
@@ -8415,7 +9403,6 @@ int main(int argc, char **argv)
         "'__tilefinchDispatchDOMContentLoaded',"
         "'__tilefinchIntersectionRecheck','__tilefinchParserMutationCheckpoint',"
         "'__tilefinchMediaRecheck',"
-        "'__tilefinchPendingNetworkRequests','__tilefinchPendingTimers',"
         "'__tilefinchPumpTimers','__tilefinchRebindDocument',"
         "'__tilefinchRecordResourceTiming','__tilefinchRefreshNamedProperties',"
         "'__tilefinchRestoreSameDocument','__tilefinchRestoreSectionState',"
@@ -8861,22 +9848,27 @@ int main(int argc, char **argv)
         "const inserted=first.insertRule('.constructed-mid{width:3px}',1)===1"
         "&&first.cssRules[1].cssText.includes('constructed-mid');"
         "first.deleteRule(1);second.replaceSync('.constructed-last{height:4px}');"
+        /* Adopted sheets live natively, outside the document tree. */
+        "const styleCount=document.querySelectorAll('style').length,"
+        "lastChild=document.documentElement.lastChild;"
         "document.adoptedStyleSheets=[first,second];"
-        "const nodes=document.querySelectorAll("
-        "'style[data-tilefinch-constructed]'),"
-        "ordered=nodes.length===2&&nodes[0].parentNode===document.documentElement"
-        "&&nodes[1]===document.documentElement.lastChild,"
-        "before=nodes[0].textContent;"
+        "const nodes=[],ordered=document.querySelectorAll('style').length"
+        "===styleCount&&document.documentElement.lastChild===lastChild"
+        "&&document.adoptedStyleSheets[0]===first"
+        "&&document.adoptedStyleSheets[1]===second;"
         "first.replaceSync('.constructed-live{color:blue}');"
-        "const live=nodes[0].textContent!==before"
-        "&&nodes[0].textContent.includes('constructed-live');"
+        "const live=first.cssRules.length===1"
+        "&&first.cssRules[0].selectorText==='.constructed-live';"
         "let duplicate=false,ordinary=false,syntax=false;"
         "try{document.adoptedStyleSheets=[first,first]}catch(error){"
         "duplicate=error.name==='NotAllowedError'}"
         "try{document.adoptedStyleSheets=[document.createElement('style').sheet]}"
         "catch(error){ordinary=error.name==='NotAllowedError'}"
-        "try{first.replaceSync('.broken{')}catch(error){"
-        "syntax=error.name==='SyntaxError'}"
+        /* CSS has no fatal syntax errors: the parser closes a block left
+           open at the end, so replaceSync never throws SyntaxError. */
+        "const broken=new CSSStyleSheet();broken.replaceSync('.broken{');"
+        "syntax=broken.cssRules.length===1"
+        "&&broken.cssRules[0].cssText==='.broken{}';"
         "const author=document.createElement('style');"
         "author.textContent='.author-a{color:red}@media (min-width:1px){"
         ".author-b{display:block}}';document.head.appendChild(author);"
@@ -8901,8 +9893,7 @@ int main(int argc, char **argv)
         "&&authorSheet.cssRules.length===1"
         "&&authorSheet.cssRules[0].selectorText==='.author-live';"
         "document.adoptedStyleSheets=[second];"
-        "const removed=!nodes[0].isConnected"
-        "&&document.adoptedStyleSheets.length===1"
+        "const removed=document.adoptedStyleSheets.length===1"
         "&&document.adoptedStyleSheets[0]===second;"
         "const detachedDoc=document.implementation.createHTMLDocument(''),"
         "detached=detachedDoc.createElement('div'),oldStyle=detached.style;"
@@ -9101,7 +10092,8 @@ int main(int argc, char **argv)
         "document.body.appendChild(node);globalThis.__tilefinchProbeHandle="
         "node.__handle;globalThis.__tilefinchProbeOldLease="
         "node.__tilefinchHandleLease;globalThis.pocSummary="
-        "globalThis.__tilefinchWeakNodeCache&&node.__tilefinchHandleLease>0"
+        "typeof WeakRef==='function'&&typeof FinalizationRegistry==='function'"
+        "&&node.__tilefinchHandleLease>0"
         "?'WEAK-NODE-CACHE-SETUP-OK':'WEAK-NODE-CACHE-SETUP-FAILED';"
         "__tilefinchClearNodeCache();})()";
     CHECK(script_runtime_evaluate_diagnostic(
@@ -9666,7 +10658,7 @@ int main(int argc, char **argv)
     script_runtime_destroy(runtime);
     runtime = NULL;
 
-    puts("test: classic external bytecode reuses the bounded HTTP cache");
+    puts("test: classic external bytecode restores in a new realm");
     BrowserSession bytecode_session = {0};
     ScriptRuntimeOptions bytecode_options = options;
     bytecode_options.session = &bytecode_session;
@@ -9692,12 +10684,17 @@ int main(int argc, char **argv)
           && script_runtime_evaluate_external_classic_cached(
               first_bytecode_runtime, script, cached_script_source,
               sizeof(cached_script_source) - 1, cached_script_url,
-              cached_script_url, &first_bytecode_result)
+              cached_script_url, false, &first_bytecode_result)
           && strcmp(first_bytecode_result.summary,
                     "CLASSIC-BYTECODE-CACHE-OK") == 0
           && first_bytecode_result.external_script_bytecode_cache_misses == 1
-          && first_bytecode_result.external_script_bytecode_cache_stores == 1
+          && first_bytecode_result.external_script_bytecode_deferred == 1
           && first_bytecode_result.external_script_bytecode_cache_hits == 0);
+    /* The page's idle turn stores what the load queued. */
+    CHECK(script_runtime_store_pending_bytecode(first_bytecode_runtime,
+                                                &first_bytecode_result)
+          && first_bytecode_result.external_script_bytecode_cache_stores
+                 == 1);
     size_t first_compile_attempts =
         first_bytecode_result.host_compile_attempts;
     script_runtime_destroy(first_bytecode_runtime);
@@ -9712,7 +10709,7 @@ int main(int argc, char **argv)
           && script_runtime_evaluate_external_classic_cached(
               second_bytecode_runtime, script, cached_script_source,
               sizeof(cached_script_source) - 1, cached_script_url,
-              cached_script_url, &second_bytecode_result)
+              cached_script_url, false, &second_bytecode_result)
           && strcmp(second_bytecode_result.summary,
                     "CLASSIC-BYTECODE-CACHE-OK") == 0
           && second_bytecode_result.external_script_bytecode_cache_hits == 1
@@ -9792,7 +10789,7 @@ int main(int argc, char **argv)
           && script_runtime_evaluate_external_classic_cached(
               installed_bytecode_runtime, script, cached_script_source,
               sizeof(cached_script_source) - 1, cached_script_url,
-              cached_script_url, &installed_bytecode_result)
+              cached_script_url, false, &installed_bytecode_result)
           && strcmp(installed_bytecode_result.summary,
                     "CLASSIC-BYTECODE-CACHE-OK") == 0
           && installed_bytecode_result.external_script_bytecode_cache_hits == 1

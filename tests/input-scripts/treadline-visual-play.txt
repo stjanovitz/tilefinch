@@ -1,0 +1,51 @@
+# Visual-review gameplay outside the long soak: a campaign mission or the
+# Practice Range, entered the way a person does and driven by real pad input
+# (no qualification auto-driver). The package URL picks the scene, and its
+# qualification=visual loads qualification.js for the companion's
+# __treadlineDebug (the killcam stays on, as in ordinary play):
+#   ?qualification=visual&visual=mission&mission=N   campaign mission N (0 = 1-1), Veteran
+#   ?qualification=visual&visual=range               Practice Range, free range
+# Recorded with scripts/run-ppsspp-input-script.sh --measure --record-video
+# for scripts/visual-review.py; there is no golden (input timing varies).
+#
+# The companion opens the mission briefing or the drill list with the
+# primary button focused once the runtime is ready; Cross is then a trusted
+# activation that claims Page controls, so play runs full screen.
+until 900
+mark-page open
+until 300
+wait-live 15
+tap-live cross
+mark-page deployed
+until 900
+wait-live 90
+mark-page play-start
+# About 40 seconds of ARCADE input: nub driving, camera-relative face-button
+# aim with held R fire, D-pad gadget and command, L secondary.
+stick-live 75 up
+hold-live 45 triangle+rtrigger
+stick-live 60 right
+hold-live 30 square+rtrigger
+stick-live 75 down
+tap-live up
+hold-live 45 circle+rtrigger
+stick-live 60 left
+tap-live ltrigger
+hold-live 45 cross+rtrigger
+stick-live 90 up
+hold-live 30 triangle+rtrigger
+stick-live 60 right
+tap-live down
+hold-live 45 square+rtrigger
+stick-live 75 left
+hold-live 30 circle+rtrigger
+stick-live 60 down
+tap-live ltrigger
+hold-live 45 triangle+rtrigger
+stick-live 90 right
+hold-live 45 cross+rtrigger
+stick-live 75 up
+hold-live 30 square+rtrigger
+mark-page play-end
+wait-live 10
+end

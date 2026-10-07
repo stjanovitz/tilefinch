@@ -1,3 +1,154 @@
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+#include "../validation_phase_internal.h"
+
+static JSValue js_validation_render_history(JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (!bridge || argc != 1 || !JS_IsBool(argv[0])) return JS_FALSE;
+    return JS_NewBool(context, script_runtime_webgl_validation_history(
+        bridge->host, JS_ToBool(context, argv[0]) != 0));
+}
+
+static ValidationPhaseClock js_validation_phase_clock(void)
+{
+    ValidationPhaseClock clock = {0};
+    SceKernelThreadRunStatus status = {.size = sizeof(status)};
+    clock.wall_begin_us = (uint64_t) sceKernelGetSystemTimeWide();
+    int result = sceKernelReferThreadRunStatus(sceKernelGetThreadId(), &status);
+    clock.wall_end_us = (uint64_t) sceKernelGetSystemTimeWide();
+    clock.valid = result >= 0;
+    if (clock.valid)
+        clock.cpu_us = ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
+    return clock;
+}
+
+void js_rt_validation_cpu_enter(ScriptRuntime *runtime, unsigned phase)
+{
+    if (runtime != NULL && runtime->validation_cpu.enabled)
+        validation_cpu_enter(&runtime->validation_cpu, phase, js_validation_phase_clock());
+}
+
+void js_rt_validation_cpu_leave(ScriptRuntime *runtime, unsigned phase)
+{
+    if (runtime != NULL && runtime->validation_cpu.enabled)
+        validation_cpu_leave(&runtime->validation_cpu, phase, js_validation_phase_clock());
+}
+
+/* Numeric validation protocol: configure, begin-frame, enter, leave,
+   end-frame. It is deliberately not a shipping browser API. Only configure
+   allocates; per-frame counts arrive in one fixed typed-array copy. */
+static JSValue js_validation_phase(JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    uint32_t op, id;
+    if (runtime == NULL || argc < 2 || !JS_IsNumber(argv[0])
+        || !JS_IsNumber(argv[1])) return JS_FALSE;
+    if (JS_ToUint32(context, &op, argv[0]) < 0
+        || JS_ToUint32(context, &id, argv[1]) < 0) return JS_EXCEPTION;
+    if (op == 0u) {
+        if (id < 1u || id > 3u
+            || (runtime->validation_phases && runtime->validation_phases->active))
+            return JS_FALSE;
+        if (!runtime->validation_phases)
+            runtime->validation_phases = budget_calloc_category(runtime->budget,
+                BUDGET_CATEGORY_JAVASCRIPT, 1u, sizeof(ValidationPhaseCapture));
+        if (!runtime->validation_phases) return JS_FALSE;
+        memset(runtime->validation_phases, 0, sizeof(*runtime->validation_phases));
+        runtime->validation_phases->mode = id;
+        return JS_TRUE;
+    }
+    ValidationPhaseCapture *capture = runtime->validation_phases;
+    if (!capture) return JS_FALSE;
+    ValidationPhaseClock clock = {0};
+    if (capture->mode != 2u && (op == 1u || op == 4u
+            || (capture->mode == 3u && (op == 2u || op == 3u))))
+        clock = js_validation_phase_clock();
+    bool okay = false;
+    if (op == 1u) okay = validation_phase_begin(capture, id, clock);
+    else if (op == 2u) okay = validation_phase_enter(capture, id, clock);
+    else if (op == 3u) okay = validation_phase_leave(capture, id, clock);
+    else if (op == 4u && argc == 4 && JS_IsNumber(argv[2])) {
+        uint32_t checksum_b;
+        if (JS_ToUint32(context, &checksum_b, argv[2]) < 0) return JS_EXCEPTION;
+        size_t offset = 0, length = 0, element = 0;
+        JSValue buffer = JS_GetTypedArrayBuffer(context, argv[3], &offset, &length, &element);
+        if (JS_IsException(buffer)) return buffer;
+        size_t capacity = 0;
+        uint8_t *bytes = JS_GetArrayBuffer(context, &capacity, buffer);
+        if (bytes && element == sizeof(uint32_t) && offset % sizeof(uint32_t) == 0u
+            && offset <= capacity && length <= capacity - offset
+            && length % sizeof(uint32_t) == 0u
+            && length / sizeof(uint32_t) <= VALIDATION_PHASE_COUNTER_LIMIT)
+            okay = validation_phase_end(capture, clock, id, checksum_b,
+                (const uint32_t *) (bytes + offset), length / sizeof(uint32_t));
+        else validation_phase_fail(capture);
+        JS_FreeValue(context, buffer);
+    } else validation_phase_fail(capture);
+    return JS_NewBool(context, okay);
+}
+
+#endif
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Whole-buffer validation hashes avoid thousands of JS/native Math.imul
+   crossings in the intrusive parity proof. Views and writes remain bounded;
+   no strings, temporary objects, source coercion or allocation occur here. */
+static JSValue js_validation_hash_bytes(JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    uint32_t count;
+    if (argc != 3 || !JS_IsNumber(argv[1])) return JS_FALSE;
+    if (JS_ToUint32(context, &count, argv[1]) < 0) return JS_EXCEPTION;
+    if (count > 512u * 1024u) return JS_FALSE;
+    size_t in_offset = 0, in_length = 0, in_element = 0;
+    size_t out_offset = 0, out_length = 0, out_element = 0;
+    JSValue input = JS_GetTypedArrayBuffer(context, argv[0],
+        &in_offset, &in_length, &in_element);
+    if (JS_IsException(input)) return input;
+    JSValue output = JS_GetTypedArrayBuffer(context, argv[2],
+        &out_offset, &out_length, &out_element);
+    if (JS_IsException(output)) {JS_FreeValue(context, input); return output;}
+    size_t in_capacity = 0, out_capacity = 0;
+    uint8_t *in = JS_GetArrayBuffer(context, &in_capacity, input);
+    uint8_t *out = JS_GetArrayBuffer(context, &out_capacity, output);
+    bool okay = in && out && in_offset <= in_capacity
+        && in_length <= in_capacity - in_offset && count <= in_length
+        && out_offset <= out_capacity && out_length <= out_capacity - out_offset
+        && out_element == sizeof(uint32_t) && out_length >= 2u * sizeof(uint32_t);
+    if (okay) {
+        uint32_t hashes[2] = {UINT32_C(2166136261), UINT32_C(0x9e3779b9)};
+        for (uint32_t at = 0; at < count; at++) {
+            hashes[0] = (hashes[0] ^ in[in_offset + at]) * UINT32_C(16777619);
+            hashes[1] = (hashes[1] ^ in[in_offset + at]) * UINT32_C(2246822519);
+        }
+        memcpy(out + out_offset, hashes, sizeof(hashes));
+    }
+    JS_FreeValue(context, output); JS_FreeValue(context, input);
+    return JS_NewBool(context, okay);
+}
+#endif
+
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Two samples around a bounded validation kernel separate CPU work from
+   mixer/supervisor preemption. Never polled inside ordinary gameplay. */
+static JSValue js_validation_thread_cpu_us(JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value; (void) argc; (void) argv;
+    SceKernelThreadRunStatus status = {.size = sizeof(status)};
+    if (sceKernelReferThreadRunStatus(sceKernelGetThreadId(), &status) < 0)
+        return JS_ThrowInternalError(context, "CPU clock unavailable");
+    uint64_t us = ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
+    return JS_NewFloat64(context, (double) us);
+}
+#endif
+
 typedef enum {
     BOOTSTRAP_BYTECODE_UNAVAILABLE = 0,
     BOOTSTRAP_BYTECODE_EVALUATED,
@@ -385,6 +536,11 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"SourceBuffer", LAZY_BOOTSTRAP_CAPABILITIES, LAZY_BOOTSTRAP_GLOBAL},
     {"SourceBufferList", LAZY_BOOTSTRAP_CAPABILITIES,
      LAZY_BOOTSTRAP_GLOBAL},
+    {"FontFaceSet", LAZY_BOOTSTRAP_CAPABILITIES, LAZY_BOOTSTRAP_GLOBAL},
+    {"fonts", LAZY_BOOTSTRAP_CAPABILITIES,
+     LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE},
+    {"PerformanceEventTiming", LAZY_BOOTSTRAP_CAPABILITIES,
+     LAZY_BOOTSTRAP_GLOBAL},
     {"Intl", LAZY_BOOTSTRAP_INTL, LAZY_BOOTSTRAP_GLOBAL},
     {"FileSystemHandle", LAZY_BOOTSTRAP_OPFS, LAZY_BOOTSTRAP_GLOBAL},
     {"FileSystemFileHandle", LAZY_BOOTSTRAP_OPFS,
@@ -473,6 +629,44 @@ static JSValue js_runtime_trace_eval_source(
             length, written_length, okay ? "yes" : "no");
     JS_FreeCString(context, source);
     return JS_UNDEFINED;
+}
+
+/* TILEFINCH_LAB_INIT_SCRIPT: read a bounded lab file and evaluate it as a
+   diagnostic in the page realm. Failures are printed, never fatal. */
+static void runtime_evaluate_lab_init_script(ScriptRuntime *host)
+{
+    const char *path = tilefinch_lab_init_script_path();
+    FILE *file = path == NULL ? NULL : fopen(path, "rb");
+    if (file == NULL) {
+        printf("census-init-script status=unreadable\n");
+        return;
+    }
+    const long limit = 1024L * 1024L;
+    long size = fseek(file, 0L, SEEK_END) == 0 ? ftell(file) : -1L;
+    char *source = size >= 0L && size <= limit
+                   && fseek(file, 0L, SEEK_SET) == 0
+        ? budget_malloc(host->budget, (size_t) size + 1u) : NULL;
+    size_t length = source == NULL ? 0
+        : fread(source, 1u, (size_t) size, file);
+    bool complete = source != NULL && length == (size_t) size
+                    && !ferror(file);
+    fclose(file);
+    if (!complete) {
+        budget_free(host->budget, source);
+        printf("census-init-script status=too-large\n");
+        return;
+    }
+    source[length] = '\0';
+    ScriptResult *scratch = budget_calloc(host->budget, 1, sizeof(*scratch));
+    bool ok = scratch != NULL && js_rt_evaluate_source_type_at(
+        host->context, source, length, "<lab-init-script>", NULL, NULL,
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN, JS_EVAL_TYPE_GLOBAL,
+        SCRIPT_COMPILE_SOURCE_DIAGNOSTIC, scratch);
+    budget_free(host->budget, source);
+    printf("census-init-script status=%s bytes=%zu error=\"%.200s\"\n",
+           ok ? "ok" : "failed", length,
+           ok || scratch == NULL ? "" : scratch->error);
+    budget_free(host->budget, scratch);
 }
 #endif
 
@@ -655,13 +849,27 @@ static bool runtime_load_lazy_bootstrap(
             &browser_bootstrap_streams_bytecode, false, trace,
             &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
-        evaluated = runtime_evaluate_bootstrap_profiled(
-            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
-                         browser_bootstrap_game_audio,
-                         browser_bootstrap_game_audio_bytecode),
-            "<browser-game-audio-lazy>",
-            &browser_bootstrap_game_audio_bytecode, false, trace,
-            &total_us, &compile_us);
+        if (runtime->game_audio_internal_slots) {
+            evaluated = audio_slots_initialize(runtime);
+        }
+#ifdef TILEFINCH_GAME_AUDIO_REFERENCE
+        else {
+            JSValue global = JS_GetGlobalObject(runtime->context);
+            bool ready = !JS_IsException(global)
+                && js_rt_install_function(runtime->context, global,
+                       "__tilefinchGameAudioDecode", js_game_audio_decode, 1)
+                && js_rt_install_function(runtime->context, global,
+                       "__tilefinchGameAudioCommand", js_game_audio_command, 11);
+            if (ready) evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_game_audio,
+                             browser_bootstrap_game_audio_bytecode),
+                "<browser-game-audio-lazy>",
+                &browser_bootstrap_game_audio_bytecode, false, trace,
+                &total_us, &compile_us);
+            JS_FreeValue(runtime->context, global);
+        }
+#endif
     } else if (feature == LAZY_BOOTSTRAP_WEBGL) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -772,12 +980,32 @@ static bool runtime_load_lazy_bootstrap(
             &browser_bootstrap_capabilities_bytecode,
             false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_INTL) {
+        /* Hand intl.js the time zone Date's local time uses through a
+           temporary global, deleted as soon as the module has captured it. */
+        char time_zone[64];
+        js_rt_default_time_zone(&runtime->bridge, time_zone,
+                                sizeof(time_zone));
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom zone_atom = JS_NewAtom(
+            runtime->context, "__tilefinchDefaultTimeZone");
+        if (!JS_IsException(global) && zone_atom != JS_ATOM_NULL) {
+            (void) JS_DefinePropertyValue(
+                runtime->context, global, zone_atom,
+                JS_NewString(runtime->context, time_zone),
+                JS_PROP_CONFIGURABLE);
+        }
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
                          browser_bootstrap_intl,
                          browser_bootstrap_intl_bytecode),
             "<browser-intl-lazy>", &browser_bootstrap_intl_bytecode,
             false, trace, &total_us, &compile_us);
+        if (zone_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(
+                runtime->context, global, zone_atom, 0);
+            JS_FreeAtom(runtime->context, zone_atom);
+        }
+        JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_TRAVERSAL) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -823,7 +1051,9 @@ static bool runtime_load_lazy_bootstrap(
         }
         JS_FreeValue(runtime->context, global);
     }
-    if (evaluated && feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
+#ifdef TILEFINCH_GAME_AUDIO_REFERENCE
+    if (evaluated && feature == LAZY_BOOTSTRAP_GAME_AUDIO
+        && !runtime->game_audio_internal_slots) {
         JSValue global = JS_GetGlobalObject(runtime->context);
         runtime->game_audio_host_suspend = JS_GetPropertyStr(
             runtime->context, global,
@@ -861,6 +1091,7 @@ static bool runtime_load_lazy_bootstrap(
             evaluated = false;
         }
     }
+#endif
     *state = evaluated ? 2 : 3;
     if (evaluated) {
         js_rt_saturating_add_size(
@@ -874,6 +1105,20 @@ static bool runtime_load_lazy_bootstrap(
         (void) runtime_install_lazy_bootstrap_feature(runtime, feature);
     }
     return evaluated;
+}
+
+bool script_runtime_game_audio_status(
+    const ScriptRuntime *runtime, ScriptGameAudioStatus *status)
+{
+    if (status == NULL) return false;
+    *status = (ScriptGameAudioStatus) {0};
+    if (runtime == NULL) return false;
+    uint8_t state = runtime->lazy_bootstrap_state[LAZY_BOOTSTRAP_GAME_AUDIO];
+    status->selected_native = runtime->game_audio_internal_slots;
+    status->lazy_installed = state == 2;
+    status->native_present = runtime->game_audio_slots != NULL;
+    status->failed = state == 3;
+    return true;
 }
 
 static JSValue js_runtime_lazy_bootstrap_property(
@@ -915,7 +1160,15 @@ static JSValue js_runtime_lazy_bootstrap_property(
         JS_FreeValue(context, target);
         return result < 0 ? JS_EXCEPTION : JS_UNDEFINED;
     }
-    JSValue result = JS_GetPropertyStr(context, target, property->name);
+    /* A prototype accessor (document.fonts) reads with the original
+       receiver; the receiver does not matter for prototype methods. */
+    JSAtom atom = JS_NewAtom(context, property->name);
+    JSValue result = atom == JS_ATOM_NULL ? JS_EXCEPTION
+        : JS_GetPropertyInternal(
+              context, target, atom,
+              property->target == LAZY_BOOTSTRAP_GLOBAL ? target : this_value,
+              0);
+    if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
     JS_FreeValue(context, target);
     return result;
 }
@@ -1529,9 +1782,15 @@ static ScriptRuntime *script_runtime_create_internal(
     host->media_update = JS_UNDEFINED;
     host->page_visibility_host_apply = JS_UNDEFINED;
     host->fullscreen_host_exit = JS_UNDEFINED;
+    host->document_all_cache = JS_UNDEFINED;
     host->opfs_storage_manager = JS_UNDEFINED;
     host->game_audio_host_suspend = JS_UNDEFINED;
     host->game_audio_host_complete = JS_UNDEFINED;
+#ifdef TILEFINCH_GAME_AUDIO_REFERENCE
+    host->game_audio_internal_slots = options->game_audio_internal_slots;
+#else
+    host->game_audio_internal_slots = true;
+#endif
     host->function_to_string = JS_UNDEFINED;
     host->host_global = JS_UNDEFINED;
     for (size_t callback = 0; callback < SCRIPT_HOST_CALLBACK_COUNT;
@@ -1656,7 +1915,7 @@ static ScriptRuntime *script_runtime_create_internal(
 #elif defined(__SANITIZE_ADDRESS__)
     stack_limit = 4u * 1024u * 1024u;
 #endif
-    const char *stack_kib_value = getenv("TILEFINCH_JS_STACK_KB");
+    const char *stack_kib_value = tilefinch_lab_getenv("TILEFINCH_JS_STACK_KB");
     if (stack_kib_value != NULL && stack_kib_value[0] != '\0') {
         char *end = NULL;
         unsigned long stack_kib = strtoul(stack_kib_value, &end, 10);
@@ -1673,13 +1932,14 @@ static ScriptRuntime *script_runtime_create_internal(
         host->profile = budget_calloc(budget, 1, sizeof(*host->profile));
     }
     JS_SetGCHook(host->runtime, script_runtime_gc_hook, host);
+    JS_SetGCPacingHook(host->runtime, js_rt_gc_pacing, host);
     JS_SetLazyCompileHook(host->runtime, script_runtime_lazy_compile_hook,
                           host);
     /* The page runtime's thread owns the script split (script_split.h).
        TILEFINCH_SCRIPT_SPLIT=0 leaves it off and =1 keeps the timed kinds
        without the poll sample, to measure its own cost in one binary. */
     {
-        const char *split_mode = getenv("TILEFINCH_SCRIPT_SPLIT");
+        const char *split_mode = tilefinch_lab_getenv("TILEFINCH_SCRIPT_SPLIT");
         bool split_off = split_mode != NULL && strcmp(split_mode, "0") == 0;
         script_split_set_sampling(split_mode == NULL
                                   || strcmp(split_mode, "1") != 0);
@@ -1769,6 +2029,15 @@ static ScriptRuntime *script_runtime_create_internal(
         script_runtime_destroy(host);
         return NULL;
     }
+    if (!js_rt_bridge_node_table_init(
+            &host->bridge,
+            host->bridge.execution_policy.dom_handle_slot_capacity)) {
+        snprintf(result->error, sizeof(result->error),
+                 "could not allocate the DOM node handle table");
+        script_runtime_destroy(host);
+        return NULL;
+    }
+    host->result.dom_handle_slot_capacity = host->bridge.node_capacity;
     snprintf(host->bridge.referrer_policy,
              sizeof(host->bridge.referrer_policy), "%s",
              options->referrer_policy == NULL
@@ -1930,9 +2199,15 @@ static ScriptRuntime *script_runtime_create_internal(
                 host->context, (double) performance_time_origin_ms)) >= 0;
     }
     if (setup_ok) {
+        /* The realm reports its top-level document's identity, the same one
+           fetch_prepare_page_request() puts on that document's requests.
+           Worker navigators mirror this value. */
+        const char *site_user_agent =
+            site_identity_user_agent_override(host->top_level_url);
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchBrowserUserAgent",
-            JS_NewString(host->context, TILEFINCH_BROWSER_USER_AGENT)) >= 0;
+            JS_NewString(host->context, site_user_agent != NULL
+                ? site_user_agent : TILEFINCH_BROWSER_USER_AGENT)) >= 0;
     }
     if (setup_ok) {
         setup_ok = JS_SetPropertyStr(
@@ -1951,7 +2226,8 @@ static ScriptRuntime *script_runtime_create_internal(
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchDiagnosticMobileSafari",
             JS_NewBool(host->context,
-                getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL)) >= 0;
+                tilefinch_lab_getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI")
+                    != NULL)) >= 0;
     }
     if (setup_ok) {
         setup_ok = js_lazy_webpack_install(host, global);
@@ -1996,18 +2272,14 @@ static ScriptRuntime *script_runtime_create_internal(
                               (double) device_width
                               / (double) css_viewport_width)) >= 0;
     }
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* Host and validation realms only: the bootstrap then publishes its
+       test-only probes. hardening.js deletes this flag. */
     if (setup_ok) {
         setup_ok = JS_SetPropertyStr(
-            host->context, global, "__tilefinchTraceBase64",
-            JS_NewBool(host->context,
-                tilefinch_trace_base64())) >= 0;
+            host->context, global, "__tilefinchTestProbes", JS_TRUE) >= 0;
     }
-    if (setup_ok) {
-        setup_ok = JS_SetPropertyStr(
-            host->context, global, "__tilefinchTraceTasksEnabled",
-            JS_NewBool(host->context,
-                tilefinch_trace_tasks())) >= 0;
-    }
+#endif
     if (setup_ok) {
         setup_ok = JS_SetPropertyStr(
             host->context, global,
@@ -2021,6 +2293,10 @@ static ScriptRuntime *script_runtime_create_internal(
         setup_ok = js_rt_install_function(
                        host->context, global, "__tilefinchCssSupports",
                        js_css_supports, 2)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchFontShorthandValid",
+                       js_font_shorthand_valid, 1)
                    && js_rt_install_function(
                        host->context, global,
                        "__tilefinchCompileInlineEventHandler",
@@ -2060,7 +2336,7 @@ static ScriptRuntime *script_runtime_create_internal(
                        host->context, global,
                        "__tilefinchWasmSnapshotSource",
                        js_wasm_snapshot_source, 1)
-                   && (getenv("TILEFINCH_DISABLE_COMPRESSION_STREAMS") != NULL
+                   && (tilefinch_lab_getenv("TILEFINCH_DISABLE_COMPRESSION_STREAMS") != NULL
                        || js_rt_install_function(
                            host->context, global,
                            "__tilefinchCompressionRun", js_compression_run, 3))
@@ -2077,6 +2353,15 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchRegisterShadowRoot",
                                        js_dom_register_shadow_root, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchConstructedSheetText",
+                                       js_dom_constructed_sheet_text, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCssStatementEnds",
+                                       js_css_statement_ends, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchSetAdoptedSheets",
+                                       js_dom_set_adopted_sheets, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchMatches",
                                        js_dom_matches, 2)
@@ -2171,11 +2456,8 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchSetFullscreen",
                                        js_dom_set_fullscreen, 2)
                    && js_rt_install_function(host->context, global,
-                                       "__tilefinchGameAudioDecode",
-                                       js_game_audio_decode, 1)
-                   && js_rt_install_function(host->context, global,
-                                       "__tilefinchGameAudioCommand",
-                                       js_game_audio_command, 11)
+                                       "__tilefinchPageControlsNotice",
+                                       js_dom_page_controls_notice, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCanvasRasterRect",
                                        js_canvas_raster_rect, 13)
@@ -2185,9 +2467,7 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCanvasMeasureText",
                                        js_canvas_measure_text, 5)
-                   && js_rt_install_function(host->context, global,
-                                       "__tilefinchCanvasRasterText",
-                                       js_canvas_raster_text, 22)
+
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCanvasRasterPath",
                                        js_canvas_raster_path, 21)
@@ -2215,6 +2495,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchNamedElementIds",
                                        js_dom_named_element_ids, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchFrameHandles",
+                                       js_dom_frame_handles, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchContent",
                                        js_dom_content, 1)
@@ -2301,6 +2584,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchComputedStyleRead",
                                        js_computed_style_read, 3)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchRenderedText",
+                                       js_dom_rendered_text, 1)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchComputedStyleSupport",
                                        js_computed_style_support, 1)
                    && js_rt_install_function(host->context, global,
@@ -2384,6 +2670,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchSecureContext",
                                        js_secure_context, 0)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchDocumentDomainValid",
+                                       js_document_domain_valid, 2)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchDocumentURLRevision",
                                        js_document_url_revision, 0)
                    && js_rt_install_function(host->context, global,
@@ -2397,6 +2686,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchScriptAsyncAssigned",
                                        js_script_async_assigned, 1)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchElementNonce",
+                                       js_element_nonce, 2)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchCryptoRandomFill",
                                        js_crypto_random_fill, 1)
                    && js_rt_install_function(host->context, global,
@@ -2405,6 +2697,12 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDecodeUtf8Valid",
                                        js_utf8_decode_valid, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchEncodingName",
+                                       js_encoding_name, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchDecodeSingleByte",
+                                       js_decode_single_byte, 3)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchEncodeUtf8",
                                        js_utf8_encode, 1)
@@ -2521,23 +2819,6 @@ static ScriptRuntime *script_runtime_create_internal(
     if (setup_ok) {
         setup_ok = JS_SetPropertyStr(host->context, js_document, "title",
             JS_NewString(host->context, document->title == NULL ? "" : document->title)) >= 0;
-        JSAtom body_text_atom = JS_NewAtom(host->context, "bodyText");
-        JSValue body_text_getter = JS_NewCFunction(
-            host->context, js_document_body_text, "get bodyText", 0);
-        if (body_text_atom == JS_ATOM_NULL
-            || JS_IsException(body_text_getter)) {
-            if (!JS_IsException(body_text_getter)) {
-                JS_FreeValue(host->context, body_text_getter);
-            }
-            setup_ok = false;
-        } else if (JS_DefinePropertyGetSet(
-                       host->context, js_document, body_text_atom,
-                       body_text_getter, JS_UNDEFINED,
-                       JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) < 0) {
-            /* QuickJS consumes getter/setter values on this API path. */
-            setup_ok = false;
-        }
-        JS_FreeAtom(host->context, body_text_atom);
         if (setup_ok) {
             JSAtom current_script_atom = JS_NewAtom(
                 host->context, "currentScript");
@@ -2553,15 +2834,15 @@ static ScriptRuntime *script_runtime_create_internal(
             } else if (JS_DefinePropertyGetSet(
                            host->context, js_document,
                            current_script_atom, current_script_getter,
-                           JS_UNDEFINED, JS_PROP_ENUMERABLE) < 0) {
-                /* No configurable bit and no setter: author code can
-                   neither replace nor write the native execution scope. */
+                           JS_UNDEFINED,
+                           JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) < 0) {
+                /* No setter: author code cannot write the native execution
+                   scope. Configurable so the bootstrap can move it to
+                   Document.prototype, where WebIDL puts it (hardening.js). */
                 setup_ok = false;
             }
             JS_FreeAtom(host->context, current_script_atom);
         }
-        setup_ok = setup_ok && JS_SetPropertyStr(host->context, js_document, "nodeCount",
-            JS_NewInt64(host->context, (int64_t) document->node_count)) >= 0;
         if (setup_ok) {
             int property_result = JS_SetPropertyStr(host->context, global, "document",
                                                     js_document);
@@ -2570,6 +2851,22 @@ static ScriptRuntime *script_runtime_create_internal(
         }
     }
 
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    if (setup_ok) setup_ok = js_rt_install_function(
+        host->context, global, "__tilefinchValidationThreadCpuUs",
+        js_validation_thread_cpu_us, 0);
+    if (setup_ok) setup_ok = js_rt_install_function(
+        host->context, global, "__tilefinchValidationPhase",
+        js_validation_phase, 4);
+    if (setup_ok) setup_ok = js_rt_install_function(
+        host->context, global, "__tilefinchValidationRenderHistory",
+        js_validation_render_history, 1);
+#endif
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    if (setup_ok) setup_ok = js_rt_install_function(
+        host->context, global, "__tilefinchValidationHashBytes",
+        js_validation_hash_bytes, 3);
+#endif
     native_ready_ns = js_rt_monotonic_time_ns();
     if (setup_ok) setup_ok = js_rt_runtime_script_checkpoint(host, 1);
     bool evaluated = false;
@@ -2735,6 +3032,8 @@ static ScriptRuntime *script_runtime_create_internal(
                 false, trace_startup,
                 &bootstrap_total_us, &bootstrap_compile_us);
         }
+        if (evaluated)
+            evaluated = runtime_install_legacy_surface(host, global);
         if (evaluated) {
             host->page_scroll_apply = JS_GetPropertyStr(
                 host->context, global, "__tilefinchApplyPageScroll");
@@ -2881,6 +3180,15 @@ static ScriptRuntime *script_runtime_create_internal(
             JS_FreeAtom(host->context, visibility_query_atom);
             JS_FreeAtom(host->context, user_activation_atom);
         }
+#ifndef TILEFINCH_NO_TRACE
+        /* Lab-only site-census instrumentation (tools/site-census): run a
+           file in the top-level page realm before author code. A failing
+           probe is reported and never fails the page. */
+        if (evaluated && tilefinch_lab_init_script_path() != NULL
+            && host->document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL) {
+            runtime_evaluate_lab_init_script(host);
+        }
+#endif
         /* Trusted bootstrap may use dynamic compilation to construct bounded
            browser shims. Author code begins only after the native QuickJS
            gate adopts the document's CSP decision. Wrapping eval in page JS

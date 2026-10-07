@@ -234,18 +234,29 @@
     schedule(callback, delay, false, EMPTY_TIMER_ARGS, "platform-task", true);
   globalThis.__tilefinchScheduleReservedFrame = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame", true);
-  globalThis.setTimeout = scheduleTimeout;
-  globalThis.setInterval = scheduleInterval;
-  globalThis.clearTimeout = clear;
-  globalThis.clearInterval = clear;
-  globalThis.requestAnimationFrame = (callback) => {
-    if (typeof callback !== "function")
-      throw new TypeError("callback must be a function");
-    /* The dispatcher invokes animation-frame callbacks with exactly one
-       timestamp argument, so the author callback needs no adapter. */
-    return schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
-  };
-  globalThis.cancelAnimationFrame = clear;
+  /* The public timer functions are distinct objects whose name and length
+     match WebIDL (the optional timeout/handle arguments do not count), as
+     page scripts and fingerprinting probes read both. */
+  const setTimeout = (handler, timeout = 0, ...args) =>
+      schedule(handler, timeout, false, args, "timeout"),
+    setInterval = (handler, timeout = 0, ...args) =>
+      schedule(handler, timeout, true, args, "interval"),
+    clearTimeout = (id = 0) => clear(id),
+    clearInterval = (id = 0) => clear(id),
+    requestAnimationFrame = (callback) => {
+      if (typeof callback !== "function")
+        throw new TypeError("callback must be a function");
+      /* The dispatcher invokes animation-frame callbacks with exactly one
+         timestamp argument, so the author callback needs no adapter. */
+      return schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
+    },
+    cancelAnimationFrame = (handle) => clear(handle);
+  globalThis.setTimeout = setTimeout;
+  globalThis.setInterval = setInterval;
+  globalThis.clearTimeout = clearTimeout;
+  globalThis.clearInterval = clearInterval;
+  globalThis.requestAnimationFrame = requestAnimationFrame;
+  globalThis.cancelAnimationFrame = cancelAnimationFrame;
   globalThis.__tilefinchScheduleRenderObserver = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-observer");
   globalThis.__tilefinchScheduleRenderFixup = (callback) =>
@@ -552,7 +563,7 @@
     });
     globalThis.BroadcastChannel = BroadcastChannel;
   }
-  globalThis.requestIdleCallback = (callback, options = {}) => {
+  const requestIdleCallback = (callback, options = {}) => {
     if (typeof callback !== "function")
       throw new TypeError("callback required");
     const requested = now,
@@ -586,7 +597,9 @@
       "idle",
     );
   };
-  globalThis.cancelIdleCallback = clear;
+  const cancelIdleCallback = (handle) => clear(handle);
+  globalThis.requestIdleCallback = requestIdleCallback;
+  globalThis.cancelIdleCallback = cancelIdleCallback;
   {
     const listeners = new Map();
     const viewport = {
@@ -701,7 +714,7 @@
       visualViewport.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll")));
       return true;
     };
-    globalThis.scrollTo = (xOrOptions, y) => {
+    const scrollTo = (xOrOptions = undefined, y = undefined) => {
       const scrollingElement = document.scrollingElement,
         top =
           typeof xOrOptions === "object" && xOrOptions !== null
@@ -739,14 +752,17 @@
       };
       requestAnimationFrame(step);
     };
-    globalThis.scroll = (...args) => globalThis.scrollTo(...args);
-    globalThis.scrollBy = (xOrOptions, y) => {
-      const delta =
-        typeof xOrOptions === "object" && xOrOptions !== null
-          ? Number(xOrOptions.top) || 0
-          : Number(y) || 0;
-      globalThis.scrollTo({ top: pageTop + delta });
-    };
+    const scroll = (...args) => globalThis.scrollTo(...args),
+      scrollBy = (xOrOptions = undefined, y = undefined) => {
+        const delta =
+          typeof xOrOptions === "object" && xOrOptions !== null
+            ? Number(xOrOptions.top) || 0
+            : Number(y) || 0;
+        globalThis.scrollTo({ top: pageTop + delta });
+      };
+    globalThis.scrollTo = scrollTo;
+    globalThis.scroll = scroll;
+    globalThis.scrollBy = scrollBy;
   }
   globalThis.__tilefinchPumpTimers = (elapsed, maxCallbacks) => {
     if (usesSampledClock) currentSchedulerTime();
@@ -805,7 +821,6 @@
     }
     return ran;
   };
-  globalThis.__tilefinchPendingTimers = () => timers.length;
   /* Source-free native/lab liveness snapshot. Keep the returned tuple numeric
      and bounded so diagnostics never serialize callbacks, arguments, URLs, or
      challenge payloads. This is called only by the native diagnostic seam. */
@@ -832,25 +847,7 @@
       intervalCallbacks,
     ];
   };
-  globalThis.__tilefinchDescribeTimers = () =>
-    JSON.stringify({
-      now,
-      lastFramePost: globalThis.__tilefinchLastFramePost || null,
-      frameLifecycle: globalThis.__tilefinchFrameLifecycle || [],
-      uncaught: [...(globalThis.__tilefinchUncaughtErrors || [])].slice(-4),
-      timers: [...timers]
-        .sort((a, b) => a.due - b.due || a.id - b.id)
-        .slice(0, 16)
-        .map((timer) => ({
-          id: timer.id,
-          kind: timer.kind,
-          due: timer.due,
-          remaining: timer.due - now,
-          span: timer.span,
-          repeat: timer.repeat,
-          name: String(timer.callback.name || ""),
-        })),
-    });
+  const createBootstrapEvent = Document.prototype.createEvent;
   const trusted = globalThis.__tilefinchTrustedEvent,
     nonBubblingEventTypes = new Set([
       "focus", "blur", "load", "error", "scroll", "mouseenter",
@@ -977,7 +974,7 @@
     pointerCaptureTarget = null,
     pointerMarkupPossible =
       !!globalThis.__tilefinchPointerMarkupInitiallyPresent;
-  Element.prototype.setPointerCapture = function (pointerId) {
+  Element.prototype.setPointerCapture = function setPointerCapture(pointerId) {
     if (Number(pointerId) !== 1)
       throw new DOMException("Unknown pointer", "NotFoundError");
     if (pointerCaptureTarget === this) return;
@@ -988,12 +985,12 @@
     pointerCaptureTarget = this;
     this.dispatchEvent(tilefinchEvent("gotpointercapture", { pointerId: 1 }));
   };
-  Element.prototype.releasePointerCapture = function (pointerId) {
+  Element.prototype.releasePointerCapture = function releasePointerCapture(pointerId) {
     if (Number(pointerId) !== 1 || pointerCaptureTarget !== this) return;
     pointerCaptureTarget = null;
     this.dispatchEvent(tilefinchEvent("lostpointercapture", { pointerId: 1 }));
   };
-  Element.prototype.hasPointerCapture = function (pointerId) {
+  Element.prototype.hasPointerCapture = function hasPointerCapture(pointerId) {
     return Number(pointerId) === 1 && pointerCaptureTarget === this;
   };
   globalThis.__tilefinchPointerMarkupChanged = () => {
@@ -1207,6 +1204,14 @@
     const name = String(type);
     if (name === "input" && currentValue !== null) {
       globalThis.__tilefinchSyncNativeControlValue?.(target, currentValue);
+    }
+    /* Typed text first fires a cancelable textInput TextEvent, as in
+       Chrome; cancelling it cancels the insertion like beforeinput. */
+    if (name === "beforeinput" && String(inputType) === "insertText" &&
+        data !== null && String(data) !== "") {
+      const text = createBootstrapEvent.call(document, "TextEvent");
+      text.initTextEvent("textInput", true, true, globalThis, String(data));
+      if (!target.dispatchEvent(trusted(text))) return false;
     }
     return target.dispatchEvent(
       trusted(

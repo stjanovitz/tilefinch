@@ -94,6 +94,14 @@ int test_background_interruption_journey(void)
             /* Exercise the cancellable transaction even above the default
                optional-publication policy threshold. */
             config.fonts.maximum_publication_work_units = 0;
+            /* Relayout synchronously. With the default threshold, a page
+               whose commit layout took 150 ms of wall time relayouts as a
+               preview of the screens near the reader; a loaded host crossed
+               it, the font publication then made 14 layout checkpoints
+               instead of 149, and the input planned for checkpoint 19, 35
+               or 51 never arrived. Preview relayouts are not this test's
+               subject. */
+            config.relayout_preview_threshold_us = UINT64_MAX;
             CHECK(browser_config_set_font_paths(&config,
                 TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf",
                 TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Latin.ttf",

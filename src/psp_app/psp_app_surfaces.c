@@ -646,6 +646,21 @@ void psp_collections_sync_ui(
                 snprintf(surface->view.rows[rows].trailing,
                          sizeof(surface->view.rows[rows].trailing), "%s",
                          state);
+            } else if (item->type == OFFLINE_ITEM_WEB_APP
+                       && offline_library_app_needs_recompile(
+                              &offline_store->library, item->id, NULL)) {
+                /* Bytecode from an older engine: a cheap index check (or
+                   one header probe for entries from older builds). */
+                surface->view.rows[rows].needs_recompile = true;
+                snprintf(surface->view.rows[rows].trailing,
+                         sizeof(surface->view.rows[rows].trailing),
+                         "RECOMPILE");
+                snprintf(surface->download_detail[rows],
+                         sizeof(surface->download_detail[rows]),
+                         "Needs recompile for this browser  |  %s",
+                         item->source_url);
+                surface->view.rows[rows].detail =
+                    surface->download_detail[rows];
             } else {
                 psp_collections_format_bytes(
                     surface->view.rows[rows].trailing,

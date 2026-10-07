@@ -97,6 +97,19 @@ void clear_line_floats(LineState *line, ClearMode clear)
 void make_float_slot(LineState *line)
 {
     if (line->float_count < ACTIVE_FLOAT_LIMIT) return;
+    /* Floats that end at or above the current position can no longer
+       exclude, clear or bound anything placed from here on. Retire them
+       first: a page header's floats must not use up the slots of a list
+       of floats far below it, which then lost its own exclusions. */
+    size_t kept = 0;
+    for (size_t i = 0; i < line->float_count; i++) {
+        line->layout->performance.float_exclusion_probes++;
+        if (line->floats[i].bottom > line->y) {
+            line->floats[kept++] = line->floats[i];
+        }
+    }
+    line->float_count = kept;
+    if (kept < ACTIVE_FLOAT_LIMIT) return;
     int bottom = line->y;
     for (size_t i = 0; i < line->float_count; i++) {
         line->layout->performance.float_exclusion_probes++;
@@ -163,6 +176,16 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
     if (!definite_float_width && desired_width > containing_width) {
         desired_width = containing_width;
     }
+    /* CSS 2.1 10.4: max-width then min-width apply to the tentative
+       (declared or shrink-to-fit) width, with percentages of the
+       containing block. The exclusion must use that used width. */
+    {
+        int margins = style->margin.left + style->margin.right;
+        int border_box = constrain_border_box_width(
+            context, node, parent, style, containing_width,
+            desired_width - margins, NULL);
+        desired_width = border_box + margins;
+    }
     int available = line->right - line->start_x;
     while (desired_width > available) {
         int next_bottom = INT_MAX;
@@ -188,11 +211,16 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
         ? line->right - desired_width : line->start_x;
     int float_top = line->y;
     int float_bottom = float_top;
-    if (!layout_block(context, node, parent, float_x, float_top,
-                      desired_width, containing_height, true,
-                      &line->positioned_box, &float_bottom)) {
-        return false;
-    }
+    lxb_dom_node_t *saved_basis_node = context->percentage_basis_node;
+    int saved_basis_width = context->percentage_basis_width;
+    context->percentage_basis_node = node;
+    context->percentage_basis_width = containing_width;
+    bool placed = layout_block(context, node, parent, float_x, float_top,
+                               desired_width, containing_height, true,
+                               &line->positioned_box, &float_bottom);
+    context->percentage_basis_node = saved_basis_node;
+    context->percentage_basis_width = saved_basis_width;
+    if (!placed) return false;
     if (float_bottom <= float_top) float_bottom = float_top + 1;
     line->floats[line->float_count++] = (FloatExclusion) {
         .x = float_x,

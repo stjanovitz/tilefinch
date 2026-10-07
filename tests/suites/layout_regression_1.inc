@@ -16,6 +16,7 @@
 
     puts("test: bounded deep block, inline, and intrinsic layout stacks");
     CHECK(test_reuse_rejects_same_address_stylesheet_rebuild(&budget) == 0);
+    CHECK(test_reuse_selector_facts_memo(&budget) == 0);
     CHECK(test_reuse_preserves_generation_across_stylesheet_move(&budget)
           == 0);
     CHECK(test_has_attribute_dependency_classification(&budget) == 0);
@@ -66,6 +67,12 @@
     puts("test: HTML UA body margin and author spacing resets");
     CHECK(test_ua_body_spacing(&budget) == 0);
 
+    puts("test: a transparent stuck sticky bar shows no static copy");
+    CHECK(test_transparent_sticky_bar_has_no_ghost(&budget) == 0);
+
+    puts("test: a sticky box without top stays in flow");
+    CHECK(test_sticky_without_top_stays_in_flow(&budget) == 0);
+
     puts("test: inline replaced-element box model and decoration");
     CHECK(test_inline_replaced_box_model(&budget) == 0);
 
@@ -81,9 +88,12 @@
     CHECK(test_declared_failed_image_geometry_converges(&budget) == 0);
     puts("test: width-only failed flex images retain alt text height");
     CHECK(test_width_only_failed_image_in_flex_shows_alt(&budget) == 0);
+    puts("test: unloaded ratio images reserve their box; alt never overlaps");
+    CHECK(test_unloaded_image_reserves_ratio_box(&budget) == 0);
 
     puts("test: resumable authoritative layout is exact and transactional");
     CHECK(test_resumable_authoritative_layout(&budget) == 0);
+    CHECK(test_wrapped_flex_preview_stops_at_limit(&budget) == 0);
 
     puts("test: table column constraints, rowspan placement, and captions");
     CHECK(test_table_column_and_rowspan_construction(&budget) == 0);
@@ -274,6 +284,11 @@
     puts("test: box-shadow rasterizes a rounded analytic falloff");
     CHECK(test_box_shadow_raster(&budget) == 0);
 
+    puts("test: long custom properties paint Tailwind gradients and shadows");
+    CHECK(test_long_custom_property_paint(&budget) == 0);
+    puts("test: @property defaults paint Tailwind v4's registered gradient");
+    CHECK(test_registered_property_gradient_paint(&budget) == 0);
+
     puts("test: hostile box-shadow geometry stays raster-bounded");
     CHECK(test_box_shadow_hostile_clamp(&budget) == 0);
 
@@ -288,6 +303,8 @@
 
     puts("test: CSS table cells form an implicit row");
     CHECK(test_css_table_implicit_row(&budget) == 0);
+    CHECK(test_css_table_anonymous_row_width(&budget) == 0);
+    CHECK(test_noscript_renders_without_scripting(&budget) == 0);
 
     puts("test: end padding contributes once to scroll extent");
     CHECK(test_padding_scroll_extent(&budget) == 0);
@@ -301,6 +318,7 @@
     puts("test: conditional cascade layers and bounded CSS nesting");
     CHECK(test_modern_conditional_cascade(&budget) == 0);
     CHECK(test_bounded_container_queries(&budget) == 0);
+    CHECK(test_container_queries_one_pass(&budget) == 0);
     CHECK(test_bounded_multicolumn_blocks(&budget) == 0);
 
     puts("test: bounded large layout values and aspect products");

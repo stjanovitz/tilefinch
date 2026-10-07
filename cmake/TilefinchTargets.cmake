@@ -23,6 +23,14 @@ if(NOT PSP)
         tools/offline_library_fixture.c)
     target_link_libraries(tilefinch-offline-library-fixture
         PRIVATE tilefinch_core)
+    # Global camera motion between video frames for
+    # scripts/analyze-game-video.py (recorded PPSSPP gameplay).
+    add_executable(tilefinch-video-motion tools/video_motion.c)
+    if(NOT WIN32)
+        target_link_libraries(tilefinch-video-motion PRIVATE m)
+    endif()
+    # Short on-off-on blinks of small regions (the analyzer's blink check).
+    add_executable(tilefinch-video-blink tools/video_blink.c)
 endif()
 if(NOT PSP AND PSP_BROWSER_BUILD_HOST_MEDIA_LAB)
     find_package(PkgConfig QUIET)
@@ -112,6 +120,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 add_library(tilefinch_psp_ui STATIC
+    src/psp_basic_fallback.c
+    src/psp_reader_policy.c
     src/psp_ui.c
     src/psp_ui_action.c
     src/psp_ui_theme.c
@@ -161,7 +171,7 @@ if(PSP AND TILEFINCH_PSP_VALIDATION_LOG)
     # browser installs its logger callback only after the persistent sink is
     # ready, while other consumers leave it inert.
     target_compile_definitions(tilefinch_psp_display PRIVATE
-        TILEFINCH_PSP_LATCH_PROBE=1)
+        TILEFINCH_PSP_LATCH_PROBE=1 TILEFINCH_PSP_VALIDATION_LOG=1)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tilefinch_psp_display PRIVATE
@@ -391,9 +401,11 @@ if(PSP)
             src/psp_app/psp_app_input.c
             src/psp_app/psp_app_settings.c
             src/psp_app/psp_app_storage.c
+            src/psp_app/psp_app_heavy.c
             src/psp_app/psp_app_network.c
             src/psp_app/psp_app_page.c
             src/psp_app/psp_app_runtime.c
+            src/psp_canvas_ge.c
             src/psp_app/psp_app_surfaces.c
             src/psp_app/psp_app_youtube.c
             src/psp_app/psp_app_exit_handoff.c
@@ -438,6 +450,17 @@ if(PSP)
             tilefinch_psp_media_scale
             tilefinch_psp_media_present
             tilefinch_psp_app_support tilefinch_diagnostic_qr)
+        # newlib's integer-only printf cores are pulled in only by newlib
+        # itself (assert -> fiprintf, strftime -> sniprintf), while the
+        # browser already links the full _vfprintf_r and _svfprintf_r for its
+        # own printf/snprintf calls. The full cores print every integer-only
+        # format identically, so resolve the integer-only entry points to them
+        # instead of linking a second copy of each (11.5 KB of .text). Only the
+        # browser does this: in an image without its own printf, the alias
+        # would pull the larger core in.
+        target_link_options(psp-browser-script PRIVATE
+            "LINKER:--defsym=_vfiprintf_r=_vfprintf_r"
+            "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
         # Code-layout experiments (PERFORMANCE_LEDGER.md, "Profile-ordered
         # code layout"). Every function already has its own section
         # (-ffunction-sections), so a
@@ -642,7 +665,16 @@ if(PSP)
             # 1.3 KB of the old 4,500,000-byte limit.
             # Raised by 280,000 bytes (user-approved) for the -O2 JavaScript
             # engine (TilefinchDependencies.cmake): 4,548,332 -> 4,824,900.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4980000)
+            # Native AudioParam scheduling measured 5,001,716 bytes with all
+            # validation probes retained (previous image: 4,974,340). Its
+            # device component tests reduce scheduling CPU by 59-73%; whole
+            # gameplay qualification remains opt-in. Admit a user-approved
+            # 24 KiB validation-only increase; shipping keeps its own limit.
+            # Installed-app heap, deferred script source and recompile
+            # work plus the larger game menus measured 5,029,216 bytes in
+            # validation. The user approved a validation-only ceiling of
+            # 5,500,000 bytes (2026-10-04); shipping keeps its own limit.
+            set(TILEFINCH_PSP_TEXT_LIMIT 5500000)
         else()
             # Security-boundary retirement and private lazy Worker compiler
             # installation are native fail-closed paths.  Their measured
@@ -670,6 +702,45 @@ if(PSP)
                 "build, not a shippable image")
             set(TILEFINCH_PSP_TEXT_LIMIT ${PSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE})
         endif()
+        # Public struct layouts must not depend on defines private to one
+        # library (TILEFINCH_NO_TRACE is private to tilefinch_core; the PSP
+        # support libraries never see TILEFINCH_PSP_VALIDATION_LOG). Compile
+        # src/abi_layout_probe.c with each side's exact settings (never
+        # linked) and fail the browser build if any struct size or field
+        # offset differs from the core's.
+        set(_abi_probe_objects)
+        foreach(_abi_side IN ITEMS tilefinch_core tilefinch_psp_ui
+                tilefinch_psp_app_support psp-browser-script)
+            string(MAKE_C_IDENTIFIER "${_abi_side}" _abi_name)
+            set(_abi_probe tilefinch_abi_probe_${_abi_name})
+            add_library(${_abi_probe} OBJECT src/abi_layout_probe.c)
+            target_compile_definitions(${_abi_probe} PRIVATE
+                $<TARGET_PROPERTY:${_abi_side},COMPILE_DEFINITIONS>)
+            target_include_directories(${_abi_probe} PRIVATE
+                $<TARGET_PROPERTY:${_abi_side},INCLUDE_DIRECTORIES>)
+            target_compile_options(${_abi_probe} PRIVATE
+                $<TARGET_PROPERTY:${_abi_side},COMPILE_OPTIONS>)
+            # The core's dependencies install headers the probe includes.
+            add_dependencies(${_abi_probe} tilefinch_core)
+            if(_abi_side STREQUAL "tilefinch_core")
+                set(_abi_reference "$<TARGET_OBJECTS:${_abi_probe}>")
+            else()
+                list(APPEND _abi_probe_objects
+                    "$<TARGET_OBJECTS:${_abi_probe}>")
+            endif()
+            list(APPEND _abi_probe_targets ${_abi_probe})
+        endforeach()
+        list(JOIN _abi_probe_objects "|" _abi_consumers)
+        add_custom_target(tilefinch-abi-layout-check
+            COMMAND ${CMAKE_COMMAND}
+                -DPSP_NM=${CMAKE_NM}
+                "-DABI_REFERENCE=${_abi_reference}"
+                "-DABI_CONSUMERS=${_abi_consumers}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAbiLayout.cmake"
+            DEPENDS ${_abi_probe_targets}
+            COMMENT "Checking public struct layouts across PSP libraries"
+            VERBATIM)
+        add_dependencies(psp-browser-script tilefinch-abi-layout-check)
         add_custom_command(TARGET psp-browser-script POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 -DPSP_OBJDUMP=${TILEFINCH_PSP_OBJDUMP}
@@ -857,6 +928,11 @@ if(PSP)
         if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
             target_link_options(psp-browser-script-dev-prx PRIVATE ${_transport_probe_link_options})
         endif()
+        # The EBOOT's newlib printf aliases (see psp-browser-script above),
+        # so a host0: hardware run executes the same printf cores it does.
+        target_link_options(psp-browser-script-dev-prx PRIVATE
+            "LINKER:--defsym=_vfiprintf_r=_vfprintf_r"
+            "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
             # A target whose only sources are prebuilt objects has no language
             # to infer a linker from. The .elf name keeps this intermediate
             # from ever colliding with the EBOOT's own ELF, which every script

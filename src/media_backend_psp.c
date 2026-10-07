@@ -2425,9 +2425,23 @@ static int psp_media_emit_captured_picture(
     state->generation++;
     state->epoch = epoch;
     /* Publish enough ordering metadata with ME_WRITING for a concurrent take
-       to tell whether this conversion precedes an already-READY picture. The
-       values are repeated after success for clarity; a failed conversion
-       returns the slot to FREE and they are never consumed. */
+       to tell whether this conversion precedes an already-READY picture.
+
+       From the release below until this slot is FREE again, the ordering key
+       -- epoch, sequence, pts_us, duration_us -- is frozen: the browser
+       thread's psp_media_slot_take_index reads it with no other ordering
+       than that release, concurrently with the conversion. Storing it again
+       after the conversion, even with the same values, is a write racing
+       that read (it used to be "repeated after success for clarity", and
+       ThreadSanitizer reports it). Only fields a take never reads on a
+       ME_WRITING slot -- identity, signature, emitted_us and the extent
+       proof -- are written between ME_WRITING and READY.
+
+       A failed conversion publishes FREE and ends the job with an error;
+       the worker does not chain a prepared job behind an error, and a
+       prepared job is audio-only anyway, so the next store into this key
+       comes from a job the browser thread queues after any take that read
+       it. */
     state->sequence = backend->frame_sequence + UINT64_C(1);
     state->pts_us = timestamp.pts_us;
     state->duration_us = timestamp.duration_us;
@@ -2461,13 +2475,16 @@ static int psp_media_emit_captured_picture(
     }
     backend->frame_identity++;
     backend->frame_sequence++;
+    /* sequence, pts_us and duration_us already hold these values; see the
+       frozen-key note at the ME_WRITING publish above. */
     state->identity = backend->frame_identity;
-    state->sequence = backend->frame_sequence;
-    state->pts_us = timestamp.pts_us;
-    state->duration_us = timestamp.duration_us;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* Read only by the validation picture trace and its stage-signature
+       check (media_psp_backend_note_stage_signature). */
     state->signature = psp_media_surface_signature(
         backend->surfaces[write_slot], backend->decoded_width,
         backend->decoded_height, backend->frame_stride);
+#endif
     backend->stats.decoded_video_frames++;
     backend->stats.video_slot_conversions[write_slot]++;
     /* Segment two closes here: firmware returned this batch at

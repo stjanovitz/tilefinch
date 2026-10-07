@@ -20,7 +20,9 @@
  *   FIRST_SCREEN, SETTLED --- reader scrolled ---> FOLLOWING
  *   any ------------------- given up (memory) ---> ABANDONED
  *
- * A failed attempt leaves the phase unchanged.
+ * A failed attempt leaves the phase unchanged. An attempt that laid out
+ * but showed nothing in the viewport (empty) also leaves it unchanged, and
+ * backs the next first-screen attempt off (see below).
  */
 
 /* Rebuilds of a first screen that is still filling in. */
@@ -38,6 +40,17 @@
 #define PREVIEW_POLICY_EXTENSION_BYTES (4u * 1024u)
 #define PREVIEW_POLICY_EXTENSION_ELEMENTS 32u
 #define PREVIEW_POLICY_EXTENSION_ELEMENTS_LIMIT 4096u
+/* After an empty first-screen attempt (the viewport held only boxes, image
+   slots or nothing), the next one waits for this many more rendering
+   elements, doubled by each further empty attempt, or for the parsed body
+   to double. Re-laying out the same prefix shows the same nothing: a large
+   inline script or JSON blob can add megabytes without a single element,
+   and every attempt is a layout from the top plus the stylesheet
+   fingerprint. An empty attempt that already laid out past the first
+   screen (truncated at its limit) waits for the body to double: what
+   follows flows below the screen. */
+#define PREVIEW_POLICY_EMPTY_ELEMENTS 32u
+#define PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT (64u * 1024u)
 /* Admitted checks (past the stream's cheap gates) without new input. */
 #define PREVIEW_POLICY_CHECK_LIMIT 4u
 
@@ -76,6 +89,11 @@ typedef struct {
        not follow, say); the next waits for more body, at these bytes. */
     bool refused;
     size_t refused_bytes;
+    /* Empty first-screen attempts, and where the last one was. */
+    unsigned empty_attempts;
+    size_t empty_elements;
+    size_t empty_bytes;
+    size_t empty_wait_elements;
 } PreviewPolicy;
 
 typedef struct {
@@ -137,6 +155,12 @@ void preview_policy_painted(PreviewPolicy *policy,
                             const PreviewPaintResult *result,
                             int previous_content_end_y);
 void preview_policy_failed(PreviewPolicy *policy);
+/* The attempt laid out but nothing in the viewport could be shown.
+   closed_content_elements: the input's, when the attempt was decided;
+   covered: the layout reached its limit (the first screen is complete). */
+void preview_policy_empty(PreviewPolicy *policy,
+                          const PreviewDecision *decision,
+                          size_t closed_content_elements, bool covered);
 void preview_policy_abandon(PreviewPolicy *policy);
 /* Nothing has been painted or attempted, and more may still be. */
 bool preview_policy_awaiting_first(const PreviewPolicy *policy);

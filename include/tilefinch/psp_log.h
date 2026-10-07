@@ -44,6 +44,10 @@ int psp_log_printf(const char *format, ...)
     ;
 FILE *psp_log_file(void);
 bool psp_log_flush(bool synchronize_device);
+/* Validation timing window: retain routine output in bounded RAM. Explicit
+   crash/checkpoint flushes still work and are counted as contaminated windows. */
+bool psp_log_begin_timing_window(void);
+void psp_log_end_timing_window(void);
 bool psp_log_healthy(void);
 void psp_log_checkpoint(const char *name);
 void psp_log_emergency(const char *state);
@@ -79,6 +83,10 @@ void psp_log_finish(const char *outcome);
 #define psp_log_flush(synchronize_device) \
     (0 ? psp_log_flush(synchronize_device) : false)
 #define psp_log_healthy() (0 ? psp_log_healthy() : false)
+#define psp_log_begin_timing_window() \
+    (0 ? psp_log_begin_timing_window() : false)
+#define psp_log_end_timing_window() \
+    (0 ? psp_log_end_timing_window() : (void) 0)
 #define psp_log_checkpoint(name) (0 ? psp_log_checkpoint(name) : (void) 0)
 #define psp_log_emergency(state) (0 ? psp_log_emergency(state) : (void) 0)
 #define psp_log_finish(outcome) (0 ? psp_log_finish(outcome) : (void) 0)

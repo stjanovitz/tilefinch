@@ -116,6 +116,12 @@ case "$MODE" in
                     scenario="$ROOT/tests/input-scripts/$input_script"
                     if [ -f "$scenario" ]; then
                         cp "$scenario" "$BUILD_DIR/$input_script"
+                        for extension in mark.js until.js; do
+                            probe=${scenario%.*}.$extension
+                            if [ -f "$probe" ]; then
+                                cp "$probe" "$BUILD_DIR/${input_script%.*}.$extension"
+                            fi
+                        done
                     fi
                     ;;
             esac

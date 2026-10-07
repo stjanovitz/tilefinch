@@ -84,6 +84,14 @@ bytes. GTS still publishes the retained legacy R1 as
 334 of 426 tested origins, with 84 unreachable service/apex hosts, eight apex
 hostname mismatches, and no certificate-policy or missing-trust failures.
 
+The 0.1.29 refresh again leaves the 25 retained anchors unchanged. Twenty-one
+match the current Mozilla bundle; the four compatibility variants match the
+CA repositories listed above (GTS R1/R2, GlobalSign R1, and Microsoft TLS RSA
+G2). The native-Mbed-TLS census verified 329 of 426 origins, with 88
+unreachable service/apex hosts, nine apex hostname mismatches, and no
+certificate-policy or missing-trust failures. Neither verification policy
+nor the set of trusted anchors was relaxed.
+
 After the PSP dependency build has unpacked Mbed TLS, build its native client
 and run the live qualification against a current top-300 list, the
 signed-update hosts, and any locally available resource traces. The ranking is

@@ -223,6 +223,10 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
             return "TRYING LOWER VIDEO QUALITY...";
         case PSP_UI_ACTION_RECOVERY_RETURN:
             return "RETURNING TO LAST PAGE...";
+        case PSP_UI_ACTION_RECOVERY_BASIC:
+            return NULL;
+        case PSP_UI_ACTION_RECOVERY_RELOAD_BASIC:
+            return "RELOADING IN BASIC VIEW...";
         case PSP_UI_ACTION_OPEN_ADDRESS: return "OPENING ADDRESS INPUT...";
         case PSP_UI_ACTION_OPEN_FIND:
         case PSP_UI_ACTION_FIND_EDIT:
@@ -242,6 +246,9 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
             return "INSTALLING OFFLINE APP...";
         case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return NULL;
+        case PSP_UI_ACTION_RECOMPILE_OFFLINE_APP:
+            return "RECOMPILING OFFLINE APP...";
+        case PSP_UI_ACTION_OPEN_OFFLINE_APP_ANYWAY: return "OPENING...";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "OPENING OFFLINE LIBRARY...";
         case PSP_UI_ACTION_SHOW_DOWNLOADS: return "OPENING DOWNLOADS...";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "OPENING SCREENSHOTS...";

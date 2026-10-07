@@ -335,6 +335,12 @@ struct JSRuntime {
     /* Tilefinch: called with 1 before and 0 after JS_RunGC's collection. */
     void (*gc_hook)(void *opaque, int begin);
     void *gc_hook_opaque;
+    /* Tilefinch: chooses the next automatic-collection threshold after a
+       collection the allocation trigger ran (JS_SetGCPacingHook). */
+    JSGCPacingFunc *gc_pacing_hook;
+    void *gc_pacing_hook_opaque;
+    /* Tilefinch: why the running collection runs (JS_GC_CAUSE_*). */
+    uint8_t gc_cause;
     /* Tilefinch: called with 1 before and 0 after a lazy body's compile. */
     void (*lazy_compile_hook)(void *opaque, int begin);
     void *lazy_compile_hook_opaque;
@@ -392,6 +398,9 @@ struct JSRuntime {
     BOOL current_exception_is_uncatchable : 8;
     /* true if inside an out of memory error, to avoid recursing */
     BOOL in_out_of_memory : 8;
+    /* Tilefinch: JS_ThrowOutOfMemory calls, so a caller can tell that an
+       operation failed for lack of memory (see js_lazy_function_compile). */
+    uint32_t tf_out_of_memory_throws;
 
     struct JSStackFrame *current_stack_frame;
 
@@ -1964,6 +1973,7 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
         printf("GC: size=%" PRIu64 "\n",
                (uint64_t)rt->malloc_ctx.malloc_state.malloc_size);
 #endif
+        rt->gc_cause = JS_GC_CAUSE_THRESHOLD;
         JS_RunGC(rt);
         /* The embedding's next safe point may be after a long author task.
            Do not let automatic collection re-arm beyond its hard heap limit:
@@ -1979,8 +1989,15 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
         } else {
             growth = 0;
         }
-        rt->malloc_gc_threshold = growth > SIZE_MAX - live
+        size_t threshold = growth > SIZE_MAX - live
             ? SIZE_MAX : live + growth;
+        /* Near the cap that halving re-arms every few hundred KiB, each
+           time paying a full collection of the whole live graph. The
+           embedding may grow its limit or space collections out instead. */
+        if (rt->gc_pacing_hook)
+            threshold = rt->gc_pacing_hook(rt->gc_pacing_hook_opaque, live,
+                                           limit, threshold);
+        rt->malloc_gc_threshold = threshold;
     }
 }
 
@@ -4009,8 +4026,17 @@ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
             return __JS_AtomFromUInt32(n);
         }
     }
-    /* XXX: should generate an exception */
-    return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
+    /* Tilefinch: an atom table that cannot grow raises "out of memory"
+       (upstream: "XXX: should generate an exception"). Without it a
+       refused identifier in the parser's lookahead scan left no trace,
+       the scan misread the loop head, and the compile failed with a
+       SyntaxError (see js_parse_error_v()). */
+    {
+        JSAtom atom = __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
+        if (atom == JS_ATOM_NULL)
+            JS_ThrowOutOfMemory(ctx);
+        return atom;
+    }
 }
 
 /* XXX: optimize */
@@ -7666,6 +7692,7 @@ void JS_RunGC(JSRuntime *rt)
     JS_RunGCInternal(rt, TRUE);
     if (rt->gc_hook)
         rt->gc_hook(rt->gc_hook_opaque, 0);
+    rt->gc_cause = JS_GC_CAUSE_EXPLICIT;
 }
 
 /* Return false if not an object or if the object has already been
@@ -8687,6 +8714,7 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowInternalError(JSContext *c
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
+    rt->tf_out_of_memory_throws++;
     if (!rt->in_out_of_memory) {
         rt->in_out_of_memory = TRUE;
         JS_ThrowInternalError(ctx, "out of memory");
@@ -21487,6 +21515,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
                     p = JS_VALUE_GET_OBJ(sp[-3]);
                     idx = JS_VALUE_GET_INT(sp[-2]);
+                    if (unlikely(p->class_id == JS_CLASS_FLOAT32_ARRAY ||
+                                 p->class_id == JS_CLASS_FLOAT64_ARRAY)) {
+                        /* Numeric primitive conversion cannot run author code
+                           or detach/resize the view. Other values retain the
+                           full conversion-before-bounds-check path below. */
+                        uint32_t tag = JS_VALUE_GET_TAG(sp[-1]);
+                        if (idx < (uint32_t)p->u.array.count &&
+                            (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag))) {
+                            if (p->class_id == JS_CLASS_FLOAT32_ARRAY) {
+                                /* An int32 is exact in double; converting it
+                                   directly to float gives the same result and
+                                   avoids two soft-float helpers on Allegrex. */
+                                if (tag == JS_TAG_INT)
+                                    p->u.array.u.float_ptr[idx] =
+                                        (float)JS_VALUE_GET_INT(sp[-1]);
+                                else
+                                    p->u.array.u.float_ptr[idx] =
+                                        JS_VALUE_GET_FLOAT64(sp[-1]);
+                            } else {
+                                p->u.array.u.double_ptr[idx] = tag == JS_TAG_INT
+                                    ? (double)JS_VALUE_GET_INT(sp[-1])
+                                    : JS_VALUE_GET_FLOAT64(sp[-1]);
+                            }
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            BREAK;
+                        }
+                    }
                     if (unlikely(p->class_id != JS_CLASS_ARRAY))
                         goto put_array_el_slow_path;
                     if (unlikely(is_compact_array(p))) {
@@ -24030,6 +24086,9 @@ typedef struct JSFunctionDef {
     int scope_first;    /* index into vd->vars of first lexically scoped variable */
     int scope_size;     /* allocated size of fd->scopes array */
     int scope_count;    /* number of entries used in the fd->scopes array */
+    /* Tilefinch: scopes entered while the scope array could not grow (see
+       push_scope()); their pop_scope() calls undo nothing */
+    int scope_push_failures;
     JSVarScope *scopes;
     JSVarScope def_scope_array[4];
     int body_scope; /* scope of the body of the function or eval */
@@ -24151,6 +24210,9 @@ typedef struct JSParseState {
        next_token().  Zero or negative forces a poll on the next token. */
     uint32_t first_line_column;
     int interrupt_countdown;
+    /* Tilefinch: JSRuntime.tf_out_of_memory_throws when the parse began
+       (see js_parse_error_v()) */
+    uint32_t out_of_memory_throws;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -24402,6 +24464,19 @@ static int js_parse_error_v(JSParseState *s, const uint8_t *ptr, const char *fmt
 {
     JSContext *ctx = s->ctx;
     int line_num, col_num;
+    /* Tilefinch: once the function's bytecode buffer has lost a refused
+       allocation, the parser reads back what it emitted as OP_invalid and
+       reports it as the author's syntax ("invalid assignment left-hand
+       side"). The script is not wrong; the heap is full. Likewise once
+       any allocation of the parse was refused: the lookahead scan
+       (js_parse_skip_parens_token()) ignores a token it could not make,
+       an atom, and misreads the code that follows ("expected 'of' or 'in'
+       in for control expression"). */
+    if ((s->cur_func && dbuf_error(&s->cur_func->byte_code)) ||
+        ctx->rt->tf_out_of_memory_throws != s->out_of_memory_throws) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
     line_num = get_line_col(&col_num, s->buf_start, ptr - s->buf_start);
     if (line_num == 0)
         col_num += s->first_line_column;
@@ -26234,6 +26309,19 @@ static int push_scope(JSParseState *s) {
     if (s->cur_func) {
         JSFunctionDef *fd = s->cur_func;
         int scope = fd->scope_count;
+        /* Tilefinch: most callers do not check for failure. A scope that
+           could not be entered must not be left by the matching
+           pop_scope(), which would leave its parent instead and reach
+           scope -1 (emitted as scope 65535 and read back by get_lvalue()
+           and has_with_scope() far outside the scope array). Once a push
+           fails, the scopes nested in it are not entered either, so the
+           count of failed pushes unwinds in order; the lost growth fails
+           the compile with "out of memory" (the bytecode buffer is marked
+           failed). */
+        if (fd->scope_push_failures) {
+            fd->scope_push_failures++;
+            return -1;
+        }
         /* XXX: should check for scope overflow */
         if ((fd->scope_count + 1) > fd->scope_size) {
             int new_size;
@@ -26244,12 +26332,12 @@ static int push_scope(JSParseState *s) {
             if (fd->scopes == fd->def_scope_array) {
                 new_buf = js_realloc2(s->ctx, NULL, new_size * sizeof(*fd->scopes), &slack);
                 if (!new_buf)
-                    return -1;
+                    goto fail;
                 memcpy(new_buf, fd->scopes, fd->scope_count * sizeof(*fd->scopes));
             } else {
                 new_buf = js_realloc2(s->ctx, fd->scopes, new_size * sizeof(*fd->scopes), &slack);
                 if (!new_buf)
-                    return -1;
+                    goto fail;
             }
             new_size += slack / sizeof(*new_buf);
             fd->scopes = new_buf;
@@ -26261,6 +26349,10 @@ static int push_scope(JSParseState *s) {
         emit_op(s, OP_enter_scope);
         emit_u16(s, scope);
         return fd->scope_level = scope;
+    fail:
+        fd->scope_push_failures = 1;
+        dbuf_set_error(&fd->byte_code);
+        return -1;
     }
     return 0;
 }
@@ -26281,6 +26373,10 @@ static void pop_scope(JSParseState *s) {
         /* disable scoped variables */
         JSFunctionDef *fd = s->cur_func;
         int scope = fd->scope_level;
+        if (fd->scope_push_failures) {
+            fd->scope_push_failures--;
+            return;
+        }
         emit_op(s, OP_leave_scope);
         emit_u16(s, scope);
         fd->scope_level = fd->scopes[scope].parent;
@@ -27786,8 +27882,11 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         if (js_parse_class_default_ctor(s, class_flags & JS_DEFINE_CLASS_HAS_HERITAGE, &ctor_fd))
             goto fail;
     }
-    /* patch the constant pool index for the constructor */
-    put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
+    /* patch the constant pool index for the constructor (Tilefinch: not
+       if the bytecode lost a write, which may have been that operand; the
+       compile then fails with "out of memory") */
+    if (!dbuf_error(&fd->byte_code))
+        put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
 
     /* store the class source code in the constructor. */
     if (!fd->strip_source) {
@@ -27821,8 +27920,10 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                     goto fail;
             }
             /* patch the start of the function to enable the
-               OP_add_brand_instance code */
-            cf->fields_init_fd->byte_code.buf[cf->brand_push_pos] = OP_push_true;
+               OP_add_brand_instance code (Tilefinch: unless that opcode
+               was lost to a refused growth) */
+            if (!dbuf_error(&cf->fields_init_fd->byte_code))
+                cf->fields_init_fd->byte_code.buf[cf->brand_push_pos] = OP_push_true;
         }
 
         /* store the function to initialize the fields to that it can be
@@ -28920,7 +29021,9 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
         /* remove test and decrement label ref count */
         memset(s->cur_func->byte_code.buf + start_addr, OP_nop,
                assign_addr - start_addr);
-        s->cur_func->label_slots[label_parse].ref_count--;
+        /* (Tilefinch: -1 if the label could not be allocated) */
+        if (label_parse >= 0)
+            s->cur_func->label_slots[label_parse].ref_count--;
         has_initializer = FALSE;
     }
     return has_initializer;
@@ -30969,8 +31072,12 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
         int chunk_size = pos_expr - pos_next;
         int offset = bc->size - pos_next;
         int i;
-        if (dbuf_claim(bc, chunk_size))
+        /* (Tilefinch: not after a refused growth: label_cont may be the
+           -1 of a label that could not be allocated) */
+        if (dbuf_error(bc) || dbuf_claim(bc, chunk_size)) {
+            JS_ThrowOutOfMemory(s->ctx);
             return -1;
+        }
         dbuf_put(bc, bc->buf + pos_next, chunk_size);
         memset(bc->buf + pos_next, OP_nop, chunk_size);
         /* `next` part ends with a goto */
@@ -31376,8 +31483,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 int chunk_size = pos_body - pos_cont;
                 int offset = bc->size - pos_cont;
                 int i;
-                if (dbuf_claim(bc, chunk_size))
+                /* (Tilefinch: not after a refused growth: label_cont
+                   may be the -1 of a label that could not be allocated) */
+                if (dbuf_error(bc) || dbuf_claim(bc, chunk_size)) {
+                    JS_ThrowOutOfMemory(ctx);
                     goto fail;
+                }
                 dbuf_put(bc, bc->buf + pos_cont, chunk_size);
                 memset(bc->buf + pos_cont, OP_nop, chunk_size);
                 /* increment part ends with a goto */
@@ -31503,7 +31614,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             }
             if (js_parse_expect(s, '}'))
                 goto fail;
-            if (default_label_pos >= 0) {
+            /* Tilefinch: a lost label operand leaves default_label_pos on
+               earlier code; the compile fails with "out of memory" anyway */
+            if (default_label_pos >= 0 &&
+                !dbuf_error(&s->cur_func->byte_code)) {
                 /* Ugly patch for the `default` label, shameful and risky */
                 put_u32(s->cur_func->byte_code.buf + default_label_pos,
                         label_case);
@@ -37055,6 +37169,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     for (pos = 0; pos < bc_len; pos = pos_next) {
         int val;
+        /* Tilefinch: once the output has refused to grow, the addresses
+           recorded for relocations and short jumps no longer match it;
+           patching or moving by them writes past its end. */
+        if (unlikely(dbuf_error(&bc_out)))
+            goto fail;
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
@@ -37216,7 +37335,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     dbuf_putc(&bc_out, OP_if_false8 + (op - OP_if_false));
                     dbuf_putc(&bc_out, 0);
                     if (!add_reloc(ctx, ls, bc_out.size - 1, 1))
-                        goto fail;
+                        goto fail_next;
                     break;
                 }
                 if (diff < 32768 && op == OP_goto) {
@@ -37225,7 +37344,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     dbuf_putc(&bc_out, OP_goto16);
                     dbuf_put_u16(&bc_out, 0);
                     if (!add_reloc(ctx, ls, bc_out.size - 2, 2))
-                        goto fail;
+                        goto fail_next;
                     break;
                 }
             } else {
@@ -37251,7 +37370,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             if (ls->addr == -1) {
                 /* unresolved yet: create a new relocation entry */
                 if (!add_reloc(ctx, ls, bc_out.size - 4, 4))
-                    goto fail;
+                    goto fail_next;
             }
             break;
         case OP_with_get_var:
@@ -37285,7 +37404,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 if (ls->addr == -1) {
                     /* unresolved yet: create a new relocation entry */
                     if (!add_reloc(ctx, ls, bc_out.size - 4, 4))
-                        goto fail;
+                        goto fail_next;
                 }
                 dbuf_putc(&bc_out, is_with);
             }
@@ -37750,6 +37869,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
+    if (unlikely(dbuf_error(&bc_out)))
+        goto fail; /* pos == bc_len: the whole input was consumed */
     /* check that there were no missing labels */
     for(i = 0; i < s->label_count; i++) {
         assert(label_slots[i].first_reloc == NULL);
@@ -37843,14 +37964,37 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     dbuf_free(&s->byte_code);
     s->byte_code = bc_out;
     s->use_short_opcodes = TRUE;
-    if (dbuf_error(&s->byte_code)) {
+    if (dbuf_error(&s->byte_code) || dbuf_error(&s->pc2line)) {
         JS_ThrowOutOfMemory(ctx);
         return -1;
     }
     return 0;
+ fail_next:
+    /* the instruction at 'pos' was consumed: its atoms are in the output
+       or were released */
+    pos = pos_next;
  fail:
-    /* XXX: not safe */
-    dbuf_free(&bc_out);
+    /* Tilefinch: the input before 'pos' gave its atoms to the output (or
+       released them); the input from 'pos' on still owns its own. Keep the
+       output, which js_free_function_def() releases in short-opcode form,
+       and release the rest of the input here; the upstream code freed the
+       output and kept the whole input, releasing the atoms of the
+       instructions the optimizer had already dropped a second time. An
+       output that lost a growth only holds whole instructions up to the
+       refusal and fewer bytes after it than the refused write, so walking
+       it never reads an operand that was not written. */
+    for(i = 0; i < s->label_count; i++) {
+        for(re = label_slots[i].first_reloc; re != NULL; re = re_next) {
+            re_next = re->next;
+            js_free(ctx, re);
+        }
+        label_slots[i].first_reloc = NULL;
+    }
+    free_bytecode_atoms(ctx->rt, bc_buf + pos, bc_len - pos, FALSE);
+    dbuf_free(&s->byte_code);
+    s->byte_code = bc_out;
+    s->use_short_opcodes = TRUE;
+    JS_ThrowOutOfMemory(ctx);
     return -1;
 }
 
@@ -38394,8 +38538,13 @@ static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd)
     const uint8_t *buf_start = fd->get_line_col_cache->buf_start;
     DynBuf pc2line;
     int line_num, col_num, function_size;
+    uint32_t oom_throws = ctx->rt->tf_out_of_memory_throws;
 
-    if (js_lazy_resolve_variables(ctx, fd))
+    /* Tilefinch: variable resolution goes on after a closure variable
+       could not be added and records index -1 (see js_create_function());
+       the stub's closure variables would be wrong */
+    if (js_lazy_resolve_variables(ctx, fd) ||
+        ctx->rt->tf_out_of_memory_throws != oom_throws)
         goto fail;
 
     lz = js_mallocz(ctx, sizeof(*lz));
@@ -38509,6 +38658,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     int function_size, byte_code_offset, cpool_offset;
     int closure_var_offset, vardefs_offset;
     BOOL strip_var_debug;
+    uint32_t oom_throws;
     
     /* Parsing may have stopped between an opcode and its operands. */
     if (dbuf_error(&fd->byte_code)) {
@@ -38518,6 +38668,14 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
     /* recompute scope linkage */
     js_link_function_scopes(fd);
+
+    /* Tilefinch: the variable passes do not check every allocation. A
+       variable or closure variable that could not be added leaves its
+       index at -1, which is recorded (as a 16-bit operand, 65535) or used
+       as an index, and the function would compile with references far
+       outside its variable and closure tables. Any "out of memory" thrown
+       during those passes fails the compile instead. */
+    oom_throws = ctx->rt->tf_out_of_memory_throws;
 
     /* if the function contains an eval call, the closure variables
        are used to compile the eval and they must be ordered by scope,
@@ -38531,6 +38689,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         if (add_global_variables(ctx, fd))
             goto fail;
     } 
+    if (ctx->rt->tf_out_of_memory_throws != oom_throws)
+        goto fail;
 
     /* first create all the child functions */
     list_for_each_safe(el, el1, &fd->child_list) {
@@ -38539,6 +38699,13 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
         fd1 = list_entry(el, JSFunctionDef, link);
         cpool_idx = fd1->parent_cpool_idx;
+        if (cpool_idx < 0) {
+            /* Tilefinch: the parser could not grow the constant pool for
+               it (its OP_fclosure operand is -1 too); the store below would
+               write before the pool. fd1 is freed with fd. */
+            JS_ThrowOutOfMemory(ctx);
+            goto fail;
+        }
         js_share_child_function_source(ctx, fd, fd1);
         if (fd1->preparsed) {
             /* its body was skipped when it was found eligible; a direct
@@ -38573,7 +38740,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     }
 #endif
 
-    if (resolve_variables(ctx, fd))
+    /* (sharing a child's source above may fail harmlessly) */
+    oom_throws = ctx->rt->tf_out_of_memory_throws;
+    if (resolve_variables(ctx, fd) ||
+        ctx->rt->tf_out_of_memory_throws != oom_throws)
         goto fail;
 
 #if defined(DUMP_BYTECODE) && (DUMP_BYTECODE & 2)
@@ -38592,6 +38762,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         goto fail;
 
     if (compute_stack_size(ctx, fd, &stack_size) < 0)
+        goto fail;
+    if (ctx->rt->tf_out_of_memory_throws != oom_throws)
         goto fail;
 
     if (fd->strip_debug) {
@@ -38689,7 +38861,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         //DynBuf pc2line;
         //compute_pc2line_info(fd, &pc2line);
         //js_free(ctx, fd->line_number_slots)
-        b->debug.pc2line_buf = js_realloc(ctx, fd->pc2line.buf, fd->pc2line.size);
+        /* (Tilefinch: a refused shrink keeps the buffer; it must not
+           leave an exception behind a successful compile) */
+        b->debug.pc2line_buf = js_realloc_rt(ctx->rt, fd->pc2line.buf, fd->pc2line.size);
         if (!b->debug.pc2line_buf)
             b->debug.pc2line_buf = fd->pc2line.buf;
         b->debug.pc2line_len = fd->pc2line.size;
@@ -43083,6 +43257,7 @@ static void js_parse_init(JSContext *ctx, JSParseState *s,
     s->get_line_col_cache.col_num = first_line_column;
     s->first_line_column = first_line_column;
     s->interrupt_countdown = JS_PARSE_INTERRUPT_INTERVAL;
+    s->out_of_memory_throws = ctx->rt->tf_out_of_memory_throws;
 }
 
 static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
@@ -43401,6 +43576,7 @@ static int js_lazy_function_compile(JSContext *caller_ctx, JSFunctionBytecode *b
     BOOL skipped = FALSE, retry;
     const char *name, *message;
     int ret;
+    uint32_t out_of_memory_before = rt->tf_out_of_memory_throws;
 
     if (rt->lazy_compile_hook)
         rt->lazy_compile_hook(rt->lazy_compile_hook_opaque, 1);
@@ -43422,8 +43598,21 @@ static int js_lazy_function_compile(JSContext *caller_ctx, JSFunctionBytecode *b
             ret = js_lazy_function_compile1(caller_ctx, b, TRUE, &skipped);
         }
     }
-    if (ret < 0)
+    if (ret < 0) {
         rt->lazy_stats.compile_failures++;
+        /* Tilefinch: a call that could not compile for lack of memory fails
+           the way an interrupted execution does: uncatchably. The function
+           stays lazy, so the call was the page's only visible operation; a
+           page that catches and retries (React's render loop does) would
+           otherwise recompile it on every turn and never yield, with each
+           attempt refused again. The error still reads "out of memory", so
+           the embedder's exhausted-realm handling sees it. */
+        if (rt->tf_out_of_memory_throws != out_of_memory_before
+            && !JS_IsUninitialized(rt->current_exception)) {
+            rt->lazy_stats.memory_failures++;
+            JS_SetUncatchableException(caller_ctx, TRUE);
+        }
+    }
     if (rt->lazy_compile_hook)
         rt->lazy_compile_hook(rt->lazy_compile_hook_opaque, 0);
     return ret;
@@ -62545,8 +62734,10 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
                             "-%02d-%02dT", mon + 1, d);
             break;
         case 3:
+            /* Tilefinch: en-US shape ("10/1/2026"), matching
+               Intl.DateTimeFormat's default format. */
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "%02d/%02d/%0*d", mon + 1, d, 4 + (y < 0), y);
+                            "%d/%d/%0*d", mon + 1, d, 4 + (y < 0), y);
             if (part == 3) {
                 buf[pos++] = ',';
                 buf[pos++] = ' ';
@@ -62579,8 +62770,9 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
                             "%02d:%02d:%02d.%03dZ", h, m, s, ms);
             break;
         case 3:
+            /* Tilefinch: en-US shape ("9:05:00 AM"). */
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "%02d:%02d:%02d %cM", (h + 11) % 12 + 1, m, s,
+                            "%d:%02d:%02d %cM", (h + 11) % 12 + 1, m, s,
                             (h < 12) ? 'A' : 'P');
             break;
         }
@@ -68655,6 +68847,27 @@ void JS_SetGCHook(JSRuntime *rt, void (*hook)(void *opaque, int begin),
 {
     rt->gc_hook = hook;
     rt->gc_hook_opaque = opaque;
+}
+
+/* Tilefinch: choose the threshold automatic collection re-arms at after
+   each collection the allocation trigger runs. The hook receives the heap
+   left by that collection, the limit and the default threshold, and returns
+   the threshold to use. It may change the memory limit; it must not
+   allocate on or re-enter the runtime. */
+void JS_SetGCPacingHook(JSRuntime *rt, JSGCPacingFunc *hook, void *opaque)
+{
+    rt->gc_pacing_hook = hook;
+    rt->gc_pacing_hook_opaque = hook == NULL ? NULL : opaque;
+}
+
+size_t JS_GetGCThreshold(JSRuntime *rt)
+{
+    return rt->malloc_gc_threshold;
+}
+
+int JS_GetGCCause(JSRuntime *rt)
+{
+    return rt->gc_cause;
 }
 
 /* Tilefinch: observe first-call compiles of lazy function bodies, e.g. to

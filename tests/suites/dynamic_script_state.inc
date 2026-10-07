@@ -51,15 +51,18 @@ static bool test_native_script_element_state(Budget *budget)
         "<!doctype html><head></head><body></body>";
     static const char exercise[] =
         "globalThis.scriptStateEvents=[];"
+        /* As in browsers, currentScript is a read-only accessor on
+           Document.prototype: assignment is ignored, and the native
+           execution scope behind the getter cannot be written. */
         "const currentDescriptor=Object.getOwnPropertyDescriptor("
-        "document,'currentScript');"
-        "let redefineBlocked=false;try{Object.defineProperty(document,"
-        "'currentScript',{value:'poison'});}catch(error){redefineBlocked=true;}"
+        "Document.prototype,'currentScript');"
         "document.currentScript='poison';"
         "const currentProtected=currentDescriptor&&"
-        "currentDescriptor.configurable===false&&"
-        "currentDescriptor.set===undefined&&redefineBlocked&&"
-        "delete document.currentScript===false&&"
+        "!Object.getOwnPropertyDescriptor(document,'currentScript')&&"
+        "typeof currentDescriptor.get==='function'&&"
+        "currentDescriptor.get.name==='get currentScript'&&"
+        "currentDescriptor.set===undefined&&"
+        "delete document.currentScript===true&&"
         "document.currentScript===null;"
         "const crossScript=document.createElement('script'),"
         "crossLink=document.createElement('link');"

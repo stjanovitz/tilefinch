@@ -36,6 +36,10 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE:
             return "remember-reader-site-scale";
         case PSP_UI_SETTING_READER_AUTO_MODE: return "reader-auto-mode";
+        case PSP_UI_SETTING_BASIC_FALLBACK: return "basic-fallback";
+        case PSP_UI_SETTING_GLYPH_OFFERS: return "glyph-offers";
+        case PSP_UI_SETTING_GLYPH_OFFERS_RESET: return "glyph-offers-reset";
+        case PSP_UI_SETTING_HEAVY_PAGES: return "heavy-pages";
         case PSP_UI_SETTING_CUSTOM_HOMEPAGE: return "custom-homepage";
         case PSP_UI_SETTING_HISTORY: return "history";
         case PSP_UI_SETTING_RESTORE_LAST_PAGE: return "restore-last-page";
@@ -104,6 +108,8 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_SITE_STORAGE_SITE: return "site-storage-site";
         case PSP_UI_SETTING_SITE_STORAGE_LISTED:
             return "site-storage-listed";
+        case PSP_UI_SETTING_KEEP_COMPILED_SCRIPTS:
+            return "keep-compiled-scripts";
     }
     return "unknown";
 }
@@ -136,8 +142,10 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_FIND: return "find";
         case PSP_UI_SCREEN_STORAGE_SITE: return "storage-site";
         case PSP_UI_SCREEN_STORAGE_OFFER: return "storage-offer";
+        case PSP_UI_SCREEN_HEAVY_OFFER: return "heavy-offer";
         case PSP_UI_SCREEN_HOME: return "home";
         case PSP_UI_SCREEN_COLLECTIONS: return "collections";
+        case PSP_UI_SCREEN_GLYPH_OFFER: return "glyph-offer";
         case PSP_UI_SCREEN_DIAGNOSTIC_QR: return "diagnostic-qr";
     }
     return "unknown";

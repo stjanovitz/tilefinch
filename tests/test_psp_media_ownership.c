@@ -49,14 +49,21 @@ static void *slot_producer(void *opaque)
                         &stress->failed, memory_order_relaxed));
         if (chosen < 0) return NULL;
         PspMediaSurfaceSlot *slot = &stress->slots[chosen];
+        /* The same stores, in the same order, as
+           psp_media_emit_captured_picture: the ordering key before
+           ME_WRITING and never again while the slot is out of FREE, the rest
+           of the picture between ME_WRITING and READY. The consumer's take
+           reads the key of a ME_WRITING slot concurrently with the second
+           group, so under ThreadSanitizer this is what proves the split. */
         slot->generation++;
         slot->epoch = PSP_MEDIA_EPOCH_FIRST;
-        slot->identity = identity;
+        slot->sequence = identity;
         slot->pts_us = identity * UINT64_C(40000);
         slot->duration_us = UINT64_C(40000);
-        slot->sequence = identity;
         psp_media_slot_publish(slot, PSP_MEDIA_SLOT_ME_WRITING);
+        slot->identity = identity;
         slot->signature = picture_signature(identity);
+        slot->emitted_us = (uint32_t) identity;
         slot->canary_armed = true;
         slot->extent_validated = true;
         jitter((unsigned) identity);

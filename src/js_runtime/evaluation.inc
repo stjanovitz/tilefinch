@@ -12,6 +12,80 @@ static bool install_named_function(JSContext *context, JSValue global,
            && JS_SetPropertyStr(context, global, property_name, value) >= 0;
 }
 
+/* Author page code, as opposed to trusted bootstrap or diagnostic source:
+   what compile admission weighs and the site census counts. */
+static bool compile_kind_is_page(ScriptCompileSourceKind kind)
+{
+    return kind != SCRIPT_COMPILE_SOURCE_INTERNAL
+        && kind != SCRIPT_COMPILE_SOURCE_DIAGNOSTIC;
+}
+
+#ifndef TILEFINCH_NO_TRACE
+/* Site-census ledger (TILEFINCH_TRACE_CENSUS, tools/site-census): print a
+   bounded field as a double-quoted token with quotes and controls replaced,
+   so every ledger record stays one parseable line. */
+static void census_print_field(const char *text, size_t limit)
+{
+    putchar('"');
+    for (size_t i = 0; text != NULL && text[i] != '\0' && i < limit; i++) {
+        unsigned char c = (unsigned char) text[i];
+        putchar(c == '"' ? '\'' : (c < 0x20u || c == 0x7fu) ? ' ' : (int) c);
+    }
+    putchar('"');
+}
+
+static const char *census_kind_name(ScriptCompileSourceKind kind)
+{
+    switch (kind) {
+    case SCRIPT_COMPILE_SOURCE_INLINE: return "inline";
+    case SCRIPT_COMPILE_SOURCE_EXTERNAL: return "external";
+    case SCRIPT_COMPILE_SOURCE_MODULE: return "module";
+    case SCRIPT_COMPILE_SOURCE_LAZY_FACTORY: return "lazy-factory";
+    case SCRIPT_COMPILE_SOURCE_DIAGNOSTIC: return "diagnostic";
+    case SCRIPT_COMPILE_SOURCE_INTERNAL:
+    default: return "internal";
+    }
+}
+
+static void census_print_script_event(const char *event, const char *kind,
+                                      const char *name, size_t bytes,
+                                      uint64_t started_us, uint64_t us,
+                                      bool ok)
+{
+    printf("census-js event=%s kind=%s bytes=%zu us=%llu t=%llu ok=%s name=",
+           event, kind, bytes, (unsigned long long) us,
+           (unsigned long long) started_us, ok ? "yes" : "no");
+    census_print_field(name == NULL ? "<script>" : name, 300);
+    putchar('\n');
+}
+
+/* `text` is "message\nstack...": print the message and the first stack
+   frame (the throwing location) as separate fields. */
+static void census_print_error(const char *record, const char *text)
+{
+    if (text == NULL) text = "";
+    const char *newline = strchr(text, '\n');
+    size_t message_length = newline == NULL ? strlen(text)
+                                            : (size_t) (newline - text);
+    char message[301];
+    if (message_length > sizeof(message) - 1) message_length = sizeof(message) - 1;
+    memcpy(message, text, message_length);
+    message[message_length] = '\0';
+    const char *where = newline == NULL ? "" : newline + 1;
+    while (*where == ' ') where++;
+    char frame[241];
+    size_t frame_length = strcspn(where, "\n");
+    if (frame_length > sizeof(frame) - 1) frame_length = sizeof(frame) - 1;
+    memcpy(frame, where, frame_length);
+    frame[frame_length] = '\0';
+    printf("%s message=", record);
+    census_print_field(message, sizeof(message) - 1);
+    printf(" where=");
+    census_print_field(frame, sizeof(frame) - 1);
+    putchar('\n');
+}
+#endif
+
 static uint64_t wall_time_ms(void)
 {
     return tilefinch_platform_wall_time_ns() / UINT64_C(1000000);
@@ -258,6 +332,8 @@ typedef struct {
 static ScriptProfileNative script_profile_natives[SCRIPT_PROFILE_NATIVES];
 static size_t script_profile_native_count;
 
+static size_t script_runtime_current_limit(const ScriptRuntime *runtime);
+
 /* Installed on every realm: records the heap left after each collection
    (the live graph that collection pacing grows from) and times collections
    for the profiler. Allocation-free. */
@@ -269,10 +345,41 @@ static void script_runtime_gc_hook(void *opaque, int begin)
     static unsigned gc_split = SCRIPT_SPLIT_KIND_COUNT + 1u;
     if (begin) gc_split = script_split_enter(SCRIPT_SPLIT_GC);
     else script_split_leave(gc_split);
+    if (begin) {
+        owner->gc_live_before = owner->quickjs_pool == NULL ? 0
+            : budget_quickjs_pool_js_malloc_current(owner->quickjs_pool);
+    }
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    if (begin) {
+        owner->gc_begin_ns = js_rt_monotonic_time_ns();
+    } else if (owner->gc_begin_ns != 0) {
+        uint64_t now = js_rt_monotonic_time_ns();
+        if (now > owner->gc_begin_ns)
+            owner->gc_total_ns += now - owner->gc_begin_ns;
+    }
+#endif
     if (!begin && owner->quickjs_pool != NULL) {
         owner->heap_live_after_gc =
             budget_quickjs_pool_js_malloc_current(owner->quickjs_pool);
         owner->heap_collections++;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+        if (JS_GetGCCause(owner->runtime) == JS_GC_CAUSE_THRESHOLD)
+            owner->gc_threshold_collections++;
+#endif
+#if !defined(TILEFINCH_NO_TRACE) && defined(PSP_BROWSER_BELLARD_QUICKJS)
+        if (tilefinch_trace_gc()) {
+            uint64_t now = js_rt_monotonic_time_ns();
+            fprintf(stderr,
+                    "tilefinch-gc n=%zu cause=%d before=%zu after=%zu "
+                    "limit=%zu threshold=%zu us=%llu\n",
+                    owner->heap_collections, JS_GetGCCause(owner->runtime),
+                    owner->gc_live_before, owner->heap_live_after_gc,
+                    script_runtime_current_limit(owner),
+                    JS_GetGCThreshold(owner->runtime),
+                    (unsigned long long) (now > owner->gc_begin_ns
+                        ? (now - owner->gc_begin_ns) / UINT64_C(1000) : 0));
+        }
+#endif
     }
     struct ScriptProfile *profile = owner->profile;
     if (profile == NULL) return;
@@ -1433,6 +1540,10 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
         JS_FreeCString(context, stack);
     }
     JS_FreeValue(context, stack_value);
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_census()) census_print_error("census-exception",
+                                                     result->error);
+#endif
     JSValue global = JS_GetGlobalObject(context);
     JSValue selector_value = JS_GetPropertyStr(
         context, global, "__tilefinchLastMissingSelector");
@@ -1534,6 +1645,9 @@ static void promise_rejection_tracker(JSContext *context,
     if (result == NULL) return;
     void *identity = JS_VALUE_GET_PTR(promise);
     if (is_handled) {
+#ifndef TILEFINCH_NO_TRACE
+        if (tilefinch_trace_census()) puts("census-rejection-handled");
+#endif
         js_rt_saturating_add_size(&result->promise_rejections_handled, 1);
         for (size_t i = 0; i < state->count; i++) {
             if (state->promises[i] != identity) continue;
@@ -1626,6 +1740,12 @@ static void promise_rejection_tracker(JSContext *context,
                 result->promise_rejections,
                 result->promise_rejections_undefined);
     }
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_census()) {
+        census_print_error("census-rejection",
+                           result->last_promise_rejection);
+    }
+#endif
     JS_FreeValue(context, stack_value);
 }
 
@@ -1830,6 +1950,44 @@ static bool js_rt_compile_source_admitted(
         }
         return false;
     }
+    /* A page unit whose smallest measured compile working set does not fit
+       the heap the realm can still reach cannot compile: refuse it before
+       spending the compile time (script_admission.h). Larger, likely peaks
+       are left to the heap limit itself (js_rt_compile_source_type). */
+    ScriptRuntime *owner = bridge == NULL ? NULL : bridge->host;
+    if (owner != NULL && owner->runtime != NULL
+        && compile_kind_is_page(source_kind)
+        && length >= SCRIPT_ADMISSION_FLOOR_MINIMUM_UNIT_BYTES) {
+        size_t floor_bytes = script_admission_compile_floor(length);
+        size_t available = script_runtime_heap_available(owner);
+        /* Collect before refusing only when enough has been allocated
+           since the last collection for it to free something
+           (js_rt_gc_due): a page refusing one large unit after another
+           would otherwise mark its whole heap for each. */
+        if (floor_bytes > available && js_rt_gc_due(owner)) {
+            JS_RunGC(owner->runtime);
+            available = script_runtime_heap_available(owner);
+        }
+        if (floor_bytes > available) {
+            if (result != NULL) {
+                result->last_compile_admission =
+                    SCRIPT_COMPILE_ADMISSION_REJECTED_MEMORY;
+                js_rt_saturating_add_size(&result->host_compile_rejections, 1);
+                js_rt_saturating_add_size(
+                    &result->host_compile_memory_refusals, 1);
+                js_rt_saturating_add_size(
+                    &result->host_compile_memory_refused_bytes, length);
+                script_runtime_note_oversized_script(owner, length);
+                snprintf(result->error, sizeof(result->error),
+                         "JavaScript source rejected before compile: "
+                         "%s has %zu bytes; compiling it needs at least "
+                         "%zu bytes of script memory and %zu are free",
+                         name == NULL ? "<script>" : name, length,
+                         floor_bytes, available);
+            }
+            return false;
+        }
+    }
     uint64_t projected_limit_us = bridge == NULL ? 0
         : bridge->execution_policy.maximum_host_compile_projected_us;
     size_t modeled_rate = bridge == NULL ? 0
@@ -1901,6 +2059,9 @@ bool js_rt_evaluate_compiled_source(
     }
     BudgetAllocationOwner previous_owner =
         bridge_document_owner_enter(bridge);
+#ifndef TILEFINCH_NO_TRACE
+    uint64_t census_started_us = tilefinch_platform_monotonic_time_us();
+#endif
     unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
     unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
     script_profile_enter(bridge == NULL ? NULL : bridge->host);
@@ -1909,6 +2070,14 @@ bool js_rt_evaluate_compiled_source(
     script_split_leave(split);
     work_ledger_leave(ledger);
     bridge_document_owner_leave(bridge, previous_owner);
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_census()) {
+        census_print_script_event(
+            "execute", "classic", name, source_length, census_started_us,
+            tilefinch_platform_monotonic_time_us() - census_started_us,
+            !JS_IsException(compiled));
+    }
+#endif
     if (JS_IsException(compiled)) {
         JS_FreeValue(context, compiled);
         js_rt_record_exception(context, result);
@@ -1969,7 +2138,7 @@ static bool script_lazy_function_preparse(void)
     static bool resolved = false;
     static bool enabled = true;
     if (!resolved) {
-        const char *value = getenv("TILEFINCH_JS_PREPARSE");
+        const char *value = tilefinch_lab_getenv("TILEFINCH_JS_PREPARSE");
         if (value != NULL && strcmp(value, "0") == 0) enabled = false;
         resolved = true;
     }
@@ -2007,14 +2176,18 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
        This is a collection heuristic, not an admission guarantee: the hard
        heap limit still governs every allocation. Keep a 64 KiB minimum for
        parser overhead and the existing 1 MiB maximum; saturate before size
-       multiplication. Do not retry an already executed script. */
-    const size_t gc_minimum = 64u * 1024u;
-    const size_t gc_maximum = 1024u * 1024u;
-    size_t gc_reserve = length >= (gc_maximum - gc_minimum) / 16u
-        ? gc_maximum : gc_minimum + length * 16u;
+       multiplication. Do not retry an already executed script. While
+       growth the page Budget can still grant covers the reserve, the
+       collection is only in case it helps: it waits until enough has been
+       allocated since the last one to pay for it (js_rt_gc_due), or a heap
+       near its limit collects before every compile. */
+    size_t gc_reserve = script_admission_work_reserve(
+        length, SCRIPT_ADMISSION_GC_HEAP_MULTIPLIER, 1024u * 1024u);
     if (source_kind == SCRIPT_COMPILE_SOURCE_EXTERNAL && bridge != NULL
         && bridge->host != NULL
-        && script_runtime_heap_remaining(bridge->host) < gc_reserve) {
+        && script_runtime_heap_remaining(bridge->host) < gc_reserve
+        && (script_runtime_heap_available(bridge->host) < gc_reserve
+            || js_rt_gc_due(bridge->host))) {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t gc_started = js_rt_monotonic_time_ns();
         size_t remaining_before = script_runtime_heap_remaining(bridge->host);
@@ -2047,6 +2220,9 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
     script_profile_enter(profile_owner);
     if (profile_owner != NULL && profile_owner->profile != NULL)
         profile_owner->profile->compile_depth++;
+    size_t heap_rejections_before =
+        profile_owner == NULL || profile_owner->quickjs_pool == NULL ? 0
+        : budget_quickjs_pool_rejection_count(profile_owner->quickjs_pool);
     JSValue value = JS_Eval(
         context, source, length, name == NULL ? "<script>" : name,
         evaluation_type | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -2061,6 +2237,57 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
     uint64_t compile_finished = js_rt_monotonic_time_ns();
     uint64_t compile_us = compile_finished >= compile_started
         ? (compile_finished - compile_started) / UINT64_C(1000) : 0;
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_census() && compile_kind_is_page(source_kind)) {
+        census_print_script_event(
+            "compile", census_kind_name(source_kind), name, length,
+            compile_started / UINT64_C(1000), compile_us,
+            !JS_IsException(value));
+    }
+#endif
+    /* A page compile that ran into the realm's heap limit (its working set
+       was larger than the median the loader planned on; 10 times the source
+       has been measured) is abandoned like a compile refused for memory: no
+       author code ran, the parser has freed what it held, and the realm is
+       intact, so it must not read as the realm exhausting its memory
+       (navigation_retire_exhausted_script_realms). The heap rejections it
+       caused are absorbed from that count. */
+    size_t heap_rejections_after =
+        profile_owner == NULL || profile_owner->quickjs_pool == NULL ? 0
+        : budget_quickjs_pool_rejection_count(profile_owner->quickjs_pool);
+    if (JS_IsException(value) && compile_kind_is_page(source_kind)
+        && heap_rejections_after > heap_rejections_before
+        && !(profile_owner->watchdog.interrupted)) {
+        JS_FreeValue(context, JS_GetException(context));
+        profile_owner->compile_heap_rejections_absorbed +=
+            heap_rejections_after - heap_rejections_before;
+        JS_RunGC(js_runtime);
+        if (result != NULL) {
+            result->last_compile_admission =
+                SCRIPT_COMPILE_ADMISSION_REJECTED_MEMORY;
+            js_rt_saturating_add_size(&result->host_compile_rejections, 1);
+            js_rt_saturating_add_size(&result->host_compile_memory_refusals, 1);
+            js_rt_saturating_add_size(
+                &result->host_compile_memory_refused_bytes, length);
+            js_rt_saturating_add_size(&result->host_compile_memory_abandoned,
+                                      1);
+            script_runtime_note_oversized_script(profile_owner, length);
+            snprintf(result->error, sizeof(result->error),
+                     "JavaScript source rejected while compiling: %s has "
+                     "%zu bytes and needs more script memory to compile "
+                     "than the page has free",
+                     name == NULL ? "<script>" : name, length);
+        }
+        if (admitted != NULL) *admitted = false;
+        if (result != NULL) {
+            js_rt_saturating_add_u64(&result->host_compile_total_us,
+                                     compile_us);
+        }
+        script_residency_trace_compile(
+            js_runtime, name, length, source_kind, residency_before,
+            false, false);
+        return JS_EXCEPTION;
+    }
     /* The parser polls the watchdog's interrupt handler, so an admitted
        compile can now end early through the normal parse-error unwind.
        Record the truthful classification; the elapsed slice still counts
@@ -2120,6 +2347,8 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
            the runtime-owned copy registered above for import.meta as well. */
         base = js_rt_runtime_module_base_lookup(runtime, name);
         if (base == NULL) return false;
+        js_rt_runtime_module_csp_grant_set(
+            runtime, name, bridge->current_script_csp_grant);
         if (!js_rt_runtime_module_root_state_set(
                 runtime, name, SCRIPT_MODULE_MAP_LOADING)) return false;
     }
@@ -2127,7 +2356,8 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
     uint64_t compile_started_us = tilefinch_platform_monotonic_time_us();
     JSValue value = module && external_module
         ? js_rt_module_compile_external(
-            runtime, context, source, length, name, base, result, &admitted)
+            runtime, context, source, length, name, base,
+            runtime->module_root_no_store, result, &admitted)
         : js_rt_compile_source_type(
             context, source, length, name, evaluation_type, source_kind,
             result, &admitted);
@@ -2171,7 +2401,9 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
         runtime_configure_property_fault_trace(JS_GetRuntime(context));
     }
 #endif
+    bool census_executed = false;
     if (!JS_IsException(value)) {
+        census_executed = true;
         unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
         unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
         script_profile_enter(runtime);
@@ -2184,6 +2416,18 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
         result->execute_us[source_kind] +=
             tilefinch_platform_monotonic_time_us() - execute_started_us;
     }
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_census() && compile_kind_is_page(source_kind)
+        && census_executed) {
+        census_print_script_event(
+            "execute", census_kind_name(source_kind), name, length,
+            execute_started_us,
+            tilefinch_platform_monotonic_time_us() - execute_started_us,
+            !JS_IsException(value));
+    }
+#else
+    (void) census_executed;
+#endif
     bridge_document_owner_leave(bridge, previous_owner);
     if (JS_IsException(value)) {
         JS_FreeValue(context, value);
@@ -2397,6 +2641,18 @@ bool js_rt_current_script_scope_begin(JSContext *context,
                                 ScriptResult *result)
 {
     if (!document_current_script_get(context, previous, result)) return false;
+    DomBridge *grant_bridge = JS_GetContextOpaque(context);
+    if (grant_bridge != NULL) {
+        previous->csp_grant = grant_bridge->current_script_csp_grant;
+        const TilefinchContentSecurityPolicy *csp =
+            grant_bridge->document == NULL ? NULL
+            : &grant_bridge->document->content_security_policy;
+        grant_bridge->current_script_csp_grant =
+            csp == NULL || !csp->header_present || node == NULL ? 0
+            : tilefinch_csp_element_descendant_grant(
+                  csp, node, script_runtime_script_parser_inserted(
+                                 grant_bridge->host, node));
+    }
     bool set = module
         ? document_current_script_set(context, JS_NULL, result)
         : set_current_script(context, node, result);
@@ -2407,6 +2663,9 @@ bool js_rt_current_script_scope_begin(JSContext *context,
         if (bridge != NULL) {
             bridge->current_script_owner_document_identity =
                 previous->owner_document_identity;
+            /* A failed scope must not leave this script's CSP grant behind
+               for later classic import() calls. */
+            bridge->current_script_csp_grant = previous->csp_grant;
         }
         JS_FreeValue(context, previous->value);
         previous->value = JS_UNDEFINED;
@@ -2427,6 +2686,7 @@ bool js_rt_current_script_scope_end(JSContext *context,
         bridge->current_script_owner_document_identity =
             previous->owner_document_identity;
     }
+    if (bridge != NULL) bridge->current_script_csp_grant = previous->csp_grant;
     JS_FreeValue(context, previous->value);
     previous->value = JS_UNDEFINED;
     previous->owner_document_identity = 0;
@@ -2607,8 +2867,15 @@ FetchScheduler *script_runtime_fetch_scheduler(ScriptRuntime *runtime)
     if (runtime == NULL) return NULL;
     DomBridge *bridge = &runtime->bridge;
     if (bridge->fetch_scheduler == NULL) {
+        /* Room for SCRIPT_DYNAMIC_INFLIGHT_REQUESTS responses at the
+           realm's full source bound (see the constant). */
+        size_t pool = bridge->maximum_script_bytes;
+        pool = pool > SCRIPT_REALM_MAXIMUM_TOTAL_BYTES
+                          / SCRIPT_DYNAMIC_INFLIGHT_REQUESTS
+            ? SCRIPT_REALM_MAXIMUM_TOTAL_BYTES
+            : pool * SCRIPT_DYNAMIC_INFLIGHT_REQUESTS;
         bridge->fetch_scheduler = bridge_fetch_scheduler_create(
-            bridge, bridge->maximum_script_bytes);
+            bridge, pool);
     }
     return bridge->fetch_scheduler;
 }

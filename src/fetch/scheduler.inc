@@ -1961,6 +1961,12 @@ size_t fetch_scheduler_pump_bounded(
                     snprintf(item->result.error,
                              sizeof(item->result.error),
                              "HTTP replay body is corrupt");
+                } else if (item->writer.replay_limit_truncated) {
+                    item->result.response_limit_exceeded = true;
+                    snprintf(item->result.error,
+                             sizeof(item->result.error),
+                             "response quota exceeded");
+                    intact = false;
                 }
                 scheduled_mark_complete(
                     scheduler, item, intact,

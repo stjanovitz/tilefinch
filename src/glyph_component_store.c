@@ -13,6 +13,7 @@
 
 #include "tilefinch/glyph_component.h"
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/document.h"
 #include "tilefinch/sha256.h"
 
 #define GLYPH_INSTALL_IO_CHUNK (16u * 1024u)
@@ -25,30 +26,35 @@
 #define GLYPH_COMPONENT_ACTIVATED_MARKER "ACTIVATED"
 #define GLYPH_INSTALL_RECONCILE_ATTEMPTS 2u
 
+/* Published packs are about 1 MB each and color emoji about 5 MB
+   (docs/STORAGE.md). Bare Han cannot tell Simplified from Traditional
+   Chinese, so both Chinese packs list it; kana and Hangul are unambiguous. */
 static const TilefinchGlyphPackSpec glyph_specs[TILEFINCH_GLYPH_PACK_COUNT] = {
     {"glyph-ja", "Japanese", "tilefinch-glyph-ja-v1.tfgm",
-     "tilefinch-glyph-ja-v1.tfgf"},
+     "tilefinch-glyph-ja-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_JAPANESE, 1024u},
     {"glyph-zh-hans", "Simplified Chinese",
      "tilefinch-glyph-zh-hans-v1.tfgm",
-     "tilefinch-glyph-zh-hans-v1.tfgf"},
+     "tilefinch-glyph-zh-hans-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_HAN, 1024u},
     {"glyph-zh-hant", "Traditional Chinese",
      "tilefinch-glyph-zh-hant-v1.tfgm",
-     "tilefinch-glyph-zh-hant-v1.tfgf"},
+     "tilefinch-glyph-zh-hant-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_HAN, 1024u},
     {"glyph-ko", "Korean", "tilefinch-glyph-ko-v1.tfgm",
-     "tilefinch-glyph-ko-v1.tfgf"},
+     "tilefinch-glyph-ko-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_KOREAN, 1024u},
     {"glyph-emoji-color", "Color Emoji",
      "tilefinch-glyph-emoji-color-v1.tfgm",
-     "tilefinch-glyph-emoji-color-v1.tfgf"},
+     "tilefinch-glyph-emoji-color-v1.tfgf", 0u, 5120u},
     {"glyph-cyrillic", "Cyrillic",
      "tilefinch-glyph-cyrillic-v1.tfgm",
-     "tilefinch-glyph-cyrillic-v1.tfgf"},
+     "tilefinch-glyph-cyrillic-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_CYRILLIC,
+     1024u},
     {"glyph-latin-extended", "Extended Latin",
      "tilefinch-glyph-latin-extended-v1.tfgm",
-     "tilefinch-glyph-latin-extended-v1.tfgf"},
+     "tilefinch-glyph-latin-extended-v1.tfgf",
+     DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED, 1024u},
     {"glyph-arabic", "Arabic", "tilefinch-glyph-arabic-v1.tfgm",
-     "tilefinch-glyph-arabic-v1.tfgf"},
+     "tilefinch-glyph-arabic-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_ARABIC, 1024u},
     {"glyph-hebrew", "Hebrew", "tilefinch-glyph-hebrew-v1.tfgm",
-     "tilefinch-glyph-hebrew-v1.tfgf"}
+     "tilefinch-glyph-hebrew-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_HEBREW, 1024u}
 };
 
 const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(

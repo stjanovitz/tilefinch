@@ -766,6 +766,66 @@ static bool style_parse_color_with_alpha_depth(const Stylesheet *sheet,
                                                 uint8_t *alpha,
                                                 unsigned depth);
 
+/* CSS Color 4 <color-interpolation-method> at the start of `text`:
+   `in <colour space>`, and after a polar space an optional
+   `<hue-interpolation-method> hue`. Returns the length it spans (0 when
+   there is none, or it is malformed) and the space color_to_space mixes
+   in: 0 sRGB, 1 linear sRGB, 2 Oklab, 3 Lab. Spaces without their own
+   conversion use the nearest one: the XYZ spaces mix exactly as linear
+   sRGB (a linear transform of it), oklch and lch as their rectangular
+   forms (the hue arc is not followed), and the other RGB spaces, hsl and
+   hwb as sRGB. Shared by color-mix() and the gradient header, so both
+   accept the same grammar. */
+static size_t color_interpolation_method(const char *text, size_t length,
+                                         unsigned *space)
+{
+    static const struct {
+        const char *name;
+        uint8_t space;
+        bool polar;
+    } spaces[] = {
+        {"srgb", 0, false}, {"srgb-linear", 1, false},
+        {"display-p3", 0, false}, {"a98-rgb", 0, false},
+        {"prophoto-rgb", 0, false}, {"rec2020", 0, false},
+        {"xyz", 1, false}, {"xyz-d50", 1, false}, {"xyz-d65", 1, false},
+        {"oklab", 2, false}, {"lab", 3, false},
+        {"hsl", 0, true}, {"hwb", 0, true},
+        {"oklch", 2, true}, {"lch", 3, true}
+    };
+    const char *tokens[4];
+    size_t lengths[4];
+    size_t ends[4];
+    size_t count = 0;
+    for (size_t at = 0; count < 4;) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        if (at >= length) break;
+        size_t start = at;
+        while (at < length && !isspace((unsigned char) text[at])) at++;
+        tokens[count] = text + start;
+        lengths[count] = at - start;
+        ends[count++] = at;
+    }
+    if (count < 2 || !span_case_equal(tokens[0], lengths[0], "in"))
+        return 0;
+    size_t found = sizeof(spaces) / sizeof(spaces[0]);
+    for (size_t i = 0; i < sizeof(spaces) / sizeof(spaces[0]); i++) {
+        if (span_case_equal(tokens[1], lengths[1], spaces[i].name)) {
+            found = i;
+            break;
+        }
+    }
+    if (found == sizeof(spaces) / sizeof(spaces[0])) return 0;
+    *space = spaces[found].space;
+    if (spaces[found].polar && count >= 4
+        && span_case_equal(tokens[3], lengths[3], "hue")
+        && (span_case_equal(tokens[2], lengths[2], "shorter")
+            || span_case_equal(tokens[2], lengths[2], "longer")
+            || span_case_equal(tokens[2], lengths[2], "increasing")
+            || span_case_equal(tokens[2], lengths[2], "decreasing")))
+        return ends[3];
+    return ends[1];
+}
+
 static bool style_parse_color_mix(const Stylesheet *sheet, const char *value,
                                   uint32_t *color, uint8_t *alpha,
                                   unsigned depth)
@@ -788,16 +848,9 @@ static bool style_parse_color_mix(const Stylesheet *sheet, const char *value,
         size_t segment_length = end - start;
         trim(&segment, &segment_length);
         if (segment_index == 0) {
-            if (span_case_equal(segment, segment_length, "in srgb"))
-                interpolation_space = 0;
-            else if (span_case_equal(segment, segment_length,
-                                     "in srgb-linear"))
-                interpolation_space = 1;
-            else if (span_case_equal(segment, segment_length, "in oklab"))
-                interpolation_space = 2;
-            else if (span_case_equal(segment, segment_length, "in lab"))
-                interpolation_space = 3;
-            else return false;
+            if (color_interpolation_method(segment, segment_length,
+                                           &interpolation_space)
+                != segment_length) return false;
             segment_index++;
             continue;
         }
@@ -1283,7 +1336,7 @@ bool style_parse_image_url(Stylesheet *sheet, const char *text,
                             size_t length, const char **output)
 {
     if (output == NULL) return false;
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)) {
         return false;
     }
@@ -1390,7 +1443,7 @@ bool style_parse_background_shorthand_color(const Stylesheet *sheet,
                                              uint8_t *alpha,
                                              bool *transparent)
 {
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)) {
         return false;
     }
@@ -1445,7 +1498,7 @@ bool style_parse_background_shorthand_position(
     ComputedStyle *style)
 {
     if (sheet == NULL || text == NULL || style == NULL) return false;
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(
             sheet, text, length, resolved, sizeof(resolved), 0)) {
         return false;
@@ -1680,6 +1733,44 @@ static bool gradient_radial_header(const char *text, size_t length,
     return false;
 }
 
+/* A gradient header without its colour interpolation method (CSS Images 4:
+   `to left in oklab`, `in oklch longer hue 45deg`), which may sit before or
+   after the direction. The ramp is interpolated in sRGB whatever the
+   method, as it always was for a header that is only `in <space>`.
+   Tailwind v4 writes every gradient direction as `to <side> in oklab`.
+   False when the header has no well-formed method. */
+static bool gradient_header_without_interpolation(
+    const char *text, size_t length, char *output, size_t output_size)
+{
+    bool found = false;
+    size_t written = 0;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        if (at >= length) break;
+        size_t start = at;
+        while (at < length && !isspace((unsigned char) text[at])) at++;
+        const char *token = text + start;
+        size_t token_length = at - start;
+        if (!found && span_case_equal(token, token_length, "in")) {
+            unsigned space = 0;
+            size_t method = color_interpolation_method(
+                text + start, length - start, &space);
+            if (method == 0) return false;
+            found = true;
+            at = start + method;
+            continue;
+        }
+        if (token_length + (written != 0) >= output_size - written)
+            return false;
+        if (written != 0) output[written++] = ' ';
+        memcpy(output + written, token, token_length);
+        written += token_length;
+    }
+    if (!found || output_size == 0) return false;
+    output[written] = '\0';
+    return true;
+}
+
 /* Keep parsing bounded independently of the retained paint representation.
    Long generated ramps are reduced to evenly sampled stops instead of
    invalidating the entire background and exposing content that expected a
@@ -1694,7 +1785,7 @@ bool style_parse_gradient(const Stylesheet *sheet, const char *text,
                           size_t length, StyleGradient *gradient)
 {
     if (gradient == NULL) return false;
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved),
                              0)) return false;
     const char *value = resolved;
@@ -1732,13 +1823,20 @@ bool style_parse_gradient(const Stylesheet *sheet, const char *text,
         if (segment_length == 0) return false;
         if (first_segment) {
             first_segment = false;
-            if (segment_length > 3
-                && strncasecmp(segment, "in ", 3) == 0) continue;
+            char header[STYLE_CUSTOM_RESOLVED_CAPACITY];
+            const char *head = segment;
+            size_t head_length = segment_length;
+            if (gradient_header_without_interpolation(
+                    segment, segment_length, header, sizeof(header))) {
+                if (header[0] == '\0') continue;
+                head = header;
+                head_length = strlen(header);
+            }
             if (!radial) {
-                if (gradient_side_angle(segment, segment_length, &angle)) continue;
-                if (gradient_angle_value(segment, segment_length, &angle)) continue;
+                if (gradient_side_angle(head, head_length, &angle)) continue;
+                if (gradient_angle_value(head, head_length, &angle)) continue;
             } else if (gradient_radial_header(
-                           segment, segment_length, &radial_circle)) {
+                           head, head_length, &radial_circle)) {
                 continue;
             }
         }
@@ -1923,7 +2021,7 @@ bool style_parse_box_shadow(const Stylesheet *sheet, const char *text,
                             uint8_t *count)
 {
     if (shadows == NULL || count == NULL) return false;
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved),
                              0)) return false;
     const char *value = resolved;
@@ -1939,11 +2037,11 @@ bool style_parse_box_shadow(const Stylesheet *sheet, const char *text,
     StyleBoxShadow parsed[STYLE_BOX_SHADOW_LIMIT];
     memset(parsed, 0, sizeof(parsed));
     size_t layers = 0;
+    bool any_layer = false;
     size_t cursor = 0, start = 0, end = 0;
     while (style_next_top_level(value, value_length, ',', &cursor,
                                 &start, &end)) {
         if (end == start) return false;
-        if (layers >= STYLE_BOX_SHADOW_LIMIT) return false;
         const char *layer = value + start;
         size_t layer_length = end - start;
 
@@ -1992,6 +2090,13 @@ bool style_parse_box_shadow(const Stylesheet *sheet, const char *text,
         /* CSS forbids a negative blur radius; a negative spread is legal and
            shrinks the shadow. */
         if (lengths[2] < 0.0) return false;
+        any_layer = true;
+        /* A fully transparent layer paints nothing, so it needs no slot.
+           Tailwind v4 composes every shadow utility from five var()s whose
+           unused ones are `0 0 #0000`: six layers for shadow-md, past the
+           retained limit, which rejected the whole declaration. */
+        if (has_color && !current_color && alpha == 0) continue;
+        if (layers >= STYLE_BOX_SHADOW_LIMIT) return false;
 
         StyleBoxShadow *slot = &parsed[layers++];
         slot->offset_x = box_shadow_clamp(lengths[0],
@@ -2012,7 +2117,7 @@ bool style_parse_box_shadow(const Stylesheet *sheet, const char *text,
             slot->blur |= STYLE_BOX_SHADOW_CURRENT_COLOR;
         }
     }
-    if (layers == 0) return false;
+    if (!any_layer) return false;
 
     memset(shadows, 0, sizeof(*shadows) * STYLE_BOX_SHADOW_LIMIT);
     for (size_t i = 0; i < layers; i++) shadows[i] = parsed[i];
@@ -2275,7 +2380,7 @@ bool style_parse_background_box(Stylesheet *sheet, const char *text,
 bool style_parse_mask_image_layers(Stylesheet *sheet, const char *text,
                                    size_t length, ComputedStyle *style)
 {
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2348,7 +2453,7 @@ static bool mask_shorthand_append(char *output, size_t capacity,
 bool style_parse_mask_shorthand(Stylesheet *sheet, const char *text,
                                 size_t length, ComputedStyle *style)
 {
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2713,7 +2818,7 @@ static bool style_parse_layer_geometry(
     Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style,
     unsigned component)
 {
-    char resolved[384];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2795,7 +2900,7 @@ bool style_parse_background_layer_position(
     Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style)
 {
-    char resolved[384];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2822,7 +2927,7 @@ bool style_parse_background_layer_position_axis(
     Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style, bool horizontal)
 {
-    char resolved[384];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2886,7 +2991,7 @@ bool style_parse_background_layer_size(
     Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style)
 {
-    char resolved[384];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2937,8 +3042,8 @@ static void style_parse_background_layer_shorthand_geometry(
     StylePaintLayer *layer)
 {
     if (sheet == NULL || text == NULL || layer == NULL || length == 0
-        || length >= 384) return;
-    char copy[384];
+        || length >= STYLE_CUSTOM_RESOLVED_CAPACITY) return;
+    char copy[STYLE_CUSTOM_RESOLVED_CAPACITY];
     memcpy(copy, text, length);
     copy[length] = '\0';
     ComputedStyle parsed = {0};
@@ -2969,7 +3074,7 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                                             bool reset_geometry)
 {
     if (style == NULL) return false;
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved),
                              0)) return false;
     length = strlen(resolved);
@@ -3807,6 +3912,35 @@ static bool font_size_pixels_to_fixed(double pixels, int *fixed)
     return true;
 }
 
+/* CSS Fonts 4 2.5: absolute-size keywords use Chrome's medium=16px table
+   (pixels); larger/smaller scale the parent's size by 1.2 (thousandths of
+   an em). Shared by the font-size longhand and the font shorthand. */
+static bool font_size_keyword(const char *text, size_t length, int *size,
+                              uint8_t *unit)
+{
+    static const struct {
+        const char *name;
+        int pixels;
+    } keywords[] = {
+        {"xx-small", 9}, {"x-small", 10}, {"small", 13},
+        {"medium", 16}, {"large", 18}, {"x-large", 24},
+        {"xx-large", 32}, {"xxx-large", 48}
+    };
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (style_font_span_equal(text, length, keywords[i].name)) {
+            *size = keywords[i].pixels;
+            *unit = FONT_SIZE_UNIT_ABSOLUTE;
+            return true;
+        }
+    }
+    bool larger = style_font_span_equal(text, length, "larger");
+    if (!larger && !style_font_span_equal(text, length, "smaller"))
+        return false;
+    *size = larger ? 1200 : 833;
+    *unit = FONT_SIZE_UNIT_EM;
+    return true;
+}
+
 int style_parse_font_size(const Stylesheet *sheet, const char *text,
                            size_t length, uint8_t *unit,
                            uint8_t *fraction)
@@ -3849,6 +3983,9 @@ int style_parse_font_size(const Stylesheet *sheet, const char *text,
             return 14;
         }
     }
+    int keyword_size = 0;
+    if (font_size_keyword(math, math_length, &keyword_size, unit))
+        return keyword_size;
     char *end = NULL;
     double number = strtod(value, &end);
     if (end == value || !isfinite(number) || number < 0.0) return 14;
@@ -3970,26 +4107,7 @@ static bool parse_font_size_component(const Stylesheet *sheet,
 {
     *unit = FONT_SIZE_UNIT_ABSOLUTE;
     *fraction = 0;
-    static const struct {
-        const char *name;
-        int pixels;
-    } keywords[] = {
-        {"xx-small", 9}, {"x-small", 10}, {"small", 13},
-        {"medium", 16}, {"large", 18}, {"x-large", 24},
-        {"xx-large", 32}, {"xxx-large", 48}
-    };
-    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
-        if (style_font_span_equal(text, length, keywords[i].name)) {
-            *size = keywords[i].pixels;
-            return true;
-        }
-    }
-    if (style_font_span_equal(text, length, "larger")
-        || style_font_span_equal(text, length, "smaller")) {
-        *size = style_font_span_equal(text, length, "larger") ? 1200 : 800;
-        *unit = FONT_SIZE_UNIT_PERCENT;
-        return true;
-    }
+    if (font_size_keyword(text, length, size, unit)) return true;
     if ((length > 5 && text[length - 1] == ')')
         && (style_font_span_equal(text, 4, "min(")
             || style_font_span_equal(text, 4, "max(")
@@ -4446,7 +4564,7 @@ bool style_font_family_component(const Stylesheet *sheet,
 bool style_parse_font_shorthand(const Stylesheet *sheet, const char *text,
                                  size_t length, ComputedStyle *font)
 {
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)) {
         return false;
     }
@@ -4666,7 +4784,10 @@ static bool style_parse_grid_track_template(
 bool style_parse_grid_columns(Stylesheet *sheet, const char *text,
                                size_t length, ComputedStyle *style)
 {
-    char value[192];
+    /* Named-line templates run long: Guardian's section rows are 196
+       characters. A template resolved through var() may take the whole
+       substitution capacity. */
+    char value[STYLE_CUSTOM_RESOLVED_CAPACITY];
     /* Resolve BEFORE clearing: a value that cannot be resolved is an invalid
        declaration, which CSS drops at parse time, so the previously cascaded
        track list must survive untouched. */
@@ -4731,7 +4852,11 @@ bool style_parse_grid_line(const Stylesheet *sheet, const char *text,
         long parsed = strtol(start + 5, &end, 10);
         while (end != NULL && isspace((unsigned char) *end)) end++;
         if (end != NULL && end != start + 5 && *end == '\0' && parsed > 0) {
-            if (parsed > 8) parsed = 8;
+            /* Spans past the compact bound still cover every track the
+               layout envelope can hold. */
+            if (parsed > COMPUTED_GRID_SPAN_LIMIT) {
+                parsed = COMPUTED_GRID_SPAN_LIMIT;
+            }
             *span = (int) parsed;
             return true;
         }
@@ -4743,8 +4868,10 @@ bool style_parse_grid_line(const Stylesheet *sheet, const char *text,
     if (end == NULL || end == start || *end != '\0' || parsed == 0) {
         return false;
     }
-    if (parsed < -6) parsed = -6;
-    if (parsed > 9) parsed = 9;
+    if (parsed < -COMPUTED_GRID_LINE_LIMIT) {
+        parsed = -COMPUTED_GRID_LINE_LIMIT;
+    }
+    if (parsed > COMPUTED_GRID_LINE_LIMIT) parsed = COMPUTED_GRID_LINE_LIMIT;
     *line = (int) parsed;
     return true;
 }
@@ -5022,18 +5149,11 @@ static bool style_parse_grid_track_template(
         at = end;
     }
     if (!subgrid && parsed.track_count == 0) return false;
-    /* Positive grid placements occupy only values 1..9 in the compact
-       four-bit representation; values 10..15 encode negative lines.  A
-       named template must therefore keep its final positive line at nine or
-       below instead of resolving a later name to a silently clamped line. */
-    if (has_line_names
-        && ((subgrid
-             && subgrid_line > COMPUTED_GRID_NEGATIVE_LINE_MIN - 1u)
-            || (!subgrid
-                && parsed.track_count
-                   >= COMPUTED_GRID_NEGATIVE_LINE_MIN - 1u))) {
-        return false;
-    }
+    /* A named line resolves to a positive placement line (at most
+       track_limit + 1), which must stay exactly encodable rather than be
+       silently clamped by the signed-byte placement representation. */
+    _Static_assert(GRID_TRACK_REPEAT_LIMIT + 1 <= COMPUTED_GRID_LINE_LIMIT,
+                   "named grid lines must remain encodable");
 
     ComputedStyle candidate = *style;
     if (rows) {
@@ -5129,7 +5249,10 @@ static bool style_parse_grid_track_template(
 bool style_parse_grid_rows(Stylesheet *sheet, const char *text,
                            size_t length, ComputedStyle *style)
 {
-    char value[192];
+    /* Named-line templates run long: Guardian's section rows are 196
+       characters. A template resolved through var() may take the whole
+       substitution capacity. */
+    char value[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(
                sheet, text, length, value, sizeof(value), 0)) return false;
@@ -5166,7 +5289,7 @@ static int local_grid_area_name(
 bool style_parse_grid_template_areas(
     Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style)
 {
-    char resolved[512];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(
                sheet, text, length, resolved, sizeof(resolved), 0)) {
@@ -5564,6 +5687,33 @@ static int style_grid_named_line(
     return 0;
 }
 
+/* CSS Grid 8.3.1: a <custom-ident> placement first looks for the implicit
+   area lines `<ident>-start` (start edge) or `<ident>-end` (end edge), so
+   `grid-column: title` spans [title-start]..[title-end] even without a
+   named area; only then for a line named `<ident>` itself. */
+static int style_grid_named_edge_line(
+    const Stylesheet *sheet, const ComputedStyle *container,
+    bool rows, uint8_t name_id, bool start)
+{
+    if (sheet == NULL || sheet->grid_areas == NULL || name_id == 0
+        || name_id > sheet->grid_areas->line_name_count) return 0;
+    const char *name = sheet->grid_areas->line_names[name_id - 1u];
+    size_t length = strlen(name);
+    const char *suffix = start ? "-start" : "-end";
+    size_t suffix_length = strlen(suffix);
+    if (length + suffix_length < STYLE_GRID_AREA_NAME_CAPACITY) {
+        char edge[STYLE_GRID_AREA_NAME_CAPACITY];
+        memcpy(edge, name, length);
+        memcpy(edge + length, suffix, suffix_length);
+        uint8_t edge_id = style_find_grid_line_name(
+            sheet->grid_areas, edge, length + suffix_length);
+        int line = edge_id == 0 ? 0 : style_grid_named_line(
+            sheet, container, rows, edge_id);
+        if (line != 0) return line;
+    }
+    return style_grid_named_line(sheet, container, rows, name_id);
+}
+
 bool stylesheet_resolve_named_grid_lines(
     const Stylesheet *sheet, const ComputedStyle *container,
     ComputedStyle *item)
@@ -5574,8 +5724,9 @@ bool stylesheet_resolve_named_grid_lines(
     do {                                                                    \
         uint8_t name = computed_style_grid_##axis##_##field##_name(item);    \
         if (name != 0) {                                                     \
-            int line = style_grid_named_line(                                \
-                sheet, container, rows_value, name);                         \
+            int line = style_grid_named_edge_line(                           \
+                sheet, container, rows_value, name,                          \
+                sizeof(#field) == sizeof("start"));                          \
             if (line != 0) {                                                 \
                 computed_style_set_grid_##axis##_##field(                    \
                     item, computed_style_encode_grid_line(line));            \

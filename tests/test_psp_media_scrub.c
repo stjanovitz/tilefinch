@@ -124,6 +124,30 @@ int main(void)
     CHECK(continuation.phase == PSP_MEDIA_CONTINUATION_NONE
           && continuation.position_us == 0u && !continuation.playing);
 
+    /* Every reopen with a known duration ends in the resume seek, including
+       a paused one to exactly 0:00 (an ended clip rewound past the 30 s
+       reopen threshold). That case used to settle as a fresh passive open,
+       whose poster frame is never decoded: the device sat with zero packets
+       and failed "VIDEO FIRST FRAME TIMED OUT" five seconds later. */
+    const uint64_t duration_us = 60000000u;
+    psp_media_continuation_reopen(&continuation, 0u, false);
+    CHECK(psp_media_continuation_needs_resume_seek(
+        &continuation, duration_us));
+    psp_media_continuation_reopen(&continuation, 0u, true);
+    CHECK(psp_media_continuation_needs_resume_seek(
+        &continuation, duration_us));
+    psp_media_continuation_reopen(&continuation, 45000000u, false);
+    CHECK(psp_media_continuation_needs_resume_seek(
+        &continuation, duration_us));
+    /* No duration (nothing to seek within), or nothing continuing: none. */
+    CHECK(!psp_media_continuation_needs_resume_seek(&continuation, 0u));
+    psp_media_continuation_begin_resume(&continuation);
+    CHECK(!psp_media_continuation_needs_resume_seek(
+        &continuation, duration_us));
+    psp_media_continuation_clear(&continuation);
+    CHECK(!psp_media_continuation_needs_resume_seek(
+        &continuation, duration_us));
+
     puts("psp-media-scrub-tests status=PASS");
     return 0;
 }

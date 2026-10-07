@@ -14,6 +14,10 @@
 #include <stdbool.h>
 
 typedef struct {
+    /* Host-only native audio allocation/publication refusal gates. */
+    unsigned audio_slot_allocation_fail_at;
+    unsigned audio_slot_install_fail_at;
+    unsigned audio_slot_publish_fail_at;
     /* Expire the host watchdog at the Nth WebAssembly task checkpoint. */
     unsigned wasm_task_checkpoints;
     /* Refuse the next WebAssembly memory alias buffer allocation once. */
@@ -32,6 +36,11 @@ typedef struct {
     bool refuse_next_static_fallback_layout;
     /* Refuse the next same-document relayout once. */
     bool refuse_next_same_document_relayout;
+    /* Refuse the next adopted-sheet root metadata allocation once. */
+    bool refuse_next_adopted_scope_table;
+    /* Simulate one pack I/O read failure, separately from Budget refusal. */
+    bool fail_next_script_cache_read;
+    unsigned script_cache_read_attempts;
     /* Refuse the next child-frame presentation refresh once. */
     bool refuse_next_frame_presentation;
     /* Refuse the next background web-font relayout once. */
@@ -51,9 +60,32 @@ typedef struct {
     /* Stop the next compaction right after the original log is moved
        aside, as a power loss there would. */
     bool crash_next_site_storage_compact;
+    /* Rasterize box shadows pixel by pixel, without the fully covered
+       core run, as the reference the core run must reproduce. */
+    bool shadow_reference_raster;
+    /* Compose a canvas page with the canvas path only over a valid
+       previous frame (the tile path otherwise): the reference a
+       full-viewport canvas frame must reproduce. */
+    bool canvas_frame_reference;
+    /* Rasterize fills and box-shadow cores pixel by pixel, without
+       interior spans, core runs or the translucent blend memo: the
+       reference those must reproduce. */
+    bool raster_span_reference;
     /* Host observation for index-refusal tests: linear node-box lookups.
        Reset by the test; never present on the PSP. */
     unsigned long long layout_node_box_scans;
+    /* Host work observations: CSS source handed to the statement scanner
+       and body text inspected by the visible-content census. */
+    unsigned long long css_statement_max_source_bytes;
+    unsigned long long document_body_text_bytes_inspected;
+    /* Host observation for per-site identity tests: the request key and
+       effective User-Agent of each request trace replay answered, as a
+       ring of the latest 16. Reset by the test. */
+    struct {
+        char url[256];
+        char user_agent[192];
+    } replayed_requests[16];
+    unsigned replayed_request_count;
 } TilefinchTestFaults;
 
 TilefinchTestFaults *tilefinch_test_faults(void);

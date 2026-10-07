@@ -3,21 +3,27 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"
+#include "tilefinch/script_admission.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/style.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/public_suffix.h"
 #include "tilefinch/sha256.h"
+#include "tilefinch/text_encoding.h"
 #include "tilefinch/url.h"
+#include "tilefinch/site_identity.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch/work_ledger.h"
 #include "tilefinch/script_split.h"
 #include "tilefinch/script_census.h"
+#include "tilefinch/text_encoding.h"
 
 #include "js_runtime_internal.h"
 
 #include <stdio.h>
 #include <ctype.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +31,9 @@
 #include <time.h>
 #include <errno.h>
 #include <zlib.h>
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+#include <pspkernel.h>
+#endif
 #if defined(__linux__)
 #endif
 
@@ -50,11 +59,14 @@ static void runtime_configure_property_fault_trace(JSRuntime *runtime);
    QuickJS/DOM state static while separating responsibilities for review. */
 #include "js_runtime/bridge_state.inc"
 #include "js_runtime/host_primitives.inc"
+#include "js_runtime/game_audio_slots.inc"
 #include "js_runtime/evaluation.inc"
 #include "js_runtime/dynamic_scripts.inc"
 #include "js_runtime/document_state.inc"
+#include "js_runtime/heavy_pages.inc"
 #include "js_runtime/event_loop.inc"
 #include "js_runtime/result_snapshot.inc"
+#include "js_runtime/legacy_surface.inc"
 #include "js_runtime/runtime_creation.inc"
 #include "js_runtime/document_evaluation.inc"
 #include "js_runtime/runtime_loop.inc"

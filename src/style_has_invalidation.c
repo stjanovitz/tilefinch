@@ -279,7 +279,7 @@ typedef struct {
 
 /* Splits one complex (or relative) selector into its compounds. */
 static size_t has_compounds(const char *text, size_t at, size_t end,
-                            HasCompound *out, bool *overflow)
+                            HasCompound *out, size_t capacity, bool *overflow)
 {
     size_t count = 0;
     char pending = 0;
@@ -315,7 +315,7 @@ static size_t has_compounds(const char *text, size_t at, size_t end,
             at++;
             continue;
         }
-        if (count == HAS_COMPOUND_LIMIT) {
+        if (count == capacity) {
             *overflow = true;
             return count;
         }
@@ -483,7 +483,7 @@ static bool has_list_combines(const char *text, size_t at, size_t end)
         size_t item_end = has_item_end(text, at, end);
         bool overflow = false;
         size_t count = has_compounds(text, at, item_end, compounds,
-                                     &overflow);
+                                     HAS_COMPOUND_LIMIT, &overflow);
         if (overflow || count > 1
             || (count == 1 && compounds[0].combinator != 0)) return true;
         at = item_end + 1;
@@ -657,7 +657,7 @@ static bool has_compound_features(StyleHasPlan *plan, const char *text,
             HasCompound compounds[HAS_COMPOUND_LIMIT];
             bool overflow = false;
             size_t n = has_compounds(text, item, item_end, compounds,
-                                     &overflow);
+                                     HAS_COMPOUND_LIMIT, &overflow);
             keyed = !overflow && n != 0
                 && has_compound_features(plan, text, compounds[n - 1].begin,
                                          compounds[n - 1].end, keys, count,
@@ -706,7 +706,7 @@ static void has_collect_argument_items(HasAnalysis *analysis, size_t index,
         HasCompound compounds[HAS_COMPOUND_LIMIT];
         bool overflow = false;
         size_t count = has_compounds(text, at, item_end, compounds,
-                                     &overflow);
+                                     HAS_COMPOUND_LIMIT, &overflow);
         if (overflow || count == 0) {
             entry->tree_keyless = entry->text_keyless = true;
             at = item_end + 1;
@@ -868,7 +868,8 @@ static void has_analyze_complex(HasAnalysis *analysis, size_t at, size_t end,
     const char *text = analysis->text;
     HasCompound compounds[HAS_COMPOUND_LIMIT];
     bool overflow = false;
-    size_t count = has_compounds(text, at, end, compounds, &overflow);
+    size_t count = has_compounds(text, at, end, compounds,
+                                 HAS_COMPOUND_LIMIT, &overflow);
     if (overflow) {
         analysis->other = true;
         return;
@@ -943,7 +944,8 @@ static void has_analyze_rule(StyleHasPlan *plan, uint32_t rule,
     if (has_item_end(text, 0, length) == length) {
         HasCompound compounds[HAS_COMPOUND_LIMIT];
         bool overflow = false;
-        size_t count = has_compounds(text, 0, length, compounds, &overflow);
+        size_t count = has_compounds(text, 0, length, compounds,
+                                     HAS_COMPOUND_LIMIT, &overflow);
         if (!overflow && count != 0)
             analysis.subject_key = has_compound_key(
                 text, compounds[count - 1].begin, compounds[count - 1].end,
@@ -1809,6 +1811,102 @@ bool stylesheet_tree_change_has_entries(const Stylesheet *sheet,
     return false;
 }
 
+/* ---- Changes inside the document's head. ----------------------------- */
+
+typedef struct {
+    uint32_t hash[32];
+    size_t count;
+    bool overflow;
+} HasKeyList;
+
+static bool has_collect_key(void *context, uint32_t hash)
+{
+    HasKeyList *keys = context;
+    if (keys->count == sizeof(keys->hash) / sizeof(keys->hash[0])) {
+        keys->overflow = true;
+        return true;
+    }
+    keys->hash[keys->count++] = hash;
+    return false;
+}
+
+/* Whether `head` or `html` matches the selector text before some :has()
+   of `text` (the compound holding it, or the outermost pseudo-class whose
+   argument holds it, cut off; a universal compound when nothing or only a
+   combinator precedes it). */
+static bool has_prefix_matches(const char *text, size_t length,
+                               lxb_dom_node_t *head, lxb_dom_node_t *html)
+{
+    char buffer[256];
+    size_t item = 0, open = 0;
+    unsigned depth = 0;
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char c = text[at];
+        if (quote != 0) {
+            if (c == '\\') at++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '\\') { at++; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == ',' && depth == 0) { item = at + 1; continue; }
+        if (c == '(' || c == '[') { depth++; continue; }
+        if (c == ')' || c == ']') { if (depth != 0) depth--; continue; }
+        if (c != ':') continue;
+        if (depth == 0) open = at;
+        if (length - at < 5 || strncasecmp(text + at, ":has(", 5) != 0)
+            continue;
+        size_t cut = depth == 0 ? at : open;
+        while (item < cut && isspace((unsigned char) text[item])) item++;
+        size_t prefix = cut - item;
+        if (prefix + 2 > sizeof(buffer)) return true;
+        memcpy(buffer, text + item, prefix);
+        if (prefix == 0 || isspace((unsigned char) buffer[prefix - 1])
+            || strchr(">+~", buffer[prefix - 1]) != NULL)
+            buffer[prefix++] = '*';
+        if (style_selector_matches(head, buffer, prefix)
+            || style_selector_matches(html, buffer, prefix)) return true;
+    }
+    return false;
+}
+
+bool stylesheet_head_change_reaches_outside(const Stylesheet *sheet,
+                                            lxb_dom_node_t *head,
+                                            lxb_dom_node_t *node)
+{
+    lxb_dom_node_t *html = head == NULL ? NULL : head->parent;
+    const StyleHasPlan *plan = sheet == NULL || html == NULL
+        || html->type != LXB_DOM_NODE_TYPE_ELEMENT
+        ? NULL : has_plan_prepare(sheet);
+    if (plan == NULL || plan->bounded) return true;
+    /* Only the entries whose argument can see the changed node. */
+    HasTreeProbe probe = {.plan = plan};
+    bool all = node == NULL || node->parent == NULL
+        || !has_tree_probe(&probe, node, node->parent);
+    HasKeyList keys = {0};
+    (void) has_element_keys(plan, head, has_collect_key, &keys);
+    (void) has_element_keys(plan, html, has_collect_key, &keys);
+    if (keys.overflow) return true;
+    for (size_t i = 0; i < plan->entry_count; i++) {
+        const StyleHasPlanEntry *entry = &plan->entries[i];
+        if (!all && !HAS_BIT(probe.hit, i)) continue;
+        if (entry->anchor_key != 0) {
+            for (size_t k = 0; k < keys.count; k++)
+                if (keys.hash[k] == entry->anchor_key) return true;
+            continue;
+        }
+        size_t length = 0;
+        const char *text = has_entry_text(sheet, entry, &length);
+#ifndef TILEFINCH_NO_TRACE
+        ((Stylesheet *) sheet)->head_script_selector_scans++;
+#endif
+        if (text == NULL || has_prefix_matches(text, length, head, html))
+            return true;
+    }
+    return false;
+}
+
 /* ---- Keys for layout's :empty sibling scope. -------------------------- */
 
 static size_t has_skip_back_block(const char *text, size_t at)
@@ -2027,7 +2125,8 @@ static void has_complex_structure(const char *text, size_t at, size_t end,
 {
     HasCompound compounds[HAS_COMPOUND_LIMIT];
     bool overflow = false, unused = false;
-    size_t count = has_compounds(text, at, end, compounds, &overflow);
+    size_t count = has_compounds(text, at, end, compounds,
+                                 HAS_COMPOUND_LIMIT, &overflow);
     if (overflow) {
         out->reaches = out->any = true;
         return;
@@ -2094,4 +2193,479 @@ void style_selector_structure_keys(const char *selector, size_t length,
 {
     if (selector != NULL && keys != NULL)
         has_list_structure(selector, 0, length, 0, keys);
+}
+
+/* ---- Tests counting from the end, for appended hidden siblings. ------- */
+
+static bool has_trailing_name(const char *text, size_t begin, size_t end)
+{
+    return (end - begin > 5 && strncasecmp(text + begin, "last-", 5) == 0)
+        || (end - begin > 9
+            && strncasecmp(text + begin, "nth-last-", 9) == 0)
+        || (end - begin > 5 && strncasecmp(text + begin, "only-", 5) == 0);
+}
+
+/* Whether [at, end) holds a pseudo-class whose name starts with one of
+   `names` (ASCII case-insensitive): a scan for ':' rather than a substring
+   search per name, since these run over every selector of a sheet. */
+static bool has_text_pseudo(const char *text, size_t at, size_t end,
+                            const char *const *names, size_t count)
+{
+    for (; at < end; at++) {
+        if (text[at] != ':') continue;
+        for (size_t i = 0; i < count; i++) {
+            size_t length = strlen(names[i]);
+            if (end - (at + 1) >= length
+                && strncasecmp(text + at + 1, names[i], length) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool has_text_trailing(const char *text, size_t at, size_t end)
+{
+    static const char *const names[] = {"last-", "nth-last-", "only-"};
+    return has_text_pseudo(text, at, end, names,
+                           sizeof(names) / sizeof(names[0]));
+}
+
+static bool has_text_positional_or_has(const char *text, size_t at,
+                                       size_t end, bool *nested_has)
+{
+    static const char *const positional[] = {
+        "first-", "last-", "nth-", "only-", "empty", "blank"
+    };
+    static const char *const has[] = {"has("};
+    *nested_has = has_text_pseudo(text, at, end, has, 1);
+    return has_text_pseudo(text, at, end, positional,
+                           sizeof(positional) / sizeof(positional[0]));
+}
+
+/* 1 when the compound [at, end) holds a trailing test outside :has() for
+   the element it matches, 0 when not, -1 when one sits where the compound
+   alone does not place it (a logical item with combinators, `of S`, an
+   unknown functional pseudo-class). */
+static int has_compound_trailing(const char *text, size_t at, size_t end,
+                                 unsigned depth)
+{
+    if (depth > HAS_NESTING_LIMIT) return -1;
+    int found = 0;
+    HasPseudo pseudo;
+    size_t cursor = at;
+    while (has_next_pseudo(text, &cursor, end, &pseudo)) {
+        size_t b = pseudo.name_begin, e = pseudo.name_end;
+        if (has_name_is(text, b, e, "has")) continue;
+        if (has_trailing_name(text, b, e)) {
+            found = 1;
+            if (pseudo.functional
+                && has_text_trailing(text, pseudo.argument_begin,
+                                     pseudo.argument_end)) return -1;
+            continue;
+        }
+        if (!pseudo.functional
+            || !has_text_trailing(text, pseudo.argument_begin,
+                                  pseudo.argument_end)) continue;
+        if (!has_pseudo_is_logical(text, &pseudo)) return -1;
+        for (size_t item = pseudo.argument_begin;
+             item < pseudo.argument_end;) {
+            size_t item_end = has_item_end(text, item,
+                                           pseudo.argument_end);
+            HasCompound compounds[HAS_COMPOUND_LIMIT];
+            bool overflow = false;
+            size_t count = has_compounds(text, item, item_end, compounds,
+                                         HAS_COMPOUND_LIMIT, &overflow);
+            for (size_t i = 0; i < count && !overflow; i++) {
+                int inner = has_compound_trailing(
+                    text, compounds[i].begin, compounds[i].end, depth + 1);
+                if (inner < 0 || (inner > 0 && count != 1)) return -1;
+                if (inner > 0) found = 1;
+            }
+            if (overflow) return -1;
+            item = item_end + 1;
+        }
+    }
+    return found;
+}
+
+static void has_trailing_add(StyleTrailingKeys *out, uint32_t key,
+                             size_t depth, bool at_least)
+{
+    if (key == 0 || depth > UINT8_MAX) {
+        out->any = true;
+        return;
+    }
+    for (size_t i = 0; i < out->count; i++) {
+        if (out->keys[i] == key && out->depth[i] == depth
+            && out->at_least[i] == at_least) return;
+    }
+    if (out->count == STYLE_TRAILING_KEY_LIMIT) {
+        out->any = true;
+        return;
+    }
+    out->keys[out->count] = key;
+    out->depth[out->count] = (uint8_t) depth;
+    out->at_least[out->count] = at_least;
+    out->count++;
+}
+
+void style_selector_trailing_keys(const char *selector, size_t length,
+                                  StyleTrailingKeys *keys)
+{
+    if (selector == NULL || keys == NULL || keys->any
+        || !has_text_trailing(selector, 0, length)) return;
+    for (size_t at = 0; at < length;) {
+        size_t item_end = has_item_end(selector, at, length);
+        HasCompound compounds[HAS_COMPOUND_LIMIT];
+        bool overflow = false;
+        size_t count = has_compounds(selector, at, item_end, compounds,
+                                     HAS_COMPOUND_LIMIT, &overflow);
+        if (overflow) {
+            keys->any = true;
+            return;
+        }
+        for (size_t i = 0; i < count; i++) {
+            int trailing = has_compound_trailing(
+                selector, compounds[i].begin, compounds[i].end, 0);
+            if (trailing == 0) continue;
+            if (trailing < 0) {
+                keys->any = true;
+                return;
+            }
+            bool unused = false;
+            uint32_t key = has_compound_key(selector, compounds[i].begin,
+                                            compounds[i].end, &unused);
+            if (key != 0) {
+                has_trailing_add(keys, key, 0, false);
+                continue;
+            }
+            /* Place it by the nearest keyed ancestor compound; a sibling
+               combinator on the way leaves it unplaced. */
+            bool at_least = false, placed = false;
+            for (size_t j = i; j > 0 && !placed; j--) {
+                char combinator = compounds[j].combinator;
+                if (combinator != ' ' && combinator != '>') break;
+                if (combinator == ' ') at_least = true;
+                key = has_compound_key(selector, compounds[j - 1].begin,
+                                       compounds[j - 1].end, &unused);
+                if (key == 0) continue;
+                has_trailing_add(keys, key, i - j + 1u, at_least);
+                placed = true;
+            }
+            if (!placed) {
+                keys->any = true;
+                return;
+            }
+        }
+        at = item_end + 1;
+    }
+}
+
+/* ---- :has() argument keys, for inserted subtrees. --------------------- */
+
+static void has_argument_bloom_add(uint32_t *bloom, uint32_t key)
+{
+    const uint32_t bits = STYLE_HAS_ARGUMENT_BLOOM_WORDS * 32u;
+    uint32_t a = key % bits, b = (key >> 11) % bits;
+    bloom[a >> 5] |= UINT32_C(1) << (a & 31u);
+    bloom[b >> 5] |= UINT32_C(1) << (b & 31u);
+}
+
+static bool has_argument_bloom_test(const uint32_t *bloom, uint32_t key)
+{
+    const uint32_t bits = STYLE_HAS_ARGUMENT_BLOOM_WORDS * 32u;
+    uint32_t a = key % bits, b = (key >> 11) % bits;
+    return (bloom[a >> 5] & (UINT32_C(1) << (a & 31u))) != 0
+        && (bloom[b >> 5] & (UINT32_C(1) << (b & 31u))) != 0;
+}
+
+static void has_argument_anchor_add(StyleHasArgumentKeys *keys,
+                                    uint32_t key, uint8_t region)
+{
+    if (key == 0 || region == 0) {
+        keys->any = true;
+        return;
+    }
+    for (size_t i = 0; i < keys->anchor_count; i++) {
+        if (keys->anchors[i] == key) {
+            keys->anchor_regions[i] |= region;
+            return;
+        }
+    }
+    if (keys->anchor_count == STYLE_HAS_ANCHOR_LIMIT) {
+        keys->any = true;
+        return;
+    }
+    keys->anchors[keys->anchor_count] = key;
+    keys->anchor_regions[keys->anchor_count] = region;
+    keys->anchor_count++;
+}
+
+/* Logical selectors can inspect ancestors/siblings outside the :has()
+   anchor even when its relative selector starts with a descendant. Such
+   dependencies cannot be represented by the anchor-region summary. */
+static bool has_argument_compound_escapes(const char *text, size_t at,
+                                         size_t end, unsigned depth)
+{
+    if (depth > HAS_NESTING_LIMIT) return true;
+    HasPseudo pseudo;
+    while (has_next_pseudo(text, &at, end, &pseudo)) {
+        if (!pseudo.functional) continue;
+        if (has_name_is(text, pseudo.name_begin, pseudo.name_end, "has"))
+            return true;
+        if ((has_pseudo_is_logical(text, &pseudo)
+             && has_list_combines(text, pseudo.argument_begin,
+                                  pseudo.argument_end))
+            || has_argument_compound_escapes(
+                   text, pseudo.argument_begin, pseudo.argument_end,
+                   depth + 1u)) return true;
+    }
+    return false;
+}
+
+/* One :has() argument [at, end): plain items go into the Bloom set; the
+   regions the others reach from the anchor are returned. */
+static uint8_t has_argument_keys_of(const char *text, size_t at, size_t end,
+                                    StyleHasArgumentKeys *keys)
+{
+    uint32_t plain[HAS_COMPOUND_LIMIT];
+    uint8_t regions = 0;
+    while (at < end && !keys->any) {
+        size_t item_end = has_item_end(text, at, end);
+        HasCompound compounds[HAS_COMPOUND_LIMIT];
+        bool overflow = false;
+        size_t count = has_compounds(text, at, item_end, compounds,
+                                     HAS_COMPOUND_LIMIT, &overflow);
+        if (overflow) {
+            keys->any = true;
+            return 0;
+        }
+        bool simple = true;
+        for (size_t i = 0; i < count; i++) {
+            bool unused = false;
+            plain[i] = has_compound_key(text, compounds[i].begin,
+                                        compounds[i].end, &unused);
+            bool nested_has = false;
+            bool positional = has_text_positional_or_has(
+                text, compounds[i].begin, compounds[i].end, &nested_has);
+            if (nested_has || has_argument_compound_escapes(
+                    text, compounds[i].begin, compounds[i].end, 0)) {
+                keys->any = true;
+                return 0;
+            }
+            if (plain[i] == 0
+                || compounds[i].combinator == '+'
+                || compounds[i].combinator == '~'
+                || positional)
+                simple = false;
+        }
+        if (simple && count != 0) {
+            has_argument_bloom_add(keys->first, plain[0]);
+            has_argument_bloom_add(keys->last, plain[count - 1]);
+        } else if (count != 0) {
+            char lead = compounds[0].combinator;
+            regions |= lead == '+' || lead == '~'
+                ? STYLE_HAS_REGION_SIBLINGS : STYLE_HAS_REGION_DESCENDANTS;
+        }
+        at = item_end + 1;
+    }
+    return regions;
+}
+
+/* Anchors for the :has() at `at`: the key every element of its compound
+   carries, or else the keys of a :is()/:where() alternative list of single
+   keyed compounds in it (`:is(.a, .b):has(...)`). */
+static void has_argument_anchors_add(const char *text, size_t length,
+                                     size_t at, uint8_t regions,
+                                     StyleHasArgumentKeys *keys)
+{
+    uint32_t key = style_selector_compound_key_at(text, length, at);
+    if (key != 0) {
+        has_argument_anchor_add(keys, key, regions);
+        return;
+    }
+    size_t begin = at;
+    while (begin > 0) {
+        char value = text[begin - 1];
+        if (value == ')' || value == ']') {
+            begin = has_skip_back_block(text, begin);
+            continue;
+        }
+        if (isspace((unsigned char) value) || value == '>' || value == '+'
+            || value == '~' || value == ',' || value == '(') break;
+        begin--;
+    }
+    HasPseudo pseudo;
+    size_t cursor = begin;
+    while (has_next_pseudo(text, &cursor, at, &pseudo)) {
+        size_t b = pseudo.name_begin, e = pseudo.name_end;
+        if (!pseudo.functional || !has_pseudo_is_logical(text, &pseudo)
+            || has_name_is(text, b, e, "not")) continue;
+        uint32_t alternatives[8];
+        size_t count = 0;
+        bool keyed = true;
+        for (size_t item = pseudo.argument_begin;
+             keyed && item < pseudo.argument_end;) {
+            size_t item_end = has_item_end(text, item, pseudo.argument_end);
+            HasCompound compounds[2];
+            bool overflow = false, unused = false;
+            size_t parts = has_compounds(text, item, item_end, compounds,
+                                         sizeof(compounds) / sizeof(compounds[0]),
+                                         &overflow);
+            keyed = parts == 1 && !overflow
+                && count < sizeof(alternatives) / sizeof(alternatives[0]);
+            if (keyed) {
+                alternatives[count] = has_compound_key(
+                    text, compounds[0].begin, compounds[0].end, &unused);
+                keyed = alternatives[count++] != 0;
+            }
+            item = item_end + 1;
+        }
+        if (!keyed || count == 0) continue;
+        for (size_t i = 0; i < count; i++)
+            has_argument_anchor_add(keys, alternatives[i], regions);
+        return;
+    }
+    keys->any = true;
+}
+
+void style_selector_has_argument_keys(const char *selector, size_t length,
+                                      StyleHasArgumentKeys *keys)
+{
+    if (selector == NULL || keys == NULL || keys->any) return;
+    for (size_t at = 0; at + 5 <= length && !keys->any; at++) {
+        if (selector[at] == '"' || selector[at] == '\'') {
+            at = has_skip_string(selector, at, length) - 1;
+            continue;
+        }
+        if (selector[at] == '\\') {
+            at++;
+            continue;
+        }
+        if (selector[at] != ':'
+            || strncasecmp(selector + at + 1, "has(", 4) != 0) continue;
+        size_t close = has_skip_block(selector, at + 4, length);
+        size_t argument_end = close > at + 5 && selector[close - 1] == ')'
+            ? close - 1 : close;
+        uint8_t regions = has_argument_keys_of(selector, at + 5,
+                                               argument_end, keys);
+        if (regions != 0 && !keys->any)
+            has_argument_anchors_add(selector, length, at, regions, keys);
+        /* Arguments are scanned whole; a nested :has() set `any`. */
+        at = close - 1;
+    }
+}
+
+static bool has_argument_bloom_visit(void *context, uint32_t hash)
+{
+    return has_argument_bloom_test(context, hash);
+}
+
+typedef struct {
+    const StyleHasArgumentKeys *keys;
+    uint8_t region;
+} HasAnchorSearch;
+
+static bool has_anchor_visit(void *context, uint32_t hash)
+{
+    const HasAnchorSearch *search = context;
+    for (size_t i = 0; i < search->keys->anchor_count; i++) {
+        if (search->keys->anchors[i] == hash
+            && (search->keys->anchor_regions[i] & search->region) != 0)
+            return true;
+    }
+    return false;
+}
+
+bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
+                                   const lxb_dom_node_t *subtree,
+                                   const lxb_dom_node_t *parent)
+{
+    if (keys == NULL || parent == NULL || keys->any
+        || parent->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
+    StyleHasPlan plan = {.attribute_keys = true};
+    size_t visited = 0;
+    bool last = false, first = false;
+    const lxb_dom_node_t *at = subtree;
+    while (at != NULL && !(last && first)) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (++visited > 256u) return true;
+            last = last || has_element_keys(&plan, at,
+                                            has_argument_bloom_visit,
+                                            (void *) keys->last);
+            first = first || has_element_keys(&plan, at,
+                                              has_argument_bloom_visit,
+                                              (void *) keys->first);
+        }
+        if (at->first_child != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != subtree && at->next == NULL) at = at->parent;
+        if (at == subtree) break;
+        at = at->next;
+    }
+    HasAnchorSearch descendants = {keys, STYLE_HAS_REGION_DESCENDANTS},
+                    siblings = {keys, STYLE_HAS_REGION_SIBLINGS};
+    size_t steps = 0;
+    for (const lxb_dom_node_t *node = parent; node != NULL
+         && node->type == LXB_DOM_NODE_TYPE_ELEMENT; node = node->parent) {
+        if (++steps > HAS_DEPTH_LIMIT) return true;
+        if (last && !first)
+            first = has_element_keys(&plan, node, has_argument_bloom_visit,
+                                     (void *) keys->first);
+        if (keys->anchor_count != 0
+            && has_element_keys(&plan, node, has_anchor_visit, &descendants))
+            return true;
+    }
+    if (last && first) return true;
+    if (keys->anchor_count == 0) return false;
+    /* Sibling arguments: anchors before the subtree in place, or (for a
+       change among the parent's children it cannot place) any child. */
+    steps = 0;
+    bool placed = subtree != NULL && subtree->parent == parent;
+    for (const lxb_dom_node_t *earlier = placed ? subtree->prev
+                                                : parent->last_child;
+         earlier != NULL; earlier = earlier->prev) {
+        if (earlier->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (++steps > HAS_SIBLING_LIMIT
+            || has_element_keys(&plan, earlier, has_anchor_visit, &siblings))
+            return true;
+    }
+    for (const lxb_dom_node_t *node = parent; node != NULL
+         && node->type == LXB_DOM_NODE_TYPE_ELEMENT; node = node->parent) {
+        for (const lxb_dom_node_t *earlier = node->prev; earlier != NULL;
+             earlier = earlier->prev) {
+            if (earlier->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+            if (++steps > HAS_SIBLING_LIMIT
+                || has_element_keys(&plan, earlier, has_anchor_visit,
+                                    &siblings)) return true;
+        }
+    }
+    return false;
+}
+
+bool style_trailing_keys_reach(const StyleTrailingKeys *keys,
+                               const lxb_dom_node_t *sibling,
+                               const lxb_dom_node_t *parent)
+{
+    if (keys == NULL) return true;
+    if (keys->any) return true;
+    for (size_t i = 0; i < keys->count; i++) {
+        if (keys->depth[i] == 0) {
+            if (style_element_carries_key(sibling, keys->keys[i]))
+                return true;
+            continue;
+        }
+        size_t level = 1;
+        for (const lxb_dom_node_t *at = parent;
+             at != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT
+             && level <= HAS_DEPTH_LIMIT;
+             at = at->parent, level++) {
+            if (level < keys->depth[i]) continue;
+            if (style_element_carries_key(at, keys->keys[i])) return true;
+            if (!keys->at_least[i]) break;
+        }
+    }
+    return false;
 }

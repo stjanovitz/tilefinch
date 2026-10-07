@@ -1635,13 +1635,16 @@ int main(int argc, char **argv)
            scripts.runtime_ticks, scripts.timer_callbacks_run,
            scripts.pending_tasks, scripts.summary);
     printf("javascript-external-bytecode hits=%zu misses=%zu stores=%zu "
-           "admission-skips=%zu restore-failures=%zu restored-bytes=%zu\n",
+           "admission-skips=%zu restore-failures=%zu restored-bytes=%zu "
+           "stored-bytes=%zu restore-us=%llu\n",
            scripts.external_script_bytecode_cache_hits,
            scripts.external_script_bytecode_cache_misses,
            scripts.external_script_bytecode_cache_stores,
            scripts.external_script_bytecode_cache_admission_skips,
            scripts.external_script_bytecode_cache_restore_failures,
-           scripts.external_script_bytecode_cache_bytes);
+           scripts.external_script_bytecode_cache_bytes,
+           scripts.external_script_bytecode_cache_stored_bytes,
+           scripts.external_script_bytecode_restore_us);
     printf("javascript-module-bytecode hits=%zu misses=%zu stores=%zu "
            "admission-skips=%zu restore-failures=%zu restored-bytes=%zu "
            "stored-bytes=%zu restore-us=%llu\n",
@@ -1655,14 +1658,21 @@ int main(int argc, char **argv)
            scripts.module_bytecode_restore_us);
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
-           "connected-preserves=%zu stale-releases=%zu capacity=%u\n",
+           "connected-preserves=%zu stale-releases=%zu capacity=%zu "
+           "growths=%zu growth-refusals=%zu\n",
            scripts.dom_handle_slots_live, scripts.dom_handle_slots_peak,
            scripts.dom_handle_slots_high_water,
            scripts.dom_handle_slot_reuses, scripts.dom_handle_exhaustions,
            scripts.dom_handle_wrapper_releases,
            scripts.dom_handle_connected_preserves,
            scripts.dom_handle_stale_releases,
-           SCRIPT_DOM_HANDLE_SLOT_CAPACITY);
+           scripts.dom_handle_slot_capacity,
+           scripts.dom_handle_growths,
+           scripts.dom_handle_growth_refusals);
+    printf("javascript-script-clone started=%zu unstarted=%zu "
+           "suppressed=%zu refused=%zu\n",
+           scripts.script_clones_started, scripts.script_clones_unstarted,
+           scripts.script_clones_suppressed, scripts.script_clones_refused);
     printf("javascript-geometry queries=%zu retained-fast-paths=%zu "
            "ancestor-visits=%zu synchronous-layouts=%zu\n",
            scripts.geometry_queries, scripts.geometry_retained_fast_paths,

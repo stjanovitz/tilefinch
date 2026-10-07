@@ -3700,25 +3700,38 @@ function resolveWithin(rootValue, relative, label) {
   return resolved;
 }
 
+/* A blocked_origins entry is a lowercase host (that host and its
+   subdomains) or a host followed by a path prefix, such as
+   "developer.mozilla.org/pong/", which excludes only that first-party route.
+   The engine's --block-origin applies the same rule. */
 function parseBlockedOrigins(raw, manifestPath) {
   if (!raw || raw === "-") return [];
-  const hosts = raw.split("|");
-  if (hosts.length > 64) {
+  const entries = raw.split("|");
+  if (entries.length > 64) {
     throw new CaptureError(`${manifestPath}: blocked_origins lists more than 64 hosts`);
   }
   const HOSTNAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
-  for (const host of hosts) {
-    if (!HOSTNAME.test(host)) {
+  const PATH_PREFIX = /^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$/;
+  return entries.map((entry) => {
+    const slash = entry.indexOf("/");
+    const host = slash < 0 ? entry : entry.slice(0, slash);
+    const pathPrefix = slash < 0 ? "" : entry.slice(slash);
+    if (!HOSTNAME.test(host) || (pathPrefix && !PATH_PREFIX.test(pathPrefix))) {
       throw new CaptureError(
-        `${manifestPath}: blocked_origins entry is not a lowercase hostname: ${host}`);
+        `${manifestPath}: blocked_origins entry is not a lowercase hostname `
+        + `or hostname/path-prefix: ${entry}`);
     }
-  }
-  return hosts;
+    return { entry, host, pathPrefix };
+  });
 }
 
-function blockedHostMatches(hostname, blockedHosts) {
-  return blockedHosts.some((entry) =>
-    hostname === entry || hostname.endsWith(`.${entry}`));
+function blockedUrlMatches(value, blockedEntries) {
+  let url;
+  try { url = new URL(String(value)); } catch (_error) { return false; }
+  const hostname = url.hostname.toLowerCase();
+  return blockedEntries.some(({ host, pathPrefix }) =>
+    (hostname === host || hostname.endsWith(`.${host}`))
+    && (!pathPrefix || url.pathname.startsWith(pathPrefix)));
 }
 
 function loadScenario(manifestPath, wanted) {
@@ -3902,14 +3915,20 @@ async function settleCapture(page, milliseconds, isNetworkIdle) {
 
 async function checkpointPosition(page, checkpoint) {
   if (checkpoint.kind === "top") {
-    return page.evaluate(() => { window.scrollTo(0, 0); return window.scrollY; });
+    /* Checkpoints are positions, not animations: an author's
+       `scroll-behavior: smooth` (MDN sets it on html) would otherwise leave
+       the paused-clock page mid-scroll. The engine never animates. */
+    return page.evaluate(() => {
+      window.scrollTo({ left: 0, top: 0, behavior: "instant" });
+      return window.scrollY;
+    });
   }
   if (checkpoint.kind === "bottom") {
     let state = null;
     for (let i = 0; i < 4; i += 1) {
       state = await page.evaluate(() => {
         const root = document.scrollingElement || document.documentElement;
-        window.scrollTo(0, root.scrollHeight);
+        window.scrollTo({ left: 0, top: root.scrollHeight, behavior: "instant" });
         return { scrollY: window.scrollY, maximum: Math.max(0, root.scrollHeight - innerHeight) };
       });
       await new Promise((resolve) => setImmediate(resolve));
@@ -3932,7 +3951,7 @@ async function checkpointPosition(page, checkpoint) {
     }
     if (!element) return null;
     const y = Math.max(0, Math.floor(element.getBoundingClientRect().top + scrollY));
-    window.scrollTo(0, y);
+    window.scrollTo({ left: 0, top: y, behavior: "instant" });
     return { requested: y, actual: window.scrollY };
   }, checkpoint);
   if (result === null) throw new CaptureError(`${checkpoint.kind} checkpoint target was not found`);
@@ -4483,10 +4502,7 @@ async function captureReference(options) {
     }
 
     if (scenario.blockedOrigins.length > 0) {
-      let blockedHostname = "";
-      try { blockedHostname = new URL(requestUrl).hostname.toLowerCase(); }
-      catch (_error) {}
-      if (blockedHostMatches(blockedHostname, scenario.blockedOrigins)) {
+      if (blockedUrlMatches(requestUrl, scenario.blockedOrigins)) {
         /* Declared ad/telemetry hosts mint unique URLs per visit and can
            never converge to a hermetic trace.  Abort them outside the
            replay ledger so they neither count as unmatched evidence nor
@@ -4695,10 +4711,7 @@ async function captureReference(options) {
       }
       activity.value += 1;
       if (scenario.blockedOrigins.length > 0) {
-        let deniedHostname = "";
-        try { deniedHostname = new URL(String(value)).hostname.toLowerCase(); }
-        catch (_error) {}
-        if (blockedHostMatches(deniedHostname, scenario.blockedOrigins)) {
+        if (blockedUrlMatches(value, scenario.blockedOrigins)) {
           /* A denied write to a declared blocked host is expected traffic
              suppression, not read-only-policy evidence. */
           ledger.blocked += 1;
@@ -5086,7 +5099,7 @@ async function captureReference(options) {
       .map((entry) => `${entry.method} ${entry.url}`),
     unexpected_requests: unexpectedSummary,
     blocked: ledger.blocked,
-    blocked_origins: scenario.blockedOrigins,
+    blocked_origins: scenario.blockedOrigins.map(({ entry }) => entry),
     blocked_requests: blockedSummary,
   };
   const topBottomCoincident = scenario.checkpoints.length === 2
@@ -5226,7 +5239,7 @@ if (require.main === module) {
 
 module.exports = {
   CaptureError, applyResponseCookies, buildReadOnlyAcquisitionPlan, compactRanges,
-  boundedDrainRouteHandlers,
+  blockedUrlMatches, boundedDrainRouteHandlers,
   claimRouteRecord, cookieReplayOperation, createRequestDiagnostics,
   createHostOperationTracker, createResponseScheduler, inspectTrace,
   deliverReplayRecord, teardownEvidenceChanges, teardownEvidenceReady,
@@ -5237,7 +5250,8 @@ module.exports = {
   installReadOnlyPolicy, installReplayEnvironment,
   loadRecord, loadScenario, loadTrace, normalizeUrl,
   offlineCapabilityEvidenceReady,
-  parseArguments, parseCookieDate, parseSetCookie, responseCookies,
+  parseArguments, parseBlockedOrigins, parseCookieDate, parseSetCookie,
+  responseCookies,
   replayClockEvidenceReady, replayEnvironment, responseCookieDateBaseline,
   retainedFailureAbortCode,
   runScenarioClock,

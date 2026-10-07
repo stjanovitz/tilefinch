@@ -1,0 +1,1 @@
+<!doctype html><title>Replace state</title><p>Same document.</p><script>history.replaceState(null,'','/replaced-state')</script>

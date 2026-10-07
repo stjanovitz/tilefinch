@@ -279,9 +279,12 @@
                getter_result.error);
     CHECK(strcmp(getter_result.summary, "GETTERS-OK") == 0);
     static const char local_name_source[] =
+        /* The shared receiver descriptor nearest the wrapper: <p> has its
+           own (member-less) interface prototype above the native layer. */
         "(()=>{const p=document.getElementById('p'),"
-        "get=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(p),"
-        "'localName').get,"
+        "inherited=(o,k)=>{for(let at=Object.getPrototypeOf(o);at;"
+        "at=Object.getPrototypeOf(at)){const d=Object.getOwnPropertyDescriptor"
+        "(at,k);if(d)return d}},get=inherited(p,'localName').get,"
         "checks=[p.localName==='p',"
         "document.getElementById('s').localName==='svg',"
         "document.getElementById('c').localName==='circle',"
@@ -1629,6 +1632,45 @@
         }
     }
 
+    puts("test: heap growth counts headroom the realm already holds");
+    /* Unused headroom under the current limit can still be drawn from the
+       Budget after a raise. A request larger than that headroom must not
+       be admitted merely because the remainder fits the spare memory: the
+       whole request would then dig into the page reserve. */
+    {
+        static const char held_page[] =
+            "<!doctype html><body><script>"
+            "globalThis.take=(n)=>{try{globalThis.big=new ArrayBuffer(n);"
+            "return 'ok'}catch(e){return String(e)}};"
+            "globalThis.pocSummary='ready';</script></body>";
+        size_t held_baseline = budget.current;
+        PocDocument held_document;
+        CHECK(document_parse(&held_document, &budget, held_page,
+                             strlen(held_page), 17));
+        ScriptResult held_result;
+        ScriptRuntime *held_runtime = script_runtime_create(
+            &held_document, &budget, 3 * MIB, 1000,
+            "https://held.test/", &held_result);
+        CHECK(held_runtime != NULL);
+        size_t headroom = script_runtime_heap_remaining(held_runtime);
+        size_t reserve = budget_remaining(&budget) - MIB;
+        CHECK(headroom > MIB && budget_remaining(&budget) > 2u * MIB);
+        script_runtime_enable_heap_growth(held_runtime, 8 * MIB, reserve);
+        char call[64];
+        snprintf(call, sizeof(call), "pocSummary=take(%zu)",
+                 headroom + 512u * 1024u);
+        CHECK(script_runtime_evaluate_diagnostic(
+            held_runtime, call, "<held>", &held_result));
+        if (budget_remaining(&budget) + 64u * 1024u < reserve)
+            printf("held headroom: %s free=%zu reserve=%zu headroom=%zu\n",
+                   held_result.summary, budget_remaining(&budget), reserve,
+                   headroom);
+        CHECK(budget_remaining(&budget) + 64u * 1024u >= reserve);
+        script_runtime_destroy(held_runtime);
+        document_destroy(&held_document);
+        CHECK(budget.current == held_baseline);
+    }
+
     puts("test: queries and tree walkers are not truncated at 128 nodes");
     /* chatgpt.com's partial-update polyfill finds the answer's
        <?start name=...> markers with a comment TreeWalker over the whole
@@ -2056,8 +2098,11 @@
                          wasm_large_memory_page,
                          strlen(wasm_large_memory_page), 17));
     ScriptResult wasm_large_memory_result;
+    /* 3 MiB: the realm must also hold the bootstrap and the lazily
+       loaded WebAssembly module; 2 MiB left too little headroom once the
+       bootstrap gained the HTML element interfaces (2026-10). */
     CHECK(scripts_run_document_at(
-              &wasm_large_memory_document, &budget, 2 * MIB, 2000,
+              &wasm_large_memory_document, &budget, 3 * MIB, 2000,
               "https://wasm-large-memory.test/", &wasm_large_memory_result)
           && wasm_large_memory_result.success
           && strcmp(wasm_large_memory_result.summary,
@@ -2508,10 +2553,31 @@
     CHECK(document_parse(&wasm_meter_document, &budget,
                          wasm_meter_page, strlen(wasm_meter_page), 17));
     ScriptResult wasm_meter_result;
-    CHECK(scripts_run_document_at(
-              &wasm_meter_document, &budget, 8 * MIB, 3000,
-              "https://wasm-meter.test/", &wasm_meter_result)
-          && wasm_meter_result.success
+    /* The bound under test is the instruction meter: two loops of 50M
+       instructions each, 0.5-1.3 s of wall time apiece at load averages of
+       160-180. The 3 s script watchdog, a backstop here, is checked when
+       each call returns, so a host stall long enough to stretch the two
+       loops past it ends the script as an interrupt rather than the
+       RuntimeError the page checks for. A counting clock (1 us per read)
+       makes the watchdog a count of clock reads, which the metered loops do
+       not make; a meter that stopped trapping would still never return. */
+    TestCountingClock wasm_meter_clock = {.step_ns = UINT64_C(1000)};
+    TilefinchPlatformServices wasm_meter_services = {
+        .context = &wasm_meter_clock,
+        .wall_time_ns = test_counting_clock_wall_ns,
+        .monotonic_time_ns = test_counting_clock_ns
+    };
+    tilefinch_platform_set_services(&wasm_meter_services);
+    bool wasm_meter_ran = scripts_run_document_at(
+        &wasm_meter_document, &budget, 8 * MIB, 3000,
+        "https://wasm-meter.test/", &wasm_meter_result);
+    tilefinch_platform_set_services(NULL);
+    if (!wasm_meter_ran || !wasm_meter_result.success
+        || strcmp(wasm_meter_result.summary, "WASM-METER-OK") != 0)
+        fprintf(stderr, "wasm meter ran=%d summary=%s error=%s\n",
+                wasm_meter_ran, wasm_meter_result.summary,
+                wasm_meter_result.error);
+    CHECK(wasm_meter_ran && wasm_meter_result.success
           && strcmp(wasm_meter_result.summary, "WASM-METER-OK") == 0);
     document_destroy(&wasm_meter_document);
     CHECK(budget.current == wasm_meter_baseline);
@@ -3012,7 +3078,7 @@
         "try{requestAnimationFrame(null)}catch(error){immediate=error instanceof TypeError;}"
         "const cancelledId=requestAnimationFrame(()=>cancelled=true);"
         "cancelAnimationFrame(cancelledId);const timeline=document.timeline,"
-        "documentDescriptor=Object.getOwnPropertyDescriptor(document,'timeline'),"
+        "documentDescriptor=Object.getOwnPropertyDescriptor(Document.prototype,'timeline'),"
         "timeDescriptor=Object.getOwnPropertyDescriptor(timeline,'currentTime'),"
         "rafDescriptor=Object.getOwnPropertyDescriptor(globalThis,'requestAnimationFrame'),"
         "current=timeline.currentTime,observer=new PerformanceObserver(()=>observed=true);"
@@ -3178,6 +3244,20 @@
     ScriptResult registration_clock_result;
     script_runtime_configure_deterministic_replay(false, 0);
     script_runtime_configure_wall_clock_timers(true);
+    /* Wall-clock timers sample the platform monotonic clock. With the real
+       clock a loaded host could stall 20 ms between the registering turn
+       and the next advance, and the timer then fires for the right reason
+       at the wrong time. A counting clock (100 us per read) keeps the
+       spins below, and every gap between them, a function of the code. */
+    TestCountingClock registration_clock = {
+        .now_ns = UINT64_C(5000000000), .step_ns = UINT64_C(100000)
+    };
+    TilefinchPlatformServices registration_clock_services = {
+        .context = &registration_clock,
+        .wall_time_ns = test_counting_clock_wall_ns,
+        .monotonic_time_ns = test_counting_clock_ns
+    };
+    tilefinch_platform_set_services(&registration_clock_services);
     ScriptRuntime *registration_clock_runtime =
         script_runtime_create_configured(
             &deterministic_tick_document, &budget, 4u * MIB, 1000,
@@ -3222,6 +3302,7 @@
               &registration_clock_result)
           && strcmp(registration_clock_result.summary, "fired") == 0);
     script_runtime_destroy(registration_clock_runtime);
+    tilefinch_platform_set_services(NULL);
     CHECK(budget.current == registration_clock_baseline);
     script_runtime_configure_wall_clock_timers(false);
     script_runtime_configure_deterministic_replay(true, 42);
@@ -4575,6 +4656,24 @@
     CHECK(budget.current == listener_baseline);
 
     puts("test: body snapshot reserves its exact-bound terminator");
+    puts("test: action-only census does not inspect body prose");
+    PocDocument census_document = {0};
+    static const char census_page[] =
+        "<body><p>Long server prose whose bytes are irrelevant to action counts.</p>"
+        "<a href=/next>Next</a><form><input><button>Go</button></form>"
+        "<script><button>Ignored</button></script></body>";
+    CHECK(document_parse(&census_document, &budget, census_page,
+                         sizeof(census_page) - 1u, 97u));
+    tilefinch_test_faults()->document_body_text_bytes_inspected = 0;
+    CHECK(document_body_action_count(&census_document) == 4u
+          && tilefinch_test_faults()->document_body_text_bytes_inspected == 0);
+    DocumentVisibleContent census = document_body_visible_content(
+        &census_document, DOCUMENT_SNAPSHOT_VISIT_LIMIT);
+    CHECK(census.action_count == 4u && census.text_bytes > 20u
+          && tilefinch_test_faults()->document_body_text_bytes_inspected > 20u);
+    document_destroy(&census_document);
+    CHECK(budget.current == listener_baseline);
+
     enum { exact_snapshot_bytes = 256u * 1024u };
     static const char exact_prefix[] = "<!doctype html><body><main>";
     static const char exact_suffix[] = "</main></body>";
@@ -4608,6 +4707,60 @@
     document_body_snapshot_destroy(&exact_snapshot);
     document_destroy(&exact_snapshot_document);
     free(exact_source);
+    CHECK(budget.current == listener_baseline);
+
+    puts("test: script-free body snapshot keeps everything but scripts");
+    static const char scriptless_page[] =
+        "<!doctype html><body><main id=kept><h1>Rates &amp; fees</h1>"
+        "<p>One &lt;dollar&gt; buys<br>0.86 euro<img src=a.png alt=x></p>"
+        "<script>window.APP_SECRET=1</script>"
+        "<div><script type=application/json>{\"APP_DATA\":1}</script></div>"
+        "<style>p>b{color:red}</style><template id=tpl><b>inert</b>"
+        "<script>window.TEMPLATE_SCRIPT=1</script></template>"
+        "<input id=field value=\"a&quot;b\"><a href='/next'>Next</a></main>"
+        "<script>window.TAIL=1</script></body>";
+    PocDocument scriptless_document = {0};
+    DocumentBodySnapshot scriptless_snapshot = {0};
+    CHECK(document_parse(&scriptless_document, &budget, scriptless_page,
+                         strlen(scriptless_page), 97u)
+          && document_body_snapshot_capture_without_scripts(
+                 &scriptless_document, &scriptless_snapshot)
+          && scriptless_snapshot.source_action_count == 2u);
+    CHECK(scriptless_snapshot.markup != NULL
+          && strstr(scriptless_snapshot.markup, "APP_SECRET") == NULL
+          && strstr(scriptless_snapshot.markup, "APP_DATA") == NULL
+          && strstr(scriptless_snapshot.markup, "TAIL") == NULL
+          && strstr(scriptless_snapshot.markup, "TEMPLATE_SCRIPT") != NULL
+          && strstr(scriptless_snapshot.markup, "p>b{color:red}") != NULL);
+    /* Parsing the copy gives back the same text, elements and controls. */
+    char scriptless_text[512] = {0};
+    const char *scriptless_original = document_body_text(&scriptless_document);
+    CHECK(scriptless_original != NULL
+          && strlen(scriptless_original) < sizeof(scriptless_text));
+    snprintf(scriptless_text, sizeof(scriptless_text), "%s",
+             scriptless_original == NULL ? "" : scriptless_original);
+    lxb_dom_node_t *scriptless_body = document_body_node(&scriptless_document);
+    CHECK(scriptless_body != NULL
+          && document_set_element_inner_html(
+                 &scriptless_document, scriptless_body,
+                 scriptless_snapshot.markup, scriptless_snapshot.length)
+          && document_refresh(&scriptless_document));
+    const char *scriptless_restored = document_body_text(&scriptless_document);
+    lxb_dom_node_t *scriptless_root =
+        lxb_dom_interface_node(scriptless_document.html);
+    lxb_dom_node_t *scriptless_field = find_id(scriptless_root, "field");
+    size_t scriptless_value_length = 0;
+    const char *scriptless_value = scriptless_field == NULL ? NULL
+        : document_attribute(scriptless_field, "value",
+                             &scriptless_value_length);
+    CHECK(scriptless_restored != NULL
+          && strcmp(scriptless_restored, scriptless_text) == 0
+          && find_id(scriptless_root, "kept") != NULL
+          && find_id(scriptless_root, "tpl") != NULL
+          && scriptless_value != NULL && scriptless_value_length == 3u
+          && memcmp(scriptless_value, "a\"b", 3u) == 0);
+    document_body_snapshot_destroy(&scriptless_snapshot);
+    document_destroy(&scriptless_document);
     CHECK(budget.current == listener_baseline);
 
     TileCache cache;

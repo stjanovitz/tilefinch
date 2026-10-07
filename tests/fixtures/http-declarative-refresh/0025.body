@@ -1,0 +1,1 @@
+<!doctype html><title>Href</title><p>Setting href.</p><script>setTimeout(function(){location.href='/target'},0)</script>

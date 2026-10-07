@@ -3,6 +3,7 @@
 #include "tilefinch/page_find.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
+#include "tilefinch/site_identity.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -132,6 +133,9 @@ struct BrowserEngine {
     bool script_navigation_attributed;
     bool fonts_ready;
     uint64_t startup_deferral_started_us;
+    /* Idle turns: the script-bytecode store or persistent-tier step
+       skipped one turn for an image retarget that changed a surface. */
+    bool idle_cache_waited;
     const void *startup_deferral_runtime;
     uint64_t startup_deferral_generation;
     /* A provisional page's layout completion is running: its cooperative
@@ -307,7 +311,7 @@ void browser_device_profile_psp3000(BrowserDeviceProfile *profile)
         .framebuffer_width = 480,
         .framebuffer_height = 272,
         .navigation_viewport_width = 480,
-        .recommended_memory_limit = BROWSER_PSP_REALISTIC_CONTENT_LIMIT,
+        .recommended_memory_limit = BROWSER_PSP_RECOMMENDED_CONTENT_LIMIT,
         .minimum_non_page_reserve =
             BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE,
         /* One screen (up to sixteen 128 px tiles at 480x272) plus two rows
@@ -317,10 +321,10 @@ void browser_device_profile_psp3000(BrowserDeviceProfile *profile)
     };
 }
 
-static size_t browser_engine_reclaim_module_bytecode(void *opaque,
+static size_t browser_engine_reclaim_script_bytecode(void *opaque,
                                                      size_t needed_bytes)
 {
-    return browser_session_module_bytecode_reclaim(opaque, needed_bytes);
+    return browser_session_script_bytecode_reclaim(opaque, needed_bytes);
 }
 
 void browser_config_init(BrowserConfig *config,
@@ -337,6 +341,7 @@ void browser_config_init(BrowserConfig *config,
         .history_capacity = 16,
         .session_cache_limit = 1u * MIB,
         .module_bytecode_cache_limit = BROWSER_MODULE_BYTECODE_CACHE_BYTES,
+        .classic_bytecode_cache_limit = BROWSER_CLASSIC_BYTECODE_CACHE_BYTES,
         .maximum_document_bytes = 8u * MIB,
         .navigation_timeout_ms = 20000,
         .navigation_replacement_mode =
@@ -354,14 +359,15 @@ void browser_config_init(BrowserConfig *config,
         .javascript = {
             .enabled = false,
             .document_scripts_enabled = false,
+            .game_audio_internal_slots = true,
             .heap_limit = 4u * MIB,
             .runtime_timeout_ms = 10000,
             .maximum_scripts = 48,
             .maximum_total_bytes = 4u * MIB,
             /* The realistic PSP execution policy admits one bounded Game
-               Profile script up to 384 KiB. Keep the ordinary aggregate
+               Profile script up to 512 KiB. Keep the ordinary aggregate
                quota unchanged; strict mode narrows this unit to 256 KiB. */
-            .maximum_file_bytes = 384u * KIB,
+            .maximum_file_bytes = 512u * KIB,
             .network_timeout_ms = 10000
         },
         /* About 22 us per layout work unit on the PSP-3000: a page above
@@ -399,34 +405,84 @@ void browser_config_init(BrowserConfig *config,
 bool browser_config_apply_psp_memory_profile(
     BrowserConfig *config, BrowserPspMemoryProfile profile)
 {
-    if (config == NULL
-        || (profile != BROWSER_PSP_MEMORY_STRICT
-            && profile != BROWSER_PSP_MEMORY_REALISTIC)) return false;
-    bool strict = profile == BROWSER_PSP_MEMORY_STRICT;
-    config->memory_limit = strict
-        ? BROWSER_PSP_STRICT_CONTENT_LIMIT
-        : BROWSER_PSP_REALISTIC_CONTENT_LIMIT;
+    if (config == NULL) return false;
+    if (profile == BROWSER_PSP_MEMORY_REALISTIC)
+        return browser_config_apply_psp_app_defaults(config);
+    if (profile != BROWSER_PSP_MEMORY_STRICT) return false;
+    config->memory_limit = BROWSER_PSP_STRICT_CONTENT_LIMIT;
     config->non_page_memory_reserve =
         BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE;
-    config->history_capacity = strict ? 8 : 16;
-    config->session_cache_limit = strict ? 512u * KIB : 1u * MIB;
-    config->module_bytecode_cache_limit = strict
-        ? BROWSER_MODULE_BYTECODE_CACHE_STRICT_BYTES
-        : BROWSER_MODULE_BYTECODE_CACHE_BYTES;
+    config->history_capacity = 8;
+    config->session_cache_limit = 512u * KIB;
+    config->module_bytecode_cache_limit =
+        BROWSER_MODULE_BYTECODE_CACHE_STRICT_BYTES;
+    config->classic_bytecode_cache_limit =
+        BROWSER_CLASSIC_BYTECODE_CACHE_STRICT_BYTES;
     config->tile_capacity = config->device.maximum_tile_capacity
             < BROWSER_PAINT_AHEAD_TILE_CAPACITY
         ? config->device.maximum_tile_capacity
         : BROWSER_PAINT_AHEAD_TILE_CAPACITY;
-    config->javascript.heap_limit = strict ? 4u * MIB : 5u * MIB;
-    size_t script_source_limit = strict ? 1u * MIB : 2u * MIB;
-    if (config->javascript.maximum_total_bytes > script_source_limit)
-        config->javascript.maximum_total_bytes = script_source_limit;
-    size_t script_file_limit = strict ? 256u * KIB : 384u * KIB;
-    if (config->javascript.maximum_file_bytes > script_file_limit)
-        config->javascript.maximum_file_bytes = script_file_limit;
+    config->javascript.heap_limit = 4u * MIB;
+    config->javascript.installed_app_heap_limit =
+        BROWSER_PSP_STRICT_INSTALLED_APP_HEAP;
+    if (config->javascript.maximum_total_bytes > 1u * MIB)
+        config->javascript.maximum_total_bytes = 1u * MIB;
+    if (config->javascript.maximum_file_bytes > 256u * KIB)
+        config->javascript.maximum_file_bytes = 256u * KIB;
     return script_execution_policy_for_profile(
-        strict ? SCRIPT_EXECUTION_PROFILE_PSP_STRICT
-               : SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
+        SCRIPT_EXECUTION_PROFILE_PSP_STRICT,
+        &config->javascript.execution_policy);
+}
+
+bool browser_config_apply_psp_app_defaults(BrowserConfig *config)
+{
+    if (config == NULL) return false;
+    config->memory_limit = (size_t) BROWSER_PSP_APP_MEMORY_LIMIT_MB * MIB;
+    config->history_capacity = BROWSER_PSP_APP_HISTORY_CAPACITY;
+    config->session_cache_limit = BROWSER_PSP_APP_SESSION_CACHE_BYTES;
+    config->maximum_document_bytes = BROWSER_PSP_APP_DOCUMENT_BYTES;
+    config->navigation_timeout_ms = BROWSER_PSP_APP_NAVIGATION_TIMEOUT_MS;
+    /* One screen plus two rows of optional paint-ahead (only the first
+       eight tiles are reserved up front). */
+    config->tile_capacity = config->device.maximum_tile_capacity;
+    config->javascript.enabled = true;
+    config->javascript.document_scripts_enabled = true;
+    config->javascript.heap_limit =
+        (size_t) BROWSER_PSP_APP_SCRIPT_HEAP_MB * MIB;
+    config->javascript.installed_app_heap_limit =
+        (size_t) BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB * MIB;
+    config->javascript.runtime_timeout_ms =
+        BROWSER_PSP_APP_SCRIPT_TIMEOUT_MS;
+    config->javascript.maximum_scripts = BROWSER_PSP_APP_SCRIPT_COUNT;
+    config->javascript.maximum_total_bytes =
+        (size_t) BROWSER_PSP_APP_SCRIPT_TOTAL_MB * MIB;
+    config->javascript.maximum_file_bytes =
+        (size_t) BROWSER_PSP_APP_SCRIPT_FILE_KB * KIB;
+    config->javascript.network_timeout_ms =
+        BROWSER_PSP_APP_NETWORK_TIMEOUT_MS;
+    config->resources.enabled = true;
+    /* Modern mobile shells split their critical component rules across many
+       small sheets and occasionally one 700 KiB decoded module. Keep the
+       limits hard, but retain a small tail allowance for late mobile-header
+       and accessibility components. The parse-admission gate still uses
+       actual page headroom. */
+    config->resources.maximum_stylesheets = BROWSER_PSP_APP_STYLESHEETS;
+    config->resources.maximum_stylesheet_bytes =
+        BROWSER_PSP_APP_STYLESHEET_BYTES;
+    config->resources.maximum_stylesheet_file_bytes =
+        BROWSER_PSP_APP_STYLESHEET_FILE_BYTES;
+    config->resources.maximum_images = BROWSER_PSP_APP_IMAGES;
+    config->resources.maximum_image_bytes = BROWSER_PSP_APP_IMAGE_BYTES;
+    /* Keep the aggregate image ceiling, but let one visible mobile hero
+       consume up to a third of it: CDNs commonly produce display-sized PNG
+       fallbacks just above 384 KiB. */
+    config->resources.maximum_image_file_bytes =
+        BROWSER_PSP_APP_IMAGE_FILE_BYTES;
+    config->resources.maximum_decoded_image_bytes =
+        BROWSER_PSP_APP_DECODED_IMAGE_BYTES;
+    config->resources.timeout_ms = BROWSER_PSP_APP_NETWORK_TIMEOUT_MS;
+    return script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
         &config->javascript.execution_policy);
 }
 
@@ -684,6 +740,9 @@ bool browser_config_validate(const BrowserConfig *config,
     CONFIG_REQUIRE(config->module_bytecode_cache_limit
                        < config->memory_limit,
                    "module bytecode cache must fit inside the content budget");
+    CONFIG_REQUIRE(config->classic_bytecode_cache_limit
+                       < config->memory_limit,
+                   "classic bytecode cache must fit inside the content budget");
     CONFIG_REQUIRE(config->maximum_document_bytes != 0
                        && config->navigation_timeout_ms > 0,
                    "navigation limits must be nonzero");
@@ -1696,6 +1755,8 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
         navigation, engine->config.progressive_first_paint);
     navigation->relayout_preview_threshold_us =
         engine->config.relayout_preview_threshold_us;
+    navigation->game_audio_internal_slots =
+        engine->config.javascript.game_audio_internal_slots;
     if (!navigation_set_script_execution_policy(
             navigation, &engine->config.javascript.execution_policy)) {
         return set_error_code(
@@ -1790,14 +1851,17 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
     }
     browser_session_module_bytecode_set_limit(
         &engine->session, config->module_bytecode_cache_limit);
-    browser_session_module_bytecode_set_disk(
-        &engine->session, config->module_bytecode_disk_dir,
-        config->module_bytecode_disk_write);
-    /* Module bytecode lives in room the page is not using. It is released
-       before the page Budget refuses anything, so it can speed up a revisit
-       but never be the reason an allocation fails. */
+    browser_session_script_bytecode_set_limit(
+        &engine->session, BROWSER_SCRIPT_BYTECODE_CLASSIC,
+        config->classic_bytecode_cache_limit);
+    (void) browser_session_script_disk_configure(
+        &engine->session, config->script_cache_dir,
+        config->script_cache_write, config->script_cache_limit);
+    /* Script bytecode (module and classic) lives in room the page is not
+       using. It is released before the page Budget refuses anything, so it
+       can speed up a revisit but never be the reason an allocation fails. */
     budget_set_reclaim_hook(&engine->budget,
-                            browser_engine_reclaim_module_bytecode,
+                            browser_engine_reclaim_script_bytecode,
                             &engine->session);
     engine->session_ready = true;
     BROWSER_ENGINE_CREATE_MARK(session_ready_us);
@@ -1888,6 +1952,16 @@ bool browser_engine_creation_metrics(
     (void) engine;
     return false;
 #endif
+}
+
+void browser_engine_arm_installed_app_heap(BrowserEngine *engine, bool armed)
+{
+    if (engine == NULL) return;
+    size_t heap = engine->config.javascript.installed_app_heap_limit;
+    /* A floor is never allowed to claim the whole page Budget. */
+    navigation_arm_next_top_level_heap(
+        &engine->navigation,
+        armed && heap < engine->config.memory_limit / 4u * 3u ? heap : 0u);
 }
 
 bool browser_engine_set_javascript_enabled(
@@ -2371,6 +2445,13 @@ uint16_t browser_engine_glyph_script_mask(const BrowserEngine *engine)
         ? 0 : engine->navigation.page.document.glyph_script_mask;
 }
 
+const DocumentGlyphCensus *browser_engine_glyph_census(
+    const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        ? NULL : &engine->navigation.page.document.glyph_census;
+}
+
 bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact)
 {
@@ -2750,15 +2831,22 @@ static void browser_engine_census_page_fonts(BrowserEngine *engine)
         const DrawCommand *command = &layout->commands[at];
         if (command->type != DRAW_TEXT) continue;
         FontFamily family = draw_command_font_family(command);
+        /* A web family draws with its built-in fallback until (or unless)
+           its own face loads, so census the fallback. */
+        if (font_family_is_web(family))
+            family = font_family_web_fallback(family);
         bool serif = family == FONT_SERIF;
         if (serif) requested |= FONT_SET_FACE_SERIF;
         if (draw_command_font_italic(command) && !serif)
             requested |= FONT_SET_FACE_SANS_ITALIC;
+        /* Request only the bold face font_set_face_variant() selects for
+           this family. The two sans bold faces are 77 KB (DejaVu Sans) and
+           98 KB (TilefinchSans); a page styled only with Arial, or only
+           with sans-serif, never draws the other one. */
         if (draw_command_font_weight_code(command) >= 65u) {
-            requested |= serif
-                ? FONT_SET_FACE_SERIF_BOLD
-                : (FontSetFaceMask) (FONT_SET_FACE_SANS_BOLD
-                                     | FONT_SET_FACE_METRIC_SANS_BOLD);
+            requested |= serif ? FONT_SET_FACE_SERIF_BOLD
+                : family == FONT_METRIC_SANS ? FONT_SET_FACE_METRIC_SANS_BOLD
+                : FONT_SET_FACE_SANS_BOLD;
         }
     }
     engine->font_requested_faces |= requested;
@@ -2804,6 +2892,8 @@ static void browser_engine_copy_adapter_metrics(
         adapter->build_slices;
     metrics->transform_quota_overruns =
         adapter->transform_quota_overruns;
+    metrics->maximum_transform_slice_bytes =
+        adapter->maximum_transform_slice_bytes;
     if (adapter->maximum_irreducible_unit_us
             > metrics->maximum_irreducible_unit_us) {
         metrics->maximum_irreducible_unit_us =
@@ -2959,6 +3049,8 @@ static bool browser_engine_begin_navigation_request(
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
             "browser navigation job cannot be started");
     }
+    /* Only the navigation that was refused may fall back. */
+    site_identity_clear_google_fallback();
     browser_engine_store_current_focus(engine);
     browser_engine_store_current_controls(engine);
     /* A deferred activation belongs to the page that committed it; one the
@@ -3101,6 +3193,23 @@ bool browser_engine_take_script_navigation(BrowserEngine *engine,
     return true;
 }
 
+NavigationRefreshTake browser_engine_take_refresh_navigation(
+    BrowserEngine *engine, char *url, size_t capacity)
+{
+    if (engine == NULL) return NAVIGATION_REFRESH_TAKE_NONE;
+    NavigationRefreshTake taken = navigation_take_refresh_navigation(
+        &engine->navigation, url, capacity);
+    /* The document is the initiator, as for a script navigation. */
+    if (taken == NAVIGATION_REFRESH_TAKE_NAVIGATE)
+        engine->script_navigation_attributed = true;
+    return taken;
+}
+
+void browser_engine_note_user_input(BrowserEngine *engine)
+{
+    if (engine != NULL) navigation_note_user_input(&engine->navigation);
+}
+
 bool browser_engine_capture_script_navigation_attribution(
     const BrowserEngine *engine, BrowserScriptNavigationAttribution *out)
 {
@@ -3112,6 +3221,9 @@ bool browser_engine_capture_script_navigation_attribution(
              engine->navigation.pending_navigation_referer);
     out->user_activated =
         engine->navigation.pending_navigation_user_activated;
+    /* The first attempt's navigation_begin takes the arming with it. */
+    out->replace_history = engine->navigation.history_replace_armed;
+    out->replace_url_hash = engine->navigation.history_replace_url_hash;
     return true;
 }
 
@@ -3125,6 +3237,11 @@ void browser_engine_restore_script_navigation_attribution(
              attribution->initiator_url);
     engine->navigation.pending_navigation_user_activated =
         attribution->user_activated;
+    if (attribution->replace_history) {
+        engine->navigation.history_replace_url_hash =
+            attribution->replace_url_hash;
+        engine->navigation.history_replace_armed = true;
+    }
     engine->script_navigation_attributed = true;
 }
 
@@ -3184,6 +3301,9 @@ bool browser_engine_begin_navigation_url(
     if (engine != NULL && !engine->script_navigation_attributed) {
         engine->navigation.pending_navigation_referer[0] = '\0';
         engine->navigation.pending_navigation_user_activated = false;
+        /* A browser-initiated address (typed, bookmarked, restored) is the
+           user's: the refresh loop guard starts over. */
+        navigation_note_user_input(&engine->navigation);
     } else if (engine != NULL
                && engine->navigation.pending_navigation_referer[0] == '\0') {
         /* A script without a document initiator is never a typed address. */
@@ -3216,6 +3336,8 @@ bool browser_engine_begin_navigation_action(
     }
     engine->navigation.pending_navigation_user_activated =
         action->navigation_source == CONTROLLER_NAVIGATION_USER;
+    if (action->navigation_source == CONTROLLER_NAVIGATION_USER)
+        navigation_note_user_input(&engine->navigation);
     const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
         ? action->method : "GET";
     if (action->type == CONTROLLER_ACTION_NAVIGATE
@@ -3403,6 +3525,31 @@ bool browser_engine_begin_navigation_history(
     return true;
 }
 
+/* A refused opted-in Google search (site_identity.h) fails without
+   committing and clears the opt-in. Continue the same job on the local
+   compatibility page for that query, which now carries its refusal note.
+   The fallback replaces or adds a history entry as the refused navigation
+   would have; a refused history traversal only restores its entry. */
+static BrowserNavigationJobStatus browser_engine_google_fallback(
+    BrowserEngine *engine, BrowserNavigationJobStatus finished)
+{
+    char url[NAVIGATION_URL_LIMIT];
+    if (finished != BROWSER_NAVIGATION_JOB_FAILED
+        || !site_identity_take_google_fallback(url, sizeof(url))
+        || engine->navigation_work.history_move
+        || !site_adapter_handles_navigation("GET", url)) return finished;
+    bool record_history = engine->navigation_work.record_history;
+    engine->navigation.pending_navigation_referer[0] = '\0';
+    engine->navigation.pending_navigation_user_activated = false;
+    engine->script_navigation_attributed = false;
+    if (!browser_engine_begin_navigation_request(
+            engine, url, "GET", NULL, 0, NULL,
+            engine->config.maximum_document_bytes,
+            engine->config.navigation_timeout_ms, record_history))
+        return finished;
+    return engine->navigation_work.status;
+}
+
 BrowserNavigationJobStatus browser_engine_pump_navigation(
     BrowserEngine *engine, const BrowserNavigationJobQuota *quota)
 {
@@ -3481,6 +3628,8 @@ BrowserNavigationJobStatus browser_engine_pump_navigation(
             adapter_metrics.build_slices;
         work->metrics.transform_quota_overruns =
             adapter_metrics.transform_quota_overruns;
+        work->metrics.maximum_transform_slice_bytes =
+            adapter_metrics.maximum_transform_slice_bytes;
         uint64_t advisory_us = quota == NULL
             ? 0 : quota->load.maximum_parser_time_us;
         if (advisory_us != 0
@@ -3527,7 +3676,8 @@ BrowserNavigationJobStatus browser_engine_pump_navigation(
             return BROWSER_NAVIGATION_JOB_PENDING;
         }
     }
-    return browser_engine_finish_navigation_work(engine, status);
+    return browser_engine_google_fallback(
+        engine, browser_engine_finish_navigation_work(engine, status));
 }
 
 void browser_engine_cancel_navigation(BrowserEngine *engine,
@@ -3562,6 +3712,58 @@ BrowserNavigationJobStatus browser_engine_navigation_status(
 {
     return engine == NULL ? BROWSER_NAVIGATION_JOB_FAILED
                           : engine->navigation_work.status;
+}
+
+void browser_engine_set_heavy_page_policy(BrowserEngine *engine,
+                                          ScriptHeavyPolicy policy)
+{
+    if (engine == NULL) return;
+    engine->navigation.heavy_script_policy = policy;
+    if (engine->navigation.page.runtime != NULL) {
+        script_runtime_set_heavy_policy(engine->navigation.page.runtime,
+                                        policy);
+    }
+}
+
+void browser_engine_set_heavy_page_resolver(
+    BrowserEngine *engine, ScriptHeavyPolicyResolver resolver, void *opaque)
+{
+    if (engine == NULL) return;
+    engine->navigation.heavy_policy_resolver = resolver;
+    engine->navigation.heavy_policy_opaque = resolver != NULL ? opaque : NULL;
+}
+
+bool browser_engine_heavy_page(BrowserEngine *engine,
+                               ScriptHeavyState *state)
+{
+    if (state != NULL) memset(state, 0, sizeof(*state));
+    return engine != NULL && engine->navigation.page.loaded
+        && engine->navigation.page.runtime != NULL
+        && script_runtime_heavy_state(engine->navigation.page.runtime, state);
+}
+
+bool browser_engine_answer_heavy_page(BrowserEngine *engine, bool run)
+{
+    return engine != NULL && engine->navigation.page.runtime != NULL
+        && script_runtime_answer_heavy(engine->navigation.page.runtime, run);
+}
+
+bool browser_engine_stop_page_scripts(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->navigation.page.loaded
+        || engine->navigation.page.runtime == NULL) return false;
+    navigation_retire_current_page_scripts(&engine->navigation);
+    engine->navigation.page.script_degradation_observed = true;
+    snprintf(engine->navigation.page.script_result.summary,
+             sizeof(engine->navigation.page.script_result.summary),
+             "Page scripts stopped");
+    return true;
+}
+
+bool browser_engine_page_memory_rescued(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->navigation.page.loaded
+        && navigation_page_memory_rescued(&engine->navigation);
 }
 
 bool browser_engine_parser_script_time(const BrowserEngine *engine,
@@ -3711,14 +3913,12 @@ bool browser_engine_scroll_provisional_page(
     if (engine == NULL || direction == 0
         || browser_engine_provisional_front(engine) == NULL) return false;
     /* The same step as Page Down on a loaded page. */
-    const ViewportContext *viewport = &engine->provisional_layout->viewport;
-    int viewport_height =
-        browser_engine_provisional_viewport_height(
-            engine, engine->provisional_layout);
-    int overlap = viewport_height / 8;
-    int minimum_overlap = viewport_device_to_css(viewport, 16);
-    if (overlap < minimum_overlap) overlap = minimum_overlap;
-    int step = viewport_height - overlap;
+    ViewportContext viewport = engine->provisional_layout->viewport;
+    viewport.css_height = browser_engine_provisional_viewport_height(
+        engine, engine->provisional_layout);
+    int step = controller_page_step(
+        engine->provisional_layout, &viewport,
+        engine->provisional_scroll_y, direction);
     if (step <= 0) return false;
     return browser_engine_scroll_provisional_by(
         engine, direction > 0 ? step : -step);
@@ -4141,6 +4341,9 @@ bool browser_engine_load_url_with_limits(
         .url = url,
         .record_history = record_history
     };
+    /* A synchronous URL load is the embedder's (typed, reloaded, a lab
+       command): the refresh loop guard starts over. */
+    if (engine != NULL) navigation_note_user_input(&engine->navigation);
     if (record_history && engine != NULL && engine->navigation.page.loaded) {
         browser_engine_store_current_focus(engine);
         browser_engine_store_current_controls(engine);
@@ -4149,9 +4352,23 @@ bool browser_engine_load_url_with_limits(
     long saved_timeout = engine->config.navigation_timeout_ms;
     engine->config.maximum_document_bytes = maximum_bytes;
     engine->config.navigation_timeout_ms = timeout_ms;
+    site_identity_clear_google_fallback();
     bool loaded = browser_engine_run_load(
         engine, browser_engine_do_load_url, &load, TILEFINCH_SUBSYSTEM_NETWORK,
         TILEFINCH_DIAGNOSTIC_NETWORK_FAILED);
+    /* The synchronous form of browser_engine_google_fallback(). The opt-in
+       is already cleared, so the retry is the bounded local page. */
+    char google_fallback[NAVIGATION_URL_LIMIT];
+    if (!loaded
+        && site_identity_take_google_fallback(
+               google_fallback, sizeof(google_fallback))
+        && site_adapter_handles_navigation("GET", google_fallback)) {
+        engine->config.maximum_document_bytes = saved_maximum;
+        engine->config.navigation_timeout_ms = saved_timeout;
+        return browser_engine_load_url_with_limits(
+            engine, google_fallback, maximum_bytes, timeout_ms,
+            record_history);
+    }
     if (loaded && load.used_site_adapter) {
         (void) emit_diagnostic(
             engine, TILEFINCH_DIAGNOSTIC_INFO,
@@ -4751,6 +4968,9 @@ bool browser_engine_replace_text(BrowserEngine *engine, const char *utf8,
 {
     if (!browser_engine_input_ready(engine) || utf8 == NULL) return false;
     browser_engine_cancel_idle_work(engine);
+    /* Editing a field takes control of the page: a pending refresh would
+       discard what was typed. */
+    (void) navigation_cancel_refresh(&engine->navigation);
     return browser_engine_finish_input(
         engine, controller_replace_text(&engine->controller, utf8, length));
 }
@@ -4760,6 +4980,7 @@ bool browser_engine_insert_text(BrowserEngine *engine, const char *utf8,
 {
     if (!browser_engine_input_ready(engine) || utf8 == NULL) return false;
     browser_engine_cancel_idle_work(engine);
+    (void) navigation_cancel_refresh(&engine->navigation);
     return browser_engine_finish_input(
         engine, controller_insert_text(&engine->controller, utf8, length));
 }
@@ -4768,6 +4989,7 @@ bool browser_engine_backspace(BrowserEngine *engine)
 {
     if (!browser_engine_input_ready(engine)) return false;
     browser_engine_cancel_idle_work(engine);
+    (void) navigation_cancel_refresh(&engine->navigation);
     return browser_engine_finish_input(
         engine, controller_backspace(&engine->controller));
 }
@@ -5057,6 +5279,14 @@ bool browser_engine_page_fullscreen_active(BrowserEngine *engine)
                engine->navigation.page.runtime);
 }
 
+bool browser_engine_take_page_controls_notice(BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded
+        || script_runtime_take_page_controls_notice(
+               engine->navigation.page.runtime);
+}
+
 bool browser_engine_exit_page_fullscreen(BrowserEngine *engine)
 {
     return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
@@ -5195,6 +5425,19 @@ bool browser_engine_commit_section_html(
     return true;
 }
 
+const RenderCanvasDeferral *browser_engine_canvas_deferral(
+    const BrowserEngine *engine, const uint16_t *frame)
+{
+    if (engine == NULL || frame == NULL || frame != engine->render.frame)
+        return NULL;
+    return tile_cache_canvas_deferral(&engine->render);
+}
+
+bool browser_engine_canvas_materialize(BrowserEngine *engine)
+{
+    return engine == NULL || tile_cache_canvas_materialize(&engine->render);
+}
+
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path)
 {
@@ -5217,6 +5460,14 @@ bool browser_engine_render_frame(BrowserEngine *engine,
     bool previous_scroll_valid = engine->render.last_frame_scroll_valid;
     int previous_scroll_y = viewport_device_to_css(
         &engine->navigation.viewport, engine->render.last_frame_scroll_y);
+    {
+        /* Defer only when nothing below paints into this frame. */
+        int focus_x = 0, focus_y = 0, focus_width = 0, focus_height = 0;
+        engine->render.canvas_defer_allowed =
+            engine->find.query[0] == '\0'
+            && !browser_engine_focus_indicator_rect(
+                   engine, &focus_x, &focus_y, &focus_width, &focus_height);
+    }
     RenderCanvasFrameResult canvas_frame =
         tile_cache_render_canvas_frame_fast(
             &engine->render, scroll_y,
@@ -5262,6 +5513,8 @@ bool browser_engine_render_frame(BrowserEngine *engine,
             focus_outline.style,
             focus_outline.color, focus_outline.alpha);
     }
+    if (optional_ppm_path != NULL)
+        (void) tile_cache_canvas_materialize(&engine->render);
     if (optional_ppm_path != NULL
         && !render_write_frame_ppm(
             optional_ppm_path, engine->render.frame,
@@ -5428,6 +5681,15 @@ bool browser_engine_page_task_runnable(const BrowserEngine *engine)
             return true;
     }
     return false;
+}
+
+bool browser_engine_frame_clock_delay_ms(const BrowserEngine *engine,
+                                         unsigned *delay_ms)
+{
+    return browser_engine_input_ready(engine)
+        && engine->navigation.page.loaded
+        && script_runtime_frame_clock_delay_ms(
+            engine->navigation.page.runtime, delay_ms);
 }
 
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -5766,6 +6028,17 @@ bool browser_engine_run_idle_work(
     bool layout_still_settling = font_work
         || engine->font_load != NULL
         || navigation_background_resources_pending(&engine->navigation);
+    /* Once images and fonts have settled, keep only the painted size of
+       each decoded raster, one surface per turn. A change publishes an
+       empty-damage layout generation that the next frame applies. */
+    bool retarget_work = false;
+    bool retarget_changed = false;
+    if (!layout_still_settling) {
+        retarget_changed = navigation_run_image_retarget_work(
+            &engine->navigation);
+        retarget_work = navigation_image_retarget_pending(
+            &engine->navigation);
+    }
     bool autofocus_work = browser_engine_retry_deferred_autofocus(
         engine, layout_still_settling);
     if (autofocus_work) {
@@ -5776,11 +6049,45 @@ bool browser_engine_run_idle_work(
         &engine->render, engine->config.idle_work_budget_us,
         engine->config.idle_work_maximum_units);
     bool cache_work = false;
-    if (!layout_still_settling && !autofocus_work
-        && !tile_cache_idle_work_pending(&engine->render))
-        cache_work = browser_session_module_bytecode_disk_maintenance(
-            &engine->session);
-    return cache_work || autofocus_work || font_work
+    bool turn_quiet = !font_work && engine->font_load == NULL
+        && !autofocus_work && !tile_cache_idle_work_pending(&engine->render);
+    bool store_pending = navigation_script_bytecode_pending(
+        &engine->navigation);
+    if (turn_quiet && retarget_changed && !engine->idle_cache_waited
+        && (store_pending
+            || browser_session_lazy_bundle_pending_count(
+                   &engine->session) != 0
+            || browser_session_script_disk_enabled(&engine->session))) {
+        /* A turn that already retargeted an image surface defers the
+           compiled-script work (a store or a persistent-tier slice) by one
+           turn, and not more: the two alternate while both have work, so
+           neither starves the other and a turn does at most one of each. */
+        engine->idle_cache_waited = true;
+        cache_work = true;
+    } else if (turn_quiet && store_pending
+               && !browser_engine_navigation_pending(engine)) {
+        /* The load queued its classic bytecode stores; serialize one per
+           quiet turn. Images still arriving do not hold them back (they
+           can keep arriving for as long as the page is open); a turn that
+           did font, focus or tile work does.
+           A large script is one unbreakable unit, so pending input gets
+           the checkpoint first and the store waits a turn. */
+        engine->idle_cache_waited = false;
+        cache_work = !tilefinch_platform_cooperate(
+                "script-bytecode-store", 1)
+            || navigation_store_pending_script_bytecode(&engine->navigation)
+            || navigation_script_bytecode_pending(&engine->navigation);
+    } else if (turn_quiet && !browser_engine_navigation_pending(engine)) {
+        /* Bundle records waiting for their digest take one slice of
+           hashing per quiet turn; then the persistent tier writes what the
+           stores above put in RAM, in small slices. Like them neither
+           waits for images. */
+        engine->idle_cache_waited = false;
+        cache_work = browser_session_lazy_bundle_record_maintenance(
+                &engine->session)
+            || browser_session_script_disk_maintenance(&engine->session);
+    }
+    return cache_work || autofocus_work || font_work || retarget_work
         || navigation_background_resources_pending(&engine->navigation)
         || tile_cache_idle_work_pending(&engine->render);
 }
@@ -6459,8 +6766,10 @@ bool browser_engine_prepare_basic_view(
         return false;
     }
     if (analysis != NULL) *analysis = prepared;
-    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out
-        || prepared.extraction_truncated) return false;
+    /* A Basic view shortened by its emit bound is admitted (and labeled);
+       an omitted action is not. */
+    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out)
+        return false;
     lxb_dom_node_t *root = browser_engine_establish_reader_root(
         &engine->navigation.page, READER_PAGE_BASIC);
     if (root == NULL) {
@@ -7064,8 +7373,7 @@ BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
         return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
     }
     if (analysis != NULL) *analysis = prepared;
-    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out
-        || prepared.extraction_truncated) {
+    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out) {
         return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
     }
     lxb_dom_node_t *root = browser_engine_establish_reader_root(

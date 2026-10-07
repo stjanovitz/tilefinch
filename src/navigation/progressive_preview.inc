@@ -615,7 +615,7 @@ static void navigation_stream_try_pre_eof_preview(
     uint64_t selector_pseudos_before =
         stream->blocking_stylesheet.selector_pseudo_checks;
 #endif
-    layout_reuse_cache_stats(
+    navigation_layout_reuse_sample(
         stream->preview_layout_reuse, &reuse_before);
     bool truncated = false;
     uint64_t layout_started = navigation_now_us();
@@ -633,7 +633,7 @@ static void navigation_stream_try_pre_eof_preview(
     session->performance.layout_us += layout_elapsed;
     session->performance.progressive_layout_us += layout_elapsed;
     session->performance.streaming_preview_layout_us += layout_elapsed;
-    layout_reuse_cache_stats(
+    navigation_layout_reuse_sample(
         stream->preview_layout_reuse, &reuse_after);
     navigation_record_layout_reuse(
         session, &reuse_before, &reuse_after);
@@ -723,7 +723,11 @@ static void navigation_stream_try_pre_eof_preview(
             &preview, stream->viewport.css_width,
             stream->viewport.css_height)) {
         session->performance.streaming_preview_empty_raster_skips++;
-        preview_policy_failed(&stream->preview_policy);
+        /* The same prefix would lay out to the same nothing: wait for
+           more rendering elements (preview_policy.h). */
+        preview_policy_empty(&stream->preview_policy, &decision,
+                             policy_input.closed_content_elements,
+                             truncated);
         layout_destroy(&preview);
         return;
     }

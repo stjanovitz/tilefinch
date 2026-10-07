@@ -148,34 +148,26 @@
       dispatchVisibility(new globalThis.Event("visibilitychange"));
       return true;
     };
-    document.onDOMContentLoaded = null;
-    document.exitPointerLock = function () {};
+    document.exitPointerLock = { exitPointerLock() {} }.exitPointerLock;
   }
+  const { reflectString, secondaryDocumentPrototype } =
+    globalThis.__tilefinchDomShared;
+  delete globalThis.__tilefinchDomShared;
   {
-    const reflect = (name) => ({
-      configurable: true,
-      enumerable: true,
-      get() {
-        return this.getAttribute(name) || "";
-      },
-      set(value) {
-        this.setAttribute(name, String(value));
-      },
-    });
     /* Reflected <meta> attributes. Without the interface, meta.content fell
        through to a generic null getter; ChatGPT's mobile keyboard bootstrap
        reads viewport meta.content.includes(...) and threw. */
     Object.defineProperties(HTMLMetaElement.prototype, {
-      name: reflect("name"),
-      content: reflect("content"),
-      httpEquiv: reflect("http-equiv"),
-      media: reflect("media"),
-      scheme: reflect("scheme"),
+      name: reflectString("name"),
+      content: reflectString("content"),
+      httpEquiv: reflectString("httpEquiv", "http-equiv"),
+      media: reflectString("media"),
+      scheme: reflectString("scheme"),
     });
     Object.defineProperties(HTMLLinkElement.prototype, {
-      as: reflect("as"),
-      integrity: reflect("integrity"),
-      referrerPolicy: reflect("referrerpolicy"),
+      as: reflectString("as"),
+      integrity: reflectString("integrity"),
+      referrerPolicy: reflectString("referrerPolicy"),
       relList: {
         configurable: true,
         enumerable: true,
@@ -223,7 +215,7 @@
     Object.defineProperty(
       HTMLScriptElement.prototype,
       "integrity",
-      reflect("integrity"),
+      reflectString("integrity"),
     );
   }
   {
@@ -252,7 +244,7 @@
       hash: anchorPart("hash"),
       origin: anchorPart("origin"),
     });
-    HTMLAnchorElement.prototype.toString = function () {
+    HTMLAnchorElement.prototype.toString = function toString() {
       return this.href;
     };
   }
@@ -409,6 +401,8 @@
   globalThis.localStorage = makeStorage(true);
   globalThis.sessionStorage = makeStorage(false);
   Object.defineProperty(document, "cookie", {
+    configurable: true,
+    enumerable: true,
     get() {
       return __tilefinchCookieGet();
     },
@@ -503,14 +497,15 @@
       state.immediateStopped = false;
     }
   };
-  const eventField = (name, convert, writable = true) => ({
-    configurable: true,
-    enumerable: true,
-    get() { return eventState(this)[name]; },
-    set: writable ? function (value) {
-      eventState(this)[name] = convert(value);
-    } : undefined,
-  });
+  /* Literal accessors with computed keys are named "get type" etc. and are
+     enumerable and configurable, as WebIDL attributes are. */
+  const eventField = (name, convert, writable = true) =>
+    Object.getOwnPropertyDescriptor(writable ? {
+      get [name]() { return eventState(this)[name]; },
+      set [name](value) { eventState(this)[name] = convert(value); },
+    } : {
+      get [name]() { return eventState(this)[name]; },
+    }, name);
   Object.defineProperties(Event.prototype, {
     type: eventField("type", String, false),
     bubbles: eventField("bubbles", Boolean, false),
@@ -598,6 +593,8 @@
             ? ErrorEvent
           : name === "CompositionEvent"
             ? CompositionEvent
+          : name.toLowerCase() === "textevent"
+            ? TextEventInterface
             : name === "FocusEvent"
               ? FocusEvent
               : name === "KeyboardEvent"
@@ -607,7 +604,9 @@
                   : name === "UIEvent" || name === "UIEvents"
                     ? UIEvent
                     : Event,
-      event = new Constructor("");
+      event = Constructor === TextEventInterface
+        ? new TextEventInterface("", textEventToken)
+        : new Constructor("");
     event.__initialized = false;
     return event;
   };
@@ -737,6 +736,26 @@
       return [];
     }
   };
+  /* UI Events' legacy TextEvent: not constructible, made by
+     createEvent("TextEvent") and initTextEvent. The scheduler dispatches a
+     trusted "textInput" before beforeinput for typed text, as Chrome does,
+     so React's 'TextEvent' in window check picks a path that fires. */
+  const textEventToken = {};
+  const TextEventInterface = class TextEvent extends UIEvent {
+    constructor(type, token) {
+      if (token !== textEventToken) throw new TypeError("Illegal constructor");
+      super(type, {});
+      this.data = "";
+    }
+    initTextEvent(type, bubbles = false, cancelable = false, view = null,
+                  data = "") {
+      if (this.__dispatching) return;
+      this.initEvent(type, bubbles, cancelable);
+      this.view = view;
+      this.data = String(data);
+    }
+  };
+  globalThis.TextEvent = TextEventInterface;
   globalThis.FocusEvent = class FocusEvent extends UIEvent {
     constructor(type, options = {}) {
       super(type, options);
@@ -1094,9 +1113,13 @@
     if (on) __tilefinchSetAttribute(target.__handle, "data-tilefinch-focus", "");
     else __tilefinchRemoveAttribute(target.__handle, "data-tilefinch-focus");
   };
+  const formAssociatedCustomDisabled =
+    globalThis.__tilefinchFormAssociatedCustomDisabled;
+  delete globalThis.__tilefinchFormAssociatedCustomDisabled;
   const isFocusable = (target) => {
     if (
       target.disabled ||
+      formAssociatedCustomDisabled(target) ||
       target.hidden ||
       !target.isConnected ||
       getComputedStyle(target).visibility === "hidden"
@@ -1127,7 +1150,7 @@
     focusCheckQueued = false;
   const checkFocusAfterMutations = () => {
     focusCheckQueued = false;
-    const active = document.__activeElement;
+    const active = globalThis.__tilefinchActiveElement;
     if (
       focusFixupPending ||
       !active ||
@@ -1141,13 +1164,13 @@
       ((callback) => requestAnimationFrame(callback));
     schedule(() => {
       focusFixupPending = false;
-      const current = document.__activeElement;
+      const current = globalThis.__tilefinchActiveElement;
       if (
         current &&
         current !== document.body &&
         !isFocusable(current)
       )
-        document.__activeElement = document.body;
+        globalThis.__tilefinchActiveElement = document.body;
     });
   };
   const nativeIsAncestor = globalThis.__tilefinchIsAncestor,
@@ -1227,7 +1250,7 @@
      task). */
   globalThis.__tilefinchQueueFocusFixup = (target, type, name, added) => {
     if (focusCheckQueued || focusFixupPending) return;
-    const active = document.__activeElement;
+    const active = globalThis.__tilefinchActiveElement;
     if (!active || active === document.body) return;
     if (
       target !== undefined &&
@@ -1250,7 +1273,7 @@
       getSelection().collapse(target.firstChild, 0);
     }
   };
-  const focusElement = function () {
+  const focusElement = function focus(options = undefined) {
     const shadow = globalThis.__tilefinchShadowRootForHost?.(this);
     if (shadow?.delegatesFocus) {
       let delegated = null;
@@ -1267,11 +1290,12 @@
         return;
       }
     }
-    if (!isFocusable(this) || document.__activeElement === this) return;
-    const previous = document.__activeElement || document.body;
+    if (globalThis.__tilefinchActiveElement === this || !isFocusable(this))
+      return;
+    const previous = globalThis.__tilefinchActiveElement || document.body;
     if (!globalThis.__tilefinchFocusEventsObserved?.()) {
       if (previous && previous !== document.body) markFocus(previous, false);
-      document.__activeElement = this;
+      globalThis.__tilefinchActiveElement = this;
       collapseFocusSelection(this);
       markFocus(this, true);
       return;
@@ -1282,25 +1306,25 @@
       );
     if (previous && previous !== document.body) {
       markFocus(previous, false);
-      document.__activeElement = document.body;
+      globalThis.__tilefinchActiveElement = document.body;
       fire(previous, "blur", { relatedTarget: this });
       fire(previous, "focusout", { bubbles: true, relatedTarget: this });
     }
-    document.__activeElement = this;
+    globalThis.__tilefinchActiveElement = this;
     collapseFocusSelection(this);
     markFocus(this, true);
     fire(this, "focus", { relatedTarget: previous });
     fire(this, "focusin", { bubbles: true, relatedTarget: previous });
   };
-  const blurElement = function () {
-    if (document.__activeElement !== this) return;
+  const blurElement = function blur() {
+    if (globalThis.__tilefinchActiveElement !== this) return;
     const next = document.body,
       fire = (type, options) =>
         this.dispatchEvent(__tilefinchTrustedEvent(new FocusEvent(type, options)));
     markFocus(this, false);
     fire("blur", { relatedTarget: next });
     fire("focusout", { bubbles: true, relatedTarget: next });
-    document.__activeElement = next;
+    globalThis.__tilefinchActiveElement = next;
   };
   Element.prototype.focus = focusElement;
   Element.prototype.blur = blurElement;
@@ -1324,14 +1348,14 @@
       },
     },
   });
-  HTMLDialogElement.prototype.show = function () {
+  HTMLDialogElement.prototype.show = function show() {
     if (!this.isConnected)
       throw new DOMException("Dialog is not connected", "InvalidStateError");
     if (this.open) return;
     this.removeAttribute("data-tilefinch-modal");
     this.setAttribute("open", "");
   };
-  HTMLDialogElement.prototype.showModal = function () {
+  HTMLDialogElement.prototype.showModal = function showModal() {
     if (!this.isConnected)
       throw new DOMException("Dialog is not connected", "InvalidStateError");
     if (this.open) {
@@ -1344,29 +1368,28 @@
       this.querySelector("button,input,textarea,select,[tabindex]") || this;
     target.focus();
   };
-  HTMLDialogElement.prototype.close = function (value) {
+  HTMLDialogElement.prototype.close = function close(value) {
     if (!this.open) return;
     if (value !== undefined) this.returnValue = value;
     this.removeAttribute("open");
     this.removeAttribute("data-tilefinch-modal");
     this.dispatchEvent(__tilefinchTrustedEvent(new Event("close")));
   };
-  HTMLDialogElement.prototype.requestClose = function (value) {
+  HTMLDialogElement.prototype.requestClose = function requestClose(value) {
     if (!this.open) return;
     const event = __tilefinchTrustedEvent(
       new Event("cancel", { cancelable: true }),
     );
     if (this.dispatchEvent(event)) this.close(value);
   };
-  Object.defineProperty(HTMLDetailsElement.prototype, "open", {
-    get() {
+  Object.defineProperty(HTMLDetailsElement.prototype, "open", Object.getOwnPropertyDescriptor({
+    get open() {
       return this.hasAttribute("open");
     },
-    set(value) {
+    set open(value) {
       this.toggleAttribute("open", !!value);
     },
-    configurable: true,
-  });
+  }, "open"));
   globalThis.__tilefinchDetailsDefault = (target) => {
     if (!(target instanceof HTMLSummaryElement)) return false;
     const details = target.parentElement;
@@ -1535,17 +1558,16 @@
     }
     return true;
   };
-  Object.defineProperty(HTMLElement.prototype, "popover", {
-    get() {
+  Object.defineProperty(HTMLElement.prototype, "popover", Object.getOwnPropertyDescriptor({
+    get popover() {
       return this.getAttribute("popover");
     },
-    set(value) {
+    set popover(value) {
       value === null
         ? this.removeAttribute("popover")
         : this.setAttribute("popover", String(value));
     },
-    configurable: true,
-  });
+  }, "popover"));
   const setPopoverState = (target, open) => {
     if (!target.hasAttribute("popover"))
       throw new DOMException("Element is not a popover", "NotSupportedError");
@@ -1568,13 +1590,13 @@
     );
     return open;
   };
-  HTMLElement.prototype.showPopover = function () {
+  HTMLElement.prototype.showPopover = function showPopover() {
     setPopoverState(this, true);
   };
-  HTMLElement.prototype.hidePopover = function () {
+  HTMLElement.prototype.hidePopover = function hidePopover() {
     setPopoverState(this, false);
   };
-  HTMLElement.prototype.togglePopover = function (force) {
+  HTMLElement.prototype.togglePopover = function togglePopover(force) {
     const open =
       force === undefined
         ? !this.hasAttribute("data-tilefinch-popover-open")
@@ -2352,16 +2374,15 @@
       return node;
     };
     document.implementation.createDocumentType = makeDoctype;
-    Object.defineProperty(Element.prototype, "outerHTML", {
-      configurable: true,
-      get() {
+    Object.defineProperty(Element.prototype, "outerHTML", Object.getOwnPropertyDescriptor({
+      get outerHTML() {
         const container = (
           this.__handle !== undefined ? document : this.ownerDocument || document
         ).createElement("div");
         container.appendChild(this.cloneNode(true));
         return container.innerHTML;
       },
-      set(value) {
+      set outerHTML(value) {
         const parent = this.parentNode;
         if (!parent) return;
         const owner =
@@ -2394,8 +2415,8 @@
           nextSibling,
         );
       },
-    });
-    Document.prototype.cloneNode = function (deep = false) {
+    }, "outerHTML"));
+    Document.prototype.cloneNode = function cloneNode(deep = false) {
       const clone = new Document();
       if (deep)
         for (const child of this.childNodes || [])
@@ -2417,7 +2438,7 @@
       const doc = upgradeDocument(
         originalXMLDocument(namespace, qualifiedName || "", doctype || null),
       );
-      Object.setPrototypeOf(doc, XMLDocument.prototype);
+      Object.setPrototypeOf(doc, secondaryDocumentPrototype(XMLDocument.prototype));
       doc.createAttribute = (name) =>
         __tilefinchCreateAttribute(doc, String(name));
       doc.createAttributeNS = (namespace, name) =>
@@ -2429,7 +2450,7 @@
       const cloneXMLDocument = doc.cloneNode;
       doc.cloneNode = (deep = false) => {
         const clone = cloneXMLDocument.call(doc, deep);
-        Object.setPrototypeOf(clone, XMLDocument.prototype);
+        Object.setPrototypeOf(clone, secondaryDocumentPrototype(XMLDocument.prototype));
         return clone;
       };
       return doc;
@@ -2483,6 +2504,7 @@
     }
     Object.defineProperty(document, "doctype", {
       configurable: true,
+      enumerable: true,
       get() {
         return mainDoctype.__detachedParent === document ? mainDoctype : null;
       },
@@ -2825,14 +2847,17 @@
     return [name, value];
   };
   const installXhrValidation = (XHR) => {
-    const open = XHR.prototype.open,
-      setRequestHeader = XHR.prototype.setRequestHeader;
-    XHR.prototype.open = function (method, ...args) {
-      return open.call(this, normalizeXhrMethod(method), ...args);
+    const nativeOpen = XHR.prototype.open,
+      nativeSetRequestHeader = XHR.prototype.setRequestHeader;
+    /* WebIDL length 2: method and url are required. */
+    XHR.prototype.open = function open(method, url) {
+      const args = [...arguments];
+      args[0] = normalizeXhrMethod(method);
+      return nativeOpen.apply(this, args);
     };
-    XHR.prototype.setRequestHeader = function (name, value) {
+    XHR.prototype.setRequestHeader = function setRequestHeader(name, value) {
       [name, value] = normalizeXhrHeader(name, value);
-      return setRequestHeader.call(this, name, value);
+      return nativeSetRequestHeader.call(this, name, value);
     };
   };
   const headerStorage = new TrustedWeakMap(),
@@ -2848,6 +2873,31 @@
       trustedArraySort(entries, (left, right) =>
         left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0);
       return entries;
+    };
+  /* A no-cors Request's headers have Fetch's "request-no-cors" guard: they
+     silently keep only no-CORS-safelisted request-headers (Accept,
+     Accept-Language, Content-Language and a simple Content-Type), so a
+     disallowed header is dropped and the request still goes out.
+     js_fetch_cors.c refuses anything else as a backstop. */
+  const noCorsHeaderMaps = new TrustedWeakMap(),
+    corsUnsafeHeaderByte = /[\x00-\x08\x0a-\x1f"():<>?@[\\\]{}\x7f]/,
+    noCorsSafelisted = (name, value) => {
+      if (value.length > 128) return false;
+      if (name === "accept") return !corsUnsafeHeaderByte.test(value);
+      if (name === "accept-language" || name === "content-language")
+        return /^[0-9A-Za-z *,\-.;=]*$/.test(value);
+      if (name !== "content-type" || corsUnsafeHeaderByte.test(value))
+        return false;
+      const essence = value.split(";", 1)[0].trim().toLowerCase();
+      return essence === "application/x-www-form-urlencoded" ||
+        essence === "multipart/form-data" || essence === "text/plain";
+    },
+    noCorsHeaders = (source) => {
+      const headers = new Headers();
+      trustedWeakMapSet(noCorsHeaderMaps, headerMap(headers), true);
+      for (const [key, value] of trustedMapEntries(headerMap(source)))
+        headers.set(key, value);
+      return headers;
     };
   class Headers {
     constructor(init = {}) {
@@ -2891,23 +2941,26 @@
     append(name, value) {
       name = normalizeHeaderName(name);
       value = normalizeHeaderValue(value);
-      const map = headerMap(this);
+      const map = headerMap(this),
+        combined = trustedMapHas(map, name)
+          ? trustedMapGet(map, name) + ", " + value : value;
+      if (trustedWeakMapHas(noCorsHeaderMaps, map)
+          && !noCorsSafelisted(name, combined)) return;
       if (!trustedMapHas(map, name)
           && trustedMapSize(map) >= 256)
         throw new RangeError("Header entry limit exceeded");
-      trustedMapSet(
-        map,
-        name,
-        trustedMapHas(map, name) ? trustedMapGet(map, name) + ", " + value : value,
-      );
+      trustedMapSet(map, name, combined);
     }
     set(name, value) {
       name = normalizeHeaderName(name);
+      value = normalizeHeaderValue(value);
       const map = headerMap(this);
+      if (trustedWeakMapHas(noCorsHeaderMaps, map)
+          && !noCorsSafelisted(name, value)) return;
       if (!trustedMapHas(map, name)
           && trustedMapSize(map) >= 256)
         throw new RangeError("Header entry limit exceeded");
-      trustedMapSet(map, name, normalizeHeaderValue(value));
+      trustedMapSet(map, name, value);
     }
     get(name) {
       return trustedMapGet(headerMap(this), normalizeHeaderName(name)) ?? null;
@@ -3142,7 +3195,7 @@
       if (!isHttpToken(method) || forbiddenMethod(method))
         throw new TypeError("Invalid HTTP method");
       const normalizedMethod = method.toUpperCase(),
-        headers = new Headers(
+        initHeaders = new Headers(
         init.headers === undefined
           ? prior
             ? prior.headers
@@ -3187,6 +3240,11 @@
           : init.signal;
       if (!["same-origin", "cors", "no-cors"].includes(mode))
         throw new TypeError("Invalid request mode");
+      if (mode === "no-cors" && normalizedMethod !== "GET" &&
+          normalizedMethod !== "HEAD" && normalizedMethod !== "POST")
+        throw new TypeError("no-cors requests allow only GET, HEAD and POST");
+      const headers =
+        mode === "no-cors" ? noCorsHeaders(initHeaders) : initHeaders;
       if (!["omit", "same-origin", "include"].includes(credentials))
         throw new TypeError("Invalid credentials mode");
       if (![
@@ -3466,36 +3524,38 @@
     };
   }
   if (globalThis.console === undefined) {
-    const emit =
-      (level) =>
-      (...args) =>
-        __tilefinchConsoleLog(
-          level,
-          ...args.map((value) =>
-            value && value.stack ? String(value) + "\n" + value.stack : value,
-          ),
-        );
-    const noop = () => {};
+    /* Computed keys give every console method its own name. */
+    const emit = (level) =>
+        ({
+          [level]: (...args) =>
+            __tilefinchConsoleLog(
+              level,
+              ...args.map((value) =>
+                value && value.stack ? String(value) + "\n" + value.stack : value,
+              ),
+            ),
+        })[level],
+      noop = (name) => ({ [name]: () => {} })[name];
     globalThis.console = {
-      assert: noop,
-      clear: noop,
-      count: noop,
-      countReset: noop,
+      assert: noop("assert"),
+      clear: noop("clear"),
+      count: noop("count"),
+      countReset: noop("countReset"),
       log: emit("log"),
       info: emit("info"),
       warn: emit("warn"),
       error: emit("error"),
       debug: emit("debug"),
-      dir: noop,
-      dirxml: noop,
+      dir: noop("dir"),
+      dirxml: noop("dirxml"),
       trace: emit("trace"),
-      group: noop,
-      groupCollapsed: noop,
-      groupEnd: noop,
-      table: noop,
-      time: noop,
-      timeEnd: noop,
-      timeLog: noop,
+      group: noop("group"),
+      groupCollapsed: noop("groupCollapsed"),
+      groupEnd: noop("groupEnd"),
+      table: noop("table"),
+      time: noop("time"),
+      timeEnd: noop("timeEnd"),
+      timeLog: noop("timeLog"),
     };
   }
   const nativeManagedHeaders = new Set([
@@ -3641,6 +3701,11 @@
     }
     return total;
   };
+  /* Whether the queue can admit one more request retaining `bytes`, as
+     networkRetainedBytes counts them. */
+  const networkQueueAdmits = (bytes) =>
+    networkQueueStats.currentCount < networkQueueLimit &&
+    bytes <= networkQueueByteLimit - networkQueueStats.currentBytes;
   const releaseNetwork = (entry) => {
     if (!entry || !pendingNetwork.has(entry.id)) return false;
     pendingNetwork.delete(entry.id);
@@ -3714,14 +3779,12 @@
     timingRecorder = __tilefinchRecordResourceTiming,
   ) => {
     bytes = Math.max(128, Math.floor(Number(bytes) || 128));
-    if (
-      networkQueueStats.currentCount >= networkQueueLimit ||
-      bytes > networkQueueByteLimit - networkQueueStats.currentBytes
-    ) {
+    if (!networkQueueAdmits(bytes)) {
       networkQueueStats.rejected++;
       if (bytes > networkQueueByteLimit - networkQueueStats.currentBytes)
         networkQueueStats.rejectedBytes++;
-      throw new RangeError("network pending queue quota exceeded");
+      /* Concurrency only queues; a full queue is a network error. */
+      throw new TypeError("network pending queue quota exceeded");
     }
     let id = nextNetworkId++;
     if (id > Number.MAX_SAFE_INTEGER) {
@@ -3858,11 +3921,6 @@
     queueMicrotask(pumpNetworkQueue);
     return true;
   };
-  Object.defineProperty(globalThis, "__tilefinchPendingNetworkRequests", {
-    value: () => networkQueueStats.waiting,
-    writable: false,
-    configurable: false,
-  });
   const snapshotLocalBlobRequest = (method, inputURL) => {
     const url = new URL(inputURL, location.href).href;
     if (!url.startsWith("blob:")) return null;
@@ -4012,25 +4070,25 @@
           state.body, 256 * 1024);
         return bytes;
       };
-    Response.prototype.text = function () {
+    Response.prototype.text = function text() {
       return takeBytes(this).then((bytes) => new TextDecoder().decode(bytes));
     };
-    Response.prototype.json = function () {
+    Response.prototype.json = function json() {
       return this.text().then(JSON.parse);
     };
-    Response.prototype.arrayBuffer = function () {
+    Response.prototype.arrayBuffer = function arrayBuffer() {
       return takeBytes(this).then((bytes) => bytes.buffer);
     };
-    Response.prototype.bytes = function () {
+    Response.prototype.bytes = function bytes() {
       return this.arrayBuffer().then((buffer) => new Uint8Array(buffer));
     };
-    Response.prototype.blob = function () {
+    Response.prototype.blob = function blob() {
       return takeBytes(this).then(
         (bytes) => new Blob([bytes], {
           type: this.headers.get("content-type") || "",
         }));
     };
-    Response.prototype.formData = function () {
+    Response.prototype.formData = function formData() {
       const type = this.headers.get("content-type") || "";
       if (!type.startsWith("application/x-www-form-urlencoded"))
         return Promise.reject(new TypeError("Unsupported form data encoding"));
@@ -4041,7 +4099,7 @@
         return data;
       });
     };
-    Response.prototype.clone = function () {
+    Response.prototype.clone = function clone() {
       if (this.bodyUsed || this.body?.locked)
         throw new TypeError("Body has already been consumed");
       const init = {
@@ -4279,8 +4337,9 @@
       return Promise.reject(error);
     }
   };
-  globalThis.fetch = (input, init = {}) =>
+  const fetch = (input, init = {}) =>
     fetchInternal(input, init, __tilefinchRecordResourceTiming);
+  globalThis.fetch = fetch;
   /* Dedicated workers own a separate performance timeline.  Their wrapper
      records the filtered Response surface in that timeline, so suppress the
      Window entry here without exposing native phase timings to a callback
@@ -4313,26 +4372,40 @@
         const target = new URL(String(url), location.href);
         if (target.protocol !== "http:" && target.protocol !== "https:")
           return false;
-        const request = new Request(target.href, {
-            method: "POST",
-            body: data,
-            credentials: "include",
-            keepalive: true,
-          }),
-          serialized = serializeRequestBody(request),
-          bytes =
-            serialized === undefined
-              ? 0
-              : typeof serialized === "string"
-                ? new TextEncoder().encode(serialized).byteLength
-                : serialized.byteLength;
+        /* Extract the body once, before any Request exists: measuring a
+           Request's body consumes it, and the fetch() of that Request then
+           rejected, so no beacon carrying data was ever sent. The same
+           extraction fixes the Content-Type (text/plain, a Blob's type,
+           multipart with boundary, urlencoded). */
+        const headers = new Headers(),
+          body =
+            data === null || data === undefined
+              ? null
+              : snapshotRequestBody(data, headers);
+        /* Admit exactly as the fetch below will be queued, URL and headers
+           included: true must mean the beacon was queued. */
         if (
-          bytes > 64 * 1024 ||
-          networkQueueStats.currentCount >= networkQueueLimit ||
-          networkQueueStats.currentBytes + bytes > networkQueueByteLimit
+          (body !== null && body.byteLength > 64 * 1024) ||
+          !networkQueueAdmits(
+            networkRetainedBytes(
+              "POST",
+              target.href,
+              body,
+              headers.get("content-type") || "",
+              nativeHeaderBlock(headers),
+              "cors",
+              "include",
+            ),
+          )
         )
           return false;
-        fetch(request).catch(() => {});
+        fetch(target.href, {
+          method: "POST",
+          body,
+          headers,
+          credentials: "include",
+          keepalive: true,
+        }).catch(() => {});
         return true;
       } catch (_) {
         return false;
@@ -4793,13 +4866,17 @@
     configurable: false,
     enumerable: false,
     value: Object.freeze({
-      requestPageControls(target = document.documentElement) {
+      /* {notice: "once"} only quiets a repeat of the native exit notice:
+         the browser still shows it on this document's first entry. */
+      requestPageControls(target = document.documentElement, options) {
         if (!target || typeof target.requestFullscreen !== "function") {
           return Promise.reject(new TypeError("Page controls need an element"));
         }
+        __tilefinchPageControlsNotice(options?.notice === "once");
         return target.requestFullscreen();
       },
       pageControlsExitChord: "Start+Select",
+      pageControlsNotices: Object.freeze(["always", "once"]),
     }),
   });
   {
@@ -5741,16 +5818,19 @@
   /* Small device-state APIs live with the compatibility layer so platform.js
      remains below the source-fallback admission ceiling. Public objects are
      still allocated only when author code first asks for each capability. */
+  /* Every powerful-feature name in the Permissions Registry and the
+     earlier PermissionName enum (which fingerprinting scripts still walk)
+     answers "denied": the PSP has none of these features. Other names
+     reject with a TypeError, as the Permissions spec requires. One string,
+     not a Set: it is all the realm keeps for them. */
   const platformStatusToken = {},
-    permissionNames = new Set([
-      "camera",
-      "clipboard-read",
-      "clipboard-write",
-      "geolocation",
-      "microphone",
-      "notifications",
-      "persistent-storage",
-    ]);
+    permissionNames = " accelerometer accessibility-events \
+ambient-light-sensor background-fetch background-sync bluetooth camera \
+clipboard clipboard-read clipboard-write device-info display-capture \
+geolocation gyroscope idle-detection local-fonts magnetometer microphone \
+midi nfc notifications payment-handler periodic-background-sync \
+persistent-storage push screen-wake-lock speaker speaker-selection \
+storage-access window-management ";
   let networkInformation = null,
     batteryManager = null,
     batteryPromise = null,
@@ -5872,7 +5952,7 @@
         if (typeof value === "symbol")
           throw new TypeError("Symbol is not a string");
         name = String(value);
-        if (!permissionNames.has(name))
+        if (name.includes(" ") || !permissionNames.includes(" " + name + " "))
           throw new TypeError("Unsupported permission name");
       } catch (error) {
         return Promise.reject(error);

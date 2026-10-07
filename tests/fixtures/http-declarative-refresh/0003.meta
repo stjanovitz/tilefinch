@@ -1,0 +1,17 @@
+psp-http-trace=1
+method=GET
+url=https://refresh.test/header
+success=1
+async-delay-pumps=1
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=111
+effective-url=https://refresh.test/header
+content-type=text/html; charset=utf-8
+server=fixture
+set-cookie-count=0
+response-header-count=2
+response-header-0=content-type: text/html; charset=utf-8
+response-header-1=refresh: 0; url=/target-header

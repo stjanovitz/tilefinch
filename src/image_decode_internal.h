@@ -11,6 +11,7 @@ typedef struct {
     ImageDecodeStatus status;
     unsigned char *pixels;
     size_t pixel_bytes;
+    size_t working_bytes;
     int source_width;
     int source_height;
 } ImageDecodeWorkerResult;
@@ -28,6 +29,22 @@ typedef enum {
 } ImageDecodeProbeResult;
 
 bool image_decode_busy(void);
+/* Peak bytes the last image_resource_decode_checked() held at once (its
+   allocations, libwebp's, and the output). */
+size_t image_decode_last_peak_bytes(void);
+/* Point sampling, shared by every reduction (after a full-size decode, the
+   streaming row sampler and display retargeting) so their pixels stay
+   identical: target index `at` of `target` takes source index
+   at * source / target. */
+static inline int image_point_sample_index(int at, int source, int target)
+{
+    return (int) ((int64_t) at * source / target);
+}
+/* Point-samples a source_width x source_height RGBA surface into a
+   target_width x target_height one. */
+void image_point_sample_rgba(const unsigned char *source, int source_width,
+                             int source_height, unsigned char *target,
+                             int target_width, int target_height);
 ImageDecodeProbeResult image_decode_probe_info(
     Budget *budget, const unsigned char *encoded, size_t encoded_length,
     int *width, int *height, int *components, bool *is_webp);

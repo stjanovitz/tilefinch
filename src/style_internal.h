@@ -487,7 +487,11 @@ struct StyleRuleIndexBucket {
     uint32_t representative;
     uint32_t first;
     uint32_t count;
-    uint32_t fill;
+    /* The bucket's rules that are not shadow-scoped (adopted only by
+       shadow roots) come first, ascending; the scoped ones follow,
+       ascending. An element outside every adopting carrier is planned on
+       the first part alone. Equal to `count` when nothing is scoped. */
+    uint32_t unscoped;
 };
 
 #define STYLE_TOKEN_BLOOM_WORDS 2u
@@ -516,8 +520,54 @@ struct StyleRuleFilter {
        raster resolves. INHERITED (colour, font size, var()) reaches the SVG
        from any element the rule matches; SIZE (width/height) only from the
        SVG itself, so only tokens outside the rightmost compound count. */
-    uint8_t svg_raster;
+    uint8_t svg_raster : 2;
+    /* One-based ancestor-mask bit (style_rule_ancestor_token_bit) of a
+       class or ID some ancestor of every element this rule matches
+       carries; zero for none. Set only for rules in the universal
+       range. */
+    uint8_t ancestor_token : 6;
 };
+
+/* Exact ancestor requirements of universal-range rules. The 64-bit token
+   Bloom saturates on utility-CSS documents (a dozen classes per element,
+   twenty ancestors deep), so rules such as Tailwind's `:is(.\*\*\:x *)`
+   that every element is a candidate for were walked up every element's
+   whole ancestor chain. A rule naming one of these tokens is rejected
+   without matching when no ancestor carries it. */
+#define STYLE_RULE_ANCESTOR_TOKEN_LIMIT 255u
+#define STYLE_RULE_ANCESTOR_TOKEN_SLOTS 512u
+/* Tokens share the 63 bits of an ancestor mask (and the six-bit filter
+   field) by index: past 63 tokens two share a bit, which can only admit a
+   candidate the matcher then rejects. */
+#define STYLE_RULE_ANCESTOR_TOKEN_BITS 63u
+struct StyleRuleAncestorTokens {
+    uint32_t hashes[STYLE_RULE_ANCESTOR_TOKEN_LIMIT];
+    /* Open-addressed by hash: one-based index into `hashes`, 0 empty. */
+    uint8_t slots[STYLE_RULE_ANCESTOR_TOKEN_SLOTS];
+    uint8_t count;
+    /* Distinguishes tables in per-build ancestor caches. */
+    uint32_t stamp;
+};
+
+/* The mask bit (one-based, as kept in StyleRuleFilter.ancestor_token) of
+   a token's one-based table index. */
+static inline unsigned style_rule_ancestor_token_bit(unsigned index)
+{
+    return index == 0 ? 0u : (index - 1u) % STYLE_RULE_ANCESTOR_TOKEN_BITS + 1u;
+}
+
+static inline unsigned style_rule_ancestor_token_find(
+    const struct StyleRuleAncestorTokens *tokens, uint32_t hash)
+{
+    for (size_t probe = 0, slot = hash & (STYLE_RULE_ANCESTOR_TOKEN_SLOTS - 1u);
+         probe < STYLE_RULE_ANCESTOR_TOKEN_SLOTS;
+         probe++, slot = (slot + 1u) & (STYLE_RULE_ANCESTOR_TOKEN_SLOTS - 1u)) {
+        unsigned index = tokens->slots[slot];
+        if (index == 0) return 0;
+        if (tokens->hashes[index - 1u] == hash) return index;
+    }
+    return 0;
+}
 #define STYLE_RULE_SVG_RASTER_INHERITED UINT8_C(1)
 #define STYLE_RULE_SVG_RASTER_SIZE UINT8_C(2)
 void stylesheet_note_style_source(Stylesheet *sheet,
@@ -612,6 +662,9 @@ typedef enum {
     STYLE_PSEUDO_NTH_TYPE,
     STYLE_PSEUDO_NTH_LAST_CHILD,
     STYLE_PSEUDO_NTH_LAST_TYPE,
+    /* :host as the matcher sees it: an element hosting a shadow tree. Which
+       tree's rules may use it is decided by style_shadow_scope_admits. */
+    STYLE_PSEUDO_HOST,
 } StylePseudoKind;
 
 StylePseudoKind style_pseudo_kind(const char *text, size_t length);
@@ -658,13 +711,20 @@ static inline bool style_token_bloom_missing(StyleTokenBloom required,
     return false;
 }
 
-static inline StyleTokenBloom style_compound_token_bloom(
+static inline uint32_t style_token_hash(
     StyleSelectorOpcode opcode, const char *text, size_t length)
 {
     uint32_t hash = UINT32_C(2166136261) ^ (uint32_t) opcode;
     for (size_t i = 0; i < length; i++) {
         hash = (hash ^ (unsigned char) text[i]) * UINT32_C(16777619);
     }
+    return hash;
+}
+
+static inline StyleTokenBloom style_compound_token_bloom(
+    StyleSelectorOpcode opcode, const char *text, size_t length)
+{
+    uint32_t hash = style_token_hash(opcode, text, length);
     StyleTokenBloom bloom = style_token_bloom_empty();
     for (size_t word = 0; word < STYLE_TOKEN_BLOOM_WORDS; word++) {
         uint32_t mixed = hash + UINT32_C(0x9e3779b9) * (uint32_t) word;
@@ -727,6 +787,10 @@ typedef struct {
     const char *classes;
     size_t classes_length;
     uintptr_t tag_id;
+    /* The adopted sources whose carriers contain the element (see
+       style_adopted_scope_admits), found on first need. */
+    uint64_t adopted_scope;
+    bool adopted_scope_known;
 } StyleMatchSubject;
 
 void style_match_subject_prepare(lxb_dom_node_t *node,
@@ -753,6 +817,9 @@ typedef struct {
     uint32_t scope;
     uint16_t count;
     bool usable;
+    /* One bit per token from its length and end bytes: most class tests
+       fail, and a clear bit answers without hashing the wanted name. */
+    uint64_t quick;
     char copy[STYLE_CLASS_TOKEN_COPY];
     uint32_t hashes[STYLE_CLASS_TOKEN_LIMIT];
     uint16_t offsets[STYLE_CLASS_TOKEN_LIMIT];
@@ -761,12 +828,19 @@ typedef struct {
     uint8_t slots[128];
 } StyleClassTokens;
 
+/* Prepared subjects (tag, id and class lookups) of the elements a
+   compiled descendant/child walk visits, which every candidate rule
+   repeats for the same ancestors. Valid only inside the scope that holds
+   the DOM immutable, like the class token sets. */
+#define STYLE_SUBJECT_CACHE_SIZE 64u
 typedef struct StyleClassTokenCache {
     StyleClassTokens sets[STYLE_CLASS_TOKEN_SETS];
     /* The current outermost scope; never zero once a scope has begun. */
     uint32_t scope;
     uint8_t next;
     uint8_t last;
+    StyleMatchSubject subjects[STYLE_SUBJECT_CACHE_SIZE];
+    uint32_t subject_scopes[STYLE_SUBJECT_CACHE_SIZE];
 } StyleClassTokenCache;
 
 /* Whether the subject's class list contains `key`. Within a class-token
@@ -782,16 +856,13 @@ bool style_subject_has_class(const Stylesheet *sheet,
 void style_class_tokens_scope_begin(const Stylesheet *sheet);
 void style_class_tokens_scope_end(const Stylesheet *sheet);
 
+#define STYLE_VARIABLE_RESOLVING_LIMIT 4u
+#define STYLE_VARIABLE_SUBSTITUTION_LIMIT 256u
+
 struct StyleResolveScratch {
     /* Class-token scopes in progress: class-token sets (on the Stylesheet)
        are valid only while this is non-zero. */
     uint32_t class_tokens_depth;
-    /* Lexical-only summary. Never cache a DOM match or computed display:
-       head/html attributes can change without a stylesheet generation. */
-    uint64_t head_script_generation;
-    struct { uint32_t selector_index, prefix_length; } head_script_subjects[16];
-    uint8_t head_script_subject_count;
-    uint8_t head_script_summary; /* 0 unknown, 1 bounded subjects, 2 unsafe */
     /* Image-source provenance for the declarations currently being
        parsed (external stylesheet base URL / referrer policy / slot). */
     const char *current_image_source_base;
@@ -801,6 +872,20 @@ struct StyleResolveScratch {
        consulted by var()/em/rem reparsing. */
     lxb_dom_node_t *resolution_node;
     PseudoElement resolution_pseudo;
+    /* Custom-property declarations whose var() references are being
+       resolved (innermost last). A nested lookup of one of them is a
+       reference cycle; see variable_resolve_at_declaration. */
+    struct {
+        const lxb_dom_node_t *node;
+        PseudoElement pseudo;
+        const char *name;
+        size_t name_length;
+    } variable_resolving[STYLE_VARIABLE_RESOLVING_LIMIT];
+    unsigned variable_resolving_count;
+    /* var() expansion work under the outermost resolution in progress;
+       see lookup_variable. */
+    unsigned variable_work_nesting;
+    unsigned variable_substitutions;
     int font_resolution_parent;
     int font_resolution_inherited;
     int font_resolution_root;
@@ -829,6 +914,11 @@ struct StyleResolveScratch {
     int container_inline_basis;
     int container_block_basis;
     bool container_basis_active;
+    /* Container-query evaluations of one probe layout pass, re-checked
+       against the geometry that pass measured (style_queries.c). Held by
+       pointer: nested resolutions save and restore this whole struct, and
+       must not roll the log back. */
+    struct StyleContainerLog *container_log;
     /* Retained matched-rule table attached by the layout reuse owner for one
        element resolution, plus the element currently being recorded. */
     struct StyleRetainedMatches *retained_matches;
@@ -836,7 +926,107 @@ struct StyleResolveScratch {
     uint8_t retained_pending_count;
     bool retained_pending_active;
     bool retained_pending_valid;
+    /* The adopted-scope mask of the element last asked about, valid in the
+       class-token scope it was computed in (the DOM cannot change there). */
+    const lxb_dom_node_t *adopted_scope_node;
+    uint32_t adopted_scope_tokens_scope;
+    uint64_t adopted_scope_mask;
 };
+
+/* A shadow-root carrier and the adopted sources (bits, see
+   Stylesheet.adopted_shadow_only_mask) its list holds. */
+typedef struct StyleAdoptedScopeRoot {
+    const lxb_dom_node_t *root;
+    uint64_t mask;
+    /* Position in this root's list, plus one; zero means not adopted. */
+    uint8_t order[64];
+} StyleAdoptedScopeRoot;
+
+uint64_t style_adopted_cascade_order(const Stylesheet *sheet,
+                                    const lxb_dom_node_t *node, unsigned order);
+
+/* Whether a rule of cascade order `order` may apply to `node`: false only
+   for a rule of an adopted sheet that just shadow roots adopt, at an
+   element outside every one of their carriers. */
+bool style_adopted_scope_admits(const Stylesheet *sheet, unsigned order,
+                                const lxb_dom_node_t *node,
+                                const StyleMatchSubject *subject);
+/* The adopted source (its bit, as in Stylesheet.adopted_shadow_only_mask)
+   holding the rule of cascade order `order`; 0 for a document source. */
+uint64_t style_adopted_source_bit(const Stylesheet *sheet, unsigned order);
+/* The adopted sources whose carriers contain `node`, memoized on
+   `subject` when it was prepared for `node`. */
+uint64_t style_subject_adopted_scope(const Stylesheet *sheet,
+                                     const StyleMatchSubject *subject,
+                                     const lxb_dom_node_t *node);
+/* A shadow host (:host) and a host's light child (::slotted) are reached
+   by their tree's scoped rules although they lie outside its carrier. */
+bool style_subject_near_shadow_tree(const StyleMatchSubject *subject);
+/* Whether the rule index keeps shadow-scoped rules apart (see
+   StyleRuleIndexBucket.unscoped) and `subject` lies outside every
+   adopting carrier, so its plan may leave those rules out. */
+static inline bool style_subject_outside_adopted_scopes(
+    const Stylesheet *sheet, const StyleMatchSubject *subject)
+{
+    return sheet->rule_index_scoped_split && subject != NULL
+        && style_subject_adopted_scope(sheet, subject, subject->node) == 0
+        && !style_subject_near_shadow_tree(subject);
+}
+/* The same for the custom-property index, which sorts by the current
+   shadow-only mask whenever it is built (it is dropped when that moves). */
+static inline bool style_subject_outside_custom_scopes(
+    const Stylesheet *sheet, const StyleMatchSubject *subject)
+{
+    return sheet->custom_rule_index_ready
+        && sheet->adopted_shadow_only_mask != 0 && subject != NULL
+        && style_subject_adopted_scope(sheet, subject, subject->node) == 0
+        && !style_subject_near_shadow_tree(subject);
+}
+/* One shadow tree's <style> (Stylesheet.shadow_scopes): rules with
+   begin <= order < end belong to the tree under `carrier`. */
+#define STYLE_SHADOW_SCOPE_LIMIT 256u
+typedef struct StyleShadowScope {
+    unsigned begin;
+    unsigned end;
+    const lxb_dom_node_t *carrier;
+} StyleShadowScope;
+
+/* Records the rules [begin, end) just parsed from `element` as confined to
+   its shadow tree when it lies in a carrier. Refusal keeps them global. */
+void stylesheet_note_shadow_scope(Stylesheet *sheet,
+                                  const lxb_dom_node_t *element,
+                                  unsigned begin, unsigned end);
+/* Rewrites a selector of a scoped source for the matcher: `:host(X)` to
+   `:host:is(X)` and `P::slotted(X)` to `:host > :is(X)`. False when the
+   selector uses either and must be dropped (an unscoped source, or no
+   room); `output` is unused when *rewritten stays false. */
+bool style_shadow_selector_rewrite(const Stylesheet *sheet,
+                                   const char *selector, size_t length,
+                                   char *output, size_t capacity,
+                                   bool *rewritten);
+/* Whether a shadow-confined rule (adopted by shadow roots only, or from a
+   shadow tree's <style>) may apply to `node`, given its selector: a :host
+   rule applies to the scope's host, a ::slotted() rule to the host's light
+   children, any other rule inside the tree. */
+bool style_shadow_scope_admits(const Stylesheet *sheet, unsigned order,
+                               const char *selector, size_t selector_length,
+                               const lxb_dom_node_t *node,
+                               const StyleMatchSubject *subject);
+
+/* `subject` (NULL when none is prepared) memoizes the element's scope for
+   the rest of its resolution. */
+static inline bool style_adopted_rule_in_scope(const Stylesheet *sheet,
+                                               unsigned order,
+                                               const char *selector,
+                                               size_t selector_length,
+                                               const lxb_dom_node_t *node,
+                                               const StyleMatchSubject *subject)
+{
+    return (sheet->adopted_shadow_only_mask == 0
+            && sheet->shadow_scope_count == 0 && !sheet->adopted_scopes_failed)
+        || style_shadow_scope_admits(sheet, order, selector,
+                                     selector_length, node, subject);
+}
 
 #define STYLE_CONTAINER_QUERY_LIMIT 63u
 #define STYLE_CONTAINER_NAME_LIMIT 32u
@@ -868,6 +1058,21 @@ typedef struct StyleContainerState {
     uint8_t type;
     bool occupied;
 } StyleContainerState;
+
+typedef struct StyleContainerLogEntry {
+    lxb_dom_node_t *node;
+    uint8_t query;
+    bool matched;
+} StyleContainerLogEntry;
+
+typedef struct StyleContainerLog {
+    StyleContainerLogEntry *entries;
+    size_t count;
+    size_t capacity;
+    const void *owner;
+    bool active;
+    bool overflow;
+} StyleContainerLog;
 
 typedef struct StyleContainerMatchCacheEntry {
     lxb_dom_node_t *node;
@@ -1038,16 +1243,27 @@ _Static_assert(sizeof(StyleGridAreaRect) == 5,
                "named Grid area rectangles must remain compact");
 _Static_assert(sizeof(StyleGridAreaTemplate) == 64,
                "named Grid templates must remain compact");
-_Static_assert(sizeof(StyleGridTrackTemplate) == 88,
+/* 24 tracks with up to four names per line: 222 bytes per template,
+   allocated four at a time only by stylesheets that declare track lists (at
+   most 31 templates, 6.9 KiB). */
+_Static_assert(sizeof(StyleGridTrackTemplate) == 222,
                "Grid track templates must remain compact");
-_Static_assert(sizeof(StyleGridAreas) == 3555,
+_Static_assert(sizeof(StyleGridAreas) == 4355,
                "optional Grid metadata must remain within its PSP budget");
 _Static_assert(sizeof(StyleCustomRule) <= 3u * sizeof(void *) + 24u,
                "retained sparse-rule metadata must stay compact");
 _Static_assert(STYLE_CUSTOM_SELECTOR_CAPACITY <= UINT8_MAX + 1u
-               && STYLE_CUSTOM_NAME_CAPACITY <= UINT8_MAX + 1u
-               && STYLE_CUSTOM_VALUE_CAPACITY <= UINT8_MAX + 1u,
+               && STYLE_CUSTOM_NAME_CAPACITY <= UINT8_MAX + 1u,
                "custom rule text lengths must fit their uint8_t fields");
+_Static_assert(STYLE_CUSTOM_VALUE_CAPACITY <= UINT16_MAX
+               && STYLE_CUSTOM_SHORT_VALUE_CAPACITY
+                  < STYLE_CUSTOM_RESOLVED_CAPACITY
+               && STYLE_CUSTOM_RESOLVED_CAPACITY
+                  <= STYLE_CUSTOM_VALUE_CAPACITY
+               && STYLE_CUSTOM_SELECTOR_CAPACITY + STYLE_CUSTOM_NAME_CAPACITY
+                  + STYLE_CUSTOM_VALUE_CAPACITY
+                  < STYLE_SELECTOR_CHUNK_MAX_BYTES,
+               "custom-property value limits must nest and fit the arena");
 
 /* CSS initial font size and the engine's used-font-size clamp (px). */
 #define STYLE_DEFAULT_FONT_PX 16
@@ -1363,6 +1579,12 @@ bool class_contains_length(const char *classes, size_t length,
 
 /* selector scanning shared with the sheet builder */
 size_t skip_selector_identifier(const char *text, size_t length, size_t at);
+/* The compound matcher's own identifier decoding: `text` itself when it has
+   no escape, else its CSS-unescaped form in `scratch`; NULL when the matcher
+   could never compare it (too long for `capacity`, or malformed). */
+const char *style_selector_identifier_span(const char *text, size_t length,
+                                           char *scratch, size_t capacity,
+                                           size_t *decoded_length);
 
 
 /* style_sheet.c: rule-index access shared with the resolver */

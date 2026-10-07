@@ -1603,10 +1603,18 @@ static bool trace_replay_response_with_scratch(
                  "HTTP replay record %zu exceeds request quota", sequence);
         return false;
     }
+    /* A live response that crossed its byte cap fails with the received
+       prefix still in the result; the capture recorded exactly that prefix.
+       The deferred (scheduler) path replays it the same way, so consumers
+       that use a capped prefix see what the device saw. */
+    bool limit_truncated = !recorded_success && writer != NULL
+        && writer->defer_replay_body
+        && result->status_code >= 200 && result->status_code <= 299
+        && strcmp(result->error, "response quota exceeded") == 0;
     /* CORS is a response-metadata gate. A denied successful record must not
        even open the body file, both to preserve the no-body-exposure boundary
        and to avoid leaking a replay FILE on this early return. */
-    if (recorded_success
+    if ((recorded_success || limit_truncated)
         && !replay_cors_response_allows(request, url, result)) {
         /* Response-keyed selection resolved one retained record before this
            browser-policy gate. Count the occurrence as deterministically
@@ -1645,7 +1653,7 @@ static bool trace_replay_response_with_scratch(
             return false;
         }
     }
-    if (!recorded_success) {
+    if (!recorded_success && !limit_truncated) {
         uint64_t body_hash = 0;
         bool body_ok = trace_open_body_hash(body, recorded_length, &body_hash)
             && (trace_version < 6 || body_hash == recorded_response_hash);
@@ -1665,6 +1673,10 @@ static bool trace_replay_response_with_scratch(
         writer->deferred_replay_body = body;
         writer->deferred_replay_length = recorded_length;
         writer->replay_rekey = rekey;
+        if (limit_truncated) {
+            writer->replay_limit_truncated = true;
+            result->error[0] = '\0';
+        }
         return true;
     }
     if (writer != NULL && writer->stream != NULL) {
@@ -2242,6 +2254,20 @@ static bool trace_replay_response(Budget *budget, const char *method,
                sizeof(normalized_logical_url))
         || !tilefinch_url_request_key(normalized_logical_url, canonical_url,
                                    sizeof(canonical_url))) return false;
+#ifndef __PSP__
+    {
+        TilefinchTestFaults *faults = tilefinch_test_faults();
+        size_t slot = faults->replayed_request_count++
+            % (sizeof(faults->replayed_requests)
+               / sizeof(faults->replayed_requests[0]));
+        snprintf(faults->replayed_requests[slot].url,
+                 sizeof(faults->replayed_requests[slot].url), "%s",
+                 canonical_url);
+        snprintf(faults->replayed_requests[slot].user_agent,
+                 sizeof(faults->replayed_requests[slot].user_agent), "%s",
+                 effective_user_agent == NULL ? "" : effective_user_agent);
+    }
+#endif
     TraceReplayScratch *scratch = budget_malloc(budget, sizeof(*scratch));
     if (scratch == NULL) return false;
     fetch_trace.replay_request_count++;

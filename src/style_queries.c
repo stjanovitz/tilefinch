@@ -17,6 +17,13 @@ typedef struct {
     bool valid;
 } ContainerConditionParser;
 
+/* Geometry table for a first pass with nothing measured yet (the measured
+   collection sizes its own from the boxes). */
+#define STYLE_CONTAINER_LOG_STATE_GUESS 512u
+/* Evaluations one pass may log before it is declared unverifiable. */
+#define STYLE_CONTAINER_LOG_INITIAL 256u
+#define STYLE_CONTAINER_LOG_LIMIT 16384u
+
 static void query_trim(const char **text, size_t *length)
 {
     while (*length != 0 && isspace((unsigned char) (*text)[0])) {
@@ -261,25 +268,53 @@ bool style_container_layout_state_begin(Stylesheet *sheet, Budget *budget,
     return true;
 }
 
-bool style_container_layout_state_add(Stylesheet *sheet,
-                                      lxb_dom_node_t *node,
-                                      int content_width,
-                                      int content_height,
-                                      int padding_horizontal,
-                                      int padding_vertical)
+static void container_state_store(Stylesheet *sheet, lxb_dom_node_t *node,
+                                  uint32_t names, uint8_t type,
+                                  int content_width, int content_height)
 {
-    if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL) {
-        return false;
-    }
     StyleResolveScratch *scratch = sheet->resolve_scratch;
-    if (scratch->container_states == NULL
-        || scratch->container_state_capacity == 0) return false;
+    size_t mask = scratch->container_state_capacity - 1u;
+    size_t home = container_pointer_hash(node) & mask;
+    for (size_t probe = 0; probe < 8; probe++) {
+        StyleContainerState *state =
+            &scratch->container_states[(home + probe) & mask];
+        if (!state->occupied || state->node == node) {
+            if (!state->occupied) scratch->container_state_count++;
+            *state = (StyleContainerState) {
+                .node = node,
+                .name_bits = names,
+                .content_width = content_width < 0 ? 0 : content_width,
+                .content_height = content_height < 0 ? 0 : content_height,
+                .type = type,
+                .occupied = true
+            };
+            sheet->container_state_generation++;
+            if (STYLE_TRACE(sheet, LAYOUT)) {
+                fprintf(stderr,
+                        "style-container-state node=%p type=%u names=%08x "
+                        "content=%dx%d\n",
+                        (void *) node, (unsigned) type, (unsigned) names,
+                        state->content_width, state->content_height);
+            }
+            return;
+        }
+    }
+    /* A pathological collision cluster degrades by omitting this container,
+       never by growing an unbounded chain. */
+}
 
+/* Whether `node` establishes a container, and its type and names. Resolved
+   with the geometry table hidden: size-querying container-type is
+   circular by definition. */
+static void container_establishment(Stylesheet *sheet, lxb_dom_node_t *node,
+                                    uint8_t *type, uint32_t *names)
+{
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    *type = STYLE_CONTAINER_TYPE_NONE;
+    *names = 0;
     char type_value[96] = {0};
     char name_value[96] = {0};
     char shorthand[96] = {0};
-    uint8_t type = STYLE_CONTAINER_TYPE_NONE;
-    uint32_t names = 0;
 
     /* Container establishment itself is resolved without the table being
        assembled. This avoids order-dependent partial state while node boxes
@@ -308,29 +343,48 @@ bool style_container_layout_state_add(Stylesheet *sheet,
             size_t type_length = strlen(type_text);
             query_trim(&name, &name_length);
             query_trim(&type_text, &type_length);
-            (void) parse_container_type_value(type_text, type_length, &type);
-            names = container_name_bits(sheet, name, name_length);
+            (void) parse_container_type_value(type_text, type_length, type);
+            *names = container_name_bits(sheet, name, name_length);
         } else {
             const char *value = shorthand;
             size_t value_length = strlen(shorthand);
             query_trim(&value, &value_length);
             if (!query_span_case_equal(value, value_length, "none")
                 && !parse_container_type_value(
-                    value, value_length, &type)) {
+                    value, value_length, type)) {
                 /* A recognized type may stand alone. Any other non-none
                    token is the name-only shorthand and leaves the type at
                    normal. */
-                names = container_name_bits(sheet, value, value_length);
+                *names = container_name_bits(sheet, value, value_length);
             }
         }
     }
     if (has_type) {
         (void) parse_container_type_value(
-            type_value, strlen(type_value), &type);
+            type_value, strlen(type_value), type);
     }
     if (has_name) {
-        names = container_name_bits(sheet, name_value, strlen(name_value));
+        *names = container_name_bits(sheet, name_value, strlen(name_value));
     }
+}
+
+bool style_container_layout_state_add(Stylesheet *sheet,
+                                      lxb_dom_node_t *node,
+                                      int content_width,
+                                      int content_height,
+                                      int padding_horizontal,
+                                      int padding_vertical)
+{
+    if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL) {
+        return false;
+    }
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    if (scratch->container_states == NULL
+        || scratch->container_state_capacity == 0) return false;
+
+    uint8_t type = STYLE_CONTAINER_TYPE_NONE;
+    uint32_t names = 0;
+    container_establishment(sheet, node, &type, &names);
     if (type == STYLE_CONTAINER_TYPE_NONE && names == 0) return true;
 
     /* LayoutNodeBox client dimensions describe the padding box. Probe layout
@@ -339,41 +393,138 @@ bool style_container_layout_state_add(Stylesheet *sheet,
     content_width -= padding_horizontal;
     content_height -= padding_vertical;
 
-    size_t mask = scratch->container_state_capacity - 1u;
-    size_t home = container_pointer_hash(node) & mask;
-    for (size_t probe = 0; probe < 8; probe++) {
-        StyleContainerState *state =
-            &scratch->container_states[(home + probe) & mask];
-        if (!state->occupied || state->node == node) {
-            if (!state->occupied) scratch->container_state_count++;
-            *state = (StyleContainerState) {
-                .node = node,
-                .name_bits = names,
-                .content_width = content_width < 0 ? 0 : content_width,
-                .content_height = content_height < 0 ? 0 : content_height,
-                .type = type,
-                .occupied = true
-            };
-            sheet->container_state_generation++;
-            if (STYLE_TRACE(sheet, LAYOUT)) {
-                fprintf(stderr,
-                        "style-container-state node=%p type=%u names=%08x "
-                        "content=%dx%d\n",
-                        (void *) node, (unsigned) type, (unsigned) names,
-                        state->content_width, state->content_height);
-            }
-            return true;
-        }
-    }
-    /* A pathological collision cluster degrades by omitting this container,
-       never by growing an unbounded chain. */
+    container_state_store(sheet, node, names, type, content_width,
+                          content_height);
     return true;
+}
+
+void style_container_live_update(Stylesheet *sheet, lxb_dom_node_t *node,
+                                 int content_width, int content_height)
+{
+    if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL
+        || !style_container_log_active(sheet)
+        || sheet->resolve_scratch->container_states == NULL) return;
+    uint8_t type = STYLE_CONTAINER_TYPE_NONE;
+    uint32_t names = 0;
+    container_establishment(sheet, node, &type, &names);
+    if (type == STYLE_CONTAINER_TYPE_NONE && names == 0) return;
+    if (content_height < 0) {
+        const StyleContainerState *known = container_state_find(sheet, node);
+        content_height = known == NULL ? 0 : known->content_height;
+    }
+    container_state_store(sheet, node, names, type, content_width,
+                          content_height);
+}
+
+uint32_t style_container_consults(const Stylesheet *sheet)
+{
+    return sheet == NULL ? 0 : sheet->container_consults;
+}
+
+static StyleContainerLog *container_log_of(const Stylesheet *sheet)
+{
+    return sheet == NULL || sheet->resolve_scratch == NULL
+        ? NULL : sheet->resolve_scratch->container_log;
+}
+
+bool style_container_log_active(const Stylesheet *sheet)
+{
+    const StyleContainerLog *log = container_log_of(sheet);
+    return log != NULL && log->active;
+}
+
+bool style_container_log_begin(Stylesheet *sheet, Budget *budget,
+                               const void *owner)
+{
+    if (sheet == NULL || sheet->resolve_scratch == NULL || budget == NULL
+        || sheet->budget == NULL || owner == NULL
+        || sheet->has_container_relative_units
+        || sheet->conditional_queries == NULL
+        || style_container_log_active(sheet)) return false;
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    if (scratch->container_states == NULL) {
+        /* No measured geometry yet: start an empty table the pass fills as
+           it goes (an absent container answers as it did before). */
+        if (!style_container_layout_state_begin(
+                sheet, budget, STYLE_CONTAINER_LOG_STATE_GUESS)) return false;
+    } else if (scratch->container_match_cache != NULL) {
+        /* Results cached by an earlier pass were logged by that pass. */
+        memset(scratch->container_match_cache, 0,
+               scratch->container_match_cache_capacity
+                   * sizeof(*scratch->container_match_cache));
+    }
+    StyleContainerLog *log = scratch->container_log;
+    if (log == NULL) {
+        log = budget_calloc_category(sheet->budget, BUDGET_CATEGORY_LAYOUT,
+                                     1, sizeof(*log));
+        if (log == NULL) return false;
+        log->entries = budget_malloc_category(
+            sheet->budget, BUDGET_CATEGORY_LAYOUT,
+            STYLE_CONTAINER_LOG_INITIAL * sizeof(*log->entries));
+        if (log->entries == NULL) {
+            budget_free(sheet->budget, log);
+            return false;
+        }
+        log->capacity = STYLE_CONTAINER_LOG_INITIAL;
+        scratch->container_log = log;
+    }
+    log->count = 0;
+    log->overflow = false;
+    log->owner = owner;
+    log->active = true;
+    return true;
+}
+
+void style_container_log_end(Stylesheet *sheet, const void *owner)
+{
+    StyleContainerLog *log = container_log_of(sheet);
+    if (log == NULL || log->owner != owner) return;
+    log->active = false;
+    log->owner = NULL;
+}
+
+void style_container_log_release(Stylesheet *sheet)
+{
+    StyleContainerLog *log = container_log_of(sheet);
+    if (log == NULL) return;
+    if (sheet->budget != NULL) {
+        budget_free(sheet->budget, log->entries);
+        budget_free(sheet->budget, log);
+    }
+    sheet->resolve_scratch->container_log = NULL;
+}
+
+static void container_log_note(Stylesheet *sheet, StyleContainerLog *log,
+                               lxb_dom_node_t *node, uint8_t query_id,
+                               bool matched)
+{
+    if (log->overflow) return;
+    if (log->count == log->capacity) {
+        size_t capacity = log->capacity * 2u;
+        StyleContainerLogEntry *grown =
+            capacity > STYLE_CONTAINER_LOG_LIMIT || sheet->budget == NULL
+            ? NULL
+            : budget_realloc_category(sheet->budget, BUDGET_CATEGORY_LAYOUT,
+                                      log->entries,
+                                      capacity * sizeof(*grown));
+        if (grown == NULL) {
+            /* Unverifiable, never wrong: the pass is rebuilt. */
+            log->overflow = true;
+            return;
+        }
+        log->entries = grown;
+        log->capacity = capacity;
+    }
+    log->entries[log->count++] = (StyleContainerLogEntry) {
+        .node = node, .query = query_id, .matched = matched
+    };
 }
 
 void style_container_layout_state_clear(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->resolve_scratch == NULL) return;
     sheet->container_state_generation++;
+    sheet->container_state_complete = false;
     StyleResolveScratch *scratch = sheet->resolve_scratch;
     if (scratch->container_states != NULL && sheet->budget != NULL) {
         budget_free(sheet->budget, scratch->container_states);
@@ -686,10 +837,36 @@ static bool query_matches_one(const Stylesheet *sheet,
     return false;
 }
 
+static bool container_query_evaluate(const Stylesheet *sheet,
+                                     uint8_t query_id, lxb_dom_node_t *node)
+{
+    if (query_id == 0) return true;
+    if (query_id > sheet->conditional_queries->query_count) return false;
+    const StyleContainerQuery *query =
+        &sheet->conditional_queries->queries[query_id - 1u];
+    return (query->parent == 0
+            || container_query_evaluate(sheet, query->parent, node))
+        && query_matches_one(sheet, query, node);
+}
+
+bool style_container_log_verified(const Stylesheet *sheet)
+{
+    const StyleContainerLog *log = container_log_of(sheet);
+    if (log == NULL || log->overflow || sheet->conditional_queries == NULL
+        || sheet->resolve_scratch->container_states == NULL) return false;
+    for (size_t i = 0; i < log->count; i++) {
+        const StyleContainerLogEntry *entry = &log->entries[i];
+        if (container_query_evaluate(sheet, entry->query, entry->node)
+            != entry->matched) return false;
+    }
+    return true;
+}
+
 bool style_container_query_matches(const Stylesheet *sheet, uint8_t query_id,
                                    lxb_dom_node_t *node)
 {
     if (query_id == 0) return true;
+    if (sheet != NULL) ((Stylesheet *) sheet)->container_consults++;
     if (sheet == NULL || sheet->conditional_queries == NULL
         || node == NULL || query_id > sheet->conditional_queries->query_count
         || sheet->resolve_scratch == NULL
@@ -711,6 +888,9 @@ bool style_container_query_matches(const Stylesheet *sheet, uint8_t query_id,
     bool matched = query->parent == 0
         || style_container_query_matches(sheet, query->parent, node);
     if (matched) matched = query_matches_one(sheet, query, node);
+    if (scratch->container_log != NULL && scratch->container_log->active)
+        container_log_note((Stylesheet *) sheet, scratch->container_log,
+                           node, query_id, matched);
     if (scratch->container_match_cache != NULL
         && scratch->container_match_cache_capacity != 0) {
         scratch->container_match_cache[cache_slot] =

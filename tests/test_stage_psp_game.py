@@ -46,7 +46,7 @@ class StagePspGameTests(unittest.TestCase):
             ":8770/", 1)[1])
         self.assertIn("stage-digest=", first.stdout)
         self.assertIn("stage=", first_url)
-        self.assertIn("file_kb=384", self.boot.read_text(encoding="utf-8"))
+        self.assertIn("file_kb=512", self.boot.read_text(encoding="utf-8"))
 
         same = self.stage_once()
         self.assertEqual(first_url, self.current_url())
@@ -104,12 +104,16 @@ class StagePspGameTests(unittest.TestCase):
 
     def test_game_profile_script_limit_replaces_a_stale_override(self):
         self.boot.write_text(
-            "file_kb=256\ntrace=none\nurl=https://old.invalid/\n",
+            "file_kb=384\nheap_mb=5\ntotal_mb=2\nlimit_mb=24\n"
+            "profile=strict\ntrace=none\nurl=https://old.invalid/\n",
             encoding="utf-8")
         self.stage_once()
         lines = self.boot.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(1, lines.count("file_kb=384"))
-        self.assertNotIn("file_kb=256", lines)
+        self.assertEqual(1, lines.count("file_kb=512"))
+        self.assertNotIn("file_kb=384", lines)
+        for unchanged in ("heap_mb=5", "total_mb=2", "limit_mb=24",
+                          "profile=strict"):
+            self.assertIn(unchanged, lines)
 
     def test_absolute_symlink_is_refused_without_publishing(self):
         secret = self.root / "secret.js"

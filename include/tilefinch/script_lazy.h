@@ -32,6 +32,15 @@ typedef struct ScriptLazyWebpackPlan {
     size_t factory_source_bytes;
     size_t largest_factory_bytes;
     bool strict_mode;
+    /* Set for a plan restored from a bundle record (js_runtime.h,
+       script_runtime_lazy_webpack_plan) rather than made by the planner.
+       It says nothing about the factories' syntax: each factory is checked
+       when it first compiles. */
+    bool from_record;
+    /* The SHA-256 of the planned bytes, when a record lookup had to take
+       it (a record for the same site, URL and length existed). */
+    bool digest_ready;
+    uint8_t source_digest[32];
 } ScriptLazyWebpackPlan;
 
 typedef struct {

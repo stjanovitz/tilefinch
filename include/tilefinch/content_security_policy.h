@@ -27,6 +27,13 @@ typedef enum {
     TILEFINCH_CSP_FRAME_ANCESTORS,
     TILEFINCH_CSP_WORKER_SRC,
     TILEFINCH_CSP_MEDIA_SRC,
+    /* CSP Level 3 element/attribute directives. Absent, each falls back to
+       its family (script-src or style-src) and then default-src. Keep the
+       two script entries first: the fallback is chosen by position. */
+    TILEFINCH_CSP_SCRIPT_SRC_ELEM,
+    TILEFINCH_CSP_SCRIPT_SRC_ATTR,
+    TILEFINCH_CSP_STYLE_SRC_ELEM,
+    TILEFINCH_CSP_STYLE_SRC_ATTR,
     TILEFINCH_CSP_DIRECTIVE_COUNT
 } TilefinchCspDirective;
 
@@ -63,6 +70,50 @@ bool tilefinch_csp_parse_response_headers(
 bool tilefinch_csp_allows_request(
     const TilefinchContentSecurityPolicy *policy,
     TilefinchRequestDestination destination, const char *target_url);
+/* CSP3 pre-request metadata (§6.7.1.1, "script directives pre-request
+   check"), reduced to one byte a request context carries through every
+   redirect hop. Bit i is set when enforced policy i matched the initiating
+   element's nonce (scripts and styles) or integrity metadata (scripts),
+   which admits the request whatever its URL. PARSER_INSERTED marks a
+   parser-inserted script: 'strict-dynamic' refuses it unless matched.
+   Zero is a script-initiated request without element metadata (a script-
+   inserted element, module import, worker), which 'strict-dynamic' admits
+   and which otherwise must match by URL. */
+#define TILEFINCH_CSP_GRANT_PARSER_INSERTED 0x80u
+_Static_assert(TILEFINCH_CSP_POLICY_LIMIT <= 7u,
+               "policy bits must stay below the parser-inserted flag");
+uint8_t tilefinch_csp_request_grant(
+    const TilefinchContentSecurityPolicy *policy,
+    TilefinchRequestDestination destination,
+    const char *nonce, size_t nonce_length,
+    const char *integrity, size_t integrity_length, bool parser_inserted);
+/* The grant for an element: its [[CryptographicNonce]] when the element is
+   nonceable, and for scripts its integrity attribute. */
+uint8_t tilefinch_csp_element_grant(
+    const TilefinchContentSecurityPolicy *policy,
+    TilefinchRequestDestination destination,
+    struct lxb_dom_node *element, bool parser_inserted);
+/* Every nonce-source value of every enforced policy, for the document's
+   nonce slots. */
+void tilefinch_csp_visit_nonce_sources(
+    const TilefinchContentSecurityPolicy *policy,
+    void (*visit)(void *opaque, const char *value, size_t length),
+    void *opaque);
+/* CSP3 "Is element nonceable?": an attribute name or value containing
+   "<script" or "<style" (ASCII case-insensitive) means dangling markup may
+   have swallowed a legitimate nonce. */
+bool tilefinch_csp_text_has_markup(const char *text, size_t length);
+/* The grant a module script's descendants inherit (HTML "descendant script
+   fetch options"): the root's nonce and parser metadata, never its
+   integrity, which belongs to the root's own response. */
+uint8_t tilefinch_csp_element_descendant_grant(
+    const TilefinchContentSecurityPolicy *policy,
+    struct lxb_dom_node *element, bool parser_inserted);
+/* tilefinch_csp_allows_request() is this with a zero grant. */
+bool tilefinch_csp_allows_request_granted(
+    const TilefinchContentSecurityPolicy *policy,
+    TilefinchRequestDestination destination, const char *target_url,
+    uint8_t grant);
 bool tilefinch_csp_allows_inline_script(
     const TilefinchContentSecurityPolicy *policy,
     struct lxb_dom_node *element);
@@ -73,6 +124,10 @@ bool tilefinch_csp_allows_inline_style(
     struct lxb_dom_node *element);
 bool tilefinch_csp_allows_style_attribute(
     const TilefinchContentSecurityPolicy *policy);
+/* Inline element digests computed so far (process-wide, monotonic): an
+   element is hashed only when a policy lists a 'sha256-' source. Counted
+   only in builds with tracing or the validation log (a test probe). */
+size_t tilefinch_csp_inline_digests(void);
 bool tilefinch_csp_allows_base_uri(
     const TilefinchContentSecurityPolicy *policy, const char *target_url);
 bool tilefinch_csp_allows_form_action(

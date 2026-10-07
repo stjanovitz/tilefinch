@@ -1963,11 +1963,9 @@ static void bellard_pool_update_malloc_census(BudgetQuickJSPool *pool,
         /* Peak-composition census: at each 8 MB high-water step, print the
            live size-band census so transient realloc growth is represented
            as faithfully as ordinary allocations. */
-        static int at_peak = -1;
-        if (at_peak < 0) {
-            at_peak = tilefinch_dump_js_pool_at_peak();
-        }
-        if (at_peak
+        /* The helper caches its own answer and is constant false under
+           TILEFINCH_NO_TRACE. */
+        if (tilefinch_dump_js_pool_at_peak()
             && pool->js_malloc_peak
                    >= pool->peak_dump_watermark + 8u * 1024u * 1024u) {
             pool->peak_dump_watermark = pool->js_malloc_peak;

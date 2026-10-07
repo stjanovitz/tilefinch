@@ -144,11 +144,13 @@ bool layout_block_emit_decoration(
        time (STYLE_BOX_SHADOW_* in style.h), so this loop is bounded and adds
        at most four commands per element.
 
-       APPROXIMATION: CSS clips an outer shadow to outside the border box.
-       This paints the full silhouette and lets the background cover it,
-       which is identical for any opaque background and only differs where a
-       translucent box sits over its own shadow.  Clipping it would cost a
-       second rounded-rect test per shadow pixel for that case alone.
+       CSS clips an outer shadow to outside the border box. A layer with
+       no offset or spread on a box with uniform corners (a glow, the
+       common case) carries LAYOUT_SHADOW_OUTSIDE_BOX: its shadow rect is
+       the border box, so the rasteriser clips it exactly and skips the
+       covered interior. APPROXIMATION: other layers paint the full
+       silhouette and let the background cover it, which differs only
+       where a translucent box sits over its own shadow.
 
        DESCOPED: inline-level boxes.  Inline backgrounds are emitted from
        four separate sites in layout_inline.c, half of them through
@@ -195,6 +197,22 @@ bool layout_block_emit_decoration(
            the exact four-corner code. */
         int radius = style_border_radius_maximum(
             style_border_radius_adjust(border_radius_code, spread));
+        bool outside_box = shadow->offset_x == 0 && shadow->offset_y == 0
+            && spread == 0
+            && (!style_border_radius_is_packed(border_radius_code)
+                || (radius == style_border_radius_corner(border_radius_code, 0)
+                    && radius == style_border_radius_corner(border_radius_code, 1)
+                    && radius == style_border_radius_corner(border_radius_code, 2)
+                    && radius == style_border_radius_corner(border_radius_code, 3)));
+        /* A hard (unblurred), unspread shadow on a square box offset along
+           one axis is visible only as the strip it sticks out by; the
+           patch below turns it into that fill once the height is known.
+           MDN's table-of-contents links draw their left rule this way
+           (`box-shadow: -2px 0 0`) over a transparent background, so the
+           full-silhouette approximation painted grey blocks. */
+        bool strip = blur == 0 && spread == 0 && radius == 0
+            && !style_border_radius_is_packed(border_radius_code)
+            && ((shadow->offset_x != 0) != (shadow->offset_y != 0));
         DrawCommand layer = {
             .type = DRAW_SHADOW_RECT,
             .x = outer_x + shadow->offset_x - inflate,
@@ -204,7 +222,9 @@ bool layout_block_emit_decoration(
             .color = color,
             .scale = blur,
             .radius = radius,
-            .opacity_scale = alpha_opacity_scale(alpha)
+            .opacity_scale = alpha_opacity_scale(alpha),
+            .image_fit = outside_box ? LAYOUT_SHADOW_OUTSIDE_BOX
+                         : strip ? LAYOUT_SHADOW_OFFSET_STRIP : 0
         };
         if (layout_add_command(context->layout, layer) == NULL) return false;
         shadow_command_count++;
@@ -581,6 +601,33 @@ bool layout_block_patch_decoration(
         DrawCommand *layer = &context->layout->commands[shadow_index_start + i];
         layer->height = layout_add_coordinate(
             content_bottom - outer_y, layer->width - outer_width);
+        if (layer->image_fit != LAYOUT_SHADOW_OFFSET_STRIP) continue;
+        /* The silhouette is the border box moved by one offset: keep only
+           the part outside the box (CSS Backgrounds 7.1.1 clips it). */
+        int height = content_bottom - outer_y;
+        int offset_x = layer->x - outer_x;
+        int offset_y = layer->y - outer_y;
+        layer->type = DRAW_FILL_RECT;
+        layer->image_fit = 0;
+        layer->scale = 0;
+        if (offset_x != 0) {
+            int magnitude = offset_x < 0 ? -offset_x : offset_x;
+            layer->width = magnitude < outer_width ? magnitude : outer_width;
+            layer->x = offset_x < 0 ? outer_x + offset_x
+                                    : outer_x + outer_width + offset_x
+                                      - layer->width;
+            layer->height = height;
+        } else {
+            int magnitude = offset_y < 0 ? -offset_y : offset_y;
+            layer->height = magnitude < height ? magnitude : height;
+            layer->y = offset_y < 0 ? outer_y + offset_y
+                                    : outer_y + height + offset_y
+                                      - layer->height;
+        }
+        if (layer->width <= 0 || layer->height <= 0) {
+            layer->width = 0;
+            layer->opacity_scale = 0;
+        }
     }
     if (background_index != (size_t) -1) {
         DrawCommand *background =
@@ -726,38 +773,11 @@ bool layout_block_patch_decoration(
         }
         if ((style->background_size_flags
              & STYLE_BACKGROUND_SIZE_EXPLICIT) != 0) {
-            bool width_auto = (style->background_size_flags
-                               & STYLE_BACKGROUND_WIDTH_AUTO) != 0;
-            bool height_auto = (style->background_size_flags
-                                & STYLE_BACKGROUND_HEIGHT_AUTO) != 0;
-            int image_width = width_auto ? 0
-                : ((style->background_size_flags
-                    & STYLE_BACKGROUND_WIDTH_PERCENT) != 0
-                   ? layout_scale_dimension(
-                       area_width, style->background_width, 100)
-                   : style->background_width);
-            int image_height = height_auto ? 0
-                : ((style->background_size_flags
-                    & STYLE_BACKGROUND_HEIGHT_PERCENT) != 0
-                   ? layout_scale_dimension(
-                       area_height, style->background_height, 100)
-                   : style->background_height);
-            if (width_auto && height_auto) {
-                image_width = element_background->width;
-                image_height = element_background->height;
-            } else if (width_auto && image_height > 0
-                       && element_background->height > 0) {
-                image_width = layout_scale_dimension(
-                    image_height, element_background->width,
-                    element_background->height);
-            } else if (height_auto && image_width > 0
-                       && element_background->width > 0) {
-                image_height = layout_scale_dimension(
-                    image_width, element_background->height,
-                    element_background->width);
-            }
-            if (image_width < 1) image_width = 1;
-            if (image_height < 1) image_height = 1;
+            int image_width = 0, image_height = 0;
+            layout_background_tile_size(
+                style->background_size_flags, style->background_width,
+                style->background_height, area_width, area_height,
+                element_background, &image_width, &image_height);
             bool pixels = (style->background_size_flags
                            & STYLE_BACKGROUND_POSITION_PIXELS) != 0;
             int offset_x = origin_delta_x

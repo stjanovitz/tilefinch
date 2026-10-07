@@ -754,7 +754,7 @@ int test_scroll_into_view_resolves_margin_math(void)
    inline form control answers geometry queries. chatgpt.com's composer
    (rows=1, appearance:none) collapsed to 0 px empty and 64 px once typed
    into, overlapping the disclaimer, and its autosizer read a 0 height. */
-int test_textarea_rows_geometry(void)
+static int test_textarea_rows_geometry_on_clock(void)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -824,6 +824,23 @@ int test_textarea_rows_geometry(void)
           && plain_text_height == ref_text_height);
     browser_engine_destroy(engine);
     return 0;
+}
+
+/* This test is about control geometry, not the script watchdog.
+   A commit on a JavaScript-enabled engine creates the page realm under
+   the 10 s script watchdog, which reads the platform monotonic clock. A
+   host stall of 10 s inside the commit (seen at high load; reproduced by
+   stopping the process for 11 s) interrupted it, and the commit failed with
+   "InternalError: interrupted". On the CPU-paced clock
+   (tilefinch_test_clocks.h) the watchdog counts only this process's CPU
+   time, as on an unloaded host. */
+int test_textarea_rows_geometry(void)
+{
+    TestCpuPacedClock clock;
+    test_cpu_paced_clock_install(&clock);
+    int failed = test_textarea_rows_geometry_on_clock();
+    tilefinch_platform_set_services(NULL);
+    return failed;
 }
 
 /* A definite-height grid shares its free space between fr rows only after
@@ -1120,7 +1137,7 @@ int test_module_dependency_prefetch(void)
 /* The PSP defers page-script navigations so they run as cooperative jobs.
    With deferral on, advancing the runtime must leave the page in place and
    hand the request to the frontend instead of loading it synchronously. */
-int test_deferred_script_navigation(void)
+static int test_deferred_script_navigation_on_clock(void)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -1160,6 +1177,23 @@ int test_deferred_script_navigation(void)
         engine, url, sizeof(url), &record_history));
     browser_engine_destroy(engine);
     return 0;
+}
+
+/* This test is about script-navigation deferral, not the script watchdog.
+   A commit on a JavaScript-enabled engine creates the page realm under
+   the 10 s script watchdog, which reads the platform monotonic clock. A
+   host stall of 10 s inside the commit (seen at high load; reproduced by
+   stopping the process for 11 s) interrupted it, and the commit failed with
+   "InternalError: interrupted". On the CPU-paced clock
+   (tilefinch_test_clocks.h) the watchdog counts only this process's CPU
+   time, as on an unloaded host. */
+int test_deferred_script_navigation(void)
+{
+    TestCpuPacedClock clock;
+    test_cpu_paced_clock_install(&clock);
+    int failed = test_deferred_script_navigation_on_clock();
+    tilefinch_platform_set_services(NULL);
+    return failed;
 }
 
 int test_loading_interaction_journey(void)

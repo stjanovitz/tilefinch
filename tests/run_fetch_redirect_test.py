@@ -57,6 +57,19 @@ class RedirectHandler(BaseHTTPRequestHandler):
             self.server.portal_probe["body_bytes"] += len(body)
         self.reply(204)
 
+    def beacon_sink(self, body):
+        query = urlparse(self.path).query
+        content_type = self.headers.get("Content-Type", "<none>")
+        with self.server.portal_probe_lock:
+            self.server.beacon_log.append(
+                f"{query}|{content_type}|".encode() + body)
+        self.reply(204)
+
+    def beacon_log_reply(self):
+        with self.server.portal_probe_lock:
+            payload = b"\n<beacon>\n".join(self.server.beacon_log)
+        self.reply(200, payload, (("Content-Type", "text/plain"),))
+
     def portal_probe_count(self):
         with self.server.portal_probe_lock:
             requests = self.server.portal_probe["requests"]
@@ -224,6 +237,8 @@ class RedirectHandler(BaseHTTPRequestHandler):
             self.portal_sink()
         elif path == "/portal-probe-count":
             self.portal_probe_count()
+        elif path == "/beacon-log":
+            self.beacon_log_reply()
         elif path == "/same":
             self.redirect(302, "/final", "hop=seen; Path=/")
         elif path == "/fragment-inherit":
@@ -711,6 +726,8 @@ class RedirectHandler(BaseHTTPRequestHandler):
             return
         if path == "/portal-private-sink":
             self.portal_sink(body)
+        elif path == "/beacon-sink":
+            self.beacon_sink(body)
         elif path == "/post302":
             self.redirect(302, "/method", "post302=seen; Path=/")
         elif path == "/post307":
@@ -757,11 +774,13 @@ def main():
     cross_server.blocked_port = blocked_socket.getsockname()[1]
     portal_probe = {"requests": 0, "body_bytes": 0}
     portal_probe_lock = Lock()
+    beacon_log = []
     for fixture in (server, cross_server, proxy_server):
         fixture.state_lock = Lock()
         fixture.empty_location_attempts = {}
         fixture.portal_probe = portal_probe
         fixture.portal_probe_lock = portal_probe_lock
+        fixture.beacon_log = beacon_log
     thread = Thread(target=server.serve_forever, daemon=True)
     cross_thread = Thread(target=cross_server.serve_forever, daemon=True)
     proxy_thread = Thread(target=proxy_server.serve_forever, daemon=True)

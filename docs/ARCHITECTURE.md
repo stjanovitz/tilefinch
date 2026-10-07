@@ -351,8 +351,17 @@ media download).
 The authoritative layout is a `LayoutBuildJob` with explicit phases: flow,
 compaction, visibility and focus, paint order, spatial indexing, scroll
 metadata, and finalization. Container queries get at most one measured probe
-followed by one authoritative rebuild. Partial display lists stay private to
-the job until `layout_build_job_take()` publishes a complete result.
+followed by one authoritative rebuild. The probe records each container's
+content box as soon as block layout knows it (before its descendants are
+styled) and logs every container-query evaluation; when every logged result
+still holds against the geometry the probe measured, the probe is exactly
+what the rebuild would produce and the rebuild is skipped. Queries answered
+early (a flex item's contents measured before its box is final), a dropped
+log, container-relative units, or a DOM change send the job down the
+rebuild as before. While a probe logs, reused cross-build styles that
+consulted a container query, cached intrinsic sizes and table rows are not
+taken from the reuse cache. Partial display lists stay private to the job
+until `layout_build_job_take()` publishes a complete result.
 
 #### Input during long scripts
 
@@ -432,13 +441,89 @@ can produce visible pixels: eligible pages can paint before parser-blocking
 scripts run, while pages that depend on scripts keep the correct blocking
 order. Stylesheet suffixes preserve the selector compiler's and index's state,
 and `@font-face` rules are discovered during the main CSS parse rather than in
-a second walk.
+a second walk. A sheet larger than its per-file cap is not discarded: the
+bytes already buffered are cut back to the last complete top-level rule (an
+allocation-free scan that skips strings, comments, escapes and `url()`
+bodies), so no half rule and no block that end of input would otherwise
+close is applied, and the truncation stays visible in the resource counters.
 
 The fetch scheduler caps active page slots, response bytes, callback work,
 and elapsed pump time, and it pauses curl delivery when its bounded handoff
 buffer is full. The candidate owns every continuation, so replacing or
 cancelling it retires the whole pipeline without a callback reaching the next
 page.
+
+### Declarative refresh
+
+`<meta http-equiv="refresh">` and the `Refresh` response header follow the
+HTML Standard's shared declarative refresh steps, with or without JavaScript
+(`src/declarative_refresh.c` parses; `src/navigation/declarative_refresh.inc`
+owns the rest). Only a document's first refresh counts. The header is adopted
+when the document is created and wins over any meta; otherwise the first
+connected HTML `<meta>` in tree order whose content parses is the one, in the
+head or the body, never inside `<template>`, and inside `<noscript>` only when
+the page was parsed with scripting off (where it is an element, as in a
+no-script browser: VK's link redirector has no other no-script way on). A meta
+that page script inserts later, or whose `content`/`http-equiv` it changes,
+is noticed through the mutation bridge and counts from that moment. The URL
+resolves against the document base; no URL means the document itself.
+
+The timer is page state on the page clock. It starts on the first runtime
+advance after commit, which follows the load event, and advances with the
+runtime's elapsed time, so it pauses whenever page work does (menus, the
+keyboard, media). When it comes due the refresh is followed exactly like a
+page-script navigation: the lab and other non-deferring owners load it inside
+the runtime advance; the PSP app, which defers page navigations
+(`browser_engine_set_defer_script_navigation`), takes it with
+`browser_engine_take_refresh_navigation` after any pending script navigation
+(which wins) and begins an ordinary cancellable navigation job. The document
+is the referrer, there is no user activation, and the load replaces the
+current history entry (historyHandling "replace") instead of adding one.
+
+A refresh not yet followed is cancelled by any other navigation of the page
+(even one that fails and leaves it in place), by unloading it, and by the
+user taking control of it: editing a form field
+(`browser_engine_insert_text`, `browser_engine_replace_text`,
+`browser_engine_backspace`). Targets other than HTTP(S) (`javascript:`,
+`data:`, `file:`, `about:`) are never followed but still are the document's
+refresh. A refresh in a child frame does nothing (the HTML Standard's "do
+nothing" option): frames do not navigate themselves here, so neither a
+sandboxed nor an ordinary frame can move the top-level page. A followed
+refresh is an ordinary top-level navigation request, so it passes the same
+request policy as any other.
+
+`NAVIGATION_REFRESH_CHAIN_LIMIT` (5) bounds unattended refreshes: the sixth
+consecutive refresh navigation with no user input between them is stopped,
+the page stays, and the PSP status line says `AUTO-REFRESH STOPPED`. A button
+press, a typed or bookmarked address, or a user-activated link starts the
+count again.
+
+A refresh to another URL is a redirect and is followed at any delay. A
+same-URL refresh (an auto-reload, such as a news page's `content="300"`, or a
+fragment-only target) is followed only while the page is untouched: once the
+user has pressed any button since the page loaded
+(`browser_engine_note_user_input`, which also restarts the loop guard), the
+reload is not followed. The refresh becomes `NAVIGATION_REFRESH_OFFERED`,
+`browser_engine_take_refresh_navigation` reports it once, and the PSP shows
+the non-modal note `PAGE WANTS TO RELOAD  SQUARE RELOADS`
+(`PSP_UI_STATUS_RELOAD_OFFER`); Square is the page screen's reload action. A
+reload would otherwise throw away the page someone is reading, at the cost of
+a full PSP load, while an unattended page (a status board, a challenge page's
+360-second self-reload) still refreshes.
+
+### Script navigations and history
+
+A top-level navigation requested by page script keeps or replaces the current
+history entry as the HTML Standard's history handling says.
+`location.replace()` replaces it: the loaded document takes the entry, so
+back skips the page that redirected (the same mechanism as a followed
+refresh, `navigation_arm_history_replace`). The arming belongs to the next
+navigation that starts, whichever it is, and only that navigation's load or
+direct commit (a site adapter's page) uses it.
+`location.assign()`, assigning `location.href` or a URL part, and following a
+link push a new entry. `location.reload()` and a fragment-only `replace()`
+keep the entry they are on, and `history.replaceState()` renames the current
+entry in place without loading anything.
 
 ## JavaScript
 
@@ -506,6 +591,16 @@ owner tick retries, skipping a frame that cannot publish yet (one with no box,
 for example) so it cannot starve a later one. Trusted input in a child
 notifies user activation on that realm and every ancestor before the event is
 dispatched, so parent and child handlers see one activation state.
+
+Every `<iframe>` and `<frame>` in the document's tree is a child navigable
+from the moment it is connected, loaded or not: `window.length` counts them in
+tree order, and `window[i]` and `window[name]` (`window.frames` is `window`)
+answer the same WindowProxy `contentWindow` returns, with a frame's target name
+before an element id and own Window properties shadowing both. Counting reads
+native handles only (template contents and shadow trees excluded); a
+WindowProxy, and the frame realm behind it, is created when one is read, so
+hidden frames that no script touches cost no realm. Consent-management locator
+stubs depend on this to find the frame they inserted.
 
 Nested frames live in `frames.js`, an eager module that only defines an
 installer; `platform.js` calls it with its private helpers and then deletes
@@ -584,6 +679,21 @@ origin-private file system) before author code runs and passes it through a
 temporary global that is deleted immediately. `Event.isTrusted` is a
 non-configurable own accessor backed by the same private state. New Web API
 surface is expected to follow this pattern.
+
+### DOM node handles
+
+Script reaches native nodes through a bounded handle table: a handle is a
+slot number plus a generation, so a slot can be reused after its node is
+destroyed or its detached wrapper is collected without an old wrapper ever
+naming the new node. A live connected node keeps its slot even without a
+wrapper, because bootstrap state (listeners, observers) is keyed by handle.
+Every runtime allocates 8,192 slots (about 170 KiB on the PSP) at creation.
+The realistic profile may grow the table once, to 16,352 slots, when a
+registration finds every slot live and dead wrappers cannot be reclaimed;
+news front pages hold nine to ten thousand elements and walk them all. The
+growth (about 240 KiB more, wrapper references included) is admitted by the
+Budget like any page allocation, and a refusal is the same clean
+`RangeError` a full table reports. The strict profile keeps 8,192.
 
 ### Computed style is one generated registry
 
@@ -739,8 +849,8 @@ boundaries.
   script classes keep their normal lifecycle and quotas.
 
 Compiled external scripts and parsed stylesheet fragments may be reused from
-bounded in-memory caches for the life of the process; ordinary browsing never
-writes compiler artifacts to storage. External ES modules are compiled records
+bounded in-memory caches for the life of the process; by default ordinary
+browsing never writes compiler artifacts to storage. External ES modules are compiled records
 too: after a module compiles, its QuickJS bytecode is kept in a separate
 session cache (1 MiB realistic, 512 KiB strict) keyed by module name, response
 URL, top-level site, compile options and the SHA-256 of its exact source, and a
@@ -750,15 +860,66 @@ page Budget evicts them before refusing any allocation, so the cache can only
 occupy room the page is not using. Modules of 8 KiB or more are compiled
 without their source text (line tables are kept for stacks); their functions'
 `toString()` returns the native-code form. The trade-off is recorded in
-[the memory experiment ledger](engineering/MEMORY_EXPERIMENTS.md). An opt-in
-persistent tier (the `module_cache_dir` boot setting, off by default) keeps the
-same verified records on storage across launches; a record whose key or
-SHA-256 does not match is ignored and compiled again. An explicitly installed offline app is
+[the memory experiment ledger](engineering/MEMORY_EXPERIMENTS.md). Classic
+external scripts have a second table of the same shape, filled by idle work
+after the load. An opt-in persistent tier (**Keep compiled scripts**, off by
+default; `src/session_script_disk.c`) keeps both tables' records on the
+Memory Stick across launches, one pack per script response and site, written
+in idle slices and read whole into RAM on a miss; a pack that fails its
+checksum or comes from another engine build or bytecode ABI is ignored and
+removed, and the script compiles again (see
+[STORAGE.md](STORAGE.md#keep-compiled-scripts-persistent-tier-off-by-default)).
+An explicitly installed offline app is
 the exception: installation may add bounded, locally generated classic-script
 bytecode beside the retained source. That artifact is bound to the source and
 to a dedicated QuickJS bytecode ABI (not the Tilefinch release version), and
 launch falls back to compiling the source whenever restoration is unavailable
 or fails.
+
+### Lazy webpack bundles
+
+A classic script shaped like a webpack chunk registration
+(`(self.webpackChunkX=self.webpackChunkX||[]).push([[ids],{key:factory,...}])`,
+whose factories are most of its bytes) is not compiled whole. The planner
+(`src/script_lazy.c`) finds the factories with a bounded lexer pass;
+registration replaces each with a small native trampoline and keeps its exact
+source compressed (`src/js_lazy_webpack.c`); a factory is compiled the first
+time it runs and its bytecode is dropped after the call. Most factories of a
+page never run: 341 of wapo-home's 472 on a first visit. Anything the planner
+does not take, and any bundle whose plan fails or whose registration does not
+compile, goes through the ordinary eager path, one compile of the whole
+script that checks all of its syntax before any of it runs. A bundle record
+(see [STORAGE.md](STORAGE.md#compiled-script-caches)) lets a later load of
+the same bytes skip the planner.
+
+**Syntax errors: a deliberate deviation.** A factory's syntax is checked
+when it first compiles, that is when it first runs, and not before:
+
+- a syntax error in a factory that never runs is never reported;
+- one in a factory that runs is reported when it runs: the call (webpack's
+  `require`) throws a `SyntaxError` whose `fileName`, `lineNumber`,
+  `columnNumber` and first stack line give the bundle's URL and the error's
+  position in the bundle; uncaught, it reaches the page's error reporting
+  (window `error`, the console) like any exception thrown at that point. A
+  later call compiles the factory again and throws again; the other
+  factories keep working;
+- other factories of the bundle may already have run by then. Chrome would
+  have rejected the whole file and run none of it.
+
+Until October 2026 every load compiled each factory of every lazy bundle
+once, before registration, as a syntax check (the "preflight"), and fell
+back to the eager path if one failed, so that a syntax error surfaced
+exactly when Chrome's would. That preflight was most of the cost of a lazy
+bundle (an estimated 8.4 s of PSP time per wapo-home load, 88% of it for
+factories that never ran) and it found nothing in practice: bundlers emit
+code their own parsers accept, and a bundle that does not parse is broken in
+every browser, so no working site ships one. The remaining risk is the
+planner cutting a factory at the wrong place, which would turn valid code
+into a runtime `SyntaxError`; its output is checked token for token against
+the census corpora and by `tests/test_script_lazy.c`, and a plan that does not
+cover the whole registration fails it and takes the eager path. The lab knob
+`TILEFINCH_LAZY_WEBPACK_PREFLIGHT=1` restores the preflight for A/B
+measurement.
 
 Small WebAssembly modules use the standard JavaScript API through the
 [bounded WebAssembly profile](WEBASSEMBLY.md). Host labs link the pinned
@@ -784,6 +945,47 @@ reads, which keys each must carry), so a relational change drops only the
 cached styles of elements those answers can style
 (`src/style_has_invalidation.c`), and a changed child list restyles the
 parent and its children unless a sibling test reaches their descendants.
+An element appended after every existing sibling restyles only its parent
+and its own subtree when no sibling test can see it from an earlier
+sibling (only tests counting from the end can); so does a removal of the
+last element child. The `:has()` plan holds 2048 occurrences.
+
+Computed styles are retained in a table that starts at 1024 entries and
+grows by powers of two, up to 4096, when a full walk is about to cover
+more elements (a complete layout or image traversal is told the
+document's element count first) or a build evicted more than a sixteenth
+of it, provided the budget keeps 2 MiB to spare. A smaller table than the
+walk keeps nothing: a document-order walk through an LRU table evicts each
+entry before the next build reaches it, so every relayout of a large page
+re-resolved its styles.
+
+A journal whose every change stays inside content that renders nothing
+skips the relayout altogether (`navigation_mutations_are_hidden_only`): a
+consent stub's `display:none` locator `<iframe>`, a script appended to
+`<body>`, writes inside a closed menu. Each record must lie inside an element
+that computes `display:none` now (resolved through the reuse cache as layout
+resolves it) and that rendered nothing before either (an insertion did not
+exist; only allow-listed attributes and non-`display` inline properties no
+selector reads may change the hidden element itself), and must not be able
+to restyle anything outside it: no `:empty` flip of the parent, no
+sibling-position answer of an existing sibling (tests counting from the end,
+keyed per sheet; only siblings inserted in the same turn may follow), and no
+`:has()` answer. For `:has()` the plan's walk is used when it classifies the
+sheet, and otherwise a plan-independent summary: the first and last compound
+keys of every plain argument, and the anchor keys of arguments that read
+positions, emptiness or adjacency (cnn.com's sheet, with over a thousand
+`:has()` selectors, overflowed the plan's former 512 entries). Paths through `<head>`, inline SVG, form
+option lists, media and picture sources, plugins and image maps never skip,
+nor does a hidden list item (layout numbers list items whether or not they
+render). Each cnn.com locator insertion used to cost a full relayout (3.3 s
+in PPSSPP).
+Records inserted from a detached tree and detached again in the same turn
+(a measurement probe) are transient and skipped. A head `<script>` is
+inert when the bridge's probe found no `:has()` answer it can move, or
+when neither `<head>` nor `<html>` can anchor a `:has()` whose argument
+sees it: a change inside the head moves only answers anchored at the head,
+`<html>` or inside the head, and an anchor inside the head styles only the
+head (`stylesheet_head_change_reaches_outside`).
 
 ## Rendering and presentation
 
@@ -900,7 +1102,8 @@ The Gamepad API exposes one stable, standard-mapped controller object for the
 built-in PSP controls. It stays disconnected until the user holds
 Start+Select or a trusted Play click calls the bounded
 `navigator.tilefinch.requestPageControls()` extension, which shows a native
-Start+Select exit notice and suppresses the activating face button until it
+five-second Start+Select exit notice (always on a page load's first entry; a
+`{notice: "once"}` claim quiets later repeats) and suppresses the activating face button until it
 is released. Native input authority is a small, generation-bearing capture
 record: navigation, native media, or suspend disconnects the object and
 returns control to the browser. Identical physical samples do not cross into
@@ -1332,8 +1535,11 @@ over any remaining font read, and a navigation that outruns warm-up completes
 this two-face baseline before measuring text. Serif, italic, and bold faces
 are requested from the committed page's bounded census of draw commands and
 load one at a time in 16 KiB idle slices, which navigation and rendering can
-pre-empt. A newly arrived metric face triggers one transactional relayout
-before its first repaint, so fallback measurements never survive under the
+pre-empt. Bold text requests only the bold face its family draws with
+(TilefinchSans Bold for Arial/Helvetica stacks, DejaVu Sans Bold for other
+sans families, DejaVu Serif Bold for serif), and a web family is counted as
+its built-in fallback. A newly arrived metric face triggers one
+transactional relayout before its first repaint, so fallback measurements never survive under the
 real glyph advances.
 
 Optional disk-cache and local-storage restoration starts only after HOME is

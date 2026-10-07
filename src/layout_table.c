@@ -430,7 +430,7 @@ static bool table_row_cache_get(LayoutContext *context, lxb_dom_node_t *row,
                                 int available_width, int preferred[16],
                                 int minimum[16], size_t *column_count)
 {
-    if (context->reuse == NULL) return false;
+    if (context->reuse == NULL || context->container_live) return false;
     if (context->reuse->table_rows == NULL) {
         context->reuse->stats.table_row_misses++;
         return false;
@@ -653,6 +653,54 @@ static bool table_measure_rows(LayoutContext *context, lxb_dom_node_t *table,
     return true;
 }
 
+/* CSS table fix-up for a display:table element (not <table>) with no row
+   child: consecutive table-cell children form one anonymous row, which
+   layout_block.c lays out as that row. Measure those cells so the table
+   shrinks to fit them; without this an anonymous-row table measured as
+   zero columns and collapsed to its own padding. Only an all-cell run is
+   measured here; mixed or text content keeps the previous behaviour. */
+static void table_measure_anonymous_row(
+    LayoutContext *context, lxb_dom_node_t *table,
+    const ComputedStyle *table_style, int available_width,
+    int preferred[16], size_t *column_count)
+{
+    if (layout_node_name_is(table, "table")) return;
+    int widths[16] = {0};
+    size_t cells = 0;
+    FlatItemIterator items;
+    FlatItem item;
+    flat_iterator_init(&items, context, table, table_style);
+    while (flat_iterator_next(&items, &item)) {
+        if (!item.anonymous_text
+            && (item.style.out_of_flow || item.style.fixed_position)) {
+            continue;
+        }
+        if (item.anonymous_text || item.style.display != DISPLAY_TABLE_CELL
+            || cells == 16) return;
+        if (!layout_cooperate(context, item.node)) return;
+        int wanted = 0;
+        int floor = 0;
+        intrinsic_text_widths(context, item.node, &item.parent_style,
+                              available_width, &wanted, &floor);
+        resolve_padding(context->sheet, &item.style, available_width);
+        if (item.style.has_width) {
+            int authored = resolve_declared_length(
+                context->sheet, item.style.width,
+                item.style.width_percent, available_width);
+            if (!item.style.box_sizing_border_box) {
+                authored += item.style.padding.left
+                            + item.style.padding.right
+                            + item.style.border.left
+                            + item.style.border.right;
+            }
+            if (authored > wanted) wanted = authored;
+        }
+        widths[cells++] = wanted < 8 ? 8 : wanted;
+    }
+    for (size_t i = 0; i < cells; i++) preferred[i] = widths[i];
+    *column_count = cells;
+}
+
 int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
                           const ComputedStyle *table_style,
                           int available_width)
@@ -687,6 +735,14 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
                             has_row_spans)) {
         budget_free(context->layout->budget, placements);
         return 0;
+    }
+    if (count == 0) {
+        table_measure_anonymous_row(context, table, table_style,
+                                    available_width, preferred, &count);
+        if (context->cancelled) {
+            budget_free(context->layout->budget, placements);
+            return 0;
+        }
     }
     int width = table_style->border.left + table_style->border.right
                 + table_style->padding.left + table_style->padding.right;
@@ -913,14 +969,16 @@ const TableTracks *table_tracks_for_table(
                context, table, table_style, grid_available, tracks)) {
         return tracks;
     }
-    int reserved = 0;
+    /* Column minimums can each approach INT_MAX (a percentage width of a
+       huge measured cell), so their sum is kept wide. */
+    long long reserved = 0;
     for (size_t i = 0; i < count; i++) {
         if (minimum[i] < 8) minimum[i] = 8;
         if (preferred[i] < minimum[i]) preferred[i] = minimum[i];
         reserved += minimum[i];
     }
     int distributable = grid_available > reserved
-                        ? grid_available - reserved : 0;
+                        ? (int) (grid_available - reserved) : 0;
     long long weight_total = 0;
     for (size_t i = 0; i < count; i++) {
         int weight = preferred[i] > minimum[i]

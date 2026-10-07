@@ -1,4 +1,5 @@
 #include "js_runtime_internal.h"
+#include "tilefinch/image_retarget.h"
 
 #include <limits.h>
 #include <math.h>
@@ -294,6 +295,13 @@ JSValue js_canvas_image_source(JSContext *context,
         context, bridge, argv[0]);
     const ImageResource *image = node == NULL ? NULL
         : images_find_node(bridge->images, node);
+    /* Script reads these pixels: undo any display retargeting and keep the
+       surface at its full decoded size from now on. */
+    if (image_resource_available(image)) {
+        (void) images_retarget_pin_full(
+            bridge->images, (size_t) (image - bridge->images->items),
+            bridge->session);
+    }
     if (!image_resource_available(image) || image->pixels == NULL
         || image->width <= 0 || image->height <= 0
         || (size_t) image->width > SIZE_MAX / (size_t) image->height
@@ -895,15 +903,6 @@ canvas_text_finished:
     if (clipped_out != NULL) *clipped_out = work_exhausted;
     if (!rendered) return JS_FALSE;
     return JS_NewInt32(context, work_exhausted ? 2 : 1);
-}
-
-JSValue js_canvas_raster_text(JSContext *context,
-                              JSValueConst this_value,
-                              int argc, JSValueConst *argv)
-{
-    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
-    return canvas_raster_text_with_work(
-        context, this_value, argc, argv, &work_remaining, NULL);
 }
 
 static bool canvas_path_inside(const uint8_t *points, size_t point_count,

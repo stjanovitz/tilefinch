@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tilefinch/bot_wall.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
 #include "tilefinch/reader_mode.h"
@@ -17,6 +18,10 @@
 #include "tilefinch/style.h"
 
 #define NAVIGATION_URL_LIMIT 2048
+/* A Refresh header value: room for a URL-limit URL plus its delay and
+   "; url=". A longer value is ignored (no refresh), as a meta whose URL
+   does not fit is. */
+#define NAVIGATION_REFRESH_HEADER_LIMIT (NAVIGATION_URL_LIMIT + 64)
 #define NAVIGATION_TITLE_LIMIT 256
 #define NAVIGATION_FRAME_LIMIT 4
 /* A Cloudflare managed challenge runs an obfuscated bytecode interpreter
@@ -161,6 +166,73 @@ typedef struct {
     size_t focus_index;
 } NavigationHistoryRecord;
 
+/* Consecutive refresh navigations (meta refresh or the Refresh header) that
+   may run with no user input between them. The next one that comes due is
+   stopped and the page stays as it is: a page refreshing itself every
+   second must not reload the PSP forever. Any button press, and any
+   navigation the user starts, resets the run. */
+#define NAVIGATION_REFRESH_CHAIN_LIMIT 5u
+
+typedef enum {
+    /* The document has not declared a refresh (yet). */
+    NAVIGATION_REFRESH_NONE = 0,
+    /* Declared; the timer runs from the document's load. */
+    NAVIGATION_REFRESH_PENDING,
+    /* Came due while the frontend defers page navigations: waiting for
+       navigation_take_refresh_navigation. */
+    NAVIGATION_REFRESH_DUE,
+    NAVIGATION_REFRESH_FOLLOWED,
+    /* Another navigation began, or the user took control of the page. */
+    NAVIGATION_REFRESH_CANCELLED,
+    /* NAVIGATION_REFRESH_CHAIN_LIMIT reached. */
+    NAVIGATION_REFRESH_STOPPED,
+    /* A same-URL reload came due after the user had pressed a button on
+       this page: it is not followed; the frontend offers it instead. */
+    NAVIGATION_REFRESH_OFFERED,
+    /* The target is a URL this browser never navigates to from a page
+       refresh (javascript:, data:, file:, about:, any non-HTTP(S) URL). */
+    NAVIGATION_REFRESH_REFUSED
+} NavigationRefreshState;
+
+/* The committed document's declarative refresh: the HTML Standard's
+   "will declaratively refresh" flag plus the one timer it allows. Page
+   state, so it is created and destroyed with the document. */
+typedef struct {
+    NavigationRefreshState state;
+    /* The committed document and any Refresh header were examined. This
+       happens on the first runtime advance after commit, which is after the
+       document's load event; it is when the timer starts. */
+    bool examined;
+    /* Included in NavigationRefreshStats.declared/refused. */
+    bool counted;
+    bool from_header;
+    /* The target is the document's own URL (an auto-reload). */
+    bool reload;
+    /* A stopped refresh not yet reported to the frontend. */
+    bool stop_notice;
+    /* An offered reload not yet reported to the frontend. */
+    bool offer_notice;
+    /* The user has acted (navigation_note_user_input) since this document
+       committed: a same-URL reload is then offered, not followed. */
+    bool user_touched;
+    uint32_t delay_seconds;
+    uint64_t elapsed_ms;
+    char url[NAVIGATION_URL_LIMIT];
+} NavigationRefresh;
+
+typedef struct {
+    /* Refresh navigations since the last user input or user navigation. */
+    size_t chain;
+    /* The rest are counted only in builds with tracing or the validation
+       log (tests and the host lab read them). */
+    size_t declared;
+    size_t followed;
+    size_t cancelled;
+    size_t stopped;
+    size_t refused;
+    size_t offered;
+} NavigationRefreshStats;
+
 typedef struct {
     lxb_dom_node_t *element;
     uint64_t resolved_url_hash;
@@ -201,6 +273,10 @@ typedef struct {
     /* Script-heap rejections already attributed by the realm-retirement
        check, so a later check needs a new rejection, not just text. */
     size_t script_heap_rejections_seen;
+    /* The page's realm ran out of memory and took the server-rendered body
+       down with it; the body was restored from the memory-rescue copy and
+       the realm retired (navigation_page_memory_rescued). */
+    bool script_memory_rescued;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *resource_scheduler;
     /* Optional visual resources continue only from owner idle ticks. The
@@ -210,6 +286,18 @@ typedef struct {
        with weak handles and source-generation checks across author turns.
        Its one active, at-most-two-target job is externally pumped. */
     bool image_continuation_pending;
+    /* Display retargeting (images_retarget_display_step) runs from owner
+       idle ticks once image loading is done, until a step finds nothing to
+       change for the committed layout identified here. */
+    struct {
+        const void *commands;
+        size_t count;
+        size_t images;
+        size_t relayouts;
+        size_t loads;
+        bool settled;
+        uint8_t retries;
+    } image_retarget;
     ImagePriorityTarget *deferred_image_targets;
     size_t deferred_image_count;
     size_t deferred_image_cursor;
@@ -269,6 +357,7 @@ typedef struct {
        next idle pass and published with one (provisional) relayout. */
     ImagePriorityTarget *visual_batch_targets;
     size_t visual_batch_count;
+    NavigationRefresh refresh;
 } NavigationPage;
 
 typedef struct NavigationSession NavigationSession;
@@ -462,6 +551,10 @@ typedef struct {
     size_t mutation_conservative_scans;
     size_t mutation_journal_overflows;
     size_t semantic_relayout_skips;
+    /* Journals whose every change stayed inside content that renders
+       nothing (display:none), proven unable to restyle anything that
+       renders: no relayout. */
+    size_t hidden_relayout_skips;
     size_t focus_outline_relayout_skips;
     size_t focus_paint_relayout_skips;
     size_t layout_reuse_style_hits;
@@ -728,10 +821,18 @@ struct NavigationSession {
     void *node_visibility_opaque;
     size_t runtime_section_identity;
     bool document_scripts_enabled;
+    /* Immutable selection for runtimes created by the shared page/frame factory. */
+    bool game_audio_internal_slots;
     bool defer_document_script_pipeline;
     size_t maximum_scripts;
     size_t maximum_script_bytes;
     size_t maximum_script_file_bytes;
+    /* Heavy-page policy for realms this session creates (js_runtime.h):
+       the resolver's answer for the realm's top-level URL when one is set,
+       else heavy_script_policy. */
+    ScriptHeavyPolicy heavy_script_policy;
+    ScriptHeavyPolicyResolver heavy_policy_resolver;
+    void *heavy_policy_opaque;
     long script_timeout_ms;
     size_t script_discovered;
     size_t script_attempted;
@@ -782,6 +883,9 @@ struct NavigationSession {
     size_t client_hint_retries;
     char last_cf_mitigated[32];
     char last_server[64];
+    /* Bot-protection vendor the committed document's response headers
+       identify (tilefinch_bot_wall_header_vendor), or empty. */
+    char last_bot_wall_vendor[TILEFINCH_BOT_WALL_VENDOR_LIMIT];
     char last_error[512];
     char last_script_error_context[2048];
     char last_page_trace[2048];
@@ -793,6 +897,12 @@ struct NavigationSession {
     size_t frames_failed;
     /* Runtimes given NAVIGATION_MANAGED_CHALLENGE_JS_HEAP_BYTES. */
     size_t managed_challenge_heap_raises;
+    /* One-shot heap floor for the next top-level realm (an installed app
+       launched from the offline library); 0 when unarmed. Consumed by that
+       realm, so any later document gets js_memory_limit again. */
+    size_t next_top_level_js_heap;
+    /* Counted only in builds with tracing or the validation log. */
+    size_t installed_app_heap_raises;
     size_t frame_messages_posted;
     size_t frame_messages_delivered;
     size_t frame_messages_to_parent;
@@ -851,6 +961,21 @@ struct NavigationSession {
        frontend takes it and runs an ordinary cooperative navigation job. */
     bool defer_script_navigation;
     char pending_response_referrer_policy[128];
+    /* The final response's `Refresh` header for the document being
+       committed, consumed by that commit (like the referrer policy). */
+    char pending_refresh_header[NAVIGATION_REFRESH_HEADER_LIMIT];
+    /* Survives page replacement: the loop guard and counters. */
+    NavigationRefreshStats refresh;
+    /* The next navigation to this URL hash replaces the current history
+       entry instead of keeping it (historyHandling "replace"). Armed by a
+       followed refresh or location.replace(); navigation_begin hands the
+       arming to the navigation it starts (history_replace_generation), so
+       it never outlives that navigation, and that navigation's load start
+       or direct commit takes it if its URL matches and it records no
+       entry of its own. */
+    uint64_t history_replace_url_hash;
+    uint64_t history_replace_generation;
+    bool history_replace_armed;
     char *user_css;
     size_t user_css_length;
     NavigationCandidatePrepareCallback candidate_prepare;
@@ -1051,6 +1176,10 @@ void navigation_enable_diagnostic_frame_safari(NavigationSession *session,
    instead of growing them while the page Budget has room. */
 void navigation_set_fixed_script_memory_limits(NavigationSession *session,
                                                bool fixed);
+/* Give the next top-level realm at least `heap_limit` bytes of QuickJS
+   heap (0 disarms). Carved from the same page Budget, never added to it. */
+void navigation_arm_next_top_level_heap(NavigationSession *session,
+                                        size_t heap_limit);
 void navigation_set_stream_delivery(
     NavigationSession *session, size_t chunk_bytes, uint64_t irregular_seed,
     size_t irregular_max_chunk_bytes, size_t stall_every_chunks,
@@ -1148,6 +1277,18 @@ bool navigation_back(NavigationSession *session, const NavigationEntry **entry);
 bool navigation_forward(NavigationSession *session,
                         const NavigationEntry **entry);
 const NavigationEntry *navigation_current(const NavigationSession *session);
+/* A committed top-level document that is a bot-protection wall: a refusal
+   status with a vendor signature in its headers or title, or a refusal
+   status on a page that renders nothing because its script was refused
+   (vendor empty). The frontend tells the reader the site may not work. */
+typedef struct {
+    long status;
+    char vendor[TILEFINCH_BOT_WALL_VENDOR_LIMIT];
+    char site[TILEFINCH_BOT_WALL_SITE_LIMIT];
+    bool blank_after_refused_script;
+} NavigationBotWall;
+bool navigation_bot_wall(const NavigationSession *session,
+                         NavigationBotWall *wall);
 /* Returns the committed document's effective URL.  A session-history entry
    retains the originally requested URL while a replayed redirect commits a
    different document, so security and resource policy must use this value. */
@@ -1157,6 +1298,32 @@ const NavigationEntry *navigation_current(const NavigationSession *session);
 bool navigation_take_script_navigation(NavigationSession *session,
                                        char *url, size_t capacity,
                                        bool *record_history);
+typedef enum {
+    NAVIGATION_REFRESH_TAKE_NONE = 0,
+    /* url holds the target: begin an ordinary navigation to it without
+       recording a new history entry (it replaces the current one). */
+    NAVIGATION_REFRESH_TAKE_NAVIGATE,
+    /* A refresh came due but the loop guard stopped it; reported once so
+       the frontend can say so. */
+    NAVIGATION_REFRESH_TAKE_STOPPED,
+    /* A same-URL reload came due after the user had pressed a button on
+       the page; reported once so the frontend can offer it (its own reload
+       control reloads). */
+    NAVIGATION_REFRESH_TAKE_OFFERED
+} NavigationRefreshTake;
+/* Take a meta refresh or Refresh-header navigation that came due while
+   defer_script_navigation was set. A page-script navigation already pending
+   wins: take that first (navigation_take_script_navigation). Records the
+   document as referer, without user activation, like a script navigation. */
+NavigationRefreshTake navigation_take_refresh_navigation(
+    NavigationSession *session, char *url, size_t capacity);
+/* The user acted (a button press, a typed address): the loop guard's run
+   of unattended refreshes starts again, and the live page counts as
+   touched, so its same-URL auto-reload is offered rather than followed. */
+void navigation_note_user_input(NavigationSession *session);
+/* The user took control of the page (edited a form field): a refresh not
+   yet followed is cancelled. True when one was. */
+bool navigation_cancel_refresh(NavigationSession *session);
 const char *navigation_active_document_url(
     const NavigationSession *session);
 /*
@@ -1193,6 +1360,9 @@ bool navigation_advance_runtime(NavigationSession *session,
    a viewport fill is visible output, even when its base color matches the
    page background. */
 bool navigation_layout_is_visually_blank(const LayoutDocument *layout);
+/* True once this page's realm ran out of memory, its server-rendered body
+   was restored from the memory-rescue copy and the realm retired. */
+bool navigation_page_memory_rescued(const NavigationSession *session);
 /* The active top-level realm alone receives built-in controller input. This
    matches the platform's explicit page-capture boundary and does not leak
    controller state into cross-origin child frames. A page without an author
@@ -1262,9 +1432,19 @@ bool navigation_test_install_frame_capability_trace(
    advancing webfonts, scripts, or other idle work. Frontends may use this
    after presenting an input frame so continuous focus/scroll activity cannot
    starve visible lazy images while input latency remains bounded. */
+/* Display retargeting of decoded rasters to the committed layout's painted
+   sizes (tilefinch/image_retarget.h): owner idle work after image loading
+   has finished. One step changes at most one surface and returns whether it
+   did; a change publishes an empty-damage layout generation. */
+bool navigation_image_retarget_pending(const NavigationSession *session);
+bool navigation_run_image_retarget_work(NavigationSession *session);
 bool navigation_run_deferred_image_work(NavigationSession *session);
 bool navigation_background_resources_pending(
     const NavigationSession *session);
+/* Deferred classic bytecode stores of the page and its frames: one store
+   per call (idle work only); whether one was handled / any remain. */
+bool navigation_store_pending_script_bytecode(NavigationSession *session);
+bool navigation_script_bytecode_pending(const NavigationSession *session);
 /* Move a still-deferred document image to the next owner-idle slot. If a
    different two-image batch is active, cancel only its uncommitted suffix;
    any image already published through layout remains owned by the page. */
@@ -1311,6 +1491,13 @@ bool navigation_evaluate_external_script(NavigationSession *session,
                                          const char *source,
                                          size_t source_length,
                                          const char *source_url);
+/* The same for a fetched response; `response_no_store` keeps its compiled
+   bytecode out of the session (script_runtime_evaluate_external_classic_
+   cached). */
+bool navigation_evaluate_external_script_response(
+    NavigationSession *session, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *source_url,
+    bool response_no_store);
 bool navigation_relayout(NavigationSession *session);
 typedef enum {
     NAVIGATION_LAYOUT_COMPLETION_NONE = 0,

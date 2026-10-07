@@ -351,7 +351,7 @@ static bool style_property_background(const StylePropertyParse *parse)
             target->background_position_x = 0;
             target->background_position_y = 0;
             *target_mask_high |= S2_BACKGROUND_POSITION;
-            char resolved[512];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
             bool resolved_ok = style_resolve_value(
                 sheet, value, value_length, resolved, sizeof(resolved), 0);
             /* Unresolvable: fall back only if this block has a background to

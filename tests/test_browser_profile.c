@@ -105,6 +105,22 @@ static int test_javascript_site_defaults(void)
           && !browser_profile_site_javascript_enabled(profile, "https://en.wikipedia.org/")
           && browser_profile_set_site_javascript_enabled(profile, "https://en.wikipedia.org/", true)
           && browser_profile_site_javascript_enabled(profile, "https://en.wikipedia.org/"));
+    /* A profile carrying only the Heavy pages mode (as a device test
+       stages one) loads it; an unknown mode keeps the Ask default. */
+    FILE *heavy = fopen(path, "wb");
+    CHECK(heavy != NULL
+          && fputs("TILEFINCH_PROFILE\t1\nHEAVY\t1\n", heavy) >= 0
+          && fclose(heavy) == 0 && seal_profile(path)
+          && browser_profile_load(profile, path)
+          && browser_profile_heavy_pages_mode(profile)
+                 == BROWSER_HEAVY_PAGES_RUN);
+    heavy = fopen(path, "wb");
+    CHECK(heavy != NULL
+          && fputs("TILEFINCH_PROFILE\t1\nHEAVY\t7\n", heavy) >= 0
+          && fclose(heavy) == 0 && seal_profile(path)
+          && browser_profile_load(loaded, path)
+          && browser_profile_heavy_pages_mode(loaded)
+                 == BROWSER_HEAVY_PAGES_ASK);
     static const char *invalid[] = {"2", "-1", "1junk", "4294967295"};
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         FILE *file = fopen(path, "wb");
@@ -311,6 +327,8 @@ int main(void)
                  == BROWSER_READER_FONT_SANS
           && !browser_profile_remember_reader_site_scale(profile)
           && !browser_profile_reader_auto_mode(profile)
+          && browser_profile_basic_fallback_mode(profile)
+                 == BROWSER_BASIC_FALLBACK_AUTOMATIC
           && browser_profile_reader_site_count(profile) == 0
           && browser_profile_update_check_enabled(profile)
           && browser_profile_update_channel(profile)
@@ -422,6 +440,35 @@ int main(void)
         profile, "https://en.wikipedia.org/", 125));
     browser_profile_set_remember_reader_site_scale(profile, true);
     browser_profile_set_reader_auto_mode(profile, true);
+    CHECK(!browser_profile_set_basic_fallback_mode(
+              profile, BROWSER_BASIC_FALLBACK_MODE_COUNT)
+          && browser_profile_basic_fallback_mode(profile)
+                 == BROWSER_BASIC_FALLBACK_AUTOMATIC
+          && browser_profile_set_basic_fallback_mode(
+                 profile, BROWSER_BASIC_FALLBACK_ASK));
+    /* Heavy pages: the mode and the always-run sites round-trip; a site is
+       its registrable domain; the list is bounded. */
+    CHECK(browser_profile_heavy_pages_mode(profile) == BROWSER_HEAVY_PAGES_ASK
+          && !browser_profile_set_heavy_pages_mode(
+                 profile, BROWSER_HEAVY_PAGES_MODE_COUNT)
+          && browser_profile_set_heavy_pages_mode(
+                 profile, BROWSER_HEAVY_PAGES_BASIC)
+          && !browser_profile_heavy_site_allowed(profile, "https://m.vk.ru/")
+          && browser_profile_set_heavy_site_allowed(
+                 profile, "https://m.vk.ru/feed", true)
+          && browser_profile_heavy_site_allowed(profile, "https://vk.ru/")
+          && browser_profile_set_heavy_site_allowed(
+                 profile, "https://bsky.app/", true)
+          && browser_profile_set_heavy_site_allowed(
+                 profile, "https://bsky.app/", false)
+          && !browser_profile_heavy_site_allowed(profile, "https://bsky.app/"));
+    for (unsigned i = 0; i < BROWSER_PROFILE_HEAVY_SITE_LIMIT - 1u; i++) {
+        char heavy_url[64];
+        snprintf(heavy_url, sizeof(heavy_url), "https://app%u.test/", i);
+        CHECK(browser_profile_set_heavy_site_allowed(profile, heavy_url, true));
+    }
+    CHECK(!browser_profile_set_heavy_site_allowed(
+        profile, "https://one-too-many.test/", true));
     for (unsigned i = 0; i < BROWSER_PROFILE_READER_SITE_LIMIT + 1u; i++) {
         char reader_url[96];
         snprintf(reader_url, sizeof(reader_url),
@@ -650,6 +697,13 @@ int main(void)
           && browser_profile_update_check_available_sequence(loaded) == 43
           && browser_profile_remember_reader_site_scale(loaded)
           && browser_profile_reader_auto_mode(loaded)
+          && browser_profile_basic_fallback_mode(loaded)
+                 == BROWSER_BASIC_FALLBACK_ASK
+          && browser_profile_heavy_pages_mode(loaded)
+                 == BROWSER_HEAVY_PAGES_BASIC
+          && browser_profile_heavy_site_allowed(loaded, "https://m.vk.ru/")
+          && browser_profile_heavy_site_allowed(loaded, "https://app14.test/")
+          && !browser_profile_heavy_site_allowed(loaded, "https://bsky.app/")
           && browser_profile_reader_site_count(loaded)
                  == BROWSER_PROFILE_READER_SITE_LIMIT
           && browser_profile_reader_site_font_percent(
@@ -777,6 +831,8 @@ int main(void)
                  == BROWSER_READER_FONT_SANS
           && !browser_profile_remember_reader_site_scale(legacy_loaded)
           && !browser_profile_reader_auto_mode(legacy_loaded)
+          && browser_profile_basic_fallback_mode(legacy_loaded)
+                 == BROWSER_BASIC_FALLBACK_AUTOMATIC
           && browser_profile_update_check_enabled(legacy_loaded)
           && browser_profile_update_channel(legacy_loaded)
                  == BROWSER_UPDATE_CHANNEL_STABLE
@@ -808,6 +864,34 @@ int main(void)
           && !file_contains(path, "STATS\t")
           && file_contains(path, "TPC\tcookies.example"));
     browser_profile_destroy(legacy_loaded);
+
+    /* A READER record from before the Basic view fallback setting keeps its
+       three fields and the automatic default; an unknown mode is ignored. */
+    static const char *const reader_records[] = {
+        "READER\t1\t0\t1\n", "READER\t1\t0\t1\t2\n",
+        "READER\t1\t0\t1\t9\n"
+    };
+    static const BrowserBasicFallbackMode reader_modes[] = {
+        BROWSER_BASIC_FALLBACK_AUTOMATIC, BROWSER_BASIC_FALLBACK_OFF,
+        BROWSER_BASIC_FALLBACK_AUTOMATIC
+    };
+    for (size_t record = 0; record < 3u; record++) {
+        FILE *reader_file = fopen(path, "wb");
+        CHECK(reader_file != NULL
+              && fputs("TILEFINCH_PROFILE\t1\n", reader_file) >= 0
+              && fputs(reader_records[record], reader_file) >= 0
+              && fclose(reader_file) == 0);
+        CHECK(seal_profile(path));
+        BrowserProfile *reader_loaded = browser_profile_create(&budget);
+        CHECK(reader_loaded != NULL
+              && browser_profile_load(reader_loaded, path)
+              && browser_profile_reader_font(reader_loaded)
+                     == BROWSER_READER_FONT_SERIF
+              && browser_profile_reader_auto_mode(reader_loaded)
+              && browser_profile_basic_fallback_mode(reader_loaded)
+                     == reader_modes[record]);
+        browser_profile_destroy(reader_loaded);
+    }
 
     /*
      * A MEDIA record written by the build before video scaling existed: two

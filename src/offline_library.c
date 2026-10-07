@@ -20,7 +20,7 @@
 #define OFFLINE_ARTICLE_FREE_SPACE_RESERVE (256u * 1024u)
 #define OFFLINE_ORPHAN_SCAN_LIMIT 128u
 #define OFFLINE_APP_BYTECODE_SCRIPT_LIMIT 8u
-#define OFFLINE_APP_BYTECODE_SOURCE_LIMIT (512u * 1024u)
+#define OFFLINE_APP_BYTECODE_SOURCE_LIMIT (1024u * 1024u)
 
 static void offline_error(
     char *error, size_t error_size, const char *format, ...)
@@ -38,14 +38,22 @@ static uint64_t offline_now_unix(void)
     return now > 0 ? (uint64_t) now : 0;
 }
 
-static uint32_t offline_hash(const unsigned char *data, size_t length)
+#define OFFLINE_HASH_SEED UINT32_C(2166136261)
+
+static uint32_t offline_hash_update(uint32_t hash, const void *bytes,
+                                    size_t length)
 {
-    uint32_t hash = UINT32_C(2166136261);
+    const unsigned char *data = bytes;
     for (size_t index = 0; index < length; index++) {
         hash ^= data[index];
         hash *= UINT32_C(16777619);
     }
     return hash;
+}
+
+static uint32_t offline_hash(const unsigned char *data, size_t length)
+{
+    return offline_hash_update(OFFLINE_HASH_SEED, data, length);
 }
 
 static bool put_u32(
@@ -1107,23 +1115,6 @@ static bool offline_blob_bytes(OfflineBlob *blob, const void *bytes,
     return true;
 }
 
-static bool offline_blob_u32(OfflineBlob *blob, uint32_t value)
-{
-    unsigned char bytes[4];
-    size_t used = 0;
-    return put_u32(bytes, sizeof(bytes), &used, value)
-        && offline_blob_bytes(blob, bytes, sizeof(bytes));
-}
-
-static bool offline_blob_text(OfflineBlob *blob, const char *text,
-                              size_t limit)
-{
-    size_t length = text == NULL ? 0 : strnlen(text, limit);
-    return length < limit && length <= UINT32_MAX
-        && offline_blob_u32(blob, (uint32_t) length)
-        && offline_blob_bytes(blob, text, length);
-}
-
 static lxb_status_t offline_document_receive(
     const lxb_char_t *data, size_t length, void *opaque)
 {
@@ -1131,43 +1122,87 @@ static lxb_status_t offline_document_receive(
         ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
 }
 
-static bool offline_pack_view(OfflineBlob *blob,
+/* An installed app's resource pack is streamed rather than assembled in
+   memory. While the page being installed is live, every source body (and any
+   runtime classic-script bytecode) the pack carries is already resident in
+   the session cache; a second in-memory copy plus its growth reallocations
+   used to cost roughly twice the pack again at install time. The sink only
+   measures and hashes for a preview, and also writes when it has a file. */
+typedef struct {
+    FILE *file;
+    uint32_t hash;
+    size_t length;
+    size_t limit;
+} OfflinePackSink;
+
+static bool offline_sink_bytes(OfflinePackSink *sink, const void *bytes,
+                               size_t length)
+{
+    if (sink == NULL || (bytes == NULL && length != 0)
+        || sink->length > sink->limit || length > sink->limit - sink->length)
+        return false;
+    if (length == 0) return true;
+    if (sink->file != NULL
+        && fwrite(bytes, 1, length, sink->file) != length) return false;
+    sink->hash = offline_hash_update(sink->hash, bytes, length);
+    sink->length += length;
+    return true;
+}
+
+static bool offline_sink_u32(OfflinePackSink *sink, uint32_t value)
+{
+    unsigned char bytes[4];
+    size_t used = 0;
+    return put_u32(bytes, sizeof(bytes), &used, value)
+        && offline_sink_bytes(sink, bytes, sizeof(bytes));
+}
+
+static bool offline_sink_text(OfflinePackSink *sink, const char *text,
+                              size_t limit)
+{
+    size_t length = text == NULL ? 0 : strnlen(text, limit);
+    return length < limit && length <= UINT32_MAX
+        && offline_sink_u32(sink, (uint32_t) length)
+        && offline_sink_bytes(sink, text, length);
+}
+
+static bool offline_pack_view(OfflinePackSink *sink,
                               const BrowserOfflineCacheView *view)
 {
     const TilefinchResourceGrant *grant = &view->resource_grant;
     return view->length <= UINT32_MAX
         && view->classic_script_bytecode_length <= UINT32_MAX
-        && offline_blob_u32(blob, (uint32_t) view->kind)
-        && offline_blob_u32(blob, (uint32_t) view->length)
-        && offline_blob_u32(
-               blob, (uint32_t) view->classic_script_bytecode_length)
-        && offline_blob_u32(
-               blob, view->classic_script_bytecode_length == 0
+        && offline_sink_u32(sink, (uint32_t) view->kind)
+        && offline_sink_u32(sink, (uint32_t) view->length)
+        && offline_sink_u32(
+               sink, (uint32_t) view->classic_script_bytecode_length)
+        && offline_sink_u32(
+               sink, view->classic_script_bytecode_length == 0
                    ? 0u : TILEFINCH_QUICKJS_BYTECODE_ABI)
-        && offline_blob_text(blob, view->url, OFFLINE_LIBRARY_URL_LIMIT)
-        && offline_blob_text(blob, view->content_type, 128u)
-        && offline_blob_text(blob, view->response_url,
+        && offline_sink_text(sink, view->url, OFFLINE_LIBRARY_URL_LIMIT)
+        && offline_sink_text(sink, view->content_type, 128u)
+        && offline_sink_text(sink, view->response_url,
                              OFFLINE_LIBRARY_URL_LIMIT)
-        && offline_blob_text(blob, view->response_referrer_policy, 128u)
-        && offline_blob_u32(blob, (uint32_t) grant->destination)
-        && offline_blob_u32(blob, (uint32_t) grant->mode)
-        && offline_blob_u32(blob, (uint32_t) grant->credentials)
-        && offline_blob_u32(blob, (uint32_t) grant->corp)
-        && offline_blob_u32(blob, grant->initiator_opaque ? 1u : 0u)
-        && offline_blob_u32(blob, grant->final_same_origin ? 1u : 0u)
-        && offline_blob_u32(blob, grant->final_same_site ? 1u : 0u)
-        && offline_blob_u32(blob, grant->cors_validated ? 1u : 0u)
-        && offline_blob_u32(blob, grant->nosniff ? 1u : 0u)
-        && offline_blob_u32(blob, grant->mime_validated ? 1u : 0u)
-        && offline_blob_u32(blob, (uint32_t) view->module_credentials)
-        && offline_blob_u32(blob, view->module_cors_validated ? 1u : 0u)
-        && offline_blob_u32(blob,
+        && offline_sink_text(sink, view->response_referrer_policy, 128u)
+        && offline_sink_u32(sink, (uint32_t) grant->destination)
+        && offline_sink_u32(sink, (uint32_t) grant->mode)
+        && offline_sink_u32(sink, (uint32_t) grant->credentials)
+        && offline_sink_u32(sink, (uint32_t) grant->corp)
+        && offline_sink_u32(sink, grant->initiator_opaque ? 1u : 0u)
+        && offline_sink_u32(sink, grant->final_same_origin ? 1u : 0u)
+        && offline_sink_u32(sink, grant->final_same_site ? 1u : 0u)
+        && offline_sink_u32(sink, grant->cors_validated ? 1u : 0u)
+        && offline_sink_u32(sink, grant->nosniff ? 1u : 0u)
+        && offline_sink_u32(sink, grant->mime_validated ? 1u : 0u)
+        && offline_sink_u32(sink, (uint32_t) view->module_credentials)
+        && offline_sink_u32(sink, view->module_cors_validated ? 1u : 0u)
+        && offline_sink_u32(sink,
                             view->module_redirect_origin_tainted ? 1u : 0u)
-        && offline_blob_u32(blob,
+        && offline_sink_u32(sink,
                             view->module_javascript_mime_validated ? 1u : 0u)
-        && offline_blob_bytes(blob, view->data, view->length)
-        && offline_blob_bytes(
-               blob, view->classic_script_bytecode,
+        && offline_sink_bytes(sink, view->data, view->length)
+        && offline_sink_bytes(
+               sink, view->classic_script_bytecode,
                view->classic_script_bytecode_length);
 }
 
@@ -1202,110 +1237,289 @@ static void offline_remove_app_payloads(const OfflineLibrary *library,
 
 typedef struct {
     OfflineBlob html;
-    OfflineBlob pack;
+    /* Borrowed from the session cache between collect and stream; nothing
+       in between may mutate that cache. */
+    BrowserOfflineCacheView views[BROWSER_OFFLINE_CACHE_ENTRY_LIMIT];
     size_t resource_count;
+    size_t resource_bytes;
+    size_t pack_length;
+    uint32_t pack_hash;
+    size_t classic_scripts;
+    size_t bytecode_scripts;
+    bool cancelled;
 } OfflineAppSnapshot;
+
+/* Compiler artifacts a preview produced, keyed by the exact source, so the
+   confirming install publishes them instead of compiling again. */
+typedef struct {
+    char *url;
+    uint64_t source_hash;
+    size_t source_length;
+    unsigned char *bytecode;
+    size_t length;
+} OfflineStagedScript;
+
+struct OfflineAppStagedBytecode {
+    size_t count;
+    OfflineStagedScript scripts[OFFLINE_APP_BYTECODE_SCRIPT_LIMIT];
+};
+
+void offline_library_discard_staged(OfflineLibrary *library)
+{
+    if (library == NULL || library->staged == NULL) return;
+    for (size_t at = 0; at < library->staged->count; at++) {
+        budget_free(library->budget, library->staged->scripts[at].url);
+        budget_free(library->budget, library->staged->scripts[at].bytecode);
+    }
+    budget_free(library->budget, library->staged);
+    library->staged = NULL;
+}
+
+static OfflineStagedScript *offline_staged_find(
+    OfflineLibrary *library, const BrowserOfflineCacheView *view,
+    uint64_t source_hash)
+{
+    OfflineAppStagedBytecode *staged = library->staged;
+    for (size_t at = 0; staged != NULL && at < staged->count; at++) {
+        OfflineStagedScript *script = &staged->scripts[at];
+        if (script->source_length == view->length
+            && script->source_hash == source_hash
+            && strcmp(script->url, view->url) == 0) return script;
+    }
+    return NULL;
+}
+
+static bool offline_classic_script(const BrowserOfflineCacheView *view)
+{
+    return view->kind == BROWSER_OFFLINE_CACHE_RESOURCE
+        && view->resource_grant.destination == TILEFINCH_DESTINATION_SCRIPT
+        && script_module_mime_type_allowed(view->content_type);
+}
+
+static bool offline_compile_candidate(
+    const BrowserOfflineCacheView *view, bool compile_missing_bytecode)
+{
+    return compile_missing_bytecode
+        && (view->classic_script_bytecode == NULL
+            || view->classic_script_bytecode_length == 0)
+        && offline_classic_script(view);
+}
+
+/* A TFAPP01 pack opens with this magic, its version and its record count. */
+static const unsigned char offline_app_pack_magic[8] = {
+    'T','F','A','P','P','0','1',0
+};
+#define OFFLINE_APP_PACK_VERSION 2u
+
+static bool offline_pack_begin(OfflinePackSink *sink, uint32_t count)
+{
+    return offline_sink_bytes(sink, offline_app_pack_magic,
+                              sizeof(offline_app_pack_magic))
+        && offline_sink_u32(sink, OFFLINE_APP_PACK_VERSION)
+        && offline_sink_u32(sink, count);
+}
+
+/* The bytecode a pack being written carries, for installation and
+   recompile alike: up to OFFLINE_APP_BYTECODE_SCRIPT_LIMIT scripts compiled
+   from at most OFFLINE_APP_BYTECODE_SOURCE_LIMIT of source, and at most
+   OFFLINE_LIBRARY_APP_BYTECODE_LIMIT of bytecode in all. */
+typedef struct {
+    size_t bytecode_bytes;
+    size_t compiled_source;
+    size_t compiled_scripts;
+    /* The progress denominator; grows if more scripts compile. */
+    unsigned total;
+} OfflinePackBytecode;
+
+/* Whether an artifact already in hand still fits the pack. */
+static bool offline_pack_bytecode_fits(const OfflinePackBytecode *state,
+                                       size_t length)
+{
+    return length != 0
+        && length <= OFFLINE_LIBRARY_APP_BYTECODE_LIMIT
+               - state->bytecode_bytes;
+}
+
+/* Whether `view` gets compiled bytecode in this pack; counts it if so. */
+static bool offline_pack_bytecode_admit(OfflinePackBytecode *state,
+                                        const BrowserOfflineCacheView *view,
+                                        bool compile_missing_bytecode)
+{
+    if (!offline_compile_candidate(view, compile_missing_bytecode)
+        || state->bytecode_bytes >= OFFLINE_LIBRARY_APP_BYTECODE_LIMIT
+        || state->compiled_scripts >= OFFLINE_APP_BYTECODE_SCRIPT_LIMIT
+        || view->length
+               > OFFLINE_APP_BYTECODE_SOURCE_LIMIT - state->compiled_source)
+        return false;
+    state->compiled_scripts++;
+    state->compiled_source += view->length;
+    return true;
+}
+
+/* Reports progress and yields, then compiles an admitted script into what
+   the pack has left. The view carries the bytecode when it compiled (the
+   caller frees *compiled); false when the user cancelled at the yield. */
+static bool offline_pack_bytecode_compile(OfflineLibrary *library,
+                                          OfflinePackBytecode *state,
+                                          BrowserOfflineCacheView *view,
+                                          unsigned char **compiled)
+{
+    if (state->compiled_scripts > state->total)
+        state->total = (unsigned) state->compiled_scripts;
+    if (library->progress != NULL)
+        library->progress(library->progress_context,
+                          (unsigned) state->compiled_scripts, state->total);
+    if (!tilefinch_platform_cooperate("offline-app-compile",
+                                      state->compiled_scripts))
+        return false;
+    library->script_compiles++;
+    size_t compiled_length = 0;
+    if (script_compile_classic_bytecode(
+            library->budget, (const char *) view->data, view->length,
+            view->url,
+            OFFLINE_LIBRARY_APP_BYTECODE_LIMIT - state->bytecode_bytes,
+            compiled, &compiled_length)) {
+        view->classic_script_bytecode = *compiled;
+        view->classic_script_bytecode_length = compiled_length;
+    }
+    return true;
+}
 
 static void offline_app_snapshot_destroy(
     OfflineLibrary *library, OfflineAppSnapshot *snapshot)
 {
     if (library == NULL || snapshot == NULL) return;
     budget_free(library->budget, snapshot->html.data);
-    budget_free(library->budget, snapshot->pack.data);
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
-static bool offline_app_snapshot_build(
+/* Serialize the document and select the app's same-origin responses. The
+   selection can only contain what the session cache still holds, so the
+   live cache preference bounds what an install can capture; the package
+   limit itself is OFFLINE_LIBRARY_APP_RESOURCE_LIMIT. */
+static bool offline_app_snapshot_collect(
     OfflineLibrary *library, PocDocument *document, BrowserSession *session,
-    const char *source_url, bool compile_missing_bytecode,
-    OfflineAppSnapshot *snapshot,
+    const char *source_url, OfflineAppSnapshot *snapshot,
     char *error, size_t error_size)
 {
     if (library == NULL || document == NULL || session == NULL
         || source_url == NULL || snapshot == NULL) return false;
-    *snapshot = (OfflineAppSnapshot) {
-        .html = {
-            .budget = library->budget,
-            .limit = OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT
-        },
-        .pack = {
-            .budget = library->budget,
-            .limit = OFFLINE_LIBRARY_APP_PACK_LIMIT
-        }
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->html = (OfflineBlob) {
+        .budget = library->budget,
+        .limit = OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT
     };
-    BrowserOfflineCacheView views[BROWSER_OFFLINE_CACHE_ENTRY_LIMIT];
-    size_t resource_bytes = 0;
     bool complete = false;
-    size_t cache_limit = session->maximum_cache_bytes
-        < OFFLINE_LIBRARY_APP_RESOURCE_LIMIT
-        ? session->maximum_cache_bytes : OFFLINE_LIBRARY_APP_RESOURCE_LIMIT;
     snapshot->resource_count =
         browser_session_cache_collect_offline_same_origin(
-            session, source_url, views, BROWSER_OFFLINE_CACHE_ENTRY_LIMIT,
-            cache_limit, &resource_bytes, &complete);
+            session, source_url, snapshot->views,
+            BROWSER_OFFLINE_CACHE_ENTRY_LIMIT,
+            OFFLINE_LIBRARY_APP_RESOURCE_LIMIT, &snapshot->resource_bytes,
+            &complete);
     if (!complete) {
         offline_error(error, error_size,
                       "app resources exceed the offline package bound");
         return false;
     }
-    size_t bytecode_limit = resource_bytes < session->maximum_cache_bytes
-        ? session->maximum_cache_bytes - resource_bytes : 0;
-    if (bytecode_limit > OFFLINE_LIBRARY_APP_BYTECODE_LIMIT)
-        bytecode_limit = OFFLINE_LIBRARY_APP_BYTECODE_LIMIT;
-    static const unsigned char magic[8] = {'T','F','A','P','P','0','1',0};
-    bool okay = lxb_html_serialize_tree_cb(
+    if (lxb_html_serialize_tree_cb(
             lxb_dom_interface_node(document->html),
-            offline_document_receive, &snapshot->html) == LXB_STATUS_OK
-        && snapshot->html.length != 0
-        && offline_blob_bytes(&snapshot->pack, magic, sizeof(magic))
-        && offline_blob_u32(&snapshot->pack, 2u)
-        && offline_blob_u32(
-               &snapshot->pack, (uint32_t) snapshot->resource_count);
-    size_t bytecode_bytes = 0;
-    size_t compiled_source_bytes = 0;
-    size_t compiled_scripts = 0;
-    for (size_t at = 0; okay && at < snapshot->resource_count; at++) {
-        BrowserOfflineCacheView packed = views[at];
-        unsigned char *compiled = NULL;
-        size_t compiled_length = 0;
-        size_t artifact_length = packed.classic_script_bytecode_length;
-        if (packed.classic_script_bytecode == NULL || artifact_length == 0
-            || artifact_length > bytecode_limit - bytecode_bytes) {
-            packed.classic_script_bytecode = NULL;
-            packed.classic_script_bytecode_length = 0;
-            artifact_length = 0;
-        }
-        bool classic_script = packed.kind == BROWSER_OFFLINE_CACHE_RESOURCE
-            && packed.resource_grant.destination
-                   == TILEFINCH_DESTINATION_SCRIPT
-            && script_module_mime_type_allowed(packed.content_type);
-        if (artifact_length == 0 && compile_missing_bytecode
-            && classic_script
-            && bytecode_bytes < bytecode_limit
-            && compiled_scripts < OFFLINE_APP_BYTECODE_SCRIPT_LIMIT
-            && packed.length
-                   <= OFFLINE_APP_BYTECODE_SOURCE_LIMIT - compiled_source_bytes) {
-            compiled_scripts++;
-            compiled_source_bytes += packed.length;
-            if (script_compile_classic_bytecode(
-                    library->budget, (const char *) packed.data, packed.length,
-                    packed.url,
-                    bytecode_limit - bytecode_bytes,
-                    &compiled, &compiled_length)) {
-                packed.classic_script_bytecode = compiled;
-                packed.classic_script_bytecode_length = compiled_length;
-                artifact_length = compiled_length;
-            }
-        }
-        bytecode_bytes += artifact_length;
-        okay = offline_pack_view(&snapshot->pack, &packed);
-        budget_free(library->budget, compiled);
-    }
-    if (!okay) {
+            offline_document_receive, &snapshot->html) != LXB_STATUS_OK
+        || snapshot->html.length == 0) {
         offline_error(error, error_size,
                       "offline app exceeded snapshot bounds");
         offline_app_snapshot_destroy(library, snapshot);
+        return false;
     }
+    return true;
+}
+
+/* Emit the TFAPP01 v2 pack for the collected responses into `file` (or
+   only measure and hash it when `file` is NULL). Missing classic-script
+   bytecode is compiled one script at a time; each artifact is released as
+   soon as it has been emitted, except that a preview (no file) keeps it in
+   library->staged for the install that confirms it, and an install
+   publishes a staged artifact instead of compiling again. */
+static bool offline_app_snapshot_stream(
+    OfflineLibrary *library, OfflineAppSnapshot *snapshot,
+    bool compile_missing_bytecode, FILE *file)
+{
+    OfflinePackSink sink = {
+        .file = file, .hash = OFFLINE_HASH_SEED,
+        .limit = OFFLINE_LIBRARY_APP_PACK_LIMIT
+    };
+    /* Bytecode is an optional accelerator with its own budget. It is no
+       longer clipped to the live-cache preference minus the captured
+       sources: launch admits the package's whole working set regardless of
+       that preference (offline_library_read_web_app). */
+    OfflinePackBytecode bytecode = {0};
+    for (size_t at = 0; at < snapshot->resource_count; at++) {
+        if (offline_classic_script(&snapshot->views[at]))
+            snapshot->classic_scripts++;
+        if (offline_compile_candidate(&snapshot->views[at],
+                                      compile_missing_bytecode)
+            && bytecode.total < OFFLINE_APP_BYTECODE_SCRIPT_LIMIT)
+            bytecode.total++;
+    }
+    bool okay = offline_pack_begin(&sink,
+                                   (uint32_t) snapshot->resource_count);
+    for (size_t at = 0; okay && at < snapshot->resource_count; at++) {
+        if (!tilefinch_platform_cooperate("offline-app-pack", at)) {
+            snapshot->cancelled = true;
+            okay = false;
+            break;
+        }
+        BrowserOfflineCacheView packed = snapshot->views[at];
+        unsigned char *compiled = NULL;
+        if (!offline_pack_bytecode_fits(
+                &bytecode, packed.classic_script_bytecode == NULL
+                               ? 0 : packed.classic_script_bytecode_length)) {
+            packed.classic_script_bytecode = NULL;
+            packed.classic_script_bytecode_length = 0;
+        }
+        if (packed.classic_script_bytecode_length == 0
+            && offline_pack_bytecode_admit(&bytecode, &packed,
+                                           compile_missing_bytecode)) {
+            uint64_t source_hash = browser_session_script_source_hash(
+                BROWSER_SESSION_SOURCE_HASH_SEED, packed.data, packed.length);
+            OfflineStagedScript *staged =
+                offline_staged_find(library, &packed, source_hash);
+            if (staged != NULL
+                && offline_pack_bytecode_fits(&bytecode, staged->length)) {
+                packed.classic_script_bytecode = staged->bytecode;
+                packed.classic_script_bytecode_length = staged->length;
+            } else if (!offline_pack_bytecode_compile(
+                           library, &bytecode, &packed, &compiled)) {
+                snapshot->cancelled = true;
+                okay = false;
+                break;
+            }
+            /* A preview keeps what it compiled for the install. */
+            OfflineAppStagedBytecode *keep = library->staged;
+            if (compiled != NULL && file == NULL && keep != NULL
+                && keep->count < OFFLINE_APP_BYTECODE_SCRIPT_LIMIT) {
+                OfflineStagedScript *slot = &keep->scripts[keep->count];
+                slot->url = budget_malloc_category(
+                    library->budget, BUDGET_CATEGORY_SESSION,
+                    strlen(packed.url) + 1u);
+                if (slot->url != NULL) {
+                    memcpy(slot->url, packed.url, strlen(packed.url) + 1u);
+                    slot->source_hash = source_hash;
+                    slot->source_length = packed.length;
+                    slot->bytecode = compiled;
+                    slot->length = packed.classic_script_bytecode_length;
+                    keep->count++;
+                    compiled = NULL;
+                }
+            }
+        }
+        bytecode.bytecode_bytes += packed.classic_script_bytecode_length;
+        if (packed.classic_script_bytecode_length != 0)
+            snapshot->bytecode_scripts++;
+        okay = offline_pack_view(&sink, &packed);
+        budget_free(library->budget, compiled);
+    }
+    snapshot->pack_length = okay ? sink.length : 0;
+    snapshot->pack_hash = okay ? sink.hash : 0;
     return okay;
 }
 
@@ -1325,16 +1539,28 @@ bool offline_library_preview_web_app(
         offline_error(error, error_size, "offline app input is invalid");
         return false;
     }
-    OfflineAppSnapshot snapshot = {0};
-    if (!offline_app_snapshot_build(
-            library, document, session, source_url, true, &snapshot,
+    OfflineAppSnapshot snapshot;
+    if (!offline_app_snapshot_collect(
+            library, document, session, source_url, &snapshot,
             error, error_size)) return false;
+    /* Without room to keep the artifacts the install simply compiles. */
+    offline_library_discard_staged(library);
+    library->staged = budget_calloc_category(
+        library->budget, BUDGET_CATEGORY_SESSION, 1,
+        sizeof(*library->staged));
+    if (!offline_app_snapshot_stream(library, &snapshot, true, NULL)) {
+        offline_error(error, error_size, snapshot.cancelled
+                      ? "offline app preview stopped"
+                      : "offline app exceeded snapshot bounds");
+        offline_library_discard_staged(library);
+        offline_app_snapshot_destroy(library, &snapshot);
+        return false;
+    }
     preview->estimated_bytes = (uint64_t) snapshot.html.length
-        + snapshot.pack.length + icon_length;
+        + snapshot.pack_length + icon_length;
     preview->document_hash = offline_hash(
         snapshot.html.data, snapshot.html.length);
-    preview->resource_hash = offline_hash(
-        snapshot.pack.data, snapshot.pack.length);
+    preview->resource_hash = snapshot.pack_hash;
     preview->icon_hash = icon_length == 0 ? 0 : offline_hash(icon, icon_length);
     preview->resource_count = (uint32_t) snapshot.resource_count;
     preview->operation = OFFLINE_WEB_APP_INSTALL;
@@ -1357,6 +1583,82 @@ bool offline_library_preview_web_app(
     return true;
 }
 
+static bool offline_write_app_pack(OfflineLibrary *library, uint32_t id,
+                                   OfflineAppSnapshot *snapshot)
+{
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    if (!offline_library_item_path(library, id, ".app-pack.tmp", path,
+                                   sizeof(path))) return false;
+    FILE *file = fopen(path, "wb");
+    bool okay = file != NULL
+        && offline_app_snapshot_stream(library, snapshot, true, file)
+        && fflush(file) == 0 && ferror(file) == 0;
+    if (file != NULL && fclose(file) != 0) okay = false;
+    if (!okay) (void) remove(path);
+    return okay;
+}
+
+/* Web apps keep the fingerprint of their stored bytecode in the item's
+   media-duration field, which they do not otherwise use, so the index
+   format (and an older build after an A/B rollback) is unchanged: bit 63
+   marks it known, bits 40-47 count classic scripts, bits 32-39 those with
+   bytecode, and bits 0-31 hold the compiler ABI that produced it. */
+#define OFFLINE_APP_FINGERPRINT_KNOWN (UINT64_C(1) << 63)
+#define OFFLINE_APP_BYTECODE_SCRIPTS(fingerprint) \
+    ((unsigned) (((fingerprint) >> 32) & 0xffu))
+#define OFFLINE_APP_CLASSIC_SCRIPTS(fingerprint) \
+    ((unsigned) (((fingerprint) >> 40) & 0xffu))
+
+static uint64_t offline_app_fingerprint(size_t classic, size_t scripts,
+                                        uint32_t abi)
+{
+    return OFFLINE_APP_FINGERPRINT_KNOWN | (uint64_t) (classic & 0xffu) << 40
+        | (uint64_t) (scripts & 0xffu) << 32 | (scripts == 0 ? 0u : abi);
+}
+
+/* Publish a generation whose temporaries are written under item->id into
+   `slot`, replacing `previous` when `replacing`. False leaves the index as
+   it was; the caller removes the new generation's files. */
+static bool offline_app_publish(OfflineLibrary *library, size_t slot,
+                                bool replacing,
+                                const OfflineLibraryItem *previous,
+                                const OfflineLibraryItem *item,
+                                char *error, size_t error_size)
+{
+    uint64_t free_bytes = 0;
+    if (!tilefinch_update_query_free_space(library->directory, &free_bytes)
+        || free_bytes < OFFLINE_ARTICLE_FREE_SPACE_RESERVE) {
+        offline_error(error, error_size,
+                      "not enough free Memory Stick space");
+        return false;
+    }
+    char temporary[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    static const char *const pairs[][2] = {
+        {".app-html.tmp", ".app.html"}, {".app-pack.tmp", ".app.pack"},
+        {".app-icon.tmp", ".app.icon"}
+    };
+    for (size_t at = 0; at < (item->icon_bytes == 0 ? 2u : 3u); at++) {
+        if (!offline_library_item_path(library, item->id, pairs[at][0],
+                                       temporary, sizeof(temporary))
+            || !offline_library_item_path(library, item->id, pairs[at][1],
+                                          final, sizeof(final)))
+            return false;
+        (void) remove(final);
+        if (rename(temporary, final) != 0) return false;
+    }
+    library->items[slot] = *item;
+    if (!replacing) library->count++;
+    if (!offline_library_save(library)) {
+        if (replacing) library->items[slot] = *previous;
+        else library->count--;
+        offline_error(error, error_size, "offline index could not be saved");
+        return false;
+    }
+    if (replacing) offline_remove_app_payloads(library, previous->id);
+    return true;
+}
+
 bool offline_library_save_web_app(
     OfflineLibrary *library, PocDocument *document, BrowserSession *session,
     const char *source_url, const TilefinchWebAppManifest *manifest,
@@ -1370,25 +1672,17 @@ bool offline_library_save_web_app(
         || icon_length > OFFLINE_LIBRARY_APP_ICON_LIMIT
         || !offline_library_load(library) || !offline_directory_ready(library)) {
         offline_error(error, error_size, "offline app input is invalid");
+        offline_library_discard_staged(library);
         return false;
     }
-    OfflineAppSnapshot snapshot = {0};
-    if (!offline_app_snapshot_build(
-            library, document, session, source_url, true, &snapshot,
-            error, error_size)) return false;
-    OfflineBlob *html = &snapshot.html;
-    OfflineBlob *pack = &snapshot.pack;
-    size_t resource_count = snapshot.resource_count;
-    bool okay = true;
-    uint64_t free_bytes = 0;
-    uint64_t required = (uint64_t) html->length + pack->length + icon_length
-        + OFFLINE_ARTICLE_FREE_SPACE_RESERVE;
-    if (!tilefinch_update_query_free_space(library->directory, &free_bytes)
-        || free_bytes < required) {
-        offline_error(error, error_size,
-                      "not enough free Memory Stick space");
-        okay = false;
+    OfflineAppSnapshot snapshot;
+    if (!offline_app_snapshot_collect(
+            library, document, session, source_url, &snapshot,
+            error, error_size)) {
+        offline_library_discard_staged(library);
+        return false;
     }
+    OfflineBlob *html = &snapshot.html;
     size_t slot = library->count;
     for (size_t at = 0; at < library->count; at++)
         if (library->items[at].type == OFFLINE_ITEM_WEB_APP
@@ -1396,8 +1690,22 @@ bool offline_library_save_web_app(
             slot = at;
             break;
         }
-    if (slot == library->count && library->count >= OFFLINE_LIBRARY_ITEM_LIMIT)
-        okay = false;
+    if (slot == library->count && library->count >= OFFLINE_LIBRARY_ITEM_LIMIT) {
+        offline_error(error, error_size,
+                      "offline app exceeded storage or write bounds");
+        goto release;
+    }
+    /* Pre-flight against what is certainly written (markup, captured
+       bodies, icon); compiler artifacts are only known once streamed, so
+       the reserve is re-checked after every payload is on the stick. */
+    uint64_t free_bytes = 0;
+    if (!tilefinch_update_query_free_space(library->directory, &free_bytes)
+        || free_bytes < (uint64_t) html->length + snapshot.resource_bytes
+               + icon_length + OFFLINE_ARTICLE_FREE_SPACE_RESERVE) {
+        offline_error(error, error_size,
+                      "not enough free Memory Stick space");
+        goto release;
+    }
     bool replacing = slot < library->count;
     OfflineLibraryItem previous = {0};
     if (replacing) previous = library->items[slot];
@@ -1409,43 +1717,32 @@ bool offline_library_save_web_app(
         .length = icon_length, .capacity = icon_length,
         .limit = OFFLINE_LIBRARY_APP_ICON_LIMIT
     };
-    if (!okay
+    if (!offline_write_app_pack(library, id, &snapshot)
         || !offline_write_blob(library, id, ".app-html.tmp", html)
-        || !offline_write_blob(library, id, ".app-pack.tmp", pack)
         || (icon_length != 0
             && !offline_write_blob(library, id, ".app-icon.tmp", &icon_blob))) {
-        offline_error(error, error_size,
-                      "offline app exceeded storage or write bounds");
+        offline_error(error, error_size, snapshot.cancelled
+                      ? "offline app install stopped"
+                      : "offline app exceeded storage or write bounds");
         goto fail;
-    }
-    char temporary[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
-    char final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
-    const char *pairs[][2] = {
-        {".app-html.tmp", ".app.html"}, {".app-pack.tmp", ".app.pack"},
-        {".app-icon.tmp", ".app.icon"}
-    };
-    for (size_t at = 0; at < (icon_length == 0 ? 2u : 3u); at++) {
-        if (!offline_library_item_path(library, id, pairs[at][0], temporary,
-                                       sizeof(temporary))
-            || !offline_library_item_path(library, id, pairs[at][1], final,
-                                           sizeof(final))) goto fail;
-        (void) remove(final);
-        if (rename(temporary, final) != 0) goto fail;
     }
     OfflineLibraryItem item = {
         .id = id, .type = OFFLINE_ITEM_WEB_APP, .state = OFFLINE_ITEM_READY,
-        .content_bytes = html->length, .audio_bytes = pack->length,
-        .downloaded_bytes = html->length + pack->length + icon_length,
+        .content_bytes = html->length, .audio_bytes = snapshot.pack_length,
+        .downloaded_bytes = html->length + snapshot.pack_length + icon_length,
         .saved_at_unix = offline_now_unix(),
         .article_hash = offline_hash(html->data, html->length),
-        .auxiliary_hash = offline_hash(pack->data, pack->length),
+        .auxiliary_hash = snapshot.pack_hash,
         .icon_hash = icon_length == 0 ? 0 : offline_hash(icon, icon_length),
-        .resource_count = (uint32_t) resource_count,
+        .resource_count = (uint32_t) snapshot.resource_count,
         .icon_bytes = (uint32_t) icon_length,
         .app_theme_color = manifest->theme_color,
         .app_theme_alpha = manifest->theme_alpha,
         .app_display_mode = (uint8_t) manifest->display_mode,
-        .app_theme_color_valid = manifest->theme_color_valid
+        .app_theme_color_valid = manifest->theme_color_valid,
+        .duration_ms = offline_app_fingerprint(
+            snapshot.classic_scripts, snapshot.bytecode_scripts,
+            TILEFINCH_QUICKJS_BYTECODE_ABI)
     };
     const char *name = manifest->short_name[0] != '\0'
         ? manifest->short_name : manifest->name;
@@ -1453,16 +1750,13 @@ bool offline_library_save_web_app(
              ? (document->title == NULL ? "Offline app" : document->title)
              : name);
     snprintf(item.source_url, sizeof(item.source_url), "%s", source_url);
-    library->items[slot] = item;
-    if (!replacing) library->count++;
-    if (!offline_library_save(library)) {
-        if (replacing) library->items[slot] = previous;
-        else library->count--;
+    if (!offline_app_publish(library, slot, replacing, &previous, &item,
+                             error, error_size)) {
         library->next_id = previous_next_id;
         goto fail;
     }
-    if (replacing) offline_remove_app_payloads(library, previous.id);
     if (saved_id != NULL) *saved_id = id;
+    offline_library_discard_staged(library);
     offline_app_snapshot_destroy(library, &snapshot);
     return true;
 fail:
@@ -1470,6 +1764,8 @@ fail:
     if (library->next_id != previous_next_id
         && (slot >= library->count || library->items[slot].id != id))
         library->next_id = previous_next_id;
+release:
+    offline_library_discard_staged(library);
     offline_app_snapshot_destroy(library, &snapshot);
     return false;
 }
@@ -1498,15 +1794,144 @@ static bool offline_read_file(const OfflineLibrary *library, Budget *budget,
     return true;
 }
 
-static bool offline_pack_text(const unsigned char *data, size_t length,
-                              size_t *used, const char **text)
+/* Packs are restored record by record straight from the file. Reading the
+   whole pack first and then copying each member into the session cache held
+   the package twice at launch; now only one record's body and bytecode are
+   transient beside the cache. The pack checksum is accumulated while
+   streaming and checked at the end; a pack that fails it (or any other check
+   after the first member was admitted) has the session cache cleared, so
+   nothing from an unauthenticated package outlives the failed launch. */
+typedef struct {
+    FILE *file;
+    uint32_t hash;
+    size_t remaining;
+} OfflinePackReader;
+
+static bool offline_reader_bytes(OfflinePackReader *reader, void *output,
+                                 size_t length)
 {
-    uint32_t size = 0;
-    if (!get_u32(data, length, used, &size) || *used > length
-        || size > length - *used) return false;
-    *text = (const char *) data + *used;
-    *used += size;
+    if (length > reader->remaining
+        || (length != 0 && fread(output, 1, length, reader->file) != length))
+        return false;
+    reader->hash = offline_hash_update(reader->hash, output, length);
+    reader->remaining -= length;
     return true;
+}
+
+static bool offline_reader_u32(OfflinePackReader *reader, uint32_t *value)
+{
+    unsigned char bytes[4];
+    size_t used = 0;
+    return offline_reader_bytes(reader, bytes, sizeof(bytes))
+        && get_u32(bytes, sizeof(bytes), &used, value);
+}
+
+static bool offline_reader_text(OfflinePackReader *reader, char *output,
+                                size_t capacity)
+{
+    uint32_t length = 0;
+    if (!offline_reader_u32(reader, &length) || length >= capacity
+        || !offline_reader_bytes(reader, output, length)) return false;
+    output[length] = '\0';
+    return true;
+}
+
+/* One TFAPP01 record's metadata; its body and bytecode follow. */
+typedef struct {
+    uint32_t kind, body_length, bytecode_length, bytecode_abi;
+    uint32_t fields[14];
+    char url[OFFLINE_LIBRARY_URL_LIMIT];
+    char content_type[128];
+    char response_url[OFFLINE_LIBRARY_URL_LIMIT];
+    char referrer_policy[BROWSER_REFERRER_POLICY_LIMIT];
+} OfflinePackRecord;
+
+static bool offline_pack_open(const OfflineLibrary *library,
+                              const OfflineLibraryItem *item, char *path,
+                              size_t path_size, OfflinePackReader *reader,
+                              uint32_t *version, uint32_t *count)
+{
+    unsigned char header[sizeof(offline_app_pack_magic)];
+    *reader = (OfflinePackReader) {
+        .hash = OFFLINE_HASH_SEED, .remaining = (size_t) item->audio_bytes
+    };
+    return item->audio_bytes <= OFFLINE_LIBRARY_APP_PACK_LIMIT
+        && offline_library_item_path(library, item->id, ".app.pack", path,
+                                     path_size)
+        && (reader->file = fopen(path, "rb")) != NULL
+        && offline_reader_bytes(reader, header, sizeof(header))
+        && memcmp(header, offline_app_pack_magic, sizeof(header)) == 0
+        && offline_reader_u32(reader, version)
+        && offline_reader_u32(reader, count)
+        && (*version == 1u || *version == 2u)
+        && *count == item->resource_count
+        && *count <= BROWSER_OFFLINE_CACHE_ENTRY_LIMIT;
+}
+
+static bool offline_pack_record(OfflinePackReader *reader, uint32_t version,
+                                OfflinePackRecord *record)
+{
+    record->bytecode_length = record->bytecode_abi = 0;
+    if (!offline_reader_u32(reader, &record->kind)
+        || !offline_reader_u32(reader, &record->body_length)
+        || (version >= 2u
+            && (!offline_reader_u32(reader, &record->bytecode_length)
+                || !offline_reader_u32(reader, &record->bytecode_abi)))
+        || !offline_reader_text(reader, record->url, sizeof(record->url))
+        || !offline_reader_text(reader, record->content_type,
+                                sizeof(record->content_type))
+        || !offline_reader_text(reader, record->response_url,
+                                sizeof(record->response_url))
+        || !offline_reader_text(reader, record->referrer_policy,
+                                sizeof(record->referrer_policy)))
+        return false;
+    for (size_t field = 0; field < 14u; field++)
+        if (!offline_reader_u32(reader, &record->fields[field])) return false;
+    return record->body_length != 0
+        && record->body_length <= reader->remaining
+        && record->bytecode_length <= OFFLINE_LIBRARY_APP_BYTECODE_LIMIT
+        && record->bytecode_length
+               <= reader->remaining - record->body_length
+        && record->kind <= BROWSER_OFFLINE_CACHE_MODULE;
+}
+
+static BrowserOfflineCacheView offline_pack_record_view(
+    const OfflinePackRecord *record, const unsigned char *body)
+{
+    const uint32_t *fields = record->fields;
+    return (BrowserOfflineCacheView) {
+        .kind = (BrowserOfflineCacheKind) record->kind,
+        .url = record->url, .content_type = record->content_type,
+        .response_url = record->response_url,
+        .response_referrer_policy = record->referrer_policy,
+        .data = body, .length = record->body_length,
+        .resource_grant = {
+            .destination = (TilefinchRequestDestination) fields[0],
+            .mode = (TilefinchRequestMode) fields[1],
+            .credentials = (TilefinchCredentialsMode) fields[2],
+            .corp = (TilefinchCrossOriginResourcePolicy) fields[3],
+            .initiator_opaque = fields[4] != 0,
+            .final_same_origin = fields[5] != 0,
+            .final_same_site = fields[6] != 0,
+            .cors_validated = fields[7] != 0,
+            .nosniff = fields[8] != 0,
+            .mime_validated = fields[9] != 0
+        },
+        .module_credentials = (TilefinchCredentialsMode) fields[10],
+        .module_cors_validated = fields[11] != 0,
+        .module_redirect_origin_tainted = fields[12] != 0,
+        .module_javascript_mime_validated = fields[13] != 0
+    };
+}
+
+static bool offline_pack_finished(OfflinePackReader *reader,
+                                  const OfflineLibraryItem *item)
+{
+    bool okay = reader->remaining == 0 && fgetc(reader->file) == EOF
+        && !ferror(reader->file) && reader->hash == item->auxiliary_hash;
+    if (fclose(reader->file) != 0) okay = false;
+    reader->file = NULL;
+    return okay;
 }
 
 /* Loading CSS can attach a compact parsed/compiled artifact to a restored
@@ -1515,6 +1940,7 @@ static bool offline_pack_text(const unsigned char *data, size_t length,
    limit can evict that script and incorrectly fall through to the network.
    This allowance is cache capacity, not an eager allocation. */
 #define OFFLINE_LIBRARY_APP_RUNTIME_CACHE_HEADROOM (128u * 1024u)
+#define OFFLINE_RESTORE_SCRATCH (16u * 1024u)
 
 bool offline_library_read_web_app(
     const OfflineLibrary *library, Budget *budget, BrowserSession *session,
@@ -1532,29 +1958,23 @@ bool offline_library_read_web_app(
         offline_error(error, error_size, "offline app is unavailable");
         return false;
     }
-    unsigned char *document = NULL, *pack = NULL;
-    if (!offline_read_file(library, budget, id, ".app.html",
-                           (size_t) item->content_bytes, item->article_hash,
-                           &document)
-        || !offline_read_file(library, budget, id, ".app.pack",
-                              (size_t) item->audio_bytes,
-                              item->auxiliary_hash, &pack)) goto fail;
-    static const unsigned char magic[8] = {'T','F','A','P','P','0','1',0};
-    size_t used = 0;
+    unsigned char *document = NULL, *record = NULL, *scratch = NULL;
+    OfflinePackReader reader = {0};
+    bool admitted = false;
+    size_t deferred = 0;
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     uint32_t version = 0, count = 0;
     size_t pack_bytes = (size_t) item->audio_bytes;
-    if (pack_bytes > SIZE_MAX - OFFLINE_LIBRARY_APP_RUNTIME_CACHE_HEADROOM)
-        goto fail;
     size_t working_set_bytes =
         pack_bytes + OFFLINE_LIBRARY_APP_RUNTIME_CACHE_HEADROOM;
-    if (item->audio_bytes < sizeof(magic)
-        || memcmp(pack, magic, sizeof(magic)) != 0) goto fail;
-    used = sizeof(magic);
-    if (!get_u32(pack, (size_t) item->audio_bytes, &used, &version)
-        || !get_u32(pack, (size_t) item->audio_bytes, &used, &count)
-        || (version != 1u && version != 2u)
-        || count != item->resource_count
-        || count > BROWSER_OFFLINE_CACHE_ENTRY_LIMIT
+    OfflinePackRecord *meta = budget_malloc_category(
+        budget, BUDGET_CATEGORY_SESSION, sizeof(*meta));
+    if (meta == NULL
+        || !offline_read_file(library, budget, id, ".app.html",
+                              (size_t) item->content_bytes,
+                              item->article_hash, &document)
+        || !offline_pack_open(library, item, path, sizeof(path), &reader,
+                              &version, &count)
         /* The transient-cache preference is not an installability contract.
            A valid bounded app may be larger when it carries source-bound
            bytecode, so admit this package's complete working set without
@@ -1568,95 +1988,319 @@ bool offline_library_read_web_app(
            same package are still being restored. */
         || !browser_session_cache_reserve_working_set(
                session, working_set_bytes)) goto fail;
+    /* Classic scripts with current bytecode are restored as bytecode only:
+       their source is hashed through a small scratch buffer for the pack
+       checksum and stays on the Memory Stick until something needs it.
+       Without the scratch or the session's deferred set, every record is
+       restored with its source as before. */
+    if (version >= 2u && budget == session->budget
+        && browser_session_offline_deferred_begin(
+               session, item->source_url, path))
+        scratch = budget_malloc_category(
+            budget, BUDGET_CATEGORY_SESSION, OFFLINE_RESTORE_SCRATCH);
     for (uint32_t at = 0; at < count; at++) {
-        uint32_t kind = 0, body_length = 0, bytecode_length = 0;
-        uint32_t bytecode_abi = 0, fields[14] = {0};
-        const char *texts[4] = {0};
-        size_t starts[4] = {0}, sizes[4] = {0};
-        if (!get_u32(pack, (size_t) item->audio_bytes, &used, &kind)
-            || !get_u32(pack, (size_t) item->audio_bytes, &used, &body_length))
+        if (!offline_pack_record(&reader, version, meta)) goto fail;
+        bool current = meta->bytecode_length != 0
+            && meta->bytecode_abi == TILEFINCH_QUICKJS_BYTECODE_ABI;
+        if (scratch != NULL && current
+            && meta->kind == BROWSER_OFFLINE_CACHE_RESOURCE
+            && meta->fields[0] == TILEFINCH_DESTINATION_SCRIPT
+            && script_module_mime_type_allowed(meta->content_type)) {
+            uint64_t offset = (uint64_t) (pack_bytes - reader.remaining);
+            uint64_t source_hash = BROWSER_SESSION_SOURCE_HASH_SEED;
+            for (size_t left = meta->body_length; left != 0;) {
+                size_t chunk = left < OFFLINE_RESTORE_SCRATCH
+                    ? left : OFFLINE_RESTORE_SCRATCH;
+                if (!offline_reader_bytes(&reader, scratch, chunk)) goto fail;
+                source_hash = browser_session_script_source_hash(
+                    source_hash, scratch, chunk);
+                left -= chunk;
+            }
+            record = budget_malloc_category(
+                budget, BUDGET_CATEGORY_SESSION, meta->bytecode_length);
+            BrowserSharedBody *bytecode = NULL;
+            if (record == NULL
+                || !offline_reader_bytes(&reader, record,
+                                         meta->bytecode_length)
+                || (bytecode = browser_shared_body_take(
+                        budget, record, meta->bytecode_length)) == NULL)
+                goto fail;
+            record = NULL;
+            BrowserOfflineCacheView view =
+                offline_pack_record_view(meta, NULL);
+            admitted = true;
+            if (!browser_session_offline_deferred_add(
+                    session, &view, source_hash, offset, bytecode)) {
+                browser_shared_body_release(bytecode);
+                goto fail;
+            }
+            deferred++;
+            continue;
+        }
+        /* One exact allocation per member: its body and optional bytecode
+           are consumed (copied into the cache) and released before the next
+           member is read. */
+        size_t record_length =
+            (size_t) meta->body_length + meta->bytecode_length;
+        record = budget_malloc_category(
+            budget, BUDGET_CATEGORY_SESSION, record_length);
+        if (record == NULL
+            || !offline_reader_bytes(&reader, record, record_length))
             goto fail;
-        if (version >= 2u
-            && (!get_u32(pack, (size_t) item->audio_bytes, &used,
-                         &bytecode_length)
-                || !get_u32(pack, (size_t) item->audio_bytes, &used,
-                            &bytecode_abi))) goto fail;
-        for (size_t field = 0; field < 4u; field++) {
-            starts[field] = used;
-            if (!offline_pack_text(pack, (size_t) item->audio_bytes,
-                                   &used, &texts[field])) goto fail;
-            sizes[field] = used - starts[field] - 4u;
-        }
-        for (size_t field = 0; field < 14u; field++)
-            if (!get_u32(pack, (size_t) item->audio_bytes, &used,
-                         &fields[field])) goto fail;
-        if (used > item->audio_bytes || body_length > item->audio_bytes - used
-            || bytecode_length > OFFLINE_LIBRARY_APP_BYTECODE_LIMIT
-            || bytecode_length > item->audio_bytes - used - body_length
-            || kind > BROWSER_OFFLINE_CACHE_MODULE) goto fail;
-        char url[OFFLINE_LIBRARY_URL_LIMIT];
-        char content_type[128];
-        char response_url[OFFLINE_LIBRARY_URL_LIMIT];
-        char referrer_policy[BROWSER_REFERRER_POLICY_LIMIT];
-        char *strings[4] = {
-            url, content_type, response_url, referrer_policy
-        };
-        const size_t capacities[4] = {
-            sizeof(url), sizeof(content_type), sizeof(response_url),
-            sizeof(referrer_policy)
-        };
-        for (size_t field = 0; field < 4u; field++) {
-            if (sizes[field] >= capacities[field]) goto fail;
-            memcpy(strings[field], texts[field], sizes[field]);
-            strings[field][sizes[field]] = '\0';
-        }
-        BrowserOfflineCacheView view = {
-            .kind = (BrowserOfflineCacheKind) kind,
-            .url = strings[0], .content_type = strings[1],
-            .response_url = strings[2],
-            .response_referrer_policy = strings[3],
-            .data = pack + used, .length = body_length,
-            .resource_grant = {
-                .destination = (TilefinchRequestDestination) fields[0],
-                .mode = (TilefinchRequestMode) fields[1],
-                .credentials = (TilefinchCredentialsMode) fields[2],
-                .corp = (TilefinchCrossOriginResourcePolicy) fields[3],
-                .initiator_opaque = fields[4] != 0,
-                .final_same_origin = fields[5] != 0,
-                .final_same_site = fields[6] != 0,
-                .cors_validated = fields[7] != 0,
-                .nosniff = fields[8] != 0,
-                .mime_validated = fields[9] != 0
-            },
-            .module_credentials = (TilefinchCredentialsMode) fields[10],
-            .module_cors_validated = fields[11] != 0,
-            .module_redirect_origin_tainted = fields[12] != 0,
-            .module_javascript_mime_validated = fields[13] != 0
-        };
+        BrowserOfflineCacheView view = offline_pack_record_view(meta, record);
+        admitted = true;
         if (!browser_session_cache_restore_offline(
                 session, item->source_url, &view)) goto fail;
-        used += body_length;
-        if (bytecode_length != 0
-            && bytecode_abi == TILEFINCH_QUICKJS_BYTECODE_ABI) {
+        if (current) {
             /* A compiler artifact never grants resource authority. The
                response above was independently restored and byte-for-byte
                binds this optional accelerator to its source. */
             (void) browser_session_classic_script_bytecode_put(
                 session, view.url, view.data, view.length,
-                pack + used, bytecode_length);
+                record + meta->body_length, meta->bytecode_length);
         }
-        used += bytecode_length;
+        budget_free(budget, record);
+        record = NULL;
     }
-    if (used != item->audio_bytes) goto fail;
-    budget_free(budget, pack);
+    if (!offline_pack_finished(&reader, item)) goto fail;
+    budget_free(budget, scratch);
+    budget_free(budget, meta);
+    if (deferred == 0) browser_session_offline_deferred_clear(session);
     *html = (char *) document;
     *length = (size_t) item->content_bytes;
     return true;
 fail:
+    if (reader.file != NULL) (void) fclose(reader.file);
+    budget_free(budget, record);
+    budget_free(budget, scratch);
+    budget_free(budget, meta);
     budget_free(budget, document);
-    budget_free(budget, pack);
+    browser_session_offline_deferred_clear(session);
+    if (admitted) browser_session_cache_clear(session);
     offline_error(error, error_size, "offline app failed integrity checks");
     return false;
+}
+
+/* An entry saved before fingerprints existed: read only its record headers
+   (bodies are skipped) to learn what its bytecode was compiled for. */
+static void offline_app_probe(OfflineLibrary *library,
+                              OfflineLibraryItem *item)
+{
+    OfflinePackReader reader = {0};
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    uint32_t version = 0, count = 0, abi = 0;
+    size_t scripts = 0, classic = 0;
+    OfflinePackRecord *meta = budget_malloc_category(
+        library->budget, BUDGET_CATEGORY_SESSION, sizeof(*meta));
+    bool okay = meta != NULL
+        && offline_pack_open(library, item, path, sizeof(path), &reader,
+                             &version, &count);
+    for (uint32_t at = 0; okay && at < count; at++) {
+        okay = offline_pack_record(&reader, version, meta);
+        size_t skip = okay ? (size_t) meta->body_length
+            + meta->bytecode_length : 0;
+        okay = okay && skip <= (size_t) LONG_MAX
+            && fseek(reader.file, (long) skip, SEEK_CUR) == 0;
+        if (okay) reader.remaining -= skip;
+        BrowserOfflineCacheView view = offline_pack_record_view(meta, NULL);
+        if (okay && offline_classic_script(&view)) classic++;
+        if (okay && meta->bytecode_length != 0) {
+            scripts++;
+            /* One stale artifact is enough to make the app stale. */
+            if (abi == 0 || meta->bytecode_abi
+                               != TILEFINCH_QUICKJS_BYTECODE_ABI)
+                abi = meta->bytecode_abi;
+        }
+    }
+    if (reader.file != NULL) (void) fclose(reader.file);
+    budget_free(library->budget, meta);
+    /* Only a pack read to its end is fingerprinted; a refused allocation
+       or unreadable pack is probed again next time (its launch reports a
+       damaged one). */
+    if (okay && reader.remaining == 0)
+        item->duration_ms = offline_app_fingerprint(classic, scripts, abi);
+}
+
+static bool offline_app_stale(const OfflineLibraryItem *item)
+{
+    return item->type == OFFLINE_ITEM_WEB_APP
+        && item->state == OFFLINE_ITEM_READY
+        && (item->duration_ms & OFFLINE_APP_FINGERPRINT_KNOWN) != 0
+        && OFFLINE_APP_BYTECODE_SCRIPTS(item->duration_ms) != 0
+        && (uint32_t) item->duration_ms != TILEFINCH_QUICKJS_BYTECODE_ABI;
+}
+
+bool offline_library_app_needs_recompile(
+    OfflineLibrary *library, uint32_t id, unsigned *scripts)
+{
+    OfflineLibraryItem *item = offline_library_find_mutable(library, id);
+    if (scripts != NULL) *scripts = 0;
+    if (item == NULL || item->type != OFFLINE_ITEM_WEB_APP
+        || item->state != OFFLINE_ITEM_READY) return false;
+    if ((item->duration_ms & OFFLINE_APP_FINGERPRINT_KNOWN) == 0)
+        offline_app_probe(library, item);
+    if (scripts != NULL)
+        *scripts = OFFLINE_APP_BYTECODE_SCRIPTS(item->duration_ms);
+    return offline_app_stale(item);
+}
+
+/* Copy one verified payload to the new generation's temporary file. */
+static bool offline_copy_payload(OfflineLibrary *library, uint32_t from,
+                                 uint32_t to, const char *suffix,
+                                 const char *temporary_suffix,
+                                 uint64_t size, uint32_t hash)
+{
+    char source[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char target[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    unsigned char *chunk = budget_malloc_category(
+        library->budget, BUDGET_CATEGORY_SESSION, OFFLINE_RESTORE_SCRATCH);
+    FILE *in = NULL, *out = NULL;
+    bool okay = chunk != NULL
+        && offline_library_item_path(library, from, suffix, source,
+                                     sizeof(source))
+        && offline_library_item_path(library, to, temporary_suffix, target,
+                                     sizeof(target))
+        && (in = fopen(source, "rb")) != NULL
+        && (out = fopen(target, "wb")) != NULL;
+    uint32_t copied = OFFLINE_HASH_SEED;
+    for (uint64_t left = size; okay && left != 0;) {
+        size_t step = left < OFFLINE_RESTORE_SCRATCH
+            ? (size_t) left : OFFLINE_RESTORE_SCRATCH;
+        okay = fread(chunk, 1, step, in) == step
+            && fwrite(chunk, 1, step, out) == step;
+        copied = offline_hash_update(copied, chunk, step);
+        left -= step;
+    }
+    okay = okay && fgetc(in) == EOF && copied == hash
+        && fflush(out) == 0 && ferror(out) == 0;
+    if (in != NULL) (void) fclose(in);
+    if (out != NULL && fclose(out) != 0) okay = false;
+    budget_free(library->budget, chunk);
+    return okay;
+}
+
+bool offline_library_recompile_web_app(
+    OfflineLibrary *library, uint32_t id, uint32_t *new_id,
+    char *error, size_t error_size)
+{
+    if (error != NULL && error_size != 0) error[0] = '\0';
+    size_t slot = 0;
+    while (library != NULL && library->loaded && slot < library->count
+           && library->items[slot].id != id) slot++;
+    if (library == NULL || !library->loaded || slot == library->count
+        || library->items[slot].type != OFFLINE_ITEM_WEB_APP
+        || library->items[slot].state != OFFLINE_ITEM_READY
+        || !offline_directory_ready(library)) {
+        offline_error(error, error_size, "offline app is unavailable");
+        return false;
+    }
+    /* Learn the script count (for progress) of an entry from an older
+       build before copying it. */
+    (void) offline_library_app_needs_recompile(library, id, NULL);
+    const OfflineLibraryItem previous = library->items[slot];
+    uint64_t free_bytes = 0;
+    if (!tilefinch_update_query_free_space(library->directory, &free_bytes)
+        || free_bytes < previous.content_bytes + previous.audio_bytes
+               + previous.icon_bytes + OFFLINE_ARTICLE_FREE_SPACE_RESERVE) {
+        offline_error(error, error_size,
+                      "not enough free Memory Stick space");
+        return false;
+    }
+    uint32_t previous_next_id = library->next_id;
+    uint32_t fresh = library->next_id++;
+    if (fresh == 0) fresh = library->next_id++;
+    OfflinePackReader reader = {0};
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    uint32_t version = 0, count = 0;
+    OfflinePackRecord *meta = budget_malloc_category(
+        library->budget, BUDGET_CATEGORY_SESSION, sizeof(*meta));
+    unsigned char *record = NULL, *compiled = NULL;
+    OfflinePackSink sink = {
+        .hash = OFFLINE_HASH_SEED, .limit = OFFLINE_LIBRARY_APP_PACK_LIMIT
+    };
+    bool cancelled = false;
+    bool okay = meta != NULL
+        && offline_copy_payload(library, id, fresh, ".app.html",
+                                ".app-html.tmp", previous.content_bytes,
+                                previous.article_hash)
+        && (previous.icon_bytes == 0
+            || offline_copy_payload(library, id, fresh, ".app.icon",
+                                    ".app-icon.tmp", previous.icon_bytes,
+                                    previous.icon_hash))
+        && offline_pack_open(library, &previous, path, sizeof(path), &reader,
+                             &version, &count)
+        && offline_library_item_path(library, fresh, ".app-pack.tmp", path,
+                                     sizeof(path))
+        && (sink.file = fopen(path, "wb")) != NULL
+        && offline_pack_begin(&sink, count);
+    /* The same bounds as installation (OfflinePackBytecode). */
+    OfflinePackBytecode bytecode = {
+        .total = OFFLINE_APP_CLASSIC_SCRIPTS(previous.duration_ms)
+    };
+    if (bytecode.total > OFFLINE_APP_BYTECODE_SCRIPT_LIMIT)
+        bytecode.total = OFFLINE_APP_BYTECODE_SCRIPT_LIMIT;
+    size_t bytecode_scripts = 0, classic_scripts = 0;
+    for (uint32_t at = 0; okay && at < count; at++) {
+        okay = offline_pack_record(&reader, version, meta);
+        size_t length = okay
+            ? (size_t) meta->body_length + meta->bytecode_length : 0;
+        okay = okay && (record = budget_malloc_category(
+                            library->budget, BUDGET_CATEGORY_SESSION,
+                            length)) != NULL
+            && offline_reader_bytes(&reader, record, length);
+        if (!okay) break;
+        BrowserOfflineCacheView view =
+            offline_pack_record_view(meta, record);
+        bool current = meta->bytecode_abi == TILEFINCH_QUICKJS_BYTECODE_ABI
+            && offline_pack_bytecode_fits(&bytecode, meta->bytecode_length);
+        if (offline_classic_script(&view)) classic_scripts++;
+        if (current) {
+            view.classic_script_bytecode = record + meta->body_length;
+            view.classic_script_bytecode_length = meta->bytecode_length;
+        } else if (offline_pack_bytecode_admit(&bytecode, &view, true)
+                   && !offline_pack_bytecode_compile(library, &bytecode,
+                                                     &view, &compiled)) {
+            cancelled = true;
+            okay = false;
+            break;
+        }
+        bytecode.bytecode_bytes += view.classic_script_bytecode_length;
+        if (view.classic_script_bytecode_length != 0) bytecode_scripts++;
+        okay = offline_pack_view(&sink, &view);
+        budget_free(library->budget, compiled);
+        budget_free(library->budget, record);
+        compiled = record = NULL;
+    }
+    /* The old pack must authenticate completely before anything replaces
+       it: a damaged pack is reported, never laundered into a new one. */
+    okay = okay && offline_pack_finished(&reader, &previous);
+    if (sink.file != NULL) {
+        if (fflush(sink.file) != 0 || ferror(sink.file) != 0) okay = false;
+        if (fclose(sink.file) != 0) okay = false;
+    }
+    if (reader.file != NULL) (void) fclose(reader.file);
+    budget_free(library->budget, record);
+    budget_free(library->budget, meta);
+    OfflineLibraryItem item = previous;
+    item.id = fresh;
+    item.audio_bytes = sink.length;
+    item.auxiliary_hash = sink.hash;
+    item.downloaded_bytes =
+        item.content_bytes + item.audio_bytes + item.icon_bytes;
+    item.duration_ms = offline_app_fingerprint(
+        classic_scripts, bytecode_scripts, TILEFINCH_QUICKJS_BYTECODE_ABI);
+    if (!okay || !offline_app_publish(library, slot, true, &previous, &item,
+                                      error, error_size)) {
+        offline_remove_app_payloads(library, fresh);
+        library->next_id = previous_next_id;
+        if (error != NULL && error[0] == '\0')
+            offline_error(error, error_size, cancelled
+                          ? "offline app recompile stopped"
+                          : "offline app could not be recompiled");
+        return false;
+    }
+    if (new_id != NULL) *new_id = fresh;
+    return true;
 }
 
 bool offline_library_read_web_app_icon(
@@ -1853,8 +2497,19 @@ static bool offline_saved_date(
     time_t value = (time_t) timestamp;
     if (value < 0 || (uint64_t) value != timestamp) return false;
     struct tm *parts = gmtime(&value);
-    return parts != NULL
-        && strftime(output, 11, "%Y-%m-%d", parts) == 10;
+    if (parts == NULL) return false;
+    /* Formatted by hand rather than with strftime("%Y-%m-%d"), which is
+       this browser's only strftime and would link newlib's whole formatter
+       and locale tables for one date. For every year the old call could
+       represent in ten characters (1970-9999 here, since value >= 1) the
+       output is identical; a longer year fails here as it did there. */
+    char formatted[40];
+    int written = snprintf(formatted, sizeof(formatted), "%04d-%02d-%02d",
+                           parts->tm_year + 1900, parts->tm_mon + 1,
+                           parts->tm_mday);
+    if (written != 10) return false;
+    memcpy(output, formatted, 11);
+    return true;
 }
 
 bool offline_library_build_page(
@@ -1940,8 +2595,17 @@ bool offline_library_build_page(
         if (okay && library->count == OFFLINE_LIBRARY_ITEM_LIMIT
             && index == oldest)
             okay = html_append(&html, " &middot; oldest");
+        bool stale = offline_app_stale(item);
+        if (okay && stale)
+            okay = html_append(&html, " &middot; needs recompile");
         if (okay) okay = html_append(&html, "</div>");
-        if (okay && item->state == OFFLINE_ITEM_READY)
+        if (okay && stale)
+            okay = html_append(
+                &html, "<a href=\"https://tilefinch.local/offline/recompile"
+                       "?id=%u\">Recompile</a><a href=\"https://"
+                       "tilefinch.local/offline/app?id=%u\">Open anyway</a>",
+                (unsigned) item->id, (unsigned) item->id);
+        else if (okay && item->state == OFFLINE_ITEM_READY)
             okay = html_append(
                 &html, item->type == OFFLINE_ITEM_ARTICLE
                     ? "<a href=\"https://tilefinch.local/offline/article?id=%u\">Open</a>"

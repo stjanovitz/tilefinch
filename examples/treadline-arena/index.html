@@ -13,6 +13,11 @@
       document.write('<script src="multiplayer-web.js"><\/script>');
   </script>
   <script defer src="arena-generator.js"></script>
+  <script defer src="practice.js"></script>
+  <script defer src="campaign.js"></script>
+  <script defer src="controls.js"></script>
+  <script defer src="music.js"></script>
+  <script defer src="bots.js"></script>
   <script defer src="game.js"></script>
 </head>
 <body>
@@ -25,32 +30,57 @@
       <span id="armor">ARMOR 100</span>
     </header>
     <div id="gadget" aria-live="polite">GADGET —</div>
-    <div id="gadget-meter" aria-hidden="true"><i></i></div>
     <div id="command-status" aria-live="polite" hidden>COMMAND 0%</div>
-    <div id="command-meter" aria-hidden="true" hidden><i></i></div>
-    <div id="objective-arrow" aria-hidden="true">▲</div>
-    <div id="hit-marker" aria-hidden="true">×</div>
-    <div id="damage-arrow" aria-hidden="true">▲</div>
-    <section id="panel">
+    <section id="panel" data-screen="main">
+      <div id="tabs"></div>
       <h1>TREADLINE ARENA</h1>
       <p id="message">Clear three arenas before your last redeploy.</p>
+      <p id="radio" aria-live="polite"></p>
+      <div id="medals"></div>
+      <div id="menu">
+        <button type="button" autofocus>Continue</button>
+        <button type="button">Campaign</button>
+        <button type="button">Quick Match</button>
+        <button type="button">Practice Range</button>
+        <button type="button">Multiplayer</button>
+        <button type="button">Garage</button>
+        <button type="button">Replays</button>
+        <button type="button">Settings</button>
+      </div>
       <div id="loadout">
-        <button id="mode-choice" type="button"><small>MODE</small><strong id="mode-value">SURVIVAL</strong></button>
+        <button id="mode-choice" type="button"><small>&lt; MODE &gt;</small><strong id="mode-value">SURVIVAL</strong></button>
         <button id="class-choice" type="button"><small>CLASS</small><strong id="class-value">STRIKER</strong></button>
         <button id="gadget-choice" type="button"><small>GADGET</small><strong id="gadget-value">MINES</strong></button>
         <button id="difficulty-choice" type="button"><small>BOTS</small><strong id="difficulty-value">VETERAN</strong></button>
       </div>
+      <div id="settings">
       <div id="preferences">
-        <button id="controls-choice" type="button">Controls <strong id="controls-value">Arcade</strong></button>
-        <button id="assist-choice" type="button">Aim assist <strong id="assist-value">Snap</strong></button>
-        <button id="camera-choice" type="button">Camera <strong id="camera-value">Stable</strong></button>
-        <button id="command-choice" type="button">Command <strong id="command-value">Off</strong></button>
-        <button id="music-choice" type="button">Menu music <strong id="music-value">Off</strong></button>
-        <button id="effects-choice" type="button">Effects <strong id="effects-value">On</strong></button>
-        <button id="shake-choice" type="button">Shake <strong id="shake-value">On</strong></button>
+        <button id="controls-choice" type="button" data-tab="0" data-ctl>Scheme <span class="arr">&#9668;</span> <strong id="controls-value">Arcade</strong> <span class="arr">&#9658;</span></button>
+        <button id="assist-choice" type="button" data-tab="0" data-ctl>Aim assist <strong id="assist-value">Snap</strong></button>
+        <button id="reverse-choice" type="button" data-tab="0" data-ctl>Reverse <strong id="reverse-value">120 deg</strong></button>
+        <button id="aim-choice" type="button" data-tab="0" data-ctl>Aim guide <span class="arr">&#9668;</span> <strong id="aim-value">Off</strong> <span class="arr">&#9658;</span></button>
+        <button id="command-choice" type="button" data-tab="0">Command <strong id="command-value">Off</strong></button>
+        <button id="camera-choice" type="button" data-tab="1">Camera <strong id="camera-value">Stable</strong></button>
+        <button id="palette-choice" type="button" data-tab="1">Light <strong id="palette-value">Day</strong></button>
+        <button id="shake-choice" type="button" data-tab="1">Shake <strong id="shake-value">On</strong></button>
+        <button id="effects-choice" type="button" data-tab="1">Effects <strong id="effects-value">On</strong></button>
+        <button id="objective-choice" type="button" data-tab="1">Objective arrow <strong id="objective-value">Auto</strong></button>
+        <button id="music-choice" type="button" data-tab="2">Music <strong id="music-value">Full</strong></button>
+        <button id="music-volume-choice" type="button" data-tab="2">Music volume <strong id="music-volume-value">Mid</strong></button>
+        <button id="radio-choice" type="button" data-tab="2">Radio <strong id="radio-value">Full</strong></button>
+        <button id="remarks-choice" type="button" data-tab="2">Range remarks <strong id="remarks-value">On</strong></button>
+        <button id="paint-choice" type="button" data-tab="3">Paint <strong id="paint-value">Jade</strong></button>
       </div>
+      </div>
+      <div id="bindings"></div>
       <p id="stats" hidden></p>
-      <button id="play" autofocus>Deploy</button>
+      <button id="play">Deploy</button>
+      <div id="replay-actions">
+        <button id="replay-last" type="button" disabled>Replay last run</button>
+        <button id="replay-share" type="button" disabled>Share replay</button>
+        <button id="replay-load" type="button">Play code</button>
+      </div>
+      <textarea id="replay-code" rows="2" maxlength="180000" placeholder="Paste a TR1 replay code" aria-label="Replay code" hidden spellcheck="false"></textarea>
       <div id="online-actions">
         <button id="online-host" type="button">Host online</button>
         <button id="online-lan" type="button">Find LAN</button>
@@ -92,7 +122,8 @@
         <button id="web-apply" type="button">Use response</button>
         <button id="web-cancel" type="button">Back</button>
       </section>
-      <p class="controls" id="controls">Arcade: nub moves | face buttons aim | R fire | L secondary | Up gadget | Down Command</p>
+      <p class="controls" id="controls">Arcade: nub moves | face buttons aim | R fires. All buttons: Controls.</p>
+      <p id="legend">X Select | O Back | L/R Tabs | START Deploy</p>
     </section>
     <div id="toast" aria-live="polite"></div>
   </main>
@@ -102,8 +133,30 @@
        before either executes, and this listener preserves an early Deploy. */
     (function () {
       var play = document.getElementById("play");
+      /* A script the browser skips (a per-script limit below game.js's
+         size) or cannot load fires an error event on its element. Say so
+         instead of leaving Deploy on "Starting..." forever, and hand any
+         Page controls a queued Deploy claimed back to the browser. */
+      function failed() {
+        if (globalThis.__treadlineBootReady || globalThis.__treadlineBootFailed)
+          return;
+        globalThis.__treadlineBootFailed = true;
+        var message = document.getElementById("message");
+        if (message) message.textContent = "Treadline could not load all of"
+          + " its files. Reload the page, or reinstall the game.";
+        if (play) {
+          play.textContent = "Unavailable";
+          play.disabled = true;
+          play.removeAttribute("aria-busy");
+        }
+        if (document.fullscreenElement && document.exitFullscreen)
+          document.exitFullscreen().catch(function () {});
+      }
+      var scripts = document.querySelectorAll("script[src]");
+      for (var at = 0; at < scripts.length; at++)
+        scripts[at].addEventListener("error", failed);
       if (play) play.addEventListener("click", function () {
-        if (!globalThis.__treadlineBootReady) {
+        if (!globalThis.__treadlineBootReady && !globalThis.__treadlineBootFailed) {
           globalThis.__treadlineDeployQueued = true;
           play.textContent = "Starting...";
           play.setAttribute("aria-busy", "true");

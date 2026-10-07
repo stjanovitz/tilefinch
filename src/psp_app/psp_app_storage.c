@@ -15,6 +15,8 @@
  * the site list of Settings > Device & storage > Site data & storage.
  */
 
+static void script_cache_show_size(PspUiState *ui, BrowserSession *session);
+
 static bool profile_has_room(const BrowserProfile *profile,
                              const char *origin)
 {
@@ -152,6 +154,7 @@ static void site_storage_fill(PspApp *app)
             }
         }
     }
+    script_cache_show_size(&presentation->ui, app->browser->session);
     psp_ui_set_site_storage(&presentation->ui, view);
 }
 
@@ -232,12 +235,100 @@ void psp_app_site_storage_action(PspApp *app, PspAppFrameState *frame,
     }
 }
 
+/*
+ * Keep compiled scripts (off by default): the persistent compiled-script
+ * tier in data/script-cache. Writes happen in idle slices only; turning the
+ * option off empties the directory. boot.cfg's module_cache_dir, a
+ * development override applied with the engine, takes precedence: the
+ * menu then leaves that directory alone.
+ */
+static bool script_cache_overridden(const PspProcessResources *process)
+{
+    return process->config.module_cache_dir[0] != '\0';
+}
+
+static void script_cache_show_size(PspUiState *ui, BrowserSession *session)
+{
+    uint64_t bytes = 0;
+    (void) browser_session_script_disk_usage(session, &bytes, NULL);
+    uint64_t kib = (bytes + 1023u) / 1024u;
+    ui->compiled_scripts_kib = kib > 0x7fffffu ? 0x7fffffu : (unsigned) kib;
+}
+
+void psp_app_script_cache_boot(PspProcessResources *process,
+                               PspBrowserResources *browser)
+{
+    /* Traced and replayed runs keep compiled scripts in RAM. */
+    if (script_cache_overridden(process)
+        || !process->persistent_site_data_available
+        || !browser_profile_keep_compiled_scripts(browser->profile)) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        printf("tilefinch-script-cache: boot overridden=%d site-data=%d "
+               "option=%d enabled=%d\n",
+               script_cache_overridden(process) ? 1 : 0,
+               process->persistent_site_data_available ? 1 : 0,
+               browser_profile_keep_compiled_scripts(browser->profile)
+                   ? 1 : 0,
+               browser_session_script_disk_enabled(browser->session)
+                   ? 1 : 0);
+#endif
+        return;
+    }
+    bool configured = browser_session_script_disk_configure(
+        browser->session, process->storage.script_cache, true, 0);
+    printf("tilefinch-script-cache: configured source=profile dir=%s "
+           "ok=%d\n", process->storage.script_cache, configured ? 1 : 0);
+}
+
+static void script_cache_setting(PspApp *app, PspAppFrameState *frame,
+                                 bool keep)
+{
+    PspUiState *ui = &app->process->presentation.ui;
+    BrowserSession *session = app->browser->session;
+    BrowserProfile *profile = app->browser->profile;
+    const char *status;
+    if (script_cache_overridden(app->process)) {
+        ui->keep_compiled_scripts = browser_profile_keep_compiled_scripts(
+            profile);
+        status = "SCRIPT CACHE SET BY BOOT.CFG";
+    } else if (keep && !app->process->persistent_site_data_available) {
+        ui->keep_compiled_scripts = false;
+        status = "MEMORY STICK UNAVAILABLE";
+    } else {
+        bool applied;
+        if (keep) {
+            applied = browser_session_script_disk_configure(
+                session, app->process->storage.script_cache, true, 0);
+        } else {
+            /* Off removes what it kept. */
+            applied = browser_session_script_disk_clear(session);
+            (void) browser_session_script_disk_configure(session, NULL,
+                                                         false, 0);
+        }
+        browser_profile_set_keep_compiled_scripts(profile, keep);
+        psp_profile_store_mark_dirty(&app->browser->profile_store,
+                                     frame->ui_sample_us);
+        status = !applied
+            ? (keep ? "SCRIPT CACHE UNAVAILABLE"
+                    : "SOME FILES COULD NOT BE CLEARED")
+            : keep ? "COMPILED SCRIPTS KEPT ON MEMORY STICK"
+                   : "COMPILED SCRIPTS OFF - FILES REMOVED";
+        ui->keep_compiled_scripts = keep;
+    }
+    script_cache_show_size(ui, session);
+    psp_ui_show_status(ui, status, 180);
+}
+
 bool psp_app_site_storage_setting(PspApp *app, PspAppFrameState *frame,
                                   const PspUiIntent *intent)
 {
     PspUiState *ui = &app->process->presentation.ui;
     BrowserSession *session = app->browser->session;
     BrowserProfile *profile = app->browser->profile;
+    if (intent->setting.id == PSP_UI_SETTING_KEEP_COMPILED_SCRIPTS) {
+        script_cache_setting(app, frame, intent->setting.value.boolean);
+        return true;
+    }
     if (intent->setting.id == PSP_UI_SETTING_SITE_STORAGE_OFFERS) {
         bool enabled = intent->setting.value.boolean;
         browser_profile_set_site_storage_offers(profile, enabled);

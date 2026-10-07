@@ -1068,7 +1068,8 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     psp_media_telemetry_report_feed(media, "teardown");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_media_startup_trace_report(media);
-#endif
+    /* The accumulated counters feed only this report and the validation
+       stability soak's summary. */
     if (media->playback != NULL) {
         MediaPlaybackJobStats stats = {0};
         MediaBackendStats backend_stats = {0};
@@ -1153,6 +1154,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
                media->pump_draw_submitted,
                (unsigned long long) media->pump_draw_us);
     }
+#endif
     /* The texture staging is the display's EDRAM, not ours; forget only which
        picture was in it, because the next session's first frame must stage
        rather than trust what a previous one left. */

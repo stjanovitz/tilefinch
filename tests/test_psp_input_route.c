@@ -29,6 +29,24 @@ int main(void)
     const PspInputLoopState in_menu = PSP_INPUT_LOOP_IN_MENU;
     const PspInputLoopState behind = PSP_INPUT_LOOP_BEHIND;
 
+    /* A captured game's buttons must never become raster cancellation,
+       page scrolling, optional-work preemption, or a BUSY notification. */
+    PspInputRouteContext game = {
+        .owner = service, .loop = on_page,
+        .page_gamepad_capture = true, .owner_thread = true,
+        .optional_preemptible = true, .acknowledge_busy = true,
+        .analog_active = true,
+        .pressed = PSP_UI_BUTTON_CANCEL | PSP_UI_BUTTON_CONFIRM
+            | PSP_UI_BUTTON_TOOLBAR | PSP_UI_BUTTON_PAGE_DOWN
+    };
+    CHECK(psp_input_route(&game) == PSP_INPUT_ROUTE_NONE);
+    game.owner_thread = false;
+    CHECK(psp_input_route(&game) == PSP_INPUT_ROUTE_NONE);
+    game.owner = loading;
+    CHECK(psp_input_route(&game) == PSP_INPUT_ROUTE_NONE);
+    game.owner = media; game.optional_preemptible = false;
+    CHECK(psp_input_route(&game) == PSP_INPUT_ROUTE_CANCEL);
+
     /* A loading page on screen: the supervisor pages the preview and stops
        the load; focus, activation and the menu go to the browser loop. */
     CHECK(route(loading, on_page, PSP_UI_BUTTON_PAGE_DOWN, false)

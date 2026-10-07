@@ -369,6 +369,7 @@
         "document.getElementById('remove-on-down').addEventListener('pointerdown',event=>event.currentTarget.remove());"
         "const editActivation=[];for(const type of ['pointerdown','mousedown','focus','pointerup','mouseup','click'])edit.addEventListener(type,()=>{editActivation.push(type);status.setAttribute('data-edit-activation',editActivation.join('|'))});"
         "edit.addEventListener('beforeinput',event=>{status.setAttribute('data-before',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.value+':'+event.isTrusted);if(event.data==='X')event.preventDefault();});"
+        "edit.addEventListener('textInput',event=>{status.setAttribute('data-text-input',event.constructor.name+':'+event.data+':'+edit.value+':'+event.isTrusted+':'+event.cancelable);if(event.data==='Y')event.preventDefault();});"
         "edit.addEventListener('input',event=>{status.setAttribute('data-value',edit.value);status.setAttribute('data-input',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.value+':'+event.isTrusted);});"
         "document.getElementById('prompt').addEventListener('input',()=>status.setAttribute('data-prompt','yes'));"
         "const go=document.getElementById('go'),activation=[];for(const type of ['pointerdown','mousedown','pointerup','mouseup','click'])go.addEventListener(type,event=>activation.push(type+':'+event.constructor.name+':'+event.isTrusted+(type==='click'?':'+event.detail+':'+event.pointerType:'')));go.addEventListener('click',()=>{status.textContent='CLICKED';status.setAttribute('data-activation',activation.join('|'));});edit.closest('form').addEventListener('submit',event=>status.setAttribute('data-submit',event.constructor.name+':'+(event.submitter===go)+':'+event.isTrusted));"
@@ -925,6 +926,8 @@
                               "InputEvent:insertText:BC:A:true")
           && attribute_equals(runtime_status, "data-input",
                               "InputEvent:insertText:BC:ABC:true")
+          && attribute_equals(runtime_status, "data-text-input",
+                              "TextEvent:BC:A:true:true")
           && controller_backspace(&controller));
     edit_value = document_control_value(edit_node, &edit_value_length);
     CHECK(edit_value != NULL && edit_value_length == 2
@@ -940,7 +943,18 @@
           && attribute_equals(runtime_status, "data-before",
                               "InputEvent:insertText:X:AB:true")
           && attribute_equals(runtime_status, "data-input",
-                              "InputEvent:deleteContentBackward:null:AB:true"));
+                              "InputEvent:deleteContentBackward:null:AB:true")
+          && attribute_equals(runtime_status, "data-text-input",
+                              "TextEvent:X:AB:true:true"));
+    /* Cancelling textInput cancels the insertion before beforeinput. */
+    CHECK(controller_insert_text(&controller, "Y", 1));
+    edit_value = document_control_value(edit_node, &edit_value_length);
+    CHECK(edit_value != NULL && edit_value_length == 2
+          && memcmp(edit_value, "AB", 2) == 0
+          && attribute_equals(runtime_status, "data-text-input",
+                              "TextEvent:Y:AB:true:true")
+          && attribute_equals(runtime_status, "data-before",
+                              "InputEvent:insertText:X:AB:true"));
     char controller_value[8] = {0};
     size_t controller_value_length = 0;
     CHECK(controller_text_value(
@@ -1993,6 +2007,32 @@
     CHECK(test_unobserved_data_attribute_style_reuse(&budget));
     puts("test: data attribute reuse matches a full cascade");
     CHECK(test_data_attribute_reuse_matches_full_cascade(&budget));
+    puts("test: constructed stylesheets have no rule cap");
+    CHECK(test_constructed_sheet_without_rule_cap(&budget));
+    puts("test: constructed stylesheets apply their prefix past the bound");
+    CHECK(test_constructed_sheet_text_bound_prefix(&budget));
+    puts("test: constructed stylesheet chunks preserve quota and EOF semantics");
+    CHECK(test_constructed_sheet_scan_chunks(&budget));
+    puts("test: one constructed sheet shared by many shadow roots");
+    CHECK(test_constructed_sheet_shared_by_roots(&budget));
+    puts("test: adopted sheets keep cascade order and leave when dropped");
+    CHECK(test_constructed_sheet_order_and_removal(&budget));
+    puts("test: adopted roots preserve independent order and confinement on refusal");
+    CHECK(test_constructed_sheet_root_order_and_refusal(&budget));
+    puts("test: scope metadata refusal keeps document styles and confinement");
+    CHECK(test_constructed_sheet_scope_refusal_keeps_document(&budget));
+    puts("test: source tracking exhaustion never makes adopted sheets global");
+    CHECK(test_constructed_sheet_source_bound_keeps_confinement(&budget));
+    puts("test: an adopted sheet changes scope without a reparse");
+    CHECK(test_constructed_sheet_scope_moves(&budget));
+    puts("test: a rebuild replays an adopted sheet's cached parse");
+    CHECK(test_constructed_sheet_parse_cache(&budget));
+    puts("test: the rule index leaves shadow-scoped rules out of the light DOM");
+    CHECK(test_constructed_sheet_index_scoping(&budget));
+    puts("test: var() lookups leave shadow-scoped custom properties out");
+    CHECK(test_constructed_sheet_custom_index_scoping(&budget));
+    puts("test: unadopted constructed sheets are collected");
+    CHECK(test_constructed_sheet_lifetime(&budget));
 
     puts("test: large section class changes retain resources and find late images");
     for (unsigned variant = 0; variant < 5; variant++) {
@@ -2523,6 +2563,267 @@
         CHECK(budget.current == 0);
     }
     {
+        /* A bot wall must be named instead of leaving a blank page; ordinary
+           refusals and successful responses must not be. */
+        puts("test: bot-protection walls are recognized generically");
+        static const char datadome[] =
+            "x-datadome-cid: REDACTED\nserver: DataDome\nx-datadome: protected\n";
+        static const char plain[] =
+            "server: nginx\ncontent-type: text/html\n";
+        static const char aws[] = "x-amzn-waf-action: challenge\n";
+        static const char imperva[] = "x-iinfo: 1-2-3\n";
+        CHECK(strcmp(tilefinch_bot_wall_header_vendor(
+                  403, "DataDome", "", datadome, strlen(datadome)),
+                  "DataDome") == 0);
+        CHECK(strcmp(tilefinch_bot_wall_header_vendor(
+                  429, "", "", datadome + 25, strlen(datadome + 25)),
+                  "DataDome") == 0);
+        CHECK(tilefinch_bot_wall_header_vendor(
+                  200, "DataDome", "", datadome, strlen(datadome)) == NULL);
+        CHECK(strcmp(tilefinch_bot_wall_header_vendor(
+                  403, "cloudflare", "challenge", plain, strlen(plain)),
+                  "Cloudflare") == 0);
+        CHECK(strcmp(tilefinch_bot_wall_header_vendor(
+                  202, "", "", aws, strlen(aws)), "AWS WAF") == 0);
+        CHECK(strcmp(tilefinch_bot_wall_header_vendor(
+                  403, "", "", imperva, strlen(imperva)), "Imperva") == 0);
+        CHECK(tilefinch_bot_wall_header_vendor(
+                  403, "nginx", "", plain, strlen(plain)) == NULL);
+        CHECK(tilefinch_bot_wall_header_vendor(
+                  404, "DataDome", "", datadome, strlen(datadome)) == NULL);
+        CHECK(strcmp(tilefinch_bot_wall_title_vendor(
+                  403, "Access to this page has been denied"), "HUMAN") == 0);
+        CHECK(tilefinch_bot_wall_title_vendor(200, "Just a moment...")
+              == NULL);
+        CHECK(tilefinch_bot_wall_title_vendor(403, "Forbidden") == NULL);
+        char site[TILEFINCH_BOT_WALL_SITE_LIMIT];
+        CHECK(tilefinch_bot_wall_site(
+                  "https://www.nytimes.com:443/section?x=1",
+                  site, sizeof(site))
+              && strcmp(site, "nytimes.com") == 0);
+        CHECK(tilefinch_bot_wall_site("https://[2001:db8::1]:8443/",
+                                      site, sizeof(site))
+              && strcmp(site, "[2001:db8::1]") == 0);
+        char notice[80];
+        CHECK(tilefinch_bot_wall_notice("nytimes.com", notice,
+                                        sizeof(notice))
+              && strcmp(notice, "nytimes.com blocked Tilefinch\n"
+                                "Bot protection: this site may not work")
+                 == 0);
+        CHECK(tilefinch_bot_wall_notice(
+                  "a-very-long-subdomain.example-news-site.co.uk", notice,
+                  sizeof(notice))
+              && strncmp(notice, "a-very-long-subdoma... blocked", 30) == 0
+              && strlen(notice) < 80);
+
+        static const char human_page[] =
+            "<!doctype html><title>Access to this page has been denied"
+            "</title><body><div id=px-captcha></div>";
+        static const char blank_page[] =
+            "<!doctype html><title>example</title><body>"
+            "<script src=/big.js></script>";
+        static const char article[] =
+            "<!doctype html><title>Access Denied</title><body><p>Story";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        NavigationBotWall wall;
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://www.example.com/a", human_page, strlen(human_page),
+            480, NULL, NULL, true));
+        session.last_http_status = 403;
+        CHECK(navigation_bot_wall(&session, &wall)
+              && strcmp(wall.vendor, "HUMAN") == 0 && wall.status == 403
+              && strcmp(wall.site, "example.com") == 0
+              && !wall.blank_after_refused_script);
+        /* Headers recorded for the response name the vendor. */
+        snprintf(session.last_bot_wall_vendor,
+                 sizeof(session.last_bot_wall_vendor), "%s", "DataDome");
+        CHECK(navigation_bot_wall(&session, &wall)
+              && strcmp(wall.vendor, "DataDome") == 0);
+        /* A refused 403 page that paints nothing after its only script was
+           refused is a wall whatever its vendor. */
+        generation = navigation_begin(&session);
+        CHECK(session.last_bot_wall_vendor[0] == '\0');
+        CHECK(navigation_commit_html(&session, generation,
+            "https://shop.example/", blank_page, strlen(blank_page),
+            480, NULL, NULL, true));
+        session.last_http_status = 403;
+        CHECK(!navigation_bot_wall(&session, &wall));
+        session.script_skipped_quota = 1;
+        CHECK(navigation_bot_wall(&session, &wall)
+              && wall.vendor[0] == '\0' && wall.blank_after_refused_script
+              && strcmp(wall.site, "shop.example") == 0);
+        /* A successful page is never a wall, whatever its title. */
+        generation = navigation_begin(&session);
+        session.script_skipped_quota = 0;
+        CHECK(navigation_commit_html(&session, generation,
+            "https://news.example/", article, strlen(article),
+            480, NULL, NULL, true));
+        session.last_http_status = 200;
+        CHECK(!navigation_bot_wall(&session, &wall));
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
+        /* BBC, CNN and NYT scripts read these; each was missing or wrong. */
+        puts("test: links, anchors, scrolling element and rendered innerText");
+        static const char page[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>body{margin:0}p{margin:0 0 8px;height:400px}"
+            ".up{text-transform:uppercase}.pre{white-space:pre}"
+            ".gone{visibility:hidden}</style><body>"
+            "<noscript><b>noscript-content</b></noscript>"
+            "<div style='display:none'>hidden-content</div>"
+            "<script>var inScript=1</script><style>.x{color:red}</style>"
+            "<div id=story><h2>  Head   line </h2><p>Para <a href=/a>"
+            "link   a</a></p><p><span class=up>loud</span> and<br>broken "
+            "<span class=gone>gone</span><span class=pre>a  b</span></p>"
+            "<table><tr><td>c1</td><td>c2</td></tr><tr><td>d1</td>"
+            "<td>d2</td></tr></table><a name=top>anchor</a>"
+            "<map><area href=/area></map></div>"
+            "<div id=detached-parent style='display:none'><i id=inner>x"
+            "<b>y</b></i></div>"
+            "<div id=line-breaks>A<br style='display:none'>B"
+            "<br style='visibility:hidden'>C<br>D</div></body>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://dom.test/apis", page, strlen(page), 480, NULL, NULL,
+            true));
+        CHECK(script_runtime_evaluate_diagnostic(
+            session.page.runtime,
+            "globalThis.pocSummary=JSON.stringify("
+            "document.getElementById('line-breaks').innerText)",
+            "<rendered-breaks>", &session.page.script_result));
+        CHECK(strcmp(session.page.script_result.summary, "\"ABC\\nD\"") == 0);
+        static const char probe[] =
+            "const story=document.getElementById('story');"
+            "const fresh=document.createElement('div');"
+            "fresh.innerText='one\\ntwo';"
+            "globalThis.pocSummary=JSON.stringify(["
+            "document.links.length,document.links[0].getAttribute('href'),"
+            "document.links[1].tagName,document.anchors.length,"
+            "document.anchors[0].name,"
+            "document.scrollingElement===document.documentElement,"
+            "document.documentElement.scrollHeight>=800,"
+            "document.documentElement.scrollHeight"
+            "===document.scrollingElement.scrollHeight,"
+            "document.documentElement.clientHeight,"
+            "story.innerText,"
+            "document.getElementById('inner').innerText,"
+            "fresh.innerHTML,"
+            "document.body.innerText.includes('noscript-content')"
+            "||document.body.innerText.includes('hidden-content')"
+            "||document.body.innerText.includes('inScript')])";
+        CHECK(script_runtime_evaluate_diagnostic(
+            session.page.runtime, probe, "<dom-api-probe>",
+            &session.page.script_result));
+        static const char expected[] =
+            "[2,\"/a\",\"AREA\",1,\"top\",true,true,true,272,"
+            "\"Head line\\n\\nPara link a\\n\\nLOUD and\\nbroken a  b"
+            "\\n\\nc1\\tc2\\nd1\\td2\\nanchor\","
+            "\"xy\",\"one<br>two\",false]";
+        if (strcmp(session.page.script_result.summary, expected) != 0) {
+            fprintf(stderr, "dom api summary=%s error=%s\n",
+                    session.page.script_result.summary,
+                    session.page.script_result.error);
+        }
+        CHECK(strcmp(session.page.script_result.summary, expected) == 0);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
+        /* CNN's sticky header hid the first lines of every page step: page
+           steps subtract full-width bars pinned to the viewport edges. */
+        puts("test: page steps exclude pinned top and bottom bars");
+        static const char page[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>body{margin:0}"
+            "header{position:sticky;top:0;height:40px;background:#c00}"
+            "footer{position:fixed;bottom:0;left:0;right:0;height:24px;"
+            "background:#00c}"
+            "#fab{position:fixed;top:0;right:0;width:40px;height:40px;"
+            "background:#0c0}"
+            "#tall{height:3000px}</style><body><header>Header</header>"
+            "<div id=fab>+</div><div id=tall>Story</div>"
+            "<footer>Footer</footer>";
+        static const char overlay_page[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>body{margin:0}"
+            "#sheet{position:fixed;top:0;left:0;right:0;height:250px;"
+            "background:#eee}#tall{height:3000px}</style><body>"
+            "<div id=sheet>Dialog</div><div id=tall>Story</div>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://page.test/bars", page, strlen(page), 480, NULL, NULL,
+            true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        CHECK(session.viewport.css_height == 272);
+        int covered_top = -1, covered_bottom = -1;
+        controller_page_obstructions(&session.page.layout, 100, 480, 272,
+                                     &covered_top, &covered_bottom);
+        CHECK(covered_top == 40 && covered_bottom == 24);
+        /* 272 - 40 - 24 = 208 visible; keep an eighth (26) as overlap. */
+        CHECK(controller_scroll_page(&controller, 1, 272)
+              && navigation_current(&session)->scroll_y == 182);
+        CHECK(controller_scroll_page(&controller, 1, 272)
+              && navigation_current(&session)->scroll_y == 364);
+        CHECK(controller_scroll_page(&controller, -1, 272)
+              && navigation_current(&session)->scroll_y == 182);
+        generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://page.test/overlay", overlay_page,
+            strlen(overlay_page), 480, NULL, NULL, true));
+        CHECK(controller_init(&controller, &session));
+        controller_page_obstructions(&session.page.layout, 100, 480, 272,
+                                     &covered_top, &covered_bottom);
+        CHECK(covered_top == 0 && covered_bottom == 0);
+        CHECK(controller_scroll_page(&controller, 1, 272)
+              && navigation_current(&session)->scroll_y == 238);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
+        /* washingtonpost.com pins its header, its section tabs and a
+           breaking-news banner one under the other. The banner starts
+           below the top quarter, so it only counts as part of the stack. */
+        puts("test: page steps exclude stacked pinned bars");
+        static const char page[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>body{margin:0}"
+            "header,nav,aside{position:sticky;height:40px;background:#c00}"
+            "header{top:0}nav{top:40px}aside{top:80px}"
+            "#tall{height:3000px}</style><body><header>Header</header>"
+            "<nav>Tabs</nav><aside>Breaking</aside>"
+            "<div id=tall>Story</div>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://page.test/stacked", page, strlen(page), 480, NULL,
+            NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        CHECK(session.page.layout.sticky_count == 3u);
+        int covered_top = -1, covered_bottom = -1;
+        controller_page_obstructions(&session.page.layout, 300, 480, 272,
+                                     &covered_top, &covered_bottom);
+        CHECK(covered_top == 120 && covered_bottom == 0);
+        /* 272 - 120 = 152 visible; keep an eighth (19) as overlap. */
+        CHECK(controller_scroll_page(&controller, 1, 272)
+              && navigation_current(&session)->scroll_y == 133);
+        CHECK(controller_scroll_page(&controller, 1, 272)
+              && navigation_current(&session)->scroll_y == 266);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
         puts("test: a clipped skip link becomes visible on first controller focus");
         static const char page[] =
             "<!doctype html><style>"
@@ -2717,6 +3018,91 @@
     navigation_destroy(&focus_invalidation_navigation);
     CHECK(budget.current == 0);
 
+    {
+        puts("test: focus paint stays layout-free under a translated ancestor");
+        /* A centred panel (translate(-50%,-50%)) bakes its offset into every
+           descendant command, so outline and border-paint focus moves skip
+           layout exactly as without it; a scaled panel still relayouts. */
+        static const char *const panels[2] = {
+            "transform:translate(-50%,-50%)", "transform:scale(1.5)" };
+        for (unsigned variant = 0; variant < 2; variant++) {
+            char page[1024];
+            int written = snprintf(page, sizeof(page),
+                "<!doctype html><style>"
+                "#panel{position:absolute;left:50%%;top:50%%;width:200px;%s}"
+                "button{display:block;width:80px;height:20px}"
+                "button:focus{outline:2px solid #ffffff;outline-offset:1px}"
+                ".paint{background:transparent;border:1px solid #445566;"
+                "border-radius:2px}"
+                ".paint:focus{border-color:#3366cc;outline:1px solid transparent}"
+                "</style><body><div id=panel><button id=one>ONE</button>"
+                "<button id=two>TWO</button>"
+                "<button class=paint id=paint>PAINT</button></div>",
+                panels[variant]);
+            CHECK(written > 0 && (size_t) written < sizeof(page));
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            navigation_enable_scripts(&session, 4 * MIB, 1000);
+            uint64_t generation = navigation_begin(&session);
+            CHECK(navigation_commit_html(&session, generation,
+                "https://focus.test/panel", page, strlen(page), 480,
+                NULL, NULL, true));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            lxb_dom_node_t *root = lxb_dom_interface_node(
+                session.page.document.html);
+            lxb_dom_node_t *one = find_id(root, "one");
+            lxb_dom_node_t *two = find_id(root, "two");
+            lxb_dom_node_t *paint_button = find_id(root, "paint");
+            CHECK(one != NULL && two != NULL && paint_button != NULL);
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_node(&controller, one)
+                  && controller_focus_node(&controller, two)
+                  && controller_focus_node(&controller, paint_button));
+            if (variant == 1) {
+                CHECK(session.incremental_relayouts > relayouts);
+                navigation_destroy(&session);
+                CHECK(budget.current == 0);
+                continue;
+            }
+            CHECK(session.incremental_relayouts == relayouts
+                  && session.performance.focus_outline_relayout_skips == 2
+                  && session.performance.focus_paint_relayout_skips == 1
+                  && session.focus_paint_damage_valid);
+            int x = 0, y = 0, width = 0, height = 0;
+            const LayoutNodeBox *box = layout_box_for_node(
+                &session.page.layout, paint_button);
+            CHECK(box != NULL
+                  && controller_focused_rect(&controller, &x, &y,
+                                             &width, &height)
+                  && x == box->x && width == box->width);
+            enum { PANEL_W = 480, PANEL_H = 272 };
+            size_t pixels = (size_t) PANEL_W * PANEL_H;
+            uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+            uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+            TileCache fast_cache = {0}, full_cache = {0};
+            CHECK(fast != NULL && full != NULL
+                  && tile_cache_init(&fast_cache, &budget,
+                                     &session.page.layout, 8)
+                  && tile_cache_set_frame(&fast_cache, fast, pixels)
+                  && tile_cache_render_frame(&fast_cache, 0, PANEL_W,
+                                             PANEL_H, NULL));
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget,
+                                     &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, PANEL_W,
+                                             PANEL_H, NULL)
+                  && memcmp(fast, full, pixels * sizeof(*fast)) == 0);
+            tile_cache_destroy(&full_cache);
+            tile_cache_destroy(&fast_cache);
+            budget_free(&budget, full);
+            budget_free(&budget, fast);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
+    }
     {
         puts("test: inset focus reservation is capped and excess falls back to layout");
         char page[8192];
@@ -3497,4 +3883,261 @@
           && smooth_scroll_navigation.page.layout.scroll_snap_candidate_count
              == 1);
     navigation_destroy(&smooth_scroll_navigation);
+    CHECK(budget.current == 0);
+
+    /* `name in element.style` answers the CSS properties Tilefinch
+       supports, camelCase and dashed, and vendor-prefixed names only where
+       supported: jQuery's and Modernizr's prefix detection probe the style
+       object with `in`. (A navigation, not a bare script run, so the
+       stylesheet engine that answers CSS.supports is bound.) */
+    puts("test: 'name in element.style' answers supported properties");
+    static const char style_in_page[] =
+        "<!doctype html><body><script>"
+        "const failures=[],expect=(name,ok)=>{if(!ok)failures.push(name)};"
+        "const t=(name,f)=>{try{expect(name,f())}catch(e){failures.push(name+':'+e)}};"
+        "const live=document.createElement('div').style;"
+        "const detached=document.implementation.createHTMLDocument('d')"
+        ".createElement('div').style;"
+        "for(const [label,s] of [['live',live],['detached',detached]]){"
+        "t(label+' supported',()=>['height','backgroundColor',"
+        "'background-color','cssFloat','float','display','marginTop',"
+        "'transform','opacity'].every(k=>k in s));"
+        "t(label+' unsupported',()=>!['fooBar','foo-bar','MozTransform',"
+        "'msTransform','--custom','Height'].some(k=>k in s));"
+        "t(label+' own members',()=>['cssText','length','setProperty',"
+        "'getPropertyValue','removeProperty'].every(k=>k in s));"
+        "t(label+' vendor matches CSS.supports',()=>['webkitTransform',"
+        "'WebkitTransform','webkitUserSelect','webkitLineClamp'].every(k=>"
+        "(k in s)===CSS.supports('-webkit'+k.replace(/^[wW]ebkit/,'')"
+        ".replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),'revert-rule'))"
+        "&&'webkitTransform' in s===CSS.supports('-webkit-transform',"
+        "'revert-rule'));}"
+        "live.cssText='color:red';"
+        "t('indices',()=>('0' in live)&&!('1' in live));"
+        "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
+        ":'STYLE-IN-OK';"
+        "</script></body>";
+    static NavigationSession style_in_navigation;
+    CHECK(navigation_init(&style_in_navigation, &budget, 2));
+    navigation_enable_scripts(&style_in_navigation, 4 * MIB, 1000);
+    uint64_t style_in_generation = navigation_begin(&style_in_navigation);
+    CHECK(navigation_commit_html(
+        &style_in_navigation, style_in_generation, "https://style.test/",
+        style_in_page, strlen(style_in_page), 160, NULL, NULL, true));
+    if (strcmp(style_in_navigation.page.script_result.summary,
+               "STYLE-IN-OK") != 0)
+        fprintf(stderr, "style in: summary=%s error=%s\n",
+                style_in_navigation.page.script_result.summary,
+                style_in_navigation.page.script_result.error);
+    CHECK(strcmp(style_in_navigation.page.script_result.summary,
+                 "STYLE-IN-OK") == 0);
+    navigation_destroy(&style_in_navigation);
+    CHECK(budget.current == 0);
+
+    /* Shadow composition as far as Tilefinch's light-tree layout goes: a
+       host's light child renders only through a slot that renders, so
+       content assigned to a `hidden` slot, or to no slot, has no box, and
+       opening the slot later shows it. MDN's Lit dropdown and icon-only
+       buttons rely on this. Media queries also evaluate calc() lengths
+       (MDN hides its sidebar with `width < calc(...)`). */
+    puts("test: shadow slots gate light content; media calc() lengths");
+    static const char shadow_slot_page[] =
+        "<!doctype html><style>#wide{display:block}"
+        "@media (width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))"
+        "{#wide{display:none}}</style><body>"
+        "<x-drop id=d><button slot=button>OPENER</button>"
+        "<div slot=dropdown>MENUITEM</div></x-drop>"
+        "<x-label id=l>LABELTEXT</x-label>"
+        "<x-none id=n><p>UNASSIGNED</p></x-none>"
+        "<x-show id=s><p>ASSIGNED</p></x-show>"
+        "<div id=wide>WIDEONLY</div><p>PLAINTEXT</p><script>"
+        "const d=document.getElementById('d').attachShadow({mode:'open'});"
+        "d.innerHTML='<slot name=button></slot><slot name=dropdown hidden>"
+        "</slot>';"
+        "document.getElementById('l').attachShadow({mode:'open'}).innerHTML="
+        "'<b>ICON</b><span hidden><slot></slot></span>';"
+        "document.getElementById('n').attachShadow({mode:'open'}).innerHTML="
+        "'<i>SHADOWN</i>';"
+        "document.getElementById('s').attachShadow({mode:'open'}).innerHTML="
+        "'<slot></slot>';"
+        "const slot=d.querySelector('slot[name=dropdown]');"
+        "globalThis.pocSummary=slot.assignedElements().map(e=>e.textContent)"
+        ".join()+':'+Array.isArray(slot.assignedNodes());"
+        "setTimeout(()=>{slot.hidden=false;globalThis.pocSummary+='|open'},20)"
+        "</script></body>";
+    static NavigationSession shadow_slot_navigation;
+    CHECK(navigation_init(&shadow_slot_navigation, &budget, 2));
+    navigation_enable_scripts(&shadow_slot_navigation, 4 * MIB, 1000);
+    uint64_t shadow_slot_generation = navigation_begin(&shadow_slot_navigation);
+    CHECK(navigation_commit_html(
+        &shadow_slot_navigation, shadow_slot_generation,
+        "https://shadow.test/", shadow_slot_page, strlen(shadow_slot_page),
+        480, NULL, NULL, true));
+    const LayoutDocument *shadow_layout = &shadow_slot_navigation.page.layout;
+    bool shadow_initial = strcmp(
+            shadow_slot_navigation.page.script_result.summary,
+            "MENUITEM:true") == 0
+        && command_x(shadow_layout, "OPENER") >= 0
+        && command_x(shadow_layout, "MENUITEM") < 0
+        && command_x(shadow_layout, "ICON") >= 0
+        && command_x(shadow_layout, "LABELTEXT") < 0
+        && command_x(shadow_layout, "UNASSIGNED") < 0
+        && command_x(shadow_layout, "SHADOWN") >= 0
+        && command_x(shadow_layout, "ASSIGNED") >= 0
+        && command_x(shadow_layout, "WIDEONLY") < 0
+        && command_x(shadow_layout, "PLAINTEXT") >= 0;
+    if (!shadow_initial)
+        fprintf(stderr,
+                "shadow slots: summary=%s opener=%d menu=%d icon=%d "
+                "label=%d unassigned=%d shadow=%d assigned=%d wide=%d\n",
+                shadow_slot_navigation.page.script_result.summary,
+                command_x(shadow_layout, "OPENER"),
+                command_x(shadow_layout, "MENUITEM"),
+                command_x(shadow_layout, "ICON"),
+                command_x(shadow_layout, "LABELTEXT"),
+                command_x(shadow_layout, "UNASSIGNED"),
+                command_x(shadow_layout, "SHADOWN"),
+                command_x(shadow_layout, "ASSIGNED"),
+                command_x(shadow_layout, "WIDEONLY"));
+    CHECK(shadow_initial);
+    for (size_t frame = 0; frame < 6; frame++)
+        CHECK(navigation_advance_runtime(&shadow_slot_navigation, 16, 8));
+    shadow_layout = &shadow_slot_navigation.page.layout;
+    CHECK(strcmp(shadow_slot_navigation.page.script_result.summary,
+                 "MENUITEM:true|open") == 0
+          && command_x(shadow_layout, "MENUITEM") >= 0
+          && command_x(shadow_layout, "LABELTEXT") < 0);
+    navigation_destroy(&shadow_slot_navigation);
+    CHECK(budget.current == 0);
+
+    /* Shadow encapsulation of styles (CSS Scoping 3): a shadow tree's own
+       <style> applies inside that tree only; :host and :host(<compound>)
+       reach the host and ::slotted(<compound>) its assigned light children.
+       The same holds for a constructed sheet a shadow root adopts. A
+       document sheet's :host never matches. MDN's Lit components declare
+       `:host{display:contents}` and generic `a`/`button` resets this way. */
+    puts("test: shadow styles are scoped; :host and ::slotted match");
+    /* getComputedStyle of an unslotted light child reports its cascaded
+       display, not the display:none layout resolves it to. */
+    static const char shadow_style_page[] =
+        "<!doctype html><style>p{color:#000000}:host{color:#ff00ff}</style>"
+        "<body><x-card id=a class=wide><p slot=s>LIGHTP</p>"
+        "<p id=unslotted>UNSLOTTED</p></x-card><p class=out>OUTSIDE</p>"
+        "<x-tag id=t></x-tag><span id=probe>PROBE</span><script>"
+        "const r=document.getElementById('a').attachShadow({mode:'open'});"
+        "r.innerHTML='<style>:host{display:block;padding-left:40px}"
+        ":host(.wide){padding-left:60px}p{color:#ff0000}"
+        "::slotted(p){color:#00ff00}.out,span{color:#0000ff}</style>"
+        "<p>INSIDE</p><slot name=s></slot>';"
+        "const t=document.getElementById('t').attachShadow({mode:'open'});"
+        "const sheet=new CSSStyleSheet();"
+        "sheet.replaceSync(':host{display:block;padding-left:30px}"
+        "b{color:#00aaaa}');t.adoptedStyleSheets=[sheet];"
+        "t.innerHTML='<b>ADOPTED</b>';"
+        "globalThis.pocSummary=getComputedStyle(document.getElementById("
+        "'probe')).color+'|'+getComputedStyle(document.getElementById("
+        "'unslotted')).display;"
+        "</script></body>";
+    static NavigationSession shadow_style_navigation;
+    CHECK(navigation_init(&shadow_style_navigation, &budget, 2));
+    navigation_enable_scripts(&shadow_style_navigation, 4 * MIB, 1000);
+    uint64_t shadow_style_generation =
+        navigation_begin(&shadow_style_navigation);
+    CHECK(navigation_commit_html(
+        &shadow_style_navigation, shadow_style_generation,
+        "https://shadow-style.test/", shadow_style_page,
+        strlen(shadow_style_page), 480, NULL, NULL, true));
+    for (size_t frame = 0; frame < 4; frame++)
+        CHECK(navigation_advance_runtime(&shadow_style_navigation, 16, 8));
+    const LayoutDocument *style_layout =
+        &shadow_style_navigation.page.layout;
+    const DrawCommand *inside = text_command(style_layout, "INSIDE");
+    const DrawCommand *light = text_command(style_layout, "LIGHTP");
+    const DrawCommand *outside = text_command(style_layout, "OUTSIDE");
+    const DrawCommand *adopted = text_command(style_layout, "ADOPTED");
+    const DrawCommand *probe = text_command(style_layout, "PROBE");
+    bool shadow_styles_ok = inside != NULL && light != NULL
+        && outside != NULL && adopted != NULL && probe != NULL
+        && inside->color == 0xff0000u && inside->x == 8 + 60
+        && light->color == 0x00ff00u && light->x == 8 + 60
+        && outside->color == 0x000000u && outside->x == 8
+        && probe->color == 0x000000u
+        && adopted->color == 0x00aaaau && adopted->x == 8 + 30
+        && command_x(style_layout, "UNSLOTTED") < 0
+        /* Unslotted: no box, but its cascaded display is reported. */
+        && strcmp(shadow_style_navigation.page.script_result.summary,
+                  "rgb(0, 0, 0)|block") == 0;
+    if (!shadow_styles_ok)
+        fprintf(stderr,
+                "shadow styles: inside=%06x/%d light=%06x/%d "
+                "outside=%06x/%d adopted=%06x/%d probe=%06x summary=%s\n",
+                inside ? (unsigned) inside->color : 0u,
+                inside ? inside->x : -1,
+                light ? (unsigned) light->color : 0u, light ? light->x : -1,
+                outside ? (unsigned) outside->color : 0u,
+                outside ? outside->x : -1,
+                adopted ? (unsigned) adopted->color : 0u,
+                adopted ? adopted->x : -1,
+                probe ? (unsigned) probe->color : 0u,
+                shadow_style_navigation.page.script_result.summary);
+    CHECK(shadow_styles_ok);
+    navigation_destroy(&shadow_style_navigation);
+    CHECK(budget.current == 0);
+
+    /* Flat-tree composition: a slotted light child lays out where its slot
+       is in the shadow tree, between the tree's own content, in block,
+       flex and inline formatting alike; a slot shows its fallback only
+       when nothing is assigned to it. */
+    puts("test: slotted content lays out at the slot's position");
+    static const char flat_tree_page[] =
+        "<!doctype html><style>body{margin:0}p{margin:0}</style><body>"
+        "<x-block id=b><p>LIGHTB</p></x-block>"
+        "<x-flex id=f style='display:flex'><span>FLEXB</span></x-flex>"
+        "<p><x-inline id=i><b>INB</b></x-inline></p>"
+        "<x-fall id=e></x-fall><script>"
+        "document.getElementById('b').attachShadow({mode:'open'}).innerHTML="
+        "'<p>BEFORE</p><slot></slot><p>AFTER</p>';"
+        "document.getElementById('f').attachShadow({mode:'open'}).innerHTML="
+        "'<span>FLEXA</span><slot></slot><span>FLEXC</span>';"
+        "document.getElementById('i').attachShadow({mode:'open'}).innerHTML="
+        "'<i>INA </i><slot></slot><i> INC</i>';"
+        "document.getElementById('e').attachShadow({mode:'open'}).innerHTML="
+        "'<slot>FALLBACK</slot>';"
+        "globalThis.pocSummary='FLAT-OK';"
+        "</script></body>";
+    static NavigationSession flat_tree_navigation;
+    CHECK(navigation_init(&flat_tree_navigation, &budget, 2));
+    navigation_enable_scripts(&flat_tree_navigation, 4 * MIB, 1000);
+    uint64_t flat_tree_generation = navigation_begin(&flat_tree_navigation);
+    CHECK(navigation_commit_html(
+        &flat_tree_navigation, flat_tree_generation,
+        "https://flat-tree.test/", flat_tree_page, strlen(flat_tree_page),
+        480, NULL, NULL, true));
+    for (size_t frame = 0; frame < 4; frame++)
+        CHECK(navigation_advance_runtime(&flat_tree_navigation, 16, 8));
+    const LayoutDocument *flat_layout = &flat_tree_navigation.page.layout;
+    const DrawCommand *before = text_command(flat_layout, "BEFORE");
+    const DrawCommand *lightb = text_command(flat_layout, "LIGHTB");
+    const DrawCommand *after = text_command(flat_layout, "AFTER");
+    int flex_a = command_x(flat_layout, "FLEXA");
+    int flex_b = command_x(flat_layout, "FLEXB");
+    int flex_c = command_x(flat_layout, "FLEXC");
+    int in_a = command_x(flat_layout, "INA");
+    int in_b = command_x(flat_layout, "INB");
+    int in_c = command_x(flat_layout, "INC");
+    bool flat_ok = before != NULL && lightb != NULL && after != NULL
+        && before->y < lightb->y && lightb->y < after->y
+        && flex_a >= 0 && flex_a < flex_b && flex_b < flex_c
+        && in_a >= 0 && in_a < in_b && in_b < in_c
+        && command_x(flat_layout, "FALLBACK") >= 0;
+    if (!flat_ok)
+        fprintf(stderr,
+                "flat tree: y=%d/%d/%d flex=%d/%d/%d inline=%d/%d/%d "
+                "fallback=%d summary=%s\n",
+                before ? before->y : -1, lightb ? lightb->y : -1,
+                after ? after->y : -1, flex_a, flex_b, flex_c, in_a, in_b,
+                in_c, command_x(flat_layout, "FALLBACK"),
+                flat_tree_navigation.page.script_result.summary);
+    CHECK(flat_ok);
+    navigation_destroy(&flat_tree_navigation);
     CHECK(budget.current == 0);

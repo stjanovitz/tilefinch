@@ -63,8 +63,40 @@
           if (/^(?:0|[1-9][0-9]*)$/.test(name)) return names()[Number(name)];
           return name in target ? target[name] : target.getPropertyValue(name);
         },
+        /* `prop in style` is how jQuery and Modernizr find a property and
+           its vendor prefix: answer the declaration's own members, its
+           indices and every property name Tilefinch implements. */
+        has(target, name) {
+          if (name in target) return true;
+          if (typeof name !== "string") return name === Symbol.iterator;
+          if (name === "length" || name === "parentRule") return true;
+          if (/^(?:0|[1-9][0-9]*)$/.test(name))
+            return Number(name) < names().length;
+          return supportedStyleProperty(name);
+        },
         set,
       });
+    };
+  /* Property names as CSSOM exposes them: camelCase (cssFloat, webkitFoo
+     and WebkitFoo for -webkit-foo) and the dashed spelling. Custom
+     properties are not attributes of the declaration. Answers come from
+     the stylesheet engine and are memoized, bounded. */
+  const cssSupportsNative = globalThis.__tilefinchCssSupports,
+    supportedStyleNames = new Map(),
+    supportedStyleProperty = (name) => {
+      let answer = supportedStyleNames.get(name);
+      if (answer !== undefined) return answer;
+      const dashed = /^[wW]ebkit[A-Z]/.test(name)
+          ? "-webkit-" + cssName(name.slice(6)).slice(1)
+          : /^[a-z][A-Za-z0-9]*$/.test(name)
+            ? cssName(name)
+            : /^-?[a-z][a-z0-9-]*$/.test(name) && !name.startsWith("--")
+              ? name
+              : "";
+      answer = dashed !== "" && name.length <= 64 &&
+        !!cssSupportsNative?.(dashed, "revert-rule");
+      if (supportedStyleNames.size < 512) supportedStyleNames.set(name, answer);
+      return answer;
     };
   const effectKey = (handle, property) => String(handle) + ":" + property;
   const colorValue = (value) => {
@@ -161,12 +193,14 @@
       transitionEvictions: 0,
       get transitionsRunning() { return runningTransitions.size; },
     };
-  Object.defineProperty(globalThis, "__tilefinchTransitionStats", {
-    configurable: false,
-    enumerable: false,
-    writable: false,
-    value: transitionStats,
-  });
+  /* Host and validation realms only (tests read the bounds). */
+  if (globalThis.__tilefinchTestProbes)
+    Object.defineProperty(globalThis, "__tilefinchTransitionStats", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: transitionStats,
+    });
   let transitionClock = 0,
     transitionClockDue = Infinity;
   const transitionNow = () => {

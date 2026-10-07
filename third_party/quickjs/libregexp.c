@@ -1320,6 +1320,11 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
             }
             if (!is_last) {
                 last_match_pos = re_emit_op_u32(s, REOP_goto, last_match_pos);
+                /* A refused growth leaves the buffer short of the offsets
+                   just returned (and the goto chain unwritten): patching
+                   would write past its end. */
+                if (dbuf_error(&s->byte_code))
+                    goto out_of_memory;
                 put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
             }
         }
@@ -1335,9 +1340,13 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
                 lre_realloc(s->opaque, tab, 0);
                 return -1;
             }
+            if (dbuf_error(&s->byte_code))
+                goto out_of_memory;
             if (!is_last)
                 put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
         }
+        if (dbuf_error(&s->byte_code))
+            goto out_of_memory;
 
         /* patch the 'goto match' */
         while (last_match_pos != -1) {
@@ -1349,6 +1358,9 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
         lre_realloc(s->opaque, tab, 0);
     }
     return 0;
+ out_of_memory:
+    lre_realloc(s->opaque, tab, 0);
+    return re_parse_out_of_memory(s);
 }
 
 static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp);
@@ -2258,6 +2270,10 @@ static int re_parse_term(REParseState *s, BOOL is_backward_dir)
                 BOOL need_capture_init, add_zero_advance_check;
                 int len, pos;
                 
+                /* The atom's bytecode is incomplete after a refused growth;
+                   do not scan or patch it. */
+                if (dbuf_error(&s->byte_code))
+                    goto out_of_memory;
                 /* the spec tells that if there is no advance when
                    running the atom after the first quant_min times,
                    then there is no match. We remove this test when we
@@ -2432,6 +2448,9 @@ static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir)
         if (re_parse_alternative(s, is_backward_dir))
             return -1;
 
+        /* 'pos' is past the end if the goto was never written. */
+        if (dbuf_error(&s->byte_code))
+            return re_parse_out_of_memory(s);
         /* patch the goto */
         len = s->byte_code.size - (pos + 4);
         put_u32(s->byte_code.buf + pos, len);

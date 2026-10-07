@@ -178,11 +178,11 @@ static bool block_collapses_through(
         || minimum_height != 0) {
         return false;
     }
-    for (lxb_dom_node_t *child = node->first_child; child != NULL;
-         child = child->next) {
+    for (lxb_dom_node_t *child = document_flat_first_child(node);
+         child != NULL; child = document_flat_next_sibling(child)) {
         if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
-            const char *text = document_text_data(child, &length);
+            const char *text = layout_text_data(child, &length);
             for (size_t i = 0; text != NULL && i < length; i++) {
                 if (!isspace((unsigned char) text[i])) return false;
             }
@@ -303,11 +303,11 @@ static int collapsed_inline_first_block_top(
         context, depth);
     if (scratch == NULL) return -1;
     ComputedStyle *child_style = &scratch->traversal.collapse.inline_child;
-    for (lxb_dom_node_t *child = node->first_child; child != NULL;
-         child = child->next) {
+    for (lxb_dom_node_t *child = document_flat_first_child(node);
+         child != NULL; child = document_flat_next_sibling(child)) {
         if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
-            const char *text = document_text_data(child, &length);
+            const char *text = layout_text_data(child, &length);
             for (size_t i = 0; text != NULL && i < length; i++) {
                 if (!isspace((unsigned char) text[i])) return -1;
             }

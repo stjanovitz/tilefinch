@@ -186,6 +186,10 @@ static bool navigation_stream_continue_stylesheet_suffix(
         || !stream->blocking_stylesheet_ready
         || !stream->blocking_stylesheet_user_context_neutral
         || stream->stylesheet_input_overflow) return false;
+    /* A suffix appends at the end of the sheet, but adopted sheets must
+       stay after every document source: rebuild instead. */
+    if (stream->blocking_stylesheet.adopted_source_count != 0
+        || document_adopted_sheets_signature(document) != 0) return false;
     /* Media queries are evaluated at parse against the sheet's viewport. A
        later metadata scan (a <meta name=viewport> after the first blocking
        stylesheet, or after a parser-blocking script) can move the layout
@@ -403,6 +407,9 @@ static bool navigation_stream_stylesheet_fingerprint(
                 sizeof(directive->present));
         }
     }
+    /* Adopted constructed sheets are sources outside the tree. */
+    uint64_t adopted = document_adopted_sheets_signature(document);
+    hash = fingerprint_bytes(hash, (const char *) &adopted, sizeof(adopted));
 
     lxb_dom_node_t *node = lxb_dom_interface_node(document->html);
     lxb_dom_node_t *boundary_parent = node->parent;
@@ -428,8 +435,7 @@ static bool navigation_stream_stylesheet_fingerprint(
         }
         if (style) {
             size_t nonce_length = 0;
-            const char *nonce = document_attribute(
-                node, "nonce", &nonce_length);
+            const char *nonce = document_element_nonce(node, &nonce_length);
             hash = navigation_stylesheet_fingerprint_field(
                 hash, "nonce", nonce, nonce_length, nonce != NULL);
             for (lxb_dom_node_t *child = node->first_child; child != NULL;

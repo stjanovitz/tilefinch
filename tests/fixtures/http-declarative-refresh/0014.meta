@@ -1,0 +1,16 @@
+psp-http-trace=1
+method=GET
+url=https://refresh.test/sandbox-top
+success=1
+async-delay-pumps=1
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=127
+effective-url=https://refresh.test/sandbox-top
+content-type=text/html; charset=utf-8
+server=fixture
+set-cookie-count=0
+response-header-count=1
+response-header-0=content-type: text/html; charset=utf-8

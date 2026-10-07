@@ -1601,6 +1601,9 @@ static int test_foundation(void)
     CHECK(test_parser_scripting_noscript_model(&budget));
     CHECK(test_parser_inert_script_payload_policy(&budget));
     CHECK(budget.current == 0);
+    puts("test: parser releases large-token storage");
+    CHECK(test_parser_releases_large_token_storage(&budget));
+    CHECK(budget.current == 0);
 
     puts("test: visible text emits bounded glyph-script hints");
     CHECK(test_visible_text_glyph_script_hints(&budget));
@@ -1653,6 +1656,8 @@ static int test_foundation(void)
     CHECK(test_picture_source_media_selection(&budget));
     puts("test: bounded inline SVG raster resource");
     CHECK(test_inline_svg_resource(&budget));
+    puts("test: inline SVG presentation attributes substitute var()");
+    CHECK(test_inline_svg_presentation_var(&budget));
     puts("test: mutation refresh reuses unchanged inline SVG rasters");
     CHECK(test_inline_svg_refresh_reuses_unchanged_rasters(&budget));
     CHECK(test_image_rebuild_near_budget_releases_unlent_images(&budget));
@@ -2901,8 +2906,14 @@ static int test_foundation(void)
                               &cooperative_document, 480));
     size_t cooperative_baseline = budget.current;
     LayoutCooperateProbe cooperate_probe = {0};
+    /* Layout also yields once a slice has run 8 ms. With the real clock a
+       loaded host adds time-driven yields, including layout-prepare yields
+       the probe deliberately does not count, so yields and calls drifted
+       apart (205 vs 204). A frozen clock leaves only the work quotas this
+       check is about. */
     TilefinchPlatformServices cooperate_services = {
         .context = &cooperate_probe,
+        .monotonic_time_ns = test_frozen_clock_ns,
         .cooperate = test_layout_cooperate
     };
     CHECK(setenv("TILEFINCH_SELECTOR_COOPERATE_VISITS", "64", 1) == 0);

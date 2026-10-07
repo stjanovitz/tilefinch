@@ -59,6 +59,37 @@ static char *script_node_source_copy(DomBridge *bridge,
     return copy;
 }
 
+/* "Already started" for a script element without native state: one the
+   host parser created (the document pipeline never records the flag) or
+   an innerHTML script the bounded table could not record. It is recovered
+   from what "prepare the script element" checks before it sets the flag: a script parsed into template contents was never connected, and
+   one with neither a src attribute nor source text, or with a non-script
+   type, returned first. Every other parsed script was prepared by the
+   parser the moment its end tag was seen, whether it later ran, failed or
+   was refused. A later type change cannot rewrite the answer: the
+   attribute setters record the flag first (see js_dom_set_attribute). */
+bool js_rt_script_element_parser_started(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    const lxb_dom_node_t *root = node;
+    size_t climbed = 0;
+    while (root->parent != NULL && climbed++ < DOM_TRAVERSAL_VISIT_LIMIT) {
+        root = root->parent;
+    }
+    if (root->parent != NULL) return true;
+    if (root->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT) {
+        const lxb_dom_element_t *host =
+            lxb_dom_interface_document_fragment(root)->host;
+        if (host != NULL && host->node.ns == LXB_NS_HTML
+            && host->node.local_name == LXB_TAG_TEMPLATE) return false;
+    }
+    size_t source_length = 0;
+    if (!dynamic_attribute_present(node, "src")
+        && script_node_source_length(node, &source_length)
+        && source_length == 0) return false;
+    return dynamic_script_type(node, NULL);
+}
+
 static ScriptDynamicTask *dynamic_free_task(DomBridge *bridge)
 {
     if (bridge == NULL
@@ -281,6 +312,11 @@ static int dynamic_prepare_node(JSContext *context, lxb_dom_node_t *node)
         return 1;
     }
 
+    /* HTML prepares (starts) the element first; an inline script without
+       its nonce, hash or 'unsafe-inline' then simply never runs. */
+    if (bridge->document != NULL && !tilefinch_csp_allows_inline_script(
+            &bridge->document->content_security_policy, node)) return 1;
+
     ScriptDynamicTask *module_task = module
         ? dynamic_free_task(bridge) : NULL;
     if (module && module_task == NULL) {
@@ -367,6 +403,14 @@ int js_rt_dynamic_prepare_subtree(JSContext *context,
          at != NULL && count < capacity;
          at = dom_document_order_next(&traversal)) {
         ScriptElementState *state = js_rt_script_element_state_find(bridge, at);
+#if TILEFINCH_SCRIPT_CLONE_CENSUS
+        if (state != NULL && state->census_started_clone
+            && bridge_node_is_connected(at)) {
+            state->census_started_clone = false;
+            if (bridge->result != NULL) js_rt_saturating_add_size(
+                &bridge->result->script_clones_suppressed, 1);
+        }
+#endif
         if (state != NULL) {
             int64_t handle = js_rt_bridge_register_node(bridge, at);
             if (handle != 0) {

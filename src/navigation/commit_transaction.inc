@@ -1,3 +1,7 @@
+static void navigation_prepare_layout_reuse(
+    NavigationSession *session, const ScriptMutationJournal *mutations,
+    bool full_rebuild);
+
 #define NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT 128u
 
 static bool navigation_replace_server_body_with_runtime(
@@ -574,7 +578,7 @@ static bool navigation_plan_static_image_geometry(
     }
     navigation_ensure_layout_reuse(session);
     LayoutReuseStats reuse_before = {0}, reuse_after = {0};
-    layout_reuse_cache_stats(session->page.layout_reuse, &reuse_before);
+    navigation_layout_reuse_sample(session->page.layout_reuse, &reuse_before);
     LayoutDocument probe = {0};
     uint64_t started = navigation_now_us();
     bool built = layout_build_context_reuse(
@@ -587,7 +591,7 @@ static bool navigation_plan_static_image_geometry(
               session, NAVIGATION_SLICE_LAYOUT, started,
               session->page.document.node_count);
     session->performance.layout_us += elapsed;
-    layout_reuse_cache_stats(session->page.layout_reuse, &reuse_after);
+    navigation_layout_reuse_sample(session->page.layout_reuse, &reuse_after);
     navigation_record_layout_reuse(session, &reuse_before, &reuse_after);
     size_t total_count = 0;
     bool collected = built && navigation_collect_layout_image_geometry(
@@ -722,7 +726,7 @@ static bool navigation_try_progressive_preview(
     session->performance.progressive_preview_y_limit = preview_limit;
     LayoutDocument preview = {0};
     LayoutReuseStats reuse_before = {0}, reuse_after = {0};
-    layout_reuse_cache_stats(session->page.layout_reuse, &reuse_before);
+    navigation_layout_reuse_sample(session->page.layout_reuse, &reuse_before);
     bool truncated = false;
     uint64_t layout_started = navigation_now_us();
     bool built = layout_build_context_preview(
@@ -736,7 +740,7 @@ static bool navigation_try_progressive_preview(
               session->page.document.node_count);
     session->performance.layout_us += layout_elapsed;
     session->performance.progressive_layout_us += layout_elapsed;
-    layout_reuse_cache_stats(session->page.layout_reuse, &reuse_after);
+    navigation_layout_reuse_sample(session->page.layout_reuse, &reuse_after);
     navigation_record_layout_reuse(
         session, &reuse_before, &reuse_after);
     if (!built) {
@@ -899,7 +903,7 @@ static bool navigation_document_requires_runtime(
     if (session == NULL || document == NULL || document->html == NULL) {
         return true;
     }
-    return session->trace_page_capabilities
+    return NAVIGATION_TRACES_PAGE_CAPABILITIES(session)
         || navigation_document_has_author_runtime_content(document);
 }
 
@@ -976,6 +980,8 @@ static bool navigation_finish_authoritative_layout(
             || script_runtime_consume_relayout(session->page.runtime);
     }
     session->page.loaded = true;
+    script_runtime_heavy_commit(session->page.runtime);
+    script_runtime_arm_memory_rescue(session->page.runtime);
     /* Runtime attachment publishes canvas surfaces queued by parser-time
        scripts.  A newly created or resized surface is a structural layout
        mutation: the authoritative layout built immediately above could only
@@ -1062,6 +1068,10 @@ static bool navigation_commit_document(
         || generation != session->generation || session->cancelled
         || url == NULL || document == NULL || document->html == NULL
         || viewport_width <= 0) return false;
+    /* A direct commit (a site adapter's page, committed HTML) may be the
+       armed history "replace"; a load took its arming when it started. */
+    bool replace_history = navigation_take_history_replace(
+        session, generation, url, record_history);
     ReaderDocumentAnalysis reader_analysis = {0};
     NavigationCandidatePrepareCallback candidate_prepare =
         session->candidate_prepare;
@@ -1151,6 +1161,7 @@ static bool navigation_commit_document(
              resource_base_url);
     snprintf(session->page.document_url,
              sizeof(session->page.document_url), "%s", url);
+    navigation_refresh_adopt_header(session, url);
     if (streaming != NULL
         && streaming->stylesheet_event_baseline_adopted) {
         memcpy(session->page.stylesheet_events,
@@ -1753,10 +1764,18 @@ static bool navigation_commit_document(
         /* Everything before this boundary is reflected by the rebuilt
            stylesheet.  Keep mutations made by subsequent stylesheet load
            handlers pending so a handler which changes href or inserts
-           another resource cannot be discarded at commit. */
+           another resource cannot be discarded at commit.  The layout
+           cache, though, may be the streaming preview's, holding styles
+           resolved before these scripts ran: drop what their changes
+           reached (all of it when the journal cannot say) so the commit
+           layout does not keep, say, a button's style from before its
+           class changed. */
         if (session->page.runtime != NULL) {
-            (void) script_runtime_consume_mutations(
-                session->page.runtime, NULL);
+            ScriptMutationJournal committed = {0};
+            if (script_runtime_consume_mutations(
+                    session->page.runtime, &committed)
+                && session->page.layout_reuse != NULL)
+                navigation_prepare_layout_reuse(session, &committed, false);
         }
         session->performance.style_us += navigation_record_slice(
             session, NAVIGATION_SLICE_STYLE, phase_started,
@@ -2300,8 +2319,11 @@ static bool navigation_commit_document(
             goto fail;
         }
     }
-    if (record_history
-        && !history_push(session, url, session->page.document.title)) {
+    if ((record_history
+         && !history_push(session, url, session->page.document.title))
+        || (replace_history
+            && !history_replace_current(session, url,
+                                        session->page.document.title))) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "history entry allocation failed");
         goto fail;

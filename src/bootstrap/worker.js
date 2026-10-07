@@ -1550,12 +1550,16 @@ globalThis.__tilefinchInstallWorker = (
               });
           }
         };
-      scope.setTimeout = (callback, delay, ...args) =>
-        scheduleWorkerTimer(callback, delay, false, args);
-      scope.setInterval = (callback, delay, ...args) =>
-        scheduleWorkerTimer(callback, delay, true, args);
-      scope.clearTimeout = clearWorkerTimer;
-      scope.clearInterval = clearWorkerTimer;
+      const setTimeout = (handler, timeout = 0, ...args) =>
+          scheduleWorkerTimer(handler, timeout, false, args),
+        setInterval = (handler, timeout = 0, ...args) =>
+          scheduleWorkerTimer(handler, timeout, true, args),
+        clearTimeout = (id = 0) => clearWorkerTimer(id),
+        clearInterval = (id = 0) => clearWorkerTimer(id);
+      scope.setTimeout = setTimeout;
+      scope.setInterval = setInterval;
+      scope.clearTimeout = clearTimeout;
+      scope.clearInterval = clearInterval;
       scope.TextEncoder = TextEncoder;
       scope.TextDecoder = TextDecoder;
       scope.Blob = Blob;

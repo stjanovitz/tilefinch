@@ -1,0 +1,67 @@
+--- a/source/lexbor/html/tokenizer.c
++++ b/source/lexbor/html/tokenizer.c
+@@ -61,16 +61,21 @@
+     /* Init Token */
+     tkz->token = NULL;
+ 
++    /*
++     * Tilefinch: grow the token pools in steps of 128 entries rather than
++     * reserving 4096 of each up front (0.7 MB on a 64-bit host) for every
++     * parser, including innerHTML fragment parsers.
++     */
+     tkz->dobj_token = lexbor_dobject_create();
+     status = lexbor_dobject_init(tkz->dobj_token,
+-                                 4096, sizeof(lxb_html_token_t));
++                                 128, sizeof(lxb_html_token_t));
+     if (status != LXB_STATUS_OK) {
+         return status;
+     }
+ 
+     /* Init Token Attributes */
+     tkz->dobj_token_attr = lexbor_dobject_create();
+-    status = lexbor_dobject_init(tkz->dobj_token_attr, 4096,
++    status = lexbor_dobject_init(tkz->dobj_token_attr, 128,
+                                  sizeof(lxb_html_token_attr_t));
+     if (status != LXB_STATUS_OK) {
+         return status;
+--- a/source/lexbor/html/tokenizer.h
++++ b/source/lexbor/html/tokenizer.h
+@@ -289,15 +289,35 @@
+ lxb_inline lxb_status_t
+ lxb_html_tokenizer_temp_realloc(lxb_html_tokenizer_t *tkz, size_t size)
+ {
++    lxb_char_t *start;
+     size_t length = tkz->pos - tkz->start;
+-    size_t new_size = (tkz->end - tkz->start) + size + 4096;
++    size_t capacity = tkz->end - tkz->start;
++    size_t new_size;
+ 
+-    tkz->start = (lxb_char_t *)lexbor_realloc(tkz->start, new_size);
+-    if (tkz->start == NULL) {
++    /*
++     * Tilefinch: grow by at least a quarter of the buffer. Growing by the
++     * pending bytes alone copies a multi-megabyte <style> or <script> body
++     * hundreds of times (about 180 MB of copying for a 2 MB token), and
++     * keep the old buffer when the allocation is refused.
++     */
++    if (size > ((size_t) -1) - capacity - 4096) {
++        tkz->status = LXB_STATUS_ERROR_OVERFLOW;
++        return tkz->status;
++    }
++
++    new_size = capacity + size + 4096;
++
++    if (capacity / 4 > size + 4096 && capacity / 4 <= ((size_t) -1) - capacity) {
++        new_size = capacity + capacity / 4;
++    }
++
++    start = (lxb_char_t *) lexbor_realloc(tkz->start, new_size);
++    if (start == NULL) {
+         tkz->status = LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+         return tkz->status;
+     }
+ 
++    tkz->start = start;
+     tkz->pos = tkz->start + length;
+     tkz->end = tkz->start + new_size;
+ 

@@ -302,7 +302,26 @@ def read_png(
     )
 
 
-def write_png_rgb(path: Path, width: int, height: int, pixels: bytes) -> None:
+def _filtered_row(row: bytes, previous: bytes) -> tuple[int, bytes]:
+    """The None, Sub or Up encoding of one RGB row, whichever has the
+    smallest sum of absolute (signed) bytes."""
+    stride = len(row)
+    candidates = [
+        (0, row),
+        (1, bytes((row[i] - (row[i - 3] if i >= 3 else 0)) & 255 for i in range(stride))),
+        (2, bytes((row[i] - previous[i]) & 255 for i in range(stride))),
+    ]
+    return min(
+        candidates, key=lambda c: sum(v if v < 128 else 256 - v for v in c[1])
+    )
+
+
+def write_png_rgb(
+    path: Path, width: int, height: int, pixels: bytes, *, filtered: bool = False
+) -> None:
+    """Write 8-bit RGB pixels as a PNG. ``filtered`` picks a row filter per
+    row (None, Sub or Up), which makes upscaled or flat images, such as the
+    committed Treadline references, markedly smaller at some CPU cost."""
     if width <= 0 or height <= 0 or len(pixels) != width * height * 3:
         raise ValueError("invalid RGB frame geometry")
 
@@ -312,10 +331,18 @@ def write_png_rgb(path: Path, width: int, height: int, pixels: bytes) -> None:
 
     rows = bytearray()
     row_bytes = width * 3
+    previous = bytes(row_bytes)
     for y in range(height):
-        rows.append(0)
         start = y * row_bytes
-        rows.extend(pixels[start : start + row_bytes])
+        row = pixels[start : start + row_bytes]
+        if filtered:
+            kind, encoded = _filtered_row(row, previous)
+            rows.append(kind)
+            rows.extend(encoded)
+            previous = row
+        else:
+            rows.append(0)
+            rows.extend(row)
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     path.write_bytes(
         PNG_SIGNATURE

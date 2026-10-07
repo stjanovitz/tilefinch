@@ -369,6 +369,8 @@ int main(void)
               "https://example.test/game", &changed_manifest,
               icon, sizeof(icon), &app_preview, error, sizeof(error))
           && app_preview.operation == OFFLINE_WEB_APP_UPDATE);
+    /* An abandoned preview releases the bytecode it kept. */
+    offline_library_discard_staged(&loaded);
     OfflineLibrary reloaded;
     offline_library_init(&reloaded, &budget, directory);
     CHECK(offline_library_load(&reloaded));
@@ -434,10 +436,32 @@ int main(void)
                  &app_session, "https://example.test/game.js",
                  (const unsigned char *) "different", 9u) == NULL);
     browser_shared_body_release(restored_bytecode);
+    /* The script compiled at installation was restored as bytecode only:
+       its source is not resident until something reads it from the pack,
+       which restores it as an ordinary entry bound to that bytecode. */
     BrowserSharedBody *install_bytecode =
-        browser_session_classic_script_bytecode_acquire(
+        browser_session_offline_script_bytecode(
             &app_session, install_script_context.target_url,
-            install_compiled_script, sizeof(install_compiled_script) - 1u);
+            sizeof(install_compiled_script) - 1u);
+    CHECK(install_bytecode != NULL && install_bytecode->length != 0
+          && browser_session_classic_script_bytecode_acquire(
+                 &app_session, install_script_context.target_url,
+                 install_compiled_script,
+                 sizeof(install_compiled_script) - 1u) == NULL);
+    browser_shared_body_release(install_bytecode);
+    BrowserSharedBody *install_source = browser_session_offline_script_source(
+        &app_session, install_script_context.target_url,
+        sizeof(install_compiled_script) - 1u);
+    CHECK(install_source != NULL
+          && memcmp(install_source->data, install_compiled_script,
+                    sizeof(install_compiled_script) - 1u) == 0
+          && browser_session_offline_script_bytecode(
+                 &app_session, install_script_context.target_url,
+                 sizeof(install_compiled_script) - 1u) == NULL);
+    browser_shared_body_release(install_source);
+    install_bytecode = browser_session_classic_script_bytecode_acquire(
+        &app_session, install_script_context.target_url,
+        install_compiled_script, sizeof(install_compiled_script) - 1u);
     CHECK(install_bytecode != NULL && install_bytecode->length != 0);
     browser_shared_body_release(install_bytecode);
     budget_free(&budget, html);

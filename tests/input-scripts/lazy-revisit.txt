@@ -1,0 +1,22 @@
+# Measurement scenario, not golden-gated: a page and its revisit in one
+# session. Run with a recorded trace (--trace DIR --trace-keyed) of a page
+# that loads lazily split webpack bundles (the site census's xe or
+# wapo-home), prepared with benchmarks/run-perf-journeys.py --prepare-trace
+# so the reload finds the redirected document. The first load plans every
+# lazy bundle; its idle turns then digest and store the bundle records;
+# Square reloads the page, whose bundles restore their plans from the
+# records instead of planning again. (Neither load syntax-checks the
+# factories up front: each one is checked when it first runs.) Compare the
+# two loads' tilefinch-load-experience lines (scope=initial, then
+# scope=follow) and the cumulative compile counters of tilefinch-script-cache
+# at the two marks.
+# (A wait-page right after the reload stalls: the reload is long and only
+# a -live step advances through it.)
+wait-page 120
+wait 600
+mark first-settled
+tap square
+wait-live 2400
+wait 300
+mark revisit-settled
+end

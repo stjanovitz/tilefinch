@@ -1,6 +1,5 @@
 #include "tilefinch/script_lazy.h"
 
-#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -70,35 +69,200 @@ static bool has_bounded_webpack_signature(const char *source, size_t length)
     return false;
 }
 
-static bool identifier_start(unsigned char byte)
+/* A UTF-8 byte order mark is not part of the script (the HTML decoder
+   drops it); m.vk.com serves its Webpack chunks with one. */
+static size_t utf8_bom_length(const char *source, size_t length)
 {
-    return isalpha(byte) != 0 || byte == '_' || byte == '$' || byte >= 0x80;
+    return length >= 3u && (unsigned char) source[0] == 0xefu
+            && (unsigned char) source[1] == 0xbbu
+            && (unsigned char) source[2] == 0xbfu
+        ? 3u : 0u;
 }
 
-static bool identifier_continue(unsigned char byte)
+/* Byte classes of the "C" locale's <ctype.h> predicates the lexer used to
+   call per byte (the program never changes locale), plus the lexer's own
+   identifier rule: one table load instead of a library call. */
+enum {
+    LEX_SPACE = 1u,      /* isspace: \t \n \v \f \r and space */
+    LEX_ID_START = 2u,   /* isalpha, '_', '$', or any byte >= 0x80 */
+    LEX_DIGIT = 4u,      /* isdigit */
+    LEX_ALNUM = 8u       /* isalnum */
+};
+
+#define LEX_ROW16(value) value, value, value, value, value, value, value, \
+    value, value, value, value, value, value, value, value, value
+
+static const uint8_t lex_class[256] = {
+    /* 0x00 */ 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    /* \t \n \v \f \r */ LEX_SPACE, LEX_SPACE, LEX_SPACE, LEX_SPACE,
+    LEX_SPACE, 0, 0,
+    /* 0x10 */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    /* ' ' */ LEX_SPACE, 0, 0, 0,
+    /* '$' */ LEX_ID_START, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    /* '0'-'9' */ LEX_DIGIT | LEX_ALNUM, LEX_DIGIT | LEX_ALNUM,
+    LEX_DIGIT | LEX_ALNUM, LEX_DIGIT | LEX_ALNUM, LEX_DIGIT | LEX_ALNUM,
+    LEX_DIGIT | LEX_ALNUM, LEX_DIGIT | LEX_ALNUM, LEX_DIGIT | LEX_ALNUM,
+    LEX_DIGIT | LEX_ALNUM, LEX_DIGIT | LEX_ALNUM,
+    0, 0, 0, 0, 0, 0,
+    /* '@' */ 0,
+    /* 'A'-'Z' */
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    /* [ \ ] ^ */ 0, 0, 0, 0,
+    /* '_' */ LEX_ID_START,
+    /* '`' */ 0,
+    /* 'a'-'z' */
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    LEX_ID_START | LEX_ALNUM, LEX_ID_START | LEX_ALNUM,
+    /* { | } ~ DEL */ 0, 0, 0, 0, 0,
+    /* 0x80-0xff */
+    LEX_ROW16(LEX_ID_START), LEX_ROW16(LEX_ID_START),
+    LEX_ROW16(LEX_ID_START), LEX_ROW16(LEX_ID_START),
+    LEX_ROW16(LEX_ID_START), LEX_ROW16(LEX_ID_START),
+    LEX_ROW16(LEX_ID_START), LEX_ROW16(LEX_ID_START)
+};
+
+#undef LEX_ROW16
+
+static inline bool lex_is(unsigned char byte, unsigned mask)
 {
-    return identifier_start(byte) || isdigit(byte) != 0;
+    return (lex_class[byte] & mask) != 0;
 }
 
-static bool bytes_equal(const char *source, const JsToken *token,
-                        const char *expected)
+static inline bool identifier_start(unsigned char byte)
+{
+    return lex_is(byte, LEX_ID_START);
+}
+
+static inline bool identifier_continue(unsigned char byte)
+{
+    return lex_is(byte, LEX_ID_START | LEX_DIGIT);
+}
+
+static inline bool bytes_equal(const char *source, const JsToken *token,
+                               const char *expected)
 {
     size_t length = strlen(expected);
     return token->end - token->begin == length
         && memcmp(source + token->begin, expected, length) == 0;
 }
 
+/* bytes_equal for a one-byte expected text: the planner's delimiter
+   checks, which run for every punctuator. */
+static inline bool token_is(const char *source, const JsToken *token,
+                            char expected)
+{
+    return token->end - token->begin == 1u
+        && source[token->begin] == expected;
+}
+
 static bool keyword_expects_expression(const char *source,
                                        const JsToken *token)
 {
-    static const char *const keywords[] = {
-        "await", "case", "delete", "do", "else", "in", "instanceof",
-        "new", "of", "return", "throw", "typeof", "void", "yield"
-    };
-    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
-        if (bytes_equal(source, token, keywords[i])) return true;
+    /* await case delete do else in instanceof new of return throw typeof
+       void yield, by length. */
+    const char *text = source + token->begin;
+    switch (token->end - token->begin) {
+    case 2:
+        return memcmp(text, "do", 2) == 0 || memcmp(text, "in", 2) == 0
+            || memcmp(text, "of", 2) == 0;
+    case 3:
+        return memcmp(text, "new", 3) == 0;
+    case 4:
+        return memcmp(text, "case", 4) == 0 || memcmp(text, "else", 4) == 0
+            || memcmp(text, "void", 4) == 0;
+    case 5:
+        return memcmp(text, "await", 5) == 0
+            || memcmp(text, "throw", 5) == 0
+            || memcmp(text, "yield", 5) == 0;
+    case 6:
+        return memcmp(text, "delete", 6) == 0
+            || memcmp(text, "return", 6) == 0
+            || memcmp(text, "typeof", 6) == 0;
+    case 10:
+        return memcmp(text, "instanceof", 10) == 0;
+    default:
+        return false;
     }
-    return false;
+}
+
+/* Length of the longest punctuator starting at `at`, or 1: the operators
+   >>>=; **= &&= ||= (two question marks)= === !== >>> <<= >>= ...;
+   => == != <= >= ++ -- && || (two question marks) ** << >> += -= *= /= %=
+   &= |= ^= ?. -- the list the lexer used to scan with strlen and memcmp per
+   operator per token. An operator matches only when all of its bytes are
+   present. (The question-mark pairs are spelled out: two of them start a C
+   trigraph.) */
+static size_t punctuator_length(const char *source, size_t length,
+                                size_t at)
+{
+    size_t left = length - at;
+    char c1 = left > 1 ? source[at + 1] : '\0';
+    char c2 = left > 2 ? source[at + 2] : '\0';
+    char c3 = left > 3 ? source[at + 3] : '\0';
+    switch (source[at]) {
+    case '>':
+        if (c1 == '>') {
+            if (c2 == '>') return c3 == '=' ? 4u : 3u;
+            return c2 == '=' ? 3u : 2u;
+        }
+        return c1 == '=' ? 2u : 1u;
+    case '<':
+        if (c1 == '<') return c2 == '=' ? 3u : 2u;
+        return c1 == '=' ? 2u : 1u;
+    case '=':
+        if (c1 == '=') return c2 == '=' ? 3u : 2u;
+        return c1 == '>' ? 2u : 1u;
+    case '!':
+        if (c1 == '=') return c2 == '=' ? 3u : 2u;
+        return 1u;
+    case '*':
+        if (c1 == '*') return c2 == '=' ? 3u : 2u;
+        return c1 == '=' ? 2u : 1u;
+    case '&':
+        if (c1 == '&') return c2 == '=' ? 3u : 2u;
+        return c1 == '=' ? 2u : 1u;
+    case '|':
+        if (c1 == '|') return c2 == '=' ? 3u : 2u;
+        return c1 == '=' ? 2u : 1u;
+    case '?':
+        if (c1 == '?') return c2 == '=' ? 3u : 2u;
+        return c1 == '.' ? 2u : 1u;
+    case '+':
+        return c1 == '+' || c1 == '=' ? 2u : 1u;
+    case '-':
+        return c1 == '-' || c1 == '=' ? 2u : 1u;
+    case '/':
+    case '%':
+    case '^':
+        return c1 == '=' ? 2u : 1u;
+    case '.':
+        return c1 == '.' && c2 == '.' ? 3u : 1u;
+    default:
+        return 1u;
+    }
 }
 
 static bool skip_quoted(JsLexer *lexer, unsigned char quote, size_t *end)
@@ -186,8 +350,8 @@ static bool skip_template(JsLexer *lexer, size_t *end)
             if (!lexer_next(&expression, &token)
                 || token.kind == JS_TOKEN_EOF) return false;
             if (token.kind != JS_TOKEN_PUNCTUATOR) continue;
-            if (bytes_equal(expression.source, &token, "{")) depth++;
-            else if (bytes_equal(expression.source, &token, "}")) depth--;
+            if (token_is(expression.source, &token, '{')) depth++;
+            else if (token_is(expression.source, &token, '}')) depth--;
         }
         at = expression.offset;
     }
@@ -208,11 +372,12 @@ static void lexer_update_expression_state(JsLexer *lexer,
         return;
     }
     if (token->kind != JS_TOKEN_PUNCTUATOR) return;
-    if (bytes_equal(lexer->source, token, ")")
-        || bytes_equal(lexer->source, token, "]")
-        || bytes_equal(lexer->source, token, "}")
-        || bytes_equal(lexer->source, token, "++")
-        || bytes_equal(lexer->source, token, "--")) {
+    const char *text = lexer->source + token->begin;
+    size_t length = token->end - token->begin;
+    if ((length == 1u
+         && (text[0] == ')' || text[0] == ']' || text[0] == '}'))
+        || (length == 2u && text[0] == text[1]
+            && (text[0] == '+' || text[0] == '-'))) {
         lexer->expression_expected = false;
     } else {
         lexer->expression_expected = true;
@@ -223,7 +388,7 @@ static bool lexer_skip_space_and_comments(JsLexer *lexer)
 {
     while (lexer->offset < lexer->length) {
         unsigned char byte = (unsigned char) lexer->source[lexer->offset];
-        if (isspace(byte) != 0) {
+        if (lex_is(byte, LEX_SPACE)) {
             lexer->offset++;
             continue;
         }
@@ -276,12 +441,14 @@ static bool lexer_next(JsLexer *lexer, JsToken *token)
                && identifier_continue(
                    (unsigned char) lexer->source[end])) end++;
         token->kind = JS_TOKEN_IDENTIFIER;
-    } else if (isdigit(byte) != 0
+    } else if (lex_is(byte, LEX_DIGIT)
                || (byte == '.' && end < lexer->length
-                   && isdigit((unsigned char) lexer->source[end]) != 0)) {
+                   && lex_is((unsigned char) lexer->source[end],
+                             LEX_DIGIT))) {
         while (end < lexer->length) {
             unsigned char part = (unsigned char) lexer->source[end];
-            if (!isalnum(part) && part != '.' && part != '_') break;
+            if (!lex_is(part, LEX_ALNUM) && part != '.' && part != '_')
+                break;
             end++;
         }
         token->kind = JS_TOKEN_NUMBER;
@@ -310,20 +477,8 @@ static bool lexer_next(JsLexer *lexer, JsToken *token)
         }
         token->kind = JS_TOKEN_REGEX;
     } else {
-        static const char *const operators[] = {
-            ">>>=", "**=", "&&=", "||=", "\x3f\x3f=", "===", "!==", ">>>",
-            "<<=", ">>=", "=>", "==", "!=", "<=", ">=", "++", "--",
-            "&&", "||", "??", "**", "<<", ">>", "+=", "-=", "*=",
-            "/=", "%=", "&=", "|=", "^=", "?.", "..."
-        };
-        size_t best = 1;
-        for (size_t i = 0; i < sizeof(operators) / sizeof(operators[0]); i++) {
-            size_t length = strlen(operators[i]);
-            if (length > best && lexer->offset <= lexer->length - length
-                && memcmp(lexer->source + lexer->offset,
-                          operators[i], length) == 0) best = length;
-        }
-        end = lexer->offset + best;
+        end = lexer->offset + punctuator_length(
+            lexer->source, lexer->length, lexer->offset);
         token->kind = JS_TOKEN_PUNCTUATOR;
     }
     token->end = end;
@@ -400,6 +555,7 @@ bool script_resource_loader_plan_create(
     JsLexer lexer = {
         .source = source,
         .length = source_length,
+        .offset = utf8_bom_length(source, source_length),
         .work_remaining = &work_remaining,
         .expression_expected = true
     };
@@ -421,16 +577,16 @@ bool script_resource_loader_plan_create(
                 || end.kind == JS_TOKEN_EOF
                 || end.kind == JS_TOKEN_INVALID) goto reject;
             if (end.kind != JS_TOKEN_PUNCTUATOR) continue;
-            if (bytes_equal(source, &end, "(")) round++;
-            else if (bytes_equal(source, &end, ")")) {
+            if (token_is(source, &end, '(')) round++;
+            else if (token_is(source, &end, ')')) {
                 if (round == 0) goto reject;
                 round--;
-            } else if (bytes_equal(source, &end, "[")) square++;
-            else if (bytes_equal(source, &end, "]")) {
+            } else if (token_is(source, &end, '[')) square++;
+            else if (token_is(source, &end, ']')) {
                 if (square == 0) goto reject;
                 square--;
-            } else if (bytes_equal(source, &end, "{")) curly++;
-            else if (bytes_equal(source, &end, "}")) {
+            } else if (token_is(source, &end, '{')) curly++;
+            else if (token_is(source, &end, '}')) {
                 if (curly == 0) goto reject;
                 curly--;
             }
@@ -440,7 +596,7 @@ bool script_resource_loader_plan_create(
         size_t saved_offset = lexer.offset;
         JsToken separator;
         if (!lexer_next(&lexer, &separator)) goto reject;
-        if (bytes_equal(source, &separator, ";")) {
+        if (token_is(source, &separator, ';')) {
             statement_end = separator.end;
         } else {
             lexer.offset = saved_offset;
@@ -518,7 +674,7 @@ static bool parse_parameters(JsLexer *lexer, bool parenthesized,
     if (parenthesized) {
         JsToken token;
         if (!lexer_next(lexer, &token)) return false;
-        if (bytes_equal(lexer->source, &token, ")")) {
+        if (token_is(lexer->source, &token, ')')) {
             *arity = 0;
             return true;
         }
@@ -526,8 +682,8 @@ static bool parse_parameters(JsLexer *lexer, bool parenthesized,
             if (token.kind != JS_TOKEN_IDENTIFIER || count >= 3) return false;
             count++;
             if (!lexer_next(lexer, &token)) return false;
-            if (bytes_equal(lexer->source, &token, ")")) break;
-            if (!bytes_equal(lexer->source, &token, ",")
+            if (token_is(lexer->source, &token, ')')) break;
+            if (!token_is(lexer->source, &token, ',')
                 || !lexer_next(lexer, &token)) return false;
         }
     } else {
@@ -550,7 +706,7 @@ static bool parse_factory(JsLexer *lexer, const JsToken *first,
             || !expect_token(lexer, "{", &token)) return false;
     } else {
         factory->kind = SCRIPT_LAZY_FACTORY_ARROW;
-        if (bytes_equal(lexer->source, first, "(")) {
+        if (token_is(lexer->source, first, '(')) {
             if (!parse_parameters(lexer, true, &factory->arity)) return false;
         } else if (first->kind == JS_TOKEN_IDENTIFIER) {
             factory->arity = 1;
@@ -566,8 +722,8 @@ static bool parse_factory(JsLexer *lexer, const JsToken *first,
             return false;
         }
         if (token.kind != JS_TOKEN_PUNCTUATOR) continue;
-        if (bytes_equal(lexer->source, &token, "{")) braces++;
-        else if (bytes_equal(lexer->source, &token, "}")) braces--;
+        if (token_is(lexer->source, &token, '{')) braces++;
+        else if (token_is(lexer->source, &token, '}')) braces--;
     }
     factory->source_length = token.end - factory->source_offset;
     return factory->source_length != 0;
@@ -580,7 +736,7 @@ static bool parse_chunk_ids(JsLexer *lexer)
     for (;;) {
         JsToken token;
         if (!lexer_next(lexer, &token)) return false;
-        if (bytes_equal(lexer->source, &token, "]")) {
+        if (token_is(lexer->source, &token, ']')) {
             return saw_id && !expect_id;
         }
         if (expect_id) {
@@ -590,7 +746,7 @@ static bool parse_chunk_ids(JsLexer *lexer)
             saw_id = true;
             expect_id = false;
         } else {
-            if (!bytes_equal(lexer->source, &token, ",")) return false;
+            if (!token_is(lexer->source, &token, ',')) return false;
             expect_id = true;
         }
     }
@@ -603,7 +759,7 @@ static bool parse_factory_object(JsLexer *lexer,
     for (;;) {
         JsToken key;
         if (!lexer_next(lexer, &key)) return false;
-        if (bytes_equal(lexer->source, &key, "}")) return saw_factory;
+        if (token_is(lexer->source, &key, '}')) return saw_factory;
         if (key.kind != JS_TOKEN_NUMBER
             && key.kind != JS_TOKEN_IDENTIFIER) return false;
         if (!expect_token(lexer, ":", NULL)) return false;
@@ -618,8 +774,8 @@ static bool parse_factory_object(JsLexer *lexer,
         saw_factory = true;
         JsToken separator;
         if (!lexer_next(lexer, &separator)) return false;
-        if (bytes_equal(lexer->source, &separator, "}")) return true;
-        if (!bytes_equal(lexer->source, &separator, ",")) return false;
+        if (token_is(lexer->source, &separator, '}')) return true;
+        if (!token_is(lexer->source, &separator, ',')) return false;
     }
 }
 
@@ -627,8 +783,8 @@ static bool parse_optional_runtime_and_tail(JsLexer *lexer)
 {
     JsToken token;
     if (!lexer_next(lexer, &token)) return false;
-    if (!bytes_equal(lexer->source, &token, "]")) {
-        if (!bytes_equal(lexer->source, &token, ",")) return false;
+    if (!token_is(lexer->source, &token, ']')) {
+        if (!token_is(lexer->source, &token, ',')) return false;
         size_t round = 0, square = 0, curly = 0;
         bool saw_expression = false;
         for (;;) {
@@ -639,16 +795,16 @@ static bool parse_optional_runtime_and_tail(JsLexer *lexer)
                 saw_expression = true;
                 continue;
             }
-            if (bytes_equal(lexer->source, &token, "(") ) round++;
-            else if (bytes_equal(lexer->source, &token, "[")) square++;
-            else if (bytes_equal(lexer->source, &token, "{")) curly++;
-            else if (bytes_equal(lexer->source, &token, ")")) {
+            if (token_is(lexer->source, &token, '(') ) round++;
+            else if (token_is(lexer->source, &token, '[')) square++;
+            else if (token_is(lexer->source, &token, '{')) curly++;
+            else if (token_is(lexer->source, &token, ')')) {
                 if (round == 0) return false;
                 round--;
-            } else if (bytes_equal(lexer->source, &token, "}")) {
+            } else if (token_is(lexer->source, &token, '}')) {
                 if (curly == 0) return false;
                 curly--;
-            } else if (bytes_equal(lexer->source, &token, "]")) {
+            } else if (token_is(lexer->source, &token, ']')) {
                 if (square != 0) square--;
                 else if (round == 0 && curly == 0) break;
                 else return false;
@@ -659,7 +815,7 @@ static bool parse_optional_runtime_and_tail(JsLexer *lexer)
     }
     if (!expect_token(lexer, ")", NULL)) return false;
     if (!lexer_next(lexer, &token)) return false;
-    if (bytes_equal(lexer->source, &token, ";")) {
+    if (token_is(lexer->source, &token, ';')) {
         if (!lexer_next(lexer, &token)) return false;
     }
     return token.kind == JS_TOKEN_EOF;
@@ -684,6 +840,7 @@ bool script_lazy_webpack_plan_create(Budget *budget, const char *source,
     JsLexer lexer = {
         .source = source,
         .length = source_length,
+        .offset = utf8_bom_length(source, source_length),
         .work_remaining = &work_remaining,
         .expression_expected = true
     };
@@ -697,7 +854,7 @@ bool script_lazy_webpack_plan_create(Budget *budget, const char *source,
         if (!expect_token(&lexer, ";", NULL)
             || !lexer_next(&lexer, &token)) goto reject;
     }
-    if (!bytes_equal(source, &token, "(")) goto reject;
+    if (!token_is(source, &token, '(')) goto reject;
     JsToken first_root, first_name, second_root, second_name;
     if (!lexer_next(&lexer, &first_root) || !recognized_root(source, &first_root)
         || !expect_token(&lexer, ".", NULL)

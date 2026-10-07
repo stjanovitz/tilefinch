@@ -130,15 +130,24 @@ typedef int32_t StyleLength;
 #define GRID_TRACK_MAX_CONTENT_VALUE UINT16_C(2)
 #define GRID_TRACK_FIT_CONTENT_FLAG UINT16_C(0x8000)
 #define GRID_TRACK_FIT_CONTENT_MASK UINT16_C(0x7fff)
-#define GRID_TRACK_REPEAT_LIMIT 12
+/* Explicit tracks per axis. Realistic page grids (12-column mobile
+   layouts, 14- and 16-column editorial grids, 24-column frameworks) must
+   keep every track; the stylesheet track-template tables and the transient
+   layout arrays scale with this bound, ComputedStyle does not. */
+#define GRID_TRACK_REPEAT_LIMIT 24
 #define STYLE_GRID_AREA_TEMPLATE_LIMIT 32
 #define STYLE_GRID_AREA_NAME_LIMIT 32
 #define STYLE_GRID_AREA_NAME_CAPACITY 32
 #define STYLE_GRID_AREA_RECT_LIMIT 12
 #define STYLE_GRID_AREA_ROW_LIMIT GRID_TRACK_REPEAT_LIMIT
 #define STYLE_GRID_TRACK_TEMPLATE_LIMIT 31
-#define STYLE_GRID_LINE_NAME_LIMIT 15
-#define STYLE_GRID_LINE_NAMES_PER_LINE 2
+/* Distinct line names per stylesheet and names per line. Editorial grids
+   name each line for several areas at once (Guardian's front sections use
+   `[content-end title-end hide-end]` and ~20 names across their templates);
+   a template over either bound is rejected whole. The name table lives only
+   in grid-using stylesheets (StyleGridAreas). */
+#define STYLE_GRID_LINE_NAME_LIMIT 40
+#define STYLE_GRID_LINE_NAMES_PER_LINE 4
 
 typedef uint8_t DisplayMode;
 enum {
@@ -695,7 +704,12 @@ typedef struct {
     int16_t background_position_y;
     uint8_t background_size_flags;
     uint8_t object_fit;
-    int font_scale;
+    int16_t font_scale;
+    /* A unitless line-height inherits as the number, not the pixels it
+       computed to (CSS 2.1 10.8.1): thousandths of the authored factor,
+       zero for normal and length or percentage values. It shares the
+       word font_scale (1-3) used to occupy alone. */
+    uint16_t line_height_factor;
     int font_size;
     /* The used size is retained in 26.6 pixels without growing the PSP
        style record.  font_size_unit is nonzero only while a relative
@@ -750,19 +764,21 @@ typedef struct {
      */
     int grid_columns;
     int grid_min_column_width;
-    /* Six four-bit fields retain bounded column/row placement without
-       growing ComputedStyle. Values 1..9 are line numbers, 15 represents
-       the supported -1/end line, and spans are clamped to eight tracks. */
-    uint8_t grid_placement[3];
-    /* Uses the byte that aligned FlexDirection: a five-bit integral length,
-       a temporary em-unit bit, and a two-bit overflow visual-box selector. */
-    uint8_t overflow_clip_margin;
-    /* Bounded basic-shape clip-path state, packed into the alignment hole
-       before flex_direction. */
-    uint16_t clip_path_state;
     FlexDirection flex_direction;
     bool flex_wrap;
     bool flex_wrap_reverse;
+    /* A five-bit integral length, a temporary em-unit bit, and a two-bit
+       overflow visual-box selector. */
+    uint8_t overflow_clip_margin;
+    /* Bounded basic-shape clip-path state. */
+    uint16_t clip_path_state;
+    /* Six byte fields retain column/row placement: start line, end line
+       and span for each axis (see COMPUTED_GRID_*_FIELD). Lines are signed
+       bytes clamped to +/-COMPUTED_GRID_LINE_LIMIT, spans are clamped to
+       COMPUTED_GRID_SPAN_LIMIT. The array fills the alignment hole that
+       the three flex bytes above used to leave before flex_grow, so
+       ComputedStyle does not grow. */
+    uint8_t grid_placement[6];
     int flex_grow;
     int order;
     uint16_t flex_shrink;
@@ -838,6 +854,9 @@ typedef struct {
     uint16_t grid_auto_column_type : 2;
     uint16_t grid_auto_row_type : 2;
     uint16_t visibility_hidden : 1;
+    /* The element hosts a shadow root (it has a carrier child): its light
+       children consult their slot (document_shadow_light_child_rendered). */
+    uint16_t shadow_host : 1;
     /* A single bounded implicit-track size covers the common Level 1 form.
        Lists retain their first value deterministically until cyclic implicit
        track lists can justify additional per-style storage. */
@@ -965,17 +984,28 @@ static inline bool computed_style_width_fit_content(
 #define COMPUTED_GRID_NAMED_LINE_MASK UINT32_C(0x3c000000)
 #define COMPUTED_GRID_COLUMN_GAP_SPECIFIED UINT32_C(0x40000000)
 #define COMPUTED_GRID_ROW_GAP_SPECIFIED UINT32_C(0x80000000)
-#define COMPUTED_GRID_NAMED_AREA_MARKER UINT8_C(0xf0)
+/* A named grid-area reference stores its one-based id in the column-start
+   byte and this marker in the row-span byte, which an ordinary span (at
+   most COMPUTED_GRID_SPAN_LIMIT) never reaches. */
+#define COMPUTED_GRID_NAMED_AREA_MARKER UINT8_C(0xff)
 
 enum {
-    COMPUTED_GRID_COLUMN_START_SHIFT = 0,
-    COMPUTED_GRID_COLUMN_END_SHIFT = 4,
-    COMPUTED_GRID_COLUMN_SPAN_SHIFT = 8,
-    COMPUTED_GRID_ROW_START_SHIFT = 12,
-    COMPUTED_GRID_ROW_END_SHIFT = 16,
-    COMPUTED_GRID_ROW_SPAN_SHIFT = 20,
-    COMPUTED_GRID_NEGATIVE_LINE_MIN = 10,
-    COMPUTED_GRID_LINE_LAST = 15
+    /* Byte index of each placement component within grid_placement. */
+    COMPUTED_GRID_COLUMN_START_FIELD = 0,
+    COMPUTED_GRID_COLUMN_END_FIELD = 1,
+    COMPUTED_GRID_COLUMN_SPAN_FIELD = 2,
+    COMPUTED_GRID_ROW_START_FIELD = 3,
+    COMPUTED_GRID_ROW_END_FIELD = 4,
+    COMPUTED_GRID_ROW_SPAN_FIELD = 5,
+    COMPUTED_GRID_PLACEMENT_FIELDS = 6,
+    /* Encoded lines are signed bytes: 0 is auto, 1..127 are positive
+       lines, and 128..255 are the negative lines -128..-1. Authored lines
+       beyond +/-COMPUTED_GRID_LINE_LIMIT clamp to it; layout then clamps
+       the resolved area into its own bounded track envelope. */
+    COMPUTED_GRID_LINE_LIMIT = 127,
+    COMPUTED_GRID_NEGATIVE_LINE_MIN = 128,
+    COMPUTED_GRID_LINE_LAST = 255,
+    COMPUTED_GRID_SPAN_LIMIT = 127
 };
 
 static inline unsigned computed_style_grid_column_count(
@@ -1113,67 +1143,59 @@ COMPUTED_GRID_TEMPLATE_ID_ACCESSORS(
 #undef COMPUTED_GRID_TEMPLATE_ID_ACCESSORS
 
 static inline uint8_t computed_style_grid_line_name(
-    const ComputedStyle *style, unsigned placement_shift, uint32_t named_flag)
+    const ComputedStyle *style, unsigned field, uint32_t named_flag)
 {
-    if (style == NULL || placement_shift >= 24
+    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS
         || (((uint32_t) style->grid_columns & named_flag) == 0)) return 0;
-    unsigned byte = placement_shift / 8u;
-    unsigned within = placement_shift % 8u;
-    return (uint8_t) (
-        (style->grid_placement[byte] >> within) & UINT8_C(0x0f));
+    return style->grid_placement[field];
 }
 
 static inline void computed_style_set_grid_line_name(
-    ComputedStyle *style, unsigned placement_shift,
+    ComputedStyle *style, unsigned field,
     uint32_t named_flag, uint8_t id)
 {
-    if (style == NULL || placement_shift >= 24) return;
+    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return;
     if (id == 0) {
         style->grid_columns = (int) (
             (uint32_t) style->grid_columns & ~named_flag);
         return;
     }
-    if ((style->grid_placement[2] & UINT8_C(0xf0))
+    if (style->grid_placement[COMPUTED_GRID_ROW_SPAN_FIELD]
         == COMPUTED_GRID_NAMED_AREA_MARKER) {
         memset(style->grid_placement, 0, sizeof(style->grid_placement));
     }
-    unsigned byte = placement_shift / 8u;
-    unsigned within = placement_shift % 8u;
-    uint8_t mask = (uint8_t) (UINT8_C(0x0f) << within);
-    style->grid_placement[byte] = (uint8_t) (
-        (style->grid_placement[byte] & ~mask)
-        | ((id & UINT8_C(0x0f)) << within));
+    style->grid_placement[field] = id;
     uint32_t packed = (uint32_t) style->grid_columns;
     packed |= named_flag;
     style->grid_columns = (int) packed;
 }
 
 #define COMPUTED_GRID_LINE_NAME_ACCESSORS(                                  \
-    axis, field, PLACEMENT_SHIFT, NAMED_FLAG)                                \
+    axis, field, PLACEMENT_FIELD, NAMED_FLAG)                                \
     static inline uint8_t computed_style_grid_##axis##_##field##_name(       \
         const ComputedStyle *style)                                          \
     {                                                                        \
         return computed_style_grid_line_name(                                \
-            style, PLACEMENT_SHIFT, NAMED_FLAG);                             \
+            style, PLACEMENT_FIELD, NAMED_FLAG);                             \
     }                                                                        \
     static inline void computed_style_set_grid_##axis##_##field##_name(      \
         ComputedStyle *style, uint8_t id)                                     \
     {                                                                        \
         computed_style_set_grid_line_name(                                   \
-            style, PLACEMENT_SHIFT, NAMED_FLAG, id);                         \
+            style, PLACEMENT_FIELD, NAMED_FLAG, id);                         \
     }
 
 COMPUTED_GRID_LINE_NAME_ACCESSORS(
-    row, start, COMPUTED_GRID_ROW_START_SHIFT,
+    row, start, COMPUTED_GRID_ROW_START_FIELD,
     COMPUTED_GRID_ROW_START_NAMED)
 COMPUTED_GRID_LINE_NAME_ACCESSORS(
-    row, end, COMPUTED_GRID_ROW_END_SHIFT,
+    row, end, COMPUTED_GRID_ROW_END_FIELD,
     COMPUTED_GRID_ROW_END_NAMED)
 COMPUTED_GRID_LINE_NAME_ACCESSORS(
-    column, start, COMPUTED_GRID_COLUMN_START_SHIFT,
+    column, start, COMPUTED_GRID_COLUMN_START_FIELD,
     COMPUTED_GRID_COLUMN_START_NAMED)
 COMPUTED_GRID_LINE_NAME_ACCESSORS(
-    column, end, COMPUTED_GRID_COLUMN_END_SHIFT,
+    column, end, COMPUTED_GRID_COLUMN_END_FIELD,
     COMPUTED_GRID_COLUMN_END_NAMED)
 
 #undef COMPUTED_GRID_LINE_NAME_ACCESSORS
@@ -1537,7 +1559,7 @@ static inline bool computed_style_grid_area_is_named(
     const ComputedStyle *style)
 {
     return style != NULL
-        && (style->grid_placement[2] & UINT8_C(0xf0))
+        && style->grid_placement[COMPUTED_GRID_ROW_SPAN_FIELD]
            == COMPUTED_GRID_NAMED_AREA_MARKER;
 }
 
@@ -1545,7 +1567,7 @@ static inline uint8_t computed_style_grid_named_area_id(
     const ComputedStyle *style)
 {
     return computed_style_grid_area_is_named(style)
-        ? style->grid_placement[0] : 0;
+        ? style->grid_placement[COMPUTED_GRID_COLUMN_START_FIELD] : 0;
 }
 
 static inline void computed_style_set_grid_named_area_id(
@@ -1556,16 +1578,18 @@ static inline void computed_style_set_grid_named_area_id(
     style->grid_columns = (int) (
         (uint32_t) style->grid_columns & ~COMPUTED_GRID_NAMED_LINE_MASK);
     if (id != 0) {
-        style->grid_placement[0] = id;
-        style->grid_placement[2] = COMPUTED_GRID_NAMED_AREA_MARKER;
+        style->grid_placement[COMPUTED_GRID_COLUMN_START_FIELD] = id;
+        style->grid_placement[COMPUTED_GRID_ROW_SPAN_FIELD] =
+            COMPUTED_GRID_NAMED_AREA_MARKER;
     }
 }
 
 static inline unsigned computed_style_encode_grid_line(int line)
 {
-    if (line < -6) line = -6;
-    if (line < 0) return (unsigned) (16 + line);
-    return line > 9 ? 9u : (unsigned) line;
+    if (line < -COMPUTED_GRID_LINE_LIMIT) line = -COMPUTED_GRID_LINE_LIMIT;
+    if (line < 0) return (unsigned) (256 + line);
+    return line > COMPUTED_GRID_LINE_LIMIT
+        ? (unsigned) COMPUTED_GRID_LINE_LIMIT : (unsigned) line;
 }
 
 static inline bool computed_style_grid_line_is_negative(unsigned line)
@@ -1576,81 +1600,75 @@ static inline bool computed_style_grid_line_is_negative(unsigned line)
 static inline int computed_style_decode_grid_line(unsigned line)
 {
     return computed_style_grid_line_is_negative(line)
-        ? (int) line - 16 : (int) line;
+        ? (int) line - 256 : (int) line;
+}
+
+static inline uint32_t computed_style_grid_placement_named_flag(
+    unsigned field)
+{
+    switch (field) {
+    case COMPUTED_GRID_ROW_START_FIELD: return COMPUTED_GRID_ROW_START_NAMED;
+    case COMPUTED_GRID_ROW_END_FIELD: return COMPUTED_GRID_ROW_END_NAMED;
+    case COMPUTED_GRID_COLUMN_START_FIELD:
+        return COMPUTED_GRID_COLUMN_START_NAMED;
+    case COMPUTED_GRID_COLUMN_END_FIELD:
+        return COMPUTED_GRID_COLUMN_END_NAMED;
+    default: return 0;
+    }
 }
 
 static inline uint8_t computed_style_grid_placement_value(
-    const ComputedStyle *style, unsigned shift)
+    const ComputedStyle *style, unsigned field)
 {
-    if (style == NULL || shift >= 24) return 0;
+    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return 0;
     if (computed_style_grid_area_is_named(style)) return 0;
-    uint32_t named_flag = 0;
-    if (shift == COMPUTED_GRID_ROW_START_SHIFT) {
-        named_flag = COMPUTED_GRID_ROW_START_NAMED;
-    } else if (shift == COMPUTED_GRID_ROW_END_SHIFT) {
-        named_flag = COMPUTED_GRID_ROW_END_NAMED;
-    } else if (shift == COMPUTED_GRID_COLUMN_START_SHIFT) {
-        named_flag = COMPUTED_GRID_COLUMN_START_NAMED;
-    } else if (shift == COMPUTED_GRID_COLUMN_END_SHIFT) {
-        named_flag = COMPUTED_GRID_COLUMN_END_NAMED;
-    }
-    if (((uint32_t) style->grid_columns & named_flag) != 0) return 0;
-    unsigned byte = shift / 8u;
-    unsigned within = shift % 8u;
-    return (uint8_t) ((style->grid_placement[byte] >> within) & 0x0fu);
+    if (((uint32_t) style->grid_columns
+         & computed_style_grid_placement_named_flag(field)) != 0) return 0;
+    return style->grid_placement[field];
 }
 
 static inline void computed_style_set_grid_placement_value(
-    ComputedStyle *style, unsigned shift, unsigned value)
+    ComputedStyle *style, unsigned field, unsigned value)
 {
-    if (style == NULL || shift >= 24) return;
+    if (style == NULL || field >= COMPUTED_GRID_PLACEMENT_FIELDS) return;
     if (computed_style_grid_area_is_named(style)) {
         memset(style->grid_placement, 0, sizeof(style->grid_placement));
     }
-    unsigned byte = shift / 8u;
-    unsigned within = shift % 8u;
-    uint8_t mask = (uint8_t) (0x0fu << within);
-    style->grid_placement[byte] = (uint8_t) (
-        (style->grid_placement[byte] & ~mask)
-        | ((value & 0x0fu) << within));
-    uint32_t named_flag = 0;
-    if (shift == COMPUTED_GRID_ROW_START_SHIFT) {
-        named_flag = COMPUTED_GRID_ROW_START_NAMED;
-    } else if (shift == COMPUTED_GRID_ROW_END_SHIFT) {
-        named_flag = COMPUTED_GRID_ROW_END_NAMED;
-    } else if (shift == COMPUTED_GRID_COLUMN_START_SHIFT) {
-        named_flag = COMPUTED_GRID_COLUMN_START_NAMED;
-    } else if (shift == COMPUTED_GRID_COLUMN_END_SHIFT) {
-        named_flag = COMPUTED_GRID_COLUMN_END_NAMED;
+    if ((field == COMPUTED_GRID_COLUMN_SPAN_FIELD
+         || field == COMPUTED_GRID_ROW_SPAN_FIELD)
+        && value > COMPUTED_GRID_SPAN_LIMIT) {
+        value = COMPUTED_GRID_SPAN_LIMIT;
     }
+    style->grid_placement[field] = (uint8_t) value;
     style->grid_columns = (int) (
-        (uint32_t) style->grid_columns & ~named_flag);
+        (uint32_t) style->grid_columns
+        & ~computed_style_grid_placement_named_flag(field));
 }
 
-#define COMPUTED_GRID_PLACEMENT_ACCESSORS(axis, field, shift)                 \
+#define COMPUTED_GRID_PLACEMENT_ACCESSORS(axis, field, slot)                  \
     static inline uint8_t computed_style_grid_##axis##_##field(               \
         const ComputedStyle *style)                                            \
     {                                                                          \
-        return computed_style_grid_placement_value(style, shift);              \
+        return computed_style_grid_placement_value(style, slot);               \
     }                                                                          \
     static inline void computed_style_set_grid_##axis##_##field(               \
         ComputedStyle *style, unsigned value)                                  \
     {                                                                          \
-        computed_style_set_grid_placement_value(style, shift, value);          \
+        computed_style_set_grid_placement_value(style, slot, value);           \
     }
 
 COMPUTED_GRID_PLACEMENT_ACCESSORS(
-    column, start, COMPUTED_GRID_COLUMN_START_SHIFT)
+    column, start, COMPUTED_GRID_COLUMN_START_FIELD)
 COMPUTED_GRID_PLACEMENT_ACCESSORS(
-    column, end, COMPUTED_GRID_COLUMN_END_SHIFT)
+    column, end, COMPUTED_GRID_COLUMN_END_FIELD)
 COMPUTED_GRID_PLACEMENT_ACCESSORS(
-    column, span, COMPUTED_GRID_COLUMN_SPAN_SHIFT)
+    column, span, COMPUTED_GRID_COLUMN_SPAN_FIELD)
 COMPUTED_GRID_PLACEMENT_ACCESSORS(
-    row, start, COMPUTED_GRID_ROW_START_SHIFT)
+    row, start, COMPUTED_GRID_ROW_START_FIELD)
 COMPUTED_GRID_PLACEMENT_ACCESSORS(
-    row, end, COMPUTED_GRID_ROW_END_SHIFT)
+    row, end, COMPUTED_GRID_ROW_END_FIELD)
 COMPUTED_GRID_PLACEMENT_ACCESSORS(
-    row, span, COMPUTED_GRID_ROW_SPAN_SHIFT)
+    row, span, COMPUTED_GRID_ROW_SPAN_FIELD)
 
 #undef COMPUTED_GRID_PLACEMENT_ACCESSORS
 
@@ -1755,17 +1773,63 @@ typedef struct {
     bool important;
 } StyleRule;
 
+/* A custom property declared on :root, kept for var() lookups that have
+   no element (parse-time resolution). Name and value are NUL-terminated
+   text in the stylesheet's text arena, stable until it is destroyed. */
 typedef struct {
-    char name[48];
-    char value[96];
+    const char *name;
+    const char *value;
+    uint16_t value_length;
+    uint8_t name_length;
 } StyleVariable;
+
+/* A custom property registered by @property (CSS Properties and Values
+   API 1): what var() finds where no declaration reaches an element. Name
+   and initial value are arena text; sorted by name hash. Only the
+   registration's inheritance and initial value are honoured: values are
+   not checked against its syntax. */
+typedef struct {
+    const char *name;
+    /* NULL for the guaranteed-invalid initial value (syntax "*" without
+       one). */
+    const char *initial_value;
+    uint32_t hash;
+    uint16_t initial_length;
+    uint8_t name_length;
+    /* False: an element sees only its own declarations, never an
+       ancestor's. */
+    bool inherits;
+} StyleRegisteredProperty;
+
+/* Registrations kept per sheet; later ones are ignored (Tailwind v4
+   registers about a hundred). */
+#define STYLE_REGISTERED_PROPERTY_LIMIT 256u
 
 /* Text limits of a StyleCustomRule, each including the terminating NUL. A
    longer selector, name or value is dropped (diagnostic_custom_property_
-   drops), exactly as when these were the sizes of inline buffers. */
+   drops). Values live in the stylesheet's text arena, so the value limit
+   costs nothing per rule: it bounds one declaration. Tailwind v4 composes
+   gradient stops and shadow stacks of 100 to 250 bytes; the longest
+   custom-property values in the site census are a 672-byte transition
+   list and data: URL icons up to 2.2 KiB (which no property parser could
+   take in anyway). */
 #define STYLE_CUSTOM_SELECTOR_CAPACITY 192u
 #define STYLE_CUSTOM_NAME_CAPACITY 48u
-#define STYLE_CUSTOM_VALUE_CAPACITY 96u
+#define STYLE_CUSTOM_VALUE_CAPACITY 1024u
+/* Custom-property values at least this long are "long": together they may
+   take at most STYLE_CUSTOM_LONG_VALUE_BYTES of one sheet's arena (the
+   census maximum is about 14 KiB per page), and a long declaration past
+   that total is dropped like an oversized one. */
+#define STYLE_CUSTOM_SHORT_VALUE_CAPACITY 96u
+/* The value limit of a retained standard property (fill, cursor, the
+   retained box shorthands, ...): only custom properties compose long
+   values. A longer declaration is dropped. */
+#define STYLE_RETAINED_VALUE_CAPACITY 96u
+#define STYLE_CUSTOM_LONG_VALUE_BYTES (64u * 1024u)
+/* The longest resolved custom-property value one var() substitutes, which
+   is also the largest buffer a property parser resolves into. A declared
+   value may be longer when its own var() references shorten it. */
+#define STYLE_CUSTOM_RESOLVED_CAPACITY 512u
 
 typedef struct {
     /* NUL-terminated text in the stylesheet's selector arena, stable until
@@ -1781,12 +1845,12 @@ typedef struct {
     /* Offset of an allocation-free rightmost tag/class/id rejection key.
        UINT8_MAX means no safe key. */
     uint8_t fast_key_offset;
-    /* Lengths of name, selector, fast key and value, so the per-node winner
-       scan over these rules needs no strlen or identifier re-scan. */
+    /* Lengths of name, selector and fast key, so the per-node winner scan
+       over these rules needs no strlen or identifier re-scan. The value is
+       read only by the winner, as NUL-terminated text. */
     uint8_t name_length;
     uint8_t selector_length;
     uint8_t fast_key_length;
-    uint8_t value_length;
     unsigned origin;
     unsigned layer;
     unsigned specificity;
@@ -1914,10 +1978,21 @@ typedef struct {
     /* Geometry/query inputs change independently of authored CSS and DOM
        generations, including native layout rebuilds within one JS task. */
     uint64_t container_state_generation;
+    /* Container queries consulted (any nonzero query id), monotonic: a
+       resolution that moves it depends on container geometry. Outside the
+       resolve scratch, which nested resolutions save and restore. */
+    uint32_t container_consults;
+    /* The container geometry was measured by a complete (not preview)
+       layout: the next complete layout of the same document normally
+       measures the same, so it probes without the evaluation log. */
+    bool container_state_complete;
     /* CSP style-src applies independently to style attributes and <style>
        blocks. This bit survives transactional sheet moves without retaining
        a pointer into a movable PocDocument. */
     bool block_inline_style_attributes;
+    /* Copied from PocDocument.noscript_rendered: the HTML UA rule
+       "noscript { display: none }" applies only when scripting is enabled. */
+    bool noscript_rendered;
     StyleRule *rules;
     size_t count;
     size_t capacity;
@@ -2011,6 +2086,14 @@ typedef struct {
     StyleCustomRule *custom_rules;
     size_t custom_rule_count;
     size_t custom_rule_capacity;
+    /* Arena bytes of custom-property values (custom rules, :root
+       variables and registered initial values) at least
+       STYLE_CUSTOM_SHORT_VALUE_CAPACITY long, bounded by
+       STYLE_CUSTOM_LONG_VALUE_BYTES. */
+    size_t custom_value_long_bytes;
+    StyleRegisteredProperty *registered_properties;
+    size_t registered_property_count;
+    size_t registered_property_capacity;
     StyleTransitionRule *transition_rules;
     size_t transition_rule_count;
     size_t transition_rule_capacity;
@@ -2088,9 +2171,19 @@ typedef struct {
        compound and its ancestor chain. False positives fall through to the
        exact selector program; false negatives are forbidden. */
     StyleRuleFilter *rule_filters;
+    /* Exact ancestor tokens of universal-range rules (with rule_filters),
+       or NULL. */
+    struct StyleRuleAncestorTokens *rule_ancestor_tokens;
     size_t rule_index_bucket_count;
     size_t rule_index_universal_count;
+    /* Rules without a stored fast key indexed under the key their matcher
+       requires anyway (escaped or long utility classes and IDs). */
+    size_t rule_index_derived_keys;
     uint32_t rule_index_universal_ends[3];
+    /* Ends of the unscoped head of each universal range (see
+       StyleRuleIndexBucket.unscoped), and whether any rule is scoped. */
+    uint32_t rule_index_universal_unscoped_ends[3];
+    bool rule_index_scoped_split;
     size_t rule_index_bytes;
     StyleSelectorInstruction *selector_program;
     uint16_t *selector_program_offsets;
@@ -2266,6 +2359,40 @@ typedef struct {
     unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
     uint8_t style_source_count;
     bool style_sources_bounded_out;
+    /* The adopted (constructed) sheets ingested after the document's own
+       sources (document_adopted_sheets_active), always the tail of
+       style_source_nodes: how many, and the document_adopted_tier_hash fold
+       of each with the text revision it was parsed at. */
+    uint8_t adopted_source_count;
+    uint64_t adopted_sources_signature;
+    /* Where those sources' rules apply (stylesheet_set_adopted_scopes);
+       bit i is the i-th adopted source. One the document adopts applies to
+       every element, as Tilefinch's cascade is document-wide. One that only
+       shadow roots adopt applies only to elements inside an adopting root's
+       carrier, as shadow encapsulation confines it in browsers: a
+       component's sheet does not restyle the rest of the page. */
+    uint64_t adopted_shadow_only_mask;
+    /* Allocation-free document scope/order survives root-table refusal. */
+    uint64_t adopted_document_mask;
+    uint8_t adopted_document_order[64];
+    struct StyleAdoptedScopeRoot *adopted_scope_roots;
+    uint8_t adopted_scope_root_count;
+    /* A refused scope update must never turn confined rules global. */
+    bool adopted_scopes_failed;
+    bool adopted_order_varies;
+    /* Set while a shadow tree's <style> or a constructed sheet is parsed:
+       :host and ::slotted() selectors are kept (rewritten to the matcher's
+       :host form) only there; a document sheet's never match. */
+    bool parsing_scoped_source;
+    /* Cascade-order ranges of the <style> elements inside shadow-root
+       carriers, ascending: their rules apply only within that shadow tree
+       (and to its host through :host, its assigned light children through
+       ::slotted), as shadow encapsulation confines them. Allocated only on
+       pages with such styles; bounded by STYLE_SHADOW_SCOPE_LIMIT, past
+       which a style keeps the old document-wide cascade. */
+    struct StyleShadowScope *shadow_scopes;
+    uint16_t shadow_scope_count;
+    uint16_t shadow_scope_capacity;
 } Stylesheet;
 
 bool stylesheet_build(Stylesheet *sheet, Budget *budget,
@@ -2371,6 +2498,31 @@ typedef bool (*StylesheetSourceAppender)(Stylesheet *sheet, void *opaque);
 bool stylesheet_append_sources_tracked(
     Stylesheet *sheet, StylesheetSourceAppender append, void *opaque,
     size_t after_source, StylesheetAppendResult *result);
+/* Parses one adopted constructed sheet (a detached <style> the document's
+   adoption registry knows) at the current cascade position, exempt from
+   the page's style-src policy as constructed sheets are, and records it as
+   the next adopted source at `revision`. Each adopted sheet is parsed once
+   per build however many roots adopt it, and a rebuild replays the parsed
+   form the document cached for that revision instead of reparsing. */
+bool stylesheet_add_adopted_sheet(Stylesheet *sheet,
+                                  const PocDocument *document,
+                                  lxb_dom_node_t *node, uint32_t revision);
+/* Recomputes where the adopted sources' rules apply from the document's
+   adoption lists, without reparsing. The roots whose scope changed are
+   written to `changed` (up to `capacity`, the count to `changed_count`;
+   either may be NULL); `global` reports a change that can reach any
+   element (a source gaining or losing document scope) or an overflowed
+   `changed`. False on allocation failure: the scopes are then empty and
+   every adopted rule applies everywhere, as before scoping. */
+bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
+                                   const PocDocument *document,
+                                   const lxb_dom_node_t **changed,
+                                   size_t capacity, size_t *changed_count,
+                                   bool *global);
+/* Parses the document's whole active adopted tier (inline-only builds; the
+   external-resource pipeline admits each sheet itself). */
+bool stylesheet_add_adopted_sheets(Stylesheet *sheet,
+                                   const PocDocument *document);
 /* Records a <style> or stylesheet <link> element as the source of the rules
    parsed next (see Stylesheet.style_source_nodes). */
 void stylesheet_note_style_source(Stylesheet *sheet,
@@ -2592,6 +2744,14 @@ ComputedStyle style_for_pseudo(const Stylesheet *sheet, lxb_dom_node_t *node,
 bool style_custom_property_value(
     const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
     const char *name, size_t name_length, char *output, size_t output_size);
+/* Substitutes the var() references in `text` as a declaration of the same
+   value on this element would (nested references and fallbacks included).
+   False when a reference is invalid or the result does not fit
+   `output_size`; the result is never truncated. SVG presentation
+   attributes are CSS values resolved through this. */
+bool style_resolve_value_on_node(
+    const Stylesheet *sheet, lxb_dom_node_t *node, const char *text,
+    size_t length, char *output, size_t output_size);
 /* Resolves a retained presentation declaration on exactly this element.
    Tilefinch keeps the small SVG paint subset outside ComputedStyle so pages
    without inline SVG pay no per-node memory cost. Presentation attributes
@@ -2613,7 +2773,7 @@ bool style_transition_computed(
 bool style_retained_property_value(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *name, size_t name_length, char *output, size_t output_size);
-#define STYLE_RETAINED_BOX_VALUE_CAPACITY 96u
+#define STYLE_RETAINED_BOX_VALUE_CAPACITY STYLE_RETAINED_VALUE_CAPACITY
 typedef struct {
     uint8_t present_mask;
     char values[4][STYLE_RETAINED_BOX_VALUE_CAPACITY];
@@ -2636,7 +2796,7 @@ bool style_retained_pair_values(
     const char *shorthand, const char *first_longhand,
     const char *second_longhand, StyleRetainedPairValues *output);
 #define STYLE_RETAINED_PRESENTATION_COUNT 12u
-#define STYLE_RETAINED_PRESENTATION_VALUE_CAPACITY 96u
+#define STYLE_RETAINED_PRESENTATION_VALUE_CAPACITY STYLE_RETAINED_VALUE_CAPACITY
 typedef struct {
     uint16_t present_mask;
     char values[STYLE_RETAINED_PRESENTATION_COUNT]
@@ -2665,6 +2825,31 @@ uint64_t style_container_layout_state_signature(const Stylesheet *sheet);
 /* The last layout collected container geometry: the page has container
    queries or container-relative units, possibly only in style attributes. */
 bool style_container_layout_state_present(const Stylesheet *sheet);
+/* One-pass container queries. A probe layout records each container's
+   content box as soon as layout knows it (before its descendants are
+   styled), and logs every container-query evaluation it makes. If every
+   logged result still holds against the geometry the pass measured, the
+   pass is what a rebuild from that geometry would produce, and the rebuild
+   is skipped. Evaluations made before a container's box was known, or
+   from a measurement size, simply fail the check (the rebuild runs, as
+   before). Container-relative units are not logged: such sheets keep the
+   probe-and-rebuild. */
+/* `owner` identifies the pass: another layout of the same sheet cannot
+   take over (or end) a log that is running. */
+bool style_container_log_begin(Stylesheet *sheet, Budget *budget,
+                               const void *owner);
+void style_container_log_end(Stylesheet *sheet, const void *owner);
+/* Every logged evaluation agrees with the current geometry, none was
+   dropped, and the log ran. Call after the measured geometry is collected. */
+bool style_container_log_verified(const Stylesheet *sheet);
+void style_container_log_release(Stylesheet *sheet);
+bool style_container_log_active(const Stylesheet *sheet);
+/* Record the content box of `node` if it establishes a size container.
+   content_height < 0: unknown (a size container keeps its prior height). */
+void style_container_live_update(Stylesheet *sheet, lxb_dom_node_t *node,
+                                 int content_width, int content_height);
+/* Monotonic count of container-query consultations (dependency probe). */
+uint32_t style_container_consults(const Stylesheet *sheet);
 bool computed_style_has_text_underline(const ComputedStyle *style);
 bool computed_style_has_ancestor_text_underline(const ComputedStyle *style);
 /* Returns false for the computed `auto` value, otherwise writes the bounded
@@ -2677,9 +2862,13 @@ bool computed_style_effective_text_underline_offset(
     const ComputedStyle *style, int *pixels);
 bool style_selector_matches(lxb_dom_node_t *node, const char *selector,
                             size_t selector_length);
-/* Conservative lexical dependency cache; checks live head/html subjects. */
+/* Whether a :has() of the sheet can be anchored at the head or <html>, so a
+   change inside the head could restyle rendered content (the :has() plan
+   against the live head and <html>; true when the plan is bounded). With
+   the changed `node` (connected, inside the head), only the :has()
+   arguments that can see it count; NULL considers every :has(). */
 bool stylesheet_head_scripts_affect_ancestors(
-    const Stylesheet *sheet, lxb_dom_node_t *head);
+    const Stylesheet *sheet, lxb_dom_node_t *head, lxb_dom_node_t *node);
 bool style_selector_matches_scoped(lxb_dom_node_t *node,
                                    const char *selector,
                                    size_t selector_length,
@@ -2748,9 +2937,12 @@ void stylesheet_declaration_values(const Stylesheet *sheet,
                                    const StyleDeclaration *declaration,
                                    ComputedStyle *values);
 /* Indices of the rules whose declarations can give an element an RTL
-   direction or a bidi override (var()-deferred ones conservatively). False
-   when more than `capacity` exist. */
+   direction or a bidi override (var()-deferred ones conservatively). With
+   rtl_markup_absent (no element has dir="rtl"), rules whose selector
+   requires [dir=rtl] outside a functional pseudo-class are left out: they
+   cannot match. False when more than `capacity` exist. */
 bool stylesheet_direction_change_rules(const Stylesheet *sheet,
+                                       bool rtl_markup_absent,
                                        size_t *indices, size_t capacity,
                                        size_t *count);
 bool stylesheet_rule_index_matches(const Stylesheet *sheet, size_t index,

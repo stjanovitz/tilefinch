@@ -132,6 +132,10 @@ per-visit URLs or unbounded media cannot be represented by the retained trace.
 Suffix matching is applied identically to Tilefinch and the reference browser,
 and every denied request appears in a separate evidence channel.
 
+An entry may also be `host/path-prefix` (for example
+`developer.mozilla.org/pong/`), which excludes one first-party route, such as
+an ad placement, and keeps the rest of the origin in the ledger.
+
 This is not a general permission to improve a screenshot by removing content.
 An exclusion is acceptable only when:
 
@@ -205,3 +209,101 @@ A fidelity score covers visual structure only, within these limits:
 Timing, interactivity, and layout-cost evidence gathered alongside fidelity
 work, such as the long-article layout cost and the live input runs, is
 recorded in the [performance ledger](engineering/PERFORMANCE_LEDGER.md).
+
+## MDN and Guardian references
+
+`mdn` (developer.mozilla.org, `Array.prototype.map()`) and `guardian-home`
+(theguardian.com/international) started from their October 2026 site-census
+traces (`fidelity/captures/mdn-r1` and `guardian-home-r1`, copied unmodified;
+the census trace format is the fidelity capture format). Neither closed
+Chrome's ledger: Chrome loads resources the engine never requests, namely the
+WOFF2 web fonts (Tilefinch takes the WOFF/TTF alternatives), MDN's
+browser-icon SVGs and two lazily imported chunks, and the Guardian's card
+images. A fresh engine capture would not contain them either.
+
+With explicit approval of exactly those routes, they were acquired live once
+with `benchmarks/acquire-trace-plan.py` (honest UA, no cookies or
+credentials, every response 200): 21 GETs from `developer.mozilla.org` and
+31 from `assets.guim.co.uk` and `i.guim.co.uk` (13 font files and 18 card
+images), giving `mdn-r2` and `guardian-home-r2`. Both references are
+eligible with closed ledgers. Two tool fixes were needed on the way: the
+acquisition tool now expects the v13 record the recorder writes (cookie
+provenance fields, `set-cookies-truncated`, the `@cache=` request shape), and
+it accepts a trace's `NNNN.request` request-body sidecars when they match
+their record's length and hash. A source-level test pins the tool's
+expected version to the one `src/fetch/trace_capture.inc` writes.
+
+MDN's exclusions:
+
+- `mdnplay.dev` serves the code runner from a per-visit UUID origin, and
+  `incoming.telemetry.mozilla.org` only receives beacons. Both are symmetric
+  origin exclusions.
+- `developer.mozilla.org/pong/` is excluded as a route. MDN's ad placement
+  POSTs to the first-party `/pong/get`. The engine's census capture sent it
+  and retained the response, while the reference's read-only policy denies
+  every POST before the network, so the two renderers could never see the
+  same ad slot, and the denial kept the reference ineligible. Excluding the
+  route is the same decision as the telemetry host: it is an ad endpoint, not
+  page content, and the rest of the origin stays in the ledger. A
+  `blocked_origins` entry may therefore be `host/path-prefix`; both
+  renderers apply the same rule (`--block-origin` in the engine,
+  `blockedUrlMatches` in `capture-reference.js`), and denied requests stay
+  in the blocked evidence channel.
+
+MDN also sets `html { scroll-behavior: smooth }`, which left the
+paused-clock reference mid-animation at the `bottom` checkpoint. Checkpoint
+scrolls in `capture-reference.js` now use `behavior: "instant"`: checkpoints
+are positions, and the engine never animates a scroll. The Guardian frames
+are byte-identical with and without that change.
+
+## Floor history
+
+Floors move up only with the change that earned them. The values live in
+`tests/fidelity-baselines.tsv`; this log records which rows moved and why
+the frame is more faithful.
+
+- **2026-10, MDN and Guardian rows added.** First floors, set from main
+  32de7330's renders against the new eligible references. The renders are
+  deterministic: two scoreboard runs were identical. Visible differences that
+  remain:
+  - MDN `selector-1`: the interactive example. Chrome draws the code in a
+    proportional face under a visible "JavaScript Demo" title; Tilefinch
+    draws it monospaced, with the title clipped under the sticky header.
+  - MDN `top`: the "Widely available" badge, which wraps to two lines in
+    Chrome and stays on one in Tilefinch.
+  - Guardian `selector-2`: the lead story's photo, which Chrome draws and
+    Tilefinch leaves as a grey placeholder because its own srcset choice is
+    not in the trace.
+  - Guardian `top`: the card backgrounds' tints.
+
+  No existing row moved.
+
+- **2026-10, MDN/Guardian parity (inline backgrounds).** `reddit top`
+  (SSIM about 0.569 to 0.585, edge F1 0.856 to 0.864) and
+  `wikipedia-homepage selector-1` (SSIM 0.843 to 0.847, edge F1 0.947 to
+  0.954) rose. Non-replaced inline boxes now paint their background over
+  the content area and padding of each line fragment (they painted only
+  borders before); inline boxes with backgrounds in both frames, such as
+  old.reddit's flair labels, had drawn without theirs.
+  The other rows did not move.
+- **2026-10, weather.gov parity (float sizing, clearfix, float scoping, UA
+  list defaults).** Both `reddit` rows rose: top SSIM by about 0.04 and
+  MS-SSIM by about 0.06, bottom edge F1 by about 0.15. old.reddit's listing
+  rows float their thumbnails and vote arrows inside clearfix and overflow
+  containers. With block-level `::after { clear: both }` honoured,
+  formatting context roots no longer inheriting the enclosing context's
+  floats, and floats that have already ended no longer evicting the
+  bounded active-float slots, the thumbnails render beside their titles and
+  the rows and footer land where the reference has them. The wikipedia,
+  wikipedia-homepage and hackernews rows did not move.
+- **2026-10, weather.gov parity (inline vertical alignment, line-height
+  inheritance, form controls).** `wikipedia top` and `selector-1`,
+  `wikipedia-homepage top` and `selector-2`, and both `reddit` rows rose
+  (wikipedia `selector-1` SSIM from about 0.79 to 0.99, homepage `top`
+  from about 0.67 to 0.80). Atomic inline boxes now sit on the line
+  baseline with the block's strut instead of hanging from the line top,
+  and a unitless line-height inherits as the number: Minerva's 13px
+  hatnote and tab labels get Chrome's 21px and 19px lines instead of the
+  parent's 26px and 22px, so the article lead, the infobox and the main
+  page's welcome box land within a pixel or two of the reference. The
+  hackernews rows and both `bottom` rows did not move.

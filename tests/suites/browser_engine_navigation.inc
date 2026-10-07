@@ -284,6 +284,88 @@ static int test_provisional_preview_retries_and_refreshes(void)
     return 0;
 }
 
+/* A first screen that lays out to nothing visible (one tall fill), then a
+   200 KiB inline data block that adds no element: re-laying the same
+   prefix out on every parser feed shows the same nothing. On the PSP that
+   was hundreds of layouts of a large document (each from the top, plus the
+   stylesheet fingerprint) and the navigation watchdog expired. Further
+   attempts wait for new rendering elements or a doubled body. */
+static int test_provisional_preview_empty_backoff(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 1u * MIB;
+    config.tile_capacity = 4;
+    config.resources.enabled = true;
+    config.javascript.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ProvisionalPresentProbe present_probe = {0};
+    TilefinchPlatformServices present_services = {
+        .context = &present_probe,
+        .present_rgb565 = capture_provisional_present
+    };
+    tilefinch_platform_set_services(&present_services);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    navigation_set_stream_delivery(navigation, 2048, 0, 0, 0, 0, 0);
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = {
+                .maximum_body_bytes = 2048,
+                .maximum_body_callbacks = 1,
+                .maximum_time_us = 10000
+            },
+            .maximum_parser_body_bytes = 2048,
+            .maximum_parser_time_us = 10000,
+            .maximum_finalize_work_units = 8,
+            .maximum_finalize_time_us = 1000
+        }
+    };
+    CHECK(fetch_trace_replay_begin(
+              TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-empty-backoff",
+              error, sizeof(error))
+          && browser_engine_begin_navigation_url(
+                 engine, "https://preview-empty-backoff.test/document",
+                 512u * 1024u, 1000, true));
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0;
+         pumps < 4096 && status == BROWSER_NAVIGATION_JOB_PENDING;
+         pumps++) {
+        status = browser_engine_pump_navigation(engine, &quota);
+    }
+    size_t attempts = navigation->performance.streaming_preview_attempts;
+    size_t empty = navigation->performance.streaming_preview_empty_raster_skips;
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || empty == 0
+        || attempts > 8) {
+        fprintf(stderr,
+                "preview-empty-backoff status=%d attempts=%zu empty=%zu "
+                "error=\"%s\"\n", (int) status, attempts, empty,
+                browser_engine_last_error(engine));
+    }
+    /* About one attempt per doubling of the body (8 KiB .. 216 KiB), not
+       four per 16 KiB (more than fifty before the backoff). */
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && empty >= 1 && attempts <= 8
+          && strcmp(navigation->page.document.title,
+                    "Empty first screen") == 0
+          && navigation->page.layout.count != 0);
+    fetch_trace_end();
+    tilefinch_platform_set_services(NULL);
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+          && metrics.budget_current == 0
+          && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 /* A large script-free page commits with only its top screens laid out
    (no whole-document layout or image walk before commit); page idle work
    then completes the layout, identical to a synchronous build. */

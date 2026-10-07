@@ -176,6 +176,30 @@ typedef enum {
     BROWSER_READER_FONT_SERIF
 } BrowserReaderFont;
 
+/* What Tilefinch does by itself when page scripts stop or fail and leave the
+   page blank or without a usable action (docs/BASIC_VIEW.md). Zero is the
+   default, so a profile without the field keeps the automatic switch. */
+typedef enum {
+    BROWSER_BASIC_FALLBACK_AUTOMATIC = 0,
+    BROWSER_BASIC_FALLBACK_ASK,
+    BROWSER_BASIC_FALLBACK_OFF,
+    BROWSER_BASIC_FALLBACK_MODE_COUNT
+} BrowserBasicFallbackMode;
+
+/* What Tilefinch does when a page needs a lot of script to start (the
+   heavy-page classes in include/tilefinch/script_admission.h): ask before
+   an app shell's big scripts run, run them, or show Basic view instead.
+   Zero is the default. */
+typedef enum {
+    BROWSER_HEAVY_PAGES_ASK = 0,
+    BROWSER_HEAVY_PAGES_RUN,
+    BROWSER_HEAVY_PAGES_BASIC,
+    BROWSER_HEAVY_PAGES_MODE_COUNT
+} BrowserHeavyPagesMode;
+
+/* Sites whose heavy app the user chose to always run. */
+#define BROWSER_PROFILE_HEAVY_SITE_LIMIT 16u
+
 typedef enum {
     BROWSER_UPDATE_CHANNEL_STABLE = 0,
     BROWSER_UPDATE_CHANNEL_BETA,
@@ -240,6 +264,9 @@ bool browser_profile_tls_session_persistence(
    preference is enabled. Fatal startup failures retain a one-shot fallback. */
 bool browser_profile_save_diagnostic_reports(
     const BrowserProfile *profile);
+/* Settings > Device & storage > Site data & storage > Keep compiled
+   scripts: the persistent compiled-script tier. Off by default. */
+bool browser_profile_keep_compiled_scripts(const BrowserProfile *profile);
 /* Global page policy. Both default to enabled for legacy profiles. */
 bool browser_profile_javascript_enabled(const BrowserProfile *profile);
 /* The site preference is independent of the global switch. The effective
@@ -325,12 +352,26 @@ bool browser_profile_remember_reader_site_scale(
 /* Opt-in content-shape Reader detection. Disabled by default so ordinary
    navigations neither scan nor transform the page unless the user asks. */
 bool browser_profile_reader_auto_mode(const BrowserProfile *profile);
+BrowserHeavyPagesMode browser_profile_heavy_pages_mode(
+    const BrowserProfile *profile);
+/* Whether the user chose to always run this URL's site's heavy app. */
+bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
+                                        const char *url);
+BrowserBasicFallbackMode browser_profile_basic_fallback_mode(
+    const BrowserProfile *profile);
 bool browser_profile_update_check_enabled(const BrowserProfile *profile);
 BrowserUpdateChannel browser_profile_update_channel(
     const BrowserProfile *profile);
 BrowserGlyphLanguage browser_profile_glyph_language(
     const BrowserProfile *profile);
 bool browser_profile_color_emoji(const BrowserProfile *profile);
+/* Language packs (TilefinchGlyphPack bits) the user answered "Don't ask
+   again" for on the in-page install offer. The menu still installs them. */
+uint16_t browser_profile_glyph_offer_declined_mask(
+    const BrowserProfile *profile);
+/* Settings > Appearance > Language & emoji > Offer language packs: Ask
+   (default) or Off. */
+bool browser_profile_glyph_offers_enabled(const BrowserProfile *profile);
 /* Ambient motion on the start surface. Default on. */
 bool browser_profile_wave_background(const BrowserProfile *profile);
 uint64_t browser_profile_update_check_last_unix(
@@ -373,6 +414,8 @@ void browser_profile_set_tls_session_persistence(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_save_diagnostic_reports(
     BrowserProfile *profile, bool enabled);
+void browser_profile_set_keep_compiled_scripts(BrowserProfile *profile,
+                                               bool enabled);
 void browser_profile_set_javascript_enabled(
     BrowserProfile *profile, bool enabled);
 bool browser_profile_set_site_javascript_enabled(
@@ -438,6 +481,14 @@ void browser_profile_set_reader_font(
     BrowserProfile *profile, BrowserReaderFont font);
 void browser_profile_set_remember_reader_site_scale(
     BrowserProfile *profile, bool enabled);
+bool browser_profile_set_basic_fallback_mode(
+    BrowserProfile *profile, BrowserBasicFallbackMode mode);
+bool browser_profile_set_heavy_pages_mode(
+    BrowserProfile *profile, BrowserHeavyPagesMode mode);
+/* Remembers (or forgets) "always run" for this URL's site. False when the
+   list is full or the URL has no site. */
+bool browser_profile_set_heavy_site_allowed(
+    BrowserProfile *profile, const char *url, bool allowed);
 void browser_profile_set_reader_auto_mode(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_wave_background(
@@ -450,6 +501,10 @@ void browser_profile_set_glyph_language(
     BrowserProfile *profile, BrowserGlyphLanguage language);
 void browser_profile_set_color_emoji(
     BrowserProfile *profile, bool enabled);
+void browser_profile_set_glyph_offers_enabled(
+    BrowserProfile *profile, bool enabled);
+void browser_profile_set_glyph_offer_declined_mask(
+    BrowserProfile *profile, uint16_t mask);
 void browser_profile_set_update_check_last_unix(
     BrowserProfile *profile, uint64_t unix_seconds);
 void browser_profile_set_update_check_available_sequence(

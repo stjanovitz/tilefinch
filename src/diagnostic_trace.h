@@ -4,9 +4,80 @@
 #ifndef TILEFINCH_DIAGNOSTIC_TRACE_H
 #define TILEFINCH_DIAGNOSTIC_TRACE_H
 #include <stdbool.h>
-#ifndef TILEFINCH_NO_TRACE
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 #include <stdlib.h>
 #endif
+
+/* Lab-only engine knobs read from the environment (A/B switches, GC and
+   stack overrides, kill switches). A shipping PSP build (tracing off, no
+   validation log) can never have them set: the only variables it setenv()s
+   are TILEFINCH_JS_{BOOT_WINDOW_KB,GC_GROWTH_PCT,LAZY_FUNCTIONS,ARRAY_CAP_KB}
+   (psp_apply_engine_env_knobs) and newlib's TZ, and the PSP starts with an
+   empty environment. Such a build reads every lab knob as unset; the knobs
+   it does set must keep using getenv() directly. */
+#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define TILEFINCH_LAB_ENVIRONMENT 0
+#else
+#define TILEFINCH_LAB_ENVIRONMENT 1
+#endif
+
+static inline const char *tilefinch_lab_getenv(const char *name)
+{
+#if !TILEFINCH_LAB_ENVIRONMENT
+    (void) name;
+    return NULL;
+#else
+    return getenv(name);
+#endif
+}
+
+/* Site-census ledger (tools/site-census): one stdout line per page script
+   compile and top-level execution, uncaught exception, promise rejection
+   created without a handler, and CSP refusal. Lab instrumentation only. */
+static inline bool tilefinch_trace_census(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_CENSUS") != NULL;
+    return enabled != 0;
+#endif
+}
+
+/* Factory-cache measurement (tools/site-census/factory_cache.py): stdout
+   lines per lazy webpack bundle (its digest, preflight and registration
+   cost) and per factory compile and first call (bytes, compile time,
+   serialized bytecode size). Serializes every compiled factory, so it is a
+   separate pass from timing runs. Lab instrumentation only. */
+static inline bool tilefinch_trace_factory_cache(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_FACTORY_CACHE") != NULL;
+    return enabled != 0;
+#endif
+}
+
+/* Path of a lab-only script evaluated in each top-level page realm after
+   the bootstrap and before author code (tools/site-census/api-probe.js). */
+static inline const char *tilefinch_lab_init_script_path(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return NULL;
+#else
+    static const char *value;
+    static bool sampled;
+    if (!sampled) {
+        value = getenv("TILEFINCH_LAB_INIT_SCRIPT");
+        if (value != NULL && value[0] == '\0') value = NULL;
+        sampled = true;
+    }
+    return value;
+#endif
+}
 
 static inline bool tilefinch_dump_js_memory(void)
 {
@@ -37,17 +108,6 @@ static inline bool tilefinch_dump_js_profile(void)
 #else
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("TILEFINCH_DUMP_JS_PROFILE") != NULL;
-    return enabled != 0;
-#endif
-}
-
-static inline bool tilefinch_trace_base64(void)
-{
-#ifdef TILEFINCH_NO_TRACE
-    return false;
-#else
-    static int enabled = -1;
-    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_BASE64") != NULL;
     return enabled != 0;
 #endif
 }
@@ -169,6 +229,19 @@ static inline bool tilefinch_trace_runtime_steps(void)
 #else
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_RUNTIME_STEPS") != NULL;
+    return enabled != 0;
+#endif
+}
+
+/* One stderr line per JS collection: cause, heap before and after, limit,
+   the threshold in force, and its duration (lab GC pacing analysis). */
+static inline bool tilefinch_trace_gc(void)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return false;
+#else
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("TILEFINCH_TRACE_GC") != NULL;
     return enabled != 0;
 #endif
 }

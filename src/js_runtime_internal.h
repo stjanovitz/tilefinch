@@ -9,6 +9,10 @@
 #include "tilefinch_test_faults.h"
 
 #include "tilefinch/js_runtime.h"
+#ifndef __PSP__
+/* Numeric ownership observation for host tests, never a page hook. */
+bool js_rt_audio_slot_test_snapshot(ScriptRuntime *runtime, unsigned counts[5]);
+#endif
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/game_audio.h"
@@ -17,6 +21,9 @@
 #include "tilefinch/style.h"
 #include "tilefinch/url.h"
 #include "style_cache_internal.h"
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+#include "validation_cpu_internal.h"
+#endif
 
 #include <quickjs.h>
 #include <lexbor/dom/interface.h>
@@ -33,7 +40,9 @@ void JS_SetPropertyFaultTraceLimit(JSRuntime *runtime, uint32_t limit);
    non-preemptible compile unit. */
 #define SCRIPT_BOOTSTRAP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (275u * 1024u)
 #define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (256u * 1024u)
-#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (512u * 1024u)
+/* The realistic profile's compile unit is the source ceiling; memory, not
+   size, decides admission (script_admission.h). */
+#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (4u * 1024u * 1024u)
 
 typedef struct {
     const unsigned char *data;
@@ -104,23 +113,38 @@ JSValue js_dom_parse_color(JSContext *context,
    bounds only its temporary handoff into the fresh realm. */
 #define SCRIPT_WORKER_REALM_INITIALIZER_MAX_BYTES (32u * 1024u)
 #define SCRIPT_LAZY_RESIDENT_BUNDLE_LIMIT 64u
-#define SCRIPT_LAZY_COMPILE_HEAP_MULTIPLIER 4u
-#define SCRIPT_LAZY_COMPILE_FIXED_HEAP_BYTES (256u * 1024u)
-#define SCRIPT_LAZY_COMPILE_EXECUTION_RESERVE_BYTES (256u * 1024u)
-#define SCRIPT_LAZY_COMPILE_PAGE_RESERVE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_TASK_LIMIT 64u
 #define SCRIPT_DYNAMIC_NODE_LIMIT 256u
+/* The script-clone census (clones of started scripts and their
+   suppressed insertions) is a host-lab diagnostic; the shipping PSP build
+   compiles it out. */
+#if defined(__PSP__)
+#define TILEFINCH_SCRIPT_CLONE_CENSUS 0
+#else
+#define TILEFINCH_SCRIPT_CLONE_CENSUS 1
+#endif
 #define SCRIPT_DYNAMIC_DEFAULT_FILE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_DEFAULT_TOTAL_BYTES (2u * 1024u * 1024u)
 /* Concurrent async chunk fetches (bounded by the 8-entry async bridge)
    plus a synchronous module-loader fetch must all hold slots at once on
    script-heavy SPAs. */
 #define SCRIPT_RUNTIME_FETCH_CONCURRENCY 12u
+/* Dynamic script requests in flight at once (the network pump stops
+   starting queued scripts at this many pending requests). The realm's
+   fetch scheduler bounds the sum of their response bounds at this many
+   times the realm's source total, so one stalled response never holds the
+   bound the others need (m.vk.ru: a tracker host that answered nothing for
+   over 5 s used to serialize every later dynamic script behind it). */
+#define SCRIPT_DYNAMIC_INFLIGHT_REQUESTS 4u
+/* The share of that pool fetch() responses may hold at once. */
+#define SCRIPT_RUNTIME_FETCH_POOL_BYTES (2u * 1024u * 1024u)
+/* The smallest response bound worth starting under memory pressure (the
+   page Budget keeps the presentation reserve beside a larger one:
+   script_admission_affordable_bytes). */
+#define SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES (64u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
-#define SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES (512u * 1024u)
-#define SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES (128u * 1024u)
 #define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 12u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
@@ -145,8 +169,20 @@ typedef struct {
     size_t slice_work_units;
 } Watchdog;
 
+/* The base table size every runtime allocates at creation; a policy may let
+   it grow to DOM_BRIDGE_NODE_LIMIT_MAX (see DomBridge.node_capacity). */
 #define DOM_BRIDGE_NODE_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY
-#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 64u
+#define DOM_BRIDGE_NODE_LIMIT_MAX SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
+/* Live shadow roots per realm: the handle table's capacity. How many a page
+   may attach scales with its page budget (js_dom_register_shadow_root):
+   component sites nest them (MDN's Lit reference page attaches ~70), and
+   every root and the component behind it costs memory, so the PSP app's
+   32 MiB page ceiling keeps the historical 64 (more pushed MDN and Reddit
+   past the 5 MiB script heap) while a larger ceiling admits up to the
+   table. */
+#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 256u
+#define DOM_BRIDGE_SHADOW_ROOT_BASE 64u
+#define DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES (512u * 1024u)
 #define BRIDGE_NODE_NATIVE_PIN 0x01u
 #define BRIDGE_NODE_LIVE_WRAPPER 0x02u
 #define BRIDGE_NODE_PENDING_RETIRE_NOTIFY 0x04u
@@ -154,17 +190,14 @@ typedef struct {
 #define DOM_BRIDGE_NODE_INDEX_MASK SCRIPT_DOM_HANDLE_INDEX_MASK
 #define DOM_BRIDGE_NODE_GENERATION_MAX \
     ((uint32_t) (INT32_MAX >> DOM_BRIDGE_NODE_INDEX_BITS))
-/* Open-addressed pointer -> slot index; twice the slot count keeps the load
-   factor at or below one half. Entries are slot + 1, so zero is empty. */
-#define DOM_BRIDGE_NODE_INDEX_CAPACITY (2u * DOM_BRIDGE_NODE_LIMIT)
 #define SCRIPT_SOURCE_NODE_LIMIT 256
 
-_Static_assert(DOM_BRIDGE_NODE_LIMIT <= DOM_BRIDGE_NODE_INDEX_MASK,
+_Static_assert(DOM_BRIDGE_NODE_LIMIT_MAX <= DOM_BRIDGE_NODE_INDEX_MASK,
                "DOM bridge node handles must encode every slot");
-_Static_assert(DOM_BRIDGE_NODE_LIMIT <= UINT16_MAX
-                   && (DOM_BRIDGE_NODE_INDEX_CAPACITY
-                       & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u)) == 0
-                   && DOM_BRIDGE_NODE_LIMIT % 32u == 0,
+_Static_assert(DOM_BRIDGE_NODE_LIMIT_MAX < UINT16_MAX
+                   && DOM_BRIDGE_NODE_LIMIT <= DOM_BRIDGE_NODE_LIMIT_MAX
+                   && DOM_BRIDGE_NODE_LIMIT % 32u == 0
+                   && DOM_BRIDGE_NODE_LIMIT_MAX % 32u == 0,
                "DOM bridge node index entries are 16-bit slot + 1");
 
 typedef struct {
@@ -183,6 +216,8 @@ typedef struct {
     char *integrity;
     size_t integrity_length;
     char target_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    /* Its response bound in the realm scheduler's pool. */
+    size_t response_bound;
 } ScriptAsyncFetch;
 
 #define SCRIPT_EVENT_SOURCE_LIMIT 2u
@@ -229,6 +264,10 @@ typedef struct {
     bool html;
     bool force_async;
     bool already_started;
+#if TILEFINCH_SCRIPT_CLONE_CENSUS
+    /* A clone of a started script not yet seen connected (lab census). */
+    bool census_started_clone;
+#endif
 } ScriptElementState;
 
 typedef struct {
@@ -268,6 +307,11 @@ typedef struct {
     bool stale_module_validated;
     bool stale_resource_grant_valid;
     bool resource_timing_recorded;
+    /* The response's Cache-Control carried no-store: its compiled classic
+       bytecode is not kept (classic_bytecode_store). */
+    bool response_no_store;
+    /* Counted toward the page's heavy-script weight (bridge heavy). */
+    bool heavy_counted;
     TilefinchResourceGrant stale_resource_grant;
 } ScriptDynamicTask;
 
@@ -306,6 +350,11 @@ typedef struct DomBridge {
     uint32_t webgl_realm_epoch_low;
     ScriptWebglGeometryCacheState webgl_geometry_cache;
     void *webgl_geometry_vertices[SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT];
+    /* Retained vertex blocks the GE drew from directly and that were
+       evicted later in the same frame: freed once that frame's list has
+       completed (at the next render, or when the cache is cleared). */
+    void *webgl_geometry_retired[SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT];
+    size_t webgl_geometry_retired_count;
     bool *relayout_dirty;
     ScriptMutationJournal mutations;
     BrowserSession *session;
@@ -315,22 +364,34 @@ typedef struct DomBridge {
     bool opaque_origin;
     char calculated_base_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     bool document_base_dirty;
+    /* A connected <meta http-equiv=refresh> may have been inserted (or its
+       http-equiv/content changed): navigation looks for a declarative
+       refresh again (script_runtime_take_refresh_meta_mutation). */
+    bool refresh_meta_mutated;
     /* Native URL publication precedes advisory same-document callbacks.  A
        generation lets the Location facade detect and repair a callback/OOM
        split without allocating a URL string on ordinary property reads. */
     uint32_t document_url_revision;
     char referrer_policy[128];
-    lxb_dom_node_t *nodes[DOM_BRIDGE_NODE_LIMIT];
+    /* The slot table: parallel arrays of node_capacity entries carved from
+       one Budget block (bridge_node_table_resize), allocated at runtime
+       creation with DOM_BRIDGE_NODE_LIMIT slots and grown, never beyond
+       node_capacity_limit, only when registration finds every slot live. */
+    lxb_dom_node_t **nodes;
     /* Owner identities are captured at registration so whole-document
        retirement never has to inspect a node which author mutation may have
        destroyed already. */
-    uintptr_t node_owner_document_identities[DOM_BRIDGE_NODE_LIMIT];
-    uint32_t node_generations[DOM_BRIDGE_NODE_LIMIT];
-    uint32_t node_wrapper_leases[DOM_BRIDGE_NODE_LIMIT];
+    uintptr_t *node_owner_document_identities;
+    uint32_t *node_generations;
+    uint32_t *node_wrapper_leases;
     /* Bit 0 pins a handle for native work; bit 1 records that the newest JS
        wrapper lease is still live. Sharing the byte avoids enlarging the
        bounded PSP handle table to track detached-node correctness. */
-    unsigned char node_retention_flags[DOM_BRIDGE_NODE_LIMIT];
+    unsigned char *node_retention_flags;
+    /* NULL slots whose generation can still advance, one bit per slot. */
+    uint32_t *node_reusable_bits;
+    size_t node_capacity;
+    size_t node_capacity_limit;
     /* Per handle slot, the WeakRef the script wrapper cache holds for the
        live wrapper (a strong reference to the WeakRef only), so native
        getters can return an existing wrapper. Budget-allocated on first
@@ -353,7 +414,10 @@ typedef struct DomBridge {
        slot table. Only register/invalidate write `nodes`, and both keep this
        index and the reusable-slot bitmap (NULL slots whose generation can
        still advance) in step. */
-    uint16_t node_index[DOM_BRIDGE_NODE_INDEX_CAPACITY];
+    uint16_t *node_index;
+    /* A power of two of at least twice node_capacity, so the load factor
+       stays at or below one half. */
+    size_t node_index_capacity;
     /* The last element getComputedStyle() cascaded, for consecutive
        property reads of one declaration. Valid while none of the cascade's
        inputs moved: connected DOM content (every bridge mutation, including
@@ -477,7 +541,6 @@ typedef struct DomBridge {
     size_t attribute_writes;
     size_t attribute_writes_unchanged;
     uint64_t attribute_write_ns;
-    uint32_t node_reusable_bits[DOM_BRIDGE_NODE_LIMIT / 32u];
     /* Exhaustion-time slot reclamation: a reentry guard, the exhaustions
        still to handle without a collection after a futile one (cleared at
        each entry into JavaScript), and the next such backoff. */
@@ -525,6 +588,11 @@ typedef struct DomBridge {
     double media_value;
     char *media_source;
     int64_t fullscreen_node_handle;
+    /* Page controls entry notice (navigator.tilefinch.requestPageControls
+       {notice: "once"}): the page's pending request to skip a repeat, and
+       whether this document has already shown the notice once. */
+    bool page_controls_notice_once;
+    bool page_controls_notice_shown;
     bool user_activation_active;
     bool user_activation_has_been_active;
     uint64_t user_activation_expires_ms;
@@ -598,11 +666,36 @@ typedef struct DomBridge {
     size_t maximum_script_bytes;
     size_t script_quota_pressure_raises;
     size_t maximum_script_file_bytes;
+    /* Heavy pages (script_runtime_heavy_state). */
+    struct {
+        ScriptHeavyPolicy policy;
+        ScriptHeavyClass page_class;
+        bool answered;
+        bool allowed;
+        size_t script_bytes;
+        size_t waiting_bytes;
+        size_t waiting_scripts;
+        size_t refused_scripts;
+        size_t oversized_scripts;
+        size_t oversized_bytes;
+        size_t largest_unit_bytes;
+        /* Source whose bytecode was restored instead of compiled: from the
+           session's RAM tables (about 50 ms per MiB instead of 4 s), and
+           the part of it read from the Memory Stick tier (about 1 s per
+           MiB more). */
+        size_t restored_bytes;
+        size_t disk_restored_bytes;
+        size_t visible_text_bytes;
+        bool visible_text_known;
+    } heavy;
     bool allow_test_network_primitive_overrides;
     uint64_t dynamic_script_sequence;
     ScriptExecutionPolicy execution_policy;
     JSValue current_script;
     uintptr_t current_script_owner_document_identity;
+    /* Descendant CSP grant of the script being evaluated (module roots and
+       classic import() inherit it); zero outside a script element. */
+    uint8_t current_script_csp_grant;
     JSValue trusted_node_wrap;
     JSValue trusted_stable_script_wrap;
     JSValue trusted_retire_native_node_state;
@@ -633,6 +726,9 @@ typedef struct {
     uint16_t parent_index;
     uint8_t effective_referrer_policy;
     uint8_t root_state;
+    /* CSP grant the module's requests carry: its root script's nonce and
+       parser metadata, inherited along the graph. */
+    uint8_t csp_grant;
 } ScriptModuleBaseEntry;
 
 typedef enum {
@@ -704,6 +800,13 @@ struct ScriptRuntime {
     ScriptDocumentScope document_scope;
     JSRuntime *runtime;
     JSContext *context;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    JSAtom validation_frame_packet_atom;
+#endif
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    struct ValidationPhaseCapture *validation_phases;
+    ValidationCpuCapture validation_cpu;
+#endif
     BudgetQuickJSPool *quickjs_pool;
     /* Dedicated workers run in their own QuickJS contexts (realms) inside
        this runtime: a real global object, genuine top-level `this`, and
@@ -729,6 +832,7 @@ struct ScriptRuntime {
     bool boot_window_active;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     bool heap_failure_census_reported;
+    bool checkpoint_trace_suppressed;
 #endif
     size_t boot_window_peak;
     uint64_t boot_window_advances;
@@ -761,6 +865,27 @@ struct ScriptRuntime {
        collection pacing grows from (0 before the first). */
     size_t heap_live_after_gc;
     size_t heap_collections;
+    /* Collection pacing (js_rt_gc_pacing): collections the allocation
+       threshold ran, collections that left less than an amortized
+       allocation step, and times it backed off for the rest of an advance.
+       gc_task_starved counts this advance's consecutive starved
+       collections that freed little. */
+    size_t gc_threshold_collections;
+    size_t gc_pacing_starved;
+    size_t gc_pacing_backoffs;
+    size_t gc_task_starved;
+    /* The most collections one advance and one microtask checkpoint ran,
+       and the count when the current advance began. */
+    size_t gc_advance_collections_max;
+    size_t gc_checkpoint_collections_max;
+    size_t gc_advance_collections_begin;
+    /* heap_growth_refusals when the current advance began. */
+    size_t gc_advance_refusals;
+    /* Collection time, timed builds only (host lab, validation). */
+    uint64_t gc_total_ns;
+    uint64_t gc_begin_ns;
+    /* QuickJS heap bytes as the latest collection began. */
+    size_t gc_live_before;
     /* setAttribute calls already cleared from the bridge by profile
        reports: the tilefinch-work record adds them back. */
     uint64_t work_attribute_writes_reported;
@@ -769,6 +894,13 @@ struct ScriptRuntime {
        (1 = page reserve reached, 2 = ceiling, 3 = request exceeds spare). */
     size_t heap_growth_refused_bytes;
     uint8_t heap_growth_refused_reason;
+    /* Heap rejections inside compiles abandoned as memory refusals
+       (js_rt_compile_source_type); not counted as realm exhaustion. */
+    size_t compile_heap_rejections_absorbed;
+    /* Memory rescue (script_runtime_arm_memory_rescue). */
+    DocumentBodySnapshot memory_rescue;
+    bool memory_rescue_armed;
+    uint8_t memory_rescue_captures;
     size_t heap_growth_returns;
     uint64_t heap_growth_advances;
     uint64_t heap_growth_next_check;
@@ -819,6 +951,16 @@ struct ScriptRuntime {
     size_t inline_module_sequence;
     /* This realm's module bytecode generation; 0 until its first use. */
     uint32_t module_bytecode_generation;
+    /* The root module being evaluated came from a no-store response. */
+    bool module_root_no_store;
+    /* Classic bytecode stores deferred to idle work (js_module_loader.c):
+       compiled scripts, oldest first, until script_runtime_store_pending_
+       bytecode() serializes them into the session table. NULL when none;
+       `pending_bytes` is their sources' total, a stand-in for the
+       bytecode they will add to the table. */
+    struct ScriptBytecodePending *bytecode_pending;
+    size_t bytecode_pending_count;
+    size_t bytecode_pending_bytes;
     /* Captured before author scripts run. Keeping the callable values here
        avoids a global lookup and prevents author replacement of private host
        bridge properties from intercepting native viewport updates. */
@@ -842,6 +984,9 @@ struct ScriptRuntime {
     /* Captured before author code and removed from the global object. Used
        when native lifecycle observes that the fullscreen element detached. */
     JSValue fullscreen_host_exit;
+    /* The private WeakMap from each Document to its document.all
+       collection (js_runtime/legacy_surface.inc). */
+    JSValue document_all_cache;
     /* Captured before author code can replace Window.navigator. The lazy
        OPFS module receives this identity through a temporary native-only
        handoff so StorageManager branding never consults a mutable global. */
@@ -880,6 +1025,8 @@ struct ScriptRuntime {
        queued but admitted none because due tasks took every slot. */
     uint8_t cleanup_starved_advances;
     TilefinchGameAudio *game_audio;
+    bool game_audio_internal_slots;
+    struct AudioSlotRuntime *game_audio_slots;
     struct ScriptLazyRuntimeBundle *lazy_webpack_bundles;
     uint32_t next_lazy_webpack_bundle_id;
     bool lazy_factory_recovery_pending;
@@ -898,8 +1045,20 @@ typedef struct {
     size_t compressed_source_capacity;
     uint8_t arity;
     ScriptLazyFactoryKind kind;
+    /* Where the factory starts in its bundle (1-based line, and column in
+       code points as QuickJS counts them), to report a SyntaxError found
+       when the factory first compiles at the bundle's position. */
+    uint32_t source_line;
+    uint32_t source_column;
     JSValue compiled;
     JSValue wrapper;
+#ifndef TILEFINCH_NO_TRACE
+    /* Factory-cache measurement (TILEFINCH_TRACE_FACTORY_CACHE, lab only):
+       the compiled program held from compile to the end of its first call,
+       when it is serialized again, and how often this factory compiled. */
+    JSValue census_program;
+    uint32_t census_compiles;
+#endif
 } ScriptLazyRuntimeFactory;
 
 typedef struct ScriptLazyRuntimeBundle {
@@ -915,11 +1074,15 @@ typedef struct ScriptLazyRuntimeBundle {
     void *source_lease;
     ScriptSourceLeaseReleaseCallback release_source;
     struct ScriptLazyRuntimeBundle *next;
+#ifndef TILEFINCH_NO_TRACE
+    uint64_t census_digest; /* first 8 bytes of the bundle's SHA-256 */
+#endif
 } ScriptLazyRuntimeBundle;
 
 typedef struct {
     JSValue value;
     uintptr_t owner_document_identity;
+    uint8_t csp_grant;
 } ScriptCurrentScriptScope;
 
 /* Cross-module helpers defined in js_runtime.c. */
@@ -940,6 +1103,10 @@ bool js_rt_current_script_scope_end(JSContext *context,
                                     ScriptResult *result);
 void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime);
 bool js_rt_runtime_run_jobs(ScriptRuntime *runtime);
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+void js_rt_validation_cpu_enter(ScriptRuntime *runtime, unsigned phase);
+void js_rt_validation_cpu_leave(ScriptRuntime *runtime, unsigned phase);
+#endif
 bool js_rt_runtime_checkpoint_pending(const ScriptRuntime *runtime);
 size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
                                                size_t response_bytes);
@@ -1041,7 +1208,7 @@ const char *js_rt_bridge_calculated_base_url(DomBridge *bridge);
 JSValue js_rt_module_compile_external(
     ScriptRuntime *runtime, JSContext *context, const char *source,
     size_t source_length, const char *module_name, const char *response_url,
-    ScriptResult *result, bool *admitted);
+    bool response_no_store, ScriptResult *result, bool *admitted);
 bool js_rt_module_set_import_meta(JSContext *context, JSValueConst module,
                                   const char *response_url, bool is_main);
 uint8_t js_rt_runtime_module_referrer_policy_code(const char *policy);
@@ -1052,6 +1219,10 @@ void js_rt_module_referrer_policy_for_node(
     lxb_dom_node_t *node, const char *fallback,
     char output[BROWSER_MODULE_REFERRER_POLICY_LIMIT]);
 void js_rt_runtime_module_metadata_clear(ScriptRuntime *runtime);
+/* A root's grant; descendants registered later inherit it. */
+void js_rt_runtime_module_csp_grant_set(ScriptRuntime *runtime,
+                                        const char *request_url,
+                                        uint8_t grant);
 bool js_rt_runtime_module_root_register(
     ScriptRuntime *runtime, const char *request_url, const char *response_url,
     const char *effective_referrer_policy,
@@ -1100,9 +1271,20 @@ size_t js_rt_multiplayer_abort(DomBridge *bridge);
 bool js_rt_multiplayer_deliver(ScriptRuntime *runtime,
                                size_t completion_budget,
                                size_t *author_tasks);
+/* Fills ScriptResult's last_network_* fields, which only the host lab,
+   tests and the validation input-script harness read; builds without
+   tracing or the validation log leave them untouched. */
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 void js_rt_record_network_response(ScriptResult *result,
                                    const FetchResult *fetched);
-bool js_rt_utf8_valid(const uint8_t *bytes, size_t length);
+#else
+static inline void js_rt_record_network_response(ScriptResult *result,
+                                                 const FetchResult *fetched)
+{
+    (void) result;
+    (void) fetched;
+}
+#endif
 bool js_rt_script_set_response_body(JSContext *context, JSValue response,
                                     const FetchResult *fetched,
                                     bool prefer_text);
@@ -1140,19 +1322,38 @@ ScriptQuotaReserveResult js_rt_bridge_script_quota_reserve_bounded(
     DomBridge *bridge, ScriptQuotaCountMode count_mode,
     size_t requested_max_bytes, size_t reservation_ceiling,
     ScriptQuotaReservation *reservation);
+/* Raises the realm's source total past its configured floor while the page
+   Budget keeps the realm's growth reserve free (see bridge_state.inc). */
+void js_rt_bridge_script_bytes_admit(DomBridge *bridge, size_t bytes);
+size_t js_rt_dynamic_response_bound(DomBridge *bridge);
+bool js_rt_heavy_gate_holds(ScriptRuntime *runtime, ScriptDynamicTask *task);
+/* Heap growth refusal: copy the body for memory rescue when armed. */
+void js_rt_memory_rescue_capture(ScriptRuntime *runtime);
+/* Records `source_bytes` of script restored from cached bytecode (RAM, or
+   the Memory Stick tier when `from_disk`) for the heavy-page estimate. */
+void js_rt_heavy_note_restored(ScriptRuntime *runtime, size_t source_bytes,
+                               bool from_disk);
 ScriptQuotaReserveResult js_rt_bridge_script_quota_reserve_known(
     DomBridge *bridge, ScriptQuotaCountMode count_mode,
     size_t exact_source_bytes, ScriptQuotaReservation *reservation);
 bool js_rt_bridge_script_quota_expand(
     DomBridge *bridge, ScriptQuotaReservation *reservation,
     size_t exact_source_bytes);
+/* One ResourceLoader segment of a response; segment_index (its statement
+   index) keys its classic bytecode, which a no-store response never keeps. */
 bool js_rt_evaluate_external_classic_segment(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *source_url,
-    bool final_segment);
+    size_t segment_index, bool response_no_store, bool final_segment);
 bool js_rt_preflight_external_classic_segment(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
-    const char *source, size_t source_length, const char *source_url);
+    const char *source, size_t source_length, const char *source_url,
+    size_t segment_index, bool response_no_store);
+/* A dynamically inserted classic script's response. */
+bool js_rt_evaluate_external_classic_dynamic(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *source_url,
+    bool response_no_store);
 
 void js_rt_bridge_queue_remote_element(DomBridge *bridge,
                                        const char *identifier,
@@ -1196,6 +1397,28 @@ typedef struct {
     bool track_ordinals;
 } DomDocumentOrderTraversal;
 
+/* document.all's view of a tree: its elements in tree order, exactly as
+   querySelectorAll("*") lists them, visited without registering handles. */
+typedef struct {
+    DomBridge *bridge;
+    DomDocumentOrderTraversal traversal;
+    const lxb_dom_node_t *boundary;
+    size_t shadow_depth;
+} DomElementWalk;
+/* scope 0 walks the realm's document; otherwise scope is a Document node
+   handle. False when it names no document. */
+bool js_rt_element_walk_init(DomElementWalk *walk, DomBridge *bridge,
+                             int64_t scope);
+lxb_dom_node_t *js_rt_element_walk_next(DomElementWalk *walk);
+/* The trusted wrapper of `node`, registering its handle; a RangeError when
+   the handle table is exhausted. */
+JSValue js_rt_bridge_wrap_node(JSContext *context, DomBridge *bridge,
+                               lxb_dom_node_t *node);
+/* The native tree behind a Document object: 0 for the realm's document, a
+   Document node handle, -1 for a script-side document (or any other
+   object), or -2 with an exception pending. */
+int64_t js_rt_document_scope(JSContext *context, JSValueConst value);
+
 uintptr_t js_rt_node_owner_identity(const lxb_dom_node_t *node);
 bool js_rt_node_is_strict_descendant(const lxb_dom_node_t *node,
                                      const lxb_dom_node_t *ancestor);
@@ -1203,6 +1426,7 @@ ScriptElementState *js_rt_script_element_state_find(
     DomBridge *bridge, const lxb_dom_node_t *node);
 ScriptElementState *js_rt_script_element_state_register(
     DomBridge *bridge, lxb_dom_node_t *node, bool html);
+bool js_rt_script_element_parser_started(lxb_dom_node_t *node);
 void js_rt_script_element_states_purge_marked(
     DomBridge *bridge,
     const unsigned char marked[SCRIPT_DYNAMIC_NODE_LIMIT]);
@@ -1273,12 +1497,23 @@ JSValue js_wasm_snapshot_source(JSContext *context, JSValueConst this_value,
 JSValue js_dom_set_fullscreen(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
+JSValue js_dom_page_controls_notice(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv);
+TilefinchGameAudio *js_rt_game_audio_engine(ScriptRuntime *runtime);
+bool js_rt_game_audio_lifecycle(ScriptRuntime *runtime, bool destroy);
+/* The JS Web Audio reference (game-audio.js over the command channel below)
+   serves host differential tests and explicit validation A/B runs. Shipping
+   PSP builds have only the native audio slots. */
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define TILEFINCH_GAME_AUDIO_REFERENCE 1
 JSValue js_game_audio_decode(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv);
 JSValue js_game_audio_command(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
+#endif
 JSValue js_canvas_raster_rect(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
@@ -1288,9 +1523,6 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
 JSValue js_canvas_measure_text(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
-JSValue js_canvas_raster_text(JSContext *context,
-                              JSValueConst this_value,
-                              int argc, JSValueConst *argv);
 JSValue js_canvas_raster_path(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
@@ -1311,6 +1543,8 @@ JSValue js_computed_style_get(JSContext *context,
 JSValue js_computed_style_read(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
+JSValue js_dom_rendered_text(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv);
 JSValue js_transition_snapshot(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
@@ -1369,6 +1603,8 @@ JSValue js_dom_observe_parser_insertions(JSContext *context,
 JSValue js_dom_named_element_ids(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv);
+JSValue js_dom_frame_handles(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv);
 JSValue js_dom_document_element(JSContext *context,
                                 JSValueConst this_value,
                                 int argc, JSValueConst *argv);
@@ -1415,6 +1651,13 @@ bool js_rt_bridge_computed_style_cache_holds(const DomBridge *bridge,
    Exposed for tests. */
 size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
                               size_t limit);
+/* Collection amortization: the allocation a full collection of a `live`
+   byte heap must follow to pay for itself, and whether at least that much
+   has been allocated since the realm's last collection. A collection made
+   only in case it helps ("speculative") waits until it is due; one that
+   would otherwise end in a refusal runs regardless. */
+size_t js_rt_gc_amortized_step(size_t live);
+bool js_rt_gc_due(const ScriptRuntime *runtime);
 JSValue js_dom_make_fast_getter(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
 JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,
@@ -1423,6 +1666,11 @@ JSValue js_dom_note_remote_wrapper(JSContext *context,
                                    JSValueConst this_value,
                                    int argc, JSValueConst *argv);
 void js_rt_bridge_wrapper_refs_free(DomBridge *bridge);
+/* Allocates the base slot table; `limit` (0 for the default) is the most
+   slots registration may later grow it to. Freed by
+   js_rt_bridge_node_table_free after the realm's finalizers have run. */
+bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit);
+void js_rt_bridge_node_table_free(DomBridge *bridge);
 JSValue js_dom_closest(JSContext *context, JSValueConst this_value,
                        int argc, JSValueConst *argv);
 JSValue js_dom_matches(JSContext *context, JSValueConst this_value,
@@ -1444,6 +1692,16 @@ JSValue js_dom_query_count(JSContext *context,
 JSValue js_dom_register_shadow_root(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);
+JSValue js_dom_constructed_sheet_text(JSContext *context,
+                                      JSValueConst this_value,
+                                      int argc, JSValueConst *argv);
+JSValue js_css_statement_ends(JSContext *context, JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_font_shorthand_valid(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv);
+JSValue js_dom_set_adopted_sheets(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv);
 JSValue js_dom_query_selector_all_method(JSContext *context,
                                          JSValueConst this_value,
                                          int argc,

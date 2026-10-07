@@ -1,0 +1,109 @@
+diff --git a/usbhostfs_pc/main.c b/usbhostfs_pc/main.c
+index acf4f41..cebdc65 100644
+--- a/usbhostfs_pc/main.c
++++ b/usbhostfs_pc/main.c
+@@ -98,6 +98,10 @@ struct DirHandle  open_dirs[MAX_DIRS];
+ 
+ static libusb_context *usbctx = NULL;
+ static libusb_device_handle *usbhdr = NULL;
++/* The hostfs owner reads concurrently with the endpoint-3 command writer.
++ * Protect only publication/retirement and that writer: holding this mutex
++ * across the owner's blocking read would prevent duplex protocol progress. */
++static pthread_mutex_t usb_lifetime_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static int g_servsocks[MAX_ASYNC_CHANNELS];
+ static int g_clientsocks[MAX_ASYNC_CHANNELS];
+@@ -319,6 +323,33 @@ void close_device(libusb_device_handle *dev)
+ 	}
+ }
+ 
++static void publish_device(libusb_device_handle *dev)
++{
++	pthread_mutex_lock(&usb_lifetime_mutex);
++	usbhdr = dev;
++	pthread_mutex_unlock(&usb_lifetime_mutex);
++}
++
++static void retire_device(void)
++{
++	/* Wait for the already-admitted writer; no new writer can retain dev
++	 * while interface/reset/close are releasing its libusb internals. */
++	pthread_mutex_lock(&usb_lifetime_mutex);
++	libusb_device_handle *dev = usbhdr;
++	usbhdr = NULL;
++	close_device(dev);
++	pthread_mutex_unlock(&usb_lifetime_mutex);
++}
++
++static int write_async_usb(char *bytes, int size)
++{
++	pthread_mutex_lock(&usb_lifetime_mutex);
++	int result = usbhdr ? euid_usb_bulk_write(usbhdr, 0x3, bytes, size, 10000)
++		: LIBUSB_ERROR_NO_DEVICE;
++	pthread_mutex_unlock(&usb_lifetime_mutex);
++	return result;
++}
++
+ int gen_path(char *path, int dir)
+ {
+ 	char abspath[PATH_MAX];
+@@ -2261,7 +2292,7 @@ int start_hostfs(void)
+ 	{
+ 		init_hostfs();
+ 
+-		usbhdr = wait_for_device();
++		publish_device(wait_for_device());
+ 
+ 		if(usbhdr)
+ 		{
+@@ -2331,8 +2362,7 @@ int start_hostfs(void)
+ 				}
+ 			}
+ 
+-			close_device(usbhdr);
+-			usbhdr = NULL;
++			retire_device();
+ 		}
+ 
+ 		close_hostfs();
+@@ -2470,20 +2500,18 @@ void shutdown_socket(void)
+ int exit_app(void)
+ {
+ 	printf("Exiting\n");
+-	shutdown_socket();
+-	if(usbhdr)
+-	{
+-		/* Nuke the connection */
+-		close_device(usbhdr);
+-	}
+-	exit(1);
++	fflush(stdout);
++	/* Other threads may be inside libusb or own its mutexes. Process exit
++	 * releases the OS handles; manual reset/close here would race them. */
++	_exit(1);
+ 
+ 	return 0;
+ }
+ 
+ void signal_handler(int sig)
+ {
+-	exit_app();
++	/* Do not call stdio, libusb, or a mutex from an arbitrary signal context. */
++	_exit(1);
+ }
+ 
+ int make_socket(unsigned short port)
+@@ -3092,11 +3120,8 @@ void *async_thread(void *arg)
+ 								}
+ 							}
+ 
+-							if(usbhdr)
+-							{
+-								cmd->channel = LE32(i);
+-								euid_usb_bulk_write(usbhdr, 0x3, buf, readbytes+sizeof(struct AsyncCommand), 10000);
+-							}
++							cmd->channel = LE32(i);
++							write_async_usb(buf, readbytes+sizeof(struct AsyncCommand));
+ 						}
+ 						else
+ 						{

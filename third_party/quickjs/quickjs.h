@@ -1024,6 +1024,8 @@ typedef struct JSLazyFunctionStats {
     uint64_t preparsed_source_bytes;
     uint64_t preparse_fallbacks;    /* scans that gave up (the body was parsed) */
     uint64_t preparse_restarts;     /* compiles repeated without scanning */
+    uint64_t memory_failures;       /* compile_failures for lack of memory,
+                                       thrown uncatchably (Tilefinch) */
 } JSLazyFunctionStats;
 void JS_GetLazyFunctionStats(JSRuntime *rt, JSLazyFunctionStats *stats);
 /* Tilefinch work counters, deterministic for identical execution and
@@ -1088,6 +1090,19 @@ const void *JS_GetStackTop(JSRuntime *rt);
    allocate on or re-enter the runtime (Tilefinch profiler GC time). */
 void JS_SetGCHook(JSRuntime *rt, void (*hook)(void *opaque, int begin),
                   void *opaque);
+/* Tilefinch GC pacing: after a collection the allocation threshold
+   triggered, the hook gets the heap that collection left (`live`), the
+   memory limit and QuickJS's own next threshold (`proposed`) and returns the
+   threshold to use instead. It may raise the memory limit
+   (JS_SetMemoryLimit); it must not allocate on or re-enter the runtime. */
+typedef size_t JSGCPacingFunc(void *opaque, size_t live, size_t limit,
+                              size_t proposed);
+void JS_SetGCPacingHook(JSRuntime *rt, JSGCPacingFunc *hook, void *opaque);
+size_t JS_GetGCThreshold(JSRuntime *rt);
+/* Why the collection in progress runs, for a JS_SetGCHook observer. */
+#define JS_GC_CAUSE_EXPLICIT 0      /* any other JS_RunGC */
+#define JS_GC_CAUSE_THRESHOLD 1     /* allocation passed the GC threshold */
+int JS_GetGCCause(JSRuntime *rt);
 /* Called with begin=1 before and begin=0 after every first-call compile of
    a lazy function body; must not allocate on or re-enter the runtime
    (Tilefinch script split). */

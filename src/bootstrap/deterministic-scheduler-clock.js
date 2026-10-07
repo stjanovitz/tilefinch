@@ -2,7 +2,7 @@
   const schedule = globalThis.requestAnimationFrame;
   let frameKey = NaN,
     frameTimestamp = 0;
-  globalThis.requestAnimationFrame = (callback) => {
+  const requestAnimationFrame = (callback) => {
     if (typeof callback !== "function")
       throw new TypeError("callback must be a function");
     return schedule(() => {
@@ -14,6 +14,7 @@
       callback(frameTimestamp);
     });
   };
+  globalThis.requestAnimationFrame = requestAnimationFrame;
   const timeline = {};
   Object.defineProperty(timeline, "currentTime", {
     get() {

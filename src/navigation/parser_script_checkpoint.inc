@@ -79,6 +79,9 @@ static void navigation_record_blocking_script_sample(
     } else {
         performance->parser_script_mutations += sample->dom_mutations;
     }
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* The per-script samples feed only the validation log's
+       tilefinch-navigation-script lines and the host lab. */
     if (performance->blocking_script_sample_count
         < NAVIGATION_BLOCKING_SCRIPT_SAMPLE_LIMIT) {
         performance->blocking_script_samples[
@@ -99,6 +102,7 @@ static void navigation_record_blocking_script_sample(
         > performance->blocking_script_samples[fastest].total_us) {
         performance->blocking_script_samples[fastest] = *sample;
     }
+#endif
 }
 
 #if !defined(__PSP__)
@@ -234,6 +238,10 @@ static bool navigation_stream_suppress_optional_parser_work(
    parser itself to monopolize that allowance. This is cumulative source/work
    admission, not a second heap or per-file quota. */
 #define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_WORK (1024u * 1024u)
+/* Below this much remaining work the stage counts as spent (the
+   per-script unit the stage was tuned with). */
+#define NAVIGATION_PARSER_SCRIPT_STAGE_SPENT_WORK \
+    SCRIPT_ADMISSION_LEGACY_UNIT_BYTES
 #define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US 20000000u
 #define NAVIGATION_PARSER_SCRIPT_FAILURE_LIMIT 3u
 
@@ -467,8 +475,15 @@ navigation_stream_prepare_parser_script_allowance(
     size_t remaining_work = work_limit - stream->parser_script_stage_work;
     allowance->maximum_file_bytes =
         stream->session->maximum_script_file_bytes;
+    /* The stage's work is spent when what is left would no longer hold an
+       ordinary script. A script larger than what is left before then is
+       refused on its own; it does not stop the parser scripts after it.
+       (The per-script source ceiling is far above the stage's whole work
+       allowance now that admission is memory-based, so comparing against
+       it would stop every later script after one large one.) */
     allowance->cumulative_work_limited =
-        remaining_work < allowance->maximum_file_bytes;
+        remaining_work < NAVIGATION_PARSER_SCRIPT_STAGE_SPENT_WORK
+        && remaining_work < allowance->maximum_file_bytes;
     if (allowance->maximum_file_bytes > remaining_work) {
         allowance->maximum_file_bytes = remaining_work;
     }

@@ -176,6 +176,65 @@ typedef struct {
     uint32_t pixel_offset;
 } RenderCanvasOverlayRegion;
 
+/* Deferred canvas publication. When a frontend that can scale the EDRAM
+   WebGL surface itself (the PSP presenter) enables it, a complete,
+   undecorated full-viewport 2:3 canvas frame whose WebGL surface is still
+   authoritative in EDRAM is not converted into the RAM frame: the presenter
+   scales it straight into the display back buffer with the GE, and the RAM
+   copy is produced only when something reads it
+   (tile_cache_canvas_materialize). Off unless a frontend enables it with
+   tile_cache_set_canvas_defer. */
+typedef struct {
+    const unsigned char *source;
+    size_t source_stride;
+    int source_width;
+    int source_height;
+    /* Destination rectangle in frame pixels (the frame is the viewport). */
+    int x;
+    int y;
+    int width;
+    int height;
+    /* Snapshot identity of the native surface (see
+       image_canvas_native_serial); a newer canvas frame invalidates it. */
+    uint32_t serial;
+    uint32_t epoch;
+} RenderCanvasDeferral;
+
+/* Declared in every build because TileCache embeds it (see there). */
+typedef struct {
+    uint32_t kernel_rows, general_rows, repeat_rows, skipped_rows;
+    uint32_t vfpu_rows;
+    uint32_t source_pixels;
+    uintptr_t source_address;
+    size_t source_stride;
+    int source_width, source_height, output_width, output_height;
+    bool native_source;
+    bool setup_once;
+} RenderCanvasConversionMetrics;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Measurement-only switch between the ordinary Allegrex kernel (the
+   default, as in shipping builds) and its scalar reference. The probe
+   compares output pixels and borrowed state; a failure turns the kernel
+   off until a later probe passes. */
+typedef struct {
+    uint32_t rows, pixels, mismatches, state_mismatches;
+    bool available;
+} RenderCanvasVfpuProbe;
+void tile_cache_validation_vfpu_conversion(bool enabled);
+RenderCanvasVfpuProbe tile_cache_validation_probe_vfpu_conversion(void);
+/* Measurement-only baseline control; production setup admission is default. */
+void tile_cache_validation_canvas_setup(bool enabled);
+bool tile_cache_validation_canvas_setup_probe(FILE *output);
+#endif
+
+#ifndef __PSP__
+/* Host test hook: translucent blends into a layer with its own alpha,
+   checked against the plain arithmetic for every destination alpha and
+   source alpha over one destination and source colour. */
+size_t render_test_alpha_blend_mismatches(uint16_t destination,
+                                          uint32_t foreground);
+#endif
+
 typedef struct {
     Budget *budget;
     const LayoutDocument *layout;
@@ -232,6 +291,7 @@ typedef struct {
     bool fixed_backdrop;
     bool fixed_backdrop_masked;
     size_t fixed_cache_builds;
+    size_t fixed_cache_patches;
     size_t fixed_cache_blits;
     size_t fixed_cache_pixels;
     size_t fixed_cache_bytes;
@@ -290,13 +350,33 @@ typedef struct {
     uint64_t max_frame_job_unit_us;
     bool canvas_paint_pending;
     size_t canvas_fast_frames;
+    size_t canvas_setup_frames;
     size_t canvas_fast_refusals;
     uint64_t canvas_fast_us;
     uint64_t canvas_fast_max_us;
     uint64_t canvas_fast_raster_us;
     uint64_t canvas_fast_overlay_us;
+    /* Per frame, from the engine: nothing (find highlight, authored focus
+       outline) will be painted into the frame after the canvas pass. */
+    bool canvas_defer_allowed;
+    /* The frame's canvas rectangle was not rasterized for this frame. */
+    bool canvas_deferred;
+    RenderCanvasDeferral canvas_deferral;
+    size_t canvas_deferrals;
+    size_t canvas_materializations;
+    size_t canvas_materialize_failures;
+    /* Last fast conversion's actual path, not an assumed scale ratio.
+       Scalar row counts avoid clocks or logging inside the pixel loop.
+       Filled only in validation builds, but always present: the PSP support
+       libraries never see TILEFINCH_PSP_VALIDATION_LOG, and a public struct
+       layout must not depend on it (src/abi_layout_probe.c). */
+    RenderCanvasConversionMetrics canvas_fast_conversion;
     uint16_t *canvas_overlay_pixels;
     uint8_t *canvas_overlay_alpha;
+    /* Blend tables for the retained overlay's most frequent translucent
+       (colour, alpha) pairs, planned on the first blit after the overlay
+       changes; NULL when not admitted. */
+    struct CanvasOverlayBlendCache *canvas_overlay_blend_cache;
     RenderCanvasOverlayRegion
         canvas_overlay_regions[TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT];
     size_t canvas_overlay_region_count;
@@ -304,10 +384,15 @@ typedef struct {
     int canvas_overlay_scroll_y;
     int canvas_overlay_viewport_width;
     int canvas_overlay_viewport_height;
+    /* Source layout scroll_generation the overlay was rasterized at: an
+       overflow box scrolling moves overlay content without a relayout. */
+    uint32_t canvas_overlay_scroll_generation;
     bool canvas_overlay_ready;
     size_t canvas_overlay_builds;
     size_t canvas_overlay_patches;
     size_t canvas_overlay_patch_regions;
+    /* Retained overlay pixels cleared and repainted by patches. */
+    size_t canvas_overlay_patch_pixels;
     size_t idle_jobs_scheduled;
     size_t idle_jobs_completed;
     size_t idle_jobs_cancelled;
@@ -329,6 +414,11 @@ typedef struct {
     int last_frame_viewport_width;
     int last_frame_viewport_height;
     bool last_frame_scroll_valid;
+    /* Scroll position of the last composed frame. Unlike last_frame_*,
+       layout replacement keeps it: the frontend shows placeholder tiles
+       only when the view moved, never for an in-place repaint. */
+    int presented_scroll_y;
+    bool presented_scroll_valid;
     /* Paint-ahead rows finished for the screen at prefetch_done_scroll_y;
        cleared by any tile invalidation. */
     bool prefetch_done;
@@ -401,6 +491,18 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
    path unchanged. */
 RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
     TileCache *cache, int scroll_y, int viewport_width, int viewport_height);
+/* Process-wide: only a frontend with a GE presenter turns this on. */
+void tile_cache_set_canvas_defer(bool enabled);
+bool tile_cache_canvas_defer_enabled(void);
+/* The pending deferral for the current frame, or NULL when the RAM frame is
+   complete. */
+const RenderCanvasDeferral *tile_cache_canvas_deferral(
+    const TileCache *cache);
+/* Produce the deferred canvas pixels in the RAM frame (the exact CPU
+   conversion the frame would have had). False when the surface no longer
+   holds that frame; the frame is then marked for a full repaint and the
+   deferral is dropped either way. True when nothing was deferred. */
+bool tile_cache_canvas_materialize(TileCache *cache);
 bool tile_cache_canvas_frame_fast_eligible(
     const TileCache *cache, int scroll_y,
     int viewport_width, int viewport_height);

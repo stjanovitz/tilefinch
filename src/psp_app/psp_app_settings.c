@@ -396,7 +396,7 @@ static void psp_app_reload_after_setting(
     }
     bool started = local_surface || psp_begin_page_load(
         app->browser->engine, &app->process->presentation.ui, app->browser->profile, *engine_frame,
-        &app->process->text_input, reload_url, false, 4 * MIB, 30000);
+        &app->process->text_input, reload_url, false, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
     if (started && !local_surface) {
         app->interactive->navigation_job_started_us =
             (uint64_t) sceKernelGetSystemTimeWide();
@@ -457,6 +457,7 @@ void psp_app_apply_setting(
     const char *local_storage_path = app->process->storage.local_storage;
     const char *persistent_cache_path = app->process->storage.persistent_cache;
     if (psp_app_site_storage_setting(app, frame, intent)) return;
+    if (psp_app_heavy_setting(app, frame, intent)) return;
     if (intent->setting.id == PSP_UI_SETTING_NETWORK_PROFILE) {
         unsigned operation = intent->setting.value.unsigned_value;
         int saved = (int) app->process->config.network_profile;
@@ -646,6 +647,23 @@ void psp_app_apply_setting(
         psp_ui_show_status(
             &app->process->presentation.ui,
             enabled ? "AUTO READER ON" : "AUTO READER OFF", 180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_BASIC_FALLBACK) {
+        BrowserBasicFallbackMode mode =
+            intent->setting.value.basic_fallback_mode;
+        if (browser_profile_set_basic_fallback_mode(profile, mode))
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+        app->process->presentation.ui.basic_fallback_mode =
+            (unsigned) browser_profile_basic_fallback_mode(profile);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            mode == BROWSER_BASIC_FALLBACK_ASK
+                ? "BASIC VIEW FALLBACK: ASK"
+                : (mode == BROWSER_BASIC_FALLBACK_OFF
+                       ? "BASIC VIEW FALLBACK OFF"
+                       : "BASIC VIEW FALLBACK: AUTOMATIC"),
+            180);
     }
     if (intent->setting.id == PSP_UI_SETTING_BROWSER_UI_SCALE) {
         /* Owner thread, page work paused by the menu: fill the chrome cache
@@ -936,6 +954,29 @@ void psp_app_apply_setting(
             enabled ? "COLOR EMOJI APPLIES AFTER RESTART"
                     : "EMBEDDED EMOJI SELECTED",
             180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_GLYPH_OFFERS) {
+        bool enabled = intent->setting.value.boolean;
+        browser_profile_set_glyph_offers_enabled(profile, enabled);
+        app->process->presentation.ui.glyph_offers_off = !enabled;
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enabled ? "LANGUAGE PACK OFFERS ON" : "LANGUAGE PACK OFFERS OFF",
+            150);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_GLYPH_OFFERS_RESET) {
+        bool any = browser_profile_glyph_offer_declined_mask(profile) != 0;
+        browser_profile_set_glyph_offer_declined_mask(profile, 0);
+        if (any)
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            any ? "DECLINED LANGUAGE PACK OFFERS RESET"
+                : "NO DECLINED OFFERS TO RESET",
+            150);
     }
     if (intent->setting.id == PSP_UI_SETTING_VIDEO_SCALING) {
         BrowserVideoScaling scaling = intent->setting.value.video_scaling;

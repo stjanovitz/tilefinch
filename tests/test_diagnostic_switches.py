@@ -1,36 +1,53 @@
 #!/usr/bin/env python3
-"""Every TILEFINCH_* environment switch read in src/ must be listed in
-docs/DIAGNOSTIC_SWITCHES.md, and every listed switch must still be read."""
+"""Every TILEFINCH_* environment switch read in src/ or the vendored QuickJS
+must be listed in docs/DIAGNOSTIC_SWITCHES.md, and every listed switch must
+still be read. A switch read only through tilefinch_lab_getenv() is compiled
+out of shipping PSP builds, so its row may not claim the device reads it."""
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "DIAGNOSTIC_SWITCHES.md"
-PATTERN = re.compile(r'getenv\("(TILEFINCH_[A-Z0-9_]+)"\)')
+SOURCE_DIRS = ("src", "third_party/quickjs")
+# Group 1 is set when the read goes through tilefinch_lab_getenv().
+PATTERN = re.compile(r'(tilefinch_lab_)?getenv\("(TILEFINCH_[A-Z0-9_]+)"\)')
+
+
+def source_files():
+    paths = []
+    for directory in SOURCE_DIRS:
+        paths.extend(path for path in (ROOT / directory).rglob("*")
+                     if path.suffix in (".c", ".h", ".inc"))
+    return sorted(paths)
+
+
+def switch_reads():
+    """Map each switch to its (path, through tilefinch_lab_getenv) reads."""
+    reads = {}
+    for path in source_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in PATTERN.finditer(text):
+            reads.setdefault(match[2], []).append(
+                (path.relative_to(ROOT).as_posix(), match[1] is not None))
+    return reads
 
 
 def read_switches():
-    found = set()
-    for path in (ROOT / "src").rglob("*"):
-        if path.suffix not in (".c", ".h", ".inc"):
-            continue
-        found.update(PATTERN.findall(path.read_text(encoding="utf-8", errors="replace")))
-    return found
+    return set(switch_reads())
 
 
 def switch_sites():
-    sites = {}
-    for path in sorted((ROOT / "src").rglob("*")):
-        if path.suffix not in (".c", ".h", ".inc"):
-            continue
-        for match in PATTERN.finditer(path.read_text(encoding="utf-8", errors="replace")):
-            sites.setdefault(match[1], []).append(path.relative_to(ROOT).as_posix())
-    return sites
+    return {name: [path for path, _ in reads] for name, reads in switch_reads().items()}
+
+
+def lab_only_switches():
+    return {name for name, reads in switch_reads().items() if all(lab for _, lab in reads)}
 
 
 def refresh_sites():
     sites = switch_sites()
+    lab_only = lab_only_switches()
     rows = []
     for line in DOC.read_text(encoding="utf-8").splitlines():
         if line.startswith("| `TILEFINCH_"):
@@ -41,6 +58,8 @@ def refresh_sites():
                 columns[3] = f" `{sites[name][0]}` "
                 if set(sites[name]) == {"src/diagnostic_trace.h"}:
                     columns[4] = " host "
+                elif name in lab_only and columns[4].strip() == "always":
+                    columns[4] = " host / PSP validation "
                 line = "|".join(columns)
         rows.append(line)
     DOC.write_text("\n".join(rows) + "\n", encoding="utf-8")
@@ -95,6 +114,7 @@ def main():
     if undocumented or stale:
         return 1
     sites = switch_sites()
+    lab_only = lab_only_switches()
     for line in DOC.read_text(encoding="utf-8").splitlines():
         if not line.startswith("| `TILEFINCH_"):
             continue
@@ -102,6 +122,10 @@ def main():
         name = columns[1].strip(" `")
         if columns[2].strip() != str(len(sites[name])) or columns[3].strip(" `") != sites[name][0]:
             print(f"stale sites for {name}: run {Path(__file__).name} {ROOT} --refresh-sites")
+            return 1
+        if name in lab_only and columns[4].strip().startswith("always"):
+            print(f"{name} is read only through tilefinch_lab_getenv, which shipping "
+                  "builds compile out; its Device column cannot be 'always'")
             return 1
     print(f"diagnostic switch registry: {len(read)} switches documented")
     return 0

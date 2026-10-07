@@ -4,6 +4,8 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/site_adapter.h"
+#include "tilefinch/site_identity.h"
+#include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_lite.h"
 
 #include <stdio.h>
@@ -359,7 +361,8 @@ int main(int argc, char **argv)
             strcmp(argv[1], "--navigation-interrupt-replay") == 0, NULL, false);
     }
     if (argc == 2 && strcmp(argv[1], "--font-staging-only") == 0)
-        return test_staged_optional_fonts_relayout_before_repaint();
+        return test_staged_optional_fonts_relayout_before_repaint()
+            || test_optional_bold_faces_follow_page_families();
     if (argc == 2 && strcmp(argv[1], "--native-text-sync-only") == 0)
         return test_native_text_sync_does_not_relayout_twice();
     if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
@@ -396,6 +399,9 @@ int main(int argc, char **argv)
         return test_script_free_browsing_journey();
     if (argc == 2 && strcmp(argv[1], "--background-interruption-only") == 0)
         return test_background_interruption_journey();
+    if (argc == 2 && strcmp(argv[1], "--google-identity-only") == 0)
+        return test_google_search_compatibility_adapter()
+            || test_google_search_identity();
     if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
         return test_cooperative_site_adapter_navigation();
     }
@@ -439,6 +445,7 @@ int main(int argc, char **argv)
     CHECK(test_structured_audio_preview_activation() == 0);
     CHECK(test_nomodule_capability_suppression() == 0);
     CHECK(test_staged_optional_fonts_relayout_before_repaint() == 0);
+    CHECK(test_optional_bold_faces_follow_page_families() == 0);
     CHECK(test_native_text_sync_does_not_relayout_twice() == 0);
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
     CHECK(test_computed_style_resolved_values() == 0);
@@ -461,6 +468,7 @@ int main(int argc, char **argv)
     CHECK(test_animated_canvas_follows_transactional_page_move() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
     CHECK(test_provisional_preview_retries_and_refreshes() == 0);
+    CHECK(test_provisional_preview_empty_backoff() == 0);
     CHECK(test_large_static_page_commits_provisionally() == 0);
     CHECK(test_preview_scrolls_ahead_during_load() == 0);
     CHECK(test_preview_focus_and_activation() == 0);
@@ -470,10 +478,12 @@ int main(int argc, char **argv)
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);
+    CHECK(test_google_search_identity() == 0);
     CHECK(test_reader_presentation_adapter() == 0);
     CHECK(test_blank_reader_frontend_recovery() == 0);
     CHECK(test_declared_media_card_recovery() == 0);
     CHECK(test_basic_view_admission_and_presentation() == 0);
+    CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
     CHECK(test_basic_view_native_root_provenance() == 0);
     CHECK(test_basic_view_handle_capacity_is_transactional() == 0);
     CHECK(test_basic_view_bypasses_author_delegated_actions() == 0);

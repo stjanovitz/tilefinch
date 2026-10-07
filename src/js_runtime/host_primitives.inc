@@ -244,19 +244,103 @@ static JSValue js_date_now(JSContext *context, JSValueConst this_value,
     return JS_NewFloat64(context, current);
 }
 
-static JSValue js_document_body_text(JSContext *context,
-                                     JSValueConst this_value,
-                                     int argc, JSValueConst *argv)
+/* The default time zone Intl reports must be the one Date's local-time
+   methods use. QuickJS derives local time from localtime_r(), so:
+   - PSP: the newlib build compiles QuickJS's tm_gmtoff read to a constant
+     zero (cmake/TilefinchDependencies.cmake), so Date is UTC and so is Intl.
+   - A deterministic realm replaces Date's local methods with UTC ones.
+   - Host: report the IANA name libc is using when it is genuinely known
+     (TZ naming an installed zoneinfo file, or the /etc/localtime link),
+     otherwise the current offset as an ECMA-402 offset identifier. */
+#if !defined(__PSP__) && !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+
+static bool host_time_zone_name_valid(const char *name)
 {
-    (void) this_value; (void) argc; (void) argv;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || bridge->document == NULL) {
-        return JS_NewString(context, "");
+    size_t length = strlen(name);
+    if (length == 0 || length >= 64 || name[0] == '/' || name[0] == '.'
+        || strstr(name, "..") != NULL || strstr(name, "//") != NULL
+        || name[length - 1] == '/') {
+        return false;
     }
-    const char *body_text = document_body_text(bridge->document);
-    if (body_text == NULL) return JS_ThrowOutOfMemory(context);
-    return JS_NewStringLen(context, body_text,
-                           bridge->document->body_text_length);
+    for (size_t at = 0; at < length; at++) {
+        unsigned char c = (unsigned char) name[at];
+        if (!isalnum(c) && c != '/' && c != '_' && c != '-' && c != '+')
+            return false;
+    }
+    return true;
+}
+
+static bool host_time_zone_installed(const char *name)
+{
+    static const char *const roots[] = {
+        "/usr/share/zoneinfo/", "/var/db/timezone/zoneinfo/"};
+    for (size_t at = 0; at < sizeof(roots) / sizeof(roots[0]); at++) {
+        char path[160];
+        struct stat info;
+        int written = snprintf(path, sizeof(path), "%s%s", roots[at], name);
+        if (written > 0 && (size_t) written < sizeof(path)
+            && stat(path, &info) == 0 && S_ISREG(info.st_mode)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *host_time_zone_from_path(const char *path)
+{
+    const char *marker = strstr(path, "zoneinfo/");
+    return marker == NULL ? NULL : marker + strlen("zoneinfo/");
+}
+#endif
+
+static void js_rt_default_time_zone(const DomBridge *bridge, char *out,
+                                    size_t capacity)
+{
+    snprintf(out, capacity, "UTC");
+    if (bridge != NULL && bridge->deterministic_clock) return;
+#if !defined(__PSP__) && !defined(_WIN32)
+    const char *candidate = NULL;
+    char link[256];
+    const char *tz = getenv("TZ");
+    if (tz != NULL) {
+        if (tz[0] == ':') tz++;
+        candidate = tz[0] == '/' ? host_time_zone_from_path(tz) : tz;
+        /* POSIX: an empty TZ means UTC. */
+        if (tz[0] == '\0') return;
+    } else {
+        ssize_t length = readlink("/etc/localtime", link, sizeof(link) - 1);
+        if (length > 0) {
+            link[length] = '\0';
+            candidate = host_time_zone_from_path(link);
+        }
+    }
+    if (candidate != NULL && host_time_zone_name_valid(candidate)
+        && host_time_zone_installed(candidate)) {
+        static const char *const utc_aliases[] = {
+            "UTC", "Etc/UTC", "Etc/UCT", "UCT", "Etc/GMT", "GMT",
+            "Etc/Universal", "Universal", "Etc/Zulu", "Zulu", "Etc/GMT0",
+            "GMT0", "Etc/GMT+0", "Etc/GMT-0", "GMT+0", "GMT-0",
+            "Etc/Greenwich", "Greenwich"};
+        for (size_t at = 0; at < sizeof(utc_aliases) / sizeof(utc_aliases[0]);
+             at++) {
+            if (strcmp(candidate, utc_aliases[at]) == 0) return;
+        }
+        if (strlen(candidate) < capacity) {
+            snprintf(out, capacity, "%s", candidate);
+            return;
+        }
+    }
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) == NULL) return;
+    long offset_minutes = local.tm_gmtoff / 60;
+    if (offset_minutes == 0) return;
+    long magnitude = offset_minutes < 0 ? -offset_minutes : offset_minutes;
+    snprintf(out, capacity, "%c%02ld:%02ld", offset_minutes < 0 ? '-' : '+',
+             magnitude / 60, magnitude % 60);
+#endif
 }
 
 static JSValue js_document_current_script(JSContext *context,
@@ -295,6 +379,30 @@ static JSValue js_script_async_assigned(JSContext *context,
         state->force_async = false;
     }
     return JS_UNDEFINED;
+}
+
+/* HTMLOrSVGElement.nonce: (handle) reads [[CryptographicNonce]];
+   (handle, value) sets it without touching the content attribute and
+   returns false when the element cannot hold a slot, so the caller falls
+   back to the attribute. */
+static JSValue js_element_nonce(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    size_t length = 0;
+    if (argc < 2) {
+        const char *nonce = document_element_nonce(node, &length);
+        return JS_NewStringLen(context, nonce == NULL ? "" : nonce, length);
+    }
+    const char *value = JS_ToCStringLen(context, &length, argv[1]);
+    if (value == NULL) return JS_EXCEPTION;
+    bool stored = bridge != NULL && document_element_set_nonce(
+        bridge->document, node, value, length);
+    JS_FreeCString(context, value);
+    return JS_NewBool(context, stored);
 }
 
 static JSValue js_post_message(JSContext *context,
@@ -665,10 +773,25 @@ static JSValue js_element_geometry(JSContext *context,
                                  ? bridge->viewport_height
                                  : (box == NULL ? fallback_height
                                                 : box->client_height));
-    SET_GEOMETRY("scrollWidth", box == NULL ? fallback_width
-                                             : box->content_width);
-    SET_GEOMETRY("scrollHeight", box == NULL ? fallback_height
-                                              : box->content_height);
+    /* The root element's scrolling area is the document's: at least the
+       viewport, and as large as the laid-out page. Its own retained box
+       has no content extent (pages read documentElement.scrollHeight to
+       find the page length; it was 0). */
+    int scroll_width = box == NULL ? fallback_width : box->content_width;
+    int scroll_height = box == NULL ? fallback_height : box->content_height;
+    if (document_root && bridge != NULL) {
+        int page_width = bridge->layout == NULL ? 0
+            : (bridge->layout->scroll_width > bridge->layout->width
+               ? bridge->layout->scroll_width : bridge->layout->width);
+        int page_height = bridge->layout == NULL ? 0
+            : bridge->layout->height;
+        scroll_width = page_width > bridge->viewport_width
+            ? page_width : bridge->viewport_width;
+        scroll_height = page_height > bridge->viewport_height
+            ? page_height : bridge->viewport_height;
+    }
+    SET_GEOMETRY("scrollWidth", scroll_width);
+    SET_GEOMETRY("scrollHeight", scroll_height);
     SET_GEOMETRY("scrollLeft", box == NULL
                                ? (intent == NULL ? 0 : intent->scroll_x)
                                : box->scroll_x);
@@ -1318,6 +1441,67 @@ static JSValue js_secure_context(JSContext *context,
                              bridge->document_url));
 }
 
+/* Lower-case an ASCII DNS name into output; false for anything a host
+   parser would reject or rewrite (non-ASCII, ports, paths, credentials,
+   spaces) or an over-long name. *numeric reports an all-digit IPv4 form. */
+static bool document_domain_ascii_host(const char *text, size_t length,
+                                       char output[254], bool *numeric)
+{
+    if (length == 0 || length > 253) return false;
+    *numeric = true;
+    for (size_t at = 0; at < length; at++) {
+        unsigned char byte = (unsigned char) text[at];
+        if (byte >= 'A' && byte <= 'Z') byte = (unsigned char) (byte + 32);
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9')
+              || byte == '-' || byte == '.')) return false;
+        if (byte != '.' && (byte < '0' || byte > '9')) *numeric = false;
+        output[at] = (char) byte;
+    }
+    output[length] = '\0';
+    return true;
+}
+
+/* HTML's document.domain setter checks: (value, current host) is valid when
+   the value equals the host, or is a dot-boundary suffix of a DNS host and
+   not a public suffix. IP hosts (including IPv6, which never passes the
+   ASCII check) and opaque origins are refused. The setter itself is a no-op
+   (origin-keyed agent clusters), so this only decides whether it throws. */
+static JSValue js_document_domain_valid(JSContext *context,
+                                        JSValueConst this_value,
+                                        int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (argc < 2 || bridge == NULL || bridge->opaque_origin) return JS_FALSE;
+    size_t value_length = 0, host_length = 0;
+    const char *value = JS_ToCStringLen(context, &value_length, argv[0]);
+    if (value == NULL) return JS_EXCEPTION;
+    const char *host_text = JS_ToCStringLen(context, &host_length, argv[1]);
+    if (host_text == NULL) {
+        JS_FreeCString(context, value);
+        return JS_EXCEPTION;
+    }
+    char wanted[254], host[254];
+    bool wanted_numeric = true, host_numeric = true;
+    bool same = value_length == host_length
+        && memcmp(value, host_text, value_length) == 0;
+    bool valid = !same && document_domain_ascii_host(value, value_length, wanted,
+                                            &wanted_numeric)
+        && document_domain_ascii_host(host_text, host_length, host,
+                                      &host_numeric);
+    JS_FreeCString(context, value);
+    JS_FreeCString(context, host_text);
+    if (same) return JS_TRUE;
+    bool public_suffix = true;
+    valid = valid && !wanted_numeric && !host_numeric
+        && value_length < host_length
+        && host[host_length - value_length - 1] == '.'
+        && strcmp(host + host_length - value_length, wanted) == 0
+        && tilefinch_public_suffix_classify(wanted, &public_suffix)
+        && !public_suffix;
+    return JS_NewBool(context, valid);
+}
+
 static JSValue js_document_url_revision(JSContext *context,
                                         JSValueConst this_value,
                                         int argc, JSValueConst *argv)
@@ -1363,35 +1547,7 @@ static bool fill_secure_random(uint8_t *data, size_t length)
 /* Complete buffered text bodies should not pay one interpreted iteration per
    byte. Malformed input stays in the JavaScript decoder because it implements
    the Encoding Standard's exact replacement behavior; this seam only accepts
-   a wholly valid UTF-8 sequence. */
-bool js_rt_utf8_valid(const uint8_t *bytes, size_t length)
-{
-    size_t at = 0u;
-    while (at < length) {
-        uint8_t first = bytes[at++];
-        if (first <= 0x7fu) continue;
-        size_t continuation = 0u;
-        uint8_t lower = 0x80u, upper = 0xbfu;
-        if (first >= 0xc2u && first <= 0xdfu) continuation = 1u;
-        else if (first >= 0xe0u && first <= 0xefu) {
-            continuation = 2u;
-            if (first == 0xe0u) lower = 0xa0u;
-            else if (first == 0xedu) upper = 0x9fu;
-        } else if (first >= 0xf0u && first <= 0xf4u) {
-            continuation = 3u;
-            if (first == 0xf0u) lower = 0x90u;
-            else if (first == 0xf4u) upper = 0x8fu;
-        } else return false;
-        if (continuation > length - at) return false;
-        for (size_t index = 0u; index < continuation; index++) {
-            uint8_t value = bytes[at++];
-            if (value < (index == 0u ? lower : 0x80u)
-                || value > (index == 0u ? upper : 0xbfu)) return false;
-        }
-    }
-    return true;
-}
-
+   a wholly valid UTF-8 sequence (tilefinch_utf8_valid). */
 static JSValue js_utf8_decode_valid(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv)
@@ -1419,7 +1575,7 @@ static JSValue js_utf8_decode_valid(JSContext *context,
         return JS_NULL;
     }
     bytes = bytes == NULL ? NULL : bytes + offset;
-    if (!js_rt_utf8_valid(bytes, length)) {
+    if (!tilefinch_utf8_valid(bytes, length)) {
         JS_FreeValue(context, buffer);
         return JS_NULL;
     }
@@ -1433,6 +1589,93 @@ static JSValue js_utf8_decode_valid(JSContext *context,
         context, (const char *) (bytes == NULL ? (uint8_t *) "" : bytes),
         length);
     JS_FreeValue(context, buffer);
+    return result;
+}
+
+/* TextDecoder's other encodings come from the Encoding Standard tables the
+   document parser decodes with (text_encoding.c). The single-byte ones are
+   stateless, so a streamed decode needs no carried state. */
+static bool js_text_decoder_single_byte(TilefinchEncoding encoding)
+{
+    return (encoding >= TILEFINCH_ENCODING_IBM866
+            && encoding <= TILEFINCH_ENCODING_X_MAC_CYRILLIC)
+        || encoding == TILEFINCH_ENCODING_X_USER_DEFINED;
+}
+
+static TilefinchEncoding js_text_decoder_encoding(JSContext *context,
+                                                  JSValueConst label)
+{
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(context, &length, label);
+    if (text == NULL) return TILEFINCH_ENCODING_NONE;
+    TilefinchEncoding encoding = tilefinch_encoding_for_label(text, length);
+    JS_FreeCString(context, text);
+    return encoding;
+}
+
+/* __tilefinchEncodingName(label): the name of the encoding `label` names,
+   when TextDecoder can decode it (UTF-8, which the bootstrap decodes, or a
+   single-byte encoding); otherwise null. */
+static JSValue js_encoding_name(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1) return JS_NULL;
+    TilefinchEncoding encoding = js_text_decoder_encoding(context, argv[0]);
+    if (encoding != TILEFINCH_ENCODING_UTF8
+        && !js_text_decoder_single_byte(encoding)) return JS_NULL;
+    return JS_NewString(context, tilefinch_encoding_name(encoding));
+}
+
+/* __tilefinchDecodeSingleByte(name, bytes, fatal): `bytes` (a Uint8Array)
+   decoded with a single-byte encoding; null when fatal and a byte has no
+   mapping (none of these tables maps a byte to U+FFFD). */
+static JSValue js_decode_single_byte(JSContext *context,
+                                     JSValueConst this_value,
+                                     int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 3) return JS_ThrowTypeError(context, "byte array required");
+    TilefinchEncoding encoding = js_text_decoder_encoding(context, argv[0]);
+    int fatal = JS_ToBool(context, argv[2]);
+    if (!js_text_decoder_single_byte(encoding) || fatal < 0)
+        return JS_ThrowRangeError(context, "unsupported encoding");
+    size_t offset = 0u, length = 0u, bytes_per_element = 0u;
+    JSValue buffer = JS_GetTypedArrayBuffer(
+        context, argv[1], &offset, &length, &bytes_per_element);
+    if (JS_IsException(buffer)) return buffer;
+    size_t buffer_length = 0u;
+    uint8_t *bytes = JS_GetArrayBuffer(context, &buffer_length, buffer);
+    if ((bytes == NULL && buffer_length != 0u) || bytes_per_element != 1u
+        || offset > buffer_length || length > buffer_length - offset
+        || length > 1024u * 1024u) {
+        JS_FreeValue(context, buffer);
+        return JS_ThrowTypeError(context, "byte array required");
+    }
+    /* Each byte becomes at most three UTF-8 bytes; keep the decoder's
+       eight bytes of headroom so one call consumes everything. */
+    size_t capacity = tilefinch_decoder_maximum_output(encoding, length) + 8u;
+    unsigned char *output = js_malloc(context, capacity);
+    if (output == NULL) {
+        JS_FreeValue(context, buffer);
+        return JS_EXCEPTION;
+    }
+    TilefinchDecoder decoder;
+    tilefinch_decoder_init(&decoder, encoding);
+    const unsigned char *input = bytes == NULL ? NULL : bytes + offset;
+    size_t remaining = length;
+    size_t written = tilefinch_decoder_decode(
+        &decoder, &input, &remaining, output, capacity, true);
+    JS_FreeValue(context, buffer);
+    bool refused = false;
+    for (size_t at = 0; fatal && !refused && at + 3u <= written; at++)
+        refused = output[at] == 0xefu && output[at + 1u] == 0xbfu
+            && output[at + 2u] == 0xbdu;
+    JSValue result = remaining != 0u
+        ? JS_ThrowInternalError(context, "decoder output overflow")
+        : refused ? JS_NULL
+        : JS_NewStringLen(context, (const char *) output, written);
+    js_free(context, output);
     return result;
 }
 
@@ -2429,6 +2672,12 @@ static JSValue js_compile_inline_event_handler(JSContext *context,
     }
     if (!tilefinch_csp_allows_script_attribute(
             &bridge->document->content_security_policy)) {
+#ifndef TILEFINCH_NO_TRACE
+        /* Site-census ledger: an inline event handler the page's CSP
+           refused (the policy query at realm creation is not a refusal). */
+        if (tilefinch_trace_census())
+            puts("census-csp-refusal what=event-handler-attribute url=\"\"");
+#endif
         return JS_NULL;
     }
 
@@ -2564,6 +2813,11 @@ bool js_rt_install_function(JSContext *context, JSValue global,
     bool transient_bootstrap_bridge =
         strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0
         || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0
+        || strcmp(name, "__tilefinchEncodingName") == 0
+        || strcmp(name, "__tilefinchDecodeSingleByte") == 0
+        || strcmp(name, "__tilefinchCssStatementEnds") == 0
+        || strcmp(name, "__tilefinchConstructedSheetText") == 0
+        || strcmp(name, "__tilefinchSetAdoptedSheets") == 0
         || strcmp(name, "__tilefinchEncodeUtf8") == 0
         || strcmp(name, "__tilefinchOpfsCommand") == 0
         || strcmp(name, "__tilefinchUserActivationState") == 0;

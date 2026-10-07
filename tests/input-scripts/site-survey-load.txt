@@ -1,0 +1,16 @@
+# Site survey load: like news-load, but first allows about 100 s of live
+# page work at 111 MHz so heavy pages can settle before the ready-gated
+# marks. A page that is still not ready afterwards stalls, which is itself
+# the finding. Used by the 2026-10 site survey (Reddit, weather, AP, Reuters).
+wait-live 60
+wait-live 3000
+wait-page 60
+mark-page top
+tap-page rtrigger
+wait-page 45
+mark-page p1
+tap-page rtrigger
+wait-page 45
+mark-page p2
+wait-page 30
+end

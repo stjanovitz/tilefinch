@@ -149,6 +149,42 @@ class ReferenceCaptureIndexTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(expected, completed.stderr)
 
+    def test_blocked_origins_accept_hosts_and_first_party_routes(self) -> None:
+        script = (
+            "const capture=require(process.argv[1]);"
+            "const entries=capture.parseBlockedOrigins("
+            "'mdnplay.dev|developer.mozilla.org/pong/','m.tsv');"
+            "const urls=['https://e4.mdnplay.dev/runner.html',"
+            "'https://developer.mozilla.org/pong/get',"
+            "'https://developer.mozilla.org/pong',"
+            "'https://developer.mozilla.org/en-US/docs/pong/get',"
+            "'https://developer.mozilla.org/static/a.js',"
+            "'https://example.org/pong/get','not a url'];"
+            "process.stdout.write(JSON.stringify(urls.map("
+            "(url)=>capture.blockedUrlMatches(url,entries))));"
+        )
+        completed = subprocess.run(
+            (NODE, "-e", script, str(CAPTURE)),
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            [True, True, False, False, False, False, False],
+        )
+        for bad in ("Developer.mozilla.org/pong/", "developer.mozilla.org/po ng/",
+                    "/pong/", "developer.mozilla.org?x"):
+            with self.subTest(entry=bad):
+                rejected = subprocess.run(
+                    (NODE, "-e",
+                     "require(process.argv[1]).parseBlockedOrigins("
+                     "process.argv[2],'m.tsv')",
+                     str(CAPTURE), bad),
+                    check=False, capture_output=True, text=True,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("hostname/path-prefix", rejected.stderr)
+
     def test_chromium_manifest_clock_and_native_cli_bounds(self) -> None:
         manifest = ROOT / "benchmarks" / "visual-scenarios.tsv"
         script = (

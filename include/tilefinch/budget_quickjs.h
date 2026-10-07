@@ -57,7 +57,8 @@ size_t budget_quickjs_pool_js_malloc_current(const BudgetQuickJSPool *pool);
 /* Asked when an allocation would pass the realm's heap limit: `live` bytes
    are in use and `growth` more are requested against `limit`. Return a
    larger limit to admit the allocation, or 0 to refuse it. Runs inside the
-   allocator: it must not allocate or run JavaScript. */
+   allocator before the pool is touched: it must not allocate from the
+   QuickJS heap or run JavaScript (the page Budget may be used). */
 typedef size_t (*BudgetQuickJSLimitGrowth)(void *opaque, size_t live,
                                            size_t growth, size_t limit);
 void budget_quickjs_pool_set_limit_growth(BudgetQuickJSPool *pool,

@@ -39,6 +39,7 @@
 #include "tilefinch/youtube_lite.h"
 #include "tilefinch/youtube_resolver.h"
 #include "tilefinch/youtube_subtitles.h"
+#include "tilefinch_test_clocks.h"
 
 #define MIB (1024u * 1024u)
 #ifndef TILEFINCH_TEST_SANS_FONT

@@ -76,15 +76,18 @@ void script_runtime_limit_execution_for_us(ScriptRuntime *runtime,
                                            uint64_t remaining_us)
 {
     if (runtime == NULL) return;
-    uint64_t now_ms = monotonic_time_ms();
-    uint64_t remaining_ms = remaining_us / UINT64_C(1000);
-    if (remaining_us % UINT64_C(1000) != 0u) remaining_ms++;
+    /* Round the absolute deadline up, not the start down. A whole-ms start
+       (up to 0.999 ms early) let the watchdog stop the script before the
+       caller's microsecond deadline, so the parser stage accounted just
+       under its limit and left its time breaker closed. */
+    uint64_t now_us = js_rt_monotonic_time_ns() / UINT64_C(1000);
     /* Zero is the public sentinel for "no cap", so an exhausted allowance
        is represented by the current nonzero monotonic instant. */
-    if (remaining_ms > UINT64_MAX - now_ms) {
+    if (remaining_us > UINT64_MAX - UINT64_C(999) - now_us) {
         runtime->execution_deadline_cap_ms = UINT64_MAX;
     } else {
-        runtime->execution_deadline_cap_ms = now_ms + remaining_ms;
+        runtime->execution_deadline_cap_ms =
+            (now_us + remaining_us + UINT64_C(999)) / UINT64_C(1000);
         if (runtime->execution_deadline_cap_ms == 0u) {
             runtime->execution_deadline_cap_ms = 1u;
         }
@@ -155,11 +158,17 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime);
 
 bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
 {
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_JOBS);
+#endif
     unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
     unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
     bool ok = runtime_run_jobs_checkpoint(runtime);
     script_split_leave(split);
     work_ledger_leave(ledger);
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_JOBS);
+#endif
     return ok;
 }
 
@@ -173,7 +182,8 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
     if (JS_IsStackActive(runtime->runtime)) {
         js_rt_saturating_add_size(&runtime->reentrant_checkpoints_skipped, 1);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-        runtime_log_reentrant_checkpoint(runtime);
+        if (!runtime->checkpoint_trace_suppressed)
+            runtime_log_reentrant_checkpoint(runtime);
 #endif
         return true;
     }
@@ -186,7 +196,7 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
     size_t work = 0;
     const bool trace_steps =
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-        true;
+        !runtime->checkpoint_trace_suppressed;
 #else
         tilefinch_trace_runtime_steps();
 #endif
@@ -199,6 +209,7 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
     bool split_on = trace_steps && script_split_enabled();
     if (split_on) script_split_snapshot(&split_begin);
 #endif
+    size_t gc_collections_before = runtime->heap_collections;
     size_t promise_jobs = 0, continuations = 0;
     uint64_t promise_job_us = 0, promise_job_max_us = 0;
     uint64_t continuation_us = 0, continuation_max_us = 0;
@@ -407,6 +418,10 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
         }
         work++;
     }
+    if (runtime->heap_collections - gc_collections_before
+            > runtime->gc_checkpoint_collections_max)
+        runtime->gc_checkpoint_collections_max =
+            runtime->heap_collections - gc_collections_before;
     /* Task boundary: a WebAssembly runtime left idle by this task's
        operations is released here (see wasm_runtime_leave). */
     uint64_t wasm_release_started_ns = trace_steps
@@ -892,8 +907,7 @@ bool script_runtime_configure_messaging(
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
     if (ok && child_opaque_origin) {
         static const char opaque_setup[] =
-            "(()=>{Object.defineProperty(location,'origin',{value:'null',"
-            "writable:false,configurable:false});"
+            "(()=>{globalThis.__tilefinchMarkLocationOpaque?.();"
             "Object.defineProperty(globalThis,'origin',{value:'null',"
             "writable:false,configurable:false});"
             "const denyStorage=()=>{throw new DOMException('Opaque origin',"
@@ -1224,6 +1238,59 @@ bool script_runtime_evaluate_probe(ScriptRuntime *runtime,
     return ok;
 }
 
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+bool script_runtime_call_boolean_probe(ScriptRuntime *runtime,
+                                       const char *function_name,
+                                       bool *matched)
+{
+    if (matched != NULL) *matched = false;
+    if (runtime == NULL || function_name == NULL || matched == NULL)
+        return false;
+    size_t length = 0;
+    while (length <= 96u && function_name[length] != '\0') length++;
+    if (length == 0 || length > 96u) return false;
+    bool preserve_failure_telemetry = !runtime->result.success;
+    bool previous_interrupted = runtime->result.interrupted;
+    size_t previous_polls = runtime->result.watchdog_polls;
+    unsigned long previous_elapsed = runtime->result.watchdog_elapsed_ms;
+    Watchdog previous_watchdog = runtime->watchdog;
+    js_rt_runtime_arm_watchdog(runtime);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue function = JS_GetPropertyStr(
+        runtime->context, global, function_name);
+    JSValue value = JS_UNDEFINED;
+    bool ok = !JS_IsException(function);
+    if (ok && !JS_IsFunction(runtime->context, function)) {
+        JS_ThrowTypeError(runtime->context, "diagnostic predicate is not callable");
+        ok = false;
+    }
+    if (ok) {
+        value = JS_Call(runtime->context, function, global, 0, NULL);
+        ok = !JS_IsException(value);
+        if (ok) {
+            int boolean = JS_ToBool(runtime->context, value);
+            ok = boolean >= 0;
+            if (ok) *matched = boolean != 0;
+        }
+    }
+    JS_FreeValue(runtime->context, value);
+    JS_FreeValue(runtime->context, function);
+    JS_FreeValue(runtime->context, global);
+    if (!ok) js_rt_record_exception(runtime->context, &runtime->result);
+    js_rt_runtime_finish_slice_state(runtime);
+    runtime->result.success = ok;
+    if (preserve_failure_telemetry) {
+        runtime->result.interrupted = previous_interrupted;
+        runtime->result.watchdog_polls = previous_polls;
+        runtime->result.watchdog_elapsed_ms = previous_elapsed;
+    }
+    runtime->watchdog = previous_watchdog;
+    if (runtime->watchdog.slice_started_ns != 0)
+        runtime->watchdog.slice_started_ns = js_rt_monotonic_time_ns();
+    return ok;
+}
+#endif
+
 bool script_runtime_record_resource_timing(ScriptRuntime *runtime,
                                            const char *url,
                                            const char *initiator_type)
@@ -1330,7 +1397,7 @@ bool script_runtime_node_handle_capacity_available(
 {
     if (runtime == NULL) return true;
     const DomBridge *bridge = &runtime->bridge;
-    if (bridge->node_count < DOM_BRIDGE_NODE_LIMIT) return true;
+    if (bridge->node_count < bridge->node_capacity_limit) return true;
     for (size_t slot = 0; slot < bridge->node_count; slot++) {
         if (bridge->nodes[slot] == NULL
             && bridge->node_generations[slot] != 0
@@ -1367,6 +1434,31 @@ bool script_runtime_dynamic_script_is_scheduled(
         if (state->node == node && state->already_started) return true;
     }
     return false;
+}
+
+void script_runtime_script_mark_started(ScriptRuntime *runtime,
+                                        const lxb_dom_node_t *node)
+{
+    ScriptElementState *state = runtime == NULL ? NULL
+        : js_rt_script_element_state_find(&runtime->bridge, node);
+    if (state == NULL || state->already_started) return;
+    lxb_dom_node_t *element = state->node;
+    size_t source_length = 0;
+    if (dynamic_attribute_present(element, "src")
+        || !script_node_source_length(element, &source_length)
+        || source_length != 0) state->already_started = true;
+}
+
+bool script_runtime_script_parser_inserted(
+    const ScriptRuntime *runtime, const lxb_dom_node_t *node)
+{
+    if (runtime == NULL || node == NULL) return true;
+    const DomBridge *bridge = &runtime->bridge;
+    for (size_t i = 0; i < bridge->script_element_count; i++) {
+        const ScriptElementState *state = &bridge->script_elements[i];
+        if (state->node == node) return !state->programmatic;
+    }
+    return true;
 }
 
 ScriptQuotaReserveResult script_runtime_script_quota_reserve(
@@ -1502,7 +1594,8 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
     }
     for (;;) {
         if (bridge->fetch_scheduler != NULL
-            && fetch_scheduler_pending(bridge->fetch_scheduler) >= 4) break;
+            && fetch_scheduler_pending(bridge->fetch_scheduler)
+                   >= SCRIPT_DYNAMIC_INFLIGHT_REQUESTS) break;
         ScriptDynamicTask *next = NULL;
         for (size_t i = 0; i < SCRIPT_DYNAMIC_TASK_LIMIT; i++) {
             ScriptDynamicTask *task = &bridge->dynamic_scripts[i];

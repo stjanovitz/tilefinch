@@ -150,6 +150,11 @@ const char *psp_media_present_ge_reason(void)
     return psp_media_present_ge_failure;
 }
 
+void psp_media_present_ge_latch_failure(const char *reason)
+{
+    psp_media_present_ge_latch(reason == NULL ? "ge-failure" : reason);
+}
+
 static void *psp_media_present_ge_uncached_list(void)
 {
     return (void *) ((uintptr_t) psp_media_present_ge_list
@@ -1659,6 +1664,11 @@ bool psp_media_present_ge_passthrough_check(uint32_t *destination)
 const char *psp_media_present_ge_reason(void)
 {
     return "no-graphics-engine";
+}
+
+void psp_media_present_ge_latch_failure(const char *reason)
+{
+    (void) reason;
 }
 
 void psp_media_present_ge_passthrough(uint32_t *drawn, uint32_t *source)

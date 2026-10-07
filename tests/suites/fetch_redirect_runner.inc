@@ -29,6 +29,8 @@ int main(int argc, char **argv)
         "callback-abort-classification",
         test_redirect_callback_abort_classification());
     RUN_REDIRECT_TEST(
+        "blocked-origin-routes", test_blocked_origin_routes());
+    RUN_REDIRECT_TEST(
         "private-network-admission",
         test_private_network_admission(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
@@ -174,6 +176,9 @@ int main(int argc, char **argv)
     RUN_REDIRECT_TEST(
         "javascript-binary-responses",
         test_javascript_binary_responses(&budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
+        "send-beacon-delivery",
+        test_send_beacon_delivery(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
         "browser-engine-url-replay-promotion",
         test_browser_engine_url_replay_promotion(

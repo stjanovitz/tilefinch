@@ -39,6 +39,18 @@
 #     --measure         a measurement scenario: pass without a golden (one
 #                       that exists is still enforced); used by
 #                       benchmarks/run-perf-journeys.py
+#     --record-video DIR
+#                       dump PPSSPP's frames (lossless FFV1 AVI, native
+#                       480x272, one frame per presented frame) and audio
+#                       (WAV) into DIR/VIDEO and DIR/AUDIO (DIR/run-N/ with
+#                       --runs > 1); host audio goes to a dummy driver.
+#                       Analyze with scripts/analyze-game-video.py.
+#
+# Set TILEFINCH_PPSSPP_SOFTWARE_RENDERER=1 to rasterize with PPSSPP's
+# software renderer (key SoftwareRenderer; the older SoftwareRendering
+# spelling is ignored). The hardware renderer does not show browser chrome
+# and toasts the CPU draws over GE-written frames, so a recording meant to
+# catch those overlays needs it; it is slower, and timing differs.
 #
 # Set TILEFINCH_PPSSPP_CPU_MHZ to a positive emulated PSP clock for a
 # deterministic pressure run, or leave it unset/0 for PPSSPP's normal clock.
@@ -92,6 +104,7 @@ capture_target=
 boot_extra=
 heap_mb=
 script_file_kb=
+record_video=
 # PPSSPP's OpenGL backend no longer initializes on current macOS: the emulator
 # records the failure, shows a dialog, and never starts the EBOOT, which from
 # here looks exactly like a hung browser until the timeout. Vulkan (MoltenVK,
@@ -110,6 +123,10 @@ case "$graphics" in
     *) printf 'TILEFINCH_PPSSPP_GRAPHICS must be opengl or vulkan\n' >&2; exit 2 ;;
 esac
 ppsspp_cpu_mhz=${TILEFINCH_PPSSPP_CPU_MHZ:-${TREADLINE_CPU_MHZ:-0}}
+case "${TILEFINCH_PPSSPP_SOFTWARE_RENDERER:-0}" in
+    1|true|True) software_renderer=True ;;
+    *) software_renderer=False ;;
+esac
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -143,7 +160,9 @@ ${1#--boot=}"; shift ;;
         --debug-log) debug_log=1; shift ;;
         --update-golden) update_golden=1; shift ;;
         --measure) measure=1; shift ;;
-        -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+        --record-video) record_video=$2; shift 2 ;;
+        --record-video=*) record_video=${1#--record-video=}; shift ;;
+        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -241,6 +260,13 @@ case "$build_dir" in
     /*) ;;
     *) build_dir="$root/$build_dir" ;;
 esac
+if [ -n "$record_video" ]; then
+    case "$record_video" in
+        /*) ;;
+        *) record_video="$(pwd)/$record_video" ;;
+    esac
+    mkdir -p "$record_video"
+fi
 
 script_source="$root/tests/input-scripts/$scenario.txt"
 golden="$root/tests/input-scripts/$scenario.device-golden.txt"
@@ -520,6 +546,16 @@ run_once() {
             "FirstRun = False" \
             "Enable Logging = True" \
             "AutoRun = True"
+        # --record-video: PPSSPP's frame dump writes one frame per frame the
+        # game presents (the AVI's 59.94 fps label is nominal), lossless, at
+        # the PSP's own resolution, plus the mixed audio.
+        if [ -n "${record_video:-}" ]; then
+            printf '%s\n' \
+                "DumpFrames = True" \
+                "UseFFV1 = True" \
+                "DumpVideoOutput = False" \
+                "DumpAudio = True"
+        fi
         # Code-layout profiling (tools/ppsspp_pc_sampler.py): open PPSSPP's
         # WebSocket debugger on a fixed loopback port for this run only.
         if [ -n "${TILEFINCH_PPSSPP_DEBUGGER_PORT:-}" ]; then
@@ -536,13 +572,19 @@ run_once() {
             "InfrastructureAutoDNS = True" \
             "[Graphics]" \
             "GraphicsBackend = $graphics_backend" \
+            "SoftwareRenderer = $software_renderer"
+        [ -z "${record_video:-}" ] || printf '%s\n' "InternalResolution = 1"
+        printf '%s\n' \
             "[SystemParam]" \
             "PSPModel = 1" \
             "PSPFirmwareVersion = 660"
         # Keep the emulated mixer/syscalls running, but never play background
         # Treadline test audio on the host. Only this disposable run is muted.
         # PPSSPP 1.20 uses GameVolume; GlobalVolume covers older installations.
-        case "$scenario" in
+        # A recording keeps the game's volume (the dump mixes it) and plays
+        # nothing on the host: its run uses SDL's dummy audio driver.
+        case "$scenario${record_video:+:recording}" in
+            treadline-*:recording) ;;
             treadline-*)
                 printf '%s\n' \
                     "[Sound]" \
@@ -560,6 +602,13 @@ run_once() {
 
     debug_flag=
     [ "$debug_log" -eq 1 ] && debug_flag=-d
+    # A recording plays nothing on the host (SDL's dummy audio driver).
+    audio_env=
+    if [ -n "$record_video" ]; then
+        audio_env="--env SDL_AUDIODRIVER=dummy"
+        # The direct (non-macOS) launch inherits it instead.
+        [ "$is_darwin" -eq 1 ] || export SDL_AUDIODRIVER=dummy
+    fi
 
     printf 'PPSSPP scripted input: %s run %s/%s\n' \
         "$scenario" "$run_index" "$runs"
@@ -568,7 +617,7 @@ run_once() {
         : >"$emulator_stderr"
         # shellcheck disable=SC2086
         open -g -n -W \
-            --env "HOME=$home_dir" \
+            --env "HOME=$home_dir" $audio_env \
             --stdout "$emulator_stdout" \
             --stderr "$emulator_stderr" \
             -a "$ppsspp_bundle" \
@@ -653,6 +702,24 @@ run_once() {
         mkdir -p "$run_result/pgo" && cp "$f" "$run_result/pgo/"
     done
     ls -laR "$app_dir" > "$run_result/app-dir.txt" 2>&1 || true
+    if [ -n "$record_video" ]; then
+        # The isolated HOME (and its dump) is deleted with the session.
+        video_target=$record_video
+        [ "$runs" -eq 1 ] || video_target="$record_video/run-$run_index"
+        mkdir -p "$video_target"
+        for dump in VIDEO AUDIO; do
+            dump_dir="$home_dir/.config/ppsspp/PSP/$dump"
+            [ -d "$dump_dir" ] && cp -R "$dump_dir" "$video_target/" || true
+        done
+        # The validation log carries the run's frame and mark timeline.
+        [ -f "$validation_log" ] && cp "$validation_log" "$video_target/" || true
+        if ls "$video_target"/VIDEO/*.avi >/dev/null 2>&1; then
+            printf 'recorded video: %s\n' "$video_target"
+        else
+            printf 'WARNING: no frame dump in %s\n' \
+                "$home_dir/.config/ppsspp/PSP" >&2
+        fi
+    fi
     if [ -n "$capture_target" ] && [ "$run_index" -eq 1 ]; then
         if [ -f "$app_dir/capture/trace.meta" ]; then
             cp -R "$app_dir/capture" "$capture_target"
@@ -661,9 +728,10 @@ run_once() {
             printf '%s\n' 'capture did not finish (no trace.meta)' >&2
         fi
     fi
-    # The harness's own lines, in order. Nothing here is wall-clock derived,
-    # so the extraction is the whole normalizer.
-    sed -n 's/^\(tilefinch-input-script: .*\)$/\1/p' "$validation_log" \
+    # The harness's own lines, in order. Only an until step's completion
+    # carries a clock (at-us); drop it, keeping the step and check count.
+    sed -n -e 's/^\(tilefinch-input-script: until-met .*\) at-us=[0-9]*$/\1/p' \
+        -e t -e 's/^\(tilefinch-input-script: .*\)$/\1/p' "$validation_log" \
         2>/dev/null >"$run_result/trace.txt" || true
     [ "$saw_outcome" -eq 1 ] || {
         printf 'FAIL: run %s never reached a clean exit.\n' "$run_index" >&2
@@ -992,6 +1060,22 @@ if [ "$scenario" = treadline-immediate-deploy ]; then
             >&2 || true
         exit 1
     }
+fi
+# The long soak measures real play: Deploy must have claimed Page controls
+# (no browser chrome over the canvas), the game's phase clocks must be off for
+# the window, and their report must arrive after it rather than inside it.
+if [ "$scenario" = treadline-long-soak ]; then
+    for expected in \
+        'tilefinch-input-chrome: mark=webgl-measure-start visible=0 ' \
+        'tilefinch-input-script-mark-js: mark=webgl-measure-start ok=1 value="TREADLINE-LONG-SOAK-CLOCKS-OFF"' \
+        'tilefinch-input-script-mark-js: mark=profile-report ok=1 value="TREADLINE-JS-PHASES '; do
+        grep -Fq "$expected" "$telemetry_log" || {
+            printf 'FAIL: long soak is missing: %s\n' "$expected" >&2
+            grep -E 'mark=(webgl-measure-start|profile-report)' \
+                "$telemetry_log" >&2 || true
+            exit 1
+        }
+    done
 fi
 if [ "$scenario" = treadline-offline-controls ]; then
     gamepad_line=$(grep 'tilefinch-input-gamepad:' "$telemetry_log" \

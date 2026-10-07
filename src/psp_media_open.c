@@ -1158,6 +1158,11 @@ void psp_media_open_clear_wait_budget(PspMediaSession *media)
  */
 static void psp_media_open_report(PspMediaSession *media, const char *event)
 {
+#ifndef TILEFINCH_PSP_VALIDATION_LOG
+    /* Validation-log output only. */
+    (void) media;
+    (void) event;
+#else
     MediaHttpRangeStats video = {0};
     MediaHttpRangeStats audio = {0};
     (void) media_http_range_stats(media->range, &video);
@@ -1212,6 +1217,7 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
                hls.queued_samples, hls.queued_bytes,
                hls.active_requests, hls.live ? 1 : 0);
     }
+#endif
 }
 
 /* The resolver may need several bounded client attempts and about a megabyte
@@ -1975,9 +1981,9 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
            continue an existing playback transaction. A fresh watch-page open
            always starts at zero: durable profile positions made a later app
            launch pay an immediate random-access seek over a new CDN route,
-           which is both surprising and less reliable than a clean start. A
-           zero/paused recovery already has the desired initial state and
-           avoids an unnecessary decoder reset. */
+           which is both surprising and less reliable than a clean start.
+           Any continuation, a paused one at 0:00 included, resumes through
+           the seek (psp_media_continuation_needs_resume_seek says why). */
         PspMediaContinuation *continuation = &media->continuation;
         /* Cross pressed during the reopen is where it resumes, rather than
            a second seek after the resume seek lands. */
@@ -1989,9 +1995,8 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             psp_media_target_clear(&media->pending_target);
         }
         bool reopen_resume_available =
-            psp_media_continuation_reopening(continuation)
-            && (continuation->position_us != 0 || continuation->playing)
-            && duration_us != 0;
+            psp_media_continuation_needs_resume_seek(
+                continuation, duration_us);
         if (reopen_resume_available) {
             media->job_target_us = continuation->position_us > duration_us
                 ? duration_us : continuation->position_us;
@@ -2017,9 +2022,9 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         }
         if (media->reopen_seek_completion_pending
             && !reopen_resume_available) {
-            /* A zero-position paused reopen needs no follow-up seek. The
-               replacement backend is already at its target, so this is the
-               completion boundary for that special case. */
+            /* A reopen with no known duration has nothing to seek within.
+               The replacement backend starts at its beginning, so this is
+               the completion boundary for that case. */
             media->seek_completions++;
             media->reopen_seek_completion_pending = false;
         }

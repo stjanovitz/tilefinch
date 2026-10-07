@@ -249,7 +249,7 @@ ExternalProject_Add(tilefinch_psp_curl
         "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
         "-DCMAKE_BUILD_TYPE=MinSizeRel"
-        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_transport_prefix_map_flags}${_transport_mbedtls_consumer_flags}"
+        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections -DTILEFINCH_CURL_KEEP_STRERROR=1 -DTILEFINCH_CURL_NO_CERTINFO=1 -DTILEFINCH_CURL_NO_CLIENT_CERT=1 -DTILEFINCH_CURL_NO_CIPHER_LIST=1${_transport_prefix_map_flags}${_transport_mbedtls_consumer_flags}"
         "-DCMAKE_PREFIX_PATH=${_transport_prefix}"
         "-DCURL_USE_CMAKECONFIG=OFF"
         "-DCURL_USE_PKGCONFIG=OFF"
@@ -312,12 +312,60 @@ ExternalProject_Add(tilefinch_psp_curl
         "-DCURL_DISABLE_FORM_API=ON"
         "-DCURL_DISABLE_PROGRESS_METER=ON"
         "-DCURL_DISABLE_GETOPTIONS=ON"
+        # curl never holds a credential: no CURLOPT_USERPWD/USERNAME/
+        # PASSWORD/HTTPAUTH/XOAUTH2_BEARER is set, netrc and proxies are off,
+        # tilefinch_url_parse rejects every URL with userinfo before it can
+        # reach CURLOPT_URL, and the browser follows redirects itself. With
+        # no credentials curl's auth code only records which schemes a 401
+        # offered (CURLINFO_HTTPAUTH_AVAIL, never read). Compiling the schemes
+        # out drops Digest and its MD5/SHA-512/256 helpers; NTLM, SPNEGO and
+        # Kerberos were never built (no GSSAPI, no CURL_ENABLE_NTLM).
+        "-DCURL_DISABLE_HTTP_AUTH=ON"
+        "-DCURL_DISABLE_BASIC_AUTH=ON"
+        "-DCURL_DISABLE_BEARER_AUTH=ON"
+        "-DCURL_DISABLE_DIGEST_AUTH=ON"
+        "-DCURL_DISABLE_KERBEROS_AUTH=ON"
+        "-DCURL_DISABLE_NEGOTIATE_AUTH=ON"
+        # curl parses dates only for If-Modified-Since/Last-Modified
+        # (CURLOPT_TIMECONDITION/FILETIME, never set), cookies, HSTS and
+        # alt-svc (all off) and Retry-After, whose value lands only in
+        # CURLINFO_RETRY_AFTER, which the browser never reads. The browser
+        # does its own HTTP date handling.
+        "-DCURL_DISABLE_PARSEDATE=ON"
+        # Sockets are never bound to a local interface, address or port
+        # (no CURLOPT_INTERFACE/LOCALPORT/LOCALPORTRANGE); curl's bindlocal()
+        # returned before any syscall when none is set.
+        "-DCURL_DISABLE_BINDLOCAL=ON"
+        # Tilefinch never sets CURLOPT_VERBOSE or a debug callback, so curl's
+        # infof()/CURL_TRC_* trace text is never produced. Compile it out.
+        # Upstream also folds the curl_*_strerror() tables into this switch;
+        # the browser shows those messages, so the PSP patch keeps them under
+        # TILEFINCH_CURL_KEEP_STRERROR (set in CMAKE_C_FLAGS above).
+        "-DCURL_DISABLE_VERBOSE_STRINGS=ON"
+        # CURLOPT_CERTINFO is never set either; TILEFINCH_CURL_NO_CERTINFO
+        # (CMAKE_C_FLAGS above) compiles the Mbed TLS backend's certificate
+        # extraction, and with it curl's ASN.1 formatter, out.
+        # TILEFINCH_CURL_NO_CLIENT_CERT likewise compiles out the client
+        # certificate and private-key loaders: no CURLOPT_SSLCERT, SSLKEY or
+        # their blobs is ever set, and setting one now fails as not built in.
+        # TILEFINCH_CURL_NO_CIPHER_LIST compiles out curl's cipher-list
+        # parser: CURLOPT_SSL_CIPHER_LIST/TLS13_CIPHERS are never set, so the
+        # ClientHello always carries mbedtls_ssl_list_ciphersuites(), which
+        # is still what is installed.
         ${_curl_nghttp2_args}
     BUILD_BYPRODUCTS "${_transport_prefix}/lib/libcurl.a")
 ExternalProject_Add_Step(tilefinch_psp_curl user-config
     COMMAND "${CMAKE_COMMAND}" -E true
     DEPENDS "${_transport_mbedtls_config}"
     DEPENDERS configure)
+# The patch step only reruns when its command line changes. Re-extract the
+# pristine archive whenever the patch file itself changes, so an existing
+# build tree never keeps a source tree patched by an older revision.
+ExternalProject_Add_Step(tilefinch_psp_curl patch-file
+    COMMAND "${CMAKE_COMMAND}" -E true
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch"
+    DEPENDERS download
+    INDEPENDENT TRUE)
 
 # mbed TLS's MBEDTLS_ENTROPY_HARDWARE_ALT hook. Linked immediately after
 # libmbedcrypto on both interfaces below, so any executable whose link pulls

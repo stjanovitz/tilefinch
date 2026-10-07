@@ -65,13 +65,39 @@ def run(lab, root, index, source=None, commands="commands.txt"):
     return log
 
 
+# Rule-index and selector work that a layout style cache miss adds: a miss
+# is one full resolution, which queries the rule index and matches the
+# rules it returns.
+CACHE_DRIVEN = ("style.rule_queries", "style.rule_candidates",
+                "style.selector_matches", "style.selector_hits")
+
+
 def check_equal(first, second):
     # The layout style cache is keyed by node address, so its hit/miss split
     # can move by one when allocation interleaving differs (LAB_USAGE.md);
-    # style.resolutions carries the deterministic style work.
+    # style.resolutions carries the deterministic style work. A miss also
+    # can run one more rule query and its selector matches (a retained
+    # match list can also serve it), which moved these counters too: in 600
+    # runs from fresh temporary directories, two had one or two more misses
+    # and as many more rule queries. Everything else must match exactly; the
+    # cache-driven counters must match whenever the misses do, and otherwise
+    # move only in the misses' direction, rule queries by at most as many.
     subprocess.run([sys.executable, str(REPORT), "--check-equal",
-                    "--ignore", "style.cache_", str(first), str(second)],
+                    "--ignore", "style.cache_", "--ignore", "style.rule_",
+                    "--ignore", "style.selector_", str(first), str(second)],
                    check=True)
+    a, b = parse(first.read_text()), parse(second.read_text())
+    assert [label for label, _ in a] == [label for label, _ in b], (a, b)
+    for (label, x), (_, y) in zip(a, b):
+        extra = y["style.cache_misses"] - x["style.cache_misses"]
+        delta = {field: y[field] - x[field] for field in CACHE_DRIVEN}
+        if extra == 0:
+            assert not any(delta.values()), (label, delta)
+        else:
+            assert abs(delta["style.rule_queries"]) <= abs(extra), (
+                label, extra, delta)
+            assert all(d == 0 or (d > 0) == (extra > 0)
+                       for d in delta.values()), (label, extra, delta)
 
 
 def main():

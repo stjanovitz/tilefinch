@@ -59,6 +59,9 @@ globalThis.__tilefinchInstallFrames = (support) => {
     },
     frameScope = globalThis.__tilefinchFrameScope,
     frameWindows = new Map(),
+    frameTargetName = (state, handle) =>
+      state?.targetName ??
+      String(wrap(handle)?.getAttribute?.("name") ?? ""),
     frameWindowLimit = 16,
     evictFrameWindow = () => {
       let candidate = null;
@@ -120,6 +123,19 @@ globalThis.__tilefinchInstallFrames = (support) => {
       });
       scope.frames = proxy;
       scope.length = 0;
+      /* The browsing context name: the container's name attribute until
+         the child assigns its own. */
+      Object.defineProperty(scope, "name", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return frameTargetName(state, handle);
+        },
+        set(value) {
+          state.targetName = String(value);
+          globalThis.__tilefinchChildNavigablesChanged?.(null);
+        },
+      });
       Object.defineProperty(scope, "frameElement", {
         configurable: true,
         enumerable: true,
@@ -138,25 +154,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
           targetOrigin,
           location.origin,
         );
-        const wire = encodeFrameMessage(data),
-          ancestors = [];
-        for (
-          let at = current;
-          at && ancestors.length < 8;
-          at = at.parentElement
-        )
-          ancestors.push(
-            String(at.tagName || at.nodeName || "") +
-              ":" +
-              String(at.__handle || 0),
-          );
-        globalThis.__tilefinchLastFramePost = {
-          handle,
-          connected: true,
-          ancestors,
-          src: String(current.src || ""),
-          targetOrigin: normalizedTarget,
-        };
+        const wire = encodeFrameMessage(data);
         __tilefinchPostMessage(
           handle,
           wire,
@@ -198,6 +196,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
         opaqueOrigin: false,
         managed: false,
         initialAboutBlank: true,
+        targetName: null,
         loadGeneration: 0,
         localSource: null,
         localSrcdoc: null,
@@ -474,7 +473,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
         globalThis.__tilefinchDispatchWindowEventCheckpointed(event);
       },
     );
-  globalThis.postMessage = (data, targetOrigin = "/") => {
+  const postMessage = (data, targetOrigin = "/") => {
     const normalizedTarget = normalizePostMessageTarget(
       targetOrigin,
       location.origin,
@@ -495,6 +494,131 @@ globalThis.__tilefinchInstallFrames = (support) => {
       0,
     );
   };
+  globalThis.postMessage = postMessage;
+  /* Window child navigables (HTML: the document-tree child navigables).
+     Every <iframe> and <frame> in this document's tree has a nested
+     browsing context from the moment it is connected, whether or not
+     Tilefinch ever loads it (display:none, sandboxed, past the child
+     document budget, or never navigated from its initial about:blank):
+     window.length counts them in tree order, and window[i] and
+     window[name] (window.frames is window) answer the same WindowProxy
+     contentWindow returns. A consent stub that looks for its locator frame
+     by name therefore finds the one it inserted instead of inserting
+     another forever.
+
+     Counting reads native handles only. A WindowProxy (and the frame realm
+     contentWindow already creates for it, at most 16 per page with the
+     oldest inactive one evicted) is created when one is read, never per
+     counted frame, so a page full of hidden frames costs no realms until
+     a script asks for one. Indexed and named properties are own accessors
+     of the global object kept in step with insertions, removals and
+     renames (dom.js reports them; parser insertions are caught before each
+     script runs), and every accessor reads the live tree. */
+  const nativeFrameHandles = globalThis.__tilefinchFrameHandles,
+    nativeDomVersion = globalThis.__tilefinchDomVersion,
+    exposeNamed = globalThis.__tilefinchExposeNamedProperty,
+    childFrameMemo = { task: 0, version: -1, handles: null },
+    /* Within one task only script mutations change the tree, and each
+       moves the DOM version; between tasks the parser may have run. */
+    childFrameHandles = () => {
+      const task = globalThis.__tilefinchActiveTaskSequence,
+        version = nativeDomVersion();
+      if (
+        task !== 0 &&
+        childFrameMemo.handles !== null &&
+        childFrameMemo.task === task &&
+        childFrameMemo.version === version
+      )
+        return childFrameMemo.handles;
+      const handles = nativeFrameHandles();
+      childFrameMemo.task = task;
+      childFrameMemo.version = version;
+      childFrameMemo.handles = handles;
+      return handles;
+    },
+    childNavigableWindow = (handle) =>
+      globalThis.__tilefinchFrameWindow(handle),
+    namedChildNavigable = (name) => {
+      const handles = childFrameHandles();
+      for (let index = 0; index < handles.length; index++) {
+        const handle = handles[index];
+        if (frameTargetName(frameWindows.get(handle), handle) === name)
+          return childNavigableWindow(handle);
+      }
+      return undefined;
+    },
+    retireNamed = globalThis.__tilefinchBindNamedChildNavigables(
+      namedChildNavigable,
+    ),
+    indexGetters = [],
+    indexGetter = (index) =>
+      indexGetters[index] ||
+      (indexGetters[index] = () => {
+        const handles = childFrameHandles();
+        return index < handles.length
+          ? childNavigableWindow(handles[index])
+          : undefined;
+      }),
+    frameNames = new Set();
+  let indexedCount = 0, syncedHandles = null;
+  const syncChildNavigables = (handles = childFrameHandles(), force = false) => {
+    const count = handles.length;
+    /* The task/DOM-version memo gives the same immutable handle list
+       until the tree changes. A length read must not repeat all name
+       lookups and allocate another set for that unchanged list. */
+    if (!force && handles === syncedHandles) return count;
+    for (let index = indexedCount; index < count; index++)
+      reflectDefine(globalThis, String(index), {
+        configurable: true,
+        enumerable: true,
+        get: indexGetter(index),
+      });
+    for (let index = count; index < indexedCount; index++) {
+      const descriptor = reflectDescriptor(globalThis, String(index));
+      if (descriptor?.get === indexGetters[index])
+        reflectDelete(globalThis, String(index));
+    }
+    indexedCount = count;
+    const present = new Set();
+    for (let index = 0; index < count; index++) {
+      const name = frameTargetName(frameWindows.get(handles[index]),
+        handles[index]);
+      if (!name || present.has(name)) continue;
+      present.add(name);
+      if (exposeNamed(name)) frameNames.add(name);
+    }
+    for (const name of frameNames)
+      if (!present.has(name)) {
+        frameNames.delete(name);
+        retireNamed(name);
+      }
+    syncedHandles = handles;
+    return count;
+  };
+  globalThis.__tilefinchChildNavigablesChanged = (renamed) => {
+    /* Setting the name attribute renames the child browsing context. */
+    if (renamed?.__handle !== undefined) {
+      const state = frameWindows.get(Number(renamed.__handle));
+      if (state) state.targetName = null;
+    }
+    /* A child Window.name assignment changes names without changing the
+       DOM version, so notifications always force name synchronization. */
+    syncChildNavigables(childFrameHandles(), true);
+  };
+  reflectDefine(globalThis, "length", reflectDescriptor({
+    get length() {
+      return syncChildNavigables();
+    },
+    set length(value) {
+      reflectDefine(globalThis, "length", {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value,
+      });
+    },
+  }, "length"));
+  syncChildNavigables();
   return Object.freeze({
     frameWindowCount: () => frameWindows.size,
   });

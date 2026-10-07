@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.28 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.29 LANGUAGES C)
 
 # Build directories inside the source tree must be named in CMakePresets.json
 # or in the short allowlist below. Sixty-one ad hoc trees (12 GB) accumulated
@@ -48,7 +48,7 @@ if(NOT TILEFINCH_ALLOW_BUILD_DIR
     endif()
 endif()
 
-set(TILEFINCH_RELEASE_SEQUENCE "28" CACHE STRING
+set(TILEFINCH_RELEASE_SEQUENCE "29" CACHE STRING
     "Monotonic signed release sequence compiled into this build")
 set(TILEFINCH_UPDATE_ROOT_V1 "" CACHE FILEPATH
     "Public binary Tilefinch root-v1 metadata embedded into updater builds")
@@ -130,3 +130,9 @@ include(cmake/TilefinchCore.cmake)
 include(cmake/TilefinchTargets.cmake)
 include(cmake/PspSwdec.cmake)
 include(cmake/TilefinchTests.cmake)
+
+option(TILEFINCH_BUILD_FUZZERS
+    "Build the libFuzzer parser targets in tests/fuzz (clang only)" OFF)
+if(TILEFINCH_BUILD_FUZZERS AND NOT PSP)
+    add_subdirectory(tests/fuzz)
+endif()

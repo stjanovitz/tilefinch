@@ -58,6 +58,10 @@ typedef struct {
        lane; the first active link that replays it takes over the charge. */
     bool preload_charged;
     size_t preload_charge;
+    /* The response reached its byte cap; only its complete rules (the
+       stylesheet_complete_rules_prefix of the received bytes) are retained
+       and applied. */
+    bool truncated;
 } StylesheetDocumentResource;
 
 typedef struct {
@@ -78,6 +82,11 @@ typedef struct {
     size_t retry_suppressed;
     size_t final_retry_grants;
     size_t pressure_serializations;
+    /* Responses cut at their byte cap and applied up to their last complete
+       rule, with the bytes received and the bytes kept. */
+    size_t truncated;
+    size_t truncated_received_bytes;
+    size_t truncated_applied_bytes;
     /* A generated theme registry can be discovered during the viewport-first
        pass and referenced by href links in a later parser continuation. Keep
        the bounded selection beside the page-lifetime response ledger so each
@@ -128,6 +137,9 @@ typedef struct {
     size_t retry_suppressed;
     size_t final_retry_grants;
     size_t pressure_serializations;
+    size_t truncated;
+    size_t truncated_received_bytes;
+    size_t truncated_applied_bytes;
     size_t imports_discovered;
     size_t imports_loaded;
     size_t imports_skipped_conditions;
@@ -233,7 +245,30 @@ typedef struct ImageResource {
        refresh commit verifies the lender is still present, hands ownership
        over when the lender retires, and clears the bit. */
     bool borrows_previous;
+    /* Display retargeting (src/image_retarget.c) once layout knows the
+       painted size: the decoded size before the first retarget (zero until
+       then; the surface never grows past it) and IMAGE_RETARGET_* state. */
+    uint8_t retarget_flags;
+    int full_width;
+    int full_height;
 } ImageResource;
+
+/* The surface was reduced to its painted size. */
+#define IMAGE_RETARGET_SHRUNK UINT8_C(1)
+/* It was restored after a reduction; it is never reduced again, so
+   alternating responsive layouts cost at most one reduction and one decode. */
+#define IMAGE_RETARGET_GROWN UINT8_C(2)
+/* Unpainted: the pixels were released and the encoded bytes kept. */
+#define IMAGE_RETARGET_DROPPED UINT8_C(4)
+/* Page script read the pixels (canvas drawImage, WebGL texImage2D); they
+   stay at full resolution. */
+#define IMAGE_RETARGET_PINNED UINT8_C(8)
+/* A decode failed for good; the surface is left alone. */
+#define IMAGE_RETARGET_REFUSED UINT8_C(16)
+/* The encoded bytes are SVG markup (a response, a data: body, a referenced
+   symbol or an inline <svg> serialization): decoding rasterizes them at the
+   resource's width x height, which may be above its first raster's size. */
+#define IMAGE_RETARGET_VECTOR UINT8_C(32)
 
 typedef enum {
     IMAGE_CANVAS_COMMIT_REFUSED = 0,
@@ -245,11 +280,16 @@ typedef enum {
 typedef struct {
     size_t discovered;
     size_t attempted;
+    /* Attempts the image-count cap does not charge: small rasters that never
+       touch the network (inline-SVG icons, short data: URLs). They remain in
+       `attempted` and are still charged to the decoded/encoded byte quotas;
+       the count cap applies to attempted - count_exempt. */
+    size_t count_exempt;
     size_t loaded;
     size_t failed;
     size_t unsupported;
-    /* Explicit .webp paths rewritten to a cheaper same-origin JPEG sibling;
-       signed and content-negotiated WebP remains supported. */
+    /* "name.jpg.webp"-style URLs rewritten to the original they name
+       ("name.jpg"); other WebP URLs are fetched and decoded as written. */
     size_t compatible_format_rewrites;
     size_t skipped_limit;
     /* A document-wide continuation may fail after the first viewport has
@@ -264,6 +304,9 @@ typedef struct {
     size_t downsampled;
     size_t largest_source_decode_bytes;
     size_t largest_target_decode_bytes;
+    /* Measured: the largest working set (decoder allocations plus output)
+       of one raster decode. */
+    size_t largest_decode_working_bytes;
     size_t masks_loaded;
     size_t backgrounds_loaded;
     size_t deadline_cancelled;
@@ -328,6 +371,22 @@ typedef struct {
     } canvas_depth[2];
     ImageCanvasNativeSurface canvas_native[2];
     ExternalImageStats stats;
+    /* Display retargeting (src/image_retarget.c), never rolled back with
+       the loader's stats. */
+    struct {
+        size_t scans;
+        size_t shrinks;
+        size_t grows;
+        size_t drops;
+        /* SVG markup rasterized again (a reduction or a restore). */
+        size_t rasters;
+        size_t deferred;
+        size_t released_bytes;
+        size_t restored_bytes;
+        uint64_t us;
+    } retarget;
+    /* Bounded, generation-keyed display-size scan, owned by this table. */
+    struct ImageRetargetPlan *retarget_plan;
     bool priority_staged;
 } ImageResources;
 
@@ -397,6 +456,24 @@ typedef enum {
     IMAGE_DECODE_DETERMINISTIC_FAILURE,
     IMAGE_DECODE_TRANSIENT_FAILURE
 } ImageDecodeStatus;
+
+/* Upper estimate of the Budget bytes that parsing `css` adds to a sheet,
+   including its share of the rule index built on first use. Stylesheet
+   admission compares it, plus a layout reserve, with the remaining Budget.
+   Computed by one allocation-free pass over the text. */
+size_t stylesheet_source_cost_estimate(const char *css, size_t length);
+
+/* For a response truncated at its byte cap: the length of the prefix that
+   ends with the last complete top-level rule, at-rule block or statement.
+   Anything after it (a half rule, an unclosed @media/@supports block, an
+   unterminated string or comment) is unfinished and must not be parsed. */
+size_t stylesheet_complete_rules_prefix(const char *css, size_t length);
+/* The scanner behind it, one top-level statement at a time: true with
+   *offset moved just past the next complete statement, or false when the
+   input ends first, with *open_blocks (optional) set to the number of blocks
+   the unfinished tail left open. */
+bool stylesheet_next_statement(const char *css, size_t length,
+                               size_t *offset, size_t *open_blocks);
 
 bool stylesheets_load_external(const PocDocument *document, Stylesheet *sheet,
                                Budget *budget, const char *base_url,
@@ -791,6 +868,11 @@ bool images_set_canvas_native_surface(ImageResources *images,
                                       size_t stride, uint32_t epoch);
 bool images_materialize_canvas_native_surface(ImageResources *images,
                                               lxb_dom_node_t *node);
+/* Advances whenever any native canvas surface may change (a WebGL frame is
+   rendered into EDRAM, a surface is published or forgotten). A deferred page
+   publication that recorded an older value no longer describes the surface. */
+uint32_t image_canvas_native_serial(void);
+void image_canvas_native_serial_advance(void);
 bool image_resource_native_canvas_source(const ImageResource *image,
                                          const unsigned char **pixels,
                                          size_t *stride);

@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width"><style>
+body{margin:0;font:13px sans-serif}
+.g{display:grid;grid-template-columns:repeat(4,1fr);row-gap:4px;width:448px;margin:8px 16px;background:#eef}
+.a{grid-column:1/span 4;background:#fdd;height:22px}
+.e{grid-column:1/span 4;background:#dfd;height:22px}
+</style></head><body>
+<div class="g">
+ <div class="a">auto 1 (expect row 1)</div>
+ <div class="e" style="grid-row:2">explicit row 2</div>
+ <div class="a">auto 2 (expect row 4)</div>
+ <div class="e" style="grid-row:3">explicit row 3</div>
+</div>
+</body></html>

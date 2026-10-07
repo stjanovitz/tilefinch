@@ -8,6 +8,12 @@
   const ancestorLimit = globalThis.__tilefinchAncestorLimit;
   /* Web IDL exposes interface members as enumerable; class syntax defines
      them non-enumerable, so interfaces written as classes flip them here. */
+  const {
+    reflectString,
+    reflectBoolean,
+    reflectEnumerated,
+    secondaryDocumentPrototype,
+  } = globalThis.__tilefinchDomShared;
   const enumerateInterfaceMembers = (constructor) => {
     const prototype = constructor.prototype;
     for (const key of Reflect.ownKeys(prototype)) {
@@ -24,7 +30,6 @@
      globals that exist when it runs, so anything created on first write has
      to be declared non-enumerable here instead. */
   for (const [name, initial] of [
-    ["__tilefinchLastFramePost", null],
     ["__tilefinchBase64Error", ""],
   ])
     Object.defineProperty(globalThis, name, {
@@ -37,9 +42,13 @@
   const trustedJSONStringify = JSON.stringify;
   const decodeUtf8ValidNative = globalThis.__tilefinchDecodeUtf8Valid;
   const encodeUtf8Native = globalThis.__tilefinchEncodeUtf8;
+  const encodingNameNative = globalThis.__tilefinchEncodingName;
+  const decodeSingleByteNative = globalThis.__tilefinchDecodeSingleByte;
   const cryptoRandomFillNative = globalThis.__tilefinchCryptoRandomFill;
   delete globalThis.__tilefinchDecodeUtf8Valid;
   delete globalThis.__tilefinchEncodeUtf8;
+  delete globalThis.__tilefinchEncodingName;
+  delete globalThis.__tilefinchDecodeSingleByte;
   const trustedString = String,
     trustedStringToWellFormed = Function.call.bind(
       String.prototype.toWellFormed,
@@ -148,22 +157,25 @@
   const trustedQueueCheckpointContinuation =
     globalThis.__tilefinchQueueCheckpointContinuation;
   if (globalThis.queueMicrotask === undefined)
-    globalThis.queueMicrotask = (callback) => {
-      if (typeof callback !== "function")
-        throw new TypeError("callback required");
-      trustedPromiseThen(trustedPromiseResolve(), () => {
-        try {
-          globalThis.__tilefinchRunTask(
-            "microtask",
-            callback,
-            globalThis,
-            [],
-          );
-        } catch (error) {
-          __tilefinchReportUncaught(error, "microtask");
-        }
-      });
-    };
+    /* A property definition names the function "queueMicrotask". */
+    globalThis.queueMicrotask = {
+      queueMicrotask: (callback) => {
+        if (typeof callback !== "function")
+          throw new TypeError("callback required");
+        trustedPromiseThen(trustedPromiseResolve(), () => {
+          try {
+            globalThis.__tilefinchRunTask(
+              "microtask",
+              callback,
+              globalThis,
+              [],
+            );
+          } catch (error) {
+            __tilefinchReportUncaught(error, "microtask");
+          }
+        });
+      },
+    }.queueMicrotask;
   delete globalThis.__tilefinchQueueCheckpointContinuation;
   if (globalThis.CSS === undefined)
     globalThis.CSS = {
@@ -488,32 +500,7 @@
           });
         return false;
       },
-      customControlDisabled = (element) => {
-        const internals =
-          globalThis.__tilefinchElementInternalsFor?.(element);
-        if (
-          !globalThis.__tilefinchFormAssociatedCustomElement?.(element)
-        )
-          return null;
-        if (internals)
-          try {
-            void internals.form;
-          } catch (_) {
-            return null;
-          }
-        if (element.hasAttribute("disabled")) return true;
-        for (
-          let at = element.parentElement, steps = 0;
-          at && steps < ancestorLimit;
-          at = at.parentElement, steps++
-        )
-          if (
-            String(at.localName || "").toLowerCase() === "fieldset" &&
-            at.hasAttribute("disabled")
-          )
-            return true;
-        return false;
-      },
+      customControlDisabled = globalThis.__tilefinchFormAssociatedCustomDisabled,
       wrappedElementMatches = function matches(value) {
         value = __tilefinchAssertSelector(value);
         return matchesValidSelector(
@@ -660,9 +647,12 @@
         wrappedElementClosest,
       ]),
       functionToString = Function.prototype.toString,
+      /* Marked functions print exactly as QuickJS prints its own natives
+         (and as Safari, whose user agent we present, prints natives), so
+         every platform function has one source shape. */
       nativeAwareToString = function toString() {
         return nativeMethodSet.has(this)
-          ? "function " + (this.name || "") + "() { [native code] }"
+          ? "function " + (this.name || "") + "() {\n    [native code]\n}"
           : functionToString.call(this);
       };
     nativeMethodSet.add(nativeAwareToString);
@@ -754,9 +744,46 @@
         nativeMethodSet.add(PublicError);
         globalThis[name] = PublicError;
       };
+    /* Explicit Resource Management: this QuickJS has neither the syntax
+       nor these intrinsics. The well-known symbols and SuppressedError are
+       plain data that libraries (TypeScript's using helpers, Lit's decorator
+       metadata) look up and otherwise polyfill; DisposableStack is left
+       absent rather than half-done. */
+    for (const name of ["dispose", "asyncDispose", "metadata"])
+      if (!(name in Symbol))
+        Object.defineProperty(Symbol, name, { value: Symbol("Symbol." + name) });
+    if (typeof globalThis.SuppressedError !== "function") {
+      const NativeError = Error,
+        SuppressedError = function SuppressedError(error, suppressed, message) {
+          const value = Reflect.construct(
+            NativeError,
+            message === undefined ? [] : [String(message)],
+            new.target || SuppressedError,
+          );
+          Object.defineProperty(value, "error", {
+            configurable: true, writable: true, value: error,
+          });
+          Object.defineProperty(value, "suppressed", {
+            configurable: true, writable: true, value: suppressed,
+          });
+          return value;
+        };
+      Object.setPrototypeOf(SuppressedError, NativeError);
+      Object.defineProperty(SuppressedError, "prototype", {
+        writable: false,
+        value: Object.create(NativeError.prototype, {
+          constructor: { configurable: true, writable: true, value: SuppressedError },
+          name: { configurable: true, writable: true, value: "SuppressedError" },
+          message: { configurable: true, writable: true, value: "" },
+        }),
+      });
+      Object.defineProperty(globalThis, "SuppressedError", {
+        configurable: true, writable: true, value: SuppressedError,
+      });
+    }
     for (const name of [
       "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError",
-      "TypeError", "URIError", "AggregateError",
+      "TypeError", "URIError", "AggregateError", "SuppressedError",
     ]) installPublicError(name);
     const baseSupports = CSS.supports.bind(CSS);
     CSS.supports = function (property, value) {
@@ -863,10 +890,8 @@
       }
     }
     Object.assign(globalThis, { CSSStyleRule, CSSStyleSheet });
-    Object.defineProperty(HTMLStyleElement.prototype, "sheet", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    Object.defineProperty(HTMLStyleElement.prototype, "sheet", Object.getOwnPropertyDescriptor({
+      get sheet() {
         if (!this.isConnected) return null;
         let sheet = sheets.get(this);
         if (!sheet) {
@@ -875,12 +900,14 @@
         }
         return sheet;
       },
-    });
+    }, "sheet"));
   }
   globalThis.__tilefinchRefreshNamedProperties = () => {
     const names = __tilefinchNamedElementIds();
     for (let index = 0; index < names.length; index++)
       globalThis.__tilefinchExposeNamedProperty(names[index]);
+    /* Parser-inserted frames: their indices and target names. */
+    globalThis.__tilefinchChildNavigablesChanged?.(null);
   };
   globalThis.__tilefinchRefreshNamedProperties();
   const urlSearchParamLimit = 8192,
@@ -1139,6 +1166,9 @@
     [Symbol.iterator]() {
       return this.entries();
     }
+    get size() {
+      return this.items.length;
+    }
     notify() {
       if (this.changed) this.changed(this.toString());
     }
@@ -1331,6 +1361,13 @@
           : this.origin + this.pathname + this.search + hash;
     }
     get origin() { return this._origin; }
+    /* Tilefinch's URL layer refuses userinfo outright (src/url.c), so no URL
+       it represents carries credentials: both read as empty and, as for a
+       URL that cannot have credentials, setting them changes nothing. */
+    get username() { return ""; }
+    set username(value) { tilefinchUSVString(value); }
+    get password() { return ""; }
+    set password(value) { tilefinchUSVString(value); }
     get searchParams() {
       return this._searchParams;
     }
@@ -1346,12 +1383,6 @@
           ? "blob:" + this.pathname + search + this.hash
           : this.origin + this.pathname + search + this.hash;
     }
-    assign(value) {
-      const next = new TilefinchURL(value, this.href);
-      this._set(next.href);
-      if (this === globalThis.location)
-        __tilefinchRequestNavigation(this.href, false);
-    }
     toString() {
       return this.href;
     }
@@ -1359,6 +1390,32 @@
       return this.href;
     }
   }
+  /* URL.parse and URL.canParse follow the URL Standard: without a base, a
+     relative input fails. (The constructor still resolves such input
+     against the document URL, as it always has here.) */
+  const parseURL = (url, base) => {
+    if (base === undefined) {
+      const text = tilefinchUSVString(url).replace(/^[\x00-\x20]+/, "");
+      if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return null;
+    } else if (parseURL(base) === null) return null;
+    try {
+      return new TilefinchURL(url, base);
+    } catch (_) {
+      return null;
+    }
+  };
+  Object.defineProperties(TilefinchURL, Object.getOwnPropertyDescriptors({
+    canParse(url, base = undefined) {
+      if (arguments.length < 1)
+        throw new TypeError("URL.canParse requires 1 argument");
+      return parseURL(url, base) !== null;
+    },
+    parse(url, base = undefined) {
+      if (arguments.length < 1)
+        throw new TypeError("URL.parse requires 1 argument");
+      return parseURL(url, base);
+    },
+  }));
   globalThis.URL = TilefinchURL;
   globalThis.URLSearchParams = TilefinchURLSearchParams;
   if (globalThis.TextEncoder === undefined)
@@ -1429,18 +1486,6 @@
        native validation/string-construction path instead of an O(n) series
        of interpreted string appends. */
     const textDecoderMaximumBytes = 1024 * 1024;
-    const windows1252Labels = [
-      "ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1",
-      "ibm819", "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591",
-      "iso_8859-1", "iso_8859-1:1987", "l1", "latin1", "us-ascii",
-      "windows-1252", "x-cp1252",
-    ];
-    const windows1252High = [
-      0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
-      0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
-      0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
-      0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
-    ];
     /* Length of a trailing UTF-8 sequence that is a valid prefix still
        missing bytes (0 when the input ends on a boundary or the tail is
        invalid, which the decoder reports as usual). */
@@ -1465,39 +1510,13 @@
     };
     globalThis.TextDecoder = class TextDecoder {
       constructor(label = "utf-8", options = {}) {
-        const labelText = trustedString(label);
-        let labelStart = 0,
-          labelEnd = labelText.length;
-        const isAsciiWhitespace = (code) =>
-          code === 0x09 ||
-          code === 0x0a ||
-          code === 0x0c ||
-          code === 0x0d ||
-          code === 0x20;
-        while (
-          labelStart < labelEnd &&
-          isAsciiWhitespace(trustedCharCodeAt(labelText, labelStart))
-        )
-          labelStart++;
-        while (
-          labelEnd > labelStart &&
-          isAsciiWhitespace(trustedCharCodeAt(labelText, labelEnd - 1))
-        )
-          labelEnd--;
-        const normalized = trustedStringLower(
-          trustedStringSlice(labelText, labelStart, labelEnd),
-        );
-        if (["utf-8", "utf8", "unicode-1-1-utf-8"].includes(normalized)) {
-          this.encoding = "utf-8";
-          this._encodingKind = 0;
-        } else if (windows1252Labels.includes(normalized)) {
-          /* The Encoding Standard deliberately maps ISO-8859-1 and ASCII
-             labels to the web-compatible windows-1252 decoder. */
-          this.encoding = "windows-1252";
-          this._encodingKind = 1;
-        } else {
-          throw new RangeError("only UTF-8 is supported");
-        }
+        /* The Encoding Standard's labels and single-byte tables are the
+           ones the document parser uses (text_encoding.c). */
+        const name = encodingNameNative(trustedString(label));
+        if (name === null)
+          throw new RangeError("The encoding label is not supported");
+        this.encoding = trustedStringLower(name);
+        this._encodingKind = this.encoding === "utf-8" ? 0 : 1;
         this.fatal = !!options.fatal;
         this.ignoreBOM = !!options.ignoreBOM;
         this._pending = new Uint8Array();
@@ -1518,15 +1537,11 @@
         if (this._encodingKind === 1) {
           if (bytes.length > textDecoderMaximumBytes)
             throw new RangeError("decoded input exceeds bounded size");
-          let out = "";
-          for (let i = 0; i < bytes.length; i++) {
-            const byte = bytes[i];
-            let cp = byte;
-            if (byte >= 0x80 && byte <= 0x9f)
-              cp = windows1252High[byte - 0x80];
-            out += trustedStringFromCodePoint(null, cp);
-          }
-          return out;
+          const decoded = decodeSingleByteNative(
+            this.encoding, bytes, this.fatal);
+          if (decoded === null)
+            throw new TypeError("invalid " + this.encoding + " data");
+          return decoded;
         }
         const hadPending = this._pending.length !== 0;
         if (hadPending) {
@@ -2192,10 +2207,10 @@
       },
     },
   });
-  HTMLSelectElement.prototype.item = function (index) {
+  HTMLSelectElement.prototype.item = function item(index) {
     return selectOptions(this)[Number(index)] ?? null;
   };
-  HTMLSelectElement.prototype.namedItem = function (name) {
+  HTMLSelectElement.prototype.namedItem = function namedItem(name) {
     name = String(name);
     return (
       selectOptions(this).find(
@@ -2203,7 +2218,7 @@
       ) ?? null
     );
   };
-  HTMLSelectElement.prototype.add = function (option, before = null) {
+  HTMLSelectElement.prototype.add = function add(option, before = null) {
     if (!(option instanceof HTMLOptionElement))
       throw new TypeError("Option required");
     if (before === null) this.appendChild(option);
@@ -2454,10 +2469,11 @@
     },
     webkitFullscreenElement: {
       configurable: true,
+      enumerable: true,
       get() { return document.fullscreenElement; },
     },
   });
-  Element.prototype.requestFullscreen = function () {
+  Element.prototype.requestFullscreen = function requestFullscreen() {
     return new Promise((resolve, reject) => {
       if (!this.isConnected || !__tilefinchSetFullscreen(this.__handle, 1)) {
         const error = new DOMException(
@@ -2476,15 +2492,17 @@
   };
   Element.prototype.webkitRequestFullscreen =
     Element.prototype.requestFullscreen;
-  document.exitFullscreen = () => new Promise((resolve, reject) => {
-    if (!fullscreenElement) { resolve(); return; }
-    if (!leaveFullscreen(false)) {
-      reject(new DOMException("Could not leave fullscreen", "InvalidStateError"));
-      return;
-    }
-    resolve();
-  });
-  document.webkitExitFullscreen = document.exitFullscreen;
+  const exitFullscreen = () => new Promise((resolve, reject) => {
+      if (!fullscreenElement) { resolve(); return; }
+      if (!leaveFullscreen(false)) {
+        reject(new DOMException("Could not leave fullscreen", "InvalidStateError"));
+        return;
+      }
+      resolve();
+    }),
+    webkitExitFullscreen = () => exitFullscreen();
+  document.exitFullscreen = exitFullscreen;
+  document.webkitExitFullscreen = webkitExitFullscreen;
   globalThis.__tilefinchExitFullscreenFromHost = () => leaveFullscreen(true);
   globalThis.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
     if (fullscreenElement?.__handle === Number(handle)) leaveFullscreen(true);
@@ -2580,28 +2598,7 @@
       Object.assign(this, fields);
     }
   };
-  const reflectedBoolean = (name) => ({
-      configurable: true,
-      get() {
-        return this.hasAttribute(name);
-      },
-      set(value) {
-        this.toggleAttribute(name, !!value);
-      },
-    }),
-    reflectedEnumerated = (name, values, missing, invalid = missing) => ({
-      configurable: true,
-      get() {
-        const value = this.getAttribute(name);
-        if (value === null) return missing;
-        const lowered = value.toLowerCase();
-        return values.includes(lowered) ? lowered : invalid;
-      },
-      set(value) {
-        this.setAttribute(name, String(value));
-      },
-    }),
-    reflectedInteger = (name, fallback) => ({
+  const reflectedInteger = (name, fallback) => ({
       configurable: true,
       get() {
         const value = this.getAttribute(name);
@@ -2738,8 +2735,8 @@
           return nativeFormOwner(this);
         },
       },
-      required: reflectedBoolean("required"),
-      readOnly: reflectedBoolean("readonly"),
+      required: reflectBoolean("required"),
+      readOnly: reflectBoolean("readOnly"),
       minLength: reflectedInteger("minlength", -1),
       maxLength: reflectedInteger("maxlength", -1),
       pattern: {
@@ -2849,10 +2846,10 @@
       },
     },
   });
-  HTMLFieldSetElement.prototype.setCustomValidity = function (message) {
+  HTMLFieldSetElement.prototype.setCustomValidity = function setCustomValidity(message) {
     this.__customValidity = String(message);
   };
-  HTMLFieldSetElement.prototype.checkValidity = function () {
+  HTMLFieldSetElement.prototype.checkValidity = function checkValidity() {
     return true;
   };
   HTMLFieldSetElement.prototype.reportValidity =
@@ -3103,13 +3100,13 @@
     if (hasMax && value > parsedMax) value = parsedMax;
     input.value = String(value);
   };
-  HTMLInputElement.prototype.stepUp = function (count = 1) {
+  HTMLInputElement.prototype.stepUp = function stepUp(count = 1) {
     stepInput(this, count);
   };
-  HTMLInputElement.prototype.stepDown = function (count = 1) {
+  HTMLInputElement.prototype.stepDown = function stepDown(count = 1) {
     stepInput(this, -Number(count));
   };
-  const formEnctype = reflectedEnumerated(
+  const formEnctype = reflectEnumerated(
     "enctype",
     [
       "application/x-www-form-urlencoded",
@@ -3119,12 +3116,12 @@
     "application/x-www-form-urlencoded",
   );
   Object.defineProperties(HTMLFormElement.prototype, {
-    noValidate: reflectedBoolean("novalidate"),
-    method: reflectedEnumerated("method", ["get", "post", "dialog"], "get"),
+    noValidate: reflectBoolean("noValidate"),
+    method: reflectEnumerated("method", ["get", "post", "dialog"], "get"),
     enctype: formEnctype,
     encoding: formEnctype,
   });
-  HTMLFormElement.prototype.checkValidity = function () {
+  HTMLFormElement.prototype.checkValidity = function checkValidity() {
     let valid = true;
     for (const control of formControls(this)) {
       const internals =
@@ -3187,7 +3184,7 @@
     else invokeCustomCallbacks();
     return true;
   };
-  HTMLFormElement.prototype.reset = function () {
+  HTMLFormElement.prototype.reset = function reset() {
     resetForm(this);
   };
   globalThis.__tilefinchResetFormFromActivation = (form) =>
@@ -3199,12 +3196,12 @@
         return nativeFormOwner(this);
       },
     },
-    formNoValidate: reflectedBoolean("formnovalidate"),
+    formNoValidate: reflectBoolean("formNoValidate"),
   });
   Object.defineProperty(
     HTMLInputElement.prototype,
     "formNoValidate",
-    reflectedBoolean("formnovalidate"),
+    reflectBoolean("formNoValidate"),
   );
   const constructingFormData = new WeakSet();
   globalThis.FormData = class FormData {
@@ -3852,25 +3849,26 @@
     };
   globalThis.__tilefinchCloneWorkerValue = cloneWorkerValue;
   if (globalThis.structuredClone === undefined)
-    globalThis.structuredClone = (value, options = undefined) =>
-      cloneWorkerValue(value, ownerWorkerCloneIntrinsics, options?.transfer);
+    globalThis.structuredClone = {
+      structuredClone: (value, options = undefined) =>
+        cloneWorkerValue(value, ownerWorkerCloneIntrinsics, options?.transfer),
+    }.structuredClone;
   const tilefinchCurrentDocumentURL =
       globalThis.__tilefinchCurrentDocumentURL,
     tilefinchDocumentURLRevision =
       globalThis.__tilefinchDocumentURLRevision,
-    location = new TilefinchURL(
+    /* The document's URL as script sees it; Location reads through it. */
+    locationURL = new TilefinchURL(
       String(globalThis.__tilefinchLocationHref || "https://example.invalid/"),
     ),
     locationPartNames = [
       "protocol",
+      "host",
       "hostname",
       "port",
-      "host",
       "pathname",
       "search",
       "hash",
-      "origin",
-      "searchParams",
     ];
   let locationRevision = Number(tilefinchDocumentURLRevision()) >>> 0,
     locationSynchronizing = false;
@@ -3881,7 +3879,7 @@
       const href = tilefinchCurrentDocumentURL();
       locationSynchronizing = true;
       try {
-        location._set(String(href));
+        locationURL._set(String(href));
         locationRevision = revision;
       } finally {
         locationSynchronizing = false;
@@ -3890,42 +3888,107 @@
     setSynchronizedLocation = (href) => {
       locationSynchronizing = true;
       try {
-        location._set(String(href));
+        locationURL._set(String(href));
         locationRevision = Number(tilefinchDocumentURLRevision()) >>> 0;
       } finally {
         locationSynchronizing = false;
       }
-    };
-  for (const name of locationPartNames) {
-    const descriptor = trustedObjectDescriptor(
-      TilefinchURL.prototype, name);
-    Object.defineProperty(location, name, {
-      configurable: true,
-      enumerable: true,
-      get() {
-        synchronizeLocation();
-        return descriptor.get.call(location);
-      },
-      set: descriptor.set === undefined ? undefined : function (value) {
-        synchronizeLocation();
-        const previous = location._href;
-        descriptor.set.call(location, value);
-        if (!locationSynchronizing && location._href !== previous)
-          __tilefinchRequestNavigation(location._href, false);
-      },
-    });
-  }
-  Object.defineProperty(location, "href", {
-    configurable: false,
-    enumerable: true,
-    get() {
-      synchronizeLocation();
-      return this._href;
     },
-    set(value) {
-      this.assign(value);
+    withoutFragment = (href) => {
+      const at = href.indexOf("#");
+      return at < 0 ? href : href.slice(0, at);
+    },
+    /* HTML "navigate" from Location: a fragment navigation (same URL apart
+       from a fragment) changes the document's URL synchronously and the
+       host commits the history entry and hashchange. Any other navigation
+       leaves this document, and its location, at the old URL until the new
+       document replaces it. */
+    navigateLocation = (href, replace) => {
+      synchronizeLocation();
+      if (
+        href.includes("#") &&
+        withoutFragment(href) === withoutFragment(locationURL._href)
+      )
+        locationURL._set(href);
+      __tilefinchRequestNavigation(href, replace);
+    },
+    resolveLocationURL = (value) =>
+      new TilefinchURL(value, locationURL._href)._href;
+  /* A sandboxed (opaque-origin) frame realm reports origin "null"; its
+     host setup flips this once (event_loop.inc), since the unforgeable
+     members cannot be redefined. */
+  let locationOpaqueOrigin = false;
+  Object.defineProperty(globalThis, "__tilefinchMarkLocationOpaque", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: () => {
+      locationOpaqueOrigin = true;
     },
   });
+  /* Location: every member is an own [LegacyUnforgeable] property. */
+  const locationToken = {};
+  class Location {
+    constructor(key) {
+      if (key !== locationToken) throw new TypeError("Illegal constructor");
+    }
+  }
+  Object.defineProperty(Location.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "Location",
+  });
+  const location = new Location(locationToken),
+    locationMembers = {
+      get href() {
+        synchronizeLocation();
+        return locationURL._href;
+      },
+      set href(value) {
+        navigateLocation(resolveLocationURL(value), false);
+      },
+      get origin() {
+        if (locationOpaqueOrigin) return "null";
+        synchronizeLocation();
+        return locationURL.origin;
+      },
+      assign(url) {
+        navigateLocation(resolveLocationURL(url), false);
+      },
+      replace(url) {
+        navigateLocation(resolveLocationURL(url), true);
+      },
+      reload() {
+        synchronizeLocation();
+        __tilefinchRequestNavigation(locationURL._href, true);
+      },
+      toString() {
+        synchronizeLocation();
+        return locationURL._href;
+      },
+    };
+  for (const name of locationPartNames) {
+    const part = trustedObjectDescriptor(TilefinchURL.prototype, name);
+    Object.defineProperty(locationMembers, name, Object.getOwnPropertyDescriptor({
+      get [name]() {
+        synchronizeLocation();
+        return part.get.call(locationURL);
+      },
+      set [name](value) {
+        synchronizeLocation();
+        const next = new TilefinchURL(locationURL._href);
+        part.set.call(next, value);
+        if (next._href !== locationURL._href)
+          navigateLocation(next._href, false);
+      },
+    }, name));
+  }
+  for (const key of Reflect.ownKeys(locationMembers)) {
+    const descriptor = Object.getOwnPropertyDescriptor(locationMembers, key);
+    descriptor.configurable = false;
+    if ("value" in descriptor) descriptor.writable = false;
+    Object.defineProperty(location, key, descriptor);
+  }
+  globalThis.Location = Location;
   Object.defineProperty(document, "forms", {
     configurable: true,
     enumerable: true,
@@ -4573,7 +4636,9 @@
       compatMode = "CSS1Compat",
     ) => {
       const doc = Object.create(
-          xml ? XMLDocument.prototype : HTMLDocument.prototype,
+          secondaryDocumentPrototype(
+            xml ? XMLDocument.prototype : HTMLDocument.prototype,
+          ),
         ),
         makeElement = (tag, namespace = htmlNamespace) => {
           tag = String(tag).toLowerCase();
@@ -4984,10 +5049,8 @@
     };
     const implementationToken = {},
       implementations = new WeakMap();
-    Object.defineProperty(Document.prototype, "implementation", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    Object.defineProperty(Document.prototype, "implementation", Object.getOwnPropertyDescriptor({
+      get implementation() {
         if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
         let value = implementations.get(this);
         if (!value) {
@@ -4996,7 +5059,7 @@
         }
         return value;
       },
-    });
+    }, "implementation"));
     globalThis.__tilefinchAdoptNodeOwner = adoptOwner;
     globalThis.__tilefinchDetachNode = detach;
   }
@@ -5011,7 +5074,7 @@
     __tilefinchAdoptNodeOwner(node, document);
     return node;
   };
-  Document.prototype.importNode = function (node, deep = false) {
+  Document.prototype.importNode = function importNode(node, deep = false) {
     if (!(node instanceof Node)) throw new TypeError("Node required");
     if (node instanceof Document)
       throw new DOMException(
@@ -5030,22 +5093,67 @@
     compatMode: { configurable: true, enumerable: true, value: "CSS1Compat" },
     defaultView: { configurable: true, enumerable: true, value: globalThis },
   });
-  document.location = location;
-  Object.defineProperties(Document.prototype, {
-    images: {
-      configurable: true,
-      enumerable: true,
-      get() {
-        if (!this.__tilefinchImagesCollection)
-          Object.defineProperty(this, "__tilefinchImagesCollection", {
-            configurable: true,
-            value: globalThis.__tilefinchLiveHTMLCollection(() =>
-              Array.from(this.querySelectorAll("img")),
-            ),
-          });
-        return this.__tilefinchImagesCollection;
-      },
+  /* [LegacyUnforgeable]: document.location is the document's only own
+     property in browsers, an accessor onto window.location. */
+  Object.defineProperty(document, "location", Object.getOwnPropertyDescriptor({
+    get location() {
+      return location;
     },
+    set location(value) {
+      location.href = value;
+    },
+  }, "location"));
+  Object.defineProperty(document, "location", { configurable: false });
+  const imagesCollections = new WeakMap();
+  Object.defineProperty(Document.prototype, "images", Object.getOwnPropertyDescriptor({
+    get images() {
+      let collection = imagesCollections.get(this);
+      if (!collection) {
+        collection = globalThis.__tilefinchLiveHTMLCollection(() =>
+          Array.from(this.querySelectorAll("img")),
+        );
+        imagesCollections.set(this, collection);
+      }
+      return collection;
+    },
+  }, "images"));
+  /* document.links (a and area with href) and document.anchors (a with
+     name) are live collections, cached per document like images. */
+  const linksCollections = new WeakMap(),
+    anchorsCollections = new WeakMap();
+  Object.defineProperties(Document.prototype, {
+    links: Object.getOwnPropertyDescriptor({
+      get links() {
+        let collection = linksCollections.get(this);
+        if (!collection) {
+          collection = globalThis.__tilefinchLiveHTMLCollection(() =>
+            Array.from(this.querySelectorAll("a[href],area[href]")),
+          );
+          linksCollections.set(this, collection);
+        }
+        return collection;
+      },
+    }, "links"),
+    anchors: Object.getOwnPropertyDescriptor({
+      get anchors() {
+        let collection = anchorsCollections.get(this);
+        if (!collection) {
+          collection = globalThis.__tilefinchLiveHTMLCollection(() =>
+            Array.from(this.querySelectorAll("a[name]")),
+          );
+          anchorsCollections.set(this, collection);
+        }
+        return collection;
+      },
+    }, "anchors"),
+    /* CSSOM View: the root element in no-quirks mode, else the body. */
+    scrollingElement: Object.getOwnPropertyDescriptor({
+      get scrollingElement() {
+        return this.compatMode === "BackCompat"
+          ? this.body
+          : this.documentElement;
+      },
+    }, "scrollingElement"),
   });
   Object.defineProperties(document, {
     URL: {
@@ -5075,13 +5183,18 @@
       get() {
         return location.hostname;
       },
+      /* HTML's document.domain setter. Every agent cluster is origin-keyed
+         (Chrome's default), so a valid relaxation to a parent domain is a
+         no-op; an invalid value still throws. */
       set(value) {
         if (
-          String(value).toLowerCase() !==
-          String(location.hostname).toLowerCase()
+          !__tilefinchDocumentDomainValid(
+            String(value).toLowerCase(),
+            String(location.hostname).toLowerCase(),
+          )
         )
           throw new DOMException(
-            "Origin relaxation is not supported",
+            "Not a valid document.domain for this host",
             "SecurityError",
           );
       },
@@ -5115,12 +5228,16 @@
           String(control.value).slice(control.selectionEnd);
       return true;
     };
-    document.queryCommandSupported = (command) =>
-      ["copy", "cut"].includes(String(command).toLowerCase());
-    document.queryCommandEnabled = document.queryCommandSupported;
+    const queryCommandSupported = (command) =>
+        ["copy", "cut"].includes(String(command).toLowerCase()),
+      queryCommandEnabled = (command) => queryCommandSupported(command);
+    document.queryCommandSupported = queryCommandSupported;
+    document.queryCommandEnabled = queryCommandEnabled;
     globalThis.__tilefinchClipboardWrite = write;
   }
   Object.defineProperty(document, "lang", {
+    configurable: true,
+    enumerable: true,
     get() {
       return document.documentElement?.getAttribute("lang") || "";
     },
@@ -5129,6 +5246,8 @@
     },
   });
   Object.defineProperty(document, "dir", {
+    configurable: true,
+    enumerable: true,
     get() {
       const value = String(
         document.documentElement?.getAttribute("dir") || "",
@@ -5139,8 +5258,15 @@
       document.documentElement?.setAttribute("dir", String(value));
     },
   });
-  document.readyState = "loading";
-  document.__tilefinchDocumentElementValue = wrap(__tilefinchDocumentElement());
+  /* readyState is read-only to pages; the loader advances it here. */
+  let documentReadyState = "loading";
+  Object.defineProperty(document, "readyState", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      return documentReadyState;
+    },
+  });
   Object.defineProperty(document, "childNodes", {
     configurable: true,
     get() {
@@ -5157,38 +5283,37 @@
         return wrap(pick(__tilefinchDocumentChildNodes()) || 0);
       },
     });
+  /* Each read asks the native document; the last wrapper of each root
+     element is kept here (not on the document object) so collection does
+     not recreate the <html>, <head> and <body> wrappers on every read.
+     documentElement and head are read-only attributes. */
+  let rootElementWrapper = wrap(__tilefinchDocumentElement()),
+    headWrapper = wrap(__tilefinchQuery("head")),
+    bodyWrapper = wrap(__tilefinchBody());
   Object.defineProperty(document, "documentElement", {
     configurable: true,
     enumerable: true,
     get() {
       const next = wrap(__tilefinchDocumentElement());
-      if (next) this.__tilefinchDocumentElementValue = next;
+      if (next) rootElementWrapper = next;
       return next;
     },
-    set(value) {
-      this.__tilefinchDocumentElementValue = value || null;
-    },
   });
-  document.__tilefinchHeadValue = wrap(__tilefinchQuery("head"));
   Object.defineProperty(document, "head", {
     configurable: true,
     enumerable: true,
     get() {
       const next = wrap(__tilefinchQuery("head"));
-      if (next) this.__tilefinchHeadValue = next;
+      if (next) headWrapper = next;
       return next;
     },
-    set(value) {
-      this.__tilefinchHeadValue = value || null;
-    },
   });
-  document.__tilefinchBodyValue = wrap(__tilefinchBody());
   Object.defineProperty(document, "body", {
     configurable: true,
     enumerable: true,
     get() {
       const next = wrap(__tilefinchBody());
-      if (next) this.__tilefinchBodyValue = next;
+      if (next) bodyWrapper = next;
       return next;
     },
     set(value) {
@@ -5217,7 +5342,7 @@
           value,
           this.documentElement.firstChild,
         );
-      this.__tilefinchBodyValue = value;
+      bodyWrapper = value;
     },
   });
   Object.defineProperty(document, "title", {
@@ -5240,8 +5365,11 @@
   });
   let activeElementHandle = Number(document.body?.__handle) || 0,
     activeElementValue = document.body;
-  Object.defineProperty(document, "__activeElement", {
-    configurable: true,
+  /* The focused element is browser state, kept off the document object
+     (pages see it only through document.activeElement). */
+  Object.defineProperty(globalThis, "__tilefinchActiveElement", {
+    configurable: false,
+    enumerable: false,
     get() {
       if (
         activeElementValue &&
@@ -5270,15 +5398,17 @@
     return true;
   };
   Object.defineProperty(document, "activeElement", {
+    configurable: true,
+    enumerable: true,
     get() {
-      const active = document.__activeElement || document.body;
+      const active = globalThis.__tilefinchActiveElement || document.body;
       return (
         globalThis.__tilefinchRetargetShadowEvent?.(active, document) ||
         active
       );
     },
   });
-  document.hasFocus = () => true;
+  document.hasFocus = { hasFocus: () => true }.hasFocus;
   const nodeExtent = (node) =>
     node?.nodeType === Node.TEXT_NODE || node?.nodeType === Node.COMMENT_NODE
       ? node.data.length
@@ -5506,6 +5636,91 @@
     cloneContents() {
       return rangeContents(this, false, 0);
     }
+    /* DOM Parsing: parse with the start node (or its parent element) as
+       the fragment parser's context, <body> for none or <html>. Unlike
+       innerHTML, the scripts stay unstarted and script-inserted, so they
+       run, under CSP, once the fragment is connected. Reddit's bundles
+       build markup this way. */
+    createContextualFragment(markup) {
+      markup = String(markup);
+      const node = this.startContainer,
+        type = node?.nodeType,
+        owner =
+          type === Node.DOCUMENT_NODE ? node : node?.ownerDocument || document;
+      let element =
+        type === Node.ELEMENT_NODE
+          ? node
+          : type === Node.TEXT_NODE ||
+              type === Node.CDATA_SECTION_NODE ||
+              type === Node.COMMENT_NODE
+            ? node.parentElement
+            : null,
+        name = String(element?.localName || "").toLowerCase();
+      if (
+        !element ||
+        (name === "html" &&
+          element.namespaceURI === "http://www.w3.org/1999/xhtml")
+      )
+        name = "body";
+      if (owner !== document) {
+        /* A script-side DOMParser/createHTMLDocument document: its own
+           bounded innerHTML copy. XML fragment parsing is not provided. */
+        if (owner.contentType !== "text/html")
+          throw new DOMException(
+            "XML fragment parsing is not supported",
+            "NotSupportedError",
+          );
+        const holder = owner.createElement(name),
+          result = owner.createDocumentFragment();
+        holder.innerHTML = markup;
+        for (const child of [...holder.childNodes]) result.appendChild(child);
+        return result;
+      }
+      const result = document.createDocumentFragment();
+      if (!__tilefinchSetInnerHTML(result.__handle, markup, name))
+        throw new DOMException(
+          "Contextual fragment exceeds bounded parsing",
+          "NotSupportedError",
+        );
+      return result;
+    }
+    selectNode(node) {
+      const parent = node?.parentNode;
+      if (!parent)
+        throw new DOMException("Node has no parent", "InvalidNodeTypeError");
+      const index = Array.prototype.indexOf.call(parent.childNodes, node);
+      this.startContainer = this.endContainer = parent;
+      this.startOffset = index;
+      this.endOffset = index + 1;
+    }
+    compareBoundaryPoints(how, source) {
+      how = Number(how);
+      if (!(source instanceof Range)) throw new TypeError("Range required");
+      if (!(how >= 0 && how <= 3 && Number.isInteger(how)))
+        throw new DOMException("Invalid comparison", "NotSupportedError");
+      const ownEnd = how === 1 || how === 2,
+        sourceEnd = how === 2 || how === 3;
+      return compareBoundaryPoints(
+        ownEnd ? this.endContainer : this.startContainer,
+        ownEnd ? this.endOffset : this.startOffset,
+        sourceEnd ? source.endContainer : source.startContainer,
+        sourceEnd ? source.endOffset : source.startOffset,
+      );
+    }
+    comparePoint(node, offset) {
+      if (node?.getRootNode?.() !== this.startContainer.getRootNode?.())
+        throw new DOMException("Node is in another tree", "WrongDocumentError");
+      offset = boundedOffset(node, offset);
+      if (compareBoundaryPoints(node, offset, this.startContainer,
+                                this.startOffset) < 0) return -1;
+      return compareBoundaryPoints(node, offset, this.endContainer,
+                                   this.endOffset) > 0 ? 1 : 0;
+    }
+    isPointInRange(node, offset) {
+      if (node?.getRootNode?.() !== this.startContainer.getRootNode?.())
+        return false;
+      return this.comparePoint(node, offset) === 0;
+    }
     intersectsNode(node) {
       if (!(node instanceof Node)) throw new TypeError("Node required");
       const parent = node.parentNode;
@@ -5580,6 +5795,13 @@
     }
     detach() {}
   };
+  ["START_TO_START", "START_TO_END", "END_TO_END", "END_TO_START"].forEach(
+    (name, value) => {
+      const constant = { value, enumerable: true };
+      Object.defineProperty(Range, name, constant);
+      Object.defineProperty(Range.prototype, name, constant);
+    },
+  );
   const selection = {
     _range: null,
     get rangeCount() {
@@ -5606,7 +5828,7 @@
     addRange(range) {
       if (!(range instanceof Range)) throw new TypeError("Range required");
       this._range = range;
-      document.__tilefinchSelectionChanged();
+      selectionChanged();
     },
     getRangeAt(index) {
       if (Number(index) !== 0 || !this._range)
@@ -5615,7 +5837,7 @@
     },
     removeAllRanges() {
       this._range = null;
-      document.__tilefinchSelectionChanged();
+      selectionChanged();
     },
     empty() {
       this.removeAllRanges();
@@ -5625,7 +5847,7 @@
       range.setStart(node, offset);
       range.collapse(true);
       this._range = range;
-      document.__tilefinchSelectionChanged();
+      selectionChanged();
     },
     setPosition(node, offset = 0) {
       this.collapse(node, offset);
@@ -5634,13 +5856,13 @@
       const range = new Range();
       range.selectNodeContents(node);
       this._range = range;
-      document.__tilefinchSelectionChanged();
+      selectionChanged();
     },
     extend(node, offset = 0) {
       if (!this._range) this.collapse(node, offset);
       else {
         this._range.setEnd(node, offset);
-        document.__tilefinchSelectionChanged();
+        selectionChanged();
       }
     },
     containsNode(node, allowPartial = false) {
@@ -5656,10 +5878,14 @@
       return this._range?.toString() || "";
     },
   };
-  document.__tilefinchSelectionChanged = () =>
+  const selectionChanged = () =>
     document.dispatchEvent(new Event("selectionchange"));
-  document.createRange = () => new Range();
-  document.getSelection = globalThis.getSelection = () => selection;
+  globalThis.__tilefinchSelectionChanged = selectionChanged;
+  const createRange = () => new Range();
+  document.createRange = createRange;
+  /* Window and Document each expose their own getSelection function. */
+  globalThis.getSelection = { getSelection: () => selection }.getSelection;
+  document.getSelection = { getSelection: () => selection }.getSelection;
   Object.setPrototypeOf(document, HTMLDocument.prototype);
   document.createElement = (tag) => {
     tag = String(tag);
@@ -5686,19 +5912,9 @@
   Image.prototype = HTMLImageElement.prototype;
   globalThis.Image = Image;
   {
-    const reflect = (name) => ({
-      configurable: true,
-      enumerable: true,
-      get() {
-        return this.getAttribute(name) || "";
-      },
-      set(value) {
-        this.setAttribute(name, String(value));
-      },
-    });
     Object.defineProperties(HTMLImageElement.prototype, {
-      srcset: reflect("srcset"),
-      sizes: reflect("sizes"),
+      srcset: reflectString("srcset"),
+      sizes: reflectString("sizes"),
       currentSrc: {
         configurable: true,
         enumerable: true,
@@ -5734,7 +5950,7 @@
       },
     });
     let pendingImageDecodes = 0;
-    HTMLImageElement.prototype.decode = function () {
+    HTMLImageElement.prototype.decode = function decode() {
       const image = this;
       return new Promise((resolve, reject) => {
         if (pendingImageDecodes >= 16) {
@@ -5772,17 +5988,17 @@
       });
     };
     Object.defineProperties(HTMLSourceElement.prototype, {
-      srcset: reflect("srcset"),
-      sizes: reflect("sizes"),
-      media: reflect("media"),
-      type: reflect("type"),
+      srcset: reflectString("srcset"),
+      sizes: reflectString("sizes"),
+      media: reflectString("media"),
+      type: reflectString("type"),
     });
     Object.defineProperties(HTMLIFrameElement.prototype, {
-      srcdoc: reflect("srcdoc"),
-      loading: reflect("loading"),
-      referrerPolicy: reflect("referrerpolicy"),
+      srcdoc: reflectString("srcdoc"),
+      referrerPolicy: reflectString("referrerPolicy"),
     });
-    Object.defineProperty(HTMLVideoElement.prototype, "poster", reflect("poster"));
+    Object.defineProperty(HTMLVideoElement.prototype, "poster",
+      reflectString("poster"));
   }
   {
     const states = new WeakMap(),
@@ -5825,27 +6041,7 @@
           states.set(node, state);
         }
         return state;
-      },
-      reflectString = (name) => ({
-        configurable: true,
-        enumerable: true,
-        get() {
-          return this.getAttribute(name) || "";
-        },
-        set(value) {
-          this.setAttribute(name, String(value));
-        },
-      }),
-      reflectBoolean = (name) => ({
-        configurable: true,
-        enumerable: true,
-        get() {
-          return this.hasAttribute(name);
-        },
-        set(value) {
-          this.toggleAttribute(name, !!value);
-        },
-      });
+      };
     /* Native controls can activate a video without calling the page-visible
        play() method. The runtime captures and removes this bootstrap bridge
        before author code runs, so native state delivery can still obtain the
@@ -5868,12 +6064,12 @@
           }
         },
       },
-      crossOrigin: { ...reflectString("crossorigin") },
-      preload: { ...reflectString("preload") },
+      crossOrigin: reflectString("crossOrigin"),
+      preload: reflectString("preload"),
       autoplay: reflectBoolean("autoplay"),
       loop: reflectBoolean("loop"),
       controls: reflectBoolean("controls"),
-      playsInline: reflectBoolean("playsinline"),
+      playsInline: reflectBoolean("playsInline"),
       paused: {
         configurable: true,
         enumerable: true,
@@ -6044,7 +6240,7 @@
         value: HTMLMediaElement[name],
         enumerable: true,
       });
-    HTMLMediaElement.prototype.canPlayType = function (type) {
+    HTMLMediaElement.prototype.canPlayType = function canPlayType(type) {
       type = String(type || "").toLowerCase();
       if (
         type.startsWith("video/mp4") &&
@@ -6059,7 +6255,7 @@
       }
       return "";
     };
-    HTMLMediaElement.prototype.load = function () {
+    HTMLMediaElement.prototype.load = function load() {
       const state = stateFor(this);
       state.paused = true;
       state.ended = false;
@@ -6075,7 +6271,7 @@
           : HTMLMediaElement.NETWORK_EMPTY;
       }
     };
-    HTMLMediaElement.prototype.play = function () {
+    HTMLMediaElement.prototype.play = function play() {
       const state = stateFor(this),
         source = this.currentSrc;
       if (
@@ -6096,7 +6292,7 @@
       }
       return Promise.resolve();
     };
-    HTMLMediaElement.prototype.pause = function () {
+    HTMLMediaElement.prototype.pause = function pause() {
       const state = stateFor(this);
       __tilefinchRequestMedia(this.__handle, 2, this.currentSrc, 0);
       if (!state.paused) {
@@ -6104,7 +6300,7 @@
         this.dispatchEvent(new Event("pause"));
       }
     };
-    HTMLMediaElement.prototype.fastSeek = function (time) {
+    HTMLMediaElement.prototype.fastSeek = function fastSeek(time) {
       this.currentTime = time;
     };
     function Audio(src) {
@@ -6231,7 +6427,9 @@
       html.appendChild(head);
       html.appendChild(body);
       body.innerHTML = source;
-      const parsed = Object.create(Document.prototype);
+      const parsed = Object.create(
+        secondaryDocumentPrototype(Document.prototype),
+      );
       doctype.__detachedOwner = parsed;
       Object.defineProperties(parsed, {
         nodeType: { value: Node.DOCUMENT_NODE },
@@ -6312,8 +6510,6 @@
         pointerHoverObserverCount + amount,
       );
   };
-  globalThis.__tilefinchFocusObserverDelta = (type, delta) =>
-    globalThis.__tilefinchEventObserverDelta(type, delta);
   globalThis.__tilefinchFocusEventsObserved = () => focusObserverCount !== 0;
   globalThis.__tilefinchPointerMoveEventsObserved = () =>
     pointerMoveObserverCount !== 0;
@@ -6495,20 +6691,6 @@
     event.__immediateStopped = false;
     event.__passive = false;
   };
-  document.addEventListener = (type, callback, options = false) =>
-    globalThis.__tilefinchAddEventListener(
-      documentListeners,
-      type,
-      callback,
-      options,
-    );
-  document.removeEventListener = (type, callback, options = false) =>
-    globalThis.__tilefinchRemoveEventListener(
-      documentListeners,
-      type,
-      callback,
-      options,
-    );
   globalThis.__tilefinchInvokeDocumentEvent = (event, capture) => {
     event.currentTarget = document;
     event.eventPhase = document === event.target ? 2 : capture ? 1 : 3;
@@ -6537,7 +6719,10 @@
     return !value.defaultPrevented;
   };
   {
-    const maps = new WeakMap(),
+    /* The document's listeners live in the list the native dispatcher
+       reads, so EventTarget.prototype's methods serve document (and window)
+       directly, as in browsers. */
+    const maps = new WeakMap([[document, documentListeners]]),
       mapFor = (target) => {
         let map = maps.get(target);
         if (!map) {
@@ -6706,7 +6891,7 @@
         throw error;
       }
     };
-    EventTarget.prototype.addEventListener = function (
+    EventTarget.prototype.addEventListener = function addEventListener(
       type,
       callback,
       options = false,
@@ -6718,7 +6903,7 @@
         options,
       );
     };
-    EventTarget.prototype.removeEventListener = function (
+    EventTarget.prototype.removeEventListener = function removeEventListener(
       type,
       callback,
       options = false,
@@ -6730,7 +6915,8 @@
         options,
       );
     };
-    EventTarget.prototype.dispatchEvent = function (event) {
+    EventTarget.prototype.dispatchEvent = function dispatchEvent(event) {
+      if (this === globalThis) return dispatchWindowEvent(event);
       const value = event,
         map = mapFor(this);
       globalThis.__tilefinchPrepareEvent(value, this, [this]);
@@ -6745,10 +6931,9 @@
       __tilefinchRecordEvent();
       return !value.defaultPrevented;
     };
-    Node.prototype.addEventListener = EventTarget.prototype.addEventListener;
-    Node.prototype.removeEventListener =
-      EventTarget.prototype.removeEventListener;
-    Node.prototype.dispatchEvent = function (event) {
+    /* Node inherits addEventListener/removeEventListener from
+       EventTarget.prototype; only dispatch walks the node path. */
+    Node.prototype.dispatchEvent = function dispatchEvent(event) {
       const path = boundedAncestorPath(
         this,
         (at) => at.__tilefinchDetachedParent || at.parentNode,
@@ -6788,23 +6973,23 @@
       return !event.defaultPrevented;
     };
   }
-  document.head = wrap(__tilefinchQuery("head"));
+  headWrapper = wrap(__tilefinchQuery("head"));
   globalThis.__tilefinchRebindDocument = () => {
     globalThis.__tilefinchClearNodeCache();
     __tilefinchSuppressRemoteLookup(true);
     try {
-      document.documentElement = wrap(__tilefinchDocumentElement());
-      /* Rebinding an existing runtime is not an authored body replacement.
-         Bypass the public setter: it correctly performs replaceChild(), but
-         that traversal belongs to the retired document whose remote reader
-         has already been detached. */
-      document.__tilefinchBodyValue = wrap(__tilefinchBody());
-      document.head = document.querySelector("head");
+      /* Re-pin the root wrappers of the new document. Rebinding
+         an existing runtime is not an authored body replacement, so the
+         public body setter (and its replaceChild() traversal of the retired
+         document) is not involved. */
+      rootElementWrapper = wrap(__tilefinchDocumentElement());
+      bodyWrapper = wrap(__tilefinchBody());
+      headWrapper = document.querySelector("head");
     } finally {
       __tilefinchSuppressRemoteLookup(false);
     }
     globalThis.__tilefinchRebindStableNodes();
-    document.__activeElement = document.body;
+    globalThis.__tilefinchActiveElement = document.body;
     selection._range = null;
   };
   {
@@ -7051,9 +7236,48 @@
           if (state.pending) flush(this, state);
         },
       },
+      /* Tilefinch's write() appends markup to the body rather than feeding
+         a live parser, so open() is shaped to match: the three-argument
+         form is window.open; while the main document is still being parsed
+         HTML ignores open() (its active-parser case) and so does this; an
+         XML document throws; otherwise the reopened document starts empty:
+         queued writes are dropped and the body's children removed, so the
+         write()/close() that follow replace the page as they would in a
+         browser. The head (and its styles) and listeners are kept, and a
+         written <script> does not run, as for every write() here. */
+      open: {
+        configurable: true,
+        writable: true,
+        value: function open(...args) {
+          if (args.length >= 3)
+            return globalThis.open(args[0], args[1], args[2]);
+          const state = stateFor(this);
+          if (this instanceof XMLDocument ||
+              (this.contentType && this.contentType !== "text/html"))
+            throw new DOMException(
+              "open() is not supported on XML documents",
+              "InvalidStateError",
+            );
+          if (this === document && this.readyState === "loading") return this;
+          state.buffer = "";
+          const body = this.body;
+          if (body) body.replaceChildren();
+          return this;
+        },
+      },
+      prerendering: {
+        configurable: true,
+        enumerable: true,
+        get: Object.getOwnPropertyDescriptor(
+          { get prerendering() { return false; } },
+          "prerendering",
+        ).get,
+      },
     });
   }
   Object.defineProperty(document, "scripts", {
+    configurable: true,
+    enumerable: true,
     get() {
       return document.querySelectorAll("script");
     },
@@ -7061,6 +7285,8 @@
   let cachedDocumentStyleSheets = null,
     cachedDocumentStyleSheetsGeneration = -1;
   Object.defineProperty(document, "styleSheets", {
+    configurable: true,
+    enumerable: true,
     get() {
       const generation = Number(
         globalThis.__tilefinchStyleSheetGeneration?.() || 0,
@@ -7073,7 +7299,6 @@
       const nodes = document.querySelectorAll("style,link"),
         sheets = [];
       for (let index = 0; index < nodes.length; index++) {
-        if (nodes[index].hasAttribute("data-tilefinch-constructed")) continue;
         const sheet = nodes[index].sheet;
         if (sheet) sheets.push(sheet);
       }
@@ -7089,20 +7314,17 @@
     globalThis.__tilefinchDocumentReferrer || "",
   );
   delete globalThis.__tilefinchDocumentReferrer;
-  Object.defineProperty(Document.prototype, "referrer", {
-    configurable: true,
-    enumerable: true,
-    get() {
+  Object.defineProperty(Document.prototype, "referrer", Object.getOwnPropertyDescriptor({
+    get referrer() {
       if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
       return this === document ? documentReferrer : "";
     },
-  });
+  }, "referrer"));
   globalThis.window = globalThis;
   globalThis.self = globalThis;
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.frames = globalThis;
-  globalThis.length = 0;
   Object.defineProperty(globalThis, "frameElement", {
     configurable: false,
     enumerable: true,
@@ -7123,18 +7345,32 @@
     configurable: false,
     enumerable: false,
     writable: false,
-    value: () => null,
+    value: { open: (url = undefined, target = undefined) => null }.open,
   });
-  Object.defineProperty(globalThis, "location", {
-    configurable: false,
-    enumerable: true,
-    get() {
+  Object.defineProperty(globalThis, "location", Object.getOwnPropertyDescriptor({
+    get location() {
       return location;
     },
-    set(value) {
-      location.assign(value);
+    /* [PutForwards=href]. */
+    set location(value) {
+      location.href = value;
     },
-  });
+  }, "location"));
+  Object.defineProperty(globalThis, "location", { configurable: false });
+  /* [Replaceable] window.origin: the origin of the document's location. */
+  Object.defineProperty(globalThis, "origin", Object.getOwnPropertyDescriptor({
+    get origin() {
+      return location.origin;
+    },
+    set origin(value) {
+      Object.defineProperty(globalThis, "origin", {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    },
+  }, "origin"));
   const diagnosticMobileSafari = !!globalThis.__tilefinchDiagnosticMobileSafari,
     tilefinchInnerWidth = Number(globalThis.__tilefinchViewportWidth) || 480,
     tilefinchInnerHeight = Number(globalThis.__tilefinchViewportHeight) || 272,
@@ -7588,12 +7824,6 @@
     location,
   });
   delete globalThis.__tilefinchInstallFrames;
-  location.replace = (value) => {
-    const next = new TilefinchURL(value, location.href);
-    location._set(next.href);
-    __tilefinchRequestNavigation(location.href, true);
-  };
-  location.reload = () => __tilefinchRequestNavigation(location.href, true);
   let historyState = null,
     historyLength = 1;
   globalThis.history = {
@@ -7604,7 +7834,7 @@
       return historyLength;
     },
     scrollRestoration: "auto",
-    replaceState(state, title, url) {
+    replaceState(state, title, url = undefined) {
       if (url !== undefined && url !== null) {
         const next = new TilefinchURL(url, location.href);
         if (
@@ -7616,13 +7846,13 @@
       }
       historyState = state;
     },
-    pushState(state, title, url) {
+    pushState(state, title, url = undefined) {
       this.replaceState(state, title, url);
       historyLength++;
     },
     back() {},
     forward() {},
-    go() {},
+    go(delta = 0) {},
   };
   globalThis.__tilefinchCommitSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
@@ -7642,12 +7872,6 @@
     event.newURL = location.href;
     globalThis.dispatchEvent(event);
   };
-  globalThis.addEventListener = (type, callback, options = false) =>
-    EventTarget.prototype.addEventListener.call(
-      globalThis, type, callback, options);
-  globalThis.removeEventListener = (type, callback, options = false) =>
-    EventTarget.prototype.removeEventListener.call(
-      globalThis, type, callback, options);
   const windowMessageHandlers = new Map(),
     setWindowMessageHandler = (type, value) => {
       let slot = windowMessageHandlers.get(type);
@@ -7692,7 +7916,9 @@
       event.eventPhase,
     );
   };
-  globalThis.dispatchEvent = (event) => {
+  /* window has no own dispatchEvent: EventTarget.prototype.dispatchEvent
+     routes the Window target here, as browsers expose it. */
+  const dispatchWindowEvent = (event) => {
     const value = event,
       path = [globalThis];
     globalThis.__tilefinchPrepareEvent(value, globalThis, path);
@@ -8155,6 +8381,13 @@
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return false;
       }
+      /* No Sec-GPC header is sent and there is no privacy setting it would
+         mirror (the content blocker is a different thing), so the honest
+         answer is that no signal is being sent. */
+      get globalPrivacyControl() {
+        if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
+        return false;
+      }
       javaEnabled() {
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return false;
@@ -8252,14 +8485,12 @@
         enumerable: true,
       });
     storageManager = new StorageManager(storageManagerToken);
-    Object.defineProperty(Navigator.prototype, "storage", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    Object.defineProperty(Navigator.prototype, "storage", Object.getOwnPropertyDescriptor({
+      get storage() {
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return storageManager;
       },
-    });
+    }, "storage"));
     globalThis.StorageManager = StorageManager;
 
     /* The Keyboard Map API is exposed by Chromium even when the platform
@@ -8359,15 +8590,13 @@
       });
       enumerateInterfaceMembers(constructor);
     }
-    Object.defineProperty(Navigator.prototype, "keyboard", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    Object.defineProperty(Navigator.prototype, "keyboard", Object.getOwnPropertyDescriptor({
+      get keyboard() {
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         if (keyboard === null) keyboard = new Keyboard(keyboardToken);
         return keyboard;
       },
-    });
+    }, "keyboard"));
     globalThis.Keyboard = Keyboard;
     globalThis.KeyboardLayoutMap = KeyboardLayoutMap;
 
@@ -8479,7 +8708,7 @@
       if (connected === nextConnected) return;
       connected = nextConnected;
       const type = connected ? "gamepadconnected" : "gamepaddisconnected";
-      queueMicrotask(() => dispatchEvent(new GamepadEvent(type, { gamepad })));
+      queueMicrotask(() => dispatchWindowEvent(new GamepadEvent(type, { gamepad })));
     };
   }
   {
@@ -8517,14 +8746,12 @@
         enumerable: true,
       });
     clipboard = new Clipboard(clipboardToken);
-    Object.defineProperty(Navigator.prototype, "clipboard", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    Object.defineProperty(Navigator.prototype, "clipboard", Object.getOwnPropertyDescriptor({
+      get clipboard() {
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
         return clipboard;
       },
-    });
+    }, "clipboard"));
     globalThis.Clipboard = Clipboard;
   }
   {
@@ -8537,7 +8764,7 @@
           : new TypeError("InvalidCharacterError: " + message);
       throw error;
     };
-    globalThis.btoa = (input) => {
+    const btoa = (input) => {
       const text = String(input);
       if (text.length > 256 * 1024)
         throw new RangeError("base64 input exceeds bounded size");
@@ -8550,7 +8777,8 @@
           text.charCodeAt(encoded),
       );
     };
-    globalThis.atob = (input) => {
+    globalThis.btoa = btoa;
+    const atob = (input) => {
       const text = String(input);
       if (text.length > 1024 * 1024)
         throw new RangeError("base64 input exceeds bounded size");
@@ -8573,6 +8801,7 @@
         );
       }
     };
+    globalThis.atob = atob;
   }
   globalThis.DOMRect = class DOMRect {
     constructor(x = 0, y = 0, width = 0, height = 0) {
@@ -8811,7 +9040,7 @@
       return undefined;
     },
   };
-  globalThis.getComputedStyle = (node, pseudo = null) => {
+  const getComputedStyle = (node, pseudo = null) => {
     if (!node || !node.style)
       throw new TypeError("getComputedStyle requires an Element");
     const target = new CSSStyleDeclaration(computedStyleToken),
@@ -8824,6 +9053,7 @@
     computedStyleStates.set(proxy, state);
     return proxy;
   };
+  globalThis.getComputedStyle = getComputedStyle;
   {
     const mediaLength = (value) => {
         const match = String(value)
@@ -9180,7 +9410,8 @@
     };
     globalThis.MediaQueryList = MediaQueryList;
     globalThis.MediaQueryListEvent = MediaQueryListEvent;
-    globalThis.matchMedia = (query) => new MediaQueryList(query);
+    const matchMedia = (query) => new MediaQueryList(query);
+    globalThis.matchMedia = matchMedia;
   }
   const performanceEntryState = new WeakMap(),
     requirePerformanceEntryState = (value) => {
@@ -9447,10 +9678,8 @@
         return state[name];
       },
     });
-  Object.defineProperty(PerformanceNavigationTiming.prototype, "confidence", {
-    configurable: true,
-    enumerable: true,
-    get() {
+  Object.defineProperty(PerformanceNavigationTiming.prototype, "confidence", Object.getOwnPropertyDescriptor({
+    get confidence() {
       const state = requirePerformanceEntryState(this).navigation;
       if (!state) throw new TypeError("Illegal invocation");
       if (state.domInteractive === 0) return null;
@@ -9459,7 +9688,7 @@
           performanceTimingConfidenceToken, 0, "high");
       return state.confidence;
     },
-  });
+  }, "confidence"));
   for (const [constructor, name] of [
     [PerformanceEntry, "PerformanceEntry"],
     [PerformanceMark, "PerformanceMark"],
@@ -10085,7 +10314,7 @@
       requirePerformanceEntryState(navigationPerformanceEntry),
       navigationTiming = navigationState.navigation,
       domInteractive = __tilefinchPerformanceNow(3);
-    document.readyState = "interactive";
+    documentReadyState = "interactive";
     navigationTiming.domInteractive = domInteractive;
     performanceTimingState.domInteractive =
       performanceTimeOrigin + domInteractive;
@@ -10096,7 +10325,7 @@
     document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
     globalThis.__tilefinchMaybeStartMotion?.();
     const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
-    document.readyState = "complete";
+    documentReadyState = "complete";
     const domComplete = __tilefinchPerformanceNow(3),
       loadEventStart = __tilefinchPerformanceNow(3);
     navigationTiming.domContentLoadedEventEnd = domContentLoadedEventEnd;

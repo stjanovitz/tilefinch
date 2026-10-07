@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -149,6 +150,8 @@ class PspSdkContractTests(unittest.TestCase):
 #include <stdlib.h>
 #define NAVIGATION_URL_LIMIT 2048
 #define MIB (1024u * 1024u)
+#define PSP_NAVIGATION_DOCUMENT_BYTES (8u * MIB)
+#define PSP_NAVIGATION_TIMEOUT_MS 30000L
 #define PSP_UI_SCREEN_HOME 1
 #define PSP_PROFILE_PAGE_NONE 0
 typedef struct { char url[2048]; int base_screen; } Ui;
@@ -173,7 +176,7 @@ static uint64_t sceKernelGetSystemTimeWide(void) { clocks++; return 1234; }
 static bool psp_begin_page_load(void *engine, Ui *ui, void *profile, const uint16_t *frame,
                                 int *input, const char *url, bool history, size_t cap, int timeout) {
     (void)engine; (void)profile; (void)input;
-    if (strcmp(url, ui->url) || history || cap != 4 * MIB || timeout != 30000) abort();
+    if (strcmp(url, ui->url) || history || cap != PSP_NAVIGATION_DOCUMENT_BYTES || timeout != 30000) abort();
     if (frame != expected_frame) abort();
     calls++; return succeeds;
 }
@@ -422,6 +425,9 @@ int main(void) {
             "audio_nodes": 16,
             "decoded_pcm_bytes_total": 512 * 1024,
             "mixer_block_frames": 512,
+            "curve_points_minimum": 2,
+            "curve_points_maximum": 64,
+            "curves_per_parameter": 1,
             "schedule_ahead_us": 10 * 1000 * 1000,
             "minimum_sample_rate_hz": 8000,
             "maximum_sample_rate_hz": 48000,
@@ -432,18 +438,60 @@ int main(void) {
             "manifest_bytes": 64 * 1024,
             "document_bytes": 1024 * 1024,
             "resource_count": 32,
-            "resource_body_bytes_total": 1024 * 1024,
-            "classic_script_bytes_each": 384 * 1024,
+            "resource_body_bytes_total": 1536 * 1024,
+            "classic_script_bytes_each": 512 * 1024,
             "classic_script_compile_count": 8,
-            "classic_script_compile_source_bytes": 512 * 1024,
-            "classic_script_bytecode_bytes": 512 * 1024,
+            "classic_script_compile_source_bytes": 1024 * 1024,
+            "classic_script_bytecode_bytes": 1024 * 1024,
             "classic_script_source_fallback": True,
-            "resource_pack_bytes": 1024 * 1024 + 512 * 1024 + 160 * 1024,
+            "resource_pack_bytes": 1536 * 1024 + 1024 * 1024 + 160 * 1024,
             "native_icon_width_px": 16,
             "native_icon_height_px": 16,
             "native_icon_rgba_bytes": 16 * 16 * 4,
             "library_items": 12,
         })
+        self.assertEqual(profile["limits"]["installed_app"], {
+            "javascript_heap_floor_bytes": 9 * 1024 * 1024,
+            "strict_javascript_heap_floor_bytes": 6 * 1024 * 1024,
+            "psp_boot_keys": {"app_heap_mb": 9, "file_kb": 512},
+        })
+        self.assertEqual(
+            profile["apis"]["animation_frame"]
+            ["psp_page_clock_maximum_advance_per_loop_us"], 16000)
+        engine_header = (ROOT / "include/tilefinch/browser_engine.h").read_text(
+            encoding="utf-8")
+        for token in (
+            "#define BROWSER_PSP_STRICT_INSTALLED_APP_HEAP "
+            "(6u * 1024u * 1024u)",
+            # The PSP app profile shared by boot.cfg defaults and the lab.
+            "#define BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB 9u",
+            "#define BROWSER_PSP_APP_SCRIPT_FILE_KB 4096u",
+        ):
+            self.assertIn(token, engine_header)
+        boot_config = (ROOT / "src/psp_boot_config.c").read_text(
+            encoding="utf-8")
+        for token in (
+            "#define PSP_DEFAULT_APP_HEAP_MB "
+            "((long) BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB)",
+            "#define PSP_DEFAULT_SCRIPT_FILE_KB "
+            "((long) BROWSER_PSP_APP_SCRIPT_FILE_KB)",
+            "config->tick_ms = 16;",
+        ):
+            self.assertIn(token, boot_config)
+
+        runtime_header = (ROOT / "src/js_runtime_internal.h").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (4u * 1024u * 1024u)",
+            runtime_header)
+        self.assertIn(
+            "#define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES "
+            "(256u * 1024u)", runtime_header)
+        boot = dict(line.split("=", 1) for line in
+                    (ROOT / "psp-assets/boot-live.cfg").read_text(
+                        encoding="utf-8").splitlines()
+                    if line and not line.startswith("#"))
+        self.assertEqual(boot["file_kb"], "4096")
 
         canvas = (ROOT / "src/bootstrap/canvas.js").read_text(
             encoding="utf-8")
@@ -505,18 +553,40 @@ int main(void) {
             encoding="utf-8")
         self.assertIn("nodeLimit = 16", audio_js)
         self.assertIn("Only one game AudioContext is available", audio_js)
+        # The reference's command opcodes carry one set of names.
+        c_opcodes = dict(re.findall(
+            r"TILEFINCH_GAME_AUDIO_COMMAND_([A-Z_]+) = (\d+),", audio_header))
+        js_table = audio_js[audio_js.index("const RESUME = 0"):]
+        js_table = js_table[:js_table.index(";")]
+        js_opcodes = dict(re.findall(r"([A-Z_]+) = (\d+)", js_table))
+        self.assertEqual(len(c_opcodes), 12)
+        self.assertEqual(js_opcodes, c_opcodes)
+        self.assertNotRegex(audio_js, r"nativeCommand\(\s*\d")
+        # Shipping PSP builds carry only the native slots.
+        internal = (ROOT / "src/js_runtime_internal.h").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)\n"
+            "#define TILEFINCH_GAME_AUDIO_REFERENCE 1", internal)
 
         offline = (ROOT / "include/tilefinch/offline_library.h").read_text(
             encoding="utf-8")
         for token in (
             "#define OFFLINE_LIBRARY_ITEM_LIMIT 12u",
             "#define OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT (1024u * 1024u)",
-            "#define OFFLINE_LIBRARY_APP_RESOURCE_LIMIT (1024u * 1024u)",
-            "#define OFFLINE_LIBRARY_APP_BYTECODE_LIMIT (512u * 1024u)",
+            "#define OFFLINE_LIBRARY_APP_RESOURCE_LIMIT (1536u * 1024u)",
+            "#define OFFLINE_LIBRARY_APP_BYTECODE_LIMIT (1024u * 1024u)",
             "+ OFFLINE_LIBRARY_APP_BYTECODE_LIMIT + 160u * 1024u)",
             "#define OFFLINE_LIBRARY_APP_ICON_EDGE 16u",
         ):
             self.assertIn(token, offline)
+        offline_source = (ROOT / "src/offline_library.c").read_text(
+            encoding="utf-8")
+        for token in (
+            "#define OFFLINE_APP_BYTECODE_SCRIPT_LIMIT 8u",
+            "#define OFFLINE_APP_BYTECODE_SOURCE_LIMIT (1024u * 1024u)",
+        ):
+            self.assertIn(token, offline_source)
         manifest = (ROOT / "include/tilefinch/web_app_manifest.h").read_text(
             encoding="utf-8")
         self.assertIn(
@@ -540,6 +610,19 @@ int main(void) {
         guide = (ROOT / "docs/GAME_PROFILE.md").read_text(encoding="utf-8")
         self.assertIn("[Game Profile v1](GAME_PROFILE.md)", docs_map)
         self.assertIn("tilefinch-game-profile-v1.json", guide)
+
+    def test_page_fullscreen_retracts_chrome_before_its_first_present(self):
+        # Page script enters fullscreen during dispatch or the runtime
+        # advance, after the input sample that adopts it; the loop must hide
+        # chrome before presenting that frame (Treadline's Deploy flash).
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        frame = main[main.index("void psp_loop_frame(PspLoop *loop)"):]
+        retract = frame.index("psp_ui_retract_chrome_for_page_fullscreen(")
+        self.assertLess(frame.index("psp_sync_ui(&process->presentation.ui"),
+                        retract)
+        self.assertLess(retract, frame.index("PSP_LOOP_PHASE(LOOP_PRESENT);"))
+        self.assertIn("browser_engine_page_fullscreen_active(browser->engine)",
+                      frame[retract:retract + 200])
 
     def test_activation_cooperates_and_acknowledges_only_a_successful_latch(self):
         actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text())
@@ -763,6 +846,28 @@ int main(void) {
         self.assertNotIn("tilefinch-validation", source)
         self.assertNotIn("tilefinch-crash", source)
 
+    def test_psplink_stages_scenario_probe_companions(self):
+        source = (ROOT / "scripts/psplink-device.sh").read_text()
+        start = source.index('if [ -f "$scenario" ]; then')
+        end = source.index('\n                    ;;', start)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            authored = root / "authored"
+            served = root / "served"
+            authored.mkdir()
+            served.mkdir()
+            for name in ("game.txt", "game.mark.js", "game.until.js"):
+                (authored / name).write_text("fresh:" + name)
+                (served / name).write_text("stale:" + name)
+            result = subprocess.run(
+                ["sh", "-c", 'set -eu\nscenario=$1\nBUILD_DIR=$2\n'
+                 'input_script=game.txt\n' + source[start:end], "test",
+                 str(authored / "game.txt"), str(served)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in ("game.txt", "game.mark.js", "game.until.js"):
+                self.assertEqual((served / name).read_text(), "fresh:" + name)
+
     def test_psplink_module_guards_accept_device_crlf(self):
         source = (ROOT / "scripts/psplink-device.sh").read_text()
         helpers = source[source.index("unload_named_modules()"):
@@ -878,57 +983,6 @@ int main(void) {
         self.assertIn("tilefinch_test_faults()->refuse_next_render_shell_init = true", source)
         self.assertIn("tilefinch_test_faults()->refuse_next_render_shell_init = false", source)
         self.assertNotIn("static bool browser_engine_test_refuse_render_shell_init", source)
-
-    def test_quickjs_variant_refreshes_header_and_supporting_sources(self):
-        dependencies = (ROOT / "cmake/TilefinchDependencies.cmake").read_text()
-        # Exercise the production preparation block in a disposable, dependency-
-        # free CMake project; never alter a shared engine or build tree.
-        block = dependencies.split("if(PSP_BROWSER_USE_BELLARD_QUICKJS)\n    # The engine", 1)[1]
-        block = "if(PSP_BROWSER_USE_BELLARD_QUICKJS)\n    # The engine" + block.split("    add_library(qjs STATIC", 1)[0] + "endif()\n"
-        with tempfile.TemporaryDirectory() as temporary:
-            source, build = Path(temporary) / "source", Path(temporary) / "build"
-            vendor = source / "third_party/quickjs"
-            shutil.copytree(ROOT / "third_party/quickjs", vendor)
-            (source / "patches").symlink_to(ROOT / "patches", target_is_directory=True)
-            (source / "CMakeLists.txt").write_text(
-                'cmake_minimum_required(VERSION 3.24)\nproject(qjs_review NONE)\n'
-                'find_program(PATCH_EXECUTABLE patch REQUIRED)\n'
-                'set(PSP_BROWSER_USE_BELLARD_QUICKJS ON)\n'
-                'option(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH "" OFF)\n'
-                'option(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY "" ON)\n'
-                'option(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE "" OFF)\n' + block +
-                'add_custom_target(check_copy ALL COMMAND "${CMAKE_COMMAND}" -E compare_files '
-                '"${quickjs_SOURCE_DIR}/cutils.h" "${tilefinch_quickjs_vendor_dir}/cutils.h")\n')
-            command = ["cmake", "-S", str(source), "-B", str(build)]
-            result = subprocess.run(command, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            header = build / "quickjs-variant/quickjs.h"
-            header.write_text(header.read_text() + "\n/* stale variant */\n")
-            result = subprocess.run(command, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(header.read_bytes(), (vendor / "quickjs.h").read_bytes())
-            support = vendor / "cutils.h"
-            support.write_text(support.read_text() + "\n/* vendor update */\n")
-            # No explicit configure: the ordinary build must refresh the copy.
-            result = subprocess.run(["cmake", "--build", str(build)], capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual((build / "quickjs-variant/cutils.h").read_bytes(), support.read_bytes())
-            cache = (build / "CMakeCache.txt").read_text()
-            self.assertIn(f"TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR:INTERNAL={build}/quickjs-variant", cache)
-            # Baseline engine changes must refresh every variant pin, not only
-            # the vendor fingerprint or this fixture's initial OFF-ON-OFF pin.
-            for capture, compact, trace in (
-                ("ON", "OFF", "OFF"), ("ON", "ON", "ON"),
-                ("ON", "OFF", "ON"), ("OFF", "ON", "ON"),
-                ("OFF", "OFF", "OFF"), ("OFF", "OFF", "ON"),
-            ):
-                with self.subTest(capture=capture, compact=compact, trace=trace):
-                    result = subprocess.run(command + [
-                        f"-DPSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH={capture}",
-                        f"-DPSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY={compact}",
-                        f"-DPSP_BROWSER_JS_PROPERTY_FAULT_TRACE={trace}",
-                    ], capture_output=True)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_incremental_benchmark_checks_selected_engine_not_fetch_override(self):
         spec = importlib.util.spec_from_file_location(
@@ -1064,6 +1118,81 @@ int main(void) {
                 os.kill(bridge_pid, 15)
             except ProcessLookupError:
                 pass
+
+    def test_psplink_hold_observes_one_bridge_without_replacement(self):
+        # Real wrapper, mocked host tools only. Every wait and mock lifetime
+        # is bounded; this test never opens USB or a PSPLink socket.
+        for change in ("pid", "root", "death", "stop"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                host = root / "host"
+                ready = root / "ready"
+                starts = root / "starts"
+                mock_pid = root / "mock-pid"
+                pspsh = root / "pspsh"
+                usbhostfs = root / "usbhostfs_pc"
+                pspsh.write_text(
+                    '#!/bin/sh\n[ -f "$MOCK_READY" ] || exit 1\n'
+                    'echo "PSPLink v3.2.1"\n')
+                usbhostfs.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$$" >"$MOCK_PID"\n'
+                    'echo start >>"$MOCK_STARTS"\n: >"$MOCK_READY"\n'
+                    'exec sleep 20\n')
+                pspsh.chmod(0o755)
+                usbhostfs.chmod(0o755)
+                environment = dict(
+                    os.environ, HOST_ROOT=str(host), PSPLINK_STATE_DIR=str(root),
+                    PSPSH=str(pspsh), USBHOSTFS=str(usbhostfs),
+                    MOCK_READY=str(ready), MOCK_PID=str(mock_pid), MOCK_STARTS=str(starts),
+                    LINK_TIMEOUT_SECONDS="1", BRIDGE_START_TIMEOUT_SECONDS="2",
+                    PSPLINK_POLLS_PER_SECOND="10")
+                command = [str(ROOT / "scripts/psplink-shell.sh")]
+                hold = subprocess.Popen(command + ["hold"], env=environment,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True)
+                try:
+                    readable, _, _ = select.select([hold.stdout], [], [], 5)
+                    self.assertTrue(readable, "bounded hold readiness")
+                    line = hold.stdout.readline()
+                    self.assertIn("PSPLink hold ready", line)
+                    bridge_pid = int(mock_pid.read_text().strip())
+                    self.assertIn(f"bridge PID: {bridge_pid}", line)
+                    self.assertIsNone(hold.poll())
+                    # Ordinary commands reuse the held bridge unchanged.
+                    probe = subprocess.run(command + ["exec", "ver"], env=environment,
+                                           capture_output=True, text=True, timeout=3)
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
+                    self.assertEqual(starts.read_text().splitlines(), ["start"])
+                    self.assertIsNone(hold.poll())
+                    if change == "pid":
+                        (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
+                    elif change == "root":
+                        (root / ".tilefinch-usbhostfs.root").write_text(str(root / "other"))
+                    elif change == "death":
+                        os.kill(bridge_pid, 15)
+                    else:
+                        hold.terminate()
+                    _, error = hold.communicate(timeout=3)
+                    if change == "stop":
+                        self.assertEqual(hold.returncode, 0, error)
+                    else:
+                        self.assertNotEqual(hold.returncode, 0)
+                        self.assertIn("not replacing it", error)
+                    self.assertEqual(starts.read_text().splitlines(), ["start"])
+                    if change != "death":
+                        # Neither ownership failure nor stopping hold kills
+                        # the bridge (or the newly recorded PID).
+                        os.kill(bridge_pid, 0)
+                        os.kill(os.getpid(), 0)
+                finally:
+                    if hold.poll() is None:
+                        hold.terminate()
+                    hold.communicate(timeout=3)
+                    if mock_pid.exists():
+                        try:
+                            os.kill(int(mock_pid.read_text().strip()), 15)
+                        except ProcessLookupError:
+                            pass
 
     def test_psplink_bridge_reports_host_socket_denial(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5806,6 +5935,176 @@ int main(void) {
         self.assertNotIn(
             '#define PSP_MEDIA_AU_DUMP_PATH "ms0:', completion)
 
+    def test_canvas_raster_attribution_uses_per_frame_counter_deltas(self):
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        render = main[main.rindex("unsigned psp_loop_render_job("):
+                      main.rindex("unsigned psp_loop_render_job(") + 8500]
+        self.assertIn("canvas_fast_raster_us - canvas_raster_before", render)
+        self.assertIn("canvas_fast_overlay_us - canvas_overlay_before", render)
+        self.assertIn("canvas_render && psp_canvas_cadence.causal_window", render)
+        self.assertIn("&render_cpu_before, &render_cpu_after", render)
+        rendered = main[main.index("static void psp_canvas_cadence_rendered("):
+                        main.index("static void psp_canvas_cadence_cpu(")]
+        self.assertIn("before->valid && after->valid", rendered)
+        self.assertIn("pending_render_cpu_samples++", rendered)
+        self.assertIn("metrics->pending_render_canvas_raster_us = 0;", main)
+        self.assertIn("metrics->pending_render_canvas_overlay_us = 0;", main)
+        self.assertIn("metrics->pending_render_cpu_samples = 0;", main)
+        self.assertIn("tilefinch-canvas-raster: n=%lu", main)
+
+    def test_canvas_timing_window_retains_logs_without_live_io(self):
+        log = (ROOT / "src/psp_log.c").read_text(encoding="utf-8")
+        self.assertIn("if (locked && timing_window) {", log)
+        write = log[log.index("if (locked && timing_window) {"):
+                    log.index("FILE *psp_log_file(void)", log.index("if (locked && timing_window) {"))]
+        retained = write[:write.index("if (length != 0)")]
+        self.assertIn("psp_log_capture_append", retained)
+        self.assertIn("return truncated", retained)
+        self.assertNotIn("fwrite", retained)
+        self.assertIn("if (!timing_window && flushed != 0", log)
+        self.assertIn("forced-flushes=%zu", log)
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        self.assertIn("psp_log_begin_timing_window()", main)
+        self.assertIn("psp_log_end_timing_window();", main)
+        self.assertIn("|| psp_validation_canvas_live_trace)", main)
+        checkpoint = (ROOT / "src/js_runtime/event_loop.inc").read_text(encoding="utf-8")
+        self.assertIn("!runtime->checkpoint_trace_suppressed;", checkpoint)
+
+    def test_canvas_copy_and_conversion_attribution_report_actual_work(self):
+        runtime = (ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8")
+        query = runtime[runtime.index("static bool psp_present_thread_cpu("):
+                        runtime.index("bool psp_present_validation_last_timing(")]
+        self.assertIn("sceKernelReferThreadRunStatus", query)
+        self.assertIn("< 0)", query)
+        self.assertIn("return false;", query)
+        present = runtime[runtime.index("bool psp_present_internal("):
+                          runtime.index("bool psp_present_internal(") + 12000]
+        self.assertIn("base_cpu_before_valid && base_cpu_after_valid", present)
+        self.assertIn("base_cpu_after >= base_cpu_before", present)
+        self.assertIn("psp_present_cpu_measurement\n", present)
+        self.assertIn("copy_end > opaque_top ? copy_end - opaque_top : 0u", present)
+        render = (ROOT / "src/render.c").read_text(encoding="utf-8")
+        raster = render[render.index("static void rasterize_opaque_canvas_fast("):
+                        render.index("RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(")]
+        for path in ("kernel_rows++", "general_rows++", "repeat_rows++", "skipped_rows++"):
+            self.assertIn(path, raster)
+        self.assertIn("source_address = (uintptr_t) source_pixels", raster)
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        self.assertIn("canvas_fast_frames > canvas_frames_before", main)
+        self.assertIn("psp_present_validation_measure_cpu(true);", main)
+        self.assertIn("psp_present_validation_measure_cpu(false);", main)
+        self.assertIn("tilefinch-canvas-copy: n=%lu valid=%u", main)
+        self.assertIn("tilefinch-canvas-conversion: n=%lu samples=%lu", main)
+
+    def test_canvas_peer_records_survive_sampling_stop(self):
+        # Compile the actual two dump loops with sampling already disabled.
+        # The final report must use each buffered record, not the live sampler
+        # count/enable bit which canvas-thread-off clears before shutdown.
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        peer = main.index('printf("tilefinch-canvas-peer-cpu:')
+        begin = main.rindex('        printf("\\n");', 0, peer)
+        begin = main.index("\n", begin) + 1
+        end = main.index('        printf("tilefinch-canvas-raster:', peer)
+        runtime_loop = main[begin:end]
+        peer = main.index('printf("tilefinch-canvas-budget-peer:')
+        begin = main.rindex("            for (size_t at =", 0, peer)
+        end = main.index(";", peer) + 1
+        budget_loop = main[begin:end]
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#define PSP_CANVAS_PEER_LIMIT 8u
+static bool psp_canvas_peer_enabled;
+static size_t psp_canvas_peer_count;
+typedef struct {
+    uint32_t ordinal, peer_samples[8], peer_cpu_us[8];
+    uint32_t peer_span_us, peer_window_extra_us;
+    uint32_t budget_peer_mask, budget_peer_cpu_us[8];
+} Sample;
+int main(void) {
+    const Sample row = {.ordinal=42, .peer_samples={[2]=1, [4]=1},
+        .peer_cpu_us={[4]=123}, .peer_span_us=7, .peer_window_extra_us=9,
+        .budget_peer_mask=(1u<<2)|(1u<<4), .budget_peer_cpu_us={[4]=456}};
+    const Sample *s = &row;
+''' + runtime_loop + budget_loop + "\nreturn 0;\n}\n"
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "peers.c").write_text(fixture)
+            compiled = subprocess.run(
+                [compiler, "-O2", "-std=c11", str(path / "peers.c"),
+                 "-o", str(path / "peers")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            run = subprocess.run([str(path / "peers")], capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.stdout.decode().splitlines(), [
+                "tilefinch-canvas-peer-cpu: n=42 slot=2 samples=1 cpu=0 span=7 extra=9",
+                "tilefinch-canvas-peer-cpu: n=42 slot=4 samples=1 cpu=123 span=7 extra=9",
+                "tilefinch-canvas-budget-peer: n=42 slot=2 cpu=0",
+                "tilefinch-canvas-budget-peer: n=42 slot=4 cpu=456",
+            ])
+
+    def test_intrusive_audio_attribution_does_not_repeat_author_coercion(self):
+        source = (ROOT / "src/js_dom_bindings.c").read_text(encoding="utf-8")
+        wrapper = source[source.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG\nJSValue js_game_audio_command("):
+                         source.index("void bridge_invalidate_node_slot(")]
+        self.assertNotIn("JS_ToInt", wrapper)
+        self.assertIn("JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT", wrapper)
+        self.assertIn("if (!game_audio_native_measurement)", wrapper)
+        self.assertIn("game_audio_native_depth++ == 0", wrapper)
+        self.assertIn("game_audio_native_depth--;", wrapper)
+        self.assertIn("native_metrics.nested_calls++", wrapper)
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        self.assertIn('strcmp(mark, "canvas-audio-on")', main)
+        for mark in ("canvas-audio-on", "canvas-audio-off"):
+            self.assertLess(len(mark), 20)
+        self.assertIn("script_runtime_game_audio_native_measure(psp_validation_native_detail);", main)
+        self.assertIn("script_runtime_game_audio_native_measure(false);", main)
+        self.assertIn("script_runtime_game_audio_native_take(&audio_native);", main)
+        # Validation builds keep shipping's native slots unless boot.cfg
+        # explicitly selects the reference.
+        self.assertIn(
+            "    if (process.config.validation_game_audio_reference == 1)\n"
+            "        engine_config->javascript.game_audio_internal_slots = false;",
+            main)
+        self.assertNotIn("validation_game_audio_slots", main)
+        self.assertIn("tilefinch-canvas-audio: n=%lu command=%u", main)
+
+    def test_validation_vfpu_conversion_is_guarded_and_preserves_state(self):
+        render = (ROOT / "src/render.c").read_text(encoding="utf-8")
+        block = render[render.index("#if defined(_MIPS_ARCH_ALLEGREX)\n/* vt5650.q"):
+                       render.index("static bool canvas_fast_frame_candidate_impl(")]
+        self.assertIn("enabled && canvas_validation_vfpu_usable", block)
+        # Validation builds convert as shipping builds do unless a mark
+        # selects the scalar reference.
+        self.assertIn("static bool canvas_validation_vfpu_conversion = true;", block)
+        self.assertIn("#if defined(_MIPS_ARCH_ALLEGREX)", block)
+        kernel = block[block.index("static __attribute__((noinline)) void canvas_fast_scale_row_vfpu_3_to_2("):
+                       block.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG")]
+        self.assertIn("sv.q C000,0(%3)", kernel)
+        self.assertIn("lv.q C000,0(%3)", kernel)
+        for prefix in (128, 129, 130):
+            self.assertRegex(kernel, rf"mfvc %[012],\${prefix}")
+            self.assertRegex(kernel, rf"mtvc %[012],\${prefix}")
+        self.assertNotIn("sceGu", kernel)
+        self.assertNotIn("malloc", kernel)
+        self.assertIn("result.mismatches == 0 && result.state_mismatches == 0", block)
+        self.assertIn("row < 512u", block)
+        self.assertIn("memcmp(after, sentinel, sizeof(after))", block)
+        raster = render[render.index("static void rasterize_opaque_canvas_fast("):
+                        render.index("RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(")]
+        self.assertIn("#if defined(_MIPS_ARCH_ALLEGREX)", raster)
+        self.assertIn("#ifdef TILEFINCH_PSP_VALIDATION_LOG\n                && canvas_validation_vfpu_conversion", raster)
+        self.assertIn("source_row % 16u", raster)
+        self.assertIn("vfpu_rows++", raster)
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        for mark in ("canvas-vfpu-check", "canvas-vfpu-on", "canvas-vfpu-off"):
+            self.assertLess(len(mark), 20)
+            self.assertIn(f'strcmp(mark, "{mark}")', main)
+
     def test_failed_codec_calls_dump_the_memory_firmware_owns(self):
         # Both firmware codecs report a rejection as one opaque status, which
         # cannot say whether the Media Engine ran at all. The buffers firmware
@@ -6146,6 +6445,46 @@ int main(void) {
             policy.index("static inline int psp_media_slot_free_index("):
             policy.index("static inline unsigned psp_media_slot_free_count(")]
         self.assertIn("psp_media_slot_observe(&slots[at])", free_index)
+        # The take decides on the state before it reads anything else. A
+        # FREE slot is the writer's, and an epoch read made before the state
+        # test discarded it was a race against the next conversion's stores
+        # (ThreadSanitizer, tilefinch-psp-media-ownership-tsan-tests).
+        take_index = policy[
+            policy.index("static inline int psp_media_slot_take_index("):
+            policy.index("#define PSP_MEDIA_VIDEO_LATE_DROP_US")]
+        self.assertLess(
+            take_index.index("psp_media_slot_observe(&slots[at])"),
+            take_index.index("state != PSP_MEDIA_SLOT_ME_WRITING) continue;"))
+        self.assertLess(
+            take_index.index("state != PSP_MEDIA_SLOT_ME_WRITING) continue;"),
+            take_index.index("slots[at].epoch"))
+        # And the key that take reads from a ME_WRITING slot is written
+        # once, before ME_WRITING is published. A second store while the
+        # conversion runs -- even of the same value -- races the read.
+        convert = source[
+            source.index(
+                "static int psp_media_emit_captured_picture(\n"
+                "    PspMediaBackend *backend, unsigned write_slot, "
+                "uint64_t epoch,\n"
+                "    char *error, size_t error_size)\n{"):
+            source.rindex(
+                "static bool psp_media_validate_output_surface(\n"
+                "    PspMediaBackend *backend, unsigned write_slot,\n"
+                "    char *error, size_t error_size)\n{")]
+        writing = convert[
+            convert.index(
+                "psp_media_slot_publish(state, PSP_MEDIA_SLOT_ME_WRITING)"):
+            convert.index(
+                "psp_media_slot_publish(state, PSP_MEDIA_SLOT_READY)")]
+        for key in ("state->epoch =", "state->sequence =",
+                    "state->pts_us =", "state->duration_us =",
+                    "state->generation"):
+            self.assertNotIn(
+                key, writing,
+                "the ordering key is frozen while the slot is ME_WRITING")
+            self.assertIn(
+                key, convert[:convert.index(
+                    "psp_media_slot_publish(state, PSP_MEDIA_SLOT_ME_WRITING)")])
 
     def test_seek_waits_for_a_healthy_codec_unit_before_failing(self):
         source = without_comments(
@@ -7657,10 +7996,22 @@ int main(void) {
         reader_prepare = blank_recovery.index(
             "browser_engine_prepare_blank_reader_recovery")
         self.assertLess(basic_prepare, reader_prepare)
-        self.assertIn(
-            "BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE", blank_recovery)
-        self.assertIn("ui->basic_mode = true", blank_recovery)
-        self.assertIn("ui->reader_mode = false", blank_recovery)
+        # The Basic view fallback setting decides between switching, asking
+        # and keeping the page (psp_basic_fallback_*); the switch presents
+        # through one activation helper.
+        self.assertIn("psp_basic_fallback_decide", blank_recovery)
+        self.assertIn("PSP_BASIC_FALLBACK_SWITCH", blank_recovery)
+        self.assertIn("PSP_BASIC_FALLBACK_ASK", blank_recovery)
+        self.assertIn("psp_app_set_basic_view(app, loaded_url, true",
+                      blank_recovery)
+        page = (ROOT / "src/psp_app/psp_app_page.c").read_text(
+            encoding="utf-8")
+        activate_basic = page[
+            page.index("bool psp_app_set_basic_view("):
+            page.index("bool psp_reader_navigation_prepare(")]
+        self.assertIn("browser_engine_activate_basic_view", activate_basic)
+        self.assertIn("ui->basic_mode = enable", activate_basic)
+        self.assertIn("ui->reader_mode = false", activate_basic)
         self.assertIn("psp_present_blank_reader_unavailable", blank_recovery)
         self.assertIn("blank_reader_recovery_pending = true", blank_recovery)
         self.assertIn(
@@ -8149,7 +8500,8 @@ int main(void) {
                     subprocess.run(["/bin/sh", "-eu", "-c", source[start:end]],
                         env={**os.environ, "run_dir": temporary,
                              "ppsspp_cpu_mhz": "0", "scenario": scenario,
-                             "graphics_backend": "3 (VULKAN)"},
+                             "graphics_backend": "3 (VULKAN)",
+                             "software_renderer": "False"},
                         check=True)
                     config = configparser.ConfigParser()
                     config.read(Path(temporary) / "script.ini")
@@ -8161,6 +8513,33 @@ int main(void) {
                     for key in ("GameVolume", "GlobalVolume", "UIVolume",
                                 "GamePreviewVolume", "AchievementVolume"):
                         self.assertEqual(config.getint("Sound", key), 0)
+
+    def test_recording_harness_dumps_lossless_native_frames_silently(self):
+        source = (ROOT / "scripts/run-ppsspp-input-script.sh").read_text(
+            encoding="utf-8")
+        end_marker = '} >"$run_dir/script.ini"'
+        end = source.index(end_marker) + len(end_marker)
+        start = source.rfind("    {\n", 0, end)
+        with tempfile.TemporaryDirectory() as temporary:
+            subprocess.run(["/bin/sh", "-eu", "-c", source[start:end]],
+                env={**os.environ, "run_dir": temporary, "ppsspp_cpu_mhz": "0",
+                     "scenario": "treadline-long-soak", "record_video": temporary,
+                     "graphics_backend": "3 (VULKAN)", "software_renderer": "True"},
+                check=True)
+            config = configparser.ConfigParser()
+            config.read(Path(temporary) / "script.ini")
+        # TILEFINCH_PPSSPP_SOFTWARE_RENDERER=1 (overlays the hardware
+        # renderer drops) writes the key PPSSPP 1.20 actually reads.
+        self.assertTrue(config.getboolean("Graphics", "SoftwareRenderer"))
+        self.assertIn('TILEFINCH_PPSSPP_SOFTWARE_RENDERER:-0', source)
+        for key in ("DumpFrames", "UseFFV1", "DumpAudio"):
+            self.assertTrue(config.getboolean("General", key), key)
+        self.assertEqual(config.getint("Graphics", "InternalResolution"), 1)
+        # The dump mixes the game's audio, so a recording is not muted; it
+        # plays nothing on the host through SDL's dummy driver instead.
+        self.assertNotIn("Sound", config)
+        self.assertIn('audio_env="--env SDL_AUDIODRIVER=dummy"', source)
+        self.assertIn('--env "HOME=$home_dir" $audio_env', source)
 
     def test_input_harness_does_not_require_images_for_control_marks(self):
         source = (ROOT / "scripts/run-ppsspp-input-script.sh").read_text(
@@ -8231,6 +8610,19 @@ int main(void) {
             '} >>"$home_dir/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"')
         self.assertLess(base_copy, alias_append)
 
+    def test_presentation_css_buffer_holds_every_appended_sheet(self):
+        # The Reader/Basic sheet is followed by the cosmetic and cookie
+        # sheets in one buffer; tilefinch-psp-basic-fallback-tests measures
+        # that the three fit this sum.
+        # Whitespace is normalized so a reflow does not fail the check.
+        page = " ".join(without_comments(
+            (ROOT / "src/psp_app/psp_app_page.c").read_text(
+                encoding="utf-8")).split())
+        self.assertIn(
+            "char css[SITE_ADAPTER_READER_CSS_LIMIT"
+            " + CONTENT_BLOCKER_COSMETIC_CSS_LIMIT"
+            " + CONTENT_BLOCKER_COOKIE_CSS_LIMIT + 2u];", page)
+
     def test_canvas_rect_batch_fits_native_work_allowance(self):
         # canvas.js retains a rectangle batch whose native call reported
         # status 2, so the facade's batch cap and surface ceiling must match
@@ -8250,6 +8642,64 @@ int main(void) {
         self.assertIn("<= CANVAS_RASTER_WORK_LIMIT", bridge)
 
 
+class QuickJsVariantPreparationTests(unittest.TestCase):
+    """The one slow contract: nine real CMake configures (about 22 s alone).
+    CTest runs it as its own test so it overlaps the source scans above
+    instead of making one long test that a loaded host can time out."""
+
+    def test_quickjs_variant_refreshes_header_and_supporting_sources(self):
+        dependencies = (ROOT / "cmake/TilefinchDependencies.cmake").read_text()
+        # Exercise the production preparation block in a disposable, dependency-
+        # free CMake project; never alter a shared engine or build tree.
+        block = dependencies.split("if(PSP_BROWSER_USE_BELLARD_QUICKJS)\n    # The engine", 1)[1]
+        block = "if(PSP_BROWSER_USE_BELLARD_QUICKJS)\n    # The engine" + block.split("    add_library(qjs STATIC", 1)[0] + "endif()\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            source, build = Path(temporary) / "source", Path(temporary) / "build"
+            vendor = source / "third_party/quickjs"
+            shutil.copytree(ROOT / "third_party/quickjs", vendor)
+            (source / "patches").symlink_to(ROOT / "patches", target_is_directory=True)
+            (source / "CMakeLists.txt").write_text(
+                'cmake_minimum_required(VERSION 3.24)\nproject(qjs_review NONE)\n'
+                'find_program(PATCH_EXECUTABLE patch REQUIRED)\n'
+                'set(PSP_BROWSER_USE_BELLARD_QUICKJS ON)\n'
+                'option(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH "" OFF)\n'
+                'option(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY "" ON)\n'
+                'option(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE "" OFF)\n' + block +
+                'add_custom_target(check_copy ALL COMMAND "${CMAKE_COMMAND}" -E compare_files '
+                '"${quickjs_SOURCE_DIR}/cutils.h" "${tilefinch_quickjs_vendor_dir}/cutils.h")\n')
+            command = ["cmake", "-S", str(source), "-B", str(build)]
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            header = build / "quickjs-variant/quickjs.h"
+            header.write_text(header.read_text() + "\n/* stale variant */\n")
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(header.read_bytes(), (vendor / "quickjs.h").read_bytes())
+            support = vendor / "cutils.h"
+            support.write_text(support.read_text() + "\n/* vendor update */\n")
+            # No explicit configure: the ordinary build must refresh the copy.
+            result = subprocess.run(["cmake", "--build", str(build)], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((build / "quickjs-variant/cutils.h").read_bytes(), support.read_bytes())
+            cache = (build / "CMakeCache.txt").read_text()
+            self.assertIn(f"TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR:INTERNAL={build}/quickjs-variant", cache)
+            # Baseline engine changes must refresh every variant pin, not only
+            # the vendor fingerprint or this fixture's initial OFF-ON-OFF pin.
+            for capture, compact, trace in (
+                ("ON", "OFF", "OFF"), ("ON", "ON", "ON"),
+                ("ON", "OFF", "ON"), ("OFF", "ON", "ON"),
+                ("OFF", "OFF", "OFF"), ("OFF", "OFF", "ON"),
+            ):
+                with self.subTest(capture=capture, compact=compact, trace=trace):
+                    result = subprocess.run(command + [
+                        f"-DPSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH={capture}",
+                        f"-DPSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY={compact}",
+                        f"-DPSP_BROWSER_JS_PROPERTY_FAULT_TRACE={trace}",
+                    ], capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
-    # CTest passes the source root as argv[1]; keep unittest from parsing it.
-    unittest.main(argv=[sys.argv[0]])
+    # CTest passes the source root as argv[1]; keep unittest from parsing
+    # it. Any later arguments select test classes or methods.
+    unittest.main(argv=[sys.argv[0]] + sys.argv[2:])

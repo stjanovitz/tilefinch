@@ -329,6 +329,7 @@ bool psp_input_script_frame(
                    (unsigned long long) sceKernelGetSystemTimeWide());
         }
     }
+    psp_webgl_measurement_main_frame();
     psp_webgl_measurement_mark(
         psp_input_script_mark(&psp_input_script));
     psp_input_script_latch_live_capture_mark();
@@ -444,24 +445,48 @@ static void psp_input_script_test_until(const NavigationSession *navigation)
                < PSP_INPUT_SCRIPT_UNTIL_INTERVAL_US) return;
     psp_input_script_until_last_us = now;
     psp_input_script_until_checks++;
-    int written = snprintf(
-        psp_input_script_until_js_program,
-        sizeof(psp_input_script_until_js_program),
-        "__tilefinchClipboardWrite((function(){%s\n})()?'1':'');",
-        psp_input_script_until_js);
     memset(&psp_input_script_mark_js_result, 0,
            sizeof(psp_input_script_mark_js_result));
-    bool ok = written > 0
-        && (size_t) written < sizeof(psp_input_script_until_js_program)
-        && script_runtime_evaluate_probe(
-               navigation->page.runtime, psp_input_script_until_js_program,
-               "<until-js>", &psp_input_script_mark_js_result);
+    bool ok = false, matched = false;
+    if (strncmp(psp_input_script_until_js, "@global", 7) == 0) {
+        if (psp_input_script_until_js[7] != ' ') goto probe_finished;
+        const char *source = psp_input_script_until_js + 8;
+        size_t length = 0;
+        while (length < 96u && ((source[length] >= 'a' && source[length] <= 'z')
+               || (source[length] >= 'A' && source[length] <= 'Z')
+               || source[length] == '_' || source[length] == '$'
+               || (length != 0 && source[length] >= '0' && source[length] <= '9')))
+            length++;
+        const char *tail = source + length;
+        while (*tail == ' ' || *tail == '\t' || *tail == '\r' || *tail == '\n')
+            tail++;
+        if (length != 0 && *tail == '\0') {
+            memcpy(psp_input_script_until_js_program, source, length);
+            psp_input_script_until_js_program[length] = '\0';
+            ok = script_runtime_call_boolean_probe(
+                navigation->page.runtime, psp_input_script_until_js_program,
+                &matched);
+        }
+    } else {
+        int written = snprintf(
+            psp_input_script_until_js_program,
+            sizeof(psp_input_script_until_js_program),
+            "__tilefinchClipboardWrite((function(){%s\n})()?'1':'');",
+            psp_input_script_until_js);
+        ok = written > 0
+            && (size_t) written < sizeof(psp_input_script_until_js_program)
+            && script_runtime_evaluate_probe(
+                   navigation->page.runtime, psp_input_script_until_js_program,
+                   "<until-js>", &psp_input_script_mark_js_result);
+        matched = ok
+            && psp_input_script_mark_js_result.last_clipboard_text[0] == '1';
+    }
+probe_finished: ;
     unsigned long long finished = sceKernelGetSystemTimeWide();
     printf("tilefinch-input-probe: step=%u begin-us=%llu end-us=%llu matched=%d success=%d\n",
            (unsigned) psp_input_script.step, now, finished,
-           psp_input_script_mark_js_result.last_clipboard_text[0] == '1', ok);
-    if (!ok || psp_input_script_mark_js_result.last_clipboard_text[0] != '1')
-        return;
+           matched, ok);
+    if (!ok || !matched) return;
     printf("tilefinch-input-script: until-met step=%u checks=%u at-us=%llu\n",
            (unsigned) psp_input_script.step, psp_input_script_until_checks,
            finished);
@@ -549,6 +574,12 @@ void psp_input_script_observe_page(
            (unsigned long long) page->script_result.execute_us[3],
            (unsigned long long) page->script_result.execute_us[0],
            page->script_result.summary, page->script_result.error);
+    printf("tilefinch-input-offline-app: mark=%s deferred-pending=%zu "
+           "deferred-failures=%zu\n", mark,
+           browser_session_offline_deferred_pending(
+               navigation->browser_session),
+           navigation->browser_session == NULL ? 0u
+               : navigation->browser_session->offline_deferred_failures);
     if (page->runtime != NULL) {
         ScriptHeapGrowth growth;
         script_runtime_heap_growth(page->runtime, &growth);
@@ -562,6 +593,15 @@ void psp_input_script_observe_page(
                growth.source_committed, growth.source_limit,
                growth.source_raises, growth.lazy_compile_failures,
                growth.reentrant_checkpoints);
+        printf("tilefinch-input-script-gc: mark=%s collections=%zu "
+               "threshold=%zu max-advance=%zu max-checkpoint=%zu "
+               "starved=%zu backoffs=%zu gc-us=%llu live=%zu\n",
+               mark, growth.collections, growth.threshold_collections,
+               growth.max_advance_collections,
+               growth.max_checkpoint_collections, growth.pacing_starved,
+               growth.pacing_backoffs,
+               (unsigned long long) growth.collection_us,
+               script_runtime_heap_used(page->runtime));
     }
     /* The script time since the previous mark, by function: the page
        realm, then each child frame's realm (they have their own). */
@@ -598,8 +638,8 @@ void psp_input_script_observe_page(
     printf("tilefinch-input-script-modules: mark=%s compiled=%zu "
            "compile-us=%llu restored=%zu restore-us=%llu misses=%zu "
            "stores=%zu skips=%zu restore-failures=%zu restored-bytes=%zu "
-           "disk-hits=%zu disk-stores=%zu disk-load-us=%llu "
-           "disk-read-us=%llu disk-verify-us=%llu promote-us=%llu "
+           "disk-hits=%zu disk-load-us=%llu classic-hits=%zu "
+           "classic-misses=%zu "
            "key-us=%llu parse-us=%llu store-us=%llu source-bytes=%llu "
            "fetch-us=%llu\n",
            mark,
@@ -612,17 +652,73 @@ void psp_input_script_observe_page(
            page->script_result.module_bytecode_cache_admission_skips,
            page->script_result.module_bytecode_cache_restore_failures,
            page->script_result.module_bytecode_cache_bytes,
-           page->script_result.module_bytecode_disk_hits,
-           page->script_result.module_bytecode_disk_stores,
-           page->script_result.module_bytecode_disk_load_us,
-           page->script_result.module_bytecode_disk_read_us,
-           page->script_result.module_bytecode_disk_verify_us,
-           page->script_result.module_bytecode_promote_us,
+           page->script_result.script_bytecode_disk_hits,
+           page->script_result.script_bytecode_disk_load_us,
+           page->script_result.external_script_bytecode_cache_hits,
+           page->script_result.external_script_bytecode_cache_misses,
            page->script_result.module_key_us,
            page->script_result.module_parse_us,
            page->script_result.module_store_us,
            page->script_result.module_source_bytes,
            page->script_result.module_fetch_us);
+    /* Compiled-script caches: the classic table (with its idle-time
+       stores) and the persistent tier, so a device run shows compile,
+       restore, store and Memory Stick (or host0) activity. Compile totals
+       cover every compile of the page realm (inline and lazy factories
+       too); classic-* and disk-* are the external-script caches. */
+    {
+        const ScriptResult *js = &page->script_result;
+        BrowserScriptDiskStats disk;
+        browser_session_script_disk_stats(navigation->browser_session,
+                                          &disk);
+        printf("tilefinch-script-cache: mark=%s compiles=%zu "
+               "compile-bytes=%zu compile-us=%llu classic-hits=%zu "
+               "classic-misses=%zu classic-pending-hits=%zu "
+               "classic-deferred=%zu classic-stores=%zu "
+               "classic-stored-bytes=%zu classic-dropped=%zu "
+               "classic-skips=%zu classic-restore-failures=%zu "
+               "classic-restore-us=%llu classic-store-us=%llu "
+               "classic-idle-store-us=%llu module-hits=%zu "
+               "module-misses=%zu tier=%s disk-hits=%zu disk-load-us=%llu "
+               "disk-reads=%zu disk-read-bytes=%llu disk-promoted=%zu "
+               "disk-index-reads=%zu disk-index-misses=%zu "
+               "disk-read-us=%llu disk-verify-us=%llu disk-writes=%zu "
+               "disk-written-bytes=%llu disk-write-us=%llu "
+               "disk-index-writes=%zu disk-rejects=%zu disk-removed=%zu "
+               "disk-evictions=%zu disk-skipped=%zu disk-write-failures=%zu "
+               "disk-files=%zu disk-bytes=%llu\n",
+               mark, js->host_compile_attempts, js->host_compile_source_bytes,
+               (unsigned long long) js->host_compile_total_us,
+               js->external_script_bytecode_cache_hits,
+               js->external_script_bytecode_cache_misses,
+               js->external_script_bytecode_pending_hits,
+               js->external_script_bytecode_deferred,
+               js->external_script_bytecode_cache_stores,
+               js->external_script_bytecode_cache_stored_bytes,
+               js->external_script_bytecode_deferred_dropped,
+               js->external_script_bytecode_cache_admission_skips,
+               js->external_script_bytecode_cache_restore_failures,
+               js->external_script_bytecode_restore_us,
+               js->external_script_bytecode_store_us,
+               js->external_script_bytecode_idle_store_us,
+               js->module_bytecode_cache_hits,
+               js->module_bytecode_cache_misses,
+               !browser_session_script_disk_enabled(
+                       navigation->browser_session) ? "off"
+                   : browser_session_script_disk_writable(
+                         navigation->browser_session) ? "write" : "read",
+               js->script_bytecode_disk_hits,
+               js->script_bytecode_disk_load_us, disk.reads,
+               (unsigned long long) disk.read_bytes, disk.promoted,
+               disk.index_reads, disk.index_misses,
+               (unsigned long long) (disk.read_ns / 1000u),
+               (unsigned long long) (disk.verify_ns / 1000u), disk.writes,
+               (unsigned long long) disk.written_bytes,
+               (unsigned long long) (disk.write_ns / 1000u),
+               disk.index_writes, disk.rejects, disk.removed,
+               disk.evictions, disk.skipped, disk.write_failures,
+               disk.files, (unsigned long long) disk.bytes);
+    }
     /* Deterministic work counts for the document (LAB_USAGE.md, "Work
        vector"): the same record the host lab prints. */
     tilefinch_work_print(mark, navigation);

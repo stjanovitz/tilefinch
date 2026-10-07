@@ -225,6 +225,16 @@ bool script_runtime_page_fullscreen_active(ScriptRuntime *runtime)
     return true;
 }
 
+bool script_runtime_take_page_controls_notice(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return true;
+    bool quiet = runtime->bridge.page_controls_notice_once
+        && runtime->bridge.page_controls_notice_shown;
+    runtime->bridge.page_controls_notice_once = false;
+    runtime->bridge.page_controls_notice_shown = true;
+    return !quiet;
+}
+
 bool script_runtime_exit_page_fullscreen(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return false;
@@ -365,6 +375,14 @@ bool script_runtime_consume_relayout(ScriptRuntime *runtime)
     bool needed = runtime->relayout_dirty;
     runtime->relayout_dirty = false;
     return needed;
+}
+
+bool script_runtime_take_refresh_meta_mutation(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return false;
+    bool mutated = runtime->bridge.refresh_meta_mutated;
+    runtime->bridge.refresh_meta_mutated = false;
+    return mutated;
 }
 
 bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime)
@@ -641,6 +659,11 @@ void script_runtime_set_images(ScriptRuntime *runtime,
     }
     JS_FreeValue(runtime->context, flush);
     JS_FreeValue(runtime->context, global);
+}
+
+bool script_runtime_has_shadow_roots(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->bridge.shadow_root_count != 0;
 }
 
 void script_runtime_set_stylesheet(ScriptRuntime *runtime,

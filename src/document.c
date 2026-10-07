@@ -12,13 +12,16 @@
 #include <lexbor/dom/interfaces/text.h>
 #include <lexbor/html/interfaces/template_element.h>
 #include <lexbor/html/parser.h>
+#include <lexbor/html/tokenizer/state_script.h>
 #include <lexbor/html/tree.h>
 #include <lexbor/ns/const.h>
 
 #include "tilefinch/platform.h"
 #include "tilefinch/font.h"
+#include "tilefinch/text_encoding.h"
 #include "tilefinch/media_discovery.h"
 #include "tilefinch/url.h"
+#include "tilefinch_test_faults.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_DOM, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_DOM, (n), (s))
@@ -38,6 +41,14 @@
    rather than per chunk, so a document smaller than one window costs
    nothing. */
 #define DOCUMENT_PARSE_COOPERATE_BYTES (8u * 1024u)
+/* Lexbor's tokenizer collects every token that spans input windows (a whole
+   <style> or <script> body, a long comment or attribute) in one temporary
+   buffer that grows to the largest such token and never shrinks. Above
+   this capacity the buffer is trimmed between input windows once most of it
+   is unused, so one 2 MiB inline block does not stay resident for the rest of
+   the parse. Lexbor's default capacity is 16 KiB. */
+#define DOCUMENT_TOKENIZER_RETAINED_BYTES (64u * 1024u)
+#define DOCUMENT_TOKENIZER_TRIM_SLACK (16u * 1024u)
 #define DOCUMENT_CONTROL_STATE_LIMIT 128u
 #define DOCUMENT_CONTROL_STATE_MAGIC UINT32_C(0x4354524c)
 #define DOCUMENT_BODY_SNAPSHOT_LIMIT (256u * 1024u)
@@ -68,9 +79,296 @@ void document_style_attribute_set_cssom_authorized(lxb_dom_node_t *node,
     }
 }
 
+/* Shadow-root carriers (document.h). The bridge represents a shadow root
+   as a display:contents element appended to its host; the carrier's marker
+   attribute holds a provenance pointer only native code can set, so author
+   markup naming the same attribute is not a carrier. */
+static const char document_shadow_carrier_marker;
+/* Carriers this process has ever marked: a fast path that keeps the
+   per-element and per-text checks free on pages without shadow roots (it
+   only ever gates, so sharing it between documents is harmless). */
+static size_t document_shadow_carriers_marked;
+#define DOCUMENT_SHADOW_CARRIER_ATTRIBUTE "data-tilefinch-shadow-root"
+#define DOCUMENT_SHADOW_SLOT_SEARCH_LIMIT 512u
+
+bool document_mark_shadow_carrier(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
+        lxb_dom_interface_element(node),
+        (const lxb_char_t *) DOCUMENT_SHADOW_CARRIER_ATTRIBUTE,
+        sizeof(DOCUMENT_SHADOW_CARRIER_ATTRIBUTE) - 1u,
+        (const lxb_char_t *) "", 0);
+    if (attribute == NULL) return false;
+    attribute->node.user = (void *) &document_shadow_carrier_marker;
+    if (document_shadow_carriers_marked < SIZE_MAX)
+        document_shadow_carriers_marked++;
+    return true;
+}
+
+bool document_node_is_shadow_carrier(const lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        ) return false;
+    lxb_dom_attr_t *attribute = lxb_dom_element_attr_by_name(
+        lxb_dom_interface_element((lxb_dom_node_t *) node),
+        (const lxb_char_t *) DOCUMENT_SHADOW_CARRIER_ATTRIBUTE,
+        sizeof(DOCUMENT_SHADOW_CARRIER_ATTRIBUTE) - 1u);
+    return attribute != NULL
+        && attribute->node.user == &document_shadow_carrier_marker;
+}
+
+lxb_dom_node_t *document_shadow_carrier_of_host(const lxb_dom_node_t *host)
+{
+    if (document_shadow_carriers_marked == 0 || host == NULL
+        || host->type != LXB_DOM_NODE_TYPE_ELEMENT) return NULL;
+    for (lxb_dom_node_t *child = host->first_child; child != NULL;
+         child = child->next) {
+        if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && child->local_name == LXB_TAG_DIV
+            && document_node_is_shadow_carrier(child)) return child;
+    }
+    return NULL;
+}
+
+lxb_dom_node_t *document_shadow_carrier_containing(
+    const lxb_dom_node_t *node)
+{
+    if (document_shadow_carriers_marked == 0) return NULL;
+    size_t steps = 0;
+    for (const lxb_dom_node_t *at = node; at != NULL && steps < 256u;
+         at = at->parent, steps++) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && at->local_name == LXB_TAG_DIV
+            && document_node_is_shadow_carrier(at))
+            return (lxb_dom_node_t *) at;
+    }
+    return NULL;
+}
+
+static bool document_name_equal(const char *a, size_t a_length,
+                                const char *b, size_t b_length)
+{
+    return a_length == b_length && (a_length == 0 || memcmp(a, b, a_length) == 0);
+}
+
+/* DOM "find a slot" for a host's light child in named slot-assignment mode:
+   the first slot in tree order whose name matches the child's slot
+   attribute, outside nested shadow trees. A search that runs past its
+   bound reports `*bounded` so callers can degrade to rendering the child
+   in place rather than hiding content. */
+static lxb_dom_node_t *document_shadow_find_slot(
+    const lxb_dom_node_t *carrier, lxb_dom_node_t *child, bool *bounded)
+{
+    *bounded = false;
+    size_t wanted_length = 0;
+    const char *wanted = child->type == LXB_DOM_NODE_TYPE_ELEMENT
+        ? document_attribute(child, "slot", &wanted_length) : NULL;
+    if (wanted == NULL) wanted_length = 0;
+    size_t visited = 0;
+    lxb_dom_node_t *at = carrier->first_child;
+    while (at != NULL) {
+        if (++visited > DOCUMENT_SHADOW_SLOT_SEARCH_LIMIT) {
+            *bounded = true;
+            return NULL;
+        }
+        bool descend = at->type == LXB_DOM_NODE_TYPE_ELEMENT;
+        if (descend && at->local_name == LXB_TAG_DIV
+            && document_node_is_shadow_carrier(at)) descend = false;
+        if (descend && at->local_name == LXB_TAG_TEMPLATE) descend = false;
+        if (descend && at->local_name == LXB_TAG_SLOT
+            && at->ns == LXB_NS_HTML) {
+            size_t name_length = 0;
+            const char *name = document_attribute(at, "name", &name_length);
+            if (name == NULL) name_length = 0;
+            if (document_name_equal(wanted == NULL ? "" : wanted,
+                                    wanted_length,
+                                    name == NULL ? "" : name, name_length))
+                return at;
+        }
+        if (descend && at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != NULL && at != carrier && at->next == NULL)
+            at = at->parent;
+        if (at == NULL || at == carrier) break;
+        at = at->next;
+    }
+    return NULL;
+}
+
+/* Whether a host's light child renders: its slot exists and has no
+   `hidden` ancestor up to the root. Past the search bound it renders. */
+bool document_shadow_light_child_rendered(const lxb_dom_node_t *carrier,
+                                          lxb_dom_node_t *child)
+{
+    if (carrier == NULL || child == NULL || child == carrier) return true;
+    bool bounded = false;
+    lxb_dom_node_t *slot = document_shadow_find_slot(carrier, child, &bounded);
+    if (bounded) return true;
+    if (slot == NULL) return false;
+    for (const lxb_dom_node_t *ancestor = slot;
+         ancestor != NULL && ancestor != carrier;
+         ancestor = ancestor->parent) {
+        if (ancestor->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && lxb_dom_element_has_attribute(
+                   lxb_dom_interface_element((lxb_dom_node_t *) ancestor),
+                   (const lxb_char_t *) "hidden", 6))
+            return false;
+    }
+    return true;
+}
+
+bool document_shadow_trees_present(void)
+{
+    return document_shadow_carriers_marked != 0;
+}
+
+/* The host's carrier when `node` is a light child (not the carrier). */
+static lxb_dom_node_t *document_flat_light_carrier(const lxb_dom_node_t *node)
+{
+    if (node == NULL || node->parent == NULL) return NULL;
+    lxb_dom_node_t *carrier = document_shadow_carrier_of_host(node->parent);
+    return carrier == node ? NULL : carrier;
+}
+
+/* The light child of `host` after `from` (or its first one) assigned to
+   `slot`, bounded by the host's child count. */
+static lxb_dom_node_t *document_flat_assigned_from(
+    lxb_dom_node_t *carrier, lxb_dom_node_t *slot, lxb_dom_node_t *from)
+{
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = from; at != NULL; at = at->next) {
+        if (++visited > DOCUMENT_SHADOW_SLOT_SEARCH_LIMIT) return NULL;
+        if (at == carrier
+            || (at->type != LXB_DOM_NODE_TYPE_ELEMENT
+                && at->type != LXB_DOM_NODE_TYPE_TEXT)) continue;
+        bool bounded = false;
+        if (document_shadow_find_slot(carrier, at, &bounded) == slot)
+            return at;
+    }
+    return NULL;
+}
+
+static lxb_dom_node_t *document_flat_slot_carrier(const lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->local_name != LXB_TAG_SLOT || node->ns != LXB_NS_HTML)
+        return NULL;
+    lxb_dom_node_t *carrier = document_shadow_carrier_containing(node);
+    return carrier != NULL && carrier->parent != NULL ? carrier : NULL;
+}
+
+lxb_dom_node_t *document_flat_first_child(lxb_dom_node_t *node)
+{
+    if (node == NULL) return NULL;
+    if (document_shadow_carriers_marked == 0) return node->first_child;
+    lxb_dom_node_t *carrier = document_shadow_carrier_of_host(node);
+    if (carrier != NULL) return carrier;
+    carrier = document_flat_slot_carrier(node);
+    if (carrier != NULL) {
+        lxb_dom_node_t *assigned = document_flat_assigned_from(
+            carrier, node, carrier->parent->first_child);
+        if (assigned != NULL) return assigned;
+    }
+    return node->first_child;
+}
+
+lxb_dom_node_t *document_flat_next_sibling(lxb_dom_node_t *node)
+{
+    if (node == NULL) return NULL;
+    if (document_shadow_carriers_marked == 0) return node->next;
+    /* A shadow tree is its host's only flat child. */
+    if (node->parent != NULL
+        && document_shadow_carrier_of_host(node->parent) == node)
+        return NULL;
+    lxb_dom_node_t *carrier = document_flat_light_carrier(node);
+    if (carrier == NULL) return node->next;
+    bool bounded = false;
+    lxb_dom_node_t *slot = document_shadow_find_slot(carrier, node, &bounded);
+    return slot == NULL ? NULL
+        : document_flat_assigned_from(carrier, slot, node->next);
+}
+
+lxb_dom_node_t *document_flat_parent(lxb_dom_node_t *node)
+{
+    if (node == NULL) return NULL;
+    if (document_shadow_carriers_marked == 0) return node->parent;
+    lxb_dom_node_t *carrier = document_flat_light_carrier(node);
+    if (carrier == NULL) return node->parent;
+    bool bounded = false;
+    lxb_dom_node_t *slot = document_shadow_find_slot(carrier, node, &bounded);
+    return slot != NULL ? slot : node->parent;
+}
+
+bool document_shadow_text_rendered(lxb_dom_node_t *text)
+{
+    if (document_shadow_carriers_marked == 0 || text == NULL
+        || text->type != LXB_DOM_NODE_TYPE_TEXT || text->parent == NULL)
+        return true;
+    const lxb_dom_node_t *carrier =
+        document_shadow_carrier_of_host(text->parent);
+    return carrier == NULL
+        || document_shadow_light_child_rendered(carrier, text);
+}
+
+/* HTML [[CryptographicNonce]] values (document.h). Values are interned per
+   document and immutable: an element refers to one through node->user, or
+   through its control state when it is a form control, so the reference
+   lives and dies with the node and needs no per-node bookkeeping. */
+#define DOCUMENT_NONCE_REGISTRY_MAGIC UINT32_C(0x4e4f4e52)
+#define DOCUMENT_NONCE_VALUE_MAGIC UINT32_C(0x4e4f4e56)
+/* Distinct values that no enforced policy lists. Values a policy lists are
+   interned when hiding is enabled and never count against this. */
+#define DOCUMENT_NONCE_UNLISTED_LIMIT 64u
+#define DOCUMENT_NONCE_VALUE_LIMIT 512u
+
+struct DocumentNonceSlot {
+    uint32_t magic;
+    struct DocumentNonceSlot *next;
+    bool listed;
+    size_t length;
+    char value[];
+};
+
+struct DocumentNonceRegistry {
+    uint32_t magic;
+    Budget *budget;
+    BudgetAllocationOwner owner;
+    lxb_dom_document_t *document;
+    DocumentNonceSlot *values;
+    size_t unlisted;
+    bool hide;
+};
+
+static DocumentNonceRegistry *document_nonce_registry(
+    const lxb_dom_node_t *node)
+{
+    DocumentNonceRegistry *registry = node == NULL
+        || node->owner_document == NULL ? NULL : node->owner_document->user;
+    return registry != NULL
+        && registry->magic == DOCUMENT_NONCE_REGISTRY_MAGIC ? registry : NULL;
+}
+
+/* Membership, not a magic read: node->user may be a copy Lexbor made while
+   cloning from another document. */
+static DocumentNonceSlot *document_nonce_value_of(
+    const DocumentNonceRegistry *registry, const void *candidate)
+{
+    if (registry == NULL || candidate == NULL) return NULL;
+    for (DocumentNonceSlot *value = registry->values; value != NULL;
+         value = value->next) {
+        if (value == candidate) return value;
+    }
+    return NULL;
+}
+
 struct DocumentControlState {
     uint32_t magic;
     lxb_dom_node_t *node;
+    /* The element's [[CryptographicNonce]] while the state owns node->user. */
+    DocumentNonceSlot *nonce;
     lxb_dom_node_t *parser_form_owner;
     char *value;
     size_t length;
@@ -100,17 +398,35 @@ static bool document_node_has_tag(lxb_dom_node_t *node,
         && node->ns == LXB_NS_HTML && node->local_name == tag_id;
 }
 
+/* node->user as a control state; NULL when it holds a nonce value. */
+static DocumentControlState *document_control_state_of(
+    const lxb_dom_node_t *node)
+{
+    if (node == NULL || node->user == NULL
+        || document_nonce_value_of(document_nonce_registry(node), node->user)
+               != NULL) return NULL;
+    return node->user;
+}
+
+/* What node->user returns to when a control state is retired. */
+static void *document_control_state_released_user(
+    const DocumentControlState *state)
+{
+    return state == NULL ? NULL : state->nonce;
+}
+
 static DocumentControlState *document_control_state_ensure(
     PocDocument *document, lxb_dom_node_t *node)
 {
     if (document == NULL || document->budget == NULL || node == NULL
         || node->owner_document != &document->html->dom_document) return NULL;
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (state != NULL) {
         return state->magic == DOCUMENT_CONTROL_STATE_MAGIC
                     && state->node == node
             ? state : NULL;
     }
+    DocumentNonceSlot *nonce = node->user;
     if (document->control_state_count >= DOCUMENT_CONTROL_STATE_LIMIT) {
         return NULL;
     }
@@ -118,6 +434,7 @@ static DocumentControlState *document_control_state_ensure(
     if (state == NULL) return NULL;
     state->magic = DOCUMENT_CONTROL_STATE_MAGIC;
     state->node = node;
+    state->nonce = nonce;
     state->next = document->control_states;
     document->control_states = state;
     document->control_state_count++;
@@ -269,6 +586,254 @@ static void document_parser_journal_record(PocDocument *document,
     if (journal->recorded != SIZE_MAX) journal->recorded++;
 }
 
+/* Interns a value. A full table refuses only values no policy lists. */
+static DocumentNonceSlot *document_nonce_intern(
+    DocumentNonceRegistry *registry, const char *value, size_t length,
+    bool listed)
+{
+    if (registry == NULL || length > DOCUMENT_NONCE_VALUE_LIMIT
+        || (value == NULL && length != 0)) return NULL;
+    for (DocumentNonceSlot *at = registry->values; at != NULL;
+         at = at->next) {
+        if (at->length == length
+            && (length == 0 || memcmp(at->value, value, length) == 0)) {
+            if (listed && !at->listed) {
+                at->listed = true;
+                registry->unlisted--;
+            }
+            return at;
+        }
+    }
+    if (!listed && registry->unlisted >= DOCUMENT_NONCE_UNLISTED_LIMIT)
+        return NULL;
+    BudgetAllocationOwner previous = budget_allocation_owner_enter(
+        registry->budget, registry->owner);
+    DocumentNonceSlot *slot = budget_malloc(
+        registry->budget, sizeof(*slot) + length + 1u);
+    budget_allocation_owner_leave(registry->budget, previous);
+    if (slot == NULL) return NULL;
+    slot->magic = DOCUMENT_NONCE_VALUE_MAGIC;
+    slot->listed = listed;
+    slot->length = length;
+    if (length != 0) memcpy(slot->value, value, length);
+    slot->value[length] = '\0';
+    slot->next = registry->values;
+    registry->values = slot;
+    if (!listed) registry->unlisted++;
+    return slot;
+}
+
+/* The element's slot, from node->user or its control state. */
+static DocumentNonceSlot *document_nonce_slot(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->user == NULL) return NULL;
+    DocumentNonceRegistry *registry = document_nonce_registry(node);
+    DocumentNonceSlot *slot = document_nonce_value_of(registry, node->user);
+    if (slot != NULL) return slot;
+    DocumentControlState *state = node->user;
+    return registry != NULL && state->magic == DOCUMENT_CONTROL_STATE_MAGIC
+        && state->node == node
+        ? document_nonce_value_of(registry, state->nonce) : NULL;
+}
+
+/* Points the element at `slot` (NULL clears it), beside any control state. */
+static void document_nonce_attach(lxb_dom_node_t *node,
+                                  DocumentNonceSlot *slot)
+{
+    DocumentControlState *state = document_control_state_of(node);
+    if (state != NULL && state->magic == DOCUMENT_CONTROL_STATE_MAGIC
+        && state->node == node) {
+        state->nonce = slot;
+        return;
+    }
+    /* Anything else in node->user is a value or a stale clone copy. */
+    node->user = slot;
+}
+
+static DocumentNonceRegistry *document_nonce_registry_ensure(
+    PocDocument *document)
+{
+    if (document == NULL || document->html == NULL
+        || document->budget == NULL) return NULL;
+    lxb_dom_document_t *dom = &document->html->dom_document;
+    if (document->nonce_registry != NULL) {
+        dom->user = document->nonce_registry;
+        return document->nonce_registry;
+    }
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    DocumentNonceRegistry *registry = budget_calloc(
+        document->budget, 1, sizeof(*registry));
+    document_allocation_owner_leave(document, previous);
+    if (registry == NULL) return NULL;
+    registry->magic = DOCUMENT_NONCE_REGISTRY_MAGIC;
+    registry->budget = document->budget;
+    registry->owner = document->allocation_owner;
+    registry->document = dom;
+    document->nonce_registry = registry;
+    dom->user = registry;
+    return registry;
+}
+
+static void document_nonce_registry_destroy(PocDocument *document)
+{
+    DocumentNonceRegistry *registry = document->nonce_registry;
+    if (registry == NULL) return;
+    if (document->html != NULL
+        && document->html->dom_document.user == registry) {
+        document->html->dom_document.user = NULL;
+    }
+    for (DocumentNonceSlot *slot = registry->values; slot != NULL;) {
+        DocumentNonceSlot *next = slot->next;
+        budget_free(document->budget, slot);
+        slot = next;
+    }
+    registry->magic = 0;
+    budget_free(document->budget, registry);
+    document->nonce_registry = NULL;
+}
+
+/* HTML "nonce attributes": an element that becomes connected to a document
+   with a header-delivered policy moves a non-empty nonce attribute into its
+   slot and empties the attribute, so neither markup nor selectors can read
+   it. A value no policy lists is still hidden when the bounded table is
+   full; it then reads back empty from the IDL attribute too, which costs
+   nothing a policy could match, and a listed value always has a slot. The
+   attribute is emptied in place: its bytes are already interned, and the
+   insertion that brought us here has noted the style change. */
+static void document_nonce_hide(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return;
+    DocumentNonceRegistry *registry = document_nonce_registry(node);
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    if (registry == NULL || !registry->hide || element->first_attr == NULL)
+        return;
+    lxb_dom_attr_t *attribute = lxb_dom_element_attr_by_name(
+        element, (const lxb_char_t *) "nonce", 5);
+    if (attribute == NULL || attribute->value == NULL
+        || attribute->value->length == 0) return;
+    const lxb_dom_node_t *root = node;
+    for (size_t depth = 0; root->parent != NULL; depth++) {
+        if (depth >= DOCUMENT_TRAVERSAL_NODE_LIMIT) return;
+        root = root->parent;
+    }
+    if (root != lxb_dom_interface_node(registry->document)) return;
+    document_nonce_attach(node, document_nonce_intern(
+        registry, (const char *) attribute->value->data,
+        attribute->value->length, false));
+    attribute->value->data[0] = 0x00;
+    attribute->value->length = 0;
+}
+
+/* An author write to the nonce attribute sets the slot to the new value
+   (HTML attribute change steps): drop the slot so the attribute speaks. */
+static void document_nonce_attribute_changed(lxb_dom_element_t *element,
+                                             lxb_dom_attr_id_t name)
+{
+    lxb_dom_node_t *node = lxb_dom_interface_node(element);
+    if (node->user == NULL || document_nonce_slot(node) == NULL) return;
+    const lxb_dom_attr_data_t *data = lxb_dom_attr_data_by_id(
+        node->owner_document->attrs, name);
+    if (data == NULL || data->entry.length != 5
+        || strncasecmp((const char *) lexbor_hash_entry_str(&data->entry),
+                       "nonce", 5) != 0) return;
+    document_nonce_attach(node, NULL);
+}
+
+const char *document_element_nonce(lxb_dom_node_t *node, size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return NULL;
+    const DocumentNonceSlot *slot = document_nonce_slot(node);
+    if (slot == NULL) return document_attribute(node, "nonce", length);
+    if (length != NULL) *length = slot->length;
+    return slot->value;
+}
+
+bool document_element_set_nonce(PocDocument *document,
+                                 lxb_dom_node_t *node, const char *value,
+                                 size_t length)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || (value == NULL && length != 0)) return false;
+    DocumentNonceRegistry *registry = document_nonce_registry(node);
+    if (registry == NULL && document != NULL && document->html != NULL
+        && node->owner_document == &document->html->dom_document) {
+        registry = document_nonce_registry_ensure(document);
+    }
+    DocumentNonceSlot *slot = document_nonce_intern(
+        registry, value == NULL ? "" : value, length, false);
+    if (slot == NULL) return false;
+    document_nonce_attach(node, slot);
+    return true;
+}
+
+bool document_nonce_clone_subtree(lxb_dom_node_t *source,
+                                  lxb_dom_node_t *clone, bool deep)
+{
+    if (source == NULL || clone == NULL
+        || document_nonce_registry(source) == NULL) return true;
+    lxb_dom_node_t *from = source, *to = clone;
+    for (size_t visited = 0;; visited++) {
+        if (visited >= DOCUMENT_TRAVERSAL_NODE_LIMIT || to == NULL)
+            return false;
+        DocumentNonceSlot *slot = document_nonce_slot(from);
+        if (slot != NULL) {
+            /* Values are per document: re-intern into the clone's. */
+            DocumentNonceRegistry *registry = document_nonce_registry(to);
+            DocumentNonceSlot *copy = registry == NULL ? NULL
+                : document_nonce_intern(registry, slot->value, slot->length,
+                                        slot->listed);
+            if (copy != NULL) document_nonce_attach(to, copy);
+        }
+        if (!deep) return true;
+        if (from->first_child != NULL) {
+            from = from->first_child;
+            to = to->first_child;
+            continue;
+        }
+        while (from != source && from->next == NULL) {
+            from = from->parent;
+            to = to->parent;
+        }
+        if (from == source) return true;
+        from = from->next;
+        to = to == NULL ? NULL : to->next;
+    }
+}
+
+static void document_nonce_list_value(void *opaque, const char *value,
+                                      size_t length)
+{
+    (void) document_nonce_intern(opaque, value, length, true);
+}
+
+bool document_nonce_hiding_enable(PocDocument *document)
+{
+    DocumentNonceRegistry *registry = document_nonce_registry_ensure(document);
+    if (registry == NULL) return false;
+    registry->hide = true;
+    tilefinch_csp_visit_nonce_sources(
+        &document->content_security_policy, document_nonce_list_value,
+        registry);
+    /* A frame document is parsed before its policy is known: hide what is
+       already connected. A streaming document has no elements yet. */
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root->first_child;
+    for (size_t visited = 0; node != NULL; visited++) {
+        if (visited >= DOCUMENT_TRAVERSAL_NODE_LIMIT) return false;
+        document_nonce_hide(node);
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != root && node->next == NULL)
+            node = node->parent;
+        node = node == NULL || node == root ? NULL : node->next;
+    }
+    document_style_changed();
+    return true;
+}
+
 /* Host-side style generation (document.h). One browser thread owns every
    page DOM, so process-wide state is enough; a change in any page document
    conservatively reaches every cache. */
@@ -292,6 +857,8 @@ static const lxb_dom_document_mutation_cb_t *document_style_tree_base;
 static const lxb_dom_document_attr_mutation_cb_t *document_style_attr_base;
 static lxb_dom_document_mutation_cb_t document_style_tree_callbacks;
 static lxb_dom_document_attr_mutation_cb_t document_style_attr_callbacks;
+/* <iframe> and <frame> insertions into any tracked document's trees. */
+static uint64_t document_frame_insertions;
 
 uint64_t document_style_generation(void)
 {
@@ -366,7 +933,13 @@ static void document_style_note_write(const lxb_dom_node_t *node)
 
 static lxb_status_t document_style_node_inserted(lxb_dom_node_t *node)
 {
+    if (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && node->ns == LXB_NS_HTML
+        && (node->local_name == LXB_TAG_IFRAME
+            || node->local_name == LXB_TAG_FRAME))
+        document_frame_insertions++;
     document_style_note_write(node);
+    document_nonce_hide(node);
     return document_style_tree_base->inserted == NULL ? LXB_STATUS_OK
         : document_style_tree_base->inserted(node);
 }
@@ -391,6 +964,7 @@ static lxb_status_t document_style_node_removed(lxb_dom_node_t *node,
         const lxb_char_t *value, size_t length, lxb_ns_id_t ns)             \
     {                                                                       \
         document_style_note_write(lxb_dom_interface_node(element));         \
+        document_nonce_attribute_changed(element, name);                    \
         return document_style_attr_base->slot == NULL ? LXB_STATUS_OK       \
             : document_style_attr_base->slot(element, name, old_value,      \
                                              old_length, value, length, ns); \
@@ -400,6 +974,14 @@ DOCUMENT_STYLE_ATTRIBUTE_HOOK(append)
 DOCUMENT_STYLE_ATTRIBUTE_HOOK(remove)
 DOCUMENT_STYLE_ATTRIBUTE_HOOK(replace)
 #undef DOCUMENT_STYLE_ATTRIBUTE_HOOK
+
+bool document_frames_impossible(const PocDocument *document)
+{
+    return document != NULL && document->html != NULL
+        && document->html->dom_document.mutation
+               == &document_style_tree_callbacks
+        && document->frame_insertions_at_parse == document_frame_insertions;
+}
 
 /* Route a new page document's tree and attribute callbacks through the
    style generation, keeping Lexbor's own steps behind them. Fragment and
@@ -441,6 +1023,7 @@ static lxb_status_t document_parser_node_inserted(lxb_dom_node_t *node)
                              node->parent) == DOCUMENT_ANCESTRY_INSIDE) {
         document_parser_journal_record(document, node);
     }
+    document_nonce_hide(node);
     /* Only the inserted root is a parser insertion. Lexbor then walks its
        descendants, which exist only when the adoption agency reinserts an
        existing subtree; they moved with the root. Stop that walk. */
@@ -686,6 +1269,10 @@ typedef struct {
     size_t body_bytes;
     size_t body_text_nodes;
     uint16_t glyph_script_mask;
+    /* Saturating visible-codepoint counts per DocumentGlyphScript bit and
+       the census samples; reduced to DocumentGlyphCensus after the walk. */
+    uint16_t glyph_script_counts[DOCUMENT_GLYPH_SCRIPT_KINDS];
+    DocumentGlyphCensus glyph_census;
     bool bidi_text_present;
     bool bidi_markup_present;
     bool pointer_event_attributes_present;
@@ -738,19 +1325,34 @@ static uint16_t document_codepoint_glyph_script(unsigned codepoint)
     return 0;
 }
 
+/* One add and compare per classified codepoint. The 1st, 4th, 16th and
+   64th occurrences become the census samples. */
+static void document_count_glyph_script(DocumentStats *stats,
+                                        uint16_t script, unsigned codepoint)
+{
+    /* The classifier returns exactly one bit. */
+    unsigned index = (unsigned) __builtin_ctz(script);
+    if (index >= DOCUMENT_GLYPH_SCRIPT_KINDS) return;
+    uint16_t count = stats->glyph_script_counts[index];
+    if (count == UINT16_MAX) return;
+    stats->glyph_script_counts[index] = ++count;
+    if (count == 1u || count == 4u || count == 16u || count == 64u) {
+        unsigned slot = count == 1u ? 0u
+            : count == 4u ? 1u : count == 16u ? 2u : 3u;
+        stats->glyph_census.samples[index][slot] = codepoint;
+    }
+}
+
 static void document_note_glyph_scripts(DocumentStats *stats,
                                         const char *text, size_t length)
 {
     if (stats == NULL || text == NULL || length == 0) return;
-    const uint16_t all = DOCUMENT_GLYPH_SCRIPT_HAN
-        | DOCUMENT_GLYPH_SCRIPT_JAPANESE | DOCUMENT_GLYPH_SCRIPT_KOREAN
-        | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
-        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
-        | DOCUMENT_GLYPH_SCRIPT_ARABIC | DOCUMENT_GLYPH_SCRIPT_HEBREW;
+    /* No early exit once every script bit is seen: the usage census needs
+       the whole visible text. Before the census only pages carrying all
+       seven scripts plus bidi text stopped early, so ordinary pages pay
+       nothing new beyond one count per classified non-ASCII codepoint. */
     size_t at = 0;
-    while (at < length
-           && (stats->glyph_script_mask != all
-               || !stats->bidi_text_present)) {
+    while (at < length) {
         /* Most top-site text is ASCII. Skip it without calling the UTF-8
            decoder; this pass runs only once in the parser's existing visible
            text/statistics walk. */
@@ -772,8 +1374,11 @@ static void document_note_glyph_scripts(DocumentStats *stats,
             || (codepoint >= 0x2066u && codepoint <= 0x2069u)) {
             stats->bidi_text_present = true;
         }
-        stats->glyph_script_mask |=
-            document_codepoint_glyph_script(codepoint);
+        uint16_t script = document_codepoint_glyph_script(codepoint);
+        if (script != 0) {
+            stats->glyph_script_mask |= script;
+            document_count_glyph_script(stats, script, codepoint);
+        }
         at += used;
     }
 }
@@ -976,9 +1581,19 @@ static bool copy_body_text(lxb_dom_node_t *node, bool hidden, char *output,
     return true;
 }
 
+static void document_parser_release_prescan(DocumentParser *parser)
+{
+    if (parser->prescan_bytes != NULL && parser->budget != NULL) {
+        budget_free(parser->budget, parser->prescan_bytes);
+    }
+    parser->prescan_bytes = NULL;
+    parser->prescan_length = 0;
+}
+
 void document_parser_abort(DocumentParser *parser)
 {
     if (parser == NULL) return;
+    document_parser_release_prescan(parser);
     BudgetAllocationOwner allocation_owner =
         parser->document.allocation_owner;
     /* Lexbor can retain inconsistent internal pointers after an OOM. The
@@ -997,6 +1612,9 @@ bool document_parser_begin(DocumentParser *parser, Budget *budget)
 {
     if (parser == NULL) return false;
     memset(parser, 0, sizeof(*parser));
+    parser->transport_encoding = TILEFINCH_ENCODING_NONE;
+    parser->input_ascii = true;
+    tilefinch_decoder_init(&parser->decoder, TILEFINCH_ENCODING_UTF8);
     if (budget == NULL || !budget_lexbor_is_installed(budget)) return false;
     parser->budget = budget;
     if (!budget_allocation_owner_create(
@@ -1010,6 +1628,7 @@ bool document_parser_begin(DocumentParser *parser, Budget *budget)
     parser->document.html = lxb_html_document_create();
     if (parser->document.html != NULL)
         document_style_track(parser->document.html);
+    parser->document.frame_insertions_at_parse = document_frame_insertions;
     bool began = parser->document.html != NULL
         && lxb_html_document_parse_chunk_begin(parser->document.html)
                == LXB_STATUS_OK;
@@ -1045,6 +1664,7 @@ bool document_parser_set_scripting(DocumentParser *parser, bool enabled)
     lxb_html_parser_scripting_set(html_parser, enabled);
     lxb_html_document_scripting_set(parser->document.html, enabled);
     parser->scripting_enabled = enabled;
+    parser->document.noscript_rendered = !enabled;
     return true;
 }
 
@@ -1106,12 +1726,112 @@ void document_parser_set_element_closed_callback(
     parser->element_closed_opaque = opaque;
 }
 
-bool document_parser_feed(DocumentParser *parser, const char *data,
-                          size_t length)
+/* Lexbor's plain script-data state function is file-static. Its exported
+   entry helper installs it; with is_eof set the helper touches nothing but
+   tkz->state, so a zeroed probe yields the function pointer to compare
+   against (Lexbor v3.0.0, pinned by the dependency hash). */
+static lxb_html_tokenizer_state_f document_script_data_state(void)
 {
-    if (parser == NULL || !parser->active || parser->failed
-        || (data == NULL && length != 0)
-        || length > SIZE_MAX - parser->bytes_fed) return false;
+    static lxb_html_tokenizer_state_f state;
+    if (state == NULL) {
+        lxb_html_tokenizer_t probe;
+        memset(&probe, 0, sizeof(probe));
+        probe.is_eof = true;
+        (void) lxb_html_tokenizer_state_script_data_before(&probe, NULL, NULL);
+        state = probe.state;
+    }
+    return state;
+}
+
+static bool document_parser_note_truncated_script(DocumentParser *parser,
+                                                  lxb_dom_node_t *script)
+{
+    for (size_t at = 0; at < parser->truncated_script_count; at++) {
+        if (parser->truncated_script_nodes[at] == script) return true;
+    }
+    if (parser->truncated_script_count
+        < sizeof(parser->truncated_script_nodes)
+              / sizeof(parser->truncated_script_nodes[0])) {
+        parser->truncated_script_nodes[parser->truncated_script_count++] =
+            script;
+    } else {
+        parser->truncated_script_overflow = true;
+    }
+    return true;
+}
+
+/* An inline script body that has already outgrown the inline-script limit
+   (or that the inert-script policy discards) will be emptied when its text
+   token is emitted. Drop the bytes accumulated so far instead of carrying
+   them to the end tag: a multi-megabyte bundle otherwise occupies the
+   tokenizer buffer for its whole download. Only the plain script-data state
+   is touched; there the buffer holds nothing but script text (the end-tag
+   states keep a start-relative offset into it). The script is recorded as
+   truncated exactly as the token callback would record it. */
+static void document_parser_discard_doomed_script_text(
+    DocumentParser *parser, lxb_html_tokenizer_t *tokenizer)
+{
+    if (tokenizer->pos == tokenizer->start
+        || tokenizer->state != document_script_data_state()) return;
+    lxb_html_tree_t *tree = parser->original_token_context;
+    lxb_dom_node_t *current = tree == NULL
+        ? NULL : lxb_html_tree_current_node(tree);
+    if (current == NULL || current->local_name != LXB_TAG_SCRIPT
+        || current->ns != LXB_NS_HTML) return;
+    size_t type_length = 0;
+    const char *type = document_attribute(current, "type", &type_length);
+    bool json_ld = type != NULL && type_length == 19u
+        && strncasecmp(type, "application/ld+json", type_length) == 0;
+    if (json_ld) return;
+    size_t pending = (size_t) (tokenizer->pos - tokenizer->start);
+    if (parser->discard_inert_script_text) {
+        tokenizer->pos = tokenizer->start;
+        return;
+    }
+    if (!parser->scripting_enabled
+        || parser->maximum_inline_script_bytes == 0u) return;
+    size_t retained = parser->current_script_node == current
+        ? parser->retained_current_script_bytes : 0u;
+    if (retained > parser->maximum_inline_script_bytes
+        || pending > parser->maximum_inline_script_bytes - retained) {
+        if (parser->current_script_node != current) {
+            parser->current_script_node = current;
+            parser->retained_current_script_bytes = 0u;
+        }
+        (void) document_parser_note_truncated_script(parser, current);
+        tokenizer->pos = tokenizer->start;
+    }
+}
+
+/* Return the unused tail of Lexbor's temporary token buffer. Only called
+   between input windows, where no tokenizer state function is running: the
+   tokenizer then refers to its buffer solely through start/pos/end and
+   start-relative entity offsets, exactly the invariant Lexbor's own
+   lxb_html_tokenizer_temp_realloc relies on when it moves the buffer. A
+   refused reallocation keeps the larger buffer, which is still valid. */
+static void document_parser_trim_tokenizer(DocumentParser *parser)
+{
+    lxb_html_tokenizer_t *tokenizer = parser->tokenizer;
+    if (tokenizer == NULL || tokenizer->start == NULL
+        || tokenizer->pos < tokenizer->start
+        || tokenizer->end < tokenizer->pos) return;
+    document_parser_discard_doomed_script_text(parser, tokenizer);
+    size_t capacity = (size_t) (tokenizer->end - tokenizer->start);
+    size_t used = (size_t) (tokenizer->pos - tokenizer->start);
+    if (capacity <= DOCUMENT_TOKENIZER_RETAINED_BYTES
+        || used > capacity / 4u) return;
+    size_t target = used + DOCUMENT_TOKENIZER_TRIM_SLACK;
+    lxb_char_t *trimmed = lexbor_realloc(tokenizer->start, target);
+    if (trimmed == NULL) return;
+    tokenizer->start = trimmed;
+    tokenizer->pos = trimmed + used;
+    tokenizer->end = trimmed + target;
+}
+
+static bool document_parser_feed_utf8(DocumentParser *parser,
+                                      const char *data, size_t length)
+{
+    if (length > SIZE_MAX - parser->bytes_fed) return false;
     if (length == 0) return true;
     /* Tree-builder moves and text appends do not all raise Lexbor
        callbacks: parser input is a host style change as a whole. */
@@ -1130,6 +1850,7 @@ bool document_parser_feed(DocumentParser *parser, const char *data,
         lxb_status_t status = lxb_html_document_parse_chunk(
             parser->document.html,
             (const lxb_char_t *) data + offset, window);
+        if (status == LXB_STATUS_OK) document_parser_trim_tokenizer(parser);
         budget_allocation_owner_leave(parser->budget, previous);
         if (status != LXB_STATUS_OK) {
             /* The caller owns callback-created consumers. Leave the
@@ -1151,10 +1872,161 @@ bool document_parser_feed(DocumentParser *parser, const char *data,
     return true;
 }
 
+bool document_parser_set_transport_encoding(DocumentParser *parser,
+                                            TilefinchEncoding encoding)
+{
+    if (parser == NULL || !parser->active || parser->failed
+        || parser->encoding_decided || parser->bytes_fed != 0) return false;
+    parser->transport_encoding = (uint8_t) encoding;
+    return true;
+}
+
+static void document_parser_use_encoding(DocumentParser *parser,
+                                         TilefinchEncoding encoding)
+{
+    if (!tilefinch_encoding_decodable(encoding)) {
+        encoding = TILEFINCH_ENCODING_UTF8;
+    }
+    tilefinch_decoder_init(&parser->decoder, encoding);
+    parser->document.encoding = (uint8_t) encoding;
+}
+
+/* HTML 13.2.3.1 steps 1-4 and 9, decided on the first bytes received. */
+static void document_parser_decide_encoding(DocumentParser *parser,
+                                            const unsigned char *data,
+                                            size_t length)
+{
+    parser->encoding_decided = true;
+    size_t bom = 0;
+    TilefinchEncoding encoding = tilefinch_encoding_sniff_bom(
+        data, length, &bom);
+    if (encoding != TILEFINCH_ENCODING_NONE) {
+        parser->encoding_skip = bom;
+        document_parser_use_encoding(parser, encoding);
+        return;
+    }
+    encoding = (TilefinchEncoding) parser->transport_encoding;
+    if (encoding != TILEFINCH_ENCODING_NONE) {
+        /* A declared encoding without a decoder (GBK, Shift_JIS, ...)
+           keeps the UTF-8 fallback rather than a prescan guess. */
+        document_parser_use_encoding(parser, encoding);
+        return;
+    }
+    encoding = tilefinch_encoding_prescan(data, length);
+    if (encoding != TILEFINCH_ENCODING_NONE) {
+        document_parser_use_encoding(parser, encoding);
+        return;
+    }
+    document_parser_use_encoding(parser, TILEFINCH_ENCODING_UTF8);
+    /* The prescan saw fewer than 1024 bytes: keep looking while they
+       arrive. */
+    parser->encoding_tentative = length < TILEFINCH_ENCODING_PRESCAN_BYTES;
+}
+
+/* More of the first 1024 bytes arrived after a tentative UTF-8 decision.
+   Until a non-ASCII byte has been decoded every ASCII-compatible encoding
+   agrees on the bytes so far, so a late declaration can still switch. */
+static void document_parser_continue_prescan(DocumentParser *parser,
+                                             const unsigned char *data,
+                                             size_t length)
+{
+    if (parser->prescan_bytes == NULL) {
+        parser->encoding_tentative = false;
+        return;
+    }
+    size_t room = TILEFINCH_ENCODING_PRESCAN_BYTES - parser->prescan_length;
+    size_t copy = length < room ? length : room;
+    memcpy(parser->prescan_bytes + parser->prescan_length, data, copy);
+    parser->prescan_length += copy;
+    TilefinchEncoding encoding = tilefinch_encoding_prescan(
+        parser->prescan_bytes, parser->prescan_length);
+    if (encoding != TILEFINCH_ENCODING_NONE && parser->input_ascii) {
+        document_parser_use_encoding(parser, encoding);
+    }
+    if (encoding != TILEFINCH_ENCODING_NONE
+        || parser->prescan_length >= TILEFINCH_ENCODING_PRESCAN_BYTES
+        || !parser->input_ascii) {
+        parser->encoding_tentative = false;
+        document_parser_release_prescan(parser);
+    }
+}
+
+static bool document_parser_feed_decoded(DocumentParser *parser,
+                                         const unsigned char *data,
+                                         size_t length, bool flush)
+{
+    if (parser->decoder.encoding == TILEFINCH_ENCODING_UTF8) {
+        return document_parser_feed_utf8(parser, (const char *) data,
+                                         length);
+    }
+    unsigned char window[3u * 1024u];
+    while (length != 0 || flush) {
+        size_t before = length;
+        size_t written = tilefinch_decoder_decode(
+            &parser->decoder, &data, &length, window, sizeof(window), flush);
+        if (written != 0
+            && !document_parser_feed_utf8(parser, (const char *) window,
+                                          written)) {
+            return false;
+        }
+        if (length == before && written == 0) break;
+    }
+    return true;
+}
+
+bool document_parser_feed(DocumentParser *parser, const char *data,
+                          size_t length)
+{
+    if (parser == NULL || !parser->active || parser->failed
+        || (data == NULL && length != 0)) return false;
+    if (length == 0) return true;
+    const unsigned char *bytes = (const unsigned char *) data;
+    if (!parser->encoding_decided) {
+        document_parser_decide_encoding(parser, bytes, length);
+        if (parser->encoding_tentative) {
+            /* Seed the prescan window with this first chunk. */
+            parser->prescan_bytes = budget_malloc(
+                parser->budget, TILEFINCH_ENCODING_PRESCAN_BYTES);
+            if (parser->prescan_bytes == NULL) {
+                parser->encoding_tentative = false;
+            } else {
+                memcpy(parser->prescan_bytes, bytes, length);
+                parser->prescan_length = length;
+            }
+        }
+    } else if (parser->encoding_tentative) {
+        document_parser_continue_prescan(parser, bytes, length);
+    }
+    if (parser->input_ascii) {
+        for (size_t at = 0; at < length; at++) {
+            if (bytes[at] >= 0x80u) {
+                parser->input_ascii = false;
+                break;
+            }
+        }
+    }
+    if (parser->encoding_skip != 0) {
+        size_t skip = parser->encoding_skip < length
+            ? parser->encoding_skip : length;
+        bytes += skip;
+        length -= skip;
+        parser->encoding_skip -= skip;
+    }
+    return document_parser_feed_decoded(parser, bytes, length, false);
+}
+
 bool document_parser_end_input(DocumentParser *parser)
 {
     if (parser == NULL || !parser->active || parser->failed) return false;
     if (parser->input_ended) return true;
+    document_parser_release_prescan(parser);
+    parser->encoding_tentative = false;
+    /* A UTF-16 stream ending mid code unit decodes that unit to U+FFFD. */
+    if ((parser->decoder.has_lead_byte || parser->decoder.lead_surrogate != 0)
+        && !document_parser_feed_decoded(parser, NULL, 0, true)) {
+        parser->failed = true;
+        return false;
+    }
     document_style_changed();
     BudgetAllocationOwner previous = budget_allocation_owner_enter(
         parser->budget, parser->document.allocation_owner);
@@ -1165,6 +2037,21 @@ bool document_parser_end_input(DocumentParser *parser)
         lxb_html_tokenizer_callback_token_done_set(
             parser->tokenizer, parser->original_token_callback,
             parser->original_token_context);
+    }
+    if (status == LXB_STATUS_OK) {
+        /* The streaming parser is finished, but Lexbor keeps it on the
+           document for later fragment parsing, together with its token
+           pools and its temporary buffer sized for the page's largest
+           token (megabytes on pages with large inline blocks). Release it:
+           Lexbor creates a fresh parser on the first innerHTML or fragment
+           parse that needs one, with token pools that start small
+           (patches/lexbor-v3.0.0-compact-tokenizer-storage.patch). */
+        lxb_dom_document_t *dom =
+            lxb_dom_interface_document(parser->document.html);
+        if (dom != NULL && dom->parser != NULL) {
+            dom->parser = lxb_html_parser_unref(dom->parser);
+        }
+        parser->tokenizer = NULL;
     }
     budget_allocation_owner_leave(parser->budget, previous);
     if (status != LXB_STATUS_OK) {
@@ -1201,6 +2088,15 @@ bool document_parser_finish(DocumentParser *parser, PocDocument *document)
 bool document_parse(PocDocument *document, Budget *budget,
                     const char *html, size_t html_length, size_t chunk_size)
 {
+    return document_parse_with_transport_encoding(
+        document, budget, html, html_length, chunk_size,
+        TILEFINCH_ENCODING_NONE);
+}
+
+bool document_parse_with_transport_encoding(
+    PocDocument *document, Budget *budget, const char *html,
+    size_t html_length, size_t chunk_size, TilefinchEncoding transport)
+{
     if (document == NULL || budget == NULL || html == NULL) {
         return false;
     }
@@ -1208,6 +2104,7 @@ bool document_parse(PocDocument *document, Budget *budget,
     if (chunk_size == 0) return false;
     DocumentParser parser;
     if (!document_parser_begin(&parser, budget)) return false;
+    (void) document_parser_set_transport_encoding(&parser, transport);
 
     size_t cooperated = 0;
     for (size_t offset = 0; offset < html_length; offset += chunk_size) {
@@ -1276,6 +2173,14 @@ bool document_refresh(PocDocument *document)
     document->body_text_node_count = stats.body_text_nodes;
     document->body_text_length = 0;
     document->glyph_script_mask = stats.glyph_script_mask;
+    document->glyph_census = stats.glyph_census;
+    document->glyph_census.offer_mask = 0;
+    for (unsigned index = 0; index < DOCUMENT_GLYPH_SCRIPT_KINDS; index++) {
+        size_t count = stats.glyph_script_counts[index];
+        if (count >= DOCUMENT_GLYPH_OFFER_MINIMUM
+            && count >= stats.body_bytes / DOCUMENT_GLYPH_OFFER_SHARE)
+            document->glyph_census.offer_mask |= (uint16_t) (1u << index);
+    }
     document->bidi_text_present = stats.bidi_text_present;
     document->bidi_markup_present = stats.bidi_markup_present;
     document->pointer_event_attributes_present =
@@ -2137,6 +3042,15 @@ bool document_set_element_inner_html(PocDocument *document,
         return false;
     }
 
+    /* Engine-owned form state (and parser form-owner links into a replaced
+       <form>) must not outlive the children Lexbor is about to destroy. */
+    for (lxb_dom_node_t *child = element->first_child; child != NULL;
+         child = child->next) {
+        if (!document_control_state_discard_subtree(document, child)) {
+            return false;
+        }
+    }
+
     lxb_dom_document_t *dom = &document->html->dom_document;
     lxb_html_parser_t *streaming_parser = dom->parser;
     bool parser_active = streaming_parser != NULL
@@ -2161,11 +3075,6 @@ typedef struct {
     bool failed;
 } DocumentBodySnapshotWriter;
 
-typedef struct {
-    size_t visible_text_bytes;
-    size_t action_count;
-} DocumentSnapshotContent;
-
 static bool document_snapshot_is_action(lxb_dom_node_t *node)
 {
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
@@ -2179,47 +3088,35 @@ static bool document_snapshot_is_action(lxb_dom_node_t *node)
     return href != NULL && href_length != 0;
 }
 
-static size_t document_snapshot_action_count(lxb_dom_node_t *root)
+static DocumentVisibleContent document_body_content(
+    const PocDocument *document, size_t node_limit, bool inspect_text)
 {
-    size_t action_count = 0;
-    lxb_dom_node_t *node = root;
-    for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
-        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && (document_name_is(node, "script")
-                || document_name_is(node, "style")
-                || document_name_is(node, "template")
-                || document_name_is(node, "svg")
-                || document_name_is(node, "noscript"));
-        if (document_snapshot_is_action(node) && action_count != SIZE_MAX) {
-            action_count++;
-        }
-        node = document_bounded_next(node, root, skip);
-    }
-    return action_count;
-}
-
-static DocumentSnapshotContent document_snapshot_content(lxb_dom_node_t *root)
-{
-    DocumentSnapshotContent content = {0};
+    DocumentVisibleContent content = {0};
+    lxb_dom_node_t *root = document == NULL ? NULL
+        : document_body_node(document);
     bool previous_space = true;
     lxb_dom_node_t *node = root;
-    for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < node_limit;
+         visited++) {
         bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
             && (document_name_is(node, "script")
                 || document_name_is(node, "style")
                 || document_name_is(node, "template")
                 || document_name_is(node, "svg")
                 || document_name_is(node, "noscript"));
-        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+        if (inspect_text && node->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
             const char *text = document_text_data(node, &length);
+#ifndef __PSP__
+            tilefinch_test_faults()->document_body_text_bytes_inspected += length;
+#endif
             for (size_t at = 0; text != NULL && at < length; at++) {
                 bool space = isspace((unsigned char) text[at]) != 0;
-                if (!space || !previous_space) {
-                    if (content.visible_text_bytes != SIZE_MAX) {
-                        content.visible_text_bytes++;
-                    }
-                }
+                if (!space && content.text_bytes != SIZE_MAX)
+                    content.text_bytes++;
+                if ((!space || !previous_space)
+                    && content.collapsed_text_bytes != SIZE_MAX)
+                    content.collapsed_text_bytes++;
                 previous_space = space;
             }
         }
@@ -2229,12 +3126,22 @@ static DocumentSnapshotContent document_snapshot_content(lxb_dom_node_t *root)
         }
         node = document_bounded_next(node, root, skip);
     }
+    content.truncated = node != NULL;
     return content;
+}
+
+DocumentVisibleContent document_body_visible_content(
+    const PocDocument *document, size_t node_limit)
+{
+    return document_body_content(document, node_limit, true);
 }
 
 size_t document_body_action_count(const PocDocument *document)
 {
-    return document_snapshot_action_count(document_body_node(document));
+    /* Parser checkpoints only need controls. Reuse the traversal and skip
+       predicates, without rescanning retained prose after each small append. */
+    return document_body_content(
+        document, DOCUMENT_SNAPSHOT_VISIT_LIMIT, false).action_count;
 }
 
 static lxb_status_t document_body_snapshot_receive(
@@ -2276,31 +3183,115 @@ static lxb_status_t document_body_snapshot_receive(
     return LXB_STATUS_OK;
 }
 
-bool document_body_snapshot_capture(PocDocument *document,
-                                    DocumentBodySnapshot *snapshot)
+static void document_body_snapshot_send(DocumentBodySnapshotWriter *writer,
+                                        const char *data, size_t length)
+{
+    if (!writer->failed && length != 0
+        && document_body_snapshot_receive(
+               (const lxb_char_t *) data, length, writer) != LXB_STATUS_OK)
+        writer->failed = true;
+}
+
+/* The body's markup with every <script> element left out (template
+   contents are inert and kept whole). A script-free copy fits pages whose
+   body carries a large data or app script, and is all a page restored
+   without its realm can use. */
+static void document_body_snapshot_write_without_scripts(
+    lxb_dom_node_t *body, DocumentBodySnapshotWriter *writer)
+{
+    lxb_dom_node_t *node = body->first_child;
+    while (node != NULL && !writer->failed) {
+        bool element = node->type == LXB_DOM_NODE_TYPE_ELEMENT;
+        bool descend = false;
+        if (element && document_name_is(node, "script")) {
+            /* Left out with its contents. */
+        } else if (!element || document_name_is(node, "template")) {
+            if (lxb_html_serialize_tree_cb(
+                    node, document_body_snapshot_receive, writer)
+                != LXB_STATUS_OK) writer->failed = true;
+        } else {
+            if (lxb_html_serialize_cb(
+                    node, document_body_snapshot_receive, writer)
+                != LXB_STATUS_OK) {
+                writer->failed = true;
+                break;
+            }
+            if (!lxb_html_node_is_void(node)) {
+                if (node->first_child != NULL) {
+                    descend = true;
+                } else {
+                    size_t length = 0;
+                    const lxb_char_t *name = lxb_dom_element_qualified_name(
+                        lxb_dom_interface_element(node), &length);
+                    document_body_snapshot_send(writer, "</", 2);
+                    document_body_snapshot_send(
+                        writer, (const char *) name, name == NULL ? 0 : length);
+                    document_body_snapshot_send(writer, ">", 1);
+                }
+            }
+        }
+        if (descend) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node->next == NULL && !writer->failed) {
+            node = node->parent;
+            if (node == NULL || node == body) return;
+            size_t length = 0;
+            const lxb_char_t *name = lxb_dom_element_qualified_name(
+                lxb_dom_interface_element(node), &length);
+            document_body_snapshot_send(writer, "</", 2);
+            document_body_snapshot_send(
+                writer, (const char *) name, name == NULL ? 0 : length);
+            document_body_snapshot_send(writer, ">", 1);
+        }
+        if (node != NULL) node = node->next;
+    }
+}
+
+static bool document_body_snapshot_capture_markup(
+    PocDocument *document, DocumentBodySnapshot *snapshot,
+    bool without_scripts)
 {
     if (snapshot == NULL) return false;
     *snapshot = (DocumentBodySnapshot) {0};
     lxb_dom_node_t *body = document_body_node(document);
-    DocumentSnapshotContent content = document_snapshot_content(body);
+    DocumentVisibleContent content = document_body_visible_content(
+        document, DOCUMENT_SNAPSHOT_VISIT_LIMIT);
     if (document == NULL || document->budget == NULL || body == NULL
-        || (content.visible_text_bytes < 128u
+        || (content.collapsed_text_bytes < 128u
             && content.action_count == 0u)) return false;
     snapshot->budget = document->budget;
-    snapshot->source_text_bytes = content.visible_text_bytes;
+    snapshot->source_text_bytes = content.collapsed_text_bytes;
     snapshot->source_action_count = content.action_count;
     DocumentBodySnapshotWriter writer = {.snapshot = snapshot};
-    for (lxb_dom_node_t *child = body->first_child;
-         child != NULL && !writer.failed; child = child->next) {
-        if (lxb_html_serialize_tree_cb(
-                child, document_body_snapshot_receive, &writer)
-            != LXB_STATUS_OK) writer.failed = true;
+    if (without_scripts) {
+        document_body_snapshot_write_without_scripts(body, &writer);
+    } else {
+        for (lxb_dom_node_t *child = body->first_child;
+             child != NULL && !writer.failed; child = child->next) {
+            if (lxb_html_serialize_tree_cb(
+                    child, document_body_snapshot_receive, &writer)
+                != LXB_STATUS_OK) writer.failed = true;
+        }
     }
     if (writer.failed || snapshot->length == 0) {
         document_body_snapshot_destroy(snapshot);
         return false;
     }
     return true;
+}
+
+bool document_body_snapshot_capture(PocDocument *document,
+                                    DocumentBodySnapshot *snapshot)
+{
+    return document_body_snapshot_capture_markup(document, snapshot, false);
+}
+
+bool document_body_snapshot_capture_without_scripts(
+    PocDocument *document, DocumentBodySnapshot *snapshot)
+{
+    return document_body_snapshot_capture_markup(document, snapshot, true);
 }
 
 bool document_body_snapshot_restore_if_degraded(
@@ -2312,9 +3303,9 @@ bool document_body_snapshot_restore_if_degraded(
         || (snapshot->source_text_bytes < 128u
             && snapshot->source_action_count == 0u)
         || !document_refresh(document)) return false;
-    DocumentSnapshotContent retained = document_snapshot_content(
-        document_body_node(document));
-    bool text_degraded = retained.visible_text_bytes
+    DocumentVisibleContent retained = document_body_visible_content(
+        document, DOCUMENT_SNAPSHOT_VISIT_LIMIT);
+    bool text_degraded = retained.collapsed_text_bytes
         < snapshot->source_text_bytes / 3u;
     /* Hydration failures often leave the server prose in place while
        replacing its only usable form/link with an inert application shell.
@@ -2402,6 +3393,8 @@ void document_destroy(PocDocument *document)
     }
     if (document->budget != NULL) {
         media_declared_video_cache_destroy(document);
+        document_nonce_registry_destroy(document);
+        document_adopted_sheets_destroy(document);
         DocumentControlState *state = document->control_states;
         while (state != NULL) {
             DocumentControlState *next = state->next;
@@ -2460,6 +3453,17 @@ const char *document_attribute(lxb_dom_node_t *node, const char *name,
         strlen(name), length);
 }
 
+bool document_is_refresh_meta(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->local_name != LXB_TAG_META || node->ns != LXB_NS_HTML)
+        return false;
+    size_t length = 0;
+    const char *value = document_attribute(node, "http-equiv", &length);
+    return value != NULL && length == 7u
+        && strncasecmp(value, "refresh", 7u) == 0;
+}
+
 const char *document_web_app_manifest_href(
     const PocDocument *document, size_t *length)
 {
@@ -2487,7 +3491,7 @@ const char *document_control_value(lxb_dom_node_t *node, size_t *length)
 {
     if (length != NULL) *length = 0;
     if (node == NULL) return NULL;
-    const DocumentControlState *state = node->user;
+    const DocumentControlState *state = document_control_state_of(node);
     if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
         || state->node != node) return NULL;
     if (length != NULL) *length = state->length;
@@ -2497,7 +3501,7 @@ const char *document_control_value(lxb_dom_node_t *node, size_t *length)
 lxb_dom_node_t *document_control_parser_form_owner(lxb_dom_node_t *node)
 {
     if (node == NULL) return NULL;
-    const DocumentControlState *state = node->user;
+    const DocumentControlState *state = document_control_state_of(node);
     if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
         || state->node != node) return NULL;
     lxb_dom_node_t *owner = state->parser_form_owner;
@@ -2548,7 +3552,7 @@ bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
         || length > DOCUMENT_CONTROL_VALUE_LIMIT
         || node->owner_document
                != &document->html->dom_document) return false;
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (state != NULL
         && (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
             || state->node != node)) return false;
@@ -2615,7 +3619,7 @@ bool document_control_value_snapshot(
         || node->owner_document != &document->html->dom_document) {
         return false;
     }
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (state == NULL) {
         snapshot->valid = true;
         snapshot->node = node;
@@ -2652,7 +3656,7 @@ bool document_control_value_transaction_set(
         || snapshot->node != node
         || (value == NULL && length != 0)
         || length > DOCUMENT_CONTROL_VALUE_LIMIT) return false;
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (snapshot->state_present) {
         if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
             || state->node != node
@@ -2669,7 +3673,7 @@ bool document_control_value_transaction_set(
         return false;
     }
     if (!document_control_value_set(document, node, value, length)) {
-        state = node->user;
+        state = document_control_state_of(node);
         if (snapshot->state_present && state != NULL
             && state->magic == DOCUMENT_CONTROL_STATE_MAGIC
             && state->node == node && state->value == NULL) {
@@ -2710,7 +3714,7 @@ bool document_control_value_restore(
         || node->owner_document != &document->html->dom_document) {
         return false;
     }
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (!snapshot->transaction_active) {
         if (!snapshot->state_present) return state == NULL;
         if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
@@ -2735,7 +3739,7 @@ bool document_control_value_restore(
             && document->parser_form_owner_count != 0) {
             document->parser_form_owner_count--;
         }
-        node->user = NULL;
+        node->user = document_control_state_released_user(state);
         state->magic = 0;
         state->node = NULL;
         budget_free(document->budget, state->value);
@@ -2777,7 +3781,7 @@ bool document_control_checked_snapshot(
         || node->owner_document != &document->html->dom_document) {
         return false;
     }
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (state != NULL
         && (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
             || state->node != node)) return false;
@@ -2801,7 +3805,7 @@ bool document_control_checked_restore(
         || node->owner_document != &document->html->dom_document) {
         return false;
     }
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (!snapshot->state_present) {
         if (state == NULL) return true;
         if (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
@@ -2813,7 +3817,7 @@ bool document_control_checked_restore(
         while (*link != NULL && *link != state) link = &(*link)->next;
         if (*link != state) return false;
         *link = state->next;
-        node->user = NULL;
+        node->user = document_control_state_released_user(state);
         state->magic = 0;
         state->node = NULL;
         budget_free(document->budget, state);
@@ -2841,7 +3845,7 @@ bool document_control_default_value(
     if (length != NULL) *length = 0;
     if (document == NULL || node == NULL || value == NULL || length == NULL
         || node->owner_document != &document->html->dom_document) return false;
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (state != NULL
         && (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
             || state->node != node)) return false;
@@ -2858,7 +3862,7 @@ bool document_control_default_value(
             if (!document_control_value_set(
                     document, node, authored, authored_length)) return false;
         }
-        state = node->user;
+        state = document_control_state_of(node);
     }
     if (state == NULL || !state->default_value_known) return false;
     *value = state->default_value;
@@ -2906,7 +3910,7 @@ bool document_control_resize(lxb_dom_node_t *node,
                              int *width, int *height)
 {
     if (node == NULL) return false;
-    DocumentControlState *state = node->user;
+    DocumentControlState *state = document_control_state_of(node);
     if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
         || state->node != node || state->resized_width < 1
         || state->resized_height < 1) return false;

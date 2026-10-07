@@ -10,17 +10,10 @@
 #include <openssl/evp.h>
 #endif
 
-typedef enum {
-    INTEGRITY_HASH_NONE = 0,
-    INTEGRITY_HASH_SHA256 = 1,
-    INTEGRITY_HASH_SHA384 = 2,
-    INTEGRITY_HASH_SHA512 = 3
-} IntegrityHash;
-
 typedef struct {
     const char *encoded;
     size_t encoded_length;
-    IntegrityHash hash;
+    size_t digest_length;
 } IntegrityToken;
 
 static bool integrity_ascii_whitespace(unsigned char character)
@@ -41,26 +34,45 @@ static bool integrity_ascii_equal_lower(
     return true;
 }
 
-static IntegrityHash integrity_hash_name(const char *token, size_t length,
-                                         size_t *prefix_length)
+/* The digest size of a token's algorithm prefix; 0 when unknown. */
+static size_t integrity_digest_length(const char *token, size_t length)
 {
-    if (length >= 7u
-        && integrity_ascii_equal_lower(token, "sha256-", 7u)) {
-        *prefix_length = 7u;
-        return INTEGRITY_HASH_SHA256;
+    if (length < 7u) return 0;
+    if (integrity_ascii_equal_lower(token, "sha256-", 7u)) return 32u;
+    if (integrity_ascii_equal_lower(token, "sha384-", 7u)) return 48u;
+    if (integrity_ascii_equal_lower(token, "sha512-", 7u)) return 64u;
+    return 0;
+}
+
+bool tilefinch_integrity_next_token(const char *metadata, size_t length,
+                                    size_t *at,
+                                    TilefinchIntegrityToken *token)
+{
+    if (metadata == NULL || at == NULL || token == NULL) return false;
+    while (*at < length) {
+        while (*at < length
+               && integrity_ascii_whitespace(
+                      (unsigned char) metadata[*at])) (*at)++;
+        size_t start = *at;
+        while (*at < length
+               && !integrity_ascii_whitespace(
+                      (unsigned char) metadata[*at])) (*at)++;
+        if (start == *at) continue;
+        size_t end = *at;
+        const char *question = memchr(metadata + start, '?', end - start);
+        if (question != NULL) end = (size_t) (question - metadata);
+        size_t digest_length = integrity_digest_length(
+            metadata + start, end - start);
+        if (digest_length == 0) continue;
+        *token = (TilefinchIntegrityToken) {
+            .algorithm = metadata + start,
+            .digest_length = digest_length,
+            .value = metadata + start + 7u,
+            .value_length = end - start - 7u
+        };
+        return true;
     }
-    if (length >= 7u
-        && integrity_ascii_equal_lower(token, "sha384-", 7u)) {
-        *prefix_length = 7u;
-        return INTEGRITY_HASH_SHA384;
-    }
-    if (length >= 7u
-        && integrity_ascii_equal_lower(token, "sha512-", 7u)) {
-        *prefix_length = 7u;
-        return INTEGRITY_HASH_SHA512;
-    }
-    *prefix_length = 0;
-    return INTEGRITY_HASH_NONE;
+    return false;
 }
 
 static int base64_digit(unsigned char character)
@@ -114,20 +126,78 @@ static bool decode_digest(const char *encoded, size_t length,
     return out == expected;
 }
 
+#if defined(__PSP__)
+_Static_assert(sizeof(mbedtls_sha512_context)
+                   <= TILEFINCH_SHA512_STATE_BYTES,
+               "SHA-512 state must fit its opaque storage");
+#endif
+
+bool tilefinch_sha512_begin(TilefinchSha512 *context, bool sha384)
+{
+    if (context == NULL) return false;
+    memset(context, 0, sizeof(*context));
+    context->sha384 = sha384;
+#if defined(__PSP__)
+    mbedtls_sha512_context *state =
+        (mbedtls_sha512_context *) context->state.bytes;
+    mbedtls_sha512_init(state);
+    context->active = true;
+    context->failed = mbedtls_sha512_starts(state, sha384 ? 1 : 0) != 0;
+#else
+    EVP_MD_CTX *state = EVP_MD_CTX_new();
+    context->state.pointer = state;
+    context->active = state != NULL;
+    context->failed = state == NULL || EVP_DigestInit_ex(
+        state, sha384 ? EVP_sha384() : EVP_sha512(), NULL) != 1;
+#endif
+    return context->active && !context->failed;
+}
+
+void tilefinch_sha512_update(TilefinchSha512 *context,
+                             const uint8_t *bytes, size_t length)
+{
+    if (context == NULL || !context->active || context->failed
+        || length == 0) return;
+    if (bytes == NULL) {
+        context->failed = true;
+        return;
+    }
+#if defined(__PSP__)
+    context->failed = mbedtls_sha512_update(
+        (mbedtls_sha512_context *) context->state.bytes, bytes, length) != 0;
+#else
+    context->failed = EVP_DigestUpdate(
+        context->state.pointer, bytes, length) != 1;
+#endif
+}
+
+bool tilefinch_sha512_finish(TilefinchSha512 *context, uint8_t output[64])
+{
+    if (context == NULL || !context->active) return false;
+    bool ok = !context->failed && output != NULL;
+#if defined(__PSP__)
+    mbedtls_sha512_context *state =
+        (mbedtls_sha512_context *) context->state.bytes;
+    if (ok) ok = mbedtls_sha512_finish(state, output) == 0;
+    mbedtls_sha512_free(state);
+#else
+    unsigned length = 0;
+    if (ok) ok = EVP_DigestFinal_ex(context->state.pointer, output,
+                                    &length) == 1
+        && length == (context->sha384 ? 48u : 64u);
+    EVP_MD_CTX_free(context->state.pointer);
+#endif
+    context->active = false;
+    return ok;
+}
+
 static bool digest_sha384_or_512(const uint8_t *bytes, size_t length,
                                  bool sha384, uint8_t output[64])
 {
-    static const uint8_t empty = 0;
-    if (bytes == NULL) bytes = &empty;
-#if defined(__PSP__)
-    return mbedtls_sha512(bytes, length, output, sha384 ? 1 : 0) == 0;
-#else
-    unsigned output_length = 0;
-    const EVP_MD *algorithm = sha384 ? EVP_sha384() : EVP_sha512();
-    return EVP_Digest(bytes, length, output, &output_length,
-                      algorithm, NULL) == 1
-        && output_length == (sha384 ? 48u : 64u);
-#endif
+    TilefinchSha512 context;
+    (void) tilefinch_sha512_begin(&context, sha384);
+    tilefinch_sha512_update(&context, bytes, length);
+    return tilefinch_sha512_finish(&context, output);
 }
 
 static bool constant_time_equal(const uint8_t *left, const uint8_t *right,
@@ -151,60 +221,41 @@ TilefinchIntegrityResult tilefinch_resource_integrity_verify(
     }
     IntegrityToken tokens[TILEFINCH_INTEGRITY_TOKEN_LIMIT];
     size_t token_count = 0;
-    IntegrityHash strongest = INTEGRITY_HASH_NONE;
+    size_t strongest = 0;
     bool recognized = false;
     size_t at = 0;
-    while (at < metadata_length) {
-        while (at < metadata_length
-               && integrity_ascii_whitespace(
-                      (unsigned char) metadata[at])) at++;
-        size_t start = at;
-        while (at < metadata_length
-               && !integrity_ascii_whitespace(
-                      (unsigned char) metadata[at])) at++;
-        if (start == at) continue;
-        size_t end = at;
-        const char *question = memchr(metadata + start, '?', end - start);
-        if (question != NULL) end = (size_t) (question - metadata);
-        size_t prefix = 0;
-        IntegrityHash hash = integrity_hash_name(
-            metadata + start, end - start, &prefix);
-        if (hash == INTEGRITY_HASH_NONE) continue;
+    TilefinchIntegrityToken token;
+    while (tilefinch_integrity_next_token(metadata, metadata_length, &at,
+                                          &token)) {
         recognized = true;
-        size_t encoded_length = end - start - prefix;
-        size_t expected = hash == INTEGRITY_HASH_SHA256 ? 32u
-            : hash == INTEGRITY_HASH_SHA384 ? 48u : 64u;
         uint8_t decoded[64];
-        if (!decode_digest(metadata + start + prefix, encoded_length,
-                           decoded, expected)) continue;
+        if (!decode_digest(token.value, token.value_length, decoded,
+                           token.digest_length)) continue;
         if (token_count == TILEFINCH_INTEGRITY_TOKEN_LIMIT) {
             return TILEFINCH_INTEGRITY_INVALID;
         }
         tokens[token_count++] = (IntegrityToken) {
-            .encoded = metadata + start + prefix,
-            .encoded_length = encoded_length,
-            .hash = hash
+            .encoded = token.value,
+            .encoded_length = token.value_length,
+            .digest_length = token.digest_length
         };
-        if (hash > strongest) strongest = hash;
+        if (token.digest_length > strongest) strongest = token.digest_length;
     }
-    if (strongest == INTEGRITY_HASH_NONE) {
+    if (strongest == 0) {
         return recognized ? TILEFINCH_INTEGRITY_INVALID
                           : TILEFINCH_INTEGRITY_NOT_ENFORCED;
     }
     uint8_t digest[64];
-    size_t digest_length = strongest == INTEGRITY_HASH_SHA256 ? 32u
-        : strongest == INTEGRITY_HASH_SHA384 ? 48u : 64u;
-    bool digested = strongest == INTEGRITY_HASH_SHA256
+    bool digested = strongest == 32u
         ? tilefinch_sha256_digest(bytes, byte_length, digest)
-        : digest_sha384_or_512(bytes, byte_length,
-                              strongest == INTEGRITY_HASH_SHA384, digest);
+        : digest_sha384_or_512(bytes, byte_length, strongest == 48u, digest);
     if (!digested) return TILEFINCH_INTEGRITY_INVALID;
     for (size_t i = 0; i < token_count; i++) {
-        if (tokens[i].hash != strongest) continue;
+        if (tokens[i].digest_length != strongest) continue;
         uint8_t expected[64];
         if (decode_digest(tokens[i].encoded, tokens[i].encoded_length,
-                          expected, digest_length)
-            && constant_time_equal(digest, expected, digest_length)) {
+                          expected, strongest)
+            && constant_time_equal(digest, expected, strongest)) {
             return TILEFINCH_INTEGRITY_MATCH;
         }
     }

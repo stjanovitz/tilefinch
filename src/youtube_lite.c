@@ -1880,6 +1880,8 @@ typedef struct {
     YoutubeLiteRoute route;
     YoutubeLiteBuildPhase phase;
     size_t scan_offset;
+    /* Bytes scan_offset has moved forward, over every phase. */
+    size_t walked_bytes;
     size_t metadata_start;
     size_t emit_index;
     YoutubeLiteVideo videos[YOUTUBE_LITE_MAXIMUM_RESULTS];
@@ -1916,6 +1918,15 @@ static YoutubeLiteSpan lite_build_window(
     };
 }
 
+/* Every move of the build's scan cursor goes through here, so that
+   walked_bytes counts each forward step, however many happen in a pump. */
+static void lite_build_seek(YoutubeLiteBuildWork *work, size_t offset)
+{
+    if (offset > work->scan_offset)
+        work->walked_bytes += offset - work->scan_offset;
+    work->scan_offset = offset;
+}
+
 static void lite_build_work_fail(YoutubeLiteBuildWork *work)
 {
     if (work != NULL) work->phase = YOUTUBE_LITE_BUILD_FAILED;
@@ -1932,13 +1943,13 @@ static void lite_build_begin_emission(YoutubeLiteBuildWork *work)
                 work->watch.video.title,
                 sizeof(work->watch.video.title), "YouTube video");
     }
-    work->scan_offset = 0;
+    lite_build_seek(work, 0);
     work->phase = YOUTUBE_LITE_BUILD_EMIT_HEADER;
 }
 
 static void lite_build_after_videos(YoutubeLiteBuildWork *work)
 {
-    work->scan_offset = 0;
+    lite_build_seek(work, 0);
     if (work->route == YOUTUBE_LITE_ROUTE_WATCH) {
         work->phase = YOUTUBE_LITE_BUILD_WATCH_MARKER;
     } else if (work->comments_requested
@@ -1952,7 +1963,7 @@ static void lite_build_after_videos(YoutubeLiteBuildWork *work)
 
 static void lite_build_after_watch(YoutubeLiteBuildWork *work)
 {
-    work->scan_offset = 0;
+    lite_build_seek(work, 0);
     if (work->comments_requested
         && work->supplemental != NULL
         && work->supplemental_length != 0) {
@@ -2043,10 +2054,11 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
            repeating that scan across the remainder of a large response did
            roughly three times the necessary lexical work. Find continuation
            objects once, then parse only their bounded object windows. */
-        size_t found = 0;
+        size_t found = 0, offset = work->scan_offset;
         YoutubeLiteScanStatus status = lite_bytes_scan_pump(
             work->decoded, work->decoded_length, work->decoded_length,
-            "\"continuationItemRenderer\"", &work->scan_offset, &found);
+            "\"continuationItemRenderer\"", &offset, &found);
+        lite_build_seek(work, offset);
         if (status == YOUTUBE_LITE_SCAN_FOUND) {
             size_t remaining = work->decoded_length - found;
             size_t window = YOUTUBE_LITE_BUILD_OBJECT_BYTES
@@ -2100,8 +2112,8 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
                 lite_build_after_videos(work);
                 return;
             }
-            work->scan_offset =
-                (size_t) (renderer.end - work->decoded);
+            lite_build_seek(
+                work, (size_t) (renderer.end - work->decoded));
             return;
         }
         YoutubeLiteVideo parsed;
@@ -2113,14 +2125,15 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
                 work->videos, work->video_count, parsed.id)) {
             work->videos[work->video_count++] = parsed;
         }
-        work->scan_offset =
-            (size_t) (renderer.end - work->decoded);
+        lite_build_seek(
+            work, (size_t) (renderer.end - work->decoded));
         return;
     }
     if (scope.end == work->decoded + work->decoded_length) {
         lite_build_after_videos(work);
     } else {
-        work->scan_offset += YOUTUBE_LITE_BUILD_SCAN_BYTES;
+        lite_build_seek(
+            work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
     }
 }
 
@@ -2139,12 +2152,13 @@ static void lite_build_watch_marker_pump(YoutubeLiteBuildWork *work)
     if (found != NULL) {
         work->metadata_start =
             (size_t) (found - work->source) + sizeof(marker) - 1u;
-        work->scan_offset = work->metadata_start;
+        lite_build_seek(work, work->metadata_start);
         work->phase = YOUTUBE_LITE_BUILD_WATCH_DETAILS;
     } else if (window == remaining) {
         lite_build_after_watch(work);
     } else {
-        work->scan_offset += YOUTUBE_LITE_BUILD_SCAN_BYTES;
+        lite_build_seek(
+            work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
     }
 }
 
@@ -2152,7 +2166,7 @@ static void lite_build_watch_key_pump(
     YoutubeLiteBuildWork *work, const char *key, bool details)
 {
     if (work->scan_offset >= work->source_length) {
-        work->scan_offset = work->metadata_start;
+        lite_build_seek(work, work->metadata_start);
         if (details) {
             work->phase = YOUTUBE_LITE_BUILD_WATCH_MICROFORMAT;
         } else {
@@ -2167,7 +2181,7 @@ static void lite_build_watch_key_pump(
         if (details) {
             lite_watch_details(&value, &work->watch);
             work->watch_details_found = true;
-            work->scan_offset = work->metadata_start;
+            lite_build_seek(work, work->metadata_start);
             work->phase = YOUTUBE_LITE_BUILD_WATCH_MICROFORMAT;
         } else {
             lite_watch_microformat(&value, &work->watch);
@@ -2175,9 +2189,10 @@ static void lite_build_watch_key_pump(
             lite_build_after_watch(work);
         }
     } else if (scope.end == work->source + work->source_length) {
-        work->scan_offset = work->source_length;
+        lite_build_seek(work, work->source_length);
     } else {
-        work->scan_offset += YOUTUBE_LITE_BUILD_SCAN_BYTES;
+        lite_build_seek(
+            work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
     }
 }
 
@@ -2220,15 +2235,16 @@ static void lite_build_comments_pump(YoutubeLiteBuildWork *work)
         YoutubeLiteComment parsed;
         if (lite_parse_comment_renderer(&renderer, &parsed))
             work->comments[work->comment_count++] = parsed;
-        work->scan_offset =
-            (size_t) (renderer.end - work->supplemental);
+        lite_build_seek(
+            work, (size_t) (renderer.end - work->supplemental));
         return;
     }
     if (scope.end
         == work->supplemental + work->supplemental_length) {
         lite_build_begin_emission(work);
     } else {
-        work->scan_offset += YOUTUBE_LITE_BUILD_SCAN_BYTES;
+        lite_build_seek(
+            work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
     }
 }
 
@@ -2742,10 +2758,41 @@ struct YoutubeLiteLoadJob {
     size_t fact_scan_limit;
     YoutubeLiteCommentsScan comments_scan;
     YoutubeLiteIdentity identity;
+    /* Bytes the decode, fact and comments scans have advanced over; the
+       build counts its own walk (YoutubeLiteBuildWork.walked_bytes). */
+    size_t walked_bytes;
     YoutubeLiteBuildWork *build;
     YoutubeLiteDocument document;
     YoutubeLiteLoadMetrics metrics;
 };
+
+/* A transform slice's work in bytes: how far it moved the decode, the fact
+   and comments scans and the build's renderer and metadata walk, plus the
+   HTML it emitted. Each counter only grows while its owner lives, so the
+   difference across a slice counts every step taken in it, however many.
+   Every pump bounds each of these, so the largest difference is a
+   host-independent size for the largest slice. */
+enum { LITE_SLICE_COUNTERS = 2 };
+
+static void lite_slice_counters(const YoutubeLiteLoadJob *job,
+                                size_t counters[LITE_SLICE_COUNTERS])
+{
+    counters[0] = job->walked_bytes;
+    counters[1] = job->build != NULL
+        ? job->build->walked_bytes + job->build->html.length : 0;
+}
+
+static void lite_slice_record_work(YoutubeLiteLoadJob *job,
+                                   const size_t before[LITE_SLICE_COUNTERS])
+{
+    size_t after[LITE_SLICE_COUNTERS];
+    lite_slice_counters(job, after);
+    size_t work = 0;
+    for (size_t at = 0; at < LITE_SLICE_COUNTERS; at++)
+        if (after[at] > before[at]) work += after[at] - before[at];
+    if (work > job->metrics.maximum_transform_slice_bytes)
+        job->metrics.maximum_transform_slice_bytes = work;
+}
 
 static void lite_load_release_unused_primary(YoutubeLiteLoadJob *job)
 {
@@ -2936,6 +2983,7 @@ static bool lite_load_identity_pump(YoutubeLiteLoadJob *job)
                 sizeof(job->identity.visitor));
         }
     }
+    job->walked_bytes += stop - job->fact_scan_offset;
     job->fact_scan_offset = stop;
     /* Each field already keeps its first valid value. Once all are present,
        scanning the remaining HTML cannot change the result. Keep the same
@@ -3027,6 +3075,16 @@ static bool lite_comments_scan_pump(
     return true;
 }
 
+static bool lite_load_comments_scan_pump(YoutubeLiteLoadJob *job)
+{
+    size_t offset = job->comments_scan.offset;
+    bool advanced = lite_comments_scan_pump(
+        job->decoded, job->decoded_length, &job->comments_scan);
+    if (job->comments_scan.offset > offset)
+        job->walked_bytes += job->comments_scan.offset - offset;
+    return advanced;
+}
+
 static bool lite_load_decode_pump(YoutubeLiteLoadJob *job)
 {
     enum { TRANSFORM_BYTES_PER_PUMP = 16u * 1024u };
@@ -3049,6 +3107,8 @@ static bool lite_load_decode_pump(YoutubeLiteLoadJob *job)
                 break;
             }
         }
+        job->walked_bytes +=
+            (marker == SIZE_MAX ? stop : marker) - job->decode_search_offset;
         if (marker == SIZE_MAX) {
             if (stop == length) {
                 job->decode_attempted = true;
@@ -3106,6 +3166,7 @@ static bool lite_load_decode_pump(YoutubeLiteLoadJob *job)
             job->decoded[job->decoded_length++] = simple;
         }
     }
+    job->walked_bytes += (size_t) (at - source) - job->decode_input_offset;
     job->decode_input_offset = (size_t) (at - source);
     if (at < end && *at == job->decode_quote) {
         job->decoded[job->decoded_length] = '\0';
@@ -3600,14 +3661,16 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         || job->phase == YOUTUBE_LITE_JOB_COMMENTS_COMMAND
         || job->phase == YOUTUBE_LITE_JOB_COMMENTS_TOKEN;
     if (identity_scan || comments_scan) {
+        size_t counters[LITE_SLICE_COUNTERS];
+        lite_slice_counters(job, counters);
         uint64_t started_us = tilefinch_platform_monotonic_time_us();
         job->metrics.build_slices++;
         bool advanced = identity_scan
             ? lite_load_identity_pump(job)
-            : lite_comments_scan_pump(job->decoded, job->decoded_length,
-                                      &job->comments_scan);
+            : lite_load_comments_scan_pump(job);
         if (comments_scan) job->phase = job->comments_scan.phase;
         uint64_t finished_us = tilefinch_platform_monotonic_time_us();
+        lite_slice_record_work(job, counters);
         uint64_t elapsed_us = finished_us >= started_us
             ? finished_us - started_us : 0;
         job->metrics.build_us += elapsed_us;
@@ -3623,6 +3686,8 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         return job->status;
     }
     if (job->phase == YOUTUBE_LITE_JOB_BUILD) {
+        size_t counters[LITE_SLICE_COUNTERS];
+        lite_slice_counters(job, counters);
         uint64_t started_us = tilefinch_platform_monotonic_time_us();
         job->metrics.build_slices++;
         /* Discover the small comments token alongside already-required build
@@ -3632,8 +3697,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
             && !job->supplemental_requested && job->decoded != NULL
             && !lite_description_view_requested(job->url)
             && job->comments_scan.phase != YOUTUBE_LITE_JOB_PREPARE)
-            (void) lite_comments_scan_pump(job->decoded, job->decoded_length,
-                                           &job->comments_scan);
+            (void) lite_load_comments_scan_pump(job);
         if (job->build == NULL) {
             job->build = lite_build_work_create(
                 job->budget, job->url,
@@ -3650,6 +3714,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
             lite_build_work_pump(job->build);
         }
         uint64_t finished_us = tilefinch_platform_monotonic_time_us();
+        lite_slice_record_work(job, counters);
         uint64_t elapsed_us = finished_us >= started_us
             ? finished_us - started_us : 0;
         job->metrics.build_us += elapsed_us;
@@ -3705,9 +3770,12 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         return job->status;
     }
     if (job->phase == YOUTUBE_LITE_JOB_DECODE) {
+        size_t counters[LITE_SLICE_COUNTERS];
+        lite_slice_counters(job, counters);
         uint64_t started_us = tilefinch_platform_monotonic_time_us();
         bool advanced = lite_load_decode_pump(job);
         uint64_t finished_us = tilefinch_platform_monotonic_time_us();
+        lite_slice_record_work(job, counters);
         uint64_t elapsed_us = finished_us >= started_us
             ? finished_us - started_us : 0;
         job->metrics.build_us += elapsed_us;

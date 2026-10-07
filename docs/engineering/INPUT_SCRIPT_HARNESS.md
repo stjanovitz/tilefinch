@@ -9,6 +9,23 @@ lifecycle without depending on an emulator automation API.
 Shipping EBOOTs compile the harness out. A release build handed an
 `input_script=` key ignores it and boots normally.
 
+### Fixed-pixel canvas setup probe
+
+Validation mark `canvas-setup-probe` (after `canvas-vfpu-check`, outside the
+timing window) compares baseline and setup-once dispatch in one binary.
+The probe alternates three batches per variant for both packed and padded
+320×180 input, scaled to 480×272 with padded output. It preserves the existing
+VFPU row converter and duplicate-row copy. Full output/padding and borrowed
+VFPU state must match; actual VFPU row count must be 180, not merely enabled.
+Each batch reports owner CPU, wall-clock bounds and clock-query overhead.
+
+This bounded Budget-owned **RAM** corpus is not an EDRAM bandwidth or FPS
+measurement. It leaves framebuffer ownership unchanged and releases every
+allocation. `canvas-setup-on` / `canvas-setup-off` select the research path
+for subsequent gameplay; baseline is the default. None of these paths ships
+in ordinary builds. A gameplay comparison must still use identical recorded
+input/dt/state and distinguish profiling overhead from deadline misses.
+
 ## Why input is injected inside the application
 
 PPSSPP input injection cannot reliably answer when a frame consumed an edge,
@@ -24,6 +41,19 @@ stepper owns those facts and produces a deterministic trace:
 Visual marks enter a bounded RAM capture queue and are flushed only after the
 scenario ends. Device timing therefore does not include per-frame Memory Stick
 writes.
+
+The current mark name capacity is 20 bytes including the terminator, and only
+three distinct mark images are retained. Validate generated names against
+`PSP_INPUT_SCRIPT_MARK_CAPACITY` before a launch. Extra diagnostic marks can
+consume image slots: require the matching `tilefinch-input-capture:` record
+and a successful current-run write before inspecting a named file. A file
+left by a previous run is not evidence. Keep expensive pixel comparisons in
+warm-up or after the measured window, not in startup or timed gameplay.
+
+Qualification-only boots should have an empty `input_script`: otherwise the
+report waiter correctly demands completion of a script the qualification
+runner never executes. Read the qualification outcome separately from an
+ordinary scripted browsing/gameplay outcome.
 
 For small-text or emoji inspection, the validation build also honors
 `dump_frame=1` after the interactive scenario finishes. It writes
@@ -59,6 +89,50 @@ consumed by the input supervisor while page work is still running: its UI
 capture is valid, but the main-loop page observer may not emit the JavaScript
 profile or the `.mark.js` diagnostic. Verify those records exist before using
 a mark as a timing/report boundary; a captured image alone does not prove it.
+`mark-page` also runs in the main loop and is useful for an animated game.
+Probe names replace the input script extension: `game.txt` uses
+`game.mark.js` and `game.until.js`, not `game.txt.mark.js`.
+`psplink-device.sh memory` stages these companions with a committed scenario,
+so an updated diagnostic cannot silently run with an older copy on host0.
+
+`treadline-action-budget.txt` exercises Deploy, all nub directions, face-button
+aim, cannon, secondary, gadget, command, and the escape chord in an Onslaught
+boss scene. Its companion requires successful gameplay and killcam history,
+and disables game phase clocks during the displayed-frame measurement. Use the
+USB-only installed-package route in [PSPLink dev loop](PSPLINK_DEV_LOOP.md),
+with `qualification=input&bridge-profile=off&profile-report=off&seed=12345`
+in the package source URL. The `configure`, `heavy-setup`, and `post-play`
+capture slots cover the menu, heavy scene, and post-action scene. Keep attribution
+runs separate: phase clocks add work
+and must not be mistaken for ordinary gameplay timings.
+
+For attribution, leave input profiling enabled after `webgl-measure-start`
+and collect `__treadlineDebug.slowProfile()` at the end. Input qualification
+retains up to 540 samples, covering the full button workload rather than only
+its first 180 frames. The ranked `rows` have ten words per frame: update,
+prelude, bots, movement, projectiles, world, scene build, HUD, commands, total.
+The first three ranks have matching `aiRows`; use `aiRowWords` for their stride
+(currently 31). Words 0–10 are target selection, goal, route, steering, aim,
+fire, BFS, aim preparation, visibility, bank planning, and aim angle. Words
+11–14 are movement drive/traction, collision/recovery, travel/height/turret,
+and timers/actions. Words 15–17 split the route helper into goal remapping,
+field lookup/build, and waypoint selection/visibility. Word 18 counts strategy
+refreshes; 19–20 are aim-preview time and count. Words 21–24 are cannon,
+secondary, gadget, and command attempt times; 26–29 are their attempt counts
+(not successful shots). Words 25 and 30 are gain-envelope scheduling time and
+count. Action times are nested in movement timers/actions; envelopes can also
+run in other phases. Nested phases must not be added to their parent totals.
+Movement, action and envelope deltas reuse existing clock readings;
+the finer route clocks run only during attribution. Run host CPU-heavy gates
+separately from USB timing runs so host0 servicing is not a confounder.
+
+For silent physical-device game tests, set `validation_game_audio_mute=1`
+in the validation build's `boot.cfg`. Voices, envelope processing and PCM
+mixing still run; only hardware output volume is zero. The default is 0,
+and shipping configuration scrubbing removes the setting. For Treadline
+cadence runs, `profile-report=off` suppresses the large formatted in-game
+report; collect its bounded `__treadlineDebug.aiProfile()` totals in a mark
+probe instead. A report-building pause is not a gameplay optimization target.
 
 Use `-page` on the same commands to wait for a committed, painted page but
 not for background resources to finish. These steps run only in the main
@@ -76,6 +150,14 @@ take a full runtime snapshot. This keeps author continuations on the normal
 runtime path. Probe source is still trusted diagnostic JavaScript and can
 explicitly call author functions or mutate state; write observation-only
 predicates. Ordinary `.mark.js` diagnostics retain their checkpoint behavior.
+For frame-timing runs, the entire `.until.js` file may instead contain
+`@global predicateName` (an ASCII identifier of at most 96 bytes, followed only
+by whitespace). Define that function before the measured window. The harness
+calls it directly with no arguments and the page global as its receiver, under
+the same watchdog. This avoids repeated source compilation and clipboard
+bookkeeping; it still does not drain jobs. A missing, throwing, or non-callable
+predicate cannot satisfy the condition. Malformed `@global` directives fail
+the check rather than executing as JavaScript.
 `COUNT` stays the upper bound, so a probe that never holds costs the same as
 the fixed wait it replaces. The probe never runs inside page script. Like
 `<script>.mark.js`, which is evaluated at every mark and logged, it is a
@@ -306,6 +388,10 @@ to isolate these kernels. The PSP filter is cleared from ordinary builds,
 and the log prints the selected names. Match source, flags, iteration count,
 loaded PRX hash and successful outcome; repeat hardware runs before drawing
 conclusions. A kernel win is not a whole-page speed claim.
+Explicit filters refuse unknown names, empty comma-separated entries and
+more than 512 bytes before any kernel runs; `compile_trace` also requires a
+trace directory. Duplicate names select a kernel once. This prevents an
+empty or partially misspelled short run from becoming false timing evidence.
 
 Always run the same binary and replay with the census off as well as on.
 The tags themselves cost work on Allegrex: the initial hardware comparison
@@ -383,6 +469,321 @@ avoidable sleep, page timers, network, harness), the runtime-advance
 breakdown, timer lateness, the waits by reason, and the requests replay held
 for their recorded pumps.
 
+### Causal canvas deadline capture
+
+In validation builds, `webgl-measure-start` begins an additional bounded
+capture and `webgl-measure-end` ends its window: presentation counts, the
+over-34-ms tally and the worst pipeline stop there too (the end mark's own
+frame carries that mark's diagnostics and is not counted). The counters
+reset at the main loop's next frame after `webgl-measure-start`, so the
+start mark's own diagnostics (page report, `.mark.js`) stay outside the
+window too; the page's `__tilefinchStartInputProfile` hook still runs on the
+mark frame, before any `.mark.js` for that mark. Use `mark-page` for both
+marks in timing runs. Scripts with `until` steps keep their `until-met` line
+in goldens without its `at-us` clock. The final report contains
+one `tilefinch-canvas-frame` row for every stored presentation in that
+window (up to 1,024), not merely the sixteen longest pipelines. Rows carry
+absolute runtime-start, framebuffer-ready and post-vblank timestamps,
+the corresponding display vcounts, and the previous canvas publication.
+Compare the vcount delta with the desired two-vblank cadence; do not infer
+a missed deadline from `present` time, which includes waiting. Join the
+runtime-start timestamp to `tilefinch-loop-timing` to account for input,
+dispatch, idle and post-present work. Runtime contains callbacks and
+microtasks; native WebGL is nested inside microtasks, not additive to them.
+Loop-timing rows inside this window are buffered with their presentation,
+not printed live: USB log flushing can otherwise delay the next frame by
+several milliseconds. Exclusive `loop-work` text is suppressed in this
+window; the joined native/game phases provide the attribution instead.
+Routine runtime-checkpoint tracing and per-frame publication text are also
+disabled in this window. Other log records are retained whole in a 32 KiB
+validation-only buffer; heartbeat flushes wait until measurement ends.
+`tilefinch-timing-log` reports retained bytes, refused records and explicit
+flushes. Require `dropped=0 forced-flushes=0` for a clean timing capture.
+Crash/watchdog records and explicit failure/checkpoint flushes remain enabled;
+such a flush contaminates the timing run rather than being silently hidden.
+`canvas-trace-live` before the start mark restores the former live tracing
+for a same-binary overhead control; `canvas-trace-quiet` restores the default.
+The buffer still formats occasional input diagnostics and uses the log lock,
+so this removes I/O and routine trace work, not every validation instruction.
+Each presentation also has a `tilefinch-canvas-cpu` row with the runtime's
+thread-run microseconds, successful sample-pair count, interrupt/thread
+preemptions and voluntary releases. These are firmware thread counters,
+not instruction-cycle counts. Require `samples` to equal the frame's
+runtime `turns` before interpreting wall-minus-CPU time; a failed firmware
+query is unavailable evidence, not zero CPU work. The two boundary queries
+add measurement overhead. `tilefinch-canvas-raster` separately records
+successful raster CPU sample pairs and per-frame deltas of the fast canvas
+conversion and overlay counters. Require its `samples` to match `slices`;
+conversion and overlays are nested in `render`, not additional frame work.
+The residual also includes fast-path preparation or a non-fast render slice.
+`tilefinch-canvas-copy` records successful CPU accounting for base-frame
+copy/clear, plus the actual byte count. Require `valid=1`; its CPU time is
+nested in `base`, and wall-minus-CPU includes preemption and query overhead.
+It does not cover publication or the vblank wait.
+`tilefinch-canvas-conversion` identifies the last successful fast conversion's
+actual source address/stride, dimensions and kernel/general/reused row counts.
+Require `samples=1` before treating those row counts as a whole-frame account.
+This distinguishes a slow conversion kernel from falling off its fast path.
+Ordinary Allegrex builds use the pixel-exact VFPU color-packing kernel on
+16-byte-aligned rows, retaining the scalar path for other source alignment.
+Validation builds use the same kernel by default. `canvas-vfpu-off` selects
+the scalar kernel in the same binary for an A/B run, and `canvas-vfpu-on`
+restores the VFPU kernel. `canvas-vfpu-check` runs the bounded
+pixel/canary/register/prefix probe outside the timing window: require
+`available=1` and zero pixel and state mismatches. A failed check turns the
+VFPU kernel off (and `canvas-vfpu-on` refuses it) until a later check passes.
+Verify `vfpu` row counts in the conversion records: for an aligned 320x180
+canvas using the 3:2 fast path, require 180 VFPU rows per applicable
+single-conversion frame.
+
+The base-frame copy follows the same rule. Validation builds copy with the
+VFPU on its owner thread, as shipping builds do. `copy-vfpu-off` selects the
+scalar copy and `copy-vfpu-on` restores the VFPU copy. `copy-vfpu-check`
+compares every VFPU copy against the scalar copy and turns the VFPU copy off at
+the first mismatch. `copy-vfpu-stat` prints `tilefinch-copy-vfpu: copies=
+checks= errors=`.
+Both retain the canonical RAM
+frame and back-buffer-only publication. Ordinary builds contain neither the
+probe nor these controls. This saves about 0.28-0.30 ms of conversion CPU in
+three same-binary device pairs; it does not eliminate gameplay deadline misses.
+For intrusive audio attribution, mark `canvas-audio-on` before
+`webgl-measure-start` (`canvas-audio-off` is the default). Each
+`tilefinch-canvas-audio` row records calls and inclusive boundary time for one
+native command. This includes argument collection and service, not the
+JavaScript graph/scheduling work surrounding it. Reentrant native calls belong
+to their outer boundary and are reported as `nested`; do not double-count.
+These per-call clocks deliberately add overhead. Use a clocks-off control
+for deadline incidence, and compare composition only in the intrusive lane.
+Do not charge preempted wall time to the JavaScript or conversion phase
+that happened to span it.
+
+Audio CPU overlapping a runtime turn is not the cost of one output block.
+For block accounting, use `audio-mix-start` / `audio-mix-stat` outside the
+start/end measurement marks. `tilefinch-audio-block` reports completed
+512-sample blocks, mixing and output-submission thread CPU separately,
+maximum block CPU, firmware-query overhead, failed samples and dropped
+records. Work rows partition actual voice-samples into silent/audible and
+constant/automated; fast-forwarded samples are a subset of silent samples.
+The CPU histogram uses 100 us bins (the last includes overflow). These
+intrusive counters are off by default and absent from ordinary builds.
+Do not subtract the entire observer duration from either CPU interval.
+`tilefinch-audio-block-records` reports the bounded record count and overflow;
+each `tilefinch-audio-block-record` retains before/after brackets for the three
+CPU queries, absolute audio-thread CPU counters, output sample position, work
+counts, and the actual firmware output result. Join these to frame timestamps,
+report blocks crossing boundaries separately, and never charge the entire CPU
+of a crossing block to both frames. Overflow, unavailable clocks, or dropped
+records invalidates detailed attribution. Records are flushed after measurement,
+not while the mixer runs. No individual sample has a timing query.
+
+`tilefinch-canvas-webgl` copies existing translator counters at runtime batch
+boundaries without sorting samples. It splits command wall time into decode,
+cache, vertex, state, emission, AA, writeback and finalization, with draw/vertex/
+cache/state/list counts. Matrix and tint clocks are nested inside vertex work;
+native WebGL is nested inside runtime/microtask work. These are wall clocks,
+not owner CPU, and may include audio preemption. `invalid` must be zero.
+
+`audio-mix-probe` runs outside gameplay with no hardware output. It compares
+each PCM block and every voice state on a fixed four-voice command corpus,
+then alternates reference/optimized mixing six times with work counters off.
+Setup, command scheduling and PCM comparison are outside the timed mixer
+intervals. `audio-mix-off` / `audio-mix-on` select the same-binary paths;
+ordinary builds contain no switch. Record corpus CPU per block separately
+from gameplay deadline incidence, and require zero PCM/state mismatches.
+
+`audio-const-probe` isolates constant-state block specialization from silent
+oscillator fast-forwarding: the latter stays enabled for both variants.
+It uses the same per-block PCM and complete voice-state checks, then six
+alternating 256-block runs with work counters disabled. `audio-const-off` /
+`audio-const-on` select that specialization in validation builds (on by
+default, as shipped); ordinary builds use it without a switch. Admission excludes blocks
+containing starts, stops, unfinished automation or nonlooping completion.
+Looping-buffer wrap, voice order, integer rounding and final clipping remain
+unchanged. A corpus CPU saving is not a gameplay deadline claim; qualify the
+recorded-frame workload separately, with output muted but mixing active.
+
+`audio-auto-probe` is the same comparison for the native automation path
+(gain and pan curves), and `audio-auto-off` / `audio-auto-on` select that path
+in validation builds.
+
+Presentation and WebGL A/B marks select the same binary's previous path for
+a device comparison. Validation builds start on the shipping path, and
+ordinary builds have no switch:
+
+- `canvas-ge-off` (or `canvas-cpu`) publishes canvas frames through the CPU
+  copy instead of straight from the graphics engine, and `canvas-ge-on`
+  restores GE-direct publication. `canvas-ge-verify` publishes GE-direct
+  while comparing every published frame with the CPU copy.
+  `canvas-ge-stat` prints `tilefinch-canvas-ge:` with presents, refusals,
+  materializations and the verify counts.
+- `webgl-tint-off` gives every colored instance its own vertex slice instead
+  of sharing one per tint, and `webgl-tint-on` restores sharing.
+  `webgl-direct-off` turns off direct geometry draws, and `webgl-direct-on`
+  restores them. `webgl-tint-stat` prints `tilefinch-webgl-tint:` with
+  instances, slices, direct draws and retired geometry.
+
+For intrusive competing-thread attribution, issue `canvas-thread-on` before
+the measurement window (`canvas-thread-off` disables it). Discovery checks
+firmware results and reports the thread inventory, selected slots and omissions;
+at most eight browser, callback/watchdog and USB peers are sampled. A missing
+or retired thread is unavailable, not zero CPU. `tilefinch-canvas-peer-cpu`
+joins each valid peer delta to its presentation ordinal.
+
+The runtime wall timer excludes peer sampling. Owner CPU queries carry matching
+wall bounds: `wall-min`/`wall-max` contain the actual firmware counter interval,
+and `observer` is their uncertainty width. Compute off-CPU time from those
+bounds, not a differently bracketed runtime timer. Peer `span` reports sampling
+duration; `extra` bounds the peer window outside the owner queries. Neither is
+a blanket correction to subtract from off-CPU time. Report the remaining
+unexplained interval and use a clocks-off control for actual deadlines.
+`causal-loops-without-sample` exposes loops that had no retained canvas row.
+The first 64 such loops also emit `tilefinch-canvas-loop-gap`, retaining
+their timer head/due time, fast-followup decision, callback count and wait
+duration. Join those timestamps between consecutive publications to
+distinguish a work overrun from an empty rAF turn followed by an extra wait.
+
+A private instrumented page may publish one preallocated 96-word 32-bit
+typed-array packet as `__tilefinchValidationFrameMetrics`. The native
+observer copies the own data property after publication, without executing
+getters, proxies or JavaScript. Short/detached views are refused. The
+report pairs `tilefinch-canvas-game` with the same presentation ordinal and
+the page's `performance.now()` origin. Packet schema and phase labels
+belong to the capture; reject unknown versions, stale frame IDs or timestamps
+outside the corresponding runtime/publication window. The first 512
+packets are retained in fixed validation-only storage (192 KiB); overflow
+never wraps onto old frames. Records are formatted after measurement,
+not inside the deadline-critical path. `packet-read` reports observer cost.
+
+Always bracket a deeply instrumented capture with clocks-off runs using
+the same binary, pack, seed and real input sequence. Keep gameplay and
+killcam/menu intervals separate. Intrusive phase clocks can turn otherwise
+successful frames into misses: use controls for real lateness and detailed
+packets for work composition, not the intrusive miss rate as product FPS.
+Use fixed-step operation counts to screen host candidates; host microsecond
+timings are not a PSP deadline oracle. A counter-only packet avoids inner
+phase clocks but still costs instrumentation and packet construction, so
+it is not a replacement for the clocks-off control.
+An offline fixture must preserve the qualification query on its original
+source URL; a completed input script without successful setup markers is
+not a valid performance run.
+
+Validate generated marker JavaScript syntax on the host before a device launch,
+and reject a capture if any `tilefinch-input-script-mark-js` row reports `ok=0`.
+Successful script completion or gameplay alone does not prove profiler switches,
+heavy-scene setup, or measurement start/end controls ran. Verify the loaded
+artifact hash after the wrapper's build as well as before it; a rebuild between
+hashing and launch must invalidate the comparison.
+
+For finer game attribution, record cache misses by both goal and completed
+geometry revision (including warm-up), split field initialization from BFS
+traversal, and separate bank-shot arithmetic from exact wall/smoke checks.
+Record audio lookup hits and parameter scheduling spans alongside the native
+command boundaries. Keep an explicit residual for each parent rather than
+assuming a phase name describes everything inside it: the game prelude may
+include sound and particle updates. Observer packing and callback tail costs
+are separate from game phases. Check simulation/work-count identity before
+using an instrumented source, and retain a clocks-off control of that exact
+pack when observer source differs from the ordinary light packet. Never
+subtract differently evolved live-run medians as a precise saved-time estimate.
+For matched gameplay comparisons, record the admitted per-frame simulation
+step, canonical input and time-dependent events, then replay from identical
+initial state and check each frame's simulation result. The same seed and
+physical button script alone do not guarantee identical work when elapsed
+time or rendering cadence changes.
+
+### Native hierarchical game phase records
+
+Validation builds expose `__tilefinchValidationPhase(op, id, ...)` for a
+private instrumented game. This is not a browser API and is absent from
+ordinary PSP builds. Configuration allocates one Budget-owned capture;
+there are no per-frame allocations or log writes. It retains at most 512
+frames, 32 numeric phase IDs, 32 counters and 12 nested scopes. Any overflow,
+invalid clock or unbalanced scope invalidates the entire capture instead of
+discarding inconvenient frames.
+
+Operations are configure (`0`, mode), begin frame (`1`, sequence), enter
+(`2`, phase), leave (`3`, phase), and end frame (`4`, checksum A, checksum B,
+preallocated `Uint32Array` counters). Modes are coarse frame clocks (`1`),
+counters without clock reads (`2`), and hierarchical clocks (`3`). The
+`phase-stat` mark formats records after the measured window. Each timed scope
+reports inclusive wall/owner-thread CPU, exclusive CPU after subtracting its
+children, calls and clock-query uncertainty. Observer durations are reported,
+not subtracted wholesale; uninstrumented and counters-only comparisons are
+still required. Missing native/render phases remain unattributed work, not
+zero-cost work.
+
+Host and validation builds also expose `__tilefinchValidationHashBytes(view,
+byteCount, outputUint32Array)` for intrusive parity checks. It hashes at most
+512 KiB without JS byte loops or intermediate allocations. Hashing and
+`readPixels` belong to a separate correctness run, never a deadline run.
+Require changing rendered output and per-frame parity, not merely matching
+hashes of an unchanged canvas. Record HUD admission and other time-dependent
+decisions when replaying identical work. A host report timeout is not device
+completion; do not restore served assets while a proof is still running.
+On PSP, `__tilefinchValidationRenderHistory(restoreBoolean)` snapshots or
+restores the current realm/canvas's temporal antialiasing matrix for that
+proof. It does not restore EDRAM ownership or an old display epoch. Restore
+CPU staging arrays and separately published HUD/mesh buffers as well: a
+partially rebuilt HUD is not equivalent to its last uploaded buffer. Keep
+these setup/proof operations outside the timed window.
+Hold the simulation at a completed replay until the final check is read;
+otherwise live frames between the completion predicate and the mark can
+invalidate that check. `canvas-stat` dumps the current publication/deadline
+window before the next reset, while `phase-stat` dumps the corresponding
+hierarchical records. Measurement marks follow the current frontend session,
+including an initial navigation committed after the boot handoff.
+
+For an identical-work replay, begin with clocks and detailed counters disabled.
+`phase-select-misses` selects the actually late publication sequence numbers
+through the private game's `fixedSelectFrame` hook after that window. The hook
+may include nearby ordinary controls; it must not evaluate script in a timed
+frame. Enable fine scopes only on those selected sequences. Export recorded
+gameplay/killcam/transition labels through the numeric capture after the window,
+not through a rate-limited console log. Cold geometry initialization is a separate
+category. An empty, disabled game-phase capture is not a timed sample.
+
+`runtime-cpu-on` / `runtime-cpu-off` control a second, batch-only owner-thread
+CPU tree. `tilefinch-canvas-runtime-cpu` reports inclusive/exclusive/call triples
+for advance, event preparation, callback dispatch, jobs, native WebGL and DOM
+refresh. Native WebGL flushes nested inside jobs are children, not extra siblings.
+Game scopes use the same thread clock. Reconcile their exclusive sum plus the
+game remainder with the callback; keep dispatch outside the game explicit.
+Reconcile the native tree with script advance and retain the difference between
+script advance and the outer browser runtime as DOM/layout/damage plus an
+unattributed remainder. Never obtain JavaScript CPU by subtracting WebGL wall
+time. Report bracket uncertainty and matched observer-mode deltas separately.
+
+`audio-work-off` disables per-voice/sample counting while retaining audio block
+CPU clocks; `audio-work-on` enables those counts. Change this switch only outside
+an active audio measurement. A zero counter in clocks-only mode means unmeasured,
+not silent or absent work. `audio-count-probe` alternates counting off/on over
+identical commands, checks exact PCM and subsequent voice state, and prices that
+observer independently of gameplay. For consecutive valid block records, add
+the CPU gap from the previous submission to the next block's beginning to mix
+and output CPU. This full span must reconcile with the block thread clock.
+Bound blocks crossing frame edges rather than charging each full block twice,
+and compare the coverage with independently sampled audio-thread CPU. Native
+audio state is not rewound merely by restoring the game's simulation.
+
+For each genuine missed sequence, compare a nearby ordinary sequence with the
+same mode, live tanks and wave. Report differences in actual candidates, exact
+tests, navigation cells, uploads, glyphs and cache paths alongside exclusive CPU
+differences. Retain ambiguous legacy counters as ambiguous; a combined sound/
+route counter is not evidence of a route search. If a broad unexplained branch
+dominates, split that branch next rather than instrumenting every small helper.
+Detailed-run deadline misses are observer effects until confirmed by the minimal
+run. Audio can also disturb the owner's caches; subtracting its independently
+measured CPU does not account for that secondary effect.
+
+Validation marks `canvas-followup-off` and `canvas-followup-on` compare the
+canvas timer-remainder wait in one binary. Ordinary builds always use the
+wait: after a successful canvas publication, a fast followup whose virtual
+frame timer is not due sleeps only the remainder needed for the next
+admitted clock tick. It does not consume the clock while predicting, catch
+up missed ticks, spin, or alter NEXTFRAME publication and buffer ownership.
+Timers beyond one tick and non-frame timer heads keep the existing policy;
+native menus, navigation and media do not take this canvas shortcut.
+
 ### What script time is made of
 
 "Script" above includes the synchronous host work page script asks for.
@@ -446,6 +847,133 @@ output directory must be new so prior evidence is not overwritten. This is a
 48 MiB/10 MiB JS host-throughput fixture, not a PSP memory or transport test.
 Changing session/request identifiers in the private replay adapter is solely
 fixture normalization; live requests and browser policy must remain unchanged.
+
+#### Fast screening versus hardware confirmation
+
+Use buffered host replay for the inner edit loop: responses are already
+available, page time advances without sleeping, and a batch builds once then
+runs several fresh realms. Set `TILEFINCH_REPLAY_PUMP_US=0` explicitly for this
+throughput mode. Do not combine fixed-wall response delays with thousands of
+accelerated timer ticks: the page can time out before the response is released.
+Keep the fixed-wall replay configuration for the separate PSP confirmation.
+The runner defaults script-split timing off and records an explicit override;
+keep sampling and execution census off for timing, too. Use separate runs for
+attribution rather than comparing a profiled host run with an unprofiled PSP.
+
+Place `work send-begin` **before** the activating click, and `work answer` after
+the reply completes. Add these options to the command above:
+
+```sh
+--window-labels send-begin answer \
+--require-work js.module_compiles=EXPECTED_COUNT \
+--require-work js.module_restores=EXPECTED_COUNT
+```
+
+Replace the expected counts with the captured workload's actual values. Match
+eager/lazy compilation, bootstrap mode, module-cache state and PGO explicitly;
+for eager compilation use `TILEFINCH_JS_LAZY_FUNCTIONS=0`. The manifest records
+process wall time, the buffered command window, executable/core-library hashes,
+QuickJS flags and work-vector differences. Nested runtime/relayout timers are
+not added to the command wall total. Required work counters fail closed;
+non-required differences remain visible and prevent an identical-work claim.
+The actual answer, final pixels, author-error diagnostic (when supplied) and
+zero-owned teardown remain mandatory checks.
+
+Qualified completion-bounded host reply batches took about 1.2–1.6 s per run,
+with 0.38–0.53 s in the activation-through-reply processing window. A same-binary wrapper-reuse A/B
+was flat/worse on both host and PSP, so the fast loop could have rejected that
+candidate without six more full hardware journeys. This is one negative
+calibration case, **not** proof of a universal speed ratio or percentage-gain
+predictor. ARM64/64-bit heap sizes, hardware caches, soft-float, executable
+placement, PSP scanout and real networking differ. Host memory limits in this
+fixture are intentionally larger and do not qualify PSP admission/refusal.
+
+Reject broken or clearly slower candidates on the host; retain the raw result.
+Take promising changes to a matched, sampler-off, same-binary PSP A/B before
+claiming device gains. Accumulate positive and negative calibration cases by
+subsystem; one matching DOM result does not validate interpreter or GE changes.
+Do not repeatedly rebuild/re-baseline the fixed PSP control for host edits.
+
+An existing host or PSP `tilefinch-work:` log can supply an explicit endpoint
+contract instead of copying its counter values into the command line:
+
+```sh
+--reference-log /private/path/reference.log --reference-label answer \
+--match-work js.module_compiles --match-work js.module_restores \
+--match-work dom.mutations --match-work dom.mutation_records
+```
+
+The reference must have one unique endpoint record and each named field must
+be an available integer. Missing/duplicate records, `n/a` and mismatches fail
+before accepting a run; an incomplete reference fails before building. Every
+run records all other endpoint differences as well. These are **cumulative
+counts at completion**, not Send-window deltas or evidence that all executed
+bytecodes match. Keep the reference build/configuration manifest alongside its
+log; the runner records the log hash but cannot infer its hardware provenance.
+Do not silently normalize missing device counters or call a partial match full
+host/PSP equivalence.
+
+Match page preferences as well as the compiler configuration. The runner
+accepts `--content-blocker basic` and `--user-css /private/path/presentation.css`
+and records the blocker mode and stylesheet content hash. For example, a
+device profile using 125% text must not be compared silently with the lab's
+100% default; use the same font-scale and stock cosmetic/consent rules. CSS is
+bounded to 64 KiB. These options retain the lab's existing behavior: its user
+stylesheet is applied after initial load, whereas the PSP frontend installs
+presentation CSS before navigation. They bring reply rendering closer but do
+not qualify initial-load parity. Recheck pointer coordinates after changing
+text scale; a missed Send button must fail completion rather than become an
+apparently fast sample.
+
+For a qualified PSP capture, add `--reference-frame /private/path/answer.ppm`
+and `--match-region X Y W H` to require exact RGB pixels in a shared-page
+region. Identify that region from the real capture and include the visible
+answer, not an empty background; native chrome and its clock may be outside
+it. Missing/truncated/oversized PPMs, out-of-bounds regions and pixel mismatches
+fail closed. The manifest retains the reference image hash, region and region
+hash. This is an additional visual contract, not a substitute for full-reply
+DOM checks or proof of identical VM work. Do not widen exclusions to conceal a
+rendering regression.
+
+Use a three-level loop: short operation-family probes to reject a mechanism,
+the completion-bounded host journey to check real-page effects, then physical
+PSP confirmation only for surviving candidates. Host semantic/bridge work is
+shared with PSP; cache-sensitive VM/code-layout changes, soft-float, memory
+admission and scanout need hardware evidence even when the endpoint contract
+matches. One-time paired calibration is reusable until its source/configuration
+premise changes; it is not a universal seconds-to-seconds conversion.
+
+For a closer completion boundary, replace the post-Send fixed `tick` tail
+with `until MAX-TURNS MS EXPRESSION` in the private lab commands. For example,
+`until 6000 16 document.getElementById('reply').textContent.length > 0`.
+Use the same actual-DOM predicate as the device journey, not a predetermined
+tick count or copied response string. The lab checks before advancing, then
+after each runtime turn, and stops on the first match. The normal command
+tail paints that state. A throwing predicate, missing runtime, or exhausted
+turn cap fails the journey. Bounds are 1–10,000 turns and 0–60,000 ms/turn.
+First nonempty text and complete reply are different milestones in a streamed
+response. Keep a separate full-reply diagnostic; if the experiment measures
+completion, its predicate must wait for the complete expected DOM text or a
+real completion signal. Early pixels need not match a later settled frame.
+Like the device probe, this uses the synchronous diagnostic path without an
+extra microtask checkpoint. Predicate work is still observation overhead;
+keep it small and identical across A/B runs. Timer cadence, memory admission
+and scanout remain separate hardware checks even when reply work matches.
+
+The manifest also records whole-process child CPU time where the host supports
+it (`process_cpu_us`; otherwise null). This includes load and teardown, not just
+the Send window. Compare it alongside process wall time to distinguish host
+scheduling noise from a throughput change; never substitute it for window time
+or for device CPU attribution.
+
+Use this loop as a screening tier: build once, run alternating fresh-realm
+controls/candidates, and require the same answer, pixels and admission counters.
+Retain the settled-work check separately from first/complete reply. Confirm a
+positive result in an independent batch before spending a hardware run. A neutral
+host result does not reject an explicitly PSP-specific cache or soft-float
+hypothesis. Shared engine code and matching output establish functional
+confidence, not a universal ARM64-to-Allegrex timing ratio; physical confirmation
+is still required before promoting a claimed device speedup.
 
 Validation device logs now split pointer (all phases) and submit dispatch into
 handler, promise-checkpoint and document-refresh time. Timed checkpoint records
@@ -657,6 +1185,10 @@ same emulated time on every run. `--measure` accepts a scenario with no golden
 (one that exists is still enforced). Both exist for the
 [performance journeys](PERF_JOURNEYS.md).
 
+`--record-video DIR` dumps the run's presented frames (lossless FFV1 AVI at
+480x272) and audio into `DIR` for `scripts/analyze-game-video.py`; see
+[Treadline visual QA](../DEVELOPMENT.md#treadline-visual-qa-camera-track-and-recorded-gameplay).
+
 Use `--debug-log` when the question is which PSP call PPSSPP accepted or
 rejected. The wrapper launches PPSSPP through the macOS-safe path described in
 `AGENTS.md`.
@@ -799,6 +1331,14 @@ Outcomes are:
 
 ## Adding coverage
 
+PSP validation realms expose `__tilefinchValidationThreadCpuUs()` for two
+samples around a bounded, isolated kernel. It returns the firmware thread's
+microsecond run counter, not CPU cycles, and throws if the firmware query
+fails. It is absent from ordinary and host builds. Keep such sampling outside
+frame timing, and collect operation counts separately: counter writes can
+disproportionately penalize the reference implementation. Restore any mutable
+game state used by an identical-input replay before resuming gameplay.
+
 Prefer one focused script over extending the hermetic menu tour with network or
 persistent-state prerequisites. Useful independent panels include:
 
@@ -823,12 +1363,23 @@ library layout used on-device:
 scripts/run-ppsspp-input-script.sh \
   --script treadline-offline-controls \
   --offline-library build-preset-psp-validation/offline \
-  --heap-mb 7 --script-file-kb 384
+  --heap-mb 7 --script-file-kb 512
 ```
 
 The optional directory is copied into the run's disposable Memory Stick. It
 must contain `library.bin` and the referenced payload files; the runner never
 falls back to the network to manufacture a missing installed app.
+
+`treadline-menu-focus-probe.txt` takes the same installed-package route to
+check D-pad focus geometry in the menus: from the title it moves to Quick
+Match, down through the setup screen's bottom row and back up to Deploy,
+then deploys with Cross. Its marks (`deploy-focus`, `bottom-code-focus`,
+`deploy-return-focus`, `deploy-result`) and its device golden
+(`treadline-menu-focus-probe.device-golden.txt`) record that every move
+lands where a person expects; run it with the same `--offline-library`
+options as above. Menu focus timing has its own, longer scripted loop
+(PERFORMANCE_LEDGER.md, "Focus moves and small updates over live
+canvases").
 
 Every new scenario must bound each wait, state whether its evidence is
 hermetic or external, and identify the receiver output that proves success.

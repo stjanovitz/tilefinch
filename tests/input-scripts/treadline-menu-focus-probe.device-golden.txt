@@ -1,22 +1,23 @@
 tilefinch-input-script: text-entry=danzeff
-tilefinch-input-script: armed script=input-script.txt steps=22 stall-limit=1800
+tilefinch-input-script: armed script=input-script.txt steps=25 stall-limit=1800
 tilefinch-input-script: step=2 action=show-offline setting=none screen=collections list=0 tab=0
 tilefinch-input-script: step=5 action=collection-activate setting=none screen=page list=1 tab=0
 tilefinch-input-script: step=7 action=focus-down setting=none screen=page list=0 tab=0
-tilefinch-input-script: step=9 action=focus-right setting=none screen=page list=0 tab=0
-tilefinch-input-script: step=11 action=focus-right setting=none screen=page list=0 tab=0
-tilefinch-input-script: mark=bottom-code-focus step=14 screen=page
-tilefinch-input-script: step=14 action=focus-up setting=none screen=page list=0 tab=0
-tilefinch-input-script: mark=deploy-return-focus step=17 screen=page
-tilefinch-input-script: step=17 action=activate setting=none screen=page list=0 tab=0
-tilefinch-input-script: mark=deploy-result step=20 screen=page
+tilefinch-input-script: step=9 action=activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=deploy-focus step=12 screen=page
+tilefinch-input-script: step=12 action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=14 action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=bottom-code-focus step=17 screen=page
+tilefinch-input-script: step=17 action=focus-up setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=deploy-return-focus step=20 screen=page
+tilefinch-input-script: step=20 action=activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=deploy-result step=23 screen=page
 tilefinch-input-script: covered action=focus-up count=1
-tilefinch-input-script: covered action=focus-down count=1
-tilefinch-input-script: covered action=focus-right count=2
-tilefinch-input-script: covered action=activate count=1
+tilefinch-input-script: covered action=focus-down count=3
+tilefinch-input-script: covered action=activate count=2
 tilefinch-input-script: covered action=show-offline count=1
 tilefinch-input-script: covered action=collection-activate count=1
-tilefinch-input-script: outcome=complete steps=21/22 frames=567 held-frames=12 actions=6 settings=0
+tilefinch-input-script: outcome=complete steps=24/25 frames=630 held-frames=13 actions=5 settings=0
+tilefinch-input-script: capture=deploy-focus written=1 size=240x136
 tilefinch-input-script: capture=bottom-code-focus written=1 size=240x136
 tilefinch-input-script: capture=deploy-return-focus written=1 size=240x136
-tilefinch-input-script: capture=deploy-result written=1 size=240x136

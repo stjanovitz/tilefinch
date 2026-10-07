@@ -24,10 +24,12 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/script_lazy.h"
 
 #define JS_BENCH_LINE_MAX 320
 #define JS_BENCH_TRACE_RECORDS_MAX 4096
 #define JS_BENCH_TRACE_BODY_MAX (4u * 1024u * 1024u)
+#define JS_BENCH_SELECTION_MAX 512u
 
 typedef enum {
     JS_BENCH_ALLOC_POOL,
@@ -380,6 +382,52 @@ static int js_bench_selected(const JsBenchOptions *options, const char *name)
         only = end + 1;
     }
     return 0;
+}
+
+static int js_bench_selection_name(const char *text, size_t length,
+                                    const char *name)
+{
+    return strlen(name) == length && memcmp(text, name, length) == 0;
+}
+
+/* Refuse the whole filter before running anything. Otherwise a typo can
+   produce a successful empty timing, or silently omit part of an A/B. */
+static int js_bench_selection_valid(const JsBenchOptions *options)
+{
+    const char *text = options->only;
+    if (text == NULL || text[0] == '\0') return 1;
+    size_t length = 0;
+    while (length <= JS_BENCH_SELECTION_MAX && text[length] != '\0')
+        length++;
+    if (length > JS_BENCH_SELECTION_MAX) return 0;
+    size_t start = 0;
+    for (size_t end = 0; end <= length; end++) {
+        if (end != length && text[end] != ',') continue;
+        size_t span = end - start;
+        if (span == 0) return 0;
+        int known = 0;
+        for (size_t at = 0; at < JS_BENCH_KERNEL_COUNT; at++) {
+            if (js_bench_selection_name(text + start, span,
+                                        js_bench_kernels[at].name)) {
+                known = 1;
+                break;
+            }
+        }
+        if (!known)
+            known = js_bench_selection_name(text + start, span, "poll")
+                || js_bench_selection_name(text + start, span, "gc")
+                || js_bench_selection_name(text + start, span,
+                                           "compile_synthetic");
+        if (!known && (js_bench_selection_name(text + start, span,
+                                                "compile_trace")
+                       || js_bench_selection_name(text + start, span,
+                                                  "compile_peak")))
+            known = options->trace_dir != NULL
+                && options->trace_dir[0] != '\0';
+        if (!known) return 0;
+        start = end + 1u;
+    }
+    return 1;
 }
 
 static uint64_t js_bench_iterations(const JsBenchOptions *options,
@@ -746,6 +794,220 @@ static void js_bench_run_compile_trace(JsBenchSession *session,
     if (files == 0) session->failed++;
 }
 
+/* 1 when `source` must compile as a module (it is not a valid classic
+   script: import/export or top-level await), 0 for a classic script, as the
+   browser loads nearly every bundle. Classified on a throwaway runtime so
+   the failed attempt does not raise the measured runtime's high-water
+   marks. */
+static int js_bench_source_is_module(const char *name, const char *source,
+                                     size_t length, size_t memory_limit)
+{
+    JsBenchRuntime probe;
+    int module = 0;
+    if (js_bench_runtime_open(&probe, JS_BENCH_ALLOC_POOL, memory_limit)
+        != 0) {
+        js_bench_runtime_close(&probe);
+        return -1;
+    }
+    JSValue value = JS_Eval(probe.context, source, length, name,
+                            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(probe.context);
+        JSValue name_value = JS_GetPropertyStr(probe.context, exception,
+                                               "name");
+        const char *kind = JS_ToCString(probe.context, name_value);
+        module = kind != NULL && strcmp(kind, "SyntaxError") == 0;
+        if (kind != NULL) JS_FreeCString(probe.context, kind);
+        JS_FreeValue(probe.context, name_value);
+        JS_FreeValue(probe.context, exception);
+    }
+    JS_FreeValue(probe.context, value);
+    js_bench_runtime_close(&probe);
+    return module;
+}
+
+/* Compiles `source` once on a fresh pool runtime configured like a page
+   realm and reports its high-water marks over the empty context. */
+typedef struct {
+    int ok;
+    uint64_t us;
+    size_t js_peak, js_retained, budget_peak, budget_retained;
+    unsigned long long deferred, deferred_bytes;
+} JsBenchCompilePeak;
+
+static int js_bench_measure_compile(const char *name, const char *source,
+                                    size_t length, int module,
+                                    uint32_t lazy_threshold,
+                                    size_t memory_limit,
+                                    JsBenchCompilePeak *out)
+{
+    JsBenchRuntime bench;
+    memset(out, 0, sizeof *out);
+    if (js_bench_runtime_open(&bench, JS_BENCH_ALLOC_POOL, memory_limit)
+        != 0) {
+        js_bench_runtime_close(&bench);
+        return -1;
+    }
+    JS_SetLazyFunctionThreshold(bench.runtime, (unsigned) lazy_threshold);
+    JS_SetLazyFunctionPreparse(bench.runtime, 1);
+    JS_SetStripInfo(bench.runtime,
+                    module && length >= 8u * 1024u ? JS_STRIP_SOURCE : 0);
+    JS_RunGC(bench.runtime);
+    size_t budget_base = bench.budget.current;
+    size_t js_base = budget_quickjs_pool_js_malloc_current(bench.pool);
+    size_t budget_peak_before = bench.budget.peak;
+    size_t js_peak_before = budget_quickjs_pool_js_malloc_peak(bench.pool);
+    uint64_t started_ns = js_bench_now_ns();
+    JSValue value = JS_Eval(bench.context, source, length, name,
+                            (module ? JS_EVAL_TYPE_MODULE
+                                    : JS_EVAL_TYPE_GLOBAL)
+                                | JS_EVAL_FLAG_COMPILE_ONLY);
+    out->us = (js_bench_now_ns() - started_ns) / 1000u;
+    out->ok = !JS_IsException(value);
+    size_t budget_peak = bench.budget.peak > budget_peak_before
+        ? bench.budget.peak : budget_peak_before;
+    size_t js_peak = budget_quickjs_pool_js_malloc_peak(bench.pool);
+    if (js_peak < js_peak_before) js_peak = js_peak_before;
+    out->js_peak = js_peak - js_base;
+    out->budget_peak = budget_peak - budget_base;
+    out->js_retained =
+        budget_quickjs_pool_js_malloc_current(bench.pool) - js_base;
+    out->budget_retained = bench.budget.current - budget_base;
+    JSLazyFunctionStats lazy;
+    JS_GetLazyFunctionStats(bench.runtime, &lazy);
+    out->deferred = (unsigned long long) lazy.deferred;
+    out->deferred_bytes = (unsigned long long) lazy.deferred_source_bytes;
+    JS_FreeValue(bench.context, value);
+    js_bench_runtime_close(&bench);
+    return 0;
+}
+
+/* The compile working set of every JavaScript record of a trace, for the
+   script admission model (docs/engineering/MEMORY_EXPERIMENTS.md, "Script
+   admission by compile working set"). Each record compiles once on its own
+   fresh pool runtime, the way the browser compiles a page script (lazy
+   function threshold and preparsing on, modules of 8 KiB or more with
+   their source stripped), so the pool's and the Budget's high-water marks
+   belong to that one compile. Reported per record: the transient peak over
+   the empty context (js-peak, budget-peak) and what stays after the compile
+   with the compiled function still held (js-retained, budget-retained). */
+static void js_bench_run_compile_peak(JsBenchSession *session,
+                                      uint32_t lazy_threshold)
+{
+    const char *dir = session->options->trace_dir;
+    char path[512];
+    unsigned files = 0, failures = 0;
+    for (unsigned index = 0; index < JS_BENCH_TRACE_RECORDS_MAX; index++) {
+        (void) snprintf(path, sizeof path, "%s/%04u.meta", dir, index);
+        int javascript = js_bench_meta_is_javascript(path);
+        if (javascript < 0) break;
+        if (!javascript) continue;
+        (void) snprintf(path, sizeof path, "%s/%04u.body", dir, index);
+        size_t length = 0;
+        char *source = js_bench_read_file(path, &length);
+        if (source == NULL || length == 0) {
+            free(source);
+            continue;
+        }
+        char name[32];
+        (void) snprintf(name, sizeof name, "%04u.js", index);
+        int module = js_bench_source_is_module(
+            name, source, length, session->options->memory_limit);
+        JsBenchCompilePeak whole;
+        if (module < 0
+            || js_bench_measure_compile(name, source, length, module,
+                                        lazy_threshold,
+                                        session->options->memory_limit,
+                                        &whole) != 0) {
+            free(source);
+            failures++;
+            continue;
+        }
+        if (whole.ok) files++; else failures++;
+        js_bench_emitf(session,
+                       "tilefinch-js-bench: kernel=compile_peak file=%s "
+                       "kind=%s ok=%d bytes=%zu us=%llu js-peak=%zu "
+                       "js-retained=%zu budget-peak=%zu budget-retained=%zu "
+                       "deferred=%llu deferred-bytes=%llu",
+                       name, module ? "module" : "classic", whole.ok, length,
+                       (unsigned long long) whole.us, whole.js_peak,
+                       whole.js_retained, whole.budget_peak,
+                       whole.budget_retained, whole.deferred,
+                       whole.deferred_bytes);
+        /* A bundle the browser splits (a Webpack factory table or a
+           resource-loader statement sequence) compiles one unit at a time;
+           its working set is the largest unit's. */
+        Budget plan_budget;
+        budget_init(&plan_budget, 64u * 1024u * 1024u);
+        ScriptLazyWebpackPlan webpack;
+        ScriptResourceLoaderPlan loader;
+        memset(&webpack, 0, sizeof webpack);
+        memset(&loader, 0, sizeof loader);
+        const char *unit_kind = NULL;
+        size_t units = 0, unit_offset = 0, unit_length = 0, unit_bytes = 0;
+        if (!module && script_lazy_webpack_plan_create(
+                &plan_budget, source, length, &webpack)) {
+            unit_kind = "webpack";
+            units = webpack.factory_count;
+            unit_bytes = webpack.factory_source_bytes;
+            for (size_t at = 0; at < webpack.factory_count; at++) {
+                if (webpack.factories[at].source_length > unit_length) {
+                    unit_length = webpack.factories[at].source_length;
+                    unit_offset = webpack.factories[at].source_offset;
+                }
+            }
+        } else if (!module && script_resource_loader_plan_create(
+                       &plan_budget, source, length, &loader)) {
+            unit_kind = "loader";
+            units = loader.statement_count;
+            unit_bytes = loader.statement_source_bytes;
+            for (size_t at = 0; at < loader.statement_count; at++) {
+                if (loader.statements[at].source_length > unit_length) {
+                    unit_length = loader.statements[at].source_length;
+                    unit_offset = loader.statements[at].source_offset;
+                }
+            }
+        }
+        if (unit_kind != NULL && unit_length != 0) {
+            /* A factory compiles as a parenthesized function expression;
+               a loader statement as itself. */
+            int wrap = strcmp(unit_kind, "webpack") == 0;
+            char *unit = malloc(unit_length + 3u);
+            if (unit != NULL) {
+                size_t at = 0;
+                if (wrap) unit[at++] = '(';
+                memcpy(unit + at, source + unit_offset, unit_length);
+                at += unit_length;
+                if (wrap) unit[at++] = ')';
+                unit[at] = '\0';
+                JsBenchCompilePeak largest;
+                if (js_bench_measure_compile(name, unit, at, 0,
+                                             lazy_threshold,
+                                             session->options->memory_limit,
+                                             &largest) == 0) {
+                    js_bench_emitf(session,
+                                   "tilefinch-js-bench: kernel=compile_unit "
+                                   "file=%s unit=%s units=%zu unit-bytes=%zu "
+                                   "largest=%zu ok=%d us=%llu js-peak=%zu "
+                                   "budget-peak=%zu",
+                                   name, unit_kind, units, unit_bytes, at,
+                                   largest.ok,
+                                   (unsigned long long) largest.us,
+                                   largest.js_peak, largest.budget_peak);
+                }
+                free(unit);
+            }
+        }
+        script_lazy_webpack_plan_destroy(&webpack);
+        script_resource_loader_plan_destroy(&loader);
+        free(source);
+    }
+    js_bench_emitf(session,
+                   "tilefinch-js-bench: kernel=compile_peak_summary files=%u "
+                   "failed=%u", files, failures);
+    if (files == 0) session->failed++;
+}
+
 void js_bench_default_options(JsBenchOptions *options)
 {
     memset(options, 0, sizeof *options);
@@ -773,6 +1035,10 @@ int js_bench_run(const JsBenchOptions *options, JsBenchEmit emit,
     if (effective.only != NULL)
         js_bench_emitf(&session, "tilefinch-js-bench: selected=%s",
                        effective.only);
+    if (!js_bench_selection_valid(&effective)) {
+        js_bench_emitf(&session, "tilefinch-js-bench: error=\"selection\"");
+        return 1;
+    }
 
     /* Pass 1: every kernel on the production allocator. */
     if (js_bench_runtime_open(&bench, JS_BENCH_ALLOC_POOL,
@@ -809,6 +1075,11 @@ int js_bench_run(const JsBenchOptions *options, JsBenchEmit emit,
         && js_bench_selected(&effective, "compile_trace"))
         js_bench_run_compile_trace(&session, &bench, effective.lazy_threshold);
     js_bench_runtime_close(&bench);
+    /* Opens its own runtime per record, so only on explicit request. */
+    if (effective.trace_dir != NULL && effective.trace_dir[0] != '\0'
+        && effective.only != NULL
+        && js_bench_selected(&effective, "compile_peak"))
+        js_bench_run_compile_peak(&session, effective.lazy_threshold);
 
     /* Pass 2: the allocation-bound kernels on the default allocator. */
     if (js_bench_runtime_open(&bench, JS_BENCH_ALLOC_MALLOC,

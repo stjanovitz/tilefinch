@@ -889,6 +889,9 @@ static bool test_new_pack_store_lifecycle(void)
     return true;
 }
 
+#include "suites/glyph_pack_offer.inc"
+#include "suites/glyph_session_reattach.inc"
+
 typedef struct {
     TilefinchGlyphInstallFaultPoint point;
     bool fired;
@@ -1050,6 +1053,12 @@ static bool test_phase_aware_install_faults(void)
 
 int main(void)
 {
+    /* Before any test installs an optional provider: the offer checks
+       the embedded faces alone. */
+    if (!test_glyph_offer_detection()) return 1;
+    if (!test_glyph_offer_session_memory()) return 1;
+    if (!test_glyph_offer_decline_persists()) return 1;
+    if (!test_glyph_session_install_reattaches()) return 1;
     if (!test_pack_catalog()) return 1;
     if (!test_bounded_pack_provider()) return 1;
     if (!test_new_pack_store_lifecycle()) return 1;

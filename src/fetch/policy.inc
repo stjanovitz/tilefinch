@@ -374,9 +374,9 @@ static bool fetch_request_target_allowed_with_session(
         && browser_session_captive_portal_url_allowed(
             session, target_url);
     if (page != NULL && request->content_security_policy != NULL
-        && !tilefinch_csp_allows_request(
+        && !tilefinch_csp_allows_request_granted(
                request->content_security_policy, page->destination,
-               target_url)) return false;
+               target_url, page->csp_grant)) return false;
     /* Portal authority relaxes only mixed-content/PNA policy. It must not
        bypass the portal document's own CSP. Initial user navigation is still
        admitted far enough for the resolved-peer PNA guard to provide its
@@ -859,6 +859,11 @@ void fetch_set_blocked_origins(const char *const *hosts, size_t count)
     }
 }
 
+/* An entry is a host ("mdnplay.dev": that host and its subdomains) or a
+   host followed by a path prefix ("developer.mozilla.org/pong/": only URLs
+   on that host whose path starts with the prefix). The route form excludes
+   one first-party endpoint, such as an ad placement, without excluding the
+   rest of its origin. */
 bool fetch_origin_blocked(const char *url)
 {
     if (fetch_blocked_origin_count == 0 || url == NULL) return false;
@@ -867,9 +872,23 @@ bool fetch_origin_blocked(const char *url)
     const char *host = strstr(origin, "://");
     host = host == NULL ? origin : host + 3;
     size_t host_length = strcspn(host, ":");
+    TilefinchUrl parsed;
+    bool have_path = false;
     for (size_t i = 0; i < fetch_blocked_origin_count; i++) {
         const char *entry = fetch_blocked_origins[i];
-        if (tilefinch_host_within(host, host_length, entry, strlen(entry)))
+        const char *path = strchr(entry, '/');
+        size_t entry_host_length = path == NULL
+            ? strlen(entry) : (size_t) (path - entry);
+        if (!tilefinch_host_within(host, host_length, entry,
+                                   entry_host_length)) continue;
+        if (path == NULL) return true;
+        if (!have_path) {
+            if (!tilefinch_url_parse(url, &parsed)) return false;
+            have_path = true;
+        }
+        size_t prefix_length = strlen(path);
+        if (parsed.path_length >= prefix_length
+            && memcmp(url + parsed.path_offset, path, prefix_length) == 0)
             return true;
     }
     return false;

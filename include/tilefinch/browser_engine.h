@@ -18,14 +18,68 @@
 
 #define BROWSER_ENGINE_PROFILE_NAME_LIMIT 32
 #define BROWSER_ENGINE_PATH_LIMIT 512
+/* The device profile's recommended page budget, browser_config_init's
+   default for embedders; the PSP app runs BROWSER_PSP_APP_MEMORY_LIMIT_MB. */
+#define BROWSER_PSP_RECOMMENDED_CONTENT_LIMIT (24u * 1024u * 1024u)
 #define BROWSER_PSP_STRICT_CONTENT_LIMIT (16u * 1024u * 1024u)
-#define BROWSER_PSP_REALISTIC_CONTENT_LIMIT (24u * 1024u * 1024u)
 #define BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE (8u * 1024u * 1024u)
+/* The strict profile's installed-app QuickJS heap floor (the app's is
+   BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB; see docs/GAME_PROFILE.md, "Target
+   and budgets", for the measurement behind them). */
+#define BROWSER_PSP_STRICT_INSTALLED_APP_HEAP (6u * 1024u * 1024u)
 /* Default module bytecode ceilings (BrowserConfig.module_bytecode_cache_limit).
    See docs/engineering/MEMORY_EXPERIMENTS.md for the measurement. */
 #define BROWSER_MODULE_BYTECODE_CACHE_BYTES (1024u * 1024u)
 #define BROWSER_MODULE_BYTECODE_CACHE_STRICT_BYTES (512u * 1024u)
+/* The default classic-script bytecode ceilings
+   (BrowserConfig.classic_bytecode_cache_limit) are in session.h, whose
+   browser_session_init applies the same default. */
 
+/* The PSP application's page configuration: the defaults of its boot.cfg
+   (src/psp_boot_config.c) and the fixed limits it gives the engine
+   (browser_config_apply_psp_app_defaults). This is the one source of truth
+   for the PSP app, the host lab's `--psp-profile realistic` and the
+   embedder's BROWSER_PSP_MEMORY_REALISTIC, so a lab replay admits what the
+   device admits. Page and voice work share the whole 32 MiB envelope. */
+#define BROWSER_PSP_APP_MEMORY_LIMIT_MB 32u
+#define BROWSER_PSP_APP_SCRIPT_HEAP_MB 5u
+#define BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB 9u
+/* QuickJS boot allowance above the heap, returned after the post-boot
+   collection (TILEFINCH_JS_BOOT_WINDOW_KB). */
+#define BROWSER_PSP_APP_SCRIPT_BOOT_WINDOW_KB 4096u
+/* Sanity ceilings on page source, not size policy: a script is admitted
+   when its compile working set fits the realm's heap and growth while the
+   presentation reserve stays free (include/tilefinch/script_admission.h).
+   boot.cfg's file_kb can move the per-script ceiling; the realm clamps it
+   at SCRIPT_REALM_MAXIMUM_FILE_BYTES (8 MiB). */
+#define BROWSER_PSP_APP_SCRIPT_TOTAL_MB 16u
+#define BROWSER_PSP_APP_SCRIPT_FILE_KB 4096u
+#define BROWSER_PSP_APP_SCRIPT_COUNT 256u
+#define BROWSER_PSP_APP_SCRIPT_TIMEOUT_MS 60000u
+#define BROWSER_PSP_APP_GC_GROWTH_PERCENT 150u
+#define BROWSER_PSP_APP_JS_ARRAY_CAP_KB 4096u
+#define BROWSER_PSP_APP_HISTORY_CAPACITY 4u
+/* Installed games can retain source plus a source-bound, one-launch
+   compiler accelerator; Treadline's 603 KiB cold working set fits. */
+#define BROWSER_PSP_APP_SESSION_CACHE_BYTES (640u * 1024u)
+/* The runaway-response guard, not a page-size policy (a watch page's HTML
+   can approach 2 MiB). */
+#define BROWSER_PSP_APP_DOCUMENT_BYTES (8u * 1024u * 1024u)
+/* A page navigation's whole deadline, and each script and subresource
+   request's. */
+#define BROWSER_PSP_APP_NAVIGATION_TIMEOUT_MS 30000L
+#define BROWSER_PSP_APP_NETWORK_TIMEOUT_MS 15000L
+#define BROWSER_PSP_APP_STYLESHEETS 24u
+#define BROWSER_PSP_APP_STYLESHEET_BYTES (2112u * 1024u)
+#define BROWSER_PSP_APP_STYLESHEET_FILE_BYTES (768u * 1024u)
+#define BROWSER_PSP_APP_IMAGES 24u
+#define BROWSER_PSP_APP_IMAGE_BYTES (1536u * 1024u)
+#define BROWSER_PSP_APP_IMAGE_FILE_BYTES (512u * 1024u)
+#define BROWSER_PSP_APP_DECODED_IMAGE_BYTES (3u * 1024u * 1024u)
+
+/* STRICT is an engineering pressure profile (16 MiB page, 4 MiB heap, 1 MiB
+   of script source); REALISTIC is the PSP app's own configuration
+   (browser_config_apply_psp_app_defaults). */
 typedef enum {
     BROWSER_PSP_MEMORY_STRICT = 0,
     BROWSER_PSP_MEMORY_REALISTIC
@@ -45,8 +99,15 @@ typedef struct {
 typedef struct {
     bool enabled;
     bool document_scripts_enabled;
+    /* Trusted, native-by-default selection copied into new navigation realms.
+       This does not switch the backend of an already-created runtime. */
+    bool game_audio_internal_slots;
     ScriptExecutionPolicy execution_policy;
     size_t heap_limit;
+    /* QuickJS heap floor for an installed app launched from the offline
+       library (0: same as heap_limit). It is carved from memory_limit like
+       every other heap, and applies only to that app's top-level realm. */
+    size_t installed_app_heap_limit;
     unsigned runtime_timeout_ms;
     size_t maximum_scripts;
     size_t maximum_total_bytes;
@@ -116,11 +177,17 @@ typedef struct {
        hits them where the small response cache holds almost none of its
        modules. Charged to the same page Budget and reclaimed with it. */
     size_t module_bytecode_cache_limit;
-    /* Optional persistent module bytecode directory (empty: off, the
-       default) and whether this engine may write to it; see
-       browser_session_module_bytecode_set_disk. */
-    char module_bytecode_disk_dir[160];
-    bool module_bytecode_disk_write;
+    /* In-memory classic external-script bytecode, the same way (zero
+       disables). It used to hang off HTTP response entries and was evicted
+       with them, which left almost nothing for a revisit. */
+    size_t classic_bytecode_cache_limit;
+    /* Optional persistent compiled-script directory (empty: off, the
+       default), whether this engine writes to it, and its size ceiling
+       (zero: BROWSER_SCRIPT_DISK_DEFAULT_BYTES); see
+       browser_session_script_disk_configure. */
+    char script_cache_dir[BROWSER_SCRIPT_DISK_DIRECTORY_LIMIT];
+    bool script_cache_write;
+    size_t script_cache_limit;
     size_t maximum_document_bytes;
     long navigation_timeout_ms;
     NavigationReplacementMode navigation_replacement_mode;
@@ -310,6 +377,8 @@ typedef struct {
     uint64_t provisional_reach_us;
     size_t transform_slices;
     size_t transform_quota_overruns;
+    /* See YoutubeLiteLoadMetrics: the largest transform slice in bytes. */
+    size_t maximum_transform_slice_bytes;
     size_t irreducible_unit_overruns;
 } BrowserNavigationJobMetrics;
 
@@ -333,6 +402,9 @@ void browser_config_init(BrowserConfig *config,
                          const BrowserDeviceProfile *profile);
 bool browser_config_apply_psp_memory_profile(
     BrowserConfig *config, BrowserPspMemoryProfile profile);
+/* The BROWSER_PSP_APP_* configuration with the realistic execution policy.
+   Callers apply boot-time overrides (and fonts) afterwards. */
+bool browser_config_apply_psp_app_defaults(BrowserConfig *config);
 bool browser_config_set_font_paths(
     BrowserConfig *config, const char *sans_path, const char *serif_path,
     const char *sans_italic_path, const char *sans_bold_path,
@@ -359,6 +431,10 @@ void browser_engine_destroy(BrowserEngine *engine);
 const BrowserConfig *browser_engine_config(const BrowserEngine *engine);
 /* Changes the global author-script policy for subsequent navigations. The
    frontend reloads the active page after changing it. */
+/* Arm (or disarm) the installed-app heap floor for the next top-level
+   realm. Callers arm immediately before committing an offline app's
+   document and disarm right after, so the floor can only reach that app. */
+void browser_engine_arm_installed_app_heap(BrowserEngine *engine, bool armed);
 bool browser_engine_set_javascript_enabled(
     BrowserEngine *engine, bool enabled);
 const char *browser_engine_last_error(const BrowserEngine *engine);
@@ -421,6 +497,29 @@ bool browser_engine_navigation_pending(const BrowserEngine *engine);
 /* While a navigation loads: parser-blocking JavaScript time spent against
    its stage allowance (a running turn included). Pages that exhaust it keep
    their server content but lose JavaScript, so frontends can show it. */
+/* Heavy pages (include/tilefinch/script_admission.h, js_runtime.h). The
+   policy applies to the next page realm and to the current one. The state
+   is the committed page's; false without a live page realm. Answering runs
+   or refuses the big scripts that wait; stopping retires the page's
+   realms, keeping its DOM, as a script that ran out of memory does, so the
+   Basic view fallback treats the page as degraded. */
+void browser_engine_set_heavy_page_policy(BrowserEngine *engine,
+                                          ScriptHeavyPolicy policy);
+/* A per-site policy: when set, each new page realm takes the resolver's
+   answer for its top-level URL instead of the policy above, so a site's
+   remembered choice holds from its first script and never carries over to
+   the next site. NULL goes back to the policy above. */
+void browser_engine_set_heavy_page_resolver(
+    BrowserEngine *engine, ScriptHeavyPolicyResolver resolver, void *opaque);
+bool browser_engine_heavy_page(BrowserEngine *engine,
+                               ScriptHeavyState *state);
+bool browser_engine_answer_heavy_page(BrowserEngine *engine, bool run);
+bool browser_engine_stop_page_scripts(BrowserEngine *engine);
+/* True once the committed page's realm ran out of memory, took the
+   server-rendered body down with it, and the engine put that body back and
+   retired the realm (navigation_page_memory_rescued). */
+bool browser_engine_page_memory_rescued(const BrowserEngine *engine);
+
 bool browser_engine_parser_script_time(const BrowserEngine *engine,
                                       uint64_t *used_us, uint64_t *limit_us);
 typedef enum {
@@ -608,12 +707,26 @@ bool browser_engine_take_script_form_submission(BrowserEngine *engine,
 bool browser_engine_take_script_navigation(BrowserEngine *engine,
                                            char *url, size_t capacity,
                                            bool *record_history);
-/* Preserve the initiator and activation if a platform retries the same
-   deferred script navigation after reclaiming optional memory. A fresh URL
-   navigation must not inherit this attribution. */
+/* With deferral on, a <meta http-equiv=refresh> or Refresh-header
+   navigation that came due is taken the same way, after any page-script
+   navigation: begin it with browser_engine_begin_navigation_url and
+   record_history false (it replaces the current entry). STOPPED reports
+   once that the loop guard kept the page (NAVIGATION_REFRESH_CHAIN_LIMIT). */
+NavigationRefreshTake browser_engine_take_refresh_navigation(
+    BrowserEngine *engine, char *url, size_t capacity);
+/* A user input event (a button press): restarts the refresh loop guard's
+   count of unattended refresh navigations. Editing a form field also
+   cancels the page's pending refresh (browser_engine_insert_text,
+   browser_engine_replace_text, browser_engine_backspace). */
+void browser_engine_note_user_input(BrowserEngine *engine);
+/* Preserve the initiator, activation and history "replace" if a platform
+   retries the same deferred script navigation after reclaiming optional
+   memory. A fresh URL navigation must not inherit this attribution. */
 typedef struct {
     char initiator_url[NAVIGATION_URL_LIMIT];
     bool user_activated;
+    bool replace_history;
+    uint64_t replace_url_hash;
 } BrowserScriptNavigationAttribution;
 bool browser_engine_capture_script_navigation_attribution(
     const BrowserEngine *engine, BrowserScriptNavigationAttribution *out);
@@ -656,6 +769,8 @@ bool browser_engine_set_gamepad_state(
 bool browser_engine_set_page_visibility(BrowserEngine *engine, bool visible);
 bool browser_engine_page_fullscreen_active(BrowserEngine *engine);
 bool browser_engine_exit_page_fullscreen(BrowserEngine *engine);
+/* See script_runtime_take_page_controls_notice(); true without a page. */
+bool browser_engine_take_page_controls_notice(BrowserEngine *engine);
 /* Release page-owned presentation devices before a platform suspend while
    retaining the document and decoded, budget-owned game assets. */
 void browser_engine_suspend_page_presentations(BrowserEngine *engine);
@@ -698,12 +813,22 @@ bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine);
 /* Visible Unicode-script hints gathered without a second DOM walk. The
    frontend may use these to attach installed optional glyph packs lazily. */
 uint16_t browser_engine_glyph_script_mask(const BrowserEngine *engine);
+/* The committed document's usage census for the in-page language-pack
+   offer; NULL while no page is active. */
+const DocumentGlyphCensus *browser_engine_glyph_census(
+    const BrowserEngine *engine);
 /* Choose the generated YouTube search-result density. This is an engine
    preference, not a query parameter exposed by the provider page. */
 bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact);
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path);
+/* Deferred canvas publication (see render.h): the deferral that describes
+   `frame` (the engine's own framebuffer), or NULL when its RAM pixels are
+   complete. Materialize before reading the RAM frame directly. */
+const RenderCanvasDeferral *browser_engine_canvas_deferral(
+    const BrowserEngine *engine, const uint16_t *frame);
+bool browser_engine_canvas_materialize(BrowserEngine *engine);
 /*
  * Compose the frame at the current scroll position from the tiles already
  * rasterized, drawing a checkerboard where one is still missing, without
@@ -741,6 +866,10 @@ bool browser_engine_canvas_frame_pending(const BrowserEngine *engine);
 /* Whether the committed page or one of its frames has a task its next
    runtime advance could run now (script_runtime_task_runnable). */
 bool browser_engine_page_task_runnable(const BrowserEngine *engine);
+/* The committed top realm's virtual frame-timer head, without JS entry;
+   see script_runtime_frame_clock_delay_ms. */
+bool browser_engine_frame_clock_delay_ms(const BrowserEngine *engine,
+                                         unsigned *delay_ms);
 /* Validation diagnostics (host and PSP validation builds): the committed
    page realm's runnable work, see script_runtime_runnable_state. False
    without a live page realm. */

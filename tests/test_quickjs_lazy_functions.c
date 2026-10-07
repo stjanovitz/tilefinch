@@ -1767,6 +1767,60 @@ static int run_compile_memory_failure(size_t allowance, bool *refused)
     return failed;
 }
 
+/* A first-call compile refused for lack of memory fails uncatchably: a
+   page that catches the error and calls again (React's render loop retries
+   a unit of work that threw) must not recompile the body on every turn.
+   One attempt, then the script ends with "out of memory"; once memory is
+   available again the function compiles. */
+static int run_compile_memory_retry_loop(size_t allowance, bool *refused)
+{
+    Realm realm;
+    if (!realm_open(&realm, 1u)) return 1;
+    int failed = 0;
+    free(value_text(realm.ctx, eval_value(&realm,
+        "function big(a) { var o = { p: a, q: 'text-' + a, r: [a, a + 1, a + 2] };\n"
+        "  return Object.keys(o).map(function(k) { return k + ':' + o[k]; }).join(',')\n"
+        "    + [1, 2, 3].map(x => x * a).join(''); }\n"
+        "globalThis.big = big; globalThis.caught = 0;\n"
+        "globalThis.retry = function(n) { for (var i = 0; i < n; i++) {\n"
+        "  try { return big(i); } catch (e) { globalThis.caught++; } }\n"
+        "  return 'gave up'; }; retry(0)")));
+    /* retry(0) compiled retry() itself, not big(). */
+    JS_RunGC(realm.rt);
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(realm.rt, &usage);
+    JSLazyFunctionStats before = realm_stats(&realm);
+    JS_SetMemoryLimit(realm.rt, (size_t) usage.malloc_size + allowance);
+    JSValue global = JS_GetGlobalObject(realm.ctx);
+    JSValue retry = JS_GetPropertyStr(realm.ctx, global, "retry");
+    JS_FreeValue(realm.ctx, global);
+    JSValue rounds = JS_NewInt32(realm.ctx, 1000);
+    JSValue result = JS_Call(realm.ctx, retry, JS_UNDEFINED, 1, &rounds);
+    JS_FreeValue(realm.ctx, retry);
+    char *text = value_text(realm.ctx, result);
+    JS_SetMemoryLimit(realm.rt, 8u * MIB);
+    JSLazyFunctionStats after = realm_stats(&realm);
+    uint64_t failures = after.compile_failures - before.compile_failures;
+    if (failures != 0) {
+        *refused = true;
+        /* Refused for memory: one attempt, uncatchable, "out of memory". */
+        uint64_t memory = after.memory_failures - before.memory_failures;
+        if (failures > 1 || memory != failures || text == NULL
+            || strstr(text, "out of memory") == NULL
+            || !eval_equals(&realm, "caught", "0")) {
+            fprintf(stderr, "memory retry loop (allowance %zu): %llu "
+                    "compile failures, %llu for memory, result %s\n",
+                    allowance, (unsigned long long) failures,
+                    (unsigned long long) memory, text ? text : "(null)");
+            failed = 1;
+        }
+    }
+    free(text);
+    if (!eval_equals(&realm, "big(2)", "p:2,q:text-2,r:2,3,4246")) failed = 1;
+    if (!realm_close(&realm)) failed = 1;
+    return failed;
+}
+
 /* The interrupt handler can stop a long first-call compile; the call fails
    as an interrupted execution does (uncatchable), the function stays lazy,
    and a later call compiles it. */
@@ -1897,6 +1951,18 @@ int main(void)
     }
     if (!refused) {
         fprintf(stderr, "no memory limit refused a lazy compile\n");
+        failed = 1;
+    }
+    refused = false;
+    for (size_t allowance = 0; allowance <= 16384; allowance += 128) {
+        if (run_compile_memory_retry_loop(allowance, &refused) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (!refused) {
+        fprintf(stderr, "no memory limit refused a lazy compile in the "
+                "retry loop\n");
         failed = 1;
     }
     puts(failed ? "QuickJS lazy functions: FAIL" : "QuickJS lazy functions: PASS");

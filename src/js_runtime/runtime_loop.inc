@@ -98,13 +98,11 @@ static bool runtime_timer_due(ScriptRuntime *runtime)
         <= runtime_timer_now_ms(runtime);
 }
 
-#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 static bool runtime_timer_is_frame_callback(double kind)
 {
     return kind >= SCRIPT_HOST_TIMER_ANIMATION_FRAME
         && kind <= SCRIPT_HOST_TIMER_RENDER_FIXUP;
 }
-#endif
 
 /* Fetch responses this realm delivers whose results are complete. */
 static size_t runtime_responses_ready(const ScriptRuntime *runtime)
@@ -139,6 +137,25 @@ bool script_runtime_task_runnable(ScriptRuntime *runtime)
         return true;
     if (runtime_task_due_in_ms(runtime) <= 0) return true;
     return runtime_responses_ready(runtime) != 0;
+}
+
+bool script_runtime_frame_clock_delay_ms(ScriptRuntime *runtime,
+                                         unsigned *delay_ms)
+{
+    if (runtime == NULL || runtime->runtime == NULL || delay_ms == NULL)
+        return false;
+    const double *state = runtime->host_state;
+    if (state[SCRIPT_HOST_STATE_TIMERS] == 0
+        || state[SCRIPT_HOST_STATE_SAMPLED_CLOCK] != 0
+        || !runtime_timer_is_frame_callback(state[SCRIPT_HOST_STATE_EARLIEST_KIND]))
+        return false;
+    double delay = state[SCRIPT_HOST_STATE_EARLIEST_DUE]
+        - state[SCRIPT_HOST_STATE_NOW];
+    if (!(delay > -1e9 && delay < 1e9)) return false;
+    unsigned rounded = delay <= 0 ? 0u : (unsigned)delay;
+    if (delay > (double)rounded) rounded++;
+    *delay_ms = rounded;
+    return true;
 }
 
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -349,8 +366,6 @@ static size_t runtime_heap_pacing_limit(size_t live, long growth_pct)
     return want > SIZE_MAX ? SIZE_MAX : (size_t) want;
 }
 
-static long runtime_gc_growth_pct_value = -1;
-
 /* Return memory-pressure growth the live graph no longer uses, so the rest
    of the page (and the next page) regains that Budget. Same cadence and
    pending-work deferral as the boot window, which it follows. */
@@ -393,9 +408,7 @@ static void runtime_heap_growth_step(ScriptRuntime *runtime)
     /* Keep the collection headroom pre-growth would restore next advance;
        returning it only brings the collection storm back. Under pressure
        pre-growth stops, and this returns the rest. */
-    size_t pacing = runtime_heap_pacing_limit(
-        live, runtime_gc_growth_pct_value < 0 ? 125
-                                              : runtime_gc_growth_pct_value);
+    size_t pacing = runtime_heap_pacing_limit(live, js_rt_gc_growth_pct());
     if (pacing > target && runtime->budget != NULL
         && budget_remaining(runtime->budget) > runtime->heap_growth_reserve)
         target = pacing;
@@ -418,7 +431,8 @@ static void runtime_heap_growth_step(ScriptRuntime *runtime)
    determinism.  Reachability at a fixed logical point is semantics-only,
    so pin collections to the advance schedule instead and keep the
    threshold trigger out of the way.  Opt-in pacing experiments
-   (TILEFINCH_JS_GC_SLACK_KB) override this. */
+   (TILEFINCH_JS_GC_SLACK_KB, or an explicit TILEFINCH_JS_GC_GROWTH_PCT)
+   override this. */
 #define DETERMINISTIC_GC_ADVANCE_INTERVAL 16u
 
 static void runtime_apply_deterministic_gc(ScriptRuntime *runtime)
@@ -427,15 +441,9 @@ static void runtime_apply_deterministic_gc(ScriptRuntime *runtime)
         || !runtime->bridge.deterministic_clock) {
         return;
     }
-    static long slack_kb = -1;
-    if (slack_kb < 0) {
-        const char *value = getenv("TILEFINCH_JS_GC_SLACK_KB");
-        slack_kb = value == NULL ? 0 : atol(value);
-        if (slack_kb < 0) slack_kb = 0;
-        const char *growth = getenv("TILEFINCH_JS_GC_GROWTH_PCT");
-        if (growth != NULL && atol(growth) > 0) slack_kb = -2;
-    }
-    if (slack_kb != 0) return;
+    /* An explicit growth percentage or slack is a pacing experiment that
+       overrides the advance schedule. */
+    if (js_rt_gc_slack_kb() != 0 || js_rt_gc_growth_knob() > 0) return;
     JS_SetGCThreshold(runtime->runtime, (size_t) -1);
     runtime->deterministic_gc_advances++;
     if (runtime->deterministic_gc_advances
@@ -458,23 +466,12 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
        limit and converges to live + min_slack only inside the danger
        zone, aiming for the tight-pacing ceiling at a fraction of its
        CPU cost. */
-    static long slack_kb = -1;
-    static long growth_pct = -1;
+    long slack_kb = js_rt_gc_slack_kb();
+    long growth_pct = js_rt_gc_growth_pct();
     static long min_slack_kb = -1;
-    if (slack_kb < 0) {
-        const char *value = getenv("TILEFINCH_JS_GC_SLACK_KB");
-        slack_kb = value == NULL ? 0 : atol(value);
-        if (slack_kb < 0) slack_kb = 0;
-        value = getenv("TILEFINCH_JS_GC_GROWTH_PCT");
-        /* QuickJS's unconstrained threshold growth can reach a realm's hard
-           ceiling before collecting dead cyclic browser state.  A 125% live
-           heap threshold remains logarithmic while there is room, then the
-           reserve clamp below leaves ordinary event construction headroom.
-           Tests and deterministic replay may still override this explicitly. */
-        growth_pct = value == NULL ? 125 : atol(value);
-        if (growth_pct < 0) growth_pct = 0;
-        runtime_gc_growth_pct_value = growth_pct;
-        value = getenv("TILEFINCH_JS_GC_MIN_SLACK_KB");
+    if (min_slack_kb < 0) {
+        const char *value =
+            tilefinch_lab_getenv("TILEFINCH_JS_GC_MIN_SLACK_KB");
         min_slack_kb = value == NULL ? 512 : atol(value);
         if (min_slack_kb < 64) min_slack_kb = 64;
     }
@@ -531,7 +528,7 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
         clamped = true;
         static long reserve_kb = -1;
         if (reserve_kb < 0) {
-            const char *value = getenv("TILEFINCH_JS_GC_RESERVE_KB");
+            const char *value = tilefinch_lab_getenv("TILEFINCH_JS_GC_RESERVE_KB");
             reserve_kb = value == NULL ? 256 : atol(value);
             if (reserve_kb < 64) reserve_kb = 64;
         }
@@ -587,12 +584,18 @@ static bool runtime_dispatch_game_audio_completion(ScriptRuntime *runtime,
     uint32_t voice_handle = 0;
     if (!tilefinch_game_audio_take_completion(
             runtime->game_audio, &voice_handle)) return true;
-    JSValue argument = JS_NewUint32(runtime->context, voice_handle);
-    bool ok = !JS_IsException(argument)
+    JSValue arguments[2] = {
+        JS_NewUint32(runtime->context, voice_handle),
+        JS_NewUint32(runtime->context, runtime->game_audio_slots == NULL
+            ? 0u : runtime->game_audio_slots->epoch)
+    };
+    bool ok = !JS_IsException(arguments[0])
         && runtime_call_captured(
                runtime, runtime->game_audio_host_complete,
-               "game audio completion", 1, &argument, NULL);
-    JS_FreeValue(runtime->context, argument);
+               "game audio completion",
+               runtime->game_audio_internal_slots ? 2 : 1, arguments, NULL);
+    JS_FreeValue(runtime->context, arguments[0]);
+    JS_FreeValue(runtime->context, arguments[1]);
     if (dispatched != NULL) *dispatched = true;
     return ok;
 }
@@ -660,7 +663,11 @@ static size_t runtime_run_cleanup_tasks(ScriptRuntime *runtime, size_t limit,
     return ran_tasks;
 }
 
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+static bool runtime_advance_cpu_body(ScriptRuntime *runtime, unsigned elapsed_ms,
+#else
 bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
+#endif
                             size_t callback_budget, ScriptResult *result)
 {
     if (runtime == NULL || callback_budget > 1024) return false;
@@ -674,6 +681,18 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     budget_quickjs_pool_activity(runtime->quickjs_pool, &allocator_before);
     runtime->timing_metrics.advance_timer_late_max_us = 0;
 #endif
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_PREPARATION);
+#endif
+    /* Advance boundary: account the previous advance's collections (with
+       whatever the host collected since) and start a new pacing task. */
+    if (runtime->heap_collections - runtime->gc_advance_collections_begin
+            > runtime->gc_advance_collections_max)
+        runtime->gc_advance_collections_max = runtime->heap_collections
+            - runtime->gc_advance_collections_begin;
+    runtime->gc_advance_collections_begin = runtime->heap_collections;
+    runtime->gc_task_starved = 0;
+    runtime->gc_advance_refusals = runtime->heap_growth_refusals;
     runtime_apply_gc_slack(runtime);
     runtime_apply_deterministic_gc(runtime);
     runtime_boot_window_step(runtime);
@@ -734,6 +753,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     ok = runtime_pump_network(runtime, 0, elapsed_ms,
                               &prepared_network_tasks);
     network_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_PREPARATION);
+#endif
     if (!ok || prepared_network_tasks != 0) {
         runtime->result.success = false;
         js_rt_runtime_update_frame_result(runtime, result);
@@ -836,7 +858,13 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
 #endif
         size_t timer_callbacks = 0;
         phase_started = js_rt_monotonic_time_ns();
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+        js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_CALLBACK);
+#endif
         ok = runtime_pump_timers(runtime, 0, 1, &timer_callbacks);
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+        js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_CALLBACK);
+#endif
         uint64_t timer_turn_ns = js_rt_monotonic_time_ns() - phase_started;
         timer_elapsed_ns += timer_turn_ns;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -914,7 +942,13 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         }
         if (!classic_continuation) {
             phase_started = js_rt_monotonic_time_ns();
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+            js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_REFRESH);
+#endif
             ok = js_rt_runtime_refresh(runtime);
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+            js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_REFRESH);
+#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             runtime->timing_metrics.refresh_us +=
                 (js_rt_monotonic_time_ns() - phase_started)
@@ -998,6 +1032,53 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     return ok;
 }
 
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
+                            size_t callback_budget, ScriptResult *result)
+{
+    js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_ADVANCE);
+    bool okay = runtime_advance_cpu_body(runtime, elapsed_ms, callback_budget, result);
+    /* A refused preparation may return before closing its scope. Unwind
+       diagnostics only; never change the runtime's failure semantics. */
+    if (runtime != NULL && runtime->validation_cpu.enabled
+        && runtime->validation_cpu.depth > 1u) {
+        validation_cpu_error(&runtime->validation_cpu);
+        for (unsigned remaining = VALIDATION_CPU_DEPTH;
+             remaining != 0u && runtime->validation_cpu.depth > 1u; remaining--)
+            js_rt_validation_cpu_leave(runtime,
+                runtime->validation_cpu.stack[runtime->validation_cpu.depth - 1u].phase);
+    }
+    js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_ADVANCE);
+    return okay;
+}
+#endif
+
+bool script_runtime_validation_cpu_measure(ScriptRuntime *runtime, bool enabled)
+{
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    if (runtime == NULL || runtime->validation_cpu.depth != 0u) return false;
+    memset(&runtime->validation_cpu, 0, sizeof(runtime->validation_cpu));
+    runtime->validation_cpu.enabled = enabled;
+    return true;
+#else
+    (void)runtime; (void)enabled; return false;
+#endif
+}
+
+bool script_runtime_validation_cpu_metrics(const ScriptRuntime *runtime,
+                                           ScriptRuntimeCpuMetrics *out)
+{
+    if (out == NULL) return false;
+    memset(out, 0, sizeof(*out));
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    if (runtime == NULL || !runtime->validation_cpu.enabled) return false;
+    *out = runtime->validation_cpu.metrics;
+    return true;
+#else
+    (void)runtime; return false;
+#endif
+}
+
 bool script_runtime_timing_metrics(
     const ScriptRuntime *runtime, ScriptRuntimeTimingMetrics *metrics)
 {
@@ -1016,6 +1097,16 @@ bool script_runtime_timing_metrics(
 #endif
 }
 
+void script_runtime_suppress_checkpoint_trace(ScriptRuntime *runtime, bool suppress)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (runtime != NULL) runtime->checkpoint_trace_suppressed = suppress;
+#else
+    (void) runtime;
+    (void) suppress;
+#endif
+}
+
 void script_runtime_timing_metrics_reset(ScriptRuntime *runtime)
 {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1027,6 +1118,97 @@ void script_runtime_timing_metrics_reset(ScriptRuntime *runtime)
     (void) runtime;
 #endif
 }
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+bool script_runtime_copy_validation_frame_words(
+    ScriptRuntime *runtime, uint32_t *words, size_t count,
+    uint64_t *performance_origin_us)
+{
+    if (runtime == NULL || words == NULL || count == 0
+        || count > SCRIPT_VALIDATION_FRAME_WORD_LIMIT
+        || runtime->context == NULL || JS_HasException(runtime->context))
+        return false;
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    /* Hold the name across frames. Creating and releasing an absent name
+       per clocks-off control frame would itself refill an allocator block. */
+    if (runtime->validation_frame_packet_atom == JS_ATOM_NULL)
+        runtime->validation_frame_packet_atom = JS_NewAtom(context,
+            "__tilefinchValidationFrameMetrics");
+    JSAtom name = runtime->validation_frame_packet_atom;
+    JSPropertyDescriptor property = {0};
+    bool copied = false;
+    if (name != JS_ATOM_NULL && !JS_IsProxy(global)
+        && JS_GetOwnProperty(context, &property, global, name) == 1) {
+        if (!(property.flags & JS_PROP_GETSET)
+            && !JS_IsProxy(property.value)) {
+            size_t offset = 0, length = 0, element_bytes = 0;
+            JSValue buffer = JS_GetTypedArrayBuffer(context, property.value,
+                &offset, &length, &element_bytes);
+            size_t buffer_length = 0;
+            uint8_t *bytes = JS_IsException(buffer) ? NULL
+                : JS_GetArrayBuffer(context, &buffer_length, buffer);
+            size_t needed = count * sizeof(*words);
+            if (bytes != NULL && element_bytes == sizeof(*words)
+                && offset <= buffer_length && length <= buffer_length - offset
+                && needed <= length) {
+                memcpy(words, bytes + offset, needed);
+                if (performance_origin_us != NULL)
+                    *performance_origin_us = runtime->bridge.performance_origin_ns
+                        / UINT64_C(1000);
+                copied = true;
+            }
+            JS_FreeValue(context, buffer);
+        }
+        JS_FreeValue(context, property.value);
+        JS_FreeValue(context, property.getter);
+        JS_FreeValue(context, property.setter);
+    }
+    JS_FreeValue(context, global);
+    /* Only errors raised by this inspection are discarded; an existing
+       pending author exception was rejected before any inspection. */
+    if (JS_HasException(context))
+        JS_FreeValue(context, JS_GetException(context));
+    return copied;
+}
+#endif
+
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+bool script_runtime_validation_phase_report(ScriptRuntime *runtime, FILE *out)
+{
+    if (!out || !runtime || !runtime->validation_phases) return false;
+    const ValidationPhaseCapture *capture = runtime->validation_phases;
+    bool okay = !capture->active && capture->errors == 0u
+        && capture->count != 0u && capture->mode >= 1u && capture->mode <= 3u;
+    fprintf(out, "tilefinch-phase-capture: mode=%lu frames=%lu errors=%lu active=%u bytes=%lu valid=%u\n",
+        (unsigned long) capture->mode, (unsigned long) capture->count,
+        (unsigned long) capture->errors, capture->active ? 1u : 0u,
+        (unsigned long) sizeof(*capture), okay ? 1u : 0u);
+    if (!okay) return false;
+    for (uint32_t at = 0; at < capture->count; at++) {
+        const ValidationPhaseFrame *frame = &capture->frames[at];
+        fprintf(out, "tilefinch-phase-frame: seq=%lu checksum=%lu/%lu begin=%llu end=%llu cpu=%lu wall=%lu observer=%lu uncertainty=%lu\n",
+            (unsigned long) frame->sequence, (unsigned long) frame->checksum_a,
+            (unsigned long) frame->checksum_b, (unsigned long long) frame->begin_us,
+            (unsigned long long) frame->end_us, (unsigned long) frame->cpu_us,
+            (unsigned long) frame->wall_us, (unsigned long) frame->observer_us,
+            (unsigned long) frame->uncertainty_us);
+        for (uint32_t phase = 0; phase < VALIDATION_PHASE_LIMIT; phase++) {
+            const ValidationPhaseTotals *totals = &frame->phases[phase];
+            if (!totals->calls) continue;
+            fprintf(out, "tilefinch-phase-work: seq=%lu phase=%lu calls=%lu cpu=%lu exclusive=%lu wall=%lu\n",
+                (unsigned long) frame->sequence, (unsigned long) phase,
+                (unsigned long) totals->calls, (unsigned long) totals->cpu_us,
+                (unsigned long) totals->exclusive_cpu_us, (unsigned long) totals->wall_us);
+        }
+        fprintf(out, "tilefinch-phase-counts: seq=%lu", (unsigned long) frame->sequence);
+        for (uint32_t counter = 0; counter < VALIDATION_PHASE_COUNTER_LIMIT; counter++)
+            fprintf(out, " %lu", (unsigned long) frame->counters[counter]);
+        fprintf(out, "\n");
+    }
+    return !ferror(out);
+}
+#endif
 
 /* Validation probe: one timed full collection on the live realm, so a report
    can state what a garbage-paced GC pause costs on the measured processor

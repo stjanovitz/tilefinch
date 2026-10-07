@@ -498,10 +498,35 @@ static void navigation_ensure_layout_reuse(NavigationSession *session)
     layout_reuse_cache_enable_retained_matches(session->page.layout_reuse);
 }
 
+/* The layout_reuse_* performance counters are read only by the host lab,
+   tests and the validation log; builds without tracing or that log neither
+   sample the reuse cache around each build nor record the deltas. */
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define NAVIGATION_LAYOUT_REUSE_TELEMETRY 1
+#else
+#define NAVIGATION_LAYOUT_REUSE_TELEMETRY 0
+#endif
+
+static void navigation_layout_reuse_sample(const LayoutReuseCache *cache,
+                                           LayoutReuseStats *stats)
+{
+#if NAVIGATION_LAYOUT_REUSE_TELEMETRY
+    layout_reuse_cache_stats(cache, stats);
+#else
+    (void) cache;
+    (void) stats;
+#endif
+}
+
 static void navigation_record_layout_reuse(
     NavigationSession *session, const LayoutReuseStats *before,
     const LayoutReuseStats *after)
 {
+#if !NAVIGATION_LAYOUT_REUSE_TELEMETRY
+    (void) session;
+    (void) before;
+    (void) after;
+#else
     if (session == NULL || before == NULL || after == NULL) return;
 #define ADD_REUSE_DELTA(field, target) do {                                \
     if (after->field >= before->field) {                                   \
@@ -551,6 +576,7 @@ static void navigation_record_layout_reuse(
         tilefinch_platform_log_message(message);
     }
 #endif
+#endif /* NAVIGATION_LAYOUT_REUSE_TELEMETRY */
 }
 
 static bool navigation_build_layout(NavigationSession *session,
@@ -561,13 +587,13 @@ static bool navigation_build_layout(NavigationSession *session,
     if (session == NULL || layout == NULL) return false;
     navigation_ensure_layout_reuse(session);
     LayoutReuseStats before = {0}, after = {0};
-    layout_reuse_cache_stats(session->page.layout_reuse, &before);
+    navigation_layout_reuse_sample(session->page.layout_reuse, &before);
     layout->performance.cancelled = false;
     bool built = layout_build_context_reuse(
         layout, session->budget, &session->page.document,
         &session->page.stylesheet, fonts, images, &session->viewport,
         session->page.layout_reuse);
-    layout_reuse_cache_stats(session->page.layout_reuse, &after);
+    navigation_layout_reuse_sample(session->page.layout_reuse, &after);
     navigation_record_layout_reuse(session, &before, &after);
     session->layout_build_cancelled = !built && layout->performance.cancelled;
     if (built && session->page.layout_reuse != NULL
@@ -684,6 +710,19 @@ static ScriptRuntime *navigation_create_runtime(
         navigation_script_heap_limit(session, document_scope, url);
     if (js_memory_limit != session->js_memory_limit)
         session->managed_challenge_heap_raises++;
+    if (document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL
+        && session->next_top_level_js_heap != 0) {
+        /* An installed app's realm. The floor is consumed here so a later
+           document in this tab (or a failed launch's successor) is back on
+           the ordinary heap. */
+        if (js_memory_limit != 0
+            && session->next_top_level_js_heap > js_memory_limit) {
+            js_memory_limit = session->next_top_level_js_heap;
+            if (NAVIGATION_TEST_COUNTERS)
+                session->installed_app_heap_raises++;
+        }
+        session->next_top_level_js_heap = 0;
+    }
     bool bind_remote_document = inherit_remote_document
         && document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL;
     ScriptRuntimeOptions options = {
@@ -702,6 +741,7 @@ static ScriptRuntime *navigation_create_runtime(
         .maximum_script_file_bytes = session->document_scripts_enabled
             ? session->maximum_script_file_bytes : 0,
         .defer_document_scripts = defer_document_scripts,
+        .game_audio_internal_slots = session->game_audio_internal_slots,
         .dynamic_code_disabled = !tilefinch_csp_allows_dynamic_code(
             &document->content_security_policy),
         .document_scope = document_scope,
@@ -744,6 +784,14 @@ static ScriptRuntime *navigation_create_runtime(
         session->js_timeout_ms, url, &options, result);
     if (runtime != NULL && canvas_images != NULL) {
         script_runtime_set_images(runtime, canvas_images);
+    }
+    if (runtime != NULL) {
+        script_runtime_set_heavy_policy(
+            runtime, session->heavy_policy_resolver != NULL
+                         && options.top_level_url != NULL
+                ? session->heavy_policy_resolver(
+                      session->heavy_policy_opaque, options.top_level_url)
+                : session->heavy_script_policy);
     }
     if (runtime != NULL && session->budget != NULL
         && !session->fixed_script_memory_limits) {
@@ -798,7 +846,18 @@ static int navigation_max_scroll(const NavigationSession *session)
 static uint64_t fingerprint_bytes(uint64_t hash, const char *data,
                                   size_t length)
 {
-    for (size_t i = 0; data != NULL && i < length; i++) {
+    if (data == NULL) return hash;
+    /* Four bytes per 64-bit multiply (an FNV-style step on a word): the
+       stylesheet fingerprint covers every inline <style> text and runs at
+       each parser-blocking script and load preview, megabytes per load on
+       a front page. Fingerprints are only compared within the process. */
+    size_t i = 0;
+    for (; length - i >= 4u; i += 4u) {
+        uint32_t word;
+        memcpy(&word, data + i, sizeof(word));
+        hash = (hash ^ word) * UINT64_C(1099511628211);
+    }
+    for (; i < length; i++) {
         hash = (hash ^ (unsigned char) data[i]) * UINT64_C(1099511628211);
     }
     return hash;
@@ -893,9 +952,13 @@ static bool page_resource_fingerprint_split(const PocDocument *document,
     *hash = 0;
     if (parts != NULL) parts[0] = parts[1] = 0;
     if (document == NULL || document->html == NULL) return true;
-    *hash = UINT64_C(1469598103934665603);
-    if (parts != NULL)
-        parts[0] = parts[1] = UINT64_C(1469598103934665603);
+    /* Adopted constructed sheets are stylesheet sources outside the tree. */
+    uint64_t adopted = document_adopted_sheets_signature(document);
+    *hash = UINT64_C(1469598103934665603) ^ adopted;
+    if (parts != NULL) {
+        parts[0] = UINT64_C(1469598103934665603) ^ adopted;
+        parts[1] = UINT64_C(1469598103934665603);
+    }
     return resource_fingerprint_node(
         lxb_dom_interface_node(document->html), hash, parts);
 }
@@ -998,20 +1061,34 @@ static void damage_add(int *left, int *top, int *right, int *bottom,
                        const DrawCommand *command)
 {
     if (command->width <= 0 || command->height <= 0) return;
+    /* Ink outside the box: a blurred text shadow and an explicit
+       underline (the same extents the renderer's cull uses). Retained
+       canvas overlays repaint exactly this rectangle. */
+    int ink_x = draw_command_text_shadow_blur(command), ink_y = ink_x;
+    if (command->type == DRAW_TEXT
+        && draw_command_text_has_underline(command)
+        && draw_command_text_underline_offset(command, NULL)) {
+        int extent = command->font_size < 0 ? 0 : command->font_size;
+        if (extent > TILEFINCH_FONT_RASTER_PIXEL_LIMIT)
+            extent = TILEFINCH_FONT_RASTER_PIXEL_LIMIT;
+        ink_y += extent + 17;
+    }
+    int64_t x0 = (int64_t) command->x - ink_x;
+    int64_t y0 = (int64_t) command->y - ink_y;
+    int64_t x1 = (int64_t) command->x + command->width + ink_x;
+    int64_t y1 = (int64_t) command->y + command->height + ink_y;
+    int l = x0 < INT_MIN ? INT_MIN : (int) x0;
+    int t = y0 < INT_MIN ? INT_MIN : (int) y0;
+    int r = x1 > INT_MAX ? INT_MAX : (int) x1;
+    int b = y1 > INT_MAX ? INT_MAX : (int) y1;
     if (*right <= *left) {
-        *left = command->x; *top = command->y;
-        *right = command->x + command->width;
-        *bottom = command->y + command->height;
+        *left = l; *top = t; *right = r; *bottom = b;
         return;
     }
-    if (command->x < *left) *left = command->x;
-    if (command->y < *top) *top = command->y;
-    if (command->x + command->width > *right) {
-        *right = command->x + command->width;
-    }
-    if (command->y + command->height > *bottom) {
-        *bottom = command->y + command->height;
-    }
+    if (l < *left) *left = l;
+    if (t < *top) *top = t;
+    if (r > *right) *right = r;
+    if (b > *bottom) *bottom = b;
 }
 
 static void damage_add_rect(int *left, int *top, int *right, int *bottom,
@@ -1641,6 +1718,9 @@ static bool navigation_queue_frame_message(void *opaque,
                 json);
     }
 #endif
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* The last-message, event-log and reject-reason fields below are read
+       only by the host interactive lab and tests. */
     const char *event = strstr(json, "\"event\":");
     if (event != NULL) {
         event = strchr(event + 8, '"');
@@ -1745,6 +1825,11 @@ static bool navigation_queue_frame_message(void *opaque,
             }
         }
     }
+#else
+    (void) source_result;
+    (void) task_kind;
+    (void) task_sequence;
+#endif
     return true;
 }
 
@@ -2668,6 +2753,17 @@ static uint64_t navigation_enqueue_frame_fetch(
         512 * 1024, 15000);
 }
 
+/* A child frame's scripts share the page's per-script source ceiling:
+   memory-based admission decides whether each one compiles. A fixed
+   512 KiB here refused DataDome's 523 KB challenge script inside its
+   iframe on etsy.com and nytimes.com. */
+static size_t navigation_frame_script_file_bytes(
+    const NavigationSession *session)
+{
+    return session->maximum_script_file_bytes != 0
+        ? session->maximum_script_file_bytes : 512u * 1024u;
+}
+
 static bool navigation_frame_descends_from(
     const NavigationSession *session, const NavigationFrame *candidate,
     size_t ancestor_slot)
@@ -3357,10 +3453,15 @@ static bool navigation_complete_frame(NavigationSession *session,
     bool ok = fetched_ok && fetch->status_code >= 200
               && fetch->status_code < 400
               && embedding_allowed
-              && document_parse(&frame->document, session->budget,
-                                fetch->data, fetch->length, 512);
+              && document_parse_with_transport_encoding(
+                     &frame->document, session->budget, fetch->data,
+                     fetch->length, 512,
+                     tilefinch_encoding_from_content_type(
+                         fetch->content_type));
     if (ok) {
         frame->document.content_security_policy = response_csp;
+        if (response_csp.header_present)
+            (void) document_nonce_hiding_enable(&frame->document);
     }
     fetch_result_destroy(fetch);
     if (ok) {
@@ -3406,7 +3507,7 @@ static bool navigation_complete_frame(NavigationSession *session,
                 session);
         if (ok) script_runtime_set_images(frame->runtime, &frame->images);
     }
-    if (ok && frame->runtime != NULL && session->trace_frame_capabilities) {
+    if (ok && frame->runtime != NULL && NAVIGATION_TRACES_FRAME_CAPABILITIES(session)) {
         ok = navigation_install_frame_capability_trace(frame);
     }
     if (ok && frame->runtime != NULL) {
@@ -3421,7 +3522,8 @@ static bool navigation_complete_frame(NavigationSession *session,
                 &frame->document, frame->runtime, session->budget,
                 session->browser_session, frame_base_url, frame->url,
                 frame->referrer_policy, 16, 1024 * 1024,
-                512 * 1024, 15000, session->page.resource_scheduler,
+                navigation_frame_script_file_bytes(session), 15000,
+                session->page.resource_scheduler,
                 &metrics, &frame->script_result)
                 && script_runtime_finish_loading(frame->runtime,
                                                  &frame->script_result);
@@ -3492,7 +3594,7 @@ static bool navigation_progress_frames(NavigationSession *session)
 
 bool navigation_collect_frame_capability_trace(NavigationSession *session)
 {
-    if (session == NULL || !session->trace_frame_capabilities) return true;
+    if (session == NULL || !NAVIGATION_TRACES_FRAME_CAPABILITIES(session)) return true;
     static const char report[] =
         "{globalThis.__tilefinchFrameSummaryBeforeTrace=globalThis.pocSummary;"
         "const trace=globalThis.__tilefinchCapabilityTrace,"

@@ -30,6 +30,13 @@ typedef struct {
     const char *label;
     const char *metadata_asset;
     const char *pack_asset;
+    /* DocumentGlyphScript bits whose page text this pack draws. Lazy
+       attachment and the in-page install offer both key off this, so a new
+       pack needs only a catalog row. Zero (color emoji) is never hinted. */
+    uint16_t page_scripts;
+    /* Display-only size for the in-page offer; the signed manifest's size
+       governs the download and its free-space preflight. */
+    uint16_t approximate_kib;
 } TilefinchGlyphPackSpec;
 
 const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(

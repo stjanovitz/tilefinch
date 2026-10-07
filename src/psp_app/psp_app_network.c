@@ -575,6 +575,10 @@ static void psp_network_lifecycle_drive_demand_recovery(
 
 void psp_report_network_result(PspNetwork *network)
 {
+#ifndef TILEFINCH_PSP_VALIDATION_LOG
+    /* Validation-log output only, including the interface queries. */
+    (void) network;
+#else
     if (network == NULL) return;
     printf("tilefinch-network: status=%s failure-phase=%s profile=%d/%d "
            "fallback=%d "
@@ -637,6 +641,7 @@ void psp_report_network_result(PspNetwork *network)
                interface_report.has_primary_dns ? 1 : 0,
                interface_report.has_secondary_dns ? 1 : 0);
     }
+#endif
 }
 
 bool psp_connect_network(PspNetwork *network, int profile_index,

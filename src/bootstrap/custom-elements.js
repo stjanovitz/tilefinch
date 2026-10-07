@@ -5,6 +5,8 @@
     constructors = new Map(),
     waiting = new Map(),
     scopedRegistryStates = new WeakMap(),
+    /* The registry each document uses; kept off the document objects. */
+    registryByDocument = new WeakMap(),
     definitionByConstructor = new WeakMap(),
     formOwnerByElement = new WeakMap(),
     disabledStateByElement = new WeakMap(),
@@ -109,7 +111,7 @@
       return undefined;
     const owner = node.ownerDocument;
     if (owner && owner !== document && !owner.defaultView) return undefined;
-    const registry = owner?.__tilefinchCustomElementRegistry,
+    const registry = owner ? registryByDocument.get(owner) : undefined,
       available =
         scopedRegistryStates.get(registry)?.definitions || definitions,
       localName = String(
@@ -483,11 +485,7 @@
     }
   }
   const registry = new CustomElementRegistry();
-  Object.defineProperty(document, "__tilefinchCustomElementRegistry", {
-    configurable: true,
-    writable: true,
-    value: registry,
-  });
+  registryByDocument.set(document, registry);
   globalThis.CustomElementRegistry = CustomElementRegistry;
   globalThis.customElements = registry;
   Object.defineProperty(
@@ -500,8 +498,8 @@
       value(root) {
         if (definitions.size) return true;
         if (root?.__tilefinchCustomElementState === "custom") return true;
-        const ownerRegistry =
-            root?.ownerDocument?.__tilefinchCustomElementRegistry,
+        const owner = root?.ownerDocument,
+          ownerRegistry = owner ? registryByDocument.get(owner) : undefined,
           scoped = scopedRegistryStates.get(ownerRegistry);
         return !!scoped?.definitions?.size;
       },
@@ -815,7 +813,7 @@
       configurable: true,
       enumerable: true,
       writable: true,
-      value() {
+      value: function attachInternals() {
         const definition = definitionForInternals(this);
         if (
           !definition ||
@@ -872,18 +870,89 @@
         .replace(/\/\*[\s\S]*?\*\//g, "")
         .trimStart(),
     ),
-    weakTargetReference = (target) =>
-      typeof WeakRef === "function"
-        ? new WeakRef(target)
-        : { deref: () => target };
+    /* A constructed sheet keeps at most this many characters of rule text
+       (its rules joined by newlines): a memory bound, not a rule count.
+       Text past it is not applied; the complete rules before it are, as
+       for an oversized <link> sheet (stylesheet_complete_rules_prefix). */
+    constructedSheetTextLimit = 256 * 1024,
+    /* Splits CSS text into its top-level statements with the native
+       tokenizer that bounds <link> sheets (stylesheet_next_statement in
+       src/resources.c).  CSS has no fatal syntax errors, so this never
+       throws: a block still open at the end is closed, as the CSS parser
+       closes it, and a bare trailing fragment is dropped, as the parser
+       drops it.  Statements are kept while their joined length fits
+       `limit`; `truncated` reports that later text was left out. */
+    nativeStatementEnds = globalThis.__tilefinchCssStatementEnds,
+    splitConstructedRules = (text, limit) => {
+      const rules = [];
+      let start = 0,
+        used = 0,
+        scanWindow = 16 * 1024;
+      const keep = (end, closing = "") => {
+        /* A statement that can no longer fit is not even sliced. */
+        if (end - start > limit - used) return false;
+        const rule = closing
+          ? text.slice(start, end).trim() + closing
+          : text.slice(start, end).trim();
+        start = end;
+        if (!rule || constructedImportRule(rule)) return true;
+        const cost = rule.length + (rules.length ? 1 : 0);
+        if (cost > limit - used) return false;
+        used += cost;
+        rules.push(rule);
+        return true;
+      };
+      while (start < text.length) {
+        /* The output quota is not the scanner's work bound: a near-full
+           sheet can still end in ignored whitespace, comments or a bare
+           prelude. Scan bounded windows independently of remaining space. A
+           trimmed rule or discarded @import can leave room for another
+           chunk; restart at the last complete statement, never inside a
+           token. This bounds the native offsets array and UTF-8 conversion
+           without changing the joined-rule quota. */
+        const base = start,
+          scanLimit = constructedSheetTextLimit + 1,
+          scanSize = Math.min(scanLimit, scanWindow),
+          scanEnd = Math.min(text.length, base + scanSize),
+          ends = nativeStatementEnds(text.slice(base, scanEnd)),
+          openBlocks = ends.pop();
+        for (const end of ends)
+          if (!keep(base + end)) return { rules, truncated: true };
+        if (openBlocks !== -1 && scanEnd === text.length) {
+          if (openBlocks > 0 && !keep(text.length, "}".repeat(openBlocks)))
+            return { rules, truncated: true };
+          break;
+        }
+        /* Do not close a block at an artificial chunk boundary. At the
+           scan ceiling, decline an unfinished large tail conservatively. */
+        if (start === base) {
+          if (scanSize === scanLimit) return { rules, truncated: true };
+          /* One long rule may span ordinary windows. Grow this window
+             geometrically, never beyond the native scan ceiling. */
+          scanWindow = Math.min(scanLimit, scanWindow * 2);
+        } else scanWindow = 16 * 1024;
+      }
+      return { rules, truncated: false };
+    };
+  /* Native constructed-sheet storage (document_adopted_sheets.c): a
+     sheet's text lives once, in a detached <style> element made on its
+     first adoption; adoptedStyleSheets lists name those elements, and the
+     cascade parses each adopted sheet once however many roots adopt it. */
+  const nativeSheetText = globalThis.__tilefinchConstructedSheetText,
+    nativeSetAdopted = globalThis.__tilefinchSetAdoptedSheets,
+    sheetQuotaError = () =>
+      new DOMException("Stylesheet exceeds bounded size", "QuotaExceededError");
+  delete globalThis.__tilefinchConstructedSheetText;
+  delete globalThis.__tilefinchCssStatementEnds;
+  delete globalThis.__tilefinchSetAdoptedSheets;
   class CSSStyleSheet {
     constructor() {
-      this.__text = "";
       this.__rules = [];
+      this.__textLength = 0;
       this.__cssRules = [];
       this.__constructed = true;
-      this.__adoptedNodes = new WeakMap();
-      this.__adoptedTargets = [];
+      /* The native sheet element, once adopted. */
+      this.__node = null;
       this.ownerNode = null;
       this.disabled = false;
       this.media = {
@@ -898,99 +967,52 @@
         },
       };
     }
-    __sync() {
-      this.__text = this.__rules.join("\n");
-      this.__cssRules.length = 0;
-      for (const cssText of this.__rules) {
-        const atRule = cssText.trimStart().startsWith("@"),
-          open = cssText.indexOf("{");
-        this.__cssRules.push({
-          cssText,
-          parentStyleSheet: this,
-          type: atRule ? 4 : 1,
-          selectorText: !atRule && open >= 0
-            ? cssText.slice(0, open).trim()
-            : undefined,
-        });
-      }
+    /* The text is derived, not kept: the native element holds the only
+       copy the cascade reads. */
+    get __text() {
+      return this.__rules.join("\n");
+    }
+    /* Makes `rules` the sheet's rules. The native copy is replaced first,
+       so a refusal leaves the sheet exactly as it was. */
+    __commit(rules) {
+      const text = rules.join("\n");
+      if (
+        this.__constructed &&
+        this.__node &&
+        !nativeSheetText(this.__node.__handle, text)
+      )
+        throw sheetQuotaError();
+      this.__rules = rules;
+      this.__textLength = text.length;
+      /* Rule objects are built once a page reads cssRules, not for every
+         replaceSync: a framework sheet of thousands of rules is usually
+         applied without being inspected. The list is live, so once read
+         it is kept current. */
+      this.__cssRulesStale = true;
+      if (this.__cssRulesRead) this.cssRules;
       if (!this.__constructed && this.ownerNode) {
-        this.__authorSource = this.__text;
-        if (this.ownerNode.textContent !== this.__text)
-          this.ownerNode.textContent = this.__text;
+        this.__authorSource = text;
+        if (this.ownerNode.textContent !== text)
+          this.ownerNode.textContent = text;
       }
-      const retained = [];
-      for (const reference of this.__adoptedTargets) {
-        const target = reference.deref();
-        if (!target) continue;
-        retained.push(reference);
-        const node = this.__adoptedNodes.get(target);
-        if (node) node.textContent = this.__text;
+    }
+    /* The native element for adoption, made on first use. */
+    __adoptionNode() {
+      if (!this.__node) {
+        const node = document.createElement("style");
+        if (!nativeSheetText(node.__handle, this.__text))
+          throw sheetQuotaError();
+        this.__node = node;
       }
-      this.__adoptedTargets = retained;
+      return this.__node;
     }
     replaceSync(text) {
-      text = String(text);
-      if (text.length > 256 * 1024)
-        throw new DOMException(
-          "Stylesheet exceeds bounded size",
-          "QuotaExceededError",
-        );
-      const rules = [],
-        length = text.length;
-      let start = 0,
-        depth = 0,
-        quote = "";
-      for (let index = 0; index < length; index++) {
-        const character = text[index];
-        if (quote) {
-          if (character === "\\") index++;
-          else if (character === quote) quote = "";
-          continue;
-        }
-        if (character === '"' || character === "'") {
-          quote = character;
-          continue;
-        }
-        if (character === "/" && text[index + 1] === "*") {
-          index += 2;
-          while (
-            index + 1 < length &&
-            !(text[index] === "*" && text[index + 1] === "/")
-          )
-            index++;
-          index++;
-          continue;
-        }
-        if (character === "{") depth++;
-        else if (character === "}") {
-          if (depth === 0)
-            throw new DOMException("Invalid CSS rule", "SyntaxError");
-          depth--;
-          if (depth === 0) {
-            const rule = text.slice(start, index + 1).trim();
-            if (rule && !constructedImportRule(rule))
-              rules.push(rule);
-            start = index + 1;
-            if (rules.length > 1024)
-              throw new DOMException(
-                "Stylesheet rule limit reached",
-                "QuotaExceededError",
-              );
-          }
-        } else if (character === ";" && depth === 0) {
-          const rule = text.slice(start, index + 1).trim();
-          if (rule && !constructedImportRule(rule))
-            rules.push(rule);
-          start = index + 1;
-        }
-      }
-      if (depth !== 0 || quote)
-        throw new DOMException("Invalid CSS rule", "SyntaxError");
-      const tail = text.slice(start).trim();
-      if (tail && !constructedImportRule(tail))
-        throw new DOMException("Invalid CSS rule", "SyntaxError");
-      this.__rules = rules;
-      this.__sync();
+      const split = splitConstructedRules(
+        String(text),
+        constructedSheetTextLimit,
+      );
+      this.__commit(split.rules);
+      this.__truncated = split.truncated;
     }
     replace(text) {
       return Promise.resolve().then(() => {
@@ -999,9 +1021,36 @@
       });
     }
     get cssRules() {
+      this.__cssRulesRead = true;
+      if (this.__cssRulesStale) {
+        this.__cssRulesStale = false;
+        this.__cssRules.length = 0;
+        for (const cssText of this.__rules) {
+          const atRule = cssText.trimStart().startsWith("@"),
+            open = cssText.indexOf("{");
+          this.__cssRules.push({
+            cssText,
+            parentStyleSheet: this,
+            type: atRule ? 4 : 1,
+            selectorText: !atRule && open >= 0
+              ? cssText.slice(0, open).trim()
+              : undefined,
+          });
+        }
+      }
       return this.__cssRules;
     }
+    /* An author <style> past the text bound is reflected only in part;
+       writing that part back would delete the rest of the element. */
+    __assertWholeAuthorSheet() {
+      if (!this.__constructed && this.__truncated)
+        throw new DOMException(
+          "Stylesheet exceeds bounded size",
+          "QuotaExceededError",
+        );
+    }
     insertRule(rule, index = 0) {
+      this.__assertWholeAuthorSheet();
       rule = String(rule);
       index = Number(index);
       if (!Number.isInteger(index) || index < 0 || index > this.__rules.length)
@@ -1016,33 +1065,35 @@
           "@import is not allowed in constructed stylesheets",
           "SyntaxError",
         );
-      const parsed = new CSSStyleSheet();
-      parsed.replaceSync(rule);
-      if (parsed.__rules.length !== 1)
+      const split = splitConstructedRules(rule, constructedSheetTextLimit);
+      if (split.truncated) throw sheetQuotaError();
+      const parsed = split.rules;
+      if (parsed.length !== 1)
         throw new DOMException(
           "insertRule requires exactly one rule",
           "SyntaxError",
         );
-      if (this.__rules.length >= 1024)
-        throw new DOMException(
-          "Stylesheet rule limit reached",
-          "QuotaExceededError",
-        );
-      if (this.__text.length + rule.length > 256 * 1024)
-        throw new DOMException(
-          "Stylesheet exceeds bounded size",
-          "QuotaExceededError",
-        );
-      this.__rules.splice(index, 0, parsed.__rules[0]);
-      this.__sync();
+      /* The text bound is the one replaceSync applies a prefix under. One
+         rule has no prefix to apply: refuse it whole so cssRules always
+         lists exactly the rules the cascade holds. */
+      if (
+        parsed[0].length + (this.__rules.length ? 1 : 0) >
+        constructedSheetTextLimit - this.__textLength
+      )
+        throw sheetQuotaError();
+      const rules = this.__rules.slice();
+      rules.splice(index, 0, parsed[0]);
+      this.__commit(rules);
       return index;
     }
     deleteRule(index) {
+      this.__assertWholeAuthorSheet();
       index = Number(index);
       if (!Number.isInteger(index) || index < 0 || index >= this.__rules.length)
         throw new DOMException("Invalid rule index", "IndexSizeError");
-      this.__rules.splice(index, 1);
-      this.__sync();
+      const rules = this.__rules.slice();
+      rules.splice(index, 1);
+      this.__commit(rules);
     }
   }
   globalThis.CSSStyleSheet = CSSStyleSheet;
@@ -1064,37 +1115,27 @@
         source = String(source || "");
         if (sheet.__authorSource !== source) {
           sheet.__constructed = true;
-          try {
-            sheet.replaceSync(source);
-          } catch (_) {
-            sheet.__rules = [];
-            sheet.__text = source.slice(0, 256 * 1024);
-            sheet.__cssRules.length = 0;
-          }
+          sheet.replaceSync(source);
           sheet.__constructed = false;
           sheet.__authorSource = source;
         }
         return sheet;
       };
-    Object.defineProperty(HTMLStyleElement.prototype, "sheet", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    Object.defineProperty(HTMLStyleElement.prototype, "sheet", Object.getOwnPropertyDescriptor({
+      get sheet() {
         return this.isConnected
           ? authorSheet(this, this.textContent, null)
           : null;
       },
-    });
-    Object.defineProperty(HTMLLinkElement.prototype, "sheet", {
-      configurable: true,
-      enumerable: true,
-      get() {
+    }, "sheet"));
+    Object.defineProperty(HTMLLinkElement.prototype, "sheet", Object.getOwnPropertyDescriptor({
+      get sheet() {
         const rel = String(this.getAttribute("rel") || "").toLowerCase();
         return this.isConnected && rel.split(/\s+/).includes("stylesheet")
           ? authorSheet(this, "", this.href || null)
           : null;
       },
-    });
+    }, "sheet"));
   }
   {
     const adoptedByTarget = new WeakMap(),
@@ -1119,35 +1160,23 @@
             );
           unique.add(sheet);
         }
-        const adopted = adoptedByTarget.get(target) || [];
-        for (const sheet of adopted)
-          if (!unique.has(sheet)) {
-            sheet.__adoptedNodes.get(target)?.remove();
-            sheet.__adoptedNodes.delete(target);
-            const at = sheet.__adoptedTargets.findIndex(
-              (reference) => reference.deref() === target,
+        /* The document and connected shadow roots style the page: their
+           lists go to the native registry (rootHandle 0 is the document).
+           Any other document, and a shadow root without a native carrier,
+           keep the list for script only. */
+        const rootHandle =
+          target === document
+            ? 0
+            : target instanceof ShadowRoot
+              ? target.__handle
+              : undefined;
+        if (rootHandle !== undefined) {
+          const handles = next.map((sheet) => sheet.__adoptionNode().__handle);
+          if (!nativeSetAdopted(rootHandle, handles))
+            throw new DOMException(
+              "Adopted stylesheet limit reached",
+              "QuotaExceededError",
             );
-            if (at >= 0) sheet.__adoptedTargets.splice(at, 1);
-          }
-        /* Adopted document sheets cascade after ordinary document sheets.
-           A trailing child of <html> keeps that order even when authors put
-           late <style> elements in <body>; inserting in <head> would not. */
-        const parent =
-          target instanceof ShadowRoot
-            ? target
-            : document.documentElement || document.head;
-        for (const sheet of next) {
-          let node = sheet.__adoptedNodes.get(target);
-          if (!node) {
-            const node = document.createElement("style");
-            node.setAttribute("data-tilefinch-constructed", "");
-            node.textContent = sheet.__text;
-            sheet.__adoptedNodes.set(target, node);
-            sheet.__adoptedTargets.push(weakTargetReference(target));
-            parent.appendChild(node);
-          } else {
-            parent.appendChild(node);
-          }
         }
         adoptedByTarget.set(target, next.slice());
       };
@@ -1200,7 +1229,8 @@
       return node;
     const definition = definitionFor(node);
     if (state === 3 && definition) {
-      globalThis.__tilefinchPrepareNativePrototype?.(node);
+      globalThis.__tilefinchPrepareNativePrototype?.(
+        node, definition.constructor.prototype);
       Object.setPrototypeOf(node, definition.constructor.prototype);
       node.__tilefinchCustomElementState = "custom";
       node.__tilefinchCustomElementConnectedState = connected(node);
@@ -1229,7 +1259,8 @@
         definition &&
         Object.getPrototypeOf(node) !== definition.prototype
       ) {
-        globalThis.__tilefinchPrepareNativePrototype?.(node);
+        globalThis.__tilefinchPrepareNativePrototype?.(
+          node, definition.prototype);
         Object.setPrototypeOf(node, definition.prototype);
       }
       if (
@@ -1464,7 +1495,7 @@
     );
     if (definition.localName !== definition.name)
       node.setAttribute("is", definition.name);
-    globalThis.__tilefinchPrepareNativePrototype?.(node);
+    globalThis.__tilefinchPrepareNativePrototype?.(node, definition.prototype);
     Object.setPrototypeOf(node, definition.prototype);
     node.__tilefinchCustomElementState = "custom";
     if (node.__handle !== undefined) __tilefinchSetCustomState(node.__handle, 1);
@@ -1520,7 +1551,7 @@
         configurable: true,
         value: document.implementation,
       });
-    const current = frameDocument.__tilefinchCustomElementRegistry;
+    const current = registryByDocument.get(frameDocument);
     if (current && scopedRegistryStates.has(current)) {
       view.customElements = current;
       return;
@@ -1538,15 +1569,7 @@
         createUnupgraded: createRaw,
       };
     scopedRegistryStates.set(frameRegistry, state);
-    Object.defineProperty(
-      frameDocument,
-      "__tilefinchCustomElementRegistry",
-      {
-        configurable: true,
-        writable: true,
-        value: frameRegistry,
-      },
-    );
+    registryByDocument.set(frameDocument, frameRegistry);
     frameDocument.createElement = (tag, options = undefined) => {
       const localName = String(tag).toLowerCase(),
         is =

@@ -111,7 +111,10 @@ static bool style_property_font_family(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[160];
+    /* Design-system font stacks are often custom properties longer than
+       160 bytes (GitHub's --fontStack-sansSerif is 170); a stack that
+       does not fit drops the whole declaration. */
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             for (size_t i = 0; resolved[i] != '\0'; i++) {
@@ -373,7 +376,59 @@ static bool style_property_white_space(const StylePropertyParse *parse)
                     ? WHITE_SPACE_BREAK_SPACES : WHITE_SPACE_NORMAL;
             *mask |= S_WHITE_SPACE;
         }
-    
+
+    return true;
+}
+
+/* CSS Text 4 splits white-space into white-space-collapse and
+   text-wrap-mode; `text-wrap` is the shorthand for text-wrap-mode and
+   text-wrap-style.  Tilefinch keeps the combined white-space mode, so a
+   wrap-mode declaration rewrites that mode's wrapping half.  When the
+   same block also set white-space its collapse half is kept (pre + nowrap
+   is pre); otherwise collapsing is assumed.  A wrapping value is applied
+   only over a same-block white-space: it cannot then erase an inherited
+   `pre` on a `text-wrap: pretty` block.  The style half stays retained
+   for balance/pretty (style_resolve.c). */
+static bool style_property_text_wrap_mode(const StylePropertyParse *parse)
+{
+    const char *value = parse->value;
+    size_t value_length = parse->value_length;
+    bool shorthand = parse->name_length == 9;
+    bool nowrap = false, wrap = false;
+    size_t cursor = 0, start = 0, end = 0, words = 0;
+    while (style_next_top_level(value, value_length, ' ', &cursor, &start,
+                                &end)) {
+        if (++words > 2) return true;
+        const char *word = value + start;
+        size_t length = end - start;
+        if (span_case_equal(word, length, "nowrap")) nowrap = true;
+        else if (span_case_equal(word, length, "wrap")) wrap = true;
+        else if (!shorthand
+                 || !(span_case_equal(word, length, "auto")
+                      || span_case_equal(word, length, "balance")
+                      || span_case_equal(word, length, "pretty")
+                      || span_case_equal(word, length, "stable"))) {
+            return true;
+        } else {
+            wrap = true;
+        }
+    }
+    if (nowrap == wrap) return true;
+    ComputedStyle *style = parse->style;
+    bool same_block = (*parse->mask & S_WHITE_SPACE) != 0;
+    uint8_t mode = same_block ? style->white_space_mode
+                                     : WHITE_SPACE_NORMAL;
+    if (nowrap) {
+        mode = mode == WHITE_SPACE_PRE_WRAP || mode == WHITE_SPACE_PRE
+                   || mode == WHITE_SPACE_BREAK_SPACES
+               ? WHITE_SPACE_PRE : WHITE_SPACE_NOWRAP;
+    } else {
+        if (!same_block) return true;
+        mode = mode == WHITE_SPACE_PRE ? WHITE_SPACE_PRE_WRAP
+               : mode == WHITE_SPACE_NOWRAP ? WHITE_SPACE_NORMAL : mode;
+    }
+    style->white_space_mode = mode;
+    *parse->mask |= S_WHITE_SPACE;
     return true;
 }
 

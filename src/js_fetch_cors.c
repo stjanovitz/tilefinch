@@ -5,6 +5,7 @@
    js_runtime_internal.h. */
 #include "js_runtime_internal.h"
 
+#include "tilefinch/script_admission.h"
 #include "tilefinch/script_split.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/multiplayer.h"
@@ -12,6 +13,7 @@
 #include "tilefinch/url.h"
 #include "tilefinch/resource_integrity.h"
 #include "tilefinch/script_loader.h"
+#include "tilefinch/text_encoding.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +25,7 @@
    literal in the dynamic task fetch). */
 #define JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS 8000L
 
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 static void copy_response_header_value(const FetchResult *fetched,
                                        const char *wanted, char *output,
                                        size_t capacity)
@@ -119,6 +122,7 @@ void js_rt_record_network_response(ScriptResult *result,
     }
     result->last_network_body_prefix[at] = '\0';
 }
+#endif
 
 #define JS_FETCH_MAXIMUM_BYTES (1024u * 1024u)
 
@@ -144,8 +148,8 @@ bool js_rt_script_set_response_body(JSContext *context, JSValue response,
        byte-canonical, and keep malformed XHR input on the JavaScript
        decoder so its replacement behavior remains exact. */
     if (prefer_text && fetched->length <= JS_FETCH_MAXIMUM_BYTES
-        && js_rt_utf8_valid((const uint8_t *) fetched->data,
-                            fetched->length)) {
+        && tilefinch_utf8_valid((const unsigned char *) fetched->data,
+                                fetched->length)) {
         const uint8_t *bytes = (const uint8_t *) fetched->data;
         size_t length = fetched->length;
         if (length >= 3u && bytes[0] == 0xefu && bytes[1] == 0xbbu
@@ -171,10 +175,24 @@ static size_t js_fetch_response_limit(const DomBridge *bridge)
     if (bridge != NULL && bridge->maximum_script_file_bytes > limit) {
         limit = bridge->maximum_script_file_bytes;
         if (limit > 8u * 1024u * 1024u) limit = 8u * 1024u * 1024u;
+        /* The script ceiling is a sanity bound now, not a memory budget:
+           above the 1 MiB floor, a response may use only what the page
+           Budget can stage beside its presentation reserve. Unlike a
+           dynamic script's bound, this one does not evict optional caches
+           up front: pages poll fetch() far more often than they load
+           scripts, most responses never approach the bound, and the 1 MiB
+           floor already covers ordinary payloads (the Budget's reclaim
+           hook still frees caches when a large body really arrives). */
+        if (bridge->budget != NULL) {
+            size_t affordable = script_admission_affordable_bytes(
+                bridge->budget, JS_FETCH_MAXIMUM_BYTES, false);
+            if (limit > affordable) limit = affordable;
+        }
     }
     return limit;
 }
 #define JS_FETCH_MAXIMUM_HEADERS (8u * 1024u)
+#define JS_FETCH_OPAQUE_MAXIMUM_BYTES (64u * 1024u)
 #define JS_FETCH_MAXIMUM_ACCEPT_BYTES 511u
 
 typedef struct {
@@ -1368,15 +1386,28 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
                  && body_length <= FETCH_REQUEST_BODY_LIMIT
                  && extra_headers_length <= JS_FETCH_MAXIMUM_HEADERS
                  && tilefinch_url_resolve(bridge->document_url, reference, url,
-                                       sizeof(url))
-                 && bridge->async_fetch_count < 8;
+                                       sizeof(url));
+    /* Every native slot belongs to a request already on the wire, so a full
+       table always drains.  It is backpressure for the JavaScript FIFO in
+       front of this function, exactly like a full shared page scheduler
+       below, never a failed Fetch. */
+    bool native_slots_full = bridge->async_fetch_count
+        >= sizeof(bridge->async_fetches) / sizeof(bridge->async_fetches[0]);
     ScriptRequestPolicy policy;
     TilefinchRequestDestination destination = worker_destination
         ? TILEFINCH_DESTINATION_WORKER : TILEFINCH_DESTINATION_FETCH;
+    /* Fetch admits a cross-origin no-cors request and filters its response
+       to an opaque one (status 0, no URL, headers or body) on delivery.  It
+       is the script form of an <img> or a form post, so it is limited below
+       to a CORS-safelisted method and headers: anything that would need a
+       preflight under CORS is refused rather than sent unannounced. */
+    bool no_cors_fetch = request_mode == TILEFINCH_REQUEST_MODE_NO_CORS
+        && destination == TILEFINCH_DESTINATION_FETCH;
     valid = valid && script_request_policy_prepare(
         bridge, url, method, request_mode, credentials,
         destination,
-        request_mode == TILEFINCH_REQUEST_MODE_CORS, &policy);
+        request_mode == TILEFINCH_REQUEST_MODE_CORS || no_cors_fetch,
+        &policy);
     FetchPreparedPageRequest prepared;
     const char *author_referrer = NULL;
     const char *author_referrer_policy = NULL;
@@ -1399,6 +1430,14 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
     bool cross_origin = target_origin_valid
         && !tilefinch_request_same_origin(&policy.context);
     if (valid && !target_origin_valid) valid = false;
+    if (valid && cross_origin && no_cors_fetch) {
+        ScriptCorsPreflight simple;
+        valid = script_cors_analyze_request(
+                method, content_type, extra_headers, &simple)
+            && !simple.required;
+    }
+    bool slot_deferred = valid && native_slots_full;
+    if (slot_deferred) valid = false;
     if (valid && cross_origin
         && request_mode == TILEFINCH_REQUEST_MODE_CORS) {
         ScriptCorsPreflight preflight;
@@ -1429,6 +1468,15 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
         scheduler_timeout_ms = (long) requested_timeout_ms;
     }
     size_t response_limit = js_fetch_response_limit(bridge);
+    /* A cross-origin no-cors body is discarded on delivery (the response is
+       opaque), so it reserves a beacon-sized share of the shared scheduler's
+       response bytes, not a full fetch's: ad and analytics pixels then no
+       longer hold the reservations that the page's own requests wait for.
+       A larger opaque body is a network error. */
+    if (cross_origin && no_cors_fetch
+        && response_limit > JS_FETCH_OPAQUE_MAXIMUM_BYTES) {
+        response_limit = JS_FETCH_OPAQUE_MAXIMUM_BYTES;
+    }
     char *integrity_copy = NULL;
     bool integrity_copy_failed = false;
     if (valid && integrity_length != 0u) {
@@ -1440,7 +1488,26 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
         }
     }
     if (integrity_copy_failed) valid = false;
-    uint64_t id = valid && bridge->fetch_scheduler != NULL
+    /* fetch() keeps the response pool it had before the realm's scheduler
+       was widened for dynamic scripts (SCRIPT_DYNAMIC_INFLIGHT_REQUESTS):
+       its in-flight bounds share at most the 2 MiB that pool held, so page
+       requests stay as concurrent as before. */
+    bool fetch_pool_deferred = false;
+    if (valid && bridge->fetch_scheduler != NULL) {
+        size_t reserved = 0;
+        for (size_t i = 0; i < bridge->async_fetch_count; i++) {
+            size_t bound = bridge->async_fetches[i].response_bound;
+            reserved = bound > SIZE_MAX - reserved ? SIZE_MAX
+                                                   : reserved + bound;
+        }
+        size_t pool = bridge->maximum_script_bytes
+                < SCRIPT_RUNTIME_FETCH_POOL_BYTES
+            ? bridge->maximum_script_bytes : SCRIPT_RUNTIME_FETCH_POOL_BYTES;
+        fetch_pool_deferred = reserved != 0
+            && (response_limit > pool || reserved > pool - response_limit);
+    }
+    uint64_t id = valid && !fetch_pool_deferred
+            && bridge->fetch_scheduler != NULL
         ? fetch_scheduler_enqueue(
             bridge->fetch_scheduler, url, &request,
             response_limit, scheduler_timeout_ms)
@@ -1450,18 +1517,24 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
        failed Fetch: return the reserved zero sentinel so it can retain the
        logical request and retry after another native completion.  All policy,
        URL and request-shape failures continue to throw below. */
-    bool scheduler_deferred = id == 0 && valid
+    bool scheduler_deferred = slot_deferred || fetch_pool_deferred
+        || (id == 0 && valid
         && fetch_scheduler_enqueue_would_block(
-               bridge->fetch_scheduler, response_limit);
+               bridge->fetch_scheduler, response_limit));
     script_request_policy_free_referrer(
         context, author_referrer, author_referrer_policy);
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_TRACE_NETWORK_RESPONSES") != NULL) {
         fprintf(stderr,
                 "tilefinch-network-request: id=%llu method=%.*s "
-                "mode=%d credentials=%d body-bytes=%zu url=\"%s\"\n",
+                "mode=%d credentials=%d body-bytes=%zu outcome=%s "
+                "scheduler-error=\"%s\" url=\"%s\"\n",
                 (unsigned long long) id, (int) method_length, method,
                 (int) request_mode, (int) credentials, body_length,
+                id != 0 ? "admitted"
+                    : scheduler_deferred ? "deferred" : "refused",
+                id != 0 || !valid || bridge->fetch_scheduler == NULL ? ""
+                    : fetch_scheduler_last_error(bridge->fetch_scheduler),
                 url[0] == '\0' ? "<invalid>" : url);
     }
 #endif
@@ -1488,8 +1561,12 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
         if (bridge->result != NULL) {
             bridge->result->async_network_quota_rejected++;
         }
-        return JS_ThrowRangeError(
-            context, "async request rejected by origin, context, or quota");
+        /* An origin, CSP, content-blocking, address-space or memory refusal
+           is a Fetch network error: fetch() rejects with a TypeError and XHR
+           fires error.  Concurrency never reaches here (see the deferrals
+           above). */
+        return JS_ThrowTypeError(
+            context, "async request refused by origin, policy, or quota");
     }
     ScriptAsyncFetch *async_fetch =
         &bridge->async_fetches[bridge->async_fetch_count++];
@@ -1498,7 +1575,8 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
         .destination = destination,
         .prefer_text_response = prefer_text_response,
         .integrity = integrity_copy,
-        .integrity_length = integrity_length
+        .integrity_length = integrity_length,
+        .response_bound = response_limit
     };
     snprintf(async_fetch->target_origin, sizeof(async_fetch->target_origin),
              "%s", target_origin);
@@ -2451,6 +2529,17 @@ static void dynamic_cache_revalidate(BrowserSession *session,
         context, grant);
 }
 
+/* A script-inserted element: its nonce or integrity may satisfy a policy,
+   and 'strict-dynamic' admits it without either. */
+static uint8_t dynamic_script_csp_grant(const DomBridge *bridge,
+                                        const ScriptDynamicTask *task)
+{
+    return bridge == NULL || task == NULL || bridge->document == NULL ? 0
+        : tilefinch_csp_element_grant(
+              &bridge->document->content_security_policy,
+              TILEFINCH_DESTINATION_SCRIPT, task->node, false);
+}
+
 static TilefinchRequestContext dynamic_script_request_context(
     const DomBridge *bridge, const ScriptDynamicTask *task)
 {
@@ -2463,7 +2552,8 @@ static TilefinchRequestContext dynamic_script_request_context(
         .credentials = task == NULL ? TILEFINCH_CREDENTIALS_OMIT
                                     : task->credentials,
         .destination = TILEFINCH_DESTINATION_SCRIPT,
-        .initiator_opaque = bridge != NULL && bridge->opaque_origin
+        .initiator_opaque = bridge != NULL && bridge->opaque_origin,
+        .csp_grant = dynamic_script_csp_grant(bridge, task)
     };
 }
 
@@ -2522,7 +2612,12 @@ static bool dynamic_task_take_source(DomBridge *bridge,
         return false;
     }
     bool segmented = false;
-    if (!task->module && length > bridge->maximum_script_file_bytes
+    /* A large resource-loader aggregate compiles one registration at a
+       time: compiling Wikipedia's 1.1 MiB load.php response whole peaks at
+       about nine times its source and exhausted the realm. */
+    if (!task->module
+        && (length > SCRIPT_ADMISSION_LEGACY_UNIT_BYTES
+            || length > bridge->maximum_script_file_bytes)
         && dynamic_source_body_usable(body, length)) {
         segmented = script_resource_loader_plan_create(
             bridge->budget, (const char *) body->data, length,
@@ -2557,6 +2652,8 @@ static bool dynamic_task_take_source(DomBridge *bridge,
             js_rt_saturating_add_size(
                 &bridge->result->dynamic_scripts_quota_rejected, 1);
         }
+        if (length > bridge->maximum_script_file_bytes && !segmented)
+            script_runtime_note_oversized_script(bridge->host, length);
         browser_shared_body_release(body);
         return false;
     }
@@ -2569,6 +2666,32 @@ static bool dynamic_task_take_source(DomBridge *bridge,
     return true;
 }
 
+/* The response bound of a dynamic script request: the realm's remaining
+   source total (a classic response may prove to be a segmentable loader
+   aggregate larger than one file, so it is not cut at the file size; the
+   file size is enforced when the body arrives), and no more than the page
+   Budget can stage while keeping the presentation reserve. Zero when the
+   source total is spent or memory cannot stage even a small script. */
+size_t js_rt_dynamic_response_bound(DomBridge *bridge)
+{
+    if (bridge == NULL) return 0;
+    js_rt_bridge_script_bytes_admit(bridge, bridge->maximum_script_file_bytes);
+    size_t used = bridge->script_quota_bytes;
+    if (bridge->script_quota_reserved_bytes > SIZE_MAX - used) return 0;
+    used += bridge->script_quota_reserved_bytes;
+    if (used >= bridge->maximum_script_bytes) return 0;
+    size_t bound = bridge->maximum_script_bytes - used;
+    if (bridge->budget != NULL) {
+        /* Optional caches (response and bytecode tables) give way before a
+           page script is cut short: at 30.7 MB of m.vk.ru's 32 MiB the
+           64 KiB floor refused the language chunk its login form needed. */
+        size_t affordable = script_admission_affordable_bytes(
+            bridge->budget, SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES, true);
+        if (bound > affordable) bound = affordable;
+    }
+    return bound;
+}
+
 bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
                         ScriptDynamicTask *task, bool *deferred)
 {
@@ -2576,6 +2699,15 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     if (deferred != NULL) *deferred = false;
     if (task == NULL || !task->active
         || task->state != SCRIPT_DYNAMIC_QUEUED) return true;
+    /* A fresh cache hit never reaches the transport's CSP check. */
+    if (bridge->document != NULL && !tilefinch_csp_allows_request_granted(
+            &bridge->document->content_security_policy,
+            TILEFINCH_DESTINATION_SCRIPT, task->request_url,
+            dynamic_script_csp_grant(bridge, task))) {
+        task->state = SCRIPT_DYNAMIC_READY;
+        task->success = false;
+        return true;
+    }
 
     /* Borrowed cache metadata is safe to inspect before reservation.  An
        exact fresh-body length avoids pinning a file-sized quota slice for a
@@ -2609,18 +2741,29 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
             bridge->session, task->request_url, &resource_context,
             js_rt_monotonic_time_ns(), &cached);
     }
-    size_t requested_bytes = bridge->maximum_script_file_bytes;
-    if (cache_status == BROWSER_CACHE_FRESH && cached != NULL) {
-        requested_bytes = cached->length;
-    }
-    ScriptQuotaReserveResult quota_status =
-        cache_status == BROWSER_CACHE_FRESH && cached != NULL
+    /* A fresh cache hit reserves its exact length. A network response's
+       length is unknown until it completes, so it holds no source bytes
+       while in flight and is admitted against its exact length when it
+       arrives (dynamic_task_take_source). Reserving a file-sized slice
+       here let a few pending requests, or one that stalled, exhaust the
+       realm's source quota and defer every later dynamic script. */
+    bool fresh_hit = cache_status == BROWSER_CACHE_FRESH && cached != NULL;
+    ScriptQuotaReserveResult quota_status = fresh_hit
         ? js_rt_bridge_script_quota_reserve_known(
               bridge, SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE,
-              requested_bytes, &task->quota_reservation)
+              cached->length, &task->quota_reservation)
         : js_rt_bridge_script_quota_reserve(
-              bridge, SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE,
-              requested_bytes, &task->quota_reservation);
+              bridge, SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE, 0,
+              &task->quota_reservation);
+    size_t network_bound = 0;
+    if (!fresh_hit && quota_status == SCRIPT_QUOTA_RESERVE_GRANTED) {
+        network_bound = js_rt_dynamic_response_bound(bridge);
+        if (network_bound == 0) {
+            js_rt_bridge_script_quota_abort(
+                bridge, &task->quota_reservation);
+            quota_status = SCRIPT_QUOTA_RESERVE_REJECTED;
+        }
+    }
     if (quota_status == SCRIPT_QUOTA_RESERVE_DEFERRED) {
         if (deferred != NULL) *deferred = true;
         return true;
@@ -2727,19 +2870,9 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     if (bridge->fetch_scheduler == NULL) {
         bridge->fetch_scheduler = script_runtime_fetch_scheduler(runtime);
     }
-    size_t response_limit = task->quota_reservation.reserved_bytes;
-    if (!task->module
-        && bridge->script_quota_bytes < bridge->maximum_script_bytes) {
-        /*
-         * A classic response may prove to be a safely segmentable loader
-         * aggregate only after the complete bounded body is available.
-         * Keep the ordinary logical reservation at the per-file ceiling so
-         * unrelated async scripts remain concurrent; an accepted aggregate
-         * atomically expands to its exact size before quota commit.
-         */
-        response_limit =
-            bridge->maximum_script_bytes - bridge->script_quota_bytes;
-    }
+    /* A stale entry being revalidated has no exact reservation either. */
+    size_t response_limit = network_bound != 0 ? network_bound
+        : task->quota_reservation.reserved_bytes;
     ScriptRequestPolicy policy;
     FetchRequest request = {
         .method = "GET", .allow_http_errors = true,
@@ -2764,6 +2897,7 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
                task->credentials, TILEFINCH_DESTINATION_SCRIPT, true,
                &policy);
     if (valid) {
+        policy.context.csp_grant = dynamic_script_csp_grant(bridge, task);
         policy.referrer_policy = js_rt_runtime_module_referrer_policy_text(
             task->incoming_referrer_policy);
         valid = policy.referrer_policy != NULL;
@@ -3031,6 +3165,7 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
         }
     }
     budget_free(bridge->budget, replacement_response_url);
+    task->response_no_store = script_response_no_store(fetched);
     if (success) {
         success = dynamic_task_take_source(bridge, task, body, length);
         body = NULL;
@@ -3110,30 +3245,55 @@ ScriptQuotaProgressResult script_runtime_script_quota_progress(
 }
 
 static bool dynamic_admit_compile(ScriptRuntime *runtime,
-                                  size_t working_bytes, bool continuing_classic)
+                                  size_t unit_bytes, bool continuing_classic)
 {
-    /* Scale the initial reserve with the source, up to the existing 512 KiB
-       ceiling. A tiny late registration does not require half a MiB merely
+    /* Plan on the unit's measured median compile working set
+       (script_admission.h); a unit that needs more is stopped by the heap
+       limit and refused at compile time with the realm intact. */
+    size_t working_bytes = script_admission_compile_peak(unit_bytes);
+    /* Scale the initial reserve with the source, up to the execution
+       reserve. A tiny late registration does not require half a MiB merely
        because earlier scripts legitimately retained their initialized state.
-       A continued
-       classic script has already passed that admission and may legitimately
-       retain registrations in it. Re-demanding the entire startup reserve
-       at every tail statement can discard an otherwise runnable remainder.
+       A continued classic script has already passed that admission and may
+       legitimately retain registrations in it. Re-demanding the entire
+       startup reserve at every tail statement can discard an otherwise
+       runnable remainder.
        Keep a bounded compiler/dispatch floor plus the segment's source size;
        the unchanged hard heap/Budget limits remain authoritative. */
-    size_t floor = 64u * 1024u;
-    if (!continuing_classic) {
-        const size_t maximum = SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES;
-        floor = working_bytes >= (maximum - floor) / 8u
-            ? maximum : floor + working_bytes * 8u;
-    }
-    size_t reserve = working_bytes > floor ? working_bytes : floor;
+    size_t floor = continuing_classic
+        ? SCRIPT_ADMISSION_WORK_FLOOR_BYTES
+        : script_admission_work_reserve(
+              unit_bytes, SCRIPT_ADMISSION_DYNAMIC_HEAP_MULTIPLIER,
+              SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES);
+    size_t reserve = floor;
+    /* Admission asks whether the planned working set fits the heap the
+       realm can still reach. */
     bool budget_pressure = budget_pressure_required(
         runtime->budget, working_bytes, reserve);
-    size_t heap = script_runtime_heap_remaining(runtime);
+    size_t heap = script_runtime_heap_available(runtime);
     bool heap_pressure = working_bytes > heap
         || reserve > heap - (working_bytes > heap ? heap : working_bytes);
-    if (!budget_pressure && !heap_pressure) return true;
+    if (!budget_pressure && !heap_pressure) {
+        /* Admitted. When the source and its reserve do not fit the heap's
+           current limit, collect before growing it, paced like every
+           other compile-pressure collection (js_rt_compile_source_type):
+           only while growth cannot cover them, or once enough has been
+           allocated since the last collection to pay for it
+           (js_rt_gc_due). A growable realm sits near its limit, so an
+           unpaced collection here ran before almost every dynamic
+           script, each a full mark that freed nothing. */
+        size_t source_reserve = unit_bytes > floor ? unit_bytes : floor;
+        size_t current = script_runtime_heap_remaining(runtime);
+        bool tight = unit_bytes > current
+            || source_reserve > current - unit_bytes;
+        bool growth_short = budget_pressure_required(
+                runtime->budget, unit_bytes, source_reserve)
+            || unit_bytes > heap || source_reserve > heap - unit_bytes;
+        if (tight && (growth_short || js_rt_gc_due(runtime)))
+            (void) script_runtime_collect_and_trim(runtime);
+        return true;
+    }
+    /* The last resort before refusing the compile. */
     (void) script_runtime_collect_and_trim(runtime);
     if (runtime->session != NULL
         && runtime->session->budget == runtime->budget) {
@@ -3210,6 +3370,7 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
             if (!task->active || task->state != SCRIPT_DYNAMIC_READY) {
                 continue;
             }
+            if (js_rt_heavy_gate_holds(runtime, task)) continue;
             if (dynamic_ordered_blocked(bridge, task)) {
                 if (bridge->result != NULL) {
                     js_rt_saturating_add_size(
@@ -3283,20 +3444,12 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                     &selected->resource_timing);
             }
             ScriptLazyWebpackPlan lazy_plan;
-            bool has_lazy_plan = !selected->module
-                && selected->source_body != NULL
-                && selected->source_length
-                       >= SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES
-                && getenv("TILEFINCH_DISABLE_LAZY_WEBPACK") == NULL
-                && script_lazy_webpack_plan_create(
-                       runtime->budget, source, selected->source_length,
+            /* The planner, or a bundle record of exactly these bytes. */
+            bool has_lazy_plan = selected->source_body != NULL
+                && script_runtime_lazy_webpack_plan_eligible(
+                       runtime, runtime->budget, selected->request_url,
+                       source, selected->source_length, selected->module,
                        &lazy_plan);
-            if (has_lazy_plan
-                && lazy_plan.factory_source_bytes
-                       < selected->source_length / 2) {
-                script_lazy_webpack_plan_destroy(&lazy_plan);
-                has_lazy_plan = false;
-            }
             bool resource_loader_preflight =
                 selected->resource_loader_plan.statement_count != 0
                 && selected->resource_loader_preflight_statement
@@ -3370,11 +3523,13 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                             ? js_rt_preflight_external_classic_segment(
                                   runtime, selected_node,
                                   selected->resource_loader_source,
-                                  statement->source_length, source_url)
+                                  statement->source_length, source_url,
+                                  index, selected->response_no_store)
                             : js_rt_evaluate_external_classic_segment(
                                runtime, selected_node,
                                selected->resource_loader_source,
                                statement->source_length, source_url,
+                               index, selected->response_no_store,
                                final_segment));
                     if (evaluated && final_segment
                         && selected->resource_loader_plan
@@ -3415,11 +3570,16 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                     BrowserSharedBody *lease = browser_shared_body_retain(
                         selected->source_body);
                     if (lease != NULL) {
+                        ScriptLazyBundleRecordTarget record = {
+                            .request_url = selected->request_url,
+                            .body = selected->source_body,
+                            .no_store = selected->response_no_store
+                        };
                         ScriptLazyEvaluation lazy =
-                            script_runtime_evaluate_external_lazy_webpack(
+                            script_runtime_evaluate_external_lazy_webpack_recorded(
                                 runtime, selected_node, source,
                                 selected->source_length, source_url,
-                                &lazy_plan, lease,
+                                &lazy_plan, &record, lease,
                                 dynamic_source_lease_release, NULL);
                         handled = lazy != SCRIPT_LAZY_EVALUATION_FALLBACK;
                         if (!handled) browser_shared_body_release(lease);
@@ -3428,17 +3588,18 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                 }
                 if (!handled) {
                     bool evaluated = selected->module
-                        ? script_runtime_evaluate_external_module_context(
+                        ? script_runtime_evaluate_external_module_response(
                               runtime, selected_node, source,
                               selected->source_length, selected->request_url,
                               source_url,
                               js_rt_runtime_module_referrer_policy_text(
                                   selected->effective_referrer_policy),
-                              selected->credentials, NULL)
-                        : script_runtime_evaluate_external_typed(
+                              selected->credentials,
+                              selected->response_no_store, NULL)
+                        : js_rt_evaluate_external_classic_dynamic(
                               runtime, selected_node, source,
-                              selected->source_length, source_url, false,
-                              NULL);
+                              selected->source_length, source_url,
+                              selected->response_no_store);
                     fatal = !evaluated
                         && dynamic_runtime_failure_is_fatal(
                                runtime, failures_before);

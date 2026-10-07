@@ -543,7 +543,7 @@
       traversalStates.set(object, state);
       return object;
     };
-    Document.prototype.createTreeWalker = function (
+    Document.prototype.createTreeWalker = function createTreeWalker(
       root,
       whatToShow = 0xffffffff,
       filter = null,
@@ -556,7 +556,7 @@
         filter,
       );
     };
-    Document.prototype.createNodeIterator = function (
+    Document.prototype.createNodeIterator = function createNodeIterator(
       root,
       whatToShow = 0xffffffff,
       filter = null,

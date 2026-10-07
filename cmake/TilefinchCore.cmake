@@ -5,7 +5,9 @@ set(TILEFINCH_CORE_SOURCES
     src/budget.c
     src/frame_pumps.c
     src/preview_policy.c
+    src/declarative_refresh.c
     src/tilefinch_test_faults.c
+    src/bot_wall.c
     src/captive_portal.c
     src/content_blocker.c
     src/content_security_policy.c
@@ -15,6 +17,7 @@ set(TILEFINCH_CORE_SOURCES
     src/data_url.c
     src/diagnostics.c
     src/document.c
+    src/document_adopted_sheets.c
     src/document_backing.c
     ${PSP_BROWSER_TRANSPORT_SOURCE}
     src/fetch_fault.c
@@ -24,8 +27,10 @@ set(TILEFINCH_CORE_SOURCES
     src/gamepad.c
     src/glyph_component.c
     src/glyph_component_store.c
+    src/glyph_pack_offer.c
     src/image.c
     src/image_decode.c
+    src/image_retarget.c
     src/image_svg_decode.c
     src/install_paths.c
     src/generated/js_bootstrap.c
@@ -79,6 +84,7 @@ set(TILEFINCH_CORE_SOURCES
     src/psp_network_supervisor.c
     src/public_suffix.c
     src/render.c
+    src/canvas_ge_presenter.c
     src/reader_mode.c
     src/request_context.c
     src/resource_integrity.c
@@ -87,12 +93,16 @@ set(TILEFINCH_CORE_SOURCES
     src/section_router.c
     src/section_store.c
     src/sha256.c
+    src/script_admission.c
     src/script_lazy.c
     src/script_loader.c
     src/session.c
     src/session_persistence.c
+    src/session_lazy_bundle.c
+    src/session_script_disk.c
     src/session_site_storage.c
     src/site_adapter.c
+    src/site_identity.c
     src/style.c
     src/style_has_invalidation.c
     src/style_match.c
@@ -106,6 +116,7 @@ set(TILEFINCH_CORE_SOURCES
     src/swdec_component_store.c
     src/tls_session_store.c
     src/text_bidi.c
+    src/text_encoding.c
     src/url.c
     src/web_app_manifest.c
     src/update_manifest.c

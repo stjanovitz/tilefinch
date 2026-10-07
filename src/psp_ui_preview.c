@@ -1,4 +1,5 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_reader_policy.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
@@ -374,11 +375,17 @@ int main(int argc, char **argv)
         ui.toast_frames = 0;
     } else if (strcmp(mode, "site-storage") == 0
                || strcmp(mode, "site-storage-caches") == 0
+               || strcmp(mode, "site-storage-compiled") == 0
                || strcmp(mode, "storage-site") == 0) {
         ui.screen = strcmp(mode, "storage-site") == 0
             ? PSP_UI_SCREEN_STORAGE_SITE : PSP_UI_SCREEN_DATA_OPTIONS;
+        /* Three listed sites, then the fixed rows: Disk cache is the
+           fourth, Keep compiled scripts the fifth. */
         ui.data_options_selection =
-            strcmp(mode, "site-storage-caches") == 0 ? 8 : 0;
+            strcmp(mode, "site-storage-caches") == 0 ? 6
+            : strcmp(mode, "site-storage-compiled") == 0 ? 7 : 0;
+        ui.keep_compiled_scripts = true;
+        ui.compiled_scripts_kib = 3277;
         ui.site_storage_offers = true;
         ui.live_cache_kib = 1024;
         ui.persistent_cache_mb = 4;
@@ -389,6 +396,77 @@ int main(int argc, char **argv)
                                   75u * 1024u, 4u * 1024u * 1024u, true,
                                   UINT64_C(1288490188));
         ui.overlay_animation_frames = 0;
+        ui.toast_frames = 0;
+    } else if (strncmp(mode, "language-pack-", 14) == 0) {
+        /* The in-page language-pack offer and the toasts that follow an
+           answer, over a Russian news page; pass a lab frame of a Cyrillic
+           page rendered with the PSP faces as the third argument to see the
+           blank cells it explains. */
+        psp_ui_set_page(&ui, "Новости Тайлфинча",
+                        "https://news.example.ru/", true);
+        psp_ui_set_history(&ui, true, false);
+        psp_ui_set_scroll(&ui, 0, 412);
+        psp_ui_set_focus(&ui, false, 0, 0, 0, 0);
+        if (strstr(mode, "-large") != NULL) ui.browser_ui_scale = 2;
+        if (strncmp(mode, "language-pack-offer", 19) == 0) {
+            psp_ui_show_glyph_offer(
+                &ui, strstr(mode, "-chinese") != NULL
+                         ? TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL
+                         : TILEFINCH_GLYPH_PACK_CYRILLIC);
+        } else if (strncmp(mode, "language-pack-confirm", 21) == 0) {
+            /* The second step, reached with X on the offer. The size is
+               the one a signed Cyrillic manifest would carry. */
+            psp_ui_show_glyph_offer(&ui, TILEFINCH_GLYPH_PACK_CYRILLIC);
+            PspUiInput arm = {.analog_x = 128, .analog_y = 128,
+                              .elapsed_ms = 100};
+            for (int frame = 0; frame < 7; frame++)
+                (void) psp_ui_update(&ui, &arm);
+            arm.pressed = PSP_UI_BUTTON_CONFIRM;
+            (void) psp_ui_update(&ui, &arm);
+            if (strstr(mode, "-ready") != NULL)
+                psp_ui_set_glyph_offer_size(
+                    &ui, TILEFINCH_GLYPH_PACK_CYRILLIC, 1101004u);
+            else if (strstr(mode, "-error") != NULL)
+                psp_ui_set_glyph_offer_error(
+                    &ui, TILEFINCH_GLYPH_PACK_CYRILLIC,
+                    "NETWORK NOT READY FOR FONT PACK");
+            ui.overlay_animation_frames = 0;
+            ui.toast_frames = 0;
+        } else if (strncmp(mode, "language-pack-progress", 22) == 0) {
+            psp_ui_show_status(&ui, "Cyrillic pack: downloading 45%", 240);
+        } else if (strncmp(mode, "language-pack-installed", 23) == 0) {
+            psp_ui_show_status(&ui, "Cyrillic language pack installed",
+                               240);
+        } else if (strncmp(mode, "language-pack-declined", 22) == 0) {
+            psp_ui_show_status(
+                &ui, "Won't ask again. Install it later in\n"
+                     "Settings > Appearance > Language & emoji", 300);
+        } else if (strncmp(mode, "language-pack-error", 19) == 0) {
+            psp_ui_show_status(&ui, "NOT ENOUGH FREE SPACE FOR UPDATE", 240);
+        }
+        ui.toast_entry_frames = 0;
+    } else if (strcmp(mode, "heavy-offer") == 0) {
+        /* m.vk.ru logged out: 5.3 MB of script, about 51 s to start. */
+        psp_ui_set_page(&ui, "VK", "https://m.vk.ru/", true);
+        psp_ui_show_heavy_offer(&ui, "vk.ru", 5327443u, 50807u);
+        ui.overlay_animation_frames = 0;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "heavy-over") == 0) {
+        psp_ui_set_page(&ui, "VK", "https://m.vk.ru/", true);
+        psp_ui_show_heavy_recovery(
+            &ui, "ITS SCRIPTS NEED ABOUT 9.5 MB MORE MEMORY; 8.4 MB IS FREE",
+            PSP_UI_FAILURE_BASIC_VIEW | PSP_UI_FAILURE_READER
+                | PSP_UI_FAILURE_DISABLE_JAVASCRIPT);
+        ui.overlay_animation_frames = 0;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "heavy-status") == 0) {
+        psp_ui_set_page(&ui, "Reuters", "https://www.reuters.com/", true);
+        psp_ui_show_heavy_scripts_status(
+            &ui, "PAGE SCRIPTS: 2.3 MB, ABOUT 23 SECONDS", 300u);
+        ui.toast_entry_frames = 0;
+    } else if (strcmp(mode, "heavy-setting") == 0) {
+        ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
+        ui.options_selection = argc > 4 ? (uint8_t) atoi(argv[4]) : 44;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "page-tools") == 0) {
         ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
@@ -444,10 +522,14 @@ int main(int argc, char **argv)
             BROWSER_CHROME_THEME_CUSTOM
             + (custom == SIZE_MAX ? 0u : custom));
         ui.toast_frames = 0;
-    } else if (strcmp(mode, "glyph-options") == 0) {
+    } else if (strcmp(mode, "glyph-options") == 0
+               || strcmp(mode, "glyph-options-offers") == 0
+               || strcmp(mode, "glyph-options-reset") == 0) {
         ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
         ui.glyph_language = BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED;
-        ui.glyph_options_selection = 0;
+        ui.glyph_options_selection =
+            strcmp(mode, "glyph-options-offers") == 0 ? 4u
+            : strcmp(mode, "glyph-options-reset") == 0 ? 5u : 0u;
         ui.glyph_installed_mask =
             (uint16_t) (1u << TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
         ui.toast_frames = 0;
@@ -597,11 +679,31 @@ int main(int argc, char **argv)
         psp_ui_set_loading(&ui, true, 380);
         ui.loading_phase = 46u;
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "refresh-offer") == 0
+               || strcmp(mode, "refresh-offer-large") == 0) {
+        /* A same-URL meta refresh came due on a page the reader had used:
+           the note that offers the reload (psp_begin_script_navigation). */
+        if (strcmp(mode, "refresh-offer-large") == 0)
+            ui.browser_ui_scale = 2;
+        psp_ui_show_status(&ui, PSP_UI_STATUS_RELOAD_OFFER, 600);
+        ui.toast_entry_frames = 0;
     } else if (strcmp(mode, "tls-error") == 0) {
         ui.browser_ui_scale = 2;
         psp_ui_show_status(
             &ui, "YouTube page fetch failed\n"
                  "Try correcting PSP date/time, then retry", 300);
+        ui.toast_entry_frames = 0;
+    } else if (strcmp(mode, "bot-wall") == 0) {
+        /* The notice over a bot-protection wall (navigation_bot_wall);
+           the optional fourth argument names the site, the fifth the
+           page title and the sixth its URL. */
+        psp_ui_set_page(&ui, argc > 5 ? argv[5] : "example.com",
+                        argc > 6 ? argv[6] : "https://example.com/", true);
+        psp_ui_set_history(&ui, false, false);
+        psp_ui_set_scroll(&ui, 0, 0);
+        psp_ui_set_focus(&ui, false, 0, 0, 0, 0);
+        (void) psp_ui_show_site_blocked_status(
+            &ui, argc > 4 ? argv[4] : "example.com", 480);
         ui.toast_entry_frames = 0;
     } else if (strcmp(mode, "page-capture") == 0
                || strcmp(mode, "reader-capture") == 0) {
@@ -611,6 +713,12 @@ int main(int argc, char **argv)
         ui.reader_mode = strcmp(mode, "reader-capture") == 0;
         ui.toast_frames = 0;
         psp_ui_set_focus(&ui, false, 0, 0, 0, 0);
+    } else if (strcmp(mode, "reader-auto-note") == 0) {
+        /* The note Auto Reader shows over the page it switched to Reader
+           (pass the Reader page frame as the third argument). */
+        psp_ui_set_focus(&ui, false, 0, 0, 0, 0);
+        psp_reader_mark_engaged(&ui, true);
+        ui.toast_entry_frames = 0;
     } else if (strcmp(mode, "large") == 0) {
         ui.browser_ui_scale = 2;
     } else if (preview_media_mode(mode)) {

@@ -323,7 +323,8 @@ static bool test_caught_allocation_keeps_bounded_reader_runtime(void)
         "document.body.className='staged';"
         "try{new ArrayBuffer(8*1024*1024)}catch(error){"
         "globalThis.pocSummary='caught-bounded'}},1)</script></body>";
-    const size_t paragraph_count = 600u;
+    /* More paragraphs than the largest (4,096-node) extraction bound. */
+    const size_t paragraph_count = 4200u;
     const size_t html_length = sizeof(prefix) - 1u
         + paragraph_count * (sizeof(unit) - 1u)
         + sizeof(suffix) - 1u;
@@ -443,6 +444,128 @@ static bool test_caught_large_allocation_does_not_reveal_raw_app_shell(void)
     return ok && clean;
 }
 
+/* A content page whose app runs out of memory and tears the server page
+   down in the same task (React unmounts its root on an uncaught render
+   error; xe.com's 1 MB app did this once admission let it run). The body
+   carries a large data script, as xe.com's does, so only a script-free copy
+   fits the snapshot bound. `tear_down` false is the control: the same
+   refusal with the page left intact keeps its realm. */
+static bool memory_rescue_page_run(bool tear_down, bool *rescued_out,
+                                   bool *runtime_kept_out,
+                                   bool *content_out, bool *data_gone_out,
+                                   bool *copy_released_out)
+{
+    static const char prefix[] =
+        "<!doctype html><title>Memory rescue</title><body><main id=survivor>"
+        "<h1>Server-rendered exchange rates</h1><p>This complete "
+        "server-rendered page shows its useful text and links before its "
+        "application starts, and must not end blank because the "
+        "application ran out of memory while starting.</p>"
+        "<a id=survivor-link href='/next'>Next rates</a></main>"
+        "<script type=application/json id=page-data>{\"filler\":\"";
+    static const char teardown_suffix[] =
+        "\"}</script><script>setTimeout(()=>{let keep=[];"
+        "try{for(;;)keep.push(new ArrayBuffer(256*1024))}catch(error){}"
+        "keep=null;document.body.textContent='';"
+        "globalThis.pocSummary='torn-down'},1)</script></body>";
+    static const char control_suffix[] =
+        "\"}</script><script>setTimeout(()=>{let keep=[];"
+        "try{for(;;)keep.push(new ArrayBuffer(256*1024))}catch(error){}"
+        "keep=null;globalThis.pocSummary='kept'},1)</script></body>";
+    const char *suffix = tear_down ? teardown_suffix : control_suffix;
+    size_t suffix_length = strlen(suffix);
+    /* Past the 256 KiB body snapshot bound with its scripts. */
+    const size_t filler = 300u * 1024u;
+    size_t html_length = sizeof(prefix) - 1u + filler + suffix_length;
+    char *html = malloc(html_length + 1u);
+    if (html == NULL) return false;
+    memcpy(html, prefix, sizeof(prefix) - 1u);
+    memset(html + sizeof(prefix) - 1u, 'x', filler);
+    memcpy(html + sizeof(prefix) - 1u + filler, suffix, suffix_length + 1u);
+
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        /* Heap growth stays on: the rescue copy is taken as growth is
+           refused. */
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://memory-rescue.test/", html,
+        html_length, 480, NULL, NULL, true);
+    free(html);
+    size_t links_before = committed ? navigation.page.layout.link_count : 0;
+    size_t rejections_before = committed && navigation.page.runtime != NULL
+        ? script_runtime_heap_rejections(navigation.page.runtime) : 0;
+    bool advanced = committed;
+    for (int tick = 0; advanced && tick < 3; tick++)
+        advanced = navigation_advance_runtime(&navigation, 2, 4);
+    bool refused = navigation.page.runtime == NULL
+        || script_runtime_heap_rejections(navigation.page.runtime)
+               > rejections_before;
+    lxb_dom_node_t *root = advanced
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    *rescued_out = advanced && navigation_page_memory_rescued(&navigation);
+    *runtime_kept_out = advanced && navigation.page.runtime != NULL;
+    *content_out = advanced && links_before != 0u
+        && test_find_id(root, "survivor") != NULL
+        && test_find_id(root, "survivor-link") != NULL
+        && !navigation_layout_is_visually_blank(&navigation.page.layout)
+        && navigation.page.layout.link_count == links_before;
+    *data_gone_out = advanced && test_find_id(root, "page-data") == NULL;
+    DocumentBodySnapshot leftover = {0};
+    *copy_released_out = !(navigation.page.runtime != NULL
+        && script_runtime_take_memory_rescue(
+               navigation.page.runtime, &leftover));
+    document_body_snapshot_destroy(&leftover);
+    bool ok = committed && advanced && refused;
+    if (!ok || (tear_down && !*rescued_out)) {
+        fprintf(stderr,
+                "memory rescue tear-down=%d committed=%d advanced=%d "
+                "refused=%d rescued=%d runtime=%p links=%zu/%zu "
+                "commands=%zu summary=\"%s\" error=\"%s\"\n",
+                tear_down, committed, advanced, refused, *rescued_out,
+                (void *) navigation.page.runtime, links_before,
+                navigation.page.layout.link_count,
+                navigation.page.layout.count,
+                navigation.page.script_result.summary,
+                navigation.page.script_result.error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_memory_exhaustion_restores_torn_down_server_page(void)
+{
+    bool rescued = false, runtime_kept = true, content = false;
+    bool data_gone = false, released = false;
+    bool ran = memory_rescue_page_run(true, &rescued, &runtime_kept,
+                                      &content, &data_gone, &released);
+    return ran && rescued && !runtime_kept && content && data_gone
+        && released;
+}
+
+static bool test_memory_refusal_keeps_intact_page_and_realm(void)
+{
+    bool rescued = true, runtime_kept = false, content = false;
+    bool data_gone = true, released = false;
+    bool ran = memory_rescue_page_run(false, &rescued, &runtime_kept,
+                                      &content, &data_gone, &released);
+    return ran && !rescued && runtime_kept && content && !data_gone
+        && released;
+}
+
 static bool test_late_script_oom_frees_queued_frame_messages(void)
 {
     static const char html[] =
@@ -458,7 +581,8 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
            retirement trigger must not depend on the bootstrap's size. */
         "{const m=performance.memory;globalThis.filler=[];"
         "let room=m.jsHeapSizeLimit-m.usedJSHeapSize-80*1024;"
-        "while(room>=65536){filler.push(new ArrayBuffer(65536));room-=65536}}"
+        "while(room>=65536){filler.push(new ArrayBuffer(65536));room-=65536}"
+        "if(room>0)filler.push(new ArrayBuffer(room))}"
         "setTimeout(()=>{"
         "document.body.className='staged';"
         "setTimeout("

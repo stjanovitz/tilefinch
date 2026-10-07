@@ -127,13 +127,10 @@ static PspDisplay psp_display;
 
 static void psp_present(const uint16_t *frame)
 {
-    uint16_t *vram = psp_display_back_buffer(&psp_display);
-    if (vram == NULL) return;
-    for (int y = 0; y < PSP_SCREEN_HEIGHT; y++) {
-        memcpy(vram + (size_t) y * PSP_VRAM_STRIDE,
-               frame + (size_t) y * PSP_SCREEN_WIDTH,
-               PSP_SCREEN_WIDTH * sizeof(*frame));
-    }
+    /* Fixture presentation does not establish a verified VFPU owner. Keep
+       the shared helper's exact fallback instead of assuming thread flags. */
+    if (psp_display_copy_rgb565_rows(&psp_display, frame,
+            0u, PSP_SCREEN_HEIGHT, false) < 0) return;
     (void) psp_display_publish(&psp_display);
 }
 

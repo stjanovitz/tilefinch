@@ -2,6 +2,7 @@
 #define TILEFINCH_REQUEST_CONTEXT_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum {
     TILEFINCH_REQUEST_MODE_NAVIGATE = 0,
@@ -47,6 +48,10 @@ typedef struct {
     bool initiator_opaque;
     bool top_level_navigation;
     bool user_activated;
+    /* The initiating element's CSP grant (tilefinch_csp_request_grant):
+       which policies its nonce or integrity already satisfied, and whether
+       the parser inserted it. Rechecked on every redirect hop. */
+    uint8_t csp_grant;
 } TilefinchRequestContext;
 
 typedef enum {

@@ -184,6 +184,88 @@ int main(void)
     d = preview_policy_decide(&policy, &in);
     CHECK(d.action == PREVIEW_ACTION_FIRST && d.fresh);
 
+    /* An attempt that laid out but showed nothing (a header of boxes and
+       unresolved image slots): the same prefix would show the same nothing,
+       so the next waits for more rendering elements, doubled each time,
+       however many bytes (a megabyte inline script adds no element)
+       arrive -- unless the parsed body doubles. */
+    preview_policy_init(&policy);
+    in = input_at(100000, 60, 0);
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST);
+    preview_policy_note_check(&policy, &d);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    preview_policy_empty(&policy, &d, in.closed_content_elements, false);
+    CHECK(preview_policy_awaiting_first(&policy)
+          && policy.empty_attempts == 1
+          && policy.empty_wait_elements == PREVIEW_POLICY_EMPTY_ELEMENTS);
+    in.parsed_bytes += 4 * PREVIEW_POLICY_REFRESH_BYTES;
+    in.closed_content_elements += PREVIEW_POLICY_EMPTY_ELEMENTS - 1;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_NONE && strcmp(d.reason, "empty") == 0);
+    in.closed_content_elements += 1;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && d.fresh && d.limit_y == BASE);
+    preview_policy_note_check(&policy, &d);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    preview_policy_empty(&policy, &d, in.closed_content_elements, false);
+    CHECK(policy.empty_wait_elements == 2 * PREVIEW_POLICY_EMPTY_ELEMENTS);
+    /* Bytes alone, short of doubling the body, never retry. */
+    size_t empty_at = in.parsed_bytes;
+    in.parsed_bytes = 2 * empty_at - 1;
+    in.closed_content_elements += 2 * PREVIEW_POLICY_EMPTY_ELEMENTS - 1;
+    for (unsigned i = 0; i < 8; i++) {
+        d = preview_policy_decide(&policy, &in);
+        CHECK(d.action == PREVIEW_ACTION_NONE
+              && strcmp(d.reason, "empty") == 0);
+    }
+    in.parsed_bytes = 2 * empty_at;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && d.fresh);
+    /* One that shows content paints as before; the backoff no longer
+       applies once the first screen is out of the NONE phase... */
+    (void) attempt(&policy, &in, 408, true, true);
+    CHECK(policy.phase == PREVIEW_PHASE_SETTLED);
+    /* ...and the doubling is bounded. */
+    preview_policy_init(&policy);
+    in = input_at(100000, 60, 0);
+    for (unsigned i = 0; i < 40; i++) {
+        d = preview_policy_decide(&policy, &in);
+        CHECK(d.action == PREVIEW_ACTION_FIRST);
+        preview_policy_note_check(&policy, &d);
+        preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+        preview_policy_empty(&policy, &d, in.closed_content_elements, false);
+        CHECK(policy.empty_wait_elements
+              <= PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT);
+        in.closed_content_elements += policy.empty_wait_elements;
+    }
+    CHECK(policy.empty_wait_elements == PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT);
+    /* An empty attempt that covered the first screen (it reached its
+       limit) waits for the body to double, however many elements. */
+    preview_policy_init(&policy);
+    in = input_at(100000, 60, 0);
+    d = preview_policy_decide(&policy, &in);
+    preview_policy_note_check(&policy, &d);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    preview_policy_empty(&policy, &d, in.closed_content_elements, true);
+    in.closed_content_elements += PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT - 1;
+    in.parsed_bytes = 2 * 100000 - 1;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_NONE && strcmp(d.reason, "empty") == 0);
+    in.parsed_bytes += 1;
+    CHECK(preview_policy_decide(&policy, &in).action == PREVIEW_ACTION_FIRST);
+    /* An empty extension is an ordinary failure (no first-screen wait). */
+    preview_policy_init(&policy);
+    in = input_at(10000, 60, 0);
+    (void) attempt(&policy, &in, 1200, true, true);
+    in.reader_y = 1000;
+    preview_policy_observe(&policy, &in);
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_EXTEND);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    preview_policy_empty(&policy, &d, in.closed_content_elements, false);
+    CHECK(!policy.building && policy.empty_attempts == 0);
+
     /* Given up under memory pressure: nothing more, ever. */
     preview_policy_abandon(&policy);
     CHECK(!preview_policy_awaiting_first(&policy));

@@ -45,6 +45,42 @@ Both ordinary and validation named cross-build targets and all 149 enabled
 host tests passed. These are linked ELF measurements, not estimates of
 archive members that may already have been discarded by the linker.
 
+A later wire-neutral trim (2026-10-05) removed Mbed TLS modules that only
+generic dispatch tables reached: RIPEMD-160, SHA-3, NIST key wrap, DES,
+PKCS#5/#7/#12, CRL parsing, persistent PSA key storage, DTLS, the TLS 1.2
+static-PSK key exchanges (never offered without a configured PSK) and the
+CFB/OFB/XTS cipher modes. The ClientHello, the offered groups, signature
+algorithms and cipher suites, and the serialized-session header are
+unchanged. Ordinary `.text` fell from 4,759,308 to 4,716,056 bytes and
+`.rodata` from 2,146,444 to 2,136,380 bytes.
+
+curl is built with `CURL_DISABLE_VERBOSE_STRINGS`: the browser never sets
+`CURLOPT_VERBOSE` or a debug callback, so `infof()` and the `CURL_TRC_*`
+trace text could never be emitted. Upstream ties the `curl_*_strerror()`
+message tables to the same switch; the PSP curl patch keeps them under
+`TILEFINCH_CURL_KEEP_STRERROR`, so error pages and logs read exactly as
+before, and `failf()` messages in the error buffer are unaffected. This
+removed 52,808 bytes of `.text` and 21,296 bytes of `.rodata`. Changing
+`patches/curl-8.22.0-psp.patch` now re-extracts the curl archive in an
+existing build tree, because ExternalProject reruns a patch step only when
+its command line changes.
+
+A second wire-neutral trim (2026-10-06) removed transport code that no
+client path reaches. curl is built without HTTP authentication (the browser
+never holds a credential and `tilefinch_url_parse` rejects URLs with
+userinfo), without its date parser (only `TIMECONDITION`, `FILETIME`,
+cookies, HSTS, alt-svc and the unread `CURLINFO_RETRY_AFTER` used it) and
+without local-address binding. The PSP curl patch compiles out the client
+certificate and private-key loaders (`TILEFINCH_CURL_NO_CLIENT_CERT`) and
+the cipher-list parser (`TILEFINCH_CURL_NO_CIPHER_LIST`; the default
+`mbedtls_ssl_list_ciphersuites()` is still what the ClientHello offers);
+setting either option now fails as not built in. Mbed TLS drops RSA key
+generation (`GENPRIME`), deterministic ECDSA and HMAC_DRBG, CMAC, the
+non-PKCS#7 cipher paddings, `PK_WRITE` (only curl's public-key pinning used
+it) and `FS_IO` (the CA bundle is loaded from memory). The ClientHello,
+certificate verification and the serialized-session header are unchanged.
+Ordinary `.text` fell by 31,484 bytes (4,664,536 to 4,633,052).
+
 Post-change PPSSPP qualification passed a small public HTTPS page (HTTP 200,
 verified TLS, page load and clean teardown). The live Wikipedia article run
 received HTTPS data but exceeded its timeout in CSS selector matching; it is

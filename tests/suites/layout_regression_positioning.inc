@@ -563,7 +563,7 @@
                     &intrinsic_grid_sheet, &intrinsic_grid_style, false, 1)
           && stylesheet_grid_track_count(
                  &intrinsic_grid_sheet, &twelve_style, false)
-             == GRID_TRACK_REPEAT_LIMIT
+             == 12
           && twelve_first_box != NULL && twelve_last_box != NULL
           && twelve_first_box->width == 10
           && twelve_last_box->width == 10
@@ -1255,8 +1255,12 @@
                  &subgrid_sheet, &row_min_style, true,
                  minimum_rows, sizeof(minimum_rows))
           && strcmp(minimum_rows, "minmax(25px,1fr)") == 0);
+    /* Fifteen tracks and a trailing name on line 16 now fit the signed-byte
+       placement encoding, so the declaration is kept rather than dropped. */
     CHECK(stylesheet_grid_track_count(
-              &subgrid_sheet, &bounded_name_style, false) == 0);
+              &subgrid_sheet, &bounded_name_style, false) == 15
+          && stylesheet_grid_track_line_name(
+                 &subgrid_sheet, &bounded_name_style, false, 15, 0) != 0);
     CHECK(subgrid_parent_box != NULL && subgrid_child_box != NULL
           && inherited_column_box != NULL && local_column_box != NULL
           && inherited_row_box != NULL
@@ -1418,6 +1422,551 @@
     layout_destroy(&float_layout);
     stylesheet_destroy(&float_sheet);
     document_destroy(&float_document);
+    CHECK(budget.current == 0);
+
+    /* CSS 2.1 10.6.7: an auto-height formatting context root grows to its
+       floats' margin edges. weather.gov's "current conditions" panel is an
+       overflow:hidden box holding only floats; it collapsed to its padding
+       and clipped the temperature away. */
+    puts("test: formatting context roots contain their floats");
+    static const char bfc_page[] =
+        "<!doctype html><style>body{margin:0;padding:0}"
+        ".f{float:left;width:50px}"
+        "#hidden{overflow:hidden;padding:10px}#hidden .f{height:80px}"
+        "#flow-root{display:flow-root}#flow-root .f{height:30px;"
+        "margin-bottom:5px}"
+        "#float-root{float:left;width:100px}#nested{float:left;width:40px;"
+        "height:60px}"
+        "#after{clear:both;height:10px}"
+        "#text{overflow:hidden}#text .f{height:70px}"
+        "#plain{height:auto}#plain .f{height:40px}"
+        "</style><body><div id=hidden><div class=f></div></div>"
+        "<div id=flow-root><div class=f></div></div>"
+        "<div id=float-root><div id=nested></div></div><div id=after></div>"
+        "<div id=text><div class=f></div>x</div>"
+        "<div id=plain><div class=f></div></div></body>";
+    PocDocument bfc_document;
+    Stylesheet bfc_sheet;
+    LayoutDocument bfc_layout;
+    CHECK(document_parse(&bfc_document, &budget, bfc_page,
+                         strlen(bfc_page), strlen(bfc_page))
+          && stylesheet_build(&bfc_sheet, &budget, &bfc_document, 480)
+          && layout_build(&bfc_layout, &budget, &bfc_document,
+                          &bfc_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *bfc_root = lxb_dom_interface_node(bfc_document.html);
+    const LayoutNodeBox *bfc_hidden = layout_box_for_node(
+        &bfc_layout, find_id(bfc_root, "hidden"));
+    const LayoutNodeBox *bfc_flow_root = layout_box_for_node(
+        &bfc_layout, find_id(bfc_root, "flow-root"));
+    const LayoutNodeBox *bfc_float_root = layout_box_for_node(
+        &bfc_layout, find_id(bfc_root, "float-root"));
+    const LayoutNodeBox *bfc_after = layout_box_for_node(
+        &bfc_layout, find_id(bfc_root, "after"));
+    const LayoutNodeBox *bfc_text = layout_box_for_node(
+        &bfc_layout, find_id(bfc_root, "text"));
+    const LayoutNodeBox *bfc_plain = layout_box_for_node(
+        &bfc_layout, find_id(bfc_root, "plain"));
+    CHECK(bfc_hidden != NULL && bfc_flow_root != NULL
+          && bfc_float_root != NULL && bfc_after != NULL
+          && bfc_text != NULL && bfc_plain != NULL);
+    CHECK(bfc_hidden->y == 0 && bfc_hidden->height == 100);
+    /* The float's bottom margin is inside the root too. */
+    CHECK(bfc_flow_root->y == 100 && bfc_flow_root->height == 35);
+    CHECK(bfc_float_root->y == 135 && bfc_float_root->height == 60);
+    CHECK(bfc_after->y == 195);
+    CHECK(bfc_text->y == 205 && bfc_text->height == 70);
+    /* A block that is not a formatting context root still lets its floats
+       overflow (CSS 2.1 10.6.3). */
+    CHECK(bfc_plain->y == 275 && bfc_plain->height == 0);
+    layout_destroy(&bfc_layout);
+    stylesheet_destroy(&bfc_sheet);
+    document_destroy(&bfc_document);
+    CHECK(budget.current == 0);
+
+    /* CSS 2.1 10.4: a float's percentage min/max-width refer to its
+       containing block, not to the float's own shrink-to-fit width.
+       weather.gov's header logos are floats with max-width 7% / 17.7%
+       around width:100% images; they shrank to a few pixels. */
+    puts("test: float percentage min/max-width use the containing block");
+    static const char float_percent_page[] =
+        "<!doctype html><style>body{margin:0;padding:0}"
+        "#max{float:left;max-width:50%}#max div{width:300px;height:10px}"
+        "#min{float:left;clear:left;min-width:25%;height:10px}"
+        "#fixed{float:right;clear:right;width:300px;max-width:40%;"
+        "height:10px}"
+        "</style><body><div id=max><div></div></div>"
+        "<div id=min>x</div><div id=fixed></div></body>";
+    PocDocument fp_document;
+    Stylesheet fp_sheet;
+    LayoutDocument fp_layout;
+    CHECK(document_parse(&fp_document, &budget, float_percent_page,
+                         strlen(float_percent_page),
+                         strlen(float_percent_page))
+          && stylesheet_build(&fp_sheet, &budget, &fp_document, 480)
+          && layout_build(&fp_layout, &budget, &fp_document,
+                          &fp_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *fp_root = lxb_dom_interface_node(fp_document.html);
+    const LayoutNodeBox *fp_max = layout_box_for_node(
+        &fp_layout, find_id(fp_root, "max"));
+    const LayoutNodeBox *fp_min = layout_box_for_node(
+        &fp_layout, find_id(fp_root, "min"));
+    const LayoutNodeBox *fp_fixed = layout_box_for_node(
+        &fp_layout, find_id(fp_root, "fixed"));
+    CHECK(fp_max != NULL && fp_min != NULL && fp_fixed != NULL);
+    CHECK(fp_max->x == 0 && fp_max->width == 240);
+    CHECK(fp_min->x == 0 && fp_min->width == 120);
+    /* The exclusion and the box agree: right-aligned at 40% of 480. */
+    CHECK(fp_fixed->width == 192 && fp_fixed->x == 480 - 192);
+    layout_destroy(&fp_layout);
+    stylesheet_destroy(&fp_sheet);
+    document_destroy(&fp_document);
+    CHECK(budget.current == 0);
+
+    /* The clearfix idiom: a block-level ::after with clear:both sits below
+       the floats it clears, so the container grows to contain them; a
+       content:" " table holds only collapsible white space and creates no
+       line box (CSS 2.1 9.5.2, CSS Text 4.1.1). Bootstrap's navbar header
+       and weather.gov's page header depend on both. */
+    puts("test: generated clearfix boxes clear floats and collapse spaces");
+    static const char clearfix_page[] =
+        "<!doctype html><style>body{margin:0;padding:0}"
+        ".cf:before,.cf:after{content:\" \";display:table}"
+        ".cf:after{clear:both}"
+        ".f{float:right;width:40px;height:34px;margin:8px}"
+        "#block:after{content:\"\";display:block;clear:both}"
+        "#left:after{content:\"\";display:block;clear:left}"
+        "#pre:before{content:\" \";display:block;white-space:pre}"
+        "</style><body><div id=table class=cf><div class=f></div></div>"
+        "<div id=block><div class=f></div></div>"
+        "<div id=left><div class=f></div></div>"
+        "<div id=next style=\"clear:both\"></div>"
+        "<div id=pre></div><div id=spaces class=cf></div></body>";
+    PocDocument cf_document;
+    Stylesheet cf_sheet;
+    LayoutDocument cf_layout;
+    CHECK(document_parse(&cf_document, &budget, clearfix_page,
+                         strlen(clearfix_page), strlen(clearfix_page))
+          && stylesheet_build(&cf_sheet, &budget, &cf_document, 480)
+          && layout_build(&cf_layout, &budget, &cf_document,
+                          &cf_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *cf_root = lxb_dom_interface_node(cf_document.html);
+    const LayoutNodeBox *cf_table = layout_box_for_node(
+        &cf_layout, find_id(cf_root, "table"));
+    const LayoutNodeBox *cf_block = layout_box_for_node(
+        &cf_layout, find_id(cf_root, "block"));
+    const LayoutNodeBox *cf_left = layout_box_for_node(
+        &cf_layout, find_id(cf_root, "left"));
+    const LayoutNodeBox *cf_next = layout_box_for_node(
+        &cf_layout, find_id(cf_root, "next"));
+    const LayoutNodeBox *cf_pre = layout_box_for_node(
+        &cf_layout, find_id(cf_root, "pre"));
+    const LayoutNodeBox *cf_spaces = layout_box_for_node(
+        &cf_layout, find_id(cf_root, "spaces"));
+    CHECK(cf_table != NULL && cf_block != NULL && cf_left != NULL
+          && cf_next != NULL && cf_pre != NULL && cf_spaces != NULL);
+    CHECK(cf_table->y == 0 && cf_table->height == 50);
+    CHECK(cf_block->y == 50 && cf_block->height == 50);
+    /* clear:left does not clear a right float, which still overflows. */
+    CHECK(cf_left->y == 100 && cf_left->height == 0);
+    CHECK(cf_next->y == 150);
+    /* A preserved space does form a line. */
+    CHECK(cf_pre->height > 0);
+    CHECK(cf_spaces->height == 0);
+    layout_destroy(&cf_layout);
+    stylesheet_destroy(&cf_sheet);
+    document_destroy(&cf_document);
+    CHECK(budget.current == 0);
+
+    /* Earlier floats that are already cleared must not take the bounded
+       active-float slots of later ones (weather.gov's footer columns and
+       link blocks sit below a header of floats): the third full-width
+       float overlapped the first once its exclusion was dropped. A
+       formatting context root also starts with none of the enclosing
+       context's floats (CSS 2.1 9.4.1). */
+    puts("test: cleared floats do not evict later float exclusions");
+    static const char slots_page[] =
+        "<!doctype html><style>body{margin:0;padding:0}"
+        ".s{float:left;width:10px;height:10px}"
+        ".w{float:left;width:100%;height:20px}"
+        "#bfc{overflow:hidden}#clear{clear:both}"
+        "</style><body><div class=s></div><div class=s></div>"
+        "<div class=s></div><div class=s></div><div class=s></div>"
+        "<div class=s></div><div class=s></div><div id=clear></div>"
+        "<div id=bfc><div class=w id=b1></div><div class=w id=b2></div>"
+        "<div class=w id=b3></div></div>"
+        "<div id=plain><div class=w id=p1></div><div class=w id=p2></div>"
+        "<div class=w id=p3></div></div></body>";
+    PocDocument sl_document;
+    Stylesheet sl_sheet;
+    LayoutDocument sl_layout;
+    CHECK(document_parse(&sl_document, &budget, slots_page,
+                         strlen(slots_page), strlen(slots_page))
+          && stylesheet_build(&sl_sheet, &budget, &sl_document, 480)
+          && layout_build(&sl_layout, &budget, &sl_document,
+                          &sl_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *sl_root = lxb_dom_interface_node(sl_document.html);
+    const char *const sl_ids[] = {"b1", "b2", "b3", "p1", "p2", "p3"};
+    for (size_t i = 0; i < 6; i++) {
+        const LayoutNodeBox *box = layout_box_for_node(
+            &sl_layout, find_id(sl_root, sl_ids[i]));
+        CHECK(box != NULL);
+        /* Stacked one below the other from y=10: three in the overflow
+           root (which contains them), then three in the plain block. */
+        CHECK(box->x == 0 && box->width == 480
+              && box->y == 10 + 20 * (int) i);
+    }
+    layout_destroy(&sl_layout);
+    stylesheet_destroy(&sl_sheet);
+    document_destroy(&sl_document);
+    CHECK(budget.current == 0);
+
+    /* HTML 15.3.7/15.3.8 UA rules: lists have 1em block margins (none when
+       nested) and 40px inline-start padding; dd, blockquote and figure
+       indent by 40px. An outside marker ends one space (its counter-style
+       suffix) before the item's content edge. Tilefinch had none of these,
+       so weather.gov's headlines put an inline bullet at the left edge. */
+    puts("test: UA list and indentation defaults with hanging markers");
+    static const char lists_page[] =
+        "<!doctype html><style>body{margin:0;padding:0;"
+        "font:10px/10px sans-serif}</style><body>"
+        "<ul id=ul><li id=li>A</li><li>B<ol id=ol2><li id=li2>C</li></ol>"
+        "</li></ul><dl id=dl><dt id=dt>T</dt><dd id=dd>D</dd></dl>"
+        "<blockquote id=bq>Q</blockquote><figure id=fig>G</figure>"
+        "</body>";
+    PocDocument ls_document;
+    Stylesheet ls_sheet;
+    LayoutDocument ls_layout;
+    CHECK(document_parse(&ls_document, &budget, lists_page,
+                         strlen(lists_page), strlen(lists_page))
+          && stylesheet_build(&ls_sheet, &budget, &ls_document, 480)
+          && layout_build(&ls_layout, &budget, &ls_document,
+                          &ls_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *ls_root = lxb_dom_interface_node(ls_document.html);
+    const LayoutNodeBox *ls_ul = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "ul"));
+    const LayoutNodeBox *ls_li = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "li"));
+    const LayoutNodeBox *ls_ol2 = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "ol2"));
+    const LayoutNodeBox *ls_li2 = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "li2"));
+    const LayoutNodeBox *ls_dl = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "dl"));
+    const LayoutNodeBox *ls_dt = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "dt"));
+    const LayoutNodeBox *ls_dd = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "dd"));
+    const LayoutNodeBox *ls_bq = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "bq"));
+    const LayoutNodeBox *ls_fig = layout_box_for_node(
+        &ls_layout, find_id(ls_root, "fig"));
+    CHECK(ls_ul != NULL && ls_li != NULL && ls_ol2 != NULL
+          && ls_li2 != NULL && ls_dl != NULL && ls_dt != NULL
+          && ls_dd != NULL && ls_bq != NULL && ls_fig != NULL);
+    CHECK(ls_ul->x == 0 && ls_ul->y == 10 && ls_ul->height == 30);
+    CHECK(ls_li->x == 40 && ls_li->width == 440);
+    /* The nested list has no block margins but is indented again. */
+    CHECK(ls_ol2->x == 40 && ls_ol2->y == 30 && ls_li2->x == 80);
+    /* ul's bottom and dl's top margins collapse to one em. */
+    CHECK(ls_dl->x == 0 && ls_dl->y == 50 && ls_dt->x == 0
+          && ls_dd->x == 40 && ls_dd->width == 440);
+    CHECK(ls_bq->x == 40 && ls_bq->width == 400 && ls_bq->y == 80);
+    CHECK(ls_fig->x == 40 && ls_fig->width == 400 && ls_fig->y == 100);
+    const DrawCommand *ls_bullet = text_command(&ls_layout, "\xe2\x80\xa2");
+    CHECK(ls_bullet != NULL && ls_bullet->y == 10);
+    CHECK(ls_bullet->x > 20 && ls_bullet->x + ls_bullet->width < 40);
+    layout_destroy(&ls_layout);
+    stylesheet_destroy(&ls_sheet);
+    document_destroy(&ls_document);
+    CHECK(budget.current == 0);
+
+    /* CSS Fonts 4 2.5: font-size keywords. The longhand fell through to
+       an unknown-value 14px, so weather.gov's font-size:smaller zone link
+       came out larger than its 12px parent instead of 10px. */
+    puts("test: font-size absolute and relative keywords");
+    static const char keywords_page[] =
+        "<!doctype html><style>#p{font-size:12px}#s{font-size:small}"
+        "#xl{font-size:x-large}#sm{font-size:smaller}"
+        "#lg{font-size:larger}#xxs{font-size:xx-small}"
+        "#short{font:smaller sans-serif}</style><body><div id=p>"
+        "<span id=s>a</span><span id=xl>b</span><span id=sm>c</span>"
+        "<span id=lg>d</span><span id=xxs>e</span><span id=short>f</span>"
+        "</div></body>";
+    PocDocument fk_document;
+    Stylesheet fk_sheet;
+    CHECK(document_parse(&fk_document, &budget, keywords_page,
+                         strlen(keywords_page), strlen(keywords_page))
+          && stylesheet_build(&fk_sheet, &budget, &fk_document, 480));
+    lxb_dom_node_t *fk_root = lxb_dom_interface_node(fk_document.html);
+    ComputedStyle fk_parent = style_for_node(
+        &fk_sheet, find_id(fk_root, "p"), NULL);
+    const char *const fk_ids[] = {"s", "xl", "sm", "lg", "xxs", "short"};
+    /* 26.6 fixed point: 13, 24, 12/1.2, 12*1.2, 9, 12/1.2 px. */
+    const int fk_expected[] = {13 * 64, 24 * 64, 640, 922, 9 * 64, 640};
+    CHECK(computed_style_font_size_fixed(&fk_parent) == 12 * 64);
+    for (size_t i = 0; i < 6; i++) {
+        ComputedStyle child = style_for_node(
+            &fk_sheet, find_id(fk_root, fk_ids[i]), &fk_parent);
+        int size = computed_style_font_size_fixed(&child);
+        CHECK(size >= fk_expected[i] - 2 && size <= fk_expected[i] + 2);
+    }
+    stylesheet_destroy(&fk_sheet);
+    document_destroy(&fk_document);
+    CHECK(budget.current == 0);
+
+    /* CSS 2.1 10.8.1: atomic inline boxes sit on the line baseline (an
+       empty inline-block's baseline is its bottom margin edge, an
+       inline-block with text uses its last line's), vertical-align:middle
+       centres a box on the parent's baseline raised by half an x-height, and
+       in standards mode a line holding atomic boxes keeps the strut, so the
+       descender space remains below them. Tilefinch top-aligned every
+       atomic box: weather.gov's search row and image-only lines differed. */
+    puts("test: atomic inline boxes align to the line baseline");
+    static const char baseline_page[] =
+        "<!doctype html><style>body{margin:0;padding:0;"
+        "font:10px/10px sans-serif}"
+        ".b{display:inline-block;width:20px;height:40px}"
+        "#mid .b{vertical-align:middle}#top .b{vertical-align:top}"
+        "#big{display:inline-block;font-size:30px;line-height:30px}"
+        "</style><body><div id=alone>x</div>"
+        "<div id=base>y<span class=b id=b1></span></div>"
+        "<div id=mid>z<span class=b id=b2></span></div>"
+        "<div id=top>w<span class=b id=b3></span></div>"
+        "<div id=texts><span id=big>B</span>s</div></body>";
+    PocDocument bl_document;
+    Stylesheet bl_sheet;
+    LayoutDocument bl_layout;
+    CHECK(document_parse(&bl_document, &budget, baseline_page,
+                         strlen(baseline_page), strlen(baseline_page))
+          && stylesheet_build(&bl_sheet, &budget, &bl_document, 480)
+          && layout_build(&bl_layout, &budget, &bl_document,
+                          &bl_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *bl_root = lxb_dom_interface_node(bl_document.html);
+    const LayoutNodeBox *bl_base = layout_box_for_node(
+        &bl_layout, find_id(bl_root, "base"));
+    const LayoutNodeBox *bl_mid = layout_box_for_node(
+        &bl_layout, find_id(bl_root, "mid"));
+    const LayoutNodeBox *bl_top = layout_box_for_node(
+        &bl_layout, find_id(bl_root, "top"));
+    const LayoutNodeBox *bl_b1 = layout_box_for_node(
+        &bl_layout, find_id(bl_root, "b1"));
+    const LayoutNodeBox *bl_b2 = layout_box_for_node(
+        &bl_layout, find_id(bl_root, "b2"));
+    const LayoutNodeBox *bl_b3 = layout_box_for_node(
+        &bl_layout, find_id(bl_root, "b3"));
+    const DrawCommand *bl_x = text_command(&bl_layout, "x");
+    const DrawCommand *bl_y = text_command(&bl_layout, "y");
+    const DrawCommand *bl_z = text_command(&bl_layout, "z");
+    const DrawCommand *bl_w = text_command(&bl_layout, "w");
+    const DrawCommand *bl_big = text_command(&bl_layout, "B");
+    const DrawCommand *bl_small = text_command(&bl_layout, "s");
+    CHECK(bl_base != NULL && bl_mid != NULL && bl_top != NULL
+          && bl_b1 != NULL && bl_b2 != NULL && bl_b3 != NULL
+          && bl_x != NULL && bl_y != NULL && bl_z != NULL && bl_w != NULL
+          && bl_big != NULL && bl_small != NULL);
+    /* The text baseline (x's offset within its own 10px line) is found
+       again at the empty inline-block's bottom edge. */
+    int bl_text_baseline = 40 - (bl_y->y - bl_base->y);
+    CHECK(bl_b1->y == bl_base->y && bl_y->y > bl_base->y);
+    CHECK(bl_text_baseline > 0 && bl_text_baseline <= 10);
+    /* The strut's descent stays below the box. */
+    CHECK(bl_base->height > 40 && bl_base->height < 50);
+    /* middle: the box straddles the baseline, so the text sits lower than
+       the box top but well above its bottom. */
+    CHECK(bl_b2->y == bl_mid->y && bl_z->y > bl_mid->y
+          && bl_z->y - bl_mid->y < 40 - bl_text_baseline);
+    /* top: the box hangs from the line top; the text keeps its own line. */
+    CHECK(bl_b3->y == bl_top->y && bl_w->y == bl_top->y
+          && bl_top->height == 40);
+    /* An inline-block's baseline is its text's: the small run moves down
+       to the big glyphs' baseline. */
+    CHECK(bl_small->y > bl_big->y);
+    layout_destroy(&bl_layout);
+    stylesheet_destroy(&bl_sheet);
+    document_destroy(&bl_document);
+    CHECK(budget.current == 0);
+
+    /* Quirks mode keeps no strut on a line holding only atomic boxes. */
+    puts("test: quirks-mode atomic-only lines have no strut");
+    static const char quirks_page[] =
+        "<style>body{margin:0;padding:0;font:10px/10px sans-serif}"
+        "</style><body><div id=q><span style=\"display:inline-block;"
+        "width:20px;height:40px\"></span></div></body>";
+    PocDocument qk_document;
+    Stylesheet qk_sheet;
+    LayoutDocument qk_layout;
+    CHECK(document_parse(&qk_document, &budget, quirks_page,
+                         strlen(quirks_page), strlen(quirks_page))
+          && stylesheet_build(&qk_sheet, &budget, &qk_document, 480)
+          && layout_build(&qk_layout, &budget, &qk_document,
+                          &qk_sheet, NULL, NULL, 480));
+    const LayoutNodeBox *qk_box = layout_box_for_node(
+        &qk_layout, find_id(lxb_dom_interface_node(qk_document.html), "q"));
+    CHECK(qk_box != NULL && qk_box->height == 40);
+    layout_destroy(&qk_layout);
+    stylesheet_destroy(&qk_sheet);
+    document_destroy(&qk_document);
+    CHECK(budget.current == 0);
+
+    /* Form controls: min/max-width apply to text fields (weather.gov's
+       search box is 45% capped at 11em); a push button's auto size is its
+       label plus its own padding and borders on one line of its
+       line-height, exactly like a <button> with the same rules; select is
+       an inline-block menulist; an inline-block's percentage max-width
+       refers to its containing block. */
+    puts("test: form control sizing and inline-block percentage basis");
+    static const char controls_page[] =
+        "<!doctype html><style>body{margin:0;padding:0;"
+        "font:12px/1.5 sans-serif}"
+        "#field{width:45%;max-width:132px;box-sizing:border-box}"
+        ".btn{padding:6px 12px;font-size:14px;line-height:20px;"
+        "border:1px solid #ccc}"
+        "#ib{display:inline-block;width:300px;max-width:50%}"
+        "</style><body><div><input id=field type=text></div>"
+        "<div><input id=submit class=btn type=submit value=Go></div>"
+        "<div><button id=button class=btn>Go</button></div>"
+        "<div><span id=ib>i</span></div><select id=menu>"
+        "<option>One</option></select></body>";
+    PocDocument fc_document;
+    Stylesheet fc_sheet;
+    LayoutDocument fc_layout;
+    CHECK(document_parse(&fc_document, &budget, controls_page,
+                         strlen(controls_page), strlen(controls_page))
+          && stylesheet_build(&fc_sheet, &budget, &fc_document, 480)
+          && layout_build(&fc_layout, &budget, &fc_document,
+                          &fc_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *fc_root = lxb_dom_interface_node(fc_document.html);
+    const LayoutNodeBox *fc_field = layout_box_for_node(
+        &fc_layout, find_id(fc_root, "field"));
+    const LayoutNodeBox *fc_submit = layout_box_for_node(
+        &fc_layout, find_id(fc_root, "submit"));
+    const LayoutNodeBox *fc_button = layout_box_for_node(
+        &fc_layout, find_id(fc_root, "button"));
+    const LayoutNodeBox *fc_ib = layout_box_for_node(
+        &fc_layout, find_id(fc_root, "ib"));
+    CHECK(fc_field != NULL && fc_submit != NULL && fc_button != NULL
+          && fc_ib != NULL);
+    CHECK(fc_field->width == 132);
+    CHECK(fc_submit->height == 34 && fc_button->height == 34);
+    CHECK(fc_submit->width == fc_button->width && fc_submit->width > 26
+          && fc_submit->width < 60);
+    CHECK(fc_ib->width == 240);
+    ComputedStyle fc_body = style_for_node(
+        &fc_sheet, find_id(fc_root, "field")->parent->parent, NULL);
+    ComputedStyle fc_menu = style_for_node(
+        &fc_sheet, find_id(fc_root, "menu"), &fc_body);
+    ComputedStyle fc_field_style = style_for_node(
+        &fc_sheet, find_id(fc_root, "field"), &fc_body);
+    CHECK(fc_menu.display == DISPLAY_INLINE_BLOCK);
+    /* Controls do not inherit the page's line-height (UA font reset). */
+    CHECK(fc_field_style.line_height == 0);
+    layout_destroy(&fc_layout);
+    stylesheet_destroy(&fc_sheet);
+    document_destroy(&fc_document);
+    CHECK(budget.current == 0);
+
+    /* CSS 2.1 10.8.1: a unitless line-height inherits as the number, so a
+       larger child font gets a proportionally taller line. Tilefinch
+       inherited the parent's computed pixels (Bootstrap's 1.42857 body
+       gave every heading a 17px line). */
+    puts("test: unitless line-height inherits as a factor");
+    static const char factor_page[] =
+        "<!doctype html><style>#p{font:12px/1.5 sans-serif}"
+        "#c{font-size:20px}#px{font:12px/18px sans-serif}"
+        "#pxc{font-size:20px}</style><body><div id=p><div id=c>a</div>"
+        "</div><div id=px><div id=pxc>b</div></div></body>";
+    PocDocument lf_document;
+    Stylesheet lf_sheet;
+    CHECK(document_parse(&lf_document, &budget, factor_page,
+                         strlen(factor_page), strlen(factor_page))
+          && stylesheet_build(&lf_sheet, &budget, &lf_document, 480));
+    lxb_dom_node_t *lf_root = lxb_dom_interface_node(lf_document.html);
+    ComputedStyle lf_p = style_for_node(&lf_sheet, find_id(lf_root, "p"),
+                                        NULL);
+    ComputedStyle lf_c = style_for_node(&lf_sheet, find_id(lf_root, "c"),
+                                        &lf_p);
+    ComputedStyle lf_px = style_for_node(&lf_sheet, find_id(lf_root, "px"),
+                                         NULL);
+    ComputedStyle lf_pxc = style_for_node(
+        &lf_sheet, find_id(lf_root, "pxc"), &lf_px);
+    CHECK(lf_p.line_height == 18 && lf_c.line_height == 30);
+    /* A length inherits as the length. */
+    CHECK(lf_px.line_height == 18 && lf_pxc.line_height == 18);
+    stylesheet_destroy(&lf_sheet);
+    document_destroy(&lf_document);
+    CHECK(budget.current == 0);
+
+    /* A content:" " table pseudo (Bootstrap's clearfix ::after) is a
+       formatting context root: the last child's bottom margin stays
+       inside the container instead of collapsing through it. Floats
+       that ended above a block are not inherited into it, so the floats
+       it propagates are all still contained by a clearfix around them. */
+    puts("test: table clearfix keeps margins and contains every float");
+    static const char contain_page[] =
+        "<!doctype html><style>body{margin:0;padding:0}"
+        ".cf:after{content:\" \";display:table;clear:both}"
+        "#last{height:10px;margin-bottom:20px}"
+        ".s{float:left;width:10px;height:10px}"
+        ".f{float:left;width:200px;height:20px}"
+        "#clear{clear:both}</style><body>"
+        "<div id=keep class=cf><div id=last></div></div><div id=next></div>"
+        "<div class=s></div><div class=s></div><div class=s></div>"
+        "<div class=s></div><div class=s></div><div class=s></div>"
+        "<div class=s></div><div id=clear></div>"
+        "<div id=box class=cf><div><div class=f></div><div class=f></div>"
+        "<div class=f></div><div class=f></div><div class=f></div>"
+        "<div class=f></div></div></div></body>";
+    PocDocument ct_document;
+    Stylesheet ct_sheet;
+    LayoutDocument ct_layout;
+    CHECK(document_parse(&ct_document, &budget, contain_page,
+                         strlen(contain_page), strlen(contain_page))
+          && stylesheet_build(&ct_sheet, &budget, &ct_document, 480)
+          && layout_build(&ct_layout, &budget, &ct_document,
+                          &ct_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *ct_root = lxb_dom_interface_node(ct_document.html);
+    const LayoutNodeBox *ct_keep = layout_box_for_node(
+        &ct_layout, find_id(ct_root, "keep"));
+    const LayoutNodeBox *ct_next = layout_box_for_node(
+        &ct_layout, find_id(ct_root, "next"));
+    const LayoutNodeBox *ct_box = layout_box_for_node(
+        &ct_layout, find_id(ct_root, "box"));
+    CHECK(ct_keep != NULL && ct_next != NULL && ct_box != NULL);
+    CHECK(ct_keep->y == 0 && ct_keep->height == 30 && ct_next->y == 30);
+    /* Six 200px floats, two per 480px row, three rows of 20px. */
+    CHECK(ct_box->height == 60);
+    layout_destroy(&ct_layout);
+    stylesheet_destroy(&ct_sheet);
+    document_destroy(&ct_document);
+    CHECK(budget.current == 0);
+
+    /* CSS Backgrounds 3 7.1: box-shadow is ink overflow and never extends
+       the scrollable area. weather.gov's <main> carries a 6px shadow,
+       which made the document scroll past its last box onto the body
+       colour. */
+    puts("test: box-shadow does not extend scrollable overflow");
+    static const char shadow_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#m{height:400px;box-shadow:0 0 5px 1px #333}"
+        "#w{width:470px;height:20px;box-shadow:12px 0 0 4px #333}"
+        "</style><body><div id=w></div><div id=m></div></body>";
+    PocDocument sh_document;
+    Stylesheet sh_sheet;
+    LayoutDocument sh_layout;
+    CHECK(document_parse(&sh_document, &budget, shadow_page,
+                         strlen(shadow_page), strlen(shadow_page))
+          && stylesheet_build(&sh_sheet, &budget, &sh_document, 480)
+          && layout_build(&sh_layout, &budget, &sh_document,
+                          &sh_sheet, NULL, NULL, 480));
+    bool sh_painted = false;
+    for (size_t i = 0; i < sh_layout.count; i++) {
+        sh_painted |= sh_layout.commands[i].type == DRAW_SHADOW_RECT;
+    }
+    CHECK(sh_painted && sh_layout.height == 420
+          && sh_layout.scroll_width == 480);
+    layout_destroy(&sh_layout);
+    stylesheet_destroy(&sh_sheet);
+    document_destroy(&sh_document);
     CHECK(budget.current == 0);
 
     puts("test: text-decoration cascade, propagation, clipping, and transform");
@@ -1856,9 +2405,19 @@
                     fixed_cache.fixed_cache_builds);
         CHECK(fixed_cache.fixed_cache_builds == 2
               && fixed_frame[70u * 100u + 10u] == test_rgb565(0x0000ff));
+        /* Paint damage over the fixed layer repaints that rectangle of
+           the retained layer in place instead of rebuilding it; damage
+           over content scrolled out of view repaints nothing. */
         CHECK(tile_cache_sync_layout_paint(&fixed_cache, 0, 50, 40, 70)
               && tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL)
-              && fixed_cache.fixed_cache_builds == 3);
+              && fixed_cache.fixed_cache_builds == 2
+              && fixed_cache.fixed_cache_patches == 0
+              && fixed_frame[70u * 100u + 10u] == test_rgb565(0x0000ff));
+        CHECK(tile_cache_sync_layout_paint(&fixed_cache, 0, 80, 40, 120)
+              && tile_cache_render_frame(&fixed_cache, 0, 100, 100, NULL)
+              && fixed_cache.fixed_cache_builds == 2
+              && fixed_cache.fixed_cache_patches == 1
+              && fixed_frame[70u * 100u + 10u] == test_rgb565(0x0000ff));
         tile_cache_destroy(&fixed_cache);
         budget_free(&budget, fixed_frame);
         layout_destroy(&fixed_layout);

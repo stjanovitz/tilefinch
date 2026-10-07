@@ -112,7 +112,7 @@ static bool bidi_scan_inline_subtree(LayoutContext *context,
     }
     if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
         size_t length = 0;
-        const char *text = document_text_data(node, &length);
+        const char *text = layout_text_data(node, &length);
         if (text == NULL) return false;
         if (length > TEXT_BIDI_PARAGRAPH_BYTE_LIMIT - *bytes) {
             *limited = true;
@@ -216,7 +216,7 @@ static bool bidi_flatten(LayoutBidiFlow *flow, lxb_dom_node_t *node,
     }
     if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
         size_t length = 0;
-        const char *text = document_text_data(node, &length);
+        const char *text = layout_text_data(node, &length);
         return text == NULL || bidi_append_bytes(flow, text, length, true);
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
@@ -342,8 +342,11 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
     size_t candidate_count = 0;
     bool change_possible = false;
     if (sheet != NULL
+        /* Rules that need [dir=rtl] are left out of the candidates; the
+           walk below treats any dir="rtl" element as a possible change
+           itself, so a document that has one loses nothing. */
         && !stylesheet_direction_change_rules(
-               sheet, candidates,
+               sheet, true, candidates,
                sizeof(candidates) / sizeof(candidates[0]),
                &candidate_count)) return;
     lxb_dom_node_t **ancestors = budget_malloc(
@@ -363,7 +366,7 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
         }
         if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
-            const char *text = document_text_data(node, &length);
+            const char *text = layout_text_data(node, &length);
             if (text != NULL && bidi_text_has_rtl(text, length)) {
                 for (lxb_dom_node_t *up = node->parent; up != NULL;
                      up = up->parent) {
@@ -386,13 +389,25 @@ void layout_bidi_prepare(LayoutContext *context, Budget *budget)
                                              "unicode-bidi"))) {
                 change_possible = true;
             }
+            size_t dir_length = 0;
+            const char *dir = document_attribute(node, "dir", &dir_length);
+            if (dir != NULL && dir_length == 3u
+                && strncasecmp(dir, "rtl", 3u) == 0)
+                change_possible = true;
             for (size_t i = 0; !change_possible && i < candidate_count; i++) {
                 if (stylesheet_rule_index_matches(
                         sheet, candidates[i], node))
                     change_possible = true;
             }
         }
-        if (node->first_child != NULL) {
+        /* Script, style and template text never renders: front pages
+           carry megabytes of it, and scanning it for RTL code points
+           cost more than the layout it was preparing. */
+        bool raw_text = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (node->local_name == LXB_TAG_SCRIPT
+                || node->local_name == LXB_TAG_STYLE
+                || node->local_name == LXB_TAG_TEMPLATE);
+        if (node->first_child != NULL && !raw_text) {
             node = node->first_child;
             continue;
         }
@@ -451,6 +466,7 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
     size_t budget_before = context->layout->budget->current;
     size_t nodes = 0, bytes = 0;
     bool limited = false;
+    if (!authored_bidi) context->layout->performance.bidi_subtree_scans++;
     if (!authored_bidi
         && !bidi_scan_inline_subtree(
                context, node, style, true, 0, &nodes, &bytes, &limited)) {

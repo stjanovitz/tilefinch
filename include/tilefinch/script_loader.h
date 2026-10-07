@@ -99,6 +99,9 @@ bool document_script_is_parser_blocking(lxb_dom_node_t *element);
 /* The Cache-Control and Vary a fetched script is cached under. */
 void script_cache_response_policy(const FetchResult *fetch,
                                   char cache_control[256], char vary[128]);
+/* Whether a fetched script's Cache-Control carries no-store: it is then not
+   cached, and neither is its compiled bytecode. */
+bool script_response_no_store(const FetchResult *fetch);
 /* Records a fetched module script in the session cache with the provenance
    a later module-map hit must match: a store of a non-empty body, or with
    revalidate the 304 refresh of the existing entry. Parser-inserted and

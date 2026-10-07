@@ -19,8 +19,13 @@
 #define OFFLINE_LIBRARY_INDEX_LIMIT (32u * 1024u)
 #define OFFLINE_LIBRARY_ARTICLE_LIMIT (1024u * 1024u)
 #define OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT (1024u * 1024u)
-#define OFFLINE_LIBRARY_APP_RESOURCE_LIMIT (1024u * 1024u)
-#define OFFLINE_LIBRARY_APP_BYTECODE_LIMIT (512u * 1024u)
+/* An installed game may carry about 1 MiB of classic script plus its
+   markup-adjacent CSS, images and data (512 KiB), with up to 1 MiB of
+   optional source-bound bytecode. The pack is streamed to and from the
+   Memory Stick, so these bound disk and session-cache working set, not a
+   second in-memory copy. */
+#define OFFLINE_LIBRARY_APP_RESOURCE_LIMIT (1536u * 1024u)
+#define OFFLINE_LIBRARY_APP_BYTECODE_LIMIT (1024u * 1024u)
 #define OFFLINE_LIBRARY_APP_PACK_LIMIT \
     (OFFLINE_LIBRARY_APP_RESOURCE_LIMIT \
      + OFFLINE_LIBRARY_APP_BYTECODE_LIMIT + 160u * 1024u)
@@ -86,6 +91,14 @@ typedef struct {
     bool app_theme_color_valid;
 } OfflineLibraryItem;
 
+/* Called before each classic script an install, preview or recompile
+   compiles: `done` of `total` (1-based). Work then reaches a
+   tilefinch_platform_cooperate() checkpoint, whose refusal stops it with
+   nothing published. */
+typedef void (*OfflineLibraryProgress)(void *context, unsigned done,
+                                       unsigned total);
+typedef struct OfflineAppStagedBytecode OfflineAppStagedBytecode;
+
 typedef struct {
     Budget *budget;
     char directory[OFFLINE_LIBRARY_DIRECTORY_LIMIT];
@@ -93,6 +106,12 @@ typedef struct {
     size_t count;
     uint32_t next_id;
     bool loaded;
+    OfflineLibraryProgress progress;
+    void *progress_context;
+    /* Bytecode a preview compiled, kept for the confirming install. */
+    OfflineAppStagedBytecode *staged;
+    /* Classic scripts compiled by install/preview/recompile (telemetry). */
+    size_t script_compiles;
 } OfflineLibrary;
 
 void offline_library_init(
@@ -120,9 +139,28 @@ bool offline_library_preview_web_app(
     const char *source_url, const TilefinchWebAppManifest *manifest,
     const unsigned char *icon, size_t icon_length,
     OfflineWebAppPreview *preview, char *error, size_t error_size);
+/* Release bytecode a preview kept for its install (install does this
+   itself; call it when a preview is abandoned). */
+void offline_library_discard_staged(OfflineLibrary *library);
 bool offline_library_read_web_app(
     const OfflineLibrary *library, Budget *budget, BrowserSession *session,
     uint32_t id, char **html, size_t *length,
+    char *error, size_t error_size);
+/* True when an installed app's stored bytecode came from another compiler
+   ABI (an engine update), so its next launch would compile every script.
+   `scripts` receives how many scripts carry bytecode. Reads the fingerprint
+   kept in the index; an entry saved by an older build is probed once from
+   its pack's record headers (no bodies are read). */
+bool offline_library_app_needs_recompile(
+    OfflineLibrary *library, uint32_t id, unsigned *scripts);
+/* Recompile an installed app's classic scripts from its stored source and
+   publish a new generation (new id) with fresh bytecode, using the same
+   temporary-file, index-first transaction as installation. The old pack
+   must authenticate completely; any failure leaves the old generation and
+   index untouched. Reports progress and stops at a refused cooperate
+   checkpoint like installation. */
+bool offline_library_recompile_web_app(
+    OfflineLibrary *library, uint32_t id, uint32_t *new_id,
     char *error, size_t error_size);
 bool offline_library_read_web_app_icon(
     const OfflineLibrary *library, uint32_t id,

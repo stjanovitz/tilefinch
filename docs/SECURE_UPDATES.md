@@ -623,6 +623,16 @@ pump reads after a cache miss; measurement and rasterization themselves perform
 no file I/O, and the runtime path never writes. Optional packs are built from
 redistributable Noto inputs and do not read PSP firmware fonts.
 
+The in-page language-pack offer is not a second installer. Page content can
+only make a script count in the parser census; the pack, its label, its
+display size and its asset names all come from the compiled-in catalog, and
+nothing is fetched until the user presses X. That first press runs only
+the client's metadata check (same URL, `TFGMv1` signature and monotonic
+sequence) to show the verified package size; the package is requested only
+by a second X on that confirmation, which raises the same primary request
+as **Settings → Appearance → Language & emoji** and so the same free-space
+preflight and promotion described above.
+
 `slot.tfum` is not a TFUP payload: putting the envelope inside the package
 whose hash its own manifest signs would be circular. After package and
 per-file verification, the installer writes the already verified envelope as

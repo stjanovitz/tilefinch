@@ -94,6 +94,146 @@ uint16_t *psp_display_back_buffer(const PspDisplay *display)
     return buffer_at(display, display->back_buffer);
 }
 
+#if defined(_MIPS_ARCH_ALLEGREX)
+static __attribute__((noinline)) void psp_display_copy_rows_vfpu(
+    uint16_t *back, const uint16_t *frame, unsigned top, unsigned end)
+{
+    uint32_t saved[16] __attribute__((aligned(16)));
+    /* Only loads/stores: prefixes are neither applied nor consumed. Save
+       all four borrowed quads once for the entire band, including NaN bits. */
+    __asm__ volatile (
+        "sv.q C000,0(%0)\n" "sv.q C010,16(%0)\n"
+        "sv.q C020,32(%0)\n" "sv.q C030,48(%0)\n"
+        : : "r" (saved) : "memory");
+    for (unsigned y = top; y < end; y++) {
+        const uint16_t *source = frame + (size_t) y * PSP_DISPLAY_SCREEN_WIDTH;
+        uint16_t *destination = back + (size_t) y * PSP_DISPLAY_STRIDE;
+        for (unsigned x = 0; x < PSP_DISPLAY_SCREEN_WIDTH; x += 32u) {
+            __asm__ volatile (
+                "lv.q C000,0(%0)\n" "lv.q C010,16(%0)\n"
+                "lv.q C020,32(%0)\n" "lv.q C030,48(%0)\n"
+                "sv.q C000,0(%1)\n" "sv.q C010,16(%1)\n"
+                "sv.q C020,32(%1)\n" "sv.q C030,48(%1)\n"
+                : : "r" (source + x), "r" (destination + x) : "memory");
+        }
+    }
+    __asm__ volatile (
+        "lv.q C000,0(%0)\n" "lv.q C010,16(%0)\n"
+        "lv.q C020,32(%0)\n" "lv.q C030,48(%0)\n"
+        : : "r" (saved) : "memory");
+}
+#endif
+
+PspDisplayRowCopyResult psp_display_copy_rgb565_rows(
+    PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end,
+    bool vfpu_eligible)
+{
+    uint16_t *back = psp_display_back_buffer(display);
+    if (back == NULL || frame == NULL || top > end
+        || end > PSP_DISPLAY_SCREEN_HEIGHT)
+        return PSP_DISPLAY_ROW_COPY_REFUSED;
+    if (top == end) return PSP_DISPLAY_ROW_COPY_MEMCPY;
+    /* Reject overlap before either implementation writes anything. Integer
+       differences avoid end-address overflow and unrelated-pointer ordering. */
+    uintptr_t source = (uintptr_t) frame, destination = (uintptr_t) back;
+    if (source <= destination
+            ? destination - source < (size_t) PSP_DISPLAY_SCREEN_WIDTH
+                  * PSP_DISPLAY_SCREEN_HEIGHT * sizeof(*frame)
+            : source - destination < PSP_DISPLAY_BUFFER_PIXELS * sizeof(*back))
+        return PSP_DISPLAY_ROW_COPY_REFUSED;
+#if defined(_MIPS_ARCH_ALLEGREX)
+    _Static_assert(PSP_DISPLAY_SCREEN_WIDTH % 32 == 0,
+                   "VFPU row copies require whole 64-byte blocks");
+    _Static_assert(PSP_DISPLAY_STRIDE % 8 == 0,
+                   "VFPU destination rows must stay 16-byte aligned");
+    if (vfpu_eligible && ((source | destination) & 15u) == 0u) {
+        psp_display_copy_rows_vfpu(back, frame, top, end);
+        return PSP_DISPLAY_ROW_COPY_VFPU;
+    }
+#else
+    (void) vfpu_eligible;
+#endif
+    for (unsigned y = top; y < end; y++)
+        memcpy(back + (size_t) y * PSP_DISPLAY_STRIDE,
+               frame + (size_t) y * PSP_DISPLAY_SCREEN_WIDTH,
+               PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame));
+    return PSP_DISPLAY_ROW_COPY_MEMCPY;
+}
+
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Hash of the back buffer outside the copied rows (padding and other rows),
+   which a copy must leave untouched. */
+static uint32_t validation_untouched_hash(
+    const uint16_t *back, unsigned top, unsigned end)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (unsigned y = 0; y < PSP_DISPLAY_SCREEN_HEIGHT; y++) {
+        unsigned first = y >= top && y < end ? PSP_DISPLAY_SCREEN_WIDTH : 0u;
+        for (unsigned x = first; x < PSP_DISPLAY_STRIDE; x++) {
+            hash ^= back[(size_t) y * PSP_DISPLAY_STRIDE + x];
+            hash *= UINT32_C(16777619);
+        }
+    }
+    return hash;
+}
+
+unsigned psp_display_validation_probe_row_copy(
+    PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end)
+{
+    uint16_t *back = psp_display_back_buffer(display);
+    if (back == NULL || frame == NULL || top >= end
+        || end > PSP_DISPLAY_SCREEN_HEIGHT) return 1u;
+#if defined(_MIPS_ARCH_ALLEGREX)
+    uint32_t saved[16] __attribute__((aligned(16)));
+    uint32_t sentinel[16] __attribute__((aligned(16)));
+    uint32_t after[16] __attribute__((aligned(16)));
+    uint32_t original_s, original_t, original_d, after_s, after_t, after_d;
+    uint32_t ps = UINT32_C(0x000f4321), pt = UINT32_C(0x000e9876);
+    uint32_t pd = UINT32_C(0x00000a5a);
+    for (unsigned i = 0; i < 16u; i++)
+        sentinel[i] = UINT32_C(0x7fc01234) ^ (i * UINT32_C(0x13579bdf));
+    uint32_t untouched = validation_untouched_hash(back, top, end);
+    __asm__ volatile (
+        "sv.q C000,0(%3)\n" "sv.q C010,16(%3)\n"
+        "sv.q C020,32(%3)\n" "sv.q C030,48(%3)\n"
+        "mfvc %0,$128\n" "mfvc %1,$129\n" "mfvc %2,$130\n"
+        : "=&r" (original_s), "=&r" (original_t), "=&r" (original_d)
+        : "r" (saved) : "memory");
+    __asm__ volatile (
+        "lv.q C000,0(%3)\n" "lv.q C010,16(%3)\n"
+        "lv.q C020,32(%3)\n" "lv.q C030,48(%3)\n"
+        "mtvc %0,$128\n" "mtvc %1,$129\n" "mtvc %2,$130\n"
+        : : "r" (ps), "r" (pt), "r" (pd), "r" (sentinel) : "memory");
+    PspDisplayRowCopyResult copied = psp_display_copy_rgb565_rows(
+        display, frame, top, end, true);
+    __asm__ volatile (
+        "sv.q C000,0(%3)\n" "sv.q C010,16(%3)\n"
+        "sv.q C020,32(%3)\n" "sv.q C030,48(%3)\n"
+        "mfvc %0,$128\n" "mfvc %1,$129\n" "mfvc %2,$130\n"
+        : "=&r" (after_s), "=&r" (after_t), "=&r" (after_d)
+        : "r" (after) : "memory");
+    __asm__ volatile (
+        "lv.q C000,0(%3)\n" "lv.q C010,16(%3)\n"
+        "lv.q C020,32(%3)\n" "lv.q C030,48(%3)\n"
+        "mtvc %0,$128\n" "mtvc %1,$129\n" "mtvc %2,$130\n"
+        : : "r" (original_s), "r" (original_t), "r" (original_d),
+            "r" (saved) : "memory");
+    unsigned result = copied == PSP_DISPLAY_ROW_COPY_VFPU ? 0u : 1u;
+    if (after_s != ps || after_t != pt || after_d != pd
+        || memcmp(after, sentinel, sizeof(after)) != 0) result |= 4u;
+    for (unsigned y = top; y < end; y++)
+        if (memcmp(back + (size_t) y * PSP_DISPLAY_STRIDE,
+                   frame + (size_t) y * PSP_DISPLAY_SCREEN_WIDTH,
+                   PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame)) != 0)
+            result |= 2u;
+    if (untouched != validation_untouched_hash(back, top, end)) result |= 8u;
+    return result;
+#else
+    return 1u;
+#endif
+}
+#endif
+
 uint16_t *psp_display_front_buffer(const PspDisplay *display)
 {
     if (display == NULL || psp_display_video_active(display)) return NULL;

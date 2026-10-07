@@ -20,7 +20,9 @@ Use `--skip-js` to measure HTML/CSS/layout/rendering independently when a real p
 
 `--challenge-diagnostic` is an explicitly diagnostic navigation policy. It retains an HTTP error page, records `cf-mitigated`, `Accept-CH`, `Critical-CH`, and server headers, runs only the page's initially present inline scripts, and reports external script URLs inserted into the DOM. It does not claim the error page is the requested site and does not fabricate or submit a challenge result.
 
-The interactive lab can make a legitimate managed-challenge attempt with `--url ... --fetch-scripts`. It retains secure/HttpOnly response cookies, retries a safe GET once when `Critical-CH` requests truthful PSP client hints, and sends only the named high-entropy hints to the origin that requested them. A cross-origin retry redirect suppresses those hints for the rest of that redirect chain while truthful low-entropy hints continue normally. The lab loads scripts inserted by the bootstrap under normal quotas and reports challenge/network/clearance state without cookie values. It never copies clearance from another browser. The ordinary compatibility User-Agent carries iPhone/WebKit/Safari routing tokens so large sites choose their bounded mobile document, while also naming `PlayStation Portable` and `Tilefinch`; `navigator.platform` and low-entropy Client Hints remain explicitly PSP/Tilefinch rather than claiming the capabilities of Safari or Chrome.
+The interactive lab's closing summary reports `bot-wall detected=yes site=... vendor=... status=...` when the committed top-level document is a bot-protection wall: a refusal status (403, 405, 429 or 503, or AWS WAF's 202) with a vendor signature in its headers or title (DataDome, Cloudflare challenge, Imperva, AWS WAF, Kasada, HUMAN, Akamai's block page), or a refusal-status page that paints nothing after its script was refused. The PSP chrome raises the same two-line notice ("<site> blocked Tilefinch / Bot protection: this site may not work") instead of leaving a silent blank page. Detection is generic, reads only the response and the committed page, and never attempts the challenge.
+
+The interactive lab can make a legitimate managed-challenge attempt with `--url ... --fetch-scripts`. It retains secure/HttpOnly response cookies, retries a safe GET once when `Critical-CH` requests truthful PSP client hints, and sends only the named high-entropy hints to the origin that requested them. A cross-origin retry redirect suppresses those hints for the rest of that redirect chain while truthful low-entropy hints continue normally. The lab loads scripts inserted by the bootstrap under normal quotas and reports challenge/network/clearance state without cookie values. It never copies clearance from another browser. The ordinary compatibility User-Agent carries iPhone/WebKit/Safari routing tokens so large sites choose their bounded mobile document, while also naming `PlayStation Portable` and `Tilefinch`; `navigator.platform` and low-entropy Client Hints remain explicitly PSP/Tilefinch rather than claiming the capabilities of Safari or Chrome. Google is the one per-site exception (`src/site_identity.c`): with the compatibility User-Agent it serves an XHTML-MP "Update your browser" page, so Google searches open a local compatibility page. Its "Try Google anyway" button opts the session in until the browser restarts; Google top-level documents then use the honest `Mozilla/5.0 (PlayStation Portable) Tilefinch/0.1` for their navigation, every request they make, and `navigator.userAgent`, and a 429, `/sorry/`, XHTML-MP, or failed search clears the opt-in and returns to the compatibility page. The opt-in marker on that button's URL is stripped before any request is built.
 
 ### Managed challenges as a standards qualification
 
@@ -189,7 +191,7 @@ A bounded mobile-CSS run is:
 
 `--scroll-all` walks from top to bottom in half-viewport increments, writes `scroll-manifest.tsv`, rejects blank frames, and verifies that the top frame is identical after tile eviction. It saves top/middle/bottom PPMs; repeatable `--save-scroll Y` options add semantic checkpoints. `--viewport-width` and `--viewport-height` select the device render surface within guarded ranges; page viewport metadata selects the CSS layout viewport. `--no-render` runs fetch/parse/style/layout/link analysis while retaining the framebuffer reservation but writing no images.
 
-`--psp-profile strict` selects a 16 MiB content ceiling, 4 MiB JavaScript ceiling, 1 MiB cumulative script-source allowance, and eight tiles. `--psp-profile realistic` selects a 24 MiB content ceiling, a measured 5 MiB JavaScript ceiling, and a 2 MiB source allowance. The VM value is a ceiling rather than an up-front reservation. The public `BrowserEngine` profile additionally records an 8 MiB minimum non-page reserve for UI, stacks, TLS/backend state, sockets, libc metadata, and fragmentation; that reserve is deliberately unavailable to page content. `browser_config_apply_psp_memory_profile()` applies the same strict or realistic policy to embedders. Both profiles enable generic allocation-pressure adaptation: as owned memory approaches guarded stage reserves, the loader may skip JavaScript, reduce stylesheet and image quotas, or retain four rather than eight tiles. Each decision is logged, depends only on remaining budget, and can be selected or disabled explicitly with `--adaptive-resources` or `--no-adaptive-resources`. Explicit `--limit-mb`, `--js-limit-mb`, or `--tile-count` values override the selected profile. `--navigation-stress N` repeatedly replaces a page through the bounded navigation owner and fails if teardown does not return to the pre-stress allocation level. `--resource-stage-ms` bounds each complete external CSS or image phase (100–60000 ms); requests inside the phase remain four-way concurrent and preserve document order when applied. CSS telemetry reports batches, the usable first batch, deadline cancellation, and total elapsed time.
+`--psp-profile strict` selects a 16 MiB content ceiling, 4 MiB JavaScript ceiling, 1 MiB cumulative script-source allowance, and eight tiles. `--psp-profile realistic` is the PSP application's own configuration, taken from the `BROWSER_PSP_APP_*` constants that `src/psp_boot_config.c` and the PSP app use (`browser_config_apply_psp_app_defaults()`): a 32 MiB page envelope, a 5 MiB JavaScript heap with the app's 4 MiB boot window, GC growth and array-cap engine knobs (an explicit environment value wins), 256 scripts, memory-based script admission with a 16 MiB source ceiling and 4 MiB per file, a 60-second script timeout, an 8 MiB document cap, four history entries, a 640 KiB session cache, 24 tiles, and the app's stylesheet and image limits. A lab replay therefore admits what the device admits without explicit limit flags. The VM value is a ceiling rather than an up-front reservation. The public `BrowserEngine` profile additionally records an 8 MiB minimum non-page reserve for UI, stacks, TLS/backend state, sockets, libc metadata, and fragmentation; that reserve is deliberately unavailable to page content. `browser_config_apply_psp_memory_profile()` applies the same strict or realistic policy to embedders (realistic there is `browser_config_apply_psp_app_defaults()` too). Both profiles enable generic allocation-pressure adaptation: as owned memory approaches guarded stage reserves, the loader may skip JavaScript, reduce stylesheet and image quotas, or retain four rather than eight tiles. Each decision is logged, depends only on remaining budget, and can be selected or disabled explicitly with `--adaptive-resources` or `--no-adaptive-resources`. Explicit `--limit-mb`, `--js-limit-mb`, or `--tile-count` values override the selected profile. `--navigation-stress N` repeatedly replaces a page through the bounded navigation owner and fails if teardown does not return to the pre-stress allocation level. `--resource-stage-ms` bounds each complete external CSS or image phase (100–60000 ms); requests inside the phase remain four-way concurrent and preserve document order when applied. CSS telemetry reports batches, the usable first batch, deadline cancellation, and total elapsed time.
 
 Very large static documents can exercise the separate, explicitly experimental
 path without changing the default architecture. With no explicit section,
@@ -371,6 +373,11 @@ What is and is not deterministic:
 - `style.cache_hits`/`style.cache_misses` are keyed by node address, so their
   split can move by one when allocation interleaving differs; compare
   `style.resolutions` and pass `--ignore style.cache_` to `--check-equal`.
+  An extra miss can be one more full resolution, so `style.rule_queries`
+  moves in the same direction by at most the miss difference, and
+  `style.rule_candidates`/`style.selector_*` move with it (about one run in
+  300 when each run's fixture sits in a fresh temporary directory). The
+  determinism test checks those against the miss difference.
 - Page script that reads the clock can change behaviour between runs; use
   `--deterministic-replay-seed` (seeded clock and random) for such pages.
   Without it, `js.float64_boxes` can differ by a few (a timestamp that
@@ -452,11 +459,26 @@ limit, at most 24 stylesheets (2,112 KiB total, 768 KiB each) and 24 images
 (1.5 MiB encoded total, 512 KiB each, 3 MiB decoded) with a 15-second
 per-resource timeout; a limit of 16 MiB or less with adaptive resources
 tightens those to 4 stylesheets (512 KiB total, 192 KiB each) and 12 images
-(768 KiB encoded, 256 KiB each, 1.5 MiB decoded). `<link rel=preload
+(768 KiB encoded, 256 KiB each, 1.5 MiB decoded). The image count bounds
+network work: icon-sized inline-SVG rasters (64x64 or less) and data: URLs of
+at most 4 KiB do not spend it, but still pay the decoded and encoded byte
+quotas and the 128-node tracking limit. `<link rel=preload
 as=style>` responses use a separate lane (the same count, half the stylesheet
 byte total), so preloads can never refuse an active stylesheet; an active link
 for the same URL, mode and credentials replays the preloaded body and takes
-over its charge. Resource counts and bytes are printed in the final status. Page-owned assets are destroyed on
+over its charge. Where the per-file cap is 512 KiB or more (large-sheet
+profiles, the PSP app's included), it is a floor rather than a limit: one
+response may grow to 2 MiB while the page Budget can stage about six times
+its size beside the 2 MiB layout reserve and the requests in flight, and a
+sheet that memory no longer parses keeps its complete rules up to the cap.
+Such sheets also keep up to 2,304 DOM-relevant rules past their 768-rule
+allowance while the Budget has 512 bytes per rule to spare. A stylesheet that
+reaches its per-file cap is applied up to
+its last complete top-level rule: the rule, declaration, string, comment or
+unclosed `@media`/`@supports` block the cap cut through is dropped, the cut
+response is kept only in the document's ledger (never the HTTP cache), and the
+`resources` line reports `css-truncated=SHEETS/APPLIED/RECEIVED` bytes (the PSP
+validation log prints the same field). Resource counts and bytes are printed in the final status. Page-owned assets are destroyed on
 navigation and reloaded after a DOM relayout; the user stylesheet is retained
 as a session-level cascade layer instead of being lost on that rebuild.
 
@@ -525,8 +547,19 @@ alive while commands are read from a file or standard input:
 Commands include accelerated `up`/`down`, `page-up`/`page-down`, `top`,
 `bottom`, focus movement, screen-coordinate `tap`, `activate`, text editing,
 selector clicks, timer ticks, direct navigation, reload, back/forward, status,
-and frame rendering. PSP aliases include `dpad-up`, `dpad-down`,
+and frame rendering. `reader-on`/`reader-off` and `basic-on` switch to the
+extracted views the way Page tools does (`basic-on` prints a `loop-basic` line
+with the visited and emitted nodes, truncation and preparation time). The
+`census` command prints the site-census report of the live page: the
+first-paint timebase, the share of draw commands and boxes below the first
+and second screen, each image's decoded and painted size, and the Reader
+analysis (see [tools/site-census/README.md](../../tools/site-census/README.md)). PSP
+aliases include `dpad-up`, `dpad-down`,
 `dpad-left`, `dpad-right`, `cross`, `circle`, `ltrigger`, and `rtrigger`.
+`--parser-script-time-limit-ms N` scales the parser-stage script circuit
+breaker (20 s on the PSP) down to the host: a host replay runs scripts about
+a hundred times faster, so roughly 150 ms reproduces where PPSSPP at
+111 MHz trips it.
 Focus movement automatically scrolls the focused link or control into view,
 and each history entry retains its own scroll position.
 Same-document DOM relayouts retain the focused node, compare the old and new
@@ -541,29 +574,47 @@ memory min/max/growth sampling for long-session plateau checks.
 The `script-report` command prints the JavaScript heap census and the
 compile/restore counters of the page that is live at that point; the
 post-load report covers only the first document of a page that reloads itself.
+It also prints the page's `heavy-page` line (class none, content, shell or
+over; script bytes; estimated PSP start time; waiting scripts; planned and
+reachable heap; visible text measured at commit; see
+`include/tilefinch/script_admission.h`), which the site census records.
+Its first line's `memory-rescue=yes` says the page's realm ran out of
+memory, its server-rendered body was put back and the realm retired
+(the census records it as `heavy.memory_rescue`).
+`--heavy-policy run|ask|refuse` sets the heavy-page policy (run by default,
+so a lab run never waits); with `ask`, `heavy-answer run` or
+`heavy-answer stop` answers the scripts that wait, and `stop-scripts`
+retires the page's realms as the PSP's Stop page scripts does.
+`refresh-status` prints the live document's declarative refresh (`loop-refresh
+state=none|pending|due|followed|cancelled|stopped|refused|offered`, delay,
+elapsed page-clock time, whether it came from the `Refresh` header, whether
+input has touched the page, target URL) and the session's loop-guard run and counters. The lab follows a due refresh inside the
+next `tick`, like a page-script navigation; input commands (scrolling, focus,
+`type`, `activate`, `go`, `back`, ...) restart the loop guard as a PSP button
+press does, mark the page touched (a same-URL reload is then `offered`, not
+followed), and `type`/`backspace` cancel a pending refresh.
 `--module-bytecode-cache-kb N` overrides the in-memory module bytecode ceiling
-(0 disables it); `--reload 1` loads the page twice through the engine, which
-is how a revisit's restores are measured.
-`--module-cache-dir DIR` adds the persistent tier: modules missing from the
-in-memory cache are restored from files in `DIR` when their key matches;
-`--module-cache-write` also stores newly compiled modules there (never
-overwriting a file). The two runs of a cold/warm comparison use the same
-`DIR`, the first with `--module-cache-write`. Directory accounting visits at
-most eight entries per maintenance slice (2 ms soft time limit, 4,096 entries
-total). Writes wait for accounting to finish; idle work continues the scan
-after presentation/resource work. Compilation never removes entries: a full
-cache (a maximum-size module might not fit, or 512 files) declines the write,
-and idle maintenance then removes this build's oldest records by
-modification time, eight per slice, until the directory is at or under 75%
-of both ceilings, rescanning for the next sixteen candidates as needed. A
-scan that fails or reaches the entry limit defers writes and is retried
-after 64 idle slices, doubling to 4,096. Only the tier's own file names are
-ever removed, and a read-only tier removes nothing. Explicit cache clearing is
-bounded by the same total-entry limit and reports incomplete removal. The
-`javascript-module-bytecode-disk` report line times the whole synchronous
-disk path (`load-us`, split into `read-us` and `verify-us`) apart from
-deserialization (`restore-us` on the line above) and the copy into RAM
-(`promote-us`); compare cold/warm runs by those, not `restore-us` alone.
+(0 disables it) and `--classic-bytecode-cache-kb N` the classic-script one;
+`--reload 1` loads the page twice through the engine, which is how a
+revisit's restores are measured. Classic bytecode is stored by page-idle
+work, which the `tick` command does not run: `idle N` runs up to N idle
+turns (stopping at the first that leaves no work) without moving the clock,
+as the PSP loop does while a page is quiet.
+`--script-cache-dir DIR` (or the older `--module-cache-dir`) adds the
+persistent compiled-script tier, classic scripts and modules: a script
+missing from the RAM tables is restored from the pack in `DIR` that its
+response and top-level site name, read whole and verified at most once per
+load and copied into RAM. `--script-cache-write` (or `--module-cache-write`)
+lets idle work write packs there, 16 KiB per idle turn, so a writing run
+needs idle turns (`idle N`) before it quits. The two runs of a cold/warm
+comparison use the same `DIR`; `tools/site-census/census.py replay
+--restart` does exactly that per page. The `javascript-script-cache-disk`
+report line gives this load's disk hits and the synchronous read time
+(`load-us`: index, pack reads, checksum and copies into RAM), packs and
+bytes read, records promoted, lookups the index did not name, and for the
+session's writes the packs and bytes written (index included), write time,
+removals, evictions and the directory's files and bytes. A host lab refuses
+a device path (`ms0:`, `host0:`).
 `--no-progressive-first-paint` provides a same-build control for measuring the
 provisional first-viewport tradeoff; final rendering and resource policy are
 unchanged.

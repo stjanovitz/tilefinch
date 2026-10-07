@@ -70,6 +70,11 @@ typedef struct {
     size_t reused_connections;
     size_t build_slices;
     size_t transform_quota_overruns;
+    /* The most bytes one transform slice advanced through the response
+       (decode, fact and comments scans, the renderer and metadata walk) or
+       emitted as HTML: the slice's size as work, which unlike
+       maximum_transform_slice_us does not depend on the host. */
+    size_t maximum_transform_slice_bytes;
     uint64_t network_us;
     uint64_t build_us;
     uint64_t request_wall_us;

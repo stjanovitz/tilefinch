@@ -1,0 +1,42 @@
+# DEVICE JOURNEY -- a paused rewind to 0:00 that rebuilds the decoder.
+#
+# Boot straight into the offline player (url=https://tilefinch.local/offline/
+# video?id=1 with the 60 s 640x360 fixture from
+# tools/make-offline-youtube-fixture.sh; the offline route autoplays). No
+# stability harness: validation_media_stability_auto=0.
+#
+# In order: three previews committed with Cross (about +30 s, an in-place
+# forward seek); Cross pauses; L previews 0:00 and Cross commits it while
+# paused. That rewind is 30 s or more, so it is a full backend reopen with a
+# paused continuation at exactly 0 -- the case that used to settle as a
+# passive open which never fed its decoder and failed "VIDEO FIRST FRAME
+# TIMED OUT" (2026-10-06). It must now resume through the seek, paused at 0
+# (`tilefinch-media-job: resume-open at=0us ... playing=0`); Cross then plays
+# from 0 and Circle closes the player. Each mark logs playing/failed/current.
+# No screenshot step: that writes to the Memory Stick.
+wait-live 300
+mark-live opened
+tap-live right
+wait-live 10
+tap-live right
+wait-live 10
+tap-live right
+wait-live 10
+tap-live cross
+wait-live 200
+mark-live forward
+tap-live cross
+wait-live 60
+mark-live paused
+tap-live ltrigger
+wait-live 20
+tap-live cross
+wait-live 600
+mark-live rewound-paused
+tap-live cross
+wait-live 300
+mark-live replaying
+tap-live circle
+wait-live 120
+mark-live closed
+end

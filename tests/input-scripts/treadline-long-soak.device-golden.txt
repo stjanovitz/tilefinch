@@ -1,5 +1,17 @@
 tilefinch-input-script: text-entry=danzeff
-tilefinch-input-script: armed script=input-script.txt steps=6 stall-limit=1800
-tilefinch-input-script: mark=webgl-measure-start step=1 screen=page
-tilefinch-input-script: mark=webgl-measure-end step=3 screen=page
-tilefinch-input-script: outcome=complete steps=5/6 frames=2972 held-frames=0 actions=0 settings=0
+tilefinch-input-script: armed script=input-script.txt steps=14 stall-limit=1800
+tilefinch-input-script: probe=input-script.mark.js bytes=1108
+tilefinch-input-script: probe=input-script.until.js bytes=356
+tilefinch-input-script: until-met step=0 checks=1
+tilefinch-input-script: step=0 action=activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=deployed step=2 screen=page
+tilefinch-input-script: until-met step=3 checks=1
+tilefinch-input-script: mark=profile-start step=5 screen=page
+tilefinch-input-script: mark=profile-report step=7 screen=page
+tilefinch-input-script: mark=webgl-measure-start step=9 screen=page
+tilefinch-input-script: mark=webgl-measure-end step=11 screen=page
+tilefinch-input-script: covered action=activate count=1
+tilefinch-input-script: outcome=complete steps=13/14 frames=1731 held-frames=1 actions=1 settings=0
+tilefinch-input-script: capture=deployed written=1 size=240x136
+tilefinch-input-script: capture=profile-start written=1 size=240x136
+tilefinch-input-script: capture=profile-report written=1 size=240x136

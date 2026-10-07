@@ -34,6 +34,12 @@ typedef struct {
     bool extraction_truncated;
 } ReaderDocumentAnalysis;
 
+/* The floor of an extracted view's bounds (Reader and Basic, see
+   reader_mode.c): every preparation may emit at least this many nodes and
+   markup bytes, however little memory is left; free memory raises both. */
+#define READER_EXTRACT_NODE_FLOOR 512u
+#define READER_EXTRACT_BYTE_FLOOR (256u * 1024u)
+
 /* Analyze one loaded DOM and install one hidden, bounded semantic Reader tree
    in a single operation. The raw DOM remains intact; the generic Reader
    stylesheet switches which tree is presented. The caller keeps the result

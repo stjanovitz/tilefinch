@@ -487,6 +487,9 @@ void psp_media_present_ge_stage_dma_stats(PspMediaPresentDmaStats *stats);
 
 /* Why the graphics engine is unusable, or NULL while it has not failed. */
 const char *psp_media_present_ge_reason(void);
+/* Close the shared GE context for every page/media user after a
+   submission whose completion could not be established. Sticky. */
+void psp_media_present_ge_latch_failure(const char *reason);
 
 /*
  * Prove, once per process and before anything is published, that this

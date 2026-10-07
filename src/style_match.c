@@ -5,6 +5,7 @@
 #include "style_internal.h"
 #include "style_cache_internal.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -198,6 +199,15 @@ static uint32_t style_class_token_hash(const char *text, size_t length)
     return hash;
 }
 
+static inline uint64_t style_class_token_quick(const char *text,
+                                               size_t length)
+{
+    unsigned mix = (unsigned) length * 7u
+        + (unsigned char) text[0] * 3u
+        + (unsigned char) text[length - 1u];
+    return UINT64_C(1) << (mix & 63u);
+}
+
 static void style_class_tokens_build(StyleClassTokens *tokens,
                                      const char *classes, size_t length,
                                      uint32_t scope)
@@ -208,6 +218,7 @@ static void style_class_tokens_build(StyleClassTokens *tokens,
     /* Only a list whose copy fits can be recognized in a later scope. */
     if (length <= STYLE_CLASS_TOKEN_COPY) memcpy(tokens->copy, classes, length);
     tokens->count = 0;
+    tokens->quick = 0;
     tokens->usable = length <= UINT16_MAX;
     memset(tokens->slots, 0, sizeof(tokens->slots));
     for (size_t at = 0; tokens->usable && at < length;) {
@@ -220,6 +231,7 @@ static void style_class_tokens_build(StyleClassTokens *tokens,
                 break;
             }
             uint32_t hash = style_class_token_hash(classes + at, end - at);
+            tokens->quick |= style_class_token_quick(classes + at, end - at);
             tokens->hashes[tokens->count] = hash;
             tokens->offsets[tokens->count] = (uint16_t) at;
             tokens->lengths[tokens->count] = (uint8_t) (end - at);
@@ -315,6 +327,9 @@ bool style_subject_has_class(const Stylesheet *sheet,
     }
     if (!tokens->usable)
         return class_contains_length(classes, length, key, key_length);
+    if (key_length == 0
+        || (tokens->quick & style_class_token_quick(key, key_length)) == 0)
+        return false;
     uint32_t hash = style_class_token_hash(key, key_length);
     for (size_t slot = hash & 127u, probes = 0; probes < 128u;
          slot = (slot + 1u) & 127u, probes++) {
@@ -392,6 +407,14 @@ static const char *style_identifier_span(const char *text, size_t length,
     }
     return decode_css_identifier(text, length, scratch, capacity, decoded_length)
         ? scratch : NULL;
+}
+
+const char *style_selector_identifier_span(const char *text, size_t length,
+                                           char *scratch, size_t capacity,
+                                           size_t *decoded_length)
+{
+    return style_identifier_span(text, length, scratch, capacity,
+                                 decoded_length);
 }
 
 static bool attribute_span_equal_case(const char *actual,
@@ -671,6 +694,7 @@ StylePseudoKind style_pseudo_kind(const char *text, size_t length)
     case 4:
         if (memcmp(text, "root", 4) == 0) return STYLE_PSEUDO_ROOT;
         if (memcmp(text, "link", 4) == 0) return STYLE_PSEUDO_LINK;
+        if (memcmp(text, "host", 4) == 0) return STYLE_PSEUDO_HOST;
         if (memcmp(text, "open", 4) == 0) return STYLE_PSEUDO_OPEN;
         break;
     case 5:
@@ -1369,6 +1393,8 @@ static bool simple_pseudo_matches(const Stylesheet *sheet,
             }
         }
     }
+    if (kind == STYLE_PSEUDO_HOST
+        && document_shadow_carrier_of_host(node) == NULL) return false;
     if (defined_pseudo) {
         lxb_dom_element_t *element = lxb_dom_interface_element(node);
         bool built_in = node->local_name >= LXB_TAG__BEGIN
@@ -1805,6 +1831,29 @@ static bool style_selector_program_matches_at(
     size_t instruction, unsigned depth,
     const StyleMatchSubject *known_subject);
 
+/* A prepared subject for `node` from the scope's subject cache, or `local`
+   prepared afresh outside such a scope. */
+static const StyleMatchSubject *style_subject_for_walk(
+    const Stylesheet *sheet, lxb_dom_node_t *node, StyleMatchSubject *local)
+{
+    const StyleResolveScratch *scratch = sheet->resolve_scratch;
+    StyleClassTokenCache *cache = sheet->class_tokens;
+    if (scratch == NULL || scratch->class_tokens_depth == 0 || cache == NULL
+        || cache->scope == 0) {
+        style_match_subject_prepare(node, local);
+        return local;
+    }
+    uintptr_t value = (uintptr_t) node;
+    size_t slot = (size_t) ((value >> 4) ^ (value >> 10))
+        & (STYLE_SUBJECT_CACHE_SIZE - 1u);
+    StyleMatchSubject *entry = &cache->subjects[slot];
+    if (cache->subject_scopes[slot] != cache->scope || entry->node != node) {
+        style_match_subject_prepare(node, entry);
+        cache->subject_scopes[slot] = cache->scope;
+    }
+    return entry;
+}
+
 static bool style_selector_program_matches_uncached(
     const Stylesheet *sheet, const StyleRule *rule, lxb_dom_node_t *node,
     size_t instruction, unsigned depth,
@@ -1821,8 +1870,7 @@ static bool style_selector_program_matches_uncached(
         STYLE_SELECTOR_COUNT(sheet, selector_subject_cache_hits, 1);
     } else {
         STYLE_SELECTOR_COUNT(sheet, selector_subject_cache_misses, 1);
-        style_match_subject_prepare(node, &local_subject);
-        subject = &local_subject;
+        subject = style_subject_for_walk(sheet, node, &local_subject);
     }
     const char *attribute_value = "";
     size_t attribute_value_length = 0;
@@ -2013,12 +2061,241 @@ static bool style_selector_program_matches_at(
     return matched;
 }
 
+/* The adopted sources whose carriers contain `node`. */
+static uint64_t style_node_adopted_scope(const Stylesheet *sheet,
+                                         const lxb_dom_node_t *node)
+{
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    const StyleClassTokenCache *tokens = sheet->class_tokens;
+    bool memo = scratch != NULL && tokens != NULL
+        && scratch->class_tokens_depth != 0;
+    if (memo && scratch->adopted_scope_node == node
+        && scratch->adopted_scope_tokens_scope == tokens->scope)
+        return scratch->adopted_scope_mask;
+    uint64_t mask = 0;
+    size_t depth = 0;
+    for (const lxb_dom_node_t *at = node; at != NULL && depth < 4096u;
+         at = at->parent, depth++) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        size_t low = 0, high = sheet->adopted_scope_root_count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2u;
+            uintptr_t root = (uintptr_t)
+                sheet->adopted_scope_roots[middle].root;
+            if (root == (uintptr_t) at) {
+                mask |= sheet->adopted_scope_roots[middle].mask;
+                break;
+            }
+            if (root < (uintptr_t) at) low = middle + 1u;
+            else high = middle;
+        }
+    }
+    if (memo) {
+        scratch->adopted_scope_node = node;
+        scratch->adopted_scope_tokens_scope = tokens->scope;
+        scratch->adopted_scope_mask = mask;
+    }
+    return mask;
+}
+
+uint64_t style_adopted_source_bit(const Stylesheet *sheet, unsigned order)
+{
+    size_t count = sheet->adopted_source_count;
+    if (count == 0 || count > sheet->style_source_count
+        || sheet->style_sources_bounded_out) return 0;
+    size_t base = sheet->style_source_count - count;
+    const unsigned *first = &sheet->style_source_first_order[base];
+    if (order < first[0]) return 0;
+    /* The last adopted source starting at or before `order` holds it. */
+    size_t low = 0, high = count;
+    while (high - low > 1u) {
+        size_t middle = low + (high - low) / 2u;
+        if (first[middle] <= order) low = middle;
+        else high = middle;
+    }
+    return low < 64u ? UINT64_C(1) << low : 0;
+}
+
+uint64_t style_subject_adopted_scope(const Stylesheet *sheet,
+                                     const StyleMatchSubject *subject,
+                                     const lxb_dom_node_t *node)
+{
+    if (node == NULL) return 0;
+    if (subject != NULL && subject->node == node) {
+        /* The subject is the caller's, prepared for this one element. */
+        StyleMatchSubject *memo = (StyleMatchSubject *) subject;
+        if (!memo->adopted_scope_known) {
+            memo->adopted_scope = style_node_adopted_scope(sheet, node);
+            memo->adopted_scope_known = true;
+        }
+        return memo->adopted_scope;
+    }
+    return style_node_adopted_scope(sheet, node);
+}
+
+bool style_adopted_scope_admits(const Stylesheet *sheet, unsigned order,
+                                const lxb_dom_node_t *node,
+                                const StyleMatchSubject *subject)
+{
+    uint64_t bit = style_adopted_source_bit(sheet, order);
+    if (bit != 0 && sheet->adopted_scopes_failed)
+        return (sheet->adopted_document_mask & bit) != 0;
+    if ((sheet->adopted_shadow_only_mask & bit) == 0) return true;
+    return (style_subject_adopted_scope(sheet, subject, node) & bit) != 0;
+}
+
+uint64_t style_adopted_cascade_order(const Stylesheet *sheet,
+                                    const lxb_dom_node_t *node, unsigned order)
+{
+    uint64_t bit = style_adopted_source_bit(sheet, order);
+    if (bit == 0) return order;
+    size_t source = 0;
+    while ((bit >> source) != 1u) source++;
+    unsigned rank = (unsigned) source + 1u;
+    if (sheet->adopted_scopes_failed) {
+        if (sheet->adopted_document_order[source] != 0)
+            rank = sheet->adopted_document_order[source];
+        size_t base = sheet->style_source_count - sheet->adopted_source_count;
+        return ((uint64_t) rank << 32)
+            | (order - sheet->style_source_first_order[base + source]);
+    }
+    const StyleAdoptedScopeRoot *document_root = NULL;
+    /* Nearest adopting carrier first; :host/::slotted subjects may instead
+       refer to the carrier attached to the element or its parent. */
+    const lxb_dom_node_t *carrier = document_shadow_carrier_containing(node);
+    if (carrier == NULL) carrier = document_shadow_carrier_of_host(node);
+    if (carrier == NULL && node != NULL)
+        carrier = document_shadow_carrier_of_host(node->parent);
+    bool found = false;
+    for (size_t i = 0; i < sheet->adopted_scope_root_count; i++) {
+        const StyleAdoptedScopeRoot *root = &sheet->adopted_scope_roots[i];
+        if (root->root == NULL) document_root = root;
+        if (root->root == carrier && carrier != NULL
+            && root->order[source] != 0) {
+            rank = root->order[source];
+            found = true;
+        }
+    }
+    if (!found && document_root != NULL && document_root->order[source] != 0)
+        rank = document_root->order[source];
+    size_t base = sheet->style_source_count - sheet->adopted_source_count;
+    return ((uint64_t) rank << 32)
+        | (order - sheet->style_source_first_order[base + source]);
+}
+
+typedef enum {
+    STYLE_SHADOW_RULE_INSIDE,
+    STYLE_SHADOW_RULE_HOST,
+    STYLE_SHADOW_RULE_SLOTTED
+} StyleShadowRuleKind;
+
+/* Where a shadow-confined selector's subject lives, read from its text as
+   style_shadow_selector_rewrite left it: a rightmost compound beginning
+   with :host targets the host; the rewritten `:host > :is(X)` form of
+   ::slotted() targets the host's light children. */
+static StyleShadowRuleKind style_shadow_rule_kind(const char *selector,
+                                                  size_t length)
+{
+    if (selector == NULL || length < 5) return STYLE_SHADOW_RULE_INSIDE;
+    size_t rightmost = 0;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < length; i++) {
+        char c = selector[i];
+        if (quote != 0) {
+            if (c == '\\' && i + 1 < length) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(' || c == '[') depth++;
+        else if ((c == ')' || c == ']') && depth > 0) depth--;
+        else if (depth == 0 && (c == ' ' || c == '>' || c == '+'
+                                || c == '~')) rightmost = i + 1;
+    }
+    if (length - rightmost >= 5
+        && memcmp(selector + rightmost, ":host", 5) == 0
+        && (length - rightmost == 5
+            || !(isalnum((unsigned char) selector[rightmost + 5])
+                 || selector[rightmost + 5] == '-'))) {
+        return STYLE_SHADOW_RULE_HOST;
+    }
+    if (length > 12 && memcmp(selector, ":host > :is(", 12) == 0
+        && rightmost == 8) {
+        return STYLE_SHADOW_RULE_SLOTTED;
+    }
+    return STYLE_SHADOW_RULE_INSIDE;
+}
+
+static const StyleShadowScope *style_shadow_scope_for_order(
+    const Stylesheet *sheet, unsigned order)
+{
+    size_t low = 0, high = sheet->shadow_scope_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2u;
+        const StyleShadowScope *scope = &sheet->shadow_scopes[middle];
+        if (order < scope->begin) high = middle;
+        else if (order >= scope->end) low = middle + 1u;
+        else return scope;
+    }
+    return NULL;
+}
+
+bool style_subject_near_shadow_tree(const StyleMatchSubject *subject)
+{
+    const lxb_dom_node_t *node = subject == NULL ? NULL : subject->node;
+    return node != NULL
+        && (document_shadow_carrier_of_host(node) != NULL
+            || (node->parent != NULL
+                && document_shadow_carrier_of_host(node->parent) != NULL));
+}
+
+bool style_shadow_scope_admits(const Stylesheet *sheet, unsigned order,
+                               const char *selector, size_t selector_length,
+                               const lxb_dom_node_t *node,
+                               const StyleMatchSubject *subject)
+{
+    if (sheet->adopted_scopes_failed
+        && (style_adopted_source_bit(sheet, order)
+            & ~sheet->adopted_document_mask) != 0) return false;
+    uint64_t bit = sheet->adopted_scopes_failed
+        || sheet->adopted_shadow_only_mask == 0 ? 0
+        : style_adopted_source_bit(sheet, order)
+          & sheet->adopted_shadow_only_mask;
+    const StyleShadowScope *scope = bit != 0 || sheet->shadow_scope_count == 0
+        ? NULL : style_shadow_scope_for_order(sheet, order);
+    if (bit == 0 && scope == NULL) return true;
+    StyleShadowRuleKind kind = style_shadow_rule_kind(
+        selector, selector_length);
+    if (kind == STYLE_SHADOW_RULE_INSIDE) {
+        if (bit != 0) {
+            return (style_subject_adopted_scope(sheet, subject, node) & bit)
+                != 0;
+        }
+        /* The nearest tree: an outer shadow tree's style does not reach
+           into a component nested inside it. */
+        return document_shadow_carrier_containing(node) == scope->carrier;
+    }
+    const lxb_dom_node_t *host = kind == STYLE_SHADOW_RULE_HOST
+        ? node : (node == NULL ? NULL : node->parent);
+    const lxb_dom_node_t *carrier = document_shadow_carrier_of_host(host);
+    if (carrier == NULL) return false;
+    if (kind == STYLE_SHADOW_RULE_SLOTTED
+        && !document_shadow_light_child_rendered(
+               carrier, (lxb_dom_node_t *) node)) return false;
+    if (bit != 0) return (style_node_adopted_scope(sheet, carrier) & bit) != 0;
+    return carrier == scope->carrier;
+}
+
 bool style_rule_selector_matches_subject(
     const Stylesheet *sheet, size_t rule_index, lxb_dom_node_t *node,
     const StyleMatchSubject *subject)
 {
     if (sheet == NULL || rule_index >= sheet->count) return false;
     const StyleRule *rule = &sheet->rules[rule_index];
+    if (!style_adopted_rule_in_scope(sheet, rule->order, rule->selector,
+                                     rule->selector_length, node, subject))
+        return false;
     if (sheet->selector_program_ready
         && sheet->selector_program_offsets != NULL
         && rule_index < sheet->count) {

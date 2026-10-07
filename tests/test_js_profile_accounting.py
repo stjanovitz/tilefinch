@@ -65,11 +65,15 @@ with tempfile.TemporaryDirectory() as directory:
     result = subprocess.run([str(lab), "--fixture", str(page),
         "--commands", str(commands), "--no-loop-capture", "--output",
         str(root / "out.ppm")], env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20, check=True)
-    summary = re.search(r"label=probe samples=.*?unframed-us=(\d+)", result.stdout)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=True)
+    # Keep concurrent checkpoint stderr out of stdout records while capturing.
+    # Joining complete streams afterward preserves every accounting assertion
+    # without allowing a diagnostic to splice through a required field.
+    output = result.stdout + "\n" + result.stderr
+    summary = re.search(r"label=probe samples=.*?unframed-us=(\d+)", output)
     gaps = re.search(r"label=probe samples=.*?long-gap-us=(\d+) long-gap-count=(\d+)",
-                     result.stdout)
-    detail = re.search(r"label=probe unframed ([^\n]+)", result.stdout)
+                     output)
+    detail = re.search(r"label=probe unframed ([^\n]+)", output)
     assert summary and gaps and detail, "missing empty-stack or long-gap accounting"
     fields = {key: int(value) for key, value in
               re.findall(r"([a-z]+)-us=(\d+)", detail[1])}
@@ -78,7 +82,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert fields["compile"] > 0 and fields["tail"] > 0, fields
     assert fields["profiler"] > 0, fields
     jobs = {}
-    for record in re.findall(r"tilefinch-promise-job: ([^\n]+)", result.stdout):
+    for record in re.findall(r"tilefinch-promise-job: ([^\n]+)", output):
         values = {key: int(value) for key, value in
                   re.findall(r"([\w-]+)=(\d+)", record)}
         assert values["job"] not in jobs, "job identity reused"
@@ -91,10 +95,10 @@ with tempfile.TemporaryDirectory() as directory:
         assert values["unframed-us"] <= values["sampled-us"], values
         assert "long-gap-us" in values, "missing per-job unattributed interval total"
     assert jobs, "missing per-job accounting"
-    roots = re.findall(r"tilefinch-promise-root: job=(\d+) us=(\d+) complete=1 at=([^\n]+)", result.stdout)
+    roots = re.findall(r"tilefinch-promise-root: job=(\d+) us=(\d+) complete=1 at=([^\n]+)", output)
     assert any(":job@" in root for _, _, root in roots), "missing named promise callback"
     assert all(int(job) in jobs for job, _, _ in roots), "orphan promise samples"
-    grouped = report(result.stdout)
+    grouped = report(output)
     assert len(grouped) == len(jobs)
     assert any(any(":job@" in name for name, _ in item["complete_roots"])
                for item in grouped), "report lost callback provenance"
@@ -105,7 +109,8 @@ with tempfile.TemporaryDirectory() as directory:
                   "gc-us=0 cooperate-us=0 profiler-us=0 unframed-us=0\n")[0]["complete_roots"] == []
     env["TILEFINCH_JS_PROFILE_OUTLIER_US"] = "0"
     quiet = subprocess.run(result.args, env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20, check=True)
-    assert "tilefinch-promise-job:" not in quiet.stdout
-    assert "tilefinch-promise-root:" not in quiet.stdout
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=True)
+    quiet_output = quiet.stdout + "\n" + quiet.stderr
+    assert "tilefinch-promise-job:" not in quiet_output
+    assert "tilefinch-promise-root:" not in quiet_output
     print("profile accounting:", fields)

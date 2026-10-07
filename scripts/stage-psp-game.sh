@@ -244,20 +244,19 @@ else
     stage_url=$stage_url?stage=$short_digest
 fi
 temporary_config=$boot_config.tmp.$$
-# The Game Profile permits one bounded 384 KiB authored script. Make direct
-# device staging exercise that same contract instead of the generic 256 KiB
-# web-page default; otherwise a valid installed game can degrade to its static
-# shell only in the PSP validation route.
+# The Game Profile permits one bounded 512 KiB authored script. Make direct
+# device staging exercise that same contract, including with a stale lower
+# boot override. Strict mode still applies its own 256 KiB compile ceiling.
 awk -v staged_url="$stage_url" '
     BEGIN { replaced = 0; file_replaced = 0 }
     /^url=/ && !replaced { print "url=" staged_url; replaced = 1; next }
     /^file_kb=/ && !file_replaced {
-        print "file_kb=384"; file_replaced = 1; next
+        print "file_kb=512"; file_replaced = 1; next
     }
     { print }
     END {
         if (!replaced) print "url=" staged_url
-        if (!file_replaced) print "file_kb=384"
+        if (!file_replaced) print "file_kb=512"
     }
 ' "$boot_config" >"$temporary_config"
 mv "$temporary_config" "$boot_config"

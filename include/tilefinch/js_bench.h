@@ -26,7 +26,9 @@ typedef struct {
     uint32_t lazy_threshold;
     /* QuickJS heap limit for the bench runtime, in bytes. */
     size_t memory_limit;
-    /* Comma-separated kernel names to run, or NULL for all. */
+    /* Comma-separated kernel names to run, or NULL/empty for all. Explicit
+       filters are bounded to 512 bytes and must name existing kernels;
+       compile_trace additionally requires trace_dir. Refusal runs no work. */
     const char *only;
 } JsBenchOptions;
 

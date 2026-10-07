@@ -230,8 +230,18 @@ set(PSP_BROWSER_LEXBOR_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-partial-document-destroy.patch")
 set(PSP_BROWSER_LEXBOR_FOSTER_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-foster-parent-insertion-events.patch")
+set(PSP_BROWSER_LEXBOR_TOKENIZER_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-compact-tokenizer-storage.patch")
+set(PSP_BROWSER_LEXBOR_MRAW_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-mraw-shrink-offset.patch")
+set(PSP_BROWSER_STB_JPEG_SCALE_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-jpeg-scaled-idct.patch")
 set(PSP_BROWSER_NANOSVG_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-bounded-fixed-edges.patch")
+set(PSP_BROWSER_NANOSVG_GEOMETRY_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-hostile-geometry.patch")
+set(PSP_BROWSER_NANOSVG_DIVISIONS_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-bounded-curve-divisions.patch")
 set(PSP_BROWSER_POCKETSPHINX_SOURCE_DIR "" CACHE PATH
     "Optional prepared PocketSphinx 5.1.1 source tree for PSP voice input")
 option(PSP_BROWSER_PACKED_VOICE_LEXICON
@@ -246,7 +256,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_QUICKJS_PATCH}"
     "${PSP_BROWSER_LEXBOR_PATCH}"
     "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
+    "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
+    "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
+    "${PSP_BROWSER_STB_JPEG_SCALE_PATCH}"
     "${PSP_BROWSER_NANOSVG_PATCH}"
+    "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
+    "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-int32.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-no-mmap.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-timer.patch"
@@ -357,7 +372,9 @@ else()
     set(PSP_BROWSER_LEXBOR_NEEDS_ADD_SUBDIRECTORY OFF)
 endif()
 foreach(lexbor_patch IN ITEMS
-        "${PSP_BROWSER_LEXBOR_PATCH}" "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}")
+        "${PSP_BROWSER_LEXBOR_PATCH}" "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
+        "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
+        "${PSP_BROWSER_LEXBOR_MRAW_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
@@ -392,9 +409,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-        "de3e49b132640635b2a282ca7796e8ecfc8e1401897a4e1838f11bb5f116676a")
+        "6570a5234cbc4c4aef83e3f1580cf52c1502aa1cda62ab255107631469c03ba8")
     set(tilefinch_quickjs_vendor_h_sha256
-        "be98f918f36fafc853e404a72d7a8abb622e531bc8e656ff7873e495ef1d7ed4")
+        "3b405af189281669e35d9177547ac36c89464bb6120523d53ea64170965a367d")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
     if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -406,6 +423,40 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "intentional, update tilefinch_quickjs_vendor_c_sha256 and "
             "tilefinch_quickjs_vendor_h_sha256 in cmake/TilefinchDependencies.cmake "
             "in the same commit; otherwise restore the vendored files.")
+    endif()
+    # The other engine sources whose change can alter compiled bytecode:
+    # regexp literals are compiled at parse time and lre_compile's output is
+    # serialized into every cached script (classic, module, Memory Stick
+    # tier); the atom and opcode tables and the number parser shape every
+    # record too. They are pinned as one fingerprint and folded into
+    # TILEFINCH_QUICKJS_ENGINE_ID below, which keys the persistent tier.
+    set(tilefinch_quickjs_bytecode_sources
+        quickjs-atom.h quickjs-opcode.h libregexp.c libregexp.h
+        libregexp-opcode.h libunicode.c libunicode.h libunicode-table.h
+        dtoa.c dtoa.h)
+    set(tilefinch_quickjs_vendor_bytecode_sources_sha256
+        "be01d4dcecb931935ae07678aa36d947eaa66f5a7a35efe5c776dfabf7d38998")
+    set(tilefinch_quickjs_bytecode_source_hashes "")
+    foreach(source IN LISTS tilefinch_quickjs_bytecode_sources)
+        file(SHA256 "${tilefinch_quickjs_vendor_dir}/${source}"
+             tilefinch_quickjs_source_sha256)
+        string(APPEND tilefinch_quickjs_bytecode_source_hashes
+               "${source} ${tilefinch_quickjs_source_sha256}\n")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${tilefinch_quickjs_vendor_dir}/${source}")
+    endforeach()
+    string(SHA256 tilefinch_quickjs_bytecode_sources_sha256
+           "${tilefinch_quickjs_bytecode_source_hashes}")
+    if(NOT tilefinch_quickjs_bytecode_sources_sha256 STREQUAL
+           tilefinch_quickjs_vendor_bytecode_sources_sha256)
+        message(FATAL_ERROR
+            "third_party/quickjs's regexp, unicode, atom, opcode and dtoa "
+            "sources do not match their pinned fingerprint "
+            "(${tilefinch_quickjs_bytecode_sources_sha256}). If this engine "
+            "change is intentional, update "
+            "tilefinch_quickjs_vendor_bytecode_sources_sha256 in "
+            "cmake/TilefinchDependencies.cmake in the same commit; otherwise "
+            "restore the vendored files.")
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${tilefinch_quickjs_vendor_dir}/quickjs.c"
@@ -441,19 +492,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "018ad5fc57201cc011bb6bf64048dc20047d63c2d5d4239c4acabe6f2d343c44")
+            "503177c74e8c6e4683f009c30cc925bea26b58030ac2cf4c2c80aea4cca4ba77")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "ae60a551990db8f6e2649b278f6fdd389a445a957aed1734f2af3cc662528690")
+            "8d0aca7fe92288981aa7427827e7823b3d34d0ce0e18b2cf0311bd0cf3b1be18")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "6fdae33097296768d5d2833a78c94a65b18e410e9ab91931aa0459c6a47545be")
+            "494c98afa394cb099414aea38414bd5284468c91fc82d694af75c3a457e193d9")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "650b2c67474e8a1a95fa591579b74c62052d66ec3960a426972b14dace8dc828")
+            "bca2b483166080e7e5297f3d206020790104a0f80f49e4344ae84b05b5b3943c")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "61f1a2271333d5c347878d893a450be527ec8c940fd54f773cf7226ab146b84e")
+            "d02bc841e1eb2d9861ec4cc04551889c9e24eadd22ea96399a68ffa4ef907d00")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "bf01c494f17dd18885ae6414c8fce55d9e22dc6fac31ccfe4d83f51c4be1f39f")
+            "94d67b256b6ffa6c58d4a78689d2030720d95baf193f4db27bf94c4420583494")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "5f443a4a1256de43933e4e2459368acb6ff0fab31ed53752f9029d8a90f5c1fc")
+            "79c0393feddf90d78d4d8bd8a83eff6e0f1bcf45739fd9544a54a8bed6452d41")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -482,6 +533,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             endforeach()
             # Reverse the default stack above the shared bounded baseline.
             foreach(layer
+                    float-array-indexed-store
                     native-string-gc
                     compact-array-repack
                     compact-byte-array
@@ -501,7 +553,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "72d86d358f4a8416308648df90877380a77ad007be46f15970c6072128cf40cc")
+                   "23965fca3eb0c0f8e977ce23d11bac3180d35d9e841bc01b20ab05193e698e9b")
                 message(FATAL_ERROR
                     "Reversing the QuickJS default stack reached "
                     "${tilefinch_quickjs_variant_baseline}, not the pinned "
@@ -528,7 +580,8 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
                 list(APPEND tilefinch_quickjs_forward
                     compact-byte-array compact-array-repack)
             endif()
-            list(APPEND tilefinch_quickjs_forward native-string-gc)
+            list(APPEND tilefinch_quickjs_forward native-string-gc
+                float-array-indexed-store)
             foreach(layer IN LISTS tilefinch_quickjs_forward)
                 execute_process(COMMAND "${PATCH_EXECUTABLE}" --force --forward --silent -p1
                     -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
@@ -558,9 +611,12 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     endif()
     set(TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR "${quickjs_SOURCE_DIR}"
         CACHE INTERNAL "Actual Bellard engine source selected for this build" FORCE)
-    # Persistent module bytecode is valid only for the engine that wrote it:
-    # key it by the exact interpreter source compiled here.
+    # Persistent bytecode is valid only for the engine that wrote it: key it
+    # by the exact interpreter source compiled here and the pinned sources
+    # whose output it serializes (regexp programs, atoms, opcodes).
     file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c" tilefinch_quickjs_engine_sha256)
+    string(SHA256 tilefinch_quickjs_engine_sha256
+           "${tilefinch_quickjs_engine_sha256} ${tilefinch_quickjs_bytecode_sources_sha256}")
     string(SUBSTRING "${tilefinch_quickjs_engine_sha256}" 0 16
         tilefinch_quickjs_engine_id)
     set(TILEFINCH_QUICKJS_ENGINE_ID "${tilefinch_quickjs_engine_id}"
@@ -943,6 +999,20 @@ else()
     )
     FetchContent_MakeAvailable(stb)
 endif()
+# src/image_decode.c decodes a JPEG that is shown smaller than its source by
+# storing each IDCT block box-averaged by 2, 4 or 8, so the full-resolution
+# component planes never exist (stbi__jpeg.tilefinch_scale_shift; zero, the
+# default for every other stb caller, is the unchanged upstream path).
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        -DPATCH_SOURCE_DIR=${stb_SOURCE_DIR}
+        -DPATCH_FILE=${PSP_BROWSER_STB_JPEG_SCALE_PATCH}
+        -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
+        -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
+    RESULT_VARIABLE stb_patch_result)
+if(NOT stb_patch_result EQUAL 0)
+    message(FATAL_ERROR "Could not prepare the stb_image source")
+endif()
 
 if(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/dejavu-fonts/ttf/DejaVuSans.ttf")
     set(dejavu_fonts_SOURCE_DIR "${PSP_BROWSER_VENDOR_DIR}/dejavu-fonts")
@@ -991,16 +1061,20 @@ else()
     )
     FetchContent_MakeAvailable(nanosvg)
 endif()
-execute_process(
-    COMMAND "${CMAKE_COMMAND}"
-        -DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}
-        -DPATCH_FILE=${PSP_BROWSER_NANOSVG_PATCH}
-        -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-        -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-    RESULT_VARIABLE nanosvg_patch_result)
-if(NOT nanosvg_patch_result EQUAL 0)
-    message(FATAL_ERROR "Could not prepare the NanoSVG source")
-endif()
+foreach(nanosvg_patch IN ITEMS
+        "${PSP_BROWSER_NANOSVG_PATCH}" "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
+        "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}")
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+            -DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}
+            -DPATCH_FILE=${nanosvg_patch}
+            -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
+            -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
+        RESULT_VARIABLE nanosvg_patch_result)
+    if(NOT nanosvg_patch_result EQUAL 0)
+        message(FATAL_ERROR "Could not prepare the NanoSVG source")
+    endif()
+endforeach()
 
 # Decode-only WebP support.  Sites increasingly sign the requested WebP
 # transform into their CDN URLs, so content negotiation or URL rewriting
@@ -1029,6 +1103,19 @@ FetchContent_MakeAvailable(libwebp)
 # is disabled. Tilefinch links only webpdecoder; keep the unrelated encoder,
 # demux, and sharp-YUV targets out of the ordinary `all` build so adding WebP
 # does not turn each clean host build into an encoder build.
+# src/image_decode.c decodes to MODE_RGBA only. WEBP_REDUCE_CSP keeps the
+# RGBA/BGRA (and premultiplied) fancy upsamplers and drops the RGB, BGR,
+# ARGB, RGBA-4444 and RGB-565 copies (about 4 KB of PSP .text); the RGBA
+# path compiles identically, so decoded pixels do not change.
+target_compile_definitions(webpdspdecode PRIVATE WEBP_REDUCE_CSP)
+# Every libwebp allocation goes through WebPSafeMalloc/WebPSafeCalloc/
+# WebPSafeFree in utils.c. Route them to src/image_decode.c, which charges
+# the decode's Budget, so a WebP decode is accounted exactly (and refused when
+# it does not fit) instead of pre-reserving a per-source-pixel estimate.
+set_source_files_properties("${libwebp_SOURCE_DIR}/src/utils/utils.c"
+    TARGET_DIRECTORY webputilsdecode
+    PROPERTIES COMPILE_DEFINITIONS
+        "malloc=tilefinch_webp_malloc;calloc=tilefinch_webp_calloc;free=tilefinch_webp_free")
 foreach(_tilefinch_unused_webp_target
         sharpyuv webpencode webpdsp webputils webp webpdemux)
     if(TARGET ${_tilefinch_unused_webp_target})

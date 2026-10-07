@@ -1,0 +1,35 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21488,4 +21488,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     p = JS_VALUE_GET_OBJ(sp[-3]);
+                     idx = JS_VALUE_GET_INT(sp[-2]);
++                    if (unlikely(p->class_id == JS_CLASS_FLOAT32_ARRAY ||
++                                 p->class_id == JS_CLASS_FLOAT64_ARRAY)) {
++                        /* Numeric primitive conversion cannot run author code
++                           or detach/resize the view. Other values retain the
++                           full conversion-before-bounds-check path below. */
++                        uint32_t tag = JS_VALUE_GET_TAG(sp[-1]);
++                        if (idx < (uint32_t)p->u.array.count &&
++                            (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag))) {
++                            if (p->class_id == JS_CLASS_FLOAT32_ARRAY) {
++                                /* An int32 is exact in double; converting it
++                                   directly to float gives the same result and
++                                   avoids two soft-float helpers on Allegrex. */
++                                if (tag == JS_TAG_INT)
++                                    p->u.array.u.float_ptr[idx] =
++                                        (float)JS_VALUE_GET_INT(sp[-1]);
++                                else
++                                    p->u.array.u.float_ptr[idx] =
++                                        JS_VALUE_GET_FLOAT64(sp[-1]);
++                            } else {
++                                p->u.array.u.double_ptr[idx] = tag == JS_TAG_INT
++                                    ? (double)JS_VALUE_GET_INT(sp[-1])
++                                    : JS_VALUE_GET_FLOAT64(sp[-1]);
++                            }
++                            JS_FreeValue(ctx, sp[-3]);
++                            sp -= 3;
++                            BREAK;
++                        }
++                    }
+                     if (unlikely(p->class_id != JS_CLASS_ARRAY))
+                         goto put_array_el_slow_path;

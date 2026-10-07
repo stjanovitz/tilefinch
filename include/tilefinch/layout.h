@@ -26,6 +26,16 @@
    overflow content. It joins that bounded per-frame stream rather than being
    baked underneath it in a cached tile. */
 #define LAYOUT_COMMAND_LATE_POSITIONED UINT8_C(16)
+/* A command of a position:sticky range. It never enters a cached tile: the
+   frame compositor paints it at its static position until the range sticks
+   and offset after, so a stuck bar with a transparent background does not
+   show its own tile copy (a ghost) scrolling beneath it. */
+#define LAYOUT_COMMAND_STICKY UINT8_C(32)
+/* Commands painted by the frame compositor rather than baked into tiles.
+   The tile builder and the compositor must agree on this exactly: a
+   command in both shows as a ghost. */
+#define LAYOUT_COMMAND_UNTILED \
+    (LAYOUT_COMMAND_FIXED | LAYOUT_COMMAND_STICKY)
 #define LAYOUT_IMAGE_FIT_STRETCH UINT8_C(0)
 #define LAYOUT_IMAGE_FIT_COVER UINT8_C(1)
 #define LAYOUT_IMAGE_FIT_CONTAIN UINT8_C(2)
@@ -43,6 +53,12 @@
 #define LAYOUT_STROKE_DOTTED UINT8_C(2)
 /* Solid stroke with stable identity for one retained, simple inset shadow. */
 #define LAYOUT_STROKE_FOCUS_INSET UINT8_C(3)
+/* A DRAW_SHADOW_RECT whose shadow rect is its element's border box (no
+   offset or spread, uniform corners): it paints only outside that box. */
+#define LAYOUT_SHADOW_OUTSIDE_BOX UINT8_C(1)
+/* Layout-internal: a hard single-axis offset shadow that the decoration
+   patch converts to the visible fill strip; never reaches the painter. */
+#define LAYOUT_SHADOW_OFFSET_STRIP UINT8_C(2)
 /* image_fit is otherwise unused by text commands, so the retained underline
    bit costs no display-list bytes on the PSP. */
 #define LAYOUT_TEXT_DECORATION_UNDERLINE UINT8_C(4)
@@ -604,6 +620,11 @@ typedef struct {
     int inset;
     int scroll_end;
     bool from_bottom;
+    /* Nearest clip-path ancestor. clip-path clips every descendant, but a
+       viewport-fixed one paints in viewport space, so the compositor
+       intersects it with that ancestor's clip box at the current scroll
+       (scroll_end is the clip box's document bottom). NULL when none. */
+    const lxb_dom_node_t *clip_node;
 } FixedRange;
 
 typedef struct {
@@ -671,7 +692,10 @@ typedef struct {
     uint8_t clip_only_x : 1;
     uint8_t clip_only_y : 1;
     uint8_t cssom_geometry_authoritative : 1;
-    uint8_t clip_flags_reserved : 3;
+    /* The clip comes from clip-path, which clips all descendants rather
+       than only those whose containing block chain includes the box. */
+    uint8_t clip_path_clip : 1;
+    uint8_t clip_flags_reserved : 2;
     /* Zero for normal-flow boxes. For positioned boxes this is the bounded
        DOM-ancestor distance to their containing block; 255 denotes the
        initial containing block. It reuses trailing structure padding on
@@ -798,6 +822,8 @@ typedef struct {
     size_t matched_token_dropped;
     size_t matched_token_affected_rules;
     size_t stylesheet_appends;
+    /* Selector facts restored from an earlier scan of the same sheet. */
+    size_t selector_fact_reuses;
     size_t retired_subtrees;
     /* :has() changes handled by scoped invalidation, and those that fell
        back to a full reset; elements whose cached style and retained list
@@ -883,6 +909,9 @@ typedef struct {
     uint64_t bidi_paragraphs;
     uint64_t bidi_line_fallbacks;
     uint64_t bidi_limit_degradations;
+    /* Inline subtrees scanned for a possible direction change (each one a
+       walk of the block's inline content). */
+    uint64_t bidi_subtree_scans;
     uint64_t bidi_us;
     size_t bidi_peak_transient_bytes;
     int first_coordinate_clamp_y;
@@ -1136,6 +1165,11 @@ void layout_reuse_cache_end_font_publication(LayoutReuseCache *cache);
 /* Bind retained styles to one immutable stylesheet/font/viewport state.
    Image discovery uses the same binding before resolving nodes, allowing its
    complete document walk to seed the subsequent authoritative layout. */
+/* The next prepare should hold about this many element styles: the walk
+   about to start covers the document's elements, not only the evictions
+   an earlier, shorter walk saw. */
+void layout_reuse_cache_expect_elements(LayoutReuseCache *cache,
+                                        size_t elements);
 void layout_reuse_cache_prepare(LayoutReuseCache *cache,
                                 const Stylesheet *sheet,
                                 const FontSet *fonts,
@@ -1183,6 +1217,21 @@ void layout_reuse_cache_invalidate_structure(LayoutReuseCache *cache,
 /* invalidate_structure for a change already classified against the
    sheet's :has() rules (stylesheet_tree_change_may_affect_has, or true
    when it could not be): a non-relational one skips the :has() walk. */
+/* invalidate_children for `parent` whose last element child `removed`
+   left: the remaining children keep their styles unless a test counting
+   from the end can see them (the trailing keys); otherwise as
+   invalidate_children. */
+void layout_reuse_cache_invalidate_removed_last(LayoutReuseCache *cache,
+                                                const Stylesheet *sheet,
+                                                lxb_dom_node_t *parent,
+                                                const lxb_dom_node_t *removed,
+                                                bool relational);
+/* invalidate_tree for `node` inserted this turn after every sibling that
+   existed before it, when layout_insertion_reaches_siblings proved no
+   sibling test can see it from one of those: they keep their styles. */
+void layout_reuse_cache_invalidate_appended(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *node,
+                                            bool relational);
 void layout_reuse_cache_invalidate_tree(LayoutReuseCache *cache,
                                         lxb_dom_node_t *node, bool relational);
 /* `parent`'s child list changed (`removed` left it, NULL when unknown or
@@ -1195,6 +1244,38 @@ void layout_reuse_cache_invalidate_children(LayoutReuseCache *cache,
                                             lxb_dom_node_t *parent,
                                             const lxb_dom_node_t *removed,
                                             bool relational);
+/* `node` (an element) was inserted under its parent this turn and renders
+   nothing. Whether the insertion can still change a selector answer of an
+   element that existed before it through a sibling-position test (only
+   tests counting from the end of an earlier sibling, when every later
+   element sibling satisfies `is_new`, i.e. was inserted this turn too;
+   any positional or sibling test otherwise). The parent's :empty and
+   :has() are the caller's. Uses the selector facts of `sheet`'s current
+   build (the cache's, or remembered ones); true when there are none. */
+bool layout_insertion_reaches_siblings(
+    LayoutReuseCache *cache, const Stylesheet *sheet,
+    const lxb_dom_node_t *node,
+    bool (*is_new)(void *context, const lxb_dom_node_t *node),
+    void *context);
+/* A tree change at `node` (an inserted node, or the element whose
+   children changed) that may be visible to :has() rules, with the
+   journal's has_entries/serial for it: true when the sheet's :has() plan
+   finds no element whose answer the change can move. */
+bool layout_has_tree_change_inert(const Stylesheet *sheet,
+                                  lxb_dom_node_t *node, uint64_t entries,
+                                  uint32_t serial);
+/* layout_has_tree_change_inert for a tree change under element `parent`
+   (`subtree`: the inserted subtree in place, the removed one detached, or
+   NULL for a text change or children whose keys are not at hand), first
+   trying the plan-independent facts of `sheet`'s current build (the
+   cache's, or remembered ones): no :has() argument can match an element
+   that joined or left, and no argument the change's position can affect is
+   anchored on `parent`, above it, or on an earlier sibling. Those hold even
+   when the sheet has more :has() rules than the plan classifies. */
+bool layout_tree_change_has_inert(
+    LayoutReuseCache *cache, const Stylesheet *sheet,
+    lxb_dom_node_t *subtree, lxb_dom_node_t *parent, uint64_t entries,
+    uint32_t serial);
 /* Mutation journal proved that this change cannot affect a :has() selector;
    invalidate the ordinary subtree/sizing scope without discarding the cache
    merely because unrelated relational rules exist elsewhere in the sheet. */
@@ -1213,6 +1294,11 @@ void layout_reuse_cache_invalidate_measurements(
    not record (ScriptMutationJournal overflow_roots): restyle each. */
 void layout_reuse_cache_invalidate_overflow_root(LayoutReuseCache *cache,
                                                  lxb_dom_node_t *root);
+/* A change at or below `node` inside a shadow tree: the host's light
+   children, whose rendering depends on its slots, restyle. A no-op outside
+   shadow trees. */
+void layout_reuse_cache_invalidate_shadow_composition(
+    LayoutReuseCache *cache, lxb_dom_node_t *node);
 /* The :has() plan entries the structure changes invalidated next can
    move, as the journal's record summarizes them (ScriptMutationRecord
    has_entries, of plan build `serial`); UINT64_MAX restores "all". Only

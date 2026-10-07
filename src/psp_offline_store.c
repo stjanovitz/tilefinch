@@ -87,6 +87,19 @@ static bool offline_commit(
     return browser_engine_render_frame(engine, NULL);
 }
 
+static void offline_store_progress(void *context, unsigned done,
+                                   unsigned total)
+{
+    PspOfflineStore *store = context;
+    snprintf(store->status, sizeof(store->status),
+             "PREPARING %u OF %u SCRIPTS - CIRCLE STOPS", done, total);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-offline-app-progress: status=\"%s\"\n", store->status);
+#endif
+    if (store->show_progress != NULL)
+        store->show_progress(store->show_progress_context, store->status);
+}
+
 void psp_offline_store_init(
     PspOfflineStore *store, Budget *budget, BrowserSession *session,
     const char *directory)
@@ -94,6 +107,8 @@ void psp_offline_store_init(
     if (store == NULL) return;
     memset(store, 0, sizeof(*store));
     offline_library_init(&store->library, budget, directory);
+    store->library.progress = offline_store_progress;
+    store->library.progress_context = store;
     store->session = session;
     offline_download_manager_init(
         &store->download, budget, session, &store->library);
@@ -132,7 +147,9 @@ static bool offline_fetch_page_resource(
 
 void psp_offline_store_discard_app_preparation(PspOfflineStore *store)
 {
-    if (store == NULL || store->app_preparation == NULL) return;
+    if (store == NULL) return;
+    offline_library_discard_staged(&store->library);
+    if (store->app_preparation == NULL) return;
     budget_free(store->library.budget, store->app_preparation);
     store->app_preparation = NULL;
 }
@@ -160,6 +177,25 @@ static uint16_t offline_known_unavailable_resources(
     return count > UINT16_MAX ? UINT16_MAX : (uint16_t) count;
 }
 
+/* The library entry the current document was opened from, if this is
+   still that document: its stored manifest metadata and icon stand in for
+   a network fetch when the running app is installed again. */
+static const OfflineLibraryItem *offline_opened_app(
+    const PspOfflineStore *store, const NavigationSession *navigation,
+    const char *url)
+{
+    if (store->opened_app_url[0] == '\0' || navigation == NULL
+        || navigation->generation != store->opened_app_generation
+        || strcmp(store->opened_app_url, url) != 0) return NULL;
+    const OfflineLibraryItem *found = NULL;
+    for (size_t at = 0; at < store->library.count; at++) {
+        const OfflineLibraryItem *item = &store->library.items[at];
+        if (item->type == OFFLINE_ITEM_WEB_APP
+            && strcmp(item->source_url, url) == 0) found = item;
+    }
+    return found;
+}
+
 bool psp_offline_store_prepare_current_app(
     PspOfflineStore *store, BrowserEngine *engine)
 {
@@ -173,6 +209,33 @@ bool psp_offline_store_prepare_current_app(
         return false;
     }
     psp_offline_store_discard_app_preparation(store);
+    TilefinchWebAppManifest manifest;
+    char error[160] = {0};
+    unsigned char thumbnail[OFFLINE_LIBRARY_APP_ICON_LIMIT];
+    size_t thumbnail_length = 0;
+    const OfflineLibraryItem *opened =
+        offline_opened_app(store, navigation, entry->url);
+    if (opened != NULL) {
+        /* Opened from the library: everything the install consumes from
+           the manifest (name, theme, display mode) and the decoded icon
+           is already in the entry, so no request is made. */
+        memset(&manifest, 0, sizeof(manifest));
+        snprintf(manifest.name, sizeof(manifest.name), "%s", opened->title);
+        snprintf(manifest.short_name, sizeof(manifest.short_name), "%s",
+                 opened->title);
+        snprintf(manifest.start_url, sizeof(manifest.start_url), "%s",
+                 opened->source_url);
+        manifest.theme_color = opened->app_theme_color;
+        manifest.theme_alpha = opened->app_theme_alpha;
+        manifest.theme_color_valid = opened->app_theme_color_valid;
+        manifest.display_mode =
+            (TilefinchWebAppDisplayMode) opened->app_display_mode;
+        if (opened->icon_bytes != 0
+            && offline_library_read_web_app_icon(
+                   &store->library, opened->id, thumbnail))
+            thumbnail_length = sizeof(thumbnail);
+        goto preview;
+    }
     size_t href_length = 0;
     const char *href = document_web_app_manifest_href(
         &navigation->page.document, &href_length);
@@ -198,8 +261,6 @@ bool psp_offline_store_prepare_current_app(
         TILEFINCH_DESTINATION_FETCH, TILEFINCH_WEB_APP_MANIFEST_LIMIT,
         "application/manifest+json,application/json;q=0.9,*/*;q=0.1",
         manifest_result);
-    TilefinchWebAppManifest manifest;
-    char error[160] = {0};
     bool parsed = fetched && tilefinch_web_app_manifest_parse(
         manifest_result->data, manifest_result->length, manifest_url,
         entry->url, &manifest, error, sizeof(error));
@@ -230,8 +291,6 @@ bool psp_offline_store_prepare_current_app(
         }
         fetch_result_free(icon_result);
     }
-    unsigned char thumbnail[OFFLINE_LIBRARY_APP_ICON_LIMIT];
-    size_t thumbnail_length = 0;
     if (icon != NULL) {
         int width = 0, height = 0, components = 0;
         if (image_decode_probe_info(
@@ -256,6 +315,9 @@ bool psp_offline_store_prepare_current_app(
             }
         }
     }
+    budget_free(browser_engine_budget(engine), icon);
+    icon = NULL;
+preview: ;
     PspOfflineAppPreparation *preparation = budget_calloc_category(
         browser_engine_budget(engine), BUDGET_CATEGORY_SESSION,
         1u, sizeof(*preparation));
@@ -295,7 +357,6 @@ bool psp_offline_store_prepare_current_app(
     } else {
         budget_free(browser_engine_budget(engine), preparation);
     }
-    budget_free(browser_engine_budget(engine), icon);
     offline_status(store, prepared ? "OFFLINE APP PREVIEW READY"
                                    : (error[0] == '\0'
                                       ? "OFFLINE APP COULD NOT BE PREPARED"
@@ -372,6 +433,67 @@ const unsigned char *psp_offline_store_app_icon(
     return pixels;
 }
 
+bool psp_offline_store_offer_recompile(PspOfflineStore *store, uint32_t id)
+{
+    unsigned scripts = 0;
+    if (store == NULL) return false;
+    if (store->open_anyway_id == id && id != 0) {
+        store->open_anyway_id = 0;
+        return false;
+    }
+    const OfflineLibraryItem *item = offline_library_find(&store->library, id);
+    if (item == NULL || !offline_library_app_needs_recompile(
+            &store->library, id, &scripts)) return false;
+    psp_offline_store_discard_app_preparation(store);
+    PspOfflineAppPreparation *preparation = budget_calloc_category(
+        store->library.budget, BUDGET_CATEGORY_SESSION, 1u,
+        sizeof(*preparation));
+    if (preparation == NULL) return false;
+    PspUiOfflineAppPreview *view = &preparation->view;
+    snprintf(view->name, sizeof(view->name), "%s", item->title);
+    view->estimated_bytes =
+        item->content_bytes + item->audio_bytes + item->icon_bytes;
+    view->captured_resources = (uint16_t) scripts;
+    view->theme_color = item->app_theme_color;
+    view->theme_alpha = item->app_theme_alpha;
+    view->theme_color_valid = item->app_theme_color_valid;
+    view->display_mode = item->app_display_mode;
+    view->operation = PSP_UI_OFFLINE_APP_RECOMPILE;
+    store->app_preparation = preparation;
+    store->recompile_offer_id = id;
+    return true;
+}
+
+uint32_t psp_offline_store_take_offer(PspOfflineStore *store,
+                                      bool open_anyway)
+{
+    if (store == NULL) return 0;
+    uint32_t id = store->recompile_offer_id;
+    store->recompile_offer_id = 0;
+    psp_offline_store_discard_app_preparation(store);
+    if (open_anyway) store->open_anyway_id = id;
+    return id;
+}
+
+bool psp_offline_store_recompile_app(PspOfflineStore *store, uint32_t id,
+                                     uint32_t *new_id)
+{
+    if (new_id != NULL) *new_id = 0;
+    if (store == NULL) return false;
+    char error[160] = {0};
+    uint32_t fresh = 0;
+    bool recompiled = offline_library_recompile_web_app(
+        &store->library, id, &fresh, error, sizeof(error));
+    if (recompiled)
+        for (size_t at = 0; at < OFFLINE_LIBRARY_ITEM_LIMIT; at++)
+            if (store->app_icon_ids[at] == id) store->app_icon_ids[at] = 0;
+    offline_status(store, recompiled ? "OFFLINE APP RECOMPILED"
+                   : (error[0] == '\0' ? "OFFLINE APP COULD NOT BE RECOMPILED"
+                                       : error));
+    if (new_id != NULL) *new_id = fresh;
+    return recompiled;
+}
+
 bool psp_offline_store_save_current(
     PspOfflineStore *store, BrowserEngine *engine)
 {
@@ -400,6 +522,9 @@ bool psp_offline_store_open_library(
         offline_status(store, "OFFLINE LIBRARY UNAVAILABLE");
         return false;
     }
+    for (size_t at = 0; at < store->library.count; at++)
+        (void) offline_library_app_needs_recompile(
+            &store->library, store->library.items[at].id, NULL);
     char *html = NULL;
     size_t length = 0;
     if (!offline_library_build_page(
@@ -459,8 +584,21 @@ static bool offline_open_app(
         offline_status(store, "OFFLINE APP POLICY FAILED");
         return false;
     }
+    /* A full-screen game page has little DOM, style or layout, so its realm
+       gets the installed-app heap floor (carved from the same page Budget).
+       It is one-shot: leaving the app returns to the ordinary heap. */
+    browser_engine_arm_installed_app_heap(engine, true);
     bool opened = offline_commit(
         engine, item->source_url, html, length, record_history);
+    browser_engine_arm_installed_app_heap(engine, false);
+    store->opened_app_url[0] = '\0';
+    if (opened) {
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        snprintf(store->opened_app_url, sizeof(store->opened_app_url),
+                 "%s", item->source_url);
+        store->opened_app_generation =
+            navigation == NULL ? 0u : navigation->generation;
+    }
     /* read_web_app has already authenticated the package and restored every
        indexed response before the document reaches this point.  A zero
        script_loaded count at commit is not evidence of an incomplete app:
@@ -583,6 +721,15 @@ PspOfflineRouteResult psp_offline_store_handle_url(
     if (offline_route_id(url, "app", &id))
         return offline_open_app(store, engine, profile, id, record_history)
             ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
+    if (offline_route_id(url, "recompile", &id)) {
+        bool recompiled = psp_offline_store_recompile_app(store, id, NULL);
+        char status[sizeof(store->status)];
+        snprintf(status, sizeof(status), "%s", store->status);
+        (void) psp_offline_store_open_library(store, engine, record_history);
+        offline_status(store, status);
+        return recompiled ? PSP_OFFLINE_ROUTE_STATE_CHANGED
+                          : PSP_OFFLINE_ROUTE_ERROR;
+    }
     if (offline_route_id(url, "video", &id))
         return offline_open_video_page(store, engine, id, record_history)
             ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;

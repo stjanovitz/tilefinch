@@ -1,0 +1,12 @@
+# Load a large news page, then capture the top and two page-downs.
+wait-live 60
+wait-page 60
+mark-page top
+tap-page rtrigger
+wait-page 45
+mark-page p1
+tap-page rtrigger
+wait-page 45
+mark-page p2
+wait-page 30
+end

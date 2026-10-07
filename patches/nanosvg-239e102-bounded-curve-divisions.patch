@@ -1,0 +1,25 @@
+Bound NanoSVG's round cap and join subdivision.
+
+nsvg__curveDivs(): a huge or non-finite stroke width made the division
+count Inf or NaN, whose int conversion is undefined and becomes INT_MAX
+on the PSP. Clamp it to 2..256.
+
+--- a/src/nanosvgrast.h
++++ b/src/nanosvgrast.h
+@@ -605,9 +605,13 @@
+ static int nsvg__curveDivs(float r, float arc, float tol)
+ {
+ 	float da = acosf(r / (r + tol)) * 2.0f;
+-	int divs = (int)ceilf(arc / da);
+-	if (divs < 2) divs = 2;
+-	return divs;
++	float divs = ceilf(arc / da);
++	// A huge or non-finite stroke width makes divs Inf or NaN, whose int
++	// conversion is undefined (INT_MAX on the PSP): every round cap or
++	// join would then emit billions of points.
++	if (!(divs >= 2.0f)) return 2;
++	if (divs > 256.0f) return 256;
++	return (int)divs;
+ }
+ 
+ static void nsvg__expandStroke(NSVGrasterizer* r, NSVGpoint* points, int npoints, int closed, int lineJoin, int lineCap, float lineWidth)

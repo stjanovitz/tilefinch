@@ -55,17 +55,113 @@ discards a bounded candidate snapshot, then shows its estimated payload size,
 captured resource count, known unavailable-resource count, display mode, and
 theme color. It labels a new app **Install**, changed content at the same source
 **Update**, and byte-identical content **Reinstall**. No payload is written until
-the user confirms. Cancel releases the small retained manifest/icon
+the user confirms. To measure the package the preview compiles each classic
+script that lacks bytecode; it keeps that bytecode (at most 1 MiB, charged to
+the page Budget) so the confirming install publishes it instead of compiling
+the same scripts again. Cancel releases it with the small manifest/icon
 preparation. The confirmed pass repeats every size, budget, and free-space
 check before publishing.
 
-The snapshot is capped at 1 MiB of document markup, 1 MiB of response bodies,
-32 resources, and one fixed-size icon thumbnail. Reinstalling the same source
+Both passes compile at most one script at a time and show progress on the
+status line (**PREPARING 2 OF 4 SCRIPTS - CIRCLE STOPS**). Circle stops either
+pass between scripts or pack records: a stopped preview keeps nothing, and a
+stopped install removes its temporary files and leaves the library unchanged.
+On the host, previewing then installing Treadline now compiles its four
+scripts once instead of twice; the install's Budget peak fell from 2.07 MB to
+37 KB, while the preview peak rose from 2.07 to 2.15 MB because it holds the
+335 KB of bytecode it compiled (2.85 to 3.32 MB with 631 KB kept for 1 MiB of
+synthetic script).
+
+The snapshot is capped at 1 MiB of document markup, 1.5 MiB of response bodies,
+32 resources, up to 1 MiB of optional classic-script bytecode compiled from
+at most 1 MiB of source, and one fixed-size icon thumbnail. Only responses the
+live memory cache still holds can be captured, so a large game may need a
+larger **Memory cache** setting while it is loaded for installation. The
+resource pack is streamed to and from the Memory Stick: installing does not
+hold a second copy of it in memory, and launching holds one member at a time
+beside the restored cache entries. Reinstalling the same source
 publishes a new payload generation and updates the index before deleting the
 old one. This is intended for small, mostly self-contained games and tools.
 It does not crawl links, guess assets that the page never requested, archive
 cross-origin dependencies, retain login cookies, or promise that a
 server-dependent application will work offline.
+
+### Script source on demand
+
+Launching reads and checksums the whole pack as before, but a classic script
+stored with current bytecode is restored as bytecode only: its source is
+hashed through a 16 KiB buffer and stays in the pack. The script then runs
+from its bytecode without its source ever being in memory. The source is read
+from the pack, verified against the hash taken at launch, and restored as an
+ordinary cache entry (with its bytecode) only when something needs the
+bytes:
+
+- the bytecode fails to restore (for example a damaged artifact); the script
+  is then compiled from that source, as before;
+- the `<script>` element has `integrity` metadata, which is checked against
+  the bytes;
+- the page inserts that script dynamically, or any other loader asks the
+  cache for the response;
+- a cross-origin script of at least 192 KiB needs the static cost check
+  (packs hold only same-origin responses, so this does not occur in
+  practice);
+- the page-capability trace wraps the source;
+- the running app is installed again (the capture reads every source).
+
+What page script observes is unchanged: offline bytecode was already
+compiled without source text, so `Function.prototype.toString()` returns the
+same `[native code]` body, and error positions come from the same line
+tables. The only difference is a browser diagnostic: a script that throws
+while running from bytecode does not record the surrounding source lines in
+the failure trace. If the pack was removed or damaged after launch, the read
+fails its length or hash check, the request misses like any absent response
+(the script's `error` event fires), and `offline-app: deferred script source
+unavailable` is logged. A Budget refusal while reading leaves the script
+deferred for a later attempt. The deferred bytecode is cache: it goes with
+the session cache or the next app launch, and under memory pressure only the
+bytecode is released; the script stays a hit and compiles from its source,
+read on demand, instead of missing to the network.
+
+Measured on the host (`tilefinch-offline-app-limits-tests`, realistic 24 MiB
+budget), the launch's Budget peak and what it leaves resident fell from
+1.42/0.90 MB to 0.37/0.35 MB for Treadline and from 2.07/1.66 MB to
+0.65/0.63 MB for 1 MiB of synthetic script. Those Treadline figures were for
+an older five-script model of the game; the test now installs the shipped
+module set read from `index.html` (seven deferred scripts, 675 KiB of
+source), whose launch peak and resident bytes are 0.48/0.45 MB.
+
+### After a browser update
+
+Stored bytecode is valid only for the compiler that produced it. When an
+update changes it, **Library → Saved** marks the app **RECOMPILE** and its
+detail line says **Needs recompile for this browser**; the hint bar says
+**X RECOMPILE**. The check is a comparison against a fingerprint kept in the
+library index (which compiler ABI produced the bytecode, and for how many
+scripts), so showing the list reads nothing else. An entry saved by an older
+build has no fingerprint yet; its pack's record headers are read once,
+skipping every body, and the result is kept with the index.
+
+X on that row opens **Recompile offline app**: the saved size, how many
+scripts will be recompiled, and **X Recompile**, **Square Open anyway**,
+**O Back**. Recompile reads the stored package record by record, compiles
+each classic script from its stored source (the same bounds as installing:
+up to eight scripts and 1 MiB of source and of bytecode), shows **PREPARING
+2 OF 4 SCRIPTS - CIRCLE STOPS**, and writes a new generation through the
+same temporary-file and index-first transaction as an install: the markup
+and icon are copied after their checksums are verified, the new pack is
+written beside the old one, the whole old pack must pass its checksum before
+anything is published, and the index changes before the old generation is
+removed. Circle, a full Memory Stick, a write failure, a damaged old pack or
+a Budget refusal leaves the old generation and the index exactly as they
+were (a script whose compile alone is refused is published source-only, as
+in an install). The recompiled app then opens. **Open anyway** opens the app
+as before: every script is compiled from its stored source at launch, which
+is slower.
+
+The fingerprint lives in a field web-app entries did not use, so the index
+format is unchanged and a build from before this change, after an A/B
+rollback, still reads it. The library page used by the host lab shows the
+same state with **Recompile** and **Open anyway** links.
 
 This is deliberately not a Service Worker implementation. Tilefinch does not
 run background fetch, push, periodic sync, install events, or a page-authored

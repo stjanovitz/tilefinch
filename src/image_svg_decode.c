@@ -10,6 +10,11 @@ static Budget *svg_budget;
 static unsigned svg_allocations;
 static uint64_t svg_slice_started_us;
 
+bool image_svg_decode_busy(void)
+{
+    return svg_budget != NULL;
+}
+
 /* NanoSVG parses a document in one call (a 10 KB wordmark takes 0.2 s on
    the PSP, mostly software double math) but allocates throughout, as path
    point arrays grow. Its allocator is therefore where the decode can let
@@ -74,6 +79,7 @@ unsigned char *image_svg_decode(const void *data, size_t length,
 {
     if (data == NULL || budget == NULL || width == NULL || height == NULL
         || maximum_decoded_bytes < 4 || svg_budget != NULL) return NULL;
+    int target_width = *width, target_height = *height;
     /* Parser and rasterizer state is scratch under a private allocation
        owner, so one rollback reclaims it (including what the third-party
        parser leaks on malformed input) while the pixels, allocated outside
@@ -102,6 +108,10 @@ unsigned char *image_svg_decode(const void *data, size_t length,
         && svg->width <= 32767.0f && svg->height <= 32767.0f) {
         output_width = (int) ceilf(svg->width);
         output_height = (int) ceilf(svg->height);
+        if (target_width > 0 && target_height > 0) {
+            output_width = target_width;
+            output_height = target_height;
+        }
         if (output_width > 0 && output_height > 0
             && (size_t) output_width
                    <= SIZE_MAX / (size_t) output_height

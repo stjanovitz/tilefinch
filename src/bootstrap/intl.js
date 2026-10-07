@@ -141,31 +141,251 @@
         return NumberFormat.supportedLocalesOf(locales);
       }
     }
+    /* The default time zone is the one Date's local-time methods use; the
+       host hands it over through a temporary global (runtime_creation.inc).
+       Local fields come from Date itself, so formatting agrees with Date for
+       every instant, DST included. */
+    const hostZone =
+        typeof globalThis.__tilefinchDefaultTimeZone === "string"
+          ? globalThis.__tilefinchDefaultTimeZone
+          : "UTC",
+      dateProto = Date.prototype,
+      localOffset = dateProto.getTimezoneOffset,
+      utcTime = dateProto.getTime,
+      weekdayNames = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+      ],
+      monthNames = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+      ],
+      utcZones = /^(?:etc\/)?(?:utc|uct|gmt|gmt[+-]?0|universal|zulu|greenwich)$/i,
+      offsetZone = /^([+-])(\d{2})(?::?(\d{2}))?$/,
+      resolveZone = (value) => {
+        if (value === undefined) return hostZone;
+        const text = String(value);
+        if (utcZones.test(text)) return "UTC";
+        const offset = offsetZone.exec(text);
+        if (offset) {
+          if (Number(offset[2]) > 23 || Number(offset[3] || 0) > 59)
+            throw new RangeError("Invalid time zone specified: " + text);
+          return offset[1] + offset[2] + ":" + (offset[3] || "00");
+        }
+        if (text.toLowerCase() === hostZone.toLowerCase()) return hostZone;
+        if (!/^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)*$/.test(text))
+          throw new RangeError("Invalid time zone specified: " + text);
+        return text;
+      },
+      /* Minutes east of UTC for this instant in a resolved zone. A named
+         zone other than the host's has no rules here and formats as UTC. */
+      zoneOffset = (zone, time) => {
+        if (zone === hostZone) return -localOffset.call(new Date(time));
+        const offset = offsetZone.exec(zone);
+        return offset
+          ? (offset[1] === "-" ? -1 : 1) *
+              (Number(offset[2]) * 60 + Number(offset[3]))
+          : 0;
+      },
+      dateFields = ["weekday", "year", "month", "day"],
+      timeFields = ["hour", "minute", "second"];
+    const boundFormats = new WeakMap(),
+      two = (value) => String(value).padStart(2, "0"),
+      named = (names, index, style) =>
+        style === "long"
+          ? names[index]
+          : style === "narrow"
+            ? names[index][0]
+            : names[index].slice(0, 3),
+      numeric = (value, style) => (style === "2-digit" ? two(value) : value);
     class DateTimeFormat {
       constructor(locales, options = {}) {
         this.locale = localeTag(Array.isArray(locales) ? locales[0] : locales);
-        this.options = options || {};
-      }
-      format(value) {
-        const date = value === undefined ? new Date() : new Date(value);
-        if (!Number.isFinite(date.getTime()))
-          throw new RangeError("Invalid time value");
-        if (this.options.timeStyle || this.options.hour !== undefined)
-          return date.toLocaleTimeString
-            ? date.toLocaleTimeString()
-            : date.toISOString().slice(11, 19);
-        return date.toISOString().slice(0, 10);
+        options = options || {};
+        const resolved = {};
+        for (const key of [
+          ...dateFields,
+          ...timeFields,
+          "timeZoneName",
+          "dateStyle",
+          "timeStyle",
+        ])
+          if (options[key] !== undefined) resolved[key] = String(options[key]);
+        if (
+          !resolved.dateStyle &&
+          !resolved.timeStyle &&
+          ![...dateFields, ...timeFields].some((key) => resolved[key])
+        )
+          resolved.year = resolved.month = resolved.day = "numeric";
+        this.hour12 =
+          options.hour12 !== undefined
+            ? !!options.hour12
+            : options.hourCycle === undefined ||
+              options.hourCycle === "h12" ||
+              options.hourCycle === "h11";
+        this.timeZone = resolveZone(options.timeZone);
+        this.options = resolved;
       }
       formatToParts(value) {
-        return [{ type: "literal", value: this.format(value) }];
+        const time = utcTime.call(
+          value === undefined
+            ? new Date()
+            : value instanceof Date
+              ? value
+              : new Date(Number(value)),
+        );
+        if (!Number.isFinite(time)) throw new RangeError("Invalid time value");
+        const offset = zoneOffset(this.timeZone, time),
+          shifted = new Date(time + offset * 60000),
+          o = this.options,
+          parts = [],
+          add = (type, value) => parts.push({ type, value: String(value) }),
+          list = (fields, separator) =>
+            fields.forEach((field, at) => {
+              if (at) add("literal", separator);
+              add(field[0], field[1]);
+            }),
+          month = shifted.getUTCMonth(),
+          hour = shifted.getUTCHours();
+        let { weekday, month: monthStyle, day, year, hour: hourStyle } = o,
+          { minute, second, timeZoneName } = o,
+          joiner = ", ";
+        if (o.dateStyle) {
+          const style = o.dateStyle;
+          weekday = style === "full" ? "long" : undefined;
+          monthStyle =
+            style === "short" ? "numeric" : style === "medium" ? "short" : "long";
+          day = "numeric";
+          year = style === "short" ? "2-digit" : "numeric";
+          if (style === "full" || style === "long") joiner = " at ";
+        }
+        if (o.timeStyle) {
+          hourStyle = minute = "numeric";
+          second = o.timeStyle === "short" ? undefined : "numeric";
+          timeZoneName =
+            o.timeStyle === "full" || o.timeStyle === "long"
+              ? "short"
+              : undefined;
+        }
+        const weekdayField = weekday && [
+            "weekday",
+            named(weekdayNames, shifted.getUTCDay(), weekday),
+          ],
+          dayField = day && ["day", numeric(shifted.getUTCDate(), day)],
+          yearValue = shifted.getUTCFullYear(),
+          yearField = year && [
+            "year",
+            year === "2-digit" ? two(yearValue % 100) : yearValue,
+          ];
+        if (monthStyle === "numeric" || monthStyle === "2-digit") {
+          /* en-US numeric dates: "Thu, 10/1/2026". */
+          if (weekdayField) list([weekdayField], ""), add("literal", ", ");
+          list(
+            [["month", numeric(month + 1, monthStyle)], dayField, yearField].filter(
+              Boolean,
+            ),
+            "/",
+          );
+        } else if (monthStyle) {
+          /* en-US textual dates: "Thursday, October 1, 2026". */
+          if (weekdayField) list([weekdayField], ""), add("literal", ", ");
+          add("month", named(monthNames, month, monthStyle));
+          if (dayField) add("literal", " "), add(dayField[0], dayField[1]);
+          if (yearField)
+            add("literal", dayField ? ", " : " "), add(yearField[0], yearField[1]);
+        } else list([weekdayField, dayField, yearField].filter(Boolean), " ");
+        if (hourStyle || minute || second) {
+          if (parts.length) add("literal", joiner);
+          const shown = this.hour12 ? hour % 12 || 12 : hour,
+            paired = (style, other) => (other ? "2-digit" : style);
+          list(
+            [
+              hourStyle && [
+                "hour",
+                numeric(
+                  shown,
+                  !this.hour12 && (minute || second) ? "2-digit" : hourStyle,
+                ),
+              ],
+              minute && [
+                "minute",
+                numeric(
+                  shifted.getUTCMinutes(),
+                  paired(minute, hourStyle || second),
+                ),
+              ],
+              second && [
+                "second",
+                numeric(
+                  shifted.getUTCSeconds(),
+                  paired(second, hourStyle || minute),
+                ),
+              ],
+            ].filter(Boolean),
+            ":",
+          );
+          if (hourStyle && this.hour12)
+            add("literal", " "), add("dayPeriod", hour < 12 ? "AM" : "PM");
+        }
+        if (timeZoneName) {
+          if (parts.length) add("literal", " ");
+          const magnitude = Math.abs(offset);
+          add(
+            "timeZoneName",
+            this.timeZone === "UTC"
+              ? "UTC"
+              : "GMT" +
+                  (offset === 0
+                    ? ""
+                    : (offset < 0 ? "-" : "+") +
+                      Math.floor(magnitude / 60) +
+                      (magnitude % 60 ? ":" + two(magnitude % 60) : "")),
+          );
+        }
+        return parts;
+      }
+      /* ECMA-402: format is an accessor returning a function bound to this
+         formatter, so `dates.map(formatter.format)` works. */
+      get format() {
+        let bound = boundFormats.get(this);
+        if (!bound) {
+          bound = (value) =>
+            this.formatToParts(value)
+              .map((part) => part.value)
+              .join("");
+          boundFormats.set(this, bound);
+        }
+        return bound;
       }
       resolvedOptions() {
-        return {
-          locale: this.locale,
-          calendar: "gregory",
-          numberingSystem: "latn",
-          timeZone: "UTC",
-        };
+        const result = {
+            locale: this.locale,
+            calendar: "gregory",
+            numberingSystem: "latn",
+            timeZone: this.timeZone,
+          },
+          o = this.options;
+        if (o.hour !== undefined || o.timeStyle !== undefined) {
+          result.hourCycle = this.hour12 ? "h12" : "h23";
+          result.hour12 = this.hour12;
+        }
+        for (const key in o) result[key] = o[key];
+        return result;
       }
       static supportedLocalesOf(locales) {
         return NumberFormat.supportedLocalesOf(locales);

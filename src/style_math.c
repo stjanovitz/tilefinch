@@ -1142,6 +1142,9 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
             function = LENGTH_CLAMP; prefix = 6;
         } else if (strncmp(value, "calc(", 5) == 0) {
             function = LENGTH_CALC; prefix = 5;
+        } else if (value[0] == '(') {
+            /* A parenthesized calc() term: calc((15rem + 2rem) * 2). */
+            function = LENGTH_CALC; prefix = 1;
         }
         if (function != LENGTH_NONE) {
             const char *inside = value + prefix;
@@ -1166,10 +1169,13 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
                 const char *part = value + prefix + part_start;
                 trim(&part, &part_length);
                 if (part_length == 0) return fallback;
+                /* Terms report failure as INT_MIN, never as the caller's
+                   fallback: a fallback such as line-height's INT_MIN + 1
+                   was otherwise negated or summed as a term. */
                 int parsed = function == LENGTH_CALC
-                    ? parse_calc_product(sheet, part, part_length, fallback,
+                    ? parse_calc_product(sheet, part, part_length, INT_MIN,
                                          &percentages[count], depth + 1)
-                    : parse_length_depth(sheet, part, part_length, fallback,
+                    : parse_length_depth(sheet, part, part_length, INT_MIN,
                                          &percentages[count], depth + 1);
                 /* INT_MIN is the failure sentinel used by declaration
                    parsers.  Negating it is signed overflow and previously
@@ -1201,8 +1207,13 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
                 result = values[1] < values[0] ? values[0] : values[1];
                 if (result > values[2]) result = values[2];
             } else {
-                result = 0;
-                for (size_t i = 0; i < count; i++) result += values[i];
+                /* Terms saturate at INT_MAX, so eight of them can overflow
+                   an int. Sum wide and keep clear of the INT_MIN sentinel. */
+                long long sum = 0;
+                for (size_t i = 0; i < count; i++) sum += values[i];
+                if (sum > INT_MAX) sum = INT_MAX;
+                if (sum < -INT_MAX) sum = -INT_MAX;
+                result = (int) sum;
             }
             if (percent != NULL) *percent = percentages[0];
             return result;

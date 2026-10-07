@@ -24,6 +24,8 @@ typedef struct {
     long tick_ms;
     long limit_mb;
     long heap_mb;
+    /* QuickJS heap for installed apps opened from the offline library. */
+    long app_heap_mb;
     long total_mb;
     long file_kb;
     long count;
@@ -48,6 +50,12 @@ typedef struct {
     /* Validation only: keep the existing JS sampler enabled by default.
        Set to 0 for a same-binary profiler-off device comparison. */
     long validation_js_profile;
+    /* Validation only: silence game PCM after mixing, not its CPU work. */
+    long validation_game_audio_mute;
+    /* Trusted validation boot only: 1 selects the JS Web Audio reference
+       instead of the native audio slots (as shipped) before realm creation.
+       Exactly 0 or 1; default 0, scrubbed and never persisted. */
+    long validation_game_audio_reference;
     /* Validation only: report promise jobs at or above this duration in
        microseconds. Zero leaves the extra per-job accounting disabled. */
     long validation_js_outlier_us;
@@ -56,6 +64,10 @@ typedef struct {
        without the poll sample; 0 turns it off. For a same-binary check of
        what the split's own instrumentation costs. */
     long validation_script_split;
+    /* Validation only: 0 restores the JS collection pacing from before
+       amortized near-limit pacing (TILEFINCH_JS_GC_PACING=0), for a
+       same-binary A/B; 1 (default) is the shipping pacing. */
+    long validation_gc_pacing;
     long validation_execution_census;
     /* Validation only: replay recorded POSTs without matching their bodies
        (pages mint fresh tokens into them), as the host lab's
@@ -257,6 +269,33 @@ bool psp_boot_config_write_overrides(
 
 bool psp_boot_config_validate(
     const PspBootConfig *config, const char **invalid_field);
+
+/*
+ * One-time migration of the per-script source ceiling. Before memory-based
+ * script admission the shipped boot.cfg said file_kb=512; that value now
+ * refuses the app bundles of many sites. When the file's effective file_kb
+ * line is exactly the old default (`file_kb=512`), it becomes the current
+ * default and the file records the migration with the comment line
+ * PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK (a comment, so every build, older
+ * slots included, reads the file as before). A file that carries the mark,
+ * any other file_kb value, a file managed by scripts/stage-psp-game.sh (a
+ * `PATH.tilefinch-game-stage` sibling), or a file whose total_mb would not
+ * admit the new default is left untouched. Rewrites are atomic like
+ * psp_boot_config_write_overrides (PATH.tmp, PATH.bak).
+ */
+#define PSP_BOOT_CONFIG_OLD_DEFAULT_FILE_KB 512L
+#define PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK "#file_kb-migrated-from=512"
+typedef enum {
+    PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED = 0,
+    PSP_BOOT_CONFIG_MIGRATION_DONE,
+    /* The mark is present: migrated before; nothing changes again. */
+    PSP_BOOT_CONFIG_MIGRATION_ALREADY,
+    /* Eligible, but the file could not be read or rewritten. */
+    PSP_BOOT_CONFIG_MIGRATION_FAILED
+} PspBootConfigMigration;
+PspBootConfigMigration psp_boot_config_migrate_file_kb(const char *path);
+/* The value a migrated file now carries (the app default). */
+long psp_boot_config_default_file_kb(void);
 
 #define PSP_BOOT_CONFIG_DROPPED_DEVELOPER_UPDATE_URL 0x1u
 #define PSP_BOOT_CONFIG_DROPPED_DEVELOPER_PACKAGE_URL 0x2u

@@ -69,6 +69,29 @@ Do not add a bare `add_executable` there, which could leave `dev.sh test` runnin
 a stale executable. Release tests using C `assert` must undefine `NDEBUG` before
 including `<assert.h>`.
 
+### Optional private tests
+
+The default configure, build, and CTest suite need only the public source tree.
+Local reproducing inputs and investigation tests belong in the ignored
+`.private-investigations/tests/` directory (and the private backup), not public
+fixtures or inline public test cases. To include a local suite:
+
+```sh
+cmake --preset release -DTILEFINCH_ENABLE_PRIVATE_TESTS=ON
+cmake --build build-preset-release --target tilefinch-test-binaries -j8
+ctest --test-dir build-preset-release -L private --output-on-failure
+```
+
+`TILEFINCH_PRIVATE_TESTS_DIR` can point at another local directory containing
+`CMakeLists.txt`. Register its executables with `tilefinch_add_test_binary` and
+its tests with `tilefinch_add_private_test(name COMMAND ... LABELS ... TIMEOUT
+...)`; these receive the `private` label and join the ordinary build-before-test
+gate. Full CTest runs include them when enabled. An explicitly enabled suite
+whose source directory is missing fails configuration, rather than silently
+losing coverage. Disable it with `-DTILEFINCH_ENABLE_PRIVATE_TESTS=OFF`; public
+tests can also be selected with `ctest --test-dir build-preset-release -LE private`.
+Do not make public tests or shipping targets depend on private files.
+
 Standalone C measurement probes must inherit the target's public compile
 definitions and include paths, preferably through a CMake target linked to
 `tilefinch_core`. For example, `TILEFINCH_OWNER_CHECKS` changes the `Budget`
@@ -247,6 +270,14 @@ and prevents several tests exposing the same defect from overwhelming
 CoreSymbolication/LaunchServices and hiding the first useful report. Override
 the default two workers on macOS (eight elsewhere) with
 `TILEFINCH_SANITIZER_JOBS`.
+
+ThreadSanitizer cannot share a binary with AddressSanitizer, so it has no
+preset. Instead the ordinary host trees (`release`, `dev`) build one
+TSan-instrumented test, `tilefinch-psp-media-ownership-tsan-tests` (label
+`tsan`), whenever the compiler links `-fsanitize=thread` and no other
+sanitizer is in `CMAKE_C_FLAGS`. It is the PSP media slot hand-off stress
+from `tilefinch-psp-media-ownership-tests`, and it fails on the first race
+report (`TSAN_OPTIONS=halt_on_error=1`), so it runs in the normal gate.
 
 The hostile-input parser harness is opt-in:
 
@@ -571,11 +602,49 @@ buffer/index ranges. It also runs the complete installable
 `examples/prism-break-3d/` game through deterministic physics, collision,
 level-transition, multiball, power-up, particle, and dynamic-mesh scenarios.
 The same lane runs `examples/treadline-arena/` through its PSP-realistic
-startup, offline manifest, fixed-step tread movement, firing, pause, one-bounce
+startup, offline manifest, fixed-step tread movement, charge/release firing, pause, ricocheting
 shells, destructible barrier swaps, three armor/speed classes, class-specific
 secondary weapons, directional armor, the opt-in Command meter, all five
 gadgets, Survival, Team Control, Convoy Escort, objective-aware bot movement,
 saved setup preferences, bounded entity pools, and teardown ownership.
+The Treadline feature fixture also covers Daily Arena, Billiards, bosses,
+hazards, local artillery handoff, paints/palettes, wall refusal/leading/routes,
+replay checksums and deterministic results, and killcam return-to-play.
+These fixtures run once per CTest pass, in
+`tilefinch-treadline-feature-budget-tests`: a fresh 7MiB JS realm that
+requires zero allocator refusals and zero owned bytes after teardown. The
+default conformance test loads the game but does not repeat them.
+
+The binary's `--treadline-features` mode runs the Game Profile
+script-admission check, replay import, and the Treadline feature fixtures
+(features, nearest goal, occupancy, render cache, campaign, campaign HUD,
+controls, practice, placement, planning, breach, camera, look, smoke, layers).
+The layers fixture measures every overlapping pair of parallel box faces in
+16-bit depth steps at the real camera (and flat tops against the static grid
+and contact-shadow layers) and checks that a decal dropped for instance room
+stays dropped. An optional
+second argument chooses a source-root-relative game script for pre-fix checks;
+normal CTest always loads the current packaged game. `--treadline-league N`
+runs 1..1000 headless seeded matches; an optional following source-root-relative
+game-script path permits exact before/after comparisons without changing the
+packaged game. The
+`scripts/run-treadline-bot-league.py` wrapper summarizes the JSONL results.
+
+For scheduling research, `--treadline-host-profile [game-script]` runs six
+fixed-seed/arena cases of 1,200 frames at 30Hz. A test-only lexical probe counts
+strategy refreshes, bank plans, wall rays and bot updates, and the host measures
+simulation plus instance preparation with an external monotonic clock. It does
+not render, wait for vblank, exercise the active audio graph or predict PSP
+milliseconds. `scripts/profile-treadline-host.py --candidate <game-script>` runs
+three alternating pairs, requires deterministic work counts, and reports tail
+timing and clustering separately. Timing uses `--treadline-host-timing` without
+the per-ray/planner counters; separate work runs check their determinism and
+fairness. Initial/reset warmup is excluded explicitly;
+raw maximum timing remains reported. Pair this screening tool with feature and
+bot-league checks, then use physical-device timing only for surviving changes.
+Alternate research sources and the normal packaged-game gate share the
+Game Profile's 512 KiB per-script shipping ceiling. The 7 MiB feature realm
+and aggregate source, page, and offline-package limits are unchanged.
 
 ```sh
 cmake --build build-preset-release \
@@ -613,6 +682,36 @@ time and records canvas-presentation median, p95, maximum, and 60/30 Hz
 deadline counts. These probes are absent from shipping builds and do not expose
 a higher-resolution clock to arbitrary page JavaScript.
 
+**Treadline's harness API lives in `qualification.js`.** The game ships
+without it: `__treadlineDebug` (the fixtures', companions' and sweeps'
+API), the phase-clock profile behind `__tilefinchStartInputProfile` with its
+`TREADLINE-JS-PHASES` report, the soak's action cycle and the long-soak
+driver are all in `examples/treadline-arena/qualification.js`, and ordinary
+play never loads it. The modules' own harness surfaces come through it too:
+`__treadlineDebug.campaign` (the menu, the save, missions and `bridge()`,
+the game bindings the campaign attached with), `.practice` and `.controls`.
+The modules hand them over at attach only when the game was started for
+qualification or a harness, so ordinary play neither builds nor exposes
+them. Each harness loads it explicitly:
+
+- **A qualification URL** (any `?qualification=...`) makes the page fetch it
+  after `game.js`. An installed game must carry it, so build qualification
+  packages from every entry of `examples/treadline-arena/package-files.txt`
+  (`awk '!/^#/ && NF { print $1 }'`); ordinary packages leave it out. In Tilefinch the
+  fetched script attaches within a frame or two of boot, before any
+  companion mark reads `__treadlineDebug`.
+- **A harness that evaluates the scripts itself** sets
+  `globalThis.__treadlineEnableDebug = true` before `game.js` and evaluates
+  `qualification.js` right after it, as
+  `tests/test_canvas_webgl_conformance.c` does for the fixtures, the bot
+  league and the campaign and invariant sweeps. The game then does not fetch
+  it.
+- **The lab-driven gates** use qualification URLs that change nothing they
+  measure: the menu-layout check `?qualification=layout`, the reference
+  screenshots `?qualification=references` and `treadline-visual-play`
+  `?qualification=visual` (its companion turns the killcam back on, which
+  qualification runs otherwise keep off).
+
 Treadline Arena also provides `?qualification=long-soak`. It keeps the player
 alive, drives the player with the game's bounded target/avoidance planner,
 aims and fires through the ordinary cooldown and projectile paths, cycles
@@ -620,16 +719,28 @@ arenas, and repeats collisions, particles, smoke, and destruction. The run
 therefore proves real movement and combat instead of tracing a blind route
 that can park against scenery or settling into an idle title or victory
 screen. Use
-`tests/input-scripts/treadline-long-soak.txt`: its 2,700-frame measured window
-is roughly ninety seconds at the PSP's intended 30 Hz presentation cadence,
-with marks bracketing the interval. The validation writer
+`tests/input-scripts/treadline-long-soak.txt`. The page opens on Quick Match
+with Deploy focused; once the runtime is ready the script presses Cross, a
+trusted Deploy that claims Page controls, so the match runs full screen as real
+play does, with no browser chrome composited over the canvas (the long soak
+keeps its audio-free workload). Its companion
+`treadline-long-soak.mark.js` runs the game's 180-frame JavaScript phase-clock
+profile and returns its report before the window, after the five-second
+PAGE CONTROLS ON toast, and switches the clocks off for the window: clocks and
+report are attribution work, not gameplay. The measured window is 1,350 game
+frames (about 45 seconds at 30 Hz; under Page controls each script frame is
+one game frame), bracketed by `mark-page` marks so the measurement reset falls
+between frames. The PPSSPP harness requires chrome hidden and clocks off at
+the window's start and a delivered profile report. The validation writer
 persists one marked frame per run, so archive a gameplay frame at the first
 mark and use the final active-game summary plus near-zero HTML-overlay time to
 prove that the run did not fall back to a title panel. Use a second paired run
 or a PSPLink screenshot when a visual end-frame comparison is required.
 Validation retains percentile samples for the first 1,024 presented pipelines
 and separately counts every over-34-ms pipeline and the global worst pipeline
-for the complete run; use the latter two values to judge the long tail. Compare
+from `webgl-measure-start` to `webgl-measure-end` (the end mark's own frame
+and later frames are not counted); use the latter two values to judge the long
+tail. Compare
 the pre-interaction and controlled budget/category reports as well as the
 QuickJS retained heap so a smooth run cannot hide gradual growth.
 
@@ -652,6 +763,159 @@ run configuration. Emulated audio remains enabled so mixer and audio-syscall
 work is still exercised. Do not change the game's audio preferences or the
 user's normal emulator/system volume to silence a background test.
 
+### Treadline visual QA: camera track and recorded gameplay
+
+Two tools look at what the player sees rather than at simulation state.
+
+**Camera track in the invariant sweep.** `python3 scripts/run-treadline-invariants.py`
+composes the camera after every 1/30 s step, the way a device frame does after
+its update (`__treadlineDebug.presentCamera`), and feeds the pure detector in
+`tests/fixtures/treadline-camera-motion.js`: distance, pitch (eye height 5.7,
+target .28), yaw, and the eye and look target relative to the player. Per
+1.5 s window it flags oscillation (distance, pitch or yaw reversing three
+times over), re-retraction (snapping in, easing out and snapping in again),
+jumps no authored motion makes (yaw beyond the follow rate, a look target
+leaping without a retraction, an expansion faster than its ease), sustained
+jerk, and shake that never settles. Arena changes, the killcam, respawns,
+Duel turns and camera-mode switches are hard cuts; a single retraction, the
+follow turn and hit shake stay below the limits. Bot cases alternate the
+fixed and follow cameras. The runner prints a `camera motion:` summary line;
+`-v` lists every flagged case with a distance excerpt. A flagged case fails
+the sweep like any other violation. To look at one case's camera frame by frame, a
+`--treadline-probe` script can set `globalThis.__treadlineCameraTrace =
+{case, from, to, rows: []}` before beginning that case.
+`tests/test_treadline_camera_motion.js` (CTest
+`tilefinch-treadline-camera-motion-tests`) drives the detector with synthetic
+series.
+
+**Recorded PPSSPP gameplay.** `scripts/run-ppsspp-input-script.sh
+--record-video DIR` turns on PPSSPP's frame dump for that run only: a lossless
+FFV1 AVI at native 480x272 in `DIR/VIDEO`, the mixed audio in `DIR/AUDIO`,
+and the validation log, copied out of the isolated HOME before it is deleted.
+Host audio goes to SDL's dummy driver, so the run stays silent without
+muting the dump. Without the flag nothing changes. A Treadline long soak:
+
+```sh
+build-preset-release/tilefinch-offline-library-fixture --web-app OUT \
+  'https://game.test/index.html?qualification=long-soak&seed=12345' \
+  examples/treadline-arena \
+  $(awk '!/^#/ && NF { print $1 }' examples/treadline-arena/package-files.txt)
+  # add &mode=onslaught to the URL for Onslaught
+scripts/run-ppsspp-input-script.sh --script treadline-long-soak \
+  --url 'https://tilefinch.local/offline/app?id=1' --offline-library OUT \
+  --script-file-kb 512 --measure --record-video recording
+python3 scripts/analyze-game-video.py recording --out analysis
+```
+
+The file list is the game's canonical package list,
+`examples/treadline-arena/package-files.txt`; this `awk` takes every entry,
+including `qualification.js`, which a `?qualification=` page fetches (see the
+file's header for an ordinary package). `OUT` must not exist yet. Do not
+point `TMPDIR` under `~/Documents`
+(LaunchServices then refuses the launch). The long soak alternates the fixed
+and follow cameras every 900 game frames. PPSSPP writes one AVI frame per
+presented frame; the file's 59.94 fps label is nominal. The analyzer takes
+the true rate from frames / audio duration (`--fps` overrides): about 58 fps
+at PPSSPP's normal clock, about 31 fps (device-like 1/30 s steps) with
+`TILEFINCH_PPSSPP_CPU_MHZ=111`.
+
+The analyzer uses ffmpeg and the standard library, plus
+`build-preset-release/tilefinch-video-motion` (`tools/video_motion.c`), which
+estimates a zoom about the screen centre and a shift per frame (`--no-camera`
+skips it). It reports camera oscillation, pumping, jerk and single jumps;
+single-frame transients (a band such as browser chrome, or a large area,
+shown for one frame); brightness flashes and HUD-text dropouts (the HUD bands
+are `--hud-top`/`--hud-bottom`); popping; black, blank and noise frames;
+frozen runs; the tile checkerboard; and partially drawn frames. Single jumps
+(a cut, a deliberate retraction or a glitch: the video alone cannot tell) and
+frozen runs (pause screens freeze on purpose) are listed for review but not
+counted as problems. `report.txt` gives times and frame numbers, `frames.tsv`
+the per-frame measures, `events.json` the events, and each event gets an mp4
+clip at the true rate and a 4x3 contact sheet of twelve consecutive frames
+starting five before its peak. `--skip SECONDS` ignores boot and menus. A
+32 s recording (1,900 frames) takes about 45 s to analyze. CTest
+`tilefinch-game-video-analyzer-tests` runs it on synthetic ffmpeg clips.
+
+**Blinks.** The flicker, transient and popping checks look for large areas
+(they let hit flashes and smoke through), so the analyzer also runs
+`build-preset-release/tilefinch-video-blink` (`tools/video_blink.c`, about
+4 s per recording) on the full-resolution colour frames: a region that
+changes for one to four frames and then returns exactly to what it was
+(on-off-on or off-on-off) while its surroundings stay put and the camera is
+still. Each blink is a `blink hud` (bright pixels in a HUD band), a
+`blink object` (scenery, a tank, an effect or a HUD indicator in the scene
+area) or `shimmer line` (a thin or sparse run: sub-pixel lines such as the
+floor grid and wall tops dropping in and out of the rasterization as the
+camera moves; info only, compare counts between reviews). The report gives
+each blink's box in native pixels, its length and whether it appears or
+vanishes, and writes `NNN-...-zoom.png`, eight frames cropped around it and
+enlarged. Intended blinks exist: the enemy hit flash (white, 0.12 s), the
+8 Hz fire-windup pulse, muzzle and bounce flashes, sparks, the pickup bob at
+a screen edge. `--no-blink` skips the check.
+
+PPSSPP's hardware renderer does not show what the browser's CPU draws over
+a GE-written frame (chrome, toasts such as PAGE CONTROLS ON), so menus and
+overlays are missing from ordinary recordings. Set
+`TILEFINCH_PPSSPP_SOFTWARE_RENDERER=1` for the input-script runner to
+record with the software renderer (slower) when overlays matter.
+
+**Reference screenshots.** `scripts/check-treadline-references.py` renders
+Treadline's key scenes in the interactive lab and compares them pixel for
+pixel with `tests/visual/treadline/*.png`: the title, every main menu
+screen, the Controls pages, the Practice Range panel, pause, the HUD in
+play and the opening view of each authored arena: the `*-first-frame` scenes
+render after two ticks, because the first tick runs the arena change. The lab is byte-deterministic (fixed 16 ms ticks, a pinned save
+with remarks off, `?daily=20261001`), and menu scenes reuse
+`check-treadline-menu-layout.py`'s `SCREENS` visits. CTest
+`tilefinch-treadline-reference-tests` (label `visual`, about 10 s) runs it.
+On a mismatch it fails and writes the current render and
+`<scene>-diff.png` (reference, render, changed pixels in magenta) into
+`build-preset-release/treadline-references/`. When, and only when, the
+change is intended, approve it after looking at the diffs:
+
+```sh
+python3 scripts/check-treadline-references.py --update-references [--only SCENE,...]
+```
+
+and commit the new PNGs with the change that caused them. `--list` names
+the scenes. Any branch that restyles Treadline's text, HUD, menus or
+palette must re-approve the references in the same change.
+
+**Milestone review.** Before merging any Treadline change to visuals, the
+camera, rendering, the HUD or menus (and at each milestone), record the
+standard scenario set and read the review folder:
+
+```sh
+scripts/visual-review.py --build-dir build-preset-psp-validation --out review
+# or: cmake --build build-preset-release --target treadline-visual-review
+#     (EBOOT from TILEFINCH_VISUAL_REVIEW_PSP_BUILD, folder
+#      build-preset-release/treadline-visual-review)
+```
+
+It packages the game from the checkout (so an older validation EBOOT still
+reviews the current JavaScript), records each scenario in PPSSPP at the
+device-like 111 MHz clock (`--clock normal|both` for PPSSPP's own),
+analyzes it, builds an overview sheet (one frame every 2 s), runs the
+reference check, and writes `index.html` and `index.md`: a summary table,
+then per run the overview and every event with its sheet, zoom and clip,
+then a review checklist. The standard set is the Quick Match long soak
+(seed 12345), Onslaught seeds 2 and 7, campaign mission 1-1 and the
+Practice Range; `--scenarios` adds `onslaught-12345` and `mission-3-4`.
+Missions and the range use `tests/input-scripts/treadline-visual-play.txt`:
+real pad input after a trusted Deploy, the scene chosen by the package URL
+(`?visual=mission&mission=N`, `?visual=range`). `--software` adds a
+software-renderer run of each; `--keep-video` keeps the 60-80 MB lossless
+recordings. The standard set takes about 10 minutes (each run about 1 min
+to record at 111 MHz plus 45 s to analyze). It needs PPSSPP, so it is a
+build target and never part of the default CTest gate; `--strict` makes
+analyzer problems or reference changes fail it.
+
+Review checklist (also in each index): decide for every event whether it is
+an intended effect, a known issue or a new problem; look at every overview
+sheet for things no detector names; compare 111 MHz with normal-clock runs
+(a problem only at 111 MHz is a frame-budget effect: deferred HUD work,
+dropped optional geometry); and approve reference changes only when the
+diff is the intended one.
 
 ### Scripted input on PPSSPP
 
@@ -793,7 +1057,7 @@ python3 -m http.server 8770 --bind HOST_LAN_IP \
 
 The helper prints the full tree digest and final URL. Preserve that output with
 the device log: it is the revision identity for the run. It also selects the
-Game Profile's bounded 384 KiB per-script envelope in the validation boot
+Game Profile's bounded 512 KiB per-script envelope in the validation boot
 configuration, so a direct device run and an installed offline game admit the
 same authored package. Never edit a staged
 directory. If its contents no longer match the marker, the helper refuses it
@@ -823,7 +1087,7 @@ Prove the loaded revision instead of relying on the screen alone:
 - when measuring cadence, use the committed input script and its explicit
   qualification URL rather than the manual staging configuration.
 
-An installed copy in **Library → Offline apps** is a sealed snapshot. Source or
+An installed copy in **Library → Saved** is a sealed snapshot. Source or
 staging changes do not mutate it. Open the current network-backed page, choose
 **Page tools → Install offline app**, confirm that the preview says Update or
 Reinstall and lists the expected resources, and complete that operation before

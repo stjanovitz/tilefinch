@@ -106,7 +106,7 @@ static void navigation_stream_add_preload_url(
     NavigationDocumentStream *stream, lxb_dom_node_t *node,
     const char *reference, bool script, bool module, bool cors,
     TilefinchCredentialsMode credentials, bool count_discovery,
-    bool render_blocking_style)
+    bool render_blocking_style, uint8_t csp_grant)
 {
     if (stream == NULL || stream->session == NULL || reference == NULL
         || reference[0] == '\0') return;
@@ -131,6 +131,7 @@ static void navigation_stream_add_preload_url(
     preload->cors = cors;
     preload->render_blocking_style = render_blocking_style;
     preload->credentials = credentials;
+    preload->csp_grant = csp_grant;
     size_t length = strlen(resolved);
     preload->url = budget_malloc(session->budget, length + 1);
     if (preload->url == NULL) {
@@ -199,9 +200,18 @@ static void navigation_stream_discover_preload(
     char reference[2048];
     memcpy(reference, href, href_length);
     reference[href_length] = '\0';
+    /* Speculation never fetches what the parser's element could not: a
+       classic script preload counts as parser-inserted, so 'strict-dynamic'
+       wants its nonce. HTML fetches a modulepreload with parser metadata
+       "not-parser-inserted" (its nonce and integrity still count), which
+       'strict-dynamic' admits; reddit's loader inserts one from a trusted
+       script while the page parses. */
     navigation_stream_add_preload_url(
         stream, node, reference, script, module, cors, credentials, false,
-        false);
+        false, tilefinch_csp_element_grant(
+                   &stream->parser->document.content_security_policy,
+                   script ? TILEFINCH_DESTINATION_SCRIPT
+                          : TILEFINCH_DESTINATION_STYLE, node, !module));
 }
 
 static void navigation_stream_confirm_stylesheet_preload(
@@ -430,9 +440,22 @@ static void navigation_stream_preload_scan_tag(
                         ? TILEFINCH_CREDENTIALS_INCLUDE
                         : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
                 }
+                const char *nonce = NULL, *integrity = NULL;
+                size_t nonce_length = 0, integrity_length = 0;
+                /* The tag is the element the parser will build: one whose
+                   attributes swallowed "<script"/"<style" is not
+                   nonceable (dangling markup stealing a later nonce). */
+                if (!tilefinch_csp_text_has_markup(tag + 1, length - 1u))
+                    (void) navigation_preload_scan_attribute(
+                        tag, length, "nonce", &nonce, &nonce_length);
+                (void) navigation_preload_scan_attribute(
+                    tag, length, "integrity", &integrity, &integrity_length);
                 navigation_stream_add_preload_url(
                     stream, NULL, reference, true, module, cors, credentials,
-                    true, false);
+                    true, false, tilefinch_csp_request_grant(
+                        &stream->parser->document.content_security_policy,
+                        TILEFINCH_DESTINATION_SCRIPT, nonce, nonce_length,
+                        integrity, integrity_length, true));
             }
         }
         stream->preload_scan_raw_text = 1;
@@ -474,8 +497,17 @@ static void navigation_stream_preload_scan_tag(
             ? TILEFINCH_CREDENTIALS_INCLUDE
             : cors ? TILEFINCH_CREDENTIALS_SAME_ORIGIN
                    : TILEFINCH_CREDENTIALS_INCLUDE;
+    const char *nonce = NULL;
+    size_t nonce_length = 0;
+    if (!tilefinch_csp_text_has_markup(tag + 1, length - 1u))
+        (void) navigation_preload_scan_attribute(
+            tag, length, "nonce", &nonce, &nonce_length);
     navigation_stream_add_preload_url(
-        stream, NULL, reference, false, false, cors, credentials, true, true);
+        stream, NULL, reference, false, false, cors, credentials, true, true,
+        tilefinch_csp_request_grant(
+            &stream->parser->document.content_security_policy,
+            TILEFINCH_DESTINATION_STYLE, nonce, nonce_length, NULL, 0,
+            true));
 }
 
 static void navigation_stream_scan_style_preloads(
@@ -1329,12 +1361,27 @@ static void navigation_stream_launch_preloads(
                                   : TILEFINCH_REQUEST_MODE_NO_CORS,
             .credentials = preload->credentials,
             .destination = preload->script
-                ? TILEFINCH_DESTINATION_SCRIPT : TILEFINCH_DESTINATION_STYLE
+                ? TILEFINCH_DESTINATION_SCRIPT : TILEFINCH_DESTINATION_STYLE,
+            .csp_grant = preload->csp_grant
         };
         bool cache_blocked = content_blocker_would_block(
             session->browser_session->content_blocker, preload->url,
             stream->document_url, destination,
             preload->cors ? "cors" : "no-cors");
+        size_t deferred_length = 0;
+        if (!cache_blocked && preload->script && !preload->module
+            && !preload->cors
+            && browser_session_offline_script_match(
+                   session->browser_session, preload->url, &request_context,
+                   &deferred_length)) {
+            /* An installed app's script restored as bytecode only: a hit
+               that must not read its source just to warm it. */
+            preload->complete = true;
+            if (deferred_length <= preload->maximum_bytes)
+                session->preloads_cache_hits++;
+            else session->preloads_deferred++;
+            continue;
+        }
         BrowserCacheStatus status = cache_blocked
             ? BROWSER_CACHE_MISS : (preload->module
             ? browser_session_cache_match_module(
@@ -1547,8 +1594,8 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
            the two lanes overlap on a real network and refused the next
            authoritative enqueue outright with "response reservation exceeds
            scheduler byte bound". This is reservation accounting, not resident
-           memory: on the PSP profile max_file is 384 KiB, so the pool states
-           a 2.25 MiB ceiling instead of 1.5 MiB. */
+           memory: with a 512 KiB file limit, the pool states a 3 MiB ceiling
+           instead of 2 MiB. */
         const size_t preload_lanes = (size_t) NAVIGATION_PRELOAD_CONCURRENCY;
         const size_t authoritative_lanes = 4u;
         const size_t lanes = preload_lanes + authoritative_lanes;

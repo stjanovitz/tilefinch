@@ -3,10 +3,12 @@
    compile; ordinary image scheduling edits should not rebuild them. */
 #include <stdatomic.h>
 #include "tilefinch/psp_fpu.h"
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "image_decode_internal.h"
+#include "image_svg_decode_internal.h"
 #include "tilefinch/integer_math.h"
 #include "tilefinch/platform.h"
 
@@ -40,6 +42,50 @@ typedef union {
 
 static Budget *decode_budget;
 static ImageDecodeArena *decode_arena;
+/* Bytes the current decode holds through image_malloc, the libwebp hooks
+   and its output, and their peak: the decode's real working set, which the
+   census reports instead of the source-size product. */
+static size_t decode_live_bytes;
+static size_t decode_peak_bytes;
+
+static void image_decode_charged(const void *pointer)
+{
+    if (pointer == NULL) return;
+    decode_live_bytes += budget_usable_size(pointer);
+    if (decode_live_bytes > decode_peak_bytes)
+        decode_peak_bytes = decode_live_bytes;
+}
+
+static void image_decode_discharged(const void *pointer)
+{
+    if (pointer == NULL) return;
+    size_t bytes = budget_usable_size(pointer);
+    decode_live_bytes -= bytes < decode_live_bytes ? bytes : decode_live_bytes;
+}
+
+void image_point_sample_rgba(const unsigned char *source, int source_width,
+                             int source_height, unsigned char *target,
+                             int target_width, int target_height)
+{
+    for (int y = 0; y < target_height; y++) {
+        const unsigned char *row = source
+            + (size_t) image_point_sample_index(y, source_height,
+                                                target_height)
+              * (size_t) source_width * 4u;
+        unsigned char *out = target + (size_t) y * (size_t) target_width * 4u;
+        for (int x = 0; x < target_width; x++) {
+            memcpy(out + (size_t) x * 4u,
+                   row + (size_t) image_point_sample_index(
+                             x, source_width, target_width) * 4u,
+                   4u);
+        }
+    }
+}
+
+size_t image_decode_last_peak_bytes(void)
+{
+    return decode_peak_bytes;
+}
 static atomic_bool decode_gate = ATOMIC_VAR_INIT(false);
 static atomic_bool image_worker_decode_pending = ATOMIC_VAR_INIT(false);
 
@@ -126,6 +172,41 @@ static bool image_decode_is_webp(const unsigned char *encoded, size_t length)
         && memcmp(encoded + 8, "WEBP", 4) == 0;
 }
 
+/* libwebp allocates only through WebPSafeMalloc/WebPSafeCalloc/WebPSafeFree,
+   and cmake/TilefinchDependencies.cmake compiles its utils.c with malloc,
+   calloc and free renamed to these. They charge the decode's Budget while a
+   WebP decode is in progress and refuse otherwise, so libwebp's real scratch
+   (row caches, alpha and lossless planes) is accounted exactly. */
+static Budget *webp_budget;
+
+void *tilefinch_webp_malloc(size_t size);
+void *tilefinch_webp_calloc(size_t count, size_t size);
+void tilefinch_webp_free(void *pointer);
+
+void *tilefinch_webp_malloc(size_t size)
+{
+    void *pointer = webp_budget == NULL ? NULL
+        : budget_malloc(webp_budget, size);
+    image_decode_charged(pointer);
+    return pointer;
+}
+
+void *tilefinch_webp_calloc(size_t count, size_t size)
+{
+    void *pointer = webp_budget == NULL ? NULL
+        : budget_calloc_category(
+              webp_budget, BUDGET_CATEGORY_RESOURCE, count, size);
+    image_decode_charged(pointer);
+    return pointer;
+}
+
+void tilefinch_webp_free(void *pointer)
+{
+    if (pointer == NULL) return;
+    image_decode_discharged(pointer);
+    budget_free(webp_budget, pointer);
+}
+
 static unsigned char *image_decode_webp_scaled(
     const unsigned char *encoded, size_t encoded_length,
     int target_width, int target_height, int *source_width,
@@ -151,29 +232,10 @@ static unsigned char *image_decode_webp_scaled(
                > SIZE_MAX / 4u) return NULL;
     size_t target_pixels = (size_t) target_width * (size_t) target_height;
 
-    /* libwebp owns transient coefficient/YUV scratch even when its RGBA
-       destination is caller-owned. Lossless streams alone retain a four-byte
-       source-sized transform plane plus row caches and Huffman metadata, so
-       pre-admit a conservative eight source bytes per pixel plus the encoded
-       stream before entering the upstream allocator. The ordinary shared
-       budget can refuse a very large image without exposing raw allocations
-       outside Tilefinch's memory discipline. */
-    if ((size_t) decoded_source_width
-            > SIZE_MAX / (size_t) decoded_source_height) return NULL;
-    size_t source_pixels = (size_t) decoded_source_width
-                           * (size_t) decoded_source_height;
-    if (source_pixels > (SIZE_MAX - encoded_length) / 8u) return NULL;
-    size_t scratch_bytes = source_pixels * 8u + encoded_length;
-    BudgetReservation scratch = {0};
-    if (!budget_reservation_acquire(
-            &scratch, decode_budget, BUDGET_CATEGORY_RESOURCE,
-            scratch_bytes)) return NULL;
     size_t target_bytes = target_pixels * 4u;
     unsigned char *output = budget_malloc(decode_budget, target_bytes);
-    if (output == NULL) {
-        budget_reservation_release(&scratch);
-        return NULL;
-    }
+    if (output == NULL) return NULL;
+    image_decode_charged(output);
     config.options.use_scaling = target_width != config.input.width
                                  || target_height != config.input.height;
     config.options.scaled_width = target_width;
@@ -188,8 +250,9 @@ static unsigned char *image_decode_webp_scaled(
        upstream call on Allegrex, including when invoked by a raster cache
        miss. Feed the same decoder incrementally so input/cancel/watchdog
        service gets a checkpoint between small compressed-data windows. The
-       external destination and source-pixel reservation keep ownership and
-       memory accounting identical to the one-shot path. */
+       external destination and the Budget-routed allocator keep ownership
+       and memory accounting identical to the one-shot path. */
+    webp_budget = decode_budget;
     WebPIDecoder *decoder = WebPIDecode(NULL, 0, &config);
     VP8StatusCode status = VP8_STATUS_SUSPENDED;
     size_t offset = 0;
@@ -210,8 +273,9 @@ static unsigned char *image_decode_webp_scaled(
     }
     if (decoder != NULL) WebPIDelete(decoder);
     WebPFreeDecBuffer(&config.output);
-    budget_reservation_release(&scratch);
+    webp_budget = NULL;
     if (status != VP8_STATUS_OK) {
+        image_decode_discharged(output);
         budget_free(decode_budget, output);
         return NULL;
     }
@@ -223,20 +287,30 @@ static unsigned char *image_decode_webp_scaled(
 
 static void *image_malloc(size_t size)
 {
-    return decode_arena != NULL
-        ? image_arena_malloc(size) : budget_malloc(decode_budget, size);
+    if (decode_arena != NULL) return image_arena_malloc(size);
+    void *pointer = budget_malloc(decode_budget, size);
+    image_decode_charged(pointer);
+    return pointer;
 }
 
 static void *image_realloc(void *pointer, size_t size)
 {
-    return decode_arena != NULL
-        ? image_arena_realloc(pointer, size)
-        : budget_realloc(decode_budget, pointer, size);
+    if (decode_arena != NULL) return image_arena_realloc(pointer, size);
+    size_t before = pointer == NULL ? 0 : budget_usable_size(pointer);
+    void *replacement = budget_realloc(decode_budget, pointer, size);
+    if (replacement != NULL) {
+        decode_live_bytes -= before < decode_live_bytes
+            ? before : decode_live_bytes;
+        image_decode_charged(replacement);
+    }
+    return replacement;
 }
 
 static void image_free(void *pointer)
 {
-    if (decode_arena == NULL) budget_free(decode_budget, pointer);
+    if (decode_arena != NULL) return;
+    image_decode_discharged(pointer);
+    budget_free(decode_budget, pointer);
 }
 
 #define STBI_MALLOC(size) image_malloc(size)
@@ -245,6 +319,14 @@ static void image_free(void *pointer)
 #define STBI_NO_STDIO
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
+/* Nothing reads stbi_failure_reason() (every caller only checks for a NULL
+   or zero result, which stbi__err still returns), and the flip,
+   unpremultiply and iPhone-PNG flags are never set, so their per-thread
+   copies always fall back to the zero globals. Without the failure strings
+   and thread-local copies stb stops storing a reason string at each of its
+   error sites and needs no emulated TLS on the PSP. */
+#define STBI_NO_FAILURE_STRINGS
+#define STBI_NO_THREAD_LOCALS
 #if defined(TILEFINCH_DISABLE_GIF)
 #define STBI_NO_GIF
 #endif
@@ -315,20 +397,44 @@ static unsigned char *image_decode_gif_first_frame(
 }
 #endif
 
-/* stb_image's ordinary JPEG path materializes a full RGBA source after its
-   component planes.  That transient peak is unnecessary when the retained
-   resource is already bounded to the physical viewport.  Reuse stb's JPEG
-   decoder and resamplers, but emit only the requested rows and columns into
-   the final target.  The component decoder remains upstream and unchanged;
-   this function only replaces load_jpeg_image's full-size color-conversion
-   surface. */
+#include "image_decode/row_sampler.inc"
+#include "image_decode/png_stream.inc"
+
+/* The largest IDCT reduction (1/2, 1/4 or 1/8 per dimension) that still
+   leaves at least the target in both dimensions. */
+static int image_jpeg_scale_shift(int source_width, int source_height,
+                                  int target_width, int target_height)
+{
+    int shift = 0;
+    while (shift < 3
+           && ((source_width + (2 << shift) - 1) >> (shift + 1))
+                  >= target_width
+           && ((source_height + (2 << shift) - 1) >> (shift + 1))
+                  >= target_height) {
+        shift++;
+    }
+    return shift;
+}
+
+/* A JPEG shown smaller than its source is decoded near the target and never
+   at full resolution. stb's entropy decoder (patched, see
+   patches/stb-31c1ad37-jpeg-scaled-idct.patch) stores every 8x8 IDCT block
+   box-averaged by 2^shift, so its component planes are allocated at the
+   reduced size. Rows of the reduced image are then chroma-upsampled with
+   stb's own kernels one at a time, and those the row sampler takes for the
+   remaining factor (below two) are colour-converted into the target.
+   Progressive streams still hold their full coefficient planes until the
+   last scan. */
 static unsigned char *image_decode_jpeg_scaled(
     const unsigned char *encoded, int encoded_length,
+    int expected_width, int expected_height,
     int target_width, int target_height, int *source_width,
     int *source_height, int *components, unsigned char *external_output)
 {
     if (encoded == NULL || encoded_length <= 0
-        || target_width <= 0 || target_height <= 0) return NULL;
+        || target_width <= 0 || target_height <= 0
+        || expected_width < target_width
+        || expected_height < target_height) return NULL;
     stbi__context stream;
     stbi__start_mem(&stream, encoded, encoded_length);
     if (!stbi__jpeg_test(&stream)) return NULL;
@@ -338,6 +444,9 @@ static unsigned char *image_decode_jpeg_scaled(
     memset(jpeg, 0, sizeof(*jpeg));
     jpeg->s = &stream;
     stbi__setup_jpeg(jpeg);
+    int shift = image_jpeg_scale_shift(
+        expected_width, expected_height, target_width, target_height);
+    jpeg->tilefinch_scale_shift = shift;
     if (!stbi__decode_jpeg_image(jpeg)) {
         stbi__cleanup_jpeg(jpeg);
         STBI_FREE(jpeg);
@@ -346,8 +455,12 @@ static unsigned char *image_decode_jpeg_scaled(
     int width = stream.img_x;
     int height = stream.img_y;
     int decode_components = stream.img_n;
-    if (width <= 0 || height <= 0 || decode_components <= 0
-        || target_width > width || target_height > height
+    int step = 1 << shift;
+    int reduced_width = (width + step - 1) >> shift;
+    int reduced_height = (height + step - 1) >> shift;
+    if (width != expected_width || height != expected_height
+        || decode_components <= 0 || decode_components > 4
+        || target_width > reduced_width || target_height > reduced_height
         || (size_t) target_width > SIZE_MAX / (size_t) target_height
         || (size_t) target_width * (size_t) target_height > SIZE_MAX / 4u) {
         stbi__cleanup_jpeg(jpeg);
@@ -356,21 +469,26 @@ static unsigned char *image_decode_jpeg_scaled(
     }
 
     stbi__resample resample[4];
+    int plane_rows[4] = {0, 0, 0, 0};
+    int plane_stride[4] = {0, 0, 0, 0};
     stbi_uc *component_rows[4] = {NULL, NULL, NULL, NULL};
-    bool setup_ok = decode_components <= 4;
+    bool setup_ok = true;
     for (int component = 0; setup_ok && component < decode_components;
          component++) {
         stbi__resample *row = &resample[component];
         jpeg->img_comp[component].linebuf =
-            (stbi_uc *) stbi__malloc((size_t) width + 3u);
+            (stbi_uc *) stbi__malloc((size_t) reduced_width + 3u);
         if (jpeg->img_comp[component].linebuf == NULL) {
             setup_ok = false;
             break;
         }
+        plane_rows[component] =
+            (jpeg->img_comp[component].y + step - 1) >> shift;
+        plane_stride[component] = jpeg->img_comp[component].w2 >> shift;
         row->hs = jpeg->img_h_max / jpeg->img_comp[component].h;
         row->vs = jpeg->img_v_max / jpeg->img_comp[component].v;
         row->ystep = row->vs >> 1;
-        row->w_lores = (width + row->hs - 1) / row->hs;
+        row->w_lores = (reduced_width + row->hs - 1) / row->hs;
         row->ypos = 0;
         row->line0 = row->line1 = jpeg->img_comp[component].data;
         if (row->hs == 1 && row->vs == 1) {
@@ -385,19 +503,26 @@ static unsigned char *image_decode_jpeg_scaled(
             row->resample = stbi__resample_row_generic;
         }
     }
+    bool scaled = reduced_width != target_width
+        || reduced_height != target_height;
     size_t target_bytes = (size_t) target_width * (size_t) target_height * 4u;
     stbi_uc *output = setup_ok && external_output != NULL
         ? external_output
         : setup_ok ? (stbi_uc *) stbi__malloc(target_bytes) : NULL;
-    stbi_uc *rgba_row = output == NULL
-        ? NULL : (stbi_uc *) stbi__malloc((size_t) width * 4u);
-    if (output == NULL || rgba_row == NULL) setup_ok = false;
+    stbi_uc *rgba_row = output == NULL || !scaled
+        ? NULL : (stbi_uc *) stbi__malloc((size_t) reduced_width * 4u);
+    ImageRowSampler sampler;
+    memset(&sampler, 0, sizeof(sampler));
+    if (output == NULL || (scaled && (rgba_row == NULL
+            || !image_row_sampler_init(
+                   &sampler, reduced_width, reduced_height, target_width,
+                   target_height, output)))) setup_ok = false;
 
-    int next_target_y = 0;
     bool source_is_rgb = stream.img_n == 3
         && (jpeg->rgb == 3
             || (jpeg->app14_color_transform == 0 && !jpeg->jfif));
-    for (int source_y = 0; setup_ok && source_y < height; source_y++) {
+    int source_y = 0;
+    for (; setup_ok && source_y < reduced_height; source_y++) {
         for (int component = 0; component < decode_components; component++) {
             stbi__resample *row = &resample[component];
             int lower = row->ystep >= (row->vs >> 1);
@@ -409,90 +534,78 @@ static unsigned char *image_decode_jpeg_scaled(
             if (++row->ystep >= row->vs) {
                 row->ystep = 0;
                 row->line0 = row->line1;
-                if (++row->ypos < jpeg->img_comp[component].y) {
-                    row->line1 += jpeg->img_comp[component].w2;
+                if (++row->ypos < plane_rows[component]) {
+                    row->line1 += plane_stride[component];
                 }
             }
         }
-        int wanted_source_y = next_target_y < target_height
-            ? tilefinch_mul_div_int(next_target_y, height, target_height)
-            : height;
-        if (wanted_source_y != source_y) continue;
-
+        if (scaled && !image_row_sampler_wants(&sampler)) {
+            (void) image_row_sampler_push(&sampler, NULL);
+            continue;
+        }
+        stbi_uc *out = scaled ? rgba_row
+            : output + (size_t) source_y * (size_t) target_width * 4u;
         if (stream.img_n == 3 && source_is_rgb) {
-            for (int x = 0; x < width; x++) {
-                rgba_row[(size_t) x * 4u] = component_rows[0][x];
-                rgba_row[(size_t) x * 4u + 1u] = component_rows[1][x];
-                rgba_row[(size_t) x * 4u + 2u] = component_rows[2][x];
-                rgba_row[(size_t) x * 4u + 3u] = 255;
+            for (int x = 0; x < reduced_width; x++) {
+                out[(size_t) x * 4u] = component_rows[0][x];
+                out[(size_t) x * 4u + 1u] = component_rows[1][x];
+                out[(size_t) x * 4u + 2u] = component_rows[2][x];
+                out[(size_t) x * 4u + 3u] = 255;
             }
         } else if (stream.img_n == 3) {
             jpeg->YCbCr_to_RGB_kernel(
-                rgba_row, component_rows[0], component_rows[1],
-                component_rows[2], width, 4);
+                out, component_rows[0], component_rows[1],
+                component_rows[2], reduced_width, 4);
         } else if (stream.img_n == 4
                    && jpeg->app14_color_transform == 0) {
-            for (int x = 0; x < width; x++) {
+            for (int x = 0; x < reduced_width; x++) {
                 stbi_uc multiplier = component_rows[3][x];
-                rgba_row[(size_t) x * 4u] = stbi__blinn_8x8(
+                out[(size_t) x * 4u] = stbi__blinn_8x8(
                     component_rows[0][x], multiplier);
-                rgba_row[(size_t) x * 4u + 1u] = stbi__blinn_8x8(
+                out[(size_t) x * 4u + 1u] = stbi__blinn_8x8(
                     component_rows[1][x], multiplier);
-                rgba_row[(size_t) x * 4u + 2u] = stbi__blinn_8x8(
+                out[(size_t) x * 4u + 2u] = stbi__blinn_8x8(
                     component_rows[2][x], multiplier);
-                rgba_row[(size_t) x * 4u + 3u] = 255;
+                out[(size_t) x * 4u + 3u] = 255;
             }
         } else if (stream.img_n == 4
                    && jpeg->app14_color_transform == 2) {
             jpeg->YCbCr_to_RGB_kernel(
-                rgba_row, component_rows[0], component_rows[1],
-                component_rows[2], width, 4);
-            for (int x = 0; x < width; x++) {
+                out, component_rows[0], component_rows[1],
+                component_rows[2], reduced_width, 4);
+            for (int x = 0; x < reduced_width; x++) {
                 stbi_uc multiplier = component_rows[3][x];
-                rgba_row[(size_t) x * 4u] = stbi__blinn_8x8(
-                    255 - rgba_row[(size_t) x * 4u], multiplier);
-                rgba_row[(size_t) x * 4u + 1u] = stbi__blinn_8x8(
-                    255 - rgba_row[(size_t) x * 4u + 1u], multiplier);
-                rgba_row[(size_t) x * 4u + 2u] = stbi__blinn_8x8(
-                    255 - rgba_row[(size_t) x * 4u + 2u], multiplier);
+                out[(size_t) x * 4u] = stbi__blinn_8x8(
+                    255 - out[(size_t) x * 4u], multiplier);
+                out[(size_t) x * 4u + 1u] = stbi__blinn_8x8(
+                    255 - out[(size_t) x * 4u + 1u], multiplier);
+                out[(size_t) x * 4u + 2u] = stbi__blinn_8x8(
+                    255 - out[(size_t) x * 4u + 2u], multiplier);
             }
         } else if (stream.img_n >= 3) {
             jpeg->YCbCr_to_RGB_kernel(
-                rgba_row, component_rows[0], component_rows[1],
-                component_rows[2], width, 4);
+                out, component_rows[0], component_rows[1],
+                component_rows[2], reduced_width, 4);
         } else {
-            for (int x = 0; x < width; x++) {
+            for (int x = 0; x < reduced_width; x++) {
                 stbi_uc value = component_rows[0][x];
-                rgba_row[(size_t) x * 4u] = value;
-                rgba_row[(size_t) x * 4u + 1u] = value;
-                rgba_row[(size_t) x * 4u + 2u] = value;
-                rgba_row[(size_t) x * 4u + 3u] = 255;
+                out[(size_t) x * 4u] = value;
+                out[(size_t) x * 4u + 1u] = value;
+                out[(size_t) x * 4u + 2u] = value;
+                out[(size_t) x * 4u + 3u] = 255;
             }
         }
-        while (next_target_y < target_height
-               && tilefinch_mul_div_int(
-                      next_target_y, height, target_height) == source_y) {
-            stbi_uc *target_row = output
-                + (size_t) next_target_y * (size_t) target_width * 4u;
-            int source_x = 0;
-            int remainder = 0;
-            for (int target_x = 0; target_x < target_width; target_x++) {
-                memcpy(target_row + (size_t) target_x * 4u,
-                       rgba_row + (size_t) source_x * 4u, 4u);
-                remainder += width;
-                while (remainder >= target_width) {
-                    source_x++;
-                    remainder -= target_width;
-                }
-                if (source_x >= width) source_x = width - 1;
-            }
-            next_target_y++;
+        if (scaled && !image_row_sampler_push(&sampler, rgba_row)) {
+            setup_ok = false;
         }
     }
+    bool complete = setup_ok && source_y == reduced_height
+        && (!scaled || image_row_sampler_finished(&sampler));
+    image_row_sampler_release(&sampler);
     STBI_FREE(rgba_row);
     stbi__cleanup_jpeg(jpeg);
     STBI_FREE(jpeg);
-    if (!setup_ok || next_target_y != target_height) {
+    if (!complete) {
         if (external_output == NULL) STBI_FREE(output);
         return NULL;
     }
@@ -535,6 +648,8 @@ typedef struct {
     size_t encoded_length;
     int target_width;
     int target_height;
+    int expected_source_width;
+    int expected_source_height;
     int source_width;
     int source_height;
     ImageDecodeStatus result_status;
@@ -560,6 +675,7 @@ static void image_decode_worker_execute(ImageDecodeWorker *worker)
     if (entered) {
         pixels = image_decode_jpeg_scaled(
             worker->encoded, (int) worker->encoded_length,
+            worker->expected_source_width, worker->expected_source_height,
             worker->target_width, worker->target_height,
             &source_width, &source_height, &components,
             worker->arena_storage);
@@ -680,10 +796,17 @@ static void image_decode_worker_release_job(ImageDecodeWorker *worker)
         memory_order_release);
 }
 
-static bool image_jpeg_progressive(
-    const unsigned char *encoded, size_t length)
+/* Worker scratch for one scaled JPEG decode, from the frame header: the
+   reduced component planes (stb pads each to whole MCUs), progressive
+   coefficient planes (full size, two bytes per coefficient), one reduced
+   RGBA row, line buffers and the sampler's column table. The floor covers the
+   decoder state, Huffman tables and allocation headers. */
+static bool image_jpeg_worker_scratch(
+    const unsigned char *encoded, size_t length, int target_width,
+    int target_height, size_t *scratch_bytes)
 {
-    if (encoded == NULL || length < 4u
+    if (encoded == NULL || length < 4u || target_width <= 0
+        || target_height <= 0
         || encoded[0] != 0xffu || encoded[1] != 0xd8u) return false;
     size_t at = 2u;
     while (at + 1u < length) {
@@ -691,15 +814,49 @@ static bool image_jpeg_progressive(
         while (at < length && encoded[at] == 0xffu) at++;
         if (at >= length) break;
         unsigned marker = encoded[at++];
-        if (marker == 0xc2u) return true;
-        if (marker == 0xc0u || marker == 0xc1u || marker == 0xdau
-            || marker == 0xd9u) return false;
+        if (marker == 0xd9u || marker == 0xdau) return false;
         if (marker == 0x01u || (marker >= 0xd0u && marker <= 0xd8u))
             continue;
         if (at + 1u >= length) break;
         size_t segment = ((size_t) encoded[at] << 8u) | encoded[at + 1u];
         if (segment < 2u || segment > length - at) break;
-        at += segment;
+        if (marker != 0xc0u && marker != 0xc1u && marker != 0xc2u) {
+            at += segment;
+            continue;
+        }
+        const unsigned char *sof = encoded + at + 2u;
+        if (segment < 8u) return false;
+        int height = (sof[1] << 8) | sof[2];
+        int width = (sof[3] << 8) | sof[4];
+        int count = sof[5];
+        if (width <= 0 || height <= 0 || count <= 0 || count > 4
+            || segment != 8u + 3u * (size_t) count) return false;
+        int h[4], v[4], h_max = 1, v_max = 1;
+        for (int i = 0; i < count; i++) {
+            h[i] = sof[7 + i * 3] >> 4;
+            v[i] = sof[7 + i * 3] & 15;
+            if (h[i] < 1 || h[i] > 4 || v[i] < 1 || v[i] > 4) return false;
+            if (h[i] > h_max) h_max = h[i];
+            if (v[i] > v_max) v_max = v[i];
+        }
+        int shift = image_jpeg_scale_shift(
+            width, height, target_width, target_height);
+        size_t mcu_x = ((size_t) width + (size_t) h_max * 8u - 1u)
+                       / ((size_t) h_max * 8u);
+        size_t mcu_y = ((size_t) height + (size_t) v_max * 8u - 1u)
+                       / ((size_t) v_max * 8u);
+        size_t total = IMAGE_DECODE_WORKER_SCRATCH_FLOOR;
+        for (int i = 0; i < count; i++) {
+            size_t plane_w = mcu_x * (size_t) h[i] * 8u;
+            size_t plane_h = mcu_y * (size_t) v[i] * 8u;
+            total += (plane_w >> shift) * (plane_h >> shift) + 16u;
+            if (marker == 0xc2u) total += plane_w * plane_h * 2u + 16u;
+        }
+        size_t reduced_width = ((size_t) width + (1u << shift) - 1u) >> shift;
+        total += reduced_width * (4u + 4u + (size_t) count)
+            + (size_t) target_width * 64u;
+        *scratch_bytes = total;
+        return true;
     }
     return false;
 }
@@ -743,7 +900,6 @@ ImageDecodeSubmitResult image_decode_worker_submit(
         || target_width > SIZE_MAX / target_height) {
         return IMAGE_DECODE_SUBMIT_REJECTED;
     }
-    size_t source_pixels = source_width * source_height;
     size_t target_pixels = target_width * target_height;
     if (target_pixels > SIZE_MAX / 4u)
         return IMAGE_DECODE_SUBMIT_REJECTED;
@@ -757,16 +913,13 @@ ImageDecodeSubmitResult image_decode_worker_submit(
             return IMAGE_DECODE_SUBMIT_REJECTED;
         output_aligned += padding;
     }
-    /* Progressive JPEG keeps coefficient planes alongside component data.
-       Baseline thumbnails need only the component bound; reserve the larger
-       peak only when the authored stream actually carries progressive SOF. */
-    size_t scratch_per_pixel = image_jpeg_progressive(
-        resource->encoded, resource->encoded_length) ? 8u : 4u;
-    if (source_pixels > (SIZE_MAX - IMAGE_DECODE_WORKER_SCRATCH_FLOOR
-                         - resource->encoded_length) / scratch_per_pixel)
+    size_t scratch_bytes = 0;
+    if (!image_jpeg_worker_scratch(
+            resource->encoded, resource->encoded_length, resource->width,
+            resource->height, &scratch_bytes)
+        || scratch_bytes > SIZE_MAX - resource->encoded_length)
         return IMAGE_DECODE_SUBMIT_REJECTED;
-    size_t scratch_bytes = source_pixels * scratch_per_pixel
-        + resource->encoded_length + IMAGE_DECODE_WORKER_SCRATCH_FLOOR;
+    scratch_bytes += resource->encoded_length;
     if (output_aligned > SIZE_MAX - scratch_bytes)
         return IMAGE_DECODE_SUBMIT_REJECTED;
     size_t arena_bytes = output_aligned + scratch_bytes;
@@ -789,6 +942,8 @@ ImageDecodeSubmitResult image_decode_worker_submit(
     worker->encoded_length = resource->encoded_length;
     worker->target_width = resource->width;
     worker->target_height = resource->height;
+    worker->expected_source_width = resource->source_width;
+    worker->expected_source_height = resource->source_height;
     worker->source_width = 0;
     worker->source_height = 0;
     worker->result_status = IMAGE_DECODE_TRANSIENT_FAILURE;
@@ -825,6 +980,7 @@ bool image_decode_worker_collect(
     *result = (ImageDecodeWorkerResult) {
         .status = worker->result_status,
         .pixel_bytes = worker->output_bytes,
+        .working_bytes = worker->output_bytes + worker->arena.used,
         .source_width = worker->source_width,
         .source_height = worker->source_height
     };
@@ -902,43 +1058,94 @@ ImageDecodeStatus image_resource_decode_checked(
         || image->encoded_length > INT32_MAX) {
         return IMAGE_DECODE_DETERMINISTIC_FAILURE;
     }
+    if ((image->retarget_flags & IMAGE_RETARGET_VECTOR) != 0) {
+        /* Vector markup is rasterized straight at the size wanted. */
+        int width = image->width, height = image->height;
+        if (width <= 0 || height <= 0
+            || (size_t) width > SIZE_MAX / 4u / (size_t) height)
+            return IMAGE_DECODE_DETERMINISTIC_FAILURE;
+        if (image_svg_decode_busy()) return IMAGE_DECODE_TRANSIENT_FAILURE;
+        size_t failures_before = budget->failure_count;
+        *decoded = image_svg_decode(
+            image->encoded, image->encoded_length, budget,
+            (size_t) width * (size_t) height * 4u, &width, &height);
+        if (*decoded != NULL) return IMAGE_DECODE_SUCCEEDED;
+        return budget->failure_count != failures_before
+            ? IMAGE_DECODE_TRANSIENT_FAILURE
+            : IMAGE_DECODE_DETERMINISTIC_FAILURE;
+    }
     if (!image_decode_begin_budget(budget))
         return IMAGE_DECODE_TRANSIENT_FAILURE;
+    decode_live_bytes = 0;
+    decode_peak_bytes = 0;
     int width = 0, height = 0, components = 0;
     size_t failures_before = budget->failure_count;
-    bool scaled_jpeg = image->encoded_length >= 2u
-        && image->encoded[0] == 0xffu && image->encoded[1] == 0xd8u
-        && image->source_width > image->width
-        && image->source_height > image->height;
+    int expected_width = image->source_width > 0
+                         ? image->source_width : image->width;
+    int expected_height = image->source_height > 0
+                          ? image->source_height : image->height;
+    bool reduces = image->width > 0 && image->height > 0
+        && image->width <= expected_width && image->height <= expected_height
+        && (image->width < expected_width
+            || image->height < expected_height);
+    bool scaled_jpeg = reduces && image->encoded_length >= 2u
+        && image->encoded[0] == 0xffu && image->encoded[1] == 0xd8u;
     bool webp = image_decode_is_webp(
         image->encoded, image->encoded_length);
-    bool webp_interrupted = false;
-    unsigned char *pixels = webp
-        ? image_decode_webp_scaled(
-              image->encoded, image->encoded_length,
-              image->width, image->height,
-              &width, &height, &components, &webp_interrupted)
+    bool interrupted = false;
+    bool at_target = false;
+    unsigned char *pixels = NULL;
+    if (webp) {
+        pixels = image_decode_webp_scaled(
+            image->encoded, image->encoded_length,
+            image->width, image->height,
+            &width, &height, &components, &interrupted);
+        at_target = true;
+    } else if (scaled_jpeg) {
+        pixels = image_decode_jpeg_scaled(
+            image->encoded, (int) image->encoded_length,
+            expected_width, expected_height, image->width, image->height,
+            &width, &height, &components, NULL);
+        at_target = true;
+    } else {
+        ImagePngStreamResult png = image->width > 0 && image->height > 0
+            ? image_decode_png_stream(
+                  image->encoded, image->encoded_length,
+                  image->width, image->height, &width, &height, &pixels,
+                  &interrupted)
+            : IMAGE_PNG_STREAM_FAILED;
+        bool png_signature = image->encoded_length >= 8u
+            && memcmp(image->encoded, "\x89PNG\r\n\x1a\n", 8u) == 0;
+        /* A PNG the streaming decoder refused for a reason other than memory
+           or an interruption still gets stb's verdict, so stb's tolerance
+           remains the floor. */
+        bool png_retry = png == IMAGE_PNG_STREAM_FAILED && png_signature
+            && !interrupted && budget->failure_count == failures_before;
+        if (png == IMAGE_PNG_STREAM_DECODED) {
+            components = 4;
+            at_target = true;
+        } else if (!png_signature || png == IMAGE_PNG_STREAM_FALLBACK
+                   || png_retry) {
 #if !defined(TILEFINCH_DISABLE_GIF)
-        : image_is_gif(image->encoded, image->encoded_length)
-        ? image_decode_gif_first_frame(
-              image->encoded, (int) image->encoded_length,
-              &width, &height, &components)
+            pixels = image_is_gif(image->encoded, image->encoded_length)
+                ? image_decode_gif_first_frame(
+                      image->encoded, (int) image->encoded_length,
+                      &width, &height, &components)
+                : stbi_load_from_memory(
+                      image->encoded, (int) image->encoded_length,
+                      &width, &height, &components, 4);
+#else
+            pixels = stbi_load_from_memory(
+                image->encoded, (int) image->encoded_length,
+                &width, &height, &components, 4);
 #endif
-        : scaled_jpeg
-        ? image_decode_jpeg_scaled(
-              image->encoded, (int) image->encoded_length,
-              image->width, image->height, &width, &height, &components,
-              NULL)
-        : stbi_load_from_memory(
-              image->encoded, (int) image->encoded_length,
-              &width, &height, &components, 4);
+        }
+    }
     image_decode_end();
-    int source_width = image->source_width > 0
-                       ? image->source_width : image->width;
-    int source_height = image->source_height > 0
-                        ? image->source_height : image->height;
+    int source_width = expected_width;
+    int source_height = expected_height;
     if (pixels == NULL) {
-        return webp_interrupted || budget->failure_count != failures_before
+        return interrupted || budget->failure_count != failures_before
             ? IMAGE_DECODE_TRANSIENT_FAILURE
             : IMAGE_DECODE_DETERMINISTIC_FAILURE;
     }
@@ -946,14 +1153,13 @@ ImageDecodeStatus image_resource_decode_checked(
         image_resource_free_decoded(budget, pixels);
         return IMAGE_DECODE_DETERMINISTIC_FAILURE;
     }
-    if (scaled_jpeg || webp) {
+    if (at_target
+        || (width == image->width && height == image->height)) {
         *decoded = pixels;
         return IMAGE_DECODE_SUCCEEDED;
     }
-    if (width == image->width && height == image->height) {
-        *decoded = pixels;
-        return IMAGE_DECODE_SUCCEEDED;
-    }
+    /* GIF, BMP and the other stb formats (and interlaced PNG) still decode
+       at source size before this reduction. */
     if (image->width <= 0 || image->height <= 0
         || (size_t) image->width > SIZE_MAX / (size_t) image->height
         || (size_t) image->width * (size_t) image->height > SIZE_MAX / 4u) {
@@ -966,15 +1172,9 @@ ImageDecodeStatus image_resource_decode_checked(
         image_resource_free_decoded(budget, pixels);
         return IMAGE_DECODE_TRANSIENT_FAILURE;
     }
-    for (int y = 0; y < image->height; y++) {
-        int source_y = (int) ((int64_t) y * height / image->height);
-        for (int x = 0; x < image->width; x++) {
-            int source_x = (int) ((int64_t) x * width / image->width);
-            memcpy(target + ((size_t) y * image->width + x) * 4u,
-                   pixels + ((size_t) source_y * width + source_x) * 4u,
-                   4u);
-        }
-    }
+    image_decode_charged(target);
+    image_point_sample_rgba(pixels, width, height, target, image->width,
+                            image->height);
     image_resource_free_decoded(budget, pixels);
     *decoded = target;
     return IMAGE_DECODE_SUCCEEDED;

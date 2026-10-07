@@ -6,10 +6,43 @@ index f06fe26d7..9ef93710c 100644
 -static void h2_stream_hash_free(unsigned int id, void *stream)
 +static void h2_stream_hash_free(uint32_t id, void *stream)
 diff --git a/lib/vtls/mbedtls.c b/lib/vtls/mbedtls.c
-index 6245cc26a..87a0a5af2 100644
+index dbee473d..a94cc95a 100644
 --- a/lib/vtls/mbedtls.c
 +++ b/lib/vtls/mbedtls.c
-@@ -445,6 +445,8 @@ static int mbed_verify_cb(void *ptr, mbedtls_x509_crt *crt,
+@@ -279,6 +279,7 @@ static uint16_t mbed_cipher_suite_walk_str(const char **str, const char **end)
+ #define mbed_cipher_suite_walk_str Curl_cipher_suite_walk_str
+ #endif
+ 
++#ifndef TILEFINCH_CURL_NO_CIPHER_LIST
+ static CURLcode mbed_set_selected_ciphers(
+   struct Curl_easy *data,
+   struct mbed_ssl_backend_data *backend,
+@@ -388,6 +389,7 @@ add_ciphers:
+   mbedtls_ssl_conf_ciphersuites(&backend->config, backend->ciphersuites);
+   return CURLE_OK;
+ }
++#endif /* !TILEFINCH_CURL_NO_CIPHER_LIST */
+ 
+ static void mbed_dump_cert_info(struct Curl_easy *data,
+                                 const mbedtls_x509_crt *crt)
+@@ -413,6 +415,9 @@ static void mbed_dump_cert_info(struct Curl_easy *data,
+ #endif
+ }
+ 
++/* Tilefinch never sets CURLOPT_CERTINFO; compiling the extraction out
++   drops curl's ASN.1 certificate formatter (lib/vtls/x509asn1.c). */
++#ifndef TILEFINCH_CURL_NO_CERTINFO
+ static void mbed_extract_certinfo(struct Curl_easy *data,
+                                   const mbedtls_x509_crt *crt)
+ {
+@@ -438,19 +443,24 @@ static void mbed_extract_certinfo(struct Curl_easy *data,
+     result = Curl_extract_certinfo(data, i, beg, end);
+   }
+ }
++#endif /* !TILEFINCH_CURL_NO_CERTINFO */
+ 
+ static int mbed_verify_cb(void *ptr, mbedtls_x509_crt *crt,
+                           int depth, uint32_t *flags)
  {
    struct Curl_cfilter *cf = (struct Curl_cfilter *)ptr;
    struct ssl_primary_config *conn_config = Curl_ssl_cf_get_primary_config(cf);
@@ -18,7 +51,16 @@ index 6245cc26a..87a0a5af2 100644
    struct Curl_easy *data = CF_DATA_CURRENT(cf);
  
    if(depth == 0) {
-@@ -462,6 +464,8 @@ static int mbed_verify_cb(void *ptr, mbedtls_x509_crt *crt,
+     if(data->set.verbose)
+       mbed_dump_cert_info(data, crt);
++#ifndef TILEFINCH_CURL_NO_CERTINFO
+     if(data->set.ssl.certinfo)
+       mbed_extract_certinfo(data, crt);
++#endif
+   }
+ 
+   /* `verifypeer` and `verifyhost` are independent, so clear the flags of a
+@@ -460,6 +470,8 @@ static int mbed_verify_cb(void *ptr, mbedtls_x509_crt *crt,
    if(!conn_config->verifyhost)
      *flags &= ~MBEDTLS_X509_BADCERT_CN_MISMATCH;
  
@@ -27,7 +69,96 @@ index 6245cc26a..87a0a5af2 100644
    if(*flags) {
  #ifndef MBEDTLS_X509_REMOVE_INFO
      char buf[128];
-@@ -1034,8 +1038,10 @@ static CURLcode mbed_connect_step1(struct Curl_cfilter *cf,
+@@ -591,6 +603,18 @@ static CURLcode mbed_load_clicert(struct Curl_cfilter *cf,
+ 
+   mbedtls_x509_crt_init(&backend->clicert);
+ 
++#ifdef TILEFINCH_CURL_NO_CLIENT_CERT
++  /* Tilefinch never configures a client certificate. */
++  (void)ret;
++  (void)errorbuf;
++#ifdef MBEDTLS_PEM_PARSE_C
++  (void)ssl_cert_type;
++#endif
++  if(ssl_cert || ssl_cert_blob) {
++    failf(data, "mbedTLS: client certificates not built in");
++    return CURLE_NOT_BUILT_IN;
++  }
++#else /* !TILEFINCH_CURL_NO_CLIENT_CERT */
+   if(ssl_cert) {
+ #ifdef MBEDTLS_FS_IO
+     ret = mbedtls_x509_crt_parse_file(&backend->clicert, ssl_cert);
+@@ -649,6 +673,7 @@ static CURLcode mbed_load_clicert(struct Curl_cfilter *cf,
+       return CURLE_SSL_CERTPROBLEM;
+     }
+   }
++#endif /* TILEFINCH_CURL_NO_CLIENT_CERT */
+ 
+   return CURLE_OK;
+ }
+@@ -665,6 +690,15 @@ static CURLcode mbed_load_privkey(struct Curl_cfilter *cf,
+ 
+   mbedtls_pk_init(&backend->pk);
+ 
++#ifdef TILEFINCH_CURL_NO_CLIENT_CERT
++  /* Tilefinch never configures a client private key. */
++  (void)ret;
++  (void)errorbuf;
++  if(ssl_config->primary.key || ssl_config->primary.key_blob) {
++    failf(data, "mbedTLS: client private keys not built in");
++    return CURLE_NOT_BUILT_IN;
++  }
++#else /* !TILEFINCH_CURL_NO_CLIENT_CERT */
+   if(ssl_config->primary.key || ssl_config->primary.key_blob) {
+     if(ssl_config->primary.key) {
+ #ifdef MBEDTLS_FS_IO
+@@ -743,6 +777,7 @@ static CURLcode mbed_load_privkey(struct Curl_cfilter *cf,
+       }
+     }
+   }
++#endif /* TILEFINCH_CURL_NO_CLIENT_CERT */
+ 
+   return CURLE_OK;
+ }
+@@ -904,6 +939,16 @@ static CURLcode mbed_configure_ssl(struct Curl_cfilter *cf,
+                       mbedtls_bio_cf_read,
+                       NULL /*  rev_timeout() */);
+ 
++#ifdef TILEFINCH_CURL_NO_CIPHER_LIST
++  /* Tilefinch never sets a cipher list: offer Mbed TLS's full default
++     list, exactly as the else branch below does. */
++  if(conn_config->cipher_list || conn_config->cipher_list13) {
++    failf(data, "mbedTLS: cipher lists not built in");
++    return CURLE_NOT_BUILT_IN;
++  }
++  mbedtls_ssl_conf_ciphersuites(&backend->config,
++                                mbedtls_ssl_list_ciphersuites());
++#else /* !TILEFINCH_CURL_NO_CIPHER_LIST */
+ #ifndef MBEDTLS_SSL_PROTO_TLS1_3
+   if(conn_config->cipher_list) {
+     result = mbed_set_selected_ciphers(data, backend,
+@@ -923,6 +968,7 @@ static CURLcode mbed_configure_ssl(struct Curl_cfilter *cf,
+     mbedtls_ssl_conf_ciphersuites(&backend->config,
+                                   mbedtls_ssl_list_ciphersuites());
+   }
++#endif /* TILEFINCH_CURL_NO_CIPHER_LIST */
+ 
+ #ifdef MBEDTLS_SSL_RENEGOTIATION
+   mbedtls_ssl_conf_renegotiation(&backend->config,
+@@ -983,10 +1029,12 @@ static CURLcode mbed_configure_ssl(struct Curl_cfilter *cf,
+ #endif
+     );
+ 
++#ifndef TILEFINCH_CURL_NO_CLIENT_CERT
+   if(ssl_config->primary.key || ssl_config->primary.key_blob) {
+     mbedtls_ssl_conf_own_cert(&backend->config, &backend->clicert,
+                               &backend->pk);
+   }
++#endif
+ 
+   if(mbedtls_ssl_set_hostname(&backend->ssl, connssl->peer.sni ?
+                               connssl->peer.sni :
+@@ -1034,8 +1082,10 @@ static CURLcode mbed_connect_step1(struct Curl_cfilter *cf,
  {
    struct ssl_connect_data *connssl = cf->ctx;
    struct ssl_primary_config *conn_config = Curl_ssl_cf_get_primary_config(cf);
@@ -38,3 +169,58 @@ index 6245cc26a..87a0a5af2 100644
    if((conn_config->version == CURL_SSLVERSION_SSLv2) ||
       (conn_config->version == CURL_SSLVERSION_SSLv3)) {
      failf(data, "Not supported SSL version");
+@@ -1109,6 +1159,7 @@ static CURLcode mbed_connect_step2(struct Curl_cfilter *cf,
+     return CURLE_SSL_CONNECT_ERROR;
+   }
+ 
++#ifdef CURLVERBOSE
+   {
+     char cipher_str[64];
+     uint16_t cipher_id;
+@@ -1118,6 +1169,7 @@ static CURLcode mbed_connect_step2(struct Curl_cfilter *cf,
+     infof(data, "mbedTLS: %s Handshake complete, cipher is %s",
+           mbedtls_ssl_get_version(&backend->ssl), cipher_str);
+   }
++#endif
+ 
+ #ifdef HAVE_PINNED_PUBKEY
+   if(pinnedpubkey) {
+diff --git a/lib/strerror.c b/lib/strerror.c
+--- a/lib/strerror.c
++++ b/lib/strerror.c
+@@ -33,7 +33,7 @@
+ 
+ const char *curl_easy_strerror(CURLcode error)
+ {
+-#ifdef CURLVERBOSE
++#if defined(CURLVERBOSE) || defined(TILEFINCH_CURL_KEEP_STRERROR)
+   switch(error) {
+   case CURLE_OK:
+     return "No error";
+@@ -325,7 +325,7 @@
+ 
+ const char *curl_multi_strerror(CURLMcode error)
+ {
+-#ifdef CURLVERBOSE
++#if defined(CURLVERBOSE) || defined(TILEFINCH_CURL_KEEP_STRERROR)
+   switch(error) {
+   case CURLM_CALL_MULTI_PERFORM:
+     return "Please call curl_multi_perform() soon";
+@@ -384,7 +384,7 @@
+ 
+ const char *curl_share_strerror(CURLSHcode error)
+ {
+-#ifdef CURLVERBOSE
++#if defined(CURLVERBOSE) || defined(TILEFINCH_CURL_KEEP_STRERROR)
+   switch(error) {
+   case CURLSHE_OK:
+     return "No error";
+@@ -419,7 +419,7 @@
+ 
+ const char *curl_url_strerror(CURLUcode error)
+ {
+-#ifdef CURLVERBOSE
++#if defined(CURLVERBOSE) || defined(TILEFINCH_CURL_KEEP_STRERROR)
+   switch(error) {
+   case CURLUE_OK:
+     return "No error";

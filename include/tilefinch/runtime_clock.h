@@ -47,4 +47,19 @@ static inline unsigned tilefinch_runtime_clock_step(
     return elapsed_us / 1000u;
 }
 
+/* Predict the short wait needed for a virtual-clock frame timer, without
+   consuming elapsed time. Refuse deadlines beyond one admitted tick: this
+   is not permission to catch up timers or spin through long delays. */
+static inline bool tilefinch_runtime_clock_frame_wait(
+    const TilefinchRuntimeClock *clock, uint64_t now_us, unsigned tick_ms,
+    unsigned required_ms, uint32_t *wait_us)
+{
+    if (clock == 0 || wait_us == 0 || required_ms > tick_ms) return false;
+    TilefinchRuntimeClock projected = *clock;
+    unsigned step_ms = tilefinch_runtime_clock_step(&projected, now_us, tick_ms);
+    if (step_ms >= required_ms) *wait_us = 0;
+    else *wait_us = (required_ms - step_ms) * 1000u - projected.carry_us;
+    return true;
+}
+
 #endif

@@ -1362,6 +1362,78 @@ static inline uint32_t raster_mix_color(
     return (fr << 16) | (fg << 8) | fb;
 }
 
+/* ceil(2^32 / d): for a dividend below 2^16, (n * R[d]) >> 32 is n / d
+   (the error stays below 1/d), so the alpha compositing below divides with
+   one multiply instead of a hardware divide. R[1] is never used with a
+   nonzero dividend: an output alpha of 1 comes only from a zero source
+   alpha over a zero destination. */
+static const uint32_t blend_reciprocals[256] = {
+    UINT32_C(0x00000000), UINT32_C(0xffffffff), UINT32_C(0x80000000), UINT32_C(0x55555556),
+    UINT32_C(0x40000000), UINT32_C(0x33333334), UINT32_C(0x2aaaaaab), UINT32_C(0x24924925),
+    UINT32_C(0x20000000), UINT32_C(0x1c71c71d), UINT32_C(0x1999999a), UINT32_C(0x1745d175),
+    UINT32_C(0x15555556), UINT32_C(0x13b13b14), UINT32_C(0x12492493), UINT32_C(0x11111112),
+    UINT32_C(0x10000000), UINT32_C(0x0f0f0f10), UINT32_C(0x0e38e38f), UINT32_C(0x0d79435f),
+    UINT32_C(0x0ccccccd), UINT32_C(0x0c30c30d), UINT32_C(0x0ba2e8bb), UINT32_C(0x0b21642d),
+    UINT32_C(0x0aaaaaab), UINT32_C(0x0a3d70a4), UINT32_C(0x09d89d8a), UINT32_C(0x097b425f),
+    UINT32_C(0x0924924a), UINT32_C(0x08d3dcb1), UINT32_C(0x08888889), UINT32_C(0x08421085),
+    UINT32_C(0x08000000), UINT32_C(0x07c1f07d), UINT32_C(0x07878788), UINT32_C(0x07507508),
+    UINT32_C(0x071c71c8), UINT32_C(0x06eb3e46), UINT32_C(0x06bca1b0), UINT32_C(0x06906907),
+    UINT32_C(0x06666667), UINT32_C(0x063e7064), UINT32_C(0x06186187), UINT32_C(0x05f417d1),
+    UINT32_C(0x05d1745e), UINT32_C(0x05b05b06), UINT32_C(0x0590b217), UINT32_C(0x0572620b),
+    UINT32_C(0x05555556), UINT32_C(0x0539782a), UINT32_C(0x051eb852), UINT32_C(0x05050506),
+    UINT32_C(0x04ec4ec5), UINT32_C(0x04d4873f), UINT32_C(0x04bda130), UINT32_C(0x04a7904b),
+    UINT32_C(0x04924925), UINT32_C(0x047dc120), UINT32_C(0x0469ee59), UINT32_C(0x0456c798),
+    UINT32_C(0x04444445), UINT32_C(0x04325c54), UINT32_C(0x04210843), UINT32_C(0x04104105),
+    UINT32_C(0x04000000), UINT32_C(0x03f03f04), UINT32_C(0x03e0f83f), UINT32_C(0x03d22636),
+    UINT32_C(0x03c3c3c4), UINT32_C(0x03b5cc0f), UINT32_C(0x03a83a84), UINT32_C(0x039b0ad2),
+    UINT32_C(0x038e38e4), UINT32_C(0x0381c0e1), UINT32_C(0x03759f23), UINT32_C(0x0369d037),
+    UINT32_C(0x035e50d8), UINT32_C(0x03531ded), UINT32_C(0x03483484), UINT32_C(0x033d91d3),
+    UINT32_C(0x03333334), UINT32_C(0x03291620), UINT32_C(0x031f3832), UINT32_C(0x03159722),
+    UINT32_C(0x030c30c4), UINT32_C(0x03030304), UINT32_C(0x02fa0be9), UINT32_C(0x02f14991),
+    UINT32_C(0x02e8ba2f), UINT32_C(0x02e05c0c), UINT32_C(0x02d82d83), UINT32_C(0x02d02d03),
+    UINT32_C(0x02c8590c), UINT32_C(0x02c0b02d), UINT32_C(0x02b93106), UINT32_C(0x02b1da47),
+    UINT32_C(0x02aaaaab), UINT32_C(0x02a3a0fe), UINT32_C(0x029cbc15), UINT32_C(0x0295fad5),
+    UINT32_C(0x028f5c29), UINT32_C(0x0288df0d), UINT32_C(0x02828283), UINT32_C(0x027c4598),
+    UINT32_C(0x02762763), UINT32_C(0x02702703), UINT32_C(0x026a43a0), UINT32_C(0x02647c6a),
+    UINT32_C(0x025ed098), UINT32_C(0x02593f6a), UINT32_C(0x0253c826), UINT32_C(0x024e6a18),
+    UINT32_C(0x02492493), UINT32_C(0x0243f6f1), UINT32_C(0x023ee090), UINT32_C(0x0239e0d6),
+    UINT32_C(0x0234f72d), UINT32_C(0x02302303), UINT32_C(0x022b63cc), UINT32_C(0x0226b903),
+    UINT32_C(0x02222223), UINT32_C(0x021d9eae), UINT32_C(0x02192e2a), UINT32_C(0x0214d022),
+    UINT32_C(0x02108422), UINT32_C(0x020c49bb), UINT32_C(0x02082083), UINT32_C(0x02040811),
+    UINT32_C(0x02000000), UINT32_C(0x01fc07f1), UINT32_C(0x01f81f82), UINT32_C(0x01f4465a),
+    UINT32_C(0x01f07c20), UINT32_C(0x01ecc07c), UINT32_C(0x01e9131b), UINT32_C(0x01e573ad),
+    UINT32_C(0x01e1e1e2), UINT32_C(0x01de5d6f), UINT32_C(0x01dae608), UINT32_C(0x01d77b66),
+    UINT32_C(0x01d41d42), UINT32_C(0x01d0cb59), UINT32_C(0x01cd8569), UINT32_C(0x01ca4b31),
+    UINT32_C(0x01c71c72), UINT32_C(0x01c3f8f1), UINT32_C(0x01c0e071), UINT32_C(0x01bdd2b9),
+    UINT32_C(0x01bacf92), UINT32_C(0x01b7d6c4), UINT32_C(0x01b4e81c), UINT32_C(0x01b20365),
+    UINT32_C(0x01af286c), UINT32_C(0x01ac5702), UINT32_C(0x01a98ef7), UINT32_C(0x01a6d01b),
+    UINT32_C(0x01a41a42), UINT32_C(0x01a16d40), UINT32_C(0x019ec8ea), UINT32_C(0x019c2d15),
+    UINT32_C(0x0199999a), UINT32_C(0x01970e50), UINT32_C(0x01948b10), UINT32_C(0x01920fb5),
+    UINT32_C(0x018f9c19), UINT32_C(0x018d3019), UINT32_C(0x018acb91), UINT32_C(0x01886e60),
+    UINT32_C(0x01861862), UINT32_C(0x0183c978), UINT32_C(0x01818182), UINT32_C(0x017f4060),
+    UINT32_C(0x017d05f5), UINT32_C(0x017ad221), UINT32_C(0x0178a4c9), UINT32_C(0x01767dcf),
+    UINT32_C(0x01745d18), UINT32_C(0x01724288), UINT32_C(0x01702e06), UINT32_C(0x016e1f77),
+    UINT32_C(0x016c16c2), UINT32_C(0x016a13ce), UINT32_C(0x01681682), UINT32_C(0x01661ec7),
+    UINT32_C(0x01642c86), UINT32_C(0x01623fa8), UINT32_C(0x01605817), UINT32_C(0x015e75bc),
+    UINT32_C(0x015c9883), UINT32_C(0x015ac057), UINT32_C(0x0158ed24), UINT32_C(0x01571ed4),
+    UINT32_C(0x01555556), UINT32_C(0x01539095), UINT32_C(0x0151d07f), UINT32_C(0x01501502),
+    UINT32_C(0x014e5e0b), UINT32_C(0x014cab89), UINT32_C(0x014afd6b), UINT32_C(0x0149539f),
+    UINT32_C(0x0147ae15), UINT32_C(0x01460cbd), UINT32_C(0x01446f87), UINT32_C(0x0142d663),
+    UINT32_C(0x01414142), UINT32_C(0x013fb014), UINT32_C(0x013e22cc), UINT32_C(0x013c995b),
+    UINT32_C(0x013b13b2), UINT32_C(0x013991c3), UINT32_C(0x01381382), UINT32_C(0x013698e0),
+    UINT32_C(0x013521d0), UINT32_C(0x0133ae46), UINT32_C(0x01323e35), UINT32_C(0x0130d191),
+    UINT32_C(0x012f684c), UINT32_C(0x012e025d), UINT32_C(0x012c9fb5), UINT32_C(0x012b404b),
+    UINT32_C(0x0129e413), UINT32_C(0x01288b02), UINT32_C(0x0127350c), UINT32_C(0x0125e228),
+    UINT32_C(0x0124924a), UINT32_C(0x01234568), UINT32_C(0x0121fb79), UINT32_C(0x0120b471),
+    UINT32_C(0x011f7048), UINT32_C(0x011e2ef4), UINT32_C(0x011cf06b), UINT32_C(0x011bb4a5),
+    UINT32_C(0x011a7b97), UINT32_C(0x01194539), UINT32_C(0x01181182), UINT32_C(0x0116e069),
+    UINT32_C(0x0115b1e6), UINT32_C(0x011485f1), UINT32_C(0x01135c82), UINT32_C(0x0112358f),
+    UINT32_C(0x01111112), UINT32_C(0x010fef02), UINT32_C(0x010ecf57), UINT32_C(0x010db20b),
+    UINT32_C(0x010c9715), UINT32_C(0x010b7e6f), UINT32_C(0x010a6811), UINT32_C(0x010953f4),
+    UINT32_C(0x01084211), UINT32_C(0x01073261), UINT32_C(0x010624de), UINT32_C(0x01051980),
+    UINT32_C(0x01041042), UINT32_C(0x0103091c), UINT32_C(0x01020409), UINT32_C(0x01010102),
+};
+
 /* Blend one already-resolved pixel.  Shared by the per-pixel path and the
    span loops below so the blend math has a single definition. */
 static inline void blend_at_index(RasterTarget *target, size_t index,
@@ -1371,23 +1443,32 @@ static inline void blend_at_index(RasterTarget *target, size_t index,
     foreground = raster_mix_color(
         target->pixels[index], foreground, target->blend_mode);
     if (target->alpha != NULL) {
-        if (alpha == 255u) {
+        unsigned destination_alpha = target->alpha[index];
+        /* Over a transparent pixel the source is stored as it is, with its
+           own alpha; an opaque source replaces whatever was there. */
+        if (alpha == 255u || destination_alpha == 0u) {
             target->pixels[index] = rgb565(foreground);
-            target->alpha[index] = 255u;
+            target->alpha[index] = (uint8_t) alpha;
             return;
         }
-        unsigned destination_alpha = target->alpha[index];
-        unsigned output_alpha = alpha
-            + (destination_alpha * (255u - alpha) + 127u) / 255u;
         uint16_t destination = target->pixels[index];
-        if (destination_alpha == 0) {
-            target->pixels[index] = rgb565(foreground);
-        } else {
-            unsigned effective = output_alpha == 0 ? 0
-                : alpha * 255u / output_alpha;
+        /* (255 * (255 - a) + 127) / 255 is 255 - a: an opaque destination
+           stays opaque and takes the ordinary blend at the source alpha. */
+        if (destination_alpha == 255u) {
             target->pixels[index] = blend_rgb565(
-                destination, foreground, effective);
+                destination, foreground, alpha);
+            return;
         }
+        /* The dividend is at most 254 * 255 + 127, inside the exact range
+           of the shift form (a -Os build emits a hardware divide for the
+           constant on the Allegrex). The output alpha is at least the
+           destination's, so never zero here. */
+        unsigned output_alpha = alpha + tilefinch_div255_u16(
+            destination_alpha * (255u - alpha) + 127u);
+        unsigned effective = (unsigned) (((uint64_t) (alpha * 255u)
+            * blend_reciprocals[output_alpha]) >> 32);
+        target->pixels[index] = blend_rgb565(
+            destination, foreground, effective);
         target->alpha[index] = (uint8_t) output_alpha;
         return;
     }
@@ -1410,6 +1491,66 @@ static inline void blend_surface_at_index(
     foreground = raster_target_color(target, foreground);
     target->pixels[index] = rgb565_surface(foreground);
     if (target->alpha != NULL) target->alpha[index] = 255u;
+}
+
+/* The fully covered interior of a fill on one row: count pixels from
+   index, all at the same source alpha. An opaque surface is one colour,
+   converted once. A translucent fill into a retained layer with its own
+   alpha (the canvas overlay, the fixed layer) memoizes blend_at_index,
+   which for one command (one colour, filter and blend mode) is a pure
+   function of the destination pixel, its alpha and the source alpha: a
+   panel background over its own dithered glow meets a handful of
+   destinations, repeating every four pixels, so the memo slot is the
+   position and almost every pixel replays a stored result instead of
+   the divisions. Exact by construction; with memo NULL every pixel takes
+   the reference blend. */
+enum { BLEND_MEMO_SLOTS = 8 };
+
+typedef struct {
+    uint32_t keys[BLEND_MEMO_SLOTS];
+    uint16_t pixels[BLEND_MEMO_SLOTS];
+    uint8_t alphas[BLEND_MEMO_SLOTS];
+} BlendMemo;
+
+static void blend_memo_reset(BlendMemo *memo)
+{
+    memset(memo->keys, 0xff, sizeof(memo->keys));
+}
+
+__attribute__((noinline))
+static void fill_interior_span(RasterTarget *target, size_t index, int count,
+                               uint32_t color, unsigned alpha,
+                               BlendMemo *memo)
+{
+    uint16_t *pixels = target->pixels + index;
+    uint8_t *coverage = target->alpha == NULL ? NULL : target->alpha + index;
+    if (alpha == 255u && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL) {
+        uint16_t surface = rgb565_surface(raster_target_color(target, color));
+        for (int at = 0; at < count; at++) pixels[at] = surface;
+        if (coverage != NULL) memset(coverage, 255, (size_t) count);
+        return;
+    }
+    if (memo == NULL || coverage == NULL || alpha == 255u) {
+        for (int at = 0; at < count; at++)
+            blend_surface_at_index(target, index + (size_t) at, color, alpha);
+        return;
+    }
+    /* A source alpha below 255 keeps every key below the empty marker. */
+    uint32_t source = (uint32_t) alpha << 24;
+    for (int at = 0; at < count; at++) {
+        uint32_t key = pixels[at] | ((uint32_t) coverage[at] << 16) | source;
+        unsigned slot = (unsigned) (index + (size_t) at)
+            & (BLEND_MEMO_SLOTS - 1u);
+        if (memo->keys[slot] == key) {
+            pixels[at] = memo->pixels[slot];
+            coverage[at] = memo->alphas[slot];
+            continue;
+        }
+        blend_at_index(target, index + (size_t) at, color, alpha);
+        memo->keys[slot] = key;
+        memo->pixels[slot] = pixels[at];
+        memo->alphas[slot] = coverage[at];
+    }
 }
 
 static void blend_pixel(RasterTarget *target, int world_x, int world_y,

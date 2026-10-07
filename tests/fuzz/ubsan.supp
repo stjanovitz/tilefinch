@@ -1,0 +1,6 @@
+# UBSan reports in third-party code that are known and accepted, so that
+# run.sh can make every other report fatal (halt_on_error=1).
+# libwebp's DSP transforms rely on wrapping int multiplies (upstream).
+signed-integer-overflow:src/dsp/dec.c
+# QuickJS calls allocator hooks through a mismatched function pointer type.
+function:third_party/quickjs/cutils.c

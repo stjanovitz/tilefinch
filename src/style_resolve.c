@@ -58,6 +58,16 @@ static bool presentational_nonnegative_pixels(lxb_dom_node_t *node,
 static bool style_element_name_is(const char *name, size_t length,
                                   const char *wanted);
 
+static bool style_input_is_push_button(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *type = document_attribute(node, "type", &length);
+    return type != NULL
+        && ((length == 6 && strncasecmp(type, "submit", 6) == 0)
+            || (length == 6 && strncasecmp(type, "button", 6) == 0)
+            || (length == 5 && strncasecmp(type, "reset", 5) == 0));
+}
+
 static bool style_input_has_special_appearance(lxb_dom_node_t *node)
 {
     size_t length = 0;
@@ -289,10 +299,11 @@ static bool style_static_staged_content_reveals(
 static bool retained_modern_value(const Stylesheet *sheet,
                                   lxb_dom_node_t *node,
                                   const char *name,
-                                  char output[96])
+                                  char output[STYLE_RETAINED_VALUE_CAPACITY])
 {
     return style_retained_property_value(
-        sheet, node, name, strlen(name), output, 96);
+        sheet, node, name, strlen(name), output,
+        STYLE_RETAINED_VALUE_CAPACITY);
 }
 
 static bool modern_keyword(const char *value, const char *keyword)
@@ -435,7 +446,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
     if (sheet == NULL || node == NULL || style == NULL
         || sheet->modern_property_mask == 0) return;
     uint32_t mask = sheet->modern_property_mask;
-    char value[96];
+    char value[STYLE_RETAINED_VALUE_CAPACITY];
     bool paint_dirty = false;
     StylePaintStack paint = {0};
     if ((mask & (STYLE_MODERN_MIX_BLEND
@@ -1011,13 +1022,18 @@ static bool style_element_is_ua_block(const char *name, size_t length)
                 || style_element_name_is(name, length, "ul")
                 || style_element_name_is(name, length, "ol")
                 || style_element_name_is(name, length, "li")
-                || style_element_name_is(name, length, "hr");
+                || style_element_name_is(name, length, "hr")
+                || style_element_name_is(name, length, "dl")
+                || style_element_name_is(name, length, "dt")
+                || style_element_name_is(name, length, "dd");
         case 3:
             return style_element_name_is(name, length, "nav")
                 || style_element_name_is(name, length, "div")
-                || style_element_name_is(name, length, "pre");
+                || style_element_name_is(name, length, "pre")
+                || style_element_name_is(name, length, "dir");
         case 4:
-            return style_element_name_is(name, length, "html")
+            return style_element_name_is(name, length, "menu")
+                || style_element_name_is(name, length, "html")
                 || style_element_name_is(name, length, "body")
                 || style_element_name_is(name, length, "main")
                 || style_element_name_is(name, length, "form");
@@ -1031,13 +1047,15 @@ static bool style_element_is_ua_block(const char *name, size_t length)
                 || style_element_name_is(name, length, "center");
         case 7:
             return style_element_name_is(name, length, "section")
+                || style_element_name_is(name, length, "address")
                 || style_element_name_is(name, length, "article")
                 || style_element_name_is(name, length, "details")
                 || style_element_name_is(name, length, "summary");
         case 8:
             return style_element_name_is(name, length, "fieldset");
         case 10:
-            return style_element_name_is(name, length, "figcaption");
+            return style_element_name_is(name, length, "figcaption")
+                || style_element_name_is(name, length, "blockquote");
         default:
             return false;
     }
@@ -1061,6 +1079,31 @@ static void inherit_text_shadow(const Stylesheet *sheet,
         == STYLE_PAINT_INTERN_RETAINED) {
         computed_style_set_paint_stack_id(style, id);
     }
+}
+
+static bool style_element_is_ua_list(const char *name, size_t length)
+{
+    return style_element_name_is(name, length, "ul")
+        || style_element_name_is(name, length, "ol")
+        || style_element_name_is(name, length, "menu")
+        || style_element_name_is(name, length, "dir")
+        || style_element_name_is(name, length, "dl");
+}
+
+/* HTML's UA sheet drops the block margins of a list nested anywhere inside
+   another list (":is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul)"). */
+static bool style_ua_list_is_nested(lxb_dom_node_t *node)
+{
+    unsigned depth = 0;
+    for (lxb_dom_node_t *ancestor = node == NULL ? NULL : node->parent;
+         ancestor != NULL && depth < 256u;
+         ancestor = ancestor->parent, depth++) {
+        if (ancestor->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        size_t length = 0;
+        const char *name = document_element_name(ancestor, &length);
+        if (style_element_is_ua_list(name, length)) return true;
+    }
+    return false;
 }
 
 static ComputedStyle default_style(const Stylesheet *sheet,
@@ -1127,7 +1170,9 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         }
         style.word_spacing = parent->word_spacing;
         style.letter_spacing = parent->letter_spacing;
-        style.line_height = parent->line_height;
+        style.line_height = parent->line_height_factor != 0
+            ? -(int) parent->line_height_factor : parent->line_height;
+        style.line_height_factor = parent->line_height_factor;
         style.text_indent = parent->text_indent;
         style.text_align = parent->text_align;
         style.white_space_mode = parent->white_space_mode;
@@ -1263,6 +1308,11 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         style.display = DISPLAY_TABLE_CELL;
         if (parent != NULL) style.vertical_align = parent->vertical_align;
     }
+    if (NODE_TAG_IS("slot")) {
+        /* HTML's UA sheet: a slot generates no box; its assigned nodes (or
+           fallback content) take its place in the flat tree. */
+        style.display = DISPLAY_CONTENTS;
+    }
     if (NODE_TAG_IS("button")) {
         /* Replaced form controls are atomic inline-level boxes in the UA
            display sheet.  Treating them as ordinary inline containers lets
@@ -1317,7 +1367,9 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     if (NODE_TAG_IS("script") || NODE_TAG_IS("style")
         || NODE_TAG_IS("head") || NODE_TAG_IS("meta")
         || NODE_TAG_IS("link") || NODE_TAG_IS("title")
-        || NODE_TAG_IS("source") || NODE_TAG_IS("noscript")) {
+        || NODE_TAG_IS("source")
+        || (NODE_TAG_IS("noscript")
+            && (sheet == NULL || !sheet->noscript_rendered))) {
         style.display = DISPLAY_NONE;
     }
     /* The HTML UA sheet gives body an 8px margin, not padding.  Keeping the
@@ -1337,8 +1389,19 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         }
         style.has_background = true;
         style.background = 0xffffff;
+        /* Chromium's UA sheet gives controls `font: -webkit-small-control`:
+           13.333px with a normal line-height rather than the page's;
+           `font: inherit` (Bootstrap and most resets) restores both. */
+        style.font_size = style_font_size_from_fixed(
+            853, &style.font_size_fraction);
+        style.font_scale = 2;
+        style.line_height = 0;
+        style.line_height_factor = 0;
     }
-    if (NODE_TAG_IS("button")) {
+    if (NODE_TAG_IS("button")
+        || (NODE_TAG_IS("input") && style_input_is_push_button(node))) {
+        /* input[type=submit|button|reset] shares the button face and its
+           1px 6px padding (HTML 15.5.x, Chromium's UA sheet). */
         style.background = 0xefefef;
         style.padding.left = 6;
         style.padding.right = 6;
@@ -1347,6 +1410,9 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         /* Reserve the native menulist affordance without changing authored
            padding once the author cascade runs. */
         style.padding.right = 20;
+        /* A menulist is an atomic inline-block (Chromium's UA sheet), which
+           is also the layout path that paints its drop-down affordance. */
+        style.display = DISPLAY_INLINE_BLOCK;
     }
     if (NODE_TAG_IS("input") && style_input_has_special_appearance(node)) {
         /* Toggle/range appearance paints its own shell. Generic text-field
@@ -1375,6 +1441,30 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     }
     if (NODE_TAG_IS("li")) {
         style.margin = (StyleEdges) {0, 0, 0, 0};
+    }
+    /* HTML 15.3.7/15.3.8: lists get one em of block spacing (none when
+       nested in another list) and a 40px inline-start padding, so outside
+       markers hang in the padding beside the text. dd, blockquote and
+       figure indent by a 40px margin. Sentinels let author margins win and
+       resolve against the element's final font size. */
+    bool ua_rtl = (style.filter_code & STYLE_DIRECTION_RTL) != 0;
+    if (style_element_is_ua_list(node_name, node_name_length)) {
+        if (!style_ua_list_is_nested(node)) {
+            style.margin.top = STYLE_LENGTH_NONE;
+            style.margin.bottom = STYLE_LENGTH_NONE;
+        }
+        if (!NODE_TAG_IS("dl")) {
+            if (ua_rtl) style.padding.right = 40;
+            else style.padding.left = 40;
+        }
+    } else if (NODE_TAG_IS("dd")) {
+        if (ua_rtl) style.margin.right = 40;
+        else style.margin.left = 40;
+    } else if (NODE_TAG_IS("blockquote") || NODE_TAG_IS("figure")) {
+        style.margin = (StyleEdges) {
+            .top = STYLE_LENGTH_NONE, .right = 40,
+            .bottom = STYLE_LENGTH_NONE, .left = 40
+        };
     }
     /* UA spacing for paragraphs and headings is block-axis spacing.  Inline
        margins here would indent the element even when the author has made a
@@ -1537,6 +1627,92 @@ static StyleTokenBloom style_match_ancestor_bloom(
     return bloom;
 }
 
+/* The bits of the sheet's exact ancestor tokens that `subject` carries. */
+static uint64_t style_subject_ancestor_token_bits(
+    const struct StyleRuleAncestorTokens *tokens,
+    const StyleMatchSubject *subject)
+{
+    uint64_t bits = 0;
+    if (subject->id != NULL) {
+        unsigned found = style_rule_ancestor_token_find(
+            tokens, style_token_hash(STYLE_SELECTOR_ID, subject->id,
+                                     subject->id_length));
+        if (found != 0)
+            bits |= UINT64_C(1) << (style_rule_ancestor_token_bit(found) - 1u);
+    }
+    size_t at = 0;
+    while (subject->classes != NULL && at < subject->classes_length) {
+        while (at < subject->classes_length
+               && isspace((unsigned char) subject->classes[at])) at++;
+        size_t begin = at;
+        while (at < subject->classes_length
+               && !isspace((unsigned char) subject->classes[at])) at++;
+        if (at == begin) continue;
+        unsigned found = style_rule_ancestor_token_find(
+            tokens, style_token_hash(STYLE_SELECTOR_CLASS,
+                                     subject->classes + begin, at - begin));
+        if (found != 0)
+            bits |= UINT64_C(1) << (style_rule_ancestor_token_bit(found) - 1u);
+    }
+    return bits;
+}
+
+/* Which of the sheet's exact ancestor tokens some ancestor of `node`
+   carries; every bit past the walk bound (the matchers' own descendant
+   walks are bounded no tighter, and a truncated answer must fail open).
+   Cached per ancestor chain like the Bloom above, inside a build scope. */
+static uint64_t style_ancestor_token_mask(const Stylesheet *sheet,
+                                          const lxb_dom_node_t *node)
+{
+    const struct StyleRuleAncestorTokens *tokens = sheet->rule_ancestor_tokens;
+    lxb_dom_node_t *at = node->parent;
+    lxb_dom_node_t *first = at;
+    StyleAncestorBloomCache *cache = sheet->resolve_scratch == NULL
+        ? NULL : sheet->resolve_scratch->ancestor_bloom_cache;
+    uint64_t mask = 0;
+    size_t visits = 0;
+    for (; at != NULL && visits < 64u; at = at->parent, visits++) {
+        if (cache != NULL) {
+            size_t slot = style_ancestor_cache_slot(at);
+            if (cache->token_entries[slot].node == at
+                && cache->token_entries[slot].stamp == tokens->stamp) {
+                mask |= cache->token_entries[slot].mask;
+                at = NULL;
+                break;
+            }
+        }
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        StyleMatchSubject ancestor = {0};
+        style_match_subject_prepare(at, &ancestor);
+        mask |= style_subject_ancestor_token_bits(tokens, &ancestor);
+    }
+    if (at != NULL) mask = UINT64_MAX;
+    if (cache != NULL && first != NULL) {
+        size_t slot = style_ancestor_cache_slot(first);
+        cache->token_entries[slot].node = first;
+        cache->token_entries[slot].mask = mask;
+        cache->token_entries[slot].stamp = tokens->stamp;
+    }
+    return mask;
+}
+
+/* False when `candidate` names an exact ancestor token no ancestor of
+   `node` carries; `mask` is computed on first need. */
+static bool style_candidate_ancestor_token_possible(
+    const Stylesheet *sheet, uint32_t candidate, lxb_dom_node_t *node,
+    uint64_t *mask, bool *ready)
+{
+    if (sheet->rule_ancestor_tokens == NULL || sheet->rule_filters == NULL)
+        return true;
+    unsigned token = sheet->rule_filters[candidate].ancestor_token;
+    if (token == 0) return true;
+    if (!*ready) {
+        *mask = style_ancestor_token_mask(sheet, node);
+        *ready = true;
+    }
+    return (*mask & (UINT64_C(1) << (token - 1u))) != 0;
+}
+
 static StyleMatchSubject style_match_subject(
     const Stylesheet *sheet, lxb_dom_node_t *node)
 {
@@ -1608,16 +1784,24 @@ static bool style_rule_add_range(StyleRuleIndexPlan *plan, uint32_t begin,
     return true;
 }
 
+/* A bucket's candidates: its unscoped rules, and its shadow-scoped ones
+   (a separately sorted range) unless the subject is outside every
+   adopting carrier. */
 static bool style_rule_add_key_source(const Stylesheet *sheet,
                                       StyleRuleIndexPlan *plan,
                                       SelectorType type, const char *text,
-                                      size_t length, PseudoElement pseudo)
+                                      size_t length, PseudoElement pseudo,
+                                      bool outside_scopes)
 {
     if (text == NULL || length == 0) return true;
     StyleRuleIndexBucket *bucket = style_rule_find_bucket(
         sheet, type, text, length, false, pseudo);
-    return bucket == NULL || style_rule_add_range(
-        plan, bucket->first, bucket->first + bucket->count);
+    if (bucket == NULL) return true;
+    if (!style_rule_add_range(plan, bucket->first,
+                              bucket->first + bucket->unscoped)) return false;
+    return outside_scopes || style_rule_add_range(
+        plan, bucket->first + bucket->unscoped,
+        bucket->first + bucket->count);
 }
 
 static StyleMatchedRangeCacheEntry *style_matched_range_slot(
@@ -1676,7 +1860,8 @@ bool style_pseudo_known_absent(const Stylesheet *sheet,
    into `list`; false when they do not fit. */
 static bool style_rule_gather_class_candidates(
     const Stylesheet *sheet, const StyleMatchSubject *subject,
-    PseudoElement pseudo, uint32_t *list, size_t capacity, size_t *count)
+    PseudoElement pseudo, bool outside_scopes, uint32_t *list,
+    size_t capacity, size_t *count)
 {
     size_t used = 0;
     size_t at = 0;
@@ -1691,8 +1876,9 @@ static bool style_rule_gather_class_candidates(
             sheet, SELECTOR_CLASS, subject->classes + begin, at - begin,
             false, pseudo);
         if (bucket == NULL) continue;
-        for (uint32_t entry = bucket->first;
-             entry < bucket->first + bucket->count; entry++) {
+        uint32_t end = bucket->first
+            + (outside_scopes ? bucket->unscoped : bucket->count);
+        for (uint32_t entry = bucket->first; entry < end; entry++) {
             uint32_t index = sheet->rule_index_entries[entry];
             /* Insertion sort: a bucket is usually one rule here. */
             size_t slot = used;
@@ -1732,15 +1918,25 @@ static StyleRuleIndexPlan style_rule_index_plan(
         || (unsigned) pseudo > PSEUDO_AFTER) {
         return plan;
     }
-    if (!style_rule_add_range(
-            &plan, pseudo == PSEUDO_NONE ? 0
-                       : sheet->rule_index_universal_ends[pseudo - 1],
-            sheet->rule_index_universal_ends[pseudo])
+    /* Shadow-scoped rules are left out for an element outside every
+       adopting carrier: the matcher would refuse each of them anyway. */
+    bool outside = style_subject_outside_adopted_scopes(sheet, subject);
+    uint32_t universal_begin = pseudo == PSEUDO_NONE ? 0
+        : sheet->rule_index_universal_ends[pseudo - 1];
+    uint32_t universal_unscoped =
+        sheet->rule_index_universal_unscoped_ends[pseudo];
+    if (!style_rule_add_range(&plan, universal_begin, universal_unscoped)
+        || (!outside
+            && !style_rule_add_range(
+                   &plan, universal_unscoped,
+                   sheet->rule_index_universal_ends[pseudo]))
         || !style_rule_add_key_source(
-            sheet, &plan, SELECTOR_TAG, subject->tag, subject->tag_length, pseudo)
+            sheet, &plan, SELECTOR_TAG, subject->tag, subject->tag_length,
+            pseudo, outside)
         || !style_rule_add_key_source(
             sheet, &plan, SELECTOR_ID, subject->id,
-            subject->id_length, pseudo)) return (StyleRuleIndexPlan) {0};
+            subject->id_length, pseudo, outside))
+        return (StyleRuleIndexPlan) {0};
     size_t keyed_count = plan.count;
     size_t at = 0;
     while (subject->classes != NULL && at < subject->classes_length) {
@@ -1751,12 +1947,13 @@ static StyleRuleIndexPlan style_rule_index_plan(
                && !isspace((unsigned char) subject->classes[at])) at++;
         if (at != begin && !style_rule_add_key_source(
                 sheet, &plan, SELECTOR_CLASS, subject->classes + begin,
-                at - begin, pseudo)) {
+                at - begin, pseudo, outside)) {
             /* Too many class buckets for `ranges`: merge them all into the
                caller's list, keeping the universal/tag/id ranges. */
             size_t listed = 0;
             if (list == NULL || !style_rule_gather_class_candidates(
-                    sheet, subject, pseudo, list, list_capacity, &listed))
+                    sheet, subject, pseudo, outside, list, list_capacity,
+                    &listed))
                 return (StyleRuleIndexPlan) {0};
             plan.count = keyed_count;
             plan.list = list;
@@ -2393,7 +2590,27 @@ static void style_retained_commit(const Stylesheet *sheet,
     table->stores++;
 }
 
-static void style_apply_matching_range(const Stylesheet *sheet,
+typedef struct {
+    uint32_t rules[128];
+    uint64_t orders[128];
+    size_t count;
+    bool overflow;
+} StyleCascadeMatches;
+
+static void style_apply_or_collect(const Stylesheet *sheet,
+    const StyleRule *rule, ComputedStyle *style, const ComputedStyle *parent,
+    lxb_dom_node_t *node, StyleCascadeMatches *matches)
+{
+    if (matches == NULL) {
+        apply_style_rule(sheet, rule, style, parent);
+    } else if (matches->count < 128u) {
+        size_t at = matches->count++;
+        matches->rules[at] = (uint32_t) (rule - sheet->rules);
+        matches->orders[at] = style_adopted_cascade_order(sheet, node, rule->order);
+    } else matches->overflow = true;
+}
+
+static void style_apply_matching_ordered_range(const Stylesheet *sheet,
                                        const ComputedStyle *parent,
                                        lxb_dom_node_t *node,
                                        const StyleMatchSubject *subject,
@@ -2403,7 +2620,8 @@ static void style_apply_matching_range(const Stylesheet *sheet,
                                        ComputedStyle *style,
                                        bool trace_position,
                                        const StyleRetainedMatchEntry *retained_entry,
-                                       bool record)
+                                       bool record,
+                                       StyleCascadeMatches *collected)
 {
     if (sheet == NULL || start >= end) return;
     if (retained_entry != NULL) {
@@ -2414,7 +2632,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
             if (index < start || index >= end || index >= sheet->count) continue;
             const StyleRule *rule = &sheet->rules[index];
             if (trace_position) style_trace_position_match(sheet, rule, node);
-            apply_style_rule(sheet, rule, style, parent);
+            style_apply_or_collect(sheet, rule, style, parent, node, collected);
         }
         return;
     }
@@ -2433,7 +2651,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
             for (size_t i = 0; i < matches.count; i++) {
                 const StyleRule *rule = &sheet->rules[matches.rules[i]];
                 if (trace_position) style_trace_position_match(sheet, rule, node);
-                apply_style_rule(sheet, rule, style, parent);
+                style_apply_or_collect(sheet, rule, style, parent, node, collected);
                 if (record) style_retained_note(sheet, matches.rules[i]);
             }
             return;
@@ -2459,7 +2677,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
                 continue;
             }
             if (trace_position) style_trace_position_match(sheet, rule, node);
-            apply_style_rule(sheet, rule, style, parent);
+            style_apply_or_collect(sheet, rule, style, parent, node, collected);
             if (record) style_retained_note(sheet, i);
             if (retained != NULL) {
                 if (matches.count < STYLE_MATCHED_RANGE_RULE_LIMIT)
@@ -2490,6 +2708,8 @@ static void style_apply_matching_range(const Stylesheet *sheet,
     }
 
     uint32_t previous = STYLE_RULE_INDEX_EMPTY;
+    uint64_t ancestor_tokens = 0;
+    bool ancestor_tokens_ready = false;
     for (;;) {
         uint32_t candidate = STYLE_RULE_INDEX_EMPTY;
         for (size_t i = 0; i < source_count; i++) {
@@ -2524,10 +2744,13 @@ static void style_apply_matching_range(const Stylesheet *sheet,
 #endif
             continue;
         }
-        if (plan->ancestor_bloom_ready
-            && style_token_bloom_missing(
-                sheet->rule_filters[candidate].ancestors,
-                plan->ancestor_bloom)) {
+        if ((plan->ancestor_bloom_ready
+             && style_token_bloom_missing(
+                 sheet->rule_filters[candidate].ancestors,
+                 plan->ancestor_bloom))
+            || !style_candidate_ancestor_token_possible(
+                   sheet, candidate, node, &ancestor_tokens,
+                   &ancestor_tokens_ready)) {
 #ifndef TILEFINCH_NO_TRACE
             mutable_sheet->rule_ancestor_filter_rejections++;
 #endif
@@ -2545,7 +2768,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
             continue;
         }
         if (trace_position) style_trace_position_match(sheet, rule, node);
-        apply_style_rule(sheet, rule, style, parent);
+        style_apply_or_collect(sheet, rule, style, parent, node, collected);
         if (record) style_retained_note(sheet, candidate);
         if (retained != NULL) {
             if (matches.count < STYLE_MATCHED_RANGE_RULE_LIMIT)
@@ -2555,6 +2778,123 @@ static void style_apply_matching_range(const Stylesheet *sheet,
     }
     if (retained != NULL && !sheet->selector_cooperate_cancelled)
         *retained = matches;
+}
+
+/* Rules are stored once, globally sorted. Only roots whose list differs
+   need this path: reorder contiguous source spans inside equal-priority
+   groups, never across specificity, origin, importance or layer. The
+   existing matcher/retained lists still visit each candidate once. */
+static bool style_rules_same_priority(const StyleRule *a, const StyleRule *b)
+{
+    return a->origin == b->origin && a->important == b->important
+        && a->specificity == b->specificity
+        && (a->layer == b->layer
+            || (a->layer != UINT_MAX && b->layer != UINT_MAX
+                && (a->layer >> 8) == (b->layer >> 8)));
+}
+
+static void style_apply_matching_range(const Stylesheet *sheet,
+                                       const ComputedStyle *parent,
+                                       lxb_dom_node_t *node,
+                                       const StyleMatchSubject *subject,
+                                       const StyleRuleIndexPlan *plan,
+                                       PseudoElement pseudo,
+                                       size_t start, size_t end,
+                                       ComputedStyle *style,
+                                       bool trace_position,
+                                       const StyleRetainedMatchEntry *retained_entry,
+                                       bool record)
+{
+    if (sheet == NULL || !sheet->adopted_order_varies) {
+        style_apply_matching_ordered_range(sheet, parent, node, subject, plan,
+            pseudo, start, end, style, trace_position, retained_entry, record, NULL);
+        return;
+    }
+    StyleCascadeMatches collected = {0};
+    style_apply_matching_ordered_range(sheet, parent, node, subject, plan,
+        pseudo, start, end, style, trace_position, retained_entry, record,
+        &collected);
+    if (!collected.overflow) {
+        /* Sort only actual matches, preserving the index and retained fast
+           paths. Equal-priority matches use this root's sheet order. */
+        for (size_t i = 1; i < collected.count; i++) {
+            size_t j = i;
+            while (j != 0 && style_rules_same_priority(
+                    &sheet->rules[collected.rules[j]],
+                    &sheet->rules[collected.rules[j - 1u]])
+                && collected.orders[j] < collected.orders[j - 1u]) {
+                uint32_t rule = collected.rules[j];
+                uint64_t order = collected.orders[j];
+                collected.rules[j] = collected.rules[j - 1u];
+                collected.orders[j] = collected.orders[j - 1u];
+                collected.rules[j - 1u] = rule;
+                collected.orders[j - 1u] = order;
+                j--;
+            }
+        }
+        for (size_t i = 0; i < collected.count; i++)
+            apply_style_rule(sheet, &sheet->rules[collected.rules[i]], style, parent);
+        return;
+    }
+    /* An exceptionally dense match set uses bounded source spans instead.
+       The collection pass applied nothing and recorded each match once. */
+    record = false;
+    while (start < end) {
+        const StyleRule *first = &sheet->rules[start];
+        size_t stop = start + 1u;
+        while (stop < end) {
+            const StyleRule *next = &sheet->rules[stop];
+            if (!style_rules_same_priority(next, first)) break;
+            stop++;
+        }
+        struct { size_t begin, end; uint64_t order; } spans[65];
+        size_t count = 0;
+        bool overflow = false;
+        for (size_t at = start; at < stop;) {
+            uint64_t source = style_adopted_source_bit(sheet,
+                                                       sheet->rules[at].order);
+            size_t next = at + 1u;
+            while (next < stop && source == style_adopted_source_bit(
+                    sheet, sheet->rules[next].order)) next++;
+            if (count == sizeof(spans) / sizeof(spans[0])) {
+                overflow = true;
+                break;
+            }
+            spans[count].begin = at;
+            spans[count].end = next;
+            spans[count].order = style_adopted_cascade_order(
+                sheet, node, sheet->rules[at].order);
+            count++;
+            at = next;
+        }
+        /* Valid sorted groups fit the source bound. If an inconsistent
+           order ever violates it, apply this whole group in global order;
+           no rule has been applied from this group yet. */
+        if (overflow) {
+            style_apply_matching_ordered_range(sheet, parent, node, subject,
+                plan, pseudo, start, stop, style, trace_position,
+                retained_entry, record, NULL);
+            start = stop;
+            continue;
+        }
+        for (size_t i = 1; i < count; i++) {
+            size_t j = i;
+            while (j != 0 && spans[j].order < spans[j - 1u].order) {
+                size_t begin = spans[j].begin, finish = spans[j].end;
+                uint64_t order = spans[j].order;
+                spans[j] = spans[j - 1u];
+                spans[j - 1u].begin = begin;
+                spans[j - 1u].end = finish;
+                spans[j - 1u].order = order;
+                j--;
+            }
+        }
+        for (size_t i = 0; i < count; i++)
+            style_apply_matching_ordered_range(sheet, parent, node, subject,
+                plan, pseudo, spans[i].begin, spans[i].end, style,
+                trace_position, retained_entry, record, NULL);
+        start = stop;
+    }
 }
 
 static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
@@ -2842,7 +3182,10 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
     if (mask & S_LETTER_SPACING) {
         style->letter_spacing = values->letter_spacing;
     }
-    if (mask & S_LINE_HEIGHT) style->line_height = values->line_height;
+    if (mask & S_LINE_HEIGHT) {
+        style->line_height = values->line_height;
+        style->line_height_factor = 0;
+    }
     if (mask & S_TEXT_ALIGN) style->text_align = values->text_align;
     if (mask & S_WHITE_SPACE) {
         style->white_space_mode = values->white_space_mode;
@@ -3362,7 +3705,9 @@ static void apply_inherit_mask(Stylesheet *sheet, ComputedStyle *style,
         style->font_italic = parent->font_italic;
     }
     if (inherit_mask & S_LINE_HEIGHT) {
-        style->line_height = parent->line_height;
+        style->line_height = parent->line_height_factor != 0
+            ? -(int) parent->line_height_factor : parent->line_height;
+        style->line_height_factor = parent->line_height_factor;
     }
     if (inherit_mask & S_WHITE_SPACE) {
         style->white_space_mode = parent->white_space_mode;
@@ -3954,6 +4299,8 @@ static bool style_plan_has_discovery_rule(const Stylesheet *sheet,
                                           PseudoElement pseudo)
 {
     if (!plan->ready) return true;
+    uint64_t ancestor_tokens = 0;
+    bool ancestor_tokens_ready = false;
     for (size_t i = 0; i <= plan->count; i++) {
         bool listed = i == plan->count;
         uint32_t begin = listed ? 0 : plan->ranges[i].begin;
@@ -3972,6 +4319,10 @@ static bool style_plan_has_discovery_rule(const Stylesheet *sheet,
             if (plan->ancestor_bloom_ready
                 && style_token_bloom_missing(
                     sheet->rule_filters[index].ancestors, plan->ancestor_bloom))
+                continue;
+            if (!style_candidate_ancestor_token_possible(
+                    sheet, index, node, &ancestor_tokens,
+                    &ancestor_tokens_ready))
                 continue;
             if (style_rule_selector_matches_subject(sheet, index, node, subject))
                 return true;
@@ -4008,6 +4359,9 @@ static void resolve_relative_line_height(ComputedStyle *style)
 {
     if (style->line_height >= 0
         || style->line_height == STYLE_LINE_HEIGHT_ZERO) return;
+    int64_t factor = -(int64_t) style->line_height;
+    style->line_height_factor = (uint16_t) (factor > UINT16_MAX
+                                            ? UINT16_MAX : factor);
     /* Computed unitless line-height can land just below an integer after
        its bounded thousandth representation (for example GOV.UK's
        21px * 1.190476...). Round the used device-pixel height instead of
@@ -4145,6 +4499,23 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
     if (style.border_color == UINT32_MAX) {
         style.border_color = style.color;
         style.border_alpha = style.color_alpha;
+    }
+    /* Shadow composition: a host's light child that the flat tree leaves
+       out (unassigned, or assigned to a slot that does not render) has no
+       box. Like closed <details> content this is a rendering constraint,
+       applied after author CSS; getComputedStyle reports it as display
+       none, where a browser would report the cascaded value. */
+    if (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        style.shadow_host =
+            document_shadow_carrier_of_host(node) != NULL;
+        if (parent != NULL && parent->shadow_host
+            && style.display != DISPLAY_NONE) {
+            const lxb_dom_node_t *carrier =
+                document_shadow_carrier_of_host(node->parent);
+            if (carrier != NULL && carrier != node
+                && !document_shadow_light_child_rendered(carrier, node))
+                style.display = DISPLAY_NONE;
+        }
     }
     /* `open` is a boolean attribute: Lexbor reports no value for the
        common valueless `<dialog open>`, so test presence, not a value. */

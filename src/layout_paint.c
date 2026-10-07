@@ -718,6 +718,18 @@ bool layout_positioned_command_escapes_clip_indexed(
            only a disjoint subtree escapes this clip. */
         return !layout_node_within(clip_box->node, positioned_owner->node);
     }
+    if (positioned_owner != NULL && clip_box->clip_path_clip) {
+        /* clip-path clips every descendant whatever its containing block.
+           Only viewport-fixed content leaves the document-space clip; the
+           fixed compositor applies this box's clip in viewport space. */
+        for (size_t i = 0; i < layout->fixed_count; i++) {
+            const FixedRange *range = &layout->fixed_ranges[i];
+            if (command_index >= range->command_start
+                && command_index < range->command_end
+                && range->clip_node != NULL) return true;
+        }
+        return false;
+    }
     if (positioned_owner != NULL) {
         const LayoutNodeBox *positioned = positioned_owner;
         uint8_t containing_distance =
@@ -1319,6 +1331,18 @@ bool build_spatial_index(LayoutDocument *layout,
             layout->command_flags[i] |= LAYOUT_COMMAND_FIXED;
         }
     }
+    /* Sticky content stays out of the tile index; the frame compositor
+       paints it in every frame (render.c, paint_sticky_overlays). A fixed
+       descendant keeps its fixed-layer paint. */
+    for (size_t range = 0; range < layout->sticky_count; range++) {
+        size_t end = layout->sticky_ranges[range].command_end;
+        if (end > layout->count) end = layout->count;
+        for (size_t i = layout->sticky_ranges[range].command_start;
+             i < end; i++) {
+            if ((layout->command_flags[i] & LAYOUT_COMMAND_FIXED) == 0)
+                layout->command_flags[i] |= LAYOUT_COMMAND_STICKY;
+        }
+    }
     for (size_t box_index = 0; box_index < layout->node_box_count;
          box_index++) {
         const LayoutNodeBox *box = &layout->node_boxes[box_index];
@@ -1372,10 +1396,10 @@ bool build_spatial_index(LayoutDocument *layout,
              & (LAYOUT_COMMAND_OVERFLOW | LAYOUT_COMMAND_DYNAMIC_OVERFLOW))
               == (LAYOUT_COMMAND_OVERFLOW
                   | LAYOUT_COMMAND_DYNAMIC_OVERFLOW)
-            && !(layout->command_flags[index] & LAYOUT_COMMAND_FIXED)) {
+            && !(layout->command_flags[index] & LAYOUT_COMMAND_UNTILED)) {
             overflow_count++;
         }
-        if (layout->command_flags[index] & LAYOUT_COMMAND_FIXED) {
+        if (layout->command_flags[index] & LAYOUT_COMMAND_UNTILED) {
             continue;
         }
         const DrawCommand *command = &layout->commands[index];
@@ -1455,10 +1479,10 @@ bool build_spatial_index(LayoutDocument *layout,
              & (LAYOUT_COMMAND_OVERFLOW | LAYOUT_COMMAND_DYNAMIC_OVERFLOW))
               == (LAYOUT_COMMAND_OVERFLOW
                   | LAYOUT_COMMAND_DYNAMIC_OVERFLOW)
-            && !(layout->command_flags[index] & LAYOUT_COMMAND_FIXED)) {
+            && !(layout->command_flags[index] & LAYOUT_COMMAND_UNTILED)) {
             layout->overflow_orders[overflow_at++] = (uint32_t) order;
         }
-        if (layout->command_flags[index] & LAYOUT_COMMAND_FIXED) {
+        if (layout->command_flags[index] & LAYOUT_COMMAND_UNTILED) {
             continue;
         }
         const DrawCommand *command = &layout->commands[index];
@@ -1515,7 +1539,7 @@ bool build_spatial_index(LayoutDocument *layout,
                 ? (int64_t) layout->spatial_band_count - 1
                 : (bottom - 1) / LAYOUT_SPATIAL_BAND_HEIGHT;
             if (scan_all_overflow
-                || (layout->command_flags[index] & LAYOUT_COMMAND_FIXED) != 0
+                || (layout->command_flags[index] & LAYOUT_COMMAND_UNTILED) != 0
                 || command->height <= 0 || top >= layout->height
                 || bottom <= 0 || last - first + 1 > 8) {
                 all_overflow_orders[unbanded_overflow_at++] = (uint32_t) order;
@@ -1534,7 +1558,7 @@ bool build_spatial_index(LayoutDocument *layout,
             size_t index = layout->paint_order[order];
             const DrawCommand *candidate = &layout->commands[index];
             uint8_t flags = layout->command_flags[index];
-            if ((flags & (LAYOUT_COMMAND_FIXED | LAYOUT_COMMAND_OVERFLOW)) != 0
+            if ((flags & (LAYOUT_COMMAND_UNTILED | LAYOUT_COMMAND_OVERFLOW)) != 0
                 || candidate->z_index < 0
                 || (candidate->z_index == 0
                     && !draw_command_has_positioned_phase(candidate))) {
@@ -1619,7 +1643,7 @@ bool build_spatial_index(LayoutDocument *layout,
                 for (size_t command_index = range_start;
                      command_index < range_end; command_index++) {
                     if ((layout->command_flags[command_index]
-                         & (LAYOUT_COMMAND_FIXED
+                         & (LAYOUT_COMMAND_UNTILED
                             | LAYOUT_COMMAND_OVERFLOW)) == 0) {
                         layout->command_flags[command_index] |=
                             LAYOUT_COMMAND_LATE_POSITIONED;
@@ -1799,6 +1823,8 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
              & (LAYOUT_COMMAND_CLIPPED_X | LAYOUT_COMMAND_FIXED)) != 0) {
             continue;
         }
+        /* Box shadows are ink overflow, not scrollable overflow. */
+        if (layout->commands[i].type == DRAW_SHADOW_RECT) continue;
         int64_t right = (int64_t) layout->commands[i].x
                         + layout->commands[i].width;
         if (right > maximum && right <= INT_MAX) {
@@ -1864,7 +1890,10 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
         if (source != NULL && !layout_node_within(box->node, source)) continue;
         if (box->command_start < command_start
             || box->command_end > layout->count) continue;
-        const char *trace_class = layout->trace_range_class;
+        /* Set only by layout_read_trace_environment, which
+           TILEFINCH_NO_TRACE compiles out. */
+        const char *trace_class = TILEFINCH_TRACE_COMPILED_IN != 0
+            ? layout->trace_range_class : NULL;
         if (trace_class != NULL && dx != 0) {
             size_t class_length = 0;
             const char *class_name = document_attribute(

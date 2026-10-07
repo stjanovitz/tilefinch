@@ -1,5 +1,6 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/image_retarget.h"
 #include "tilefinch/layout.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/platform.h"
@@ -9,7 +10,9 @@
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
 #include "../src/image_decode_internal.h"
+#include "../src/image_svg_decode_internal.h"
 #include "../src/tilefinch_test_faults.h"
+#include "tilefinch_test_clocks.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,6 +21,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <zlib.h>
 
 #ifndef TILEFINCH_TEST_SOURCE_DIR
 #define TILEFINCH_TEST_SOURCE_DIR "."
@@ -1169,6 +1174,95 @@ static bool test_cross_origin_image_taints_canvas(void)
         && budget_categories_reconcile(&budget);
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+/* Legacy single-byte documents (Encoding Standard, HTML 13.2.3): the
+   fixtures hold "Привет, мир" in windows-1251 named by the HTTP charset,
+   and in KOI8-R named only by <meta http-equiv>. The decoded DOM text is
+   read back through JavaScript. The windows-1251 page also runs an external
+   script in windows-1251 served without a charset (it inherits the
+   document's encoding) and one in UTF-8 served with charset=utf-8. */
+static bool legacy_charset_load(const char *fixture, const char *url,
+                                size_t chunk_bytes, const char *probe,
+                                const char *expected,
+                                uint8_t expected_encoding)
+{
+    char error[256] = {0};
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2)
+        && fetch_trace_replay_begin(fixture, error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        if (chunk_bytes != 0)
+            navigation_set_stream_delivery(
+                &navigation, chunk_bytes, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, url, 64 * 1024, 1000, 480, NULL, NULL,
+        true);
+    ScriptResult result;
+    memset(&result, 0, sizeof(result));
+    bool probed = loaded && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime, probe, "<legacy-charset>", &result);
+    bool ok = probed && strcmp(result.summary, expected) == 0
+        && navigation.page.document.encoding == expected_encoding;
+    if (!ok) {
+        fprintf(stderr,
+                "legacy-charset %s ready=%d loaded=%d probed=%d "
+                "encoding=%u summary=\"%s\" error=\"%s\" last=\"%s\"\n",
+                url, ready, loaded, probed,
+                (unsigned) navigation.page.document.encoding,
+                result.summary, result.error, navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_legacy_charset_documents_decode(void)
+{
+    static const char hello_probe[] =
+        "const hello='\\u041f\\u0440\\u0438\\u0432\\u0435\\u0442, "
+        "\\u043c\\u0438\\u0440',hedgehog='\\u0401\\u0436\\u0438\\u043a',"
+        "text=document.getElementById('p').textContent,"
+        "q=document.getElementById('q');"
+        "globalThis.pocSummary=[text===hello,"
+        "document.title===hello||document.title==='t',"
+        "q===null||q.getAttribute('data-legacy')===hedgehog,"
+        "q===null||globalThis.utf8Script===hedgehog].join(',')+'|'+"
+        "encodeURIComponent(text)";
+    static const char expected[] =
+        "true,true,true,true|"
+        "%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82%2C%20"
+        "%D0%BC%D0%B8%D1%80";
+    /* The header names windows-1251; both external scripts ran. */
+    bool header = legacy_charset_load(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-legacy-charset",
+        "https://charset.test/cp1251", 0, hello_probe, expected,
+        TILEFINCH_ENCODING_WINDOWS_1251);
+    /* Only <meta http-equiv> names KOI8-R. Delivered in 37-byte chunks,
+       the declaration arrives after the first chunk was parsed as UTF-8;
+       every byte before it was ASCII, so the decoder still switches. */
+    bool meta = legacy_charset_load(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-legacy-charset-meta",
+        "https://charset.test/koi8", 0, hello_probe, expected,
+        TILEFINCH_ENCODING_KOI8_R);
+    bool meta_chunked = legacy_charset_load(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-legacy-charset-meta",
+        "https://charset.test/koi8", 37, hello_probe, expected,
+        TILEFINCH_ENCODING_KOI8_R);
+    return header && meta && meta_chunked;
 }
 
 static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
@@ -2793,6 +2887,29 @@ static bool test_parser_transport_failures_do_not_retire_realm(void)
     return ok && clean;
 }
 
+/* The parser-script stage limit and the script watchdog are wall-clock
+   deadlines. The mutation-checkpoint test below checks that the stage limit,
+   not the watchdog or the DOM-mutation bound, ends a hostile observer; on a
+   loaded host a preempted parser met a spent stage on another path (the
+   loop was stopped as "bounded DOM mutation work" with no stage breaker at
+   245 ms of a 250 ms stage). It runs on a counting clock instead: every
+   read of the platform monotonic clock advances it 100 us, so each
+   deadline is a count of the engine's own clock reads and the outcome
+   depends only on the code. */
+static bool run_on_counting_clock(bool (*test)(void))
+{
+    TestCountingClock clock = {
+        .now_ns = UINT64_C(1000000000), .step_ns = UINT64_C(100000)
+    };
+    TilefinchPlatformServices services = {
+        .context = &clock, .monotonic_time_ns = test_counting_clock_ns
+    };
+    tilefinch_platform_set_services(&services);
+    bool passed = test();
+    tilefinch_platform_set_services(NULL);
+    return passed;
+}
+
 static bool test_parser_script_stage_watchdog_and_failure_reset(void)
 {
     Budget budget;
@@ -2896,7 +3013,10 @@ static bool test_parser_script_stage_watchdog_and_failure_reset(void)
             &navigation, 43, 0, 0, 0, 0, 0);
     }
     generation = ready ? navigation_begin(&navigation) : 0;
-    navigation_test_set_parser_script_stage_time_limit_us(25000u);
+    /* 250 ms, as in the mutation-deadline test: under load the healthy
+       later script alone could outlast a 25 ms stage and open the breaker
+       this test says transport waits must not open. */
+    navigation_test_set_parser_script_stage_time_limit_us(250000u);
     started_us = tilefinch_platform_monotonic_time_us();
     loaded = ready && navigation_load_url(
         &navigation, generation,
@@ -2920,7 +3040,13 @@ static bool test_parser_script_stage_watchdog_and_failure_reset(void)
         && navigation.performance.parser_script_stage_breakers == 0u
         && navigation.preloads_deferred != 0u
         && navigation.last_error[0] == '\0'
-        && wall_us < UINT64_C(750000);
+        /* A preload wait that ignored the stage deadline would sit out the
+           1.5-second script fetch timeout, so it cannot finish sooner. The
+           healthy path pumps the replayed transport until the stage
+           deadline; with the old 25 ms stage it took about 90 ms alone and
+           over 800 ms under a 32-way parallel run, which the old 750 ms
+           bound mistook for that regression. */
+        && wall_us < UINT64_C(1500000);
     if (!preload_ok) {
         fprintf(stderr,
                 "parser preload watchdog ready=%d loaded=%d wall=%llu "
@@ -3415,7 +3541,11 @@ static bool test_parser_mutation_checkpoint_uses_stage_deadline(void)
         navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
     }
     uint64_t generation = ready ? navigation_begin(&navigation) : 0;
-    navigation_test_set_parser_script_stage_time_limit_us(25000u);
+    /* 250 ms, not 25: the stage limit is wall time, and on a loaded host the
+       harmless first script alone was seen to take 22 ms of a 25 ms stage,
+       so the hostile observer met a nearly spent stage and failed on
+       another path. Ten times the room keeps the scenario the same. */
+    navigation_test_set_parser_script_stage_time_limit_us(250000u);
     uint64_t started_us = tilefinch_platform_monotonic_time_us();
     bool loaded = ready && navigation_load_url(
         &navigation, generation,
@@ -3443,7 +3573,8 @@ static bool test_parser_mutation_checkpoint_uses_stage_deadline(void)
         && navigation.page.script_degradation_observed
         && navigation.page.runtime == NULL
         && navigation.last_error[0] == '\0'
-        && wall_us < UINT64_C(750000);
+        /* The 1.5-second script watchdog would end the loop no sooner. */
+        && wall_us < UINT64_C(1500000);
     if (!ok) {
         fprintf(stderr,
                 "parser mutation deadline ready=%d loaded=%d page=%d "
@@ -3472,6 +3603,12 @@ static bool test_parser_mutation_checkpoint_uses_stage_deadline(void)
         && budget_categories_reconcile(&budget);
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+static bool test_parser_mutation_checkpoint_uses_stage_deadline_counted(void)
+{
+    return run_on_counting_clock(
+        test_parser_mutation_checkpoint_uses_stage_deadline);
 }
 
 static bool test_late_server_actions_refresh_hydration_snapshot(void)
@@ -4466,7 +4603,9 @@ static bool prior_page(NavigationSession *navigation)
 /* Navigation tests retain a single executable and shared fixture lifetime;
    these ordered units follow document, transaction, and runtime boundaries. */
 #include "suites/navigation_document.inc"
+#include "suites/navigation_image_retarget.inc"
 #include "suites/navigation_transactions.inc"
+#include "suites/navigation_svg_retarget.inc"
 #include "suites/navigation_streaming.inc"
 #include "suites/navigation_runtime.inc"
 #include "suites/navigation_runner.inc"

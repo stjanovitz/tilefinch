@@ -39,7 +39,10 @@ The drawing buffer is opaque and stencil buffers are not advertised. An
 explicit `antialias:true` enables a bounded edge-coverage mode rather than a
 second multisample framebuffer: the PSP GE adds hardware-smoothed line and
 eligible triangle fringes, while the host fallback uses four fixed coverage
-samples only for triangle rasterization. On PSP, full-clear opaque frames also
+samples only for triangle rasterization. There the pixel centre still decides
+which triangle owns a pixel (watertight, top-left fill rule), and the samples
+only add a partial-coverage fringe where a triangle misses the centre, so
+triangles that share an edge never let the clear colour through. On PSP, full-clear opaque frames also
 use a bounded temporal edge pass during small camera motion. It reprojects a
 limited number of preceding fringe samples at low alpha, resets across large
 camera, surface, or context changes, and never blends the filled scene. This
@@ -51,9 +54,9 @@ limits instead of assuming desktop defaults.
 
 ## Use shaders the GE can translate
 
-Use a conventional position attribute, optional vertex color or one 2D
-texture, and at most four `mat4` uniforms in the position expression. A
-uniform color multiplier is also supported. Keep shaders short and direct:
+Use a position attribute, optional vertex color or one 2D texture, and at most
+four `mat4` uniforms in the position expression. A `vec4` uniform or literal
+color multiplier is also supported. Keep shaders short and direct:
 
 ```glsl
 attribute vec3 aPosition;
@@ -78,13 +81,65 @@ void main() {
 }
 ```
 
-Shader loops, `discard`, derivatives, arbitrary fragment effects, and general
-shader control flow are outside this profile. Compile and link status must be
-checked: unsupported shader shapes fail as ordinary WebGL errors so the page
-can offer a Canvas 2D or static fallback. Source is bounded to 16 KiB per
-shader; a larger shader is refused and is not retained for
-`getShaderSource()`. Vertex and fragment uniform-vector limits are enforced
-independently at the values returned by `getParameter()`.
+### What the translator runs
+
+The PSP does not execute GLSL. At `linkProgram()` Tilefinch reads the two
+shaders and maps them onto the GE's fixed-function pipeline:
+
+- **Position:** `gl_Position` is one product of up to four `mat4` uniforms,
+  optionally one per-instance `mat4` attribute, and the position attribute
+  itself, `vec4(position, 1.0)` or `vec4(position, 0.0, 1.0)`. The bounded
+  instance form `vec4(aPosition * aInstanceTransform.w +
+  aInstanceTransform.xyz, 1.0)` is also accepted.
+- **Colour:** `gl_FragColor` is one product of at most these factors:
+  `texture2D(sampler, varying)`, a varying, one `vec4` uniform, or one
+  literal `vec4(r, g, b, a)` constant. A varying it reads must be written once
+  in the vertex shader as a product of attributes and at most one `vec4`
+  uniform. The GE applies one vertex colour attribute and one per-instance
+  colour attribute. A texture coordinate varying must be a plain copy of one
+  attribute. A local such as `vec4 texel = texture2D(...);` may stand for its
+  value.
+- **Inputs follow data flow.** The attribute that feeds the texture
+  coordinate, the colour varyings, and `gl_Position` is the one used, whatever
+  its name. When the colour is fully recognised, inputs the fragment colour
+  never reads (an unused colour attribute or uniform) are not applied.
+
+Everything else in `main()` is either refused or reported:
+
+| Construct | Result |
+|---|---|
+| `for`, `while`, `do`, `discard`, `dFdx`/`dFdy`/`fwidth` | link fails |
+| `if` or `?:` whose condition reads a varying, attribute, texture sample, `gl_FragCoord`, `gl_FrontFacing`, `gl_PointCoord`, a helper function, or a local derived from them | link fails: the GE cannot branch per pixel or per vertex |
+| `texture2D` in the vertex shader; `textureCube`, `texture2DProj`, `texture2DLod` | link fails (`MAX_VERTEX_TEXTURE_IMAGE_UNITS` is 0; only 2D sampling exists) |
+| two or more samplers sampled | link fails (`MAX_TEXTURE_IMAGE_UNITS` is 1) |
+| `if` or `?:` that reads only uniforms and constants | links with a warning: neither branch is evaluated |
+| other colour math (`vColor * 0.5`, `vec4(vColor.rgb, 1.0)`, `mix`, lighting, `gl_FragCoord` effects, helpers) | links with a warning naming the factor; the PSP draws the recognised factors |
+| other position math (offsets, `mat3` transforms, swizzles) | links with a warning; the PSP draws the recognised transform |
+| `gl_FragColor` or `gl_Position` written in parts or more than once | links with a warning |
+
+A refusal leaves `LINK_STATUS` false. A warning leaves it true. In both cases
+`getProgramInfoLog()` names the construct and its line in the author's
+source, for example
+`ERROR: fragment shader line 5: 'if' depends on per-pixel data; the PSP GE
+cannot branch per pixel` or
+`WARNING: fragment shader line 2: '0.5' is not applied to gl_FragColor on the
+PSP`. Each program also logs this text once with `console.warn`, and
+`__tilefinchWebGLDiagnostics.shaderRefusals` and `.shaderWarnings` count
+refused links and links with warnings. The check runs only at link time, so it
+costs nothing per draw.
+
+The split is deliberate. A per-pixel branch or a second texture has no
+fixed-function meaning: the GE would draw one input's colour everywhere, so
+the program fails like any WebGL program that exceeds the implementation, and
+a page that checks `LINK_STATUS` can fall back. Dropped arithmetic still
+draws the shader's base colour or texture, so it keeps working and the warning
+tells the author what is missing. A game in development should treat any
+program info log as a defect: on Tilefinch, a clean log means the PSP draws
+exactly what the shader says.
+
+Source is bounded to 16 KiB per shader; a larger shader is refused and is not
+retained for `getShaderSource()`. Vertex and fragment uniform-vector limits
+are enforced independently at the values returned by `getParameter()`.
 
 Tilefinch intentionally substitutes PSP-practical texture defaults: a new
 texture starts with `LINEAR` minification/magnification and
@@ -154,39 +209,26 @@ instancing?.drawElementsInstancedANGLE(
 
 ### Canvas publication on PSP
 
-The GE-rendered WebGL color surface lives in EDRAM, but Tilefinch's ordinary
-page framebuffer is a budget-owned RGB565 surface in main RAM. The current
-publication path converts and scales an eligible opaque canvas into that page
-frame, applies retained HTML/browser overlays there, then copies the completed
-page into the triple-buffered scanout surface. This keeps page rendering,
-screenshots, focus damage, and the tear-free vblank owner on one authoritative
-frame.
+The GE-rendered WebGL color surface lives in EDRAM, while Tilefinch's page
+framebuffer is a budget-owned RGB565 surface in main RAM. By default an
+eligible canvas frame skips that RAM frame: when one opaque WebGL canvas
+fills the viewport at the 2:3 scale (a 320×180 backing shown at 480×270) and
+nothing is composited above it (no HTML overlay, fixed or sticky element,
+scroll thumb, or focus outline), the presenter has the GE scale the EDRAM
+surface straight into the back buffer in 32-texel column strips, pixel-exact
+with the CPU kernel. The RAM frame is produced only when something reads it
+(screenshots, thumbnails, a fallback); WebGL readback is unaffected. Any
+other frame, and any refused or failed GE submission, keeps the exact CPU
+conversion and copy.
 
-A direct GE-to-scanout canvas blit is therefore not a drop-in replacement for
-the CPU conversion. It needs an explicit compositor handoff: exact canvas
-geometry and EDRAM epoch must cross the platform-present boundary, overlays
-must be composed after the GE fence, and every fallback/navigation path must
-restore the main-RAM frame without exposing a partially written back buffer.
-Until that ownership transition is qualified pixel-for-pixel on real hardware,
-Tilefinch deliberately keeps the measured CPU fast path. Authors still benefit
-most from a 320×180 opaque canvas and stable overlay geometry.
-
-The Treadline device soak puts an upper bound on the opportunity: canvas
-conversion averaged about 3.9 ms and the page-base copy was about 1.6 ms in
-tail frames. Even removing both entirely would leave that scene around 27–28
-ms, still in the 30 Hz rather than 60 Hz presentation band.
-
-The physical-PSP validation probe compares the exact 320x180-to-480x270
-CPU kernel with a direct GE 8888-to-RGB565 back-buffer draw. Across 120
-measured frames after 12 warm-ups, CPU conversion averaged 3.175 ms and its
-following page copy 2.058 ms; the GE path averaged 4.315 ms end to end
-(0.035 ms submission and 4.269 ms synchronization), with a 4.371 ms maximum.
-All 129,600 displayed
-pixels matched exactly. That proves the conversion is viable, but its isolated
-saving is only about 0.9 ms before overlay/ownership integration, so it does
-not justify changing the tear-free compositor by itself. Keep the CPU path
-unless a later trace shows publication, rather than page JavaScript, is again
-the limiting phase.
+On a PSP-3000 in October 2026 the GE scale averaged about 0.7 ms against
+roughly 5 ms of CPU conversion and copy, and Treadline's long soak missed
+0.5% of two-vblank deadlines instead of 4.1%. Pixel verification over more
+than 250 million published pixels found no mismatch. Authors benefit most
+from a 320×180 opaque canvas with the HUD drawn inside it: a DOM HUD, menu
+or toast over the canvas keeps those frames on the CPU path. Dated figures
+and the remaining frame tails are in the
+[performance ledger](engineering/PERFORMANCE_LEDGER.md).
 
 ## Run a single bounded game loop
 
@@ -258,7 +300,8 @@ described in [Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification).
 ## Preflight checklist
 
 - The drawing buffer is deliberately PSP-sized.
-- Shader compile and program link results are checked.
+- Shader compile and program link results are checked, and every program
+  info log is empty (a non-empty log names logic the PSP does not run).
 - The scene stays below the queried buffer, texture, draw, and vertex limits.
 - No per-frame readback or object-graph allocation occurs.
 - One animation chain pauses when the document is hidden.

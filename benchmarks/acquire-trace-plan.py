@@ -41,6 +41,7 @@ MAX_RECORDS = 4096
 HARD_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HARD_MAX_TRACE_BYTES = 512 * 1024 * 1024
 OUTPUT_CAPTURE_LIMIT = 64 * 1024
+REQUEST_SIDECAR_LIMIT = 16 * 1024
 ECMASCRIPT_DATE_MAX_MS = 8_640_000_000_000_000
 REFERENCE_INSPECTOR = Path(__file__).with_name("capture-reference.js")
 REFERENCE_CLOSURE = Path(__file__).with_name("verify-trace-acquisition.js")
@@ -50,7 +51,7 @@ MAX_DIAGNOSTIC_ENTRIES = 512
 MAX_DIAGNOSTIC_COUNTER_KEYS = 64
 MAX_DIAGNOSTIC_EVENTS = 1_000_000
 
-CURRENT_TRACE_VERSION = "11"
+CURRENT_TRACE_VERSION = "13"
 CURRENT_REQUIRED_KEYS = frozenset(
     {
         "psp-http-trace",
@@ -69,6 +70,9 @@ CURRENT_REQUIRED_KEYS = frozenset(
         "request-content-type",
         "request-cookie-bytes",
         "request-has-cf-clearance",
+        "request-cookie-provenance-count",
+        "request-cookie-provenance-complete",
+        "request-cookie-provenance-evictions",
         "request-extra-header-bytes",
         "request-extra-header-shape",
         "request-allow-http-errors",
@@ -116,6 +120,7 @@ CURRENT_REQUIRED_KEYS = frozenset(
         "response-security-allow-origin",
         "response-header-count",
         "set-cookie-count",
+        "set-cookies-truncated",
     }
 )
 
@@ -733,6 +738,22 @@ def _trace_inventory(root: Path) -> tuple[dict[str, str], bytes, set[tuple[str, 
             raise AcquisitionError(f"trace record {stem} has no method/URL")
         keys.add((method, url))
         _regular_file(root / f"{stem}.body", f"trace body {stem}")
+        # Capture keeps a request body of up to 16 KiB beside its record
+        # (NNNN.request, diagnostic only; replay keys on the meta hash).
+        # Accept it only when it is exactly the body the meta names.
+        sidecar = root / f"{stem}.request"
+        if sidecar.exists() or sidecar.is_symlink():
+            length = _decimal(meta, "request-body-length", REQUEST_SIDECAR_LIMIT)
+            if (
+                length == 0
+                or _regular_file(sidecar, f"trace request body {stem}",
+                                 REQUEST_SIDECAR_LIMIT) != length
+                or _fnv1a64(sidecar.read_bytes()) != meta.get("request-body-hash")
+            ):
+                raise AcquisitionError(
+                    f"trace request body {stem} does not match its record"
+                )
+            expected.add(f"{stem}.request")
     actual = {relative for _path, relative, _size in _trace_files(root)}
     if actual != expected:
         raise AcquisitionError(
@@ -891,8 +912,11 @@ def _validate_acquired_record(
         "request-content-type": "",
         "request-cookie-bytes": "0",
         "request-has-cf-clearance": "0",
+        "request-cookie-provenance-count": "0",
+        "request-cookie-provenance-complete": "1",
+        "request-cookie-provenance-evictions": "0",
         "request-extra-header-bytes": "0",
-        "request-extra-header-shape": "",
+        "request-extra-header-shape": "@cache=0;",
         "request-allow-http-errors": "1",
         "request-enforce-cors": "0",
         "request-redirect-same-origin-only": "0",
@@ -918,12 +942,15 @@ def _validate_acquired_record(
         "request-referrer-source": "",
         "request-referrer-policy": "",
         "effective-url": url,
+        "set-cookies-truncated": "0",
     }
     for key, expected in exact.items():
         if meta.get(key) != expected:
             raise AcquisitionError(
                 f"acquired record {key} differs: expected {expected!r}, got {meta.get(key)!r}"
             )
+    if any(re.fullmatch(r"request-cookie-provenance-[0-9]+", key) for key in meta):
+        raise AcquisitionError("acquired record names request cookies it never sent")
     if not meta.get("request-user-agent"):
         raise AcquisitionError("acquired record has no deterministic User-Agent")
     status_code = _decimal(meta, "status", 599)

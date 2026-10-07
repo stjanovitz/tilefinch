@@ -38,6 +38,14 @@ int main(void)
         failures++;
     }
     if (!test_dynamic_scheduler_backpressure_retries(&budget)) failures++;
+    if (!test_stalled_dynamic_script_does_not_block_later_ones(&budget)) {
+        failures++;
+    }
+    if (!test_compile_over_heap_is_refused_with_realm_intact(&budget)) {
+        failures++;
+    }
+    if (!test_heavy_page_gate(&budget)) failures++;
+    if (!test_oversized_script_marks_page_over(&budget)) failures++;
     if (!test_oversized_resource_loader_envelope_is_segmented(&budget)) {
         failures++;
     }
@@ -70,6 +78,15 @@ int main(void)
     if (!test_initial_script_snapshot_mutation(&budget)) failures++;
     if (!test_external_script_self_destruction(&budget)) failures++;
     if (!test_deep_initial_script_snapshot(&budget)) failures++;
+    if (!test_contextual_fragment_contexts(&budget)) failures++;
+    if (!test_contextual_fragment_scripts(&budget)) failures++;
+    if (!test_contextual_fragment_csp(&budget)) failures++;
+    if (!test_cloned_started_scripts_never_rerun(&budget)) failures++;
+    if (!test_unstarted_script_clones_run_once(&budget)) failures++;
+    if (!test_moved_started_scripts_never_rerun(&budget)) failures++;
+    if (!test_script_clone_state_exhaustion_fails_safe(&budget)) {
+        failures++;
+    }
     bool clean = budget.current == 0 && budget_uninstall_lexbor(&budget);
     if (!clean) {
         fprintf(stderr, "dynamic script tests left %zu owned bytes\n",

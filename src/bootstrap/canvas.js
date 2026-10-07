@@ -1728,8 +1728,9 @@
       return new ImageBitmap(
         imageBitmapConstructorKey, width, height, pixels, input.originClean);
     };
-  globalThis.createImageBitmap = (source, ...args) =>
-    Promise.resolve().then(() => createBitmap(source, args));
+  const createImageBitmap = (image, ...args) =>
+    Promise.resolve().then(() => createBitmap(image, args));
+  globalThis.createImageBitmap = createImageBitmap;
 
   class CanvasRenderingContext2D {
     constructor(canvas) {
@@ -3008,7 +3009,7 @@
       },
     },
   });
-  HTMLCanvasElement.prototype.getContext = function (type, attributes) {
+  HTMLCanvasElement.prototype.getContext = function getContext(type, attributes = undefined) {
     type = String(type).toLowerCase();
     const existingKind = contextKinds.get(this);
     if (type === "webgl" || type === "experimental-webgl") {
@@ -3029,7 +3030,7 @@
     }
     return context;
   };
-  HTMLCanvasElement.prototype.toDataURL = function () {
+  HTMLCanvasElement.prototype.toDataURL = function toDataURL() {
     const state = canvasReadbackState(this);
     if (!state) return "data:,";
     if (!state.originClean)
@@ -3042,7 +3043,7 @@
       return "data:,";
     return "data:image/png;base64," + bytesToBase64(encodeCanvasPNG(this));
   };
-  HTMLCanvasElement.prototype.toBlob = function (callback) {
+  HTMLCanvasElement.prototype.toBlob = function toBlob(callback) {
     if (typeof callback !== "function")
       throw new TypeError("toBlob requires a callback");
     const state = canvasReadbackState(this);

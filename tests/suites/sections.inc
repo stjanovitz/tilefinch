@@ -1007,4 +1007,6 @@ static int test_sections(void)
 
     Budget tiny;
     puts("test: tiny-budget rejection");
-    budget_init(&tiny, 1 * MIB);
+    /* Below what the document needs; a small page's parse fits in 1 MiB
+       since the parser's token pools start small. */
+    budget_init(&tiny, 256u * 1024u);

@@ -90,10 +90,27 @@ void psp_media_present_emit_after_release(PspMediaSession *media);
 
 /* Validation/reporting is deliberately separate from lifecycle authority.
    These functions sample an already-owned session and never mutate playback
-   policy, state-machine state, or backend ownership. */
+   policy, state-machine state, or backend ownership. Their only output is
+   the validation log, so builds without it compile them to nothing. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
 void psp_media_telemetry_report_slow_unit(
     PspMediaSession *media, const char *stage, uint64_t unit_us);
 void psp_media_telemetry_report_feed(
     PspMediaSession *media, const char *phase);
+#else
+static inline void psp_media_telemetry_report_slow_unit(
+    PspMediaSession *media, const char *stage, uint64_t unit_us)
+{
+    (void) media;
+    (void) stage;
+    (void) unit_us;
+}
+static inline void psp_media_telemetry_report_feed(
+    PspMediaSession *media, const char *phase)
+{
+    (void) media;
+    (void) phase;
+}
+#endif
 
 #endif

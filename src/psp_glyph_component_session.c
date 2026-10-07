@@ -15,6 +15,11 @@
 #define TILEFINCH_GLYPH_COMPONENT_REPOSITORY_NAME "tilefinch-models"
 #endif
 
+#ifdef TILEFINCH_GLYPH_SESSION_TEST_SEAM
+bool (*psp_glyph_component_session_test_identity)(
+    const TilefinchInstallPaths *paths, TilefinchGlyphPack pack) = NULL;
+#endif
+
 static uint16_t pack_bit(TilefinchGlyphPack pack)
 {
     return pack < TILEFINCH_GLYPH_PACK_COUNT
@@ -28,16 +33,31 @@ static bool ensure_root(PspGlyphComponentSession *session)
     return session->root_ready;
 }
 
+/* An installed generation's signed identity. Host tests that compile this
+   file with TILEFINCH_GLYPH_SESSION_TEST_SEAM may substitute the check so
+   unsigned fixture packs exercise the real resolve/attach path; shipped
+   builds have no such hook. */
+static bool installed_identity(
+    PspGlyphComponentSession *session, const TilefinchInstallPaths *paths,
+    TilefinchGlyphPack pack)
+{
+#ifdef TILEFINCH_GLYPH_SESSION_TEST_SEAM
+    if (psp_glyph_component_session_test_identity != NULL)
+        return psp_glyph_component_session_test_identity(paths, pack);
+#endif
+    uint64_t sequence = 0;
+    uint8_t digest[32];
+    return session->budget != NULL && ensure_root(session)
+        && tilefinch_glyph_component_installed_identity(
+               session->budget, paths, pack, &session->root,
+               &sequence, digest);
+}
+
 static bool pack_signed_and_resolved(
     PspGlyphComponentSession *session, const TilefinchInstallPaths *paths,
     TilefinchGlyphPack pack, char path[TILEFINCH_INSTALL_PATH_LIMIT])
 {
-    uint64_t sequence = 0;
-    uint8_t digest[32];
-    return session != NULL && session->budget != NULL && ensure_root(session)
-        && tilefinch_glyph_component_installed_identity(
-               session->budget, paths, pack, &session->root,
-               &sequence, digest)
+    return session != NULL && installed_identity(session, paths, pack)
         && tilefinch_glyph_component_resolve(
                paths, pack, path, TILEFINCH_INSTALL_PATH_LIMIT);
 }
@@ -119,30 +139,22 @@ bool psp_glyph_component_session_attach_hinted(
                >= TILEFINCH_GLYPH_COMPONENT_LAZY_LANGUAGE_LIMIT) {
         return false;
     }
+    /* The catalog names each pack's scripts. Kana and Hangul are
+       unambiguous regional hints; bare Han cannot distinguish Simplified
+       from Traditional Chinese, so both Chinese packs list it and neither
+       Japanese nor Korean spends one of the two lazy slots on it. */
     uint16_t requested = 0;
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_JAPANESE) != 0)
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_JAPANESE);
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_KOREAN) != 0)
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_KOREAN);
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_CYRILLIC) != 0)
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_CYRILLIC);
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED) != 0)
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_ARABIC) != 0)
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_ARABIC);
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_HEBREW) != 0)
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_HEBREW);
-    if ((script_mask & DOCUMENT_GLYPH_SCRIPT_HAN) != 0) {
-        /* Kana and Hangul already provide unambiguous regional hints above.
-           Bare Han cannot distinguish Simplified from Traditional Chinese,
-           so try both without consuming the two lazy slots on Japanese or
-           Korean packs that the page did not otherwise request. */
-        requested |= pack_bit(TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED)
-            | pack_bit(TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL);
+    for (TilefinchGlyphPack pack = 0; pack < TILEFINCH_GLYPH_PACK_COUNT;
+         pack++) {
+        const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(pack);
+        if (spec != NULL && (spec->page_scripts & script_mask) != 0)
+            requested |= pack_bit(pack);
     }
     requested &= (uint16_t) ~(session->attached_mask
                              | session->lazy_attempted_mask
                              | pack_bit(TILEFINCH_GLYPH_PACK_COLOR_EMOJI));
+    _Static_assert(TILEFINCH_GLYPH_PACK_COUNT == 9u,
+                   "list a new language pack in the lazy preference");
     static const TilefinchGlyphPack preference[] = {
         TILEFINCH_GLYPH_PACK_ARABIC,
         TILEFINCH_GLYPH_PACK_HEBREW,
@@ -204,6 +216,12 @@ static void deactivate_runtime(
         (void) browser_engine_optional_glyphs_updated(engine);
 }
 
+void psp_glyph_component_session_detach_runtime(
+    PspGlyphComponentSession *session, BrowserEngine *engine)
+{
+    deactivate_runtime(session, engine);
+}
+
 void psp_glyph_component_session_destroy(PspGlyphComponentSession *session)
 {
     if (session == NULL) return;
@@ -244,14 +262,10 @@ void psp_glyph_component_session_probe(
     session->installed_mask = 0;
     session->lazy_attempted_mask = 0;
     session->lazy_processed_script_mask = 0;
-    if (session->budget == NULL || !ensure_root(session)) return;
+    if (session->budget == NULL) return;
     for (TilefinchGlyphPack pack = 0;
          pack < TILEFINCH_GLYPH_PACK_COUNT; pack++) {
-        uint64_t sequence = 0;
-        uint8_t digest[32];
-        if (tilefinch_glyph_component_installed_identity(
-                session->budget, paths, pack, &session->root,
-                &sequence, digest))
+        if (installed_identity(session, paths, pack))
             session->installed_mask |= pack_bit(pack);
     }
 }
@@ -300,6 +314,75 @@ static void finish_activated_install(
     session->operation_initialized = false;
     session->auto_install = false;
     psp_glyph_component_session_probe(session, paths);
+    /* The install detached every runtime pack (deactivate_runtime); the
+       caller re-attaches with the current selection on its next pass. */
+    session->reattach_pending = true;
+}
+
+bool psp_glyph_component_session_reattach(
+    PspGlyphComponentSession *session, Budget *budget,
+    const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
+    bool color_emoji, uint16_t script_mask, BrowserEngine *engine)
+{
+    if (session == NULL || !session->reattach_pending) return false;
+    session->reattach_pending = false;
+    uint16_t before = session->attached_mask;
+    if (session->provider == NULL)
+        (void) psp_glyph_component_session_attach_selected(
+            session, budget, paths, language, color_emoji);
+    /* At most two lazy additions; each call attempts one pack. */
+    for (unsigned attempt = 0;
+         script_mask != 0
+         && attempt < TILEFINCH_GLYPH_COMPONENT_LAZY_LANGUAGE_LIMIT;
+         attempt++) {
+        if (!psp_glyph_component_session_attach_hinted(
+                session, paths, script_mask, engine)) break;
+    }
+    if (session->attached_mask != before && engine != NULL)
+        (void) browser_engine_optional_glyphs_updated(engine);
+    return true;
+}
+
+bool psp_glyph_component_session_prepare_size_check(
+    PspGlyphComponentSession *session, Budget *budget,
+    const TilefinchInstallPaths *paths, TilefinchGlyphPack pack)
+{
+    if (session == NULL || psp_glyph_component_session_active(session))
+        return false;
+    bool selected = session->operation_initialized
+        && session->operation_pack == pack && session->installer == NULL;
+    if (!selected && !psp_glyph_component_session_select_operation(
+            session, budget, paths, pack)) return false;
+    /* Stop at AVAILABLE: only the confirmation's second X downloads. */
+    session->auto_install = false;
+    (void) tilefinch_update_client_snapshot(
+        session->client, &session->client_snapshot);
+    return true;
+}
+
+PspGlyphComponentSizeState psp_glyph_component_session_size(
+    const PspGlyphComponentSession *session, TilefinchGlyphPack pack,
+    uint64_t *bytes, const char **message)
+{
+    if (bytes != NULL) *bytes = 0;
+    if (message != NULL) *message = "";
+    if (session == NULL || !session->operation_initialized
+        || session->client == NULL || session->operation_pack != pack)
+        return PSP_GLYPH_COMPONENT_SIZE_NONE;
+    const TilefinchUpdateClientSnapshot *client = &session->client_snapshot;
+    if (message != NULL) *message = client->message;
+    switch (client->phase) {
+        case TILEFINCH_UPDATE_CLIENT_CHECKING:
+            return PSP_GLYPH_COMPONENT_SIZE_CHECKING;
+        case TILEFINCH_UPDATE_CLIENT_AVAILABLE:
+            if (bytes != NULL) *bytes = client->manifest.package_size;
+            return PSP_GLYPH_COMPONENT_SIZE_READY;
+        case TILEFINCH_UPDATE_CLIENT_ERROR:
+        case TILEFINCH_UPDATE_CLIENT_UP_TO_DATE:
+            return PSP_GLYPH_COMPONENT_SIZE_FAILED;
+        default:
+            return PSP_GLYPH_COMPONENT_SIZE_NONE;
+    }
 }
 
 bool psp_glyph_component_session_select_operation(

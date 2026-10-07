@@ -15,6 +15,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/integer_math.h"
 #include "tilefinch/layout.h"
+#include "tilefinch/image_retarget.h"
 #include "tilefinch/media_discovery.h"
 #include "tilefinch/platform.h"
 #if defined(__PSP__)
@@ -40,6 +41,19 @@
     budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
 
 #define MAX_TRACKED_IMAGE_NODES 128
+/* Image-count policy. The per-page image count (24 on the PSP) bounds the
+   work a page can start against the network: every counted attempt may hold
+   a fetch slot, an encoded-byte reservation and a full raster decode. Memory
+   is bounded separately and honestly by the decoded- and encoded-byte quotas
+   and by MAX_TRACKED_IMAGE_NODES, which every image still pays. Icons that
+   never touch the network would otherwise exhaust the count before the first
+   real photograph (a news header carries twenty-odd inline-SVG glyphs), so
+   an inline SVG whose raster is no larger than a 64x64 icon, and a data: URL
+   no longer than a small inline placeholder, are recorded as count_exempt.
+   A larger inline SVG still counts, and once the count is spent only an
+   icon-sized raster is admitted. */
+#define IMAGE_COUNT_EXEMPT_DECODED_BYTES (64u * 64u * 4u)
+#define IMAGE_COUNT_EXEMPT_DATA_URL_BYTES 4096u
 #define MAX_RASTER_DECODE_WORKING_BYTES (8u * 1024u * 1024u)
 #define MAX_PRIORITY_RASTER_DECODE_WORKING_BYTES (10u * 1024u * 1024u)
 #define IMAGE_FETCH_CONCURRENCY 4
@@ -56,9 +70,9 @@
 static void image_trace(const char *reason, const char *source,
                         size_t length)
 {
-    static int enabled = -1;
-    if (enabled < 0) enabled = tilefinch_trace_images();
-    if (!enabled) return;
+    /* tilefinch_trace_images() caches its own answer and is constant false
+       under TILEFINCH_NO_TRACE. */
+    if (!tilefinch_trace_images()) return;
     if (source == NULL) source = "";
     if (length > 200) length = 200;
     fprintf(stderr, "tilefinch: image %s %.*s\n", reason, (int) length, source);
@@ -210,6 +224,14 @@ typedef struct {
        inside that unit and accidentally turn benign input into image failure. */
     bool externally_pumped;
 } ImageLoadContext;
+
+static bool image_count_exhausted(const ImageLoadContext *context)
+{
+    const ExternalImageStats *stats = &context->images->stats;
+    size_t exempt = stats->count_exempt <= stats->attempted
+        ? stats->count_exempt : stats->attempted;
+    return stats->attempted - exempt >= context->maximum_count;
+}
 
 static bool image_response_cross_origin(const char *document_url,
                                         const char *response_url)
@@ -481,11 +503,8 @@ static bool image_profile_enabled(void)
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     return true;
 #else
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = tilefinch_trace_image_profile();
-    }
-    return enabled != 0;
+    /* Cached inside the helper; constant false under TILEFINCH_NO_TRACE. */
+    return tilefinch_trace_image_profile();
 #endif
 }
 
@@ -794,8 +813,24 @@ static void image_canvas_copy_rect(unsigned char *destination,
     }
 }
 
+static uint32_t image_canvas_native_serial_value = 1u;
+
+uint32_t image_canvas_native_serial(void)
+{
+    return image_canvas_native_serial_value;
+}
+
+void image_canvas_native_serial_advance(void)
+{
+    if (++image_canvas_native_serial_value == 0u)
+        image_canvas_native_serial_value = 1u;
+}
+#define IMAGE_CANVAS_NATIVE_SERIAL_ADVANCE() \
+    image_canvas_native_serial_advance()
+
 static void image_canvas_native_forget(ImageResource *resource)
 {
+    IMAGE_CANVAS_NATIVE_SERIAL_ADVANCE();
     if (resource == NULL || resource->canvas_native_surface == NULL) return;
     memset(resource->canvas_native_surface, 0,
            sizeof(*resource->canvas_native_surface));
@@ -1105,6 +1140,7 @@ bool images_set_canvas_native_surface(ImageResources *images,
             .authoritative = true
         };
         resource->canvas_native_surface = &images->canvas_native[slot];
+        IMAGE_CANVAS_NATIVE_SERIAL_ADVANCE();
         return true;
     }
     return false;
@@ -1813,10 +1849,22 @@ static bool inline_svg_apply_default_viewport(
             numeric_height = parsed;
         }
     }
-    /* HTML's 300x150 default applies when neither dimension is supplied.
-       If exactly one dimension is authored, preserve the SVG viewBox ratio
-       instead of stretching the image through the missing legacy default. */
-    if (width_missing != height_missing) {
+    /* A viewBox gives the SVG an intrinsic ratio. If exactly one dimension
+       is known -- from CSS or from an attribute -- the other follows that
+       ratio instead of HTML's 300x150 legacy default; a CSS height with
+       width:auto must not rasterize a 300px-wide image that layout then
+       stretches (BBC's logo). With neither known the raster keeps the
+       300px default width and takes its height from the ratio, so layout
+       scales it into its container undistorted (the NYT masthead). Only
+       the 300x150 default remains for SVGs without a usable viewBox. */
+    bool width_known = numeric_width > 0.0f;
+    bool height_known = numeric_height > 0.0f;
+    if (!width_known && !height_known && width_missing && height_missing) {
+        numeric_width = 300.0f;
+        width_known = true;
+    }
+    if (width_known != height_known
+        && (width_known ? height_missing : width_missing)) {
         size_t viewbox_length = 0;
         const char *viewbox = document_attribute(
             root, "viewBox", &viewbox_length);
@@ -1833,7 +1881,7 @@ static bool inline_svg_apply_default_viewport(
                        &viewbox_width, &viewbox_height) == 4
                 && isfinite(viewbox_width) && isfinite(viewbox_height)
                 && viewbox_width > 0.0f && viewbox_height > 0.0f) {
-                if (height_missing && numeric_width > 0.0f) {
+                if (!height_known) {
                     float derived = numeric_width * viewbox_height
                                     / viewbox_width;
                     if (isfinite(derived) && derived > 0.0f
@@ -1842,7 +1890,7 @@ static bool inline_svg_apply_default_viewport(
                         snprintf(height, sizeof(height), "%d",
                                  (int) numeric_height);
                     }
-                } else if (width_missing && numeric_height > 0.0f) {
+                } else {
                     float derived = numeric_height * viewbox_width
                                     / viewbox_height;
                     if (isfinite(derived) && derived > 0.0f
@@ -1898,20 +1946,37 @@ static bool inline_svg_inherited_presentation(const char *name)
 }
 
 static bool inline_svg_apply_presentation_value(
-    lxb_dom_node_t *original, lxb_dom_node_t *clone,
-    const ComputedStyle *style, const char *name, const char *css_value)
+    const Stylesheet *sheet, lxb_dom_node_t *original,
+    lxb_dom_node_t *clone, const ComputedStyle *style, const char *name,
+    const char *css_value)
 {
-    char value[STYLE_CUSTOM_VALUE_CAPACITY];
+    /* Room for an attribute's var() references once substituted. */
+    char value[STYLE_CUSTOM_RESOLVED_CAPACITY];
     size_t name_length = strlen(name);
     bool from_css = css_value != NULL;
+    bool invalid = false;
     if (from_css) snprintf(value, sizeof(value), "%s", css_value);
     if (!from_css) {
         size_t attribute_length = 0;
         const char *attribute = document_attribute(
             original, name, &attribute_length);
-        if (attribute != NULL && attribute_length < sizeof(value)) {
+        if (attribute != NULL
+            && attribute_length < STYLE_RETAINED_VALUE_CAPACITY) {
             memcpy(value, attribute, attribute_length);
             value[attribute_length] = '\0';
+            /* Presentation attributes are CSS values: `fill="var(--x)"`
+               resolves on the element exactly like the same declaration
+               (the masthead logo of a large news page is filled with a
+               custom property; utility-CSS tokens are oklch()). One
+               that cannot resolve is invalid at computed-value time, so
+               the property is unset. */
+            if (strstr(value, "var(") != NULL
+                && !style_resolve_value_on_node(
+                       sheet, original, attribute, attribute_length,
+                       value, sizeof(value))) {
+                value[0] = '\0';
+                invalid = true;
+            }
         } else {
             value[0] = '\0';
         }
@@ -1931,12 +1996,38 @@ static bool inline_svg_apply_presentation_value(
         size_t parent_length = 0;
         const char *parent = document_attribute(
             clone->parent, name, &parent_length);
-        if (parent != NULL && parent_length < sizeof(value)) {
+        if (parent != NULL
+            && parent_length < STYLE_RETAINED_VALUE_CAPACITY) {
             memcpy(value, parent, parent_length);
             value[parent_length] = '\0';
         }
     }
-    if (value[0] == '\0') return true;
+    if (value[0] == '\0') {
+        /* The clone still carries the unresolved var() text, which the
+           rasterizer would read as an unknown colour. */
+        if (invalid) {
+            (void) lxb_dom_element_remove_attribute(
+                lxb_dom_interface_element(clone),
+                (const lxb_char_t *) name, name_length);
+        }
+        return true;
+    }
+    /* The rasterizer reads hex and rgb() colors only: settle CSS color
+       functions it does not know (light-dark(), color-mix(), hsl(), ...)
+       to the hex the cascade would compute. MDN's logo is filled with
+       light-dark(). */
+    if (strchr(value, '(') != NULL && strncasecmp(value, "url(", 4) != 0
+        && strncasecmp(value, "rgb", 3) != 0
+        && (strcmp(name, "fill") == 0 || strcmp(name, "stroke") == 0
+            || strcmp(name, "stop-color") == 0)) {
+        uint32_t color = 0;
+        uint8_t alpha = 255;
+        if (style_color_parse(value, strlen(value), &color, &alpha)) {
+            if (alpha == 0) snprintf(value, sizeof(value), "none");
+            else snprintf(value, sizeof(value), "#%06x",
+                          (unsigned) (color & UINT32_C(0xffffff)));
+        }
+    }
     if (inline_svg_value_is(value, "currentcolor")) {
         snprintf(value, sizeof(value), "#%06x",
                  (unsigned) (style->color & UINT32_C(0xffffff)));
@@ -1961,7 +2052,8 @@ static bool inline_svg_apply_node_presentation(
             ? retained.values[i] : NULL;
         if (name == NULL
             || !inline_svg_apply_presentation_value(
-                original, clone, style, name, css_value)) return false;
+                context->stylesheet, original, clone, style, name,
+                css_value)) return false;
     }
     return true;
 }
@@ -2127,18 +2219,61 @@ static bool image_node_in_refresh_set(
     const lxb_dom_node_t *node, lxb_dom_node_t *const *nodes,
     size_t node_count);
 
-/* Only a plain inline-SVG raster qualifies: budget-owned pixels at their
-   source size with no encoded body, session lease, canvas or paint role. */
+/* An SVG raster that keeps its markup (IMAGE_RETARGET_VECTOR), whatever
+   its paint role: display retargeting may have resized or released it, and
+   the borrower takes over that state with the markup. Without markup only a
+   plain inline-SVG raster qualifies: budget-owned pixels at their source
+   size with no encoded body, session lease, canvas or paint role. */
 static bool image_refresh_svg_lendable(const ImageResource *item)
 {
+    if (item->is_canvas || item->canvas_native_surface != NULL
+        || item->width <= 0 || item->height <= 0) return false;
+    if ((item->retarget_flags & IMAGE_RETARGET_VECTOR) != 0
+        && item->encoded != NULL) return true;
     return item->pixels != NULL && item->pixel_body == NULL
         && item->encoded == NULL && item->encoded_body == NULL
-        && !item->is_canvas && item->canvas_native_surface == NULL
         && !item->is_mask && !item->is_background
         && item->pseudo == PSEUDO_NONE && item->source_hash == 0
-        && item->width > 0 && item->height > 0
         && item->width == item->source_width
         && item->height == item->source_height;
+}
+
+/* Whether the entry owns the surface it shows: its pixels, or the markup of
+   a vector raster released while unpainted. */
+static bool image_owns_surface(const ImageResource *item)
+{
+    return item->pixels != NULL ? item->owns_pixels : item->owns_encoded;
+}
+
+/* Moves ownership of a shared surface (pixels and markup) between two
+   entries that show it. */
+static void image_move_surface(ImageResource *from, ImageResource *to)
+{
+    if (from->owns_pixels) {
+        from->owns_pixels = false;
+        to->owns_pixels = true;
+    }
+    if (from->owns_encoded && from->encoded == to->encoded) {
+        from->owns_encoded = false;
+        to->owns_encoded = true;
+    }
+}
+
+/* The bytes of an inline-SVG raster as first rasterized, which decided
+   whether it spent the image count. */
+static size_t image_svg_first_raster_bytes(const ImageResource *item)
+{
+    int width = item->full_width > 0 ? item->full_width : item->width;
+    int height = item->full_height > 0 ? item->full_height : item->height;
+    return (size_t) width * (size_t) height * 4u;
+}
+
+/* A raster keeps its SVG markup only when a reduction could repay it:
+   markup above half the raster's bytes costs more than the smallest
+   reduction display retargeting makes saves. */
+static bool image_svg_keeps_source(size_t decoded, size_t length)
+{
+    return length != 0 && length <= decoded / 2u;
 }
 
 /* A mutation-driven refresh rebuilds into a fresh table, so the hash lookup
@@ -2180,7 +2315,8 @@ static const ImageResource *image_refresh_previous_svg(
     if (match == NULL) return NULL;
     for (size_t i = 0; i < previous->count; i++) {
         const ImageResource *item = &previous->items[i];
-        if (item->pixels == match->pixels
+        if (image_resource_backing_identity(item)
+                == image_resource_backing_identity(match)
             && !image_node_in_refresh_set(
                 item->node, context->refresh_retired_nodes,
                 context->refresh_retired_count)) {
@@ -2189,6 +2325,72 @@ static const ImageResource *image_refresh_previous_svg(
         }
     }
     return match;
+}
+
+/* A refresh rebuilding the table takes over an outgoing SVG raster of the
+   same markup or request, with the paint role of `role`, instead of
+   rasterizing it again. Returns 0 when there is none to take over, 1 when
+   it was taken over (or skipped at the count limit) and -1 when the table
+   could not grow. */
+static int image_refresh_borrow(ImageLoadContext *context,
+                                const ImageResource *role, uint64_t hash,
+                                bool count_exhausted)
+{
+    ImageResources *images = context->images;
+    bool lender_retained = false;
+    const ImageResource *lender =
+        image_refresh_previous_svg(context, hash, &lender_retained);
+    if (lender == NULL) return 0;
+    size_t lent_bytes = lender->pixels == NULL ? 0
+        : (size_t) lender->width * (size_t) lender->height * 4u;
+    /* A retiring lender's bytes were already deducted from this table's
+       total, so re-charge them exactly as a fresh decode would, against the
+       same quota; a raster that would not fit is left to the decoder to
+       refuse. A retained lender keeps its charge and this is an alias. */
+    if (!lender_retained && count_exhausted
+        && image_svg_first_raster_bytes(lender)
+               > IMAGE_COUNT_EXEMPT_DECODED_BYTES) {
+        images->stats.skipped_limit++;
+        return 1;
+    }
+    if (!lender_retained && lent_bytes > context->maximum_decoded_bytes
+                                         - images->stats.decoded_bytes)
+        return 0;
+    ImageResource borrowed = *lender;
+    borrowed.node = role->node;
+    borrowed.url_hash = hash;
+    borrowed.source_hash = role->source_hash;
+    borrowed.is_mask = role->is_mask;
+    borrowed.is_background = role->is_background;
+    borrowed.pseudo = role->pseudo;
+    borrowed.owns_pixels = false;
+    borrowed.owns_encoded = false;
+    borrowed.borrows_previous = true;
+    if (!image_add(images, borrowed)) return -1;
+    image_trace(lender_retained ? "svg-refresh-alias" : "svg-refresh-adopt",
+                "", 0);
+    images->stats.inline_svg_refresh_reused++;
+    if (lender_retained) {
+        images->stats.duplicate++;
+        return 1;
+    }
+    images->stats.attempted++;
+    if (image_svg_first_raster_bytes(lender)
+            <= IMAGE_COUNT_EXEMPT_DECODED_BYTES) {
+        images->stats.count_exempt++;
+    }
+    images->stats.loaded++;
+    if (role->is_mask) images->stats.masks_loaded++;
+    if (role->is_background) images->stats.backgrounds_loaded++;
+    images->stats.decoded_bytes += lent_bytes;
+    images->stats.encoded_bytes += lender->encoded_length;
+    if (lent_bytes > images->stats.largest_source_decode_bytes) {
+        images->stats.largest_source_decode_bytes = lent_bytes;
+    }
+    if (lent_bytes > images->stats.largest_target_decode_bytes) {
+        images->stats.largest_target_decode_bytes = lent_bytes;
+    }
+    return 1;
 }
 
 static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
@@ -2201,11 +2403,13 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
     }
     images->stats.discovered++;
     if (images->count >= MAX_TRACKED_IMAGE_NODES
-        || images->stats.attempted >= context->maximum_count
         || images->stats.decoded_bytes >= context->maximum_decoded_bytes) {
         images->stats.skipped_limit++;
         return true;
     }
+    /* See IMAGE_COUNT_EXEMPT_DECODED_BYTES: an icon-sized raster is admitted
+       even when the count is spent, a larger one only while it is not. */
+    bool count_exhausted = image_count_exhausted(context);
     size_t failures_before = context->budget->failure_count;
     uint64_t serialize_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
@@ -2238,76 +2442,77 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
         budget_free(context->budget, source.data);
         return image_add(images, alias);
     }
+    ImageResource role = {.node = node};
+    int borrowed = image_refresh_borrow(context, &role, hash,
+                                        count_exhausted);
+    if (borrowed != 0) {
+        budget_free(context->budget, source.data);
+        return borrowed > 0;
+    }
     size_t remaining = context->maximum_decoded_bytes
                        - images->stats.decoded_bytes;
-    bool lender_retained = false;
-    const ImageResource *lender =
-        image_refresh_previous_svg(context, hash, &lender_retained);
-    size_t lent_bytes = lender == NULL ? 0
-        : (size_t) lender->width * (size_t) lender->height * 4u;
-    /* A retiring lender's bytes were already deducted from this table's
-       total, so re-charge them exactly as a fresh decode would, against the
-       same quota; a raster that would not fit is left to the decoder to
-       refuse. A retained lender keeps its charge and this is an alias. */
-    if (lender != NULL && (lender_retained || lent_bytes <= remaining)) {
-        ImageResource borrowed = {
-            .node = node, .url_hash = hash, .pixels = lender->pixels,
-            .source_width = lender->source_width,
-            .source_height = lender->source_height,
-            .width = lender->width, .height = lender->height,
-            .borrows_previous = true
-        };
-        budget_free(context->budget, source.data);
-        if (!image_add(images, borrowed)) return false;
-        image_trace(lender_retained ? "inline-svg-refresh-alias"
-                                    : "inline-svg-refresh-adopt", "", 0);
-        images->stats.inline_svg_refresh_reused++;
-        if (lender_retained) {
-            images->stats.duplicate++;
-            return true;
-        }
-        images->stats.attempted++;
-        images->stats.loaded++;
-        images->stats.decoded_bytes += lent_bytes;
-        if (lent_bytes > images->stats.largest_source_decode_bytes) {
-            images->stats.largest_source_decode_bytes = lent_bytes;
-        }
-        if (lent_bytes > images->stats.largest_target_decode_bytes) {
-            images->stats.largest_target_decode_bytes = lent_bytes;
-        }
-        return true;
-    }
     int width = 0, height = 0;
+    size_t raster_limit = remaining;
+    if (count_exhausted && raster_limit > IMAGE_COUNT_EXEMPT_DECODED_BYTES) {
+        raster_limit = IMAGE_COUNT_EXEMPT_DECODED_BYTES;
+    }
     images->stats.attempted++;
     images->stats.inline_svg_rasterized++;
     image_trace("inline-svg-rasterize", source.data, source.length);
     uint64_t rasterize_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
     unsigned char *pixels = image_svg_decode(
-        source.data, source.length, context->budget, remaining,
+        source.data, source.length, context->budget, raster_limit,
         &width, &height);
     if (rasterize_started != 0) {
         images->stats.inline_svg_rasterize_us +=
             image_profile_now_us() - rasterize_started;
     }
-    budget_free(context->budget, source.data);
     if (pixels == NULL || width <= 0 || height <= 0
         || (size_t) width > SIZE_MAX / (size_t) height
         || (size_t) width * (size_t) height > SIZE_MAX / 4u) {
         budget_free(context->budget, pixels);
+        budget_free(context->budget, source.data);
         if (context->budget->failure_count != failures_before) return false;
-        images->stats.unsupported++;
-        image_trace("inline-svg-decode-unsupported", "", 0);
+        /* Nothing is retained, so a refused raster never spends the count.
+           Once the count is spent the decoder was held to icon size, and a
+           larger picture is a limit skip rather than an unsupported one. */
+        images->stats.count_exempt++;
+        if (count_exhausted) {
+            images->stats.skipped_limit++;
+            image_trace("inline-svg-count-limit", "", 0);
+        } else {
+            images->stats.unsupported++;
+            image_trace("inline-svg-decode-unsupported", "", 0);
+        }
         return true;
     }
     size_t decoded = (size_t) width * (size_t) height * 4u;
+    if (decoded <= IMAGE_COUNT_EXEMPT_DECODED_BYTES) {
+        images->stats.count_exempt++;
+    }
     ImageResource resource = {
         .node = node, .url_hash = hash, .pixels = pixels,
         .source_width = width, .source_height = height,
         .width = width, .height = height, .owns_pixels = true
     };
+    /* The serialized markup is the rasterizer's whole input, so display
+       retargeting can rasterize it again at the painted size. */
+    if (image_svg_keeps_source(decoded, source.length)) {
+        char *kept = budget_realloc(context->budget, source.data,
+                                    source.length + 1u);
+        resource.encoded = (unsigned char *) (kept != NULL
+                                              ? kept : source.data);
+        resource.encoded_length = source.length;
+        resource.owns_encoded = true;
+        resource.retarget_flags = IMAGE_RETARGET_VECTOR;
+        source.data = NULL;
+        images->stats.encoded_bytes += resource.encoded_length;
+    }
+    budget_free(context->budget, source.data);
     if (!image_add(images, resource)) {
         budget_free(context->budget, pixels);
+        budget_free(context->budget, resource.encoded);
         return false;
     }
     images->stats.loaded++;
@@ -2661,17 +2866,24 @@ const char *image_select_source(const Stylesheet *stylesheet,
     return image_select_source_for_width(stylesheet, node, 0, length);
 }
 
-static bool svg_response(const FetchResult *fetched)
+static bool svg_markup(const char *content_type, const void *body,
+                       size_t length)
 {
-    if (strstr(fetched->content_type, "image/svg+xml") != NULL) return true;
-    size_t maximum = fetched->length < 512 ? fetched->length : 512;
+    if (strstr(content_type, "image/svg+xml") != NULL) return true;
+    const unsigned char *data = body;
+    size_t maximum = length < 512 ? length : 512;
     for (size_t i = 0; i + 4 <= maximum; i++) {
-        if (fetched->data[i] == '<'
-            && tolower((unsigned char) fetched->data[i + 1]) == 's'
-            && tolower((unsigned char) fetched->data[i + 2]) == 'v'
-            && tolower((unsigned char) fetched->data[i + 3]) == 'g') return true;
+        if (data[i] == '<'
+            && tolower(data[i + 1]) == 's'
+            && tolower(data[i + 2]) == 'v'
+            && tolower(data[i + 3]) == 'g') return true;
     }
     return false;
+}
+
+static bool svg_response(const FetchResult *fetched)
+{
+    return svg_markup(fetched->content_type, fetched->data, fetched->length);
 }
 
 static bool pending_add_target(ImageLoadContext *context,
@@ -2830,10 +3042,25 @@ static ImageDecodedCacheResult image_adopt_decoded_cache(
         .pseudo = primary.pseudo,
         .owns_pixels = true
     };
+    /* An SVG raster also leases the cached markup, so display retargeting
+       can rasterize it at the size this page paints it. */
+    if (intrinsic && cached->body != NULL
+        && inline_svg_external_use_href(primary.node, NULL) == NULL
+        && image_svg_keeps_source(decoded.pixels->length, cached->length)
+        && svg_markup(cached->content_type, cached->data, cached->length)) {
+        resource.encoded_body = browser_shared_body_retain(cached->body);
+        if (resource.encoded_body != NULL) {
+            resource.encoded = resource.encoded_body->data;
+            resource.encoded_length = cached->length;
+            resource.owns_encoded = true;
+            resource.retarget_flags = IMAGE_RETARGET_VECTOR;
+        }
+    }
     size_t before = context->images->count;
     if (!image_add(context->images, resource)
         || context->images->count == before) {
         image_resource_release_owned_pixels(context->budget, &resource);
+        browser_shared_body_release(resource.encoded_body);
         return IMAGE_DECODED_CACHE_FAILED;
     }
     context->images->stats.loaded++;
@@ -2873,6 +3100,7 @@ static ImageDecodedCacheResult image_adopt_decoded_cache(
         alias.is_background = target.is_background;
         alias.pseudo = target.pseudo;
         alias.owns_pixels = false;
+        alias.owns_encoded = false;
         context->images->stats.duplicate++;
         if (!image_add(context->images, alias)) {
             return IMAGE_DECODED_CACHE_FAILED;
@@ -2953,23 +3181,19 @@ static bool image_pending_raster_publish(
                 resource->width, resource->height);
         }
     }
-    if (resource->encoded_body != NULL) {
-        browser_shared_body_release(resource->encoded_body);
-    } else {
-        budget_free(context->budget, resource->encoded);
-    }
-    resource->encoded = NULL;
-    resource->encoded_body = NULL;
-    resource->encoded_length = 0;
-    resource->owns_encoded = false;
+    /* The encoded bytes stay with the resource (usually a lease on the HTTP
+       cache's copy): display retargeting decodes from them again if a
+       reduced surface is later painted larger. */
     if (!image_add(images, *resource)) {
         image_resource_release_owned_pixels(context->budget, resource);
         image_pending_raster_release(context);
         return false;
     }
-    /* The primary entry now owns the surface. The pending transaction keeps
-       only metadata so rollback can release through ImageResources once. */
+    /* The primary entry now owns the surface and the encoded bytes. The
+       pending transaction keeps only metadata so rollback can release
+       through ImageResources once. */
     resource->owns_pixels = false;
+    resource->owns_encoded = false;
     images->stats.loaded++;
     if (resource->is_mask) images->stats.masks_loaded++;
     if (resource->is_background) images->stats.backgrounds_loaded++;
@@ -2978,6 +3202,10 @@ static bool image_pending_raster_publish(
     if (resource->width != resource->source_width
         || resource->height != resource->source_height) {
         images->stats.downsampled++;
+    }
+    if (decoded->working_bytes
+            > images->stats.largest_decode_working_bytes) {
+        images->stats.largest_decode_working_bytes = decoded->working_bytes;
     }
     if (pending->source_decoded_bytes
             > images->stats.largest_source_decode_bytes) {
@@ -3178,7 +3406,12 @@ static bool finish_image_fetch(ImageLoadContext *context,
             budget_rollback(context->budget, svg_checkpoint);
         }
     }
-    budget_free(context->budget, external_symbol.data);
+    /* A kept raster keeps its markup: the response (usually a lease on the
+       HTTP cache's copy), the data: body or the referenced symbol. */
+    bool keep_svg = pixels != NULL && image_svg_keeps_source(
+        (size_t) width * (size_t) height * 4u, decode_length);
+    if (!keep_svg || !external_use)
+        budget_free(context->budget, external_symbol.data);
     if (!supported || width <= 0 || height <= 0
         || (size_t) width > SIZE_MAX / (size_t) height
         || (size_t) width * (size_t) height > SIZE_MAX / 4u) {
@@ -3186,6 +3419,8 @@ static bool finish_image_fetch(ImageLoadContext *context,
         image_trace("decode-unsupported", fetched->effective_url,
                     strlen(fetched->effective_url));
         budget_free(context->budget, pixels);
+        if (keep_svg && external_use)
+            budget_free(context->budget, external_symbol.data);
         fetch_result_destroy(fetched);
         return true;
     }
@@ -3242,6 +3477,9 @@ static bool finish_image_fetch(ImageLoadContext *context,
     }
     if (decoded > decoded_limit) {
         images->stats.skipped_limit++;
+        if (keep_svg && external_use)
+            budget_free(context->budget, external_symbol.data);
+        budget_free(context->budget, pixels);
         fetch_result_destroy(fetched);
         return true;
     }
@@ -3281,7 +3519,13 @@ static bool finish_image_fetch(ImageLoadContext *context,
             }
         }
     }
-    if (!is_svg) {
+    if (keep_svg) resource.retarget_flags = IMAGE_RETARGET_VECTOR;
+    if (keep_svg && external_use) {
+        resource.encoded = (unsigned char *) external_symbol.data;
+        resource.encoded_length = decode_length;
+        resource.owns_encoded = true;
+    }
+    if (!is_svg || (keep_svg && !external_use)) {
         resource.encoded = (unsigned char *) fetched->data;
         resource.encoded_body = fetched->shared_body;
         resource.encoded_length = fetched->length;
@@ -3290,6 +3534,8 @@ static bool finish_image_fetch(ImageLoadContext *context,
         fetched->data = NULL;
         fetched->length = 0;
         fetched->capacity = 0;
+    }
+    if (!is_svg) {
         bool scaled_jpeg = resource.encoded_length >= 2u
             && resource.encoded[0] == 0xffu
             && resource.encoded[1] == 0xd8u
@@ -3326,6 +3572,11 @@ static bool finish_image_fetch(ImageLoadContext *context,
             unsigned char *decoded_pixels = NULL;
             ImageDecodeStatus decode_status = image_resource_decode_checked(
                 &resource, context->budget, &decoded_pixels);
+            if (image_decode_last_peak_bytes()
+                    > images->stats.largest_decode_working_bytes) {
+                images->stats.largest_decode_working_bytes =
+                    image_decode_last_peak_bytes();
+            }
             if (decode_status == IMAGE_DECODE_SUCCEEDED) {
                 resource.pixels = decoded_pixels;
                 resource.owns_pixels = true;
@@ -3341,15 +3592,8 @@ static bool finish_image_fetch(ImageLoadContext *context,
                             source_width, source_height, width, height);
                     }
                 }
-                if (resource.encoded_body != NULL) {
-                    browser_shared_body_release(resource.encoded_body);
-                } else {
-                    budget_free(context->budget, resource.encoded);
-                }
-                resource.encoded = NULL;
-                resource.encoded_body = NULL;
-                resource.encoded_length = 0;
-                resource.owns_encoded = false;
+                /* Keep the encoded bytes (usually a lease on the HTTP
+                   cache's copy) for display retargeting. */
             } else if (is_webp) {
                 /* WebP is always attempted in the cooperative resource
                    continuation. If that bounded attempt cannot be admitted,
@@ -3611,13 +3855,15 @@ static void cancel_pending(ImageLoadContext *context)
     image_pending_raster_release(context);
 }
 
-/* Many image CDNs expose the same asset through an extension-selected
-   endpoint. Prefer a same-origin JPEG sibling when the URL makes that mapping
-   explicit: the JPEG path has a smaller PSP decoder footprint, while signed
-   or content-negotiated WebP URLs remain supported by the bounded decoder.
-   This is deliberately narrower than arbitrary content negotiation: the path
-   or one complete query value must end in .webp, and the substitution can
-   only shrink it. */
+/* Many image CDNs publish a WebP rendition by appending ".webp" to the
+   original file name ("photo.jpg.webp" beside "photo.jpg"). When the URL
+   itself names that original, prefer it: the JPEG/PNG/GIF path has a smaller
+   PSP decoder footprint, and the URL guarantees the sibling it names. The
+   suffix must end the path or one complete query value, and the rewrite only
+   removes it. A bare "name.webp" is not rewritten: nothing in it says that a
+   "name.jpg" exists (guessing one turned working WebP images into 404s), and
+   the bounded WebP decoder handles it, as it does signed and
+   content-negotiated WebP URLs. */
 static bool image_rewrite_webp_sibling(char url[4096])
 {
     if (url == NULL) return false;
@@ -3630,8 +3876,18 @@ static bool image_rewrite_webp_sibling(char url[4096])
         }
     }
     if (suffix == NULL) return false;
-    memcpy(suffix, ".jpg", 4);
-    memmove(suffix + 4, suffix + 5, strlen(suffix + 5) + 1);
+    static const char *const originals[] = {".jpg", ".jpeg", ".png", ".gif"};
+    bool names_original = false;
+    for (size_t i = 0; i < sizeof(originals) / sizeof(originals[0]); i++) {
+        size_t length = strlen(originals[i]);
+        if ((size_t) (suffix - url) > length
+            && strncasecmp(suffix - length, originals[i], length) == 0) {
+            names_original = true;
+            break;
+        }
+    }
+    if (!names_original) return false;
+    memmove(suffix, suffix + 5, strlen(suffix + 5) + 1);
     return true;
 }
 
@@ -3828,7 +4084,8 @@ static bool load_image_node_with_provenance_impl(
             images->stats.failed++;
             return true;
         }
-        if (images->stats.attempted >= context->maximum_count
+        bool count_exempt = source_length <= IMAGE_COUNT_EXEMPT_DATA_URL_BYTES;
+        if ((!count_exempt && image_count_exhausted(context))
             || images->stats.encoded_bytes
                    >= context->maximum_total_encoded_bytes
             || images->stats.decoded_bytes
@@ -3852,6 +4109,9 @@ static bool load_image_node_with_provenance_impl(
                 .source_height = duplicate->source_height,
                 .width = duplicate->width,
                 .height = duplicate->height,
+                .retarget_flags = duplicate->retarget_flags,
+                .full_width = duplicate->full_width,
+                .full_height = duplicate->full_height,
                 .is_mask = is_mask,
                 .is_background = is_background,
                 .pseudo = pseudo,
@@ -3861,6 +4121,13 @@ static bool load_image_node_with_provenance_impl(
             images->stats.duplicate++;
             return image_add(images, alias);
         }
+        ImageResource role = {
+            .node = node, .source_hash = source_hash, .is_mask = is_mask,
+            .is_background = is_background, .pseudo = pseudo
+        };
+        int borrowed = image_refresh_borrow(
+            context, &role, hash, image_count_exhausted(context));
+        if (borrowed != 0) return borrowed > 0;
         size_t remaining = context->maximum_total_encoded_bytes
                            - images->stats.encoded_bytes;
         size_t maximum = context->maximum_single_encoded_bytes < remaining
@@ -3872,6 +4139,7 @@ static bool load_image_node_with_provenance_impl(
             context->budget, source, source_length, maximum, &body,
             &body_length, media_type, sizeof(media_type));
         images->stats.attempted++;
+        if (count_exempt) images->stats.count_exempt++;
         if (decoded != DATA_URL_DECODED) {
             if (decoded == DATA_URL_TOO_LARGE) {
                 images->stats.skipped_limit++;
@@ -3972,6 +4240,9 @@ static bool load_image_node_with_provenance_impl(
                                .source_height = duplicate->source_height,
                                .width = duplicate->width,
                                .height = duplicate->height,
+                               .retarget_flags = duplicate->retarget_flags,
+                               .full_width = duplicate->full_width,
+                               .full_height = duplicate->full_height,
                                .is_mask = is_mask,
                                .is_background = is_background,
                                .pseudo = pseudo,
@@ -3980,6 +4251,13 @@ static bool load_image_node_with_provenance_impl(
         images->stats.duplicate++;
         return image_add(images, alias);
     }
+    ImageResource role = {
+        .node = node, .source_hash = source_hash, .is_mask = is_mask,
+        .is_background = is_background, .pseudo = pseudo
+    };
+    int borrowed = image_refresh_borrow(
+        context, &role, hash, image_count_exhausted(context));
+    if (borrowed != 0) return borrowed > 0;
     PendingImageFetch *same = pending_find_hash(context, hash);
     if (same != NULL) {
         return pending_add_target(context, same, node, source_hash, is_mask,
@@ -3996,7 +4274,7 @@ static bool load_image_node_with_provenance_impl(
         image_trace("stage-expired", resolved, strlen(resolved));
         return true;
     }
-    if (images->stats.attempted >= context->maximum_count
+    if (image_count_exhausted(context)
         || images->stats.encoded_bytes >= context->maximum_total_encoded_bytes
         || images->stats.decoded_bytes >= context->maximum_decoded_bytes) {
         images->stats.skipped_limit++;
@@ -4800,9 +5078,13 @@ static bool images_load_external_impl(
     /* Selected refresh prepared this cache against the stable outgoing table
        before creating its transactional replacement. Never retain a pointer
        to that stack-local temporary in the page's cache. */
-    if (!refresh_complete_nodes)
+    if (!refresh_complete_nodes) {
+        if (full_traversal)
+            layout_reuse_cache_expect_elements(style_cache,
+                                               document->element_count);
         layout_reuse_cache_prepare(
             style_cache, stylesheet, fonts, images, viewport_width);
+    }
     bool owns_scheduler = scheduler == NULL;
     if (owns_scheduler) {
         size_t reserved = maximum_single_encoded_bytes;
@@ -5090,13 +5372,14 @@ static void image_rebuild_release_unlendable(ImageResources *images)
 {
     for (size_t i = 0; i < images->count; i++) {
         ImageResource *item = &images->items[i];
-        if (image_refresh_svg_lendable(item) || !item->owns_pixels) continue;
+        if (image_refresh_svg_lendable(item) || !image_owns_surface(item))
+            continue;
         for (size_t at = 0; at < images->count; at++) {
             ImageResource *kept = &images->items[at];
-            if (kept->pixels == item->pixels
+            if (image_resource_backing_identity(kept)
+                    == image_resource_backing_identity(item)
                 && image_refresh_svg_lendable(kept)) {
-                kept->owns_pixels = true;
-                item->owns_pixels = false;
+                image_move_surface(item, kept);
                 break;
             }
         }
@@ -5172,13 +5455,15 @@ bool images_rebuild_external_reusing_rasters(
         borrowed->borrows_previous = false;
         for (size_t at = 0; at < images->count; at++) {
             ImageResource *lender = &images->items[at];
-            if (lender->owns_pixels && lender->pixels == borrowed->pixels) {
-                lender->owns_pixels = false;
-                borrowed->owns_pixels = true;
+            if (image_owns_surface(lender)
+                && image_resource_backing_identity(lender)
+                       == image_resource_backing_identity(borrowed)) {
+                image_move_surface(lender, borrowed);
                 break;
             }
         }
     }
+    replacement.retarget = images->retarget;
     images_destroy(images);
     *images = replacement;
     return true;
@@ -5284,12 +5569,13 @@ static size_t image_refresh_owned_decoded_bytes(
    refreshes skip the icons outright. */
 static size_t image_refresh_owned_svg_attempts(
     const ImageResources *images, lxb_dom_node_t *const *nodes,
-    size_t node_count)
+    size_t node_count, size_t *exempt)
 {
     size_t attempts = 0;
+    *exempt = 0;
     for (size_t i = 0; i < images->count; i++) {
         const ImageResource *item = &images->items[i];
-        if (!item->owns_pixels || !image_refresh_svg_lendable(item)
+        if (!image_owns_surface(item) || !image_refresh_svg_lendable(item)
             || !image_node_in_refresh_set(item->node, nodes, node_count)) {
             continue;
         }
@@ -5299,12 +5585,18 @@ static size_t image_refresh_owned_svg_attempts(
             if (alias != i
                 && !image_node_in_refresh_set(
                     candidate->node, nodes, node_count)
-                && candidate->pixels == item->pixels) {
+                && image_resource_backing_identity(candidate)
+                       == image_resource_backing_identity(item)) {
                 retained_alias = true;
                 break;
             }
         }
-        if (!retained_alias) attempts++;
+        if (retained_alias) continue;
+        attempts++;
+        if (image_svg_first_raster_bytes(item)
+                <= IMAGE_COUNT_EXEMPT_DECODED_BYTES) {
+            (*exempt)++;
+        }
     }
     return attempts;
 }
@@ -5347,7 +5639,8 @@ static bool image_refresh_lenders_present(
         bool present = false;
         for (size_t at = 0; !present && at < images->count; at++) {
             const ImageResource *lender = &images->items[at];
-            present = lender->pixels == borrowed->pixels
+            present = image_resource_backing_identity(lender)
+                    == image_resource_backing_identity(borrowed)
                 && lender->url_hash == borrowed->url_hash
                 && lender->width == borrowed->width
                 && lender->height == borrowed->height
@@ -5372,11 +5665,12 @@ static void image_refresh_adopt_lent_surfaces(
         borrowed->borrows_previous = false;
         for (size_t at = 0; at < images->count; at++) {
             ImageResource *lender = &images->items[at];
-            if (lender->owns_pixels && lender->pixels == borrowed->pixels
+            if (image_owns_surface(lender)
+                && image_resource_backing_identity(lender)
+                       == image_resource_backing_identity(borrowed)
                 && image_node_in_refresh_set(
                     lender->node, nodes, node_count)) {
-                lender->owns_pixels = false;
-                borrowed->owns_pixels = true;
+                image_move_surface(lender, borrowed);
                 break;
             }
         }
@@ -5445,8 +5739,9 @@ bool images_refresh_external_nodes_reusing_layout_styles(
         images, nodes, node_count);
     size_t retired_decoded = image_refresh_owned_decoded_bytes(
         images, nodes, node_count);
+    size_t retired_exempt = 0;
     size_t retired_attempts = image_refresh_owned_svg_attempts(
-        images, nodes, node_count);
+        images, nodes, node_count, &retired_exempt);
     ImageResources replacement = {
         .budget = budget,
         .stats = images->stats,
@@ -5461,6 +5756,9 @@ bool images_refresh_external_nodes_reusing_layout_styles(
     replacement.stats.attempted =
         retired_attempts <= replacement.stats.attempted
         ? replacement.stats.attempted - retired_attempts : 0;
+    replacement.stats.count_exempt =
+        retired_exempt <= replacement.stats.count_exempt
+        ? replacement.stats.count_exempt - retired_exempt : 0;
     const ImageResources *lenders = images;
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_DISABLE_SVG_REFRESH_REUSE") != NULL) lenders = NULL;
@@ -5977,6 +6275,7 @@ void images_destroy(ImageResources *images)
 {
     if (images == NULL) return;
     if (images->budget != NULL) {
+        images_retarget_plan_discard(images);
         for (size_t i = 0; i < images->count; i++) {
             image_canvas_native_forget(&images->items[i]);
             image_resource_release_owned_pixels(

@@ -21,7 +21,13 @@ bool psp_set_presentation_css(
     const BrowserProfile *profile, bool reader_mode,
     const char *url, unsigned font_percent, bool relayout)
 {
-    char css[SITE_ADAPTER_READER_CSS_LIMIT];
+    /* The Reader/Basic sheet may use its whole limit (the generic
+       content-shape sheet is 7.7 KiB), and the cosmetic and cookie-notice
+       sheets are appended after it: size for all three, or every extracted
+       presentation fails on the default content-blocker settings. */
+    char css[SITE_ADAPTER_READER_CSS_LIMIT
+             + CONTENT_BLOCKER_COSMETIC_CSS_LIMIT
+             + CONTENT_BLOCKER_COOKIE_CSS_LIMIT + 2u];
     size_t length = 0;
     if (reader_mode) {
         char adapter[32];
@@ -86,7 +92,7 @@ void psp_leave_reader_for_navigation(
 {
     browser_engine_set_reader_candidate_mode(engine, false);
     unsigned global_percent = browser_profile_page_font_percent(profile);
-    ui->reader_mode = false;
+    psp_reader_mark_left(ui);
     ui->basic_mode = false;
     ui->page_font_percent = global_percent;
     if (!psp_set_presentation_css(
@@ -97,12 +103,44 @@ void psp_leave_reader_for_navigation(
     }
 }
 
+bool psp_app_set_basic_view(PspApp *app, const char *url, bool enable,
+                            bool *page_dirty)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    PspUiState *ui = &app->process->presentation.ui;
+    unsigned percent = browser_profile_page_font_percent(profile);
+    if (!psp_set_presentation_css(engine, ui, profile, enable, url, percent,
+                                  true)) {
+        printf("tilefinch-basic-view: enable=%d css-refused error=\"%s\"\n",
+               enable ? 1 : 0, browser_engine_last_error(engine));
+        return false;
+    }
+    if (enable && !browser_engine_activate_basic_view(engine)) {
+        printf("tilefinch-basic-view: enable=1 refused error=\"%s\"\n",
+               browser_engine_last_error(engine));
+        (void) psp_set_presentation_css(engine, ui, profile, ui->basic_mode,
+                                        url, ui->page_font_percent, true);
+        return false;
+    }
+    ui->basic_mode = enable;
+    ui->reader_mode = false;
+    ui->page_font_percent = percent;
+    browser_engine_set_reader_candidate_mode(engine, false);
+    (void) psp_engine_views_refresh(app->views, engine);
+    BrowserController *controller = browser_engine_controller(engine);
+    if (controller != NULL) (void) controller_rebind_focus(controller);
+    if (page_dirty != NULL) *page_dirty = true;
+    return true;
+}
+
 bool psp_reader_navigation_prepare(
     BrowserEngine *engine, PspUiState *ui, const BrowserProfile *profile,
     PspReaderNavigation *navigation, const char *url)
 {
     if (engine == NULL || ui == NULL || profile == NULL
-        || navigation == NULL || url == NULL || !ui->reader_mode
+        || navigation == NULL || url == NULL
+        || !psp_reader_carries_to_navigation(ui)
         || navigation->pending) {
         return false;
     }
@@ -142,14 +180,12 @@ void psp_reader_navigation_finish(
         return;
     }
     if (succeeded) {
-        ui->reader_mode = true;
-        ui->basic_mode = false;
+        psp_reader_mark_engaged(ui, false);
         ui->page_font_percent = navigation->destination_percent;
     } else {
         const char *incumbent_url =
             current_url == NULL ? ui->url : current_url;
-        ui->reader_mode = true;
-        ui->basic_mode = false;
+        psp_reader_mark_engaged(ui, false);
         ui->page_font_percent = navigation->incumbent_percent;
         /* Candidate failure leaves the incumbent page and its already-drawn
            Reader layout intact. Restore only the configured sheet so the
@@ -159,7 +195,7 @@ void psp_reader_navigation_finish(
                 engine, ui, profile, true, incumbent_url,
                 navigation->incumbent_percent, false)) {
             (void) browser_engine_set_user_css(engine, "", 0);
-            ui->reader_mode = false;
+            psp_reader_mark_left(ui);
             ui->basic_mode = false;
             ui->page_font_percent =
                 browser_profile_page_font_percent(profile);
@@ -470,7 +506,8 @@ bool psp_run_initial_page_load(
                 status = BROWSER_NAVIGATION_JOB_CANCELLED;
             }
         }
-        if (dump_provisional && !provisional_dump_attempted) {
+        if (PSP_VALIDATION_KNOB(dump_provisional)
+            && !provisional_dump_attempted) {
             BrowserProvisionalViewport provisional = {0};
             if (browser_engine_provisional_viewport(engine, &provisional)) {
                 provisional_dump_attempted = true;
@@ -506,7 +543,10 @@ bool psp_run_initial_page_load(
     BrowserNavigationJobMetrics metrics = {0};
     (void) browser_engine_navigation_job_metrics(engine, &metrics);
     BrowserEngineMetrics engine_metrics = {0};
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Only the validation reports below read the engine metrics. */
     (void) browser_engine_metrics(engine, &engine_metrics);
+#endif
     const NavigationPerformance *performance =
         &engine_metrics.navigation;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -676,8 +716,10 @@ bool psp_run_initial_page_load(
             (unsigned long long) metrics.adapter_body_transfer_us,
             (unsigned long long) metrics.adapter_admission_collect_us);
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_report_blocking_script_samples(performance);
     psp_report_background_transport_metrics();
+#endif
     if (dump_provisional && !provisional_dump_attempted) {
         printf("tilefinch-psp-script: provisional-frame-dumped=0 "
                "reason=unavailable\n");
@@ -685,6 +727,10 @@ bool psp_run_initial_page_load(
     psp_ui_set_loading(
         ui, false,
         status == BROWSER_NAVIGATION_JOB_SUCCEEDED ? 1000 : 0);
+    NavigationBotWall bot_wall;
+    if (status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && navigation_bot_wall(browser_engine_navigation(engine), &bot_wall))
+        (void) psp_ui_show_site_blocked_status(ui, bot_wall.site, 480);
     if (status == BROWSER_NAVIGATION_JOB_FAILED) {
         char visible_error[PSP_UI_STATUS_CAPACITY];
         TilefinchTlsGuidance tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
@@ -794,6 +840,8 @@ void psp_report_blocking_script_samples(
 __attribute__((noinline, cold))
 void psp_report_background_transport_metrics(void)
 {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Validation-log output only. */
     FetchBackgroundTransportMetrics metrics = {0};
     if (!fetch_background_transport_metrics(&metrics)) return;
     printf("tilefinch-background-transport: stream-starts=%zu "
@@ -850,6 +898,7 @@ void psp_report_background_transport_metrics(void)
            dns.answered, dns.retransmitted, dns.nxdomain, dns.fallbacks,
            dns.stood_down ? 1 : 0);
 #endif
+#endif /* TILEFINCH_PSP_VALIDATION_LOG */
 }
 
 void psp_report_budget_counters(const Budget *budget,

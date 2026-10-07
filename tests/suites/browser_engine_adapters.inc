@@ -15,10 +15,12 @@ static void report_provider_navigation(const char *phase,
     const BrowserNavigationJobMetrics *metrics)
 {
     printf("provider-navigation phase=%s elapsed-us=%llu max-transform-us=%llu "
+        "max-transform-bytes=%zu "
         "max-unit-us=%llu commit-us=%llu parse-us=%llu style-us=%llu "
         "resource-us=%llu layout-us=%llu runtime-us=%llu\n", phase,
         (unsigned long long) metrics->elapsed_us,
         (unsigned long long) metrics->maximum_transform_slice_us,
+        metrics->maximum_transform_slice_bytes,
         (unsigned long long) metrics->maximum_irreducible_unit_us,
         (unsigned long long) metrics->adapter_commit_us,
         (unsigned long long) metrics->adapter_parse_us,
@@ -26,6 +28,41 @@ static void report_provider_navigation(const char *phase,
         (unsigned long long) metrics->adapter_resource_us,
         (unsigned long long) metrics->adapter_layout_us,
         (unsigned long long) metrics->adapter_runtime_us);
+}
+
+/* The most bytes one transform slice of a provider navigation may advance
+   or emit (BrowserNavigationJobMetrics.maximum_transform_slice_bytes): one
+   48 KiB renderer window (a 16 KiB step plus a 32 KiB object overlap)
+   beside one 16 KiB comments scan, with room for the HTML of one emission
+   step. Decoding or walking the 768 KiB search fixture in one slice is
+   nearly ten times this. */
+#define TEST_PROVIDER_SLICE_BYTES (80u * 1024u)
+
+/* Pump a provider navigation whose slice and unit times are checked against
+   ceilings (50 ms per transform slice, 100 ms for the irreducible commit).
+   The ceilings are about the work in one slice, but a real clock also
+   counts the time a loaded host spends running other processes in the
+   middle of it: at load averages near 140, slices of about 19 us of work
+   measured 34-100 ms and failed 5-11 of 120 runs. On the CPU-paced clock
+   (tilefinch_test_clocks.h) the engine's own slice and unit timers count
+   only this process's CPU time. The ceilings are far too loose to show
+   whether a slice is bounded (decoding the whole 768 KiB search response
+   at once takes under 1 ms), so maximum_transform_slice_bytes checks the
+   slicing itself. */
+static BrowserNavigationJobStatus test_pump_provider_navigation_cpu_paced(
+    BrowserEngine *engine, const BrowserNavigationJobQuota *quota,
+    size_t pump_limit)
+{
+    TestCpuPacedClock clock;
+    test_cpu_paced_clock_install(&clock);
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0;
+         pumps < pump_limit && status == BROWSER_NAVIGATION_JOB_PENDING;
+         pumps++) {
+        status = browser_engine_pump_navigation(engine, quota);
+    }
+    tilefinch_platform_set_services(NULL);
+    return status;
 }
 
 static int test_watch_reuse_load(Budget *budget, BrowserSession *session,
@@ -400,12 +437,7 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
           && browser_engine_begin_navigation_url(
                  engine, url, 1u * MIB, 1000, true));
-    status = BROWSER_NAVIGATION_JOB_PENDING;
-    for (size_t pumps = 0;
-         pumps < 128 && status == BROWSER_NAVIGATION_JOB_PENDING;
-         pumps++) {
-        status = browser_engine_pump_navigation(engine, &quota);
-    }
+    status = test_pump_provider_navigation_cpu_paced(engine, &quota, 128);
     BrowserNavigationJobMetrics metrics = {0};
     CHECK(browser_engine_navigation_job_metrics(engine, &metrics));
     report_provider_navigation("watch", &metrics);
@@ -420,6 +452,9 @@ static int test_cooperative_site_adapter_navigation(void)
           && metrics.pump_calls > 6
           && metrics.load.pump_calls > 4
           && metrics.load.body_bytes == 1190
+          && metrics.maximum_transform_slice_bytes > 0
+          && metrics.maximum_transform_slice_bytes
+                 <= TEST_PROVIDER_SLICE_BYTES
           && metrics.maximum_transform_slice_us < UINT64_C(50000)
           && metrics.transform_slices > 6
           && metrics.maximum_irreducible_unit_us < UINT64_C(100000)
@@ -867,12 +902,8 @@ static int test_cooperative_site_adapter_navigation(void)
               engine,
               "https://www.youtube.com/results?search_query=ratchet",
               1u * MIB, 2000, true));
-    status = BROWSER_NAVIGATION_JOB_PENDING;
-    for (size_t pumps = 0;
-         pumps < 256 && status == BROWSER_NAVIGATION_JOB_PENDING;
-         pumps++) {
-        status = browser_engine_pump_navigation(engine, &large_quota);
-    }
+    status = test_pump_provider_navigation_cpu_paced(
+        engine, &large_quota, 256);
     metrics = (BrowserNavigationJobMetrics) {0};
     lxb_dom_node_t *compact_body = document_body_node(
         &browser_engine_navigation(engine)->page.document);
@@ -880,10 +911,14 @@ static int test_cooperative_site_adapter_navigation(void)
     const char *compact_class = compact_body == NULL ? NULL
         : document_attribute(
               compact_body, "class", &compact_class_length);
-    CHECK(browser_engine_navigation_job_metrics(engine, &metrics)
-          && status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+    CHECK(browser_engine_navigation_job_metrics(engine, &metrics));
+    report_provider_navigation("search", &metrics);
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
           && metrics.load.body_bytes == large_body_length
           && metrics.pump_calls > 80
+          && metrics.maximum_transform_slice_bytes > 0
+          && metrics.maximum_transform_slice_bytes
+                 <= TEST_PROVIDER_SLICE_BYTES
           && metrics.maximum_transform_slice_us < UINT64_C(50000)
           && metrics.transform_slices > 12
           && metrics.maximum_irreducible_unit_us < UINT64_C(100000)
@@ -895,7 +930,6 @@ static int test_cooperative_site_adapter_navigation(void)
               browser_engine_navigation(engine)->page.document.title,
               "ratchet") != NULL);
     char focused_provider_url[NAVIGATION_URL_LIMIT] = {0};
-    report_provider_navigation("search", &metrics);
     CHECK(browser_engine_focused_provider_media_url(
               engine, focused_provider_url,
               sizeof(focused_provider_url)));
@@ -1249,6 +1283,542 @@ static int test_google_search_compatibility_adapter(void)
 
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
+    return 0;
+}
+
+/* "Try Google anyway" (site_identity.h): the Google document presents one
+   honest identity in its requests and realms, the opt-in marker never
+   reaches the network, the opt-in persists, and refusals fall back. */
+typedef struct {
+    const char *url;
+    const char *effective_url;
+    long status;
+    const char *content_type;
+    const char *body;
+    bool failed;
+} GoogleIdentityRecord;
+
+static bool write_google_identity_replay(
+    char directory[128], const GoogleIdentityRecord *records, size_t count)
+{
+    snprintf(directory, 128, "/tmp/tilefinch-google-identity-XXXXXX");
+    if (mkdtemp(directory) == NULL) return false;
+    char path[256];
+    bool ok = true;
+    for (size_t i = 0; ok && i < count; i++) {
+        const GoogleIdentityRecord *record = &records[i];
+        size_t length = strlen(record->body);
+        snprintf(path, sizeof(path), "%s/%04zu.body", directory, i);
+        FILE *body = fopen(path, "wb");
+        ok = body != NULL && fwrite(record->body, 1, length, body) == length;
+        ok = body != NULL && fclose(body) == 0 && ok;
+        snprintf(path, sizeof(path), "%s/%04zu.meta", directory, i);
+        FILE *meta = ok ? fopen(path, "wb") : NULL;
+        ok = meta != NULL && fprintf(
+            meta,
+            "psp-http-trace=1\nmethod=GET\nurl=%s\n"
+            "success=%d\nasync-delay-pumps=0\nexternal-cancel=0\n"
+            "transport-timeout=0\nerror=%s\nstatus=%ld\nlength=%zu\n"
+            "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
+            "cf-mitigated=\naccept-ch=\ncritical-ch=\nserver=gws\n"
+            "cf-ray=\nset-cookie-count=0\n",
+            record->url, record->failed ? 0 : 1,
+            record->failed ? "Invalid HTTP header field was received" : "",
+            record->status, record->failed ? 0u : length,
+            record->effective_url == NULL ? record->url
+                                          : record->effective_url,
+            record->content_type) > 0;
+        ok = meta != NULL && fclose(meta) == 0 && ok;
+    }
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    FILE *trace = ok ? fopen(path, "wb") : NULL;
+    return trace != NULL && fprintf(
+        trace, "psp-http-trace-clock=1\norigin-ms=1700000000000\n"
+               "capture-complete=yes\nrecord-count=%zu\n", count) > 0
+        && fclose(trace) == 0;
+}
+
+static void remove_google_identity_replay(const char *directory,
+                                          size_t count)
+{
+    char path[256];
+    for (size_t i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/%04zu.body", directory, i);
+        (void) unlink(path);
+        snprintf(path, sizeof(path), "%s/%04zu.meta", directory, i);
+        (void) unlink(path);
+    }
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    (void) unlink(path);
+    (void) rmdir(directory);
+}
+
+/* The User-Agent replay saw for the latest request whose key is url, or
+   NULL when no such request reached the transport. */
+static const char *google_identity_replayed_user_agent(const char *url)
+{
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    size_t capacity = sizeof(faults->replayed_requests)
+        / sizeof(faults->replayed_requests[0]);
+    unsigned count = faults->replayed_request_count;
+    for (unsigned back = 0; back < count && back < capacity; back++) {
+        size_t slot = (count - 1u - back) % capacity;
+        if (strcmp(faults->replayed_requests[slot].url, url) == 0)
+            return faults->replayed_requests[slot].user_agent;
+    }
+    return NULL;
+}
+
+static bool google_identity_replay_saw_marker(void)
+{
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    size_t capacity = sizeof(faults->replayed_requests)
+        / sizeof(faults->replayed_requests[0]);
+    unsigned count = faults->replayed_request_count;
+    for (unsigned back = 0; back < count && back < capacity; back++) {
+        size_t slot = (count - 1u - back) % capacity;
+        if (strstr(faults->replayed_requests[slot].url, "tilefinch_raw"))
+            return true;
+    }
+    return false;
+}
+
+static BrowserNavigationJobStatus google_identity_pump(BrowserEngine *engine)
+{
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0u;
+         pumps < 4096u && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++)
+        status = browser_engine_pump_navigation(engine, NULL);
+    return status;
+}
+
+static const char *google_identity_prepared_user_agent(
+    const char *document_url, const char *target_url, bool navigation)
+{
+    static FetchPreparedPageRequest prepared;
+    FetchPageSecurityContext security = {
+        .document_url = document_url,
+        .top_level_url = document_url
+    };
+    FetchPageRequestDescriptor descriptor = {
+        .target_url = target_url,
+        .method = "GET",
+        .mode = navigation ? TILEFINCH_REQUEST_MODE_NAVIGATE
+                           : TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = navigation ? TILEFINCH_DESTINATION_DOCUMENT
+                                  : TILEFINCH_DESTINATION_SCRIPT,
+        .top_level_navigation = navigation
+    };
+    if (!fetch_prepare_page_request(&security, &descriptor, &prepared, NULL))
+        return "<refused>";
+    const FetchRequest *request = fetch_prepared_page_request(&prepared);
+    return request == NULL ? "<refused>" : request->user_agent;
+}
+
+static bool google_identity_same(const char *left, const char *right)
+{
+    return left == right
+        || (left != NULL && right != NULL && strcmp(left, right) == 0);
+}
+
+static int test_google_search_identity(void)
+{
+    static const char google_ua[] = TILEFINCH_GOOGLE_USER_AGENT;
+    site_identity_reset();
+
+    /* Host scope, marker stripping, and the refusal classifier. */
+    char stripped[256];
+    CHECK(site_identity_google_host("https://www.google.com/search?q=a")
+          && site_identity_google_host("https://google.com/")
+          && site_identity_google_host("http://WWW.Google.com/x")
+          && !site_identity_google_host("https://www.google.com.evil.test/")
+          && !site_identity_google_host("https://maps.google.com/")
+          && !site_identity_google_host("https://www.google.com:8443/")
+          && !site_identity_google_host("https://www.google.co.uk/")
+          && !site_identity_google_host("https://notgoogle.com/"));
+    CHECK(!site_identity_take_google_opt_in_marker(
+              "https://www.google.com/search?q=PSP", stripped,
+              sizeof(stripped))
+          && !site_identity_take_google_opt_in_marker(
+              "https://example.test/search?q=PSP&tilefinch_raw=1",
+              stripped, sizeof(stripped))
+          && !site_identity_google_opted_in()
+          && site_identity_user_agent_override(
+                 "https://www.google.com/search?q=PSP") == NULL);
+    CHECK(site_identity_take_google_opt_in_marker(
+              "https://www.google.com/search?tilefinch_raw=1&q=PSP&hl=en#top",
+              stripped, sizeof(stripped))
+          && strcmp(stripped, "https://www.google.com/search?q=PSP&hl=en#top")
+                 == 0
+          && site_identity_google_opted_in());
+    CHECK(site_identity_take_google_opt_in_marker(
+              "https://google.com/search?q=a&tilefinch_raw=1", stripped,
+              sizeof(stripped))
+          && strcmp(stripped, "https://google.com/search?q=a") == 0);
+    CHECK(google_identity_same(site_identity_user_agent_override(
+              "https://www.google.com/search?q=PSP"), google_ua)
+          && site_identity_user_agent_override(
+              "https://en.m.wikipedia.org/wiki/PSP") == NULL
+          && strcmp(google_ua,
+                    "Mozilla/5.0 (PlayStation Portable) Tilefinch/0.1") == 0);
+    static const char search[] = "https://www.google.com/search?q=PSP";
+    CHECK(!site_identity_google_refusal(search, search, 200,
+                                        "text/html; charset=UTF-8", false)
+          && site_identity_google_refusal(search, search, 429,
+                                          "text/html", false)
+          && site_identity_google_refusal(
+                 search, "https://www.google.com/sorry/index?continue=x",
+                 200, "text/html", false)
+          && site_identity_google_refusal(
+                 search, search, 200, "application/xhtml+xml; charset=UTF-8",
+                 false)
+          && site_identity_google_refusal(search, NULL, 0, NULL, true)
+          && site_identity_google_refusal(
+                 "https://www.google.com/sorry/index?continue=x", NULL, 200,
+                 "text/html", false)
+          && !site_identity_google_refusal(
+                 "https://www.google.com/maps", NULL, 0, NULL, true)
+          && !site_identity_google_refusal(
+                 "https://example.test/search?q=a", NULL, 429, NULL, false));
+
+    /* Request identity follows the top-level document; a top-level
+       navigation follows its target. */
+    CHECK(google_identity_same(google_identity_prepared_user_agent(
+              "https://en.m.wikipedia.org/wiki/PSP", search, true),
+              google_ua)
+          && google_identity_prepared_user_agent(
+              search, "https://en.m.wikipedia.org/wiki/PSP", true) == NULL
+          && google_identity_same(google_identity_prepared_user_agent(
+              search, "https://www.gstatic.com/og/probe.js", false),
+              google_ua)
+          && google_identity_same(google_identity_prepared_user_agent(
+              search, "https://www.google.com/xjs/probe.js", false),
+              google_ua)
+          && google_identity_prepared_user_agent(
+              "https://en.m.wikipedia.org/wiki/PSP",
+              "https://www.google.com/xjs/probe.js", false) == NULL);
+    site_identity_google_refused(search);
+    char fallback[256];
+    CHECK(!site_identity_google_opted_in()
+          && google_identity_prepared_user_agent(
+              "https://en.m.wikipedia.org/", search, true) == NULL
+          && site_identity_take_google_fallback(fallback, sizeof(fallback))
+          && strcmp(fallback, search) == 0
+          && !site_identity_take_google_fallback(fallback, sizeof(fallback))
+          && site_identity_take_google_refusal_note()
+          && !site_identity_take_google_refusal_note());
+    site_identity_reset();
+
+    static const char google_page[] =
+        "<!doctype html><title>Google probe</title><p>results</p><script>"
+        "globalThis.workerIdentity='';"
+        "try{const w=new Worker(URL.createObjectURL(new Blob(["
+        "\"postMessage(navigator.userAgent+'|'+navigator.appVersion)\"])));"
+        "w.onmessage=e=>{globalThis.workerIdentity=e.data};}catch(e){"
+        "globalThis.workerIdentity='error:'+e;}"
+        "fetch('https://www.google.com/gen_204?probe=fetch');"
+        "fetch('https://www.gstatic.com/og/probe.js');"
+        "</script>";
+    static const char other_page[] =
+        "<!doctype html><title>Other</title><p>elsewhere</p>"
+        "<script>globalThis.other=1</script>";
+    static const char wap_page[] =
+        "<?xml version=\"1.0\"?><html><body>Update your browser</body></html>";
+    static const char refusal_page[] =
+        "<!doctype html><title>Sorry</title><p>unusual traffic</p>";
+    const GoogleIdentityRecord records[] = {
+        {.url = search, .status = 200, .content_type = "text/html",
+         .body = google_page},
+        {.url = "https://www.google.com/search?q=PSP&sei=abc",
+         .status = 200, .content_type = "text/html", .body = google_page},
+        {.url = "https://www.google.com/gen_204?probe=fetch", .status = 204,
+         .content_type = "text/html", .body = ""},
+        {.url = "https://www.google.com/gen_204?probe=beacon", .status = 204,
+         .content_type = "text/html", .body = ""},
+        {.url = "https://www.gstatic.com/og/probe.js", .status = 200,
+         .content_type = "text/javascript", .body = "void 0;"},
+        {.url = "https://other.test/", .status = 200,
+         .content_type = "text/html", .body = other_page},
+        {.url = "https://www.google.com/search?q=limited", .status = 429,
+         .content_type = "text/html", .body = refusal_page},
+        {.url = "https://www.google.com/search?q=wap", .status = 200,
+         .content_type = "application/xhtml+xml; charset=UTF-8",
+         .body = wap_page},
+        {.url = "https://www.google.com/search?q=sorry",
+         .effective_url =
+             "https://www.google.com/sorry/index?continue=x&q=token",
+         .status = 200, .content_type = "text/html", .body = refusal_page},
+        {.url = "https://www.google.com/search?q=broken", .status = 429,
+         .content_type = "", .body = "", .failed = true},
+        {.url = "https://www.google.com/sorry/index?continue=y",
+         .status = 200, .content_type = "text/html", .body = refusal_page}
+    };
+    size_t record_count = sizeof(records) / sizeof(records[0]);
+    char replay[128];
+    char error[256] = {0};
+    CHECK(write_google_identity_replay(replay, records, record_count)
+          && fetch_trace_replay_begin_response_keyed(
+                 replay, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    memset(faults->replayed_requests, 0, sizeof(faults->replayed_requests));
+    faults->replayed_request_count = 0;
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+
+    /* The compatibility page: DuckDuckGo first, Google with its warning. */
+    CHECK(browser_engine_begin_navigation_url(engine, search, 1u * MIB, 1000,
+                                              true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    const char *body = document_body_text(&navigation->page.document);
+    const char *duck = body == NULL ? NULL
+        : strstr(body, "Search with DuckDuckGo");
+    const char *google = body == NULL ? NULL
+        : strstr(body, "Try Google anyway");
+    CHECK(strcmp(navigation->page.document.title, "Web search") == 0
+          && duck != NULL && google != NULL && duck < google
+          && strstr(google, "Slower: Google runs a browser check first "
+                    "(several seconds on the PSP), and Google may still "
+                    "refuse.") != NULL
+          && strstr(body, "didn't accept") == NULL
+          && faults->replayed_request_count == 0);
+    lxb_dom_node_t *try_google =
+        actionable_find_id(&navigation->page.document, "compat-google");
+    ControllerAction action = {0};
+    CHECK(try_google != NULL && browser_engine_focus_node(engine, try_google)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strstr(action.url, "tilefinch_raw=1") != NULL);
+
+    /* Choosing Google: the marker stays local, the session opts in, and
+       the navigation, fetch, third-party script, beacon, and realms all
+       present the Google identity. */
+    CHECK(browser_engine_begin_navigation_action(engine, &action, 1u * MIB,
+                                                 1000)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    const NavigationEntry *entry = navigation_current(navigation);
+    if (entry == NULL || strcmp(entry->url, search) != 0)
+        fprintf(stderr, "google identity entry=%s error=%s\n",
+                entry == NULL ? "(none)" : entry->url,
+                browser_engine_last_error(engine));
+    CHECK(site_identity_google_opted_in()
+          && entry != NULL && strcmp(entry->url, search) == 0
+          && strcmp(navigation->page.document_url, search) == 0
+          && strcmp(navigation->page.document.title, "Google probe") == 0
+          && !google_identity_replay_saw_marker()
+          && google_identity_same(
+                 google_identity_replayed_user_agent(search), google_ua)
+          && navigation->page.runtime != NULL);
+    for (unsigned tick = 0; tick < 16; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+              "if(!navigator.sendBeacon("
+              "'https://www.google.com/gen_204?probe=beacon'))"
+              "throw Error('beacon refused')",
+              "<google-beacon>", &navigation->page.script_result));
+    for (unsigned tick = 0; tick < 64
+         && google_identity_replayed_user_agent(
+                "https://www.google.com/gen_204?probe=beacon") == NULL;
+         tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    const char *fetch_ua = google_identity_replayed_user_agent(
+        "https://www.google.com/gen_204?probe=fetch");
+    const char *script_ua = google_identity_replayed_user_agent(
+        "https://www.gstatic.com/og/probe.js");
+    const char *beacon_ua = google_identity_replayed_user_agent(
+        "https://www.google.com/gen_204?probe=beacon");
+    if (!google_identity_same(fetch_ua, google_ua)
+        || !google_identity_same(script_ua, google_ua)
+        || !google_identity_same(beacon_ua, google_ua))
+        fprintf(stderr, "google identity fetch=%s script=%s beacon=%s\n",
+                fetch_ua == NULL ? "(none)" : fetch_ua,
+                script_ua == NULL ? "(none)" : script_ua,
+                beacon_ua == NULL ? "(none)" : beacon_ua);
+    CHECK(google_identity_same(fetch_ua, google_ua)
+          && google_identity_same(script_ua, google_ua)
+          && google_identity_same(beacon_ua, google_ua));
+    if (!script_runtime_evaluate_diagnostic(navigation->page.runtime,
+            "(()=>{const ua='" TILEFINCH_GOOGLE_USER_AGENT "';"
+            "const app=ua.slice(8);"
+            "if(navigator.userAgent!==ua)throw Error('ua '+navigator.userAgent);"
+            "if(navigator.appVersion!==app)"
+            "throw Error('app '+navigator.appVersion);"
+            "if(workerIdentity!==ua+'|'+app)"
+            "throw Error('worker '+workerIdentity);"
+            "const d=navigator.userAgentData;"
+            "if(d&&(d.platform!=='PlayStation Portable'"
+            "||d.brands[0].brand!=='Tilefinch'))"
+            "throw Error('uad '+JSON.stringify(d));})()",
+            "<google-identity>", &navigation->page.script_result))
+        fprintf(stderr, "google identity realm: %s\n",
+                navigation->page.script_result.error);
+    CHECK(navigation->page.script_result.error[0] == '\0');
+
+    /* Google's own location.replace(...&sei=) reload keeps the identity. */
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+              "location.replace(location.href+'&sei=abc')",
+              "<google-sei>", &navigation->page.script_result));
+    for (unsigned tick = 0; tick < 4; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    char script_url[NAVIGATION_URL_LIMIT] = {0};
+    bool record_history = true;
+    CHECK(browser_engine_take_script_navigation(
+              engine, script_url, sizeof(script_url), &record_history)
+          && strcmp(script_url,
+                    "https://www.google.com/search?q=PSP&sei=abc") == 0
+          && browser_engine_begin_navigation_url(engine, script_url,
+                                                 1u * MIB, 1000,
+                                                 record_history)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && google_identity_same(google_identity_replayed_user_agent(
+                 script_url), google_ua)
+          && script_runtime_evaluate_diagnostic(navigation->page.runtime,
+              "if(navigator.userAgent!=='" TILEFINCH_GOOGLE_USER_AGENT "')"
+              "throw Error(navigator.userAgent)",
+              "<google-sei-realm>", &navigation->page.script_result));
+
+    /* Other sites keep the shipping identity in requests and realms. */
+    CHECK(browser_engine_begin_navigation_url(engine, "https://other.test/",
+                                              1u * MIB, 1000, true));
+    BrowserNavigationJobStatus other_status = google_identity_pump(engine);
+    const char *other_ua =
+        google_identity_replayed_user_agent("https://other.test/");
+    if (other_status != BROWSER_NAVIGATION_JOB_SUCCEEDED
+        || !google_identity_same(other_ua, TILEFINCH_BROWSER_USER_AGENT))
+        fprintf(stderr, "other status=%d ua=%s error=%s\n", (int) other_status,
+                other_ua == NULL ? "(none)" : other_ua,
+                browser_engine_last_error(engine));
+    CHECK(other_status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && google_identity_same(other_ua, TILEFINCH_BROWSER_USER_AGENT)
+          && navigation->page.runtime != NULL
+          && script_runtime_evaluate_diagnostic(navigation->page.runtime,
+              "if(navigator.userAgent!=='" TILEFINCH_BROWSER_USER_AGENT "')"
+              "throw Error(navigator.userAgent)",
+              "<other-realm>", &navigation->page.script_result));
+
+    /* Back to Google re-requests it with the Google identity. */
+    unsigned before_back = faults->replayed_request_count;
+    CHECK(browser_engine_begin_navigation_history(engine, false, 1u * MIB,
+                                                  1000)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && strncmp(navigation->page.document_url,
+                     "https://www.google.com/search?q=PSP", 35) == 0);
+    CHECK(faults->replayed_request_count != before_back
+          && google_identity_same(google_identity_replayed_user_agent(
+                 navigation->page.document_url), google_ua));
+    CHECK(navigation->page.runtime == NULL
+          || script_runtime_evaluate_diagnostic(navigation->page.runtime,
+              "if(navigator.userAgent!=='" TILEFINCH_GOOGLE_USER_AGENT "')"
+              "throw Error(navigator.userAgent)",
+              "<google-back-realm>", &navigation->page.script_result));
+
+    /* The opt-in persists: further searches go straight to Google. */
+    CHECK(!site_adapter_handles_navigation(
+              "GET", "https://www.google.com/search?q=limited"));
+
+    /* Each refusal shape falls back to the compatibility page with its
+       note and clears the opt-in. */
+    static const char *const refused[] = {
+        "https://www.google.com/search?q=limited",
+        "https://www.google.com/search?q=wap",
+        "https://www.google.com/search?q=sorry",
+        "https://www.google.com/search?q=broken"
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        site_identity_google_opt_in();
+        BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_FAILED;
+        CHECK(browser_engine_begin_navigation_url(engine, refused[i],
+                                                  1u * MIB, 1000, true));
+        status = google_identity_pump(engine);
+        body = document_body_text(&navigation->page.document);
+        if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || body == NULL
+            || strstr(body, "Google didn't accept this search") == NULL)
+            fprintf(stderr, "google refusal %s status=%d title=%s "
+                    "error=%s\n", refused[i], (int) status,
+                    navigation->page.document.title,
+                    browser_engine_last_error(engine));
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+              && !site_identity_google_opted_in()
+              && google_identity_same(google_identity_replayed_user_agent(
+                     refused[i]), google_ua)
+              && strcmp(navigation->page.document.title, "Web search") == 0
+              && strcmp(navigation->page.document_url, refused[i]) == 0
+              && body != NULL
+              && strstr(body, "Google didn't accept this search") != NULL
+              && strstr(body, "unusual traffic") == NULL
+              && strstr(body, "Update your browser") == NULL);
+    }
+    /* A Google page navigating to the /sorry/ interstitial itself falls
+       back to that page's search. */
+    site_identity_google_opt_in();
+    CHECK(browser_engine_begin_navigation_url(engine, search, 1u * MIB, 1000,
+                                              true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && navigation->page.runtime != NULL
+          && script_runtime_evaluate_diagnostic(navigation->page.runtime,
+              "location.href='/sorry/index?continue=y'",
+              "<google-sorry>", &navigation->page.script_result));
+    for (unsigned tick = 0; tick < 4; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    CHECK(browser_engine_take_script_navigation(
+              engine, script_url, sizeof(script_url), &record_history)
+          && browser_engine_begin_navigation_url(engine, script_url,
+                                                 1u * MIB, 1000,
+                                                 record_history)
+          && google_identity_pump(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    body = document_body_text(&navigation->page.document);
+    CHECK(!site_identity_google_opted_in()
+          && strcmp(navigation->page.document_url, search) == 0
+          && body != NULL
+          && strstr(body, "Google didn't accept this search") != NULL
+          && strstr(body, "unusual traffic") == NULL);
+    /* The note is shown once; the next search is the plain page. */
+    CHECK(browser_engine_begin_navigation_url(
+              engine, "https://www.google.com/search?q=again", 1u * MIB,
+              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    body = document_body_text(&navigation->page.document);
+    CHECK(body != NULL && strstr(body, "Try Google anyway") != NULL
+          && strstr(body, "didn't accept") == NULL);
+
+    /* The longest admitted query still fits the bounded page with the
+       refusal note. */
+    char worst[sizeof("https://www.google.com/search?q=") + 384];
+    int used = snprintf(worst, sizeof(worst), "%s",
+                        "https://www.google.com/search?q=");
+    memset(worst + used, '"', 384u);
+    worst[used + 384] = '\0';
+    site_identity_google_refused(NULL);
+    CHECK(browser_engine_begin_navigation_url(engine, worst, 1u * MIB, 1000,
+                                              true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    body = document_body_text(&navigation->page.document);
+    CHECK(strcmp(navigation->page.document.title, "Web search") == 0
+          && body != NULL
+          && strstr(body, "Google didn't accept this search") != NULL);
+
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_google_identity_replay(replay, record_count);
+    site_identity_reset();
     return 0;
 }
 
@@ -1927,7 +2497,8 @@ static int test_blank_reader_frontend_recovery(void)
     static const char bounded_suffix[] =
         "</article><script>throw new Error('bundle failed')</script>"
         "</body>";
-    const size_t bounded_units = 600u;
+    /* More paragraphs than the largest (4,096-node) extraction bound. */
+    const size_t bounded_units = 4200u;
     size_t bounded_length = sizeof(bounded_prefix) - 1u
         + bounded_units * (sizeof(bounded_unit) - 1u)
         + sizeof(bounded_suffix) - 1u;
@@ -2211,9 +2782,10 @@ static int test_blank_reader_frontend_recovery(void)
                  == BROWSER_BLANK_READER_RECOVERY_NONE
           && !analysis.prepared);
 
-    /* A main-root article is deliberately below optional auto-Reader's high
-       confidence threshold. Proven blank output plus a real script failure
-       still admits its independently useful extracted semantic tree. */
+    /* Blank-page recovery does not depend on optional auto-Reader's
+       confidence: proven blank output plus a real script failure admits the
+       independently useful extracted semantic tree of this main-root
+       article whatever its confidence. */
     static const char degraded_article[] =
         "<!doctype html><style>.staged{transform:scale(0)}</style><body>"
         "<main class=staged>" RECOVERY_PROSE
@@ -2240,8 +2812,7 @@ static int test_blank_reader_frontend_recovery(void)
           && browser_engine_prepare_blank_reader_recovery(
                  engine, &analysis)
                  == BROWSER_BLANK_READER_RECOVERY_AVAILABLE
-          && analysis.prepared && analysis.kind == READER_PAGE_ARTICLE
-          && !analysis.high_confidence);
+          && analysis.prepared && analysis.kind == READER_PAGE_ARTICLE);
     char css[SITE_ADAPTER_READER_CSS_LIMIT
              + CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
     char adapter[32];
@@ -2923,6 +3494,86 @@ static int test_basic_view_admission_and_presentation(void)
               == BROWSER_BASIC_VIEW_RECOVERY_NONE
           && !basic.prepared);
 
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(budget != NULL && browser_engine_shutdown(engine)
+          && budget->current == 0u
+          && budget_active_allocations(budget, NULL) == 0u);
+    browser_engine_test_set_recovery_time_us(0u);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_basic_view_recovery_large_and_hidden_pages(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 4u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.maximum_scripts = 8u;
+    config.javascript.maximum_total_bytes = 64u * 1024u;
+    config.javascript.maximum_file_bytes = 32u * 1024u;
+    char error[128] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_test_set_recovery_time_us(UINT64_MAX);
+
+    size_t capacity = 160u * 1024u;
+    char *page = malloc(capacity);
+    CHECK(page != NULL);
+    size_t used = (size_t) snprintf(
+        page, capacity,
+        "<!doctype html><head><style id=antiflicker>"
+        ".app{visibility:hidden!important}</style><script>"
+        "setTimeout(function(){"
+        "var hide=document.getElementById('antiflicker');"
+        "hide.parentNode.removeChild(hide);},60000);</script>"
+        "<script>throw new Error('vendor bundle failed');</script>"
+        "</head><body><div class=app><h1>Front page</h1><p>The first story "
+        "is server rendered.</p>");
+    /* Two emitted nodes per story: more than the 4,096-node ceiling. */
+    for (size_t i = 0; i < 2100u && used + 64u < capacity; i++)
+        used += (size_t) snprintf(page + used, capacity - used,
+                                  "<p><a href='/s/%zu'>Story %zu</a></p>",
+                                  i, i);
+    used += (size_t) snprintf(page + used, capacity - used, "</div></body>");
+    CHECK(browser_engine_commit_html(
+              engine, "https://news.example.test/", page, used, true));
+    free(page);
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    ReaderDocumentAnalysis basic = {0};
+    BrowserBasicViewRecovery recovery =
+        browser_engine_prepare_basic_view_recovery(engine, &basic);
+    for (size_t turn = 0;
+         turn < 16u && recovery == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED;
+         turn++) {
+        (void) browser_engine_advance_runtime(engine, 1u, 4u, NULL);
+        recovery = browser_engine_prepare_basic_view_recovery(
+            engine, &basic);
+    }
+    bool ok = navigation->page.layout.link_count != 0u
+        && browser_engine_page_is_visually_blank(engine)
+        && recovery == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE
+        && basic.kind == READER_PAGE_BASIC && basic.extraction_truncated
+        && !basic.bounded_out && basic.extracted_nodes > 512u
+        && basic.extracted_nodes <= 4096u;
+    if (!ok) {
+        fprintf(stderr, "basic large/hidden: links=%zu blank=%d recovery=%d "
+                "kind=%d truncated=%d bounded=%d nodes=%u summary=%s\n",
+                navigation->page.layout.link_count,
+                (int) browser_engine_page_is_visually_blank(engine),
+                (int) recovery, (int) basic.kind,
+                (int) basic.extraction_truncated, (int) basic.bounded_out,
+                (unsigned) basic.extracted_nodes,
+                navigation->page.script_result.summary);
+    }
+    CHECK(ok);
+    CHECK(browser_engine_set_javascript_enabled(engine, true));
     Budget *budget = browser_engine_budget(engine);
     CHECK(budget != NULL && browser_engine_shutdown(engine)
           && budget->current == 0u
@@ -3801,10 +4452,11 @@ static int test_reader_alias_relocation_rebinds_declined_auto_layout(void)
     int prefix = snprintf(
         html, sizeof(html),
         "<!doctype html><title>Declined automatic Reader</title><body><main>"
-        "<h1>Declined automatic Reader</h1>"
+        "<h2>Declined automatic Reader</h2>"
         "<p>This substantial first paragraph creates a useful manual Reader "
-        "candidate without an article element, so automatic engagement must "
-        "conservatively decline it while retaining the raw display list.</p>");
+        "candidate without an article element or a page title (h1), so "
+        "automatic engagement must conservatively decline it while "
+        "retaining the raw display list.</p>");
     CHECK(prefix > 0 && (size_t) prefix < sizeof(html));
     size_t used = (size_t) prefix;
     static const char image[] =

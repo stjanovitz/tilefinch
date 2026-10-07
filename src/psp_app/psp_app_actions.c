@@ -3,6 +3,62 @@
  * supplies values sampled for the current loop iteration.
  */
 #include "psp_app_internal.h"
+/* Page tools -> Basic view, and the recovery prompt's "Show Basic view"
+   (require_enable: never toggles an active Basic view off). */
+__attribute__((noinline))
+static void psp_app_toggle_basic_view(
+    PspApp *app, PspAppFrameState *frame, bool require_enable)
+{
+    BrowserEngine *engine = app->browser->engine;
+    if (require_enable && app->process->presentation.ui.basic_mode) {
+        psp_ui_show_status(
+            &app->process->presentation.ui, "BASIC VIEW ON", 180);
+        return;
+    }
+    const NavigationEntry *entry =
+        navigation_current(app->views->navigation);
+    const char *basic_url = entry == NULL ? NULL : entry->url;
+    if (app->process->presentation.ui.reader_mode) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "TURN READER MODE OFF BEFORE BASIC VIEW", 180);
+        return;
+    }
+    bool old_mode = app->process->presentation.ui.basic_mode;
+    bool enable = !old_mode;
+    char basic_anchor[BROWSER_TEXT_ANCHOR_LIMIT + 1u];
+    int basic_anchor_y = 0;
+    bool have_basic_anchor = browser_engine_capture_text_anchor(
+        engine, basic_anchor, &basic_anchor_y);
+    ReaderDocumentAnalysis basic_analysis = {0};
+    if (enable && !browser_engine_prepare_basic_view(
+            engine, &basic_analysis)) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            basic_analysis.prepared
+                && basic_analysis.kind != READER_PAGE_BASIC
+                ? "RELOAD PAGE TO SWITCH EXTRACTED VIEWS"
+                : "BASIC VIEW UNAVAILABLE",
+            240);
+        return;
+    }
+    if (!psp_app_set_basic_view(app, basic_url, enable,
+                                frame == NULL ? NULL : &frame->page_dirty)) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enable ? "BASIC VIEW UNAVAILABLE"
+                   : "BASIC VIEW COULD NOT CLOSE",
+            240);
+        return;
+    }
+    if (have_basic_anchor)
+        (void) browser_engine_restore_text_anchor(
+            engine, basic_anchor, basic_anchor_y);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        enable ? "BASIC VIEW ON" : "BASIC VIEW OFF", 180);
+}
+
 __attribute__((noinline))
 static void psp_app_dispatch_heavy_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
@@ -48,6 +104,13 @@ static void psp_app_finish_focus_action(
                                  ? frame->replayed_press_us
                                  : frame->ui_sample_us);
 #endif
+    /* Over a live canvas this loop would render and present again after
+       the page's animation callbacks: two compositions per move. Present
+       the move now and skip this iteration's callbacks, unless the
+       previous iteration already skipped them (a held D-pad); then leave
+       the move to the loop's own canvas frame. */
+    bool single_composition = frame->canvas_live;
+    if (single_composition && frame->runtime_deferred) return;
     BrowserRenderJobStatus rendered = browser_engine_render_frame_bounded(
         app->browser->engine, PSP_RENDER_JOB_BUDGET_US, 4u);
     if (rendered != BROWSER_RENDER_JOB_COMPLETE
@@ -60,6 +123,7 @@ static void psp_app_finish_focus_action(
     if (!shown) return;
     frame->page_dirty = false;
     intent->visual_changed = false;
+    frame->defer_runtime = single_composition;
 }
 
 typedef struct {
@@ -629,6 +693,8 @@ static void psp_app_dispatch_heavy_action(
                     if (!submit_after_edit) break;
                 }
                 activations_before = app->views->controller->activations;
+                size_t relayouts_before =
+                    app->views->navigation->incremental_relayouts;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                 uint64_t activation_started_us = sceKernelGetSystemTimeWide();
                 size_t activation_relayouts = app->views->navigation->incremental_relayouts;
@@ -649,6 +715,16 @@ static void psp_app_dispatch_heavy_action(
                     && psp_runtime_cooperate_end(&activation_buttons))
                     app->interactive->previous_buttons =
                         psp_ui_buttons(activation_buttons);
+                /* An activation that relaid out a page over a live canvas
+                   (a menu screen switch) is composed later in this
+                   iteration; running the animation callbacks first would
+                   only delay it. They run next iteration, as after a focus
+                   move (never two iterations in a row). */
+                if (activated && frame->canvas_live
+                    && !frame->runtime_deferred
+                    && app->views->navigation->incremental_relayouts
+                           != relayouts_before)
+                    frame->defer_runtime = true;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                 printf("tilefinch-control-activation: ok=%u kind=%d elapsed=%lluus relayouts=%zu\n",
                        activated ? 1u : 0u, activated ? (int) action.type : -1,
@@ -1014,9 +1090,9 @@ static void psp_app_dispatch_heavy_action(
                         == CONTROLLER_ACTION_NONE
                     || (navigates
                         ? psp_retry_navigation_action_after_reclaim(
-                              engine, &action, 4 * MIB, 30000)
+                              engine, &action, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS)
                         : browser_engine_execute_action(
-                              engine, &action, 4 * MIB, 30000));
+                              engine, &action, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS));
                 if (action_ok) {
                     if (navigates) {
                         app->interactive->navigation_job_started_us =
@@ -1195,7 +1271,7 @@ static void psp_app_dispatch_heavy_action(
                         profile, history_url));
             bool started = javascript_ready
                 && browser_engine_begin_navigation_history(
-                    engine, forward, 4 * MIB, 30000);
+                    engine, forward, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
             if (started) {
                 if (recovery_return) psp_app_clear_lifecycle_retry(app);
                 app->interactive->navigation_job_started_us =
@@ -1246,9 +1322,20 @@ static void psp_app_dispatch_heavy_action(
                 &app->process->presentation.ui, engine_frame, true, true,
                 false, "STOPPING APP PREVIEW...", "offline-app-preview",
                 NULL, NULL);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            uint64_t preview_started_us = sceKernelGetSystemTimeWide();
+#endif
             bool prepared = psp_offline_store_prepare_current_app(
                 &app->browser->offline_store, engine);
             bool cancelled = psp_navigation_cancel_requested();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            printf("tilefinch-offline-app-op: op=preview ok=%u "
+                   "cancelled=%u elapsed=%lluus status=\"%s\"\n",
+                   prepared ? 1u : 0u, cancelled ? 1u : 0u,
+                   (unsigned long long) (sceKernelGetSystemTimeWide()
+                                         - preview_started_us),
+                   psp_offline_store_status(&app->browser->offline_store));
+#endif
             psp_navigation_cooperate_end_adopting_buttons(
                 "offline-app-preview", &app->interactive->previous_buttons);
             if (prepared && !cancelled) {
@@ -1274,9 +1361,20 @@ static void psp_app_dispatch_heavy_action(
             psp_work_cooperate_begin(
                 &app->process->presentation.ui, engine_frame, true, true,
                 false, "STOPPING APP INSTALL...", "offline-app", NULL, NULL);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            uint64_t install_started_us = sceKernelGetSystemTimeWide();
+#endif
             bool saved = psp_offline_store_install_current_app(
                 &app->browser->offline_store, engine);
             bool cancelled = psp_navigation_cancel_requested();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            printf("tilefinch-offline-app-op: op=install ok=%u "
+                   "cancelled=%u elapsed=%lluus status=\"%s\"\n",
+                   saved ? 1u : 0u, cancelled ? 1u : 0u,
+                   (unsigned long long) (sceKernelGetSystemTimeWide()
+                                         - install_started_us),
+                   psp_offline_store_status(&app->browser->offline_store));
+#endif
             psp_navigation_cooperate_end_adopting_buttons(
                 "offline-app", &app->interactive->previous_buttons);
             psp_ui_show_status(
@@ -1287,10 +1385,89 @@ static void psp_app_dispatch_heavy_action(
                 saved ? 180 : (cancelled ? 120 : 240));
             break;
         }
-        case PSP_UI_ACTION_CANCEL_OFFLINE_APP:
-            psp_offline_store_discard_app_preparation(
-                &app->browser->offline_store);
+        case PSP_UI_ACTION_CANCEL_OFFLINE_APP: {
+            /* The recompile offer is an overlay over Library > Saved and
+               shares the UI's native-view slot with the collections view;
+               re-establish the list it returns to. */
+            bool offered =
+                app->browser->offline_store.recompile_offer_id != 0;
+            (void) psp_offline_store_take_offer(
+                &app->browser->offline_store, false);
+            if (offered)
+                psp_collections_sync_ui(
+                    &app->process->presentation.ui,
+                    &app->process->presentation.collections_surface,
+                    profile, &app->browser->offline_store,
+                    PSP_UI_COLLECTION_SAVED);
             break;
+        }
+        case PSP_UI_ACTION_RECOMPILE_OFFLINE_APP:
+        case PSP_UI_ACTION_OPEN_OFFLINE_APP_ANYWAY: {
+            /* The answer to a Library recompile offer: recompile with
+               progress (Circle stops), then open the app either way the
+               user chose, through the ordinary Library activation. */
+            PspOfflineStore *store = &app->browser->offline_store;
+            PspUiState *ui = &app->process->presentation.ui;
+            PspCollectionsSurface *surface =
+                &app->process->presentation.collections_surface;
+            bool anyway =
+                intent->action == PSP_UI_ACTION_OPEN_OFFLINE_APP_ANYWAY;
+            uint32_t id = psp_offline_store_take_offer(store, anyway);
+            /* The offer borrowed the native-view slot the Saved list uses:
+               restore the list before the recompile's progress is shown
+               over it (it otherwise read "NOTHING HERE YET"). */
+            psp_collections_sync_ui(ui, surface, profile, store,
+                                    PSP_UI_COLLECTION_SAVED);
+            if (!anyway) {
+                psp_ui_show_status(
+                    ui, "RECOMPILING OFFLINE APP - CIRCLE STOPS", 120);
+                psp_work_cooperate_begin(
+                    ui, engine_frame, true, true, false,
+                    "STOPPING RECOMPILE...", "offline-app-recompile",
+                    NULL, NULL);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                uint64_t recompile_started_us = sceKernelGetSystemTimeWide();
+#endif
+                bool recompiled = psp_offline_store_recompile_app(
+                    store, id, &id);
+                bool cancelled = psp_navigation_cancel_requested();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                printf("tilefinch-offline-app-op: op=recompile ok=%u "
+                       "cancelled=%u id=%u elapsed=%lluus status=\"%s\"\n",
+                       recompiled ? 1u : 0u, cancelled ? 1u : 0u,
+                       (unsigned) id,
+                       (unsigned long long) (sceKernelGetSystemTimeWide()
+                                             - recompile_started_us),
+                       psp_offline_store_status(store));
+#endif
+                psp_navigation_cooperate_end_adopting_buttons(
+                    "offline-app-recompile",
+                    &app->interactive->previous_buttons);
+                if (!recompiled) {
+                    psp_collections_sync_ui(ui, surface, profile, store,
+                                            PSP_UI_COLLECTION_SAVED);
+                    psp_ui_show_status(
+                        ui, cancelled ? "RECOMPILE STOPPED"
+                                      : psp_offline_store_status(store),
+                        cancelled ? 120 : 240);
+                    break;
+                }
+            }
+            psp_collections_sync_ui(ui, surface, profile, store,
+                                    PSP_UI_COLLECTION_SAVED);
+            for (size_t row = 0; id != 0 && row < surface->view.count;
+                 row++) {
+                if (surface->id[row] != id) continue;
+                ui->collections_selection = (uint8_t) row;
+                PspUiIntent open = {
+                    .action = PSP_UI_ACTION_COLLECTION_ACTIVATE,
+                    .list_index = (uint8_t) row
+                };
+                psp_app_dispatch_heavy_action(app, frame, &open);
+                break;
+            }
+            break;
+        }
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: {
             if (app->process->presentation.ui.screen
                     == PSP_UI_SCREEN_COLLECTIONS) {
@@ -1376,8 +1553,7 @@ static void psp_app_dispatch_heavy_action(
                 break;
             }
 #endif
-            app->process->presentation.ui.reader_mode = true;
-            app->process->presentation.ui.basic_mode = false;
+            psp_reader_mark_engaged(&app->process->presentation.ui, false);
             bool prepared = psp_reader_navigation_prepare(
                 engine, &app->process->presentation.ui, profile,
                 &app->interactive->reader_navigation,
@@ -1394,7 +1570,7 @@ static void psp_app_dispatch_heavy_action(
                 &app->process->presentation.ui, engine_frame, engine);
             psp_text_input_before_navigation(&app->process->text_input);
             bool started = psp_retry_navigation_url_after_reclaim(
-                engine, lifecycle_retry_url, 4 * MIB, 30000, false);
+                engine, lifecycle_retry_url, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS, false);
             if (started) {
                 app->interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
                 app->interactive->navigation_job_started_us =
@@ -1502,7 +1678,7 @@ recovery_reload: {
             bool started = psp_begin_page_load(
                 engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
                 reload_url, false,
-                4 * MIB, 30000);
+                PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
             if (started) {
                 app->interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
                 app->interactive->navigation_job_started_us =
@@ -1551,7 +1727,14 @@ recovery_reload: {
                 reader_url, target_percent, true);
             if (presentation_applied
                 && (!enable || browser_engine_activate_reader_view(engine))) {
-                app->process->presentation.ui.reader_mode = enable;
+                /* A user's Reader is sticky; turning it off also ends an
+                   automatically engaged one. */
+                if (enable) {
+                    psp_reader_mark_engaged(
+                        &app->process->presentation.ui, false);
+                } else {
+                    psp_reader_mark_left(&app->process->presentation.ui);
+                }
                 app->process->presentation.ui.basic_mode = false;
                 browser_engine_set_reader_candidate_mode(engine, enable);
                 app->process->presentation.ui.page_font_percent = target_percent;
@@ -1581,70 +1764,70 @@ recovery_reload: {
             }
             break;
         }
-        case PSP_UI_ACTION_TOGGLE_BASIC: {
-            const NavigationEntry *entry =
-                navigation_current(app->views->navigation);
-            const char *basic_url = entry == NULL ? NULL : entry->url;
-            if (app->process->presentation.ui.reader_mode) {
+        case PSP_UI_ACTION_TOGGLE_BASIC:
+            psp_app_toggle_basic_view(app, frame, false);
+            break;
+        case PSP_UI_ACTION_RECOVERY_BASIC:
+            app->interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
+            psp_app_toggle_basic_view(app, frame, true);
+            break;
+        case PSP_UI_ACTION_RECOVERY_RELOAD_BASIC: {
+            if (app->interactive->recovery_offer == PSP_RECOVERY_OFFER_NONE) {
                 psp_ui_show_status(
                     &app->process->presentation.ui,
-                    "TURN READER MODE OFF BEFORE BASIC VIEW", 180);
+                    "FAILED PAGE IS NO LONGER AVAILABLE", 180);
                 break;
             }
-            bool old_mode = app->process->presentation.ui.basic_mode;
-            unsigned old_percent =
-                app->process->presentation.ui.page_font_percent;
-            bool enable = !old_mode;
-            unsigned target_percent =
-                browser_profile_page_font_percent(profile);
-            char basic_anchor[BROWSER_TEXT_ANCHOR_LIMIT + 1u];
-            int basic_anchor_y = 0;
-            bool have_basic_anchor = browser_engine_capture_text_anchor(
-                engine, basic_anchor, &basic_anchor_y);
-            ReaderDocumentAnalysis basic_analysis = {0};
-            if (enable && !browser_engine_prepare_basic_view(
-                    engine, &basic_analysis)) {
-                psp_ui_show_status(
-                    &app->process->presentation.ui,
-                    basic_analysis.prepared
-                        && basic_analysis.kind != READER_PAGE_BASIC
-                        ? "RELOAD PAGE TO SWITCH EXTRACTED VIEWS"
-                        : "BASIC VIEW UNAVAILABLE",
-                    240);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+            if (strcmp(app->process->config.trace, "none") == 0
+                && !psp_ensure_network_for_navigation(
+                       app->network, app->network_lifecycle,
+                       (int) app->process->config.network_profile,
+                       "GET", lifecycle_retry_url, true,
+                       engine_frame, &app->process->presentation.ui)) {
                 break;
             }
-            bool presentation_applied = psp_set_presentation_css(
-                    engine, &app->process->presentation.ui, profile, enable,
-                    basic_url, target_percent, true);
-            if (presentation_applied
-                && (!enable || browser_engine_activate_basic_view(engine))) {
-                app->process->presentation.ui.basic_mode = enable;
-                app->process->presentation.ui.reader_mode = false;
-                browser_engine_set_reader_candidate_mode(engine, false);
-                app->process->presentation.ui.page_font_percent =
-                    target_percent;
-                (void) psp_engine_views_refresh(app->views, engine);
-                BrowserController *controller =
-                    browser_engine_controller(engine);
-                if (controller != NULL) (void) controller_rebind_focus(controller);
-                if (have_basic_anchor)
-                    (void) browser_engine_restore_text_anchor(
-                        engine, basic_anchor, basic_anchor_y);
-                frame->page_dirty = true;
+#endif
+            /* Page JavaScript is off for this one load only: the commit (or
+               failure) restores the site's policy, and every ordinary
+               navigation sets it again. */
+            if (!browser_engine_set_javascript_enabled(engine, false)) {
                 psp_ui_show_status(
                     &app->process->presentation.ui,
-                    enable ? "BASIC VIEW ON" : "BASIC VIEW OFF", 180);
+                    "BASIC VIEW UNAVAILABLE", 240);
+                break;
+            }
+            psp_leave_reader_for_navigation(
+                engine, &app->process->presentation.ui, profile,
+                lifecycle_retry_url);
+            psp_ui_set_navigation_target(
+                &app->process->presentation.ui, lifecycle_retry_url);
+            psp_ui_set_loading(&app->process->presentation.ui, true, -1);
+            psp_ui_show_status(
+                &app->process->presentation.ui, "LOADING BASIC VIEW", 240);
+            psp_navigation_cooperate_begin(
+                &app->process->presentation.ui, engine_frame, engine);
+            psp_text_input_before_navigation(&app->process->text_input);
+            bool started = psp_retry_navigation_url_after_reclaim(
+                engine, lifecycle_retry_url, PSP_NAVIGATION_DOCUMENT_BYTES,
+                PSP_NAVIGATION_TIMEOUT_MS, false);
+            if (started) {
+                app->interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
+                app->interactive->basic_reload_pending = true;
+                snprintf(app->interactive->basic_reload_url,
+                         sizeof(app->interactive->basic_reload_url), "%s",
+                         lifecycle_retry_url);
+                app->interactive->navigation_job_started_us =
+                    (uint64_t) sceKernelGetSystemTimeWide();
             } else {
-                (void) psp_set_presentation_css(
-                    engine, &app->process->presentation.ui, profile,
-                    old_mode, basic_url, old_percent, true);
-                app->process->presentation.ui.basic_mode = old_mode;
-                app->process->presentation.ui.page_font_percent = old_percent;
+                psp_navigation_cooperate_end("basic-reload-start-failed");
+                (void) browser_engine_set_javascript_enabled(
+                    engine, browser_profile_javascript_allowed_for_url(
+                                profile, lifecycle_retry_url));
+                psp_ui_set_loading(&app->process->presentation.ui, false, 0);
                 psp_ui_show_status(
                     &app->process->presentation.ui,
-                    enable ? "BASIC VIEW UNAVAILABLE"
-                           : "BASIC VIEW COULD NOT CLOSE",
-                    240);
+                    browser_engine_last_error(engine), 300);
             }
             break;
         }
@@ -1746,7 +1929,7 @@ recovery_reload: {
                     bool started = psp_begin_page_load(
                         engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
                         destination, true,
-                        4 * MIB, 30000);
+                        PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
                     if (started)
                         app->interactive->navigation_job_started_us =
                             (uint64_t) sceKernelGetSystemTimeWide();
@@ -1795,7 +1978,7 @@ recovery_reload: {
             psp_ui_leave_native_surface(&app->process->presentation.ui);
             bool started = psp_begin_page_load(
                 engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                destination, true, 4 * MIB, 30000);
+                destination, true, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
             if (started) {
                 app->interactive->navigation_job_started_us =
                     (uint64_t) sceKernelGetSystemTimeWide();
@@ -1966,7 +2149,7 @@ recovery_reload: {
 #endif
                     bool started = psp_begin_page_load(
                         engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                        destination, false, 4 * MIB, 30000);
+                        destination, false, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
                     if (started) {
                         psp_ui_leave_native_surface(&app->process->presentation.ui);
                         app->interactive->navigation_job_started_us =
@@ -2131,6 +2314,18 @@ recovery_reload: {
                         180);
                     break;
                 }
+                /* Bytecode from an older engine: offer to recompile it
+                   (with Open anyway) rather than a silent slow start. */
+                if (selected_item != NULL
+                    && selected_item->type == OFFLINE_ITEM_WEB_APP
+                    && psp_offline_store_offer_recompile(
+                           &app->browser->offline_store, selected_id)) {
+                    psp_ui_show_offline_app_offer(
+                        &app->process->presentation.ui,
+                        psp_offline_store_app_preview(
+                            &app->browser->offline_store));
+                    break;
+                }
                 char offline_url[NAVIGATION_URL_LIMIT];
                 bool fullscreen_offline_app = selected_item != NULL
                     && selected_item->type == OFFLINE_ITEM_WEB_APP
@@ -2229,7 +2424,7 @@ recovery_reload: {
             psp_ui_leave_native_surface(&app->process->presentation.ui);
             if (psp_begin_page_load(
                     engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                    destination_copy, true, 4 * MIB, 30000)) {
+                    destination_copy, true, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS)) {
                 app->interactive->navigation_job_started_us =
                     (uint64_t) sceKernelGetSystemTimeWide();
             } else {
@@ -2384,6 +2579,13 @@ recovery_reload: {
             psp_app_site_storage_action(app, frame, intent);
             frame->page_dirty = true;
             break;
+        case PSP_UI_ACTION_HEAVY_RUN_SESSION:
+        case PSP_UI_ACTION_HEAVY_RUN_ALWAYS:
+        case PSP_UI_ACTION_HEAVY_CANCEL:
+        case PSP_UI_ACTION_HEAVY_STOP_SCRIPTS:
+            psp_app_heavy_action(app, frame, intent);
+            frame->page_dirty = true;
+            break;
         case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
             psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
             tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
@@ -2467,7 +2669,7 @@ recovery_reload: {
                 bool started = psp_begin_page_load(
                     engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
                     PSP_MEDIA_STABILITY_URL, true,
-                    4 * MIB, 30000);
+                    PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
                 if (started) {
                     app->interactive->navigation_job_started_us =
                         (uint64_t) sceKernelGetSystemTimeWide();

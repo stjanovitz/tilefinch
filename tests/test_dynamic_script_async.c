@@ -1,4 +1,5 @@
 #include "tilefinch/budget.h"
+#include "tilefinch/content_security_policy.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
@@ -257,12 +258,20 @@ static bool start_runtime_page(NavigationSession *navigation, Budget *budget,
         navigation, budget, browser, url, 1000);
 }
 
-static bool start_custom_runtime_page(
+/* Starts a page whose realm takes the heavy-page policy as an embedder
+   configures it: `heavy_default`, or `heavy_resolver`'s per-site answer
+   when one is given. */
+static bool start_custom_runtime_page_heavy(
     NavigationSession *navigation, Budget *budget, BrowserSession *browser,
     const char *url, const char *html, size_t maximum_scripts,
-    size_t maximum_total_bytes, size_t maximum_file_bytes)
+    size_t maximum_total_bytes, size_t maximum_file_bytes,
+    ScriptHeavyPolicy heavy_default, ScriptHeavyPolicyResolver heavy_resolver,
+    void *heavy_opaque)
 {
     if (!navigation_init(navigation, budget, 4)) return false;
+    navigation->heavy_script_policy = heavy_default;
+    navigation->heavy_policy_resolver = heavy_resolver;
+    navigation->heavy_policy_opaque = heavy_opaque;
     navigation_attach_browser_session(navigation, browser);
     navigation_enable_scripts(navigation, 8u * MIB, 1000);
     navigation_enable_document_scripts(
@@ -274,6 +283,17 @@ static bool start_custom_runtime_page(
     return navigation_commit_html(
         navigation, generation, url, html, strlen(html), 480,
         NULL, NULL, true);
+}
+
+static bool start_custom_runtime_page(
+    NavigationSession *navigation, Budget *budget, BrowserSession *browser,
+    const char *url, const char *html, size_t maximum_scripts,
+    size_t maximum_total_bytes, size_t maximum_file_bytes)
+{
+    return start_custom_runtime_page_heavy(
+        navigation, budget, browser, url, html, maximum_scripts,
+        maximum_total_bytes, maximum_file_bytes, SCRIPT_HEAVY_POLICY_RUN,
+        NULL, NULL);
 }
 
 static bool evaluate(NavigationSession *navigation, const char *source,
@@ -404,4 +424,6 @@ static char *make_padded_script_source(const char *prefix, size_t length)
 #include "suites/dynamic_script_lifecycle.inc"
 #include "suites/dynamic_script_quota.inc"
 #include "suites/dynamic_script_state.inc"
+#include "suites/dynamic_script_contextual_fragment.inc"
+#include "suites/dynamic_script_clone.inc"
 #include "suites/dynamic_script_runner.inc"

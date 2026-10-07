@@ -1,0 +1,1 @@
+<!doctype html><title>Dynamic</title><p>Script adds a refresh.</p><script>setTimeout(function(){var m=document.createElement('meta');m.httpEquiv='refresh';m.content='0;url=/target';document.head.appendChild(m);},50);</script>

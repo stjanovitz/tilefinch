@@ -20,7 +20,11 @@
 #define MAX_TRACKED_STYLESHEETS 32
 #define STYLESHEET_FETCH_CONCURRENCY 4
 #define STYLESHEET_FETCH_BATCH 2
-#define STYLESHEET_PARSE_EXPANSION 3u
+/* Parsed-cost model for admission (stylesheet_source_cost_estimate). */
+#define STYLESHEET_ESTIMATE_BLOCK_BYTES 512u
+#define STYLESHEET_ESTIMATE_CUSTOM_PROPERTY_BYTES 176u
+#define STYLESHEET_ESTIMATE_GROWTH_BYTES (128u * 1024u)
+#define STYLESHEET_ESTIMATE_MINIMUM_BYTES (32u * 1024u)
 #define STYLESHEET_LAYOUT_RESERVE (2u * 1024u * 1024u)
 #define STYLESHEET_LARGE_SOURCE_BYTES (512u * 1024u)
 #define STYLESHEET_LARGE_SOURCE_RULE_LIMIT 1572u
@@ -28,6 +32,18 @@
 #define STYLESHEET_LARGE_SOURCE_RELEVANT_RULES 768u
 #define STYLESHEET_LARGE_SOURCE_SECONDARY_RULES 256u
 #define STYLESHEET_LARGE_SOURCE_TAIL_PERCENT 95u
+/* Memory-based admission of large stylesheets (stylesheet_response_bound):
+   above a profile's per-file cap, when that cap is already large-sheet sized,
+   one response may grow to this sanity ceiling if the page Budget can stage
+   it. A response needs about its size for the body and five more for the
+   large-source parse working set (stylesheet_source_cost_estimate measures
+   4.9x on gitlab's and 4.4x on reuters' 768 KiB prefixes). */
+#define STYLESHEET_FILE_CEILING_BYTES (2u * 1024u * 1024u)
+#define STYLESHEET_STAGING_FACTOR 6u
+/* Past its 768-rule allowance, a large sheet may keep up to this many more
+   DOM-relevant rules while the Budget has STYLESHEET_ESTIMATE_BLOCK_BYTES per
+   rule to spare beside the layout reserve. */
+#define STYLESHEET_LARGE_SOURCE_EXTRA_RELEVANT_RULES 2304u
 #define STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS 64u
 #define STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS 128u
 #define STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT 512u
@@ -63,7 +79,9 @@ static void stylesheet_selector_token_add_words(
     bloom[second / 32u] |= UINT32_C(1) << (second & 31u);
 }
 
-static void stylesheet_collect_selector_tokens(
+/* Returns true when the census visited every node under root, so the bloom
+   answers "absent" only for tokens the document really lacks. */
+static bool stylesheet_collect_selector_tokens(
     lxb_dom_node_t *root, uint32_t *bloom, size_t bloom_words,
     size_t node_limit, bool saturate_on_overflow)
 {
@@ -108,6 +126,7 @@ static void stylesheet_collect_selector_tokens(
            source order rather than pretending unseen tokens are absent. */
         memset(bloom, 0xff, bloom_words * sizeof(*bloom));
     }
+    return node == NULL;
 }
 
 _Static_assert(STYLESHEET_REFERRER_POLICY_LIMIT
@@ -164,6 +183,8 @@ typedef struct {
     bool alternate_theme_selection_valid;
     uint32_t selector_token_bloom[STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS];
     uint32_t priority_token_bloom[STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS];
+    /* The whole-document census fit its node limit (no saturation). */
+    bool selector_token_census_complete;
     ExternalStylesheetStats *stats;
     PendingStylesheet pending[STYLESHEET_FETCH_CONCURRENCY];
     size_t pending_count;
@@ -175,25 +196,208 @@ typedef struct {
     bool deadline_reached;
 } ResourceContext;
 
-/* Selector programs, declarations and retained source provenance make a
-   parsed sheet larger than its wire bytes.  Admission is deliberately
-   conservative: preserve enough budget for authoritative layout and paint,
-   and omit this optional author source before the allocator can fail halfway
-   through it.  Earlier document-order sheets therefore win deterministically
-   on constrained pages. */
+static size_t stylesheet_estimate_add(size_t total, size_t amount)
+{
+    return amount > SIZE_MAX - total ? SIZE_MAX : total + amount;
+}
+
+static size_t stylesheet_estimate_scale(size_t count, size_t unit)
+{
+    return count > SIZE_MAX / unit ? SIZE_MAX : count * unit;
+}
+
+/* Rules, declarations and selector programs plus the rule index built on
+   first use. Source bytes
+   are a poor proxy (measured 1.0x to 5.6x across captured sites): a 2 MiB
+   sheet of short rules costs about its own size, while a 50 KiB block of
+   custom properties costs five times its size. The cost follows the number
+   of rule blocks and custom-property declarations instead, which one
+   allocation-free pass over the text counts (comments skipped; braces in
+   strings over-count, which only makes the estimate more conservative).
+   The coefficients bound every sheet of the calibration recorded in
+   docs/engineering/MEMORY_EXPERIMENTS.md; a quarter is added for geometric
+   array growth, plus a fixed allowance (ramped in for small sheets) for
+   arrays and index tables that double on first use. */
+size_t stylesheet_source_cost_estimate(const char *css, size_t length)
+{
+    if (css == NULL || length == 0) return 0;
+    size_t blocks = 0;
+    size_t custom_properties = 0;
+    bool declaration_start = false;
+    for (size_t at = 0; at < length; at++) {
+        unsigned char value = (unsigned char) css[at];
+        if (value == '/' && at + 1u < length && css[at + 1u] == '*') {
+            at += 2u;
+            while (at + 1u < length
+                   && !(css[at] == '*' && css[at + 1u] == '/')) at++;
+            at++;
+            continue;
+        }
+        if (value == '{' || value == ';') {
+            if (value == '{') blocks++;
+            declaration_start = true;
+            continue;
+        }
+        if (value == ' ' || value == '\t' || value == '\n'
+            || value == '\r' || value == '\f') continue;
+        if (declaration_start && value == '-' && at + 1u < length
+            && css[at + 1u] == '-') custom_properties++;
+        declaration_start = false;
+    }
+    size_t cost = stylesheet_estimate_add(
+        stylesheet_estimate_scale(blocks, STYLESHEET_ESTIMATE_BLOCK_BYTES),
+        stylesheet_estimate_scale(custom_properties,
+                                  STYLESHEET_ESTIMATE_CUSTOM_PROPERTY_BYTES));
+    cost = stylesheet_estimate_add(cost, cost / 4u);
+    size_t growth = length < STYLESHEET_ESTIMATE_GROWTH_BYTES / 2u
+        ? length * 2u : STYLESHEET_ESTIMATE_GROWTH_BYTES;
+    cost = stylesheet_estimate_add(cost, growth);
+    return cost < STYLESHEET_ESTIMATE_MINIMUM_BYTES
+        ? STYLESHEET_ESTIMATE_MINIMUM_BYTES : cost;
+}
+
+/* A response cut at its byte cap ends wherever the cap fell: inside a
+   declaration, a string, a comment, or an at-rule block. CSS parsing closes
+   every open construct at end of input, so parsing the raw prefix would apply
+   half a rule (or a whole @media block's worth of rules whose block was never
+   closed). One allocation-free pass finds each top-level construct that ended
+   on its own: a rule or at-rule block whose closing brace arrived, or a
+   top-level statement such as @import ending in a ';' outside
+   parentheses. Strings,
+   comments, escapes and unquoted url() bodies are skipped the way the
+   tokenizer consumes them, so braces and semicolons inside them never count,
+   and input that ends inside any of them is unfinished. Constructed sheets
+   split their text with the same scanner (js_css_statement_ends). */
+bool stylesheet_next_statement(const char *css, size_t length,
+                               size_t *offset, size_t *open_blocks)
+{
+    size_t depth = 0, parentheses = 0;
+    if (css == NULL || offset == NULL) goto unfinished;
+    for (size_t at = *offset; at < length; at++) {
+        unsigned char value = (unsigned char) css[at];
+        if (value == '/' && at + 1u < length && css[at + 1u] == '*') {
+            size_t close = at + 2u;
+            while (close + 1u < length
+                   && !(css[close] == '*' && css[close + 1u] == '/')) {
+                close++;
+            }
+            if (close + 1u >= length) goto unfinished;
+            at = close + 1u;
+            continue;
+        }
+        if (value == '\\') {
+            /* An escape consumes the next code point; a trailing backslash
+               is an incomplete token. */
+            if (at + 1u >= length) goto unfinished;
+            at++;
+            continue;
+        }
+        if (value == '"' || value == '\'') {
+            size_t close = at + 1u;
+            bool closed = false;
+            while (close < length) {
+                unsigned char inner = (unsigned char) css[close];
+                if (inner == '\\') {
+                    if (close + 1u >= length) break;
+                    close += 2u;
+                    continue;
+                }
+                /* An unescaped newline ends a (bad) string token. */
+                if (inner == value || inner == '\n' || inner == '\r'
+                    || inner == '\f') {
+                    closed = true;
+                    break;
+                }
+                close++;
+            }
+            if (!closed) goto unfinished;
+            at = close;
+            continue;
+        }
+        if ((value == 'u' || value == 'U') && at + 3u < length
+            && (css[at + 1u] == 'r' || css[at + 1u] == 'R')
+            && (css[at + 2u] == 'l' || css[at + 2u] == 'L')
+            && css[at + 3u] == '('
+            && (at == 0
+                || !(isalnum((unsigned char) css[at - 1u])
+                     || css[at - 1u] == '-' || css[at - 1u] == '_'))) {
+            size_t body = at + 4u;
+            while (body < length
+                   && (css[body] == ' ' || css[body] == '\t'
+                       || css[body] == '\n' || css[body] == '\r'
+                       || css[body] == '\f')) body++;
+            if (body >= length) goto unfinished;
+            if (css[body] != '"' && css[body] != '\'') {
+                /* Unquoted url(): everything up to ')' is one token. */
+                size_t close = body;
+                while (close < length && css[close] != ')') {
+                    if (css[close] == '\\') {
+                        if (close + 1u >= length) goto unfinished;
+                        close++;
+                    }
+                    close++;
+                }
+                if (close >= length) goto unfinished;
+                at = close;
+                continue;
+            }
+            /* A quoted url( is a function: the string is consumed above. */
+            parentheses++;
+            at += 3u;
+            continue;
+        }
+        if (value == '(') {
+            parentheses++;
+        } else if (value == ')') {
+            if (parentheses != 0) parentheses--;
+        } else if (value == '{') {
+            depth++;
+        } else if (value == '}') {
+            /* A stray top-level '}' joins the prelude of the rule it
+               interrupts, as CSS Syntax consumes it: it ends nothing. */
+            if (depth == 0) continue;
+            if (--depth == 0) {
+                *offset = at + 1u;
+                return true;
+            }
+        } else if (value == ';' && depth == 0 && parentheses == 0) {
+            *offset = at + 1u;
+            return true;
+        }
+    }
+    /* Even at depth zero the tail is unfinished: a selector without its
+       block, or an @import whose media list may have been cut. */
+unfinished:
+    if (open_blocks != NULL) *open_blocks = depth;
+    return false;
+}
+
+size_t stylesheet_complete_rules_prefix(const char *css, size_t length)
+{
+    size_t complete = 0;
+    while (stylesheet_next_statement(css, length, &complete, NULL)) {}
+    return complete;
+}
+
+/* Parsing a sheet must leave enough budget for authoritative layout and
+   paint, so admission compares the estimate above plus that reserve with
+   what remains, and omits this optional author source before the allocator
+   can fail halfway through it. Earlier document-order sheets therefore win
+   deterministically on constrained pages. Before refusing, the Budget's
+   reclaim hook may release optional caches (module bytecode): an unstyled
+   page is worse than a slower revisit. */
 static bool stylesheet_parse_admitted(ResourceContext *context,
-                                      size_t source_bytes)
+                                      size_t source_bytes, size_t working)
 {
     if (context == NULL || context->budget == NULL || source_bytes == 0) {
         return true;
     }
-    size_t working = source_bytes > SIZE_MAX / STYLESHEET_PARSE_EXPANSION
-        ? SIZE_MAX : source_bytes * STYLESHEET_PARSE_EXPANSION;
-    if (working != SIZE_MAX && working < 32u * 1024u) {
-        working = 32u * 1024u;
-    }
-    if (!budget_pressure_required(
-            context->budget, working, STYLESHEET_LAYOUT_RESERVE)) {
+    size_t required = stylesheet_estimate_add(
+        working, STYLESHEET_LAYOUT_RESERVE);
+    if (!budget_pressure_required(context->budget, working,
+                                  STYLESHEET_LAYOUT_RESERVE)
+        || (required != SIZE_MAX
+            && budget_make_room(context->budget, required))) {
         return true;
     }
 #ifndef TILEFINCH_NO_TRACE
@@ -209,6 +413,38 @@ static bool stylesheet_parse_admitted(ResourceContext *context,
     budget_record_pressure(context->budget, BUDGET_PRESSURE_STYLESHEET,
                            working, 0);
     return false;
+}
+
+/* The largest response one stylesheet request may reserve: the profile's
+   per-file cap, raised by memory when that cap is already large-sheet sized
+   (the sheet's retained rules are then bounded by the large-source rule
+   admission, so the byte cap only bounds staging). The extension is what the
+   Budget can stage beside the layout reserve and the requests already in
+   flight, up to STYLESHEET_FILE_CEILING_BYTES; small-memory profiles and a
+   tight Budget keep the per-file cap, where the complete-rules prefix of a
+   longer sheet still applies. `remaining` is the lane's aggregate room. */
+static size_t stylesheet_response_bound(const ResourceContext *context,
+                                        size_t remaining)
+{
+    size_t bound = context->maximum_single_bytes;
+    if (bound >= STYLESHEET_LARGE_SOURCE_BYTES
+        && bound < STYLESHEET_FILE_CEILING_BYTES
+        && context->budget != NULL) {
+        size_t reserved = STYLESHEET_LAYOUT_RESERVE;
+        for (size_t i = 0; i < context->pending_count; i++) {
+            reserved = stylesheet_estimate_add(
+                reserved, stylesheet_estimate_scale(
+                    context->pending[i].maximum_bytes,
+                    STYLESHEET_STAGING_FACTOR));
+        }
+        size_t free_bytes = budget_remaining(context->budget);
+        size_t affordable = free_bytes > reserved
+            ? (free_bytes - reserved) / STYLESHEET_STAGING_FACTOR : 0;
+        if (affordable > STYLESHEET_FILE_CEILING_BYTES)
+            affordable = STYLESHEET_FILE_CEILING_BYTES;
+        if (affordable > bound) bound = affordable;
+    }
+    return bound < remaining ? bound : remaining;
 }
 
 /* Style preloads are optional hints with a lane of their own: as many
@@ -397,6 +633,39 @@ static void document_resource_record_failure(
         resources->transient_failures++;
         entry->state = STYLESHEET_DOCUMENT_RESOURCE_TRANSIENT_FAILURE;
     }
+}
+
+static void stylesheet_note_truncated(
+    ResourceContext *context, const char *url, size_t received,
+    size_t applied)
+{
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
+        fprintf(stderr,
+                "tilefinch-stylesheet-truncated received=%zu applied=%zu "
+                "url=%s\n", received, applied, url == NULL ? "" : url);
+    }
+#endif
+    StylesheetDocumentResources *resources = context->document_resources;
+    StylesheetDocumentResource *entry =
+        document_resource_find(resources, url);
+    if (entry != NULL) {
+        /* The page-lifetime ledger counts each response once, however many
+           continuations reapply its retained prefix. */
+        if (entry->truncated) return;
+        entry->truncated = true;
+    }
+    size_t *count = resources != NULL ? &resources->truncated
+                                      : &context->stats->truncated;
+    size_t *received_total = resources != NULL
+        ? &resources->truncated_received_bytes
+        : &context->stats->truncated_received_bytes;
+    size_t *applied_total = resources != NULL
+        ? &resources->truncated_applied_bytes
+        : &context->stats->truncated_applied_bytes;
+    (*count)++;
+    *received_total = stylesheet_estimate_add(*received_total, received);
+    *applied_total = stylesheet_estimate_add(*applied_total, applied);
 }
 
 static void document_resource_record_loaded(
@@ -1053,7 +1322,32 @@ static bool apply_stylesheet_data(ResourceContext *context,
         context->stats->skipped_limit++;
         return true;
     }
-    if (!stylesheet_parse_admitted(context, css_length)) return true;
+    size_t parse_cost = stylesheet_source_cost_estimate(
+        (const char *) css_data, css_length);
+    if (css_length > context->maximum_single_bytes
+        && budget_pressure_required(context->budget, parse_cost,
+                                    STYLESHEET_LAYOUT_RESERVE)
+        && !budget_make_room(context->budget, stylesheet_estimate_add(
+               parse_cost, STYLESHEET_LAYOUT_RESERVE))) {
+        /* Memory admitted this response past the per-file cap but no longer
+           holds its parse: keep what the cap alone would have kept, its
+           complete rules up to the cap, rather than refusing the sheet. */
+        size_t kept = stylesheet_complete_rules_prefix(
+            (const char *) css_data, context->maximum_single_bytes);
+        if (kept == 0) {
+            context->stats->skipped_pressure++;
+            budget_record_pressure(context->budget,
+                                   BUDGET_PRESSURE_STYLESHEET, parse_cost, 0);
+            return true;
+        }
+        stylesheet_note_truncated(context, resolved, css_length, kept);
+        css_length = kept;
+        parse_cost = stylesheet_source_cost_estimate(
+            (const char *) css_data, css_length);
+    }
+    if (!stylesheet_parse_admitted(context, css_length, parse_cost)) {
+        return true;
+    }
     /* Only retained author CSS consumes the aggregate source quota. A large
        sheet refused by the independent memory-pressure gate must not crowd
        out a later, small sheet that still fits and may carry critical mobile
@@ -1121,18 +1415,44 @@ static bool apply_stylesheet_data(ResourceContext *context,
             rules_before > SIZE_MAX - STYLESHEET_LARGE_SOURCE_HEAD_RULES
                 ? SIZE_MAX
                 : rules_before + STYLESHEET_LARGE_SOURCE_HEAD_RULES;
+        /* DOM-relevant rules past the fixed allowance are admitted by
+           memory: each needs about a rule block's estimate beside the
+           sheet's parse working set and the layout reserve. Both the
+           relevant allowance and the sheet's rule ceiling grow by them. */
+        size_t extra_relevant = 0;
+        size_t spare = budget_remaining(context->budget);
+        size_t needed = stylesheet_estimate_add(
+            parse_cost, STYLESHEET_LAYOUT_RESERVE);
+        if (spare > needed) {
+            extra_relevant = (spare - needed)
+                             / STYLESHEET_ESTIMATE_BLOCK_BYTES;
+            if (extra_relevant > STYLESHEET_LARGE_SOURCE_EXTRA_RELEVANT_RULES)
+                extra_relevant = STYLESHEET_LARGE_SOURCE_EXTRA_RELEVANT_RULES;
+        }
+        context->sheet->source_rule_limit_end = stylesheet_estimate_add(
+            context->sheet->source_rule_limit_end, extra_relevant);
         context->sheet->source_rule_relevant_limit_end =
-            context->sheet->source_rule_head_limit_end
-                > SIZE_MAX - STYLESHEET_LARGE_SOURCE_RELEVANT_RULES
-                ? SIZE_MAX
-                : context->sheet->source_rule_head_limit_end
-                    + STYLESHEET_LARGE_SOURCE_RELEVANT_RULES;
+            stylesheet_estimate_add(
+                stylesheet_estimate_add(
+                    context->sheet->source_rule_head_limit_end,
+                    STYLESHEET_LARGE_SOURCE_RELEVANT_RULES),
+                extra_relevant);
+        /* A whole-document census that fit its node limit is as exact as
+           the first-screen one, so rules it admits share the full relevant
+           allowance. Only a saturated census (every token "present") keeps
+           the small secondary allowance, which then degrades to plain
+           source order. Sharing the allowance does not raise the sheet's
+           rule ceiling (source_rule_limit_end); it stops DOM-relevant rules
+           in the middle of a large sheet (icon sizes, display:none on
+           mobile) from being dropped while the allowance sits unused. */
         context->sheet->source_rule_secondary_limit_end =
-            context->sheet->source_rule_head_limit_end
-                > SIZE_MAX - STYLESHEET_LARGE_SOURCE_SECONDARY_RULES
-                ? SIZE_MAX
+            context->selector_token_census_complete
+                ? context->sheet->source_rule_relevant_limit_end
                 : context->sheet->source_rule_head_limit_end
-                    + STYLESHEET_LARGE_SOURCE_SECONDARY_RULES;
+                        > SIZE_MAX - STYLESHEET_LARGE_SOURCE_SECONDARY_RULES
+                    ? SIZE_MAX
+                    : context->sheet->source_rule_head_limit_end
+                        + STYLESHEET_LARGE_SOURCE_SECONDARY_RULES;
         context->sheet->source_rule_priority_token_bloom =
             context->priority_token_bloom;
         context->sheet->source_rule_priority_token_bloom_words =
@@ -1276,7 +1596,10 @@ static bool apply_stylesheet_data(ResourceContext *context,
         context->stats->rules_added += context->sheet->count - rules_before;
         context->stats->variables_added += context->sheet->variable_count
                                            - variables_before;
-        if (!use_cached && context->session != NULL && fetched != NULL) {
+        /* A response cut at its byte cap is not the resource; only this
+           document's ledger keeps its complete-rule prefix. */
+        if (!use_cached && context->session != NULL && fetched != NULL
+            && !fetched->response_limit_exceeded) {
             (void) cache_store_fetch(
                 context->session, resolved, fetched, &stable_provenance,
                 request_context, resource_grant);
@@ -1628,8 +1951,7 @@ static bool load_stylesheet_url(
         return true;
     }
     size_t remaining = context->maximum_total_bytes - context->stats->bytes;
-    size_t maximum = context->maximum_single_bytes < remaining
-                     ? context->maximum_single_bytes : remaining;
+    size_t maximum = stylesheet_response_bound(context, remaining);
     if (maximum == 0) {
         context->stats->skipped_limit++;
         document_resource_record_failure(
@@ -1909,6 +2231,26 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                 }
             }
         }
+        /* A sheet over its byte cap still carries the received prefix. Its
+           complete rules are applied in place (the cut only shortens the
+           buffer already held); the unfinished tail is dropped. */
+        bool truncated = false;
+        size_t truncated_received = 0;
+        if (!success && pending->apply_rules && pending->request_id != 0
+            && fetched->response_limit_exceeded
+            && fetched->status_code >= 200 && fetched->status_code <= 299
+            && fetched->data != NULL && fetched->length != 0
+            && fetched->shared_body == NULL) {
+            size_t kept = stylesheet_complete_rules_prefix(
+                fetched->data, fetched->length);
+            if (kept != 0) {
+                truncated_received = fetched->length;
+                fetched->length = kept;
+                fetched->data[kept] = '\0';
+                truncated = true;
+                success = true;
+            }
+        }
         if (context->stats->batches == 1 && success) {
             context->stats->first_batch_loaded++;
         }
@@ -2107,6 +2449,10 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                         pending->cors, pending->credentials);
                     if (pending->url == NULL) pending->owns_url = false;
                 }
+                if (truncated) {
+                    stylesheet_note_truncated(
+                        context, url, truncated_received, css_length);
+                }
                 StylesheetDocumentResource *entry = preload_only && retain
                     ? document_resource_find(resources, url) : NULL;
                 if (entry != NULL) {
@@ -2207,9 +2553,13 @@ static bool queue_stylesheet_link(ResourceContext *context,
         context->stats->skipped_alternate_theme++;
         return true;
     }
-    if (!tilefinch_csp_allows_request(
+    /* A matching nonce admits the link whatever its URL (style-src). */
+    uint8_t csp_grant = tilefinch_csp_element_grant(
+        context->content_security_policy, TILEFINCH_DESTINATION_STYLE, node,
+        true);
+    if (!tilefinch_csp_allows_request_granted(
             context->content_security_policy,
-            TILEFINCH_DESTINATION_STYLE, resolved)) {
+            TILEFINCH_DESTINATION_STYLE, resolved, csp_grant)) {
         context->stats->failed++;
         return true;
     }
@@ -2247,8 +2597,7 @@ static bool queue_stylesheet_link(ResourceContext *context,
         context->stats->duplicate++;
         size_t remaining = stats->bytes < context->maximum_total_bytes
             ? context->maximum_total_bytes - stats->bytes : 0;
-        size_t wanted = context->maximum_single_bytes < remaining
-            ? context->maximum_single_bytes : remaining;
+        size_t wanted = stylesheet_response_bound(context, remaining);
         for (size_t i = 0; i < context->pending_count; i++) {
             PendingStylesheet *queued = &context->pending[i];
             size_t queued_integrity_length = 0;
@@ -2304,8 +2653,7 @@ static bool queue_stylesheet_link(ResourceContext *context,
     /* The flush settles charges; read this lane's again. */
     charged = stylesheet ? stats->bytes : stats->preload_bytes;
     size_t remaining = charged < byte_limit ? byte_limit - charged : 0;
-    size_t maximum = context->maximum_single_bytes < remaining
-                     ? context->maximum_single_bytes : remaining;
+    size_t maximum = stylesheet_response_bound(context, remaining);
     if (maximum == 0) {
         context->stats->skipped_limit++;
         if (stylesheet)
@@ -2332,6 +2680,7 @@ static bool queue_stylesheet_link(ResourceContext *context,
     pending->credentials = credentials;
     TilefinchRequestContext request_context = stylesheet_request_context(
         context, resolved, pending->cors, pending->credentials);
+    request_context.csp_grant = csp_grant;
     if (integrity_present
         && !tilefinch_url_same_origin(context->document_url, resolved)
         && !pending->cors) {
@@ -2445,17 +2794,18 @@ static bool process_stylesheet_node(
         if (!tilefinch_csp_allows_inline_style(
                 context->content_security_policy, node)) return true;
         size_t inline_bytes = 0;
+        size_t inline_working = 0;
         for (lxb_dom_node_t *child = node->first_child;
              child != NULL; child = child->next) {
             size_t css_length = 0;
-            (void) document_text_data(child, &css_length);
-            if (css_length > SIZE_MAX - inline_bytes) {
-                inline_bytes = SIZE_MAX;
-                break;
-            }
-            inline_bytes += css_length;
+            const char *css = document_text_data(child, &css_length);
+            inline_bytes = stylesheet_estimate_add(inline_bytes, css_length);
+            inline_working = stylesheet_estimate_add(
+                inline_working,
+                stylesheet_source_cost_estimate(css, css_length));
         }
-        if (!stylesheet_parse_admitted(context, inline_bytes)) return true;
+        if (!stylesheet_parse_admitted(context, inline_bytes,
+                                       inline_working)) return true;
         /* A queued external sheet precedes this inline block in the
            document and must be parsed first. Consecutive links remain
            batched, preserving parallel fetch without changing the author
@@ -2483,6 +2833,40 @@ static bool process_stylesheet_node(
     }
     return !name_is(node, "link")
         || queue_stylesheet_link(context, node);
+}
+
+/* The document's adopted constructed sheets, once each, after every <style>
+   and <link> source (document_adopted_sheets_active). They are admitted
+   like inline blocks; no style-src check applies to script-built sheets,
+   and they cannot @import. */
+static bool process_adopted_sheets(ResourceContext *context,
+                                   const PocDocument *document)
+{
+    lxb_dom_node_t *nodes[DOCUMENT_ADOPTED_TIER_LIMIT];
+    uint32_t revisions[DOCUMENT_ADOPTED_TIER_LIMIT];
+    size_t count = document_adopted_sheets_active(
+        document, nodes, revisions, DOCUMENT_ADOPTED_TIER_LIMIT);
+    if (count == SIZE_MAX) count = DOCUMENT_ADOPTED_TIER_LIMIT;
+    for (size_t i = 0; i < count; i++) {
+        if (!resource_work(context, 1, false)) return false;
+        size_t bytes = 0, working = 0;
+        for (lxb_dom_node_t *child = nodes[i]->first_child;
+             child != NULL; child = child->next) {
+            size_t css_length = 0;
+            const char *css = document_text_data(child, &css_length);
+            bytes = stylesheet_estimate_add(bytes, css_length);
+            working = stylesheet_estimate_add(
+                working, stylesheet_source_cost_estimate(css, css_length));
+        }
+        if (!stylesheet_parse_admitted(context, bytes, working)) continue;
+        if (!flush_stylesheet_batch(context)
+            || !stylesheet_add_adopted_sheet(
+                   context->sheet, document, nodes[i], revisions[i]))
+            return false;
+    }
+    (void) stylesheet_set_adopted_scopes(context->sheet, document, NULL, 0,
+                                         NULL, NULL);
+    return true;
 }
 
 static bool walk(ResourceContext *context, lxb_dom_node_t *node)
@@ -2612,10 +2996,11 @@ static bool stylesheets_append_ordered_suffix_impl(
         selector_root, context.priority_token_bloom,
         STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
         STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT, false);
-    stylesheet_collect_selector_tokens(
-        selector_root, context.selector_token_bloom,
-        STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
-        STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
+    context.selector_token_census_complete =
+        stylesheet_collect_selector_tokens(
+            selector_root, context.selector_token_bloom,
+            STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
+            STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
     context.deadline_ms = context.started_ms + (double) timeout_ms;
     stylesheet_restore_alternate_themes(&context);
     /* The full ordered loader suppresses URLs already encountered earlier
@@ -2656,6 +3041,10 @@ static bool stylesheets_append_ordered_suffix_impl(
         stats->retry_suppressed = resources->retry_suppressed;
         stats->final_retry_grants = resources->final_retry_grants;
         stats->pressure_serializations = resources->pressure_serializations;
+        stats->truncated = resources->truncated;
+        stats->truncated_received_bytes =
+            resources->truncated_received_bytes;
+        stats->truncated_applied_bytes = resources->truncated_applied_bytes;
     }
     return ok;
 }
@@ -2746,10 +3135,12 @@ bool stylesheets_load_external_tracked_with_context(
         lxb_dom_interface_node(document->html), context.priority_token_bloom,
         STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
         STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT, false);
-    stylesheet_collect_selector_tokens(
-        lxb_dom_interface_node(document->html), context.selector_token_bloom,
-        STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
-        STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
+    context.selector_token_census_complete =
+        stylesheet_collect_selector_tokens(
+            lxb_dom_interface_node(document->html),
+            context.selector_token_bloom,
+            STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
+            STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
     size_t parallel_working = maximum_single_bytes;
     if (parallel_working <= SIZE_MAX / STYLESHEET_FETCH_BATCH) {
         parallel_working *= STYLESHEET_FETCH_BATCH;
@@ -2781,6 +3172,7 @@ bool stylesheets_load_external_tracked_with_context(
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(&context,
                                    "stylesheet discovery cancelled");
+    if (ok) ok = process_adopted_sheets(&context, document);
     if (batch_rules && !stylesheet_end_rule_batch(sheet)) ok = false;
     resource_finish_slice(&context);
     if (ok) sheet->document_rules_deferred = false;
@@ -2797,6 +3189,10 @@ bool stylesheets_load_external_tracked_with_context(
         stats->retry_suppressed = resources->retry_suppressed;
         stats->final_retry_grants = resources->final_retry_grants;
         stats->pressure_serializations = resources->pressure_serializations;
+        stats->truncated = resources->truncated;
+        stats->truncated_received_bytes =
+            resources->truncated_received_bytes;
+        stats->truncated_applied_bytes = resources->truncated_applied_bytes;
     }
     if (owns_scheduler) fetch_scheduler_destroy(scheduler);
     return ok;

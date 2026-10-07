@@ -17,6 +17,110 @@ static bool apply_user_css(NavigationSession *navigation, const char *path)
     return navigation_relayout(navigation);
 }
 
+/* Site-census report (tools/site-census, `census` command): first-paint
+   timebase, off-screen share of the retained layout, per-image decoded and
+   painted sizes, and Reader suitability. Read-only; lab frontend only. */
+static void interactive_census_report(BrowserEngine *engine,
+                                      NavigationSession *navigation)
+{
+    const LayoutDocument *layout = &navigation->page.layout;
+    int viewport_height = navigation->viewport.css_height > 0
+        ? navigation->viewport.css_height : 272;
+    printf("census-timebase navigation-start-us=%llu first-paint-us=%llu "
+           "completion-us=%llu viewport-height=%d\n",
+           (unsigned long long) navigation->navigation_started_us,
+           (unsigned long long) navigation->performance.first_paint_us,
+           (unsigned long long) navigation->performance.completion_us,
+           viewport_height);
+    size_t below = 0, below_two = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        if (layout->commands[i].y >= viewport_height) below++;
+        if (layout->commands[i].y >= 2 * viewport_height) below_two++;
+    }
+    size_t boxes_below = 0, boxes_below_two = 0;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        if (layout->node_boxes[i].y >= viewport_height) boxes_below++;
+        if (layout->node_boxes[i].y >= 2 * viewport_height) boxes_below_two++;
+    }
+    printf("census-layout commands=%zu below=%zu below2=%zu command-size=%zu "
+           "boxes=%zu boxes-below=%zu boxes-below2=%zu box-size=%zu "
+           "document-height=%d\n",
+           layout->count, below, below_two, sizeof(*layout->commands),
+           layout->node_box_count, boxes_below, boxes_below_two,
+           sizeof(*layout->node_boxes), layout->height);
+
+    const ImageResources *images = &navigation->page.images;
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *image = &images->items[i];
+        size_t painted_area = 0;
+        int painted_width = 0, painted_height = 0, top = -1;
+        size_t paints = 0;
+        for (size_t c = 0; c < layout->count; c++) {
+            const DrawCommand *command = &layout->commands[c];
+            if (command->type != DRAW_IMAGE || command->image != image)
+                continue;
+            paints++;
+            if (top < 0 || command->y < top) top = command->y;
+            int w = command->width > 0 ? command->width : 0;
+            int h = command->height > 0 ? command->height : 0;
+            if ((size_t) w * (size_t) h > painted_area) {
+                painted_area = (size_t) w * (size_t) h;
+                painted_width = w;
+                painted_height = h;
+            }
+        }
+        size_t decoded = image->pixels == NULL ? 0
+            : (size_t) (image->width > 0 ? image->width : 0)
+                * (size_t) (image->height > 0 ? image->height : 0) * 4u;
+        /* Several resources can alias one decoded surface (a background
+           shared by many elements); `surface` names it within this report so
+           the census counts its bytes once. */
+        size_t surface = i;
+        for (size_t j = 0; j < i; j++) {
+            if (image->pixels != NULL
+                && images->items[j].pixels == image->pixels) {
+                surface = j;
+                break;
+            }
+        }
+        /* What backs the surface: SVG markup (rasterized again at the
+           painted size), decoded pixels with their encoded bytes (a raster
+           display retargeting can resize), encoded bytes only (decoded at
+           paint), pixels alone (SVG rasters too small to keep their markup,
+           adopted cache copies) or a canvas. */
+        const char *origin = image->is_canvas ? "canvas"
+            : (image->retarget_flags & IMAGE_RETARGET_VECTOR) != 0
+                && image->encoded != NULL ? "vector"
+            : image->pixels == NULL ? "encoded"
+            : image->encoded != NULL ? "raster"
+            : "pixels";
+        printf("census-image index=%zu kind=%s source=%dx%d decoded=%dx%d "
+               "decoded-bytes=%zu encoded-bytes=%zu painted=%dx%d paints=%zu "
+               "top=%d surface=%zu origin=%s\n",
+               i, image->is_canvas ? "canvas" : image->is_mask ? "mask"
+                   : image->is_background ? "background" : "image",
+               image->source_width, image->source_height,
+               image->width, image->height, decoded, image->encoded_length,
+               painted_width, painted_height, paints, top, surface, origin);
+    }
+
+    ReaderDocumentAnalysis analysis = {0};
+    bool analyzed = browser_engine_analyze_reader(engine, &analysis);
+    printf("census-reader analyzed=%s kind=%s high-confidence=%s "
+           "visited=%u visible-text=%u extracted-bytes=%u extracted-nodes=%u "
+           "listing-entries=%u bounded=%s truncated=%s blank=%s\n",
+           analyzed ? "yes" : "no", reader_page_kind_name(analysis.kind),
+           analysis.high_confidence ? "yes" : "no",
+           (unsigned) analysis.visited_nodes,
+           (unsigned) analysis.visible_text_bytes,
+           (unsigned) analysis.extracted_bytes,
+           (unsigned) analysis.extracted_nodes,
+           (unsigned) analysis.listing_entries,
+           analysis.bounded_out ? "yes" : "no",
+           analysis.extraction_truncated ? "yes" : "no",
+           browser_engine_page_is_visually_blank(engine) ? "yes" : "no");
+}
+
 static char *instrument_probe_source(Budget *budget, char *source,
                                      size_t *length)
 {
@@ -1053,16 +1157,51 @@ static void loop_help(void)
          "history-controls, "
          "anchor ID, node-text ID, node-attribute ID NAME, "
          "tap X Y, cross|activate, "
-         "type TEXT, backspace, profile [LABEL], work [LABEL], "
-         "click SELECTOR, tick [COUNT [MS]], "
+         "type TEXT, backspace, profile [LABEL], work [LABEL], census, "
+         "click SELECTOR, tick [COUNT [MS]], until MAX-TURNS MS EXPRESSION, "
          "drain [MAX-TURNS [SETTLE-MS]], "
          "media-status|media-play|media-pause|media-seek SECONDS|"
          "media-open|media-close|media-run [COUNT [MS]], "
          "reader-on|reader-off, "
          "go URL, reload, "
-         "back|circle, forward, mark-steady, script-report, help, quit");
+         "back|circle, forward, mark-steady, script-report, "
+         "refresh-status, help, quit");
     puts("PSP aliases: dpad-up/down scroll, dpad-left/right move focus, "
          "ltrigger goes back, rtrigger goes forward, cross activates");
+}
+
+/* Commands that stand for a button press or a typed address: they restart
+   the refresh loop guard, as a PSP press does. Waiting and inspection
+   (tick, until, idle, drain, status, render...) are not input. */
+static bool loop_command_is_user_input(const char *line)
+{
+    static const char *const commands[] = {
+        "up", "down", "dpad-up", "dpad-down", "dpad-left", "dpad-right",
+        "page-up", "page-down", "top", "bottom", "section-walk",
+        "focus-next", "focus-prev", "focus-up", "focus-down", "focus-left",
+        "focus-right", "focus-id", "focus-url", "tap", "click", "type",
+        "backspace", "activate", "cross", "circle", "back", "ltrigger",
+        "forward", "rtrigger", "go", "reload", "reader-on", "reader-off",
+        "basic-on"
+    };
+    for (size_t at = 0; at < sizeof(commands) / sizeof(commands[0]); at++)
+        if (strcmp(line, commands[at]) == 0) return true;
+    return false;
+}
+
+static const char *loop_refresh_state_name(NavigationRefreshState state)
+{
+    switch (state) {
+    case NAVIGATION_REFRESH_NONE: return "none";
+    case NAVIGATION_REFRESH_PENDING: return "pending";
+    case NAVIGATION_REFRESH_DUE: return "due";
+    case NAVIGATION_REFRESH_FOLLOWED: return "followed";
+    case NAVIGATION_REFRESH_CANCELLED: return "cancelled";
+    case NAVIGATION_REFRESH_STOPPED: return "stopped";
+    case NAVIGATION_REFRESH_REFUSED: return "refused";
+    case NAVIGATION_REFRESH_OFFERED: return "offered";
+    }
+    return "unknown";
 }
 
 /* One census of every quantity that a zero-time engine turn can move.  The
@@ -1322,6 +1461,8 @@ static bool run_command_loop(FILE *commands, bool interactive,
             *argument++ = '\0';
             while (*argument == ' ') argument++;
         }
+        if (loop_command_is_user_input(line))
+            browser_engine_note_user_input(engine);
         bool changed = true, reset_cache = false, ok = true;
         uint64_t network_before = navigation->performance.network_us;
         uint64_t script_before = navigation->performance.script_us;
@@ -1346,9 +1487,34 @@ static bool run_command_loop(FILE *commands, bool interactive,
                the first document; a page that reloads itself during startup
                needs this to measure its replacement document. */
             const ScriptResult *js = &navigation->page.script_result;
-            printf("script-report loads=%zu runtime=%s\n",
+            printf("script-report loads=%zu runtime=%s memory-rescue=%s\n",
                    navigation->loads_committed,
-                   navigation->page.runtime == NULL ? "none" : "live");
+                   navigation->page.runtime == NULL ? "none" : "live",
+                   navigation_page_memory_rescued(navigation)
+                       ? "yes" : "no");
+            ScriptHeavyState heavy;
+            if (browser_engine_heavy_page(engine, &heavy)) {
+                static const char *const classes[] = {
+                    "none", "content", "shell", "over"
+                };
+                printf("heavy-page class=%s script-bytes=%zu "
+                       "restored=%zu/%zu estimate-ms=%u waiting=%zu/%zu "
+                       "waiting-ms=%u oversized=%zu/%zu "
+                       "refused=%zu largest-unit=%zu memory-needed=%zu "
+                       "memory-free=%zu visible-text=%zu answered=%s\n",
+                       classes[(unsigned) heavy.page_class & 3u],
+                       heavy.script_bytes, heavy.restored_bytes,
+                       heavy.disk_restored_bytes,
+                       (unsigned) heavy.estimate_ms,
+                       heavy.waiting_scripts, heavy.waiting_bytes,
+                       (unsigned) heavy.waiting_ms,
+                       heavy.oversized_scripts, heavy.oversized_bytes,
+                       heavy.refused_scripts,
+                       heavy.largest_unit_bytes, heavy.memory_needed,
+                       heavy.memory_free, heavy.visible_text_bytes,
+                       !heavy.answered ? "no"
+                           : heavy.allowed ? "run" : "refuse");
+            }
             if (navigation->page.runtime != NULL) {
                 script_runtime_report_memory(navigation->page.runtime,
                                              stdout);
@@ -1376,6 +1542,23 @@ static bool run_command_loop(FILE *commands, bool interactive,
                        SCRIPT_COMPILE_SOURCE_MODULE],
                    (unsigned long long) js->max_nonpreemptible_compile_us,
                    js->max_nonpreemptible_compile_bytes);
+            changed = false;
+        }
+        else if (strcmp(line, "refresh-status") == 0) {
+            const NavigationRefresh *refresh = &navigation->page.refresh;
+            const NavigationRefreshStats *stats = &navigation->refresh;
+            printf("loop-refresh state=%s delay=%u elapsed-ms=%llu "
+                   "header=%d reload=%d touched=%d url=\"%s\" chain=%zu "
+                   "declared=%zu followed=%zu cancelled=%zu stopped=%zu "
+                   "refused=%zu offered=%zu\n",
+                   loop_refresh_state_name(refresh->state),
+                   (unsigned) refresh->delay_seconds,
+                   (unsigned long long) refresh->elapsed_ms,
+                   refresh->from_header ? 1 : 0, refresh->reload ? 1 : 0,
+                   refresh->user_touched ? 1 : 0,
+                   refresh->url, stats->chain, stats->declared,
+                   stats->followed, stats->cancelled, stats->stopped,
+                   stats->refused, stats->offered);
             changed = false;
         }
         else if (strcmp(line, "mark-steady") == 0) {
@@ -1686,6 +1869,17 @@ static bool run_command_loop(FILE *commands, bool interactive,
             tilefinch_work_print(argument == NULL ? "lab" : argument,
                                  navigation);
             ok = true;
+        } else if (strcmp(line, "heavy-answer") == 0 && argument != NULL) {
+            /* Answer a heavy page's waiting scripts: "run" or "stop". */
+            ok = browser_engine_answer_heavy_page(
+                engine, strcmp(argument, "run") == 0);
+            printf("heavy-answer %s ok=%s\n", argument, ok ? "yes" : "no");
+        } else if (strcmp(line, "stop-scripts") == 0) {
+            ok = browser_engine_stop_page_scripts(engine);
+            printf("stop-scripts ok=%s\n", ok ? "yes" : "no");
+        } else if (strcmp(line, "census") == 0) {
+            interactive_census_report(engine, navigation);
+            ok = true;
         } else if (strcmp(line, "work") == 0) {
             /* The deterministic work record (LAB_USAGE.md, "Work vector"). */
             tilefinch_work_print(argument == NULL ? "lab" : argument,
@@ -1713,6 +1907,69 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    scratch->script_result.last_clipboard_text,
                    scratch->script_result.error);
             ok = true;
+        } else if (strcmp(line, "until") == 0) {
+            /* Match the device's readiness probe rather than executing a
+               fixed tail of timers after the observed reply is present.
+               Probe evaluation does not drain jobs or refresh the document.
+               This is trusted lab input, not an author-facing API. */
+            char *end = NULL;
+            unsigned long count = 0, milliseconds = 0;
+            ok = argument != NULL && isdigit((unsigned char) *argument);
+            if (ok) {
+                count = strtoul(argument, &end, 10);
+                ok = end != argument && *end == ' '
+                    && count != 0 && count <= 10000;
+            }
+            if (ok) {
+                while (*end == ' ') end++;
+                char *number = end;
+                ok = isdigit((unsigned char) *number);
+                if (ok) {
+                    milliseconds = strtoul(number, &end, 10);
+                    ok = end != number && *end == ' '
+                        && milliseconds <= 60000;
+                }
+            }
+            if (ok) {
+                while (*end == ' ') end++;
+                int written = snprintf(scratch->script,
+                    sizeof(scratch->script),
+                    "__tilefinchClipboardWrite((%s)?'1':'');", end);
+                ok = *end != '\0' && written > 0
+                    && (size_t) written < sizeof(scratch->script);
+            }
+            unsigned long iterations = 0;
+            bool matched = false;
+            for (; ok; iterations++) {
+                memset(&scratch->script_result, 0,
+                       sizeof(scratch->script_result));
+                ok = navigation->page.runtime != NULL
+                    && script_runtime_evaluate_probe(
+                        navigation->page.runtime, scratch->script,
+                        "<until-js>", &scratch->script_result);
+                matched = ok
+                    && scratch->script_result.last_clipboard_text[0] == '1';
+                if (!ok || matched || iterations == count) break;
+                if (pace_real_time && milliseconds != 0) {
+                    struct timespec delay = {
+                        .tv_sec = (time_t) (milliseconds / 1000u),
+                        .tv_nsec = (long) ((milliseconds % 1000u) * 1000000u)
+                    };
+                    nanosleep(&delay, NULL);
+                }
+                ok = browser_engine_advance_runtime(
+                    engine, (unsigned) milliseconds, 8, NULL);
+                bool media_changed = false;
+                if (ok) {
+                    ok = interactive_media_advance(
+                        media, navigation, cache, (unsigned) milliseconds,
+                        &media_changed);
+                }
+            }
+            printf("loop-until matched=%s iterations=%lu cap=%lu "
+                   "probe-ok=%s\n", matched ? "yes" : "no", iterations,
+                   count, ok ? "yes" : "no");
+            ok = ok && matched;
         } else if (strcmp(line, "tick") == 0) {
             unsigned count = 1, milliseconds = 16;
             if (argument != NULL) {
@@ -1748,9 +2005,12 @@ static bool run_command_loop(FILE *commands, bool interactive,
             unsigned count = argument == NULL
                 ? 1u : (unsigned) strtoul(argument, NULL, 10);
             if (count == 0 || count > 10000) count = 1;
+            /* run_idle_work reports whether work remains, not failure:
+               stop at the first turn that leaves none. */
             for (unsigned i = 0; ok && i < count; i++) {
                 bool visual_changed = false;
-                ok = browser_engine_run_idle_work(engine, &visual_changed);
+                if (!browser_engine_run_idle_work(engine, &visual_changed))
+                    break;
             }
             printf("idle provisional=%d limit=%d height=%d "
                    "extensions=%zu completions=%zu relayouts=%zu "
@@ -1942,7 +2202,44 @@ static bool run_command_loop(FILE *commands, bool interactive,
                        scroll_after, have_anchor ? anchor_before : "",
                        after_anchor ? anchor_after : "");
             }
+        } else if (strcmp(line, "basic-on") == 0) {
+            /* Manual Basic view, as Page tools -> Basic view does it. */
+            ReaderDocumentAnalysis analysis = {0};
+            const NavigationEntry *entry = navigation_current(navigation);
+            const char *basic_url = entry == NULL
+                ? navigation->page.document_url : entry->url;
+            char basic_css[SITE_ADAPTER_READER_CSS_LIMIT];
+            char adapter[32];
+            uint64_t basic_started = tilefinch_platform_monotonic_time_us();
+            bool prepared = !reader_active
+                && browser_engine_prepare_basic_view(engine, &analysis);
+            uint64_t basic_prepared = tilefinch_platform_monotonic_time_us();
+            ok = prepared
+                && site_adapter_reader_css(
+                    basic_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
+                    basic_css, sizeof(basic_css), adapter, sizeof(adapter))
+                && browser_engine_apply_user_css(
+                    engine, basic_css, strlen(basic_css))
+                && browser_engine_activate_basic_view(engine);
+            printf("loop-basic prepared=%s activated=%s visited=%u "
+                   "nodes=%u bytes=%u forms=%u truncated=%s bounded=%s "
+                   "prepare-us=%llu text=%u\n",
+                   prepared ? "yes" : "no", ok ? "yes" : "no",
+                   (unsigned) analysis.visited_nodes,
+                   (unsigned) analysis.extracted_nodes,
+                   (unsigned) analysis.extracted_bytes,
+                   (unsigned) analysis.retained_forms,
+                   analysis.extraction_truncated ? "yes" : "no",
+                   analysis.bounded_out ? "yes" : "no",
+                   (unsigned long long) (basic_prepared - basic_started),
+                   (unsigned) analysis.visible_text_bytes);
+            if (ok) {
+                reader_active = true;
+                browser_engine_set_reader_candidate_mode(engine, false);
+            }
         } else if (strcmp(line, "go") == 0 && argument != NULL) {
+            /* Site-census ledger: split the records by visit. */
+            if (tilefinch_trace_census()) puts("census-visit command=go");
             bool handled = false;
             ok = experimental_anchor_reference(
                 experimental, navigation, controller, argument, user_css,
@@ -1966,6 +2263,8 @@ static bool run_command_loop(FILE *commands, bool interactive,
             }
             reset_cache = ok;
         } else if (strcmp(line, "reload") == 0) {
+            /* Site-census ledger: split the records by visit. */
+            if (tilefinch_trace_census()) puts("census-visit command=reload");
             if (experimental != NULL && experimental->active) {
                 ok = experimental_reload_document(
                     experimental, navigation, controller, user_css);

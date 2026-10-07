@@ -90,7 +90,14 @@ static void js_rt_runtime_update_core(ScriptRuntime *runtime, JSValue global)
 /* Diagnostic counters read by labs, validation reports and traces: dozens
    of global lookups and string copies. Builds without tracing do not refresh
    them per frame; they are refreshed at load boundaries, on failures, and
-   by script_runtime_refresh_result(). */
+   by script_runtime_refresh_result(). The shipping PSP build (tracing off,
+   no validation log) has no reader for any of them, so it never fills
+   them. */
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define JS_RT_RUNTIME_TELEMETRY 1
+#endif
+
+#ifdef JS_RT_RUNTIME_TELEMETRY
 static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
                                            JSValue global)
 {
@@ -342,6 +349,7 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
 #undef READ_ROOT
     JS_FreeValue(runtime->context, roots);
 }
+#endif /* JS_RT_RUNTIME_TELEMETRY */
 
 void js_rt_runtime_update_result(ScriptRuntime *runtime,
                                  ScriptResult *result)
@@ -349,7 +357,9 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
     js_rt_runtime_finish_slice_state(runtime);
     JSValue global = JS_GetGlobalObject(runtime->context);
     js_rt_runtime_update_core(runtime, global);
+#ifdef JS_RT_RUNTIME_TELEMETRY
     js_rt_runtime_update_telemetry(runtime, global);
+#endif
     JS_FreeValue(runtime->context, global);
     if (result != NULL) *result = runtime->result;
 }

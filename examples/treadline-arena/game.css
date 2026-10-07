@@ -43,7 +43,7 @@ html, body {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 1px;
-  text-shadow: 0 1px 2px #000;
+  text-shadow: 0 1px 0 #000;
   pointer-events: none;
 }
 
@@ -54,27 +54,8 @@ html, body {
   color: #8fffd4;
   font-size: 9px;
   font-weight: 600;
-  text-shadow: 0 1px 2px #000;
+  text-shadow: 0 1px 0 #000;
   pointer-events: none;
-}
-
-#gadget-meter {
-  position: absolute;
-  left: 7px;
-  bottom: 3px;
-  width: 86px;
-  height: 2px;
-  overflow: hidden;
-  background: rgba(143, 255, 212, .2);
-  pointer-events: none;
-}
-
-#gadget-meter i {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background: #8fffd4;
-  transform-origin: left center;
 }
 
 #command-status {
@@ -84,87 +65,32 @@ html, body {
   color: #ffd76f;
   font-size: 9px;
   font-weight: 600;
-  text-shadow: 0 1px 2px #000;
+  text-shadow: 0 1px 0 #000;
   pointer-events: none;
 }
-
-#command-meter {
-  position: absolute;
-  right: 7px;
-  bottom: 3px;
-  width: 86px;
-  height: 2px;
-  overflow: hidden;
-  background: rgba(255, 215, 111, .2);
-  pointer-events: none;
-}
-
-#command-meter i {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background: #ffd76f;
-  transform: scaleX(0);
-  transform-origin: left center;
-}
-
-#objective-arrow,
-#damage-arrow,
-#hit-marker {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  pointer-events: none;
-  text-shadow: 0 1px 2px #000;
-}
-
-#objective-arrow {
-  margin: -36px 0 0 -5px;
-  color: #70ffe0;
-  font-size: 10px;
-  transform-origin: 5px 36px;
-}
-
-#damage-arrow {
-  margin: -48px 0 0 -5px;
-  color: #ff7657;
-  font-size: 11px;
-  opacity: 0;
-  transform-origin: 5px 48px;
-}
-
-#damage-arrow.visible { opacity: 1; }
-
-#hit-marker {
-  margin: -13px 0 0 -7px;
-  color: #fff2a0;
-  font: 600 20px sans-serif;
-  opacity: 0;
-}
-
-#hit-marker.visible { opacity: 1; }
 
 /* Gameplay chrome is retained in the WebGL surface. These authored elements
    stay available to the title/pause shell and assistive tooling without
    creating style/layout work during the animation loop. */
 #game-shell.game-running #hud,
 #game-shell.game-running #gadget,
-#game-shell.game-running #gadget-meter,
 #game-shell.game-running #command-status,
-#game-shell.game-running #command-meter,
-#game-shell.game-running #objective-arrow,
-#game-shell.game-running #hit-marker,
-#game-shell.game-running #damage-arrow,
 #game-shell.game-running #toast {
   display: none;
 }
 
+/* Tilefinch repaints a focus move under this pure translate without
+   relaying out the page. A transform-free flex layer (commit 7a9c7f10)
+   measured the same on a PSP (about 51 ms per move either way), so the
+   translate stays. */
 #panel {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: min(452px, 96%);
-  padding: 12px 14px 10px;
+  width: min(468px, 98%);
+  max-height: calc(100% - 6px);
+  overflow-y: auto;
+  padding: 10px 12px 8px;
   transform: translate(-50%, -50%);
   border: 1px solid #5de0c2;
   border-radius: 10px;
@@ -174,6 +100,8 @@ html, body {
 }
 
 #panel[hidden] { display: none; }
+#settings[hidden] { display: none; }
+#settings { margin-bottom: 4px; }
 #panel.web-pairing-panel {
   width: min(420px, 88%);
   max-height: calc(100% - 24px);
@@ -183,7 +111,7 @@ html, body {
 h1 {
   margin: 0 0 7px;
   color: #ffffff;
-  font-size: 21px;
+  font-size: 26px;
   font-weight: 600;
   letter-spacing: 2px;
 }
@@ -192,24 +120,24 @@ h1 {
   margin: 0 0 9px;
   min-height: 30px;
   color: #b9d7dc;
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: 14px;
+  line-height: 1.3;
 }
 
 #play {
-  min-width: 112px;
-  min-height: 30px;
-  padding: 5px 16px;
+  min-width: 136px;
+  min-height: 32px;
+  padding: 4px 18px;
   border: 1px solid #c6fff2;
   border-radius: 7px;
   background: linear-gradient(#5de0c2, #249e91);
   color: #02110f;
-  font: 600 13px sans-serif;
+  font: 600 16px sans-serif;
 }
 
 #play:focus { outline: 2px solid #ffffff; outline-offset: 2px; }
 
-#online-actions {
+#online-actions, #replay-actions {
   display: flex;
   gap: 5px;
   justify-content: center;
@@ -217,19 +145,22 @@ h1 {
 }
 
 #online-actions button,
+#replay-actions button,
 #online-status button,
 #code-entry button,
 #web-pairing button {
-  min-height: 22px;
-  padding: 2px 7px;
+  min-height: 24px;
+  padding: 2px 8px;
   border: 1px solid #477d7d;
   border-radius: 4px;
   background: #102b31;
   color: #d8fbf4;
-  font: 600 9px sans-serif;
+  font: 600 12px sans-serif;
 }
 
 #online-actions button:focus,
+#replay-actions button:focus,
+#replay-code:focus,
 #online-status button:focus,
 #code-entry button:focus,
 #web-pairing button:focus,
@@ -238,13 +169,13 @@ h1 {
   outline-offset: 1px;
 }
 
-#online-status p { margin: 2px 0 5px; font-size: 10px; }
+#online-status p { margin: 2px 0 5px; font-size: 12px; }
 #online-invite, #code-value {
   display: block;
-  min-height: 18px;
-  margin: 3px 0 6px;
+  min-height: 20px;
+  margin: 2px 0 4px;
   color: #fff2a0;
-  font: 600 13px monospace;
+  font: 600 16px monospace;
   letter-spacing: 1px;
 }
 
@@ -254,26 +185,37 @@ h1 {
 #code-keypad {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 4px;
-  width: 164px;
-  margin: 0 auto 5px;
+  gap: 3px;
+  width: 204px;
+  margin: 0 auto 4px;
 }
 
-#code-keypad button { min-height: 25px; font-size: 10px; }
+#code-keypad button { min-height: 24px; font-size: 13px; }
 #online-status[hidden], #code-entry[hidden], #online-actions[hidden],
-#web-pairing[hidden], #preferences[hidden], #web-pairing [hidden] { display: none; }
+#web-pairing[hidden], #preferences[hidden], #web-pairing [hidden],
+#replay-code[hidden] { display: none; }
+
+#replay-code {
+  box-sizing: border-box;
+  width: 100%;
+  max-height: 48px;
+  margin-top: 5px;
+  background: #102b31;
+  color: #d8fbf4;
+  font: 12px monospace;
+}
 
 #web-pairing {
   width: 100%;
   margin: 0 auto;
   color: #d8fbf4;
-  font: 11px sans-serif;
+  font: 13px sans-serif;
 }
 
 #web-step {
   margin: 0 0 4px;
   color: #fff2a0;
-  font: 600 9px sans-serif;
+  font: 600 11px sans-serif;
   letter-spacing: .7px;
 }
 
@@ -306,7 +248,7 @@ h1 {
   border-radius: 4px;
   background: #07181d;
   color: #fff2a0;
-  font: 9px/1.25 monospace;
+  font: 11px/1.25 monospace;
 }
 
 #web-share-size {
@@ -314,7 +256,7 @@ h1 {
   min-height: 11px;
   margin: 1px 0 2px;
   color: #83aaa9;
-  font: 8px sans-serif;
+  font: 10px sans-serif;
   text-align: right;
 }
 
@@ -332,13 +274,13 @@ h1 {
 
 #loadout button {
   min-width: 0;
-  min-height: 31px;
-  padding: 3px 7px 4px;
+  min-height: 36px;
+  padding: 2px 8px 3px;
   border: 1px solid #477d7d;
   border-radius: 5px;
   background: #102b31;
   color: #d8fbf4;
-  font: 600 10px sans-serif;
+  font: 600 13px sans-serif;
   text-align: left;
 }
 
@@ -346,32 +288,32 @@ h1 {
   display: block;
   margin-bottom: 1px;
   color: #79aaa7;
-  font-size: 8px;
+  font-size: 10px;
   letter-spacing: .7px;
 }
 
-#loadout strong { color: #e8fff9; font-size: 11px; font-weight: 600; }
+#loadout strong { color: #e8fff9; font-size: 14px; font-weight: 600; }
 
 #preferences {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: 1fr 1fr;
   gap: 4px;
   margin: 0 0 8px;
 }
 
 #preferences button {
   min-width: 0;
-  min-height: 22px;
-  padding: 2px 3px;
+  min-height: 24px;
+  padding: 2px 6px;
   border: 1px solid #385f62;
   border-radius: 4px;
   background: #0b2228;
   color: #bfe2df;
-  font: 600 8px sans-serif;
+  font: 600 12px sans-serif;
   white-space: nowrap;
 }
 
-#preferences strong { color: #8fffd4; font-size: 8px; font-weight: 600; }
+#preferences strong { color: #8fffd4; font-size: 12px; font-weight: 600; }
 
 #preferences button:focus,
 #loadout button:focus { outline: 2px solid #ffffff; outline-offset: 1px; }
@@ -379,7 +321,7 @@ h1 {
 #stats {
   margin: -2px 0 8px;
   color: #f7db8f;
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.3;
 }
 
@@ -387,8 +329,8 @@ h1 {
   margin: 8px 0 0;
   min-height: 25px;
   color: #85aab1;
-  font-size: 9px;
-  line-height: 1.35;
+  font-size: 12px;
+  line-height: 1.3;
 }
 
 #toast {
@@ -410,17 +352,17 @@ h1 {
 #toast.visible { opacity: 1; }
 
 @media (max-height: 300px) {
-  #panel { padding: 6px 10px 5px; }
-  h1 { margin-bottom: 3px; font-size: 18px; }
-  #message { margin-bottom: 4px; min-height: 24px; font-size: 10px; line-height: 1.2; }
+  #panel { padding: 5px 9px 4px; }
+  h1 { margin-bottom: 3px; font-size: 22px; }
+  #message { margin-bottom: 4px; min-height: 15px; font-size: 12px; line-height: 1.25; }
   #loadout { gap: 4px; margin-bottom: 4px; }
-  #loadout button { min-height: 26px; padding: 2px 6px; }
+  #loadout button { min-height: 34px; padding: 1px 7px 2px; }
   #preferences { gap: 3px; margin-bottom: 4px; }
-  #preferences button { min-height: 18px; }
-  #play { min-height: 26px; }
+  #preferences button { min-height: 22px; }
+  #play { min-height: 28px; }
   #online-actions { margin-top: 3px; }
-  #online-actions button { min-height: 20px; }
-  .controls { margin-top: 3px; min-height: 20px; font-size: 8px; }
+  #online-actions button { min-height: 22px; }
+  .controls { margin-top: 3px; min-height: 0; font-size: 12px; line-height: 1.25; }
 }
 
 @media (max-height: 210px) {
@@ -430,4 +372,192 @@ h1 {
   #loadout { margin-bottom: 5px; }
   #preferences { margin-bottom: 5px; }
   #preferences button { min-height: 19px; }
+}
+
+/* Menu screens. One data-screen attribute selects which authored groups are
+   visible, so a screen change is a single attribute write plus the rebuilt
+   #menu buttons; nothing here changes during gameplay. Elements default to
+   hidden and each screen opts its groups back in. */
+#panel > #tabs, #panel > #message, #panel > #radio, #panel > #medals,
+#panel > #menu, #panel > #loadout, #panel > #settings, #panel > #stats,
+#panel > #play, #panel > #replay-actions, #panel > #replay-code,
+#panel > #online-actions, #panel > #online-status, #panel > #code-entry,
+#panel > #web-pairing, #panel > .controls, #panel > #legend,
+#panel > #bindings { display: none; }
+#panel[data-screen] > #legend,
+#panel[data-screen="quick"] > #message,
+#panel[data-screen="quick"] > .controls,
+#panel[data-screen="campaign"] > #message,
+#panel[data-screen="briefing"] > #message,
+#panel[data-screen="results"] > #message,
+#panel[data-screen="pause"] > #message,
+#panel[data-screen="game"] > #message,
+#panel[data-screen="replaydone"] > #message,
+#panel[data-screen="duel"] > #message,
+#panel[data-screen="garage"] > #message,
+#panel[data-screen="logs"] > #message,
+#panel[data-screen="faults"] > #message,
+#panel[data-screen="difficulty"] > #message,
+#panel[data-screen="replays"] > #message,
+#panel[data-screen="practice"] > #message,
+#panel[data-screen="range"] > #message,
+#panel[data-screen="drilldone"] > #message,
+#panel[data-screen="briefing"] > #radio,
+#panel[data-screen="results"] > #radio,
+#panel[data-screen="logs"] > #radio,
+#panel[data-screen="briefing"] > #medals,
+#panel[data-screen="results"] > #medals,
+#panel[data-screen="controls"] > #bindings { display: block; }
+#panel[data-screen="campaign"] > #tabs,
+#panel[data-screen="settings"] > #tabs,
+#panel[data-screen="faults"] > #tabs,
+#panel[data-screen="controls"] > #tabs,
+#panel[data-screen="logs"] > #tabs { display: flex; }
+#panel[data-screen="quick"] > #loadout,
+#panel[data-screen="briefing"] > #loadout { display: grid; }
+#panel[data-screen="briefing"] #mode-choice,
+#panel[data-screen="briefing"] #difficulty-choice { display: none; }
+#panel[data-screen="settings"] > #settings,
+#panel[data-screen="garage"] > #settings,
+#panel[data-screen="controls"] > #settings,
+#panel[data-screen="pause"] > #settings { display: block; }
+#panel[data-screen="settings"][data-tab="0"] #preferences > :not([data-tab="0"]),
+#panel[data-screen="pause"] #preferences > :not([data-tab="0"]),
+#panel[data-screen="settings"][data-tab="1"] #preferences > :not([data-tab="1"]),
+#panel[data-screen="settings"][data-tab="2"] #preferences > :not([data-tab="2"]),
+#panel[data-screen="garage"] #preferences > :not([data-tab="3"]),
+#panel[data-screen="settings"] #preferences > [data-ctl],
+#panel[data-screen="pause"] #preferences > [data-ctl],
+#panel[data-screen="controls"] #preferences > :not([data-ctl]) { display: none; }
+/* Controls: scheme, assist and reverse on one row; ◄ ► mark the scheme. */
+#preferences .arr { display: none; color: #8fffd4; }
+#panel[data-screen="controls"] #preferences .arr { display: inline; }
+#panel[data-screen="controls"] #preferences { grid-template-columns: 1.25fr 1fr 1fr; }
+/* Controls page 3 (Aim guide): only the level choice, then one row per
+   level with the current level lit and the others dimmed. */
+#panel[data-screen="controls"] #aim-choice,
+#panel[data-screen="controls"][data-tab="2"] #preferences > [data-ctl] { display: none; }
+#panel[data-screen="controls"][data-tab="2"] #preferences > #aim-choice { display: block; }
+#panel[data-screen="controls"][data-tab="2"] #preferences {
+  grid-template-columns: 1fr; width: 50%; margin-left: auto; margin-right: auto;
+}
+#panel[data-screen="controls"][data-tab="2"] #bindings b { width: 84px; }
+#bindings b.off { color: #59777a; }
+#preferences button[disabled] { opacity: .45; }
+#panel[data-screen="pause"] #preferences,
+#panel[data-screen="settings"][data-tab="0"] #preferences {
+  grid-template-columns: 1fr; width: 50%; margin-left: auto; margin-right: auto;
+}
+#panel[data-screen="results"] > #stats:not([hidden]),
+#panel[data-screen="game"] > #stats:not([hidden]) { display: block; }
+#panel[data-screen="quick"] > #play,
+#panel[data-screen="game"] > #play,
+#panel[data-screen="pause"] > #play,
+#panel[data-screen="duel"] > #play { display: inline-block; }
+#panel[data-screen="replays"] > #replay-actions,
+#panel[data-screen="multiplayer"] > #online-actions:not([hidden]) { display: flex; }
+#panel[data-screen="replays"] > #replay-code:not([hidden]),
+#panel[data-screen="multiplayer"] > #online-status:not([hidden]),
+#panel[data-screen="multiplayer"] > #code-entry:not([hidden]),
+#panel[data-screen="multiplayer"] > #web-pairing:not([hidden]) { display: block; }
+#panel[data-screen] > #menu { display: grid; }
+#panel[data-screen] > #menu.row { display: flex; }
+#panel[data-screen="pause"] > #menu,
+#panel[data-screen="controls"] > #menu,
+#panel[data-screen="quick"] > #menu { margin-top: 5px; order: 1; }
+#panel[data-screen] { display: flex; flex-direction: column; }
+#panel[data-screen][hidden] { display: none; }
+#panel[data-screen] > #play { align-self: center; }
+#panel[data-screen] > #legend { order: 2; }
+
+#menu {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin: 0 0 4px;
+}
+#menu.list { grid-template-columns: 1fr; }
+#menu.list button { min-height: 20px; padding: 1px 7px; }
+#menu.mixed { grid-template-columns: repeat(4, 1fr); }
+#menu.mixed button { min-height: 20px; padding: 1px 4px; font-size: 12px; }
+#menu.mixed button.wide { grid-column: 1 / -1; padding: 1px 7px; font-size: 13px; text-align: left; }
+#menu.row { display: flex; justify-content: center; gap: 5px; }
+#menu button, #tabs button {
+  min-width: 0;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid #477d7d;
+  border-radius: 4px;
+  background: #102b31;
+  color: #d8fbf4;
+  font: 600 13px sans-serif;
+  white-space: nowrap;
+  text-align: center;
+}
+#menu.list button { text-align: left; }
+#menu button.primary {
+  border-color: #c6fff2;
+  background: linear-gradient(#5de0c2, #249e91);
+  color: #02110f;
+}
+#menu button[disabled] { opacity: .45; }
+#menu button.on { border-color: #ffd76f; color: #ffe9a8; }
+/* Focus changes only the outline, which Tilefinch composites over the
+   cached menu at no raster cost. A focus border or background change
+   repaints just that button's rectangle of the cached menu. */
+#menu button:focus, #tabs button:focus {
+  outline: 2px solid #ffffff;
+  outline-offset: 1px;
+}
+#tabs { gap: 3px; justify-content: center; margin: 0 0 4px; }
+#tabs button { min-height: 19px; padding: 1px 7px; font-size: 11px; }
+#tabs button.on { border-color: #5de0c2; background: #174b4d; color: #ffffff; }
+#radio {
+  margin: 0 0 5px;
+  padding: 3px 6px;
+  border-left: 2px solid #ffd76f;
+  color: #f4e7c0;
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: left;
+}
+#radio[hidden], #medals[hidden], #menu button[hidden], #tabs button[hidden],
+#radio > span[hidden], #medals > span[hidden] { display: none !important; }
+#radio > span, #medals > span { display: block; }
+#radio b { color: #ffd76f; font-weight: 600; }
+#medals {
+  margin: 0 0 5px;
+  color: #b9d7dc;
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: left;
+}
+#medals b { color: #ffd76f; font-weight: 600; }
+#medals b.off { color: #59777a; }
+#legend {
+  margin: 3px 0 0;
+  color: #7fa3a5;
+  font-size: 10px;
+  letter-spacing: .3px;
+}
+#panel[data-screen="game"] > #legend { display: none; }
+/* During a run the retained WebGL HUD stays on the canvas behind pause and
+   results, so the authored copy would only overlap it. */
+#game-shell.in-run #hud, #game-shell.in-run #gadget,
+#game-shell.in-run #command-status { display: none; }
+/* One action per row at button scale: key on the left, action after it. */
+#bindings {
+  margin: 0 0 4px;
+  color: #d8fbf4;
+  font-size: 13px;
+  line-height: 1.3;
+  text-align: left;
+}
+#bindings > span { display: block; padding: 0 0 0 4px; white-space: nowrap; }
+#bindings > span[hidden] { display: none; }
+#bindings b {
+  display: inline-block;
+  width: 168px;
+  color: #8fffd4;
+  font-weight: 600;
 }

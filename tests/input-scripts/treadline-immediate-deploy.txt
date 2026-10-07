@@ -1,5 +1,9 @@
-# Open Treadline through the shipping Saved surface and press Deploy on the
-# first interactive frame, before the large precompiled runtime is restored.
+# Open Treadline through the shipping Saved surface and deploy through Quick
+# Match on the first frame the precompiled runtime answers. Deploy (#play) is
+# only shown on the Quick Match screen, so the pre-boot queued-Deploy path in
+# index.html is no longer reachable from the title menu; this scenario now
+# covers the earliest real Quick Match -> Deploy sequence instead. The
+# companion .until.js ends the wait once the game reports boot readiness.
 wait 30
 tap select
 press 3 down
@@ -7,6 +11,10 @@ tap cross
 wait 10
 tap down
 tap cross
+until 600
+tap-live down
+tap-live cross
+wait-live 10
 tap-live cross
 mark-live deploy-pressed
 wait-live 30

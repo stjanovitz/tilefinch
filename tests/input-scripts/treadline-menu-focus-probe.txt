@@ -8,14 +8,18 @@ tap down
 tap cross
 wait-live 300
 
-# Autofocus begins on Deploy. Move through every compact bottom-row button,
-# then return geometrically to Deploy and activate it with the same X path a
-# person uses on hardware.
+# The title menu autofocuses Continue (Start campaign); Quick Match is the
+# button below it, and its setup screen focuses Deploy. Move down through
+# the compact bottom row, return geometrically to Deploy and activate it
+# with the same X path a person uses on hardware.
 tap-live down
 wait-live 20
-tap-live right
+tap-live cross
+wait-live 60
+mark-live deploy-focus
+tap-live down
 wait-live 20
-tap-live right
+tap-live down
 wait-live 20
 mark-live bottom-code-focus
 tap-live up

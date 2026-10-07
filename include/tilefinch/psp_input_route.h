@@ -71,6 +71,10 @@ typedef struct {
        while a rewind rebuilds the decoder): Circle drops the highlight
        rather than stopping the video. */
     bool media_preview_active;
+    /* Gamepad polling owns page buttons/nub even during a raster slice.
+       HOME is handled independently; the held escape chord is consumed by
+       the owner loop on its next pass. */
+    bool page_gamepad_capture;
 } PspInputRouteContext;
 
 typedef enum {
@@ -108,6 +112,8 @@ typedef enum {
 static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
 {
     if (c == NULL) return PSP_INPUT_ROUTE_NONE;
+    if (c->page_gamepad_capture && c->owner != PSP_INPUT_OWNER_MEDIA)
+        return PSP_INPUT_ROUTE_NONE;
     bool scroll_only = !c->analog_active && c->pressed != 0
         && (c->pressed & ~PSP_INPUT_ROUTE_SCROLL_BUTTONS) == 0;
     bool forward_queued = c->forward_awaited && !c->analog_active

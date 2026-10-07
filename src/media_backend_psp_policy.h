@@ -1250,6 +1250,27 @@ static inline int psp_media_slot_take_index(
         int pass_writing = -1;
         for (unsigned at = 0; at < count; at++) {
             int state = psp_media_slot_observe(&slots[at]);
+            /*
+             * The state decides whether ANY other field may be read, so it is
+             * tested before the epoch, never after. A FREE slot belongs to the
+             * writer, which may be storing a new epoch, sequence and
+             * timestamp into it at this instant: the release that made it
+             * FREE ordered this thread's earlier reads before those stores,
+             * but nothing orders a read made after it. Reading the epoch
+             * first and discarding the slot on its state afterwards was
+             * exactly that read -- a data race ThreadSanitizer reports
+             * against the ownership stress, and on the PSP a two-word load a
+             * worker preemption can tear. READING is this thread's own and
+             * holds nothing to claim.
+             *
+             * READY and ME_WRITING are the two states whose ordering key
+             * (epoch, pts_us, sequence) was stored before the release this
+             * acquire pairs with, and which the writer leaves untouched
+             * until the slot passes back through FREE -- see
+             * psp_media_emit_captured_picture.
+             */
+            if (state != PSP_MEDIA_SLOT_READY
+                && state != PSP_MEDIA_SLOT_ME_WRITING) continue;
             if (!psp_media_epoch_current(slots[at].epoch, epoch)) continue;
             if (state == PSP_MEDIA_SLOT_READY) {
                 if (pass_best < 0

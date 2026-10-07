@@ -30,7 +30,7 @@ static size_t count_named_elements(PocDocument *document, const char *name)
     lxb_dom_node_t *node = body;
     size_t count = 0;
     for (size_t visited = 0;
-         node != NULL && node != boundary && visited < 4096u; visited++) {
+         node != NULL && node != boundary && visited < 65536u; visited++) {
         size_t length = 0;
         const char *actual = document_element_name(node, &length);
         if (actual != NULL && length == strlen(name)
@@ -52,7 +52,7 @@ static lxb_dom_node_t *find_reader_root(PocDocument *document)
     lxb_dom_node_t *boundary = body == NULL ? NULL : body->parent;
     lxb_dom_node_t *node = body;
     for (size_t visited = 0;
-         node != NULL && node != boundary && visited < 8192u; visited++) {
+         node != NULL && node != boundary && visited < 65536u; visited++) {
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             size_t length = 0;
             if (document_attribute(
@@ -74,7 +74,7 @@ static lxb_dom_node_t *find_named_within(lxb_dom_node_t *root,
                                          const char *name)
 {
     lxb_dom_node_t *node = root;
-    for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
         size_t length = 0;
         const char *actual = document_element_name(node, &length);
         if (actual != NULL && length == strlen(name)
@@ -118,7 +118,7 @@ static bool subtree_contains_text(lxb_dom_node_t *root, const char *needle)
 {
     lxb_dom_node_t *node = root;
     size_t wanted = strlen(needle);
-    for (size_t visited = 0; node != NULL && visited < 8192u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
         if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
             const char *text = document_text_data(node, &length);
@@ -143,7 +143,7 @@ static size_t count_named_within(lxb_dom_node_t *root, const char *name)
 {
     lxb_dom_node_t *node = root;
     size_t count = 0;
-    for (size_t visited = 0; node != NULL && visited < 8192u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
         size_t length = 0;
         const char *actual = document_element_name(node, &length);
         if (actual != NULL && length == strlen(name)
@@ -165,7 +165,7 @@ static lxb_dom_node_t *find_attribute_value_within(
 {
     lxb_dom_node_t *node = root;
     size_t wanted_length = strlen(wanted);
-    for (size_t visited = 0; node != NULL && visited < 8192u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             size_t length = 0;
             const char *value = document_attribute(node, attribute, &length);
@@ -190,7 +190,7 @@ static size_t count_attribute_value_within(
     lxb_dom_node_t *node = root;
     size_t wanted_length = wanted == NULL ? 0u : strlen(wanted);
     size_t count = 0u;
-    for (size_t visited = 0; node != NULL && visited < 8192u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             size_t length = 0;
             const char *value = document_attribute(node, attribute, &length);
@@ -219,7 +219,7 @@ static bool subtree_text_contains_words(lxb_dom_node_t *root,
     size_t used = 0;
     bool pending_space = false;
     lxb_dom_node_t *node = root;
-    for (size_t visited = 0; node != NULL && visited < 8192u; visited++) {
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
         if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
             size_t length = 0;
             const char *data = document_text_data(node, &length);
@@ -846,6 +846,255 @@ static bool test_auto_article_requires_semantic_root(void)
     return true;
 }
 
+/* Automatic Reader shape rules (October 2026 site census). Each fixture is
+   synthetic; the comments name the census page shape it stands for. */
+static const char clear_prose_paragraph[] =
+    "<p>This paragraph of a long report carries its own sentences, more than "
+    "one hundred and twenty bytes of ordinary prose with only a single "
+    "<a href='/related'>link</a> in it.</p>";
+
+static bool analyze_fixture(const char *html, size_t length,
+                            ReaderDocumentAnalysis *analysis,
+                            bool expect_root)
+{
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    *analysis = (ReaderDocumentAnalysis) {0};
+    CHECK(document_parse(&document, &budget, html, length, 113u)
+          && reader_document_prepare(&document, analysis));
+    CHECK((find_reader_root(&document) != NULL) == expect_root);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
+static bool append_paragraphs(char *html, size_t capacity, size_t *used,
+                              const char *paragraph, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+        CHECK(append_text(html, capacity, used, paragraph));
+    return true;
+}
+
+/* A wiki or documentation article without an authored <article> element:
+   one h1 and long paragraphs in a plain wrapper (the Guardian, MDN). */
+static bool test_auto_reader_accepts_unmarked_clear_article(void)
+{
+    char html[8192];
+    size_t used = 0;
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<!doctype html><body><nav><a href='/'>Home</a></nav>"
+                      "<div id=content><h1>A plain report</h1>"
+                      "<h2 id=background><a href='#background'>Background"
+                      "</a></h2>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            clear_prose_paragraph, 3u));
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<h2 id=example><a href='#example'>Example</a></h2>"
+                      "<pre>const doubled = values.map((value) => value * 2);"
+                      "</pre>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            clear_prose_paragraph, 3u));
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<p>Short note.</p></div><footer>Footer</footer>"
+                      "</body>"));
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(analyze_fixture(html, used, &analysis, true));
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && analysis.high_confidence);
+    return true;
+}
+
+/* A news front page: the same prose density, but every story is a headline
+   link to another page (npr.org: 44 of them). */
+static bool test_auto_reader_refuses_front_page_teasers(void)
+{
+    char html[16384];
+    size_t used = 0;
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<!doctype html><body><main><h1>News</h1>"));
+    for (size_t i = 0; i < 8u; i++) {
+        char story[512];
+        int written = snprintf(
+            story, sizeof(story),
+            "<section><h3><a href='/story/%zu'>Headline number %zu</a></h3>"
+            "%s</section>", i, i, clear_prose_paragraph);
+        CHECK(written > 0 && (size_t) written < sizeof(story)
+              && append_text(html, sizeof(html), &used, story));
+    }
+    CHECK(append_text(html, sizeof(html), &used, "</main></body>"));
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(analyze_fixture(html, used, &analysis, true));
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && !analysis.high_confidence);
+    return true;
+}
+
+/* A converter or product page: a title and a few explanatory paragraphs
+   among many short label paragraphs (xe.com), or no page title in the dense
+   region at all (store and forecast pages). */
+static bool test_auto_reader_refuses_label_pages_and_untitled_regions(void)
+{
+    char html[16384];
+    size_t used = 0;
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<!doctype html><body><main><h1>Convert units</h1>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            clear_prose_paragraph, 5u));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            "<p>1 unit = 0.88 other units</p>", 12u));
+    CHECK(append_text(html, sizeof(html), &used, "</main></body>"));
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(analyze_fixture(html, used, &analysis, true));
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && !analysis.high_confidence);
+
+    used = 0;
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<!doctype html><body><main><h2>Store item</h2>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            clear_prose_paragraph, 8u));
+    CHECK(append_text(html, sizeof(html), &used, "</main></body>"));
+    CHECK(analyze_fixture(html, used, &analysis, true));
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && !analysis.high_confidence);
+    return true;
+}
+
+/* Paragraphs inside excluded chrome used to count toward every wrapper
+   around it, so an outer <div> outscored the page's own <article> (bbc.co.uk
+   article pages: 50 counted paragraphs against the article's 22). */
+static bool test_excluded_paragraphs_do_not_favor_wrappers(void)
+{
+    char html[16384];
+    size_t used = 0;
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<!doctype html><body><div id=root><nav>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            "<p>Navigation label</p>", 40u));
+    CHECK(append_text(html, sizeof(html), &used,
+                      "</nav><article><h1>The report</h1>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            clear_prose_paragraph, 5u));
+    CHECK(append_text(html, sizeof(html), &used,
+                      "</article></div></body>"));
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, used, 113u)
+          && reader_document_prepare(&document, &analysis));
+    lxb_dom_node_t *article = find_named_within(
+        document_body_node(&document), "article");
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && analysis.high_confidence
+          && article != NULL
+          && has_attribute(article, "data-tilefinch-reader-article"));
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
+/* Collapsed disclosure sections (MediaWiki's mobile article layout): the
+   heading's button names the hidden section in aria-controls with
+   aria-expanded="false". Reader and Basic retire scripts, so they keep the
+   section; content hidden any other way stays out. */
+static bool test_collapsed_disclosure_sections_are_kept(void)
+{
+    char html[16384];
+    size_t used = 0;
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<!doctype html><body><main><h1>Encyclopedia entry</h1>"
+                      "<p>The lead paragraph is shown before any section and "
+                      "summarizes the subject in more than one hundred and "
+                      "twenty bytes of prose.</p>"
+                      "<div class=heading><h2>History</h2>"
+                      "<button aria-controls='history-content' "
+                      "aria-expanded='false'>Toggle</button></div>"
+                      "<div id=history-content hidden>"));
+    CHECK(append_paragraphs(html, sizeof(html), &used,
+                            clear_prose_paragraph, 5u));
+    CHECK(append_text(html, sizeof(html), &used,
+                      "<p>COLLAPSED SECTION TEXT</p></div>"
+                      "<div class=heading><h2>Search</h2></div>"
+                      "<div id=found hidden=until-found><p>UNTIL FOUND TEXT"
+                      "</p></div>"
+                      "<div id=plain hidden><p>PLAIN HIDDEN TEXT</p></div>"
+                      "<button aria-controls='other' aria-expanded='false'>"
+                      "Menu</button><div id=other hidden><p>UNNAMED REGION"
+                      "</p></div><div id=menu hidden><p>CONTROLLED ELSEWHERE"
+                      "</p></div></main></body>"));
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, used, 113u)
+          && reader_document_prepare(&document, &analysis));
+    lxb_dom_node_t *root = find_reader_root(&document);
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && analysis.high_confidence
+          && root != NULL
+          && subtree_contains_text(root, "COLLAPSED SECTION TEXT")
+          && subtree_contains_text(root, "UNTIL FOUND TEXT")
+          && !subtree_contains_text(root, "PLAIN HIDDEN TEXT")
+          && subtree_contains_text(root, "UNNAMED REGION")
+          && !subtree_contains_text(root, "CONTROLLED ELSEWHERE"));
+    document_destroy(&document);
+
+    Stylesheet stylesheet = {0};
+    document = (PocDocument) {0};
+    CHECK(document_parse(&document, &budget, html, used, 113u)
+          && stylesheet_build(&stylesheet, &budget, &document, 480)
+          && reader_document_prepare_basic_with_stylesheet(
+                 &document, &stylesheet, &analysis));
+    root = find_direct_reader_root(&document);
+    CHECK(analysis.kind == READER_PAGE_BASIC && root != NULL
+          && subtree_contains_text(root, "COLLAPSED SECTION TEXT")
+          && !subtree_contains_text(root, "PLAIN HIDDEN TEXT"));
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
+/* Text nodes no longer exhaust the classifier walk: a 4,000-element article
+   with about 10,000 nodes is classified whole and can engage automatically
+   (en.wikipedia.org articles have about two nodes per element). */
+static bool test_text_nodes_do_not_bound_the_classifier(void)
+{
+    const size_t capacity = 512u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = 0;
+    CHECK(append_text(html, capacity, &used,
+                      "<!doctype html><body><main><h1>Long article</h1>"));
+    CHECK(append_paragraphs(
+        html, capacity, &used,
+        "<p>Readable prose with an <b>emphasized</b> phrase continues the long "
+        "article with well over one hundred and twenty bytes of its own "
+        "text.</p>",
+        2000u));
+    CHECK(append_text(html, capacity, &used,
+                      "<p>FINAL PARAGRAPH</p></main></body>"));
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(analyze_fixture(html, used, &analysis, true));
+    free(html);
+    if (!(analysis.kind == READER_PAGE_ARTICLE && !analysis.bounded_out
+          && !analysis.extraction_truncated && analysis.visited_nodes > 8192u
+          && analysis.high_confidence)) {
+        fprintf(stderr, "text-heavy article: kind=%d bounded=%d truncated=%d "
+                "visited=%u high=%d nodes=%u\n", (int) analysis.kind,
+                (int) analysis.bounded_out,
+                (int) analysis.extraction_truncated,
+                (unsigned) analysis.visited_nodes,
+                (int) analysis.high_confidence,
+                (unsigned) analysis.extracted_nodes);
+        return false;
+    }
+    return true;
+}
+
 static bool test_reader_heading_sizes_are_bounded(void)
 {
     char css[SITE_ADAPTER_READER_CSS_LIMIT];
@@ -1175,7 +1424,7 @@ static bool test_unknown_wrappers_do_not_consume_semantic_quota(void)
 
 static bool test_extraction_truncation_is_explicit(void)
 {
-    const size_t capacity = 256u * 1024u;
+    const size_t capacity = 1024u * 1024u;
     char *html = malloc(capacity);
     CHECK(html != NULL);
     size_t used = 0;
@@ -1185,7 +1434,8 @@ static bool test_extraction_truncation_is_explicit(void)
     static const char paragraph[] =
         "<p>Bounded readable prose fills the article while the extracted tree "
         "retains a balanced prefix and explicitly reports its omitted suffix.</p>";
-    for (size_t i = 0; i < 700u; i++)
+    /* More paragraphs than the 4,096-node ceiling an ample budget grants. */
+    for (size_t i = 0; i < 4200u; i++)
         CHECK(append_text(html, capacity, &used, paragraph));
     CHECK(append_text(html, capacity, &used,
                       "<p>BOTTOM MUST BE OMITTED</p></article></main></body>"));
@@ -1201,7 +1451,7 @@ static bool test_extraction_truncation_is_explicit(void)
     CHECK(analysis.kind == READER_PAGE_ARTICLE
           && analysis.extraction_truncated && analysis.bounded_out
           && !analysis.high_confidence
-          && analysis.extracted_nodes == 512u
+          && analysis.extracted_nodes == 4096u
           && root != NULL
           && document_attribute(
                  root, "data-tilefinch-reader-truncated",
@@ -1261,7 +1511,7 @@ static bool test_large_page_bound(void)
 
 static bool test_bounded_page_keeps_manual_article(void)
 {
-    const size_t capacity = 2u * 1024u * 1024u;
+    const size_t capacity = 3u * 1024u * 1024u;
     char *html = malloc(capacity);
     CHECK(html != NULL);
     size_t used = 0;
@@ -1273,7 +1523,8 @@ static bool test_bounded_page_keeps_manual_article(void)
         "remains useful when a very large document reaches the analyzer's "
         "fixed traversal ceiling. Links, headings, and semantic structure "
         "must remain available to an explicit Reader request.</p>";
-    for (size_t i = 0; i < 5000u; i++)
+    /* More elements than the classifier's 8,192 scratch records. */
+    for (size_t i = 0; i < 9000u; i++)
         CHECK(append_text(html, capacity, &used, paragraph));
     CHECK(append_text(html, capacity, &used, "</article></main></body>"));
 
@@ -1286,7 +1537,7 @@ static bool test_bounded_page_keeps_manual_article(void)
     CHECK(reader_document_prepare(&document, &analysis));
     CHECK(analysis.bounded_out && analysis.kind == READER_PAGE_ARTICLE
           && !analysis.high_confidence
-          && analysis.visited_nodes == 8193u
+          && analysis.visited_nodes > 8192u
           && find_direct_reader_root(&document) != NULL);
     document_destroy(&document);
     free(html);
@@ -1556,18 +1807,20 @@ static bool test_basic_anchor_bounds_are_transactional(void)
     CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
           && budget_categories_reconcile(&budget));
 
-    char many[32768];
+    const size_t many_capacity = 160u * 1024u;
+    char *many = malloc(many_capacity);
+    CHECK(many != NULL);
     size_t used = 0u;
     CHECK(append_text(
-        many, sizeof(many), &used,
+        many, many_capacity, &used,
         "<!doctype html><body><h1>Many anchors</h1>"));
-    for (size_t i = 0; i <= 512u; i++) {
+    for (size_t i = 0; i <= 4096u; i++) {
         char marker[48];
         written = snprintf(marker, sizeof(marker), "<x id='a%zu'></x>", i);
         CHECK(written > 0 && (size_t) written < sizeof(marker)
-              && append_text(many, sizeof(many), &used, marker));
+              && append_text(many, many_capacity, &used, marker));
     }
-    CHECK(append_text(many, sizeof(many), &used, "</body>"));
+    CHECK(append_text(many, many_capacity, &used, "</body>"));
     budget_init(&budget, 32u * 1024u * 1024u);
     CHECK(budget_install_lexbor(&budget));
     document = (PocDocument) {0};
@@ -1575,23 +1828,84 @@ static bool test_basic_anchor_bounds_are_transactional(void)
     analysis = (ReaderDocumentAnalysis) {0};
     CHECK(document_parse(&document, &budget, many, used, 113u)
           && stylesheet_build(&stylesheet, &budget, &document, 480));
-    nodes_before = document.node_count;
-    attributes_before = document.attribute_count;
     body = document_body_node(&document);
+    /* More fragment markers than the emitted-node bound is a node bound,
+       not an omitted action: the view is admitted as a labeled prefix. */
     CHECK(reader_document_prepare_basic_complete_with_stylesheet(
               &document, &stylesheet, &analysis)
           && analysis.prepared && analysis.kind == READER_PAGE_BASIC
-          && analysis.bounded_out && analysis.extraction_truncated
-          && analysis.extracted_nodes == 512u
-          && find_direct_reader_root(&document) == NULL
-          && !has_attribute(body, "data-tilefinch-reader-kind")
-          && document.node_count == nodes_before
-          && document.attribute_count == attributes_before);
+          && !analysis.bounded_out && analysis.extraction_truncated
+          && analysis.extracted_nodes == 4096u
+          && find_direct_reader_root(&document) != NULL
+          && has_attribute(body, "data-tilefinch-reader-kind")
+          && subtree_contains_text(
+                 find_direct_reader_root(&document),
+                 "Basic view shortened to fit this device."));
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
+    free(many);
     CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
           && budget_categories_reconcile(&budget));
     return true;
+}
+
+/* A news front page puts thousands of wrapper nodes ahead of its first
+   story. Basic view is bounded by what it emits, so the content after them
+   is extracted; a form the emitted-node bound cuts through is withdrawn
+   whole rather than offered with some of its controls. */
+static bool test_basic_view_bounds_emitted_not_inspected_nodes(void)
+{
+    size_t capacity = 160u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = 0u;
+    CHECK(append_text(html, capacity, &used,
+                      "<!doctype html><body><nav>"));
+    for (size_t i = 0; i < 5000u; i++)
+        CHECK(append_text(html, capacity, &used, "<div></div>"));
+    CHECK(append_text(
+        html, capacity, &used,
+        "</nav><h1>Front page</h1><p>The first story survives the "
+        "wrappers.</p><form role='search' action='/find'>"
+        "<label>Query<input name='q'></label>"));
+    /* More filler than the 4,096-node ceiling an ample budget grants. */
+    for (size_t i = 0; i < 4200u; i++)
+        CHECK(append_text(html, capacity, &used, "<p>filler</p>"));
+    CHECK(append_text(html, capacity, &used,
+                      "<input name='late'></form></body>"));
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, used, 113u)
+          && stylesheet_build(&stylesheet, &budget, &document, 480));
+    CHECK(reader_document_prepare_basic_complete_with_stylesheet(
+              &document, &stylesheet, &analysis));
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    bool ok = analysis.kind == READER_PAGE_BASIC && !analysis.bounded_out
+        && analysis.extraction_truncated && analysis.visited_nodes > 4096u
+        && analysis.retained_forms == 0u && root != NULL
+        && subtree_contains_text(root, "The first story survives")
+        && subtree_contains_text(root, "Basic view shortened")
+        && count_named_within(root, "form") == 0u
+        && count_named_within(root, "input") == 0u;
+    if (!ok) {
+        fprintf(stderr, "basic large page: kind=%d bounded=%d truncated=%d "
+                "visited=%u forms=%u nodes=%u root=%d\n",
+                (int) analysis.kind, (int) analysis.bounded_out,
+                (int) analysis.extraction_truncated,
+                (unsigned) analysis.visited_nodes,
+                (unsigned) analysis.retained_forms,
+                (unsigned) analysis.extracted_nodes, root != NULL);
+    }
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    free(html);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return ok;
 }
 
 static bool test_basic_view_complete_bound_is_transactional(void)
@@ -1802,6 +2116,74 @@ static bool test_basic_structural_extraction_is_cooperative_once(void)
     return true;
 }
 
+/* The emitted bound scales with the budget's free room: an ample budget
+   extracts a long page whole, while a budget with less than the 4 MiB
+   reserve free still gets the 512-node floor, as before scaling. The markup
+   buffer grows past its initial 64 KiB on the way. */
+static bool basic_view_nodes_under_budget(const char *html, size_t length,
+                                          size_t limit,
+                                          ReaderDocumentAnalysis *analysis)
+{
+    Budget budget;
+    budget_init(&budget, limit);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    *analysis = (ReaderDocumentAnalysis) {0};
+    CHECK(document_parse(&document, &budget, html, length, 113u)
+          && stylesheet_build(&stylesheet, &budget, &document, 480));
+    CHECK(reader_document_prepare_basic_complete_with_stylesheet(
+              &document, &stylesheet, analysis));
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    CHECK(root != NULL && subtree_contains_text(root, "Paragraph 0 "));
+    CHECK(analysis->extraction_truncated
+          == subtree_contains_text(root, "Basic view shortened"));
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
+static bool test_basic_view_bound_scales_with_budget(void)
+{
+    const size_t capacity = 256u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = 0u;
+    CHECK(append_text(html, capacity, &used,
+                      "<!doctype html><body><h1>Long listing</h1>"));
+    for (size_t i = 0; i < 1500u; i++) {
+        char paragraph[160];
+        int written = snprintf(
+            paragraph, sizeof(paragraph),
+            "<p>Paragraph %zu of a long server-rendered page whose second "
+            "half used to be cut.</p>", i);
+        CHECK(written > 0 && (size_t) written < sizeof(paragraph)
+              && append_text(html, capacity, &used, paragraph));
+    }
+    CHECK(append_text(html, capacity, &used,
+                      "<p>LAST PARAGRAPH</p></body>"));
+    ReaderDocumentAnalysis ample = {0};
+    CHECK(basic_view_nodes_under_budget(
+        html, used, 32u * 1024u * 1024u, &ample));
+    CHECK(ample.kind == READER_PAGE_BASIC && !ample.extraction_truncated
+          && !ample.bounded_out && ample.extracted_nodes == 1502u
+          && ample.extracted_bytes > 64u * 1024u);
+    ReaderDocumentAnalysis tight = {0};
+    CHECK(basic_view_nodes_under_budget(
+        html, used, 2u * 1024u * 1024u, &tight));
+    if (!(tight.kind == READER_PAGE_BASIC && tight.extraction_truncated
+          && tight.extracted_nodes == 512u)) {
+        fprintf(stderr, "basic budget floor: kind=%d truncated=%d nodes=%u\n",
+                (int) tight.kind, (int) tight.extraction_truncated,
+                (unsigned) tight.extracted_nodes);
+        return false;
+    }
+    free(html);
+    return true;
+}
+
 static bool test_declared_video_synthesizes_watch_surface(void)
 {
     static const char html[] =
@@ -1902,10 +2284,18 @@ int main(void)
         || !test_basic_view_preserves_actions_without_guessing()
         || !test_extracted_fragment_markers_preserve_empty_targets()
         || !test_basic_anchor_bounds_are_transactional()
+        || !test_basic_view_bounds_emitted_not_inspected_nodes()
         || !test_basic_view_complete_bound_is_transactional()
         || !test_basic_view_form_scan_bound_is_transactional()
         || !test_basic_select_option_bound_is_transactional()
         || !test_basic_structural_extraction_is_cooperative_once()
+        || !test_basic_view_bound_scales_with_budget()
+        || !test_auto_reader_accepts_unmarked_clear_article()
+        || !test_auto_reader_refuses_front_page_teasers()
+        || !test_auto_reader_refuses_label_pages_and_untitled_regions()
+        || !test_excluded_paragraphs_do_not_favor_wrappers()
+        || !test_collapsed_disclosure_sections_are_kept()
+        || !test_text_nodes_do_not_bound_the_classifier()
         || !test_declared_video_synthesizes_watch_surface())
         return EXIT_FAILURE;
     puts("reader-mode-tests: ok");

@@ -81,6 +81,60 @@ presentation forms emitted by the shaper. The Hebrew pack includes Hebrew
 letters, marks, and presentation forms. Both use the existing TFGF/TFGM signed
 component format and cause no pack enumeration or payload read at boot.
 
+### In-page install offer
+
+The parser's existing visible-text statistics pass also keeps a census for
+each script: a saturating count and the page's own codepoints at the 1st,
+4th, 16th and 64th occurrence (`DocumentGlyphCensus`). A script is in
+meaningful use at 32 or more codepoints that are also at least one per 20
+visible-text bytes, so a stray word or a long article's language-picker list
+does not qualify. This adds one count per classified non-ASCII codepoint and
+no DOM walk; the scan no longer stops early on the rare page that already
+showed all seven script families and bidi text, because the count needs the
+whole text.
+
+On a settled page with no other notice, the PSP app asks
+`tilefinch_glyph_offer_poll()` once per page identity (URL plus census). It
+offers the first catalog pack whose `page_scripts` lists a qualifying script
+when no pack for that script is installed (the session mask, then the
+store resolver's few `stat` calls), the pack is not in the profile's "Don't
+ask again" mask, and the active sans face lacks at least half of the sampled
+codepoints (`font_face_has_codepoint`, which also consults the attached
+packs and the embedded CJK/emoji fallback). That last test is the trigger:
+Polish (Latin Extended-A, carried by the embedded faces) is not offered the
+Extended Latin pack that Vietnamese (Latin Extended Additional) needs, and
+CJK is not offered at all while the embedded fallback draws it. A site is
+offered at most once per session (16 hashed sites, oldest forgotten).
+
+The offer takes only X and Triangle, once armed (0.6 s); Circle stays Back
+and closes it. X opens a confirmation overlay
+(`PSP_UI_SCREEN_GLYPH_OFFER`) and asks the session for the size:
+`psp_glyph_component_session_prepare_size_check()` selects the pack's
+update-client operation without the menu's auto-install, the app starts the
+client's signed-metadata check over the network exactly as the menu does,
+and the check stops at AVAILABLE. The confirmation shows **Checking
+size...**, then **Install Cyrillic pack (1.0 MB)?** with the verified
+manifest's `package_size`, or the check's own failure message. Only a
+second X there raises the menu's `glyph_component_primary_requested`, so
+the download, signature verification, free-space preflight and Memory Stick
+promotion are unchanged and one press can never download. Triangle sets the
+pack's bit in the profile's "Don't ask again" mask; **Settings > Appearance
+> Language & emoji > Offer language packs** (Ask/Off) and **Reset declined
+offers** control both. The offer also runs over Reader mode and Basic view,
+which draw with the same faces.
+
+Every completed install, from the menu or the offer, sets the session's
+`reattach_pending`. `psp_glyph_component_session_reattach()` then restores
+the selected language and emoji packs that the install detached and attaches
+installed packs for the page's scripts through the lazy path (the offered
+pack's scripts for an offer install), and the app relayouts the page in
+place through the user-stylesheet rebuild that page text size uses, because
+advances measured against blank cells are wrong. If the relayout cannot run
+the notice asks for a reload; if the installed pack is not one the page or
+the selection uses, **Font pack ready after restart** still applies.
+Scripted and replay runs (`trace` not `none`) and builds without live
+networking never show the offer.
+
 ## Qualification
 
 The focused host tests combine UAX #9-derived mixed-direction cases with

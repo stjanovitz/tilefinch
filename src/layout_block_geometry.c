@@ -125,6 +125,35 @@ void layout_block_set_paint_layer_object_position(
         style_object_position_encode(y_percent, y_offset));
 }
 
+void layout_background_tile_size(unsigned flags, int width, int height,
+                                 int area_width, int area_height,
+                                 const ImageResource *image,
+                                 int *tile_width, int *tile_height)
+{
+    bool width_auto = (flags & STYLE_BACKGROUND_WIDTH_AUTO) != 0;
+    bool height_auto = (flags & STYLE_BACKGROUND_HEIGHT_AUTO) != 0;
+    int resolved_width = width_auto ? 0
+        : ((flags & STYLE_BACKGROUND_WIDTH_PERCENT) != 0
+           ? layout_scale_dimension(area_width, width, 100) : width);
+    int resolved_height = height_auto ? 0
+        : ((flags & STYLE_BACKGROUND_HEIGHT_PERCENT) != 0
+           ? layout_scale_dimension(area_height, height, 100) : height);
+    int natural_width = image_resource_intrinsic_width(image);
+    int natural_height = image_resource_intrinsic_height(image);
+    if (width_auto && height_auto) {
+        resolved_width = natural_width;
+        resolved_height = natural_height;
+    } else if (width_auto && resolved_height > 0 && natural_height > 0) {
+        resolved_width = layout_scale_dimension(
+            resolved_height, natural_width, natural_height);
+    } else if (height_auto && resolved_width > 0 && natural_width > 0) {
+        resolved_height = layout_scale_dimension(
+            resolved_width, natural_height, natural_width);
+    }
+    *tile_width = resolved_width < 1 ? 1 : resolved_width;
+    *tile_height = resolved_height < 1 ? 1 : resolved_height;
+}
+
 void layout_block_size_paint_image_command(
     DrawCommand *command, const StylePaintLayer *layer,
     const ImageResource *image, int area_width, int area_height)
@@ -133,30 +162,10 @@ void layout_block_size_paint_image_command(
         || area_width <= 0 || area_height <= 0) return;
     command->image_fit = layer->fit;
     if ((layer->flags & STYLE_BACKGROUND_SIZE_EXPLICIT) != 0) {
-        bool width_auto = (layer->flags & STYLE_BACKGROUND_WIDTH_AUTO) != 0;
-        bool height_auto = (layer->flags & STYLE_BACKGROUND_HEIGHT_AUTO) != 0;
-        int width = width_auto ? 0
-            : ((layer->flags & STYLE_BACKGROUND_WIDTH_PERCENT) != 0
-               ? layout_scale_dimension(area_width, layer->width, 100)
-               : layer->width);
-        int height = height_auto ? 0
-            : ((layer->flags & STYLE_BACKGROUND_HEIGHT_PERCENT) != 0
-               ? layout_scale_dimension(area_height, layer->height, 100)
-               : layer->height);
-        int natural_width = image_resource_intrinsic_width(image);
-        int natural_height = image_resource_intrinsic_height(image);
-        if (width_auto && height_auto) {
-            width = natural_width;
-            height = natural_height;
-        } else if (width_auto && height > 0 && natural_height > 0) {
-            width = layout_scale_dimension(height, natural_width,
-                                           natural_height);
-        } else if (height_auto && width > 0 && natural_width > 0) {
-            height = layout_scale_dimension(width, natural_height,
-                                            natural_width);
-        }
-        if (width < 1) width = 1;
-        if (height < 1) height = 1;
+        int width = 0, height = 0;
+        layout_background_tile_size(layer->flags, layer->width,
+                                    layer->height, area_width, area_height,
+                                    image, &width, &height);
         bool x_pixels =
             (layer->flags & STYLE_BACKGROUND_POSITION_PIXELS) != 0
             || (layer->position_edges
@@ -194,10 +203,8 @@ void layout_block_size_paint_image_command(
         layout_block_set_paint_layer_object_position(command, layer);
         return;
     }
-    int natural_width = image->source_width > 0
-        ? image->source_width : image->width;
-    int natural_height = image->source_height > 0
-        ? image->source_height : image->height;
+    int natural_width = image_resource_intrinsic_width(image);
+    int natural_height = image_resource_intrinsic_height(image);
     bool x_pixels =
         (layer->flags & STYLE_BACKGROUND_POSITION_PIXELS) != 0
         || (layer->position_edges

@@ -403,6 +403,15 @@ form, and base-URL entry points therefore cannot bypass policy by reaching a
 lower-level transport helper directly. Browser-owned update and provider
 requests use separate privileged paths and never inherit page authority.
 
+A cross-origin `fetch()` in `no-cors` mode is admitted only when it is a
+CORS-simple request (GET, HEAD or POST, CORS-safelisted headers and content
+type); one that would need a preflight under CORS, including any other
+method, is a network error rather than being sent unannounced. Its completion is filtered to an opaque response (status 0, empty URL,
+no headers or body) before page script sees it, so it can send what an image
+or form could, and read nothing. Redirects to another origin fail closed, and
+since the body is discarded, one larger than 64 KiB is a network error rather
+than a full response reservation.
+
 The bounded response-header CSP subset intersects up to four policies and
 supports `default-src`, `script-src`, `style-src`, `img-src`, `media-src`,
 `font-src`, `connect-src`, `frame-src`, `object-src`, `base-uri`, `form-action`, and
@@ -417,6 +426,17 @@ distinction between inline content and an API operation. Permitted event-
 handler attributes are compiled lazily through a bounded host path that accepts
 only the attribute body. It does not reopen page access to `eval` or the
 Function constructor.
+A declarative refresh (`<meta http-equiv=refresh>` or the `Refresh` header)
+is a top-level navigation from the document, built like a page-script
+navigation: the document is the referrer, it never carries user activation,
+and its request goes through the same top-level request policy. Only HTTP(S)
+targets are followed; `javascript:`, `data:`, `file:`, `about:` and every other
+scheme are refused. A refresh declared inside a child frame, sandboxed or not,
+is ignored, so frames cannot navigate the top-level page this way, and the
+refresh loop guard (`NAVIGATION_REFRESH_CHAIN_LIMIT`) stops a document that
+keeps refreshing without user input. See `ARCHITECTURE.md`, "Declarative
+refresh".
+
 Security-header truncation, policy overflow, or an invalid bounded policy fails
 the affected navigation closed rather than applying a partial policy.
 
@@ -483,18 +503,40 @@ CORP, `nosniff`, malformed, or truncated revalidation metadata can revoke use.
 The in-memory cache retains that grant with its response and matches it only
 under the same top-level partition and requesting principal. Multiple
 authorized representations of the same URL may coexist; a generic cache
-lookup cannot consume them. Compiled classic-script bytecode remains keyed by
-the exact response bytes, so partitions may share an immutable compiled
-artifact only when their independently authorized bodies are byte-identical.
-Module entries additionally retain the immutable top-level site partition;
-opaque-origin modules are not placed in the shared module cache because the
-serialized `null` origin is not a principal. Module bytecode follows the same
-rules: an entry is keyed by the top-level site, module name and response URL
-plus the SHA-256 of the exact response bytes (the bytes are not retained, so a
-non-cryptographic hash would let a colliding body run another body's code
-after SRI admitted it), it is consulted only after the fetch, CSP, SRI, CORS
-and MIME checks have admitted those bytes, and opaque-origin realms and
-captive sign-ins neither read nor write it. Child runtimes receive the
+lookup cannot consume them. Module entries additionally retain the immutable
+top-level site partition; opaque-origin modules are not placed in the shared
+module cache because the serialized `null` origin is not a principal.
+Compiled bytecode lives in two RAM-only session tables, one for modules and
+one for classic external scripts, under the same rules: an entry is keyed by
+the top-level site, the compile name and the request (classic) or response
+(module) URL, plus the SHA-256 of the exact bytes compiled (the bytes are not
+retained, so a non-cryptographic hash would let a colliding body run another
+body's code after SRI admitted it); it is consulted only after the fetch,
+CSP, SRI, CORS and MIME checks have admitted those bytes, and only ever
+replaces compiling them, never a request; and opaque-origin realms and
+captive sign-ins neither read nor write it. Partitions never share an entry,
+so whether a script compiled is not observable across top-level sites.
+Bytecode outlives its HTTP response entry (it does not share that entry's
+lifetime), so a response whose `Cache-Control` carries `no-store` is compiled
+and run but its bytecode is not kept, whether it is a classic script, a
+module root or an imported module: QuickJS bytecode retains function source
+text (always for classic scripts; for modules under 8 KiB, whose text is kept
+for `Function.prototype.toString()`), and keeping it would retain the
+response no-store asked the browser not to keep.
+The opt-in **Keep compiled scripts** tier (off by default) writes those same
+records to the Memory Stick and reads them back on a later launch, under the
+same keys: a pack is named by its top-level site's partition with the rest
+of the key, a record is used only for byte-identical source after the same
+admission, and nothing is written during a captive sign-in, while site data
+is blocked, or for a no-store response (which never enters the tables). The
+card is treated as the browser's own storage, as trusted as the program
+installed on it; a CRC-32 per file catches torn or damaged files, not a
+deliberate forgery by someone who can already rewrite the EBOOT. Clearing
+the HTTP caches, turning the option off or **Clear compiled scripts**
+removes every pack, and a site's **Clear data for this site** removes the
+packs of that top-level site along with its RAM records. Host builds refuse
+a device path for the tier, so no test or lab run can write the card. Installed offline apps carry their own
+source-bound classic bytecode, restored with the app's responses. Child runtimes receive the
 top-level document URL at creation and reuse it for fetch, XHR, classic-script,
 and module request/cookie/cache contexts rather than substituting their frame
 URL. Stylesheet and image consumers
@@ -662,4 +704,8 @@ artifact from one class cannot authorize another. Glyph packs are parsed as
 untrusted bounded indexes, payload blocks are read only through the cooperative
 provider, and malformed or unavailable data falls back to the embedded glyphs.
 Neither optional path uses PSP firmware data or creates a new executable-code
-authority.
+authority. A page can cause the in-page language-pack offer only by using a
+script; the offer's wording comes from the compiled-in pack catalog, never
+from the page, the size it asks about comes from the verified signed
+manifest, and installing takes two separate presses of X and then the
+signed glyph-component path.

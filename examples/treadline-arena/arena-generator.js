@@ -2,6 +2,13 @@
   "use strict";
 
   const SIDE = 32, CELLS = SIDE * SIDE, GENERATED = 3;
+  /* The circle candidate grids (walls and the gate here, barriers and
+     crates in game.js) grow each rectangle by this much: room for the
+     boss's hull (game.js BOSS) plus navigation clearance. A larger circle query scans
+     every rectangle instead (game.js circleHitsObstacle, hullContact). */
+  const CIRCLE_GRID_RADIUS = .8;
+  // A crate's half size; game.js and bots.js take it from here.
+  const CRATE_HALF = .22;
   const arenas = [
     {obstacles: [
       [-4.55, 0, .55, 5.1], [-2.75, 0, .55, 5.1],
@@ -57,6 +64,7 @@
     () => new Uint16Array(CELLS));
   const circleGateGrids = Array.from({length: arenas.length},
     () => new Uint16Array(CELLS));
+  const spatialRevisions = new Uint32Array(arenas.length);
   function itemCount(arena, kind) {
     if (!arena.generated) return arena[kind].length;
     return kind === "obstacles" ? arena.obstacleCount
@@ -87,6 +95,7 @@
     }
   }
   function fillSpatialData(index) {
+    spatialRevisions[index]++;
     const arena = arenas[index];
     const obstacles = itemCount(arena, "obstacles");
     const gates = itemCount(arena, "gates");
@@ -108,14 +117,146 @@
     fillRectGrid(obstacleBounds[index], obstacles, .1,
       bulletObstacleGrids[index]);
     fillRectGrid(gateBounds[index], gates, .1, bulletGateGrids[index]);
-    fillRectGrid(obstacleBounds[index], obstacles, .6,
+    fillRectGrid(obstacleBounds[index], obstacles, CIRCLE_GRID_RADIUS,
       circleObstacleGrids[index]);
-    fillRectGrid(gateBounds[index], gates, .6, circleGateGrids[index]);
+    fillRectGrid(gateBounds[index], gates, CIRCLE_GRID_RADIUS,
+      circleGateGrids[index]);
   }
   for (let at = 0; at < arenas.length; at++) fillSpatialData(at);
+  function createNavigationCache(radius) {
+    // Exact occupancy at the 16x16 navigation cell centers. This is not a
+    // movement broad phase: live tank/projectile collision remains unchanged.
+    // 2.5KiB of fixed masks replaces repeated rectangle tests after damage.
+    // Bits: static/boundary, gate, six barriers, four crates. Prepare after
+    // placement/replacement; active flags may change without rebuilding masks.
+    const templates = Array.from({length: arenas.length},
+      () => new Uint16Array(256));
+    const revisions = new Uint32Array(arenas.length);
+    const masks = new Uint16Array(256);
+    const squared = radius * radius;
+    function fill(grid, left, right, top, bottom, bit, crateX, crateZ) {
+      // Round outwards for candidate admission; the exact predicate below
+      // retains strict '< radiusSquared' and the crate's original arithmetic.
+      const firstX = Math.max(1, Math.floor(left - radius + 7.5));
+      const lastX = Math.min(14, Math.ceil(right + radius + 7.5));
+      const firstZ = Math.max(1, Math.floor(top - radius + 7.5));
+      const lastZ = Math.min(14, Math.ceil(bottom + radius + 7.5));
+      for (let z = firstZ; z <= lastZ; z++) {
+        for (let x = firstX; x <= lastX; x++) {
+          const px = x - 7.5, pz = z - 7.5;
+          let dx, dz;
+          if (crateX === crateX) {
+            const ax = px - crateX, az = pz - crateZ;
+            dx = (ax < 0 ? -ax : ax) - CRATE_HALF;
+            dz = (az < 0 ? -az : az) - CRATE_HALF;
+            if (dx < 0) dx = 0;
+            if (dz < 0) dz = 0;
+          } else {
+            dx = px < left ? px - left : px > right ? px - right : 0;
+            dz = pz < top ? pz - top : pz > bottom ? pz - bottom : 0;
+          }
+          if (dx * dx + dz * dz < squared) grid[z * 16 + x] |= bit;
+        }
+      }
+    }
+    function prepare(index, barriers, crates) {
+      if (barriers.length > 6 || crates.length > 4 || gateCounts[index] > 1)
+        throw new RangeError("Navigation mask capacity");
+      const template = templates[index];
+      if (revisions[index] !== spatialRevisions[index]) {
+        template.fill(0);
+        for (let cell = 0; cell < 256; cell++) {
+          const x = cell & 15, z = cell >> 4;
+          if (!x || x === 15 || !z || z === 15) template[cell] = 1;
+        }
+        const bounds = obstacleBounds[index];
+        for (let at = 0; at < obstacleCounts[index] * 4; at += 4)
+          fill(template, bounds[at], bounds[at + 1], bounds[at + 2],
+            bounds[at + 3], 1, NaN, NaN);
+        const gate = gateBounds[index];
+        if (gateCounts[index]) fill(template, gate[0], gate[1], gate[2], gate[3],
+          2, NaN, NaN);
+        revisions[index] = spatialRevisions[index];
+      }
+      masks.set(template);
+      for (let at = 0; at < barriers.length; at++) {
+        const b = barriers[at];
+        if (b.present) fill(masks, b.left, b.right, b.top, b.bottom,
+          4 << at, NaN, NaN);
+      }
+      for (let at = 0; at < crates.length; at++) {
+        const c = crates[at];
+        if (c.active) fill(masks, c.x - CRATE_HALF, c.x + CRATE_HALF,
+          c.z - CRATE_HALF, c.z + CRATE_HALF, 256 << at, c.x, c.z);
+      }
+    }
+    /* Optionally also writes a route-field template: 65535 (unreached)
+       for open cells and 65534 for blocked ones, so a search reads one
+       array to learn both. */
+    function update(grid, first, end, barriers, crates, gateOpen,
+        template = null, offset = 0) {
+      let active = gateOpen ? 1 : 3;
+      for (let at = 0; at < barriers.length; at++)
+        if (barriers[at].active) active |= 4 << at;
+      for (let at = 0; at < crates.length; at++)
+        if (crates[at].active) active |= 256 << at;
+      if (template) {
+        for (let cell = first; cell < end; cell++) {
+          const blocked = (masks[cell] & active) ? 1 : 0;
+          grid[cell] = blocked;
+          template[offset + cell] = 65535 - blocked;
+        }
+        return;
+      }
+      for (let cell = first; cell < end; cell++)
+        grid[cell] = (masks[cell] & active) ? 1 : 0;
+    }
+    /* What could block each cell, active or not (read-only): bit 1 the
+       static walls and the boundary, 2 the gate, 4 << n barrier n,
+       256 << n crate n. Pocket checks and breach plans tell destructible
+       blockers from the rest with it. */
+    function blockers() { return masks; }
+    return Object.freeze({prepare, update, blockers});
+  }
+  // Routing-only; this does not change the seed-to-arena protocol mapping.
+  function nearestOpenCell(grid, goalX, goalZ) {
+    const px = goalX + 8, pz = goalZ + 8;
+    const cx = px <= 0 ? 0 : px >= 16 ? 15 : px | 0;
+    const cz = pz <= 0 ? 0 : pz >= 16 ? 15 : pz | 0;
+    const offset = Math.max(Math.abs(goalX - (cx - 7.5)),
+      Math.abs(goalZ - (cz - 7.5)));
+    let best = Infinity, nearest = -1;
+    for (let radius = 0; radius < 16; radius++) {
+      for (let side = 0; side < 4; side++) {
+        const horizontal = side < 2;
+        const first = horizontal ? -radius : 1 - radius;
+        const last = horizontal ? radius : radius - 1;
+        for (let along = first; along <= last; along++) {
+          const x = cx + (horizontal ? along : side === 2 ? -radius : radius);
+          const z = cz + (horizontal ? side === 0 ? -radius : radius : along);
+          if (x < 0 || x >= 16 || z < 0 || z >= 16) continue;
+          const at = z * 16 + x;
+          if (grid[at]) continue;
+          const dx = (at & 15) - 7.5 - goalX;
+          const dz = (at >> 4) - 7.5 - goalZ;
+          const score = dx * dx + dz * dz;
+          // Keep the full scan's ascending-index tie winner.
+          if (score < best || (nearest >= 0 && score === best && at < nearest)) {
+            best = score; nearest = at;
+          }
+        }
+      }
+      // Every unvisited center is at least this far away on one axis.
+      // Keep an epsilon margin so floating rounding cannot omit a close tie.
+      const outside = radius + 1 - offset;
+      if (nearest >= 0 && outside > 0 && best + 1e-9 < outside * outside) break;
+    }
+    return nearest;
+  }
   const spatial = Object.freeze({obstacleBounds, gateBounds, obstacleCounts,
     gateCounts, rampGrids, bulletObstacleGrids, bulletGateGrids,
-    circleObstacleGrids, circleGateGrids, fillSpatialData, itemCount});
+    circleObstacleGrids, circleGateGrids, CIRCLE_GRID_RADIUS, CRATE_HALF, fillSpatialData,
+    itemCount, nearestOpenCell, createNavigationCache});
   Object.defineProperty(globalThis, "__treadlineArenaData", {
     value: Object.freeze({arenas, generatedArena, spatial}),
     configurable: false, writable: false,
@@ -164,12 +305,6 @@
     let steppedValidationActive = false, steppedWinningSeed = 0;
     let seedState = 1;
 
-    function count(arena, kind) {
-      if (!arena.generated) return arena[kind].length;
-      return kind === "obstacles" ? arena.obstacleCount
-        : kind === "barriers" ? arena.barrierCount
-          : kind === "ramps" ? arena.rampCount : arena.gateCount;
-    }
     function next() {
       seedState ^= seedState << 13;
       seedState ^= seedState >>> 17;
@@ -260,11 +395,11 @@
         blocked[edge] = blocked[(SIDE - 1) * SIDE + edge] = 1;
         blocked[edge * SIDE] = blocked[edge * SIDE + SIDE - 1] = 1;
       }
-      let total = count(arena, "obstacles");
+      let total = itemCount(arena, "obstacles");
       for (let at = 0; at < total; at++) mark(arena.obstacles[at], .55);
-      total = count(arena, "barriers");
+      total = itemCount(arena, "barriers");
       for (let at = 0; at < total; at++) mark(arena.barriers[at], .35);
-      total = count(arena, "gates");
+      total = itemCount(arena, "gates");
       for (let at = 0; at < total; at++) mark(arena.gates[at], .35);
     }
     function nearest(x, z) {
@@ -565,7 +700,7 @@
         const list = kind === 0 ? generated.obstacles
           : kind === 1 ? generated.barriers
             : kind === 2 ? generated.ramps : generated.gates;
-        const total = count(generated, kind === 0 ? "obstacles"
+        const total = itemCount(generated, kind === 0 ? "obstacles"
           : kind === 1 ? "barriers" : kind === 2 ? "ramps" : "gates");
         const width = kind === 2 ? 6 : 4;
         hash ^= (kind << 8) | total;

@@ -12,6 +12,11 @@ typedef bool (*StyleSelectorCooperate)(
  * mutations between layouts from observing stale custom-property values.
  */
 bool style_variable_cache_begin(Stylesheet *sheet, Budget *budget);
+/* A cache entry holds a value shorter than STYLE_CUSTOM_SHORT_VALUE_CAPACITY
+   inline. Longer resolved values go to one spill buffer of this size per
+   cache, allocated by the first such value and emptied with the table;
+   once it is full, further long values are simply not cached. */
+#define STYLE_VARIABLE_CACHE_SPILL_BYTES 4096u
 void style_variable_cache_end(Stylesheet *sheet);
 /* A cache kept by an owner outside layout builds (the DOM bridge's
    getComputedStyle), attached only while it resolves and cleared by that
@@ -75,6 +80,13 @@ typedef struct StyleAncestorBloomCache {
     } entries[STYLE_ANCESTOR_BLOOM_CACHE_CAPACITY];
     StyleSelectorResultCacheEntry *results;
     StyleMatchedRangeCacheEntry matched_ranges[STYLE_MATCHED_RANGE_CACHE_CAPACITY];
+    /* The exact ancestor-token mask of a node and all its ancestors, for
+       the sheet's StyleRuleAncestorTokens table with this stamp. */
+    struct {
+        const lxb_dom_node_t *node;
+        uint64_t mask;
+        uint32_t stamp;
+    } token_entries[STYLE_ANCESTOR_BLOOM_CACHE_CAPACITY];
 } StyleAncestorBloomCache;
 
 /* Exact matched-rule lists retained across layout builds, keyed by element.
@@ -164,7 +176,7 @@ size_t style_retained_matches_drop_selected(
    by subject key alone otherwise. A rule that cannot be keyed or located
    leaves the caller's full reset as the fallback. */
 typedef struct StyleHasPlan StyleHasPlan;
-#define STYLE_HAS_PLAN_LIMIT 512u
+#define STYLE_HAS_PLAN_LIMIT 2048u
 #define STYLE_HAS_ROOT_LIMIT 16u
 #define STYLE_HAS_WALKED_LIMIT 48u
 typedef struct {
@@ -328,6 +340,78 @@ typedef struct {
 } StyleStructureKeys;
 void style_selector_structure_keys(const char *selector, size_t length,
                                    StyleStructureKeys *keys);
+/* Where a test counting an element's position from the end of its
+   siblings (:last-*, :nth-last-*, :only-*, outside :has() arguments) can
+   sit: appending a later sibling changes only those answers. Each entry is
+   a key carried by the element holding the test (`depth` 0) or, when that
+   compound has none, by its ancestor `depth` levels up (`at_least`: that
+   level or any above it, through a descendant combinator). `any` when some
+   test cannot be placed by a key. */
+#define STYLE_TRAILING_KEY_LIMIT 64u
+typedef struct {
+    uint32_t keys[STYLE_TRAILING_KEY_LIMIT];
+    uint8_t depth[STYLE_TRAILING_KEY_LIMIT];
+    bool at_least[STYLE_TRAILING_KEY_LIMIT];
+    uint8_t count;
+    bool any;
+} StyleTrailingKeys;
+void style_selector_trailing_keys(const char *selector, size_t length,
+                                  StyleTrailingKeys *keys);
+/* What a :has() argument can see of a newly inserted subtree, without the
+   :has() plan (which stops at STYLE_HAS_PLAN_LIMIT entries). A plain
+   argument (every compound keyed, no positional, :empty or :blank test,
+   no sibling combinator) changes its answer only through a match whose
+   rightmost element is in the new subtree and whose leftmost element is in
+   it or above it: the keys of its first and last compounds go into two
+   2048-bit Bloom sets. Any other argument can also change through the new
+   subtree's position, so only at anchors related to it: the key of the
+   compound holding the :has() goes into `anchors`, with the region its
+   argument reaches from there (STYLE_HAS_REGION_*). `any` when such an
+   anchor has no key, sits in a nested :has() argument, or the anchors
+   overflow. */
+#define STYLE_HAS_ARGUMENT_BLOOM_WORDS 64u
+#define STYLE_HAS_ANCHOR_LIMIT 64u
+typedef struct {
+    uint32_t first[STYLE_HAS_ARGUMENT_BLOOM_WORDS];
+    uint32_t last[STYLE_HAS_ARGUMENT_BLOOM_WORDS];
+    uint32_t anchors[STYLE_HAS_ANCHOR_LIMIT];
+    uint8_t anchor_regions[STYLE_HAS_ANCHOR_LIMIT];
+    uint8_t anchor_count;
+    bool any;
+} StyleHasArgumentKeys;
+void style_selector_has_argument_keys(const char *selector, size_t length,
+                                      StyleHasArgumentKeys *keys);
+/* Whether a tree change under element `parent` may move a :has() answer
+   `keys` describe. `subtree` is the inserted (in place) or removed
+   (detached) subtree, or NULL when only text or children whose keys are
+   not at hand changed and no element joined or left (then no plain
+   argument can move). Moves: an element of `subtree` may carry a plain
+   argument's last key while it or `parent` or above carries a first key;
+   an anchor key sits on `parent` or above (descendant region) or on an
+   earlier sibling of `subtree` (any child of `parent` when `subtree` is not
+   in place) or of `parent` or above (sibling region). True when `keys`
+   cannot tell. */
+bool style_has_argument_keys_reach(const StyleHasArgumentKeys *keys,
+                                   const lxb_dom_node_t *subtree,
+                                   const lxb_dom_node_t *parent);
+/* Whether an element whose later siblings changed (`sibling`, under
+   `parent`) can carry a test of `keys`. */
+bool style_trailing_keys_reach(const StyleTrailingKeys *keys,
+                               const lxb_dom_node_t *sibling,
+                               const lxb_dom_node_t *parent);
+/* Whether a tree change inside the document's `head` can move a :has()
+   answer that styles an element outside it. An argument reads its anchor's
+   descendants or later siblings, so such a change moves only answers
+   anchored at the head, at its <html> parent, or inside the head, and an
+   anchor inside the head styles only elements inside it (relation self,
+   ancestor or sibling alike). False only when neither the head nor <html>
+   can be any :has() anchor of the sheet: keyed anchors are compared with
+   their keys, unkeyed ones matched as the selector text before the :has().
+   Given the changed `node` (connected), only the :has() arguments that
+   can see it count. True when the plan is bounded. */
+bool stylesheet_head_change_reaches_outside(const Stylesheet *sheet,
+                                            lxb_dom_node_t *head,
+                                            lxb_dom_node_t *node);
 /* Diagnostics and tests: the classified entries (built on demand). */
 typedef enum {
     STYLE_HAS_RELATION_SELF = 0,

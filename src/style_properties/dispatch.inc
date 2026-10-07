@@ -40,6 +40,7 @@ static const StylePropertyEntry style_property_table[] = {
     { "mask-size", 9, style_property_mask_size },
     { "max-width", 9, style_property_max_width },
     { "min-width", 9, style_property_min_width },
+    { "text-wrap", 9, style_property_text_wrap_mode },
     { "transform", 9, style_property_transform },
     { "word-wrap", 9, style_property_overflow_wrap },
     { "align-self", 10, style_property_align_self },
@@ -132,6 +133,7 @@ static const StylePropertyEntry style_property_table[] = {
     { "padding-inline", 14, style_property_padding_inline },
     { "pointer-events", 14, style_property_pointer_events },
     { "text-transform", 14, style_property_text_transform },
+    { "text-wrap-mode", 14, style_property_text_wrap_mode },
     { "vertical-align", 14, style_property_vertical_align },
     { "background-clip", 15, style_property_background_box },
     { "background-size", 15, style_property_background_size },
@@ -682,7 +684,7 @@ bool style_apply_deferred_program_basis(
            expansion bounded, but do not force those declarations to their
            initial value merely because they exceed the math parser's smaller
            source buffer. Nothing from this array is retained. */
-        char resolved_value[512];
+        char resolved_value[STYLE_CUSTOM_RESOLVED_CAPACITY];
         const char initial_value[] = "initial";
         /* An unresolved var() makes the declaration invalid at computed-value
            time.  It has already won the cascade, so the affected longhands

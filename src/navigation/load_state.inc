@@ -126,6 +126,10 @@ static bool navigation_stream_headers(void *opaque,
         snprintf(stream->response_content_type,
                  sizeof(stream->response_content_type), "%s",
                  metadata->content_type);
+        /* The transport charset ranks after a BOM and before <meta>. */
+        (void) document_parser_set_transport_encoding(
+            stream->parser,
+            tilefinch_encoding_from_content_type(metadata->content_type));
     }
     if (metadata->effective_url[0] != '\0') {
         snprintf(stream->document_url, sizeof(stream->document_url), "%s",
@@ -160,6 +164,9 @@ static bool navigation_stream_headers(void *opaque,
                  "response security policy is invalid or exceeds limits");
         return false;
     }
+    /* A header-delivered policy hides nonce attributes from the page. */
+    if (stream->parser->document.content_security_policy.header_present)
+        (void) document_nonce_hiding_enable(&stream->parser->document);
     stream->referrer_policy[0] = '\0';
     bool referrer_policy_header_present = false;
     return fetch_response_referrer_policy(
@@ -174,11 +181,6 @@ static bool navigation_stream_stall(void *opaque)
         stream->session->last_stream.parser_pauses++;
     }
     return true;
-}
-
-static bool navigation_same_origin(const char *left, const char *right)
-{
-    return tilefinch_url_same_origin(left, right);
 }
 
 typedef enum {
@@ -245,6 +247,12 @@ struct NavigationLoad {
     NavigationSession *candidate_session;
     char commit_url[NAVIGATION_URL_LIMIT];
     char response_referrer_policy[128];
+    /* The final response's Refresh header, for the committed document. */
+    char refresh_header[NAVIGATION_REFRESH_HEADER_LIMIT];
+    /* The armed history "replace" (a followed declarative refresh or
+       location.replace()): replace the current entry rather than keep it
+       (record_history is false). */
+    bool replace_history;
     bool low_memory_replacement;
     bool incumbent_retired;
     bool replacement_outcome_reported;
@@ -284,6 +292,16 @@ static void navigation_load_set_error(NavigationLoad *load,
     }
 }
 
+/* The search a refused Google navigation falls back to: the search itself,
+   or the search page that navigated to Google's /sorry/ interstitial. */
+static const char *navigation_load_google_search(const NavigationLoad *load)
+{
+    return site_identity_google_search_url(load->requested_url)
+        ? load->requested_url
+        : (site_identity_google_search_url(load->source_url)
+           ? load->source_url : NULL);
+}
+
 static bool navigation_load_headers(void *opaque,
                                     const FetchResult *metadata)
 {
@@ -298,6 +316,18 @@ static bool navigation_load_headers(void *opaque,
         snprintf(load->session->last_error,
                  sizeof(load->session->last_error), "%s",
                  "response effective URL is invalid");
+        return false;
+    }
+    /* A refused opted-in Google search (site_identity.h) never commits:
+       failing here keeps the incumbent page, clears the opt-in, and leaves
+       the browser a fallback to the compatibility page. */
+    if (site_identity_google_refusal(
+            load->requested_url, effective, metadata->status_code,
+            metadata->content_type, false)) {
+        site_identity_google_refused(navigation_load_google_search(load));
+        snprintf(load->session->last_error,
+                 sizeof(load->session->last_error), "%s",
+                 "Google didn't accept this search");
         return false;
     }
     /* Set-Cookie takes effect at the response-header boundary.  The parser
@@ -420,6 +450,18 @@ static NavigationParserCheckpointOutcome navigation_load_process_staged_body(
     size_t maximum_bytes = quota == NULL
         || quota->maximum_parser_body_bytes == 0
             ? 64u * 1024u : quota->maximum_parser_body_bytes;
+#ifndef TILEFINCH_NO_TRACE
+    /* Lab aid: the synchronous host load has no frontend quota; this
+       reproduces the PSP's small parser deliveries (psp_navigation_quota)
+       so per-feed work (preview checks, fingerprints) is counted as the
+       device pays it. */
+    if (quota == NULL) {
+        const char *chunk = getenv("TILEFINCH_LAB_PARSER_CHUNK_BYTES");
+        unsigned long parsed = chunk == NULL ? 0 : strtoul(chunk, NULL, 10);
+        if (parsed >= 256u && parsed <= 1024u * 1024u)
+            maximum_bytes = (size_t) parsed;
+    }
+#endif
     uint64_t maximum_time_us = quota == NULL
         || quota->maximum_parser_time_us == 0
             ? UINT64_C(10000) : quota->maximum_parser_time_us;
@@ -563,6 +605,24 @@ static bool navigation_load_prepare_document_stream(NavigationLoad *load)
                load, load->document_stream);
 }
 
+/* Inline script text the parser keeps in the DOM. External scripts are
+   admitted by the memory their compile needs and may reach the per-script
+   source ceiling (4 MiB in the PSP app); inline text stays within the old
+   per-script unit (SCRIPT_ADMISSION_LEGACY_UNIT_BYTES), which also keeps a
+   single parser-blocking inline script inside the parser stage's
+   cumulative work allowance. Larger inline scripts are truncated and
+   skipped, as before. */
+#define NAVIGATION_INLINE_SCRIPT_TEXT_BYTES SCRIPT_ADMISSION_LEGACY_UNIT_BYTES
+
+static size_t navigation_inline_script_text_limit(
+    const NavigationSession *session)
+{
+    return session->maximum_script_file_bytes
+               < NAVIGATION_INLINE_SCRIPT_TEXT_BYTES
+        ? session->maximum_script_file_bytes
+        : NAVIGATION_INLINE_SCRIPT_TEXT_BYTES;
+}
+
 static bool navigation_load_begin_parser(NavigationLoad *load)
 {
     if (!document_parser_begin(&load->parser, load->session->budget)) {
@@ -576,7 +636,9 @@ static bool navigation_load_begin_parser(NavigationLoad *load)
     if (!document_parser_set_inert_script_policy(
             &load->parser, !load->session->document_scripts_enabled,
             256u * 1024u,
-            load->session->maximum_script_file_bytes)) return false;
+            navigation_inline_script_text_limit(load->session))) {
+        return false;
+    }
     return true;
 }
 
@@ -808,7 +870,9 @@ static bool navigation_load_reset_for_retry(NavigationLoad *load)
     if (!document_parser_set_inert_script_policy(
             &load->parser, !load->session->document_scripts_enabled,
             256u * 1024u,
-            load->session->maximum_script_file_bytes)) return false;
+            navigation_inline_script_text_limit(load->session))) {
+        return false;
+    }
     NavigationDocumentStream *stream = load->document_stream;
     return navigation_load_initialize_document_stream(load, stream);
 }
@@ -916,6 +980,8 @@ static NavigationLoad *navigation_load_begin_common(
     load->fonts = fonts;
     load->images = images;
     load->record_history = record_history;
+    load->replace_history = navigation_take_history_replace(
+        session, generation, url, record_history);
     load->sectioned = store != NULL;
     bool low_memory_requested = store == NULL
         && session->replacement_mode == NAVIGATION_REPLACEMENT_LOW_MEMORY
@@ -967,9 +1033,25 @@ static NavigationLoad *navigation_load_begin_common(
     load->initial_section = initial_section;
     load->response.budget = session->budget;
     const char *actual_method = method == NULL ? "GET" : method;
-    if (strlen(actual_method) >= sizeof(load->method)
-        || !tilefinch_url_normalize(url, load->requested_url,
-                                 sizeof(load->requested_url))
+    /* A pending Google fallback belongs to the navigation that failed; a
+       new navigation supersedes it. */
+    site_identity_clear_google_fallback();
+    bool normalized = strlen(actual_method) < sizeof(load->method)
+        && tilefinch_url_normalize(url, load->requested_url,
+                                   sizeof(load->requested_url));
+    /* "Try Google anyway" carries tilefinch_raw=1 only as far as this
+       point: opt the session in and drop the marker before the URL becomes
+       a request, a history entry, or a Referer. effective_url is scratch
+       until it is assigned below. */
+    if (normalized
+        && site_identity_take_google_opt_in_marker(
+               load->requested_url, load->effective_url,
+               sizeof(load->effective_url))) {
+        normalized = tilefinch_url_normalize(
+            load->effective_url, load->requested_url,
+            sizeof(load->requested_url));
+    }
+    if (!normalized
         || !tilefinch_url_request_key(load->requested_url, load->request_url,
                                    sizeof(load->request_url))) {
         navigation_load_set_error(
@@ -1284,6 +1366,10 @@ NavigationLoadStatus navigation_load_pump(
             && session->last_error[0] != '\0') {
             detail = session->last_error;
         }
+        if (site_identity_google_refusal(
+                load->requested_url, NULL, 0, NULL, true))
+            site_identity_google_refused(
+                navigation_load_google_search(load));
         navigation_load_set_error(
             load, NAVIGATION_LOAD_FAILED,
             detail[0] == '\0' ? "navigation request failed" : detail);
@@ -1295,6 +1381,13 @@ NavigationLoadStatus navigation_load_pump(
              load->response.cf_mitigated);
     snprintf(session->last_server, sizeof(session->last_server), "%s",
              load->response.server);
+    const char *bot_wall_vendor = tilefinch_bot_wall_header_vendor(
+        load->response.status_code, load->response.server,
+        load->response.cf_mitigated, load->response.response_headers,
+        load->response.response_headers_length);
+    snprintf(session->last_bot_wall_vendor,
+             sizeof(session->last_bot_wall_vendor), "%s",
+             bot_wall_vendor == NULL ? "" : bot_wall_vendor);
     if (!load->response_cookies_accepted) {
         navigation_accept_response_cookies(
             session->browser_session, &load->request_context, &load->response,
@@ -1362,6 +1455,13 @@ static bool navigation_load_history_url(
 static bool navigation_load_finalize_parse(NavigationLoad *load)
 {
     NavigationSession *session = load->session;
+    /* A value that fills the buffer was cut short: ignore it rather than
+       follow a different URL than the server named. */
+    if (fetch_response_header_value(&load->response, "refresh",
+                                    load->refresh_header,
+                                    sizeof(load->refresh_header))
+        && strlen(load->refresh_header) + 1u >= sizeof(load->refresh_header))
+        load->refresh_header[0] = '\0';
     load->response_referrer_policy[0] = '\0';
     bool referrer_policy_header_present = false;
     if (!fetch_response_referrer_policy(
@@ -1596,6 +1696,9 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
         snprintf(candidate->pending_response_referrer_policy,
                  sizeof(candidate->pending_response_referrer_policy), "%s",
                  load->response_referrer_policy);
+        snprintf(candidate->pending_refresh_header,
+                 sizeof(candidate->pending_refresh_header), "%s",
+                 load->refresh_header);
         load->candidate_session = candidate;
         built = navigation_commit_document(
             candidate, load->generation, load->commit_url,
@@ -1792,9 +1895,12 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
             return false;
         }
     }
-    if (load->record_history
-        && !history_push(session, load->commit_url,
-                         candidate->page.document.title)) {
+    if ((load->record_history
+         && !history_push(session, load->commit_url,
+                          candidate->page.document.title))
+        || (load->replace_history
+            && !history_replace_current(session, load->commit_url,
+                                        candidate->page.document.title))) {
         if (hook_prepared) abort(hook_opaque);
         navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
                                   "history entry allocation failed");
@@ -1811,6 +1917,9 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
     size_t history_count = session->history_count;
     size_t history_index = session->history_index;
     size_t history_pruned = session->history_pruned;
+    /* The live session's refresh run: user input during the load reset it
+       after the candidate copied the session. */
+    NavigationRefreshStats refresh_stats = session->refresh;
     bool candidate_uses_page_images =
         candidate->images == &candidate->page.images;
     /* Charge incumbent teardown to the candidate's accumulated performance
@@ -1829,6 +1938,7 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
     session->history_count = history_count;
     session->history_index = history_index;
     session->history_pruned = history_pruned;
+    session->refresh = refresh_stats;
     if (candidate_uses_page_images) {
         /* images is a convenience pointer used by later relayouts. The
            candidate's inline NavigationPage changes address when its session

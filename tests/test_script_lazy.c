@@ -1,5 +1,6 @@
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
+#include "tilefinch/script_admission.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/session.h"
 #include "tilefinch/viewport.h"
@@ -354,10 +355,120 @@ static int inspect_files(int argc, char **argv)
     return 0;
 }
 
+/* The planner's exact output on bundles built to exercise its lexer: every
+   operator it knows (longest match), regular expressions against division,
+   template literals with nested substitutions, comments and strings holding
+   braces, and gaps between keys and factories. Each factory's offsets,
+   key, kind and arity are known by construction. The lexer's operator scan
+   was rewritten as a first-character switch (script_lazy.c); these pin the
+   factory boundaries it must keep finding. */
+typedef struct {
+    const char *key;
+    const char *gap;
+    const char *factory;
+    ScriptLazyFactoryKind kind;
+    uint8_t arity;
+} SyntheticFactory;
+
+static void test_planner_synthetic_identity(void)
+{
+    static const SyntheticFactory factories[] = {
+        {"1", "", "(m,e)=>{let a=1,b=2,c=3;a>>>=1;b**=2;c&&=a;c||=b;"
+         "c\x3f\x3f=a;a=a===b;a=a!==b;a=b>>>1;a<<=1;a>>=1;a=a==b;a=a!=b;"
+         "a=a<=b;a=a>=b;a++;a--;a=a&&b;a=a||b;a=a\x3f\x3f" "b;a=a**b;"
+         "a=a<<b;a=a>>b;a+=1;a-=1;a*=2;a/=2;a%=2;a&=1;a|=1;a^=1;"
+         "e.x=m?.y;e.s=[...[a]];e.f=(...z)=>z;e.g=a<b?a>b:!a;e.h=~a}",
+         SCRIPT_LAZY_FACTORY_ARROW, 2},
+        {"22", " ", "function(m,e){var a=4,b=2,g=1;e.d=a/b/g;"
+         "e.r=/}{/g.test('}');e.q=a/ /*}*/b;e.t=typeof /x{/;e.u=(a)/2;"
+         "e.v=[1][0]/2;e.w=a++/2;e.k=g?/[}]/:/{/;e.n=a/=2;"
+         "return /\\/}/.source}",
+         SCRIPT_LAZY_FACTORY_FUNCTION, 2},
+        {"abc", "/* } */ ", "m=>{const n=1;m.exports=`a${n}{b}${`in${n+1}}`}"
+         "c${'}'}${({a:1}).a}`+`x\\`}`+`${`${`${n}`}`}`}",
+         SCRIPT_LAZY_FACTORY_ARROW, 1},
+        {"4", "\n// }\n", "function(m){// } brace\n/* } { */"
+         "var s='}{\\'',t=\"}\\\"{\",u='a\\\nb';m.exports=s+t+u}",
+         SCRIPT_LAZY_FACTORY_FUNCTION, 1},
+        {"$five", "  ", "function(){return{a:{b:[{}]}}.a.b.length/1}",
+         SCRIPT_LAZY_FACTORY_FUNCTION, 0},
+        {"6", "", "()=>{if(1)/x/.test('');else{}return 6..toFixed(1)}",
+         SCRIPT_LAZY_FACTORY_ARROW, 0}
+    };
+    static const char prefix[] =
+        "\"use strict\";(self.webpackChunk_s=self.webpackChunk_s||[])"
+        ".push([[7,\"x\"],{";
+    static const char suffix[] = "}]);";
+    size_t count = sizeof(factories) / sizeof(factories[0]);
+    char source[2048];
+    size_t used = 0;
+    size_t key_offsets[8], offsets[8];
+    used += (size_t) snprintf(source + used, sizeof(source) - used, "%s",
+                              prefix);
+    for (size_t i = 0; i < count; i++) {
+        if (i != 0) source[used++] = ',';
+        key_offsets[i] = used;
+        used += (size_t) snprintf(source + used, sizeof(source) - used,
+                                  "%s:%s", factories[i].key,
+                                  factories[i].gap);
+        offsets[i] = used;
+        used += (size_t) snprintf(source + used, sizeof(source) - used,
+                                  "%s", factories[i].factory);
+    }
+    used += (size_t) snprintf(source + used, sizeof(source) - used, "%s",
+                              suffix);
+    CHECK(used < sizeof(source) - 1);
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    ScriptLazyWebpackPlan plan;
+    CHECK(script_lazy_webpack_plan_create(&budget, source, used, &plan));
+    CHECK(plan.factory_count == count && plan.strict_mode);
+    size_t total = 0;
+    for (size_t i = 0; i < count && i < plan.factory_count; i++) {
+        const ScriptLazyFactory *factory = &plan.factories[i];
+        size_t length = strlen(factories[i].factory);
+        CHECK(factory->source_offset == offsets[i]
+              && factory->source_length == length
+              && factory->key_offset == key_offsets[i]
+              && factory->key_length == strlen(factories[i].key)
+              && factory->kind == factories[i].kind
+              && factory->arity == factories[i].arity);
+        if (factory->source_offset != offsets[i]
+            || factory->source_length != length) {
+            fprintf(stderr, "factory %zu: planned %zu+%zu, built %zu+%zu\n",
+                    i, factory->source_offset, factory->source_length,
+                    offsets[i], length);
+        }
+        total += length;
+    }
+    CHECK(plan.factory_source_bytes == total);
+    script_lazy_webpack_plan_destroy(&plan);
+
+    /* One byte off in each lexer path changes the outcome: an operator
+       that is not one, a regular expression read as division, a template
+       substitution left open. */
+    static const char *const rejected[] = {
+        /* `/` after `)` is division, so the regex's brace counts. */
+        "(self.webpackChunk_s=self.webpackChunk_s||[]).push([[1],{"
+        "1:()=>{if(a)/}/.test('')}}]);",
+        "(self.webpackChunk_s=self.webpackChunk_s||[]).push([[1],{"
+        "1:()=>{return `${`}]);",
+        /* `=>` is required between the parameters and the body. */
+        "(self.webpackChunk_s=self.webpackChunk_s||[]).push([[1],{"
+        "1:(a)= >{}}]);"
+    };
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        CHECK(!script_lazy_webpack_plan_create(
+            &budget, rejected[i], strlen(rejected[i]), &plan));
+    }
+    CHECK(budget.current == 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) return inspect_files(argc, argv);
     test_resource_loader_statement_planning();
+    test_planner_synthetic_identity();
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     test_nested_template_depth_is_bounded(&budget);
@@ -386,6 +497,23 @@ int main(int argc, char **argv)
     CHECK(strstr(rendered, "b.x=/[{}]/") == NULL);
     budget_free(&budget, rendered);
     script_lazy_webpack_plan_destroy(&plan);
+
+    /* A UTF-8 byte order mark before the registration (m.vk.com's chunks)
+       still plans; the factory offsets stay offsets into the original
+       bytes. */
+    const char bom_source[] =
+        "\xef\xbb\xbf\"use strict\";"
+        "(self.webpackChunk_bom=self.webpackChunk_bom||[])"
+        ".push([[3],{30:function(a,b){b.y=1}}]);";
+    ScriptLazyWebpackPlan bom_plan;
+    CHECK(plans(&budget, bom_source, &bom_plan));
+    CHECK(bom_plan.factory_count == 1);
+    CHECK(bom_plan.strict_mode);
+    if (bom_plan.factory_count == 1) {
+        CHECK(memcmp(bom_source + bom_plan.factories[0].source_offset,
+                     "function(a,b)", 13) == 0);
+    }
+    script_lazy_webpack_plan_destroy(&bom_plan);
 
     static const char *const rejected[] = {
         "(self.notWebpack=self.notWebpack||[]).push([[1],{1:a=>{}}]);",
@@ -516,15 +644,15 @@ int main(int argc, char **argv)
               lazy_body->length, "https://example.test/chunk.js",
               &runtime_plan, lazy_body, release_shared_source, &result)
           == SCRIPT_LAZY_EVALUATION_SUCCEEDED
+          /* The registration only: no factory compiles before it runs. */
           && result.host_compile_attempts
-                 == basic_registration_compiles + 4
+                 == basic_registration_compiles + 1
           && result.lazy_webpack_syntax_preflight_attempts
-                 == basic_preflight_attempts + 3
+                 == basic_preflight_attempts
           && result.lazy_webpack_syntax_preflight_failures
                  == basic_preflight_failures
           && result.lazy_webpack_syntax_preflight_source_bytes
-                 == basic_preflight_bytes
-                      + runtime_plan.factory_source_bytes);
+                 == basic_preflight_bytes);
     script_lazy_webpack_plan_destroy(&runtime_plan);
     static const char invoke_modules[] =
         "(()=>{const modules=globalThis.__lazyModules,cache={};"
@@ -578,8 +706,8 @@ int main(int argc, char **argv)
           && result.lazy_webpack_factory_compile_failures == 0);
 
     /* A syntactically large but semantically tiny factory proves registration
-       retains only exact compressed source after the mandatory grammar
-       preflight. The long comment makes retained bytecode easy to detect. */
+       retains only exact compressed source and compiles nothing. The long
+       comment makes retained bytecode easy to detect. */
     static const char large_prefix[] =
         "(self.webpackChunk_test=self.webpackChunk_test||[]).push([[9],{"
         "9:function(module){/*";
@@ -622,12 +750,11 @@ int main(int argc, char **argv)
                   && result.lazy_webpack_candidates == 2
                   && result.lazy_webpack_applied == 2
                   && result.host_compile_attempts
-                         == registration_compiles + 2
+                         == registration_compiles + 1
                   && result.lazy_webpack_syntax_preflight_attempts
-                         == preflight_attempts + 1
+                         == preflight_attempts
                   && result.lazy_webpack_syntax_preflight_source_bytes
                          == preflight_bytes
-                              + large_plan.factory_source_bytes
                   && result.lazy_webpack_source_compiles == 4
                   && result.lazy_webpack_bytecode_bytes == 0
                   && result.lazy_webpack_compressed_bytecode_bytes == 0);
@@ -678,6 +805,7 @@ int main(int argc, char **argv)
     }
     static const char schedule_pressure_failure[] =
         "globalThis.__lazyPressureUnexpected=false;"
+        "globalThis.__lazyLargeFactory=globalThis.__lazyModules[9];"
         "globalThis.__lazyPressureModule={exports:{}};"
         "setTimeout(()=>{globalThis.__lazyModules[9]("
         "globalThis.__lazyPressureModule);"
@@ -723,9 +851,9 @@ int main(int argc, char **argv)
           && result.lazy_webpack_factories_compiled == 5
           && result.lazy_webpack_compiled_factory_evictions == 5);
 
-    /* A thousand neutral factories expose the unavoidable syntax-preflight
-       CPU separately while proving no executable bytecode remains resident.
-       Only the two used wrappers are compiled into callable functions later. */
+    /* A thousand neutral factories register with one compile (the
+       registration) and no executable bytecode resident. Only the two used
+       wrappers are compiled into callable functions later. */
     const size_t thousand_factory_count = 1000;
     const size_t thousand_capacity = 256u * 1024u;
     char *thousand_source = malloc(thousand_capacity);
@@ -792,14 +920,13 @@ int main(int argc, char **argv)
               && result.lazy_webpack_applied == 3
               && result.lazy_webpack_factories_deferred == 1004
               && result.host_compile_attempts
-                     == registration_compiles + thousand_factory_count + 1
+                     == registration_compiles + 1
               && result.lazy_webpack_syntax_preflight_attempts
-                     == preflight_attempts + thousand_factory_count
+                     == preflight_attempts
               && result.lazy_webpack_syntax_preflight_failures
                      == preflight_failures
               && result.lazy_webpack_syntax_preflight_source_bytes
                      == preflight_bytes
-                          + thousand_plan.factory_source_bytes
               && result.lazy_webpack_source_compiles == 5
               && result.lazy_webpack_bytecode_bytes == 0
               && result.lazy_webpack_compressed_bytecode_bytes == 0
@@ -829,8 +956,10 @@ int main(int argc, char **argv)
           && result.lazy_webpack_compiled_factory_evictions == 7
           && result.lazy_webpack_factory_compile_failures == 1);
 
-    /* A lexically well-formed factory with invalid grammar must fail the
-       one-at-a-time preflight before registration can call push. */
+        /* A lexically well-formed factory with invalid grammar registers like
+       any other (nothing compiles it before it runs, so nothing finds the
+       error); calling it throws the SyntaxError, at the bundle position,
+       and leaves the realm usable. */
     static const char invalid_source[] =
         "(self.webpackChunk_bad=self.webpackChunk_bad||[]).push([[2],{"
         "4:(a,b,c)=>{const = 1}}]);";
@@ -844,31 +973,38 @@ int main(int argc, char **argv)
         result.lazy_webpack_syntax_preflight_attempts;
     size_t invalid_preflight_failures =
         result.lazy_webpack_syntax_preflight_failures;
-    CHECK(script_runtime_evaluate_external_lazy_webpack(
-          runtime, script, (const char *) invalid_body->data,
-              invalid_body->length, "https://example.test/invalid-chunk.js",
-              &invalid_plan, invalid_body, release_shared_source, &result)
-          == SCRIPT_LAZY_EVALUATION_FALLBACK
+    ScriptLazyEvaluation invalid_evaluation =
+        script_runtime_evaluate_external_lazy_webpack(
+            runtime, script, (const char *) invalid_body->data,
+            invalid_body->length, "https://example.test/invalid-chunk.js",
+            &invalid_plan, invalid_body, release_shared_source, &result);
+    CHECK(invalid_evaluation == SCRIPT_LAZY_EVALUATION_SUCCEEDED
           && result.lazy_webpack_candidates == 4
-          && result.lazy_webpack_applied == 3
-          && result.lazy_webpack_fallbacks == 1
+          && result.lazy_webpack_applied == 4
+          && result.lazy_webpack_fallbacks == 0
           && result.host_compile_attempts
                  == invalid_registration_compiles + 1
           && result.lazy_webpack_syntax_preflight_attempts
-                 == invalid_preflight_attempts + 1
+                 == invalid_preflight_attempts
           && result.lazy_webpack_syntax_preflight_failures
-                 == invalid_preflight_failures + 1
+                 == invalid_preflight_failures
           && result.lazy_webpack_source_compiles == 7
           && result.lazy_webpack_factory_compile_failures == 1);
-    browser_shared_body_release(invalid_body);
+    if (invalid_evaluation == SCRIPT_LAZY_EVALUATION_FALLBACK)
+        browser_shared_body_release(invalid_body);
     script_lazy_webpack_plan_destroy(&invalid_plan);
-    static const char verify_no_invalid_effect[] =
-        "globalThis.pocSummary=typeof globalThis.webpackChunk_bad==='undefined'"
-        "?'LAZY-PREFLIGHT-CLEAN':'LAZY-PREFLIGHT-DIRTY'";
+    static const char verify_invalid_factory_throws[] =
+        "(()=>{const f=globalThis.webpackChunk_bad[0][1][4];let r='NONE';"
+        "try{f(1,2,3)}catch(e){r=(e instanceof SyntaxError)+':'+e.fileName"
+        "+':'+e.lineNumber}"
+        "globalThis.pocSummary=r})()";
     CHECK(script_runtime_evaluate_diagnostic(
-              runtime, verify_no_invalid_effect,
-              "<verify-invalid-lazy-fallback>", &result)
-          && strcmp(result.summary, "LAZY-PREFLIGHT-CLEAN") == 0);
+              runtime, verify_invalid_factory_throws,
+              "<verify-invalid-lazy-factory>", &result)
+          && strcmp(result.summary,
+                    "true:https://example.test/invalid-chunk.js:1") == 0
+          && result.lazy_webpack_source_compiles == 7
+          && result.lazy_webpack_factory_compile_failures == 2);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "globalThis.pocSummary='LAZY-AFTER-FAILURE-OK'",
@@ -958,6 +1094,53 @@ int main(int argc, char **argv)
     browser_shared_body_release(rejected_body);
     if (rejected_planned) script_lazy_webpack_plan_destroy(&rejected_plan);
     free(rejected_source);
+
+    /* First-use admission plans on the measured model whole scripts are
+       admitted with (twice the source plus parser state, and the execution
+       reserve beside it), not four times the source. With the page Budget
+       between the two requirements the factory compiles and runs. */
+    {
+        const size_t factory_bytes = large_comment_length;
+        size_t measured = factory_bytes + 32u
+            + script_admission_compile_peak(factory_bytes)
+            + SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES;
+        size_t four_times = factory_bytes + 32u + factory_bytes * 4u
+            + 256u * 1024u + 512u * 1024u;
+        CHECK(four_times > measured + 256u * 1024u);
+        static const char schedule_measured[] =
+            "globalThis.__lazyMeasuredModule={exports:{}};"
+            "setTimeout(()=>{globalThis.__lazyLargeFactory("
+            "globalThis.__lazyMeasuredModule)},0)";
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, schedule_measured, "<schedule-lazy-measured>",
+            &result));
+        (void) script_runtime_collect_and_trim(runtime);
+        size_t target = measured + (four_times - measured) / 2u;
+        size_t remaining = budget_remaining(&runtime_budget);
+        size_t filler_bytes = remaining > target ? remaining - target : 0;
+        void *filler = filler_bytes == 0 ? NULL
+            : budget_malloc_category(&runtime_budget,
+                                     BUDGET_CATEGORY_RESOURCE, filler_bytes);
+        CHECK(filler != NULL);
+        size_t rejections = result.lazy_webpack_compile_admission_rejections;
+        size_t compile_failures =
+            result.lazy_webpack_factory_compile_failures;
+        CHECK(filler != NULL
+              && script_runtime_advance(runtime, 0, 1, &result)
+              && result.lazy_webpack_compile_admission_rejections
+                     == rejections
+              && result.lazy_webpack_factory_compile_failures
+                     == compile_failures);
+        budget_free(&runtime_budget, filler);
+        static const char verify_measured[] =
+            "globalThis.pocSummary="
+            "globalThis.__lazyMeasuredModule.exports===99"
+            "?'LAZY-MEASURED-ADMITTED':'LAZY-MEASURED-REFUSED'";
+        CHECK(script_runtime_evaluate_diagnostic(
+                  runtime, verify_measured, "<verify-lazy-measured>",
+                  &result)
+              && strcmp(result.summary, "LAZY-MEASURED-ADMITTED") == 0);
+    }
 
     script_runtime_destroy(runtime);
     document_destroy(&document);

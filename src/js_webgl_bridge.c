@@ -306,20 +306,24 @@ typedef struct {
     bool repeat_t;
 } WebglTexture;
 
+/* A software-raster vertex. clip is the homogeneous clip-space position;
+   x, y (pixels, y down), z (0..1) and inverse_w are its projection, valid
+   only when geometry_valid (inside the near and far planes and the guard
+   band). clip_valid alone lets a triangle that crosses the near or far
+   plane be clipped instead of dropped. */
 typedef struct {
     float x;
     float y;
     float z;
     float inverse_w;
-    float object_x;
-    float object_y;
-    float object_z;
+    float clip[4];
     float u;
     float v;
-    uint8_t red;
-    uint8_t green;
-    uint8_t blue;
-    uint8_t alpha;
+    float red;
+    float green;
+    float blue;
+    float alpha;
+    bool clip_valid;
     bool geometry_valid;
 } WebglVertex;
 
@@ -890,6 +894,32 @@ static bool webgl_draw_vertex_index(const WebglDecodedDraw *draw,
     return true;
 }
 
+/* Project a clip-space vertex to the surface. A vertex outside the near or
+   far plane, or beyond the 2^20-pixel guard band (which also bounds the
+   raster's fixed-point coordinates), is left !geometry_valid. */
+static void webgl_vertex_project(const WebglDecodedDraw *draw,
+                                 int surface_height, WebglVertex *vertex)
+{
+    const float *clip = vertex->clip;
+    vertex->geometry_valid = false;
+    if (clip[3] < 0.000001f || clip[2] < -clip[3] || clip[2] > clip[3])
+        return;
+    float ndc_x = clip[0] / clip[3];
+    float ndc_y = clip[1] / clip[3];
+    float ndc_z = clip[2] / clip[3];
+    vertex->x = (float) draw->viewport_x
+        + (ndc_x + 1.0f) * 0.5f * (float) draw->viewport_width;
+    vertex->y = (float) surface_height
+        - ((float) draw->viewport_y
+           + (ndc_y + 1.0f) * 0.5f * (float) draw->viewport_height);
+    vertex->z = (ndc_z + 1.0f) * 0.5f;
+    vertex->inverse_w = 1.0f / clip[3];
+    vertex->geometry_valid = isfinite(vertex->inverse_w)
+        && vertex->x >= -1048576.0f && vertex->x <= 1048576.0f
+        && vertex->y >= -1048576.0f && vertex->y <= 1048576.0f
+        && vertex->z >= -1048576.0f && vertex->z <= 1048576.0f;
+}
+
 static bool webgl_decode_vertex(const WebglDecodedDraw *draw,
                                 uint32_t sequence,
                                 int surface_height,
@@ -928,34 +958,14 @@ static bool webgl_decode_vertex(const WebglDecodedDraw *draw,
     }
     for (int component = 0; component < 4; component++)
         if (!isfinite(transformed[component])) return true;
-    if (transformed[3] < 0.000001f
-        || transformed[2] < -transformed[3]
-        || transformed[2] > transformed[3]) return true;
-    float ndc_x = transformed[0] / transformed[3];
-    float ndc_y = transformed[1] / transformed[3];
-    float ndc_z = transformed[2] / transformed[3];
-    output->x = (float) draw->viewport_x
-        + (ndc_x + 1.0f) * 0.5f * (float) draw->viewport_width;
-    output->y = (float) surface_height
-        - ((float) draw->viewport_y
-           + (ndc_y + 1.0f) * 0.5f * (float) draw->viewport_height);
-    output->z = (ndc_z + 1.0f) * 0.5f;
-    output->inverse_w = 1.0f / transformed[3];
-    output->object_x = position[0] / position[3];
-    output->object_y = position[1] / position[3];
-    output->object_z = position[2] / position[3];
+    memcpy(output->clip, transformed, sizeof(output->clip));
     output->u = texcoord[0]; output->v = texcoord[1];
     output->red = webgl_color_byte(color[0] * draw->uniform[0]);
     output->green = webgl_color_byte(color[1] * draw->uniform[1]);
     output->blue = webgl_color_byte(color[2] * draw->uniform[2]);
     output->alpha = webgl_color_byte(color[3] * draw->uniform[3]);
-    output->geometry_valid = isfinite(output->x) && isfinite(output->y)
-        && isfinite(output->z) && isfinite(output->inverse_w)
-        && isfinite(output->object_x) && isfinite(output->object_y)
-        && isfinite(output->object_z)
-        && output->x >= -1048576.0f && output->x <= 1048576.0f
-        && output->y >= -1048576.0f && output->y <= 1048576.0f
-        && output->z >= -1048576.0f && output->z <= 1048576.0f;
+    output->clip_valid = true;
+    webgl_vertex_project(draw, surface_height, output);
     return true;
 }
 
@@ -1171,8 +1181,48 @@ static void webgl_sample_texture(const WebglTexture *texture,
 }
 
 static bool webgl_depth_test_write(uint16_t *depth, int width, int height,
-                                   int x, int y, float value,
+                                   int x, int y, float value, bool write,
                                    const WebglRasterState *state);
+
+/* Triangle setup is in 1/16-pixel fixed point with exact integer edge
+   functions and the top-left fill rule. Triangles that share an edge share
+   its two vertices, so they snap to the same integers and evaluate exactly
+   opposite edge values: every pixel centre on or near the edge belongs to
+   exactly one of them. (Float barycentrics with an inclusion epsilon hit
+   such pixels twice, and the old per-sample coverage blend let the clear
+   colour through along every shared edge.) */
+#define WEBGL_SUBPIXEL 16
+#define WEBGL_SUBPIXEL_HALF 8
+
+typedef struct {
+    int64_t row;       /* value at the current row's first pixel centre */
+    int64_t step_x;    /* change per pixel to the right */
+    int64_t step_y;    /* change per row down */
+    int64_t bias;      /* 0 on a top or left edge, -1 otherwise */
+    int64_t sample[4]; /* pixel centre to each antialiasing sample */
+} WebglEdge;
+
+static void webgl_edge_setup(WebglEdge *edge, int64_t x0, int64_t y0,
+                             int64_t x1, int64_t y1, int64_t px, int64_t py)
+{
+    /* The samples of the old 2x2 pattern, a quarter pixel from the centre. */
+    static const int64_t offsets[4][2] = {{-4, -4}, {4, -4}, {-4, 4}, {4, 4}};
+    int64_t dx = x1 - x0, dy = y1 - y0;
+    edge->row = dx * (py - y0) - dy * (px - x0);
+    edge->step_x = -dy * WEBGL_SUBPIXEL;
+    edge->step_y = dx * WEBGL_SUBPIXEL;
+    /* Inside is where the value grows, along (-dy, dx); y points down. */
+    edge->bias = dy < 0 || (dy == 0 && dx > 0) ? 0 : -1;
+    for (size_t sample = 0; sample < 4u; sample++)
+        edge->sample[sample] =
+            offsets[sample][1] * dx - offsets[sample][0] * dy;
+}
+
+static int64_t webgl_floor_div(int64_t value, int64_t divisor)
+{
+    int64_t quotient = value / divisor;
+    return quotient - (value % divisor != 0 && value < 0 ? 1 : 0);
+}
 
 static bool webgl_raster_triangle(uint8_t *surface, int width, int height,
                                   uint16_t *depth,
@@ -1186,25 +1236,46 @@ static bool webgl_raster_triangle(uint8_t *surface, int width, int height,
 {
     if (!a->geometry_valid || !b->geometry_valid || !c->geometry_valid)
         return true;
-    float area = (b->x - a->x) * (c->y - a->y)
-               - (b->y - a->y) * (c->x - a->x);
-    if (!isfinite(area) || fabsf(area) < 0.00001f) return true;
-    bool front = state->front_face == 0x0901 ? area < 0.0f : area > 0.0f;
+    /* The guard band keeps |coordinate| <= 2^20 pixels, so snapped values
+       fit 2^24 and every edge product fits comfortably in 64 bits. */
+    int64_t ax = (int64_t) lrintf(a->x * (float) WEBGL_SUBPIXEL);
+    int64_t ay = (int64_t) lrintf(a->y * (float) WEBGL_SUBPIXEL);
+    int64_t bx = (int64_t) lrintf(b->x * (float) WEBGL_SUBPIXEL);
+    int64_t by = (int64_t) lrintf(b->y * (float) WEBGL_SUBPIXEL);
+    int64_t cx = (int64_t) lrintf(c->x * (float) WEBGL_SUBPIXEL);
+    int64_t cy = (int64_t) lrintf(c->y * (float) WEBGL_SUBPIXEL);
+    int64_t area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (area == 0) return true;
+    bool front = state->front_face == 0x0901 ? area < 0 : area > 0;
     if (state->cull && (state->cull_face == 0x0408
         || (state->cull_face == 0x0405 && !front)
         || (state->cull_face == 0x0404 && front))) return true;
-    if (fmaxf(a->x, fmaxf(b->x, c->x)) <= 0.0f
-        || fminf(a->x, fminf(b->x, c->x)) >= (float) width
-        || fmaxf(a->y, fmaxf(b->y, c->y)) <= 0.0f
-        || fminf(a->y, fminf(b->y, c->y)) >= (float) height) return true;
-    int left = (int) floorf(fminf(a->x, fminf(b->x, c->x)));
-    int right = (int) ceilf(fmaxf(a->x, fmaxf(b->x, c->x)));
-    int top = (int) floorf(fminf(a->y, fminf(b->y, c->y)));
-    int bottom = (int) ceilf(fmaxf(a->y, fmaxf(b->y, c->y)));
+    if (area < 0) {
+        const WebglVertex *swap = b; b = c; c = swap;
+        int64_t swap_x = bx, swap_y = by;
+        bx = cx; by = cy; cx = swap_x; cy = swap_y;
+        area = -area;
+    }
+    /* Pixels whose centre or any antialiasing sample (a quarter pixel
+       either side) can lie inside, clipped to the surface and scissor. */
+    int64_t min_x = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
+    int64_t max_x = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
+    int64_t min_y = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
+    int64_t max_y = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
+    int64_t left = webgl_floor_div(min_x - 12 + WEBGL_SUBPIXEL - 1,
+                                   WEBGL_SUBPIXEL);
+    int64_t right = webgl_floor_div(max_x - 4, WEBGL_SUBPIXEL) + 1;
+    int64_t top = webgl_floor_div(min_y - 12 + WEBGL_SUBPIXEL - 1,
+                                  WEBGL_SUBPIXEL);
+    int64_t bottom = webgl_floor_div(max_y - 4, WEBGL_SUBPIXEL) + 1;
     if (left < 0) left = 0;
     if (top < 0) top = 0;
     if (right > width) right = width;
     if (bottom > height) bottom = height;
+    if (left < state->scissor.left) left = state->scissor.left;
+    if (top < state->scissor.top) top = state->scissor.top;
+    if (right > state->scissor.right) right = state->scissor.right;
+    if (bottom > state->scissor.bottom) bottom = state->scissor.bottom;
     if (right <= left || bottom <= top) return true;
     size_t pixels = (size_t) (right - left) * (size_t) (bottom - top);
     /* Exhausting a page-controlled raster budget drops this primitive. It is
@@ -1213,43 +1284,50 @@ static bool webgl_raster_triangle(uint8_t *surface, int width, int height,
     if (pixels > (WEBGL_RASTER_WORK_LIMIT - *work) / work_per_pixel)
         return true;
     *work += pixels * work_per_pixel;
-    for (int y = top; y < bottom; y++) {
-        for (int x = left; x < right; x++) {
-            if (!webgl_scissor_contains(&state->scissor, x, y)) continue;
-            float px = (float) x + 0.5f, py = (float) y + 0.5f;
-            float wa = ((b->x - px) * (c->y - py)
-                        - (b->y - py) * (c->x - px)) / area;
-            float wb = ((c->x - px) * (a->y - py)
-                        - (c->y - py) * (a->x - px)) / area;
-            float wc = 1.0f - wa - wb;
-            float coverage = 1.0f;
-            if (antialias) {
-                static const float offsets[4][2] = {
-                    {0.25f, 0.25f}, {0.75f, 0.25f},
-                    {0.25f, 0.75f}, {0.75f, 0.75f}
-                };
-                float sum_a = 0.0f, sum_b = 0.0f, sum_c = 0.0f;
+    int64_t origin_x = left * WEBGL_SUBPIXEL + WEBGL_SUBPIXEL_HALF;
+    int64_t origin_y = top * WEBGL_SUBPIXEL + WEBGL_SUBPIXEL_HALF;
+    WebglEdge edges[3];
+    webgl_edge_setup(&edges[0], bx, by, cx, cy, origin_x, origin_y);
+    webgl_edge_setup(&edges[1], cx, cy, ax, ay, origin_x, origin_y);
+    webgl_edge_setup(&edges[2], ax, ay, bx, by, origin_x, origin_y);
+    float inverse_area = 1.0f / (float) area;
+    for (int y = (int) top; y < (int) bottom; y++) {
+        int64_t ea = edges[0].row, eb = edges[1].row, ec = edges[2].row;
+        for (int x = (int) left; x < (int) right; x++,
+             ea += edges[0].step_x, eb += edges[1].step_x,
+             ec += edges[2].step_x) {
+            float wa, wb, wc, coverage = 1.0f;
+            /* The pixel centre is the authoritative sample: it decides
+               which triangle owns the pixel and writes depth, exactly as
+               without antialiasing. A neighbour that reaches the pixel
+               only with its quarter-pixel samples adds a fringe blended by
+               the covered fraction over whatever the owner left, so a
+               shared edge mixes the two triangles and never the clear
+               colour behind them. */
+            bool centre = ea + edges[0].bias >= 0
+                && eb + edges[1].bias >= 0 && ec + edges[2].bias >= 0;
+            if (centre) {
+                wa = (float) ea * inverse_area;
+                wb = (float) eb * inverse_area;
+                wc = (float) ec * inverse_area;
+            } else {
+                if (!antialias) continue;
+                int64_t sum_a = 0, sum_b = 0, sum_c = 0;
                 unsigned covered = 0;
                 for (size_t sample = 0; sample < 4u; sample++) {
-                    float sx = (float) x + offsets[sample][0];
-                    float sy = (float) y + offsets[sample][1];
-                    float sa = ((b->x - sx) * (c->y - sy)
-                                - (b->y - sy) * (c->x - sx)) / area;
-                    float sb = ((c->x - sx) * (a->y - sy)
-                                - (c->y - sy) * (a->x - sx)) / area;
-                    float sc = 1.0f - sa - sb;
-                    if (sa < -0.0001f || sb < -0.0001f || sc < -0.0001f)
-                        continue;
+                    int64_t sa = ea + edges[0].sample[sample];
+                    int64_t sb = eb + edges[1].sample[sample];
+                    int64_t sc = ec + edges[2].sample[sample];
+                    if (sa + edges[0].bias < 0 || sb + edges[1].bias < 0
+                        || sc + edges[2].bias < 0) continue;
                     sum_a += sa; sum_b += sb; sum_c += sc; covered++;
                 }
                 if (covered == 0u) continue;
-                float inverse = 1.0f / (float) covered;
-                wa = sum_a * inverse;
-                wb = sum_b * inverse;
-                wc = sum_c * inverse;
+                float scale = inverse_area / (float) covered;
+                wa = (float) sum_a * scale;
+                wb = (float) sum_b * scale;
+                wc = (float) sum_c * scale;
                 coverage = (float) covered * 0.25f;
-            } else if (wa < -0.0001f || wb < -0.0001f || wc < -0.0001f) {
-                continue;
             }
             float perspective_sum = wa * a->inverse_w
                 + wb * b->inverse_w + wc * c->inverse_w;
@@ -1260,7 +1338,8 @@ static bool webgl_raster_triangle(uint8_t *surface, int width, int height,
             float pc = wc * c->inverse_w / perspective_sum;
             if (!webgl_depth_test_write(
                     depth, width, height, x, y,
-                    wa * a->z + wb * b->z + wc * c->z, state)) continue;
+                    wa * a->z + wb * b->z + wc * c->z, centre, state))
+                continue;
             uint8_t sample[4];
             webgl_sample_texture(texture, sources,
                 pa * a->u + pb * b->u + pc * c->u,
@@ -1272,12 +1351,94 @@ static bool webgl_raster_triangle(uint8_t *surface, int width, int height,
                 (pa * a->alpha + pb * b->alpha + pc * c->alpha) * sample[3] / 255.0f,
                 state, coverage);
         }
+        for (size_t edge = 0; edge < 3u; edge++)
+            edges[edge].row += edges[edge].step_y;
+    }
+    return true;
+}
+
+/* Signed distance inside the near (plane 0: z >= -w) or far (plane 1:
+   z <= w) clip plane. */
+static float webgl_clip_distance(const WebglVertex *vertex, int plane)
+{
+    return plane == 0 ? vertex->clip[2] + vertex->clip[3]
+                      : vertex->clip[3] - vertex->clip[2];
+}
+
+/* The point where the edge from an inside to an outside vertex meets the
+   plane. Always interpolating from the inside end makes the result a
+   function of the unordered edge, so the two triangles that share a
+   clipped edge get bit-identical new vertices (and the integer raster then
+   keeps them watertight). */
+static void webgl_clip_edge(const WebglVertex *inside,
+                            const WebglVertex *outside, int plane,
+                            WebglVertex *output)
+{
+    float inside_distance = webgl_clip_distance(inside, plane);
+    float t = inside_distance
+        / (inside_distance - webgl_clip_distance(outside, plane));
+    *output = *inside;
+    for (size_t component = 0; component < 4u; component++)
+        output->clip[component] += t
+            * (outside->clip[component] - inside->clip[component]);
+    output->clip[2] = plane == 0 ? -output->clip[3] : output->clip[3];
+    output->u += t * (outside->u - inside->u);
+    output->v += t * (outside->v - inside->v);
+    output->red += t * (outside->red - inside->red);
+    output->green += t * (outside->green - inside->green);
+    output->blue += t * (outside->blue - inside->blue);
+    output->alpha += t * (outside->alpha - inside->alpha);
+}
+
+/* Rasterize a triangle, clipping it against the near and far planes in
+   homogeneous space (as WebGL requires) when a vertex lies beyond one. */
+static bool webgl_raster_clipped_triangle(
+    uint8_t *surface, int width, int height, uint16_t *depth,
+    const WebglDecodedDraw *draw,
+    const WebglVertex *a, const WebglVertex *b, const WebglVertex *c,
+    const WebglRasterState *state, const WebglTexture *texture,
+    const WebglSource *sources, bool antialias, size_t *work)
+{
+    if (a->geometry_valid && b->geometry_valid && c->geometry_valid)
+        return webgl_raster_triangle(surface, width, height, depth, a, b, c,
+                                     state, texture, sources, antialias,
+                                     work);
+    if (!a->clip_valid || !b->clip_valid || !c->clip_valid) return true;
+    /* Each plane adds at most one vertex to the convex polygon. */
+    WebglVertex polygon[2][5] = {{*a, *b, *c}};
+    size_t count = 3u;
+    for (int plane = 0; plane < 2; plane++) {
+        const WebglVertex *input = polygon[plane];
+        WebglVertex *output = polygon[plane ^ 1];
+        size_t kept = 0;
+        for (size_t at = 0; at < count; at++) {
+            const WebglVertex *from = &input[at];
+            const WebglVertex *to = &input[(at + 1u) % count];
+            bool from_inside = webgl_clip_distance(from, plane) >= 0.0f;
+            bool to_inside = webgl_clip_distance(to, plane) >= 0.0f;
+            if (from_inside) output[kept++] = *from;
+            if (from_inside != to_inside)
+                webgl_clip_edge(from_inside ? from : to,
+                                from_inside ? to : from, plane,
+                                &output[kept++]);
+        }
+        count = kept;
+        if (count < 3u) return true;
+    }
+    WebglVertex *clipped = polygon[0];
+    for (size_t at = 0; at < count; at++)
+        webgl_vertex_project(draw, height, &clipped[at]);
+    for (size_t at = 1; at + 1u < count; at++) {
+        if (!webgl_raster_triangle(surface, width, height, depth,
+                                   &clipped[0], &clipped[at],
+                                   &clipped[at + 1u], state, texture,
+                                   sources, antialias, work)) return false;
     }
     return true;
 }
 
 static bool webgl_depth_test_write(uint16_t *depth, int width, int height,
-                                   int x, int y, float value,
+                                   int x, int y, float value, bool write,
                                    const WebglRasterState *state)
 {
     if (state == NULL || !state->depth) return true;
@@ -1296,7 +1457,7 @@ static bool webgl_depth_test_write(uint16_t *depth, int width, int height,
         || (function == 0x0204 && incoming < retained)
         || (function == 0x0205 && incoming != retained)
         || (function == 0x0206 && incoming <= retained);
-    if (passes) depth[at] = incoming;
+    if (passes && write) depth[at] = incoming;
     return passes;
 }
 
@@ -1324,7 +1485,7 @@ static bool webgl_raster_line(uint8_t *surface, uint16_t *depth,
         float left = 1.0f - right;
         if (!webgl_depth_test_write(
                 depth, width, height, x, y,
-                (1.0f - ratio) * a->z + ratio * b->z, state)) continue;
+                (1.0f - ratio) * a->z + ratio * b->z, true, state)) continue;
         webgl_pixel(surface, width, height, x, y,
                     left * a->red + right * b->red,
                     left * a->green + right * b->green,
@@ -1456,7 +1617,7 @@ static bool webgl_render_software(Budget *budget, uint8_t *surface,
                         &raster_state.scissor, pixel_x, pixel_y)) continue;
                 if (!webgl_depth_test_write(
                         depth, width, height, pixel_x, pixel_y,
-                        decoded[i].z, &raster_state)) continue;
+                        decoded[i].z, true, &raster_state)) continue;
                 webgl_pixel(
                     surface, width, height, pixel_x, pixel_y,
                     decoded[i].red, decoded[i].green,
@@ -1494,7 +1655,8 @@ static bool webgl_render_software(Budget *budget, uint8_t *surface,
                     ia = i; ib = i + 1; ic = i + 2;
                     if ((i & 1) != 0) { int swap = ia; ia = ib; ib = swap; }
                 }
-                if (!webgl_raster_triangle(surface, width, height, depth,
+                if (!webgl_raster_clipped_triangle(
+                        surface, width, height, depth, &draw,
                         &decoded[ia], &decoded[ib], &decoded[ic],
                         &raster_state, texture, sources, antialias, &work)) {
                     rendered = false; break;
@@ -1536,6 +1698,82 @@ typedef struct {
     uint32_t color;
     float x, y, z;
 } WebglGeVertex;
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Validation-only same-binary switch and census for tint sharing. */
+static bool webgl_tint_share_disabled;
+static uint64_t webgl_tint_instances, webgl_tint_slices;
+
+void script_runtime_webgl_validation_tint_share(bool enabled)
+{
+    webgl_tint_share_disabled = !enabled;
+}
+
+void script_runtime_webgl_validation_tint_counts(uint64_t *instances,
+                                                 uint64_t *slices)
+{
+    if (instances != NULL) *instances = webgl_tint_instances;
+    if (slices != NULL) *slices = webgl_tint_slices;
+}
+
+static bool webgl_direct_geometry_disabled;
+static uint64_t webgl_direct_draws, webgl_direct_retired;
+
+void script_runtime_webgl_validation_direct_geometry(bool enabled)
+{
+    webgl_direct_geometry_disabled = !enabled;
+}
+
+void script_runtime_webgl_validation_direct_counts(uint64_t *direct,
+                                                   uint64_t *retired)
+{
+    if (direct != NULL) *direct = webgl_direct_draws;
+    if (retired != NULL) *retired = webgl_direct_retired;
+}
+#endif
+
+/* Instances of one draw whose tints are bit-identical share one colored
+   vertex slice: the output of webgl_color_modulate depends only on the
+   packed color and the tint, so the GE drawing the same slice under each
+   instance's model matrix is exact. Only the first WEBGL_GE_TINT_SEARCH
+   distinct tints are searched; later ones still get their own slice. */
+#define WEBGL_GE_TINT_SEARCH 32u
+
+/* Modulates the colors of `count` vertices by `tint` in place. Indexed
+   meshes commonly repeat a small authored face palette, so each distinct
+   packed color is modulated once instead of repeating four Allegrex float
+   conversions per expanded index. Eight entries cover the measured box/game
+   meshes; excess colors use the same calculation without growing storage.
+   (A fused copy-and-tint pass measured slower on a PSP-3000 than this
+   color-only pass over a freshly memcpy'd, cache-resident slice.) */
+static void webgl_ge_tint_colors(WebglGeVertex *vertices, size_t count,
+                                 const float tint[4])
+{
+    uint32_t source_colors[8], tinted_colors[8];
+    size_t cached_colors = 0;
+    uint32_t last_source = 0, last_tinted = 0;
+    bool have_last = false;
+    for (size_t vertex = 0; vertex < count; vertex++) {
+        uint32_t color = vertices[vertex].color;
+        uint32_t tinted = last_tinted;
+        if (!have_last || color != last_source) {
+            size_t cached = 0;
+            while (cached < cached_colors && source_colors[cached] != color)
+                cached++;
+            tinted = cached < cached_colors
+                ? tinted_colors[cached] : webgl_color_modulate(color, tint);
+            if (cached == cached_colors && cached_colors < 8u) {
+                source_colors[cached_colors] = color;
+                tinted_colors[cached_colors] = tinted;
+                cached_colors++;
+            }
+            last_source = color;
+            last_tinted = tinted;
+            have_last = true;
+        }
+        vertices[vertex].color = tinted;
+    }
+}
 
 static bool webgl_ge_stable_signature(
     const uint8_t *command, ScriptWebglGeometryCacheSignature *signature)
@@ -1695,6 +1933,35 @@ typedef struct {
     bool valid;
 } WebglGeSurfaceOwner;
 static WebglGeSurfaceOwner webgl_ge_surface_owner;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Replay only temporal AA history. EDRAM ownership and its current display
+   epoch must never be rewound along with a simulation snapshot. */
+static WebglGeSurfaceOwner webgl_ge_validation_history;
+bool script_runtime_webgl_validation_history(ScriptRuntime *runtime, bool restore)
+{
+    if (!runtime || !webgl_ge_surface_owner.valid
+        || webgl_ge_surface_owner.realm_epoch_high != runtime->bridge.webgl_realm_epoch_high
+        || webgl_ge_surface_owner.realm_epoch_low != runtime->bridge.webgl_realm_epoch_low)
+        return false;
+    if (!restore) {
+        webgl_ge_validation_history = webgl_ge_surface_owner;
+        return true;
+    }
+    if (!webgl_ge_validation_history.valid
+        || webgl_ge_validation_history.realm_epoch_high != webgl_ge_surface_owner.realm_epoch_high
+        || webgl_ge_validation_history.realm_epoch_low != webgl_ge_surface_owner.realm_epoch_low
+        || webgl_ge_validation_history.canvas_handle != webgl_ge_surface_owner.canvas_handle
+        || webgl_ge_validation_history.width != webgl_ge_surface_owner.width
+        || webgl_ge_validation_history.height != webgl_ge_surface_owner.height)
+        return false;
+    memcpy(webgl_ge_surface_owner.temporal_matrix,
+        webgl_ge_validation_history.temporal_matrix,
+        sizeof(webgl_ge_surface_owner.temporal_matrix));
+    webgl_ge_surface_owner.temporal_matrix_valid =
+        webgl_ge_validation_history.temporal_matrix_valid;
+    return true;
+}
+#endif
 static WebglGeTextureCacheEntry
     webgl_ge_texture_cache[WEBGL_TEXTURE_LIMIT];
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -1975,6 +2242,40 @@ static bool webgl_ge_compact_instance_needs_antialias(
         radius_pixels_squared);
 }
 
+/* Frees blocks retired by an earlier frame; that frame's list has
+   completed (every render ends in, or fails through, sceGuSync). */
+static void webgl_ge_geometry_retired_release(DomBridge *bridge)
+{
+    for (size_t i = 0; i < bridge->webgl_geometry_retired_count; i++) {
+        budget_free(bridge->budget, bridge->webgl_geometry_retired[i]);
+        bridge->webgl_geometry_retired[i] = NULL;
+    }
+    bridge->webgl_geometry_retired_count = 0;
+}
+
+/* Drops slot's retained block. A block the GE was told to read earlier in
+   the frame being built must outlive that list, so it is retired instead of
+   freed (bounded: each direct draw reserves one retirement). */
+static void webgl_ge_geometry_release_slot(DomBridge *bridge, size_t slot,
+                                           uint32_t *direct_slots)
+{
+    void *block = bridge->webgl_geometry_vertices[slot];
+    bridge->webgl_geometry_vertices[slot] = NULL;
+    if (block == NULL) return;
+    if ((*direct_slots & (UINT32_C(1) << slot)) != 0u
+        && bridge->webgl_geometry_retired_count
+               < SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT) {
+        *direct_slots &= ~(UINT32_C(1) << slot);
+        bridge->webgl_geometry_retired[
+            bridge->webgl_geometry_retired_count++] = block;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        webgl_direct_retired++;
+#endif
+        return;
+    }
+    budget_free(bridge->budget, block);
+}
+
 static void webgl_ge_geometry_cache_clear(DomBridge *bridge)
 {
     if (bridge == NULL) return;
@@ -1982,6 +2283,7 @@ static void webgl_ge_geometry_cache_clear(DomBridge *bridge)
         budget_free(bridge->budget, bridge->webgl_geometry_vertices[i]);
         bridge->webgl_geometry_vertices[i] = NULL;
     }
+    webgl_ge_geometry_retired_release(bridge);
     memset(&bridge->webgl_geometry_cache, 0,
            sizeof(bridge->webgl_geometry_cache));
 }
@@ -2013,12 +2315,16 @@ static bool webgl_render_ge(DomBridge *bridge,
 {
     if (native_authoritative != NULL) *native_authoritative = false;
     if (bridge == NULL || bridge->budget == NULL) return false;
+    /* Any EDRAM color write invalidates a deferred page publication that
+       still points at the previous WebGL frame. */
+    image_canvas_native_serial_advance();
     Budget *budget = bridge->budget;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
     uint64_t total_started = (uint64_t) sceKernelGetSystemTimeWide();
 #endif
     if (!psp_media_present_ge_context_acquire()
         || !psp_media_present_ge_context_idle()) return false;
+    webgl_ge_geometry_retired_release(bridge);
     size_t ge_vertex_capacity = 0, validity_capacity = 0;
     size_t edge_index_capacity = 0, instance_capacity = 0;
     if (!webgl_ge_vertex_storage_required(
@@ -2033,8 +2339,9 @@ static bool webgl_render_ge(DomBridge *bridge,
     size_t scratch_vertex_capacity = ge_vertex_capacity
         + temporal_vertex_capacity;
     size_t scratch_bytes = scratch_vertex_capacity * sizeof(WebglGeVertex)
-        + instance_capacity * 16u * sizeof(float)
-        + edge_index_capacity * sizeof(uint16_t) + validity_capacity;
+        + instance_capacity * 20u * sizeof(float)
+        + edge_index_capacity * sizeof(uint16_t)
+        + instance_capacity * sizeof(uint16_t) + validity_capacity;
     if (scratch_bytes == 0u) scratch_bytes = 1u;
     WebglGeVertex *scratch = budget_malloc_category(
         budget, BUDGET_CATEGORY_RENDER, scratch_bytes);
@@ -2047,10 +2354,13 @@ static bool webgl_render_ge(DomBridge *bridge,
     WebglGeVertex *temporal_vertices = scratch + ge_vertex_capacity;
     float *instance_matrices = (float *) (
         scratch + scratch_vertex_capacity);
+    /* One distinct tint per colored slice, and each instance's slice. */
+    float *slice_tints = instance_matrices + instance_capacity * 16u;
     uint16_t *edge_indices = (uint16_t *) (
-        instance_matrices + instance_capacity * 16u);
+        slice_tints + instance_capacity * 4u);
+    uint16_t *instance_slices = edge_indices + edge_index_capacity;
     uint8_t *vertex_validity = (uint8_t *) (
-        edge_indices + edge_index_capacity);
+        instance_slices + instance_capacity);
     void *edram = sceGeEdramGetAddr();
     if (edram == NULL) { budget_free(budget, scratch); return false; }
     uint8_t *color_target = (uint8_t *) edram + WEBGL_GE_COLOR_OFFSET;
@@ -2258,6 +2568,9 @@ static bool webgl_render_ge(DomBridge *bridge,
     sceGuClearStencil(0xffu);
     sceGuPixelMask(UINT32_C(0xff000000));
     size_t vertex_cursor = 0, edge_index_cursor = 0;
+    /* Cache slots this list draws from directly (see below). */
+    uint32_t direct_slots = 0;
+    size_t direct_draws = 0;
     size_t antialias_draws_used = 0;
     size_t temporal_vertex_cursor = 0, temporal_draws_used = 0;
     float temporal_frame_matrix[16] = {0};
@@ -2425,18 +2738,35 @@ static bool webgl_render_ge(DomBridge *bridge,
             cacheable = true;
             for (size_t slot = 0;
                  slot < SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT; slot++) {
-                if ((cache_reset
-                     || !bridge->webgl_geometry_cache.records[slot].valid)
-                    && bridge->webgl_geometry_vertices[slot] != NULL) {
-                    budget_free(budget, bridge->webgl_geometry_vertices[slot]);
-                    bridge->webgl_geometry_vertices[slot] = NULL;
-                }
+                if (cache_reset
+                    || !bridge->webgl_geometry_cache.records[slot].valid)
+                    webgl_ge_geometry_release_slot(bridge, slot,
+                                                   &direct_slots);
             }
             if (cache_hit
                 && bridge->webgl_geometry_vertices[cache_slot] != NULL) {
-                memcpy(draw_vertices,
-                       bridge->webgl_geometry_vertices[cache_slot],
-                       cache_bytes);
+                /* A hit that is drawn as stored (no per-instance colors and
+                   no closing LINE_LOOP vertex) needs no scratch copy: the GE
+                   reads the retained block, which stays allocated until this
+                   list completes even if a later command evicts it. */
+                bool direct = draw.instance_color.source == NULL
+                    && mode != WEBGL_LINE_LOOP
+                    && direct_draws < SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                if (webgl_direct_geometry_disabled) direct = false;
+#endif
+                if (direct) {
+                    draw_vertices = bridge->webgl_geometry_vertices[cache_slot];
+                    direct_slots |= UINT32_C(1) << cache_slot;
+                    direct_draws++;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                    webgl_direct_draws++;
+#endif
+                } else {
+                    memcpy(draw_vertices,
+                           bridge->webgl_geometry_vertices[cache_slot],
+                           cache_bytes);
+                }
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
                 webgl_native_metrics.geometry_cache_hit_vertices
                     += (size_t) count;
@@ -2444,18 +2774,18 @@ static bool webgl_render_ge(DomBridge *bridge,
             } else {
                 /* Admission may replace a valid LRU record in-place. Reuse
                    its allocation only when the translated byte size is
-                   identical. Dynamic HUD generations otherwise paid a free
-                   and equal-sized allocation before every possible hit. */
+                   identical and this list has not drawn from it. Dynamic
+                   HUD generations otherwise paid a free and equal-sized
+                   allocation before every possible hit. */
                 bool reuse_equal_block = !cache_hit
                     && bridge->webgl_geometry_vertices[cache_slot] != NULL
-                    && previous_cache_bytes[cache_slot] == cache_bytes;
+                    && previous_cache_bytes[cache_slot] == cache_bytes
+                    && (direct_slots & (UINT32_C(1) << cache_slot)) == 0u;
                 cache_promote = cache_hit || reuse_equal_block;
                 cache_hit = false;
-                if (!reuse_equal_block) {
-                    budget_free(
-                        budget, bridge->webgl_geometry_vertices[cache_slot]);
-                    bridge->webgl_geometry_vertices[cache_slot] = NULL;
-                }
+                if (!reuse_equal_block)
+                    webgl_ge_geometry_release_slot(bridge, cache_slot,
+                                                   &direct_slots);
             }
         }
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -2718,56 +3048,54 @@ static bool webgl_render_ge(DomBridge *bridge,
 #endif
         /* The GE cannot bind a second per-instance color stream. Keep the
            retained base mesh, then make one tiny colored vertex slice per
-           instance. The JS/native work ceiling bounds the total to 4096
-           vertices and the copies are emitted from back to front so the
-           first slice remains the source until every snapshot exists. */
+           distinct instance tint; instances with the same tint share it.
+           The JS/native work ceiling bounds the total to 4096 vertices and
+           the slices are written from back to front so the first slice
+           remains the untinted source until every other slice exists. */
+        uint32_t colored_slices = 1u;
         if (draw.instance_color.source != NULL) {
-            for (uint32_t instance = draw.instance_count; instance-- > 0u;) {
-                WebglGeVertex *instance_vertices =
-                    draw_vertices + (size_t) instance * ge_count;
-                if (instance != 0u) memcpy(
-                    instance_vertices, draw_vertices,
-                    ge_count * sizeof(*instance_vertices));
-                if (draw.instance_color.source != NULL) {
-                    float tint[4];
-                    if (!webgl_instance_color(&draw, instance, tint)) {
-                        sceGuFinish(); sceGuSync(0, 0);
-                        budget_free(budget, scratch); return false;
-                    }
-                    /* Indexed meshes commonly repeat a small authored face
-                       palette. Modulate each distinct packed color once per
-                       instance instead of repeating four Allegrex soft-float
-                       conversions for every expanded index. Eight entries
-                       cover the measured box/game meshes; excess colors use
-                       the exact former calculation without growing storage. */
-                    uint32_t source_colors[8], tinted_colors[8];
-                    size_t cached_colors = 0;
-                    uint32_t last_source = 0, last_tinted = 0;
-                    bool have_last = false;
-                    for (size_t vertex = 0; vertex < ge_count; vertex++) {
-                        uint32_t color = instance_vertices[vertex].color;
-                        uint32_t tinted = last_tinted;
-                        if (!have_last || color != last_source) {
-                            size_t cached = 0;
-                            while (cached < cached_colors
-                                   && source_colors[cached] != color) cached++;
-                            tinted = cached < cached_colors
-                                ? tinted_colors[cached]
-                                : webgl_color_modulate(color, tint);
-                            if (cached == cached_colors
-                                && cached_colors < 8u) {
-                                source_colors[cached_colors] = color;
-                                tinted_colors[cached_colors] = tinted;
-                                cached_colors++;
-                            }
-                            last_source = color;
-                            last_tinted = tinted;
-                            have_last = true;
-                        }
-                        instance_vertices[vertex].color = tinted;
+            uint32_t distinct = 0;
+            uint32_t search_limit = WEBGL_GE_TINT_SEARCH;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (webgl_tint_share_disabled) search_limit = 0;
+#endif
+            for (uint32_t instance = 0; instance < draw.instance_count;
+                 instance++) {
+                float tint[4];
+                if (!webgl_instance_color(&draw, instance, tint)) {
+                    sceGuFinish(); sceGuSync(0, 0);
+                    budget_free(budget, scratch); return false;
+                }
+                uint32_t slice = distinct;
+                uint32_t searched = distinct < search_limit
+                    ? distinct : search_limit;
+                for (uint32_t at = 0; at < searched; at++) {
+                    if (memcmp(slice_tints + (size_t) at * 4u, tint,
+                               sizeof(tint)) == 0) {
+                        slice = at;
+                        break;
                     }
                 }
+                if (slice == distinct) {
+                    memcpy(slice_tints + (size_t) distinct * 4u, tint,
+                           sizeof(tint));
+                    distinct++;
+                }
+                instance_slices[instance] = (uint16_t) slice;
             }
+            for (uint32_t slice = distinct; slice-- > 0u;) {
+                const float *tint = slice_tints + (size_t) slice * 4u;
+                WebglGeVertex *slice_vertices =
+                    draw_vertices + (size_t) slice * ge_count;
+                if (slice != 0u) memcpy(slice_vertices, draw_vertices,
+                    ge_count * sizeof(*slice_vertices));
+                webgl_ge_tint_colors(slice_vertices, ge_count, tint);
+            }
+            colored_slices = distinct;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            webgl_tint_instances += draw.instance_count;
+            webgl_tint_slices += distinct;
+#endif
         }
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         frame_instance_color_us +=
@@ -2783,8 +3111,7 @@ static bool webgl_render_ge(DomBridge *bridge,
            end of list construction leaves a hardware race in which the GE
            can fetch stale scratch vertices and stretch a triangle across the
            framebuffer. One range covers every per-instance color copy. */
-        size_t published_vertex_copies = draw.instance_color.source != NULL
-            ? draw.instance_count : 1u;
+        size_t published_vertex_copies = colored_slices;
         if (ge_count != 0u && published_vertex_copies != 0u) {
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
             uint64_t writeback_started =
@@ -2816,7 +3143,7 @@ static bool webgl_render_ge(DomBridge *bridge,
             sceGumLoadMatrix(&instance_matrix);
             WebglGeVertex *instance_vertices = draw_vertices
                 + (draw.instance_color.source != NULL
-                    ? (size_t) instance * ge_count : 0u);
+                    ? (size_t) instance_slices[instance] * ge_count : 0u);
             sceGumDrawArray(webgl_ge_primitive(mode),
                 GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
                     | GU_TRANSFORM_3D,
@@ -2913,7 +3240,8 @@ static bool webgl_render_ge(DomBridge *bridge,
                            sizeof(instance_matrix));
                     WebglGeVertex *instance_vertices = draw_vertices
                         + (draw.instance_color.source != NULL
-                            ? (size_t) instance * ge_count : 0u);
+                            ? (size_t) instance_slices[instance] * ge_count
+                            : 0u);
                     const uint16_t *edges = edge_indices
                         + edge_index_cursor;
                     if (temporal_command
@@ -2990,7 +3318,7 @@ static bool webgl_render_ge(DomBridge *bridge,
             }
         }
         sceGuDisable(GU_LINE_SMOOTH);
-        vertex_cursor += ge_count * vertex_copies;
+        vertex_cursor += ge_count * colored_slices;
     }
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
     uint64_t finalize_started =
@@ -3117,6 +3445,18 @@ static bool webgl_render_ge(DomBridge *bridge,
     return true;
 }
 #endif
+
+bool script_runtime_webgl_native_counters(ScriptWebglNativeMetrics *metrics)
+{
+    if (metrics == NULL) return false;
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+    *metrics = webgl_native_metrics;
+    return true;
+#else
+    memset(metrics, 0, sizeof(*metrics));
+    return false;
+#endif
+}
 
 bool script_runtime_webgl_native_metrics(ScriptWebglNativeMetrics *metrics)
 {
@@ -3368,7 +3708,11 @@ JSValue js_webgl_combine_matrix4(JSContext *context,
     return JS_NewBool(context, valid);
 }
 
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+static JSValue webgl_render_cpu_body(JSContext *context, JSValueConst this_value,
+#else
 JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
+#endif
                         int argc, JSValueConst *argv)
 {
     (void) this_value;
@@ -3496,6 +3840,19 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
         bridge, node, prepared == IMAGE_CANVAS_COMMIT_UPDATED);
     return JS_NewInt32(context, 1);
 }
+
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
+                        int argc, JSValueConst *argv)
+{
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_WEBGL);
+    JSValue result = webgl_render_cpu_body(context, this_value, argc, argv);
+    js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_WEBGL);
+    return result;
+}
+#endif
 
 JSValue js_webgl_snapshot(JSContext *context, JSValueConst this_value,
                           int argc, JSValueConst *argv)

@@ -1,0 +1,38 @@
+# Real page-controls input, with killcam enabled and phase clocks disabled.
+# Navigation: Quick Match -> Deploy (Survival setup as selected by the
+# companion), not the campaign behind the autofocused Continue button.
+wait-live 300
+mark-page configure
+# The title menu autofocuses Continue (Start campaign). Quick Match sits
+# below it and opens the setup panel with Deploy (#play) focused; the
+# companion checks that focus before Deploy is pressed.
+tap-page down
+wait-live 30
+tap-page cross
+wait-live 150
+mark-page quick-match
+tap-page cross
+# Long enough for the arena to settle, short enough that an idle player is
+# not destroyed (killcam) before the heavy wave is configured.
+wait-live 300
+mark-page heavy-setup
+wait-live 60
+mark-page webgl-measure-start
+stick-live 90 right
+hold-live 45 triangle+rtrigger
+stick-live 90 up
+tap-live up
+hold-live 45 square+rtrigger
+stick-live 90 left
+tap-live ltrigger
+tap-live down
+hold-live 45 cross+rtrigger
+stick-live 90 down
+hold-live 45 circle+rtrigger
+mark-page webgl-measure-end
+wait-live 20
+mark-page post-play
+mark-live treadline-actions
+hold-live 45 start+select
+wait-live 20
+end

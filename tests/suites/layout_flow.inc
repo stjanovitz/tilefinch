@@ -487,6 +487,108 @@ static int test_scroll_scene_coordinate_containment(Budget *budget)
     CHECK(budget->current == 0);
     return 0;
 }
+/* A stuck sticky bar with no background of its own must not show its own
+   static-position copy scrolling beneath it. xe.com's sticky header (whose
+   gradient does not paint) showed a second "Currency converter" link once
+   inline backgrounds painted: the tiles held the bar at its static
+   position and the sticky pass painted it again, offset, on top. */
+static int test_transparent_sticky_bar_has_no_ghost(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;background:#ffffff}"
+        ".before{height:40px}.bar{position:sticky;top:0}"
+        "header{height:72px}nav{overflow:auto;height:40px}"
+        "ul{display:flex;margin:0;padding:0;list-style:none}"
+        "a{padding:8px 16px;background:#04249e;color:#ffffff}"
+        ".after{height:1000px;background:#224466}</style><body>"
+        "<div class=before></div><div class=bar><header></header><nav><ul>"
+        "<li><a href=/c>Currency converter</a></li></ul></nav></div>"
+        "<div class=after></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 34u)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                          480));
+    frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    const uint16_t link = test_rgb565(0x04249e);
+    const uint16_t page_white = test_rgb565(0xffffff);
+    /* The bar starts at y 40 and its link's padding box covers y 64..99 of
+       the bar: 104..139 on the page. */
+    CHECK(layout.sticky_count == 1u
+          && layout.sticky_ranges[0].origin_y == 40
+          && frame != NULL
+          && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          /* Not yet stuck: the bar paints where it is in the flow. */
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+          && frame[122u * 480u + 6u] == link
+          && frame[30u * 480u + 6u] == page_white
+          /* Stuck 60 px down: the link sits at 82 on screen, and its
+             static position (22 on screen) shows the page beneath the
+             transparent bar, not a second link. */
+          && tile_cache_render_frame(&cache, 100, 480, 272, NULL)
+          && frame[82u * 480u + 6u] == link
+          && frame[22u * 480u + 6u] == page_white
+          /* The same frame again from resident tiles. */
+          && tile_cache_render_frame(&cache, 100, 480, 272, NULL)
+          && frame[22u * 480u + 6u] == page_white
+          && frame[82u * 480u + 6u] == link);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* position:sticky with top:auto never sticks vertically (CSS Positioned
+   Layout 3, 3.4). washingtonpost.com makes its whole <main> sticky with no
+   inset; treated as top:0 it stuck under the header and every page press
+   showed the same screen. */
+static int test_sticky_without_top_stays_in_flow(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;background:#ffffff}"
+        "header{position:sticky;top:0;height:40px;background:#cc0000}"
+        "main{position:sticky}.gap{height:460px}"
+        ".mark{height:40px;background:#224466}.rest{height:2000px}"
+        "</style><body><header></header><main><div class=gap></div>"
+        "<div class=mark></div><div class=rest></div></main></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 34u)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                          480));
+    frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    /* Only the header sticks; the marker (page y 500..539) scrolls with
+       the page: on screen at 200..239 when scrolled 300. */
+    CHECK(layout.sticky_count == 1u
+          && layout.sticky_ranges[0].origin_y == 0
+          && frame != NULL
+          && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 300, 480, 272, NULL)
+          && frame[20u * 480u + 10u] == test_rgb565(0xcc0000)
+          && frame[220u * 480u + 10u] == test_rgb565(0x224466)
+          && frame[100u * 480u + 10u] == test_rgb565(0xffffff));
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_inline_replaced_box_model(Budget *budget)
 {
     static const char page[] =
@@ -514,30 +616,42 @@ static int test_inline_replaced_box_model(Budget *budget)
           && layout_build(&layout, budget, &document, &sheet,
                           NULL, &images, 480));
     const DrawCommand *painted_image = NULL;
-    bool background = false, top = false, bottom = false;
-    bool left = false, right = false;
     for (size_t i = 0; i < layout.count; i++) {
         const DrawCommand *command = &layout.commands[i];
         if (command->type == DRAW_IMAGE && command->image == &item) {
             painted_image = command;
-        } else if (command->type == DRAW_FILL_RECT
+        }
+    }
+    CHECK(painted_image != NULL);
+    /* The whole 8px margin box (border, padding, background, image) sits
+       on the line baseline beside TAIL (CSS 2.1 10.8.1), so every part
+       moves down by the same amount. */
+    int dy = painted_image->y - 3;
+    const LayoutNodeBox *image_box = layout_box_for_node(&layout,
+                                                         image_node);
+    CHECK(dy > 0 && image_box != NULL && image_box->y == dy);
+    bool background = false, top = false, bottom = false;
+    bool left = false, right = false;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type == DRAW_FILL_RECT
                    && command->color == 0x112233) {
-            background = command->x == 5 && command->y == 2
+            background = command->x == 5 && command->y == 2 + dy
                          && command->width == 6 && command->height == 4;
         } else if (command->type == DRAW_FILL_RECT
                    && command->color == 0xaabbcc) {
-            top |= command->x == 3 && command->y == 0
+            top |= command->x == 3 && command->y == dy
                    && command->width == 10 && command->height == 2;
-            bottom |= command->x == 3 && command->y == 6
+            bottom |= command->x == 3 && command->y == 6 + dy
                       && command->width == 10 && command->height == 2;
-            left |= command->x == 3 && command->y == 0
+            left |= command->x == 3 && command->y == dy
                     && command->width == 2 && command->height == 8;
-            right |= command->x == 11 && command->y == 0
+            right |= command->x == 11 && command->y == dy
                      && command->width == 2 && command->height == 8;
         }
     }
-    CHECK(painted_image != NULL && painted_image->x == 6
-          && painted_image->y == 3 && painted_image->width == 4
+    CHECK(painted_image->x == 6
+          && painted_image->width == 4
           && painted_image->height == 2 && background
           && top && bottom && left && right
           && command_x(&layout, "TAIL") == 18);
@@ -890,6 +1004,73 @@ static int test_width_only_failed_image_in_flex_shows_alt(Budget *budget)
     return 0;
 }
 
+/* BBC cards: an <img style="width:100%;aspect-ratio:16/9"> inside a
+   line-height:0 wrapper measured 208x0 before its pixels arrived, and its
+   alt text flowed with a zero line height so every wrapped line painted on
+   top of the first. An unloaded image whose size follows from one specified
+   dimension and a ratio (CSS aspect-ratio, else width/height attributes)
+   reserves that box; alt text without a box never overlaps itself. */
+static int test_unloaded_image_reserves_ratio_box(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        ".wrap{line-height:0;width:300px}"
+        "#ratio{width:100%;aspect-ratio:16/9}"
+        "#attrs{max-width:100%;height:auto}"
+        "#block{display:block;width:200px;aspect-ratio:2/1}"
+        "</style><body>"
+        "<div class=wrap><img id=ratio src=/a.jpg alt='Ratio alt'></div>"
+        "<div class=wrap><img id=attrs width=640 height=360 src=/b.jpg "
+        "alt='Attribute alt'></div>"
+        "<img id=block src=/c.jpg alt='Block alt'>"
+        "<div class=wrap><img id=bare src=/d.jpg alt='one two three four "
+        "five six seven eight nine ten eleven twelve thirteen fourteen "
+        "fifteen sixteen seventeen eighteen nineteen twenty'></div>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1, 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *ratio = layout_box_for_node(
+        &layout, find_id(root, "ratio"));
+    const LayoutNodeBox *attrs = layout_box_for_node(
+        &layout, find_id(root, "attrs"));
+    const LayoutNodeBox *block = layout_box_for_node(
+        &layout, find_id(root, "block"));
+    CHECK(ratio != NULL && ratio->width == 300 && ratio->height == 168);
+    CHECK(attrs != NULL && attrs->width == 300 && attrs->height == 168);
+    CHECK(block != NULL && block->width == 200 && block->height == 100);
+    size_t alt_length = 0;
+    const char *alt = document_attribute(
+        find_id(root, "bare"), "alt", &alt_length);
+    int previous_y = INT_MIN, previous_height = 0, lines = 0;
+    bool overlap = false;
+    for (size_t i = 0; alt != NULL && i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_TEXT || command->text < alt
+            || command->text >= alt + alt_length) continue;
+        if (command->y != previous_y) {
+            if (previous_y != INT_MIN
+                && command->y < previous_y + previous_height) {
+                overlap = true;
+            }
+            previous_y = command->y;
+            previous_height = command->height;
+            lines++;
+        }
+    }
+    CHECK(lines >= 3 && !overlap);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static bool layout_command_equivalent(const DrawCommand *left,
                                       const DrawCommand *right)
 {
@@ -904,6 +1085,69 @@ static bool layout_command_equivalent(const DrawCommand *left,
     return left->text_length == 0
         || (left->text != NULL && right->text != NULL
             && memcmp(left->text, right->text, left->text_length) == 0);
+}
+
+/* A long wrapping flex list (a front page's card stack): a load preview
+   lays out the lines down to its depth limit and stops, instead of
+   measuring and laying out every card; the lines it does lay out match the
+   complete layout's exactly, and the complete layout is unchanged. */
+static int test_wrapped_flex_preview_stops_at_limit(Budget *budget)
+{
+    char page[24000];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><style>html,body{margin:0}"
+        ".stack{display:flex;flex-wrap:wrap;justify-content:space-between}"
+        ".card{width:100%%;padding:4px}.card b{display:block;height:40px}"
+        "</style><body><div class=stack>");
+    for (int i = 0; i < 60 && used < sizeof(page) - 200; i++) {
+        used += (size_t) snprintf(
+            page + used, sizeof(page) - used,
+            "<div class=card id=c%d><b>Card %d</b><p>Words in card %d "
+            "<span>with</span> <em>inline</em> runs.</p></div>",
+            i, i, i);
+    }
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div><p>after</p></body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument preview = {0}, complete = {0};
+    ViewportContext viewport = {0};
+    CHECK(document_parse(&document, budget, page, used, 24)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && viewport_context_init(&viewport, 480, 272, 480, 272));
+    bool truncated = false;
+    CHECK(layout_build_context_preview(
+              &preview, budget, &document, &sheet, NULL, NULL,
+              &viewport, NULL, 408, &truncated)
+          && truncated);
+    bool complete_truncated = true;
+    CHECK(layout_build_context_preview(
+              &complete, budget, &document, &sheet, NULL, NULL,
+              &viewport, NULL, INT_MAX, &complete_truncated)
+          && !complete_truncated);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    /* The first cards are laid out exactly as in the complete layout; the
+       ones well past the limit are not laid out at all. */
+    for (int i = 0; i < 3; i++) {
+        char id[8];
+        snprintf(id, sizeof(id), "c%d", i);
+        const LayoutNodeBox *a = layout_box_for_node(
+            &preview, find_id(root, id));
+        const LayoutNodeBox *b = layout_box_for_node(
+            &complete, find_id(root, id));
+        CHECK(a != NULL && b != NULL && a->x == b->x && a->y == b->y
+              && a->width == b->width && a->height == b->height);
+    }
+    CHECK(layout_box_for_node(&preview, find_id(root, "c20")) == NULL
+          && layout_box_for_node(&complete, find_id(root, "c20")) != NULL
+          && preview.performance.style_resolutions
+                 < complete.performance.style_resolutions / 4);
+    layout_destroy(&preview);
+    layout_destroy(&complete);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return 0;
 }
 
 static int test_resumable_authoritative_layout(Budget *budget)

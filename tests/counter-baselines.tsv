@@ -4,9 +4,9 @@ demo	document.attributes	9
 demo	document.elements	34
 demo	document.nodes	99
 demo	document.text-nodes	63
-demo	layout.commands	271
+demo	layout.commands	272
 demo	layout.fixed	0
-demo	layout.height	1081
+demo	layout.height	1097
 demo	layout.links	0
 demo	layout.scroll-width	980
 demo	layout.sticky	0
@@ -28,7 +28,7 @@ demo	stylesheet.layers	0
 demo	stylesheet.rules	7
 demo	stylesheet.scoped-variables	0
 demo	stylesheet.variables	0
-demo	tiles.candidates	2694
+demo	tiles.candidates	2769
 demo	tiles.evictions	16
 demo	tiles.glyph-evictions	0
 demo	tiles.glyph-misses	89

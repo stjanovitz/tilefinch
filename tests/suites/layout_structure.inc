@@ -499,6 +499,117 @@ static int test_bounded_container_queries(Budget *budget)
     return 0;
 }
 
+/* Container queries in one pass: containers record their content box as
+   layout reaches them, the pass logs every query it evaluates, and when the
+   measured geometry confirms them all the measured rebuild is skipped. The
+   result must equal the probe-and-rebuild exactly. Pseudo-elements inside
+   @container rules run nested resolutions (which save and restore the
+   resolve scratch), and a nested container answers to the inner box. */
+static bool container_layouts_equal(const LayoutDocument *a,
+                                    const LayoutDocument *b)
+{
+    if (a->count != b->count || a->height != b->height
+        || a->node_box_count != b->node_box_count) return false;
+    for (size_t i = 0; i < a->count; i++) {
+        const DrawCommand *x = &a->commands[i], *y = &b->commands[i];
+        if (x->type != y->type || x->x != y->x || x->y != y->y
+            || x->width != y->width || x->height != y->height
+            || x->color != y->color || x->text_length != y->text_length
+            || (x->text_length != 0
+                && memcmp(x->text, y->text, x->text_length) != 0))
+            return false;
+    }
+    for (size_t i = 0; i < a->node_box_count; i++) {
+        const LayoutNodeBox *x = &a->node_boxes[i], *y = &b->node_boxes[i];
+        if (x->x != y->x || x->y != y->y || x->width != y->width
+            || x->height != y->height) return false;
+    }
+    return true;
+}
+
+static int container_one_pass_compare(Budget *budget, const char *page,
+                                      size_t expected_passes)
+{
+    PocDocument documents[2] = {{0}};
+    Stylesheet sheets[2] = {{0}};
+    LayoutDocument layouts[2] = {{0}};
+    int narrow[2] = {0}, wide[2] = {0};
+    for (size_t run = 0; run < 2; run++) {
+        /* Run 0 logs; run 1 is the probe-and-rebuild it replaces. */
+        if (run == 0) unsetenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG");
+        else setenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG", "1", 1);
+        CHECK(document_parse(&documents[run], budget, page, strlen(page),
+                             33 + (unsigned) run)
+              && stylesheet_build(&sheets[run], budget, &documents[run], 480)
+              && stylesheet_has_container_queries(&sheets[run])
+              && layout_build(&layouts[run], budget, &documents[run],
+                              &sheets[run], NULL, NULL, 480));
+        unsetenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG");
+        lxb_dom_node_t *root = lxb_dom_interface_node(documents[run].html);
+        const LayoutNodeBox *narrow_box = layout_box_for_node(
+            &layouts[run], find_id(root, "narrow-t"));
+        const LayoutNodeBox *wide_box = layout_box_for_node(
+            &layouts[run], find_id(root, "wide-t"));
+        CHECK(narrow_box != NULL && wide_box != NULL);
+        narrow[run] = narrow_box->height;
+        wide[run] = wide_box->height;
+    }
+    /* The queries applied: a narrow card's title is 30px tall, a wide
+       one's 12px. */
+    CHECK(narrow[0] == 30 && wide[0] == 12
+          && narrow[1] == 30 && wide[1] == 12);
+    CHECK(layouts[0].performance.resumable_passes == expected_passes
+          && layouts[1].performance.resumable_passes == 2
+          && container_layouts_equal(&layouts[0], &layouts[1]));
+    for (size_t run = 0; run < 2; run++) {
+        layout_destroy(&layouts[run]);
+        stylesheet_destroy(&sheets[run]);
+        document_destroy(&documents[run]);
+    }
+    return 0;
+}
+
+static int test_container_queries_one_pass(Budget *budget)
+{
+    size_t baseline = budget->current;
+#define CONTAINER_ONE_PASS_STYLE \
+        "<!doctype html><style>body{margin:0}" \
+        ".card{container:card / inline-size;box-sizing:border-box;" \
+        "padding:4px}" \
+        ".wide{width:300px}.narrow{width:120px}" \
+        ".row{display:flex}.row>.card{flex:1 1 0}" \
+        ".t{height:10px;background:#111}" \
+        ".t::before{content:'x'}" \
+        "@container card (width < 200px){.t{height:30px;background:#222}" \
+        " .t::before{content:'narrow'}}" \
+        "@container card (width >= 200px){.t{height:12px}.x{display:none}}" \
+        "</style>"
+    /* Block containers, a nested one, and pseudo-elements inside the
+       rules: every query is answered after its container's box is known,
+       so the pass is verified and the rebuild skipped. */
+    static const char blocks[] = CONTAINER_ONE_PASS_STYLE
+        "<div class='card wide'><div class=t id=wide-t></div>"
+        "<div class=x>wide only</div></div>"
+        "<div class='card narrow'><div class=t id=narrow-t></div>"
+        "<div class=x>shown</div></div>"
+        "<div class='card wide'><div class='card narrow'>"
+        "<div class=t></div><div class=x>inner</div></div></div>";
+    CHECK(container_one_pass_compare(budget, blocks, 1) == 0);
+    /* Flex items are measured (their contents styled) before the item's
+       box is final: the pass cannot be verified and is rebuilt, exactly
+       as before. */
+    static const char flex[] = CONTAINER_ONE_PASS_STYLE
+        "<div class='card wide'><div class=t id=wide-t></div></div>"
+        "<div class='card narrow'><div class=t id=narrow-t></div></div>"
+        "<div class=row><div class=card><div class=t></div></div>"
+        "<div class=card><div class=t></div></div>"
+        "<div class=card><div class=t></div></div></div>";
+    CHECK(container_one_pass_compare(budget, flex, 2) == 0);
+#undef CONTAINER_ONE_PASS_STYLE
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_bounded_multicolumn_blocks(Budget *budget)
 {
     size_t baseline = budget->current;
@@ -913,6 +1024,49 @@ static int test_international_line_flow(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
 
+    /* Front pages ship RTL variants of their components ([dir=rtl] .x
+       {direction:rtl}) and var()-deferred flex-direction declarations.
+       Neither can change direction in a document without dir="rtl", so
+       the sheet still prepares bidi once and no paragraph is scanned; a
+       substring test took flex-direction for direction, and more than
+       eight such rules had disabled the preparation for every flow. */
+    static const char variants_page[] =
+        "<!doctype html><style>"
+        "[dir=rtl] .a1{direction:rtl}[dir=rtl] .a2{direction:rtl}"
+        "[dir=rtl] .a3{direction:rtl}[dir='rtl'] .a4{direction:rtl}"
+        "[dir=\"rtl\"] .a5{direction:rtl}[dir=rtl i] .a6{direction:rtl}"
+        "[ dir = rtl ] .a7{direction:rtl}body[dir=rtl] .a8{direction:rtl}"
+        "[dir=rtl].a9{direction:rtl}"
+        ".f1{flex-direction:var(--d1,row)}.f2{flex-direction:var(--d2,row)}"
+        ".f3{color:var(--c);flex-direction:column}"
+        ":not([dir=rtl]) .never{direction:rtl}"
+        "</style><div class='a1 f1 f3'><p>left text</p></div>"
+        "<div class=f2><p>more text</p></div>";
+    CHECK(document_parse(
+              &document, budget, variants_page,
+              sizeof(variants_page) - 1u, 448)
+          && !document.bidi_text_present
+          && !document.bidi_markup_present
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && sheet.has_bidi_declarations);
+    size_t direction_rules[16];
+    size_t direction_count = 0;
+    /* Only the :not() rule remains a candidate without dir markup; all
+       ten [dir=rtl] rules count when markup could be present. */
+    CHECK(stylesheet_direction_change_rules(
+              &sheet, true, direction_rules, 16, &direction_count)
+          && direction_count == 1
+          && stylesheet_direction_change_rules(
+              &sheet, false, direction_rules, 16, &direction_count)
+          && direction_count == 10
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_subtree_scans == 0
+          && layout.performance.bidi_paragraphs == 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
     /* RTL text in one paragraph must not send every other paragraph through
        the scan, yet an RTL rule that matches an element anywhere keeps the
        conservative per-paragraph scan (the second page's ASCII paragraph
@@ -1132,6 +1286,66 @@ static int test_font_publication_preserves_retained_tail(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == 0);
+    return 0;
+}
+
+/* A reuse cache bound to a sheet derives selector facts from every
+   selector (an 11,700-rule front page: 7 ms host, 0.8 s PSP). A second
+   cache bound to the same sheet generation restores them instead, with
+   identical facts; a rebuilt sheet (new generation) scans again. */
+static int test_reuse_selector_facts_memo(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>"
+        ".a:has(.b){color:red}.c:empty+.d{color:red}"
+        "input:checked~label{color:red}.e:focus+.f{color:red}"
+        "li:nth-child(2n){color:red}.g ~ .h{color:red}"
+        ".plain{color:blue}"
+        "</style><div class=a><span class=b></span></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 49)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    LayoutReuseCache *first = layout_reuse_cache_create(budget);
+    LayoutReuseCache *second = layout_reuse_cache_create(budget);
+    CHECK(first != NULL && second != NULL);
+    layout_reuse_cache_prepare(first, &sheet, NULL, NULL, 480);
+    layout_reuse_cache_prepare(second, &sheet, NULL, NULL, 480);
+    CHECK(second->stats.selector_fact_reuses == 1
+          && first->selector_has_has && second->selector_has_has
+          && first->selector_has_empty == second->selector_has_empty
+          && first->selector_has_empty
+          && first->empty_key_count == second->empty_key_count
+          && memcmp(first->empty_keys, second->empty_keys,
+                    sizeof(first->empty_keys)) == 0
+          && first->empty_any == second->empty_any
+          && first->state_rule_count == second->state_rule_count
+          && first->state_rule_count != 0
+          && memcmp(first->state_rules, second->state_rules,
+                    first->state_rule_count
+                        * sizeof(first->state_rules[0])) == 0
+          && first->state_rules_bounded == second->state_rules_bounded
+          && first->selector_focus_has_sibling
+          && second->selector_focus_has_sibling
+          && first->selector_has_structure
+          && second->selector_has_structure
+          && memcmp(&first->structure, &second->structure,
+                    sizeof(first->structure)) == 0);
+    /* A reset rebinds through the memo too. */
+    layout_reuse_cache_reset(second);
+    layout_reuse_cache_prepare(second, &sheet, NULL, NULL, 480);
+    CHECK(second->stats.selector_fact_reuses == 2
+          && second->selector_has_has);
+    /* A rebuilt sheet is a new generation: scanned afresh. */
+    stylesheet_destroy(&sheet);
+    memset(&sheet, 0, sizeof(sheet));
+    CHECK(stylesheet_build(&sheet, budget, &document, 480));
+    layout_reuse_cache_prepare(first, &sheet, NULL, NULL, 480);
+    CHECK(first->stats.selector_fact_reuses == 0 && first->selector_has_has);
+    layout_reuse_cache_destroy(first);
+    layout_reuse_cache_destroy(second);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
     return 0;
 }
 
@@ -1756,6 +1970,114 @@ static int test_css_table_implicit_row(Budget *budget)
     CHECK(budget->current == 0);
     return 0;
 }
+/* A display:table element whose cells are its own children (an implicit
+   anonymous row) is shrink-to-fit: its used width comes from the cells'
+   max-content widths, capped at the available width, plus its padding.
+   Padding used to become the whole width when no explicit row existed,
+   wrapping a long cell one word per line. */
+static int test_css_table_anonymous_row_width(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;padding:0;font-size:16px}"
+        ".box{display:table;margin:0 auto;max-width:620px;padding:24px 12px}"
+        ".cell{display:table-cell;vertical-align:middle}"
+        ".short{display:table}</style>"
+        "<body><div id=box class=box><div id=cell class=cell>"
+        "<p>A sentence long enough that its max-content width is much wider "
+        "than the four hundred and eighty pixel screen it is laid out on.</p>"
+        "</div></div><div id=short class=short><span id=word class=cell>"
+        "Word</span></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *box = layout_box_for_node(
+        &layout, find_id(root, "box"));
+    const LayoutNodeBox *cell = layout_box_for_node(
+        &layout, find_id(root, "cell"));
+    const LayoutNodeBox *shrink = layout_box_for_node(
+        &layout, find_id(root, "short"));
+    const LayoutNodeBox *word = layout_box_for_node(
+        &layout, find_id(root, "word"));
+    if (box != NULL && cell != NULL && shrink != NULL && word != NULL) {
+        fprintf(stderr, "css-table widths: box=%d@%d cell=%d short=%d "
+                "word=%d\n", box->width, box->x, cell->width,
+                shrink->width, word->width);
+    }
+    CHECK(box != NULL && cell != NULL && box->x == 0 && box->width == 480
+          && cell->x == 12 && cell->width == 456
+          && shrink != NULL && word != NULL
+          && word->width > 8 && word->width < 120
+          && shrink->width == word->width);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+/* HTML hides <noscript> only when scripting is enabled. A document parsed
+   with scripting disabled (JavaScript turned off for the page) renders its
+   noscript fallback like any other inline content. */
+static int test_noscript_renders_without_scripting(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}</style><body><p>before</p>"
+        "<noscript><p id=fallback>Continue without JavaScript</p>"
+        "</noscript><p id=after>after</p></body>";
+    for (int scripting = 0; scripting < 2; scripting++) {
+        DocumentParser parser = {0};
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parser_begin(&parser, budget)
+              && document_parser_set_scripting(&parser, scripting != 0)
+              && document_parser_feed(&parser, page, sizeof(page) - 1u)
+              && document_parser_finish(&parser, &document));
+        CHECK(stylesheet_build(&sheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &sheet,
+                              NULL, NULL, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *fallback = find_id(root, "fallback");
+        const LayoutNodeBox *fallback_box = fallback == NULL ? NULL
+            : layout_box_for_node(&layout, fallback);
+        const LayoutNodeBox *after = layout_box_for_node(
+            &layout, find_id(root, "after"));
+        if (scripting == 0) {
+            CHECK(fallback_box != NULL && fallback_box->height > 0
+                  && after != NULL && after->y > fallback_box->y);
+        } else {
+            /* Scripting parses noscript as raw text; nothing renders. */
+            CHECK(fallback == NULL && after != NULL);
+        }
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_parser_abort(&parser);
+        document_destroy(&document);
+    }
+    /* A document built without the streaming parser keeps the old
+       scripting-aware default: noscript stays hidden. */
+    PocDocument plain = {0};
+    Stylesheet plain_sheet = {0};
+    LayoutDocument plain_layout = {0};
+    CHECK(document_parse(&plain, budget, page, sizeof(page) - 1u, 19)
+          && stylesheet_build(&plain_sheet, budget, &plain, 480)
+          && layout_build(&plain_layout, budget, &plain, &plain_sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *hidden = find_id(
+        lxb_dom_interface_node(plain.html), "fallback");
+    const LayoutNodeBox *hidden_box = hidden == NULL ? NULL
+        : layout_box_for_node(&plain_layout, hidden);
+    CHECK(hidden_box == NULL || hidden_box->height == 0);
+    layout_destroy(&plain_layout);
+    stylesheet_destroy(&plain_sheet);
+    document_destroy(&plain);
+    CHECK(budget->current == 0);
+    return 0;
+}
 static int test_padding_scroll_extent(Budget *budget)
 {
     static const char page[] =
@@ -2292,6 +2614,7 @@ static int test_table_and_control_ua_box_models(Budget *budget)
         "<div id=control-line>Long label: <input id=wide-input></div>"
         "<div><input id=size-input size=35>"
         "<input id=search-submit type=submit value=Search></div>"
+        "<div><button id=search-button>Search</button></div>"
         "</body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
@@ -2330,9 +2653,19 @@ static int test_table_and_control_ua_box_models(Budget *budget)
           && label != NULL && input_control != NULL
           && input_control->y > label->y
           && input_control->x == 24 && input_control->width == 432
-          && input_control->height == 22
           && size_control != NULL && size_control->width == 257
-          && submit_control != NULL && submit_control->width == 58);
+          && submit_control != NULL);
+    /* A push button is as wide as a <button> with the same label: its
+       measured text at the 13.33px control font plus 1px 6px padding and
+       2px borders (Chromium: 58.25px). Its content box is one 1.15em line
+       of the control font (21px tall, as in Chromium); the text field keeps
+       its font-size content box (14 + 6). */
+    const LayoutNodeBox *button_box = layout_box_for_node(
+        &layout, find_id(root, "search-button"));
+    CHECK(button_box != NULL
+          && submit_control->width == button_box->width
+          && submit_control->height == 21
+          && input_control->height == 20);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);

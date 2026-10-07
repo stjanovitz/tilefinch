@@ -213,6 +213,68 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
     return true;
 }
 
+/* navigator.sendBeacon() must deliver its body: the size check used to
+   consume the Request's body, so the fetch() that followed rejected and no
+   beacon ever reached the network while sendBeacon() still returned true. */
+static bool test_send_beacon_delivery(Budget *budget, unsigned port)
+{
+    size_t baseline = budget->current;
+    static const char html[] =
+        "<!doctype html><title>Beacon</title><body></body>";
+    PocDocument document = {0};
+    ScriptResult result = {0};
+    char document_url[256];
+    snprintf(document_url, sizeof(document_url),
+             "http://127.0.0.1:%u/page", port);
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17));
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, budget, 4u * MIB, 5000, document_url, &result);
+    CHECK(runtime != NULL && result.success);
+    static const char send_probe[] =
+        "(()=>{const form=new FormData();form.append('field','form-value');"
+        "const sent=[navigator.sendBeacon('/beacon-sink?kind=string',"
+        "'string-body'),navigator.sendBeacon('/beacon-sink?kind=blob',"
+        "new Blob(['blob-body'],{type:'application/x-beacon'})),"
+        "navigator.sendBeacon('/beacon-sink?kind=form',form),"
+        "navigator.sendBeacon('/beacon-sink?kind=params',"
+        "new URLSearchParams('a=1&b=2')),"
+        "navigator.sendBeacon('/beacon-sink?kind=empty'),"
+        "!navigator.sendBeacon('/beacon-sink?kind=large',"
+        "'x'.repeat(65537))];"
+        "globalThis.pocSummary=sent.every(Boolean)?'beacons-queued'"
+        ":'beacons-refused:'+sent.join(',');})()";
+    bool sent = script_runtime_evaluate_diagnostic(
+        runtime, send_probe, "<beacon-send>", &result)
+        && strcmp(result.summary, "beacons-queued") == 0
+        && pump_script_network(runtime, &result);
+    static const char log_probe[] =
+        "(()=>{globalThis.pocSummary='pending';fetch('/beacon-log')"
+        ".then(r=>r.text()).then(text=>{const lines=text.split('\\n<beacon>\\n'),"
+        "has=(prefix,body)=>lines.some(line=>line.startsWith(prefix)"
+        "&&line.includes(body)),checks=["
+        "has('kind=string|text/plain;charset=UTF-8|','string-body'),"
+        "has('kind=blob|application/x-beacon|','blob-body'),"
+        "has('kind=form|multipart/form-data; boundary=','form-value'),"
+        "has('kind=params|application/x-www-form-urlencoded;charset=UTF-8|',"
+        "'a=1&b=2'),lines.some(line=>line.startsWith('kind=empty|')),"
+        "!lines.some(line=>line.startsWith('kind=large|'))];"
+        "globalThis.pocSummary=checks.every(Boolean)?'beacons-delivered'"
+        ":'beacons-missing:'+checks.join(',')+':'+JSON.stringify(text);})"
+        ".catch(error=>globalThis.pocSummary='beacon-log-error:'+error);})()";
+    bool delivered = sent
+        && script_runtime_evaluate_diagnostic(
+            runtime, log_probe, "<beacon-log>", &result)
+        && pump_script_network(runtime, &result)
+        && strcmp(result.summary, "beacons-delivered") == 0;
+    if (!delivered)
+        fprintf(stderr, "beacon delivery sent=%d summary=\"%s\" error=\"%s\"\n",
+                sent, result.summary, result.error);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(delivered && budget->current == baseline);
+    return true;
+}
+
 static bool browser_engine_promoted_shell_is_live(BrowserEngine *engine)
 {
     NavigationSession *navigation = browser_engine_navigation(engine);

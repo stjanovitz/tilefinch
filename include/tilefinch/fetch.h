@@ -399,6 +399,7 @@ typedef struct {
     TilefinchRequestDestination destination;
     bool top_level_navigation;
     bool user_activated;
+    uint8_t csp_grant;
     /* Transport-only options. Authority-bearing fields are ignored and must
        be zero; the builder derives them from security_context. */
     FetchRequest transport;

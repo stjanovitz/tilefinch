@@ -60,6 +60,7 @@ typedef struct {
     size_t reused_connections;
     size_t build_slices;
     size_t transform_quota_overruns;
+    size_t maximum_transform_slice_bytes;
     uint64_t network_us;
     uint64_t build_us;
     uint64_t request_wall_us;

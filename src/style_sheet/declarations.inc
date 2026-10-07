@@ -5,6 +5,13 @@ static uint64_t stylesheet_next_generation(void)
     return stylesheet_generation_sequence;
 }
 
+/* StyleVariableCacheEntry.found. */
+enum {
+    VARIABLE_CACHE_MISS = 0,
+    VARIABLE_CACHE_INLINE = 1,
+    VARIABLE_CACHE_SPILLED = 2
+};
+
 typedef struct {
     lxb_dom_node_t *node;
     uint32_t hash;
@@ -16,17 +23,45 @@ typedef struct {
        declared value referenced): a hit reports them as read too. */
     uint64_t reads;
     char name[STYLE_CUSTOM_NAME_CAPACITY];
-    char value[STYLE_CUSTOM_VALUE_CAPACITY];
+    union {
+        char text[STYLE_CUSTOM_SHORT_VALUE_CAPACITY];
+        /* A longer value's NUL-terminated bytes in the cache's spill. */
+        struct {
+            uint32_t offset;
+            uint32_t length;
+        } spill;
+    } value;
 } StyleVariableCacheEntry;
 
 typedef struct StyleVariableCache {
     Budget *budget;
     StyleVariableCacheEntry *entries;
     size_t capacity;
+    /* STYLE_VARIABLE_CACHE_SPILL_BYTES, allocated by the first long value.
+       Append-only until the table is emptied: an evicted entry's bytes are
+       only reclaimed then. */
+    char *spill;
+    uint32_t spill_used;
     uint32_t clock;
     /* An entry was stored since the table was last emptied. */
     bool stored;
+    bool spill_refused;
 } StyleVariableCache;
+
+static size_t variable_cache_footprint(const StyleVariableCache *cache)
+{
+    return cache == NULL ? 0
+        : sizeof(*cache) + cache->capacity * sizeof(*cache->entries)
+          + (cache->spill == NULL ? 0 : STYLE_VARIABLE_CACHE_SPILL_BYTES);
+}
+
+/* Empties the table, its spill included. */
+static void variable_cache_empty(StyleVariableCache *cache)
+{
+    memset(cache->entries, 0, cache->capacity * sizeof(*cache->entries));
+    cache->spill_used = 0;
+    cache->spill_refused = false;
+}
 
 static size_t variable_cache_capacity(size_t capacity)
 {
@@ -89,6 +124,7 @@ static void variable_cache_destroy(StyleVariableCache *cache)
 {
     if (cache == NULL) return;
     Budget *budget = cache->budget;
+    budget_free(budget, cache->spill);
     budget_free(budget, cache->entries);
     budget_free(budget, cache);
 }
@@ -106,7 +142,7 @@ bool style_variable_cache_begin(Stylesheet *sheet, Budget *budget)
         budget, STYLE_VARIABLE_CACHE_DEFAULT_ENTRIES);
     if (cache == NULL) return false;
     sheet->resolve_scratch->variable_cache = cache;
-    size_t bytes = sizeof(*cache) + cache->capacity * sizeof(*cache->entries);
+    size_t bytes = variable_cache_footprint(cache);
     if (bytes > sheet->variable_cache_peak_bytes) {
         sheet->variable_cache_peak_bytes = bytes;
     }
@@ -141,7 +177,7 @@ void style_variable_cache_lease_clear(StyleVariableCacheLease *lease)
     StyleVariableCache *cache = lease == NULL ? NULL : lease->cache;
     /* An empty table stays empty: mutations between reads cost nothing. */
     if (cache == NULL || !cache->stored) return;
-    memset(cache->entries, 0, cache->capacity * sizeof(*cache->entries));
+    variable_cache_empty(cache);
     cache->clock = 0;
     cache->stored = false;
     lease->clears++;
@@ -149,9 +185,7 @@ void style_variable_cache_lease_clear(StyleVariableCacheLease *lease)
 
 size_t style_variable_cache_lease_bytes(const StyleVariableCacheLease *lease)
 {
-    const StyleVariableCache *cache = lease == NULL ? NULL : lease->cache;
-    return cache == NULL ? 0
-        : sizeof(*cache) + cache->capacity * sizeof(*cache->entries);
+    return variable_cache_footprint(lease == NULL ? NULL : lease->cache);
 }
 
 bool style_variable_cache_attach(Stylesheet *sheet,
@@ -224,15 +258,13 @@ void style_variable_cache_invalidate_node(
      * bounded table is both correct and rare: this is used only while
      * comparing the one active focus marker during a layout snapshot.
      */
-    memset(cache->entries, 0, cache->capacity * sizeof(*cache->entries));
+    variable_cache_empty(cache);
 }
 
 size_t style_variable_cache_bytes(const Stylesheet *sheet)
 {
-    if (sheet == NULL || sheet->resolve_scratch == NULL
-        || sheet->resolve_scratch->variable_cache == NULL) return 0;
-    const StyleVariableCache *cache = sheet->resolve_scratch->variable_cache;
-    return sizeof(*cache) + cache->capacity * sizeof(*cache->entries);
+    if (sheet == NULL || sheet->resolve_scratch == NULL) return 0;
+    return variable_cache_footprint(sheet->resolve_scratch->variable_cache);
 }
 
 bool style_selector_cooperation_begin(
@@ -311,12 +343,12 @@ static void stylesheet_read_trace_environment(Stylesheet *sheet)
 #endif
 }
 
-/* Copies text (NUL-terminated) into the sheet's append-only text arena.
-   Callers bound `length`; stored text never moves before destruction. */
-static const char *stylesheet_store_text(Stylesheet *sheet,
-                                         const char *text, size_t length)
+/* Reserves length + 1 bytes in the sheet's append-only text arena for the
+   caller to fill. Callers bound `length`; stored text never moves before
+   destruction. */
+static char *stylesheet_reserve_text(Stylesheet *sheet, size_t length)
 {
-    if (sheet == NULL || sheet->budget == NULL || text == NULL
+    if (sheet == NULL || sheet->budget == NULL
         || length >= STYLE_SELECTOR_CHUNK_MAX_BYTES) return NULL;
     size_t required = length + 1u;
     StyleTextChunk *chunk = sheet->selector_chunks_tail;
@@ -345,11 +377,34 @@ static const char *stylesheet_store_text(Stylesheet *sheet,
         sheet->selector_storage_bytes += allocation;
     }
     char *stored = chunk->data + chunk->used;
-    memcpy(stored, text, length);
-    stored[length] = '\0';
     chunk->used += required;
     sheet->selector_bytes += required;
     return stored;
+}
+
+/* Copies text (NUL-terminated) into the sheet's text arena. */
+static const char *stylesheet_store_text(Stylesheet *sheet,
+                                         const char *text, size_t length)
+{
+    if (text == NULL) return NULL;
+    char *stored = stylesheet_reserve_text(sheet, length);
+    if (stored == NULL) return NULL;
+    memcpy(stored, text, length);
+    stored[length] = '\0';
+    return stored;
+}
+
+/* Whether a custom-property value of `length` bytes may be stored: within
+   STYLE_CUSTOM_VALUE_CAPACITY and, when long, within what is left of the
+   sheet's STYLE_CUSTOM_LONG_VALUE_BYTES. Charges an admitted long value. */
+static bool stylesheet_admit_custom_value(Stylesheet *sheet, size_t length)
+{
+    if (length >= STYLE_CUSTOM_VALUE_CAPACITY) return false;
+    if (length < STYLE_CUSTOM_SHORT_VALUE_CAPACITY) return true;
+    if (length + 1u > STYLE_CUSTOM_LONG_VALUE_BYTES
+                      - sheet->custom_value_long_bytes) return false;
+    sheet->custom_value_long_bytes += length + 1u;
+    return true;
 }
 
 static const char *stylesheet_store_selector(Stylesheet *sheet,
@@ -361,10 +416,15 @@ static const char *stylesheet_store_selector(Stylesheet *sheet,
 }
 
 
+/* The winning declaration of `name` in the element's style attribute, as
+   a span of the attribute text (stable while the DOM is). A value of
+   `limit` bytes or more is ignored, as an oversized rule value is. */
 static bool inline_variable_value(const Stylesheet *sheet,
                                   lxb_dom_node_t *node, const char *name,
-                                  size_t name_length, char *output,
-                                  size_t output_size, bool *important_output)
+                                  size_t name_length, size_t limit,
+                                  const char **value_output,
+                                  size_t *length_output,
+                                  bool *important_output)
 {
     size_t length = 0;
     const char *text = sheet != NULL && sheet->block_inline_style_attributes
@@ -397,10 +457,10 @@ static bool inline_variable_value(const Stylesheet *sheet,
                 && (custom_property
                     ? memcmp(candidate, name, name_length) == 0
                     : strncasecmp(candidate, name, name_length) == 0)
-                && value_length < output_size
+                && value_length < limit
                 && (!found || important || !found_important)) {
-                memcpy(output, value, value_length);
-                output[value_length] = '\0';
+                *value_output = value;
+                *length_output = value_length;
                 found = true;
                 found_important = important;
             }
@@ -413,7 +473,8 @@ static bool inline_variable_value(const Stylesheet *sheet,
     return found;
 }
 
-static bool custom_rule_later(const StyleCustomRule *candidate,
+static bool custom_rule_later(const Stylesheet *sheet, const lxb_dom_node_t *node,
+                              const StyleCustomRule *candidate,
                               const StyleCustomRule *current)
 {
     if (current == NULL) return true;
@@ -436,13 +497,22 @@ static bool custom_rule_later(const StyleCustomRule *candidate,
     if (candidate->specificity != current->specificity) {
         return candidate->specificity > current->specificity;
     }
-    return candidate->order >= current->order;
+    if (!sheet->adopted_order_varies)
+        return candidate->order >= current->order;
+    uint64_t a = style_adopted_cascade_order(sheet, node, candidate->order >> 8);
+    uint64_t b = style_adopted_cascade_order(sheet, node, current->order >> 8);
+    return a != b ? a > b : candidate->order >= current->order;
 }
 
 struct StyleCustomRuleIndexEntry {
     uint32_t hash;
+    /* The custom rule's index; STYLE_CUSTOM_INDEX_SCOPED marks a rule of a
+       sheet only shadow roots adopt. Within one hash those sort after the
+       others, so a lookup for an element outside every adopting carrier
+       stops at the first. */
     uint32_t index;
 };
+#define STYLE_CUSTOM_INDEX_SCOPED UINT32_C(0x80000000)
 
 static uint32_t custom_rule_name_hash(const char *text, size_t length)
 {
@@ -452,6 +522,169 @@ static uint32_t custom_rule_name_hash(const char *text, size_t length)
         hash *= UINT32_C(16777619);
     }
     return hash == 0 ? UINT32_C(1) : hash;
+}
+
+/* The @property registration of `name`, or NULL. */
+static const StyleRegisteredProperty *stylesheet_registered_property(
+    const Stylesheet *sheet, const char *name, size_t name_length,
+    uint32_t hash)
+{
+    size_t begin = 0, end = sheet->registered_property_count;
+    while (begin < end) {
+        size_t middle = begin + (end - begin) / 2u;
+        if (sheet->registered_properties[middle].hash < hash)
+            begin = middle + 1u;
+        else end = middle;
+    }
+    for (size_t i = begin; i < sheet->registered_property_count
+                           && sheet->registered_properties[i].hash == hash;
+         i++) {
+        const StyleRegisteredProperty *property =
+            &sheet->registered_properties[i];
+        if (property->name_length == name_length
+            && memcmp(property->name, name, name_length) == 0)
+            return property;
+    }
+    return NULL;
+}
+
+/* Records an @property rule: `name` is its prelude, `block` its
+   descriptors. A rule without syntax or inherits, or with a syntax other
+   than "*" and no initial-value, is invalid and ignored; a later valid
+   rule for the same name replaces an earlier one. False only when memory
+   is refused. */
+static bool stylesheet_register_property(Stylesheet *sheet,
+                                         const char *name,
+                                         size_t name_length,
+                                         const char *block,
+                                         size_t block_length)
+{
+    trim(&name, &name_length);
+    if (name_length <= 2 || name_length >= STYLE_CUSTOM_NAME_CAPACITY
+        || name[0] != '-' || name[1] != '-') return true;
+    for (size_t i = 0; i < name_length; i++) {
+        if (isspace((unsigned char) name[i])) return true;
+    }
+    bool has_syntax = false, universal = false, has_inherits = false;
+    bool inherits = false;
+    const char *initial = NULL;
+    size_t initial_length = 0;
+    for (size_t at = 0; at < block_length;) {
+        at = skip_css_space_and_comments(block, block_length, at);
+        if (at >= block_length) break;
+        size_t end = find_declaration_end(block, block_length, at);
+        size_t colon = at;
+        while (colon < end && block[colon] != ':') colon++;
+        if (colon < end) {
+            const char *descriptor = block + at;
+            size_t descriptor_length = colon - at;
+            const char *value = block + colon + 1;
+            size_t value_length = end - colon - 1;
+            trim(&descriptor, &descriptor_length);
+            trim(&value, &value_length);
+            if (span_case_equal(descriptor, descriptor_length, "syntax")
+                && value_length >= 2
+                && (value[0] == '"' || value[0] == '\'')
+                && value[value_length - 1] == value[0]) {
+                const char *syntax = value + 1;
+                size_t syntax_length = value_length - 2;
+                trim(&syntax, &syntax_length);
+                has_syntax = true;
+                universal = syntax_length == 1 && syntax[0] == '*';
+            } else if (span_case_equal(descriptor, descriptor_length,
+                                       "inherits")) {
+                has_inherits = span_case_equal(value, value_length, "true")
+                    || span_case_equal(value, value_length, "false");
+                inherits = span_case_equal(value, value_length, "true");
+            } else if (span_case_equal(descriptor, descriptor_length,
+                                       "initial-value")) {
+                initial = value;
+                initial_length = value_length;
+            }
+        }
+        at = end + (end < block_length);
+    }
+    if (!has_syntax || !has_inherits || (!universal && initial == NULL))
+        return true;
+    uint32_t hash = custom_rule_name_hash(name, name_length);
+    StyleRegisteredProperty *existing = (StyleRegisteredProperty *)
+        stylesheet_registered_property(sheet, name, name_length, hash);
+    if (existing == NULL && sheet->registered_property_count
+                            >= STYLE_REGISTERED_PROPERTY_LIMIT) return true;
+    if (initial != NULL
+        && !stylesheet_admit_custom_value(sheet, initial_length)) {
+        if (sheet->diagnostic_custom_property_drops != UINT64_MAX) {
+            sheet->diagnostic_custom_property_drops++;
+        }
+        return true;
+    }
+    if (existing == NULL
+        && sheet->registered_property_count
+           == sheet->registered_property_capacity) {
+        size_t capacity = sheet->registered_property_capacity == 0
+            ? 16u : sheet->registered_property_capacity * 2u;
+        StyleRegisteredProperty *properties = budget_realloc(
+            sheet->budget, sheet->registered_properties,
+            capacity * sizeof(*properties));
+        if (properties == NULL) return false;
+        sheet->registered_properties = properties;
+        sheet->registered_property_capacity = capacity;
+    }
+    /* One arena string holds "name\0initial\0". */
+    size_t text_length = name_length + 1u
+        + (initial == NULL ? 0 : initial_length);
+    char *text = stylesheet_reserve_text(sheet, text_length);
+    if (text == NULL) return false;
+    memcpy(text, name, name_length);
+    text[name_length] = '\0';
+    if (initial != NULL) memcpy(text + name_length + 1u, initial,
+                                initial_length);
+    text[text_length] = '\0';
+    StyleRegisteredProperty property = {
+        .name = text,
+        .initial_value = initial == NULL ? NULL : text + name_length + 1u,
+        .hash = hash,
+        .initial_length = (uint16_t) initial_length,
+        .name_length = (uint8_t) name_length,
+        .inherits = inherits
+    };
+    if (existing != NULL) {
+        *existing = property;
+        return true;
+    }
+    size_t at = sheet->registered_property_count;
+    while (at != 0 && sheet->registered_properties[at - 1u].hash > hash) at--;
+    memmove(&sheet->registered_properties[at + 1u],
+            &sheet->registered_properties[at],
+            (sheet->registered_property_count - at)
+                * sizeof(*sheet->registered_properties));
+    sheet->registered_properties[at] = property;
+    sheet->registered_property_count++;
+    return true;
+}
+
+/* A registered property's initial value into `output`: false when it has
+   none (the guaranteed-invalid value) or it does not fit. */
+static bool registered_initial_value(const StyleRegisteredProperty *property,
+                                     char *output, size_t output_size)
+{
+    if (property == NULL || property->initial_value == NULL
+        || property->initial_length >= output_size) return false;
+    memcpy(output, property->initial_value, property->initial_length + 1u);
+    return true;
+}
+
+/* A registered property declared `initial` takes its initial value. */
+static void registered_initial_keyword(
+    const StyleRegisteredProperty *property, char *output,
+    size_t output_size)
+{
+    if (property == NULL || property->initial_value == NULL) return;
+    const char *value = output;
+    size_t value_length = strlen(output);
+    trim(&value, &value_length);
+    if (span_case_equal(value, value_length, "initial"))
+        (void) registered_initial_value(property, output, output_size);
 }
 
 static const char *const retained_presentation_names[
@@ -487,6 +720,7 @@ static int compare_custom_rule_index_entries(const void *left,
     const StyleCustomRuleIndexEntry *a = left;
     const StyleCustomRuleIndexEntry *b = right;
     if (a->hash != b->hash) return a->hash < b->hash ? -1 : 1;
+    /* The scoped bit is the top bit: unscoped rules sort first. */
     if (a->index == b->index) return 0;
     return a->index < b->index ? -1 : 1;
 }
@@ -542,11 +776,19 @@ static int variable_cache_lookup(Stylesheet *sheet, lxb_dom_node_t *node,
         TILEFINCH_WORK_ADD(style_variable_cache_hits, 1);
         if (sheet->resolve_scratch->variable_cache_lease != NULL)
             sheet->resolve_scratch->variable_cache_lease->hits++;
-        if (!entry->found) {
+        if (entry->found == VARIABLE_CACHE_MISS) {
             sheet->variable_cache_negative_hits++;
             return 0;
         }
-        style_copy_text(output, output_size, entry->value);
+        if (entry->found == VARIABLE_CACHE_INLINE) {
+            style_copy_text(output, output_size, entry->value.text);
+            return 1;
+        }
+        /* A long value the caller cannot hold is resolved afresh, which
+           reports the same overflow; never truncate it. */
+        if (entry->value.spill.length >= output_size) return -1;
+        memcpy(output, cache->spill + entry->value.spill.offset,
+               entry->value.spill.length + 1u);
         return 1;
     }
     sheet->variable_cache_misses++;
@@ -556,52 +798,97 @@ static int variable_cache_lookup(Stylesheet *sheet, lxb_dom_node_t *node,
     return -1;
 }
 
+/* Copies a long value into the cache's spill: its offset there, or
+   UINT32_MAX when it is not cached (spill full or refused). */
+static uint32_t variable_cache_spill(Stylesheet *sheet,
+                                     StyleVariableCache *cache,
+                                     const char *value, size_t length)
+{
+    if (cache->spill == NULL) {
+        if (cache->spill_refused) return UINT32_MAX;
+        cache->spill = budget_malloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT,
+            STYLE_VARIABLE_CACHE_SPILL_BYTES);
+        if (cache->spill == NULL) {
+            cache->spill_refused = true;
+            return UINT32_MAX;
+        }
+        size_t bytes = variable_cache_footprint(cache);
+        if (bytes > sheet->variable_cache_peak_bytes)
+            sheet->variable_cache_peak_bytes = bytes;
+    }
+    if (length + 1u > STYLE_VARIABLE_CACHE_SPILL_BYTES - cache->spill_used)
+        return UINT32_MAX;
+    uint32_t offset = cache->spill_used;
+    memcpy(cache->spill + offset, value, length + 1u);
+    cache->spill_used += (uint32_t) (length + 1u);
+    return offset;
+}
+
+/* Stores one lookup result for each of `nodes`. A long value is spilled
+   once and shared by every entry: the spill is only ever emptied with the
+   whole table. */
+static void variable_cache_store_nodes(
+    Stylesheet *sheet, lxb_dom_node_t *const *nodes, size_t node_count,
+    const char *name, size_t name_length, uint32_t hash, const char *value)
+{
+    StyleVariableCache *cache = sheet->resolve_scratch->variable_cache;
+    if (cache == NULL || node_count == 0
+        || name_length >= sizeof(cache->entries[0].name)) return;
+    size_t value_length = value == NULL ? 0 : strlen(value);
+    uint32_t spill = UINT32_MAX;
+    if (value_length >= sizeof(cache->entries[0].value.text)) {
+        spill = variable_cache_spill(sheet, cache, value, value_length);
+        if (spill == UINT32_MAX) return;
+    }
+    for (size_t i = 0; i < node_count; i++) {
+        size_t home = variable_cache_home(cache, nodes[i], hash);
+        StyleVariableCacheEntry *target = NULL;
+        uint32_t oldest_age = 0;
+        for (size_t probe = 0; probe < STYLE_VARIABLE_CACHE_PROBES; probe++) {
+            StyleVariableCacheEntry *entry =
+                &cache->entries[(home + probe) & (cache->capacity - 1u)];
+            if (!entry->occupied) {
+                target = entry;
+                break;
+            }
+            uint32_t age = cache->clock - entry->stamp;
+            if (target == NULL || age > oldest_age) {
+                target = entry;
+                oldest_age = age;
+            }
+        }
+        if (target == NULL) continue;
+        if (target->occupied) sheet->variable_cache_evictions++;
+        cache->stored = true;
+        *target = (StyleVariableCacheEntry) {
+            .node = nodes[i],
+            .hash = hash,
+            .stamp = ++cache->clock,
+            .name_length = (uint16_t) name_length,
+            .occupied = 1,
+            .found = value == NULL ? VARIABLE_CACHE_MISS
+                : spill != UINT32_MAX ? VARIABLE_CACHE_SPILLED
+                : VARIABLE_CACHE_INLINE,
+            .reads = sheet->variable_read_names
+        };
+        memcpy(target->name, name, name_length);
+        target->name[name_length] = '\0';
+        if (spill != UINT32_MAX) {
+            target->value.spill.offset = spill;
+            target->value.spill.length = (uint32_t) value_length;
+        } else if (value != NULL) {
+            memcpy(target->value.text, value, value_length + 1u);
+        }
+    }
+}
+
 static void variable_cache_store(Stylesheet *sheet, lxb_dom_node_t *node,
                                  const char *name, size_t name_length,
                                  uint32_t hash, const char *value)
 {
-    StyleVariableCache *cache = sheet->resolve_scratch->variable_cache;
-    if (cache == NULL || name_length >= sizeof(cache->entries[0].name)) return;
-    /* Long inline custom-property values remain owned by the DOM attribute.
-       Never truncate one into the compact cache: a later var() lookup would
-       observe a syntactically plausible but invalid URL. Re-reading the rare
-       long value is cheaper than enlarging every cache entry on the PSP. */
-    if (value != NULL && strlen(value) >= sizeof(cache->entries[0].value)) {
-        return;
-    }
-    size_t home = variable_cache_home(cache, node, hash);
-    StyleVariableCacheEntry *target = NULL;
-    uint32_t oldest_age = 0;
-    for (size_t probe = 0; probe < STYLE_VARIABLE_CACHE_PROBES; probe++) {
-        StyleVariableCacheEntry *entry =
-            &cache->entries[(home + probe) & (cache->capacity - 1u)];
-        if (!entry->occupied) {
-            target = entry;
-            break;
-        }
-        uint32_t age = cache->clock - entry->stamp;
-        if (target == NULL || age > oldest_age) {
-            target = entry;
-            oldest_age = age;
-        }
-    }
-    if (target == NULL) return;
-    if (target->occupied) sheet->variable_cache_evictions++;
-    cache->stored = true;
-    *target = (StyleVariableCacheEntry) {
-        .node = node,
-        .hash = hash,
-        .stamp = ++cache->clock,
-        .name_length = (uint16_t) name_length,
-        .occupied = 1,
-        .found = value != NULL,
-        .reads = sheet->variable_read_names
-    };
-    memcpy(target->name, name, name_length);
-    target->name[name_length] = '\0';
-    if (value != NULL) {
-        style_copy_text(target->value, sizeof(target->value), value);
-    }
+    variable_cache_store_nodes(sheet, &node, 1, name, name_length, hash,
+                               value);
 }
 
 static bool retained_rule_fast_matches(const Stylesheet *sheet,
@@ -671,11 +958,15 @@ static const StyleCustomRule *custom_rule_winner(
         : 0;
     size_t end = sheet->custom_rule_index_ready
         ? sheet->custom_rule_index_count : sheet->custom_rule_count;
+    bool outside = style_subject_outside_custom_scopes(sheet, subject);
     for (size_t i = first; i < end; i++) {
         size_t rule_index = i;
         if (sheet->custom_rule_index_ready) {
-            if (sheet->custom_rule_index[i].hash != hash) break;
-            rule_index = sheet->custom_rule_index[i].index;
+            uint32_t entry = sheet->custom_rule_index[i].index;
+            if (sheet->custom_rule_index[i].hash != hash
+                || (outside && (entry & STYLE_CUSTOM_INDEX_SCOPED) != 0))
+                break;
+            rule_index = entry & ~STYLE_CUSTOM_INDEX_SCOPED;
         }
         if (candidates != NULL) (*candidates)++;
         const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
@@ -685,17 +976,22 @@ static const StyleCustomRule *custom_rule_winner(
             || rule->name_length != name_length
             || memcmp(rule->name, name, name_length) != 0
             || !retained_rule_fast_matches(sheet, rule, subject)
+            || !style_adopted_rule_in_scope(
+                   sheet, rule->order >> 8, rule->selector,
+                   rule->selector_length, node, subject)
             || !style_selector_matches_profiled(
                 sheet, node, rule->selector, rule->selector_length)) continue;
-        if (custom_rule_later(rule, winner)) winner = rule;
+        if (custom_rule_later(sheet, node, rule, winner)) winner = rule;
     }
     return winner;
 }
 
+/* The declared value of custom property `name` that wins on the element
+   itself, as a span of stylesheet arena or style attribute text. */
 static bool local_variable_value(
     Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement wanted_pseudo,
     const char *name, size_t name_length, uint32_t hash,
-    char *output, size_t output_size)
+    const char **value, size_t *value_length)
 {
     StyleMatchSubject subject = {0};
     style_match_subject_prepare(node, &subject);
@@ -710,30 +1006,21 @@ static bool local_variable_value(
     bool inline_wins = false;
     bool inline_found = wanted_pseudo == PSEUDO_NONE
         && inline_variable_value(
-            sheet, node, name, name_length, output,
-            output_size, &inline_important);
+            sheet, node, name, name_length, STYLE_CUSTOM_VALUE_CAPACITY,
+            value, value_length, &inline_important);
     if (inline_found) {
         inline_rule.important = inline_important;
         inline_rule.origin = 0;
         inline_rule.layer = UINT_MAX;
         inline_rule.specificity = UINT_MAX;
         inline_rule.order = UINT_MAX;
-        inline_wins = custom_rule_later(&inline_rule, winner);
+        inline_wins = custom_rule_later(sheet, node, &inline_rule, winner);
     }
     if (inline_wins) return true;
     if (winner == NULL) return false;
-    style_copy_text(output, output_size, winner->value);
+    *value = winner->value;
+    *value_length = strlen(winner->value);
     return true;
-}
-
-static void variable_cache_store_nodes(
-    Stylesheet *sheet, lxb_dom_node_t *const *nodes, size_t node_count,
-    const char *name, size_t name_length, uint32_t hash, const char *value)
-{
-    for (size_t i = 0; i < node_count; i++) {
-        variable_cache_store(
-            sheet, nodes[i], name, name_length, hash, value);
-    }
 }
 
 bool style_resolve_value(const Stylesheet *sheet, const char *text,
@@ -746,27 +1033,65 @@ bool style_resolve_value(const Stylesheet *sheet, const char *text,
    leak in: chatgpt.com's :root colours built from lightningcss's
    --lightningcss-light/-dark toggles came out in the wrong scheme under
    any element that re-declared a toggle. Bounded against reference
-   cycles; an unresolvable value is kept raw (the former behaviour). */
-static void variable_resolve_at_declaration(
-    Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
-    char *value, size_t value_size)
+   cycles; an unresolvable value is kept raw (the former behaviour).
+
+   The declarations being resolved are recorded so that a nested lookup of
+   one of them is recognised as a reference cycle, which makes it invalid
+   (CSS Variables 1, section 2.3). Merely letting the nesting bound stop a
+   cycle re-resolved it at every level of both recursions, rescanning the
+   inline style each time (a two-property cycle in style="" cost over a
+   thousand lookups per use). The record lives in the sheet's resolve
+   scratch, beside resolution_node, so it is scoped exactly like the
+   resolution itself (the former nesting counter was process-global). */
+static bool variable_resolving_contains(const StyleResolveScratch *scratch,
+                                        const lxb_dom_node_t *node,
+                                        PseudoElement pseudo,
+                                        const char *name, size_t name_length)
 {
-    static unsigned active;
-    if (strstr(value, "var(") == NULL || active >= 4u) return;
+    for (unsigned i = 0; i < scratch->variable_resolving_count; i++) {
+        if (scratch->variable_resolving[i].node == node
+            && scratch->variable_resolving[i].pseudo == pseudo
+            && scratch->variable_resolving[i].name_length == name_length
+            && memcmp(scratch->variable_resolving[i].name, name,
+                      name_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Resolves the declared value (`value`, `value_length`) of `name` on the
+   element that declares it into `output`. False only when the result does
+   not fit `output_size`: a value is never truncated. */
+static bool variable_resolve_at_declaration(
+    Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    const char *name, size_t name_length, const char *value,
+    size_t value_length, char *output, size_t output_size)
+{
     StyleResolveScratch *scratch = sheet->resolve_scratch;
-    lxb_dom_node_t *saved_node = scratch->resolution_node;
-    PseudoElement saved_pseudo = scratch->resolution_pseudo;
-    scratch->resolution_node = node;
-    scratch->resolution_pseudo = pseudo;
-    char resolved[STYLE_CUSTOM_VALUE_CAPACITY];
-    active++;
-    bool ok = style_resolve_value(sheet, value, strlen(value), resolved,
-                                  sizeof(resolved), 0);
-    active--;
-    scratch->resolution_node = saved_node;
-    scratch->resolution_pseudo = saved_pseudo;
-    if (ok && strlen(resolved) < value_size)
-        style_copy_text(value, value_size, resolved);
+    if (span_contains_text(value, value_length, "var(")
+        && scratch->variable_resolving_count
+               < STYLE_VARIABLE_RESOLVING_LIMIT) {
+        lxb_dom_node_t *saved_node = scratch->resolution_node;
+        PseudoElement saved_pseudo = scratch->resolution_pseudo;
+        scratch->resolution_node = node;
+        scratch->resolution_pseudo = pseudo;
+        unsigned slot = scratch->variable_resolving_count++;
+        scratch->variable_resolving[slot].node = node;
+        scratch->variable_resolving[slot].pseudo = pseudo;
+        scratch->variable_resolving[slot].name = name;
+        scratch->variable_resolving[slot].name_length = name_length;
+        bool resolved = style_resolve_value(sheet, value, value_length,
+                                            output, output_size, 0);
+        scratch->variable_resolving_count--;
+        scratch->resolution_node = saved_node;
+        scratch->resolution_pseudo = saved_pseudo;
+        if (resolved) return true;
+    }
+    /* No reference, or unresolvable here: the raw value. */
+    if (value_length >= output_size) return false;
+    memcpy(output, value, value_length);
+    output[value_length] = '\0';
+    return true;
 }
 
 uint64_t stylesheet_custom_property_name_bits(const char *name,
@@ -810,18 +1135,36 @@ static bool lookup_variable_reading(const Stylesheet *sheet,
 
 /* Records the names one lookup reads, the transitive ones included, both
    for the caller's resolution and for the variable-cache entries it
-   stores (see StyleVariableCacheEntry.reads). */
+   stores (see StyleVariableCacheEntry.reads).
+
+   Each var() is expanded where it is used, so a chain of custom properties
+   that each reference the next several times expands exponentially
+   (eleven references per level fit in a custom value, so five levels are
+   161,051 lookups). Without the layout variable cache, as for properties
+   declared only in style="", a few hundred bytes stalled layout.
+   One outermost resolution (style_resolve_value or lookup, with all the
+   re-resolution nested in it) may therefore expand at most
+   STYLE_VARIABLE_SUBSTITUTION_LIMIT references; past that they are
+   treated as undefined. Real token chains use a few dozen. */
 static bool lookup_variable(const Stylesheet *sheet, const char *name,
                             size_t name_length, char *output,
                             size_t output_size)
 {
     if (sheet == NULL || output == NULL || output_size == 0) return false;
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    if (scratch->variable_work_nesting == 0)
+        scratch->variable_substitutions = 0;
+    if (scratch->variable_substitutions >= STYLE_VARIABLE_SUBSTITUTION_LIMIT)
+        return false;
+    scratch->variable_substitutions++;
     Stylesheet *mutable_sheet = (Stylesheet *) sheet;
     uint64_t outer = sheet->variable_read_names;
     mutable_sheet->variable_read_names =
         stylesheet_custom_property_name_bits(name, name_length);
+    scratch->variable_work_nesting++;
     bool found = lookup_variable_reading(sheet, name, name_length, output,
                                          output_size);
+    scratch->variable_work_nesting--;
     mutable_sheet->variable_read_names |= outer;
     return found;
 }
@@ -837,6 +1180,9 @@ static bool lookup_variable_reading(const Stylesheet *sheet,
     uint32_t hash = custom_rule_name_hash(name, name_length);
     PseudoElement resolution_pseudo =
         sheet->resolve_scratch->resolution_pseudo;
+    if (variable_resolving_contains(sheet->resolve_scratch, resolution_node,
+                                    resolution_pseudo, name, name_length))
+        return false;
     /* The bounded cache is otherwise keyed by node and property name. Salt
        pseudo lookups so an originating element and its generated boxes
        cannot reuse one another's winning custom property. */
@@ -850,14 +1196,25 @@ static bool lookup_variable_reading(const Stylesheet *sheet,
     /* Generated boxes cascade their own declarations before inheriting the
        originating element's ordinary environment. Keep that distinct cache
        key, but do not repeat the ancestor walk when the pseudo has no local
-       winner. */
+       winner. A winner whose value does not fit `output` is not found and
+       not cached (another caller's buffer may hold it). */
+    const char *declared = NULL;
+    size_t declared_length = 0;
+    /* An @property registration decides inheritance and what an element
+       no declaration reaches sees. */
+    const StyleRegisteredProperty *registered =
+        sheet->registered_property_count == 0 ? NULL
+        : stylesheet_registered_property(sheet, name, name_length, hash);
+    bool inherits = registered == NULL || registered->inherits;
     if (resolution_pseudo != PSEUDO_NONE
         && local_variable_value(
             mutable_sheet, resolution_node, resolution_pseudo,
-            name, name_length, hash, output, output_size)) {
-        variable_resolve_at_declaration(
-            mutable_sheet, resolution_node, resolution_pseudo,
-            output, output_size);
+            name, name_length, hash, &declared, &declared_length)) {
+        if (!variable_resolve_at_declaration(
+                mutable_sheet, resolution_node, resolution_pseudo,
+                name, name_length, declared, declared_length,
+                output, output_size)) return false;
+        registered_initial_keyword(registered, output, output_size);
         variable_cache_store(
             mutable_sheet, resolution_node, name, name_length,
             cache_hash, output);
@@ -867,8 +1224,11 @@ static bool lookup_variable_reading(const Stylesheet *sheet,
     enum { CACHED_DESCENDANT_LIMIT = 64 };
     lxb_dom_node_t *uncached_nodes[CACHED_DESCENDANT_LIMIT];
     size_t uncached_count = 0;
-    for (lxb_dom_node_t *node = resolution_node; node != NULL;
-         node = node->parent) {
+    /* A generated box of a non-inheriting property sees only its own
+       declarations; an element, only its own. */
+    for (lxb_dom_node_t *node = inherits || resolution_pseudo == PSEUDO_NONE
+             ? resolution_node : NULL;
+         node != NULL; node = inherits ? node->parent : NULL) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         /* The ordinary-element lookup at the function entrance already
            established this first miss. Do not probe and count it twice. */
@@ -895,9 +1255,12 @@ static bool lookup_variable_reading(const Stylesheet *sheet,
         }
         if (local_variable_value(
                 mutable_sheet, node, PSEUDO_NONE, name, name_length,
-                hash, output, output_size)) {
-            variable_resolve_at_declaration(
-                mutable_sheet, node, PSEUDO_NONE, output, output_size);
+                hash, &declared, &declared_length)) {
+            if (!variable_resolve_at_declaration(
+                    mutable_sheet, node, PSEUDO_NONE, name, name_length,
+                    declared, declared_length, output, output_size))
+                return false;
+            registered_initial_keyword(registered, output, output_size);
             variable_cache_store_nodes(
                 mutable_sheet, uncached_nodes, uncached_count,
                 name, name_length, hash, output);
@@ -910,14 +1273,24 @@ static bool lookup_variable_reading(const Stylesheet *sheet,
         }
     }
     const char *global_value = NULL;
-    for (size_t i = sheet->variable_count; i != 0; i--) {
+    for (size_t i = inherits || resolution_node == NULL
+                        ? sheet->variable_count : 0;
+         i != 0; i--) {
         const StyleVariable *variable = &sheet->variables[i - 1];
-        if (strlen(variable->name) == name_length
+        if (variable->name_length == name_length
             && memcmp(variable->name, name, name_length) == 0) {
-            style_copy_text(output, output_size, variable->value);
+            if (variable->value_length >= output_size) return false;
+            memcpy(output, variable->value, variable->value_length + 1u);
+            registered_initial_keyword(registered, output, output_size);
             global_value = output;
             break;
         }
+    }
+    if (global_value == NULL && registered != NULL
+        && registered->initial_value != NULL) {
+        if (!registered_initial_value(registered, output, output_size))
+            return false;
+        global_value = output;
     }
     variable_cache_store_nodes(
         mutable_sheet, uncached_nodes, uncached_count,
@@ -960,7 +1333,7 @@ static bool style_custom_property_value_scoped(
     PseudoElement saved_pseudo = scratch->resolution_pseudo;
     scratch->resolution_node = node;
     scratch->resolution_pseudo = pseudo;
-    char raw[STYLE_CUSTOM_VALUE_CAPACITY];
+    char raw[STYLE_CUSTOM_RESOLVED_CAPACITY];
     bool found = lookup_variable(
         sheet, name, name_length, raw, sizeof(raw));
     if (found) {
@@ -975,6 +1348,31 @@ static bool style_custom_property_value_scoped(
     scratch->resolution_node = saved_node;
     scratch->resolution_pseudo = saved_pseudo;
     style_relative_selector_cache_end((Stylesheet *) sheet);
+    return found;
+}
+
+bool style_resolve_value_on_node(
+    const Stylesheet *sheet, lxb_dom_node_t *node, const char *text,
+    size_t length, char *output, size_t output_size)
+{
+    if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL
+        || text == NULL || output == NULL || output_size == 0) {
+        return false;
+    }
+    style_class_tokens_scope_begin(sheet);
+    style_relative_selector_cache_begin((Stylesheet *) sheet);
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    lxb_dom_node_t *saved_node = scratch->resolution_node;
+    PseudoElement saved_pseudo = scratch->resolution_pseudo;
+    scratch->resolution_node = node;
+    scratch->resolution_pseudo = PSEUDO_NONE;
+    bool found = style_resolve_value(
+        sheet, text, length, output, output_size, 0);
+    if (!found) output[0] = '\0';
+    scratch->resolution_node = saved_node;
+    scratch->resolution_pseudo = saved_pseudo;
+    style_relative_selector_cache_end((Stylesheet *) sheet);
+    style_class_tokens_scope_end(sheet);
     return found;
 }
 
@@ -1012,23 +1410,31 @@ static bool style_retained_property_value_scoped(
     uint32_t hash = custom_rule_name_hash(name, name_length);
     const StyleCustomRule *winner = custom_rule_winner(
         sheet, node, PSEUDO_NONE, name, name_length, hash, &subject, NULL);
-    char inline_value[STYLE_CUSTOM_VALUE_CAPACITY];
+    const char *value = winner == NULL ? NULL : winner->value;
+    size_t value_length = value == NULL ? 0 : strlen(value);
+    const char *inline_value = NULL;
+    size_t inline_length = 0;
     bool inline_important = false;
-    StyleCustomRule inline_rule = {0};
+    bool custom_property = name_length > 2 && name[0] == '-'
+        && name[1] == '-';
     if (inline_variable_value(
-            sheet, node, name, name_length, inline_value,
-            sizeof(inline_value),
-            &inline_important)) {
-        inline_rule.important = inline_important;
-        inline_rule.origin = 0;
-        inline_rule.layer = UINT_MAX;
-        inline_rule.specificity = UINT_MAX;
-        inline_rule.order = UINT_MAX;
-        inline_rule.value = inline_value;
-        inline_rule.value_length = (uint8_t) strlen(inline_value);
-        if (custom_rule_later(&inline_rule, winner)) winner = &inline_rule;
+            sheet, node, name, name_length,
+            custom_property ? STYLE_CUSTOM_VALUE_CAPACITY
+                            : STYLE_RETAINED_VALUE_CAPACITY,
+            &inline_value, &inline_length, &inline_important)) {
+        StyleCustomRule inline_rule = {
+            .important = inline_important,
+            .origin = 0,
+            .layer = UINT_MAX,
+            .specificity = UINT_MAX,
+            .order = UINT_MAX
+        };
+        if (custom_rule_later(sheet, node, &inline_rule, winner)) {
+            value = inline_value;
+            value_length = inline_length;
+        }
     }
-    if (winner == NULL) {
+    if (value == NULL) {
         output[0] = '\0';
         style_relative_selector_cache_end((Stylesheet *) sheet);
         return false;
@@ -1040,7 +1446,7 @@ static bool style_retained_property_value_scoped(
     scratch->resolution_node = node;
     scratch->resolution_pseudo = PSEUDO_NONE;
     bool found = style_resolve_value(
-        sheet, winner->value, strlen(winner->value), output, output_size, 0);
+        sheet, value, value_length, output, output_size, 0);
     scratch->resolution_node = saved_node;
     scratch->resolution_pseudo = saved_pseudo;
     if (!found) output[0] = '\0';
@@ -1051,7 +1457,7 @@ static bool style_retained_property_value_scoped(
 typedef struct {
     const StyleCustomRule *rule;
     StyleCustomRule inline_rule;
-    char inline_value[STYLE_CUSTOM_VALUE_CAPACITY];
+    char inline_value[STYLE_RETAINED_VALUE_CAPACITY];
 } RetainedRuleWinner;
 
 static bool retained_rule_fast_matches(const Stylesheet *sheet,
@@ -1121,11 +1527,10 @@ static void retained_rule_winner(
                     .specificity = UINT_MAX,
                     .order = declaration_order
                 };
-                if (custom_rule_later(&candidate, output->rule)) {
+                if (custom_rule_later(sheet, node, &candidate, output->rule)) {
                     memcpy(output->inline_value, value, value_length);
                     output->inline_value[value_length] = '\0';
                     candidate.value = output->inline_value;
-                    candidate.value_length = (uint8_t) value_length;
                     output->inline_rule = candidate;
                     output->rule = &output->inline_rule;
                 }
@@ -1216,7 +1621,7 @@ bool style_retained_box_values(
     for (size_t side = 0; side < 4; side++) {
         const StyleCustomRule *winner = winners[side + 1].rule;
         if (shorthand_valid
-            && custom_rule_later(winners[0].rule, winner)) {
+            && custom_rule_later(sheet, node, winners[0].rule, winner)) {
             winner = winners[0].rule;
         }
         if (winner == NULL) continue;
@@ -1279,7 +1684,7 @@ bool style_retained_pair_values(
     for (size_t component = 0; component < 2; component++) {
         const StyleCustomRule *winner = winners[component + 1].rule;
         if (shorthand_valid
-            && custom_rule_later(winners[0].rule, winner)) {
+            && custom_rule_later(sheet, node, winners[0].rule, winner)) {
             winner = winners[0].rule;
         }
         if (winner == NULL) continue;
@@ -1387,11 +1792,15 @@ bool style_retained_presentation_values(
             : 0;
         size_t end = sheet->custom_rule_index_ready
             ? sheet->custom_rule_index_count : sheet->custom_rule_count;
+        bool outside = style_subject_outside_custom_scopes(sheet, &subject);
         for (size_t i = first; i < end; i++) {
             size_t rule_index = i;
             if (sheet->custom_rule_index_ready) {
-                if (sheet->custom_rule_index[i].hash != hash) break;
-                rule_index = sheet->custom_rule_index[i].index;
+                uint32_t entry = sheet->custom_rule_index[i].index;
+                if (sheet->custom_rule_index[i].hash != hash
+                    || (outside
+                        && (entry & STYLE_CUSTOM_INDEX_SCOPED) != 0)) break;
+                rule_index = entry & ~STYLE_CUSTOM_INDEX_SCOPED;
             }
             const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
             if (rule->pseudo != PSEUDO_NONE
@@ -1399,7 +1808,12 @@ bool style_retained_presentation_values(
                     sheet, rule->container_query, node)
                 || rule->name_length != name_length
                 || memcmp(rule->name, name, name_length) != 0
-                || !retained_rule_fast_matches(sheet, rule, &subject)) continue;
+                || !retained_rule_fast_matches(sheet, rule, &subject)
+                /* Outside the selector-text cache: the same text in an
+                   unscoped sheet matches regardless. */
+                || !style_adopted_rule_in_scope(
+                       sheet, rule->order >> 8, rule->selector,
+                       rule->selector_length, node, &subject)) continue;
             size_t selector_length = rule->selector_length;
             uint32_t selector_hash = custom_rule_name_hash(
                 rule->selector, selector_length);
@@ -1424,7 +1838,7 @@ bool style_retained_presentation_values(
                     .matched = matched
                 };
             }
-            if (matched && custom_rule_later(rule, winners[property])) {
+            if (matched && custom_rule_later(sheet, node, rule, winners[property])) {
                 winners[property] = rule;
             }
         }
@@ -1448,7 +1862,7 @@ bool style_retained_presentation_values(
                 .specificity = UINT_MAX,
                 .order = UINT_MAX
             };
-            if (custom_rule_later(&inline_rule, winners[property])) {
+            if (custom_rule_later(sheet, node, &inline_rule, winners[property])) {
                 value = output->values[property];
             }
         }
@@ -1478,23 +1892,24 @@ bool style_set_variable(Stylesheet *sheet, const char *name,
                          size_t name_length, const char *value,
                          size_t value_length)
 {
-    if (name_length == 0 || name_length >= sizeof(((StyleVariable *) 0)->name)
-        || value_length >= sizeof(((StyleVariable *) 0)->value)) {
+    size_t index = sheet->variable_count;
+    for (size_t i = 0; name_length < STYLE_CUSTOM_NAME_CAPACITY
+                       && i < sheet->variable_count; i++) {
+        if (sheet->variables[i].name_length == name_length
+            && memcmp(sheet->variables[i].name, name, name_length) == 0) {
+            index = i;
+            break;
+        }
+    }
+    if (name_length == 0 || name_length >= STYLE_CUSTOM_NAME_CAPACITY
+        || !stylesheet_admit_custom_value(sheet, value_length)) {
         if (sheet->diagnostic_custom_property_drops != UINT64_MAX) {
             sheet->diagnostic_custom_property_drops++;
         }
         return true;
     }
-    for (size_t i = 0; i < sheet->variable_count; i++) {
-        StyleVariable *variable = &sheet->variables[i];
-        if (strlen(variable->name) == name_length
-            && memcmp(variable->name, name, name_length) == 0) {
-            memcpy(variable->value, value, value_length);
-            variable->value[value_length] = '\0';
-            return true;
-        }
-    }
-    if (sheet->variable_count == sheet->variable_capacity) {
+    if (index == sheet->variable_count
+        && sheet->variable_count == sheet->variable_capacity) {
         size_t capacity = sheet->variable_capacity == 0
                           ? 16 : sheet->variable_capacity * 2;
         StyleVariable *variables = budget_realloc(
@@ -1503,17 +1918,54 @@ bool style_set_variable(Stylesheet *sheet, const char *name,
         sheet->variables = variables;
         sheet->variable_capacity = capacity;
     }
-    StyleVariable *variable = &sheet->variables[sheet->variable_count++];
-    memcpy(variable->name, name, name_length);
-    variable->name[name_length] = '\0';
-    memcpy(variable->value, value, value_length);
-    variable->value[value_length] = '\0';
+    /* One arena string holds "name\0value\0"; a redeclaration takes new
+       text (the old bytes stay until the sheet is destroyed). */
+    char *text = stylesheet_reserve_text(sheet,
+                                         name_length + 1u + value_length);
+    if (text == NULL) return false;
+    memcpy(text, name, name_length);
+    text[name_length] = '\0';
+    memcpy(text + name_length + 1u, value, value_length);
+    text[name_length + 1u + value_length] = '\0';
+    if (index == sheet->variable_count) sheet->variable_count++;
+    sheet->variables[index] = (StyleVariable) {
+        .name = text,
+        .value = text + name_length + 1u,
+        .value_length = (uint16_t) value_length,
+        .name_length = (uint8_t) name_length
+    };
     return true;
 }
 
+static bool style_resolve_value_nested(const Stylesheet *sheet,
+                                       const char *text, size_t length,
+                                       char *output, size_t output_size,
+                                       unsigned depth);
+
+/* Scopes the var() expansion budget (see lookup_variable) to the
+   outermost resolution. */
 bool style_resolve_value(const Stylesheet *sheet, const char *text,
                          size_t length, char *output, size_t output_size,
                          unsigned depth)
+{
+    StyleResolveScratch *scratch =
+        sheet == NULL ? NULL : sheet->resolve_scratch;
+    if (scratch == NULL) {
+        return style_resolve_value_nested(sheet, text, length, output,
+                                          output_size, depth);
+    }
+    if (scratch->variable_work_nesting++ == 0)
+        scratch->variable_substitutions = 0;
+    bool resolved = style_resolve_value_nested(sheet, text, length, output,
+                                               output_size, depth);
+    scratch->variable_work_nesting--;
+    return resolved;
+}
+
+static bool style_resolve_value_nested(const Stylesheet *sheet,
+                                       const char *text, size_t length,
+                                       char *output, size_t output_size,
+                                       unsigned depth)
 {
     trim(&text, &length);
     bool has_comment = false;
@@ -1535,7 +1987,7 @@ bool style_resolve_value(const Stylesheet *sheet, const char *text,
         /* CSS comments are removed before property-value tokenization. Keep
            the exceptional normalization path stack-bounded; ordinary values
            remain allocation-free and retain their existing larger caps. */
-        char uncommented[512];
+        char uncommented[STYLE_CUSTOM_RESOLVED_CAPACITY];
         size_t written = 0;
         quote = 0;
         for (size_t at = 0; at < length;) {
@@ -1632,10 +2084,10 @@ bool style_resolve_value(const Stylesheet *sheet, const char *text,
         const char *name = inside;
         size_t name_length = comma;
         trim(&name, &name_length);
-        /* Inline design-token URLs commonly exceed the retained-rule value
-           cap. The resolver consumes them directly from the DOM and keeps
-           this bounded scratch local; retained stylesheet rules stay compact. */
-        char raw[320];
+        /* The looked-up value, already resolved where it was declared:
+           at most STYLE_CUSTOM_RESOLVED_CAPACITY, never truncated (a longer
+           one is not found). */
+        char raw[STYLE_CUSTOM_RESOLVED_CAPACITY];
         const char *replacement = NULL;
         size_t replacement_length = 0;
         /* A custom property set to "initial" holds the guaranteed-invalid
@@ -1659,7 +2111,7 @@ bool style_resolve_value(const Stylesheet *sheet, const char *text,
             replacement_length = inside_length - comma - 1;
         }
         else return false;
-        char resolved[512];
+        char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (!style_resolve_value(sheet, replacement, replacement_length, resolved,
                            sizeof(resolved), depth + 1)) return false;
         size_t resolved_length = strlen(resolved);
@@ -2259,9 +2711,14 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
                             unsigned order, bool important,
                             PseudoElement pseudo)
 {
+    /* Retained standard properties keep their own short value limit. */
+    bool custom_property = name_length > 2 && name[0] == '-'
+        && name[1] == '-';
     if (selector_length >= STYLE_CUSTOM_SELECTOR_CAPACITY
         || name_length >= STYLE_CUSTOM_NAME_CAPACITY
-        || value_length >= STYLE_CUSTOM_VALUE_CAPACITY) {
+        || (custom_property
+            ? !stylesheet_admit_custom_value(sheet, value_length)
+            : value_length >= STYLE_RETAINED_VALUE_CAPACITY)) {
         if (sheet->diagnostic_custom_property_drops != UINT64_MAX) {
             sheet->diagnostic_custom_property_drops++;
         }
@@ -2277,18 +2734,16 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
         sheet->custom_rule_capacity = capacity;
     }
     /* One arena string holds "selector\0name\0value\0". */
-    char text[STYLE_CUSTOM_SELECTOR_CAPACITY + STYLE_CUSTOM_NAME_CAPACITY
-              + STYLE_CUSTOM_VALUE_CAPACITY];
-    size_t text_length = selector_length + 1u + name_length + 1u
-                         + value_length;
-    memcpy(text, selector, selector_length);
-    text[selector_length] = '\0';
-    memcpy(text + selector_length + 1u, name, name_length);
-    text[selector_length + 1u + name_length] = '\0';
-    memcpy(text + selector_length + 1u + name_length + 1u, value,
-           value_length);
-    const char *stored = stylesheet_store_text(sheet, text, text_length);
+    char *stored = stylesheet_reserve_text(
+        sheet, selector_length + 1u + name_length + 1u + value_length);
     if (stored == NULL) return false;
+    memcpy(stored, selector, selector_length);
+    stored[selector_length] = '\0';
+    memcpy(stored + selector_length + 1u, name, name_length);
+    stored[selector_length + 1u + name_length] = '\0';
+    memcpy(stored + selector_length + 1u + name_length + 1u, value,
+           value_length);
+    stored[selector_length + 1u + name_length + 1u + value_length] = '\0';
     StyleCustomRule *rule = &sheet->custom_rules[sheet->custom_rule_count++];
     memset(rule, 0, sizeof(*rule));
     rule->selector = stored;
@@ -2296,7 +2751,6 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
     rule->value = rule->name + name_length + 1u;
     rule->name_length = (uint8_t) name_length;
     rule->selector_length = (uint8_t) selector_length;
-    rule->value_length = (uint8_t) value_length;
     rule->important = important;
     rule->pseudo = (uint8_t) pseudo;
     rule->container_query = sheet->current_container_query;

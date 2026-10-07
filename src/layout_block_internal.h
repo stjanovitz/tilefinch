@@ -26,6 +26,16 @@ void layout_block_size_paint_image_command(
     DrawCommand *command, const StylePaintLayer *layer,
     const ImageResource *image, int area_width, int area_height);
 
+/* The tile size of an explicit background-size (`flags` holds the
+   STYLE_BACKGROUND_* size bits): lengths, percentages of the positioning
+   area, and `auto` from the image's natural size, never the decoded copy,
+   which budget limits or display retargeting may have reduced. At least
+   1x1. */
+void layout_background_tile_size(unsigned flags, int width, int height,
+                                 int area_width, int area_height,
+                                 const ImageResource *image,
+                                 int *tile_width, int *tile_height);
+
 /* style_pixel_height() plus the percentage case against a definite
    containing-block height. */
 int layout_block_style_resolved_height(const Stylesheet *sheet,
@@ -235,6 +245,18 @@ static inline bool block_establishes_formatting_context(
                || style->display == DISPLAY_FLEX
                || style->display == DISPLAY_GRID
                || style->display == DISPLAY_TABLE);
+}
+
+/* Boxes whose auto height contains the floats placed inside them: formatting
+   context roots (CSS 2.1 10.6.7), including floats, inline-blocks, table
+   cells and absolutely positioned boxes. */
+static inline bool block_contains_own_floats(const ComputedStyle *style)
+{
+    return block_establishes_formatting_context(style)
+           || style->float_mode != FLOAT_NONE
+           || style->display == DISPLAY_INLINE_BLOCK
+           || style->display == DISPLAY_TABLE_CELL
+           || style->out_of_flow || style->fixed_position;
 }
 
 static inline bool block_parent_collapses_top(const ComputedStyle *style)

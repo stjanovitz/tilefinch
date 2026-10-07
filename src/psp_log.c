@@ -65,11 +65,15 @@ bool psp_log_flush(bool synchronize_device)
 }
 
 bool psp_log_healthy(void) { return false; }
+bool psp_log_begin_timing_window(void) { return false; }
+void psp_log_end_timing_window(void) {}
 void psp_log_checkpoint(const char *name) { (void) name; }
 void psp_log_emergency(const char *state) { (void) state; }
 void psp_log_finish(const char *outcome) { (void) outcome; }
 
 #else
+
+#include "psp_log_capture.h"
 
 #define PSP_LOG_LINE_BYTES 1024u
 #define PSP_CRASH_RECORD_BYTES 512u
@@ -107,6 +111,9 @@ static _Atomic bool watchdog_running;
 static _Atomic bool persistent_healthy;
 static _Atomic bool watchdog_reported;
 static bool persistent_paths_on_memory_stick;
+static PspLogCapture timing_capture;
+static _Atomic bool timing_window;
+static size_t timing_forced_flushes;
 
 static const char *const phase_names[PSP_LOG_PHASE_COUNT] = {
     "boot", "config", "assets", "engine", "network", "navigation",
@@ -383,7 +390,7 @@ void psp_log_heartbeat(void)
        stream buffer; bound that from the heartbeat the owner thread beats
        every frame and every cooperate checkpoint. */
     uint32_t flushed = last_flush_ms;
-    if (flushed != 0 && (uint32_t) (current - flushed)
+    if (!timing_window && flushed != 0 && (uint32_t) (current - flushed)
                             >= PSP_LOG_FLUSH_INTERVAL_MS) {
         (void) psp_log_flush(false);
     }
@@ -426,6 +433,11 @@ int psp_log_printf(const char *format, ...)
 
     bool locked = log_semaphore >= 0
         && sceKernelWaitSema(log_semaphore, 1, NULL) >= 0;
+    if (locked && timing_window) {
+        (void) psp_log_capture_append(&timing_capture, line, length);
+        (void) sceKernelSignalSema(log_semaphore, 1);
+        return truncated ? (int) length : requested;
+    }
     if (length != 0) {
         (void) fwrite(line, 1, length, stdout);
     }
@@ -445,10 +457,53 @@ FILE *psp_log_file(void)
     return validation_log;
 }
 
+/* Caller holds the log semaphore. Failure diagnostics may force this while
+   timing is active; their safety takes precedence over an uncontaminated run. */
+static void psp_log_drain_timing_capture(void)
+{
+    if (timing_capture.used == 0) return;
+    (void) fwrite(timing_capture.bytes, 1, timing_capture.used, stdout);
+    if (validation_log != NULL
+        && fwrite(timing_capture.bytes, 1, timing_capture.used, validation_log)
+            != timing_capture.used)
+        persistent_healthy = false;
+    timing_capture.used = 0;
+}
+
+bool psp_log_begin_timing_window(void)
+{
+    if (timing_window || !psp_log_flush(false)) return false;
+    if (log_semaphore < 0
+        || sceKernelWaitSema(log_semaphore, 1, NULL) < 0) return false;
+    timing_capture.used = timing_capture.dropped = 0;
+    timing_forced_flushes = 0;
+    timing_window = true;
+    (void) sceKernelSignalSema(log_semaphore, 1);
+    return true;
+}
+
+void psp_log_end_timing_window(void)
+{
+    if (!timing_window || log_semaphore < 0
+        || sceKernelWaitSema(log_semaphore, 1, NULL) < 0) return;
+    timing_window = false;
+    size_t retained = timing_capture.used;
+    size_t dropped = timing_capture.dropped;
+    size_t forced = timing_forced_flushes;
+    psp_log_drain_timing_capture();
+    (void) sceKernelSignalSema(log_semaphore, 1);
+    psp_log_printf("tilefinch-timing-log: retained=%zu dropped=%zu "
+                   "forced-flushes=%zu\n", retained, dropped, forced);
+}
+
 bool psp_log_flush(bool synchronize_device)
 {
     bool locked = log_semaphore >= 0
         && sceKernelWaitSema(log_semaphore, 1, NULL) >= 0;
+    if (locked && timing_window) {
+        if (timing_forced_flushes != SIZE_MAX) timing_forced_flushes++;
+        psp_log_drain_timing_capture();
+    }
     bool okay = validation_log != NULL && locked
         && fflush(validation_log) == 0 && !ferror(validation_log);
     /* PSPLink output is a best-effort mirror. Its availability must never
@@ -533,6 +588,7 @@ void psp_log_emergency(const char *state)
 void psp_log_finish(const char *outcome)
 {
     psp_log_stop_watchdog();
+    psp_log_end_timing_window();
     psp_log_printf("tilefinch-log: finish outcome=%s healthy=%d\n",
                    outcome == NULL ? "unknown" : outcome,
                    persistent_healthy ? 1 : 0);

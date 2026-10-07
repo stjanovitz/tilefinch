@@ -12,6 +12,7 @@
 #include "js_runtime_internal.h"
 
 #include "tilefinch/platform.h"
+#include "tilefinch/resources.h"
 #include "tilefinch_compiler.h"
 #include "tilefinch/media_discovery.h"
 
@@ -36,7 +37,8 @@ static int64_t bridge_node_handle(const DomBridge *bridge, size_t slot)
                      | (uint32_t) (slot + 1));
 }
 
-static size_t bridge_node_index_home(const lxb_dom_node_t *node)
+static size_t bridge_node_index_home(const DomBridge *bridge,
+                                     const lxb_dom_node_t *node)
 {
     uintptr_t key = (uintptr_t) node;
     uint32_t mixed = (uint32_t) (key >> 3);
@@ -44,7 +46,7 @@ static size_t bridge_node_index_home(const lxb_dom_node_t *node)
     mixed ^= (uint32_t) (key >> 35);
 #endif
     mixed *= UINT32_C(2654435761);
-    return (size_t) mixed & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u);
+    return (size_t) mixed & (bridge->node_index_capacity - 1u);
 }
 
 /* The slot holding `node`, or SIZE_MAX. Compares pointers only: a slot may
@@ -52,23 +54,24 @@ static size_t bridge_node_index_home(const lxb_dom_node_t *node)
 static size_t bridge_node_index_find(const DomBridge *bridge,
                                      const lxb_dom_node_t *node)
 {
-    if (bridge == NULL || node == NULL) return SIZE_MAX;
-    size_t at = bridge_node_index_home(node);
-    for (size_t probes = 0; probes < DOM_BRIDGE_NODE_INDEX_CAPACITY;
+    if (bridge == NULL || node == NULL || bridge->node_index == NULL)
+        return SIZE_MAX;
+    size_t at = bridge_node_index_home(bridge, node);
+    for (size_t probes = 0; probes < bridge->node_index_capacity;
          probes++) {
         uint16_t entry = bridge->node_index[at];
         if (entry == 0u) return SIZE_MAX;
         if (bridge->nodes[entry - 1u] == node) return entry - 1u;
-        at = (at + 1u) & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u);
+        at = (at + 1u) & (bridge->node_index_capacity - 1u);
     }
     return SIZE_MAX;
 }
 
 static void bridge_node_index_insert(DomBridge *bridge, size_t slot)
 {
-    size_t at = bridge_node_index_home(bridge->nodes[slot]);
+    size_t at = bridge_node_index_home(bridge, bridge->nodes[slot]);
     while (bridge->node_index[at] != 0u)
-        at = (at + 1u) & (DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u);
+        at = (at + 1u) & (bridge->node_index_capacity - 1u);
     bridge->node_index[at] = (uint16_t) (slot + 1u);
 }
 
@@ -76,10 +79,10 @@ static void bridge_node_index_insert(DomBridge *bridge, size_t slot)
    probing with backward-shift deletion keeps every run unbroken. */
 static void bridge_node_index_remove(DomBridge *bridge, size_t slot)
 {
-    const size_t mask = DOM_BRIDGE_NODE_INDEX_CAPACITY - 1u;
-    size_t hole = bridge_node_index_home(bridge->nodes[slot]);
+    const size_t mask = bridge->node_index_capacity - 1u;
+    size_t hole = bridge_node_index_home(bridge, bridge->nodes[slot]);
     for (size_t probes = 0;; probes++) {
-        if (probes == DOM_BRIDGE_NODE_INDEX_CAPACITY
+        if (probes == bridge->node_index_capacity
             || bridge->node_index[hole] == 0u) return;
         if (bridge->node_index[hole] == (uint16_t) (slot + 1u)) break;
         hole = (hole + 1u) & mask;
@@ -87,7 +90,7 @@ static void bridge_node_index_remove(DomBridge *bridge, size_t slot)
     for (size_t at = (hole + 1u) & mask; bridge->node_index[at] != 0u;
          at = (at + 1u) & mask) {
         size_t home = bridge_node_index_home(
-            bridge->nodes[bridge->node_index[at] - 1u]);
+            bridge, bridge->nodes[bridge->node_index[at] - 1u]);
         /* The entry may fill the hole unless its home lies cyclically in
            (hole, at]. */
         bool stays = hole <= at ? home > hole && home <= at
@@ -97,6 +100,153 @@ static void bridge_node_index_remove(DomBridge *bridge, size_t slot)
         hole = at;
     }
     bridge->node_index[hole] = 0u;
+}
+
+static size_t bridge_node_index_capacity_for(size_t capacity)
+{
+    size_t index = 64u;
+    while (index < 2u * capacity) index *= 2u;
+    return index;
+}
+
+/* Moves the slot table to `capacity` slots (a multiple of 32, at least the
+   current one). Every array, including the lazily allocated wrapper
+   references and owner tags, is resized before anything is published: a
+   refusal leaves the table exactly as it was (an array already enlarged
+   only carries unused, initialized tail entries). Slot numbers, and so
+   handles, are unchanged; only the pointer index is rebuilt. */
+static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
+{
+    if (bridge == NULL || bridge->budget == NULL || capacity == 0
+        || capacity % 32u != 0 || capacity > DOM_BRIDGE_NODE_LIMIT_MAX
+        || capacity < bridge->node_capacity) return false;
+    if (capacity == bridge->node_capacity) return true;
+    size_t index_capacity = bridge_node_index_capacity_for(capacity);
+    size_t pointer_bytes = capacity
+        * (sizeof(lxb_dom_node_t *) + sizeof(uintptr_t));
+    size_t word_bytes = capacity * 2u * sizeof(uint32_t)
+        + capacity / 32u * sizeof(uint32_t);
+    unsigned char *block = budget_calloc(
+        bridge->budget, 1, pointer_bytes + word_bytes + capacity);
+    if (block == NULL) return false;
+    uint16_t *index = budget_calloc(
+        bridge->budget, index_capacity, sizeof(uint16_t));
+    if (index == NULL) {
+        budget_free(bridge->budget, block);
+        return false;
+    }
+    if (bridge->wrapper_refs != NULL) {
+        JSValue *refs = budget_realloc(
+            bridge->budget, bridge->wrapper_refs,
+            capacity * sizeof(JSValue));
+        if (refs == NULL) {
+            budget_free(bridge->budget, index);
+            budget_free(bridge->budget, block);
+            return false;
+        }
+        for (size_t at = bridge->node_capacity; at < capacity; at++)
+            refs[at] = JS_UNDEFINED;
+        bridge->wrapper_refs = refs;
+    }
+    if (bridge->node_owner_tags != NULL) {
+        unsigned char *tags = budget_realloc(
+            bridge->budget, bridge->node_owner_tags, capacity);
+        if (tags == NULL) {
+            budget_free(bridge->budget, index);
+            budget_free(bridge->budget, block);
+            return false;
+        }
+        memset(tags + bridge->node_capacity, 0,
+               capacity - bridge->node_capacity);
+        bridge->node_owner_tags = tags;
+    }
+    lxb_dom_node_t **nodes = (lxb_dom_node_t **) (void *) block;
+    uintptr_t *owners = (uintptr_t *) (void *) (nodes + capacity);
+    uint32_t *generations = (uint32_t *) (void *) (owners + capacity);
+    uint32_t *leases = generations + capacity;
+    uint32_t *reusable = leases + capacity;
+    unsigned char *flags = (unsigned char *) (reusable + capacity / 32u);
+    size_t old = bridge->node_capacity;
+    if (old != 0) {
+        memcpy(nodes, bridge->nodes, old * sizeof(*nodes));
+        memcpy(owners, bridge->node_owner_document_identities,
+               old * sizeof(*owners));
+        memcpy(generations, bridge->node_generations,
+               old * sizeof(*generations));
+        memcpy(leases, bridge->node_wrapper_leases, old * sizeof(*leases));
+        memcpy(reusable, bridge->node_reusable_bits,
+               old / 32u * sizeof(*reusable));
+        memcpy(flags, bridge->node_retention_flags, old);
+    }
+    /* The arrays share one block whose base is `nodes`. */
+    budget_free(bridge->budget, bridge->nodes);
+    budget_free(bridge->budget, bridge->node_index);
+    bridge->nodes = nodes;
+    bridge->node_owner_document_identities = owners;
+    bridge->node_generations = generations;
+    bridge->node_wrapper_leases = leases;
+    bridge->node_reusable_bits = reusable;
+    bridge->node_retention_flags = flags;
+    bridge->node_index = index;
+    bridge->node_index_capacity = index_capacity;
+    bridge->node_capacity = capacity;
+    for (size_t slot = 0; slot < bridge->node_count; slot++)
+        if (bridge->nodes[slot] != NULL)
+            bridge_node_index_insert(bridge, slot);
+    return true;
+}
+
+bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit)
+{
+    if (bridge == NULL || bridge->nodes != NULL) return false;
+    if (limit == 0) limit = DOM_BRIDGE_NODE_LIMIT;
+    if (limit > DOM_BRIDGE_NODE_LIMIT_MAX) limit = DOM_BRIDGE_NODE_LIMIT_MAX;
+    limit -= limit % 32u;
+    if (limit == 0) return false;
+    bridge->node_capacity_limit = limit;
+    return bridge_node_table_resize(
+        bridge, limit < DOM_BRIDGE_NODE_LIMIT ? limit : DOM_BRIDGE_NODE_LIMIT);
+}
+
+void js_rt_bridge_node_table_free(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    budget_free(bridge->budget, bridge->nodes);
+    budget_free(bridge->budget, bridge->node_index);
+    bridge->nodes = NULL;
+    bridge->node_owner_document_identities = NULL;
+    bridge->node_generations = NULL;
+    bridge->node_wrapper_leases = NULL;
+    bridge->node_reusable_bits = NULL;
+    bridge->node_retention_flags = NULL;
+    bridge->node_index = NULL;
+    bridge->node_index_capacity = 0;
+    bridge->node_capacity = 0;
+    bridge->node_count = 0;
+}
+
+/* One growth step when every slot is live: double, up to the policy's
+   ceiling. Growth is admitted like any page allocation; a refusal leaves the
+   table full and registration reports exhaustion as before. */
+static bool bridge_node_table_grow(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->node_capacity >= bridge->node_capacity_limit)
+        return false;
+    size_t capacity = bridge->node_capacity * 2u;
+    if (capacity > bridge->node_capacity_limit)
+        capacity = bridge->node_capacity_limit;
+    if (!bridge_node_table_resize(bridge, capacity)) {
+        if (bridge->result != NULL
+            && bridge->result->dom_handle_growth_refusals != SIZE_MAX)
+            bridge->result->dom_handle_growth_refusals++;
+        return false;
+    }
+    if (bridge->result != NULL) {
+        bridge->result->dom_handle_slot_capacity = bridge->node_capacity;
+        if (bridge->result->dom_handle_growths != SIZE_MAX)
+            bridge->result->dom_handle_growths++;
+    }
+    return true;
 }
 
 static void bridge_node_set_reusable(DomBridge *bridge, size_t slot,
@@ -153,17 +303,15 @@ bool js_rt_bridge_node_slot_for_handle(const DomBridge *bridge,
     return true;
 }
 
+/* Every registered root carries the native-only carrier mark (set in
+   js_dom_register_shadow_root), so a query walk tests the node itself
+   instead of scanning the registry once per visited element. */
 static bool bridge_node_is_shadow_root(const DomBridge *bridge,
                                        const lxb_dom_node_t *node)
 {
-    if (bridge == NULL || node == NULL) return false;
-    for (size_t i = 0; i < bridge->shadow_root_count; i++) {
-        size_t slot = 0;
-        int64_t handle = (int64_t) bridge->shadow_root_handles[i];
-        if (js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
-            && bridge->nodes[slot] == node) return true;
-    }
-    return false;
+    if (bridge == NULL || node == NULL || bridge->shadow_root_count == 0)
+        return false;
+    return document_node_is_shadow_carrier(node);
 }
 
 /* The carrier itself is not observable as part of the light tree, nor are
@@ -211,7 +359,18 @@ JSValue js_dom_register_shadow_root(JSContext *context,
         bridge->shadow_root_handles[write++] = existing;
     }
     bridge->shadow_root_count = write;
-    if (write >= DOM_BRIDGE_SHADOW_ROOT_LIMIT) return JS_FALSE;
+    size_t admitted = DOM_BRIDGE_SHADOW_ROOT_BASE;
+    if (bridge->budget != NULL) {
+        size_t by_budget = bridge->budget->limit
+                           / DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES;
+        if (by_budget > admitted) admitted = by_budget;
+    }
+    if (admitted > DOM_BRIDGE_SHADOW_ROOT_LIMIT)
+        admitted = DOM_BRIDGE_SHADOW_ROOT_LIMIT;
+    if (write >= admitted) return JS_FALSE;
+    /* Style resolution recognises the carrier by this native-only mark
+       (shadow composition, document.h). */
+    if (!document_mark_shadow_carrier(bridge->nodes[slot])) return JS_FALSE;
     bridge->shadow_root_handles[write] = (uint32_t) handle;
     bridge->shadow_root_count = write + 1u;
     return JS_TRUE;
@@ -260,6 +419,21 @@ static int64_t bridge_invalidate_node_slot_impl(
     return retired_handle;
 }
 
+/* Records whether the next Page controls claim asked to skip a repeated
+   entry notice. Only script_runtime_take_page_controls_notice() reads it,
+   and it can only quiet a notice this document has already shown. */
+JSValue js_dom_page_controls_notice(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge != NULL)
+        bridge->page_controls_notice_once =
+            argc > 0 && JS_ToBool(context, argv[0]) > 0;
+    return JS_UNDEFINED;
+}
+
 JSValue js_dom_set_fullscreen(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv)
@@ -300,12 +474,28 @@ JSValue js_dom_set_fullscreen(JSContext *context,
     return JS_TRUE;
 }
 
+TilefinchGameAudio *js_rt_game_audio_engine(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return NULL;
+    if (runtime->game_audio == NULL)
+        runtime->game_audio = tilefinch_game_audio_create(runtime->budget);
+    return runtime->game_audio;
+}
+
+bool js_rt_game_audio_lifecycle(ScriptRuntime *runtime, bool destroy)
+{
+    if (runtime == NULL) return false;
+    if (destroy) {
+        tilefinch_game_audio_destroy(runtime->game_audio);
+        runtime->game_audio = NULL;
+    } else tilefinch_game_audio_suspend(runtime->game_audio);
+    return true;
+}
+
+#ifdef TILEFINCH_GAME_AUDIO_REFERENCE
 static TilefinchGameAudio *runtime_game_audio(DomBridge *bridge)
 {
-    if (bridge == NULL || bridge->host == NULL) return NULL;
-    if (bridge->host->game_audio == NULL)
-        bridge->host->game_audio = tilefinch_game_audio_create(bridge->budget);
-    return bridge->host->game_audio;
+    return bridge == NULL ? NULL : js_rt_game_audio_engine(bridge->host);
 }
 
 JSValue js_game_audio_decode(JSContext *context,
@@ -337,85 +527,45 @@ JSValue js_game_audio_decode(JSContext *context,
     return object;
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static bool game_audio_native_measurement;
+static unsigned game_audio_native_depth;
+static ScriptGameAudioNativeMetrics game_audio_native_metrics;
+
+void script_runtime_game_audio_native_measure(bool enabled)
+{
+    game_audio_native_measurement = enabled;
+    memset(&game_audio_native_metrics, 0, sizeof(game_audio_native_metrics));
+}
+
+void script_runtime_game_audio_native_take(ScriptGameAudioNativeMetrics *metrics)
+{
+    if (metrics != NULL) *metrics = game_audio_native_metrics;
+    memset(&game_audio_native_metrics, 0, sizeof(game_audio_native_metrics));
+}
+
+static JSValue js_game_audio_command_impl(JSContext *context,
+#else
 JSValue js_game_audio_command(JSContext *context,
+#endif
                               JSValueConst this_value,
                               int argc, JSValueConst *argv)
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
     int32_t command = -1;
-    if (bridge == NULL || bridge->host == NULL || argc < 1
-        || JS_ToInt32(context, &command, argv[0]) < 0) return JS_FALSE;
-    if (command == 0) {
+    if (bridge == NULL || bridge->host == NULL || argc < 1) return JS_FALSE;
+    if (JS_ToInt32(context, &command, argv[0]) < 0) return JS_EXCEPTION;
+    switch ((TilefinchGameAudioCommand) command) {
+    case TILEFINCH_GAME_AUDIO_COMMAND_RESUME:
         if (!js_rt_bridge_user_activation_is_active(bridge)) return JS_FALSE;
         return tilefinch_game_audio_resume(runtime_game_audio(bridge))
             ? JS_TRUE : JS_FALSE;
-    }
-    if (command == 1) {
-        tilefinch_game_audio_suspend(bridge->host->game_audio);
-        return JS_TRUE;
-    }
-    if (command == 2) {
-        tilefinch_game_audio_destroy(bridge->host->game_audio);
-        bridge->host->game_audio = NULL;
-        return JS_TRUE;
-    }
-    uint32_t handle = 0;
-    if (argc < 2 || JS_ToUint32(context, &handle, argv[1]) < 0)
-        return JS_FALSE;
-    if (command == 4) {
-        double delay = 0;
-        if (argc > 2 && JS_ToFloat64(context, &delay, argv[2]) < 0)
-            return JS_FALSE;
-        tilefinch_game_audio_stop(
-            bridge->host->game_audio, handle, delay);
-        return JS_TRUE;
-    }
-    if (command == 6) {
-        double gain_left = 1, gain_right = 1;
-        if (argc < 4
-            || JS_ToFloat64(context, &gain_left, argv[2]) < 0
-            || JS_ToFloat64(context, &gain_right, argv[3]) < 0)
-            return JS_FALSE;
-        return tilefinch_game_audio_update_voice(
-            bridge->host->game_audio, handle, gain_left, gain_right)
-            ? JS_TRUE : JS_FALSE;
-    }
-    if (command == 7) {
-        double frequency = 0;
-        if (argc < 3
-            || JS_ToFloat64(context, &frequency, argv[2]) < 0)
-            return JS_FALSE;
-        return tilefinch_game_audio_update_oscillator(
-            bridge->host->game_audio, handle, frequency)
-            ? JS_TRUE : JS_FALSE;
-    }
-    if (command == 8) {
-        double gain_left = 0, gain_right = 0;
-        double delay = 0, time_constant = 0;
-        if (argc < 6
-            || JS_ToFloat64(context, &gain_left, argv[2]) < 0
-            || JS_ToFloat64(context, &gain_right, argv[3]) < 0
-            || JS_ToFloat64(context, &delay, argv[4]) < 0
-            || JS_ToFloat64(context, &time_constant, argv[5]) < 0)
-            return JS_FALSE;
-        /* Numeric coercion can run author code. Resolve the runtime-owned
-           audio pointer only after every coercion has completed. */
-        bridge = JS_GetContextOpaque(context);
-        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
-        TilefinchGameAudio *audio = bridge->host->game_audio;
-        return tilefinch_game_audio_schedule_envelope_target(
-            audio, handle, gain_left, gain_right, delay, time_constant)
-            ? JS_TRUE : JS_FALSE;
-    }
-    if (command == 9) {
-        bridge = JS_GetContextOpaque(context);
-        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
-        TilefinchGameAudio *audio = bridge->host->game_audio;
-        return tilefinch_game_audio_cancel_envelope(audio, handle)
-            ? JS_TRUE : JS_FALSE;
-    }
-    if (command == 5) {
+    case TILEFINCH_GAME_AUDIO_COMMAND_SUSPEND:
+        return JS_NewBool(context, js_rt_game_audio_lifecycle(bridge->host, false));
+    case TILEFINCH_GAME_AUDIO_COMMAND_CLOSE:
+        return JS_NewBool(context, js_rt_game_audio_lifecycle(bridge->host, true));
+    case TILEFINCH_GAME_AUDIO_COMMAND_START_OSCILLATOR: {
         int32_t type = 0;
         double frequency = 0, gain_left = 1, gain_right = 1, delay = 0;
         if (argc < 6 || JS_ToInt32(context, &type, argv[1]) < 0
@@ -424,38 +574,189 @@ JSValue js_game_audio_command(JSContext *context,
             || JS_ToFloat64(context, &gain_right, argv[4]) < 0
             || JS_ToFloat64(context, &delay, argv[5]) < 0)
             return JS_FALSE;
-        TilefinchGameAudio *audio = bridge->host->game_audio;
+        bridge = JS_GetContextOpaque(context);
+        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
         uint32_t voice = 0;
         if (!tilefinch_game_audio_start_oscillator(
-                audio, (TilefinchGameAudioOscillatorType) type,
+                bridge->host->game_audio,
+                (TilefinchGameAudioOscillatorType) type,
                 frequency, gain_left, gain_right, delay, &voice))
             return JS_FALSE;
         return JS_NewUint32(context, voice);
     }
-    double offset = 0, duration = 0, rate = 1;
-    double gain_left = 1, gain_right = 1;
-    double loop_start = 0, loop_end = 0, delay = 0;
-    int loop = 0;
-    if (command != 3 || argc < 11
-        || JS_ToFloat64(context, &offset, argv[2]) < 0
-        || JS_ToFloat64(context, &duration, argv[3]) < 0
-        || JS_ToFloat64(context, &rate, argv[4]) < 0
-        || JS_ToFloat64(context, &gain_left, argv[5]) < 0
-        || JS_ToFloat64(context, &gain_right, argv[6]) < 0
-        || (loop = JS_ToBool(context, argv[7])) < 0
-        || JS_ToFloat64(context, &loop_start, argv[8]) < 0
-        || JS_ToFloat64(context, &loop_end, argv[9]) < 0
-        || JS_ToFloat64(context, &delay, argv[10]) < 0) return JS_FALSE;
-    /* Every coercion above can run author code. Resolve the runtime-owned
-       engine only afterward so a nested close() cannot leave a stale native
-       pointer in this command. */
-    TilefinchGameAudio *audio = bridge->host->game_audio;
-    uint32_t voice = 0;
-    if (!tilefinch_game_audio_start(
-            audio, handle, offset, duration, rate, gain_left, gain_right,
-            loop > 0, loop_start, loop_end, delay, &voice)) return JS_FALSE;
-    return JS_NewUint32(context, voice);
+    default:
+        break;
+    }
+    uint32_t handle = 0;
+    if (argc < 2) return JS_FALSE;
+    if (JS_ToUint32(context, &handle, argv[1]) < 0) return JS_EXCEPTION;
+    /* Every coercion can run author code, which may close the context.
+       Resolve the runtime-owned engine only after the last one, so a nested
+       close() cannot leave a stale native pointer in this command. */
+    switch ((TilefinchGameAudioCommand) command) {
+    case TILEFINCH_GAME_AUDIO_COMMAND_STOP: {
+        double delay = 0;
+        if (argc > 2 && JS_ToFloat64(context, &delay, argv[2]) < 0)
+            return JS_FALSE;
+        bridge = JS_GetContextOpaque(context);
+        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
+        tilefinch_game_audio_stop(bridge->host->game_audio, handle, delay);
+        return JS_TRUE;
+    }
+    case TILEFINCH_GAME_AUDIO_COMMAND_SET_GAIN: {
+        double gain_left = 1, gain_right = 1;
+        if (argc < 4
+            || JS_ToFloat64(context, &gain_left, argv[2]) < 0
+            || JS_ToFloat64(context, &gain_right, argv[3]) < 0)
+            return JS_FALSE;
+        bridge = JS_GetContextOpaque(context);
+        return bridge != NULL && bridge->host != NULL
+            && tilefinch_game_audio_update_voice(
+                bridge->host->game_audio, handle, gain_left, gain_right)
+            ? JS_TRUE : JS_FALSE;
+    }
+    case TILEFINCH_GAME_AUDIO_COMMAND_SET_FREQUENCY: {
+        double frequency = 0;
+        if (argc < 3
+            || JS_ToFloat64(context, &frequency, argv[2]) < 0)
+            return JS_FALSE;
+        bridge = JS_GetContextOpaque(context);
+        return bridge != NULL && bridge->host != NULL
+            && tilefinch_game_audio_update_oscillator(
+                bridge->host->game_audio, handle, frequency)
+            ? JS_TRUE : JS_FALSE;
+    }
+    case TILEFINCH_GAME_AUDIO_COMMAND_GAIN_TARGET: {
+        double gain_left = 0, gain_right = 0;
+        double delay = 0, time_constant = 0;
+        if (argc < 6
+            || JS_ToFloat64(context, &gain_left, argv[2]) < 0
+            || JS_ToFloat64(context, &gain_right, argv[3]) < 0
+            || JS_ToFloat64(context, &delay, argv[4]) < 0
+            || JS_ToFloat64(context, &time_constant, argv[5]) < 0)
+            return JS_FALSE;
+        bridge = JS_GetContextOpaque(context);
+        return bridge != NULL && bridge->host != NULL
+            && tilefinch_game_audio_schedule_envelope_target(
+                bridge->host->game_audio, handle, gain_left, gain_right,
+                delay, time_constant)
+            ? JS_TRUE : JS_FALSE;
+    }
+    case TILEFINCH_GAME_AUDIO_COMMAND_CANCEL_GAIN:
+        bridge = JS_GetContextOpaque(context);
+        return bridge != NULL && bridge->host != NULL
+            && tilefinch_game_audio_cancel_envelope(
+                bridge->host->game_audio, handle) ? JS_TRUE : JS_FALSE;
+    case TILEFINCH_GAME_AUDIO_COMMAND_CANCEL_PITCH:
+        bridge = JS_GetContextOpaque(context);
+        return bridge != NULL && bridge->host != NULL
+            && tilefinch_game_audio_cancel_pitch_curve(
+                bridge->host->game_audio, handle) ? JS_TRUE : JS_FALSE;
+    case TILEFINCH_GAME_AUDIO_COMMAND_CURVE: {
+        int32_t pitch = 0;
+        double left = 1, right = 1, delay = 0, duration = 0;
+        if (argc < 8) return JS_FALSE;
+        if (JS_ToInt32(context, &pitch, argv[2]) < 0
+            || JS_ToFloat64(context, &left, argv[4]) < 0
+            || JS_ToFloat64(context, &right, argv[5]) < 0
+            || JS_ToFloat64(context, &delay, argv[6]) < 0
+            || JS_ToFloat64(context, &duration, argv[7]) < 0)
+            return JS_EXCEPTION;
+        if (pitch != 0 && pitch != 1) return JS_FALSE;
+        /* Coercion may close the context or detach the view. Collect bytes
+           only afterward, copy them before releasing the backing buffer,
+           and resolve the runtime-owned engine last. */
+        size_t offset = 0, length = 0, element_size = 0, storage = 0;
+        JSValue buffer = JS_GetTypedArrayBuffer(
+            context, argv[3], &offset, &length, &element_size);
+        if (JS_IsException(buffer)) return JS_EXCEPTION;
+        uint8_t *bytes = JS_GetArrayBuffer(context, &storage, buffer);
+        float values[TILEFINCH_GAME_AUDIO_CURVE_POINT_LIMIT];
+        bool valid = bytes != NULL && element_size == sizeof(float)
+            && offset <= storage && length <= storage - offset
+            && length % sizeof(float) == 0u
+            && length / sizeof(float) >= 2u
+            && length / sizeof(float) <= TILEFINCH_GAME_AUDIO_CURVE_POINT_LIMIT;
+        if (valid) memcpy(values, bytes + offset, length);
+        JS_FreeValue(context, buffer);
+        if (!valid) return JS_FALSE;
+        for (size_t at = 0; at < length / sizeof(float); at++) {
+            uint32_t bits = 0u;
+            memcpy(&bits, &values[at], sizeof(bits));
+            if ((bits & UINT32_C(0x7fffffff)) >= UINT32_C(0x7f800000))
+                return JS_ThrowTypeError(context,
+                    "Audio curve samples must be finite");
+        }
+        bridge = JS_GetContextOpaque(context);
+        return bridge != NULL && bridge->host != NULL
+            && tilefinch_game_audio_schedule_curve(
+                bridge->host->game_audio, handle, pitch != 0, values,
+                length / sizeof(float), left, right, delay, duration)
+            ? JS_TRUE : JS_FALSE;
+    }
+    case TILEFINCH_GAME_AUDIO_COMMAND_START_BUFFER: {
+        double offset = 0, duration = 0, rate = 1;
+        double gain_left = 1, gain_right = 1;
+        double loop_start = 0, loop_end = 0, delay = 0;
+        int loop = 0;
+        if (argc < 11
+            || JS_ToFloat64(context, &offset, argv[2]) < 0
+            || JS_ToFloat64(context, &duration, argv[3]) < 0
+            || JS_ToFloat64(context, &rate, argv[4]) < 0
+            || JS_ToFloat64(context, &gain_left, argv[5]) < 0
+            || JS_ToFloat64(context, &gain_right, argv[6]) < 0
+            || (loop = JS_ToBool(context, argv[7])) < 0
+            || JS_ToFloat64(context, &loop_start, argv[8]) < 0
+            || JS_ToFloat64(context, &loop_end, argv[9]) < 0
+            || JS_ToFloat64(context, &delay, argv[10]) < 0) return JS_FALSE;
+        bridge = JS_GetContextOpaque(context);
+        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
+        uint32_t voice = 0;
+        if (!tilefinch_game_audio_start(
+                bridge->host->game_audio, handle, offset, duration, rate,
+                gain_left, gain_right, loop > 0, loop_start, loop_end, delay,
+                &voice)) return JS_FALSE;
+        return JS_NewUint32(context, voice);
+    }
+    default:
+        return JS_FALSE;
+    }
 }
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+JSValue js_game_audio_command(JSContext *context,
+                             JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    if (!game_audio_native_measurement)
+        return js_game_audio_command_impl(context, this_value, argc, argv);
+    /* Observe an already-integer opcode without repeating author coercion.
+       Slot 12 is unknown/non-integer input. Reentrant calls are counted but
+       not timed twice; their time belongs to the outer native boundary. */
+    _Static_assert(SCRIPT_GAME_AUDIO_NATIVE_COMMANDS
+                       == TILEFINCH_GAME_AUDIO_COMMAND_COUNT + 1u,
+                   "one metrics slot per command plus the unknown slot");
+    unsigned slot = SCRIPT_GAME_AUDIO_NATIVE_COMMANDS - 1u;
+    if (argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
+        int command = JS_VALUE_GET_INT(argv[0]);
+        if (command >= 0 && command < (int) slot) slot = (unsigned) command;
+    }
+    bool outer = game_audio_native_depth++ == 0;
+    uint64_t before = outer ? tilefinch_platform_monotonic_time_us() : 0;
+    JSValue result = js_game_audio_command_impl(context, this_value, argc, argv);
+    uint64_t after = outer ? tilefinch_platform_monotonic_time_us() : 0;
+    game_audio_native_depth--;
+    if (outer) {
+        game_audio_native_metrics.command_calls[slot]++;
+        if (after >= before)
+            game_audio_native_metrics.command_us[slot] += after - before;
+    } else {
+        game_audio_native_metrics.nested_calls++;
+    }
+    return result;
+}
+#endif
+#endif /* TILEFINCH_GAME_AUDIO_REFERENCE */
 
 void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot)
 {
@@ -523,8 +824,10 @@ static unsigned char bridge_node_owner_tag_inherited(
 int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
 {
     if (bridge == NULL || node == NULL) return 0;
+    if (bridge->nodes == NULL) return 0;
     uintptr_t owner = js_rt_node_owner_identity(node);
-    size_t reusable = DOM_BRIDGE_NODE_LIMIT;
+    const size_t none = SIZE_MAX;
+    size_t reusable = none;
     size_t existing = bridge_node_index_find(bridge, node);
     if (existing != SIZE_MAX) {
         if (bridge->node_owner_document_identities[existing] == owner)
@@ -543,12 +846,14 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
              & (UINT32_C(1) << (existing % 32u))) != 0u)
             reusable = existing;
     }
-    if (reusable == DOM_BRIDGE_NODE_LIMIT) {
+    if (reusable == none) {
         size_t first = bridge_first_reusable_slot(bridge);
         if (first != SIZE_MAX) reusable = first;
     }
-    if (reusable == DOM_BRIDGE_NODE_LIMIT
-        && bridge->node_count == DOM_BRIDGE_NODE_LIMIT) {
+    if (reusable == none
+        && bridge->node_count == bridge->node_capacity) {
+        /* Dead wrappers are reclaimed first, exactly as at a fixed-size
+           table; only a table that is genuinely live grows. */
         bridge_reclaim_node_slots(bridge, node);
         /* Reclamation runs retirement callbacks, which may have registered
            this node meanwhile. */
@@ -558,9 +863,11 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
             return bridge_node_handle(bridge, again);
         size_t first = bridge_first_reusable_slot(bridge);
         if (first != SIZE_MAX) reusable = first;
+        else if (bridge->node_count == bridge->node_capacity)
+            (void) bridge_node_table_grow(bridge);
     }
-    if (reusable == DOM_BRIDGE_NODE_LIMIT) {
-        if (bridge->node_count == DOM_BRIDGE_NODE_LIMIT) {
+    if (reusable == none) {
+        if (bridge->node_count == bridge->node_capacity) {
             if (bridge->result != NULL
                 && bridge->result->dom_handle_exhaustions != SIZE_MAX) {
                 bridge->result->dom_handle_exhaustions++;
@@ -641,7 +948,7 @@ static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot)
 void js_rt_bridge_wrapper_refs_free(DomBridge *bridge)
 {
     if (bridge == NULL || bridge->wrapper_refs == NULL) return;
-    for (size_t slot = 0; slot < DOM_BRIDGE_NODE_LIMIT; slot++)
+    for (size_t slot = 0; slot < bridge->node_capacity; slot++)
         bridge_wrapper_ref_clear(bridge, slot);
     budget_free(bridge->budget, bridge->wrapper_refs);
     bridge->wrapper_refs = NULL;
@@ -675,9 +982,9 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
     if (argc > 1 && JS_IsObject(argv[1])) {
         if (bridge->wrapper_refs == NULL) {
             bridge->wrapper_refs = budget_calloc(
-                bridge->budget, DOM_BRIDGE_NODE_LIMIT, sizeof(JSValue));
+                bridge->budget, bridge->node_capacity, sizeof(JSValue));
             if (bridge->wrapper_refs != NULL)
-                for (size_t at = 0; at < DOM_BRIDGE_NODE_LIMIT; at++)
+                for (size_t at = 0; at < bridge->node_capacity; at++)
                     bridge->wrapper_refs[at] = JS_UNDEFINED;
         }
         if (bridge->wrapper_refs != NULL) {
@@ -776,7 +1083,7 @@ JSValue js_dom_release_node_wrapper(JSContext *context,
    the table; a collection that frees little backs off exponentially within
    one entry into JavaScript, so a genuinely full table cannot turn every
    refused registration into a collection. */
-#define BRIDGE_RECLAIM_ENOUGH (DOM_BRIDGE_NODE_LIMIT / 64u)
+#define BRIDGE_RECLAIM_ENOUGH(bridge) ((bridge)->node_capacity / 64u)
 #define BRIDGE_RECLAIM_BACKOFF_MAX 1024u
 
 static size_t bridge_release_dead_wrappers(DomBridge *bridge,
@@ -807,7 +1114,7 @@ static void bridge_reclaim_node_slots(DomBridge *bridge,
         || bridge->node_reclaim_active) return;
     bridge->node_reclaim_active = true;
     size_t released = bridge_release_dead_wrappers(bridge, keep);
-    if (released < BRIDGE_RECLAIM_ENOUGH) {
+    if (released < BRIDGE_RECLAIM_ENOUGH(bridge)) {
         if (bridge->node_reclaim_gc_skip != 0) {
             bridge->node_reclaim_gc_skip--;
         } else {
@@ -816,7 +1123,7 @@ static void bridge_reclaim_node_slots(DomBridge *bridge,
             JS_RunGC(bridge->host->runtime);
             JS_RunGC(bridge->host->runtime);
             released += bridge_release_dead_wrappers(bridge, keep);
-            if (released < BRIDGE_RECLAIM_ENOUGH) {
+            if (released < BRIDGE_RECLAIM_ENOUGH(bridge)) {
                 uint32_t backoff = bridge->node_reclaim_gc_backoff == 0
                     ? 8u : 2u * (uint32_t) bridge->node_reclaim_gc_backoff;
                 if (backoff > BRIDGE_RECLAIM_BACKOFF_MAX)
@@ -826,7 +1133,7 @@ static void bridge_reclaim_node_slots(DomBridge *bridge,
             }
         }
     }
-    if (released >= BRIDGE_RECLAIM_ENOUGH) {
+    if (released >= BRIDGE_RECLAIM_ENOUGH(bridge)) {
         bridge->node_reclaim_gc_skip = 0;
         bridge->node_reclaim_gc_backoff = 0;
     }
@@ -950,13 +1257,21 @@ static bool bridge_subtree_visit_handles(void *opaque, lxb_dom_node_t *node)
     return false;
 }
 
+static void bridge_adopted_sheet_unpin(DomBridge *bridge,
+                                       lxb_dom_node_t *sheet);
+static void bridge_mutation_journal_append(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length,
+    const uint32_t *changed_tokens, size_t changed_token_count,
+    bool relational, uint64_t has_entries, uint32_t has_serial);
+
 static size_t bridge_discard_unretained_detached_subtree(
     DomBridge *bridge, lxb_dom_node_t *root)
 {
     if (bridge == NULL || root == NULL || root->parent != NULL) return 0;
     /* One walk finds every handle inside the subtree through the pointer
        index; any still-retained identity keeps the whole subtree. */
-    unsigned char retire_slots[(DOM_BRIDGE_NODE_LIMIT + 7u) / 8u] = {0};
+    unsigned char retire_slots[(DOM_BRIDGE_NODE_LIMIT_MAX + 7u) / 8u] = {0};
     BridgeSubtreeHandleScan handle_scan = {
         bridge, retire_slots, SIZE_MAX, 0
     };
@@ -1087,10 +1402,17 @@ static size_t bridge_discard_unretained_detached_subtree(
         bridge->node_retirement(bridge->node_retirement_opaque, root);
     }
     document_parser_insertions_discard_subtree(bridge->document, root);
+    /* Adoption lists of shadow roots inside the subtree go with it; the
+       sheets they alone adopted lose their pin below. */
+    lxb_dom_node_t *unadopted[DOCUMENT_CONSTRUCTED_SHEET_LIMIT];
+    size_t unadopted_count = document_adoptions_discard_subtree(
+        bridge->document, root, unadopted, DOCUMENT_CONSTRUCTED_SHEET_LIMIT);
     /* Detached: no style can change, and the removal walk is wasted. */
     document_style_quiet_begin();
     lxb_dom_node_destroy_deep(root);
     document_style_quiet_end();
+    for (size_t i = 0; i < unadopted_count; i++)
+        bridge_adopted_sheet_unpin(bridge, unadopted[i]);
     /* Cleanup callbacks are JavaScript. Run them only after native teardown
        and handle retirement are complete, so author reentrancy cannot destroy
        the subtree a second time. */
@@ -1109,6 +1431,233 @@ void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle)
     if (node == NULL || bridge_node_is_connected(node)) return;
     lxb_dom_node_t *root = bridge_owned_lifetime_root(node);
     (void) bridge_discard_unretained_detached_subtree(bridge, root);
+}
+
+/* Constructed stylesheets (document.h, document_adopted_sheets_active).
+   A sheet's text lives in a detached <style> element held by its
+   CSSStyleSheet; while any adoptedStyleSheets list names it the bridge pins
+   it, so a collected wrapper cannot free an element the cascade parses. */
+static void bridge_adopted_sheet_unpin(DomBridge *bridge,
+                                       lxb_dom_node_t *sheet)
+{
+    if (bridge == NULL || sheet == NULL
+        || document_constructed_sheet_adopted(bridge->document, sheet))
+        return;
+    size_t slot = bridge_node_index_find(bridge, sheet);
+    if (slot == SIZE_MAX) return;
+    bridge_release_native_node_pin(bridge, bridge_node_handle(bridge, slot));
+}
+
+/* What adoption contributes to the cascade changed. Journaled as an
+   author data attribute on `scope` (a shadow root's carrier, or the root
+   element for the document's list and sheet text), which restyles nothing
+   by itself, with the stylesheet flags set: navigation then inserts newly
+   adopted sheets after the document's sources, restyles the roots whose
+   scope moved, or rebuilds (navigation_try_append_style_sources). */
+static void bridge_note_adopted_styles_changed(DomBridge *bridge,
+                                               lxb_dom_node_t *scope)
+{
+    static const char attribute[] = "data-adopted-stylesheets";
+    if (bridge == NULL || bridge->document == NULL
+        || bridge->document->html == NULL) return;
+    lxb_dom_element_t *root_element = lxb_dom_document_element(
+        &bridge->document->html->dom_document);
+    if (root_element == NULL) return;
+    if (scope == NULL || !bridge_node_is_connected(scope))
+        scope = lxb_dom_interface_node(root_element);
+    bridge->dom_version++;
+    document_note_connected_mutation(bridge->document);
+    document_style_changed();
+    bridge->computed_style_cache.dirty_all = true;
+    if (bridge->result != NULL) {
+        bridge->result->dom_mutations++;
+        bridge->result->relayout_required = true;
+    }
+    if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
+    bridge_mutation_journal_append(
+        bridge, SCRIPT_MUTATION_ATTRIBUTE, scope, attribute,
+        sizeof(attribute) - 1u, NULL, 0, false, UINT64_MAX, 0);
+    bridge->mutations.resource_rebuild_required = true;
+    bridge->mutations.stylesheet_rebuild_required = true;
+}
+
+/* __tilefinchConstructedSheetText(handle, text): makes `text` the sheet
+   element's only child and registers the sheet. False (nothing applied)
+   when the element is not a detached <style> or a bound refuses it. */
+JSValue js_dom_constructed_sheet_text(JSContext *context,
+                                      JSValueConst this_value,
+                                      int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 1
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    if (node == NULL || bridge->document == NULL
+        || bridge->document->html == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->local_name != LXB_TAG_STYLE || node->ns != LXB_NS_HTML
+        || node->parent != NULL) return JS_FALSE;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(context, &length, argv[1]);
+    if (text == NULL) return JS_EXCEPTION;
+    bool ok = document_constructed_sheet_text_fits(
+        bridge->document, node, length);
+    lxb_dom_text_t *replacement = !ok || length == 0 ? NULL
+        : lxb_dom_document_create_text_node(
+            &bridge->document->html->dom_document,
+            (const lxb_char_t *) text, length);
+    JS_FreeCString(context, text);
+    if (length != 0 && replacement == NULL) ok = false;
+    bool active = false;
+    if (ok) ok = document_constructed_sheet_note_text(
+        bridge->document, node, length, &active);
+    if (!ok) {
+        if (replacement != NULL)
+            lxb_dom_node_destroy_deep(lxb_dom_interface_node(replacement));
+        return JS_FALSE;
+    }
+    while (node->first_child != NULL) {
+        lxb_dom_node_t *removed = node->first_child;
+        document_style_quiet_begin();
+        lxb_dom_node_remove(removed);
+        document_style_quiet_end();
+        (void) bridge_discard_unretained_detached_subtree(bridge, removed);
+    }
+    if (replacement != NULL) {
+        document_style_quiet_begin();
+        (void) lxb_dom_node_append_child(
+            node, lxb_dom_interface_node(replacement));
+        document_style_quiet_end();
+    }
+    if (active) bridge_note_adopted_styles_changed(bridge, NULL);
+    return JS_TRUE;
+}
+
+/* __tilefinchCssStatementEnds(text): the UTF-16 end offsets of the complete
+   top-level statements of `text`, split by the native stylesheet scanner
+   (stylesheet_next_statement), then the number of blocks its unfinished
+   tail leaves open. -1 instead of that tail count means a bounded batch of
+   complete statements was returned; the caller resumes at its last end. */
+JSValue js_css_statement_ends(JSContext *context, JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    size_t length = 0;
+    const char *text = argc > 0
+        ? JS_ToCStringLen(context, &length, argv[0])
+        : NULL;
+    if (text == NULL) return JS_EXCEPTION;
+#ifndef __PSP__
+    if (length > tilefinch_test_faults()->css_statement_max_source_bytes)
+        tilefinch_test_faults()->css_statement_max_source_bytes = length;
+#endif
+    JSValue ends = JS_NewArray(context);
+    size_t offset = 0, open_blocks = 0, mapped = 0;
+    int64_t units = 0;
+    uint32_t count = 0;
+    bool more = true;
+    /* This is a batch bound, not a stylesheet rule cap. Dense sheets must
+       not allocate their whole offset table before the joined-text quota
+       can stop them. Every batch is continued at a complete statement. */
+    const uint32_t statement_batch = 4096u;
+    while (!JS_IsException(ends) && more && count < statement_batch) {
+        more = stylesheet_next_statement(text, length, &offset, &open_blocks);
+        /* UTF-8 lead bytes start one UTF-16 unit, four-byte ones two. */
+        for (; more && mapped < offset; mapped++) {
+            unsigned char byte = (unsigned char) text[mapped];
+            if ((byte & 0xc0u) != 0x80u) units += byte >= 0xf0u ? 2 : 1;
+        }
+        if (JS_SetPropertyUint32(
+                context, ends, count++,
+                JS_NewInt64(context,
+                            more ? units : (int64_t) open_blocks)) < 0) {
+            JS_FreeValue(context, ends);
+            ends = JS_EXCEPTION;
+        }
+    }
+    if (!JS_IsException(ends) && more && count == statement_batch
+        && JS_SetPropertyUint32(context, ends, count, JS_NewInt32(context, -1)) < 0) {
+        JS_FreeValue(context, ends);
+        ends = JS_EXCEPTION;
+    }
+    JS_FreeCString(context, text);
+    return ends;
+}
+
+/* __tilefinchFontShorthandValid(text): whether `text` parses as a CSS font
+   shorthand value by the cascade's own parser (document.fonts.check and
+   load use it), with the realm's stylesheet for viewport units when there
+   is one. */
+JSValue js_font_shorthand_valid(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    size_t length = 0;
+    const char *text = argc > 0
+        ? JS_ToCStringLen(context, &length, argv[0])
+        : NULL;
+    if (text == NULL) return JS_EXCEPTION;
+    ComputedStyle font = {0};
+    bool valid = style_parse_font_shorthand(
+        bridge == NULL ? NULL : (const Stylesheet *) bridge->stylesheet,
+        text, length, &font);
+    JS_FreeCString(context, text);
+    return JS_NewBool(context, valid);
+}
+
+/* __tilefinchSetAdoptedSheets(rootHandle, [sheetHandles]): rootHandle 0
+   is the document, otherwise a shadow root's carrier. Every sheet must have
+   been given text first. False (nothing changes) when a bound refuses. */
+JSValue js_dom_set_adopted_sheets(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->document == NULL || argc < 2)
+        return JS_FALSE;
+    int64_t root_handle = 0;
+    if (JS_ToInt64(context, &root_handle, argv[0]) < 0) return JS_EXCEPTION;
+    lxb_dom_node_t *root = NULL;
+    if (root_handle != 0) {
+        root = js_rt_bridge_node_arg(context, bridge, argv[0]);
+        if (root == NULL) return JS_FALSE;
+    }
+    int64_t length = 0;
+    JSValue length_value = JS_GetPropertyStr(context, argv[1], "length");
+    if (JS_IsException(length_value)) return JS_EXCEPTION;
+    int status = JS_ToInt64(context, &length, length_value);
+    JS_FreeValue(context, length_value);
+    if (status < 0) return JS_EXCEPTION;
+    if (length < 0 || length > (int64_t) DOCUMENT_ADOPTED_SHEETS_PER_ROOT)
+        return JS_FALSE;
+    lxb_dom_node_t *sheets[DOCUMENT_ADOPTED_SHEETS_PER_ROOT];
+    for (int64_t i = 0; i < length; i++) {
+        JSValue item = JS_GetPropertyUint32(context, argv[1], (uint32_t) i);
+        if (JS_IsException(item)) return JS_EXCEPTION;
+        sheets[i] = js_rt_bridge_node_arg(context, bridge, item);
+        JS_FreeValue(context, item);
+        if (sheets[i] == NULL
+            || !document_constructed_sheet_known(bridge->document, sheets[i]))
+            return JS_FALSE;
+    }
+    uint64_t before = document_adopted_sheets_signature(bridge->document);
+    lxb_dom_node_t *released[DOCUMENT_ADOPTED_SHEETS_PER_ROOT];
+    size_t released_count = 0;
+    if (!document_adoption_set(bridge->document, root, sheets,
+                               (size_t) length, released, &released_count))
+        return JS_FALSE;
+    for (int64_t i = 0; i < length; i++) {
+        size_t slot = bridge_node_index_find(bridge, sheets[i]);
+        if (slot != SIZE_MAX)
+            bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+    }
+    if (document_adopted_sheets_signature(bridge->document) != before)
+        bridge_note_adopted_styles_changed(bridge, root);
+    for (size_t i = 0; i < released_count; i++)
+        bridge_adopted_sheet_unpin(bridge, released[i]);
+    return JS_TRUE;
 }
 
 static void bridge_detach_and_discard_children(
@@ -1520,10 +2069,17 @@ lxb_dom_node_t *dom_document_order_next(
     return node;
 }
 
-static void script_element_states_register_parsed_subtree(
-    DomBridge *bridge, lxb_dom_node_t *container)
+/* innerHTML marks every parsed script "already started", so it never runs.
+   Range.createContextualFragment instead clears that flag and the parser
+   document: its scripts are script-inserted (programmatic, not force-async)
+   and run through the ordinary insertion path, CSP included, when the
+   fragment is connected. Those must all get native state, or one would be
+   silently inert, so a capacity failure there rolls back and reports. */
+static bool script_element_states_register_parsed_subtree(
+    DomBridge *bridge, lxb_dom_node_t *container, bool unstarted)
 {
-    if (bridge == NULL || container == NULL) return;
+    if (bridge == NULL || container == NULL) return false;
+    size_t initial_count = bridge->script_element_count;
     DomDocumentOrderTraversal traversal = {
         .next = container->first_child, .boundary = container
     };
@@ -1534,20 +2090,36 @@ static void script_element_states_register_parsed_subtree(
         if (name == NULL || name_length != 6
             || strncasecmp(name, "script", 6) != 0) continue;
         ScriptElementState *state = js_rt_script_element_state_register(
-            bridge, at, true);
+            bridge, at, !unstarted || at->ns == LXB_NS_HTML);
         if (state != NULL) {
-            state->programmatic = false;
+            state->programmatic = unstarted;
             state->force_async = false;
-            state->already_started = true;
+            state->already_started = !unstarted;
+        } else if (unstarted) {
+            memset(bridge->script_elements + initial_count, 0,
+                   (bridge->script_element_count - initial_count)
+                       * sizeof(bridge->script_elements[0]));
+            bridge->script_element_count = initial_count;
+            return false;
         }
     }
+    return true;
 }
 
-static bool script_element_states_clone_subtree(
+/* HTML's script cloning steps copy only "already started": a clone of a
+   script that ran (or failed, or was refused) never runs, and a clone of
+   one that never started (template contents, a non-script type, no
+   source yet) runs once when inserted. Everything else is a new element's:
+   no parser document (script-inserted) and force-async set.
+
+   Every cloned script element gets native state, including clones of the
+   host parser's scripts, which have none: a script without state is what
+   the document pipeline's discovery waves execute as newly inserted, which
+   ran parser-script clones a second time. */
+static bool script_element_states_clone_pass(
     DomBridge *bridge, lxb_dom_node_t *source, lxb_dom_node_t *clone,
-    bool deep)
+    bool deep, size_t *started, size_t *unstarted)
 {
-    if (bridge == NULL || source == NULL || clone == NULL) return false;
     size_t initial_count = bridge->script_element_count;
     DomDocumentOrderTraversal source_traversal = {
         .next = source, .boundary = source
@@ -1561,11 +2133,20 @@ static bool script_element_states_clone_subtree(
         lxb_dom_node_t *clone_node = dom_document_order_next(
             &clone_traversal);
         if (source_node == NULL || clone_node == NULL) break;
+        size_t name_length = 0;
+        const char *name = document_element_name(source_node, &name_length);
         ScriptElementState *source_state = js_rt_script_element_state_find(
             bridge, source_node);
-        if (source_state != NULL) {
-            ScriptElementState *clone_state = js_rt_script_element_state_register(
-                bridge, clone_node, source_state->html);
+        if (source_state != NULL
+            || (name != NULL && name_length == 6
+                && strncasecmp(name, "script", 6) == 0)) {
+            bool already_started = source_state != NULL
+                ? source_state->already_started
+                : js_rt_script_element_parser_started(source_node);
+            bool html = source_state != NULL ? source_state->html
+                                             : source_node->ns == LXB_NS_HTML;
+            ScriptElementState *clone_state =
+                js_rt_script_element_state_register(bridge, clone_node, html);
             if (clone_state == NULL) {
                 memset(bridge->script_elements + initial_count, 0,
                        (bridge->script_element_count - initial_count)
@@ -1573,13 +2154,54 @@ static bool script_element_states_clone_subtree(
                 bridge->script_element_count = initial_count;
                 return false;
             }
-            clone_state->programmatic = source_state->programmatic;
-            clone_state->force_async = source_state->force_async;
-            clone_state->already_started = source_state->already_started;
+            clone_state->programmatic = true;
+            clone_state->force_async = html;
+            clone_state->already_started = already_started;
+#if TILEFINCH_SCRIPT_CLONE_CENSUS
+            clone_state->census_started_clone = already_started;
+#endif
+            if (already_started) (*started)++;
+            else (*unstarted)++;
         }
         if (!deep) break;
     }
     return true;
+}
+
+/* The table is bounded and its entries are released only when a dropped
+   clone's wrapper is reclaimed, which a long synchronous script (a slider
+   cloning slides in a loop) never reaches on its own. A full table first
+   reclaims dead wrappers, as handle registration does; when the subtree
+   still cannot be recorded, the clone is refused and reported rather than
+   produced with a script that could run again. */
+static bool script_element_states_clone_subtree(
+    DomBridge *bridge, lxb_dom_node_t *source, lxb_dom_node_t *clone,
+    bool deep)
+{
+    if (bridge == NULL || source == NULL || clone == NULL) return false;
+    size_t started = 0, unstarted = 0;
+    bool recorded = script_element_states_clone_pass(
+        bridge, source, clone, deep, &started, &unstarted);
+    if (!recorded) {
+        bridge_reclaim_node_slots(bridge, source);
+        started = unstarted = 0;
+        recorded = script_element_states_clone_pass(
+            bridge, source, clone, deep, &started, &unstarted);
+    }
+#if TILEFINCH_SCRIPT_CLONE_CENSUS
+    if (bridge->result != NULL) {
+        js_rt_saturating_add_size(
+            recorded ? &bridge->result->script_clones_started
+                     : &bridge->result->script_clones_refused,
+            recorded ? started : 1);
+        if (recorded) js_rt_saturating_add_size(
+            &bridge->result->script_clones_unstarted, unstarted);
+    }
+#else
+    (void) started;
+    (void) unstarted;
+#endif
+    return recorded;
 }
 
 static lxb_dom_node_t *selector_query(
@@ -1704,9 +2326,14 @@ typedef enum {
     BRIDGE_MUTATION_RESOURCE_NONE = 0,
     BRIDGE_MUTATION_RESOURCE_IMAGE = 1u << 0,
     BRIDGE_MUTATION_RESOURCE_STYLESHEET = 1u << 1,
-    BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT = 1u << 2
+    BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT = 1u << 2,
+    /* Not a fetched resource: a <meta http-equiv=refresh>, which navigation
+       must consider for the document's declarative refresh. */
+    BRIDGE_MUTATION_RESOURCE_REFRESH_META = 1u << 3
 } BridgeMutationResourceFlags;
 
+/* An HTML <meta> whose http-equiv is "refresh" (ASCII case-insensitive,
+   untrimmed, as the enumerated attribute is matched). */
 static bool bridge_mutation_link_is_style_resource(lxb_dom_node_t *node)
 {
     size_t length = 0;
@@ -1827,7 +2454,7 @@ static bool bridge_mutation_style_property_is_resource(
 }
 
 static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
-    lxb_dom_node_t *root)
+    const PocDocument *document, lxb_dom_node_t *root)
 {
     /* DOM parent links let this be a stackless depth-first walk.  The caps
        prevent hostile author trees from turning one bridge call into an
@@ -1835,6 +2462,7 @@ static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
        "clean".  The root's siblings are intentionally outside the subtree. */
     enum { MAXIMUM_SUBTREE_WORK = 256, MAXIMUM_SUBTREE_DEPTH = 48 };
     if (root == NULL) return BRIDGE_MUTATION_RESOURCE_NONE;
+    bool adopters = document_adoption_shadow_roots_present(document);
     lxb_dom_node_t *node = root;
     size_t work = 0, depth = 0;
     BridgeMutationResourceFlags result = BRIDGE_MUTATION_RESOURCE_NONE;
@@ -1845,6 +2473,15 @@ static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
         size_t tag_length = 0;
         const char *tag = document_element_name(node, &tag_length);
         if (bridge_mutation_name_equal(tag, tag_length, "style")) {
+            result |= BRIDGE_MUTATION_RESOURCE_STYLESHEET;
+        }
+        if (document_is_refresh_meta(node)) {
+            result |= BRIDGE_MUTATION_RESOURCE_REFRESH_META;
+        }
+        /* A shadow root's adopted sheets enter or leave the cascade with
+           its carrier. */
+        if (adopters && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_adoption_root_has_sheets(document, node)) {
             result |= BRIDGE_MUTATION_RESOURCE_STYLESHEET;
         }
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
@@ -2085,6 +2722,7 @@ static void bridge_mutation_journal_append(
     record->has_entries = has_serial == 0 ? UINT64_MAX : has_entries;
     record->inserted_from_detached = false;
     record->scope = NULL;
+    record->removed_last = false;
     record->owner_document_identity = js_rt_node_owner_identity(node);
     size_t copy_length = attribute == NULL ? 0 : attribute_length;
     if (copy_length >= sizeof(record->attribute)) {
@@ -2220,6 +2858,9 @@ static void bridge_mutated_summarized(
     bool image_resource_scan = false;
     bool image_resource_refresh = false;
     bool conservative_scan = false;
+    /* A connected <meta http-equiv=refresh> may have arrived (or a subtree
+       too large to inspect did). */
+    bool refresh_meta = false;
     switch (kind) {
     case SCRIPT_MUTATION_TEXT:
         if (node == NULL) conservative_scan = true;
@@ -2265,6 +2906,14 @@ static void bridge_mutated_summarized(
         BridgeMutationResourceFlags flags =
             bridge_mutation_resource_attribute(
                 node, attribute, attribute_length);
+        /* Setting content or http-equiv on a connected meta processes it
+           again, as browsers do for an element already in the document. */
+        refresh_meta = node != NULL && node->local_name == LXB_TAG_META
+            && node->ns == LXB_NS_HTML
+            && (bridge_mutation_name_equal(
+                    attribute, attribute_length, "content")
+                || bridge_mutation_name_equal(
+                    attribute, attribute_length, "http-equiv"));
         /* A style attribute is an inline declaration block, not a sheet:
            a URL (or var() that may resolve to one) in the new value needs
            additive image discovery, never a stylesheet rebuild. */
@@ -2295,7 +2944,7 @@ static void bridge_mutated_summarized(
     case SCRIPT_MUTATION_INNER_HTML:
     {
         BridgeMutationResourceFlags subtree =
-            bridge_mutation_resource_subtree(node);
+            bridge_mutation_resource_subtree(bridge->document, node);
         resource_rebuild = node != NULL
             && (bridge_mutation_inside_style(node)
                 || (subtree & (BRIDGE_MUTATION_RESOURCE_IMAGE
@@ -2309,13 +2958,16 @@ static void bridge_mutated_summarized(
            inferred by walking only the replacement subtree. */
         conservative_scan = !resource_rebuild
             || (subtree & BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT) != 0;
+        refresh_meta = (subtree & (BRIDGE_MUTATION_RESOURCE_REFRESH_META
+                                   | BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT))
+            != 0;
         break;
     }
     case SCRIPT_MUTATION_CHILD_LIST:
     case SCRIPT_MUTATION_HEAD_SCRIPT:
     {
         BridgeMutationResourceFlags subtree =
-            bridge_mutation_resource_subtree(node);
+            bridge_mutation_resource_subtree(bridge->document, node);
         bool connected = node != NULL && bridge_node_is_connected(node);
         if (!connected) {
             /* A removal can invalidate retained decoded surfaces and source
@@ -2335,6 +2987,9 @@ static void bridge_mutated_summarized(
         }
         conservative_scan =
             (subtree & BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT) != 0;
+        refresh_meta = connected
+            && (subtree & (BRIDGE_MUTATION_RESOURCE_REFRESH_META
+                           | BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT)) != 0;
         break;
     }
     case SCRIPT_MUTATION_CANVAS:
@@ -2395,6 +3050,7 @@ static void bridge_mutated_summarized(
                                 && bridge_mutation_style_property_affects_svg_raster(
                                        attribute, attribute_length)))))
                && bridge_mutation_subtree_contains_image(bridge, node)));
+    if (refresh_meta) bridge->refresh_meta_mutated = true;
     journal->resource_rebuild_required |= resource_rebuild;
     journal->image_rebuild_required |= resource_rebuild && image_rebuild;
     journal->stylesheet_rebuild_required |= resource_rebuild && stylesheet_cause;
@@ -2536,10 +3192,13 @@ JSValue js_dom_query(JSContext *context, JSValueConst this_value,
 }
 
 /* Results one querySelectorAll or descendant walk may return. Every result
-   takes a node handle slot, so stay well inside the handle table; 128
-   silently truncated ordinary pages (chatgpt.com's partial-update polyfill
-   walks every comment in the document to find its answer's targets). */
-#define DOM_QUERY_RESULT_LIMIT (SCRIPT_DOM_HANDLE_SLOT_CAPACITY / 2u)
+   holds its own node handle, so the handle table is the real bound: a walk
+   needing more handles than the table can give throws the handle-exhausted
+   error instead of returning a short list. One past the largest table keeps
+   the walk going until that failing registration rather than truncating
+   silently (a fixed cap of 128, later 4,096, cut whole-document walks
+   short on large pages). */
+#define DOM_QUERY_RESULT_LIMIT (SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX + 1u)
 
 /* False when a match could not be given a handle. */
 static bool query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
@@ -2785,6 +3444,76 @@ JSValue js_rt_wrap_dom_handle(JSContext *context, JSValueConst handle)
     }
     return JS_Call(
         context, bridge->trusted_node_wrap, JS_UNDEFINED, 1, &handle);
+}
+
+JSValue js_rt_bridge_wrap_node(JSContext *context, DomBridge *bridge,
+                               lxb_dom_node_t *node)
+{
+    JSValue handle = bridge_node_handle_value(context, bridge, node);
+    if (JS_IsException(handle)) return handle;
+    JSValue wrapped = js_rt_wrap_dom_handle(context, handle);
+    JS_FreeValue(context, handle);
+    return wrapped;
+}
+
+int64_t js_rt_document_scope(JSContext *context, JSValueConst value)
+{
+    JSValue handle_value = JS_GetPropertyStr(context, value, "__handle");
+    if (JS_IsException(handle_value)) return -2;
+    if (!JS_IsUndefined(handle_value)) {
+        int64_t handle = 0;
+        int converted = JS_ToInt64(context, &handle, handle_value);
+        JS_FreeValue(context, handle_value);
+        if (converted < 0) return -2;
+        DomBridge *bridge = JS_GetContextOpaque(context);
+        size_t slot = 0;
+        return handle > 0
+            && js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+            && bridge->nodes[slot]->type == LXB_DOM_NODE_TYPE_DOCUMENT
+            ? handle : -1;
+    }
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue document = JS_IsException(global) ? JS_EXCEPTION
+        : JS_GetPropertyStr(context, global, "document");
+    JS_FreeValue(context, global);
+    if (JS_IsException(document)) return -2;
+    bool realm_document = js_values_strict_equal(context, value, document);
+    JS_FreeValue(context, document);
+    return realm_document ? 0 : -1;
+}
+
+bool js_rt_element_walk_init(DomElementWalk *walk, DomBridge *bridge,
+                             int64_t scope)
+{
+    *walk = (DomElementWalk) { .bridge = bridge, .shadow_depth = SIZE_MAX };
+    if (bridge == NULL || bridge->document == NULL
+        || bridge->document->html == NULL) return false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(bridge->document->html);
+    walk->boundary = root;
+    if (scope != 0) {
+        size_t slot = 0;
+        if (!js_rt_bridge_node_slot_for_handle(bridge, scope, &slot)
+            || bridge->nodes[slot]->type != LXB_DOM_NODE_TYPE_DOCUMENT)
+            return false;
+        walk->boundary = bridge->nodes[slot];
+        root = bridge->nodes[slot]->first_child;
+    }
+    return bridge_document_order_traversal_init(
+        bridge, &walk->traversal, root, walk->boundary);
+}
+
+lxb_dom_node_t *js_rt_element_walk_next(DomElementWalk *walk)
+{
+    for (lxb_dom_node_t *at = dom_document_order_next(&walk->traversal);
+         at != NULL; at = dom_document_order_next(&walk->traversal)) {
+        if (bridge_query_node_hidden_by_shadow(
+                walk->bridge, at, walk->boundary, &walk->traversal,
+                &walk->shadow_depth)) continue;
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && bridge_traversal_node_visible(
+                   walk->bridge, at, &walk->traversal)) return at;
+    }
+    return NULL;
 }
 
 static lxb_dom_node_t *find_element_id_exact(DomBridge *bridge,
@@ -3417,7 +4146,7 @@ JSValue js_dom_node_owner(JSContext *context, JSValueConst this_value,
     if (JS_ToInt32(context, &tag, argv[1]) < 0) return JS_EXCEPTION;
     if (tag < 1 || tag > 255) return JS_FALSE;
     if (tags == NULL) {
-        tags = budget_calloc(bridge->budget, DOM_BRIDGE_NODE_LIMIT, 1);
+        tags = budget_calloc(bridge->budget, bridge->node_capacity, 1);
         if (tags == NULL) return JS_FALSE;
         /* Registered nodes are the document's or template contents'. */
         for (size_t at = 0; at < bridge->node_count; at++)
@@ -4243,6 +4972,55 @@ JSValue js_dom_named_element_ids(JSContext *context,
     return array;
 }
 
+/* Handles of the <iframe> and <frame> elements in the document's tree (or
+   in the subtree at the optional root handle), in tree order: the
+   containers of the document-tree child navigables window.length, window[i]
+   and window[name] answer for. Template contents and shadow trees (their
+   carriers' subtrees) are not in that tree. Bounded like a query result. */
+JSValue js_dom_frame_handles(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    JSValue array = JS_NewArray(context);
+    if (JS_IsException(array) || bridge == NULL
+        || bridge->document == NULL || bridge->document->html == NULL)
+        return array;
+    /* Most pages have no frames at all: skip the walk (this runs before
+       every script and on every element insertion or removal). */
+    if (document_frames_impossible(bridge->document)) return array;
+    lxb_dom_node_t *root = argc > 0 && !JS_IsUndefined(argv[0])
+        ? js_rt_bridge_node_arg(context, bridge, argv[0])
+        : lxb_dom_interface_node(bridge->document->html);
+    DomDocumentOrderTraversal traversal;
+    if (root == NULL || !bridge_document_order_traversal_init(
+            bridge, &traversal, root, root)) return array;
+    uint32_t count = 0;
+    size_t shadow_depth = SIZE_MAX;
+    for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
+         at != NULL && count < DOM_QUERY_RESULT_LIMIT;
+         at = dom_document_order_next(&traversal)) {
+        if (bridge_query_node_hidden_by_shadow(
+                bridge, at, root, &traversal, &shadow_depth)
+            || at->type != LXB_DOM_NODE_TYPE_ELEMENT || at->ns != LXB_NS_HTML
+            || (at->local_name != LXB_TAG_IFRAME
+                && at->local_name != LXB_TAG_FRAME)
+            || !bridge_traversal_node_visible(bridge, at, &traversal))
+            continue;
+        int64_t handle = js_rt_bridge_register_node(bridge, at);
+        if (handle == 0) {
+            JS_FreeValue(context, array);
+            return bridge_throw_handles_exhausted(context);
+        }
+        if (JS_SetPropertyUint32(context, array, count++,
+                                 JS_NewInt64(context, handle)) < 0) {
+            JS_FreeValue(context, array);
+            return JS_EXCEPTION;
+        }
+    }
+    return array;
+}
+
 JSValue js_dom_content(JSContext *context, JSValueConst this_value,
                        int argc, JSValueConst *argv)
 {
@@ -4343,6 +5121,7 @@ JSValue js_dom_clone(JSContext *context, JSValueConst this_value,
                                          : lxb_dom_node_clone(node, deep);
     if (clone != NULL
         && (!bridge_clear_cloned_node_user(clone, deep)
+            || !document_nonce_clone_subtree(node, clone, deep)
             || !script_element_states_clone_subtree(
                    bridge, node, clone, deep))) {
         lxb_dom_node_destroy_deep(clone);
@@ -4866,9 +5645,14 @@ JSValue js_dom_get_inner_html(JSContext *context,
     return value;
 }
 
+/* `context_name`, when given, replaces the target's own name as the
+   fragment parser's context element (Range.createContextualFragment parses
+   into a new DocumentFragment, which has none) and leaves parsed scripts
+   unstarted instead of inert. */
 static bool bridge_replace_inner_html(
     DomBridge *bridge, lxb_dom_node_t *node,
-    const char *html, size_t length, bool prepare_dynamic_scripts)
+    const char *html, size_t length, bool prepare_dynamic_scripts,
+    const char *context_override, size_t context_override_length)
 {
     if (bridge == NULL || bridge->document == NULL || node == NULL
         || (node->type != LXB_DOM_NODE_TYPE_ELEMENT
@@ -4878,7 +5662,10 @@ static bool bridge_replace_inner_html(
     static const char div_name[] = "div";
     size_t context_name_length = sizeof(div_name) - 1u;
     const char *context_name = div_name;
-    if (node->type == LXB_DOM_NODE_TYPE_ELEMENT)
+    if (context_override != NULL) {
+        context_name = context_override;
+        context_name_length = context_override_length;
+    } else if (node->type == LXB_DOM_NODE_TYPE_ELEMENT)
         context_name = document_element_name(node, &context_name_length);
     /* Every connected change below is published as one INNER_HTML note.
        Brackets stay around Lexbor calls only (see js_dom_set_text). */
@@ -4914,9 +5701,10 @@ static bool bridge_replace_inner_html(
     if (container_node != NULL) lxb_dom_node_destroy_deep(container_node);
     document_style_quiet_end();
     if (changed) {
-        /* Fragment parsing does not execute scripts. Register every restored
-           source node as already started before publishing the mutation. */
-        script_element_states_register_parsed_subtree(bridge, node);
+        /* innerHTML's fragment parsing does not execute scripts. Register
+           every restored source node before publishing the mutation. */
+        if (!script_element_states_register_parsed_subtree(
+                bridge, node, context_override != NULL)) valid = false;
         bridge_mutated(
             bridge, SCRIPT_MUTATION_INNER_HTML, node, NULL, 0);
         if (prepare_dynamic_scripts)
@@ -4935,7 +5723,7 @@ bool script_runtime_replace_document_body(
         || runtime->bridge.document != document) return false;
     lxb_dom_node_t *body = document_body_node(document);
     return bridge_replace_inner_html(
-        &runtime->bridge, body, markup, length, false);
+        &runtime->bridge, body, markup, length, false, NULL, 0);
 }
 
 JSValue js_dom_set_inner_html(JSContext *context,
@@ -4950,11 +5738,27 @@ JSValue js_dom_set_inner_html(JSContext *context,
         && node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT) || argc < 2) {
         return JS_FALSE;
     }
+    /* (fragment, html, contextName): Range.createContextualFragment's
+       parse into an empty DocumentFragment it just created. */
+    const char *context_name = NULL;
+    size_t context_length = 0;
+    if (argc > 2) {
+        if (node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
+            || node->first_child != NULL) return JS_FALSE;
+        context_name = JS_ToCStringLen(context, &context_length, argv[2]);
+        if (context_name == NULL) return JS_EXCEPTION;
+        if (context_length == 0 || context_length > 64) {
+            JS_FreeCString(context, context_name);
+            return JS_FALSE;
+        }
+    }
     size_t length = 0;
     const char *html = JS_ToCStringLen(context, &length, argv[1]);
+    bool valid = html != NULL && bridge_replace_inner_html(
+        bridge, node, html, length, context_name == NULL,
+        context_name, context_length);
+    if (context_name != NULL) JS_FreeCString(context, context_name);
     if (html == NULL) return JS_EXCEPTION;
-    bool valid = bridge_replace_inner_html(
-        bridge, node, html, length, true);
     JS_FreeCString(context, html);
     return JS_NewBool(context, valid);
 }
@@ -5054,6 +5858,28 @@ static bool js_dom_latch_checked_default(DomBridge *bridge,
         &ignored_default);
 }
 
+/* The answer js_rt_script_element_parser_started infers for a host-parser
+   script reads its type, which the author can change without starting or
+   un-starting the element (consent managers retype text/plain scripts and
+   clone them). Record the flag the parser left before the type moves. The
+   state stays parser-inserted, as a stateless script is to CSP. */
+static void script_element_state_pin_parser_started(
+    DomBridge *bridge, lxb_dom_node_t *node,
+    const char *name, size_t name_length)
+{
+    if (bridge == NULL || node == NULL || name_length != 4
+        || strncasecmp(name, "type", 4) != 0 || node->ns != LXB_NS_HTML
+        || node->local_name != LXB_TAG_SCRIPT
+        || js_rt_script_element_state_find(bridge, node) != NULL) return;
+    bool started = js_rt_script_element_parser_started(node);
+    ScriptElementState *state =
+        js_rt_script_element_state_register(bridge, node, true);
+    if (state == NULL) return;
+    state->programmatic = false;
+    state->force_async = false;
+    state->already_started = started;
+}
+
 JSValue js_dom_set_attribute(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv)
@@ -5133,6 +5959,7 @@ JSValue js_dom_set_attribute(JSContext *context,
             old_present ? old_value_length : 0,
             value, value_length, changed_tokens,
             SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
+    script_element_state_pin_parser_started(bridge, node, name, name_length);
     document_style_quiet_begin();
     lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
@@ -5314,6 +6141,10 @@ JSValue js_dom_remove_attribute(JSContext *context,
         existed ? (old_value == NULL ? "" : (const char *) old_value) : NULL,
         existed ? old_value_length : 0, NULL, 0, changed_tokens,
         SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
+    if (existed) {
+        script_element_state_pin_parser_started(
+            bridge, node, name, name_length);
+    }
     document_style_quiet_begin();
     lxb_status_t status = lxb_dom_element_remove_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
@@ -5947,6 +6778,13 @@ static void bridge_computed_style_note_mutation(
                                                 : bridge->document->html))
         return;
     bridge_computed_style_flags(bridge);
+    /* A change inside a shadow tree can change which of the host's light
+       children render (shadow composition): those are outside its scope. */
+    if (bridge->shadow_root_count != 0
+        && document_shadow_carrier_containing(node) != NULL) {
+        cache->dirty_all = true;
+        return;
+    }
     bool known = kind == SCRIPT_MUTATION_ATTRIBUTE
         || kind == SCRIPT_MUTATION_INLINE_STYLE
         || kind == SCRIPT_MUTATION_TEXT
@@ -7450,6 +8288,22 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
             memo->style = style;
         }
     }
+    /* A light child the flat tree leaves out has no box (style_for_node
+       resolves it display:none for layout), but getComputedStyle reports
+       its cascaded display, as browsers do for an unslotted element. */
+    if (style.display == DISPLAY_NONE && node->parent != NULL
+        && document_shadow_carrier_of_host(node->parent) != NULL
+        && !document_shadow_light_child_rendered(
+               document_shadow_carrier_of_host(node->parent), node)) {
+        ComputedStyle parent_style;
+        if (bridge_computed_style(bridge, node->parent, &parent_style,
+                                  NULL, NULL)) {
+            parent_style.shadow_host = 0;
+            ComputedStyle cascaded = style_for_node(
+                bridge->stylesheet, node, &parent_style);
+            style.display = cascaded.display;
+        }
+    }
     PseudoElement pseudo = PSEUDO_NONE;
     if (argc > 2) {
         size_t pseudo_length = 0;
@@ -7671,7 +8525,19 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
             bridge->stylesheet, node, pseudo, name, name_length,
             value, sizeof(value));
     } else if (id == CSP_DISPLAY) {
-        snprintf(value, sizeof(value), "%s", display_names[style.display]);
+        /* CSS Display 2.7: floats and absolutely positioned boxes compute
+           to their blockified display; a list item serializes as such. */
+        DisplayMode display = style.display;
+        if (style.float_mode != FLOAT_NONE || style.out_of_flow
+            || style.fixed_position) {
+            if (display == DISPLAY_INLINE
+                || display == DISPLAY_INLINE_BLOCK) display = DISPLAY_BLOCK;
+            else if (display == DISPLAY_INLINE_FLEX) display = DISPLAY_FLEX;
+            else if (display == DISPLAY_INLINE_GRID) display = DISPLAY_GRID;
+        }
+        snprintf(value, sizeof(value), "%s",
+                 display == DISPLAY_BLOCK && style.list_item
+                     ? "list-item" : display_names[display]);
     } else if (id == CSP_VISIBILITY) {
         snprintf(value, sizeof(value), "%s",
                  style.visibility_hidden ? "hidden" : "visible");
@@ -8512,6 +9378,323 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
     return computed_style_string(context, value, empty);
 }
 
+/* HTML innerText for a connected, rendered element: the text as laid
+   out, not the raw descendant text. display:none subtrees and elements that
+   are never rendered (script, style, noscript while scripting runs,
+   template, replaced elements' fallback) contribute nothing; block-level
+   boxes separate lines, paragraphs a blank line, table rows a line and
+   cells a tab; <br> is a line break; collapsible white space collapses
+   across element boundaries and vanishes at line edges; visibility:hidden
+   drops text but not visible descendants; text-transform applies (ASCII
+   letters). Returns undefined when the receiver is not being rendered, for
+   which script answers textContent as specified. Styles come from the
+   bridge's computed-style cache (one resolution per element); the walk is
+   iterative, bounded in nodes, depth and output bytes. */
+#define RENDERED_TEXT_NODE_LIMIT 200000u
+#define RENDERED_TEXT_BYTE_LIMIT (1024u * 1024u)
+#define RENDERED_TEXT_DEPTH_LIMIT 256u
+
+typedef struct {
+    Budget *budget;
+    char *data;
+    size_t length;
+    size_t capacity;
+    bool failed;
+    bool truncated;
+    bool at_start;
+    bool pending_space;
+    uint8_t pending_break;
+} RenderedText;
+
+typedef struct {
+    lxb_dom_node_t *node;
+    uint8_t white_space;
+    uint8_t transform;
+    bool visible;
+    int8_t after;
+} RenderedTextFrame;
+
+static bool rendered_text_reserve(RenderedText *text, size_t extra)
+{
+    if (text->failed || text->truncated) return false;
+    if (extra > RENDERED_TEXT_BYTE_LIMIT - text->length) {
+        text->truncated = true;
+        return false;
+    }
+    if (text->length + extra <= text->capacity) return true;
+    size_t capacity = text->capacity == 0 ? 256u : text->capacity;
+    while (capacity < text->length + extra) capacity *= 2u;
+    if (capacity > RENDERED_TEXT_BYTE_LIMIT) {
+        capacity = RENDERED_TEXT_BYTE_LIMIT;
+    }
+    char *grown = budget_realloc(text->budget, text->data, capacity);
+    if (grown == NULL) {
+        text->failed = true;
+        return false;
+    }
+    text->data = grown;
+    text->capacity = capacity;
+    return true;
+}
+
+static void rendered_text_put(RenderedText *text, const char *bytes,
+                              size_t length)
+{
+    if (length == 0 || !rendered_text_reserve(text, length)) return;
+    memcpy(text->data + text->length, bytes, length);
+    text->length += length;
+}
+
+/* Required line breaks collapse to their largest run and vanish at the
+   start and end of the result. */
+static void rendered_text_flush(RenderedText *text)
+{
+    if (text->pending_break == 0) return;
+    if (text->length != 0) {
+        for (uint8_t i = 0; i < text->pending_break; i++) {
+            rendered_text_put(text, "\n", 1);
+        }
+    }
+    text->pending_break = 0;
+    text->at_start = true;
+    text->pending_space = false;
+}
+
+static void rendered_text_break(RenderedText *text, uint8_t count)
+{
+    if (count > text->pending_break) text->pending_break = count;
+    text->pending_space = false;
+}
+
+static void rendered_text_literal(RenderedText *text, const char *bytes,
+                                  size_t length)
+{
+    rendered_text_flush(text);
+    rendered_text_put(text, bytes, length);
+    if (length != 0) text->at_start = bytes[length - 1] == '\n';
+    text->pending_space = false;
+}
+
+static char rendered_text_case(char byte, uint8_t transform, bool word_start)
+{
+    if (transform == TEXT_TRANSFORM_UPPERCASE
+        || (transform == TEXT_TRANSFORM_CAPITALIZE && word_start)) {
+        return byte >= 'a' && byte <= 'z' ? (char) (byte - 32) : byte;
+    }
+    if (transform == TEXT_TRANSFORM_LOWERCASE) {
+        return byte >= 'A' && byte <= 'Z' ? (char) (byte + 32) : byte;
+    }
+    return byte;
+}
+
+static bool rendered_text_space(char byte)
+{
+    return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r'
+           || byte == '\f';
+}
+
+static void rendered_text_append(RenderedText *text,
+                                 const RenderedTextFrame *context,
+                                 const char *data, size_t length)
+{
+    if (!context->visible || length == 0) return;
+    uint8_t mode = context->white_space;
+    bool preserve = mode == WHITE_SPACE_PRE || mode == WHITE_SPACE_PRE_WRAP
+                    || mode == WHITE_SPACE_BREAK_SPACES;
+    bool keep_lines = mode == WHITE_SPACE_PRE_LINE;
+    if (preserve) {
+        rendered_text_flush(text);
+        if (text->pending_space && !text->at_start) {
+            rendered_text_put(text, " ", 1);
+        }
+        text->pending_space = false;
+    }
+    bool word_start = text->at_start || text->pending_space;
+    for (size_t i = 0; i < length && !text->failed && !text->truncated;
+         i++) {
+        char byte = data[i];
+        if (byte == '\r') {
+            if (i + 1 < length && data[i + 1] == '\n') continue;
+            byte = '\n';
+        }
+        if (preserve) {
+            char out = rendered_text_case(byte, context->transform,
+                                          word_start);
+            rendered_text_put(text, &out, 1);
+            text->at_start = byte == '\n';
+            word_start = rendered_text_space(byte);
+            continue;
+        }
+        if (byte == '\n' && keep_lines) {
+            rendered_text_literal(text, "\n", 1);
+            word_start = true;
+            continue;
+        }
+        if (rendered_text_space(byte)) {
+            if (!text->at_start && text->pending_break == 0) {
+                text->pending_space = true;
+            }
+            word_start = true;
+            continue;
+        }
+        rendered_text_flush(text);
+        if (text->pending_space && !text->at_start) {
+            rendered_text_put(text, " ", 1);
+        }
+        char out = rendered_text_case(byte, context->transform, word_start);
+        rendered_text_put(text, &out, 1);
+        text->at_start = false;
+        text->pending_space = false;
+        word_start = false;
+    }
+}
+
+static bool rendered_text_skipped(lxb_dom_node_t *node)
+{
+    static const char *const skipped[] = {
+        "script", "style", "noscript", "template", "head", "title", "meta",
+        "link", "base", "canvas", "video", "audio", "iframe", "object",
+        "embed", "select", "datalist"
+    };
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    if (name == NULL) return false;
+    for (size_t i = 0; i < sizeof(skipped) / sizeof(skipped[0]); i++) {
+        if (strlen(skipped[i]) == length
+            && strncasecmp(name, skipped[i], length) == 0) return true;
+    }
+    return false;
+}
+
+static bool rendered_text_name_is(lxb_dom_node_t *node, const char *wanted)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    return name != NULL && strlen(wanted) == length
+           && strncasecmp(name, wanted, length) == 0;
+}
+
+static lxb_dom_node_t *rendered_text_next_element(lxb_dom_node_t *node)
+{
+    for (lxb_dom_node_t *at = node->next; at != NULL; at = at->next) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) return at;
+    }
+    return NULL;
+}
+
+static bool rendered_text_style(DomBridge *bridge, lxb_dom_node_t *node,
+                                ComputedStyle *style)
+{
+    return bridge_computed_style(bridge, node, style, NULL, NULL);
+}
+
+JSValue js_dom_rendered_text(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->stylesheet == NULL || argc < 1) {
+        return JS_UNDEFINED;
+    }
+    lxb_dom_node_t *root = js_rt_bridge_node_arg(context, bridge, argv[0]);
+    if (root == NULL || root->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !bridge_node_is_connected(root)) return JS_UNDEFINED;
+    ComputedStyle style;
+    /* Not being rendered: the receiver or an ancestor is undisplayed. */
+    for (lxb_dom_node_t *at = root; at != NULL; at = at->parent) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (!rendered_text_style(bridge, at, &style)) return JS_UNDEFINED;
+        if (style.display == DISPLAY_NONE || style.hidden) {
+            return JS_UNDEFINED;
+        }
+    }
+    if (!rendered_text_style(bridge, root, &style)) return JS_UNDEFINED;
+    RenderedText text = {.budget = bridge->budget, .at_start = true};
+    RenderedTextFrame stack[RENDERED_TEXT_DEPTH_LIMIT];
+    size_t depth = 0;
+    stack[depth++] = (RenderedTextFrame) {
+        .node = root, .white_space = style.white_space_mode,
+        .transform = (uint8_t) style.text_transform,
+        .visible = !style.visibility_hidden, .after = 0
+    };
+    lxb_dom_node_t *at = root->first_child;
+    uint32_t visited = 0;
+    while (depth != 0 && !text.failed && !text.truncated) {
+        if (at == NULL) {
+            /* Leave the innermost open element. */
+            RenderedTextFrame *closing = &stack[--depth];
+            if (closing->after < 0) rendered_text_literal(&text, "\t", 1);
+            else if (closing->after > 0) {
+                rendered_text_break(&text, (uint8_t) closing->after);
+            }
+            at = depth == 0 ? NULL : closing->node->next;
+            continue;
+        }
+        if (++visited > RENDERED_TEXT_NODE_LIMIT) break;
+        const RenderedTextFrame *parent = &stack[depth - 1];
+        if (at->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *data = document_text_data(at, &length);
+            if (data != NULL) {
+                rendered_text_append(&text, parent, data, length);
+            }
+            at = at->next;
+            continue;
+        }
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || rendered_text_skipped(at)) {
+            at = at->next;
+            continue;
+        }
+        if (!rendered_text_style(bridge, at, &style)) {
+            text.failed = true;
+            break;
+        }
+        if (style.display == DISPLAY_NONE || style.hidden
+            || depth == RENDERED_TEXT_DEPTH_LIMIT) {
+            at = at->next;
+            continue;
+        }
+        if (rendered_text_name_is(at, "br")) {
+            if (!style.visibility_hidden)
+                rendered_text_literal(&text, "\n", 1);
+            at = at->next;
+            continue;
+        }
+        int8_t after = 0;
+        if (rendered_text_name_is(at, "p")) {
+            after = 2;
+        } else if (style.display == DISPLAY_BLOCK
+                   || style.display == DISPLAY_FLOW_ROOT
+                   || style.display == DISPLAY_FLEX
+                   || style.display == DISPLAY_GRID
+                   || style.display == DISPLAY_TABLE) {
+            after = 1;
+        } else if (style.display == DISPLAY_TABLE_ROW) {
+            if (rendered_text_next_element(at) != NULL) after = 1;
+        } else if (style.display == DISPLAY_TABLE_CELL) {
+            if (rendered_text_next_element(at) != NULL) after = -1;
+        }
+        if (after > 0 && style.display != DISPLAY_TABLE_ROW) {
+            rendered_text_break(&text, (uint8_t) after);
+        }
+        stack[depth++] = (RenderedTextFrame) {
+            .node = at, .white_space = style.white_space_mode,
+            .transform = (uint8_t) style.text_transform,
+            .visible = !style.visibility_hidden, .after = after
+        };
+        at = at->first_child;
+    }
+    if (text.failed) {
+        budget_free(bridge->budget, text.data);
+        return JS_ThrowOutOfMemory(context);
+    }
+    JSValue value = JS_NewStringLen(
+        context, text.data == NULL ? "" : text.data, text.length);
+    budget_free(bridge->budget, text.data);
+    return value;
+}
+
 JSValue js_computed_style_get(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv)
@@ -8716,16 +9899,31 @@ static ScriptMutationKind bridge_child_mutation_kind(
    recent record for (kind, node) whether it was new or coalesced. */
 static void bridge_mutation_note_scope(
     DomBridge *bridge, ScriptMutationKind kind, const lxb_dom_node_t *node,
-    lxb_dom_node_t *scope)
+    lxb_dom_node_t *scope, bool last)
 {
     if (scope == NULL || scope->type == LXB_DOM_NODE_TYPE_DOCUMENT) return;
     ScriptMutationJournal *journal = &bridge->mutations;
     for (size_t reverse = journal->count; reverse != 0; reverse--) {
         ScriptMutationRecord *record = &journal->records[reverse - 1];
         if (record->kind != kind || record->node != node) continue;
-        if (record->scope == NULL) record->scope = scope;
+        if (record->scope == NULL) {
+            record->scope = scope;
+            record->removed_last = last;
+        }
         return;
     }
+}
+
+/* Whether connected `node` has no later element sibling (bounded). */
+static bool bridge_node_is_last_element(const lxb_dom_node_t *node)
+{
+    unsigned visited = 0;
+    for (const lxb_dom_node_t *later = node->next; later != NULL;
+         later = later->next) {
+        if (later->type == LXB_DOM_NODE_TYPE_ELEMENT || ++visited > 64u)
+            return false;
+    }
+    return true;
 }
 
 /* Journals the removal of connected `node` from its parent, classifying
@@ -8734,11 +9932,12 @@ static void bridge_mutation_note_scope(
 static void bridge_note_removal(DomBridge *bridge, lxb_dom_node_t *node)
 {
     BridgeMutationResourceFlags removed_resources =
-        bridge_mutation_resource_subtree(node);
+        bridge_mutation_resource_subtree(bridge->document, node);
     ScriptMutationKind removal_kind =
         bridge_child_mutation_kind(bridge, node->parent, node);
     bridge_mutated(bridge, removal_kind, node, NULL, 0);
-    bridge_mutation_note_scope(bridge, removal_kind, node, node->parent);
+    bridge_mutation_note_scope(bridge, removal_kind, node, node->parent,
+                               bridge_node_is_last_element(node));
     if ((removed_resources & (BRIDGE_MUTATION_RESOURCE_IMAGE
                               | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0) {
         bridge->mutations.resource_rebuild_required = true;
@@ -8838,7 +10037,8 @@ static void bridge_child_inserted(
         && bridge->mutations.count > before) {
         bridge->mutations.records[before].inserted_from_detached = was_detached;
     }
-    if (!was_detached) bridge_mutation_note_scope(bridge, kind, node, old_parent);
+    if (!was_detached)
+        bridge_mutation_note_scope(bridge, kind, node, old_parent, false);
 }
 
 JSValue js_dom_append(JSContext *context, JSValueConst this_value,

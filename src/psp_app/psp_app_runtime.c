@@ -13,11 +13,62 @@
 #include "tilefinch/psp_load_experience.h"
 #include "tilefinch/psp_time.h"
 #include "tilefinch/psp_threads.h"
+#include "../psp_thread_contract.h"
+#include "../psp_canvas_ge.h"
+#include "tilefinch/canvas_ge_presenter.h"
 
 PspMediaSession *psp_active_media;
 atomic_uint psp_background_ui_available;
 atomic_bool psp_home_exit_requested;
 PspLifecycle psp_lifecycle;
+
+/* Only the browser's verified VFPU owner may use the accelerated CPU copy.
+   The supervisor also presents pages but has no VFPU thread context. */
+static atomic_int psp_present_vfpu_owner;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* On, as in shipping builds; copy-vfpu-off selects the scalar copy for an
+   A/B run, and copy-vfpu-check compares each copy (a mismatch turns the
+   VFPU copy off). */
+static bool psp_present_vfpu_copy_enabled = true;
+static bool psp_present_vfpu_copy_verify;
+static uint32_t psp_present_vfpu_copies, psp_present_vfpu_checks;
+static uint32_t psp_present_vfpu_errors;
+
+void psp_present_validation_vfpu_copy(bool enabled, bool verify)
+{
+    psp_present_vfpu_copy_enabled = enabled;
+    psp_present_vfpu_copy_verify = verify;
+}
+
+void psp_present_validation_vfpu_copy_counts(
+    uint32_t *copies, uint32_t *checks, uint32_t *errors)
+{
+    *copies = psp_present_vfpu_copies;
+    *checks = psp_present_vfpu_checks;
+    *errors = psp_present_vfpu_errors;
+}
+
+#endif
+
+/* GE-direct canvas publication (canvas_ge_presenter.h, psp_canvas_ge.h).
+   The engine pointer only identifies whose RAM frame a present is handed. */
+static BrowserEngine *psp_present_canvas_engine;
+static CanvasGePresenter psp_present_canvas_ge;
+
+void psp_present_canvas_engine_bind(BrowserEngine *engine)
+{
+    psp_present_canvas_engine = engine;
+}
+
+void psp_present_canvas_ge_enable(bool enabled, bool verify)
+{
+    canvas_ge_presenter_enable(&psp_present_canvas_ge, enabled, verify);
+}
+
+const CanvasGePresenterStats *psp_present_canvas_ge_stats(void)
+{
+    return &psp_present_canvas_ge.stats;
+}
 
 #define PSP_CERTIFICATE_YOUTUBE_HEAD "YouTube page fetch failed"
 #define PSP_CERTIFICATE_GENERIC_HEAD "Secure page fetch failed"
@@ -86,7 +137,21 @@ void psp_exit_plan_request(PspExitPlan *plan, PspExitCause cause)
 void psp_presentation_init(PspPresentationResources *presentation)
 {
     if (presentation == NULL) return;
+    SceKernelThreadInfo thread;
+    SceUID owner = sceKernelGetThreadId();
+    atomic_store_explicit(&psp_present_vfpu_owner,
+        owner > 0 && psp_thread_snapshot(owner, &thread) >= 0
+            && (thread.attr & PSP_THREAD_ATTR_VFPU) != 0 ? owner : 0,
+        memory_order_relaxed);
     memset(presentation, 0, sizeof(*presentation));
+    /* GE-direct publication is the default for eligible full-screen WebGL
+       canvases; everything else keeps the CPU conversion and copy. */
+    static const CanvasGeBackend canvas_ge_backend = {
+        .scale = psp_canvas_ge_scale, .busy = psp_canvas_ge_busy,
+        .fail = psp_canvas_ge_fail, .context = NULL
+    };
+    canvas_ge_presenter_init(&psp_present_canvas_ge, &canvas_ge_backend);
+    canvas_ge_presenter_enable(&psp_present_canvas_ge, true, false);
     psp_ui_init(&presentation->ui);
     psp_ui_set_tabs(&presentation->ui, &presentation->tab_view);
 }
@@ -401,12 +466,12 @@ _Static_assert(
         >= (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
              * (size_t) PSP_UI_MEDIA_TRACK_MENU_HEIGHT * sizeof(uint16_t),
     "the bounded video EDRAM tail must hold the retained track menu");
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
 /* Only so the mode line is printed once rather than once a frame. */
 static int psp_media_present_reported_mode = -1;
 static uint64_t psp_media_present_reported_generation;
 static int psp_media_present_reported_width;
 static int psp_media_present_reported_height;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
 /* Set by the presenter admission seam and sampled only after a successful
    publish. Validation needs to distinguish a freshly drawn picture from a
    scanout accepted through the same-picture fast path. */
@@ -501,6 +566,27 @@ typedef struct {
 
 static PspPresentationCadence psp_presentation_cadence;
 static PspPresentPhaseTiming psp_present_last_timing;
+static bool psp_present_cpu_measurement;
+static void (*psp_present_pre_publish_hook)(uint32_t sequence);
+
+void psp_present_validation_pre_publish_hook(void (*hook)(uint32_t sequence))
+{
+    psp_present_pre_publish_hook = hook;
+}
+
+void psp_present_validation_measure_cpu(bool enabled)
+{
+    psp_present_cpu_measurement = enabled;
+}
+
+static bool psp_present_thread_cpu(uint64_t *run_us)
+{
+    SceKernelThreadRunStatus status = {.size = sizeof(status)};
+    if (sceKernelReferThreadRunStatus(sceKernelGetThreadId(), &status) < 0)
+        return false;
+    *run_us = ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
+    return true;
+}
 
 bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing)
 {
@@ -831,8 +917,22 @@ static bool psp_media_present_software(
  * One line per opened stream, or per change of mind within one. The device
  * truth cycle reads this to learn which presenter actually ran: a session
  * that silently fell back to software would otherwise look exactly like one
- * that chose it, and the frame budget of the two is not the same.
+ * that chose it, and the frame budget of the two is not the same. The line
+ * is validation-log output, so other builds compile the report away.
  */
+#ifndef TILEFINCH_PSP_VALIDATION_LOG
+static inline void psp_media_present_report(
+    PspMediaPresentMode mode, const char *reason,
+    const MediaVideoFrame *frame, const PspMediaPresentPlan *plan,
+    const PspMediaPresentTexture *texture)
+{
+    (void) mode;
+    (void) reason;
+    (void) frame;
+    (void) plan;
+    (void) texture;
+}
+#else
 __attribute__((noinline))
 static void psp_media_present_report(
     PspMediaPresentMode mode, const char *reason,
@@ -880,15 +980,19 @@ static void psp_media_present_report(
                       ? "edram" : "main"),
            (unsigned) passthrough_drawn, (unsigned) passthrough_source);
 }
+#endif /* TILEFINCH_PSP_VALIDATION_LOG */
 
 /* Common bookkeeping for both presenters: cost accounting and the identity
-   record, which are the same statements whatever the surface's width is. */
+   record, which are the same statements whatever the surface's width is.
+   The cost totals feed only the validation build's media job report and
+   stability summary. */
 static void psp_media_present_account(
     PspMediaPresentRecord *record, const MediaVideoFrame *frame,
     const PspMediaPresentPlan *plan, uint64_t generation,
     uint64_t started_us, const PspMediaPresentGeCost *cost, bool drawn,
     bool chrome_paints)
 {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t elapsed_us =
         (uint64_t) sceKernelGetSystemTimeWide() - started_us;
     if (psp_active_media != NULL) {
@@ -907,6 +1011,11 @@ static void psp_media_present_account(
                 psp_active_media->present_ge_wait_max_us = cost->wait_us;
         }
     }
+#else
+    (void) started_us;
+    (void) cost;
+    (void) drawn;
+#endif
     /* Only an overlay-free present may be remembered: some chrome surfaces
        blend with the picture and the time-dependent controls move, so a
        buffer they touched no longer holds the picture on its own. */
@@ -1036,7 +1145,9 @@ static bool psp_present_media_frame_video_strips(
         return false;
 
     bool succeeded = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t stage_total_us = 0;
+#endif
     PspMediaPresentGeCost total = {0, 0, 0};
     psp_active_media->present_texture_staged = true;
     for (size_t at = 0; at < strips->strip_count; at++) {
@@ -1047,15 +1158,19 @@ static bool psp_present_media_frame_video_strips(
             * (size_t) strip->copy_rows * sizeof(*source);
         if (bytes > PSP_DISPLAY_VIDEO_TEXTURE_BYTES) goto finished;
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t copy_started_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
         if (!psp_media_present_ge_stage_dma(staging, source, bytes)) {
             psp_media_present_stage(
                 staging, source, frame->stride_pixels,
                 frame->stride_pixels, strip->copy_rows);
             psp_media_present_ge_stage_flush(staging, bytes);
         }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
         stage_total_us +=
             (uint64_t) sceKernelGetSystemTimeWide() - copy_started_us;
+#endif
 
         PspMediaPresentTexture texture = {
             .pixels = staging,
@@ -1080,10 +1195,13 @@ finished:
         psp_active_media->playback, (unsigned) frame->slot);
     if (!succeeded) return false;
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Read only by the validation media-job report. */
     psp_active_media->present_stage_frames++;
     psp_active_media->present_stage_total_us += stage_total_us;
     if (stage_total_us > psp_active_media->present_stage_max_us)
         psp_active_media->present_stage_max_us = stage_total_us;
+#endif
     psp_media_fill_bands_video(vram, full);
     PspMediaPresentTexture report_texture = {
         .pixels = staging,
@@ -1589,6 +1707,10 @@ bool psp_present_internal(
         (uint64_t) sceKernelGetSystemTimeWide();
     uint64_t base_finished_us = presentation_started_us;
     uint64_t composite_finished_us = presentation_started_us;
+    uint64_t base_cpu_before = 0, base_cpu_after = 0;
+    bool base_cpu_before_valid = psp_present_cpu_measurement
+        && psp_present_thread_cpu(&base_cpu_before);
+    uint32_t base_bytes = 0;
 #endif
     bool native_surface = !media_visible && ui != NULL
         && psp_ui_screen_is_native_surface(ui->screen);
@@ -1607,18 +1729,60 @@ bool psp_present_internal(
             memset(vram + (size_t) y * PSP_VRAM_STRIDE, 0,
                    PSP_SCREEN_WIDTH * sizeof(*vram));
         }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        base_bytes = PSP_SCREEN_WIDTH * PSP_SCREEN_HEIGHT * sizeof(*vram);
+#endif
     } else if (!media_replaces_page && !native_surface) {
         unsigned opaque_top = 0u, opaque_bottom = 0u;
         psp_ui_opaque_chrome_rows(ui, &opaque_top, &opaque_bottom);
         unsigned copy_end = PSP_SCREEN_HEIGHT - opaque_bottom;
-        for (unsigned y = opaque_top; y < copy_end; y++) {
-            memcpy(vram + (size_t) y * PSP_VRAM_STRIDE,
-                   frame + (size_t) y * PSP_SCREEN_WIDTH,
-                   PSP_SCREEN_WIDTH * sizeof(*frame));
+        int ge_copied = (int) canvas_ge_presenter_publish(
+            &psp_present_canvas_ge,
+            psp_present_canvas_engine == NULL ? NULL
+                : browser_engine_render_shell(psp_present_canvas_engine),
+            frame, vram, PSP_VRAM_STRIDE, PSP_SCREEN_WIDTH,
+            opaque_top, copy_end,
+            sceKernelGetThreadId() == atomic_load_explicit(
+                &psp_present_vfpu_owner, memory_order_relaxed));
+        if (ge_copied < 0) return false;
+        if (ge_copied == 0) {
+            bool vfpu_eligible = sceKernelGetThreadId() == atomic_load_explicit(
+                &psp_present_vfpu_owner, memory_order_relaxed);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            vfpu_eligible = vfpu_eligible && psp_present_vfpu_copy_enabled;
+            if (vfpu_eligible && psp_present_vfpu_copy_verify
+                && opaque_top < copy_end) {
+                psp_present_vfpu_checks++;
+                unsigned errors = psp_display_validation_probe_row_copy(
+                    &psp_display, frame, opaque_top, copy_end);
+                psp_present_vfpu_errors |= errors;
+                if (errors != 0u) {
+                    psp_present_vfpu_copy_enabled = false;
+                    return false;
+                }
+                psp_present_vfpu_copies++;
+            } else
+#endif
+            {
+                PspDisplayRowCopyResult copied = psp_display_copy_rgb565_rows(
+                    &psp_display, frame, opaque_top, copy_end,
+                    vfpu_eligible);
+                if (copied < 0) return false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                if (copied == PSP_DISPLAY_ROW_COPY_VFPU)
+                    psp_present_vfpu_copies++;
+#endif
+            }
         }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        base_bytes = (copy_end > opaque_top ? copy_end - opaque_top : 0u)
+            * PSP_SCREEN_WIDTH * sizeof(*frame);
+#endif
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     base_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
+    bool base_cpu_after_valid = psp_present_cpu_measurement
+        && psp_present_thread_cpu(&base_cpu_after);
     PspUiCompositeTiming ui_timing = {0};
 #endif
     if (media_visible) {
@@ -1663,6 +1827,10 @@ bool psp_present_internal(
     unsigned published_index = psp_display.back_buffer;
     PspDisplayBackendTiming display_timing_before = {0};
     (void) psp_display_validation_timing_snapshot(&display_timing_before);
+    if (psp_present_pre_publish_hook != NULL) {
+        uint32_t next = psp_present_last_timing.sequence + 1u;
+        psp_present_pre_publish_hook(next == 0u ? 1u : next);
+    }
 #endif
     bool published = psp_display_publish(&psp_display);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1673,6 +1841,11 @@ bool psp_present_internal(
     if (sequence == 0) sequence = 1u;
     psp_present_last_timing = (PspPresentPhaseTiming) {
         .base_us = base_finished_us - presentation_started_us,
+        .base_cpu_valid = base_cpu_before_valid && base_cpu_after_valid
+            && base_cpu_after >= base_cpu_before,
+        .base_cpu_us = base_cpu_after >= base_cpu_before
+            ? base_cpu_after - base_cpu_before : 0,
+        .base_bytes = base_bytes,
         .composite_us = composite_finished_us - base_finished_us,
         .publish_us = published_us - composite_finished_us,
         .publish_flush_us = display_timing_after.flush_us
@@ -2675,7 +2848,7 @@ void psp_work_cooperate_begin_media_open(
 {
     if (ui == NULL || media_ui == NULL) return;
     psp_ui_set_loading(ui, true, -1);
-    psp_ui_show_status(ui, "OPENING VIDEO  O CANCEL", 600);
+    psp_ui_show_status(ui, PSP_MEDIA_OPEN_STATUS, 600);
     psp_work_cooperate_begin(
         ui, engine_frame, true, true, true,
         "STOPPING VIDEO...", "media-open", NULL, media_ui);
@@ -2728,6 +2901,24 @@ static void psp_supervisor_show_status(
     psp_ui_show_status(
         &cooperate->supervisor_ui,
         status == NULL ? "STOPPING VIDEO..." : status, 600);
+}
+
+void psp_work_cooperate_show_status(void *context, const char *status)
+{
+    (void) context;
+    PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
+    /* The supervisor owns its UI copy while presenting; a progress line
+       that loses that race is replaced by the next one anyway. */
+    if (status == NULL || cooperate->active == 0
+        || tilefinch_cancellation_requested(&cooperate->cancellation)
+        || !__sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u))
+        return;
+    /* Cancellation may have been shown since the check above. */
+    if (!tilefinch_cancellation_requested(&cooperate->cancellation))
+        psp_ui_show_status(&cooperate->supervisor_ui, status, 600);
+    cooperate->last_present_us = 0;
+    __sync_synchronize();
+    cooperate->presenting = 0;
 }
 
 bool psp_navigation_cooperate_active(void)
@@ -3217,7 +3408,7 @@ static void psp_work_ui_tick(bool owner_thread)
         urgent_present = true;
     }
     unsigned validation_cancel_after_ms =
-        psp_validation_cancel_after_ms;
+        PSP_VALIDATION_KNOB(psp_validation_cancel_after_ms);
     if (validation_cancel_after_ms != 0
         && !tilefinch_cancellation_requested(&cooperate->cancellation)
         && now_us >= cooperate->started_us
@@ -3253,6 +3444,7 @@ static void psp_work_ui_tick(bool owner_thread)
     bool priority_handled = false;
     if (owner_thread && cooperate->engine == NULL
         && !cooperate->media_surface && !cooperate->media_detached
+        && !cooperate->supervisor_ui.page_gamepad_capture
         && cooperate->pending_page_input_count == 0) {
         /* Native menus and cursor movement do not call the document. Keep
            their visual state on the completed frame while page work runs. */
@@ -3306,7 +3498,8 @@ static void psp_work_ui_tick(bool owner_thread)
             &cooperate->cancellation),
         .acknowledge_busy = cooperate->acknowledge_non_cancel_busy,
         .media_preview_active = cooperate->media_surface
-            && cooperate->supervisor_media_ui.seek_preview_active
+            && cooperate->supervisor_media_ui.seek_preview_active,
+        .page_gamepad_capture = cooperate->supervisor_ui.page_gamepad_capture
     };
     switch (psp_input_route(&route_context)) {
         case PSP_INPUT_ROUTE_YIELD:
@@ -3697,6 +3890,10 @@ bool psp_platform_cooperate(
             /* Include work before the first checkpoint in gap accounting. */
             cooperate->started_us = psp_runtime_cooperate.started_us;
             cooperate->last_checkpoint_us = psp_runtime_cooperate.started_us;
+            /* The activation's acknowledgement was presented as it began,
+               with the status this scope would show: the periodic present
+               is due an interval after that, not at the first tick. */
+            cooperate->last_present_us = psp_runtime_cooperate.started_us;
         }
         if (cooperate->active && cooperate->owner_thread_only
             && (psp_runtime_cooperate.last_poll_us == 0
@@ -3752,7 +3949,7 @@ bool psp_platform_cooperate(
             cooperate->provisional_present_requested = 0;
         }
     }
-    if (psp_validation_preview_scroll != 0
+    if (PSP_VALIDATION_KNOB(psp_validation_preview_scroll != 0)
         && !cooperate->validation_preview_scroll_injected
         && cooperate->engine != NULL
         && !tilefinch_cancellation_requested(

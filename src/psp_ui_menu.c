@@ -169,6 +169,10 @@ static bool menu_handle_escape(
             intent->theme_catalog_closed = true;
         else if (ui->screen == PSP_UI_SCREEN_STORAGE_OFFER)
             intent->action = PSP_UI_ACTION_STORAGE_OFFER_DECLINE;
+        else if (ui->screen == PSP_UI_SCREEN_GLYPH_OFFER)
+            intent->glyph_offer_answer = PSP_UI_GLYPH_OFFER_CANCEL;
+        else if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER)
+            intent->action = PSP_UI_ACTION_HEAVY_CANCEL;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
             psp_ui_clear_find(ui);
             intent->action = PSP_UI_ACTION_FIND_CLOSE;
@@ -208,6 +212,23 @@ static bool menu_handle_escape(
 static void menu_update_offline_app_preview(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
+    if (ui->offline_app_preview != NULL
+        && ui->offline_app_preview->operation
+               == PSP_UI_OFFLINE_APP_RECOMPILE) {
+        /* Offered from Library > Saved: every answer returns there. */
+        intent->action = (pressed & PSP_UI_BUTTON_CONFIRM)
+            ? PSP_UI_ACTION_RECOMPILE_OFFLINE_APP
+            : (pressed & PSP_UI_BUTTON_RELOAD)
+            ? PSP_UI_ACTION_OPEN_OFFLINE_APP_ANYWAY
+            : (pressed & PSP_UI_BUTTON_CANCEL)
+            ? PSP_UI_ACTION_CANCEL_OFFLINE_APP : PSP_UI_ACTION_NONE;
+        if (intent->action != PSP_UI_ACTION_NONE) {
+            ui->offline_app_preview = NULL;
+            menu_close(ui);
+            intent->visual_changed = true;
+        }
+        return;
+    }
     if (pressed & PSP_UI_BUTTON_CONFIRM) {
         intent->action = PSP_UI_ACTION_CONFIRM_OFFLINE_APP;
         menu_close(ui);
@@ -377,7 +398,11 @@ static void menu_update_page_information(
 
 static size_t menu_failure_action_count(const PspUiState *ui)
 {
-    size_t count = 2u; /* Retry and return. */
+    /* Retry and return; a page too heavy for the PSP would only fail the
+       same way again, so its sheet has no Retry. */
+    size_t count = ui->failure_recovery_heavy ? 1u : 2u;
+    if (ui->failure_actions & PSP_UI_FAILURE_BASIC_VIEW) count++;
+    if (ui->failure_actions & PSP_UI_FAILURE_RELOAD_BASIC) count++;
     if (ui->failure_actions & PSP_UI_FAILURE_READER) count++;
     if (ui->failure_actions & PSP_UI_FAILURE_WIFI) count++;
     if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT) count++;
@@ -389,7 +414,14 @@ static size_t menu_failure_action_count(const PspUiState *ui)
 static PspUiAction menu_failure_action(
     const PspUiState *ui, size_t selected)
 {
-    if (selected-- == 0u) return PSP_UI_ACTION_RELOAD;
+    if (!ui->failure_recovery_heavy && selected-- == 0u)
+        return PSP_UI_ACTION_RELOAD;
+    if ((ui->failure_actions & PSP_UI_FAILURE_BASIC_VIEW) != 0u) {
+        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_BASIC;
+    }
+    if ((ui->failure_actions & PSP_UI_FAILURE_RELOAD_BASIC) != 0u) {
+        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_RELOAD_BASIC;
+    }
     if ((ui->failure_actions & PSP_UI_FAILURE_READER) != 0u) {
         if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_READER;
     }

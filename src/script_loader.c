@@ -6,6 +6,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"
+#include "tilefinch/script_admission.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/url.h"
 
@@ -21,22 +22,19 @@
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/ns/const.h>
 
+/* The tilefinch_trace_* helpers cache their own answer, and are constant
+   false under TILEFINCH_NO_TRACE; a second cache here would keep the
+   formatting alive in builds that cannot trace. */
 static void script_trace_skip(const char *url)
 {
-    static int enabled = -1;
-    if (enabled < 0)
-        enabled = tilefinch_trace_script_failures();
-    if (enabled)
+    if (tilefinch_trace_script_failures())
         fprintf(stderr, "script-quota-skip url=%s\n",
                 url == NULL ? "<null>" : url);
 }
 
 static void script_trace_attempt(const char *url)
 {
-    static int enabled = -1;
-    if (enabled < 0)
-        enabled = tilefinch_trace_script_attempts();
-    if (enabled)
+    if (tilefinch_trace_script_attempts())
         fprintf(stderr, "script-attempt url=%s\n",
                 url == NULL ? "<null>" : url);
 }
@@ -58,15 +56,12 @@ static void script_metrics_record_source_work(
 
 #define EXTERNAL_SCRIPT_HARD_LIMIT 256
 #define SCRIPT_DISCOVERY_VISIT_LIMIT 65536u
-#define SCRIPT_MIN_EXECUTION_RESERVE_BYTES (512u * 1024u)
 /* Early parser-blocking JavaScript is optional; visible CSS and the first
-   authoritative layout are not. Preserve the stylesheet loader's 2 MiB
-   layout reserve plus a bounded 1 MiB parse window (a 256 KiB sheet at the
-   conservative 4x expansion) so a large bundle cannot consume the capacity
-   the page still needs to become readable. */
-#define SCRIPT_PRESENTATION_RESERVE_BYTES (3u * 1024u * 1024u)
-#define SCRIPT_INLINE_BUDGET_RESERVE_FLOOR_BYTES (64u * 1024u)
-#define SCRIPT_LAZY_WEBPACK_MINIMUM_BYTES (128u * 1024u)
+   authoritative layout are not. Every admission below keeps the
+   presentation reserve (script_admission.h) free so a large bundle cannot
+   consume the capacity the page still needs to become readable. */
+#define SCRIPT_PRESENTATION_RESERVE_BYTES \
+    SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES
 #define SCRIPT_CRITICAL_BOOTSTRAP_RESERVE 8u
 
 _Static_assert(
@@ -127,6 +122,20 @@ static size_t script_collect_pressure_once(
     return reclaimed;
 }
 
+/* Compiled-script tables are optional Budget memory: they give way, through
+   the Budget reclaim hook, before a page script is capped or refused for
+   lack of room. Returns whether the pressure remains. */
+static bool script_budget_pressure(Budget *budget, size_t working_bytes,
+                                   size_t reserve_bytes)
+{
+    if (!budget_pressure_required(budget, working_bytes, reserve_bytes))
+        return false;
+    (void) budget_make_room(budget, working_bytes > SIZE_MAX - reserve_bytes
+                                        ? SIZE_MAX
+                                        : working_bytes + reserve_bytes);
+    return budget_pressure_required(budget, working_bytes, reserve_bytes);
+}
+
 static bool script_admit_known_working_set_with_reserve(
     ScriptRuntime *runtime, Budget *budget, size_t working_bytes,
     size_t minimum_budget_reserve_bytes,
@@ -137,8 +146,7 @@ static bool script_admit_known_working_set_with_reserve(
         ? working_bytes : minimum_budget_reserve_bytes;
     size_t heap_reserve = working_bytes > minimum_heap_reserve_bytes
         ? working_bytes : minimum_heap_reserve_bytes;
-    if (!budget_pressure_required(
-            budget, working_bytes, budget_reserve)
+    if (!script_budget_pressure(budget, working_bytes, budget_reserve)
         && !script_heap_pressure_required(
             runtime, working_bytes, heap_reserve)) {
         return true;
@@ -160,30 +168,40 @@ static bool script_admit_known_working_set_with_reserve(
     return false;
 }
 
+/* Admits one compile unit (a whole script, or the largest factory or
+   statement of a bundle the browser splits) of `unit_bytes` source when its
+   planned compile working set (script_admission.h: the measured median,
+   twice the source plus parser state) fits the heap the realm can reach,
+   and the page Budget keeps the presentation reserve beside it. After one
+   collection, a refusal counts as memory pressure. A unit that needs more
+   than planned is stopped by the heap limit and refused at compile time
+   with the realm intact. A page realm's heap grows on demand
+   (script_runtime_heap_available counts that headroom). */
 static bool script_admit_known_working_set(
-    ScriptRuntime *runtime, Budget *budget, size_t working_bytes,
+    ScriptRuntime *runtime, Budget *budget, size_t unit_bytes,
     ExternalScriptMetrics *metrics)
 {
-    /* A page realm's heap grows on demand (script_runtime_heap_available
-       counts that headroom), so no separate growth step is needed here. */
-    return script_admit_known_working_set_with_reserve(
-        runtime, budget, working_bytes,
-        SCRIPT_PRESENTATION_RESERVE_BYTES,
-        SCRIPT_MIN_EXECUTION_RESERVE_BYTES, metrics);
-}
-
-/* The QuickJS heap gate below independently reserves the measured expansion
-   window selected by script_runtime_inline_execution_reserve(). Requiring the
-   same fixed 512 KiB a second time from the shared C budget made tiny inline
-   scripts disappear once the (already charged) platform bootstrap grew.
-   Keep a modest DOM/work floor and scale it with authored source instead.
-   Hostile expansion is still bounded by both allocators during execution. */
-static size_t script_inline_budget_reserve(size_t source_length)
-{
-    const size_t ceiling = SCRIPT_MIN_EXECUTION_RESERVE_BYTES;
-    const size_t floor = SCRIPT_INLINE_BUDGET_RESERVE_FLOOR_BYTES;
-    if (source_length > (ceiling - floor) / 4u) return ceiling;
-    return floor + source_length * 4u;
+    if (budget == NULL || metrics == NULL) return false;
+    size_t peak = script_admission_compile_peak(unit_bytes);
+    if (!script_budget_pressure(
+            budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES)
+        && !script_heap_pressure_required(runtime, peak, 0)) {
+        return true;
+    }
+    size_t reclaimed = script_collect_pressure_once(
+        runtime, budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES, 0,
+        metrics);
+    if (!budget_pressure_required(
+            budget, peak, SCRIPT_PRESENTATION_RESERVE_BYTES)
+        && !script_heap_pressure_required(runtime, peak, 0)) {
+        budget_record_pressure(
+            budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
+        return true;
+    }
+    metrics->skipped_pressure++;
+    budget_record_pressure(
+        budget, BUDGET_PRESSURE_JAVASCRIPT, peak, reclaimed);
+    return false;
 }
 
 static bool script_bound_network_working_set(
@@ -194,7 +212,7 @@ static bool script_bound_network_working_set(
         || pressure_capped == NULL || metrics == NULL) return false;
     *pressure_capped = false;
     size_t requested = *response_limit;
-    if (!budget_pressure_required(
+    if (!script_budget_pressure(
             budget, requested, SCRIPT_PRESENTATION_RESERVE_BYTES)) {
         return true;
     }
@@ -203,7 +221,7 @@ static bool script_bound_network_working_set(
         size_t reclaimed = script_collect_pressure_once(
             runtime, budget, requested,
             SCRIPT_PRESENTATION_RESERVE_BYTES,
-            SCRIPT_MIN_EXECUTION_RESERVE_BYTES, metrics);
+            SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES, metrics);
         if (!budget_pressure_required(
                 budget, requested, SCRIPT_PRESENTATION_RESERVE_BYTES)) {
             budget_record_pressure(
@@ -299,6 +317,13 @@ void script_cache_response_policy(const FetchResult *fetch,
     (void) fetch_response_header_value(fetch, "cache-control",
                                        cache_control, 256);
     (void) fetch_response_header_value(fetch, "vary", vary, 128);
+}
+
+bool script_response_no_store(const FetchResult *fetch)
+{
+    char cache_control[256], vary[128];
+    script_cache_response_policy(fetch, cache_control, vary);
+    return browser_session_cache_control_no_store(cache_control);
 }
 
 static void script_cache_store(BrowserSession *session, const char *url,
@@ -543,6 +568,17 @@ static void collect_scripts(ScriptRuntime *runtime, lxb_dom_node_t *node,
     }
 }
 
+/* A page without a policy never pays for the parser-inserted lookup. */
+static uint8_t script_element_csp_grant(
+    const TilefinchContentSecurityPolicy *csp, ScriptRuntime *runtime,
+    lxb_dom_node_t *node)
+{
+    return csp == NULL || !csp->header_present ? 0
+        : tilefinch_csp_element_grant(
+              csp, TILEFINCH_DESTINATION_SCRIPT, node,
+              script_runtime_script_parser_inserted(runtime, node));
+}
+
 static TilefinchRequestContext script_request_context(
     const char *document_url, const char *top_level_url,
     const char *target_url, bool cors,
@@ -731,9 +767,12 @@ bool external_scripts_load(NavigationSession *navigation,
             (void) navigation_dispatch_node_event(navigation, node, "error");
             continue;
         }
-        if (!tilefinch_csp_allows_request(
+        uint8_t csp_grant = script_element_csp_grant(
+            &navigation->page.document.content_security_policy,
+            navigation->page.runtime, node);
+        if (!tilefinch_csp_allows_request_granted(
                 &navigation->page.document.content_security_policy,
-                TILEFINCH_DESTINATION_SCRIPT, resolved)) {
+                TILEFINCH_DESTINATION_SCRIPT, resolved, csp_grant)) {
             metrics->failed++;
             (void) navigation_dispatch_node_event(
                 navigation, node, "error");
@@ -793,6 +832,7 @@ bool external_scripts_load(NavigationSession *navigation,
         TilefinchRequestContext request_context = script_request_context(
             document_url, document_url, resolved, cors, credentials,
             initiator_opaque);
+        request_context.csp_grant = csp_grant;
         const BrowserCacheEntry *cached = NULL;
         BrowserCacheStatus cache_status = cors ? BROWSER_CACHE_MISS
             : script_cache_match(
@@ -976,10 +1016,11 @@ bool external_scripts_load(NavigationSession *navigation,
             source = fetch->data;
         }
         if (loaded) {
-            loaded = navigation_evaluate_external_script(
+            loaded = navigation_evaluate_external_script_response(
                 navigation, node, source, source_length,
                 fetch->effective_url[0] == '\0'
-                ? resolved : fetch->effective_url);
+                ? resolved : fetch->effective_url,
+                script_response_no_store(fetch));
         }
         if (revalidated) {
             script_cache_revalidate(navigation->browser_session, resolved,
@@ -1081,25 +1122,6 @@ static void script_referrer_policy_for_node(
     }
     if (!script_referrer_policy_valid(selected)) selected = "";
     snprintf(output, FETCH_REFERRER_POLICY_LIMIT, "%s", selected);
-}
-
-static bool script_lazy_plan_prepare(Budget *budget, const char *source,
-                                     size_t source_length, bool module,
-                                     ScriptLazyWebpackPlan *plan)
-{
-    memset(plan, 0, sizeof(*plan));
-    if (module || source_length < SCRIPT_LAZY_WEBPACK_MINIMUM_BYTES
-        || getenv("TILEFINCH_DISABLE_LAZY_WEBPACK") != NULL
-        || !script_lazy_webpack_plan_create(
-               budget, source, source_length, plan)) return false;
-    /* Planning/registry overhead is justified only when factories account
-       for most of the body. This remains a content-shape decision; no URL,
-       host, chunk identifier, or module identifier participates. */
-    if (plan->factory_source_bytes < source_length / 2) {
-        script_lazy_webpack_plan_destroy(plan);
-        return false;
-    }
-    return true;
 }
 
 static bool script_cost_identifier_equal(
@@ -1272,8 +1294,12 @@ static bool script_evaluate_external_node(
     const char *module_referrer_policy,
     TilefinchCredentialsMode module_credentials,
     BrowserSharedBody *source_body, const ScriptLazyWebpackPlan *lazy_plan,
-    ExternalScriptMetrics *metrics)
+    bool response_no_store, ExternalScriptMetrics *metrics)
 {
+    /* The page's script weight (heavy pages, script_admission.h). */
+    script_runtime_note_script_source(
+        runtime, source_length,
+        lazy_plan != NULL ? lazy_plan->largest_factory_bytes : source_length);
     size_t integrity_length = 0;
     const char *integrity = document_attribute(
         node, "integrity", &integrity_length);
@@ -1314,10 +1340,16 @@ static bool script_evaluate_external_node(
             metrics->lazy_webpack_candidates++;
             uint64_t evaluation_started_ns =
                 tilefinch_platform_monotonic_time_ns();
+            ScriptLazyBundleRecordTarget record = {
+                .request_url = request_url,
+                .body = source_body,
+                .no_store = response_no_store
+            };
             ScriptLazyEvaluation lazy =
-                script_runtime_evaluate_external_lazy_webpack(
+                script_runtime_evaluate_external_lazy_webpack_recorded(
                     runtime, node, source, source_length, response_url,
-                    lazy_plan, lease, script_lazy_source_release, result);
+                    lazy_plan, &record, lease, script_lazy_source_release,
+                    result);
             script_metrics_record_execution_time(
                 metrics, evaluation_started_ns);
             if (lazy != SCRIPT_LAZY_EVALUATION_FALLBACK) {
@@ -1346,13 +1378,13 @@ static bool script_evaluate_external_node(
     }
     uint64_t evaluation_started_ns = tilefinch_platform_monotonic_time_ns();
     bool ok = module
-        ? script_runtime_evaluate_external_module_context(
+        ? script_runtime_evaluate_external_module_response(
               runtime, node, source, source_length, request_url,
               response_url, module_referrer_policy, module_credentials,
-              result)
+              response_no_store, result)
         : script_runtime_evaluate_external_classic_cached(
               runtime, node, source, source_length, request_url,
-              response_url, result);
+              response_url, response_no_store, result);
     script_metrics_record_execution_time(metrics, evaluation_started_ns);
     if (!ok) {
         metrics->execution_failures++;
@@ -1515,6 +1547,7 @@ static bool script_execute_inline_admitted(
     const TilefinchContentSecurityPolicy *csp,
     ExternalScriptMetrics *metrics)
 {
+    script_runtime_script_mark_started(runtime, node);
     if (!module && prefer_data) {
         size_t source_length = 0;
         if (script_admit_inline_data_node(
@@ -1591,12 +1624,13 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
         source_length += length;
     }
     if (source_length == 0) return true;
+    /* The QuickJS heap keeps the expansion window
+       script_runtime_inline_execution_reserve() selects; the page Budget
+       keeps the presentation reserve, which already covers the inline
+       script's DOM work. */
     size_t execution_reserve =
         script_runtime_inline_execution_reserve(runtime, source_length);
-    size_t budget_reserve = script_inline_budget_reserve(source_length);
-    if (budget_reserve < SCRIPT_PRESENTATION_RESERVE_BYTES) {
-        budget_reserve = SCRIPT_PRESENTATION_RESERVE_BYTES;
-    }
+    size_t budget_reserve = SCRIPT_PRESENTATION_RESERVE_BYTES;
     bool admitted = script_admit_known_working_set_with_reserve(
         runtime, budget, source_length,
         budget_reserve, execution_reserve, metrics);
@@ -1682,7 +1716,7 @@ static bool script_evaluate_data_url_node(
     bool ok = script_evaluate_external_node(
         runtime, budget, node, (const char *) source, source_length,
         url, url, module, module ? effective_policy : NULL, credentials,
-        NULL, NULL, metrics);
+        NULL, NULL, true, metrics);
     if (ok) {
         metrics->loaded++;
         metrics->bytes += source_length;
@@ -1721,6 +1755,7 @@ static bool execute_external_node(
     if (process_result != NULL) {
         *process_result = DOCUMENT_SCRIPT_PROCESS_COMPLETE;
     }
+    script_runtime_script_mark_started(runtime, node);
     size_t reference_length = 0;
     const char *reference = script_source_attribute(node, &reference_length);
     if (reference == NULL || reference_length == 0) {
@@ -1732,6 +1767,8 @@ static bool execute_external_node(
         }
         return false;
     }
+    uint8_t csp_grant = script_element_csp_grant(
+        content_security_policy, runtime, node);
     if (reference_length >= 5
         && strncasecmp(reference, "data:", 5) == 0) {
         if (!executable_precounted
@@ -1740,23 +1777,27 @@ static bool execute_external_node(
             (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
             return true;
         }
-        char data_url[NAVIGATION_URL_LIMIT];
-        if (reference_length >= sizeof(data_url)) {
+        /* CSP sees only a data: URL's scheme, so check its header (media
+           type and parameters) rather than requiring the whole bundle to
+           fit a URL buffer: Reddit ships a 34 KB data: module. The decoder
+           below bounds the payload by the per-file script limit. */
+        char data_url[256];
+        size_t header_length = 0;
+        while (header_length < reference_length
+               && reference[header_length] != ','
+               && header_length + 2u < sizeof(data_url)) header_length++;
+        if (header_length >= reference_length
+            || reference[header_length] != ',') {
             metrics->failed++;
-            if (tilefinch_trace_script_failures()) {
-                fprintf(stderr,
-                        "data-script-url-too-long length=%zu limit=%zu\n",
-                        reference_length, sizeof(data_url) - 1u);
-            }
             (void) script_runtime_dispatch_node(
                 runtime, node, "error", NULL);
             return true;
         }
-        memcpy(data_url, reference, reference_length);
-        data_url[reference_length] = '\0';
-        if (!tilefinch_csp_allows_request(
+        memcpy(data_url, reference, header_length + 1u);
+        data_url[header_length + 1u] = '\0';
+        if (!tilefinch_csp_allows_request_granted(
                 content_security_policy, TILEFINCH_DESTINATION_SCRIPT,
-                data_url)) {
+                data_url, csp_grant)) {
             metrics->failed++;
             metrics->policy_refusals++;
             (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
@@ -1785,9 +1826,9 @@ static bool execute_external_node(
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
-    if (!tilefinch_csp_allows_request(
+    if (!tilefinch_csp_allows_request_granted(
             content_security_policy, TILEFINCH_DESTINATION_SCRIPT,
-            resolved)) {
+            resolved, csp_grant)) {
         metrics->failed++;
         metrics->policy_refusals++;
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
@@ -1865,8 +1906,23 @@ static bool execute_external_node(
     TilefinchRequestContext request_context = script_request_context(
         document_url, top_level_url, resolved, cors, module_credentials,
         initiator_opaque);
+    request_context.csp_grant = csp_grant;
     const BrowserCacheEntry *cached = NULL;
-    BrowserCacheStatus cache_status = module
+    /* An installed app's classic script restored as bytecode only runs
+       without reading its source unless integrity metadata, or the
+       cross-origin cost check below, needs the bytes. */
+    size_t deferred_length = 0;
+    bool deferred = !module && !cors && session != NULL
+        && !script_integrity_present(node)
+        && !content_blocker_would_block(
+               session->content_blocker, resolved, document_url,
+               "script", "no-cors")
+        && browser_session_offline_script_match(
+               session, resolved, &request_context, &deferred_length)
+        && (deferred_length < 192u * 1024u
+            || tilefinch_url_same_origin(document_url, resolved));
+    BrowserCacheStatus cache_status = deferred ? BROWSER_CACHE_FRESH
+        : module
         ? script_module_cache_match(
             session, resolved, initiator_origin, top_level_url,
             initiator_opaque, module_credentials, &cached)
@@ -1880,10 +1936,14 @@ static bool execute_external_node(
         cache_status = BROWSER_CACHE_MISS;
     }
     if (cache_status == BROWSER_CACHE_FRESH) {
-        if (cached == NULL || cached->length > response_limit) {
+        size_t fresh_length = deferred ? deferred_length
+            : cached == NULL ? 0 : cached->length;
+        if ((cached == NULL && !deferred) || fresh_length > response_limit) {
             script_runtime_script_quota_abort(runtime, &quota);
             metrics->skipped_quota++; script_trace_skip(resolved);
-            if (cached != NULL && cached->length > maximum_file_bytes
+            if (fresh_length > maximum_file_bytes)
+                script_runtime_note_oversized_script(runtime, fresh_length);
+            if (fresh_length > maximum_file_bytes
                 && process_result != NULL) {
                 *process_result = DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT;
             }
@@ -1891,8 +1951,11 @@ static bool execute_external_node(
                 runtime, node, "error", NULL);
             return true;
         }
-        ScriptCacheSource cached_source;
-        if (!script_cache_source_acquire(budget, cached, &cached_source)) {
+        ScriptCacheSource cached_source = {
+            .length = deferred_length, .budget = budget
+        };
+        if (!deferred
+            && !script_cache_source_acquire(budget, cached, &cached_source)) {
             script_runtime_script_quota_abort(runtime, &quota);
             metrics->failed++;
             (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
@@ -1903,7 +1966,7 @@ static bool execute_external_node(
         const char *cached_response_url = module
             ? cached->module_effective_url : resolved;
         bool cost_rejected = false;
-        if (!module && cached_length >= 192u * 1024u
+        if (!module && !deferred && cached_length >= 192u * 1024u
             && !tilefinch_url_same_origin(
                    document_url, cached_response_url)) {
             ScriptStaticCostProfile cost;
@@ -1930,9 +1993,9 @@ static bool execute_external_node(
         }
         ScriptLazyWebpackPlan lazy_plan;
         bool has_lazy_plan = cached_source.body != NULL
-            && script_lazy_plan_prepare(
-                budget, cached_source.data, cached_length, module,
-                &lazy_plan);
+            && script_runtime_lazy_webpack_plan_eligible(
+                runtime, budget, resolved, cached_source.data, cached_length,
+                module, &lazy_plan);
         size_t compile_working_bytes = has_lazy_plan
             ? lazy_plan.largest_factory_bytes : cached_length;
         if (!script_admit_known_working_set(
@@ -1961,7 +2024,7 @@ static bool execute_external_node(
             resolved,
             module ? cached->module_effective_url : resolved,
             module, module_policy, module_credentials, cached_source.body,
-            has_lazy_plan ? &lazy_plan : NULL, metrics);
+            has_lazy_plan ? &lazy_plan : NULL, false, metrics);
         if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
         script_cache_source_release(&cached_source);
         if (ok) {
@@ -2045,6 +2108,7 @@ static bool execute_external_node(
             metrics->policy_refusals++;
         } else if (fetch->response_limit_exceeded && !pressure_capped) {
             metrics->skipped_quota++;
+            script_runtime_note_oversized_script(runtime, response_limit);
         } else if (script_fetch_was_pressure_rejected(fetch, pressure_capped)) {
             metrics->skipped_pressure++;
         } else {
@@ -2132,8 +2196,10 @@ static bool execute_external_node(
     BrowserSharedBody *source_body = fetch->status_code == 304
         ? cached_source.body : NULL;
     ScriptLazyWebpackPlan lazy_plan;
-    bool has_lazy_plan = ok && script_lazy_plan_prepare(
-        budget, source, source_length, module, &lazy_plan);
+    /* The planner, or a bundle record of exactly these bytes. */
+    bool has_lazy_plan = ok && script_runtime_lazy_webpack_plan_eligible(
+        runtime, budget, resolved, source, source_length, module,
+        &lazy_plan);
     if (has_lazy_plan && fetch->status_code != 304) {
         bool shared = fetch_result_share_body(fetch);
         source = fetch->data;
@@ -2214,7 +2280,8 @@ static bool execute_external_node(
             runtime, budget, node, source, source_length, resolved,
             response_url, module, module_policy, module_credentials,
             source_body,
-            has_lazy_plan ? &lazy_plan : NULL, metrics);
+            has_lazy_plan ? &lazy_plan : NULL,
+            script_response_no_store(fetch), metrics);
     } else {
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
     }
@@ -2374,9 +2441,7 @@ static void module_load_refused(const char *url, const char *reason)
         tilefinch_platform_log_message(message);
     }
 #else
-    static int enabled = -1;
-    if (enabled < 0) enabled = tilefinch_trace_script_failures();
-    if (enabled)
+    if (tilefinch_trace_script_failures())
         fprintf(stderr, "module-refused reason=%s url=%s\n", reason,
                 url == NULL ? "<null>" : url);
 #endif
@@ -2510,6 +2575,8 @@ static void module_prefetch_dependencies(
         TilefinchRequestContext request_context = script_request_context(
             document_url, context->top_level_url, resolved, true,
             credentials, initiator_opaque);
+        request_context.csp_grant = script_runtime_module_csp_grant(
+            context->runtime, module_url);
         FetchRequest transport = {
             .allow_http_errors = true,
             .send_low_client_hints = true,
@@ -2569,6 +2636,15 @@ static bool pipeline_module_load(void *opaque,
         memcpy(initiator_origin, "null", sizeof("null"));
     } else if (!tilefinch_url_origin(document_url, initiator_origin,
                                      sizeof(initiator_origin))) return false;
+    /* A fresh cache hit never reaches the transport's CSP check. An import
+       carries its root script's nonce and parser metadata. */
+    if (!tilefinch_csp_allows_request_granted(
+            script_runtime_content_security_policy(context->runtime),
+            TILEFINCH_DESTINATION_SCRIPT, url, module_request->csp_grant)) {
+        context->metrics->policy_refusals++;
+        module_load_refused(url, "content-security-policy");
+        return false;
+    }
     FetchScheduler *scheduler = script_runtime_fetch_scheduler(
         context->runtime);
     if (scheduler == NULL) return false;
@@ -2645,6 +2721,7 @@ static bool pipeline_module_load(void *opaque,
         TilefinchRequestContext request_context = script_request_context(
             document_url, context->top_level_url, url, true,
             credentials, initiator_opaque);
+        request_context.csp_grant = module_request->csp_grant;
         FetchRequest transport = {
             .allow_http_errors = true,
             .send_low_client_hints = true,
@@ -2861,6 +2938,10 @@ static bool pipeline_module_load(void *opaque,
             document_url, credentials, initiator_opaque, initiator_origin,
             (const char *) selected, selected_length);
     }
+    /* A fresh cache hit is never no-store: the HTTP cache does not keep
+       such a response. */
+    result->response_no_store = fetch != NULL
+        && script_response_no_store(fetch);
     size_t quota_source_length = selected_length;
     if (!script_runtime_script_quota_commit(
             context->runtime, &quota, quota_source_length)) {

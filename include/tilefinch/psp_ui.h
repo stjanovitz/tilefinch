@@ -19,6 +19,13 @@
 #define PSP_UI_STATUS_CAPACITY 80
 /* Character ceiling of a scale-2 toast on the 480-pixel PSP display. */
 #define PSP_UI_LARGE_TOAST_CHARACTER_LIMIT 36u
+/* A page's same-URL auto-reload, offered instead of forced once the reader
+   has pressed a button on it. Square is the page screen's reload control
+   (PSP_UI_BUTTON_RELOAD, PSP_UI_ACTION_RELOAD). */
+#define PSP_UI_STATUS_RELOAD_OFFER "PAGE WANTS TO RELOAD  SQUARE RELOADS"
+_Static_assert(sizeof(PSP_UI_STATUS_RELOAD_OFFER) - 1u
+                   <= PSP_UI_LARGE_TOAST_CHARACTER_LIMIT,
+               "the reload offer must fit the large PSP toast");
 /* Multiline diagnostics use measured proportional width, so the explanatory
    line can be longer without shrinking the chrome font. */
 #define PSP_UI_MULTILINE_TOAST_CHARACTER_LIMIT 64u
@@ -103,6 +110,8 @@ typedef struct {
     uint16_t app_theme_rgb565;
     uint16_t progress_per_mille;
     uint8_t offline_state;
+    /* An installed app whose bytecode needs recompiling (X offers it). */
+    bool needs_recompile;
     const unsigned char *icon_rgba;
 } PspUiCollectionsRow;
 
@@ -126,6 +135,9 @@ typedef struct {
     char stick_free[32];
     PspUiSiteStorageRow rows[PSP_UI_SITE_STORAGE_ROW_LIMIT];
 } PspUiSiteStorageView;
+
+/* PspUiOfflineAppPreview.operation: OfflineWebAppOperation, or this. */
+#define PSP_UI_OFFLINE_APP_RECOMPILE 3u
 
 typedef struct {
     char name[PSP_UI_TITLE_CAPACITY];
@@ -191,6 +203,8 @@ typedef enum {
     PSP_UI_ACTION_INSTALL_OFFLINE_APP,
     PSP_UI_ACTION_CONFIRM_OFFLINE_APP,
     PSP_UI_ACTION_CANCEL_OFFLINE_APP,
+    PSP_UI_ACTION_RECOMPILE_OFFLINE_APP,
+    PSP_UI_ACTION_OPEN_OFFLINE_APP_ANYWAY,
     PSP_UI_ACTION_SHOW_OFFLINE,
     PSP_UI_ACTION_SHOW_DOWNLOADS,
     PSP_UI_ACTION_SHOW_SCREENSHOTS,
@@ -232,6 +246,11 @@ typedef enum {
     PSP_UI_ACTION_RECOVERY_AUDIO_ONLY,
     PSP_UI_ACTION_RECOVERY_LOWER_QUALITY,
     PSP_UI_ACTION_RECOVERY_RETURN,
+    /* Present this page's Basic view (its DOM still exists). */
+    PSP_UI_ACTION_RECOVERY_BASIC,
+    /* Reload the failed address with page JavaScript off for that one load
+       and present it in Basic view. */
+    PSP_UI_ACTION_RECOVERY_RELOAD_BASIC,
     /* Site data & storage. SHOW asks the frontend to fill the site list;
        DELETE carries
        intent.list_index and follows the row's own confirm step. The three
@@ -241,6 +260,13 @@ typedef enum {
     PSP_UI_ACTION_STORAGE_OFFER_SESSION,
     PSP_UI_ACTION_STORAGE_OFFER_ALWAYS,
     PSP_UI_ACTION_STORAGE_OFFER_DECLINE,
+    /* The heavy-page offer (an app shell that needs a lot of script): run
+       it for this session, always for this site, or not now. STOP_SCRIPTS
+       comes from the "page scripts still running" status. */
+    PSP_UI_ACTION_HEAVY_RUN_SESSION,
+    PSP_UI_ACTION_HEAVY_RUN_ALWAYS,
+    PSP_UI_ACTION_HEAVY_CANCEL,
+    PSP_UI_ACTION_HEAVY_STOP_SCRIPTS,
     PSP_UI_ACTION_EXIT
 } PspUiAction;
 
@@ -253,7 +279,9 @@ enum {
     PSP_UI_FAILURE_WIFI = 1u << 1,
     PSP_UI_FAILURE_DISABLE_JAVASCRIPT = 1u << 2,
     PSP_UI_FAILURE_AUDIO_ONLY = 1u << 3,
-    PSP_UI_FAILURE_LOWER_QUALITY = 1u << 4
+    PSP_UI_FAILURE_LOWER_QUALITY = 1u << 4,
+    PSP_UI_FAILURE_BASIC_VIEW = 1u << 5,
+    PSP_UI_FAILURE_RELOAD_BASIC = 1u << 6
 };
 
 typedef struct {
@@ -353,7 +381,18 @@ typedef enum {
     /* unsigned_value is a BrowserSiteStoragePolicy: for the current page's
        site, or (LISTED) for row intent.list_index of Site data & storage. */
     PSP_UI_SETTING_SITE_STORAGE_SITE,
-    PSP_UI_SETTING_SITE_STORAGE_LISTED
+    PSP_UI_SETTING_SITE_STORAGE_LISTED,
+    /* basic_fallback_mode: Automatic, Ask or Off. */
+    PSP_UI_SETTING_BASIC_FALLBACK,
+    /* boolean: offer language packs on pages that need them (Ask/Off). */
+    PSP_UI_SETTING_GLYPH_OFFERS,
+    /* Forget every "Don't ask again" answer. */
+    PSP_UI_SETTING_GLYPH_OFFERS_RESET,
+    /* boolean: keep compiled scripts on the Memory Stick across restarts
+       (the persistent compiled-script tier). */
+    PSP_UI_SETTING_KEEP_COMPILED_SCRIPTS,
+    /* heavy_pages_mode: Ask, Run or Basic view (BrowserHeavyPagesMode). */
+    PSP_UI_SETTING_HEAVY_PAGES
 } PspUiSettingId;
 
 typedef union {
@@ -375,6 +414,8 @@ typedef union {
     BrowserUpdateChannel update_channel;
     BrowserGlyphLanguage glyph_language;
     ContentBlockerMode content_blocker_mode;
+    BrowserBasicFallbackMode basic_fallback_mode;
+    BrowserHeavyPagesMode heavy_pages_mode;
 } PspUiSettingValue;
 
 typedef struct {
@@ -402,6 +443,29 @@ typedef enum {
     PSP_UI_GLYPH_COMPONENT_READY,
     PSP_UI_GLYPH_COMPONENT_ERROR
 } PspUiGlyphComponentPhase;
+
+/* The in-page language-pack offer's answers (PspUiIntent). */
+typedef enum {
+    PSP_UI_GLYPH_OFFER_NONE = 0,
+    /* X on the offer: opens the confirmation and asks for the signed size.
+       Nothing is downloaded. */
+    PSP_UI_GLYPH_OFFER_CONFIRM,
+    /* X on the confirmation once the size is known: the only answer that
+       installs. */
+    PSP_UI_GLYPH_OFFER_INSTALL,
+    /* O on the confirmation (or the Menu button over it). */
+    PSP_UI_GLYPH_OFFER_CANCEL,
+    /* Triangle on the offer. */
+    PSP_UI_GLYPH_OFFER_NEVER
+} PspUiGlyphOfferAnswer;
+
+/* The confirmation's body: the signed size is being fetched, is known, or
+   the check failed with the operation's own message. */
+typedef enum {
+    PSP_UI_GLYPH_CONFIRM_CHECKING = 0,
+    PSP_UI_GLYPH_CONFIRM_READY,
+    PSP_UI_GLYPH_CONFIRM_ERROR
+} PspUiGlyphConfirmPhase;
 
 typedef enum {
     PSP_UI_CURSOR_CROSSHAIR = 0,
@@ -431,6 +495,7 @@ typedef struct {
     bool clear_cookies_requested;
     bool clear_local_storage_requested;
     bool clear_session_storage_requested;
+    bool clear_compiled_scripts_requested;
     bool clear_site_data_requested;
     bool reset_site_permissions_requested;
     bool update_primary_requested;
@@ -448,6 +513,10 @@ typedef struct {
     bool glyph_component_cancel_requested;
     bool glyph_component_remove_requested;
     uint8_t glyph_component_pack;
+    /* PspUiGlyphOfferAnswer. INSTALL also raises
+       glyph_component_primary_requested for glyph_component_pack, so the
+       offer installs through exactly the menu's download path. */
+    uint8_t glyph_offer_answer;
     bool theme_catalog_probe_requested;
     bool theme_catalog_closed;
     bool theme_selected;
@@ -481,13 +550,20 @@ typedef enum {
     PSP_UI_SCREEN_STORAGE_SITE,
     /* A site outgrew RAM: X this session, Triangle always, O no. */
     PSP_UI_SCREEN_STORAGE_OFFER,
+    /* An app shell needs a lot of script: X this session, Triangle always,
+       O not now. */
+    PSP_UI_SCREEN_HEAVY_OFFER,
     /*
      * Native chrome surfaces. Unlike every screen above they are full
      * surfaces rather than overlays over a page: they own the whole panel,
      * keep the analog cursor live, and are never captured as tab state.
      */
     PSP_UI_SCREEN_HOME,
-    PSP_UI_SCREEN_COLLECTIONS
+    PSP_UI_SCREEN_COLLECTIONS,
+    /* The language-pack offer's confirmation: the pack's signed size, then
+       X Install / O Cancel. An overlay over the page; appended so the
+       surfaces above keep their numbers. */
+    PSP_UI_SCREEN_GLYPH_OFFER
 } PspUiScreen;
 
 /* True for the native surfaces above, which draw instead of the page. */
@@ -533,7 +609,12 @@ typedef struct {
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
     uint16_t alternate_language : 4;
-    unsigned persistent_cache_mb;
+    /* The disk cache size (0..4 MB), then Keep compiled scripts and the
+       size its files use, rounded up to KiB (shown on Site data &
+       storage), share one word so the state stays at its ratchet. */
+    unsigned persistent_cache_mb : 8;
+    unsigned keep_compiled_scripts : 1;
+    unsigned compiled_scripts_kib : 23;
     unsigned live_cache_kib;
     bool persist_local_storage;
     bool update_primary_enabled;
@@ -555,6 +636,9 @@ typedef struct {
     unsigned content_blocker_mode : 2;
     unsigned content_blocker_site_allowed : 1;
     unsigned reader_mode : 1;
+    /* Reader was engaged by Auto Reader, not by the user: it does not carry
+       over to the next navigation (psp_reader_policy.h). */
+    unsigned reader_automatic : 1;
     unsigned reader_font_serif : 1;
     unsigned remember_reader_site_scale : 1;
     unsigned reader_auto_mode : 1;
@@ -637,6 +721,11 @@ typedef struct {
        source DOM remains connected in either mode. Pack this beside the
        existing page-color bit so the fixed 1 KiB UI state does not grow. */
     uint8_t basic_mode : 1;
+    /* BrowserBasicFallbackMode, in the same byte's spare bits. */
+    uint8_t basic_fallback_mode : 2;
+    /* Zero, or the TilefinchGlyphPack plus one of the language-pack offer
+       the toast is showing; the byte's last four spare bits. */
+    uint8_t glyph_offer_plus_one : 4;
     bool loading;
     bool secure;
     bool can_go_back;
@@ -644,8 +733,11 @@ typedef struct {
     bool has_focus;
     bool focus_editable;
     bool custom_homepage_enabled;
-    /* All three are frame counters bounded below 1024 by their producers. */
+    /* Frame counters bounded below 1024 by their producers (toast_frames
+       also has the timed form below). */
     uint16_t activity_frames;
+    /* Bit 15 set (psp_ui_show_status_ms): the low bits are the toast's
+       remaining real time in 4 ms units instead of UI frames. */
     uint16_t toast_frames;
     uint16_t loading_phase : 10;
     /* Uses a spare bit in the bounded phase counter, not another UI byte. */
@@ -680,7 +772,7 @@ typedef struct {
        ratchet while leaving the provider's four-pack runtime limit intact. */
     uint16_t glyph_installed_mask : PSP_UI_GLYPH_INSTALLED_MASK_BITS;
     uint16_t glyph_operation_pack : 4;
-    uint16_t glyph_options_selection : 2;
+    uint16_t glyph_options_selection : 3;
     /* Native surfaces. HOME indexes tiles then CONTINUE rows in one space;
        COLLECTIONS keeps a row selection, its first visible row, and zero or
        the row awaiting a delete confirmation plus one. */
@@ -695,7 +787,11 @@ typedef struct {
        high bit is one pre-dispatch activation-feedback frame, preserving the
        1 KiB UI-state ratchet. */
     uint8_t collections_delete_confirmation;
-    uint8_t failure_actions;
+    /* PspUiFailureAction bits; the seventh flag is the last. */
+    uint8_t failure_actions : 7;
+    /* Settings > Appearance > Language & emoji > Offer language packs is
+       Off (the profile's default is Ask). The byte's spare bit. */
+    uint8_t glyph_offers_off : 1;
     const PspUiTabsView *tabs;
     /* Exactly one native surface is showing at a time, so their views share
        a slot the way the text-entry and find views already do. */
@@ -728,7 +824,14 @@ typedef struct {
     uint16_t cursor_idle_ms;
     /* One of the four direction bits, or zero. */
     uint16_t focus_repeat_direction;
-    int8_t analog_scroll_direction;
+    /* -1, 0 or 1. Then, in the same byte, Settings > Browsing & input >
+       Heavy pages (BrowserHeavyPagesMode), the status "page scripts still
+       running" (X stops them, O keeps reading) and the recovery sheet
+       titled for a page too heavy for the PSP. */
+    int8_t analog_scroll_direction : 2;
+    uint8_t heavy_pages_mode : 2;
+    uint8_t heavy_scripts_suggested : 1;
+    uint8_t failure_recovery_heavy : 1;
     /* Uses alignment padding before the cursor coordinates. */
     bool save_playback_positions;
     int cursor_x_milli;
@@ -761,6 +864,25 @@ typedef struct {
             bool storage_offer_free_known;
             /* Frames left before the offer accepts an answer. */
             uint8_t storage_offer_arming;
+        };
+        /* The language-pack confirmation: signed package size, its
+           PspUiGlyphConfirmPhase, its pack, and a failed check's
+           message. */
+        struct {
+            uint32_t glyph_confirm_bytes;
+            uint8_t glyph_confirm_phase;
+            /* A status clears the toast's pack, so keep a copy. */
+            uint8_t glyph_confirm_pack;
+            char glyph_confirm_message[96];
+        };
+        /* The heavy-page offer; script source in bytes, start estimate in
+           seconds. */
+        struct {
+            char heavy_offer_site[80];
+            uint32_t heavy_offer_script_bytes;
+            uint16_t heavy_offer_seconds;
+            /* Frames left before the offer accepts an answer. */
+            uint8_t heavy_offer_arming;
         };
         struct {
             char site_tls_version[16];
@@ -1002,6 +1124,14 @@ void psp_ui_set_history(PspUiState *ui, bool can_go_back,
                         bool can_go_forward);
 void psp_ui_set_loading(PspUiState *ui, bool loading,
                         int progress_per_mille);
+/* Page script can enter fullscreen during a frame's dispatch or runtime
+   advance, after that frame sampled input. The frontend adopts the state
+   (page_fullscreen, Page controls) at the next input sample; call this with
+   the engine's state before presenting so the page's first full-screen frame
+   is composed without chrome. Only retracts: never shows chrome, and leaves
+   chrome the user revealed after adoption alone. Returns true on a change. */
+bool psp_ui_retract_chrome_for_page_fullscreen(PspUiState *ui,
+                                               bool page_fullscreen_active);
 /* Presentation-only activity, distinct from navigation loading. */
 bool psp_ui_set_page_activation(PspUiState *ui, bool active);
 /* End input-receipt feedback after dispatch, without dismissing a newer
@@ -1024,17 +1154,51 @@ void psp_ui_keep_status(PspUiState *ui, const char *status,
                         unsigned duration_frames);
 void psp_ui_show_status(PspUiState *ui, const char *status,
                         unsigned duration_frames);
+/* Retire `status` if it is the toast still showing; any other toast stands.
+   For a status that announces work which has now finished: a toast's frames
+   count down only in psp_ui_update, which does not run while the video
+   player owns input, so without this it outlives its work. */
+void psp_ui_dismiss_status(PspUiState *ui, const char *status);
+/* As psp_ui_show_status(), timed in real milliseconds (at most 60000) rather
+   than UI frames, whose rate follows the page's presentation cadence. */
+void psp_ui_show_status_ms(PspUiState *ui, const char *status,
+                           unsigned duration_ms);
 /* For a status that counts (e.g. seconds): while a toast whose first
    family_length characters match is showing, replace its text in place
    without replaying the entry motion. Never displaces a different status. */
 void psp_ui_keep_progress_status(PspUiState *ui, const char *status,
                                  size_t family_length,
                                  unsigned duration_frames);
+/* A committed page is a bot-protection wall (navigation_bot_wall): tell
+   the reader "<site> blocked Tilefinch / Bot protection: this site may not
+   work" instead of leaving a silent blank page. */
+bool psp_ui_show_site_blocked_status(PspUiState *ui, const char *site,
+                                     unsigned duration_frames);
 void psp_ui_show_tls_status(
     PspUiState *ui, const char *headline,
     TilefinchTlsGuidance guidance, unsigned duration_frames);
 void psp_ui_show_wifi_sign_in_status(
     PspUiState *ui, const char *headline, unsigned duration_frames);
+/* The in-page language-pack offer: a three-line toast over the page, not a
+   panel, so reading and scrolling continue under it. It lasts
+   PSP_UI_GLYPH_OFFER_MS of real time. Once armed (PSP_UI_GLYPH_OFFER_ARMING_MS,
+   so a press already meant for the page stays the page's) it takes only
+   X, which opens the confirmation, and Triangle (Don't ask again). Circle
+   stays Back and closes the offer on its way. Nothing the offer itself
+   takes can start a download: that needs a second X on the confirmation,
+   after its signed size is shown. Any other status replaces it. */
+#define PSP_UI_GLYPH_OFFER_MS 12000u
+#define PSP_UI_GLYPH_OFFER_ARMING_MS 600u
+void psp_ui_show_glyph_offer(PspUiState *ui, uint8_t pack);
+bool psp_ui_glyph_offer_visible(const PspUiState *ui);
+/* The confirmation's state, published by the app as the signed metadata
+   check runs. Ignored unless the confirmation for that pack is showing. */
+void psp_ui_set_glyph_offer_size(PspUiState *ui, uint8_t pack,
+                                 uint64_t bytes);
+void psp_ui_set_glyph_offer_error(PspUiState *ui, uint8_t pack,
+                                  const char *message);
+/* The confirmation is showing, for which pack. */
+bool psp_ui_glyph_offer_confirming(const PspUiState *ui, uint8_t *pack);
 void psp_ui_set_update(
     PspUiState *ui, const char *version, const char *status,
     const char *notes, int progress_per_mille, const char *primary_label,
@@ -1059,6 +1223,10 @@ void psp_ui_set_home(PspUiState *ui, const PspUiHomeView *home);
 void psp_ui_set_collections(
     PspUiState *ui, const PspUiCollectionsView *collections);
 void psp_ui_show_offline_app_preview(
+    PspUiState *ui, const PspUiOfflineAppPreview *preview);
+/* The same panel offered from Library > Saved (a recompile): Circle
+   returns to the Library instead of Page tools. */
+void psp_ui_show_offline_app_offer(
     PspUiState *ui, const PspUiOfflineAppPreview *preview);
 /* Opens COLLECTIONS on a section, resetting scroll and any confirmation. */
 void psp_ui_show_collections(
@@ -1121,6 +1289,18 @@ void psp_ui_show_storage_offer(
     PspUiState *ui, const char *origin, size_t current_bytes,
     size_t needed_bytes, size_t limit_bytes, bool free_known,
     uint64_t free_bytes);
+/* Opens the heavy-page offer over the page: the site needs about
+   `script_bytes` of script and `estimate_ms` to start. Like the storage
+   offer it ignores buttons for PSP_UI_STORAGE_OFFER_ARMING_FRAMES. */
+void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
+                             size_t script_bytes, uint32_t estimate_ms);
+/* A page-scripts status that X answers with HEAVY_STOP_SCRIPTS and O
+   dismisses while it shows. */
+void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
+                                      unsigned duration_frames);
+/* The recovery sheet titled for a page too heavy for the PSP. */
+void psp_ui_show_heavy_recovery(PspUiState *ui, const char *detail,
+                                uint8_t actions);
 /* Abandon page-directed held/analog input while a candidate navigation owns
    the foreground. The cursor position is retained for the next analog move. */
 void psp_ui_suspend_page_input(PspUiState *ui);

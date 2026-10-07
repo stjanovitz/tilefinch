@@ -6,14 +6,33 @@
 #include <strings.h>
 
 #include "tilefinch/document.h"
+#include "tilefinch/resource_integrity.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
+#include "diagnostic_trace.h"
 
 static const char *const csp_directive_names[TILEFINCH_CSP_DIRECTIVE_COUNT] = {
     "default-src", "script-src", "style-src", "img-src", "font-src",
     "connect-src", "frame-src", "object-src", "base-uri", "form-action",
-    "frame-ancestors", "worker-src", "media-src"
+    "frame-ancestors", "worker-src", "media-src", "script-src-elem",
+    "script-src-attr", "style-src-elem", "style-src-attr"
 };
+
+/* Site-census ledger (TILEFINCH_TRACE_CENSUS): one line per refusal. A
+   check may run more than once for one resource; the census tool dedupes. */
+static bool csp_census(const char *what, const char *url, bool allowed)
+{
+#ifndef TILEFINCH_NO_TRACE
+    if (!allowed && tilefinch_trace_census()) {
+        printf("census-csp-refusal what=%s url=\"%.200s\"\n", what,
+               url == NULL ? "" : url);
+    }
+#else
+    (void) what;
+    (void) url;
+#endif
+    return allowed;
+}
 
 void tilefinch_csp_init(TilefinchContentSecurityPolicy *policy)
 {
@@ -141,6 +160,13 @@ static const TilefinchCspDirectiveValue *directive_for(
 {
     if (policy->directives[directive].present) {
         return &policy->directives[directive];
+    }
+    if (directive >= TILEFINCH_CSP_SCRIPT_SRC_ELEM) {
+        directive = directive <= TILEFINCH_CSP_SCRIPT_SRC_ATTR
+            ? TILEFINCH_CSP_SCRIPT_SRC : TILEFINCH_CSP_STYLE_SRC;
+        if (policy->directives[directive].present) {
+            return &policy->directives[directive];
+        }
     }
     return fallback_default && policy->directives[TILEFINCH_CSP_DEFAULT_SRC]
                                    .present
@@ -339,6 +365,38 @@ static bool policy_allows_url(const TilefinchContentSecurityPolicy *csp,
     return count != 0 && matched;
 }
 
+static bool keyword_token(const char *token, size_t length, void *opaque)
+{
+    return span_equal_ci(token, length, opaque);
+}
+
+static bool directive_has_keyword(const TilefinchContentSecurityPolicy *csp,
+                                  const TilefinchCspDirectiveValue *value,
+                                  const char *keyword)
+{
+    return visit_tokens(csp, value, keyword_token, (void *) keyword, NULL);
+}
+
+/* One policy's verdict. For script-like requests a grant bit (nonce or
+   integrity match) admits the URL, and 'strict-dynamic' replaces the URL
+   list with the parser-inserted test. */
+static bool policy_allows_request(const TilefinchContentSecurityPolicy *csp,
+                                  size_t index,
+                                  TilefinchCspDirective directive,
+                                  bool fallback_default, const char *url,
+                                  uint8_t grant, bool script_like)
+{
+    const TilefinchCspPolicy *policy = &csp->policies[index];
+    const TilefinchCspDirectiveValue *value = directive_for(
+        policy, directive, fallback_default);
+    if (value == NULL || (grant & (1u << index)) != 0) return true;
+    if (script_like
+        && directive_has_keyword(csp, value, "'strict-dynamic'")) {
+        return (grant & TILEFINCH_CSP_GRANT_PARSER_INSERTED) == 0;
+    }
+    return policy_allows_url(csp, policy, directive, fallback_default, url);
+}
+
 static bool csp_allows_url(const TilefinchContentSecurityPolicy *csp,
                            TilefinchCspDirective directive,
                            bool fallback_default, const char *url)
@@ -352,37 +410,84 @@ static bool csp_allows_url(const TilefinchContentSecurityPolicy *csp,
     return true;
 }
 
+static bool csp_request_directive(TilefinchRequestDestination destination,
+                                  TilefinchCspDirective *directive)
+{
+    switch (destination) {
+        case TILEFINCH_DESTINATION_SCRIPT:
+            *directive = TILEFINCH_CSP_SCRIPT_SRC_ELEM; return true;
+        case TILEFINCH_DESTINATION_STYLE:
+            *directive = TILEFINCH_CSP_STYLE_SRC_ELEM; return true;
+        case TILEFINCH_DESTINATION_FONT:
+            *directive = TILEFINCH_CSP_FONT_SRC; return true;
+        case TILEFINCH_DESTINATION_IMAGE:
+            *directive = TILEFINCH_CSP_IMG_SRC; return true;
+        case TILEFINCH_DESTINATION_FETCH:
+            *directive = TILEFINCH_CSP_CONNECT_SRC; return true;
+        case TILEFINCH_DESTINATION_FRAME:
+            *directive = TILEFINCH_CSP_FRAME_SRC; return true;
+        case TILEFINCH_DESTINATION_MEDIA:
+            *directive = TILEFINCH_CSP_MEDIA_SRC; return true;
+        case TILEFINCH_DESTINATION_OTHER:
+            *directive = TILEFINCH_CSP_OBJECT_SRC; return true;
+        default:
+            return false;
+    }
+}
+
+static bool csp_allows_request_granted(
+    const TilefinchContentSecurityPolicy *csp,
+    TilefinchRequestDestination destination, const char *target_url,
+    uint8_t grant);
+
+bool tilefinch_csp_allows_request_granted(
+    const TilefinchContentSecurityPolicy *csp,
+    TilefinchRequestDestination destination, const char *target_url,
+    uint8_t grant)
+{
+#ifdef TILEFINCH_NO_TRACE
+    return csp_allows_request_granted(csp, destination, target_url, grant);
+#else
+    /* Indexed by TilefinchRequestDestination. */
+    static const char *const names[] = {
+        "document", "frame", "script", "style", "image", "fetch", "other",
+        "font", "media", "worker"
+    };
+    bool allowed = csp_allows_request_granted(
+        csp, destination, target_url, grant);
+    return csp_census((unsigned) destination < sizeof(names) / sizeof(names[0])
+                          ? names[destination] : "request",
+                      target_url, allowed);
+#endif
+}
+
+static bool csp_allows_request_granted(
+    const TilefinchContentSecurityPolicy *csp,
+    TilefinchRequestDestination destination, const char *target_url,
+    uint8_t grant)
+{
+    if (destination == TILEFINCH_DESTINATION_DOCUMENT) return true;
+    if (destination == TILEFINCH_DESTINATION_WORKER) {
+        return tilefinch_csp_allows_worker(csp, target_url);
+    }
+    TilefinchCspDirective directive;
+    if (!csp_request_directive(destination, &directive)) return false;
+    if (csp == NULL || !csp->header_present) return true;
+    if (!csp->valid || target_url == NULL) return false;
+    for (size_t i = 0; i < csp->policy_count; i++) {
+        if (!policy_allows_request(
+                csp, i, directive, true, target_url, grant,
+                destination == TILEFINCH_DESTINATION_SCRIPT)) return false;
+    }
+    return true;
+}
+
 bool tilefinch_csp_allows_request(
     const TilefinchContentSecurityPolicy *csp,
     TilefinchRequestDestination destination, const char *target_url)
 {
-    TilefinchCspDirective directive;
-    switch (destination) {
-        case TILEFINCH_DESTINATION_SCRIPT:
-            directive = TILEFINCH_CSP_SCRIPT_SRC; break;
-        case TILEFINCH_DESTINATION_STYLE:
-            directive = TILEFINCH_CSP_STYLE_SRC; break;
-        case TILEFINCH_DESTINATION_FONT:
-            directive = TILEFINCH_CSP_FONT_SRC; break;
-        case TILEFINCH_DESTINATION_IMAGE:
-            directive = TILEFINCH_CSP_IMG_SRC; break;
-        case TILEFINCH_DESTINATION_FETCH:
-            directive = TILEFINCH_CSP_CONNECT_SRC; break;
-        case TILEFINCH_DESTINATION_FRAME:
-            directive = TILEFINCH_CSP_FRAME_SRC; break;
-        case TILEFINCH_DESTINATION_MEDIA:
-            directive = TILEFINCH_CSP_MEDIA_SRC; break;
-        case TILEFINCH_DESTINATION_WORKER:
-            return tilefinch_csp_allows_worker(csp, target_url);
-        case TILEFINCH_DESTINATION_OTHER:
-            directive = TILEFINCH_CSP_OBJECT_SRC; break;
-        case TILEFINCH_DESTINATION_DOCUMENT:
-            return true;
-        default:
-            return false;
-    }
-    return csp_allows_url(
-        csp, directive, true, target_url);
+    return tilefinch_csp_allows_request_granted(
+        csp, destination, target_url, 0);
 }
 
 bool tilefinch_csp_allows_worker(
@@ -396,10 +501,214 @@ bool tilefinch_csp_allows_worker(
         if (!policy->directives[directive].present) {
             directive = TILEFINCH_CSP_SCRIPT_SRC;
         }
-        if (!policy_allows_url(csp, policy, directive, true, target_url))
-            return false;
+        /* A worker is always script-initiated: 'strict-dynamic' admits it. */
+        if (!policy_allows_request(csp, i, directive, true, target_url, 0,
+                                   true)) return false;
     }
     return true;
+}
+
+typedef struct {
+    const char *value;
+    size_t length;
+} CspSpan;
+
+static bool nonce_token_matches(const char *token, size_t length,
+                                void *opaque)
+{
+    const CspSpan *nonce = opaque;
+    return nonce->length != 0 && length == nonce->length + 8u
+        && strncasecmp(token, "'nonce-", 7) == 0
+        && token[length - 1] == '\''
+        && memcmp(token + 7, nonce->value, nonce->length) == 0;
+}
+
+/* hash-source: 'sha256-', 'sha384-' or 'sha512-' and a base64 value. */
+static bool hash_source_token(const char *token, size_t length, void *opaque)
+{
+    (void) opaque;
+    return length >= 10u && token[0] == '\'' && token[length - 1] == '\''
+        && (strncasecmp(token + 1, "sha256-", 7) == 0
+            || strncasecmp(token + 1, "sha384-", 7) == 0
+            || strncasecmp(token + 1, "sha512-", 7) == 0);
+}
+
+typedef struct {
+    const char *algorithm;
+    const char *value;
+    size_t value_length;
+} IntegritySource;
+
+static bool integrity_token_matches(const char *token, size_t length,
+                                    void *opaque)
+{
+    const IntegritySource *source = opaque;
+    return hash_source_token(token, length, NULL)
+        && strncasecmp(token + 1, source->algorithm, 7) == 0
+        && length == source->value_length + 9u
+        && memcmp(token + 8, source->value, source->value_length) == 0;
+}
+
+/* CSP3 integrity bypass: every recognized SRI hash must be listed. SRI
+   itself is enforced when the response arrives, so admitting the request
+   on the listed digests admits only those bytes. */
+static bool integrity_matches(const TilefinchContentSecurityPolicy *csp,
+                              const TilefinchCspDirectiveValue *value,
+                              const char *integrity, size_t length)
+{
+    if (integrity == NULL || length == 0
+        || !visit_tokens(csp, value, hash_source_token, NULL, NULL))
+        return false;
+    size_t recognized = 0;
+    size_t at = 0;
+    TilefinchIntegrityToken token;
+    while (tilefinch_integrity_next_token(integrity, length, &at, &token)) {
+        if (token.value_length == 0) continue;
+        IntegritySource source = {
+            .algorithm = token.algorithm,
+            .value = token.value,
+            .value_length = token.value_length
+        };
+        recognized++;
+        if (!visit_tokens(csp, value, integrity_token_matches, &source,
+                          NULL)) return false;
+    }
+    return recognized != 0;
+}
+
+typedef struct {
+    void (*visit)(void *, const char *, size_t);
+    void *opaque;
+} NonceVisit;
+
+static bool nonce_source_visit(const char *token, size_t length,
+                               void *opaque)
+{
+    const NonceVisit *visit = opaque;
+    if (length > 8u && strncasecmp(token, "'nonce-", 7) == 0
+        && token[length - 1] == '\'') {
+        visit->visit(visit->opaque, token + 7, length - 8u);
+    }
+    return false;
+}
+
+void tilefinch_csp_visit_nonce_sources(
+    const TilefinchContentSecurityPolicy *csp,
+    void (*visit)(void *opaque, const char *value, size_t length),
+    void *opaque)
+{
+    if (csp == NULL || !csp->header_present || !csp->valid || visit == NULL)
+        return;
+    NonceVisit state = {.visit = visit, .opaque = opaque};
+    for (size_t i = 0; i < csp->policy_count; i++) {
+        for (size_t d = 0; d < TILEFINCH_CSP_DIRECTIVE_COUNT; d++) {
+            const TilefinchCspDirectiveValue *value =
+                &csp->policies[i].directives[d];
+            if (value->present)
+                (void) visit_tokens(csp, value, nonce_source_visit, &state,
+                                    NULL);
+        }
+    }
+}
+
+uint8_t tilefinch_csp_request_grant(
+    const TilefinchContentSecurityPolicy *csp,
+    TilefinchRequestDestination destination,
+    const char *nonce, size_t nonce_length,
+    const char *integrity, size_t integrity_length, bool parser_inserted)
+{
+    bool script = destination == TILEFINCH_DESTINATION_SCRIPT;
+    uint8_t grant = script && parser_inserted
+        ? TILEFINCH_CSP_GRANT_PARSER_INSERTED : 0u;
+    TilefinchCspDirective directive;
+    if (csp == NULL || !csp->header_present || !csp->valid
+        || (!script && destination != TILEFINCH_DESTINATION_STYLE)
+        || !csp_request_directive(destination, &directive)) return grant;
+    CspSpan span = {.value = nonce, .length = nonce == NULL ? 0 : nonce_length};
+    for (size_t i = 0; i < csp->policy_count; i++) {
+        const TilefinchCspDirectiveValue *value = directive_for(
+            &csp->policies[i], directive, true);
+        if (value == NULL) continue;
+        if (visit_tokens(csp, value, nonce_token_matches, &span, NULL)
+            || (script && integrity_matches(
+                    csp, value, integrity, integrity_length))) {
+            grant |= (uint8_t) (1u << i);
+        }
+    }
+    return grant;
+}
+
+bool tilefinch_csp_text_has_markup(const char *value, size_t length)
+{
+    for (size_t at = 0; value != NULL && at < length; at++) {
+        if (value[at] != '<') continue;
+        size_t left = length - at - 1u;
+        if ((left >= 6u && strncasecmp(value + at + 1, "script", 6) == 0)
+            || (left >= 5u && strncasecmp(value + at + 1, "style", 5) == 0))
+            return true;
+    }
+    return false;
+}
+
+/* CSP3 "Is element nonceable?": a dangling-markup injection that swallows
+   a legitimate nonce leaves "<script" or "<style" in an attribute. Like the
+   major engines, the [[CryptographicNonce]] slot rather than the (hidden)
+   content attribute decides whether there is a nonce at all. */
+static const char *csp_element_nonce(struct lxb_dom_node *element,
+                                     size_t *length)
+{
+    *length = 0;
+    size_t nonce_length = 0;
+    const char *nonce = document_element_nonce(element, &nonce_length);
+    if (nonce == NULL || nonce_length == 0) return NULL;
+    size_t visited = 0;
+    for (lxb_dom_attr_t *attribute =
+             lxb_dom_interface_element(element)->first_attr;
+         attribute != NULL; attribute = attribute->next) {
+        if (++visited > 256u) return NULL;
+        size_t name_length = 0, value_length = 0;
+        const char *name = (const char *) lxb_dom_attr_qualified_name(
+            attribute, &name_length);
+        const char *value = (const char *) lxb_dom_attr_value(
+            attribute, &value_length);
+        if (tilefinch_csp_text_has_markup(name, name_length)
+            || tilefinch_csp_text_has_markup(value, value_length))
+            return NULL;
+    }
+    *length = nonce_length;
+    return nonce;
+}
+
+uint8_t tilefinch_csp_element_descendant_grant(
+    const TilefinchContentSecurityPolicy *csp,
+    struct lxb_dom_node *element, bool parser_inserted)
+{
+    size_t nonce_length = 0;
+    const char *nonce = element == NULL || csp == NULL
+        || !csp->header_present
+        ? NULL : csp_element_nonce(element, &nonce_length);
+    return tilefinch_csp_request_grant(
+        csp, TILEFINCH_DESTINATION_SCRIPT, nonce, nonce_length, NULL, 0,
+        parser_inserted);
+}
+
+uint8_t tilefinch_csp_element_grant(
+    const TilefinchContentSecurityPolicy *csp,
+    TilefinchRequestDestination destination,
+    struct lxb_dom_node *element, bool parser_inserted)
+{
+    size_t nonce_length = 0, integrity_length = 0;
+    const char *nonce = NULL, *integrity = NULL;
+    if (element != NULL && csp != NULL && csp->header_present) {
+        nonce = csp_element_nonce(element, &nonce_length);
+        if (destination == TILEFINCH_DESTINATION_SCRIPT) {
+            integrity = document_attribute(
+                element, "integrity", &integrity_length);
+        }
+    }
+    return tilefinch_csp_request_grant(
+        csp, destination, nonce, nonce_length, integrity, integrity_length,
+        parser_inserted);
 }
 
 static bool unsafe_eval_token(const char *token, size_t length, void *opaque)
@@ -408,7 +717,18 @@ static bool unsafe_eval_token(const char *token, size_t length, void *opaque)
     return span_equal_ci(token, length, "'unsafe-eval'");
 }
 
+static bool csp_allows_dynamic_code(
+    const TilefinchContentSecurityPolicy *csp);
+
 bool tilefinch_csp_allows_dynamic_code(
+    const TilefinchContentSecurityPolicy *csp)
+{
+    /* A policy query made once per realm, not an attempted eval: the
+       engine's own refusal surfaces as an EvalError the ledger records. */
+    return csp_census("policy-no-eval", "", csp_allows_dynamic_code(csp));
+}
+
+static bool csp_allows_dynamic_code(
     const TilefinchContentSecurityPolicy *csp)
 {
     if (csp == NULL || !csp->header_present) return true;
@@ -427,19 +747,45 @@ bool tilefinch_csp_allows_dynamic_code(
 typedef struct {
     const char *nonce;
     size_t nonce_length;
-    char hash[48];
-    bool have_hash;
+    /* The element whose text a 'sha256-' source is compared with. Its
+       digest is computed at the first such source: a policy without one
+       (CNN's style-src is 'unsafe-inline' 'self') never hashes the
+       megabytes of an inline stylesheet or script, which every check of
+       that element did before. */
+    struct lxb_dom_node *element;
+    /* Base64 digests by algorithm (SHA-256, -384, -512), each computed at
+       the first source of its algorithm. */
+    char hash[3][92];
+    bool hash_attempted[3];
+    bool have_hash[3];
     bool has_nonce_or_hash_source;
+    bool has_strict_dynamic;
     bool has_unsafe_inline;
 } InlineMatch;
+
+static bool inline_element_hash(struct lxb_dom_node *element,
+                                size_t algorithm, char output[92]);
+
+/* 0, 1 or 2 for a 'sha256-', 'sha384-' or 'sha512-' source; else 3. */
+static size_t hash_source_algorithm(const char *token, size_t length)
+{
+    if (!hash_source_token(token, length, NULL)) return 3u;
+    return token[4] == '2' ? 0u : token[4] == '3' ? 1u : 2u;
+}
 
 static bool inline_token_matches(const char *token, size_t length,
                                  void *opaque)
 {
     InlineMatch *match = opaque;
+    size_t algorithm = hash_source_algorithm(token, length);
+    /* Any nonce or hash source (and, for scripts, 'strict-dynamic')
+       disables 'unsafe-inline' (CSP3 "allow all inline"). */
     if ((length > 8 && strncasecmp(token, "'nonce-", 7) == 0)
-        || (length > 10 && strncasecmp(token, "'sha256-", 8) == 0)) {
+        || algorithm < 3u) {
         match->has_nonce_or_hash_source = true;
+    }
+    if (span_equal_ci(token, length, "'strict-dynamic'")) {
+        match->has_strict_dynamic = true;
     }
     if (span_equal_ci(token, length, "'unsafe-inline'")) {
         match->has_unsafe_inline = true;
@@ -450,55 +796,76 @@ static bool inline_token_matches(const char *token, size_t length,
         && memcmp(token + 7, match->nonce, match->nonce_length) == 0) {
         return true;
     }
-    if (match->have_hash && length == strlen(match->hash) + 9u
-        && strncasecmp(token, "'sha256-", 8) == 0
-        && token[length - 1] == '\''
-        && memcmp(token + 8, match->hash, strlen(match->hash)) == 0) {
-        return true;
+    if (algorithm == 3u || match->element == NULL) return false;
+    if (!match->hash_attempted[algorithm]) {
+        match->hash_attempted[algorithm] = true;
+        match->have_hash[algorithm] = inline_element_hash(
+            match->element, algorithm, match->hash[algorithm]);
     }
-    return false;
+    size_t digest_length = strlen(match->hash[algorithm]);
+    return match->have_hash[algorithm] && length == digest_length + 9u
+        && memcmp(token + 8, match->hash[algorithm], digest_length) == 0;
 }
 
-static void digest_base64(const uint8_t digest[32], char output[45])
+static void digest_base64(const uint8_t *digest, size_t length, char *output)
 {
     static const char alphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t out = 0;
-    for (size_t i = 0; i < 30; i += 3) {
-        uint32_t word = ((uint32_t) digest[i] << 16)
-            | ((uint32_t) digest[i + 1] << 8) | digest[i + 2];
+    for (size_t i = 0; i < length; i += 3) {
+        size_t left = length - i;
+        uint32_t word = (uint32_t) digest[i] << 16
+            | (left > 1 ? (uint32_t) digest[i + 1] << 8 : 0u)
+            | (left > 2 ? digest[i + 2] : 0u);
         output[out++] = alphabet[(word >> 18) & 63u];
         output[out++] = alphabet[(word >> 12) & 63u];
-        output[out++] = alphabet[(word >> 6) & 63u];
-        output[out++] = alphabet[word & 63u];
+        output[out++] = left > 1 ? alphabet[(word >> 6) & 63u] : '=';
+        output[out++] = left > 2 ? alphabet[word & 63u] : '=';
     }
-    uint32_t tail = (uint32_t) digest[30] << 16
-        | (uint32_t) digest[31] << 8;
-    output[out++] = alphabet[(tail >> 18) & 63u];
-    output[out++] = alphabet[(tail >> 12) & 63u];
-    output[out++] = alphabet[(tail >> 6) & 63u];
-    output[out++] = '=';
     output[out] = '\0';
 }
 
-static bool inline_element_hash(struct lxb_dom_node *element,
-                                char output[45])
+static size_t csp_inline_digests;
+
+size_t tilefinch_csp_inline_digests(void)
 {
-    if (element == NULL) return false;
-    TilefinchSha256 sha;
-    tilefinch_sha256_init(&sha);
-    for (struct lxb_dom_node *child = element->first_child; child != NULL;
-         child = child->next) {
+    return csp_inline_digests;
+}
+
+static bool inline_element_hash(struct lxb_dom_node *element,
+                                size_t algorithm, char output[92])
+{
+    if (element == NULL || algorithm > 2u) return false;
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    csp_inline_digests++;
+#endif
+    TilefinchSha256 sha256;
+    TilefinchSha512 sha512;
+    bool ok = algorithm == 0u
+        ? (tilefinch_sha256_init(&sha256), true)
+        : tilefinch_sha512_begin(&sha512, algorithm == 1u);
+    for (struct lxb_dom_node *child = element->first_child; ok
+         && child != NULL; child = child->next) {
         size_t length = 0;
         const char *text = document_text_data(child, &length);
         if (text == NULL) continue;
-        if (!tilefinch_sha256_update(
-                &sha, (const uint8_t *) text, length)) return false;
+        if (algorithm == 0u) {
+            ok = tilefinch_sha256_update(
+                &sha256, (const uint8_t *) text, length);
+        } else {
+            tilefinch_sha512_update(&sha512, (const uint8_t *) text, length);
+        }
     }
-    uint8_t digest[32];
-    /* Empty inline elements have the ordinary SHA-256 digest of zero bytes. */
-    if (!tilefinch_sha256_final(&sha, digest)) return false;
-    digest_base64(digest, output);
+    uint8_t digest[64];
+    /* Empty inline elements have the ordinary digest of zero bytes. */
+    if (algorithm == 0u) {
+        ok = ok && tilefinch_sha256_final(&sha256, digest);
+    } else {
+        ok = tilefinch_sha512_finish(&sha512, digest) && ok;
+    }
+    if (!ok) return false;
+    digest_base64(digest, algorithm == 0u ? 32u : algorithm == 1u ? 48u : 64u,
+                  output);
     return true;
 }
 
@@ -511,14 +878,17 @@ static bool policy_allows_inline(const TilefinchContentSecurityPolicy *csp,
         policy, directive, true);
     if (value == NULL) return true;
     size_t nonce_length = 0;
-    const char *nonce = document_attribute(element, "nonce", &nonce_length);
-    InlineMatch match = {.nonce = nonce, .nonce_length = nonce_length};
-    match.have_hash = inline_element_hash(element, match.hash);
+    const char *nonce = csp_element_nonce(element, &nonce_length);
+    InlineMatch match = {
+        .nonce = nonce, .nonce_length = nonce_length, .element = element
+    };
     size_t count = 0;
     if (visit_tokens(csp, value, inline_token_matches, &match, &count)) {
         return true;
     }
-    if (count == 0 || match.has_nonce_or_hash_source) return false;
+    if (count == 0 || match.has_nonce_or_hash_source
+        || (match.has_strict_dynamic
+            && directive == TILEFINCH_CSP_SCRIPT_SRC_ELEM)) return false;
     return match.has_unsafe_inline;
 }
 
@@ -538,13 +908,17 @@ static bool csp_allows_inline(const TilefinchContentSecurityPolicy *csp,
 bool tilefinch_csp_allows_inline_script(
     const TilefinchContentSecurityPolicy *csp, struct lxb_dom_node *element)
 {
-    return csp_allows_inline(csp, TILEFINCH_CSP_SCRIPT_SRC, element);
+    return csp_census("inline-script", "",
+                      csp_allows_inline(csp, TILEFINCH_CSP_SCRIPT_SRC_ELEM,
+                                        element));
 }
 
 bool tilefinch_csp_allows_inline_style(
     const TilefinchContentSecurityPolicy *csp, struct lxb_dom_node *element)
 {
-    return csp_allows_inline(csp, TILEFINCH_CSP_STYLE_SRC, element);
+    return csp_census("inline-style", "",
+                      csp_allows_inline(csp, TILEFINCH_CSP_STYLE_SRC_ELEM,
+                                        element));
 }
 
 static bool csp_allows_inline_attribute(
@@ -562,6 +936,8 @@ static bool csp_allows_inline_attribute(
         (void) visit_tokens(
             csp, value, inline_token_matches, &match, &count);
         if (count == 0 || match.has_nonce_or_hash_source
+            || (match.has_strict_dynamic
+                && directive == TILEFINCH_CSP_SCRIPT_SRC_ATTR)
             || !match.has_unsafe_inline) return false;
     }
     return true;
@@ -570,13 +946,13 @@ static bool csp_allows_inline_attribute(
 bool tilefinch_csp_allows_script_attribute(
     const TilefinchContentSecurityPolicy *csp)
 {
-    return csp_allows_inline_attribute(csp, TILEFINCH_CSP_SCRIPT_SRC);
+    return csp_allows_inline_attribute(csp, TILEFINCH_CSP_SCRIPT_SRC_ATTR);
 }
 
 bool tilefinch_csp_allows_style_attribute(
     const TilefinchContentSecurityPolicy *csp)
 {
-    return csp_allows_inline_attribute(csp, TILEFINCH_CSP_STYLE_SRC);
+    return csp_allows_inline_attribute(csp, TILEFINCH_CSP_STYLE_SRC_ATTR);
 }
 
 bool tilefinch_csp_allows_base_uri(

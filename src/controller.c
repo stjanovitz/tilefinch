@@ -22,6 +22,7 @@
 #define CONTROLLER_EDIT_LIMIT 512
 #define CONTROLLER_DEFAULT_VIEWPORT_HEIGHT 272
 #define CONTROLLER_DEFAULT_FOCUS_MARGIN 16
+#define CONTROLLER_PAGE_OBSTRUCTION_SCAN 4096u
 
 static bool controller_set_scroll(BrowserController *controller, int scroll_y,
                                   int viewport_height);
@@ -3620,6 +3621,180 @@ bool controller_scroll_step(BrowserController *controller, int direction,
                                 viewport_height);
 }
 
+/* Horizontal paint extent of a fixed range, bounded so a fixed app shell
+   cannot make a page press walk the whole display list. */
+static bool controller_range_spans_width(const LayoutDocument *layout,
+                                         size_t start, size_t end,
+                                         int viewport_width)
+{
+    if (viewport_width <= 0) return false;
+    if (end > layout->count) end = layout->count;
+    if (end <= start) return false;
+    if (end - start > CONTROLLER_PAGE_OBSTRUCTION_SCAN) return true;
+    int left = INT_MAX, right = INT_MIN;
+    for (size_t i = start; i < end; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->width <= 0 || command->height <= 0) continue;
+        if (command->x < left) left = command->x;
+        int command_right = controller_add_coordinate(
+            command->x, command->width);
+        if (command_right > right) right = command_right;
+    }
+    if (left < 0) left = 0;
+    if (right > viewport_width) right = viewport_width;
+    return right > left && right - left >= viewport_width / 2;
+}
+
+/* Classify one viewport band [top, bottom) as a bar pinned at the top or
+   the bottom of the viewport. On a 272-pixel screen a mobile header plus
+   its ad slot legitimately covers half of it, so only bands taller than
+   two thirds of the viewport (open menus, dialogs, full-screen shells) are
+   ignored as not being bars. */
+static bool controller_page_bar_height(int height, int viewport_height)
+{
+    return height > 0 && height <= viewport_height - viewport_height / 3;
+}
+
+/* One full-width band [top, bottom) a pinned bar covers on screen. */
+typedef struct {
+    int top;
+    int bottom;
+} ControllerPageBar;
+
+static void controller_note_page_bar(int top, int bottom,
+                                     int viewport_height,
+                                     ControllerPageBar *bars, size_t *count)
+{
+    if (bottom <= top || bottom <= 0 || top >= viewport_height
+        || !controller_page_bar_height(bottom - top, viewport_height)
+        || *count >= LAYOUT_FIXED_RANGE_LIMIT + LAYOUT_STICKY_RANGE_LIMIT)
+        return;
+    bars[(*count)++] = (ControllerPageBar) { top, bottom };
+}
+
+/* Height of the viewport hidden behind position:fixed bars and stuck
+   position:sticky bars at the top and bottom edge when the document is
+   scrolled to scroll_y. Only bars spanning at least half the viewport width
+   count, so floating buttons and side rails never shorten a page step. A
+   bar starting in the top quarter covers down to its bottom, and bars
+   stacked onto it (touching or overlapping what is already covered) extend
+   it: washingtonpost.com pins its header, its section tabs and a breaking-
+   news banner one under the other. The bottom edge is the mirror image. */
+void controller_page_obstructions(const LayoutDocument *layout,
+                                  int scroll_y, int viewport_width,
+                                  int viewport_height, int *covered_top,
+                                  int *covered_bottom)
+{
+    *covered_top = 0;
+    *covered_bottom = 0;
+    if (layout == NULL || viewport_height <= 0) return;
+    ControllerPageBar bars[LAYOUT_FIXED_RANGE_LIMIT
+                           + LAYOUT_STICKY_RANGE_LIMIT];
+    size_t bar_count = 0;
+    for (size_t i = 0; i < layout->fixed_count; i++) {
+        const FixedRange *range = &layout->fixed_ranges[i];
+        if (!controller_page_bar_height(range->height, viewport_height)
+            || (range->scroll_end != INT_MAX
+                && scroll_y >= range->scroll_end)) continue;
+        int top = range->from_bottom
+            ? viewport_height - range->inset - range->height
+            : range->inset;
+        int bottom = controller_add_coordinate(top, range->height);
+        if (!controller_range_spans_width(
+                layout, range->command_start, range->command_end,
+                viewport_width)) continue;
+        controller_note_page_bar(top, bottom, viewport_height, bars,
+                                 &bar_count);
+    }
+    for (size_t i = 0; i < layout->sticky_count; i++) {
+        const StickyRange *range = &layout->sticky_ranges[i];
+        int trigger = controller_add_coordinate(range->origin_y, -range->top);
+        if (scroll_y <= trigger) continue;
+        int offset = controller_add_coordinate(scroll_y, -trigger);
+        if (range->maximum_offset != INT_MAX
+            && offset > range->maximum_offset) {
+            offset = range->maximum_offset;
+        }
+        int top = controller_add_coordinate(
+            controller_add_coordinate(range->origin_y, offset), -scroll_y);
+        int bottom = controller_add_coordinate(
+            controller_add_coordinate(range->bottom_y, offset), -scroll_y);
+        if (!controller_page_bar_height(bottom - top, viewport_height)
+            || !controller_range_spans_width(
+                layout, range->command_start, range->command_end,
+                viewport_width)) continue;
+        controller_note_page_bar(top, bottom, viewport_height, bars,
+                                 &bar_count);
+    }
+    /* Each pass adds at least one bar or stops: at most bar_count passes. */
+    int top_edge = viewport_height / 4;
+    int bottom_edge = viewport_height - viewport_height / 4;
+    for (size_t pass = 0; pass < bar_count; pass++) {
+        bool grew = false;
+        for (size_t i = 0; i < bar_count; i++) {
+            const ControllerPageBar *bar = &bars[i];
+            bool anchored = bar->top <= top_edge
+                            || bar->top <= *covered_top;
+            if (anchored && bar->bottom > *covered_top
+                && bar->bottom < viewport_height) {
+                *covered_top = bar->bottom;
+                grew = true;
+            }
+        }
+        if (!grew) break;
+    }
+    for (size_t pass = 0; pass < bar_count; pass++) {
+        bool grew = false;
+        int covered_from = viewport_height - *covered_bottom;
+        for (size_t i = 0; i < bar_count; i++) {
+            const ControllerPageBar *bar = &bars[i];
+            bool anchored = bar->bottom >= bottom_edge
+                            || bar->bottom >= covered_from;
+            if (anchored && bar->top < covered_from && bar->top > 0
+                && bar->top >= *covered_top) {
+                covered_from = bar->top;
+                *covered_bottom = viewport_height - bar->top;
+                grew = true;
+            }
+        }
+        if (!grew) break;
+    }
+}
+
+int controller_page_step(const LayoutDocument *layout,
+                         const ViewportContext *viewport, int scroll_y,
+                         int direction)
+{
+    if (viewport == NULL || viewport->css_height <= 0) return 0;
+    int viewport_height = viewport->css_height;
+    int overlap = viewport_height / 8;
+    int minimum_overlap = viewport_device_to_css(viewport, 16);
+    if (overlap < minimum_overlap) overlap = minimum_overlap;
+    int step = viewport_height - overlap;
+    if (step <= 0) return 0;
+    /* Like browsers, step by the part of the viewport that bars pinned to
+       its top and bottom edges leave visible, judged where the step lands
+       (a sticky header only sticks once the page has scrolled). Content
+       would otherwise scroll under a header without ever being seen. The
+       step never drops below a quarter of the viewport. */
+    long long landing = (long long) scroll_y
+                        + (direction < 0 ? -(long long) step : step);
+    if (landing < 0) landing = 0;
+    if (landing > INT_MAX) landing = INT_MAX;
+    int covered_top = 0, covered_bottom = 0;
+    controller_page_obstructions(layout, (int) landing, viewport->css_width,
+                                 viewport_height, &covered_top,
+                                 &covered_bottom);
+    if (covered_top == 0 && covered_bottom == 0) return step;
+    int visible = viewport_height - covered_top - covered_bottom;
+    int visible_overlap = visible / 8;
+    if (visible_overlap < minimum_overlap) visible_overlap = minimum_overlap;
+    int obstructed = visible - visible_overlap;
+    int minimum = viewport_height / 4;
+    if (obstructed < minimum) obstructed = minimum;
+    return obstructed < step ? obstructed : step;
+}
+
 bool controller_scroll_page(BrowserController *controller, int direction,
                             int viewport_height)
 {
@@ -3627,15 +3802,15 @@ bool controller_scroll_page(BrowserController *controller, int direction,
         return false;
     }
     if (controller == NULL || controller->navigation == NULL) return false;
-    int css_viewport_height = controller->navigation->viewport.css_height;
-    int css_overlap = css_viewport_height / 8;
-    int minimum_overlap = viewport_device_to_css(
-        &controller->navigation->viewport, 16);
+    const ViewportContext *viewport = &controller->navigation->viewport;
+    int css_overlap = viewport->css_height / 8;
+    int minimum_overlap = viewport_device_to_css(viewport, 16);
     if (css_overlap < minimum_overlap) css_overlap = minimum_overlap;
     const NavigationEntry *entry = navigation_current(controller->navigation);
     if (entry == NULL) return false;
-    int delta = css_viewport_height - css_overlap;
-    int requested_delta = direction * delta;
+    /* A nested scroller under the pointer or focus takes the plain step;
+       pinned bars only shorten the document's own step. */
+    int requested_delta = direction * (viewport->css_height - css_overlap);
     lxb_dom_node_t *target = retained_pointer_hover_node(controller);
     if (target == NULL) target = retained_focus_node(controller);
     int remaining_y = requested_delta;
@@ -3647,6 +3822,11 @@ bool controller_scroll_page(BrowserController *controller, int direction,
             &controller->navigation->page.layout, target);
     }
     if (remaining_y == 0) return nested;
+    if (remaining_y == requested_delta) {
+        remaining_y = direction * controller_page_step(
+            &controller->navigation->page.layout, viewport,
+            entry->scroll_y, direction);
+    }
     long long requested = (long long) entry->scroll_y + remaining_y;
     if (requested < 0) requested = 0;
     if (requested > INT_MAX) requested = INT_MAX;

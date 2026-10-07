@@ -131,9 +131,12 @@ typedef struct {
     size_t focus_moves;
     size_t activations;
     size_t text_edits;
-#ifndef TILEFINCH_NO_TRACE
+    /* Always present: TILEFINCH_NO_TRACE is private to tilefinch_core, so a
+       field it removed would shift every later field for the frontends that
+       read this struct. Without tracing it simply stays zero. Public struct
+       layouts must not depend on private defines; the PSP builds check this
+       (src/abi_layout_probe.c). */
     uint64_t focus_outline_us;
-#endif
     /* Indices are layout-generation local. Retain the DOM identity so a
        relayout between focus and activation cannot silently retarget input. */
     lxb_dom_node_t *focus_node;
@@ -255,6 +258,19 @@ LayoutScrollbarWidth controller_root_scrollbar_width(
     const BrowserController *controller);
 bool controller_scroll_step(BrowserController *controller, int direction,
                             unsigned held_frames, int viewport_height);
+/* Viewport height hidden behind fixed bars and stuck sticky bars at the top
+   and bottom edges at scroll_y (CSS pixels); page steps subtract it. */
+void controller_page_obstructions(const LayoutDocument *layout,
+                                  int scroll_y, int viewport_width,
+                                  int viewport_height, int *covered_top,
+                                  int *covered_bottom);
+/* The Page Up/Down step in CSS pixels from scroll_y: the viewport minus an
+   eighth of overlap, shortened so content never passes unseen under pinned
+   bars (never below a quarter of the viewport). Shared by loaded pages and
+   the provisional preview. */
+int controller_page_step(const LayoutDocument *layout,
+                         const ViewportContext *viewport, int scroll_y,
+                         int direction);
 bool controller_scroll_page(BrowserController *controller, int direction,
                             int viewport_height);
 bool controller_scroll_to_top(BrowserController *controller,

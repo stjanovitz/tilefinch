@@ -20,9 +20,15 @@ tap cross
 wait-live 300
 mark-live offline-open
 
-# The focused Deploy button requests Page controls. Cross is still browser
-# input on this frame; the resulting fullscreen transition activates capture
-# before the later gameplay steps.
+# The title menu autofocuses Continue (Start campaign). Quick Match is the
+# button below it; its setup screen focuses Deploy (#play), whose trusted
+# click requests Page controls. Cross is still browser input on that frame;
+# the resulting fullscreen transition activates capture before the later
+# gameplay steps.
+tap-live down
+wait-live 20
+tap-live cross
+wait-live 60
 tap-live cross
 wait-live 90
 mark-live auto-controls
