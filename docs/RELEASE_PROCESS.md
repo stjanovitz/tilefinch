@@ -27,6 +27,15 @@ Developer builds use the separate `developer-envelope` workflow in
 [SECURE_UPDATES.md](SECURE_UPDATES.md); they do not consume or advance the
 signed release sequence.
 
+A same-version reissue requires explicit authorization to replace its public
+commit/tag and assets. Keep the human-facing version, but consume a new signed
+release sequence so installed copies recognize the update. Preserve the original
+source refs, artifacts and metadata privately; run the complete release gates
+again. Construct the replacement squash on the previous release's cleaned
+public parent, not on the full development graph. Upload the new package before
+its signed metadata, and verify the final public bytes and higher-sequence update
+acceptance. Never reuse the old sequence for changed bytes.
+
 The shipped artifacts are:
 
 | Artifact | Purpose |
@@ -72,17 +81,29 @@ Before the next public squash/push, preserve the complete development history
 in the private backup. Keep raw browsing journeys and per-release development
 or maintenance journals in the private work area, not under `docs/engineering/`
 in the public tree. In particular, public commits must not contain
-`BROWSING_JOURNEYS.md` or any `RELEASE_*_CHECKS.md` file. The ignore rules
+`BROWSING_JOURNEYS.md`, `PERFORMANCE_LEDGER.md`, `MEMORY_EXPERIMENTS.md` or any
+`RELEASE_*_CHECKS.md` file. The ignore rules
 prevent ordinary staging, and the cut script rejects a prospective release if
 one was force-added.
 Remove or replace public documentation links to private logs before publishing,
 while retaining the logs in the private backup for future development. This
 requirement does not authorize rewriting already-published history.
 
-Native-tier and performance investigations follow the same rule: publish
-summaries of findings, measurement limits and conditions for revisiting rejected
-approaches. Keep detailed journals, local evidence paths and internal branch
+Native-tier investigations may publish summaries of findings, measurement
+limits and conditions for revisiting rejected approaches. Keep the full
+performance and memory ledgers, detailed journals, local evidence paths and internal branch
 references in the private archive and the ignored local investigation directory.
+Preserve both local ledgers explicitly in the private backup; ignored files are
+not included by an ordinary Git push.
+
+An explicitly approved public-history cleanup must use an isolated mirror,
+preserve all original refs in the private archive, and verify every rewritten
+tree and author/committer/tag date before a lease-guarded atomic push. Release
+assets and signed update packages stay unchanged. Old public commit IDs change;
+clones should be recreated or carefully rebased, never merged back into the
+cleaned public history. Keep the full development graph private and construct
+future public squash commits on the cleaned public branch. Never bulk-push
+development-checkout tags: they may retain pre-cleanup history.
 
 ## Step 1 — finalize the changelog
 
@@ -109,6 +130,7 @@ release commit, after the changelog commit:
 cmake --preset psp -B build-pgo-gen -DTILEFINCH_ALLOW_BUILD_DIR=ON \
     -DTILEFINCH_PSP_VALIDATION_LOG=ON -DPSP_BROWSER_QUICKJS_PGO_GENERATE=ON \
     -DPSP_BROWSER_EXECUTION_CENSUS=OFF \
+    -DPSP_BROWSER_ENABLE_PSP_VOICE=OFF \
     -DPSP_BROWSER_PSP_TEXT_LIMIT_OVERRIDE=9000000
 cmake --build build-pgo-gen --target psp-browser-script
 scripts/train-quickjs-pgo.sh build-pgo-gen build-pgo-profile perf/traces
@@ -118,15 +140,17 @@ Training replays the chatgpt-ask journey under PPSSPP (about two minutes;
 it needs a logged-in GUI session, so it cannot run in CI) and never touches
 a device. Disable the validation-only execution census while training: its
 engine hooks are absent from shipping builds and would produce an incompatible
-profile. The isolated training profile explicitly selects Run for heavy
+profile. Leave the optional voice component out of this training-only image;
+the replay does not exercise it, and the shipping package still builds it.
+The isolated training profile explicitly selects Run for heavy
 pages and waits out the transient Stop shortcut before opening the composer;
 it does not change the shipping Ask default, timing journeys or user settings.
 Pass the directory to the cut script with `--quickjs-pgo
 build-pgo-profile`; configure refuses a profile whose fingerprint does not
 match the engine being built, because a stale profile makes the engine
 larger and slower than none. `--no-quickjs-pgo` builds without it, as a
-deliberate choice. Measured on a PSP-3000 (PERFORMANCE_LEDGER.md,
-2026-09-29): first usable input on chatgpt.com 39.4 -> 37.4 s, first answer
+deliberate choice. Measured on a PSP-3000 on
+2026-09-29: first usable input on chatgpt.com 39.4 -> 37.4 s, first answer
 about 98 -> 93.5 s.
 
 ## Step 2 — run the cut script
@@ -267,6 +291,16 @@ The models repository owns the pinned producer, regional codepoint manifests,
 TFGF wire-format contract, and user-facing install instructions. Source fonts
 and generated packs remain release inputs/artifacts rather than Git content.
 
+Native interface translations are also hosted by `tilefinch-models`, under
+`translations/ui/vN/` on its `main` branch. Publish the exact generated `.tful`
+files exported by the browser revision's generator before distributing a build that pins them;
+verify each public download's SHA-256 against `src/generated/ui_languages.inc`.
+Keep published models-repository version paths immutable. Do not commit generated
+`.tful` downloads to the browser repository; host tests generate them in the build
+directory. Translation sources, generation and layout tests remain
+in the browser repository. This data publication does not require a browser
+binary release.
+
 Build each pack with that repository's `tools/build_glyph_pack.py`, then use
 the exact main-repository revision being released to create its manifest and
 envelope:
@@ -283,7 +317,10 @@ python3 tools/tilefinch_update_tool.py envelope --glyph-component \
 ```
 
 Repeat with the fixed names for `zh-hans`, `zh-hant`, `ko`, `emoji-color`,
-`cyrillic`, `latin-extended`, `arabic`, and `hebrew`. The newest models release
+`cyrillic`, `latin-extended`, `arabic`, `hebrew`, and `devanagari`. For Hindi,
+use the models producer's explicit offline shaping path and the exact browser
+revision's active `translations/ui/vN/hi.sequences`; require all interface clusters
+to resolve and inspect real menu captures before signing. The newest models release
 must contain every current
 voice and glyph asset pair because the device deliberately fetches
 fixed names from `releases/latest/download`. Before publishing, require a

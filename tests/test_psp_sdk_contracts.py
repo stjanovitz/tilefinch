@@ -136,6 +136,69 @@ def frame_pump_policy(name):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_portrait_stage_copy_is_fenced_and_uses_the_borrowed_picture(self):
+        source = without_comments((ROOT / "src/psp_media_present_ge.c").read_text())
+        copy = source[source.index("bool psp_media_present_ge_stage_rows("):
+                      source.index("bool psp_media_present_ge_blit_565(")]
+        for bound in ("source_stride_pixels > 1024", "texture_width > 512",
+                      "rows > 512", "PSP_MEDIA_PRESENT_STAGE_BYTES",
+                      "psp_media_present_ge_pending"):
+            self.assertIn(bound, copy)
+        self.assertLess(copy.index("sceKernelDcacheWritebackInvalidateRange"),
+                        copy.index("sceGuCopyImage"))
+        self.assertLess(copy.index("sceGuCopyImage"), copy.index("sceGuFinish"))
+        self.assertLess(copy.index("sceGuFinish"),
+                        copy.index("psp_media_present_ge_complete(NULL)"))
+        self.assertNotIn("media_playback_release_video", copy)
+        session = without_comments((ROOT / "src/psp_media_present_session.c").read_text())
+        stage = session[session.index("void psp_media_present_texture_for("):
+                        session.index("static size_t psp_media_pump_present(")]
+        self.assertLess(stage.index("media_playback_borrow_video_slot("),
+                        stage.index("psp_media_present_ge_stage_rows("))
+        self.assertLess(stage.index("psp_media_present_ge_stage_rows("),
+                        stage.index("media_playback_note_frame_staged("))
+        self.assertIn("if (!copied)", stage)
+        probe = source[source.index("static void psp_media_present_probe_stage("):
+                       source.index("static void psp_media_present_probe_stage_strip(")]
+        self.assertIn("psp_media_present_ge_stage_rows(", probe)
+        self.assertIn("memcmp(", probe)
+        self.assertIn('psp_media_present_ge_latch("stage-copy-mismatch")', probe)
+
+    def test_portrait_journey_marks_fit_and_measure_only_playback(self):
+        for name in ("media-portrait-seek", "media-portrait-cadence"):
+            script = (ROOT / f"tests/input-scripts/{name}.txt").read_text()
+            self.assertIn("until-live 2400", script)
+            self.assertEqual((ROOT / f"tests/input-scripts/{name}.until.js")
+                             .read_text().strip(), "@media-playing")
+            for mark in re.findall(r"^mark-live\s+(\S+)", script, re.M):
+                self.assertLess(len(mark.encode("utf-8")), 20, mark)
+            self.assertEqual(script.count("mark-live video-measure-start"),
+                             script.count("mark-live video-measure-end"))
+        source = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        self.assertIn("!psp_video_scanout_measuring", source)
+        measure = source[source.index("void psp_video_scanout_measurement("):
+                         source.index("static void psp_cadence_composed(")]
+        self.assertIn("metrics->video_scanout_intervals = 0", measure)
+        self.assertIn("psp_video_scanout_note_discontinuity()", measure)
+        self.assertNotIn("psp_active_media->", measure)
+        publish = source[source.index("static void psp_cadence_video_published("):
+                         source.index("static bool psp_media_frame_presentable(")]
+        self.assertIn("psp_video_measure_begin = psp_video_measure_end", publish)
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        self.assertIn("&& !psp_validation_video_timing_window", main)
+        owner = main[main.index("void psp_webgl_measurement_main_frame(void)"):
+                     main.index("void psp_webgl_measurement_mark(")]
+        self.assertIn("atomic_exchange(&psp_validation_video_window_requested, 0)", owner)
+        self.assertIn("psp_video_scanout_measurement(true)", owner)
+        marks = main[main.index("void psp_webgl_measurement_mark("):
+                     main.index("\n}\n", main.index("void psp_webgl_measurement_mark("))]
+        self.assertIn("atomic_store(&psp_validation_video_window_requested, 1)", marks)
+        self.assertNotIn("psp_video_scanout_measurement(", marks)
+        inputs = without_comments((ROOT / "src/psp_app/psp_app_input_script.c").read_text())
+        self.assertIn("&& media->visible && media->playing && !media->resolving", inputs)
+        self.assertIn("&& !media->failed && !media->buffering && !media->seek_in_progress", inputs)
+        self.assertIn("&& media->current_time_us != 0", inputs)
+
     def test_policy_settings_share_reload_without_changing_local_or_failure_paths(self):
         source = (ROOT / "src/psp_app/psp_app_settings.c").read_text()
         start = source.index("static void psp_app_reload_after_setting(")
@@ -2800,6 +2863,12 @@ int main(void) {
                       stage)
         self.assertIn("media->present_stage_identity = frame->identity",
                       stage)
+        self.assertIn("media->present_stage_source_column != source_column",
+                      stage)
+        self.assertIn("media->present_stage_texture_width != texture_width",
+                      stage)
+        self.assertIn("if (source_column != 0)", stage)
+        self.assertIn("psp_media_present_release_claimed_surface(media);", stage)
         # Only when the plan admits it, and the engine must be able to see it.
         self.assertIn("psp_media_present_stage_fits(", stage)
         self.assertIn("psp_media_present_ge_stage_flush(", stage)
@@ -2821,8 +2890,8 @@ int main(void) {
         # the present's feed, off the interactive thread. A device cycle
         # measured even the synchronous DMA still on the critical path at 1.67ms
         # -- enough to push the 17.8ms frame past the 16.67ms vblank. The
-        # synchronous DMA and then the CPU stage remain the strided/host
-        # fallback, and only the CPU stage needs the writeback.
+        # strided sources use a synchronous GE copy; refused copies and hosts
+        # retain the CPU fallback, which needs the explicit writeback.
         self.assertIn("psp_media_present_ge_stage_dma_submit(", stage)
         self.assertIn("media->present_stage_async = true", stage)
         self.assertIn("frame->stride_pixels == texture_width", stage)
@@ -2841,6 +2910,7 @@ int main(void) {
                 encoding="utf-8"))
         self.assertIn("psp_display_video_texture(&psp_display)", runtime)
         self.assertIn("PSP_DISPLAY_VIDEO_TEXTURE_BYTES", runtime)
+        self.assertIn("psp_active_media->present_stage_identity = 0;", runtime)
         # The posted copy is collected before the list is started, so the
         # engine never samples an unfinished texture.
         present = runtime[
@@ -3870,6 +3940,8 @@ int main(void) {
         # A unit may sleep, but never past the window that made it free.
         self.assertIn("media_psp_backend_set_wait_limit_us(", pump)
         self.assertIn("PSP_MEDIA_PUMP_DRAW_SLICE_US - spent_us", pump)
+        backend = without_comments((ROOT / "src/media_backend_psp.c").read_text())
+        self.assertIn("sceKernelDelayThread(psp_media_codec_poll_delay_us(", backend)
         # The feed before the block takes no wait of any kind: it runs on the
         # frame's own terms, which is what makes it affordable there.
         feed = source[

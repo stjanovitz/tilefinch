@@ -1196,6 +1196,79 @@ int test_deferred_script_navigation(void)
     return failed;
 }
 
+int test_text_content_does_not_retain_scratch(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] = "<!doctype html><div hidden id=large></div>"
+        "<div id=small>a<!--excluded--><b>\xc3\xa9</b>c</div><div hidden id=wide></div>";
+    CHECK(browser_engine_commit_html(engine, "https://text-memory.test/",
+        page, sizeof(page) - 1u, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *large = test_reader_find_id(
+        lxb_dom_interface_node(nav->page.document.html), "large");
+    lxb_dom_node_t *wide = test_reader_find_id(
+        lxb_dom_interface_node(nav->page.document.html), "wide");
+    CHECK(large != NULL && wide != NULL);
+    const size_t part = 160u * 1024u;
+    char *source = malloc(part);
+    CHECK(source != NULL);
+    memset(source, 'x', part);
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&nav->page.document);
+    for (unsigned i = 0; i < 2; i++) {
+        lxb_dom_text_t *text = lxb_dom_document_create_text_node(
+            &nav->page.document.html->dom_document,
+            (const lxb_char_t *) source, part);
+        CHECK(text != NULL && lxb_dom_node_append_child(large,
+            lxb_dom_interface_node(text)) == LXB_DOM_EXCEPTION_OK);
+    }
+    document_allocation_owner_leave(&nav->page.document, owner);
+    free(source);
+    owner = document_allocation_owner_enter(&nav->page.document);
+    for (unsigned i = 0; i < 33000; i++) {
+        lxb_dom_text_t *text = lxb_dom_document_create_text_node(
+            &nav->page.document.html->dom_document, (const lxb_char_t *) "z", 1);
+        CHECK(text != NULL && lxb_dom_node_append_child(wide,
+            lxb_dom_interface_node(text)) == LXB_DOM_EXCEPTION_OK);
+    }
+    document_allocation_owner_leave(&nav->page.document, owner);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "globalThis.largeTextNode=document.getElementById('large');"
+        "globalThis.wideTextNode=document.getElementById('wide');",
+        "<text-memory-warm>", &nav->page.script_result));
+    size_t before = nav->budget->categories[BUDGET_CATEGORY_DOM].current;
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    bool text_read_okay = script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "(()=>{for(let i=0;i<8;i++){const t=largeTextNode.textContent;"
+        "if(t.length!==327680||t[0]!=='x'||t[t.length-1]!=='x')throw Error('text');}"
+        "if(wideTextNode.textContent.length!==33000)throw Error('truncated wide tree');"
+        "const s=document.getElementById('small');"
+        "if(s.textContent!=='a\u00e9c'||s.childNodes[1].textContent!=='excluded')"
+        "throw Error('text semantics');})()",
+        "<text-memory-read>", &nav->page.script_result);
+    if (!text_read_okay) fprintf(stderr, "text-memory: %s\n", nav->page.script_result.error);
+    CHECK(text_read_okay);
+    size_t after = nav->budget->categories[BUDGET_CATEGORY_DOM].current;
+    printf("text-content-memory: bytes=%zu reads=8 dom-before=%zu dom-after=%zu elapsed-us=%llu\n",
+        part * 2u, before, after,
+        (unsigned long long)(tilefinch_platform_monotonic_time_us() - started));
+    CHECK(after == before);
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 int test_loading_interaction_journey(void)
 {
     BrowserDeviceProfile profile;

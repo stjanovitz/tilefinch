@@ -39,7 +39,7 @@ _Static_assert(sizeof(PSP_UI_STATUS_RELOAD_OFFER) - 1u
 #define PSP_UI_TEXT_ENTRY_CAPACITY 512
 #define PSP_UI_TEXT_SUGGESTION_LIMIT BROWSER_PROFILE_SUGGESTION_LIMIT
 #define PSP_UI_FIND_QUERY_LIMIT 96u
-#define PSP_UI_GLYPH_INSTALLED_MASK_BITS 9u
+#define PSP_UI_GLYPH_INSTALLED_MASK_BITS 10u
 
 /*
  * Native chrome surfaces (HOME and COLLECTIONS). Both read bounded views the
@@ -392,7 +392,10 @@ typedef enum {
        (the persistent compiled-script tier). */
     PSP_UI_SETTING_KEEP_COMPILED_SCRIPTS,
     /* heavy_pages_mode: Ask, Run or Basic view (BrowserHeavyPagesMode). */
-    PSP_UI_SETTING_HEAVY_PAGES
+    PSP_UI_SETTING_HEAVY_PAGES,
+    PSP_UI_SETTING_WIFI_DIAGNOSTICS,
+    PSP_UI_SETTING_YOUTUBE_TOPICS,
+    PSP_UI_SETTING_UI_LANGUAGE
 } PspUiSettingId;
 
 typedef union {
@@ -604,7 +607,12 @@ typedef struct {
     bool analog_cursor_enabled;
     bool danzeff_text_input;
     bool cursor_visible;
-    bool cursor_pointer_down;
+    uint8_t cursor_pointer_down : 1;
+    uint8_t youtube_topics : 1;
+    uint8_t wifi_diagnostics : 1;
+    /* Native locale uses the spare cursor-status bits, keeping snapshots
+       within the existing 1 KiB admission ceiling. */
+    uint8_t ui_language : 4;
     uint16_t cursor_shape : 4;
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
@@ -726,13 +734,15 @@ typedef struct {
     /* Zero, or the TilefinchGlyphPack plus one of the language-pack offer
        the toast is showing; the byte's last four spare bits. */
     uint8_t glyph_offer_plus_one : 4;
-    bool loading;
-    bool secure;
-    bool can_go_back;
-    bool can_go_forward;
-    bool has_focus;
-    bool focus_editable;
-    bool custom_homepage_enabled;
+    /* Page-status booleans share a byte; adding a catalog entry must not
+       enlarge every supervisor snapshot beyond its existing 1 KiB bound. */
+    uint8_t loading : 1;
+    uint8_t secure : 1;
+    uint8_t can_go_back : 1;
+    uint8_t can_go_forward : 1;
+    uint8_t has_focus : 1;
+    uint8_t focus_editable : 1;
+    uint8_t custom_homepage_enabled : 1;
     /* Frame counters bounded below 1024 by their producers (toast_frames
        also has the timed form below). */
     uint16_t activity_frames;
@@ -767,9 +777,8 @@ typedef struct {
     uint8_t data_clear_confirmation;
     uint8_t tab_selection;
     uint8_t experimental_options_selection;
-    /* Nine installed packs, the active operation, and the three-row glyph
-       submenu share two bytes. This preserves the 1 KiB per-frame state
-       ratchet while leaving the provider's four-pack runtime limit intact. */
+    /* Installed packs and the active operation retain compact masks; the
+       provider's four-pack runtime limit is independent of this catalog. */
     uint16_t glyph_installed_mask : PSP_UI_GLYPH_INSTALLED_MASK_BITS;
     uint16_t glyph_operation_pack : 4;
     uint16_t glyph_options_selection : 3;
@@ -925,6 +934,7 @@ typedef enum {
     PSP_UI_MEDIA_ACTION_LOWER_QUALITY,
     PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK,
     PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK,
+    PSP_UI_MEDIA_ACTION_ROTATE,
     PSP_UI_MEDIA_ACTION_CLOSE
 } PspUiMediaAction;
 
@@ -960,6 +970,9 @@ typedef struct {
     int8_t selected_subtitle_track;
     uint8_t subtitle_size;
     uint8_t subtitle_background;
+    bool clockwise;
+    bool rotation_available;
+    bool portrait_crop;
     PspUiMediaTrack audio_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     PspUiMediaTrack subtitle_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
@@ -1074,6 +1087,10 @@ void psp_ui_init(PspUiState *ui);
 /* Presentation-only input during page work. Never emits a page, storage or
    settings action; false leaves ui unchanged for ordinary queued dispatch. */
 bool psp_ui_update_priority(PspUiState *ui, const PspUiInput *input);
+/* Native presentation does not wait for queued document input. Opening an
+   overlay supersedes old page presses; they must not activate its rows. */
+bool psp_ui_update_priority_with_page_queue(PspUiState *ui,
+    const PspUiInput *input, uint8_t *queued_page_inputs);
 bool psp_ui_filter_toolbar_input(PspUiToolbarInputState *state, PspUiInput *input,
                                 bool page_eligible, uint64_t now_ms);
 /* Merge only native interaction state after the worker/presentation fence. */

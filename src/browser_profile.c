@@ -1,5 +1,6 @@
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/ui_language.h"
 #include "tilefinch/url.h"
 
 #include <ctype.h>
@@ -44,6 +45,8 @@ struct BrowserProfile {
     bool persist_local_storage;
     bool tls_session_persistence;
     bool save_diagnostic_reports;
+    bool wifi_diagnostics;
+    bool youtube_topics;
     /* Off by default: compiled scripts stay in RAM for the session. */
     bool keep_compiled_scripts;
     bool javascript_enabled;
@@ -93,6 +96,7 @@ struct BrowserProfile {
     bool update_check_enabled;
     BrowserUpdateChannel update_channel;
     BrowserGlyphLanguage glyph_language;
+    uint8_t ui_language;
     bool color_emoji;
     uint16_t glyph_offer_declined_mask;
     bool glyph_offers_off;
@@ -348,6 +352,7 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->analog_cursor_enabled = true;
     profile->live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB;
     profile->youtube_quality = BROWSER_YOUTUBE_QUALITY_360P;
+    profile->youtube_topics = true;
     profile->video_language = BROWSER_VIDEO_LANGUAGE_SYSTEM;
     profile->subtitle_language = BROWSER_SUBTITLE_LANGUAGE_SYSTEM;
     profile->alternate_language = BROWSER_ALTERNATE_LANGUAGE_NONE;
@@ -685,6 +690,9 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
     if (ok) {
         /* Optional installed components are selected independently of their
            on-disk presence. Missing packs degrade to the embedded fallback. */
+        ok = fprintf(file, "UILANG\t%u\n", (unsigned)profile->ui_language) > 0;
+    }
+    if (ok) {
         ok = fprintf(file, "GLYPHS\t%u\t%u\n",
                      (unsigned) profile->glyph_language,
                      profile->color_emoji ? 1u : 0u) > 0;
@@ -724,6 +732,12 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = fprintf(
             file, "DIAG\t%u\n",
             profile->save_diagnostic_reports ? 1u : 0u) > 0;
+    }
+    if (ok) {
+        /* Independent records: discovery defaults on, diagnostics off. */
+        ok = fprintf(file, "DISCOVERY\t%u\nWIFIDIAG\t%u\n",
+                     profile->youtube_topics ? 1u : 0u,
+                     profile->wifi_diagnostics ? 1u : 0u) > 0;
     }
     if (ok) {
         /* Append-only and default-off, like DIAG. */
@@ -1122,6 +1136,12 @@ static bool profile_load_internal(
         } else if (strcmp(line, "SCRIPTCACHE") == 0) {
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->keep_compiled_scripts = first[0] == '1';
+        } else if (strcmp(line, "DISCOVERY") == 0) {
+            if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
+                loaded->youtube_topics = first[0] == '1';
+        } else if (strcmp(line, "WIFIDIAG") == 0) {
+            if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
+                loaded->wifi_diagnostics = first[0] == '1';
         } else if (strcmp(line, "JSDEFAULT") == 0) {
             /* Only the defined bit is admitted; malformed/future records
                retain the safe default rather than granting an exception. */
@@ -1248,6 +1268,10 @@ static bool profile_load_internal(
                 (BrowserUpdateChannel) strtoul(first, NULL, 10);
             if (profile_valid_update_channel(channel))
                 loaded->update_channel = channel;
+        } else if (strcmp(line, "UILANG") == 0) {
+            unsigned long language = strtoul(first, NULL, 10);
+            if (language < TILEFINCH_UI_LANGUAGE_COUNT)
+                loaded->ui_language = (uint8_t)language;
         } else if (strcmp(line, "GLYPHS") == 0) {
             BrowserGlyphLanguage language =
                 (BrowserGlyphLanguage) strtoul(first, NULL, 10);
@@ -1493,6 +1517,26 @@ bool browser_profile_save_diagnostic_reports(
 bool browser_profile_keep_compiled_scripts(const BrowserProfile *profile)
 {
     return profile != NULL && profile->keep_compiled_scripts;
+}
+
+bool browser_profile_wifi_diagnostics(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->wifi_diagnostics;
+}
+
+bool browser_profile_youtube_topics(const BrowserProfile *profile)
+{
+    return profile == NULL || profile->youtube_topics;
+}
+
+void browser_profile_set_wifi_diagnostics(BrowserProfile *profile, bool enabled)
+{
+    if (profile != NULL) profile->wifi_diagnostics = enabled;
+}
+
+void browser_profile_set_youtube_topics(BrowserProfile *profile, bool enabled)
+{
+    if (profile != NULL) profile->youtube_topics = enabled;
 }
 
 bool browser_profile_javascript_enabled(const BrowserProfile *profile)
@@ -1806,6 +1850,17 @@ BrowserUpdateChannel browser_profile_update_channel(
 {
     return profile == NULL
         ? BROWSER_UPDATE_CHANNEL_STABLE : profile->update_channel;
+}
+
+unsigned browser_profile_ui_language(const BrowserProfile *profile)
+{
+    return profile ? profile->ui_language : TILEFINCH_UI_LANGUAGE_ENGLISH;
+}
+
+void browser_profile_set_ui_language(BrowserProfile *profile, unsigned language)
+{
+    if (profile && language < TILEFINCH_UI_LANGUAGE_COUNT)
+        profile->ui_language = (uint8_t)language;
 }
 
 BrowserGlyphLanguage browser_profile_glyph_language(

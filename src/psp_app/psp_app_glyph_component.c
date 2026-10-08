@@ -67,7 +67,9 @@ static bool profile_language_uses_pack(
         || (language == BROWSER_GLYPH_LANGUAGE_ARABIC
             && pack == TILEFINCH_GLYPH_PACK_ARABIC)
         || (language == BROWSER_GLYPH_LANGUAGE_HEBREW
-            && pack == TILEFINCH_GLYPH_PACK_HEBREW);
+            && pack == TILEFINCH_GLYPH_PACK_HEBREW)
+        || (language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI
+            && pack == TILEFINCH_GLYPH_PACK_DEVANAGARI);
 }
 
 /* ---- In-page language-pack offer (docs/TEXT_BIDI.md#glyph-components) */
@@ -184,6 +186,18 @@ static const char *glyph_begin_check(PspApp *app,
 }
 
 /* Publishes the confirmation's signed size or failure once known. */
+const char *psp_glyph_component_request_pack(PspApp *app, TilefinchGlyphPack pack)
+{
+    PspGlyphComponentSession *session = app->browser->glyph_component_session;
+    if (!psp_glyph_component_session_select_operation(session, app->browser->budget,
+            &app->process->install_paths, pack)) return "SIGNED PACK DOWNLOAD UNAVAILABLE";
+    PspGlyphComponentPrimaryResult primary = psp_glyph_component_session_primary(
+        session, &app->process->install_paths, app->browser->engine);
+    if (primary == PSP_GLYPH_COMPONENT_PRIMARY_CHECK_REQUIRED)
+        return glyph_begin_check(app, session, &app->process->presentation.ui, pack);
+    return NULL;
+}
+
 static bool glyph_offer_size_track(PspGlyphComponentSession *session,
                                    PspUiState *ui)
 {
@@ -302,7 +316,7 @@ static void glyph_install_finish(PspApp *app,
     if (from_offer && spec != NULL) scripts = spec->page_scripts;
     (void) psp_glyph_component_session_reattach(
         session, app->browser->budget, &app->process->install_paths,
-        browser_profile_glyph_language(app->browser->profile),
+        psp_ui_language_glyphs(app->browser->profile),
         browser_profile_color_emoji(app->browser->profile), scripts,
         engine);
     if (from_offer) session->offer_install_pending = false;
@@ -439,6 +453,19 @@ bool psp_glyph_component_handle_frame(
         ? (TilefinchGlyphPack) intent->glyph_component_pack
         : TILEFINCH_GLYPH_PACK_JAPANESE;
     if (intent->glyph_component_remove_requested) {
+        TilefinchGlyphPack ui_pack;
+        const TilefinchUiLanguageSpec *locale = tilefinch_ui_language_spec(
+            browser_profile_ui_language(app->browser->profile));
+        const TilefinchUiLanguageSpec *active_locale = tilefinch_ui_language_spec(
+            tilefinch_ui_translation_bound_language());
+        bool needed = locale && tilefinch_glyph_pack_for_language(locale->glyphs, &ui_pack)
+            && requested == ui_pack;
+        needed |= active_locale && tilefinch_glyph_pack_for_language(active_locale->glyphs, &ui_pack)
+            && requested == ui_pack;
+        if (needed) {
+            psp_ui_show_status(ui, "SELECT ENGLISH UI AND RESTART BEFORE REMOVING THIS PACK", 240);
+            return true;
+        }
         bool requested_attached =
             (session->attached_mask & (1u << (unsigned) requested)) != 0;
         bool selection_changed = false;
@@ -482,7 +509,7 @@ bool psp_glyph_component_handle_frame(
             (void) psp_glyph_component_session_attach_selected(
                 session, app->browser->budget,
                 &app->process->install_paths,
-                browser_profile_glyph_language(app->browser->profile),
+                psp_ui_language_glyphs(app->browser->profile),
                 browser_profile_color_emoji(app->browser->profile));
         }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG

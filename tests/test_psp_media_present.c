@@ -623,9 +623,94 @@ static bool test_360p_wide_strip_plan(void)
     return true;
 }
 
+static bool test_clockwise_portrait_geometry(void)
+{
+    PspMediaPresentPlan plan;
+    CHECK(psp_media_present_plan_clockwise(
+        &plan, 240, 426, 512, SCREEN_WIDTH, SCREEN_HEIGHT));
+    CHECK(rect_equals(plan.video, 0, 1, 480, 270));
+    CHECK(plan.quad_count == 1 && plan.quads[0].clockwise);
+    CHECK(plan.quads[0].texture_width == 256);
+    CHECK(plan.quads[0].texture_height == 512);
+    CHECK(bands_tile_the_panel(&plan));
+    CHECK(quads_sample_inside(&plan, 240, 426));
+    CHECK(psp_media_present_stage_fits(&plan, 426, PSP_MEDIA_PRESENT_STAGE_BYTES));
+    PspMediaPresentVertex vertices[4];
+    psp_media_present_quad_vertices(&plan.quads[0], vertices);
+    CHECK(vertices[0].x == 480 && vertices[0].y == 1);
+    CHECK(vertices[1].x == 480 && vertices[1].y == 271);
+    CHECK(vertices[2].x == 0 && vertices[2].y == 271);
+    CHECK(vertices[3].x == 0 && vertices[3].y == 1);
+    CHECK(vertices[0].u == 0 && vertices[0].v == 0);
+    CHECK(vertices[1].u == plan.quads[0].u1 && vertices[1].v == 0);
+    CHECK(vertices[2].v == plan.quads[0].v1 && vertices[3].u == 0);
+    for (int width = 64; width <= 272; width += 13) {
+        for (int height = 240; height <= 480; height += 11) {
+            CHECK(psp_media_present_plan_clockwise(
+                &plan, width, height, 512, SCREEN_WIDTH, SCREEN_HEIGHT));
+            CHECK(bands_tile_the_panel(&plan));
+            CHECK(quads_sample_inside(&plan, width, height));
+        }
+    }
+    return true;
+}
+
+static bool test_central_portrait_crop(void)
+{
+    PspMediaPresentPlan plan;
+    CHECK(psp_media_present_plan_portrait_crop(
+        &plan, 426, 240, 512, SCREEN_WIDTH, SCREEN_HEIGHT));
+    CHECK(plan.quad_count == 1 && plan.quads[0].clockwise);
+    CHECK(plan.quads[0].texture_width == 256);
+    CHECK(plan.quads[0].texture_column == 144);
+    CHECK(plan.quads[0].u0 == 1.0f);
+    CHECK(plan.quads[0].u1 > 135.0f && plan.quads[0].u1 <= 136.0f);
+    CHECK(quads_sample_inside(&plan, 426, 240));
+    CHECK(bands_tile_the_panel(&plan));
+    CHECK(psp_media_present_stage_fits(&plan, 240, PSP_MEDIA_PRESENT_STAGE_BYTES));
+    CHECK(psp_media_present_plan_portrait_crop(
+        &plan, 640, 360, 768, SCREEN_WIDTH, SCREEN_HEIGHT));
+    CHECK(plan.quad_count == 1 && plan.quads[0].texture_width == 256);
+    CHECK(plan.quads[0].texture_column == 208);
+    CHECK(plan.quads[0].u0 == 11.0f);
+    CHECK(quads_sample_inside(&plan, 640, 360));
+    CHECK(psp_media_present_stage_fits(&plan, 360, PSP_MEDIA_PRESENT_STAGE_BYTES));
+    CHECK(!psp_media_present_plan_portrait_crop(
+        &plan, 0, 240, 512, SCREEN_WIDTH, SCREEN_HEIGHT));
+    return true;
+}
+
+static bool test_crop_stage_exact_source_rows(void)
+{
+    static uint32_t source[768 * 360];
+    static uint32_t staged[256 * 360 + 2];
+    for (size_t at = 0; at < sizeof(source) / sizeof(source[0]); at++)
+        source[at] = (uint32_t) at ^ 0xa5342b19u;
+    PspMediaPresentPlan plan;
+    CHECK(psp_media_present_plan_portrait_crop(
+        &plan, 640, 360, 768, SCREEN_WIDTH, SCREEN_HEIGHT));
+    const PspMediaPresentQuad *quad = &plan.quads[0];
+    staged[0] = staged[256 * 360 + 1] = 0xdeadbeefu;
+    psp_media_present_stage(staged + 1, source + quad->texture_column,
+                            768, quad->texture_width, 360);
+    for (int row = 0; row < 360; row++) {
+        CHECK(memcmp(staged + 1 + row * 256,
+                     source + row * 768 + quad->texture_column,
+                     256 * sizeof(uint32_t)) == 0);
+    }
+    CHECK(staged[0] == 0xdeadbeefu
+          && staged[256 * 360 + 1] == 0xdeadbeefu);
+    CHECK(quad->u0 + (float) quad->texture_column == 219.0f);
+    CHECK(psp_media_present_stage_bytes(quad->texture_width, 360) == 368640u);
+    return true;
+}
+
 int main(void)
 {
     struct { const char *name; bool (*run)(void); } cases[] = {
+        {"clockwise-portrait-geometry", test_clockwise_portrait_geometry},
+        {"central-portrait-crop", test_central_portrait_crop},
+        {"crop-stage-exact-source-rows", test_crop_stage_exact_source_rows},
         {"stage-is-a-linear-copy-into-the-texture",
          test_stage_is_a_linear_copy_into_the_texture},
         {"stage-admission-follows-the-plan",

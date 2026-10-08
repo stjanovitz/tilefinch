@@ -493,7 +493,7 @@ void psp_media_present_forget_buffers(void)
  */
 static PspMediaPresentMode psp_media_present_requested_mode(void)
 {
-    if (psp_active_media == NULL)
+    if (psp_active_media == NULL || psp_active_media->ui_presentation.clockwise)
         return PSP_MEDIA_PRESENT_MODE_GE_SMOOTH;
     return browser_profile_video_scaling(psp_active_media->profile)
             == BROWSER_VIDEO_SCALING_SHARP
@@ -565,6 +565,17 @@ typedef struct {
 } PspPresentationCadence;
 
 static PspPresentationCadence psp_presentation_cadence;
+static bool psp_video_scanout_measuring = true;
+typedef struct {
+    uint64_t stage_us;
+    size_t stage_frames;
+    uint64_t draw_us;
+    size_t draw_frames;
+    uint32_t ge_copies;
+} PspVideoDrawSnapshot;
+static PspVideoDrawSnapshot psp_video_measure_begin;
+static PspVideoDrawSnapshot psp_video_measure_end;
+static bool psp_video_measure_valid;
 static PspPresentPhaseTiming psp_present_last_timing;
 static bool psp_present_cpu_measurement;
 static void (*psp_present_pre_publish_hook)(uint32_t sequence);
@@ -722,6 +733,36 @@ void psp_video_scanout_note_discontinuity(void)
     psp_presentation_cadence.video_scanout_frame_valid = false;
 }
 
+void psp_video_scanout_measurement(bool enabled)
+{
+    psp_video_scanout_measuring = enabled;
+    /* Input marks run outside the presenter's scoped active-media pointer.
+       Snapshot counters while presenting; never retain that session pointer. */
+    if (!enabled && psp_video_measure_valid
+        && psp_video_measure_end.stage_frames >= psp_video_measure_begin.stage_frames
+        && psp_video_measure_end.draw_frames >= psp_video_measure_begin.draw_frames
+        && psp_video_measure_end.stage_us >= psp_video_measure_begin.stage_us
+        && psp_video_measure_end.draw_us >= psp_video_measure_begin.draw_us) {
+        size_t stages = psp_video_measure_end.stage_frames - psp_video_measure_begin.stage_frames;
+        size_t draws = psp_video_measure_end.draw_frames - psp_video_measure_begin.draw_frames;
+        printf("tilefinch-video-draw-window: stages=%zu stage-average=%lluus "
+               "draws=%zu draw-average=%lluus ge-copies=%lu\n", stages,
+               (unsigned long long) (stages == 0 ? 0
+                   : (psp_video_measure_end.stage_us - psp_video_measure_begin.stage_us) / stages),
+               draws, (unsigned long long) (draws == 0 ? 0
+                   : (psp_video_measure_end.draw_us - psp_video_measure_begin.draw_us) / draws),
+               (unsigned long) (psp_video_measure_end.ge_copies - psp_video_measure_begin.ge_copies));
+    }
+    if (!enabled) return;
+    psp_video_measure_valid = false;
+    PspPresentationCadence *metrics = &psp_presentation_cadence;
+    metrics->video_scanout_interval_total_us = 0;
+    metrics->video_scanout_interval_max_us = 0;
+    metrics->video_scanout_intervals = 0;
+    memset(metrics->video_scanout_buckets, 0, sizeof(metrics->video_scanout_buckets));
+    psp_video_scanout_note_discontinuity();
+}
+
 /*
  * Both presenters report here.
  *
@@ -801,7 +842,20 @@ static size_t psp_video_scanout_interval_bucket(uint64_t interval_us)
 static void psp_cadence_video_published(
     bool published, const MediaVideoFrame *frame)
 {
-    if (!published || frame == NULL) return;
+    if (!published || frame == NULL || !psp_video_scanout_measuring) return;
+    if (psp_active_media != NULL) {
+        psp_video_measure_end = (PspVideoDrawSnapshot) {
+            psp_active_media->present_stage_total_us,
+            psp_active_media->present_stage_frames,
+            psp_active_media->present_scale_total_us,
+            psp_active_media->present_scale_frames,
+            psp_media_present_ge_stage_rows_copies()
+        };
+        if (!psp_video_measure_valid) {
+            psp_video_measure_begin = psp_video_measure_end;
+            psp_video_measure_valid = true;
+        }
+    }
     PspPresentationCadence *metrics = &psp_presentation_cadence;
     bool same_picture = metrics->video_scanout_frame_valid
         && metrics->video_scanout_identity == frame->identity
@@ -1032,6 +1086,12 @@ static bool psp_media_present_prepare(
     PspMediaPresentPlan *plan, PspMediaPresentRecord **record,
     uint64_t *generation)
 {
+    static bool previous_clockwise;
+    bool clockwise = plan->quad_count != 0 && plan->quads[0].clockwise;
+    if (clockwise != previous_clockwise) {
+        psp_media_present_forget_buffers();
+        previous_clockwise = clockwise;
+    }
     *generation =
         psp_active_media == NULL ? 0 : psp_active_media->generation;
     unsigned buffer_index =
@@ -1057,6 +1117,12 @@ static bool psp_present_media_frame(
     uint16_t *vram, const MediaVideoFrame *frame, bool chrome_paints)
 {
     if (vram == NULL || !psp_media_frame_presentable(frame)) return false;
+    /* A refused GE never leads to a CPU rotation pass. Return to the proven
+       landscape Sharp path, including its matching control orientation. */
+    if (psp_active_media != NULL) {
+        psp_active_media->ui_presentation.clockwise = false;
+        psp_active_media->ui_presentation.portrait_crop = false;
+    }
     PspMediaPresentPlan plan;
     if (!psp_media_present_plan(
             &plan, frame->width, frame->height, frame->stride_pixels,
@@ -1149,6 +1215,9 @@ static bool psp_present_media_frame_video_strips(
     uint64_t stage_total_us = 0;
 #endif
     PspMediaPresentGeCost total = {0, 0, 0};
+    /* The strip copies overwrite the same EDRAM buffer used by a retained
+       crop. A paused picture can change modes without changing identity. */
+    psp_active_media->present_stage_identity = 0;
     psp_active_media->present_texture_staged = true;
     for (size_t at = 0; at < strips->strip_count; at++) {
         const PspMediaPresentStrip *strip = &strips->strips[at];
@@ -1238,9 +1307,21 @@ static bool psp_present_media_frame_video(
 {
     if (vram == NULL || !psp_media_frame_presentable(frame)) return false;
     PspMediaPresentPlan plan;
-    if (!psp_media_present_plan(
-            &plan, frame->width, frame->height, frame->stride_pixels,
-            PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT)) return false;
+    bool clockwise = psp_active_media != NULL
+        && psp_active_media->ui_presentation.clockwise;
+    bool crop = clockwise && psp_active_media->ui_presentation.portrait_crop;
+    bool planned = crop
+        ? psp_media_present_plan_portrait_crop(
+              &plan, frame->width, frame->height, frame->stride_pixels,
+              PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT)
+        : clockwise
+        ? psp_media_present_plan_clockwise(
+              &plan, frame->width, frame->height, frame->stride_pixels,
+              PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT)
+        : psp_media_present_plan(
+              &plan, frame->width, frame->height, frame->stride_pixels,
+              PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+    if (!planned) return false;
     if (frame->format == MEDIA_PIXEL_RGB565 || plan.quad_count == 0) {
         /* The engine would take a 16-bit texture and this surface would not
            pass its bytes through, and a geometry it cannot express has no
@@ -3444,8 +3525,7 @@ static void psp_work_ui_tick(bool owner_thread)
     bool priority_handled = false;
     if (owner_thread && cooperate->engine == NULL
         && !cooperate->media_surface && !cooperate->media_detached
-        && !cooperate->supervisor_ui.page_gamepad_capture
-        && cooperate->pending_page_input_count == 0) {
+        && !cooperate->supervisor_ui.page_gamepad_capture) {
         /* Native menus and cursor movement do not call the document. Keep
            their visual state on the completed frame while page work runs. */
         PspUiInput native_input = { .pressed = ui_pressed,
@@ -3459,8 +3539,12 @@ static void psp_work_ui_tick(bool owner_thread)
                 cooperate->supervisor_ui.screen == PSP_UI_SCREEN_PAGE,
                 scripted && toolbar != NULL ? toolbar->sample_ms + 16u : now_us / 1000u))
             toolbar->reader_pending = true;
-        priority_handled = psp_ui_update_priority(
-            &cooperate->supervisor_ui, &native_input);
+        uint8_t queued_before = cooperate->pending_page_input_count;
+        priority_handled = psp_ui_update_priority_with_page_queue(
+            &cooperate->supervisor_ui, &native_input,
+            &cooperate->pending_page_input_count);
+        cooperate->pending_page_input_dropped +=
+            queued_before - cooperate->pending_page_input_count;
         /* A held Triangle is consumed by the gesture, not replayed as a
            fresh press on return to the main loop. Reader dispatch waits for
            the page's borrowed state to be released. */

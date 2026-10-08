@@ -3,7 +3,9 @@
 #include "tilefinch/font.h"
 #include "tilefinch/glyph_component.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/psp_ui.h"
 #include "tilefinch/sha256.h"
+#include "tilefinch/ui_language.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -260,7 +262,9 @@ static bool test_pack_catalog(void)
         {"glyph-arabic", "Arabic", "tilefinch-glyph-arabic-v1.tfgm",
          "tilefinch-glyph-arabic-v1.tfgf"},
         {"glyph-hebrew", "Hebrew", "tilefinch-glyph-hebrew-v1.tfgm",
-         "tilefinch-glyph-hebrew-v1.tfgf"}
+         "tilefinch-glyph-hebrew-v1.tfgf"},
+        {"glyph-devanagari", "Devanagari (Hindi)",
+         "tilefinch-glyph-devanagari-v1.tfgm", "tilefinch-glyph-devanagari-v1.tfgf"}
     };
     CHECK(TILEFINCH_GLYPH_PACK_JAPANESE == 0
           && TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED == 1
@@ -271,6 +275,7 @@ static bool test_pack_catalog(void)
           && TILEFINCH_GLYPH_PACK_LATIN_EXTENDED == 6
           && TILEFINCH_GLYPH_PACK_ARABIC == 7
           && TILEFINCH_GLYPH_PACK_HEBREW == 8
+          && TILEFINCH_GLYPH_PACK_DEVANAGARI == 9
           && TILEFINCH_GLYPH_PACK_COUNT
                  == sizeof(expected) / sizeof(expected[0]));
     for (TilefinchGlyphPack pack = 0;
@@ -303,7 +308,8 @@ static bool test_pack_catalog(void)
         {BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
          TILEFINCH_GLYPH_PACK_LATIN_EXTENDED},
         {BROWSER_GLYPH_LANGUAGE_ARABIC, TILEFINCH_GLYPH_PACK_ARABIC},
-        {BROWSER_GLYPH_LANGUAGE_HEBREW, TILEFINCH_GLYPH_PACK_HEBREW}
+        {BROWSER_GLYPH_LANGUAGE_HEBREW, TILEFINCH_GLYPH_PACK_HEBREW},
+        {BROWSER_GLYPH_LANGUAGE_DEVANAGARI, TILEFINCH_GLYPH_PACK_DEVANAGARI}
     };
     for (size_t at = 0;
          at < sizeof(language_packs) / sizeof(language_packs[0]); at++) {
@@ -422,17 +428,22 @@ static bool test_release_artifacts(void)
                && strcmp(stage_selection, "hebrew") == 0) {
         staged_language = BROWSER_GLYPH_LANGUAGE_HEBREW;
         staged_pack = TILEFINCH_GLYPH_PACK_HEBREW;
+    } else if (stage_selection != NULL
+               && strcmp(stage_selection, "devanagari") == 0) {
+        staged_language = BROWSER_GLYPH_LANGUAGE_DEVANAGARI;
+        staged_pack = TILEFINCH_GLYPH_PACK_DEVANAGARI;
     }
     static const unsigned probes[TILEFINCH_GLYPH_PACK_COUNT] = {
         0x65e5u, 0x6c49u, 0x6f22u, 0xac00u, 0x1f600u,
-        0x0490u, 0x1ed9u, 0xfeb3u, 0x05e9u
+        0x0490u, 0x1ed9u, 0xfeb3u, 0x05e9u, 0x0939u
     };
     static const char *const samples[TILEFINCH_GLYPH_PACK_COUNT] = {
         NULL, NULL, NULL, NULL, NULL,
         "Привет мир Привіт, Україно",
         "Tiếng Việt",
         "مرحبا فارسی اردو",
-        "שלום עולם"
+        "שלום עולם",
+        "नमस्ते हिन्दी"
     };
     for (TilefinchGlyphPack pack = 0;
          pack < TILEFINCH_GLYPH_PACK_COUNT; pack++) {
@@ -467,8 +478,11 @@ static bool test_release_artifacts(void)
         CHECK(status == TILEFINCH_UPDATE_OK);
         CHECK(verified.manifest.package_format
               == TILEFINCH_UPDATE_PACKAGE_GLYPH);
-        CHECK(verified.manifest.release_sequence == 1u);
-        CHECK(strcmp(verified.manifest.tag, "components-v1") == 0);
+        bool revised_hindi = pack == TILEFINCH_GLYPH_PACK_DEVANAGARI
+            && verified.manifest.release_sequence == 2u;
+        CHECK(revised_hindi || verified.manifest.release_sequence == 1u);
+        CHECK(strcmp(verified.manifest.tag,
+                     revised_hindi ? "components-v2" : "components-v1") == 0);
         CHECK(strcmp(verified.manifest.asset, spec->pack_asset) == 0);
         if (pack == TILEFINCH_GLYPH_PACK_CYRILLIC
             || pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED
@@ -547,7 +561,7 @@ static bool test_release_artifacts(void)
             CHECK(tilefinch_glyph_component_installed_identity(
                 &budget, &paths, pack, &root, &installed_sequence,
                 installed_sha256));
-            CHECK(installed_sequence == 1u
+            CHECK(installed_sequence == verified.manifest.release_sequence
                   && memcmp(installed_sha256,
                             package_digest, sizeof(package_digest)) == 0);
             CHECK(budget.current == 0);
@@ -561,6 +575,10 @@ static bool test_release_artifacts(void)
         CHECK(profile != NULL);
         browser_profile_set_glyph_language(
             profile, staged_language);
+        if (staged_language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI)
+            browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_HINDI);
+        else if (staged_language == BROWSER_GLYPH_LANGUAGE_ARABIC)
+            browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_ARABIC);
         browser_profile_set_color_emoji(profile, true);
         const char *bookmark_title = staged_language
                 == BROWSER_GLYPH_LANGUAGE_CYRILLIC
@@ -571,6 +589,8 @@ static bool test_release_artifacts(void)
                 ? "مرحبا — فارسی — اردو"
             : staged_language == BROWSER_GLYPH_LANGUAGE_HEBREW
                 ? "שלום עולם"
+            : staged_language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI
+                ? "नमस्ते हिन्दी"
                 : "日本語  漢字  한국어  😀";
         CHECK(browser_profile_add_bookmark(
             profile, "https://example.com/", bookmark_title));
@@ -637,6 +657,17 @@ static bool test_bounded_pack_provider(void)
     CHECK(font_glyph_load(face, 0x4e00u, 16, false, &glyph));
     CHECK(glyph.provider_pending && glyph.colors == NULL);
     font_glyph_destroy(face, &glyph);
+    /* A chrome label can be painted before its pack's queued block arrives.
+       Repainting after the pump must replace that placeholder, not cache it
+       for the rest of the session. */
+    static uint16_t pending_pixels[480 * 272];
+    static uint16_t ready_pixels[480 * 272];
+    static uint16_t fresh_pixels[480 * 272];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_show_status(&ui, "\xe4\xb8\x80", 180);
+    psp_ui_set_chrome_fonts(face, NULL, 1);
+    psp_ui_composite(&ui, pending_pixels, 480, 272, 480);
     bool changed = true;
     size_t bytes_read = 99;
     CHECK(tilefinch_glyph_provider_pump(
@@ -650,9 +681,21 @@ static bool test_bounded_pack_provider(void)
     CHECK(source.kind == TILEFINCH_GLYPH_COMPONENT_MONO);
     CHECK(source.width == 16 && source.height == 16);
     CHECK(source.pixels[0] == 0x31u);
+    psp_ui_composite(&ui, ready_pixels, 480, 272, 480);
+    psp_ui_clear_chrome_font();
+    psp_ui_set_chrome_fonts(face, NULL, 1);
+    psp_ui_composite(&ui, fresh_pixels, 480, 272, 480);
+    CHECK(memcmp(ready_pixels, fresh_pixels, sizeof(ready_pixels)) == 0);
+    CHECK(memcmp(pending_pixels, ready_pixels, sizeof(ready_pixels)) != 0);
+    psp_ui_clear_chrome_font();
     CHECK(font_glyph_load(face, 0x4e00u, 16, false, &glyph));
     CHECK(!glyph.provider_pending && glyph.colors == NULL
           && glyph.width == 16 && glyph.height == 16);
+    font_glyph_destroy(face, &glyph);
+    CHECK(font_glyph_load(face, 0x4e00u, 8, false, &glyph));
+    /* The source has ink at x=7, between the old nearest samples 6 and 8. */
+    CHECK(!glyph.provider_pending && glyph.width == 8 && glyph.height == 8
+          && glyph.pixels[3] > 0 && glyph.pixels[3] < 255);
     font_glyph_destroy(face, &glyph);
 
     static const char family[] =
@@ -671,6 +714,7 @@ static bool test_bounded_pack_provider(void)
     CHECK(font_optional_glyph_match_sequence(
         family, sizeof(family) - 1u, &font_used, &sequence_key));
     CHECK(font_used == 11u && sequence_key == key);
+    CHECK(font_face_has_codepoint(face, sequence_key));
     size_t sequence_start = 99u;
     CHECK(font_optional_glyph_match_sequence_ending_at(
         family, font_used, &sequence_start, &sequence_key));

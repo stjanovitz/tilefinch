@@ -142,23 +142,33 @@ void psp_media_present_texture_for(
         return;
     }
     int texture_width = plan->quads[0].texture_width;
+    int source_column = plan->quads[0].texture_column;
+    if (source_column > frame->stride_pixels
+        || texture_width > frame->stride_pixels - source_column) return;
+    const uint32_t *source = (const uint32_t *) frame->pixels + source_column;
     media->present_stage_async = false;
+    /* Mode changes can reuse the picture identity but need a different
+       subtexture. Never mistake a previous full-width/cropped stage for it. */
+    if (media->present_stage_source_column != source_column
+        || media->present_stage_texture_width != texture_width)
+        media->present_stage_identity = 0;
     if (media->present_stage_identity != frame->identity) {
         int rows = psp_media_present_stage_rows(frame->height);
         if (rows > plan->quads[0].texture_height)
             rows = plan->quads[0].texture_height;
         size_t stage_bytes =
             psp_media_present_stage_bytes(texture_width, rows);
-        bool contiguous = frame->stride_pixels == texture_width;
+        bool contiguous = source_column == 0
+            && frame->stride_pixels == texture_width;
         /*
          * Post the half-megabyte copy to the DMA worker when the source rows
          * are as wide as the texture -- the shipping 512 case -- so the DMA
          * controller runs it in parallel with the feed the present does next,
          * instead of blocking the interactive thread on it. The texture is not
          * sampled until psp_media_present_texture_finish has joined the copy. A
-         * strided source, or a host with no worker, falls back to the
-         * synchronous DMA and then the CPU stage, each of which completes the
-         * copy before this returns and costs the thread the whole transfer.
+         * strided source uses a synchronous GE copy into the same stage.
+         * Refused copies and hosts with no graphics engine retain the CPU
+         * fallback; every synchronous path finishes before this returns.
          */
         /* Every branch below reads the decoded surface -- the controller in
            parallel, the CPU inline -- so the claim covers all of them. The
@@ -180,7 +190,7 @@ void psp_media_present_texture_for(
         }
         if (contiguous
             && psp_media_present_ge_stage_dma_submit(
-                   staging, frame->pixels, stage_bytes,
+                   staging, source, stage_bytes,
                    (unsigned) frame->slot, frame->generation)) {
             media->present_stage_async = true;
             media->present_stage_pixels = staging;
@@ -190,18 +200,27 @@ void psp_media_present_texture_for(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             uint64_t started_us = psp_media_internal_now_us(media);
 #endif
-            if (!(contiguous
-                  && psp_media_present_ge_stage_dma(
-                         staging, frame->pixels, stage_bytes))) {
+            bool copied = contiguous
+                ? psp_media_present_ge_stage_dma(staging, source, stage_bytes)
+                : psp_media_present_ge_stage_rows(
+                      staging, source, frame->stride_pixels, texture_width, rows);
+            if (!copied) {
                 psp_media_present_stage(
-                    staging, frame->pixels, frame->stride_pixels,
+                    staging, source, frame->stride_pixels,
                     texture_width, rows);
                 psp_media_present_ge_stage_flush(staging, stage_bytes);
             }
             psp_media_note_stage_signature(media, frame, staging,
                                            texture_width, rows);
             media_playback_note_frame_staged(media->playback, frame);
-            psp_media_finish_staged_surface(media);
+            /* A cropped stage cannot reconstruct the full paused picture
+               after a mode change. Retain its source claim, as the wide-strip
+               presenter does; release only the read lease after this copy.
+               The normal frame advance retires the claim. */
+            if (source_column != 0)
+                psp_media_present_release_claimed_surface(media);
+            else
+                psp_media_finish_staged_surface(media);
             psp_media_present_emit_after_release(media);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             /* Read only by the validation media-job report. */
@@ -213,6 +232,8 @@ void psp_media_present_texture_for(
 #endif
         }
         media->present_stage_identity = frame->identity;
+        media->present_stage_source_column = source_column;
+        media->present_stage_texture_width = texture_width;
     }
     texture->pixels = staging;
     texture->stride_pixels = texture_width;

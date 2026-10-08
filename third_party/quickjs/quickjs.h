@@ -1102,6 +1102,7 @@ size_t JS_GetGCThreshold(JSRuntime *rt);
 /* Why the collection in progress runs, for a JS_SetGCHook observer. */
 #define JS_GC_CAUSE_EXPLICIT 0      /* any other JS_RunGC */
 #define JS_GC_CAUSE_THRESHOLD 1     /* allocation passed the GC threshold */
+#define JS_GC_CAUSE_ARRAY_GROWTH 2  /* required array capacity passed it */
 int JS_GetGCCause(JSRuntime *rt);
 /* Called with begin=1 before and begin=0 after every first-call compile of
    a lazy function body; must not allocate on or re-enter the runtime

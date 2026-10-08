@@ -10,6 +10,9 @@
 #undef budget_calloc
 #undef budget_realloc
 #include "js_runtime_internal.h"
+#include <lexbor/dom/interfaces/character_data.h>
+#include <lexbor/dom/interfaces/text.h>
+#include <lexbor/dom/interfaces/attr.h>
 
 #include "tilefinch/platform.h"
 #include "tilefinch/resources.h"
@@ -5321,6 +5324,24 @@ JSValue js_dom_get_custom_state(JSContext *context,
         context, (int) lxb_dom_interface_element(node)->custom_state);
 }
 
+#define DOM_TEXT_CONTENT_NODE_LIMIT 200000u
+#define DOM_TEXT_CONTENT_BYTE_LIMIT (8u * 1024u * 1024u)
+
+/* The selector traversal has a smaller, silently terminating quota. Text
+   reads need their own complete walk: the caller checks the visited count
+   and throws rather than publishing a prefix. Parent links are native-owned. */
+static lxb_dom_node_t *bridge_text_content_next(lxb_dom_node_t *at,
+                                               const lxb_dom_node_t *root)
+{
+    if (at->first_child != NULL) return at->first_child;
+    for (size_t climbed = 0; at != root && at->next == NULL
+         && climbed < DOM_TEXT_CONTENT_NODE_LIMIT; climbed++) {
+        at = at->parent;
+        if (at == NULL) return NULL;
+    }
+    return at == root ? NULL : at->next;
+}
+
 JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
                         int argc, JSValueConst *argv)
 {
@@ -5356,14 +5377,63 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
         js_rt_remote_node_read_result_destroy(bridge, &read);
         return value;
     }
-    size_t length = 0;
-    lxb_char_t *text = lxb_dom_node_text_content(node, &length);
-    JSValue value = text == NULL ? JS_NewString(context, "")
-                                 : JS_NewStringLen(context,
-                                     (const char *) text, length);
-    if (text != NULL) {
-        lxb_dom_document_destroy_text(node->owner_document, text);
+    /* Do not put read-only scratch in Lexbor's retained text arena. In
+       particular, a large style.textContent read used to leave another arena
+       chunk resident after its temporary string was freed. No author code is
+       invoked while these borrowed bytes are copied into the JS string. */
+    lxb_dom_node_t *text_node = node;
+    if ((node->type == LXB_DOM_NODE_TYPE_ELEMENT
+         || node->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT)
+        && node->first_child != NULL && node->first_child == node->last_child
+        && node->first_child->type == LXB_DOM_NODE_TYPE_TEXT)
+        text_node = node->first_child;
+    if (text_node->type == LXB_DOM_NODE_TYPE_TEXT
+        || text_node->type == LXB_DOM_NODE_TYPE_COMMENT
+        || text_node->type == LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION) {
+        const lexbor_str_t *data =
+            &lxb_dom_interface_character_data(text_node)->data;
+        return JS_NewStringLen(context,
+            data->data == NULL ? "" : (const char *) data->data, data->length);
     }
+    if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        && node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT)
+    {
+        if (node->type == LXB_DOM_NODE_TYPE_ATTRIBUTE) {
+            size_t length = 0;
+            const lxb_char_t *text = lxb_dom_attr_value(lxb_dom_interface_attr(node), &length);
+            return JS_NewStringLen(context, text == NULL ? "" : (const char *) text, length);
+        }
+        return JS_NewString(context, "");
+    }
+
+    /* Complete results or an explicit quota error, never a silent prefix.
+       These bounds cover the admitted document and the existing rendered-text
+       traversal ceiling while keeping hostile script-built trees bounded. */
+    size_t length = 0, visited = 0;
+    for (lxb_dom_node_t *at = node; at != NULL;
+         at = bridge_text_content_next(at, node)) {
+        if (++visited > DOM_TEXT_CONTENT_NODE_LIMIT)
+            return JS_ThrowRangeError(context, "textContent node quota exceeded");
+        if (at->type != LXB_DOM_NODE_TYPE_TEXT) continue;
+        size_t bytes = lxb_dom_interface_text(at)->char_data.data.length;
+        if (bytes > DOM_TEXT_CONTENT_BYTE_LIMIT - length)
+            return JS_ThrowRangeError(context, "textContent byte quota exceeded");
+        length += bytes;
+    }
+    char local[512];
+    char *text = length <= sizeof(local) ? local
+        : budget_malloc(bridge->budget, length);
+    if (text == NULL) return JS_ThrowOutOfMemory(context);
+    size_t used = 0;
+    for (lxb_dom_node_t *at = node; at != NULL;
+         at = bridge_text_content_next(at, node)) {
+        if (at->type != LXB_DOM_NODE_TYPE_TEXT) continue;
+        const lexbor_str_t *data = &lxb_dom_interface_text(at)->char_data.data;
+        if (data->length != 0) memcpy(text + used, data->data, data->length);
+        used += data->length;
+    }
+    JSValue value = JS_NewStringLen(context, text, length);
+    if (text != local) budget_free(bridge->budget, text);
     return value;
 }
 

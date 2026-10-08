@@ -47,7 +47,7 @@ bool tilefinch_glyph_provider_attach(
     TilefinchGlyphProvider *provider, const char *path,
     const char *expected_component_id);
 
-/* Match one codepoint or the longest installed emoji sequence. `glyph_key`
+/* Match one codepoint or the longest installed emoji/Indic sequence. `glyph_key`
    is an opaque provider key, not a Unicode scalar. Ordinary callers should
    retain the original UTF-8 when this returns false. */
 bool tilefinch_glyph_provider_match(

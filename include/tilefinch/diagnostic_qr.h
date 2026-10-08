@@ -22,6 +22,9 @@ typedef struct TilefinchDiagnosticQrReport TilefinchDiagnosticQrReport;
 typedef struct {
     const char *name;
     const char *path;
+    /* build() owns a snapshot; no temporary file is needed for RAM reports. */
+    const void *memory;
+    size_t memory_size;
 } TilefinchDiagnosticSource;
 
 typedef struct {

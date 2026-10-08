@@ -3439,7 +3439,13 @@ NavigationUserCssTransaction *navigation_apply_user_css_begin(
     StylesheetDocumentResources next_resources = {0};
     ExternalStylesheetStats next_external = {0};
     LayoutDocument next_layout = {0};
-    bool okay = session->external_resources_enabled
+    /* Changing presentation is not a new navigation. Keep validated response
+       bytes and redirect/referrer provenance even after the HTTP cache evicts
+       them, without mutating the incumbent ledger needed by rollback. */
+    bool okay = !session->external_resources_enabled
+        || stylesheet_document_resources_copy_for_rebuild(
+               &next_resources, &session->page.stylesheet_resources);
+    if (okay) okay = session->external_resources_enabled
         ? stylesheet_build_context_deferred(
               &next_sheet, session->budget, &session->page.document,
               &session->viewport)

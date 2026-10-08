@@ -3,6 +3,7 @@
 Tilefinch can display its existing diagnostic logs as one or more QR codes.
 This is a transport view only: building a report does not alter, delete, or
 replace any log file, and it creates no new file on the Memory Stick.
+It can also include the latest opt-in Wi-Fi failure report directly from RAM.
 
 ## User flow
 
@@ -26,6 +27,13 @@ than one part is divided into exact contiguous segments, so no log bytes are
 dropped. Each part contains at most 56 KiB of input and 64 QR pages. Moving to
 another part frees the current compressed payload before reading and building
 the requested part, keeping RAM bounded regardless of total log size.
+
+With **Wi-Fi diagnostics** enabled, a failed connection retains a bounded
+4 KiB report in RAM. Diagnostic QR puts that report first and owns a snapshot
+of its bytes so another connection cannot change an open report. No file is
+created for it, even when Save error reports is Off. It contains numeric
+connection state, error codes and configuration flags—not network names,
+credentials or addresses. Turning diagnostics Off clears the retained report.
 
 ## QR geometry
 

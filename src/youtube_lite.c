@@ -57,6 +57,12 @@ typedef struct {
     char snippet[YOUTUBE_LITE_SNIPPET_LIMIT];
 } YoutubeLiteVideo;
 
+#define YOUTUBE_LITE_MAXIMUM_TOPICS 8u
+typedef struct {
+    char title[64];
+    char url[256];
+} YoutubeLiteTopic;
+
 typedef struct {
     YoutubeLiteVideo video;
     char description[YOUTUBE_LITE_DESCRIPTION_LIMIT];
@@ -677,13 +683,153 @@ static bool lite_parse_video(const YoutubeLiteSpan *renderer,
     return true;
 }
 
+/* Read an immediate member, not a similarly named field in an endpoint or
+   another nested card. Values are skipped with the existing depth-bounded
+   scanner; no DOM or general-purpose JSON allocation is needed. */
+static bool lite_json_member(const YoutubeLiteSpan *object, const char *name,
+                             YoutubeLiteSpan *value)
+{
+    if (object == NULL || object->start == object->end
+        || *object->start != '{') return false;
+    const char *at = object->start + 1;
+    for (unsigned members = 0; members < 256u; members++) {
+        while (at < object->end && isspace((unsigned char) *at)) at++;
+        if (at == object->end || *at == '}') return false;
+        YoutubeLiteSpan key;
+        if (*at != '"' || !lite_json_span(at, object->end, &key))
+            return false;
+        at = key.end;
+        while (at < object->end && isspace((unsigned char) *at)) at++;
+        if (at == object->end || *at++ != ':') return false;
+        if (!lite_json_span(at, object->end, value)) return false;
+        char decoded[64];
+        if (lite_json_string(key.start, key.end, decoded, sizeof(decoded))
+            && strcmp(decoded, name) == 0) return true;
+        at = value->end;
+        while (at < object->end && isspace((unsigned char) *at)) at++;
+        if (at == object->end || *at++ != ',') return false;
+    }
+    return false;
+}
+
+static bool lite_member_string(const YoutubeLiteSpan *object, const char *name,
+                               char *output, size_t capacity, bool truncate)
+{
+    YoutubeLiteSpan value;
+    return lite_json_member(object, name, &value)
+        && lite_json_string_bounded(
+               value.start, value.end, output, capacity, truncate);
+}
+
+static bool lite_array_next(const YoutubeLiteSpan *array, const char **cursor,
+                            YoutubeLiteSpan *value)
+{
+    if (array->start == array->end || *array->start != '[') return false;
+    const char *at = *cursor == NULL ? array->start + 1 : *cursor;
+    while (at < array->end && isspace((unsigned char) *at)) at++;
+    if (at < array->end && *at == ',') at++;
+    while (at < array->end && isspace((unsigned char) *at)) at++;
+    if (at == array->end || *at == ']'
+        || !lite_json_span(at, array->end, value)) return false;
+    *cursor = value->end;
+    return true;
+}
+
+static bool lite_parse_lockup(const YoutubeLiteSpan *renderer,
+                              YoutubeLiteVideo *video)
+{
+    YoutubeLiteVideo parsed = {0};
+    char type[48];
+    if (!lite_member_string(renderer, "contentType", type, sizeof(type), false)
+        || strcmp(type, "LOCKUP_CONTENT_TYPE_VIDEO") != 0
+        || !lite_member_string(renderer, "contentId", parsed.id,
+                               sizeof(parsed.id), false)
+        || !lite_valid_video_id(parsed.id)) return false;
+
+    YoutubeLiteSpan metadata, model, title, content, rows;
+    if (lite_json_member(renderer, "metadata", &metadata)
+        && lite_json_member(&metadata, "lockupMetadataViewModel", &model)) {
+        if (lite_json_member(&model, "title", &title))
+            (void) lite_member_string(&title, "content", parsed.title,
+                                      sizeof(parsed.title), true);
+        if (lite_json_member(&model, "metadata", &metadata)
+            && lite_json_member(&metadata, "contentMetadataViewModel", &content)
+            && lite_json_member(&content, "metadataRows", &rows)) {
+            const char *row_cursor = NULL;
+            YoutubeLiteSpan row, parts, part, text;
+            for (unsigned row_at = 0; row_at < 8u
+                 && lite_array_next(&rows, &row_cursor, &row); row_at++) {
+                if (!lite_json_member(&row, "metadataParts", &parts)) continue;
+                const char *part_cursor = NULL;
+                for (unsigned part_at = 0; part_at < 8u
+                     && lite_array_next(&parts, &part_cursor, &part); part_at++) {
+                    if (!lite_json_member(&part, "text", &text)) continue;
+                    char *output = row_at == 0 ? parsed.channel
+                        : row_at == 1 && part_at == 0 ? parsed.views
+                        : row_at == 1 && part_at == 1 ? parsed.published
+                        : row_at == 2 && part_at == 0 ? parsed.snippet : NULL;
+                    size_t capacity = row_at == 0 ? sizeof(parsed.channel)
+                        : row_at == 2 ? sizeof(parsed.snippet)
+                        : sizeof(parsed.views);
+                    if (output != NULL && output[0] == '\0')
+                        (void) lite_member_string(
+                            &text, "content", output, capacity, true);
+                }
+            }
+        }
+    }
+    if (parsed.title[0] == '\0')
+        snprintf(parsed.title, sizeof(parsed.title), "YouTube video");
+    YoutubeLiteSpan image, badge;
+    if (lite_json_member(renderer, "contentImage", &image)) {
+        const char *after = image.start;
+        for (unsigned badges = 0; badges < 16u
+             && lite_json_key(&image, "thumbnailBadgeViewModel", after, &badge);
+             badges++) {
+            char duration[YOUTUBE_LITE_METADATA_LIMIT] = {0};
+            if (lite_member_string(&badge, "text", duration,
+                                    sizeof(duration), false)) {
+                unsigned colons = 0, digits = 0;
+                bool valid = true;
+                for (const char *at = duration; *at != '\0'; at++) {
+                    if (*at >= '0' && *at <= '9') digits++;
+                    else if (*at == ':' && digits != 0 && colons < 2u) {
+                        colons++;
+                        digits = 0;
+                    } else { valid = false; break; }
+                }
+                if (valid && colons != 0 && digits == 2u) {
+                    memcpy(parsed.duration, duration, sizeof(duration));
+                    break;
+                }
+            }
+            after = badge.end;
+        }
+    }
+    lite_clamp_snippet(parsed.snippet, sizeof(parsed.snippet),
+                       YOUTUBE_LITE_SNIPPET_BUDGET);
+    *video = parsed;
+    return true;
+}
+
 enum {
     YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT = 0,
     YOUTUBE_LITE_RENDERER_VIDEO,
     YOUTUBE_LITE_RENDERER_GRID_VIDEO,
     YOUTUBE_LITE_RENDERER_COMPACT_VIDEO,
+    YOUTUBE_LITE_RENDERER_LOCKUP,
     YOUTUBE_LITE_RENDERER_DESCRIPTION_HEADER
 };
+
+static bool lite_parse_video_renderer(const YoutubeLiteSpan *renderer,
+                                      size_t kind, YoutubeLiteVideo *video)
+{
+    return kind == YOUTUBE_LITE_RENDERER_LOCKUP
+        ? lite_parse_lockup(renderer, video)
+        : lite_parse_video(renderer,
+                          kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
+                          video);
+}
 
 typedef struct {
     const char *name;
@@ -701,6 +847,7 @@ static bool lite_next_video_renderer(
         {"videoRenderer", sizeof("videoRenderer") - 1u},
         {"gridVideoRenderer", sizeof("gridVideoRenderer") - 1u},
         {"compactVideoRenderer", sizeof("compactVideoRenderer") - 1u},
+        {"lockupViewModel", sizeof("lockupViewModel") - 1u},
         {"videoDescriptionHeaderRenderer",
          sizeof("videoDescriptionHeaderRenderer") - 1u}
     };
@@ -760,10 +907,7 @@ static size_t lite_parse_videos(const char *json, size_t length,
                 &all, after, false, &renderer, &selected_kind)) break;
         after = renderer.end;
         YoutubeLiteVideo candidate;
-        if (lite_parse_video(
-                &renderer,
-                selected_kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
-                &candidate)
+        if (lite_parse_video_renderer(&renderer, selected_kind, &candidate)
             && !lite_video_duplicate(videos, count, candidate.id)) {
             videos[count++] = candidate;
         }
@@ -1482,6 +1626,75 @@ static bool lite_compact_results_requested(const char *url)
         && strcmp(layout, "compact") == 0;
 }
 
+static bool lite_topics_requested(const char *url)
+{
+    char value[8] = {0};
+    return lite_query_value(url, "tilefinch_topics", value, sizeof(value))
+        && strcmp(value, "1") == 0;
+}
+
+/* These are provider-supplied navigation categories, not fabricated trends.
+   Only destinations handled by the lightweight provider are admitted. */
+static bool lite_next_topic(YoutubeLiteSpan scope, YoutubeLiteSpan *renderer,
+                            YoutubeLiteTopic *topic)
+{
+    YoutubeLiteSpan navigation = {0}, chip = {0};
+    bool have_navigation = lite_json_key(
+        &scope, "navigationItemViewModel", NULL, &navigation);
+    bool have_chip = lite_json_key(
+        &scope, "chipCloudChipRenderer", NULL, &chip);
+    if (!have_navigation && !have_chip) return false;
+    bool is_navigation = have_navigation
+        && (!have_chip || navigation.start < chip.start);
+    *renderer = is_navigation ? navigation : chip;
+    *topic = (YoutubeLiteTopic) {0};
+    char destination[256] = {0};
+    YoutubeLiteSpan text = {0};
+    bool titled = is_navigation
+        ? lite_json_member(renderer, "text", &text)
+            && lite_member_string(&text, "content", topic->title,
+                                  sizeof(topic->title), false)
+        : lite_text_runs(renderer, "text", topic->title,
+                         sizeof(topic->title));
+    if (!titled || topic->title[0] == '\0'
+        || !lite_json_key_string(renderer, "url", destination,
+                                 sizeof(destination))) return true;
+    char resolved[256];
+    if (!tilefinch_url_resolve("https://www.youtube.com/", destination,
+                              resolved, sizeof(resolved))) return true;
+    YoutubeLiteRoute route = youtube_lite_route(resolved);
+    if ((route != YOUTUBE_LITE_ROUTE_SEARCH
+         && route != YOUTUBE_LITE_ROUTE_CHANNEL)
+        || strlen(resolved) >= sizeof(topic->url)) return true;
+    snprintf(topic->url, sizeof(topic->url), "%s", resolved);
+    return true;
+}
+
+static void lite_topic_append(YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS],
+                              size_t *count, const YoutubeLiteTopic *topic)
+{
+    if (topic->url[0] == '\0' || *count >= YOUTUBE_LITE_MAXIMUM_TOPICS) return;
+    for (size_t at = 0; at < *count; at++)
+        if (strcmp(topics[at].url, topic->url) == 0) return;
+    topics[(*count)++] = *topic;
+}
+
+static bool lite_html_topics(YoutubeLiteHtml *html,
+                             const YoutubeLiteTopic *topics, size_t count)
+{
+    if (count == 0) return lite_html_text(html,
+        "<p class=hint>Explore topics are unavailable. Search above to find videos.</p>");
+    if (!lite_html_text(html, "<h2>Explore YouTube</h2><section>")) return false;
+    for (size_t at = 0; at < count; at++) {
+        if (!lite_html_text(html, "<p><a class=more href=\"")
+            || !lite_html_escape(html, topics[at].url)
+            || !lite_html_text(html, "\">")
+            || !lite_html_escape(html, topics[at].title)
+            || !lite_html_text(html, "</a></p>")) return false;
+    }
+    return lite_html_text(html, "</section>");
+}
+
 static bool lite_html_search_intro(YoutubeLiteHtml *html, const char *query,
                                    size_t result_count)
 {
@@ -1589,7 +1802,8 @@ static bool lite_build_document_with_comments_decoded(
         route == YOUTUBE_LITE_ROUTE_SEARCH
         && comments_source != NULL && comments_length != 0;
     if (budget == NULL || url == NULL || document == NULL
-        || (!direct_search_continuation
+        || (source_length != 0 && source == NULL)
+        || (route != YOUTUBE_LITE_ROUTE_HOME && !direct_search_continuation
             && (source == NULL || source_length == 0))
         || source_length > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES
         || comments_length > YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES
@@ -1606,7 +1820,7 @@ static bool lite_build_document_with_comments_decoded(
     size_t decoded_length = 0;
     char *decoded = NULL;
     bool decoded_borrowed = false;
-    if (route != YOUTUBE_LITE_ROUTE_HOME) {
+    if (route != YOUTUBE_LITE_ROUTE_HOME || lite_topics_requested(url)) {
         bool search_continuation =
             route == YOUTUBE_LITE_ROUTE_SEARCH
             && comments_source != NULL && comments_length != 0;
@@ -1629,7 +1843,8 @@ static bool lite_build_document_with_comments_decoded(
     }
     bool description_requested = route == YOUTUBE_LITE_ROUTE_WATCH
         && lite_description_view_requested(url);
-    size_t result_count = decoded == NULL || description_requested ? 0 : lite_parse_videos(
+    size_t result_count = decoded == NULL || description_requested
+        || route == YOUTUBE_LITE_ROUTE_HOME ? 0 : lite_parse_videos(
         decoded, decoded_length, videos, YOUTUBE_LITE_MAXIMUM_RESULTS);
     size_t display_count = route == YOUTUBE_LITE_ROUTE_WATCH
         && result_count > 6 ? 6 : result_count;
@@ -1704,6 +1919,23 @@ static bool lite_build_document_with_comments_decoded(
         ok = lite_html_text(
             &html, "<section class=hero>"
                    "<h1>Watch YouTube on this device</h1></section>");
+        if (ok && lite_topics_requested(url)) {
+            YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS] = {0};
+            size_t count = 0;
+            YoutubeLiteSpan scope = {
+                decoded, decoded == NULL ? NULL : decoded + decoded_length
+            };
+            YoutubeLiteSpan renderer;
+            YoutubeLiteTopic topic;
+            for (size_t walked = 0; decoded != NULL && walked < 256u
+                 && count < YOUTUBE_LITE_MAXIMUM_TOPICS
+                 && lite_next_topic(scope, &renderer, &topic); walked++) {
+                lite_topic_append(topics, &count, &topic);
+                scope.start = renderer.end;
+            }
+            display_count = count;
+            ok = lite_html_topics(&html, topics, count);
+        }
     } else if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH) {
         ok = lite_html_search_intro(&html, query, result_count);
     } else if (ok && route == YOUTUBE_LITE_ROUTE_CHANNEL) {
@@ -1886,6 +2118,8 @@ typedef struct {
     size_t emit_index;
     YoutubeLiteVideo videos[YOUTUBE_LITE_MAXIMUM_RESULTS];
     size_t video_count;
+    YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS];
+    size_t topic_count;
     YoutubeLiteWatch watch;
     YoutubeLiteComment comments[YOUTUBE_LITE_MAXIMUM_COMMENTS];
     size_t comment_count;
@@ -2027,8 +2261,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
         work->decoded = decoded;
         work->decoded_length = decoded_length;
     }
-    if (route != YOUTUBE_LITE_ROUTE_HOME
-        && work->decoded != NULL && work->decoded_length != 0) {
+    if (work->decoded != NULL && work->decoded_length != 0) {
         work->phase = YOUTUBE_LITE_BUILD_VIDEOS;
     } else {
         lite_build_after_videos(work);
@@ -2038,6 +2271,26 @@ static YoutubeLiteBuildWork *lite_build_work_create(
 
 static void lite_build_video_pump(YoutubeLiteBuildWork *work)
 {
+    if (work->route == YOUTUBE_LITE_ROUTE_HOME) {
+        if (work->scan_offset >= work->decoded_length
+            || work->topic_count >= YOUTUBE_LITE_MAXIMUM_TOPICS) {
+            lite_build_after_videos(work);
+            return;
+        }
+        YoutubeLiteSpan scope = lite_build_window(
+            work->decoded, work->decoded_length, work->scan_offset);
+        YoutubeLiteSpan renderer;
+        YoutubeLiteTopic topic;
+        if (lite_next_topic(scope, &renderer, &topic)) {
+            lite_topic_append(work->topics, &work->topic_count, &topic);
+            lite_build_seek(work, (size_t) (renderer.end - work->decoded));
+        } else if (scope.end == work->decoded + work->decoded_length) {
+            lite_build_after_videos(work);
+        } else {
+            lite_build_seek(work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
+        }
+        return;
+    }
     if (work->scan_offset >= work->decoded_length
         || (work->video_count >= YOUTUBE_LITE_MAXIMUM_RESULTS
             && work->route != YOUTUBE_LITE_ROUTE_SEARCH
@@ -2117,10 +2370,8 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
             return;
         }
         YoutubeLiteVideo parsed;
-        if (!work->description_requested && lite_parse_video(
-                &renderer,
-                kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
-                &parsed)
+        if (!work->description_requested
+            && lite_parse_video_renderer(&renderer, kind, &parsed)
             && !lite_video_duplicate(
                 work->videos, work->video_count, parsed.id)) {
             work->videos[work->video_count++] = parsed;
@@ -2276,7 +2527,9 @@ static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
     if (work->route == YOUTUBE_LITE_ROUTE_HOME) {
         return lite_html_text(
             html, "<section class=hero>"
-                  "<h1>Watch YouTube on this device</h1></section>");
+                  "<h1>Watch YouTube on this device</h1></section>")
+            && (!lite_topics_requested(work->url)
+                || lite_html_topics(html, work->topics, work->topic_count));
     }
     if (work->route == YOUTUBE_LITE_ROUTE_SEARCH) {
         return lite_html_search_intro(
@@ -2503,7 +2756,8 @@ static bool lite_build_work_take_document(
         .html = work->html.data,
         .html_length = work->html.length,
         .source_bytes = work->source_bytes + work->supplemental_length,
-        .result_count = display,
+        .result_count = work->route == YOUTUBE_LITE_ROUTE_HOME
+            ? work->topic_count : display,
         .route = work->route
     };
     work->html.data = NULL;
@@ -2942,7 +3196,8 @@ static void lite_load_after_identity(YoutubeLiteLoadJob *job)
     bool search_continuation =
         job->route == YOUTUBE_LITE_ROUTE_SEARCH
         && job->supplemental_requested;
-    job->phase = job->route != YOUTUBE_LITE_ROUTE_HOME
+    job->phase = (job->route != YOUTUBE_LITE_ROUTE_HOME
+                   || lite_topics_requested(job->url))
             && !search_continuation
         ? YOUTUBE_LITE_JOB_DECODE : YOUTUBE_LITE_JOB_PREPARE;
     job->fact_scan_offset = 0;
@@ -3438,6 +3693,17 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     snprintf(job->url, sizeof(job->url), "%s", url);
     snprintf(job->language, sizeof(job->language), "%s",
              lite_preferred_language());
+    if (route == YOUTUBE_LITE_ROUTE_HOME && !lite_topics_requested(url)) {
+        /* The search form is local. Optional discovery gets a separate idle
+           job after first paint; it must not delay entering a query. */
+        if (!youtube_lite_build_document(budget, url, NULL, 0,
+                &job->document, error, error_size)) {
+            youtube_lite_load_destroy(job);
+            return NULL;
+        }
+        job->status = YOUTUBE_LITE_LOAD_SUCCEEDED;
+        return job;
+    }
     if (!lite_fetch_url(url, route, job->fetch_url)) {
         youtube_error(error, error_size, "invalid YouTube search query");
         youtube_lite_load_destroy(job);
@@ -3808,7 +4074,8 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
                     "continuation/configuration missing or request rejected\n");
             }
             job->phase =
-                job->route != YOUTUBE_LITE_ROUTE_HOME
+                (job->route != YOUTUBE_LITE_ROUTE_HOME
+                 || lite_topics_requested(job->url))
                 && job->decoded == NULL
                 && job->source.data != NULL
                 && !job->decode_attempted
@@ -4078,6 +4345,35 @@ bool youtube_lite_load(
     }
     youtube_lite_load_destroy(job);
     return loaded;
+}
+
+bool youtube_lite_home_set_search_value(YoutubeLiteDocument *document,
+                                      const char *value, size_t length)
+{
+    if (document == NULL || document->budget == NULL || document->html == NULL
+        || document->route != YOUTUBE_LITE_ROUTE_HOME || value == NULL
+        || length >= YOUTUBE_LITE_QUERY_LIMIT
+        || memchr(value, '\0', length) != NULL) return false;
+    const char *input = strstr(document->html, "<input id=yt-search ");
+    const char *start = input == NULL ? NULL : strstr(input, " value=\"");
+    if (start == NULL) return false;
+    start += sizeof(" value=\"") - 1u;
+    const char *end = strchr(start, '"');
+    if (end == NULL) return false;
+    YoutubeLiteHtml html = {.budget = document->budget};
+    bool okay = lite_html_bytes(&html, document->html,
+                               (size_t) (start - document->html))
+        && lite_html_escape_bytes(&html, value, length)
+        && lite_html_bytes(&html, end,
+                           document->html_length - (size_t) (end - document->html));
+    if (!okay) {
+        budget_free(document->budget, html.data);
+        return false;
+    }
+    budget_free(document->budget, document->html);
+    document->html = html.data;
+    document->html_length = html.length;
+    return true;
 }
 
 void youtube_lite_document_destroy(YoutubeLiteDocument *document)

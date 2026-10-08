@@ -2,7 +2,9 @@
 
 These pages are current subsystem contracts and reproducible workflows,
 organized by the part of the system an engineer is changing. Investigation
-logs and raw evidence live outside the public repository. Top-level contracts
+logs, performance and memory experiment ledgers, and raw evidence are kept
+locally and in the private development archive, outside the public repository.
+Top-level contracts
 remain authoritative when a focused manual is narrower.
 
 ## PSP constraints and qualification
@@ -10,9 +12,7 @@ remain authoritative when a focused manual is narrower.
 - [PSPLINK_DEV_LOOP.md](PSPLINK_DEV_LOOP.md) — bounded build/flash/run/log workflow for a real PSP.
 - [DEVICE_QUALIFICATION.md](DEVICE_QUALIFICATION.md) — which claims host, PPSSPP, and hardware can prove.
 - [PSP_ENVELOPE.md](PSP_ENVELOPE.md) — memory, CPU-slice, executable-size, and storage budgets.
-- [MEMORY_EXPERIMENTS.md](MEMORY_EXPERIMENTS.md) — accepted and rejected memory experiments, with explicit conditions for revisiting them.
 - [PERF_JOURNEYS.md](PERF_JOURNEYS.md) — deterministic PPSSPP performance journeys (trace replay at 111 MHz) and their lower-only baselines.
-- [PERFORMANCE_LEDGER.md](PERFORMANCE_LEDGER.md) — selected host and device measurements, accepted improvements, rejected approaches and measurement limits.
 - [BUILD_SPEED_EXPERIMENT.md](BUILD_SPEED_EXPERIMENT.md) — the measured targeted host incremental build-speed experiment (base `2ad0b27c`).
 - [NATIVE_TIER_INVESTIGATION.md](NATIVE_TIER_INVESTIGATION.md) — native-tier feasibility findings, the decision to park the research and conditions for revisiting it; not a shipping feature.
 

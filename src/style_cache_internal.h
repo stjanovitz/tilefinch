@@ -102,15 +102,24 @@ typedef struct StyleAncestorBloomCache {
 #define STYLE_RETAINED_MATCH_CAPACITY 32768u
 #define STYLE_RETAINED_MATCH_PROBE_LIMIT 8u
 #define STYLE_RETAINED_AFFECTED_RULE_LIMIT 64u
+_Static_assert(STYLE_RETAINED_MATCH_CAPACITY <= UINT16_MAX,
+               "Retained match slots must fit index + 1 in uint16_t");
 typedef struct {
     const lxb_dom_node_t *node;
     uint16_t rules[STYLE_RETAINED_MATCH_RULE_LIMIT];
     uint8_t count;
     uint8_t pseudo;
+    uint16_t slot; /* Hash bucket while live, next free record otherwise. */
 } StyleRetainedMatchEntry;
 typedef struct StyleRetainedMatches {
     Budget *budget;
+    /* Keep the original hash/probe space, but reserve payload only for
+       populated slots. Zero is empty; other values are dense index + 1. */
+    uint16_t *slots;
     StyleRetainedMatchEntry *entries;
+    size_t entry_count, entry_capacity;
+    uint16_t free_entry;
+    bool growth_refused;
     size_t occupied;
     size_t hits, misses, stores;
     size_t token_invalidations, token_fallbacks, token_dropped,
@@ -135,6 +144,9 @@ void style_retained_matches_invalidate_rules(
     StyleRetainedMatches *table, const Stylesheet *sheet,
     const uint32_t *rules, size_t count);
 StyleRetainedMatches *style_retained_matches_create(Budget *budget);
+/* Match lists cannot retain geometry-dependent query admission. Use the
+   same gate for allocation and lookup; eligibility can change with CSS. */
+bool style_retained_matches_supported(const Stylesheet *sheet);
 void style_retained_matches_destroy(StyleRetainedMatches *table);
 void style_retained_matches_clear(StyleRetainedMatches *table);
 /* Drop every entry whose element lies inside `scope` (inclusive). */

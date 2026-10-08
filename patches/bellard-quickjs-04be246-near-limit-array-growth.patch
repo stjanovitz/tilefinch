@@ -52,7 +52,7 @@
      if (unlikely(ctx->rt->fast_array_byte_limit != 0)
          && sizeof(JSValue) * (uint64_t) new_len
                 > ctx->rt->fast_array_byte_limit) {
-@@ -10097,12 +10119,15 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+@@ -10097,12 +10119,25 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
                 <= ctx->rt->malloc_ctx.malloc_state.malloc_limit) {
          headroom = ctx->rt->malloc_ctx.malloc_state.malloc_limit
              - ctx->rt->malloc_ctx.malloc_state.malloc_size;
@@ -69,7 +69,18 @@
 +               capacity turns near-limit growth into an avoidable full-heap
 +               pause. The array and pushed value remain rooted by the active
 +               interpreter frame. */
-             JS_RunGC(ctx->rt);
+-            JS_RunGC(ctx->rt);
++            /* Realloc-only growth must honor the same pacing as object
++               allocation. A starved growable realm can then reach its
++               allocator's on-demand growth instead of marking an unchanged
++               graph again. With no embedding hook retain the original
++               exhaustion collection for upstream embedders. */
++            if (ctx->rt->gc_pacing_hook)
++                js_trigger_gc_cause(ctx->rt,
++                    (size_t)(minimum_bytes - current_bytes),
++                    JS_GC_CAUSE_ARRAY_GROWTH);
++            else
++                JS_RunGC(ctx->rt);
              headroom = ctx->rt->malloc_ctx.malloc_state.malloc_size
                      <= ctx->rt->malloc_ctx.malloc_state.malloc_limit
 @@ -10113,12 +10138,45 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)

@@ -219,6 +219,7 @@ typedef enum {
     BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
     BROWSER_GLYPH_LANGUAGE_ARABIC,
     BROWSER_GLYPH_LANGUAGE_HEBREW,
+    BROWSER_GLYPH_LANGUAGE_DEVANAGARI,
     BROWSER_GLYPH_LANGUAGE_COUNT
 } BrowserGlyphLanguage;
 
@@ -233,6 +234,9 @@ typedef struct {
 } BrowserProfileSuggestion;
 
 BrowserProfile *browser_profile_create(Budget *budget);
+/* Native interface locale; independent of page glyphs and Accept-Language. */
+unsigned browser_profile_ui_language(const BrowserProfile *profile);
+void browser_profile_set_ui_language(BrowserProfile *profile, unsigned language);
 void browser_profile_destroy(BrowserProfile *profile);
 bool browser_profile_load(BrowserProfile *profile, const char *path);
 bool browser_profile_load_without_content_blocker_sites(
@@ -264,6 +268,8 @@ bool browser_profile_tls_session_persistence(
    preference is enabled. Fatal startup failures retain a one-shot fallback. */
 bool browser_profile_save_diagnostic_reports(
     const BrowserProfile *profile);
+bool browser_profile_wifi_diagnostics(const BrowserProfile *profile);
+bool browser_profile_youtube_topics(const BrowserProfile *profile);
 /* Settings > Device & storage > Site data & storage > Keep compiled
    scripts: the persistent compiled-script tier. Off by default. */
 bool browser_profile_keep_compiled_scripts(const BrowserProfile *profile);
@@ -414,6 +420,8 @@ void browser_profile_set_tls_session_persistence(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_save_diagnostic_reports(
     BrowserProfile *profile, bool enabled);
+void browser_profile_set_wifi_diagnostics(BrowserProfile *profile, bool enabled);
+void browser_profile_set_youtube_topics(BrowserProfile *profile, bool enabled);
 void browser_profile_set_keep_compiled_scripts(BrowserProfile *profile,
                                                bool enabled);
 void browser_profile_set_javascript_enabled(

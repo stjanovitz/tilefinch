@@ -5,9 +5,10 @@ rewriting DOM strings. Ordinary English and other LTR-only paragraphs retain
 the existing text path; a parser census and stylesheet summary keep them out
 of bidi analysis entirely.
 
-This contract covers page content. Browser chrome localization, a general
-text-selection UI, and complex-script shaping beyond the Arabic family are
-not part of the current milestone.
+This contract covers page content. Arabic browser labels reuse the same
+shaping and visual-order helpers once at translation load; they do not rewrite
+the page DOM or mirror panel geometry. A general text-selection UI and general
+complex-script shaping beyond the Arabic family are not part of this contract.
 
 ## Pipeline
 
@@ -69,7 +70,7 @@ text, links, or hit geometry.
 ## Glyph components
 
 Arabic and Hebrew are optional signed language packs, alongside Japanese,
-Chinese, Korean, Cyrillic, and Extended Latin. The default embedded Latin and
+Chinese, Korean, Cyrillic, Extended Latin and Devanagari. The default embedded Latin and
 fallback glyphs remain available through missing, damaged, interrupted, or
 removed components. Selecting a language keeps that pack attached; the parser
 may lazily attach at most two other installed language packs when the page
@@ -80,6 +81,14 @@ The Arabic pack includes U+0600–U+08FF base/mark coverage and the contextual
 presentation forms emitted by the shaper. The Hebrew pack includes Hebrew
 letters, marks, and presentation forms. Both use the existing TFGF/TFGM signed
 component format and cause no pack enumeration or payload read at boot.
+
+Devanagari uses a bounded pre-shaped cluster inventory generated offline with
+HarfBuzz/FreeType, consumed by longest-sequence matching in the existing pack
+format. It covers current Hindi interface labels and common syllables, not
+every possible Indic shaping sequence. No runtime shaping stack is linked.
+Downscaled monochrome pack cells average their source footprint at glyph
+creation so small vowel marks and thin strokes are not dropped by a nearest
+sample; retained painting still uses the same cached glyph bitmap.
 
 ### In-page install offer
 

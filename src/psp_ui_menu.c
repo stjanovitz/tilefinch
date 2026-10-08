@@ -96,6 +96,18 @@ bool psp_ui_page_work_paused(const PspUiState *ui)
         && !psp_ui_screen_is_native_surface(ui->screen);
 }
 
+bool psp_ui_update_priority_with_page_queue(PspUiState *ui,
+    const PspUiInput *input, uint8_t *queued_page_inputs)
+{
+    /* Only presentation state is touched here, regardless of queue depth. */
+    PspUiScreen before = ui == NULL ? PSP_UI_SCREEN_PAGE : ui->screen;
+    bool handled = psp_ui_update_priority(ui, input);
+    if (handled && queued_page_inputs != NULL
+        && before == PSP_UI_SCREEN_PAGE && ui->screen != before)
+        *queued_page_inputs = 0;
+    return handled;
+}
+
 void psp_ui_adopt_priority(PspUiState *ui, const PspUiState *snapshot,
                            PspUiScreen original_screen, bool original_chrome_visible)
 {

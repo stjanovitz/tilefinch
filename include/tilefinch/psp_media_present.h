@@ -69,7 +69,12 @@ typedef struct {
     float y0;
     float x1;
     float y1;
+    bool clockwise;
 } PspMediaPresentQuad;
+
+typedef struct {
+    float u, v, x, y, z;
+} PspMediaPresentVertex;
 
 typedef struct {
     /* The video rectangle, in screen pixels. */
@@ -128,6 +133,21 @@ bool psp_media_present_plan(
     int source_width, int source_height, int source_stride_pixels,
     int screen_width, int screen_height);
 
+/* Fit into a portrait logical panel, then rotate its geometry clockwise into
+   the physical landscape panel. Texture storage and ownership do not change. */
+bool psp_media_present_plan_clockwise(
+    PspMediaPresentPlan *plan,
+    int source_width, int source_height, int source_stride_pixels,
+    int screen_width, int screen_height);
+/* Explicit central 9:16 crop for pillarboxed vertical content. The original
+   decoded surface stays intact; only the GE texture coordinates change. */
+bool psp_media_present_plan_portrait_crop(
+    PspMediaPresentPlan *plan,
+    int source_width, int source_height, int source_stride_pixels,
+    int screen_width, int screen_height);
+void psp_media_present_quad_vertices(
+    const PspMediaPresentQuad *quad, PspMediaPresentVertex vertices[4]);
+
 /*
  * Derive the wide-only two-strip presentation described above.
  *
@@ -185,10 +205,11 @@ typedef struct {
  * of the same memory slows with it. Copying that surface into EDRAM first,
  * where the engine is fast, brings the same draw to 6.8ms.
  *
- * `staged` says which: true means `pixels` is a copy of the picture placed at
- * the origin of an EDRAM buffer (the shipping 240p case); false means `pixels`
- * is the source surface itself, read where it lies, with the quad's column
- * offset applied (the 360p split, which does not fit one staging buffer). The
+ * `staged` says which: for one quad, true means `pixels` starts at the quad's
+ * source column in an EDRAM buffer; the column offset is already copied and
+ * must not be applied twice. Wide multi-quad strips retain their full source
+ * pitch and column offsets. False means `pixels` is the original source
+ * surface, with the quad's column offset applied by the graphics engine. The
  * copy is gated on the picture changing rather than on the present, because it
  * is per-picture overhead -- see psp_media_present_stage. An earlier version
  * reordered the copy into the texture unit's swizzled block layout; a device
@@ -224,10 +245,9 @@ size_t psp_media_present_stage_bytes(int texture_width, int rows);
 
 /*
  * True when `plan` can be drawn from one EDRAM staging buffer of `capacity`
- * bytes: one quad anchored at the surface origin, whose texture fits. A split
- * wide-frame plan does not qualify -- its second texture starts part way along
- * the source rows, an offset a single origin-anchored staging buffer cannot
- * hold -- and is drawn from the source surface in main RAM instead.
+ * bytes: one quad whose (possibly cropped) texture fits. Its source column
+ * becomes the stage's origin; the UVs are already relative to that column.
+ * Split wide-frame plans instead use the guarded two-strip staging path.
  */
 bool psp_media_present_stage_fits(
     const PspMediaPresentPlan *plan, int source_height, size_t capacity);
@@ -288,6 +308,19 @@ bool psp_media_present_ge_submit(
     const PspMediaPresentPlan *plan, const PspMediaPresentTexture *texture,
     uint32_t *destination, PspMediaPresentGeCost *cost);
 bool psp_media_present_ge_complete(PspMediaPresentGeCost *cost);
+
+/* Pack a strided decoded picture into the bounded EDRAM texture, without a
+ * CPU row-copy/writeback pass. Synchronous: both buffers remain borrowed until
+ * this returns. The caller supplies clean source pixels and an admitted stage.
+ * Host builds refuse, preserving the exact CPU fallback. */
+bool psp_media_present_ge_stage_rows(
+    void *destination, const void *source, int source_stride_pixels,
+    int texture_width, int rows);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Same-binary comparison of the copy only; no change to decoder/scanout. */
+void psp_media_present_ge_stage_rows_enabled(bool enabled);
+uint32_t psp_media_present_ge_stage_rows_copies(void);
+#endif
 
 /* Draw one retained opaque RGB565 UI rectangle into an RGBA8888 video back
  * buffer. This is deliberately narrower than a general compositor: one
@@ -637,15 +670,16 @@ typedef struct {
     /* Which texture layout the case drew from, chosen exactly as playback
        chooses it. */
     bool staged;
+    bool clockwise;
+    bool portrait_crop;
     /* And which decoded-output slot's surface it drew from, so a failure names
        the address rather than only the geometry. */
     unsigned slot;
     bool passed;
 } PspMediaPresentProbeCase;
 
-/* Two geometries -- the 240p stream in its 512-pixel stride and the 360p one
-   that must be split across two quads -- from each slot. */
-#define PSP_MEDIA_PRESENT_PROBE_GEOMETRIES 2u
+/* Landscape 240p/360p, tall 240p in both orientations, and central crops. */
+#define PSP_MEDIA_PRESENT_PROBE_GEOMETRIES 6u
 #define PSP_MEDIA_PRESENT_PROBE_CASES \
     (PSP_MEDIA_PRESENT_PROBE_GEOMETRIES * PSP_MEDIA_PRESENT_PROBE_SLOTS)
 

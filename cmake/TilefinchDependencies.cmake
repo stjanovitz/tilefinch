@@ -234,8 +234,14 @@ set(PSP_BROWSER_LEXBOR_TOKENIZER_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-compact-tokenizer-storage.patch")
 set(PSP_BROWSER_LEXBOR_MRAW_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-mraw-shrink-offset.patch")
+set(PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-fragment-clone-storage.patch")
 set(PSP_BROWSER_STB_JPEG_SCALE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-jpeg-scaled-idct.patch")
+set(PSP_BROWSER_WEBP_ALPHA_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/libwebp-v1.6.0-byte-alpha-history.patch")
+set(PSP_BROWSER_WEBP_ALPHA_FRAME_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/libwebp-v1.6.0-remove-unused-alpha-frame.patch")
 set(PSP_BROWSER_NANOSVG_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-bounded-fixed-edges.patch")
 set(PSP_BROWSER_NANOSVG_GEOMETRY_PATCH
@@ -258,7 +264,10 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
     "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
     "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
+    "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
     "${PSP_BROWSER_STB_JPEG_SCALE_PATCH}"
+    "${PSP_BROWSER_WEBP_ALPHA_PATCH}"
+    "${PSP_BROWSER_WEBP_ALPHA_FRAME_PATCH}"
     "${PSP_BROWSER_NANOSVG_PATCH}"
     "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
     "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}"
@@ -374,7 +383,8 @@ endif()
 foreach(lexbor_patch IN ITEMS
         "${PSP_BROWSER_LEXBOR_PATCH}" "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
         "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
-        "${PSP_BROWSER_LEXBOR_MRAW_PATCH}")
+        "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
+        "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
@@ -409,9 +419,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-        "6570a5234cbc4c4aef83e3f1580cf52c1502aa1cda62ab255107631469c03ba8")
+    "ee698a0ab8f59179f836a8094935c147253f1c8ce96c2913f2c4eab2ee70a82f")
     set(tilefinch_quickjs_vendor_h_sha256
-        "3b405af189281669e35d9177547ac36c89464bb6120523d53ea64170965a367d")
+        "22ce1f238eb5bc0daddbda515d57441d71f7b69627654eaff1c3b697a5087f13")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
     if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -492,19 +502,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "503177c74e8c6e4683f009c30cc925bea26b58030ac2cf4c2c80aea4cca4ba77")
+            "24b0d275e949db9dd91577a4ac1b5cfc031d17d172fb06d94fea304a9aac39ab")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "8d0aca7fe92288981aa7427827e7823b3d34d0ce0e18b2cf0311bd0cf3b1be18")
+            "114df4fb6b4654772ae7d0ef6874481a380efcb1aef2f1d4b19c9910066ada7f")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "494c98afa394cb099414aea38414bd5284468c91fc82d694af75c3a457e193d9")
+            "8a09498c4dfe501c1c7951f400da8ec5a7f60c9043a30d7bfaeb5d39c6b70513")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "bca2b483166080e7e5297f3d206020790104a0f80f49e4344ae84b05b5b3943c")
+            "df89b8b97db007510ec7dc5e6b48c2e72b1f2c5ccd333401bd7af7c4d3bdb1a8")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "d02bc841e1eb2d9861ec4cc04551889c9e24eadd22ea96399a68ffa4ef907d00")
+            "0af773aec7d8311c7a6307d560d20939ec8063457148a7f02db1a45cfec4ad7c")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "94d67b256b6ffa6c58d4a78689d2030720d95baf193f4db27bf94c4420583494")
+            "bb5256d6c2c6360343b9fbc31456a66257e2430218eaab299fe2369d09b141c9")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "79c0393feddf90d78d4d8bd8a83eff6e0f1bcf45739fd9544a54a8bed6452d41")
+            "767026fa9e172de1932800be485b2ab1aa9c529e84099da083de370e465cbfd3")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -553,7 +563,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "23965fca3eb0c0f8e977ce23d11bac3180d35d9e841bc01b20ab05193e698e9b")
+                   "707934c64c3d98be50fb0200b9e44e988e9b4756d71f501ec5a539a0d1005a9b")
                 message(FATAL_ERROR
                     "Reversing the QuickJS default stack reached "
                     "${tilefinch_quickjs_variant_baseline}, not the pinned "
@@ -1099,6 +1109,26 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(libwebp)
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DPATCH_SOURCE_DIR=${libwebp_SOURCE_DIR}"
+        "-DPATCH_FILE=${PSP_BROWSER_WEBP_ALPHA_PATCH}"
+        "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+        -P "${PSP_BROWSER_APPLY_PATCH_SCRIPT}"
+    RESULT_VARIABLE webp_patch_result)
+if(NOT webp_patch_result EQUAL 0)
+    message(FATAL_ERROR "Could not apply bounded WebP alpha-history patch")
+endif()
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DPATCH_SOURCE_DIR=${libwebp_SOURCE_DIR}"
+        "-DPATCH_FILE=${PSP_BROWSER_WEBP_ALPHA_FRAME_PATCH}"
+        "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+        -P "${PSP_BROWSER_APPLY_PATCH_SCRIPT}"
+    RESULT_VARIABLE webp_frame_patch_result)
+if(NOT webp_frame_patch_result EQUAL 0)
+    message(FATAL_ERROR "Could not remove unused WebP frame alpha reservation")
+endif()
 # Upstream always declares its encoder libraries even when every encoder tool
 # is disabled. Tilefinch links only webpdecoder; keep the unrelated encoder,
 # demux, and sharp-YUV targets out of the ordinary `all` build so adding WebP

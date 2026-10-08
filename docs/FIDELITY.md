@@ -208,7 +208,7 @@ A fidelity score covers visual structure only, within these limits:
 
 Timing, interactivity, and layout-cost evidence gathered alongside fidelity
 work, such as the long-article layout cost and the live input runs, is
-recorded in the [performance ledger](engineering/PERFORMANCE_LEDGER.md).
+retained in private investigation records rather than the public source tree.
 
 ## MDN and Guardian references
 

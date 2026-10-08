@@ -1,3 +1,45 @@
+    puts("test: fragment clones retain their complete native interface");
+    size_t fragment_clone_baseline = budget.current;
+    static const char fragment_clone_page[] =
+        "<!doctype html><body><template id=source><p>Clone text</p></template>";
+    PocDocument fragment_clone_document = {0};
+    CHECK(document_parse(&fragment_clone_document, &budget,
+                         fragment_clone_page, sizeof(fragment_clone_page) - 1u,
+                         17));
+    lxb_dom_node_t *fragment_template = find_id(
+        lxb_dom_interface_node(fragment_clone_document.html), "source");
+    CHECK(fragment_template != NULL);
+    lxb_dom_document_fragment_t *fragment_source =
+        lxb_html_interface_template(fragment_template)->content;
+    CHECK(fragment_source != NULL && fragment_source->host != NULL);
+    for (unsigned deep = 0; deep < 2u; deep++) {
+        lxb_dom_node_t *fragment_clone = lxb_dom_node_clone(
+            lxb_dom_interface_node(fragment_source), deep != 0);
+        CHECK(fragment_clone != NULL
+              && fragment_clone->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT);
+        /* Check storage before reading the derived interface. A generic
+           Node allocation cannot represent a DocumentFragment's host. */
+        CHECK(lexbor_mraw_data_size(fragment_clone)
+              >= sizeof(lxb_dom_document_fragment_t));
+        CHECK(lxb_dom_interface_document_fragment(fragment_clone)->host == NULL
+              && fragment_clone->parent == NULL
+              && fragment_clone->owner_document
+                     == fragment_source->node.owner_document);
+        CHECK((fragment_clone->first_child != NULL) == (deep != 0));
+        if (deep != 0) {
+            CHECK(fragment_clone->first_child != fragment_source->node.first_child
+                  && fragment_clone->first_child->parent == fragment_clone);
+            size_t cloned_text_length = 0;
+            const char *cloned_text = document_text_data(
+                fragment_clone->first_child->first_child, &cloned_text_length);
+            CHECK(cloned_text != NULL && cloned_text_length == 10u
+                  && memcmp(cloned_text, "Clone text", 10u) == 0);
+        }
+        lxb_dom_node_destroy_deep(fragment_clone);
+    }
+    document_destroy(&fragment_clone_document);
+    CHECK(budget.current == fragment_clone_baseline);
+
     puts("test: style/layout");
     CHECK(stylesheet_build(&sheet, &budget, &document, 480));
     CHECK(sheet.count >= 3);

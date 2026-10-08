@@ -170,6 +170,17 @@ static void psp_app_build_diagnostic_qr(
         paths->sources[at].name = names[at];
         paths->sources[at].path = paths->paths[at];
     }
+    const char *wifi = psp_wifi_diagnostic_report();
+    if (wifi[0] != '\0') {
+        /* The current Wi-Fi failure takes priority over the oldest crash
+           source. QR owns its bytes; this writes no Memory Stick file. */
+        for (size_t at = TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT - 1u; at > 0; at--)
+            paths->sources[at] = paths->sources[at - 1u];
+        paths->sources[0] = (TilefinchDiagnosticSource) {
+            .name = "tilefinch-wifi.txt", .memory = wifi,
+            .memory_size = strlen(wifi)
+        };
+    }
     if (!paths_valid) {
         free(paths);
         psp_ui_show_status(

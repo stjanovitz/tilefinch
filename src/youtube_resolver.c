@@ -626,13 +626,16 @@ static bool youtube_mime_has_exact_codec(
 /*
  * The firmware path is intentionally narrower than generic AVC:
  * Baseline is admitted only at PSP-screen geometry, Main is admitted through
- * 640x360, and both stop at level 3.0. The optional software path adds High
+ * 640x360 or bounded 272x480 portrait, and both stop at level 3.0.
+ * The optional software path adds High
  * profile only through its device-proven 432x240 ceiling.
  */
 static bool youtube_psp_avc_codec_supported(
     const char *mime, int width, int height)
 {
-    if (mime == NULL || width <= 0 || height <= 0) return false;
+    if (mime == NULL || width <= 0 || height <= 0
+        || !media_h264_psp_dimensions_supported(
+               (unsigned) width, (unsigned) height)) return false;
     for (const char *at = mime; (at = strstr(at, "avc1.")) != NULL; at++) {
         unsigned char before = at == mime ? '\0' : (unsigned char) at[-1];
         bool left_boundary = at == mime || before == '"' || before == ','
@@ -679,12 +682,19 @@ static unsigned youtube_video_route_rank(const YoutubeFormat *format)
         : route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION ? 1u : 0u;
 }
 
+static int youtube_video_quality(const YoutubeFormat *format)
+{
+    return format->width < format->height ? format->width : format->height;
+}
+
 static bool youtube_video_format_better(
     const YoutubeFormat *candidate, const YoutubeFormat *selected)
 {
     if (selected->url[0] == '\0') return true;
-    if (candidate->height != selected->height)
-        return candidate->height > selected->height;
+    int candidate_quality = youtube_video_quality(candidate);
+    int selected_quality = youtube_video_quality(selected);
+    if (candidate_quality != selected_quality)
+        return candidate_quality > selected_quality;
     unsigned candidate_rank = youtube_video_route_rank(candidate);
     unsigned selected_rank = youtube_video_route_rank(selected);
     if (candidate_rank != selected_rank) return candidate_rank > selected_rank;
@@ -697,7 +707,7 @@ static bool youtube_format_supported(const YoutubeFormat *format,
     return format->url[0] != '\0'
         && format->content_length != 0
         && format->width > 0 && format->height > 0
-        && format->height <= maximum_height
+        && youtube_video_quality(format) <= maximum_height
         && strstr(format->mime, "video/mp4") != NULL
         && youtube_psp_avc_codec_supported(
             format->mime, format->width, format->height)
@@ -711,7 +721,7 @@ static bool youtube_video_format_supported(
     return format->url[0] != '\0'
         && format->content_length != 0
         && format->width > 0 && format->height > 0
-        && format->height <= maximum_height
+        && youtube_video_quality(format) <= maximum_height
         && strstr(format->mime, "video/mp4") != NULL
         && youtube_psp_avc_codec_supported(
             format->mime, format->width, format->height)
@@ -1526,7 +1536,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     if (adaptive_video->url[0] != '\0'
         && selected_audio->url[0] != '\0'
         && (!progressive_delivery_is_sized
-            || adaptive_video->height >= selected->height)) {
+            || youtube_video_quality(adaptive_video)
+                >= youtube_video_quality(selected))) {
         *selected = *adaptive_video;
     } else {
         memset(selected_audio, 0, sizeof(*selected_audio));
@@ -1670,20 +1681,26 @@ bool youtube_watch_url_video_id(
     } else if (youtube_host_is(&url, "youtube.com")
                || youtube_host_is(&url, "www.youtube.com")
                || youtube_host_is(&url, "m.youtube.com")) {
-        if (!url.has_query) return false;
-        const char *query = url.value + url.query_offset;
-        const char *query_end = query + url.query_length;
-        while (query < query_end) {
-            const char *field_end = memchr(
-                query, '&', (size_t) (query_end - query));
-            if (field_end == NULL) field_end = query_end;
-            if ((size_t) (field_end - query) > 2u
-                && query[0] == 'v' && query[1] == '=') {
-                start = query + 2;
-                end = field_end;
-                break;
+        const char *path = url.value + url.path_offset;
+        if (url.path_length > 8u && memcmp(path, "/shorts/", 8u) == 0) {
+            start = path + 8u;
+            end = path + url.path_length;
+        } else {
+            if (!url.has_query) return false;
+            const char *query = url.value + url.query_offset;
+            const char *query_end = query + url.query_length;
+            while (query < query_end) {
+                const char *field_end = memchr(
+                    query, '&', (size_t) (query_end - query));
+                if (field_end == NULL) field_end = query_end;
+                if ((size_t) (field_end - query) > 2u
+                    && query[0] == 'v' && query[1] == '=') {
+                    start = query + 2;
+                    end = field_end;
+                    break;
+                }
+                query = field_end < query_end ? field_end + 1 : query_end;
             }
-            query = field_end < query_end ? field_end + 1 : query_end;
         }
     }
     if (start == NULL || end == NULL || start == end

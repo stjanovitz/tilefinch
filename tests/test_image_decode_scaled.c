@@ -589,6 +589,8 @@ static int test_webp_accounting(Budget *budget)
     return 0;
 }
 
+#include "suites/image_decode_webp_alpha.inc"
+
 int main(int argc, char **argv)
 {
     Budget budget;
@@ -603,6 +605,8 @@ int main(int argc, char **argv)
         {"large-png", test_large_png_peak},
         {"jpeg", test_jpeg_scaled},
         {"webp", test_webp_accounting},
+        {"webp-alpha", test_webp_alpha_byte_history},
+        {"webp-alpha-filters", test_webp_alpha_filters},
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         if (only != NULL && strcmp(only, tests[i].name) != 0) continue;

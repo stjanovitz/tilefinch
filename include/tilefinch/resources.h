@@ -539,6 +539,12 @@ bool stylesheets_settle_style_preloads_with_context(
     ExternalStylesheetStats *stats);
 void stylesheet_document_resources_destroy(
     StylesheetDocumentResources *resources);
+/* Copy a page's response ledger for a transactional presentation rebuild.
+   Bodies are shared, URL/provenance storage is independently owned, and rule
+   application is reset. Refusal leaves the source and empty destination intact. */
+bool stylesheet_document_resources_copy_for_rebuild(
+    StylesheetDocumentResources *destination,
+    const StylesheetDocumentResources *source);
 /* Retains one successfully fetched speculative stylesheet for the ordinary
    ordered loader. The caller supplies normalized response provenance; this
    function never parses or applies CSS. */

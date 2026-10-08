@@ -82,6 +82,7 @@
 #include "tilefinch/psp_update_session.h"
 #include "tilefinch/psp_voice_component_session.h"
 #include "tilefinch/psp_glyph_component_session.h"
+#include "tilefinch/ui_language.h"
 #include "tilefinch/render.h"
 #include "tilefinch/screenshot_png.h"
 #include "tilefinch/session_persistence.h"
@@ -195,6 +196,8 @@ bool psp_write_failure_report(
 /* Applies the profile policy without writing. clear_existing is used only by
    the explicit Off action, never during ordinary boot. */
 bool psp_failure_report_configure(bool enabled, bool clear_existing);
+const char *psp_wifi_diagnostic_report(void);
+void psp_wifi_diagnostic_clear(void);
 bool psp_write_navigation_failure_report(
     const char *stage, const char *detail, const char *url,
     const NavigationSession *navigation);
@@ -595,6 +598,7 @@ void psp_present_validation_pre_publish_hook(void (*hook)(uint32_t sequence));
 bool psp_display_validation_timing_snapshot(
     PspDisplayBackendTiming *timing);
 void psp_video_scanout_note_discontinuity(void);
+void psp_video_scanout_measurement(bool enabled);
 void psp_cursor_latency_sample(uint64_t sampled_us);
 void psp_cursor_latency_idle(void);
 void psp_clock_validation_probe(void);
@@ -623,6 +627,7 @@ bool psp_power_auto_start(
    than guarding each of them. */
 #define psp_report_presentation_cadence(phase) ((void) 0)
 #define psp_video_scanout_note_discontinuity() ((void) 0)
+#define psp_video_scanout_measurement(enabled) ((void) (enabled))
 #define psp_cursor_latency_sample(sampled_us) ((void) (sampled_us))
 #define psp_cursor_latency_idle() ((void) 0)
 #endif
@@ -962,6 +967,11 @@ typedef struct {
     PspUpdateSession update_session;
     PspVoiceComponentSession *voice_component_session;
     PspGlyphComponentSession *glyph_component_session;
+    TilefinchUiTranslation *ui_translation;
+    unsigned char *ui_language_download;
+    uint64_t ui_language_request;
+    unsigned ui_language_requested;
+    bool ui_language_waiting_font;
     PspUiThemeCatalog *theme_catalog;
 } PspBrowserResources;
 
@@ -1436,6 +1446,12 @@ bool psp_ensure_network_for_navigation(
    ordinary page/video frames pay only this one inactive call. */
 bool psp_voice_component_handle_frame(
     PspApp *app, const PspUiIntent *intent, uint64_t now_us);
+BrowserGlyphLanguage psp_ui_language_glyphs(const BrowserProfile *profile);
+bool psp_ui_language_font_available(const PspBrowserResources *browser);
+bool psp_ui_language_handle_frame(PspApp *app, const PspUiIntent *intent, uint64_t now_us);
+void psp_ui_language_destroy(PspBrowserResources *browser);
+const char *psp_glyph_component_request_pack(PspApp *app, TilefinchGlyphPack pack);
+
 bool psp_glyph_component_handle_frame(
     PspApp *app, const PspUiIntent *intent, uint64_t now_us);
 

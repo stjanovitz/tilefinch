@@ -582,15 +582,14 @@ about 4.1 KiB of that was the bounded draw-template state. Authors should
 repeat the measurement for their own scene rather than assume these timings.
 The expanded game requires fresh hardware qualification; this historical
 result is not a performance claim for its new modes. Later component runs on
-a PSP-3000 (validation build, October 2026, see the
-[performance ledger](engineering/PERFORMANCE_LEDGER.md)) are encouraging but
+a PSP-3000 (validation build, October 2026) are encouraging but
 are not that qualification: an Onslaught boss wave with real input and audio
 missed 3 of 2,176 two-vblank deadlines (readiness p95 28.2 ms, maximum
 33.7 ms), and the long soak 20 of 2,046 (with the Enhanced lighting, now
 Treadline's only look).
 
 The sections below collect what building Treadline taught about the PSP.
-Figures are dated physical PSP-3000 measurements from the ledger. Several of
+Figures are dated physical PSP-3000 measurements. Several of
 the browser paths involved are still being optimized, so treat them as the
 current cost model rather than promises.
 

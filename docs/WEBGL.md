@@ -226,9 +226,8 @@ roughly 5 ms of CPU conversion and copy, and Treadline's long soak missed
 0.5% of two-vblank deadlines instead of 4.1%. Pixel verification over more
 than 250 million published pixels found no mismatch. Authors benefit most
 from a 320×180 opaque canvas with the HUD drawn inside it: a DOM HUD, menu
-or toast over the canvas keeps those frames on the CPU path. Dated figures
-and the remaining frame tails are in the
-[performance ledger](engineering/PERFORMANCE_LEDGER.md).
+or toast over the canvas keeps those frames on the CPU path. These component
+measurements do not guarantee the same deadline results for other games.
 
 ## Run a single bounded game loop
 

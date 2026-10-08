@@ -2,9 +2,9 @@
 
 `src/public_suffix_dafsa.inc` is an ASCII/punycode DAFSA generated from the
 [Public Suffix List](https://publicsuffix.org/) at commit
-`4018bd98001399ebff682f401664d469787ed7eb` (2026-10-06), downloaded from
+`3929462652695bad04f0a27afb600974014a3c8b` (2026-10-07), downloaded from
 the official published list. The source list's SHA-256 is
-`f3f659ccbc7606addee9f97adf333e9b2c719ddf808acda1dafc1e1850167f7e`.
+`ba7d836c0ea57a8bcf9f1fcb868066a7554bed029b441ecc6204ad8494a32612`.
 
 Generation command, using libpsl commit
 `3e02f2cd038209e873c970709a9eeeead4d70afa`:
@@ -14,7 +14,7 @@ python3 src/psl-make-dafsa --encoding=ascii --output-format=cxx \
   list/public_suffix_list.dat suffixes_ascii_dafsa.h
 ```
 
-The checked-in graph is 53,471 bytes in the linked image, needs no heap, and
+The checked-in graph is 53,341 bytes in the linked image, needs no heap, and
 contains both ICANN and PRIVATE rules. Tilefinch accepts only ASCII-serialized
 URL hosts, so the graph contains punycode rules but omits duplicate UTF-8
 spellings. Refresh the snapshot as a security maintenance task when the PSL

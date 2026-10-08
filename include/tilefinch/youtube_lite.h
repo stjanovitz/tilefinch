@@ -37,6 +37,11 @@ typedef struct {
 
 typedef struct YoutubeLiteLoadJob YoutubeLiteLoadJob;
 
+/* Preserve a typed query in a locally generated Home document before its
+   first layout. Transactional and bounded; failure leaves HTML unchanged. */
+bool youtube_lite_home_set_search_value(YoutubeLiteDocument *document,
+                                      const char *value, size_t length);
+
 /*
  * Small resolver context retained from the mobile page the provider already
  * fetched. Reusing this bounded BrowserSession-owned record avoids fetching

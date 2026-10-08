@@ -52,6 +52,10 @@
    setting once because the UI may never become usable. */
 static const TilefinchInstallPaths *psp_failure_report_paths;
 static bool psp_failure_report_persistence_enabled;
+static char psp_wifi_report[4096];
+
+const char *psp_wifi_diagnostic_report(void) { return psp_wifi_report; }
+void psp_wifi_diagnostic_clear(void) { psp_wifi_report[0] = '\0'; }
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 static const PspDisplayBackend *psp_validation_display_inner;
@@ -402,6 +406,12 @@ bool psp_write_navigation_failure_report(
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 bool psp_write_network_failure_report(const PspNetwork *network)
 {
+    /* Independent of file persistence: opt-in details remain in RAM and can
+       be shared through Diagnostic QR even when Save error reports is off. */
+    if (psp_network_diagnostics_enabled())
+        (void) psp_network_diagnostics_format(network, psp_wifi_report,
+                                             sizeof(psp_wifi_report));
+    else psp_wifi_diagnostic_clear();
     if (network == NULL) {
         return psp_write_failure_report(
             "network-association", "network state unavailable", NULL,
@@ -783,13 +793,14 @@ static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
             probe_case->sync_us > probe_case->output_sync_us
                 ? probe_case->sync_us - probe_case->output_sync_us : 0;
         printf("tilefinch-media-present-probe: case=%dx%d stride=%d quads=%u "
-               "slot=%u "
+               "slot=%u clockwise=%d crop=%d "
                "output=%dx%d texture=%s flat=0x%06x halves=0x%06x/0x%06x "
                "submit=%lluus sync=%lluus output-sync=%lluus "
                "texture-sync=%lluus outcome=%s\n",
                probe_case->source_width, probe_case->source_height,
                probe_case->source_stride, probe_case->quads,
-               probe_case->slot,
+               probe_case->slot, probe_case->clockwise ? 1 : 0,
+               probe_case->portrait_crop ? 1 : 0,
                probe_case->output_width, probe_case->output_height,
                probe_case->staged ? "edram" : "main",
                (unsigned) probe_case->flat, (unsigned) probe_case->left,
@@ -3612,10 +3623,32 @@ static void psp_webgl_measurement_reset(const NavigationSession *navigation)
     }
 }
 
+static bool psp_validation_video_timing_window;
+static atomic_int psp_validation_video_window_requested;
+static atomic_int psp_validation_video_copy_requested;
+
 /* The main loop's input step, before its script turn. Only here, never from
    the busy-frame supervisor, so the reset cannot split a frame. */
 void psp_webgl_measurement_main_frame(void)
 {
+    /* Live marks can be consumed by the busy-frame supervisor. It may queue
+       a request, but must not reset owner-thread presentation counters or
+       change a GE copy while that owner's draw is in progress. */
+    int copy = atomic_exchange(&psp_validation_video_copy_requested, 0);
+    if (copy != 0) psp_media_present_ge_stage_rows_enabled(copy == 2);
+    int window = atomic_exchange(&psp_validation_video_window_requested, 0);
+    if (window == 1) {
+        psp_validation_video_timing_window = true;
+        psp_log_begin_timing_window();
+        psp_video_scanout_measurement(true);
+    } else if (window == 2) {
+        psp_validation_video_timing_window = false;
+        /* Snapshots end at the last presentation. Flush before reporting so
+           a full diagnostic buffer cannot silently drop the summary. */
+        psp_log_end_timing_window();
+        psp_video_scanout_measurement(false);
+        psp_report_presentation_cadence("video-window");
+    }
     if (!psp_webgl_measurement_reset_pending) return;
     psp_webgl_measurement_reset_pending = false;
     psp_webgl_measurement_reset(psp_webgl_measurement_navigation);
@@ -3841,6 +3874,14 @@ void psp_webgl_measurement_mark(const char *mark)
         psp_validation_canvas_followup_enabled = false;
     else if (mark != NULL && strcmp(mark, "canvas-followup-on") == 0)
         psp_validation_canvas_followup_enabled = true;
+    if (mark != NULL && strcmp(mark, "media-stage-cpu") == 0)
+        atomic_store(&psp_validation_video_copy_requested, 1);
+    else if (mark != NULL && strcmp(mark, "media-stage-ge") == 0)
+        atomic_store(&psp_validation_video_copy_requested, 2);
+    if (mark != NULL && strcmp(mark, "video-measure-start") == 0)
+        atomic_store(&psp_validation_video_window_requested, 1);
+    else if (mark != NULL && strcmp(mark, "video-measure-end") == 0)
+        atomic_store(&psp_validation_video_window_requested, 2);
     /* The start mark's own loop frame also runs that mark's diagnostics
        (page report, .mark.js) before its script turn; measuring from the
        next frame keeps that work out of the window. The page's profile hook
@@ -5016,7 +5057,8 @@ static void psp_loop_ready_sample(void);
 static void psp_loop_timing_begin(void)
 {
     memset(&psp_loop_timing, 0, sizeof(psp_loop_timing));
-    psp_loop_timing.active = psp_input_script_running();
+    psp_loop_timing.active = psp_input_script_running()
+        && !psp_validation_video_timing_window;
     work_ledger_set_enabled(psp_loop_timing.active);
     if (psp_loop_timing.active) {
         psp_loop_timing.start = psp_loop_timing.last =
@@ -6016,6 +6058,8 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     bool glyph_component_visual_changed =
         psp_glyph_component_handle_frame(
             app, &intent, frame.ui_sample_us);
+    glyph_component_visual_changed |= psp_ui_language_handle_frame(
+        app, &intent, frame.ui_sample_us);
     bool update_visual_changed = psp_loop_update_frame(
         loop, frame.ui_sample_us, &intent, &navigation_visual_changed);
     navigation_visual_changed |= psp_app_site_storage_poll(app);
@@ -8853,6 +8897,7 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
         psp_log_operation_begin("engine-cleanup");
     psp_update_session_destroy(&browser->update_session);
     psp_ui_theme_catalog_bind(NULL);
+    psp_ui_language_destroy(browser);
     psp_ui_theme_catalog_destroy(browser->theme_catalog);
     browser->theme_catalog = NULL;
     psp_voice_component_session_destroy(
@@ -9965,10 +10010,15 @@ int main(int argc, char *argv[])
     if (!psp_glyph_component_session_attach_selected(
             browser.glyph_component_session, browser.budget,
             &process.install_paths,
-            browser_profile_glyph_language(browser.profile),
+            psp_ui_language_glyphs(browser.profile),
             browser_profile_color_emoji(browser.profile))) {
         printf("tilefinch-glyph-component: selected packs unavailable\n");
     }
+    unsigned locale = browser_profile_ui_language(browser.profile);
+    if (psp_ui_language_font_available(&browser))
+        browser.ui_translation = tilefinch_ui_translation_load(browser.budget,
+            &process.install_paths, locale);
+    tilefinch_ui_translation_bind(browser.ui_translation);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     printf(
         "tilefinch-glyph-component: language=%u color=%u "
@@ -10273,6 +10323,11 @@ int main(int argc, char *argv[])
         tls_session_persistence;
     process.presentation.ui.save_diagnostic_reports =
         browser_profile_save_diagnostic_reports(browser.profile);
+    process.presentation.ui.wifi_diagnostics =
+        browser_profile_wifi_diagnostics(browser.profile);
+    process.presentation.ui.youtube_topics =
+        browser_profile_youtube_topics(browser.profile);
+    psp_network_diagnostics_enable(process.presentation.ui.wifi_diagnostics);
     process.presentation.ui.network_profile =
         (uint8_t) process.config.network_profile;
     process.presentation.ui.javascript_enabled = javascript_enabled ? 1u : 0u;
@@ -10297,6 +10352,7 @@ int main(int argc, char *argv[])
     }
     process.presentation.ui.glyph_language =
         (unsigned) browser_profile_glyph_language(browser.profile);
+    process.presentation.ui.ui_language = browser_profile_ui_language(browser.profile);
     process.presentation.ui.color_emoji =
         browser_profile_color_emoji(browser.profile);
     process.presentation.ui.glyph_offers_off =
@@ -10359,6 +10415,8 @@ int main(int argc, char *argv[])
     (void) browser_engine_set_forced_dark(browser.engine, process.presentation.ui.page_dark);
     (void) browser_engine_set_youtube_compact_results(
         browser.engine, process.presentation.ui.youtube_compact_results);
+    (void) browser_engine_set_youtube_topics(
+        browser.engine, process.presentation.ui.youtube_topics);
     (void) psp_set_presentation_css(
         browser.engine, &process.presentation.ui, browser.profile, false, startup_url,
         process.presentation.ui.page_font_percent, false);

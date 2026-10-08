@@ -22,7 +22,7 @@ bool (*psp_glyph_component_session_test_identity)(
 
 static uint16_t pack_bit(TilefinchGlyphPack pack)
 {
-    return pack < TILEFINCH_GLYPH_PACK_COUNT
+    return (unsigned) pack < TILEFINCH_GLYPH_PACK_COUNT
         ? (uint16_t) (1u << (unsigned) pack) : 0;
 }
 
@@ -41,16 +41,23 @@ static bool installed_identity(
     PspGlyphComponentSession *session, const TilefinchInstallPaths *paths,
     TilefinchGlyphPack pack)
 {
+    if ((unsigned) pack >= TILEFINCH_GLYPH_PACK_COUNT) return false;
+    session->installed_sequences[pack] = 0;
 #ifdef TILEFINCH_GLYPH_SESSION_TEST_SEAM
-    if (psp_glyph_component_session_test_identity != NULL)
-        return psp_glyph_component_session_test_identity(paths, pack);
+    if (psp_glyph_component_session_test_identity != NULL) {
+        bool installed = psp_glyph_component_session_test_identity(paths, pack);
+        session->installed_sequences[pack] = installed ? 1 : 0;
+        return installed;
+    }
 #endif
     uint64_t sequence = 0;
     uint8_t digest[32];
-    return session->budget != NULL && ensure_root(session)
+    bool installed = session->budget != NULL && ensure_root(session)
         && tilefinch_glyph_component_installed_identity(
                session->budget, paths, pack, &session->root,
                &sequence, digest);
+    if (installed) session->installed_sequences[pack] = sequence;
+    return installed;
 }
 
 static bool pack_signed_and_resolved(
@@ -153,11 +160,12 @@ bool psp_glyph_component_session_attach_hinted(
     requested &= (uint16_t) ~(session->attached_mask
                              | session->lazy_attempted_mask
                              | pack_bit(TILEFINCH_GLYPH_PACK_COLOR_EMOJI));
-    _Static_assert(TILEFINCH_GLYPH_PACK_COUNT == 9u,
+    _Static_assert(TILEFINCH_GLYPH_PACK_COUNT == 10u,
                    "list a new language pack in the lazy preference");
     static const TilefinchGlyphPack preference[] = {
         TILEFINCH_GLYPH_PACK_ARABIC,
         TILEFINCH_GLYPH_PACK_HEBREW,
+        TILEFINCH_GLYPH_PACK_DEVANAGARI,
         TILEFINCH_GLYPH_PACK_CYRILLIC,
         TILEFINCH_GLYPH_PACK_LATIN_EXTENDED,
         TILEFINCH_GLYPH_PACK_JAPANESE,
@@ -260,6 +268,7 @@ void psp_glyph_component_session_probe(
 {
     if (session == NULL || paths == NULL) return;
     session->installed_mask = 0;
+    memset(session->installed_sequences, 0, sizeof(session->installed_sequences));
     session->lazy_attempted_mask = 0;
     session->lazy_processed_script_mask = 0;
     if (session->budget == NULL) return;
@@ -275,6 +284,14 @@ bool psp_glyph_component_session_installed(
 {
     return session != NULL
         && (session->installed_mask & pack_bit(pack)) != 0;
+}
+
+bool psp_glyph_component_session_installed_at_least(
+    const PspGlyphComponentSession *session, TilefinchGlyphPack pack,
+    uint64_t minimum_sequence)
+{
+    return psp_glyph_component_session_installed(session, pack)
+        && session->installed_sequences[pack] >= minimum_sequence;
 }
 
 bool psp_glyph_component_session_metadata_url(

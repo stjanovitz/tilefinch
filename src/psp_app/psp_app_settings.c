@@ -1605,4 +1605,23 @@ void psp_app_apply_setting(
                                   : "OFF - OLD REPORT NOT REMOVED"),
             240);
     }
+    if (intent->setting.id == PSP_UI_SETTING_WIFI_DIAGNOSTICS) {
+        bool enabled = intent->setting.value.boolean;
+        browser_profile_set_wifi_diagnostics(profile, enabled);
+        psp_network_diagnostics_enable(enabled);
+        if (!enabled) psp_wifi_diagnostic_clear();
+        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(&app->process->presentation.ui,
+            enabled ? "WI-FI DETAILS IN RAM - RETRY, THEN DIAGNOSTIC QR"
+                    : "WI-FI DIAGNOSTICS OFF", 240);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_TOPICS) {
+        bool enabled = intent->setting.value.boolean;
+        browser_profile_set_youtube_topics(profile, enabled);
+        (void) browser_engine_set_youtube_topics(engine, enabled);
+        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(&app->process->presentation.ui,
+            enabled ? "YOUTUBE HOME TOPICS ON"
+                    : "YOUTUBE HOME TOPICS OFF - RELOAD TO HIDE", 240);
+    }
 }

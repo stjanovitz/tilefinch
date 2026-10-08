@@ -17,6 +17,14 @@ profile**. You can also set `network_profile=<N>` (the 1-based position of
 the saved connection) in `PSP/GAME/TILEFINCH/data/boot-overrides.cfg`; create
 the file if it does not exist, with one `key=value` per line.
 
+For a failure you want to share, turn on **Settings → Device & storage →
+Wi-Fi diagnostics**, retry the connection, then open **Help & diagnostics →
+Diagnostic QR**. The verbose connection report stays in RAM: ordinary
+connections do not write a diagnostic file. It includes connection phases,
+firmware error codes, profile number and basic configuration flags, but no
+network name, password, IP address or MAC address. Turning the option Off or
+exiting clears it.
+
 ## A secure page says its certificate failed
 
 Check the PSP's date and time under **Settings → Date & Time Settings**, then

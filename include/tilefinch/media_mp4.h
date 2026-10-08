@@ -189,6 +189,9 @@ MediaH264DecoderRoute media_h264_annexb_decoder_route(
     const unsigned char *config, size_t length, uint8_t *profile_idc);
 MediaH264DecoderRoute media_h264_codec_string_decoder_route(
     const char *mime, uint8_t *profile_idc);
+/* Bounded firmware display geometries. Tall 240p-class pictures use the
+   existing large decode pool, not an enlarged or uncharged allocation. */
+bool media_h264_psp_dimensions_supported(unsigned width, unsigned height);
 /*
  * Validates one length-prefixed AVC access unit using the same bounded
  * contract as the PSP firmware bridge. Every NAL must fit exactly. The

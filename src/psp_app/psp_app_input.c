@@ -547,6 +547,7 @@ const char *psp_media_action_name(PspUiMediaAction action)
             return "media-select-audio-track";
         case PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK:
             return "media-select-subtitle-track";
+        case PSP_UI_MEDIA_ACTION_ROTATE: return "media-rotate";
         case PSP_UI_MEDIA_ACTION_CLOSE: return "media-close";
         case PSP_UI_MEDIA_ACTION_NONE:
         default: return "media-none";

@@ -7202,7 +7202,8 @@ static bool psp_media_wait_codec_job(
         if (waited_us != NULL) *waited_us = elapsed;
         if (state != PSP_MEDIA_CODEC_JOB_RUNNING) return true;
         if (elapsed >= wait_limit_us) return false;
-        if (sceKernelDelayThread(1000) < 0) return false;
+        if (sceKernelDelayThread(psp_media_codec_poll_delay_us(
+                wait_limit_us, elapsed)) < 0) return false;
     }
 }
 
@@ -7808,11 +7809,11 @@ static bool psp_media_backend_create_track_info(
     }
     if ((!backend->have_video && !backend->have_audio)
         || (backend->have_video
-            && (backend->video.width > 640
-                || backend->video.height > 360))) {
+            && !media_h264_psp_dimensions_supported(
+                   backend->video.width, backend->video.height))) {
         psp_media_error(error, error_size,
                         backend->have_video
-                            ? "PSP AVC exceeds 640x360"
+                            ? "PSP AVC geometry unsupported"
                             : "PSP media has no supported track");
         psp_media_destroy(backend);
         return false;
@@ -7925,11 +7926,11 @@ static bool psp_media_backend_create_track_info(
     }
     if (decoder_route != MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
         || !dimensions_ok
-        || backend->decoded_width > 640
-        || backend->decoded_height > 360) {
+        || !media_h264_psp_dimensions_supported(
+               backend->decoded_width, backend->decoded_height)) {
         psp_media_error(
             error, error_size,
-            "PSP AVC SPS exceeds 640x360");
+            "PSP AVC SPS geometry unsupported");
         psp_media_destroy(backend);
         return false;
     }

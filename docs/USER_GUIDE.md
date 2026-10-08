@@ -86,14 +86,56 @@ to open it anyway, which starts more slowly.
 [The offline library reference](OFFLINE_LIBRARY.md) has the formats and
 limits.
 
+## Native video player
+
+YouTube results and compatible page videos open in the same native player.
+X pauses or resumes, L/R or the nub previews a seek, and X confirms the new
+position. Circle cancels a preview or closes playback. Triangle opens audio
+and subtitle tracks when available.
+
+**Select rotates the picture and player controls** for holding the PSP
+vertically. For landscape 240p video it cycles through portrait fit, a central
+9:16 crop, and landscape. The crop is useful when vertical footage has black
+sidebars baked into a horizontal video; it is never applied automatically.
+For 360p landscape video, Select toggles directly between that crop and
+landscape. Native portrait video toggles between portrait fit and landscape.
+Captions, track menus, D-pad directions and nub seeking follow the rotated
+view. Rotation uses Smooth GPU scaling even if Sharp is selected. Tall video
+is bounded to 272×480; 360×640 streams are not supported. A failed GPU
+presentation returns to landscape rather than doing a slow CPU rotation.
+
+YouTube Shorts links open in the same player when a compatible stream is
+available; they do not require a separate Shorts player.
+
+### YouTube home topics
+
+The YouTube homepage shows its search box first, without downloading a feed.
+**Settings → Video → YouTube home topics** defaults to On and loads up to
+eight provider-supplied Explore destinations afterward. Turn it Off to skip
+that optional request. These are categories, not a trending-search ranking;
+signed-out YouTube does not consistently supply such a list. If discovery
+fails, the search box remains usable. Topics follow the PSP's system language
+where YouTube supplies localized labels.
+
 ## Other languages and language packs
+
+For the browser interface, open **Settings → Appearance → Language & emoji →
+Interface language**. Choose with Left/Right and press X to install. English,
+Spanish, French, German, Japanese, Russian, Ukrainian, Simplified Chinese,
+Korean, Hindi and Arabic are available. Languages needing extra glyphs also
+download their font pack. Restart to apply. This is separate from page fonts
+and preferred audio/subtitle languages; it does not translate websites or
+games. Advanced messages not yet translated stay in English. Translations and
+signed glyph packs are downloaded from
+[tilefinch-models](https://github.com/stjanovitz/tilefinch-models).
 
 The built-in fonts cover Latin text, and a small built-in fallback draws
 Chinese, Japanese and Korean characters and emoji. Other scripts need an
 optional language pack (about 1 MB each, on the Memory Stick): Cyrillic,
-Extended Latin (for example Vietnamese), Arabic and Hebrew, plus nicer
+Extended Latin (for example Vietnamese), Arabic, Hebrew and Devanagari (Hindi), plus nicer
 Japanese, Chinese and Korean glyphs. Without one, those words show as blank
-cells, or as boxes in bold text.
+cells, or as boxes in bold text. Hindi uses pre-shaped common syllables; unusual
+conjuncts outside the pack's bounded inventory may use separate fallback cells.
 
 When a page you are reading uses one of these scripts and its pack is not
 installed, a notice appears above the bottom bar, for example

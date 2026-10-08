@@ -821,6 +821,8 @@ const DocumentGlyphCensus *browser_engine_glyph_census(
    preference, not a query parameter exposed by the provider page. */
 bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact);
+/* Optional provider discovery runs after the local search page's first paint. */
+bool browser_engine_set_youtube_topics(BrowserEngine *engine, bool enabled);
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path);
 /* Deferred canvas publication (see render.h): the deferral that describes

@@ -288,6 +288,8 @@ typedef struct {
      * the memory the engine is fast against.
      */
     uint64_t present_stage_identity;
+    int present_stage_source_column;
+    int present_stage_texture_width;
     size_t present_stage_frames;
     uint64_t present_stage_total_us;
     uint64_t present_stage_max_us;

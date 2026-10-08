@@ -202,9 +202,8 @@ for development and then takes precedence over the menu.
 2026-10 site census (146 KiB of source each, about 1.5 times that in
 bytecode) or five of its heaviest (1.45 MiB of source at the 90th
 percentile), against 12-18 MB for all 55 pages. Writing it is a few seconds
-of idle Memory Stick time spread over many pages; see the
-[performance ledger](engineering/PERFORMANCE_LEDGER.md) for what a restart
-saves.
+of idle Memory Stick time spread over many pages. The cache avoids recompiling
+unchanged assets after a restart; the benefit depends on the page and cache hits.
 
 ### Site storage
 
@@ -345,7 +344,8 @@ Optional components are siblings of the browser slots so A/B browser updates
 neither duplicate nor delete them. Voice uses `components/voice-en-us/`;
 glyph packs use `components/glyph-ja/`, `glyph-zh-hans/`, `glyph-zh-hant/`,
 `glyph-ko/`, `glyph-emoji-color/`, `glyph-cyrillic/`,
-`glyph-latin-extended/`, `glyph-arabic/`, and `glyph-hebrew/`. A user-built
+`glyph-latin-extended/`, `glyph-arabic/`, `glyph-hebrew/`, and
+`glyph-devanagari/`. A user-built
 video decoder uses `components/swdec/`
 and contains exactly `tilefinch-swdec.prx`, `swdec-meload.prx`, and the small
 `component-info.txt` ABI record. Tilefinch never writes or updates those
@@ -377,6 +377,12 @@ The in-page language-pack offer ([TEXT_BIDI.md](TEXT_BIDI.md#in-page-install-off
 adds no storage path. Deciding whether to show it reads nothing for ordinary
 pages; for a page whose census qualifies it runs the resolver's few `stat`
 calls once, and it never writes. Its **Install** is the menu's install above.
+Native UI translations live in `data/ui-language/<code>-vN.tful`, at most
+32 KiB per supported non-English language plus one installation temporary.
+Only explicit installation writes them; startup verifies the selected file's
+SHA-256 against the browser catalog. Missing, incompatible or corrupt data
+falls back to English. Painting never reads or writes these files.
+
 **Don't ask again** answers and the **Offer language packs** switch are one
 append-only `GLYPHASK` record (a pack bit mask, then 1 for Off) in
 `profile.cfg`, written only while something is declined or the switch is

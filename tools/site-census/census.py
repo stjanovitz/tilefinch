@@ -9,7 +9,7 @@
   census.py sheet OUT.png RUN_ROOT NAME...       480x272 screenshot sheet
 
 SELECTOR is a page name or a tag from sites.tsv (default: every page).
-The corpus (CENSUS_DIR, default i/work/census) holds private captured pages and
+The corpus selected by CENSUS_DIR holds private captured pages and
 must never be committed: corpus/NAME/capture is the HTTP trace, meta.json the
 page's URL and tags.
 

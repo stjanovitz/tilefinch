@@ -4,6 +4,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/site_identity.h"
+#include "tilefinch/youtube_lite.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -162,6 +163,11 @@ struct BrowserEngine {
     bool page_dark;
     uint64_t page_dark_generation;
     bool youtube_compact_results;
+    bool youtube_topics;
+    bool youtube_topics_attempted;
+    uint64_t youtube_topics_generation;
+    YoutubeLiteLoadJob *youtube_topics_job;
+    bool youtube_topics_publishing;
     bool autofocus_pending;
     size_t render_relayout_generation;
     uint64_t render_shell_serial;
@@ -1128,6 +1134,17 @@ static bool browser_engine_prepare_candidate_shell(
             "candidate controller initialization failed");
     }
     engine->candidate_controller_ready = true;
+    if (engine->youtube_topics_publishing
+        && engine->controller.focus_kind == CONTROLLER_FOCUS_CONTROL
+        && engine->controller.focus_index < candidate->page.layout.control_count) {
+        (void) controller_restore_focus_node(&engine->candidate_controller,
+            candidate->page.layout.controls[engine->controller.focus_index].node);
+    } else if (engine->youtube_topics_publishing
+        && engine->controller.focus_kind == CONTROLLER_FOCUS_LINK
+        && engine->controller.focus_index < candidate->page.layout.link_count) {
+        (void) controller_restore_focus_node(&engine->candidate_controller,
+            candidate->page.layout.links[engine->controller.focus_index].node);
+    }
     if (engine->config.tile_capacity != 0 && !keep_progressive_render) {
         bool injected_refusal =
             browser_engine_test_consume_render_shell_refusal();
@@ -1826,6 +1843,7 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
     }
     engine->config = *config;
     engine->state = BROWSER_ENGINE_ACTIVE;
+    engine->youtube_topics = true;
     tilefinch_diagnostics_init(
         &engine->diagnostics, config->diagnostics.callback,
         config->diagnostics.opaque, config->diagnostics.minimum_severity);
@@ -1996,6 +2014,8 @@ bool browser_engine_shutdown(BrowserEngine *engine)
             && budget_active_allocations(&engine->budget, NULL) == 0;
     }
     browser_engine_cancel_navigation(engine, "browser engine shutdown");
+    youtube_lite_load_destroy(engine->youtube_topics_job);
+    engine->youtube_topics_job = NULL;
     budget_free(&engine->budget, engine->script_form_body);
     engine->script_form_body = NULL;
     /* A page cancellation only invalidates the JPEG completion token; it
@@ -2460,6 +2480,20 @@ bool browser_engine_set_youtube_compact_results(
     }
     engine->youtube_compact_results = compact;
     clear_error(engine);
+    return true;
+}
+
+bool browser_engine_set_youtube_topics(BrowserEngine *engine, bool enabled)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) return false;
+    if (engine->youtube_topics == enabled) return true;
+    engine->youtube_topics = enabled;
+    if (!enabled) {
+        youtube_lite_load_destroy(engine->youtube_topics_job);
+        engine->youtube_topics_job = NULL;
+    } else {
+        engine->youtube_topics_attempted = false;
+    }
     return true;
 }
 
@@ -3050,6 +3084,8 @@ static bool browser_engine_begin_navigation_request(
             "browser navigation job cannot be started");
     }
     /* Only the navigation that was refused may fall back. */
+    youtube_lite_load_destroy(engine->youtube_topics_job);
+    engine->youtube_topics_job = NULL;
     site_identity_clear_google_fallback();
     browser_engine_store_current_focus(engine);
     browser_engine_store_current_controls(engine);
@@ -3703,8 +3739,11 @@ void browser_engine_cancel_navigation(BrowserEngine *engine,
 size_t browser_engine_cancel_network_work(
     BrowserEngine *engine, const char *reason)
 {
-    return engine == NULL ? 0
-        : navigation_cancel_network_work(&engine->navigation, reason);
+    if (engine == NULL) return 0;
+    size_t cancelled = engine->youtube_topics_job != NULL ? 1u : 0u;
+    youtube_lite_load_destroy(engine->youtube_topics_job);
+    engine->youtube_topics_job = NULL;
+    return cancelled + navigation_cancel_network_work(&engine->navigation, reason);
 }
 
 BrowserNavigationJobStatus browser_engine_navigation_status(
@@ -4134,6 +4173,8 @@ static bool browser_engine_run_load(BrowserEngine *engine,
        transport descriptor ahead of the authoritative replacement. A
        failed candidate can still restore the incumbent pixels and document;
        only unfinished network embellishment is superseded. */
+    youtube_lite_load_destroy(engine->youtube_topics_job);
+    engine->youtube_topics_job = NULL;
     (void) navigation_cancel_network_work(
         &engine->navigation, "superseded by a new navigation");
     browser_engine_retire_large_incumbent_realm(engine);
@@ -5704,12 +5745,102 @@ bool browser_engine_runnable_state(BrowserEngine *engine,
 }
 #endif
 
+static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
+                                             bool *visual_changed)
+{
+    uint64_t generation = engine->navigation.generation;
+    if (engine->youtube_topics_generation != generation) {
+        youtube_lite_load_destroy(engine->youtube_topics_job);
+        engine->youtube_topics_job = NULL;
+        engine->youtube_topics_generation = generation;
+        engine->youtube_topics_attempted = false;
+    }
+    if (!engine->youtube_topics || browser_engine_navigation_pending(engine)
+        || !engine->navigation.page.loaded
+        || youtube_lite_route(engine->navigation.page.document_url)
+               != YOUTUBE_LITE_ROUTE_HOME
+        || engine->render.frames_rendered == 0) return false;
+    if (!engine->youtube_topics_attempted) {
+        engine->youtube_topics_attempted = true;
+        char error[128] = {0};
+        engine->youtube_topics_job = youtube_lite_load_begin_configured(
+            &engine->budget, &engine->session,
+            "https://www.youtube.com/?tilefinch_topics=1",
+            engine->youtube_compact_results, YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES,
+            engine->config.navigation_timeout_ms, error, sizeof(error));
+    }
+    YoutubeLiteLoadJob *job = engine->youtube_topics_job;
+    if (job == NULL) return false;
+    FetchPumpQuota quota = {
+        .maximum_body_callbacks = 1, .maximum_body_bytes = 16u * KIB,
+        .maximum_time_us = engine->config.idle_work_budget_us
+    };
+    YoutubeLiteLoadStatus status = youtube_lite_load_pump(job, &quota);
+    if (status == YOUTUBE_LITE_LOAD_PENDING) return true;
+    /* Wait for a pointer gesture to finish; never replace its pressed node. */
+    if (status == YOUTUBE_LITE_LOAD_SUCCEEDED
+        && engine->controller.pointer_down_active) return true;
+    YoutubeLiteDocument document = {0};
+    size_t search_length = 0;
+    const char *search = engine->navigation.page.layout.control_count == 0
+        ? NULL : document_control_value(
+            engine->navigation.page.layout.controls[0].node, &search_length);
+    if (search == NULL && engine->navigation.page.layout.control_count != 0)
+        search = document_attribute(engine->navigation.page.layout.controls[0].node,
+                                    "value", &search_length);
+    if (status == YOUTUBE_LITE_LOAD_SUCCEEDED
+        && youtube_lite_load_take_document(job, &document)
+        && document.result_count != 0
+        && youtube_lite_home_set_search_value(&document,
+               search == NULL ? "" : search, search_length)) {
+        DocumentBacking previous = engine->backing;
+        const NavigationEntry *entry = navigation_current(&engine->navigation);
+        int scroll = entry == NULL ? 0 : entry->scroll_y;
+        char url[NAVIGATION_URL_LIMIT];
+        snprintf(url, sizeof(url), "%s", engine->navigation.page.document_url);
+        engine->youtube_topics_publishing = true;
+        document_backing_uninstall(&engine->navigation);
+        bool hooked = navigation_set_candidate_commit_hooks(
+            &engine->navigation, browser_engine_prepare_candidate_shell,
+            browser_engine_abort_candidate_shell,
+            browser_engine_commit_candidate_shell, engine);
+        bool committed = hooked && navigation_commit_static_html(
+            &engine->navigation, generation, url, document.html,
+            document.html_length, engine->config.device.navigation_viewport_width,
+            engine->fonts_ready ? &engine->fonts : NULL, NULL, false);
+        (void) navigation_set_candidate_commit_hooks(
+            &engine->navigation, NULL, NULL, NULL, NULL);
+        engine->youtube_topics_publishing = false;
+        if (engine->candidate_shell_prepared || engine->candidate_render.budget != NULL)
+            browser_engine_abort_candidate_shell(engine);
+        if (committed) {
+            (void) browser_engine_bind_current_full_document(engine);
+            navigation_set_scroll(&engine->navigation, scroll);
+            if (visual_changed != NULL) *visual_changed = true;
+        } else {
+            engine->backing = previous;
+            (void) document_backing_install(&engine->backing, &engine->navigation);
+            /* Optional discovery refusal is not a page failure. */
+            clear_error(engine);
+        }
+    }
+    youtube_lite_document_destroy(&document);
+    youtube_lite_load_destroy(job);
+    engine->youtube_topics_job = NULL;
+    return false;
+}
+
 bool browser_engine_run_idle_work(
     BrowserEngine *engine, bool *visual_changed)
 {
     if (visual_changed != NULL) *visual_changed = false;
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->render_ready) return false;
+    /* Discovery is optional: a slow response must not monopolize idle turns
+       ahead of fonts, images or tile preparation. Keep pumping it once per
+       turn, while still allowing the other bounded continuations to run. */
+    bool topics_work = browser_engine_run_youtube_topics(engine, visual_changed);
+    if (visual_changed != NULL && *visual_changed) return true;
     /* Startup script tasks can still change the whole document's geometry.
        Do not compete with them by reading/publishing optional fonts and
        images only to reflow the same page again immediately. The committed
@@ -6087,7 +6218,7 @@ bool browser_engine_run_idle_work(
                 &engine->session)
             || browser_session_script_disk_maintenance(&engine->session);
     }
-    return cache_work || autofocus_work || font_work || retarget_work
+    return topics_work || cache_work || autofocus_work || font_work || retarget_work
         || navigation_background_resources_pending(&engine->navigation)
         || tile_cache_idle_work_pending(&engine->render);
 }

@@ -94,13 +94,7 @@ static unsigned int __attribute__((aligned(64)))
 
 /* Texture coordinates first, then position: the order sceGuDrawArray expects
    for GU_TEXTURE_32BITF | GU_VERTEX_32BITF. */
-typedef struct {
-    float u;
-    float v;
-    float x;
-    float y;
-    float z;
-} PspMediaPresentGeVertex;
+typedef PspMediaPresentVertex PspMediaPresentGeVertex;
 
 /* 0 before the first attempt, 1 once the context exists, -1 once latched off
    for the rest of the process. */
@@ -827,6 +821,64 @@ static unsigned psp_media_present_texture_extent(unsigned value)
     return extent;
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static bool psp_media_ge_stage_rows_enabled = true;
+static uint32_t psp_media_ge_stage_rows_copies;
+void psp_media_present_ge_stage_rows_enabled(bool enabled)
+{
+    psp_media_ge_stage_rows_enabled = enabled;
+}
+uint32_t psp_media_present_ge_stage_rows_copies(void)
+{
+    return psp_media_ge_stage_rows_copies;
+}
+#endif
+
+bool psp_media_present_ge_stage_rows(
+    void *destination, const void *source, int source_stride_pixels,
+    int texture_width, int rows)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (!psp_media_ge_stage_rows_enabled) return false;
+#endif
+    if (destination == NULL || source == NULL
+        || source_stride_pixels < texture_width || source_stride_pixels > 1024
+        || texture_width < 16 || texture_width > 512 || rows < 1 || rows > 512
+        || (texture_width & 15) != 0 || (source_stride_pixels & 15) != 0
+        || ((uintptr_t) source & 15u) != 0
+        || ((uintptr_t) destination & 15u) != 0
+        || psp_media_present_stage_bytes(texture_width, rows)
+               > PSP_MEDIA_PRESENT_STAGE_BYTES
+        || !psp_media_present_ge_checked || psp_media_present_ge_state <= 0
+        || psp_media_present_ge_pending) return false;
+    uintptr_t physical = (uintptr_t) destination & PSP_MEDIA_PRESENT_PHYSICAL_MASK;
+    if (physical < UINT32_C(0x04000000)
+        || physical - UINT32_C(0x04000000) > PSP_MEDIA_PRESENT_EDRAM_BYTES
+        || psp_media_present_stage_bytes(texture_width, rows)
+               > PSP_MEDIA_PRESENT_EDRAM_BYTES
+                   - (physical - UINT32_C(0x04000000))) return false;
+    unsigned bytes = (unsigned) psp_media_present_stage_bytes(texture_width, rows);
+    /* The decoder has already invalidated its clean source. Dirty destination
+       lines must be retired before GE writes, and stale clean lines afterwards.
+       No framebuffer or decoded-slot ownership changes during this copy. */
+    sceKernelDcacheWritebackInvalidateRange(destination, bytes);
+    sceGuStart(GU_DIRECT, psp_media_present_ge_uncached_list());
+    sceGuCopyImage(GU_PSM_8888, 0, 0, texture_width, rows,
+                   source_stride_pixels, (void *) source,
+                   0, 0, texture_width, destination);
+    sceGuFinish();
+    psp_media_present_ge_pending_rows = destination;
+    psp_media_present_ge_pending_bytes = bytes;
+    psp_media_present_ge_submitted_us = (uint64_t) sceKernelGetSystemTimeWide();
+    psp_media_present_ge_pending = true;
+    bool copied = psp_media_present_ge_complete(NULL);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (copied && psp_media_ge_stage_rows_copies != UINT32_MAX)
+        psp_media_ge_stage_rows_copies++;
+#endif
+    return copied;
+}
+
 bool psp_media_present_ge_blit_565(
     const uint16_t *source, int source_width, int source_height,
     int source_stride, bool source_changed, uint32_t *destination,
@@ -1035,8 +1087,12 @@ bool psp_media_present_ge_submit(
            The ordinary retained stage has one quad at column zero; the wide
            strip stage keeps the decoder's 768-pixel pitch and therefore has
            the same 512+remainder column origins as the source surface. */
+        /* A retained single-quad stage already starts at the source column.
+           Wide strips retain their full pitch and still need each offset. */
+        int column = texture->staged && plan->quad_count == 1
+            ? 0 : quad->texture_column;
         const unsigned char *texels = (const unsigned char *) texture->pixels
-            + (size_t) quad->texture_column * 4u;
+            + (size_t) column * 4u;
         sceGuTexImage(
             0, quad->texture_width, quad->texture_height,
             texture->stride_pixels, texels);
@@ -1046,20 +1102,25 @@ bool psp_media_present_ge_submit(
            third. Flush unconditionally -- there is no address the cache can be
            assumed to still be right about. */
         sceGuTexFlush();
+        int vertex_count = quad->clockwise ? 4 : 2;
         PspMediaPresentGeVertex *vertices =
-            sceGuGetMemory(2 * (int) sizeof(*vertices));
+            sceGuGetMemory(vertex_count * (int) sizeof(*vertices));
         if (vertices == NULL) {
             submitted = false;
             break;
         }
-        vertices[0] = (PspMediaPresentGeVertex) {
-            quad->u0, quad->v0, quad->x0, quad->y0, 0.0f};
-        vertices[1] = (PspMediaPresentGeVertex) {
-            quad->u1, quad->v1, quad->x1, quad->y1, 0.0f};
+        if (quad->clockwise) {
+            psp_media_present_quad_vertices(quad, vertices);
+        } else {
+            vertices[0] = (PspMediaPresentGeVertex) {
+                quad->u0, quad->v0, quad->x0, quad->y0, 0.0f};
+            vertices[1] = (PspMediaPresentGeVertex) {
+                quad->u1, quad->v1, quad->x1, quad->y1, 0.0f};
+        }
         sceGuDrawArray(
-            GU_SPRITES,
+            quad->clockwise ? GU_TRIANGLE_FAN : GU_SPRITES,
             GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
-            2, NULL, vertices);
+            vertex_count, NULL, vertices);
     }
     sceGuFinish();
     uint64_t submitted_us = (uint64_t) sceKernelGetSystemTimeWide();
@@ -1214,6 +1275,23 @@ static void psp_media_present_probe_stage(
         && psp_media_present_ge_stage_dma(staging, surface, bytes)) {
         return;
     }
+    if (stride != texture_width
+        && psp_media_present_ge_stage_rows(
+               staging, surface, stride, texture_width, rows)) {
+        /* The probe checks every staged word, including padding rows, before
+           checking the rendered picture. A fast but partial copy cannot pass. */
+        bool exact = true;
+        for (int row = 0; row < rows; row++) {
+            if (memcmp(staging + (size_t) row * texture_width,
+                       surface + (size_t) row * stride,
+                       (size_t) texture_width * sizeof(*staging)) != 0) {
+                exact = false;
+                break;
+            }
+        }
+        if (exact) return;
+        psp_media_present_ge_latch("stage-copy-mismatch");
+    }
     psp_media_present_stage(staging, surface, stride, texture_width, rows);
     sceKernelDcacheWritebackRange(staging, (unsigned) bytes);
 }
@@ -1275,7 +1353,8 @@ static bool psp_media_present_probe_draw(
     };
     if (retained_stage) {
         psp_media_present_probe_stage(
-            staging, surface, stride, plan->quads[0].texture_width,
+            staging, surface + plan->quads[0].texture_column,
+            stride, plan->quads[0].texture_width,
             retained_rows, slot, generation);
         texture.pixels = staging;
         texture.stride_pixels = plan->quads[0].texture_width;
@@ -1289,7 +1368,7 @@ static bool psp_media_present_probe_case(
     uint32_t *surface, uint32_t *staging, size_t staging_bytes,
     uint32_t *destination,
     int picture_width, int picture_height, int stride, int rows,
-    unsigned slot,
+    unsigned slot, bool clockwise, bool crop,
     PspMediaPresentProbeCase *report, char *detail, size_t detail_size)
 {
     memset(report, 0, sizeof(*report));
@@ -1297,12 +1376,21 @@ static bool psp_media_present_probe_case(
     report->source_width = picture_width;
     report->source_height = picture_height;
     report->source_stride = stride;
+    report->clockwise = clockwise;
+    report->portrait_crop = crop;
     PspMediaPresentPlan plan;
-    if (!psp_media_present_plan(
+    bool planned = crop ? psp_media_present_plan_portrait_crop(
             &plan, picture_width, picture_height, stride,
             PSP_MEDIA_PRESENT_SCREEN_WIDTH,
             PSP_MEDIA_PRESENT_SCREEN_HEIGHT)
-        || plan.quad_count == 0) {
+        : clockwise ? psp_media_present_plan_clockwise(
+            &plan, picture_width, picture_height, stride,
+            PSP_MEDIA_PRESENT_SCREEN_WIDTH,
+            PSP_MEDIA_PRESENT_SCREEN_HEIGHT) : psp_media_present_plan(
+            &plan, picture_width, picture_height, stride,
+            PSP_MEDIA_PRESENT_SCREEN_WIDTH,
+            PSP_MEDIA_PRESENT_SCREEN_HEIGHT);
+    if (!planned || plan.quad_count == 0) {
         snprintf(detail, detail_size, "%dx%d slot %u: no plan",
                  picture_width, picture_height, slot);
         return false;
@@ -1390,10 +1478,13 @@ static bool psp_media_present_probe_case(
                  picture_width, picture_height, slot);
         return false;
     }
-    uint32_t left = psp_media_present_probe_at(
-        destination, quarter_x, centre_y);
-    uint32_t right = psp_media_present_probe_at(
-        destination, three_quarter_x, centre_y);
+    /* Source left/right become physical top/bottom when turned clockwise. */
+    uint32_t left = psp_media_present_probe_at(destination,
+        clockwise ? video->x + video->width / 2 : quarter_x,
+        clockwise ? video->y + video->height / 4 : centre_y);
+    uint32_t right = psp_media_present_probe_at(destination,
+        clockwise ? video->x + video->width / 2 : three_quarter_x,
+        clockwise ? video->y + video->height * 3 / 4 : centre_y);
     /* Absolute, not relative: the left quarter is the first colour and the
        right quarter is the second. A mirrored draw swaps them, a sheared one
        moves the split, and either fails. */
@@ -1460,7 +1551,8 @@ bool psp_media_present_ge_probe(
     /*
      * The two shipping surface geometries -- the 240p stream inside its
      * 512-pixel stride, and the 360p stream whose 640 columns exceed one
-     * texture and must be drawn as two quads -- from each decoded-output slot.
+     * texture and must be drawn as two quads -- plus a tall surface in both
+     * orientations, from each decoded-output slot.
      *
      * Both slots, because playback draws from both. A single-surface probe
      * certifies one texture base address and says nothing about the other, and
@@ -1474,12 +1566,32 @@ bool psp_media_present_ge_probe(
             + (size_t) slot * PSP_MEDIA_PRESENT_PROBE_SURFACE_BYTES);
         passed = psp_media_present_probe_case(
             surface, staging, staging_bytes, destination, 426, 240, 512, 272,
-            slot, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES],
+            slot, false, false, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES],
             detail, detail_size);
         if (!passed) break;
         passed = psp_media_present_probe_case(
             surface, staging, staging_bytes, destination, 640, 360, 768, 368,
-            slot, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES + 1u],
+            slot, false, false, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES + 1u],
+            detail, detail_size);
+        if (!passed) break;
+        passed = psp_media_present_probe_case(
+            surface, staging, staging_bytes, destination, 240, 426, 512, 432,
+            slot, false, false, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES + 2u],
+            detail, detail_size);
+        if (!passed) break;
+        passed = psp_media_present_probe_case(
+            surface, staging, staging_bytes, destination, 240, 426, 512, 432,
+            slot, true, false, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES + 3u],
+            detail, detail_size);
+        if (!passed) break;
+        passed = psp_media_present_probe_case(
+            surface, staging, staging_bytes, destination, 426, 240, 512, 272,
+            slot, true, true, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES + 4u],
+            detail, detail_size);
+        if (!passed) break;
+        passed = psp_media_present_probe_case(
+            surface, staging, staging_bytes, destination, 640, 360, 768, 368,
+            slot, true, true, &cases[slot * PSP_MEDIA_PRESENT_PROBE_GEOMETRIES + 5u],
             detail, detail_size);
     }
     if (passed && !copied) {
@@ -1492,6 +1604,28 @@ bool psp_media_present_ge_probe(
 }
 
 #else
+
+bool psp_media_present_ge_stage_rows(
+    void *destination, const void *source, int source_stride_pixels,
+    int texture_width, int rows)
+{
+    (void) destination;
+    (void) source;
+    (void) source_stride_pixels;
+    (void) texture_width;
+    (void) rows;
+    return false;
+}
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+void psp_media_present_ge_stage_rows_enabled(bool enabled)
+{
+    (void) enabled;
+}
+uint32_t psp_media_present_ge_stage_rows_copies(void)
+{
+    return 0;
+}
+#endif
 
 bool psp_media_present_ge_context_acquire(void)
 {

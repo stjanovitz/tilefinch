@@ -31,9 +31,9 @@ keeps a 3 MiB presentation reserve. A script may be up to 4 MiB
 (`BROWSER_PSP_APP_SCRIPT_FILE_KB`), a page's scripts up to 16 MiB in all
 (`BROWSER_PSP_APP_SCRIPT_TOTAL_MB`); both are sanity ceilings for hostile
 input. A compile that needs more than planned is stopped by the heap limit
-and refused alone. The measurements and the heavy-page classes are in
-`include/tilefinch/script_admission.h` and
-[MEMORY_EXPERIMENTS.md](MEMORY_EXPERIMENTS.md#accepted-script-admission-by-compile-working-set).
+and refused alone. The admission contract is in
+`include/tilefinch/script_admission.h`; detailed experiment measurements are
+maintained in the private memory ledger.
 
 Tiles are 128x128 RGB565 (32 KiB). A 480x272 screen touches twelve to
 sixteen; the first eight are reserved when a page's render shell is built.

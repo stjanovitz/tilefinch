@@ -51,6 +51,12 @@ mandatory sampler-off comparison: the validation tags have a measurable
 Allegrex cost. This is diagnostic evidence, not a new author-visible API or
 an optimization of the interpreter.
 
+Bound-function finalization and marking tolerate a not-yet-created payload:
+the object enters the runtime before its separately allocated bound arguments.
+An allocation refusal or collection in that interval must not dereference NULL.
+`test_quickjs_oom --bind-refusal-only` refuses each allocation in turn, checks
+the exception, and verifies that the first successful bind remains callable.
+
 Numeric primitive indexed writes to in-bounds Float32Array/Float64Array views
 run directly in the interpreter. Int32-to-float32 writes avoid an unnecessary
 intermediate double conversion on soft-float targets. Non-numeric values and
@@ -466,7 +472,10 @@ so its difference from malloc usage must not be described as reclaimable memory.
     and returns the one to use. `JS_GetGCThreshold` reads the threshold and
     `JS_GetGCCause` tells a `JS_SetGCHook` observer whether the running
     collection is the allocation threshold's (`JS_GC_CAUSE_THRESHOLD`) or
-    any other `JS_RunGC` (`JS_GC_CAUSE_EXPLICIT`). Without a hook the
+    realloc-only array exhaustion (`JS_GC_CAUSE_ARRAY_GROWTH`), or
+    any other `JS_RunGC` (`JS_GC_CAUSE_EXPLICIT`). The array rescue uses the
+    same threshold/hook rather than collecting on every refused append.
+    Without a hook the
     re-arm is unchanged. Tilefinch's pacing (`js_rt_gc_pacing`) uses it to
     stop near-limit collection thrash. The lab-variant baseline and variant
     pins moved with this change.

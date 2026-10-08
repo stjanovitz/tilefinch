@@ -1100,6 +1100,109 @@ static bool test_youtube_lite_commit_cooperates(Budget *budget)
     return cooperative_commit_ok && budget->current == entry_baseline;
 }
 
+static int test_youtube_portrait_renditions(void)
+{
+    static const char response[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"videoDetails\":{\"title\":\"Portrait fixture\"},"
+        "\"streamingData\":{\"formats\":["
+        "{\"itag\":18,\"width\":240,\"height\":426,\"contentLength\":\"2000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d401e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/tall240.mp4\"},"
+        "{\"itag\":22,\"width\":360,\"height\":640,\"contentLength\":\"3000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d401e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/tall360.mp4\"}]}}";
+    YoutubeStream stream;
+    char error[256];
+    CHECK(youtube_parse_player_response(response, sizeof(response) - 1u,
+                                       "TFTEST00001", 240, &stream,
+                                       error, sizeof(error)));
+    CHECK(stream.width == 240 && stream.height == 426);
+    CHECK(strcmp(stream.media_url, "https://rr1.googlevideo.com/tall240.mp4") == 0);
+    CHECK(youtube_parse_player_response(response, sizeof(response) - 1u,
+                                       "TFTEST00001", 360, &stream,
+                                       error, sizeof(error)));
+    CHECK(stream.width == 240 && stream.height == 426);
+    CHECK(!youtube_parse_player_response(response, sizeof(response) - 1u,
+                                        "TFTEST00001", 144, &stream,
+                                        error, sizeof(error)));
+    /* Adaptive/progressive ranking must use the same short-side quality.
+       A taller 240p picture must not outrank a landscape 360p rendition. */
+    static const char mixed[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},\"streamingData\":{"
+        "\"formats\":[{\"width\":240,\"height\":426,\"contentLength\":\"2000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d401e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/tall240.mp4\"}],"
+        "\"adaptiveFormats\":[{\"width\":640,\"height\":360,\"contentLength\":\"3000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d401e\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/wide360.mp4\"},"
+        "{\"contentLength\":\"1000\",\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/audio.m4a\"}]}}";
+    CHECK(youtube_parse_player_response(mixed, sizeof(mixed) - 1u,
+        "TFTEST00001", 360, &stream, error, sizeof(error)));
+    CHECK(stream.width == 640 && stream.height == 360);
+    return 0;
+}
+
+static int test_youtube_lite_lockup_cards(void)
+{
+    /* Synthetic provider data, not a retained third-party response. A card
+       must identify itself as a video; nested endpoints cannot supply its ID
+       or overwrite metadata. Both formats preserve response order. */
+    static const char source[] =
+        "<script>var ytInitialData = '{\"contents\":["
+        "{\"lockupViewModel\":{\"contentType\":\"LOCKUP_CONTENT_TYPE_PLAYLIST\","
+        "\"contentId\":\"NOTVIDEO001\"}},"
+        "{\"videoRenderer\":{\"videoId\":\"LEGACY00001\","
+        "\"title\":{\"simpleText\":\"Legacy first\"}}},"
+        "{\"lockupViewModel\":{\"endpoint\":{\"contentId\":\"WRONG000001\","
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\"},"
+        "\"contentId\":\"LOCKUP00001\",\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "\"contentImage\":{\"thumbnailViewModel\":{\"overlays\":["
+        "{\"thumbnailBadgeViewModel\":{\"text\":\"HD\"}},{"
+        "\"thumbnailBadgeViewModel\":{\"text\":\"4:12\"}}]}},"
+        "\"metadata\":{\"lockupMetadataViewModel\":{"
+        "\"title\":{\"content\":\"New & clear\"},\"metadata\":{"
+        "\"contentMetadataViewModel\":{\"metadataRows\":["
+        "{\"metadataParts\":[{\"text\":{\"content\":\"Example channel\"}}]},"
+        "{\"metadataParts\":[{\"text\":{\"content\":\"20K views\"}},"
+        "{\"text\":{\"content\":\"3 days ago\"}}]},"
+        "{\"metadataParts\":[{\"text\":{\"content\":\"A short <description>\"}}]}"
+        "]}}}}}},"
+        "{\"lockupViewModel\":{\"contentId\":\"LEGACY00001\","
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\"}},"
+        "{\"lockupViewModel\":{\"endpoint\":{\"contentId\":\"NESTED00001\"},"
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\"}},"
+        "{\"lockupViewModel\":{\"contentId\":\"INVALID/id\","
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\"}},"
+        "{\"lockupViewModel\":{\"contentId\":\"LOCKUP00002\","
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\"}}"
+        "]}';</script>";
+    Budget budget;
+    budget_init(&budget, 2 * MIB);
+    YoutubeLiteDocument document = {0};
+    char error[256] = {0};
+    CHECK(youtube_lite_build_document(
+        &budget, "https://www.youtube.com/results?search_query=fixture",
+        source, sizeof(source) - 1u, &document, error, sizeof(error)));
+    CHECK(document.result_count == 3u);
+    const char *legacy = strstr(document.html, "Legacy first");
+    const char *lockup = strstr(document.html, "New &amp; clear");
+    CHECK(legacy != NULL && lockup != NULL && legacy < lockup);
+    CHECK(strstr(document.html, "Example channel") != NULL);
+    CHECK(strstr(document.html, "20K views") != NULL);
+    CHECK(strstr(document.html, "3 days ago") != NULL);
+    CHECK(strstr(document.html, "4:12") != NULL);
+    CHECK(strstr(document.html, "A short &lt;description&gt;") != NULL);
+    CHECK(strstr(document.html, "watch?v=LOCKUP00002") != NULL);
+    CHECK(strstr(document.html, "NOTVIDEO001") == NULL);
+    CHECK(strstr(document.html, "WRONG000001") == NULL);
+    CHECK(strstr(document.html, "NESTED00001") == NULL);
+    youtube_lite_document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static bool test_youtube_lite_document_builder(Budget *layout_budget)
 {
     char video_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
@@ -1127,6 +1230,13 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
             != YOUTUBE_LITE_ROUTE_NONE
         || youtube_lite_route("https://notyoutube.com/")
             != YOUTUBE_LITE_ROUTE_NONE
+        || youtube_lite_route("https://www.youtube.com/shorts/TFTEST00001")
+            != YOUTUBE_LITE_ROUTE_WATCH
+        || !youtube_watch_url_video_id(
+               "https://m.youtube.com/shorts/TFTEST00001?feature=share", video_id)
+        || strcmp(video_id, "TFTEST00001") != 0
+        || youtube_watch_url_video_id(
+               "https://www.youtube.com/shorts/TFTEST00001/extra", video_id)
         || youtube_watch_url_video_id(NULL, video_id)
         || youtube_watch_url_video_id(
                "https://youtu.be/TFTEST00001", NULL)
@@ -1584,6 +1694,8 @@ static int test_foundation(void)
     CHECK(test_youtube_subtitle_parser());
     puts("test: bounded YouTube lightweight page builder");
     CHECK(test_youtube_lite_document_builder(&budget));
+    CHECK(test_youtube_lite_lockup_cards() == 0);
+    CHECK(test_youtube_portrait_renditions() == 0);
     puts("test: YouTube adapter commit parses cooperatively");
     CHECK(test_youtube_lite_commit_cooperates(&budget));
     CHECK(budget.current == 0);

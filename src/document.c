@@ -1281,6 +1281,11 @@ typedef struct {
 
 static uint16_t document_codepoint_glyph_script(unsigned codepoint)
 {
+    if ((codepoint >= 0x0900u && codepoint <= 0x097fu)
+        || (codepoint >= 0xa8e0u && codepoint <= 0xa8ffu)
+        || (codepoint >= 0x11b00u && codepoint <= 0x11b09u)) {
+        return DOCUMENT_GLYPH_SCRIPT_DEVANAGARI;
+    }
     if ((codepoint >= 0x3400u && codepoint <= 0x4dbfu)
         || (codepoint >= 0x4e00u && codepoint <= 0x9fffu)
         || (codepoint >= 0xf900u && codepoint <= 0xfaffu)

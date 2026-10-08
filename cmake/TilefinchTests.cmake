@@ -16,8 +16,39 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_property(GLOBAL APPEND PROPERTY TILEFINCH_TEST_BINARIES ${target})
     endfunction()
     find_package(Threads REQUIRED)
+    tilefinch_add_test_binary(tilefinch-ui-language-tests tests/test_ui_language.c)
+    target_link_libraries(tilefinch-ui-language-tests PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-ui-language-tests PRIVATE
+        TILEFINCH_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+        TILEFINCH_UI_RESOURCE_ROOT="${TILEFINCH_UI_RESOURCE_ROOT}")
+    if(NOT PSP)
+        add_dependencies(tilefinch-ui-language-tests tilefinch-ui-resources)
+    endif()
+    add_test(NAME tilefinch-ui-language-tests COMMAND tilefinch-ui-language-tests)
+    set_tests_properties(tilefinch-ui-language-tests PROPERTIES
+        LABELS "tilefinch;unit;ui;storage" TIMEOUT 20)
     if(NOT PSP)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        tilefinch_add_test_binary(tilefinch-ui-language-layout-tests
+            tests/test_ui_language_layout.c)
+        target_link_libraries(tilefinch-ui-language-layout-tests PRIVATE tilefinch_psp_ui)
+        target_compile_definitions(tilefinch-ui-language-layout-tests PRIVATE
+            TILEFINCH_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+            TILEFINCH_UI_RESOURCE_ROOT="${TILEFINCH_UI_RESOURCE_ROOT}")
+        add_dependencies(tilefinch-ui-language-layout-tests tilefinch-ui-resources)
+        add_test(NAME tilefinch-ui-language-layout-tests COMMAND tilefinch-ui-language-layout-tests)
+        set_tests_properties(tilefinch-ui-language-layout-tests PROPERTIES
+            LABELS "tilefinch;unit;ui;visual" TIMEOUT 60)
+        add_test(NAME tilefinch-ui-translations-generated-check
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_ui_translations.py
+                --check --resource-dir "${TILEFINCH_UI_RESOURCE_ROOT}")
+        set_tests_properties(tilefinch-ui-translations-generated-check PROPERTIES
+            LABELS "tilefinch;unit;ui;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-ui-translation-resources-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_translation_resources.py)
+        set_tests_properties(tilefinch-ui-translation-resources-tests PROPERTIES
+            LABELS "tilefinch;unit;ui;tooling" TIMEOUT 10)
         if(TARGET tilefinch-offline-library-fixture)
             add_test(NAME tilefinch-offline-app-fixture-tests
                 COMMAND ${Python3_EXECUTABLE}
@@ -528,7 +559,7 @@ if(PSP_BROWSER_BUILD_TESTS)
     tilefinch_add_test_binary(tilefinch-glyph-component-tests
         tests/test_glyph_component.c src/psp_glyph_component_session.c)
     target_link_libraries(tilefinch-glyph-component-tests
-        PRIVATE tilefinch_core)
+        PRIVATE tilefinch_core tilefinch_psp_ui)
     target_compile_definitions(tilefinch-glyph-component-tests PRIVATE
         TILEFINCH_GLYPH_SESSION_TEST_SEAM=1
         TILEFINCH_TEST_SANS_FONT="${PSP_BROWSER_SANS_FONT}"
@@ -672,6 +703,11 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-browser-engine-tests PROPERTIES
         LABELS "tilefinch;unit;architecture;lifecycle"
         ENVIRONMENT "TILEFINCH_TRACE_TASKS=1"
+        TIMEOUT 30)
+    add_test(NAME tilefinch-search-video-journey-tests
+        COMMAND tilefinch-browser-engine-tests --search-video-journey-only)
+    set_tests_properties(tilefinch-search-video-journey-tests PROPERTIES
+        LABELS "tilefinch;journey;navigation;media"
         TIMEOUT 30)
     # Every registered computed-style property, read from a fixture page that
     # authors most of them, against a checked-in dump: a changed resolved

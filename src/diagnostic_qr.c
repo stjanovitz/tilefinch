@@ -29,6 +29,7 @@ struct TilefinchDiagnosticQrReport {
         char path[DIAGNOSTIC_PATH_LIMIT + 1u];
         uint32_t size;
         uint32_t part_count;
+        uint8_t *memory;
     } source[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
     size_t source_count;
     uint32_t part_count;
@@ -47,6 +48,7 @@ typedef struct {
     const char *name;
     const char *path;
     uint32_t size;
+    const void *memory;
 } DiagnosticOpenSource;
 
 static void set_error(char *output, size_t capacity, const char *message)
@@ -81,9 +83,21 @@ static bool source_open(
     const TilefinchDiagnosticSource *source, DiagnosticOpenSource *opened)
 {
     if (source == NULL || opened == NULL || source->name == NULL
-        || source->path == NULL || source->name[0] == '\0'
-        || source->path[0] == '\0') return false;
+        || source->name[0] == '\0') return false;
     size_t name_length = strlen(source->name);
+    if (name_length > DIAGNOSTIC_NAME_LIMIT) return false;
+    if (source->memory != NULL) {
+        if (source->path != NULL || source->memory_size == 0u
+            || source->memory_size > TILEFINCH_DIAGNOSTIC_QR_CAPTURE_LIMIT)
+            return false;
+        opened->name = source->name;
+        opened->path = "";
+        opened->memory = source->memory;
+        opened->size = (uint32_t) source->memory_size;
+        return true;
+    }
+    if (source->memory_size != 0u || source->path == NULL
+        || source->path[0] == '\0') return false;
     size_t path_length = strlen(source->path);
     if (name_length > DIAGNOSTIC_NAME_LIMIT
         || path_length > DIAGNOSTIC_PATH_LIMIT) return false;
@@ -372,18 +386,19 @@ static bool report_build_part(
         set_error(error, error_capacity, "NOT ENOUGH MEMORY FOR DIAGNOSTICS");
         return false;
     }
-    FILE *file = fopen(report->source[source_index].path, "rb");
-    if (file == NULL || fseek(file, 0, SEEK_END) != 0) {
+    const uint8_t *memory = report->source[source_index].memory;
+    FILE *file = memory == NULL ? fopen(report->source[source_index].path, "rb") : NULL;
+    if (memory == NULL && (file == NULL || fseek(file, 0, SEEK_END) != 0)) {
         if (file != NULL) fclose(file);
         free(raw);
         set_error(error, error_capacity, "A DIAGNOSTIC LOG COULD NOT BE READ");
         return false;
     }
-    long current_length = ftell(file);
-    if (current_length < 0 || (uint64_t) (unsigned long) current_length
+    long current_length = memory == NULL ? ftell(file) : (long) report->source[source_index].size;
+    if (memory == NULL && (current_length < 0 || (uint64_t) (unsigned long) current_length
             < report->source[source_index].size
         || offset > (uint32_t) LONG_MAX
-        || fseek(file, (long) offset, SEEK_SET) != 0) {
+        || fseek(file, (long) offset, SEEK_SET) != 0)) {
         fclose(file);
         free(raw);
         set_error(error, error_capacity, "A DIAGNOSTIC LOG CHANGED WHILE READING");
@@ -419,8 +434,12 @@ static bool report_build_part(
     memcpy(raw + used, report->source[source_index].name, name_length);
     used += name_length;
     size_t data_offset = used;
-    size_t got = fread(raw + used, 1u, retained, file);
-    fclose(file);
+    size_t got = retained;
+    if (memory != NULL) memcpy(raw + used, memory + offset, retained);
+    else {
+        got = fread(raw + used, 1u, retained, file);
+        fclose(file);
+    }
     if (got != retained) {
         free(raw);
         set_error(error, error_capacity, "A DIAGNOSTIC LOG CHANGED WHILE READING");
@@ -490,7 +509,8 @@ TilefinchDiagnosticQrReport *tilefinch_diagnostic_qr_build(
             set_error(error, error_capacity, "A DIAGNOSTIC LOG COULD NOT BE READ");
             return NULL;
         }
-        if (candidate.file != NULL) opened[opened_count++] = candidate;
+        if (candidate.file != NULL || candidate.memory != NULL)
+            opened[opened_count++] = candidate;
     }
     if (opened_count == 0u) {
         set_error(error, error_capacity, "NO DIAGNOSTIC LOG FOUND");
@@ -515,6 +535,16 @@ TilefinchDiagnosticQrReport *tilefinch_diagnostic_qr_build(
         snprintf(report->source[at].path, sizeof(report->source[at].path),
                  "%s", opened[at].path);
         report->source[at].size = opened[at].size;
+        if (opened[at].memory != NULL) {
+            report->source[at].memory = malloc(opened[at].size);
+            if (report->source[at].memory == NULL) {
+                close_sources(opened, opened_count);
+                tilefinch_diagnostic_qr_destroy(report);
+                set_error(error, error_capacity, "NOT ENOUGH MEMORY FOR DIAGNOSTICS");
+                return NULL;
+            }
+            memcpy(report->source[at].memory, opened[at].memory, opened[at].size);
+        }
         size_t payload = part_payload_capacity(
             version_length, strlen(report->source[at].name));
         if (payload == 0u) total_parts = UINT64_MAX;
@@ -553,6 +583,7 @@ void tilefinch_diagnostic_qr_destroy(TilefinchDiagnosticQrReport *report)
 {
     if (report == NULL) return;
     report_release_part(report);
+    for (size_t at = 0; at < report->source_count; at++) free(report->source[at].memory);
     free(report);
 }
 

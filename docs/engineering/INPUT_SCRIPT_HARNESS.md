@@ -55,6 +55,35 @@ report waiter correctly demands completion of a script the qualification
 runner never executes. Read the qualification outcome separately from an
 ordinary scripted browsing/gameplay outcome.
 
+### Portrait video seeking and cadence
+
+`media-portrait-seek.txt` exercises clockwise playback using the same native
+button receiver as physical input: forward seek, a 60-second rewind (decoder
+reopen), preview/cancel, vertical-nub seek, paused seek and resume. Use a local
+silent 90-second MP4 fixture, either a tall 240×426 picture or a 640×360
+pillarboxed picture cropped to portrait. The USB-only offline-library fixture
+route needs no HTTP server or Wi-Fi. Check every semantic media mark for
+`clockwise=1`, the expected `crop` flag, `failed=0`, and completed seek state;
+require script completion and clean teardown too.
+Their `.until.js` companions use the native `@media-playing` predicate:
+visible, playing, non-buffering media with a nonzero clock. This avoids sending
+Select to a loading screen when decoder startup outlasts a fixed frame wait.
+The ordinary bounded `until-live` exhaustion still applies; a timed-out setup
+or a measurement mark reporting `clockwise=0` invalidates the comparison.
+
+`media-portrait-cadence.txt` alternates CPU / GE / CPU / GE strided texture
+copies in one validation binary. `media-stage-cpu` and `media-stage-ge` change
+only that copy, not decoding, rotation or framebuffer ownership. Quiet
+`video-measure-start` / `video-measure-end` windows reset and freeze new-picture
+scanout cadence and report stage/draw averages plus successful GE copies.
+Per-loop detailed timing is disabled inside these video windows; per-picture
+cadence and the existing copy/draw counters remain active.
+These control marks do not consume image capture slots. Session counters are
+sampled during presentation, not through a retained session pointer in the
+input handler. Do not combine seeks, pauses, initialization or diagnostic
+flushes with steady-play cadence. A successful GE probe additionally checks
+every staged word and the final rendered pixels, including padded geometries.
+
 For small-text or emoji inspection, the validation build also honors
 `dump_frame=1` after the interactive scenario finishes. It writes
 `frame-device-final.ppm` from the current 480×272 RGB565 front buffer before
@@ -1269,7 +1298,7 @@ and captures for visual inspection. Menu focus now has a separate 150 ms
 emulator gate; menu activation is timed but still requires full relayout.
 Its golden ignores asynchronous action-cursor annotations, not receiver
 order or captures. A passing action golden alone is not a latency budget.
-See [the performance ledger](PERFORMANCE_LEDGER.md#long-article-layout-cost-and-live-input-evidence-from-2026-09-04).
+Keep dated latency results and raw captures in the private investigation area.
 
 `wikipedia-search-keyboard-live` starts at the English Main Page, hides
 the toolbar, opens its responsive search icon, then moves the nub to the
@@ -1377,9 +1406,8 @@ then deploys with Cross. Its marks (`deploy-focus`, `bottom-code-focus`,
 `deploy-return-focus`, `deploy-result`) and its device golden
 (`treadline-menu-focus-probe.device-golden.txt`) record that every move
 lands where a person expects; run it with the same `--offline-library`
-options as above. Menu focus timing has its own, longer scripted loop
-(PERFORMANCE_LEDGER.md, "Focus moves and small updates over live
-canvases").
+options as above. Menu focus timing has its own, longer scripted loop;
+keep its measurements separately from the activation golden.
 
 Every new scenario must bound each wait, state whether its evidence is
 hermetic or external, and identify the receiver output that proves success.

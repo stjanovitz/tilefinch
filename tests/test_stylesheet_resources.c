@@ -3149,6 +3149,71 @@ static bool test_complete_rules_prefix_scanner(void)
     return stylesheet_complete_rules_prefix(NULL, 4) == 0;
 }
 
+static bool test_response_ledger_copy_is_transactional(void)
+{
+    Budget budget;
+    budget_init(&budget, 1u * MIB);
+    static const char css[] = "body{color:#123456}";
+    unsigned char *bytes = budget_malloc(&budget, sizeof(css) - 1u);
+    if (bytes == NULL) return false;
+    memcpy(bytes, css, sizeof(css) - 1u);
+    BrowserSharedBody *body = browser_shared_body_take(
+        &budget, bytes, sizeof(css) - 1u);
+    StylesheetDocumentResources original = {.budget = &budget};
+    bool okay = body != NULL
+        && stylesheet_document_resources_retain(
+            &original, "https://ledger.test/style.css",
+            "https://ledger.test/cdn/style.css", "no-referrer", body,
+            sizeof(css) - 1u, true, TILEFINCH_CREDENTIALS_OMIT)
+        && stylesheet_document_resources_retain(
+            &original, "https://ledger.test/second.css",
+            "https://ledger.test/second.css", "strict-origin", body,
+            sizeof(css) - 1u, false, TILEFINCH_CREDENTIALS_INCLUDE);
+    browser_shared_body_release(body);
+    if (okay) {
+        original.items[0].rules_applied = true;
+        original.items[0].truncated = true;
+        original.items[1].state = STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE;
+        original.items[1].attempts = 3u;
+        size_t owned = budget.current;
+        /* Every URL-copy refusal rolls back without modifying the incumbent. */
+        for (size_t failure = 0u; failure < 3u && okay; failure++) {
+            StylesheetDocumentResources refused = {0};
+            budget_inject_failure_after(&budget, failure);
+            okay = !stylesheet_document_resources_copy_for_rebuild(
+                &refused, &original);
+            budget_clear_failure_injection(&budget);
+            okay = okay && refused.count == 0u && refused.budget == NULL
+                && budget.current == owned && original.items[0].rules_applied;
+        }
+        StylesheetDocumentResources copied = {0};
+        okay = okay && stylesheet_document_resources_copy_for_rebuild(
+            &copied, &original);
+        if (okay) {
+            okay = copied.count == 2u
+                && copied.items[0].url != original.items[0].url
+                && copied.items[0].response_url != original.items[0].response_url
+                && copied.items[0].body == original.items[0].body
+                && !copied.items[0].rules_applied
+                && copied.items[0].truncated && copied.items[0].cors_validated
+                && copied.items[0].credentials == TILEFINCH_CREDENTIALS_OMIT
+                && strcmp(copied.items[0].response_url,
+                          "https://ledger.test/cdn/style.css") == 0
+                && strcmp(copied.items[0].response_referrer_policy,
+                          "no-referrer") == 0
+                && copied.items[1].state
+                    == STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE
+                && copied.items[1].attempts == 3u;
+            stylesheet_document_resources_destroy(&original);
+            okay = okay && copied.items[0].body != NULL
+                && memcmp(copied.items[0].body->data, css, sizeof(css) - 1u) == 0;
+        }
+        stylesheet_document_resources_destroy(&copied);
+    }
+    stylesheet_document_resources_destroy(&original);
+    return okay && budget.current == 0u;
+}
+
 int main(void)
 {
 #define RUN_TEST(test) do {                                                  \
@@ -3158,6 +3223,7 @@ int main(void)
     }                                                                        \
 } while (0)
     RUN_TEST(test_nonmatching_media_settles_without_applying);
+    RUN_TEST(test_response_ledger_copy_is_transactional);
     RUN_TEST(test_integrity_mismatch_rejects_stylesheet);
     RUN_TEST(test_integrity_is_scoped_to_each_link_element);
     RUN_TEST(test_integrity_rechecks_cross_origin_redirect);

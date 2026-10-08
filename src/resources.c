@@ -3713,6 +3713,48 @@ void stylesheet_document_resources_destroy(
     memset(resources, 0, sizeof(*resources));
 }
 
+bool stylesheet_document_resources_copy_for_rebuild(
+    StylesheetDocumentResources *destination,
+    const StylesheetDocumentResources *source)
+{
+    if (destination == NULL || source == NULL || destination == source
+        || destination->budget != NULL || destination->count != 0u
+        || source->count > STYLESHEET_DOCUMENT_RESOURCE_LIMIT
+        || (source->count != 0u && source->budget == NULL)) return false;
+    *destination = *source;
+    destination->count = 0u;
+    for (size_t i = 0; i < source->count; i++) {
+        const StylesheetDocumentResource *original = &source->items[i];
+        StylesheetDocumentResource *copy = &destination->items[i];
+        *copy = *original;
+        copy->url = NULL;
+        copy->response_url = NULL;
+        copy->body = NULL;
+        copy->rules_applied = false;
+        destination->count++;
+        if (original->url != NULL) {
+            size_t length = strlen(original->url) + 1u;
+            copy->url = budget_malloc_category(
+                source->budget, BUDGET_CATEGORY_RESOURCE, length);
+            if (copy->url == NULL) goto refused;
+            memcpy(copy->url, original->url, length);
+        }
+        if (original->response_url != NULL) {
+            size_t length = strlen(original->response_url) + 1u;
+            copy->response_url = budget_malloc_category(
+                source->budget, BUDGET_CATEGORY_RESOURCE, length);
+            if (copy->response_url == NULL) goto refused;
+            memcpy(copy->response_url, original->response_url, length);
+        }
+        copy->body = browser_shared_body_retain(original->body);
+    }
+    return true;
+
+refused:
+    stylesheet_document_resources_destroy(destination);
+    return false;
+}
+
 bool stylesheet_document_resources_retain(
     StylesheetDocumentResources *resources, const char *request_url,
     const char *response_url, const char *response_referrer_policy,

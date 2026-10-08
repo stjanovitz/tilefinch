@@ -1,0 +1,136 @@
+--- a/src/dec/vp8l_dec.c
++++ b/src/dec/vp8l_dec.c
+@@ -861,8 +861,8 @@
+   assert(dec->last_row <= dec->height);
+ }
+ 
+-// Row-processing for the special case when alpha data contains only one
+-// transform (color indexing), and trivial non-green literals.
++// Row-processing for alpha with no transform or only color indexing, and
++// trivial non-green literals.
+ static int Is8bOptimizable(const VP8LMetadata* const hdr) {
+   int i;
+   if (hdr->color_cache_size > 0) return 0;
+@@ -893,27 +893,32 @@
+   }
+ }
+ 
+-static void ExtractPalettedAlphaRows(VP8LDecoder* const dec, int last_row) {
++static void Extract8bAlphaRows(VP8LDecoder* const dec, int last_row) {
+   // For vertical and gradient filtering, we need to decode the part above the
+   // crop_top row, in order to have the correct spatial predictors.
+   ALPHDecoder* const alph_dec = (ALPHDecoder*)dec->io->opaque;
+-  const int top_row =
++  const int top_row = (dec->next_transform == 0) ? dec->last_row :
+       (alph_dec->filter == WEBP_FILTER_NONE ||
+        alph_dec->filter == WEBP_FILTER_HORIZONTAL) ? dec->io->crop_top
+                                                     : dec->last_row;
+   const int first_row = (dec->last_row < top_row) ? top_row : dec->last_row;
+   assert(last_row <= dec->io->crop_bottom);
+   if (last_row > first_row) {
+-    // Special method for paletted alpha data. We only process the cropped area.
++    // Keep filtered output separate from the complete unfiltered LZ history.
+     const int width = dec->io->width;
+     uint8_t* out = alph_dec->output + width * first_row;
+     const uint8_t* const in =
+       (uint8_t*)dec->pixels + dec->width * first_row;
+     VP8LTransform* const transform = &dec->transforms[0];
+-    assert(dec->next_transform == 1);
+-    assert(transform->type == COLOR_INDEXING_TRANSFORM);
+-    VP8LColorIndexInverseTransformAlpha(transform, first_row, last_row,
+-                                        in, out);
++    if (dec->next_transform == 0) {
++      assert(dec->width == width);
++      memcpy(out, in, (size_t)width * (last_row - first_row));
++    } else {
++      assert(dec->next_transform == 1);
++      assert(transform->type == COLOR_INDEXING_TRANSFORM);
++      VP8LColorIndexInverseTransformAlpha(transform, first_row, last_row,
++                                         in, out);
++    }
+     AlphaApplyFilter(alph_dec, first_row, last_row, out, width);
+   }
+   dec->last_row = dec->last_out_row = last_row;
+@@ -1061,22 +1066,40 @@
+ 
+   while (!br->eos && pos < last) {
+     int code;
++    int literal_length = 1;
+     // Only update when changing tile.
+     if ((col & mask) == 0) {
+       htree_group = GetHtreeGroupForPos(hdr, col, row);
+     }
+     assert(htree_group != NULL);
+-    VP8LFillBitWindow(br);
+-    code = ReadSymbol(htree_group->htrees[GREEN], br);
++    if (htree_group->is_trivial_code &&
++        htree_group->htrees[GREEN][0].value < NUM_LITERAL_CODES) {
++      // Trivial trees consume no bits. Fill at most the rest of this row
++      // and Huffman tile, retaining identical history for later LZ copies.
++      literal_length = width - col;
++      if (mask != ~0) {
++        const int tile_remaining = (mask + 1) - (col & mask);
++        if (literal_length > tile_remaining) literal_length = tile_remaining;
++      }
++      if (literal_length > last - pos) literal_length = last - pos;
++      code = htree_group->htrees[GREEN][0].value;
++    } else {
++      VP8LFillBitWindow(br);
++      code = ReadSymbol(htree_group->htrees[GREEN], br);
++    }
+     if (code < NUM_LITERAL_CODES) {  // Literal
+-      data[pos] = code;
+-      ++pos;
+-      ++col;
++      if (literal_length == 1) {
++        data[pos] = code;
++      } else {
++        memset(data + pos, code, literal_length);
++      }
++      pos += literal_length;
++      col += literal_length;
+       if (col >= width) {
+         col = 0;
+         ++row;
+         if (row <= last_row && (row % NUM_ARGB_CACHE_ROWS == 0)) {
+-          ExtractPalettedAlphaRows(dec, row);
++          Extract8bAlphaRows(dec, row);
+         }
+       }
+     } else if (code < len_code_limit) {  // Backward reference
+@@ -1099,7 +1122,7 @@
+         col -= width;
+         ++row;
+         if (row <= last_row && (row % NUM_ARGB_CACHE_ROWS == 0)) {
+-          ExtractPalettedAlphaRows(dec, row);
++          Extract8bAlphaRows(dec, row);
+         }
+       }
+       if (pos < last && (col & mask)) {
+@@ -1112,7 +1135,7 @@
+     br->eos = VP8LIsEndOfStream(br);
+   }
+   // Process the remaining rows corresponding to last row-block.
+-  ExtractPalettedAlphaRows(dec, row > last_row ? last_row : row);
++  Extract8bAlphaRows(dec, row > last_row ? last_row : row);
+ 
+  End:
+   br->eos = VP8LIsEndOfStream(br);
+@@ -1638,11 +1661,12 @@
+     goto Err;
+   }
+ 
+-  // Special case: if alpha data uses only the color indexing transform and
+-  // doesn't use color cache (a frequent case), we will use DecodeAlphaData()
+-  // method that only needs allocation of 1 byte per pixel (alpha channel).
+-  if (dec->next_transform == 1 &&
+-      dec->transforms[0].type == COLOR_INDEXING_TRANSFORM &&
++  // A stream without transforms needs the same full byte history as the
++  // paletted case. Nontrivial channels, predictors and color caches retain
++  // the general 32-bit path.
++  if ((dec->next_transform == 0 ||
++       (dec->next_transform == 1 &&
++        dec->transforms[0].type == COLOR_INDEXING_TRANSFORM)) &&
+       Is8bOptimizable(&dec->hdr)) {
+     alph_dec->use_8b_decode = 1;
+     ok = AllocateInternalBuffers8b(dec);

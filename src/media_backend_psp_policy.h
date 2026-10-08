@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "media_video_geometry.h"
 
 /*
  * How far past the presentation clock a pump may submit.
@@ -229,6 +230,14 @@ static inline PspMediaBufferPolicyDecision psp_media_buffer_policy(
  */
 #define PSP_MEDIA_PUMP_DRAW_SLICE_US 9000u
 #define PSP_MEDIA_PUMP_DRAW_MAXIMUM_UNITS 12u
+/* Do not oversleep the tail of a bounded collect window. */
+static inline unsigned psp_media_codec_poll_delay_us(
+    unsigned limit_us, unsigned elapsed_us)
+{
+    if (elapsed_us >= limit_us) return 0u;
+    unsigned remaining_us = limit_us - elapsed_us;
+    return remaining_us < 1000u ? remaining_us : 1000u;
+}
 /* Fullscreen playback is paced by the presenter's vblank. Waiting a second
    vblank before inspecting PTS aliases a 24-fps stream against the browser's
    ~30-fps loop: one check is early and the next is late. A short sleep still
@@ -1943,6 +1952,17 @@ static inline bool psp_media_decoder_policy(
             ? 4 : PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;
         return true;
     }
+    /* A tall 240p Baseline picture has the same admitted surface size as
+       its Main counterpart, but needs the large-picture program because
+       its height exceeds the screen. Do not broaden wide landscape admission
+       or the geometry ceiling: those remain independently guarded. */
+    if (profile == PSP_MEDIA_AVC_PROFILE_BASELINE
+        && width <= 272u && height > 360u
+        && psp_video_dimensions_supported(width, height)) {
+        policy->mpeg_mode = 5;
+        policy->me_boot_type = 1;
+        return true;
+    }
     return false;
 }
 
@@ -2057,13 +2077,13 @@ static inline unsigned psp_media_macroblock_align(unsigned pixels)
 static inline bool psp_media_surface_policy(
     unsigned width, unsigned height, PspMediaSurfacePolicy *policy)
 {
-    if (policy == NULL || width == 0 || height == 0
-        || width > PSP_MEDIA_360P_MAX_WIDTH
-        || height > PSP_MEDIA_360P_MAX_HEIGHT) return false;
+    if (policy == NULL || !psp_video_dimensions_supported(width, height))
+        return false;
     bool high = width > 480u || height > 272u;
-    policy->stride_pixels = high
+    bool portrait = height > PSP_MEDIA_360P_MAX_HEIGHT;
+    policy->stride_pixels = high && !portrait
         ? PSP_MEDIA_360P_FRAME_STRIDE : PSP_MEDIA_240P_FRAME_STRIDE;
-    policy->surface_rows = high
+    policy->surface_rows = portrait ? psp_media_macroblock_align(height) : high
         ? PSP_MEDIA_360P_FRAME_ROWS : PSP_MEDIA_240P_FRAME_ROWS;
     policy->surface_bytes =
         (size_t) policy->stride_pixels * policy->surface_rows

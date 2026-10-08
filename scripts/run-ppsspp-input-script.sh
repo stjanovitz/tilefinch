@@ -841,7 +841,7 @@ if grep -Eq '^[[:space:]]*(tap|hold|press)-live([[:space:]]|$)' \
     }
 fi
 if grep -E '^[[:space:]]*mark-live([[:space:]]|$)' "$script_source" \
-        | grep -Ev '^[[:space:]]*mark-live[[:space:]]+(webgl-measure-start|webgl-measure-end|auto-controls|controls-exited)([[:space:]]|$)' \
+        | grep -Ev '^[[:space:]]*mark-live[[:space:]]+(webgl-measure-start|webgl-measure-end|video-measure-start|video-measure-end|media-stage-cpu|media-stage-ge|auto-controls|controls-exited)([[:space:]]|$)' \
         >/dev/null; then
     grep -Eq 'tilefinch-input-script: capture=.* written=1' "$trace" || {
         printf 'FAIL: live script wrote no temporal frame.\n' >&2

@@ -1,6 +1,7 @@
 #include "tilefinch/media_mp4.h"
 
 #include "media_mp4_policy.h"
+#include "media_video_geometry.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -2863,6 +2864,11 @@ MediaH264DecoderRoute media_h264_avcc_decoder_route(
         return MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION;
     }
     return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+}
+
+bool media_h264_psp_dimensions_supported(unsigned width, unsigned height)
+{
+    return psp_video_dimensions_supported(width, height);
 }
 
 static int media_h264_hex(unsigned char value)

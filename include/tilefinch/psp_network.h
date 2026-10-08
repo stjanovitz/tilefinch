@@ -22,6 +22,14 @@ typedef enum {
     PSP_NETWORK_STATUS_COUNT
 } PspNetworkStatus;
 
+#define PSP_NETWORK_DIAGNOSTIC_EVENTS 24u
+typedef struct {
+    uint64_t elapsed_us;
+    PspNetworkStatus phase;
+    int apctl_state;
+    int native_result;
+} PspNetworkDiagnosticEvent;
+
 typedef struct {
     PspNetworkStatus status;
     PspNetworkStatus failure_phase;
@@ -71,6 +79,10 @@ typedef struct {
     uint64_t join_state_started_us;
     bool join_progressed;
     bool join_disconnect_requested;
+    bool diagnostics_enabled;
+    unsigned diagnostic_count;
+    unsigned diagnostic_dropped;
+    PspNetworkDiagnosticEvent diagnostic_events[PSP_NETWORK_DIAGNOSTIC_EVENTS];
 } PspNetwork;
 
 typedef struct {
@@ -195,5 +207,11 @@ bool psp_network_shutdown_pump(
 void psp_network_shutdown(
     PspNetwork *network, PspNetworkShutdownReport *report);
 const char *psp_network_status_name(PspNetworkStatus status);
+/* RAM only, off by default. No SSIDs, addresses, credentials or packets. */
+void psp_network_diagnostics_enable(bool enabled);
+bool psp_network_diagnostics_enabled(void);
+void psp_network_diagnostics_record(PspNetwork *network);
+bool psp_network_diagnostics_format(const PspNetwork *network,
+                                   char *output, size_t capacity);
 
 #endif

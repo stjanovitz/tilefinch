@@ -1,0 +1,41 @@
+# USB-only fixture: a silent 90-second portrait or pillarboxed 360p video.
+# In clockwise mode, physical Down seeks forward and Up seeks backward.
+until-live 2400
+wait-live 30
+tap-live select
+wait-live 30
+mark-live portrait-open
+tap-live rtrigger
+tap-live cross
+wait-live 240
+mark-live portrait-forward
+tap-live ltrigger
+tap-live cross
+wait-live 360
+mark-live portrait-rewind
+tap-live down
+wait-live 10
+mark-live portrait-preview
+tap-live circle
+wait-live 10
+mark-live portrait-cancel
+stick-live 30 down
+tap-live cross
+wait-live 180
+mark-live portrait-nub-seek
+tap-live cross
+wait-live 10
+tap-live down
+tap-live cross
+wait-live 180
+mark-live portrait-paused
+tap-live cross
+wait-live 240
+mark-live video-measure-start
+wait-live 1200
+mark-live video-measure-end
+mark-live portrait-steady
+tap-live circle
+wait-live 30
+mark-live portrait-closed
+end

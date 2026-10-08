@@ -6,6 +6,8 @@
 #include "tilefinch/work_vector.h"
 
 #include <stdarg.h>
+#include <lexbor/core/mraw.h>
+#include <lexbor/dom/interfaces/document_fragment.h>
 
 static bool test_cache_put_stylesheet(BrowserSession *session,
                                       const char *url,
@@ -818,14 +820,15 @@ static bool test_visible_text_glyph_script_hints(Budget *budget)
 {
     static const char html[] =
         "<!doctype html><body><p>Привет Tiếng Việt 日本語 かな 한국어 漢 "
-        "مرحبا שלום</p>"
+        "مرحبا שלום नमस्ते</p>"
         "<script>const hidden='Ґ';</script><style>.x{content:'ộ'}</style>";
     PocDocument document = {0};
     const uint16_t expected = DOCUMENT_GLYPH_SCRIPT_HAN
         | DOCUMENT_GLYPH_SCRIPT_JAPANESE | DOCUMENT_GLYPH_SCRIPT_KOREAN
         | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
         | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
-        | DOCUMENT_GLYPH_SCRIPT_ARABIC | DOCUMENT_GLYPH_SCRIPT_HEBREW;
+        | DOCUMENT_GLYPH_SCRIPT_ARABIC | DOCUMENT_GLYPH_SCRIPT_HEBREW
+        | DOCUMENT_GLYPH_SCRIPT_DEVANAGARI;
     bool ok = document_parse(
             &document, budget, html, sizeof(html) - 1u, 7u)
         && document.glyph_script_mask == expected;

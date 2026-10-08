@@ -859,8 +859,8 @@ would. The cache sits after every fetch check. Its bytes are optional: the
 page Budget evicts them before refusing any allocation, so the cache can only
 occupy room the page is not using. Modules of 8 KiB or more are compiled
 without their source text (line tables are kept for stacks); their functions'
-`toString()` returns the native-code form. The trade-off is recorded in
-[the memory experiment ledger](engineering/MEMORY_EXPERIMENTS.md). Classic
+`toString()` returns the native-code form. Detailed measurements and rejected
+alternatives are recorded in the private memory experiment ledger. Classic
 external scripts have a second table of the same shape, filled by idle work
 after the load. An opt-in persistent tier (**Keep compiled scripts**, off by
 default; `src/session_script_disk.c`) keeps both tables' records on the
@@ -1618,8 +1618,7 @@ Performance claims come from the device. Any relink moves single code paths by
 up to about 40% and a whole journey by about a second (16 KiB instruction
 cache, code placement), so small engine changes are judged with one binary and
 a runtime switch over alternating runs, and ideas that did not pay off on the
-hardware are recorded as rejected in the
-[performance ledger](engineering/PERFORMANCE_LEDGER.md).
+hardware are recorded as rejected in private investigation records.
 
 Release builds compile logging out, along with HTTP capture and replay (about
 42 KB of code). Validation builds aggregate counters in

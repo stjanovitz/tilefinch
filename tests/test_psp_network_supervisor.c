@@ -1,4 +1,5 @@
 #include "tilefinch/psp_network_supervisor.h"
+#include "tilefinch/psp_network.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -403,6 +404,28 @@ static bool test_demand_scaled_pump_policy(void)
 
 int main(void)
 {
+    PspNetwork report = {0};
+    char text[4096];
+    psp_network_diagnostics_enable(false);
+    if (psp_network_diagnostics_enabled()
+        || psp_network_diagnostics_format(&report, text, sizeof(text))
+        || text[0] != '\0') return 1;
+    report.diagnostics_enabled = true;
+    report.status = PSP_NETWORK_FAILED;
+    report.native_result = (int) 0x80110601u;
+    psp_network_diagnostics_record(&report);
+    psp_network_diagnostics_record(&report);
+    if (report.diagnostic_count != 1u
+        || !psp_network_diagnostics_format(&report, text, sizeof(text))
+        || strstr(text, "native=0x80110601") == NULL) return 1;
+    for (unsigned at = 0; at < 40; at++) {
+        report.apctl_state = (int) at;
+        psp_network_diagnostics_record(&report);
+    }
+    if (report.diagnostic_count != PSP_NETWORK_DIAGNOSTIC_EVENTS
+        || report.diagnostic_dropped == 0
+        || psp_network_diagnostics_format(&report, text, 8)
+        || text[0] != '\0') return 1;
     if (!test_request_precedence_and_generations()
         || !test_offline_open_releases_only_boot_request()
         || !test_retained_suspend_and_resume()

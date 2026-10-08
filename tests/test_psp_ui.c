@@ -1,5 +1,6 @@
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/ui_language.h"
 #include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_power_policy.h"
 #include "tilefinch/youtube_subtitles.h"
@@ -104,6 +105,26 @@ static bool test_page_activation_activity(void)
     CHECK(ui.toast_frames == 180 && strcmp(ui.status, "REQUEST FAILED") == 0);
     CHECK(!psp_ui_finish_page_activation(&ui, receipt));
     CHECK(!psp_ui_finish_page_activation(NULL, receipt));
+    return true;
+}
+
+static bool test_every_interface_language_fits_the_ui_state(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
+    ui.glyph_options_selection = 6u;
+    for (unsigned language = 0; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
+        ui.ui_language = language;
+        CHECK(ui.ui_language == language);
+        PspUiInput input = {.pressed = PSP_UI_BUTTON_RIGHT};
+        psp_ui_update(&ui, &input);
+        CHECK(ui.ui_language == (language + 1u) % TILEFINCH_UI_LANGUAGE_COUNT);
+        input.pressed = PSP_UI_BUTTON_CONFIRM;
+        PspUiIntent intent = psp_ui_update(&ui, &input);
+        CHECK(intent.setting.id == PSP_UI_SETTING_UI_LANGUAGE
+            && intent.setting.value.unsigned_value == ui.ui_language);
+    }
     return true;
 }
 
@@ -887,6 +908,7 @@ static bool test_input_mapping_and_menu(void)
         BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
         BROWSER_GLYPH_LANGUAGE_ARABIC,
         BROWSER_GLYPH_LANGUAGE_HEBREW,
+        BROWSER_GLYPH_LANGUAGE_DEVANAGARI,
         BROWSER_GLYPH_LANGUAGE_EMBEDDED
     };
     for (size_t glyph = 0;
@@ -899,9 +921,9 @@ static bool test_input_mapping_and_menu(void)
     }
     input.pressed = PSP_UI_BUTTON_LEFT;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_HEBREW
+    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI
           && intent.setting.value.glyph_language
-                 == BROWSER_GLYPH_LANGUAGE_HEBREW);
+                 == BROWSER_GLYPH_LANGUAGE_DEVANAGARI);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
@@ -1542,6 +1564,14 @@ static bool test_glyph_offer_settings_rows(void)
     ui.glyph_options_selection = 0;
     PspUiInput input = {.analog_x = 128, .analog_y = 128};
     PspUiIntent intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_UP);
+    CHECK(ui.glyph_options_selection == 6u && ui.ui_language == 0u);
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_LEFT);
+    CHECK(ui.ui_language == TILEFINCH_UI_LANGUAGE_COUNT - 1u
+        && intent.setting.id == PSP_UI_SETTING_NONE);
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_UI_LANGUAGE
+          && intent.setting.value.unsigned_value == TILEFINCH_UI_LANGUAGE_COUNT - 1u);
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_UP);
     CHECK(ui.glyph_options_selection == 5u);
     intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
     CHECK(intent.setting.id == PSP_UI_SETTING_GLYPH_OFFERS_RESET
@@ -3547,7 +3577,8 @@ static bool test_chrome_retains_bounded_unicode_glyphs(void)
  * ui_ellipsis_advance() asks for '.', and draw_text_with_font() and
  * chrome_text_width_bytes() ask for every codepoint of whatever string the
  * chrome is drawing. Every string literal in src/psp_ui.c, the src/psp_app
- * sources, src/psp_script_main.c and src/danzeff_input.c is ASCII, so the
+ * sources, src/psp_script_main.c and src/danzeff_input.c is ASCII, except
+ * the Square-button symbol drawn directly as an outline, so the
  * fixed part
  * of that vocabulary is the retained cache range U+0020..U+007E; the variable
  * part is page-derived text, for which draw_text_with_font() names a table of
@@ -6212,9 +6243,123 @@ static bool test_chrome_font_cache_binding_and_refusals(void)
     return true;
 }
 
+static bool test_media_clockwise_controls_and_pixels(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272, STRIDE = 512 };
+    static uint32_t physical[STRIDE * HEIGHT];
+    static uint16_t scratch[STRIDE * HEIGHT];
+    static uint16_t logical[WIDTH * HEIGHT];
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set(&media, true, true, false, UINT64_C(10000000),
+                     UINT64_C(60000000), "Portrait fixture");
+    presentation.rotation_available = true;
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_MENU,
+                         .analog_x = 128, .analog_y = 128};
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_ROTATE);
+    presentation.clockwise = true;
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
+    CHECK(media.seek_preview_time_us > media.current_time_us);
+    uint64_t forward_target = media.seek_preview_time_us;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    PspUiMediaIntent commit = psp_ui_media_update(&media, &input);
+    CHECK(commit.action == PSP_UI_MEDIA_ACTION_SEEK
+          && commit.seek_time_us == forward_target);
+    /* The target remains visible until the seek receiver accepts it. */
+    CHECK(media.seek_preview_active
+          && media.seek_preview_time_us == forward_target);
+    psp_ui_media_commit_seek(&media, commit.seek_time_us);
+    CHECK(media.seek_in_progress && media.current_time_us == forward_target
+          && !media.seek_preview_active && presentation.clockwise);
+    psp_ui_media_set(&media, true, true, false, forward_target,
+                     UINT64_C(60000000), "Portrait fixture");
+    input.pressed = PSP_UI_BUTTON_UP;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
+    CHECK(media.seek_preview_time_us < media.current_time_us);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_media_update(&media, &input).action
+          == PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW);
+    psp_ui_media_cancel_seek_preview(&media);
+    CHECK(media.current_time_us == forward_target && presentation.clockwise);
+    input.pressed = 0;
+    input.analog_x = 230; /* Perpendicular to the portrait timeline. */
+    input.analog_y = 128;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_NONE);
+    CHECK(!media.seek_preview_active);
+    input.analog_x = 128;
+    input.analog_y = 230;
+    CHECK(psp_ui_media_update(&media, &input).visual_changed);
+    CHECK(media.seek_preview_time_us > media.current_time_us);
+    input.analog_y = 128;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
+    CHECK(media.analog_seek_direction == 0);
+    psp_ui_media_cancel_seek_preview(&media);
+    /* The portrait scrubber is y=411 in logical coordinates: physically it
+       lies in the left strip. Its transformed hit target still previews. */
+    CHECK(psp_ui_media_activate_at(&media, WIDTH - 1 - 411, 136,
+                                   WIDTH, HEIGHT).action
+          == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
+    psp_ui_media_cancel_seek_preview(&media);
+    for (unsigned variant = 0; variant < 4; variant++) {
+        for (size_t at = 0; at < STRIDE * HEIGHT; at++)
+            physical[at] = UINT32_C(0xff000000);
+        /* Nonblack, exactly representable backdrop exercises subtitle-shadow
+           blending as well as rotated ink, without quantization ambiguity. */
+        for (int y = 0; y < WIDTH; y++) {
+            for (int x = 0; x < HEIGHT; x++) {
+                uint16_t backdrop = tilefinch_rgb565_pack_codes(
+                    (unsigned) x % 32u, (unsigned) y % 64u,
+                    (unsigned) (x + y) % 32u);
+                logical[y * HEIGHT + x] = backdrop;
+                unsigned r = tilefinch_rgb565_red_code(backdrop);
+                unsigned g = tilefinch_rgb565_green_code(backdrop);
+                unsigned b = tilefinch_rgb565_blue_code(backdrop);
+                physical[x * STRIDE + WIDTH - 1 - y] = UINT32_C(0xff000000)
+                    | (r << 3 | r >> 2) | ((g << 2 | g >> 4) << 8)
+                    | ((b << 3 | b >> 2) << 16);
+            }
+        }
+        memset(scratch, 0xa5, sizeof(scratch));
+        presentation.track_menu_open = variant == 2;
+        presentation.subtitle_track_count = 1;
+        presentation.track_menu_tab = 1;
+        strcpy(presentation.subtitle_tracks[0].label, "English");
+        strcpy(presentation.subtitle_text,
+               variant == 1 || variant == 3 ? "Portrait subtitle" : "");
+        presentation.subtitle_background = variant == 3
+            ? BROWSER_SUBTITLE_BACKGROUND_SHADOW : BROWSER_SUBTITLE_BACKGROUND_BOX;
+        psp_ui_media_composite_with_preview(
+            &media, NULL, logical, HEIGHT, WIDTH, HEIGHT);
+        psp_ui_media_composite_8888(
+            &media, NULL, physical, WIDTH, HEIGHT, STRIDE, scratch);
+        for (int y = 0; y < WIDTH; y++) {
+            for (int x = 0; x < HEIGHT; x++) {
+                uint16_t pixel = logical[y * HEIGHT + x];
+                unsigned r = tilefinch_rgb565_red_code(pixel);
+                unsigned g = tilefinch_rgb565_green_code(pixel);
+                unsigned b = tilefinch_rgb565_blue_code(pixel);
+                uint32_t expected = (r << 3 | r >> 2)
+                    | ((g << 2 | g >> 4) << 8)
+                    | ((b << 3 | b >> 2) << 16);
+                CHECK((physical[x * STRIDE + WIDTH - 1 - y]
+                       & UINT32_C(0x00ffffff)) == expected);
+            }
+        }
+        for (int y = 0; y < HEIGHT; y++)
+            for (int x = WIDTH; x < STRIDE; x++)
+                CHECK(physical[y * STRIDE + x] == UINT32_C(0xff000000));
+    }
+    return true;
+}
+
 int main(void)
 {
-    if (!test_page_activation_activity()
+    if (!test_media_clockwise_controls_and_pixels()
+        || !test_page_activation_activity()
+        || !test_every_interface_language_fits_the_ui_state()
         || !test_priority_menu_during_page_work()
         || !test_input_mapping_and_menu()
         || !test_wifi_sign_in_suggestion_is_actionable()

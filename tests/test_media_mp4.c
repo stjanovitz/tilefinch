@@ -2671,6 +2671,14 @@ int main(void)
           && !psp_media_decoder_policy(
               PSP_MEDIA_AVC_PROFILE_MAIN, 31, 640, 360, true, false,
               &decoder_policy));
+    CHECK(psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, true, false,
+              &decoder_policy)
+          && decoder_policy.mpeg_mode == 5
+          && decoder_policy.me_boot_type == 1
+          && !psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, false, false,
+              &decoder_policy));
     /*
      * Baseline that fits the screen now defaults to the program which makes
      * no Media Engine boot call at all (create mode 4 / boot type 3). Three
@@ -3189,6 +3197,20 @@ int main(void)
           && psp_media_macroblock_align(0xfff0u) == 0xfff0u
           && psp_media_macroblock_align(0xfff1u) == 0u
           && psp_media_macroblock_align(0xffffu) == 0u);
+    CHECK(psp_media_surface_policy(240, 426, &surface_policy)
+          && surface_policy.stride_pixels == 512
+          && surface_policy.surface_rows == 432
+          && surface_policy.surface_bytes == (size_t) 512 * 432 * 4u
+          && surface_policy.surface_bytes <= PSP_MEDIA_360P_SURFACE_BYTES
+          && surface_policy.external_reserve_bytes == PSP_MEDIA_360P_EXTERNAL_RESERVE
+          && psp_media_surface_covers_decoded(&surface_policy, 240, 426)
+          && psp_media_decoded_geometry_admitted(240, 432, 240, 426)
+          && psp_media_surface_policy(272, 480, &surface_policy)
+          && psp_media_surface_covers_decoded(&surface_policy, 272, 480)
+          && surface_policy.surface_bytes <= PSP_MEDIA_360P_SURFACE_BYTES
+          && !psp_media_surface_policy(273, 480, &surface_policy)
+          && !psp_media_surface_policy(240, 481, &surface_policy)
+          && !psp_media_surface_policy(360, 640, &surface_policy));
     /* Firmware reports the CODED size. A 426x240 stream is coded 432x240, and
        that is agreement, not a mid-stream geometry change. */
     CHECK(psp_media_decoded_geometry_admitted(432, 240, 426, 240)
@@ -3753,6 +3775,10 @@ int main(void)
           && psp_media_advance_may_submit_video(PSP_MEDIA_ADVANCE_DRAW)
           && !psp_media_advance_may_submit_video(
                  PSP_MEDIA_ADVANCE_STAGE_COPY));
+    CHECK(psp_media_codec_poll_delay_us(1000u, 0u) == 1000u
+          && psp_media_codec_poll_delay_us(1000u, 900u) == 100u
+          && psp_media_codec_poll_delay_us(1000u, 1000u) == 0u
+          && psp_media_codec_poll_delay_us(1000u, 1001u) == 0u);
 
     puts("test: a stalled pipeline names the cause above the consequence");
     /* A clock the source has not outrun is an ordinary stall, and the older

@@ -1264,6 +1264,82 @@ static int test_gc_thrash_compile_pressure_amortized(void)
     return gc_thrash_close(&realm);
 }
 
+/* Realloc-only appends do not enter the object-allocation GC trigger. A
+   live array a few bytes below its limit must grow on demand, not repeatedly
+   collect the unchanged graph before each small capacity increase. */
+static JSValue gc_array_pin_heap(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge->host;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue array = JS_GetPropertyStr(context, global, "__array");
+    JSValue item = JS_GetPropertyStr(context, global, "__item");
+    JSValue length = JS_GetPropertyStr(context, array, "length");
+    uint32_t count = 0, capacity = JS_GetFastArrayCapacityForTest(array);
+    int okay = JS_ToUint32(context, &count, length);
+    JS_FreeValue(context, length);
+    for (uint32_t i = count; okay >= 0 && i < capacity; i++)
+        okay = JS_SetPropertyUint32(context, array, i, JS_DupValue(context, item));
+    JS_FreeValue(context, item);
+    JS_FreeValue(context, array);
+    JS_FreeValue(context, global);
+    if (okay < 0) return JS_EXCEPTION;
+    JS_RunGC(runtime->runtime);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = live + 64u;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    script_runtime_enable_heap_growth(runtime, live + 2u * MIB, 4u * MIB);
+    if (argc != 0 && !JS_ToBool(context, argv[0]))
+        runtime->heap_growth_enabled = false;
+    JS_SetGCThreshold(runtime->runtime, live + 32u);
+    return JS_UNDEFINED;
+}
+
+static int test_gc_thrash_array_growth_amortized(void)
+{
+    GcThrashRealm realm;
+    CHECK(gc_thrash_open(&realm, 4u * MIB, 768u * 1024u, 6u * MIB) == 0);
+    ScriptRuntime *runtime = realm.runtime;
+    runtime->base_memory_limit = 16u * MIB;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    CHECK(JS_SetPropertyStr(runtime->context, global, "__pinArrayHeap",
+        JS_NewCFunction(runtime->context, gc_array_pin_heap, "pinArrayHeap", 0)) >= 0);
+    JS_FreeValue(runtime->context, global);
+    JSValue value = JS_Eval(runtime->context,
+        "globalThis.__item={n:1};globalThis.__array=new Array(10000).fill(__item);",
+        strlen("globalThis.__item={n:1};globalThis.__array=new Array(10000).fill(__item);"),
+        "<gc-array-setup>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(value));
+    JS_FreeValue(runtime->context, value);
+    JS_RunGC(runtime->runtime);
+    realm.live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = realm.live + 64u;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    script_runtime_enable_heap_growth(runtime, realm.live + 2u * MIB, 4u * MIB);
+    JS_SetGCThreshold(runtime->runtime, realm.live + 32u);
+    bool threw = false;
+    char message[128];
+    size_t collections = gc_thrash_run(&realm,
+        "__pinArrayHeap();for(let i=0;i<40000;i++)__array.push(__item);__array.length",
+        &threw, message, sizeof(message));
+    printf("gc-thrash array-growth: collections=%zu limit=%zu error=\"%s\"\n",
+        collections, runtime->base_memory_limit, message);
+    CHECK(!threw && collections <= 4u);
+    CHECK(runtime->base_memory_limit <= realm.live + 3u * MIB);
+    CHECK(budget_remaining(&realm.budget) >= 4u * MIB);
+    collections = gc_thrash_run(&realm,
+        "__array=new Array(10000).fill(__item);__pinArrayHeap(false);"
+        "for(let i=0;i<100;i++){try{__array.push(__item)}catch(e){}}",
+        &threw, message, sizeof(message));
+    printf("gc-thrash array-refusal: collections=%zu error=\"%s\"\n",
+        collections, message);
+    CHECK(!threw && collections <= 24u);
+    return gc_thrash_close(&realm);
+}
+
 static int test_gc_thrash(void)
 {
     /* Every case runs (and prints its counts) even after a failure. */
@@ -1271,6 +1347,7 @@ static int test_gc_thrash(void)
     failed |= test_gc_thrash_garbage_churn_stays_under_limit();
     failed |= test_gc_thrash_starved_churn_completes();
     failed |= test_gc_thrash_compile_pressure_amortized();
+    failed |= test_gc_thrash_array_growth_amortized();
     return failed;
 }
 
@@ -4956,6 +5033,8 @@ int main(int argc, char **argv)
             || test_gc_pacing_requires_heap_growth()
             || test_dom_wrapper_receiver_sharing()
             || test_dom_order_without_sibling_wrappers();
+    if (argc == 2 && strcmp(argv[1], "--gc-array-growth-only") == 0)
+        return test_gc_thrash_array_growth_amortized();
     if (argc == 2 && strcmp(argv[1], "--gc-thrash-only") == 0)
         return test_gc_thrash();
     if (argc == 2 && strcmp(argv[1], "--task-time-slice-only") == 0)

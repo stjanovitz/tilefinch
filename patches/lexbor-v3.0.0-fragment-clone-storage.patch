@@ -1,0 +1,28 @@
+--- a/source/lexbor/dom/interfaces/node.c
++++ b/source/lexbor/dom/interfaces/node.c
+@@ -7,6 +7,7 @@
+ #include "lexbor/dom/interfaces/node.h"
+ #include "lexbor/dom/interfaces/attr.h"
+ #include "lexbor/dom/interfaces/document.h"
++#include "lexbor/dom/interfaces/document_fragment.h"
+ #include "lexbor/dom/interfaces/document_type.h"
+ #include "lexbor/dom/interfaces/element.h"
+ #include "lexbor/dom/interfaces/processing_instruction.h"
+@@ -123,7 +124,16 @@
+ {
+     lxb_dom_node_t *new;
+ 
+-    new = lxb_dom_node_interface_create(document);
++    /* The clone keeps its node type, so allocate that type's complete
++     * interface. DocumentFragment has a host beyond the Node prefix;
++     * unlike template content, its independent clone has no host. */
++    if (node->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT) {
++        new = lxb_dom_interface_node(
++            lxb_dom_document_fragment_interface_create(document));
++    }
++    else {
++        new = lxb_dom_node_interface_create(document);
++    }
+     if (new == NULL) {
+         return NULL;
+     }

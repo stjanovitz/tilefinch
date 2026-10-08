@@ -350,6 +350,45 @@ static void test_error_summary_prefers_transport_diagnostics(void)
     free(path);
 }
 
+static void test_memory_report_is_owned_and_complete(void)
+{
+    char message[] = "tilefinch-wifi-v1\nnative=0x80110601\n";
+    const char expected[] = "tilefinch-wifi-v1\nnative=0x80110601\n";
+    TilefinchDiagnosticSource source = {
+        .name = "tilefinch-wifi.txt", .memory = message,
+        .memory_size = sizeof(message) - 1u
+    };
+    TilefinchDiagnosticMetadata metadata = {.app_version = "test"};
+    char error[96];
+    TilefinchDiagnosticQrReport *report = tilefinch_diagnostic_qr_build(
+        &metadata, &source, 1, error, sizeof(error));
+    assert(report != NULL);
+    memset(message, 'x', sizeof(message) - 1u);
+    assert(tilefinch_diagnostic_qr_select_part(report, 0, error, sizeof(error)));
+    size_t length;
+    uint8_t *raw = decode_current_part(report, &length);
+    size_t at = 45u + raw[44];
+    unsigned name_length = raw[at];
+    at += 4u;
+    assert(read_u32(raw + at) == sizeof(expected) - 1u);
+    at += 4u;
+    assert(read_u32(raw + at) == 0);
+    at += 4u;
+    assert(read_u32(raw + at) == sizeof(expected) - 1u);
+    at += 8u + name_length;
+    assert(at + sizeof(expected) - 1u == length);
+    assert(memcmp(raw + at, expected, sizeof(expected) - 1u) == 0);
+    free(raw);
+    tilefinch_diagnostic_qr_destroy(report);
+    source.path = "/tmp/unused";
+    assert(tilefinch_diagnostic_qr_build(&metadata, &source, 1,
+        error, sizeof(error)) == NULL);
+    source.path = NULL;
+    source.memory_size = TILEFINCH_DIAGNOSTIC_QR_CAPTURE_LIMIT + 1u;
+    assert(tilefinch_diagnostic_qr_build(&metadata, &source, 1,
+        error, sizeof(error)) == NULL);
+}
+
 int main(void)
 {
     test_base45_vectors();
@@ -357,6 +396,7 @@ int main(void)
     test_oversized_logs_are_complete_across_bounded_parts();
     test_missing_logs_refused();
     test_error_summary_prefers_transport_diagnostics();
+    test_memory_report_is_owned_and_complete();
     puts("diagnostic QR tests passed");
     return 0;
 }

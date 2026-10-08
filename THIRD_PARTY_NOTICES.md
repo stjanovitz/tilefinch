@@ -36,8 +36,10 @@ runtime assets or immutable engine data.
 - **libwebp 1.6.0**: BSD-3-Clause-style license plus Google's additional
   patent grant. Tilefinch links only the static decode library, with encoders,
   tools, animation helpers, SIMD, and threading disabled. Decode output is a
-  caller-owned viewport-sized buffer and upstream scratch is pre-admitted
-  against the resource budget. Complete `COPYING` and `PATENTS` texts are
+  caller-owned target-sized buffer and upstream scratch allocations are
+  charged to the resource budget. Local patches extend qualifying alpha
+  streams' byte-wide history and omit an unused frame alpha reservation.
+  Complete `COPYING` and `PATENTS` texts are
   checked in under `third_party/notices/libwebp/`.
 - **FreeType 2.14.3**: dual-licensed FreeType License (FTL) or GPLv2.
   **Tilefinch elects the FTL** for all use and distribution of FreeType; the

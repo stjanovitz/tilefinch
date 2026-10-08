@@ -1,0 +1,13 @@
+psp-http-trace=1
+method=GET
+url=https://m.youtube.com/results?search_query=journey
+success=1
+async-delay-pumps=3
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=455
+effective-url=https://m.youtube.com/results?search_query=journey
+content-type=text/html; charset=utf-8
+set-cookie-count=0

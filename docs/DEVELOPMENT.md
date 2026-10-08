@@ -4,10 +4,10 @@ The short edit loop and the qualification loop are deliberately separate. Use
 `scripts/dev.sh` for the fastest targeted rebuild, or the checked-in CMake
 presets when reproducible configure, build, and test directories are more
 useful. This page covers how to build, test, and qualify a change. Measured
-results, experiments (kept and reverted), and the engine mechanisms they
-motivated are in the [performance ledger](engineering/PERFORMANCE_LEDGER.md);
-read it, and the [memory experiment ledger](engineering/MEMORY_EXPERIMENTS.md),
-before starting performance or memory work.
+results and detailed performance investigations are maintained privately.
+Maintainers read the private local memory and performance ledgers before
+repeating an experiment. These are preserved in the private development archive;
+public contributors can request the relevant prior outcomes from a maintainer.
 
 ## Quick start
 

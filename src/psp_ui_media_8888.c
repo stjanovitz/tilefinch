@@ -68,6 +68,16 @@ static void ui_media_composite_8888(
 {
     if (media == NULL || pixels == NULL || scratch == NULL
         || width <= 0 || height <= 0 || stride < width) return;
+    bool clockwise = media->presentation != NULL
+        && media->presentation->clockwise;
+    int physical_width = width;
+    int physical_stride = stride;
+    if (clockwise) {
+        int swap = width;
+        width = height;
+        height = swap;
+        stride = width;
+    }
     PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
     size_t count = without_track_menu
         ? psp_ui_media_overlay_regions_without_track_menu(
@@ -91,7 +101,10 @@ static void ui_media_composite_8888(
     for (size_t region = 0; region < count; region++) {
         const PspUiOverlayRegion *bounds = &regions[region];
         for (int y = bounds->top; y < bounds->bottom; y++) {
-            const uint32_t *source = pixels + (size_t) y * (size_t) stride;
+            const uint32_t *source = clockwise
+                ? pixels + (size_t) bounds->left * physical_stride
+                    + physical_width - 1 - y
+                : pixels + (size_t) y * (size_t) stride + bounds->left;
             uint16_t *destination = scratch + (size_t) y * (size_t) stride;
             size_t pixels_wide = (size_t) (bounds->right - bounds->left);
             if (!bounds->needs_backdrop) {
@@ -99,8 +112,13 @@ static void ui_media_composite_8888(
                     destination + bounds->left, 0,
                     pixels_wide * sizeof(*destination));
             } else {
-                for (int x = bounds->left; x < bounds->right; x++)
-                    destination[x] = ui_media_narrow(source[x]);
+                int source_step = clockwise ? physical_stride : 1;
+                for (int x = bounds->left; x < bounds->right; x++) {
+                    destination[x] = ui_media_narrow(*source);
+                    /* Do not form an out-of-allocation pointer after the
+                       last logical column in the rotated view. */
+                    if (x + 1 < bounds->right) source += source_step;
+                }
             }
         }
     }
@@ -121,9 +139,15 @@ static void ui_media_composite_8888(
         const PspUiOverlayRegion *bounds = &regions[region];
         for (int y = bounds->top; y < bounds->bottom; y++) {
             const uint16_t *source = scratch + (size_t) y * (size_t) stride;
-            uint32_t *destination = pixels + (size_t) y * (size_t) stride;
-            for (int x = bounds->left; x < bounds->right; x++)
-                destination[x] = ui_media_widen(source[x]);
+            uint32_t *destination = clockwise
+                ? pixels + (size_t) bounds->left * physical_stride
+                    + physical_width - 1 - y
+                : pixels + (size_t) y * (size_t) stride + bounds->left;
+            int destination_step = clockwise ? physical_stride : 1;
+            for (int x = bounds->left; x < bounds->right; x++) {
+                *destination = ui_media_widen(source[x]);
+                if (x + 1 < bounds->right) destination += destination_step;
+            }
         }
     }
 }
@@ -209,7 +233,8 @@ void psp_ui_media_composite_8888_cached(
         ? NULL : media->presentation;
     size_t required = (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
         * (size_t) PSP_UI_MEDIA_TRACK_MENU_HEIGHT;
-    if (presentation == NULL || !presentation->track_menu_open
+    if (presentation == NULL || presentation->clockwise
+        || !presentation->track_menu_open
         || menu_pixels == NULL || menu_pixel_capacity < required
         || menu_cache == NULL
         || width < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH

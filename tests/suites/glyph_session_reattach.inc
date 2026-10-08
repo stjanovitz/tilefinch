@@ -59,6 +59,12 @@ static bool reattach_install_through_session(
     (void) remove(package);
     CHECK(session->installer == NULL && session->reattach_pending
           && psp_glyph_component_session_installed(session, pack));
+    CHECK(psp_glyph_component_session_installed_at_least(session, pack, 1));
+    CHECK(!psp_glyph_component_session_installed_at_least(session, pack, 2));
+    CHECK(!psp_glyph_component_session_installed_at_least(
+        session, TILEFINCH_GLYPH_PACK_COUNT, 1));
+    CHECK(!psp_glyph_component_session_installed_at_least(
+        session, (TilefinchGlyphPack) -1, 1));
     return true;
 }
 

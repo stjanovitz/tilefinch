@@ -5,6 +5,10 @@
 #include "tilefinch/render.h"
 #include "tilefinch/style.h"
 #include "../src/style_cache_internal.h"
+#include "../src/layout_internal.h"
+#undef budget_malloc
+#undef budget_calloc
+#undef budget_realloc
 #include "../src/style_internal.h"
 
 #include <pthread.h>
@@ -1077,6 +1081,58 @@ static int test_quoted_declaration_boundaries(void)
     return 0;
 }
 
+static int test_retained_cache_eligibility(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<p>cache eligibility</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet ordinary = {0}, containers = {0};
+    CHECK(stylesheet_build(&ordinary, &budget, &document, 480));
+    CHECK(stylesheet_build(&containers, &budget, &document, 480));
+    for (unsigned i = 0; i < 64; i++) {
+        char css[64];
+        int length = snprintf(css, sizeof(css), ".pad%u{color:red}", i);
+        CHECK(length > 0
+              && stylesheet_add_css(&ordinary, css, (size_t) length)
+              && stylesheet_add_css(&containers, css, (size_t) length));
+    }
+    static const char query[] =
+        "@container (min-width: 100px){.pad0{color:blue}}";
+    CHECK(stylesheet_add_css(&containers, query, sizeof(query) - 1u));
+    CHECK(stylesheet_has_container_queries(&containers));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
+    CHECK(reuse->matches == NULL && !reuse->matches_attempted);
+    layout_reuse_cache_prepare(reuse, &ordinary, NULL, NULL, 480);
+    CHECK(reuse->matches != NULL);
+    LayoutReuseStats eligible, ineligible;
+    layout_reuse_cache_stats(reuse, &eligible);
+    size_t match_bytes = style_retained_matches_bytes(reuse->matches);
+    layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
+    layout_reuse_cache_stats(reuse, &ineligible);
+    CHECK(reuse->matches == NULL && !reuse->matches_attempted
+          && eligible.retained_bytes - ineligible.retained_bytes == match_bytes);
+    layout_reuse_cache_prepare(reuse, &ordinary, NULL, NULL, 480);
+    CHECK(reuse->matches != NULL);
+    layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    layout_reuse_cache_prepare(reuse, &ordinary, NULL, NULL, 480);
+    CHECK(reuse->matches == NULL && reuse->matches_attempted);
+    budget.limit = limit;
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&ordinary);
+    stylesheet_destroy(&containers);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_retained_range_cache_handoff(void)
 {
     Budget budget;
@@ -1113,6 +1169,98 @@ static int test_retained_range_cache_handoff(void)
     return 0;
 }
 
+static int test_retained_dense_storage(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    char html[8192];
+    size_t length = (size_t) snprintf(html, sizeof(html),
+        "<style>p{color:#123456}p::before{content:'x'}</style>");
+    for (unsigned i = 0; i < 600; i++) {
+        int added = snprintf(html + length, sizeof(html) - length,
+                             "<p>x</p>");
+        CHECK(added > 0 && (size_t) added < sizeof(html) - length);
+        length += (size_t) added;
+    }
+    CHECK(document_parse(&document, &budget, html, length, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    StyleRetainedMatches *table = style_retained_matches_create(&budget);
+    CHECK(table != NULL && table->entry_count == 0
+          && style_retained_matches_bytes(table) < 70u * 1024u);
+    lxb_dom_node_t *body = lxb_dom_interface_node(document.html->body);
+    lxb_dom_node_t *node = body->first_child;
+    CHECK(node != NULL);
+    ComputedStyle reference = style_for_node(&sheet, node, NULL);
+    (void) style_retained_matches_attach(&sheet, table);
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    ComputedStyle refused = style_for_node(&sheet, node, NULL);
+    CHECK(refused.color == reference.color && table->occupied == 0
+          && table->growth_refused && table->entry_capacity == 0);
+    size_t failures = budget.failure_count;
+    (void) style_for_node(&sheet, node, NULL);
+    CHECK(budget.failure_count == failures); /* No allocation-refusal storm. */
+    budget.limit = limit;
+    style_retained_matches_clear(table);
+    /* A later optional growth refusal must also preserve already-cached
+       answers, their hash associations, and their allocation. */
+    node = body->first_child;
+    while (node != NULL && table->entry_count < 128u) {
+        (void) style_for_node(&sheet, node, NULL);
+        node = node->next;
+    }
+    CHECK(node != NULL && table->entry_count == 128u
+          && table->entry_capacity == 128u);
+    budget.limit = budget.current;
+    while (node != NULL && !table->growth_refused) {
+        ComputedStyle computed = style_for_node(&sheet, node, NULL);
+        CHECK(computed.color == reference.color);
+        node = node->next;
+    }
+    CHECK(table->growth_refused && table->entry_count == 128u);
+    size_t growth_hits = table->hits;
+    CHECK(style_for_node(&sheet, body->first_child, NULL).color == reference.color
+          && table->hits == growth_hits + 1u);
+    budget.limit = limit;
+    style_retained_matches_clear(table);
+    for (node = body->first_child; node != NULL; node = node->next) {
+        ComputedStyle computed = style_for_node(&sheet, node, NULL);
+        CHECK(computed.color == reference.color);
+        (void) style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &computed);
+        (void) style_for_pseudo(&sheet, node, PSEUDO_AFTER, &computed);
+    }
+    CHECK(table->entry_count > 128 && table->entry_capacity <= 2048
+          && style_retained_matches_bytes(table) < 150u * 1024u);
+    size_t count = table->entry_count, capacity = table->entry_capacity;
+    size_t before_hits = table->hits;
+    for (node = body->first_child; node != NULL; node = node->next) {
+        ComputedStyle computed = style_for_node(&sheet, node, NULL);
+        CHECK(computed.color == reference.color);
+        (void) style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &computed);
+        (void) style_for_pseudo(&sheet, node, PSEUDO_AFTER, &computed);
+    }
+    CHECK(table->hits > before_hits && table->entry_count == count);
+    for (node = body->first_child; node != NULL; node = node->next)
+        style_retained_matches_forget_node(table, node);
+    CHECK(table->occupied == 0);
+    for (node = body->first_child; node != NULL; node = node->next)
+        (void) style_for_node(&sheet, node, NULL);
+    CHECK(table->entry_count == count && table->entry_capacity == capacity);
+    style_retained_matches_clear(table);
+    CHECK(table->occupied == 0 && table->entry_count == 0);
+    (void) style_for_node(&sheet, body->first_child, NULL);
+    CHECK(table->entry_count == 1 && table->entry_capacity == capacity);
+    (void) style_retained_matches_attach(&sheet, NULL);
+    style_retained_matches_destroy(table);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_retained_retirement_probe_holes(void)
 {
     Budget budget;
@@ -1136,21 +1284,29 @@ static int test_retained_retirement_probe_holes(void)
         if (pseudos[p] != PSEUDO_NONE)
             (void) style_for_pseudo(&sheet, node, pseudos[p], &computed);
         size_t home = 0;
-        while (home < STYLE_RETAINED_MATCH_CAPACITY
-               && !(retained->entries[home].node == node
-                    && retained->entries[home].pseudo == (uint8_t) pseudos[p])) home++;
+        while (home < STYLE_RETAINED_MATCH_CAPACITY) {
+            uint16_t index = retained->slots[home];
+            if (index != 0 && retained->entries[index - 1u].node == node
+                && retained->entries[index - 1u].pseudo == (uint8_t) pseudos[p]) break;
+            home++;
+        }
         CHECK(home < STYLE_RETAINED_MATCH_CAPACITY);
-        StyleRetainedMatchEntry entry = retained->entries[home];
+        StyleRetainedMatchEntry entry = retained->entries[retained->slots[home] - 1u];
         style_retained_matches_clear(retained);
         /* Token invalidation leaves holes; a subsequent insertion can also
            duplicate a key that survives farther along its bounded probe. */
-        retained->entries[(home + 1u) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)] = entry;
-        retained->entries[(home + 3u) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)] = entry;
+        for (size_t i = 0; i < 2; i++) {
+            size_t slot = (home + 1u + i * 2u) & (STYLE_RETAINED_MATCH_CAPACITY - 1u);
+            retained->entries[i] = entry;
+            retained->entries[i].slot = (uint16_t) slot;
+            retained->slots[slot] = (uint16_t) (i + 1u);
+        }
+        retained->entry_count = 2;
         retained->occupied = 2;
         style_retained_matches_forget_subtree(retained, group);
         CHECK(retained->occupied == 0);
         for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++)
-            CHECK(retained->entries[i].node == NULL);
+            CHECK(retained->slots[i] == 0);
     }
     (void) style_retained_matches_attach(&sheet, NULL);
     style_retained_matches_destroy(retained);
@@ -1281,7 +1437,7 @@ static int test_retained_keyless_lost_match(void)
 static bool retained_has_entry(const StyleRetainedMatches *table,
                                const lxb_dom_node_t *node)
 {
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++)
+    for (size_t i = 0; i < table->entry_count; i++)
         if (table->entries[i].node == node) return true;
     return false;
 }
@@ -2833,6 +2989,8 @@ int main(int argc, char **argv)
         return test_escaped_utility_classes_indexed();
     CHECK(test_selector_attribute_names() == 0);
     CHECK(benchmark_selector_attribute_names() == 0);
+    CHECK(test_retained_cache_eligibility() == 0);
+    CHECK(test_retained_dense_storage() == 0);
     CHECK(test_retained_range_cache_handoff() == 0);
     CHECK(test_class_token_byte_boundaries() == 0);
     CHECK(test_retained_properties_share_class_tokens() == 0);

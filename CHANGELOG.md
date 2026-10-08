@@ -8,6 +8,44 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.30 — 2026-10-07
+
+Reissued with signed update sequence 31. The public version remains 0.1.30;
+existing sequence-30 installations can update normally.
+
+### Interface and browsing
+
+- Downloadable interface languages are available in Settings → Appearance →
+  Language & emoji. Install the selected translation and any required glyph
+  pack, then restart to apply it. This translates browser menus, not websites.
+- Menu-navigation instructions are translated too, with Up/Down guidance and
+  bounded fitting for longer labels. Downloads are hosted only by the optional
+  resource repository; browser builds retain versioned resource keys and hashes.
+- Reader mode reuses stylesheets already loaded by the page instead of
+  downloading them again when switching views.
+- Cursor, focus and browser controls retain priority while page work is
+  ongoing. Video journeys also preserve bounded, in-memory navigation state.
+- The Square button shortcut now uses a built-in □ symbol.
+
+### Video and connection support
+
+- Added portrait playback, rotation and center-crop controls, including
+  graphics-engine presentation for supported 240p/360p video. Seeking and
+  playback controls follow the rotated view.
+- The YouTube homepage can load optional topic categories after displaying
+  its search box. Disable them in Settings → Video → YouTube home topics.
+  Additional video-result card formats are supported.
+- Optional verbose Wi-Fi diagnostics provide a shareable on-screen report
+  without writing a log for each connection or recording network passwords.
+
+### Memory and reliability
+
+- Reduced WebP decoder scratch memory while preserving exact image output.
+- Reduced unnecessary selector-cache allocation and near-limit JavaScript
+  collections during array growth.
+- Fixed allocation-failure handling for JavaScript bound functions and
+  storage ownership when cloning document fragments.
+
 ## 0.1.29 — 2026-10-07
 
 ### Before you update

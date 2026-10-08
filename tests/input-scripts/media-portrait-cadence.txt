@@ -1,0 +1,28 @@
+# Local silent 90-second fixture, alternating copy paths in one binary.
+# Video marks exclude startup, seeks, pauses, closing, and diagnostic flushes.
+until-live 2400
+wait-live 30
+tap-live select
+wait-live 240
+mark-live media-stage-cpu
+mark-live video-measure-start
+wait-live 1200
+mark-live video-measure-end
+mark-live media-stage-ge
+wait-live 60
+mark-live video-measure-start
+wait-live 1200
+mark-live video-measure-end
+mark-live media-stage-cpu
+wait-live 60
+mark-live video-measure-start
+wait-live 1200
+mark-live video-measure-end
+mark-live media-stage-ge
+wait-live 60
+mark-live video-measure-start
+wait-live 1200
+mark-live video-measure-end
+tap-live circle
+wait-live 30
+end

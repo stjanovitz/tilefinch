@@ -2857,7 +2857,7 @@ static bool refuse_style_invalidate(void *context, const char *phase,
 
 static int test_checked_invalidation_cancel_drops_lists(Budget *budget)
 {
-    static char html[8192];
+    static char html[16384];
     int used = snprintf(html, sizeof(html),
         "<!doctype html><style>p{color:#111111}.drawer{display:none}"
         ".toggle:checked ~ .drawer{display:block;color:#123456}");
@@ -2868,7 +2868,17 @@ static int test_checked_invalidation_cancel_drops_lists(Budget *budget)
     CHECK(used > 0 && (size_t) used < sizeof(html) - 256u);
     used += snprintf(html + used, sizeof(html) - (size_t) used,
         "</style><body><input type=checkbox class=toggle id=t>"
-        "<p class=drawer>drawer</p><p>other</p></body>");
+        "<p class=drawer>drawer</p><p>other</p>");
+    /* Dense cache invalidation visits populated records, not empty hash
+       buckets. Populate enough records to reach the real cancellation
+       checkpoint rather than depending on a wasteful empty-table scan. */
+    for (unsigned i = 0; i < 800; i++) {
+        int added = snprintf(html + used, sizeof(html) - (size_t) used,
+                             "<p>x</p>");
+        CHECK(added > 0 && (size_t) added < sizeof(html) - (size_t) used);
+        used += added;
+    }
+    used += snprintf(html + used, sizeof(html) - (size_t) used, "</body>");
     PocDocument document = {0};
     Stylesheet sheet = {0};
     ViewportContext viewport;
@@ -2884,7 +2894,7 @@ static int test_checked_invalidation_cancel_drops_lists(Budget *budget)
     layout_destroy(&retained);
     LayoutReuseStats before;
     layout_reuse_cache_stats(reuse, &before);
-    CHECK(before.matched_stores > 0);
+    CHECK(before.matched_stores > 2048);
     lxb_dom_node_t *toggle = find_id(document_body_node(&document), "t");
     CHECK(toggle != NULL && lxb_dom_element_set_attribute(
         lxb_dom_interface_element(toggle), (const lxb_char_t *) "checked", 7,

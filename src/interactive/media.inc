@@ -400,6 +400,8 @@ static bool interactive_media_execute_intent(
             return sought;
         }
         case PSP_UI_MEDIA_ACTION_RETRY:
+        /* The host player does not advertise the PSP GE rotation action. */
+        case PSP_UI_MEDIA_ACTION_ROTATE:
         case PSP_UI_MEDIA_ACTION_AUDIO_ONLY:
         case PSP_UI_MEDIA_ACTION_LOWER_QUALITY:
         case PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK:

@@ -7,6 +7,7 @@
 #include "tilefinch/site_identity.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_lite.h"
+#include "tilefinch/psp_ui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -395,6 +396,8 @@ int main(int argc, char **argv)
         return test_deferred_startup_journey();
     if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
         return test_loading_interaction_journey();
+    if (argc == 2 && strcmp(argv[1], "--text-memory-only") == 0)
+        return test_text_content_does_not_retain_scratch();
     if (argc == 2 && strcmp(argv[1], "--script-free-journey-only") == 0)
         return test_script_free_browsing_journey();
     if (argc == 2 && strcmp(argv[1], "--background-interruption-only") == 0)
@@ -405,6 +408,8 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
         return test_cooperative_site_adapter_navigation();
     }
+    if (argc == 2 && strcmp(argv[1], "--search-video-journey-only") == 0)
+        return test_search_video_journey();
     if (argc == 2 && strcmp(argv[1], "--pointer-search-only") == 0)
         return profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
             "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
@@ -414,6 +419,7 @@ int main(int argc, char **argv)
         "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
         0, true, "psp", false) == 0);
     CHECK(test_loading_interaction_journey() == 0);
+    CHECK(test_text_content_does_not_retain_scratch() == 0);
     CHECK(test_script_focus_adoption() == 0);
     CHECK(test_late_script_text_focus_adoption() == 0);
     CHECK(test_boot_window_check_backs_off() == 0);
@@ -476,10 +482,12 @@ int main(int argc, char **argv)
     CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_lite_escaped_title_is_valid_utf8() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
+    CHECK(test_youtube_home_topics_are_lazy() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);
     CHECK(test_google_search_identity() == 0);
     CHECK(test_reader_presentation_adapter() == 0);
+    CHECK(test_reader_switch_reuses_page_stylesheet_responses() == 0);
     CHECK(test_blank_reader_frontend_recovery() == 0);
     CHECK(test_declared_media_card_recovery() == 0);
     CHECK(test_basic_view_admission_and_presentation() == 0);

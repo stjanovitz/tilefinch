@@ -198,6 +198,10 @@ add_library(tilefinch_psp_media_present STATIC
     src/psp_media_present.c
     src/psp_media_present_ge.c)
 target_include_directories(tilefinch_psp_media_present PUBLIC include)
+if(PSP AND TILEFINCH_PSP_VALIDATION_LOG)
+    target_compile_definitions(tilefinch_psp_media_present PRIVATE
+        TILEFINCH_PSP_VALIDATION_LOG=1)
+endif()
 # Only the validation-only probe needs it: it draws the same synthetic frame
 # through both presenters and requires them to agree pixel for pixel.
 target_link_libraries(tilefinch_psp_media_present PUBLIC
@@ -223,6 +227,9 @@ endif()
 
 if(NOT PSP)
     add_executable(psp-browser-ui-preview src/psp_ui_preview.c)
+    add_dependencies(psp-browser-ui-preview tilefinch-ui-resources)
+    target_compile_definitions(psp-browser-ui-preview PRIVATE
+        TILEFINCH_UI_RESOURCE_ROOT="${TILEFINCH_UI_RESOURCE_ROOT}")
     target_link_libraries(psp-browser-ui-preview PRIVATE
         tilefinch_psp_ui tilefinch_diagnostic_qr)
 endif()
@@ -411,6 +418,7 @@ if(PSP)
             src/psp_app/psp_app_exit_handoff.c
             src/psp_app/psp_app_frame_pumps.c
             src/psp_app/psp_app_glyph_component.c
+            src/psp_app/psp_app_ui_language.c
             src/psp_app/psp_app_voice_component.c
             src/psp_clock_worker.c
             src/psp_log.c

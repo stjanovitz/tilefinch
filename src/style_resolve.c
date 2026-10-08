@@ -2036,14 +2036,15 @@ StyleRetainedMatches *style_retained_matches_create(Budget *budget)
     StyleRetainedMatches *table = budget_calloc_category(
         budget, BUDGET_CATEGORY_LAYOUT, 1, sizeof(*table));
     if (table == NULL) return NULL;
-    table->entries = budget_calloc_category(
+    table->slots = budget_calloc_category(
         budget, BUDGET_CATEGORY_LAYOUT, STYLE_RETAINED_MATCH_CAPACITY,
-        sizeof(*table->entries));
-    if (table->entries == NULL) {
+        sizeof(*table->slots));
+    if (table->slots == NULL) {
         budget_free(budget, table);
         return NULL;
     }
     table->budget = budget;
+    table->free_entry = UINT16_MAX;
     return table;
 }
 
@@ -2051,6 +2052,7 @@ void style_retained_matches_destroy(StyleRetainedMatches *table)
 {
     if (table == NULL) return;
     Budget *budget = table->budget;
+    budget_free(budget, table->slots);
     budget_free(budget, table->entries);
     memset(table, 0, sizeof(*table));
     budget_free(budget, table);
@@ -2060,15 +2062,73 @@ size_t style_retained_matches_bytes(const StyleRetainedMatches *table)
 {
     if (table == NULL) return 0;
     return sizeof(*table)
-           + STYLE_RETAINED_MATCH_CAPACITY * sizeof(*table->entries);
+           + STYLE_RETAINED_MATCH_CAPACITY * sizeof(*table->slots)
+           + table->entry_capacity * sizeof(*table->entries);
 }
 
 void style_retained_matches_clear(StyleRetainedMatches *table)
 {
-    if (table == NULL || table->entries == NULL || table->occupied == 0) return;
-    memset(table->entries, 0,
-           STYLE_RETAINED_MATCH_CAPACITY * sizeof(*table->entries));
+    if (table == NULL || table->slots == NULL) return;
+    table->growth_refused = false;
+    if (table->entry_count == 0) return;
+    memset(table->slots, 0,
+           STYLE_RETAINED_MATCH_CAPACITY * sizeof(*table->slots));
     table->occupied = 0;
+    table->entry_count = 0;
+    table->free_entry = UINT16_MAX;
+}
+
+static StyleRetainedMatchEntry *style_retained_slot(
+    const StyleRetainedMatches *table, size_t slot)
+{
+    uint16_t index = table->slots[slot];
+    return index == 0 ? NULL : &table->entries[index - 1u];
+}
+
+static void style_retained_remove(StyleRetainedMatches *table,
+                                  StyleRetainedMatchEntry *entry)
+{
+    table->slots[entry->slot] = 0;
+    size_t index = (size_t) (entry - table->entries);
+    memset(entry, 0, sizeof(*entry));
+    entry->slot = table->free_entry;
+    table->free_entry = (uint16_t) index;
+    table->occupied--;
+}
+
+static StyleRetainedMatchEntry *style_retained_allocate(
+    StyleRetainedMatches *table, size_t slot)
+{
+    size_t index;
+    if (table->free_entry != UINT16_MAX) {
+        index = table->free_entry;
+        table->free_entry = table->entries[index].slot;
+    } else {
+        if (table->entry_count == table->entry_capacity) {
+            if (table->growth_refused) return NULL;
+            size_t capacity = table->entry_capacity == 0
+                ? 128u : table->entry_capacity * 2u;
+            if (capacity > STYLE_RETAINED_MATCH_CAPACITY) return NULL;
+            StyleRetainedMatchEntry *entries = budget_realloc_category(
+                table->budget, BUDGET_CATEGORY_LAYOUT, table->entries,
+                capacity * sizeof(*entries));
+            /* Optional memoization: refusal changes neither the computed
+               answer nor any existing key/payload association. */
+            if (entries == NULL) {
+                table->growth_refused = true;
+                return NULL;
+            }
+            table->entries = entries;
+            table->entry_capacity = capacity;
+        }
+        index = table->entry_count++;
+    }
+    StyleRetainedMatchEntry *entry = &table->entries[index];
+    memset(entry, 0, sizeof(*entry));
+    entry->slot = (uint16_t) slot;
+    table->slots[slot] = (uint16_t) (index + 1u);
+    table->occupied++;
+    return entry;
 }
 
 StyleRetainedMatches *style_retained_matches_attach(
@@ -2102,14 +2162,14 @@ static void style_retained_forget_node(StyleRetainedMatches *table,
         size_t home = style_retained_home(node, pseudos[p]);
         for (size_t probe = 0; probe < STYLE_RETAINED_MATCH_PROBE_LIMIT;
              probe++) {
-            StyleRetainedMatchEntry *entry = &table->entries[
-                (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)];
+            StyleRetainedMatchEntry *entry = style_retained_slot(table,
+                (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u));
             /* Invalidation leaves holes and reinsertion can duplicate a key.
                Retirement must clear the entire bounded probe, not just the
                prefix visible to lookup, before the DOM storage is freed. */
-            if (entry->node == node && entry->pseudo == (uint8_t) pseudos[p]) {
-                memset(entry, 0, sizeof(*entry));
-                table->occupied--;
+            if (entry != NULL && entry->node == node
+                && entry->pseudo == (uint8_t) pseudos[p]) {
+                style_retained_remove(table, entry);
             }
         }
     }
@@ -2130,7 +2190,7 @@ size_t style_retained_matches_drop_selected(
     if (table == NULL || table->entries == NULL || table->occupied == 0
         || selects == NULL) return 0;
     size_t dropped = 0;
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+    for (size_t i = 0; i < table->entry_count; i++) {
         /* As in style_retained_matches_invalidate_rules: dropping every
            list is always correct, so a cancelled scan does that. */
         if ((i & 2047u) == 2047u
@@ -2141,8 +2201,7 @@ size_t style_retained_matches_drop_selected(
         }
         StyleRetainedMatchEntry *entry = &table->entries[i];
         if (entry->node == NULL || !selects(opaque, entry->node)) continue;
-        memset(entry, 0, sizeof(*entry));
-        table->occupied--;
+        style_retained_remove(table, entry);
         dropped++;
     }
     return dropped;
@@ -2200,12 +2259,11 @@ void style_retained_matches_invalidate_within(
         style_retained_matches_forget_subtree(table, scope);
         return;
     }
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+    for (size_t i = 0; i < table->entry_count; i++) {
         StyleRetainedMatchEntry *entry = &table->entries[i];
         if (entry->node != NULL
             && style_retained_node_within(entry->node, scope)) {
-            memset(entry, 0, sizeof(*entry));
-            table->occupied--;
+            style_retained_remove(table, entry);
         }
     }
 }
@@ -2236,13 +2294,18 @@ static size_t style_retained_home(const lxb_dom_node_t *node,
            & (STYLE_RETAINED_MATCH_CAPACITY - 1u);
 }
 
+bool style_retained_matches_supported(const Stylesheet *sheet)
+{
+    return sheet != NULL && sheet->count <= UINT16_MAX
+           && !stylesheet_has_container_queries(sheet);
+}
+
 static bool style_retained_usable(const Stylesheet *sheet)
 {
-    return sheet != NULL && sheet->resolve_scratch != NULL
+    return style_retained_matches_supported(sheet)
+           && sheet->resolve_scratch != NULL
            && sheet->resolve_scratch->retained_matches != NULL
-           && sheet->resolve_scratch->retained_matches->entries != NULL
-           && sheet->count <= UINT16_MAX
-           && !stylesheet_has_container_queries(sheet);
+           && sheet->resolve_scratch->retained_matches->slots != NULL;
 }
 
 static const StyleRetainedMatchEntry *style_retained_lookup(
@@ -2253,13 +2316,13 @@ static const StyleRetainedMatchEntry *style_retained_lookup(
     StyleRetainedMatches *table = sheet->resolve_scratch->retained_matches;
     size_t home = style_retained_home(node, pseudo);
     for (size_t probe = 0; probe < STYLE_RETAINED_MATCH_PROBE_LIMIT; probe++) {
-        const StyleRetainedMatchEntry *entry = &table->entries[
-            (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)];
+        const StyleRetainedMatchEntry *entry = style_retained_slot(table,
+            (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u));
+        if (entry == NULL) break;
         if (entry->node == node && entry->pseudo == (uint8_t) pseudo) {
             table->hits++;
             return entry;
         }
-        if (entry->node == NULL) break;
     }
     table->misses++;
     return NULL;
@@ -2309,7 +2372,7 @@ void style_retained_matches_invalidate_tokens(
     }
     table->token_invalidations++;
     table->token_affected_rules += affected_count;
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+    for (size_t i = 0; i < table->entry_count; i++) {
         StyleRetainedMatchEntry *entry = &table->entries[i];
         if (entry->node == NULL) continue;
         bool drop = false;
@@ -2317,8 +2380,7 @@ void style_retained_matches_invalidate_tokens(
             drop = entry->node == nodes[n];
         }
         if (drop) {
-            memset(entry, 0, sizeof(*entry));
-            table->occupied--;
+            style_retained_remove(table, entry);
             table->token_dropped++;
         }
     }
@@ -2460,7 +2522,7 @@ void style_retained_matches_invalidate_rules(
                                           &key_mask);
         budget_free(sheet->budget, keyed_rules);
     }
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+    for (size_t i = 0; i < table->entry_count; i++) {
         /* A full table is ~16k lists on a long article, 70 ms on the PSP.
            Dropping every list is always correct, so a cancelled scan does
            exactly that instead of holding input. */
@@ -2496,8 +2558,7 @@ void style_retained_matches_invalidate_rules(
             }
         }
         if (drop) {
-            memset(entry, 0, sizeof(*entry));
-            table->occupied--;
+            style_retained_remove(table, entry);
             table->token_dropped++;
         }
     }
@@ -2508,7 +2569,7 @@ void style_retained_matches_remap(StyleRetainedMatches *table,
                                   const uint16_t *remap, size_t old_count)
 {
     if (table == NULL || table->entries == NULL || table->occupied == 0) return;
-    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+    for (size_t i = 0; i < table->entry_count; i++) {
         StyleRetainedMatchEntry *entry = &table->entries[i];
         if (entry->node == NULL) continue;
         bool valid = remap != NULL;
@@ -2517,8 +2578,7 @@ void style_retained_matches_remap(StyleRetainedMatches *table,
                     && remap[entry->rules[k]] != UINT16_MAX;
         }
         if (!valid) {
-            memset(entry, 0, sizeof(*entry));
-            table->occupied--;
+            style_retained_remove(table, entry);
             continue;
         }
         for (size_t k = 0; k < entry->count; k++) {
@@ -2568,20 +2628,21 @@ static void style_retained_commit(const Stylesheet *sheet,
     scratch->retained_pending_active = false;
     scratch->retained_pending_valid = false;
     StyleRetainedMatches *table = scratch->retained_matches;
-    if (!valid || node == NULL || table == NULL || table->entries == NULL) return;
+    if (!valid || node == NULL || table == NULL || table->slots == NULL) return;
     size_t home = style_retained_home(node, pseudo);
     size_t slot = home;
     for (size_t probe = 0; probe < STYLE_RETAINED_MATCH_PROBE_LIMIT; probe++) {
         slot = (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u);
-        const StyleRetainedMatchEntry *entry = &table->entries[slot];
-        if (entry->node == NULL
+        const StyleRetainedMatchEntry *entry = style_retained_slot(table, slot);
+        if (entry == NULL
             || (entry->node == node && entry->pseudo == (uint8_t) pseudo))
             break;
     }
     /* A full probe window replaces its last slot; every surviving entry is
        still exact for its own element, so a displaced one only misses. */
-    StyleRetainedMatchEntry *entry = &table->entries[slot];
-    if (entry->node == NULL) table->occupied++;
+    StyleRetainedMatchEntry *entry = style_retained_slot(table, slot);
+    if (entry == NULL) entry = style_retained_allocate(table, slot);
+    if (entry == NULL) return;
     entry->node = node;
     entry->pseudo = (uint8_t) pseudo;
     entry->count = scratch->retained_pending_count;
@@ -4150,6 +4211,14 @@ static ComputedStyle style_apply_node_cascade_inner(
        and every candidate evaluation; the rules are replayed per range. */
     const StyleRetainedMatchEntry *retained =
         style_retained_lookup(sheet, node, PSEUDO_NONE);
+    /* Resolving declarations can recurse into another node's style and grow
+       the dense payload array. Keep this exact list independent of that
+       optional allocation (and of nested cache invalidation). */
+    StyleRetainedMatchEntry retained_copy;
+    if (retained != NULL) {
+        retained_copy = *retained;
+        retained = &retained_copy;
+    }
     bool record = retained == NULL && style_retained_begin(sheet);
     StyleMatchSubject subject = {0};
     StyleRuleIndexPlan index_plan = {0};
@@ -5138,8 +5207,13 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
     StyleRuleIndexPlan index_plan = {0};
     uint32_t candidate_list[STYLE_RULE_INDEX_LIST_CAPACITY];
     const StyleRetainedMatchEntry *retained = NULL;
+    StyleRetainedMatchEntry retained_copy;
     if (sheet != NULL && node != NULL && pseudo != PSEUDO_NONE) {
         retained = style_retained_lookup(sheet, node, pseudo);
+        if (retained != NULL) {
+            retained_copy = *retained;
+            retained = &retained_copy;
+        }
     }
     if (layout_only && sheet != NULL && node != NULL && pseudo != PSEUDO_NONE) {
         stylesheet_prepare_rule_index((Stylesheet *) sheet);

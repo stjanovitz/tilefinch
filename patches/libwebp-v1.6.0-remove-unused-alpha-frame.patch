@@ -1,0 +1,29 @@
+--- a/src/dec/frame_dec.c
++++ b/src/dec/frame_dec.c
+@@ -707,13 +707,10 @@
+   const size_t cache_height = (16 * num_caches
+                             + kFilterExtraRows[dec->filter_type]) * 3 / 2;
+   const size_t cache_size = top_size * cache_height;
+-  // alpha_size is the only one that scales as width x height.
+-  const uint64_t alpha_size = (dec->alpha_data != NULL) ?
+-      (uint64_t)dec->pic_hdr.width * dec->pic_hdr.height : 0ULL;
+   const uint64_t needed = (uint64_t)intra_pred_mode_size
+                         + top_size + mb_info_size + f_info_size
+                         + yuv_size + mb_data_size
+-                        + cache_size + alpha_size + WEBP_ALIGN_CST;
++                        + cache_size + WEBP_ALIGN_CST;
+   uint8_t* mem;
+ 
+   if (!CheckSizeOverflow(needed)) return 0;  // check for overflow
+@@ -777,9 +774,8 @@
+   }
+   mem += cache_size;
+ 
+-  // alpha plane
+-  dec->alpha_plane = alpha_size ? mem : NULL;
+-  mem += alpha_size;
++  // Alpha decoding owns its output in alpha_plane_mem (alpha_dec.c).
++  // Do not reserve a second, unused source-sized plane in this frame block.
+   assert(mem <= (uint8_t*)dec->mem + dec->mem_size);
+ 
+   // note: left/top-info is initialized once for all.

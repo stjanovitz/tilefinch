@@ -2017,6 +2017,7 @@ void layout_reuse_cache_stats(const LayoutReuseCache *cache,
     }
     *stats = cache->stats;
     if (cache->matches != NULL) {
+        stats->retained_bytes += style_retained_matches_bytes(cache->matches);
         stats->matched_hits = cache->matches->hits;
         stats->matched_misses = cache->matches->misses;
         stats->matched_stores = cache->matches->stores;
@@ -2570,17 +2571,23 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
     cache->style_shortfall = 0;
     uint64_t sheet_generation =
         sheet == NULL ? 0 : sheet->build_generation;
-    if (sheet != NULL && cache->matches_enabled && cache->matches == NULL
+    bool matches_supported = style_retained_matches_supported(sheet);
+    if (!matches_supported) {
+        /* Preparation is outside a resolution's attachment lifetime. A
+           query added by CSS can make an old table permanently unusable. */
+        if (cache->matches != NULL) {
+            style_retained_matches_destroy(cache->matches);
+            cache->matches = NULL;
+        }
+        cache->matches_attempted = false;
+    }
+    if (matches_supported && cache->matches_enabled && cache->matches == NULL
         && !cache->matches_attempted && sheet->count >= 64u) {
         cache->matches_attempted = true;
 #ifndef TILEFINCH_NO_TRACE
         if (getenv("TILEFINCH_DISABLE_RETAINED_MATCHES") == NULL)
 #endif
         cache->matches = style_retained_matches_create(cache->budget);
-        if (cache->matches != NULL) {
-            cache->stats.retained_bytes +=
-                style_retained_matches_bytes(cache->matches);
-        }
     }
     if (cache->sheet == sheet
         && cache->sheet_generation == sheet_generation

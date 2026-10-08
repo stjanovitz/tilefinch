@@ -263,6 +263,10 @@ static void psp_input_script_latch_live_capture_mark(void)
        control records, not visual checkpoints. */
     if (strcmp(mark, "webgl-measure-start") == 0
         || strcmp(mark, "webgl-measure-end") == 0
+        || strcmp(mark, "video-measure-start") == 0
+        || strcmp(mark, "video-measure-end") == 0
+        || strcmp(mark, "media-stage-cpu") == 0
+        || strcmp(mark, "media-stage-ge") == 0
         || strcmp(mark, "auto-controls") == 0
         || strcmp(mark, "controls-exited") == 0) return;
     snprintf(psp_input_script_pending_capture_mark,
@@ -434,10 +438,22 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
            (unsigned) intent->tab_index);
 }
 
+static bool psp_input_script_until_media_playing(void)
+{
+    static const char directive[] = "@media-playing";
+    if (strncmp(psp_input_script_until_js, directive,
+                sizeof(directive) - 1u) != 0) return false;
+    const char *tail = psp_input_script_until_js + sizeof(directive) - 1u;
+    while (*tail == ' ' || *tail == '\t' || *tail == '\r' || *tail == '\n')
+        tail++;
+    return *tail == '\0';
+}
+
 static void psp_input_script_test_until(const NavigationSession *navigation)
 {
     if (!psp_input_script_awaiting_condition(&psp_input_script)
         || psp_input_script_until_js[0] == '\0'
+        || psp_input_script_until_media_playing()
         || navigation->page.runtime == NULL) return;
     unsigned long long now = sceKernelGetSystemTimeWide();
     if (psp_input_script_until_checks != 0
@@ -790,11 +806,25 @@ void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media)
 {
     if (!psp_input_script_armed(&psp_input_script) || media == NULL) return;
+    /* A fixed live wait can expire during decoder startup and send Select
+       to the loading screen instead of the player. Native media readiness is
+       deliberately independent of author JavaScript and loading duration. */
+    if (psp_input_script_awaiting_condition(&psp_input_script)
+        && psp_input_script_until_media_playing()
+        && media->visible && media->playing && !media->resolving
+        && !media->failed && !media->buffering && !media->seek_in_progress
+        && media->current_time_us != 0) {
+        printf("tilefinch-input-script: until-met step=%u native=media-playing at-us=%llu\n",
+               (unsigned) psp_input_script.step,
+               (unsigned long long) sceKernelGetSystemTimeWide());
+        psp_input_script_satisfy_condition(&psp_input_script);
+    }
     const char *mark = psp_input_script_mark(&psp_input_script);
     if (mark != NULL) {
         printf("tilefinch-input-script-media: mark=%s step=%u "
                "visible=%d playing=%d resolving=%d failed=%d buffering=%d "
-               "preview=%d current=%lluus target=%lluus duration=%lluus\n",
+               "preview=%d current=%lluus target=%lluus duration=%lluus "
+               "clockwise=%d crop=%d seeking=%d\n",
                mark, (unsigned) psp_input_script.step,
                media->visible ? 1 : 0, media->playing ? 1 : 0,
                media->resolving ? 1 : 0, media->failed ? 1 : 0,
@@ -802,7 +832,10 @@ void psp_input_script_observe_media(
                media->seek_preview_active ? 1 : 0,
                (unsigned long long) media->current_time_us,
                (unsigned long long) media->seek_preview_time_us,
-               (unsigned long long) media->duration_us);
+               (unsigned long long) media->duration_us,
+               media->presentation != NULL && media->presentation->clockwise,
+               media->presentation != NULL && media->presentation->portrait_crop,
+               media->seek_in_progress ? 1 : 0);
     }
     if (intent == NULL || intent->action == PSP_UI_MEDIA_ACTION_NONE) return;
     printf("tilefinch-input-script-media: step=%u action=%s "

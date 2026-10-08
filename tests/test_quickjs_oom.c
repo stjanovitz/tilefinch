@@ -2719,8 +2719,56 @@ static int run_function_compile_refusal(bool for_heads, size_t refuse_min,
     return failed;
 }
 
+static int run_bound_function_refusals(void)
+{
+    bool reached = true;
+    unsigned refusals = 0;
+    for (size_t point = 0; reached && point < 64; point++) {
+        RegexpGuardState state = { .refuse_from = SIZE_MAX };
+        JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+        JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
+        if (context == NULL) return 1;
+        const char source[] = "(function(){return arguments.length})";
+        JSValue target = JS_Eval(context, source, sizeof(source) - 1,
+                                 "<bind-refusal>", JS_EVAL_TYPE_GLOBAL);
+        JSValue bind = JS_GetPropertyStr(context, target, "bind");
+        if (JS_IsException(target) || JS_IsException(bind)) return 1;
+        JSValue args[257];
+        args[0] = JS_NULL;
+        for (size_t i = 1; i < 257; i++) args[i] = JS_NewInt32(context, (int)i);
+        size_t start = state.calls;
+        state.refuse_from = start + point;
+        JSValue bound = JS_Call(context, bind, target, 257, args);
+        reached = state.calls > start + point;
+        state.refuse_from = SIZE_MAX;
+        bool okay = true;
+        if (JS_IsException(bound)) {
+            refusals++;
+            JSValue exception = JS_GetException(context);
+            okay = !JS_IsUndefined(exception);
+            JS_FreeValue(context, exception);
+        } else {
+            JSValue result = JS_Call(context, bound, JS_UNDEFINED, 0, NULL);
+            int32_t length = 0;
+            okay = !JS_IsException(result)
+                && JS_ToInt32(context, &length, result) == 0 && length == 256;
+            JS_FreeValue(context, result);
+        }
+        JS_FreeValue(context, bound);
+        JS_FreeValue(context, bind);
+        JS_FreeValue(context, target);
+        JS_RunGC(runtime);
+        JS_FreeContext(context);
+        JS_FreeRuntime(runtime);
+        if (!okay || state.live != 0 || state.corrupted != 0) return 1;
+    }
+    return reached || refusals == 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--bind-refusal-only") == 0)
+        return run_bound_function_refusals();
     if (argc == 2) {
         char *end = NULL;
         unsigned long requested = strtoul(argv[1], &end, 10);
@@ -2728,6 +2776,7 @@ int main(int argc, char **argv)
         return run_failure_boundary((size_t) requested);
     }
     if (argc != 1) return 2;
+    if (run_bound_function_refusals() != 0) return 1;
     if (run_float_array_indexed_stores() != 0) return 1;
 
     /* Refused bytecode growth inside the regexp compiler must raise, not

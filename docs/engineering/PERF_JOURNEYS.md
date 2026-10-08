@@ -1,5 +1,36 @@
 # Performance journeys
 
+## Host continuity and interruption gates
+
+`tilefinch-search-video-journey-tests` exercises Search → scroll → Details →
+Comments → native-player handoff → seek/close intents → Back. It checks the
+exact selected video, expanded-section visibility, restored result focus and
+scroll, and an edited search value. Transactions use bounded synthetic response
+fixtures, including a transport timeout, cancellation and a successful retry;
+failures must retain the incumbent page and expose a nonempty cause. The
+history, control values and provider reuse remain in RAM. No persistent
+cache or playback-position store is configured. The native-player part checks
+real control receivers, not decoding: the offline hardware journey remains the
+decode/seek gate.
+
+The browser-engine interruption lane measures **request → changed pixels** for
+Select, cursor, Triangle, scroll and focus during font publication, image work,
+section layout and a running script. It also starts with queued page input:
+native presentation must not wait behind it, and opening a menu discards older
+page presses rather than replaying them into menu rows. Focus/scroll wait until
+the document borrow ends. Host timings are diagnostics, not device estimates;
+the gates assert admission and actual changed pixels without flaky time limits.
+
+Targeted checks:
+
+```sh
+build-preset-release/tilefinch-browser-engine-tests --search-video-journey-only
+build-preset-release/tilefinch-browser-engine-tests --background-interruption-only
+build-preset-release/tilefinch-browser-engine-tests --text-memory-only
+```
+
+## Recorded performance journeys
+
 A performance journey is one [scripted-input scenario](INPUT_SCRIPT_HARNESS.md)
 measured under PPSSPP with every page served from a recorded HTTP trace. The
 emulated PSP runs at a fixed 111 MHz and the trace replaces the network, so a
@@ -12,8 +43,8 @@ replace it. At the fixed 111 MHz, PPSSPP is slower than a PSP-3000 on CPU-bound
 phases. On the Wikipedia article, device times were about 0.56x the journey
 numbers for page loads, 0.9x for layout completion, and 0.55x for frame
 composition. Press latencies measured alike on both. (At PPSSPP's normal clock
-the emulator is instead faster than the device.) Record device results in the
-[performance ledger](PERFORMANCE_LEDGER.md).
+the emulator is instead faster than the device.) Keep detailed device results
+in private investigation records.
 
 ## Running
 

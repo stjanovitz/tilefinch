@@ -494,9 +494,11 @@ bool tilefinch_glyph_provider_match(
     uint32_t first = 0;
     size_t first_bytes = utf8_next(text, length, &first);
     if (first_bytes == 0) return false;
-    /* Sequences in the shipped catalog begin in the emoji/keycap/flag
-       ranges. Keep ordinary CJK and Latin at the O(1) codepoint lookup. */
+    /* Emoji and pre-shaped Indic clusters use sequence indexes. Keep
+       ordinary CJK and Latin at the O(1) codepoint lookup. */
     bool sequence_candidate = first == '#' || first == '*'
+        || (first >= 0x0900u && first <= 0x097fu)
+        || (first >= 0xa8e0u && first <= 0xa8ffu)
         || (first >= '0' && first <= '9')
         || first == 0x00a9u || first == 0x00aeu
         || first == 0x203cu || first == 0x2049u

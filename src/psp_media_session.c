@@ -187,6 +187,9 @@ void psp_media_raise_error(
 {
     if (media == NULL) return;
     bool was_failed = media->ui.failed;
+    media->ui_presentation.clockwise = false;
+    media->ui_presentation.portrait_crop = false;
+    media->ui_presentation.rotation_available = false;
     if (reason != NULL) {
         psp_ui_media_set_error_reason(&media->ui, message, reason);
     } else {
@@ -1904,6 +1907,9 @@ void psp_media_close(PspMediaSession *media)
     psp_media_cancel_decode(media);
     if (recovery_in_flight) media->clock_us = recovery_us;
     media->ui.visible = false;
+    media->ui_presentation.clockwise = false;
+    media->ui_presentation.portrait_crop = false;
+    media->ui_presentation.rotation_available = false;
     /* Hidden retained pipelines consume no transport work. Keeping media
        priority here would permanently reserve two of the six shared worker
        descriptors after Back, including when the next navigation fails and
@@ -2114,6 +2120,26 @@ void psp_media_execute_intent(PspMediaSession *media,
     if (media == NULL) return;
     if (psp_media_continuation_intent(media, intent)) return;
     switch (intent.action) {
+        case PSP_UI_MEDIA_ACTION_ROTATE:
+            if (media->ui_presentation.rotation_available
+                && media->have_frame && media->frame.width <= 640
+                && media->frame.height <= 512 && media->frame.width > 0
+                && media->frame.height > 0) {
+                /* Landscape -> portrait fit -> central portrait crop ->
+                   landscape. Native portrait frames need no crop step. */
+                if (!media->ui_presentation.clockwise) {
+                    media->ui_presentation.clockwise = true;
+                    media->ui_presentation.portrait_crop = media->frame.width > 512;
+                } else if (!media->ui_presentation.portrait_crop
+                           && media->frame.width > media->frame.height) {
+                    media->ui_presentation.portrait_crop = true;
+                } else {
+                    media->ui_presentation.clockwise = false;
+                    media->ui_presentation.portrait_crop = false;
+                }
+                psp_ui_media_show_controls(&media->ui);
+            }
+            break;
         case PSP_UI_MEDIA_ACTION_PLAY_PAUSE:
             if (media->playback != NULL) {
                 bool was_playing = psp_media_machine_wants_playing(media);
@@ -3579,6 +3605,10 @@ bool psp_media_advance(
             psp_media_duration_us(media),
             media->stream.title);
         media->ui.live = media->stream.live_hls;
+        media->ui_presentation.rotation_available = media->have_frame
+            && media->frame.format == MEDIA_PIXEL_RGBA8888
+            && media->frame.width > 0 && media->frame.width <= 640
+            && media->frame.height > 0 && media->frame.height <= 512;
     }
     uint64_t buffered =
         media_playback_buffered_until_us(media->playback);

@@ -81,7 +81,11 @@
 
   check(d.dailySeed(20261001) === d.dailySeed(20261001), 'daily deterministic');
   check(d.dailySeed(20261001) !== d.dailySeed(20261002), 'daily variation');
-  start(4); d.step(120);
+  start(4);
+  // The calendar seed can require several sliced validation attempts.
+  // Bound the hands-free wait, rather than requiring today's seed to fit
+  // the old single-template generation window.
+  for (let wait = 0; wait < 1200 && d.snapshot().mode === 'generating'; wait++) d.step(1);
   const daily = d.snapshot(), seed = d.dailySeed(daily.dailyDay);
   check(daily.mode === 'playing' && daily.classId === seed % 3,
     'daily fixed class and hands-free generation');

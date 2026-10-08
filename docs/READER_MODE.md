@@ -132,6 +132,12 @@ Limits are deliberate:
   navigations continue to leave Reader mode before admitting their target.
 
 Reader mode is not a sanitizer, content blocker, or separate browsing realm.
+Switching views reuses the current page's retained stylesheet responses,
+including their redirect and referrer provenance. It does not depend on those
+responses still being present in the optional HTTP cache. The presentation
+transaction shares response bytes while keeping its own ledger, so a refused
+rebuild leaves the previous view intact.
+
 The retained author DOM remains page-owned, while the connected extracted tree
 has exact native provenance and the current page's author realms are retired
 after presentation succeeds. The host renderer's `--reader-profile` options

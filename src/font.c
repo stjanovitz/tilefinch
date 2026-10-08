@@ -1279,6 +1279,8 @@ static bool optional_sequence_advance_fixed(
 bool font_face_has_codepoint(const FontFace *face, unsigned codepoint)
 {
     if (face == NULL) return false;
+    if (codepoint > 0x10ffffu)
+        return optional_fallback_metrics(codepoint, NULL, NULL, NULL);
     if (builtin_fallback_supported(codepoint)
         || optional_fallback_key(codepoint, NULL, NULL, NULL)) return true;
 #ifdef TILEFINCH_HAVE_FREETYPE
@@ -1359,10 +1361,29 @@ static bool optional_fallback_glyph(
             size_t source_at = (size_t) source_y * source.width + source_x;
             size_t output_at = (size_t) y * (size_t) width + (size_t) x;
             if (source.kind == TILEFINCH_GLYPH_COMPONENT_MONO) {
-                const uint8_t *row = source.pixels + source_y * 2u;
-                if ((row[source_x >> 3u]
-                     & (uint8_t) (0x80u >> (source_x & 7u))) != 0)
-                    coverage[output_at] = 255u;
+                if ((unsigned)width < source.width || (unsigned)height < source.height) {
+                    /* A nearest sample can delete an entire one-pixel mark
+                       when a 16px pack cell becomes 11px chrome. Average the
+                       bounded source footprint once at glyph creation. */
+                    unsigned end_x = ((unsigned)(x + 1) * source.width
+                                      + (unsigned)width - 1u) / (unsigned)width;
+                    unsigned end_y = ((unsigned)(y + 1) * source.height
+                                      + (unsigned)height - 1u) / (unsigned)height;
+                    unsigned ink = 0, samples = 0;
+                    for (unsigned sy = source_y; sy < end_y; sy++) {
+                        const uint8_t *row = source.pixels + sy * 2u;
+                        for (unsigned sx = source_x; sx < end_x; sx++) {
+                            ink += (row[sx >> 3u] >> (7u - (sx & 7u))) & 1u;
+                            samples++;
+                        }
+                    }
+                    coverage[output_at] = (unsigned char)(ink * 255u / samples);
+                } else {
+                    const uint8_t *row = source.pixels + source_y * 2u;
+                    if ((row[source_x >> 3u]
+                         & (uint8_t) (0x80u >> (source_x & 7u))) != 0)
+                        coverage[output_at] = 255u;
+                }
             } else {
                 const uint8_t *color = source.pixels + source_at * 2u;
                 colors[output_at] = (uint16_t) color[0] << 8 | color[1];
@@ -2133,7 +2154,7 @@ bool font_glyph_load_at_size(const FontFace *face, unsigned codepoint,
         bool pending = false;
         bool loaded = optional_fallback_glyph(
             face, codepoint, pixel_height_fixed, bold, glyph, &pending);
-        if (loaded) glyph->provider_pending = pending;
+        glyph->provider_pending = pending;
         return loaded;
     }
 #ifdef TILEFINCH_HAVE_FREETYPE

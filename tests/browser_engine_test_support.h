@@ -25,6 +25,7 @@
 uint64_t frame_checksum(const uint16_t *pixels, size_t pixel_count);
 lxb_dom_node_t *test_reader_find_id(lxb_dom_node_t *root, const char *wanted);
 int test_loading_interaction_journey(void);
+int test_text_content_does_not_retain_scratch(void);
 int test_script_focus_adoption(void);
 int test_late_script_text_focus_adoption(void);
 int test_boot_window_check_backs_off(void);

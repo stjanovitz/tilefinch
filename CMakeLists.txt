@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.29 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.30 LANGUAGES C)
 
 # Build directories inside the source tree must be named in CMakePresets.json
 # or in the short allowlist below. Sixty-one ad hoc trees (12 GB) accumulated
@@ -48,7 +48,7 @@ if(NOT TILEFINCH_ALLOW_BUILD_DIR
     endif()
 endif()
 
-set(TILEFINCH_RELEASE_SEQUENCE "29" CACHE STRING
+set(TILEFINCH_RELEASE_SEQUENCE "31" CACHE STRING
     "Monotonic signed release sequence compiled into this build")
 set(TILEFINCH_UPDATE_ROOT_V1 "" CACHE FILEPATH
     "Public binary Tilefinch root-v1 metadata embedded into updater builds")
@@ -127,6 +127,7 @@ file(COPY_FILE "${_tilefinch_update_root_staging}"
 # directory scope so existing cache options and target variables remain stable.
 include(cmake/TilefinchDependencies.cmake)
 include(cmake/TilefinchCore.cmake)
+include(cmake/TilefinchUiResources.cmake)
 include(cmake/TilefinchTargets.cmake)
 include(cmake/PspSwdec.cmake)
 include(cmake/TilefinchTests.cmake)

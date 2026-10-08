@@ -108,10 +108,11 @@ typedef enum {
     DOCUMENT_GLYPH_SCRIPT_CYRILLIC = 1u << 3,
     DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED = 1u << 4,
     DOCUMENT_GLYPH_SCRIPT_ARABIC = 1u << 5,
-    DOCUMENT_GLYPH_SCRIPT_HEBREW = 1u << 6
+    DOCUMENT_GLYPH_SCRIPT_HEBREW = 1u << 6,
+    DOCUMENT_GLYPH_SCRIPT_DEVANAGARI = 1u << 7
 } DocumentGlyphScript;
 
-#define DOCUMENT_GLYPH_SCRIPT_KINDS 7u
+#define DOCUMENT_GLYPH_SCRIPT_KINDS 8u
 #define DOCUMENT_GLYPH_CENSUS_SAMPLES 4u
 /* A script is in meaningful use when the visible text holds at least this
    many of its codepoints and at least one per DOCUMENT_GLYPH_OFFER_SHARE

@@ -28,6 +28,7 @@ set(TILEFINCH_CORE_SOURCES
     src/glyph_component.c
     src/glyph_component_store.c
     src/glyph_pack_offer.c
+    src/ui_language.c
     src/image.c
     src/image_decode.c
     src/image_retarget.c
@@ -132,6 +133,7 @@ set(TILEFINCH_CORE_SOURCES
     src/voice_component.c
     src/viewport.c
     src/youtube_lite.c
+    src/psp_network_diagnostics.c
     src/youtube_resolver.c
     src/youtube_subtitles.c
 )

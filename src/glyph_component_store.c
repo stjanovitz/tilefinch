@@ -54,7 +54,11 @@ static const TilefinchGlyphPackSpec glyph_specs[TILEFINCH_GLYPH_PACK_COUNT] = {
     {"glyph-arabic", "Arabic", "tilefinch-glyph-arabic-v1.tfgm",
      "tilefinch-glyph-arabic-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_ARABIC, 1024u},
     {"glyph-hebrew", "Hebrew", "tilefinch-glyph-hebrew-v1.tfgm",
-     "tilefinch-glyph-hebrew-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_HEBREW, 1024u}
+     "tilefinch-glyph-hebrew-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_HEBREW, 1024u},
+    {"glyph-devanagari", "Devanagari (Hindi)",
+     "tilefinch-glyph-devanagari-v1.tfgm",
+     "tilefinch-glyph-devanagari-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_DEVANAGARI,
+     284u}
 };
 
 const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(
@@ -91,6 +95,9 @@ bool tilefinch_glyph_pack_for_language(
             return true;
         case BROWSER_GLYPH_LANGUAGE_HEBREW:
             *pack = TILEFINCH_GLYPH_PACK_HEBREW;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_DEVANAGARI:
+            *pack = TILEFINCH_GLYPH_PACK_DEVANAGARI;
             return true;
         case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:

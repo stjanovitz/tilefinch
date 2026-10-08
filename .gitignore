@@ -1,5 +1,7 @@
 /build*/
 /dist/
+# Generated translation downloads belong to tilefinch-models, not this tree.
+/translations/ui/**/*.tful
 /frames/
 /benchmark-frames/
 /benchmarks/downloads/
@@ -42,6 +44,8 @@ __pycache__/
 # Investigation journals and per-release maintenance logs belong in the
 # private work area, not in the public source tree.
 /docs/engineering/BROWSING_JOURNEYS.md
+/docs/engineering/PERFORMANCE_LEDGER.md
+/docs/engineering/MEMORY_EXPERIMENTS.md
 /docs/engineering/RELEASE_*_CHECKS.md
 /.private-investigations/
 

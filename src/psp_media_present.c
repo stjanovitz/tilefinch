@@ -174,6 +174,86 @@ bool psp_media_present_plan(
     return true;
 }
 
+static PspMediaPresentRect present_rotate_rect(
+    PspMediaPresentRect rect, int screen_width)
+{
+    return (PspMediaPresentRect) {
+        screen_width - rect.y - rect.height, rect.x, rect.height, rect.width};
+}
+
+bool psp_media_present_plan_clockwise(
+    PspMediaPresentPlan *plan,
+    int source_width, int source_height, int source_stride_pixels,
+    int screen_width, int screen_height)
+{
+    if (!psp_media_present_plan(plan, source_width, source_height,
+                               source_stride_pixels, screen_height,
+                               screen_width)) return false;
+    plan->video = present_rotate_rect(plan->video, screen_width);
+    for (size_t at = 0; at < plan->band_count; at++)
+        plan->bands[at] = present_rotate_rect(plan->bands[at], screen_width);
+    for (size_t at = 0; at < plan->quad_count; at++) {
+        PspMediaPresentQuad *quad = &plan->quads[at];
+        float left = screen_width - quad->y1;
+        float right = screen_width - quad->y0;
+        float top = quad->x0;
+        float bottom = quad->x1;
+        quad->x0 = left;
+        quad->x1 = right;
+        quad->y0 = top;
+        quad->y1 = bottom;
+        quad->clockwise = true;
+    }
+    return true;
+}
+
+void psp_media_present_quad_vertices(
+    const PspMediaPresentQuad *quad, PspMediaPresentVertex vertices[4])
+{
+    /* Clockwise positions of the source's TL, TR, BR, BL corners. A sprite
+       cannot exchange texture axes; a four-vertex fan can, without a copy. */
+    if (quad->clockwise) {
+        vertices[0] = (PspMediaPresentVertex) {quad->u0, quad->v0, quad->x1, quad->y0, 0};
+        vertices[1] = (PspMediaPresentVertex) {quad->u1, quad->v0, quad->x1, quad->y1, 0};
+        vertices[2] = (PspMediaPresentVertex) {quad->u1, quad->v1, quad->x0, quad->y1, 0};
+        vertices[3] = (PspMediaPresentVertex) {quad->u0, quad->v1, quad->x0, quad->y0, 0};
+    } else {
+        vertices[0] = (PspMediaPresentVertex) {quad->u0, quad->v0, quad->x0, quad->y0, 0};
+        vertices[1] = (PspMediaPresentVertex) {quad->u1, quad->v0, quad->x1, quad->y0, 0};
+        vertices[2] = (PspMediaPresentVertex) {quad->u1, quad->v1, quad->x1, quad->y1, 0};
+        vertices[3] = (PspMediaPresentVertex) {quad->u0, quad->v1, quad->x0, quad->y1, 0};
+    }
+}
+
+bool psp_media_present_plan_portrait_crop(
+    PspMediaPresentPlan *plan,
+    int source_width, int source_height, int source_stride_pixels,
+    int screen_width, int screen_height)
+{
+    if (source_width <= 0 || source_width > 640
+        || source_height <= 0 || source_height > PSP_MEDIA_PRESENT_TEXTURE_MAX
+        || source_stride_pixels < source_width) return false;
+    int width = source_height * 9 / 16;
+    if (width <= 0 || width > source_width) return false;
+    if (!psp_media_present_plan_clockwise(plan, width, source_height,
+            source_stride_pixels, screen_width, screen_height)) return false;
+    int left = (source_width - width) / 2;
+    PspMediaPresentQuad *quad = &plan->quads[0];
+    /* Rebase to an aligned texture origin. Copying this subtexture (256x360
+       for 360p) fits the protected EDRAM stage; staging the full 512x360
+       texture did not, forcing a much slower main-RAM draw. Preserve the
+       original sample positions, including the bilinear guard texels. */
+    quad->texture_column = left / PSP_MEDIA_PRESENT_COLUMN_ALIGN
+        * PSP_MEDIA_PRESENT_COLUMN_ALIGN;
+    int offset = left - quad->texture_column;
+    quad->texture_width = present_pow2_at_least(width + offset);
+    if (quad->texture_width > source_stride_pixels - quad->texture_column)
+        return false;
+    quad->u0 += (float) offset;
+    quad->u1 += (float) offset;
+    return true;
+}
+
 bool psp_media_present_wide_strip_plan(
     PspMediaPresentStripPlan *strips, const PspMediaPresentPlan *full,
     int source_width, int source_height, int source_stride_pixels,
@@ -191,6 +271,7 @@ bool psp_media_present_wide_strip_plan(
     if (full == NULL || source_width <= 512 || source_width > 640
         || source_height != 360
         || source_stride_pixels != 768 || full->quad_count != 2
+        || full->quads[0].clockwise
         || full->video.height <= 0 || (full->video.height & 1) != 0)
         return false;
 
@@ -258,6 +339,11 @@ bool psp_media_present_quad_samples_inside(
     if (quad == NULL) return false;
     int columns = (int) (quad->x1 - quad->x0);
     int rows = (int) (quad->y1 - quad->y0);
+    if (quad->clockwise) {
+        int swap = columns;
+        columns = rows;
+        rows = swap;
+    }
     if (columns <= 0 || rows <= 0) return false;
     int width_limit = source_width - 1 - quad_source_column;
     if (width_limit > quad->texture_width - 1)
@@ -380,7 +466,9 @@ bool psp_media_present_stage_fits(
     if (plan == NULL || plan->quad_count != 1 || source_height <= 0)
         return false;
     const PspMediaPresentQuad *quad = &plan->quads[0];
-    if (quad->texture_column != 0) return false;
+    if (quad->texture_column < 0
+        || quad->texture_column % PSP_MEDIA_PRESENT_COLUMN_ALIGN != 0)
+        return false;
     int rows = psp_media_present_stage_rows(source_height);
     /* The sampler never reaches past the picture, so only the blocks that
        cover it are staged -- but the declared texture is what addresses

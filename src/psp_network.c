@@ -533,6 +533,7 @@ static PspNetworkStatus psp_network_finish_pump(
         network->maximum_free_block_ready =
             (size_t) sceKernelMaxFreeMemSize();
     }
+    psp_network_diagnostics_record(network);
     return network->status;
 }
 
@@ -690,6 +691,7 @@ bool psp_network_begin(PspNetwork *network, int profile_index)
     if (network == NULL || profile_index <= 0) return false;
     memset(network, 0, sizeof(*network));
     network->requested_profile_index = profile_index;
+    network->diagnostics_enabled = psp_network_diagnostics_enabled();
     network->profile_index = profile_index;
     network->apctl_state = -1;
     network->native_result = 0;

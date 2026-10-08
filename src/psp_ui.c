@@ -13,6 +13,7 @@
 #include "tilefinch/bot_wall.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/ui_language.h"
 #include "tilefinch/offline_library.h"
 #include "tilefinch/update_history.h"
 #include "psp_boot_mark.h"
@@ -29,6 +30,8 @@ _Static_assert(TILEFINCH_GLYPH_PACK_COUNT
                "installed glyph packs exceed PspUiState mask width");
 _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
                "chrome themes exceed PspUiState representation");
+_Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
+               "interface languages exceed PspUiState representation");
 
 /* The private token sheet supplies geometry and the built-in palette source.
    Painters use the selected runtime palette for colors. Presentation is
@@ -77,12 +80,12 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_TOAST_TIMED 0x8000u
 /* Language & emoji: language, emoji, the two pack rows, offers, reset. */
-#define UI_GLYPH_OPTION_ROWS 6u
+#define UI_GLYPH_OPTION_ROWS 7u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 47u
+#define UI_OPTIONS_ITEM_COUNT 49u
 #else
-#define UI_OPTIONS_ITEM_COUNT 45u
+#define UI_OPTIONS_ITEM_COUNT 47u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -146,7 +149,9 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 /* Non-ASCII chrome glyphs, and glyphs from a preferred face (the media
    title's), share one LRU. Sized so a title and two subtitle lines of CJK
    fit instead of evicting each other on every present. */
-#define UI_CHROME_UNICODE_GLYPH_LIMIT 96u
+/* A complete Arabic settings page needs contextual forms at both weights.
+   Keep enough retained slots to avoid cycling its visible glyphs forever. */
+#define UI_CHROME_UNICODE_GLYPH_LIMIT 160u
 
 typedef struct {
     FontGlyph glyph;
@@ -251,7 +256,9 @@ typedef enum {
     UI_OPTION_CLEAR_PLAYBACK_POSITIONS,
     UI_OPTION_SAVE_DIAGNOSTIC_REPORTS,
     UI_OPTION_BASIC_FALLBACK,
-    UI_OPTION_HEAVY_PAGES
+    UI_OPTION_HEAVY_PAGES,
+    UI_OPTION_WIFI_DIAGNOSTICS,
+    UI_OPTION_YOUTUBE_TOPICS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -316,7 +323,9 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_CLEAR_PLAYBACK_POSITIONS,
     UI_OPTION_SAVE_DIAGNOSTIC_REPORTS,
     UI_OPTION_BASIC_FALLBACK,
-    UI_OPTION_HEAVY_PAGES
+    UI_OPTION_HEAVY_PAGES,
+    UI_OPTION_WIFI_DIAGNOSTICS,
+    UI_OPTION_YOUTUBE_TOPICS
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -355,6 +364,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
         case UI_OPTION_YOUTUBE_RESULTS:
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
+        case UI_OPTION_YOUTUBE_TOPICS:
         case UI_OPTION_RESUME_DOWNLOADS:
         case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
         case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
@@ -376,6 +386,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_MEDIA_TEST:
 #endif
         case UI_OPTION_NETWORK_PROFILE:
+        case UI_OPTION_WIFI_DIAGNOSTICS:
         case UI_OPTION_SITE_DATA:
         case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
             return "DEVICE & STORAGE";
@@ -397,7 +408,7 @@ static const char *ui_option_group_at(size_t group)
         "Privacy & security", "Device & storage", "Updates",
         "Advanced & experimental"
     };
-    return groups[group < UI_SETTINGS_GROUP_COUNT ? group : 0u];
+    return tilefinch_ui_text(groups[group < UI_SETTINGS_GROUP_COUNT ? group : 0u]);
 }
 
 static size_t ui_option_group_index(UiOptionId option)
@@ -545,6 +556,10 @@ static const char *ui_option_description(UiOptionId option)
             return "Sites' storage, caches, and clearing";
         case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
             return "Write failure details to the Memory Stick";
+        case UI_OPTION_WIFI_DIAGNOSTICS:
+            return "Keep connection details in RAM for Diagnostic QR";
+        case UI_OPTION_YOUTUBE_TOPICS:
+            return "Load Explore topics after the YouTube search box";
     }
     return "";
 }
@@ -1286,6 +1301,8 @@ static bool chrome_glyph_load_allowed(void)
 #define UI_CHROME_GLYPH_MISSING 2u
 #define UI_CHROME_GLYPH_REFUSED_FIRST 3u
 #define UI_CHROME_GLYPH_REFUSED_LIMIT 4u
+#define UI_CHROME_GLYPH_PENDING \
+    (UI_CHROME_GLYPH_REFUSED_FIRST + UI_CHROME_GLYPH_REFUSED_LIMIT)
 
 static __attribute__((noinline)) uint8_t chrome_glyph_load(
     size_t weight, unsigned codepoint, int pixel_height, FontGlyph *glyph,
@@ -1294,9 +1311,16 @@ static __attribute__((noinline)) uint8_t chrome_glyph_load(
     const FontFace *face = chrome_font_cache.faces[weight];
     if (!font_face_has_codepoint(face, codepoint))
         return UI_CHROME_GLYPH_MISSING;
-    if (font_glyph_load(face, codepoint, pixel_height, false, glyph))
-        return UI_CHROME_GLYPH_LOADED;
+    bool loaded = font_glyph_load(face, codepoint, pixel_height, false, glyph);
+    /* Opaque cluster keys have no .notdef fallback. A queued payload is
+       still pending when the load returns false, not a Budget refusal. */
+    if (glyph->provider_pending) {
+        font_glyph_destroy(face, glyph);
+        return UI_CHROME_GLYPH_PENDING;
+    }
+    if (loaded) return UI_CHROME_GLYPH_LOADED;
     unsigned refusals = previous >= UI_CHROME_GLYPH_REFUSED_FIRST
+            && previous < UI_CHROME_GLYPH_PENDING
         ? previous - UI_CHROME_GLYPH_REFUSED_FIRST + 1u : 0u;
     return refusals + 1u >= UI_CHROME_GLYPH_REFUSED_LIMIT
         ? UI_CHROME_GLYPH_MISSING
@@ -1324,6 +1348,11 @@ static const FontGlyph *chrome_font_glyph(
                 && entry->codepoint == codepoint
                 && entry->weight == weight && entry->size == size) {
                 entry->age = ++chrome_font_cache.unicode_clock;
+                if (chrome_glyph_slot_retryable(entry->loaded)
+                    && chrome_glyph_load_allowed())
+                    entry->loaded = chrome_glyph_load(
+                        weight, codepoint, size == 0u ? 11 : 15,
+                        &entry->glyph, entry->loaded);
                 if (entry->loaded != 1u) {
                     if (known_missing != NULL) *known_missing = true;
                     return NULL;
@@ -1443,6 +1472,27 @@ static size_t utf8_character_count(const char *text, size_t bytes)
     return characters;
 }
 
+/* Indic vowel/conjunct clusters are pre-shaped in optional packs. Measurement
+   and painting must consume the same longest sequence instead of separating
+   its marks into unrelated character cells. Ordinary labels stay unchanged. */
+static size_t ui_text_next_glyph(const char *text, size_t bytes,
+                                 unsigned *codepoint, size_t *characters)
+{
+    size_t used = font_utf8_next(text, bytes, codepoint);
+    if (characters) *characters = used ? 1u : 0u;
+    if (used && ((*codepoint >= 0x0900u && *codepoint <= 0x097fu)
+        || (*codepoint >= 0xa8e0u && *codepoint <= 0xa8ffu))) {
+        size_t matched = 0;
+        unsigned key;
+        if (font_optional_glyph_match_sequence(text, bytes, &matched, &key)) {
+            if (characters) *characters = utf8_character_count(text, matched);
+            *codepoint = key;
+            return matched;
+        }
+    }
+    return used;
+}
+
 /*
  * Truncation ellipsis metrics. The dots belong to whichever face is
  * drawing the run: builtin dots advanced a flat 6 * scale span ~36px at
@@ -1467,6 +1517,11 @@ static int draw_text_with_font(
     bool chrome_bold)
 {
     if (text == NULL) return x;
+#ifdef TILEFINCH_UI_TEXT_OBSERVER
+    const int original_x = x;
+    int ink_left = x, ink_right = x, ink_top = y, ink_bottom = y;
+    bool missing_glyph = false;
+#endif
     const FontGlyph *dot = NULL;
     int dot_advance = ui_ellipsis_advance(scale, chrome_bold, &dot);
     int ellipsis_reserve = 3 * dot_advance;
@@ -1477,37 +1532,68 @@ static int draw_text_with_font(
         ? characters : maximum_characters;
     if (ellipsis && visible > 3u) visible -= 3u;
     size_t byte_at = 0;
-    for (size_t at = 0; at < visible && byte_at < bytes; at++) {
+    for (size_t at = 0; at < visible && byte_at < bytes;) {
         unsigned codepoint = 0;
-        size_t used = font_utf8_next(
-            text + byte_at, bytes - byte_at, &codepoint);
+        size_t consumed = 0;
+        size_t used = ui_text_next_glyph(
+            text + byte_at, bytes - byte_at, &codepoint, &consumed);
         if (used == 0) break;
+        if (consumed > visible - at) { ellipsis = true; break; }
+        at += consumed;
         byte_at += used;
         const FontGlyph *glyph = NULL;
         /* Always prefer the retained chrome cache for ASCII and any Unicode
            glyph it can serve. A preferred face is a fallback, not a reason
            to bypass the cache: doing so made ASCII media titles such as
            "Retrying at 240p" fall back to the blocky boot bitmap. */
-        glyph = chrome_font_glyph(
-            codepoint, scale, chrome_bold, NULL);
-        if (glyph == NULL && font != NULL)
+        /* The staged Latin subset has no U+25A1. Draw the controller's
+           Square symbol with the existing outline primitive, even during
+           boot or font loading; never depend on an optional language pack. */
+        bool square_button = codepoint == 0x25a1u;
+        if (!square_button)
+            glyph = chrome_font_glyph(codepoint, scale, chrome_bold, NULL);
+        if (!square_button && glyph == NULL && font != NULL)
             glyph = preferred_face_glyph(font, codepoint, scale);
-        int advance = glyph != NULL ? glyph->advance : 6 * scale;
+        int square_side = scale >= 2 ? 11 : 7;
+        int advance = square_button ? square_side + 2
+            : glyph != NULL ? glyph->advance : 6 * scale;
         if (advance < 0) advance = 0;
-        bool more = at + 1u < visible || byte_at < bytes;
+        bool more = byte_at < bytes;
         int limit = maximum_x - (more ? ellipsis_reserve : 0);
         if (x > limit - advance) {
             ellipsis = true;
             break;
         }
-        if (glyph != NULL) {
+        if (square_button) {
+            outline_rect(pixels, width, height, stride,
+                         (UiRect) { x, y + 2, square_side, square_side }, color, 1);
+#ifdef TILEFINCH_UI_TEXT_OBSERVER
+            if (x + square_side > ink_right) ink_right = x + square_side;
+            if (y + 2 + square_side > ink_bottom) ink_bottom = y + 2 + square_side;
+#endif
+        } else if (glyph != NULL) {
             int baseline = y + (scale >= 2 ? 13 : 10);
+#ifdef TILEFINCH_UI_TEXT_OBSERVER
+            if (x + glyph->x_offset < ink_left) ink_left = x + glyph->x_offset;
+            if (x + glyph->x_offset + glyph->width > ink_right)
+                ink_right = x + glyph->x_offset + glyph->width;
+            if (baseline + glyph->y_offset < ink_top) ink_top = baseline + glyph->y_offset;
+            if (baseline + glyph->y_offset + glyph->height > ink_bottom)
+                ink_bottom = baseline + glyph->y_offset + glyph->height;
+#endif
             draw_font_glyph(pixels, width, height, stride, x,
                             baseline, glyph, color);
         } else if (codepoint <= 0x7fu) {
+#ifdef TILEFINCH_UI_TEXT_OBSERVER
+            if (x + 5 * scale > ink_right) ink_right = x + 5 * scale;
+            if (y + 7 * scale > ink_bottom) ink_bottom = y + 7 * scale;
+#endif
             draw_character(pixels, width, height, stride, x, y,
                            (char) codepoint, color, scale);
         } else {
+#ifdef TILEFINCH_UI_TEXT_OBSERVER
+            missing_glyph = true;
+#endif
             /*
              * Browser chrome deliberately uses the tiny built-in face so it
              * remains available before page fonts are loaded. Map common
@@ -1557,6 +1643,10 @@ static int draw_text_with_font(
             x += dot_advance;
         }
     }
+#ifdef TILEFINCH_UI_TEXT_OBSERVER
+    TILEFINCH_UI_TEXT_OBSERVER(text, original_x, y, x, maximum_x,
+        ink_left, ink_top, ink_right, ink_bottom, ellipsis, missing_glyph);
+#endif
     return x;
 }
 
@@ -1588,9 +1678,13 @@ static int chrome_text_width_bytes(
     int width = 0;
     for (size_t at = 0; at < bytes;) {
         unsigned codepoint = 0;
-        size_t used = font_utf8_next(text + at, bytes - at, &codepoint);
+        size_t used = ui_text_next_glyph(text + at, bytes - at, &codepoint, NULL);
         if (used == 0 || at + used > bytes) break;
         at += used;
+        if (codepoint == 0x25a1u) {
+            width += scale >= 2 ? 13 : 9;
+            continue;
+        }
         bool known_missing = false;
         const FontGlyph *glyph = chrome_font_glyph(
             codepoint, scale, bold, &known_missing);
@@ -1598,6 +1692,72 @@ static int chrome_text_width_bytes(
         if (advance > 0) width += advance;
     }
     return width;
+}
+
+/* Native labels are bounded catalog strings, not page titles. Measure in
+   pixels, using compact chrome only when necessary; never abbreviate a label
+   merely because its translation contains more characters than English. */
+static int draw_fitted_ui_text(
+    uint16_t *pixels, int width, int height, int stride, int x, int y,
+    const char *text, int right, uint16_t color, int scale, bool bold)
+{
+    if (scale > 1 && chrome_text_width_bytes(text, strlen(text), scale, bold) > right - x)
+        scale = 1;
+    bool fits = chrome_text_width_bytes(text, strlen(text), scale, bold) <= right - x;
+    return draw_text_with_font(pixels, width, height, stride, x, y, text,
+        TILEFINCH_UI_TRANSLATION_BYTES,
+        right + (fits ? 3 * ui_ellipsis_advance(scale, bold, NULL) : 0),
+        color, scale, NULL, bold);
+}
+
+static void draw_ui_label_value(
+    uint16_t *pixels, int width, int height, int stride, int left, int right,
+    int y, const char *label, const char *value, uint16_t ink,
+    uint16_t value_ink, int scale)
+{
+    const int gap = 10;
+    size_t label_bytes = strlen(label), value_bytes = strlen(value);
+    int label_width = chrome_text_width_bytes(label, label_bytes, scale, false);
+    int value_width = chrome_text_width_bytes(value, value_bytes, scale, true);
+    if (scale > 1 && label_width + value_width + gap > right - left) {
+        scale = 1;
+        value_width = chrome_text_width_bytes(value, value_bytes, scale, true);
+    }
+    int value_left = right - value_width;
+    draw_fitted_ui_text(pixels, width, height, stride, left, y, label,
+        value_left - gap, ink, scale, false);
+    draw_fitted_ui_text(pixels, width, height, stride, value_left, y, value,
+        right, value_ink, scale, true);
+}
+
+static void draw_ui_settings_heading(
+    uint16_t *pixels, int width, int height, int stride, UiRect box,
+    const char *category, uint16_t text, uint16_t accent)
+{
+    const char *settings = tilefinch_ui_text("Settings");
+    int left = box.x + 16, right = box.x + box.width - 16;
+    int scale = 2;
+    if (chrome_text_width_bytes(settings, strlen(settings), scale, true)
+        + chrome_text_width_bytes(category, strlen(category), scale, true)
+        + 24 > right - left) scale = 1;
+    if (scale == 1
+        && chrome_text_width_bytes(settings, strlen(settings), scale, true)
+            + chrome_text_width_bytes(category, strlen(category), scale, true)
+            + 24 > right - left) {
+        /* Two compact lines fit above the existing hint/rule. Do not truncate
+           the category just because the translated parent title is wider. */
+        draw_fitted_ui_text(pixels, width, height, stride, left,
+            box.y + 4, settings, right, text, 1, true);
+        draw_fitted_ui_text(pixels, width, height, stride, left,
+            box.y + 18, category, right, accent, 1, true);
+        return;
+    }
+    int end = draw_fitted_ui_text(pixels, width, height, stride, left,
+        box.y + 14, settings, right, text, scale, true);
+    end = draw_fitted_ui_text(pixels, width, height, stride, end + 8,
+        box.y + 14, ">", right, accent, scale, true);
+    draw_fitted_ui_text(pixels, width, height, stride, end + 8,
+        box.y + 14, category, right, accent, scale, true);
 }
 
 static int draw_text_right_aligned(
@@ -1804,6 +1964,7 @@ void psp_ui_init(PspUiState *ui)
     ui->browser_ui_scale = 1;
     ui->page_font_percent = 100;
     ui->analog_cursor_enabled = true;
+    ui->youtube_topics = true;
     ui->javascript_enabled = 1u;
     ui->site_javascript_enabled = 1u;
     ui->site_data_allowed = 1u;
@@ -3476,6 +3637,17 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                 ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
             }
             intent.visual_changed = true;
+        } else if (ui->glyph_options_selection == 6u
+                   && (pressed & (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT))) {
+            int direction = (pressed & PSP_UI_BUTTON_LEFT) ? -1 : 1;
+            ui->ui_language = ((int)ui->ui_language + TILEFINCH_UI_LANGUAGE_COUNT + direction)
+                % TILEFINCH_UI_LANGUAGE_COUNT;
+            intent.visual_changed = true;
+        } else if (ui->glyph_options_selection == 6u
+                   && (pressed & PSP_UI_BUTTON_CONFIRM)) {
+            intent.setting.id = PSP_UI_SETTING_UI_LANGUAGE;
+            intent.setting.value.unsigned_value = ui->ui_language;
+            intent.visual_changed = true;
         } else if (ui->glyph_options_selection == 0u
                    && (pressed & (PSP_UI_BUTTON_LEFT
                                   | PSP_UI_BUTTON_RIGHT
@@ -4041,6 +4213,16 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     intent.setting.value.boolean =
                         ui->youtube_compact_results;
                     break;
+                case UI_OPTION_YOUTUBE_TOPICS:
+                    ui->youtube_topics = !ui->youtube_topics;
+                    intent.setting.id = PSP_UI_SETTING_YOUTUBE_TOPICS;
+                    intent.setting.value.boolean = ui->youtube_topics;
+                    break;
+                case UI_OPTION_WIFI_DIAGNOSTICS:
+                    ui->wifi_diagnostics = !ui->wifi_diagnostics;
+                    intent.setting.id = PSP_UI_SETTING_WIFI_DIAGNOSTICS;
+                    intent.setting.value.boolean = ui->wifi_diagnostics;
+                    break;
                 case UI_OPTION_VIDEO_STARTUP_BUFFERING:
                     ui->video_startup_buffering =
                         !ui->video_startup_buffering;
@@ -4500,13 +4682,12 @@ static void draw_button_legend(uint16_t *pixels, int width, int height,
                                uint16_t text)
 {
     (void) text;
-    int button_width = (int) strlen(button) * 6 + 6;
-    draw_text(pixels, width, height, stride, x + 3, y + 3, button, 8,
-              accent, 1);
+    int button_end = draw_text(pixels, width, height, stride,
+                               x + 3, y + 3, button, 8, accent, 1);
     /* Without the chip the glyph and its word need the gap the chip's
        padding used to provide, or "START Search" reads as one word. */
     draw_text(pixels, width, height, stride,
-              x + button_width + PSP_THEME_SPACE_M, y + 3,
+              button_end + 3 + PSP_THEME_SPACE_M, y + 3,
               label, 12, PSP_THEME_TEXT_MUTED, 1);
 }
 
@@ -4745,13 +4926,12 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
     fill_rect(pixels, width, height, stride,
               (UiRect) { 0, top, width, 1 }, PSP_THEME_LINE, 4);
     if (ui->page_gamepad_capture) {
-        draw_text_with_font(
+        draw_fitted_ui_text(
             pixels, width, height, stride, 7,
             top + (scale == 2 ? 7 : 6),
-            scale == 2 ? "PAGE CONTROLS  START+SELECT EXIT"
-                       : "PAGE CONTROLS  HOLD START+SELECT TO EXIT",
-            40,
-            width - 7, accent, scale == 2 ? 2 : 1, NULL, true);
+            scale == 2 ? tilefinch_ui_text("PAGE CONTROLS  START+SELECT EXIT")
+                       : tilefinch_ui_text("PAGE CONTROLS  HOLD START+SELECT TO EXIT"),
+            width - 7, accent, scale == 2 ? 2 : 1, true);
         return;
     }
     if (ui->captive_portal_active) {
@@ -4772,8 +4952,8 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
     if (scale == 2) {
         draw_text(pixels, width, height, stride, 7, top + 7,
                   ui->focus_editable
-                      ? "X Edit O Back SQ Reload Start Enter"
-                      : "X Open O Back SQ Reload Start Search",
+                      ? "X Edit O Back □ Reload Start Enter"
+                      : "X Open O Back □ Reload Start Search",
                   38,
                   PSP_THEME_TEXT_MUTED, 2);
         return;
@@ -4788,7 +4968,7 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
                        "START", ui->focus_editable ? "Enter" : "Search",
                        accent, text);
     draw_button_legend(pixels, width, height, stride, 253, top + 4,
-                       "Square", "Reload", accent, text);
+                       "□", "Reload", accent, text);
     int percent = ui->maximum_scroll_y <= 0 ? 100
         : ui->scroll_y * 100 / ui->maximum_scroll_y;
     char progress[16];
@@ -4982,26 +5162,26 @@ static TILEFINCH_OUT_OF_LINE void draw_menu(
         }
         bool exit_armed = at == UI_MENU_ROW_EXIT
             && ui->data_clear_confirmation == UI_MENU_EXIT_CONFIRMATION;
-        draw_text_with_font(
+        draw_fitted_ui_text(
                   pixels, width, height, stride, shadow.x + 18, row_y,
-                  exit_armed ? "Press X again to exit" : items[at], 24,
-                  shadow.x + shadow.width - 18,
+                  tilefinch_ui_text(exit_armed ? "Press X again to exit" : items[at]),
+                  shadow.x + shadow.width - 32,
                   at == ui->menu_selection
                       ? PSP_THEME_ON_ACCENT
                       : (at == PSP_UI_MENU_ITEM_COUNT - 1
                              ? PSP_THEME_TEXT_MUTED : PSP_THEME_TEXT_BODY),
-                  scale, NULL, false);
+                  scale, false);
         if (at >= UI_MENU_ROW_TABS && at <= UI_MENU_ROW_HELP)
             draw_chevron(
                 pixels, width, height, stride,
                 shadow.x + shadow.width - 20, row_y + 4, 1,
                 at == ui->menu_selection ? PSP_THEME_ON_ACCENT : accent);
     }
-    draw_text_with_font(pixels, width, height, stride, shadow.x + 16,
+    draw_fitted_ui_text(pixels, width, height, stride, shadow.x + 16,
               shadow.y + shadow.height - 18,
-              "X Open   O Back   Start Address",
-              36, shadow.x + shadow.width - 12,
-              muted, scale, NULL, false);
+              tilefinch_ui_text("X Open   O Back   Start Address"),
+              shadow.x + shadow.width - 12,
+              muted, scale, false);
 }
 
 static void draw_routed_list(
@@ -5017,12 +5197,19 @@ static void draw_routed_list(
     draw_panel_rule(pixels, width, height, stride, box, box.y + 45);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
-    draw_text_bold(pixels, width, height, stride,
-                   box.x + 16, box.y + 14, title, 25, text, 2);
-    if (context != NULL && context[0] != '\0')
-        draw_text_right_aligned(
-            pixels, width, height, stride, box.x + box.width - 16,
-            box.y + 15, context, 25, accent, 1, true);
+    int title_right = box.x + box.width - 16;
+    if (context != NULL && context[0] != '\0') {
+        int context_left = title_right
+            - chrome_text_width_bytes(context, strlen(context), 1, true);
+        if (context_left < box.x + box.width / 2)
+            context_left = box.x + box.width / 2;
+        draw_fitted_ui_text(pixels, width, height, stride, context_left,
+            box.y + 15, context, title_right, accent, 1, true);
+        title_right = context_left - 10;
+    }
+    draw_fitted_ui_text(pixels, width, height, stride,
+        box.x + 16, box.y + 14, tilefinch_ui_text(title),
+        title_right, text, 2, true);
     /* Seven 24px rows fit above the fixed hint bar. Longer routed lists are
        selection-windowed; drawing an eighth physical row would overlap the
        bottom hint and make its action label unreadable. */
@@ -5047,16 +5234,12 @@ static void draw_routed_list(
                 pixels, width, height, stride,
                 (UiRect) {box.x + 10, row_y - 5, pill_width, 22},
                 PSP_THEME_RADIUS_ROW, accent, 4);
-        draw_text_with_font(
-            pixels, width, height, stride, box.x + 18, row_y,
-            labels[at], 31, value_right - 87,
+        draw_ui_label_value(
+            pixels, width, height, stride, box.x + 18, value_right, row_y,
+            tilefinch_ui_text(labels[at]),
+            values != NULL && values[at] != NULL ? tilefinch_ui_text(values[at]) : "",
             selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
-            2, NULL, false);
-        if (values != NULL && values[at] != NULL)
-            draw_text_right_aligned(
-                pixels, width, height, stride, value_right,
-                row_y, values[at], 18,
-                selected ? PSP_THEME_ON_ACCENT : accent, 2, true);
+            selected ? PSP_THEME_ON_ACCENT : accent, 2);
     }
     if (first != 0)
         draw_vertical_chevron(pixels, width, height, stride,
@@ -5066,10 +5249,10 @@ static void draw_routed_list(
         draw_vertical_chevron(
             pixels, width, height, stride, box.x + box.width - 17,
             box.y + 60 + ((int) visible - 1) * 24, 1, muted, 3);
-    draw_text_with_font(
+    draw_fitted_ui_text(
         pixels, width, height, stride, box.x + 16,
-        box.y + box.height - 20, "X Open or toggle   O Back", 28,
-        box.x + box.width - 14, muted, 2, NULL, false);
+        box.y + box.height - 20, tilefinch_ui_text("X Open or toggle   O Back"),
+        box.x + box.width - 14, muted, 2, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_page_tools(
@@ -5207,9 +5390,10 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
                 row.x + row.width - 8, row.y + 4, ">", 2,
                 selected ? accent : muted, 1, true);
     }
-    draw_text(pixels, width, height, stride,
+    draw_fitted_ui_text(pixels, width, height, stride,
         box.x + 16, box.y + box.height - 20,
-        "X Open / confirm   O Back", 28, muted, 1);
+        tilefinch_ui_text("X Open / confirm   O Back"),
+        box.x + box.width - 16, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
@@ -5291,10 +5475,11 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
             ? "Only already-loaded same-origin resources are included."
             : "Unavailable resources may still need a network connection.",
         64, box.x + box.width - 16, muted, 1, NULL, false);
-    draw_text(pixels, width, height, stride,
+    draw_fitted_ui_text(pixels, width, height, stride,
               box.x + 16, box.y + box.height - 20,
               recompile ? "X Recompile   Square Open anyway   O Back"
-                        : "X Confirm   O Back", 44, muted, 1);
+                        : tilefinch_ui_text("X Confirm   O Back"),
+              box.x + box.width - 16, muted, 1, false);
 }
 
 static size_t ui_failure_labels(
@@ -5360,9 +5545,10 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
         draw_text(pixels, width, height, stride, row.x + 8, row.y + 3,
                   labels[at], 48, selected ? text : PSP_THEME_TEXT_BODY, 1);
     }
-    draw_text(pixels, width, height, stride,
+    draw_fitted_ui_text(pixels, width, height, stride,
               box.x + 15, box.y + box.height - 20,
-              "X Choose   O Return", 24, muted, 1);
+              tilefinch_ui_text("X Choose   O Return"),
+              box.x + box.width - 15, muted, 1, false);
     (void) accent;
 }
 
@@ -5377,7 +5563,7 @@ static TILEFINCH_OUT_OF_LINE void draw_help_detail(
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
     const char *title = "Help";
-    const char *lines[5] = {NULL, NULL, NULL, NULL, NULL};
+    const char *lines[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     if (ui->menu_selection == 2u) {
         title = "Last error summary";
         lines[0] = "The last saved error is included first";
@@ -5385,11 +5571,12 @@ static TILEFINCH_OUT_OF_LINE void draw_help_detail(
         lines[2] = "part to preserve the complete report.";
     } else if (ui->menu_selection == 3u) {
         title = "Controls guide";
-        lines[0] = "X opens or toggles.  O goes back.";
-        lines[1] = "Start opens Address.  Square reloads.";
-        lines[2] = "Select: menu.  L/R: page/category.";
-        lines[3] = "Analog moves the pointer or scrolls.";
-        lines[4] = "Hold Start+Select for page controls.";
+        lines[0] = tilefinch_ui_text("Up/Down selects a menu item.");
+        lines[1] = tilefinch_ui_text("X opens or toggles.  O goes back.");
+        lines[2] = tilefinch_ui_text("Start opens Address.  Square reloads.");
+        lines[3] = tilefinch_ui_text("Select: menu.  L/R: page/category.");
+        lines[4] = tilefinch_ui_text("Analog moves the pointer or scrolls.");
+        lines[5] = tilefinch_ui_text("Hold Start+Select for page controls.");
     } else if (ui->menu_selection == 4u) {
         title = "Version & system";
         lines[0] = "Tilefinch " TILEFINCH_VERSION_STRING;
@@ -5402,18 +5589,18 @@ static TILEFINCH_OUT_OF_LINE void draw_help_detail(
         lines[2] = "are included in the distribution.";
     }
     draw_text_bold(pixels, width, height, stride,
-                   box.x + 16, box.y + 14, title, 32, text, 2);
-    for (size_t at = 0; at < 5u; at++) {
+                   box.x + 16, box.y + 14, tilefinch_ui_text(title), 32, text, 2);
+    for (size_t at = 0; at < 6u; at++) {
         if (lines[at] == NULL) continue;
-        draw_text_with_font(
+        draw_fitted_ui_text(
             pixels, width, height, stride, box.x + 18,
-            box.y + 61 + (int) at * 24, lines[at], 50,
+            box.y + 61 + (int) at * 24, lines[at],
             box.x + box.width - 18,
             at == 0u ? accent : PSP_THEME_TEXT_BODY,
-            at == 0u ? 2 : 1, NULL, false);
+            at == 0u ? 2 : 1, false);
     }
     draw_text(pixels, width, height, stride,
-        box.x + 16, box.y + box.height - 20, "O Back", 12, muted, 2);
+        box.x + 16, box.y + box.height - 20, tilefinch_ui_text("O Back"), 12, muted, 2);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_tabs(
@@ -5429,7 +5616,7 @@ static TILEFINCH_OUT_OF_LINE void draw_tabs(
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 19);
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 13,
-                   "Tabs", 8, text, 2);
+                   tilefinch_ui_text("Tabs"), 32, text, 2);
 
     size_t count = ui->tabs == NULL ? 1u : ui->tabs->count;
     if (count == 0 || count > PSP_UI_TAB_LIMIT) count = 1u;
@@ -5547,12 +5734,12 @@ static TILEFINCH_OUT_OF_LINE void draw_tabs(
                 selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY, 1);
         }
     }
-    draw_text_with_font(
+    draw_fitted_ui_text(
         pixels, width, height, stride, box.x + 16,
         box.y + box.height - 19,
-        count > 1u ? "X Open   Square Close   O Back"
-                   : "X Open   O Back",
-        40, box.x + box.width - 12, muted, 1, NULL, false);
+        count > 1u ? tilefinch_ui_text("X Open   Square Close   O Back")
+                   : tilefinch_ui_text("X Open   O Back"),
+        box.x + box.width - 12, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_options(
@@ -5567,8 +5754,8 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
     draw_panel_rule(pixels, width, height, stride, box, box.y + 43);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
-    draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
-                   "Settings", 20, text, 2);
+    draw_fitted_ui_text(pixels, width, height, stride, box.x + 16, box.y + 14,
+        tilefinch_ui_text("Settings"), box.x + box.width - 16, text, 2, true);
     for (size_t at = 0; at < UI_SETTINGS_GROUP_COUNT; at++) {
         int row_y = box.y + 55 + (int) at * 24;
         bool selected = at == ui->options_group_selection;
@@ -5578,20 +5765,20 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
                 (UiRect) {box.x + 10, row_y - 5, box.width - 20, 23},
                 PSP_THEME_RADIUS_ROW, accent, 4);
         }
-        draw_text_with_font(
+        draw_fitted_ui_text(
             pixels, width, height, stride, box.x + 20, row_y,
-            ui_option_group_at(at), 28, box.x + box.width - 42,
+            ui_option_group_at(at), box.x + box.width - 42,
             selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
-            2, NULL, false);
+            2, false);
         draw_text_right_aligned(
             pixels, width, height, stride, box.x + box.width - 20,
             row_y, ">", 1,
             selected ? PSP_THEME_ON_ACCENT : accent, 2, true);
     }
-    draw_text_with_font(
+    draw_fitted_ui_text(
         pixels, width, height, stride, box.x + 16,
-        box.y + box.height - 20, "X Open   O Back", 18,
-        box.x + box.width - 14, muted, 2, NULL, false);
+        box.y + box.height - 20, tilefinch_ui_text("X Open   O Back"),
+        box.x + box.width - 14, muted, 2, false);
 }
 
 static const char *ui_video_language_name(unsigned language)
@@ -5856,6 +6043,14 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *label = "Save error reports";
             *value = ui->save_diagnostic_reports ? "On" : "Off";
             break;
+        case UI_OPTION_WIFI_DIAGNOSTICS:
+            *label = "Wi-Fi diagnostics";
+            *value = ui->wifi_diagnostics ? "Verbose (RAM)" : "Off";
+            break;
+        case UI_OPTION_YOUTUBE_TOPICS:
+            *label = "YouTube home topics";
+            *value = ui->youtube_topics ? "On" : "Off";
+            break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
             *label = "Power test";
@@ -5895,19 +6090,12 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     draw_panel_rule(pixels, width, height, stride, box, box.y + 48);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 18);
-    draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
-                   "Settings", 20, text, 2);
-    draw_text_with_font(
-        pixels, width, height, stride, box.x + 96, box.y + 14,
-        ">", 1, box.x + 112, accent, 2, NULL, true);
-    draw_text_with_font(
-        pixels, width, height, stride, box.x + 116, box.y + 14,
+    draw_ui_settings_heading(pixels, width, height, stride, box,
         ui_option_group_at(ui_option_group_index(
-            ui_option_id(ui->options_selection))), 24,
-        box.x + box.width - 16, accent, 2, NULL, true);
+            ui_option_id(ui->options_selection))), text, accent);
     draw_text_right_aligned(
         pixels, width, height, stride, box.x + box.width - 16,
-        box.y + 31, "X or Left/Right change   L/R category   O Back", 48,
+        box.y + 31, tilefinch_ui_text("X or Left/Right change   L/R category   O Back"), 48,
         muted, 1, false);
     size_t group = ui_option_group_index(
         ui_option_id(ui->options_selection));
@@ -5936,7 +6124,6 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     bool scrolls = first != 0 || end != group_count;
     const int value_right = box.x + box.width - (scrolls ? 46 : 16);
     const int pill_width = box.width - (scrolls ? 48 : 20);
-    const int label_right = box.x + box.width - (scrolls ? 145 : 115);
     const int scroll_gutter_x = box.x + box.width - 17;
     for (size_t row = first; row < end; row++) {
         size_t at = group_items[row];
@@ -5954,15 +6141,12 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                     box.x + 10, row_y - 4, pill_width, row_height
                 },
                 PSP_THEME_RADIUS_ROW, accent, 4);
-        draw_text_with_font(
-            pixels, width, height, stride, box.x + 18, row_y,
-            label, 28, label_right,
+        draw_ui_label_value(
+            pixels, width, height, stride, box.x + 18, value_right, row_y,
+            tilefinch_ui_text(label), ui_option_id(at) == UI_OPTION_NETWORK_PROFILE
+                ? value : tilefinch_ui_text(value),
             selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
-            2, NULL, false);
-        draw_text_right_aligned(
-            pixels, width, height, stride, value_right,
-            row_y, value, 22,
-            selected ? PSP_THEME_ON_ACCENT : accent, 2, true);
+            selected ? PSP_THEME_ON_ACCENT : accent, 2);
     }
     if (first != 0)
         draw_vertical_chevron(
@@ -6072,7 +6256,7 @@ static TILEFINCH_OUT_OF_LINE void draw_experimental_options(
             2, NULL, false);
     }
     const char *hint = ui->experimental_options_selection == 5
-        ? "X Edit URL   O Back" : "X Select   O Back";
+        ? "X Edit URL   O Back" : tilefinch_ui_text("X Select   O Back");
     if (ui->experimental_options_selection == 1) {
         hint = ui->voice_component_remove_confirmation
             ? "X Remove model   O Cancel"
@@ -6097,8 +6281,9 @@ static TILEFINCH_OUT_OF_LINE void draw_experimental_options(
              == UI_EXPERIMENTAL_ROW_VIDEO_DECODER)
         hint = "Left/Right choose   X Save   O Back";
 #endif
-    draw_text(pixels, width, height, stride, box.x + 16,
-              box.y + box.height - 22, hint, 24, muted, 2);
+    draw_fitted_ui_text(pixels, width, height, stride, box.x + 16,
+              box.y + box.height - 22, hint,
+              box.x + box.width - 16, muted, 2, false);
 }
 
 static const char *ui_glyph_language_name(unsigned language)
@@ -6115,6 +6300,7 @@ static const char *ui_glyph_language_name(unsigned language)
             return "Extended Latin";
         case BROWSER_GLYPH_LANGUAGE_ARABIC: return "Arabic";
         case BROWSER_GLYPH_LANGUAGE_HEBREW: return "Hebrew";
+        case BROWSER_GLYPH_LANGUAGE_DEVANAGARI: return "Devanagari (Hindi)";
         case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:
         default: return "Embedded";
@@ -6131,7 +6317,8 @@ static const char *ui_glyph_pack_state(
         && ui->glyph_component_progress_plus_one != 0) {
         snprintf(output, 32, "%s %d%%",
                  phase == PSP_UI_GLYPH_COMPONENT_DOWNLOADING
-                     ? "Downloading" : "Installing",
+                     ? tilefinch_ui_text("Downloading")
+                     : tilefinch_ui_text("Installing"),
                  ((int) ui->glyph_component_progress_plus_one - 1) / 10);
         return output;
     }
@@ -6160,14 +6347,8 @@ static TILEFINCH_OUT_OF_LINE void draw_theme_options(
     draw_panel_rule(pixels, width, height, stride, box, box.y + 48);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 18);
-    draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
-                   "Settings", 20, text, 2);
-    draw_text_with_font(pixels, width, height, stride, box.x + 96,
-                        box.y + 14, ">", 1, box.x + 112, accent, 2,
-                        NULL, true);
-    draw_text_with_font(pixels, width, height, stride, box.x + 116,
-                        box.y + 14, "Themes", 16,
-                        box.x + box.width - 16, accent, 2, NULL, true);
+    draw_ui_settings_heading(pixels, width, height, stride, box,
+        "Themes", text, accent);
     draw_text_right_aligned(pixels, width, height, stride,
                             box.x + box.width - 16, box.y + 31,
                             "X Apply   O Back", 18, muted, 1, false);
@@ -6208,15 +6389,22 @@ static TILEFINCH_OUT_OF_LINE void draw_theme_options(
             pixels, width, height, stride,
             (UiRect) {box.x + box.width - 48, row_y - 1, 18, 10},
             PSP_THEME_RADIUS_CHIP, row_accent, 4);
+        const char *active_label = tilefinch_ui_text("Active");
+        int label_right = box.x + box.width - 82;
+        if (active) {
+            int active_left = box.x + box.width - 58
+                - chrome_text_width_bytes(active_label, strlen(active_label), 1, true);
+            if (label_right > active_left - 10) label_right = active_left - 10;
+        }
         draw_text_with_font(
             pixels, width, height, stride, box.x + 18, row_y,
-            label == NULL ? "Unnamed" : label, 25, box.x + box.width - 82,
+            label == NULL ? "Unnamed" : label, 25, label_right,
             row_selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
             2, NULL, false);
         if (active)
             draw_text_right_aligned(
                 pixels, width, height, stride, box.x + box.width - 58,
-                row_y, "Active", 6,
+                row_y, active_label, TILEFINCH_UI_TRANSLATION_BYTES,
                 row_selected ? PSP_THEME_ON_ACCENT : accent, 1, true);
     }
     const char *hint = custom_count == 0u
@@ -6240,44 +6428,44 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
     draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 22);
-    draw_text_bold(pixels, width, height, stride,
+    draw_fitted_ui_text(pixels, width, height, stride,
                    box.x + 16, box.y + 14,
-                   "Language & emoji", 30, text, 2);
+                   tilefinch_ui_text("Language & emoji"),
+                   box.x + box.width - 16, text, 2, true);
     TilefinchGlyphPack language_pack = TILEFINCH_GLYPH_PACK_JAPANESE;
     bool downloadable = tilefinch_glyph_pack_for_language(
         ui->glyph_language, &language_pack);
     char language_state[32], emoji_state[32];
-    char rows[UI_GLYPH_OPTION_ROWS][64];
-    snprintf(rows[0], sizeof(rows[0]), "Language  %s",
-             ui_glyph_language_name(ui->glyph_language));
-    snprintf(rows[1], sizeof(rows[1]), "Emoji  %s",
-             ui->color_emoji ? "Color pack" : "Embedded");
-    snprintf(rows[2], sizeof(rows[2]), "Language pack  %s",
-             downloadable
-                 ? ui_glyph_pack_state(ui, language_pack, language_state)
-                 : "Built in");
-    snprintf(rows[3], sizeof(rows[3]), "Color emoji pack  %s",
-             ui_glyph_pack_state(
-                 ui, TILEFINCH_GLYPH_PACK_COLOR_EMOJI, emoji_state));
-    snprintf(rows[4], sizeof(rows[4]), "Offer language packs  %s",
-             ui->glyph_offers_off ? "Off" : "Ask");
-    snprintf(rows[5], sizeof(rows[5]), "%s", "Reset declined offers");
+    const TilefinchUiLanguageSpec *locale = tilefinch_ui_language_spec(ui->ui_language);
+    const char *labels[UI_GLYPH_OPTION_ROWS] = {
+        "Page glyphs", "Emoji", "Language pack", "Color emoji pack",
+        "Offer language packs", "Reset declined offers", "Interface language"
+    };
+    const char *values[UI_GLYPH_OPTION_ROWS] = {
+        ui_glyph_language_name(ui->glyph_language),
+        ui->color_emoji ? "Color pack" : "Embedded",
+        downloadable ? ui_glyph_pack_state(ui, language_pack, language_state) : "Built in",
+        ui_glyph_pack_state(ui, TILEFINCH_GLYPH_PACK_COLOR_EMOJI, emoji_state),
+        ui->glyph_offers_off ? "Off" : "Ask", "", locale ? locale->label : "English"
+    };
     for (size_t at = 0; at < UI_GLYPH_OPTION_ROWS; at++) {
-        int row_y = box.y + 54 + (int) at * 28;
+        int row_y = box.y + 54 + (int) at * 24;
         bool selected = at == ui->glyph_options_selection;
         if (selected)
             fill_round_rect(
                 pixels, width, height, stride,
                 (UiRect) {box.x + 10, row_y - 5, box.width - 20, 24},
                 PSP_THEME_RADIUS_ROW, accent, 4);
-        draw_text_with_font(
-            pixels, width, height, stride, box.x + 18, row_y,
-            rows[at], 42, box.x + box.width - 14,
+        draw_ui_label_value(
+            pixels, width, height, stride, box.x + 18, box.x + box.width - 14, row_y,
+            tilefinch_ui_text(labels[at]), tilefinch_ui_text(values[at]),
             selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
-            2, NULL, false);
+            selected ? PSP_THEME_ON_ACCENT : accent, 2);
     }
     const char *hint = "Left/Right choose   O Back";
-    if (ui->glyph_options_selection == 5u) {
+    if (ui->glyph_options_selection == 6u) {
+        hint = "X Install language   O Back";
+    } else if (ui->glyph_options_selection == 5u) {
         hint = "X Reset   O Back";
     } else if (ui->glyph_options_selection == 2u
                || ui->glyph_options_selection == 3u) {
@@ -6301,10 +6489,10 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
         else if (installed) hint = "X Check update   Square remove";
         else hint = "X Download pack   O Back";
     }
-    draw_text_with_font(
+    draw_fitted_ui_text(
         pixels, width, height, stride, box.x + 16,
-        box.y + box.height - 22, hint, 34,
-        box.x + box.width - 14, muted, 1, NULL, false);
+        box.y + box.height - 22, tilefinch_ui_text(hint),
+        box.x + box.width - 14, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_video_language_options(
@@ -6319,9 +6507,8 @@ static TILEFINCH_OUT_OF_LINE void draw_video_language_options(
     draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 22);
-    draw_text_bold(pixels, width, height, stride,
-                   box.x + 16, box.y + 14,
-                   "Settings > Video > Audio & subtitles", 38, text, 2);
+    draw_ui_settings_heading(pixels, width, height, stride, box,
+        tilefinch_ui_text("Audio & subtitles"), text, accent);
     static const char *const labels[5] = {
         "Audio language", "Subtitle language", "Alternate language",
         "Subtitle size", "Subtitle background"
@@ -6343,17 +6530,14 @@ static TILEFINCH_OUT_OF_LINE void draw_video_language_options(
                 PSP_THEME_RADIUS_ROW, accent, 4);
         uint16_t color = selected ? PSP_THEME_ON_ACCENT
                                   : PSP_THEME_TEXT_BODY;
-        draw_text_with_font(
-            pixels, width, height, stride, box.x + 18, row_y,
-            labels[at], 24, box.x + 220, color, 1, NULL, false);
-        draw_text_right_aligned(
-            pixels, width, height, stride, box.x + box.width - 18,
-            row_y, values[at], 18, color, 1, true);
+        draw_ui_label_value(pixels, width, height, stride, box.x + 18,
+            box.x + box.width - 18, row_y, tilefinch_ui_text(labels[at]),
+            tilefinch_ui_text(values[at]), color, color, 1);
     }
-    draw_text_with_font(
+    draw_fitted_ui_text(
         pixels, width, height, stride, box.x + 16,
-        box.y + box.height - 22, "Left/Right choose   O Back", 30,
-        box.x + box.width - 14, muted, 1, NULL, false);
+        box.y + box.height - 22, tilefinch_ui_text("Left/Right choose   O Back"),
+        box.x + box.width - 14, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_update(
@@ -6425,7 +6609,7 @@ static TILEFINCH_OUT_OF_LINE void draw_update(
         draw_text(
             pixels, width, height, stride, box.x + 16,
             box.y + box.height - 18,
-            ui->update_cancel_enabled ? "O Stop" : "O Back",
+            ui->update_cancel_enabled ? "O Stop" : tilefinch_ui_text("O Back"),
             20, muted, 2);
     }
 }
@@ -6511,12 +6695,12 @@ static TILEFINCH_OUT_OF_LINE void draw_update_versions(
     }
     const char *hint = ui->update_history_phase
             == TILEFINCH_UPDATE_HISTORY_ERROR
-        ? "X Retry   O Back"
-        : count != 0 ? "X Select   O Back" : "O Back";
-    draw_text_with_font(
+        ? tilefinch_ui_text("X Retry   O Back")
+        : count != 0 ? tilefinch_ui_text("X Select   O Back") : tilefinch_ui_text("O Back");
+    draw_fitted_ui_text(
         pixels, width, height, stride, box.x + 16,
-        box.y + box.height - 18, hint, 22,
-        box.x + box.width - 14, muted, 1, NULL, false);
+        box.y + box.height - 18, hint,
+        box.x + box.width - 14, muted, 1, false);
 }
 
 /* "812 KB", "1.4 MB", "3.2 GB": one decimal once past a megabyte. */
@@ -6682,13 +6866,14 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
             box.y + 52 + ((int) UI_SITE_DATA_VISIBLE_LINES - 1) * 21, 1,
             muted, 3);
     const char *hint = ui->data_clear_confirmation != 0
-        ? "X Confirm clear   O Cancel"
-        : selection < sites ? "X Open   Left/Right change   O Back"
+        ? tilefinch_ui_text("X Confirm clear   O Cancel")
+        : selection < sites ? tilefinch_ui_text("X Open   Left/Right change   O Back")
         : selection == sites + UI_SITE_DATA_COMPILED_SCRIPTS
             ? "Faster revisits; uses Memory Stick space"
-            : "X or Left/Right change   L/R section";
-    draw_text(pixels, width, height, stride, box.x + 16,
-              box.y + box.height - 22, hint, 40, muted, 2);
+            : tilefinch_ui_text("X or Left/Right change   L/R section");
+    draw_fitted_ui_text(pixels, width, height, stride, box.x + 16,
+              box.y + box.height - 22, hint,
+              box.x + box.width - 16, muted, 2, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_storage_site(
@@ -6741,11 +6926,11 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_site(
     draw_text_with_font(pixels, width, height, stride, box.x + 18,
                         box.y + 146, explanations[row->state & 3u], 56,
                         box.x + box.width - 14, muted, 1, NULL, false);
-    draw_text(pixels, width, height, stride, box.x + 16,
+    draw_fitted_ui_text(pixels, width, height, stride, box.x + 16,
               box.y + box.height - 22,
-              focus == 0u ? "X or Left/Right change   O Back"
-                          : "X Delete   O Back",
-              34, muted, 2);
+              focus == 0u ? tilefinch_ui_text("X or Left/Right change   O Back")
+                          : tilefinch_ui_text("X Delete   O Back"),
+              box.x + box.width - 16, muted, 2, false);
 }
 
 /* The language-pack confirmation, in the Memory Stick offer's panel
@@ -6994,7 +7179,7 @@ static TILEFINCH_OUT_OF_LINE void draw_diagnostic_qr(
     draw_text(pixels, width, height, stride, text_x, 120,
               page, 22, accent, 1);
     draw_text(pixels, width, height, stride, text_x, 136,
-              "Error", 12, PSP_THEME_TEXT_MUTED, 1);
+              tilefinch_ui_text("Error"), 12, PSP_THEME_TEXT_MUTED, 1);
     draw_text_with_font(
         pixels, width, height, stride, text_x, 149,
         view->error_summary, 34, width - 6,
@@ -7010,7 +7195,7 @@ static TILEFINCH_OUT_OF_LINE void draw_diagnostic_qr(
     draw_text(pixels, width, height, stride, text_x, 243,
               "L/R Page", 20, accent, 1);
     draw_text(pixels, width, height, stride, text_x, 256,
-              "Up/Down Part  O Back", 28, PSP_THEME_TEXT_BODY, 1);
+              tilefinch_ui_text("Up/Down Part  O Back"), 28, PSP_THEME_TEXT_BODY, 1);
 }
 
 /*
@@ -7272,8 +7457,8 @@ static void draw_home_entering(const PspUiState *ui, uint16_t *pixels,
     draw_surface_hint(
         pixels, width, height, stride,
         ui->home != NULL && !ui->home->engine_ready
-            ? "X OPEN WHEN READY   SELECT MENU"
-            : "X OPEN   START SEARCH   SELECT MENU",
+            ? tilefinch_ui_text("X OPEN WHEN READY   SELECT MENU")
+            : tilefinch_ui_text("X OPEN   START SEARCH   SELECT MENU"),
         entrance.furniture);
 }
 
@@ -9092,6 +9277,20 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
     PspUiMediaIntent intent = {0};
     if (media == NULL || input == NULL || !media->visible) return intent;
     PspUiMediaPresentation *presentation = media->presentation;
+    PspUiInput rotated;
+    if (presentation != NULL && presentation->clockwise) {
+        rotated = *input;
+        uint32_t arrows = PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN
+            | PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT;
+        rotated.pressed &= ~arrows;
+        if (input->pressed & PSP_UI_BUTTON_UP) rotated.pressed |= PSP_UI_BUTTON_LEFT;
+        if (input->pressed & PSP_UI_BUTTON_DOWN) rotated.pressed |= PSP_UI_BUTTON_RIGHT;
+        if (input->pressed & PSP_UI_BUTTON_LEFT) rotated.pressed |= PSP_UI_BUTTON_DOWN;
+        if (input->pressed & PSP_UI_BUTTON_RIGHT) rotated.pressed |= PSP_UI_BUTTON_UP;
+        rotated.analog_x = input->analog_y;
+        rotated.analog_y = (uint8_t) (255u - input->analog_x);
+        input = &rotated;
+    }
     uint32_t pressed = input->pressed;
     if (presentation != NULL && presentation->track_menu_open) {
         unsigned count = presentation->track_menu_tab == 0
@@ -9190,6 +9389,10 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
     psp_ui_media_show_controls(media);
     intent.visual_changed = true;
     if (!media->failed && presentation != NULL
+        && presentation->rotation_available
+        && !media->resolving && (pressed & PSP_UI_BUTTON_MENU)) {
+        intent.action = PSP_UI_MEDIA_ACTION_ROTATE;
+    } else if (!media->failed && presentation != NULL
         && (pressed & PSP_UI_BUTTON_TOOLBAR)
         && (presentation->audio_track_count != 0
             || presentation->subtitle_track_count != 0)) {
@@ -9279,7 +9482,8 @@ bool psp_ui_media_intent_has_predispatch_visual(
        keep the early present because seek, retry, and close can block while
        the already-mutated preview or controls should remain responsive. */
     return intent->action != PSP_UI_MEDIA_ACTION_NONE
-        && intent->action != PSP_UI_MEDIA_ACTION_PLAY_PAUSE;
+        && intent->action != PSP_UI_MEDIA_ACTION_PLAY_PAUSE
+        && intent->action != PSP_UI_MEDIA_ACTION_ROTATE;
 }
 
 /*
@@ -9319,6 +9523,14 @@ PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
     PspUiMediaIntent intent = {0};
     if (media == NULL || !media->visible || width <= 0 || height <= 0
         || x < 0 || y < 0 || x >= width || y >= height) return intent;
+    if (media->presentation != NULL && media->presentation->clockwise) {
+        int logical_y = width - 1 - x;
+        x = y;
+        y = logical_y;
+        int swap = width;
+        width = height;
+        height = swap;
+    }
     bool controls_were_hidden = !media->controls_visible;
     psp_ui_media_show_controls(media);
     intent.visual_changed = true;
@@ -9687,10 +9899,12 @@ typedef struct {
 static UiRect media_track_menu_rect(int width, int height)
 {
     (void) height;
+    int menu_width = (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH;
+    if (menu_width > width - 16) menu_width = width - 16;
     return (UiRect) {
-        width / 2 - (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH / 2,
+        (width - menu_width) / 2,
         48,
-        (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+        menu_width,
         (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT
     };
 }
@@ -9708,9 +9922,9 @@ static UiRect media_subtitle_rect(
        black flicker against moving video on the physical panel. One-row text
        is centered in the same bounded two-row box. */
     int subtitle_height = small ? 36 : 50;
-    return (UiRect) {
-        width / 2 - 202, bottom - subtitle_height, 404, subtitle_height
-    };
+    int subtitle_width = width < 428 ? width - 24 : 404;
+    return (UiRect) {(width - subtitle_width) / 2,
+                     bottom - subtitle_height, subtitle_width, subtitle_height};
 }
 
 static int media_badge_center_y(
@@ -10022,7 +10236,11 @@ static void draw_media_control_bar(
                           ? "X PAUSE  TRI TRACKS"
                           : "X PLAY  TRI TRACKS")
                       : (media->playing ? "X PAUSE" : "X PLAY"),
-                  24, muted, 2);
+                  24, muted, width < 360 ? 1 : 2);
+        if (media->presentation != NULL
+            && media->presentation->rotation_available)
+            draw_text(pixels, width, height, stride, left, height - 13,
+                      "SELECT ROTATE", 13, muted, 1);
         return;
     }
     if (media->duration_us != 0 && media->buffered_visual_pixel != 0u) {
@@ -10068,7 +10286,10 @@ static void draw_media_control_bar(
                       : (media->playing
                           ? "STICK/L/R SEEK  X PAUSE"
                           : "STICK/L/R SEEK  X PLAY"),
-              32, muted, 2);
+              32, muted, width < 360 ? 1 : 2);
+    if (media->presentation != NULL && media->presentation->rotation_available)
+        draw_text(pixels, width, height, stride, left, height - 13,
+                  "SELECT ROTATE", 13, muted, 1);
 }
 
 static void draw_media_subtitle(
@@ -10211,10 +10432,10 @@ static void draw_media_track_menu_box(
                       box.x + box.width - 30, y, "X", 1,
                       PSP_THEME_ACCENT_EMBER_HI, 1);
     }
-    draw_text(pixels, width, height, stride,
+    draw_fitted_ui_text(pixels, width, height, stride,
               box.x + 16, box.y + box.height - 17,
-              "L/R CATEGORY   X SELECT   O BACK", 34,
-              PSP_THEME_TEXT_MUTED, 1);
+              tilefinch_ui_text("L/R CATEGORY   X SELECT   O BACK"),
+              box.x + box.width - 16, PSP_THEME_TEXT_MUTED, 1, false);
 }
 
 static void draw_media_track_menu(
@@ -10417,12 +10638,14 @@ void psp_ui_media_composite_layers(
             fill_round_rect(
                 pixels, width, height, stride, back,
                 PSP_THEME_RADIUS_CHIP, PSP_THEME_SURFACE, 4);
+            const char *back_label = tilefinch_ui_text("O Back");
             int back_width = chrome_text_width_bytes(
-                "O Back", strlen("O Back"), 2, true);
+                back_label, strlen(back_label), 2, true);
             draw_text_bold(
                 pixels, width, height, stride,
                 back.x + (back.width - back_width) / 2,
-                back.y + (back.height - 18) / 2, "O Back", 6, text, 2);
+                back.y + (back.height - 18) / 2, back_label,
+                TILEFINCH_UI_TRANSLATION_BYTES, text, 2);
             if (!media->retry_unavailable
                 && (media->audio_only_recovery_available
                     || media->lower_quality_recovery_available)) {

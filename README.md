@@ -33,7 +33,7 @@ coding agents are capable of. A web browser tests all three.
 | **Reader, Basic view and offline** | Reader mode reflows articles; Basic view rescues pages whose scripts fail, keeping their links, tables and simple search forms. Save articles, and install small manifest-backed web apps for offline use with their icon and the same-origin resources already loaded, then update, reinstall, or remove them. |
 | **Text entry** | The PSP system keyboard or the faster Danzeff radial keyboard, with completion from local bookmarks and history. |
 | **Games** | Bounded Canvas 2D and WebGL 1 for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
-| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, bounded mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
+| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, translated browser menus, bounded mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, Hindi, and color-emoji glyph packs. |
 | **Native PSP interface** | An immediate home screen, Collections, clock, battery and Wi-Fi status, contextual controls, PNG screenshots, and diagnostics shown as photographable QR codes. |
 | **Optional XMB redirect** | With ARK-4, Sony's Internet Browser icon can launch Tilefinch; holding L opens the original browser instead. |
 | **Updates** | Signed in-app updates with A/B slots, a trial boot, automatic rollback, explicit approval, and an optional picker for signed earlier versions. |
@@ -64,6 +64,10 @@ coding agents are capable of. A web browser tests all three.
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine, so memory is never freed beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS, CSP, SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
 | **Hardware-aware gates** | The optimized host suite is backed by sanitizer, hostile-input, WPT, fidelity, and PSP cross-build gates, plus ratchets on executable size and hot-function size ([engineering guide](AGENTS.md)). |
+
+Detailed performance and memory experiment ledgers are kept locally and in
+the private development archive, not in this public repository. Public
+engineering documentation describes the current contracts and reproducible checks.
 
 ## What you need
 
@@ -194,6 +198,43 @@ The [user guide](docs/USER_GUIDE.md) covers everyday use in detail:
   the **per-site controls** for JavaScript, ad blocking, cookie notices, and
   storage.
 
+## Language support
+
+### Browser menus
+
+Open **Settings → Appearance → Language & emoji → Interface language**.
+Choose with Left/Right, press X to install, then restart Tilefinch to apply.
+English is built in; downloadable translations are available for Spanish,
+French, German, Japanese, Russian, Ukrainian, Simplified Chinese, Korean,
+Hindi and Arabic. Choosing a language also downloads its required glyph pack
+if it is not already installed. Advanced messages not yet translated remain
+in English, and English stays available if a download fails.
+
+This changes Tilefinch's menus—not the text of websites, games, or subtitles.
+Preferred video, audio and subtitle languages are separate settings.
+
+### Page text and emoji
+
+The built-in fonts cover Latin text, with compact fallbacks for some Chinese,
+Japanese, Korean and emoji characters. **Settings → Appearance → Language &
+emoji** offers additional page-text packs: Japanese, Simplified Chinese,
+Traditional Chinese, Korean, Cyrillic (including Russian and Ukrainian),
+Extended Latin, Arabic, Hebrew and Devanagari (Hindi), plus a color emoji pack.
+A page using a missing pack can also offer to install it while you browse.
+
+Confirm the corresponding pack download and restart to use it. Square removes
+an installed pack. Packs add glyph coverage; they do not translate page text.
+Arabic and Hebrew have right-to-left layout support. Hindi covers common
+syllables and interface clusters; unusual conjuncts may still use fallback
+cells.
+
+Translations and signed packs are hosted in
+[tilefinch-models](https://github.com/stjanovitz/tilefinch-models), which lists
+the available downloads. Tilefinch verifies them before installation and keeps
+installed downloads on the Memory Stick for offline use. See the
+[language-pack guide](docs/USER_GUIDE.md#other-languages-and-language-packs)
+for installation, removal and missing-text notices.
+
 ## Updating
 
 Check for updates from **Settings → Updates**. An optional background check
@@ -238,10 +279,11 @@ have the details.
   HTTP caches**. **Settings → Privacy & security → TLS ticket saving** stops
   keeping them between boots without disabling connection reuse within a
   session.
-- The PSP contacts only the sites you visit, plus the GitHub releases API at
-  most once a week if the update check is on. That check compares version
-  numbers, sends nothing identifying beyond an ordinary HTTPS request, and
-  can be turned off.
+- The background update check contacts the GitHub releases API at most once
+  a week if enabled. It compares version numbers, sends nothing identifying
+  beyond an ordinary HTTPS request, and can be turned off. Downloads you
+  request—including updates, language packs and interface translations—also
+  contact their published download hosts.
 - **Help & diagnostics → Check Wi-Fi sign-in** makes one cookie-free HTTP
   request to `connectivitycheck.gstatic.com`, only when you ask for it or
   accept a sign-in suggestion. A detected sign-in page opens with temporary
@@ -368,7 +410,7 @@ bundle itself carries the PocketSphinx license that its linked decoder
 requires.
 
 The optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic,
-Hebrew, and color-emoji packs are likewise not part of the download. They are
+Hebrew, Devanagari (Hindi), and color-emoji packs are likewise not part of the download. They are
 generated from Noto fonts, carry the complete SIL Open Font License notice
 and a digest of the source font, and are fetched only when you ask for one.
 Tilefinch does not read the PSP's proprietary firmware fonts.

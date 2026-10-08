@@ -7,7 +7,8 @@ typedef struct {
     PspUiState ui;
     uint16_t *base, *before, *presented;
     unsigned input, checkpoints, request_checkpoint;
-    bool font_work, publication, received, handled, visible;
+    uint8_t queued_page_inputs;
+    bool font_work, script_work, publication, received, handled, visible;
     uint64_t requested_us, acknowledged_us, visible_us, returned_us;
     uint64_t last_us, max_gap_us;
     char gap_phase[48];
@@ -16,6 +17,19 @@ typedef struct {
 static uint64_t interruption_retry_clock(void *opaque)
 {
     return *(uint64_t *) opaque;
+}
+
+static void interruption_sync_focus(BrowserEngine *engine, PspUiState *ui)
+{
+    NavigationSession *nav = browser_engine_navigation(engine);
+    int x = 0, y = 0, w = 0, h = 0;
+    bool visible = browser_engine_focus_indicator_rect(engine, &x, &y, &w, &h);
+    int scroll = navigation_current(nav)->scroll_y;
+    psp_ui_set_focus(ui, visible,
+        viewport_css_to_device(&nav->viewport, x),
+        viewport_css_to_device(&nav->viewport, y - scroll),
+        viewport_css_to_device(&nav->viewport, w),
+        viewport_css_to_device(&nav->viewport, h));
 }
 
 static bool interruption_checkpoint(void *opaque, const char *phase, size_t work)
@@ -30,7 +44,8 @@ static bool interruption_checkpoint(void *opaque, const char *phase, size_t work
     if (strcmp(phase, "optional-font-publication") == 0)
         p->publication = work != 0;
     if (p->received || (p->font_work && !p->publication)
-        || strncmp(phase, "layout", 6) != 0) return true;
+        || (p->script_work ? strcmp(phase, "script") != 0
+            : strncmp(phase, "layout", 6) != 0)) return true;
     if (++p->checkpoints < p->request_checkpoint) return true;
     if (!p->requested_us) {
         /* Input arrives just after a safe point, not at its receiver. */
@@ -49,11 +64,12 @@ static bool interruption_checkpoint(void *opaque, const char *phase, size_t work
         input.pressed = input.held = 0;
         (void) psp_ui_filter_toolbar_input(&toolbar, &input, true, 1100);
     }
-    if (p->input == 3) {
+    if (p->input >= 3) {
         /* Scroll is queued until the owner releases its borrowed document.
            Queue admission is not a claim that scroll pixels are visible. */
         p->handled = true;
-    } else p->handled = psp_ui_update_priority(&p->ui, &input);
+    } else p->handled = psp_ui_update_priority_with_page_queue(
+        &p->ui, &input, &p->queued_page_inputs);
     p->acknowledged_us = tilefinch_platform_monotonic_time_us();
     memcpy(p->presented, p->base, 480u * 272u * sizeof(uint16_t));
     psp_ui_composite(&p->ui, p->presented, 480, 272, 480);
@@ -71,7 +87,8 @@ int test_background_interruption_journey(void)
     size_t used = (size_t) snprintf(html, sizeof(html),
         "<!doctype html><style>body{margin:8px}p{font:700 18px serif;height:32px}"
         "summary,a{display:block;height:36px}</style><body>"
-        "<a href='/next' style='font:700 18px serif'>Next article</a><details id=section open>"
+        "<a href='/next' style='font:700 18px serif'>Next article</a>"
+        "<a href='/other' style='font:700 18px serif'>Other article</a><details id=section open>"
         "<summary id=toggle>History</summary>");
     for (unsigned row = 0; row < 400; row++) {
         int n = snprintf(html + used, sizeof(html) - used,
@@ -80,15 +97,15 @@ int test_background_interruption_journey(void)
         used += (size_t) n;
     }
     used += (size_t) snprintf(html + used, sizeof(html) - used, "</details><p>End of article.</p></body>");
-    for (unsigned work = 0; work < 3; work++) {
-        for (unsigned input = 0; input < 4; input++) {
+    for (unsigned work = 0; work < 4; work++) {
+        for (unsigned input = 0; input < 5; input++) {
             BrowserDeviceProfile profile;
             browser_device_profile_psp3000(&profile);
             BrowserConfig config;
             browser_config_init(&config, &profile);
             config.memory_limit = 24u * MIB;
-            config.javascript.enabled = work == 2;
-            config.javascript.document_scripts_enabled = work == 2;
+            config.javascript.enabled = work >= 2;
+            config.javascript.document_scripts_enabled = work >= 2;
             config.resources.enabled = work == 2;
             config.resources.web_fonts_enabled = false;
             /* Exercise the cancellable transaction even above the default
@@ -134,17 +151,23 @@ int test_background_interruption_journey(void)
             memcpy(base, browser_engine_framebuffer(engine, &pixels), sizeof(base));
             CHECK(pixels == 480u * 272u);
             InterruptionProbe probe = { .base = base, .before = before, .presented = shown,
-                .input = input, .request_checkpoint = work == 2 ? 1 : 3 + 16 * input,
-                .font_work = work == 0 };
+                .input = input, .request_checkpoint = work >= 2 ? 1 : 3 + 16 * input,
+                .queued_page_inputs = 1,
+                .font_work = work == 0, .script_work = work == 3 };
             psp_ui_init(&probe.ui);
             psp_ui_set_page(&probe.ui, "Article", "https://interruption.test/article", true);
             probe.ui.chrome_visible = true;
             probe.ui.analog_cursor_enabled = true;
+            interruption_sync_focus(engine, &probe.ui);
             /* Compare with the same chrome before input, not a bare page. */
             memcpy(before, base, sizeof(base));
             psp_ui_composite(&probe.ui, before, 480, 272, 480);
             size_t fonts_before = font_set_loaded_bytes(browser_engine_fonts(engine));
             size_t relayouts = nav->incremental_relayouts;
+            if (work == 3) CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "setTimeout(()=>{let n=0;for(let i=0;i<200000;i++)n+=(i&7);"
+                "globalThis.backgroundWork=n;},0)",
+                "<background-script>", &nav->page.script_result));
             TilefinchPlatformServices services = { .context = &probe, .cooperate = interruption_checkpoint };
             tilefinch_platform_set_services(&services);
             probe.last_us = tilefinch_platform_monotonic_time_us();
@@ -156,6 +179,7 @@ int test_background_interruption_journey(void)
                 for (unsigned pump = 0; pump < 512 && !probe.received; pump++) {
                     bool changed = false;
                     if (work == 0) (void) browser_engine_run_idle_work(engine, &changed);
+                    else if (work == 3) CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
                     else (void) browser_engine_run_deferred_image_work(engine, &changed);
                     (void) interruption_checkpoint(&probe, "pump-return", 0);
                 }
@@ -163,32 +187,43 @@ int test_background_interruption_journey(void)
             probe.returned_us = tilefinch_platform_monotonic_time_us();
             (void) interruption_checkpoint(&probe, "owner-return", 0);
             tilefinch_platform_set_services(NULL);
-            if (!probe.received || !probe.handled || (!probe.visible && input != 3))
+            if (!probe.received || !probe.handled || (!probe.visible && input < 3))
                 fprintf(stderr, "interruption work=%u input=%u received=%d handled=%d visible=%d checkpoints=%u publication=%d\n",
                     work, input, probe.received, probe.handled, probe.visible, probe.checkpoints, probe.publication);
-            CHECK(probe.received && probe.handled && (probe.visible || input == 3) && nav->page.loaded);
+            CHECK(probe.received && probe.handled && (probe.visible || input >= 3) && nav->page.loaded);
             if (work == 0) CHECK(font_set_loaded_bytes(browser_engine_fonts(engine)) == fonts_before
                 && nav->incremental_relayouts == relayouts && nav->layout_build_cancelled);
             if (input == 0) {
-                CHECK(probe.ui.screen == PSP_UI_SCREEN_MENU);
+                CHECK(probe.ui.screen == PSP_UI_SCREEN_MENU && probe.queued_page_inputs == 0);
                 PspUiInput down = { .pressed = PSP_UI_BUTTON_DOWN, .analog_x = 128, .analog_y = 128 };
                 CHECK(psp_ui_update_priority(&probe.ui, &down) && probe.ui.menu_selection == 1);
             }
+            if (input == 1 || input == 2) CHECK(probe.queued_page_inputs == 1);
             if (input == 3) {
                 CHECK(browser_engine_scroll_by(engine, 100));
             }
+            if (input == 4) CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN));
             CHECK(browser_engine_render_frame(engine, NULL));
             if (input == 3) {
                 CHECK(memcmp(base, browser_engine_framebuffer(engine, NULL), sizeof(base)) != 0);
                 probe.visible_us = tilefinch_platform_monotonic_time_us();
             }
+            if (input == 4) {
+                memcpy(shown, browser_engine_framebuffer(engine, NULL), sizeof(shown));
+                interruption_sync_focus(engine, &probe.ui);
+                psp_ui_composite(&probe.ui, shown, 480, 272, 480);
+                CHECK(memcmp(before, shown, sizeof(shown)) != 0);
+                probe.visible_us = tilefinch_platform_monotonic_time_us();
+            }
             printf("background-interruption work=%s input=%u acknowledgement-us=%llu "
                 "visible-us=%llu owner-return-us=%llu max-gap-us=%llu phase=%s\n",
-                work == 0 ? "font" : work == 1 ? "section" : "image", input,
+                work == 0 ? "font" : work == 1 ? "section" : work == 2 ? "image" : "script", input,
                 (unsigned long long)(probe.acknowledged_us - probe.requested_us),
                 (unsigned long long)(probe.visible_us - probe.requested_us),
                 (unsigned long long)(probe.returned_us - probe.requested_us),
                 (unsigned long long)probe.max_gap_us, probe.gap_phase);
+            /* Deterministic admission/visible-pixel checks above are the gate.
+               These CPU/host latency samples are not PSP timing promises. */
             if (work == 0) {
                 bool published = false;
                 uint64_t retry_now = tilefinch_platform_monotonic_time_us() + UINT64_C(500000);

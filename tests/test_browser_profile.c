@@ -248,12 +248,14 @@ int main(void)
           && BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED == 6
           && BROWSER_GLYPH_LANGUAGE_ARABIC == 7
           && BROWSER_GLYPH_LANGUAGE_HEBREW == 8
-          && BROWSER_GLYPH_LANGUAGE_COUNT == 9);
+          && BROWSER_GLYPH_LANGUAGE_DEVANAGARI == 9
+          && BROWSER_GLYPH_LANGUAGE_COUNT == 10);
     CHECK(glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_CYRILLIC)
           && glyph_language_roundtrips(
                  BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED)
           && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_ARABIC)
-          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_HEBREW));
+          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_HEBREW)
+          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_DEVANAGARI));
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     BrowserProfile *profile = browser_profile_create(&budget);
@@ -272,6 +274,8 @@ int main(void)
           && !browser_profile_persist_local_storage(profile)
           && browser_profile_tls_session_persistence(profile)
           && !browser_profile_save_diagnostic_reports(profile)
+          && !browser_profile_wifi_diagnostics(profile)
+          && browser_profile_youtube_topics(profile)
           && browser_profile_javascript_enabled(profile)
           && browser_profile_site_javascript_enabled(
                  profile, "https://problem.example/page")
@@ -363,6 +367,8 @@ int main(void)
     browser_profile_set_persist_local_storage(profile, true);
     browser_profile_set_tls_session_persistence(profile, false);
     browser_profile_set_save_diagnostic_reports(profile, true);
+    browser_profile_set_wifi_diagnostics(profile, true);
+    browser_profile_set_youtube_topics(profile, false);
     CHECK(browser_profile_set_site_javascript_enabled(
               profile, "https://problem.example/page", false)
           && !browser_profile_site_javascript_enabled(
@@ -640,6 +646,8 @@ int main(void)
           && browser_profile_persist_local_storage(loaded)
           && !browser_profile_tls_session_persistence(loaded)
           && browser_profile_save_diagnostic_reports(loaded)
+          && browser_profile_wifi_diagnostics(loaded)
+          && !browser_profile_youtube_topics(loaded)
           && !browser_profile_javascript_enabled(loaded)
           && !browser_profile_site_javascript_enabled(
                  loaded, "https://problem.example/reloaded")

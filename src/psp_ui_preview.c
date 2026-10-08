@@ -3,6 +3,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/ui_language.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -100,6 +101,23 @@ int main(int argc, char **argv)
     FontSet fonts;
     budget_init(&font_budget, 2u * 1024u * 1024u);
     memset(&fonts, 0, sizeof(fonts));
+    TilefinchUiTranslation *translation = NULL;
+    if (strcmp(mode, "glyph-options-es") == 0 || strcmp(mode, "glyph-options-fr") == 0
+        || strcmp(mode, "glyph-options-de") == 0) {
+        unsigned language = strcmp(mode, "glyph-options-es") == 0 ? 1u
+            : strcmp(mode, "glyph-options-fr") == 0 ? 2u : 3u;
+        char source[1024];
+        snprintf(source, sizeof(source), "%s/%s", TILEFINCH_UI_RESOURCE_ROOT,
+                 tilefinch_ui_language_spec(language)->resource_key);
+        FILE *file = fopen(source, "rb");
+        unsigned char bytes[TILEFINCH_UI_TRANSLATION_BYTES + 1];
+        size_t length = file ? fread(bytes, 1, sizeof(bytes), file) : 0;
+        bool okay = file && !ferror(file);
+        if (file && fclose(file) != 0) okay = false;
+        if (okay) translation = tilefinch_ui_translation_create(&font_budget, language, bytes, length);
+        if (!translation) { free(frame); return 1; }
+        tilefinch_ui_translation_bind(translation);
+    }
     bool fonts_ready = font_set_load(
         &fonts, &font_budget,
         "fonts/DejaVuSans-Latin.ttf", "fonts/DejaVuSerif-Latin.ttf",
@@ -523,13 +541,20 @@ int main(int argc, char **argv)
             + (custom == SIZE_MAX ? 0u : custom));
         ui.toast_frames = 0;
     } else if (strcmp(mode, "glyph-options") == 0
+               || strcmp(mode, "glyph-options-es") == 0
+               || strcmp(mode, "glyph-options-fr") == 0
+               || strcmp(mode, "glyph-options-de") == 0
                || strcmp(mode, "glyph-options-offers") == 0
                || strcmp(mode, "glyph-options-reset") == 0) {
         ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
         ui.glyph_language = BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED;
+        if (translation) {
+            ui.ui_language = tilefinch_ui_translation_bound_language();
+            ui.glyph_options_selection = 6u;
+        }
         ui.glyph_options_selection =
             strcmp(mode, "glyph-options-offers") == 0 ? 4u
-            : strcmp(mode, "glyph-options-reset") == 0 ? 5u : 0u;
+            : strcmp(mode, "glyph-options-reset") == 0 ? 5u : translation ? 6u : 0u;
         ui.glyph_installed_mask =
             (uint16_t) (1u << TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
         ui.toast_frames = 0;
@@ -772,6 +797,8 @@ int main(int argc, char **argv)
     printf("psp-ui-preview: output=%s state-bytes=%zu\n",
            output, psp_ui_state_bytes());
     psp_ui_theme_catalog_bind(NULL);
+    tilefinch_ui_translation_bind(NULL);
+    tilefinch_ui_translation_destroy(translation);
     psp_ui_theme_catalog_destroy(theme_catalog);
     psp_ui_clear_chrome_font();
     tilefinch_diagnostic_qr_destroy(diagnostic_report);

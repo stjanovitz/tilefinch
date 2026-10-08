@@ -42,7 +42,7 @@ and device wall time divided by a host opcode count is not cycles per opcode.
 
 Profile-guided optimization, validated lazy compilation, cached module
 bytecode, and narrower style invalidation have produced useful improvements
-without a native execution tier. See the [performance summary](PERFORMANCE_LEDGER.md).
+without a native execution tier.
 
 One matched device profile comparison reduced Send to the DOM-answer
 predicate from 43.472 to 40.469 seconds median (6.9%). Eager cached bytecode

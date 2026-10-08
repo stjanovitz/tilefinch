@@ -23,6 +23,7 @@ typedef struct {
     char package_path[TILEFINCH_INSTALL_PATH_LIMIT];
     TilefinchGlyphPack operation_pack;
     uint16_t installed_mask;
+    uint64_t installed_sequences[TILEFINCH_GLYPH_PACK_COUNT];
     uint16_t attached_mask;
     uint16_t lazy_attempted_mask;
     uint16_t lazy_processed_script_mask;
@@ -86,6 +87,9 @@ void psp_glyph_component_session_probe(
     PspGlyphComponentSession *session, const TilefinchInstallPaths *paths);
 bool psp_glyph_component_session_installed(
     const PspGlyphComponentSession *session, TilefinchGlyphPack pack);
+bool psp_glyph_component_session_installed_at_least(
+    const PspGlyphComponentSession *session, TilefinchGlyphPack pack,
+    uint64_t minimum_sequence);
 bool psp_glyph_component_session_metadata_url(
     TilefinchGlyphPack pack, char *output, size_t capacity);
 bool psp_glyph_component_session_select_operation(

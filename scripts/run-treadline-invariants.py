@@ -12,8 +12,8 @@ their recording and compare digests. See tests/fixtures/treadline-invariants.js.
 Every step also composes the camera as a device frame does and tracks it for
 oscillation, re-retraction (pumping), sudden jumps, sustained jerk and
 unsettled shake (tests/fixtures/treadline-camera-motion.js). A flagged case
-fails the sweep like any other violation (since the pumping and follow-turn
-fixes landed with claude/combat-and-breach).
+fails the sweep like any other violation, including pumping and follow-turn
+regressions.
 
 Runs in the foreground, single-threaded, for about a minute; exits 1 when any
 invariant is violated.

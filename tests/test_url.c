@@ -128,6 +128,8 @@ int main(void)
           && is_public_suffix);
     CHECK(tilefinch_public_suffix_classify("github.io", &is_public_suffix)
           && is_public_suffix);
+    CHECK(tilefinch_public_suffix_classify("newtenant.replit.dev", &is_public_suffix)
+          && is_public_suffix);
     CHECK(tilefinch_public_suffix_classify("example.com", &is_public_suffix)
           && !is_public_suffix);
     CHECK(tilefinch_public_suffix_classify("foo.ck", &is_public_suffix)

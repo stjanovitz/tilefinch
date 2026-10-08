@@ -1959,7 +1959,7 @@ static __maybe_unused void js_malloc_iter(JSMallocContext *s, JSMallocIterFunc *
 
 /* end JS malloc */
 
-static void js_trigger_gc(JSRuntime *rt, size_t size)
+static void js_trigger_gc_cause(JSRuntime *rt, size_t size, uint8_t cause)
 {
     BOOL force_gc;
 #ifdef FORCE_GC_AT_MALLOC
@@ -1973,7 +1973,7 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
         printf("GC: size=%" PRIu64 "\n",
                (uint64_t)rt->malloc_ctx.malloc_state.malloc_size);
 #endif
-        rt->gc_cause = JS_GC_CAUSE_THRESHOLD;
+        rt->gc_cause = cause;
         JS_RunGC(rt);
         /* The embedding's next safe point may be after a long author task.
            Do not let automatic collection re-arm beyond its hard heap limit:
@@ -1999,6 +1999,11 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
                                            limit, threshold);
         rt->malloc_gc_threshold = threshold;
     }
+}
+
+static void js_trigger_gc(JSRuntime *rt, size_t size)
+{
+    js_trigger_gc_cause(rt, size, JS_GC_CAUSE_THRESHOLD);
 }
 
 #ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
@@ -7139,6 +7144,11 @@ static void js_bound_function_finalizer(JSRuntime *rt, JSValue val)
     JSBoundFunction *bf = p->u.bound_function;
     int i;
 
+    /* The object is registered before the separately allocated payload.
+       Both failed allocation teardown and a collection during allocation
+       can observe that partially constructed object. */
+    if (!bf)
+        return;
     JS_FreeValueRT(rt, bf->func_obj);
     JS_FreeValueRT(rt, bf->this_val);
     for(i = 0; i < bf->argc; i++) {
@@ -7154,6 +7164,8 @@ static void js_bound_function_mark(JSRuntime *rt, JSValueConst val,
     JSBoundFunction *bf = p->u.bound_function;
     int i;
 
+    if (!bf)
+        return;
     JS_MarkValue(rt, bf->func_obj, mark_func);
     JS_MarkValue(rt, bf->this_val, mark_func);
     for(i = 0; i < bf->argc; i++)
@@ -11007,7 +11019,17 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
                capacity turns near-limit growth into an avoidable full-heap
                pause. The array and pushed value remain rooted by the active
                interpreter frame. */
-            JS_RunGC(ctx->rt);
+            /* Realloc-only growth must honor the same pacing as object
+               allocation. A starved growable realm can then reach its
+               allocator's on-demand growth instead of marking an unchanged
+               graph again. With no embedding hook retain the original
+               exhaustion collection for upstream embedders. */
+            if (ctx->rt->gc_pacing_hook)
+                js_trigger_gc_cause(ctx->rt,
+                    (size_t)(minimum_bytes - current_bytes),
+                    JS_GC_CAUSE_ARRAY_GROWTH);
+            else
+                JS_RunGC(ctx->rt);
             headroom = ctx->rt->malloc_ctx.malloc_state.malloc_size
                     <= ctx->rt->malloc_ctx.malloc_state.malloc_limit
                 ? ctx->rt->malloc_ctx.malloc_state.malloc_limit

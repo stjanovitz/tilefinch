@@ -207,8 +207,190 @@ static int test_watch_metadata_reuse(void)
     return 0;
 }
 
+static int test_cooperative_lockup_cards(void)
+{
+    static const char url[] = "https://www.youtube.com/results?search_query=fixture";
+    static const char source[] =
+        "<script>var ytInitialData='{\"contents\":[{\"lockupViewModel\":{"
+        "\"contentId\":\"LOCKUP00001\",\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "\"metadata\":{\"lockupMetadataViewModel\":{"
+        "\"title\":{\"content\":\"Cooperative card\"}}}}}]}';</script>";
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 512u * 1024u));
+    char fixture[128], error[256] = {0};
+    CHECK(write_document_replay(fixture,
+        "https://m.youtube.com/results?search_query=fixture", source,
+        sizeof(source) - 1u, 200, "")
+        && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+    YoutubeLiteDocument actual = {0}, expected = {0};
+    CHECK(youtube_lite_build_document(&budget, url, source, sizeof(source) - 1u,
+        &expected, error, sizeof(error)));
+    YoutubeLiteLoadJob *job = youtube_lite_load_begin(&budget, &session, url,
+        1u * MIB, 1000, error, sizeof(error));
+    CHECK(job != NULL);
+    YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+    for (unsigned pumps = 0; pumps < 256u && status == YOUTUBE_LITE_LOAD_PENDING;
+         pumps++) status = youtube_lite_load_pump(job, NULL);
+    if (status != YOUTUBE_LITE_LOAD_SUCCEEDED)
+        fprintf(stderr, "cooperative lockup status=%d error=%s\n", status,
+                youtube_lite_load_error(job));
+    CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
+        && youtube_lite_load_take_document(job, &actual)
+        && actual.result_count == 1u && expected.result_count == 1u
+        && actual.html_length == expected.html_length
+        && memcmp(actual.html, expected.html, actual.html_length) == 0);
+    youtube_lite_document_destroy(&actual);
+    youtube_lite_document_destroy(&expected);
+    youtube_lite_load_destroy(job);
+    fetch_trace_end();
+    remove_large_youtube_replay(fixture);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0 && budget.external_reserved == 0);
+    return 0;
+}
+
+static lxb_dom_node_t *test_journey_link(BrowserEngine *engine, const char *needle,
+                                        bool native_media)
+{
+    LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
+    for (size_t i = 0; i < layout->link_count; i++) {
+        LinkRegion *link = &layout->links[i];
+        if (link->node == NULL || link->url == NULL || strstr(link->url, needle) == NULL)
+            continue;
+        bool marked = lxb_dom_element_has_attribute(lxb_dom_interface_element(link->node),
+            (const lxb_char_t *) "data-tilefinch-provider-media", 29);
+        if (marked == native_media) return link->node;
+    }
+    return NULL;
+}
+
+static int test_journey_complete(BrowserEngine *engine)
+{
+    BrowserNavigationJobStatus status = browser_engine_navigation_status(engine);
+    for (unsigned i = 0; i < 512 && status == BROWSER_NAVIGATION_JOB_PENDING; i++)
+        status = browser_engine_pump_navigation(engine, NULL);
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED)
+        fprintf(stderr, "video journey: status=%d error=%s\n", status, browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && browser_engine_render_frame(engine, NULL));
+    return 0;
+}
+
+/* The native decoder is covered separately by the offline hardware journey.
+   This host lane joins real provider transactions and native control intents:
+   it never treats a synthetic media clock as proof that decoding succeeded. */
+static int test_search_video_journey(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.resources.enabled = false;
+    config.javascript.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_begin_navigation_url(engine,
+        "https://www.youtube.com/", 1u * MIB, 1000, true)
+        && test_journey_complete(engine) == 0);
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *search = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-search");
+    CHECK(search != NULL && browser_engine_focus_node(engine, search)
+        && browser_engine_insert_text(engine, "journey", 7));
+    ControllerAction action = {0};
+    CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_FORM_SUBMIT);
+    static const char results[] = TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-video-journey";
+    static const char watch[] = TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-site-adapter-youtube";
+    CHECK(fetch_trace_replay_begin_response_keyed(results, error, sizeof(error))
+        && browser_engine_begin_navigation_action(engine, &action, 1u * MIB, 1000)
+        && test_journey_complete(engine) == 0);
+    search = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-search");
+    CHECK(search != NULL && browser_engine_focus_node(engine, search)
+        && browser_engine_insert_text(engine, " draft", 6));
+    lxb_dom_node_t *details = test_journey_link(engine, "watch?v=TFTEST00001", false);
+    CHECK(details != NULL && browser_engine_focus_node(engine, details)
+        && browser_engine_scroll_by(engine, 80) && browser_engine_scroll_by(engine, -80)
+        && browser_engine_render_frame(engine, NULL));
+    int result_scroll = navigation_current(nav)->scroll_y;
+    CHECK(result_scroll > 0);
+    ControllerAction selected = {0};
+    CHECK(browser_engine_activate(engine, &selected) && !selected.prefer_native_media
+        && strstr(selected.url, "TFTEST00001") != NULL);
+    fetch_trace_end();
+    CHECK(fetch_trace_replay_begin_response_keyed(watch, error, sizeof(error)));
+    /* A real provider transport failure exposes a cause and leaves the
+       selected result available for both cancel and an ordinary retry. */
+    fetch_inject_failure_once(FETCH_INJECT_TIMEOUT);
+    CHECK(browser_engine_begin_navigation_action(engine, &selected, 1u * MIB, 1000));
+    BrowserNavigationJobStatus failed = BROWSER_NAVIGATION_JOB_PENDING;
+    for (unsigned i = 0; i < 512 && failed == BROWSER_NAVIGATION_JOB_PENDING; i++)
+        failed = browser_engine_pump_navigation(engine, NULL);
+    CHECK(failed == BROWSER_NAVIGATION_JOB_FAILED && browser_engine_last_error(engine)[0] != '\0'
+        && nav->page.loaded && navigation_current(nav)->scroll_y == result_scroll
+        && browser_engine_activate(engine, &action) && strcmp(action.url, selected.url) == 0);
+    CHECK(browser_engine_begin_navigation_action(engine, &selected, 1u * MIB, 1000));
+    browser_engine_cancel_navigation(engine, "user cancelled video details");
+    CHECK(browser_engine_navigation_status(engine) == BROWSER_NAVIGATION_JOB_CANCELLED
+        && nav->page.loaded && navigation_current(nav)->scroll_y == result_scroll
+        && browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_begin_navigation_action(engine, &selected, 1u * MIB, 1000)
+        && test_journey_complete(engine) == 0);
+    lxb_dom_node_t *comments = test_journey_link(engine, "tilefinch_view=comments", false);
+    CHECK(comments != NULL && browser_engine_focus_node(engine, comments)
+        && browser_engine_activate(engine, &action)
+        && browser_engine_begin_navigation_action(engine, &action, 1u * MIB, 1000)
+        && test_journey_complete(engine) == 0 && test_navigation_fragment_visible(engine, "comments"));
+    CHECK(strstr(document_body_text(&nav->page.document), "Cooperative comment") != NULL);
+    lxb_dom_node_t *play = test_journey_link(engine, "watch?v=TFTEST00001", true);
+    CHECK(play != NULL && browser_engine_focus_node(engine, play)
+        && browser_engine_activate(engine, &action) && action.prefer_native_media
+        && strcmp(action.url, "https://www.youtube.com/watch?v=TFTEST00001") == 0);
+    int player_scroll = navigation_current(nav)->scroll_y;
+    uint64_t generation = nav->generation;
+    CHECK(browser_engine_set_page_visibility(engine, false));
+    browser_engine_suspend_page_presentations(engine);
+    PspUiMediaState media = {0};
+    psp_ui_media_set_resolving(&media, "Fixture video");
+    PspUiInput buttons = { .pressed = PSP_UI_BUTTON_CANCEL, .analog_x = 128, .analog_y = 128 };
+    CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_CLOSE);
+    psp_ui_media_set_error_reason(&media, "VIDEO LOAD FAILED", "The connection timed out. Retry or close.");
+    CHECK(media.failed && media.status[0] != '\0');
+    buttons.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_RETRY);
+    psp_ui_media_set(&media, true, true, false, 1000000, 20000000, "Fixture video");
+    psp_ui_media_set_seek_preview(&media, 8000000);
+    CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_SEEK);
+    psp_ui_media_commit_seek(&media, 8000000);
+    CHECK(media.seek_in_progress && media.current_time_us == 8000000);
+    buttons.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_CLOSE);
+    CHECK(browser_engine_set_page_visibility(engine, true) && browser_engine_render_frame(engine, NULL)
+        && nav->generation == generation && navigation_current(nav)->scroll_y == player_scroll
+        && browser_engine_activate(engine, &action) && action.prefer_native_media
+        && strcmp(action.url, "https://www.youtube.com/watch?v=TFTEST00001") == 0);
+    CHECK(browser_engine_begin_navigation_history(engine, false, 1u * MIB, 1000)
+        && test_journey_complete(engine) == 0);
+    fetch_trace_end();
+    CHECK(fetch_trace_replay_begin_response_keyed(results, error, sizeof(error))
+        && browser_engine_begin_navigation_history(engine, false, 1u * MIB, 1000)
+        && test_journey_complete(engine) == 0 && navigation_current(nav)->scroll_y == result_scroll
+        && browser_engine_activate(engine, &action) && strcmp(action.url, selected.url) == 0);
+    search = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-search");
+    size_t length = 0;
+    const char *value = document_control_value(search, &length);
+    CHECK(value != NULL && length == 13 && memcmp(value, "journey draft", 13) == 0);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_cooperative_site_adapter_navigation(void)
 {
+    CHECK(test_cooperative_lockup_cards() == 0);
     CHECK(test_watch_metadata_reuse() == 0);
     /* A large watch response may put a useful description header before a
        long recommendation tail. Description does not display that tail. */
@@ -290,9 +472,9 @@ static int test_cooperative_site_adapter_navigation(void)
         remove_large_youtube_replay(fixture);
         CHECK(budget.current == 0);
     }
-    /* Identity facts at the front of a large response must not make Home
-       scan irrelevant trailing content. Missing facts still use the bounded
-       complete scan. This isolates identity work from result JSON parsing. */
+    /* Home must remain usable without fetching or inspecting a response,
+       including when a replay contains a large identity-bearing response.
+       Optional discovery is a separate idle job, not part of navigation. */
     for (unsigned has_identity = 0; has_identity < 2; has_identity++) {
         Budget identity_budget;
         budget_init(&identity_budget, 8u * MIB);
@@ -317,13 +499,11 @@ static int test_cooperative_site_adapter_navigation(void)
             && youtube_lite_load_metrics(job, &identity_metrics)
             && youtube_lite_load_take_document(job, &home)
             && strstr(home.html, "yt-search") != NULL);
-        CHECK(has_identity ? identity_metrics.build_slices < 20u
-                           : identity_metrics.build_slices >= 48u);
+        CHECK(identity_metrics.requests_started == 0u
+            && identity_metrics.build_slices == 0u);
         YoutubeLiteResolverIdentity identity_result = {0};
-        if (has_identity) CHECK(youtube_lite_resolver_identity_get(
-            &identity_session, &identity_result)
-            && strcmp(identity_result.api_key, "fixture-key") == 0
-            && strcmp(identity_result.visitor, "fixture-visitor") == 0);
+        CHECK(!youtube_lite_resolver_identity_get(
+            &identity_session, &identity_result));
         youtube_lite_document_destroy(&home);
         youtube_lite_load_destroy(job);
         fetch_trace_end();
@@ -1834,6 +2014,101 @@ static const DrawCommand *test_reader_text_command(
             && memcmp(command->text, text, length) == 0) return command;
     }
     return NULL;
+}
+
+static int test_reader_switch_reuses_page_stylesheet_responses(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 4u;
+    config.resources.enabled = false;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char html[] =
+        "<!doctype html><title>Retained presentation</title>"
+        "<link rel=stylesheet href='/style.css'><body>"
+        "<script>globalThis.readerTestReady=true;</script>"
+        "<article class=external><h1>Retained presentation</h1>"
+        "<p>EXTERNAL_MARKER introduces a substantial complete story with "
+        "enough semantic prose to remain readable without page scripts.</p>"
+        "<p>A second explanatory paragraph continues the report with "
+        "ordinary prose rather than application chrome or navigation.</p>"
+        "<p>A third paragraph provides useful context and keeps the "
+        "article dominant over the surrounding page interface.</p>"
+        "<p>The fourth paragraph explains the result without relying "
+        "on script hydration or a subsequently downloaded resource.</p>"
+        "<p>The final paragraph preserves a coherent narrative and "
+        "provides enough evidence for the bounded article classifier.</p>"
+        "<p>A closing note supplies practical next steps for the reader "
+        "while keeping every extracted paragraph independently useful.</p>"
+        "</article></body>";
+    CHECK(engine != NULL && browser_engine_commit_html(
+        engine, "https://presentation.test/article", html, sizeof(html) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.runtime != NULL);
+    static const char external_css[] = ".external{color:#123456}";
+    unsigned char *bytes = budget_malloc(
+        browser_engine_budget(engine), sizeof(external_css) - 1u);
+    CHECK(bytes != NULL);
+    memcpy(bytes, external_css, sizeof(external_css) - 1u);
+    BrowserSharedBody *body = browser_shared_body_take(
+        browser_engine_budget(engine), bytes, sizeof(external_css) - 1u);
+    CHECK(body != NULL);
+    navigation->page.stylesheet_resources.budget = browser_engine_budget(engine);
+    CHECK(stylesheet_document_resources_retain(
+        &navigation->page.stylesheet_resources,
+        "https://presentation.test/style.css",
+        "https://presentation.test/cdn/style.css", "no-referrer", body,
+        sizeof(external_css) - 1u, false, TILEFINCH_CREDENTIALS_INCLUDE));
+    browser_shared_body_release(body);
+    navigation->page.stylesheet_resources.items[0].rules_applied = true;
+    navigation_enable_external_resources(navigation, 4u, 4096u, 4096u,
+        4u, 4096u, 4096u, 4096u, 1000);
+    /* The response ledger, not the optional HTTP cache, owns the page's CSS.
+       Strict offline transport must see no requests during either toggle. */
+    browser_session_cache_clear(navigation->browser_session);
+    CHECK(fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-browser-engine-async",
+        error, sizeof(error)));
+    char css[SITE_ADAPTER_READER_CSS_LIMIT], adapter[32];
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(browser_engine_prepare_reader(engine, &analysis));
+    CHECK(site_adapter_reader_css("https://presentation.test/article",
+            SITE_ADAPTER_READER_FONT_SANS, 100u, css, sizeof(css),
+            adapter, sizeof(adapter)));
+    CHECK(browser_engine_apply_user_css(engine, css, strlen(css)));
+    CHECK(navigation->page.external_stylesheets.retained_body_hits == 1u);
+    CHECK(browser_engine_activate_reader_view(engine));
+    CHECK(browser_engine_render_frame(engine, NULL));
+    BrowserSharedBody *retained = navigation->page.stylesheet_resources.items[0].body;
+    size_t owned = browser_engine_budget(engine)->current;
+    browser_engine_test_refuse_next_render_shell_init();
+    CHECK(!browser_engine_apply_user_css(engine, "", 0u)
+        && browser_engine_budget(engine)->current == owned
+        && navigation->page.stylesheet_resources.items[0].body == retained
+        && navigation->page.stylesheet_resources.items[0].rules_applied);
+    CHECK(browser_engine_apply_user_css(engine, "", 0u)
+        && navigation->page.external_stylesheets.retained_body_hits == 2u
+        && navigation->page.stylesheet_resources.items[0].body == retained
+        && strcmp(navigation->page.stylesheet_resources.items[0].response_url,
+                  "https://presentation.test/cdn/style.css") == 0);
+    const DrawCommand *text = test_reader_text_command(
+        &navigation->page.layout, "EXTERNAL_MARKER");
+    FetchTraceReplayStats stats = {0};
+    CHECK(text != NULL && text->color == 0x123456
+        && fetch_trace_replay_stats(&stats) && stats.request_count == 0u
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics final = {0};
+    CHECK(browser_engine_metrics(engine, &final)
+        && final.budget_current == 0u && final.budget_active_allocations == 0u);
+    browser_engine_destroy(engine);
+    return 0;
 }
 
 static int test_reader_presentation_adapter(void)
@@ -4907,6 +5182,102 @@ static int test_youtube_cooperative_build_convergence(void)
     free(supplemental);
     free(primary);
     CHECK(budget.current == 0 && budget.external_reserved == 0);
+    return 0;
+}
+
+static int test_youtube_home_topics_are_lazy(void)
+{
+    static const char fixture[] = TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-youtube-home-topics";
+    char body_path[1024], pure_error[128] = {0};
+    snprintf(body_path, sizeof(body_path), "%s/0000.body", fixture);
+    size_t body_length = 0;
+    char *body = read_test_file(body_path, &body_length);
+    Budget pure_budget;
+    budget_init(&pure_budget, 4u * MIB);
+    YoutubeLiteDocument pure = {0};
+    CHECK(body != NULL && youtube_lite_build_document(&pure_budget,
+        "https://www.youtube.com/?tilefinch_topics=1", body, body_length,
+        &pure, pure_error, sizeof(pure_error)) && pure.result_count == 2);
+    char *incumbent = pure.html;
+    budget_inject_failure_after(&pure_budget, 0);
+    CHECK(!youtube_lite_home_set_search_value(&pure, "query", 5)
+        && pure.html == incumbent);
+    budget_clear_failure_injection(&pure_budget);
+    CHECK(!youtube_lite_home_set_search_value(&pure, "a\0b", 3)
+        && pure.html == incumbent);
+    CHECK(youtube_lite_home_set_search_value(&pure, "<&\"", 3)
+        && strstr(pure.html, "value=\"&lt;&amp;&quot;\"") != NULL);
+    youtube_lite_document_destroy(&pure);
+    free(body);
+    CHECK(pure_budget.current == 0);
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 8;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    for (unsigned lane = 0; lane < 3; lane++) {
+        bool enabled = lane != 0;
+        bool refuse = lane == 2;
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_set_youtube_topics(engine, enabled != 0)
+            && browser_engine_load_url(engine, "https://www.youtube.com/", true)
+            && browser_engine_render_frame(engine, NULL));
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        CHECK(navigation->page.layout.control_count != 0);
+        size_t base_links = navigation->page.layout.link_count;
+        CHECK(document_control_value_set(&navigation->page.document,
+            navigation->page.layout.controls[0].node, "still <&\"ing", 12));
+        CHECK(controller_restore_focus_node(browser_engine_controller(engine),
+            navigation->page.layout.controls[0].node));
+        if (refuse) browser_engine_test_refuse_next_render_shell_init();
+        size_t history = navigation->history_count;
+        uint64_t generation = navigation->generation;
+        bool changed = false;
+        if (enabled) {
+            bool visual = false;
+            (void) browser_engine_run_idle_work(engine, &visual);
+            /* Reapplying a preference must not replace/leak a live job. */
+            CHECK(browser_engine_set_youtube_topics(engine, true));
+        }
+        for (unsigned turn = 0; turn < 256; turn++) {
+            bool visual = false;
+            (void) browser_engine_run_idle_work(engine, &visual);
+            changed |= visual;
+            if (navigation->page.layout.link_count > base_links) break;
+        }
+        size_t value_length;
+        const char *value = document_control_value(
+            navigation->page.layout.controls[0].node, &value_length);
+        if (value == NULL) value = document_attribute(
+            navigation->page.layout.controls[0].node, "value", &value_length);
+        CHECK(value != NULL && value_length == 12
+            && memcmp(value, "still <&\"ing", 12) == 0
+            && navigation->history_count == history
+            && navigation->generation == generation
+            && controller_focused_node(browser_engine_controller(engine))
+               == navigation->page.layout.controls[0].node);
+        if (enabled && !refuse) {
+            CHECK(changed && navigation->page.layout.link_count == base_links + 2);
+            CHECK(strstr(navigation->page.layout.links[base_links].url, "UCfixturemusic") != NULL);
+            bool painted_value = false;
+            for (size_t at = 0; at < navigation->page.layout.count; at++) {
+                const DrawCommand *command = &navigation->page.layout.commands[at];
+                if (command->type == DRAW_TEXT && command->text != NULL
+                    && command->text_length == 12
+                    && memcmp(command->text, "still <&\"ing", 12) == 0)
+                    painted_value = true;
+            }
+            CHECK(painted_value);
+        } else CHECK(navigation->page.layout.link_count == base_links);
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+        fetch_trace_end();
+    }
     return 0;
 }
 
