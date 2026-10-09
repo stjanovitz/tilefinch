@@ -943,6 +943,22 @@ static void navigation_stream_finish_preload(
     if (success && !preload->script && result->status_code != 304) {
         bool header_present = false;
         char response_policy[STYLESHEET_REFERRER_POLICY_LIMIT] = {0};
+        TilefinchRequestContext style_request = {
+            .target_url = preload->url,
+            .initiator_url = stream->document_url,
+            .top_level_url = stream->document_url,
+            .method = "GET",
+            .mode = preload->cors ? TILEFINCH_REQUEST_MODE_CORS
+                                  : TILEFINCH_REQUEST_MODE_NO_CORS,
+            .credentials = preload->credentials,
+            .destination = TILEFINCH_DESTINATION_STYLE,
+            .csp_grant = preload->csp_grant
+        };
+        TilefinchResourceGrant style_grant = {0};
+        bool style_grant_valid = fetch_resource_grant_create(
+            result, &style_request, preload->cors,
+            navigation_stylesheet_mime_matches(result->content_type),
+            false, &style_grant, NULL);
         const char *response_url = result->effective_url[0] == '\0'
             ? preload->url : result->effective_url;
         if (!fetch_response_referrer_policy(
@@ -957,7 +973,8 @@ static void navigation_stream_finish_preload(
                        &stream->stylesheet_resources, preload->url,
                        response_url, response_policy, result->shared_body,
                        result->length, preload->cors,
-                       preload->credentials)) {
+                       preload->credentials,
+                       style_grant_valid ? &style_grant : NULL)) {
             success = false;
             failure_stage = 6;
         }

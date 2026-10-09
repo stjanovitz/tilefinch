@@ -53,6 +53,9 @@ typedef struct {
        mode and credentials.  In particular, a no-CORS preload must never
        satisfy a later crossorigin stylesheet request. */
     bool cors_validated;
+    /* Authorization of motion text for the author-realm scheduler, recorded
+       from the response grant independently of the request's CORS mode. */
+    bool motion_source_readable;
     TilefinchCredentialsMode credentials;
     /* A style preload charged this response to the current pass's preload
        lane; the first active link that replays it takes over the charge. */
@@ -101,6 +104,12 @@ typedef struct {
     bool selector_census_complete;
     bool final_resample_required;
     bool final_resample_completed;
+    /* Late inserted class/tag/id tokens can make a sampled large source
+       relevant. Fixed metadata and eight optional transactional retries keep
+       this recovery bounded without reloading CSS on ordinary mutations. */
+    uint32_t sampled_selector_tokens[64];
+    uint8_t dynamic_selector_resamples;
+    bool sampled_large_source;
 } StylesheetDocumentResources;
 
 typedef struct {
@@ -403,6 +412,7 @@ typedef struct {
 #define IMAGE_PRIORITY_KIND_DOCUMENT UINT8_C(0)
 #define IMAGE_PRIORITY_KIND_MASK UINT8_C(1)
 #define IMAGE_PRIORITY_KIND_BACKGROUND UINT8_C(2)
+#define IMAGE_PRIORITY_KIND_LINKED_VIDEO UINT8_C(3)
 
 /* Exact resource identity retained by a transient bounded layout.  CSS
    source pointers are interned in the page stylesheet; document-image
@@ -552,7 +562,8 @@ bool stylesheet_document_resources_retain(
     StylesheetDocumentResources *resources, const char *request_url,
     const char *response_url, const char *response_referrer_policy,
     struct BrowserSharedBody *body, size_t length, bool cors_validated,
-    TilefinchCredentialsMode credentials);
+    TilefinchCredentialsMode credentials,
+    const TilefinchResourceGrant *resource_grant);
 /* Once the top-level response has left the transport, allow a URL which
    exhausted its transient parser-time attempts one last bounded retry. */
 void stylesheet_document_resources_open_final_retry(
@@ -562,6 +573,8 @@ void stylesheet_document_resources_open_final_retry(
    sources are made eligible so that rebuild preserves cascade order. */
 bool stylesheet_document_resources_prepare_complete_census(
     StylesheetDocumentResources *resources);
+bool stylesheet_document_resources_note_dynamic_tokens(
+    StylesheetDocumentResources *resources, lxb_dom_node_t *root);
 /* Whether the sheet a link's href names has had its rules applied (the
    ordered loaders apply one URL once; a later reference is a duplicate). */
 bool stylesheet_document_resources_link_applied(
@@ -804,6 +817,9 @@ const ImageResource *images_find_pseudo_background(
  */
 const char *image_select_source(const Stylesheet *stylesheet,
                                 lxb_dom_node_t *node, size_t *length);
+/* Empty sources and encoded one-pixel sentinels, not arbitrary data images.
+   Simplified views share the loader's placeholder/lazy-source decision. */
+bool image_source_is_placeholder(const char *source, size_t length);
 /* Associate newly-created document image nodes with an already-admitted
    resource from the same committed document. This alias-only operation
    resolves authored sources with the original document provenance, but never

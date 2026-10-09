@@ -22,6 +22,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--image-retarget-only") == 0) {
         RUN_TEST(test_display_retarget_follows_painted_size);
         RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
+        RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
         puts("image retarget tests passed");
         return 0;
     }
@@ -44,6 +45,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_pump_and_cancel);
     RUN_TEST(test_display_retarget_follows_painted_size);
     RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
+    RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
     RUN_TEST(test_progressive_preview_is_bounded_and_transient);
     RUN_TEST(test_failed_candidate_rolls_back_presented_preview);
     RUN_TEST(test_progressive_preview_waits_for_external_visuals);

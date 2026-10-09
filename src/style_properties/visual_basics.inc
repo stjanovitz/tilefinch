@@ -292,6 +292,7 @@ static bool style_property_background(const StylePropertyParse *parse)
             }
             if (color_property) {
                 style->has_background = false;
+                style->background_current_color = false;
                 style->background = 0;
                 style->background_alpha = 0;
                 *mask |= S_BACKGROUND;
@@ -342,6 +343,7 @@ static bool style_property_background(const StylePropertyParse *parse)
             target->background_image_kind = STYLE_BACKGROUND_IMAGE_NONE;
             *target_mask |= S_BACKGROUND_IMAGE;
             target->has_background = false;
+            target->background_current_color = false;
             target->background_alpha = 0;
             *target_mask |= S_BACKGROUND;
             target->background_fit = 0;
@@ -464,14 +466,25 @@ static bool style_property_background(const StylePropertyParse *parse)
         }
         if (color_property) {
             bool transparent = false;
+            bool current_color = false;
             bool parsed = shorthand
                 ? style_parse_background_shorthand_color(
                       sheet, value, value_length, &target->background,
-                      &target->background_alpha, &transparent)
+                      &target->background_alpha, &transparent, &current_color)
                 : style_parse_color_with_alpha(
                       sheet, value, value_length, &target->background,
                       &target->background_alpha);
+            if (!parsed && !shorthand) {
+                char color_keyword[64];
+                current_color = style_resolve_value(
+                    sheet, value, value_length, color_keyword,
+                    sizeof(color_keyword), 0)
+                    && strcasecmp(color_keyword, "currentcolor") == 0;
+                parsed = current_color;
+            }
             if (parsed) {
+                target->background_current_color = current_color;
+                if (current_color) target->background_alpha = 255;
                 target->has_background = shorthand
                                         ? !transparent
                                         : target->background_alpha != 0;
@@ -483,6 +496,7 @@ static bool style_property_background(const StylePropertyParse *parse)
             style->background_image = work.background_image;
             style->background_image_kind = work.background_image_kind;
             style->has_background = work.has_background;
+            style->background_current_color = work.background_current_color;
             style->background = work.background;
             style->background_alpha = work.background_alpha;
             style->background_fit = work.background_fit;

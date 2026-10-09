@@ -1495,6 +1495,38 @@
         CHECK(budget.current == tree_baseline);
     }
 
+    puts("test: mutation delivery survives observer-backed Promise polyfills");
+    {
+        size_t polyfill_baseline = budget.current;
+        static const char polyfill_page[] =
+            "<!doctype html><body><script>"
+            "var signal=document.createTextNode('0'),queued=[];"
+            "var observer=new MutationObserver(function(){"
+            "var jobs=queued.splice(0);jobs.forEach(function(fn){fn()})});"
+            "observer.observe(signal,{characterData:true});"
+            "globalThis.Promise={resolve:function(){return{then:function(fn){"
+            "queued.push(fn);signal.data=signal.data==='0'?'1':'0'}}}};"
+            "Promise.resolve().then(function(){pocSummary='delivered';"
+            "observer.disconnect()});"
+            "</script></body>";
+        PocDocument polyfill_document;
+        CHECK(document_parse(&polyfill_document, &budget, polyfill_page,
+                             strlen(polyfill_page), 17));
+        ScriptResult polyfill_result;
+        ScriptRuntime *polyfill_runtime = script_runtime_create(
+            &polyfill_document, &budget, 4 * MIB, 1000,
+            "https://polyfill.test/", &polyfill_result);
+        CHECK(polyfill_runtime != NULL);
+        for (size_t i = 0; i < 4 && strcmp(polyfill_result.summary,
+                                         "delivered") != 0; i++)
+            CHECK(script_runtime_advance(polyfill_runtime, 16, 64,
+                                         &polyfill_result));
+        CHECK(strcmp(polyfill_result.summary, "delivered") == 0);
+        script_runtime_destroy(polyfill_runtime);
+        document_destroy(&polyfill_document);
+        CHECK(budget.current == polyfill_baseline);
+    }
+
     puts("test: transient mutation registrations end at every delivery");
     /* DOM "notify mutation observers" removes every observer's transient
        registrations, including observers with no records. Kept, they piled
@@ -3371,6 +3403,121 @@
           && strcmp(motion_free_result.summary,
                     "MOTION-NEGATIVE-CACHED") == 0);
     script_runtime_destroy(motion_free_runtime);
+
+    puts("test: external stylesheet motion uses the bounded host scheduler");
+    size_t external_motion_baseline = budget.current;
+    static const char external_motion_page[] =
+        "<!doctype html><body><a id=fade>Account</a></body>";
+    static const char external_motion_css[] =
+        "@keyframes reveal{from{opacity:0}to{opacity:1}}"
+        "#fade{opacity:0;animation:reveal .2s ease-in;"
+        "animation-fill-mode:forwards}"
+        "/* Large sheets contain nonsemantic whitespace; the compact parsed"
+        " representation must retain keyframes too.                         "
+        "                                                                "
+        "                                                                */";
+    PocDocument external_motion_document = {0};
+    Stylesheet external_motion_sheet = {0};
+    CHECK(document_parse(&external_motion_document, &budget,
+              external_motion_page, sizeof(external_motion_page) - 1u, 17)
+          && stylesheet_build(&external_motion_sheet, &budget,
+                               &external_motion_document, 480));
+    unsigned char *external_motion_ir = NULL;
+    size_t external_motion_ir_length = 0;
+    CHECK(stylesheet_add_css_from_context_capture_ir(
+        &external_motion_sheet, external_motion_css,
+        sizeof(external_motion_css) - 1u, "https://motion.test/external.css",
+        NULL, &external_motion_ir, &external_motion_ir_length));
+    for (unsigned lane = 0; lane < 2; lane++) {
+        if (lane == 1) {
+            stylesheet_destroy(&external_motion_sheet);
+            CHECK(stylesheet_build(&external_motion_sheet, &budget,
+                                   &external_motion_document, 480));
+            CHECK(external_motion_ir != NULL
+                  && stylesheet_add_parsed_ir_from_context(
+                      &external_motion_sheet, external_motion_ir,
+                      external_motion_ir_length,
+                      "https://motion.test/external.css", NULL, NULL)
+                      == STYLE_PARSED_IR_APPLIED);
+        }
+        ScriptResult external_motion_result = {0};
+        ScriptRuntime *external_motion_runtime = script_runtime_create_configured(
+            &external_motion_document, &budget, 4u * MIB, 1000,
+            "https://motion.test/", &deterministic_tick_options,
+            &external_motion_result);
+        CHECK(external_motion_runtime != NULL);
+        script_runtime_set_stylesheet(external_motion_runtime,
+                                       &external_motion_sheet);
+        CHECK(script_runtime_evaluate_diagnostic(external_motion_runtime,
+            "document.getElementById('fade').removeAttribute('style');"
+            "__tilefinchMaybeStartMotion();pocSummary='pending'",
+            "<external-motion>", &external_motion_result));
+        for (size_t tick = 0; tick < 20; tick++)
+            CHECK(script_runtime_advance(external_motion_runtime, 16, 16,
+                                          &external_motion_result));
+        CHECK(script_runtime_evaluate_diagnostic(external_motion_runtime,
+            "pocSummary=Number(getComputedStyle(document.getElementById('fade'))"
+            ".opacity)>.99 && typeof __tilefinchMotionSourceBridge==='undefined'"
+            " && typeof __tilefinchStylesheetMotionSource==='undefined'"
+            "?'EXTERNAL-MOTION-OK':'EXTERNAL-MOTION-MISSING'",
+            "<external-motion-result>", &external_motion_result)
+            && strcmp(external_motion_result.summary, "EXTERNAL-MOTION-OK") == 0);
+        script_runtime_destroy(external_motion_runtime);
+    }
+    Stylesheet refused_motion_sheet = {0};
+    CHECK(stylesheet_build(&refused_motion_sheet, &budget,
+                           &external_motion_document, 480));
+    static const char refused_motion_css[] =
+        "@keyframes optional{from{opacity:0}to{opacity:1}}";
+    budget_inject_failure_after(&budget, 0u);
+    bool refused_motion_kept_styling = stylesheet_add_css(
+        &refused_motion_sheet, refused_motion_css,
+        sizeof(refused_motion_css) - 1u);
+    budget_clear_failure_injection(&budget);
+    CHECK(refused_motion_kept_styling
+          && refused_motion_sheet.motion_css == NULL
+          && refused_motion_sheet.motion_css_bounded_out);
+    CHECK(stylesheet_add_css(&refused_motion_sheet,
+        "#fade{color:#123456}", sizeof("#fade{color:#123456}") - 1u));
+    stylesheet_destroy(&refused_motion_sheet);
+    puts("test: bounded native motion source falls back to inline styles");
+    Stylesheet bounded_motion_sheet = {0};
+    CHECK(stylesheet_build(&bounded_motion_sheet, &budget,
+                           &external_motion_document, 480));
+    CHECK(stylesheet_add_css(&bounded_motion_sheet,
+        "@keyframes absent{from{opacity:0}to{opacity:1}}"
+        "#missing{animation:absent .2s}",
+        sizeof("@keyframes absent{from{opacity:0}to{opacity:1}}"
+               "#missing{animation:absent .2s}") - 1u));
+    CHECK(bounded_motion_sheet.motion_css != NULL);
+    bounded_motion_sheet.motion_css_bounded_out = true;
+    ScriptResult bounded_motion_result = {0};
+    ScriptRuntime *bounded_motion_runtime = script_runtime_create_configured(
+        &external_motion_document, &budget, 4u * MIB, 1000,
+        "https://motion.test/", &deterministic_tick_options,
+        &bounded_motion_result);
+    CHECK(bounded_motion_runtime != NULL);
+    script_runtime_set_stylesheet(bounded_motion_runtime,
+                                  &bounded_motion_sheet);
+    CHECK(script_runtime_evaluate_diagnostic(bounded_motion_runtime,
+        "const style=document.createElement('style');"
+        "style.textContent='@keyframes local{from{opacity:0}to{opacity:1}}'"
+        "+'#fade{animation:local .2s}';"
+        "document.head.appendChild(style);"
+        "__tilefinchMaybeStartMotion();pocSummary='pending'",
+        "<bounded-motion>", &bounded_motion_result));
+    CHECK(script_runtime_evaluate_diagnostic(bounded_motion_runtime,
+        "pocSummary=__tilefinchRootCensus.motionRules>0"
+        "&&__tilefinchRootCensus.motionElements>0"
+        "?'BOUNDED-MOTION-OK':'BOUNDED-MOTION-MISSING'",
+        "<bounded-motion-result>", &bounded_motion_result)
+        && strcmp(bounded_motion_result.summary, "BOUNDED-MOTION-OK") == 0);
+    script_runtime_destroy(bounded_motion_runtime);
+    stylesheet_destroy(&bounded_motion_sheet);
+    budget_free(&budget, external_motion_ir);
+    stylesheet_destroy(&external_motion_sheet);
+    document_destroy(&external_motion_document);
+    CHECK(budget.current == external_motion_baseline);
 
     puts("test: motion discovery does not wrap unrelated native nodes");
     size_t motion_wrapper_page_capacity = 40u * 1024u;

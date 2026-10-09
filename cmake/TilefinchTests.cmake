@@ -16,6 +16,26 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_property(GLOBAL APPEND PROPERTY TILEFINCH_TEST_BINARIES ${target})
     endfunction()
     find_package(Threads REQUIRED)
+    tilefinch_add_test_binary(tilefinch-linked-video-preview-tests tests/test_linked_video_preview.c)
+    target_link_libraries(tilefinch-linked-video-preview-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-linked-video-preview-tests COMMAND tilefinch-linked-video-preview-tests)
+    set_tests_properties(tilefinch-linked-video-preview-tests PROPERTIES
+        LABELS "tilefinch;unit;navigation;resources" TIMEOUT 30)
+    tilefinch_add_test_binary(tilefinch-compact-controls-tests tests/test_compact_controls.c)
+    target_link_libraries(tilefinch-compact-controls-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-compact-controls-tests COMMAND tilefinch-compact-controls-tests)
+    set_tests_properties(tilefinch-compact-controls-tests PROPERTIES
+        LABELS "tilefinch;unit;layout;controls" TIMEOUT 20)
+    tilefinch_add_test_binary(tilefinch-media-queries-tests tests/test_media_queries.c)
+    target_link_libraries(tilefinch-media-queries-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-media-queries-tests COMMAND tilefinch-media-queries-tests)
+    set_tests_properties(tilefinch-media-queries-tests PROPERTIES
+        LABELS "tilefinch;unit;script;style" TIMEOUT 20)
+    tilefinch_add_test_binary(tilefinch-dom-intrinsics-tests tests/test_dom_intrinsics.c)
+    target_link_libraries(tilefinch-dom-intrinsics-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-dom-intrinsics-tests COMMAND tilefinch-dom-intrinsics-tests)
+    set_tests_properties(tilefinch-dom-intrinsics-tests PROPERTIES
+        LABELS "tilefinch;unit;script;dom" TIMEOUT 20)
     tilefinch_add_test_binary(tilefinch-ui-language-tests tests/test_ui_language.c)
     target_link_libraries(tilefinch-ui-language-tests PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-ui-language-tests PRIVATE

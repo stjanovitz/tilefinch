@@ -292,7 +292,7 @@ static bool add_transition_rule(Stylesheet *sheet, const char *selector,
                                 unsigned order, bool important,
                                 PseudoElement pseudo)
 {
-    if (selector_length >= STYLE_SELECTOR_CAPACITY
+    if (selector_length >= STYLE_SELECTOR_TEXT_CAPACITY
         || value_length >= STYLE_SELECTOR_CAPACITY) return true;
     if (!transition_value_is_css_wide(value, value_length)
         && !transition_value_has_var(value, value_length)) {

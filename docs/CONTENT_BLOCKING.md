@@ -78,11 +78,23 @@ following conservative markers with `display: none !important`:
 
 ```text
 ins.adsbygoogle
-.advertisement .advertising .ad-banner .ad-container .ad-slot
+.advertisement .advertising .ad-banner .ad-container .ad-slot .ad-wrapper
 .sponsored .promoted .promotedlink
 [data-ad] [data-ad-slot] [data-ad-client]
 [aria-label="advertisement"] [aria-label="sponsored"]
 ```
+
+It also hides class tokens beginning with `ad-slot-` or `ad-banner-`, at any
+position in a whitespace-separated class list. The families deliberately
+include a hyphen boundary; arbitrary `ad-*` names, embedded substrings, and
+`data-ad*` attribute prefixes are not hidden. This uses a fixed set of CSS
+selectors in the normal style pass, without another DOM traversal or script.
+The complete prefix unions compile to bounded native scans. The first two
+bytes reject unrelated tokens before a full prefix comparison. Byte loads
+keep unaligned class spans safe on PSP, with no per-element allocation,
+extra DOM walk, or added cache.
+The matched container is removed from flow, including its own reserved
+height and margins; unmatched ancestors' spacing is left intact.
 
 It is composed in source order with global font scaling and Reader mode, so
 turning on either of those does not discard it. It is on by default, and

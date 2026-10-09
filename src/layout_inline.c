@@ -878,13 +878,14 @@ static int layout_style_text_width(LayoutContext *context,
         style->font_italic, style_uses_bold_face(style));
     FontFamily metric_family = font_context_metric_family(
         context->web_fonts, style->font_family, face);
-    return measured_text_width(
+    return measured_flow_text_width(
         face, metric_family, text, length,
         computed_style_font_size_fixed(style),
         style_uses_synthetic_weight(
             context->fonts, context->web_fonts, style, face),
         style_uses_bold_face(style), style->font_scale,
-        style->letter_spacing);
+        style->letter_spacing, style->text_transform,
+        !computed_style_kerning_none(style));
 }
 
 int generated_inline_pseudo_width(LayoutContext *context,
@@ -899,9 +900,32 @@ int generated_inline_pseudo_width(LayoutContext *context,
     resolve_generated_expression(
         context, node, &style,
         generated_text, sizeof(generated_text));
+    bool horizontal_flex = (parent->display == DISPLAY_FLEX
+                             || parent->display == DISPLAY_INLINE_FLEX)
+        && (parent->flex_direction == FLEX_ROW
+            || parent->flex_direction == FLEX_ROW_REVERSE);
+    if (style.generated_content && !style.hidden && !style.out_of_flow
+        && !style.fixed_position && style.display == DISPLAY_INLINE_BLOCK
+        && !horizontal_flex) {
+        /* Percentages do not resolve against the viewport during intrinsic
+           sizing; their containing inline size is not known yet. */
+        int reference = 0;
+        resolve_padding(context->sheet, &style, reference);
+        resolve_margin(context->sheet, &style, reference);
+        int width = style.has_width
+            ? resolve_declared_length(context->sheet, style.width,
+                                      style.width_percent, reference)
+            : layout_style_text_width(context, &style, style.generated_text,
+                                       style.generated_text_length);
+        if (!style.box_sizing_border_box || !style.has_width)
+            width = layout_add_coordinate(width, style.padding.left
+                + style.padding.right + style.border.left + style.border.right);
+        return layout_add_coordinate(width, style.margin.left
+                                              + style.margin.right);
+    }
     if (!style.generated_content || style.display == DISPLAY_NONE
         || style.hidden || style.out_of_flow || style.fixed_position
-        || style.has_width
+        || (style.has_width && style.display != DISPLAY_INLINE)
         || (style.mask_image != NULL && style.mask_image[0] != '\0')
         || (style.background_image != NULL
             && style.background_image[0] != '\0')
@@ -938,6 +962,11 @@ int generated_inline_pseudo_width(LayoutContext *context,
    originating box (hlist separators, quote marks). Relatively positioned
    text keeps its flow advance but shifts only the generated fragment;
    out-of-flow and box-bearing pseudos keep the rectangle painter. */
+static bool flow_generated_atomic_pseudo(
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent,
+    PseudoElement pseudo, const ComputedStyle *style, LineState *line,
+    bool *flowed);
+
 bool flow_generated_inline_pseudo(LayoutContext *context,
                                   lxb_dom_node_t *node,
                                   const ComputedStyle *parent,
@@ -971,13 +1000,19 @@ bool flow_generated_inline_pseudo(LayoutContext *context,
                             0, line_height, SIZE_MAX, 0,
                             &line->positioned_box);
     }
-    bool own_box = style.has_width
+    /* Width does not apply to a non-replaced inline, including generated
+       text. Its glyphs must still advance the surrounding line cursor. */
+    bool own_box = (style.has_width && style.display != DISPLAY_INLINE)
         || (style.mask_image != NULL && style.mask_image[0] != '\0')
         || (style.background_image != NULL
             && style.background_image[0] != '\0')
         || style.has_background
         || style.border.left > 0 || style.border.right > 0
         || style.border.top > 0 || style.border.bottom > 0;
+    if (!out_of_flow && style.display == DISPLAY_INLINE_BLOCK) {
+        return flow_generated_atomic_pseudo(
+            context, node, parent, pseudo, &style, line, flowed);
+    }
     if (out_of_flow || own_box || generated_pseudo_is_flow_block(&style)
         || style.generated_text == NULL
         || style.generated_text_length == 0) {
@@ -1041,7 +1076,8 @@ bool flow_generated_inline_pseudo(LayoutContext *context,
     }
     line->pending_space = false;
     if (flowed != NULL) *flowed = true;
-    return true;
+    return apply_pseudo_visual_range(context, node, command_start,
+                                    context->layout->count, &style);
 }
 
 bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
@@ -1101,6 +1137,7 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
         context->fonts, context->web_fonts, &style, face);
     int text_width = 0;
     int text_height = 0;
+    int text_line_height = 0;
     if (style.generated_text != NULL && style.generated_text_length != 0) {
         int text_width_fixed = font_text_width_for_family_at_size_fixed(
             face, metric_family, style.generated_text,
@@ -1127,6 +1164,8 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
         text_height = font_line_height_at_size(
             face, computed_style_font_size_fixed(&style));
         if (text_height < 0) text_height = 7 * style.font_scale;
+        text_line_height = layout_fixed_ceil(
+            layout_inline_style_line_height_fixed(context, &style));
     }
     bool flow_block = generated_pseudo_is_flow_block(&style);
     /* CSS 2.1 10.1: an absolutely positioned pseudo is placed in its
@@ -1176,6 +1215,12 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
                           : (text_width > 0
                           ? text_width + style.padding.left
                             + style.padding.right : width));
+    if (style.display == DISPLAY_INLINE_BLOCK && !style.out_of_flow
+        && forced_border_height > 0) {
+        /* The inline formatter already resolved the entire border box. Do
+           not resolve percentages a second time against that box itself. */
+        pseudo_width = width;
+    }
     if (!style.has_width && style.has_left && style.has_right) {
         pseudo_width = box_width - inset_left - inset_right
                        - margin_left - margin_right;
@@ -1185,8 +1230,8 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
     }
     int pseudo_content_height = style_content_height(
         context->sheet, &style, box_width, box_height);
-    if (pseudo_content_height <= 0 && text_height > 0) {
-        pseudo_content_height = text_height;
+    if (!style.has_height && text_height > 0) {
+        pseudo_content_height = text_line_height;
     }
     int64_t used_height = (int64_t) pseudo_content_height
                           + style.padding.top + style.padding.bottom
@@ -1214,7 +1259,7 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
                       ? box_y + box_height - inset_bottom - margin_bottom
                         - pseudo_height
                       : (pseudo == PSEUDO_AFTER ? y + height - pseudo_height
-                                                : y));
+                                                : y) + margin_top);
     size_t command_count_before = context->layout->count;
     size_t pseudo_command_start = insertion_index <= command_count_before
                                   ? insertion_index : command_count_before;
@@ -1316,10 +1361,18 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
         }
     }
     if (style.generated_text != NULL && style.generated_text_length != 0) {
+        int text_space = pseudo_width - style.padding.left
+                         - style.padding.right - style.border.left
+                         - style.border.right - text_width;
+        TextAlign alignment = computed_style_used_text_align(&style);
+        int text_offset_x = alignment == TEXT_ALIGN_CENTER ? text_space / 2
+            : (alignment == TEXT_ALIGN_RIGHT ? text_space : 0);
         DrawCommand text = {
             .type = DRAW_TEXT,
-            .x = pseudo_x + style.padding.left,
-            .y = pseudo_y + style.padding.top,
+            .x = pseudo_x + style.padding.left + style.border.left
+                 + text_offset_x,
+            .y = pseudo_y + style.padding.top + style.border.top
+                 + (text_line_height - text_height) / 2,
             .width = text_width,
             .height = text_height,
             .color = style.color,
@@ -1356,13 +1409,21 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
             }
         }
     }
+    size_t inserted = context->layout->count - command_count_before;
     if (style.has_transform) {
-        size_t inserted = context->layout->count - command_count_before;
         int origin_x_twice = 0, origin_y_twice = 0;
         layout_transform_origin_twice(
             context->sheet, &style, pseudo_x, pseudo_y,
             pseudo_width, pseudo_height,
             &origin_x_twice, &origin_y_twice);
+        const StylePaintStack *paint = stylesheet_paint_stack(
+            context->sheet, computed_style_paint_stack_id(&style));
+        if (paint != NULL && paint->skew_x_q10 != 0) {
+            (void) layout_skew_solid_command_span(
+                context->layout, pseudo_command_start,
+                pseudo_command_start + inserted, origin_y_twice,
+                paint->skew_x_q10);
+        }
         int dx = style.transform_x_percent
                  ? pseudo_width * style.transform_x / 100
                  : style.transform_x;
@@ -1375,7 +1436,8 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
             origin_x_twice, origin_y_twice, style.transform_scale_q6,
             style.individual_rotate_quadrants, dx, dy);
     }
-    return true;
+    return apply_pseudo_visual_range(context, node, pseudo_command_start,
+        pseudo_command_start + inserted, &style);
 }
 
 /* Fills the inline background placeholder at `index` for the first line
@@ -1861,7 +1923,8 @@ static void line_record_atomic(LineState *line, lxb_dom_node_t *node,
                                size_t extra_control_start)
 {
     LineAtomicStack *stack = line == NULL ? NULL : line->atomics;
-    if (stack == NULL || node == NULL || style == NULL || parent == NULL
+    if (stack == NULL || style == NULL || parent == NULL
+        || (node == NULL && command_start == SIZE_MAX)
         || height <= 0) return;
     if (stack->count < line->atomic_base) stack->count = line->atomic_base;
     if (stack->count >= LINE_ATOMIC_LIMIT) return;
@@ -2015,12 +2078,6 @@ int layout_inline_strut_baseline(LayoutContext *context,
         face, computed_style_font_size_fixed(style), line_height);
     return baseline > 0 ? baseline : 0;
 }
-
-static int measured_flow_text_width_fixed(
-    const FontFace *face, FontFamily metric_family,
-    const char *text, size_t length, int font_size_fixed,
-    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
-    TextTransformMode transform, bool kerning);
 
 static size_t fitting_text_prefix(const FontFace *face,
                                   FontFamily metric_family,
@@ -2488,11 +2545,79 @@ static void line_note_atomic(LineState *line,
     line->text_generation++;
 }
 
-static int measured_flow_text_width_fixed(
-    const FontFace *face, FontFamily metric_family,
-    const char *text, size_t length, int font_size_fixed,
-    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
-    TextTransformMode transform, bool kerning);
+/* A generated inline-block has no DOM box of its own. Reserve its advance
+   and register only its commands with the same bounded baseline machinery
+   used for replaced elements; moving the originating element would also
+   move the surrounding text. Relative offsets affect paint, not the line. */
+static bool flow_generated_atomic_pseudo(
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent,
+    PseudoElement pseudo, const ComputedStyle *style, LineState *line,
+    bool *flowed)
+{
+    ComputedStyle used = *style;
+    int reference = line->right - line->start_x;
+    resolve_padding(context->sheet, &used, reference);
+    resolve_margin(context->sheet, &used, reference);
+    int width = used.has_width
+        ? resolve_declared_length(context->sheet, used.width,
+                                  used.width_percent, reference)
+        : layout_style_text_width(context, &used, used.generated_text,
+                                   used.generated_text_length);
+    int height = style_content_height(context->sheet, &used, reference, 0);
+    if (!used.has_height && used.generated_text_length != 0)
+        height = layout_fixed_ceil(
+            layout_inline_style_line_height_fixed(context, &used));
+    if (!used.box_sizing_border_box || !used.has_width)
+        width = layout_add_coordinate(width, used.padding.left
+            + used.padding.right + used.border.left + used.border.right);
+    height = layout_add_coordinate(height, used.padding.top
+        + used.padding.bottom + used.border.top + used.border.bottom);
+    if (width <= 0 || height <= 0) return true;
+    int advance = layout_add_coordinate(width,
+                                        used.margin.left + used.margin.right);
+    int spacing = atomic_inline_spacing_fixed(context, parent, line);
+    if (line->x != line->start_x
+        && (int64_t) line_cursor_fixed(line) + spacing
+             + (int64_t) advance * 64 > (int64_t) line->right * 64) {
+        layout_flush_line(line);
+        spacing = 0;
+    }
+    int x = layout_fixed_ceil(
+        layout_fixed_add(line_cursor_fixed(line), spacing));
+    int top = layout_fixed_ceil(line_y_fixed(line));
+    size_t commands = context->layout->count;
+    size_t links = context->layout->link_count;
+    size_t controls = context->layout->control_count;
+    if (!paint_pseudo(context, node, parent, pseudo,
+                      layout_add_coordinate(x, used.margin.left),
+                      layout_add_coordinate(top, used.margin.top),
+                      width, height, SIZE_MAX, height, NULL)) return false;
+    int outer_height = layout_add_coordinate(height,
+        used.margin.top + used.margin.bottom);
+    int baseline = outer_height;
+    if (used.generated_text_length != 0
+        && !used.overflow_x_scroll && !used.overflow_y_scroll
+        && !used.overflow_x_clip_only && !used.overflow_y_clip_only) {
+        for (size_t i = commands; i < context->layout->count; i++) {
+            const DrawCommand *command = &context->layout->commands[i];
+            int text_baseline = line_text_baseline(context->layout, command);
+            if (text_baseline >= 0) {
+                int relative_y = used.has_top ? used.top
+                    : used.has_bottom ? -used.bottom : 0;
+                baseline = command->y - top - relative_y + text_baseline;
+            }
+        }
+    }
+    line_record_atomic(line, NULL, &used, parent, top, outer_height,
+                        baseline, commands, links, controls);
+    line_height_include_fixed(line,
+                               layout_fixed_from_integer(outer_height));
+    line_cursor_set(line, layout_add_coordinate(x, advance));
+    line_note_atomic(line, parent);
+    line->pending_space = false;
+    if (flowed != NULL) *flowed = true;
+    return true;
+}
 
 int layout_single_text_advance_fixed(
     LayoutContext *context, lxb_dom_node_t *node,
@@ -2789,7 +2914,7 @@ int measured_text_width(const FontFace *face,
     return fixed > INT_MAX - 32 ? INT_MAX / 64 : (fixed + 32) / 64;
 }
 
-static int measured_flow_text_width_fixed(
+int measured_flow_text_width_fixed(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
@@ -2816,6 +2941,18 @@ static int measured_flow_text_width_fixed(
     return measured_text_width_fixed_mode(
         face, metric_family, transformed, length, font_size_fixed,
         synthetic_bold, metric_bold, scale, letter_spacing, kerning);
+}
+
+int measured_flow_text_width(
+    const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    TextTransformMode transform, bool kerning)
+{
+    int fixed = measured_flow_text_width_fixed(
+        face, metric_family, text, length, font_size_fixed, synthetic_bold,
+        metric_bold, scale, letter_spacing, transform, kerning);
+    return fixed > INT_MAX - 32 ? INT_MAX / 64 : (fixed + 32) / 64;
 }
 
 static size_t fitting_text_prefix(const FontFace *face,

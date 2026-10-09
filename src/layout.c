@@ -483,9 +483,58 @@ static uint64_t layout_style_parent_hash(const ComputedStyle *style)
     return (uint64_t) high << 32 | low;
 }
 
+static LayoutReuseStylePayload *layout_reuse_payload(
+    const LayoutReuseCache *cache, uint16_t index)
+{
+    return &cache->style_pages[index / LAYOUT_REUSE_STYLE_PAGE_SIZE]
+                             [index % LAYOUT_REUSE_STYLE_PAGE_SIZE];
+}
+
+static void layout_reuse_drop_style(LayoutReuseCache *cache,
+                                     LayoutReuseStyleEntry *entry)
+{
+    if (entry->node != NULL) {
+        layout_reuse_payload(cache, entry->payload)->next_free =
+            cache->style_payload_free;
+        cache->style_payload_free = (uint16_t) (entry->payload + 1u);
+    }
+    memset(entry, 0, sizeof(*entry));
+}
+
+static bool layout_reuse_admit_payload(LayoutReuseCache *cache,
+                                       uint16_t *index)
+{
+    if (cache->style_payload_free != 0) {
+        *index = (uint16_t) (cache->style_payload_free - 1u);
+        cache->style_payload_free =
+            layout_reuse_payload(cache, *index)->next_free;
+        return true;
+    }
+    if (cache->style_payload_count == LAYOUT_REUSE_STYLE_CAPACITY_LIMIT)
+        return false;
+    *index = cache->style_payload_count;
+    size_t page = *index / LAYOUT_REUSE_STYLE_PAGE_SIZE;
+    if (cache->style_pages[page] == NULL) {
+        if (cache->style_payload_refused) return false;
+        cache->style_pages[page] = budget_malloc(cache->budget,
+            LAYOUT_REUSE_STYLE_PAGE_SIZE * sizeof(LayoutReuseStylePayload));
+        if (cache->style_pages[page] == NULL) {
+            cache->style_payload_refused = true;
+            return false;
+        }
+        cache->stats.retained_bytes +=
+            LAYOUT_REUSE_STYLE_PAGE_SIZE * sizeof(LayoutReuseStylePayload);
+    }
+    cache->style_payload_count++;
+    return true;
+}
+
 static void layout_reuse_clear_styles(LayoutReuseCache *cache)
 {
     memset(cache->styles, 0, (cache->style_mask + 1u) * sizeof(*cache->styles));
+    cache->style_payload_count = 0;
+    cache->style_payload_free = 0;
+    cache->style_payload_refused = false;
 }
 
 static void layout_reuse_clear_entries(LayoutReuseCache *cache)
@@ -567,14 +616,17 @@ static void layout_reuse_fit_styles(LayoutReuseCache *cache)
     for (size_t i = 0; i < capacity; i++) {
         if (old[i].node == NULL) continue;
         size_t home = layout_pointer_hash(old[i].node) & cache->style_mask;
+        bool moved = false;
         for (size_t probe = 0; probe < 8; probe++) {
             LayoutReuseStyleEntry *slot =
                 &styles[(home + probe) & cache->style_mask];
             if (slot->node == NULL) {
                 *slot = old[i];
+                moved = true;
                 break;
             }
         }
+        if (!moved) layout_reuse_drop_style(cache, &old[i]);
     }
     budget_free(cache->budget, old);
     cache->stats.retained_bytes += (grown - capacity) * sizeof(*styles);
@@ -595,6 +647,8 @@ void layout_reuse_cache_destroy(LayoutReuseCache *cache)
     }
     style_retained_matches_destroy(cache->matches);
     budget_free(budget, cache->styles);
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_PAGE_COUNT; i++)
+        budget_free(budget, cache->style_pages[i]);
     budget_free(budget, cache->identity_tokens);
     budget_free(budget, cache->identity_names);
     budget_free(budget, cache->structural_rules);
@@ -704,7 +758,7 @@ void layout_reuse_cache_begin_font_publication(LayoutReuseCache *cache)
     layout_reuse_clear_sizing_entries(cache);
     for (size_t i = 0; i <= cache->style_mask; i++) {
         if ((cache->styles[i].dependent & LAYOUT_REUSE_FONT_DEPENDENT) != 0)
-            cache->styles[i].node = NULL;
+            layout_reuse_drop_style(cache, &cache->styles[i]);
     }
     /* A document-order walk would otherwise evict the previous build's
        retained tail before reaching it. Keep those bounded entries through
@@ -849,7 +903,7 @@ static void layout_reuse_drop_subtree(LayoutReuseCache *cache,
         LayoutReuseStyleEntry *entry = &cache->styles[i];
         if (entry->node != NULL
             && layout_node_is_within(entry->node, scope)) {
-            memset(entry, 0, sizeof(*entry));
+            layout_reuse_drop_style(cache, entry);
         }
     }
     if (include_matches)
@@ -867,7 +921,7 @@ static void layout_reuse_drop_element(LayoutReuseCache *cache,
     for (size_t probe = 0; probe < 8; probe++) {
         LayoutReuseStyleEntry *entry = &cache->styles[
             (home + probe) & cache->style_mask];
-        if (entry->node == node) memset(entry, 0, sizeof(*entry));
+        if (entry->node == node) layout_reuse_drop_style(cache, entry);
     }
     if (include_matches) style_retained_matches_forget_node(cache->matches, node);
 }
@@ -1008,7 +1062,7 @@ static void layout_reuse_drop_structural_readers(LayoutReuseCache *cache,
         for (size_t r = 0; r < count; r++) {
             if ((entry->variable_reads & names[r]) != 0
                 && layout_node_is_within(entry->node, reached[r])) {
-                memset(entry, 0, sizeof(*entry));
+                layout_reuse_drop_style(cache, entry);
                 break;
             }
         }
@@ -1141,7 +1195,7 @@ static void layout_reuse_has_drop(void *opaque, lxb_dom_node_t *node)
     for (size_t probe = 0; probe < 8; probe++) {
         LayoutReuseStyleEntry *entry = &cache->styles[
             (home + probe) & cache->style_mask];
-        if (entry->node == node) memset(entry, 0, sizeof(*entry));
+        if (entry->node == node) layout_reuse_drop_style(cache, entry);
     }
     layout_reuse_cache_invalidate_measurements(cache, node);
     cache->stats.has_dropped++;
@@ -1247,7 +1301,7 @@ static void layout_reuse_has_flush(LayoutReuseCache *cache)
             drop = layout_reuse_has_reaches_reader(cache, &memo,
                                                    entry->node);
         if (drop) {
-            memset(entry, 0, sizeof(*entry));
+            layout_reuse_drop_style(cache, entry);
             dropped++;
         }
     }
@@ -1506,7 +1560,7 @@ static void layout_reuse_drop_reached(LayoutReuseCache *cache,
         if (!reached)
             reached = style_element_carries_any_key(entry->node, keys,
                                                     key_count);
-        if (reached) memset(entry, 0, sizeof(*entry));
+        if (reached) layout_reuse_drop_style(cache, entry);
     }
     layout_reuse_cache_invalidate_measurements(cache, scope);
 }
@@ -1687,7 +1741,7 @@ void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
         LayoutReuseStyleEntry *entry = &cache->styles[i];
         if (entry->node != NULL
             && layout_node_is_within(entry->node, scope)) {
-            memset(entry, 0, sizeof(*entry));
+            layout_reuse_drop_style(cache, entry);
         }
     }
     for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
@@ -1934,7 +1988,7 @@ void layout_reuse_cache_invalidate_inline_style(
         LayoutReuseStyleEntry *entry = &cache->styles[i];
         if (entry->node != NULL && (entry->variable_reads & names) != 0
             && layout_node_is_within(entry->node, node)) {
-            memset(entry, 0, sizeof(*entry));
+            layout_reuse_drop_style(cache, entry);
         }
     }
     layout_reuse_cache_invalidate_measurements(cache, node);
@@ -1972,7 +2026,7 @@ void layout_reuse_cache_invalidate_focus(
         LayoutReuseStyleEntry *entry = &cache->styles[i];
         if (entry->node != NULL
             && layout_node_is_within(node, entry->node)) {
-            memset(entry, 0, sizeof(*entry));
+            layout_reuse_drop_style(cache, entry);
         }
     }
     style_retained_matches_invalidate_ancestors(cache->matches, node);
@@ -2648,7 +2702,7 @@ static bool layout_reuse_style_get_hashed(LayoutReuseCache *cache,
                 && style_container_log_active(cache->sheet)) break;
             entry->stamp = ++cache->clock;
             cache->stats.style_hits++;
-            *style = entry->style;
+            *style = layout_reuse_payload(cache, entry->payload)->style;
             return true;
         }
 #ifndef TILEFINCH_NO_TRACE
@@ -2695,13 +2749,16 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
         cache->stats.style_evictions++;
 #endif
     }
+    uint16_t payload = cache->styles[replacement].payload;
+    if (cache->styles[replacement].node == NULL
+        && !layout_reuse_admit_payload(cache, &payload)) return;
     size_t inline_length = 0;
     const char *inline_style = document_attribute(node, "style",
                                                   &inline_length);
     cache->styles[replacement] = (LayoutReuseStyleEntry) {
         .node = node,
         .parent_hash = parent_hash,
-        .style = *style,
+        .payload = payload,
         .stamp = ++cache->clock,
         .variable_reads = variable_reads,
         .dependent = (uint8_t) ((font_dependent
@@ -2712,6 +2769,7 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
             : stylesheet_inline_custom_property_bits(inline_style,
                                                      inline_length)
     };
+    layout_reuse_payload(cache, payload)->style = *style;
 }
 
 static void layout_resolve_canonical_style(
@@ -2796,7 +2854,8 @@ bool layout_reuse_pseudo_absent(const LayoutReuseCache *cache,
     const LayoutReuseStyleEntry *entry = layout_reuse_entry_for(cache, node);
     return entry != NULL
         && (entry->pseudo_absent & (1u << pseudo)) != 0
-        && memcmp(&entry->style, parent, sizeof(*parent)) == 0;
+        && memcmp(&layout_reuse_payload(cache, entry->payload)->style,
+                  parent, sizeof(*parent)) == 0;
 }
 
 void layout_reuse_note_pseudo(LayoutReuseCache *cache,
@@ -2809,7 +2868,9 @@ void layout_reuse_note_pseudo(LayoutReuseCache *cache,
     if (cache == NULL || sheet == NULL || cache->sheet != sheet
         || node == NULL || parent == NULL || pseudo == PSEUDO_NONE) return;
     LayoutReuseStyleEntry *entry = layout_reuse_entry_for(cache, node);
-    if (entry == NULL || memcmp(&entry->style, parent, sizeof(*parent)) != 0)
+    if (entry == NULL
+        || memcmp(&layout_reuse_payload(cache, entry->payload)->style,
+                  parent, sizeof(*parent)) != 0)
         return;
     uint8_t bit = (uint8_t) (1u << pseudo);
     /* A custom property can change what it generates without restyling
@@ -4351,6 +4412,9 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
         layout_finish_work_slice(job->context);
         job->layout.scroll_width = root_scroll_width_after_clipping(
             &job->layout, job->viewport_width);
+        job->layout.height = root_scroll_height_after_clipping(
+            &job->layout, job->bottom < job->viewport_height
+                ? job->viewport_height : job->bottom);
         job->preview_truncated = job->context->preview_truncated;
         tilefinch_platform_trace_step("finish-trace");
         layout_job_trace_finished(job);
@@ -4896,6 +4960,13 @@ bool layout_clone_visual(LayoutDocument *visual,
                after converting device deltas back to CSS.  Scaling it here
                would apply the viewport ratio twice, sliding a downscaled
                crop with a large negative offset off its art. */
+        } else if (command->type == DRAW_SHEARED_FILL) {
+            command->text_length = (uint32_t) viewport_scale_ceil(
+                (int) command->text_length, numerator, denominator);
+            command->font_size = viewport_scale_ceil(
+                command->font_size, numerator, denominator);
+            command->radius = viewport_scale_floor(
+                command->radius, numerator, denominator);
         } else if (command->type == DRAW_IMAGE) {
             /* Replaced images pack object-position into radius/font_size.
                Preserve each percentage and scale only its signed CSS-pixel

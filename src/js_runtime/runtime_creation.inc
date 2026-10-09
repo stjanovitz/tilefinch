@@ -833,13 +833,30 @@ static bool runtime_load_lazy_bootstrap(
             evaluated = false;
         JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_MOTION) {
-        evaluated = runtime_evaluate_bootstrap_profiled(
-            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
-                         browser_bootstrap_motion,
-                         browser_bootstrap_motion_bytecode),
-            "<browser-motion-lazy>",
-            &browser_bootstrap_motion_bytecode, false, trace,
-            &total_us, &compile_us);
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom bridge_atom = JS_NewAtom(
+            runtime->context, "__tilefinchMotionSourceBridge");
+        bool bridge_ready = !JS_IsException(global)
+            && bridge_atom != JS_ATOM_NULL
+            && js_rt_install_function(runtime->context, global,
+                "__tilefinchMotionSourceBridge", js_stylesheet_motion_source, 0);
+        if (bridge_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_motion,
+                             browser_bootstrap_motion_bytecode),
+                "<browser-motion-lazy>",
+                &browser_bootstrap_motion_bytecode, false, trace,
+                &total_us, &compile_us);
+        }
+        /* Capture only inside trusted initialization: exposing raw external
+           stylesheet text to authors would bypass CSSOM origin checks. Also
+           remove the capability when initialization fails before its cleanup. */
+        if (bridge_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(runtime->context, global, bridge_atom, 0);
+            JS_FreeAtom(runtime->context, bridge_atom);
+        }
+        JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_STREAMS) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -2357,6 +2374,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchConstructedSheetText",
                                        js_dom_constructed_sheet_text, 2)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchSheetRevision",
+                                       js_dom_sheet_revision, 1)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchCssStatementEnds",
                                        js_css_statement_ends, 1)
                    && js_rt_install_function(host->context, global,
@@ -2694,6 +2714,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchPrefersDark",
                                        js_prefers_dark_color_scheme, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchMediaMatches",
+                                       js_media_matches, 4)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDecodeUtf8Valid",
                                        js_utf8_decode_valid, 2)

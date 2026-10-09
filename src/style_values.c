@@ -82,10 +82,22 @@ bool style_parse_background_size(const Stylesheet *sheet,
                                   ComputedStyle *style)
 {
     if (style == NULL) return false;
-    return style_parse_background_size_values(
-        sheet, text, length, &style->background_width,
-        &style->background_height, &style->background_fit,
-        &style->background_size_flags);
+    uint16_t width = style->background_width;
+    uint16_t height = style->background_height;
+    uint8_t fit = style->background_fit;
+    uint8_t flags = 0;
+    if (!style_parse_background_size_values(
+        sheet, text, length, &width, &height, &fit,
+        &flags)) return false;
+    const uint8_t size_mask = STYLE_BACKGROUND_SIZE_EXPLICIT
+        | STYLE_BACKGROUND_WIDTH_AUTO | STYLE_BACKGROUND_HEIGHT_AUTO
+        | STYLE_BACKGROUND_WIDTH_PERCENT | STYLE_BACKGROUND_HEIGHT_PERCENT;
+    style->background_size_flags = (uint8_t) (
+        (style->background_size_flags & ~size_mask) | flags);
+    style->background_width = width;
+    style->background_height = height;
+    style->background_fit = fit;
+    return true;
 }
 
 static bool background_position_component(const char *text, size_t length,
@@ -296,12 +308,32 @@ static bool transform_angle_quadrants(const char *text, size_t length,
     return true;
 }
 
+static bool transform_skew_number(const char *text, size_t length,
+                                  double *shear)
+{
+    char buffer[40];
+    if (length == 0 || length >= sizeof(buffer)) return false;
+    memcpy(buffer, text, length);
+    buffer[length] = '\0';
+    char *end = NULL;
+    double angle = strtod(buffer, &end);
+    if (end == buffer || !isfinite(angle)) return false;
+    if (strcasecmp(end, "turn") == 0) angle *= 360.0;
+    else if (strcasecmp(end, "grad") == 0) angle *= 0.9;
+    else if (strcasecmp(end, "rad") == 0) angle *= 57.29577951308232;
+    else if (*end != '\0' && strcasecmp(end, "deg") != 0) return false;
+    else if (*end == '\0' && angle != 0.0) return false;
+    if (fabs(angle) > 75.0) return false;
+    *shear = tan(angle * 0.017453292519943295);
+    return true;
+}
+
 /* Compose the practical 2D subset into one uniform-scale/quarter-turn/
    translation tuple.  Parsing the complete function list fixes the former
    first-function-only behaviour while preserving the display list's exact,
-   axis-aligned representation.  Non-uniform scale, skew and arbitrary-angle
-   rotation fail closed instead of silently painting the wrong transform. */
-void style_parse_transform_translation(const Stylesheet *sheet,
+   axis-aligned representation. Horizontal shear has a bounded solid-box
+   painter; non-uniform scale and arbitrary-angle rotation fail closed. */
+void style_parse_transform_translation(Stylesheet *sheet,
                                         const char *text, size_t length,
                                         ComputedStyle *style)
 {
@@ -311,6 +343,17 @@ void style_parse_transform_translation(const Stylesheet *sheet,
     style->individual_rotate_quadrants = 0;
     style->transform_x = style->transform_y = 0;
     style->transform_x_percent = style->transform_y_percent = false;
+    StylePaintStack prior_paint = style_paint_stack_copy(sheet, style);
+    if ((prior_paint.components & STYLE_PAINT_COMPONENT_SKEW) != 0) {
+        prior_paint.skew_x_q10 = 0;
+        prior_paint.components &= (uint8_t) ~STYLE_PAINT_COMPONENT_SKEW;
+        bool retained = false;
+        if (!style_apply_paint_stack(sheet, style, &prior_paint, &retained)
+            || !retained) {
+            computed_style_set_paint_stack_id(style, 0);
+            return;
+        }
+    }
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)
         || strcmp(value, "none") == 0) return;
 
@@ -374,6 +417,20 @@ void style_parse_transform_translation(const Stylesheet *sheet,
             else { tx += a * x; ty += b * x; }
             if (yp) { pxh += c * y; pyh += d * y; }
             else { tx += c * y; ty += d * y; }
+        } else if ((name_length == 4 && strncasecmp(name, "skew", 4) == 0)
+                   || (name_length == 5
+                       && strncasecmp(name, "skewx", 5) == 0)
+                   || (name_length == 5
+                       && strncasecmp(name, "skewy", 5) == 0)) {
+            bool vertical = name_length == 5
+                && strncasecmp(name, "skewy", 5) == 0;
+            double shear = 0.0, other = 0.0;
+            if (count == 0 || count > (name_length == 4 ? 2u : 1u)
+                || !transform_skew_number(parts[0], part_lengths[0], &shear)
+                || (count == 2 && !transform_skew_number(
+                        parts[1], part_lengths[1], &other))
+                || other != 0.0 || (vertical && shear != 0.0)) return;
+            if (!vertical) { c += a * shear; d += b * shear; }
         } else if ((name_length == 5
                     && strncasecmp(name, "scale", 5) == 0)
                    || (name_length == 7
@@ -450,6 +507,7 @@ void style_parse_transform_translation(const Stylesheet *sheet,
     }
     if (!any || fabs(pxh) > 0.000001 || fabs(pyw) > 0.000001) return;
     double scale = hypot(a, b);
+    double shear = 0.0;
     unsigned quadrants = 0;
     if (scale > 0.000001) {
         double na = a / scale, nb = b / scale;
@@ -462,8 +520,11 @@ void style_parse_transform_translation(const Stylesheet *sheet,
                             : (quadrants == 3 ? scale : 0.0);
         double expected_d = quadrants == 2 ? -scale
                             : (quadrants == 0 ? scale : 0.0);
-        if (fabs(c - expected_c) > 0.000001
-            || fabs(d - expected_d) > 0.000001) return;
+        if (quadrants == 0 && fabs(d - scale) < 0.000001) {
+            shear = c / scale;
+            if (fabs(shear) > 4.0) return;
+        } else if (fabs(c - expected_c) > 0.000001
+                   || fabs(d - expected_d) > 0.000001) return;
     } else if (fabs(c) > 0.000001 || fabs(d) > 0.000001) return;
     if ((fabs(tx) > 0.000001 && fabs(pxw) > 0.000001)
         || (fabs(ty) > 0.000001 && fabs(pyh) > 0.000001)) return;
@@ -481,7 +542,16 @@ void style_parse_transform_translation(const Stylesheet *sheet,
     style->transform_x = (int) (final_x < 0 ? final_x - 0.5 : final_x + 0.5);
     style->transform_y = (int) (final_y < 0 ? final_y - 0.5 : final_y + 0.5);
     style->has_transform = style->transform_scale_q6 != 64
-        || quadrants != 0 || style->transform_x != 0 || style->transform_y != 0;
+        || quadrants != 0 || style->transform_x != 0 || style->transform_y != 0
+        || shear != 0.0;
+    if (shear != 0.0) {
+        StylePaintStack stack = style_paint_stack_copy(sheet, style);
+        stack.skew_x_q10 = (int16_t) round(shear * 1024.0);
+        stack.components |= STYLE_PAINT_COMPONENT_SKEW;
+        bool retained = false;
+        if (!style_apply_paint_stack(sheet, style, &stack, &retained)
+            || !retained) style->has_transform = false;
+    }
 }
 
 static void skip_color_separator(const char **cursor)
@@ -1441,7 +1511,8 @@ bool style_parse_background_shorthand_color(const Stylesheet *sheet,
                                              const char *text, size_t length,
                                              uint32_t *color,
                                              uint8_t *alpha,
-                                             bool *transparent)
+                                             bool *transparent,
+                                             bool *current_color)
 {
     char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)) {
@@ -1450,6 +1521,7 @@ bool style_parse_background_shorthand_color(const Stylesheet *sheet,
     length = strlen(resolved);
     bool found = false;
     *transparent = false;
+    *current_color = false;
     for (size_t at = 0; at < length;) {
         while (at < length && isspace((unsigned char) resolved[at])) at++;
         size_t end = at;
@@ -1464,8 +1536,14 @@ bool style_parse_background_shorthand_color(const Stylesheet *sheet,
         if (end > at) {
             uint32_t candidate = 0;
             uint8_t candidate_alpha = 255;
-            if (style_parse_color_with_alpha(sheet, resolved + at, end - at,
+            if (span_case_equal(resolved + at, end - at, "currentcolor")) {
+                *current_color = true;
+                *transparent = false;
+                *alpha = 255;
+                found = true;
+            } else if (style_parse_color_with_alpha(sheet, resolved + at, end - at,
                                        &candidate, &candidate_alpha)) {
+                *current_color = false;
                 *color = candidate;
                 *alpha = candidate_alpha;
                 *transparent = candidate_alpha == 0;
@@ -4997,6 +5075,23 @@ bool style_parse_grid_line_or_name(
     return true;
 }
 
+static bool grid_track_automatic_minimum(const char *text, size_t length)
+{
+    trim(&text, &length);
+    /* A bare flexible track means minmax(auto, <flex>). Do not conflate
+       it with minmax(0, <flex>), whose zero minimum deliberately shrinks. */
+    if (length <= 7 || memcmp(text, "minmax(", 7) != 0) return true;
+    text += 7;
+    length -= 7;
+    const char *comma = memchr(text, ',', length);
+    if (comma == NULL) return false;
+    length = (size_t) (comma - text);
+    trim(&text, &length);
+    return span_equal(text, length, "auto")
+        || span_equal(text, length, "min-content")
+        || span_equal(text, length, "max-content");
+}
+
 static bool grid_append_track(
     const Stylesheet *sheet, StyleGridTrackTemplate *parsed,
     const char *text, size_t length, unsigned limit)
@@ -5012,6 +5107,8 @@ static bool grid_append_track(
         value > UINT16_MAX ? UINT16_MAX : (uint16_t) value;
     parsed->track_minimums[index] =
         minimum > UINT16_MAX ? UINT16_MAX : (uint16_t) minimum;
+    if (grid_track_automatic_minimum(text, length))
+        parsed->automatic_minimums[index / 8u] |= (uint8_t) (1u << (index % 8u));
     return true;
 }
 
@@ -5036,6 +5133,7 @@ static bool grid_expand_uniform_repeat(
     unsigned value = 0, minimum = 0;
     if (!style_parse_grid_track(
             sheet, track, track_length, &type, &value, &minimum)) return false;
+    bool automatic_minimum = grid_track_automatic_minimum(track, track_length);
     for (long i = 0; i < count; i++) {
         unsigned index = parsed->track_count++;
         parsed->track_types[index] = type;
@@ -5043,6 +5141,8 @@ static bool grid_expand_uniform_repeat(
             value > UINT16_MAX ? UINT16_MAX : (uint16_t) value;
         parsed->track_minimums[index] =
             minimum > UINT16_MAX ? UINT16_MAX : (uint16_t) minimum;
+        if (automatic_minimum)
+            parsed->automatic_minimums[index / 8u] |= (uint8_t) (1u << (index % 8u));
     }
     return true;
 }
@@ -5631,6 +5731,18 @@ unsigned stylesheet_grid_track_minimum(
     return 0;
 }
 
+bool stylesheet_grid_track_automatic_minimum(
+    const Stylesheet *sheet, const ComputedStyle *container,
+    bool rows, unsigned index)
+{
+    const StyleGridTrackTemplate *template =
+        style_grid_track_template(sheet, container, rows);
+    return template != NULL && !template->subgrid
+        && index < template->track_count
+        && (template->automatic_minimums[index / 8u]
+            & (1u << (index % 8u))) != 0;
+}
+
 uint8_t stylesheet_grid_track_line_name(
     const Stylesheet *sheet, const ComputedStyle *container,
     bool rows, unsigned line, unsigned slot)
@@ -5745,7 +5857,7 @@ bool stylesheet_resolve_named_grid_lines(
 
 static bool append_grid_track_token(
     char *output, size_t capacity, size_t *used,
-    uint8_t type, unsigned value, unsigned minimum)
+    uint8_t type, unsigned value, unsigned minimum, bool automatic_minimum)
 {
     char token[64];
     if (type == GRID_TRACK_FIXED) {
@@ -5777,7 +5889,8 @@ static bool append_grid_track_token(
     } else {
         snprintf(token, sizeof(token), "auto");
     }
-    if (minimum != 0 && type != GRID_TRACK_FIXED) {
+    if ((minimum != 0 || (type == GRID_TRACK_FLEX && !automatic_minimum))
+        && type != GRID_TRACK_FIXED) {
         char wrapped[96];
         snprintf(wrapped, sizeof(wrapped), "minmax(%upx,%s)",
                  minimum, token);
@@ -5847,6 +5960,8 @@ bool stylesheet_serialize_grid_template_tracks(
                 stylesheet_grid_track_type(sheet, container, rows, line),
                 stylesheet_grid_track_value(sheet, container, rows, line),
                 stylesheet_grid_track_minimum(
+                    sheet, container, rows, line),
+                stylesheet_grid_track_automatic_minimum(
                     sheet, container, rows, line))) return false;
     }
     if (used == 0) {
@@ -5937,6 +6052,11 @@ const char *style_store_generated_text(Stylesheet *sheet, const char *text,
         }
     }
     if (sheet->generated_text_count >= STYLE_GENERATED_TEXT_LIMIT) return NULL;
+    if (sheet->generated_text_bytes > STYLE_GENERATED_TEXT_BYTE_LIMIT
+        || length + 1u > STYLE_GENERATED_TEXT_BYTE_LIMIT
+                           - sheet->generated_text_bytes) return NULL;
+    char *copy = budget_malloc(sheet->budget, length + 1u);
+    if (copy == NULL) return NULL;
     if (sheet->generated_text_count == sheet->generated_text_capacity) {
         size_t capacity = sheet->generated_text_capacity == 0
                           ? 8 : sheet->generated_text_capacity * 2;
@@ -5945,12 +6065,13 @@ const char *style_store_generated_text(Stylesheet *sheet, const char *text,
         }
         char **texts = budget_realloc(sheet->budget, sheet->generated_texts,
                                       capacity * sizeof(*texts));
-        if (texts == NULL) return NULL;
+        if (texts == NULL) {
+            budget_free(sheet->budget, copy);
+            return NULL;
+        }
         sheet->generated_texts = texts;
         sheet->generated_text_capacity = capacity;
     }
-    char *copy = budget_malloc(sheet->budget, length + 1);
-    if (copy == NULL) return NULL;
     memcpy(copy, text, length);
     copy[length] = '\0';
     sheet->generated_texts[sheet->generated_text_count++] = copy;

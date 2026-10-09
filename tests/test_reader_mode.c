@@ -248,6 +248,86 @@ static bool subtree_text_contains_words(lxb_dom_node_t *root,
     return strstr(text, words) != NULL;
 }
 
+static bool test_reading_identity_and_semantic_selection(void)
+{
+    const char *paragraph = "<p>OPENING PROSE. This complete paragraph supplies ordinary "
+        "article text with enough sentences to distinguish a genuine reading "
+        "body from link-heavy recommendations, captions, or unrelated page chrome.</p>";
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><body><main><article><figure><img src='/hero.png'>"
+        "<figcaption>Lead caption</figcaption></figure><h1>READING TITLE</h1>"
+        "<a rel='nofollow author' href='/author'>READING AUTHOR</a>%s%s%s%s"
+        "<p>FINAL BODY SENTINEL.</p></article><section>",
+        paragraph, paragraph, paragraph, paragraph);
+    for (unsigned i = 0; i < 3; i++) {
+        int n = snprintf(html + used, sizeof(html) - used,
+            "<p>UNRELATED RECOMMENDATION. %s</p>", paragraph);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    CHECK(used + strlen("</section></main></body>") < sizeof(html));
+    strcpy(html + used, "</section></main></body>");
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(analyze(html, &analysis, &document, &budget));
+    lxb_dom_node_t *root = find_reader_root(&document);
+    CHECK(analysis.kind == READER_PAGE_ARTICLE && root != NULL
+        && count_named_within(root, "h1") == 1u
+        && count_named_within(root, "p") == 5u
+        && !subtree_contains_text(root, "UNRELATED RECOMMENDATION")
+        && subtree_contains_text(root, "FINAL BODY SENTINEL"));
+    lxb_dom_node_t *article = find_named_within(root, "article");
+    lxb_dom_node_t *first = article == NULL ? NULL : article->first_child;
+    CHECK(first != NULL && subtree_contains_text(first, "READING TITLE")
+        && first->next != NULL && subtree_contains_text(first->next, "READING AUTHOR")
+        && first->next->next != NULL
+        && subtree_contains_text(first->next->next, "OPENING PROSE"));
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+    return true;
+}
+
+static bool test_basic_layout_tables_and_embedded_images(void)
+{
+    const char html[] = "<!doctype html><body><table><tr><td><h1>Page heading</h1>"
+        "<table><caption>Actual data</caption><tr><th scope=col>Key</th>"
+        "<td>Value</td></tr></table></td><td><p>Side content</p></td></tr></table>"
+        "<table role=presentation><tr><td><a href='/one'>First</a></td><td></td>"
+        "<td><a href='/two'>Second</a></td></tr></table>"
+        "<table><tr><td>10</td><td>20</td></tr></table>"
+        "<table><tr><td><img src='/logo.png'></td><td><a href='/a'>A</a>"
+        "<a href='/b'>B</a><a href='/c'>C</a><a href='/d'>D</a></td></tr></table>"
+        "<img src='data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2220%22%20height=%2220%22/%3E'>"
+        "<img src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==' data-src='/real.png'>"
+        "</body>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 113u)
+        && reader_document_prepare_basic_with_stylesheet(&document, NULL, &analysis));
+    lxb_dom_node_t *root = find_reader_root(&document);
+    CHECK(root != NULL && analysis.kind == READER_PAGE_BASIC
+        && count_named_within(root, "table") == 2u
+        && count_named_within(root, "th") == 1u
+        && count_named_within(root, "a") == 6u
+        && count_named_within(root, "img") == 3u);
+    lxb_dom_node_t *image = find_attribute_value_within(root, "src",
+        "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2220%22%20height=%2220%22/%3E");
+    size_t length = 0;
+    const char *source = document_attribute(image, "src", &length);
+    CHECK(source != NULL && length > 19u && memcmp(source, "data:image/svg+xml,", 19u) == 0);
+    CHECK(find_attribute_value_within(root, "src", "/real.png") != NULL);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+    return true;
+}
+
 static bool test_article(void)
 {
     static const char html[] =
@@ -623,7 +703,7 @@ static bool test_empty_listing_extraction_falls_back_to_raw(void)
         int written = snprintf(
             entry, sizeof(entry),
             "<article><a href='/video-%u' title='Clip %u'>"
-            "<img src='data:image/gif;base64,AAAA'></a></article>",
+            "<img src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='></a></article>",
             i, i);
         CHECK(written > 0 && (size_t) written < sizeof(entry)
               && append_text(html, sizeof(html), &used, entry));
@@ -1609,6 +1689,47 @@ static bool test_complete_bounded_walk_is_transactional(void)
     return true;
 }
 
+static bool test_basic_navigation_and_link_boundaries(void)
+{
+    static const char html[] =
+        "<!doctype html><body><nav aria-label='Browse &amp; explore'>"
+        "<a href='/one'>One</a><a href='/two'>Two</a></nav>"
+        "<div role='navigation'><a href='/three'>Three</a></div>"
+        "<main><p><span>word</span><span>piece</span> "
+        "<a href='/four'>Four</a><a href='/five'>Five</a> "
+        "<b><a href='/six'>Six</a></b><a href='/seven'>Seven</a></p>"
+        "<select><option>UNUSABLE OPTION</option></select>"
+        "<form role='search' action='/search'><input name='q'><select name='kind'>"
+        "<option value='all'>All</option></select></form></main></body>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 113u)
+          && reader_document_prepare_basic_complete_with_stylesheet(
+                 &document, NULL, &analysis));
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    CHECK(root != NULL && analysis.kind == READER_PAGE_BASIC
+          && !analysis.bounded_out && !analysis.extraction_truncated
+          && count_named_within(root, "details") == 2u
+          && count_named_within(root, "summary") == 2u
+          && !has_attribute(find_named_within(root, "details"), "open")
+          && subtree_contains_text(root, "Browse & explore")
+          && subtree_text_contains_words(root, "One Two")
+          && subtree_text_contains_words(root, "wordpiece Four Five")
+          && subtree_text_contains_words(root, "Six Seven")
+          && !subtree_contains_text(root, "UNUSABLE OPTION")
+          && count_named_within(root, "select") == 1u
+          && count_named_within(root, "option") == 1u
+          && find_attribute_value_within(root, "href", "/three") != NULL
+          && analysis.retained_forms == 1u);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
 static bool test_basic_view_preserves_actions_without_guessing(void)
 {
     static const char html[] =
@@ -2116,6 +2237,45 @@ static bool test_basic_structural_extraction_is_cooperative_once(void)
     return true;
 }
 
+static bool refuse_reader_table(void *context, const char *phase, size_t work)
+{
+    size_t *calls = context;
+    if (strcmp(phase, "reader-table") != 0) return true;
+    (*calls)++;
+    return work < 128u;
+}
+
+static bool test_basic_table_classification_cancellation(void)
+{
+    char html[8192];
+    size_t used = 0;
+    CHECK(append_text(html, sizeof(html), &used, "<body><table><tr><td>"));
+    for (size_t i = 0; i < 180u; i++)
+        CHECK(append_text(html, sizeof(html), &used, "<span>cell</span>"));
+    CHECK(append_text(html, sizeof(html), &used, "</td></tr></table></body>"));
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, used, 113u));
+    size_t nodes_before = document.node_count, calls = 0;
+    TilefinchPlatformServices services = {
+        .context = &calls, .cooperate = refuse_reader_table
+    };
+    ReaderDocumentAnalysis analysis = {0};
+    tilefinch_platform_set_services(&services);
+    bool prepared = reader_document_prepare_basic_complete_with_stylesheet(
+        &document, NULL, &analysis);
+    tilefinch_platform_set_services(NULL);
+    CHECK(!prepared && calls == 1u && analysis.bounded_out
+        && find_direct_reader_root(&document) == NULL
+        && document.node_count == nodes_before
+        && !has_attribute(document_body_node(&document), "data-tilefinch-reader-kind"));
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u);
+    return true;
+}
+
 /* The emitted bound scales with the budget's free room: an ample budget
    extracts a long page whole, while a budget with less than the 4 MiB
    reserve free still gets the 512-node floor, as before scaling. The markup
@@ -2281,6 +2441,9 @@ int main(void)
         || !test_large_page_bound()
         || !test_bounded_page_keeps_manual_article()
         || !test_complete_bounded_walk_is_transactional()
+        || !test_reading_identity_and_semantic_selection()
+        || !test_basic_layout_tables_and_embedded_images()
+        || !test_basic_navigation_and_link_boundaries()
         || !test_basic_view_preserves_actions_without_guessing()
         || !test_extracted_fragment_markers_preserve_empty_targets()
         || !test_basic_anchor_bounds_are_transactional()
@@ -2289,6 +2452,7 @@ int main(void)
         || !test_basic_view_form_scan_bound_is_transactional()
         || !test_basic_select_option_bound_is_transactional()
         || !test_basic_structural_extraction_is_cooperative_once()
+        || !test_basic_table_classification_cancellation()
         || !test_basic_view_bound_scales_with_budget()
         || !test_auto_reader_accepts_unmarked_clear_article()
         || !test_auto_reader_refuses_front_page_teasers()

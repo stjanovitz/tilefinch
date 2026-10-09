@@ -149,6 +149,7 @@ function parseArguments(argv) {
     timeoutMs: 15000,
     settleMs: 750,
     python: "python3",
+    scriptFreeDiagnostic: false,
   };
   const value = (option, index) => {
     if (index + 1 >= argv.length || argv[index + 1].startsWith("--")) {
@@ -159,6 +160,7 @@ function parseArguments(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const option = argv[i];
     if (option === "--help" || option === "-h") result.help = true;
+    else if (option === "--script-free-diagnostic") result.scriptFreeDiagnostic = true;
     else if (option === "--inspect-trace") result.inspectTrace = value(option, i++);
     else if (option === "--manifest") result.manifest = value(option, i++);
     else if (option === "--scenario") result.scenario = value(option, i++);
@@ -192,6 +194,7 @@ function usage() {
     "  node benchmarks/capture-reference.js --scenario NAME --trace-root DIR \\",
     "       --output-root DIR [--manifest FILE] [--browser chromium]",
     "       [--text-metrics-output FILE]",
+    "       [--script-free-diagnostic] (resource discovery only; never a qualified reference)",
     "",
     "Capture mode requires the Playwright package and a selected browser binary.",
   ].join("\n");
@@ -1439,6 +1442,56 @@ function installReplayEnvironment(configuration) {
     static supportedLocalesOf(locales) { return supportedLocales(locales); }
   }
 
+  /* Keep this limited segmentation identical to bootstrap/intl.js. Native
+     Chromium ICU would change wrapping, while omitting Segmenter altogether
+     prevents pages from initializing even though the engine exposes it. */
+  const segmentLocale = (value) => String(value === undefined ? "en-US"
+    : Array.isArray(value) ? value[0] : value).replace(/_/g, "-");
+  class BoundedSegmenter {
+    constructor(locales, options = {}) {
+      this.locale = segmentLocale(locales);
+      this.granularity = ["grapheme", "word", "sentence"].includes(options.granularity)
+        ? options.granularity : "grapheme";
+    }
+    segment(input) {
+      const text = String(input), segments = [];
+      if (this.granularity === "grapheme") {
+        let index = 0;
+        for (const value of text) {
+          segments.push({ segment: value, index, input: text });
+          index += value.length;
+        }
+      } else if (this.granularity === "word") {
+        const pattern = /([\p{L}\p{N}_'’]+|\s+|[^\s\p{L}\p{N}_'’]+)/gu;
+        let match;
+        while ((match = pattern.exec(text)) !== null)
+          segments.push({ segment: match[0], index: match.index, input: text,
+            isWordLike: /[\p{L}\p{N}_]/u.test(match[0]) });
+      } else {
+        const pattern = /[^.!?\n]*(?:[.!?\n]+\s*|$)/g;
+        let match;
+        while ((match = pattern.exec(text)) !== null && match[0] !== "") {
+          segments.push({ segment: match[0], index: match.index, input: text });
+          if (pattern.lastIndex === match.index) pattern.lastIndex++;
+        }
+      }
+      return {
+        [Symbol.iterator]() { return segments[Symbol.iterator](); },
+        containing(at) {
+          at = Math.floor(Number(at) || 0);
+          for (const entry of segments)
+            if (at >= entry.index && at < entry.index + entry.segment.length) return entry;
+          return undefined;
+        },
+      };
+    }
+    resolvedOptions() { return { locale: this.locale, granularity: this.granularity }; }
+    static supportedLocalesOf(locales) {
+      return (Array.isArray(locales) ? locales : [locales])
+        .filter(value => value !== undefined).map(segmentLocale);
+    }
+  }
+
   const boundedIntl = {
     Locale: constructOnly("Locale", BoundedLocale),
     NumberFormat: callable("NumberFormat", BoundedNumberFormat),
@@ -1448,6 +1501,7 @@ function installReplayEnvironment(configuration) {
     RelativeTimeFormat: constructOnly("RelativeTimeFormat", BoundedRelativeTimeFormat),
     ListFormat: constructOnly("ListFormat", BoundedListFormat),
     DisplayNames: constructOnly("DisplayNames", BoundedDisplayNames),
+    Segmenter: constructOnly("Segmenter", BoundedSegmenter),
     getCanonicalLocales: nativeShape(function getCanonicalLocales(locales) {
       return supportedLocales(locales);
     }),
@@ -4382,7 +4436,7 @@ async function captureReference(options) {
          honoured exactly as the engine honours them. */
       isMobile: true, hasTouch: true,
       locale: "en-US", timezoneId: "UTC", colorScheme: "light",
-      serviceWorkers: "block", javaScriptEnabled: true,
+      serviceWorkers: "block", javaScriptEnabled: !options.scriptFreeDiagnostic,
     }));
   if (!context.clock || typeof context.clock.install !== "function"
       || typeof context.clock.pauseAt !== "function") {
@@ -5050,6 +5104,7 @@ async function captureReference(options) {
         && captureUrlSameOrigin);
   const navigationReady = navigationStatus === scenario.expectedHttp;
   const eligibilityReasons = [
+    ...(options.scriptFreeDiagnostic ? ["reference-script-free-diagnostic"] : []),
     ...(failure ? [failure] : []),
     ...(cleanLedger ? [] : ["reference-replay-ledger-unhealthy"]),
     ...(environmentReady ? [] : ["reference-replay-environment-missing"]),

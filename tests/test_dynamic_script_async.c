@@ -63,6 +63,7 @@ typedef struct {
     bool transport_failure;
     bool module;
     bool validate_request_context;
+    bool document;
 } ScriptReplayRecord;
 
 static uint64_t replay_body_hash(const char *data, size_t length)
@@ -192,8 +193,23 @@ static bool write_replay_fixture(
         }
         FILE *meta = fopen(meta_path, "wb");
         if (meta == NULL) { ok = false; break; }
-        bool written = write_module_replay_metadata(
-            meta, &records[i], length);
+        bool written = records[i].document
+            ? fprintf(meta,
+                "psp-http-trace=3\nmethod=GET\nurl=%s\nsuccess=1\n"
+                "async-delay-pumps=0\nexternal-cancel=0\ntransport-timeout=0\n"
+                "error=\nrequest-body-length=0\n"
+                "request-body-hash=cbf29ce484222325\n"
+                "request-cookie-bytes=0\nrequest-has-cf-clearance=0\n"
+                "request-extra-header-bytes=0\nrequest-send-client-hints=0\n"
+                "request-send-low-client-hints=1\nrequest-sec-fetch-user=1\n"
+                "request-upgrade-insecure=1\nstatus=200\nlength=%zu\n"
+                "effective-url=%s\ncontent-type=text/html; charset=utf-8\n"
+                "etag=\nlast-modified=\ncf-mitigated=\naccept-ch=\n"
+                "critical-ch=\nserver=fixture\ncf-ray=\n"
+                "response-header-count=1\nset-cookie-count=0\n"
+                "response-header-0=content-type: text/html; charset=utf-8\n",
+                records[i].url, length, records[i].url) > 0
+            : write_module_replay_metadata(meta, &records[i], length);
         ok = written && fclose(meta) == 0;
     }
     char clock_path[192];
@@ -332,15 +348,17 @@ static bool advance_until(NavigationSession *navigation, const char *summary,
     return false;
 }
 
-static bool put_script(BrowserSession *browser, const char *url,
-                       const char *source)
+static bool put_script_for_document(BrowserSession *browser, const char *url,
+                       const char *source, const char *initiator_url)
 {
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     char document_url[TILEFINCH_ORIGIN_SERIALIZED_LIMIT + 2u];
     size_t source_length = source == NULL ? 0 : strlen(source);
     if (browser == NULL || source_length == 0
         || !tilefinch_url_origin(url, origin, sizeof(origin))) return false;
-    int written = snprintf(document_url, sizeof(document_url), "%s/", origin);
+    int written = initiator_url == NULL
+        ? snprintf(document_url, sizeof(document_url), "%s/", origin)
+        : snprintf(document_url, sizeof(document_url), "%s", initiator_url);
     if (written <= 0 || (size_t) written >= sizeof(document_url)) return false;
     unsigned char *copy = budget_malloc(
         browser->budget, source_length + 1u);
@@ -364,13 +382,19 @@ static bool put_script(BrowserSession *browser, const char *url,
         .destination = TILEFINCH_DESTINATION_SCRIPT,
         .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
-        .final_same_origin = true
+        .final_same_origin = tilefinch_url_same_origin(document_url, url)
     };
     bool stored = browser_session_cache_put_http_shared_classic_script(
         browser, url, body, NULL, NULL, "text/javascript",
         "immutable", NULL, 0, &context, &grant);
     browser_shared_body_release(body);
     return stored;
+}
+
+static bool put_script(BrowserSession *browser, const char *url,
+                       const char *source)
+{
+    return put_script_for_document(browser, url, source, NULL);
 }
 
 static bool put_module_policy(BrowserSession *browser, const char *url,

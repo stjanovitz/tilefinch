@@ -236,6 +236,8 @@ bool style_math_resolve_number_thousandths_in(
         || length >= STYLE_MATH_SOURCE_CAPACITY) return false;
     StyleMathParser parser = {
         .sheet = sheet, .text = text, .length = length,
+        .viewport_width = sheet != NULL ? sheet->viewport_width : 0,
+        .viewport_height = sheet != NULL ? sheet->viewport_height : 0,
         .em_basis = STYLE_DEFAULT_FONT_PX,
         .rem_basis = STYLE_DEFAULT_FONT_PX,
         .ch_basis = STYLE_DEFAULT_FONT_PX / 2
@@ -477,7 +479,7 @@ static int style_math_parse_primary(StyleMathParser *parser)
         pixels *= 96.0 / 25.4;
     } else if (style_math_identifier_equal(unit, unit_length, "q")) {
         pixels *= 96.0 / 101.6;
-    } else if (parser->sheet != NULL
+    } else if (parser->viewport_width > 0 && parser->viewport_height > 0
                && (style_math_identifier_equal(unit, unit_length, "vw")
                    || style_math_identifier_equal(unit, unit_length, "dvw")
                    || style_math_identifier_equal(unit, unit_length, "svw")
@@ -486,8 +488,8 @@ static int style_math_parse_primary(StyleMathParser *parser)
                    || style_math_identifier_equal(unit, unit_length, "dvi")
                    || style_math_identifier_equal(unit, unit_length, "svi")
                    || style_math_identifier_equal(unit, unit_length, "lvi"))) {
-        pixels *= parser->sheet->viewport_width / 100.0;
-    } else if (parser->sheet != NULL
+        pixels *= parser->viewport_width / 100.0;
+    } else if (parser->viewport_width > 0 && parser->viewport_height > 0
                && (style_math_identifier_equal(unit, unit_length, "vh")
                    || style_math_identifier_equal(unit, unit_length, "vb")
                    || style_math_identifier_equal(unit, unit_length, "dvh")
@@ -496,8 +498,8 @@ static int style_math_parse_primary(StyleMathParser *parser)
                    || style_math_identifier_equal(unit, unit_length, "svb")
                    || style_math_identifier_equal(unit, unit_length, "lvh")
                    || style_math_identifier_equal(unit, unit_length, "lvb"))) {
-        pixels *= parser->sheet->viewport_height / 100.0;
-    } else if (parser->sheet != NULL
+        pixels *= parser->viewport_height / 100.0;
+    } else if (parser->viewport_width > 0 && parser->viewport_height > 0
                && (style_math_identifier_equal(unit, unit_length, "vmin")
                    || style_math_identifier_equal(unit, unit_length, "vmax")
                    || style_math_identifier_equal(unit, unit_length, "dvmin")
@@ -507,16 +509,16 @@ static int style_math_parse_primary(StyleMathParser *parser)
                    || style_math_identifier_equal(unit, unit_length, "lvmin")
                    || style_math_identifier_equal(unit, unit_length,
                                                   "lvmax"))) {
-        int basis = parser->sheet->viewport_width;
+        int basis = parser->viewport_width;
         bool minimum = style_math_identifier_equal(unit, unit_length, "vmin")
             || style_math_identifier_equal(unit, unit_length, "dvmin")
             || style_math_identifier_equal(unit, unit_length, "svmin")
             || style_math_identifier_equal(unit, unit_length, "lvmin");
         if (minimum) {
-            if (parser->sheet->viewport_height < basis)
-                basis = parser->sheet->viewport_height;
-        } else if (parser->sheet->viewport_height > basis) {
-            basis = parser->sheet->viewport_height;
+            if (parser->viewport_height < basis)
+                basis = parser->viewport_height;
+        } else if (parser->viewport_height > basis) {
+            basis = parser->viewport_height;
         }
         pixels *= basis / 100.0;
     } else if (parser->sheet != NULL
@@ -670,17 +672,19 @@ static bool style_math_emit_node(const StyleMathParser *parser, int index,
     return true;
 }
 
-bool style_math_candidate(const Stylesheet *sheet, const char *text,
+static bool style_math_candidate_context(const Stylesheet *sheet, const char *text,
                                  size_t length, StyleMathParser *parser,
                                  StyleMathCandidate *candidate,
                                  int *root_output, int em_basis,
-                                 int rem_basis, int ch_basis)
+                                 int rem_basis, int ch_basis,
+                                 int viewport_width, int viewport_height)
 {
     if (parser == NULL || candidate == NULL || root_output == NULL
         || text == NULL || length == 0
         || length >= STYLE_MATH_SOURCE_CAPACITY) return false;
     *parser = (StyleMathParser) {
         .sheet = sheet, .text = text, .length = length,
+        .viewport_width = viewport_width, .viewport_height = viewport_height,
         .em_basis = em_basis > 0 ? em_basis : 16,
         .rem_basis = rem_basis > 0 ? rem_basis : 16,
         .ch_basis = ch_basis > 0 ? ch_basis
@@ -718,6 +722,35 @@ bool style_math_candidate(const Stylesheet *sheet, const char *text,
     if (depth != 1 || maximum_depth == 0) return false;
     candidate->stack_depth = (uint8_t) maximum_depth;
     *root_output = root;
+    return true;
+}
+
+bool style_math_candidate(const Stylesheet *sheet, const char *text,
+                          size_t length, StyleMathParser *parser,
+                          StyleMathCandidate *candidate, int *root_output,
+                          int em_basis, int rem_basis, int ch_basis)
+{
+    return style_math_candidate_context(sheet, text, length, parser, candidate,
+        root_output, em_basis, rem_basis, ch_basis,
+        sheet != NULL ? sheet->viewport_width : 0,
+        sheet != NULL ? sheet->viewport_height : 0);
+}
+
+/* Allocation-free initial-value context for media queries. Passing only the
+   viewport avoids a full throwaway sheet and excludes cascade variables,
+   container state and pending font-resolution writes. Q8 retains fractional
+   thresholds instead of rounding a half-pixel boundary to an integer. */
+bool style_math_resolve_media_length(const char *text, size_t length,
+                                      int width, int height, int32_t *pixels_q8)
+{
+    StyleMathParser parser;
+    StyleMathCandidate candidate;
+    int root = -1;
+    if (pixels_q8 == NULL || !style_math_candidate_context(NULL, text, length,
+            &parser, &candidate, &root, STYLE_DEFAULT_FONT_PX,
+            STYLE_DEFAULT_FONT_PX, STYLE_DEFAULT_FONT_PX / 2, width, height)
+        || candidate.has_percent || !parser.nodes[root].folded) return false;
+    *pixels_q8 = (int32_t) parser.nodes[root].a;
     return true;
 }
 

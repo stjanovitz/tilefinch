@@ -1,5 +1,10 @@
 # Reader mode
 
+Reader's extracted presentation neutralizes author sizing, text metrics and
+generated decorations, while preserving semantic headings, inline emphasis,
+code, links and image sizing hints. This prevents application styles from
+introducing oversized gaps or overlapping labels into the reading surface.
+
 Reader mode is a bounded native presentation of an ordinary HTTP(S) page. It
 keeps the parsed author document, its resources, and its history entry, adds
 one extracted semantic tree beside them, and styles that tree with user-origin
@@ -27,6 +32,14 @@ as one of four forms:
   `watch`, for stylesheet and telemetry compatibility.
 - **Raw:** no safe semantic shape was found. Reader mode is unavailable and
   the author presentation remains unchanged.
+
+A substantial authored article takes precedence over a containing page
+wrapper whose extra prose comes from recommendations. Within that article,
+Reader puts its heading, author link and opening prose before lead media,
+retaining each source node once and preserving the rest of the article in
+source order. Content beyond an extraction bound is never presented as
+complete: manual views show the shortening notice, while automatic admission
+still requires a complete extraction.
 
 The pass keeps a scratch record for at most 8,192 elements, visits at most
 65,536 nodes (text nodes need no record, and an encyclopedia article has

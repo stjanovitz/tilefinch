@@ -7,6 +7,7 @@
 
 #include "tilefinch/platform.h"
 #include "tilefinch/media_discovery.h"
+#include "tilefinch/resources.h"
 
 #include <lexbor/dom/interfaces/element.h>
 
@@ -134,6 +135,9 @@ typedef struct {
     bool tail_mode;
     bool basic_mode;
     bool bounded_out;
+    lxb_dom_node_t *promoted[3];
+    lxb_dom_node_t *reading_parts[3];
+    lxb_dom_node_t *reading_root;
 } ReaderExtractBuffer;
 
 typedef struct {
@@ -1328,13 +1332,67 @@ static bool reader_prune_when_empty(const char *tag)
     return false;
 }
 
+/* Only positive layout evidence removes table structure. Header/caption
+   tables remain tables, including unlabeled plain numeric data. */
+static bool reader_layout_table(lxb_dom_node_t *table, bool *cancelled)
+{
+    if (reader_attribute_equals_ci_trimmed(table, "role", "presentation")
+        || reader_attribute_equals_ci_trimmed(table, "role", "none"))
+        return true;
+    bool layout_content = false;
+    size_t visited = 0, links = 0, empty_cells = 0, rows = 0, images = 0;
+    for (lxb_dom_node_t *node = table->first_child; node != NULL;) {
+        if (++visited > READER_NODE_LIMIT) return false;
+        if (visited % READER_NODE_WORK_SLICE == 0u
+            && !tilefinch_platform_cooperate("reader-table", visited)) {
+            *cancelled = true;
+            return false;
+        }
+        if (reader_name_is(node, "th") || reader_name_is(node, "caption")
+            || reader_has_attribute(node, "headers")
+            || reader_has_attribute(node, "scope")) return false;
+        if (reader_name_is(node, "table") || reader_name_is(node, "h1")
+            || reader_name_is(node, "h2") || reader_name_is(node, "p")
+            || reader_name_is(node, "form") || reader_name_is(node, "nav"))
+            layout_content = true;
+        if (reader_name_is(node, "a")) links++;
+        if (reader_name_is(node, "tr")) rows++;
+        if (reader_name_is(node, "img")) images++;
+        if (reader_name_is(node, "td") && node->first_child == NULL) empty_cells++;
+        /* A nested table is itself layout evidence, not an invitation to
+           classify its data cells as part of the outer table. */
+        if (!reader_name_is(node, "table") && node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != table && node->next == NULL) node = node->parent;
+        if (node == table) break;
+        node = node->next;
+    }
+    return layout_content || (links >= 8u && empty_cells >= 3u)
+        || (rows <= 2u && links >= 4u && images != 0u);
+}
+
+static bool reader_previous_ends_link(lxb_dom_node_t *node)
+{
+    lxb_dom_node_t *previous = node->prev;
+    for (size_t depth = 0; previous != NULL && depth < 64u; depth++) {
+        if (reader_name_is(previous, "a")) return true;
+        previous = previous->last_child;
+    }
+    return false;
+}
+
 static bool reader_extract_node(ReaderExtractBuffer *output,
                                 lxb_dom_node_t *node, size_t depth,
                                 bool in_admitted_form,
+                                bool in_layout_table,
                                 bool *meaningful_content)
 {
     if (meaningful_content != NULL) *meaningful_content = false;
     if (output == NULL || node == NULL) return false;
+    for (size_t i = 0; i < sizeof(output->promoted) / sizeof(output->promoted[0]); i++)
+        if (node == output->promoted[i]) return true;
     if (output->truncated) return true;
     if (depth > READER_EXTRACT_DEPTH_LIMIT
         || output->visited_nodes++ >= (output->basic_mode
@@ -1411,6 +1469,10 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         || (output->basic_mode && admitted_form
             && reader_basic_form_control(node, &control_state_bounded));
     if (control_state_bounded) output->bounded_out = true;
+    /* An unretained chooser is not prose. Flattening its option labels can
+       put hundreds of hidden choices ahead of the page's actual content.
+       Keep ordinary button text, but omit unusable select subtrees whole. */
+    if (reader_name_is(node, "select") && !basic_control_safe) return true;
     bool counted_control = basic_control_safe && output->basic_mode
         && admitted_form
         && (reader_name_is(node, "input")
@@ -1430,29 +1492,34 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         ? reader_extract_tag(
               node, output->basic_mode, admitted_form, basic_control_safe)
         : NULL;
+    if (output->basic_mode && reader_name_is(node, "table")) {
+        bool cancelled = false;
+        in_layout_table = reader_layout_table(node, &cancelled);
+        if (cancelled) {
+            output->bounded_out = true;
+            return false;
+        }
+    }
+    bool layout_cell = in_layout_table
+        && (reader_name_is(node, "th") || reader_name_is(node, "td"));
+    if (in_layout_table) {
+        if (reader_name_is(node, "table") || reader_name_is(node, "tr")) tag = "div";
+        else if (layout_cell || reader_name_is(node, "thead")
+            || reader_name_is(node, "tbody") || reader_name_is(node, "tfoot"))
+            tag = NULL;
+    }
+    bool folded_navigation = output->basic_mode && !in_admitted_form
+        && (reader_name_is(node, "nav")
+            || reader_attribute_equals_ci_trimmed(node, "role", "navigation"));
+    if (folded_navigation) tag = "nav";
     const char *image_source = NULL;
     size_t image_source_length = 0;
     if (tag != NULL && strcmp(tag, "img") == 0) {
-        image_source = document_attribute(
-            node, "src", &image_source_length);
-        if (image_source == NULL || image_source_length == 0
-            || reader_slice_contains_ci(
-                   image_source, image_source_length, "data:image")) {
-            static const char *const lazy[] = {
-                "data-src", "data-original", "data-thumb", "data-lazy-src"
-            };
-            image_source = NULL;
-            image_source_length = 0;
-            for (size_t i = 0; i < sizeof(lazy) / sizeof(lazy[0]); i++) {
-                image_source = document_attribute(
-                    node, lazy[i], &image_source_length);
-                if (image_source != NULL && image_source_length != 0) break;
-            }
-        }
+        image_source = image_select_source(NULL, node, &image_source_length);
         /* A placeholder without a usable source paints its alt text into a
            zero-height replaced box in the bounded renderer. The caption and
            surrounding prose remain; omit the broken visual entirely. */
-        if (image_source == NULL || image_source_length == 0) tag = NULL;
+        if (image_source_is_placeholder(image_source, image_source_length)) tag = NULL;
     }
     bool emitted = tag != NULL;
     size_t flattened_id_length = 0;
@@ -1465,8 +1532,9 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         && flattened_id_length > READER_ANCHOR_VALUE_LIMIT)
         output->bounded_out = true;
     bool separated_wrapper = !emitted && reader_flattened_block_wrapper(node);
-    if ((emitted || marker_emitted)
-        && output->nodes >= output->node_limit) {
+    size_t node_cost = (emitted || marker_emitted ? 1u : 0u)
+        + (folded_navigation ? 2u : 0u);
+    if (node_cost > output->node_limit - output->nodes) {
         /* Preserve a balanced semantic prefix and tell the reader that the
            suffix was intentionally omitted under the device bound. Unknown
            wrapper elements do not consume this scarce emitted-node quota
@@ -1477,8 +1545,28 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     size_t checkpoint = output->length;
     size_t nodes_checkpoint = output->nodes;
     uint16_t anchors_checkpoint = output->mapped_anchors;
+    /* Independent adjacent links must remain separate after their layout
+       wrappers disappear. Do not insert spaces between ordinary inline
+       spans: authors also use those to split a single word. */
+    if (emitted && strcmp(tag, "a") == 0 && reader_previous_ends_link(node)
+        && !reader_extract_separator(output)) goto append_failed;
     if (separated_wrapper && !reader_extract_separator(output))
         goto append_failed;
+    if (layout_cell && !reader_extract_separator(output)) goto append_failed;
+    if (folded_navigation) {
+        size_t label_length = 0;
+        const char *label = document_attribute(node, "aria-label", &label_length);
+        if (!reader_extract_literal(output, "<details><summary>"))
+            goto append_failed;
+        if (label != NULL && label_length != 0u
+            && label_length <= READER_LABEL_LIMIT) {
+            if (!reader_extract_escaped(output, label, label_length, false, NULL))
+                goto append_failed;
+        } else if (!reader_extract_literal(output, "Navigation"))
+            goto append_failed;
+        if (!reader_extract_literal(output, "</summary>")) goto append_failed;
+        output->nodes += 2u;
+    }
     if (marker_emitted) {
         /* Unknown wrappers are flattened, but their fragment position is
            still observable. Keep a deliberately empty neutral marker at the
@@ -1655,11 +1743,31 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
                     live_control_value, live_control_value_length));
         }
     } else {
+        if (node == output->reading_root) {
+            output->reading_root = NULL;
+            for (size_t i = 0; i < 3u; i++) {
+                lxb_dom_node_t *part = output->reading_parts[i];
+                if (part == NULL) continue;
+                bool already_emitted = false;
+                for (lxb_dom_node_t *at = part; at != NULL; at = at->parent) {
+                    for (size_t j = 0; j < i; j++)
+                        already_emitted = already_emitted || at == output->promoted[j];
+                    if (at == node) break;
+                }
+                if (already_emitted) continue;
+                bool part_meaningful = false;
+                if (!reader_extract_node(output, part, depth + 1u, false,
+                        false, &part_meaningful)) return false;
+                output->promoted[i] = part;
+                meaningful = meaningful || part_meaningful;
+            }
+        }
         for (lxb_dom_node_t *child = node->first_child;
              child != NULL && !output->truncated; child = child->next) {
             bool child_meaningful = false;
             if (!reader_extract_node(
                     output, child, depth + 1u, child_in_admitted_form,
+                    in_layout_table,
                     &child_meaningful)) return false;
             meaningful = meaningful || child_meaningful;
         }
@@ -1688,8 +1796,16 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         }
         output->tail_mode = previous_tail_mode;
     }
+    if (folded_navigation) {
+        bool previous_tail_mode = output->tail_mode;
+        if (output->truncated) output->tail_mode = true;
+        bool closed = reader_extract_literal(output, "</details>");
+        output->tail_mode = previous_tail_mode;
+        if (!closed) return false;
+    }
     if (!output->truncated && emitted && !meaningful
-        && !retained_anchor_identity && reader_prune_when_empty(tag)) {
+        && !retained_anchor_identity
+        && (folded_navigation || reader_prune_when_empty(tag))) {
         reader_extract_rewind(output, checkpoint);
         output->nodes = nodes_checkpoint;
         output->mapped_anchors = anchors_checkpoint;
@@ -2185,6 +2301,8 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
 {
     uint16_t winner = READER_INVALID_INDEX;
     uint32_t best_score = 0;
+    uint16_t semantic_winner = READER_INVALID_INDEX;
+    uint32_t semantic_score = 0;
     for (size_t i = 0; i < count; i++) {
         const ReaderNodeStat *stat = &stats[i];
         if ((stat->flags & READER_STAT_EXCLUDED) != 0
@@ -2204,11 +2322,23 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
            page as a high-confidence article. */
         if (reader_name_is(stat->node, "article"))
             score = reader_add_u32(score, 160u);
+        if (reader_name_is(stat->node, "article")
+            && content_bytes >= 600u && stat->paragraphs >= 3u
+            && score > semantic_score) {
+            semantic_score = score;
+            semantic_winner = (uint16_t) i;
+        }
         if (score > best_score) {
             best_score = score;
             winner = (uint16_t) i;
         }
     }
+    /* A containing main/div gains every recommendation paragraph. Its
+       larger aggregate must not displace a substantial authored article. */
+    if (semantic_winner != READER_INVALID_INDEX
+        && winner != READER_INVALID_INDEX
+        && reader_descends_from(stats, semantic_winner, winner))
+        winner = semantic_winner;
     if (winner == READER_INVALID_INDEX) return true;
     const ReaderNodeStat *selected = &stats[winner];
     uint32_t visible = analysis->visible_text_bytes;
@@ -2367,8 +2497,50 @@ static bool reader_install_extracted_tree(
         okay = reader_extract_declared_video(&output, declared_video);
     bool article_meaningful = false;
     if (okay && article_root < count) {
-        okay = reader_extract_node(
+        if (kind == READER_PAGE_ARTICLE) {
+            lxb_dom_node_t *parts[3] = {0};
+            size_t end = reader_subtree_end(stats, count, article_root);
+            for (size_t i = article_root; i < end; i++) {
+                if ((stats[i].flags & READER_STAT_EXCLUDED) != 0) continue;
+                if (parts[0] == NULL && reader_name_is(stats[i].node, "h1")) {
+                    parts[0] = stats[i].node;
+                    for (uint16_t at = stats[i].parent;
+                         at != READER_INVALID_INDEX && at != article_root;
+                         at = stats[at].parent) {
+                        if (reader_name_is(stats[at].node, "header")) {
+                            parts[0] = stats[at].node;
+                            break;
+                        }
+                    }
+                }
+                if (parts[1] == NULL && reader_name_is(stats[i].node, "a")) {
+                    static const char *const author[] = {"author"};
+                    if (reader_attribute_has_any_token(stats[i].node, "rel", author, 1u))
+                        parts[1] = stats[i].node;
+                }
+                if (parts[2] == NULL && reader_name_is(stats[i].node, "p")
+                    && reader_own_content(&stats[i]) >= 120u) {
+                    bool caption = false;
+                    for (uint16_t at = stats[i].parent;
+                         at != READER_INVALID_INDEX && at != article_root;
+                         at = stats[at].parent)
+                        caption = caption || reader_name_is(stats[at].node, "figure")
+                            || reader_name_is(stats[at].node, "figcaption")
+                            || reader_name_is(stats[at].node, "li");
+                    if (!caption) parts[2] = stats[i].node;
+                }
+            }
+            /* Put the reading identity and opening prose before lead media
+               whose authored grid order often comes first in the DOM. Each
+               source node is emitted exactly once; no text is synthesized. */
+            if (parts[0] != NULL) {
+                memcpy(output.reading_parts, parts, sizeof(parts));
+                output.reading_root = stats[article_root].node;
+            }
+        }
+        if (okay) okay = reader_extract_node(
             &output, stats[article_root].node, 0u, false,
+            false,
             &article_meaningful);
     }
     bool listing_meaningful = false;
@@ -2378,6 +2550,7 @@ static bool reader_install_extracted_tree(
         if (okay) {
             okay = reader_extract_node(
                 &output, stats[listing_root].node, 0u, false,
+                false,
                 &listing_meaningful);
         }
     }
@@ -2959,7 +3132,7 @@ static bool reader_document_prepare_basic_internal(
          okay && child != NULL && !output.truncated; child = child->next) {
         bool child_meaningful = false;
         okay = reader_extract_node(
-            &output, child, 0u, false, &child_meaningful);
+            &output, child, 0u, false, false, &child_meaningful);
         meaningful = meaningful || child_meaningful;
     }
     /* Complete admission refuses any omitted action (form, control,

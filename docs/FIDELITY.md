@@ -12,6 +12,57 @@ redistributing site captures.
 
 ## What is measured
 
+Ordinary component selectors are admitted up to 1023 bytes, retaining only
+their actual text in the stylesheet arena. Rewrite/nesting scratch remains
+bounded to 256 bytes; neither ordinary nor sparse rule records grow. Reduced
+229- and 521-byte selectors check functional alternatives, specificity,
+ancestor/child combinators, variable-backed badge colors and full-bleed sizing.
+The former 191/255-byte admission ceilings dropped these valid rules. Packed
+compound offsets reserve ten bits independently of the six container-query
+bits; indexed and fallback matching must agree.
+
+Definite single-line flex rows establish stretched cross sizes before laying
+out percentage-height descendants. Reduced tests include nested links,
+padding/borders/margins and non-stretched centered items.
+
+The Chrome replay's bounded Intl facade includes the engine's limited
+`Segmenter` behavior, checked against the bootstrap implementation. It must
+neither substitute native ICU segmentation nor stop otherwise compatible
+page initialization by omitting that constructor.
+
+Explicit `box-sizing: inherit` follows the originating element's parent,
+including generated boxes and variable-backed declarations. Universal
+border-box resets therefore retain the available width through nested padded
+containers. Reduced tests cover content-box overrides, initial/unset values
+and declaration order; invalid keywords do not erase an earlier valid value.
+
+Generated text decorations honor their used line height and horizontal
+alignment. Solid, square generated decorations also retain bounded horizontal
+`skew()` / `skewX()` painting without an offscreen surface. This is not general
+affine-transform support: text, image, rounded, gradient and blurred spans
+still decline that specialized path. Pixel tests cover both shear directions,
+`transform:none` overrides and all-or-nothing span refusal.
+
+Large sampled external stylesheets can be re-sampled transactionally when
+script-inserted subtrees introduce new selector tokens. The document census
+is capped at 16,384 nodes; eight optional hydration repairs are allowed per
+page. A refused replacement keeps the published styles and layout intact.
+These bounds do not change the fidelity floors.
+
+Generated inline text ignores non-applicable width declarations, while
+inline-block decorations reserve their full advance and align to the line
+baseline. Single-line nested flex rows also re-align their children after
+cross-axis stretching. External CSS animation metadata is retained within
+64 KiB, 128 rules and 16 keyframes, including parsed-stylesheet cache reuse;
+its source is available only to trusted animation initialization, not page
+scripts. Optional metadata refusal does not fail ordinary styling.
+
+The host trace recorder accepts an optional canonical HTTPS `--origin` for
+anonymous cross-origin requests. Capture the actual Origin-sensitive response
+instead of fabricating CORS metadata or disabling enforcement. A diagnostic
+response replacement is not a qualified reference: ledger closure remains
+required for scoreboard admission.
+
 The always-available [search form pixel regression](../tests/visual/search-form/README.md)
 also covers the reduced script-free search form, middle/lower results,
 pagination and a bottom-to-top scroll revisit. It uses
@@ -54,6 +105,14 @@ Fidelity scenarios run the general engine:
 The native HOME and YouTube provider are not scored against website Chrome
 pages because they are intentional product surfaces, not alternative renders
 of the same document.
+
+For external SVG images, an intrinsic canvas larger than the decoded-image
+quota can use a bounded initial raster while retaining its intrinsic dimensions
+and markup. This fallback applies only to otherwise-refused ordinary images;
+successful decodes, masks, backgrounds and referenced SVG sprites keep their
+existing path. Subsequent display retargeting rasterizes the retained markup
+at the painted size. Reduced tests pin exact pixels, refusal cleanup and the
+unchanged successful-decode path.
 
 ## Local corpus layout
 

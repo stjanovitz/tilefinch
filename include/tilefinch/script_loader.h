@@ -57,7 +57,7 @@ typedef struct {
     size_t inline_data_fast_paths;
     size_t inline_data_fast_path_bytes;
     size_t inline_data_quota_exemptions;
-    size_t cost_class_rejections;
+    size_t cost_class_rejections; /* legacy telemetry; no size-only refusal */
     size_t watchdog_classification_misses;
     size_t watchdog_classification_miss_bytes;
     size_t watchdog_classification_miss_loops;
@@ -77,12 +77,10 @@ typedef struct {
     unsigned flags;
 } ScriptStaticCostProfile;
 
-/* Allocation-free lexical telemetry used by the bounded admission policy.
+/* Allocation-free lexical telemetry for watchdog diagnostics.
    This is a content-shape scan, not a JavaScript parser. */
 void script_static_cost_profile(
     const char *source, size_t length, ScriptStaticCostProfile *profile);
-bool script_static_cost_rejects(
-    const ScriptStaticCostProfile *profile, bool third_party, bool module);
 
 typedef struct {
     long parser_executed[256];

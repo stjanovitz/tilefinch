@@ -113,7 +113,8 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                                          scale_q6);
         command->width = scale_dimension(command->width, scale_q6);
         command->height = scale_dimension(command->height, scale_q6);
-        if (command->type != DRAW_TEXT && command->type != DRAW_IMAGE) {
+        if (command->type != DRAW_TEXT && command->type != DRAW_IMAGE
+            && command->type != DRAW_SHEARED_FILL) {
             command->radius = layout_scale_radius_code(
                 command->radius, scale_q6, 64);
         }
@@ -144,6 +145,12 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                     command, scale_around_center(
                         underline_offset, 0, scale_q6));
             }
+        }
+        if (command->type == DRAW_SHEARED_FILL) {
+            command->text_length = (uint32_t) scale_dimension(
+                (int) command->text_length, scale_q6);
+            command->font_size = scale_dimension(command->font_size, scale_q6);
+            command->radius = scale_dimension(command->radius, scale_q6);
         }
         if (command->type == DRAW_TEXT
             || command->type == DRAW_STROKE_RECT
@@ -1110,6 +1117,9 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
     if (context_map != NULL) {
         size_t mask = context_map_capacity - 1u;
         for (size_t i = 0; i < context_count; i++) {
+            /* Generated boxes use their originating element for ancestry,
+               but are not that element's DOM stacking-context identity. */
+            if (context->stacking_contexts[i].generated_pseudo) continue;
             const lxb_dom_node_t *node = context->stacking_contexts[i].node;
             size_t slot = layout_pointer_hash(node) & mask;
             while (context_map[slot].node != NULL) {
@@ -1182,7 +1192,8 @@ bool build_paint_order(LayoutDocument *layout, LayoutContext *context)
                 layout->count + stack[context_stack_count - 1u]);
         if (parent == root) {
             const lxb_dom_node_t *ancestor = range->node == NULL
-                ? NULL : range->node->parent;
+                ? NULL : (range->generated_pseudo
+                          ? range->node : range->node->parent);
             while (ancestor != NULL) {
                 size_t slot = layout_pointer_hash(ancestor)
                               & (context_map_capacity - 1u);
@@ -1357,7 +1368,8 @@ bool build_spatial_index(LayoutDocument *layout,
         bool dynamic = box->clips_y && box->content_height > box->height;
         uint8_t flags = LAYOUT_COMMAND_OVERFLOW
                         | (dynamic ? LAYOUT_COMMAND_DYNAMIC_OVERFLOW : 0)
-                        | (box->clips_x ? LAYOUT_COMMAND_CLIPPED_X : 0);
+                        | (box->clips_x ? LAYOUT_COMMAND_CLIPPED_X : 0)
+                        | (box->clips_y ? LAYOUT_COMMAND_CLIPPED_Y : 0);
         size_t end = box->scroll_command_end;
         if (end > layout->count) end = layout->count;
         for (size_t i = box->scroll_command_start; i < end; i++) {
@@ -1706,16 +1718,22 @@ static size_t scroll_clip_slot(const lxb_dom_node_t *node, size_t capacity)
     return (size_t) (value & (capacity - 1u));
 }
 
-int root_scroll_width_after_clipping(LayoutDocument *layout,
-                                            int viewport_width)
+static int root_scroll_extent_after_clipping(LayoutDocument *layout,
+                                            int minimum, bool vertical)
 {
-    int maximum = viewport_width;
-    bool trace = LAYOUT_TRACE(layout, SCROLL_WIDTH);
+    int maximum = minimum;
+    bool trace = !vertical && LAYOUT_TRACE(layout, SCROLL_WIDTH);
     size_t trace_lines = 0;
     size_t clip_count = 0;
     for (size_t i = 0; i < layout->node_box_count; i++) {
-        if (layout->node_boxes[i].clips_x) clip_count++;
+        if (vertical ? layout->node_boxes[i].clips_y
+                     : layout->node_boxes[i].clips_x) clip_count++;
     }
+    /* Ordinary layouts already have the correct flow/overflow height. Only
+       clipping can make that preliminary maximum include hidden descendants. */
+    if (vertical && clip_count == 0) return layout->height;
+    LayoutPositionedClipIndex positioned;
+    if (vertical) layout_positioned_clip_index_prepare(layout, &positioned);
     /* A candidate is clipped when any other clipping box's node is on its
        ancestor chain (its own node included, for a second box of the same
        node). Testing every candidate against every clipping box walked the
@@ -1737,7 +1755,7 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
         if (clip_set != NULL) {
             for (size_t i = 0; i < layout->node_box_count; i++) {
                 const LayoutNodeBox *box = &layout->node_boxes[i];
-                if (!box->clips_x) continue;
+                if (!(vertical ? box->clips_y : box->clips_x)) continue;
                 size_t slot = scroll_clip_slot(box->node, clip_capacity);
                 while (clip_set[slot].node != NULL
                        && clip_set[slot].node != box->node) {
@@ -1754,6 +1772,9 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
     }
     for (size_t i = 0; i < layout->node_box_count; i++) {
         const LayoutNodeBox *candidate = &layout->node_boxes[i];
+        if (vertical && candidate->command_start < layout->count
+            && (layout->command_flags[candidate->command_start]
+                & LAYOUT_COMMAND_FIXED) != 0) continue;
         bool clipped = false;
         if (clip_set != NULL) {
             for (const lxb_dom_node_t *at = candidate->node;
@@ -1761,8 +1782,12 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
                 size_t slot = scroll_clip_slot(at, clip_capacity);
                 while (clip_set[slot].node != NULL) {
                     if (clip_set[slot].node == at) {
-                        clipped = clip_set[slot].shared
-                                  || clip_set[slot].box != candidate;
+                        clipped = (clip_set[slot].shared
+                                  || clip_set[slot].box != candidate)
+                            && (!vertical
+                                || !layout_positioned_command_escapes_clip_indexed(
+                                    layout, candidate->command_start,
+                                    clip_set[slot].box, &positioned));
                         break;
                     }
                     slot = (slot + 1u) & (clip_capacity - 1u);
@@ -1771,12 +1796,18 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
         } else {
             for (size_t j = 0; j < layout->node_box_count && !clipped; j++) {
                 const LayoutNodeBox *ancestor = &layout->node_boxes[j];
-                if (ancestor == candidate || !ancestor->clips_x) continue;
-                clipped = layout_node_within(candidate->node, ancestor->node);
+                if (ancestor == candidate
+                    || !(vertical ? ancestor->clips_y : ancestor->clips_x)) continue;
+                clipped = layout_node_within(candidate->node, ancestor->node)
+                    && (!vertical
+                        || !layout_positioned_command_escapes_clip_indexed(
+                            layout, candidate->command_start, ancestor, &positioned));
             }
         }
         if (clipped) continue;
-        int64_t right = (int64_t) candidate->x + candidate->width;
+        int64_t right = vertical
+            ? (int64_t) candidate->y + candidate->height
+            : (int64_t) candidate->x + candidate->width;
         if (right > maximum && right <= INT_MAX) {
             maximum = (int) right;
             if (trace && trace_lines++ < 64) {
@@ -1820,13 +1851,15 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
     budget_free(layout->budget, clip_set);
     for (size_t i = 0; i < layout->count; i++) {
         if ((layout->command_flags[i]
-             & (LAYOUT_COMMAND_CLIPPED_X | LAYOUT_COMMAND_FIXED)) != 0) {
+             & ((vertical ? LAYOUT_COMMAND_CLIPPED_Y : LAYOUT_COMMAND_CLIPPED_X)
+                | LAYOUT_COMMAND_FIXED)) != 0) {
             continue;
         }
         /* Box shadows are ink overflow, not scrollable overflow. */
         if (layout->commands[i].type == DRAW_SHADOW_RECT) continue;
-        int64_t right = (int64_t) layout->commands[i].x
-                        + layout->commands[i].width;
+        int64_t right = vertical
+            ? (int64_t) layout->commands[i].y + layout->commands[i].height
+            : (int64_t) layout->commands[i].x + layout->commands[i].width;
         if (right > maximum && right <= INT_MAX) {
             maximum = (int) right;
             if (trace && trace_lines++ < 64) {
@@ -1841,6 +1874,21 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
         }
     }
     return maximum;
+}
+
+int root_scroll_width_after_clipping(LayoutDocument *layout, int viewport_width)
+{
+    return root_scroll_extent_after_clipping(layout, viewport_width, false);
+}
+
+int root_scroll_height_after_clipping(LayoutDocument *layout, int minimum_height)
+{
+    /* Flow keeps its margins and border boxes. Only unclipped descendants
+       and commands may extend it: retained contents of a collapsed local
+       scroller are not document-space overflow. Reuse the positioned-clip
+       rules so an absolute descendant with an outside containing block
+       still contributes its genuine overflow. */
+    return root_scroll_extent_after_clipping(layout, minimum_height, true);
 }
 
 
@@ -1920,6 +1968,58 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
     }
 }
 
+/* Filled generated decorations retain a horizontal shear without a surface
+   allocation or a larger command. Reject the whole span before any write
+   if another primitive would require a general affine surface. */
+bool layout_skew_solid_command_span(LayoutDocument *layout, size_t start,
+                                     size_t end, int origin_y_twice,
+                                     int16_t shear_q10)
+{
+    if (layout == NULL || start > end || end > layout->count) return false;
+    if (shear_q10 == 0) return true;
+    for (size_t i = start; i < end; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_FILL_RECT || command->radius != 0
+            || command->font_size != 0
+            || draw_command_backdrop_blur(command) != 0) return false;
+        int64_t top = (int64_t) command->x * 1024
+            + ((int64_t) command->y * 2 - origin_y_twice) * shear_q10 / 2;
+        int64_t bottom = top + (int64_t) command->height * shear_q10;
+        int64_t left = top < bottom ? top : bottom;
+        int64_t right = (top > bottom ? top : bottom)
+            + (int64_t) command->width * 1024;
+        int64_t pixel_left = left >= 0 ? left / 1024
+            : -((-left + 1023) / 1024);
+        int64_t pixel_right = right >= 0 ? (right + 1023) / 1024
+            : -((-right) / 1024);
+        if (command->width < 0 || command->height < 0
+            || pixel_left < INT_MIN || pixel_right > INT_MAX
+            || pixel_right - pixel_left > INT_MAX
+            || top - pixel_left * 1024 > INT_MAX) return false;
+    }
+    for (size_t i = start; i < end; i++) {
+        DrawCommand *command = &layout->commands[i];
+        int64_t top = (int64_t) command->x * 1024
+            + ((int64_t) command->y * 2 - origin_y_twice) * shear_q10 / 2;
+        int64_t bottom = top + (int64_t) command->height * shear_q10;
+        int64_t left = top < bottom ? top : bottom;
+        int64_t right = (top > bottom ? top : bottom)
+            + (int64_t) command->width * 1024;
+        int64_t pixel_left = left >= 0 ? left / 1024
+            : -((-left + 1023) / 1024);
+        int64_t pixel_right = right >= 0 ? (right + 1023) / 1024
+            : -((-right) / 1024);
+        command->type = DRAW_SHEARED_FILL;
+        command->text_length = (uint32_t) command->width;
+        command->font_size = command->height;
+        command->scale = shear_q10;
+        command->radius = (int) (top - pixel_left * 1024);
+        command->x = (int) pixel_left;
+        command->width = (int) (pixel_right - pixel_left);
+    }
+    return true;
+}
+
 /* Generated pseudo boxes can be inserted into the middle of an already-built
    command list.  The ordinary subtree helpers intentionally run to the end of
    the document, so expose a bounded command-only span for those inserted
@@ -1944,10 +2044,10 @@ void layout_transform_command_span(
                            "pseudo-transform", NULL);
 }
 
-bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
-                        size_t command_start, size_t link_start,
+static bool apply_visual_span(LayoutContext *context, lxb_dom_node_t *node,
+                        size_t command_start, size_t command_end, size_t link_start,
                         size_t control_start, const ComputedStyle *style,
-                        bool flex_or_grid_item)
+                        bool flex_or_grid_item, bool generated_pseudo)
 {
     LayoutDocument *layout = context->layout;
     const StylePaintStack *paint = stylesheet_paint_stack(
@@ -1959,14 +2059,14 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
             || style->fixed_position || style->sticky_position
             || flex_or_grid_item);
     if (style->opacity < 255) {
-        for (size_t i = command_start; i < layout->count; i++) {
+        for (size_t i = command_start; i < command_end; i++) {
             unsigned combined = (unsigned) layout->commands[i].opacity_scale
                                 * style->opacity / 255u;
             layout->commands[i].opacity_scale = (uint16_t) combined;
         }
     }
     if (computed_style_filter_code(style) != STYLE_FILTER_NONE) {
-        for (size_t i = command_start; i < layout->count; i++) {
+        for (size_t i = command_start; i < command_end; i++) {
             draw_command_set_filter_code(
                 &layout->commands[i], computed_style_filter_code(style));
             if (paint != NULL
@@ -1977,12 +2077,12 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
         }
     }
     if (blend_mode != STYLE_MIX_BLEND_NORMAL) {
-        for (size_t i = command_start; i < layout->count; i++) {
+        for (size_t i = command_start; i < command_end; i++) {
             draw_command_set_blend_mode(&layout->commands[i], blend_mode);
         }
     }
     if (effective_z_index) {
-        for (size_t i = command_start; i < layout->count; i++) {
+        for (size_t i = command_start; i < command_end; i++) {
             layout->commands[i].z_index = style->z_index;
         }
         for (size_t i = link_start; i < layout->link_count; i++) {
@@ -1995,12 +2095,12 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
     if (style->out_of_flow || style->fixed_position
         || style->relative_position || style->sticky_position
         || effective_z_index) {
-        for (size_t i = command_start; i < layout->count; i++) {
+        for (size_t i = command_start; i < command_end; i++) {
             layout->commands[i].font_weight |=
                 LAYOUT_COMMAND_POSITIONED_PHASE;
         }
     }
-    bool root_context = layout_node_name_is(node, "body")
+    bool root_context = !generated_pseudo && layout_node_name_is(node, "body")
         && node->parent != NULL && layout_node_name_is(node->parent, "html");
     bool positioned_context = style->fixed_position
         || style->sticky_position
@@ -2010,17 +2110,19 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
     if (!root_context && !positioned_context
         && style->opacity == 255 && !style->has_transform
         && !style->has_filter) return true;
-    if (command_start > UINT32_MAX || layout->count > UINT32_MAX) return false;
-    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (command_start > UINT32_MAX || command_end > UINT32_MAX) return false;
+    const LayoutNodeBox *box = generated_pseudo
+        ? NULL : layout_box_for_node(layout, node);
     size_t decoration_end = box == NULL
         ? command_start : box->scroll_command_start;
-    if (decoration_end > layout->count) decoration_end = layout->count;
+    if (decoration_end > command_end) decoration_end = command_end;
     for (size_t i = context->stacking_context_count; i != 0; i--) {
         LayoutStackingContext *existing =
             &context->stacking_contexts[i - 1u];
-        if (existing->node != node) continue;
+        if (generated_pseudo || existing->generated_pseudo
+            || existing->node != node) continue;
         existing->command_start = (uint32_t) command_start;
-        existing->command_end = (uint32_t) layout->count;
+        existing->command_end = (uint32_t) command_end;
         existing->decoration_end = (uint32_t) decoration_end;
         existing->z_index = effective_z_index ? style->z_index : 0;
         return true;
@@ -2044,11 +2146,32 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
         (LayoutStackingContext) {
             .node = node,
             .command_start = (uint32_t) command_start,
-            .command_end = (uint32_t) layout->count,
+            .command_end = (uint32_t) command_end,
             .decoration_end = (uint32_t) decoration_end,
-            .z_index = effective_z_index ? style->z_index : 0
+            .z_index = effective_z_index ? style->z_index : 0,
+            .generated_pseudo = generated_pseudo
         };
     return true;
+}
+
+bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
+                        size_t command_start, size_t link_start,
+                        size_t control_start, const ComputedStyle *style,
+                        bool flex_or_grid_item)
+{
+    return apply_visual_span(context, node, command_start,
+        context->layout->count, link_start, control_start, style,
+        flex_or_grid_item, false);
+}
+
+bool apply_pseudo_visual_range(LayoutContext *context, lxb_dom_node_t *node,
+                              size_t command_start, size_t command_end,
+                              const ComputedStyle *style)
+{
+    if (command_start == command_end) return true;
+    return apply_visual_span(context, node, command_start, command_end,
+        context->layout->link_count, context->layout->control_count,
+        style, false, true);
 }
 
 bool layout_record_visibility_range(

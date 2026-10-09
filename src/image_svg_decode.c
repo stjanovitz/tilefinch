@@ -8,6 +8,7 @@
 
 static Budget *svg_budget;
 static unsigned svg_allocations;
+static bool svg_allocation_failed;
 static uint64_t svg_slice_started_us;
 
 bool image_svg_decode_busy(void)
@@ -33,15 +34,19 @@ static void svg_cooperate(void)
 static void *svg_malloc(size_t size)
 {
     svg_cooperate();
-    return budget_malloc_category(
+    void *result = budget_malloc_category(
         svg_budget, BUDGET_CATEGORY_RESOURCE, size);
+    if (result == NULL && size != 0) svg_allocation_failed = true;
+    return result;
 }
 
 static void *svg_realloc(void *pointer, size_t size)
 {
     svg_cooperate();
-    return budget_realloc_category(
+    void *result = budget_realloc_category(
         svg_budget, BUDGET_CATEGORY_RESOURCE, pointer, size);
+    if (result == NULL && size != 0) svg_allocation_failed = true;
+    return result;
 }
 
 static void svg_free(void *pointer)
@@ -72,10 +77,11 @@ static void svg_free(void *pointer)
 #undef realloc
 #undef free
 
-unsigned char *image_svg_decode(const void *data, size_t length,
-                                Budget *budget,
-                                size_t maximum_decoded_bytes,
-                                int *width, int *height)
+unsigned char *image_svg_decode_bounded(
+    const void *data, size_t length, Budget *budget,
+    size_t maximum_decoded_bytes, int *width, int *height,
+    ImageSvgOversizeTarget target, void *opaque,
+    int *source_width, int *source_height)
 {
     if (data == NULL || budget == NULL || width == NULL || height == NULL
         || maximum_decoded_bytes < 4 || svg_budget != NULL) return NULL;
@@ -89,6 +95,7 @@ unsigned char *image_svg_decode(const void *data, size_t length,
     BudgetAllocationOwner scratch_owner = BUDGET_ALLOCATION_OWNER_NONE;
     if (!budget_allocation_owner_create(budget, &scratch_owner)) return NULL;
     svg_allocations = 0;
+    svg_allocation_failed = false;
     svg_slice_started_us = tilefinch_platform_monotonic_time_us();
     BudgetAllocationOwner previous_owner =
         budget_allocation_owner_enter(budget, scratch_owner);
@@ -104,13 +111,27 @@ unsigned char *image_svg_decode(const void *data, size_t length,
     budget_allocation_owner_leave(budget, previous_owner);
     unsigned char *pixels = NULL;
     int output_width = 0, output_height = 0;
-    if (svg != NULL && svg->width > 0.0f && svg->height > 0.0f
+    int intrinsic_width = 0, intrinsic_height = 0;
+    if (svg != NULL && !svg_allocation_failed
+        && svg->width > 0.0f && svg->height > 0.0f
         && svg->width <= 32767.0f && svg->height <= 32767.0f) {
         output_width = (int) ceilf(svg->width);
         output_height = (int) ceilf(svg->height);
+        intrinsic_width = output_width;
+        intrinsic_height = output_height;
         if (target_width > 0 && target_height > 0) {
             output_width = target_width;
             output_height = target_height;
+        }
+        else if (target != NULL
+            && (size_t) output_width * (size_t) output_height
+                   > maximum_decoded_bytes / 4u) {
+            /* Both dimensions are <=32767: the product fits on PSP too.
+               This fallback is admission, not a second allocation attempt. */
+            if (!target(opaque, intrinsic_width, intrinsic_height,
+                        &output_width, &output_height)) {
+                output_width = output_height = 0;
+            }
         }
         if (output_width > 0 && output_height > 0
             && (size_t) output_width
@@ -136,7 +157,7 @@ unsigned char *image_svg_decode(const void *data, size_t length,
             nsvgDeleteRasterizer(rasterizer);
         }
         budget_allocation_owner_leave(budget, previous_owner);
-        if (rasterizer == NULL) {
+        if (rasterizer == NULL || svg_allocation_failed) {
             budget_free(budget, pixels);
             pixels = NULL;
         }
@@ -150,5 +171,16 @@ unsigned char *image_svg_decode(const void *data, size_t length,
     if (pixels == NULL) return NULL;
     *width = output_width;
     *height = output_height;
+    if (source_width != NULL) *source_width = intrinsic_width;
+    if (source_height != NULL) *source_height = intrinsic_height;
     return pixels;
+}
+
+unsigned char *image_svg_decode(const void *data, size_t length,
+                                Budget *budget,
+                                size_t maximum_decoded_bytes,
+                                int *width, int *height)
+{
+    return image_svg_decode_bounded(data, length, budget,
+        maximum_decoded_bytes, width, height, NULL, NULL, NULL, NULL);
 }

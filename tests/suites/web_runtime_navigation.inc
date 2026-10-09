@@ -2008,6 +2008,9 @@
     puts("test: data attribute reuse matches a full cascade");
     CHECK(test_data_attribute_reuse_matches_full_cascade(&budget));
     puts("test: constructed stylesheets have no rule cap");
+    CHECK(test_cssom_rule_edits_preserve_dom(&budget));
+    CHECK(test_cssom_author_bounds(&budget));
+    CHECK(test_cssom_override_refusal(&budget));
     CHECK(test_constructed_sheet_without_rule_cap(&budget));
     puts("test: constructed stylesheets apply their prefix past the bound");
     CHECK(test_constructed_sheet_text_bound_prefix(&budget));

@@ -1,9 +1,13 @@
 #include "tilefinch/document.h"
+#include "tilefinch/js_runtime.h"
 
 #include <string.h>
 
 #define budget_calloc(b, n, s) \
     budget_calloc_category((b), BUDGET_CATEGORY_DOM, (n), (s))
+
+#define DOCUMENT_CSSOM_ANCESTOR_LIMIT 65536u
+#define DOCUMENT_CSSOM_SHEET_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
 
 /* Constructed stylesheets and adoptedStyleSheets lists (document.h).
 
@@ -140,7 +144,9 @@ static void adopted_reindex(DocumentAdoptedSheets *registry)
 
 static bool node_connected(const lxb_dom_node_t *node)
 {
-    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+    size_t depth = 0;
+    for (const lxb_dom_node_t *at = node;
+         at != NULL && depth++ < DOCUMENT_CSSOM_ANCESTOR_LIMIT; at = at->parent) {
         if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) return true;
     }
     return false;
@@ -149,10 +155,201 @@ static bool node_connected(const lxb_dom_node_t *node)
 static bool node_inside(const lxb_dom_node_t *node,
                         const lxb_dom_node_t *root)
 {
-    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+    size_t depth = 0;
+    for (const lxb_dom_node_t *at = node;
+         at != NULL && depth++ < DOCUMENT_CSSOM_ANCESTOR_LIMIT; at = at->parent) {
         if (at == root) return true;
     }
     return false;
+}
+
+typedef struct DocumentCssomSheet {
+    struct DocumentCssomSheet *next;
+    lxb_dom_node_t *node;
+    char *text;
+    size_t length, capacity;
+    uint32_t revision;
+    bool active;
+} DocumentCssomSheet;
+
+struct DocumentCssomSheets {
+    Budget *budget;
+    DocumentCssomSheet *head;
+    size_t count, bytes, capacity;
+};
+
+static DocumentCssomSheet *cssom_find(const lxb_dom_node_t *node)
+{
+    struct DocumentCssomSheets *registry = document_cssom_registry(node);
+    if (registry == NULL) return NULL;
+    size_t visited = 0;
+    for (DocumentCssomSheet *entry = registry->head;
+         entry != NULL && visited++ < DOCUMENT_CSSOM_SHEET_LIMIT;
+         entry = entry->next)
+        if (entry->node == node) return entry;
+    return NULL;
+}
+
+const char *document_cssom_sheet_text(const lxb_dom_node_t *node,
+                                     size_t *length)
+{
+    DocumentCssomSheet *entry = cssom_find(node);
+    if (length != NULL) *length = entry != NULL && entry->active
+        ? entry->length : 0;
+    return entry != NULL && entry->active ? entry->text : NULL;
+}
+
+uint32_t document_cssom_sheet_revision(const lxb_dom_node_t *node)
+{
+    DocumentCssomSheet *entry = cssom_find(node);
+    return entry == NULL ? 0 : entry->revision;
+}
+
+bool document_cssom_sheet_set_text(PocDocument *document, lxb_dom_node_t *node,
+                                   const char *text, size_t length,
+                                   bool constructed, bool *active)
+{
+    if (active != NULL) *active = false;
+    if (document == NULL || document->budget == NULL || node == NULL
+        || document->html == NULL
+        || node->owner_document != &document->html->dom_document
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->local_name != LXB_TAG_STYLE
+        || node->ns != LXB_NS_HTML
+        || (text == NULL && length != 0)
+        || length > DOCUMENT_CONSTRUCTED_TEXT_LIMIT) return false;
+    struct DocumentCssomSheets *registry = document->cssom_sheets;
+    DocumentCssomSheet *entry = cssom_find(node);
+    size_t current = registry == NULL ? 0 : registry->bytes;
+    if (entry != NULL) current -= entry->length;
+    if (current > document->budget->limit
+        || length > document->budget->limit - current
+        || (entry == NULL && registry != NULL
+            && registry->count == DOCUMENT_CSSOM_SHEET_LIMIT)
+        || (constructed && !document_constructed_sheet_text_fits(
+                document, node, length))) return false;
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    bool new_registry = registry == NULL, new_entry = entry == NULL;
+    bool new_routing_registry = document->nonce_registry == NULL;
+    if (new_registry) {
+        registry = budget_calloc(document->budget, 1, sizeof(*registry));
+        if (registry != NULL) registry->budget = document->budget;
+    }
+    if (registry != NULL && new_entry)
+        entry = budget_calloc(document->budget, 1, sizeof(*entry));
+    size_t capacity = entry == NULL ? 0 : entry->capacity;
+    char *replacement = NULL;
+    if (entry != NULL && length + 1u > capacity) {
+        capacity = capacity == 0 ? 128u : capacity;
+        while (capacity < length + 1u
+               && capacity < DOCUMENT_CONSTRUCTED_TEXT_LIMIT + 1u)
+            capacity = capacity > (DOCUMENT_CONSTRUCTED_TEXT_LIMIT + 1u) / 2u
+                ? DOCUMENT_CONSTRUCTED_TEXT_LIMIT + 1u : capacity * 2u;
+        size_t held = registry->capacity - entry->capacity;
+        if (held <= document->budget->limit
+            && capacity <= document->budget->limit - held)
+            replacement = budget_malloc_category(
+                document->budget, BUDGET_CATEGORY_STYLE, capacity);
+    }
+    bool ok = registry != NULL && entry != NULL
+        && (length + 1u <= entry->capacity || replacement != NULL);
+    if (ok && new_registry)
+        ok = document_cssom_registry_attach(document, registry);
+    if (ok && constructed)
+        ok = document_constructed_sheet_note_text(
+            document, node, length, active);
+    if (ok) {
+        if (new_registry) document->cssom_sheets = registry;
+        if (new_entry) {
+            entry->node = node;
+            entry->next = registry->head;
+            registry->head = entry;
+            registry->count++;
+        }
+        if (replacement != NULL) {
+            registry->capacity -= entry->capacity;
+            registry->capacity += capacity;
+            budget_free(document->budget, entry->text);
+            entry->text = replacement;
+            entry->capacity = capacity;
+        }
+        registry->bytes = current + length;
+        if (length != 0) memcpy(entry->text, text, length);
+        entry->text[length] = '\0';
+        entry->length = length;
+        entry->active = true;
+        entry->revision++;
+        if (!constructed && active != NULL) *active = node_connected(node);
+    } else {
+        budget_free(document->budget, replacement);
+        if (new_entry) budget_free(document->budget, entry);
+        if (new_registry) {
+            if (registry != NULL)
+                document_cssom_registry_detach(document, new_routing_registry);
+            budget_free(document->budget, registry);
+        }
+    }
+    document_allocation_owner_leave(document, previous);
+    return ok;
+}
+
+void document_cssom_sheet_reset(const lxb_dom_node_t *node)
+{
+    if (document_cssom_registry(node) == NULL) return;
+    for (size_t depth = 0; node != NULL
+         && depth < DOCUMENT_CSSOM_ANCESTOR_LIMIT; depth++, node = node->parent) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || node->local_name != LXB_TAG_STYLE) continue;
+        DocumentCssomSheet *entry = cssom_find(node);
+        if (entry == NULL) return;
+        struct DocumentCssomSheets *registry = document_cssom_registry(node);
+        registry->bytes -= entry->length;
+        entry->length = 0;
+        entry->active = false;
+        entry->revision++;
+        return;
+    }
+}
+
+void document_cssom_discard_subtree(PocDocument *document,
+                                    const lxb_dom_node_t *root)
+{
+    struct DocumentCssomSheets *registry = document == NULL
+        ? NULL : document->cssom_sheets;
+    if (registry == NULL || root == NULL) return;
+    DocumentCssomSheet **link = &registry->head;
+    size_t visited = 0;
+    while (*link != NULL && visited++ < DOCUMENT_CSSOM_SHEET_LIMIT) {
+        DocumentCssomSheet *entry = *link;
+        if (!node_inside(entry->node, root)) {
+            link = &entry->next;
+            continue;
+        }
+        *link = entry->next;
+        registry->bytes -= entry->length;
+        registry->capacity -= entry->capacity;
+        registry->count--;
+        budget_free(registry->budget, entry->text);
+        budget_free(registry->budget, entry);
+    }
+}
+
+void document_cssom_sheets_destroy(PocDocument *document)
+{
+    struct DocumentCssomSheets *registry = document == NULL
+        ? NULL : document->cssom_sheets;
+    if (registry == NULL) return;
+    DocumentCssomSheet *entry = registry->head;
+    for (size_t visited = 0; entry != NULL
+         && visited < DOCUMENT_CSSOM_SHEET_LIMIT; visited++) {
+        DocumentCssomSheet *next = entry->next;
+        budget_free(registry->budget, entry->text);
+        budget_free(registry->budget, entry);
+        entry = next;
+    }
+    document_cssom_registry_detach(document, false);
+    budget_free(registry->budget, registry);
+    document->cssom_sheets = NULL;
 }
 
 static bool list_active(const DocumentAdoptionList *list)
@@ -415,6 +612,7 @@ size_t document_adoptions_discard_subtree(PocDocument *document,
                                           lxb_dom_node_t **released,
                                           size_t capacity)
 {
+    document_cssom_discard_subtree(document, root);
     DocumentAdoptedSheets *registry =
         document == NULL ? NULL : document->adopted_sheets;
     if (registry == NULL || root == NULL) return 0;

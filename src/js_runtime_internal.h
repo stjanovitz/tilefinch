@@ -1695,6 +1695,8 @@ JSValue js_dom_register_shadow_root(JSContext *context,
 JSValue js_dom_constructed_sheet_text(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv);
+JSValue js_dom_sheet_revision(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv);
 JSValue js_css_statement_ends(JSContext *context, JSValueConst this_value,
                               int argc, JSValueConst *argv);
 JSValue js_font_shorthand_valid(JSContext *context, JSValueConst this_value,

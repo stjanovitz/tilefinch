@@ -4427,6 +4427,11 @@
       return this.getBoundingClientRect().height;
     },
     get offsetParent() {
+      /* CSSOM View terminates the chain at the root and body, regardless
+         of positioning. Falling back to body here made body its own
+         offsetParent and turned ordinary author geometry walks into cycles. */
+      const owner = this.ownerDocument;
+      if (this === owner.documentElement || this === owner.body) return null;
       const position = getComputedStyle(this).position;
       if (position === "fixed") {
         for (
@@ -4457,7 +4462,7 @@
         at = at.parentElement, steps++
       )
         if (getComputedStyle(at).position !== "static") return at;
-      return document.body;
+      return owner.body;
     },
     get scrollWidth() {
       return this.__tilefinchGeometryValue().scrollWidth;
@@ -7519,7 +7524,7 @@
     state.interest = interest;
     state.subtree = subtree;
   };
-  globalThis.MutationObserver = class MutationObserver {
+  const NativeMutationObserver = class MutationObserver {
     constructor(callback) {
       if (typeof callback !== "function")
         throw new TypeError("callback required");
@@ -7620,12 +7625,42 @@
       return records;
     }
   };
-  Object.defineProperty(globalThis.MutationObserver.prototype, Symbol.toStringTag, {
+  globalThis.MutationObserver = NativeMutationObserver;
+  /* WebIDL operations are enumerable, unlike authored class methods.
+     Enumeration-based wrappers must discover these on an observer instance. */
+  for (const name of ["observe", "disconnect", "takeRecords"])
+    Object.defineProperty(NativeMutationObserver.prototype, name, {
+      enumerable: true,
+    });
+  const mutationObserverObserve = NativeMutationObserver.prototype.observe,
+    mutationObserverTakeRecords = NativeMutationObserver.prototype.takeRecords;
+  /* Motion is installed lazily, after pages may replace the public
+     constructor or its methods. Keep its observer in this realm's original
+     bounded observer machinery, without invoking authored wrappers. */
+  Object.defineProperty(globalThis, "__tilefinchObserveMutations", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: (callback, target, options) => {
+      const observer = new NativeMutationObserver(callback);
+      ancestorApply(mutationObserverObserve, observer, [target, options]);
+      return observer;
+    },
+  });
+  Object.defineProperty(NativeMutationObserver.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "MutationObserver",
   });
   {
-    const observers = new Set();
+    const observers = new Set(),
+      resizeStates = new WeakMap(),
+      resizeTargetLimit = 1024,
+      resizeState = (observer) => {
+        const state = resizeStates.get(observer);
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+      };
+    let resizeTargets = 0;
     let resizeRecheckPending = false,
       resizeDeliveryActive = false;
     class ResizeObserverSize {
@@ -7786,12 +7821,13 @@
         let shallowestDepth = Infinity,
           skipped = false;
         for (const observer of observers) {
-          if (!observer.targets.size) continue;
+          const state = resizeState(observer);
+          if (!state.targets.size) continue;
           const entries = [];
-          for (const [target, options] of observer.targets) {
+          for (const [target, options] of state.targets) {
             const geometry = resizeGeometry(target),
               dimensions = observedDimensions(geometry, options.box),
-              previous = observer.lastSizes.get(target);
+              previous = state.lastSizes.get(target);
             if (
               previous &&
               previous[0] === dimensions[0] &&
@@ -7803,7 +7839,7 @@
               skipped = true;
               continue;
             }
-            observer.lastSizes.set(target, dimensions);
+            state.lastSizes.set(target, dimensions);
             shallowestDepth = Math.min(shallowestDepth, depth);
             if (entries.length < 128)
               entries.push(new ResizeObserverEntry(target, geometry));
@@ -7830,11 +7866,12 @@
           if (!gathered.batches.length) break;
           depth = gathered.shallowestDepth;
           for (const [observer, entries] of gathered.batches) {
-            if (!observer.targets.size) continue;
+            const state = resizeState(observer);
+            if (!state.targets.size) continue;
             try {
               globalThis.__tilefinchRunTask(
                 "resize-observer",
-                observer.callback,
+                state.callback,
                 observer,
                 [entries, observer],
               );
@@ -7872,18 +7909,17 @@
       constructor(callback) {
         if (typeof callback !== "function")
           throw new TypeError("callback required");
-        if (observers.size >= 64)
-          throw new RangeError("ResizeObserver limit reached");
-        this.callback = callback;
-        this.targets = new Map();
-        this.lastSizes = new Map();
-        observers.add(this);
+        /* Empty observers have no delivery work and must not be retained.
+           Bound live registrations, not the number of component instances:
+           pages commonly create one observer per card. */
+        resizeStates.set(this, {
+          callback, targets: new Map(), lastSizes: new Map(),
+        });
       }
       observe(target, options = {}) {
+        const state = resizeState(this);
         if (!(target instanceof Element))
           throw new TypeError("Element required");
-        if (!this.targets.has(target) && this.targets.size >= 128)
-          throw new RangeError("ResizeObserver target limit reached");
         const box = String(options?.box || "content-box");
         if (
           box !== "content-box" &&
@@ -7891,23 +7927,37 @@
           box !== "device-pixel-content-box"
         )
           throw new TypeError("Invalid ResizeObserver box");
-        if (!observers.has(this)) {
-          if (observers.size >= 64)
-            throw new RangeError("ResizeObserver limit reached");
-          observers.add(this);
+        /* Option getters may register other observations. Admit against
+           the current state after coercion, and roll back on allocation
+           refusal before charging the live-registration count. */
+        const added = !state.targets.has(target);
+        if (added &&
+            (state.targets.size >= 128 || resizeTargets >= resizeTargetLimit))
+          throw new RangeError("ResizeObserver target limit reached");
+        const wasActive = observers.has(this);
+        observers.add(this);
+        try {
+          state.targets.set(target, { box });
+        } catch (error) {
+          if (!wasActive) observers.delete(this);
+          throw error;
         }
-        this.targets.set(target, { box });
+        if (added) resizeTargets++;
         scheduleResizeRecheck();
       }
       unobserve(target) {
+        const state = resizeState(this);
         if (!(target instanceof Element))
           throw new TypeError("Element required");
-        this.targets.delete(target);
-        this.lastSizes.delete(target);
+        if (state.targets.delete(target)) resizeTargets--;
+        state.lastSizes.delete(target);
+        if (!state.targets.size) observers.delete(this);
       }
       disconnect() {
-        this.targets.clear();
-        this.lastSizes.clear();
+        const state = resizeState(this);
+        resizeTargets -= state.targets.size;
+        state.targets.clear();
+        state.lastSizes.clear();
         observers.delete(this);
       }
     };
@@ -8393,7 +8443,10 @@
   const scheduleMutationDelivery = () => {
     if (!mutationDeliveryPending) {
       mutationDeliveryPending = true;
-      Promise.resolve().then(() => {
+      /* Delivery is a host microtask, not a call into the page's current
+         Promise. Observer-backed Promise polyfills otherwise deadlock:
+         their reaction needs this very mutation notification to run. */
+      mutationPromiseThen(mutationPromiseResolve(), () => {
         mutationDeliveryPending = false;
         /* DOM "notify mutation observers": the observers pending now, in
            the order they were queued, each taking its records, ending its
@@ -8406,7 +8459,9 @@
           const itemState = mutationObserverStates.get(item);
           if (!itemState) continue;
           itemState.pending = false;
-          const records = item.takeRecords();
+          const records = ancestorApply(
+            mutationObserverTakeRecords, item, emptyTaskArguments,
+          );
           itemState.transientRoots = [];
           if (records.length)
             try {

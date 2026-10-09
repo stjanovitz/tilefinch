@@ -190,6 +190,7 @@ typedef struct {
     uint32_t command_end;
     uint32_t decoration_end;
     int z_index;
+    bool generated_pseudo;
 } LayoutStackingContext;
 
 /* visibility participates in layout and is inherited, but a descendant may
@@ -248,6 +249,15 @@ typedef struct {
    holds (layout_reuse_fit_styles). */
 #define LAYOUT_REUSE_STYLE_CAPACITY 1024u
 #define LAYOUT_REUSE_STYLE_CAPACITY_LIMIT 4096u
+#define LAYOUT_REUSE_STYLE_PAGE_SIZE 128u
+#define LAYOUT_REUSE_STYLE_PAGE_COUNT \
+    (LAYOUT_REUSE_STYLE_CAPACITY_LIMIT / LAYOUT_REUSE_STYLE_PAGE_SIZE)
+typedef union {
+    ComputedStyle style;
+    uint16_t next_free;
+} LayoutReuseStylePayload;
+_Static_assert(LAYOUT_REUSE_STYLE_CAPACITY_LIMIT < UINT16_MAX,
+    "style payload indices must fit their sentinel encoding");
 #define LAYOUT_REUSE_PENDING_NODE_LIMIT 32u
 #define LAYOUT_REUSE_PENDING_TOKEN_LIMIT 32u
 #define LAYOUT_REUSE_INTRINSIC_CAPACITY 128u
@@ -262,7 +272,6 @@ typedef struct {
 typedef struct {
     lxb_dom_node_t *node;
     uint64_t parent_hash;
-    ComputedStyle style;
     uint64_t stamp;
     /* stylesheet_custom_property_name_bits of every custom property its
        resolution looked up, and of those its own inline style declares:
@@ -279,6 +288,7 @@ typedef struct {
        LAYOUT_REUSE_CONTAINER_DEPENDENT: it consulted a container query and
        is not reused while a pass logs container-query evaluations. */
     uint8_t dependent;
+    uint16_t payload;
 } LayoutReuseStyleEntry;
 #define LAYOUT_REUSE_FONT_DEPENDENT 1u
 #define LAYOUT_REUSE_CONTAINER_DEPENDENT 2u
@@ -317,6 +327,13 @@ struct LayoutReuseCache {
     /* style_mask + 1 entries (a power of two), and the live entries the
        builds since the last fit evicted. */
     LayoutReuseStyleEntry *styles;
+    /* Hash metadata retains the original probe/LRU plan. Full styles are
+       admitted only for occupied slots, in bounded pages without grow-copy
+       peaks. Invalidations recycle payloads; clear reuses existing pages. */
+    LayoutReuseStylePayload *style_pages[LAYOUT_REUSE_STYLE_PAGE_COUNT];
+    uint16_t style_payload_count;
+    uint16_t style_payload_free; /* index + 1, zero means no free payload */
+    bool style_payload_refused;
     size_t style_mask;
     size_t style_shortfall;
     bool font_publication_active;
@@ -750,6 +767,9 @@ typedef struct {
     int y;
     int width;
     int height;
+    /* A minimum height is a provisional padding-box bound, not the final
+       containing-block height for bottom-positioned descendants. */
+    bool height_provisional;
     /* CSS transforms, filters, perspective, containment, and an authored
        will-change establish a separate containing block for fixed
        descendants. Keep it alongside the ordinary positioned ancestor: a
@@ -1305,6 +1325,8 @@ int layout_fixed_scale_floor(int value, int numerator, int denominator);
 int measured_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 int measured_text_width_fixed_mode(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, bool kerning);
 int measured_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
+int measured_flow_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning);
+int measured_flow_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning);
 bool layout_add_replaced_alt_text(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int x, int y, int width, int height);
@@ -1326,6 +1348,7 @@ int constrain_border_box_width(
     const ComputedStyle *parent, const ComputedStyle *style,
     int containing_width, int candidate, bool *has_maximum);
 int root_scroll_width_after_clipping(LayoutDocument *layout, int viewport_width);
+int root_scroll_height_after_clipping(LayoutDocument *layout, int minimum_height);
 int style_content_height(const Stylesheet *sheet, const ComputedStyle *style, int width_reference, int containing_height);
 int style_minimum_width(const Stylesheet *sheet, const ComputedStyle *style, int containing_width);
 int style_pixel_height(const Stylesheet *sheet, const ComputedStyle *style, int reference);
@@ -1349,6 +1372,9 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
                         size_t command_start, size_t link_start,
                         size_t control_start, const ComputedStyle *style,
                         bool flex_or_grid_item);
+bool apply_pseudo_visual_range(LayoutContext *context, lxb_dom_node_t *node,
+                              size_t command_start, size_t command_end,
+                              const ComputedStyle *style);
 bool layout_record_visibility_range(
     LayoutContext *context, size_t command_start, size_t link_start,
     size_t control_start, bool hidden);
@@ -1402,6 +1428,9 @@ void layout_transform_origin_twice(
     const Stylesheet *sheet, const ComputedStyle *style,
     int box_x, int box_y, int box_width, int box_height,
     int *origin_x_twice, int *origin_y_twice);
+bool layout_skew_solid_command_span(LayoutDocument *layout, size_t start,
+                                     size_t end, int origin_y_twice,
+                                     int16_t shear_q10);
 void layout_transform_command_span(
     LayoutDocument *layout, size_t command_start, size_t command_end,
     int origin_x_twice, int origin_y_twice, uint8_t scale_q6,

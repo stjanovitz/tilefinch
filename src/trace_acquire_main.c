@@ -19,7 +19,7 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s --method GET|HEAD --url HTTPS_URL --output DIR "
-            "--max-bytes N --timeout-ms N\n",
+            "--max-bytes N --timeout-ms N [--origin HTTPS_ORIGIN]\n",
             program);
 }
 
@@ -134,6 +134,7 @@ int main(int argc, char **argv)
     const char *output = NULL;
     const char *max_bytes_text = NULL;
     const char *timeout_text = NULL;
+    const char *origin = NULL;
     for (int i = 1; i < argc; i++) {
         const char *option = argv[i];
         if (strcmp(option, "--help") == 0
@@ -158,6 +159,8 @@ int main(int argc, char **argv)
         } else if (strcmp(option, "--timeout-ms") == 0
                    && timeout_text == NULL) {
             timeout_text = value;
+        } else if (strcmp(option, "--origin") == 0 && origin == NULL) {
+            origin = value;
         } else {
             usage(argv[0]);
             return 2;
@@ -166,10 +169,16 @@ int main(int argc, char **argv)
 
     size_t maximum_bytes = 0;
     long timeout_ms = 0;
+    char normalized_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     if (method == NULL || url == NULL || output == NULL
         || max_bytes_text == NULL || timeout_text == NULL
         || (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
         || !exact_https_url(url)
+        || (origin != NULL
+            && (!tilefinch_url_origin(origin, normalized_origin,
+                                     sizeof(normalized_origin))
+                || strncmp(origin, "https://", 8) != 0
+                || strcmp(origin, normalized_origin) != 0))
         || !parse_size(max_bytes_text, ACQUIRE_MAX_RESPONSE_BYTES,
                        &maximum_bytes)
         || !parse_timeout(timeout_text, &timeout_ms)
@@ -204,6 +213,7 @@ int main(int argc, char **argv)
 
     FetchRequest request = {
         .method = method,
+        .origin = origin,
         .allow_http_errors = true,
         .credentials = FETCH_CREDENTIALS_INCLUDE
     };

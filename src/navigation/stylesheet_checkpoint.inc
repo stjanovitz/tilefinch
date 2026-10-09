@@ -101,7 +101,12 @@ static bool navigation_stream_collect_stylesheet_inputs(
                 hash = navigation_stylesheet_fingerprint_field(
                     hash, "element", name, name_length, true);
                 if (style) {
-                    for (lxb_dom_node_t *child = node->first_child;
+                    size_t override_length = 0;
+                    const char *override = document_cssom_sheet_text(node, &override_length);
+                    if (override != NULL)
+                        hash = navigation_stylesheet_fingerprint_field(
+                            hash, "cssom", override, override_length, true);
+                    for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL;
                          child != NULL; child = child->next) {
                         size_t length = 0;
                         const char *text = document_text_data(child, &length);
@@ -438,7 +443,12 @@ static bool navigation_stream_stylesheet_fingerprint(
             const char *nonce = document_element_nonce(node, &nonce_length);
             hash = navigation_stylesheet_fingerprint_field(
                 hash, "nonce", nonce, nonce_length, nonce != NULL);
-            for (lxb_dom_node_t *child = node->first_child; child != NULL;
+            size_t override_length = 0;
+            const char *override = document_cssom_sheet_text(node, &override_length);
+            if (override != NULL)
+                hash = navigation_stylesheet_fingerprint_field(
+                    hash, "cssom", override, override_length, true);
+            for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL; child != NULL;
                  child = child->next) {
                 size_t length = 0;
                 const char *text = document_text_data(child, &length);

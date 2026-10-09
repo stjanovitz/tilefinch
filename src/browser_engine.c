@@ -1,6 +1,7 @@
 #include "tilefinch/browser_engine.h"
 #include "tilefinch_test_faults.h"
 #include "tilefinch/page_find.h"
+#include "tilefinch/linked_video_preview.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/site_identity.h"
@@ -6133,6 +6134,15 @@ bool browser_engine_run_idle_work(
             TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "background-resources",
             "background resource continuation failed");
     }
+    bool video_preview_work = !font_work
+        && !browser_engine_navigation_pending(engine)
+        && !navigation_background_resources_pending(&engine->navigation)
+        && navigation_run_linked_video_preview(&engine->navigation);
+    if (video_preview_work && !engine->navigation.page.loaded) {
+        return set_error_code(engine, TILEFINCH_SUBSYSTEM_NETWORK,
+            TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "video-preview-publication",
+            "preview publication relayout retired the page");
+    }
     size_t relayouts_after =
         engine->navigation.performance.fast_relayouts
         + engine->navigation.performance.full_relayouts;
@@ -6156,7 +6166,7 @@ bool browser_engine_run_idle_work(
     /* Autofocus is a commitment of the settled layout, not of the earlier
        parser checkpoint. Run it after optional font/resource work so a
        relayout cannot immediately retire the region we just selected. */
-    bool layout_still_settling = font_work
+    bool layout_still_settling = font_work || video_preview_work
         || engine->font_load != NULL
         || navigation_background_resources_pending(&engine->navigation);
     /* Once images and fonts have settled, keep only the painted size of
@@ -6180,7 +6190,7 @@ bool browser_engine_run_idle_work(
         &engine->render, engine->config.idle_work_budget_us,
         engine->config.idle_work_maximum_units);
     bool cache_work = false;
-    bool turn_quiet = !font_work && engine->font_load == NULL
+    bool turn_quiet = !font_work && !video_preview_work && engine->font_load == NULL
         && !autofocus_work && !tile_cache_idle_work_pending(&engine->render);
     bool store_pending = navigation_script_bytecode_pending(
         &engine->navigation);
@@ -6218,7 +6228,7 @@ bool browser_engine_run_idle_work(
                 &engine->session)
             || browser_session_script_disk_maintenance(&engine->session);
     }
-    return topics_work || cache_work || autofocus_work || font_work || retarget_work
+    return topics_work || cache_work || autofocus_work || font_work || retarget_work || video_preview_work
         || navigation_background_resources_pending(&engine->navigation)
         || tile_cache_idle_work_pending(&engine->render);
 }

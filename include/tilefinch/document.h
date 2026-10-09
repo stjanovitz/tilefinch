@@ -214,6 +214,7 @@ typedef struct {
     /* Constructed stylesheets and the adoptedStyleSheets lists naming them;
        see document_adopted_sheets_active(). NULL until a page adopts one. */
     DocumentAdoptedSheets *adopted_sheets;
+    struct DocumentCssomSheets *cssom_sheets;
     /* The document's character encoding (a TilefinchEncoding). Zero is
        UTF-8, the default for documents not built by a sniffing parser. */
     uint8_t encoding;
@@ -359,8 +360,9 @@ bool document_nonce_clone_subtree(lxb_dom_node_t *source,
 
 /* Constructed stylesheets (new CSSStyleSheet()) and adoptedStyleSheets.
 
-   A constructed sheet's text lives once, in a detached <style> element the
-   script bridge owns and pins while any list adopts it; this registry knows
+   A constructed sheet's text lives in a reusable CSSOM override keyed by
+   a detached <style> element the script bridge owns and pins while any list
+   adopts it; this registry knows
    those elements, their text revision, and each adopting root's list (the
    document, or a shadow root's native carrier). The stylesheet builders
    parse every active sheet once, after the document's own <style> and
@@ -384,6 +386,27 @@ bool document_nonce_clone_subtree(lxb_dom_node_t *source,
 #define DOCUMENT_ADOPTION_ROOT_LIMIT 128u
 #define DOCUMENT_CONSTRUCTED_SHEET_LIMIT 128u
 #define DOCUMENT_CONSTRUCTED_TEXT_LIMIT (1024u * 1024u)
+/* CSSOM edits never change DOM text. Overrides have reusable Budget-owned
+   storage, one entry per admitted DOM handle and at most 1 MiB UTF-8 text
+   per source (the bridge's 256 Ki UTF-16-unit quota). Aggregate text and
+   capacity share the existing Budget ceiling; constructed sheet quotas
+   remain unchanged. Author child/data edits reset even identical writes. */
+bool document_cssom_sheet_set_text(PocDocument *document, lxb_dom_node_t *node,
+                                   const char *text, size_t length,
+                                   bool constructed, bool *active);
+const char *document_cssom_sheet_text(const lxb_dom_node_t *node,
+                                     size_t *length);
+uint32_t document_cssom_sheet_revision(const lxb_dom_node_t *node);
+void document_cssom_sheet_reset(const lxb_dom_node_t *node);
+void document_cssom_discard_subtree(PocDocument *document,
+                                    const lxb_dom_node_t *root);
+void document_cssom_sheets_destroy(PocDocument *document);
+/* Stable native-document registry routing, independent of PocDocument moves. */
+struct DocumentCssomSheets *document_cssom_registry(const lxb_dom_node_t *node);
+bool document_cssom_registry_attach(PocDocument *document,
+                                    struct DocumentCssomSheets *registry);
+void document_cssom_registry_detach(PocDocument *document,
+                                    bool release_new_routing_registry);
 #define DOCUMENT_ADOPTED_TIER_LIMIT 64u
 /* Bytes of parsed form (structural IR plus compiled selector fragment)
    kept for all of a document's constructed sheets together, so a full

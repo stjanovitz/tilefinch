@@ -656,6 +656,25 @@ class TraceAcquisitionTests(unittest.TestCase):
             os.close(hostile_input)
             os.close(never_written)
 
+    def test_response_cookie_accepts_trailing_empty_attribute_only(self) -> None:
+        url = "https://capture.example.test/"
+        meta = {
+            "set-cookie-count": "1",
+            "set-cookie-0": "sid=xxxx; Path=/; Secure; HttpOnly; ",
+            "set-cookie-url-0": url,
+        }
+        ACQUIRE._validate_response_cookies(meta, url, [])
+        for cookie in (
+            "sid=xxxx; ; Secure",
+            "sid=secret; Path=/; ",
+            "sid=xxxx; Domain=other.test; ",
+            "sid=xxxx; Partitioned; ",
+        ):
+            with self.subTest(cookie=cookie):
+                meta["set-cookie-0"] = cookie
+                with self.assertRaises(ACQUIRE.AcquisitionError):
+                    ACQUIRE._validate_response_cookies(meta, url, [])
+
     def test_atomic_merge_retains_origin_and_redacted_response_cookie(self) -> None:
         source_sha, _source_bytes = ACQUIRE.trace_digest(
             self.source, 1024 * 1024
@@ -988,6 +1007,21 @@ class TraceFormatDriftTests(unittest.TestCase):
 
 
 class RecorderPolicyTests(unittest.TestCase):
+    @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
+    def test_host_recorder_rejects_noncanonical_origin_before_network(self) -> None:
+        for origin in ("http://example.invalid", "https://example.invalid/",
+                       "https://example.invalid/path", "https://example.invalid:443",
+                       "https://example.invalid\r\nX-Test: bad", "null"):
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as root:
+                output = Path(root) / "must-not-exist"
+                completed = subprocess.run(
+                    [str(RECORDER_BINARY), "--method", "GET", "--url",
+                     "https://example.invalid/", "--output", str(output),
+                     "--max-bytes", "1024", "--timeout-ms", "10000",
+                     "--origin", origin], capture_output=True, check=False)
+                self.assertEqual(completed.returncode, 2)
+                self.assertFalse(output.exists())
+
     @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
     def test_host_recorder_rejects_http_before_network(self) -> None:
         recorder = RECORDER_BINARY

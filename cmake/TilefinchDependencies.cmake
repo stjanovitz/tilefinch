@@ -248,6 +248,8 @@ set(PSP_BROWSER_NANOSVG_GEOMETRY_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-hostile-geometry.patch")
 set(PSP_BROWSER_NANOSVG_DIVISIONS_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-bounded-curve-divisions.patch")
+set(PSP_BROWSER_NANOSVG_ALLOCATION_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-allocation-growth.patch")
 set(PSP_BROWSER_POCKETSPHINX_SOURCE_DIR "" CACHE PATH
     "Optional prepared PocketSphinx 5.1.1 source tree for PSP voice input")
 option(PSP_BROWSER_PACKED_VOICE_LEXICON
@@ -1073,7 +1075,7 @@ else()
 endif()
 foreach(nanosvg_patch IN ITEMS
         "${PSP_BROWSER_NANOSVG_PATCH}" "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
-        "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}")
+        "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}" "${PSP_BROWSER_NANOSVG_ALLOCATION_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}

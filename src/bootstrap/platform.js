@@ -9055,15 +9055,7 @@
   };
   globalThis.getComputedStyle = getComputedStyle;
   {
-    const mediaLength = (value) => {
-        const match = String(value)
-          .trim()
-          .match(/^(-?[0-9.]+)(px|em|rem)?$/);
-        if (!match) return NaN;
-        return (
-          Number(match[1]) * (match[2] === "em" || match[2] === "rem" ? 16 : 1)
-        );
-      },
+    const nativeMediaMatches = globalThis.__tilefinchMediaMatches,
       canonicalCalc = (text) =>
         text
           .replace(
@@ -9094,8 +9086,19 @@
         const original = String(query);
         if (original.length > 4096) return "not all";
         if (original.trim() === "") return "";
-        return original
-          .split(",")
+        const clauses = [];
+        let start = 0, depth = 0;
+        for (let at = 0; at <= original.length; at++) {
+          if (original[at] === "(") depth++;
+          else if (original[at] === ")" && --depth < 0) return "not all";
+          if (at === original.length || (original[at] === "," && depth === 0)) {
+            clauses.push(original.slice(start, at));
+            start = at + 1;
+            if (clauses.length > 32) return "not all";
+          }
+        }
+        if (depth) return "not all";
+        return clauses
           .slice(0, 32)
           .map((part) => {
             let text = part.trim();
@@ -9114,165 +9117,6 @@
               .replace(/\s*:\s*/g, ": ");
           })
           .join(", ");
-      };
-    const compareMedia = (left, operator, right) =>
-        operator === "<"
-          ? left < right
-          : operator === "<="
-            ? left <= right
-            : operator === ">"
-              ? left > right
-              : operator === ">="
-                ? left >= right
-                : left === right,
-      mediaRatio = (value) => {
-        const parts = String(value).trim().split("/");
-        if (parts.length === 1) return Number(parts[0]);
-        const numerator = Number(parts[0]),
-          denominator = Number(parts[1]);
-        return denominator ? numerator / denominator : NaN;
-      },
-      mediaResolution = (value) => {
-        const match = String(value)
-          .trim()
-          .match(/^(-?[0-9.]+)(dppx|dpi|dpcm)$/);
-        if (!match) return NaN;
-        const number = Number(match[1]);
-        return match[2] === "dpi"
-          ? number / 96
-          : match[2] === "dpcm"
-            ? number / 37.8
-            : number;
-      },
-      mediaDimension = (name) =>
-        name === "width" || name === "device-width"
-          ? innerWidth
-          : name === "height" || name === "device-height"
-            ? innerHeight
-            : NaN,
-      mediaOperand = (text) => {
-        text = String(text).trim();
-        const dimension = mediaDimension(text);
-        return Number.isFinite(dimension) ? dimension : mediaLength(text);
-      },
-      rangeMatches = (text) => {
-        const match = String(text)
-          .trim()
-          .match(/^(.+?)\s*(<=|>=|<|>|=)\s*(.+?)(?:\s*(<=|>=|<|>)\s*(.+))?$/);
-        if (!match) return null;
-        const left = mediaOperand(match[1]),
-          middle = mediaOperand(match[3]);
-        if (!Number.isFinite(left) || !Number.isFinite(middle)) return false;
-        let result = compareMedia(left, match[2], middle);
-        if (match[4]) {
-          const right = mediaOperand(match[5]);
-          result =
-            result &&
-            Number.isFinite(right) &&
-            compareMedia(middle, match[4], right);
-        }
-        return result;
-      },
-      featureMatches = (source) => {
-        const text = String(source).trim().toLowerCase(),
-          ranged = rangeMatches(text);
-        if (ranged !== null) return ranged;
-        const at = text.indexOf(":"),
-          name = (at < 0 ? text : text.slice(0, at)).trim(),
-          value = (at < 0 ? "" : text.slice(at + 1)).trim();
-        if (
-          name === "min-width" ||
-          name === "max-width" ||
-          name === "width" ||
-          name === "min-height" ||
-          name === "max-height" ||
-          name === "height" ||
-          name === "min-device-width" ||
-          name === "max-device-width" ||
-          name === "device-width" ||
-          name === "min-device-height" ||
-          name === "max-device-height" ||
-          name === "device-height"
-        ) {
-          const prefix = name.startsWith("min-")
-              ? "min"
-              : name.startsWith("max-")
-                ? "max"
-                : "exact",
-            base = name.replace(/^(min|max)-/, ""),
-            actual = mediaDimension(base),
-            numeric = mediaLength(value);
-          return Number.isFinite(numeric) &&
-            (prefix === "min"
-              ? actual >= numeric
-              : prefix === "max"
-                ? actual <= numeric
-                : actual === numeric);
-        }
-        if (name === "orientation")
-          return value === (innerWidth >= innerHeight ? "landscape" : "portrait");
-        if (name === "aspect-ratio" || name === "device-aspect-ratio")
-          return mediaRatio(value) === innerWidth / innerHeight;
-        if (name === "min-aspect-ratio" || name === "max-aspect-ratio") {
-          const wanted = mediaRatio(value),
-            actual = innerWidth / innerHeight;
-          return Number.isFinite(wanted) &&
-            (name.startsWith("min-") ? actual >= wanted : actual <= wanted);
-        }
-        if (
-          name === "resolution" ||
-          name === "min-resolution" ||
-          name === "max-resolution"
-        ) {
-          const wanted = mediaResolution(value),
-            actual = Number(devicePixelRatio) || 1;
-          return Number.isFinite(wanted) &&
-            (name.startsWith("min-")
-              ? actual >= wanted
-              : name.startsWith("max-")
-                ? actual <= wanted
-                : actual === wanted);
-        }
-        if (name === "hover" || name === "any-hover")
-          return value === "none" || (value === "" && false);
-        if (name === "pointer" || name === "any-pointer")
-          return value === "coarse" || value === "";
-        if (name === "prefers-color-scheme")
-          return value === "" || value ===
-            (globalThis.__tilefinchPrefersDark?.() ? "dark" : "light");
-        if (name === "prefers-reduced-motion") return value === "reduce";
-        if (name === "prefers-contrast") return value === "no-preference";
-        if (name === "color") return value === "" || Number(value) <= 8;
-        if (name === "monochrome") return value === "0";
-        if (name === "color-gamut") return value === "srgb";
-        return false;
-      },
-      clauseMatches = (source) => {
-        let text = String(source).trim().toLowerCase(),
-          negated = false,
-          typeMatches = true;
-        if (text.startsWith("only ")) text = text.slice(5).trim();
-        if (text.startsWith("not ")) {
-          negated = true;
-          text = text.slice(4).trim();
-        }
-        if (/^print(?:\s|$)/.test(text)) {
-          typeMatches = false;
-          text = text.replace(/^print(?:\s+and\s+)?/, "");
-        } else if (/^screen(?:\s|$)/.test(text)) {
-          text = text.replace(/^screen(?:\s+and\s+)?/, "");
-        } else if (/^all(?:\s|$)/.test(text)) {
-          text = text.replace(/^all(?:\s+and\s+)?/, "");
-        }
-        let result = typeMatches,
-          seen = false;
-        const pattern = /\(([^()]+)\)/g;
-        for (let match; (match = pattern.exec(text)); ) {
-          seen = true;
-          result = result && featureMatches(match[1]);
-        }
-        if (!seen && text !== "") result = false;
-        return negated ? !result : result;
       };
     class MediaQueryListEvent {
       constructor(type, init = {}) {
@@ -9326,7 +9170,7 @@
         this._lastMatch = this.matches;
       }
       get matches() {
-        return this.media.split(",").some(clauseMatches);
+        return nativeMediaMatches(this.media, innerWidth, innerHeight, devicePixelRatio);
       }
       get onchange() {
         return this._onchange;

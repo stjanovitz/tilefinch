@@ -234,10 +234,13 @@ static bool navigation_stream_suppress_optional_parser_work(
     return true;
 }
 
-/* A large realm for later async application work does not authorize the
-   parser itself to monopolize that allowance. This is cumulative source/work
-   admission, not a second heap or per-file quota. */
-#define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_WORK (1024u * 1024u)
+/* Source volume is not an execution-time estimate: a bounded application
+   bundle may be large and mostly lazy functions. Use the realm's finite,
+   normalized source policy rather than a second legacy one-MiB ceiling.
+   The cumulative author deadline still stops parser-stage monopolization;
+   file, count, compile/watchdog, heap and presentation limits remain active.
+   Retain the small fallback for callbacks without a live realm. */
+#define NAVIGATION_PARSER_SCRIPT_STAGE_FALLBACK_WORK (1024u * 1024u)
 /* Below this much remaining work the stage counts as spent (the
    per-script unit the stage was tuned with). */
 #define NAVIGATION_PARSER_SCRIPT_STAGE_SPENT_WORK \
@@ -280,13 +283,17 @@ void navigation_test_set_parser_script_stage_time_limit_us(uint64_t limit_us)
 static size_t navigation_parser_script_stage_work_limit(
     const NavigationDocumentStream *stream)
 {
-    (void) stream;
 #if !defined(__PSP__)
     if (navigation_parser_script_stage_test_work_limit != 0u) {
         return navigation_parser_script_stage_test_work_limit;
     }
 #endif
-    return NAVIGATION_PARSER_SCRIPT_STAGE_MAX_WORK;
+    if (stream != NULL && stream->runtime != NULL) {
+        ScriptHeapGrowth growth;
+        script_runtime_heap_growth(stream->runtime, &growth);
+        if (growth.source_limit != 0u) return growth.source_limit;
+    }
+    return NAVIGATION_PARSER_SCRIPT_STAGE_FALLBACK_WORK;
 }
 
 static uint64_t navigation_parser_script_stage_time_limit_us(void)

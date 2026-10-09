@@ -425,6 +425,8 @@ static bool selector_list_to_rules(StyleCssParseContext *context,
                                    size_t declaration_length)
 {
     Stylesheet *sheet = context == NULL ? NULL : context->sheet;
+    stylesheet_note_motion_source(sheet, selectors, selector_length,
+                                   declarations, declaration_length, false);
     if (!style_parsed_ir_builder_record(
             context, selectors, selector_length,
             declarations, declaration_length)) return false;
@@ -586,6 +588,11 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
                 context->parsed_ir->has_motion_keyframes = true;
             }
             sheet->has_motion_keyframes = true;
+            stylesheet_note_motion_source(sheet, header, header_length,
+                css + delimiter + 1, close - delimiter - 1, true);
+            if (!style_parsed_ir_builder_append(context,
+                    STYLE_PARSED_IR_KEYFRAMES, header, header_length,
+                    css + delimiter + 1, close - delimiter - 1)) return false;
         } else if (css_header_rule(header, header_length, "@media",
                             &condition, &condition_length)) {
             if (media_matches(sheet, condition, condition_length)
@@ -815,6 +822,11 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                 context->parsed_ir->has_motion_keyframes = true;
             }
             sheet->has_motion_keyframes = true;
+            stylesheet_note_motion_source(sheet, header, header_length,
+                css + brace + 1, close - brace - 1, true);
+            if (!style_parsed_ir_builder_append(context,
+                    STYLE_PARSED_IR_KEYFRAMES, header, header_length,
+                    css + brace + 1, close - brace - 1)) return false;
         } else if (css_header_rule(header, header_length, "@media",
                             &condition, &condition_length)) {
             if (media_matches(sheet, condition, condition_length)
@@ -1117,17 +1129,26 @@ static bool collect_styles(
     for (; node != NULL; node = node->next) {
         size_t name_length = 0;
         const char *name = document_element_name(node, &name_length);
-        if (name != NULL && span_equal(name, name_length, "style")) {
+        bool inline_style = name != NULL && span_equal(name, name_length, "style");
+        size_t override_length = 0;
+        const char *override = inline_style
+            ? document_cssom_sheet_text(node, &override_length) : NULL;
+        if (inline_style) {
             stylesheet_note_style_source(context->sheet, node);
         }
-        if (name != NULL && span_equal(name, name_length, "style")
-            && tilefinch_csp_allows_inline_style(
+        if (inline_style && tilefinch_csp_allows_inline_style(
                    content_security_policy, node)) {
             Stylesheet *sheet = context->sheet;
             unsigned scope_begin = sheet->next_order;
             bool scoped = document_shadow_carrier_containing(node) != NULL;
             sheet->parsing_scoped_source = scoped;
-            for (lxb_dom_node_t *child = node->first_child; child != NULL; child = child->next) {
+            if (override != NULL && !parse_css_range(
+                    context, override, 0, override_length)) {
+                sheet->parsing_scoped_source = false;
+                return false;
+            }
+            for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL;
+                 child != NULL; child = child->next) {
                 size_t length = 0;
                 const char *css = document_text_data(child, &length);
                 if (css != NULL

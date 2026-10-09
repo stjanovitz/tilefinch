@@ -1223,21 +1223,6 @@ void script_static_cost_profile(
     *profile = result;
 }
 
-bool script_static_cost_rejects(
-    const ScriptStaticCostProfile *signals, bool third_party, bool module)
-{
-    if (signals == NULL || module || !third_party) return false;
-    const unsigned dynamic = SCRIPT_COST_SIGNAL_EVAL
-                           | SCRIPT_COST_SIGNAL_FUNCTION_CTOR
-                           | SCRIPT_COST_SIGNAL_DOCUMENT_WRITE;
-    if (signals->bytes >= 384u * 1024u) return true;
-    if (signals->bytes >= 192u * 1024u
-        && (signals->flags & dynamic) != 0 && signals->loops >= 2u) {
-        return true;
-    }
-    return signals->bytes >= 256u * 1024u && signals->loops >= 16u;
-}
-
 static void script_record_watchdog_profile(
     const ScriptStaticCostProfile *signals,
     ExternalScriptMetrics *metrics)
@@ -1909,8 +1894,7 @@ static bool execute_external_node(
     request_context.csp_grant = csp_grant;
     const BrowserCacheEntry *cached = NULL;
     /* An installed app's classic script restored as bytecode only runs
-       without reading its source unless integrity metadata, or the
-       cross-origin cost check below, needs the bytes. */
+       without reading its source unless integrity metadata needs the bytes. */
     size_t deferred_length = 0;
     bool deferred = !module && !cors && session != NULL
         && !script_integrity_present(node)
@@ -1918,9 +1902,7 @@ static bool execute_external_node(
                session->content_blocker, resolved, document_url,
                "script", "no-cors")
         && browser_session_offline_script_match(
-               session, resolved, &request_context, &deferred_length)
-        && (deferred_length < 192u * 1024u
-            || tilefinch_url_same_origin(document_url, resolved));
+            session, resolved, &request_context, &deferred_length);
     BrowserCacheStatus cache_status = deferred ? BROWSER_CACHE_FRESH
         : module
         ? script_module_cache_match(
@@ -1963,25 +1945,6 @@ static bool execute_external_node(
         }
         size_t cached_length = cached_source.length;
         script_metrics_record_source_work(metrics, cached_length);
-        const char *cached_response_url = module
-            ? cached->module_effective_url : resolved;
-        bool cost_rejected = false;
-        if (!module && !deferred && cached_length >= 192u * 1024u
-            && !tilefinch_url_same_origin(
-                   document_url, cached_response_url)) {
-            ScriptStaticCostProfile cost;
-            script_static_cost_profile(
-                cached_source.data, cached_length, &cost);
-            cost_rejected = script_static_cost_rejects(
-                &cost, true, false);
-        }
-        if (cost_rejected) {
-            script_runtime_script_quota_abort(runtime, &quota);
-            script_cache_source_release(&cached_source);
-            metrics->cost_class_rejections++;
-            (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
-            return true;
-        }
         if (!script_runtime_script_quota_commit(
                 runtime, &quota, cached_length)) {
             script_runtime_script_quota_abort(runtime, &quota);
@@ -2214,20 +2177,11 @@ static bool execute_external_node(
         script_lazy_webpack_plan_destroy(&lazy_plan);
         has_lazy_plan = false;
     }
-    if (ok && !module && source_length >= 192u * 1024u
-        && !tilefinch_url_same_origin(document_url, response_url)) {
-        ScriptStaticCostProfile cost;
-        script_static_cost_profile(source, source_length, &cost);
-        if (script_static_cost_rejects(&cost, true, false)) {
-            script_runtime_script_quota_abort(runtime, &quota);
-            if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
-            metrics->cost_class_rejections++;
-            (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
-            fetch_result_free(fetch);
-            script_cache_source_release(&cached_source);
-            return true;
-        }
-    }
+    /* Cross-origin classic scripts include ordinary application CDN bundles.
+       Lexical size/loop signals cannot establish that author work is unsafe.
+       Admit by the same finite source/working-set policy as same-origin code;
+       the execution watchdog enforces the actual work bound. Cost profiling
+       remains diagnostic when that watchdog refuses execution. */
     if (ok && !script_runtime_script_quota_commit(
                   runtime, &quota, source_length)) {
         script_runtime_script_quota_abort(runtime, &quota);

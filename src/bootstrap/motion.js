@@ -1,4 +1,6 @@
 (() => {
+  const nativeMotionSource = globalThis.__tilefinchMotionSourceBridge;
+  delete globalThis.__tilefinchMotionSourceBridge;
   /*
    * CSS motion uses the same bounded property-effect scheduler as
    * Element.animate() and inline transitions.  The parser intentionally
@@ -651,17 +653,24 @@
         roots = collectTreeRoots(nativeInline),
         candidates = new Map(),
         candidateFrames = new Map();
+      const nativeSource = nativeMotionSource?.();
       for (const root of roots) {
         if (retainedStyles >= STYLE_LIMIT) break;
         const keyframes = new Map(),
           rules = [],
-          styleNodes = queryTree(
+          nativeMotion = root === document && typeof nativeSource === "string",
+          styleNodes = nativeMotion ? [] : queryTree(
             root, "style", STYLE_LIMIT - retainedStyles, nativeInline),
           styleCount = Math.min(
             STYLE_LIMIT - retainedStyles,
             styleNodes.length,
           );
         retainedStyles += styleCount;
+        if (nativeMotion) {
+          retainedBytes += boundedUtf8Length(nativeSource);
+          parseRules(nativeSource, 0, nativeSource.length, keyframes, rules,
+            0, KEYFRAME_LIMIT - totalKeyframes, RULE_LIMIT - totalRules);
+        }
         for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
           const style = styleNodes[styleIndex],
             available = STYLE_BYTES_LIMIT - retainedBytes,
@@ -874,7 +883,7 @@
       !documentHasMotionHint()
     )
       return;
-    observer = new MutationObserver((records) => {
+    observer = globalThis.__tilefinchObserveMutations((records) => {
       for (const record of records)
         if (
           record.type !== "attributes" ||
@@ -883,8 +892,7 @@
           globalThis.__tilefinchMotionRecheck();
           break;
         }
-    });
-    observer.observe(document.documentElement, {
+    }, document.documentElement, {
       subtree: true,
       childList: true,
       characterData: true,

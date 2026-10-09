@@ -13,6 +13,7 @@ set(TILEFINCH_CORE_SOURCES
     src/content_security_policy.c
     src/controller.c
     src/media_discovery.c
+    src/linked_video_preview.c
     src/danzeff_input.c
     src/data_url.c
     src/diagnostics.c

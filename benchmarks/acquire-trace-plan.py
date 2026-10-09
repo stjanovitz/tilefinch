@@ -809,8 +809,12 @@ def _validate_response_cookies(
         if any(character != "x" for character in redacted):
             raise AcquisitionError("response cookie value is not deterministically redacted")
         attributes: dict[str, str | None] = {}
-        for part in parts[1:]:
+        for index, part in enumerate(parts[1:], start=1):
             if not part:
+                # Match the offline Chrome parser: a trailing semicolon
+                # adds no cookie attribute (RFC 6265 section 5.2).
+                if index == len(parts) - 1:
+                    continue
                 raise AcquisitionError("response cookie has an empty attribute")
             if "=" in part:
                 attribute, attribute_value = part.split("=", 1)

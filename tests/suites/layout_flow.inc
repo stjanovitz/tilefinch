@@ -1026,6 +1026,11 @@ static int test_unloaded_image_reserves_ratio_box(Budget *budget)
         "<div class=wrap><img id=bare src=/d.jpg alt='one two three four "
         "five six seven eight nine ten eleven twelve thirteen fourteen "
         "fifteen sixteen seventeen eighteen nineteen twenty'></div>"
+        "<figure><img id=blockbare style='display:block;line-height:0' "
+        "src=/e.jpg alt='one two three four five six seven eight nine ten "
+        "eleven twelve thirteen fourteen fifteen sixteen seventeen "
+        "eighteen nineteen twenty'><figcaption id=blockcaption>"
+        "Caption follows the unavailable image</figcaption></figure>"
         "</body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
@@ -1064,6 +1069,22 @@ static int test_unloaded_image_reserves_ratio_box(Budget *budget)
         }
     }
     CHECK(lines >= 3 && !overlap);
+    const LayoutNodeBox *blockbare = layout_box_for_node(
+        &layout, find_id(root, "blockbare"));
+    const LayoutNodeBox *blockcaption = layout_box_for_node(
+        &layout, find_id(root, "blockcaption"));
+    CHECK(blockbare != NULL && blockbare->height >= 32
+          && blockcaption != NULL
+          && blockcaption->y >= blockbare->y + blockbare->height);
+    alt = document_attribute(find_id(root, "blockbare"), "alt", &alt_length);
+    for (size_t i = 0; alt != NULL && i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        uintptr_t text_at = (uintptr_t) command->text;
+        uintptr_t alt_at = (uintptr_t) alt;
+        if (command->type == DRAW_TEXT && text_at >= alt_at
+            && text_at - alt_at < alt_length)
+            CHECK(command->y + command->height <= blockcaption->y);
+    }
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);

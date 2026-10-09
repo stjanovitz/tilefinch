@@ -360,6 +360,59 @@ static int test_parity_bottom_inset_auto_height(void)
     return 0;
 }
 
+static int test_parity_bottom_inset_min_height(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;position:relative;min-height:272px}"
+        "#content{height:600px}#wrap{height:80px}"
+        "#badge{position:absolute;bottom:0;width:100%;height:40px;"
+        "background:#00ff00}</style><body><div id=content>content</div>"
+        "<div id=wrap><div id=badge>bottom</div></div></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const LayoutNodeBox *badge = parity_box(&page, "badge");
+    const DrawCommand *text = text_command(&page.layout, "bottom");
+    const DrawCommand *fill = parity_fill(&page.layout, 0x00ff00u, 0);
+    CHECK(badge != NULL && badge->y == 640 && badge->height == 40);
+    CHECK(text != NULL && text->y >= 640 && text->y < 680);
+    CHECK(fill != NULL && fill->y == 640);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_parity_flexible_grid_minimum(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.strip{display:grid;width:432px;"
+        "grid-template-columns:repeat(4,1fr);gap:24px;overflow-x:auto}"
+        ".strip>div{min-width:204px;height:40px}"
+        "#shrink{grid-template-columns:repeat(4,minmax(0,1fr))}"
+        "</style><body><div class=strip><div id=a>A</div><div id=b>B</div>"
+        "<div>C</div><div>D</div></div><div class=strip id=shrink>"
+        "<div id=c>E</div><div id=d>F</div><div>G</div><div>H</div></div></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const LayoutNodeBox *a = parity_box(&page, "a");
+    const LayoutNodeBox *b = parity_box(&page, "b");
+    const LayoutNodeBox *c = parity_box(&page, "c");
+    const LayoutNodeBox *d = parity_box(&page, "d");
+    CHECK(a != NULL && b != NULL && c != NULL && d != NULL);
+    CHECK(a->width == 204 && b->x == a->x + 228);
+    /* An explicit zero track minimum still permits the item to overflow
+       its 90px track; it must not silently become an automatic minimum. */
+    CHECK(c->width == 204 && d->x == c->x + 114);
+    lxb_dom_node_t *shrink = find_id(
+        lxb_dom_interface_node(page.document.html), "shrink");
+    ComputedStyle shrink_style = style_for_node(&page.sheet, shrink, NULL);
+    char tracks[128];
+    CHECK(stylesheet_serialize_grid_template_tracks(
+        &page.sheet, &shrink_style, false, tracks, sizeof(tracks)));
+    CHECK(strcmp(tracks,
+        "minmax(0px,1fr) minmax(0px,1fr) minmax(0px,1fr) minmax(0px,1fr)") == 0);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 /* Non-replaced inline boxes paint their background behind each line
    fragment's content area plus padding: MDN's `code` spans and links. */
 static int test_parity_inline_backgrounds(void)
@@ -404,8 +457,383 @@ static int test_parity_inline_backgrounds(void)
     return 0;
 }
 
+static int test_parity_current_color_background(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;color:#123456}"
+        "button{background:none;border:0;padding:4px;color:inherit}"
+        "button span{display:block;width:22px;height:2px;margin:4px auto;"
+        "background-color:currentColor}"
+        "#later{background:currentColor;color:#00ff00;width:20px;height:10px}"
+        "#override{background-color:currentColor;background-color:#ff0000;"
+        "width:20px;height:10px}"
+        "#transparent{background:currentColor;background:transparent;"
+        "width:20px;height:10px}"
+        "#inherit{background-color:inherit;color:#0000ff;width:20px;height:10px}"
+        "#pseudo::after{content:'';display:block;width:20px;height:3px;"
+        "background:var(--ink);color:#ffff00}#pseudo{--ink:currentColor}"
+        "</style><body><button><span></span><span></span><span></span></button>"
+        "<div id=later><div id=inherit></div></div><div id=override></div>"
+        "<div id=transparent></div><div id=pseudo></div></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    for (size_t i = 0; i < 3; i++) {
+        const DrawCommand *bar = parity_fill(&page.layout, 0x123456u, i);
+        CHECK(bar != NULL && bar->width == 22 && bar->height == 2);
+    }
+    CHECK(parity_fill(&page.layout, 0x00ff00u, 0) != NULL);
+    CHECK(parity_fill(&page.layout, 0x0000ffu, 0) != NULL);
+    CHECK(parity_fill(&page.layout, 0xff0000u, 0) != NULL);
+    CHECK(parity_fill(&page.layout, 0xffff00u, 0) != NULL);
+    ComputedStyle body = style_for_node(&page.sheet,
+        find_id(lxb_dom_interface_node(page.document.html), "later"), NULL);
+    ComputedStyle transparent = style_for_node(&page.sheet,
+        find_id(lxb_dom_interface_node(page.document.html), "transparent"), &body);
+    CHECK(!transparent.has_background);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_parity_transformed_intrinsic_widths(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px Arial}"
+        ".row{display:flex;gap:8px}.label{font-size:12px;font-weight:bold;"
+        "padding:4px;background:#00ff00;align-self:center}"
+        ".upper{text-transform:uppercase}.lower{text-transform:lowercase}"
+        ".atomic{display:inline-block;padding:4px;font-kerning:none}"
+        ".minimum{display:inline-block;width:min-content;overflow-wrap:anywhere}"
+        "#capital{text-transform:capitalize}"
+        "</style><body><div class=row><div id=upper class='label upper'>"
+        "Widely available</div><div id=upper-literal class=label>"
+        "WIDELY AVAILABLE</div></div>"
+        "<div class=atomic id=lower><span class=lower>WIDE LABEL</span></div>"
+        "<div class=atomic id=lower-literal>wide label</div>"
+        "<div class=minimum id=capital>immmmm</div>"
+        "<div class=minimum id=capital-literal>Immmmm</div></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        TILEFINCH_TEST_SERIF_FONT, TILEFINCH_TEST_SANS_ITALIC_FONT,
+        TILEFINCH_TEST_SANS_BOLD_FONT, TILEFINCH_TEST_SERIF_BOLD_FONT,
+        TILEFINCH_TEST_METRIC_SANS_FONT, TILEFINCH_TEST_METRIC_SANS_BOLD_FONT,
+        2u * MIB));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    const LayoutNodeBox *upper = parity_box(&page, "upper");
+    const LayoutNodeBox *literal = parity_box(&page, "upper-literal");
+    const LayoutNodeBox *lower = parity_box(&page, "lower");
+    const LayoutNodeBox *lower_literal = parity_box(&page, "lower-literal");
+    const LayoutNodeBox *capital = parity_box(&page, "capital");
+    const LayoutNodeBox *capital_literal = parity_box(&page, "capital-literal");
+    CHECK(upper != NULL && literal != NULL && lower != NULL && lower_literal != NULL);
+    CHECK(capital != NULL && capital_literal != NULL);
+    if (upper->width != literal->width || upper->height != literal->height
+        || lower->width != lower_literal->width)
+        fprintf(stderr, "transformed intrinsic: upper=%dx%d literal=%dx%d "
+                "lower=%d literal=%d\n", upper->width, upper->height,
+                literal->width, literal->height, lower->width, lower_literal->width);
+    CHECK(upper->width == literal->width && upper->height == literal->height);
+    CHECK(lower->width == lower_literal->width);
+    CHECK(capital->width == capital_literal->width);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_parity_inline_block_child_margins(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.group{display:inline-block;"
+        "padding:4px;border:0;background:none}.bar{display:block;width:22px;"
+        "height:2px;margin:4px auto;background:#123456}</style><body>"
+        "<button class=group id=button><span class=bar></span>"
+        "<span class=bar></span><span class=bar></span></button>"
+        "<div class=group id=box><div class=bar></div>"
+        "<div class=bar></div><div class=bar></div></div></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    for (size_t group = 0; group < 2; group++) {
+        const DrawCommand *first = parity_fill(&page.layout, 0x123456u, group * 3);
+        const DrawCommand *second = parity_fill(&page.layout, 0x123456u, group * 3 + 1);
+        const DrawCommand *third = parity_fill(&page.layout, 0x123456u, group * 3 + 2);
+        const LayoutNodeBox *box = parity_box(&page, group == 0 ? "button" : "box");
+        CHECK(first != NULL && second != NULL && third != NULL && box != NULL);
+        CHECK(second->y - first->y == 6 && third->y - second->y == 6);
+        CHECK(first->y - box->y == 8 && box->height == 30);
+    }
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_parity_positioned_pseudo_static_margins(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}a{float:left;width:54px;"
+        "height:44px;position:relative}span{margin:0 auto;position:relative;"
+        "top:21px;color:transparent;font:0/0 a}"
+        "span::before,span::after{content:'';position:absolute}"
+        "span,span::before,span::after{display:block;width:20px;height:3px;"
+        "background:#123456}span::before{margin-top:-7px}"
+        "span::after{margin-top:7px}</style><body>"
+        "<a><span id=bars>Menu</span></a></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const DrawCommand *middle = parity_fill(&page.layout, 0x123456u, 0);
+    const DrawCommand *before = parity_fill(&page.layout, 0x123456u, 1);
+    const DrawCommand *after = parity_fill(&page.layout, 0x123456u, 2);
+    CHECK(middle != NULL && before != NULL && after != NULL);
+    if (middle->x != 17 || middle->y != 21 || before->x != 17
+        || before->y != 14 || after->x != 17 || after->y != 28)
+        fprintf(stderr, "pseudo static margins: %d,%d %d,%d %d,%d\n",
+            middle->x, middle->y, before->x, before->y, after->x, after->y);
+    CHECK(middle->x == 17 && middle->y == 21);
+    CHECK(before->x == 17 && before->y == 14);
+    CHECK(after->x == 17 && after->y == 28);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_parity_generated_inline_spacing(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        "header{display:flex;height:52px;width:240px}"
+        "#wrap{display:flex;align-items:center;width:100%}"
+        "h2{margin:0;font:14px/18px sans-serif;display:-webkit-box;"
+        "-webkit-box-orient:vertical;-webkit-line-clamp:1}"
+        "h2::before{content:'M';width:15px;margin-right:2px}"
+        "#odds{font:10px/12px sans-serif}"
+        "#odds::after{content:'';display:inline-block;width:3px;"
+        "height:3px;margin:0 2px;background:#123456;"
+        "position:relative;top:-2px}"
+        "#bets{display:flex;justify-content:center;align-items:center;"
+        "flex-wrap:wrap;gap:4px;width:240px;margin:0;padding:0;"
+        "list-style:none;font:11px/13px sans-serif}"
+        "#bets li{float:left;position:relative;top:-2px}"
+        "#bets li:first-child::after{content:'';display:inline-block;"
+        "width:3px;height:3px;margin:0 2px;background:#654321;"
+        "position:relative;top:-2px}"
+        "#text-atomic{font:10px/12px sans-serif}"
+        "#text-atomic::before{content:'Z';display:inline-block;"
+        "position:relative;top:-4px}"
+        "#percent-atomic{width:100px;font:10px/12px sans-serif}"
+        "#percent-atomic::before{content:'';display:inline-block;"
+        "width:50%;height:3px;background:#abcdef}"
+        "</style><body><header><div id=wrap><div id=heading>"
+        "<h2>Headline</h2></div></div></header><div id=odds>Spread</div>"
+        "<ul id=bets><li>\n<span>A</span>\n </li>"
+        "<li><span>Second wager</span></li></ul>"
+        "<div id=text-atomic>Body</div>"
+        "<div id=percent-atomic>Tail</div></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const LayoutNodeBox *heading = parity_box(&page, "heading");
+    const DrawCommand *icon = text_command(&page.layout, "M");
+    const DrawCommand *title = text_command(&page.layout, "Headline");
+    const DrawCommand *spread = text_command(&page.layout, "Spread");
+    const DrawCommand *dot = parity_fill(&page.layout, 0x123456u, 0);
+    const DrawCommand *first = text_command(&page.layout, "A");
+    const DrawCommand *separator = parity_fill(&page.layout, 0x654321u, 0);
+    CHECK(heading && icon && title && spread && dot);
+    CHECK(title->x >= icon->x + icon->width + 2);
+    CHECK(heading->y == (52 - heading->height) / 2);
+    CHECK(dot->x == spread->x + spread->width + 2);
+    CHECK(dot->y > spread->y && dot->y < spread->y + spread->height);
+    CHECK(first && separator);
+    CHECK(separator->y > first->y
+          && separator->y < first->y + first->height);
+    const DrawCommand *generated = text_command(&page.layout, "Z");
+    const DrawCommand *body = text_command(&page.layout, "Body");
+    const DrawCommand *percent = parity_fill(&page.layout, 0xabcdefu, 0);
+    /* This font-free fixture uses the documented 3/4-height fallback
+       baseline. Relative positioning moves ink, not the flow baseline. */
+    CHECK(generated && body
+          && body->y + body->height * 3 / 4
+             == generated->y + generated->height * 3 / 4 + 4);
+    CHECK(percent && percent->width == 50);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_parity_inherited_box_sizing(void)
+{
+    static const char html[] =
+        "<!doctype html><style>html{box-sizing:border-box}body{margin:0}"
+        "*,::before,::after{box-sizing:inherit}"
+        "section{width:200px;padding:16px;border:2px solid}"
+        "section div{width:100%;padding:10px;border:1px solid}"
+        "#content{box-sizing:content-box}"
+        "#initial{box-sizing:initial}#unset{box-sizing:unset}"
+        "#last{box-sizing:inherit;box-sizing:content-box}"
+        "#invalid{box-sizing:inherit;box-sizing:not-border-box}"
+        "#var{--size:inherit;box-sizing:var(--size)}"
+        "#pseudo::after{content:'';display:block;width:100%;height:10px;"
+        "padding:4px;border:1px solid #123456}"
+        "</style><body><section id=border><div id=child></div></section>"
+        "<section id=content><div id=content-child></div></section>"
+        "<section id=initial></section><section id=unset></section>"
+        "<section id=last></section><section id=var></section>"
+        "<section id=invalid></section>"
+        "<section id=inline style='box-sizing:content-box;box-sizing:inherit'>"
+        "</section><section id=pseudo></section></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const LayoutNodeBox *border = parity_box(&page, "border");
+    const LayoutNodeBox *child = parity_box(&page, "child");
+    const LayoutNodeBox *content = parity_box(&page, "content");
+    const LayoutNodeBox *content_child = parity_box(&page, "content-child");
+    CHECK(border && child && content && content_child);
+    CHECK(border->width == 200 && child->width == 164);
+    CHECK(content->width == 236 && content_child->width == 222);
+    CHECK(parity_box(&page, "initial")->width == 236);
+    CHECK(parity_box(&page, "unset")->width == 236);
+    CHECK(parity_box(&page, "last")->width == 236);
+    CHECK(parity_box(&page, "var")->width == 200);
+    CHECK(parity_box(&page, "invalid")->width == 200);
+    CHECK(parity_box(&page, "inline")->width == 200);
+    const DrawCommand *edge = parity_fill(&page.layout, 0x123456u, 0);
+    CHECK(edge && edge->width == 164);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 static int test_site_parity(void)
 {
+    CHECK(test_parity_inherited_box_sizing() == 0);
+    {
+        /* Large functional lists retain their actual text, not a fixed-size
+           rewrite buffer. Keep both alternatives and ancestor matching. */
+        static const char selector[] =
+            ".visual-theme .component:is(.feature-lead-package,"
+            ".feature-lead-headlines,.feature-lead-images,.feature-vertical-strip,"
+            ".feature-grid-two,.feature-grid-three,.feature-grid-four,"
+            ".feature-hero-card,.feature-shelf-carousel,.feature-spotlight,"
+            ".feature-side-by-side,.feature-streaming-showcase) "
+            ".media-wrapper .label:is(.label-subscriber,.label-exclusive,"
+            ".label-opinion,.label-analysis,.label-investigates,.label-review,"
+            ".label-trending,.label-custom,.label-poll,.label-projection,"
+            ".label-streaming,.label-fact-check,.label-quiz)";
+        CHECK(sizeof(selector) > 256 && sizeof(selector) < 1024);
+        char html[2048];
+        int length = snprintf(html, sizeof(html),
+            "<!doctype html><style>body{margin:0}.label{width:10px;height:20px}"
+            "%s{width:70px;--badge-ink:#ff0000;background:var(--badge-ink)}"
+            ".visual-theme .label{width:30px}"
+            "</style><body class=visual-theme>"
+            "<div class='component feature-spotlight'><div class=media-wrapper>"
+            "<div id=matched class='label label-analysis'></div>"
+            "<div id=other class='label label-unknown'></div></div></div>"
+            "<div class='component feature-unknown'><div class=media-wrapper>"
+            "<div id=outside class='label label-analysis'></div></div></div>"
+            "</body>", selector);
+        CHECK(length > 0 && (size_t) length < sizeof(html));
+        ParityPage page;
+        CHECK(parity_page_load(&page, html));
+        if (parity_box(&page, "matched")->width != 70) {
+            lxb_dom_node_t *node = find_id(
+                lxb_dom_interface_node(page.document.html), "matched");
+            fprintf(stderr, "long selector: length=%zu rules=%zu custom=%zu "
+                    "drops=%llu/%llu width=%d matches=%d\n",
+                    sizeof(selector) - 1u, page.sheet.count,
+                    page.sheet.custom_rule_count,
+                    (unsigned long long) page.sheet.diagnostic_selector_drops,
+                    (unsigned long long) page.sheet.diagnostic_custom_property_drops,
+                    parity_box(&page, "matched")->width,
+                    style_selector_matches(node, selector,
+                                           sizeof(selector) - 1u));
+            for (size_t i = 0; i < page.sheet.count; i++) {
+                const StyleRule *r = &page.sheet.rules[i];
+                fprintf(stderr, "rule %zu length=%u specificity=%u match=%d key=%u+%u\n",
+                        i, r->selector_length, r->specificity,
+                        stylesheet_rule_index_matches(&page.sheet, i, node),
+                        r->fast_key_offset, r->fast_key_length);
+            }
+        }
+        CHECK(parity_box(&page, "matched")->width == 70);
+        CHECK(parity_box(&page, "other")->width == 30);
+        CHECK(parity_box(&page, "outside")->width == 30);
+        CHECK(parity_fill(&page.layout, 0xff0000u, 0) != NULL);
+        CHECK(parity_page_destroy(&page));
+    }
+    {
+        ParityPage page;
+        CHECK(parity_page_load(&page,
+            "<!doctype html><style>body{margin:0}"
+            ".primary-stack-items{padding:0 16px;--gutter:16px}"
+            ".content-item{width:100%;height:20px;position:relative}"
+            ".reader-layout-with-sidebar :is(.primary-content-zone,.primary-product-zone):first-child "
+            ":is(.primary-zone-items,.primary-product-items,.primary-stack-items)"
+            ">.content-container:first-child.featured-story .content-item:first-child{"
+            "left:calc(-1*var(--gutter));"
+            "min-width:calc(100% + (2*var(--gutter)));"
+            "max-width:calc(100% + (2*var(--gutter)))}"
+            "</style><body class=reader-layout-with-sidebar><div class=primary-product-zone>"
+            "<div><div class=primary-stack-items><div class='content-container featured-story'>"
+            "<div id=bleed class=content-item></div><div id=ordinary class=content-item></div>"
+            "</div></div></div></div></body>"));
+        const LayoutNodeBox *bleed = parity_box(&page, "bleed");
+        const LayoutNodeBox *ordinary = parity_box(&page, "ordinary");
+        CHECK(bleed && ordinary && bleed->x == 0 && bleed->width == 480);
+        CHECK(ordinary->x == 16 && ordinary->width == 448);
+        CHECK(parity_page_destroy(&page));
+    }
+    {
+        ParityPage page;
+        CHECK(parity_page_load(&page,
+            "<!doctype html><style>body{margin:0}"
+            "#row{display:flex;height:40px}"
+            "#inner{display:flex;align-items:center;height:100%}"
+            "#icon{display:block;width:46px;height:22px}"
+            "</style><body><div id=row><span id=inner><svg id=icon "
+            "viewBox='0 0 46 22'></svg></span></div></body>"));
+        const LayoutNodeBox *inner = parity_box(&page, "inner");
+        const LayoutNodeBox *icon = parity_box(&page, "icon");
+        CHECK(inner && icon && inner->height == 40 && icon->y == 9);
+        CHECK(parity_page_destroy(&page));
+        CHECK(parity_page_load(&page,
+            "<!doctype html><style>body{margin:0}"
+            "#brand{display:flex;height:40px}"
+            "a{padding:4px;border:1px solid;margin:2px 0}"
+            "#inner{display:flex;align-items:center;height:100%}"
+            "#icon{display:block;width:46px;height:22px}"
+            "</style><body><div id=brand><a id=link href='#'>"
+            "<span id=inner><svg id=icon viewBox='0 0 46 22'></svg>"
+            "</span></a></div></body>"));
+        inner = parity_box(&page, "inner");
+        icon = parity_box(&page, "icon");
+        CHECK(inner && icon && inner->height == 26 && icon->y == 9);
+        CHECK(parity_box(&page, "link")->height == 36);
+        CHECK(parity_page_destroy(&page));
+        CHECK(parity_page_load(&page,
+            "<!doctype html><style>body{margin:0}"
+            "#brand{display:flex;align-items:center;height:40px}"
+            "#inner{display:flex;align-items:center;height:100%}"
+            "#icon{display:block;width:46px;height:22px}"
+            "</style><body><div id=brand><a id=link href='#'>"
+            "<span id=inner><svg id=icon viewBox='0 0 46 22'></svg>"
+            "</span></a></div></body>"));
+        inner = parity_box(&page, "inner");
+        icon = parity_box(&page, "icon");
+        CHECK(inner && icon && inner->height == 22 && icon->y == 9);
+        CHECK(parity_page_destroy(&page));
+        CHECK(parity_page_load(&page,
+            "<!doctype html><style>body{margin:0}"
+            "#row{display:flex;align-items:center;height:40px}"
+            "#brand{display:flex;height:40px}"
+            "#inner{display:flex;align-items:center;height:100%}"
+            "#icon{display:block;width:46px;height:22px}"
+            "</style><body><div id=row><div id=brand><a id=link href='#'>"
+            "<span id=inner><svg id=icon viewBox='0 0 46 22'></svg>"
+            "</span></a></div></div></body>"));
+        inner = parity_box(&page, "inner");
+        icon = parity_box(&page, "icon");
+        CHECK(inner && icon && inner->height == 40 && icon->y == 9);
+        CHECK(parity_page_destroy(&page));
+    }
     puts("test: positioned pseudos use their containing block");
     CHECK(test_parity_positioned_pseudo_containing_block() == 0);
     puts("test: text-wrap nowrap, media not, hidden pseudos");
@@ -416,9 +844,22 @@ static int test_site_parity(void)
     CHECK(test_parity_percentages_and_strips() == 0);
     puts("test: row flex containers lay out generated items");
     CHECK(test_parity_generated_flex_items() == 0);
+    CHECK(test_parity_generated_inline_spacing() == 0);
     puts("test: bottom insets follow an auto-height containing block");
     CHECK(test_parity_bottom_inset_auto_height() == 0);
+    puts("test: bottom insets follow growth beyond a minimum height");
+    CHECK(test_parity_bottom_inset_min_height() == 0);
+    puts("test: flexible grid tracks retain automatic minimums");
+    CHECK(test_parity_flexible_grid_minimum() == 0);
     puts("test: inline boxes paint their backgrounds");
     CHECK(test_parity_inline_backgrounds() == 0);
+    puts("test: currentColor backgrounds follow the final foreground");
+    CHECK(test_parity_current_color_background() == 0);
+    puts("test: intrinsic sizing measures transformed text");
+    CHECK(test_parity_transformed_intrinsic_widths() == 0);
+    puts("test: inline-block sibling margins collapse inside the container");
+    CHECK(test_parity_inline_block_child_margins() == 0);
+    puts("test: positioned empty pseudos retain margins at their static position");
+    CHECK(test_parity_positioned_pseudo_static_margins() == 0);
     return 0;
 }

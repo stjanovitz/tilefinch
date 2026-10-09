@@ -32,7 +32,7 @@
 
 static lxb_dom_node_t *test_find_id(lxb_dom_node_t *node, const char *id);
 /* Private deterministic seam implemented by navigation.c for this test
-   executable; zero always restores the production one-MiB work bound. */
+   executable; zero restores the production realm source-policy bound. */
 void navigation_test_set_parser_script_stage_work_limit(size_t limit);
 void navigation_test_set_parser_script_stage_elapsed_us(uint64_t elapsed_us);
 void navigation_test_set_parser_script_stage_time_limit_us(uint64_t limit_us);

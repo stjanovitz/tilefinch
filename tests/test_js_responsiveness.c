@@ -1617,6 +1617,53 @@ static bool runtime_string_is(ScriptRuntime *runtime, const char *expression,
    the old 64-observer cap threw. The bound is page-wide registrations,
    which is what each update re-evaluates, and an update step evaluates a
    bounded slice so many targets never make one long step. */
+static int test_resize_observer_registration_budget(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    const char html[] = "<!doctype html><body></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://observer-budget.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{for(let i=0;i<300;i++)new ResizeObserver(()=>{});"
+        "let delivered=0;const active=[];for(let i=0;i<100;i++){"
+        "const target=document.createElement('div');document.body.append(target);"
+        "const observer=new ResizeObserver(entries=>delivered+=entries.length);"
+        "observer.observe(target);active.push([observer,target])}"
+        "globalThis.roBudget={active,get delivered(){return delivered}}})()",
+        "<resize-budget>", &result));
+    CHECK(script_runtime_advance(runtime, 16, 32, &result));
+    CHECK(runtime_string_is(runtime, "String(roBudget.delivered)", "100"));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{for(const [observer,target] of roBudget.active)observer.unobserve(target);"
+        "const target=roBudget.active[0][1],all=[];"
+        "let refused=false;try{for(let i=0;i<1100;i++)"
+        "{const observer=new ResizeObserver(()=>{});all.push(observer);"
+        "observer.observe(target)}}catch(e){"
+        "refused=e instanceof RangeError&&/target limit/.test(e.message)}"
+        "if(!refused)throw Error('unbounded registrations');"
+        "for(const observer of all)observer.disconnect();"
+        "for(let i=0;i<1023;i++)all[i].observe(target);"
+        "const inner=new ResizeObserver(()=>{}),outer=new ResizeObserver(()=>{});"
+        "let reentrantRefused=false;try{outer.observe(target,{get box(){"
+        "inner.observe(target);return 'content-box'}})}catch(e){"
+        "reentrantRefused=e instanceof RangeError}"
+        "inner.disconnect();outer.observe(target);outer.disconnect();"
+        "globalThis.pocSummary=reentrantRefused?'RESIZE-BOUNDED':'RESIZE-UNBOUNDED'})()",
+        "<resize-budget-refusal>", &result));
+    CHECK(strcmp(result.summary, "RESIZE-BOUNDED") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+    return 0;
+}
+
 static int test_intersection_observer_registration_budget(void)
 {
     Budget budget;
@@ -5042,6 +5089,8 @@ int main(int argc, char **argv)
     if (argc == 2
         && strcmp(argv[1], "--intersection-observer-budget-only") == 0)
         return test_intersection_observer_registration_budget();
+    if (argc == 2 && strcmp(argv[1], "--resize-observer-budget-only") == 0)
+        return test_resize_observer_registration_budget();
     if (argc == 2 && strcmp(argv[1], "--job-heap-rejection-only") == 0)
         return test_job_heap_rejection_is_fatal();
     if (argc == 2 && strcmp(argv[1], "--host-state-only") == 0)
@@ -5067,6 +5116,7 @@ int main(int argc, char **argv)
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_intersection_observer_registration_budget() == 0);
+    CHECK(test_resize_observer_registration_budget() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_computed_style_memo_invalidation() == 0);
     CHECK(test_computed_style_ancestor_cache() == 0);
@@ -9962,11 +10012,19 @@ int main(int argc, char **argv)
         "&&authorSheet.cssRules.length===2"
         "&&authorSheet.cssRules[0].selectorText==='.author-a'"
         "&&authorSheet.cssRules[0].parentStyleSheet===authorSheet;"
+        "const lazyAuthorTracking=authorSheet.__authorRevision===undefined"
+        "&&!Object.prototype.hasOwnProperty.call(authorSheet,'__refreshAuthor');"
+        "const authorText=author.textContent,authorChild=author.firstChild,"
+        "observer=new MutationObserver(()=>{});"
+        "observer.observe(author,{childList:true,characterData:true,subtree:true});"
         "authorSheet.insertRule('.author-inserted{height:7px}',2);"
-        "const authorInserted=author.textContent.includes('author-inserted')"
+        "const authorInserted=author.textContent===authorText"
+        "&&author.firstChild===authorChild&&observer.takeRecords().length===0"
         "&&authorRules.length===3;authorSheet.deleteRule(2);"
-        "const authorDeleted=!author.textContent.includes('author-inserted')"
+        "const authorDeleted=author.textContent===authorText"
+        "&&author.firstChild===authorChild&&observer.takeRecords().length===0"
         "&&authorRules.length===2;"
+        "observer.disconnect();"
         "author.textContent='.author-live{width:4px}';"
         "const authorRefreshed=author.sheet===authorSheet"
         "&&authorSheet.cssRules.length===1"
@@ -9981,11 +10039,11 @@ int main(int argc, char **argv)
         "&&detached.style.cssText.includes('height');"
         "author.remove();globalThis.pocSummary=importRemoved&&inserted"
         "&&ordered&&live&&authorListed&&authorRefreshed"
-        "&&authorInserted&&authorDeleted&&detachedStyleInvalidated"
+        "&&lazyAuthorTracking&&authorInserted&&authorDeleted&&detachedStyleInvalidated"
         "&&duplicate&&ordinary&&syntax&&removed"
         "?'CONSTRUCTED-STYLESHEET-OK':'CONSTRUCTED-STYLESHEET-FAILED:'"
         "+JSON.stringify({importRemoved,inserted,ordered,live,duplicate,"
-        "ordinary,syntax,removed,authorListed,authorRefreshed,authorInserted,"
+        "ordinary,syntax,removed,authorListed,authorRefreshed,lazyAuthorTracking,authorInserted,"
         "authorDeleted,detachedStyleInvalidated,"
         "count:nodes.length});})()";
     bool constructed_stylesheet_ok = script_runtime_evaluate_diagnostic(

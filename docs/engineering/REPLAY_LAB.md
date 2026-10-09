@@ -180,6 +180,13 @@ No stale or hand-authored plan is live authority. A new acquisition requires a
 fresh eligible diagnostic and explicit approval of the exact origin and route
 set.
 
+For static-image and stylesheet investigations, the reference recorder's
+`--script-free-diagnostic` disables author scripts while retaining the offline
+request ledger and acquisition-plan checks. This avoids acquiring unrelated
+script and telemetry dependencies just to inspect a static surface. Its output
+is always diagnostic and cannot become a canonical fidelity reference or move
+a floor; normal qualification must still run without this option.
+
 ## Visual comparison
 
 The fidelity scoreboard is described in [Visual fidelity](../FIDELITY.md). For

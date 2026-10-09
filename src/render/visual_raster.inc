@@ -1623,6 +1623,54 @@ static void rasterize_small_backdrop_blur(
     }
 }
 
+/* Uncommon solid decorations stay out of the ordinary raster hot path. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void rasterize_sheared_fill(RasterTarget *target,
+                                  const DrawCommand *command)
+{
+    unsigned alpha = 255u * command->opacity_scale / 256u;
+    if (alpha == 0 || command->font_size <= 0
+        || command->text_length > INT_MAX) return;
+    int left = command->x > target->left ? command->x : target->left;
+    int top = command->y > target->top ? command->y : target->top;
+    int64_t far_x = (int64_t) command->x + command->width;
+    int64_t far_y = (int64_t) command->y + command->height;
+    int right = far_x < target->right ? (int) far_x : target->right;
+    int bottom = far_y < target->bottom ? (int) far_y : target->bottom;
+    unsigned rotation = draw_command_rotation_quadrants(command);
+    int64_t local_width = (int64_t) ((rotation & 1u)
+        ? command->height : command->width) * 1024;
+    int64_t local_height = (int64_t) command->font_size * 1024;
+    for (int y = top; y < bottom; y++) {
+        for (int x = left; x < right; x++) {
+            unsigned covered = 0;
+            for (unsigned sample = 0; sample < 4; sample++) {
+                int64_t dx = ((int64_t) x - command->x) * 1024
+                    + (sample & 1u ? 768 : 256);
+                int64_t dy = ((int64_t) y - command->y) * 1024
+                    + (sample & 2u ? 768 : 256);
+                int64_t lx = rotation == 1u ? dy
+                    : (rotation == 2u ? local_width - dx
+                       : (rotation == 3u ? local_width - dy : dx));
+                int64_t ly = rotation == 1u ? local_height - dx
+                    : (rotation == 2u ? local_height - dy
+                       : (rotation == 3u ? dx : dy));
+                int64_t edge = command->radius
+                    + (int64_t) command->scale * ly / 1024;
+                if (ly >= 0 && ly < local_height && lx >= edge
+                    && lx < edge + (int64_t) command->text_length * 1024)
+                    covered++;
+            }
+            size_t index = 0;
+            if (covered != 0 && raster_target_index(target, x, y, &index))
+                blend_surface_at_index(target, index, command->color,
+                                       (alpha * covered + 2u) / 4u);
+        }
+    }
+}
+
 static void rasterize_command(TileCache *cache, RasterTarget *target,
                               const DrawCommand *command)
 {
@@ -1634,6 +1682,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
     target->forced_dark_role = command->type == DRAW_IMAGE
         ? FORCED_DARK_NONE
         : (command->type == DRAW_FILL_RECT
+               || command->type == DRAW_SHEARED_FILL
                || command->type == DRAW_SHADOW_RECT
              ? FORCED_DARK_SURFACE
              : (command->type == DRAW_STROKE_RECT
@@ -1646,6 +1695,10 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
     target->resolved_color_valid = true;
     if (!intersects(command, target->left, target->top,
                     target->right, target->bottom)) return;
+    if (command->type == DRAW_SHEARED_FILL) {
+        rasterize_sheared_fill(target, command);
+        return;
+    }
     /*
      * One span clamp for every box-shaped command: the shadow, fill,
      * gradient and stroke arms below all reduce the command box to the tile

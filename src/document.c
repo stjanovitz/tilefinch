@@ -340,6 +340,7 @@ struct DocumentNonceRegistry {
     DocumentNonceSlot *values;
     size_t unlisted;
     bool hide;
+    struct DocumentCssomSheets *cssom;
 };
 
 static DocumentNonceRegistry *document_nonce_registry(
@@ -674,6 +675,21 @@ static DocumentNonceRegistry *document_nonce_registry_ensure(
     return registry;
 }
 
+struct DocumentCssomSheets *document_cssom_registry(const lxb_dom_node_t *node)
+{
+    DocumentNonceRegistry *registry = document_nonce_registry(node);
+    return registry == NULL ? NULL : registry->cssom;
+}
+
+bool document_cssom_registry_attach(PocDocument *document,
+                                    struct DocumentCssomSheets *cssom)
+{
+    DocumentNonceRegistry *registry = document_nonce_registry_ensure(document);
+    if (registry == NULL) return false;
+    registry->cssom = cssom;
+    return true;
+}
+
 static void document_nonce_registry_destroy(PocDocument *document)
 {
     DocumentNonceRegistry *registry = document->nonce_registry;
@@ -690,6 +706,20 @@ static void document_nonce_registry_destroy(PocDocument *document)
     registry->magic = 0;
     budget_free(document->budget, registry);
     document->nonce_registry = NULL;
+}
+
+void document_cssom_registry_detach(PocDocument *document,
+                                    bool release_new_routing_registry)
+{
+    DocumentNonceRegistry *registry = document == NULL
+        ? NULL : document->nonce_registry;
+    if (registry == NULL) return;
+    registry->cssom = NULL;
+    /* Roll back only metadata created by this CSSOM admission, never an
+       existing nonce-policy registry or its independently owned values. */
+    if (release_new_routing_registry && !registry->hide
+        && registry->values == NULL && registry->unlisted == 0)
+        document_nonce_registry_destroy(document);
 }
 
 /* HTML "nonce attributes": an element that becomes connected to a document
@@ -947,6 +977,7 @@ static lxb_status_t document_style_node_inserted(lxb_dom_node_t *node)
 static lxb_status_t document_style_node_removed(lxb_dom_node_t *node,
                                                 lxb_dom_node_t *old_parent)
 {
+    document_cssom_sheet_reset(old_parent);
     for (size_t i = 0; i < DOCUMENT_REMOVAL_LISTENER_LIMIT; i++) {
         if (document_removal_listeners[i].listener != NULL)
             document_removal_listeners[i].listener(
@@ -3398,6 +3429,7 @@ void document_destroy(PocDocument *document)
     }
     if (document->budget != NULL) {
         media_declared_video_cache_destroy(document);
+        document_cssom_sheets_destroy(document);
         document_nonce_registry_destroy(document);
         document_adopted_sheets_destroy(document);
         DocumentControlState *state = document->control_states;
@@ -4304,6 +4336,7 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
     size_t content_length = 0;
     const char *content = document_attribute(meta, "content", &content_length);
     if (content == NULL) return true;
+    int scaled_width = 0;
     for (size_t at = 0; at < content_length;) {
         while (at < content_length
                && (isspace((unsigned char) content[at])
@@ -4327,8 +4360,29 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
         size_t value_end = at;
         while (value_end > value_start
                && isspace((unsigned char) content[value_end - 1])) value_end--;
-        if (!ascii_span_equal(content + name_start, name_end - name_start,
-                              "width")) continue;
+        bool initial_scale = ascii_span_equal(
+            content + name_start, name_end - name_start, "initial-scale");
+        if (!initial_scale
+            && !ascii_span_equal(content + name_start, name_end - name_start,
+                                 "width")) continue;
+        if (initial_scale) {
+            char number[32];
+            size_t length = value_end - value_start;
+            if (length == 0 || length >= sizeof(number)) continue;
+            memcpy(number, content + value_start, length);
+            number[length] = '\0';
+            char *end = NULL;
+            double scale = strtod(number, &end);
+            /* Preserve the bounded mobile viewport policy. Only convert
+               finite positive scales whose derived width fits that policy;
+               compare before converting to int, including NaN/infinity. */
+            if (end == number || !(scale >= 0.1 && scale <= 10.0)) continue;
+            double width = device_width / scale;
+            if (width >= 240.0 && width <= 1024.0) {
+                scaled_width = (int) (width + 0.5);
+            }
+            continue;
+        }
         if (ascii_span_equal(content + value_start, value_end - value_start,
                              "device-width")) {
             viewport->device_width = true;
@@ -4351,6 +4405,16 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
         viewport->scale_numerator = device_width;
         viewport->scale_denominator = (int) parsed;
         return true;
+    }
+    /* An initial scale supplies the width when no usable width was given.
+       In particular initial-scale=1 must not take the 980px desktop path
+       and shrink a responsive page to half-sized text and controls. */
+    if (scaled_width != 0) {
+        viewport->layout_width = scaled_width;
+        viewport->scale_numerator = scaled_width == device_width
+            ? 1 : device_width;
+        viewport->scale_denominator = scaled_width == device_width
+            ? 1 : scaled_width;
     }
     return true;
 }

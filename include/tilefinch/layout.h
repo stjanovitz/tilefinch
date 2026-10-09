@@ -22,6 +22,7 @@
 #define LAYOUT_COMMAND_OVERFLOW UINT8_C(2)
 #define LAYOUT_COMMAND_DYNAMIC_OVERFLOW UINT8_C(4)
 #define LAYOUT_COMMAND_CLIPPED_X UINT8_C(8)
+#define LAYOUT_COMMAND_CLIPPED_Y UINT8_C(64)
 /* A positioned command whose authored paint order follows intersecting
    overflow content. It joins that bounded per-frame stream rather than being
    baked underneath it in a cached tile. */
@@ -144,7 +145,11 @@ typedef enum {
        without a shadow special case.  scale carries the blur radius, and
        radius is the shadow rect's corner radius; the rasteriser recovers the
        shadow rect by deflating the command box by scale on every side. */
-    DRAW_SHADOW_RECT
+    DRAW_SHADOW_RECT,
+    /* Solid parallelogram, using existing payload words: text_length and
+       font_size retain local width/height, scale is horizontal Q10 shear,
+       radius is the local top-left Q10 offset inside the painted bounds. */
+    DRAW_SHEARED_FILL
 } DrawCommandType;
 
 typedef struct {

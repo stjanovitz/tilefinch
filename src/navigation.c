@@ -7,6 +7,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/frame_sandbox.h"
 #include "tilefinch/image_retarget.h"
+#include "tilefinch/linked_video_preview.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/pixel_math.h"

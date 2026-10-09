@@ -90,6 +90,7 @@ class FidelityScoreboardTests(unittest.TestCase):
                     "url": "https://fixture.test/",
                     "ticks": "23",
                     "tick_ms": "17",
+                    "max_download_kb": "8192",
                     "css_width": "480",
                     "css_height": "272",
                     "blocked_origins": "-",
@@ -107,6 +108,7 @@ class FidelityScoreboardTests(unittest.TestCase):
         )
         self.assertEqual(value_after("--ticks"), "23")
         self.assertEqual(value_after("--tick-ms"), "17")
+        self.assertEqual(value_after("--max-download-kb"), "8192")
         self.assertNotIn("--scroll-bottom", command)
 
 

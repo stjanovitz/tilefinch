@@ -1385,6 +1385,14 @@ static bool scheduled_replay_body(FetchScheduler *scheduler,
         }
         size_t wanted = item->replay_chunk_remaining;
         if (wanted > *bytes_remaining) wanted = *bytes_remaining;
+        if (item->replay_offset >= item->reserved_bytes) {
+            item->result.response_limit_exceeded = true;
+            snprintf(item->result.error, sizeof(item->result.error),
+                     "response quota exceeded");
+            return false;
+        }
+        if (wanted > item->reserved_bytes - item->replay_offset)
+            wanted = item->reserved_bytes - item->replay_offset;
         if (item->stream.cancel_after_bytes > item->replay_offset
             && wanted > item->stream.cancel_after_bytes
                         - item->replay_offset) {
@@ -2277,6 +2285,9 @@ bool fetch_scheduler_request_progress(
         *progress = (FetchRequestProgress) {
             .received_body_bytes = received,
             .status_code = item->result.status_code,
+            .replay_delay_pumps_remaining =
+                FETCH_TRACE_MODE == FETCH_TRACE_REPLAY
+                    ? item->replay_pumps_remaining : 0,
             .active = item->active,
             .complete = item->complete
         };

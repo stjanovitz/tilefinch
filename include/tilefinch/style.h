@@ -58,14 +58,21 @@
 #define STYLE_IMAGE_URL_CAPACITY 256
 #define STYLE_IMAGE_REFERENCE_LIMIT 128
 #define STYLE_IMAGE_SOURCE_LIMIT 32
-#define STYLE_SELECTOR_CAPACITY 192
+/* Rewriting/nesting scratch stays small, independently of the admission limit
+   for ordinary selectors. Retained selectors charge only their actual bytes
+   to the sheet arena; long :is()/ :where() lists need no larger stack buffer. */
+#define STYLE_SELECTOR_CAPACITY 256
+#define STYLE_SELECTOR_TEXT_CAPACITY 1024
 #define STYLE_FAST_KEY_CAPACITY 64
 #define STYLE_LAYER_CAPACITY 16
 #define STYLE_LAYER_NAME_CAPACITY 48
 #define STYLE_GENERATED_TEXT_CAPACITY 64
 #define STYLE_DIAGNOSTIC_PROPERTY_CAPACITY 16
 #define STYLE_DIAGNOSTIC_PROPERTY_NAME_CAPACITY 40
-#define STYLE_GENERATED_TEXT_LIMIT 64
+/* Many icon-font literals are only one codepoint. Bound their entry metadata
+   separately while retaining the previous maximum 64-by-64 string payload. */
+#define STYLE_GENERATED_TEXT_LIMIT 512
+#define STYLE_GENERATED_TEXT_BYTE_LIMIT 4096
 #define STYLE_WEB_FONT_NAME_CAPACITY 64
 #define STYLE_WEB_FONT_SOURCE_LIMIT 2
 #define STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY 40
@@ -683,7 +690,10 @@ typedef struct {
     uint8_t color_alpha;
     uint32_t background;
     uint8_t background_alpha;
-    bool has_background;
+    /* Keep the unresolved currentColor identity through cascade/inheritance
+       without growing this byte (or every cached style). */
+    bool has_background : 1;
+    bool background_current_color : 1;
     /* Packed into the existing two-byte alignment hole.  This retains both
        the element's inherited underline offset and the offset belonging to
        an ancestor-originated decoration without growing ComputedStyle. */
@@ -1813,7 +1823,7 @@ typedef struct {
    custom-property values in the site census are a 672-byte transition
    list and data: URL icons up to 2.2 KiB (which no property parser could
    take in anyway). */
-#define STYLE_CUSTOM_SELECTOR_CAPACITY 192u
+#define STYLE_CUSTOM_SELECTOR_CAPACITY STYLE_SELECTOR_TEXT_CAPACITY
 #define STYLE_CUSTOM_NAME_CAPACITY 48u
 #define STYLE_CUSTOM_VALUE_CAPACITY 1024u
 /* Custom-property values at least this long are "long": together they may
@@ -1838,18 +1848,19 @@ typedef struct {
     const char *selector;
     const char *name;
     const char *value;
+    uint16_t selector_length;
     bool important;
     uint8_t pseudo;
     /* One-based @container definition. */
     uint8_t container_query;
-    /* Offset of an allocation-free rightmost tag/class/id rejection key.
-       UINT8_MAX means no safe key. */
-    uint8_t fast_key_offset;
+    /* Bytes after an allocation-free rightmost tag/class/id rejection key.
+       Counting from the end supports long ancestor lists without enlarging
+       this record. UINT8_MAX means no safe key. */
+    uint8_t fast_key_suffix_bytes;
     /* Lengths of name, selector and fast key, so the per-node winner scan
        over these rules needs no strlen or identifier re-scan. The value is
        read only by the winner, as NUL-terminated text. */
     uint8_t name_length;
-    uint8_t selector_length;
     uint8_t fast_key_length;
     unsigned origin;
     unsigned layer;
@@ -2017,6 +2028,16 @@ typedef struct {
     /* Monotonic parse summary used to activate the ROM-backed motion module
        without rescanning the DOM or retaining authored CSS in JavaScript. */
     bool has_motion_keyframes;
+    /* Bounded animation-only source for the host motion scheduler. Only
+       script-readable external responses may contribute: the bootstrap
+       runs in the author realm and can pass this text to author methods. */
+    char *motion_css;
+    size_t motion_css_length;
+    size_t motion_css_capacity;
+    uint16_t motion_css_rules;
+    uint16_t motion_css_keyframes;
+    bool motion_css_bounded_out;
+    bool motion_css_source_blocked;
     /* At least one declaration can establish a directional boundary. This
        lets layout skip bidi subtree probes on the overwhelmingly common
        sheets that never mention direction or unicode-bidi. */
@@ -2166,11 +2187,19 @@ typedef struct {
     size_t cascade_starts[4];
     size_t cascade_ends[4];
     StyleRuleIndexBucket *rule_index_buckets;
+    /* One-based indices into dense occupied bucket payloads; zero is empty.
+       Slot capacity and linear-probe order are unchanged. */
+    uint32_t *rule_index_slots;
+    size_t rule_index_payload_count;
+    size_t rule_index_payload_capacity;
     uint32_t *rule_index_entries;
     /* Optional per-rule Bloom requirements for the directly matched
        compound and its ancestor chain. False positives fall through to the
        exact selector program; false negatives are forbidden. */
     StyleRuleFilter *rule_filters;
+    uint32_t *rule_relational_tokens;
+    size_t rule_relational_token_count;
+    size_t rule_relational_token_capacity;
     /* Exact ancestor tokens of universal-range rules (with rule_filters),
        or NULL. */
     struct StyleRuleAncestorTokens *rule_ancestor_tokens;
@@ -2630,6 +2659,9 @@ unsigned stylesheet_grid_track_value(
 unsigned stylesheet_grid_track_minimum(
     const Stylesheet *sheet, const ComputedStyle *container,
     bool rows, unsigned index);
+bool stylesheet_grid_track_automatic_minimum(
+    const Stylesheet *sheet, const ComputedStyle *container,
+    bool rows, unsigned index);
 uint8_t stylesheet_grid_track_line_name(
     const Stylesheet *sheet, const ComputedStyle *container,
     bool rows, unsigned line, unsigned slot);
@@ -2922,6 +2954,9 @@ void stylesheet_set_prefers_dark_color_scheme(bool dark);
 bool stylesheet_prefers_dark_color_scheme(void);
 bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
                               size_t query_length);
+/* Same bounded evaluator without a cascade or authored font context. */
+bool stylesheet_media_matches_viewport(int width, int height, double resolution,
+                                       const char *query, size_t query_length);
 bool stylesheet_supports_matches(Stylesheet *sheet, const char *query,
                                  size_t query_length);
 /* Parses a standalone CSS color without stylesheet variable resolution.

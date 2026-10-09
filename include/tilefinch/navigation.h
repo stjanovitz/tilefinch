@@ -259,6 +259,15 @@ typedef struct {
     ImageResources images;
     LayoutDocument layout;
     LayoutReuseCache *layout_reuse;
+    struct LinkedVideoPreviewJob *linked_video_preview;
+    lxb_dom_node_t *linked_video_preview_nodes[2];
+    long linked_video_preview_handles[2];
+    uint8_t linked_video_preview_attempts;
+    uint64_t linked_video_preview_scan_generation;
+    uint64_t linked_video_preview_scan_content;
+    size_t linked_video_preview_scan_cursor;
+    int linked_video_preview_scan_scroll_y;
+    bool linked_video_preview_scan_valid;
     char referrer_policy[128];
     char resource_base_url[NAVIGATION_URL_LIMIT];
     /* Full document URL of the committed page, retained so a
@@ -1439,6 +1448,16 @@ bool navigation_test_install_frame_capability_trace(
 bool navigation_image_retarget_pending(const NavigationSession *session);
 bool navigation_run_image_retarget_work(NavigationSession *session);
 bool navigation_run_deferred_image_work(NavigationSession *session);
+/* Current inherited visibility for a live image target, using the bounded
+   layout style cache. Weak targets are resolved before inspecting their DOM.
+   painted_only also rejects transparent/visibility-hidden presentations;
+   ordinary image preloading intentionally does not require painted pixels. */
+bool navigation_image_target_visible(
+    NavigationSession *session, const ImagePriorityTarget *target,
+    bool painted_only);
+/* Whether optional image arrival can publish within the configured relayout
+   bound (including the provisional-layout path). */
+bool navigation_image_publication_allowed(const NavigationSession *session);
 bool navigation_background_resources_pending(
     const NavigationSession *session);
 /* Deferred classic bytecode stores of the page and its frames: one store

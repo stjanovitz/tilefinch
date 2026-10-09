@@ -1437,7 +1437,7 @@ void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle)
 }
 
 /* Constructed stylesheets (document.h, document_adopted_sheets_active).
-   A sheet's text lives in a detached <style> element held by its
+   A sheet's text lives in a CSSOM override keyed by a detached <style> held by its
    CSSStyleSheet; while any adoptedStyleSheets list names it the bridge pins
    it, so a collected wrapper cannot free an element the cascade parses. */
 static void bridge_adopted_sheet_unpin(DomBridge *bridge,
@@ -1484,9 +1484,7 @@ static void bridge_note_adopted_styles_changed(DomBridge *bridge,
     bridge->mutations.stylesheet_rebuild_required = true;
 }
 
-/* __tilefinchConstructedSheetText(handle, text): makes `text` the sheet
-   element's only child and registers the sheet. False (nothing applied)
-   when the element is not a detached <style> or a bound refuses it. */
+/* CSSOM native text is independent of the owner's DOM children. */
 JSValue js_dom_constructed_sheet_text(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv)
@@ -1498,42 +1496,32 @@ JSValue js_dom_constructed_sheet_text(JSContext *context,
     if (node == NULL || bridge->document == NULL
         || bridge->document->html == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT
-        || node->local_name != LXB_TAG_STYLE || node->ns != LXB_NS_HTML
-        || node->parent != NULL) return JS_FALSE;
+        || node->local_name != LXB_TAG_STYLE
+        || node->ns != LXB_NS_HTML)
+        return JS_FALSE;
+    bool constructed = argc < 3 || JS_ToBool(context, argv[2]);
+    if (constructed && (node->parent != NULL || node->local_name != LXB_TAG_STYLE))
+        return JS_FALSE;
     size_t length = 0;
     const char *text = JS_ToCStringLen(context, &length, argv[1]);
     if (text == NULL) return JS_EXCEPTION;
-    bool ok = document_constructed_sheet_text_fits(
-        bridge->document, node, length);
-    lxb_dom_text_t *replacement = !ok || length == 0 ? NULL
-        : lxb_dom_document_create_text_node(
-            &bridge->document->html->dom_document,
-            (const lxb_char_t *) text, length);
-    JS_FreeCString(context, text);
-    if (length != 0 && replacement == NULL) ok = false;
     bool active = false;
-    if (ok) ok = document_constructed_sheet_note_text(
-        bridge->document, node, length, &active);
-    if (!ok) {
-        if (replacement != NULL)
-            lxb_dom_node_destroy_deep(lxb_dom_interface_node(replacement));
-        return JS_FALSE;
-    }
-    while (node->first_child != NULL) {
-        lxb_dom_node_t *removed = node->first_child;
-        document_style_quiet_begin();
-        lxb_dom_node_remove(removed);
-        document_style_quiet_end();
-        (void) bridge_discard_unretained_detached_subtree(bridge, removed);
-    }
-    if (replacement != NULL) {
-        document_style_quiet_begin();
-        (void) lxb_dom_node_append_child(
-            node, lxb_dom_interface_node(replacement));
-        document_style_quiet_end();
-    }
-    if (active) bridge_note_adopted_styles_changed(bridge, NULL);
-    return JS_TRUE;
+    bool ok = document_cssom_sheet_set_text(
+        bridge->document, node, text, length, constructed, &active);
+    JS_FreeCString(context, text);
+    if (ok && active)
+        bridge_note_adopted_styles_changed(bridge, constructed ? NULL : node);
+    return JS_NewBool(context, ok);
+}
+
+JSValue js_dom_sheet_revision(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *node = argc > 0
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    return JS_NewUint32(context, document_cssom_sheet_revision(node));
 }
 
 /* __tilefinchCssStatementEnds(text): the UTF-16 end offsets of the complete
@@ -2799,6 +2787,8 @@ static void bridge_mutated_summarized(
     size_t changed_token_count, uint64_t has_entries, uint32_t has_serial)
 {
     if (bridge == NULL) return;
+    if (kind == SCRIPT_MUTATION_TEXT || kind == SCRIPT_MUTATION_INNER_HTML)
+        document_cssom_sheet_reset(node);
     /* Every script mutation, connected or not, invalidates DOM-derived
        caches kept in the realm (attribute lists). */
     bridge->dom_version++;
@@ -10067,6 +10057,10 @@ static void bridge_child_inserted(
     bool was_detached, lxb_dom_node_t *old_parent,
     BridgeDeparture departure)
 {
+    /* Lexbor's inserted callback visits every descendant of a moved tree.
+       Reset only the actual insertion parent, not a style's unchanged Text
+       descendants when its owner disconnects/reconnects. */
+    if (node != NULL) document_cssom_sheet_reset(node->parent);
     /* A successful move into a detached construction tree still removes
        content from the live page: journaled as a removal before the move
        (bridge_note_departure), or, unclassified, as its old owner's. */

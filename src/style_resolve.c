@@ -2966,7 +2966,8 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
         | S2_BACKGROUND_POSITION
         | S2_MASK_POSITION | S2_MASK_REPEAT | S2_MASK_SIZE
         | S2_BOX_SHADOW | S2_FILTER;
-    if ((mask & (S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_BACKGROUND_SIZE)) == 0
+    if ((mask & (S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_BACKGROUND_SIZE
+                 | S_TRANSFORM)) == 0
         && (mask_high & paint_high) == 0) {
         return;
     }
@@ -2976,11 +2977,18 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
         sheet, computed_style_paint_stack_id(values));
     if (incoming == NULL) {
         if ((mask & S_MASK_IMAGE) != 0) style->mask_image = NULL;
-        if ((mask & S_BACKGROUND_IMAGE) == 0
+        if ((mask & (S_BACKGROUND_IMAGE | S_TRANSFORM)) == 0
             && (mask_high & (S2_BOX_SHADOW | S2_FILTER)) == 0) return;
     }
     StylePaintStack merged = current == NULL
         ? (StylePaintStack) {0} : *current;
+    if ((mask & S_TRANSFORM) != 0) {
+        merged.skew_x_q10 = incoming == NULL ? 0 : incoming->skew_x_q10;
+        merged.components = (uint8_t) (
+            (merged.components & ~STYLE_PAINT_COMPONENT_SKEW)
+            | (incoming == NULL ? 0
+               : incoming->components & STYLE_PAINT_COMPONENT_SKEW));
+    }
     if ((mask_high & S2_FILTER) != 0) {
         merged.reserved = (uint8_t) (
             (merged.reserved & ~STYLE_PAINT_FILTER_LOW_AMOUNT)
@@ -3207,6 +3215,7 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
         style->background = values->background;
         style->background_alpha = values->background_alpha;
         style->has_background = values->has_background;
+        style->background_current_color = values->background_current_color;
     }
     if (mask & S_BACKGROUND_IMAGE) {
         /* Gradient payloads travel through the shared paint stack. */
@@ -3217,7 +3226,12 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
         style->background_fit = values->background_fit;
         style->background_width = values->background_width;
         style->background_height = values->background_height;
-        style->background_size_flags = values->background_size_flags;
+        const uint8_t size_flags = STYLE_BACKGROUND_SIZE_EXPLICIT
+            | STYLE_BACKGROUND_WIDTH_AUTO | STYLE_BACKGROUND_HEIGHT_AUTO
+            | STYLE_BACKGROUND_WIDTH_PERCENT | STYLE_BACKGROUND_HEIGHT_PERCENT;
+        style->background_size_flags = (uint8_t) (
+            (style->background_size_flags & ~size_flags)
+            | (values->background_size_flags & size_flags));
     }
     if (mask & S_OBJECT_FIT) style->object_fit = values->object_fit;
     if (mask_high & S2_OBJECT_POSITION) {
@@ -3777,6 +3791,9 @@ static void apply_inherit_mask(Stylesheet *sheet, ComputedStyle *style,
         style->has_z_index = parent->has_z_index;
         style->z_index = parent->z_index;
     }
+    if (inherit_mask & S_BOX_SIZING) {
+        style->box_sizing_border_box = parent->box_sizing_border_box;
+    }
     if (inherit_mask & S_COLOR) {
         style->color = parent->color;
         style->color_alpha = parent->color_alpha;
@@ -3792,6 +3809,7 @@ static void apply_inherit_mask(Stylesheet *sheet, ComputedStyle *style,
     }
     if (inherit_mask & S_BACKGROUND) {
         style->has_background = parent->has_background;
+        style->background_current_color = parent->background_current_color;
         style->background = parent->background;
         style->background_alpha = parent->background_alpha;
     }
@@ -4569,6 +4587,11 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
         style.border_color = style.color;
         style.border_alpha = style.color_alpha;
     }
+    if (style.background_current_color) {
+        style.background = style.color;
+        style.background_alpha = style.color_alpha;
+        style.has_background = style.color_alpha != 0;
+    }
     /* Shadow composition: a host's light child that the flat tree leaves
        out (unassigned, or assigned to a slot that does not render) has no
        box. Like closed <details> content this is a rendering constraint,
@@ -5245,6 +5268,7 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
                            .color_alpha = parent != NULL
                                           ? parent->color_alpha : 255,
                            .background_alpha = 255,
+                           .opacity = 255,
                            .transform_scale_q6 = 64,
                            .font_scale = parent != NULL ? parent->font_scale : 2,
                            .font_size = parent != NULL ? parent->font_size : 16,
@@ -5353,6 +5377,11 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
     if (style.border_color == UINT32_MAX) {
         style.border_color = style.color;
         style.border_alpha = style.color_alpha;
+    }
+    if (style.background_current_color) {
+        style.background = style.color;
+        style.background_alpha = style.color_alpha;
+        style.has_background = style.color_alpha != 0;
     }
     if (text_decoration_propagation_boundary(NULL, &style)) {
         style_set_ancestor_text_decoration(&style, false, 0);

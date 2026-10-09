@@ -462,6 +462,8 @@ typedef struct {
     int em_basis;
     int rem_basis;
     int ch_basis;
+    int viewport_width;
+    int viewport_height;
     bool failed;
 } StyleMathParser;
 
@@ -496,6 +498,9 @@ struct StyleRuleIndexBucket {
 
 #define STYLE_TOKEN_BLOOM_WORDS 2u
 #define STYLE_RELATIONAL_TOKEN_LIMIT 8u
+/* Optional cold metadata. Exhaustion makes further rules opaque, never
+   drops a dependency or changes selector matching. */
+#define STYLE_RELATIONAL_POOL_TOKEN_LIMIT (1024u * 1024u)
 
 struct StyleRuleFilter {
     struct StyleTokenBloom {
@@ -508,7 +513,7 @@ struct StyleRuleFilter {
        dependency on other elements' classes or ids cannot be listed (:has(),
        `of S` nth forms, escaped identifiers, [class]/[id] attribute
        selectors, more tokens than fit). */
-    uint32_t relational_tokens[STYLE_RELATIONAL_TOKEN_LIMIT];
+    uint32_t relational_offset;
     uint8_t relational_count;
     bool relational_opaque;
     /* The rule can change display/visibility or supply an image (background,
@@ -625,7 +630,10 @@ typedef enum {
     STYLE_SELECTOR_ATTRIBUTE_DASH,
     /* An argument-less pseudo-class; text_offset holds its StylePseudoKind
        and text_length is zero. */
-    STYLE_SELECTOR_PSEUDO
+    STYLE_SELECTOR_PSEUDO,
+    /* Complete standard :is() union of class-attribute prefix tests at
+       start and after all five HTML spaces; text carries the prefix. */
+    STYLE_SELECTOR_CLASS_TOKEN_PREFIX
 } StyleSelectorOpcode;
 
 /* Pseudo-class classification shared by the string matcher and the
@@ -1091,11 +1099,15 @@ enum {
    single-threaded while style probes mutate their temporary marker. */
 void style_test_inject_focus_marker_remove_failures(size_t count);
 
-/* Selectors are bounded to 191 bytes, so the upper byte of the prepared
-   rightmost-compound offset can carry a one-based @container query id
-   without growing StyleRule on the PSP. */
-#define STYLE_RULE_COMPOUND_OFFSET_MASK UINT16_C(0x00ff)
-#define STYLE_RULE_CONTAINER_QUERY_SHIFT 8u
+/* Ordinary selectors fit ten offset bits; the 63 one-based @container ids
+   fit the remaining six. Keep this packed field and the PSP rule size. */
+#define STYLE_RULE_COMPOUND_OFFSET_MASK UINT16_C(0x03ff)
+#define STYLE_RULE_CONTAINER_QUERY_SHIFT 10u
+_Static_assert(STYLE_SELECTOR_TEXT_CAPACITY
+                   <= STYLE_RULE_COMPOUND_OFFSET_MASK + 1u
+               && STYLE_CONTAINER_QUERY_LIMIT
+                   <= (UINT16_MAX >> STYLE_RULE_CONTAINER_QUERY_SHIFT),
+               "selector offsets and container ids must fit the rule field");
 
 static inline uint8_t style_rule_container_query(const StyleRule *rule)
 {
@@ -1192,6 +1204,7 @@ typedef struct {
     uint8_t track_types[GRID_TRACK_REPEAT_LIMIT];
     uint16_t track_values[GRID_TRACK_REPEAT_LIMIT];
     uint16_t track_minimums[GRID_TRACK_REPEAT_LIMIT];
+    uint8_t automatic_minimums[(GRID_TRACK_REPEAT_LIMIT + 7u) / 8u];
 } StyleGridTrackTemplate;
 
 #define STYLE_GRID_TRACK_BLOCK_SIZE 4u
@@ -1243,18 +1256,18 @@ _Static_assert(sizeof(StyleGridAreaRect) == 5,
                "named Grid area rectangles must remain compact");
 _Static_assert(sizeof(StyleGridAreaTemplate) == 64,
                "named Grid templates must remain compact");
-/* 24 tracks with up to four names per line: 222 bytes per template,
+/* 24 tracks with up to four names per line: 226 bytes per template,
    allocated four at a time only by stylesheets that declare track lists (at
    most 31 templates, 6.9 KiB). */
-_Static_assert(sizeof(StyleGridTrackTemplate) == 222,
+_Static_assert(sizeof(StyleGridTrackTemplate) == 226,
                "Grid track templates must remain compact");
 _Static_assert(sizeof(StyleGridAreas) == 4355,
                "optional Grid metadata must remain within its PSP budget");
 _Static_assert(sizeof(StyleCustomRule) <= 3u * sizeof(void *) + 24u,
                "retained sparse-rule metadata must stay compact");
-_Static_assert(STYLE_CUSTOM_SELECTOR_CAPACITY <= UINT8_MAX + 1u
+_Static_assert(STYLE_CUSTOM_SELECTOR_CAPACITY <= UINT16_MAX + 1u
                && STYLE_CUSTOM_NAME_CAPACITY <= UINT8_MAX + 1u,
-               "custom rule text lengths must fit their uint8_t fields");
+               "custom rule text lengths must fit their compact fields");
 _Static_assert(STYLE_CUSTOM_VALUE_CAPACITY <= UINT16_MAX
                && STYLE_CUSTOM_SHORT_VALUE_CAPACITY
                   < STYLE_CUSTOM_RESOLVED_CAPACITY
@@ -1398,6 +1411,8 @@ bool style_math_candidate(const Stylesheet *sheet, const char *text,
                           size_t length, StyleMathParser *parser,
                           StyleMathCandidate *candidate, int *root_output,
                           int em_basis, int rem_basis, int ch_basis);
+bool style_math_resolve_media_length(const char *text, size_t length,
+                                      int width, int height, int32_t *pixels_q8);
 int style_parse_length(const Stylesheet *sheet, const char *text,
                        size_t length, int fallback, bool *percent);
 
@@ -1442,7 +1457,7 @@ bool style_parse_text_shadow(const Stylesheet *sheet, const char *text,
 bool style_parse_font_weight_component(const char *text, size_t length, uint16_t *weight);
 bool stylesheet_select_image_source_slot(Stylesheet *sheet, uint8_t slot);
 bool stylesheet_current_image_source_slot(Stylesheet *sheet, uint8_t *slot);
-void style_parse_transform_translation(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
+void style_parse_transform_translation(Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
 bool style_parse_text_underline_offset(const Stylesheet *sheet, const char *text, size_t length, unsigned *offset_code);
 bool style_parse_text_decoration_underline(const Stylesheet *sheet, const char *text, size_t length, bool *underline);
 uint64_t style_parse_padding_box(Stylesheet *sheet, const char *text, size_t length, StyleEdges *edges);
@@ -1465,7 +1480,7 @@ int style_parse_font_size(const Stylesheet *sheet, const char *text, size_t leng
 bool style_parse_font_shorthand(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *font);
 bool style_parse_color(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color);
 bool style_parse_background_size(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
-bool style_parse_background_shorthand_color(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color, uint8_t *alpha, bool *transparent);
+bool style_parse_background_shorthand_color(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color, uint8_t *alpha, bool *transparent, bool *current_color);
 bool style_parse_background_position(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
 bool style_parse_background_shorthand_image(Stylesheet *sheet,
                                             const char *text, size_t length,

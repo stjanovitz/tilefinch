@@ -262,6 +262,24 @@ rasterization, screenshots, offline saves, and installation all run as
 bounded pumps. The main loop spends a quota, presents progress the user can
 see, and resumes from an owned continuation.
 
+Parser-blocking classic scripts remain synchronous and source ordered,
+including `document.write()` insertion checkpoints. Their cumulative source
+work uses the live realm's normalized, finite source allowance, not a second
+one-MiB proxy for execution cost. A zero standalone source setting selects
+bounded defaults; oversized settings are clamped by the realm. Memory-based
+realm growth may raise that allowance only within its existing hard ceiling.
+Fetched or validated bodies still count as source work even if execution
+fails, so failed responses do not erase the parser's accounting.
+
+Large cross-origin classic scripts are treated like same-origin application
+bundles: size, loops, or dynamic-code tokens alone do not prove they should
+be refused. The lexical scan is watchdog diagnostic telemetry, not an
+admission oracle. Per-file and executable-count limits, working-set and
+presentation-reserve admission, the shared heap, compile/execution watchdog,
+and cumulative 20-second author-stage deadline remain enforced. This is
+bounded synchronous execution with cooperative checkpoints, not resumable
+JavaScript evaluation or a new worker thread.
+
 #### Optional pumps are admitted by one declared table
 
 The pipeline stages of a frame (input, navigation, runtime, media, raster,
@@ -1458,6 +1476,16 @@ settings; the opaque player furniture avoids importing moving 8888 video into
 the RGB565 chrome compositor.
 
 #### Media found in page data
+
+Visible posterless videos inside same-origin HTTPS article links may obtain
+the linked article's declared Open Graph/Twitter image during idle work.
+This is an article preview, not a decoded video frame. The page permits two
+lookups, each limited to 512 KiB of streamed head data, 4 KiB tags, and a
+five-second overall job lifetime. Raw script/style text is discarded and no
+linked document is installed or executed. Metadata requests omit credentials;
+normal request policy, CSP, redirect rules, image limits and cancellation still
+apply. Authored posters win, and hidden/offscreen videos are not looked up.
+This path does not add a decoder or change native playback admission.
 
 When a server-rendered `<video>` has no `src`, activating it may perform one
 bounded, allocation-free scan of retained data scripts and generic media

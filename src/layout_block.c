@@ -757,6 +757,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 ? declared_content_height + style->padding.top
                   + style->padding.bottom
                 : 0;
+        descendant_positioned_box->height_provisional = !definite_height;
         if (descendant_positioned_box->width < 0) {
             descendant_positioned_box->width = 0;
         }
@@ -848,14 +849,15 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     /*
      * Adjacent child margins collapse in a block formatting context even
      * when the container's own edge does not share those margins.  A table
-     * cell and flow-root are the important distinction: they collapse empty
-     * siblings with each other, but block_parent_collapses_{top,bottom}()
-     * still prevents the result escaping through the container edge.
+     * cell, flow-root and inline-block collapse sibling margins internally,
+     * but block_parent_collapses_{top,bottom}() still prevents the result
+     * escaping through the container edge.
      */
     bool margin_collapse_context =
         !multicolumn.active
         && (style->display == DISPLAY_BLOCK
             || style->display == DISPLAY_FLOW_ROOT
+            || style->display == DISPLAY_INLINE_BLOCK
             || style->display == DISPLAY_TABLE_CELL);
     bool first_flow_content = true;
     CollapsedMargin trailing_margin = {0};
@@ -886,6 +888,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         margin_collapse_context =
             style->display == DISPLAY_BLOCK
             || style->display == DISPLAY_FLOW_ROOT
+            || style->display == DISPLAY_INLINE_BLOCK
             || style->display == DISPLAY_TABLE_CELL;
     }
     if (before_pseudo_flow.active) {
@@ -1119,8 +1122,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         size_t alt_length = 0;
         const char *alt = document_attribute(node, "alt", &alt_length);
         if (alt != NULL && alt_length != 0) {
-            if (!flow_text(context, line, alt, alt_length, style,
+            ComputedStyle alt_style = layout_alt_text_flow_style(style);
+            if (!flow_text(context, line, alt, alt_length, &alt_style,
                            NULL, 0, NULL)) return false;
+            /* This replaced element has no intrinsic/declared box yet.
+               Its flowed fallback must reserve its final line before the
+               replaced-content tail skips ordinary child-line flushing. */
+            layout_flush_line(line);
+            line_finish_vertical(line);
             missing_image_alt = true;
         }
     }
@@ -1404,6 +1413,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         used_positioned_box.height = layout_subtract_coordinate(
             used_padding_bottom, used_positioned_box.y);
         if (used_positioned_box.height < 0) used_positioned_box.height = 0;
+        if (used_positioned_box.node == node)
+            used_positioned_box.height_provisional = false;
 
         FlatItemIterator *iterator = &scratch->traversal.flat.iterator;
         FlatItem *item = &scratch->traversal.flat.item;
@@ -1706,6 +1717,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 && !flow_item->anonymous_text
                 && block_establishes_formatting_context(&flow_item->style)) {
                 for (;;) {
+                    /* child_y is the margin edge. Clearance and float
+                       avoidance both constrain the BFC's border edge. */
+                    int band_y = layout_add_coordinate(
+                        child_y, item_top_margin);
                     int band_left = content_x;
                     int band_right = content_x + content_width;
                     int next_bottom = INT_MAX;
@@ -1713,8 +1728,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                     for (size_t i = 0; i < line->float_count; i++) {
                         line->layout->performance.float_exclusion_probes++;
                         const FloatExclusion *exclusion = &line->floats[i];
-                        if (exclusion->top > child_y
-                            || exclusion->bottom <= child_y) continue;
+                        if (exclusion->top > band_y
+                            || exclusion->bottom <= band_y) continue;
                         if (exclusion->bottom < next_bottom) {
                             next_bottom = exclusion->bottom;
                         }
@@ -1742,7 +1757,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                         break;
                     }
                     if (next_bottom == INT_MAX) break;
-                    child_y = next_bottom;
+                    child_y = layout_subtract_coordinate(
+                        next_bottom, item_top_margin);
                 }
             }
             if (!column_flex && line->float_count != 0) {
@@ -2800,7 +2816,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             target_y = positioned_box->y + positioning_height
                        - border_height - resolved_bottom
                        - style->margin.bottom;
-            provisional_bottom = positioned_box->height <= 0
+            provisional_bottom = (positioned_box->height <= 0
+                                  || positioned_box->height_provisional)
                 && positioned_box->node != NULL
                 && positioned_box->node != node;
         }
@@ -2810,8 +2827,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                         target_y - outer_y, "out-of-flow", node);
         /* CSS 2.1 10.6.4: `bottom` refers to the containing block's final
            padding box. An auto-height block's bottom is not known yet;
-           assume the viewport fallback above and correct it when the block
-           finishes (Guardian's footer "Back to top" hangs 21px below it). */
+           use the provisional bound above and correct it when the block
+           finishes, including growth beyond an authored minimum height. */
         if (provisional_bottom
             && context->bottom_fixup_count < LAYOUT_BOTTOM_FIXUP_LIMIT) {
             size_t at = context->bottom_fixup_count++;

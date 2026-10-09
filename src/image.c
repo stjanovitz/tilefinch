@@ -113,6 +113,7 @@ typedef struct {
     size_t reserved_bytes;
     size_t last_received_bytes;
     long last_status_code;
+    unsigned last_replay_delay_pumps;
     double started_ms;
     double last_progress_ms;
     bool no_progress_cancelled;
@@ -351,9 +352,10 @@ static void image_note_origin_no_progress(ImageLoadContext *context,
     image_trace("origin-cooldown", health->origin, strlen(health->origin));
 }
 
-static void image_note_pending_progress(ImageLoadContext *context)
+static bool image_note_pending_progress(ImageLoadContext *context)
 {
     double now = image_now_ms();
+    bool advanced = false;
     for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
         PendingImageFetch *pending = &context->pending[i];
         if (pending->request_id == 0
@@ -365,14 +367,25 @@ static void image_note_pending_progress(ImageLoadContext *context)
         }
         ExternalImageStats *stats = &context->images->stats;
         stats->progress_samples++;
+        /* Captured latency advances in virtual scheduling steps, without
+           headers or bytes until the recorded response is released. Do not
+           mistake that finite countdown for an externally stuck request. */
+        bool replay_progressed = pending->last_replay_delay_pumps != 0
+            && progress.replay_delay_pumps_remaining
+                   < pending->last_replay_delay_pumps;
+        pending->last_replay_delay_pumps =
+            progress.replay_delay_pumps_remaining;
+        advanced = advanced || replay_progressed;
         bool headers_progressed = progress.status_code != 0
             && progress.status_code != pending->last_status_code;
         if (headers_progressed) {
+            advanced = true;
             pending->last_status_code = progress.status_code;
             pending->last_progress_ms = now;
             stats->progress_events++;
         }
         if (progress.received_body_bytes > pending->last_received_bytes) {
+            advanced = true;
             size_t added =
                 progress.received_body_bytes - pending->last_received_bytes;
             if (added <= SIZE_MAX - stats->progress_bytes) {
@@ -392,6 +405,7 @@ static void image_note_pending_progress(ImageLoadContext *context)
             }
         }
     }
+    return advanced;
 }
 
 static void image_cancel_no_progress_pending(ImageLoadContext *context)
@@ -2536,6 +2550,13 @@ static int parse_source_size_length(const Stylesheet *stylesheet,
     while (length != 0
            && isspace((unsigned char) text[length - 1])) length--;
     if (length == 0 || length > 128) return -1;
+    /* currentSrc can be queried before a stylesheet exists. Keep viewport
+       units on the same default basis as source selection rather than
+       letting the ordinary length parser treat their number as pixels. */
+    static const Stylesheet default_viewport = {
+        .viewport_width = 480, .viewport_height = 272
+    };
+    if (stylesheet == NULL) stylesheet = &default_viewport;
     bool percent = false;
     int pixels = style_parse_length(
         stylesheet, text, length, INT_MIN, &percent);
@@ -2579,8 +2600,17 @@ static int image_source_size(const Stylesheet *stylesheet,
             item_length--;
         }
         size_t length_start = item_length;
-        while (length_start != 0
-               && !isspace((unsigned char) item[length_start - 1])) {
+        size_t function_depth = 0;
+        /* The final CSS component can be a math function whose whitespace
+           belongs to the length, not a separator from the media condition.
+           Walk the already bounded attribute backwards without allocating
+           another tokenizer or splitting nested calc()/clamp() arguments. */
+        while (length_start != 0) {
+            char component = item[length_start - 1];
+            if (component == ')') function_depth++;
+            else if (component == '(' && function_depth != 0) function_depth--;
+            if (function_depth == 0
+                && isspace((unsigned char) component)) break;
             length_start--;
         }
         int pixels = parse_source_size_length(
@@ -2723,7 +2753,7 @@ static bool supported_picture_type(lxb_dom_node_t *node)
         || (length == 13 && memcmp(type, "image/svg+xml", 13) == 0);
 }
 
-static bool image_source_is_placeholder(const char *source, size_t length)
+bool image_source_is_placeholder(const char *source, size_t length)
 {
     if (source == NULL || length == 0) return true;
     while (length != 0 && isspace((unsigned char) *source)) {
@@ -2966,6 +2996,40 @@ static bool image_layout_decode_target(
     *target_width = width;
     *target_height = height;
     return true;
+}
+
+typedef struct {
+    const PendingImageFetch *pending;
+    int viewport_width;
+    size_t decoded_limit;
+} ImageSvgOversizeContext;
+
+static bool image_svg_oversize_target(void *opaque, int source_width,
+                                      int source_height, int *width,
+                                      int *height)
+{
+    const ImageSvgOversizeContext *context = opaque;
+    /* Backgrounds and masks can address a sprite subrectangle; shrinking
+       those before layout would change their coordinate system. */
+    for (size_t i = 0; i < context->pending->target_count; i++) {
+        const PendingImageTarget *target = &context->pending->targets[i];
+        if (target->is_mask || target->is_background) return false;
+    }
+    if (!image_layout_decode_target(context->pending, source_width,
+                                   source_height, width, height)) {
+        if (context->viewport_width <= 0) return false;
+        *width = source_width < context->viewport_width
+            ? source_width : context->viewport_width;
+        size_t product = (size_t) source_height * (size_t) *width;
+        *height = (int) (product / (size_t) source_width
+            + (product % (size_t) source_width != 0));
+    }
+    while ((size_t) *width * (size_t) *height
+               > context->decoded_limit / 4u && (*width > 1 || *height > 1)) {
+        *width = *width > 1 ? (*width + 1) / 2 : 1;
+        *height = *height > 1 ? (*height + 1) / 2 : 1;
+    }
+    return *width > 0 && *height > 0;
 }
 
 typedef enum {
@@ -3350,6 +3414,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
     }
     PendingImageTarget primary = pending->targets[0];
     int width = 0, height = 0, components = 0;
+    int svg_source_width = 0, svg_source_height = 0;
     bool is_svg = svg_response(fetched);
     bool supported = is_svg;
     InlineSvgBuffer external_symbol = {0};
@@ -3396,8 +3461,14 @@ static bool finish_image_fetch(ImageLoadContext *context,
     if (is_svg && (!external_use || external_symbol.data != NULL)) {
         uint64_t svg_checkpoint = budget_checkpoint(context->budget);
         size_t svg_baseline = context->budget->current;
-        pixels = image_svg_decode(decode_data, decode_length, context->budget,
-                            decoded_remaining, &width, &height);
+        ImageSvgOversizeContext oversize = {
+            pending, context->viewport_width, decoded_remaining
+        };
+        pixels = image_svg_decode_bounded(
+            decode_data, decode_length, context->budget, decoded_remaining,
+            &width, &height,
+            external_use ? NULL : image_svg_oversize_target, &oversize,
+            &svg_source_width, &svg_source_height);
         supported = pixels != NULL;
         /* NanoSVG does not expose a partial parse object when parsing fails.
            Its scratch is transaction-local, so reclaim that generation when
@@ -3408,8 +3479,10 @@ static bool finish_image_fetch(ImageLoadContext *context,
     }
     /* A kept raster keeps its markup: the response (usually a lease on the
        HTTP cache's copy), the data: body or the referenced symbol. */
-    bool keep_svg = pixels != NULL && image_svg_keeps_source(
-        (size_t) width * (size_t) height * 4u, decode_length);
+    bool keep_svg = pixels != NULL
+        && ((width != svg_source_width || height != svg_source_height)
+            || image_svg_keeps_source(
+                (size_t) width * (size_t) height * 4u, decode_length));
     if (!keep_svg || !external_use)
         budget_free(context->budget, external_symbol.data);
     if (!supported || width <= 0 || height <= 0
@@ -3424,9 +3497,10 @@ static bool finish_image_fetch(ImageLoadContext *context,
         fetch_result_destroy(fetched);
         return true;
     }
-    int source_width = width, source_height = height;
-    size_t source_decoded = (size_t) width * (size_t) height * 4u;
-    size_t decoded = source_decoded;
+    int source_width = is_svg ? svg_source_width : width;
+    int source_height = is_svg ? svg_source_height : height;
+    size_t source_decoded = (size_t) source_width * (size_t) source_height * 4u;
+    size_t decoded = (size_t) width * (size_t) height * 4u;
     size_t decoded_limit = is_svg ? decoded_remaining
                                   : context->maximum_decoded_bytes;
     if (!is_svg) {
@@ -3515,7 +3589,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
                 (void) browser_session_decoded_image_put(
                     context->session, pending->url, &request_context,
                     (const unsigned char *) fetched->data, fetched->length,
-                    pixel_body, width, height, width, height);
+                    pixel_body, source_width, source_height, width, height);
             }
         }
     }
@@ -3794,9 +3868,9 @@ static bool finish_one_pending(ImageLoadContext *context, bool wait)
         size_t completed = fetch_scheduler_pump_bounded(
             context->scheduler, IMAGE_FETCH_PUMP_COMPLETIONS,
             IMAGE_FETCH_POLL_WAIT_MS, &quota, NULL);
-        image_note_pending_progress(context);
+        bool progressed = image_note_pending_progress(context);
         image_cancel_no_progress_pending(context);
-        if (completed != 0) {
+        if (completed != 0 || progressed) {
             idle_polls = 0;
         } else if (fetch_scheduler_uses_virtual_replay(context->scheduler)
                    && ++idle_polls
@@ -3853,42 +3927,6 @@ static void cancel_pending(ImageLoadContext *context)
     context->pending_count = 0;
     context->pending_reserved_bytes = 0;
     image_pending_raster_release(context);
-}
-
-/* Many image CDNs publish a WebP rendition by appending ".webp" to the
-   original file name ("photo.jpg.webp" beside "photo.jpg"). When the URL
-   itself names that original, prefer it: the JPEG/PNG/GIF path has a smaller
-   PSP decoder footprint, and the URL guarantees the sibling it names. The
-   suffix must end the path or one complete query value, and the rewrite only
-   removes it. A bare "name.webp" is not rewritten: nothing in it says that a
-   "name.jpg" exists (guessing one turned working WebP images into 404s), and
-   the bounded WebP decoder handles it, as it does signed and
-   content-negotiated WebP URLs. */
-static bool image_rewrite_webp_sibling(char url[4096])
-{
-    if (url == NULL) return false;
-    char *suffix = NULL;
-    for (char *cursor = url; *cursor != '\0' && *cursor != '#'; cursor++) {
-        if (*cursor == '.' && strncasecmp(cursor, ".webp", 5) == 0
-            && (cursor[5] == '\0' || cursor[5] == '?'
-                || cursor[5] == '#' || cursor[5] == '&')) {
-            suffix = cursor;
-        }
-    }
-    if (suffix == NULL) return false;
-    static const char *const originals[] = {".jpg", ".jpeg", ".png", ".gif"};
-    bool names_original = false;
-    for (size_t i = 0; i < sizeof(originals) / sizeof(originals[0]); i++) {
-        size_t length = strlen(originals[i]);
-        if ((size_t) (suffix - url) > length
-            && strncasecmp(suffix - length, originals[i], length) == 0) {
-            names_original = true;
-            break;
-        }
-    }
-    if (!names_original) return false;
-    memmove(suffix, suffix + 5, strlen(suffix + 5) + 1);
-    return true;
 }
 
 static const ImageResource *image_find_document_hash(
@@ -4013,7 +4051,6 @@ ImageAliasResult images_alias_existing_document_subtree(
                                    sizeof(scratch->resolved))) {
                 continue;
             }
-            (void) image_rewrite_webp_sibling(scratch->resolved);
             url_hash = image_hash_request(
                 scratch->resolved, document_url, referrer_policy);
         }
@@ -4211,9 +4248,6 @@ static bool load_image_node_with_provenance_impl(
     if (!fetch_resolve_url(source_base_url, reference, resolved, 4096u)) {
         images->stats.failed++;
         return true;
-    }
-    if (image_rewrite_webp_sibling(resolved)) {
-        images->stats.compatible_format_rewrites++;
     }
     if (!tilefinch_csp_allows_request(
             &context->document->content_security_policy,
@@ -4909,6 +4943,16 @@ static bool image_process_priority_target(
 {
     if (context == NULL || target == NULL || target->node == NULL) {
         return false;
+    }
+    if (target->kind == IMAGE_PRIORITY_KIND_LINKED_VIDEO) {
+        context->current_display_width = target->display_width;
+        context->current_display_height = target->display_height;
+        bool loaded = load_document_image_node(context, target->node,
+            target->source, target->source == NULL ? 0 : strlen(target->source),
+            false, false, PSEUDO_NONE);
+        context->current_display_width = 0;
+        context->current_display_height = 0;
+        return loaded;
     }
     if (target->kind == IMAGE_PRIORITY_KIND_DOCUMENT) {
         uint16_t display_width = target->display_width;
@@ -5938,7 +5982,8 @@ ImagePriorityLoadJob *images_priority_load_begin_batch(
     }
     for (size_t at = 0; at < target_count; at++) {
         if (targets[at].node == NULL
-            || targets[at].kind != IMAGE_PRIORITY_KIND_DOCUMENT) return NULL;
+            || (targets[at].kind != IMAGE_PRIORITY_KIND_DOCUMENT
+                && targets[at].kind != IMAGE_PRIORITY_KIND_LINKED_VIDEO)) return NULL;
     }
     if (maximum_count > MAX_TRACKED_IMAGE_NODES) {
         maximum_count = MAX_TRACKED_IMAGE_NODES;

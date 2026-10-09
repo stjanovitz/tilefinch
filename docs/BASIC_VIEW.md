@@ -32,6 +32,27 @@ The extracted tree retains, in document order:
   Basic view retires scripts, so that control could never open it;
 - explicitly authored, labeled `GET` or search forms.
 
+Navigation landmarks (`nav` or `role="navigation"`) become closed, expandable
+groups in place, labeled with the page's `aria-label` when supplied. Their
+links remain available without JavaScript, while the main content and search
+form no longer sit behind several screens of menu links. Ordinary inline
+word fragments stay joined; adjacent independent links get a word boundary.
+An unretained select is omitted rather than printing its entire option list.
+
+Tables used to arrange navigation or page columns become ordinary stacked
+blocks, instead of squeezing stories into narrow equal-width cells. Tables
+with data headers or captions retain their structure; nested data tables are
+classified separately from an enclosing layout table.
+
+The simplified presentation resets author sizing, text metrics and generated
+decorations on extracted content. Image width hints remain available so an
+illustration awaiting download keeps a usable layout target.
+If an image is unavailable, its alternative text reserves space before the
+caption or following paragraph instead of painting over it.
+Meaningful embedded images remain visible. Lazy sources use the same source
+selection and resource authorization as the full page, including after a
+view switch; the browser never guesses an alternative image URL.
+
 Basic view does not infer behavior from button text, classes, test IDs or
 click-handler-shaped markup. `POST` forms, unowned buttons, disabled controls,
 downloads and opaque application commands never become new actions. An

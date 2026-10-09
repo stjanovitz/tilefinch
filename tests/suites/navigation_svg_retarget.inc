@@ -104,6 +104,127 @@ static const ImageResource *svg_retarget_icon(NavigationSession *navigation,
    the resized rasters over without rasterizing anything, and zooming in 2x
    rasterizes a 20 px icon at 40 device pixels. Teardown leaves no bytes
    behind. */
+static bool svg_oversize_test_target(void *opaque, int source_width,
+                                      int source_height, int *width,
+                                      int *height)
+{
+    size_t *calls = opaque;
+    (*calls)++;
+    if (source_width != 3000 || source_height != 1000) return false;
+    *width = 72;
+    *height = 24;
+    return true;
+}
+
+static bool test_svg_oversize_initial_raster_preserves_intrinsic_size(void)
+{
+    static const char html[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>img{display:block;width:72px;height:24px}</style>"
+        "<img id=large src=\"data:image/svg+xml,%3Csvg "
+        "xmlns='http://www.w3.org/2000/svg' viewBox='0 0 3000 1000'%3E"
+        "%3Crect width='1500' height='1000' fill='%23ff0000'/%3E"
+        "%3Crect x='1500' width='1500' height='1000' fill='%230000ff'/%3E"
+        "%3C/svg%3E\">";
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            8, 512 * 1024, 256 * 1024, MIB, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://svg-sized.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    if (committed) retarget_pump(&navigation);
+    const ImageResource *image = committed
+        ? retarget_image(&navigation, "large") : NULL;
+    bool sized = image != NULL && image->pixels != NULL
+        && image->source_width == 3000 && image->source_height == 1000
+        && image->width == 72 && image->height == 24
+        && image->encoded != NULL
+        && (image->retarget_flags & IMAGE_RETARGET_VECTOR) != 0
+        && svg_retarget_pixel(image, 10, 12)[0] == 255
+        && svg_retarget_pixel(image, 60, 12)[2] == 255;
+    if (sized) {
+        int width = 72, height = 24;
+        unsigned char *direct = image_svg_decode(
+            image->encoded, image->encoded_length, &budget,
+            72u * 24u * 4u, &width, &height);
+        sized = direct != NULL
+            && memcmp(direct, image->pixels, 72u * 24u * 4u) == 0;
+        budget_free(&budget, direct);
+    }
+    if (!sized) svg_retarget_report(&navigation);
+    if (ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool released = budget.current == 0;
+    if (installed) released = budget_uninstall_lexbor(&budget) && released;
+    static const char svg[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 3000 1000'>"
+        "<rect width='3000' height='1000' fill='red'/></svg>";
+    bool refusal_clean = true, fallback_succeeded = false;
+    /* Each refused parse/raster allocation must return all scratch, leave
+       output parameters unchanged, and permit the subsequent retry. */
+    for (size_t fail = 0; fail < 40; fail++) {
+        Budget scratch;
+        budget_init(&scratch, MIB);
+        budget_inject_failure_after(&scratch, fail);
+        size_t calls = 0;
+        int width = 0, height = 0, source_width = -1, source_height = -1;
+        unsigned char *pixels = image_svg_decode_bounded(
+            svg, sizeof(svg) - 1u, &scratch, 72u * 24u * 4u,
+            &width, &height, svg_oversize_test_target, &calls,
+            &source_width, &source_height);
+        if (pixels != NULL) {
+            fallback_succeeded = true;
+            refusal_clean = refusal_clean && calls == 1 && width == 72
+                && height == 24 && source_width == 3000 && source_height == 1000;
+        } else {
+            refusal_clean = refusal_clean && width == 0 && height == 0
+                && source_width == -1 && source_height == -1;
+        }
+        budget_free(&scratch, pixels);
+        refusal_clean = refusal_clean && scratch.current == 0
+            && !image_svg_decode_busy();
+    }
+    /* An explicit raster target remains the old API's behavior and never
+       calls the oversized-intrinsic fallback. */
+    size_t calls = 0;
+    int width = 72, height = 24;
+    unsigned char *pixels = image_svg_decode_bounded(
+        svg, sizeof(svg) - 1u, &budget, 72u * 24u * 4u,
+        &width, &height, svg_oversize_test_target, &calls, NULL, NULL);
+    refusal_clean = refusal_clean && pixels != NULL && calls == 0;
+    budget_free(&budget, pixels);
+    static const char small_svg[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='32'>"
+        "<circle cx='32' cy='16' r='14' fill='blue'/></svg>";
+    width = height = 0;
+    pixels = image_svg_decode_bounded(
+        small_svg, sizeof(small_svg) - 1u, &budget, 64u * 32u * 4u,
+        &width, &height, svg_oversize_test_target, &calls, NULL, NULL);
+    int direct_width = 0, direct_height = 0;
+    unsigned char *direct = image_svg_decode(
+        small_svg, sizeof(small_svg) - 1u, &budget, 64u * 32u * 4u,
+        &direct_width, &direct_height);
+    refusal_clean = refusal_clean && pixels != NULL && direct != NULL
+        && calls == 0 && width == 64 && height == 32
+        && memcmp(pixels, direct, 64u * 32u * 4u) == 0;
+    budget_free(&budget, pixels);
+    budget_free(&budget, direct);
+    return sized && released && refusal_clean && fallback_succeeded
+        && budget.current == 0;
+}
+
 static bool test_svg_retarget_rasterizes_at_painted_size(void)
 {
     static const char html[] =

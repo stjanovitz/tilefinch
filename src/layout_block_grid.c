@@ -145,7 +145,8 @@ static int grid_subgrid_track_size(
  */
 static void grid_distribute_intrinsic_extra(
     int start, int span, int extra, bool maximum_phase,
-    const uint8_t *types, const uint16_t *values, int *widths)
+    const uint8_t *types, const uint16_t *values,
+    const bool *automatic_minimums, int *widths)
 {
     if (extra <= 0 || types == NULL || values == NULL || widths == NULL) {
         return;
@@ -156,7 +157,8 @@ static void grid_distribute_intrinsic_extra(
         for (int offset = 0; offset < span; offset++) {
             int track = start + offset;
             if (track < 0 || track >= GRID_TRACK_LIMIT) continue;
-            if (locked[track] || types[track] != GRID_TRACK_AUTO) continue;
+            if (locked[track] || (types[track] != GRID_TRACK_AUTO
+                && (maximum_phase || !automatic_minimums[track]))) continue;
             if (maximum_phase
                 && !grid_track_accepts_max_content(
                        types[track], values[track])) {
@@ -171,7 +173,8 @@ static void grid_distribute_intrinsic_extra(
         for (int offset = 0; offset < span && extra > 0; offset++) {
             int track = start + offset;
             if (track < 0 || track >= GRID_TRACK_LIMIT) continue;
-            if (locked[track] || types[track] != GRID_TRACK_AUTO) continue;
+            if (locked[track] || (types[track] != GRID_TRACK_AUTO
+                && (maximum_phase || !automatic_minimums[track]))) continue;
             if (maximum_phase
                 && !grid_track_accepts_max_content(
                        types[track], values[track])) {
@@ -644,6 +647,7 @@ bool layout_block_grid_section(LayoutContext *context,
         int track_starts[GRID_TRACK_LIMIT] = {0};
         uint8_t track_types[GRID_TRACK_LIMIT] = {0};
         uint16_t track_values[GRID_TRACK_LIMIT] = {0};
+        bool automatic_minimums[GRID_TRACK_LIMIT] = {false};
         FlexOrderPlan *grid_order = &scratch->row_order;
         *grid_order = (FlexOrderPlan) {0};
         if (!flex_order_plan_build(grid_order, context, node, style)) {
@@ -716,6 +720,11 @@ bool layout_block_grid_section(LayoutContext *context,
                 minimum = (int) value;
             }
             track_types[column] = type;
+            automatic_minimums[column] = type == GRID_TRACK_FLEX
+                && !adaptive_columns && !auto_sized_column
+                && !inherited_grid_columns
+                && stylesheet_grid_track_automatic_minimum(
+                    context->sheet, style, false, (unsigned) explicit_column);
             track_values[column] = value > UINT16_MAX
                 ? UINT16_MAX : (uint16_t) value;
             track_floors[column] = minimum;
@@ -870,6 +879,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 continue;
             }
             int intrinsic_tracks = 0;
+            int flexible_minimum_tracks = 0;
             int minimum_occupied =
                 grid_column_gap * (item_span - 1);
             for (int offset = 0; offset < item_span; offset++) {
@@ -878,6 +888,7 @@ bool layout_block_grid_section(LayoutContext *context,
                     intrinsic_tracks++;
                     minimum_occupied += track_floors[column];
                 } else {
+                    if (automatic_minimums[column]) flexible_minimum_tracks++;
                     int contribution = track_widths[column];
                     if (track_floors[column] > contribution) {
                         contribution = track_floors[column];
@@ -885,10 +896,14 @@ bool layout_block_grid_section(LayoutContext *context,
                     minimum_occupied += contribution;
                 }
             }
-            if (intrinsic_tracks > 0) {
-                int preferred = intrinsic_text_width(
+            /* A specified item minimum also sizes bare fr tracks. Avoid
+               another intrinsic subtree walk for the automatic-minimum
+               case here; automatic tracks already use the path below. */
+            if (intrinsic_tracks > 0 || (flexible_minimum_tracks > 0
+                && !measured_item->style.min_width_auto)) {
+                int preferred = intrinsic_tracks > 0 ? intrinsic_text_width(
                     context, measured_item->node,
-                    &measured_item->parent_style, available);
+                    &measured_item->parent_style, available) : 0;
                 int floor = grid_item_minimum_contribution(
                     context, measured_item, available,
                     item_start, item_span, track_types);
@@ -896,7 +911,8 @@ bool layout_block_grid_section(LayoutContext *context,
                     item_start, item_span,
                     floor > minimum_occupied
                         ? floor - minimum_occupied : 0,
-                    false, track_types, track_values, track_floors);
+                    false, track_types, track_values,
+                    automatic_minimums, track_floors);
                 for (int offset = 0; offset < item_span; offset++) {
                     int column = item_start + offset;
                     if (track_types[column] != GRID_TRACK_AUTO) continue;
@@ -914,7 +930,8 @@ bool layout_block_grid_section(LayoutContext *context,
                     item_start, item_span,
                     preferred > preferred_occupied
                         ? preferred - preferred_occupied : 0,
-                    true, track_types, track_values, track_widths);
+                    true, track_types, track_values,
+                    automatic_minimums, track_widths);
                 for (int offset = 0; offset < item_span; offset++) {
                     int column = item_start + offset;
                     if (track_types[column] == GRID_TRACK_AUTO
@@ -1422,6 +1439,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 grid_area.y = area_y;
                 grid_area.width = area_width;
                 grid_area.height = area_height;
+                grid_area.height_provisional = false;
                 int positioned_bottom = area_y;
                 if (!layout_block(
                         context, positioned_item->node,

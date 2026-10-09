@@ -1854,6 +1854,35 @@ static const StyleMatchSubject *style_subject_for_walk(
     return entry;
 }
 
+/* Reject on the first byte before checking HTML whitespace, then on the
+   second byte before calling memcmp. Unlike a memchr loop this does not
+   repeatedly enter libc for interior occurrences of the first byte (common
+   in long class lists). Keep byte loads: class spans can be unaligned on
+   Allegrex, and this tiny loop needs no locale table or extra cache. */
+static bool style_class_token_has_prefix(
+    const char *classes, size_t length, const char *prefix, size_t prefix_length)
+{
+    if (classes == NULL || prefix_length == 0 || prefix_length > length)
+        return false;
+    const char first = prefix[0];
+    const char *last = classes + (length - prefix_length);
+    for (const char *candidate = classes; candidate <= last; candidate++) {
+        if (*candidate != first) continue;
+        unsigned char preceding = candidate == classes ? ' '
+            : (unsigned char) candidate[-1];
+        /* HTML whitespace excludes vertical tab, unlike isspace(). */
+        if (preceding != ' '
+            && !(preceding >= '\t' && preceding <= '\r'
+                 && preceding != '\v')) continue;
+        if (prefix_length == 1u) return true;
+        if (candidate[1] != prefix[1]) continue;
+        if (prefix_length == 2u
+            || memcmp(candidate + 2u, prefix + 2u,
+                      prefix_length - 2u) == 0) return true;
+    }
+    return false;
+}
+
 static bool style_selector_program_matches_uncached(
     const Stylesheet *sheet, const StyleRule *rule, lxb_dom_node_t *node,
     size_t instruction, unsigned depth,
@@ -1957,6 +1986,14 @@ static bool style_selector_program_matches_uncached(
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_END) return true;
+        /* Keep this uncommon opcode after the hot tag/class/id/attribute
+           and END cases rather than in their predicate chain. */
+        if (op->opcode == STYLE_SELECTOR_CLASS_TOKEN_PREFIX) {
+            if (!style_class_token_has_prefix(
+                    subject->classes, subject->classes_length,
+                    wanted, wanted_length)) return false;
+            continue;
+        }
         if (op->opcode == STYLE_SELECTOR_PARENT) {
             lxb_dom_node_t *parent = node->parent;
             while (parent != NULL

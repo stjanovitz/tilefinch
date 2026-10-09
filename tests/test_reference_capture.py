@@ -93,6 +93,26 @@ def reference_environment_state() -> dict[str, object]:
 
 @unittest.skipIf(NODE is None, "Node.js is unavailable")
 class ReferenceCaptureIndexTests(unittest.TestCase):
+    def test_script_free_discovery_is_explicit_and_never_qualified(self) -> None:
+        script = (
+            "const capture=require(process.argv[1]);"
+            "process.stdout.write(JSON.stringify(["
+            "capture.parseArguments([]).scriptFreeDiagnostic,"
+            "capture.parseArguments(['--script-free-diagnostic']).scriptFreeDiagnostic]));"
+        )
+        completed = subprocess.run(
+            (NODE, "-e", script, str(CAPTURE)),
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), [False, True])
+        source = CAPTURE.read_text()
+        self.assertIn("javaScriptEnabled: !options.scriptFreeDiagnostic", source)
+        self.assertIn(
+            'options.scriptFreeDiagnostic ? ["reference-script-free-diagnostic"] : []',
+            source,
+        )
+
     def test_inspection_matches_canonical_digest_and_route_count(self) -> None:
         trace = ROOT / "fixtures" / "http-stream"
         completed = inspect(trace)
@@ -1154,6 +1174,19 @@ capture.installReplayEnvironment({
   originMs: 1700000000042,
 });
 const instant = 1700000000042;
+const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
+const engine = vm.createContext({});
+vm.runInContext('Intl = undefined;' + fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), '../src/bootstrap/intl.js'), 'utf8'), engine);
+function segmentState(Constructor) {
+  return ['grapheme', 'word', 'sentence'].flatMap(granularity =>
+    ['Hello 🌏! Next sentence.', 'a\u0301 日本語', "one’s word\n"].map(text => {
+      const segmenter = new Constructor('en_US', {granularity});
+      const result = segmenter.segment(text);
+      return [segmenter.resolvedOptions(), Array.from(result),
+        Array.from({length:text.length + 2}, (_,i) => result.containing(i - 1))];
+    }));
+}
 const date = new Intl.DateTimeFormat("en-US", { timeZone: "UTC" });
 const time = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", hour: "numeric" });
 let localeCall = "";
@@ -1192,6 +1225,8 @@ process.stdout.write(JSON.stringify({
     Object.getOwnPropertyDescriptor(Intl.Collator.prototype, "compare").get,
   ].every(value => Function.prototype.toString.call(value).includes("[native code]")),
   dateConstructor: Date.prototype.constructor === Date,
+  segmenterMatchesBootstrap: JSON.stringify(segmentState(Intl.Segmenter)) ===
+    JSON.stringify(segmentState(engine.Intl.Segmenter)),
 }));
 """
         completed = subprocess.run(
@@ -1204,7 +1239,7 @@ process.stdout.write(JSON.stringify({
             state["keys"],
             [
                 "Locale", "NumberFormat", "PluralRules", "DateTimeFormat",
-                "Collator", "RelativeTimeFormat", "ListFormat", "DisplayNames",
+                "Collator", "RelativeTimeFormat", "ListFormat", "DisplayNames", "Segmenter",
                 "getCanonicalLocales",
             ],
         )
@@ -1219,6 +1254,7 @@ process.stdout.write(JSON.stringify({
                 ["RelativeTimeFormat", "RelativeTimeFormat", 1],
                 ["ListFormat", "ListFormat", 1],
                 ["DisplayNames", "DisplayNames", 1],
+                ["Segmenter", "Segmenter", 1],
                 ["getCanonicalLocales", "getCanonicalLocales", 1],
             ],
         )
@@ -1250,6 +1286,7 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(state["constructorsNative"])
         self.assertTrue(state["methodsNative"])
         self.assertTrue(state["dateConstructor"])
+        self.assertTrue(state["segmenterMatchesBootstrap"])
 
     def test_read_only_policy_denies_mutations_before_native_network_apis(self) -> None:
         script = r"""

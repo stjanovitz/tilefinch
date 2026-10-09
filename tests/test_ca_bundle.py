@@ -8,7 +8,7 @@ import re
 import sys
 
 
-EXPECTED_CERTIFICATE_COUNT = 25
+EXPECTED_CERTIFICATE_COUNT = 26
 REQUIRED_SHA256_FINGERPRINTS = {
     # September 2026 native-Mbed-TLS census: public modern trust anchors.
     "8fe4fb0af93a4d0d67db0bebb23e37c71bf325dcbcdd240ea04daf58b47e1840",
@@ -32,6 +32,8 @@ REQUIRED_SHA256_FINGERPRINTS = {
     "d95d0e8eda79525bf9beb11b14d2100d3294985f0c62d9fabd9cd999eccb7b1d",
     # SSL.com's modern ECC TLS hierarchy.
     "c32ffd9f46f936d16c3673990959434b9ad60aafbb9e7cf33654f144cc1ba143",
+    # Official self-signed RSA TLS root, also present in Mozilla's bundle.
+    "8faf7d2e2cb4709bb8e0b33666bf75a5dd45b5de480f8ea8d4bfe6bebc17f2ed",
     # Sectigo's current RSA server-authentication hierarchy.
     "7bb647a62aeeac88bf257aa522d01ffea395e0ab45c73f93f65654ec38f25a06",
     # Current Google Trust Services roots and its GlobalSign R4

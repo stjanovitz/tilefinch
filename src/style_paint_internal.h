@@ -17,6 +17,7 @@
 #define STYLE_PAINT_COMPONENT_TRANSFORM_ORIGIN UINT8_C(16)
 #define STYLE_PAINT_COMPONENT_TEXT_SHADOW      UINT8_C(32)
 #define STYLE_PAINT_COMPONENT_BOX_SHADOW       UINT8_C(64)
+#define STYLE_PAINT_COMPONENT_SKEW             UINT8_C(128)
 #define STYLE_PAINT_POSITION_FROM_RIGHT UINT8_C(1)
 #define STYLE_PAINT_POSITION_FROM_BOTTOM UINT8_C(2)
 #define STYLE_PAINT_POSITION_X_PIXELS UINT8_C(4)
@@ -64,6 +65,7 @@ struct StylePaintStack {
     uint8_t reserved;
     uint16_t transform_origin_x;
     uint16_t transform_origin_y;
+    int16_t skew_x_q10;
     StylePaintLayer backgrounds[STYLE_PAINT_LAYER_LIMIT];
     StylePaintLayer masks[STYLE_PAINT_LAYER_LIMIT];
     StyleBoxShadow text_shadows[STYLE_BOX_SHADOW_LIMIT];

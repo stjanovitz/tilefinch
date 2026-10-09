@@ -282,7 +282,7 @@ async function main() {
   assert.deepEqual(shape.intl, {
     keys: [
       "Locale", "NumberFormat", "PluralRules", "DateTimeFormat", "Collator",
-      "RelativeTimeFormat", "ListFormat", "DisplayNames", "getCanonicalLocales",
+      "RelativeTimeFormat", "ListFormat", "DisplayNames", "Segmenter", "getCanonicalLocales",
     ],
     date: "11/14/2023",
     parts: ["month:11", "literal:/", "day:14", "literal:/", "year:2023"],

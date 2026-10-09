@@ -117,10 +117,10 @@ cleanup:
     return ok;
 }
 
-static bool test_static_script_cost_admission(Budget *budget)
+static bool test_static_script_cost_profile(Budget *budget)
 {
     (void) budget;
-    const char *test_name = "static script cost admission";
+    const char *test_name = "static script cost profile";
     bool ok = true;
     char *heavy = NULL;
     static const char small[] =
@@ -129,7 +129,6 @@ static bool test_static_script_cost_admission(Budget *budget)
     ScriptStaticCostProfile profile = {0};
     script_static_cost_profile(small, sizeof(small) - 1u, &profile);
     REQUIRE(profile.loops == 1u && profile.flags == 0u);
-    REQUIRE(!script_static_cost_rejects(&profile, true, false));
 
     heavy = make_padded_script_source(
         "while(ready){document.write(value);}", 400u * 1024u);
@@ -137,13 +136,107 @@ static bool test_static_script_cost_admission(Budget *budget)
     script_static_cost_profile(heavy, 400u * 1024u, &profile);
     REQUIRE(profile.loops == 1u);
     REQUIRE((profile.flags & SCRIPT_COST_SIGNAL_DOCUMENT_WRITE) != 0u);
-    REQUIRE(script_static_cost_rejects(&profile, true, false));
-    REQUIRE(!script_static_cost_rejects(&profile, false, false));
-    REQUIRE(!script_static_cost_rejects(&profile, true, true));
 
 cleanup:
     free(heavy);
     if (!ok) fprintf(stderr, "%s failed\n", test_name);
+    return ok;
+}
+
+/* Generic authored bundles, not captured source. Exercise the actual stream
+   checkpoint, both source origins and both source acquisition paths. */
+static bool test_large_parser_bundles_follow_bounded_realm_policy(Budget *budget)
+{
+    const char *test_name = "large parser bundles use bounded realm policy";
+    bool ok = true;
+    for (size_t variant = 0; variant < 3u; variant++) {
+        bool cdn = variant != 0u;
+        bool cached = variant == 2u;
+        const char *first_url = cdn ? "https://bundle-cdn.test/first.js"
+            : "https://bundle-page.test/first.js";
+        const char *second_url = cdn ? "https://bundle-cdn.test/second.js"
+            : "https://bundle-page.test/second.js";
+        char html[1024];
+        snprintf(html, sizeof(html),
+            "<!doctype html><body><p>Useful prefix</p>"
+            "<script>globalThis.bundleOrder=['before'];</script>"
+            "<script src='%s'></script><script src='%s'></script>"
+            "<script>bundleOrder.push('after');globalThis.pocSummary="
+            "bundleOrder.join(',')+':'+document.getElementById('written')."
+            "textContent;</script><a href='/useful'>Useful link</a></body>",
+            first_url, second_url);
+        char *first = make_padded_script_source(
+            "bundleOrder.push('first');document.write('<p id=written>wrote</p>');",
+            600u * 1024u);
+        char *second = make_padded_script_source(
+            "if(document.getElementById('written'))bundleOrder.push('second');",
+            600u * 1024u);
+        ScriptReplayRecord records[3] = {
+            {.url = "https://bundle-page.test/", .source = html,
+             .document = true},
+            {.url = first_url, .source = first},
+            {.url = second_url, .source = second}
+        };
+        char directory[128] = {0}, error[256] = {0};
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool fixture_ready = false, replaying = false;
+        bool browser_ready = false, navigation_ready = false;
+        REQUIRE(first != NULL && second != NULL);
+        REQUIRE(write_replay_fixture(directory, records, cached ? 1u : 3u));
+        fixture_ready = true;
+        REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+        replaying = true;
+        REQUIRE(browser_session_init(&browser, budget, 2u * MIB));
+        browser_ready = true;
+        if (cached) {
+            REQUIRE(put_script_for_document(&browser, first_url, first,
+                                           "https://bundle-page.test/"));
+            REQUIRE(put_script_for_document(&browser, second_url, second,
+                                           "https://bundle-page.test/"));
+        }
+        REQUIRE(navigation_init(&navigation, budget, 2));
+        navigation_ready = true;
+        navigation.heavy_script_policy = SCRIPT_HEAVY_POLICY_RUN;
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 8u * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8u, 2u * MIB, 700u * 1024u, 1000);
+        navigation_set_fixed_script_memory_limits(&navigation, true);
+        navigation_set_stream_delivery(&navigation, 43u, 0, 0, 0, 0, 0);
+        uint64_t generation = navigation_begin(&navigation);
+        REQUIRE(navigation_load_url(&navigation, generation,
+            "https://bundle-page.test/", 4096u, 1000, 480,
+            NULL, NULL, true));
+        REQUIRE(navigation.page.runtime != NULL);
+        if (strcmp(navigation.page.script_result.summary,
+                   "before,first,second,after:wrote") != 0) {
+            fprintf(stderr, "bundle variant=%zu summary=%s error=%s source=%s "
+                "loaded=%zu failed=%zu quota=%zu pressure=%zu work=%zu\n",
+                variant, navigation.page.script_result.summary,
+                navigation.page.script_result.error,
+                navigation.page.script_result.error_source_context,
+                navigation.script_loaded, navigation.script_failed,
+                navigation.script_skipped_quota, navigation.script_skipped_pressure,
+                navigation.performance.parser_script_stage_work);
+        }
+        REQUIRE(strcmp(navigation.page.script_result.summary,
+            "before,first,second,after:wrote") == 0);
+        REQUIRE(navigation.performance.parser_script_stage_work > MIB);
+        REQUIRE(navigation.performance.parser_script_stage_breakers == 0u);
+        REQUIRE(navigation.script_cost_class_rejections == 0u);
+        REQUIRE(navigation.script_skipped_quota == 0u);
+
+cleanup:
+        if (navigation_ready) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        if (replaying) fetch_trace_end();
+        if (fixture_ready) remove_replay_fixture(directory, cached ? 1u : 3u);
+        free(second);
+        free(first);
+        if (budget->current != 0) ok = false;
+        if (!ok) return false;
+    }
     return ok;
 }
 
@@ -173,6 +266,9 @@ static bool test_script_realm_quota_caps_and_defaults(Budget *budget)
         &document, budget, 8u * MIB, 1000,
         "https://realm-cap.test/", &capped, &result);
     REQUIRE(runtime != NULL && result.success);
+    ScriptHeapGrowth growth;
+    script_runtime_heap_growth(runtime, &growth);
+    REQUIRE(growth.source_limit == 128u * MIB);
 
     /* Executable-count storage is a realm contract, not the 64-entry active
        dynamic-task queue.  These reservations carry metadata only. */
@@ -230,6 +326,8 @@ static bool test_script_realm_quota_caps_and_defaults(Budget *budget)
         &document, budget, 8u * MIB, 1000,
         "https://realm-default.test/", &defaults, &result);
     REQUIRE(runtime != NULL && result.success);
+    script_runtime_heap_growth(runtime, &growth);
+    REQUIRE(growth.source_limit == 2u * MIB);
     for (size_t i = 0; i < 64u; i++) {
         ScriptQuotaReservation count = {0};
         REQUIRE(script_runtime_script_quota_reserve(

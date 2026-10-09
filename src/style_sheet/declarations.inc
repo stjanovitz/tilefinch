@@ -411,7 +411,7 @@ static const char *stylesheet_store_selector(Stylesheet *sheet,
                                              const char *text,
                                              size_t length)
 {
-    if (length >= STYLE_SELECTOR_CAPACITY) return NULL;
+    if (length >= STYLE_SELECTOR_TEXT_CAPACITY) return NULL;
     return stylesheet_store_text(sheet, text, length);
 }
 
@@ -1465,12 +1465,14 @@ static bool retained_rule_fast_matches(const Stylesheet *sheet,
                                         const StyleMatchSubject *subject)
 {
     if (rule == NULL || subject == NULL
-        || rule->fast_key_offset == UINT8_MAX
+        || rule->fast_key_suffix_bytes == UINT8_MAX
         || rule->fast_key_length == 0) return true;
-    size_t offset = rule->fast_key_offset;
-    if (offset >= rule->selector_length
-        || rule->fast_key_length > rule->selector_length - offset)
+    if (rule->fast_key_suffix_bytes > rule->selector_length
+        || rule->fast_key_length
+           > rule->selector_length - rule->fast_key_suffix_bytes)
         return true;
+    size_t offset = rule->selector_length - rule->fast_key_suffix_bytes
+        - rule->fast_key_length;
     const char *key = rule->selector + offset;
     size_t key_length = rule->fast_key_length;
     char marker = offset == 0 ? '\0' : rule->selector[offset - 1u];
@@ -2750,20 +2752,21 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
     rule->name = stored + selector_length + 1u;
     rule->value = rule->name + name_length + 1u;
     rule->name_length = (uint8_t) name_length;
-    rule->selector_length = (uint8_t) selector_length;
+    rule->selector_length = (uint16_t) selector_length;
     rule->important = important;
     rule->pseudo = (uint8_t) pseudo;
     rule->container_query = sheet->current_container_query;
-    rule->fast_key_offset = UINT8_MAX;
+    rule->fast_key_suffix_bytes = UINT8_MAX;
     StyleRule selector_metadata = {
         .selector = rule->selector,
         .selector_length = (uint16_t) selector_length
     };
     selector_assign_fast_key(
         &selector_metadata, rule->selector, selector_length);
-    if (selector_metadata.has_fast_key
-        && selector_metadata.fast_key_offset < UINT8_MAX) {
-        rule->fast_key_offset = (uint8_t) selector_metadata.fast_key_offset;
+    size_t suffix_bytes = selector_length
+        - selector_metadata.fast_key_offset - selector_metadata.fast_key_length;
+    if (selector_metadata.has_fast_key && suffix_bytes < UINT8_MAX) {
+        rule->fast_key_suffix_bytes = (uint8_t) suffix_bytes;
         rule->fast_key_length = selector_metadata.fast_key_length;
     }
     rule->origin = sheet->current_origin;

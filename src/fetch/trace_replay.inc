@@ -1597,7 +1597,12 @@ static bool trace_replay_response_with_scratch(
         snprintf(result->effective_url, sizeof(result->effective_url), "%s",
                  url);
     }
-    if (recorded_length > maximum_bytes) {
+    /* A streaming consumer may intentionally stop inside a larger, complete
+       captured response. Verify that entire capture below, then enforce the
+       request byte ceiling while delivering slices, as live transport does. */
+    bool bounded_stream = recorded_success && writer != NULL
+        && writer->defer_replay_body && writer->stream != NULL;
+    if (recorded_length > maximum_bytes && !bounded_stream) {
         result->response_limit_exceeded = true;
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay record %zu exceeds request quota", sequence);

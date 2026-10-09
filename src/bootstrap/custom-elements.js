@@ -934,15 +934,17 @@
       }
       return { rules, truncated: false };
     };
-  /* Native constructed-sheet storage (document_adopted_sheets.c): a
-     sheet's text lives once, in a detached <style> element made on its
+  /* Native CSSOM storage (document_adopted_sheets.c): a sheet's text lives
+     in reusable storage keyed by a detached <style> element made on its
      first adoption; adoptedStyleSheets lists name those elements, and the
      cascade parses each adopted sheet once however many roots adopt it. */
   const nativeSheetText = globalThis.__tilefinchConstructedSheetText,
+    nativeSheetRevision = globalThis.__tilefinchSheetRevision,
     nativeSetAdopted = globalThis.__tilefinchSetAdoptedSheets,
     sheetQuotaError = () =>
       new DOMException("Stylesheet exceeds bounded size", "QuotaExceededError");
   delete globalThis.__tilefinchConstructedSheetText;
+  delete globalThis.__tilefinchSheetRevision;
   delete globalThis.__tilefinchCssStatementEnds;
   delete globalThis.__tilefinchSetAdoptedSheets;
   class CSSStyleSheet {
@@ -967,7 +969,7 @@
         },
       };
     }
-    /* The text is derived, not kept: the native element holds the only
+    /* The text is derived, not kept: the native override holds the only
        copy the cascade reads. */
     get __text() {
       return this.__rules.join("\n");
@@ -976,12 +978,17 @@
        so a refusal leaves the sheet exactly as it was. */
     __commit(rules) {
       const text = rules.join("\n");
+      const nativeOwner = this.__constructed ? this.__node
+        : this.ownerNode instanceof HTMLStyleElement ? this.ownerNode : null;
       if (
-        this.__constructed &&
-        this.__node &&
-        !nativeSheetText(this.__node.__handle, text)
+        nativeOwner &&
+        !nativeSheetText(
+          nativeOwner.__handle,
+          text, this.__constructed)
       )
         throw sheetQuotaError();
+      if (!this.__constructed && nativeOwner)
+        this.__authorRevision = nativeSheetRevision(nativeOwner.__handle);
       this.__rules = rules;
       this.__textLength = text.length;
       /* Rule objects are built once a page reads cssRules, not for every
@@ -990,7 +997,10 @@
          it is kept current. */
       this.__cssRulesStale = true;
       if (this.__cssRulesRead) this.cssRules;
-      if (!this.__constructed && this.ownerNode) {
+      /* Link sheets retain their existing reflection path. Their response
+         URL, rel/href changes and source fetching are a separate lifetime
+         contract, not an inline CSSOM source. */
+      if (!this.__constructed && this.ownerNode && !nativeOwner) {
         this.__authorSource = text;
         if (this.ownerNode.textContent !== text)
           this.ownerNode.textContent = text;
@@ -1021,6 +1031,8 @@
       });
     }
     get cssRules() {
+      if (!this.__constructed && this.__authorRevision !== undefined)
+        this.__refreshAuthor();
       this.__cssRulesRead = true;
       if (this.__cssRulesStale) {
         this.__cssRulesStale = false;
@@ -1043,6 +1055,8 @@
     /* An author <style> past the text bound is reflected only in part;
        writing that part back would delete the rest of the element. */
     __assertWholeAuthorSheet() {
+      if (!this.__constructed && this.__authorRevision !== undefined)
+        this.__refreshAuthor();
       if (!this.__constructed && this.__truncated)
         throw new DOMException(
           "Stylesheet exceeds bounded size",
@@ -1113,14 +1127,25 @@
           authorSheets.set(node, sheet);
         }
         source = String(source || "");
-        if (sheet.__authorSource !== source) {
+        /* Untouched sheets use the original lazy DOM reflection. Only a
+           successfully admitted CSSOM override needs native reset tracking. */
+        const revision = sheet.__authorRevision === undefined
+          ? undefined : nativeSheetRevision(node.__handle);
+        if (sheet.__authorSource !== source || sheet.__authorRevision !== revision) {
           sheet.__constructed = true;
           sheet.replaceSync(source);
           sheet.__constructed = false;
           sheet.__authorSource = source;
+          if (revision !== undefined) sheet.__authorRevision = revision;
         }
         return sheet;
       };
+    /* One shared callback, not a closure allocated for every reflected sheet. */
+    CSSStyleSheet.prototype.__refreshAuthor = function () {
+      const node = this.ownerNode;
+      if (this.__authorRevision !== nativeSheetRevision(node.__handle))
+        authorSheet(node, node.textContent, this.href);
+    };
     Object.defineProperty(HTMLStyleElement.prototype, "sheet", Object.getOwnPropertyDescriptor({
       get sheet() {
         return this.isConnected

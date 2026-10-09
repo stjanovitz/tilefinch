@@ -1,0 +1,92 @@
+Preserve NanoSVG array ownership and capacity when realloc is refused.
+
+A refused point growth previously installed NULL with the new capacity;
+the next point wrote through NULL. The decoder's Budget hook records any
+refused allocation and declines the partial parse/raster at its boundary.
+
+--- a/src/nanosvg.h
++++ b/src/nanosvg.h
+@@ -734,5 +734,7 @@
+ 	if (p->npts+1 > p->cpts) {
+-		p->cpts = p->cpts ? p->cpts*2 : 8;
+-		p->pts = (float*)realloc(p->pts, p->cpts*2*sizeof(float));
+-		if (!p->pts) return;
++		int capacity = p->cpts ? p->cpts*2 : 8;
++		float* points = (float*)realloc(p->pts, capacity*2*sizeof(float));
++		if (!points) return;
++		p->pts = points;
++		p->cpts = capacity;
+ 	}
+@@ -2821,4 +2823,5 @@
+-	grad->nstops++;
+-	grad->stops = (NSVGgradientStop*)realloc(grad->stops, sizeof(NSVGgradientStop)*grad->nstops);
+-	if (grad->stops == NULL) return;
++	NSVGgradientStop* stops = (NSVGgradientStop*)realloc(grad->stops, sizeof(NSVGgradientStop)*(grad->nstops+1));
++	if (stops == NULL) return;
++	grad->stops = stops;
++	grad->nstops++;
+ 
+--- a/src/nanosvgrast.h
++++ b/src/nanosvgrast.h
+@@ -232,6 +232,7 @@
+ 	if (r->curpage == NULL || r->curpage->size+size > NSVG__MEMPAGE_SIZE) {
+ 		r->curpage = nsvg__nextPage(r, r->curpage);
+ 	}
++	if (r->curpage == NULL) return NULL;
+ 	buf = &r->curpage->mem[r->curpage->size];
+ 	r->curpage->size += size;
+ 	return buf;
+@@ -257,5 +257,7 @@
+ 	if (r->npoints+1 > r->cpoints) {
+-		r->cpoints = r->cpoints > 0 ? r->cpoints * 2 : 64;
+-		r->points = (NSVGpoint*)realloc(r->points, sizeof(NSVGpoint) * r->cpoints);
+-		if (r->points == NULL) return;
++		int capacity = r->cpoints > 0 ? r->cpoints * 2 : 64;
++		NSVGpoint* points = (NSVGpoint*)realloc(r->points, sizeof(NSVGpoint) * capacity);
++		if (points == NULL) return;
++		r->points = points;
++		r->cpoints = capacity;
+ 	}
+@@ -272,5 +274,7 @@
+ 	if (r->npoints+1 > r->cpoints) {
+-		r->cpoints = r->cpoints > 0 ? r->cpoints * 2 : 64;
+-		r->points = (NSVGpoint*)realloc(r->points, sizeof(NSVGpoint) * r->cpoints);
+-		if (r->points == NULL) return;
++		int capacity = r->cpoints > 0 ? r->cpoints * 2 : 64;
++		NSVGpoint* points = (NSVGpoint*)realloc(r->points, sizeof(NSVGpoint) * capacity);
++		if (points == NULL) return;
++		r->points = points;
++		r->cpoints = capacity;
+ 	}
+@@ -283,5 +287,7 @@
+ 	if (r->npoints > r->cpoints2) {
+-		r->cpoints2 = r->npoints;
+-		r->points2 = (NSVGpoint*)realloc(r->points2, sizeof(NSVGpoint) * r->cpoints2);
+-		if (r->points2 == NULL) return;
++		int capacity = r->npoints;
++		NSVGpoint* points = (NSVGpoint*)realloc(r->points2, sizeof(NSVGpoint) * capacity);
++		if (points == NULL) return;
++		r->points2 = points;
++		r->cpoints2 = capacity;
+ 	}
+@@ -301,5 +307,7 @@
+ 	if (r->nedges+1 > r->cedges) {
+-		r->cedges = r->cedges > 0 ? r->cedges * 2 : 64;
+-		r->edges = (NSVGedge*)realloc(r->edges, sizeof(NSVGedge) * r->cedges);
+-		if (r->edges == NULL) return;
++		int capacity = r->cedges > 0 ? r->cedges * 2 : 64;
++		NSVGedge* edges = (NSVGedge*)realloc(r->edges, sizeof(NSVGedge) * capacity);
++		if (edges == NULL) return;
++		r->edges = edges;
++		r->cedges = capacity;
+ 	}
+@@ -1429,5 +1437,6 @@
+ 	if (w > r->cscanline) {
+-		r->cscanline = w;
+-		r->scanline = (unsigned char*)realloc(r->scanline, w);
+-		if (r->scanline == NULL) return;
++		unsigned char* scanline = (unsigned char*)realloc(r->scanline, w);
++		if (scanline == NULL) return;
++		r->scanline = scanline;
++		r->cscanline = w;
+ 	}

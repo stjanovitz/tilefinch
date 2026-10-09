@@ -47,7 +47,9 @@
 #define STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS 64u
 #define STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS 128u
 #define STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT 512u
-#define STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT 8192u
+/* Count text nodes too, but leave room for a hydrated document to add its
+   first dynamic panels without immediately saturating the token census. */
+#define STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT 16384u
 
 static uint32_t stylesheet_selector_token_hash(
     unsigned char kind, const char *text, size_t length)
@@ -672,7 +674,8 @@ static void document_resource_record_loaded(
     ResourceContext *context, const char *url, char **owned_url,
     const StylesheetResponseProvenance *provenance,
     BrowserSharedBody *body, size_t length, bool rules_applied,
-    bool cors_validated, TilefinchCredentialsMode credentials)
+    bool cors_validated, TilefinchCredentialsMode credentials,
+    const TilefinchResourceGrant *resource_grant)
 {
     StylesheetDocumentResources *resources = context->document_resources;
     if (resources == NULL) return;
@@ -733,6 +736,8 @@ static void document_resource_record_loaded(
     entry->length = length;
     entry->rules_applied = entry->rules_applied || rules_applied;
     entry->cors_validated = cors_validated;
+    entry->motion_source_readable = resource_grant != NULL
+        && resource_grant->cors_validated;
     entry->credentials = credentials;
     /* Completion and retention are deliberately independent.  Under memory
        pressure the bounded body wrapper can fail after the transport has
@@ -1303,7 +1308,8 @@ static bool apply_stylesheet_data(ResourceContext *context,
                                   bool use_cached,
                                   BrowserSharedBody *cached_body,
                                   const TilefinchRequestContext *request_context,
-                                  const TilefinchResourceGrant *resource_grant)
+                                  const TilefinchResourceGrant *resource_grant,
+                                  bool retained_motion_source_readable)
 {
     if (provenance == NULL || !provenance->known
         || provenance->response_url == NULL
@@ -1469,6 +1475,14 @@ static bool apply_stylesheet_data(ResourceContext *context,
         && context->session != NULL
         && tilefinch_url_same_origin(
                context->document_url, stable_provenance.response_url);
+    if (parsed && css_length >= STYLESHEET_LARGE_SOURCE_BYTES
+        && context->document_resources != NULL) {
+        context->document_resources->sampled_large_source = true;
+        for (size_t i = 0; i < STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS; i++) {
+            context->document_resources->sampled_selector_tokens[i] |=
+                context->selector_token_bloom[i];
+        }
+    }
 #ifndef TILEFINCH_NO_TRACE
     fragment_eligible = fragment_eligible
         && getenv("TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE") == NULL;
@@ -1495,6 +1509,16 @@ static bool apply_stylesheet_data(ResourceContext *context,
     size_t new_ir_length = 0;
     size_t ir_operations_reused = 0;
     StyleParsedIrApplyResult ir_result = STYLE_PARSED_IR_REJECTED;
+    /* The motion bootstrap runs in the page realm and invokes author
+       methods with parsed selectors/keyframes. A no-CORS external response
+       may style the page but must never enter that JS-visible side channel.
+       Fresh imports have their own grant; retained responses keep the
+       grant-derived readability bit. Missing provenance is non-readable. */
+    bool previous_motion_source_blocked =
+        context->sheet->motion_css_source_blocked;
+    context->sheet->motion_css_source_blocked =
+        !retained_motion_source_readable
+        && (resource_grant == NULL || !resource_grant->cors_validated);
     if (parsed && parsed_ir != NULL) {
         ir_result = stylesheet_add_parsed_ir_from_context(
             context->sheet, parsed_ir->data, parsed_ir->length,
@@ -1534,6 +1558,8 @@ static bool apply_stylesheet_data(ResourceContext *context,
                   context->sheet, (const char *) css_data, css_length,
                   source_base, stable_provenance.referrer_policy);
     }
+    context->sheet->motion_css_source_blocked =
+        previous_motion_source_blocked;
     fragment_eligible = fragment_eligible && parsed;
     unsigned char *new_fragment = NULL;
     size_t new_fragment_length = 0;
@@ -1689,7 +1715,7 @@ static bool settle_stylesheet_data(ResourceContext *context,
         return apply_stylesheet_data(
             context, resolved, provenance, css_data, css_length,
             depth, fetched,
-            use_cached, cached_body, request_context, resource_grant);
+            use_cached, cached_body, request_context, resource_grant, false);
     }
     size_t *charged = preload ? &context->stats->preload_bytes
                               : &context->stats->bytes;
@@ -1937,7 +1963,8 @@ static bool load_stylesheet_url(
             document_resource->body == NULL
                 ? NULL : document_resource->body->data,
             document_resource->length, depth, NULL, true,
-            document_resource->body, &request_context, NULL);
+            document_resource->body, &request_context, NULL,
+            document_resource->motion_source_readable);
     }
     if (context->stats->attempted >= context->maximum_count
         || context->stats->bytes >= context->maximum_total_bytes) {
@@ -2114,7 +2141,8 @@ static bool load_stylesheet_url(
                                         use_cached
                                             ? cached_snapshot.retained_body
                                             : NULL,
-                                        &request_context, &resource_grant);
+                                        &request_context, &resource_grant,
+                                        false);
     if (parsed) {
         BrowserSharedBody *body = use_cached
             ? cached_snapshot.retained_body
@@ -2126,7 +2154,7 @@ static bool load_stylesheet_url(
         }
         document_resource_record_loaded(
             context, resolved, NULL, &response_provenance, body, css_length,
-            true, false, TILEFINCH_CREDENTIALS_INCLUDE);
+            true, false, TILEFINCH_CREDENTIALS_INCLUDE, &resource_grant);
     }
     if (revalidated) {
         (void) cache_revalidate_fetch(
@@ -2446,7 +2474,8 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                         context, pending->url,
                         pending->owns_url ? &pending->url : NULL,
                         &provenance, body, css_length, pending->apply_rules,
-                        pending->cors, pending->credentials);
+                        pending->cors, pending->credentials,
+                        resource_grant_valid ? &resource_grant : NULL);
                     if (pending->url == NULL) pending->owns_url = false;
                 }
                 if (truncated) {
@@ -2793,9 +2822,15 @@ static bool process_stylesheet_node(
     if (name_is(node, "style")) {
         if (!tilefinch_csp_allows_inline_style(
                 context->content_security_policy, node)) return true;
+        size_t override_length = 0;
+        const char *override = document_cssom_sheet_text(node, &override_length);
         size_t inline_bytes = 0;
         size_t inline_working = 0;
-        for (lxb_dom_node_t *child = node->first_child;
+        if (override != NULL) {
+            inline_bytes = override_length;
+            inline_working = stylesheet_source_cost_estimate(override, override_length);
+        }
+        for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL;
              child != NULL; child = child->next) {
             size_t css_length = 0;
             const char *css = document_text_data(child, &css_length);
@@ -2818,7 +2853,9 @@ static bool process_stylesheet_node(
         snprintf(inline_sheet.referrer_policy,
                  sizeof(inline_sheet.referrer_policy), "%s",
                  context->document_referrer_policy);
-        for (lxb_dom_node_t *child = node->first_child;
+        if (override != NULL && !load_stylesheet_imports(
+                context, override, override_length, &inline_sheet, 0)) return false;
+        for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL;
              child != NULL; child = child->next) {
             size_t css_length = 0;
             const char *css = document_text_data(child, &css_length);
@@ -2850,7 +2887,13 @@ static bool process_adopted_sheets(ResourceContext *context,
     for (size_t i = 0; i < count; i++) {
         if (!resource_work(context, 1, false)) return false;
         size_t bytes = 0, working = 0;
-        for (lxb_dom_node_t *child = nodes[i]->first_child;
+        size_t override_length = 0;
+        const char *override = document_cssom_sheet_text(nodes[i], &override_length);
+        if (override != NULL) {
+            bytes = override_length;
+            working = stylesheet_source_cost_estimate(override, override_length);
+        }
+        for (lxb_dom_node_t *child = override == NULL ? nodes[i]->first_child : NULL;
              child != NULL; child = child->next) {
             size_t css_length = 0;
             const char *css = document_text_data(child, &css_length);
@@ -3759,7 +3802,8 @@ bool stylesheet_document_resources_retain(
     StylesheetDocumentResources *resources, const char *request_url,
     const char *response_url, const char *response_referrer_policy,
     BrowserSharedBody *body, size_t length, bool cors_validated,
-    TilefinchCredentialsMode credentials)
+    TilefinchCredentialsMode credentials,
+    const TilefinchResourceGrant *resource_grant)
 {
     if (resources == NULL || resources->budget == NULL
         || request_url == NULL || response_url == NULL
@@ -3781,7 +3825,7 @@ bool stylesheet_document_resources_retain(
              "%s", response_referrer_policy);
     document_resource_record_loaded(
         &context, request_url, NULL, &provenance, body, length, false,
-        cors_validated, credentials);
+        cors_validated, credentials, resource_grant);
     StylesheetDocumentResource *entry = document_resource_find(
         resources, request_url);
     return entry != NULL
@@ -3825,6 +3869,27 @@ bool stylesheet_document_resources_prepare_complete_census(
     resources->final_resample_required = false;
     resources->final_resample_completed = true;
     return true;
+}
+
+bool stylesheet_document_resources_note_dynamic_tokens(
+    StylesheetDocumentResources *resources, lxb_dom_node_t *root)
+{
+    if (resources == NULL || root == NULL
+        || !resources->sampled_large_source
+        || resources->dynamic_selector_resamples >= 8u) return false;
+    uint32_t tokens[STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS];
+    bool complete = stylesheet_collect_selector_tokens(
+        root, tokens, STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS, 512u, false);
+    /* A bounded partial census is still useful: absence is never used here,
+       only the positively observed tokens. */
+    (void) complete;
+    bool changed = false;
+    for (size_t i = 0; i < STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS; i++) {
+        changed |= (tokens[i] & ~resources->sampled_selector_tokens[i]) != 0;
+        resources->sampled_selector_tokens[i] |= tokens[i];
+    }
+    if (changed) resources->dynamic_selector_resamples++;
+    return changed;
 }
 
 bool stylesheet_document_resources_link_applied(

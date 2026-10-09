@@ -1049,6 +1049,10 @@ static bool navigation_settle_style_preloads(
    select. Every source the sheet already holds must still be connected, in
    the same order, and unchanged; image resources the journal cannot account
    for keep the full rebuild. */
+static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
+    NavigationSession *session, const char *css, size_t length,
+    bool allow_author_fallback);
+
 static bool navigation_style_append_refused(const char *reason)
 {
 #ifndef TILEFINCH_NO_TRACE
@@ -3084,6 +3088,28 @@ static bool navigation_relayout_body(NavigationSession *session)
             reuse_prepared, images_done, &images_before, &images_after,
             events_done - events_started);
 #endif
+        if (mutation_driven && session->external_resources_enabled) {
+            for (size_t i = 0; i < mutations.count; i++) {
+                const ScriptMutationRecord *record = &mutations.records[i];
+                if ((record->kind != SCRIPT_MUTATION_CHILD_LIST
+                     && record->kind != SCRIPT_MUTATION_INNER_HTML)
+                    || record->node == NULL
+                    || !navigation_node_connected(record->node)) continue;
+                if (!stylesheet_document_resources_note_dynamic_tokens(
+                        &session->page.stylesheet_resources, record->node))
+                    continue;
+                /* Use the existing presentation transaction: retained CSS
+                   is re-sampled against the hydrated DOM, while refusal
+                   leaves this already-published layout and sheet intact. */
+                NavigationUserCssTransaction *transaction =
+                    navigation_apply_presentation_css_begin(
+                        session, session->user_css, session->user_css_length,
+                        false);
+                if (transaction != NULL)
+                    navigation_apply_user_css_commit(session, transaction);
+                break;
+            }
+        }
         return true;
     }
     int old_height = session->page.layout.height;
@@ -3413,8 +3439,9 @@ static void navigation_user_css_transaction_release(
     budget_free(session->budget, transaction);
 }
 
-NavigationUserCssTransaction *navigation_apply_user_css_begin(
-    NavigationSession *session, const char *css, size_t length)
+static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
+    NavigationSession *session, const char *css, size_t length,
+    bool allow_author_fallback)
 {
     if (session == NULL || session->budget == NULL || !session->page.loaded
         || (css == NULL && length != 0) || length > 128u * 1024u)
@@ -3465,7 +3492,19 @@ NavigationUserCssTransaction *navigation_apply_user_css_begin(
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session, &next_resources, &next_external);
-        if (!okay) {
+        if (okay && !allow_author_fallback) {
+            /* Optional re-sampling must not trade existing author styling
+               for a pressure-skipped response in the replacement sheet. */
+            for (size_t i = 0; i < session->page.stylesheet_resources.count; i++) {
+                if (session->page.stylesheet_resources.items[i].rules_applied
+                    && (i >= next_resources.count
+                        || !next_resources.items[i].rules_applied)) {
+                    okay = false;
+                    break;
+                }
+            }
+        }
+        if (!okay && allow_author_fallback) {
             /* Presentation overrides such as Reader mode must remain
                available when optional author CSS was unavailable during the
                original navigation (or has since fallen out of cache). Match
@@ -3550,6 +3589,12 @@ NavigationUserCssTransaction *navigation_apply_user_css_begin(
     navigation_attach_layout(session);
     navigation_clamp_scroll_to_layout(session);
     return transaction;
+}
+
+NavigationUserCssTransaction *navigation_apply_user_css_begin(
+    NavigationSession *session, const char *css, size_t length)
+{
+    return navigation_apply_presentation_css_begin(session, css, length, true);
 }
 
 void navigation_apply_user_css_commit(
@@ -3773,6 +3818,8 @@ size_t navigation_cancel_network_work(
             session->page.frames[i].runtime, reason);
     }
     navigation_deferred_images_finish(session);
+    navigation_destroy_linked_video_preview(session, &session->page);
+    session->page.linked_video_preview_attempts = LINKED_VIDEO_PREVIEW_ATTEMPTS;
     return cancelled;
 }
 
@@ -3946,9 +3993,11 @@ static bool navigation_deferred_target_live(
 /* A missing node box is not a visibility test (inline replaced elements
    need not have one). Resolve the bounded ancestor chain using the layout
    style cache instead, and never inspect a retired weak target. */
-static bool navigation_deferred_image_visible(
-    NavigationSession *session, const ImagePriorityTarget *target)
+bool navigation_image_target_visible(
+    NavigationSession *session, const ImagePriorityTarget *target,
+    bool painted_only)
 {
+    if (session == NULL || target == NULL || target->node == NULL) return false;
     if (!navigation_deferred_target_live(&session->page, target)) return false;
     lxb_dom_node_t *ancestors[64];
     size_t count = 0;
@@ -3963,10 +4012,12 @@ static bool navigation_deferred_image_visible(
         layout_reuse_cache_resolve_style(session->page.layout_reuse,
             &session->page.stylesheet, session->fonts, ancestors[--count],
             &style, &next);
-        if (next.display == DISPLAY_NONE || next.hidden) return false;
+        if (next.display == DISPLAY_NONE || next.hidden
+            || (painted_only && (next.opacity == 0
+                || next.content_visibility == STYLE_CONTENT_VISIBILITY_HIDDEN))) return false;
         style = next;
     }
-    return true;
+    return !painted_only || !style.visibility_hidden;
 }
 
 /* Reader retains raw resource ownership while presenting a native extracted
@@ -3981,13 +4032,13 @@ static lxb_dom_node_t *navigation_deferred_reader_image(
             page->runtime, page->reader_root_handle) != root))) return NULL;
     if (!navigation_deferred_target_live(page, target)) return NULL;
     size_t length = 0;
-    const char *source = document_attribute(target->node, "src", &length);
+    const char *source = image_select_source(&page->stylesheet, target->node, &length);
     if (source == NULL || length == 0) return NULL;
     size_t visited = 0;
     for (lxb_dom_node_t *node = root; node != NULL && visited++ < 8192u;) {
         if (node_name_is(node, "img")) {
             size_t candidate_length = 0;
-            const char *candidate = document_attribute(node, "src", &candidate_length);
+            const char *candidate = image_select_source(&page->stylesheet, node, &candidate_length);
             if (candidate != NULL && length == candidate_length
                 && memcmp(source, candidate, length) == 0) return node;
         }
@@ -4007,13 +4058,13 @@ static void navigation_rank_deferred_images(NavigationSession *session, int scro
     for (size_t i = start; i < page->deferred_image_count; i++) {
         ImagePriorityTarget *target = &page->deferred_image_targets[i];
         ImagePriorityTarget presentation = *target;
-        bool visible = navigation_deferred_image_visible(session, target);
+        bool visible = navigation_image_target_visible(session, target, false);
         if (!visible) {
             lxb_dom_node_t *reader = navigation_deferred_reader_image(page, target);
             if (reader != NULL) {
                 presentation.node = reader;
                 presentation.weak_handle = 0;
-                visible = navigation_deferred_image_visible(session, &presentation);
+                visible = navigation_image_target_visible(session, &presentation, false);
             }
         }
         uint64_t distance = UINT64_MAX;
@@ -4256,6 +4307,13 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     return true;
 }
 
+bool navigation_image_publication_allowed(const NavigationSession *session)
+{
+    return session != NULL && (session->maximum_publication_work_units == 0
+        || navigation_relayout_preview_eligible(session)
+        || session->page.layout.layout_work_units <= session->maximum_publication_work_units);
+}
+
 bool navigation_run_deferred_image_work(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
@@ -4263,10 +4321,7 @@ bool navigation_run_deferred_image_work(NavigationSession *session)
         || session->page.deferred_image_targets == NULL) return true;
     /* Pages that relayout provisionally show each batch in a fraction of
        a second and complete in preemptible idle work. */
-    if (session->maximum_publication_work_units != 0
-        && !navigation_relayout_preview_eligible(session)
-        && session->page.layout.layout_work_units
-               > session->maximum_publication_work_units) {
+    if (!navigation_image_publication_allowed(session)) {
         /* Every batch is published through a full relayout costing about
            what the committed layout cost. On a page this large that is
            seconds of blocked input per pair of images; keep the fallback

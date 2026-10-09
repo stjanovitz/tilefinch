@@ -5,163 +5,16 @@ static void diagnostic_saturating_add(uint64_t *value, size_t increment)
     *value = add > UINT64_MAX - *value ? UINT64_MAX : *value + add;
 }
 
+static bool stylesheet_prefers_dark;
 static bool span_contains_literal(const char *text, size_t length,
                                   const char *literal)
 {
     size_t wanted = strlen(literal);
     if (text == NULL || wanted == 0 || wanted > length) return false;
-    for (size_t i = 0; i + wanted <= length; i++) {
+    for (size_t i = 0; i + wanted <= length; i++)
         if (memcmp(text + i, literal, wanted) == 0) return true;
-    }
     return false;
 }
-
-static bool media_feature_known(const char *feature, size_t length)
-{
-    if (feature == NULL || length == 0) return false;
-    static const char *prefixes[] = {
-        "min-width:", "max-width:", "width:",
-        "min-height:", "max-height:", "height:",
-        "min-device-width:", "max-device-width:", "device-width:",
-        "min-device-height:", "max-device-height:", "device-height:",
-        "min-aspect-ratio:", "max-aspect-ratio:", "aspect-ratio:",
-        "orientation:", "hover:", "any-hover:",
-        "pointer:", "any-pointer:", "prefers-color-scheme:",
-        "prefers-reduced-motion:", "prefers-contrast:", "forced-colors:"
-    };
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        size_t prefix_length = strlen(prefixes[i]);
-        if (length >= prefix_length
-            && memcmp(feature, prefixes[i], prefix_length) == 0) return true;
-    }
-    bool comparison = memchr(feature, '<', length) != NULL
-                      || memchr(feature, '>', length) != NULL
-                      || memchr(feature, '=', length) != NULL;
-    return comparison && (span_contains_literal(feature, length, "width")
-                          || span_contains_literal(feature, length, "height"));
-}
-
-static bool media_ratio_ranges_match(const char *query, const char *feature,
-                                     int width, int height, int relation)
-{
-    size_t feature_length = strlen(feature);
-    for (const char *match = strstr(query, feature); match != NULL;
-         match = strstr(match + feature_length, feature)) {
-        if (match > query
-            && (isalnum((unsigned char) match[-1]) || match[-1] == '-')) {
-            continue;
-        }
-        const char *value = match + feature_length;
-        char *end = NULL;
-        long numerator = strtol(value, &end, 10);
-        if (end == value || numerator <= 0 || *end != '/') return false;
-        value = end + 1;
-        long denominator = strtol(value, &end, 10);
-        if (end == value || denominator <= 0) return false;
-        int64_t actual = (int64_t) width * denominator;
-        int64_t threshold = (int64_t) height * numerator;
-        if ((relation < 0 && actual > threshold)
-            || (relation > 0 && actual < threshold)
-            || (relation == 0 && actual != threshold)) return false;
-    }
-    return true;
-}
-
-static size_t media_unknown_feature_count(const char *query)
-{
-    if (query == NULL) return 0;
-    size_t length = strlen(query);
-    size_t unknown = 0;
-    for (size_t at = 0; at < length; at++) {
-        if (query[at] != '(') continue;
-        size_t end = at + 1;
-        unsigned depth = 1;
-        while (end < length && depth != 0) {
-            if (query[end] == '(') depth++;
-            else if (query[end] == ')') depth--;
-            if (depth != 0) end++;
-        }
-        if (depth != 0 || end <= at + 1
-            || !media_feature_known(query + at + 1, end - at - 1)) {
-            unknown++;
-        }
-        if (depth == 0) at = end;
-    }
-    return unknown;
-}
-
-/* A media feature's length value. The query text runs on past it, so a
-   math function (calc, min, max, clamp) is handed to the length parser as
-   its balanced extent alone; MDN's layout breakpoints are written as
-   `(width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))`. Relative units
-   use the initial font size, as media queries require. */
-static bool media_math_function_at(const char *value, size_t length,
-                                   size_t *name_length)
-{
-    size_t name = 0;
-    while (name < length && isalpha((unsigned char) value[name])) name++;
-    if (name >= length || value[name] != '(') return false;
-    *name_length = name;
-    return (name == 4 && strncmp(value, "calc", 4) == 0)
-        || (name == 3 && (strncmp(value, "min", 3) == 0
-                          || strncmp(value, "max", 3) == 0))
-        || (name == 5 && strncmp(value, "clamp", 5) == 0);
-}
-
-static int media_length_value(const Stylesheet *sheet, const char *value,
-                              size_t length, int fallback)
-{
-    size_t name = 0;
-    if (value == NULL || !media_math_function_at(value, length, &name))
-        return style_parse_length(sheet, value, length, fallback, NULL);
-    int depth = 0;
-    for (size_t i = name; i < length && i < 256u; i++) {
-        if (value[i] == '(') depth++;
-        else if (value[i] == ')' && --depth == 0)
-            return style_parse_length(sheet, value, i + 1u, fallback, NULL);
-    }
-    return fallback;
-}
-
-static bool media_colon_ranges_match(const Stylesheet *sheet,
-                                     const char *query,
-                                     const char *feature,
-                                     int actual, bool minimum)
-{
-    if (sheet == NULL || query == NULL || feature == NULL) return false;
-    size_t feature_length = strlen(feature);
-    for (const char *match = strstr(query, feature); match != NULL;
-         match = strstr(match + feature_length, feature)) {
-        const char *value = match + feature_length;
-        int fallback = minimum ? 0 : 32767;
-        int threshold = media_length_value(NULL, value, strlen(value),
-                                           fallback);
-        if ((minimum && actual < threshold)
-            || (!minimum && actual > threshold)) return false;
-    }
-    return true;
-}
-
-static bool media_colon_exact_match(const Stylesheet *sheet,
-                                    const char *query,
-                                    const char *feature, int actual)
-{
-    size_t feature_length = strlen(feature);
-    for (const char *match = strstr(query, feature); match != NULL;
-         match = strstr(match + feature_length, feature)) {
-        if (match > query
-            && (isalnum((unsigned char) match[-1]) || match[-1] == '-')) {
-            continue;
-        }
-        const char *value = match + feature_length;
-        int threshold = media_length_value(sheet, value, strlen(value),
-                                           INT_MIN);
-        if (threshold == INT_MIN || actual != threshold) return false;
-    }
-    return true;
-}
-
-static bool stylesheet_prefers_dark;
 
 void stylesheet_set_prefers_dark_color_scheme(bool dark)
 {
@@ -177,202 +30,12 @@ bool stylesheet_prefers_dark_color_scheme(void)
     return stylesheet_prefers_dark;
 }
 
-static bool media_clause_matches(const Stylesheet *sheet,
-                                 const char *text, size_t length)
-{
-    char query[512];
-    size_t output = 0;
-    size_t consumed = 0;
-    for (; consumed < length && output + 1 < sizeof(query); consumed++) {
-        size_t i = consumed;
-        if (!isspace((unsigned char) text[i])) {
-            query[output++] = (char) tolower((unsigned char) text[i]);
-        }
-    }
-    query[output] = '\0';
-    size_t unknown = media_unknown_feature_count(query);
-    if (consumed != length) unknown++;
-    if (unknown != 0) {
-        diagnostic_saturating_add(
-            &((Stylesheet *) sheet)->diagnostic_unknown_media_features,
-            unknown);
-        return false;
-    }
-    /* A leading `not` negates the whole query (Media Queries 4: `not` before
-       a media type or a parenthesized condition). Without this MDN's
-       `@media not (width <= 769px)` desktop heading anchors matched on the
-       480 px handheld.  An unknown feature above already made the query
-       false, which `not` does not invert. */
-    if (strncmp(query, "not", 3) == 0
-        && (query[3] == '(' || strncmp(query + 3, "all", 3) == 0
-            || strncmp(query + 3, "screen", 6) == 0
-            || strncmp(query + 3, "print", 5) == 0)) {
-        size_t at = 0;
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        if (at + 3 <= length) {
-            return !media_clause_matches(sheet, text + at + 3,
-                                         length - at - 3);
-        }
-    }
-    /* Media types are evaluated before their feature tail.  The device is a
-       screen/all environment, so the common responsive-image sentinel
-       `not all` and an explicitly negated screen query can never match,
-       while `not print` can.  Keeping this in the shared evaluator makes
-       <source media>, @media, and the native matchMedia bridge agree. */
-    if (strncmp(query, "notall", 6) == 0
-        || strncmp(query, "notscreen", 9) == 0) return false;
-    if (strstr(query, "print") != NULL && strstr(query, "screen") == NULL
-        && strstr(query, "notprint") == NULL) return false;
-    if ((strstr(query, "prefers-color-scheme:dark") != NULL
-         && !stylesheet_prefers_dark)
-        || (strstr(query, "prefers-color-scheme:light") != NULL
-            && stylesheet_prefers_dark)
-        || strstr(query, "prefers-reduced-motion:no-preference") != NULL
-        || (strstr(query, "prefers-contrast:") != NULL
-            && strstr(query, "prefers-contrast:no-preference") == NULL)
-        || strstr(query, "forced-colors:active") != NULL
-        || strstr(query, "hover:hover") != NULL
-        || strstr(query, "any-hover:hover") != NULL
-        || strstr(query, "pointer:fine") != NULL
-        || strstr(query, "any-pointer:fine") != NULL
-        || strstr(query, "orientation:portrait") != NULL) return false;
-    struct DimensionRange {
-        const char *name;
-        int actual;
-    } dimensions[] = {{"width", sheet->viewport_width},
-                      {"height", sheet->viewport_height}};
-    bool range_recognized = false;
-    bool range_matches = true;
-    for (size_t dimension = 0;
-         dimension < sizeof(dimensions) / sizeof(dimensions[0]); dimension++) {
-        const char *name = dimensions[dimension].name;
-        int actual = dimensions[dimension].actual;
-        const char *operators[] = {">=", "<=", ">", "<", "="};
-        for (size_t operation = 0;
-             operation < sizeof(operators) / sizeof(operators[0]); operation++) {
-            char pattern[24];
-            snprintf(pattern, sizeof(pattern), "%s%s", name,
-                     operators[operation]);
-            for (const char *match = strstr(query, pattern); match != NULL;
-                 match = strstr(match + 1, pattern)) {
-                const char *value = match + strlen(pattern);
-                if ((operation == 2 || operation == 3)
-                    && *value == '=') continue;
-                int threshold = media_length_value(sheet, value,
-                                                   strlen(value), 0);
-                range_recognized = true;
-                if ((operation == 0 && actual < threshold)
-                    || (operation == 1 && actual > threshold)
-                    || (operation == 2 && actual <= threshold)
-                    || (operation == 3 && actual >= threshold)
-                    || (operation == 4 && actual != threshold)) {
-                    range_matches = false;
-                }
-            }
-            snprintf(pattern, sizeof(pattern), "%s%s", operators[operation],
-                     name);
-            for (const char *match = strstr(query, pattern); match != NULL;
-                 match = strstr(match + 1, pattern)) {
-                if ((operation == 2 || operation == 3)
-                    && match > query && match[-1] == '=') continue;
-                const char *start = match;
-                if (start > query && start[-1] == ')') {
-                    /* `calc(...) < width`: back over the balanced call. */
-                    int depth = 0;
-                    const char *at = start;
-                    while (at > query && (size_t) (match - at) < 256u) {
-                        at--;
-                        if (*at == ')') depth++;
-                        else if (*at == '(' && --depth == 0) break;
-                    }
-                    while (at > query && isalpha((unsigned char) at[-1]))
-                        at--;
-                    size_t name = 0;
-                    if (depth == 0
-                        && media_math_function_at(
-                               at, (size_t) (match - at), &name))
-                        start = at;
-                }
-                while (start == match && start > query) {
-                    unsigned char character = (unsigned char) start[-1];
-                    if (!(isalnum(character) || character == '.'
-                          || character == '%' || character == '-')) break;
-                    start--;
-                }
-                if (start == match) continue;
-                int threshold = media_length_value(
-                    sheet, start, (size_t) (match - start), 0);
-                range_recognized = true;
-                if ((operation == 0 && threshold < actual)
-                    || (operation == 1 && threshold > actual)
-                    || (operation == 2 && threshold <= actual)
-                    || (operation == 3 && threshold >= actual)
-                    || (operation == 4 && threshold != actual)) {
-                    range_matches = false;
-                }
-            }
-        }
-    }
-    if (range_recognized && !range_matches) return false;
-    return media_colon_ranges_match(sheet, query, "min-width:",
-                                    sheet->viewport_width, true)
-           && media_colon_ranges_match(sheet, query, "max-width:",
-                                       sheet->viewport_width, false)
-           && media_colon_ranges_match(sheet, query, "min-height:",
-                                       sheet->viewport_height, true)
-           && media_colon_ranges_match(sheet, query, "max-height:",
-                                       sheet->viewport_height, false)
-           && media_colon_ranges_match(sheet, query, "min-device-width:",
-                                       sheet->viewport_width, true)
-           && media_colon_ranges_match(sheet, query, "max-device-width:",
-                                       sheet->viewport_width, false)
-           && media_colon_ranges_match(sheet, query, "min-device-height:",
-                                       sheet->viewport_height, true)
-           && media_colon_ranges_match(sheet, query, "max-device-height:",
-                                       sheet->viewport_height, false)
-           && media_colon_exact_match(sheet, query, "width:",
-                                      sheet->viewport_width)
-           && media_colon_exact_match(sheet, query, "height:",
-                                      sheet->viewport_height)
-           && media_colon_exact_match(sheet, query, "device-width:",
-                                      sheet->viewport_width)
-           && media_colon_exact_match(sheet, query, "device-height:",
-                                      sheet->viewport_height)
-           && media_ratio_ranges_match(query, "min-aspect-ratio:",
-                                       sheet->viewport_width,
-                                       sheet->viewport_height, 1)
-           && media_ratio_ranges_match(query, "max-aspect-ratio:",
-                                       sheet->viewport_width,
-                                       sheet->viewport_height, -1)
-           && media_ratio_ranges_match(query, "aspect-ratio:",
-                                       sheet->viewport_width,
-                                       sheet->viewport_height, 0);
-}
+#include "media_queries.inc"
 
 static bool media_matches(const Stylesheet *sheet, const char *text, size_t length)
 {
-    /* Media Queries 4, section 2.1: an empty media query list evaluates to
-       true. CSS-in-JS runtimes such as Stitches wrap whole theme blocks in
-       a bare `@media{...}`; refusing it dropped every custom property and
-       size those blocks carry. */
-    size_t content = 0;
-    while (content < length && isspace((unsigned char) text[content])) {
-        content++;
-    }
-    if (content == length) return true;
-    for (size_t at = 0; at < length;) {
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (text[end] == ',' && parentheses == 0) break;
-            end++;
-        }
-        if (media_clause_matches(sheet, text + at, end - at)) return true;
-        at = end + (end < length);
-    }
-    return false;
+    return media_evaluate(sheet, text, length, 1.0,
+                           sheet->viewport_width, sheet->viewport_height);
 }
 
 bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
@@ -380,6 +43,13 @@ bool stylesheet_media_matches(const Stylesheet *sheet, const char *query,
 {
     return sheet != NULL && query != NULL
            && media_matches(sheet, query, query_length);
+}
+
+bool stylesheet_media_matches_viewport(int width, int height, double resolution,
+                                       const char *query, size_t length)
+{
+    return width > 0 && height > 0 && isfinite(resolution) && resolution > 0
+        && media_evaluate(NULL, query, length, resolution, width, height);
 }
 
 size_t skip_selector_identifier(const char *text, size_t length,
@@ -1450,7 +1120,7 @@ static bool selector_to_rule(
     StyleRule base;
     memset(&base, 0, sizeof(base));
     base.pseudo = (uint8_t) pseudo;
-    if (length >= STYLE_SELECTOR_CAPACITY) {
+    if (length >= STYLE_SELECTOR_TEXT_CAPACITY) {
         if (sheet->diagnostic_selector_drops != UINT64_MAX) {
             sheet->diagnostic_selector_drops++;
         }
@@ -2136,7 +1806,7 @@ static bool supports_selector_pseudo(const char *name, size_t length)
 static bool supports_selector_syntax(const char *text, size_t length)
 {
     trim(&text, &length);
-    if (length == 0 || length >= STYLE_SELECTOR_CAPACITY) return false;
+    if (length == 0 || length >= STYLE_SELECTOR_TEXT_CAPACITY) return false;
     unsigned round = 0, square = 0;
     char quote = 0;
     bool token = false;

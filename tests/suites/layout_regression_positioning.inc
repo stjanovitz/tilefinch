@@ -1483,6 +1483,129 @@
     document_destroy(&bfc_document);
     CHECK(budget.current == 0);
 
+    puts("test: cleared formatting contexts query floats at their border edge");
+    for (int margin = -10; margin <= 10; margin += 10) {
+        char clear_margin_page[512];
+        int count = snprintf(clear_margin_page, sizeof(clear_margin_page),
+            "<!doctype html><style>body{margin:0}"
+            "#float{float:left;width:480px;height:40px}"
+            "#clear{clear:both;overflow:hidden;margin-top:%dpx;height:20px}"
+            "</style><body><div id=float></div><div id=clear>footer</div>",
+            margin);
+        PocDocument clear_document = {0};
+        Stylesheet clear_sheet = {0};
+        LayoutDocument clear_layout = {0};
+        CHECK(count > 0 && (size_t) count < sizeof(clear_margin_page)
+              && document_parse(&clear_document, &budget, clear_margin_page,
+                                (size_t) count, 17)
+              && stylesheet_build(&clear_sheet, &budget, &clear_document, 480)
+              && layout_build(&clear_layout, &budget, &clear_document,
+                              &clear_sheet, NULL, NULL, 480));
+        const LayoutNodeBox *cleared = layout_box_for_node(&clear_layout,
+            find_id(lxb_dom_interface_node(clear_document.html), "clear"));
+        CHECK(cleared != NULL && cleared->x == 0 && cleared->y == 40
+              && cleared->width == 480 && cleared->height == 20);
+        layout_destroy(&clear_layout);
+        stylesheet_destroy(&clear_sheet);
+        document_destroy(&clear_document);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: positioned generated text honors its line box and alignment");
+    {
+        static const char generated_line_page[] =
+            "<!doctype html><style>body{margin:0}"
+            "#tool{position:relative;width:32px;height:44px}"
+            "#tool::after{content:'M';position:absolute;left:0;right:0;"
+            "top:1px;font-size:16px;line-height:44px;text-align:center}"
+            "</style><body><div id=tool></div>";
+        PocDocument generated_document = {0};
+        Stylesheet generated_sheet = {0};
+        LayoutDocument generated_layout = {0};
+        CHECK(document_parse(&generated_document, &budget, generated_line_page,
+                             sizeof(generated_line_page) - 1u, 17)
+              && stylesheet_build(&generated_sheet, &budget,
+                                  &generated_document, 480)
+              && layout_build(&generated_layout, &budget, &generated_document,
+                              &generated_sheet, NULL, NULL, 480));
+        bool found = false;
+        for (size_t i = 0; i < generated_layout.count; i++) {
+            const DrawCommand *command = &generated_layout.commands[i];
+            if (command->type != DRAW_TEXT || command->text_length != 1
+                || command->text[0] != 'M') continue;
+            CHECK(command->x == (32 - command->width) / 2
+                  && command->y == 1 + (44 - command->height) / 2);
+            found = true;
+        }
+        CHECK(found);
+        layout_destroy(&generated_layout);
+        stylesheet_destroy(&generated_sheet);
+        document_destroy(&generated_document);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: solid generated decorations retain bounded horizontal shear");
+    for (int angle = -45; angle <= 90; angle += 45) {
+        char page[512];
+        int length = snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0;background:white}"
+            "#badge{position:relative;left:20px;top:10px;width:30px;height:20px}"
+            "#badge::before{content:'';position:absolute;inset:0;"
+            "background:red;transform:skew(%ddeg,0)}%s"
+            "</style><body><div id=badge></div>",
+            angle == 90 ? 45 : angle,
+            angle == 90 ? "#badge::before{transform:none}" : "");
+        PocDocument doc = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(length > 0 && (size_t) length < sizeof(page)
+              && document_parse(&doc, &budget, page, (size_t) length, 17)
+              && stylesheet_build(&sheet, &budget, &doc, 80)
+              && layout_build(&layout, &budget, &doc, &sheet,
+                              NULL, NULL, 80));
+        TileCache cache;
+        uint16_t pixels[80u * 40u];
+        CHECK(tile_cache_init(&cache, &budget, &layout, 2)
+              && tile_cache_set_frame(&cache, pixels, 80u * 40u)
+              && tile_cache_render_frame(&cache, 0, 80, 40, NULL));
+        CHECK(pixels[20u * 80u + 35u] == 0xf800u);
+        if (angle != 0 && angle != 90) {
+            size_t top_ink = angle < 0 ? 55u : 15u;
+            size_t bottom_ink = angle < 0 ? 15u : 55u;
+            CHECK(pixels[11u * 80u + top_ink] == 0xf800u
+                  && pixels[28u * 80u + bottom_ink] == 0xf800u
+                  && pixels[11u * 80u + bottom_ink] == 0xffffu
+                  && pixels[28u * 80u + top_ink] == 0xffffu);
+        } else {
+            CHECK(pixels[11u * 80u + 21u] == 0xf800u
+                  && pixels[11u * 80u + 15u] == 0xffffu
+                  && pixels[11u * 80u + 55u] == 0xffffu);
+        }
+        tile_cache_destroy(&cache);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&doc);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: unsupported generated shear spans decline without partial writes");
+    {
+        DrawCommand commands[] = {
+            {.type = DRAW_FILL_RECT, .x = 2, .y = 3, .width = 10, .height = 8},
+            {.type = DRAW_TEXT, .x = 2, .y = 3, .width = 10, .height = 8}
+        };
+        DrawCommand previous[2];
+        memcpy(previous, commands, sizeof(commands));
+        LayoutDocument span = {.commands = commands, .count = 2};
+        CHECK(!layout_skew_solid_command_span(&span, 0, 2, 14, 1024)
+              && memcmp(commands, previous, sizeof(commands)) == 0);
+        commands[1].type = DRAW_FILL_RECT;
+        commands[1].radius = 3;
+        memcpy(previous, commands, sizeof(commands));
+        CHECK(!layout_skew_solid_command_span(&span, 0, 2, 14, 1024)
+              && memcmp(commands, previous, sizeof(commands)) == 0);
+    }
+
     /* CSS 2.1 10.4: a float's percentage min/max-width refer to its
        containing block, not to the float's own shrink-to-fit width.
        weather.gov's header logos are floats with max-width 7% / 17.7%
@@ -1970,6 +2093,53 @@
     CHECK(budget.current == 0);
 
     puts("test: text-decoration cascade, propagation, clipping, and transform");
+    /* A collapsed absolute menu can retain a tall subtree. Its local
+       scroller must not add empty screens after the document footer. */
+    static const char clipped_menu_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "main{height:400px}footer{height:40px;position:relative}"
+        "#menu{position:absolute;top:0;height:1px;overflow:hidden auto}"
+        "#menu>div{height:2100px;background:red}"
+        "</style><body><main>Article</main><footer>Footer"
+        "<div id=menu><div>Menu contents</div></div></footer></body>";
+    PocDocument clipped_menu_document;
+    Stylesheet clipped_menu_sheet;
+    LayoutDocument clipped_menu_layout;
+    CHECK(document_parse(&clipped_menu_document, &budget, clipped_menu_page,
+            strlen(clipped_menu_page), 113)
+        && stylesheet_build(&clipped_menu_sheet, &budget, &clipped_menu_document, 480)
+        && layout_build(&clipped_menu_layout, &budget, &clipped_menu_document,
+            &clipped_menu_sheet, NULL, NULL, 480));
+    CHECK(clipped_menu_layout.height == 440);
+    const LayoutNodeBox *clipped_menu_box = layout_box_for_node(
+        &clipped_menu_layout, find_id(document_body_node(&clipped_menu_document), "menu"));
+    CHECK(clipped_menu_box != NULL && clipped_menu_box->clips_y
+        && clipped_menu_box->content_height >= 2100);
+    layout_destroy(&clipped_menu_layout);
+    stylesheet_destroy(&clipped_menu_sheet);
+    document_destroy(&clipped_menu_document);
+    CHECK(budget.current == 0);
+
+    /* Absolute content whose containing block lies above a clip can escape
+       it. Do not remove genuine document overflow with the hidden menu. */
+    static const char escaped_menu_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "main{height:400px}footer{height:40px;position:relative}"
+        "#clip{height:1px;overflow:hidden}"
+        "#escape{position:absolute;top:1000px;height:40px;background:red}"
+        "</style><body><main>Article</main><footer>Footer"
+        "<div id=clip><div id=escape>Escaped content</div></div></footer></body>";
+    CHECK(document_parse(&clipped_menu_document, &budget, escaped_menu_page,
+            strlen(escaped_menu_page), 113)
+        && stylesheet_build(&clipped_menu_sheet, &budget, &clipped_menu_document, 480)
+        && layout_build(&clipped_menu_layout, &budget, &clipped_menu_document,
+            &clipped_menu_sheet, NULL, NULL, 480));
+    CHECK(clipped_menu_layout.height == 1440);
+    layout_destroy(&clipped_menu_layout);
+    stylesheet_destroy(&clipped_menu_sheet);
+    document_destroy(&clipped_menu_document);
+    CHECK(budget.current == 0);
+
     static const char decoration_page[] =
         "<!doctype html><style>body{margin:0;padding:0}"
         "#removed{text-decoration:none}"

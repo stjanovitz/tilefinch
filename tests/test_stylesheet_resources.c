@@ -522,6 +522,109 @@ static void remove_stylesheet_replay(const char *directory, size_t count)
     (void) rmdir(directory);
 }
 
+static bool test_motion_source_origin_case(bool cross_origin)
+{
+    static const char document_url[] = "https://document.example/page";
+    const char *sheet_url = cross_origin
+        ? "https://assets.example/motion.css"
+        : "https://document.example/motion.css";
+    const char *import_url = cross_origin
+        ? "https://assets.example/imported.css"
+        : "https://document.example/imported.css";
+    const char *html = cross_origin
+        ? "<!doctype html><link rel=stylesheet href=https://assets.example/motion.css>"
+        : "<!doctype html><link rel=stylesheet href=https://document.example/motion.css>";
+    const StylesheetReplayRecord replay[] = {
+        {
+            .url = sheet_url,
+            .body = "@import 'imported.css';"
+                    "@keyframes hidden-motion{from{opacity:0}to{opacity:1}}"
+                    "#protected-selector{animation:hidden-motion .2s;color:#123456}",
+            .effective_url = sheet_url,
+            .request_sec_fetch_site = cross_origin ? "cross-site" : "same-origin",
+            .request_credential_origin = document_url,
+            .request_initiator_url = document_url,
+            .request_referrer_source = document_url,
+            .request_referrer_policy = "no-referrer",
+            .response_referrer_policy = "no-referrer",
+            .status = 200
+        },
+        {
+            .url = import_url,
+            .body = "@keyframes imported-motion{from{opacity:0}to{opacity:1}}"
+                    "#imported-selector{animation:imported-motion .2s}",
+            .effective_url = import_url,
+            .request_sec_fetch_site = cross_origin ? "cross-site" : "same-origin",
+            .request_credential_origin = document_url,
+            .request_initiator_url = document_url,
+            .request_referrer_source = sheet_url,
+            .request_referrer_policy = "no-referrer",
+            .status = 200
+        }
+    };
+    char directory[128] = {0};
+    bool written = write_stylesheet_replay(directory, replay, 2);
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    bool replaying = false;
+    bool ok = written && installed
+        && document_parse(&document, &budget, html, strlen(html), 17)
+        && stylesheet_build(&sheet, &budget, &document, 480);
+    if (ok) {
+        char error[256] = {0};
+        replaying = fetch_trace_replay_begin(directory, error, sizeof(error));
+        ok = replaying && stylesheets_load_external_tracked_with_context(
+            &document, &sheet, &budget, document_url, document_url,
+            "no-referrer", 4, 4096, 4096, 1000, NULL, NULL,
+            &resources, &stats);
+    }
+    ok = ok && stats.loaded == 2 && stats.imports_loaded == 1
+        && sheet.has_motion_keyframes
+        && ((sheet.motion_css_keyframes == 0) == cross_origin)
+        && ((sheet.motion_css == NULL) == cross_origin);
+    if (!ok) fprintf(stderr,
+        "motion origin cross=%d loaded=%zu failed=%zu keyframes=%d source=%s\n",
+        cross_origin, stats.loaded, stats.failed,
+        sheet.has_motion_keyframes, sheet.motion_css == NULL ? "null" : "present");
+    if (cross_origin && ok) {
+        static const char inline_css[] =
+            "#inline-motion{animation:safe-motion .2s}";
+        ok = stylesheet_add_css(&sheet, inline_css, sizeof(inline_css) - 1u)
+            && sheet.motion_css != NULL
+            && strstr(sheet.motion_css, "#inline-motion") != NULL
+            && strstr(sheet.motion_css, "protected-selector") == NULL
+            && strstr(sheet.motion_css, "imported-selector") == NULL;
+    }
+    if (replaying) fetch_trace_end();
+    stylesheet_destroy(&sheet);
+    memset(&stats, 0, sizeof(stats));
+    if (ok) {
+        ok = stylesheet_build(&sheet, &budget, &document, 480)
+            && stylesheets_load_external_tracked_with_context(
+                &document, &sheet, &budget, document_url, document_url,
+                "no-referrer", 4, 4096, 4096, 1000, NULL, NULL,
+                &resources, &stats)
+            && stats.retained_body_hits == 2
+            && stats.imports_loaded == 1
+            && ((sheet.motion_css_keyframes == 0) == cross_origin)
+            && ((sheet.motion_css == NULL) == cross_origin);
+        if (ok && !cross_origin)
+            ok = strstr(sheet.motion_css, "imported-selector") != NULL;
+    }
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (written) remove_stylesheet_replay(directory, 2);
+    return ok && clean;
+}
+
 static bool test_integrity_rechecks_cross_origin_redirect(void)
 {
     static const char document_url[] = "https://document.example/page";
@@ -1578,10 +1681,9 @@ static bool test_css_data_svg_mask_uses_bounded_image_pipeline(void)
     return ok && clean;
 }
 
-/* "name.jpg.webp" names its original, so the cheaper sibling is fetched
-   ("name.jpg", never "name.jpg.jpg"); a bare "name.webp" names no sibling
-   and is fetched as written. */
-static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
+/* A filename/query suffix is not authority to request a different resource.
+   Only the exact authored URLs exist in this trace; guessed siblings fail. */
+static bool test_webp_url_preserves_authored_resource(void)
 {
     static const char html[] =
         "<!doctype html><body><img id=hero "
@@ -1590,8 +1692,8 @@ static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
         "<img id=plain src='plain.webp'>";
     static const char document_url[] = "https://image.example/page";
     static const char jpeg_url[] =
-        "https://image.example/image?id=hero.jpg&quality=80";
-    static const char card_url[] = "https://image.example/news/480/card.jpg";
+        "https://image.example/image?id=hero.jpg.webp&quality=80";
+    static const char card_url[] = "https://image.example/news/480/card.jpg.webp";
     static const char plain_url[] = "https://image.example/plain.webp";
     static const char svg[] =
         "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='1'>"
@@ -1677,13 +1779,13 @@ static bool test_webp_url_uses_same_origin_jpeg_sibling(void)
             4, 4096, 2048, 4096, 1000, NULL, NULL)
             && fetch_trace_replay_stats(&replay_stats);
     }
-    ok = ok && images.stats.compatible_format_rewrites == 2
+    ok = ok && images.stats.compatible_format_rewrites == 0
         && images.stats.loaded == 3 && images.stats.unsupported == 0
         && replay_stats.matched_request_count == 3
         && replay_stats.unmatched_request_count == 0;
     if (!ok) {
         fprintf(stderr,
-                "webp sibling replay='%s' rewrites=%zu loaded=%zu "
+                "authored image replay='%s' rewrites=%zu loaded=%zu "
                 "unsupported=%zu requests=%zu/%zu\n",
                 replay_error, images.stats.compatible_format_rewrites,
                 images.stats.loaded, images.stats.unsupported,
@@ -2176,7 +2278,7 @@ static bool test_cors_stylesheet_reuses_document_preload(void)
     bool ok = installed && body != NULL
         && stylesheet_document_resources_retain(
                &resources, url, url, "", body, sizeof(css) - 1u, true,
-               TILEFINCH_CREDENTIALS_SAME_ORIGIN)
+               TILEFINCH_CREDENTIALS_SAME_ORIGIN, NULL)
         && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
         && stylesheet_build(&stylesheet, &budget, &document, 480)
         && stylesheets_load_external_tracked_with_context(
@@ -2496,11 +2598,11 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
     bool ok = installed && large_body != NULL && late_body != NULL
         && stylesheet_document_resources_retain(
                &resources, large_url, large_url, "", large_body,
-               LARGE_BYTES, false, TILEFINCH_CREDENTIALS_INCLUDE)
+               LARGE_BYTES, false, TILEFINCH_CREDENTIALS_INCLUDE, NULL)
         && stylesheet_document_resources_retain(
                &resources, late_url, late_url, "", late_body,
                sizeof(late_css) - 1u, false,
-               TILEFINCH_CREDENTIALS_INCLUDE)
+               TILEFINCH_CREDENTIALS_INCLUDE, NULL)
         && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
         && stylesheet_build(&stylesheet, &budget, &document, 480);
     browser_shared_body_release(large_body);
@@ -2814,7 +2916,7 @@ static bool test_uncacheable_retained_css_skips_ir_capture(void)
         bool ready = installed && body != NULL
             && browser_session_init(&session, &budget, MIB)
             && stylesheet_document_resources_retain(&resources, url, url, "", body,
-                strlen(css), false, TILEFINCH_CREDENTIALS_INCLUDE)
+                strlen(css), false, TILEFINCH_CREDENTIALS_INCLUDE, NULL)
             && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
             && stylesheet_build(&sheet, &budget, &document, 480);
         size_t before = budget.current;
@@ -2868,6 +2970,48 @@ static bool test_complete_selector_census_reopens_retained_sources_once(void)
         && !resources.final_resample_required
         && !resources.items[0].rules_applied
         && resources.items[1].rules_applied;
+}
+
+static bool test_dynamic_selector_census_is_bounded_and_retained(void)
+{
+    static const char html[] =
+        "<!doctype html><body><div id=late class='late-score-name'>x</div>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    StylesheetDocumentResources resources = {0};
+    bool okay = installed && document_parse(&document, &budget, html,
+                                            sizeof(html) - 1u, 17);
+    lxb_dom_node_t *root = okay ? find_element_id(
+        lxb_dom_interface_node(document.html), "late") : NULL;
+    size_t owned = budget.current;
+    okay = okay && root != NULL
+        && !stylesheet_document_resources_note_dynamic_tokens(&resources, root);
+    resources.sampled_large_source = true;
+    okay = okay && stylesheet_document_resources_note_dynamic_tokens(
+        &resources, root)
+        && resources.dynamic_selector_resamples == 1u
+        && !stylesheet_document_resources_note_dynamic_tokens(&resources, root)
+        && budget.current == owned;
+    for (unsigned i = 1; okay && i < 8u; i++) {
+        memset(resources.sampled_selector_tokens, 0,
+               sizeof(resources.sampled_selector_tokens));
+        okay = stylesheet_document_resources_note_dynamic_tokens(&resources, root)
+            && resources.dynamic_selector_resamples == i + 1u;
+    }
+    memset(resources.sampled_selector_tokens, 0,
+           sizeof(resources.sampled_selector_tokens));
+    okay = okay && !stylesheet_document_resources_note_dynamic_tokens(
+        &resources, root) && budget.current == owned;
+    StylesheetDocumentResources copy = {0};
+    okay = okay && stylesheet_document_resources_copy_for_rebuild(&copy, &resources)
+        && copy.sampled_large_source && copy.dynamic_selector_resamples == 8u;
+    stylesheet_document_resources_destroy(&copy);
+    document_destroy(&document);
+    okay = okay && budget.current == 0u;
+    if (installed) okay = budget_uninstall_lexbor(&budget) && okay;
+    return okay;
 }
 
 /* A capture records a response that stopped at its byte cap as a failed
@@ -3017,14 +3161,33 @@ static bool test_large_sheet_admitted_by_memory(void)
     static const char html[] =
         "<!doctype html><link rel=stylesheet href=big.css>"
         "<body><div id=z>z</div></body>";
+    /* Hydration can exceed the old 8192-node census even when it is well
+       below the document ceiling. Keep late admission from saturating and
+       falling back to unrelated source-order rules. */
+    char hydrated_html[33000];
+    _Static_assert(4100u * 8u + sizeof(html) < 33000u,
+                   "hydrated fixture fits its bounded buffer");
+    size_t hydrated_length = (size_t) snprintf(
+        hydrated_html, sizeof(hydrated_html), "%s", html);
+    for (size_t i = 0; i < 4100u; i++) {
+        memcpy(hydrated_html + hydrated_length, "<p>x</p>", 8);
+        hydrated_length += 8u;
+    }
+    hydrated_html[hydrated_length] = '\0';
     static const char last_rule[] = "#z{color:#0a0b0c}";
     const size_t floor_bytes = 512u * 1024u;
     const size_t filler_rules = 600u * 1024u / 24u;
-    size_t body_capacity = filler_rules * 24u + sizeof(last_rule);
+    static const char late_rule[] = ".score-name-long{display:none}";
+    size_t body_capacity = filler_rules * 24u + sizeof(last_rule)
+        + sizeof(late_rule);
     char *body = malloc(body_capacity);
     if (body == NULL) return false;
     size_t length = 0;
     for (size_t i = 0; i < filler_rules; i++) {
+        if (i == filler_rules / 2u) {
+            memcpy(body + length, late_rule, sizeof(late_rule) - 1u);
+            length += sizeof(late_rule) - 1u;
+        }
         length += (size_t) snprintf(body + length, body_capacity - length,
                                     ".f%06zu{color:#123456}", i);
     }
@@ -3068,9 +3231,11 @@ static bool test_large_sheet_admitted_by_memory(void)
         StylesheetDocumentResources resources = {0};
         ExternalStylesheetStats stats = {0};
         bool replaying = false;
+        const char *markup = cases[index].admitted ? hydrated_html : html;
+        size_t markup_length = cases[index].admitted
+            ? hydrated_length : sizeof(html) - 1u;
         bool ok = replay_written && session_ready
-            && document_parse(&document, &budget, html, sizeof(html) - 1u,
-                              17)
+            && document_parse(&document, &budget, markup, markup_length, 17)
             && stylesheet_build(&stylesheet, &budget, &document, 480);
         if (ok) {
             char error[256] = {0};
@@ -3088,6 +3253,29 @@ static bool test_large_sheet_admitted_by_memory(void)
         ok = ok && target != NULL && styled == cases[index].admitted
             && stats.loaded == (cases[index].admitted ? 1u : 0u)
             && stats.truncated == 0;
+        if (ok && cases[index].admitted) {
+            Stylesheet next = {0};
+            StylesheetDocumentResources retained = {0};
+            ExternalStylesheetStats next_stats = {0};
+            ok = lxb_dom_element_set_attribute(lxb_dom_interface_element(target),
+                    (const lxb_char_t *) "class", 5,
+                    (const lxb_char_t *) "score-name-long", 15) != NULL
+                && style_for_node(&stylesheet, target, NULL).display
+                    != DISPLAY_NONE
+                && stylesheet_document_resources_note_dynamic_tokens(
+                    &resources, target)
+                && stylesheet_document_resources_copy_for_rebuild(
+                    &retained, &resources)
+                && stylesheet_build(&next, &budget, &document, 480)
+                && stylesheets_load_external_tracked_with_context(
+                    &document, &next, &budget, document_url, document_url,
+                    "unsafe-url", 4, 4u * MIB, floor_bytes, 5000, NULL,
+                    &session, &retained, &next_stats)
+                && style_for_node(&next, target, NULL).display == DISPLAY_NONE
+                && retained.dynamic_selector_resamples == 1u;
+            stylesheet_document_resources_destroy(&retained);
+            stylesheet_destroy(&next);
+        }
         if (replaying) fetch_trace_end();
         stylesheet_document_resources_destroy(&resources);
         stylesheet_destroy(&stylesheet);
@@ -3164,11 +3352,11 @@ static bool test_response_ledger_copy_is_transactional(void)
         && stylesheet_document_resources_retain(
             &original, "https://ledger.test/style.css",
             "https://ledger.test/cdn/style.css", "no-referrer", body,
-            sizeof(css) - 1u, true, TILEFINCH_CREDENTIALS_OMIT)
+            sizeof(css) - 1u, true, TILEFINCH_CREDENTIALS_OMIT, NULL)
         && stylesheet_document_resources_retain(
             &original, "https://ledger.test/second.css",
             "https://ledger.test/second.css", "strict-origin", body,
-            sizeof(css) - 1u, false, TILEFINCH_CREDENTIALS_INCLUDE);
+            sizeof(css) - 1u, false, TILEFINCH_CREDENTIALS_INCLUDE, NULL);
     browser_shared_body_release(body);
     if (okay) {
         original.items[0].rules_applied = true;
@@ -3227,6 +3415,11 @@ int main(void)
     RUN_TEST(test_integrity_mismatch_rejects_stylesheet);
     RUN_TEST(test_integrity_is_scoped_to_each_link_element);
     RUN_TEST(test_integrity_rechecks_cross_origin_redirect);
+    if (!test_motion_source_origin_case(true)
+        || !test_motion_source_origin_case(false)) {
+        fprintf(stderr, "stylesheet resource test failed: motion source origin\n");
+        return 1;
+    }
     RUN_TEST(test_matching_duplicate_promotes_queued_response);
     RUN_TEST(test_inactive_declared_themes_do_not_consume_quota);
     RUN_TEST(test_initial_link_uses_document_context_and_attribute_policy);
@@ -3239,7 +3432,7 @@ int main(void)
     RUN_TEST(test_unknown_cache_provenance_is_bypassed);
     RUN_TEST(test_css_images_keep_declaring_source_context);
     RUN_TEST(test_css_data_svg_mask_uses_bounded_image_pipeline);
-    RUN_TEST(test_webp_url_uses_same_origin_jpeg_sibling);
+    RUN_TEST(test_webp_url_preserves_authored_resource);
     RUN_TEST(test_icon_images_do_not_spend_image_count);
     RUN_TEST(test_css_paint_layers_keep_distinct_resources);
     RUN_TEST(test_invalid_href_has_terminal_state);
@@ -3255,6 +3448,7 @@ int main(void)
     RUN_TEST(test_ir_capture_bounds_transient_storage);
     RUN_TEST(test_uncacheable_retained_css_skips_ir_capture);
     RUN_TEST(test_complete_selector_census_reopens_retained_sources_once);
+    RUN_TEST(test_dynamic_selector_census_is_bounded_and_retained);
     RUN_TEST(test_complete_rules_prefix_scanner);
     RUN_TEST(test_truncated_sheet_applies_only_complete_rules);
     RUN_TEST(test_large_sheet_admitted_by_memory);

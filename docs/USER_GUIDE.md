@@ -89,6 +89,9 @@ limits.
 ## Native video player
 
 YouTube results and compatible page videos open in the same native player.
+Some posterless video cards show the linked article's preview image instead
+of a blank box. This does not mean the video format is supported; unsupported
+videos still show the player's normal explanation when opened.
 X pauses or resumes, L/R or the nub previews a seek, and X confirms the new
 position. Circle cancels a preview or closes playback. Triangle opens audio
 and subtitle tracks when available.

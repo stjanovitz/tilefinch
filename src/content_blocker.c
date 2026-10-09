@@ -78,11 +78,27 @@ static const char *const basic_hosts[] = {
     "yieldmo.com", "zedo.com"
 };
 
+/* Match a class-token prefix at the beginning of the attribute or after any
+   HTML space character. Keep the '-' boundary: a blanket ad-* / substring
+   rule also hides unrelated controls and content. These are ordinary CSS
+   selectors, evaluated by the existing style pass, not a second DOM walk. */
+#define COSMETIC_CLASS_PREFIX(prefix) \
+    ":is([class^=\"" prefix "\"],[class*=\" " prefix "\"]," \
+    "[class*=\"\\9 " prefix "\"],[class*=\"\\a " prefix "\"]," \
+    "[class*=\"\\c " prefix "\"],[class*=\"\\d " prefix "\"]),"
+
 static const char cosmetic_css[] =
+    COSMETIC_CLASS_PREFIX("ad-slot-")
+    COSMETIC_CLASS_PREFIX("ad-banner-")
     "ins.adsbygoogle,.advertisement,.advertising,.ad-banner,.ad-container,"
-    ".ad-slot,.sponsored,.promoted,.promotedlink,[data-ad],[data-ad-slot],"
+    ".ad-slot,.ad-wrapper,.sponsored,.promoted,.promotedlink,[data-ad],[data-ad-slot],"
     "[data-ad-client],[aria-label=\"advertisement\"],"
     "[aria-label=\"sponsored\"]{display:none!important}";
+
+#undef COSMETIC_CLASS_PREFIX
+
+_Static_assert(sizeof(cosmetic_css) <= CONTENT_BLOCKER_COSMETIC_CSS_LIMIT,
+               "built-in cosmetic stylesheet must fit the frontend buffer");
 
 /* Deliberately limited to established consent-manager roots and explicit
    cookie-notice names. Generic modal/dialog selectors would hide sign-in,

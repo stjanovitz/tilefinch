@@ -28,7 +28,7 @@ void stylesheet_drop_selector_program(Stylesheet *sheet)
 
 #define STYLE_SELECTOR_PROGRAM_BUDGET (320u * 1024u)
 #define STYLE_COMPILED_FRAGMENT_MAGIC UINT32_C(0x54465346)
-#define STYLE_COMPILED_FRAGMENT_VERSION UINT16_C(2)
+#define STYLE_COMPILED_FRAGMENT_VERSION UINT16_C(3)
 #define STYLE_COMPILED_FRAGMENT_MAX_BYTES (256u * 1024u)
 
 typedef struct {
@@ -281,6 +281,42 @@ static size_t style_selector_compile_attribute(StyleSelectorBuilder *builder,
     return close + 1;
 }
 
+/* This standard :is() spelling is precisely a class-token prefix test:
+   beginning of class or preceded by one of the five HTML space characters.
+   Fold the complete union only; partial unions, flags and other spellings
+   keep the established string matcher. Nothing is decoded per node. */
+static bool style_selector_compile_class_token_prefix(
+    StyleSelectorBuilder *builder, const char *text, size_t length)
+{
+    static const char head[] = ":is([class^=\"";
+    static const char *const tails[] = {
+        "\"],[class*=\" ", "\"],[class*=\"\\9 ", "\"],[class*=\"\\a ",
+        "\"],[class*=\"\\c ", "\"],[class*=\"\\d "
+    };
+    size_t at = sizeof(head) - 1u;
+    if (length <= at || memcmp(text, head, at) != 0) return false;
+    size_t begin = at;
+    while (at < length && ((text[at] >= 'a' && text[at] <= 'z')
+           || (text[at] >= 'A' && text[at] <= 'Z')
+           || (text[at] >= '0' && text[at] <= '9')
+           || text[at] == '-' || text[at] == '_')) at++;
+    size_t prefix_length = at - begin;
+    if (prefix_length == 0 || prefix_length > 128u) return false;
+    for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
+        size_t tail_length = strlen(tails[i]);
+        if (tail_length > length - at
+            || memcmp(text + at, tails[i], tail_length) != 0) return false;
+        at += tail_length;
+        if (prefix_length > length - at
+            || memcmp(text + at, text + begin, prefix_length) != 0) return false;
+        at += prefix_length;
+    }
+    if (length - at != 3u || memcmp(text + at, "\"])", 3u) != 0)
+        return false;
+    return style_selector_builder_emit(builder, STYLE_SELECTOR_CLASS_TOKEN_PREFIX,
+                                       text + begin, prefix_length);
+}
+
 /* Compile one argument-less pseudo-class starting at text[0] == ':'.
    Returns the bytes consumed, or 0 for pseudo-elements and functional
    pseudo-classes, which stay with the string matcher. Unknown and
@@ -381,6 +417,8 @@ static bool style_selector_compile_compound(StyleSelectorBuilder *builder,
 {
     trim(&text, &length);
     if (builder == NULL || length == 0) return false;
+    if (style_selector_compile_class_token_prefix(builder, text, length))
+        return true;
     size_t checkpoint = builder->count;
     if (style_selector_compile_simple_compound(builder, text, length)) {
         return true;

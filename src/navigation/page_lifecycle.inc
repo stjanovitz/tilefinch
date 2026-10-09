@@ -917,6 +917,19 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
             }
         }
         if (style) style_depth++;
+        if (style) {
+            size_t length = 0;
+            const char *override = document_cssom_sheet_text(node, &length);
+            if (override != NULL) {
+                static const char marker[] = "\xff" "cssom\0";
+                *hash = fingerprint_bytes(*hash, marker, sizeof(marker));
+                *hash = fingerprint_bytes(*hash, override, length);
+                if (parts != NULL) {
+                    parts[0] = fingerprint_bytes(parts[0], marker, sizeof(marker));
+                    parts[0] = fingerprint_bytes(parts[0], override, length);
+                }
+            }
+        }
         if (node->type == LXB_DOM_NODE_TYPE_TEXT && style_depth != 0) {
             size_t length = 0;
             const char *text = document_text_data(node, &length);
@@ -1371,6 +1384,7 @@ static void page_destroy_value(NavigationSession *session,
         &page->external_font_loader, page->resource_scheduler,
         &page->external_fonts);
     images_priority_load_destroy(page->deferred_image_job);
+    navigation_destroy_linked_video_preview(session, page);
     page->deferred_image_job = NULL;
     page->deferred_image_batch_count = 0;
     budget_free(session->budget, page->deferred_image_targets);
@@ -2748,9 +2762,14 @@ static uint64_t navigation_enqueue_frame_fetch(
             &transport, &prepared, NULL)) return 0;
     const FetchRequest *request = fetch_prepared_page_request(&prepared);
     if (request == NULL) return 0;
+    /* Inline app documents share the page's bounded per-script allowance.
+       Responses remain charged to the shared Budget and capped at 8 MiB. */
+    size_t frame_bytes = session->maximum_script_file_bytes;
+    if (frame_bytes < 512u * 1024u) frame_bytes = 512u * 1024u;
+    if (frame_bytes > 8u * 1024u * 1024u) frame_bytes = 8u * 1024u * 1024u;
     return fetch_scheduler_enqueue(
         session->page.resource_scheduler, frame->url, request,
-        512 * 1024, 15000);
+        frame_bytes, 15000);
 }
 
 /* A child frame's scripts share the page's per-script source ceiling:
@@ -3521,7 +3540,9 @@ static bool navigation_complete_frame(NavigationSession *session,
             ok = document_scripts_execute(
                 &frame->document, frame->runtime, session->budget,
                 session->browser_session, frame_base_url, frame->url,
-                frame->referrer_policy, 16, 1024 * 1024,
+                frame->referrer_policy, 16,
+                session->maximum_script_bytes > 1024u * 1024u
+                    ? session->maximum_script_bytes : 1024u * 1024u,
                 navigation_frame_script_file_bytes(session), 15000,
                 session->page.resource_scheduler,
                 &metrics, &frame->script_result)

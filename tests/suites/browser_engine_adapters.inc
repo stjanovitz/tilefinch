@@ -2063,7 +2063,8 @@ static int test_reader_switch_reuses_page_stylesheet_responses(void)
         &navigation->page.stylesheet_resources,
         "https://presentation.test/style.css",
         "https://presentation.test/cdn/style.css", "no-referrer", body,
-        sizeof(external_css) - 1u, false, TILEFINCH_CREDENTIALS_INCLUDE));
+        sizeof(external_css) - 1u, false, TILEFINCH_CREDENTIALS_INCLUDE,
+        NULL));
     browser_shared_body_release(body);
     navigation->page.stylesheet_resources.items[0].rules_applied = true;
     navigation_enable_external_resources(navigation, 4u, 4096u, 4096u,
@@ -2206,6 +2207,48 @@ static int test_reader_presentation_adapter(void)
           && extracted_text != NULL && extracted_text->font_size > 0
           && extracted_text->height > 0 && extracted_text->opacity_scale != 0u
           && browser_engine_render_frame(engine, NULL));
+    static const char hostile_presentation[] =
+        "<!doctype html><title>Projection isolation</title><style>"
+        "main,article{display:flex;min-height:700px}"
+        "p{display:inline;line-height:0;min-height:300px;padding:80px}"
+        "a{font-size:40px;letter-spacing:8px;white-space:nowrap}"
+        "a::after{content:'AUTHOR DECORATION'}"
+        "</style><body data-tilefinch-reader-kind=basic>"
+        "<main data-tilefinch-reader-root=basic>"
+        "<details id=fold><summary>Browse</summary><nav>"
+        "<a href='/navigation'>HIDDEN_NAVIGATION</a></nav></details><article>"
+        "<p>FIRST_PARAGRAPH <a href='/one'>FIRST_LINK</a></p>"
+        "<p>SECOND_PARAGRAPH <a href='/two'>SECOND_LINK</a></p>"
+        "<a href='/story'><h2>STORY_TITLE</h2><span>STORY_CAPTION</span></a>"
+        "</article></main></body>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://projection.example.test/", hostile_presentation,
+              sizeof(hostile_presentation) - 1u, true)
+          && browser_engine_apply_user_css(engine, css, strlen(css)));
+    const LayoutDocument *isolated = &browser_engine_navigation(engine)->page.layout;
+    const DrawCommand *first_paragraph = test_reader_text_command(isolated, "FIRST_PARAGRAPH");
+    const DrawCommand *second_paragraph = test_reader_text_command(isolated, "SECOND_PARAGRAPH");
+    const DrawCommand *first_link = test_reader_text_command(isolated, "FIRST_LINK");
+    const DrawCommand *story_title = test_reader_text_command(isolated, "STORY_TITLE");
+    const DrawCommand *story_caption = test_reader_text_command(isolated, "STORY_CAPTION");
+    CHECK(first_paragraph != NULL && second_paragraph != NULL && first_link != NULL
+          && first_link->font_size < 24 && first_link->height > 0
+          && second_paragraph->y >= first_paragraph->y + first_paragraph->height
+          && second_paragraph->y < 200
+          && test_reader_text_command(isolated, "AUTHOR DECORATION") == NULL
+          && test_reader_text_command(isolated, "HIDDEN_NAVIGATION") == NULL
+          && story_title != NULL && story_caption != NULL
+          && story_caption->y >= story_title->y + story_title->height
+          && browser_engine_render_frame(engine, NULL));
+    NavigationSession *projection_navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *fold = test_reader_find_id(
+        lxb_dom_interface_node(projection_navigation->page.document.html), "fold");
+    CHECK(fold != NULL
+          && lxb_dom_element_set_attribute(lxb_dom_interface_element(fold),
+                 (const lxb_char_t *) "open", 4u, (const lxb_char_t *) "", 0u) != NULL
+          && browser_engine_apply_user_css(engine, css, strlen(css))
+          && test_reader_text_command(&projection_navigation->page.layout,
+                 "HIDDEN_NAVIGATION") != NULL);
     static const char html[] =
         "<!doctype html><title>Reader</title>"
         "<header><nav><a href='/menu'>Menu</a></nav></header>"
@@ -3632,7 +3675,7 @@ static int test_basic_view_admission_and_presentation(void)
             authored_fragment = true;
         }
     }
-    CHECK(navigation->page.layout.link_count >= 2u
+    CHECK(navigation->page.layout.link_count >= 1u
           && navigation->page.layout.link_count <= raw_links);
     CHECK(navigation->page.layout.control_count >= 2u
           && navigation->page.layout.control_count < raw_controls);
@@ -3645,6 +3688,19 @@ static int test_basic_view_admission_and_presentation(void)
     size_t loads_before = navigation->loads_started;
     uint64_t generation_before = navigation->generation;
     ControllerAction basic_action = {0};
+    lxb_dom_node_t *fold_summary = NULL;
+    for (size_t i = 0; i < navigation->page.layout.control_count; i++) {
+        lxb_dom_node_t *candidate = navigation->page.layout.controls[i].node;
+        size_t name_length = 0;
+        const char *name = document_element_name(candidate, &name_length);
+        if (name != NULL && name_length == 7u && memcmp(name, "summary", 7u) == 0)
+            fold_summary = candidate;
+    }
+    CHECK(fold_summary != NULL && browser_engine_focus_node(engine, fold_summary)
+          && browser_engine_activate(engine, &basic_action)
+          && basic_action.type == CONTROLLER_ACTION_CONTROL
+          && navigation->page.layout.link_count >= 2u
+          && navigation->loads_started == loads_before);
     lxb_dom_node_t *details_jump = test_reader_find_id(
         lxb_dom_interface_node(navigation->page.document.html),
         "tilefinch-extracted-details-jump");
@@ -4862,7 +4918,7 @@ static int test_reader_deferred_images_alias_before_relayout(void)
     static const char html[] =
         "<!doctype html><title>Deferred Reader illustrations</title><body>"
         "<article><h1>Deferred Reader illustrations</h1>"
-        "<img id=hero loading=lazy src=/hero.svg alt='Hero illustration' "
+        "<img id=hero loading=lazy src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==' data-src=/hero.svg alt='Hero illustration' "
         "width=48 height=48>"
         "<img id=tail loading=lazy src=/tail.svg alt='Tail illustration' "
         "width=48 height=48>"

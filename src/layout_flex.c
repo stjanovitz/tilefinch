@@ -685,11 +685,12 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             size_t end = at;
             while (end < length && !isspace((unsigned char) text[end])) end++;
             if (end == at) break;
-            int word_fixed = measured_text_width_fixed(
+            int word_fixed = measured_flow_text_width_fixed(
                 face, metric_family, text + at, end - at,
                 computed_style_font_size_fixed(parent),
                 synthetic_bold, metric_bold, parent->font_scale,
-                parent->letter_spacing);
+                parent->letter_spacing, parent->text_transform,
+                !computed_style_kerning_none(parent));
             if (pair_intrinsics) {
                 int minimum_word = 0;
                 for (size_t segment_at = at; segment_at < end;) {
@@ -701,27 +702,35 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                         computed_style_hyphens_none(parent),
                         &discard);
                     if (segment_length == 0) break;
-                    int segment_width = discard ? 0 : measured_text_width(
+                    int segment_width = discard ? 0 : measured_flow_text_width(
                         face, metric_family, text + segment_at,
                         segment_length,
                         computed_style_font_size_fixed(parent),
                         synthetic_bold, metric_bold, parent->font_scale,
-                        parent->letter_spacing);
+                        parent->letter_spacing,
+                        parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                            && segment_at != at ? TEXT_TRANSFORM_NONE
+                            : parent->text_transform,
+                        !computed_style_kerning_none(parent));
                     if (break_for_minimum && !discard) {
                         segment_width = 0;
                         size_t segment_end = segment_at + segment_length;
                         for (size_t character_at = segment_at;
                              character_at < segment_end;) {
-                        size_t character_length = utf8_character_length(
-                            text + character_at,
-                            segment_end - character_at);
-                        if (character_length == 0) break;
-                        int character_width = measured_text_width(
-                            face, metric_family, text + character_at,
-                            character_length,
-                            computed_style_font_size_fixed(parent),
-                            synthetic_bold, metric_bold,
-                            parent->font_scale, 0);
+                            size_t character_length = utf8_character_length(
+                                text + character_at,
+                                segment_end - character_at);
+                            if (character_length == 0) break;
+                            int character_width = measured_flow_text_width(
+                                face, metric_family, text + character_at,
+                                character_length,
+                                computed_style_font_size_fixed(parent),
+                                synthetic_bold, metric_bold,
+                                parent->font_scale, 0,
+                                parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                                    && character_at != at ? TEXT_TRANSFORM_NONE
+                                    : parent->text_transform,
+                                !computed_style_kerning_none(parent));
                             if (character_width > segment_width) {
                                 segment_width = character_width;
                             }
@@ -1143,11 +1152,15 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
                     computed_style_hyphens_none(parent),
                     &discard);
                 if (segment_length == 0) break;
-                int segment_width = discard ? 0 : measured_text_width(
+                int segment_width = discard ? 0 : measured_flow_text_width(
                     face, metric_family, text + segment_at, segment_length,
                     computed_style_font_size_fixed(parent),
                     synthetic_bold, metric_bold, parent->font_scale,
-                    parent->letter_spacing);
+                    parent->letter_spacing,
+                    parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                        && segment_at != at ? TEXT_TRANSFORM_NONE
+                        : parent->text_transform,
+                    !computed_style_kerning_none(parent));
                 if (break_for_minimum && !discard) {
                     /* anywhere adds opportunities inside each ordinary
                        Unicode line-breaking segment. */
@@ -1159,12 +1172,16 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
                             text + character_at,
                             segment_end - character_at);
                         if (character_length == 0) break;
-                        int character_width = measured_text_width(
+                        int character_width = measured_flow_text_width(
                             face, metric_family, text + character_at,
                             character_length,
                             computed_style_font_size_fixed(parent),
                             synthetic_bold, metric_bold,
-                            parent->font_scale, 0);
+                            parent->font_scale, 0,
+                            parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
+                                && character_at != at ? TEXT_TRANSFORM_NONE
+                                : parent->text_transform,
+                            !computed_style_kerning_none(parent));
                         if (character_width > segment_width) {
                             segment_width = character_width;
                         }
@@ -1700,13 +1717,14 @@ AlignItems flex_item_alignment(const ComputedStyle *container,
 
 /* Expand an auto-sized row-flex item to its used cross size after the line's
    tallest item is known. The retained background/border geometry and the
-   item's own full-box interaction region grow in place; descendants keep
-   their normal block position. */
-static void stretch_flex_item_cross(LayoutDocument *layout,
+   item's own full-box interaction region grow in place. Ordinary block
+   descendants retain their positions; a nested row updates cross alignment. */
+static void stretch_flex_item_cross(LayoutContext *context,
                                     lxb_dom_node_t *node,
                                     const ComputedStyle *style,
                                     int target_height)
 {
+    LayoutDocument *layout = context->layout;
     LayoutNodeBox *box = layout_box_for_node_mutable(layout, node);
     if (box == NULL || target_height <= box->height) return;
     size_t box_index = (size_t) (box - layout->node_boxes);
@@ -1724,7 +1742,20 @@ static void stretch_flex_item_cross(LayoutDocument *layout,
         if (i >= box->scroll_command_start
             && i < box->scroll_command_end) continue;
         DrawCommand *command = &layout->commands[i];
-        if (command->type == DRAW_TEXT) continue;
+        if (command->type == DRAW_TEXT) {
+            /* A blockified single-line input paints its value/placeholder
+               centred in its provisional border box. Unlike normal block
+               descendants or a multiline textarea, that anonymous text
+               must follow the used cross size, including its shadows.
+               Recompute the two centres rather than rounding delta/2 so
+               odd sizes and initially undersized boxes keep exact offsets. */
+            if (layout_node_name_is(node, "input")) {
+                int offset = (target_height - command->height) / 2
+                    - (old_height - command->height) / 2;
+                command->y = layout_add_coordinate(command->y, offset);
+            }
+            continue;
+        }
         if (style->border.bottom > 0
             && command->y == old_bottom - style->border.bottom
             && command->height == style->border.bottom) {
@@ -1771,6 +1802,47 @@ static void stretch_flex_item_cross(LayoutDocument *layout,
     box->client_height += delta;
     if (box->content_height < box->client_height) {
         box->content_height = box->client_height;
+    }
+    /* A nested auto-height row was aligned at its natural height before
+       its parent stretched it. Its own center/end-aligned children must
+       follow the new used cross size, not remain pinned to the top. Apply
+       only the difference: replaying alignment would double the old offset.
+       Wrapping rows require line distribution and stay on their existing
+       path; this is the single-line cross-axis correction. */
+    if ((style->display == DISPLAY_FLEX
+         || style->display == DISPLAY_INLINE_FLEX)
+        && (style->flex_direction == FLEX_ROW
+            || style->flex_direction == FLEX_ROW_REVERSE)
+        && !style->flex_wrap) {
+        int edges = style->padding.top + style->padding.bottom
+                    + style->border.top + style->border.bottom;
+        int old_content = old_height - edges;
+        int new_content = target_height - edges;
+        FlatItemIterator iterator;
+        FlatItem item;
+        flat_iterator_init(&iterator, context, node, style);
+        while (flat_iterator_next(&iterator, &item)) {
+            if (item.style.out_of_flow || item.style.fixed_position) continue;
+            const LayoutNodeBox *child = layout_box_for_node(layout, item.node);
+            if (child == NULL) continue;
+            int outer = child->height + item.style.margin.top
+                        + item.style.margin.bottom;
+            int old_free = old_content > outer ? old_content - outer : 0;
+            int new_free = new_content > outer ? new_content - outer : 0;
+            AlignItems alignment = flex_item_alignment(style, &item.style);
+            int offset = 0;
+            if (item.style.margin_top_auto) {
+                offset = item.style.margin_bottom_auto
+                    ? new_free / 2 - old_free / 2 : new_free - old_free;
+            } else if (!item.style.margin_bottom_auto) {
+                if (alignment == ALIGN_CENTER)
+                    offset = new_free / 2 - old_free / 2;
+                else if (alignment == ALIGN_END)
+                    offset = new_free - old_free;
+            }
+            if (offset != 0)
+                translate_node_subtree(layout, item.node, 0, offset);
+        }
     }
 }
 
@@ -2858,7 +2930,7 @@ void align_flex_row_items(LayoutContext *context,
                     }
                 }
                 if (target_height > 0) {
-                    stretch_flex_item_cross(context->layout, item.node,
+                    stretch_flex_item_cross(context, item.node,
                                             &item.style, target_height);
                 }
                 if (content_offset > 0) {
@@ -2887,7 +2959,7 @@ void align_flex_row_items(LayoutContext *context,
                 int target_height = line_height - item.style.margin.top
                                     - item.style.margin.bottom;
                 if (target_height > 0) {
-                    stretch_flex_item_cross(context->layout, item.node,
+                    stretch_flex_item_cross(context, item.node,
                                             &item.style, target_height);
                 }
                 placed++;

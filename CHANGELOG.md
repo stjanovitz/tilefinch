@@ -8,6 +8,15 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.31 — 2026-10-08
+
+- More accurate page layouts, images, icons, and dynamically updated styling.
+- Clearer Basic and Reader views, with better article selection, tables,
+  navigation, and image handling.
+- Preview images for supported video cards that would otherwise appear blank.
+- Reduced memory use for page styling.
+- Improved ad blocking and additional reliability fixes.
+
 ## 0.1.30 — 2026-10-07
 
 Reissued with signed update sequence 31. The public version remains 0.1.30;

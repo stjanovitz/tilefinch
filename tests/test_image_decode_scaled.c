@@ -499,6 +499,40 @@ static Bytes jpeg_synthetic(int width, int height, int channels, int quality)
     return jpeg;
 }
 
+static int test_jpeg_incomplete_header(Budget *budget)
+{
+    Bytes jpeg = jpeg_synthetic(97, 65, 3, 85);
+    size_t scan = 2;
+    while (scan + 3 < jpeg.length && jpeg.data[scan + 1] != 0xda) {
+        CHECK(jpeg.data[scan] == 0xff);
+        size_t segment = ((size_t)jpeg.data[scan + 2] << 8)
+            | jpeg.data[scan + 3];
+        CHECK(segment >= 2 && segment <= jpeg.length - scan - 2);
+        scan += segment + 2;
+    }
+    CHECK(scan + 3 < jpeg.length && jpeg.data[scan + 1] == 0xda);
+    /* No entropy scan means no initialized component samples. Reject the
+       header instead of publishing arbitrary contents of decoder storage. */
+    size_t length = jpeg.length;
+    jpeg.length = scan;
+    DecodeRun run = decode_at(budget, &jpeg, 97, 65, 49, 33);
+    CHECK(run.status == IMAGE_DECODE_DETERMINISTIC_FAILURE && run.pixels == NULL);
+    CHECK(budget->current == 0);
+    for (size_t prefix = 2; prefix < scan; prefix++) {
+        jpeg.length = prefix;
+        run = decode_at(budget, &jpeg, 97, 65, 49, 33);
+        CHECK(run.status == IMAGE_DECODE_DETERMINISTIC_FAILURE && run.pixels == NULL);
+        CHECK(budget->current == 0);
+    }
+    jpeg.length = length;
+    run = decode_at(budget, &jpeg, 97, 65, 49, 33);
+    CHECK(run.status == IMAGE_DECODE_SUCCEEDED);
+    image_resource_free_decoded(budget, run.pixels);
+    CHECK(budget->current == 0);
+    free(jpeg.data);
+    return 0;
+}
+
 /* A JPEG is decoded at 1/2, 1/4 or 1/8 in the IDCT and finished by the
    row sampler: correct size, and a Budget peak of the target plus reduced
    planes instead of full-resolution ones (4:2:0 at 2400x1600: 5.6 MiB of
@@ -604,6 +638,7 @@ int main(int argc, char **argv)
         {"png-formats", test_png_formats},
         {"large-png", test_large_png_peak},
         {"jpeg", test_jpeg_scaled},
+        {"jpeg-incomplete-header", test_jpeg_incomplete_header},
         {"webp", test_webp_accounting},
         {"webp-alpha", test_webp_alpha_byte_history},
         {"webp-alpha-filters", test_webp_alpha_filters},

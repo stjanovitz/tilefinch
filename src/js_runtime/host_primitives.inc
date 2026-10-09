@@ -108,7 +108,23 @@ static JSValue js_stylesheet_has_motion_keyframes(
     DomBridge *bridge = JS_GetContextOpaque(context);
     return JS_NewBool(
         context, bridge != NULL && bridge->stylesheet != NULL
-                     && bridge->stylesheet->has_motion_keyframes);
+                     && bridge->stylesheet->motion_css_keyframes != 0);
+}
+
+static JSValue js_stylesheet_motion_source(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    const Stylesheet *sheet = bridge == NULL ? NULL : bridge->stylesheet;
+    /* An incomplete prefix cannot replace the DOM style fallback: later
+       inline rules may be absent even though the normal cascade has them. */
+    if (sheet == NULL || sheet->motion_css == NULL
+        || sheet->motion_css_bounded_out) return JS_UNDEFINED;
+    return JS_NewStringLen(context, sheet->motion_css, sheet->motion_css_length);
 }
 
 static double performance_clock_value(DomBridge *bridge, bool advance,
@@ -1724,6 +1740,32 @@ static JSValue js_utf8_encode(JSContext *context,
     return result;
 }
 
+static JSValue js_media_matches(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 4 || !JS_IsString(argv[0])) return JS_FALSE;
+    JSValue units_value = JS_GetPropertyStr(context, argv[0], "length");
+    uint32_t units = 0;
+    int32_t width, height;
+    double resolution;
+    bool valid = !JS_IsException(units_value)
+        && JS_ToUint32(context, &units, units_value) >= 0;
+    JS_FreeValue(context, units_value);
+    if (!valid) return JS_EXCEPTION;
+    if (units > 4096) return JS_FALSE;
+    if (JS_ToInt32(context, &width, argv[1]) < 0
+        || JS_ToInt32(context, &height, argv[2]) < 0
+        || JS_ToFloat64(context, &resolution, argv[3]) < 0) return JS_EXCEPTION;
+    size_t length = 0;
+    const char *query = JS_ToCStringLen(context, &length, argv[0]);
+    if (!query) return JS_EXCEPTION;
+    bool matches = stylesheet_media_matches_viewport(
+        width, height, resolution, query, length);
+    JS_FreeCString(context, query);
+    return JS_NewBool(context, matches);
+}
+
 /* prefers-color-scheme for matchMedia: the same answer the CSS media
    evaluator gives (Tilefinch night mode). */
 static JSValue js_prefers_dark_color_scheme(JSContext *context,
@@ -2812,11 +2854,13 @@ bool js_rt_install_function(JSContext *context, JSValue global,
             || strcmp(name, "__tilefinchMultiplayerClose") == 0);
     bool transient_bootstrap_bridge =
         strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0
+        || strcmp(name, "__tilefinchMotionSourceBridge") == 0
         || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0
         || strcmp(name, "__tilefinchEncodingName") == 0
         || strcmp(name, "__tilefinchDecodeSingleByte") == 0
         || strcmp(name, "__tilefinchCssStatementEnds") == 0
         || strcmp(name, "__tilefinchConstructedSheetText") == 0
+        || strcmp(name, "__tilefinchSheetRevision") == 0
         || strcmp(name, "__tilefinchSetAdoptedSheets") == 0
         || strcmp(name, "__tilefinchEncodeUtf8") == 0
         || strcmp(name, "__tilefinchOpfsCommand") == 0

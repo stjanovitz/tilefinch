@@ -1468,13 +1468,24 @@ static bool style_property_box_sizing(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
-        if (style_resolve_value(sheet, value, value_length, resolved,
-                          sizeof(resolved), 0)) {
-            style->box_sizing_border_box =
-                strstr(resolved, "border-box") != NULL;
+    char resolved[32];
+    if (style_resolve_value(sheet, value, value_length, resolved,
+                            sizeof(resolved), 0)) {
+        const char *keyword = resolved;
+        size_t length = strlen(keyword);
+        trim(&keyword, &length);
+        bool inherit = span_case_equal(keyword, length, "inherit");
+        bool border_box = span_case_equal(keyword, length, "border-box");
+        if (inherit || border_box
+            || span_case_equal(keyword, length, "content-box")
+            || span_case_equal(keyword, length, "initial")
+            || span_case_equal(keyword, length, "unset")) {
+            style->box_sizing_border_box = border_box;
             *mask |= S_BOX_SIZING;
+            *parse->inherit_mask &= ~S_BOX_SIZING;
+            if (inherit) *parse->inherit_mask |= S_BOX_SIZING;
         }
+    }
     
     return true;
 }

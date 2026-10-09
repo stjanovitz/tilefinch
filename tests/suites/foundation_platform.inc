@@ -1790,6 +1790,13 @@ static int test_foundation(void)
     CHECK(test_stylesheet_transient_retry_cap(&budget));
     CHECK(test_script_shared_cache_lifetimes(&budget));
     CHECK(test_image_virtual_cancel_bound(&budget));
+    CHECK(test_image_virtual_delayed_progress(&budget));
+    CHECK(test_zero_font_background_anchor_paints(&budget, 0));
+    CHECK(test_zero_font_background_anchor_paints(&budget, 1));
+    CHECK(test_zero_font_background_anchor_paints(&budget, 3));
+    CHECK(test_zero_font_background_anchor_paints(&budget, 2));
+    CHECK(test_generated_pseudo_opacity(&budget));
+    CHECK(test_generated_literal_storage_bounds(&budget));
     CHECK(test_image_style_scope(&budget) == 0);
     CHECK(test_image_request_no_progress_bound(&budget));
     CHECK(test_image_request_policy_and_cookies(&budget));
@@ -2530,6 +2537,33 @@ static int test_foundation(void)
     PocDocument legacy_viewport_document;
     PocDocument mobile_doctype_document;
     MobileViewport viewport;
+    static const struct { const char *content; int width; } scale_cases[] = {
+        { "initial-scale=1.0,maximum-scale=1.0,user-scalable=no", 480 },
+        { "initial-scale=.5", 960 },
+        { "INITIAL-SCALE=2", 240 },
+        { "initial-scale=1;width=720", 720 },
+        { "width=720;initial-scale=1", 720 },
+        { "width=bogus,initial-scale=1", 480 },
+        { "initial-scale=0", 980 },
+        { "initial-scale=-1", 980 },
+        { "initial-scale=NaN", 980 },
+        { "initial-scale=Infinity", 980 },
+        { "maximum-scale=1,user-scalable=no", 980 },
+        { "initial-scale=bogus", 980 }
+    };
+    for (size_t i = 0; i < sizeof(scale_cases) / sizeof(scale_cases[0]); i++) {
+        char html[192];
+        int length = snprintf(html, sizeof(html),
+            "<!doctype html><meta name=viewport content='%s'><body></body>",
+            scale_cases[i].content);
+        PocDocument scale_document;
+        CHECK(length > 0 && (size_t) length < sizeof(html));
+        CHECK(document_parse(&scale_document, &budget, html, (size_t) length, 17)
+              && document_mobile_viewport(&scale_document, 480, 980, &viewport)
+              && viewport.declared
+              && viewport.layout_width == scale_cases[i].width);
+        document_destroy(&scale_document);
+    }
     CHECK(document_parse(&declared_viewport_document, &budget,
                          declared_viewport_page,
                          strlen(declared_viewport_page), 17)

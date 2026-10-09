@@ -2243,6 +2243,16 @@ static bool test_mutable_surface_cache_invalidation(Budget *budget)
     return ok && budget->current == baseline;
 }
 
+static bool test_responsive_image_cancel(void *opaque,
+                                         const char *phase, size_t units)
+{
+    (void) phase;
+    (void) units;
+    unsigned *calls = opaque;
+    (*calls)++;
+    return false;
+}
+
 static bool test_picture_source_media_selection(Budget *budget)
 {
     static const char picture_html[] =
@@ -2259,6 +2269,30 @@ static bool test_picture_source_media_selection(Budget *budget)
     static const char density_html[] =
         "<!doctype html><body><img id=picture src='/b.svg' "
         "srcset='/a.svg 1x, /b.svg 2x' width=25 height=25></body>";
+    static const char calc_sizes_html[] =
+        "<!doctype html><body><img id=picture src='/b.svg' "
+        "srcset='/a.svg 320w, /b.svg 640w' "
+        "sizes='calc(25vw + 10px)' width=25 height=25></body>";
+    static const char conditional_calc_sizes_html[] =
+        "<!doctype html><body><picture>"
+        "<source srcset='/a.svg 320w, /b.svg 640w' "
+        "sizes='(max-width: 500px) calc(25vw + 10px), 600px'>"
+        "<img id=picture src='/b.svg' width=25 height=25>"
+        "</picture></body>";
+    static const char default_calc_sizes_html[] =
+        "<!doctype html><body><img id=picture src='/a.svg' "
+        "srcset='/a.svg 320w, /b.svg 640w' "
+        "sizes='calc(100vw + 10px)' width=25 height=25></body>";
+    static const char nested_sizes_html[] =
+        "<!doctype html><body><img id=picture src='/b.svg' "
+        "srcset='/a.svg 320w, /b.svg 640w' "
+        "sizes='(min-width: 900px) 900px, "
+        "clamp(120px, calc(25vw + 10px), 200px)' "
+        "width=25 height=25></body>";
+    static const char invalid_sizes_html[] =
+        "<!doctype html><body><img id=picture src='/b.svg' "
+        "srcset='/a.svg 320w, /b.svg 640w' "
+        "sizes='calc(50%), calc(-10px), 600px' width=25 height=25></body>";
     static const char implicit_density_html[] =
         "<!doctype html><body><img id=picture src='/a.svg' "
         "srcset='/b.svg 2x' width=25 height=25></body>";
@@ -2289,6 +2323,15 @@ static bool test_picture_source_media_selection(Budget *budget)
         {sizes_html, sizeof(sizes_html) - 1, 480, 0x12, "/a.svg"},
         {sizes_html, sizeof(sizes_html) - 1, 640, 0x65, "/b.svg"},
         {density_html, sizeof(density_html) - 1, 480, 0x12, "/a.svg"},
+        {calc_sizes_html, sizeof(calc_sizes_html) - 1, 480, 0x12, "/a.svg"},
+        {default_calc_sizes_html, sizeof(default_calc_sizes_html) - 1,
+         480, 0x65, "/b.svg"},
+        {conditional_calc_sizes_html, sizeof(conditional_calc_sizes_html) - 1,
+         480, 0x12, "/a.svg"},
+        {conditional_calc_sizes_html, sizeof(conditional_calc_sizes_html) - 1,
+         640, 0x65, "/b.svg"},
+        {nested_sizes_html, sizeof(nested_sizes_html) - 1, 480, 0x12, "/a.svg"},
+        {invalid_sizes_html, sizeof(invalid_sizes_html) - 1, 480, 0x65, "/b.svg"},
         {implicit_density_html, sizeof(implicit_density_html) - 1, 480,
          0x12, "/a.svg"},
         {lazy_placeholder_html, sizeof(lazy_placeholder_html) - 1, 480,
@@ -2335,6 +2378,11 @@ static bool test_picture_source_media_selection(Budget *budget)
                     && resource->width == 1 && resource->height == 1
                     && images.stats.loaded == 1
                 : images.stats.loaded == 0);
+        if (case_ok && cases[i].html == default_calc_sizes_html) {
+            selected = image_select_source(NULL, picture, &selected_length);
+            case_ok = selected != NULL && selected_length == 6
+                && memcmp(selected, "/b.svg", 6) == 0;
+        }
         if (!case_ok) {
             fprintf(stderr,
                     "responsive image case %zu width=%d selected=%.*s "
@@ -2355,7 +2403,7 @@ static bool test_picture_source_media_selection(Budget *budget)
     static const char dynamic_html[] =
         "<!doctype html><body><picture><source id=source "
         "srcset='data:,a'><img id=dynamic src='data:,b' "
-        "srcset='/small.svg 100w, /large.svg 400w' "
+        "srcset='/small.svg 200w, /large.svg 400w' "
         "sizes='calc(25vw + 10px)'></picture></body>";
     PocDocument dynamic_document = {0};
     Stylesheet dynamic_sheet = {0};
@@ -2379,13 +2427,80 @@ static bool test_picture_source_media_selection(Budget *budget)
             (const lxb_char_t *) "not all", 7) != NULL;
     selected = ok ? image_select_source(
         &dynamic_sheet, dynamic_image, &selected_length) : NULL;
-    /* calc(25vw + 10px) is 130 CSS px at 480px, so 400w is the first
+    /* calc(25vw + 10px) is 130 CSS px at 480px, so 200w is the first
        density at or above the PSP's 1x device scale. */
     ok = ok && selected != NULL && selected_length == 10
-        && memcmp(selected, "/large.svg", 10) == 0;
+        && memcmp(selected, "/small.svg", 10) == 0;
     stylesheet_destroy(&dynamic_sheet);
     document_destroy(&dynamic_document);
     ok = ok && budget->current == 0;
+    /* Correct source selection must survive ordinary resource refusal and
+       cancellation without publishing the old viewport fallback or keeping
+       partial ownership. Every attempt is followed by an uninjected retry. */
+    static const unsigned char expected_rgba[] = {0x12, 0x34, 0x56, 0xff};
+    for (unsigned mode = 0; ok && mode < 65u; mode++) {
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        ImageResources images = {0};
+        ok = document_parse(&document, budget, calc_sizes_html,
+                sizeof(calc_sizes_html) - 1u, 17)
+            && stylesheet_build(&sheet, budget, &document, 480)
+            && fetch_trace_replay_begin(
+                TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-image-cap",
+                error, sizeof(error));
+        size_t baseline = budget->current;
+        unsigned cancelled_calls = 0;
+        TilefinchPlatformServices services = {
+            .context = &cancelled_calls,
+            .cooperate = test_responsive_image_cancel
+        };
+        if (mode == 64u) tilefinch_platform_set_services(&services);
+        else budget_inject_failure_after(budget, mode);
+        if (ok) (void) images_load_external(&document, &sheet, &images,
+            budget, "https://image-cap.test/", "https://image-cap.test/",
+            NULL, 2, 4096, 2048, 4096, 1000, NULL, NULL);
+        budget_clear_failure_injection(budget);
+        tilefinch_platform_set_services(NULL);
+        lxb_dom_node_t *node = ok ? find_id(
+            lxb_dom_interface_node(document.html), "picture") : NULL;
+        const ImageResource *resource = images_find_node(&images, node);
+        size_t selected_length = 0;
+        const char *selected = image_select_source(&sheet, node, &selected_length);
+        /* A refused SVG scratch allocation must not publish partial pixels.
+           Source parsing itself remains allocation-free. */
+        ok = ok && selected != NULL && selected_length == 6u
+            && memcmp(selected, "/a.svg", 6u) == 0
+            && (resource == NULL
+                || (image_resource_available(resource) && resource->pixels != NULL
+                    && resource->width == 1 && resource->height == 1
+                    && memcmp(resource->pixels, expected_rgba,
+                              sizeof(expected_rgba)) == 0));
+        if (mode == 64u) ok = ok && cancelled_calls != 0;
+        images_destroy(&images);
+        fetch_trace_end();
+        if (budget->current != baseline)
+            fprintf(stderr, "responsive refusal mode=%u ownership=%zu baseline=%zu\n",
+                mode, budget->current, baseline);
+        ok = ok && budget->current == baseline
+            && fetch_trace_replay_begin(
+                TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-image-cap",
+                error, sizeof(error))
+            && images_load_external(&document, &sheet, &images,
+                budget, "https://image-cap.test/", "https://image-cap.test/",
+                NULL, 2, 4096, 2048, 4096, 1000, NULL, NULL);
+        resource = images_find_node(&images, node);
+        ok = ok && resource != NULL && image_resource_available(resource)
+            && resource->pixels != NULL && resource->width == 1
+            && resource->height == 1
+            && memcmp(resource->pixels, expected_rgba,
+                      sizeof(expected_rgba)) == 0;
+        images_destroy(&images);
+        fetch_trace_end();
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        ok = ok && budget->current == 0;
+        if (!ok) fprintf(stderr, "responsive refusal mode=%u failed\n", mode);
+    }
     return ok;
 }
 
@@ -4432,6 +4547,292 @@ static bool test_image_virtual_cancel_bound(Budget *budget)
     return ok && budget->current == 0;
 }
 
+/* A finite replay delay advances even before response bytes arrive. Keep
+   ordinary and generated backgrounds on the same bounded ownership path. */
+static bool test_image_virtual_delayed_progress(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>"
+        "#header .wordmark a{color:transparent;font:0/0 a;display:block;"
+        "width:80px;height:44px;background-image:url(/delayed.svg);"
+        "background-size:80px 20px;background-position:center center;"
+        "background-repeat:no-repeat}"
+        "#generated:before{content:'';display:block;width:8px;height:8px;"
+        "background-image:url(/delayed.svg)}"
+        "#hidden{display:none;background-image:url(/never.svg)}"
+        "</style><body><div id=header><h2 class=wordmark>"
+        "<a id=logo href=/>Brand</a></h2></div><div id=generated></div>"
+        "<div id=hidden></div><img id=picture src=/delayed.svg>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ImageResources images = {0};
+    char error[256] = {0};
+    bool ready = document_parse(
+            &document, budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&sheet, budget, &document, 480)
+        && fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-image-delayed-progress",
+            error, sizeof(error));
+    bool loaded = ready && images_load_external(
+        &document, &sheet, &images, budget,
+        "https://image-progress.test/", "https://image-progress.test/", NULL,
+        3, 4096, 4096, 4096, 15000, NULL, NULL);
+    lxb_dom_node_t *root = document.html == NULL ? NULL
+        : lxb_dom_interface_node(document.html);
+    const ImageResource *logo = images_find_background_node(
+        &images, find_id(root, "logo"));
+    const ImageResource *generated = images_find_pseudo_background(
+        &images, find_id(root, "generated"), PSEUDO_BEFORE);
+    const ImageResource *picture = images_find_node(
+        &images, find_id(root, "picture"));
+    bool ok = loaded && images.count == 3 && images.stats.attempted == 1
+        && images.stats.failed == 0 && images.stats.deadline_cancelled == 0
+        && images.stats.cooperative_yields > 256
+        && images.stats.cooperative_yields < 700
+        && image_resource_available(logo)
+        && image_resource_available(generated)
+        && image_resource_available(picture);
+    if (!ok) fprintf(stderr,
+        "delayed image progress: ready=%d loaded=%d count=%zu attempts=%zu "
+        "failed=%zu deadline=%zu yields=%zu resources=%d/%d/%d error=%s\n",
+        ready, loaded, images.count, images.stats.attempted,
+        images.stats.failed, images.stats.deadline_cancelled,
+        images.stats.cooperative_yields, image_resource_available(logo),
+        image_resource_available(generated), image_resource_available(picture),
+        error);
+    if (ready) fetch_trace_end();
+    images_destroy(&images);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
+static bool test_zero_font_background_anchor_paints(Budget *budget,
+                                                  unsigned mode)
+{
+    bool generated_stack = mode == 2;
+    char html[2048];
+    const char *pseudo = generated_stack
+        ? "#header .wordmark:after{content:'';display:block;position:absolute;"
+          "top:0;left:0;width:80px;height:43px;background:blue;z-index:-1}"
+          "#header .wordmark:before{content:'';display:block;position:absolute;"
+          "top:20px;left:0;width:4px;height:4px;background:lime;z-index:1}"
+        : "";
+    int length = snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0;background:white}"
+        "#header{height:44px;width:480px;position:fixed;top:0;left:0;"
+        "z-index:20;background:#333}"
+        "#header .wordmark{margin:0;float:left;position:relative}"
+        "%s"
+        "#header .wordmark a{color:transparent;font:0/0 a;display:block;"
+        "height:44px;background-position:center center;"
+        "background-repeat:no-repeat%s"
+        "width:80px;background-image:url(\"data:image/svg+xml,"
+        "%%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%%3E"
+        "%%3Crect width='8' height='8' fill='red'/%%3E%%3C/svg%%3E\");"
+        "background-size:80px 20px%s}</style><body><div id=header>"
+        "<h2 class=wordmark><a id=logo href=/>Brand</a></h2></div>",
+        pseudo, mode == 0 ? "}#header .wordmark a{" : ";",
+        generated_stack ? ";background-position:center center;background-repeat:no-repeat"
+                       : mode == 3 ? ";background-size:10px invalid" : "");
+    if (length < 0 || (size_t) length >= sizeof(html)) return false;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ImageResources images = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    bool ok = document_parse(&document, budget, html, (size_t) length, 17)
+        && stylesheet_build(&sheet, budget, &document, 480)
+        && images_load_external(&document, &sheet, &images, budget,
+            "https://wordmark.test/", "https://wordmark.test/", NULL,
+            1, 4096, 4096, 4096, 1000, NULL, NULL)
+        && layout_build(&layout, budget, &document, &sheet, NULL, &images, 480);
+    lxb_dom_node_t *node = document.html == NULL ? NULL
+        : find_id(lxb_dom_interface_node(document.html), "logo");
+    const ImageResource *logo = images_find_background_node(&images, node);
+    const DrawCommand *image = NULL;
+    for (size_t i = 0; i < layout.count; i++) {
+        if (layout.commands[i].type == DRAW_IMAGE
+            && layout.commands[i].image == logo) image = &layout.commands[i];
+    }
+    ok = ok && image_resource_available(logo) && image != NULL
+        && image->x == 0 && image->y == 0
+        && image->width == 80 && image->height == 44;
+    if (ok) frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    ok = ok && frame != NULL && tile_cache_init(&cache, budget, &layout, 8)
+        && tile_cache_set_frame(&cache, frame, 480u * 272u)
+        && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+        && frame[20u * 480u + 40u] == UINT16_C(0xf800)
+        && (!generated_stack || frame[21u * 480u + 1u] == UINT16_C(0x07e0))
+        && frame[5u * 480u + 40u] != UINT16_C(0xf800)
+        && frame[38u * 480u + 40u] != UINT16_C(0xf800)
+        && (!generated_stack || (frame[5u * 480u + 40u] == UINT16_C(0x001f)
+                                && frame[38u * 480u + 40u] == UINT16_C(0x001f)));
+    if (!ok && frame != NULL) fprintf(stderr,
+        "zero-font pixels stack=%d center=%04x front=%04x top=%04x bottom=%04x\n",
+        generated_stack, frame[20u * 480u + 40u], frame[21u * 480u + 1u],
+        frame[5u * 480u + 40u], frame[38u * 480u + 40u]);
+    if (!ok) fprintf(stderr,
+        "zero-font background: available=%d command=%d geometry=%d,%d %dx%d\n",
+        image_resource_available(logo), image != NULL,
+        image == NULL ? -1 : image->x, image == NULL ? -1 : image->y,
+        image == NULL ? -1 : image->width, image == NULL ? -1 : image->height);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    /* Refusal while admitting transient pseudo stacking contexts and their
+       paint tree must leave the loaded pixels and all source owners intact. */
+    size_t resident = budget->current;
+    for (size_t fail = 0; fail < 48; fail++) {
+        LayoutDocument candidate = {0};
+        budget_inject_failure_after(budget, fail);
+        (void) layout_build(&candidate, budget, &document, &sheet,
+                           NULL, &images, 480);
+        budget_clear_failure_injection(budget);
+        layout_destroy(&candidate);
+        ok = ok && budget->current == resident
+            && image_resource_available(logo);
+    }
+    images_destroy(&images);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
+static bool test_generated_pseudo_opacity(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;background:black}"
+        "div{position:absolute;top:0;width:20px;height:20px}"
+        "div:before{content:'';display:block;width:20px;height:20px;background:red}"
+        "#normal{left:0}#hidden{left:40px}#half{left:80px}#parent{left:120px;opacity:.5}"
+        "#hidden:before{opacity:0}#half:before{opacity:.5}</style>"
+        "<body><div id=normal></div><div id=hidden></div>"
+        "<div id=half></div><div id=parent></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    bool ok = document_parse(&document, budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&sheet, budget, &document, 480)
+        && layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480);
+    if (ok) frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    ok = ok && frame != NULL && tile_cache_init(&cache, budget, &layout, 8)
+        && tile_cache_set_frame(&cache, frame, 480u * 272u)
+        && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+        && frame[10u * 480u + 10u] == UINT16_C(0xf800)
+        && frame[10u * 480u + 50u] == 0
+        && frame[10u * 480u + 90u] != 0
+        && frame[10u * 480u + 90u] != UINT16_C(0xf800)
+        && frame[10u * 480u + 130u] == frame[10u * 480u + 90u];
+    if (!ok && frame != NULL) fprintf(stderr,
+        "pseudo opacity: default=%04x hidden=%04x half=%04x parent=%04x\n",
+        frame[10u * 480u + 10u], frame[10u * 480u + 50u],
+        frame[10u * 480u + 90u], frame[10u * 480u + 130u]);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
+static bool test_generated_literal_storage_bounds(Budget *budget)
+{
+    static const char html[] = "<!doctype html><body><span id=target></span>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    bool ok = document_parse(&document, budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&sheet, budget, &document, 480);
+    lxb_dom_node_t *target = document.html == NULL ? NULL
+        : find_id(lxb_dom_interface_node(document.html), "target");
+    if (!ok || target == NULL) goto done;
+    char css[160];
+    for (unsigned i = 0; ok && i < 96; i++) {
+        int count = snprintf(css, sizeof(css),
+            ".s%u:before{content:'s%03u'}", i, i);
+        ok = count > 0 && stylesheet_add_css(&sheet, css, (size_t) count);
+    }
+    static const char plus[] = "#target:before{content:'+'}";
+    ok = ok && stylesheet_add_css(&sheet, plus, sizeof(plus) - 1);
+    ComputedStyle parent = style_for_node(&sheet, target, NULL);
+    ComputedStyle pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    ok = ok && sheet.generated_text_count == 97
+        && sheet.generated_text_bytes == 482
+        && pseudo.generated_text_length == 1
+        && pseudo.generated_text != NULL && pseudo.generated_text[0] == '+';
+    const char *retained = pseudo.generated_text;
+    static const char duplicate[] = ".duplicate:after{content:'s000'}";
+    ok = ok && stylesheet_add_css(&sheet, duplicate, sizeof(duplicate) - 1)
+        && sheet.generated_text_count == 97 && retained[0] == '+';
+    stylesheet_destroy(&sheet);
+
+    /* Long strings exhaust the unchanged 4096-byte payload before entries. */
+    if (!ok) goto done;
+    ok = ok && stylesheet_build(&sheet, budget, &document, 480);
+    if (!ok) goto done;
+    char long_text[64];
+    memset(long_text, 'a', 63);
+    long_text[63] = '\0';
+    for (unsigned i = 0; ok && i < 64; i++) {
+        long_text[0] = (char) ('A' + i / 26u);
+        long_text[1] = (char) ('A' + i % 26u);
+        int count = snprintf(css, sizeof(css),
+            ".long%u:before{content:'%s'}", i, long_text);
+        ok = count > 0 && stylesheet_add_css(&sheet, css, (size_t) count);
+    }
+    ok = ok && sheet.generated_text_count == 64
+        && sheet.generated_text_bytes == 4096u
+        && stylesheet_add_css(&sheet, plus, sizeof(plus) - 1);
+    parent = style_for_node(&sheet, target, NULL);
+    pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    ok = ok && pseudo.generated_text == NULL
+        && sheet.generated_text_bytes == 4096u;
+    stylesheet_destroy(&sheet);
+
+    /* Distinct three-byte codepoints exhaust the finite entry quota first.
+       Deduplication remains usable even after either quota is full. */
+    if (!ok) goto done;
+    ok = ok && stylesheet_build(&sheet, budget, &document, 480);
+    if (!ok) goto done;
+    for (unsigned i = 0; ok && i < STYLE_GENERATED_TEXT_LIMIT; i++) {
+        int count = snprintf(css, sizeof(css),
+            ".icon%u:before{content:'\\%x'}", i, 0xe000u + i);
+        ok = count > 0 && stylesheet_add_css(&sheet, css, (size_t) count);
+    }
+    ok = ok && sheet.generated_text_count == STYLE_GENERATED_TEXT_LIMIT
+        && sheet.generated_text_bytes == STYLE_GENERATED_TEXT_LIMIT * 4u
+        && stylesheet_add_css(&sheet, plus, sizeof(plus) - 1);
+    parent = style_for_node(&sheet, target, NULL);
+    pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    ok = ok && pseudo.generated_text == NULL;
+    static const char first[] = "#target:before{content:'\\e000'}";
+    ok = ok && stylesheet_add_css(&sheet, first, sizeof(first) - 1);
+    parent = style_for_node(&sheet, target, NULL);
+    pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    ok = ok && pseudo.generated_text_length == 3
+        && sheet.generated_text_count == STYLE_GENERATED_TEXT_LIMIT;
+    stylesheet_destroy(&sheet);
+
+    if (!ok) goto done;
+    size_t resident = budget->current;
+    for (size_t fail = 0; fail < 48; fail++) {
+        Stylesheet candidate = {0};
+        bool built = stylesheet_build(&candidate, budget, &document, 480);
+        budget_inject_failure_after(budget, fail);
+        if (built) (void) stylesheet_add_css(&candidate, plus, sizeof(plus) - 1);
+        budget_clear_failure_injection(budget);
+        stylesheet_destroy(&candidate);
+        ok = ok && budget->current == resident;
+    }
+done:
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
 static uint64_t test_image_progress_clock(void *opaque)
 {
     uint64_t *now = opaque;
@@ -4890,6 +5291,215 @@ static bool test_constructed_sheet_without_rule_cap(Budget *budget)
         ok = false;
     }
     constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* CSSOM edits preserve author DOM identities and source order. */
+static bool test_cssom_rule_edits_preserve_dom(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<style id=rules>.target{color:#ff0000}</style>"
+        "<style>.target{color:#00ff00}</style>"
+        "<p class=target>TARGET</p>");
+    size_t dom_before = budget->categories[BUDGET_CATEGORY_DOM].current;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{globalThis.owner=document.getElementById('rules');"
+        "globalThis.sheet=owner.sheet;globalThis.text=owner.firstChild;"
+        "const source=owner.textContent,observer=new MutationObserver(()=>{});"
+        "observer.observe(owner,{childList:true,characterData:true,subtree:true});"
+        "for(let i=0;i<700;i++)sheet.insertRule('.f'+i+'{width:'+i+'px}',sheet.cssRules.length);"
+        "sheet.insertRule('.target{color:#0000ff}',sheet.cssRules.length);"
+        "const unchanged=owner.textContent===source&&owner.firstChild===text"
+        "&&observer.takeRecords().length===0&&owner.sheet===sheet"
+        "&&sheet.cssRules.length===702;observer.disconnect();"
+        "globalThis.pocSummary=unchanged?'CSSOM-OK':'CSSOM-FAILED'})()", "CSSOM-OK");
+    /* Later author sources still win: edits keep the original source slot. */
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0x00ff00;
+    size_t dom_after = budget->categories[BUDGET_CATEGORY_DOM].current;
+    if (ok && dom_after > dom_before
+        && dom_after - dom_before > 128u * 1024u) {
+        fprintf(stderr, "CSSOM retained DOM grew %zu -> %zu\n", dom_before, dom_after);
+        ok = false;
+    }
+    printf("CSSOM 700 edits: DOM current %zu -> %zu\n", dom_before, dom_after);
+    ok = ok && constructed_sheet_step(&navigation,
+        "owner.remove();sheet.deleteRule(701);"
+        "sheet.insertRule('.target{color:#2468ac}',701);document.body.appendChild(owner);"
+        "globalThis.pocSummary=owner.sheet===sheet&&owner.firstChild===text"
+        "&&sheet.cssRules.length===702?'RECONNECTED':'RECONNECT-FAILED:'"
+        "+JSON.stringify({sameSheet:owner.sheet===sheet,sameText:owner.firstChild===text,"
+        "count:sheet.cssRules.length,source:owner.textContent})", "RECONNECTED");
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0x2468ac;
+    /* Force another complete source/cache rebuild without a DOM source edit. */
+    static const char user_css[] = ".unused-cssom-probe{color:#abcdef}";
+    ok = ok && navigation_set_user_css(&navigation, user_css,
+        sizeof(user_css)-1u);
+    ok = ok && navigation_relayout(&navigation)
+        && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "globalThis.pocSummary=sheet.cssRules.length===702?'REBUILT':'REBUILD-FAILED'",
+            "<cssom-rebuild>", &navigation.page.script_result)
+        && strcmp(navigation.page.script_result.summary, "REBUILT") == 0;
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0x2468ac;
+    ok = ok && constructed_sheet_step(&navigation,
+        "globalThis.clone=owner.cloneNode(true);document.body.appendChild(clone);"
+        "globalThis.pocSummary=clone.sheet.cssRules.length===1"
+        "&&sheet.cssRules.length===702?'CLONED':'CLONE-FAILED'", "CLONED");
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0xff0000;
+    ok = ok && constructed_sheet_step(&navigation,
+        "clone.remove();globalThis.pocSummary='UNCLONED'", "UNCLONED");
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0x2468ac;
+    ok = ok && constructed_sheet_step(&navigation,
+        /* An identical author data write must reset the CSSOM-only edits. */
+        "text.data=text.data;globalThis.pocSummary=sheet.cssRules.length===1"
+        "&&owner.sheet===sheet?'RESET':'RESET-FAILED'", "RESET");
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0xff0000;
+    ok = ok && constructed_sheet_step(&navigation,
+        "sheet.insertRule('.target{color:#0000ff}',1);"
+        "owner.appendChild(document.createTextNode('.target{color:#123456}'));"
+        "globalThis.pocSummary=owner.sheet.cssRules.length===2"
+        "?'CHILD-RESET':'CHILD-RESET-FAILED'", "CHILD-RESET");
+    ok = ok && late_init_text_color(&navigation.page.layout, "TARGET") == 0x123456;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const host=document.createElement('x-host');document.body.append(host);"
+        "const root=host.attachShadow({mode:'open'});"
+        "root.innerHTML='<style>.scoped{color:#ff0000}</style>'"
+        "+'<p class=scoped>CSSOMSHADOW</p>';"
+        "const style=root.querySelector('style'),child=style.firstChild;"
+        "style.sheet.insertRule('.scoped{color:#0000ff}',1);"
+        "const outside=document.createElement('p');outside.className='scoped';"
+        "outside.textContent='CSSOMOUTSIDE';document.body.append(outside);"
+        "globalThis.pocSummary=style.firstChild===child?'SHADOW-EDIT':'SHADOW-FAILED'})()",
+        "SHADOW-EDIT");
+    ok = ok && late_init_text_color(&navigation.page.layout, "CSSOMSHADOW") == 0x0000ff
+        && late_init_text_color(&navigation.page.layout, "CSSOMOUTSIDE") != 0x0000ff;
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+static bool test_cssom_author_bounds(Budget *budget)
+{
+    size_t baseline = budget->current;
+    char html[8192];
+    size_t used = 0;
+    for (size_t i = 0; i < 132; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<style id=s%zu>.x{color:red}</style>", i);
+    PocDocument document = {0};
+    bool ok = document_parse(&document, budget, html, used, 17);
+    static char payload[200u * 1024u];
+    memset(payload, ' ', sizeof(payload));
+    static const char small[] = ".x{color:blue}";
+    for (size_t i = 0; ok && i < 132; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "s%zu", i);
+        lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), id);
+        const char *text = i < 6 ? payload : small;
+        size_t length = i < 6 ? sizeof(payload) : sizeof(small)-1u;
+        bool active = false;
+        ok = document_cssom_sheet_set_text(&document, node, text, length,
+            false, &active) && active;
+    }
+    /* Author sources are not newly limited to 128 sheets or 1 MiB total;
+       their existing per-source JS quota and shared Budget remain bounds. */
+    size_t before = budget->current;
+    lxb_dom_node_t *node = ok ? find_id(lxb_dom_interface_node(document.html), "s0") : NULL;
+    uint32_t revision = document_cssom_sheet_revision(node);
+    ok = ok && !document_cssom_sheet_set_text(&document, node, small,
+        DOCUMENT_CONSTRUCTED_TEXT_LIMIT + 1u, false, NULL)
+        && budget->current == before
+        && document_cssom_sheet_revision(node) == revision;
+    document_destroy(&document);
+    return ok && budget->current == baseline;
+}
+
+static bool test_cssom_override_refusal(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char html[] = "<style id=rules>.target{color:red}</style>";
+    static const char initial[] = ".target{color:blue}";
+    /* A first constructed edit additionally registers adoption metadata.
+       Sweep through every allocation until the first successful commit. */
+    bool swept_success = false;
+    for (size_t failure = 0; failure < 12 && !swept_success; failure++) {
+        PocDocument attempt = {0};
+        bool ok = document_parse(&attempt, budget, html, sizeof(html)-1u, 17);
+        lxb_dom_node_t *node = ok
+            ? find_id(lxb_dom_interface_node(attempt.html), "rules") : NULL;
+        if (node != NULL) lxb_dom_node_remove(node);
+        size_t before = budget->current;
+        bool active = true;
+        budget_inject_failure_after(budget, failure);
+        bool applied = ok && document_cssom_sheet_set_text(&attempt, node,
+            initial, sizeof(initial)-1u, true, &active);
+        budget_clear_failure_injection(budget);
+        if (!applied) {
+            ok = ok && budget->current == before && !active
+                && document_cssom_sheet_revision(node) == 0
+                && document_cssom_sheet_text(node, NULL) == NULL
+                && document_constructed_sheet_count(&attempt) == 0
+                && !document_constructed_sheet_known(&attempt, node);
+            /* The same document can retry, register and adopt normally. */
+            ok = ok && document_cssom_sheet_set_text(&attempt, node,
+                initial, sizeof(initial)-1u, true, &active) && !active;
+        } else swept_success = true;
+        lxb_dom_node_t *sheets[] = {node};
+        ok = ok && document_adoption_set(&attempt, NULL, sheets, 1, NULL, NULL)
+            && document_constructed_sheet_count(&attempt) == 1
+            && document_constructed_sheet_adopted(&attempt, node);
+        document_destroy(&attempt);
+        if (!ok || budget->current != baseline) {
+            fprintf(stderr, "CSSOM first-source refusal sweep failure=%zu applied=%d "
+                "ok=%d current=%zu baseline=%zu\n", failure, (int) applied,
+                (int) ok, budget->current, baseline);
+            return false;
+        }
+    }
+    if (!swept_success) return false;
+    PocDocument document = {0};
+    bool ok = document_parse(&document, budget, html, sizeof(html)-1u, 17);
+    lxb_dom_node_t *node = ok ? find_id(lxb_dom_interface_node(document.html), "rules") : NULL;
+    bool active = false;
+    size_t unedited = budget->current;
+    for (size_t failure = 0; ok && failure < 3; failure++) {
+        budget_inject_failure_after(budget, failure);
+        bool refused = !document_cssom_sheet_set_text(&document, node,
+            initial, sizeof(initial)-1u, false, &active);
+        budget_clear_failure_injection(budget);
+        ok = refused && budget->current == unedited
+            && document_cssom_sheet_text(node, NULL) == NULL
+            && document_cssom_sheet_revision(node) == 0;
+    }
+    ok = ok && document_cssom_sheet_set_text(&document, node, initial,
+        sizeof(initial)-1u, false, &active) && active;
+    size_t before = budget->current;
+    uint32_t revision = document_cssom_sheet_revision(node);
+    char large[4096];
+    memset(large, ' ', sizeof(large));
+    size_t limit = budget->limit;
+    budget->limit = budget->current;
+    bool refused = !document_cssom_sheet_set_text(&document, node, large,
+        sizeof(large), false, &active);
+    budget->limit = limit;
+    size_t length = 0;
+    const char *current = document_cssom_sheet_text(node, &length);
+    ok = ok && refused && budget->current == before
+        && document_cssom_sheet_revision(node) == revision
+        && length == sizeof(initial)-1u && current != NULL
+        && memcmp(current, initial, length) == 0;
+    ok = ok && document_cssom_sheet_set_text(&document, node, large,
+        sizeof(large), false, &active);
+    size_t retained = budget->current;
+    /* Once capacity is admitted, shorter edits allocate nothing. */
+    budget->limit = budget->current;
+    ok = ok && document_cssom_sheet_set_text(&document, node, initial,
+        sizeof(initial)-1u, false, &active) && budget->current == retained;
+    budget->limit = limit;
+    document_destroy(&document);
+    if (!ok || budget->current != baseline)
+        fprintf(stderr, "CSSOM existing-source refusal ok=%d current=%zu baseline=%zu\n",
+            (int) ok, budget->current, baseline);
     return ok && budget->current == baseline;
 }
 

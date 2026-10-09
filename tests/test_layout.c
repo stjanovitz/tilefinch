@@ -245,6 +245,7 @@ static const char responsive_page[] =
 #include "suites/layout_structure.inc"
 #include "suites/layout_news_compat.inc"
 #include "suites/layout_site_parity.inc"
+#include "suites/layout_picture_paint.inc"
 
 static int test_inline_border_command_parity(void)
 {
@@ -314,6 +315,8 @@ static int test_layout(void)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    puts("test: picture paints a replaced image through clipping");
+    CHECK(test_picture_replaced_paint() == 0);
     CHECK(test_inline_border_command_parity() == 0);
     CHECK(test_news_compat() == 0);
     CHECK(test_site_parity() == 0);

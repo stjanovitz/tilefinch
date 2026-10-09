@@ -435,7 +435,9 @@ static unsigned char *image_decode_jpeg_scaled(
         || target_width <= 0 || target_height <= 0
         || expected_width < target_width
         || expected_height < target_height) return NULL;
-    stbi__context stream;
+    /* stb does not initialize img_n in start_mem. A pre-SOF failure must
+       clean up zero components rather than interpreting stack bytes. */
+    stbi__context stream = {0};
     stbi__start_mem(&stream, encoded, encoded_length);
     if (!stbi__jpeg_test(&stream)) return NULL;
     stbi__rewind(&stream);
@@ -447,7 +449,7 @@ static unsigned char *image_decode_jpeg_scaled(
     int shift = image_jpeg_scale_shift(
         expected_width, expected_height, target_width, target_height);
     jpeg->tilefinch_scale_shift = shift;
-    if (!stbi__decode_jpeg_image(jpeg)) {
+    if (!stbi__decode_jpeg_image(jpeg) || jpeg->scan_n <= 0) {
         stbi__cleanup_jpeg(jpeg);
         STBI_FREE(jpeg);
         return NULL;

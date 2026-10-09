@@ -1,7 +1,7 @@
 # PSP TLS trust bundle
 
 `roots.pem` is the deliberately compact trust bundle staged beside the live
-PSP EBOOT. It contains twenty-five public root certificates:
+PSP EBOOT. It contains twenty-six public root certificates:
 
 - Amazon Root CA 1 (expires 2038-01-17)
 - DigiCert Global Root G2 (expires 2038-01-15)
@@ -25,6 +25,7 @@ PSP EBOOT. It contains twenty-five public root certificates:
 - Sectigo Public Server Authentication Root R46 (expires 2046-03-21)
 - SSL.com Root Certification Authority ECC (expires 2041-02-12)
 - SSL.com TLS ECC Root CA 2022 (expires 2046-08-19)
+- SSL.com TLS RSA Root CA 2022 (expires 2046-08-19)
 - Starfield Root Certificate Authority - G2 (expires 2037-12-31)
 - USERTrust RSA Certification Authority (expires 2038-01-18)
 - USERTrust ECC Certification Authority (expires 2038-01-18)
@@ -91,6 +92,13 @@ G2). The native-Mbed-TLS census verified 329 of 426 origins, with 88
 unreachable service/apex hosts, nine apex hostname mismatches, and no
 certificate-policy or missing-trust failures. Neither verification policy
 nor the set of trusted anchors was relaxed.
+
+The 0.1.31 refresh adds the self-signed SSL.com TLS RSA Root CA 2022 after
+the live census found a chain that needs it. Its DER SHA-256 is
+`8faf7d2e2cb4709bb8e0b33666bf75a5dd45b5de480f8ea8d4bfe6bebc17f2ed`,
+matching both [SSL.com's official repository](https://www.ssl.com/repository/)
+and the current Mozilla bundle. The fingerprint is pinned by the bundle test;
+no leaf/intermediate trust or certificate-verification policy is relaxed.
 
 After the PSP dependency build has unpacked Mbed TLS, build its native client
 and run the live qualification against a current top-300 list, the

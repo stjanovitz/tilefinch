@@ -440,9 +440,43 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 lxb_dom_node_t *saved_basis_node =
                     context->percentage_basis_node;
                 int saved_basis_width = context->percentage_basis_width;
+                lxb_dom_node_t *saved_flex_node = context->assigned_flex_node;
+                int saved_flex_height = context->assigned_flex_height;
+                bool saved_flex_minimum = context->assigned_flex_minimum;
                 if (!table_row && !css_table_row && !anonymous_cell_row) {
                     context->percentage_basis_node = item->node;
                     context->percentage_basis_width = content_width;
+                    /* In a definite, single-line row, a stretched item's
+                       cross size is definite too (Flexbox 9.8). Assign it
+                       before descending so percentage-height children use
+                       the stretched box, not its provisional natural height.
+                       Wrapped/auto-height lines still need the later line
+                       measurement and must not inherit this constraint. */
+                    if (frame->definite_height && !style->flex_wrap
+                        && !child_style->has_height
+                        /* Native editable controls have a separate late
+                           cross-size/text-centering path and no ordinary
+                           percentage-height child formatting context. */
+                        && !layout_node_name_is(item->node, "input")
+                        && !layout_node_name_is(item->node, "textarea")
+                        && !child_style->margin_top_auto
+                        && !child_style->margin_bottom_auto
+                        && flex_item_alignment(style, child_style)
+                           == ALIGN_STRETCH) {
+                        int height = child_containing_height
+                            - child_style->margin.top
+                            - child_style->margin.bottom;
+                        if (!child_style->box_sizing_border_box)
+                            height -= child_style->padding.top
+                                + child_style->padding.bottom
+                                + child_style->border.top
+                                + child_style->border.bottom;
+                        if (height > 0) {
+                            context->assigned_flex_node = item->node;
+                            context->assigned_flex_height = height;
+                            context->assigned_flex_minimum = false;
+                        }
+                    }
                 }
                 bool laid_out = layout_block(
                     context, item->node, &item->parent_style, cursor_x,
@@ -450,6 +484,9 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     descendant_positioned_box, &child_bottom);
                 context->percentage_basis_node = saved_basis_node;
                 context->percentage_basis_width = saved_basis_width;
+                context->assigned_flex_node = saved_flex_node;
+                context->assigned_flex_height = saved_flex_height;
+                context->assigned_flex_minimum = saved_flex_minimum;
                 if (!laid_out) {
                     flex_order_plan_destroy(row_order);
                     return false;

@@ -520,6 +520,9 @@ typedef struct {
 typedef struct {
     size_t received_body_bytes;
     long status_code;
+    /* Virtual replay's bounded scheduling countdown. Zero on live requests;
+       an external-cancel record does not advance this value. */
+    unsigned replay_delay_pumps_remaining;
     bool active;
     bool complete;
 } FetchRequestProgress;

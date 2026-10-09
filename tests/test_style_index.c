@@ -1081,6 +1081,132 @@ static int test_quoted_declaration_boundaries(void)
     return 0;
 }
 
+static int test_computed_style_payload_storage(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char html[12000];
+    size_t used = 0;
+    for (unsigned i = 0; i < 260; i++) {
+        int n = snprintf(html + used, sizeof(html) - used,
+                         "<p id=n%u>payload</p>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] = "p{color:#123456;width:37px}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *nodes[260];
+    for (unsigned i = 0; i < 260; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "n%u", i);
+        nodes[i] = find_id(lxb_dom_interface_node(document.html), id);
+        CHECK(nodes[i] != NULL);
+    }
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_expect_elements(reuse, 3000);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    CHECK(reuse->style_mask + 1u == 4096u);
+    LayoutReuseStats stats;
+    layout_reuse_cache_stats(reuse, &stats);
+    printf("computed-style storage: slots=%zu slot_bytes=%zu style_bytes=%zu "
+           "empty_bytes=%zu\n", reuse->style_mask + 1u,
+           sizeof(LayoutReuseStyleEntry), sizeof(ComputedStyle),
+           stats.retained_bytes);
+    CHECK(stats.retained_bytes < 512u * 1024u);
+    ComputedStyle parent = layout_initial_root_style(), result;
+    /* Warm independent resolver scratch before refusing optional payloads. */
+    ComputedStyle expected = style_for_node(&sheet, nodes[0], &parent);
+    size_t limit = budget.limit, retained = budget.current;
+    size_t failures = budget.failure_count;
+    budget.limit = budget.current;
+    for (unsigned i = 0; i < 20; i++) {
+        CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                               nodes[0], &parent, &result));
+        CHECK(result.color == expected.color && result.width == expected.width);
+        CHECK(budget.current == retained);
+    }
+    CHECK(budget.failure_count == failures + 1u);
+    budget.limit = limit;
+    layout_reuse_cache_reset(reuse);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    for (unsigned i = 0; i < 128; i++) {
+        CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                               nodes[i], &parent, &result));
+        CHECK(result.color == 0x123456 && result.width == 37);
+    }
+    retained = budget.current;
+    failures = budget.failure_count;
+    budget.limit = retained;
+    for (unsigned i = 128; i < 148; i++) {
+        CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                               nodes[i], &parent, &result));
+        CHECK(result.color == 0x123456 && budget.current == retained);
+    }
+    CHECK(budget.failure_count == failures + 1u);
+    for (unsigned i = 0; i < 128; i++)
+        CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                              nodes[i], &parent, &result));
+    /* A scoped drop recycles storage even after growth was refused. */
+    layout_reuse_cache_invalidate_inline_style(reuse, nodes[0], "color", false);
+    CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                           nodes[128], &parent, &result));
+    CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                          nodes[128], &parent, &result));
+    CHECK(budget.current == retained);
+    budget.limit = limit;
+    layout_reuse_cache_reset(reuse);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    for (unsigned i = 0; i < 260; i++)
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                               nodes[i], &parent, &result);
+    for (unsigned i = 0; i < 260; i++) {
+        CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                              nodes[i], &parent, &result));
+        CHECK(result.color == 0x123456 && result.width == 37);
+    }
+    layout_reuse_cache_stats(reuse, &stats);
+    /* Capacity remains 4096, but full styles are owned only for the walk. */
+    CHECK(stats.retained_bytes < 512u * 1024u);
+    ComputedStyle absent = {0};
+    layout_reuse_note_pseudo(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
+                             &result, &absent);
+    CHECK(layout_reuse_pseudo_absent(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
+                                     &result));
+    /* Font publication only drops metric-dependent records, preserving all
+       other payloads and the pseudo proof. Mark one cached dependency as a
+       deterministic unit seam; real font publication is covered separately. */
+    for (size_t i = 0; i <= reuse->style_mask; i++)
+        if (reuse->styles[i].node == nodes[1])
+            reuse->styles[i].dependent |= LAYOUT_REUSE_FONT_DEPENDENT;
+    layout_reuse_cache_begin_font_publication(reuse);
+    CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                          nodes[0], &parent, &result));
+    CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                           nodes[1], &parent, &result));
+    layout_reuse_cache_end_font_publication(reuse);
+    CHECK(layout_reuse_pseudo_absent(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
+                                     &result));
+    static const char changed[] = "p{color:#654321}";
+    CHECK(stylesheet_add_css(&sheet, changed, sizeof(changed) - 1u));
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                           nodes[0], &parent, &result));
+    CHECK(result.color == 0x654321);
+    CHECK(!layout_reuse_pseudo_absent(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
+                                      &result));
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_retained_cache_eligibility(void)
 {
     Budget budget;
@@ -1313,6 +1439,128 @@ static int test_retained_retirement_probe_holes(void)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static bool append_unrelated_style(Stylesheet *sheet, void *unused)
+{
+    (void) unused;
+    static const char css[] = ".unrelated{color:#abcdef;z-index:9!important}";
+    return stylesheet_add_css(sheet, css, sizeof(css) - 1u);
+}
+
+static bool append_no_style(Stylesheet *sheet, void *cancel)
+{
+    (void) sheet;
+    return cancel == NULL;
+}
+
+static int test_append_identity_fallback(void)
+{
+    for (unsigned mode = 0; mode < 3u; mode++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        static const char html[] = "<style>.one{color:red}.two{color:blue}</style>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        if (mode == 0) sheet.rules[1].order = sheet.rules[0].order;
+        if (mode == 1) sheet.next_order = UINT_MAX;
+        StylesheetAppendResult append = {0};
+        bool ok = stylesheet_append_sources_tracked(&sheet, append_no_style,
+            mode == 2 ? &sheet : NULL, sheet.style_source_count, &append);
+        CHECK(mode == 2 ? !ok : ok && append.appended_bounded_out
+              && append.remap == NULL);
+        stylesheet_append_result_release(&sheet, &append);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+static int retained_mixed_importance_append_case(const char *css, bool insert,
+                                                size_t fail_after,
+                                                bool *bounded_out)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    char html[1024];
+    int length = snprintf(html, sizeof(html),
+        "<style>%s</style><div class=card id=card>Card</div>", css);
+    CHECK(length > 0 && (size_t) length < sizeof(html));
+    CHECK(document_parse(&document, &budget, html, (size_t) length, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "card");
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(node != NULL && retained != NULL);
+    (void) style_retained_matches_attach(&sheet, retained);
+    ComputedStyle before = style_for_node(&sheet, node, NULL);
+    CHECK(before.out_of_flow && before.background_image_kind == STYLE_BACKGROUND_IMAGE_GRADIENT
+          && before.padding.left == 10 && before.z_index == 7);
+    StylesheetAppendResult append = {0};
+    if (fail_after != SIZE_MAX) budget_inject_failure_after(&budget, fail_after);
+    bool appended = stylesheet_append_sources_tracked(&sheet, append_unrelated_style,
+        NULL, insert ? 0 : sheet.style_source_count, &append);
+    budget_clear_failure_injection(&budget);
+    CHECK(appended || fail_after != SIZE_MAX);
+    if (appended && append.appended_bounded_out) {
+        if (bounded_out != NULL) *bounded_out = true;
+        style_retained_matches_clear(retained);
+    } else if (appended) {
+        CHECK(append.remap != NULL && append.appended_count == 2u);
+        CHECK(sheet.rules[append.appended[0]].important
+              != sheet.rules[append.appended[1]].important);
+        for (size_t i = 0; i < append.old_count; i++) {
+            for (size_t j = i + 1u; j < append.old_count; j++) {
+                CHECK(append.remap[i] != append.remap[j]);
+            }
+        }
+        style_retained_matches_remap(retained, append.remap, append.old_count);
+        style_retained_matches_invalidate_rules(retained, &sheet,
+            append.appended, append.appended_count);
+    }
+    ComputedStyle replay = appended ? style_for_node(&sheet, node, NULL) : before;
+    (void) style_retained_matches_attach(&sheet, NULL);
+    ComputedStyle exact = style_for_node(&sheet, node, NULL);
+    CHECK(!appended || (replay.out_of_flow == exact.out_of_flow
+          && replay.background_image_kind == exact.background_image_kind
+          && replay.padding.left == exact.padding.left
+          && replay.z_index == exact.z_index));
+    stylesheet_append_result_release(&sheet, &append);
+    style_retained_matches_destroy(retained);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_retained_mixed_importance_append(void)
+{
+    static const char *const css[] = {
+        ".card{position:absolute;background:linear-gradient(black,transparent);"
+        "padding:10px;z-index:7!important}",
+        ".card{position:relative;position:absolute;padding:1px;padding:10px;"
+        "background:linear-gradient(black,transparent);"
+        "z-index:2!important;z-index:7!important}",
+        "@layer cards{.card,.other{position:absolute;"
+        "background:linear-gradient(black,transparent);padding:10px;"
+        "z-index:7!important}}"
+    };
+    for (size_t i = 0; i < sizeof(css) / sizeof(css[0]); i++) {
+        CHECK(retained_mixed_importance_append_case(css[i], false, SIZE_MAX, NULL) == 0);
+        CHECK(retained_mixed_importance_append_case(css[i], true, SIZE_MAX, NULL) == 0);
+    }
+    bool bounded_out = false;
+    for (size_t fail_after = 0; fail_after < 64u; fail_after++)
+        CHECK(retained_mixed_importance_append_case(
+            css[0], false, fail_after, &bounded_out) == 0);
+    CHECK(bounded_out);
     return 0;
 }
 
@@ -2963,8 +3211,145 @@ static int test_large_sheet_compiles_every_rule(void)
 }
 
 
+/* A sparse key space and one cold dependency per rule must not reserve
+   empty bucket payloads or eight dependency hashes for every rule. */
+static int test_sparse_selector_metadata(void)
+{
+    enum { RULES = 4096, CAPACITY = RULES * 64 };
+    char *css = malloc(CAPACITY);
+    CHECK(css != NULL);
+    size_t used = 0;
+    for (unsigned i = 0; i < RULES; i++) {
+        int written = snprintf(css + used, CAPACITY - used,
+            ".parent-%u .subject-%u{color:#123456}", i, i);
+        CHECK(written > 0 && (size_t) written < CAPACITY - used);
+        used += (size_t) written;
+    }
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] =
+        "<div class=parent-4095><p id=target class=subject-4095>x</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && stylesheet_add_css(&sheet, css, used));
+    stylesheet_prepare_rule_index(&sheet);
+    CHECK(sheet.count == RULES && sheet.rule_index_ready
+          && sheet.rule_filters != NULL);
+    printf("sparse selector metadata: rules=%zu slots=%zu bytes=%zu\n",
+           sheet.count, sheet.rule_index_bucket_count, sheet.rule_index_bytes);
+    CHECK(sheet.rule_index_bytes < 270u * 1024u);
+    /* Includes collisions and both ends of each growth boundary. */
+    for (unsigned i = 0; i < RULES; i++) {
+        char key[32];
+        int length = snprintf(key, sizeof(key), "subject-%u", i);
+        StyleRuleIndexBucket *bucket = style_rule_find_bucket(
+            &sheet, SELECTOR_CLASS, key, (size_t) length, false, PSEUDO_NONE);
+        CHECK(bucket != NULL && bucket->count == 1 && bucket->unscoped == 1
+              && bucket->representative < sheet.count
+              && sheet.rule_index_entries[bucket->first]
+                 == bucket->representative);
+        length = snprintf(key, sizeof(key), "parent-%u", i);
+        uint32_t token = stylesheet_identity_token_hash(
+            false, key, (size_t) length), affected[2];
+        CHECK(stylesheet_rules_affected_by_tokens(
+            &sheet, &token, 1, affected, 2) == 1
+            && affected[0] == bucket->representative);
+    }
+    lxb_dom_node_t *target = find_id(
+        lxb_dom_interface_node(document.html), "target");
+    CHECK(target != NULL && style_for_node(&sheet, target, NULL).color == 0x123456);
+    /* An append discards and rebuilds both optional owners. */
+    static const char added[] = ".parent-4095 .subject-4095{color:#654321}";
+    CHECK(stylesheet_add_css(&sheet, added, sizeof(added) - 1u)
+          && style_for_node(&sheet, target, NULL).color == 0x654321);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    free(css);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_selector_metadata_refusal(void)
+{
+    enum { RULES = 300, CAPACITY = RULES * 64 };
+    char css[CAPACITY];
+    size_t used = 0;
+    for (unsigned i = 0; i < RULES; i++) {
+        int written = snprintf(css + used, CAPACITY - used,
+            ".ancestor-%u .item-%u{color:#123456}", i, i);
+        CHECK(written > 0 && (size_t) written < CAPACITY - used);
+        used += (size_t) written;
+    }
+    bool refused_index = false, partial_tokens = false, complete_tokens = false;
+    for (size_t allowance = 0; allowance < 40000u; allowance += 256u) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        static const char html[] =
+            "<div class=ancestor-299><p id=target class=item-299>x</p></div>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480)
+              && stylesheet_add_css(&sheet, css, used));
+        stylesheet_prepare_selector_program(&sheet);
+        size_t limit = budget.limit;
+        budget.limit = budget.current + allowance;
+        stylesheet_prepare_rule_index(&sheet);
+        if (!sheet.rule_index_ready) refused_index = true;
+        if (sheet.rule_filters != NULL) {
+            uint32_t token = stylesheet_identity_token_hash(
+                false, "ancestor-299", strlen("ancestor-299"));
+            uint32_t affected[RULES];
+            size_t count = stylesheet_rules_affected_by_tokens(
+                &sheet, &token, 1, affected, RULES);
+            CHECK(count >= 1 && count <= RULES);
+            const StyleRule *rule = find_rule(&sheet, ".ancestor-299 .item-299");
+            CHECK(rule != NULL);
+            bool found = false;
+            for (size_t i = 0; i < count; i++)
+                found = found || affected[i] == (uint32_t) (rule - sheet.rules);
+            CHECK(found);
+            if (count == 1) complete_tokens = true;
+            else partial_tokens = true;
+        }
+        size_t failures = budget.failure_count;
+        stylesheet_prepare_rule_index(&sheet);
+        CHECK(budget.failure_count == failures);
+        budget.limit = limit;
+        lxb_dom_node_t *target = find_id(
+            lxb_dom_interface_node(document.html), "target");
+        CHECK(target != NULL && style_for_node(&sheet, target, NULL).color == 0x123456);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    CHECK(refused_index && partial_tokens && complete_tokens);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    /* The selector offset and container query share one field. Exercise the
+       full admitted offset range so longer ordinary selectors cannot silently
+       wrap or overwrite a query id. */
+    for (uint16_t offset = 0; offset < STYLE_SELECTOR_TEXT_CAPACITY; offset++) {
+        for (uint8_t query = 0; query <= STYLE_CONTAINER_QUERY_LIMIT; query++) {
+            StyleRule rule = {.rightmost_compound_offset = offset};
+            style_rule_set_container_query(&rule, query);
+            CHECK(style_rule_rightmost_compound(&rule) == offset
+                  && style_rule_container_query(&rule) == query);
+        }
+    }
+    if (argc == 2 && strcmp(argv[1], "--computed-storage-only") == 0)
+        return test_computed_style_payload_storage();
+    if (argc == 2 && strcmp(argv[1], "--selector-metadata-only") == 0) {
+        CHECK(test_sparse_selector_metadata() == 0);
+        return test_selector_metadata_refusal();
+    }
     if (argc == 2 && strcmp(argv[1], "--retained-handoff-only") == 0)
         return test_retained_range_cache_handoff();
     if (argc == 2 && strcmp(argv[1], "--retained-nested-only") == 0)
@@ -2988,6 +3373,9 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--escaped-utilities-only") == 0)
         return test_escaped_utility_classes_indexed();
     CHECK(test_selector_attribute_names() == 0);
+    CHECK(test_computed_style_payload_storage() == 0);
+    CHECK(test_sparse_selector_metadata() == 0);
+    CHECK(test_selector_metadata_refusal() == 0);
     CHECK(benchmark_selector_attribute_names() == 0);
     CHECK(test_retained_cache_eligibility() == 0);
     CHECK(test_retained_dense_storage() == 0);
@@ -3002,6 +3390,8 @@ int main(int argc, char **argv)
     CHECK(test_functional_selector_keys() == 0);
     CHECK(test_deferred_font_basis() == 0);
     CHECK(test_retained_retirement_probe_holes() == 0);
+    CHECK(test_retained_mixed_importance_append() == 0);
+    CHECK(test_append_identity_fallback() == 0);
     CHECK(test_retained_nested_selector_invalidation() == 0);
     CHECK(test_quoted_pseudo_element_punctuation() == 0);
     CHECK(test_retained_focus_descendants() == 0);
@@ -3109,9 +3499,11 @@ int main(int argc, char **argv)
           && combinator_rule != NULL && adjacent_rule != NULL
           && sibling_rule != NULL && attribute_rule != NULL
           && functional_rule != NULL && hyphens_rule != NULL
-          && hyphens_rule->fast_key_offset != UINT8_MAX
+          && hyphens_rule->fast_key_suffix_bytes != UINT8_MAX
           && strcmp(hyphens_rule->selector
-                        + hyphens_rule->fast_key_offset,
+                        + hyphens_rule->selector_length
+                        - hyphens_rule->fast_key_suffix_bytes
+                        - hyphens_rule->fast_key_length,
                     "card") == 0
           && find_custom_rule(
                  &indexed, ".never:hover", "hyphens") == NULL
