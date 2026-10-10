@@ -167,6 +167,50 @@ static int test_parity_text_wrap_media_not(void)
     return 0;
 }
 
+static int test_balanced_text_ignores_collapsible_indentation(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        "a{display:inline-flex;font:700 16px sans-serif;line-height:1;"
+        "padding:8px 24px;border:1px solid;text-wrap:balance}"
+        ".pretty{text-wrap:pretty}.preserved{white-space:pre}"
+        "div{margin-bottom:4px}</style><body>"
+        "<div><a id=plain>See more examples</a></div>"
+        "<div><a id=indented>\n        See more examples\n      </a></div>"
+        "<div><a id=pretty class=pretty>\n     See   more\t examples\n</a></div>"
+        "<div><a id=preserved class=preserved>See\nmore examples</a></div>"
+        "</body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget,
+          TILEFINCH_TEST_METRIC_SANS_FONT, NULL, NULL,
+          TILEFINCH_TEST_METRIC_SANS_BOLD_FONT, NULL, NULL, NULL, 4 * MIB,
+          FONT_SET_FACE_SANS | FONT_SET_FACE_SANS_BOLD));
+    layout_destroy(&page.layout);
+    CHECK(layout_build(&page.layout, &page.budget, &page.document,
+          &page.sheet, &fonts, NULL, 480));
+    const LayoutNodeBox *plain = parity_box(&page, "plain");
+    const LayoutNodeBox *indented = parity_box(&page, "indented");
+    const LayoutNodeBox *pretty = parity_box(&page, "pretty");
+    const LayoutNodeBox *preserved = parity_box(&page, "preserved");
+    if (plain != NULL && indented != NULL
+        && (plain->width != indented->width
+            || plain->height != indented->height))
+        fprintf(stderr, "balanced indentation: plain=%dx%d indented=%dx%d\n",
+                plain->width, plain->height, indented->width, indented->height);
+    CHECK(plain != NULL && indented != NULL && pretty != NULL
+          && preserved != NULL
+          && plain->width == indented->width
+          && plain->height == indented->height
+          && plain->width == pretty->width
+          && plain->height == pretty->height
+          && preserved->height > plain->height);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 /* Guardian's front sections and masthead are named-line grids: lines carry
    up to four names (`[content-end title-end hide-end]`), templates run past
    190 characters, `grid-column: title` means title-start / title-end, and
@@ -701,8 +745,106 @@ static int test_parity_inherited_box_sizing(void)
     return 0;
 }
 
+static int test_link_defaults_and_generated_gradient(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;color:#008000}"
+        "#inherit{color:inherit}#explicit{color:#112233}"
+        "#stripe{position:relative;height:4px;width:300px}"
+        "#stripe::after{content:'';position:absolute;left:0;right:0;top:0;"
+        "height:4px;background:linear-gradient(to right,#ff0000 0%,"
+        "#ff0000 33.33%,#000000 33.33%,#000000 66.66%,#0000ff 66.66%)}"
+        "</style><body><div id=stripe></div>"
+        "<a href=''>DefaultLink</a><a>NoDestination</a>"
+        "<a id=inherit href='#'>InheritedLink</a>"
+        "<a id=explicit href='#'>ExplicitLink</a></body>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const DrawCommand *normal = text_command(&page.layout, "DefaultLink");
+    const DrawCommand *plain = text_command(&page.layout, "NoDestination");
+    const DrawCommand *inherited = text_command(&page.layout, "InheritedLink");
+    const DrawCommand *explicit = text_command(&page.layout, "ExplicitLink");
+    const DrawCommand *gradient = NULL;
+    for (size_t i = 0; i < page.layout.count; i++) {
+        const DrawCommand *command = &page.layout.commands[i];
+        if (command->type == DRAW_FILL_RECT
+            && draw_command_fill_gradient(command, NULL)) gradient = command;
+    }
+    bool links_ok = normal && plain && inherited && explicit
+        && normal->color == 0x0000ff && plain->color == 0x008000
+        && inherited->color == 0x008000 && explicit->color == 0x112233;
+    bool gradient_ok = gradient && gradient->x == 0 && gradient->y == 0
+        && gradient->width == 300 && gradient->height == 4
+        && page.layout.gradient_count == 1;
+    TileCache cache = {0};
+    uint16_t pixels[480u * 8u];
+    CHECK(tile_cache_init(&cache, &page.budget, &page.layout, 8));
+    CHECK(tile_cache_set_frame(&cache, pixels, 480u * 8u));
+    CHECK(tile_cache_render_frame(&cache, 0, 480, 8, NULL));
+    gradient_ok = gradient_ok
+        && pixels[480u + 50u] == test_rgb565(0xff0000)
+        && pixels[480u + 150u] == test_rgb565(0x000000)
+        && pixels[480u + 250u] == test_rgb565(0x0000ff);
+    tile_cache_destroy(&cache);
+    if (!links_ok || !gradient_ok)
+        fprintf(stderr, "link defaults=%d gradient=%d default=%06x gradients=%zu\n",
+                links_ok, gradient_ok, normal ? normal->color : 0u,
+                page.layout.gradient_count);
+    CHECK(parity_page_destroy(&page));
+    CHECK(links_ok && gradient_ok);
+    return 0;
+}
+
 static int test_site_parity(void)
 {
+    {
+        /* Empty flex items have zero automatic main size. They still count
+           for gaps; an intrinsic outer row must not give them a synthetic
+           text-width floor that shrinks and wraps the neighbouring label. */
+        ParityPage page;
+        CHECK(parity_page_load(&page,
+            "<!doctype html><style>body{margin:0;font:20px serif}"
+            ".outer{display:flex}.row{display:flex}.label{margin-right:8px}"
+            "#gap{gap:5px}#edges{padding:0 3px;border:1px solid}"
+            "#zero{width:0}#hidden{display:none}"
+            "</style><body>"
+            "<div class=outer><div><div class=row id=plain>"
+            "<span id=empty></span><a class=label id=label>"
+            "<span>Small label words</span></a></div></div></div>"
+            "<div class=outer><div><div class=row id=gap>"
+            "<span id=gapempty></span><a class=label id=gaplabel>"
+            "Small label words</a><span id=hidden>hidden label</span>"
+            "</div></div></div>"
+            "<div class=row id=fixed><span id=zero></span>"
+            "<span id=edges></span><span id=tail>Tail</span></div></body>"));
+        const LayoutNodeBox *empty = parity_box(&page, "empty");
+        const LayoutNodeBox *plain = parity_box(&page, "plain");
+        const LayoutNodeBox *label = parity_box(&page, "label");
+        const LayoutNodeBox *gapempty = parity_box(&page, "gapempty");
+        const LayoutNodeBox *gap = parity_box(&page, "gap");
+        const LayoutNodeBox *gaplabel = parity_box(&page, "gaplabel");
+        const LayoutNodeBox *zero = parity_box(&page, "zero");
+        const LayoutNodeBox *edges = parity_box(&page, "edges");
+        const LayoutNodeBox *tail = parity_box(&page, "tail");
+        bool ok = empty && plain && label && gapempty && gap && gaplabel
+            && zero && edges && tail && empty->width == 0
+            && label->x == plain->x && gapempty->width == 0
+            && gaplabel->x == gap->x + 5 && gap->width == plain->width + 5
+            && zero->width == 0 && edges->width == 8
+            && tail->x == edges->x + edges->width
+            && plain->height == gap->height && plain->height < 30;
+        if (!ok) fprintf(stderr,
+            "empty flex: empty=%d label-x=%d plain=%d/%d gapempty=%d "
+            "gaplabel-x=%d gap=%d/%d zero=%d edges=%d tail-x=%d\n",
+            empty ? empty->width : -1, label ? label->x : -1,
+            plain ? plain->width : -1, plain ? plain->height : -1,
+            gapempty ? gapempty->width : -1, gaplabel ? gaplabel->x : -1,
+            gap ? gap->width : -1, gap ? gap->height : -1,
+            zero ? zero->width : -1, edges ? edges->width : -1,
+            tail ? tail->x : -1);
+        CHECK(ok);
+        CHECK(parity_page_destroy(&page));
+    }
     CHECK(test_parity_inherited_box_sizing() == 0);
     {
         /* Large functional lists retain their actual text, not a fixed-size
@@ -838,6 +980,7 @@ static int test_site_parity(void)
     CHECK(test_parity_positioned_pseudo_containing_block() == 0);
     puts("test: text-wrap nowrap, media not, hidden pseudos");
     CHECK(test_parity_text_wrap_media_not() == 0);
+    CHECK(test_balanced_text_ignores_collapsible_indentation() == 0);
     puts("test: named grid lines, long templates, spanning alignment");
     CHECK(test_parity_named_grid_lines() == 0);
     puts("test: flex/grid percentage bases, unset caps, shadow strips");
@@ -861,5 +1004,6 @@ static int test_site_parity(void)
     CHECK(test_parity_inline_block_child_margins() == 0);
     puts("test: positioned empty pseudos retain margins at their static position");
     CHECK(test_parity_positioned_pseudo_static_margins() == 0);
+    CHECK(test_link_defaults_and_generated_gradient() == 0);
     return 0;
 }

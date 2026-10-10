@@ -1707,6 +1707,62 @@
        formatting context root also starts with none of the enclosing
        context's floats (CSS 2.1 9.4.1). */
     puts("test: cleared floats do not evict later float exclusions");
+    static const char rows_page[] =
+        "<!doctype html><style>body{margin:0;padding:0}"
+        ".row{float:left;position:relative;width:33%;height:64px;"
+        "margin-bottom:16px;box-sizing:border-box;padding:0 16px}"
+        "</style><body><div class=row id=r1></div><div class=row id=r2></div>"
+        "<div class=row id=r3></div><div class=row id=r4></div><div class=row id=r5></div>"
+        "<div class=row id=r6></div><div class=row id=r7></div><div class=row id=r8></div>"
+        "<div class=row id=r9></div><div class=row id=r10></div></body>";
+    PocDocument rows_document;
+    Stylesheet rows_sheet;
+    LayoutDocument rows_layout;
+    CHECK(document_parse(&rows_document, &budget, rows_page,
+                         strlen(rows_page), strlen(rows_page))
+          && stylesheet_build(&rows_sheet, &budget, &rows_document, 480)
+          && layout_build(&rows_layout, &budget, &rows_document,
+                          &rows_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *rows_root = lxb_dom_interface_node(rows_document.html);
+    for (int i = 0; i < 10; i++) {
+        char id[8];
+        snprintf(id, sizeof(id), "r%d", i + 1);
+        const LayoutNodeBox *box = layout_box_for_node(
+            &rows_layout, find_id(rows_root, id));
+        CHECK(box != NULL && box->y == (i / 3) * 80);
+    }
+    layout_destroy(&rows_layout);
+    stylesheet_destroy(&rows_sheet);
+    document_destroy(&rows_document);
+    CHECK(budget.current == 0);
+    static const char trailing_float_page[] =
+        "<!doctype html><style>body{margin:0;padding:0;width:100px}"
+        "#input{display:inline-block;width:100px;height:40px;margin-right:-30px;vertical-align:top}"
+        "#submit{float:right;width:30px;height:40px;position:relative;right:-30px}"
+        "#after{clear:both;height:10px}</style><body>"
+        "<div id=input></div><div id=submit></div><div id=after></div></body>";
+    PocDocument trailing_document;
+    Stylesheet trailing_sheet;
+    LayoutDocument trailing_layout;
+    CHECK(document_parse(&trailing_document, &budget, trailing_float_page,
+                         strlen(trailing_float_page), strlen(trailing_float_page))
+          && stylesheet_build(&trailing_sheet, &budget, &trailing_document, 480)
+          && layout_build(&trailing_layout, &budget, &trailing_document,
+                          &trailing_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *trailing_root = lxb_dom_interface_node(trailing_document.html);
+    const LayoutNodeBox *trailing_input = layout_box_for_node(
+        &trailing_layout, find_id(trailing_root, "input"));
+    const LayoutNodeBox *trailing_submit = layout_box_for_node(
+        &trailing_layout, find_id(trailing_root, "submit"));
+    const LayoutNodeBox *trailing_after = layout_box_for_node(
+        &trailing_layout, find_id(trailing_root, "after"));
+    CHECK(trailing_input != NULL && trailing_submit != NULL && trailing_after != NULL);
+    CHECK(trailing_submit->y == trailing_input->y && trailing_submit->x == 100
+          && trailing_after->y >= 40);
+    layout_destroy(&trailing_layout);
+    stylesheet_destroy(&trailing_sheet);
+    document_destroy(&trailing_document);
+    CHECK(budget.current == 0);
     static const char slots_page[] =
         "<!doctype html><style>body{margin:0;padding:0}"
         ".s{float:left;width:10px;height:10px}"

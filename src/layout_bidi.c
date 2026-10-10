@@ -554,6 +554,42 @@ void layout_bidi_flow_destroy(LayoutBidiFlow *flow)
     budget_free(flow->budget, flow);
 }
 
+void layout_bidi_insert_commands(LayoutContext *context, size_t index,
+                                 size_t count)
+{
+    LayoutDocument *layout = context->layout;
+    /* Decoration insertion moves both resolved glyph maps and the command
+       references of containing paragraphs whose line has not flushed yet.
+       Admission in layout_insert_commands bounds every adjusted index. */
+    for (size_t i = 0; i < layout->bidi_command_count; i++) {
+        LayoutBidiCommand *command = &layout->bidi_commands[i];
+        if (command->command_index >= index) command->command_index += count;
+    }
+    if (!context->document_bidi_text_present
+        && !context->document_bidi_markup_present
+        && (context->sheet == NULL || !context->sheet->has_bidi_declarations))
+        return;
+    for (size_t page = 0; page < LAYOUT_BLOCK_SCRATCH_PAGE_COUNT; page++) {
+        LayoutBlockScratch *scratch = context->block_scratch_pages[page];
+        if (scratch == NULL) continue;
+        for (size_t slot = 0; slot < LAYOUT_BLOCK_SCRATCH_PAGE_DEPTH; slot++) {
+            LayoutBidiFlow *flow = scratch[slot].bidi_flow;
+            if (flow == NULL) continue;
+            for (size_t i = 0; i < flow->command_count; i++) {
+                LayoutBidiFlowCommand *command = &flow->commands[i];
+                if (command->command_index >= index)
+                    command->command_index += count;
+            }
+            for (size_t i = 0; i < flow->atomic_count; i++) {
+                LayoutBidiAtomic *atomic = &flow->atomics[i];
+                if (!atomic->laid_out) continue;
+                if (index <= atomic->command_start) atomic->command_start += count;
+                if (index < atomic->command_end) atomic->command_end += count;
+            }
+        }
+    }
+}
+
 static size_t bidi_unit_at_byte(const LayoutBidiFlow *flow, size_t byte)
 {
     const TextBidiUnit *units = text_bidi_paragraph_units(flow->paragraph);

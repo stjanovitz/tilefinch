@@ -2749,7 +2749,7 @@ static bool test_inline_svg_resource(Budget *budget)
         "#icon{color:#ff0000}#fallback-icon{color:#0000ff;"
         "fill:var(--missing,currentColor)}"
         ".app-bar{display:flex;position:fixed;bottom:0;color:#fff;"
-        "background:#333}.app-icon{width:24px;height:24px;"
+        "background:#333}.app-bar a{color:inherit}.app-icon{width:24px;height:24px;"
         "fill:var(--icon-fill,currentColor)}</style><body>"
         "<svg id=icon width=16 height=16 viewBox='0 0 16 16' "
         "color='#ff0000' xmlns='http://www.w3.org/2000/svg'>"

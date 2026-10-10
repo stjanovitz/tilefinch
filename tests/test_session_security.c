@@ -280,7 +280,7 @@ static int test_redacted_cookie_seed(Budget *budget)
 static int test_module_cache_record_from_fetch(void)
 {
     Budget budget;
-    budget_init(&budget, 256u * 1024u);
+    budget_init(&budget, 512u * 1024u);
     BrowserSession session;
     CHECK(browser_session_init(&session, &budget, 16u * 1024u));
     static char source[] = "export const value = 1;";
@@ -324,7 +324,7 @@ static int test_module_cache_record_from_fetch(void)
 static int test_module_cache_provenance(void)
 {
     Budget budget;
-    budget_init(&budget, 256u * 1024u);
+    budget_init(&budget, 512u * 1024u);
     BrowserSession session;
     CHECK(browser_session_init(&session, &budget, 16u * 1024u));
     static const unsigned char source[] = "export const value = 1;";
@@ -480,7 +480,7 @@ static int test_module_cache_provenance(void)
 static int test_response_cache_provenance(void)
 {
     Budget budget;
-    budget_init(&budget, 256u * 1024u);
+    budget_init(&budget, 512u * 1024u);
     BrowserSession session;
     CHECK(browser_session_init(&session, &budget, 16u * 1024u));
     static const unsigned char body[] = "stylesheet-body";
@@ -1759,11 +1759,94 @@ static int test_bounded_origin_private_file_system(Budget *budget)
     return 0;
 }
 
+static int test_cookie_service_handoff_retention(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    char header[1024];
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    /* A service handoff can set several related credentials before its
+       final redirect. Later preferences must not evict the first one. */
+    for (unsigned i = 0; i < 26u; ++i) {
+        char cookie[96];
+        snprintf(cookie, sizeof(cookie),
+                 "handoff%u=value; Secure; HttpOnly; Domain=service.test; Path=/", i);
+        CHECK(browser_session_cookie_set_http(&session, "https://auth.service.test/", cookie));
+    }
+    for (unsigned i = 0; i < 20u; ++i) {
+        char cookie[96];
+        snprintf(cookie, sizeof(cookie),
+                 "peer%u=value; Secure; HttpOnly; Domain=peer.test; Path=/", i);
+        CHECK(browser_session_cookie_set_http(&session, "https://auth.peer.test/", cookie));
+    }
+    TilefinchRequestContext context = {
+        .target_url = "https://service.test/complete",
+        .top_level_url = "https://service.test/complete", .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true
+    };
+    BrowserCookieOverlay *overlay = browser_session_cookie_overlay_create(budget, &session);
+    CHECK(overlay != NULL && browser_cookie_overlay_header_context(
+              overlay, &context, header, sizeof(header)));
+    for (unsigned i = 0; i < 26u; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handoff%u", i);
+        CHECK(contains_cookie(header, name));
+    }
+    browser_cookie_overlay_destroy(overlay);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+static int test_cookie_admission_diagnostics(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    BrowserCookieDiagnostics diagnostics;
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(!diagnostics.enabled && diagnostics.http_attempts == 0);
+    browser_session_cookie_diagnostics(&session, true, NULL);
+    for (unsigned i = 0; i < BROWSER_COOKIE_PER_DOMAIN_LIMIT + 2u; ++i) {
+        char cookie[80];
+        snprintf(cookie, sizeof(cookie), "cookie%u=value; Secure; HttpOnly; Path=/", i);
+        CHECK(browser_session_cookie_set_http(&session, "https://cookie.test/", cookie));
+    }
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.http_attempts == BROWSER_COOKIE_PER_DOMAIN_LIMIT + 2u
+          && diagnostics.evictions == 2u && diagnostics.refused == 0
+          && diagnostics.peak_value_bytes > 0);
+    session.maximum_cookie_bytes = 1;
+    CHECK(!browser_session_cookie_set_http(&session, "https://other.test/",
+                                          "large=value; Secure; Path=/"));
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.byte_refusals == 1u && diagnostics.refused == 1u);
+    session.maximum_cookie_bytes = 4096;
+    size_t limit = budget->limit;
+    budget->limit = budget->current;
+    CHECK(!browser_session_cookie_set_http(&session, "https://other.test/",
+                                          "new=value; Secure; Path=/"));
+    budget->limit = limit;
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.allocation_refusals == 1u && diagnostics.refused == 2u);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    browser_session_cookie_diagnostics(NULL, false, &diagnostics);
+    CHECK(!diagnostics.enabled && diagnostics.http_attempts == 0);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget;
-    budget_init(&budget, 512u * 1024u);
+    /* This test deliberately keeps two independent session tables alive. */
+    budget_init(&budget, 1024u * 1024u);
     size_t empty_budget = budget.current;
+    CHECK(test_cookie_admission_diagnostics(&budget) == 0);
+    CHECK(test_cookie_service_handoff_retention(&budget) == 0);
     TilefinchRequestContext opaque_context = {
         .target_url = "https://opaque.test/api",
         .initiator_url = "https://opaque.test/frame",
@@ -1798,7 +1881,7 @@ int main(void)
     CHECK(test_websocket_policy_and_close_payload(&budget) == 0);
     BrowserSession expiry_session;
     char expiry_cookie[160];
-    char expiry_header[128];
+    char expiry_header[1024];
     CHECK(browser_session_init(
         &expiry_session, &budget, 32u * 1024u)
           && expiry_session.accounting_bytes
@@ -1953,7 +2036,8 @@ int main(void)
        enough for the fixed cookie table and cloned values, yet too small for
        the historical full-session overlay. */
     Budget redirect_budget;
-    budget_init(&redirect_budget, 48u * 1024u);
+    budget_init(&redirect_budget,
+        sizeof(BrowserCookieEntry) * BROWSER_COOKIE_ENTRIES + 8u * 1024u);
     BrowserCookieOverlay *redirect_overlay =
         browser_session_cookie_overlay_create(
             &redirect_budget, &overlay_session);

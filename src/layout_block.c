@@ -584,7 +584,13 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         outer_width = 8;
     }
 
-    if (layout_node_name_is(node, "hr")) {
+    if (layout_node_name_is(node, "hr") && !style->has_height
+        && style->border.top == 0 && style->border.right == 0
+        && style->border.bottom == 0 && style->border.left == 0
+        && !style->has_background) {
+        /* Keep the historical unstyled separator, but authored rules use
+           the ordinary box/decorations path: a height:0 border is not a
+           fixed two-pixel line in the inherited text color. */
         DrawCommand rule = {.type = DRAW_FILL_RECT, .x = outer_x,
                             .y = outer_y + 3, .width = outer_width,
                             .height = 2, .color = style->color, .scale = 1,

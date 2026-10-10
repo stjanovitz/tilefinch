@@ -7936,6 +7936,8 @@ int main(void) {
         heavy = actions[
             actions.index("static void psp_app_dispatch_heavy_action("):
             actions.index("case PSP_UI_ACTION_TOGGLE_BOOKMARK:")]
+        # Ignore the forward declaration and other helpers' action switches.
+        heavy = heavy[heavy.rindex("static void psp_app_dispatch_heavy_action("):]
         remap = heavy.index("psp_app_resolve_home_tab_action(")
         switch = heavy.index("switch (intent->action)")
         tab_case = heavy.index("case PSP_UI_ACTION_SWITCH_TAB:")
@@ -7962,6 +7964,37 @@ int main(void) {
         self.assertIn("return;", focus[complete:present])
         self.assertIn("PSP_RENDER_JOB_BUDGET_US, 4u", focus)
         self.assertNotIn("browser_engine_render_frame(", focus)
+
+    def test_focus_dispatch_is_supervised_before_author_work(self):
+        actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text(encoding="utf-8"))
+        begin = actions.index("static void psp_app_dispatch_focus_action(")
+        focus = actions[begin:actions.index("typedef struct", begin)]
+        self.assertLess(focus.index("psp_runtime_cooperate_begin("),
+                        focus.index("switch (intent->action)"))
+        self.assertLess(focus.index("psp_runtime_cooperate_serve_page_scroll(engine)"),
+                        focus.index("browser_engine_focus_move("))
+        self.assertLess(focus.index("psp_runtime_cooperate_end("),
+                        focus.index("psp_app_finish_focus_action("))
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
+        start = runtime.index('strcmp(phase, "page-focus-feedback")')
+        feedback = runtime[start:runtime.index('strcmp(phase, "page-scroll-servable")', start)]
+        self.assertIn("browser_engine_frontend_snapshot(engine, &snapshot)", feedback)
+        self.assertNotIn("browser_engine_navigation_view", feedback)
+        self.assertIn("browser_engine_focus_indicator_rect(", feedback)
+        self.assertIn("psp_ui_set_focus(shown_ui, true", feedback)
+        self.assertIn("psp_ui_set_focus(ui, true", feedback)
+        self.assertIn("__sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u)", feedback)
+        self.assertIn("shown_ui = &cooperate->supervisor_ui", feedback)
+        self.assertIn("shown_ui->screen == PSP_UI_SCREEN_PAGE", feedback)
+        self.assertIn("!shown_ui->cursor_visible", feedback)
+        self.assertIn("psp_present_internal(psp_supervisor_page_frame(cooperate)", feedback)
+        self.assertLess(feedback.index("__sync_bool_compare_and_swap("),
+                        feedback.index("browser_engine_frontend_snapshot("))
+        self.assertLess(feedback.index("psp_present_internal("),
+                        feedback.index("cooperate->presenting = 0"))
+        self.assertNotIn("browser_engine_render_frame", feedback)
+        self.assertLess(runtime.index("sceKernelGetThreadId() != atomic_load_explicit(",
+                                      runtime.index("bool psp_platform_cooperate(")), start)
 
     def test_focus_probe_waits_for_new_frame_and_successful_publication(self):
         header = (ROOT / "src/psp_app/psp_app_internal.h").read_text(encoding="utf-8")
@@ -8000,6 +8033,7 @@ int main(void) {
         heavy = actions[
             actions.index("static void psp_app_dispatch_heavy_action("):
             actions.index("case PSP_UI_ACTION_TOGGLE_BOOKMARK:")]
+        heavy = heavy[heavy.rindex("static void psp_app_dispatch_heavy_action("):]
         remap = heavy.index("psp_app_resolve_recovery_return_action(")
         switch = heavy.index("switch (intent->action)")
         back = heavy.index("case PSP_UI_ACTION_BACK:")

@@ -637,6 +637,15 @@ static bool navigation_stream_flush_cssom_layout(void *opaque)
         }
     }
 
+    script_runtime_set_stylesheet(
+        stream->runtime, &stream->blocking_stylesheet);
+    /* A parser-blocking head script can read computed style or geometry
+       before the parser creates a body. There is no body layout to build
+       yet, not a refused allocation or exhausted work bound. Publish the
+       current cascade and retain the geometry fallback; a later read after
+       body insertion still takes the authoritative layout path below. */
+    if (document_body_node(document) == NULL) return true;
+
     LayoutDocument fresh = {0};
     if (!layout_build_context(
             &fresh, session->budget, document,

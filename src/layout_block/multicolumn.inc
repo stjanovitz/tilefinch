@@ -215,6 +215,26 @@ static MulticolumnLayout multicolumn_prepare(
     return result;
 }
 
+/* A balanced height must fit whole, non-fragmented items, not merely their
+   average height. Keep the feasibility passes on cached integer heights so
+   balancing does not repeatedly resolve styles or walk the DOM. */
+static bool multicolumn_items_fit(const int *heights, size_t count,
+                                  unsigned columns, int target)
+{
+    unsigned used_columns = 1;
+    int used = 0;
+    for (size_t i = 0; i < count; i++) {
+        int height = heights[i];
+        if (height > target) return false;
+        if (used > target - height) {
+            if (++used_columns > columns) return false;
+            used = 0;
+        }
+        used += height;
+    }
+    return true;
+}
+
 static bool multicolumn_redistribute(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, const MulticolumnLayout *multi,
@@ -222,6 +242,11 @@ static bool multicolumn_redistribute(
 {
     if (multi == NULL || !multi->active || flow_bottom == NULL) return true;
     int total = 0;
+    int largest = 0;
+    size_t height_count = 0;
+    int *heights = definite_height <= 0
+        ? budget_malloc(context->layout->budget,
+                        multi->item_count * sizeof(*heights)) : NULL;
     FlexItemIterator iterator;
     FlatItem item;
     flex_iterator_init(&iterator, context, node, style, NULL);
@@ -236,10 +261,28 @@ static bool multicolumn_redistribute(
                     + item.style.margin.bottom;
         if (outer < 0) outer = 0;
         total = layout_add_coordinate(total, outer);
+        if (outer > largest) largest = outer;
+        if (heights != NULL && height_count < multi->item_count)
+            heights[height_count++] = outer;
     }
     int target = definite_height > 0 ? definite_height
-        : (total + multi->count - 1) / multi->count;
+        : (int) (((int64_t) total + multi->count - 1) / multi->count);
     if (target < 1) target = 1;
+    if (heights != NULL && height_count != 0) {
+        int low = target > largest ? target : largest;
+        int high = total > low ? total : low;
+        /* At most 31 passes for the signed coordinate range, each bounded
+           by LAYOUT_MULTICOLUMN_ITEM_LIMIT. An optional allocation refusal
+           retains the prior conservative average-height placement. */
+        while (low < high) {
+            int middle = low + (high - low) / 2;
+            if (multicolumn_items_fit(heights, height_count,
+                                      multi->count, middle)) high = middle;
+            else low = middle + 1;
+        }
+        target = low;
+    }
+    budget_free(context->layout->budget, heights);
 
     size_t item_index = 0;
     unsigned column = 0;
@@ -259,7 +302,7 @@ static bool multicolumn_redistribute(
         size_t remaining_items = multi->item_count - item_index;
         unsigned remaining_columns = multi->count - column - 1u;
         if (column + 1u < multi->count && used != 0
-            && (used + outer > target
+            && (outer > target || used > target - outer
                 || remaining_items <= remaining_columns)) {
             if (used > maximum) maximum = used;
             column++;

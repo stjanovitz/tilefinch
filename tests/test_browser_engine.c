@@ -7,6 +7,7 @@
 #include "tilefinch/site_identity.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_lite.h"
+#include "tilefinch/youtube_resolver.h"
 #include "tilefinch/psp_ui.h"
 
 #include <stdio.h>
@@ -317,10 +318,14 @@ static bool backing_node_write(
 #include "suites/browser_engine_lifecycle.inc"
 #include "suites/browser_engine_navigation.inc"
 #include "suites/browser_engine_adapters.inc"
+#include "suites/youtube_login_journey.inc"
 #include "suites/browser_engine_teardown.inc"
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--youtube-login-journey") == 0)
+        return test_youtube_login_journey() || test_youtube_personalized_home()
+            || test_youtube_rating_status_confirmation() || test_youtube_like_action();
     if ((argc == 4 || argc == 5)
         && (strcmp(argv[1], "--native-navigation-replay") == 0
             || strcmp(argv[1], "--native-navigation-strict-replay") == 0)) {
@@ -366,6 +371,12 @@ int main(int argc, char **argv)
             || test_optional_bold_faces_follow_page_families();
     if (argc == 2 && strcmp(argv[1], "--native-text-sync-only") == 0)
         return test_native_text_sync_does_not_relayout_twice();
+    if (argc == 2 && strcmp(argv[1], "--youtube-home-only") == 0)
+        return test_youtube_home_topics_are_lazy()
+            || test_youtube_personalized_home();
+    if (argc == 2 && strcmp(argv[1], "--youtube-account-actions-only") == 0)
+        return test_youtube_resume_metadata() || test_youtube_recent_history()
+            || test_youtube_rating_status_confirmation() || test_youtube_like_action();
     if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
         return test_computed_paint_style_does_not_force_layout();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
@@ -483,6 +494,11 @@ int main(int argc, char **argv)
     CHECK(test_youtube_lite_escaped_title_is_valid_utf8() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_home_topics_are_lazy() == 0);
+    CHECK(test_youtube_personalized_home() == 0);
+    CHECK(test_youtube_resume_metadata() == 0);
+    CHECK(test_youtube_recent_history() == 0);
+    CHECK(test_youtube_rating_status_confirmation() == 0);
+    CHECK(test_youtube_like_action() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);
     CHECK(test_google_search_identity() == 0);

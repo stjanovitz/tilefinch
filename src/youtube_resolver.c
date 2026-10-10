@@ -1736,6 +1736,34 @@ bool youtube_watch_url_supported(const char *url)
     return true;
 }
 
+uint64_t youtube_watch_url_start_time_us(const char *source)
+{
+    char id[YOUTUBE_VIDEO_ID_CAPACITY];
+    TilefinchUrl url;
+    if (!youtube_watch_url_video_id(source, id)
+        || !tilefinch_url_parse(source, &url) || !url.has_query) return 0;
+    const char *at = url.value + url.query_offset;
+    const char *end = at + url.query_length;
+    for (unsigned fields = 0; at < end && fields < 128u; fields++) {
+        const char *next = memchr(at, '&', (size_t) (end - at));
+        if (next == NULL) next = end;
+        const char *value = NULL;
+        if (next - at > 2 && memcmp(at, "t=", 2) == 0) value = at + 2;
+        else if (next - at > 6 && memcmp(at, "start=", 6) == 0) value = at + 6;
+        if (value != NULL) {
+            uint64_t seconds = 0;
+            if (next - value > 6) return 0;
+            for (; value < next; value++) {
+                if (*value < '0' || *value > '9') return 0;
+                seconds = seconds * 10u + (unsigned) (*value - '0');
+            }
+            return seconds <= 604800u ? seconds * UINT64_C(1000000) : 0;
+        }
+        at = next < end ? next + 1 : end;
+    }
+    return 0;
+}
+
 static bool youtube_watch_string(const char *html, size_t length,
                                  const char *key, char *output,
                                  size_t output_size)

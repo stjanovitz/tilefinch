@@ -10,6 +10,7 @@
 #include <stdlib.h>
 
 #include <lexbor/dom/interfaces/attr.h>
+#include <lexbor/dom/interfaces/document.h>
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/tag/const.h>
 
@@ -62,6 +63,28 @@ void style_match_subject_prepare(lxb_dom_node_t *node,
         subject->classes = (const char *) lxb_dom_attr_value(
             classes, &subject->classes_length);
     }
+}
+
+/* HTML type selectors use ASCII-insensitive names; foreign-content and XML
+   names remain exact. Keep the common lowercase spelling on the byte path,
+   and apply the same rule to prepared query keys and the full matcher. */
+static bool style_subject_tag_matches(const StyleMatchSubject *subject,
+                                      const char *wanted, size_t length)
+{
+    if (subject->tag == NULL || subject->tag_length != length) return false;
+    if (memcmp(subject->tag, wanted, length) == 0) return true;
+    const lxb_dom_node_t *node = subject->node;
+    if (node == NULL || node->ns != LXB_NS_HTML || node->owner_document == NULL
+        || node->owner_document->type != LXB_DOM_DOCUMENT_DTYPE_HTML)
+        return false;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char actual = (unsigned char) subject->tag[i];
+        unsigned char expected = (unsigned char) wanted[i];
+        if (actual >= 'A' && actual <= 'Z') actual += 'a' - 'A';
+        if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
+        if (actual != expected) return false;
+    }
+    return true;
 }
 
 bool style_tag_is(lxb_dom_node_t *node, const char *wanted)
@@ -989,9 +1012,8 @@ static bool selector_list_matches_node(
                     keyed = style_subject_has_class(
                         sheet, &subject, key, option->key_length);
                 } else {
-                    keyed = subject.tag != NULL
-                        && subject.tag_length == option->key_length
-                        && memcmp(subject.tag, key, option->key_length) == 0;
+                    keyed = style_subject_tag_matches(
+                        &subject, key, option->key_length);
                 }
                 if (!keyed) continue;
             }
@@ -1526,9 +1548,7 @@ static bool compound_matches_depth(
         const char *wanted = style_identifier_span(text + at, end - at,
             scratch, sizeof(scratch), &wanted_length);
         if (wanted == NULL
-            || subject->tag == NULL
-            || subject->tag_length != wanted_length
-            || memcmp(subject->tag, wanted, wanted_length) != 0) {
+            || !style_subject_tag_matches(subject, wanted, wanted_length)) {
             return false;
         }
         at = end;
@@ -1925,9 +1945,7 @@ static bool style_selector_program_matches_uncached(
         const char *wanted = rule->selector + op->text_offset;
         size_t wanted_length = op->text_length;
         if (op->opcode == STYLE_SELECTOR_TAG) {
-            if (subject->tag == NULL
-                || subject->tag_length != wanted_length
-                || memcmp(subject->tag, wanted, wanted_length) != 0) {
+            if (!style_subject_tag_matches(subject, wanted, wanted_length)) {
                 return false;
             }
             continue;
@@ -2407,9 +2425,8 @@ bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
                         subject.classes, subject.classes_length,
                         item->key, item->key_length);
             } else {
-                keyed = subject.tag != NULL
-                    && subject.tag_length == item->key_length
-                    && memcmp(subject.tag, item->key, item->key_length) == 0;
+                keyed = style_subject_tag_matches(
+                    &subject, item->key, item->key_length);
             }
             if (!keyed) continue;
             if (item->complete_key) return true;

@@ -110,6 +110,14 @@ the registry test verifies those paths without fragile source line numbers.
 
 These run one behavior in isolation; they do not replace the complete suite.
 
+- `build-preset-release/tilefinch-browser-engine-tests --youtube-account-actions-only`
+  checks provider-supplied watched progress, exact resume links and deduplicated
+  recent-history cards (including optional failure), plus
+  explicit Like/Unlike confirmation, refusal, cancellation and control provenance
+  using synthetic responses. It does not mutate a live account.
+- `build-preset-release/tilefinch-navigation-load-tests --replacement-pressure-only`
+  checks bounded replacement-layout recovery, cancellation after release,
+  retained scrolling and deferred author viewport reflection.
 - `build-preset-release/tilefinch-browser-engine-tests --native-text-sync-only`
   checks native text synchronization without duplicate relayout.
 - `build-preset-release/tilefinch-browser-engine-tests --computed-style-layout-only`
@@ -194,6 +202,9 @@ These run one behavior in isolation; they do not replace the complete suite.
 - `tilefinch-js-responsiveness-tests --css-name-only` checks canonical CSS
   property-name fast paths, coercion, custom-property case and camel-case
   fallback, including resistance to author changes to RegExp.prototype.exec;
+- `tilefinch-js-responsiveness-tests --html-tag-case-only` checks
+  case-insensitive HTML tag queries and compound selectors while retaining
+  case-sensitive SVG names and class tokens;
 - `tilefinch-js-responsiveness-tests --finalizers-only` queues 330 cyclic
   finalization records alongside an eight-reaction promise chain. The chain
   must finish in one 64-job checkpoint without running cleanup callbacks.
@@ -226,6 +237,12 @@ Layout likewise keeps its four-node quota for cheap work but cooperates at
 the next node boundary after eight milliseconds. A single node can still
 overrun that interval; this is a safe-point rule, not a hard frame deadline.
 Do not infer physical-PSP responsiveness from host elapsed times alone.
+
+The interactive host lab accepts `--stylesheet-count N` for diagnostic
+captures, bounded to 1 through 32. Omitting it preserves the selected profile's
+defaults (24 sheets in the ordinary 24 MiB profile). This changes only the
+count allowance, not byte, file, time, or Budget admission. A higher-count host
+capture is not evidence that the page fits the production PSP profile.
 
 ## CMake presets
 
@@ -578,6 +595,16 @@ continuation admission after the script has consumed its initial reserve.
 host builds. `tilefinch-browser-engine-tests --provider-navigation-only`
 runs the provider navigation/cancellation regressions in isolation, including
 under sanitizers; it does not replace the full suite.
+
+`tilefinch-browser-engine-tests --youtube-login-journey` covers synthetic
+Google form entry, cancellation, synchronous and asynchronous redirects into
+the native YouTube provider, and verified-login notifications across refreshes
+and account changes. The CTest journey also runs recommendation, subscription,
+Like/Unlike confirmation and sign-out checks. `tilefinch-youtube-login-tests`
+checks consent choices, bounded cookie persistence, corruption and allocation
+refusal rollback, removal, and host symlink safety. These fixtures contain no
+real credentials or authenticated captures. No full YouTube HTML or script is
+executed, including when a sign-in response redirects there.
 
 That lane also reports `watch-reuse` cold/warm Description and Comments loads,
 request/body-byte counts, build steps and peak extra Budget ownership. It uses
@@ -958,6 +985,17 @@ finishes in later render slices. It requires a newer completed engine frame,
 the same navigation generation, and a successful display publication. A
 superseded input is reported as incomplete, not a zero-latency sample. A later marked screenshot
 includes intervening runtime and frame scheduling and is not that latency.
+
+Focus dispatch also exposes a `page-focus-feedback` presentation checkpoint
+before author focus handlers can mutate the document. The PSP can show an
+onscreen target's native ring over the incumbent framebuffer there; offscreen
+targets still use the ordinary reveal and bounded raster path. This is early
+visual acknowledgement, not completed author styling. Focus actions use the
+same owner-thread supervision as activation so cursor, Triangle, and Select
+remain serviced at subsequent safe points. The host
+`tilefinch-browser-engine-tests --background-interruption-only` checks that
+feedback precedes the handler, the handler runs once, and native menus remain
+usable. It also covers optional image-relayout refusal and shell retirement.
 
 `youtube-results-focus-live`, with a normal provider results URL, sends five
 Down presses starting at the first committed paint, before thumbnails finish.

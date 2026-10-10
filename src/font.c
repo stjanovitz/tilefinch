@@ -2141,9 +2141,12 @@ int font_kerning_fixed(const FontFace *face, unsigned left, unsigned right,
         face, left, right, integer_pixel_height_to_fixed(pixel_height));
 }
 
-bool font_glyph_load_at_size(const FontFace *face, unsigned codepoint,
-                             int pixel_height_fixed, bool bold,
-                             FontGlyph *glyph)
+#include "humanist_ink_bounds.inc"
+
+bool font_glyph_load_at_size_profile(const FontFace *face, unsigned codepoint,
+                                    int pixel_height_fixed, bool bold,
+                                    unsigned humanist_profile,
+                                    FontGlyph *glyph)
 {
     if (glyph == NULL) return false;
     memset(glyph, 0, sizeof(*glyph));
@@ -2274,7 +2277,7 @@ bool font_glyph_load_at_size(const FontFace *face, unsigned codepoint,
         return true;
     }
 #endif
-    if (info == NULL) return false;
+    if (info == NULL || face->budget == NULL) return false;
     bool provider_pending = false;
     if (optional_fallback_glyph(
             face, codepoint, pixel_height_fixed, bold, glyph,
@@ -2286,19 +2289,69 @@ bool font_glyph_load_at_size(const FontFace *face, unsigned codepoint,
         return loaded;
     }
     float scale = css_font_scale_fixed(info, pixel_height_fixed);
-    glyph->pixels = stbtt_GetCodepointBitmap(info, scale, scale,
+    int advance = 0;
+    stbtt_GetCodepointHMetrics(info, (int) codepoint, &advance, NULL);
+    float scale_x = scale;
+    float shift_x = 0.0f;
+    if (humanist_profile >= 1 && humanist_profile <= 3
+        && codepoint >= 32 && codepoint <= 126
+        && !bold && stb_units_per_em(info) == 2048) {
+        int left = 0, right = 0;
+        const HumanistInkBound *target = humanist_ink_bound(
+            humanist_profile, codepoint);
+        unsigned compatible_advance = 0;
+        /* Small metric differences do not justify deforming an outline.
+           Admit only >=25% positive advance mismatch, an excess following
+           sidebearing, and a horizontal scale in [3/4, 3/2]. The profile is
+           bounded to qualified ASCII candidates; no warm glyph is refit. */
+        if (target != NULL && target->right > target->left
+            && family_compatible_advance(
+                   FONT_HUMANIST_SANS, codepoint,
+                   (humanist_profile & 1u) == 0u, &compatible_advance)
+            && stbtt_GetCodepointBox(info, (int) codepoint,
+                                     &left, NULL, &right, NULL)
+            && right > left && advance > 0
+            && (int64_t) compatible_advance * 4 >= (int64_t) advance * 5
+            && target->right > right
+            && (int64_t) (target->right - target->left) * 4
+                   >= (int64_t) (right - left) * 3
+            && (int64_t) (target->right - target->left) * 2
+                   <= (int64_t) (right - left) * 3) {
+            float target_scale = (float) pixel_height_fixed / (64.0f * 2048.0f);
+            scale_x = (target->right - target->left)
+                * target_scale / (right - left);
+            shift_x = target->left * target_scale - left * scale_x;
+        }
+    }
+    /* STB's void raster stages can return an allocated, incomplete bitmap
+       after refusing an internal allocation. A Budget is single-owner here;
+       reject the entire synchronous cold load if any stage refused memory. */
+    size_t failures_before = face->budget->failure_count;
+    glyph->pixels = stbtt_GetCodepointBitmapSubpixel(info, scale_x, scale,
+                                              shift_x, 0.0f,
                                               (int) codepoint,
                                               &glyph->width, &glyph->height,
                                               &glyph->x_offset,
                                               &glyph->y_offset);
-    int advance = 0;
-    stbtt_GetCodepointHMetrics(info, (int) codepoint, &advance, NULL);
+    if (face->budget->failure_count != failures_before) {
+        budget_free(face->budget, glyph->pixels);
+        memset(glyph, 0, sizeof(*glyph));
+        return false;
+    }
     float scaled_advance = advance * scale + (bold ? 0.35f : 0.0f);
     glyph->advance = (int) lround(scaled_advance);
     glyph->advance_fixed = (int) lround(scaled_advance * 64.0f);
     glyph->budget = face->budget;
     glyph->provider_pending = provider_pending;
     return glyph->pixels != NULL || (glyph->width == 0 && glyph->height == 0);
+}
+
+bool font_glyph_load_at_size(const FontFace *face, unsigned codepoint,
+                             int pixel_height_fixed, bool bold,
+                             FontGlyph *glyph)
+{
+    return font_glyph_load_at_size_profile(
+        face, codepoint, pixel_height_fixed, bold, 0, glyph);
 }
 
 bool font_glyph_load(const FontFace *face, unsigned codepoint,

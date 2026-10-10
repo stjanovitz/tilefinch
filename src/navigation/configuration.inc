@@ -349,6 +349,7 @@ void navigation_arm_next_top_level_heap(NavigationSession *session,
 uint64_t navigation_begin(NavigationSession *session)
 {
     if (session == NULL) return 0;
+    session->committed_scroll_reflection_pending = false;
     navigation_refresh_supersede(session);
     session->generation++;
     if (session->generation == 0) session->generation++;

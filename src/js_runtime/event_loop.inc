@@ -535,6 +535,7 @@ static const char *const runtime_host_callback_names[
     "__tilefinchDetachNetwork",
     "__tilefinchPumpTimers",
     "__tilefinchSchedulerSnapshot",
+    "__tilefinchXHRDiagnostics",
     "__tilefinchRebindDocument",
     "__tilefinchCommitSameDocument",
     "__tilefinchRestoreSameDocument",
@@ -607,6 +608,7 @@ static bool runtime_call_host(ScriptRuntime *runtime,
            scheduler snapshot is bookkeeping. Everything else runs script. */
         unsigned ledger = callback == SCRIPT_HOST_PUMP_TIMERS
                 || callback == SCRIPT_HOST_SCHEDULER_SNAPSHOT
+                || callback == SCRIPT_HOST_XHR_DIAGNOSTICS
             ? WORK_LEDGER_KIND_COUNT : work_ledger_enter(WORK_LEDGER_SCRIPT);
         unsigned split = ledger == WORK_LEDGER_KIND_COUNT
             ? SCRIPT_SPLIT_KIND_COUNT + 1u : script_split_enter(SCRIPT_SPLIT_JS);

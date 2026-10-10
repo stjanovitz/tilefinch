@@ -1355,6 +1355,8 @@ static TILEFINCH_COLD_PATH void psp_storage_paths_init(
     tilefinch_install_data_path(
         install_paths, "script-cache", storage->script_cache,
         sizeof(storage->script_cache));
+    tilefinch_install_data_path(install_paths, "youtube-login.bin",
+        storage->youtube_login, sizeof(storage->youtube_login));
 }
 
 static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
@@ -4554,6 +4556,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
     PspInteractiveState *interactive, PspEngineViews *engine_views,
     const PspUiIntent *intent, uint64_t sampled_us, bool *page_dirty)
 {
+    PspApp login_app = {.process = process, .browser = browser, .interactive = interactive};
     if (process == NULL || browser == NULL || interactive == NULL
         || engine_views == NULL || intent == NULL || page_dirty == NULL)
         return;
@@ -4596,8 +4599,10 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
     }
     if (intent->clear_cookies_requested) {
         browser_session_cookie_clear(browser->session);
+        bool removed = psp_app_youtube_login_clear(&login_app);
         psp_ui_show_status(
-            &process->presentation.ui, "COOKIES CLEARED", 180);
+            &process->presentation.ui, removed ? "COOKIES CLEARED"
+                : "COOKIES CLEARED - SAVED LOGIN NOT REMOVED", 240);
         return;
     }
     if (intent->clear_local_storage_requested) {
@@ -4637,6 +4642,11 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
     if (intent->clear_site_data_requested) {
         bool cleared = browser_session_clear_site_data(
             browser->session, site_url);
+        char site[CONTENT_BLOCKER_HOST_LIMIT];
+        if (cleared && content_blocker_site_from_url(site_url, site)
+            && (strcmp(site, "youtube.com") == 0
+                || (strlen(site) > 12u && strcmp(site + strlen(site) - 12u, ".youtube.com") == 0)))
+            cleared = psp_app_youtube_login_clear(&login_app);
         if (cleared) {
             /* Persisted snapshots are rewritten from the now-cleared
                in-memory authority at ordinary shutdown; no extra stick
@@ -6064,6 +6074,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
         loop, frame.ui_sample_us, &intent, &navigation_visual_changed);
     navigation_visual_changed |= psp_app_site_storage_poll(app);
     navigation_visual_changed |= psp_app_heavy_poll(app);
+    navigation_visual_changed |= psp_app_youtube_login_poll(app);
     frame.page_dirty = color_mode_visual_changed
         || gamepad_visual_changed;
     navigation_visual_changed |= voice_component_visual_changed
@@ -10327,6 +10338,8 @@ int main(int argc, char *argv[])
         browser_profile_wifi_diagnostics(browser.profile);
     process.presentation.ui.youtube_topics =
         browser_profile_youtube_topics(browser.profile);
+    process.presentation.ui.youtube_login_policy = (uint8_t)
+        browser_profile_youtube_login_policy(browser.profile);
     psp_network_diagnostics_enable(process.presentation.ui.wifi_diagnostics);
     process.presentation.ui.network_profile =
         (uint8_t) process.config.network_profile;
@@ -10417,6 +10430,7 @@ int main(int argc, char *argv[])
         browser.engine, process.presentation.ui.youtube_compact_results);
     (void) browser_engine_set_youtube_topics(
         browser.engine, process.presentation.ui.youtube_topics);
+    psp_app_youtube_login_boot(&process, &browser);
     (void) psp_set_presentation_css(
         browser.engine, &process.presentation.ui, browser.profile, false, startup_url,
         process.presentation.ui.page_font_percent, false);

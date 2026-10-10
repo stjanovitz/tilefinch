@@ -13,6 +13,7 @@
 #include "tilefinch/request_context.h"
 #include "tilefinch/url.h"
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/ui_language.h"
 #include "youtube_internal.h"
 
 #define YOUTUBE_LITE_TITLE_LIMIT 256
@@ -55,6 +56,10 @@ typedef struct {
     char views[YOUTUBE_LITE_METADATA_LIMIT];
     char published[YOUTUBE_LITE_METADATA_LIMIT];
     char snippet[YOUTUBE_LITE_SNIPPET_LIMIT];
+    unsigned resume_seconds;
+    bool has_resume;
+    unsigned progress_percent;
+    bool has_progress;
 } YoutubeLiteVideo;
 
 #define YOUTUBE_LITE_MAXIMUM_TOPICS 8u
@@ -126,9 +131,12 @@ YoutubeLiteRoute youtube_lite_route(const char *url)
         return YOUTUBE_LITE_ROUTE_WATCH;
     TilefinchUrl parsed;
     if (!tilefinch_url_parse(url, &parsed)
-        || parsed.scheme != TILEFINCH_URL_SCHEME_HTTPS
+        || (parsed.scheme != TILEFINCH_URL_SCHEME_HTTPS
+            && parsed.scheme != TILEFINCH_URL_SCHEME_HTTP)
         || !lite_youtube_host(&parsed)) return YOUTUBE_LITE_ROUTE_NONE;
-    if (parsed.path_length == 0 || lite_path_is(&parsed, "/"))
+    if (parsed.path_length == 0 || lite_path_is(&parsed, "/")
+        || lite_path_is(&parsed, "/feed/subscriptions")
+        || lite_path_is(&parsed, "/feed/recommended"))
         return YOUTUBE_LITE_ROUTE_HOME;
     if (lite_path_is(&parsed, "/results"))
         return YOUTUBE_LITE_ROUTE_SEARCH;
@@ -139,7 +147,9 @@ YoutubeLiteRoute youtube_lite_route(const char *url)
         || (parsed.path_length > 3u && memcmp(path, "/c/", 3) == 0)
         || (parsed.path_length > 6u && memcmp(path, "/user/", 6) == 0))
         return YOUTUBE_LITE_ROUTE_CHANNEL;
-    return YOUTUBE_LITE_ROUTE_NONE;
+    /* Unsupported service paths still belong to our native provider. Never
+       fall through to executing the full YouTube application. */
+    return YOUTUBE_LITE_ROUTE_HOME;
 }
 
 static const char *lite_find_bytes(const char *start, const char *end,
@@ -617,7 +627,7 @@ static bool lite_text_object(const YoutubeLiteSpan *scope, const char *key,
 
 static bool lite_valid_video_id(const char *id)
 {
-    size_t length = strlen(id);
+    size_t length = strnlen(id, YOUTUBE_VIDEO_ID_CAPACITY);
     if (length == 0 || length >= YOUTUBE_VIDEO_ID_CAPACITY) return false;
     for (size_t i = 0; i < length; i++) {
         unsigned char byte = (unsigned char) id[i];
@@ -824,11 +834,55 @@ enum {
 static bool lite_parse_video_renderer(const YoutubeLiteSpan *renderer,
                                       size_t kind, YoutubeLiteVideo *video)
 {
-    return kind == YOUTUBE_LITE_RENDERER_LOCKUP
+    bool parsed = kind == YOUTUBE_LITE_RENDERER_LOCKUP
         ? lite_parse_lockup(renderer, video)
         : lite_parse_video(renderer,
                           kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
                           video);
+    if (!parsed) return false;
+    YoutubeLiteSpan overlay, value, endpoint;
+    if ((lite_json_key(renderer, "thumbnailOverlayResumePlaybackProgressRenderer", NULL, &overlay)
+            && lite_json_member(&overlay, "percentDurationWatched", &value))
+        || lite_json_member(renderer, "percentDurationWatched", &value)
+        || (lite_json_member(renderer, "thumbnailOverlays", &overlay)
+            && lite_json_key(&overlay, "percentDurationWatched", NULL, &value))) {
+        unsigned percent = 0;
+        bool valid = value.end > value.start && value.end - value.start <= 3;
+        for (const char *at = value.start; valid && at < value.end; at++) {
+            valid = *at >= '0' && *at <= '9';
+            if (valid) percent = percent * 10u + (unsigned) (*at - '0');
+        }
+        if (valid && percent <= 100u) {
+            video->has_progress = true;
+            video->progress_percent = percent;
+        }
+    }
+    if (lite_json_key(renderer, "watchEndpoint", NULL, &endpoint)) {
+        char id[YOUTUBE_VIDEO_ID_CAPACITY];
+        char seconds[16] = {0};
+        if (lite_member_string(&endpoint, "videoId", id, sizeof(id), false)
+            && strcmp(id, video->id) == 0
+            && lite_json_member(&endpoint, "startTimeSeconds", &value)) {
+            size_t count = (size_t) (value.end - value.start);
+            bool copied = false;
+            if (value.start < value.end && *value.start == '"') {
+                copied = lite_json_string(value.start, value.end, seconds, sizeof(seconds));
+            } else if (count < sizeof(seconds)) {
+                memcpy(seconds, value.start, count);
+                seconds[count] = '\0';
+                copied = true;
+            }
+            if (copied) {
+                char url[128];
+                snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s&t=%s", id, seconds);
+                video->resume_seconds = (unsigned) (youtube_watch_url_start_time_us(url) / 1000000u);
+                size_t digits = strlen(seconds);
+                video->has_resume = video->resume_seconds != 0u
+                    || (digits > 0u && digits <= 6u && strspn(seconds, "0") == digits);
+            }
+        }
+    }
+    return true;
 }
 
 typedef struct {
@@ -1017,16 +1071,34 @@ static bool lite_html_text(YoutubeLiteHtml *html, const char *text)
     return lite_html_bytes(html, text, strlen(text));
 }
 
-static bool lite_html_format(YoutubeLiteHtml *html,
-                             const char *format, ...)
+static bool lite_html_ui_markup(YoutubeLiteHtml *html, const char *markup);
+
+static bool lite_html_vformat(YoutubeLiteHtml *html, bool localized,
+                             const char *format, va_list arguments)
 {
     char buffer[1024];
+    int length = vsnprintf(buffer, sizeof(buffer), format, arguments);
+    return length >= 0 && (size_t) length < sizeof(buffer)
+        && (localized ? lite_html_ui_markup(html, buffer)
+                      : lite_html_bytes(html, buffer, (size_t) length));
+}
+
+static bool lite_html_format(YoutubeLiteHtml *html, const char *format, ...)
+{
     va_list arguments;
     va_start(arguments, format);
-    int length = vsnprintf(buffer, sizeof(buffer), format, arguments);
+    bool okay = lite_html_vformat(html, false, format, arguments);
     va_end(arguments);
-    return length >= 0 && (size_t) length < sizeof(buffer)
-        && lite_html_bytes(html, buffer, (size_t) length);
+    return okay;
+}
+
+static bool lite_html_ui_format(YoutubeLiteHtml *html, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    bool okay = lite_html_vformat(html, true, format, arguments);
+    va_end(arguments);
+    return okay;
 }
 
 static bool lite_html_escape_bytes(YoutubeLiteHtml *html, const char *text,
@@ -1055,6 +1127,26 @@ static bool lite_html_escape(YoutubeLiteHtml *html, const char *text)
     return lite_html_escape_bytes(html, text, strlen(text));
 }
 
+/* Only trusted native templates use {{English key}}. Values are escaped as
+   data, including inside quoted attributes; author text never enters here.
+   Format arguments in these templates are validated IDs or numeric values. */
+static bool lite_html_ui_markup(YoutubeLiteHtml *html, const char *markup)
+{
+    const char *at = markup, *start;
+    while ((start = strstr(at, "{{")) != NULL) {
+        const char *end = strstr(start + 2, "}}");
+        char key[256];
+        if (end == NULL || end - start - 2 >= (ptrdiff_t) sizeof(key)) return false;
+        size_t length = (size_t)(end - start - 2);
+        memcpy(key, start + 2, length);
+        key[length] = '\0';
+        if (!lite_html_bytes(html, at, (size_t)(start - at))
+            || !lite_html_escape(html, tilefinch_ui_logical_text(key))) return false;
+        at = end + 2;
+    }
+    return lite_html_text(html, at);
+}
+
 static bool lite_html_continuation_link(
     YoutubeLiteHtml *html, const char *base_url, const char *token,
     const char *label)
@@ -1067,14 +1159,14 @@ static bool lite_html_continuation_link(
         && lite_html_escape(html, base_url)
         && lite_html_text(html, encoded)
         && lite_html_text(html, "\">")
-        && lite_html_escape(html, label)
+        && lite_html_escape(html, tilefinch_ui_logical_text(label))
         && lite_html_text(html, "</a></p>");
 }
 
 static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
                              const char *page_title,
                              bool search_autofocus,
-                             bool compact_results)
+                             bool compact_results, bool signed_in)
 {
     static const char prefix[] =
         "<!doctype html><html><head><meta charset=utf-8>"
@@ -1085,8 +1177,18 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "*{box-sizing:border-box}html{background:#0f0f0f;color:#f1f1f1}"
         "body{margin:0;font-family:Arial,sans-serif;font-size:14px}"
         "header{background:#0f0f0f;border-bottom:1px solid #333;padding:8px 10px}"
-        ".top{display:flex;align-items:center;gap:10px;margin-bottom:8px}"
+        ".top{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}"
         ".brand{color:#fff;text-decoration:none;font-size:19px;font-weight:bold}"
+        ".account{color:#ddd;text-decoration:none;font-size:12px;padding:5px}"
+        ".account-menu{position:relative}.account-menu summary{list-style:none;font-weight:normal}"
+        ".account-panel{position:fixed;left:10px;top:36px;width:calc(100% - 20px);max-width:460px;z-index:3;background:#222;border:1px solid #666;padding:10px}"
+        ".account-panel a{display:inline-block;color:#ddd;margin:4px 10px 4px 0}"
+        ".feed-status{font-size:11px;white-space:nowrap;height:16px;color:#aaa}"
+        ".feed-refresh{color:#ddd;font-size:12px;display:inline-block;white-space:nowrap;margin:4px 0 10px}"
+        ".feed-home{position:relative}.feed-home h1{padding-right:130px}"
+        ".feed-home .feed-refresh{position:absolute;right:10px;top:18px;margin:0}"
+        ".watch-progress{position:absolute;left:0;bottom:0;width:100%;height:3px;background:#666}"
+        ".watch-progress-fill{display:block;height:3px;background:#f33}"
         "form{display:flex;gap:6px;width:100%}"
         "input{flex:none;width:calc(100% - 82px);min-width:0;"
         "background:#181818;color:#fff;"
@@ -1200,20 +1302,38 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
     static const char header[] =
         "><header><div class=top>"
         "<a class=brand href=\"https://www.youtube.com/\">"
-        "YouTube</a></div>"
+        "YouTube</a>";
+    static const char search_form[] =
+        "</div>"
         "<form action=\"https://www.youtube.com/results\" method=get>"
         "<input id=yt-search name=search_query type=search"
-        " aria-label=\"Search YouTube\""
-        " placeholder=\"Search YouTube\" value=\"";
+        " aria-label=\"{{Search YouTube}}\""
+        " placeholder=\"{{Search YouTube}}\" value=\"";
     return lite_html_text(html, prefix)
         && lite_html_escape(html, page_title)
         && lite_html_text(html, style)
         && lite_html_text(html, content_style)
         && (!compact_results || lite_html_text(html, compact_style))
+        && (tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ENGLISH
+            || lite_html_text(html,
+                "input{width:calc(100% - 116px)}button{width:110px;font-size:13px;padding:0 8px}"
+                ".top{gap:6px}.account{padding:4px}.feed-home h1{padding-right:170px}"
+                ".feed-home .feed-refresh{width:160px;text-align:right}"))
+        && (tilefinch_ui_translation_bound_language() != TILEFINCH_UI_LANGUAGE_ARABIC
+            || lite_html_text(html,
+                ".account,.account-panel,.feed-status,.feed-refresh,.hint,h1,h2,button{direction:rtl}"))
         && lite_html_text(html, style_end)
         && (!compact_results
             || lite_html_text(html, " class=compact-results"))
         && lite_html_text(html, header)
+        && lite_html_ui_markup(html, signed_in
+            ? "<details id=yt-account-menu class=account-menu><summary id=yt-account-action class=account>{{Account}}</summary><section id=yt-account-panel class=account-panel><h2>{{YouTube account}}</h2><p>{{Signed in on this device.}}</p><a href=\"https://www.youtube.com/feed/recommended\">{{Recommendations}}</a><a href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a><a href=\"https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Switch account}}</a><p>{{Select Account again to close.}}</p></section></details>"
+            : "<a id=yt-account-action class=account href=\"https://accounts.google.com/ServiceLogin?service=youtube&amp;continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Sign in}}</a>")
+        && lite_html_ui_markup(html,
+            "<a class=account href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a>")
+        && (!signed_in || lite_html_ui_markup(html,
+            "<a id=yt-signout-action class=account href=\"#tilefinch-signout\">{{Sign out}}</a>"))
+        && lite_html_ui_markup(html, search_form)
         && lite_html_escape(html, query)
         /* Close the value attribute before autofocus. A quote glued to the
            attribute name parses as part of the name (`autofocus"`), so the
@@ -1221,8 +1341,9 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         && lite_html_text(html, "\"")
         && (!search_autofocus || lite_html_text(html, " autofocus"))
         && lite_html_text(html, ">")
-        && lite_html_text(
-            html, "<button type=submit>Search</button></form></header><main>");
+        && lite_html_ui_markup(html, "<button type=submit>{{Search}}</button></form>")
+        && lite_html_text(html, "</header>")
+        && lite_html_text(html, signed_in ? "<main class=feed-home>" : "<main>");
 }
 
 static bool lite_html_video(YoutubeLiteHtml *html,
@@ -1239,13 +1360,19 @@ static bool lite_html_video(YoutubeLiteHtml *html,
     if (!lite_html_format(
             html, "<div class=result-row><a class=card%s "
                   "data-tilefinch-provider-media href=\""
-                  "https://www.youtube.com/watch?v=%s\">",
+                  "https://www.youtube.com/watch?v=%s",
             autofocus ? " autofocus" : "", video->id)
+        || (video->resume_seconds != 0u
+            && !lite_html_format(html, "&amp;t=%u", video->resume_seconds))
+        || !lite_html_text(html, "\">")
         || !lite_html_format(
             html, "<span class=thumb-wrap><img class=thumb "
                   "src=\"https://i.ytimg.com/vi/%s/mqdefault.jpg\" "
                   "width=160 height=90 loading=lazy alt=\"\">",
             video->id)
+        || (video->has_progress && !lite_html_ui_format(html,
+            "<span class=watch-progress aria-label=\"%u {{percent watched}}\"><span class=watch-progress-fill style=\"width:%u%%\"></span></span>",
+            video->progress_percent, video->progress_percent))
         || (video->duration[0] != '\0'
             && (!lite_html_text(html, "<span class=duration>")
                 || !lite_html_escape(html, video->duration)
@@ -1284,14 +1411,13 @@ static bool lite_html_video(YoutubeLiteHtml *html,
             html, "</span></a><a class=details href=\""
                   "https://www.youtube.com/watch?v=")
         || !lite_html_escape(html, video->id)
+        || (video->resume_seconds != 0u
+            && !lite_html_format(html, "&amp;t=%u", video->resume_seconds))
         || (retain_query
             && (!lite_html_text(html, "&amp;search_query=")
                 || !lite_html_text(html, encoded_query)))
-        || !lite_html_text(
-            html, "\" aria-label=\"Open video details\">"
-                  "<span class=details-icon aria-hidden=true>"
-                  "<span class=details-i-dot></span>"
-                  "<span class=details-i-stem></span></span></a></div>")) {
+        || !lite_html_ui_markup(
+            html, "\" aria-label=\"{{Open video details}}\"><span class=details-icon aria-hidden=true><span class=details-i-dot></span><span class=details-i-stem></span></span></a></div>")) {
         return false;
     }
     return true;
@@ -1633,6 +1759,28 @@ static bool lite_topics_requested(const char *url)
         && strcmp(value, "1") == 0;
 }
 
+static bool lite_feed_requested(const char *url)
+{
+    char value[24] = {0};
+    return lite_query_value(url, "tilefinch_feed", value, sizeof(value))
+        && (strcmp(value, "recommended") == 0 || strcmp(value, "subscriptions") == 0);
+}
+
+static bool lite_html_feed_refresh(YoutubeLiteHtml *html)
+{
+    return lite_html_ui_markup(html,
+        "<a id=yt-feed-refresh class=feed-refresh href=\"#tilefinch-refresh\">{{Refresh suggestions}}</a>");
+}
+
+static bool lite_html_feed_notice(YoutubeLiteHtml *html, bool defer_refresh)
+{
+    /* One fixed-size native status line: idle updates repaint this line only,
+       never relayout or replace the result nodes beneath a selection. */
+    return lite_html_ui_markup(html,
+        "<p id=yt-feed-status class=feed-status>{{Suggestions will load in the background.}}</p>")
+        && (defer_refresh || lite_html_feed_refresh(html));
+}
+
 /* These are provider-supplied navigation categories, not fabricated trends.
    Only destinations handled by the lightweight provider are admitted. */
 static bool lite_next_topic(YoutubeLiteSpan scope, YoutubeLiteSpan *renderer,
@@ -1682,9 +1830,9 @@ static void lite_topic_append(YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPIC
 static bool lite_html_topics(YoutubeLiteHtml *html,
                              const YoutubeLiteTopic *topics, size_t count)
 {
-    if (count == 0) return lite_html_text(html,
-        "<p class=hint>Explore topics are unavailable. Search above to find videos.</p>");
-    if (!lite_html_text(html, "<h2>Explore YouTube</h2><section>")) return false;
+    if (count == 0) return lite_html_ui_markup(html,
+        "<p class=hint>{{Explore topics are unavailable. Search above to find videos.}}</p>");
+    if (!lite_html_ui_markup(html, "<h2>{{Explore YouTube}}</h2><section>")) return false;
     for (size_t at = 0; at < count; at++) {
         if (!lite_html_text(html, "<p><a class=more href=\"")
             || !lite_html_escape(html, topics[at].url)
@@ -1698,17 +1846,16 @@ static bool lite_html_topics(YoutubeLiteHtml *html,
 static bool lite_html_search_intro(YoutubeLiteHtml *html, const char *query,
                                    size_t result_count)
 {
-    bool ok = lite_html_text(html, "<h1>Search results");
+    bool ok = lite_html_ui_markup(html, "<h1>{{Search results}}");
     if (ok && query[0] != '\0')
-        ok = lite_html_text(html, " for &ldquo;")
+        ok = lite_html_text(html, tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ENGLISH
+            ? " for &ldquo;" : " &ldquo;")
             && lite_html_escape(html, query)
             && lite_html_text(html, "&rdquo;");
     ok = ok && lite_html_text(html, "</h1>");
     if (ok && result_count == 0)
-        ok = lite_html_text(
-            html, "<p class=empty>No playable video results were "
-                  "present in the bounded public response. Try another "
-                  "search.</p>");
+        ok = lite_html_ui_markup(
+            html, "<p class=empty>{{No playable video results were present in the bounded public response. Try another search.}}</p>");
     return ok;
 }
 
@@ -1745,19 +1892,16 @@ static bool lite_html_description_summary(YoutubeLiteHtml *html,
 
 static bool lite_html_watch_intro(
     YoutubeLiteHtml *html, const YoutubeLiteWatch *watch,
-    bool autofocus)
+    bool autofocus, unsigned resume_seconds)
 {
     bool ok = lite_html_format(
         html, "<section class=watch-hero><a class=watch-target%s "
               "data-tilefinch-provider-media "
-              "href=\"https://www.youtube.com/watch?v=%s\" "
-              "aria-label=\"Play video\">"
-              "<span class=play-icon aria-hidden=true></span>"
-              "<span class=play-glyph aria-hidden=true>&#9658;</span>"
-              "<img class=watch src=\"https://i.ytimg.com/vi/%s/"
-              "hqdefault.jpg\" loading=lazy alt=\"\"></a>"
-              "<div class=watch-copy><h1>",
-        autofocus ? " autofocus" : "", watch->video.id,
+              "href=\"https://www.youtube.com/watch?v=%s",
+        autofocus ? " autofocus" : "", watch->video.id)
+        && (resume_seconds == 0u || lite_html_format(html, "&amp;t=%u", resume_seconds))
+        && lite_html_ui_format(html,
+              "\" aria-label=\"{{Play video}}\"><span class=play-icon aria-hidden=true></span><span class=play-glyph aria-hidden=true>&#9658;</span><img class=watch src=\"https://i.ytimg.com/vi/%s/hqdefault.jpg\" loading=lazy alt=\"\"></a><div class=watch-copy><h1>",
         watch->video.id)
         && lite_html_escape(html, watch->video.title)
         && lite_html_text(html, "</h1><p class=watch-meta>");
@@ -1774,18 +1918,24 @@ static bool lite_html_watch_intro(
         ok = lite_html_text(html, " &middot; ")
             && lite_html_escape(html, watch->video.duration);
     if (ok && watch->published[0] != '\0')
-        ok = lite_html_text(html, "<br>Published ")
+        ok = lite_html_ui_markup(html, "<br>{{Published}} ")
             && lite_html_escape(html, watch->published);
     if (ok && watch->category[0] != '\0')
-        ok = lite_html_text(html, "<br>Category: ")
+        ok = lite_html_ui_markup(html, "<br>{{Category}}: ")
             && lite_html_escape(html, watch->category);
     return ok
-        && lite_html_format(
+        && lite_html_ui_format(
             html,
-            "</p><p><a class=comments-link href=\"https://tilefinch.local/"
-            "offline/youtube?id=%s\">Save video offline</a></p>"
-            "</div></section>",
+            "</p><p><a class=comments-link href=\"https://tilefinch.local/offline/youtube?id=%s\">{{Save video offline}}</a></p><p><a id=yt-like-action class=comments-link href=\"#tilefinch-like\">{{Like}}</a> <a id=yt-unlike-action class=comments-link href=\"#tilefinch-unlike\">{{Unlike}}</a></p></div></section><p id=yt-like-status class=feed-status>{{Select Like or Unlike.}}</p>",
             watch->video.id);
+}
+
+static void lite_resume_suffix(const char *url, char suffix[32])
+{
+    uint64_t seconds = youtube_watch_url_start_time_us(url) / UINT64_C(1000000);
+    suffix[0] = '\0';
+    if (seconds != 0)
+        snprintf(suffix, 32, "&amp;t=%u", (unsigned) seconds);
 }
 
 static bool lite_build_document_with_comments_decoded(
@@ -1914,14 +2064,11 @@ static bool lite_build_document_with_comments_decoded(
     }
     bool ok = lite_html_header(
         &html, query, page_title, route == YOUTUBE_LITE_ROUTE_HOME,
-        compact_results);
+        compact_results, false);
     if (ok && route == YOUTUBE_LITE_ROUTE_HOME) {
-        ok = lite_html_text(
-            &html, "<section class=hero>"
-                   "<h1>Watch YouTube on this device</h1></section>");
-        if (ok && lite_topics_requested(url)) {
-            YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS] = {0};
-            size_t count = 0;
+        YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS] = {0};
+        size_t count = 0;
+        if (lite_topics_requested(url)) {
             YoutubeLiteSpan scope = {
                 decoded, decoded == NULL ? NULL : decoded + decoded_length
             };
@@ -1934,67 +2081,61 @@ static bool lite_build_document_with_comments_decoded(
                 scope.start = renderer.end;
             }
             display_count = count;
-            ok = lite_html_topics(&html, topics, count);
         }
+        ok = (count != 0 || lite_html_ui_markup(
+            &html, "<section class=hero><h1>{{Watch YouTube on this device}}</h1></section>"))
+            && lite_html_feed_notice(&html, false)
+            && (!lite_topics_requested(url)
+                || lite_html_topics(&html, topics, count));
     } else if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH) {
         ok = lite_html_search_intro(&html, query, result_count);
     } else if (ok && route == YOUTUBE_LITE_ROUTE_CHANNEL) {
-        ok = lite_html_text(
-            &html, "<h1>Channel videos</h1>"
-                   "<p class=hint>Recent public uploads from this channel."
-                   "</p>");
+        ok = lite_html_ui_markup(
+            &html, "<h1>{{Channel videos}}</h1><p class=hint>{{Recent public uploads from this channel.}}</p>");
         if (ok && result_count == 0)
-            ok = lite_html_text(
-                &html, "<p class=empty>No public video entries were present "
-                       "in the bounded channel response.</p>");
+            ok = lite_html_ui_markup(
+                &html, "<p class=empty>{{No public video entries were present in the bounded channel response.}}</p>");
     } else if (ok) {
+        char resume[32];
+        lite_resume_suffix(url, resume);
         ok = lite_html_watch_intro(
             &html, watch,
-            !comments_requested && !description_requested);
+            !comments_requested && !description_requested,
+            (unsigned) (youtube_watch_url_start_time_us(url) / 1000000u));
         if (ok && !comments_requested && !description_requested)
-            ok = lite_html_text(
-                &html, "<p class=hint>Select the thumbnail to retry playback. "
-                       "The player provides play, pause, seek, time, and exit "
-                       "controls.</p>");
+            ok = lite_html_ui_markup(
+                &html, "<p class=hint>{{Select the thumbnail to retry playback. The player provides play, pause, seek, time, and exit controls.}}</p>");
         if (ok && watch->description[0] != '\0') {
-            ok = lite_html_text(
-                    &html, "<h2>Description</h2>"
-                           "<div id=description class=description>")
+            ok = lite_html_ui_markup(
+                    &html, "<h2>{{Description}}</h2><div id=description class=description>")
                 && (description_requested
                     ? lite_html_multiline(&html, watch->description)
                     : lite_html_description_summary(
                           &html, watch->description))
                 && lite_html_text(&html, "</div>");
             if (ok && !description_requested)
-                ok = lite_html_format(
-                    &html, "<p><a class=comments-link href=\"https://www."
-                           "youtube.com/watch?v=%s&amp;tilefinch_view="
-                           "description#description\">"
-                           "View full description</a></p>",
-                    watch->video.id);
+                ok = lite_html_ui_format(
+                    &html, "<p><a class=comments-link href=\"https://www.youtube.com/watch?v=%s%s&amp;tilefinch_view=description#description\">{{View full description}}</a></p>",
+                    watch->video.id, resume);
             else if (ok)
-                ok = lite_html_format(
-                    &html, "<p><a class=comments-link href=\"https://www."
-                           "youtube.com/watch?v=%s\">Back to video</a></p>",
-                    watch->video.id);
+                ok = lite_html_ui_format(
+                    &html, "<p><a class=comments-link href=\"https://www.youtube.com/watch?v=%s%s\">{{Back to video}}</a></p>",
+                    watch->video.id, resume);
         }
         if (ok && !comments_requested && !description_requested)
-            ok = lite_html_format(
-                &html, "<p><a class=comments-link href=\"https://www.youtube."
-                       "com/watch?v=%s&amp;tilefinch_view=comments#comments\">"
-                       "View comments</a></p>",
-                watch->video.id);
+            ok = lite_html_ui_format(
+                &html, "<p><a class=comments-link href=\"https://www.youtube.com/watch?v=%s%s&amp;tilefinch_view=comments#comments\">{{View comments}}</a></p>",
+                watch->video.id, resume);
         if (ok && comments_requested) {
-            ok = lite_html_text(&html, "<section id=comments><h2>Comments");
+            ok = lite_html_ui_markup(&html, "<section id=comments><h2>{{Comments}}");
             if (ok && comments_count[0] != '\0')
                 ok = lite_html_text(&html, " (")
                     && lite_html_escape(&html, comments_count)
                     && lite_html_text(&html, ")");
             ok = ok && lite_html_text(&html, "</h2>");
             if (ok && comment_count == 0)
-                ok = lite_html_text(
-                    &html, "<p class=empty>No public comments were returned "
-                           "within the bounded request.</p>");
+                ok = lite_html_ui_markup(
+                    &html, "<p class=empty>{{No public comments were returned within the bounded request.}}</p>");
             for (size_t i = 0; ok && i < comment_count; i++)
                 ok = lite_html_comment(&html, &comments[i]);
             if (ok && next_continuation[0] != '\0') {
@@ -2011,7 +2152,7 @@ static bool lite_build_document_with_comments_decoded(
             ok = ok && lite_html_text(&html, "</section>");
         }
         if (ok && !description_requested && display_count != 0)
-            ok = lite_html_text(&html, "<h2>Up next</h2>");
+            ok = lite_html_ui_markup(&html, "<h2>{{Up next}}</h2>");
     }
     if (ok && route != YOUTUBE_LITE_ROUTE_HOME
         && !description_requested) {
@@ -2087,6 +2228,7 @@ typedef enum {
     YOUTUBE_LITE_BUILD_COMMENTS,
     YOUTUBE_LITE_BUILD_EMIT_HEADER,
     YOUTUBE_LITE_BUILD_EMIT_INTRO,
+    YOUTUBE_LITE_BUILD_EMIT_RECENT,
     YOUTUBE_LITE_BUILD_EMIT_DESCRIPTION,
     YOUTUBE_LITE_BUILD_EMIT_COMMENTS_HEADER,
     YOUTUBE_LITE_BUILD_EMIT_COMMENTS,
@@ -2127,6 +2269,8 @@ typedef struct {
     bool comments_requested;
     bool description_requested;
     bool compact_results;
+    bool personalized_feed;
+    bool recent_video;
     bool watch_details_found;
     bool watch_microformat_found;
     bool watch_description_header_found;
@@ -2250,6 +2394,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
     work->description_requested = route == YOUTUBE_LITE_ROUTE_WATCH
         && lite_description_view_requested(url);
     work->compact_results = compact_results;
+    work->personalized_feed = lite_feed_requested(url);
     (void) lite_query_value(
         url, "search_query", work->query, sizeof(work->query));
     if (route == YOUTUBE_LITE_ROUTE_WATCH)
@@ -2271,7 +2416,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
 
 static void lite_build_video_pump(YoutubeLiteBuildWork *work)
 {
-    if (work->route == YOUTUBE_LITE_ROUTE_HOME) {
+    if (work->route == YOUTUBE_LITE_ROUTE_HOME && !work->personalized_feed) {
         if (work->scan_offset >= work->decoded_length
             || work->topic_count >= YOUTUBE_LITE_MAXIMUM_TOPICS) {
             lite_build_after_videos(work);
@@ -2518,16 +2663,26 @@ static bool lite_build_emit_header(YoutubeLiteBuildWork *work)
     return lite_html_header(
         &work->html, work->query, title,
         work->route == YOUTUBE_LITE_ROUTE_HOME,
-        work->compact_results);
+        work->compact_results, work->personalized_feed);
 }
 
 static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
 {
     YoutubeLiteHtml *html = &work->html;
     if (work->route == YOUTUBE_LITE_ROUTE_HOME) {
-        return lite_html_text(
-            html, "<section class=hero>"
-                  "<h1>Watch YouTube on this device</h1></section>")
+        if (work->personalized_feed) {
+            char feed[24] = {0};
+            (void) lite_query_value(work->url, "tilefinch_feed", feed, sizeof(feed));
+            return lite_html_ui_markup(html, strcmp(feed, "subscriptions") == 0
+                ? "<h1>{{Your subscriptions}}</h1>" : "<h1>{{Recommended for you}}</h1>")
+                && lite_html_feed_notice(html, true)
+                && (work->video_count != 0 || lite_html_ui_markup(html,
+                    "<p class=empty>{{No videos are available in this feed yet.}}</p>"));
+        }
+        return ((lite_topics_requested(work->url) && work->topic_count != 0)
+            || lite_html_ui_markup(
+            html, "<section class=hero><h1>{{Watch YouTube on this device}}</h1></section>"))
+            && lite_html_feed_notice(html, false)
             && (!lite_topics_requested(work->url)
                 || lite_html_topics(html, work->topics, work->topic_count));
     }
@@ -2536,26 +2691,22 @@ static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
             html, work->query, work->video_count);
     }
     if (work->route == YOUTUBE_LITE_ROUTE_CHANNEL) {
-        bool ok = lite_html_text(
-            html, "<h1>Channel videos</h1>"
-                  "<p class=hint>Recent public uploads from this channel."
-                  "</p>");
+        bool ok = lite_html_ui_markup(
+            html, "<h1>{{Channel videos}}</h1><p class=hint>{{Recent public uploads from this channel.}}</p>");
         if (ok && work->video_count == 0)
-            ok = lite_html_text(
-                html, "<p class=empty>No public video entries were present "
-                      "in the bounded channel response.</p>");
+            ok = lite_html_ui_markup(
+                html, "<p class=empty>{{No public video entries were present in the bounded channel response.}}</p>");
         return ok;
     }
     YoutubeLiteWatch *watch = &work->watch;
     bool ok = lite_html_watch_intro(
         html, watch,
-        !work->comments_requested && !work->description_requested);
+        !work->comments_requested && !work->description_requested,
+        (unsigned) (youtube_watch_url_start_time_us(work->url) / 1000000u));
     if (ok && !work->comments_requested
         && !work->description_requested)
-        ok = lite_html_text(
-            html, "<p class=hint>Select the thumbnail to retry playback. "
-                  "The player provides play, pause, seek, time, and exit "
-                  "controls.</p>");
+        ok = lite_html_ui_markup(
+            html, "<p class=hint>{{Select the thumbnail to retry playback. The player provides play, pause, seek, time, and exit controls.}}</p>");
     return ok;
 }
 
@@ -2564,36 +2715,31 @@ static bool lite_build_emit_description(YoutubeLiteBuildWork *work)
     if (work->route != YOUTUBE_LITE_ROUTE_WATCH) return true;
     YoutubeLiteHtml *html = &work->html;
     YoutubeLiteWatch *watch = &work->watch;
+    char resume[32];
+    lite_resume_suffix(work->url, resume);
     bool ok = true;
     if (watch->description[0] != '\0') {
-        ok = lite_html_text(
-                 html, "<h2>Description</h2>"
-                       "<div id=description class=description>")
+        ok = lite_html_ui_markup(
+                 html, "<h2>{{Description}}</h2><div id=description class=description>")
             && (work->description_requested
                 ? lite_html_multiline(html, watch->description)
                 : lite_html_description_summary(
                       html, watch->description))
             && lite_html_text(html, "</div>");
         if (ok && !work->description_requested)
-            ok = lite_html_format(
-                html, "<p><a class=comments-link href=\"https://www."
-                      "youtube.com/watch?v=%s&amp;tilefinch_view="
-                      "description#description\">"
-                      "View full description</a></p>",
-                watch->video.id);
+            ok = lite_html_ui_format(
+                html, "<p><a class=comments-link href=\"https://www.youtube.com/watch?v=%s%s&amp;tilefinch_view=description#description\">{{View full description}}</a></p>",
+                watch->video.id, resume);
         else if (ok)
-            ok = lite_html_format(
-                html, "<p><a class=comments-link href=\"https://www."
-                      "youtube.com/watch?v=%s\">Back to video</a></p>",
-                watch->video.id);
+            ok = lite_html_ui_format(
+                html, "<p><a class=comments-link href=\"https://www.youtube.com/watch?v=%s%s\">{{Back to video}}</a></p>",
+                watch->video.id, resume);
     }
     if (ok && !work->comments_requested
         && !work->description_requested) {
-        ok = lite_html_format(
-            html, "<p><a class=comments-link href=\"https://www.youtube."
-                  "com/watch?v=%s&amp;tilefinch_view=comments#comments\">"
-                  "View comments</a></p>",
-            watch->video.id);
+        ok = lite_html_ui_format(
+            html, "<p><a class=comments-link href=\"https://www.youtube.com/watch?v=%s%s&amp;tilefinch_view=comments#comments\">{{View comments}}</a></p>",
+            watch->video.id, resume);
     }
     return ok;
 }
@@ -2601,17 +2747,16 @@ static bool lite_build_emit_description(YoutubeLiteBuildWork *work)
 static bool lite_build_emit_comments_header(YoutubeLiteBuildWork *work)
 {
     YoutubeLiteHtml *html = &work->html;
-    bool ok = lite_html_text(
-        html, "<section id=comments><h2>Comments");
+    bool ok = lite_html_ui_markup(
+        html, "<section id=comments><h2>{{Comments}}");
     if (ok && work->comments_count[0] != '\0')
         ok = lite_html_text(html, " (")
             && lite_html_escape(html, work->comments_count)
             && lite_html_text(html, ")");
     ok = ok && lite_html_text(html, "</h2>");
     if (ok && work->comment_count == 0)
-        ok = lite_html_text(
-            html, "<p class=empty>No public comments were returned "
-                  "within the bounded request.</p>");
+        ok = lite_html_ui_markup(
+            html, "<p class=empty>{{No public comments were returned within the bounded request.}}</p>");
     return ok;
 }
 
@@ -2674,6 +2819,21 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
         break;
     case YOUTUBE_LITE_BUILD_EMIT_INTRO:
         ok = lite_build_emit_intro(work);
+        work->phase = work->recent_video
+            ? YOUTUBE_LITE_BUILD_EMIT_RECENT : YOUTUBE_LITE_BUILD_EMIT_DESCRIPTION;
+        break;
+    case YOUTUBE_LITE_BUILD_EMIT_RECENT:
+        if (work->recent_video) {
+            const YoutubeLiteVideo *recent = &work->watch.video;
+            ok = lite_html_ui_markup(&work->html, "<section id=yt-recent-video><h2>{{Recently watched}}</h2>");
+            if (ok && recent->has_resume)
+                ok = lite_html_ui_format(&work->html, "<p class=hint>{{Continue from}} %u:%02u</p>",
+                    recent->resume_seconds / 60u, recent->resume_seconds % 60u);
+            else if (ok && recent->has_progress)
+                ok = lite_html_ui_format(&work->html, "<p class=hint>%u%% {{watched}}</p>", recent->progress_percent);
+            ok = ok && lite_html_video(&work->html, recent, false, NULL)
+                && lite_html_ui_markup(&work->html, "</section><h2>{{Suggestions}}</h2>");
+        }
         work->phase = YOUTUBE_LITE_BUILD_EMIT_DESCRIPTION;
         break;
     case YOUTUBE_LITE_BUILD_EMIT_DESCRIPTION:
@@ -2704,7 +2864,7 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
             && work->video_count > 6u ? 6u : work->video_count;
         if (work->route == YOUTUBE_LITE_ROUTE_WATCH
             && !work->description_requested && display != 0) {
-            ok = lite_html_text(&work->html, "<h2>Up next</h2>");
+            ok = lite_html_ui_markup(&work->html, "<h2>{{Up next}}</h2>");
         }
         work->emit_index = 0;
         work->phase = YOUTUBE_LITE_BUILD_EMIT_VIDEOS;
@@ -2713,7 +2873,7 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
     case YOUTUBE_LITE_BUILD_EMIT_VIDEOS: {
         size_t display = work->route == YOUTUBE_LITE_ROUTE_WATCH
             && work->video_count > 6u ? 6u : work->video_count;
-        if (work->route != YOUTUBE_LITE_ROUTE_HOME
+        if ((work->route != YOUTUBE_LITE_ROUTE_HOME || work->personalized_feed)
             && !work->description_requested
             && work->emit_index < display) {
             size_t emit_index = work->emit_index++;
@@ -2732,7 +2892,11 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
         work->phase = YOUTUBE_LITE_BUILD_EMIT_FOOTER;
         break;
     case YOUTUBE_LITE_BUILD_EMIT_FOOTER:
-        ok = lite_html_text(&work->html, "</main></body></html>");
+        /* Visually beside the heading, but after cards in sequential focus
+           order: moving down through results never stops on an idle refresh. */
+        ok = (!(work->route == YOUTUBE_LITE_ROUTE_HOME && work->personalized_feed)
+                || lite_html_feed_refresh(&work->html))
+            && lite_html_text(&work->html, "</main></body></html>");
         work->phase = YOUTUBE_LITE_BUILD_DONE;
         break;
     case YOUTUBE_LITE_BUILD_DONE:
@@ -2756,8 +2920,8 @@ static bool lite_build_work_take_document(
         .html = work->html.data,
         .html_length = work->html.length,
         .source_bytes = work->source_bytes + work->supplemental_length,
-        .result_count = work->route == YOUTUBE_LITE_ROUTE_HOME
-            ? work->topic_count : display,
+        .result_count = work->route == YOUTUBE_LITE_ROUTE_HOME && !work->personalized_feed
+            ? work->topic_count : display + (work->recent_video ? 1u : 0u),
         .route = work->route
     };
     work->html.data = NULL;
@@ -3494,7 +3658,8 @@ static bool lite_document_cacheable(
 
 static uint32_t lite_document_cache_variant(bool compact_results)
 {
-    return compact_results ? UINT32_C(1) : UINT32_C(0);
+    return (compact_results ? UINT32_C(1) : UINT32_C(0))
+        | (tilefinch_ui_translation_bound_language() << 1u);
 }
 
 static void lite_apply_preference_cookies(YoutubeLiteLoadJob *job)
@@ -4383,3 +4548,9 @@ void youtube_lite_document_destroy(YoutubeLiteDocument *document)
         budget_free(document->budget, document->html);
     *document = (YoutubeLiteDocument) {0};
 }
+
+#include "youtube_feed_authority.inc"
+#include "youtube_feed.inc"
+#ifndef __PSP__
+#include "youtube_feed_probe.inc"
+#endif

@@ -69,6 +69,7 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS:
             return "youtube-compact-results";
         case PSP_UI_SETTING_YOUTUBE_TOPICS: return "youtube-topics";
+        case PSP_UI_SETTING_YOUTUBE_LOGIN: return "youtube-login";
         case PSP_UI_SETTING_WIFI_DIAGNOSTICS: return "wifi-diagnostics";
         case PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY:
             return "youtube-audio-only";
@@ -145,6 +146,7 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_FIND: return "find";
         case PSP_UI_SCREEN_STORAGE_SITE: return "storage-site";
         case PSP_UI_SCREEN_STORAGE_OFFER: return "storage-offer";
+        case PSP_UI_SCREEN_YOUTUBE_LOGIN: return "youtube-login";
         case PSP_UI_SCREEN_HEAVY_OFFER: return "heavy-offer";
         case PSP_UI_SCREEN_HOME: return "home";
         case PSP_UI_SCREEN_COLLECTIONS: return "collections";

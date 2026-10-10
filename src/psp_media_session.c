@@ -1684,6 +1684,10 @@ static void psp_media_prepare_route_kind(
         .has_separate_audio = false,
         .audio_only = media->audio_only
     }, "route-open");
+    uint64_t explicit_start_us = provider_video_route
+        ? youtube_watch_url_start_time_us(url) : 0;
+    if (explicit_start_us != 0)
+        psp_media_continuation_reopen(&media->continuation, explicit_start_us, autoplay);
     psp_ui_media_set_resolving(
         &media->ui, offline_route ? "Saved video"
             : media->page_audio ? "Page audio"

@@ -468,7 +468,13 @@ bool navigation_set_scroll(NavigationSession *session, int scroll_y)
     if (session != NULL && session->page.runtime != NULL) {
         /* Native scrolling is a user-agent operation; a page exception only
            prevents the advisory JS reflection, never the viewport movement. */
-        (void) script_runtime_set_page_scroll(session->page.runtime, next);
+        if (session->committed_layout_servable) {
+            /* Scroll feedback during a replacement build must not reenter
+               author code: even the advisory viewport setter is observable. */
+            session->committed_scroll_reflection_pending = true;
+        } else {
+            (void) script_runtime_set_page_scroll(session->page.runtime, next);
+        }
     }
     if (entry != NULL && entry->scroll_y != next
         && session->page.deferred_image_targets != NULL) {
@@ -488,11 +494,10 @@ static void navigation_clamp_scroll_to_layout(NavigationSession *session)
         &session->viewport, session->page.layout.height);
     if (entry->scroll_y <= maximum) return;
     /* A relayout may shrink the document under an existing scroll position.
-       Keep the native viewport valid even if page script throws while its
-       scroll state is being synchronized. */
+       Update native geometry now, but never invoke an author viewport setter
+       from the publication tail: it could delete the newly laid-out text. */
     if (session->page.runtime != NULL) {
-        (void) script_runtime_set_page_scroll(
-            session->page.runtime, maximum);
+        session->committed_scroll_reflection_pending = true;
     }
     entry->scroll_y = maximum;
 }
@@ -2104,6 +2109,44 @@ static bool navigation_relayout_failed(
     return false;
 }
 
+/* A consumed author mutation makes the incumbent unsuitable for publication,
+   but it can still own the memory that a replacement needs. On a real Budget
+   refusal, give that replacement one attempt without the invalid incumbent.
+   Retain only bounded numeric scroll state; never read its borrowed DOM or
+   paint commands after releasing it. Synthetic faults and cancellation must
+   continue to exercise the ordinary retirement path. */
+static bool navigation_retry_mutation_layout_under_pressure(
+    NavigationSession *session, LayoutDocument *next, bool *released)
+{
+    struct {
+        lxb_dom_node_t *node;
+        int x, y;
+    } scrolls[64];
+    size_t count = 0;
+    for (size_t i = 0; i < session->page.layout.node_box_count; i++) {
+        const LayoutNodeBox *box = &session->page.layout.node_boxes[i];
+        if (box->node == NULL || (box->scroll_x == 0 && box->scroll_y == 0))
+            continue;
+        if (count == sizeof(scrolls) / sizeof(scrolls[0])) return false;
+        scrolls[count].node = box->node;
+        scrolls[count].x = box->scroll_x;
+        scrolls[count++].y = box->scroll_y;
+    }
+    layout_destroy(&session->page.layout);
+    *released = true;
+    session->performance.mutation_layout_pressure_retries++;
+    if (!navigation_build_layout(session, next, session->fonts,
+                                 session->images)) return false;
+    for (size_t i = 0; i < count; i++) {
+        /* Like layout_transfer_scroll_state, this is an identity lookup in
+           the replacement, not a dereference of an old node. */
+        (void) layout_scroll_node(next, scrolls[i].node,
+                                 scrolls[i].x, scrolls[i].y);
+    }
+    session->performance.mutation_layout_pressure_recoveries++;
+    return true;
+}
+
 /* Pending targets the ordinary image loader must leave alone. A target that
    already holds a committed resource is the batch currently being published:
    a rebuild that drops the image table must reload it like every eager image,
@@ -2649,6 +2692,32 @@ static bool navigation_mutations_are_hidden_only(
 
 static bool navigation_relayout_body(NavigationSession *session);
 
+/* These writes leave every node and text buffer borrowed by the incumbent
+   intact. Structural/text mutations, dropped journal entries and resource
+   replacement remain owner-only: the old display list may no longer be safe
+   even if a later layout happens to look unchanged. Generated attr() content
+   is retained in layout-owned storage, not in the changed attribute buffer. */
+static bool navigation_mutations_keep_committed_layout_servable(
+    const ScriptMutationJournal *mutations)
+{
+    if (mutations == NULL || mutations->overflowed
+        || mutations->retirement_unobserved
+        || mutations->resource_rebuild_required
+        || mutations->image_resource_scan_required
+        || mutations->image_resource_refresh_required
+        || mutations->conservative_resource_scan) return false;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->kind == SCRIPT_MUTATION_INLINE_STYLE) continue;
+        if (record->kind != SCRIPT_MUTATION_ATTRIBUTE
+            || (strcmp(record->attribute, "class") != 0
+                && strcmp(record->attribute, "style") != 0
+                && strcmp(record->attribute, "data-tilefinch-focus") != 0))
+            return false;
+    }
+    return true;
+}
+
 bool navigation_relayout(NavigationSession *session)
 {
     unsigned ledger = work_ledger_enter(WORK_LEDGER_LAYOUT);
@@ -2986,6 +3055,10 @@ static bool navigation_relayout_body(NavigationSession *session)
         }
         navigation_evict_layout_reuse_under_pressure(session);
         LayoutDocument next = {0};
+        size_t failures_before = session->budget->failure_count;
+        size_t injected_failures_before = session->budget->injected_failure_count;
+        int incumbent_height = session->page.layout.height;
+        bool incumbent_released = false;
 #if !defined(__PSP__)
         bool injected_refusal =
             navigation_test_consume_same_document_relayout_refusal();
@@ -2996,10 +3069,16 @@ static bool navigation_relayout_body(NavigationSession *session)
         uint64_t relayout_prepared = navigation_now_us();
 #endif
         bool provisional = navigation_relayout_preview_eligible(session);
-        /* Without a script realm nothing mutated the DOM the committed
-           layout borrows, so the reader can page through it while the
-           screens around them are rebuilt (seconds deep in a long page). */
-        if (provisional) {
+        bool servable = !image_rebuild && !image_resource_refresh
+            && (!mutation_driven
+                || navigation_mutations_keep_committed_layout_servable(
+                       &mutations));
+        /* A stable incumbent can serve scroll feedback during either a full
+           replacement or a scriptless preview. JS reflection is deferred to
+           a later owner turn after adoption, so the checkpoint cannot mutate
+           the DOM underneath either layout. Author turns and destructive
+           journals stay queued. */
+        if (servable) {
             session->committed_layout_servable = true;
             (void) tilefinch_platform_cooperate("page-scroll-servable", 1);
         }
@@ -3008,15 +3087,12 @@ static bool navigation_relayout_body(NavigationSession *session)
                   session, &next, session->page.layout.height, 0)
             : navigation_build_layout(
                   session, &next, session->fonts, session->images);
-        if (provisional) {
+        if (servable) {
             session->committed_layout_servable = false;
             (void) tilefinch_platform_cooperate("page-scroll-servable", 0);
         }
         if (built && next.content_limit_y != 0)
             session->performance.provisional_relayouts++;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        uint64_t relayout_built = navigation_now_us();
-#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         if (session->page.document.node_count > 8192) {
             printf("tilefinch-large-page-relayout: built=%d elapsed=%lluus "
@@ -3031,6 +3107,15 @@ static bool navigation_relayout_body(NavigationSession *session)
         if (injected_refusal)
             budget_clear_failure_injection(session->budget);
 #endif
+        if (!built && mutation_driven && !session->layout_build_cancelled
+            && session->budget->failure_count > failures_before
+            && session->budget->injected_failure_count == injected_failures_before) {
+            built = navigation_retry_mutation_layout_under_pressure(
+                session, &next, &incumbent_released);
+        }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t relayout_built = navigation_now_us();
+#endif
         if (!built) {
             return navigation_relayout_failed(session, mutation_driven);
         }
@@ -3038,7 +3123,16 @@ static bool navigation_relayout_body(NavigationSession *session)
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t relayout_transferred = navigation_now_us();
 #endif
-        navigation_measure_damage(session, &session->page.layout, &next);
+        if (incumbent_released) {
+            session->relayout_damage_valid = true;
+            session->relayout_damage_left = 0;
+            session->relayout_damage_top = 0;
+            session->relayout_damage_right = session->viewport.css_width;
+            session->relayout_damage_bottom = incumbent_height > next.height
+                ? incumbent_height : next.height;
+        } else {
+            navigation_measure_damage(session, &session->page.layout, &next);
+        }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t relayout_damaged = navigation_now_us();
 #endif
@@ -4509,8 +4603,13 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
         if (!navigation_relayout(session)) {
             session->page.image_continuation_pending = false;
             session->performance.background_image_failures++;
-            session->page.loaded = false;
-            return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+            /* A fast replacement refusal leaves the incumbent layout valid:
+               no author DOM was changed. Do not retire that usable page for
+               an optional image. Destructive/full-rebuild failures already
+               retire the page in navigation_relayout_failed. */
+            return session->page.loaded
+                ? NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+                : NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
         }
         session->performance.background_image_relayouts++;
     }
@@ -5166,6 +5265,22 @@ bool navigation_advance_runtime(NavigationSession *session,
     /* A copy left from memory refused outside a turn (an event handler) is
        not this turn's. */
     (void) script_runtime_take_memory_rescue(session->page.runtime, NULL);
+    if (session->committed_scroll_reflection_pending) {
+        session->committed_scroll_reflection_pending = false;
+        const NavigationEntry *entry = navigation_current(session);
+        if (entry != NULL) {
+            /* Reflection can invoke an author-defined viewport setter. Do it
+               only in an owner turn, never in the layout-publication return:
+               a destructive setter must be settled before any paint or other
+               author task can use that display list. */
+            (void) script_runtime_set_page_scroll(session->page.runtime,
+                                                  entry->scroll_y);
+            if (navigation_retire_failed_document_refresh(
+                    session, session->page.runtime)) return false;
+            if (script_runtime_consume_relayout(session->page.runtime)
+                && !navigation_relayout(session)) return false;
+        }
+    }
     bool advanced = script_runtime_advance(
         session->page.runtime, elapsed_ms, callback_budget,
         &session->page.script_result);

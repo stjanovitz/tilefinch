@@ -1,0 +1,66 @@
+--- a/stb_truetype.h
++++ b/stb_truetype.h
+@@ -2836,7 +2836,6 @@ static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, i
+ {
+    stbtt__active_edge *z = (stbtt__active_edge *) stbtt__hheap_alloc(hh, sizeof(*z), userdata);
+    float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
+-   STBTT_assert(z != NULL);
+    if (!z) return z;
+ 
+    // round dx down to avoid overshooting
+@@ -2858,7 +2857,6 @@ static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, i
+ {
+    stbtt__active_edge *z = (stbtt__active_edge *) stbtt__hheap_alloc(hh, sizeof(*z), userdata);
+    float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
+-   STBTT_assert(z != NULL);
+    //STBTT_assert(e->y0 <= start_point);
+    if (!z) return z;
+    z->fdx = dxdy;
+@@ -2935,6 +2933,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
+    else
+       scanline = scanline_data;
+ 
++   if (scanline == NULL) return; // Tilefinch: Budget refusal is recoverable.
+    y = off_y * vsubsample;
+    e[n].y0 = (off_y + result->h) * (float) vsubsample + 1;
+ 
+@@ -2983,6 +2982,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
+          while (e->y0 <= scan_y) {
+             if (e->y1 > scan_y) {
+                stbtt__active_edge *z = stbtt__new_active(&hh, e, off_x, scan_y, userdata);
++               if (z == NULL) goto cleanup; // Tilefinch: discard partial raster.
+                if (z != NULL) {
+                   // find insertion point
+                   if (active == NULL)
+@@ -3015,6 +3015,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
+       ++j;
+    }
+ 
++cleanup:
+    stbtt__hheap_cleanup(&hh, userdata);
+ 
+    if (scanline != scanline_data)
+@@ -3308,6 +3309,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
+    else
+       scanline = scanline_data;
+ 
++   if (scanline == NULL) return; // Tilefinch: before pointer arithmetic.
+    scanline2 = scanline + result->w;
+ 
+    y = off_y;
+@@ -3340,6 +3342,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
+       while (e->y0 <= scan_y_bottom) {
+          if (e->y0 != e->y1) {
+             stbtt__active_edge *z = stbtt__new_active(&hh, e, off_x, scan_y_top, userdata);
++            if (z == NULL) goto cleanup; // Tilefinch: discard partial raster.
+             if (z != NULL) {
+                if (j == 0 && off_y != 0) {
+                   if (z->ey < scan_y_top) {
+@@ -3385,6 +3388,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
+       ++j;
+    }
+ 
++cleanup:
+    stbtt__hheap_cleanup(&hh, userdata);
+ 
+    if (scanline != scanline_data)

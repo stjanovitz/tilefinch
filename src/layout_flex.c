@@ -906,7 +906,10 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             }
             int item_width = intrinsic_text_width(
                 context, item.node, &item.parent_style, limit);
-            if (item_width <= 0) continue;
+            /* An empty item has a zero max-content contribution, but it
+               still occupies a position in the flex sequence and therefore
+               contributes a gap beside the next item. */
+            if (item_width < 0) item_width = 0;
             int gap = horizontal_flex_items == 0
                 ? 0 : computed_style_resolve_gap(style.gap, limit);
             if (inline_width > limit - gap
@@ -947,6 +950,21 @@ static int intrinsic_text_width_impl(LayoutContext *context,
        space in the inline flow.  Losing it makes shrink-to-fit boxes
        narrower than the line they must hold, wrapping their last inline
        piece internally. */
+    int first_line_indent = 0;
+    if (style.display != DISPLAY_INLINE && style.display != DISPLAY_CONTENTS) {
+        /* Cyclic percentage indentation contributes zero to intrinsic
+           sizing; a positive fixed component still occupies the first
+           formatted line. Inline descendants inherit text-indent without
+           starting another line, so they must not charge it again. */
+        if (!style_length_resolve(
+                context->sheet, style.text_indent, 0, &first_line_indent)
+            || first_line_indent < 0) first_line_indent = 0;
+    }
+    bool first_line_indent_pending = true;
+    if (inline_width > 0) {
+        inline_width = layout_add_coordinate(inline_width, first_line_indent);
+        first_line_indent_pending = false;
+    }
     int boundary_space_width = -1;
     bool pending_boundary_space = false;
     bool has_inline_text = false;
@@ -960,6 +978,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             pending_boundary_space = false;
             has_inline_text = false;
             previous_atomic = false;
+            first_line_indent_pending = false;
             continue;
         }
         int child_width = intrinsic_text_width(context, child, &style, limit);
@@ -1018,6 +1037,11 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             if (child_width > block_width) block_width = child_width;
         } else {
             if (child_width > 0) {
+                if (first_line_indent_pending) {
+                    inline_width = layout_add_coordinate(
+                        inline_width, first_line_indent);
+                    first_line_indent_pending = false;
+                }
                 if (has_inline_text && child_has_unit
                     && (pending_boundary_space || leading_space)) {
                     if (boundary_space_width < 0) {
@@ -1059,8 +1083,12 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         }
         if (inline_width >= limit || block_width >= limit) return limit;
     }
-    inline_width += generated_inline_pseudo_width(
+    int after_width = generated_inline_pseudo_width(
         context, node, &style, PSEUDO_AFTER);
+    if (first_line_indent_pending && after_width > 0) {
+        inline_width = layout_add_coordinate(inline_width, first_line_indent);
+    }
+    inline_width += after_width;
     if (inline_width > block_width) block_width = inline_width;
     if (style.display != DISPLAY_CONTENTS
         && style.display != DISPLAY_TABLE_ROW_GROUP
@@ -2295,7 +2323,10 @@ int flex_child_basis(LayoutContext *context, const FlatItem *item,
     basis = constrain_border_box_width(
         context, item->node, &item->parent_style, child_style,
         content_width, basis - margins, NULL) + margins;
-    if (basis < 8) basis = 8;
+    /* Flex bases are box sizes, not text-flow widths. Empty and explicitly
+       zero-width items may consume no main-axis space; a text safety floor
+       here silently shrinks their neighbours inside intrinsic containers. */
+    if (basis < 0) basis = 0;
     /* A definite flex base can legitimately overflow a smaller nowrap
        container; flex shrink and the automatic minimum decide whether it may
        contract. Wrapped lines do not run that container-wide shrink pass,

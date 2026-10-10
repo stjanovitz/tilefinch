@@ -1142,6 +1142,7 @@ static bool navigation_commit_document(
     session->pending_response_referrer_policy[0] = '\0';
     session->canvas_paint_damage_pending = false;
     memset(&session->page, 0, sizeof(session->page));
+    session->committed_scroll_reflection_pending = false;
     if (streaming != NULL) {
         session->page.images = streaming->canvas_images;
         memset(&streaming->canvas_images, 0,
@@ -2078,6 +2079,7 @@ static bool navigation_commit_document(
     if (session->external_resources_enabled) {
         phase_started = navigation_now_us();
         size_t loaded_before = session->page.images.stats.loaded;
+        bool image_pipeline_refused = false;
         if (image_priority_count != 0
             && !images_load_external_priority_targets(
                 &session->page.document, &session->page.stylesheet,
@@ -2091,15 +2093,22 @@ static bool navigation_commit_document(
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session)) {
-            snprintf(session->last_error, sizeof(session->last_error),
-                     "visible image priority pipeline exceeded its budget");
-            goto fail;
+            if (session->page.images.stats.load_cancelled) {
+                snprintf(session->last_error, sizeof(session->last_error),
+                         "visible image priority pipeline cancelled");
+                goto fail;
+            }
+            /* Images are optional. The loader rolled back its suffix; even
+               a first-image refusal must not discard the usable document.
+               Do not immediately repeat the same load in the full pass. */
+            session->performance.image_pressure_fallbacks++;
+            image_pipeline_refused = true;
         }
         if (session->page.images.stats.loaded >= loaded_before) {
             session->performance.progressive_image_priority_loaded =
                 session->page.images.stats.loaded - loaded_before;
         }
-        if (image_priority_count != 0) {
+        if (image_priority_count != 0 && !image_pipeline_refused) {
             images = &session->page.images;
             layout_reuse_cache_update_images(
                 session->page.layout_reuse, images);
@@ -2119,7 +2128,13 @@ static bool navigation_commit_document(
             && !allow_runtime && streaming == NULL
             && navigation_document_images_are_defer_safe(
                    &session->page.document, &session->page.stylesheet);
-        if (provisional_commit) {
+        if (image_pipeline_refused) {
+            budget_free(session->budget, session->page.deferred_image_targets);
+            session->page.deferred_image_targets = NULL;
+            session->page.deferred_image_count = 0;
+            session->page.image_continuation_pending = false;
+            session->page.visual_discovery_pending = false;
+        } else if (provisional_commit) {
             /* The viewport's priority visuals are loaded above; the rest
                are discovered by the first complete layout. */
             budget_free(session->budget,
@@ -2140,8 +2155,6 @@ static bool navigation_commit_document(
                 session->page.deferred_image_count = 0;
             }
             navigation_ensure_layout_reuse(session);
-            size_t retained_before = session->page.images.stats
-                .priority_retained_on_failure;
             session->page.image_continuation_pending = defer_mutable_document_images;
             if (!images_load_external_reusing_layout_styles_deferred(
                     &session->page.document, &session->page.stylesheet,
@@ -2156,20 +2169,17 @@ static bool navigation_commit_document(
                     session->browser_session, session->page.layout_reuse,
                     fonts, session->viewport.css_width,
                     defer_mutable_document_images)) {
-                if (session->page.images.stats.priority_retained_on_failure
-                        > retained_before
-                    && session->page.images.count != 0) {
-                    session->performance.image_pressure_fallbacks++;
-                    session->page.image_continuation_pending = false;
-                    budget_free(session->budget, session->page.deferred_image_targets);
-                    session->page.deferred_image_targets = NULL;
-                    session->page.deferred_image_count = 0;
-                } else {
+                if (session->page.images.stats.load_cancelled) {
                     snprintf(session->last_error,
                              sizeof(session->last_error),
-                             "external image pipeline exceeded its budget");
+                             "external image pipeline cancelled");
                     goto fail;
                 }
+                session->performance.image_pressure_fallbacks++;
+                session->page.image_continuation_pending = false;
+                budget_free(session->budget, session->page.deferred_image_targets);
+                session->page.deferred_image_targets = NULL;
+                session->page.deferred_image_count = 0;
             }
         }
         images = &session->page.images;
@@ -2248,12 +2258,14 @@ static bool navigation_commit_document(
             && session->page.document.node_count >= 256) {
             navigation_ensure_layout_reuse(session);
             size_t layout_failure_count = session->budget->failure_count;
+            size_t injected_failure_count = session->budget->injected_failure_count;
             LayoutBuildJob *job = layout_build_job_begin(
                 session->budget, &session->page.document,
                 &session->page.stylesheet, fonts, images,
                 &session->viewport, session->page.layout_reuse);
             if (job == NULL
                 && session->budget->failure_count > layout_failure_count
+                && session->budget->injected_failure_count == injected_failure_count
                 && navigation_install_minimal_stylesheet_fallback(session)) {
                 /* Author CSS is optional when it crowds a complete server
                    document out of its first layout. Rebuild the cheap
@@ -2279,10 +2291,32 @@ static bool navigation_commit_document(
             }
             return true;
         }
-        if (!navigation_build_layout(session, &session->page.layout,
-                                     fonts, images)) {
+        size_t layout_failure_count = session->budget->failure_count;
+        size_t injected_failure_count = session->budget->injected_failure_count;
+        bool layout_built = navigation_build_layout(
+            session, &session->page.layout, fonts, images);
+        if (!layout_built && !session->layout_build_cancelled
+            && session->budget->failure_count > layout_failure_count
+            && session->budget->injected_failure_count == injected_failure_count) {
+            /* Match deferred startup's pressure recovery. Author CSS must
+               not strand a valid new document merely because this caller
+               builds synchronously. Release failed layout/cache ownership
+               before replacing optional styles, then retry exactly once.
+               Cancellation and synthetic refusals never take this path. */
+            layout_destroy(&session->page.layout);
+            layout_reuse_cache_destroy(session->page.layout_reuse);
+            session->page.layout_reuse = NULL;
+            if (navigation_install_minimal_stylesheet_fallback(session))
+                layout_built = navigation_build_layout(
+                    session, &session->page.layout, fonts, images);
+        }
+        if (!layout_built) {
             snprintf(session->last_error, sizeof(session->last_error),
-                     "layout construction failed");
+                     "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
+                     session->page.layout.performance.failed_phase,
+                     (unsigned) session->layout_build_cancelled,
+                     session->budget->failure_count - layout_failure_count,
+                     session->budget->current, session->budget->limit);
             goto fail;
         }
         uint64_t final_layout_elapsed = navigation_record_layout_slices(

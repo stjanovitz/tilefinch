@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <lexbor/dom/interface.h>
 #include <lexbor/dom/interfaces/attr.h>
@@ -35,8 +36,10 @@
 #include "tilefinch/section_router.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/session.h"
+#include "tilefinch/url.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/youtube_lite.h"
 #include "diagnostic_trace.h"
 
 #define MIB (1024u * 1024u)
@@ -452,6 +455,7 @@ int main(int argc, char **argv)
        and the wall-clock resource stage deadline are adjustable. Zero
        means "keep the profile default". */
     size_t image_count_override = 0, image_total_kb_override = 0;
+    size_t stylesheet_count_override = 0;
     size_t image_file_kb_override = 0, image_decoded_mb_override = 0;
     size_t font_attempts_override = 0, font_total_kb_override = 0;
     size_t font_file_kb_override = 0, font_backend_kb_override = 0;
@@ -471,6 +475,7 @@ int main(int argc, char **argv)
     bool probe_usability = false;
     bool diagnostic_frame_safari = false;
     bool interactive_loop = false;
+    int private_console_fd = -1;
     bool loop_capture_frames = true;
     bool platform_sim = false;
     bool external_resources = true;
@@ -508,6 +513,14 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--follow-action") == 0) follow_action = true;
         else if (strcmp(argv[i], "--scroll-bottom") == 0) scroll_bottom = true;
         else if (strcmp(argv[i], "--interactive") == 0) interactive_loop = true;
+        else if (strcmp(argv[i], "--private-console-fd") == 0
+                 && i + 1 < argc) {
+            char *end = NULL;
+            long descriptor = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0'
+                || descriptor < 3 || descriptor > INT_MAX) return 1;
+            private_console_fd = (int) descriptor;
+        }
         else if (strcmp(argv[i], "--no-loop-capture") == 0) {
             loop_capture_frames = false;
         }
@@ -699,6 +712,17 @@ int main(int argc, char **argv)
             navigation_test_set_parser_script_stage_time_limit_us(
                 (uint64_t) limit_ms * 1000u);
         }
+        else if (strcmp(argv[i], "--stylesheet-count") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 2; }
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (argv[i][0] < '0' || argv[i][0] > '9' || end == argv[i]
+                || *end != '\0' || value == 0u || value > 32u) {
+                usage(argv[0]);
+                return 2;
+            }
+            stylesheet_count_override = (size_t) value;
+        }
         else if (strcmp(argv[i], "--image-count") == 0) {
             image_count_override = strtoul(argv[++i], NULL, 10);
         }
@@ -829,6 +853,28 @@ int main(int argc, char **argv)
     }
     bool psp_app_profile = psp_profile != NULL
         && strcmp(psp_profile, "realistic") == 0;
+    /* Only the private launcher uses this protocol. Its status pipe carries
+       numbers and the parsed origin, never DOM text or URL paths. Diagnostics
+       are discarded before any page is loaded; captures and persistent
+       bytecode are barred. */
+    if (private_console_fd >= 0) {
+        if (commands_path == NULL || strcmp(commands_path, "/dev/stdin") != 0
+            || interactive_loop || loop_capture_frames
+            || strcmp(output, "/dev/null") != 0
+            || capture_http != NULL || capture_http_from_top_level != NULL
+            || replay_http != NULL || module_cache_dir != NULL
+            || module_cache_write || typed != NULL || visual_evidence
+            || text_metrics_path != NULL || first_present_output != NULL
+            || trace_page || trace_frames || probe_script != NULL
+            || frame_probe_script != NULL || user_css != NULL
+            || fcntl(private_console_fd, F_GETFD) < 0) return 1;
+        int sink = open("/dev/null", O_WRONLY);
+        if (sink < 0) return 1;
+        bool redirected = dup2(sink, STDOUT_FILENO) >= 0
+            && dup2(sink, STDERR_FILENO) >= 0;
+        close(sink);
+        if (!redirected) return 1;
+    }
     if ((fixture == NULL) == (url == NULL) || limit_mb < 4 || limit_mb > 512
         || ticks > 20000 || interaction_ticks > 20000
         || frame_activate_delay_ticks > 20000
@@ -1058,6 +1104,7 @@ int main(int argc, char **argv)
     engine_config->resources.enabled = external_resources;
     engine_config->progressive_first_paint = progressive_first_paint;
     engine_config->relayout_preview_threshold_us = relayout_preview_us;
+    if (stylesheet_count_override != 0u) stylesheet_count = stylesheet_count_override;
     engine_config->resources.maximum_stylesheets = stylesheet_count;
     engine_config->resources.maximum_stylesheet_bytes = stylesheet_bytes;
     engine_config->resources.maximum_stylesheet_file_bytes =
@@ -2325,7 +2372,8 @@ int main(int argc, char **argv)
                                  pace_real_time,
                                  experimental_compressed_sections
                                    ? &experimental : NULL,
-                                 visual_evidence ? &visual_frames : NULL)) {
+                                 visual_evidence ? &visual_frames : NULL,
+                                 private_console_fd)) {
                 goto cleanup;
             }
     }

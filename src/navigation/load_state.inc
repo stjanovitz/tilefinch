@@ -203,6 +203,7 @@ struct NavigationLoad {
     DocumentParser parser;
     NavigationDocumentStream *document_stream;
     LayoutBuildJob *layout_job;
+    bool layout_pressure_retried;
     SectionRouteStream section_router;
     CompressedSectionStore *section_store;
     SectionStoreStreamBuilder *section_builder;
@@ -232,6 +233,7 @@ struct NavigationLoad {
     bool parser_active;
     bool response_taken;
     bool response_cookies_accepted;
+    bool adapter_redirect;
     bool client_hint_retried;
     bool client_hint_retry_pending;
     bool zero_body_retry_attempted;
@@ -338,6 +340,12 @@ static bool navigation_load_headers(void *opaque,
         load->session->browser_session, &load->request_context, metadata,
         effective);
     load->response_cookies_accepted = true;
+    /* A redirect from an ordinary sign-in page must not start parsing the
+       full service application before the facade can select its provider. */
+    if (site_adapter_handles_navigation("GET", effective)) {
+        load->adapter_redirect = true;
+        return false;
+    }
     /* Critical-CH is known at the response-header boundary.  The first
        representation is not page-visible: do not feed it to the HTML
        parser, execute parser-blocking scripts, discover preloads, route
@@ -605,22 +613,17 @@ static bool navigation_load_prepare_document_stream(NavigationLoad *load)
                load, load->document_stream);
 }
 
-/* Inline script text the parser keeps in the DOM. External scripts are
-   admitted by the memory their compile needs and may reach the per-script
-   source ceiling (4 MiB in the PSP app); inline text stays within the old
-   per-script unit (SCRIPT_ADMISSION_LEGACY_UNIT_BYTES), which also keeps a
-   single parser-blocking inline script inside the parser stage's
-   cumulative work allowance. Larger inline scripts are truncated and
-   skipped, as before. */
-#define NAVIGATION_INLINE_SCRIPT_TEXT_BYTES SCRIPT_ADMISSION_LEGACY_UNIT_BYTES
-
+/* Apply the configured source policy to inline text as well as downloads.
+   The parser discards an oversized script incrementally; admitted sources
+   still pass the cumulative parser-work and compile-memory gates. Disabled
+   scripting retains only the separately bounded inert-data allowance. */
 static size_t navigation_inline_script_text_limit(
     const NavigationSession *session)
 {
     return session->maximum_script_file_bytes
-               < NAVIGATION_INLINE_SCRIPT_TEXT_BYTES
+               < session->maximum_script_bytes
         ? session->maximum_script_file_bytes
-        : NAVIGATION_INLINE_SCRIPT_TEXT_BYTES;
+        : session->maximum_script_bytes;
 }
 
 static bool navigation_load_begin_parser(NavigationLoad *load)
@@ -1745,16 +1748,52 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
 #endif
         if (built) navigation_load_record_timing_for_runtime(
             load, candidate->page.runtime);
-        if (built && load->layout_job != NULL) return true;
+        if (built && load->layout_job != NULL) {
+            load->layout_pressure_retried =
+                candidate->performance.stylesheet_pressure_fallbacks
+                    > session->performance.stylesheet_pressure_fallbacks;
+            return true;
+        }
     } else if (load->layout_job != NULL) {
+        size_t failures_before = session->budget->failure_count;
+        size_t injected_before = session->budget->injected_failure_count;
         LayoutBuildStatus layout_status =
             layout_build_job_pump(load->layout_job);
         if (layout_status == LAYOUT_BUILD_PENDING) return true;
+        if (layout_status == LAYOUT_BUILD_FAILED
+            && !load->layout_pressure_retried
+            && session->budget->failure_count > failures_before
+            && session->budget->injected_failure_count == injected_before) {
+            /* Startup admission only covers the job shell. Its later context
+               and flow allocations can also refuse beside the incumbent.
+               Release the failed job before replacing optional author CSS,
+               and resume once; never retry cancellation or injected faults. */
+            load->layout_pressure_retried = true;
+            layout_build_job_destroy(load->layout_job);
+            load->layout_job = NULL;
+            layout_reuse_cache_destroy(candidate->page.layout_reuse);
+            candidate->page.layout_reuse = NULL;
+            if (navigation_install_minimal_stylesheet_fallback(candidate)) {
+                const ImageResources *candidate_images =
+                    candidate->external_resources_enabled
+                        ? &candidate->page.images : load->images;
+                load->layout_job = layout_build_job_begin(
+                    session->budget, &candidate->page.document,
+                    &candidate->page.stylesheet, load->fonts, candidate_images,
+                    &candidate->viewport, NULL);
+                if (load->layout_job != NULL) return true;
+            }
+        }
         if (layout_status != LAYOUT_BUILD_COMPLETE
             || !layout_build_job_take(
                    load->layout_job, &candidate->page.layout)) {
             snprintf(candidate->last_error, sizeof(candidate->last_error),
-                     "resumable layout construction failed");
+                     "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
+                     load->layout_job == NULL ? 11u
+                         : layout_build_job_failure_phase(load->layout_job),
+                     (unsigned) (layout_status == LAYOUT_BUILD_CANCELLED),
+                     session->budget->failure_count - failures_before,
+                     session->budget->current, session->budget->limit);
             built = false;
         } else {
             layout_build_job_destroy(load->layout_job);
@@ -1815,6 +1854,8 @@ static void navigation_page_relocate_runtime_storage(
         script_runtime_set_layout(session->page.runtime,
                                   &session->page.layout,
                                   session->viewport.css_height);
+        script_runtime_set_synchronous_layout_callback(session->page.runtime,
+            navigation_flush_committed_geometry, session);
         /* Transactional promotion memcpy-moves the inline NavigationPage.
            The realm's publication target must follow that move just like
            its document, layout, and stylesheet views.  Otherwise a later
@@ -2223,6 +2264,12 @@ bool navigation_load_request(NavigationSession *session,
         && navigation_load_finish(load, NULL);
     navigation_load_destroy(load);
     return success;
+}
+
+const char *navigation_load_adapter_redirect(const NavigationLoad *load)
+{
+    return load != NULL && load->adapter_redirect
+        ? load->effective_history_url : NULL;
 }
 
 bool navigation_load_url(NavigationSession *session, uint64_t generation,

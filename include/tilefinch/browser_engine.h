@@ -823,6 +823,24 @@ bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact);
 /* Optional provider discovery runs after the local search page's first paint. */
 bool browser_engine_set_youtube_topics(BrowserEngine *engine, bool enabled);
+typedef enum {
+    BROWSER_YOUTUBE_FEED_IDLE = 0,
+    BROWSER_YOUTUBE_FEED_LOADING,
+    BROWSER_YOUTUBE_FEED_READY,
+    BROWSER_YOUTUBE_FEED_CURRENT,
+    BROWSER_YOUTUBE_FEED_FAILED,
+    BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED
+} BrowserYoutubeFeedState;
+BrowserYoutubeFeedState browser_engine_youtube_feed_state(const BrowserEngine *engine);
+BrowserYoutubeFeedState browser_engine_youtube_like_state(const BrowserEngine *engine);
+/* Selected operation; authoritative only when state is CURRENT. */
+bool browser_engine_youtube_like_selected(const BrowserEngine *engine);
+#ifndef __PSP__
+struct YoutubeLiteRatingDiagnostics;
+unsigned browser_engine_youtube_history_metadata(const BrowserEngine *engine);
+bool browser_engine_youtube_rating_diagnostics(const BrowserEngine *engine,
+    struct YoutubeLiteRatingDiagnostics *result);
+#endif
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path);
 /* Deferred canvas publication (see render.h): the deferral that describes
@@ -1082,6 +1100,12 @@ const TileCache *browser_engine_render_metrics_view(
  */
 Budget *browser_engine_budget(BrowserEngine *engine);
 BrowserSession *browser_engine_session(BrowserEngine *engine);
+enum {
+    BROWSER_YOUTUBE_LOGIN_VERIFIED = 1u,
+    BROWSER_YOUTUBE_LOGIN_SIGNED_OUT = 2u
+};
+/* Native receipt after personalized API authentication, not DOM markers. */
+unsigned browser_engine_take_youtube_login_events(BrowserEngine *engine);
 const BrowserSession *browser_engine_session_view(const BrowserEngine *engine);
 
 /* Transitional mutable accessors retained for tests and unmigrated tools. */

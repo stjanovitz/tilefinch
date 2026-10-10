@@ -207,6 +207,96 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
     }
     CHECK(local_blob_valid);
 
+    /* Text response is available during LOADING, not only after progress.
+       Aborting must not leave the previous body observable in UNSENT. */
+    static const char xhr_loading_probe[] =
+        "(()=>{globalThis.pocSummary='pending';const checks=[],url="
+        "URL.createObjectURL(new Blob(['response-body'],{type:'text/plain'}));"
+        "Promise.all(['','text','arraybuffer'].map(type=>new Promise(resolve=>{"
+        "const xhr=new XMLHttpRequest;checks.push(xhr.response==='');"
+        "xhr.open('GET',url);xhr.responseType=type;"
+        "checks.push(xhr.response===(type==='arraybuffer'?null:''));"
+        "xhr.onreadystatechange=()=>{if(xhr.readyState===2)checks.push("
+        "xhr.response===(type==='arraybuffer'?null:''));"
+        "if(xhr.readyState===3)checks.push(type==='arraybuffer'?"
+        "xhr.response===null:xhr.response==='response-body'&&"
+        "xhr.response===xhr.responseText)};"
+        "xhr.onprogress=()=>{checks.push(type==='arraybuffer'?"
+        "xhr.response===null:xhr.response==='response-body');"
+        "if(type!=='arraybuffer'){xhr.abort();checks.push(xhr.readyState===0,"
+        "xhr.response==='',xhr.responseText==='');resolve()}};"
+        "xhr.onload=()=>{checks.push(xhr.response instanceof ArrayBuffer,"
+        "new TextDecoder().decode(xhr.response)==='response-body');resolve()};"
+        "xhr.send()}))).then(()=>{URL.revokeObjectURL(url);"
+        "globalThis.pocSummary=checks.every(Boolean)?'xhr-loading-ok':"
+        "'xhr-loading-failed:'+checks.join(',')})})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, xhr_loading_probe,
+                                            "<xhr-loading-probe>", &result));
+    CHECK(pump_script_network(runtime, &result));
+    if (strcmp(result.summary, "xhr-loading-ok") != 0)
+        fprintf(stderr, "XHR loading summary: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "xhr-loading-ok") == 0);
+
+    /* A promise run during progress can abort or reopen before DONE. The
+       old synchronous response loop incorrectly fired the stale load first. */
+    static const char xhr_checkpoint_cancel_probe[] =
+        "(()=>{globalThis.pocSummary='pending';const checks=[],url="
+        "URL.createObjectURL(new Blob(['owned-response']));"
+        "Promise.all(['abort','reopen'].map(mode=>new Promise(resolve=>{"
+        "const x=new XMLHttpRequest;let phase=0,oldLoad=false;"
+        "x.open('GET',url);x.onprogress=()=>{if(phase===0)"
+        "Promise.resolve().then(()=>{phase=1;checks.push(!oldLoad);"
+        "if(mode==='abort'){x.abort();resolve()}else{"
+        "x.open('GET',url);x.send()}})};"
+        "x.onload=()=>{if(phase===0)oldLoad=true;else{"
+        "checks.push(x.responseText==='owned-response');resolve()}};"
+        "x.send()}))).then(()=>{URL.revokeObjectURL(url);"
+        "globalThis.pocSummary=checks.length===3&&checks.every(Boolean)?"
+        "'xhr-checkpoint-cancel-ok':'xhr-checkpoint-cancel-failed'})})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, xhr_checkpoint_cancel_probe,
+                                            "<xhr-checkpoint-cancel>", &result));
+    CHECK(pump_script_network(runtime, &result));
+    CHECK(strcmp(result.summary, "xhr-checkpoint-cancel-ok") == 0);
+
+    static const char xhr_sync_checkpoint_probe[] =
+        "(()=>{const url=URL.createObjectURL(new Blob(['owned-response'])),"
+        "x=new XMLHttpRequest;let ran=false,stayedSync=true;"
+        "x.open('GET',url,false);x.onreadystatechange=()=>{"
+        "if(x.readyState===2)Promise.resolve().then(()=>ran=true)};"
+        "x.onload=()=>{stayedSync=!ran};x.send();"
+        "const t=new EventTarget;let queued=false;t.addEventListener('x',()=>{"
+        "Promise.resolve().then(()=>queued=true)});"
+        "t.addEventListener('x',()=>{stayedSync=stayedSync&&!queued});"
+        "t.dispatchEvent(new Event('x'));URL.revokeObjectURL(url);"
+        "globalThis.pocSummary=stayedSync?'xhr-sync-checkpoint-ok':'failed'})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, xhr_sync_checkpoint_probe,
+                                            "<xhr-sync-checkpoint>", &result));
+    CHECK(strcmp(result.summary, "xhr-sync-checkpoint-ok") == 0);
+
+    ScriptXHRDiagnostics responses = {0};
+    budget_inject_failure_after(budget, 0);
+    CHECK(!script_runtime_xhr_diagnostics(runtime, true, &responses));
+    budget_clear_failure_injection(budget);
+    CHECK(script_runtime_xhr_diagnostics(runtime, false, &responses));
+    CHECK(responses.count == 0);
+    CHECK(script_runtime_xhr_diagnostics(runtime, true, &responses));
+    CHECK(responses.count == 0 && responses.overwritten == 0);
+    static const char xhr_history_probe[] =
+        "(()=>{const url=URL.createObjectURL(new Blob(['mock-secret']));"
+        "for(let i=0;i<40;i++){const x=new XMLHttpRequest;"
+        "x.open('GET',url,false);x.onload=()=>{void x.response;void x.responseText};"
+        "x.send()}URL.revokeObjectURL(url)})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, xhr_history_probe,
+                                            "<xhr-history-probe>", &result));
+    CHECK(script_runtime_xhr_diagnostics(runtime, false, &responses));
+    CHECK(responses.count == 32 && responses.overwritten == 8);
+    for (size_t i = 0; i < responses.count; i++) {
+        const uint32_t *r = responses.rows[i];
+        CHECK(r[0] == i + 9 && r[1] == 200 && r[2] == 11 && r[3] == 11);
+        CHECK(r[4] == 5 && r[5] == 1 && r[6] == 1);
+        CHECK(r[7] == 3 && r[8] == 1 && r[9] == 1);
+    }
+
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget->current == baseline);

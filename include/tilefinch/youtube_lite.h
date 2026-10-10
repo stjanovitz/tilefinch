@@ -162,4 +162,71 @@ void youtube_lite_load_destroy(YoutubeLiteLoadJob *job);
 
 void youtube_lite_document_destroy(YoutubeLiteDocument *document);
 
+/* RAM-only personalized feeds. The job uses the ordinary cookie authority,
+   performs no sign-in and is advanced only in bounded idle pumps. */
+typedef struct YoutubeLiteFeedJob YoutubeLiteFeedJob;
+bool youtube_lite_session_signed_in(BrowserSession *session);
+/* Opaque RAM-only identity for native login transitions. Never log it. */
+uint64_t youtube_lite_session_login_identity(BrowserSession *session);
+YoutubeLiteFeedJob *youtube_lite_feed_begin(Budget *budget,
+    BrowserSession *session, bool subscriptions, bool compact, long timeout_ms);
+YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
+                                            const FetchPumpQuota *quota);
+bool youtube_lite_feed_take_document(YoutubeLiteFeedJob *job,
+                                    YoutubeLiteDocument *document);
+void youtube_lite_feed_destroy(YoutubeLiteFeedJob *job);
+/* Explicit user Like/Unlike only; same authority and bounded idle job as feeds.
+   Success requires the API's explicit rating state or like-button state
+   confirmation, not HTTP 200. */
+YoutubeLiteFeedJob *youtube_lite_rating_begin(Budget *budget,
+    BrowserSession *session, const char *video_id, bool liked, long timeout_ms);
+
+#ifndef __PSP__
+/* Content-free first-history-card metadata presence for host qualification. */
+unsigned youtube_lite_feed_history_metadata(const YoutubeLiteFeedJob *job);
+
+typedef struct YoutubeLiteRatingDiagnostics {
+    long bootstrap_status;
+    long api_status;
+    size_t api_bytes;
+    unsigned phase;
+    unsigned response_flags;
+} YoutubeLiteRatingDiagnostics;
+/* Numeric-only host qualification. Never expose headers, body text, IDs,
+   cookies or authorization material. */
+bool youtube_lite_rating_diagnostics(const YoutubeLiteFeedJob *job,
+                                    YoutubeLiteRatingDiagnostics *result);
+/* Host-only, data-only qualification boundary. No credential, URL, response
+   text or video metadata crosses this result; the existing session owns all
+   authentication and transport policy. It does not execute page scripts. */
+typedef struct {
+    long bootstrap_status;
+    long api_status;
+    size_t bootstrap_bytes;
+    size_t api_bytes;
+    size_t result_count;
+    unsigned bootstrap_destination; /* 0 unknown, 1 same origin, 2 accounts,
+                                       3 support, 4 other YouTube, 5 other */
+    bool bootstrap_same_origin;
+    bool login_known;
+    bool logged_in;
+    bool authorization_present;
+    bool api_json;
+    bool api_error;
+    bool api_login_known;
+    bool api_logged_out;
+    bool api_message;
+    bool api_signin_required;
+} YoutubeLiteFeedProbe;
+bool youtube_lite_probe_feed(Budget *budget, BrowserSession *session,
+                            bool subscriptions, YoutubeLiteFeedProbe *result);
+bool youtube_lite_feed_probe_classify(Budget *budget, const char *json,
+                                    size_t length, YoutubeLiteFeedProbe *result);
+/* Native request construction only: never expose this result in diagnostics,
+   JavaScript, files or the private control channel. */
+bool youtube_lite_feed_probe_authorization(BrowserSession *session,
+    const TilefinchRequestContext *context, uint64_t seconds,
+    char *output, size_t capacity);
+#endif
+
 #endif

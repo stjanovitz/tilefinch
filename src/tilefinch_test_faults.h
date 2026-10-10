@@ -45,11 +45,15 @@ typedef struct {
     bool refuse_next_frame_presentation;
     /* Refuse the next background web-font relayout once. */
     bool refuse_next_background_font_relayout;
+    /* Refuse one validated optional image-loader setup. */
+    bool refuse_next_image_load_setup;
     /* Refuse the next render-shell initialization once. */
     bool refuse_next_render_shell_init;
     /* Make the next layout cooperate checkpoint decline to continue once,
        the way a supervisor cancel (Circle press) does on the device. */
     bool cancel_next_layout_cooperate;
+    /* Inject an allocator refusal at the job context, after optional caches. */
+    bool refuse_next_layout_context;
     /* A NavigationParserCheckpointTestFault to inject at the next matching
        parser checkpoint (0 = none). Consumed once. */
     unsigned parser_checkpoint_fault;
@@ -57,6 +61,8 @@ typedef struct {
     unsigned fail_site_storage_appends;
     /* Fail the rename that puts a compacted site log in place, once. */
     bool fail_next_site_storage_compact_rename;
+    /* Model FAT's refusal to rename over an existing credential file. */
+    bool youtube_login_no_replace_rename;
     /* Stop the next compaction right after the original log is moved
        aside, as a power loss there would. */
     bool crash_next_site_storage_compact;

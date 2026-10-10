@@ -1664,6 +1664,44 @@ static int test_resize_observer_registration_budget(void)
     return 0;
 }
 
+static int test_intersection_entry_inherited_accessor(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body><div id=target>Item</div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://entry-accessor.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "Object.defineProperty(IntersectionObserverEntry.prototype,"
+        "'isIntersecting',{get(){return this.intersectionRatio>0},"
+        "configurable:true});"
+        "const entry=new IntersectionObserverEntry({time:7,"
+        "intersectionRatio:0,isIntersecting:true});"
+        "globalThis.entryOwn=Object.prototype.hasOwnProperty.call(entry,"
+        "'isIntersecting')&&entry.isIntersecting&&entry.time===7;"
+        "globalThis.entryDelivered=false;const observer=new "
+        "IntersectionObserver(entries=>{entryDelivered=entries.length===1"
+        "&&Object.prototype.hasOwnProperty.call(entries[0],"
+        "'isIntersecting');observer.disconnect()});"
+        "observer.observe(document.getElementById('target'))",
+        "<intersection-entry-accessor>", &result));
+    for (unsigned i = 0; i < 4; i++)
+        CHECK(script_runtime_advance(runtime, 16, 16, &result));
+    CHECK(runtime_string_is(runtime, "String(entryOwn&&entryDelivered)",
+                            "true"));
+    CHECK(result.uncaught_callback_errors == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_intersection_observer_registration_budget(void)
 {
     Budget budget;
@@ -4897,6 +4935,46 @@ static int test_mutation_observer_shadow_boundaries(void)
     return 0;
 }
 
+static int test_html_tag_query_case(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><html><head><title>Tag queries</title></head>"
+        "<body><section id=scope><span id=child class=Mixed></span></section>"
+        "<svg><rect id=vector></rect></svg></body></html>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 4000, "https://tag-query.test/", &result);
+    CHECK(runtime != NULL);
+    bool okay = script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const check=(ok,label)=>{if(!ok)throw Error(label)},"
+        "scope=document.getElementById('scope'),child=document.getElementById('child');"
+        "for(const name of ['head','HEAD','HeAd']){"
+        "check(document.getElementsByTagName(name)[0]===document.head,'tag:'+name);"
+        "check(document.querySelector(name)===document.head,'query:'+name);"
+        "check(document.querySelectorAll(name).length===1,'queryAll:'+name);}"
+        "check(scope.getElementsByTagName('SPAN')[0]===child,'element tags');"
+        "check(scope.querySelector('SpAn.Mixed')===child,'compound');"
+        "check(document.querySelector('SECTION > SPAN')===child,'combinator');"
+        "check(child.matches('SPAN')&&child.matches(':is(SPAN,.other)'),'matches');"
+        "check(!child.matches('SPAN.mixed'),'class case');"
+        "check(document.querySelector('rect').id==='vector','SVG exact');"
+        "check(document.querySelector('RECT')===null,'SVG upper');"
+        "check(!document.querySelector('rect').matches('RECT'),"
+        "'SVG matches');pocSummary='HTML-TAG-CASE-OK'})()",
+        "<html-tag-query-case>", &result);
+    if (!okay) fprintf(stderr, "HTML tag queries: %s\n", result.error);
+    CHECK(okay && strcmp(result.summary, "HTML-TAG-CASE-OK") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_css_property_name_canonical_fast_path(void)
 {
     Budget budget;
@@ -5034,6 +5112,9 @@ static int test_diagnostic_probe_leaves_jobs_pending(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--html-tag-case-only") == 0)
+        return test_html_tag_query_case();
+    CHECK(test_html_tag_query_case() == 0);
     if (argc == 2 && strcmp(argv[1], "--task-runnable-only") == 0)
         return test_task_runnable_follows_the_event_loop();
     CHECK(test_task_runnable_follows_the_event_loop() == 0);
@@ -5087,6 +5168,9 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--task-time-slice-only") == 0)
         return test_runtime_task_time_slice();
     if (argc == 2
+        && strcmp(argv[1], "--intersection-entry-accessor-only") == 0)
+        return test_intersection_entry_inherited_accessor();
+    if (argc == 2
         && strcmp(argv[1], "--intersection-observer-budget-only") == 0)
         return test_intersection_observer_registration_budget();
     if (argc == 2 && strcmp(argv[1], "--resize-observer-budget-only") == 0)
@@ -5116,6 +5200,7 @@ int main(int argc, char **argv)
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_intersection_observer_registration_budget() == 0);
+    CHECK(test_intersection_entry_inherited_accessor() == 0);
     CHECK(test_resize_observer_registration_budget() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_computed_style_memo_invalidation() == 0);
@@ -8061,6 +8146,7 @@ int main(int argc, char **argv)
         "for(const type of ['loadstart','progress','load','loadend'])"
         "uploadXhr.upload.addEventListener(type,recordUpload('u-'+type));"
         "uploadXhr.addEventListener('loadend',recordUpload('x-loadend'));"
+        "const uploadDone=new Promise(resolve=>uploadXhr.onloadend=resolve);"
         "uploadXhr.open('POST','https://example.test/upload');"
         "uploadXhr.send('abcde');const uploadNative=nextNative-1;"
         "__tilefinchDeliverNetwork(uploadNative,true,raw,true,100,200,300,"
@@ -8072,7 +8158,7 @@ int main(int argc, char **argv)
         "__tilefinchPumpTimers(20,16);const deferredNative=nextNative-1;"
         "__tilefinchDeliverNetwork(deferredNative,true,raw,true,110,210,310,"
         "410,510,2,2,true,false,false,true,2,200,'text/plain');"
-        "const deferredBody=await deferredPromise;"
+        "const deferredBody=await deferredPromise;await uploadDone;"
         "const xhrTiming=performance.getEntriesByName("
         "'https://example.test/upload','resource')[0],fetchTiming="
         "performance.getEntriesByName("
@@ -8107,7 +8193,10 @@ int main(int argc, char **argv)
         "&&stats.completed===14&&stats.launchFailed===0"
         "&&stats.active===0&&stats.waiting===0"
         "&&stats.currentCount===0&&cancels.length===13"
-        "?'NETWORK-QUEUE-OK':'NETWORK-QUEUE-FAILED:'+JSON.stringify(stats);"
+        "?'NETWORK-QUEUE-OK':'NETWORK-QUEUE-FAILED:'+JSON.stringify({stats,"
+        "fifo,cancelName,countQuota,xhrDeferred,xhrQuotaError,xhrQuotaReentered,"
+        "abortReleased,byteQuota,queuedBeforeTimeout,timeoutEvent,uploadOk,"
+        "progressShapeOk,timingOk,nativeDeferred,deferredBody,uploadEvents});"
         "})().catch(error=>{globalThis.pocSummary='NETWORK-QUEUE-ERROR:'+"
         "String(error&&error.stack||error)});";
     bool network_queue_ok = script_runtime_evaluate_diagnostic(

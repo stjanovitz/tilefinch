@@ -645,6 +645,43 @@ class VisualScenarioTest(unittest.TestCase):
         self.assertTrue(scenarios[0].trivial_viewport)
         self.assertEqual(scenarios[5].checkpoints[1].kind, "selector")
 
+    def test_capture_hydration_selector_is_an_optional_manifest_column(self) -> None:
+        lines = (BENCHMARKS / "visual-scenarios.tsv").read_text().splitlines()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.tsv"
+            manifest.write_text(lines[0] + "\thydration_selector\n" +
+                                lines[1] + "\tmain\n")
+            self.assertEqual(len(load_manifest(manifest)), 1)
+            manifest.write_text(lines[0] + "\tunknown_capture_column\n" +
+                                lines[1] + "\tmain\n")
+            with self.assertRaises(ManifestError):
+                load_manifest(manifest)
+
+    def test_retained_user_agent_is_bound_to_the_document_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace = self.make_trace(root)
+            ua = "Mozilla/5.0 (Portable capture)"
+            (trace / "0000.meta").write_text("method=GET\nurl=https://fixture.test/\nrequest-user-agent=" + ua + "\nstatus=200\n")
+            item = scenario(trace_digest(trace))
+            reference = root / "reference"
+            candidate = root / "candidate"
+            reference.mkdir()
+            candidate.mkdir()
+            state = state_for(item, "reference", reference)
+            state["browser"].update(user_agent=ua, user_agent_source="retained-document-request-v1",
+                user_agent_sha256=hashlib.sha256(ua.encode()).hexdigest())
+            reference_path = reference / "state.json"
+            candidate_path = candidate / "state.json"
+            write_state(reference_path, state)
+            write_state(candidate_path, state_for(item, "candidate", candidate))
+            self.assertEqual(qualify(item, trace, reference_path, candidate_path).status, "ELIGIBLE")
+            state["browser"].update(user_agent="different",
+                user_agent_sha256=hashlib.sha256(b"different").hexdigest())
+            write_state(reference_path, state)
+            self.assertIn("reference-browser-user-agent-trace-mismatch",
+                          qualify(item, trace, reference_path, candidate_path).details)
+
     def test_manifest_clock_bounds_match_the_native_lab(self) -> None:
         lines = (BENCHMARKS / "visual-scenarios.tsv").read_text().splitlines()
         header = lines[0].split("\t")

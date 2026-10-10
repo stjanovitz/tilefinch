@@ -1977,9 +1977,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             psp_ui_media_set_seek_preview(
                 &media->ui, media->pending_target.target_us);
         uint64_t duration_us = psp_media_duration_us(media);
-        /* Only an in-process retry, quality fallback, or system resume may
-           continue an existing playback transaction. A fresh watch-page open
-           always starts at zero: durable profile positions made a later app
+        /* An explicit provider start time, in-process retry, quality fallback,
+           or system resume may continue an existing playback transaction.
+           A fresh watch-page open starts at zero unless its URL requests a
+           position: durable profile positions made a later app
            launch pay an immediate random-access seek over a new CDN route,
            which is both surprising and less reliable than a clean start.
            Any continuation, a paused one at 0:00 included, resumes through

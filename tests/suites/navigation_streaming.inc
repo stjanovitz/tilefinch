@@ -157,6 +157,55 @@ static bool test_resumable_layout_cancel_preserves_incumbent(void)
     return ok && clean;
 }
 
+static bool test_parser_head_cssom_preserves_initialization(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2);
+    char error[256] = {0};
+    bool replay = ready && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-parser-head-cssom",
+        error, sizeof(error));
+    if (replay) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = replay ? navigation_begin(&navigation) : 0;
+    bool loaded = replay && navigation_load_url(
+        &navigation, generation, "https://head-cssom.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    lxb_dom_node_t *field = loaded ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "field") : NULL;
+    size_t marker_length = 0;
+    const char *marker = field == NULL ? NULL : document_attribute(
+        field, "data-ready", &marker_length);
+    bool ok = loaded && navigation.page.runtime != NULL
+        && navigation.performance.parser_checkpoint_cssom_refusals == 0
+        && navigation.performance.optional_work_sheds == 0
+        && marker != NULL && marker_length == 3
+        && memcmp(marker, "yes", 3) == 0
+        && strcmp(navigation.page.script_result.summary,
+                  "true|rgb(18, 52, 86)|true|37|73px") == 0;
+    if (!ok) fprintf(stderr,
+        "head CSSOM loaded=%d runtime=%p refusals=%zu sheds=%zu "
+        "summary=\"%s\" error=\"%s\"\n", loaded,
+        (void *) navigation.page.runtime,
+        navigation.performance.parser_checkpoint_cssom_refusals,
+        navigation.performance.optional_work_sheds,
+        navigation.page.script_result.summary, navigation.last_error);
+    if (replay) fetch_trace_end();
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_response_headers_precede_parser_script_and_viewport(void)
 {
     Budget budget;

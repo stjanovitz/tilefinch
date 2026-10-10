@@ -417,7 +417,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 used_minimum = child_basis;
             }
             if (child_width < used_minimum) child_width = used_minimum;
-            if (child_width < 8) child_width = 8;
+            if (child_width < 0) child_width = 0;
             trace_flex_sizing(context, "assigned", node, item->node,
                               child_style, content_width, total_basis,
                               remaining, cursor_x, child_basis, child_width);

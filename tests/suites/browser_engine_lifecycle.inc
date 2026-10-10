@@ -1608,12 +1608,26 @@ static int test_css_transition_lifecycle(void)
         "#long{transition:-webkit-transform .3s cubic-bezier(.2,.8,.2,1),"
         "opacity 300ms steps(4,end)}"
         "#inl{transition:opacity 1s}"
+        ".delegated.ready .leaf{transform:translateX(10px);"
+        "transition:transform 40ms}"
+        ".delegated.ready.shift .leaf{transform:translateX(20px)}"
+        "#flushed{width:120px}"
         "</style></head><body>"
         "<div id=a class=panel>a</div><div id=b class=panel>b</div>"
         "<div id=c class=menu>c</div><div id=d class=none>d</div>"
         "<div id=e class=panel>e</div><div id=long>l</div>"
         "<div id=inl style='transition: color 2s linear 1s'>i</div>"
-        "<div id=sw>s</div></body></html>";
+        "<div id=sw>s</div>"
+        "<section id=parent class=delegated><div class=leaf>x</div></section>"
+        "<section id=late class=delegated><div class=leaf>x</div></section>"
+        "<section id=concealed class=delegated style='display:none'>"
+        "<div class=leaf>x</div></section>"
+        "<section id=covered class=delegated><div class=leaf>x</div></section>"
+        "<section id=flushed class='delegated ready' style='display:none'>"
+        "<div class=leaf>x</div></section>"
+        "<div style='width:120px'><div id=forced-auto style='display:none'>"
+        "auto-sized child</div></div>"
+        "</body></html>";
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
     BrowserConfig config;
@@ -1624,6 +1638,37 @@ static int test_css_transition_lifecycle(void)
     CHECK(engine != NULL && browser_engine_commit_html(engine,
         "https://transition.test/", page, sizeof(page) - 1u, true));
     NavigationSession *navigation = browser_engine_navigation(engine);
+    /* Use the actual committed browser wiring, not the synthetic flush
+       callback used by the detailed transition timing checks below. */
+    ScriptResult forced_result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "(()=>{const n=document.getElementById('forced-auto');"
+        "n.style.display='block';const first=n.offsetWidth;"
+        "n.parentNode.style.width='160px';"
+        "globalThis.pocSummary=[first,n.offsetWidth,n.offsetWidth].join(',');"
+        "n.parentNode.style.width='120px';"
+        "n.style.display='none'})()", "<committed-geometry-flush>",
+        &forced_result) && forced_result.success);
+    if (strcmp(forced_result.summary, "120,160,160") != 0)
+        fprintf(stderr, "committed forced width=%s\n", forced_result.summary);
+    CHECK(strcmp(forced_result.summary, "120,160,160") == 0);
+    CHECK(script_runtime_has_pending_mutations(navigation->page.runtime));
+    CHECK(script_runtime_flush_geometry_layout(navigation->page.runtime,
+                                               &navigation->viewport));
+    /* A same-generation read is allocation-free; refusal on a later build
+       does not retire the realm or consume the browser's pending work. */
+    budget_inject_failure_after(navigation->budget, 0);
+    CHECK(script_runtime_flush_geometry_layout(navigation->page.runtime,
+                                               &navigation->viewport));
+    document_note_connected_mutation(&navigation->page.document);
+    CHECK(!script_runtime_flush_geometry_layout(navigation->page.runtime,
+                                                &navigation->viewport));
+    budget_clear_failure_injection(navigation->budget);
+    CHECK(navigation->page.loaded && navigation->page.runtime != NULL);
+    CHECK(script_runtime_has_pending_mutations(navigation->page.runtime));
+    CHECK(script_runtime_flush_geometry_layout(navigation->page.runtime,
+                                               &navigation->viewport));
+    CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
     script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
         computed_style_test_flush, navigation);
     static const char computed[] =
@@ -1666,6 +1711,29 @@ static int test_css_transition_lifecycle(void)
         "log.push('sw:'+event.propertyName);done()});"
         "$('sw').style.transitionDuration='80ms';"
         "$('sw').style.transform='translate3d(-100px, 0px, 0px)';"
+        "$('parent').addEventListener('transitionend',event=>{"
+        "log.push('parent:'+event.propertyName+':'"
+        "+(event.target!==event.currentTarget));done()});"
+        "$('parent').classList.add('ready');"
+        "$('late').classList.add('ready');"
+        "$('late').addEventListener('webkitTransitionEnd',event=>{"
+        "log.push('late:'+event.propertyName+':'"
+        "+(event.target!==event.currentTarget));done()});"
+        "$('concealed').addEventListener('transitionend',event=>{"
+        "log.push('concealed:'+event.propertyName);done()});"
+        "$('concealed').classList.add('ready');"
+        "setTimeout(()=>{$('concealed').style.display='block'},20);"
+        "setTimeout(()=>{$('concealed').classList.add('shift')},80);"
+        "$('flushed').addEventListener('transitionend',event=>{"
+        "log.push('flushed:'+event.propertyName);done()});"
+        "$('flushed').style.display='block';void $('flushed').offsetWidth;"
+        "$('flushed').classList.add('shift');"
+        "$('covered').addEventListener('transitionend',event=>{"
+        "log.push('covered:end');done()});"
+        "$('covered').addEventListener('transitioncancel',event=>{"
+        "log.push('covered:cancel');done()});"
+        "$('covered').classList.add('ready');"
+        "setTimeout(()=>{$('covered').style.display='none'},20);"
         "log.push('TE:'+typeof TransitionEvent);done()})()";
     CHECK(script_runtime_evaluate_diagnostic(
               navigation->page.runtime, lifecycle, "<transition-lifecycle>",
@@ -1676,7 +1744,9 @@ static int test_css_transition_lifecycle(void)
         "TE:function,a:transitionend:opacity:0.04,"
         "a:transitionrun:opacity:0,a:transitionstart:opacity:0,"
         "b:transitionend:transform:0.06,c:transitionend:opacity:0.05,"
-        "e:transitioncancel:opacity:0.022,sw:transform";
+        "concealed:transform,covered:cancel,"
+        "e:transitioncancel:opacity:0.022,flushed:transform,late:transform:true,"
+        "parent:transform:true,sw:transform";
     for (unsigned tick = 0; tick < 24
                             && strcmp(result.summary, expected_events) != 0;
          tick++) {
@@ -1966,8 +2036,8 @@ static int test_transition_snapshot_refusal_releases_arrays(void)
         "globalThis.pocSummary=String(__calls)})()",
         "<snapshot-setup>", &result) && result.success);
     unsigned insertions = (unsigned) strtoul(result.summary, NULL, 10);
-    /* 3 transitions x 3 lists, 4 values, 4 result slots. */
-    CHECK(insertions == 17u);
+    /* 3 transitions x 3 lists, 4 values, 5 result slots (rendered flag). */
+    CHECK(insertions == 18u);
     unsigned leaks = 0;
     for (unsigned fail_at = 0; fail_at <= insertions; fail_at++) {
         char source[64];
@@ -4650,6 +4720,7 @@ static int test_contenteditable_relayout_refusal_retires_shell(void)
           && !navigation->page.loaded
           && navigation->page.layout.count == 0u
           && browser_engine_render_metrics_view(engine) == NULL
+          && strstr(browser_engine_last_error(engine), "page update") != NULL
           && !browser_engine_render_frame(engine, 0));
 
     CHECK(browser_engine_shutdown(engine));
@@ -4688,6 +4759,7 @@ static int test_author_relayout_refusal_retires_shell(void)
           && !navigation->page.loaded
           && navigation->page.layout.count == 0u
           && browser_engine_render_metrics_view(engine) == NULL
+          && strstr(browser_engine_last_error(engine), "page update") != NULL
           && !browser_engine_render_frame(engine, 0));
 
     static const char timer_page[] =
@@ -4704,6 +4776,7 @@ static int test_author_relayout_refusal_retires_shell(void)
           && !navigation->page.loaded
           && navigation->page.layout.count == 0u
           && browser_engine_render_metrics_view(engine) == NULL
+          && strstr(browser_engine_last_error(engine), "page update") != NULL
           && !browser_engine_render_frame(engine, 0));
 
     static const char external_page[] =
@@ -4925,6 +4998,7 @@ static int test_post_mutation_document_refresh_refusal_retires_shell(void)
           && browser_engine_render_metrics_view(engine) == NULL
           && strstr(navigation->last_error,
                     "refresh mutated DOM") != NULL
+          && strcmp(browser_engine_last_error(engine), navigation->last_error) == 0
           && !browser_engine_render_frame(engine, 0)
           && !browser_engine_activate(engine, &action));
 

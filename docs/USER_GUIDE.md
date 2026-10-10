@@ -112,13 +112,58 @@ available; they do not require a separate Shorts player.
 
 ### YouTube home topics
 
-The YouTube homepage shows its search box first, without downloading a feed.
+The YouTube homepage shows its search box first, without waiting for a feed.
+Use **Sign in** in its header to open Google's sign-in page. YouTube itself
+always stays in the native provider, including service redirects. Once
+signed in, recommendations replace generic topics, and **Subscriptions** opens
+your subscription feed. These bounded feeds load during idle turns, so search
+does not wait for them. A status line shows when suggestions are reloading.
+If you have moved down into the page, new results wait behind **Refresh
+suggestions** rather than changing beneath your selection. Otherwise they
+appear automatically. Feed responses are kept only in memory.
+
+In the signed-in header, **Account** opens a small local panel for feed
+navigation and switching accounts; select Account again to close it.
+**Sign out** is the last header action. On personalized feeds, **Refresh
+suggestions** sits beside the heading and follows the video cards in
+sequential focus order.
+
+**Sign out** in the signed-in header removes this browser's YouTube cookies
+and cached personalized provider pages, then returns to the search homepage.
+It removes any saved YouTube login from the Memory Stick, but does not
+delete unrelated site data or sign
+the account out on other devices. A separately signed-in Google session is
+left intact; selecting Sign in can use that session again.
+
+After a newly verified login, a native prompt asks whether to save it and
+whether to ask next time. **Not now; ask next time** is selected by default.
+**Save; ask next time** saves this login only; **Always save; don't ask** also
+remembers that preference. **Never save; don't ask** keeps logins in RAM and
+removes an existing saved login. Change this choice under
+**Settings → Video → Save YouTube login**. Saving requires Cookies & storage
+to be enabled. Session cookies—not your password—are stored unencrypted on
+the card; anyone with the card may be able to use the login. Save only on a
+card you trust. A failed save leaves the current session working. There is
+no login write on exit or on an ordinary suggestions refresh.
+
+When signed in, the homepage also checks your most recent YouTube history
+entry. If it is not already suggested, a **Recently watched** card shows it;
+otherwise its existing card receives the newer playback metadata. An exact
+position supplied by YouTube becomes a resume link. If only a percentage is
+available, the card shows that progress without guessing a seek time. This
+optional lookup does not save playback history on the Memory Stick, and a
+failed or empty history response does not hide your suggestions.
+
 **Settings → Video → YouTube home topics** defaults to On and loads up to
 eight provider-supplied Explore destinations afterward. Turn it Off to skip
 that optional request. These are categories, not a trending-search ranking;
 signed-out YouTube does not consistently supply such a list. If discovery
 fails, the search box remains usable. Topics follow the PSP's system language
-where YouTube supplies localized labels.
+where YouTube supplies localized labels, as video metadata does. The introductory
+banner disappears once topics are available. Provider controls such as Account,
+Refresh suggestions and playback actions use the selected interface language.
+That preference is independent of the system language sent to YouTube for
+video metadata and topic names.
 
 ## Other languages and language packs
 

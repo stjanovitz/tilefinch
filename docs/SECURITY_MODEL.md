@@ -222,7 +222,7 @@ expiry, `Secure`, `HttpOnly`, `SameSite` Default/Lax/Strict/None,
 cannot set Secure cookies. Script access excludes HttpOnly values. Cookie names
 and serialized fields reject control, non-ASCII, and invalid token bytes.
 
-The jar holds 32 cookies overall and at most eight for one exact domain;
+The jar holds 64 cookies overall and at most 32 for one exact domain;
 insertion evicts the oldest applicable entry so one origin cannot permanently
 deny storage to every other site. Paths through 319 bytes remain inline.
 Exceptional paths through 2,047 bytes use an on-demand session pool capped at

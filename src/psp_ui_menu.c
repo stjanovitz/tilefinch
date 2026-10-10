@@ -185,6 +185,8 @@ static bool menu_handle_escape(
             intent->glyph_offer_answer = PSP_UI_GLYPH_OFFER_CANCEL;
         else if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER)
             intent->action = PSP_UI_ACTION_HEAVY_CANCEL;
+        else if (ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN)
+            intent->action = PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
             psp_ui_clear_find(ui);
             intent->action = PSP_UI_ACTION_FIND_CLOSE;

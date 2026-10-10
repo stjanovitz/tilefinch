@@ -5092,6 +5092,18 @@
     };
   }
   let xhrEventTargetState, xhrPublicState, xhrPrivateState;
+  /* The optional native recorder retains numeric metadata only. */
+  const xhrIteratorPrototype = Object.getPrototypeOf((function* () {})()),
+    xhrIteratorNext = Function.call.bind(xhrIteratorPrototype.next),
+    xhrIteratorReturn = Function.call.bind(xhrIteratorPrototype.return);
+  let xhrDiagnosticRecord = null;
+  const xhrDiagnosticAdd = (state, column, value = 1, replace = false) => {
+    if (xhrDiagnosticRecord && state && state.diagnosticSequence)
+      xhrDiagnosticRecord(state.diagnosticSequence, column, value, replace);
+  };
+  globalThis.__tilefinchXHRDiagnostics = (recorder) => {
+    xhrDiagnosticRecord = recorder;
+  };
   const xhrEventHandlerTypes = [
       "abort",
       "error",
@@ -5198,7 +5210,9 @@
         uploadComplete: false,
         uploadStarted: false,
         url: "",
+        diagnosticSequence: 0,
       };
+      xhrEventTargetState(this).diagnosticState = this.#privateState;
     }
     get responseType() {
       return xhrPrivateState(this).responseType;
@@ -5218,12 +5232,15 @@
     }
     get responseText() {
       const state = xhrPrivateState(this);
+      xhrDiagnosticAdd(state, 5);
       if (state.responseType !== "" && state.responseType !== "text")
         throw new DOMException(
           "responseText is unavailable for this response type",
           "InvalidStateError",
         );
-      return state.responseText;
+      const readyState = xhrPublicState(this).readyState;
+      return readyState === 3 || readyState === 4
+        ? state.responseText : "";
     }
     open(method, url, async = true) {
       const state = xhrPrivateState(this);
@@ -5299,16 +5316,27 @@
       xhrEmit(this, "loadend", loaded, total);
       return state.generation === generation;
     }
-    _apply(raw, generation) {
+    *_apply(raw, generation) {
       const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return;
-      if (!xhrUploadFinish(this, "load", generation)) return;
+      if (state.uploadStarted && !state.uploadComplete) {
+        state.uploadComplete = true;
+        for (const type of ["progress", "load", "loadend"]) {
+          yield [this.upload, type, state.uploadBytes, state.uploadBytes, true];
+          if (state.done || state.generation !== generation) return;
+        }
+      }
       xhrSetPublic(this, "status", Number(raw.status) || 0);
+      xhrDiagnosticAdd(state, 1, Number(raw.status) || 0, true);
       xhrSetPublic(this, "responseURL", raw.url || state.url);
       state.responseHeaders = new Headers(
         raw.headers || "content-type: " + raw.contentType + "\n",
       );
-      if (!xhrState(this, 2, generation)) return;
+      xhrSetPublic(this, "readyState", 2);
+      state.stateTrace.push(2);
+      xhrDiagnosticAdd(state, 4, 2, true);
+      yield [this, "readystatechange", 0, 0, false];
+      if (state.done || state.generation !== generation) return;
       const supplied =
           raw.bodyBytes instanceof ArrayBuffer
             ? new Uint8Array(raw.bodyBytes)
@@ -5328,7 +5356,12 @@
           ? String(raw.body)
           : new TextDecoder().decode(supplied || new Uint8Array())
         : "";
-      if (!xhrState(this, 3, generation)) return;
+      xhrDiagnosticAdd(state, 3, state.responseText.length, true);
+      xhrSetPublic(this, "readyState", 3);
+      state.stateTrace.push(3);
+      xhrDiagnosticAdd(state, 4, 3, true);
+      yield [this, "readystatechange", 0, 0, false];
+      if (state.done || state.generation !== generation) return;
       const fallbackBody = raw.body === undefined ? "" : String(raw.body),
         byteLength = Number.isFinite(Number(raw.bodyLength))
           ? Math.max(0, Number(raw.bodyLength))
@@ -5336,8 +5369,9 @@
             ? supplied.byteLength
             : new TextEncoder().encode(fallbackBody).byteLength;
       state.responseBytes = byteLength;
+      xhrDiagnosticAdd(state, 2, byteLength, true);
       state.responseLengthComputable = true;
-      xhrEmit(this, "progress", byteLength, byteLength);
+      yield [this, "progress", byteLength, byteLength, true];
       if (state.generation !== generation || state.done) return;
       if (state.responseType === "" || state.responseType === "text")
         xhrSetPublic(this, "response", state.responseText);
@@ -5388,8 +5422,20 @@
       } else if (state.responseType === "document") {
         xhrSetPublic(this, "responseXML", this.response);
       }
-      if (!xhrState(this, 4, generation)) return;
-      xhrFinish(this, "load", generation);
+      xhrSetPublic(this, "readyState", 4);
+      state.stateTrace.push(4);
+      xhrDiagnosticAdd(state, 4, 4, true);
+      yield [this, "readystatechange", 0, 0, false];
+      if (state.done || state.generation !== generation) return;
+      state.done = true;
+      if (state.timeoutId) clearTimeout(state.timeoutId);
+      state.timeoutId = 0;
+      state.requestId = 0;
+      yield [this, "load", byteLength, byteLength, true];
+      if (state.generation !== generation) return;
+      yield [this, "loadend", byteLength, byteLength, true];
+      if (state.generation === generation)
+        xhrDiagnosticAdd(state, 4, 5, true);
     }
     _fail(error, type = "error", generation) {
       const state = xhrPrivateState(this);
@@ -5409,6 +5455,8 @@
       if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
       globalThis.__tilefinchXHRSendCalls++;
+      if (xhrDiagnosticRecord)
+        state.diagnosticSequence = xhrDiagnosticRecord(0, 0, 0, false);
       state.sent = true;
       state.done = false;
       const generation = state.generation;
@@ -5543,6 +5591,7 @@
     abort() {
       const state = xhrPrivateState(this);
       if (state.done) return;
+      xhrDiagnosticAdd(state, 4, 7, true);
       state.generation += 1;
       const generation = state.generation;
       if (state.timeoutId) clearTimeout(state.timeoutId);
@@ -5595,9 +5644,17 @@
       configurable: true,
       enumerable: true,
       get() {
-        xhrPrivateState(this);
+        const privateState = xhrPrivateState(this);
         const state = xhrPublicState(this);
         if (!state) throw new TypeError("Illegal invocation");
+        if (name === "response") {
+          xhrDiagnosticAdd(privateState, 6);
+          if (privateState.responseType === "" ||
+              privateState.responseType === "text")
+            return state.readyState === 3 || state.readyState === 4
+              ? privateState.responseText : "";
+          if (state.readyState !== 4) return null;
+        }
         return state[name];
       },
     });
@@ -5639,8 +5696,9 @@
     xhrFinishImpl = TilefinchXMLHttpRequest.prototype._finish,
     xhrApplyImpl = TilefinchXMLHttpRequest.prototype._apply,
     xhrFailImpl = TilefinchXMLHttpRequest.prototype._fail,
+    xhrCheckpointDispatch = globalThis.__tilefinchDispatchEventTargetCheckpointed,
     xhrEmitTarget = (target, type, loaded = 0, total = 0,
-                     lengthComputable = total > 0) => {
+                     lengthComputable = total > 0, complete = null) => {
       /* XMLHttpRequest is the user agent, not author script.  Its progress
          events are trusted ProgressEvents in browsers; readystatechange is
          the one plain Event in this sequence.  Challenge runtimes inspect
@@ -5655,7 +5713,13 @@
               total,
             }),
       );
-      target.dispatchEvent(event);
+      const state = xhrDiagnosticRecord
+        ? xhrEventTargetState(target).diagnosticState : null;
+      if (type === "readystatechange") xhrDiagnosticAdd(state, 7);
+      else if (type === "progress") xhrDiagnosticAdd(state, 8);
+      else if (type === "load") xhrDiagnosticAdd(state, 9);
+      if (complete) xhrCheckpointDispatch(target, event, complete);
+      else target.dispatchEvent(event);
     },
     xhrEmit = (xhr, type, loaded = 0, total = 0) =>
       xhrEmitTarget(xhr, type, loaded, total),
@@ -5695,6 +5759,7 @@
       const state = xhrPrivateState(xhr);
       if (state.generation !== generation || state.done) return false;
       state.stateTrace.push(value);
+      xhrDiagnosticAdd(state, 4, value, true);
       xhrStateImpl.call(xhr, value);
       return state.generation === generation && !state.done;
     },
@@ -5712,22 +5777,56 @@
           : supplied !== null
             ? supplied
             : new TextEncoder().encode(String(raw.body || "")).byteLength;
-      xhrApplyImpl.call(xhr, raw, generation);
-      if (xhrGenerationCurrent(xhr, generation)
+      const iterator = xhrApplyImpl.call(xhr, raw, generation),
+        completed = () => {
+          if (xhrGenerationCurrent(xhr, generation)
           && xhr.readyState === 4 && xhr.status !== 0) {
-        const state = xhrPrivateState(xhr);
-        globalThis.__tilefinchXHRResponseCount++;
-        globalThis.__tilefinchXHRLastStatus = xhr.status;
-        globalThis.__tilefinchXHRLastResponseType = state.responseType;
-        globalThis.__tilefinchXHRLastTextLength = state.responseText.length;
-        globalThis.__tilefinchXHRLastByteLength = byteLength;
-        globalThis.__tilefinchXHRLastStates = state.stateTrace.join(".");
+            const state = xhrPrivateState(xhr);
+            xhrDiagnosticAdd(state, 1, xhr.status, true);
+            xhrDiagnosticAdd(state, 2, byteLength, true);
+            xhrDiagnosticAdd(state, 3, state.responseText.length, true);
+            globalThis.__tilefinchXHRResponseCount++;
+            globalThis.__tilefinchXHRLastStatus = xhr.status;
+            globalThis.__tilefinchXHRLastResponseType = state.responseType;
+            globalThis.__tilefinchXHRLastTextLength = state.responseText.length;
+            globalThis.__tilefinchXHRLastByteLength = byteLength;
+            globalThis.__tilefinchXHRLastStates = state.stateTrace.join(".");
+          }
+        };
+      /* Serialize the buffered native response across browser-invoked event
+         checkpoints. Never advance readyState past a listener's pending
+         promises. Sync send()/authored dispatchEvent() stay synchronous. */
+      if (xhrPrivateState(xhr).async) {
+        const next = () => {
+          try {
+            const step = xhrIteratorNext(iterator);
+            if (step.done) completed();
+            else {
+              const event = step.value;
+              xhrEmitTarget(event[0], event[1], event[2], event[3], event[4], next);
+            }
+          } catch (error) {
+            xhrIteratorReturn(iterator);
+            xhrFail(xhr, error, "error", generation);
+          }
+        };
+        next();
+      } else {
+        for (let event = 0; event < 12; event++) {
+          const step = xhrIteratorNext(iterator);
+          if (step.done) { completed(); return; }
+          const value = step.value;
+          xhrEmitTarget(value[0], value[1], value[2], value[3], value[4]);
+        }
+        xhrIteratorReturn(iterator);
+        throw new Error("XHR response event sequence exceeded its bound");
       }
     },
     xhrFail = (xhr, error, type = "error", generation) => {
       if (!xhrGenerationCurrent(xhr, generation)) return;
       const previous = globalThis.__tilefinchXHRLastError;
       xhrFailImpl.call(xhr, error, type, generation);
+      xhrDiagnosticAdd(xhrPrivateState(xhr), 4, 6, true);
       if (type !== "error") globalThis.__tilefinchXHRLastError = previous;
     };
   /* A dedicated worker may be terminated while one of its owner-backed XHR

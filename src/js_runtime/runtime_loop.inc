@@ -231,6 +231,243 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
     return ok;
 }
 
+static JSValue runtime_record_xhr(JSContext *context, JSValueConst receiver,
+                                   int argc, JSValueConst *argv)
+{
+    (void) receiver;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL || runtime->xhr_diagnostics == NULL || argc != 4)
+        return JS_UNDEFINED;
+    uint32_t sequence = 0, column = 0;
+    double value = 0;
+    if (JS_ToUint32(context, &sequence, argv[0]) < 0
+        || JS_ToUint32(context, &column, argv[1]) < 0
+        || JS_ToFloat64(context, &value, argv[2]) < 0) return JS_EXCEPTION;
+    ScriptXHRDiagnostics *history = runtime->xhr_diagnostics;
+    if (sequence == 0) {
+        if (runtime->xhr_diagnostic_sequence == UINT32_MAX)
+            return JS_NewUint32(context, 0);
+        sequence = ++runtime->xhr_diagnostic_sequence;
+        uint32_t *row = history->rows[runtime->xhr_diagnostic_cursor];
+        memset(row, 0, sizeof(history->rows[0]));
+        row[0] = sequence;
+        row[4] = 1;
+        runtime->xhr_diagnostic_cursor =
+            (runtime->xhr_diagnostic_cursor + 1) % SCRIPT_XHR_DIAGNOSTIC_LIMIT;
+        if (history->count < SCRIPT_XHR_DIAGNOSTIC_LIMIT) history->count++;
+        else if (history->overwritten < SIZE_MAX) history->overwritten++;
+        return JS_NewUint32(context, sequence);
+    }
+    if (column == 0 || column >= SCRIPT_XHR_DIAGNOSTIC_COLUMNS
+        || !isfinite(value) || value < 0) return JS_UNDEFINED;
+    uint32_t *row = history->rows[(sequence - 1) % SCRIPT_XHR_DIAGNOSTIC_LIMIT];
+    if (row[0] != sequence) return JS_UNDEFINED;
+    int replace = JS_ToBool(context, argv[3]);
+    if (replace < 0) return JS_EXCEPTION;
+    uint32_t current = replace ? 0 : row[column];
+    row[column] = value >= UINT32_MAX - current
+        ? UINT32_MAX : current + (uint32_t) value;
+    return JS_UNDEFINED;
+}
+
+int js_rt_private_classify(ScriptRuntime *runtime, JSValueConst value,
+                          JSValueConst parse, int event)
+{
+    if (runtime == NULL || runtime->xhr_diagnostics == NULL
+        || runtime->private_outcome_classifying
+        || !runtime->xhr_diagnostics->outcome_classifier_installed) return 0;
+    JSContext *context = runtime->context;
+    runtime->private_outcome_classifying = true;
+    JSValueConst arguments[3] = { value, parse, JS_NewInt32(context, event) };
+    JSValue category = JS_Call(context, runtime->private_outcome_classifier,
+                              JS_UNDEFINED, 3, arguments);
+    int outcome = 0;
+    double numeric = 0;
+    if (JS_IsNumber(category) && JS_ToFloat64(context, &numeric, category) == 0
+        && numeric >= 0 && numeric < (event >= 2 ? 8192 : SCRIPT_PRIVATE_OUTCOME_COUNT)
+        && numeric == (int) numeric) outcome = (int) numeric;
+    if (JS_IsException(category)) {
+        JSValue exception = JS_GetException(context);
+        JS_FreeValue(context, exception);
+    }
+    JS_FreeValue(context, category);
+    runtime->private_outcome_classifying = false;
+    return outcome;
+}
+
+unsigned script_runtime_private_probe(ScriptRuntime *runtime, bool failures)
+{
+    return (unsigned) js_rt_private_classify(runtime, JS_UNDEFINED, JS_UNDEFINED,
+                                             failures ? 3 : 2);
+}
+
+static JSValue runtime_diagnostic_json_parse(JSContext *context,
+    JSValueConst receiver, int argc, JSValueConst *argv, int magic, JSValue *data)
+{
+    (void) magic;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    ScriptXHRDiagnostics *history = runtime == NULL ? NULL : runtime->xhr_diagnostics;
+    if (history != NULL && history->json_parse_calls < SIZE_MAX)
+        history->json_parse_calls++;
+    JSValue result = JS_Call(context, data[0], receiver, argc, argv);
+    if (history != NULL && JS_IsException(result)
+        && history->json_parse_failures < SIZE_MAX)
+        history->json_parse_failures++;
+    if (history != NULL && !JS_IsException(result)
+        && !runtime->private_outcome_classifying
+        && history->outcome_classifier_installed) {
+        int outcome = js_rt_private_classify(runtime, result, data[0], 0);
+        if (history->outcome_counts[outcome] < SIZE_MAX)
+            history->outcome_counts[outcome]++;
+    }
+    return result;
+}
+
+bool script_runtime_private_outcome_classifier(
+    ScriptRuntime *runtime, const char *source, size_t length)
+{
+    if (runtime == NULL || runtime->xhr_diagnostics == NULL || source == NULL
+        || length == 0 || length > 16384 || source[length] != '\0'
+        || JS_HasException(runtime->context)) return false;
+    JSValue classifier = JS_Eval(runtime->context, source, length,
+        "<private-outcome-classifier>", JS_EVAL_TYPE_GLOBAL);
+    bool ok = !JS_IsException(classifier)
+        && JS_IsFunction(runtime->context, classifier) && !JS_IsProxy(classifier);
+    if (ok) {
+        JS_FreeValue(runtime->context, runtime->private_outcome_classifier);
+        runtime->private_outcome_classifier = classifier;
+        runtime->xhr_diagnostics->outcome_classifier_installed = true;
+    } else {
+        JS_FreeValue(runtime->context, classifier);
+        if (JS_HasException(runtime->context)) {
+            JSValue exception = JS_GetException(runtime->context);
+            JS_FreeValue(runtime->context, exception);
+        }
+    }
+    return ok;
+}
+
+static bool runtime_install_private_json_observer(ScriptRuntime *runtime)
+{
+    JSContext *context = runtime->context;
+    if (JS_HasException(context)) return false;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue json = JS_UNDEFINED, parse = JS_UNDEFINED;
+    JSPropertyDescriptor json_property = {0}, parse_property = {0};
+    JSAtom json_name = JS_NewAtom(context, "JSON");
+    JSAtom parse_name = JS_NewAtom(context, "parse");
+    bool ok = json_name != JS_ATOM_NULL && parse_name != JS_ATOM_NULL
+        && !JS_IsProxy(global)
+        && JS_GetOwnProperty(context, &json_property, global, json_name) == 1
+        && !(json_property.flags & JS_PROP_GETSET)
+        && JS_IsObject(json_property.value) && !JS_IsProxy(json_property.value);
+    if (ok) {
+        json = JS_DupValue(context, json_property.value);
+        ok = JS_GetOwnProperty(context, &parse_property, json, parse_name) == 1
+            && !(parse_property.flags & JS_PROP_GETSET)
+            && (parse_property.flags & JS_PROP_WRITABLE)
+            && JS_IsFunction(context, parse_property.value);
+    }
+    if (ok) parse = JS_DupValue(context, parse_property.value);
+    JSValue observer = JS_UNDEFINED;
+    if (ok) {
+        observer = JS_NewCFunctionData(context, runtime_diagnostic_json_parse,
+                                       2, 0, 1, &parse);
+        ok = !JS_IsException(observer);
+    }
+    if (ok) {
+        JSValue name = JS_NewString(context, "parse");
+        ok = !JS_IsException(name);
+        if (ok) ok = JS_DefinePropertyValueStr(context, observer, "name",
+            name, JS_PROP_CONFIGURABLE) == 1;
+    }
+    if (ok) {
+        ok = JS_DefinePropertyValue(context, json, parse_name, observer,
+            parse_property.flags & JS_PROP_C_W_E) == 1;
+        observer = JS_UNDEFINED; /* DefineProperty consumes on either outcome. */
+    }
+    JS_FreeValue(context, observer);
+    JS_FreeValue(context, parse);
+    JS_FreeValue(context, json);
+    JS_FreeValue(context, json_property.value);
+    JS_FreeValue(context, json_property.getter);
+    JS_FreeValue(context, json_property.setter);
+    JS_FreeValue(context, parse_property.value);
+    JS_FreeValue(context, parse_property.getter);
+    JS_FreeValue(context, parse_property.setter);
+    JS_FreeAtom(context, json_name);
+    JS_FreeAtom(context, parse_name);
+    JS_FreeValue(context, global);
+    if (!ok) {
+        JSValue exception = JS_GetException(context);
+        JS_FreeValue(context, exception);
+    }
+    return ok;
+}
+
+bool script_runtime_xhr_diagnostics(
+    ScriptRuntime *runtime, bool enable, ScriptXHRDiagnostics *snapshot)
+{
+    if (snapshot != NULL) *snapshot = (ScriptXHRDiagnostics) {0};
+    if (runtime == NULL) return false;
+    if (enable && runtime->xhr_diagnostics == NULL) {
+        runtime->xhr_diagnostics = budget_calloc_category(runtime->budget,
+            BUDGET_CATEGORY_JAVASCRIPT, 1, sizeof(*runtime->xhr_diagnostics));
+        if (runtime->xhr_diagnostics == NULL) return false;
+        JSValue recorder = JS_NewCFunction(runtime->context, runtime_record_xhr, "", 4);
+        if (JS_IsException(recorder)) {
+            JSValue exception = JS_GetException(runtime->context);
+            JS_FreeValue(runtime->context, exception);
+        }
+        bool ok = !JS_IsException(recorder)
+            && runtime_call_host(runtime, SCRIPT_HOST_XHR_DIAGNOSTICS,
+                                  1, &recorder, NULL);
+        JS_FreeValue(runtime->context, recorder);
+        if (ok) {
+            ok = runtime_install_private_json_observer(runtime);
+            runtime->xhr_diagnostics->json_parse_observer_installed = ok;
+        }
+        if (!ok) {
+            budget_free(runtime->budget, runtime->xhr_diagnostics);
+            runtime->xhr_diagnostics = NULL;
+            return false;
+        }
+    }
+    if (snapshot != NULL && runtime->xhr_diagnostics != NULL) {
+        const ScriptXHRDiagnostics *history = runtime->xhr_diagnostics;
+        snapshot->count = history->count;
+        snapshot->overwritten = history->overwritten;
+        snapshot->json_parse_calls = history->json_parse_calls;
+        snapshot->json_parse_failures = history->json_parse_failures;
+        snapshot->json_parse_observer_installed = history->json_parse_observer_installed;
+        snapshot->outcome_classifier_installed = history->outcome_classifier_installed;
+        snapshot->navigation_accepted = history->navigation_accepted;
+        snapshot->navigation_refused = history->navigation_refused;
+        snapshot->navigation_consumed = history->navigation_consumed;
+#if !defined(__PSP__)
+        snapshot->staging_count = history->staging_count;
+        snapshot->staging_overwritten = history->staging_overwritten;
+        memcpy(snapshot->staging_rows, history->staging_rows,
+               sizeof(snapshot->staging_rows));
+#endif
+        memcpy(snapshot->outcome_counts, history->outcome_counts,
+               sizeof(snapshot->outcome_counts));
+        memcpy(snapshot->rejection_kinds, history->rejection_kinds,
+               sizeof(snapshot->rejection_kinds));
+        memcpy(snapshot->rejection_stages, history->rejection_stages,
+               sizeof(snapshot->rejection_stages));
+        for (size_t i = 0; i < history->count; i++) {
+            size_t slot = (runtime->xhr_diagnostic_cursor
+                + SCRIPT_XHR_DIAGNOSTIC_LIMIT - history->count + i)
+                % SCRIPT_XHR_DIAGNOSTIC_LIMIT;
+            memcpy(snapshot->rows[i], history->rows[slot], sizeof(history->rows[0]));
+        }
+    }
+    return true;
+}
+
 bool script_runtime_scheduler_snapshot(
     ScriptRuntime *runtime, ScriptSchedulerSnapshot *snapshot)
 {

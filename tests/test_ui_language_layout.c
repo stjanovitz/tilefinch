@@ -7,6 +7,8 @@
 #include <strings.h>
 #include <unistd.h>
 #include "tilefinch/glyph_component.h"
+#include "tilefinch/browser_engine.h"
+#include "tilefinch/youtube_lite.h"
 
 static void observe_text(const char *, int, int, int, int,
                          int, int, int, int, bool, bool);
@@ -380,6 +382,239 @@ static bool test_square_button_symbol(void)
     return true;
 }
 
+static lxb_dom_node_t *provider_node(BrowserEngine *engine, const char *id)
+{
+    lxb_dom_node_t *root = lxb_dom_interface_node(
+        browser_engine_navigation(engine)->page.document.html);
+    lxb_dom_node_t *node = root;
+    for (size_t visits = 0; node && visits < 8192; visits++) {
+        size_t length = 0;
+        const char *value = document_attribute(node, "id", &length);
+        if (value && length == strlen(id) && !memcmp(value, id, length)) return node;
+        if (node->first_child) node = node->first_child;
+        else {
+            while (node != root && !node->next) node = node->parent;
+            node = node == root ? NULL : node->next;
+        }
+    }
+    return NULL;
+}
+
+static bool provider_text_fits(BrowserEngine *engine, const FontSet *fonts)
+{
+    const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
+    for (size_t at = 0; at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT || !command->text_length) continue;
+        if (command->x < 0 || command->x + command->width > WIDTH)
+            fprintf(stderr, "text bounds x=%d width=%d text=%.*s\n", command->x,
+                command->width, (int)command->text_length, command->text);
+        CHECK(command->x >= 0 && command->x + command->width <= WIDTH);
+        bool bold = draw_command_font_weight_code(command) >= 65u;
+        const FontFace *face = font_context_face_variant(layout->fonts, layout->web_fonts,
+            draw_command_font_family(command), draw_command_font_italic(command), bold);
+        int width = (font_text_width_for_family_at_size_fixed(face,
+            font_context_metric_family(layout->web_fonts, draw_command_font_family(command), face), command->text,
+            command->text_length, draw_command_text_font_size_fixed(command), false,
+            bold) + 63) / 64;
+        if (width > command->width + 2)
+            fprintf(stderr, "text width=%d available=%d text=%.*s\n", width,
+                command->width, (int)command->text_length, command->text);
+        CHECK(width <= command->width + 2);
+    }
+    (void) fonts;
+    return true;
+}
+
+static bool test_bidi_glyph_raster(const FontSet *fonts, Budget *budget)
+{
+    enum { W = 64, H = 32 };
+    size_t owned = budget->current;
+    DrawCommand command = {.type = DRAW_TEXT, .x = 2, .y = 2, .width = 60,
+        .height = 24, .text = "ABC", .text_length = 3, .color = 0xffffff,
+        .opacity_scale = 256};
+    draw_command_set_text_font_size_fixed(&command, 16 * 64);
+    LayoutBidiGlyph glyphs[] = {
+        {.codepoint = 'C', .x_fixed = 2 * 64},
+        {.codepoint = 'A', .x_fixed = 22 * 64},
+        {.codepoint = 'B', .x_fixed = 42 * 64}
+    };
+    LayoutBidiCommand bidi = {.command_index = 0, .glyph_count = 3};
+    LayoutDocument layout = {.budget = budget, .fonts = fonts,
+        .commands = &command, .count = 1, .capacity = 1, .width = W,
+        .scroll_width = W, .height = H, .bidi_commands = &bidi,
+        .bidi_command_count = 1, .bidi_glyphs = glyphs, .bidi_glyph_count = 3};
+    CHECK(viewport_context_init(&layout.viewport, W, H, W, H));
+    uint16_t actual[W * H] = {0}, expected[W * H] = {0};
+    TileCache cache = {0};
+    CHECK(tile_cache_init(&cache, budget, &layout, 4)
+        && tile_cache_set_frame(&cache, actual, W * H)
+        && tile_cache_render_frame(&cache, 0, W, H, NULL));
+    tile_cache_destroy(&cache);
+    DrawCommand reference[3];
+    for (size_t at = 0; at < 3; at++) {
+        reference[at] = command;
+        reference[at].text = at == 0 ? "C" : at == 1 ? "A" : "B";
+        reference[at].text_length = 1;
+        reference[at].width = 18;
+        draw_command_set_text_x_fixed(&reference[at], glyphs[at].x_fixed);
+    }
+    layout.commands = reference;
+    layout.count = layout.capacity = 3;
+    layout.bidi_command_count = 0;
+    CHECK(tile_cache_init(&cache, budget, &layout, 4)
+        && tile_cache_set_frame(&cache, expected, W * H)
+        && tile_cache_render_frame(&cache, 0, W, H, NULL));
+    tile_cache_destroy(&cache);
+    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    CHECK(budget->current == owned);
+    return true;
+}
+
+static bool provider_paint(BrowserEngine *engine, TilefinchGlyphProvider *provider)
+{
+    for (unsigned pass = 0; pass < 64; pass++) {
+        CHECK(browser_engine_render_frame(engine, NULL));
+        bool changed = false;
+        size_t read = 0;
+        CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+        if (!read) return true;
+        tile_cache_repaint_glyphs(browser_engine_render_shell(engine));
+    }
+    CHECK(false);
+}
+
+static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider *provider)
+{
+    static const char *const notices[] = {
+        "Search above or select Refresh.", "Reloading suggestions...",
+        "New suggestions ready - select Refresh.", "Suggestions up to date.",
+        "Suggestions unavailable - try Refresh.", "Sign in to view your subscriptions.",
+        "Suggestions will load in the background.", "Select Like or Unlike.",
+        "Saving like...", "Video liked.", "Like failed - select Like to retry.",
+        "Sign in to like this video.", "Removing like...", "Like removed.",
+        "Unlike failed - select Unlike to retry.", "Sign in to unlike this video."
+    };
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * 1024u * 1024u;
+    config.resources.enabled = false;
+    config.resources.web_fonts_enabled = false;
+    CHECK(browser_config_set_font_paths(&config,
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 1536u * 1024u));
+    char error[256] = {0};
+    for (unsigned lane = 0; lane < 3; lane++) {
+        fprintf(stderr, "provider layout language=%s lane=%u\n", language_code, lane);
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine && browser_engine_set_youtube_topics(engine, false));
+        if (lane == 1) {
+            CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_ROOT
+                "/tests/fixtures/http-youtube-personalized", error, sizeof(error)));
+            CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+                "https://m.youtube.com/", "SAPISID=fixture; Secure; HttpOnly; Path=/"));
+        }
+        if (lane < 2) {
+            CHECK(browser_engine_load_url(engine, "https://www.youtube.com/", true));
+            CHECK(browser_engine_render_frame(engine, NULL));
+            if (lane == 1) {
+                for (unsigned turn = 0; turn < 256; turn++) {
+                    bool changed = false;
+                    (void) browser_engine_run_idle_work(engine, &changed);
+                    if (browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT) break;
+                }
+                CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
+            }
+        } else {
+            static const char watch[] = "<script>var ytInitialData='{}';</script>"
+                "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+                "\"title\":\"Account\",\"shortDescription\":\"Account\",\"lengthSeconds\":\"200\"}};</script>";
+            YoutubeLiteDocument document = {0};
+            CHECK(youtube_lite_build_document(browser_engine_budget(engine),
+                "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details",
+                watch, sizeof(watch) - 1u, &document, error, sizeof(error)));
+            /* Author text coinciding with a UI key must not be translated. */
+            CHECK(strstr(document.html, "<h1>Account</h1>") != NULL
+                && strstr(document.html, "{{") == NULL);
+            CHECK(browser_engine_commit_html(engine,
+                "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details",
+                document.html, document.html_length, true));
+            youtube_lite_document_destroy(&document);
+        }
+        CHECK(provider_paint(engine, provider));
+        lxb_dom_node_t *search = provider_node(engine, "yt-search");
+        size_t length = 0;
+        const char *placeholder = document_attribute(search, "placeholder", &length);
+        const char *translated = tilefinch_ui_logical_text("Search YouTube");
+        CHECK(placeholder && length == strlen(translated)
+            && !memcmp(placeholder, translated, length));
+        CHECK(provider_text_fits(engine, fonts));
+        /* Background/border insertions must not attach a neighboring RTL
+           label's glyph map to the unlocalized brand. */
+        const LayoutDocument *painted = &browser_engine_navigation(engine)->page.layout;
+        for (size_t at = 0; at < painted->count; at++) {
+            const DrawCommand *command = &painted->commands[at];
+            if (command->type != DRAW_TEXT || command->text_length != 7
+                || memcmp(command->text, "YouTube", 7)) continue;
+            const LayoutBidiCommand *b = layout_bidi_command_for_index(painted, at);
+            for (size_t g = 0; b && g < b->glyph_count; g++)
+                CHECK(painted->bidi_glyphs[b->glyph_start + g].codepoint < 128);
+        }
+        const LayoutDocument *notice_layout = &browser_engine_navigation(engine)->page.layout;
+        const LayoutNodeBox *notice = layout_box_for_node(notice_layout,
+            provider_node(engine, lane == 2 ? "yt-like-status" : "yt-feed-status"));
+        if (notice) {
+            const FontFace *face = font_context_face(notice_layout->fonts, notice_layout->web_fonts, FONT_SANS);
+            for (size_t at = 0; at < sizeof(notices) / sizeof(*notices); at++) {
+                const char *text = tilefinch_ui_text(notices[at]);
+                int width = (font_text_width_at_size_fixed(face, text, strlen(text), 11 * 64, false) + 63) / 64;
+                CHECK(width <= notice->width);
+            }
+            if (lane == 1 && !strcmp(language_code, "ar")) {
+                for (size_t at = 0; at < notice_layout->bidi_command_count; at++) {
+                    size_t command = notice_layout->bidi_commands[at].command_index;
+                    CHECK(command < notice->command_start || command >= notice->command_end);
+                }
+            }
+        }
+        if (capture_directory) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s-youtube-%u.ppm", capture_directory, language_code, lane);
+            CHECK(browser_engine_render_frame(engine, path));
+        }
+        if (lane == 1) {
+            const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
+            const LayoutNodeBox *account = layout_box_for_node(layout, provider_node(engine, "yt-account-action"));
+            const LayoutNodeBox *signout = layout_box_for_node(layout, provider_node(engine, "yt-signout-action"));
+            CHECK(account && signout && signout->x + signout->width <= WIDTH - 5);
+            CHECK(browser_engine_focus_node(engine, provider_node(engine, "yt-account-action")));
+            ControllerAction action;
+            CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_CONTROL);
+            CHECK(provider_paint(engine, provider) && provider_text_fits(engine, fonts));
+            const LayoutNodeBox *panel = layout_box_for_node(&browser_engine_navigation(engine)->page.layout,
+                provider_node(engine, "yt-account-panel"));
+            CHECK(panel && panel->y >= 30 && panel->y + panel->height <= HEIGHT);
+            if (capture_directory) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s-youtube-account.ppm", capture_directory, language_code);
+                CHECK(browser_engine_render_frame(engine, path));
+            }
+        }
+        Budget *owned_budget = browser_engine_budget(engine);
+        CHECK(owned_budget && browser_engine_shutdown(engine) && owned_budget->current == 0);
+        browser_engine_destroy(engine);
+        if (lane == 1) fetch_trace_end();
+    }
+    return true;
+}
+
 static bool test_all_languages(void)
 {
     char path[64];
@@ -411,11 +646,13 @@ static bool test_all_languages(void)
     psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
         font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
     CHECK(test_square_button_symbol());
+    CHECK(test_bidi_glyph_raster(&fonts, &budget));
     for (unsigned language = 0; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
         TilefinchUiTranslation *translation;
         CHECK(load_catalog(&budget, language, &translation));
         tilefinch_ui_translation_bind(translation);
         language_code = tilefinch_ui_language_spec(language)->code;
+        CHECK(test_provider_language(&fonts, provider));
         if (language != TILEFINCH_UI_LANGUAGE_ENGLISH) {
             for (size_t key = 0; key < sizeof(navigation_keys) / sizeof(navigation_keys[0]); key++) {
                 CHECK(strcmp(tilefinch_ui_text(navigation_keys[key]), navigation_keys[key]) != 0);
@@ -471,6 +708,13 @@ static bool test_all_languages(void)
                 ui.data_options_selection = selected;
                 CHECK(paint(&ui, provider));
             }
+            ui.screen = PSP_UI_SCREEN_TABS;
+            psp_ui_show_youtube_login_offer(&ui);
+            for (unsigned choice = 0; choice < 4u; choice++) {
+                ui.menu_selection = (uint8_t) choice;
+                CHECK(paint(&ui, provider));
+            }
+            ui.overlay_animation_frames = 0;
             ui.screen = PSP_UI_SCREEN_TABS;
             CHECK(paint(&ui, provider));
             PspUiTabsView tabs = {.count = 2};

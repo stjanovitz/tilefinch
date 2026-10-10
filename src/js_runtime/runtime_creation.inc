@@ -839,7 +839,8 @@ static bool runtime_load_lazy_bootstrap(
         bool bridge_ready = !JS_IsException(global)
             && bridge_atom != JS_ATOM_NULL
             && js_rt_install_function(runtime->context, global,
-                "__tilefinchMotionSourceBridge", js_stylesheet_motion_source, 0);
+                "__tilefinchMotionSourceBridge", js_stylesheet_motion_source, 0)
+            && runtime_define_host_channel(runtime, false);
         if (bridge_ready) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -856,6 +857,10 @@ static bool runtime_load_lazy_bootstrap(
             (void) JS_DeleteProperty(runtime->context, global, bridge_atom, 0);
             JS_FreeAtom(runtime->context, bridge_atom);
         }
+        if (bridge_ready
+            && !runtime_take_host_channel(runtime, "styleFlushed",
+                                           &runtime->motion_style_flushed))
+            evaluated = false;
         JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_STREAMS) {
         evaluated = runtime_evaluate_bootstrap_profiled(
@@ -1789,6 +1794,7 @@ static ScriptRuntime *script_runtime_create_internal(
     host->page_scroll_flush = JS_UNDEFINED;
     host->host_network_queue_stats = JS_UNDEFINED;
     host->host_indexed_db_stats = JS_UNDEFINED;
+    host->motion_style_flushed = JS_UNDEFINED;
     host->dispatch_at = JS_UNDEFINED;
     host->dispatch_handle = JS_UNDEFINED;
     host->dispatch_activation_handle = JS_UNDEFINED;
@@ -1810,6 +1816,7 @@ static ScriptRuntime *script_runtime_create_internal(
 #endif
     host->function_to_string = JS_UNDEFINED;
     host->host_global = JS_UNDEFINED;
+    host->private_outcome_classifier = JS_UNDEFINED;
     for (size_t callback = 0; callback < SCRIPT_HOST_CALLBACK_COUNT;
          callback++) {
         host->host_callbacks[callback] = JS_UNDEFINED;

@@ -106,6 +106,22 @@ static bool style_property_text_indent(const StylePropertyParse *parse)
 
 static bool style_property_font_family(const StylePropertyParse *parse)
 {
+    if (span_case_equal(parse->value, parse->value_length, "inherit")
+        || span_case_equal(parse->value, parse->value_length, "unset")) {
+        /* A heading reset must override an earlier explicit family, not
+           merely leave that value in the cascade. Resolve against the
+           actual parent when this declaration is applied. */
+        parse->style->font_family = FONT_SANS;
+        *parse->mask |= S_FONT_FAMILY;
+        *parse->inherit_mask |= S_FONT_FAMILY;
+        return true;
+    }
+    if (span_case_equal(parse->value, parse->value_length, "initial")) {
+        parse->style->font_family = FONT_SANS;
+        *parse->mask |= S_FONT_FAMILY;
+        *parse->inherit_mask &= ~S_FONT_FAMILY;
+        return true;
+    }
     Stylesheet *sheet = parse->sheet;
     const char *value = parse->value;
     size_t value_length = parse->value_length;
@@ -126,6 +142,7 @@ static bool style_property_font_family(const StylePropertyParse *parse)
                                       &family)) {
                 style->font_family = family;
                 *mask |= S_FONT_FAMILY;
+                *parse->inherit_mask &= ~S_FONT_FAMILY;
             }
         }
     

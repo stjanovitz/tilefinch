@@ -1,3 +1,140 @@
+static bool test_inline_script_configured_source_allowance(void)
+{
+    const size_t padding = 600u * 1024u;
+    static const char prefix[] = "<!doctype html><body><script>/*";
+    static const char suffix[] =
+        "*/document.body.setAttribute('data-large','yes')</script>"
+        "<script>document.body.setAttribute('data-tail','yes')</script>";
+    size_t length = sizeof(prefix) - 1 + padding + sizeof(suffix) - 1;
+    char *html = malloc(length + 1);
+    if (html == NULL) return false;
+    memcpy(html, prefix, sizeof(prefix) - 1);
+    memset(html + sizeof(prefix) - 1, ' ', padding);
+    memcpy(html + sizeof(prefix) - 1 + padding, suffix, sizeof(suffix));
+    ReferrerNavigationReplay fixture = {
+        .document_url = "https://inline-allowance.test/",
+        .stylesheet_url = "https://inline-allowance.test/unused.css",
+        .html = html, .css = "", .response_referrer_policy = "",
+        .stylesheet_request_policy = ""
+    };
+    char directory[128] = {0};
+    bool written = write_referrer_navigation_replay(directory, &fixture);
+    bool all_ok = written;
+    /* Raised file allowance, file refusal, total refusal, disabled scripts. */
+    for (unsigned lane = 0; written && lane < 4; lane++) {
+        Budget budget;
+        budget_init(&budget, 24u * MIB);
+        NavigationSession navigation = {0};
+        bool installed = budget_install_lexbor(&budget);
+        char error[256] = {0};
+        bool ready = installed && navigation_init(&navigation, &budget, 2)
+            && fetch_trace_replay_begin(directory, error, sizeof(error));
+        if (ready) {
+            navigation_enable_scripts(&navigation, 6u * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, lane == 3 ? 0 : 4,
+                lane == 2 ? 512u * 1024u : 2u * MIB,
+                lane == 1 ? 512u * 1024u : MIB, 1000);
+            navigation_set_stream_delivery(&navigation, 8192, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation, fixture.document_url, 2u * MIB,
+            1000, 480, NULL, NULL, true);
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        size_t large_length = 0, tail_length = 0;
+        const char *large = body == NULL ? NULL
+            : document_attribute(body, "data-large", &large_length);
+        const char *tail = body == NULL ? NULL
+            : document_attribute(body, "data-tail", &tail_length);
+        bool ok = loaded && navigation.page.loaded
+            && (lane == 0 ? large != NULL && large_length == 3
+                          : large == NULL)
+            && (lane == 3 ? tail == NULL : tail != NULL && tail_length == 3);
+        if (!ok) fprintf(stderr,
+            "inline allowance lane=%u loaded=%d large=%zu tail=%zu error=%s\n",
+            lane, loaded, large_length, tail_length, navigation.last_error);
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        ok = ok && budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0;
+        if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+        all_ok = all_ok && ok;
+    }
+    if (directory[0] != '\0') remove_referrer_navigation_replay(directory);
+    free(html);
+    return all_ok;
+}
+
+static bool test_parser_refusal_stops_speculative_preview_retries(void)
+{
+    static const char prefix[] =
+        "<!doctype html><html><head><style>body{margin:0}p{height:30px}"
+        "</style></head><body><script>globalThis.first=1</script>"
+        "<p id=content>Visible content</p>";
+    static const char suffix[] = "<p id=tail>Tail content</p>";
+    static const char row[] = "<p>Visible content</p>";
+    const size_t padding = 512u * (sizeof(row) - 1);
+    size_t length = sizeof(prefix) - 1 + padding + sizeof(suffix) - 1;
+    char *html = malloc(length + 1);
+    if (html == NULL) return false;
+    memcpy(html, prefix, sizeof(prefix) - 1);
+    for (size_t i = 0; i < 512u; i++)
+        memcpy(html + sizeof(prefix) - 1 + i * (sizeof(row) - 1),
+               row, sizeof(row) - 1);
+    memcpy(html + sizeof(prefix) - 1 + padding, suffix, sizeof(suffix));
+    ReferrerNavigationReplay fixture = {
+        .document_url = "https://preview-refusal.test/",
+        .stylesheet_url = "https://preview-refusal.test/unused.css",
+        .html = html, .css = "", .response_referrer_policy = "",
+        .stylesheet_request_policy = ""
+    };
+    char directory[128] = {0}, error[256] = {0};
+    bool written = write_referrer_navigation_replay(directory, &fixture);
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    ProgressivePreviewProbe probe = {0};
+    bool ready = written && installed
+        && navigation_init(&navigation, &budget, 2)
+        && navigation_set_progressive_paint_hook(
+            &navigation, capture_progressive_preview, &probe)
+        && fetch_trace_replay_begin(directory, error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4u * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, MIB, MIB, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 64u * 1024u, 32u * 1024u,
+            2, 64u * 1024u, 32u * 1024u, 128u * 1024u, 1000);
+        navigation_set_stream_delivery(&navigation, 1024, 0, 0, 0, 0, 0);
+        navigation_test_refuse_next_parser_checkpoint(
+            NAVIGATION_TEST_PARSER_CHECKPOINT_METADATA);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, fixture.document_url, MIB, 1000,
+        480, NULL, NULL, true);
+    bool ok = loaded && navigation.page.loaded
+        && navigation.performance.optional_work_sheds == 1
+        && navigation.performance.streaming_preview_style_refresh_attempts == 0
+        && test_find_id(lxb_dom_interface_node(navigation.page.document.html),
+                        "tail") != NULL;
+    if (!ok) fprintf(stderr,
+        "preview refusal loaded=%d sheds=%zu speculative-style-retries=%zu\n",
+        loaded, navigation.performance.optional_work_sheds,
+        navigation.performance.streaming_preview_style_refresh_attempts);
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    ok = ok && budget.current == 0;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    if (directory[0] != '\0') remove_referrer_navigation_replay(directory);
+    free(html);
+    return ok;
+}
+
 static bool test_parser_blocking_script_classification(void)
 {
     static const char html[] =

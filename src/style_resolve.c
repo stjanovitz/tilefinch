@@ -1500,6 +1500,12 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     if (NODE_TAG_IS("a")) {
         size_t href_length = 0;
         if (document_attribute(node, "href", &href_length) != NULL) {
+            /* The UA :link color is a declaration on the anchor, not an
+               inherited body color. Author color (including inherit) is
+               applied later by the normal cascade. No history-dependent
+               visited state is exposed here. */
+            style.color = 0x0000ff;
+            style.color_alpha = 255;
             style_set_text_underline(&style, true);
         }
     }
@@ -2963,7 +2969,7 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
                                uint64_t mask, uint64_t mask_high)
 {
     uint64_t paint_high = S2_BACKGROUND_LAYERS | S2_BACKGROUND_BOX
-        | S2_BACKGROUND_POSITION
+        | S2_BACKGROUND_POSITION | S2_BACKGROUND_REPEAT
         | S2_MASK_POSITION | S2_MASK_REPEAT | S2_MASK_SIZE
         | S2_BOX_SHADOW | S2_FILTER;
     if ((mask & (S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_BACKGROUND_SIZE
@@ -2978,7 +2984,8 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
     if (incoming == NULL) {
         if ((mask & S_MASK_IMAGE) != 0) style->mask_image = NULL;
         if ((mask & (S_BACKGROUND_IMAGE | S_TRANSFORM)) == 0
-            && (mask_high & (S2_BOX_SHADOW | S2_FILTER)) == 0) return;
+            && (mask_high & (S2_BOX_SHADOW | S2_FILTER
+                             | S2_BACKGROUND_REPEAT)) == 0) return;
     }
     StylePaintStack merged = current == NULL
         ? (StylePaintStack) {0} : *current;
@@ -3078,19 +3085,34 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
         if (merged.background_count < count) {
             merged.background_count = (uint8_t) count;
         }
-        for (size_t i = 0; i < count
+        for (size_t i = 0; i < merged.background_count
                            && i < STYLE_PAINT_LAYER_LIMIT; i++) {
+            const StylePaintLayer *source = &incoming->backgrounds[i % count];
             merged.backgrounds[i].position_x =
-                incoming->backgrounds[i].position_x;
+                source->position_x;
             merged.backgrounds[i].position_y =
-                incoming->backgrounds[i].position_y;
+                source->position_y;
             merged.backgrounds[i].position_edges =
-                incoming->backgrounds[i].position_edges;
+                source->position_edges;
             merged.backgrounds[i].flags = (uint8_t) (
                 (merged.backgrounds[i].flags
                  & ~STYLE_BACKGROUND_POSITION_PIXELS)
-                | (incoming->backgrounds[i].flags
+                | (source->flags
                    & STYLE_BACKGROUND_POSITION_PIXELS));
+        }
+    }
+    if ((mask_high & S2_BACKGROUND_REPEAT) != 0) {
+        for (size_t i = 0; i < merged.background_count
+                           && i < STYLE_PAINT_LAYER_LIMIT; i++) {
+            /* The legacy repeat longhand has no retained layer of its own. */
+            uint8_t flags = values->background_size_flags;
+            if (incoming != NULL && incoming->background_count != 0) {
+                flags = incoming->backgrounds[i % incoming->background_count].flags;
+            }
+            merged.backgrounds[i].flags = (uint8_t) (
+                (merged.backgrounds[i].flags
+                 & ~(STYLE_BACKGROUND_NO_REPEAT_X | STYLE_BACKGROUND_NO_REPEAT_Y))
+                | (flags & (STYLE_BACKGROUND_NO_REPEAT_X | STYLE_BACKGROUND_NO_REPEAT_Y)));
         }
     }
     if (incoming != NULL && (mask & S_BACKGROUND_SIZE) != 0) {
@@ -3099,14 +3121,15 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
         if (merged.background_count < count) {
             merged.background_count = (uint8_t) count;
         }
-        for (size_t i = 0; i < count
+        for (size_t i = 0; i < merged.background_count
                            && i < STYLE_PAINT_LAYER_LIMIT; i++) {
+            const StylePaintLayer *source = &incoming->backgrounds[i % count];
             merged.backgrounds[i].width =
-                incoming->backgrounds[i].width;
+                source->width;
             merged.backgrounds[i].height =
-                incoming->backgrounds[i].height;
+                source->height;
             merged.backgrounds[i].fit =
-                incoming->backgrounds[i].fit;
+                source->fit;
             merged.backgrounds[i].flags = (uint8_t) (
                 (merged.backgrounds[i].flags
                  & ~(STYLE_BACKGROUND_SIZE_EXPLICIT
@@ -3114,7 +3137,7 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
                      | STYLE_BACKGROUND_HEIGHT_AUTO
                      | STYLE_BACKGROUND_WIDTH_PERCENT
                      | STYLE_BACKGROUND_HEIGHT_PERCENT))
-                | (incoming->backgrounds[i].flags
+                | (source->flags
                    & (STYLE_BACKGROUND_SIZE_EXPLICIT
                       | STYLE_BACKGROUND_WIDTH_AUTO
                       | STYLE_BACKGROUND_HEIGHT_AUTO

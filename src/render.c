@@ -4179,10 +4179,21 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
     }
     if (pixel_height_fixed <= 0) return false;
     size_t misses_before = cache->glyph_cache_misses;
+    bool synthetic_italic = draw_command_font_italic(command)
+        && face == font_context_face_variant(
+            cache->layout->fonts, cache->layout->web_fonts,
+            draw_command_font_family(command), false, bold_face);
+    unsigned humanist_profile = glyph_humanist_profile(
+        cache->layout->fonts, face,
+        font_context_metric_family(cache->layout->web_fonts,
+                                   draw_command_font_family(command), face),
+        bold_face, draw_command_font_italic(command),
+        synthetic_bold, synthetic_italic);
     FontGlyph temporary = {0};
     bool smoothed = false;
     const FontGlyph *glyph = glyph_cache_acquire(
         cache, face, codepoint, pixel_height_fixed, synthetic_bold,
+        humanist_profile,
         &temporary, &smoothed);
     (void) smoothed;
     font_glyph_destroy(face, &temporary);

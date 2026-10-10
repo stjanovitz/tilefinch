@@ -382,7 +382,7 @@ static bool test_youtube_player_response_parser(void)
         return false;
     }
     Budget cancellation_budget;
-    budget_init(&cancellation_budget, 256 * 1024);
+    budget_init(&cancellation_budget, 512 * 1024);
     BrowserSession cancellation_session;
     TilefinchCancellation cancellation;
     tilefinch_cancellation_init(&cancellation);
@@ -867,7 +867,7 @@ static bool test_youtube_subtitle_parser(void)
         "00:05.000 --> 00:06.000\n"
         "After an authored pause\n\n";
     Budget budget;
-    budget_init(&budget, 256u * 1024u);
+    budget_init(&budget, 512u * 1024u);
     YoutubeSubtitleDocument *document = youtube_subtitles_parse_vtt(
         &budget, vtt, sizeof(vtt) - 1u);
     size_t cursor = 0;
@@ -1227,7 +1227,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
                "https://www.youtube.com/watch?v=TFTEST00001"
                "&tilefinch_view=description")
         || youtube_lite_route("http://www.youtube.com/")
-            != YOUTUBE_LITE_ROUTE_NONE
+            != YOUTUBE_LITE_ROUTE_HOME
         || youtube_lite_route("https://notyoutube.com/")
             != YOUTUBE_LITE_ROUTE_NONE
         || youtube_lite_route("https://www.youtube.com/shorts/TFTEST00001")

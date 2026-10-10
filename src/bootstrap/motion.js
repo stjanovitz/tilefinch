@@ -913,6 +913,7 @@
    * event timeline). Bounded to the 64 most recently registered elements.
    */
   const TRANSITION_WATCH_LIMIT = 64,
+    TRANSITION_DISCOVERY_LIMIT = 128,
     /* For `all`: properties pages commonly transition whose computed value
        does not follow layout (a used height changing with content is not a
        transition), plus display, which cancels; display stays first. */
@@ -929,7 +930,8 @@
     TRANSITION_DIRTY_LIMIT = 16,
     transitionDirty = [];
   let transitionCheckQueued = false,
-    transitionDirtyAll = false;
+    transitionDirtyAll = false,
+    transitionCheckActive = false;
   const transitionNames = (state) =>
       state.explicit.length
         ? TRANSITION_SAMPLE.concat(
@@ -961,6 +963,7 @@
       }
       state.values = snapshot[3];
       state.valueNames = state.names;
+      state.rendered = !!snapshot[4];
     },
     /*
      * Where this batch's changes can reach, or null for everywhere. An
@@ -1002,11 +1005,32 @@
       return scopes;
     },
     checkTransitions = () => {
+      if (transitionCheckActive) return;
+      transitionCheckActive = true;
+      try {
+        checkTransitionChanges();
+      } finally {
+        transitionCheckActive = false;
+      }
+    },
+    checkTransitionChanges = () => {
       transitionCheckQueued = false;
       let scopes = null;
       try {
         scopes = transitionScopes();
       } catch {}
+      if (transitionDirtyAll || transitionDirty.some((_, at) =>
+          at % 3 === 1 && transitionDirty[at] !== null)) {
+        let remaining = TRANSITION_DISCOVERY_LIMIT;
+        for (const [root, state] of Array.from(transitionWatched)) {
+          if (!state.observesSubtree || !root.isConnected) continue;
+          if (scopes && !scopes.some((handle) =>
+              root.contains(globalThis.__tilefinchWrap(handle)) ||
+              __tilefinchStyleReach(root.__handle, [handle]))) continue;
+          remaining -= discoverTransitionDescendants(root, remaining);
+          if (remaining <= 0) break;
+        }
+      }
       transitionDirty.length = 0;
       transitionDirtyAll = false;
       for (const [element, state] of Array.from(transitionWatched)) {
@@ -1021,15 +1045,24 @@
         const names = state.names,
           snapshot = transitionSnapshot(element, names);
         if (!snapshot) continue;
-        const [properties, durations, delays, values] = snapshot,
+        const [properties, durations, delays, values, rendered] = snapshot,
           previous = state.values,
-          previousNames = state.valueNames;
+          previousNames = state.valueNames,
+          previouslyRendered = state.rendered;
         state.values = values;
         state.valueNames = names;
-        if (String(values[0] ?? "") === "none") {
+        state.rendered = !!rendered;
+        if (!rendered) {
           for (const name of state.running)
             globalThis.__tilefinchCancelTransition(element, name);
           state.running.clear();
+          continue;
+        }
+        /* A hidden ancestor suppresses transitions too. Revealing a subtree
+           establishes its first rendered style; it is not a transition from
+           values sampled while it had no boxes. */
+        if (!previouslyRendered) {
+          transitionBaseline(element, state);
           continue;
         }
         for (let slot = 1; slot < names.length; slot++) {
@@ -1115,11 +1148,12 @@
     transitionCheckQueued = true;
     queueMicrotask(checkTransitions);
   };
-  globalThis.__tilefinchWatchTransitions = (target, type) => {
+  const watchTransitionElement = (target, observesSubtree = false) => {
     if (!(target instanceof Element) || !(target.__handle > 0)) return;
-    if (type === "webkitTransitionEnd")
-      target.__tilefinchWebkitTransitionEnd = true;
-    if (transitionWatched.has(target)) return;
+    if (transitionWatched.has(target)) {
+      transitionWatched.get(target).observesSubtree ||= observesSubtree;
+      return;
+    }
     if (transitionWatched.size >= TRANSITION_WATCH_LIMIT)
       transitionWatched.delete(transitionWatched.keys().next().value);
     const state = {
@@ -1128,9 +1162,49 @@
       valueNames: TRANSITION_SAMPLE,
       explicit: [],
       running: new Set(),
+      rendered: false,
+      observesSubtree,
     };
     transitionWatched.set(target, state);
     baselineBeforeRecentChanges(target, state);
+  };
+  /* Transition events bubble. An ancestor listener must also observe
+     transitions on descendants, including a class which introduces both
+     the transition and its changed value. Bound discovery independently
+     of retained watches, and avoid synchronous layout during the walk. */
+  const discoverTransitionDescendants = (root, limit) => {
+    let node = root.firstElementChild, visited = 0, ascents = 0;
+    while (node && visited < limit && ascents < limit) {
+      visited++;
+      if (transitionWatched.has(node) ||
+          __tilefinchTransitionSnapshot(node.__handle, null, true)) {
+        if (root.__tilefinchWebkitTransitionEnd)
+          node.__tilefinchWebkitTransitionEnd = true;
+        watchTransitionElement(node);
+      }
+      const child = node.firstElementChild;
+      if (child) { node = child; continue; }
+      while (node !== root && !node.nextElementSibling && ascents < limit) {
+        node = node.parentElement;
+        ascents++;
+        if (!node) return visited;
+      }
+      node = node === root ? null : node.nextElementSibling;
+    }
+    return visited;
+  };
+  globalThis.__tilefinchWatchTransitions = (target, type) => {
+    if (!(target instanceof Element) || !(target.__handle > 0)) return;
+    if (type === "webkitTransitionEnd")
+      target.__tilefinchWebkitTransitionEnd = true;
+    watchTransitionElement(target, true);
+    discoverTransitionDescendants(target, TRANSITION_DISCOVERY_LIMIT);
     globalThis.__tilefinchTransitionsDirty(target, null);
+  };
+  /* A reveal followed by a forced geometry/style read establishes the
+     before-change style immediately. A later change in this same author task
+     can transition; waiting until its microtask would lose that baseline. */
+  globalThis.__tilefinchHostChannel.styleFlushed = () => {
+    if (transitionCheckQueued) checkTransitions();
   };
 })();

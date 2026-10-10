@@ -692,6 +692,9 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "#layered-sprite-position{background-image:linear-gradient(#555,#666),"
         "linear-gradient(#777,#888);background-position:-4px -8px,"
         "-12px -16px}"
+        "#split-sprite{background-image:linear-gradient(transparent,transparent),"
+        "url(sheet.svg)}#split-sprite{background-size:100%;background-position:0 -48px;"
+        "background-repeat:no-repeat}"
         "#axis-position{background-image:linear-gradient(#111,#222);"
         "background-position:10% 20%;background-position-x:right 3px;"
         "background-position-y:75%}"
@@ -711,6 +714,7 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "<div id=background-position></div>"
         "<div id=sprite-position></div>"
         "<div id=layered-sprite-position></div>"
+        "<div id=split-sprite></div>"
         "<div id=axis-position></div>"
         "<table id=table><tr><td>x</td></tr>"
         "</table></body>";
@@ -906,6 +910,21 @@ static int test_bounded_shared_paint_stack(Budget *budget)
                  | STYLE_PAINT_POSITION_Y_PIXELS))
              == (STYLE_PAINT_POSITION_X_PIXELS
                  | STYLE_PAINT_POSITION_Y_PIXELS));
+    ComputedStyle split_sprite = style_for_node(
+        &sheet, find_id(root, "split-sprite"), NULL);
+    const StylePaintStack *split_paint = stylesheet_paint_stack(
+        &sheet, computed_style_paint_stack_id(&split_sprite));
+    CHECK(split_paint != NULL && split_paint->background_count == 2);
+    for (size_t i = 0; i < 2; i++) {
+        CHECK(split_paint->backgrounds[i].position_y == -48
+              && split_paint->backgrounds[i].width == 100
+              && (split_paint->backgrounds[i].flags
+                  & (STYLE_BACKGROUND_SIZE_EXPLICIT | STYLE_BACKGROUND_WIDTH_PERCENT))
+                 == (STYLE_BACKGROUND_SIZE_EXPLICIT | STYLE_BACKGROUND_WIDTH_PERCENT)
+              && (split_paint->backgrounds[i].flags
+                  & (STYLE_BACKGROUND_NO_REPEAT_X | STYLE_BACKGROUND_NO_REPEAT_Y))
+                 == (STYLE_BACKGROUND_NO_REPEAT_X | STYLE_BACKGROUND_NO_REPEAT_Y));
+    }
     ComputedStyle axis_positioned = style_for_node(
         &sheet, find_id(root, "axis-position"), NULL);
     const StylePaintStack *axis_paint = stylesheet_paint_stack(

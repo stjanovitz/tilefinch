@@ -7757,7 +7757,7 @@ static void computed_transition_value(ComputedStylePropertyId id,
 }
 
 /* __tilefinchTransitionSnapshot(handle, names) ->
-   [properties, durations_ms, delays_ms, values]: the transitions whose delay
+   [properties, durations_ms, delays_ms, values, rendered]: transitions whose delay
    plus duration is positive (empty when there are none) and the computed
    values of names, resolved without a synchronous layout. The watcher needs
    those values while no transition applies too: a class can bring the
@@ -7782,6 +7782,10 @@ JSValue js_transition_snapshot(JSContext *context,
         animated = (duration > 0.0 ? duration : 0.0) + delay > 0.0
             && strcmp(transition.properties[i], "none") != 0;
     }
+    /* Descendant discovery needs only the cascade's answer, not four
+       temporary arrays or computed paint values for every visited node. */
+    if (argc > 2 && JS_ToBool(context, argv[2]))
+        return JS_NewBool(context, animated);
     JSValue result = JS_NewArray(context);
     JSValue properties = JS_NewArray(context);
     JSValue durations = JS_NewArray(context);
@@ -7812,6 +7816,26 @@ JSValue js_transition_snapshot(JSContext *context,
         JS_FreeValue(context, length_value);
     }
     if (name_count > 32) name_count = 32;
+    bool rendered = true;
+    unsigned ancestors = 0;
+    lxb_dom_node_t *at = node;
+    for (; ok && at != NULL && ancestors < DOM_ROOT_NODE_ANCESTOR_LIMIT;
+         at = at->parent, ancestors++) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        ComputedStyle style;
+        if (!bridge_computed_style(bridge, at, &style, NULL, NULL)) {
+            JS_FreeValue(context, result);
+            JS_FreeValue(context, properties);
+            JS_FreeValue(context, durations);
+            JS_FreeValue(context, delays);
+            JS_FreeValue(context, values);
+            return js_rt_throw_task_interruption(
+                context, "transition style interrupted");
+        }
+        if (style.display == DISPLAY_NONE) { rendered = false; break; }
+    }
+    if (at != NULL && ancestors == DOM_ROOT_NODE_ANCESTOR_LIMIT)
+        rendered = false;
     bool saved = bridge->computed_style_without_layout;
     bridge->computed_style_without_layout = true;
     for (uint32_t i = 0; ok && i < name_count; i++) {
@@ -7834,6 +7858,8 @@ JSValue js_transition_snapshot(JSContext *context,
         if (ok) ok = JS_SetPropertyUint32(context, result, i, list) >= 0;
         else JS_FreeValue(context, list);
     }
+    if (ok) ok = JS_SetPropertyUint32(
+        context, result, 4, JS_NewBool(context, rendered)) >= 0;
     if (!ok) {
         JS_FreeValue(context, result);
         return JS_EXCEPTION;
@@ -8256,7 +8282,12 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
         : ((bridge->relayout_dirty != NULL && *bridge->relayout_dirty
             && !style_only)
            || (bridge->layout == NULL && used_geometry_property))) {
-        (void) js_rt_bridge_flush_synchronous_layout(bridge);
+        if (js_rt_bridge_flush_synchronous_layout(bridge)) {
+            if (!js_rt_notify_style_flushed(context)) return JS_EXCEPTION;
+            node = js_rt_bridge_node_arg(context, bridge, argv[0]);
+            if (node == NULL || bridge->stylesheet == NULL)
+                return computed_style_string(context, "", empty);
+        }
     }
     if (custom_property) {
         /* A custom property's value comes from the custom-property rules

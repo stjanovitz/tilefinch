@@ -83,9 +83,9 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define UI_GLYPH_OPTION_ROWS 7u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 49u
+#define UI_OPTIONS_ITEM_COUNT 50u
 #else
-#define UI_OPTIONS_ITEM_COUNT 47u
+#define UI_OPTIONS_ITEM_COUNT 48u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -258,7 +258,8 @@ typedef enum {
     UI_OPTION_BASIC_FALLBACK,
     UI_OPTION_HEAVY_PAGES,
     UI_OPTION_WIFI_DIAGNOSTICS,
-    UI_OPTION_YOUTUBE_TOPICS
+    UI_OPTION_YOUTUBE_TOPICS,
+    UI_OPTION_YOUTUBE_LOGIN
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -325,7 +326,8 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_BASIC_FALLBACK,
     UI_OPTION_HEAVY_PAGES,
     UI_OPTION_WIFI_DIAGNOSTICS,
-    UI_OPTION_YOUTUBE_TOPICS
+    UI_OPTION_YOUTUBE_TOPICS,
+    UI_OPTION_YOUTUBE_LOGIN
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -365,6 +367,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_YOUTUBE_RESULTS:
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
         case UI_OPTION_YOUTUBE_TOPICS:
+        case UI_OPTION_YOUTUBE_LOGIN:
         case UI_OPTION_RESUME_DOWNLOADS:
         case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
         case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
@@ -560,6 +563,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Keep connection details in RAM for Diagnostic QR";
         case UI_OPTION_YOUTUBE_TOPICS:
             return "Load Explore topics after the YouTube search box";
+        case UI_OPTION_YOUTUBE_LOGIN:
+            return "Ask, always save, or never save YouTube login";
     }
     return "";
 }
@@ -2708,6 +2713,15 @@ void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
     ui_open_overlay(ui, PSP_UI_SCREEN_HEAVY_OFFER);
 }
 
+void psp_ui_show_youtube_login_offer(PspUiState *ui)
+{
+    if (ui == NULL) return;
+    ui->heavy_offer_arming = PSP_UI_STORAGE_OFFER_ARMING_FRAMES;
+    ui->cursor_visible = false;
+    ui_open_overlay(ui, PSP_UI_SCREEN_YOUTUBE_LOGIN);
+    ui->menu_selection = 2u; /* Not now: confirming a held button cannot opt in. */
+}
+
 void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
                                       unsigned duration_frames)
 {
@@ -3361,6 +3375,30 @@ static TILEFINCH_OUT_OF_LINE void ui_update_storage_offer(
     intent->visual_changed = true;
 }
 
+static TILEFINCH_OUT_OF_LINE void ui_update_youtube_login(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    static const PspUiAction answers[] = {
+        PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS,
+        PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW, PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER
+    };
+    if (pressed & PSP_UI_BUTTON_UP) {
+        ui->menu_selection = (ui->menu_selection + 3u) % 4u;
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_DOWN) {
+        ui->menu_selection = (ui->menu_selection + 1u) % 4u;
+        intent->visual_changed = true;
+    }
+    if (pressed & PSP_UI_BUTTON_CANCEL)
+        intent->action = PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW;
+    else if (pressed & PSP_UI_BUTTON_CONFIRM)
+        intent->action = answers[ui->menu_selection % 4u];
+    if (intent->action != PSP_UI_ACTION_NONE) {
+        ui_close_overlay(ui);
+        intent->visual_changed = true;
+    }
+}
+
 PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
 {
     PspUiIntent intent = { .action = PSP_UI_ACTION_NONE };
@@ -3474,7 +3512,8 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             ui->cursor_visible = false;
     }
 
-    if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER
+    if ((ui->screen == PSP_UI_SCREEN_HEAVY_OFFER
+         || ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN)
         && ui->heavy_offer_arming != 0) {
         ui->heavy_offer_arming--;
         return intent;
@@ -3955,6 +3994,10 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         ui_update_storage_site(ui, pressed, &intent);
         return intent;
     }
+    if (ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN) {
+        ui_update_youtube_login(ui, pressed, &intent);
+        return intent;
+    }
     if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER) {
         ui_update_heavy_offer(ui, pressed, &intent);
         return intent;
@@ -4217,6 +4260,12 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     ui->youtube_topics = !ui->youtube_topics;
                     intent.setting.id = PSP_UI_SETTING_YOUTUBE_TOPICS;
                     intent.setting.value.boolean = ui->youtube_topics;
+                    break;
+                case UI_OPTION_YOUTUBE_LOGIN:
+                    ui->youtube_login_policy = (uint8_t)
+                        ((ui->youtube_login_policy + ((pressed & PSP_UI_BUTTON_LEFT) ? 2u : 1u)) % 3u);
+                    intent.setting.id = PSP_UI_SETTING_YOUTUBE_LOGIN;
+                    intent.setting.value.unsigned_value = ui->youtube_login_policy;
                     break;
                 case UI_OPTION_WIFI_DIAGNOSTICS:
                     ui->wifi_diagnostics = !ui->wifi_diagnostics;
@@ -6051,6 +6100,11 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *label = "YouTube home topics";
             *value = ui->youtube_topics ? "On" : "Off";
             break;
+        case UI_OPTION_YOUTUBE_LOGIN:
+            *label = "Save YouTube login";
+            *value = ui->youtube_login_policy == 1u ? "Always"
+                : ui->youtube_login_policy == 2u ? "Never" : "Ask";
+            break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
             *label = "Power test";
@@ -6978,6 +7032,30 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_confirm(
                     : ui->glyph_confirm_phase == PSP_UI_GLYPH_CONFIRM_ERROR
                         ? "O Close" : "O Cancel",
               24, muted, 2);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_youtube_login_offer(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t text, uint16_t muted)
+{
+    UiRect box = {24, 24, width - 48, 224};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    const char *lines[] = {
+        "Save YouTube login?", "Session cookies, not your password.",
+        "Unencrypted on the Memory Stick.", "Anyone with the card may use your login.",
+        "Save; ask next time", "Always save; don't ask", "Not now; ask next time", "Never save; don't ask"
+    };
+    for (unsigned i = 0; i < 8u; i++) {
+        char line[80];
+        snprintf(line, sizeof(line), "%s%s", i >= 4u && ui->menu_selection == i - 4u ? "> " : "", tilefinch_ui_text(lines[i]));
+        int y = i < 4u ? box.y + 14 + (int) i * 23 : box.y + 100 + (int) (i - 4u) * 25;
+        draw_text_with_font(pixels, width, height, stride, box.x + 14, y,
+            line, sizeof(line), box.x + box.width - 14, i == 0u || i >= 4u ? text : muted,
+            i == 0u || i >= 4u ? 2 : 1, NULL, i == 0u);
+    }
+    draw_text(pixels, width, height, stride, box.x + 14, box.y + 203,
+              "Up/Down Choose   X Confirm   O Not now", 44, muted, 1);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
@@ -8392,6 +8470,8 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
         draw_glyph_confirm(ui, pixels, width, height, stride, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_HEAVY_OFFER) {
         draw_heavy_offer(ui, pixels, width, height, stride, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN) {
+        draw_youtube_login_offer(ui, pixels, width, height, stride, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_OPTIONS) {
         draw_options(ui, pixels, width, height, stride, panel, accent, text,
                      muted);

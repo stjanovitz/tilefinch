@@ -809,6 +809,8 @@ void psp_app_apply_setting(
     }
     if (intent->setting.id == PSP_UI_SETTING_SITE_DATA_ALLOWED) {
         bool allowed = intent->setting.value.boolean;
+        if (!allowed && !psp_app_youtube_login_clear(app))
+            psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
         browser_session_set_site_data_allowed(session, allowed);
         browser_profile_set_site_data_allowed(profile, allowed);
         psp_profile_store_mark_dirty(
@@ -1623,5 +1625,21 @@ void psp_app_apply_setting(
         psp_ui_show_status(&app->process->presentation.ui,
             enabled ? "YOUTUBE HOME TOPICS ON"
                     : "YOUTUBE HOME TOPICS OFF - RELOAD TO HIDE", 240);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_LOGIN) {
+        unsigned policy = intent->setting.value.unsigned_value;
+        if (policy <= YOUTUBE_LOGIN_NEVER) {
+            browser_profile_set_youtube_login_policy(profile, policy);
+            if (policy == YOUTUBE_LOGIN_NEVER) {
+                if (!psp_app_youtube_login_clear(app))
+                    psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
+            } else if (policy == YOUTUBE_LOGIN_ALWAYS) {
+                /* Always requires the warning and a deliberate confirmation. */
+                browser_profile_set_youtube_login_policy(profile, YOUTUBE_LOGIN_ASK);
+                app->process->presentation.ui.youtube_login_policy = YOUTUBE_LOGIN_ASK;
+                psp_ui_show_youtube_login_offer(&app->process->presentation.ui);
+            }
+            psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+        }
     }
 }

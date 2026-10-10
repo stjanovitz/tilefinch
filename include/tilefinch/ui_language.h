@@ -6,7 +6,7 @@
 #include "tilefinch/install_paths.h"
 
 #define TILEFINCH_UI_TRANSLATION_BYTES (32u * 1024u)
-#define TILEFINCH_UI_TRANSLATION_ROWS 256u
+#define TILEFINCH_UI_TRANSLATION_ROWS 320u
 
 typedef enum {
     TILEFINCH_UI_LANGUAGE_ENGLISH,
@@ -55,5 +55,7 @@ bool tilefinch_ui_translation_install(
 void tilefinch_ui_translation_bind(const TilefinchUiTranslation *translation);
 unsigned tilefinch_ui_translation_bound_language(void);
 const char *tilefinch_ui_text(const char *english);
+/* Logical text for HTML; the page renderer performs bidi/shaping itself. */
+const char *tilefinch_ui_logical_text(const char *english);
 
 #endif

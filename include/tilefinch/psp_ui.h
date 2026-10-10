@@ -267,7 +267,11 @@ typedef enum {
     PSP_UI_ACTION_HEAVY_RUN_ALWAYS,
     PSP_UI_ACTION_HEAVY_CANCEL,
     PSP_UI_ACTION_HEAVY_STOP_SCRIPTS,
-    PSP_UI_ACTION_EXIT
+    PSP_UI_ACTION_EXIT,
+    PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE,
+    PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS,
+    PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW,
+    PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER
 } PspUiAction;
 
 /* Stable diagnostic spelling shared by the operation journal and validation
@@ -395,7 +399,8 @@ typedef enum {
     PSP_UI_SETTING_HEAVY_PAGES,
     PSP_UI_SETTING_WIFI_DIAGNOSTICS,
     PSP_UI_SETTING_YOUTUBE_TOPICS,
-    PSP_UI_SETTING_UI_LANGUAGE
+    PSP_UI_SETTING_UI_LANGUAGE,
+    PSP_UI_SETTING_YOUTUBE_LOGIN
 } PspUiSettingId;
 
 typedef union {
@@ -566,7 +571,8 @@ typedef enum {
     /* The language-pack offer's confirmation: the pack's signed size, then
        X Install / O Cancel. An overlay over the page; appended so the
        surfaces above keep their numbers. */
-    PSP_UI_SCREEN_GLYPH_OFFER
+    PSP_UI_SCREEN_GLYPH_OFFER,
+    PSP_UI_SCREEN_YOUTUBE_LOGIN
 } PspUiScreen;
 
 /* True for the native surfaces above, which draw instead of the page. */
@@ -613,6 +619,7 @@ typedef struct {
     /* Native locale uses the spare cursor-status bits, keeping snapshots
        within the existing 1 KiB admission ceiling. */
     uint8_t ui_language : 4;
+    uint8_t youtube_login_policy : 2;
     uint16_t cursor_shape : 4;
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
@@ -1311,6 +1318,7 @@ void psp_ui_show_storage_offer(
    offer it ignores buttons for PSP_UI_STORAGE_OFFER_ARMING_FRAMES. */
 void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
                              size_t script_bytes, uint32_t estimate_ms);
+void psp_ui_show_youtube_login_offer(PspUiState *ui);
 /* A page-scripts status that X answers with HEAVY_STOP_SCRIPTS and O
    dismisses while it shows. */
 void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,

@@ -3460,8 +3460,17 @@ lxb_dom_node_t *document_body_node(const PocDocument *document)
     if (document == NULL || document->html == NULL) {
         return NULL;
     }
-    lxb_html_body_element_t *body = lxb_html_document_body_element(document->html);
-    return body == NULL ? NULL : lxb_dom_interface_node(body);
+    /* The parser's cached body pointer is not the live DOM contract. A head
+       script may temporarily insert a BODY for geometry, or replace it later. */
+    lxb_dom_element_t *root = lxb_dom_document_element(&document->html->dom_document);
+    lxb_dom_node_t *node = root == NULL ? NULL : lxb_dom_interface_node(root)->first_child;
+    for (size_t visited = 0; node != NULL && visited < DOCUMENT_TRAVERSAL_NODE_LIMIT;
+         visited++, node = node->next) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT && node->ns == LXB_NS_HTML
+            && (node->local_name == LXB_TAG_BODY || node->local_name == LXB_TAG_FRAMESET))
+            return node;
+    }
+    return NULL;
 }
 
 const char *document_element_name(lxb_dom_node_t *node, size_t *length)

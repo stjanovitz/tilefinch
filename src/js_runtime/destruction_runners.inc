@@ -30,6 +30,14 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     runtime->bridge.fullscreen_node_handle = 0;
     audio_slots_retire(runtime);
     document_body_snapshot_destroy(&runtime->memory_rescue);
+    if (runtime->geometry_layout != NULL) {
+        if (runtime->bridge.layout == runtime->geometry_layout)
+            runtime->bridge.layout = runtime->geometry_incumbent;
+        layout_destroy(runtime->geometry_layout);
+        budget_free(runtime->budget, runtime->geometry_layout);
+        runtime->geometry_layout = NULL;
+        runtime->geometry_incumbent = NULL;
+    }
     tilefinch_game_audio_destroy(runtime->game_audio);
     runtime->game_audio = NULL;
     if (tilefinch_trace_tasks()) {
@@ -118,6 +126,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         }
         JS_FreeValue(runtime->context, runtime->host_global);
         runtime->host_global = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->private_outcome_classifier);
+        runtime->private_outcome_classifier = JS_UNDEFINED;
         JS_FreeValue(runtime->context, runtime->dispatch_submit_handle);
         JS_FreeValue(
             runtime->context, runtime->dom_content_loaded_dispatch);
@@ -139,10 +149,12 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context, runtime->page_scroll_apply);
         JS_FreeValue(runtime->context, runtime->host_network_queue_stats);
         JS_FreeValue(runtime->context, runtime->host_indexed_db_stats);
+        JS_FreeValue(runtime->context, runtime->motion_style_flushed);
         runtime->page_scroll_flush = JS_UNDEFINED;
         runtime->page_scroll_apply = JS_UNDEFINED;
         runtime->host_network_queue_stats = JS_UNDEFINED;
         runtime->host_indexed_db_stats = JS_UNDEFINED;
+        runtime->motion_style_flushed = JS_UNDEFINED;
         runtime->function_to_string = JS_UNDEFINED;
         runtime->dispatch_submit_handle = JS_UNDEFINED;
         runtime->dom_content_loaded_dispatch = JS_UNDEFINED;
@@ -208,6 +220,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
     budget_free(budget, runtime->validation_phases);
 #endif
+    budget_free(budget, runtime->xhr_diagnostics);
     budget_free(budget, runtime);
 }
 

@@ -1150,7 +1150,7 @@ static bool loop_history(BrowserEngine *engine,
 static void loop_help(void)
 {
     puts("loop commands: status, render [FILE], up|down [HELD], "
-         "page-up|page-down, top|bottom, section-walk COUNT, "
+         "page-up|page-down, top|bottom, scroll-by PIXELS, section-walk COUNT, "
          "focus-next|focus-prev, tap X Y, click TARGET|X Y, "
          "focus-up|focus-down|focus-left|focus-right, "
          "focus-id ID, focus-url URL, link-urls, body-contains TEXT, "
@@ -1158,7 +1158,8 @@ static void loop_help(void)
          "anchor ID, node-text ID, node-attribute ID NAME, "
          "tap X Y, cross|activate, "
          "type TEXT, backspace, profile [LABEL], work [LABEL], census, "
-         "click SELECTOR, tick [COUNT [MS]], until MAX-TURNS MS EXPRESSION, "
+         "click SELECTOR, tick [COUNT [MS]], pump [COUNT [MS]], "
+         "until MAX-TURNS MS EXPRESSION, "
          "drain [MAX-TURNS [SETTLE-MS]], "
          "media-status|media-play|media-pause|media-seek SECONDS|"
          "media-open|media-close|media-run [COUNT [MS]], "
@@ -1177,9 +1178,10 @@ static bool loop_command_is_user_input(const char *line)
 {
     static const char *const commands[] = {
         "up", "down", "dpad-up", "dpad-down", "dpad-left", "dpad-right",
-        "page-up", "page-down", "top", "bottom", "section-walk",
+        "page-up", "page-down", "top", "bottom", "scroll-by", "section-walk",
         "focus-next", "focus-prev", "focus-up", "focus-down", "focus-left",
-        "focus-right", "focus-id", "focus-url", "tap", "click", "type",
+        "focus-right", "focus-id", "focus-url", "tap", "click", "type", "private-text",
+        "private-focus", "private-focus-action",
         "backspace", "activate", "cross", "circle", "back", "ltrigger",
         "forward", "rtrigger", "go", "reload", "reader-on", "reader-off",
         "basic-on"
@@ -1397,6 +1399,265 @@ typedef struct {
     uint64_t latency_paint_us;
 } InteractiveCommandScratch;
 
+static void private_console_wipe(void *memory, size_t length)
+{
+    volatile unsigned char *bytes = memory;
+    while (length-- != 0) *bytes++ = 0;
+}
+
+static YoutubeLiteFeedProbe private_youtube_feed;
+static bool private_youtube_feed_attempted;
+static bool private_youtube_feed_okay;
+static unsigned private_script_retry_count;
+static bool private_service_entry_attempted;
+#include "private_snapshot.inc"
+
+/* Explicit private-console sessions may opt in by supplying this owner-only
+   file in their disposable working directory. Never load it in normal lab or
+   device browsing, follow a symlink, or serialize its input/exception values. */
+static void private_console_load_outcome_classifier(NavigationSession *navigation)
+{
+    int fd = open("outcome-classifier.js", O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return;
+    struct stat file;
+    bool valid = fstat(fd, &file) == 0 && S_ISREG(file.st_mode)
+        && file.st_uid == getuid() && (file.st_mode & 0077) == 0
+        && file.st_nlink == 1 && file.st_size > 0 && file.st_size <= 16384;
+    char *source = valid ? budget_malloc(navigation->budget,
+                                         (size_t) file.st_size + 1) : NULL;
+    if (source != NULL) {
+        size_t length = (size_t) file.st_size, at = 0;
+        while (at < length) {
+            ssize_t got = read(fd, source + at, length - at);
+            if (got <= 0) break;
+            at += (size_t) got;
+        }
+        source[length] = '\0';
+        if (at == length)
+            (void) script_runtime_private_outcome_classifier(
+                navigation->page.runtime, source, length);
+        private_console_wipe(source, length + 1);
+        budget_free(navigation->budget, source);
+    }
+    close(fd);
+}
+
+static bool private_console_command_allowed(const char *command)
+{
+    static const char *const allowed[] = {
+        "status", "render", "up", "down", "page-up", "page-down", "top",
+        "bottom", "scroll-by", "focus-next", "focus-prev", "focus-up",
+        "focus-down", "focus-left", "focus-right", "focus-id", "tap", "click",
+        "activate", "cross", "back", "forward", "reload", "tick", "pump", "drain",
+        "idle", "heavy-answer", "private-text", "private-focus",
+        "private-focus-action", "private-feedback", "private-snapshot", "private-open", "quit", "exit"
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+        if (strcmp(command, allowed[i]) == 0) return true;
+    return false;
+}
+
+static bool private_console_status(int fd, size_t sequence,
+                                   BrowserEngine *engine,
+                                   const BrowserController *controller,
+                                   bool command_ok)
+{
+    if (fd < 0) return true;
+    ControllerTextInputInfo info = {0};
+    bool editable = browser_engine_text_input_info(engine, &info)
+        && info.editable;
+    char origin[272] = "unavailable";
+    /* Private opens intentionally leave history unchanged. Report the live
+       document's authority, including after an authentication handoff. */
+    if (!tilefinch_url_origin(controller->navigation->page.document_url,
+                             origin, sizeof(origin)))
+        snprintf(origin, sizeof(origin), "unavailable");
+    const ScriptResult *js = &controller->navigation->page.script_result;
+    char record[768];
+    int length = snprintf(record, sizeof(record),
+        "S %zu %u %u %u %zu %zu %zu %s %u %zu %zu %zu %zu %zu %zu %zu %u\n",
+        sequence, controller->navigation->page.loaded ? 1u : 0u,
+        editable ? 1u : 0u, (unsigned) controller->focus_kind,
+        controller->focus_index,
+        controller->navigation->page.layout.control_count,
+        controller->navigation->page.script_result.pending_tasks, origin,
+        command_ok ? 1u : 0u, js->network_requests, js->network_failures,
+        js->async_network_completed, js->async_network_timed_out,
+        js->uncaught_callback_errors, js->promise_rejections_created,
+        js->event_handlers_invoked, js->last_event_cancelled ? 1u : 0u);
+    if (length <= 0 || (size_t) length >= sizeof(record)) return false;
+    size_t at = 0;
+    while (at < (size_t) length) {
+        ssize_t written = write(fd, record + at, (size_t) length - at);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return false;
+        at += (size_t) written;
+    }
+    return true;
+}
+
+/* Only rendered, unambiguous fields qualify. Never expose field values or
+   choose a hidden input merely because it has a familiar name. */
+static bool private_console_focus_field(BrowserEngine *engine,
+                                       NavigationSession *navigation,
+                                       const char *kind)
+{
+    bool password = kind != NULL && strcmp(kind, "password") == 0;
+    if (!password && (kind == NULL || strcmp(kind, "username") != 0))
+        return false;
+    lxb_dom_node_t *selected = NULL;
+    unsigned best_rank = 0;
+    size_t matches = 0;
+    const LayoutDocument *layout = &navigation->page.layout;
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *control = &layout->controls[i];
+        if (control->type != CONTROL_INPUT) continue;
+        size_t length = 0;
+        const char *type = document_attribute(control->node, "type", &length);
+        bool is_password = type != NULL && length == 8
+            && strncasecmp(type, "password", 8) == 0;
+        unsigned rank = 0;
+        if (password) rank = is_password ? 2u : 0u;
+        else if (!is_password) {
+            if (type == NULL || length == 0
+                || (length == 4 && strncasecmp(type, "text", 4) == 0)) rank = 1;
+            if (type != NULL && length == 5
+                && strncasecmp(type, "email", 5) == 0) rank = 2;
+            const char *autocomplete = document_attribute(
+                control->node, "autocomplete", &length);
+            if (autocomplete != NULL && length == 8
+                && strncasecmp(autocomplete, "username", 8) == 0) rank = 3;
+        }
+        if (rank == 0 || rank < best_rank) continue;
+        if (rank > best_rank) { best_rank = rank; matches = 0; }
+        selected = control->node;
+        matches++;
+    }
+    return matches == 1 && browser_engine_focus_node(engine, selected);
+}
+
+/* Select a unique rendered button within an ID-labelled action container.
+   This uses the ordinary controller focus/activation path, not a standalone
+   selector-dispatched click that leaves the edited field focused. */
+static bool private_console_focus_action(BrowserEngine *engine,
+                                        NavigationSession *navigation,
+                                        const char *container_id)
+{
+    if (container_id == NULL) return false;
+    size_t wanted = strlen(container_id);
+    if (wanted == 0 || wanted > 128) return false;
+    lxb_dom_node_t *selected = NULL;
+    size_t matches = 0;
+    const LayoutDocument *layout = &navigation->page.layout;
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *control = &layout->controls[i];
+        if (control->type != CONTROL_BUTTON) continue;
+        const LayoutNodeBox *box = layout_box_for_node(layout, control->node);
+        if (box == NULL || box->width <= 0 || box->height <= 0) continue;
+        size_t length = 0;
+        if (document_attribute(control->node, "disabled", &length) != NULL)
+            continue;
+        lxb_dom_node_t *node = control->node;
+        for (size_t depth = 0; node != NULL && depth < 128;
+             depth++, node = node->parent) {
+            const char *id = document_attribute(node, "id", &length);
+            if (id != NULL && length == wanted
+                && memcmp(id, container_id, wanted) == 0) {
+                selected = control->node;
+                matches++;
+                break;
+            }
+        }
+    }
+    return matches == 1 && browser_engine_focus_node(engine, selected);
+}
+
+/* Return only a validation flag, never the author message or field value.
+   Reveal the associated feedback locally rather than capturing an unchanged
+   top-of-form viewport that hides a response below the handheld screen. */
+static bool private_console_reveal_feedback(
+    NavigationSession *navigation, const BrowserController *controller)
+{
+    lxb_dom_node_t *node = controller_focused_node(controller);
+    if (node == NULL) return false;
+    size_t length = 0;
+    const char *invalid = document_attribute(node, "aria-invalid", &length);
+    if (invalid == NULL || length != 4
+        || strncasecmp(invalid, "true", 4) != 0) return false;
+    const LayoutDocument *layout = &navigation->page.layout;
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box == NULL || box->width <= 0 || box->height <= 0) return false;
+    const char *description = document_attribute(node, "aria-describedby", &length);
+    size_t token = 0;
+    while (description != NULL && token < length
+           && !isspace((unsigned char) description[token])) token++;
+    /* A bounded first IDREF is sufficient for the local validation preview.
+       Only retained, visible layout boxes are considered; no DOM walk/eval. */
+    if (description != NULL && token > 0 && token <= 256) {
+        for (size_t i = 0; i < layout->node_box_count; i++) {
+            const LayoutNodeBox *candidate = &layout->node_boxes[i];
+            size_t id_length = 0;
+            const char *id = document_attribute(candidate->node, "id", &id_length);
+            if (id != NULL && id_length == token
+                && memcmp(id, description, token) == 0
+                && candidate->width > 0 && candidate->height > 0) {
+                box = candidate;
+                break;
+            }
+        }
+    }
+    int height = navigation->viewport.css_height > 0
+        ? navigation->viewport.css_height : 272;
+    int scroll = box->y > height / 3 ? box->y - height / 3 : 0;
+    int maximum = viewport_max_scroll_css(&navigation->viewport, layout->height);
+    return navigation_set_scroll(navigation, scroll < maximum ? scroll : maximum);
+}
+
+/* Hex transport preserves spaces and UTF-8 without placing credentials in
+   argv, command files, or the normal whitespace-trimming text command. */
+static bool private_console_set_text(BrowserEngine *engine,
+                                     NavigationSession *navigation,
+                                     const BrowserController *controller,
+                                     const char *hex,
+                                     char *text, size_t capacity)
+{
+    const NavigationEntry *entry = navigation_current(navigation);
+    TilefinchUrl url;
+    if (entry == NULL || !tilefinch_url_parse(entry->url, &url)
+        || !tilefinch_url_is_secure(&url)) return false;
+    if (hex == NULL) return browser_engine_replace_text(engine, "", 0);
+    size_t length = strlen(hex);
+    if ((length & 1u) != 0 || length / 2 >= capacity) return false;
+    bool valid = true;
+    for (size_t i = 0; i < length / 2; i++) {
+        unsigned value = 0;
+        for (size_t j = 0; j < 2; j++) {
+            unsigned char c = (unsigned char) hex[2 * i + j];
+            unsigned digit = c >= '0' && c <= '9' ? c - '0'
+                : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+            if (digit > 15) valid = false;
+            value = value * 16 + digit;
+        }
+        text[i] = (char) value;
+        if (value == 0 || value == '\n' || value == '\r') valid = false;
+    }
+    bool ok = valid && browser_engine_replace_text(engine, text, length / 2);
+    if (ok) {
+        /* A cancelled beforeinput can report successful event dispatch without
+           accepting the value. Return only equality, never the field contents. */
+        char observed[1024];
+        size_t observed_length = 0;
+        ok = controller_text_value(controller, observed,
+                                   sizeof(observed), &observed_length)
+            && observed_length == length / 2
+            && memcmp(observed, text, observed_length) == 0;
+        private_console_wipe(observed, sizeof(observed));
+    }
+    private_console_wipe(text, capacity);
+    return ok;
+}
+
 static bool run_command_loop(FILE *commands, bool interactive,
                              const char *output_dir, BrowserEngine *engine,
                              Budget *budget,
@@ -1407,7 +1668,8 @@ static bool run_command_loop(FILE *commands, bool interactive,
                              const char *user_css, bool capture_frames,
                              bool pace_real_time,
                              ExperimentalSectionContext *experimental,
-                             VisualEvidenceFrames *visual_frames)
+                             VisualEvidenceFrames *visual_frames,
+                             int private_console_fd)
 {
     if (commands == NULL || navigation == NULL || controller == NULL
         || output_dir == NULL || output_dir[0] == '\0') return false;
@@ -1436,6 +1698,15 @@ static bool run_command_loop(FILE *commands, bool interactive,
     }
     if (!visual_evidence_record_frame(visual_frames, navigation)) goto failed;
     loop_print_status(controller, cache, frame_number++);
+    size_t private_sequence = 0;
+    if (private_console_fd >= 0)
+        browser_session_cookie_diagnostics(browser_engine_session(engine), true, NULL);
+    if (private_console_fd >= 0 && navigation->page.runtime != NULL) {
+        if (script_runtime_xhr_diagnostics(navigation->page.runtime, true, NULL))
+            private_console_load_outcome_classifier(navigation);
+    }
+    if (!private_console_status(private_console_fd, private_sequence++,
+                                engine, controller, true)) goto failed;
     if (interactive) loop_help();
 
     /* A pointer click on anything but a text field completes through the
@@ -1461,9 +1732,12 @@ static bool run_command_loop(FILE *commands, bool interactive,
             *argument++ = '\0';
             while (*argument == ' ') argument++;
         }
+        if (private_console_fd >= 0
+            && !private_console_command_allowed(line)) goto failed;
         if (loop_command_is_user_input(line))
             browser_engine_note_user_input(engine);
         bool changed = true, reset_cache = false, ok = true;
+        bool private_command_ok = true;
         uint64_t network_before = navigation->performance.network_us;
         uint64_t script_before = navigation->performance.script_us;
         uint64_t runtime_before = navigation->performance.runtime_us;
@@ -1592,6 +1866,16 @@ static bool run_command_loop(FILE *commands, bool interactive,
                  && (swapped
                      || browser_engine_scroll_step(engine, 1, held));
             reset_cache = swapped;
+        } else if (strcmp(line, "scroll-by") == 0) {
+            char *end = NULL;
+            long delta = argument == NULL ? 0 : strtol(argument, &end, 10);
+            /* Exact native capture positioning must not depend on sticky
+               obstructions changing the page-down step. Section paging has
+               separate coordinates and cannot use this diagnostic command. */
+            ok = argument != NULL && end != argument && *end == '\0'
+                 && delta >= -61440 && delta <= 61440
+                 && (experimental == NULL || !experimental->active)
+                 && browser_engine_scroll_by(engine, (int) delta);
         } else if (strcmp(line, "page-up") == 0) {
             bool swapped = false;
             ok = experimental_scroll_boundary(
@@ -1861,6 +2145,20 @@ static bool run_command_loop(FILE *commands, bool interactive,
         } else if (strcmp(line, "type") == 0 && argument != NULL) {
             ok = browser_engine_insert_text(
                 engine, argument, strlen(argument));
+        } else if (strcmp(line, "private-focus") == 0
+                   && private_console_fd >= 0) {
+            ok = private_console_focus_field(engine, navigation, argument);
+        } else if (strcmp(line, "private-feedback") == 0
+                   && private_console_fd >= 0) {
+            ok = private_console_reveal_feedback(navigation, controller);
+        } else if (strcmp(line, "private-focus-action") == 0
+                   && private_console_fd >= 0) {
+            ok = private_console_focus_action(engine, navigation, argument);
+        } else if (strcmp(line, "private-text") == 0
+                   && private_console_fd >= 0) {
+            ok = private_console_set_text(engine, navigation, controller,
+                                          argument, scratch->text,
+                                          sizeof(scratch->text));
         } else if (strcmp(line, "profile") == 0) {
             /* Print and clear the page realm's sampling profile (enable
                with TILEFINCH_TRACE_JS_PROFILE=1), then the work record. */
@@ -1970,7 +2268,11 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    "probe-ok=%s\n", matched ? "yes" : "no", iterations,
                    count, ok ? "yes" : "no");
             ok = ok && matched;
-        } else if (strcmp(line, "tick") == 0) {
+        } else if (strcmp(line, "tick") == 0 || strcmp(line, "pump") == 0) {
+            /* tick isolates runtime/media. pump follows an ordinary browser
+               turn, including resource, cache and tile maintenance. Private
+               sign-in must not test an artificial runtime-only schedule. */
+            bool full_turn = strcmp(line, "pump") == 0;
             unsigned count = 1, milliseconds = 16;
             if (argument != NULL) {
                 char *end = NULL;
@@ -1988,6 +2290,12 @@ static bool run_command_loop(FILE *commands, bool interactive,
                             (milliseconds % 1000u) * 1000000u)
                     };
                     nanosleep(&delay, NULL);
+                }
+                if (full_turn) {
+                    bool quiet = false;
+                    ok = loop_drain_turn(engine, navigation, media, cache,
+                                         milliseconds, &quiet);
+                    continue;
                 }
                 ok = browser_engine_advance_runtime(
                     engine, milliseconds, 8, NULL);
@@ -2449,6 +2757,83 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 }
                 reset_cache = ok;
             }
+        } else if (strcmp(line, "private-snapshot") == 0
+                   && private_console_fd >= 0) {
+            ok = private_snapshot_page(engine, navigation, argument);
+            changed = false;
+        } else if (strcmp(line, "private-open") == 0
+                   && private_console_fd >= 0) {
+            TilefinchUrl target;
+            bool feed = argument != NULL
+                && (strcmp(argument, "https://www.youtube.com/feed/recommended") == 0
+                    || strcmp(argument, "https://www.youtube.com/feed/subscriptions") == 0);
+            if (feed) {
+                private_youtube_feed = (YoutubeLiteFeedProbe) {0};
+                private_youtube_feed_attempted = false;
+                private_youtube_feed_okay = false;
+                /* The incoming sign-in continuation may have shed scripts
+                   while the incumbent's large realm was still resident.
+                   Once committed, that incumbent is gone. An explicit feed
+                   check may retry this static document once through normal
+                   navigation, without exporting its URL or session state.
+                   Do not retry live realms, disabled scripting, or loop. */
+                bool at_service = tilefinch_url_same_origin(
+                    navigation->page.document_url, "https://m.youtube.com")
+                    || tilefinch_url_same_origin(
+                        navigation->page.document_url, "https://www.youtube.com");
+                /* Existing service credentials are enough to try the native
+                   feed, which verifies them with YouTube. Do not restart the
+                   Google flow merely because its final document stayed there. */
+                bool provider_ready = at_service || youtube_lite_session_signed_in(
+                    browser_engine_session(engine));
+                if (!provider_ready && private_script_retry_count < 2u
+                    && navigation->page.loaded
+                    && navigation->scripts_enabled
+                    && navigation->document_scripts_enabled
+                    && navigation->page.runtime == NULL
+                    && navigation->page.script_degradation_observed) {
+                    private_script_retry_count++;
+                    char retry_url[NAVIGATION_URL_LIMIT];
+                    snprintf(retry_url, sizeof(retry_url), "%s",
+                             navigation->page.document_url);
+                    ok = tilefinch_url_potentially_trustworthy(retry_url)
+                        && loop_load(engine, navigation, controller,
+                                     retry_url, false, 0, user_css);
+                    reset_cache = ok;
+                    changed = false;
+                    /* Let ordinary owner turns complete the service's page
+                       before another explicitly requested feed check. */
+                } else if (!provider_ready && !private_service_entry_attempted) {
+                    /* Authentication belongs to Google. YouTube destinations
+                       always enter the scriptless provider, never its website. */
+                    private_service_entry_attempted = true;
+                    ok = loop_load(engine, navigation, controller,
+                        "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F",
+                        false, 0, user_css);
+                    reset_cache = ok;
+                    changed = false;
+                } else {
+                    /* Once signed in, qualify the actual lightweight UI, not
+                       a second data-only implementation. This local command
+                       retains the session and records no navigation history. */
+                    ok = loop_load(engine, navigation, controller, argument,
+                                   false, 0, user_css);
+                    reset_cache = ok;
+                    changed = ok; /* Paint Home before its first lazy feed turn. */
+                }
+            } else {
+                ok = argument != NULL && tilefinch_url_parse(argument, &target)
+                    && tilefinch_url_potentially_trustworthy(argument)
+                    && loop_load(engine, navigation, controller, argument,
+                                 false, 0, user_css);
+                /* Reuse the ordinary in-memory cookie jar and navigation policy;
+                   never serialize session credentials or record this as history. */
+                reset_cache = ok;
+            }
+            /* These explicit opens replace the document without adding a
+               history entry. Its previous scroll is not a restore request:
+               retaining it can incorrectly mark a new lazy feed as browsed. */
+            if (ok) ok = controller_scroll_to_top(controller, 272);
         } else if (strcmp(line, "render") == 0) {
             if (argument != NULL && argument[0] != '\0') {
                 ok = loop_render(
@@ -2462,7 +2847,11 @@ static bool run_command_loop(FILE *commands, bool interactive,
         }
         if (!ok) {
             fprintf(stderr, "loop command-failed=\"%s\"\n", line);
-            goto failed;
+            if (private_console_fd < 0 || !navigation->page.loaded) goto failed;
+            /* A missing field or refused edit is recoverable in the local UI.
+               Acknowledge it without leaking the command or its value. */
+            private_command_ok = false;
+            changed = false;
         }
         bool remote_swapped = false;
         if (!experimental_process_remote_elements(
@@ -2561,6 +2950,11 @@ static bool run_command_loop(FILE *commands, bool interactive,
         } else {
             loop_print_status(controller, cache, frame_number);
         }
+        if (private_console_fd >= 0 && !pointer_activation_pending) {
+            private_console_wipe(scratch->input, sizeof(scratch->input));
+            if (!private_console_status(private_console_fd, private_sequence++,
+                                        engine, controller, private_command_ok)) goto failed;
+        }
     }
     printf("loop status=PASS frames=%zu output-dir=\"%s\"\n",
            frame_number, output_dir);
@@ -2575,10 +2969,12 @@ static bool run_command_loop(FILE *commands, bool interactive,
            (unsigned long long) scratch->latency_dispatch_us,
            (unsigned long long) scratch->latency_cache_us,
            (unsigned long long) scratch->latency_paint_us);
+    if (private_console_fd >= 0) private_console_wipe(scratch, sizeof(*scratch));
     budget_free(budget, scratch);
     return true;
 
 failed:
+    if (private_console_fd >= 0) private_console_wipe(scratch, sizeof(*scratch));
     budget_free(budget, scratch);
     return false;
 }

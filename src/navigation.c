@@ -15,6 +15,7 @@
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"
 #include "tilefinch/site_identity.h"
+#include "tilefinch/site_adapter.h"
 #include "tilefinch/url.h"
 #include "tilefinch/work_vector.h"
 #include "tilefinch/work_ledger.h"

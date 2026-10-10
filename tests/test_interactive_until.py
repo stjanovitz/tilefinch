@@ -21,14 +21,14 @@ document.getElementById('go').onclick = function () {
 
 
 class InteractiveUntilTest(unittest.TestCase):
-    def run_lab(self, commands):
+    def run_lab(self, commands, options=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'page.html').write_text(PAGE)
             (root / 'commands.txt').write_text(commands)
             return subprocess.run([str(LAB), '--fixture', str(root / 'page.html'),
                 '--commands', str(root / 'commands.txt'), '--no-loop-capture',
-                '--output', str(root / 'result.ppm')], text=True,
+                '--output', str(root / 'result.ppm'), *options], text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
 
     def test_stops_on_first_matching_turn(self):
@@ -65,6 +65,17 @@ class InteractiveUntilTest(unittest.TestCase):
                 result = self.run_lab('until ' + arguments + '\nquit\n')
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertNotIn('matched=yes', result.stdout)
+
+    def test_stylesheet_count_is_explicit_and_bounded(self):
+        for value in ('1', '32'):
+            result = self.run_lab('quit\n', ('--stylesheet-count', value))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn('stylesheets=' + value + ' ', result.stdout)
+        for value in ('0', '33', '-1', '+1', '32x', '', '99999999999999999999999999'):
+            result = self.run_lab('quit\n', ('--stylesheet-count', value))
+            self.assertEqual(result.returncode, 2, result.stdout)
+        result = self.run_lab('quit\n', ('--stylesheet-count',))
+        self.assertEqual(result.returncode, 2, result.stdout)
 
 
 if __name__ == '__main__':

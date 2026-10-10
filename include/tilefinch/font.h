@@ -248,6 +248,14 @@ bool font_glyph_load(const FontFace *face, unsigned codepoint,
 bool font_glyph_load_at_size(const FontFace *face, unsigned codepoint,
                              int pixel_height_fixed, bool bold,
                              FontGlyph *glyph);
+/* Optional cold-raster horizontal ink fitting for trusted platform faces.
+   Profiles 1/2/3 are qualified humanist regular/bold/italic; 0 is unchanged.
+   Other profiles, non-2048 em faces and authored FreeType faces decline it.
+   Native advances and kerning are never changed. */
+bool font_glyph_load_at_size_profile(const FontFace *face, unsigned codepoint,
+                                    int pixel_height_fixed, bool bold,
+                                    unsigned humanist_profile,
+                                    FontGlyph *glyph);
 void font_glyph_destroy(const FontFace *face, FontGlyph *glyph);
 size_t font_utf8_next(const char *text, size_t remaining,
                       unsigned *codepoint);

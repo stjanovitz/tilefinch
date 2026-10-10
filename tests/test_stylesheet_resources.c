@@ -2968,7 +2968,7 @@ static bool test_complete_selector_census_reopens_retained_sources_once(void)
     return rebuild && !second && resources.selector_census_complete
         && resources.final_resample_completed
         && !resources.final_resample_required
-        && !resources.items[0].rules_applied
+        && resources.items[0].rules_applied
         && resources.items[1].rules_applied;
 }
 
@@ -3382,7 +3382,7 @@ static bool test_response_ledger_copy_is_transactional(void)
                 && copied.items[0].url != original.items[0].url
                 && copied.items[0].response_url != original.items[0].response_url
                 && copied.items[0].body == original.items[0].body
-                && !copied.items[0].rules_applied
+                && copied.items[0].rules_applied
                 && copied.items[0].truncated && copied.items[0].cors_validated
                 && copied.items[0].credentials == TILEFINCH_CREDENTIALS_OMIT
                 && strcmp(copied.items[0].response_url,
@@ -3402,8 +3402,146 @@ static bool test_response_ledger_copy_is_transactional(void)
     return okay && budget.current == 0u;
 }
 
-int main(void)
+static bool test_rebuild_preserves_admitted_links(void)
 {
+    static const char page[] = "https://admission.test/page";
+    static const char html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=a.css></head><body>"
+        "<link rel=stylesheet href=b.css><div id=target>x</div></body></html>";
+    static const char next_html[] = "<!doctype html><html><head>"
+        "<style>@import 'new.css';</style>"
+        "<link rel=stylesheet href=a.css><link rel=stylesheet href=a.css>"
+        "<link rel=stylesheet href=new.css>"
+        "<style>#target{color:#334455}</style></head><body>"
+        "<link rel=stylesheet href=b.css><div id=target>x</div></body></html>";
+    static const char removed_html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=a.css><link rel=stylesheet href=new.css>"
+        "</head><body><link rel=stylesheet disabled href=b.css>"
+        "<div id=target>x</div></body></html>";
+    static const char absent_html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=a.css><link rel=stylesheet href=new.css>"
+        "</head><body><div id=target>x</div></body></html>";
+    static const char nonce_html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=a.css nonce=wrong>"
+        "<link rel=stylesheet href=new.css nonce=allowed></head><body>"
+        "<link rel=stylesheet href=b.css nonce=allowed>"
+        "<div id=target>x</div></body></html>";
+    static const char forbidden_html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=new.css nonce=allowed></head><body>"
+        "<link rel=stylesheet href=b.css nonce=wrong>"
+        "<div id=target>x</div></body></html>";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    StylesheetDocumentResources resources = {.budget = &budget};
+    const char *names[] = {"a.css", "b.css", "new.css"};
+    const char *css[] = {"#target{color:#112233}",
+        "#target{color:#556677}", "#target{color:#778899}"};
+    bool ok = installed;
+    for (size_t i = 0; i < 3u && ok; i++) {
+        size_t length = strlen(css[i]);
+        unsigned char *bytes = budget_malloc(&budget, length);
+        if (bytes == NULL) { ok = false; break; }
+        memcpy(bytes, css[i], length);
+        BrowserSharedBody *body = browser_shared_body_take(&budget, bytes, length);
+        char url[128];
+        snprintf(url, sizeof(url), "https://admission.test/%s", names[i]);
+        ok = body != NULL && stylesheet_document_resources_retain(
+            &resources, url, url, "no-referrer", body, length, false,
+            TILEFINCH_CREDENTIALS_INCLUDE, NULL);
+        browser_shared_body_release(body);
+    }
+    /* Later irrelevant markup must not extend the reservation walk after
+       both previously admitted links have been found. */
+    char large_next[65536];
+    size_t large_length = strlen(next_html);
+    memcpy(large_next, next_html, large_length);
+    for (size_t i = 0; i < 3000u; i++) {
+        static const char extra[] = "<div>x</div>";
+        memcpy(large_next + large_length, extra, sizeof(extra) - 1u);
+        large_length += sizeof(extra) - 1u;
+    }
+    large_next[large_length] = '\0';
+    const char *inputs[] = {html, large_next, removed_html, absent_html,
+        nonce_html, forbidden_html};
+    const uint32_t colors[] = {0x556677, 0x556677, 0x778899, 0x778899,
+        0x556677, 0x778899};
+    const bool applied[][3] = {{true,true,false}, {true,true,false},
+        {true,false,true}, {true,false,true}, {false,true,false}, {false,false,true}};
+    for (size_t pass = 0; pass < 6u && ok; pass++) {
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        ExternalStylesheetStats stats = {0};
+        StylesheetDocumentResources staged = {0};
+        if (pass >= 4u) {
+            resources.items[0].rules_applied = true;
+            resources.items[1].rules_applied = true;
+            resources.items[2].rules_applied = false;
+        }
+        ok = document_parse(&document, &budget, inputs[pass], strlen(inputs[pass]), 17);
+        if (ok && pass >= 4u) {
+            static const char headers[] = "content-security-policy: style-src 'nonce-allowed'\n";
+            ok = tilefinch_csp_parse_response_headers(&document.content_security_policy,
+                page, headers, sizeof(headers) - 1u, false)
+                && document_nonce_hiding_enable(&document);
+        }
+        ok = ok
+            && stylesheet_build(&sheet, &budget, &document, 480)
+            && stylesheet_document_resources_copy_for_rebuild(&staged, &resources);
+        if (ok && pass == 1u) {
+            size_t owned = budget.current;
+            Stylesheet refused = {0};
+            budget_inject_failure_after(&budget, 0u);
+            ok = !stylesheet_build(&refused, &budget, &document, 480);
+            budget_clear_failure_injection(&budget);
+            stylesheet_destroy(&refused);
+            ok = ok && budget.current == owned
+                && resources.items[0].rules_applied && resources.items[1].rules_applied
+                && staged.items[0].rules_applied && staged.items[1].rules_applied;
+            budget_inject_failure_after(&budget, 0u);
+            bool refused_load = !stylesheets_load_external_tracked_with_context(
+                &document, &sheet, &budget, page, page, "no-referrer", 2u,
+                4096u, 4096u, 1000, NULL, NULL, &staged, &stats);
+            budget_clear_failure_injection(&budget);
+            ok = ok && refused_load && budget.current == owned
+                && resources.items[0].rules_applied && resources.items[1].rules_applied
+                && staged.items[0].rules_applied && staged.items[1].rules_applied;
+        }
+        if (ok) ok = stylesheets_load_external_tracked_with_context(
+            &document, &sheet, &budget, page, page, "no-referrer", pass >= 4u ? 1u : 2u,
+            4096u, 4096u, 1000, NULL, NULL, &staged, &stats);
+        lxb_dom_node_t *target = document.html == NULL ? NULL : find_element_id(
+            lxb_dom_interface_node(document.html), "target");
+        uint32_t color = target == NULL ? 0u : style_for_node(&sheet, target, NULL).color;
+        ok = ok && color == colors[pass] && stats.attempted == (pass >= 4u ? 1u : 2u)
+            && staged.items[0].rules_applied == applied[pass][0]
+            && staged.items[1].rules_applied == applied[pass][1]
+            && staged.items[2].rules_applied == applied[pass][2];
+        if (pass == 1u) ok = ok && stats.duplicate >= 1u;
+        if (!ok) fprintf(stderr, "admission pass=%zu color=%06x attempted=%zu flags=%d/%d/%d\n",
+            pass, color, stats.attempted, staged.items[0].rules_applied,
+            staged.items[1].rules_applied, staged.items[2].rules_applied);
+        if (ok) {
+            stylesheet_document_resources_destroy(&resources);
+            resources = staged;
+            memset(&staged, 0, sizeof(staged));
+        }
+        stylesheet_document_resources_destroy(&staged);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    stylesheet_document_resources_destroy(&resources);
+    ok = ok && budget.current == 0u;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--retained-admission-only") == 0)
+        return test_rebuild_preserves_admitted_links() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--complete-census-only") == 0)
+        return test_complete_selector_census_reopens_retained_sources_once() ? 0 : 1;
 #define RUN_TEST(test) do {                                                  \
     if (!(test)()) {                                                         \
         fprintf(stderr, "stylesheet resource test failed: %s\n", #test);   \
@@ -3412,6 +3550,7 @@ int main(void)
 } while (0)
     RUN_TEST(test_nonmatching_media_settles_without_applying);
     RUN_TEST(test_response_ledger_copy_is_transactional);
+    RUN_TEST(test_rebuild_preserves_admitted_links);
     RUN_TEST(test_integrity_mismatch_rejects_stylesheet);
     RUN_TEST(test_integrity_is_scoped_to_each_link_element);
     RUN_TEST(test_integrity_rechecks_cross_origin_redirect);

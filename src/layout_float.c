@@ -127,9 +127,25 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
 {
     if (context == NULL || node == NULL || parent == NULL || style == NULL
         || line == NULL || style->float_mode == FLOAT_NONE) return false;
+    int preceding_line_y = line->y;
+    int preceding_line_space = line->right - line->x;
+    bool preceding_line = line->line_height != 0 || line->line_height_fixed != 0;
+    bool may_share_preceding_line = preceding_line
+        && style->float_mode == FLOAT_RIGHT && style->clear_mode == CLEAR_NONE
+        && line->float_count < ACTIVE_FLOAT_LIMIT;
+    for (size_t i = 0; may_share_preceding_line && i < line->float_count; i++) {
+        if (line->floats[i].top > preceding_line_y) may_share_preceding_line = false;
+    }
     if (line->line_height != 0 || line->line_height_fixed != 0
         || line->x != line->start_x) {
         layout_flush_line(line);
+    }
+    /* CSS 2.1 9.5.1: a later float may not be placed above an earlier
+       float. Advancing through the earlier float row also lets slot
+       retirement discard only exclusions we cannot revisit. */
+    for (size_t i = 0; i < line->float_count; i++) {
+        line->layout->performance.float_exclusion_probes++;
+        if (line->floats[i].top > line->y) line->y = line->floats[i].top;
     }
     int normal_flow_y = line->y;
     clear_line_floats(line, style->clear_mode);
@@ -185,6 +201,14 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
             context, node, parent, style, containing_width,
             desired_width - margins, NULL);
         desired_width = border_box + margins;
+    }
+    /* A right float that fits beside content already on the line belongs
+       at that line's top (CSS 2.1 9.5.1), not below it. Finalize the inline
+       commands first so their alignment cannot move the float's subtree;
+       keep the finalized flow cursor for subsequent normal content. */
+    if (may_share_preceding_line && desired_width <= preceding_line_space) {
+        line->y = preceding_line_y;
+        update_float_band(line);
     }
     int available = line->right - line->start_x;
     while (desired_width > available) {

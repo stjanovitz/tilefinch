@@ -472,7 +472,7 @@ static int script_free_browsing_journey(size_t memory_limit)
     char html[16384];
     size_t used = (size_t) snprintf(html, sizeof(html),
         "<!doctype html><style>body{color:#123456}body:has(.absent){color:red}"
-        "a{display:block;height:40px}a:focus{outline:2px solid currentColor}"
+        "a{display:block;height:40px;color:inherit}a:focus{outline:2px solid currentColor}"
         "</style><body><main><section><a id=first href='/one'>First</a>"
         "<a id=second href='/two'>Second</a>");
     for (unsigned i = 0; i < 300; i++) {

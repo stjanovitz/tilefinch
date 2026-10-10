@@ -652,6 +652,52 @@ static int test_bounded_multicolumn_blocks(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == baseline);
+    static const char indivisible[] =
+        "<!doctype html><style>body{margin:0}"
+        "ul{margin:0;padding:0;list-style:none;width:448px;"
+        "columns:90px;column-gap:24px}li{height:40px;break-inside:avoid}"
+        "</style><ul id=columns><li id=a>A</li><li id=b>B</li>"
+        "<li id=c>C</li><li id=d>D</li><li id=e>E</li><li>F</li>"
+        "<li>G</li><li>H</li><li id=i>I</li><li>J</li><li>K</li>"
+        "<li>L</li><li id=m>M</li></ul>";
+    CHECK(document_parse(&document, budget, indivisible,
+                         strlen(indivisible), 33)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    root = lxb_dom_interface_node(document.html);
+    columns = layout_box_for_node(&layout, find_id(root, "columns"));
+    a = layout_box_for_node(&layout, find_id(root, "a"));
+    d = layout_box_for_node(&layout, find_id(root, "d"));
+    const LayoutNodeBox *e = layout_box_for_node(
+        &layout, find_id(root, "e"));
+    const LayoutNodeBox *i = layout_box_for_node(
+        &layout, find_id(root, "i"));
+    const LayoutNodeBox *m = layout_box_for_node(
+        &layout, find_id(root, "m"));
+    if (!(columns && a && d && e && i && m && a->x == d->x))
+        fprintf(stderr, "balanced indivisible: first=%d fourth=%d height=%d\n",
+                a ? a->x : -1, d ? d->x : -1,
+                columns ? columns->height : -1);
+    CHECK(columns && a && d && e && i && m
+          && columns->height == 160 && a->width == 94
+          && a->x == d->x && d->y - a->y == 120
+          && e->x - a->x == 118 && e->y == a->y
+          && i->x - a->x == 236 && i->y == a->y
+          && m->x - a->x == 354 && m->y == a->y);
+    layout_destroy(&layout);
+    size_t warmed = budget->current;
+    for (size_t refused_after = 0; refused_after < 48u; refused_after++) {
+        budget_inject_failure_after(budget, refused_after);
+        (void) layout_build(&layout, budget, &document, &sheet,
+                            NULL, NULL, 480);
+        budget_clear_failure_injection(budget);
+        layout_destroy(&layout);
+        CHECK(budget->current == warmed);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
     return 0;
 }
 
@@ -800,6 +846,7 @@ static int test_international_line_flow(Budget *budget)
         "#override{direction:rtl;unicode-bidi:bidi-override}"
         "#atomic{direction:rtl;width:240px}#atomic button{display:inline-block;width:48px}"
         "#caps{text-transform:uppercase}"
+        "#decorated{direction:rtl}#decorated span{background:#ddd;outline:1px solid}"
         "</style>"
         "<div id=cjk>\xe6\xbc\xa2\xe5\xad\x97</div>"
         "<div id=opening>\xe3\x80\x8c\xe6\xbc\xa2\xe5\xad\x97</div>"
@@ -814,7 +861,8 @@ static int test_international_line_flow(Budget *budget)
         "<div id=nested dir=rtl>\xd7\x90 <span dir=ltr>ABC (12)</span> \xd7\x91</div>"
         "<div dir=rtl>\xd7\x90 <span id=caps>abc</span></div>"
         "<div id=atomic>\xd7\x90\xd7\x91 <button id=atomic-button>GO</button> \xd7\x92\xd7\x93</div>"
-        "<div id=override>ABC</div>";
+        "<div id=override>ABC</div>"
+        "<div id=decorated>\xd7\x90 <span>JKL</span><span>MNO</span> \xd7\x91</div>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -902,6 +950,20 @@ static int test_international_line_flow(Budget *budget)
     CHECK(caps_glyphs[0].codepoint == 'A'
           && caps_glyphs[1].codepoint == 'B'
           && caps_glyphs[2].codepoint == 'C');
+    /* Inline decoration insertion happens before the containing paragraph
+       is resolved. Its pending command references must move with the text. */
+    static const char *const decorated_labels[] = { "JKL", "MNO" };
+    for (size_t label = 0; label < 2; label++) {
+        const DrawCommand *command = text_command(&layout, decorated_labels[label]);
+        CHECK(command != NULL);
+        const LayoutBidiCommand *mapped = layout_bidi_command_for_index(
+            &layout, (size_t) (command - layout.commands));
+        CHECK(mapped != NULL && mapped->glyph_count == 3);
+        for (size_t glyph = 0; glyph < 3; glyph++) {
+            CHECK(layout.bidi_glyphs[mapped->glyph_start + glyph].codepoint
+                  == (unsigned char) decorated_labels[label][glyph]);
+        }
+    }
     lxb_dom_node_t *atomic_node = find_id(
         lxb_dom_interface_node(document.html), "atomic-button");
     const ControlRegion *atomic_control = NULL;
@@ -2461,7 +2523,9 @@ static int test_reference_resolved_css_math(Budget *budget)
     CHECK(negative_width != NULL && negative_width->width == 0
           && negative_min != NULL && negative_min->width == 20
           && negative_max != NULL && negative_max->width == 0
-          && negative_flex != NULL && negative_flex->width == 8);
+          /* A negative calc() flex basis clamps to zero too; flex sizing
+             must not add a synthetic minimum absent from the author rule. */
+          && negative_flex != NULL && negative_flex->width == 0);
 
     /* Invalid later declarations do not partially commit over valid ones. */
     CHECK(invalid_typed != NULL && invalid_typed->width == 73

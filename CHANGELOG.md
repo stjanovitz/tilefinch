@@ -8,6 +8,15 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.32 — 2026-10-10
+
+- Sign in to YouTube for recommendations and subscriptions, with optional
+  saved login and Sign out.
+- Like and unlike videos, and see available watch progress.
+- Translated YouTube controls and smoother background updates that preserve
+  your place.
+- Improved page layouts, text, icons, images, and browsing reliability.
+
 ## 0.1.31 — 2026-10-08
 
 - More accurate page layouts, images, icons, and dynamically updated styling.

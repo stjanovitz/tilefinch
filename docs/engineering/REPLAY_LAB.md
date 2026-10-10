@@ -166,8 +166,14 @@ from a qualified reference diagnostic. The plan fixes:
 
 The recorder performs one canonical request per authorized key. It does not
 follow redirects or send a body, cookies, Authorization, client certificates,
-custom headers, referrer, Origin, client hints, proxy credentials, or netrc
-state. A redirect is a terminal captured response.
+arbitrary custom headers, referrer, client hints, proxy credentials, or netrc
+state. A redirect is a terminal captured response. The v2 acquisition plan
+may include only the exact HTTPS `Origin` observed on an unmatched browser
+request. That field is bound into the allowlist digest and checked against
+the recorder metadata; it is not a CORS override. Conflicting or opaque
+origins refuse acquisition. Existing retained routes are never replaced by
+a differently shaped request; recapture the source rather than creating an
+ambiguous replay key.
 
 Each response first lands in an isolated one-record trace. The orchestrator
 checks metadata/body pairing, lengths, hashes, capture completion, method,

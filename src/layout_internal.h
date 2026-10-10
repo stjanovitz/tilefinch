@@ -1112,6 +1112,8 @@ LayoutBidiFlow *layout_bidi_flow_create(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, bool *attempted);
 void layout_bidi_flow_destroy(LayoutBidiFlow *flow);
+void layout_bidi_insert_commands(LayoutContext *context, size_t index,
+                                 size_t count);
 void layout_bidi_prepare(LayoutContext *context, Budget *budget);
 void layout_bidi_release(LayoutContext *context, Budget *budget);
 void layout_bidi_note_text_command(

@@ -15,6 +15,7 @@ static void usage(const char *program)
             "[--adaptive-resources | --no-adaptive-resources] "
             "[--forced-dark] "
             "[--max-download-kb N] "
+            "[--stylesheet-count 1..32] "
             "[--no-external-resources] "
             "[--no-progressive-first-paint] [--relayout-preview-us N] "
             "[--wpt-test-rendered] [--hide-cookie-banners] [--reader-mode] "

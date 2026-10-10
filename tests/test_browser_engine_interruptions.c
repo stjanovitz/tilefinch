@@ -32,6 +32,124 @@ static void interruption_sync_focus(BrowserEngine *engine, PspUiState *ui)
         viewport_css_to_device(&nav->viewport, h));
 }
 
+typedef struct {
+    BrowserEngine *engine;
+    PspUiState ui;
+    const uint16_t *base;
+    uint16_t *shown;
+    bool feedback, before_handler, visible, menu_visible;
+} FocusFeedbackProbe;
+
+static bool focus_feedback_checkpoint(void *opaque, const char *phase, size_t work)
+{
+    FocusFeedbackProbe *probe = opaque;
+    if (strcmp(phase, "page-focus-feedback") != 0 || work == 0) return true;
+    NavigationSession *nav = browser_engine_navigation(probe->engine);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    probe->before_handler = test_reader_find_id(root, "changed") == NULL;
+    interruption_sync_focus(probe->engine, &probe->ui);
+    memcpy(probe->shown, probe->base, 480u * 272u * sizeof(uint16_t));
+    psp_ui_composite(&probe->ui, probe->shown, 480, 272, 480);
+    probe->visible = probe->ui.has_focus
+        && memcmp(probe->base, probe->shown, 480u * 272u * sizeof(uint16_t)) != 0;
+    /* Native controls can respond without running another author task at
+       this boundary. The focus handler below still runs exactly once. */
+    PspUiInput input = { .pressed = PSP_UI_BUTTON_MENU, .analog_x = 128, .analog_y = 128 };
+    probe->menu_visible = psp_ui_update_priority(&probe->ui, &input)
+        && probe->ui.screen != PSP_UI_SCREEN_PAGE;
+    probe->feedback = true;
+    return true;
+}
+
+static int test_focus_feedback_before_author_work(void)
+{
+    static uint16_t base[480u * 272u], shown[480u * 272u];
+    static const char html[] =
+        "<!doctype html><style>a{display:block;height:40px}"
+        "a:focus{padding-top:12px;box-shadow:0 0 0 3px blue}</style>"
+        "<body><a id=first href='/one'>First</a>"
+        "<a id=second href='/two'>Second</a></body>";
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://focus-feedback.test/page", html, sizeof(html) - 1u, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    CHECK(nav->page.runtime != NULL
+        && browser_engine_focus_node(engine, test_reader_find_id(root, "first"))
+        && browser_engine_render_frame(engine, NULL));
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "document.getElementById('second').addEventListener('focus',function(){"
+        "this.setAttribute('data-count',String(Number(this.getAttribute('data-count')||0)+1));"
+        "document.body.insertAdjacentHTML('beforeend','<p id=changed>Changed</p>');});",
+        "<focus-feedback-listener>", &nav->page.script_result));
+    size_t pixels = 0;
+    const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+    CHECK(frame != NULL && pixels == 480u * 272u);
+    memcpy(base, frame, sizeof(base));
+    FocusFeedbackProbe probe = { .engine = engine, .base = base, .shown = shown };
+    psp_ui_init(&probe.ui);
+    psp_ui_set_page(&probe.ui, "Page", "https://focus-feedback.test/page", true);
+    probe.ui.chrome_visible = false;
+    TilefinchPlatformServices services = { .context = &probe, .cooperate = focus_feedback_checkpoint };
+    tilefinch_platform_set_services(&services);
+    bool moved = browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN);
+    tilefinch_platform_set_services(NULL);
+    CHECK(moved && probe.feedback && probe.before_handler && probe.visible && probe.menu_visible);
+    root = lxb_dom_interface_node(nav->page.document.html);
+    CHECK(test_reader_find_id(root, "changed") != NULL);
+    size_t count_length = 0;
+    const char *count = document_attribute(test_reader_find_id(root, "second"), "data-count", &count_length);
+    CHECK(count != NULL && count_length == 1u && count[0] == '1');
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_idle_publication_retirement_clears_shell(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-interactive-images", error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true)
+        && browser_engine_render_frame(engine, NULL));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.runtime != NULL && nav->page.image_continuation_pending);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "document.getElementById('next').remove()", "<publication-mutation>", &nav->page.script_result));
+    navigation_test_refuse_next_same_document_relayout();
+    for (unsigned turn = 0; turn < 128 && nav->page.loaded; turn++) {
+        bool changed = false;
+        (void) browser_engine_run_idle_work(engine, &changed);
+    }
+    CHECK(!nav->page.loaded && nav->page.document.html == NULL
+        && browser_engine_render_metrics_view(engine) == NULL
+        && strstr(browser_engine_last_error(engine), "page update") != NULL);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static bool interruption_checkpoint(void *opaque, const char *phase, size_t work)
 {
     InterruptionProbe *p = opaque;
@@ -82,6 +200,8 @@ static bool interruption_checkpoint(void *opaque, const char *phase, size_t work
 
 int test_background_interruption_journey(void)
 {
+    CHECK(test_focus_feedback_before_author_work() == 0);
+    CHECK(test_idle_publication_retirement_clears_shell() == 0);
     static uint16_t base[480u * 272u], before[480u * 272u], shown[480u * 272u];
     static char html[32768];
     size_t used = (size_t) snprintf(html, sizeof(html),

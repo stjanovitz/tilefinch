@@ -24,7 +24,7 @@ int main(void)
         == BROWSER_GLYPH_LANGUAGE_KOREAN);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->glyphs
         == BROWSER_GLYPH_LANGUAGE_DEVANAGARI);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 2);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 3);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->minimum_glyph_sequence == 1);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->glyphs
         == BROWSER_GLYPH_LANGUAGE_ARABIC);
@@ -70,6 +70,8 @@ int main(void)
         CHECK(!strcmp(tilefinch_ui_translation_text(t, "settings"), tilefinch_ui_translation_text(t, "Settings")));
         CHECK(!strcmp(tilefinch_ui_translation_text(t, "Unknown advanced message"), "Unknown advanced message"));
         tilefinch_ui_translation_bind(t);
+        if (language == TILEFINCH_UI_LANGUAGE_ARABIC)
+            CHECK(!strcmp(tilefinch_ui_logical_text("Back"), "رجوع"));
         CHECK(!strcmp(tilefinch_ui_text("Settings"), tilefinch_ui_translation_text(t, "Settings")));
         bytes[length-2] ^= 1;
         CHECK(!tilefinch_ui_translation_create(&budget, language, bytes, length));

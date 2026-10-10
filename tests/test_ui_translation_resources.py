@@ -1,5 +1,6 @@
 """Keep downloaded catalogs out of the source tree while testing exact bytes."""
 import hashlib
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,17 @@ import generate_ui_translations as generator
 
 
 class ResourceTests(unittest.TestCase):
+    def test_provider_templates_have_translations(self):
+        languages = generator.CATALOGS[-1][1]
+        keys = {row[0] for row in generator.read_rows(generator.ACTIVE_VERSION, languages)}
+        source = (ROOT / "src/youtube_lite.c").read_text()
+        # Only inspect C literals, not the explanatory template comment.
+        tokens = re.findall(r'''"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|/\*[\s\S]*?\*/|//[^\n]*''', source)
+        labels = {label for token in tokens if token.startswith('"')
+                  for label in re.findall(r"\{\{([^{}]+)\}\}", token)}
+        self.assertGreater(len(labels), 40)
+        self.assertEqual(labels - keys, set())
+
     def test_source_tree_contains_no_downloads(self):
         self.assertEqual(list((ROOT / "translations").rglob("*.tful")), [])
 
@@ -26,7 +38,7 @@ class ResourceTests(unittest.TestCase):
             subprocess.run(command + ["--check"], check=True)
             expected = generator.outputs(resources)
             files = list(resources.rglob("*.tful"))
-            self.assertEqual(len(files), 20)
+            self.assertEqual(len(files), sum(len(languages) for _, languages in generator.CATALOGS))
             manifest = before[ROOT / "src/generated/ui_languages.inc"].decode()
             for path in files:
                 data = path.read_bytes()

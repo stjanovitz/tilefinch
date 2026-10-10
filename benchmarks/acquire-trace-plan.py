@@ -28,7 +28,9 @@ from urllib.parse import urlsplit
 
 
 PLAN_MODE = "exact-get-head-plan-v1"
+ORIGIN_PLAN_MODE = "exact-get-head-plan-v2"
 ALLOWLIST_DOMAIN = b"tilefinch-exact-get-head-allowlist-v1\0"
+ORIGIN_ALLOWLIST_DOMAIN = b"tilefinch-exact-get-head-allowlist-v2\0"
 TRACE_DIGEST_DOMAIN = b"tilefinch-http-trace-v1\0"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 TRACE_RECORD = re.compile(r"([0-9]{4})\.(meta|body)\Z")
@@ -40,7 +42,9 @@ MAX_URL_BYTES = 2047
 MAX_RECORDS = 4096
 HARD_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HARD_MAX_TRACE_BYTES = 512 * 1024 * 1024
-OUTPUT_CAPTURE_LIMIT = 64 * 1024
+# A valid bounded inventory can exceed 64 KiB with a few hundred long CDN
+# URLs. Match the JSON authority ceiling rather than refusing that output.
+OUTPUT_CAPTURE_LIMIT = MAX_JSON_BYTES
 REQUEST_SIDECAR_LIMIT = 16 * 1024
 ECMASCRIPT_DATE_MAX_MS = 8_640_000_000_000_000
 REFERENCE_INSPECTOR = Path(__file__).with_name("capture-reference.js")
@@ -273,16 +277,38 @@ def _url_authority(value: Any, label: str) -> tuple[str, str]:
     return value, origin
 
 
-def _allowlist_digest(requests: Iterable[dict[str, Any]]) -> str:
-    rows = sorted((request["method"], request["url"]) for request in requests)
+def _request_origin(value: Any, label: str) -> str:
+    if value == "":
+        return ""
+    url, origin = _url_authority(value, label)
+    if url != origin:
+        raise AcquisitionError(f"{label} must be a canonical HTTPS Origin or empty")
+    return origin
+
+
+def _allowlist_digest(
+    requests: Iterable[dict[str, Any]], mode: str = PLAN_MODE
+) -> str:
+    if mode not in (PLAN_MODE, ORIGIN_PLAN_MODE):
+        raise AcquisitionError("unsupported allowlist mode")
+    with_origin = mode == ORIGIN_PLAN_MODE
+    rows = sorted(
+        (request["method"], request["url"], request["request_origin"])
+        if with_origin else (request["method"], request["url"])
+        for request in requests
+    )
     digest = hashlib.sha256()
-    digest.update(ALLOWLIST_DOMAIN)
+    digest.update(ORIGIN_ALLOWLIST_DOMAIN if with_origin else ALLOWLIST_DOMAIN)
     digest.update(str(len(rows)).encode("ascii"))
     digest.update(b"\0")
-    for method, url in rows:
+    for row in rows:
+        method, url = row[:2]
         digest.update(method.encode("ascii"))
         digest.update(b"\0")
         digest.update(url.encode("utf-8"))
+        if with_origin:
+            digest.update(b"\0")
+            digest.update(row[2].encode("ascii"))
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -556,6 +582,40 @@ def _validate_diagnostic_plan_binding(
                 "occurrences": request["occurrences"],
             }
         )
+    if diagnostic["acquisition_plan"]["mode"] == ORIGIN_PLAN_MODE:
+        evidence = diagnostic.get("browser_request_origins")
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != {"version", "entries", "overflow", "conflicts"}
+            or evidence.get("version") != "unmatched-request-origin-v1"
+            or evidence.get("overflow") is not False
+            or evidence.get("conflicts") is not False
+            or not isinstance(evidence.get("entries"), list)
+            or len(evidence["entries"]) > MAX_DIAGNOSTIC_ENTRIES
+        ):
+            raise AcquisitionError("browser Origin evidence is incomplete or unsupported")
+        request_origins: dict[tuple[str, str], str] = {}
+        for index, entry in enumerate(evidence["entries"]):
+            label = f"browser_request_origins.entries[{index}]"
+            if not isinstance(entry, dict) or set(entry) != {
+                "method", "url", "request_origin"
+            }:
+                raise AcquisitionError(f"{label} has an unsupported shape")
+            if entry["method"] not in ("GET", "HEAD"):
+                raise AcquisitionError(f"{label}.method is not read-only GET/HEAD")
+            url, _origin = _url_authority(entry["url"], f"{label}.url")
+            key = (entry["method"], url)
+            if key not in projected or key in request_origins:
+                raise AcquisitionError(f"{label} is extra, duplicate, or conflicting")
+            request_origins[key] = _request_origin(
+                entry["request_origin"], f"{label}.request_origin"
+            )
+        if list(request_origins) != sorted(projected):
+            raise AcquisitionError("browser Origin evidence is not an exact canonical projection")
+        for request in expected_requests:
+            request["request_origin"] = request_origins[
+                (request["method"], request["url"])
+            ]
     if requests != expected_requests:
         raise AcquisitionError(
             "acquisition_plan is not the exact canonical projection of unmatched evidence"
@@ -578,7 +638,7 @@ def _validate_plan(
         raise AcquisitionError("acquisition_plan has an unsupported shape")
     requests = plan.get("requests")
     if (
-        plan.get("mode") != PLAN_MODE
+        plan.get("mode") not in (PLAN_MODE, ORIGIN_PLAN_MODE)
         or plan.get("complete") is not True
         or plan.get("unplannable") != 0
         or not isinstance(requests, list)
@@ -592,14 +652,19 @@ def _validate_plan(
     origins: set[str] = set()
     for index, request in enumerate(requests):
         label = f"acquisition_plan.requests[{index}]"
-        if not isinstance(request, dict) or set(request) != {
+        request_keys = {
             "method",
             "url",
             "url_sha256",
             "resource_types",
             "occurrences",
-        }:
+        }
+        if plan["mode"] == ORIGIN_PLAN_MODE:
+            request_keys.add("request_origin")
+        if not isinstance(request, dict) or set(request) != request_keys:
             raise AcquisitionError(f"{label} has an unsupported shape")
+        if plan["mode"] == ORIGIN_PLAN_MODE:
+            _request_origin(request["request_origin"], f"{label}.request_origin")
         method = request["method"]
         if method not in contract["allowed_methods"]:
             raise AcquisitionError(f"{label}.method is not authorized")
@@ -626,7 +691,7 @@ def _validate_plan(
         raise AcquisitionError("acquisition requests are not in canonical order")
     if sorted(origins) != contract["allowed_origins"]:
         raise AcquisitionError("plan origins do not exactly match the contract")
-    actual_allowlist = _allowlist_digest(normalized)
+    actual_allowlist = _allowlist_digest(normalized, plan["mode"])
     if actual_allowlist != contract["allowlist_sha256"]:
         raise AcquisitionError(
             "allowlist SHA-256 mismatch: expected "
@@ -928,7 +993,7 @@ def _validate_acquired_record(
         "request-if-none-match": "",
         "request-if-modified-since": "",
         "request-referer": "",
-        "request-origin": "",
+        "request-origin": request.get("request_origin", ""),
         "request-accept": "",
         "request-sec-fetch-dest": "",
         "request-sec-fetch-mode": "",
@@ -1371,6 +1436,11 @@ def _run_recorder(
         "--timeout-ms",
         str(timeout_ms),
     ]
+    request_origin = _request_origin(
+        request.get("request_origin", ""), "recorder request Origin"
+    )
+    if request_origin:
+        command.extend(["--origin", request_origin])
     try:
         completed = subprocess.run(
             command,

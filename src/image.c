@@ -27,6 +27,7 @@
 #include "style_internal.h"
 #include "style_cache_internal.h"
 #include "diagnostic_trace.h"
+#include "tilefinch_test_faults.h"
 
 #include <lexbor/html/serialize.h>
 
@@ -224,6 +225,7 @@ typedef struct {
        complete idle unit, so do not call the global cooperation hook from
        inside that unit and accidentally turn benign input into image failure. */
     bool externally_pumped;
+    bool cooperate_cancelled;
 } ImageLoadContext;
 
 static bool image_count_exhausted(const ImageLoadContext *context)
@@ -553,8 +555,10 @@ static bool image_cooperate(ImageLoadContext *context, const char *phase)
     image_finish_slice(context);
     context->images->stats.cooperative_yields++;
     if (context->externally_pumped) return true;
-    return tilefinch_platform_cooperate(
+    bool continued = tilefinch_platform_cooperate(
         phase, context->images->stats.work_units);
+    if (!continued) context->cooperate_cancelled = true;
+    return continued;
 }
 
 static bool image_work(ImageLoadContext *context, size_t units,
@@ -5100,6 +5104,7 @@ static bool images_load_external_impl(
     bool defer_document_images, lxb_dom_node_t *const *deferred_nodes,
     size_t deferred_node_count, const ImageResources *refresh_previous)
 {
+    if (images != NULL) images->stats.load_cancelled = false;
     if (deferred_node_count > 128u
         || (deferred_node_count != 0 && deferred_nodes == NULL)) return false;
     if (document == NULL || document->html == NULL || stylesheet == NULL
@@ -5109,6 +5114,12 @@ static bool images_load_external_impl(
         || maximum_total_encoded_bytes == 0
         || maximum_single_encoded_bytes == 0 || maximum_decoded_bytes == 0
         || timeout_ms <= 0 || image_decode_busy()) return false;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->refuse_next_image_load_setup) {
+        tilefinch_test_faults()->refuse_next_image_load_setup = false;
+        return false;
+    }
+#endif
     /* A caller may request more images than the engine can track (a
        reference-scoring profile can raise the count to fit a busy 106-image
        page).  Exceeding a limit must soft-skip, never fail the
@@ -5284,6 +5295,7 @@ static bool images_load_external_impl(
         } else {
             images_destroy(images);
         }
+        images->stats.load_cancelled = context.cooperate_cancelled;
         budget_free(budget, context.request_scratch);
         if (owns_scheduler) fetch_scheduler_destroy(scheduler);
         return false;
@@ -5304,6 +5316,7 @@ static bool images_load_external_impl(
             } else {
                 images_destroy(images);
             }
+            images->stats.load_cancelled = context.cooperate_cancelled;
             if (owns_scheduler) fetch_scheduler_destroy(scheduler);
             budget_free(budget, context.request_scratch);
             return false;

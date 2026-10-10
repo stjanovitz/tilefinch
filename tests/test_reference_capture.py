@@ -93,6 +93,82 @@ def reference_environment_state() -> dict[str, object]:
 
 @unittest.skipIf(NODE is None, "Node.js is unavailable")
 class ReferenceCaptureIndexTests(unittest.TestCase):
+    def test_origin_aware_acquisition_is_exact_and_conflicts_fail_closed(self) -> None:
+        script = r'''
+const capture=require(process.argv[1]);
+const audit=require(process.argv[2]);
+const diagnostic=capture.createRequestDiagnostics();
+diagnostic.record('unmatched','GET','script','https://asset.test/module.js');
+const origins=audit.createOriginEvidence();
+origins.record('GET','https://asset.test/module.js','https://page.test');
+const first=capture.buildReadOnlyAcquisitionPlan(diagnostic.summary(),origins.summary());
+origins.record('GET','https://asset.test/module.js','https://other.test');
+const conflict=capture.buildReadOnlyAcquisitionPlan(diagnostic.summary(),origins.summary());
+const opaque=audit.createOriginEvidence();
+opaque.record('GET','https://asset.test/module.js','null');
+const denied=capture.buildReadOnlyAcquisitionPlan(diagnostic.summary(),opaque.summary());
+console.log(JSON.stringify({first,conflict,denied}));
+'''
+        result = subprocess.run((NODE, "-e", script, str(CAPTURE),
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["first"]["mode"], "exact-get-head-plan-v2")
+        self.assertTrue(value["first"]["complete"])
+        self.assertEqual(value["first"]["requests"][0]["request_origin"], "https://page.test")
+        self.assertFalse(value["conflict"]["complete"])
+        self.assertFalse(value["denied"]["complete"])
+
+    def test_browser_request_audit_detects_unintercepted_redirects(self) -> None:
+        script = r'''
+const audit=require(process.argv[1]).createRequestAudit();
+const request=url=>({url:()=>url,method:()=>"GET",resourceType:()=>"image",
+ failure:()=>({errorText:"net::ERR_NAME_NOT_RESOLVED"})});
+const first=request("https://asset.test/redirect"), next=request("https://images.test/final");
+audit.begin(first);audit.end(first);audit.begin(next);
+audit.expectFailure("GET", next.url());audit.end(next,true);
+const unexpected=require(process.argv[1]).createRequestAudit();
+unexpected.begin(next);unexpected.end(next,true);
+console.log(JSON.stringify([audit.summary(1),audit.summary(2),unexpected.summary(1)]));
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        old, fixed, unexpected = json.loads(result.stdout)
+        self.assertFalse(old["ready"])
+        self.assertTrue(fixed["ready"])
+        self.assertFalse(unexpected["ready"])
+        self.assertFalse(unexpected["failures"][0]["expected"])
+        self.assertEqual(old["failures"][0]["url"], "https://images.test/final")
+
+    def test_frame_target_refusal_cannot_report_ready(self) -> None:
+        script = r'''
+(async()=>{
+const {EventEmitter}=require('node:events'), root=new EventEmitter(), tasks=[];
+root.send=async(method,params)=>{
+ if(method==='Target.sendMessageToTarget') {
+  const command=JSON.parse(params.message);
+  queueMicrotask(()=>root.emit('Target.receivedMessageFromTarget',{
+   sessionId:params.sessionId,message:JSON.stringify({id:command.id,result:{}})}));
+ }
+ return {};
+};
+let failures=0;
+const capture=await require(process.argv[1]).installInterception(root,()=>{},
+ (_label,fn)=>fn(),promise=>{tasks.push(promise);promise.catch(()=>{});},()=>failures++);
+for(let i=0;i<65;i++) root.emit('Target.attachedToTarget',{sessionId:String(i),targetInfo:{type:'iframe'}});
+await Promise.allSettled(tasks);
+console.log(JSON.stringify({summary:capture.summary(),failures}));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertFalse(value["summary"]["ready"])
+        self.assertTrue(value["summary"]["overflow"])
+        self.assertGreater(value["failures"], 0)
+
     def test_script_free_discovery_is_explicit_and_never_qualified(self) -> None:
         script = (
             "const capture=require(process.argv[1]);"

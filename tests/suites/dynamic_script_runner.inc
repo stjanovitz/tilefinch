@@ -8,6 +8,10 @@ int main(void)
     }
 
     size_t failures = 0;
+    if (!test_dynamic_admission_preserves_useful_unit(&budget)) failures++;
+    if (!test_dynamic_admission_reclaims_paced_garbage(&budget)) failures++;
+    if (!test_dynamic_admission_reclaims_unborrowed_responses(&budget, false)) failures++;
+    if (!test_dynamic_admission_reclaims_unborrowed_responses(&budget, true)) failures++;
     if (!test_small_late_script_reserve(&budget)) failures++;
     if (!test_classic_continuation_uses_admitted_reserve(&budget)) failures++;
     if (!test_dynamic_classic_and_error(&budget)) failures++;

@@ -1457,6 +1457,13 @@ static bool synchronize_dom_focus(BrowserController *controller,
                                   lxb_dom_node_t *node)
 {
     NavigationSession *navigation = controller->navigation;
+    /* The selected region still belongs to the committed layout here. Give
+       the frontend a chance to show its native focus indicator before author
+       focus handlers or focus styling mutate that borrowed DOM. Do not move
+       scroll or dispatch events reentrantly at this presentation boundary. */
+    controller->has_authored_focus_outline = false;
+    if (navigation->page.runtime != NULL
+        && !tilefinch_platform_cooperate("page-focus-feedback", 1)) return false;
     if (navigation->page.runtime != NULL) {
         /*
          * Focus movement is a user-agent operation. A page-realm failure

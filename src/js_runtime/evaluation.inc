@@ -1680,6 +1680,28 @@ static void promise_rejection_tracker(JSContext *context,
     result->promise_rejections = state->count;
     state->last_reported = identity;
     const char *message = js_rt_exception_to_cstring(context, reason);
+    DomBridge *private_bridge = JS_GetContextOpaque(context);
+    ScriptXHRDiagnostics *private_history = private_bridge == NULL
+        || private_bridge->host == NULL ? NULL
+        : private_bridge->host->xhr_diagnostics;
+    if (private_history != NULL) {
+        static const char *const prefixes[] = {
+            "TypeError:", "RangeError:", "ReferenceError:", "SyntaxError:",
+            "InternalError:", "Error:"
+        };
+        size_t kind = JS_IsUndefined(reason) ? 7 : 6;
+        for (size_t i = 0; message != NULL && i < 6; i++) {
+            if (strncmp(message, prefixes[i], strlen(prefixes[i])) != 0) continue;
+            kind = i;
+            break;
+        }
+        js_rt_saturating_add_size(&private_history->rejection_kinds[kind], 1);
+        if (private_history->outcome_classifier_installed) {
+            int stage = js_rt_private_classify(private_bridge->host, reason,
+                                               JS_UNDEFINED, 1);
+            js_rt_saturating_add_size(&private_history->rejection_stages[stage], 1);
+        }
+    }
     snprintf(result->last_promise_rejection,
              sizeof(result->last_promise_rejection), "%s",
              message == NULL ? "unhandled promise rejection" : message);

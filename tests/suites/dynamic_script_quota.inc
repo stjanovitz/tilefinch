@@ -1,3 +1,238 @@
+static bool test_dynamic_admission_preserves_useful_unit(Budget *budget)
+{
+    const char *test_name = "dynamic admission preserves a useful late unit";
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = false, navigation_ready = false, ok = true;
+    void *pressure = NULL;
+    REQUIRE(browser_session_init(&browser, budget, 256u * 1024u));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://admission.test/", runtime_page,
+        16, 4u * MIB, 1u * MIB));
+    navigation_ready = true;
+    ScriptRuntime *runtime = navigation.page.runtime;
+    REQUIRE(runtime != NULL);
+    (void) script_runtime_collect_and_trim(runtime);
+    REQUIRE(!js_rt_gc_due(runtime));
+    size_t free_bytes = 2u * MIB;
+    REQUIRE(budget_remaining(budget) > free_bytes);
+    pressure = budget_malloc(budget, budget_remaining(budget) - free_bytes);
+    REQUIRE(pressure != NULL);
+    free_bytes = budget_remaining(budget);
+    size_t collections = runtime->heap_collections;
+    size_t bound = js_rt_dynamic_response_bound(&runtime->bridge, false);
+    REQUIRE(bound == 256u * 1024u);
+    REQUIRE(budget_remaining(budget) == free_bytes);
+    REQUIRE(runtime->heap_collections == collections);
+    /* A small remaining source quota wins over the emergency memory floor. */
+    size_t quota = runtime->bridge.script_quota_bytes;
+    runtime->bridge.script_quota_bytes = runtime->bridge.maximum_script_bytes
+        - runtime->bridge.script_quota_reserved_bytes - 32u * 1024u;
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, false)
+        == 32u * 1024u);
+    runtime->bridge.script_quota_bytes = quota;
+    /* An exhausted Budget must not manufacture staging capacity. */
+    budget->limit = budget->current;
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, false) == 0);
+    budget->limit = 32u * MIB;
+    REQUIRE(runtime->heap_collections == collections);
+cleanup:
+    budget->limit = 32u * MIB;
+    budget_free(budget, pressure);
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool test_dynamic_admission_reclaims_paced_garbage(Budget *budget)
+{
+    const char *test_name = "dynamic response admission reclaims paced garbage";
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = false, navigation_ready = false, ok = true;
+    void *pressure = NULL;
+
+    REQUIRE(browser_session_init(&browser, budget, 256u * 1024u));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://admission.test/", runtime_page,
+        16, 4u * MIB, 1u * MIB));
+    navigation_ready = true;
+    ScriptRuntime *runtime = navigation.page.runtime;
+    REQUIRE(runtime != NULL);
+    (void) script_runtime_collect_and_trim(runtime);
+    /* Keep the fixture's garbage until the admission boundary, rather than
+       depending on the allocator's automatic threshold or host timing. */
+    JS_SetGCThreshold(runtime->runtime, SIZE_MAX);
+    REQUIRE(evaluate(&navigation,
+        "(()=>{let garbage=[];for(let i=0;i<5000;i++){"
+        "let a=new Array(16);a[0]=a;garbage.push(a);}})();",
+        "admission garbage"));
+    REQUIRE(js_rt_gc_due(runtime));
+    size_t reserve = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES
+        + 128u * 1024u;
+    REQUIRE(budget_remaining(budget) > reserve);
+    pressure = budget_malloc(budget, budget_remaining(budget) - reserve);
+    REQUIRE(pressure != NULL);
+    size_t collections = runtime->heap_collections;
+    size_t bound = js_rt_dynamic_response_bound(&runtime->bridge, false);
+    REQUIRE(bound >= 256u * 1024u);
+    REQUIRE(runtime->heap_collections > collections);
+    REQUIRE(budget_remaining(budget)
+        >= SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES + bound);
+    collections = runtime->heap_collections;
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, false) == bound);
+    REQUIRE(runtime->heap_collections == collections);
+    /* Exhausted source quotas still refuse before any memory maintenance. */
+    size_t quota = runtime->bridge.script_quota_bytes;
+    runtime->bridge.script_quota_bytes = runtime->bridge.maximum_script_bytes;
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, false) == 0);
+    REQUIRE(runtime->heap_collections == collections);
+    runtime->bridge.script_quota_bytes = quota;
+
+cleanup:
+    budget_free(budget, pressure);
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool test_dynamic_admission_reclaims_unborrowed_responses(Budget *budget,
+                                                               bool revalidate)
+{
+    const char *test_name = "dynamic response admission reclaims unborrowed cache";
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = false, navigation_ready = false, ok = true;
+    unsigned char *data = NULL;
+    void *pressure = NULL;
+    BrowserSharedBody *body = NULL;
+    ScriptDynamicTask task = {0};
+    const unsigned char *cached = NULL;
+    size_t length = 0;
+    const char *url = "https://admission.test/optional.css";
+
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://admission.test/", runtime_page,
+        16, 4u * MIB, 1u * MIB));
+    navigation_ready = true;
+    ScriptRuntime *runtime = navigation.page.runtime;
+    REQUIRE(runtime != NULL);
+    (void) script_runtime_collect_and_trim(runtime);
+    data = budget_malloc(budget, 256u * 1024u);
+    REQUIRE(data != NULL);
+    memset(data, ' ', 256u * 1024u);
+    REQUIRE(browser_session_cache_put(&browser, url, data, 256u * 1024u));
+    budget_free(budget, data);
+    data = NULL;
+    if (revalidate) {
+        static const char source[] = "globalThis.staleScriptValue=7;";
+        const char *script_url = "https://admission.test/stale.js";
+        data = budget_malloc(budget, sizeof(source));
+        REQUIRE(data != NULL);
+        memcpy(data, source, sizeof(source));
+        body = browser_shared_body_take(budget, data, sizeof(source) - 1u);
+        REQUIRE(body != NULL);
+        data = NULL;
+        TilefinchRequestContext context = {
+            .target_url = script_url, .initiator_url = "https://admission.test/",
+            .top_level_url = "https://admission.test/", .method = "GET",
+            .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+            .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+            .destination = TILEFINCH_DESTINATION_SCRIPT
+        };
+        TilefinchResourceGrant grant = {
+            .destination = context.destination, .mode = context.mode,
+            .credentials = context.credentials,
+            .final_same_origin = true, .mime_validated = true
+        };
+        REQUIRE(browser_session_cache_put_http_shared_classic_script(
+            &browser, script_url, body, "\"revision-1\"", NULL,
+            "text/javascript", "no-cache", NULL, 1, &context, &grant));
+        browser_shared_body_release(body);
+        body = NULL;
+        task.request_url = budget_malloc(budget, strlen(script_url) + 1u);
+        REQUIRE(task.request_url != NULL);
+        strcpy(task.request_url, script_url);
+        task.active = true;
+        task.state = SCRIPT_DYNAMIC_QUEUED;
+        task.mode = context.mode;
+        task.credentials = context.credentials;
+    }
+    size_t reserve = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES
+        + 128u * 1024u;
+    REQUIRE(budget_remaining(budget) > reserve);
+    pressure = budget_malloc(budget, budget_remaining(budget) - reserve);
+    REQUIRE(pressure != NULL);
+    size_t collections = runtime->heap_collections;
+    REQUIRE(!js_rt_gc_due(runtime));
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, false)
+        == 256u * 1024u);
+    REQUIRE(browser_session_cache_get(&browser, url, &cached, &length));
+    REQUIRE(length == 256u * 1024u);
+    /* A small file cap and an exhausted total never evict optional cache. */
+    size_t file_cap = runtime->bridge.maximum_script_file_bytes;
+    runtime->bridge.maximum_script_file_bytes = 64u * 1024u;
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, true) > 0);
+    REQUIRE(browser_session_cache_get(&browser, url, &cached, &length));
+    runtime->bridge.maximum_script_file_bytes = file_cap;
+    size_t quota = runtime->bridge.script_quota_bytes;
+    runtime->bridge.script_quota_bytes = runtime->bridge.maximum_script_bytes;
+    REQUIRE(js_rt_dynamic_response_bound(&runtime->bridge, true) == 0);
+    REQUIRE(browser_session_cache_get(&browser, url, &cached, &length));
+    runtime->bridge.script_quota_bytes = quota;
+    size_t bound;
+    if (revalidate) {
+        bool deferred = true;
+        REQUIRE(js_rt_dynamic_start_task(runtime, &task, &deferred));
+        REQUIRE(!deferred);
+        REQUIRE(task.state == SCRIPT_DYNAMIC_FETCHING);
+        REQUIRE(task.stale_body != NULL);
+        REQUIRE(task.stale_resource_grant_valid);
+        REQUIRE(strcmp((const char *) task.stale_body->data,
+                       "globalThis.staleScriptValue=7;") == 0);
+        bound = budget_remaining(budget)
+            - SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES;
+    } else bound = js_rt_dynamic_response_bound(&runtime->bridge, true);
+    /* Revalidation owns a request-private cookie table as well as its
+       response reservation. Its exact size follows the bounded jar ceiling;
+       reclaiming the unborrowed cache must still beat the emergency floor. */
+    REQUIRE(bound > 256u * 1024u);
+    REQUIRE(!browser_session_cache_get(&browser, url, &cached, &length));
+    REQUIRE(runtime->heap_collections == collections);
+    REQUIRE(budget_remaining(budget)
+        >= SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES + bound);
+
+cleanup:
+    browser_shared_body_release(body);
+    if (navigation_ready)
+        js_rt_dynamic_task_clear(&navigation.page.runtime->bridge, &task,
+                                 true, true);
+    budget_free(budget, data);
+    budget_free(budget, pressure);
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
 static bool test_inert_script_types_do_not_consume_quota(Budget *budget)
 {
     const char *test_name = "inert script data blocks do not consume quota";

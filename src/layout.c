@@ -3776,6 +3776,7 @@ struct LayoutBuildJob {
     uint64_t text_fingerprint;
     uint64_t build_active_us;
     LayoutJobPhase phase;
+    unsigned failed_phase;
     LayoutBuildStatus status;
     size_t resumable_phases;
     size_t resumable_passes;
@@ -3845,6 +3846,7 @@ static void layout_job_fail(LayoutBuildJob *job,
                             LayoutBuildStatus status)
 {
     if (job == NULL || job->status != LAYOUT_BUILD_PENDING) return;
+    job->failed_phase = (unsigned) job->phase + 1u;
     layout_job_end_container_log(job);
     if (job->context != NULL) {
         layout_release_context(job->context, job->budget);
@@ -3858,6 +3860,12 @@ static void layout_job_fail(LayoutBuildJob *job,
 static bool layout_job_init(LayoutBuildJob *job)
 {
     LayoutDocument *layout = &job->layout;
+#if !defined(__PSP__)
+    if (tilefinch_test_faults()->refuse_next_layout_context) {
+        tilefinch_test_faults()->refuse_next_layout_context = false;
+        budget_inject_failure_after(job->budget, 0);
+    }
+#endif
     LayoutContext *context = budget_calloc(job->budget, 1, sizeof(*context));
     if (context == NULL) return false;
     job->context = context;
@@ -4331,6 +4339,7 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
     if (job == NULL) return LAYOUT_BUILD_FAILED;
     if (job->status != LAYOUT_BUILD_PENDING) return job->status;
     uint64_t started_us = layout_performance_now_us();
+    LayoutJobPhase active_phase = job->phase;
     bool okay = true;
     static const char *const phase_steps[] = {
         [LAYOUT_JOB_INIT] = "layout-job-init",
@@ -4505,6 +4514,7 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
             job->context != NULL && job->context->cancelled
                 ? LAYOUT_BUILD_CANCELLED : LAYOUT_BUILD_FAILED;
         layout_job_fail(job, failure);
+        job->failed_phase = (unsigned) active_phase + 1u;
         return job->status;
     }
     return job->status;
@@ -4518,6 +4528,11 @@ bool layout_build_job_take(LayoutBuildJob *job, LayoutDocument *layout)
     memset(&job->layout, 0, sizeof(job->layout));
     job->taken = true;
     return true;
+}
+
+unsigned layout_build_job_failure_phase(const LayoutBuildJob *job)
+{
+    return job == NULL ? 0 : job->failed_phase;
 }
 
 void layout_build_job_cancel(LayoutBuildJob *job)
@@ -4553,7 +4568,10 @@ static bool layout_build_context_resumable_sync(
     if (layout == NULL) return false;
     LayoutBuildJob *job = layout_build_job_begin(
         budget, document, stylesheet, fonts, images, viewport, reuse);
-    if (job == NULL) return false;
+    if (job == NULL) {
+        layout->performance.failed_phase = 11;
+        return false;
+    }
     job->preview_y_limit = preview_y_limit;
     LayoutBuildStatus status = LAYOUT_BUILD_PENDING;
     while (status == LAYOUT_BUILD_PENDING) {
@@ -4563,7 +4581,10 @@ static bool layout_build_context_resumable_sync(
                 && layout_build_job_take(job, layout);
     /* The job's own document is gone by now; keep the one bit an owner
        needs to decide between retrying and giving up. */
-    if (!okay) layout->performance.cancelled = status == LAYOUT_BUILD_CANCELLED;
+    if (!okay) {
+        layout->performance.cancelled = status == LAYOUT_BUILD_CANCELLED;
+        layout->performance.failed_phase = job->failed_phase;
+    }
     if (okay && preview_truncated != NULL)
         *preview_truncated = job->preview_truncated;
     layout_build_job_destroy(job);

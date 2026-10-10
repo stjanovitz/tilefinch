@@ -6818,6 +6818,42 @@
                                 descriptor.value.length);
     if (typeof fast === "function") descriptor.value = fast;
   }
+  let detachedAttributeMethod;
+  Object.defineProperty(globalThis, "__tilefinchBindDetachedAttributeMethods", {
+    configurable: true,
+    value(lookup) {
+      detachedAttributeMethod = lookup;
+      delete globalThis.__tilefinchBindDetachedAttributeMethods;
+    },
+  });
+  /* Attribute operations belong to Element's WebIDL interface, not only
+     the per-tag native layer. Libraries call the prototype methods directly
+     to bypass an element's override. Publish the same receiver-based
+     operations here: ordinary wrappers keep their existing fast path and
+     custom elements can delegate with super or Function.prototype.call.
+     Secondary documents use their own attribute storage, so explicit
+     prototype calls must select those operations without calling a possibly
+     author-overridden instance method. */
+  for (const name of [
+    "getAttribute", "getAttributeNS", "getAttributeNames",
+    "getAttributeNode", "getAttributeNodeNS", "setAttribute",
+    "setAttributeNS", "setAttributeNode", "setAttributeNodeNS",
+    "removeAttribute", "removeAttributeNS", "removeAttributeNode",
+    "hasAttribute", "hasAttributeNS", "toggleAttribute",
+  ]) {
+    const native = nativeNodeReceiverDescriptors[name].value,
+      method = { [name](...args) {
+        if (!(this instanceof Element))
+          throw new TypeError("Attribute operation requires an Element");
+        const detached = !(Number(this.__handle) > 0) &&
+          this.__detachedOwner && detachedAttributeMethod?.(name);
+        return (detached || native).apply(this, args);
+      } }[name];
+    Object.defineProperty(method, "length", { value: native.length });
+    Object.defineProperty(Element.prototype, name, {
+      configurable: true, enumerable: true, writable: true, value: method,
+    });
+  }
   /* ParentNode.replaceChildren lives on the per-tag native layer for speed;
      expose the same function where the standard puts it so feature
      detection on Element.prototype finds it. */
@@ -7965,7 +8001,10 @@
   {
     globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
       constructor(init = {}) {
-        Object.assign(this, init);
+        /* Copy entry fields as own data properties. Compatibility shims may
+           install getter-only prototype fields; ordinary assignment must
+           not invoke those inherited accessors and abort observer delivery. */
+        Object.defineProperties(this, Object.getOwnPropertyDescriptors({ ...init }));
       }
     };
     Object.defineProperty(

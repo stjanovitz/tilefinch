@@ -305,6 +305,8 @@ static int test_inline_border_command_parity(void)
     return 0;
 }
 
+#include "suites/layout_humanist_ink.inc"
+
 static int test_layout(void)
 {
 #include "suites/layout_regression_1.inc"
@@ -315,6 +317,7 @@ static int test_layout(void)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    CHECK(test_humanist_ink_fitting() == 0);
     puts("test: picture paints a replaced image through clipping");
     CHECK(test_picture_replaced_paint() == 0);
     CHECK(test_inline_border_command_parity() == 0);

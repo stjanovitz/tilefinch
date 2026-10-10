@@ -152,9 +152,6 @@ static void retarget_replace(ImageResources *images, const void *old_identity,
 {
     size_t old_bytes = owner->pixels == NULL ? 0
         : (size_t) owner->width * (size_t) owner->height * 4u;
-    BrowserSharedBody *old_body = owner->pixel_body;
-    unsigned char *old_pixels = owner->pixels;
-    bool old_owned = owner->owns_pixels;
     int full_width = owner->full_width > 0 ? owner->full_width : owner->width;
     int full_height = owner->full_height > 0
         ? owner->full_height : owner->height;
@@ -167,6 +164,9 @@ static void retarget_replace(ImageResources *images, const void *old_identity,
     for (size_t i = 0; i < images->count; i++) {
         ImageResource *item = &images->items[i];
         if (retarget_identity(item) != old_identity) continue;
+        BrowserSharedBody *old_body = item->pixel_body;
+        unsigned char *old_pixels = item->pixels;
+        bool old_owned = item->owns_pixels;
         item->pixels = pixels;
         item->pixel_body = body;
         item->width = width;
@@ -175,10 +175,14 @@ static void retarget_replace(ImageResources *images, const void *old_identity,
         item->full_height = full_height;
         item->retarget_flags |= set_flags;
         item->owns_pixels = item == owner && pixels != NULL;
-    }
-    if (old_owned) {
-        if (old_body != NULL) browser_shared_body_release(old_body);
-        else budget_free(images->budget, old_pixels);
+        /* A cache acquisition owns its own body lease. Multiple owning
+           entries may therefore share one pixel identity; plain aliases
+           own none. Release every former lease before collapsing the new
+           publication to one owner. */
+        if (old_owned) {
+            if (old_body != NULL) browser_shared_body_release(old_body);
+            else budget_free(images->budget, old_pixels);
+        }
     }
     size_t new_bytes = pixels == NULL ? 0
         : (size_t) width * (size_t) height * 4u;

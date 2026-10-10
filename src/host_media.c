@@ -60,6 +60,7 @@ struct HostMediaPlayer {
     uint64_t clock_us;
     uint64_t presented_video_time_us;
     uint64_t duration_us;
+    uint64_t initial_seek_us;
     size_t decoded_frames;
     size_t dropped_frames;
     size_t video_packets;
@@ -949,6 +950,7 @@ HostMediaPlayer *host_media_create(Budget *budget, BrowserSession *session,
         host_media_destroy(player);
         return NULL;
     }
+    player->initial_seek_us = youtube_input ? youtube_watch_url_start_time_us(source) : 0;
     return player;
 }
 
@@ -1003,6 +1005,12 @@ static bool media_attach_video(HostMediaPlayer *player,
         media_error(error, error_size,
                     "video surface relayout failed");
         return false;
+    }
+    if (player->initial_seek_us != 0) {
+        bool changed = false;
+        if (!host_media_seek(player, navigation, player->initial_seek_us,
+                &changed, error, error_size)) return false;
+        player->initial_seek_us = 0;
     }
     return true;
 }

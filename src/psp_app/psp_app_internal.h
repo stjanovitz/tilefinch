@@ -41,6 +41,7 @@
 #endif
 
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/youtube_login.h"
 #include "tilefinch/canvas_ge_presenter.h"
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/browser_tabs.h"
@@ -844,6 +845,7 @@ typedef struct {
     char site_storage[PSP_STORAGE_PATH_CAPACITY];
     /* Keep compiled scripts: the persistent compiled-script tier. */
     char script_cache[PSP_STORAGE_PATH_CAPACITY];
+    char youtube_login[PSP_STORAGE_PATH_CAPACITY];
 } PspStoragePaths;
 
 /* One operation record, rather than six pointers to main's locals. This is
@@ -961,6 +963,9 @@ typedef struct {
     BrowserProfile *profile;
     BrowserTabs *tabs;
     PspProfileStore profile_store;
+    uint64_t youtube_login_restored;
+    bool youtube_login_pending;
+    bool youtube_login_verified;
     PspOfflineStore offline_store;
     PspMediaSession media;
     PspYoutubePreresolve youtube_preresolve;
@@ -1250,6 +1255,10 @@ void psp_captive_portal_destroy(PspApp *app);
 bool psp_captive_portal_active(const PspInteractiveState *interactive);
 
 /* src/psp_app/psp_app_youtube.c */
+void psp_app_youtube_login_boot(PspProcessResources *, PspBrowserResources *);
+bool psp_app_youtube_login_poll(PspApp *app);
+void psp_app_youtube_login_action(PspApp *, PspAppFrameState *, const PspUiIntent *);
+bool psp_app_youtube_login_clear(PspApp *app);
 void psp_app_youtube_preresolve_tick(
     PspApp *app, const PspAppFrameState *frame, const PspUiIntent *intent,
     bool render_job_pending, bool offline_download_active,

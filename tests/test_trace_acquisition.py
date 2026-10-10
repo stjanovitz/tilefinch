@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -64,12 +65,13 @@ parser.add_argument("--url", required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--max-bytes", required=True)
 parser.add_argument("--timeout-ms", required=True)
+parser.add_argument("--origin", default="")
 args = parser.parse_args()
 
 marker = os.environ.get("FAKE_RECORDER_MARKER")
 if marker:
     with open(marker, "a", encoding="utf-8") as stream:
-        stream.write(args.method + " " + args.url + "\n")
+        stream.write(args.method + " " + args.url + (" Origin=" + args.origin if args.origin else "") + "\n")
 mode = os.environ.get("FAKE_RECORDER_MODE", "ok")
 if mode == "fail-head" and args.method == "HEAD":
     raise SystemExit(17)
@@ -126,7 +128,7 @@ meta = {
     "request-if-none-match": "",
     "request-if-modified-since": "",
     "request-referer": "",
-    "request-origin": "",
+    "request-origin": args.origin if mode != "wrong-origin" else "https://wrong.example.test",
     "request-accept": "",
     "request-sec-fetch-dest": "",
     "request-sec-fetch-mode": "",
@@ -414,7 +416,7 @@ class TraceAcquisitionTests(unittest.TestCase):
         }
 
     def _write_authority(
-        self, requests: list[dict[str, object]]
+        self, requests: list[dict[str, object]], *, mode: str = ACQUIRE.PLAN_MODE
     ) -> tuple[Path, Path]:
         source_sha, _source_bytes = ACQUIRE.trace_digest(
             self.source, 1024 * 1024
@@ -482,12 +484,22 @@ class TraceAcquisitionTests(unittest.TestCase):
                         "unexpected_requests": unexpected_requests,
                     },
                     "acquisition_plan": {
-                        "mode": ACQUIRE.PLAN_MODE,
+                        "mode": mode,
                         "complete": True,
                         "request_count": len(requests),
                         "unplannable": 0,
                         "requests": requests,
-                    }
+                    },
+                    **({"browser_request_origins": {
+                        "version": "unmatched-request-origin-v1",
+                        "overflow": False,
+                        "conflicts": False,
+                        "entries": [{
+                            "method": request["method"],
+                            "url": request["url"],
+                            "request_origin": request["request_origin"],
+                        } for request in requests],
+                    }} if mode == ACQUIRE.ORIGIN_PLAN_MODE else {}),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -506,7 +518,7 @@ class TraceAcquisitionTests(unittest.TestCase):
             "diagnostic_sha256": hashlib.sha256(
                 diagnostic.read_bytes()
             ).hexdigest(),
-            "allowlist_sha256": ACQUIRE._allowlist_digest(requests),
+            "allowlist_sha256": ACQUIRE._allowlist_digest(requests, mode),
             "source_trace_sha256": source_sha,
             "source_record_count": 1,
             "source_origin_ms": 123456789,
@@ -599,7 +611,7 @@ class TraceAcquisitionTests(unittest.TestCase):
             plan = diagnostic_data["acquisition_plan"]
             requests = plan["requests"]
             contract["request_count"] = len(requests)
-            contract["allowlist_sha256"] = ACQUIRE._allowlist_digest(requests)
+            contract["allowlist_sha256"] = ACQUIRE._allowlist_digest(requests, plan["mode"])
             contract["allowed_origins"] = sorted(
                 {
                     ACQUIRE._url_authority(request["url"], "test plan URL")[1]
@@ -944,6 +956,139 @@ class TraceAcquisitionTests(unittest.TestCase):
             ACQUIRE.AcquisitionError, "exact canonical projection"
         ):
             self._mutated_validation(omit_authorized_request, reauthorize_plan=True)
+
+    def _origin_authority(self) -> None:
+        self.requests = [
+            {**request, "request_origin": "https://page.example.test" if index == 0 else ""}
+            for index, request in enumerate(self.requests)
+        ]
+        self.diagnostic, self.contract = self._write_authority(
+            self.requests, mode=ACQUIRE.ORIGIN_PLAN_MODE
+        )
+
+    def test_origin_plan_is_pinned_and_recorder_sends_only_observed_origin(self) -> None:
+        self._origin_authority()
+        contract = ACQUIRE._validate_contract(self.contract)
+        self.assertEqual(ACQUIRE._validate_plan(self.diagnostic, contract), self.requests)
+        self.assertNotEqual(
+            ACQUIRE._allowlist_digest(self.requests, ACQUIRE.ORIGIN_PLAN_MODE),
+            ACQUIRE._allowlist_digest(self.requests),
+        )
+        output = self.root / "origin-merged"
+        completed = self._run(output)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.marker.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(calls, [
+            "GET https://assets.example.test/a.css Origin=https://page.example.test",
+            "HEAD https://media.example.test/b.js",
+        ])
+        for index, request in enumerate(self.requests, 1):
+            meta, _raw = ACQUIRE._metadata(output / f"{index:04d}.meta")
+            self.assertEqual(meta["request-origin"], request["request_origin"])
+            self.assertEqual(meta["request-cookie-bytes"], "0")
+            self.assertEqual(meta["request-credentials"], "0")
+
+    def test_origin_plan_requires_complete_exact_origin_evidence(self) -> None:
+        self._origin_authority()
+
+        def missing(diagnostic: dict[str, object]) -> None:
+            del diagnostic["browser_request_origins"]
+
+        def duplicate(diagnostic: dict[str, object]) -> None:
+            evidence = diagnostic["browser_request_origins"]
+            evidence["entries"].append(dict(evidence["entries"][0]))
+
+        def conflicting(diagnostic: dict[str, object]) -> None:
+            evidence = diagnostic["browser_request_origins"]
+            evidence["entries"][0]["request_origin"] = "https://other.example.test"
+
+        def extra(diagnostic: dict[str, object]) -> None:
+            diagnostic["browser_request_origins"]["entries"][0]["url"] += "?extra"
+
+        def omitted(diagnostic: dict[str, object]) -> None:
+            diagnostic["browser_request_origins"]["entries"].pop()
+
+        def overflow(diagnostic: dict[str, object]) -> None:
+            diagnostic["browser_request_origins"]["overflow"] = True
+
+        def conflicts(diagnostic: dict[str, object]) -> None:
+            diagnostic["browser_request_origins"]["conflicts"] = True
+
+        def changed_plan(diagnostic: dict[str, object]) -> None:
+            diagnostic["acquisition_plan"]["requests"][0]["request_origin"] = "https://other.example.test"
+
+        def unsorted(diagnostic: dict[str, object]) -> None:
+            diagnostic["browser_request_origins"]["entries"].reverse()
+
+        for label, mutate in [
+            ("missing", missing), ("duplicate", duplicate),
+            ("conflicting", conflicting), ("extra", extra),
+            ("omitted", omitted), ("overflow", overflow),
+            ("conflicts", conflicts), ("changed-plan", changed_plan),
+            ("unsorted", unsorted),
+        ]:
+            with self.subTest(label=label), self.assertRaises(ACQUIRE.AcquisitionError):
+                self._mutated_validation(mutate, reauthorize_plan=True)
+
+        for value in [
+            "null", "http://page.example.test", "https://page.example.test/",
+            "https://page.example.test:443", "https://PAGE.example.test",
+            "https://user:pass@page.example.test", "https://page.example.test\r\nx: y",
+            None, [],
+        ]:
+            with self.subTest(origin=value), self.assertRaises(ACQUIRE.AcquisitionError):
+                ACQUIRE._request_origin(value, "test Origin")
+
+    def test_origin_changes_require_new_allowlist_authority(self) -> None:
+        self._origin_authority()
+        def change_both(diagnostic: dict[str, object]) -> None:
+            diagnostic["acquisition_plan"]["requests"][0]["request_origin"] = "https://other.example.test"
+            diagnostic["browser_request_origins"]["entries"][0]["request_origin"] = "https://other.example.test"
+        with self.assertRaisesRegex(ACQUIRE.AcquisitionError, "allowlist SHA-256 mismatch"):
+            self._mutated_validation(change_both)
+
+    def test_recorder_origin_roundtrip_preserves_observed_header(self) -> None:
+        request = {**self.requests[0], "request_origin": "https://page.example.test"}
+        output = self.root / "origin-roundtrip"
+        ACQUIRE._run_recorder(self.recorder, request, output, 4096, 1000)
+        meta, _raw = ACQUIRE._metadata(output / "0000.meta")
+        self.assertEqual(meta["request-origin"], request["request_origin"])
+        ACQUIRE._validate_acquired_record(output, request, 4096)
+
+    def test_large_valid_inventory_is_not_refused_at_old_64k_limit(self) -> None:
+        urls = [f"https://assets.example.test/{index:04d}/" + "x" * 300 for index in range(260)]
+        inventory = {
+            "trace_dir": str(self.source),
+            "trace_sha256": ACQUIRE.trace_digest(self.source, 1024 * 1024)[0],
+            "records": 260, "routes": 260, "ambiguous_routes": 0,
+            "occurrence_routes": 0, "response_cookies": 0,
+            "clock_origin_ms": 123456789,
+            "route_selection_version": ACQUIRE.REFERENCE_ROUTE_SELECTION,
+            "urls": urls,
+        }
+        raw = json.dumps(inventory).encode("utf-8")
+        self.assertGreater(len(raw), 64 * 1024)
+        with mock.patch.object(ACQUIRE.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, raw, b"")):
+            self.assertEqual(
+                ACQUIRE._inspect_reference_trace(Path(sys.executable), self.source),
+                inventory,
+            )
+        for stdout, stderr in [(b"x" * (1024 * 1024 + 1), b""),
+                               (b"{}", b"x" * (1024 * 1024 + 1))]:
+            with self.subTest(stream="stdout" if len(stdout) > 1024 * 1024 else "stderr"):
+                with mock.patch.object(ACQUIRE.subprocess, "run", return_value=
+                                       subprocess.CompletedProcess([], 0, stdout, stderr)):
+                    with self.assertRaises(ACQUIRE.AcquisitionError):
+                        ACQUIRE._bounded_command([sys.executable], "inventory", 1)
+
+    def test_acquired_origin_must_match_plan_even_without_credentials(self) -> None:
+        self._origin_authority()
+        output = self.root / "wrong-origin"
+        completed = self._run(output, mode="wrong-origin")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("request-origin differs", completed.stderr)
+        self.assertFalse(output.exists())
 
     def test_url_authority_rejects_non_https_and_credentialed_urls(self) -> None:
         for url in (

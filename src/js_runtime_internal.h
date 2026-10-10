@@ -138,10 +138,13 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_DYNAMIC_INFLIGHT_REQUESTS 4u
 /* The share of that pool fetch() responses may hold at once. */
 #define SCRIPT_RUNTIME_FETCH_POOL_BYTES (2u * 1024u * 1024u)
-/* The smallest response bound worth starting under memory pressure (the
-   page Budget keeps the presentation reserve beside a larger one:
-   script_admission_affordable_bytes). */
-#define SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES (64u * 1024u)
+/* Keep a useful bounded script unit admissible when retained page state
+   consumes the presentation reserve. A 64 KiB floor truncated ordinary
+   late dependencies even with several MiB free. This is a response ceiling,
+   not a reservation: source quotas, actual Budget allocations and compiler
+   admission still apply. Larger responses keep the presentation reserve:
+   script_admission_affordable_bytes. */
+#define SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES (256u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
@@ -744,6 +747,7 @@ typedef enum {
     SCRIPT_HOST_DETACH_NETWORK,
     SCRIPT_HOST_PUMP_TIMERS,
     SCRIPT_HOST_SCHEDULER_SNAPSHOT,
+    SCRIPT_HOST_XHR_DIAGNOSTICS,
     SCRIPT_HOST_REBIND_DOCUMENT,
     SCRIPT_HOST_COMMIT_SAME_DOCUMENT,
     SCRIPT_HOST_RESTORE_SAME_DOCUMENT,
@@ -797,6 +801,13 @@ typedef enum {
 struct ScriptRuntime {
     Budget *budget;
     PocDocument *document;
+    /* A forced geometry read must not replace the browser's presentation
+       or consume its resource/mutation work while author code is active. */
+    LayoutDocument *geometry_layout;
+    LayoutDocument *geometry_incumbent;
+    uint64_t geometry_content_generation;
+    uint64_t geometry_style_generation;
+    uint64_t geometry_sheet_generation;
     ScriptDocumentScope document_scope;
     JSRuntime *runtime;
     JSContext *context;
@@ -1001,6 +1012,11 @@ struct ScriptRuntime {
        lifecycle never look them up through the mutable Window object. */
     JSValue host_global;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
+    ScriptXHRDiagnostics *xhr_diagnostics;
+    JSValue private_outcome_classifier;
+    bool private_outcome_classifying;
+    uint32_t xhr_diagnostic_sequence;
+    size_t xhr_diagnostic_cursor;
     /* Native-readable bootstrap state, so the per-turn loop and the result
        snapshot do not enter JS: the timer wheel and scroll flag (external
        Float64Array memory), and the plain records behind the network-queue
@@ -1008,6 +1024,7 @@ struct ScriptRuntime {
     double host_state[SCRIPT_HOST_STATE_COUNT];
     JSValue host_network_queue_stats;
     JSValue host_indexed_db_stats;
+    JSValue motion_style_flushed;
     /* Browser-delivered callbacks run with no enclosing author script. Resume
        their bounded listener dispatch only after QuickJS has drained the
        complete microtask checkpoint, before admitting another task. */
@@ -1157,6 +1174,8 @@ static inline void js_rt_bridge_consume_user_activation(DomBridge *bridge)
     bridge->user_activation_expires_ms = 0;
 }
 void js_rt_saturating_add_size(size_t *value, size_t amount);
+int js_rt_private_classify(ScriptRuntime *runtime, JSValueConst value,
+                          JSValueConst parse, int event);
 void js_rt_trace_script_quota_rejection(DomBridge *bridge,
                                         const char *reason);
 bool js_rt_runtime_script_checkpoint(ScriptRuntime *runtime,
@@ -1325,7 +1344,8 @@ ScriptQuotaReserveResult js_rt_bridge_script_quota_reserve_bounded(
 /* Raises the realm's source total past its configured floor while the page
    Budget keeps the realm's growth reserve free (see bridge_state.inc). */
 void js_rt_bridge_script_bytes_admit(DomBridge *bridge, size_t bytes);
-size_t js_rt_dynamic_response_bound(DomBridge *bridge);
+/* Response-cache reclamation is safe only without borrowed cache metadata. */
+size_t js_rt_dynamic_response_bound(DomBridge *bridge, bool reclaim_responses);
 bool js_rt_heavy_gate_holds(ScriptRuntime *runtime, ScriptDynamicTask *task);
 /* Heap growth refusal: copy the body for memory rescue when armed. */
 void js_rt_memory_rescue_capture(ScriptRuntime *runtime);
@@ -1436,6 +1456,7 @@ void js_rt_script_element_states_purge_marked(
 void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot);
 void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle);
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge);
+bool js_rt_notify_style_flushed(JSContext *context);
 bool bridge_node_is_connected(const lxb_dom_node_t *node);
 void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
                                        lxb_dom_node_t *node,

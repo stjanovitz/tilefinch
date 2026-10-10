@@ -2672,7 +2672,7 @@ static bool dynamic_task_take_source(DomBridge *bridge,
    file size is enforced when the body arrives), and no more than the page
    Budget can stage while keeping the presentation reserve. Zero when the
    source total is spent or memory cannot stage even a small script. */
-size_t js_rt_dynamic_response_bound(DomBridge *bridge)
+size_t js_rt_dynamic_response_bound(DomBridge *bridge, bool reclaim_responses)
 {
     if (bridge == NULL) return 0;
     js_rt_bridge_script_bytes_admit(bridge, bridge->maximum_script_file_bytes);
@@ -2682,11 +2682,46 @@ size_t js_rt_dynamic_response_bound(DomBridge *bridge)
     if (used >= bridge->maximum_script_bytes) return 0;
     size_t bound = bridge->maximum_script_bytes - used;
     if (bridge->budget != NULL) {
-        /* Optional caches (response and bytecode tables) give way before a
-           page script is cut short: at 30.7 MB of m.vk.ru's 32 MiB the
-           64 KiB floor refused the language chunk its login form needed. */
+        /* Reclaim optional bytecode storage before cutting a response short. */
         size_t affordable = script_admission_affordable_bytes(
             bridge->budget, SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES, true);
+        /* Compiler admission collects after the body arrives, too late to
+           rescue a response truncated by this staging limit. When room for
+           a bounded compilation unit is scarce, reclaim paced JS garbage
+           and empty pool pages before fixing the transport's byte ceiling.
+           Keep the presentation reserve and source quotas unchanged. HTTP
+           eviction below additionally requires the caller's ownership grant. */
+        size_t staging_target = 512u * 1024u;
+        if (staging_target > bridge->maximum_script_file_bytes)
+            staging_target = bridge->maximum_script_file_bytes;
+        if (staging_target > bound) staging_target = bound;
+        if (affordable < staging_target && bridge->host != NULL
+            && js_rt_gc_due(bridge->host)) {
+            (void) script_runtime_collect_and_trim(bridge->host);
+            affordable = script_admission_affordable_bytes(
+                bridge->budget, SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES, false);
+        }
+        /* A cache miss owns no borrowed response metadata. At that boundary
+           optional HTTP bodies may give way too; collecting JS alone cannot
+           release them. Stale/fresh cache users must retain their metadata
+           first, so callers explicitly opt in only without a borrowed entry. */
+        if (affordable < staging_target && reclaim_responses
+            && bridge->session != NULL
+            && bridge->session->budget == bridge->budget) {
+            size_t needed = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES
+                + staging_target;
+            size_t available = budget_remaining(bridge->budget);
+            if (available < needed)
+                (void) browser_session_cache_reclaim(
+                    bridge->session, needed - available);
+            affordable = script_admission_affordable_bytes(
+                bridge->budget, SCRIPT_DYNAMIC_MINIMUM_RESPONSE_BYTES, false);
+        }
+        /* The emergency floor may consume part of the presentation reserve,
+           but never promise more source staging than the actual free bytes.
+           Transport and compilation still admit their own allocations. */
+        size_t available = budget_remaining(bridge->budget);
+        if (affordable > available) affordable = available;
         if (bound > affordable) bound = affordable;
     }
     return bound;
@@ -2755,15 +2790,6 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         : js_rt_bridge_script_quota_reserve(
               bridge, SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE, 0,
               &task->quota_reservation);
-    size_t network_bound = 0;
-    if (!fresh_hit && quota_status == SCRIPT_QUOTA_RESERVE_GRANTED) {
-        network_bound = js_rt_dynamic_response_bound(bridge);
-        if (network_bound == 0) {
-            js_rt_bridge_script_quota_abort(
-                bridge, &task->quota_reservation);
-            quota_status = SCRIPT_QUOTA_RESERVE_REJECTED;
-        }
-    }
     if (quota_status == SCRIPT_QUOTA_RESERVE_DEFERRED) {
         if (deferred != NULL) *deferred = true;
         return true;
@@ -2782,15 +2808,17 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         js_rt_saturating_add_size(&bridge->result->network_requests, 1);
     }
     if (task->module && cached != NULL) {
-        task->response_url = js_rt_dynamic_copy_text(
+        char *response_url = js_rt_dynamic_copy_text(
             bridge->budget, cached->module_effective_url);
-        if (task->response_url == NULL) {
+        if (response_url == NULL) {
             js_rt_bridge_script_quota_abort(
                 bridge, &task->quota_reservation);
             task->state = SCRIPT_DYNAMIC_READY;
             task->success = false;
             return true;
         }
+        budget_free(bridge->budget, task->response_url);
+        task->response_url = response_url;
         dynamic_module_policy_assign(
             task, cached->module_response_referrer_policy);
     }
@@ -2852,6 +2880,7 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
             dynamic_resource_timing_set_content_type(
                 bridge, task, cached->content_type);
         }
+        browser_shared_body_release(task->stale_body);
         task->stale_body = browser_shared_body_retain(cached->body);
         if (!dynamic_source_body_usable(
                 task->stale_body, cached->length)) {
@@ -2870,9 +2899,15 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     if (bridge->fetch_scheduler == NULL) {
         bridge->fetch_scheduler = script_runtime_fetch_scheduler(runtime);
     }
-    /* A stale entry being revalidated has no exact reservation either. */
-    size_t response_limit = network_bound != 0 ? network_bound
-        : task->quota_reservation.reserved_bytes;
+    /* Copy the last borrowed fields before staging admission can evict the
+       entry. The 304 body/grant and module response policy are task-owned
+       above; request validators are bounded stack copies owned until enqueue. */
+    char etag[sizeof(((BrowserCacheEntry *) 0)->etag)] = {0};
+    char last_modified[sizeof(((BrowserCacheEntry *) 0)->last_modified)] = {0};
+    if (cached != NULL) {
+        memcpy(etag, cached->etag, sizeof(etag));
+        memcpy(last_modified, cached->last_modified, sizeof(last_modified));
+    }
     ScriptRequestPolicy policy;
     FetchRequest request = {
         .method = "GET", .allow_http_errors = true,
@@ -2883,14 +2918,30 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
            request deadline (18-21 s on the reference article) and every
            other transfer with it. */
         .connect_timeout_ms = JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS,
-        .if_none_match = cached == NULL ? NULL : cached->etag,
-        .if_modified_since = cached == NULL ? NULL : cached->last_modified,
+        .if_none_match = cached == NULL ? NULL : etag,
+        .if_modified_since = cached == NULL ? NULL : last_modified,
         .cors_cached_response_validated = task->module && cached != NULL
             && !cached->module_cors_redirect_origin_tainted
-            && (cached->etag[0] != '\0'
-                || cached->last_modified[0] != '\0'),
+            && (etag[0] != '\0' || last_modified[0] != '\0'),
         .redirect_same_origin_only = false
     };
+    /* No borrowed cache metadata survives this point. A stale body can stay
+       leased for a 304 while other optional response entries give way. */
+    size_t response_limit = js_rt_dynamic_response_bound(bridge, true);
+    if (response_limit == 0) {
+        js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
+        if (bridge->result != NULL) {
+            js_rt_saturating_add_size(
+                &bridge->result->dynamic_scripts_quota_rejected, 1);
+            if (bridge->result->dynamic_scripts_started != 0)
+                bridge->result->dynamic_scripts_started--;
+            if (bridge->result->network_requests != 0)
+                bridge->result->network_requests--;
+        }
+        task->state = SCRIPT_DYNAMIC_READY;
+        task->success = false;
+        return true;
+    }
     bool valid = response_limit != 0 && bridge->fetch_scheduler != NULL
         && script_request_policy_prepare(
                bridge, task->request_url, "GET", task->mode,
@@ -2944,6 +2995,54 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     task->request_id = valid ? fetch_scheduler_enqueue(
         bridge->fetch_scheduler, task->request_url, &request,
         response_limit, timeout_ms) : 0;
+#if !defined(__PSP__)
+    _Static_assert(BUDGET_CATEGORY_COUNT <= 9,
+                   "private staging census must cover every Budget category");
+    if (task->request_id != 0 && bridge->host != NULL
+        && bridge->host->xhr_diagnostics != NULL && bridge->budget != NULL) {
+        ScriptXHRDiagnostics *history = bridge->host->xhr_diagnostics;
+        size_t at = history->staging_count;
+        if (at == 16) {
+            memmove(history->staging_rows, history->staging_rows + 1,
+                    15 * sizeof(history->staging_rows[0]));
+            at = 15;
+            js_rt_saturating_add_size(&history->staging_overwritten, 1);
+        } else history->staging_count++;
+        size_t *row = history->staging_rows[at];
+        row[0] = (size_t) task->sequence;
+        row[1] = response_limit;
+        row[2] = budget_remaining(bridge->budget);
+        for (size_t i = 0; i < BUDGET_CATEGORY_COUNT; i++)
+            row[i + 3] = bridge->budget->categories[i].current;
+    }
+#endif
+#ifndef TILEFINCH_NO_TRACE
+    if (task->request_id != 0 && response_limit < 512u * 1024u
+        && tilefinch_trace_script_failures()) {
+        fprintf(stderr,
+                "dynamic-script-staging sequence=%llu bound=%zu free=%zu "
+                "source-limit=%zu source-used=%zu source-reserved=%zu\n",
+                (unsigned long long) task->sequence, response_limit,
+                budget_remaining(bridge->budget), bridge->maximum_script_bytes,
+                bridge->script_quota_bytes, bridge->script_quota_reserved_bytes);
+        if (bridge->budget != NULL) {
+            fprintf(stderr,
+                    "dynamic-script-memory sequence=%llu dom=%zu js=%zu "
+                    "style=%zu resource=%zu layout=%zu render=%zu session=%zu "
+                    "navigation=%zu other=%zu\n",
+                    (unsigned long long) task->sequence,
+                    bridge->budget->categories[BUDGET_CATEGORY_DOM].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_JAVASCRIPT].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_STYLE].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_RESOURCE].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_LAYOUT].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_RENDER].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_SESSION].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_NAVIGATION].current,
+                    bridge->budget->categories[BUDGET_CATEGORY_UNCATEGORIZED].current);
+        }
+    }
+#endif
     if (task->request_id == 0) {
         if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
@@ -3183,6 +3282,24 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
     }
     browser_shared_body_release(body);
     if (!success && bridge->result != NULL) {
+        size_t *category;
+        if (fetched->response_limit_exceeded) {
+            category = &bridge->result->dynamic_script_response_limit_failures;
+        } else if (strcmp(fetched->error, "shared memory budget exceeded") == 0) {
+            category = &bridge->result->dynamic_script_memory_failures;
+        } else if (!transport_success
+                   || (fetched->status_code != 304
+                       && (fetched->status_code < 200
+                           || fetched->status_code >= 300))) {
+            category = &bridge->result->dynamic_script_transport_failures;
+        } else if (!resource_grant_valid) {
+            category = &bridge->result->dynamic_script_authority_failures;
+        } else {
+            /* Source ownership/quota/metadata admission failed after an
+               otherwise authorized, successful response. */
+            category = &bridge->result->dynamic_script_source_failures;
+        }
+        js_rt_saturating_add_size(category, 1);
         js_rt_saturating_add_size(&bridge->result->network_failures, 1);
         if (js_rt_network_error_is_timeout(fetched->error)) {
             js_rt_saturating_add_size(&bridge->result->async_network_timed_out, 1);
@@ -3190,6 +3307,24 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
     }
     task->state = SCRIPT_DYNAMIC_READY;
     task->success = success;
+#ifndef TILEFINCH_NO_TRACE
+    if (!success && tilefinch_trace_script_failures()) {
+        /* Numeric-only host diagnostics: request/response text can contain
+           authentication state and is unnecessary to locate this refusal. */
+        fprintf(stderr,
+                "dynamic-script-fetch-refused sequence=%llu transport=%d "
+                "status=%ld grant=%d bytes=%zu heap-remaining=%zu timeout=%d "
+                "limit=%d memory=%d cancelled=%d consumer=%d\n",
+                (unsigned long long) task->sequence, transport_success,
+                fetched->status_code, resource_grant_valid, fetched->length,
+                script_runtime_heap_remaining(runtime),
+                js_rt_network_error_is_timeout(fetched->error),
+                fetched->response_limit_exceeded,
+                strcmp(fetched->error, "shared memory budget exceeded") == 0,
+                strcmp(fetched->error, "request cancelled") == 0,
+                strcmp(fetched->error, "stream consumer rejected response") == 0);
+    }
+#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (!success) {
         char diagnostic[512];

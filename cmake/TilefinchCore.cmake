@@ -134,6 +134,7 @@ set(TILEFINCH_CORE_SOURCES
     src/voice_component.c
     src/viewport.c
     src/youtube_lite.c
+    src/youtube_login.c
     src/psp_network_diagnostics.c
     src/youtube_resolver.c
     src/youtube_subtitles.c

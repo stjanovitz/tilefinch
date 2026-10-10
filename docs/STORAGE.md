@@ -69,6 +69,7 @@ smaller. "Writer" names the owning source file.
 | `tab-hibernation.bin` | `browser_tabs.c` | ≤ 16 KB + 16 B header | removed on rehydrate, on disabling hibernation, and at clean exit | tmp + remove + rename |
 | `http-cache.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation (payload further capped by the 1/2/4 MB cache setting) | user setting 0 removes it; "clear cache" removes it | backup rotation; a torn primary is removed after `.bak` recovery |
 | `local-storage.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation | disabling the setting removes it; "clear local storage" removes it | backup rotation, as above |
+| `youtube-login.bin` | `youtube_login.c` | ≤ 64 KiB | Sign out, clear cookies/YouTube site data, Never save, or Cookies & storage off | opt-in only; checksum, exclusive `.tmp` write and rename (remove + rename when FAT refuses replacement); no backup or exit write |
 | `tls-sessions.bin` (+`.bak`) | `tls_session_store.c` | ≤ 64 KB per generation (≤ 16 hosts × 2 sessions × 4 KB) | "clear HTTP caches" removes it; pruned of expired entries at load and save | backup rotation; a torn primary is removed after `.bak` recovery, and the whole file is a plain miss on any checksum, store-version, or Mbed-TLS-version-pin mismatch |
 | `entropy-seed.bin` | `psp_entropy.c` | 48 B | replaced once per boot, when the TLS entropy pool first seeds | direct overwrite; a torn, damaged or all-zero file is ignored (it is mixed in but never credited, so losing it costs nothing; see [PSP_TRANSPORT.md](engineering/PSP_TRANSPORT.md#entropy)) |
 | `site-storage/p-<hash>` | `session_site_storage.c` | per site, ≤ 4 MB live data; the log is compacted before it passes twice the dead-record threshold plus live data | **Settings → Device & storage → Site data & storage** deletes one; so does the site's **Clear data for this site** | append-only checksummed log; compaction writes `.tmp`, then remove + rename, and a load recovers a lone `.tmp` |
@@ -206,6 +207,25 @@ of idle Memory Stick time spread over many pages. The cache avoids recompiling
 unchanged assets after a restart; the benefit depends on the page and cache hits.
 
 ### Site storage
+
+#### Saved YouTube login (opt-in)
+
+The native provider offers to save a newly verified login. The default is
+**Ask**, with **Not now** selected. **Always** is an explicit remembered
+choice; **Never** removes the saved file and suppresses future prompts.
+`data/youtube-login.bin` contains only secure, unpartitioned YouTube-domain
+cookies, never a password or Google-domain cookies. It is bounded to 64 KiB
+and the session cookie-entry limit, checksummed, and replaced through a
+temporary file. There is no backup copy. The checksum detects corruption;
+it does not encrypt or authenticate the file. Anyone holding the card may
+be able to use the saved session.
+
+Restoration is transactional at boot; invalid, expired, or budget-refused
+data cannot overwrite a live cookie jar. Failed saving leaves the current
+session working. Ordinary refreshes and exit do not write this file.
+Sign out, clearing cookies, clearing YouTube's site data, selecting Never,
+or disabling Cookies & storage removes it. Preference changes use the
+existing profile-saving path independently of the credential file.
 
 `localStorage`, `sessionStorage`, and the origin-private file system
 (`navigator.storage.getDirectory()`) share one store in the browser session,

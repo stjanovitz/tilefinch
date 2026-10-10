@@ -463,6 +463,10 @@ int main(int argc, char **argv)
             psp_ui_show_status(&ui, "NOT ENOUGH FREE SPACE FOR UPDATE", 240);
         }
         ui.toast_entry_frames = 0;
+    } else if (strcmp(mode, "youtube-login") == 0) {
+        psp_ui_set_page(&ui, "YouTube", "https://www.youtube.com/", true);
+        psp_ui_show_youtube_login_offer(&ui);
+        ui.overlay_animation_frames = 0;
     } else if (strcmp(mode, "heavy-offer") == 0) {
         /* m.vk.ru logged out: 5.3 MB of script, about 51 s to start. */
         psp_ui_set_page(&ui, "VK", "https://m.vk.ru/", true);

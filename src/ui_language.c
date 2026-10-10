@@ -156,19 +156,26 @@ void tilefinch_ui_translation_destroy(TilefinchUiTranslation *t)
     }
 }
 
-const char *tilefinch_ui_translation_text(const TilefinchUiTranslation *t, const char *english)
+static const char *translation_text(const TilefinchUiTranslation *t,
+                                   const char *english, bool visual)
 {
     if (!t || !english) return english;
     size_t lo = 0, hi = t->count;
     while (lo < hi) {
         size_t mid = lo + (hi-lo)/2;
         int order = strcasecmp(english, t->text + t->rows[mid].key);
-        if (!order) return t->rows[mid].visual != UINT16_MAX
+        if (!order) return visual && t->rows[mid].visual != UINT16_MAX
             ? t->visual_text + t->rows[mid].visual : t->text + t->rows[mid].value;
         if (order < 0) hi = mid; else lo = mid + 1;
     }
     return english;
 }
+
+const char *tilefinch_ui_translation_text(const TilefinchUiTranslation *t, const char *english)
+{ return translation_text(t, english, true); }
+
+const char *tilefinch_ui_logical_text(const char *english)
+{ return translation_text(bound_translation, english, false); }
 
 static bool translation_path(const TilefinchInstallPaths *paths, unsigned language,
                              char *output, size_t capacity)

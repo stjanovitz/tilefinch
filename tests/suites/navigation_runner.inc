@@ -6,6 +6,20 @@ int main(int argc, char **argv)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--parser-head-cssom-only") == 0) {
+        RUN_TEST(test_parser_head_cssom_preserves_initialization);
+        puts("parser head CSSOM tests passed");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--replacement-pressure-only") == 0) {
+        RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
+        RUN_TEST(test_stable_relayout_scroll_defers_author_reflection);
+        RUN_TEST(test_optional_image_layout_refusal_retains_page);
+        RUN_TEST(test_optional_initial_image_refusal_retains_page);
+        RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
+        puts("replacement pressure tests passed");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--legacy-charset-only") == 0) {
         RUN_TEST(test_legacy_charset_documents_decode);
         puts("legacy charset tests passed");
@@ -20,6 +34,8 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--image-retarget-only") == 0) {
+        RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
+        RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
         RUN_TEST(test_display_retarget_follows_painted_size);
         RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
         RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
@@ -43,7 +59,11 @@ int main(int argc, char **argv)
         return 0;
     }
     RUN_TEST(test_pump_and_cancel);
+    RUN_TEST(test_inline_script_configured_source_allowance);
+    RUN_TEST(test_parser_refusal_stops_speculative_preview_retries);
     RUN_TEST(test_display_retarget_follows_painted_size);
+    RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
+    RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
     RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
     RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
     RUN_TEST(test_progressive_preview_is_bounded_and_transient);
@@ -54,6 +74,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_svg_sprite_sheet_is_not_an_image);
     RUN_TEST(test_background_images_continue_after_useful_paint);
     RUN_TEST(test_background_image_failure_retains_visible_prefix);
+    RUN_TEST(test_optional_image_layout_refusal_retains_page);
+    RUN_TEST(test_optional_initial_image_refusal_retains_page);
+    RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
+    RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
+    RUN_TEST(test_stable_relayout_scroll_defers_author_reflection);
     RUN_TEST(test_static_images_retry_after_transient_idle_failure);
     RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
     RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
@@ -67,6 +92,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_streaming_preview_precedes_eof);
     RUN_TEST(test_commit_appends_late_body_style);
     RUN_TEST(test_parser_checkpoint_refusals_preserve_server_dom);
+    RUN_TEST(test_parser_head_cssom_preserves_initialization);
     RUN_TEST(test_parser_script_stage_circuit_preserves_actions);
     RUN_TEST(test_parser_transport_failures_do_not_retire_realm);
     RUN_TEST(test_parser_script_stage_watchdog_and_failure_reset);

@@ -27,6 +27,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -70,18 +71,24 @@ def inspect_digest(trace: Path) -> str:
 
 
 def run_capture(scenario: str, manifest: Path, trace_root: Path,
-                output_root: Path) -> tuple[int, dict]:
-    log = output_root / f"{scenario}-capture.log"
-    with log.open("w") as sink:
+                output_root: Path, *, full_document: bool = False,
+                executable: str | None = None) -> tuple[int, dict, Path]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    log = output_root / "stdout.log"
+    command = ["node", str(CAPTURE), "--scenario", scenario,
+               "--trace-root", str(trace_root), "--output-root", str(output_root),
+               "--manifest", str(manifest)]
+    if full_document:
+        command.append("--full-document")
+    if executable:
+        command.extend(["--executable", executable])
+    with log.open("w") as sink, (output_root / "stderr.log").open("w") as errors:
         completed = subprocess.run(
-            ["node", str(CAPTURE), "--scenario", scenario,
-             "--trace-root", str(trace_root),
-             "--output-root", str(output_root),
-             "--manifest", str(manifest)],
-            stdout=sink, stderr=subprocess.STDOUT)
+            command,
+            stdout=sink, stderr=errors)
     diagnostic = output_root / scenario / "reference-diagnostic.json"
     info = json.loads(diagnostic.read_text()) if diagnostic.exists() else {}
-    return completed.returncode, info
+    return completed.returncode, info, diagnostic
 
 
 def acquire(scenario: str, diagnostic: Path, source: Path, output: Path,
@@ -103,7 +110,7 @@ def acquire(scenario: str, diagnostic: Path, source: Path, output: Path,
         "schema": 1, "name": scenario,
         "diagnostic_sha256": hashlib.sha256(
             diagnostic.read_bytes()).hexdigest(),
-        "allowlist_sha256": ACQUIRE._allowlist_digest(requests),
+        "allowlist_sha256": ACQUIRE._allowlist_digest(requests, plan["mode"]),
         "source_trace_sha256": sha,
         "source_record_count": int(info["record-count"]),
         "source_origin_ms": int(info["origin-ms"]),
@@ -144,23 +151,29 @@ def main() -> int:
     parser.add_argument("--native-inventory",
                         default="build-dev/psp-browser-trace-inventory")
     parser.add_argument("--max-rounds", type=int, default=5)
+    parser.add_argument("--full-document", action="store_true")
+    parser.add_argument("--executable")
     args = parser.parse_args()
 
     _, row = manifest_row(args.manifest, args.scenario)
     replay_dir = row[2]
-    for round_index in range(args.max_rounds):
-        code, info = run_capture(args.scenario, args.manifest,
-                                 args.trace_root, args.output_root)
+    if not 0 <= args.max_rounds <= 20:
+        parser.error("--max-rounds must be in 0..20")
+    for round_index in range(args.max_rounds + 1):
+        attempt = args.output_root / f"{args.scenario}-attempt-{time.time_ns()}"
+        code, info, diagnostic = run_capture(args.scenario, args.manifest,
+                                 args.trace_root, attempt,
+                                 full_document=args.full_document, executable=args.executable)
         if code == 0:
             print(f"{args.scenario}: eligible after {round_index} "
                   f"acquisition round(s); replay_dir={replay_dir}")
             return 0
-        diagnostic = args.output_root / args.scenario / \
-            "reference-diagnostic.json"
         if not diagnostic.exists():
             print(f"{args.scenario}: capture failed without diagnostic "
                   f"(rc={code}); see capture log", file=sys.stderr)
             return 1
+        if round_index == args.max_rounds:
+            break
         source = args.trace_root / replay_dir
         suffix = round_index + 1
         while (args.trace_root / f"{args.scenario}-r{suffix}").exists():

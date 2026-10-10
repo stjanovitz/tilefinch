@@ -991,12 +991,12 @@ keyed per sheet; only siblings inserted in the same turn may follow), and no
 `:has()` answer. For `:has()` the plan's walk is used when it classifies the
 sheet, and otherwise a plan-independent summary: the first and last compound
 keys of every plain argument, and the anchor keys of arguments that read
-positions, emptiness or adjacency (cnn.com's sheet, with over a thousand
-`:has()` selectors, overflowed the plan's former 512 entries). Paths through `<head>`, inline SVG, form
+positions, emptiness or adjacency (a sheet with over a thousand
+`:has()` selectors overflowed the plan's former 512 entries). Paths through `<head>`, inline SVG, form
 option lists, media and picture sources, plugins and image maps never skip,
 nor does a hidden list item (layout numbers list items whether or not they
-render). Each cnn.com locator insertion used to cost a full relayout (3.3 s
-in PPSSPP).
+render). Hidden locator insertions used to cost a full relayout (3.3 s
+in a measured PPSSPP case).
 Records inserted from a detached tree and detached again in the same turn
 (a measurement probe) are transient and skipped. A head `<script>` is
 inert when the bridge's probe found no `:has()` answer it can move, or

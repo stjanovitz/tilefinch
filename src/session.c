@@ -566,6 +566,9 @@ typedef struct {
     size_t *cookie_clock;
     const char (*third_party_cookie_allowed_sites)[BROWSER_ORIGIN_LIMIT];
     size_t third_party_cookie_allowed_site_count;
+#ifndef __PSP__
+    BrowserCookieDiagnostics *diagnostics;
+#endif
 } BrowserCookieStore;
 
 static BrowserCookieStore browser_session_cookie_store(
@@ -586,6 +589,9 @@ static BrowserCookieStore browser_session_cookie_store(
             : session->third_party_cookie_allowed_sites
         , .third_party_cookie_allowed_site_count = session == NULL ? 0
             : session->third_party_cookie_allowed_site_count
+#ifndef __PSP__
+        , .diagnostics = session == NULL ? NULL : &session->cookie_diagnostics
+#endif
     };
 }
 
@@ -1176,7 +1182,23 @@ static void cookie_clock_make_room(BrowserCookieStore *store)
     *store->cookie_clock = count;
 }
 
-static bool cookie_set(BrowserCookieStore *store,
+static void cookie_diagnostic_add(BrowserCookieStore *store, unsigned kind)
+{
+#ifndef __PSP__
+    BrowserCookieDiagnostics *d = store == NULL ? NULL : store->diagnostics;
+    if (d == NULL || !d->enabled) return;
+    size_t *counter = kind == 0 ? &d->byte_refusals
+        : kind == 1 ? &d->slot_refusals
+        : kind == 2 ? &d->allocation_refusals
+        : kind == 3 ? &d->policy_ignored : &d->evictions;
+    if (*counter != SIZE_MAX) (*counter)++;
+#else
+    (void) store;
+    (void) kind;
+#endif
+}
+
+static bool cookie_set_raw(BrowserCookieStore *store,
                        const TilefinchRequestContext *request,
                        const char *cookie, bool from_http)
 {
@@ -1358,7 +1380,10 @@ static bool cookie_set(BrowserCookieStore *store,
        ignored (rather than turning a valid response into a network error)
        unless the top-level site has an explicit bounded grant. */
     if (!partitioned && !tilefinch_request_same_site(request)
-        && !cookie_store_third_party_allowed(store, request)) return true;
+        && !cookie_store_third_party_allowed(store, request)) {
+        cookie_diagnostic_add(store, 3);
+        return true;
+    }
     if (path_length == 0 || path_length >= BROWSER_COOKIE_LONG_PATH_LIMIT) {
         return false;
     }
@@ -1408,7 +1433,7 @@ static bool cookie_set(BrowserCookieStore *store,
             /* Eviction must not become a back door around the protections
                enforced above on an exact-key overwrite.  Script (!from_http)
                may never retire an HttpOnly cookie, and an insecure origin may
-               never retire a Secure one -- otherwise eight scripted writes
+               never retire a Secure one -- otherwise enough scripted writes
                evict the session cookie and the next write forges it. */
             bool evictable = (from_http || !candidate->http_only)
                 && (secure || parsed.secure || !candidate->secure);
@@ -1443,25 +1468,35 @@ static bool cookie_set(BrowserCookieStore *store,
             }
         }
     }
-    if (entry == NULL) return false;
+    if (entry == NULL) {
+        cookie_diagnostic_add(store, 1);
+        return false;
+    }
     bool newly_created = entry->value == NULL;
     size_t old_length = entry->value == NULL ? 0 : entry->value_length;
     size_t old_long_path_length =
         entry->long_path == NULL ? 0 : entry->path_length;
     if (*store->cookie_bytes - old_length + value_length
-        > store->maximum_cookie_bytes) return false;
+        > store->maximum_cookie_bytes) {
+        cookie_diagnostic_add(store, 0);
+        return false;
+    }
     size_t new_long_path_length =
         path_length >= sizeof(entry->path) ? path_length : 0;
     if (*store->cookie_long_path_bytes - old_long_path_length
             + new_long_path_length
         > store->maximum_cookie_long_path_bytes) return false;
     char *copy = budget_malloc(store->budget, value_length + 1);
-    if (copy == NULL) return false;
+    if (copy == NULL) {
+        cookie_diagnostic_add(store, 2);
+        return false;
+    }
     memcpy(copy, value, value_length); copy[value_length] = '\0';
     char *long_path = NULL;
     if (new_long_path_length != 0) {
         long_path = budget_malloc(store->budget, path_length + 1);
         if (long_path == NULL) {
+            cookie_diagnostic_add(store, 2);
             budget_free(store->budget, copy);
             return false;
         }
@@ -1469,6 +1504,7 @@ static bool cookie_set(BrowserCookieStore *store,
         long_path[path_length] = '\0';
     }
     if (evicting) {
+        cookie_diagnostic_add(store, 4);
         clear_cookie_entry(store, entry);
         newly_created = true;
         old_length = 0;
@@ -1509,6 +1545,38 @@ static bool cookie_set(BrowserCookieStore *store,
         + new_long_path_length;
     return true;
 }
+
+static bool cookie_set(BrowserCookieStore *store,
+                       const TilefinchRequestContext *request,
+                       const char *cookie, bool from_http)
+{
+    bool okay = cookie_set_raw(store, request, cookie, from_http);
+#ifndef __PSP__
+    BrowserCookieDiagnostics *d = store == NULL ? NULL : store->diagnostics;
+    if (d != NULL && d->enabled) {
+        size_t *attempts = from_http ? &d->http_attempts : &d->script_attempts;
+        if (*attempts != SIZE_MAX) (*attempts)++;
+        if (!okay && d->refused != SIZE_MAX) d->refused++;
+        if (store->cookie_bytes != NULL
+            && *store->cookie_bytes > d->peak_value_bytes)
+            d->peak_value_bytes = *store->cookie_bytes;
+    }
+#endif
+    return okay;
+}
+
+#ifndef __PSP__
+void browser_session_cookie_diagnostics(BrowserSession *session, bool enable,
+                                        BrowserCookieDiagnostics *diagnostics)
+{
+    if (session == NULL) {
+        if (diagnostics != NULL) *diagnostics = (BrowserCookieDiagnostics) {0};
+        return;
+    }
+    if (enable) session->cookie_diagnostics.enabled = true;
+    if (diagnostics != NULL) *diagnostics = session->cookie_diagnostics;
+}
+#endif
 
 bool browser_session_cookie_set(BrowserSession *session, const char *url,
                                 const char *cookie)
@@ -1707,6 +1775,23 @@ static bool site_cookie_matches(
         && (entry->host_only
             ? strcmp(parsed->host, entry->domain) == 0
             : domain_matches(parsed->host, entry->domain));
+}
+
+bool browser_session_cookie_clear_domain(BrowserSession *session,
+                                         const char *url)
+{
+    CookieURL parsed;
+    if (session == NULL || session->budget == NULL || url == NULL
+        || !parse_cookie_url(url, &parsed)) return false;
+    BrowserCookieStore store = browser_session_cookie_store(session);
+    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+        BrowserCookieEntry *entry = &session->cookies[i];
+        if (entry->value != NULL && domain_matches(entry->domain, parsed.host))
+            clear_cookie_entry(&store, entry);
+    }
+    memset(&session->site_adapter_state, 0, sizeof(session->site_adapter_state));
+    browser_session_site_adapter_document_cache_clear(session);
+    return true;
 }
 
 bool browser_session_site_data_usage(

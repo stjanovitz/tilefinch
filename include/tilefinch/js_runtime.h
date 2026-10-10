@@ -206,6 +206,14 @@ typedef struct {
     size_t dynamic_scripts_started;
     size_t dynamic_scripts_completed;
     size_t dynamic_scripts_failed;
+    /* Fixed numeric fetch-failure categories, excluding author source,
+       URLs, response bodies and error strings. These partition failures
+       while receiving a dynamic script, not later evaluation exceptions. */
+    size_t dynamic_script_response_limit_failures;
+    size_t dynamic_script_memory_failures;
+    size_t dynamic_script_transport_failures;
+    size_t dynamic_script_authority_failures;
+    size_t dynamic_script_source_failures;
     size_t dynamic_scripts_cancelled;
     size_t dynamic_scripts_cache_hits;
     size_t dynamic_scripts_ordered_waits;
@@ -429,6 +437,46 @@ typedef struct {
     bool classic_script_continuation;
     bool sampled_clock;
 } ScriptSchedulerSnapshot;
+
+enum { SCRIPT_XHR_DIAGNOSTIC_LIMIT = 32, SCRIPT_XHR_DIAGNOSTIC_COLUMNS = 10 };
+enum { SCRIPT_PRIVATE_OUTCOME_COUNT = 13 };
+typedef struct {
+    size_t count;
+    size_t overwritten;
+    /* Private diagnostic observer only: counts calls through the installed
+       JSON.parse wrapper, not cached aliases obtained before enablement.
+       No input, result, exception text or reviver arguments are retained. */
+    size_t json_parse_calls;
+    size_t json_parse_failures;
+    bool json_parse_observer_installed;
+    bool outcome_classifier_installed;
+    /* Fixed categories only: unrecognized, rejected, verification required,
+       redirect, credential transition (not authentication proof), protocol
+       error, challenge update, and six credential-handoff subcategories
+       (navigation, form POST, native account, close, prerequisite, other).
+       Never retain parsed values or strings. */
+    size_t outcome_counts[SCRIPT_PRIVATE_OUTCOME_COUNT];
+    /* Fixed exception categories observed before a promise is handled:
+       type, range, reference, syntax, internal, error, other, undefined.
+       No reason or stack contents are retained here. */
+    size_t rejection_kinds[8];
+    /* Trusted local classifier stage IDs only, including handled rejections. */
+    size_t rejection_stages[SCRIPT_PRIVATE_OUTCOME_COUNT];
+    /* Host navigation boundaries, without targets or request metadata. */
+    size_t navigation_accepted;
+    size_t navigation_refused;
+    size_t navigation_consumed;
+    /* Send sequence, status, bytes, text units, phase, responseText reads,
+       response reads, readystatechange events, progress events, load events.
+       No request/response contents, URLs, headers or callback identities. */
+    uint32_t rows[SCRIPT_XHR_DIAGNOSTIC_LIMIT][SCRIPT_XHR_DIAGNOSTIC_COLUMNS];
+#if !defined(__PSP__)
+    /* Opt-in numeric staging census; never stores request or response text. */
+    size_t staging_count;
+    size_t staging_overwritten;
+    size_t staging_rows[16][12];
+#endif
+} ScriptXHRDiagnostics;
 
 /* Validation census for the bounded PSP WebGL translator. Shipping builds
    expose an empty snapshot without adding timing work to the frame path. */
@@ -1261,6 +1309,21 @@ bool script_runtime_deterministic_replay_diagnostics(
    arguments, URLs, or page values cross this diagnostic seam. */
 bool script_runtime_scheduler_snapshot(
     ScriptRuntime *runtime, ScriptSchedulerSnapshot *snapshot);
+/* Opt-in RAM-only history. Enabling is idempotent; ordinary runtimes allocate
+   no history. The captured bootstrap function cannot be replaced by authors.
+   The private JSON observer changes JSON.parse identity, but preserves its
+   arguments, receiver, return value and exception; it does not see aliases
+   captured before enablement. It is diagnostic, not ordinary browsing. */
+bool script_runtime_xhr_diagnostics(
+    ScriptRuntime *runtime, bool enable, ScriptXHRDiagnostics *snapshot);
+/* Trusted local diagnostic source only, never called for ordinary browsing.
+   A function expression receives (parsedValue, originalParse); only a numeric
+   category in [0, SCRIPT_PRIVATE_OUTCOME_COUNT) crosses the reporting boundary.
+   Source is limited to 16 KiB and no parser values are retained by native code. */
+bool script_runtime_private_outcome_classifier(
+    ScriptRuntime *runtime, const char *source, size_t length);
+/* Explicit local diagnostic sampling only: bounded 13-bit stage masks. */
+unsigned script_runtime_private_probe(ScriptRuntime *runtime, bool failures);
 
 typedef struct {
     bool selected_native;
@@ -2101,6 +2164,11 @@ void script_runtime_set_stylesheet(ScriptRuntime *runtime,
 void script_runtime_set_synchronous_layout_callback(
     ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
     void *opaque);
+/* Bounded, runtime-owned geometry view using already admitted styles and
+   resources. Does not retire the page, fetch resources, replace presentation,
+   or consume the pending mutation journal. Normal layout adoption releases it. */
+bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
+                                          const ViewportContext *viewport);
 /* Called with a detached subtree root immediately before the runtime frees
    it, while every node in it is still valid. A layout reuse cache that keys
    entries by node pointer evicts the subtree here, which lets removals and

@@ -887,10 +887,10 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(browser_engine_scroll_by(engine, 83));
     const NavigationEntry *focused_watch =
         navigation_current(browser_engine_navigation(engine));
-    CHECK(raw_play_index == 1
+    CHECK(raw_play_index < browser_engine_navigation(engine)->page.layout.link_count
           && focused_watch != NULL
           && focused_watch->focus_kind == CONTROLLER_FOCUS_LINK
-          && focused_watch->focus_index == 1
+          && focused_watch->focus_index == raw_play_index
           && focused_watch->scroll_y > 0);
     int focused_watch_scroll = focused_watch->scroll_y;
 
@@ -1476,6 +1476,7 @@ typedef struct {
     const char *content_type;
     const char *body;
     bool failed;
+    const char *method;
 } GoogleIdentityRecord;
 
 static bool write_google_identity_replay(
@@ -1496,12 +1497,14 @@ static bool write_google_identity_replay(
         FILE *meta = ok ? fopen(path, "wb") : NULL;
         ok = meta != NULL && fprintf(
             meta,
-            "psp-http-trace=1\nmethod=GET\nurl=%s\n"
+            "psp-http-trace=1\nmethod=%s\nurl=%s\n"
             "success=%d\nasync-delay-pumps=0\nexternal-cancel=0\n"
             "transport-timeout=0\nerror=%s\nstatus=%ld\nlength=%zu\n"
+            "redirect-origin-tainted=0\n"
             "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
             "cf-mitigated=\naccept-ch=\ncritical-ch=\nserver=gws\n"
             "cf-ray=\nset-cookie-count=0\n",
+            record->method == NULL ? "GET" : record->method,
             record->url, record->failed ? 0 : 1,
             record->failed ? "Invalid HTTP header field was received" : "",
             record->status, record->failed ? 0u : length,
@@ -5254,7 +5257,8 @@ static int test_youtube_home_topics_are_lazy(void)
     YoutubeLiteDocument pure = {0};
     CHECK(body != NULL && youtube_lite_build_document(&pure_budget,
         "https://www.youtube.com/?tilefinch_topics=1", body, body_length,
-        &pure, pure_error, sizeof(pure_error)) && pure.result_count == 2);
+        &pure, pure_error, sizeof(pure_error)) && pure.result_count == 2
+        && strstr(pure.html, "Watch YouTube on this device") == NULL);
     char *incumbent = pure.html;
     budget_inject_failure_after(&pure_budget, 0);
     CHECK(!youtube_lite_home_set_search_value(&pure, "query", 5)
@@ -5284,6 +5288,8 @@ static int test_youtube_home_topics_are_lazy(void)
             && browser_engine_load_url(engine, "https://www.youtube.com/", true)
             && browser_engine_render_frame(engine, NULL));
         NavigationSession *navigation = browser_engine_navigation(engine);
+        CHECK(strstr(document_body_text(&navigation->page.document),
+            "Watch YouTube on this device") != NULL);
         CHECK(navigation->page.layout.control_count != 0);
         size_t base_links = navigation->page.layout.link_count;
         CHECK(document_control_value_set(&navigation->page.document,
@@ -5319,6 +5325,8 @@ static int test_youtube_home_topics_are_lazy(void)
                == navigation->page.layout.controls[0].node);
         if (enabled && !refuse) {
             CHECK(changed && navigation->page.layout.link_count == base_links + 2);
+            CHECK(strstr(document_body_text(&navigation->page.document),
+                "Watch YouTube on this device") == NULL);
             CHECK(strstr(navigation->page.layout.links[base_links].url, "UCfixturemusic") != NULL);
             bool painted_value = false;
             for (size_t at = 0; at < navigation->page.layout.count; at++) {
@@ -5344,6 +5352,622 @@ static int test_youtube_home_topics_are_lazy(void)
    the synchronous entry point never returns.  Bound the pumps and require a
    terminal status; which terminal status the marker-less body reaches is the
    builder's business, only non-termination is the defect. */
+static bool youtube_notice_is_single_run(const LayoutDocument *layout,
+                                         const char *id, const char *label)
+{
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        const LayoutNodeBox *box = &layout->node_boxes[i];
+        size_t length = 0;
+        const char *name = document_attribute(box->node, "id", &length);
+        if (name == NULL || strlen(id) != length || memcmp(name, id, length) != 0) continue;
+        size_t painted = 0;
+        for (size_t at = box->command_start; at < box->command_end && at < layout->count; at++) {
+            const DrawCommand *command = &layout->commands[at];
+            if (command->type != DRAW_TEXT || command->text_length == 0) continue;
+            if (command->text_length != strlen(label)
+                || memcmp(command->text, label, command->text_length) != 0) return false;
+            painted++;
+        }
+        return painted == 1u;
+    }
+    return false;
+}
+
+static bool youtube_header_baselines_match(BrowserEngine *engine)
+{
+    const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
+    int baseline = -1;
+    size_t count = 0;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        size_t length = 0;
+        const char *name = document_attribute(layout->node_boxes[i].node, "class", &length);
+        if (name == NULL || !((length == 5 && memcmp(name,"brand",5) == 0)
+            || (length == 7 && memcmp(name,"account",7) == 0))) continue;
+        const LayoutNodeBox *box = &layout->node_boxes[i];
+        for (size_t at=box->command_start;at<box->command_end && at<layout->count;at++) {
+            const DrawCommand *command=&layout->commands[at];
+            if(command->type != DRAW_TEXT || command->text_length == 0) continue;
+            const FontFace *face=font_context_face_variant(browser_engine_fonts(engine),NULL,
+                draw_command_font_family(command),draw_command_font_italic(command),
+                draw_command_font_weight_code(command)>=65u);
+            int current=command->y+font_ascent_at_size(face,draw_command_text_font_size_fixed(command));
+            if(baseline>=0 && abs(baseline-current)>1)return false;
+            baseline=current;count++;break;
+        }
+    }
+    return count == 4u;
+}
+
+static int test_youtube_personalized_home(void)
+{
+    static const char fixture[] = TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-youtube-personalized";
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 8;
+    config.resources.web_fonts_enabled = false;
+    CHECK(browser_config_set_font_paths(&config,
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf", NULL, NULL,
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Bold-Latin.ttf", NULL, NULL, NULL,
+        1536u * 1024u));
+    char error[256] = {0};
+    for (unsigned lane = 0; lane < 8; lane++) {
+        bool browsing = lane == 1 || lane == 6 || lane == 7;
+        bool refuse = lane == 2;
+        bool subscriptions = lane == 3 || lane == 5;
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL);
+        if (lane != 5) CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+            "https://m.youtube.com/", "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+        CHECK(browser_engine_set_youtube_topics(engine, false));
+        CHECK(browser_engine_load_url(engine, subscriptions
+            ? "https://www.youtube.com/feed/subscriptions" : "https://www.youtube.com/", true));
+        if (lane == 7) {
+            static const char early_card[] = "<a href='https://www.youtube.com/'>YouTube</a>"
+                "<a href='https://www.youtube.com/signin?next=%2F'>Account</a>"
+                "<a href='https://www.youtube.com/feed/subscriptions'>Subscriptions</a>"
+                "<input id=yt-search><div class=result-row><a id=first class=card href='https://www.youtube.com/watch?v=TFTEST00001'>First result</a></div>"
+                "<p id=yt-feed-status>Suggestions will load in the background.</p>"
+                "<a id=yt-feed-refresh href='#tilefinch-refresh'>Refresh suggestions</a>";
+            CHECK(browser_engine_commit_html(engine, "https://www.youtube.com/",
+                early_card, sizeof(early_card) - 1u, true));
+        }
+        CHECK(browser_engine_render_frame(engine, NULL));
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        lxb_dom_node_t *search = navigation->page.layout.controls[0].node;
+        CHECK(document_control_value_set(&navigation->page.document, search, "typed <&", 8));
+        size_t base_links = navigation->page.layout.link_count;
+        uint64_t generation = navigation->generation;
+        size_t history = navigation->history_count;
+        CHECK(base_links >= 4);
+        CHECK(strstr(navigation->page.layout.links[1].url, lane == 7 ? "/signin?" : "accounts.google.com/ServiceLogin?") != NULL);
+        CHECK(strstr(navigation->page.layout.links[2].url, "/feed/subscriptions") != NULL);
+        if (lane == 1) CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN));
+        if (lane == 6) {
+            bool activate = false, changed = false;
+            CHECK(browser_engine_pointer_event(engine, CONTROLLER_POINTER_MOVE,
+                100, 150, &activate, &changed));
+        }
+        if (lane == 7) CHECK(browser_engine_focus_node(engine,
+            test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html), "first")));
+        if (refuse) browser_engine_test_refuse_next_render_shell_init();
+        bool saw_loading = false;
+        for (unsigned turn = 0; turn < 256; turn++) {
+            bool visual = false;
+            (void) browser_engine_run_idle_work(engine, &visual);
+            BrowserYoutubeFeedState state = browser_engine_youtube_feed_state(engine);
+            saw_loading |= state == BROWSER_YOUTUBE_FEED_LOADING;
+            if (state == BROWSER_YOUTUBE_FEED_LOADING) {
+                CHECK(test_reader_text_command(&navigation->page.layout,
+                    "Reloading suggestions...") != NULL);
+                CHECK(youtube_notice_is_single_run(&navigation->page.layout,
+                    "yt-feed-status", "Reloading suggestions..."));
+                CHECK(browser_engine_render_frame(engine, NULL));
+                CHECK(controller_focus_node(browser_engine_controller(engine), search));
+                if (lane == 4) {
+                    CHECK(browser_engine_cancel_network_work(engine, "test search priority") == 1u);
+                    static const char next[] = "<p>Search navigation owns the page</p>";
+                    CHECK(browser_engine_commit_html(engine, "https://search.test/",
+                        next, sizeof(next) - 1u, true));
+                    break;
+                }
+            }
+            if (state == BROWSER_YOUTUBE_FEED_CURRENT || state == BROWSER_YOUTUBE_FEED_FAILED
+                || state == BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED
+                || (browsing && state == BROWSER_YOUTUBE_FEED_READY)) break;
+        }
+        if (lane == 4 || lane == 5) {
+            CHECK(browser_engine_youtube_feed_state(engine) == (lane == 4
+                ? BROWSER_YOUTUBE_FEED_FAILED : BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED));
+            CHECK(browser_engine_shutdown(engine));
+            browser_engine_destroy(engine);
+            fetch_trace_end();
+            continue;
+        }
+        CHECK(saw_loading);
+        CHECK(browser_engine_take_youtube_login_events(engine) == BROWSER_YOUTUBE_LOGIN_VERIFIED);
+        CHECK(browser_engine_take_youtube_login_events(engine) == 0u);
+        if (browsing) {
+            CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_READY);
+            CHECK(test_reader_text_command(&navigation->page.layout,
+                "New suggestions ready - select Refresh.") != NULL);
+            CHECK(navigation->page.layout.link_count == base_links);
+            lxb_dom_node_t *focused = controller_focused_node(browser_engine_controller(engine));
+            for (unsigned i = 0; i < 8; i++) {
+                bool visual = false;
+                (void) browser_engine_run_idle_work(engine, &visual);
+                CHECK(controller_focused_node(browser_engine_controller(engine)) == focused);
+                CHECK(navigation->page.layout.link_count == base_links);
+            }
+            CHECK(browser_engine_focus_node(engine, navigation->page.layout.links[base_links - 1].node));
+            ControllerAction action;
+            CHECK(browser_engine_activate(engine, &action));
+            CHECK(action.type == CONTROLLER_ACTION_CONTROL);
+            bool visual = false;
+            (void) browser_engine_run_idle_work(engine, &visual);
+        }
+        CHECK(browser_engine_youtube_feed_state(engine) == (refuse
+            ? BROWSER_YOUTUBE_FEED_FAILED : BROWSER_YOUTUBE_FEED_CURRENT));
+        CHECK(navigation->page.layout.link_count == (refuse ? base_links : 10u));
+        CHECK(youtube_notice_is_single_run(&navigation->page.layout, "yt-feed-status",
+            refuse ? "Suggestions unavailable - try Refresh." : "Suggestions up to date."));
+        size_t length = 0;
+        lxb_dom_node_t *retained_search = test_reader_find_id(
+            lxb_dom_interface_node(navigation->page.document.html), "yt-search");
+        const char *value = document_control_value(retained_search, &length);
+        if (value == NULL) value = document_attribute(retained_search, "value", &length);
+        CHECK(value != NULL && length == 8 && memcmp(value, "typed <&", 8) == 0);
+        CHECK(navigation->history_count == history && navigation->generation == generation);
+        if (lane == 0) {
+            CHECK(youtube_header_baselines_match(engine));
+            const LayoutDocument *layout = &navigation->page.layout;
+            lxb_dom_node_t *signout_header = test_reader_find_id(
+                lxb_dom_interface_node(navigation->page.document.html), "yt-signout-action");
+            lxb_dom_node_t *refresh = test_reader_find_id(
+                lxb_dom_interface_node(navigation->page.document.html), "yt-feed-refresh");
+            CHECK(layout->links[2].node == signout_header);
+            CHECK(strstr(layout->links[1].url, "/feed/subscriptions") != NULL);
+            CHECK(layout->links[layout->link_count - 1u].node == refresh);
+            const LayoutNodeBox *refresh_box = layout_box_for_node(layout, refresh);
+            const LayoutNodeBox *first_box = layout_box_for_node(layout, layout->links[3].node);
+            CHECK(refresh_box != NULL && first_box != NULL
+                && refresh_box->x > 300 && refresh_box->y < first_box->y);
+            CHECK(browser_engine_focus_node(engine, layout->links[2].node));
+            CHECK(browser_engine_focus_move(engine, true));
+            CHECK(controller_focused_node(browser_engine_controller(engine)) == layout->links[3].node);
+            CHECK(browser_engine_render_frame(engine, NULL));
+            CHECK(browser_engine_focus_node(engine, test_reader_find_id(
+                lxb_dom_interface_node(navigation->page.document.html), "yt-account-action")));
+            ControllerAction account_action;
+            CHECK(browser_engine_activate(engine, &account_action)
+                && account_action.type == CONTROLLER_ACTION_CONTROL);
+            CHECK(navigation->generation == generation);
+            const LayoutNodeBox *panel_box = layout_box_for_node(&navigation->page.layout,
+                test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html), "yt-account-panel"));
+            CHECK(panel_box != NULL && panel_box->height > 40
+                && panel_box->y >= 30 && panel_box->y <= 40
+                && panel_box->y + panel_box->height <= 272);
+            CHECK(browser_engine_render_frame(engine, NULL));
+            CHECK(browser_engine_focus_node(engine, test_reader_find_id(
+                lxb_dom_interface_node(navigation->page.document.html), "yt-account-action")));
+            CHECK(browser_engine_activate(engine, &account_action)
+                && account_action.type == CONTROLLER_ACTION_CONTROL);
+            panel_box = layout_box_for_node(&navigation->page.layout,
+                test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html), "yt-account-panel"));
+            CHECK(panel_box == NULL || panel_box->height == 0);
+            CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+                "https://www.youtube.com/", "local=fixture; Secure; HttpOnly; Path=/"));
+            CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+                "https://accounts.google.com/", "unrelated=fixture; Secure; HttpOnly; Path=/"));
+            CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+                "https://notyoutube.com/", "unrelated=fixture; Secure; HttpOnly; Path=/"));
+            lxb_dom_node_t *signout = test_reader_find_id(
+                lxb_dom_interface_node(navigation->page.document.html), "yt-signout-action");
+            CHECK(signout != NULL && browser_engine_focus_node(engine, signout));
+            ControllerAction action;
+            CHECK(browser_engine_activate(engine, &action)
+                && action.type == CONTROLLER_ACTION_NAVIGATE
+                && strcmp(action.url, "https://www.youtube.com/") == 0);
+            CHECK(!youtube_lite_session_signed_in(browser_engine_session(engine)));
+            CHECK(browser_engine_take_youtube_login_events(engine) == BROWSER_YOUTUBE_LOGIN_SIGNED_OUT);
+            BrowserSiteDataUsage usage;
+            CHECK(browser_session_site_data_usage(browser_engine_session(engine),
+                "https://www.youtube.com/", &usage) && usage.cookie_count == 0);
+            CHECK(browser_session_site_data_usage(browser_engine_session(engine),
+                "https://accounts.google.com/", &usage) && usage.cookie_count == 1);
+            CHECK(browser_session_site_data_usage(browser_engine_session(engine),
+                "https://notyoutube.com/", &usage) && usage.cookie_count == 1);
+            CHECK(browser_engine_load_url(engine, action.url, true));
+            CHECK(test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html),
+                "yt-signout-action") == NULL);
+        }
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+        fetch_trace_end();
+    }
+    return 0;
+}
+
+static int test_youtube_resume_metadata(void)
+{
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=125") == UINT64_C(125000000));
+    CHECK(youtube_watch_url_start_time_us("https://youtu.be/TFTEST00001?start=9") == UINT64_C(9000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=-1") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=604801") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://evil.test/watch?v=TFTEST00001&t=125") == 0);
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    char source[2048], error[256];
+    for (unsigned lane = 0; lane < 9u; lane++) {
+        const char *endpoint = lane == 1 ? "" : lane == 2
+            ? ",\"navigationEndpoint\":{\"watchEndpoint\":{\"videoId\":\"TFTEST00002\",\"startTimeSeconds\":125}}"
+            : lane == 3
+            ? ",\"navigationEndpoint\":{\"watchEndpoint\":{\"videoId\":\"TFTEST00001\",\"startTimeSeconds\":\"125\\uFFFF\"}}"
+            : ",\"navigationEndpoint\":{\"watchEndpoint\":{\"videoId\":\"TFTEST00001\",\"startTimeSeconds\":125}}";
+        int size = snprintf(source, sizeof(source),
+            "<script>var ytInitialData='{\"contents\":[{\"videoRenderer\":{"
+            "\"videoId\":\"TFTEST00001\",\"title\":{\"simpleText\":\"Resume fixture\"},"
+            "\"thumbnailOverlays\":[{\"thumbnailOverlayResumePlaybackProgressRenderer\":{"
+            "\"percentDurationWatched\":%u}}]%s}}]}';</script>",
+            lane == 4 ? 101u : 37u, endpoint);
+        if (lane >= 5) size = snprintf(source, sizeof(source),
+            "<script>var ytInitialData='{\"contents\":[{\"videoWithContextRenderer\":{"
+            "\"videoId\":\"TFTEST00001\",\"headline\":{\"simpleText\":\"Direct progress\"},"
+            "\"percentDurationWatched\":%u}}]}';</script>", lane == 5 ? 37u : 101u);
+        if (lane >= 7) size = snprintf(source, sizeof(source),
+            "<script>var ytInitialData='{\"contents\":[{\"videoWithContextRenderer\":{"
+            "\"videoId\":\"TFTEST00001\",\"headline\":{\"simpleText\":\"Overlay progress\"},"
+            "\"%s\":[{\"progressRenderer\":{\"percentDurationWatched\":37}}]}}]}';</script>",
+            lane == 7 ? "thumbnailOverlays" : "unrelated");
+        CHECK(size > 0 && (size_t) size < sizeof(source));
+        YoutubeLiteDocument document = {0};
+        CHECK(youtube_lite_build_document(&budget,
+            "https://www.youtube.com/results?search_query=fixture", source,
+            (size_t) size, &document, error, sizeof(error)));
+        CHECK(document.result_count == 1u);
+        CHECK((strstr(document.html, "aria-label=\"37 percent watched\"") != NULL) == (lane != 4 && lane != 6 && lane != 8));
+        CHECK((strstr(document.html, "&amp;t=125") != NULL) == (lane == 0 || lane == 4));
+        if (lane == 0) {
+            BrowserDeviceProfile device;
+            browser_device_profile_psp3000(&device);
+            BrowserConfig config;
+            browser_config_init(&config, &device);
+            config.memory_limit = 16u * MIB;
+            config.resources.maximum_images = 0;
+            config.resources.web_fonts_enabled = false;
+            BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+            CHECK(engine != NULL && browser_engine_commit_html(engine,
+                "https://www.youtube.com/results?search_query=fixture",
+                document.html, document.html_length, true));
+            CHECK(browser_engine_render_frame(engine, NULL));
+            LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
+            const LayoutNodeBox *track = NULL, *fill = NULL;
+            for (size_t i = 0; i < layout->node_box_count; i++) {
+                size_t length = 0;
+                const char *name = document_attribute(layout->node_boxes[i].node, "class", &length);
+                if (name != NULL && length == 14u && memcmp(name, "watch-progress", length) == 0)
+                    track = &layout->node_boxes[i];
+                if (name != NULL && length == 19u && memcmp(name, "watch-progress-fill", length) == 0)
+                    fill = &layout->node_boxes[i];
+            }
+            CHECK(track != NULL && fill != NULL && track->width > 0
+                && track->height == 3 && fill->height == 3
+                && fill->x == track->x && fill->y == track->y
+                && abs(fill->width * 100 - track->width * 37) <= 100);
+            CHECK(browser_engine_shutdown(engine));
+            browser_engine_destroy(engine);
+        }
+        youtube_lite_document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+    static const char watch[] = "<script>var ytInitialData='{}';</script>"
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"title\":\"Resume fixture\",\"shortDescription\":\"Description\",\"lengthSeconds\":\"200\"}};</script>";
+    YoutubeLiteDocument document = {0};
+    CHECK(youtube_lite_build_document(&budget,
+        "https://www.youtube.com/watch?v=TFTEST00001&t=125&tilefinch_view=details",
+        watch, sizeof(watch) - 1u, &document, error, sizeof(error)));
+    CHECK(strstr(document.html, "watch?v=TFTEST00001&amp;t=125\"") != NULL);
+    CHECK(strstr(document.html, "watch?v=TFTEST00001&amp;t=125&amp;tilefinch_view=comments") != NULL);
+    youtube_lite_document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_youtube_recent_history(void)
+{
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
+    static const char recommendations[] = "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":false}},"
+        "\"contents\":[{\"videoRenderer\":{\"videoId\":\"TFTEST00001\",\"title\":{\"simpleText\":\"Suggestion\"},"
+        "\"navigationEndpoint\":{\"watchEndpoint\":{\"videoId\":\"TFTEST00001\",\"startTimeSeconds\":40}}}}]}";
+    for (unsigned lane = 0; lane < 10u; lane++) {
+        char history[4096];
+        int written = snprintf(history, sizeof(history),
+            "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":%s}},"
+            "\"unrelated\":{\"videoRenderer\":{\"videoId\":\"TFTEST00003\",\"title\":{\"simpleText\":\"Not history\"}}},"
+            "\"contents\":[{\"videoRenderer\":{\"videoId\":\"%s\",\"title\":{\"simpleText\":\"Recent video\"},"
+            "\"navigationEndpoint\":{\"watchEndpoint\":{\"videoId\":\"%s\",\"startTimeSeconds\":%s}},"
+            "\"thumbnailOverlays\":[{\"thumbnailOverlayResumePlaybackProgressRenderer\":{\"percentDurationWatched\":%u}}]}},"
+            "{\"videoRenderer\":{\"videoId\":\"TFTEST00004\",\"title\":{\"simpleText\":\"Older video\"}}}]}",
+            lane == 6 ? "true" : "false", lane == 1 || lane == 9 ? "TFTEST00001" : "TFTEST00002",
+            lane == 1 || lane == 9 ? "TFTEST00001" : "TFTEST00002",
+            lane == 9 ? "0" : lane == 4 || lane == 7 ? "\"invalid\"" : "75",
+            lane == 9 ? 0u : lane == 4 ? 101u : 30u);
+        CHECK(written > 0 && (size_t) written < sizeof(history));
+        const char *body = lane == 2 ? "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":false}},\"contents\":[]}"
+            : lane == 3 ? "{\"error\":{\"code\":403}}"
+            : lane == 8 ? "{\"contents\":[" : history;
+        GoogleIdentityRecord records[] = {
+            {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+            {.url="https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false",
+             .status=200, .content_type="application/json", .body=recommendations, .method="POST"},
+            {.url="https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false",
+             .status=lane == 5 ? 503 : 200, .content_type="application/json", .body=body, .method="POST"}
+        };
+        char fixture[128], error[256] = {0};
+        CHECK(write_google_identity_replay(fixture, records, 3u));
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        Budget budget;
+        budget_init(&budget, 4u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 1024));
+        CHECK(browser_session_cookie_set_http(&session, "https://m.youtube.com/",
+            "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+        YoutubeLiteFeedJob *job = youtube_lite_feed_begin(&budget, &session, false, false, 1000);
+        CHECK(job != NULL);
+        FetchPumpQuota quota = {.maximum_body_callbacks=1, .maximum_body_bytes=4096, .maximum_time_us=1000};
+        YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+        for (unsigned turn = 0; turn < 256u && status == YOUTUBE_LITE_LOAD_PENDING; turn++)
+            status = youtube_lite_feed_pump(job, &quota);
+        CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED);
+        unsigned history_metadata = youtube_lite_feed_history_metadata(job) & 65535u;
+        if (lane == 0 || lane == 1 || lane == 9) CHECK(history_metadata == 49167u);
+        else if (lane == 4) CHECK(history_metadata == 15u);
+        else if (lane == 7) CHECK(history_metadata == 32783u);
+        else CHECK(history_metadata == 0u);
+        YoutubeLiteDocument document = {0};
+        CHECK(youtube_lite_feed_take_document(job, &document));
+        CHECK(strstr(document.html, "Suggestion") != NULL
+            && strstr(document.html, "Not history") == NULL
+            && strstr(document.html, "Older video") == NULL);
+        bool extra = lane == 0 || lane == 4 || lane == 7;
+        CHECK(document.result_count == (extra ? 2u : 1u));
+        CHECK((strstr(document.html, "id=yt-recent-video") != NULL) == extra);
+        if (lane == 0) {
+            CHECK(strstr(document.html, "Continue from 1:15") != NULL);
+            CHECK(strstr(document.html, "watch?v=TFTEST00002&amp;t=75") != NULL);
+            CHECK(strstr(document.html, "30 percent watched") != NULL);
+        } else if (lane == 7) {
+            CHECK(strstr(document.html, "30% watched") != NULL
+                && strstr(document.html, "watch?v=TFTEST00002&amp;t=") == NULL);
+        } else if (lane == 1) {
+            CHECK(strstr(document.html, "watch?v=TFTEST00001&amp;t=75") != NULL);
+            CHECK(strstr(document.html, "30 percent watched") != NULL);
+        } else if (lane == 4) {
+            CHECK(strstr(document.html, "Playback position unavailable.") == NULL
+                && strstr(document.html, "Continue from") == NULL
+                && strstr(document.html, "class=hint>") == NULL);
+            CHECK(strstr(document.html, "watch?v=TFTEST00002&amp;t=") == NULL);
+        } else if (lane == 9) {
+            CHECK(strstr(document.html, "watch?v=TFTEST00001&amp;t=") == NULL);
+            CHECK(strstr(document.html, "0 percent watched") != NULL);
+        }
+        youtube_lite_document_destroy(&document);
+        youtube_lite_feed_destroy(job);
+        browser_session_destroy(&session);
+        CHECK(budget.current == 0 && budget.external_reserved == 0);
+        fetch_trace_end();
+        remove_google_identity_replay(fixture, 3u);
+    }
+    return 0;
+}
+
+static int test_youtube_rating_status_confirmation(void)
+{
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
+#define TEST_RATING_ENTITY(KEY, STATUS) \
+    "{\"frameworkUpdates\":{\"entityBatchUpdate\":{\"mutations\":[{\"entityKey\":\"" KEY \
+    "\",\"type\":\"ENTITY_MUTATION_TYPE_REPLACE\",\"payload\":{\"likeStatusEntity\":{\"key\":\"" KEY \
+    "\",\"likeStatus\":\"" STATUS "\"}}}]}}}"
+    static const struct { const char *body; bool liked, confirmed; } cases[] = {
+        {"{\"responseContext\":{},\"likeStatus\":\"LIKE\"}", true, true},
+        {"{\"responseContext\":{},\"likeStatus\":\"INDIFFERENT\"}", false, true},
+        {"{\"likeStatus\":\"INDIFFERENT\"}", true, false},
+        {"{\"likeStatus\":\"LIKE\"}", false, false},
+        {"{\"likeStatus\":\"DISLIKE\"}", false, false},
+        {"{\"likeStatus\":\"UNKNOWN\"}", true, false},
+        {"{\"likeStatus\":true}", true, false},
+        {"{\"renderer\":{\"likeStatus\":\"LIKE\"}}", true, false},
+        {"{\"likeStatus\":\"LIKE\",\"error\":{\"code\":403}}", true, false},
+        {"{\"likeStatus\":\"INDIFFERENT\",\"actions\":[{\"updateToggleButtonStateCommand\":{"
+            "\"buttonId\":\"like-button\",\"toggled\":true}}]}", true, false},
+        {"{\"likeStatus\":\"LIKE\",\"actions\":[{\"updateToggleButtonStateCommand\":{"
+            "\"buttonId\":\"like-button\",\"toggled\":false}}]}", true, false},
+        {"{\"likeStatus\":\"LIKE\",\"actions\":[{\"updateToggleButtonStateCommand\":{"
+            "\"buttonId\":\"like-button\",\"toggled\":true}}]}", true, true},
+        {"{\"likeStatus\":\"INDIFFERENT\",\"actions\":[]}", false, true},
+        {"{}", false, false},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAE%3D", "LIKE"), true, true},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA+KAE=", "INDIFFERENT"), false, true},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAE", "LIKE"), true, true},
+        {TEST_RATING_ENTITY("EgtPVEhFUjAwMDAwMSA-KAE=", "LIKE"), true, false},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAE=", "INDIFFERENT"), true, false},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAE=", "DISLIKE"), false, false},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAE%3Z", "LIKE"), true, false},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAF=", "LIKE"), true, false},
+        {TEST_RATING_ENTITY("EgtURlRFU1QwMDAwMSA-KAE==", "LIKE"), true, false},
+        {TEST_RATING_ENTITY("short", "LIKE"), true, false},
+        {"{\"frameworkUpdates\":{\"entityBatchUpdate\":{\"mutations\":[{"
+            "\"entityKey\":\"EgtPVEhFUjAwMDAwMSA-KAE=\",\"payload\":{\"likeStatusEntity\":{"
+            "\"key\":\"EgtURlRFU1QwMDAwMSA-KAE=\",\"likeStatus\":\"LIKE\"}}}]}}}", true, false},
+        {"{\"frameworkUpdates\":{\"entityBatchUpdate\":{\"mutations\":[{"
+            "\"type\":\"ENTITY_MUTATION_TYPE_DELETE\",\"payload\":{\"likeStatusEntity\":{"
+            "\"key\":\"EgtURlRFU1QwMDAwMSA-KAE=\",\"likeStatus\":\"LIKE\"}}}]}}}", true, false},
+        {"{\"likeStatus\":\"LIKE\",\"frameworkUpdates\":{\"entityBatchUpdate\":{\"mutations\":[{"
+            "\"payload\":{\"likeStatusEntity\":{\"key\":\"EgtURlRFU1QwMDAwMSA-KAE=\","
+            "\"likeStatus\":\"INDIFFERENT\"}}}]}}}", true, false}
+    };
+#undef TEST_RATING_ENTITY
+    for (size_t lane = 0; lane < sizeof(cases) / sizeof(cases[0]); lane++) {
+        GoogleIdentityRecord records[] = {
+            {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+            {.url=cases[lane].liked
+                ? "https://m.youtube.com/youtubei/v1/like/like?key=fixture-key&prettyPrint=false"
+                : "https://m.youtube.com/youtubei/v1/like/removelike?key=fixture-key&prettyPrint=false",
+             .status=200, .content_type="application/json", .body=cases[lane].body, .method="POST"}
+        };
+        char fixture[128], error[256] = {0};
+        CHECK(write_google_identity_replay(fixture, records, 2u)
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        Budget budget;
+        budget_init(&budget, 4u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 512u * 1024u)
+            && browser_session_cookie_set_http(&session, "https://m.youtube.com/",
+                "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+        YoutubeLiteFeedJob *job = youtube_lite_rating_begin(&budget, &session,
+            "TFTEST00001", cases[lane].liked, 1000);
+        CHECK(job != NULL);
+        FetchPumpQuota quota = {.maximum_body_bytes=4096,
+            .maximum_body_callbacks=4, .maximum_time_us=1000};
+        YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+        for (unsigned turn = 0; turn < 256u && status == YOUTUBE_LITE_LOAD_PENDING; turn++)
+            status = youtube_lite_feed_pump(job, &quota);
+        CHECK(status == (cases[lane].confirmed
+            ? YOUTUBE_LITE_LOAD_SUCCEEDED : YOUTUBE_LITE_LOAD_FAILED));
+        youtube_lite_feed_destroy(job);
+        browser_session_destroy(&session);
+        fetch_trace_end();
+        remove_google_identity_replay(fixture, 2u);
+        CHECK(budget.current == 0 && budget.external_reserved == 0);
+    }
+    return 0;
+}
+
+static int test_youtube_like_action(void)
+{
+    static const char watch_url[] = "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details";
+    static const char watch[] = "<script>var ytInitialData='{}';</script>"
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"title\":\"Like fixture\",\"lengthSeconds\":\"200\"}};</script>";
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
+    static const char *const responses[] = {
+        "{\"actions\":[{\"updateToggleButtonStateCommand\":{\"buttonId\":\"like-button\",\"toggled\":true}}]}",
+        "{\"actions\":[{\"updateToggleButtonStateCommand\":{\"buttonId\":\"like-button\",\"toggled\":false}}]}",
+        "{\"error\":{\"code\":403}}", "{}"
+    };
+    for (unsigned lane = 0; lane < 9u; lane++) {
+        GoogleIdentityRecord records[] = {
+            {.url="https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1", .status=200, .content_type="text/html", .body=watch},
+            {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+            {.url="https://m.youtube.com/youtubei/v1/like/like?key=fixture-key&prettyPrint=false",
+             .status=200, .content_type="application/json", .body=responses[lane < 4 ? lane : 0], .method="POST"},
+            {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+            {.url="https://m.youtube.com/youtubei/v1/like/removelike?key=fixture-key&prettyPrint=false",
+             .status=200, .content_type="application/json", .body=responses[lane == 8 ? 0 : 1], .method="POST"}
+        };
+        char fixture[128], error[256] = {0};
+        CHECK(write_google_identity_replay(fixture, records, 5u));
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        BrowserDeviceProfile device;
+        browser_device_profile_psp3000(&device);
+        BrowserConfig config;
+        browser_config_init(&config, &device);
+        config.memory_limit = 16u * MIB;
+        config.resources.web_fonts_enabled = false;
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL);
+        if (lane != 5) CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+            "https://m.youtube.com/", "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+        if (lane == 6) {
+            static const char forged[] = "<a id=yt-like-action href='#tilefinch-like'>Like</a>"
+                "<a id=yt-signout-action href='#tilefinch-signout'>Sign out</a>";
+            CHECK(browser_engine_commit_html(engine, watch_url, forged, sizeof(forged)-1u, true));
+        } else CHECK(browser_engine_load_url(engine, watch_url, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        CHECK(browser_engine_render_frame(engine, NULL));
+        lxb_dom_node_t *like = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-like-action");
+        CHECK(like != NULL && browser_engine_focus_node(engine, like));
+        uint64_t generation = nav->generation;
+        for (unsigned i = 0; i < 4u; i++) { bool changed = false; (void) browser_engine_run_idle_work(engine, &changed); }
+        CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_IDLE);
+        CHECK(browser_engine_focus_node(engine, like));
+        ControllerAction action;
+        CHECK(browser_engine_activate(engine, &action));
+        if (lane == 6) {
+            CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_IDLE);
+            lxb_dom_node_t *signout = test_reader_find_id(
+                lxb_dom_interface_node(nav->page.document.html), "yt-signout-action");
+            CHECK(signout != NULL && browser_engine_focus_node(engine, signout)
+                && browser_engine_activate(engine, &action));
+            CHECK(youtube_lite_session_signed_in(browser_engine_session(engine)));
+        }
+        else {
+            if (action.type != CONTROLLER_ACTION_CONTROL)
+                fprintf(stderr, "like fixture lane=%u action=%d url=%s state=%d\n", lane,
+                    action.type, action.url, browser_engine_youtube_like_state(engine));
+            CHECK(action.type == CONTROLLER_ACTION_CONTROL);
+            if (lane == 4) CHECK(browser_engine_cancel_network_work(engine, "test cancellation") == 1u);
+            for (unsigned i = 0; i < 256u && browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING; i++) {
+                bool changed = false; (void) browser_engine_run_idle_work(engine, &changed);
+            }
+            BrowserYoutubeFeedState expected = lane == 0 || lane >= 7 ? BROWSER_YOUTUBE_FEED_CURRENT
+                : lane == 5 ? BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED : BROWSER_YOUTUBE_FEED_FAILED;
+            if (browser_engine_youtube_like_state(engine) != expected)
+                fprintf(stderr, "like fixture lane=%u state=%d expected=%d error=%s\n", lane,
+                    browser_engine_youtube_like_state(engine), expected, nav->last_error);
+            CHECK(browser_engine_youtube_like_state(engine) == expected);
+            {bool changed=false;(void)browser_engine_run_idle_work(engine,&changed);}
+            YoutubeLiteRatingDiagnostics rating = {0};
+            CHECK(browser_engine_youtube_rating_diagnostics(engine, &rating));
+            if (lane < 4u || lane >= 7u) {
+                CHECK(rating.bootstrap_status == 200 && rating.api_status == 200
+                    && rating.api_bytes == strlen(responses[lane < 4u ? lane : 0u])
+                    && rating.phase == 4u);
+                CHECK(((rating.response_flags & 1u) != 0u) == (lane != 2u));
+                CHECK(((rating.response_flags & 8u) != 0u) == (lane == 2u));
+            }
+            CHECK(youtube_notice_is_single_run(&nav->page.layout, "yt-like-status",
+                expected == BROWSER_YOUTUBE_FEED_CURRENT ? "Video liked."
+                : expected == BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED ? "Sign in to like this video."
+                : "Like failed - select Like to retry."));
+            CHECK(nav->generation == generation);
+            if (lane == 0 || lane >= 7) {
+                CHECK(browser_engine_youtube_like_selected(engine));
+                CHECK(browser_engine_focus_node(engine, like) && browser_engine_activate(engine, &action));
+                CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
+                lxb_dom_node_t *unlike = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-unlike-action");
+                CHECK(unlike != NULL && browser_engine_focus_node(engine, unlike));
+                CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_CONTROL);
+                CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING);
+                CHECK(!browser_engine_youtube_like_selected(engine));
+                if (lane == 7) CHECK(browser_engine_cancel_network_work(engine, "unlike cancellation") == 1u);
+                for (unsigned i = 0; i < 256u && browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING; i++) {
+                    bool changed = false; (void) browser_engine_run_idle_work(engine, &changed);
+                }
+                CHECK(browser_engine_youtube_like_state(engine) == (lane == 0
+                    ? BROWSER_YOUTUBE_FEED_CURRENT : BROWSER_YOUTUBE_FEED_FAILED));
+                CHECK(nav->generation == generation);
+            }
+        }
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+        fetch_trace_end();
+        remove_google_identity_replay(fixture, 5u);
+    }
+    return 0;
+}
+
 static int test_youtube_missing_initial_data_terminates(void)
 {
     static const char url[] =

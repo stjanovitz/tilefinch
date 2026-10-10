@@ -15,6 +15,21 @@ bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge)
     return flushed;
 }
 
+bool js_rt_notify_style_flushed(JSContext *context)
+{
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL
+        || !JS_IsFunction(context, runtime->motion_style_flushed)) return true;
+    /* Captured during trusted lazy initialization, not looked up through
+       mutable page globals. The watcher samples cascade only, never layout. */
+    JSValue result = JS_Call(context, runtime->motion_style_flushed,
+                             JS_UNDEFINED, 0, NULL);
+    bool ok = !JS_IsException(result);
+    JS_FreeValue(context, result);
+    return ok;
+}
+
 static FetchScheduler *bridge_fetch_scheduler_create(
     DomBridge *bridge, size_t maximum_reserved_bytes)
 {

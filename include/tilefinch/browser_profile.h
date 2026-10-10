@@ -270,6 +270,9 @@ bool browser_profile_save_diagnostic_reports(
     const BrowserProfile *profile);
 bool browser_profile_wifi_diagnostics(const BrowserProfile *profile);
 bool browser_profile_youtube_topics(const BrowserProfile *profile);
+/* 0 Ask (default), 1 Always save, 2 Never save. Native consent policy. */
+unsigned browser_profile_youtube_login_policy(const BrowserProfile *profile);
+void browser_profile_set_youtube_login_policy(BrowserProfile *profile, unsigned policy);
 /* Settings > Device & storage > Site data & storage > Keep compiled
    scripts: the persistent compiled-script tier. Off by default. */
 bool browser_profile_keep_compiled_scripts(const BrowserProfile *profile);

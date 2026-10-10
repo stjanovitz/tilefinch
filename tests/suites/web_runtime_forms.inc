@@ -1,3 +1,54 @@
+    puts("test: Element prototype attribute methods");
+    static const char attribute_prototype_page[] =
+        "<!doctype html><body><div id=attribute-host></div><script>"
+        "const methods=['getAttribute','getAttributeNS','getAttributeNames',"
+        "'getAttributeNode','getAttributeNodeNS','setAttribute','setAttributeNS',"
+        "'setAttributeNode','setAttributeNodeNS','removeAttribute',"
+        "'removeAttributeNS','removeAttributeNode','hasAttribute',"
+        "'hasAttributeNS','toggleAttribute'];"
+        "let ok=methods.every(name=>typeof Element.prototype[name]==='function');"
+        "if(ok){const host=document.getElementById('attribute-host'),"
+        "detached=document.createElement('span'),"
+        "secondary=document.implementation.createHTMLDocument('Other'),"
+        "foreign=secondary.createElementNS('http://www.w3.org/2000/svg','g');"
+        "for(const node of [host,detached,foreign]){"
+        "node.setAttribute=()=>{throw Error('override must not run')};"
+        "node.removeAttribute=()=>{throw Error('override must not run')};"
+        "Element.prototype.setAttribute.apply(node,['data-probe','one']);"
+        "ok=ok&&Element.prototype.getAttribute.call(node,'data-probe')==='one'"
+        "&&Element.prototype.hasAttribute.call(node,'data-probe')"
+        "&&Element.prototype.getAttributeNames.call(node).includes('data-probe');"
+        "Element.prototype.removeAttribute.apply(node,['data-probe']);"
+        "ok=ok&&Element.prototype.getAttribute.call(node,'data-probe')===null;"
+        "delete node.setAttribute;delete node.removeAttribute;"
+        "Element.prototype.setAttributeNS.call(node,'urn:probe','p:key','value');"
+        "ok=ok&&Element.prototype.getAttributeNS.call(node,'urn:probe','key')==='value'"
+        "&&Element.prototype.hasAttributeNS.call(node,'urn:probe','key');"
+        "Element.prototype.removeAttributeNS.call(node,'urn:probe','key');"
+        "ok=ok&&!Element.prototype.hasAttributeNS.call(node,'urn:probe','key');}"
+        "class AttributeProbe extends HTMLElement{setAttribute(name,value){"
+        "super.setAttribute(name,value+'!')}}"
+        "customElements.define('attribute-probe',AttributeProbe);"
+        "const custom=document.createElement('attribute-probe');"
+        "custom.setAttribute('data-probe','custom');"
+        "ok=ok&&custom.getAttribute('data-probe')==='custom!';}"
+        "globalThis.pocSummary=ok?'attribute-prototype:ok':'attribute-prototype:fail';"
+        "</script></body>";
+    static NavigationSession attribute_prototype_navigation;
+    CHECK(navigation_init(&attribute_prototype_navigation, &budget, 2));
+    navigation_enable_scripts(&attribute_prototype_navigation, 3 * MIB, 1000);
+    uint64_t attribute_prototype_generation =
+        navigation_begin(&attribute_prototype_navigation);
+    bool attribute_prototype_committed = navigation_commit_html(
+              &attribute_prototype_navigation, attribute_prototype_generation,
+              "https://prototype.test/", attribute_prototype_page,
+              strlen(attribute_prototype_page), 480, NULL, NULL, true);
+    CHECK(attribute_prototype_committed
+          && strcmp(attribute_prototype_navigation.page.script_result.summary,
+                    "attribute-prototype:ok") == 0);
+    navigation_destroy(&attribute_prototype_navigation);
+    CHECK(budget.current == 0);
+
     puts("test: inherited fieldset disabled state");
     static const char disabled_page[] =
         "<!doctype html><style>input:disabled{width:61px}input:enabled{height:31px}"

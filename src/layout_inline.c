@@ -1304,6 +1304,31 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
                 return false;
             }
         }
+        const StyleGradient *background_gradient =
+            stylesheet_background_gradient(context->sheet, &style);
+        if (style.background_image_kind == STYLE_BACKGROUND_IMAGE_GRADIENT
+            && background_gradient != NULL) {
+            size_t gradient_slot = 0;
+            if (layout_intern_gradient(context->layout, background_gradient,
+                                       &gradient_slot)) {
+                DrawCommand gradient = {
+                    .type = DRAW_FILL_RECT,
+                    .x = pseudo_x, .y = pseudo_y,
+                    .width = pseudo_width, .height = pseudo_height,
+                    .scale = 1, .radius = border_radius_code,
+                    .opacity_scale = alpha_opacity_scale(255)
+                };
+                draw_command_set_fill_gradient(&gradient, gradient_slot);
+                if (next_insertion <= context->layout->count) {
+                    if (!layout_insert_command(context, next_insertion,
+                                               gradient)) return false;
+                    next_insertion++;
+                } else if (layout_add_command(context->layout, gradient)
+                           == NULL) {
+                    return false;
+                }
+            }
+        }
         if (image_resource_available(pseudo_background)) {
             DrawCommand image = {
                 .type = DRAW_IMAGE, .x = pseudo_x, .y = pseudo_y,
@@ -1809,11 +1834,14 @@ static void align_line_text_baselines(LineState *line)
         }
     }
     int target = 0;
+    int line_descent = 0;
     for (size_t i = line->command_start; i < line->layout->count; i++) {
         DrawCommand *command = &line->layout->commands[i];
         if (draw_command_text_baseline_aligned(command)) continue;
         int baseline = line_text_baseline(line->layout, command);
         if (baseline > target) target = baseline;
+        if (baseline >= 0 && command->height - baseline > line_descent)
+            line_descent = command->height - baseline;
         command->z_index = baseline < INT_MAX ? baseline + 1 : INT_MAX;
     }
     int line_baseline = target;
@@ -1830,12 +1858,29 @@ static void align_line_text_baselines(LineState *line)
         if (strut && line->strut_baseline > line_baseline) {
             line_baseline = line->strut_baseline;
         }
+        int bottom_aligned_height = 0;
+        if (strut) {
+            int descent = layout_fixed_ceil(line->strut_fixed)
+                - line->strut_baseline;
+            if (descent > line_descent) line_descent = descent;
+        }
         for (size_t i = atomic_first; i < atomic_last; i++) {
             const LineAtomic *atomic = &stack->entries[i];
+            if (atomic->mode == LINE_ATOMIC_BOTTOM
+                && atomic->height > bottom_aligned_height)
+                bottom_aligned_height = atomic->height;
             if (atomic->mode != LINE_ATOMIC_BASELINE) continue;
             int anchor = atomic->top - line->y + atomic->baseline;
             if (anchor > line_baseline) line_baseline = anchor;
+            int descent = atomic->height - atomic->baseline;
+            if (descent > line_descent) line_descent = descent;
         }
+        /* A taller bottom-aligned box can grow the line above its
+           baseline. Retain the baseline-aligned content's descent rather
+           than placing all of that extra height below an adjacent image. */
+        int required_baseline = bottom_aligned_height - line_descent;
+        if (required_baseline > line_baseline)
+            line_baseline = required_baseline;
     }
     for (size_t i = line->link_start;
          i < line->layout->link_count; i++) {
@@ -3031,6 +3076,40 @@ static int measured_line_text_width_fixed(
         transform, kerning);
 }
 
+/* Keep the bounded balancing scratch off the ordinary text-flow stack. */
+__attribute__((noinline))
+static int measured_balanced_text_width_fixed(
+    LineState *line, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    TextTransformMode transform, bool kerning, uint8_t white_space)
+{
+    char collapsed[512];
+    if (length <= sizeof(collapsed)
+        && (white_space == WHITE_SPACE_NORMAL
+            || white_space == WHITE_SPACE_NOWRAP)) {
+        /* A shrink-to-fit label fits at max-content width, but measuring
+           source indentation would manufacture extra balanced lines. */
+        size_t used = 0;
+        bool pending_space = false;
+        for (size_t i = 0; i < length; i++) {
+            if (isspace((unsigned char) text[i])) {
+                pending_space = used != 0;
+                continue;
+            }
+            if (pending_space) collapsed[used++] = ' ';
+            collapsed[used++] = text[i];
+            pending_space = false;
+        }
+        text = collapsed;
+        length = used;
+    }
+    return measured_line_text_width_fixed(
+        line, face, metric_family, text, length, font_size_fixed,
+        synthetic_bold, metric_bold, scale, letter_spacing, transform,
+        kerning);
+}
+
 static size_t fitting_line_text_prefix(
     LineState *line, const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
@@ -3208,10 +3287,11 @@ bool flow_text(LayoutContext *context, LineState *line,
         && line_cursor_fixed(line)
                == layout_fixed_from_integer(line->start_x)
         && available_pixels > 0 && length <= 512u) {
-        int total_fixed = measured_line_text_width_fixed(
+        int total_fixed = measured_balanced_text_width_fixed(
             line, face, metric_family, text, length, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing,
-            style->text_transform, !computed_style_kerning_none(style));
+            style->text_transform, !computed_style_kerning_none(style),
+            style->white_space_mode);
         int available_fixed = layout_fixed_from_integer(available_pixels);
         int lines = total_fixed <= 0 ? 1
             : (total_fixed + available_fixed - 1) / available_fixed;
@@ -4136,7 +4216,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "canvas")
         || layout_node_name_is(node, "iframe");
-    if (is_atomic_inline(style.display) && !input_control
+    /* Button contents form an atomic control face even when an author
+       requests inline display; its vertical padding still belongs to the
+       face, rather than ordinary non-replaced inline line-height. */
+    if ((is_atomic_inline(style.display)
+         || (button_control && style.display == DISPLAY_INLINE)) && !input_control
         && !textarea_control && !editable_control && !replaced_element) {
         int atomic_span_height = style_pixel_height(
             context->sheet, &style,

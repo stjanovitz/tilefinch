@@ -3,6 +3,77 @@
    written here: vertical stripes (32 of 256 units each, so their edges fall
    on whole pixels at 20 and 40 px) and a two-colour sprite sheet. */
 
+static bool test_nested_svg_viewports_preserve_atlas_geometry(void)
+{
+    static const char markup[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80' "
+        "viewBox='0 0 80 80'>"
+        "<svg x='10' y='5' width='20' height='20' viewBox='-10 -10 20 20'>"
+        "<rect x='-10' y='-10' width='20' height='20' fill='#ff0000'/></svg>"
+        "<svg x='50%' y='40' width='30' height='20' viewBox='0 0 10 10' "
+        "preserveAspectRatio='none'><rect width='10' height='10' fill='#0000ff'/></svg>"
+        "<svg x='10' y='60' width='30' height='10' viewBox='0 0 10 10'>"
+        "<rect width='10' height='10' fill='#00ff00'/></svg>"
+        "<g transform='translate(2 2)'><svg x='40' y='60' width='20' height='10' "
+        "viewBox='0 0 20 10'><svg x='4' y='2' width='6' height='6' "
+        "viewBox='0 0 6 6'><rect width='6' height='6' fill='#00ffff'/>"
+        "</svg></svg></g>"
+        "<rect x='70' y='70' width='5' height='5' fill='#ff00ff'/>"
+        "</svg>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    int width = 0, height = 0;
+    unsigned char *pixels = image_svg_decode(
+        markup, sizeof(markup) - 1, &budget, MIB, &width, &height);
+    bool okay = pixels != NULL && width == 80 && height == 80;
+    static const int samples[][5] = {
+        {15, 10, 255, 0, 0}, {45, 45, 0, 0, 255},
+        {25, 65, 0, 255, 0}, {72, 72, 255, 0, 255}, {48, 66, 0, 255, 255}
+    };
+    for (size_t i = 0; okay && i < sizeof(samples) / sizeof(samples[0]); i++) {
+        const unsigned char *p = pixels
+            + ((size_t) samples[i][1] * (size_t) width
+               + (size_t) samples[i][0]) * 4u;
+        okay = p[0] == samples[i][2] && p[1] == samples[i][3]
+              && p[2] == samples[i][4] && p[3] == 255;
+    }
+    okay = okay && pixels[((size_t) 65 * 80u + 12u) * 4u + 3u] == 0;
+    budget_free(&budget, pixels);
+    if (!okay) fprintf(stderr, "nested SVG geometry mismatch %dx%d\n", width, height);
+    /* Refuse source, viewport-context, parser, and early shape scratch
+       allocations independently; every failed decode unwinds its owner. */
+    for (size_t failure = 0; okay && failure < 24; failure++) {
+        budget_inject_failure_after(&budget, failure);
+        width = height = 0;
+        pixels = image_svg_decode(
+            markup, sizeof(markup) - 1, &budget, MIB, &width, &height);
+        budget_clear_failure_injection(&budget);
+        if (failure < 2 && pixels != NULL) okay = false;
+        budget_free(&budget, pixels);
+        okay = okay && budget.current == 0;
+    }
+    char nested[4096];
+    for (unsigned depth = 32; okay && depth <= 33; depth++) {
+        size_t length = 0;
+        for (unsigned i = 0; i < depth; i++) {
+            length += (size_t) snprintf(nested + length, sizeof(nested) - length,
+                "<svg width='8' height='8' viewBox='0 0 8 8'>");
+        }
+        length += (size_t) snprintf(nested + length, sizeof(nested) - length,
+            "<rect width='8' height='8' fill='#00ff00'/>");
+        for (unsigned i = 0; i < depth; i++) {
+            length += (size_t) snprintf(nested + length, sizeof(nested) - length, "</svg>");
+        }
+        width = height = 0;
+        pixels = image_svg_decode(nested, length, &budget, MIB, &width, &height);
+        okay = depth == 32 ? pixels != NULL && width == 8 && height == 8
+                           : pixels == NULL;
+        budget_free(&budget, pixels);
+        okay = okay && budget.current == 0;
+    }
+    return okay && budget.current == 0;
+}
+
 #define SVG_RETARGET_STRIPES(fill)                                          \
     "<rect width='256' height='256' fill='#ffffff'/>"                       \
     "<rect x='0' width='32' height='256' fill='" fill "'/>"                 \

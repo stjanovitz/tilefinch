@@ -822,6 +822,18 @@ static bool style_property_background_repeat(const StylePropertyParse *parse)
     } else if (strcmp(resolved, "repeat-y") == 0) {
         style->background_size_flags |= STYLE_BACKGROUND_NO_REPEAT_X;
     }
+    const StylePaintStack *paint = stylesheet_paint_stack(
+        sheet, computed_style_paint_stack_id(style));
+    if (paint != NULL && paint->background_count != 0) {
+        StylePaintStack stack = *paint;
+        for (size_t i = 0; i < stack.background_count
+                           && i < STYLE_PAINT_LAYER_LIMIT; i++) {
+            stack.backgrounds[i].flags = (uint8_t) (
+                (stack.backgrounds[i].flags & cleared)
+                | (style->background_size_flags & (uint8_t) ~cleared));
+        }
+        (void) style_apply_paint_stack(sheet, style, &stack, NULL);
+    }
     *parse->mask_high |= S2_BACKGROUND_REPEAT;
     return true;
 }

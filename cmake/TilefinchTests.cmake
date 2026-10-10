@@ -16,6 +16,13 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_property(GLOBAL APPEND PROPERTY TILEFINCH_TEST_BINARIES ${target})
     endfunction()
     find_package(Threads REQUIRED)
+    if(NOT PSP)
+        tilefinch_add_test_binary(tilefinch-youtube-feed-probe-tests tests/test_youtube_feed_probe.c)
+        target_link_libraries(tilefinch-youtube-feed-probe-tests PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-youtube-feed-probe-tests COMMAND tilefinch-youtube-feed-probe-tests)
+        set_tests_properties(tilefinch-youtube-feed-probe-tests PROPERTIES
+            LABELS "tilefinch;unit;provider" TIMEOUT 20)
+    endif()
     tilefinch_add_test_binary(tilefinch-linked-video-preview-tests tests/test_linked_video_preview.c)
     target_link_libraries(tilefinch-linked-video-preview-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-linked-video-preview-tests COMMAND tilefinch-linked-video-preview-tests)
@@ -383,6 +390,15 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-text-bidi-tests PROPERTIES
         LABELS "tilefinch;unit;layout;unicode" TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-paint-image-geometry-tests
+        tests/test_paint_image_geometry.c)
+    target_link_libraries(tilefinch-paint-image-geometry-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-paint-image-geometry-tests
+        COMMAND tilefinch-paint-image-geometry-tests)
+    set_tests_properties(tilefinch-paint-image-geometry-tests PROPERTIES
+        LABELS "tilefinch;unit;layout;image" TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-media-mp4-tests tests/test_media_mp4.c)
     target_link_libraries(tilefinch-media-mp4-tests PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-media-mp4-tests PRIVATE
@@ -634,6 +650,13 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-session-persistence-tests PROPERTIES
         LABELS "tilefinch;unit;session"
         TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-youtube-login-tests tests/test_youtube_login.c)
+    target_link_libraries(tilefinch-youtube-login-tests PRIVATE tilefinch_core tilefinch_psp_ui)
+    add_test(NAME tilefinch-youtube-login-tests COMMAND tilefinch-youtube-login-tests)
+    set_tests_properties(tilefinch-youtube-login-tests PROPERTIES LABELS "tilefinch;unit;session;youtube" TIMEOUT 30)
+    add_test(NAME tilefinch-youtube-login-journey COMMAND tilefinch-browser-engine-tests --youtube-login-journey)
+    set_tests_properties(tilefinch-youtube-login-journey PROPERTIES LABELS "tilefinch;journey;youtube" TIMEOUT 60)
 
     # Cross-boot TLS session store (docs/engineering/PSP_TRANSPORT.md).
     # Pure data plus file I/O; does
@@ -1945,6 +1968,19 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-reference-capture-tests PROPERTIES
             LABELS "tilefinch;unit;acceptance;tooling;network"
             TIMEOUT 10)
+        add_test(NAME tilefinch-reference-capture-browser-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py)
+        set_tests_properties(tilefinch-reference-capture-browser-tests PROPERTIES
+            LABELS "tilefinch;acceptance;tooling;network;visual"
+            TIMEOUT 120)
+        add_test(NAME tilefinch-native-capture-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_capture.py
+                --lab $<TARGET_FILE:psp-browser-interactive-lab>)
+        set_tests_properties(tilefinch-native-capture-tests PROPERTIES
+            LABELS "tilefinch;unit;acceptance;tooling;visual"
+            TIMEOUT 30)
         if(PSP_BROWSER_LIBCURL_TRANSPORT)
             add_test(NAME tilefinch-trace-acquisition-tests
                 COMMAND ${Python3_EXECUTABLE}
@@ -2042,6 +2078,14 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(interactive-loop-tests PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         TIMEOUT 30)
+
+    add_test(NAME tilefinch-private-interactive-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_private_interactive_lab.py
+            $<TARGET_FILE:psp-browser-interactive-lab>)
+    set_tests_properties(tilefinch-private-interactive-tests PROPERTIES
+        LABELS "tilefinch;lab"
+        TIMEOUT 60)
 
     add_test(NAME selected-web-platform-tests
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run-web-platform-correctness.sh

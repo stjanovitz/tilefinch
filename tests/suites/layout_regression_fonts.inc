@@ -10,6 +10,9 @@
         "#flattened-b{display:block;width:41px;height:10px}"
         "#flattened-c{display:block;width:51px;height:10px}"
         "#paired-intrinsic{float:left}"
+        ".indent-wrap{display:block;width:max-content;clear:both;font-size:14px;line-height:20px}"
+        ".indent-wrap>strong{display:block;font-weight:400}"
+        "#with-indent{text-indent:2px}"
         "#empty-clip{position:absolute;clip:rect(1px,1px,1px,1px);"
 
         "width:20px;height:20px;background:#ff0000}"
@@ -24,6 +27,8 @@
         "<div id=empty-clip></div>"
         "<div id=zero-scale></div><div id=border-none></div>"
         "<div id=paired-intrinsic>paired intrinsic words</div>"
+        "<div class=indent-wrap id=without-indent><strong>Three simple words</strong></div>"
+        "<div class=indent-wrap id=with-indent><strong id=indented-line>Three simple words</strong></div>"
         "</body>";
     PocDocument collapsed_document;
     Stylesheet collapsed_sheet;
@@ -62,6 +67,15 @@
           && border_none_style.border.bottom == 0);
     CHECK(layout_build(&collapsed_layout, &budget, &collapsed_document,
                        &collapsed_sheet, NULL, NULL, 480));
+    const LayoutNodeBox *without_indent = layout_box_for_node(
+        &collapsed_layout, find_id(collapsed_root, "without-indent"));
+    const LayoutNodeBox *with_indent = layout_box_for_node(
+        &collapsed_layout, find_id(collapsed_root, "with-indent"));
+    const LayoutNodeBox *indented_line = layout_box_for_node(
+        &collapsed_layout, find_id(collapsed_root, "indented-line"));
+    CHECK(without_indent != NULL && with_indent != NULL && indented_line != NULL
+          && with_indent->width == without_indent->width + 2
+          && indented_line->height == 20);
     const LayoutNodeBox *max_content_box = layout_box_for_node(
         &collapsed_layout, max_content);
     const LayoutNodeBox *max_child_box = layout_box_for_node(
@@ -89,6 +103,60 @@
     layout_destroy(&collapsed_layout);
     stylesheet_destroy(&collapsed_sheet);
     document_destroy(&collapsed_document);
+    CHECK(budget.current == 0);
+
+    puts("test: inline button faces and authored horizontal rules retain box geometry");
+    static const char face_rule_page[] =
+        "<!doctype html><style>body{margin:0;font-size:14px}"
+        "button{display:inline;font-size:14px;line-height:1;padding:6px 12px;"
+        "border:1px solid #a2a9b1;background:#f8f9fa}"
+        ".face-icon{display:inline-block;width:22px;height:22px;vertical-align:middle}"
+        "#authored-rule{height:0;border:0;border-bottom:1px solid #c8ccd1;margin:10px 0}"
+        "#baseline-host{font:16px/20px sans-serif}"
+        "#baseline-tall{display:inline-block;height:64px;width:80px;"
+        "margin:8px 0;vertical-align:bottom;background:#ddeeff}"
+        "</style><body><button id=inline-face><i class=face-icon></i>Choose language</button>"
+        "<hr id=authored-rule><hr id=plain-rule><div id=baseline-host><img id=baseline-picture width=40 height=40>"
+        "<span id=baseline-tall></span></div></body>";
+    PocDocument face_rule_document;
+    Stylesheet face_rule_sheet;
+    LayoutDocument face_rule_layout;
+    CHECK(document_parse(&face_rule_document, &budget, face_rule_page,
+                         strlen(face_rule_page), 23)
+          && stylesheet_build(&face_rule_sheet, &budget, &face_rule_document, 480)
+          && layout_build(&face_rule_layout, &budget, &face_rule_document,
+                          &face_rule_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *face_rule_root = lxb_dom_interface_node(face_rule_document.html);
+    const LayoutNodeBox *inline_face = layout_box_for_node(
+        &face_rule_layout, find_id(face_rule_root, "inline-face"));
+    const LayoutNodeBox *authored_rule = layout_box_for_node(
+        &face_rule_layout, find_id(face_rule_root, "authored-rule"));
+    const LayoutNodeBox *plain_rule = layout_box_for_node(
+        &face_rule_layout, find_id(face_rule_root, "plain-rule"));
+    CHECK(inline_face != NULL && inline_face->height == 36
+          && authored_rule != NULL && authored_rule->height == 1
+          && plain_rule != NULL && plain_rule->height == 8);
+    bool authored_rule_color = false;
+    for (size_t i = authored_rule->command_start;
+         i < authored_rule->command_end && i < face_rule_layout.count; i++) {
+        const DrawCommand *command = &face_rule_layout.commands[i];
+        if (command->color == 0xc8ccd1 && command->height == 1)
+            authored_rule_color = true;
+    }
+    CHECK(authored_rule_color);
+    const LayoutNodeBox *baseline_host = layout_box_for_node(
+        &face_rule_layout, find_id(face_rule_root, "baseline-host"));
+    const LayoutNodeBox *baseline_picture = layout_box_for_node(
+        &face_rule_layout, find_id(face_rule_root, "baseline-picture"));
+    CHECK(baseline_host != NULL && baseline_picture != NULL
+          && baseline_picture->y > baseline_host->y + 20
+          && baseline_host->y + baseline_host->height
+               - baseline_picture->y - baseline_picture->height >= 0
+          && baseline_host->y + baseline_host->height
+               - baseline_picture->y - baseline_picture->height <= 8);
+    layout_destroy(&face_rule_layout);
+    stylesheet_destroy(&face_rule_sheet);
+    document_destroy(&face_rule_document);
     CHECK(budget.current == 0);
 
     puts("test: positioned max-content roots measure their own in-flow text");
@@ -252,6 +320,7 @@
     puts("test: font shorthand cascade, inheritance, media, and layout");
     static const char font_shorthand_page[] =
         "<!doctype html><style>body{margin:0;padding:0}"
+        "html{font-family:serif;font-family:inherit}"
         "#font-parent{font-style:normal;font-weight:normal;font-size:9px;"
         "line-height:9px;font-family:monospace;"
         "font:italic 700 condensed 20px/1.5 'Mobile Sans',sans-serif}"
@@ -273,6 +342,14 @@
         "#font-system{font-family:-apple-system,BlinkMacSystemFont,"
         "'Segoe UI',sans-serif}"
         "#font-humanist{font-family:Verdana,Geneva,sans-serif}"
+        "#family-parent{font-family:monospace}"
+        "#family-parent h3{font-family:serif}"
+        "#family-parent #family-inherit{font-family:inherit}"
+        "#family-parent #family-unset{font-family:unset}"
+        "#family-parent #family-initial{font-family:initial}"
+        "#family-parent #family-deferred{--family:inherit;"
+        "font-family:var(--family)}"
+        "#family-parent #family-override{font:inherit;font-family:serif}"
         "#font-points{font-size:11pt;margin-left:1pc;padding-left:1in}"
         "#font-fraction-parent{font-size:10pt}"
         "#font-fraction-child{font-size:75%}"
@@ -298,6 +375,11 @@
         "<div id=font-metric>METRIC</div>"
         "<div id=font-system>SYSTEM</div>"
         "<div id=font-humanist>HUMANIST</div>"
+        "<div id=family-parent><h3 id=family-inherit>FAMILYINHERIT</h3>"
+        "<h3 id=family-unset>FAMILYUNSET</h3>"
+        "<h3 id=family-initial>FAMILYINITIAL</h3>"
+        "<h3 id=family-deferred>FAMILYDEFERRED</h3>"
+        "<h3 id=family-override>FAMILYOVERRIDE</h3></div>"
         "<div id=font-points>POINTS</div>"
         "<div id=font-fraction-parent>FRACTION-PARENT"
         "<span id=font-fraction-child>FRACTION-CHILD</span></div>"
@@ -392,13 +474,36 @@
         &font_fraction_parent_style);
     ComputedStyle font_html_style = style_for_node(
         &font_shorthand_sheet, font_html, NULL);
+    lxb_dom_node_t *family_parent = find_id(font_root, "family-parent");
+    ComputedStyle family_parent_style = style_for_node(
+        &font_shorthand_sheet, family_parent, NULL);
+    static const struct {
+        const char *id;
+        const char *text;
+        FontFamily family;
+    } family_cases[] = {
+        {"family-inherit", "FAMILYINHERIT", FONT_MONOSPACE},
+        {"family-unset", "FAMILYUNSET", FONT_MONOSPACE},
+        {"family-initial", "FAMILYINITIAL", FONT_SANS},
+        {"family-deferred", "FAMILYDEFERRED", FONT_MONOSPACE},
+        {"family-override", "FAMILYOVERRIDE", FONT_SERIF}
+    };
+    CHECK(family_parent != NULL
+          && family_parent_style.font_family == FONT_MONOSPACE);
+    for (size_t i = 0; i < sizeof(family_cases) / sizeof(family_cases[0]); i++) {
+        lxb_dom_node_t *child = find_id(font_root, family_cases[i].id);
+        ComputedStyle child_style = style_for_node(
+            &font_shorthand_sheet, child, &family_parent_style);
+        CHECK(child != NULL && child_style.font_family == family_cases[i].family);
+    }
     ComputedStyle line_inherit_parent_style = style_for_node(
         &font_shorthand_sheet, line_inherit_parent, NULL);
     ComputedStyle line_inherit_child_style = style_for_node(
         &font_shorthand_sheet, line_inherit_child,
         &line_inherit_parent_style);
     CHECK(font_html_style.font_size == 16
-          && font_html_style.root_font_size == 16);
+          && font_html_style.root_font_size == 16
+          && font_html_style.font_family == FONT_SANS);
     CHECK(font_parent_style.font_size == 20
           && font_parent_style.line_height == 30
           && font_parent_style.font_family == FONT_SANS
@@ -465,6 +570,11 @@
     CHECK(layout_build(&font_shorthand_layout, &budget,
                        &font_shorthand_document, &font_shorthand_sheet,
                        NULL, NULL, 480));
+    for (size_t i = 0; i < sizeof(family_cases) / sizeof(family_cases[0]); i++) {
+        const DrawCommand *command = text_command(
+            &font_shorthand_layout, family_cases[i].text);
+        CHECK(command != NULL && command->font_family == family_cases[i].family);
+    }
     const LayoutNodeBox *font_layout_tight_box = layout_box_for_node(
         &font_shorthand_layout, font_layout_tight);
     const LayoutNodeBox *font_layout_after_tight_box = layout_box_for_node(

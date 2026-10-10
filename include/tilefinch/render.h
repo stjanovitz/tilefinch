@@ -46,6 +46,8 @@ typedef struct {
     bool bold;
     bool valid;
     bool smoothed;
+    /* Uses pre-existing padding on the host and 32-bit PSP ABI. */
+    uint8_t humanist_profile;
     uint64_t last_used;
     size_t bytes;
     FontGlyph glyph;

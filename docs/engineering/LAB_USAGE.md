@@ -4,6 +4,234 @@ This is the complete command-line reference for the two host frontends. Build
 them first with [DEVELOPMENT.md](../DEVELOPMENT.md); the PSP EBOOT is covered
 by [Device qualification](DEVICE_QUALIFICATION.md).
 
+## Private local account input
+
+Use a dedicated disposable test account, never your main account. Do not put
+passwords, verification codes, session cookies, or authenticated URLs in chat,
+command scripts, shell arguments, or captures. For direct host-browser testing:
+
+```sh
+python3 scripts/run-private-interactive-lab.py --url https://example.com/login
+```
+
+Run this yourself in a local interactive terminal after building the release
+host lab. The launcher refuses piped input, discards the child's stdout and
+stderr, removes inherited tracing/cache settings, disables core dumps, automatic
+screenshots, HTTP captures, and persistent bytecode caching, and uses a private
+temporary directory. Its separate native status pipe contains numeric
+page/focus/task information and the parsed top-level origin, never DOM text,
+URL paths, or query parameters. Check that origin before entering a value;
+non-HTTPS credential entry is refused. Cookies and browser
+session data remain in RAM for this process.
+
+Use `view` to explicitly open a temporary 480×272 image, then `focus-id ID`,
+`focus-next`, or `tap X Y` to focus the desired field. Use `secret` to replace
+that field with locally masked input; it preserves spaces and Unicode. Use it
+for account names and verification codes too. `activate` presses the focused
+button; `pump 32 16` advances normal browser turns, including background
+resources and cache maintenance. `tick` deliberately advances runtime/media
+only and is reserved for isolated execution experiments; using it alone for
+a live sign-in can strand optional-resource maintenance and constrain later
+script staging. Ordinary `type`, script
+evaluation, and diagnostic commands are unavailable. `quit` tears down the
+browser and deletes the temporary files. An abrupt OS/process failure may
+leave that directory behind; delete it manually in that case.
+
+For the dedicated Google test account, use `signin` in this console, or add
+`--signin` when launching with `--url https://accounts.google.com/ServiceLogin`.
+On macOS it opens native, masked account/password dialogs. The local driver
+finds unambiguous rendered username/password fields, checks the exact accounts
+HTTPS origin before filling, submits each step once, and advances page work.
+It pauses on a missing password step, changed origin, or refused action; it
+does not solve verification prompts or claim authentication succeeded. The
+requested sign-in opens a temporary PNG page view locally after completion or
+pause; `view` refreshes that snapshot. Keep the process open to retain its
+RAM-only browser session. No account values are passed as shell arguments or
+saved as credential files.
+
+### Keep credentials through browser restarts
+
+For repeated host sign-in debugging, start the RAM-only keeper yourself:
+
+```sh
+python3 scripts/run-private-signin-session.py
+```
+
+Enter the dedicated account once in the local masked dialogs. The helper
+starts the same private browser and attempts the sign-in flow. It never opens
+a preview automatically; use `view` explicitly. Starting it authorizes separately
+requested attempts until stopped, not an automatic retry loop. Optional
+`--confirm-first-attempt` and `--confirm-each-attempt` enable local confirmation;
+`--password-attempt-limit 0` removes the conservative three-attempt cap.
+Its printed control socket is in an owner-only temporary
+directory outside the repository. A test driver can use that socket without
+receiving credentials or accessing page screenshots:
+
+```sh
+python3 scripts/run-private-signin-session.py \
+  --control /private/tmp/tf-auth-EXAMPLE/control.sock --action status
+```
+
+Replace the example path with the one printed by the keeper. Only `status`,
+`attempt`, `restart`, `advance`, `view`, `view-below`, `view-above`, `inspect`,
+`youtube-home`, `youtube-subscriptions`, and `stop` are accepted. Status
+contains a fixed phase name, numeric page/focus/task information, and the
+origin, never form values, cookies, DOM text, URL paths, or error strings.
+Actions run serially; status remains available while browser work is running.
+The keeper's preparation, field waits and response waits use `pump`, matching
+the browser's sliced resource/runtime schedule rather than runtime-only ticks.
+An `aria-invalid` response on the entered account field stops the flow with
+`username_rejected`, without sending the password. Its associated feedback is
+scrolled into the local preview; message text is not returned over the socket.
+`view` opens an image on the user's computer; it does not return its contents
+over the control channel. No network listener is opened.
+
+For a YouTube session, start with `--service youtube`. This follows YouTube's
+ordinary sign-in entry into the accounts page; credentials are still filled
+only on the exact accounts HTTPS origin. After sign-in, `youtube-home` and
+`youtube-subscriptions` open the lightweight provider UI in that same browser
+session: complete ordinary service-entry navigation once, then use bounded
+bootstrap metadata and the browse API. Once navigation has reached YouTube,
+feed checks do not repeat sign-in or reload its heavyweight page. The provider
+builds bounded script-free cards and loads feeds cooperatively in idle turns.
+Request signatures are derived natively from the same session's
+policy-eligible cookies and are never included in diagnostics.
+If memory pressure discarded the sign-in continuation's scripts while its
+incumbent was resident, the first feed action can reload that static page
+through at most two explicit normal reloads per browser process. Advance
+normal browser turns, then request
+the feed check again. This never submits a password or bypasses verification.
+No cookies/tokens are exported, no arbitrary
+URL or request headers are accepted through the socket, and no preview opens.
+`inspect` includes numeric provider state and row counts. Raw personal titles,
+payloads and screenshots stay local and must not be exported as diagnostics.
+An authenticated feed is published only after the API confirms signed-in
+status; an empty account can legitimately publish an empty feed. These host
+checks do not qualify the PSP sign-in journey.
+The targeted synthetic UI gate is
+`build-preset-release/tilefinch-browser-engine-tests --youtube-home-only`;
+it covers background loading, held publication, refresh, subscriptions and
+transactional allocation refusal without an account or external requests.
+The host-only private navigation command reuses normal authority/cookie policy
+and does not add a history entry or persist the session. Changing a running
+keeper's available actions requires restarting it; opaque credentials and
+cookies must never be migrated to a replacement process.
+
+Views now capture the rendered page vertically (up to 4,352 pixels), not just
+the first handheld screen. The diagnostic visual copy removes text belonging
+to input, textarea and editable controls before painting or writing files;
+live field values and focus are unchanged. Matching retained field values in
+other text commands are also removed. Raw DOM, attributes, scripts, cookies,
+and response bodies are not exported. This is a diagnostic for the dedicated
+test account, not a guarantee against an arbitrary page deliberately reflecting
+credentials through images or fragmented text.
+
+With the user's permission, `inspect` produces `redacted.png` and
+`redacted.ppm.txt` beside the socket for a developer to inspect. Only those
+redacted artifacts may be shared; do not inspect an older `view.png` or a raw
+browser dump. Wait for `busy=false` and `inspection_ready=true` before reading
+them. Files remain owner-only, outside the repository, and are removed when
+the keeper exits. The text report states the captured and complete page
+heights; oversized pages are explicitly bounded rather than called complete.
+The text report also includes fixed runtime counters and exception categories
+(such as `type` or `none`), never exception messages or stacks. This distinguishes
+script admission failures and pending requests without exposing author data.
+An opt-in promise-outcome histogram keeps only fixed exception categories,
+including rejections later handled by the page. It records no reason text or
+stack and does not change normal rejection handling.
+Response byte/text lengths, timer and pending-work counts, and allocator
+refusals help distinguish an incomplete delivery from a stalled continuation;
+response contents are never included.
+Dynamic-script fetch failures are partitioned into response-size, transport
+(including HTTP errors), shared-memory, authority/MIME, and source-admission
+counts. These describe receiving a script, not later author evaluation errors;
+they expose no request or response text.
+The private console also opts into a 32-entry RAM-only XHR history: numeric
+send sequence, status, byte/text lengths, response phase, getter-read counts,
+and event counts. Overflow is reported explicitly. Phases are 1 (sent),
+2 (headers), 3 (loading), 4 (done), 5 (loadend complete), 6 (failure), and
+7 (abort). No URL, body, headers, handler identity or field value is retained
+by this history. Ordinary browsing does not allocate it. Scheduler flags
+separate future timers from runnable promise jobs/checkpoint continuations
+and a pending navigation; a successful HTTP status alone is not sign-in success.
+Navigation boundary counters distinguish accepted, refused and consumed host
+requests without recording their targets or metadata. They share the private
+observer's opt-in lifetime and do not allocate in ordinary browsing.
+The redacted snapshot also reports numeric navigation HTTP/transport status,
+TLS/timeout/error-present flags and commit count. Browser-owned failure prefixes
+map to fixed construction-phase categories; unknown errors map to `other`.
+Neither error text nor author exceptions are exported.
+The private test also counts calls and failures through an opt-in `JSON.parse`
+observer, including caught failures. It retains no parser input, result or
+exception text. This observer preserves arguments, receivers, revivers, values
+and exceptions, but changes function identity; aliases cached by the page before
+enablement are not covered. Treat its counts as diagnostic evidence, not a
+complete parser census or a claim that a particular response was accepted.
+With separate user approval, a maintainer may supply an owner-only (0600),
+non-symlink `outcome-classifier.js` in the helper's disposable working directory
+before restarting the browser. It is a trusted local function expression, at
+most 16 KiB, receiving `(value, originalParse, event)`: event 0 observes a parse,
+event 1 observes a promise rejection (with no original parser). For event 1,
+only a bounded numeric stage ID 0–12 is reported, never exception contents.
+Snapshot sampling uses events 2 and 3 for entered/failed stage masks; only
+13-bit integer masks are accepted. Keep these diagnostic counters independent
+of live inputs and clear them at the specific public-code boundary being probed.
+Keep account-specific
+filters in private investigation storage. Only numeric categories 0–12 are
+reported: unrecognized, rejected, verification required, redirect, credential
+transition, protocol error, challenge update, then credential-handoff
+navigation, form POST, native account, close, prerequisite, and other.
+These classify the declared next action, not its completion. Invalid returns and filter
+exceptions become unrecognized; filter exceptions never replace the page's
+parse result or escape into diagnostics. Values and response contents are not
+retained by the native recorder. This observes only parses through the wrapper,
+and a credential transition is not proof that authentication completed.
+The keeper's `--outcome-classifier /private/path/filter.js` option safely copies
+that explicitly requested owner-only filter into a new session before starting
+the browser, avoiding a separate installation/restart. No filter is selected
+by default, and the file must contain diagnostic code, never account inputs.
+Button submission uses normal controller focus and activation, including blur
+notifications, not a selector-only click. Invalid password feedback is revealed
+locally without another submission.
+
+`restart` discards browser cookies and images, not retained account input.
+Use `attempt` afterward. The keeper conservatively counts a possible password
+submission before filling the password field, including failed/uncertain
+delivery. Starting the keeper locally authorizes requested attempts until it
+stops; no additional approval dialogs or image previews appear by default.
+Use `view` to open a preview, or `--confirm-each-attempt` to opt into a local
+confirmation dialog (Cancel by default) for every attempt. At most three
+possible password submissions are allowed per keeper session by default.
+For explicitly authorized extended debugging, `--password-attempt-limit 0`
+removes that lifetime cap. It does not retry automatically: after the initial
+startup attempt, each attempt remains a separate control action. Credentials
+stay in RAM until Ctrl-C or `stop`; uncapped mode does not export or migrate
+them. Repeated failures can trigger account lockouts, so inspect the result
+and change the tested implementation before retrying an unchanged failure.
+A browser failure does not request the credentials again.
+For a single explicitly approved diagnostic attempt, start a fresh keeper with
+`--password-attempt-limit 1 --confirm-first-attempt`. The first attempt then
+requires the same local confirmation, and restarting the browser cannot permit
+a second password submission. These startup options cannot change a running
+keeper's allowance or transfer its retained credentials.
+Verification and unexpected pages remain under user control. Ctrl-C or `stop`
+terminates the browser, clears the retained bytearrays, and deletes the local
+temporary directory. The keeper itself must stay running to avoid re-entry.
+
+The owner-only socket is not a security boundary against other processes
+running as the same OS user. Do not share it publicly. This helper never
+transfers cookies from another browser, and browser restarts do not retain an
+authenticated session. Credentials remain available only to the local helper
+and the intended website during its ordinary sign-in flow.
+
+This is not a hardened credential vault: the experimental browser and the
+intended website necessarily hold submitted values in memory. Python does not
+guarantee erasure of string copies; OS swap, privileged inspection, and image
+viewer caches are outside the launcher's protection. Explicit views can contain
+account details. After testing, sign out or revoke the test session from the
+account's security settings. This path does not transfer another browser's
+session or bypass an identity provider's checks.
+
 ## Static renderer (`psp-browser-lab`)
 
 ```sh

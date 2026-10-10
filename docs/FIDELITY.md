@@ -85,10 +85,50 @@ incorrect wrapping, and shifted box geometry visible. RGB error identifies
 color and antialiasing changes which structural metrics can underweight. No
 single score is treated as a complete visual judgment.
 
+## Native diagnostic five-view capture
+
+`benchmarks/native_capture.py` captures native 0/25/50/75/100-percent views
+from an existing response-keyed offline trace at 480×272. It uses the lab's
+native `top`, `scroll-by PIXELS`, and `bottom` commands, never page JavaScript.
+Exact offsets avoid sticky headers changing the meaning of page-down steps.
+This is a diagnostic strip, not a content-aligned Chrome pixel oracle.
+
+```sh
+python3 benchmarks/native_capture.py --output /tmp/native-diagnostic \
+  --height-estimate 6000 --sweep-ticks 30 -- \
+  build-preset-release/psp-browser-interactive-lab \
+  --url https://example.test/ --replay-http-response-keyed /path/to/trace
+```
+
+The command sequence records every extra clock turn explicitly, with zero-time
+drains. The runner preserves separate stdout/stderr, commands, invocation,
+five PPM frames and artifact hashes. Ordered complete labels, matching
+pre/render positions, stable geometry, both document edges and a clean
+teardown receipt are mandatory. A stale initial height permits at most one
+fresh retry using the first attempt's verified height; both attempts remain
+on disk, and further instability fails. Existing output is never overwritten.
+Resource acquisition and reference qualification remain separate steps.
+The receipt binds the lab executable, trace and invocation by hash and refuses
+input changes during either attempt. Verified frames, offsets and teardown
+do not prove resource completion or completed page hydration.
+
 For typography investigations, the lab can emit bounded text-run geometry and
 computed font data. `benchmarks/compare-text-metrics.py` then separates glyph
 advance, baseline, line-height, and wrapping differences from broad screenshot
 noise.
+
+The Verdana-compatible fallback's existing advances and kerning remain intact.
+Its real regular, bold and italic platform faces can fit independently measured
+horizontal ink bounds during cold glyph creation only. Admission requires at
+least 25% positive advance mismatch, excess following sidebearing, and an outline
+scale between 3/4 and 3/2. A sparse, bounded ASCII profile retains only qualified
+candidates. Authored fonts, non-2048-em faces, synthetic styles and unqualified
+characters preserve their native raster path. Cache keys distinguish fitted and
+native ink without increasing cache-entry size or performing warm-path fitting.
+A 36-byte membership bitset normalizes other characters to the native cache key;
+warm accesses pay only that bounded integer lookup and the profile-key comparison.
+Own-markup tests cover regular/bold/italic placement, unchanged layout metrics,
+synthetic-style refusal, cache reuse, cancellation and allocation refusal.
 
 ## Qualification boundary
 
@@ -113,6 +153,14 @@ successful decodes, masks, backgrounds and referenced SVG sprites keep their
 existing path. Subsequent display retargeting rasterizes the retained markup
 at the painted size. Reduced tests pin exact pixels, refusal cleanup and the
 unchanged successful-decode path.
+
+SVG viewport defaults use `xMidYMid meet`, including root SVGs whose authored
+dimensions and viewBox have different ratios. Explicit `none`, `slice` and
+vertical alignment overrides remain independent per viewport. CSS scale
+transforms also scale background tile dimensions and pixel offsets, including
+natural-size tiles; scaling only the paint box would alter the crop and repeat
+pattern. Repository-owned rectangle/checkerboard pixel tests cover these
+paths, downscaled raster requests and allocation refusal cleanup.
 
 ## Local corpus layout
 
@@ -155,6 +203,50 @@ committed floors live in `tests/fidelity-baselines.tsv`.
 The builder uses the replay/acquisition contract in
 [Replay and reference lab](engineering/REPLAY_LAB.md). Live acquisition is a
 separate, explicit operation; ordinary scoring never contacts a site.
+
+### Full-document census captures
+
+Use the maintained batch runner rather than an investigation-specific browser
+wrapper. It checks the browser and PNG normalizer before starting, verifies every
+trace pin, and saves each attempt in a new directory:
+
+```sh
+python3 benchmarks/capture-census.py \
+  --manifest census-scenarios.tsv --trace-root captures \
+  --output-root references --jobs 3 --resume
+```
+
+The runner is offline. Missing responses produce exact acquisition plans; it
+does not download them, relax CORS, or change exclusions. Redirect hops are
+intercepted individually, including cross-origin frame targets, with an
+independent browser-request audit detecting missed interception and unexpected
+request failures before browser shutdown. Capture uses the retained document
+User-Agent.
+
+Completion requires a bounded scroll to the bottom, five verified viewport
+positions with unchanged mobile input/viewport settings, and loaded paintable
+images. Actual offsets,
+additional replay-clock turns, failures, and tool/input hashes are retained.
+Resume requires all mandatory artifacts and matching hashes, not merely an
+old success flag. A geometry change during the viewport sequence permits one
+bounded recapture of all five views; the original images are preserved and
+hashed too. Failed or corrupt attempts are retried without overwriting
+their evidence. Access-denied, policy-refused, and unfinished pages remain
+explicitly incomplete.
+
+The diagnostic scope is `viewport-sweep-diagnostic-v2`. A coherent full-page
+image is deliberately omitted: Chromium's full-page capture can clear touch
+emulation while painting, selecting different CSS media rules. Enlarging the
+surface can instead alter viewport units or omit offscreen pixels. Verified
+viewport images remain accurate; comparison strips are labeled scroll
+sequences, not stitched full-page screenshots. Old full-page receipts must
+be recaptured rather than accepted as current evidence.
+
+The full-document sweep advances additional clock turns. These captures are
+diagnostic, not interchangeable with the ordinary manifest checkpoint oracle.
+Compare native output only with matched clock turns and content anchors;
+fractional scroll positions can show different content when layout heights
+differ. Never move a fidelity floor using a mismatched comparison.
 
 ## Running the scoreboard
 

@@ -19,7 +19,8 @@ CATALOGS = [(1, [("es", "Spanish", "EMBEDDED"), ("fr", "French", "EMBEDDED"),
                  ("zh-hans", "Chinese (Simplified)", "CHINESE_SIMPLIFIED"),
                  ("ko", "Korean", "KOREAN"), ("hi", "Hindi", "DEVANAGARI"),
                  ("ar", "Arabic", "ARABIC")])]
-ACTIVE_VERSION = 4
+CATALOGS.append((5, CATALOGS[-1][1]))
+ACTIVE_VERSION = 5
 
 def read_rows(version, languages):
     source = ROOT / f"translations/ui/v{version}/source.tsv"
@@ -27,7 +28,7 @@ def read_rows(version, languages):
     if lines[0] != "\t".join(["English"] + [label for _, label, _ in languages]):
         raise ValueError("unexpected language columns")
     rows = [line.split("\t") for line in lines[1:]]
-    if not 0 < len(rows) <= 256 or any(len(r) != len(languages) + 1 for r in rows):
+    if not 0 < len(rows) <= 320 or any(len(r) != len(languages) + 1 for r in rows):
         raise ValueError("invalid row count or columns")
     rows.sort(key=lambda row: row[0].lower().encode("ascii"))
     if len({r[0].lower() for r in rows}) != len(rows):
@@ -60,7 +61,7 @@ def outputs(resource_dir=None):
             if resource_dir is not None:
                 result[resource_dir / resource_key] = data
             if version == ACTIVE_VERSION:
-                minimum_glyph_sequence = 2 if glyphs == "DEVANAGARI" else 1
+                minimum_glyph_sequence = (3 if version >= 5 else 2) if glyphs == "DEVANAGARI" else 1
                 manifest.append(f'    {{"{code}", "{label}", BROWSER_GLYPH_LANGUAGE_{glyphs}, '
                                 f'"{hashlib.sha256(data).hexdigest()}", {version}, {minimum_glyph_sequence}, '
                                 f'"{resource_key}"}},')

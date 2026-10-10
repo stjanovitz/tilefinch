@@ -18,6 +18,8 @@
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
 
 #define MAX_TRACKED_STYLESHEETS 32
+_Static_assert(STYLESHEET_DOCUMENT_RESOURCE_LIMIT <= 32,
+               "stylesheet rebuild membership must fit its bounded bitset");
 #define STYLESHEET_FETCH_CONCURRENCY 4
 #define STYLESHEET_FETCH_BATCH 2
 /* Parsed-cost model for admission (stylesheet_source_cost_estimate). */
@@ -179,6 +181,11 @@ typedef struct {
     uint32_t hashes[MAX_TRACKED_STYLESHEETS];
     bool hash_applied[MAX_TRACKED_STYLESHEETS];
     size_t hash_count;
+    /* Rebuild membership is reserved independently of DOM cascade order. */
+    uint32_t reserved_links;
+    uint32_t applied_this_pass;
+    size_t reserved_link_count;
+    bool rebuilding;
     uint64_t alternate_theme_hashes[STYLESHEET_ALTERNATE_THEME_LIMIT];
     bool alternate_theme_active[STYLESHEET_ALTERNATE_THEME_LIMIT];
     size_t alternate_theme_count;
@@ -734,7 +741,12 @@ static void document_resource_record_loaded(
         if (!reuses_existing) budget_free(context->budget, replacement);
     }
     entry->length = length;
-    entry->rules_applied = entry->rules_applied || rules_applied;
+    if (context->rebuilding) {
+        if (rules_applied) context->applied_this_pass |=
+            UINT32_C(1) << (size_t) (entry - resources->items);
+    } else {
+        entry->rules_applied = entry->rules_applied || rules_applied;
+    }
     entry->cors_validated = cors_validated;
     entry->motion_source_readable = resource_grant != NULL
         && resource_grant->cors_validated;
@@ -1905,6 +1917,25 @@ static bool load_stylesheet_imports(ResourceContext *context,
     return true;
 }
 
+static bool stylesheet_count_available(ResourceContext *context,
+                                        const char *url)
+{
+    StylesheetDocumentResource *entry = document_resource_find(
+        context->document_resources, url);
+    uint32_t bit = entry == NULL ? 0u : UINT32_C(1) <<
+        (size_t) (entry - context->document_resources->items);
+    bool reserved = (context->reserved_links & bit) != 0u;
+    if (context->reserved_link_count > context->maximum_count) return false;
+    size_t available = context->maximum_count - context->reserved_link_count;
+    if (context->stats->attempted >=
+            (reserved ? context->maximum_count : available)) return false;
+    if (reserved) {
+        context->reserved_links &= ~bit;
+        context->reserved_link_count--;
+    }
+    return true;
+}
+
 static bool load_stylesheet_url(
     ResourceContext *context, const char *resolved, unsigned depth,
     const StylesheetResponseProvenance *initiator)
@@ -1942,6 +1973,14 @@ static bool load_stylesheet_url(
     if (document_resource_suppresses(context, document_resource)) {
         return true;
     }
+    if (!stylesheet_count_available(context, resolved)
+        || context->stats->bytes >= context->maximum_total_bytes) {
+        context->stats->skipped_limit++;
+        if (document_resource == NULL
+            || document_resource->state != STYLESHEET_DOCUMENT_RESOURCE_LOADED)
+            document_resource_record_failure(context, resolved, NULL, NULL, true);
+        return true;
+    }
     if (document_resource != NULL
         && document_resource->state
                == STYLESHEET_DOCUMENT_RESOURCE_LOADED
@@ -1965,17 +2004,6 @@ static bool load_stylesheet_url(
             document_resource->length, depth, NULL, true,
             document_resource->body, &request_context, NULL,
             document_resource->motion_source_readable);
-    }
-    if (context->stats->attempted >= context->maximum_count
-        || context->stats->bytes >= context->maximum_total_bytes) {
-        context->stats->skipped_limit++;
-        if (document_resource == NULL
-            || document_resource->state
-                   != STYLESHEET_DOCUMENT_RESOURCE_LOADED) {
-            document_resource_record_failure(
-                context, resolved, NULL, NULL, true);
-        }
-        return true;
     }
     size_t remaining = context->maximum_total_bytes - context->stats->bytes;
     size_t maximum = stylesheet_response_bound(context, remaining);
@@ -2525,6 +2553,9 @@ static bool queue_stylesheet_link(ResourceContext *context,
     const char *rel = document_attribute(node, "rel", &rel_length);
     if (rel == NULL) return true;
     bool stylesheet = token_contains(rel, rel_length, "stylesheet");
+    if (stylesheet && lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node), (const lxb_char_t *) "disabled", 8u))
+        return true;
     if (!stylesheet) {
         size_t as_length = 0;
         const char *as = document_attribute(node, "as", &as_length);
@@ -2641,7 +2672,7 @@ static bool queue_stylesheet_link(ResourceContext *context,
                     /* Promotion moves the response into the active lane:
                        it needs an active slot, and a request capped by the
                        smaller preload allowance must not cap this link. */
-                    if (stats->attempted >= context->maximum_count
+                    if (!stylesheet_count_available(context, resolved)
                         || queued->maximum_bytes < wanted) break;
                     if (stats->preload_attempted != 0)
                         stats->preload_attempted--;
@@ -2667,7 +2698,9 @@ static bool queue_stylesheet_link(ResourceContext *context,
     size_t charged = stylesheet ? stats->bytes : stats->preload_bytes;
     size_t byte_limit = stylesheet ? context->maximum_total_bytes
                                    : style_preload_byte_limit(context);
-    if (*attempted >= context->maximum_count || charged >= byte_limit) {
+    if ((stylesheet ? !stylesheet_count_available(context, resolved)
+                    : *attempted >= context->maximum_count)
+        || charged >= byte_limit) {
         context->stats->skipped_limit++;
         if (stylesheet && (document_resource == NULL
             || document_resource->state
@@ -2929,6 +2962,65 @@ static bool walk(ResourceContext *context, lxb_dom_node_t *node)
         }
         node = node->next;
     }
+}
+
+static bool reserve_applied_links(ResourceContext *context, lxb_dom_node_t *node)
+{
+    if (node == NULL || context->document_resources == NULL) return true;
+    size_t prior_applied = 0u;
+    for (size_t i = 0; i < context->document_resources->count; i++)
+        if (context->document_resources->items[i].rules_applied) prior_applied++;
+    if (prior_applied == 0u) return true;
+    lxb_dom_node_t *const boundary_parent = node->parent;
+    for (size_t visited = 0; visited < 65536u; visited++) {
+        if (!resource_work(context, 1, false)) return false;
+        if (name_is(node, "link")) {
+            size_t rel_length = 0, href_length = 0, media_length = 0;
+            const char *rel = document_attribute(node, "rel", &rel_length);
+            const char *href = document_attribute(node, "href", &href_length);
+            const char *media = document_attribute(node, "media", &media_length);
+            if (rel != NULL && token_contains(rel, rel_length, "stylesheet")
+                && !lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                       (const lxb_char_t *) "disabled", 8u)
+                && href != NULL && href_length < 2048u
+                && (media == NULL || media_length == 0u
+                    || stylesheet_media_matches(context->sheet, media, media_length))) {
+                char reference[2048], resolved[4096];
+                memcpy(reference, href, href_length);
+                reference[href_length] = '\0';
+                if (fetch_resolve_url(context->base_url, reference, resolved,
+                                      sizeof(resolved))) {
+                    StylesheetDocumentResource *entry = document_resource_find(
+                        context->document_resources, resolved);
+                    if (entry != NULL && entry->rules_applied
+                        && !stylesheet_is_inactive_alternate_theme(context, resolved)
+                        && tilefinch_csp_allows_request_granted(
+                               context->content_security_policy,
+                               TILEFINCH_DESTINATION_STYLE, resolved,
+                               tilefinch_csp_element_grant(
+                                   context->content_security_policy,
+                                   TILEFINCH_DESTINATION_STYLE, node, true))) {
+                        uint32_t bit = UINT32_C(1) <<
+                            (size_t) (entry - context->document_resources->items);
+                        if ((context->reserved_links & bit) == 0u
+                            && context->reserved_link_count < context->maximum_count) {
+                            context->reserved_links |= bit;
+                            context->reserved_link_count++;
+                            if (context->reserved_link_count == prior_applied)
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
+        if (node->first_child != NULL) { node = node->first_child; continue; }
+        while (node->next == NULL) {
+            if (node->parent == boundary_parent) return true;
+            node = node->parent;
+        }
+        node = node->next;
+    }
+    return false;
 }
 
 static bool stylesheets_append_ordered_suffix_impl(
@@ -3210,7 +3302,10 @@ bool stylesheets_load_external_tracked_with_context(
     stylesheet_collect_alternate_themes(
         &context, lxb_dom_interface_node(document->html));
     tilefinch_platform_trace_step("css-walk");
-    bool ok = walk(&context, lxb_dom_interface_node(document->html));
+    context.rebuilding = true;
+    bool ok = reserve_applied_links(&context,
+        lxb_dom_interface_node(document->html));
+    if (ok) ok = walk(&context, lxb_dom_interface_node(document->html));
     tilefinch_platform_trace_step("css-flush");
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(&context,
@@ -3218,7 +3313,12 @@ bool stylesheets_load_external_tracked_with_context(
     if (ok) ok = process_adopted_sheets(&context, document);
     if (batch_rules && !stylesheet_end_rule_batch(sheet)) ok = false;
     resource_finish_slice(&context);
-    if (ok) sheet->document_rules_deferred = false;
+    if (ok) {
+        sheet->document_rules_deferred = false;
+        for (size_t i = 0; resources != NULL && i < resources->count; i++)
+            resources->items[i].rules_applied =
+                (context.applied_this_pass & (UINT32_C(1) << i)) != 0u;
+    }
     double elapsed = resource_now_ms() - context.started_ms;
     if (elapsed < 0.0) elapsed = 0.0;
     stats->deadline_exceeded = context.deadline_reached
@@ -3773,7 +3873,8 @@ bool stylesheet_document_resources_copy_for_rebuild(
         copy->url = NULL;
         copy->response_url = NULL;
         copy->body = NULL;
-        copy->rules_applied = false;
+        /* Keep incumbent membership until a successful rebuild publishes its
+           own applied set. Refusal must not mutate the source ledger. */
         destination->count++;
         if (original->url != NULL) {
             size_t length = strlen(original->url) + 1u;
@@ -3859,13 +3960,8 @@ bool stylesheet_document_resources_prepare_complete_census(
     resources->selector_census_complete = true;
     if (!resources->final_resample_required
         || resources->final_resample_completed) return false;
-    for (size_t i = 0; i < resources->count; i++) {
-        StylesheetDocumentResource *entry = &resources->items[i];
-        if (entry->state == STYLESHEET_DOCUMENT_RESOURCE_LOADED
-            && entry->body != NULL && entry->response_provenance_known) {
-            entry->rules_applied = false;
-        }
-    }
+    /* Request the authoritative pass without unpublishing the incumbent's
+       admitted set. A failed rebuild must leave that membership intact. */
     resources->final_resample_required = false;
     resources->final_resample_completed = true;
     return true;

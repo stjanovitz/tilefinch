@@ -4626,6 +4626,9 @@
         };
         return proto;
       })();
+    globalThis.__tilefinchBindDetachedAttributeMethods?.((name) =>
+      Object.getOwnPropertyDescriptor(elementPrototype(Element.prototype),
+                                      name)?.value);
     const detachedDocument = (
       title,
       xml = false,

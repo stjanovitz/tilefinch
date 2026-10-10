@@ -18,6 +18,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 from reference_frame import read_png_bytes, read_ppm
 
@@ -672,7 +673,7 @@ def load_manifest(path: Path) -> list[Scenario]:
             if reader.fieldnames is None:
                 raise ManifestError("manifest has no header")
             missing = [name for name in MANIFEST_FIELDS if name not in reader.fieldnames]
-            optional = ("blocked_origins", "engine_scripts")
+            optional = ("blocked_origins", "engine_scripts", "hydration_selector")
             extra = [
                 name for name in reader.fieldnames
                 if name not in MANIFEST_FIELDS and name not in optional
@@ -1484,7 +1485,7 @@ def _validate_reference_environment(
             or scheduler.get("order_digest_version")
             != "exact-request-identity-v3"
             or scheduler.get("browser_ordinal_semantics")
-            != "raw-playwright-route-callback-v1"
+            not in {"raw-playwright-route-callback-v1", "raw-chromium-fetch-callback-v1"}
             or scheduler.get("request_limit")
             != REFERENCE_SCHEDULER_REQUEST_LIMIT
             or scheduler.get("retained_delay_limit_pumps")
@@ -1827,12 +1828,15 @@ def _validate_reference_state_schema(state: dict[str, Any]) -> list[str]:
             REFERENCE_ACQUISITION_FIELDS,
             "reference-acquisition-plan-fields",
         ),
-        ("browser", REFERENCE_BROWSER_FIELDS, "reference-browser-fields"),
     )
     for name, fields, reason in exact_objects:
         value = state.get(name)
         if not isinstance(value, dict) or set(value) != fields:
             reasons.append(reason)
+    browser = state.get("browser")
+    browser_fields = REFERENCE_BROWSER_FIELDS | {"user_agent_source", "user_agent_sha256"}
+    if not isinstance(browser, dict) or set(browser) not in (REFERENCE_BROWSER_FIELDS, browser_fields):
+        reasons.append("reference-browser-fields")
 
     diagnostics = (
         state.get("replay_ledger", {}).get("unexpected_requests")
@@ -1871,6 +1875,8 @@ def _validate_reference_capture(
     scenario: Scenario, state: dict[str, Any], capture_url: str
 ) -> list[str]:
     reasons = _validate_reference_state_schema(state)
+    if state.get("capture_scope") in ("full-document-diagnostic-v1", "viewport-sweep-diagnostic-v2"):
+        reasons.append("reference-full-document-is-diagnostic")
     if state.get("capture_transport") != REFERENCE_CAPTURE_TRANSPORT:
         reasons.append("reference-capture-transport-mismatch")
     if capture_url != scenario.url:
@@ -1963,9 +1969,16 @@ def _validate_reference_capture(
             or not 0 < len(user_agent) <= 2048
             or any(ord(character) < 0x20 or ord(character) > 0x7E for character in user_agent)
             or not isinstance(version, str)
-            or f"HeadlessChrome/{version}" not in user_agent
+            or (browser.get("user_agent_source") != "retained-document-request-v1"
+                and f"HeadlessChrome/{version}" not in user_agent)
         ):
             reasons.append("reference-browser-user-agent")
+        if "user_agent_source" in browser and (
+            browser.get("user_agent_source") != "retained-document-request-v1"
+            or not isinstance(user_agent, str)
+            or browser.get("user_agent_sha256") != hashlib.sha256(user_agent.encode("utf-8")).hexdigest()
+        ):
+            reasons.append("reference-browser-user-agent-provenance")
         if (
             not isinstance(platform, str)
             or not 0 < len(platform) <= 128
@@ -2149,6 +2162,33 @@ def validate_state(
     return reasons, formats
 
 
+def retained_document_user_agent(directory: Path, url: str) -> str | None:
+    def request_url(value: str) -> str:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").encode("idna").decode("ascii").lower()
+        if ":" in host:
+            host = "[" + host + "]"
+        port = parsed.port
+        if port is not None and (parsed.scheme.lower(), port) not in (("http", 80), ("https", 443)):
+            host += ":" + str(port)
+        if "@" in parsed.netloc:
+            host = parsed.netloc.rsplit("@", 1)[0] + "@" + host
+        return urlunsplit((parsed.scheme.lower(), host, parsed.path or "/", parsed.query, ""))
+
+    wanted = request_url(url)
+    records = sorted(path for path in directory.iterdir() if TRACE_RECORD.fullmatch(path.name))
+    if len(records) > 4096:
+        raise ArtifactError("retained document request exceeds the record bound")
+    for path in records:
+        if path.is_symlink() or path.stat().st_size > TRACE_META_LIMIT:
+            raise ArtifactError("retained request metadata is not a bounded regular file")
+        metadata = dict(line.partition("=")[::2] for line in path.read_text().splitlines()
+                        if "=" in line and not line.startswith("#"))
+        if metadata.get("method", "GET").upper() == "GET" and request_url(metadata.get("url", "")) == wanted:
+            return metadata.get("request-user-agent") or None
+    return None
+
+
 def qualify(
     scenario: Scenario,
     replay_directory: Path,
@@ -2185,6 +2225,13 @@ def qualify(
         side_reasons, _ = validate_state(scenario, state, path, side)
         reasons.extend(side_reasons)
         validated[side] = state
+    reference_browser = validated.get("reference", {}).get("browser", {})
+    if isinstance(reference_browser, dict) and reference_browser.get("user_agent_source") == "retained-document-request-v1":
+        try:
+            if reference_browser.get("user_agent") != retained_document_user_agent(replay_directory, scenario.url):
+                reasons.append("reference-browser-user-agent-trace-mismatch")
+        except (OSError, ArtifactError, UnicodeError, ValueError) as error:
+            reasons.append(f"reference-browser-user-agent-trace-unavailable:{error}")
     if trace_origin_ms is not None:
         for side in ("reference", "candidate"):
             if side in validated:

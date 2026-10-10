@@ -146,15 +146,20 @@ static bool glyph_prefilter(TileCache *cache, const FontFace *face,
 /* Out of line, as it has always been compiled: with the lab-only idle glyph
    prewarm compiled out, rasterize_truetype_text is its sole caller and GCC
    would otherwise fold this cache path into the text rasterizer. */
+#include "humanist_ink_membership.inc"
+
+
 static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
                                             TileCache *cache,
                                             const FontFace *face,
                                             unsigned codepoint,
                                             int pixel_height, bool bold,
+                                            unsigned humanist_profile,
                                             FontGlyph *temporary,
                                             bool *smoothed)
 {
     *smoothed = false;
+    humanist_profile = glyph_cache_ink_profile(humanist_profile, codepoint);
     size_t set = glyph_cache_set(cache, face, codepoint, pixel_height, bold);
     size_t begin = set * TILEFINCH_GLYPH_CACHE_WAYS;
     size_t end = begin + TILEFINCH_GLYPH_CACHE_WAYS;
@@ -163,7 +168,8 @@ static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
         GlyphCacheEntry *entry = &cache->glyph_cache[i];
         if (entry->valid && entry->face == face
             && entry->codepoint == codepoint
-            && entry->pixel_height == pixel_height && entry->bold == bold) {
+            && entry->pixel_height == pixel_height && entry->bold == bold
+            && entry->humanist_profile == humanist_profile) {
             entry->last_used = ++cache->clock;
             cache->glyph_cache_hits++;
             *smoothed = entry->smoothed;
@@ -172,8 +178,8 @@ static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
     }
     cache->glyph_cache_misses++;
     TILEFINCH_WORK_ADD(glyph_misses, 1);
-    if (!font_glyph_load_at_size(
-            face, codepoint, pixel_height, bold, temporary)) {
+    if (!font_glyph_load_at_size_profile(
+            face, codepoint, pixel_height, bold, humanist_profile, temporary)) {
         return NULL;
     }
     /* A first useful viewport values latency over the final expansion
@@ -211,6 +217,7 @@ static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
     entry->codepoint = codepoint;
     entry->pixel_height = pixel_height;
     entry->bold = bold;
+    entry->humanist_profile = (uint8_t) humanist_profile;
     entry->valid = true;
     entry->smoothed = *smoothed;
     entry->last_used = ++cache->clock;
@@ -349,6 +356,23 @@ static void glyph_ink_row(const GlyphInk *ink, RasterTarget *target,
     }
 }
 
+/* Only real regular/bold/italic fallback faces have qualified ink profiles.
+   Synthetic styles and authored faces preserve their existing raster path. */
+static unsigned glyph_humanist_profile(const FontSet *fonts,
+                                       const FontFace *face,
+                                       FontFamily metric_family,
+                                       bool metric_bold, bool italic,
+                                       bool synthetic_bold,
+                                       bool synthetic_italic)
+{
+    if (metric_family != FONT_HUMANIST_SANS
+        || fonts == NULL || synthetic_bold || synthetic_italic) return 0;
+    const FontFace *qualified_face = metric_bold ? &fonts->sans_bold
+        : (italic ? &fonts->sans_italic : &fonts->sans);
+    if (face != qualified_face) return 0;
+    return metric_bold ? 2u : (italic ? 3u : 1u);
+}
+
 static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                     const DrawCommand *command)
 {
@@ -370,6 +394,10 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
     bool metric_bold = bold_face;
     FontFamily metric_family = font_context_metric_family(
         cache->layout->web_fonts, draw_command_font_family(command), face);
+    unsigned humanist_profile = glyph_humanist_profile(
+        cache->layout->fonts, face, metric_family, metric_bold,
+        draw_command_font_italic(command),
+        synthetic_bold, synthetic_italic);
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
@@ -465,7 +493,7 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                 used = at - sequence_start;
             }
         }
-        if (!provider_sequence)
+        if (bidi_command == NULL && !provider_sequence)
             used = font_utf8_next(command->text + character_at,
                                   command->text_length - character_at,
                                   &codepoint);
@@ -498,6 +526,7 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
         bool smoothed = false;
         const FontGlyph *glyph = glyph_cache_acquire(
             cache, face, codepoint, pixel_height_fixed, synthetic_bold,
+            humanist_profile,
             &temporary, &smoothed);
         if (glyph == NULL) break;
         int first_row = smoothed ? 0 : -1;

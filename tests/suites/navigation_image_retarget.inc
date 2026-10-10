@@ -168,6 +168,77 @@ static bool retarget_set_id(NavigationSession *navigation, const char *from,
    again. Showing the hidden one decodes it at its painted size, and pinning
    it for page script restores and keeps the full decode. Teardown leaves no
    bytes behind. */
+/* A cache hit owns a distinct lease even when another resource already
+   shows the same pixels. Plain in-table aliases do not own such a lease. */
+static bool test_retarget_releases_each_cached_pixel_lease(void)
+{
+    for (unsigned painted = 0; painted < 2; painted++) {
+        Budget budget;
+        budget_init(&budget, MIB);
+        ImageResources images = {.budget = &budget};
+        images.items = budget_calloc(&budget, 3, sizeof(*images.items));
+        images.capacity = images.count = images.items == NULL ? 0 : 3;
+        unsigned char *pixels = budget_malloc_category(
+            &budget, BUDGET_CATEGORY_RESOURCE, 24u * 24u * 4u);
+        unsigned char *encoded = budget_malloc(&budget, 1);
+        BrowserSharedBody *body = browser_shared_body_take(
+            &budget, pixels, 24u * 24u * 4u);
+        if (images.items == NULL || encoded == NULL || body == NULL) {
+            if (body != NULL) browser_shared_body_release(body);
+            else budget_free(&budget, pixels);
+            budget_free(&budget, encoded);
+            images_destroy(&images);
+            return false;
+        }
+        memset(pixels, 0x5a, 24u * 24u * 4u);
+        /* Two independently acquired cache leases plus an observer lease. */
+        browser_shared_body_retain(body);
+        browser_shared_body_retain(body);
+        for (size_t i = 0; i < 3; i++) {
+            images.items[i] = (ImageResource) {
+                .pixels = pixels, .pixel_body = body,
+                .width = 24, .height = 24,
+                .source_width = 24, .source_height = 24,
+                .encoded = encoded, .encoded_length = 1,
+                .owns_pixels = i != 1, .owns_encoded = i == 2
+            };
+        }
+        DrawCommand commands[2] = {
+            {.type = DRAW_IMAGE, .image = &images.items[0],
+             .width = 8, .height = 8,
+             .image_fit = LAYOUT_IMAGE_FIT_STRETCH},
+            {.type = DRAW_IMAGE, .image = &images.items[2],
+             .width = 8, .height = 8,
+             .image_fit = LAYOUT_IMAGE_FIT_STRETCH}
+        };
+        LayoutDocument layout = {
+            .commands = commands, .count = painted ? 2 : 0
+        };
+        bool changed = images_retarget_display_step(
+            &images, &layout, NULL, 1) == IMAGE_RETARGET_CHANGED;
+        bool leases_released = body->references == 1;
+        bool surface_matches = true;
+        for (size_t i = 0; i < 3; i++) {
+            surface_matches &= painted
+                ? images.items[i].pixels != NULL
+                    && images.items[i].width == 8
+                    && images.items[i].height == 8
+                    && images.items[i].pixels[0] == 0x5a
+                : images.items[i].pixels == NULL;
+        }
+        browser_shared_body_release(body);
+        images_destroy(&images);
+        if (!changed || !leases_released || !surface_matches
+            || budget.current != 0) {
+            fprintf(stderr, "retarget cached leases painted=%u changed=%d "
+                    "released=%d pixels=%d retained=%zu\n", painted,
+                    changed, leases_released, surface_matches, budget.current);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool test_display_retarget_follows_painted_size(void)
 {
     char *data_url = retarget_png_data_url(400, 200, 0);

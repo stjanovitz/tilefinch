@@ -126,6 +126,53 @@ static void psp_app_finish_focus_action(
     frame->defer_runtime = single_composition;
 }
 
+/* Focus events and :focus styling can run author code and rebuild the page.
+   Use the same owner-thread supervision as activation, not an uninterruptible
+   d-pad receiver. The pre-dispatch checkpoint publishes only retained geometry. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void psp_app_dispatch_focus_action(
+    PspApp *app, PspAppFrameState *frame, PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    bool supervise = !psp_navigation_cooperate_active()
+        && app->views->frame != NULL
+        && !app->process->presentation.ui.page_gamepad_capture;
+    if (supervise) {
+        psp_runtime_cooperate_begin(&app->process->presentation.ui,
+            app->views->frame, &app->interactive->toolbar_input);
+        psp_runtime_cooperate_serve_page_scroll(engine);
+    }
+    bool changed = false;
+    switch (intent->action) {
+        case PSP_UI_ACTION_FOCUS_PREVIOUS:
+        case PSP_UI_ACTION_FOCUS_NEXT:
+            changed = browser_engine_focus_move(
+                engine, intent->action == PSP_UI_ACTION_FOCUS_NEXT);
+            break;
+        case PSP_UI_ACTION_FOCUS_AT:
+            changed = browser_engine_focus_at(
+                engine, intent->pointer_x, intent->pointer_y);
+            break;
+        default: {
+            ControllerFocusDirection direction = CONTROLLER_FOCUS_DOWN;
+            if (intent->action == PSP_UI_ACTION_FOCUS_UP)
+                direction = CONTROLLER_FOCUS_UP;
+            else if (intent->action == PSP_UI_ACTION_FOCUS_LEFT)
+                direction = CONTROLLER_FOCUS_LEFT;
+            else if (intent->action == PSP_UI_ACTION_FOCUS_RIGHT)
+                direction = CONTROLLER_FOCUS_RIGHT;
+            changed = browser_engine_focus_direction(engine, direction);
+            break;
+        }
+    }
+    uint32_t observed_buttons = 0;
+    if (supervise && psp_runtime_cooperate_end(&observed_buttons))
+        app->interactive->previous_buttons = psp_ui_buttons(observed_buttons);
+    psp_app_finish_focus_action(app, frame, intent, changed);
+}
+
 typedef struct {
     TilefinchDiagnosticSource sources[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
     char paths[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT]
@@ -504,47 +551,13 @@ void psp_app_dispatch_action(
     }
     switch (intent->action) {
         case PSP_UI_ACTION_FOCUS_PREVIOUS:
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_move(app->browser->engine, false));
-            return;
         case PSP_UI_ACTION_FOCUS_NEXT:
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_move(app->browser->engine, true));
-            return;
         case PSP_UI_ACTION_FOCUS_AT:
-            /* The d-pad press that hides the cursor also chooses the focus
-               target, rather than jumping back to the previous one. */
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_at(
-                    app->browser->engine, intent->pointer_x,
-                    intent->pointer_y));
-            return;
         case PSP_UI_ACTION_FOCUS_UP:
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_direction(
-                    app->browser->engine, CONTROLLER_FOCUS_UP));
-            return;
         case PSP_UI_ACTION_FOCUS_DOWN:
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_direction(
-                    app->browser->engine, CONTROLLER_FOCUS_DOWN));
-            return;
         case PSP_UI_ACTION_FOCUS_LEFT:
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_direction(
-                    app->browser->engine, CONTROLLER_FOCUS_LEFT));
-            return;
         case PSP_UI_ACTION_FOCUS_RIGHT:
-            psp_app_finish_focus_action(
-                app, frame, intent,
-                browser_engine_focus_direction(
-                    app->browser->engine, CONTROLLER_FOCUS_RIGHT));
+            psp_app_dispatch_focus_action(app, frame, intent);
             return;
         case PSP_UI_ACTION_PAGE_UP:
         case PSP_UI_ACTION_PAGE_DOWN: {
@@ -2581,6 +2594,13 @@ recovery_reload: {
             break;
         case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT:
             psp_app_step_diagnostic_part(app, frame, 1);
+            break;
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE:
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS:
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW:
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER:
+            psp_app_youtube_login_action(app, frame, intent);
+            frame->page_dirty = true;
             break;
         case PSP_UI_ACTION_SHOW_SITE_STORAGE:
         case PSP_UI_ACTION_SITE_STORAGE_DELETE:

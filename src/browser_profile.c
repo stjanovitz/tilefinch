@@ -47,6 +47,7 @@ struct BrowserProfile {
     bool save_diagnostic_reports;
     bool wifi_diagnostics;
     bool youtube_topics;
+    uint8_t youtube_login_policy;
     /* Off by default: compiled scripts stay in RAM for the session. */
     bool keep_compiled_scripts;
     bool javascript_enabled;
@@ -740,6 +741,10 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
                      profile->wifi_diagnostics ? 1u : 0u) > 0;
     }
     if (ok) {
+        /* Append-only; Ask is the safe default for old profiles. */
+        ok = fprintf(file, "YTLOGIN\t%u\n", (unsigned) profile->youtube_login_policy) > 0;
+    }
+    if (ok) {
         /* Append-only and default-off, like DIAG. */
         ok = fprintf(file, "SCRIPTCACHE\t%u\n",
                      profile->keep_compiled_scripts ? 1u : 0u) > 0;
@@ -1139,6 +1144,9 @@ static bool profile_load_internal(
         } else if (strcmp(line, "DISCOVERY") == 0) {
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->youtube_topics = first[0] == '1';
+        } else if (strcmp(line, "YTLOGIN") == 0) {
+            if (strlen(first) == 1u && first[0] >= '0' && first[0] <= '2')
+                loaded->youtube_login_policy = (uint8_t) (first[0] - '0');
         } else if (strcmp(line, "WIFIDIAG") == 0) {
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->wifi_diagnostics = first[0] == '1';
@@ -1527,6 +1535,16 @@ bool browser_profile_wifi_diagnostics(const BrowserProfile *profile)
 bool browser_profile_youtube_topics(const BrowserProfile *profile)
 {
     return profile == NULL || profile->youtube_topics;
+}
+
+unsigned browser_profile_youtube_login_policy(const BrowserProfile *profile)
+{
+    return profile == NULL ? 0u : profile->youtube_login_policy;
+}
+
+void browser_profile_set_youtube_login_policy(BrowserProfile *profile, unsigned policy)
+{
+    if (profile != NULL && policy <= 2u) profile->youtube_login_policy = (uint8_t) policy;
 }
 
 void browser_profile_set_wifi_diagnostics(BrowserProfile *profile, bool enabled)

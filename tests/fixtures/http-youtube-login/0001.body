@@ -1,0 +1,1 @@
+<!doctype html><title>Full YouTube must not execute</title><script>throw new Error('full YouTube executed');</script><p>Unexpected website</p>

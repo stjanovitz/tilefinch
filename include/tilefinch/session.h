@@ -29,8 +29,8 @@
 #define BROWSER_OPFS_PATH_LIMIT 256
 #define BROWSER_OPFS_FILE_BYTE_LIMIT (64u * 1024u)
 #define BROWSER_OPFS_STICK_FILE_BYTE_LIMIT (512u * 1024u)
-#define BROWSER_COOKIE_ENTRIES 32
-#define BROWSER_COOKIE_PER_DOMAIN_LIMIT 8
+#define BROWSER_COOKIE_ENTRIES 64
+#define BROWSER_COOKIE_PER_DOMAIN_LIMIT 32
 #define BROWSER_COOKIE_LONG_PATH_LIMIT 2048
 #define BROWSER_COOKIE_LONG_PATH_BYTES (8u * 1024u)
 /* A large article page can cycle ~30 tiny mask/icon responses plus content
@@ -458,6 +458,24 @@ typedef struct {
     bool digest_ready;
 } BrowserScriptBytecodeKey;
 
+#ifndef __PSP__
+/* Opt-in host diagnostics. Counts only; never retain cookie names, values,
+   targets or credentials. Includes published jar operations, not speculative
+   request-private overlay operations. */
+typedef struct {
+    size_t http_attempts;
+    size_t script_attempts;
+    size_t refused;
+    size_t byte_refusals;
+    size_t slot_refusals;
+    size_t allocation_refusals;
+    size_t policy_ignored;
+    size_t evictions;
+    size_t peak_value_bytes;
+    bool enabled;
+} BrowserCookieDiagnostics;
+#endif
+
 typedef struct BrowserSession {
     Budget *budget;
     /* Non-owning engine-lifetime request policy. */
@@ -480,6 +498,9 @@ typedef struct BrowserSession {
     size_t cache_bytes;
     size_t maximum_cookie_bytes;
     size_t maximum_cookie_long_path_bytes;
+#ifndef __PSP__
+    BrowserCookieDiagnostics cookie_diagnostics;
+#endif
     size_t maximum_cache_bytes;
     size_t clock;
     size_t cookie_clock;
@@ -656,6 +677,10 @@ typedef struct {
 bool browser_session_site_data_usage(
     const BrowserSession *session, const char *url,
     BrowserSiteDataUsage *usage);
+#ifndef __PSP__
+void browser_session_cookie_diagnostics(BrowserSession *session, bool enable,
+                                        BrowserCookieDiagnostics *diagnostics);
+#endif
 bool browser_session_clear_site_data(
     BrowserSession *session, const char *url);
 bool browser_session_storage_key(
@@ -779,6 +804,11 @@ bool browser_session_cookie_import_redacted_seed(
     BrowserSession *session, const BrowserCookieSeedEntry *entries,
     size_t count);
 void browser_session_cookie_clear(BrowserSession *session);
+/* Remove cookies owned by this host and its subdomains, plus generated
+   provider documents/identity. RAM-only: leave unrelated cookies and storage
+   intact, and never perform persistent-cache maintenance. */
+bool browser_session_cookie_clear_domain(BrowserSession *session,
+                                         const char *url);
 BrowserCookieOverlay *browser_session_cookie_overlay_create(
     Budget *budget, const BrowserSession *source);
 bool browser_cookie_overlay_header_context(

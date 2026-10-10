@@ -113,6 +113,31 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                                          scale_q6);
         command->width = scale_dimension(command->width, scale_q6);
         command->height = scale_dimension(command->height, scale_q6);
+        if (command->type == DRAW_IMAGE
+            && command->image_fit >= LAYOUT_IMAGE_FIT_SPRITE
+            && command->image_fit <= LAYOUT_IMAGE_FIT_SPRITE_TILE_XY) {
+            /* CSS transforms scale the background's image grid as well as
+               its clipping box. Keeping authored tile sizes/offsets here
+               would change repetition and crop, not magnify the image.
+               Materialize natural sizing before scaling so nested
+               transforms also scale it exactly once per ancestor. */
+            int width = draw_command_image_sprite_width(command);
+            int height = draw_command_image_sprite_height(command);
+            if (width <= 0) width = image_resource_intrinsic_width(
+                command->image);
+            if (height <= 0) height = image_resource_intrinsic_height(
+                command->image);
+            if (width > 0 && height > 0) {
+                draw_command_set_image_sprite_size(
+                    command, scale_dimension(width, scale_q6),
+                    scale_dimension(height, scale_q6));
+            }
+            draw_command_set_image_offset(
+                command, scale_around_center(
+                    draw_command_image_offset_x(command), 0, scale_q6),
+                scale_around_center(
+                    draw_command_image_offset_y(command), 0, scale_q6));
+        }
         if (command->type != DRAW_TEXT && command->type != DRAW_IMAGE
             && command->type != DRAW_SHEARED_FILL) {
             command->radius = layout_scale_radius_code(
@@ -462,6 +487,7 @@ bool layout_insert_commands(LayoutContext *context, size_t index,
             layout->commands[index + i] =
                 layout_normalize_command(commands[i]);
         }
+        layout_bidi_insert_commands(context, index, count);
         for (size_t i = 0; i < layout->sticky_count; i++) {
             StickyRange *range = &layout->sticky_ranges[i];
             if (index <= range->command_start) range->command_start += count;

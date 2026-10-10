@@ -6,6 +6,99 @@
  * slot means rapid focus changes can only cancel or replace one operation.
  */
 #include "psp_app_internal.h"
+#include "tilefinch/youtube_lite.h"
+#include <time.h>
+
+void psp_app_youtube_login_boot(PspProcessResources *process, PspBrowserResources *browser)
+{
+    if (browser_profile_youtube_login_policy(browser->profile) == YOUTUBE_LOGIN_NEVER) {
+        (void) youtube_login_remove(process->storage.youtube_login);
+        return;
+    }
+    if (youtube_login_load(browser->session,
+            process->storage.youtube_login, (int64_t) time(NULL)))
+        browser->youtube_login_restored = youtube_lite_session_login_identity(browser->session);
+}
+
+bool psp_app_youtube_login_clear(PspApp *app)
+{
+    app->browser->youtube_login_pending = false;
+    app->browser->youtube_login_restored = false;
+    app->browser->youtube_login_verified = false;
+    return youtube_login_remove(app->process->storage.youtube_login);
+}
+
+static bool psp_app_youtube_login_save(PspApp *app)
+{
+    bool saved = app->process->persistent_site_data_available
+        && app->browser->youtube_login_verified
+        && youtube_lite_session_signed_in(app->browser->session)
+        && youtube_login_save(app->browser->session,
+            app->process->storage.youtube_login, (int64_t) time(NULL));
+    psp_ui_show_status(&app->process->presentation.ui,
+        saved ? "YOUTUBE LOGIN SAVED" : "LOGIN NOT SAVED - SESSION STILL WORKS", 240);
+    return saved;
+}
+
+bool psp_app_youtube_login_poll(PspApp *app)
+{
+    PspBrowserResources *browser = app->browser;
+    unsigned events = browser_engine_take_youtube_login_events(browser->engine);
+    bool changed = false;
+    if (events & BROWSER_YOUTUBE_LOGIN_SIGNED_OUT) {
+        bool removed = psp_app_youtube_login_clear(app);
+        if (!removed) psp_ui_show_status(&app->process->presentation.ui,
+            "SIGNED OUT - SAVED LOGIN COULD NOT BE REMOVED", 300);
+        changed = true;
+    }
+    if (events & BROWSER_YOUTUBE_LOGIN_VERIFIED) {
+        browser->youtube_login_verified = true;
+        if (browser->youtube_login_restored != youtube_lite_session_login_identity(browser->session)) {
+            unsigned policy = browser_profile_youtube_login_policy(browser->profile);
+            if (policy == YOUTUBE_LOGIN_ALWAYS) {
+                (void) psp_app_youtube_login_save(app); changed = true;
+            } else if (policy == YOUTUBE_LOGIN_ASK) browser->youtube_login_pending = true;
+        }
+        browser->youtube_login_restored = false;
+    }
+    PspUiState *ui = &app->process->presentation.ui;
+    /* Cookie inspection is bounded but is not work for every rendered frame. */
+    if (browser->youtube_login_pending && !youtube_lite_session_signed_in(browser->session)) {
+        browser->youtube_login_pending = false;
+        browser->youtube_login_verified = false;
+    }
+    if (browser->youtube_login_pending && ui->screen == PSP_UI_SCREEN_PAGE
+        && !browser_engine_navigation_pending(browser->engine)) {
+        browser->youtube_login_pending = false;
+        psp_ui_show_youtube_login_offer(ui);
+        changed = true;
+    }
+    return changed;
+}
+
+void psp_app_youtube_login_action(PspApp *app, PspAppFrameState *frame,
+                                const PspUiIntent *intent)
+{
+    unsigned policy = YOUTUBE_LOGIN_ASK;
+    bool save = false;
+    switch (intent->action) {
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE: save = true; break;
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS: policy = YOUTUBE_LOGIN_ALWAYS; save = true; break;
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER: policy = YOUTUBE_LOGIN_NEVER; break;
+        default: break;
+    }
+    bool saved = !save || psp_app_youtube_login_save(app);
+    /* Never remember an Always answer whose credential write failed. */
+    if (policy == YOUTUBE_LOGIN_ALWAYS && !saved)
+        policy = YOUTUBE_LOGIN_ASK;
+    if (policy == YOUTUBE_LOGIN_NEVER && !psp_app_youtube_login_clear(app))
+        psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
+    unsigned previous = browser_profile_youtube_login_policy(app->browser->profile);
+    browser_profile_set_youtube_login_policy(app->browser->profile, policy);
+    app->process->presentation.ui.youtube_login_policy = (uint8_t) policy;
+    if (previous != policy)
+        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+}
 
 static void psp_youtube_preresolve_increment(unsigned *counter)
 {

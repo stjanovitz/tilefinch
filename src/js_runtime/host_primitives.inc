@@ -486,12 +486,18 @@ static JSValue js_request_navigation(JSContext *context,
                  && (strncmp(url, "https://", 8) == 0
                      || strncmp(url, "http://", 7) == 0);
     if (!valid) {
+        if (bridge->host != NULL && bridge->host->xhr_diagnostics != NULL)
+            js_rt_saturating_add_size(
+                &bridge->host->xhr_diagnostics->navigation_refused, 1);
         JS_FreeCString(context, url);
         return JS_ThrowTypeError(context, "invalid navigation URL");
     }
     snprintf(bridge->navigation_url, sizeof(bridge->navigation_url), "%s",
              url);
     bridge->navigation_requested = true;
+    if (bridge->host != NULL && bridge->host->xhr_diagnostics != NULL)
+        js_rt_saturating_add_size(
+            &bridge->host->xhr_diagnostics->navigation_accepted, 1);
     bridge->navigation_replace = argc > 1
                                  && JS_ToBool(context, argv[1]) > 0;
     /* Snapshot at the request boundary. The host may not consume this until
@@ -689,9 +695,14 @@ static JSValue js_element_geometry(JSContext *context,
         && (bridge->layout == NULL
             || (bridge->relayout_dirty != NULL
                 && *bridge->relayout_dirty))) {
-        if (js_rt_bridge_flush_synchronous_layout(bridge)
-            && bridge->result != NULL) {
-            bridge->result->geometry_synchronous_layouts++;
+        if (js_rt_bridge_flush_synchronous_layout(bridge)) {
+            if (bridge->result != NULL)
+                bridge->result->geometry_synchronous_layouts++;
+            if (!js_rt_notify_style_flushed(context)) return JS_EXCEPTION;
+            /* A watcher may reach author-overridden script properties.
+               Re-resolve the handle after that JavaScript boundary. */
+            node = argc < 1 ? NULL
+                : js_rt_bridge_node_arg(context, bridge, argv[0]);
         }
     }
     const LayoutNodeBox *box = node == NULL || bridge->layout == NULL

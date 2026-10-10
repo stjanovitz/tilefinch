@@ -77,6 +77,8 @@ static void svg_free(void *pointer)
 #undef realloc
 #undef free
 
+#include "image_svg_viewport.inc"
+
 unsigned char *image_svg_decode_bounded(
     const void *data, size_t length, Budget *budget,
     size_t maximum_decoded_bytes, int *width, int *height,
@@ -107,7 +109,7 @@ unsigned char *image_svg_decode_bounded(
         source[length] = '\0';
     }
     NSVGimage *svg = source == NULL
-        ? NULL : nsvgParse(source, "px", 96.0f);
+        ? NULL : svg_parse_viewports(source, budget);
     budget_allocation_owner_leave(budget, previous_owner);
     unsigned char *pixels = NULL;
     int output_width = 0, output_height = 0;

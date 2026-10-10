@@ -402,6 +402,11 @@ static void navigation_stream_try_pre_eof_preview(
 {
     if (stream == NULL || stream->session == NULL || stream->parser == NULL)
         return;
+    /* A parser refusal retires optional work and invalidates its temporary
+       sheet. Keep any already-presented preview, but do not reconstruct and
+       fingerprint that sheet on every remaining body chunk. EOF still builds
+       the authoritative layout from the complete server document. */
+    if (stream->optional_work_shed) return;
     /* What arrived and where the reader is; the policy decides whether a
        layout is worth spending and how deep (preview_policy.h). */
     NavigationRetainedPreview *live = navigation_stream_live_preview(stream);

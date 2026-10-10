@@ -419,6 +419,9 @@ bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
 {
     if (runtime == NULL || url == NULL || url_size == 0
         || !runtime->bridge.navigation_requested) return false;
+    if (runtime->xhr_diagnostics != NULL)
+        js_rt_saturating_add_size(
+            &runtime->xhr_diagnostics->navigation_consumed, 1);
     snprintf(url, url_size, "%s", runtime->bridge.navigation_url);
     if (replace != NULL) *replace = runtime->bridge.navigation_replace;
     if (user_activated != NULL)
@@ -576,6 +579,12 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
                                int viewport_height)
 {
     if (runtime == NULL) return;
+    if (runtime->geometry_layout != NULL) {
+        layout_destroy(runtime->geometry_layout);
+        budget_free(runtime->budget, runtime->geometry_layout);
+        runtime->geometry_layout = NULL;
+        runtime->geometry_incumbent = NULL;
+    }
     runtime->bridge.layout = layout;
     runtime->bridge.viewport_height = viewport_height > 0
                                       ? viewport_height : 272;
@@ -587,6 +596,54 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
                                       intent->scroll_x, intent->scroll_y);
         }
     }
+}
+
+bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
+                                          const ViewportContext *viewport)
+{
+    if (runtime == NULL || viewport == NULL) return false;
+    DomBridge *bridge = &runtime->bridge;
+    if (bridge->document == NULL || bridge->stylesheet == NULL) return false;
+    uint64_t content = bridge->document->content_generation;
+    uint64_t style = document_style_generation();
+    uint64_t sheet = bridge->stylesheet->build_generation;
+    if (runtime->geometry_layout != NULL
+        && bridge->layout == runtime->geometry_layout
+        && runtime->geometry_content_generation == content
+        && runtime->geometry_style_generation == style
+        && runtime->geometry_sheet_generation == sheet) return true;
+    if (runtime->geometry_layout == NULL) {
+        runtime->geometry_layout = budget_calloc_category(
+            runtime->budget, BUDGET_CATEGORY_LAYOUT, 1,
+            sizeof(*runtime->geometry_layout));
+        if (runtime->geometry_layout == NULL) return false;
+        runtime->geometry_incumbent = bridge->layout;
+    } else {
+        /* The previous snapshot is no longer authoritative. Release it
+           before rebuilding rather than admitting two scratch layouts. */
+        bridge->layout = runtime->geometry_incumbent;
+        layout_destroy(runtime->geometry_layout);
+        memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
+    }
+    if (!layout_build_context(runtime->geometry_layout, runtime->budget,
+            bridge->document, bridge->stylesheet, bridge->fonts,
+            bridge->images, viewport)) {
+        layout_destroy(runtime->geometry_layout);
+        memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
+        return false;
+    }
+    runtime->geometry_content_generation = bridge->document->content_generation;
+    runtime->geometry_style_generation = document_style_generation();
+    runtime->geometry_sheet_generation = bridge->stylesheet->build_generation;
+    layout_transfer_scroll_state(runtime->geometry_incumbent,
+                                 runtime->geometry_layout);
+    for (size_t i = 0; i < bridge->scroll_intent_count; i++) {
+        ElementScrollIntent *intent = &bridge->scroll_intents[i];
+        (void) layout_scroll_node(runtime->geometry_layout, intent->node,
+                                  intent->scroll_x, intent->scroll_y);
+    }
+    bridge->layout = runtime->geometry_layout;
+    return true;
 }
 
 void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,

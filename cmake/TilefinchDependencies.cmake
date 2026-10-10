@@ -238,6 +238,8 @@ set(PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-fragment-clone-storage.patch")
 set(PSP_BROWSER_STB_JPEG_SCALE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-jpeg-scaled-idct.patch")
+set(PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-truetype-allocation-refusal.patch")
 set(PSP_BROWSER_WEBP_ALPHA_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/libwebp-v1.6.0-byte-alpha-history.patch")
 set(PSP_BROWSER_WEBP_ALPHA_FRAME_PATCH
@@ -268,6 +270,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
     "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
     "${PSP_BROWSER_STB_JPEG_SCALE_PATCH}"
+    "${PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH}"
     "${PSP_BROWSER_WEBP_ALPHA_PATCH}"
     "${PSP_BROWSER_WEBP_ALPHA_FRAME_PATCH}"
     "${PSP_BROWSER_NANOSVG_PATCH}"
@@ -1024,6 +1027,18 @@ execute_process(
     RESULT_VARIABLE stb_patch_result)
 if(NOT stb_patch_result EQUAL 0)
     message(FATAL_ERROR "Could not prepare the stb_image source")
+endif()
+# Trusted platform glyphs still use Budget and must recover from refusal.
+# Keep geometry assertions; fix only allocation NULL handling in raster stages.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        -DPATCH_SOURCE_DIR=${stb_SOURCE_DIR}
+        -DPATCH_FILE=${PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH}
+        -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
+        -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
+    RESULT_VARIABLE stb_truetype_patch_result)
+if(NOT stb_truetype_patch_result EQUAL 0)
+    message(FATAL_ERROR "Could not prepare the stb_truetype source")
 endif()
 
 if(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/dejavu-fonts/ttf/DejaVuSans.ttf")

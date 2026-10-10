@@ -1,0 +1,13 @@
+psp-http-trace=1
+method=GET
+url=https://accounts.google.com/tilefinch-test-signin
+success=1
+async-delay-pumps=3
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=143
+effective-url=https://www.youtube.com/
+content-type=text/html
+set-cookie-count=0

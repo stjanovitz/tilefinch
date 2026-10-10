@@ -322,6 +322,9 @@ typedef struct {
     bool deadline_exceeded;
     uint64_t elapsed_ms;
     size_t fetch_failures_http_4xx;
+    /* Last synchronous load declined a cooperation checkpoint. Kept across
+       rollback so navigation must not mistake cancellation for pressure. */
+    bool load_cancelled;
     size_t fetch_failures_http_5xx;
     size_t fetch_failures_timeout;
     size_t fetch_failures_cancelled;

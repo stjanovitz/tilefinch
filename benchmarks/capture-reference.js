@@ -18,6 +18,7 @@ const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const childProcess = require("node:child_process");
+const captureAudit = require("./reference-capture-audit.js");
 
 const TRACE_META = /^\d{4}\.meta$/;
 const SAFE_HEADER = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -150,6 +151,7 @@ function parseArguments(argv) {
     settleMs: 750,
     python: "python3",
     scriptFreeDiagnostic: false,
+    fullDocument: false,
   };
   const value = (option, index) => {
     if (index + 1 >= argv.length || argv[index + 1].startsWith("--")) {
@@ -161,6 +163,7 @@ function parseArguments(argv) {
     const option = argv[i];
     if (option === "--help" || option === "-h") result.help = true;
     else if (option === "--script-free-diagnostic") result.scriptFreeDiagnostic = true;
+    else if (option === "--full-document") result.fullDocument = true;
     else if (option === "--inspect-trace") result.inspectTrace = value(option, i++);
     else if (option === "--manifest") result.manifest = value(option, i++);
     else if (option === "--scenario") result.scenario = value(option, i++);
@@ -194,6 +197,7 @@ function usage() {
     "  node benchmarks/capture-reference.js --scenario NAME --trace-root DIR \\",
     "       --output-root DIR [--manifest FILE] [--browser chromium]",
     "       [--text-metrics-output FILE]",
+    "       [--full-document] (bounded lazy-resource sweep and five verified views)",
     "       [--script-free-diagnostic] (resource discovery only; never a qualified reference)",
     "",
     "Capture mode requires the Playwright package and a selected browser binary.",
@@ -2249,7 +2253,7 @@ function createRequestDiagnostics(hardLimit = Number.POSITIVE_INFINITY) {
   };
 }
 
-function buildReadOnlyAcquisitionPlan(summary) {
+function buildReadOnlyAcquisitionPlan(summary, origins = null) {
   const requests = new Map();
   let unplannable = summary.truncated;
   for (const entry of summary.entries) {
@@ -2275,12 +2279,24 @@ function buildReadOnlyAcquisitionPlan(summary) {
   const ordered = [...requests.values()].sort((left, right) =>
     compareCodeUnitStrings(left.method, right.method)
       || compareCodeUnitStrings(left.url, right.url));
+  const originAware = origins !== null && origins.entries.some((entry) => entry.request_origin !== "");
+  const originRows = new Map((origins === null ? [] : origins.entries)
+    .map((entry) => [`${entry.method}\0${entry.url}`, entry.request_origin]));
+  if (origins !== null && (origins.overflow || origins.conflicts)) unplannable += 1;
+  if (originAware) for (const entry of ordered) {
+    const origin = originRows.get(`${entry.method}\0${entry.url}`);
+    let valid = origin === "";
+    try { valid ||= origin.startsWith("https://") && new URL(origin).origin === origin; }
+    catch (_) {}
+    if (!valid) unplannable += 1;
+  }
   return {
-    mode: "exact-get-head-plan-v1", complete: unplannable === 0,
+    mode: originAware ? "exact-get-head-plan-v2" : "exact-get-head-plan-v1", complete: unplannable === 0,
     request_count: ordered.length, unplannable,
     requests: ordered.map((entry) => ({
       method: entry.method, url: entry.url, url_sha256: entry.url_sha256,
       resource_types: [...entry.resource_types].sort(), occurrences: entry.occurrences,
+      ...(originAware ? { request_origin: originRows.get(`${entry.method}\0${entry.url}`) } : {}),
     })),
   };
 }
@@ -2961,7 +2977,8 @@ function createResponseScheduler(configuration = {}) {
           "exact-route-key,global-route-occurrence,resource-type,playwright-callback-ordinal",
         admission_probe: "bounded-playwright-context-roundtrip-quiescence",
         order_digest_version: "exact-request-identity-v3",
-        browser_ordinal_semantics: "raw-playwright-route-callback-v1",
+        browser_ordinal_semantics: options.browserOrdinalSemantics
+          || "raw-playwright-route-callback-v1",
         request_limit: limit,
         retained_delay_limit_pumps: MAX_RETAINED_DELAY_PUMPS,
         semantic_pump_limit: maxPumps,
@@ -3469,6 +3486,7 @@ function loadRecord(metaPath) {
     success: metadata.success === "1", status, contentType,
     headers, body, cookies, responseDateSeconds, asyncDelayPumps,
     externalCancel, transportTimeout, cacheMode, signature,
+    userAgent: metadata["request-user-agent"],
   };
 }
 
@@ -4368,6 +4386,7 @@ async function captureReference(options) {
     throw new CaptureError(`trace digest mismatch: manifest=${scenario.digest} actual=${trace.digest}`);
   }
   const environment = replayEnvironment(trace);
+  const documentUserAgent = captureAudit.retainedUserAgent(trace.records, scenario.url);
   const outputRoot = path.resolve(options.outputRoot);
   fs.mkdirSync(outputRoot, { recursive: true });
   const outputDirectory = path.join(outputRoot, scenario.name);
@@ -4401,7 +4420,13 @@ async function captureReference(options) {
       "--disable-domain-reliability", "--disable-sync",
       "--host-resolver-rules=MAP * ~NOTFOUND", "--metrics-recording-only",
       "--no-default-browser-check", "--no-first-run",
+      "--site-per-process",
     ];
+  }
+  {
+    /* A missed target interception must fail offline, including literal-IP
+       URLs which the DNS guard alone cannot contain. No live proxy is used. */
+    launch.args.push("--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>");
   }
   if (options.executable) launch.executablePath = options.executable;
   launch.args.push("--disable-quic");
@@ -4428,6 +4453,7 @@ async function captureReference(options) {
   try {
   browser = await launchBrowser(browserType, launch, hostOperations);
   context = await runHost("browser-context-create", () => browser.newContext({
+      userAgent: documentUserAgent,
       viewport: { width: scenario.cssWidth, height: scenario.cssHeight },
       screen: { width: scenario.cssWidth, height: scenario.cssHeight },
       deviceScaleFactor: scenario.scaleNumerator / scenario.scaleDenominator,
@@ -4472,7 +4498,14 @@ async function captureReference(options) {
   const blockedDiagnostics = createRequestDiagnostics(MAX_POLICY_DENIALS);
   let preflightPolicyDenials = 0;
   const activity = { value: 0 };
+  const requestAudit = captureAudit.createRequestAudit();
+  const originEvidence = captureAudit.createOriginEvidence();
+  let interceptedHttpRequests = 0;
+  context.on("request", (request) => requestAudit.begin(request));
+  context.on("requestfinished", (request) => requestAudit.end(request));
+  context.on("requestfailed", (request) => requestAudit.end(request, true));
   responseScheduler = createResponseScheduler({
+    browserOrdinalSemantics: "raw-chromium-fetch-callback-v1",
     /* BrowserContext.cookies() is a read-only round trip on the same
        Playwright connection that dispatches BrowserContext route callbacks.
        Two unchanged probes form a bounded candidate admission generation;
@@ -4554,6 +4587,7 @@ async function captureReference(options) {
       }
       return;
     }
+    interceptedHttpRequests += 1;
 
     if (scenario.blockedOrigins.length > 0) {
       if (blockedUrlMatches(requestUrl, scenario.blockedOrigins)) {
@@ -4631,6 +4665,7 @@ async function captureReference(options) {
       } else {
         const selected = trace.routes.get(routeKey);
         if (!selected) {
+          originEvidence.record(requestMethod, normalized, request.headers().origin);
           await terminalAdmission(
             "unmatched", "unmatched", normalized,
             "unmatched-route-abort", "unmatched",
@@ -4734,14 +4769,14 @@ async function captureReference(options) {
       activity.value += 1;
     }
   };
-  await context.route("**/*", (route) => {
+  const dispatchRoute = (route) => {
     /* Playwright invokes the user route callback synchronously before its
        first await. Capture phase and Playwright-channel ordinal at that boundary
        so host promise scheduling cannot move a request between generations. */
     const phase = routeLifecycle.phase;
     const browserOrdinal = routeLifecycle.nextBrowserOrdinal++;
     return trackRouteHandler(handleRoute(route, phase, browserOrdinal));
-  });
+  };
   const recordCapability = (kind, value) => {
     if (routeLifecycle.phase !== "OPEN") {
       routeLifecycle.lateBindingCallbacks += 1;
@@ -4789,6 +4824,16 @@ async function captureReference(options) {
   });
   await context.addInitScript(installOfflineProtocolPolicy);
   const page = await context.newPage();
+  let targetInterception;
+  let pageSession;
+  {
+    const session = await runHost("redirect-interception-session", () => context.newCDPSession(page));
+    pageSession = session;
+    targetInterception = await captureAudit.installInterception(session, (target, event) => {
+      dispatchRoute(captureAudit.cdpRoute(target, event,
+        (method, url) => requestAudit.expectFailure(method, url)));
+    }, runHost, trackRouteHandler, (error) => hostOperations.failTerminal(error, "frame target setup"));
+  }
   /* Diagnostic evidence only: surface page-side failures (script errors,
      failed dynamic imports) in the reference state so stalled SPA
      captures are debuggable.  Bounded; never affects eligibility. */
@@ -4835,6 +4880,111 @@ async function captureReference(options) {
     );
   } catch (error) { failure = `navigation:${error.message}`; }
 
+  const fullDocument = { version: "bounded-viewport-sweep-v2", requested: options.fullDocument,
+    steps: 0, clock_ticks: 0, complete: !options.fullDocument, viewports: [],
+    viewport_css: { width: scenario.cssWidth, height: scenario.cssHeight },
+    full_screenshot: false, full_screenshot_status: "omitted-mobile-emulation" };
+  const inputProfile = () => page.evaluate(() => ({
+    coarse: matchMedia("(pointer:coarse)").matches, touch: navigator.maxTouchPoints,
+    width: innerWidth, height: innerHeight,
+  }));
+  if (!failure && options.fullDocument) {
+    try {
+      let requested = 0;
+      for (let step = 0; step < 256; step += 1) {
+        await runHost("document-sweep-position", () => page.evaluate((y) => {
+          scrollTo({ top: y, behavior: "instant" });
+        }, requested));
+        await runScenarioClock(context, responseScheduler, 1, scenario.tickMs, hostOperations);
+        fullDocument.clock_ticks += 1;
+        await runHost("document-sweep-settle", () => responseScheduler.driveUntilSettled(
+          settleCapture(page, Math.min(options.settleMs, 100), () => ledger.active === 0),
+          "document-sweep",
+        ));
+        const position = await runHost("document-sweep-extent", () => page.evaluate(() => {
+          const root = document.scrollingElement || document.documentElement;
+          return { y: scrollY, maximum: Math.max(0, root.scrollHeight - innerHeight), height: innerHeight };
+        }));
+        fullDocument.steps += 1;
+        if (position.y >= position.maximum - 2) { fullDocument.complete = true; break; }
+        requested = Math.min(position.maximum, position.y + Math.max(1, position.height - 32));
+      }
+      if (!fullDocument.complete) throw new CaptureError("full-document scroll exceeded 256 steps");
+      fullDocument.geometry_attempts = [];
+      for (let geometryAttempt = 0; geometryAttempt < 2; geometryAttempt += 1) {
+      fullDocument.viewports = [];
+      for (const fraction of [0, .25, .5, .75, 1]) {
+        const requested = await runHost("document-view-position", () => page.evaluate((fraction) => {
+          const root = document.scrollingElement || document.documentElement;
+          const y = Math.floor(Math.max(0, root.scrollHeight - innerHeight) * fraction);
+          scrollTo({ top: y, behavior: "instant" }); return y;
+        }, fraction));
+        await runHost("document-view-settle", () => responseScheduler.driveUntilSettled(
+          settleCapture(page, options.settleMs, () => ledger.active === 0), "document-view",
+        ));
+        const evidence = await captureAudit.collectVisualEvidence(page, { fullDocument: true }, runHost);
+        if (Math.abs(evidence.scroll_y - requested) > 2) {
+          throw new CaptureError("full-document viewport shifted during settling");
+        }
+        const name = `view-${Math.round(fraction * 100)}.png`;
+        const raw = path.join(outputDirectory, `raw-${name}`);
+        const profileBefore = await runHost("document-view-input-before", inputProfile);
+        await runHost("document-view-screenshot", () => responseScheduler.driveUntilSettled(
+          page.screenshot({ path: raw, animations: "disabled", caret: "hide" }),
+          "document-view-screenshot",
+        ));
+        await runHost("document-view-normalize", () => normalizePng(
+          raw, path.join(outputDirectory, name), scenario, options.python, options.timeoutMs,
+        ));
+        const after = await captureAudit.collectVisualEvidence(page, { fullDocument: true }, runHost);
+        const profileAfter = await runHost("document-view-input-after", inputProfile);
+        for (const profile of [profileBefore, profileAfter]) {
+          if (!profile.coarse || profile.touch !== 1
+              || profile.width !== scenario.cssWidth || profile.height !== scenario.cssHeight) {
+            throw new CaptureError("document viewport input profile changed during screenshot: "
+              + JSON.stringify({ before: profileBefore, after: profileAfter }));
+          }
+        }
+        if (after.scroll_y !== evidence.scroll_y || after.maximum !== evidence.maximum) {
+          throw new CaptureError("full-document viewport changed during screenshot");
+        }
+        fullDocument.viewports.push({ fraction, requested, frame: name, ...after,
+          input_profile: { before: profileBefore, after: profileAfter } });
+      }
+      const extent = fullDocument.viewports.at(-1);
+      const pixelScale = scenario.scaleNumerator / scenario.scaleDenominator;
+      if (extent.document_width * pixelScale > 2048 || extent.document_height * pixelScale > 61440) {
+        throw new CaptureError("full-document screenshot exceeds bounded dimensions");
+      }
+      /* Full-page Chromium capture changes touch emulation while painting.
+         Enlarging its surface instead changes viewport units or omits
+         offscreen content. Keep accurate viewport screenshots; never label
+         a stitched scroll sequence as a coherent full-page image. */
+      const finalExtent = await captureAudit.collectVisualEvidence(page, { fullDocument: true }, runHost);
+      fullDocument.final_extent = { width: finalExtent.document_width, height: finalExtent.document_height,
+        maximum: finalExtent.maximum, incomplete: finalExtent.incomplete, ready: finalExtent.ready };
+      if (!finalExtent.ready) throw new CaptureError("full-document paintable images remain incomplete");
+      const mixedGeometry = fullDocument.viewports.some((view) =>
+        view.document_width !== extent.document_width || view.document_height !== extent.document_height
+        || view.maximum !== extent.maximum);
+      if (mixedGeometry || finalExtent.document_width !== extent.document_width
+          || finalExtent.document_height !== extent.document_height
+          || finalExtent.maximum !== extent.maximum) {
+        const archived = `geometry-attempt-${geometryAttempt + 1}`;
+        fs.mkdirSync(path.join(outputDirectory, archived));
+        for (const name of fullDocument.viewports.map((view) => view.frame)) {
+          fs.renameSync(path.join(outputDirectory, name), path.join(outputDirectory, archived, name));
+        }
+        fullDocument.geometry_attempts.push({ directory: archived,
+          views: fullDocument.viewports, final_extent: fullDocument.final_extent });
+        if (geometryAttempt === 0) continue;
+        throw new CaptureError("full-document contents changed during screenshot");
+      }
+      break;
+      }
+      await runHost("document-reset-scroll", () => page.evaluate(() => scrollTo({ top: 0, behavior: "instant" })));
+    } catch (error) { failure = `full-document:${error.message}`; }
+  }
   const checkpointStates = [];
   if (!failure) {
     for (const [index, checkpoint] of scenario.checkpoints.entries()) {
@@ -4871,6 +5021,7 @@ async function captureReference(options) {
           name: checkpoint.name, kind: checkpoint.kind, target: checkpoint.target,
           scroll_y: scrollY, frame: filename, format: "png-rgb8",
           width: scenario.deviceWidth, height: scenario.deviceHeight,
+          visual_evidence: await captureAudit.collectVisualEvidence(page, { fullDocument: false }, runHost),
         });
       } catch (error) { failure = `checkpoint:${checkpoint.name}:${error.message}`; break; }
     }
@@ -4940,6 +5091,10 @@ async function captureReference(options) {
   const teardownBaseline = teardownEvidenceSnapshot(
     ledger, responseScheduler, activity, routeLifecycle,
   );
+  /* A close-aborted request is not completed capture work. Preserve the
+     independent network audit at the frozen publication boundary. */
+  const browserRequestAudit = requestAudit.summary(interceptedHttpRequests);
+  const targetInterceptionEvidence = targetInterception.summary();
   const teardownChanges = [];
   let teardownReady = false;
   let contextCloseSucceeded = false;
@@ -5018,7 +5173,8 @@ async function captureReference(options) {
   const capabilitySummary = capabilityDiagnostics.summary();
   const blockedSummary = blockedDiagnostics.summary();
   const schedulerSummary = responseScheduler.summary();
-  const acquisitionPlan = buildReadOnlyAcquisitionPlan(unexpectedSummary);
+  const browserRequestOrigins = originEvidence.summary();
+  const acquisitionPlan = buildReadOnlyAcquisitionPlan(unexpectedSummary, browserRequestOrigins);
   const scripts = ledger.served_resource_types.script || 0;
   const resources = {
     ready: false,
@@ -5039,7 +5195,7 @@ async function captureReference(options) {
     && ledger.matched === ledger.served + ledger.rejected
     && ledger.unmatched === 0 && ledger.conflicts === 0 && ledger.invalid === 0
     && ledger.served > 0;
-  const expectedVirtualMs = scenario.ticks * scenario.tickMs;
+  const expectedVirtualMs = (scenario.ticks + fullDocument.clock_ticks) * scenario.tickMs;
   const clockEvidence = pageState.clockEvidence;
   const environmentReady = pageState.replayEnvironment === REPLAY_ENVIRONMENT_VERSION
     && pageState.replayClock === REPLAY_CLOCK_CONTRACT
@@ -5103,10 +5259,16 @@ async function captureReference(options) {
     || (navigatedUrl === scenario.url && documentRequests <= 1
         && captureUrlSameOrigin);
   const navigationReady = navigationStatus === scenario.expectedHttp;
+  const visualReady = checkpointStates.every((checkpoint) => checkpoint.visual_evidence.ready)
+    && (!options.fullDocument || fullDocument.complete
+      && fullDocument.viewports.length === 5 && fullDocument.viewports.every((view) => view.ready));
   const eligibilityReasons = [
     ...(options.scriptFreeDiagnostic ? ["reference-script-free-diagnostic"] : []),
     ...(failure ? [failure] : []),
     ...(cleanLedger ? [] : ["reference-replay-ledger-unhealthy"]),
+    ...(browserRequestAudit.ready ? [] : ["reference-browser-request-audit-unhealthy"]),
+    ...(targetInterceptionEvidence.ready ? [] : ["reference-frame-target-interception-unhealthy"]),
+    ...(visualReady ? [] : ["reference-paintable-images-incomplete"]),
     ...(environmentReady ? [] : ["reference-replay-environment-missing"]),
     ...(readOnlyPolicyReady ? [] : ["reference-read-only-policy-unhealthy"]),
     ...(capabilityPolicyReady ? [] : ["reference-capability-policy-unhealthy"]),
@@ -5164,6 +5326,8 @@ async function captureReference(options) {
     schema: 2, scenario: scenario.name, trace_sha256: scenario.digest,
     url: scenario.url, capture_url: captureUrl,
     capture_transport: "cdp-response-keyed",
+    capture_scope: options.fullDocument ? "viewport-sweep-diagnostic-v2" : "manifest-checkpoints-v1",
+    target_interception: targetInterceptionEvidence,
     http_status: navigationStatus,
     title: pageState.title,
     state_markers: pageState.requiredMarker ? [scenario.requiredMarker] : [],
@@ -5233,19 +5397,53 @@ async function captureReference(options) {
       teardown_changes: teardownChanges,
     },
     acquisition_plan: acquisitionPlan,
+    browser_request_audit: browserRequestAudit,
+    browser_request_origins: browserRequestOrigins,
+    full_document: fullDocument,
     page_errors: pageErrors,
     browser: { engine: options.browser, version: browserVersion, user_agent: pageState.userAgent,
-      platform: pageState.platform, locale: "en-US", timezone: "UTC" },
+      platform: pageState.platform, locale: "en-US", timezone: "UTC",
+      ...(documentUserAgent === undefined ? {} : {
+        user_agent_source: "retained-document-request-v1",
+        user_agent_sha256: crypto.createHash("sha256").update(documentUserAgent).digest("hex"),
+      }) },
     checkpoints: checkpointStates,
     capture_ready: ready,
     failure,
     eligibility_reasons: eligibilityReasons,
   };
+  /* Keep the frozen canonical schema-2 oracle intact. Rich capture diagnostics
+     live in a companion artifact; a full-document run is explicitly outside
+     the original-tick oracle and retains its diagnostic scope in the state. */
+  const auditState = {
+    version: "reference-capture-audit-v1", capture_scope: state.capture_scope,
+    target_interception: state.target_interception,
+    browser_request_audit: state.browser_request_audit,
+    browser_request_origins: state.browser_request_origins,
+    full_document: state.full_document, page_errors: state.page_errors,
+    observed_viewport: state.viewport.observed,
+    blocked_requests: { total: persistedLedger.blocked, origins: persistedLedger.blocked_origins,
+      diagnostics: persistedLedger.blocked_requests },
+    checkpoints: checkpointStates.map((checkpoint) => ({ name: checkpoint.name,
+      visual_evidence: checkpoint.visual_evidence })),
+  };
+  if (!options.fullDocument && ready) {
+    for (const key of ["capture_scope", "target_interception", "browser_request_audit",
+      "browser_request_origins", "full_document", "page_errors"]) delete state[key];
+    state.checkpoints = checkpointStates.map(({ visual_evidence, ...checkpoint }) => checkpoint);
+    for (const key of ["blocked", "blocked_origins", "blocked_requests"]) delete state.replay_ledger[key];
+    delete state.viewport.observed;
+  }
   const stateName = ready ? "reference-state.json" : "reference-diagnostic.json";
   const statePath = path.join(outputDirectory, stateName);
   const temporaryState = path.join(outputDirectory, `.${stateName}.${process.pid}.tmp`);
   fs.writeFileSync(temporaryState, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   fs.renameSync(temporaryState, statePath);
+  auditState.state_sha256 = crypto.createHash("sha256").update(fs.readFileSync(statePath)).digest("hex");
+  const auditPath = path.join(outputDirectory, "capture-audit.json");
+  const temporaryAudit = `${auditPath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryAudit, `${JSON.stringify(auditState, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporaryAudit, auditPath);
   if (ready && textMetricsPath !== null && textMetrics !== null) {
     fs.mkdirSync(path.dirname(textMetricsPath), { recursive: true });
     const temporaryMetrics = `${textMetricsPath}.${process.pid}.tmp`;
@@ -5293,6 +5491,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  captureReference,
   CaptureError, applyResponseCookies, buildReadOnlyAcquisitionPlan, compactRanges,
   blockedUrlMatches, boundedDrainRouteHandlers,
   claimRouteRecord, cookieReplayOperation, createRequestDiagnostics,

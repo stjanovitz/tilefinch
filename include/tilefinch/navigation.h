@@ -539,6 +539,8 @@ typedef struct {
     uint64_t blocking_stylesheet_continuation_append_us;
     uint64_t blocking_stylesheet_fingerprint_us;
     size_t mutation_fast_relayouts;
+    size_t mutation_layout_pressure_retries;
+    size_t mutation_layout_pressure_recoveries;
     size_t mutation_resource_rebuilds;
     /* Inserted <style> elements appended to the page sheet in place instead
        of rebuilding it, and attempts that had to fall back. */
@@ -729,6 +731,7 @@ struct NavigationSession {
        committed layout, which stays intact until the build ends: a frontend
        may page through it at the build's checkpoints. */
     bool committed_layout_servable;
+    bool committed_scroll_reflection_pending;
     /* In-place relayouts whose last complete layout took at least this long
        publish the visible screens first (UINT64_MAX: never). */
     uint64_t relayout_preview_threshold_us;
@@ -1260,6 +1263,8 @@ NavigationLoad *navigation_load_begin_sectioned(
 NavigationLoadStatus navigation_load_pump(
     NavigationLoad *load, const NavigationLoadQuota *quota);
 NavigationLoadStatus navigation_load_status(const NavigationLoad *load);
+/* Headers were accepted but no service HTML was parsed or executed. */
+const char *navigation_load_adapter_redirect(const NavigationLoad *load);
 bool navigation_load_metrics(const NavigationLoad *load,
                              NavigationLoadMetrics *metrics);
 /* With a non-NULL quota, advances exactly one transactional finalization

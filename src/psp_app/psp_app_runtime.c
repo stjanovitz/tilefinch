@@ -3937,6 +3937,52 @@ bool psp_platform_cooperate(
         if (sceKernelGetThreadId() != atomic_load_explicit(
                 &psp_runtime_cooperate.owner_thread, memory_order_relaxed))
             return true;
+        if (phase != NULL && strcmp(phase, "page-focus-feedback") == 0) {
+            BrowserEngine *engine = psp_runtime_cooperate.engine;
+            PspUiState *ui = psp_runtime_cooperate.ui;
+            if (engine != NULL && ui != NULL
+                && __sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u)) {
+                __sync_synchronize();
+                /* Use the supervisor's latest menu/cursor state and its
+                   presentation fence, not a second concurrent VRAM writer.
+                   Updating only focus preserves any priority input already
+                   acknowledged while the owner was selecting the target. */
+                PspUiState *shown_ui = &cooperate->supervisor_ui;
+                BrowserFrontendSnapshot snapshot = {0};
+                bool sampled = cooperate->active != 0
+                    && shown_ui->screen == PSP_UI_SCREEN_PAGE
+                    && !shown_ui->cursor_visible
+                    && browser_engine_frontend_snapshot(engine, &snapshot);
+                const NavigationSession *nav = sampled ? snapshot.navigation : NULL;
+                const NavigationEntry *entry = nav == NULL ? NULL : navigation_current(nav);
+                int x = 0, y = 0, width = 0, height = 0;
+                if (entry != NULL && browser_engine_focus_indicator_rect(
+                        engine, &x, &y, &width, &height)) {
+                    y -= entry->scroll_y;
+                    /* The incumbent pixels haven't scrolled yet. An offscreen
+                       target is published by the normal reveal/render path. */
+                    if (y >= 0 && (int64_t) y + height <= nav->viewport.css_height) {
+                        psp_ui_set_focus(shown_ui, true,
+                            viewport_css_to_device(&nav->viewport, x),
+                            viewport_css_to_device(&nav->viewport, y),
+                            viewport_css_to_device(&nav->viewport, width),
+                            viewport_css_to_device(&nav->viewport, height));
+                        psp_ui_set_focus(ui, true, shown_ui->focus_x, shown_ui->focus_y,
+                            shown_ui->focus_width, shown_ui->focus_height);
+                        if (psp_present_internal(psp_supervisor_page_frame(cooperate),
+                                                shown_ui, false)) {
+                            uint64_t now_us = sceKernelGetSystemTimeWide();
+                            cooperate->last_present_us = now_us;
+                            cooperate->owner_present_us = now_us;
+                            cooperate->presentations++;
+                        }
+                    }
+                }
+                __sync_synchronize();
+                cooperate->presenting = 0;
+            }
+            return !psp_home_exit_pending();
+        }
         /* Optional work that holds no author state (a font batch, the rest
            of a provisional layout) yields to page input and reruns; see
            psp_input_route() for the extension a reader waits on. */

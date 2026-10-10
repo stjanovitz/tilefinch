@@ -11,6 +11,7 @@
 #include "tilefinch/user_agent.h"
 #include "../src/image_decode_internal.h"
 #include "../src/image_svg_decode_internal.h"
+#include "../src/layout_internal.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch_test_clocks.h"
 
@@ -31,6 +32,7 @@
 #define MIB (1024u * 1024u)
 
 static lxb_dom_node_t *test_find_id(lxb_dom_node_t *node, const char *id);
+static bool test_resumable_initial_layout_pressure(void);
 /* Private deterministic seam implemented by navigation.c for this test
    executable; zero restores the production realm source-policy bound. */
 void navigation_test_set_parser_script_stage_work_limit(size_t limit);
@@ -792,6 +794,440 @@ static bool test_background_images_continue_after_useful_paint(void)
         && budget_categories_reconcile(&budget);
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+static bool cancel_optional_image_work(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    bool *cancelled = opaque;
+    if (phase != NULL && strncmp(phase, "image-", 6) == 0) {
+        *cancelled = true;
+        return false;
+    }
+    return true;
+}
+
+static bool test_optional_initial_image_refusal_case(bool cancel, bool priority)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && background_image_continuation_replay_begin();
+    bool cancelled = false;
+    TilefinchPlatformServices services = {
+        .context = &cancelled, .cooperate = cancel_optional_image_work
+    };
+    if (ready) {
+        navigation_enable_external_resources(&navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        (void) setenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW", "1", 1);
+        tilefinch_test_faults()->refuse_next_image_load_setup = !cancel;
+        if (cancel) tilefinch_platform_set_services(&services);
+    }
+    static const char text_only[] = "<h1>Useful document</h1><p>Keep this page when optional images are refused.</p>";
+    bool loaded = ready && (priority
+        ? navigation_load_url(&navigation, navigation_begin(&navigation),
+            "https://background-images.test/document", 4096, 1000, 480, NULL, NULL, true)
+        : navigation_commit_html(&navigation, navigation_begin(&navigation),
+            "https://background-images.test/text", text_only, strlen(text_only),
+            480, NULL, NULL, true));
+    tilefinch_platform_set_services(NULL);
+    tilefinch_test_faults()->refuse_next_image_load_setup = false;
+    bool ok = cancel ? !loaded && cancelled
+        : loaded && navigation.page.loaded && navigation.page.document.html != NULL
+            && navigation.page.images.count == 0
+            && navigation.performance.image_pressure_fallbacks == 1
+            && !navigation.page.image_continuation_pending;
+    (void) unsetenv("TILEFINCH_DISABLE_BOUNDED_LAYOUT_PREVIEW");
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_optional_initial_image_refusal_retains_page(void)
+{
+    return test_optional_initial_image_refusal_case(false, true)
+        && test_optional_initial_image_refusal_case(false, false)
+        && test_optional_initial_image_refusal_case(true, true);
+}
+
+typedef struct {
+    Budget *budget;
+    unsigned mode;
+    bool clamped;
+    bool cancelled;
+    bool resumable;
+} InitialLayoutPressure;
+
+static bool clamp_initial_layout_budget(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    InitialLayoutPressure *pressure = opaque;
+    if (!pressure->clamped && phase != NULL
+        && strcmp(phase, "navigation-images") == 0) {
+        pressure->clamped = true;
+        if (pressure->mode == 0) {
+            /* Refuse the context while author rules are retained, but leave
+               enough room after dropping that optional sheet. */
+            size_t room = sizeof(LayoutContext) > 32u * 1024u
+                ? sizeof(LayoutContext) - 32u * 1024u : 1u;
+            pressure->budget->limit = pressure->budget->current + room;
+        } else if (pressure->mode == 1) {
+            if (pressure->resumable)
+                tilefinch_test_faults()->refuse_next_layout_context = true;
+            else budget_inject_failure_after(pressure->budget, 0);
+        } else if (pressure->mode == 3) {
+            /* Dropping all optional CSS still cannot admit the context. */
+            pressure->budget->limit = pressure->budget->current + 1;
+        }
+    }
+    if (pressure->clamped && pressure->mode == 2 && phase != NULL
+        && strncmp(phase, "layout", 6) == 0) {
+        pressure->cancelled = true;
+        return false;
+    }
+    return true;
+}
+
+static bool test_initial_layout_pressure_case(unsigned mode)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    char *html = malloc(256u * 1024u);
+    size_t length = 0;
+    if (html != NULL) {
+        length += (size_t) sprintf(html + length, "<style>");
+        for (unsigned i = 0; i < 1800; i++)
+            length += (size_t) sprintf(html + length,
+                ".optional-%u{color:#234567;background-color:#abcdef}", i);
+        length += (size_t) sprintf(html + length, "</style><body class='");
+        for (unsigned i = 0; i < 1800; i++)
+            length += (size_t) sprintf(html + length, "optional-%u ", i);
+        length += (size_t) sprintf(html + length,
+            "'><h1>Useful document</h1><button>Continue</button>");
+    }
+    InitialLayoutPressure pressure = {.budget = &budget, .mode = mode};
+    TilefinchPlatformServices services = {
+        .context = &pressure, .cooperate = clamp_initial_layout_budget
+    };
+    if (ready && html != NULL) tilefinch_platform_set_services(&services);
+    bool loaded = ready && html != NULL && navigation_commit_html(
+        &navigation, navigation_begin(&navigation), "https://style-pressure.test/",
+        html, length, 480, NULL, NULL, true);
+    tilefinch_platform_set_services(NULL);
+    budget_clear_failure_injection(&budget);
+    budget.limit = 16 * MIB;
+    free(html);
+    bool ok = pressure.clamped && (mode == 0
+        ? loaded && navigation.page.loaded
+            && navigation.performance.stylesheet_pressure_fallbacks == 1
+            && navigation.page.layout.control_count == 1
+        : !loaded && navigation.performance.stylesheet_pressure_fallbacks == 0
+            && (mode != 2 || pressure.cancelled));
+    if (mode != 0) {
+        unsigned phase = 0, cancelled = 0;
+        size_t refusals = 0, current = 0, limit = 0;
+        ok = ok && sscanf(navigation.last_error,
+            "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
+            &phase, &cancelled, &refusals, &current, &limit) == 5
+            && phase != 0 && phase <= 11 && limit != 0
+            && cancelled == (mode == 2)
+            && (mode != 1 || refusals != 0);
+    }
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_initial_layout_pressure_uses_minimal_style(void)
+{
+    return test_initial_layout_pressure_case(0)
+        && test_initial_layout_pressure_case(1)
+        && test_initial_layout_pressure_case(2)
+        && test_resumable_initial_layout_pressure();
+}
+
+static bool test_optional_image_layout_refusal_retains_page(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    ProgressivePreviewProbe probe = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && navigation_set_progressive_paint_hook(&navigation, capture_progressive_preview, &probe)
+        && background_image_continuation_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(&navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        (void) setenv("TILEFINCH_EXPERIMENTAL_BACKGROUND_IMAGES", "1", 1);
+    }
+    bool loaded = ready && navigation_load_url(&navigation, navigation_begin(&navigation),
+        "https://background-images.test/document", 4096, 1000, 480, NULL, NULL, true);
+    bool first_frame = loaded && navigation.page.images.stats.loaded == 1
+        && navigation_background_resources_pending(&navigation);
+    DrawCommand *commands = navigation.page.layout.commands;
+    if (first_frame) navigation_test_refuse_next_same_document_relayout();
+    NavigationBackgroundWorkOutcome outcome = first_frame
+        ? navigation_run_background_resources(&navigation) : NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    bool ok = first_frame && outcome == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+        && navigation.page.loaded && navigation.page.layout.commands == commands
+        && navigation.page.layout.count != 0 && navigation.page.images.stats.loaded == 2
+        && !navigation_background_resources_pending(&navigation)
+        && navigation.performance.background_image_failures == 1;
+    (void) unsetenv("TILEFINCH_EXPERIMENTAL_BACKGROUND_IMAGES");
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+typedef struct {
+    NavigationSession *navigation;
+    bool cancel_retry;
+    bool retry_checkpoint;
+    bool unsafe;
+} PressureRetryProbe;
+
+static bool pressure_retry_checkpoint(void *context, const char *phase,
+                                     size_t work)
+{
+    (void) phase;
+    (void) work;
+    PressureRetryProbe *probe = context;
+    if (probe->navigation->performance.mutation_layout_pressure_retries != 0) {
+        probe->retry_checkpoint = true;
+        probe->unsafe |= probe->navigation->committed_layout_servable
+            || probe->navigation->page.layout.commands != NULL;
+        if (probe->cancel_retry) return false;
+    }
+    return true;
+}
+
+static bool test_mutation_layout_pressure_case(bool recover, bool cancel_retry)
+{
+    char html[32768];
+    size_t length = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>p{margin:0;height:24px}"
+        "#scroll{height:60px;overflow:auto}</style><body>"
+        "<div id=scroll><p>one</p><p>two</p><p>three</p><p>four</p></div>");
+    for (size_t i = 0; i < 400; i++) {
+        int n = snprintf(html + length, sizeof(html) - length,
+                         "<p>Retained replacement row %zu</p>", i);
+        if (n < 0 || (size_t) n >= sizeof(html) - length) return false;
+        length += (size_t) n;
+    }
+    int n = snprintf(html + length, sizeof(html) - length,
+                     "<script>globalThis.ready=1</script></body>");
+    if (n < 0 || (size_t) n >= sizeof(html) - length) return false;
+    length += (size_t) n;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                            32 * 1024, 1000);
+        navigation.relayout_preview_threshold_us = UINT64_MAX;
+    }
+    bool loaded = ready && navigation_commit_html(&navigation,
+        navigation_begin(&navigation), "https://replacement.test/page",
+        html, length, 480, NULL, NULL, true);
+    lxb_dom_node_t *scroll = loaded ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "scroll") : NULL;
+    bool scrolled = scroll != NULL
+        && layout_scroll_node(&navigation.page.layout, scroll, 0, 20);
+    ScriptResult result = {0};
+    bool mutated = scrolled && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime, "document.body.style.fontSize='18px'",
+        "<replacement-pressure>", &result);
+    /* Enough room for a replacement after releasing the incumbent, but not
+       for the two complete layouts to coexist. No synthetic fault is used. */
+    size_t original_limit = budget.limit;
+    if (mutated) {
+        layout_reuse_cache_destroy(navigation.page.layout_reuse);
+        navigation.page.layout_reuse = NULL;
+        budget.limit = budget.current + (recover ? 320 * 1024u : 0);
+    }
+    PressureRetryProbe probe = { &navigation, cancel_retry, false, false };
+    TilefinchPlatformServices services = {
+        .context = &probe, .cooperate = pressure_retry_checkpoint };
+    tilefinch_platform_set_services(&services);
+    bool rebuilt = mutated && navigation_relayout(&navigation);
+    tilefinch_platform_set_services(NULL);
+    const LayoutNodeBox *box = rebuilt
+        ? layout_box_for_node(&navigation.page.layout, scroll) : NULL;
+    bool ok = recover && !cancel_retry
+        ? rebuilt && navigation.page.loaded && box != NULL
+        && box->scroll_y == 20
+        && navigation.performance.mutation_layout_pressure_retries == 1
+        && navigation.performance.mutation_layout_pressure_recoveries == 1
+        && navigation.relayout_damage_valid
+        : !rebuilt && !navigation.page.loaded && navigation.page.runtime == NULL
+            && navigation.page.document.html == NULL
+            && navigation.page.layout.commands == NULL
+            && navigation.performance.mutation_layout_pressure_retries == 1
+            && navigation.performance.mutation_layout_pressure_recoveries == 0;
+    ok = ok && !probe.unsafe && (!cancel_retry
+        || (probe.retry_checkpoint && navigation.layout_build_cancelled));
+    if (!ok) fprintf(stderr,
+        "replacement-pressure loaded=%d mutated=%d rebuilt=%d retries=%zu "
+        "recoveries=%zu scroll=%d current=%zu limit=%zu\n", loaded, mutated,
+        rebuilt, navigation.performance.mutation_layout_pressure_retries,
+        navigation.performance.mutation_layout_pressure_recoveries,
+        box == NULL ? -1 : box->scroll_y, budget.current, budget.limit);
+    budget.limit = original_limit;
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_mutation_layout_pressure_releases_invalid_incumbent(void)
+{
+    return test_mutation_layout_pressure_case(true, false)
+        && test_mutation_layout_pressure_case(false, false)
+        && test_mutation_layout_pressure_case(true, true);
+}
+
+typedef struct {
+    NavigationSession *navigation;
+    DrawCommand *incumbent;
+    size_t admissions;
+    bool deferred;
+} RetainedScrollProbe;
+
+static bool retained_scroll_checkpoint(void *context, const char *phase,
+                                       size_t work)
+{
+    RetainedScrollProbe *probe = context;
+    if (phase == NULL || strcmp(phase, "page-scroll-servable") != 0
+        || work == 0) return true;
+    probe->admissions++;
+    NavigationSession *navigation = probe->navigation;
+    bool moved = navigation_set_scroll(navigation, 80);
+    size_t length = 0;
+    const char *reflected = document_attribute(
+        document_body_node(&navigation->page.document), "data-reflected",
+        &length);
+    probe->deferred = moved && navigation->committed_layout_servable
+        && navigation->page.layout.commands == probe->incumbent
+        && navigation_current(navigation)->scroll_y == 80
+        && reflected == NULL;
+    return true;
+}
+
+static bool test_stable_relayout_scroll_defers_author_reflection(void)
+{
+    static const char html[] =
+        "<!doctype html><style>p{height:80px}</style><body>"
+        "<p id=first>one</p><p>two</p><p>three</p><p>four</p>"
+        "<p>five</p><p>six</p><p>seven</p><p>eight</p>"
+        "<script>globalThis.ready=1</script></body>";
+    bool ok = true;
+    for (size_t variant = 0; variant < 2; variant++) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        NavigationSession navigation = {0};
+        bool ready = installed && navigation_init(&navigation, &budget, 4);
+        if (ready) {
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                                32 * 1024, 1000);
+            navigation.relayout_preview_threshold_us = UINT64_MAX;
+        }
+        bool loaded = ready && navigation_commit_html(&navigation,
+            navigation_begin(&navigation), "https://retained-scroll.test/page",
+            html, sizeof(html) - 1, 480, NULL, NULL, true);
+        ScriptResult result = {0};
+        bool prepared = loaded && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "Object.defineProperty(visualViewport,'pageTop',{configurable:true,"
+            "set(v){document.body.setAttribute('data-reflected',String(v));"
+            "document.body.textContent='reflected replacement '+v;"
+            "document.body.getBoundingClientRect()}})",
+            "<scroll-reflection>", &result);
+        bool mutated = prepared && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime, variant == 0
+                ? "document.body.style.fontSize='18px'"
+                : "document.getElementById('first').textContent='replacement'",
+            "<scroll-mutation>", &result);
+        RetainedScrollProbe probe = { &navigation,
+            navigation.page.layout.commands, 0, false };
+        TilefinchPlatformServices services = {
+            .context = &probe, .cooperate = retained_scroll_checkpoint };
+        tilefinch_platform_set_services(&services);
+        bool rebuilt = mutated && navigation_relayout(&navigation);
+        tilefinch_platform_set_services(NULL);
+        size_t length = 0;
+        const char *reflected = rebuilt ? document_attribute(
+            document_body_node(&navigation.page.document), "data-reflected",
+            &length) : NULL;
+        bool passed = rebuilt && navigation.page.loaded
+            && !navigation.committed_layout_servable
+            && (variant == 0 ? probe.admissions == 1 && probe.deferred
+                && reflected == NULL
+                && navigation.committed_scroll_reflection_pending
+                : probe.admissions == 0 && reflected == NULL
+                    && !navigation.committed_scroll_reflection_pending);
+        if (variant == 0) {
+            ScriptMutationJournal pending = {0};
+            passed = passed && !script_runtime_consume_mutations(
+                navigation.page.runtime, &pending);
+            /* The author setter runs only in the following owner turn. Its
+               text deletion must be laid out before that turn returns. */
+            passed = passed && navigation_advance_runtime(&navigation, 1, 2)
+                && navigation.committed_scroll_reflection_pending;
+            reflected = document_attribute(
+                document_body_node(&navigation.page.document),
+                "data-reflected", &length);
+            passed = passed && reflected != NULL && length == 2
+                && memcmp(reflected, "80", 2) == 0
+                && test_find_id(lxb_dom_interface_node(
+                    navigation.page.document.html), "first") == NULL
+                && navigation.page.layout.height <= navigation.viewport.css_height;
+            /* Shrinking the page clamps native scrolling. Its second author
+               reflection is likewise deferred, not called from adoption. */
+            passed = passed && navigation_current(&navigation)->scroll_y == 0
+                && navigation_advance_runtime(&navigation, 1, 2)
+                && !navigation.committed_scroll_reflection_pending;
+            reflected = document_attribute(
+                document_body_node(&navigation.page.document),
+                "data-reflected", &length);
+            passed = passed && reflected != NULL && length == 1
+                && reflected[0] == '0';
+        }
+        if (!passed) fprintf(stderr,
+            "retained-scroll variant=%zu loaded=%d prepared=%d rebuilt=%d "
+            "admissions=%zu deferred=%d reflected=%.*s height=%d scroll=%d pending=%d\n", variant, loaded,
+            prepared, rebuilt, probe.admissions, probe.deferred,
+            (int) length, reflected == NULL ? "" : reflected,
+            navigation.page.layout.height, navigation_current(&navigation)->scroll_y,
+            navigation.committed_scroll_reflection_pending);
+        navigation.committed_scroll_reflection_pending = true;
+        (void) navigation_begin(&navigation);
+        passed = passed && !navigation.committed_scroll_reflection_pending;
+        navigation.committed_scroll_reflection_pending = true;
+        navigation_discard_current_page(&navigation);
+        passed = passed && !navigation.committed_scroll_reflection_pending;
+        if (installed) navigation_destroy(&navigation);
+        bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        ok = passed && clean && ok;
+    }
+    return ok;
 }
 
 static bool test_background_image_failure_retains_visible_prefix(void)
@@ -4566,6 +5002,78 @@ static void remove_referrer_navigation_replay(const char *directory)
         (void) unlink(path);
     }
     (void) rmdir(directory);
+}
+
+static bool test_resumable_initial_layout_pressure(void)
+{
+    char *html = malloc(256u * 1024u);
+    if (html == NULL) return false;
+    size_t length = (size_t) sprintf(html, "<style>");
+    for (unsigned i = 0; i < 1800; i++)
+        length += (size_t) sprintf(html + length,
+            ".optional-%u{color:#234567;background-color:#abcdef}", i);
+    length += (size_t) sprintf(html + length, "</style><body class='");
+    for (unsigned i = 0; i < 1800; i++)
+        length += (size_t) sprintf(html + length, "optional-%u ", i);
+    length += (size_t) sprintf(html + length,
+        "'><h1>Useful document</h1><button>Continue</button>");
+    for (unsigned i = 0; i < 300; i++)
+        length += (size_t) sprintf(html + length, "<i></i>");
+    bool all_ok = true;
+    for (unsigned mode = 0; mode < 4 && all_ok; mode++) {
+        ReferrerNavigationReplay fixture = {
+            .document_url = "https://layout-pressure.test/document",
+            .stylesheet_url = "https://unused.test/style.css",
+            .html = html, .css = "", .response_referrer_policy = "",
+            .stylesheet_request_policy = ""
+        };
+        char directory[128] = {0}, error[256] = {0};
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        NavigationSession navigation = {0};
+        bool ready = installed && navigation_init(&navigation, &budget, 4)
+            && write_referrer_navigation_replay(directory, &fixture)
+            && fetch_trace_replay_begin(directory, error, sizeof(error));
+        static const char incumbent[] =
+            "<title>Retained document</title><body><button>Back</button>";
+        ready = ready && navigation_commit_static_html(
+            &navigation, navigation_begin(&navigation),
+            "https://layout-pressure.test/previous", incumbent,
+            sizeof(incumbent) - 1, 480, NULL, NULL, true);
+        InitialLayoutPressure pressure = {
+            .budget = &budget, .mode = mode, .resumable = true
+        };
+        TilefinchPlatformServices services = {
+            .context = &pressure, .cooperate = clamp_initial_layout_budget
+        };
+        if (ready) tilefinch_platform_set_services(&services);
+        bool loaded = ready && navigation_load_url(
+            &navigation, navigation_begin(&navigation), fixture.document_url,
+            256u * 1024u, 1000, 480, NULL, NULL, true);
+        tilefinch_platform_set_services(NULL);
+        budget_clear_failure_injection(&budget);
+        tilefinch_test_faults()->refuse_next_layout_context = false;
+        budget.limit = 16 * MIB;
+        all_ok = pressure.clamped && (mode == 0
+            ? loaded && navigation.page.loaded
+                && navigation.performance.stylesheet_pressure_fallbacks == 1
+                && navigation.page.layout.control_count == 1
+            : !loaded && navigation.page.loaded
+                && strcmp(navigation.page.document.title, "Retained document") == 0
+                && (mode != 2 || pressure.cancelled));
+        if (!all_ok) fprintf(stderr,
+            "resumable pressure mode=%u loaded=%d clamped=%d error=%s\n",
+            mode, loaded, pressure.clamped, navigation.last_error);
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        all_ok = budget.current == 0 && budget_categories_reconcile(&budget)
+            && all_ok;
+        if (installed) all_ok = budget_uninstall_lexbor(&budget) && all_ok;
+        if (directory[0] != '\0') remove_referrer_navigation_replay(directory);
+    }
+    free(html);
+    return all_ok;
 }
 
 static bool module_swap_replay_begin(void)

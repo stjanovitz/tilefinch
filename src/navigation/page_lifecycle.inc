@@ -808,6 +808,14 @@ static ScriptRuntime *navigation_create_runtime(
     return runtime;
 }
 
+static bool navigation_flush_committed_geometry(void *opaque)
+{
+    NavigationSession *session = opaque;
+    return session != NULL && session->page.loaded
+        && script_runtime_flush_geometry_layout(session->page.runtime,
+                                                &session->viewport);
+}
+
 static void navigation_attach_layout(NavigationSession *session)
 {
     if (session != NULL) {
@@ -829,6 +837,11 @@ static void navigation_attach_layout(NavigationSession *session)
         script_runtime_set_layout(session->page.runtime,
                                   &session->page.layout,
                                   session->viewport.css_height);
+        /* Commit installs the default once. Subsequent ordinary relayouts
+           must preserve an explicitly supplied synchronous-layout callback. */
+        if (!session->page.loaded)
+            script_runtime_set_synchronous_layout_callback(session->page.runtime,
+                navigation_flush_committed_geometry, session);
         script_runtime_set_images(session->page.runtime,
                                   &session->page.images);
         script_runtime_intersection_recheck(session->page.runtime);
@@ -1418,7 +1431,10 @@ static void page_destroy_value(NavigationSession *session,
 
 static void page_destroy(NavigationSession *session)
 {
-    if (session != NULL) page_destroy_value(session, &session->page);
+    if (session != NULL) {
+        session->committed_scroll_reflection_pending = false;
+        page_destroy_value(session, &session->page);
+    }
 }
 
 static bool navigation_retire_failed_document_refresh(
@@ -3354,6 +3370,9 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     const char *effective = fetch->effective_url[0] == '\0'
         ? frame->url : fetch->effective_url;
+    /* Provider-owned pages are native top-level surfaces, not executable
+       embedded service applications. Cookies above still honor HTTP policy. */
+    if (site_adapter_handles_navigation("GET", effective)) fetched_ok = false;
     char document_referrer[NAVIGATION_URL_LIMIT] = {0};
     /* A non-serializable initiator (for example a local about: document)
        produces an empty Document.referrer; it does not invalidate an

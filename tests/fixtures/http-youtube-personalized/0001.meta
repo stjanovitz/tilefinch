@@ -1,0 +1,14 @@
+psp-http-trace=1
+method=POST
+url=https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false
+success=1
+async-delay-pumps=3
+external-cancel=0
+transport-timeout=0
+redirect-origin-tainted=0
+error=
+status=200
+length=392
+effective-url=https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false
+content-type=application/json
+set-cookie-count=0

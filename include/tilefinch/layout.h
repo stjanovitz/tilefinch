@@ -929,6 +929,9 @@ typedef struct {
        continue (or a job was cancelled), not because a resource was refused.
        Owners can retry such a build; a refused build must not be retried. */
     bool cancelled;
+    /* Failed synchronous job phase, one-based; 0 means no failure, 11 means
+       job startup. Retained after the failed job releases its allocations. */
+    unsigned failed_phase;
 } LayoutPerformance;
 
 #if UINTPTR_MAX == UINT32_MAX
@@ -1117,6 +1120,8 @@ LayoutBuildJob *layout_build_job_begin(
     const ImageResources *images, const ViewportContext *viewport,
     LayoutReuseCache *reuse);
 LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job);
+/* Fixed numeric phase only; no document/author data. Zero until failure. */
+unsigned layout_build_job_failure_phase(const LayoutBuildJob *job);
 /* Moves a completed result into `layout`.  `layout` must be empty; the job
    remains destroyable after the move. */
 bool layout_build_job_take(LayoutBuildJob *job, LayoutDocument *layout);

@@ -42,15 +42,15 @@ Sources and generation tools remain in the browser repository. Host builds
 generate test resources in their build directory; public-clone tests need no
 network or optional-download checkout. The generated-file test checks their
 exact identity. The browser accepts only
-the SHA-256-pinned bytes, with a 32 KiB / 256-row limit. Values are display text,
+the SHA-256-pinned bytes, with a 32 KiB / 320-row limit. Values are display text,
 not executable code or formatting programs.
 
 Downloads use tilefinch-models' `main` branch and versioned
 `translations/ui/vN/` path.
 The original languages remain at v1; Russian, Ukrainian, Chinese and Korean
-use v2; Hindi and Arabic use v3. The current catalog uses v4 for all ten
-downloadable languages, adding the Settings navigation hint, menu footers,
-Controls guide, native-home instructions and page-control exit hints. V1–v3
+use v2; Hindi and Arabic use v3. The current catalog uses v5 for all ten
+downloadable languages, adding YouTube provider controls and notices to the
+navigation instructions introduced in v4. V1–v4
 remain immutable for existing releases. The file
 format is unchanged, and the browser catalog pins each language's version.
 They become available when those files are published; local-only changes cannot
@@ -71,6 +71,10 @@ text sizes. It covers settings, language choices, installation/cancellation
 states, themes, tabs, page tools, site controls and help. Every translated
 label must be complete, stay onscreen, and have at least five pixels of space
 from adjacent text. Frame and row-padding canaries catch out-of-bounds writes.
+It also renders the YouTube provider's signed-out and signed-in home pages,
+Account panel and video actions in every language, checking text extents and
+the reserved widths of all feed and rating notices. Author video titles are
+kept unchanged, even when they coincide with a translated control key.
 
 The test loads the production Latin fonts and a synthetic pack containing every
 translated display codepoint and Hindi cluster with the production 16×16
@@ -89,5 +93,5 @@ files likewise become downloadable only when their versioned paths are public.
 For a new catalog, rebuild the Hindi pack from the active version's
 `hi.sequences` before publishing the catalog: older packs may not contain the
 new navigation instructions' syllable clusters.
-The v4 Hindi catalog requires signed Devanagari revision 2; selecting Hindi
+The v5 Hindi catalog requires signed Devanagari revision 3; selecting Hindi
 updates an older pack before reporting installation complete.
